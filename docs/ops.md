@@ -1774,6 +1774,8 @@ VPHEAD_SEEDS="1 42 777" AUTUMN_CHAOS_DURATION_SECS=60 ./scripts/vphead_chaos.sh
 # cluster below quorum). Needs 6 ENs (removes 1, must leave >= K+M):
 ./scripts/decommission_chaos.sh                        # full set + remove, 3 seeds
 AUTUMN_CHAOS_DECOMMISSION=0 ./scripts/decommission_chaos.sh   # full set, no remove
+
+
 #   (any run of the base test can add the terminal remove with
 #    AUTUMN_CHAOS_DECOMMISSION=1 AUTUMN_CHAOS_NUM_ENS=6)
 # Transport-layer chaos (real cluster.sh cluster; E1 EN kill+respawn, E2 PS
@@ -1958,6 +1960,30 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   does not exit reliably once the log extent rolls (the cluster is fine
 #   through it: the roll completes, the new tail's replicas agree, the manager
 #   keeps probing) — the script caps it with `timeout -s KILL`.
+
+# AT-REST ROT (`corrupt`): the one fault the other nemeses cannot produce.
+# Every other action stops a process or cuts a link — faults the system is told
+# about. This one flips bytes in ONE replica's `.dat` on disk and tells nobody:
+# the file keeps its length and the extent keeps its eversion, so no error is
+# raised anywhere and reads still succeed from the other copies. It asserts the
+# damaged node's OWN scrub found it (`SCRUB FOUND CONTENT ROT` in that EN's
+# log) — not that a rebuild happened, because a fence in the same round rebuilds
+# the same extents for unrelated reasons.
+#
+# It seals a tail itself (`MSG_ROLL_TAILS`) when no sealed extent exists yet,
+# and only rots content a node has already DESCRIBED (`extent-{id}.ck` present)
+# — rot before the first digest is trust-on-first-use and undetectable by
+# design. Isolated round, nothing else can drive a rebuild:
+AUTUMN_CHAOS_ACTIONS=corrupt AUTUMN_CHAOS_DURATION_SECS=60 \
+  cargo test -p autumn-manager --test system_chaos -- --nocapture --ignored
+
+# AFTER ANY EN-SIDE CHANGE, rebuild the WHOLE workspace before running chaos:
+# the harness spawns `target/debug/autumn-extent-node`, and `cargo build -p
+# autumn-stream` rebuilds the library WITHOUT relinking that binary — so the
+# ENs keep running the old code while the test binary has the new. Confirm with
+# a string only the new code contains, e.g.
+#   cargo build --workspace
+#   strings -a target/debug/autumn-extent-node | grep -c '<a new log message>'
 ```
 
 ## Rolling restart & upgrade versioning

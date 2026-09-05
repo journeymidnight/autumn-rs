@@ -83,6 +83,93 @@ Task scope: (1) EC recovery 修复线，三条改动全部落地并**在生产�
   （`frame.rs` 的 `wire_payload_len as u32` 无上界检查，≥4 GiB 静默编出损坏的头——
   之前那次 4.29 GB 分片读的真正成因，我一度误判成 30 秒超时）。
 
+【2026-09-05 chaos 补上"字节错了"这一类故障（用户: 之前chaos都没测出这些bug）】
+  **用户的指控成立,而且原因是结构性的**:12 个 nemesis
+  (Split/Merge/EcConvert/FenceUnfence/Flush/Compact/Gc/ForceGc/KillEn/KillThenFence/
+  NetworkPartition/LatencySpike) 全是控制面、进程、网络故障 —— **没有一个会往磁盘写错一个字节**。
+  静默腐化不在故障模型里,跑到天荒地老也造不出 at-rest 校验要找的状态。
+  另外,这次会话里找到的那几个 recovery 缺陷(KillThenFence 从没执行、toxiproxy 修复空操作、
+  EN 控制口没被代理)**没有一个是 chaos 报出来的**,都是审计 harness 本身审出来的。
+
+  **先修仪器再下结论(而我第一次没做到,见下)**:recovery 的 op 数原本只在
+  `stranded > 0` 时才打印,而 `stranded` 只数"fence 那一刻就已经 sealed 的 slot",
+  fence sweep 随后滚掉的 open tail 不算 —— 一个不相干的代理量把真实覆盖藏了起来。
+  改成**无条件**报告。实测分布:seed 101 一轮 **2** 次,seed 303 一轮 **0** 次
+  (而那一轮 KillEn 和 KillThenFence 都跑了)。**recovery 的覆盖是附带的,为 0 时没有任何断言会失败。**
+
+  **新增 `CorruptReplica` nemesis**,以及它踩过的四个坑(都已修,都值得记):
+  1. `*b = !*b` **按位取反是对合的** —— 同一处打第二次把第一次治好了。实测两次注入之后
+     文件与原始逐字节相同。改成 `wrapping_add(1)`。
+  2. 一轮里把 extent 14 的**三个副本全打了**。RF3 打两个就离"没人读得了"只差一次隔离,
+     那是制造数据丢失不是可修复故障。改成**每个 extent 最多一个副本**。
+  3. 断言原本接受"ledger 里有该 extent 的 recovery op"。**实测被 fence 驱动的重建满足了它**,
+     而当时注入其实已被撤销 —— 一条不具区分力的证据。改成断言**只有 scrub 会写的那行日志**
+     (`SCRUB FOUND CONTENT ROT` + `extent_id=`)。
+  4. 只打**旁边已经有 `.ck`** 的副本:描述之前的腐化是 TOFU,按设计检测不到,
+     对它断言等于断言不可能的事。并且"被选中却一次都没注入成功"现在**算失败**
+     —— 否则 `corrupted` 为空、验证器早退,又是一次真空通过(实测发生过)。
+
+  **chaos 抓到的第一个真缺陷(在已提交的 b611772 里)**:scrub 的探测退避是**固定 5 分钟**,
+  且在探测**之前**打上。于是每个 extent 只在开局(还是 open tail)被问一次 → "没 seal" →
+  本轮再也不问。extent 在第 10 秒被 seal,下次提问要等第 300 秒。
+  生产后果不是"慢一点":**每次 seal 之后有最长 5 分钟盲窗,窗内发生的腐化会被 TOFU 记成真相,
+  永远不再被发现** —— 正是这个功能要防的东西。改成**指数退避**(8 tick 起,翻倍到 300 封顶):
+  新 seal 的 extent 几十秒内拿到 sidecar,长期开着的 tail 稳态成本不变。
+  顺带把那条 `!info.sealed → return` 的**静默返回**加上日志 —— 静默返回和"scrub 根本没跑"
+  长得一模一样,这个歧义让我追错了一个小时。
+
+  **只开 corrupt 一个 action 的轮次实测闭环**(没有杀节点/fence/分区,所以能驱动 recovery 的
+  只可能是腐化检测本身):
+    EN    : SCRUB FOUND CONTENT ROT extent_id=14   ← 没有任何读
+    MGR   : isolating that slot
+    LEDGER: recovery ops driven: 1 [extent 14 state=2]
+    之后  : "none of [11] are replicas ... stale layout" ← 前成员的重复上报被正确拒掉
+           (recovery 完成会把失败节点换出成员列表,所以这条 WARN 是预期行为)
+
+  **验收(两半都实测)**:只开 `corrupt` 的轮次绿 —— EN 报 rot、manager 隔离、
+  ledger 里 `extent 14 state=2`,而那一轮没有杀节点/fence/分区,所以能驱动这次重建的
+  只可能是腐化检测本身;把退避改回常数 5 分钟,同一 seed 变红("never said so")。
+  单测 `an_unsealed_extent_is_re_asked_on_a_doubling_schedule` 钉住调度表(8/16/32/64/128/256,
+  封顶 300),消融变红。
+  **顺带把 recovery 的覆盖抬上去了**:rot nemesis 需要 sealed extent,所以它会自己 roll tail,
+  而 roll 出来的正是 recovery 需要的东西 —— 全 action 轮次实测
+  seed 111 **6 次** recovery(13/13 个 action 全跑)、seed 222 **3 次**,
+  对比改动前的 0~2 次。
+
+  **fable 评审(规则 15)又抓到几条,都已修**:
+  ① **我的修复在崩溃恢复后会失效**:`tick` 定义在 supervisor 闭包里,panic 重启后从 0 数,
+     而 `scrub_probe_not_before` 存的是绝对值 ⇒ 重启后所有 extent 被冻结到旧时间戳,
+     冻多久等于节点之前跑了多久。**sweep 里崩一次就等于把 sweep 关掉。** 把 tick 移出闭包。
+  ② **探测预算永远给同四个 extent**:一趟走满整圈,游标每 tick 回到原点 ⇒ 每次都从最小 id 开始,
+     4 个探测名额被最低的四个包了,高 id 的 extent 就算早早 seal 也排在后面。每趟结束多走一步。
+  ③ 我的日志匹配 `extent_id=14` 会**前缀命中** `extent_id=140`,而一轮里会打多个 extent
+     ⇒ 一个 extent 的发现能满足另一个的断言。加分隔符检查。
+  ④ `client_for` 会 panic 而 nemesis 的 join 结果被丢弃 ⇒ 一个不可达 region 就静默杀掉整个
+     nemesis 循环,而新加的覆盖检查会把 harness 的 panic 记成产品没检测到。换 `try_client_for`。
+  ⑤ 60 秒的检测等待没有余量:检测要走完一整圈游标,时间随 extent 块数 × 该节点已描述的 extent 数
+     增长,更长的轮次或更大的 extent 会假红成"什么也没发现"。放到 180 秒并写清关系。
+  ⑥ sealed_length < 64 的 extent 会让注入报错并被算成"覆盖失败"。加下限。
+  **评审同时纠正了我文档里的一处过度声称**:指数退避只对**年轻就 roll 掉的 tail** 有效;
+  一个开了 8 分钟以上的 tail 在 seal 时已经在 300 的天花板上,拿到的还是旧的那个盲窗。
+  换曲线解决不了那一半,要么降天花板要么让 seal 方推一下。已按这个口径改写注释与 CLAUDE.md。
+
+  **评审提出的一条产品侧观察(未修,记下)**:recovery 的 verify-after-fetch 只比长度和 eversion。
+  若源副本在**被描述之前**就腐化(TOFU 窗内),它会带着"描述了腐化字节"的 sidecar 正常供源,
+  重建把腐化复制到目的地,目的地再 TOFU 一遍 ⇒ 造出一个永久检测不到的腐化副本。
+  这条完全被 TOFU 窗口界定,也就是上面那个退避改动在收窄的东西;彻底关掉需要重建时校验内容。
+
+  **我自己两次错误诊断,记以自省(第五、第六次同型)**:
+  ① 先断言"recovery 每轮最多跑一次、必须先抽到 Split"——**错**,修好仪器后 seed 101 实测 2 次。
+     我把一个**看不见目标的仪器的沉默**当成了阴性结果。
+  ② 随后断言"debug 二进制陈旧,今天所有 chaos 跑的 EN 都没有 scrub"——**也错**,
+     `strings` 证实二进制里有 scrub。但**确实有陈旧效应**,只是在另一处:
+     `cargo build -p autumn-stream` 只重建 lib,**不重建 `autumn-extent-node` 二进制**,
+     所以我用来验证"指数退避有没有用"的那两轮,EN 里根本没有那个改动。
+     教训:改了 EN 侧代码要验证 chaos 行为,必须 `cargo build --workspace`,
+     并且用一个**只有新代码才有的字符串**去 `strings` 二进制确认("里面有没有 scrub"
+     分辨不出 300 和 8)。
+  ③ 同轮还踩了账本里记着的 `pkill -f` 自杀坑(exit 144),把自己的 shell 和一批等待任务一起杀了。
+
 【2026-09-04 第二轮 fable 复审:专审"按第一轮意见改的东西",又抓到 2 条 HIGH】
   **两条 HIGH 都是我修 P0 时新造的,方向一致:只想着"别把 tick 卡死",没想清楚
   累加器和那条检查各自的生命周期。**

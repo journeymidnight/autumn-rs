@@ -174,6 +174,7 @@ impl ChaosConfig {
                     "killfence" => Action::KillThenFence,
                     "partition" => Action::NetworkPartition,
                     "latency" => Action::LatencySpike,
+                    "corrupt" => Action::CorruptReplica,
                     other => panic!("unknown action name: {other}"),
                 })
                 .collect(),
@@ -828,6 +829,7 @@ enum Action {
     KillThenFence,
     NetworkPartition,
     LatencySpike,
+    CorruptReplica,
 }
 
 /// The healthy-node count the STRICTEST nemesis insists on before it will act.
@@ -860,6 +862,7 @@ const ALL_ACTIONS: &[Action] = &[
     Action::KillThenFence,
     Action::NetworkPartition,
     Action::LatencySpike,
+    Action::CorruptReplica,
 ];
 
 struct NemesisCtx {
@@ -894,6 +897,14 @@ struct NemesisCtx {
     /// count. And above zero it is not sufficient either — a counted extent can
     /// be occupied by a delete or a conversion, which dispatches nothing.
     fence_stranded_sealed: Cell<usize>,
+    /// `(extent_id, node_id, en_log)` this round deliberately rotted on disk.
+    ///
+    /// Held because the damage is INVISIBLE to everything else the harness
+    /// checks: the file keeps its length and the extent keeps its eversion, so
+    /// per-key reads pass by rotating to a clean replica and the accounting is
+    /// untouched. Only a record of what was broken can ask whether it was
+    /// noticed.
+    corrupted: RefCell<Vec<(u64, u64, PathBuf)>>,
     nemesis_events: Arc<AtomicU64>,
     nemesis_errors: Arc<AtomicU64>,
     /// Per action: how many times it was chosen, and how many times it acted.
@@ -1389,6 +1400,234 @@ async fn do_network_partition(ctx: &NemesisCtx) -> Result<String, String> {
 /// toxic. Exercises slow-replica behaviour: commit_length still
 /// requires this replica to ACK so writes pay the latency, surfacing
 /// any timeout bug.
+/// Flip bytes in one replica's `.dat`, on disk, behind everyone's back.
+///
+/// The fault class this suite never had. Every other nemesis stops a process or
+/// cuts a link — faults the system is TOLD about, by an error or a timeout. Rot
+/// tells nobody. The file keeps its length and the extent keeps its eversion,
+/// so recovery's verify-after-fetch compares two things a flipped bit does not
+/// move; EC encodes the damage into parity and makes it canonical for the whole
+/// stripe; and the read path picks its replica by a deterministic hash of
+/// `(extent_id, offset)`, so the damaged copy is chosen CONSISTENTLY rather
+/// than rotated away from. A suite that cannot produce this state cannot claim
+/// to cover it, and this one reported green for as long as it existed.
+///
+/// Deliberately a SEALED, non-EC extent with at least two replicas: an open
+/// tail is still being written (the damage would race the writer rather than
+/// sit at rest), an EC shard repairs through a different path, and rotting the
+/// only copy tests nothing but whether the cluster can lose data.
+async fn do_corrupt_replica(ctx: &NemesisCtx) -> Result<String, String> {
+    let mut candidates = rottable_replicas(ctx).await;
+    if candidates.is_empty() {
+        // Nothing sealed yet — so SEAL something, through the same path the
+        // manager's fence-drain uses. Declining instead would make this
+        // nemesis fire only in rounds that happened to seal an extent for
+        // some other reason, which is coverage by luck: the exact shape this
+        // action exists to remove.
+        let rolled = roll_open_tails(ctx).await;
+        if rolled > 0 {
+            // Wait for a node to actually DESCRIBE the newly sealed content —
+            // the seal reaches the extent nodes lazily and the digest is paced,
+            // so returning as soon as the roll acked would inject into the
+            // trust-on-first-use window every time.
+            // Inside the 30 s per-action budget the dispatcher enforces, or
+            // the wait itself is reported as a wedged orchestration RPC.
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                compio::time::sleep(Duration::from_secs(2)).await;
+                candidates = rottable_replicas(ctx).await;
+                if !candidates.is_empty() || Instant::now() >= deadline {
+                    break;
+                }
+            }
+        }
+    }
+    // At most ONE rotted replica per extent, ever. Two is not twice the
+    // coverage, it is a different and much worse experiment: RF=3 with two
+    // damaged copies is one isolation away from an extent nobody can read, and
+    // the harness would be manufacturing data loss rather than a repairable
+    // fault. Observed rotting all three copies of one extent in a single round.
+    let spent: Vec<u64> = ctx.corrupted.borrow().iter().map(|(e, _, _)| *e).collect();
+    let Some((extent_id, node_id, path)) =
+        candidates.iter().find(|(eid, _, _)| !spent.contains(eid)).cloned()
+    else {
+        return Err(
+            "no sealed replicated extent whose copies are all still clean".into(),
+        );
+    };
+
+    // Read-modify-write, so the damage is guaranteed to DIFFER from what was
+    // there — writing a constant could land on bytes that already held it and
+    // inject nothing while reporting success.
+    //
+    // `+1`, not `!x`: bitwise NOT is an INVOLUTION, so a second hit on the same
+    // bytes RESTORES them. Observed doing exactly that — two injections logged
+    // OK and the file was byte-identical to the original, which would have made
+    // the detection assertion below fail on damage that no longer existed.
+    const ROT_LEN: usize = 64;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("open {} for rot: {e}", path.display()))?;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let mut buf = [0u8; ROT_LEN];
+    f.read_exact(&mut buf)
+        .map_err(|e| format!("read {} for rot: {e}", path.display()))?;
+    for b in buf.iter_mut() {
+        *b = b.wrapping_add(1);
+    }
+    f.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("seek {}: {e}", path.display()))?;
+    f.write_all(&buf)
+        .map_err(|e| format!("rot {}: {e}", path.display()))?;
+    f.sync_all()
+        .map_err(|e| format!("sync {}: {e}", path.display()))?;
+
+    let log_path = ctx
+        .ens
+        .borrow()
+        .iter()
+        .find(|e| e.node_id == node_id)
+        .map(|e| e.log_path.clone())
+        .ok_or_else(|| format!("no EN process for node {node_id}"))?;
+    ctx.corrupted
+        .borrow_mut()
+        .push((extent_id, node_id, log_path));
+    Ok(format!(
+        "rotted {ROT_LEN} bytes at offset 0 of extent {extent_id} on node {node_id} \
+         ({}) — no process was told",
+        path.display()
+    ))
+}
+
+/// Seal + roll every partition's log-stream tail, returning how many rolled.
+///
+/// `MSG_ROLL_TAILS` is the manager's own fence-drain instrument, so this seals
+/// the way production seals — through the live stream worker, which is the only
+/// safe way to seal a tail a writer is still appending to.
+async fn roll_open_tails(ctx: &NemesisCtx) -> u32 {
+    let mut rolled = 0u32;
+    let regions = get_regions(&ctx.mgr).await;
+    for (_, region) in regions.regions.iter() {
+        let Ok(resp) = ctx
+            .mgr
+            .call(
+                MSG_STREAM_INFO,
+                rkyv_encode(&StreamInfoReq {
+                    stream_ids: vec![region.log_stream],
+                }),
+            )
+            .await
+        else {
+            continue;
+        };
+        let Ok(info) = rkyv_decode::<StreamInfoResp>(&resp) else {
+            continue;
+        };
+        let Some((_, stream)) = info.streams.first() else {
+            continue;
+        };
+        let Some(tail) = stream.extent_ids.last().copied() else {
+            continue;
+        };
+        // `client_for` PANICS after its retry budget, and the nemesis join
+        // result is discarded — so one unreachable region would kill the loop
+        // for the rest of the round and the coverage check below would blame
+        // the product for a harness panic.
+        let Ok(client) = ctx.router.try_client_for(region.part_id).await else {
+            continue;
+        };
+        let Ok(raw) = client
+            .call(
+                partition_rpc::MSG_ROLL_TAILS,
+                rkyv_encode(&partition_rpc::RollTailsReq {
+                    part_id: region.part_id,
+                    entries: vec![(region.log_stream, tail)],
+                }),
+            )
+            .await
+        else {
+            continue;
+        };
+        if let Ok(r) = rkyv_decode::<partition_rpc::RollTailsResp>(&raw) {
+            rolled += r.rolled;
+        }
+    }
+    rolled
+}
+
+/// `(extent_id, node_id, path)` triples that may be rotted right now.
+async fn rottable_replicas(ctx: &NemesisCtx) -> Vec<(u64, u64, PathBuf)> {
+    let Ok(client) = autumn_etcd::EtcdClient::connect(&ctx.etcd_endpoint).await else {
+        return Vec::new();
+    };
+    let Ok(resp) = client.get_prefix("extents/").await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for kv in &resp.kvs {
+        let Ok(ex) = rkyv_decode::<MgrExtentInfo>(&kv.value) else {
+            continue;
+        };
+        // Two replicas minimum: the manager refuses to darken the last
+        // available slot, and rightly — an extent nobody can read is a harder
+        // failure than one served from a copy known to be bad.
+        // `>= ROT_LEN` so the read-modify-write below has bytes to work with;
+        // a shorter sealed extent would fail `read_exact` and be reported as a
+        // declined injection, which the coverage check treats as a failure.
+        if !ex.sealed
+            || ex.ec_converted
+            || ex.sealed_length < 64
+            || ex.replicates.len() < 2
+        {
+            continue;
+        }
+        let ens = ctx.ens.borrow();
+        let fenced = ctx.fenced.borrow();
+        let dead = ctx.dead.borrow();
+        let partitioned = ctx.partitioned.borrow();
+        for nid in &ex.replicates {
+            let Some(en) = ens.iter().find(|e| e.node_id == *nid) else {
+                continue;
+            };
+            if !en.is_alive()
+                || fenced.contains(nid)
+                || dead.contains(nid)
+                || partitioned.contains(&en.proxy_name)
+            {
+                continue;
+            }
+            // Only content this node has already DESCRIBED. Rot that lands
+            // before the first digest is trust-on-first-use: the sweep records
+            // the damaged bytes as truth and nothing can ever contradict them.
+            // That is a documented property, not a defect, so asserting
+            // detection on it would be asserting something impossible.
+            if let Some(path) = find_extent_dat(&en.data_dir, ex.extent_id) {
+                if path.with_extension("ck").is_file() {
+                    out.push((ex.extent_id, *nid, path));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The `.dat` for `extent_id` under an EN data dir, whichever hash subdir holds
+/// it. Walking beats recomputing the hash: the layout is the node's business
+/// and a harness that duplicates it silently stops finding files when it moves.
+fn find_extent_dat(data_dir: &Path, extent_id: u64) -> Option<PathBuf> {
+    let name = format!("extent-{extent_id}.dat");
+    let entries = std::fs::read_dir(data_dir).ok()?;
+    for e in entries.flatten() {
+        let candidate = e.path().join(&name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
     let (victim_proxy, victim_node_id) = {
         let ens = ctx.ens.borrow();
@@ -1604,6 +1843,7 @@ async fn nemesis_loop(
                 Action::KillThenFence => do_kill_then_fence(&ctx).await,
                 Action::NetworkPartition => do_network_partition(&ctx).await,
                 Action::LatencySpike => do_latency_spike(&ctx).await,
+                Action::CorruptReplica => do_corrupt_replica(&ctx).await,
             }
         };
         let result = match compio::time::timeout(Duration::from_secs(30), dispatch).await {
@@ -1906,6 +2146,158 @@ mod nemesis_budget_tests {
 ///    corrupt slot or an ordinary kill drove, so what it really asserts is
 ///    "some recovery ran", not "the fence drove one";
 ///  - it reads what is still in the ring, not a total.
+/// Every replica this round rotted on purpose must have been NOTICED.
+///
+/// Without this the injection is theatre: the read path rotates to a clean
+/// replica, per-key verify passes, the accounting is untouched, and the run is
+/// green whether or not anything ever looked at the damaged bytes. That is the
+/// exact shape this suite has been in — a fault nobody asserts on is a fault
+/// nobody covers.
+///
+/// Noticed means either the slot went dark (isolated, rebuild pending) or the
+/// ledger holds a recovery op for that extent (already rebuilt — the rebuild
+/// RESTORES the bit, so checking only the bitmap would fail on being too late).
+/// Bounded-wait rather than instant, because detection is a background sweep on
+/// a byte budget and the contract is "within a bounded time", not "by the time
+/// the nemesis returns".
+async fn verify_injected_rot_was_found(corrupted: &[(u64, u64, PathBuf)]) -> Vec<String> {
+    if corrupted.is_empty() {
+        return Vec::new();
+    }
+    // Detection is a full cursor wrap, not a fixed cost: the sweep verifies one
+    // block per described extent per tick out of an 8 MiB/s budget, so the time
+    // to reach block 0 of the rotted extent grows with BOTH the extent's block
+    // count and how many extents that node has described. 60 s covered the
+    // rounds measured (4 MiB extents, tens of candidates) with no margin; a
+    // longer round or bigger extents would have failed on latency and read as
+    // "nothing noticed". Cheap to be generous — the wait only runs to the end
+    // when the round is about to fail anyway.
+    const WAIT: Duration = Duration::from_secs(180);
+    let deadline = Instant::now() + WAIT;
+    let mut pending: Vec<(u64, u64, PathBuf)> = corrupted.to_vec();
+    loop {
+        pending.retain(|(eid, _, log)| !en_log_reports_rot(log, *eid));
+        if pending.is_empty() || Instant::now() >= deadline {
+            break;
+        }
+        compio::time::sleep(Duration::from_secs(2)).await;
+    }
+    if pending.is_empty() {
+        eprintln!(
+            "chaos: every rotted replica was found by its own node's scrub ({} injected)",
+            corrupted.len()
+        );
+        return Vec::new();
+    }
+    pending
+        .iter()
+        .map(|(eid, nid, _)| {
+            format!(
+                "extent {eid}'s replica on node {nid} was rotted on disk and its own node never \
+                 said so within {}s. Reads of it are served from the damaged copy whenever the \
+                 replica hash picks it",
+                WAIT.as_secs()
+            )
+        })
+        .collect()
+}
+
+/// Did THIS node's scrub say THIS extent's content is wrong?
+///
+/// The discriminating signal, and the reason this is not asserted through the
+/// op ledger or the `avali` bitmap: a recovery op for the extent proves only
+/// that something rebuilt it, and a fence in the same round rebuilds the same
+/// extents for reasons having nothing to do with the damage. Measured doing
+/// exactly that — an injection that had been accidentally UNDONE still
+/// satisfied a ledger-based check, because a fence-driven rebuild of that
+/// extent was sitting in the ledger. Only the scrub writes this line.
+fn en_log_reports_rot(log_path: &Path, extent_id: u64) -> bool {
+    let Ok(body) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    body.lines().any(|l| {
+        // STRIP ANSI FIRST. `tracing`'s default writer colours field names, so
+        // the bytes on disk are `<esc>[3mextent_id<esc>[0m<esc>[2m=<esc>[0m14`
+        // and a literal `extent_id=14` never appears. Matching the raw line
+        // failed while the finding was sitting in the file, which read exactly
+        // like the product not having noticed.
+        let plain = strip_ansi(l);
+        (plain.contains("SCRUB FOUND CONTENT ROT")
+            || plain.contains("SCRUB FOUND A TRUNCATED REPLICA"))
+            && mentions_extent(&plain, extent_id)
+    })
+}
+
+/// Does this line name exactly `extent_id`, not one that merely starts with it?
+///
+/// A bare `contains("extent_id=14")` also matches `extent_id=140`, and the
+/// harness rots several extents per round on the same node — so one extent's
+/// finding would satisfy another's assertion.
+fn mentions_extent(line: &str, extent_id: u64) -> bool {
+    let needle = format!("extent_id={extent_id}");
+    let mut from = 0usize;
+    while let Some(at) = line[from..].find(&needle) {
+        let end = from + at + needle.len();
+        if !line[end..].starts_with(|c: char| c.is_ascii_digit()) {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// Drop CSI escape sequences so a log line can be matched on its text.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC [ … <final byte in @-~>
+        if chars.next() != Some('[') {
+            continue;
+        }
+        for c in chars.by_ref() {
+            if ('@'..='~').contains(&c) {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Every recovery op the ledger holds, whatever caused it.
+///
+/// Reported unconditionally, because the alternative measured a PROXY and
+/// then said nothing: `stranded` counts slots that were already sealed at the
+/// instant of the fence, while the fence sweep goes on to roll the OPEN tails
+/// it found — so a round could drive real rebuilds and still print "nothing to
+/// assert on". A count that is only printed when something else predicted it
+/// cannot tell you the prediction was wrong.
+async fn recovery_ops_in_ledger(mgr: &RpcClient) -> Result<Vec<String>, String> {
+    let resp = mgr
+        .call(
+            MSG_OP_QUERY,
+            rkyv_encode(&OpQueryReq {
+                op_id: 0,
+                active_only: false,
+                kind_filter: OP_KIND_RECOVERY,
+                limit: 256,
+            }),
+        )
+        .await
+        .map_err(|e| format!("recovery-op query failed: {e:?}"))?;
+    let resp: OpQueryResp =
+        rkyv_decode(&resp).map_err(|e| format!("recovery-op query undecodable: {e}"))?;
+    Ok(resp
+        .ops
+        .iter()
+        .map(|o| format!("extent {} state={}", o.secondary_id, o.state))
+        .collect())
+}
+
 async fn verify_fence_drove_a_recovery(mgr: &RpcClient, stranded: usize) -> Vec<String> {
     let resp = match mgr
         .call(
@@ -3325,6 +3717,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             nemesis_errors: nemesis_errors.clone(),
             proxy_faults: proxy_faults.clone(),
             action_tally: RefCell::new(Default::default()),
+            corrupted: RefCell::new(Vec::new()),
             etcd_endpoint: etcd_endpoint.clone(),
             fence_stranded_sealed: Cell::new(0),
             ec_k: cfg.ec_k,
@@ -3570,13 +3963,47 @@ runs ACROSS rounds is uncovered, not unlucky.",
         // round where the victim held no sealed extent has nothing to recover,
         // and asserting on "the action ran" alone fails on luck.
         let stranded = nemesis_ctx.fence_stranded_sealed.get();
+        // Report what the round actually drove BEFORE deciding whether to
+        // assert on it. This is the number that says how much recovery
+        // coverage a run bought; `stranded` only says whether a rebuild was
+        // predictable in advance.
+        match recovery_ops_in_ledger(&mgr).await {
+            Ok(ops) => eprintln!(
+                "chaos: recovery ops driven this round: {} [{}]",
+                ops.len(),
+                ops.join(", ")
+            ),
+            Err(e) => inflight_errors.push(e),
+        }
+        {
+            let corrupted = nemesis_ctx.corrupted.borrow().clone();
+            // Chosen but never once injected is a COVERAGE failure, not a pass.
+            // The verifier below has nothing to assert on an empty list, so
+            // without this the round reports green having tested nothing —
+            // observed exactly that when the sweep produced no digests and
+            // every attempt declined for want of a target.
+            let (chosen, _ran) = nemesis_ctx
+                .action_tally
+                .borrow()
+                .get("CorruptReplica")
+                .copied()
+                .unwrap_or((0, 0));
+            if chosen > 0 && corrupted.is_empty() {
+                inflight_errors.push(format!(
+                    "CorruptReplica was chosen {chosen} time(s) and never once injected: no \
+                     sealed extent was ever described, so the rot dimension of this round is \
+                     UNCOVERED rather than passing"
+                ));
+            }
+            inflight_errors.extend(verify_injected_rot_was_found(&corrupted).await);
+        }
         if stranded > 0 {
             inflight_errors.extend(verify_fence_drove_a_recovery(&mgr, stranded).await);
         } else {
             eprintln!(
-                "chaos: no fence stranded a sealed extent this round — the fence-drove-a-\
-                 recovery check has nothing to assert on (open tails the fence sweep rolls \
-                 are not counted, so this is not proof that nothing was repaired)"
+                "chaos: no fence stranded an ALREADY-sealed extent, so the fence-drove-a-\
+                 recovery check has nothing to assert on; the count above is what the round \
+                 really drove"
             );
         }
         eprintln!(
