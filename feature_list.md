@@ -276,7 +276,17 @@
 - **Acceptance**: 人为让一次 EC 重建失败 → 下一次派发**不返回 "already exists"**；
   重复失败十次后 marker 仍能被正常执行；全程 `holds_payload`/df 对该节点其它 shard 的
   记账不变；EN 重启后不复活楔子。
-- **Status**: `passes: true` (2026-09-05) — 已按上面"正确的方向"实现。
+- **Status**: `passes: true` (2026-09-05) — 已实现**并在生产验证**。
+  线上实测（EN 滚到 15995c1 之后）:`already exists` 按 extent 逐个消失——en-6 起来后
+  63/66 停，en-5 起来后 48/69 停，之后 60 秒内**零拒绝**（此前每 2 秒四条、持续三小时）。
+  EN 侧同时打出新分支的日志 `require_recovery: local EC shard is missing, short or
+  stale — rebuilding over the existing entry`。五个 recovery op 全部
+  `succeeded`（63/66→node 83，48/69/67→node 85），`ops list --active` 清空，
+  `extent-health` 无不健康 extent。顺带验证了分片路由修复:日志里读的是
+  `192.168.2.65:9131`（分片端口）而非基础端口 9101。
+  也顺带确认了 BUG-FRAME-LEN-U32-WRAP 的数字:extent 69 的分片是 4,294,996,716 字节
+  = `u32::MAX + 29,421`，与当初推断完全一致。
+- **实现要点**。
   `ExtentNode::classify_ec_shard(info, entry, replace_id)` 是个无 `&self` 的纯函数：
   用 `ec_shard_read_len(sealed_length, replicates.len())`（即 `erasure::shard_size`，
   编码器实际写入的长度）当权威值，**长度精确相等且 eversion 相符** → Complete（上报完成）；

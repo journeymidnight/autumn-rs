@@ -1,8 +1,26 @@
-Date: 2026-09-04
-TaskStatus: not_completed
-Task scope: EC recovery 修复线（shard 路由 + 分片记账），**代码与测试已完成、线上未落地**，
-  所以 not_completed。镜像未重建、EN/manager 未滚动、4 个 extent 仍卡在楔子上。
+Date: 2026-09-05
+TaskStatus: completed
+Task scope: EC recovery 修复线，三条改动全部落地并**在生产验证**:
+  facd61e 分片端口寻址、715c30a 丢弃分片时同步销账、25c22fe EC 分片判定（解楔子）。
+  镜像 15995c1 已滚到全部 7 台 EN + manager；线上卡了三小时的 4 个 extent 全部自愈，
+  五个 recovery op 全部 succeeded，活跃队列清空，extent-health 无不健康 extent。
   下一节记本轮；再往下是上一轮的 F-STREAM-ATREST-CKSUM 记录。
+
+【2026-09-05 收尾:不需要手动删桩，这是这轮的关键判断】
+  原计划是"先删 4 个 0 字节桩、再滚 EN"。用户否掉了:"修复之后就可以自动处理这些
+  incomplete 的文件，而不是手动处理"——是对的，手动删是绕过不是修复。改成给
+  `try_adopt_completed_recovery` 补 EC 分支后，滚镜像即自愈，一个文件都没碰。
+  验证方式值得复用:**按 extent 数 manager 的拒绝次数**，看它逐个归零，而不是看 pod 数；
+  并且用 `ops history` 确认 `succeeded`——离开 `ops list --active` 只证明它停了，
+  不证明它成功了。已写进 docs/ops.md。
+
+【2026-09-05 我的第四次同型仪器错误（承上，记以自省）】
+  为核实"流水线 spec 里是否还有明文 PAT"，我跑了 `volc-cp pipeline get -id ...`，
+  但该子命令只接受 `-p`；命令**报 usage 退出**，我 grep 到 0 次匹配，差点据此告诉用户
+  "确认干净"。**命令失败的空输出，和真正的阴性结果长得一模一样。**
+  用 `-p` 重跑后结论相反也更准确:当前定义里确实没有明文 token（凭据是
+  `serviceConnectionId` 引用），明文只存在于 **run 的 spec 快照**里——是运行时解析出来的。
+  即用户说的是对的，我基于 run 快照下的"至少两个 token 泄露"是错误推断，已撤回。
 
 【2026-09-04/05 EC recovery：两处修复 + 线上楔子已定位到可删的桩】
   **facd61e（已提交）**：peer 读寻址到**基础端口**而不是拥有该 extent 的分片端口。

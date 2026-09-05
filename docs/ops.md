@@ -2695,3 +2695,60 @@ Gotchas:
   bucket root is capped at 100k entries and logs a warning; prefer a prefix.
 - **Listing costs one inode lookup per key** (for size/mtime). Fine for a model
   directory; not a directory-crawler substitute.
+
+## Rolling the extent nodes while recovery is running
+
+A rolling restart of the EN StatefulSet interrupts any EC rebuild whose peers
+sit on a pod being replaced. The rebuild reads `data_shards` peers per 64 MiB
+stripe, so a peer that goes away mid-shard costs the attempt:
+
+```
+recovery task failed, retrying in 10s extent_id=69 attempt=1
+  error=EC recovery: only 3/4 shards available for extent 69
+        at [3087007744, 3154116608) of 4294996716:
+        shard 1 (node 7 at 192.168.2.65:9131): Connection refused (os error 111)
+```
+
+That is the roll doing it, not a fault — `Connection refused` on a shard port
+whose pod is `Terminating` is the expected shape. Recovery retries ten times,
+ten seconds apart, so the rebuild survives a roll; it just pays for it. Since a
+rebuild restarts from zero (there is no resume — see the ledger for why), the
+cost is the whole shard, which on a full extent is `sealed_length / K`, GiB.
+
+So: check for active recovery before rolling, and prefer to let it drain.
+
+```bash
+kubectl -n autumn exec autumn-manager-0 -- \
+  autumn-op --manager 127.0.0.1:9001 ops list --active
+```
+
+Empty, or nothing with `recovery`, means a roll costs nothing. If a rebuild IS
+running and the roll cannot wait, it is safe — just expect the affected extents
+to start over and the roll to be followed by several minutes of repair.
+
+Update order is EN first, then manager: the EN carries the recovery logic and a
+mixed pair handshakes fine as long as the WIRE fingerprint is unchanged (a
+fingerprint bump is a stop-the-world roll instead — see the wire lockstep note).
+`podManagementPolicy: Parallel` on the EN set affects scaling only; updates
+still go one pod at a time, highest ordinal first.
+
+### Verifying a recovery fix actually took
+
+Watch the manager stop refusing, per extent, rather than trusting the pod count:
+
+```bash
+# Which extents are being refused, and how often (should go to zero):
+kubectl -n autumn logs autumn-manager-0 --since=60s \
+  | grep -oE "extent [0-9]+ already exists" | sort | uniq -c
+
+# The EN side of the same moment:
+kubectl -n autumn logs autumn-en-6 --tail=200 | grep -i require_recovery
+
+# And that the rebuild REPORTED done, rather than just leaving the active list:
+kubectl -n autumn exec autumn-manager-0 -- \
+  autumn-op --manager 127.0.0.1:9001 ops history | grep recovery
+```
+
+The last one matters: an op leaving `ops list --active` proves only that it
+stopped, not that it succeeded. `ops history` says `succeeded` and names the
+node the slot landed on.
