@@ -168,6 +168,50 @@ pub(crate) enum DispatchOutcome {
     Deferred,
 }
 
+/// How a recovery completion relates to the ledger and the layout.
+///
+/// Split out from the logging so it can be tested by VALUE. An earlier test
+/// asserted on captured `tracing` events instead and was flaky under parallel
+/// test execution — the ambient subscriber is not reliably this thread's. What
+/// actually matters is the classification; the level follows from it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompletionVerdict {
+    /// The live marker asked for exactly this. Apply it.
+    Apply,
+    /// No marker, and the layout already shows this rebuild landed — the
+    /// manager's own re-send echoing back after the executor adopted its
+    /// complete local copy. Routine, and quiet.
+    EchoOfAppliedWork,
+    /// No marker and no sign the rebuild landed: an attempt whose marker was
+    /// released while its executor kept working. The hazard the guard exists
+    /// for, and loud.
+    ReleasedAttempt,
+    /// A marker exists but names a different assignment. Loud.
+    DifferentAssignment,
+}
+
+/// Classify a completion. `pinned` is the live marker's `(node_id, replace_id)`
+/// if one is held; `reporter_is_member` and `replaced_is_member` describe the
+/// CURRENT layout.
+///
+/// Membership alone is not evidence the rebuild landed — a conversion assigning
+/// the reporter a parity slot produces exactly that — so an apply is recognised
+/// by the pair: the reporter is in, and the node it replaced is out.
+pub(crate) fn classify_recovery_completion(
+    pinned: Option<(u64, u64)>,
+    task_node: u64,
+    task_replace: u64,
+    reporter_is_member: bool,
+    replaced_is_member: bool,
+) -> CompletionVerdict {
+    match pinned {
+        Some((n, r)) if n == task_node && r == task_replace => CompletionVerdict::Apply,
+        Some(_) => CompletionVerdict::DifferentAssignment,
+        None if reporter_is_member && !replaced_is_member => CompletionVerdict::EchoOfAppliedWork,
+        None => CompletionVerdict::ReleasedAttempt,
+    }
+}
+
 impl AutumnManager {
     /// Release markers whose pinned executor can no longer run them — both
     /// Recovery (its target) and ConvertToEc (its coordinator).
@@ -663,6 +707,40 @@ impl AutumnManager {
         self.commit_extent_inflight_release(extent_id);
     }
 
+    /// Read the layout and classify a completion against it.
+    ///
+    /// Separate from `apply_recovery_done` so the WIRING is testable: which
+    /// membership question feeds which parameter is exactly the thing that
+    /// cannot be checked from the pure function or from the layout afterwards
+    /// (both non-applying verdicts leave the extent untouched, so they are
+    /// indistinguishable except by the verdict itself).
+    pub(crate) fn recovery_completion_verdict(
+        &self,
+        task: &RecoveryTask,
+        pinned: Option<&RecoveryTask>,
+    ) -> CompletionVerdict {
+        let (reporter_is_member, replaced_is_member) = {
+            let s = self.store.inner.borrow();
+            match s.extents.get(&task.extent_id) {
+                Some(ex) => (
+                    Self::extent_slot(ex, task.node_id).is_some(),
+                    Self::extent_slot(ex, task.replace_id).is_some(),
+                ),
+                // No extent: nothing shows a rebuild landed, so this cannot be
+                // an echo. `replaced_is_member = true` is what steers it to
+                // `ReleasedAttempt` rather than silently reading as applied.
+                None => (false, true),
+            }
+        };
+        classify_recovery_completion(
+            pinned.map(|p| (p.node_id, p.replace_id)),
+            task.node_id,
+            task.replace_id,
+            reporter_is_member,
+            replaced_is_member,
+        )
+    }
+
     pub(crate) async fn apply_recovery_done(
         &self,
         done_task: RecoveryTaskDone,
@@ -752,17 +830,10 @@ impl AutumnManager {
         // the identical layout, and no read of the layout can separate them.
         // That corner reads as an echo. Closing it needs attempt identity to
         // outlive the marker, which is a bigger change than a log level.
-        let already_applied = {
-            let s = self.store.inner.borrow();
-            s.extents.get(&task.extent_id).is_some_and(|ex| {
-                Self::extent_slot(ex, task.node_id).is_some()
-                    && Self::extent_slot(ex, task.replace_id).is_none()
-            })
-        };
-        match pinned_recovery {
-            Some(pinned)
-                if pinned.node_id == task.node_id && pinned.replace_id == task.replace_id => {}
-            None if already_applied => {
+        let verdict = self.recovery_completion_verdict(task, pinned_recovery.as_ref());
+        match verdict {
+            CompletionVerdict::Apply => {}
+            CompletionVerdict::EchoOfAppliedWork => {
                 tracing::debug!(
                     extent_id = task.extent_id,
                     reported_node = task.node_id,
@@ -772,7 +843,7 @@ impl AutumnManager {
                 );
                 return Ok(());
             }
-            None => {
+            CompletionVerdict::ReleasedAttempt => {
                 // Deliberately NOT "no inflight marker": another kind may hold
                 // the ledger slot (a Delete acquired once refs hit 0), and this
                 // path must not assert something it did not check.
@@ -788,7 +859,8 @@ impl AutumnManager {
                 );
                 return Ok(());
             }
-            Some(pinned) => {
+            CompletionVerdict::DifferentAssignment => {
+                let pinned = pinned_recovery.as_ref().expect("classified as mismatched");
                 tracing::warn!(
                     extent_id = task.extent_id,
                     reported_node = task.node_id,
@@ -1772,6 +1844,116 @@ impl crate::AutumnManager {
                 // from the report — the report only says "it finished" and carries
                 // `new_eversion` for a cross-check, so a stale/forged report can't
                 // steer the layout.
+                // Scrub findings: this node read its own sealed content and it
+                // did not match what was hashed at seal. Isolate the slot so
+                // recovery rebuilds it — a clear `avali` bit alone reads as
+                // "behind", which `re_avali` tries to heal with a length
+                // comparison a full-length rotted replica passes.
+                for rot in df.scrub_rot {
+                    let ex = {
+                        let s = self.store.inner.borrow();
+                        s.extents.get(&rot.extent_id).cloned()
+                    };
+                    let Some(ex) = ex else {
+                        continue;
+                    };
+                    let op_in_flight = self.extent_inflight_op(rot.extent_id).is_some();
+                    match crate::extent_corrupt::compute_corrupt_isolation(
+                        &ex,
+                        &[node.node_id],
+                        rot.eversion,
+                        op_in_flight,
+                    ) {
+                        crate::extent_corrupt::IsolationOutcome::Isolate {
+                            updated,
+                            cleared_mask,
+                        } => {
+                            tracing::error!(
+                                extent_id = rot.extent_id,
+                                node_id = node.node_id,
+                                "a node's scrub found its own copy rotted at rest — isolating \
+                                 that slot so recovery rebuilds it"
+                            );
+                            if let Err(e) = self.persist_extent(&updated).await {
+                                tracing::warn!(
+                                    extent_id = rot.extent_id,
+                                    error = %e,
+                                    "could not persist the isolation of a rotted replica \
+                                     (the scrub re-reports it on its next pass)"
+                                );
+                                continue;
+                            }
+                            // Verify at apply, as the RPC path does. The persist
+                            // above is an await, and seal / split / EC dispatch /
+                            // delete handlers interleave during it; writing this
+                            // stale clone into memory would roll their work back.
+                            // The scrub re-reports on its next pass, so dropping
+                            // a raced apply costs a sweep, not the finding.
+                            {
+                                let mut s = self.store.inner.borrow_mut();
+                                match s.extents.get(&updated.extent_id) {
+                                    Some(live) if live.eversion == rot.eversion => {
+                                        s.extents.insert(updated.extent_id, updated.clone());
+                                    }
+                                    _ => {
+                                        tracing::warn!(
+                                            extent_id = rot.extent_id,
+                                            "extent changed while isolating a rotted replica; \
+                                             dropping this apply (the scrub re-reports it)"
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                            if let Err(e) =
+                                self.mark_slots_corrupt(updated.extent_id, cleared_mask).await
+                            {
+                                tracing::warn!(
+                                    extent_id = rot.extent_id,
+                                    error = %e,
+                                    "isolated a rotted replica but could not record WHY; the \
+                                     scrub's next report re-drives the mark on the \
+                                     already-isolated path"
+                                );
+                            }
+                        }
+                        crate::extent_corrupt::IsolationOutcome::AlreadyIsolated => {
+                            // The bit is dark but the REASON may not be
+                            // recorded — a `mark_slots_corrupt` that failed
+                            // after the isolation landed leaves exactly this
+                            // shape, and under the default fenced-only gate an
+                            // unmarked dark slot is never rebuilt. This report
+                            // is the retry that closes it; without re-driving
+                            // here, nothing ever does.
+                            let slot = ex
+                                .replicates
+                                .iter()
+                                .chain(ex.parity.iter())
+                                .position(|s| *s == node.node_id);
+                            if let Some(slot) = slot {
+                                if !self.slot_is_corrupt(rot.extent_id, slot) && slot < 32 {
+                                    if let Err(e) = self
+                                        .mark_slots_corrupt(rot.extent_id, 1u32 << slot)
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            extent_id = rot.extent_id,
+                                            error = %e,
+                                            "could not record why an already-dark slot is dark"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        crate::extent_corrupt::IsolationOutcome::Refused { message, .. } => {
+                            tracing::warn!(
+                                extent_id = rot.extent_id,
+                                node_id = node.node_id,
+                                "scrub reported rot but it cannot be acted on: {message}"
+                            );
+                        }
+                    }
+                }
                 for done in df.ec_done {
                     let Some(params) = self.extent_inflight_payload_ec(done.extent_id) else {
                         // No marker: an already-applied conversion re-reported

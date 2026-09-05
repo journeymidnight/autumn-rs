@@ -26,11 +26,155 @@ use std::collections::HashMap;
 use autumn_common::AppError;
 
 use crate::AutumnManager;
+use autumn_rpc::manager_rpc::{MgrExtentInfo, CODE_PRECONDITION};
 
 pub(crate) const EXTENT_CORRUPT_PREFIX: &str = "extentCorrupt/";
 
 pub(crate) fn extent_corrupt_key(extent_id: u64) -> String {
     format!("{EXTENT_CORRUPT_PREFIX}{extent_id}")
+}
+
+/// What isolating the reported replicas of one extent would do.
+///
+/// Extracted so the two evidence sources — a partition server that failed a WAL
+/// CRC during replay, and an extent node whose scrub found its own bytes rotted
+/// — decide identically. They arrive by different routes and carry different
+/// authority, but what may be darkened, and when refusing is mandatory, is a
+/// property of the EXTENT, not of who is speaking.
+#[derive(Debug)]
+pub(crate) enum IsolationOutcome {
+    /// Clear these bits and bump eversion.
+    Isolate {
+        updated: MgrExtentInfo,
+        cleared_mask: u32,
+    },
+    /// The reported slots are already dark — a retried report after the first
+    /// isolation landed. Success, not a no-op to be confused with a refusal.
+    AlreadyIsolated,
+    /// `code` is what the RPC entry point answers with; the heartbeat entry
+    /// point only logs `message`. Both are kept so neither caller has to
+    /// re-derive the other's half.
+    Refused { code: u8, message: String },
+}
+
+/// Decide whether the named replicas of `ex` may be isolated.
+///
+/// `reported_eversion` is what the reporter saw. Every refusal below is
+/// load-bearing: an eversion that moved means the finding describes content
+/// that has already been replaced; an EC extent's `avali` bits mean shard
+/// availability, not replica health; an OPEN tail cannot be isolated without a
+/// seal-and-roll; and clearing the LAST available bit would make the extent
+/// unreadable, which is worse than serving a copy known to be damaged.
+pub(crate) fn compute_corrupt_isolation(
+    ex: &MgrExtentInfo,
+    corrupt_node_ids: &[u64],
+    reported_eversion: u64,
+    op_in_flight: bool,
+) -> IsolationOutcome {
+    // An extent with a stream-layer op in flight is mid-change: its membership,
+    // its eversion and which file holds its payload are all being rewritten by
+    // something this decision cannot see. Isolating into that window bumps the
+    // eversion out from under the op — an EC conversion then fails its
+    // value-CAS, re-reports, and the layout flip recomputes from the
+    // post-isolation baseline, where its PINNED `new_eversion` is no longer one
+    // above what the extent now holds. The flip lands with the eversion
+    // unchanged across a replicated→EC layout change, and every client caching
+    // that layout has nothing to tell it to refetch. Deferring costs one sweep:
+    // the reporter re-reports, because rot does not heal.
+    //
+    // This mirrors `handle_reconcile_extents`, which withholds a verdict for
+    // exactly the same reason.
+    if op_in_flight {
+        return IsolationOutcome::Refused {
+            code: CODE_PRECONDITION,
+            message: format!(
+                "extent {} has a stream-layer op in flight; isolating now would move the \
+                 eversion under it",
+                ex.extent_id
+            ),
+        };
+    }
+    if ex.eversion != reported_eversion {
+        return IsolationOutcome::Refused {
+            code: CODE_PRECONDITION,
+            message: format!(
+                "extent {} eversion moved ({} != reported {}) — the report describes \
+                 content that has since been replaced",
+                ex.extent_id, ex.eversion, reported_eversion
+            ),
+        };
+    }
+    if ex.ec_converted {
+        return IsolationOutcome::Refused {
+            code: CODE_PRECONDITION,
+            message: format!(
+                "extent {} is EC-converted; replicated corrupt-replica isolation does not \
+                 apply (EC shard repair routes through recovery)",
+                ex.extent_id
+            ),
+        };
+    }
+    if !ex.sealed {
+        return IsolationOutcome::Refused {
+            code: CODE_PRECONDITION,
+            message: format!(
+                "extent {} is OPEN; isolation on an unsealed tail needs seal-and-roll",
+                ex.extent_id
+            ),
+        };
+    }
+    let mut updated = ex.clone();
+    let slots: Vec<u64> = updated
+        .replicates
+        .iter()
+        .chain(updated.parity.iter())
+        .copied()
+        .collect();
+    let mut cleared_mask = 0u32;
+    let mut found = 0u32;
+    for nid in corrupt_node_ids {
+        if let Some(slot) = slots.iter().position(|s| s == nid) {
+            found += 1;
+            // `avali` is u32 — never shift past its width on a malformed or
+            // future-wider layout.
+            if slot >= 32 {
+                continue;
+            }
+            let bit = 1u32 << slot;
+            if updated.avali & bit != 0 {
+                updated.avali &= !bit;
+                cleared_mask |= bit;
+            }
+        }
+    }
+    if found == 0 {
+        return IsolationOutcome::Refused {
+            code: CODE_PRECONDITION,
+            message: format!(
+                "none of {corrupt_node_ids:?} are replicas of extent {} (slots {slots:?}) — \
+                 stale layout",
+                ex.extent_id
+            ),
+        };
+    }
+    if cleared_mask == 0 {
+        return IsolationOutcome::AlreadyIsolated;
+    }
+    if updated.avali == 0 {
+        return IsolationOutcome::Refused {
+            code: CODE_PRECONDITION,
+            message: format!(
+                "refusing to isolate the last available replica(s) of extent {} — \
+                 unrecoverable",
+                ex.extent_id
+            ),
+        };
+    }
+    updated.eversion += 1;
+    IsolationOutcome::Isolate {
+        updated,
+        cleared_mask,
+    }
 }
 
 impl AutumnManager {
@@ -180,5 +324,118 @@ mod tests {
     fn key_is_prefixed_and_parseable() {
         assert_eq!(extent_corrupt_key(42), "extentCorrupt/42");
         assert!(extent_corrupt_key(7).starts_with(EXTENT_CORRUPT_PREFIX));
+    }
+}
+
+#[cfg(test)]
+mod isolation_tests {
+    use super::*;
+
+    fn extent(avali: u32, replicates: Vec<u64>) -> MgrExtentInfo {
+        MgrExtentInfo {
+            extent_id: 42,
+            replicates,
+            parity: vec![],
+            eversion: 7,
+            refs: 1,
+            vp_table_refs: 0,
+            sealed_length: 4096,
+            sealed: true,
+            avali,
+            replicate_disks: vec![10, 11, 12],
+            parity_disks: vec![],
+            ec_converted: false,
+        }
+    }
+
+    /// Timing, not evidence: the same report that is refused mid-op is acted on
+    /// once the op clears. Rot does not heal, so the reporter comes back.
+    #[test]
+    fn a_report_is_deferred_while_the_extent_has_an_op_in_flight() {
+        let ex = extent(0b111, vec![1, 3, 5]);
+        assert!(matches!(
+            compute_corrupt_isolation(&ex, &[3], 7, true),
+            IsolationOutcome::Refused { .. }
+        ));
+        assert!(matches!(
+            compute_corrupt_isolation(&ex, &[3], 7, false),
+            IsolationOutcome::Isolate { .. }
+        ));
+    }
+
+    #[test]
+    fn a_reported_replica_is_darkened_and_the_eversion_moves() {
+        let ex = extent(0b111, vec![1, 3, 5]);
+        match compute_corrupt_isolation(&ex, &[3], 7, false) {
+            IsolationOutcome::Isolate { updated, cleared_mask } => {
+                assert_eq!(cleared_mask, 0b010, "slot 1 is node 3");
+                assert_eq!(updated.avali, 0b101);
+                assert_eq!(updated.eversion, 8, "readers must refetch");
+            }
+            other => panic!("expected isolation, got {other:?}"),
+        }
+    }
+
+    /// The last available copy is worse gone than damaged: an extent nobody can
+    /// read at all is a harder failure than one served from a copy known bad.
+    #[test]
+    fn the_last_available_replica_is_never_darkened() {
+        let ex = extent(0b001, vec![1, 3, 5]);
+        assert!(matches!(
+            compute_corrupt_isolation(&ex, &[1], 7, false),
+            IsolationOutcome::Refused { .. }
+        ));
+    }
+
+    /// A finding describes the bytes the reporter read. If the extent has moved
+    /// on — a recovery rebuilt it, a conversion replaced it — those bytes are
+    /// gone and the finding is about nothing.
+    #[test]
+    fn a_finding_about_replaced_content_is_refused() {
+        let ex = extent(0b111, vec![1, 3, 5]);
+        assert!(matches!(
+            compute_corrupt_isolation(&ex, &[3], 6, false),
+            IsolationOutcome::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn a_repeated_report_is_success_not_a_refusal() {
+        // Slot 1 already dark.
+        let ex = extent(0b101, vec![1, 3, 5]);
+        assert!(matches!(
+            compute_corrupt_isolation(&ex, &[3], 7, false),
+            IsolationOutcome::AlreadyIsolated
+        ));
+    }
+
+    /// EC `avali` bits mean shard availability; clearing one on the strength of
+    /// a replicated-content finding would corrupt the read/repair semantics.
+    #[test]
+    fn an_ec_converted_extent_is_refused() {
+        let mut ex = extent(0b111, vec![1, 3, 5]);
+        ex.ec_converted = true;
+        assert!(matches!(
+            compute_corrupt_isolation(&ex, &[3], 7, false),
+            IsolationOutcome::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn an_unsealed_extent_and_a_non_member_are_both_refused() {
+        let mut open = extent(0b111, vec![1, 3, 5]);
+        open.sealed = false;
+        assert!(matches!(
+            compute_corrupt_isolation(&open, &[3], 7, false),
+            IsolationOutcome::Refused { .. }
+        ));
+        let ex = extent(0b111, vec![1, 3, 5]);
+        assert!(
+            matches!(
+                compute_corrupt_isolation(&ex, &[99], 7, false),
+                IsolationOutcome::Refused { .. }
+            ),
+            "a report naming a node that is not a replica is a stale layout"
+        );
     }
 }

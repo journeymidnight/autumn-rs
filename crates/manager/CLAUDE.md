@@ -420,9 +420,23 @@ from a failed shard read) was considered and REJECTED: no shard-content
 checksum exists, so real rot reads back clean while the failures a reader does
 see are congestion/absence — see `crates/stream/CLAUDE.md` note 33 for the
 full argument and what should exist instead. The bitmap + gate bypass here are
-already slot-generic over `replicates ++ parity`, so a future trustworthy
-EN-side evidence source (staged shard checksum + scrub) only needs an EC-aware
-report entry point.
+slot-generic over `replicates ++ parity`, and the EN-side scrub is the second
+evidence source: it reports its own rot on `DfResp.scrub_rot` and
+`node_health_loop` runs the SAME decision. Self-reporting needs no fencing (a
+node saying "my copy is bad" can only hurt itself), which is why it does not
+use the PS-shaped RPC.
+
+Both entry points share `compute_corrupt_isolation`, which refuses when the
+eversion moved, on an EC extent, on an OPEN tail, when no reported node is a
+member, when it would darken the LAST available slot, and **while the extent
+has a stream-layer op in flight** — isolating into that window moves the
+eversion out from under the op, and an EC conversion's flip then recomputes
+from the post-isolation baseline and lands with the eversion unchanged across a
+replicated→EC layout change, leaving cached layouts with no signal to refetch.
+Deferring is free: rot does not heal, so the reporter comes back. The
+already-isolated path re-drives `mark_slots_corrupt` when the slot is dark but
+unmarked — a mark that failed after its isolation landed is otherwise never
+rebuilt under the default gate.
 
 **Node health loop** (`node_health_loop`, 2 s) is the **single** `EXT_MSG_DF` caller
 per node. **INVARIANT: never add a second `df` caller.** The EN's `handle_df`

@@ -7330,130 +7330,112 @@ mod tests {
         })
     }
 
-    /// The DELIVERABLE of the split is which of these is loud, and nothing above
-    /// tests that — swapping the two `tracing` macros passes every assertion in
-    /// this file. So capture the events and assert the levels directly.
+    /// The classification the log levels follow from, tested by VALUE.
     ///
-    /// The distinction is not cosmetic. Both refuse, but one is the manager's
-    /// own re-send echoing back and the other is an attempt whose marker was
-    /// released while its executor kept working — the case the guard exists for,
-    /// and the one that used to hide inside the same words as the echo.
+    /// An earlier version asserted on captured `tracing` events and was flaky
+    /// under parallel test execution (~1 run in 3 saw one event instead of
+    /// three). The mechanism was NOT what I first wrote: `set_default` really
+    /// does install this thread's dispatcher, and `run` is a same-thread
+    /// `block_on`. What is process-global is tracing's callsite interest cache
+    /// and max-level hint, which any parallel test's guard drop rebuilds — a
+    /// plausible culprit that was never root-caused. What was ruled out is the
+    /// thing that mattered: it was not a bug in `apply_recovery_done`. With no
+    /// marker, `Apply` is unreachable and all three remaining arms emit, so a
+    /// missing event can only be a capture failure.
+    /// What actually matters is which case a completion falls into; the level is
+    /// a consequence.
     #[test]
-    fn the_echo_is_quiet_and_the_released_attempt_is_loud() {
-        use std::sync::{Arc, Mutex};
-        use tracing::Level;
-        use tracing_subscriber::layer::SubscriberExt;
+    fn a_completion_is_classified_by_marker_and_layout() {
+        use crate::recovery::{classify_recovery_completion, CompletionVerdict};
 
-        #[derive(Clone, Default)]
-        struct Levels(Arc<Mutex<Vec<(Level, String)>>>);
-        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Levels {
-            fn on_event(
-                &self,
-                event: &tracing::Event<'_>,
-                _ctx: tracing_subscriber::layer::Context<'_, S>,
-            ) {
-                struct Msg(String);
-                impl tracing::field::Visit for Msg {
-                    fn record_debug(
-                        &mut self,
-                        f: &tracing::field::Field,
-                        v: &dyn std::fmt::Debug,
-                    ) {
-                        if f.name() == "message" {
-                            self.0 = format!("{v:?}");
-                        }
-                    }
-                }
-                let mut m = Msg(String::new());
-                event.record(&mut m);
-                if m.0.contains("recovery completion") {
-                    self.0.lock().unwrap().push((*event.metadata().level(), m.0));
-                }
-            }
-        }
-
-        let seen = Levels::default();
-        let events = seen.0.clone();
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::registry().with(seen).with(
-                tracing_subscriber::filter::LevelFilter::TRACE,
-            ),
+        // The marker asked for exactly this.
+        assert_eq!(
+            classify_recovery_completion(Some((9, 1)), 9, 1, true, false),
+            CompletionVerdict::Apply
         );
+        // A marker naming someone else — the hazard the guard exists for.
+        assert_eq!(
+            classify_recovery_completion(Some((9, 1)), 11, 1, false, true),
+            CompletionVerdict::DifferentAssignment
+        );
+        // No marker, and the layout shows the rebuild landed: the reporter is in
+        // and the node it replaced is out. The manager's own re-send echoing.
+        assert_eq!(
+            classify_recovery_completion(None, 9, 1, true, false),
+            CompletionVerdict::EchoOfAppliedWork
+        );
+        // No marker and nothing applied — a released attempt finishing late.
+        assert_eq!(
+            classify_recovery_completion(None, 9, 1, false, true),
+            CompletionVerdict::ReleasedAttempt
+        );
+        // MEMBERSHIP ALONE IS NOT EVIDENCE. The reporter holds a slot because a
+        // conversion gave it parity, while the node it was replacing is still
+        // there. Reading only the first half calls this an echo and goes quiet —
+        // which is how the hazard escaped once already.
+        assert_eq!(
+            classify_recovery_completion(None, 9, 1, true, true),
+            CompletionVerdict::ReleasedAttempt,
+            "a reporter that holds an unrelated slot has not proven its rebuild landed"
+        );
+    }
 
+    /// The WIRING, not just the classifier: which membership question feeds
+    /// which parameter.
+    ///
+    /// This cannot be checked through `apply_recovery_done`'s side effects —
+    /// both non-applying verdicts leave the extent untouched, so an argument
+    /// swap is invisible in the layout afterwards and shows up only in the log
+    /// level. Asserting on the verdict is what makes it observable without
+    /// depending on captured `tracing` events.
+    #[test]
+    fn the_layout_is_read_into_the_classifier_the_right_way_round() {
+        use crate::recovery::CompletionVerdict;
         run(async {
             let m = AutumnManager::new();
-            let extent_id = 33u64;
-            let ex = |replicates: Vec<u64>| MgrExtentInfo {
+            let extent_id = 34u64;
+            // Nothing applied: node 1 still holds the slot, node 9 is absent.
+            // Swapping the two membership answers turns this into "the reporter
+            // is in and the replaced node is out" — an echo — and goes quiet on
+            // the case the guard exists for.
+            m.store.inner.borrow_mut().extents.insert(
                 extent_id,
-                replicates,
-                parity: vec![7],
-                eversion: 3,
-                refs: 1,
-                vp_table_refs: 0,
-                sealed_length: 100_000,
-                sealed: true,
-                avali: 0xF,
-                replicate_disks: vec![10, 11, 12],
-                parity_disks: vec![13],
-                ec_converted: true,
-            };
-            let done = |node_id: u64| RecoveryTaskDone {
-                task: RecoveryTask {
+                MgrExtentInfo {
                     extent_id,
-                    replace_id: 1,
-                    node_id,
-                    start_time: 0,
+                    replicates: vec![1, 3, 5],
+                    parity: vec![],
+                    eversion: 3,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    sealed_length: 100_000,
+                    sealed: true,
+                    avali: 0b111,
+                    replicate_disks: vec![10, 11, 12],
+                    parity_disks: vec![],
+                    ec_converted: false,
                 },
-                ready_disk_id: 88,
+            );
+            let task = RecoveryTask {
+                extent_id,
+                replace_id: 1,
+                node_id: 9,
+                start_time: 0,
             };
+            assert_eq!(
+                m.recovery_completion_verdict(&task, None),
+                CompletionVerdict::ReleasedAttempt,
+                "the reporter is absent and the node it replaced is still there, so \
+                 nothing shows this rebuild landed"
+            );
 
-            // ECHO: the rebuild already applied, so node 9 IS in the layout and
-            // node 1 is gone. No marker, and verifiable duplicate work.
-            m.store.inner.borrow_mut().extents.insert(extent_id, ex(vec![9, 3, 5]));
-            assert!(m.apply_recovery_done(done(9)).await.is_ok());
-
-            // RELEASED ATTEMPT: nothing applied — node 1 still holds the slot
-            // and node 9 is nowhere in the layout. Same empty ledger.
-            m.store.inner.borrow_mut().extents.insert(extent_id, ex(vec![1, 3, 5]));
-            assert!(m.apply_recovery_done(done(9)).await.is_ok());
-
-            // RELEASED ATTEMPT, WITH THE REPORTER ALREADY A MEMBER. Same
-            // hazard, but an EC conversion has meanwhile given node 9 a PARITY
-            // slot — which the guard's own neighbour calls the typical layout
-            // change. Nothing applied: node 1 still holds the slot this report
-            // wants to replace. Reading "is the reporter a member?" alone calls
-            // this an echo and goes quiet, which is how the hazard escaped a
-            // second time, one conditional deeper than the first.
-            {
-                let mut st = m.store.inner.borrow_mut();
-                let mut e = ex(vec![1, 3, 5]);
-                e.parity = vec![9];
-                st.extents.insert(extent_id, e);
-            }
-            assert!(m.apply_recovery_done(done(9)).await.is_ok());
-        });
-
-        let got = events.lock().unwrap().clone();
-        assert_eq!(got.len(), 3, "expected one event per refusal, got {got:?}");
-        assert_eq!(
-            got[0].0,
-            Level::DEBUG,
-            "the manager's own re-send echo must not be a warning: {}",
-            got[0].1
-        );
-        assert_eq!(
-            got[1].0,
-            Level::WARN,
-            "an attempt whose marker was released while it kept working must stay loud: {}",
-            got[1].1
-        );
-        assert_eq!(
-            got[2].0,
-            Level::WARN,
-            "the reporter holding an unrelated (parity) slot is not evidence its rebuild \
-             landed — the slot it was replacing is still there: {}",
-            got[2].1
-        );
+            // And the mirror image: the rebuild DID land.
+            m.store.inner.borrow_mut().extents.get_mut(&extent_id).unwrap().replicates =
+                vec![9, 3, 5];
+            assert_eq!(
+                m.recovery_completion_verdict(&task, None),
+                CompletionVerdict::EchoOfAppliedWork
+            );
+        })
     }
 
     // ── eversion lost-update during EC conversion await ────────────────────

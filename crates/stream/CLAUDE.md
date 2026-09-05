@@ -157,6 +157,60 @@ NAME, so a shard staged for one index can never be *served* as another.
   the fd cache, a shard opened per use (read-only after staging, and keeping it
   out of `FdLru` preserves that cache's one-fd-per-extent accounting).
 
+### At-rest content integrity (`extent_cksum.rs`, `extent_scrub.rs`)
+
+A sealed extent's `.dat` gets `extent-{id}.ck`: magic + extent_id +
+sealed_length + block_bytes + block_count + one CRC32C per 1 MiB block + a
+trailer CRC. **Missing, undecodable, or describing a different `sealed_length`
+all mean "no evidence" — never "corrupt"**, which is what makes it
+zero-migration and what stops a damaged 4 KiB sidecar from condemning a healthy
+multi-GiB replica. Per block, not per extent: a whole-extent digest could only
+be checked by a full read and could not say WHICH region rotted.
+
+`remove_extent_files` unlinks it with the rest.
+
+**Who may describe content.** Two refusals, both because this node's own
+sidecar is what later condemns this node's own bytes:
+- only bytes `coalescer.last_synced` proves durable (an append advances
+  `entry.len` before its pwritev is submitted, and a short replica is a normal
+  mid-repair state);
+- `note_durable_install` — the single definition of "durable bytes installed out
+  of band", used by the peer copy and the recovery rebuild — clears any
+  half-built description, the cached sidecar and the verify cursor, so nothing
+  survives from content that was replaced. Without it a description spliced
+  across a repair makes the copy that was just made healthy fail its own
+  checksum forever.
+
+**Where it is checked.** Whole-block reads in BOTH arms of `build_read_future`
+(the production path; `handle_read_bytes` alone is unreachable over the wire)
+fail rather than serve — the client's existing rotation carries the read to
+another replica. Sub-block reads are deliberately NOT verified (a 4 KiB read
+would have to hash its whole 1 MiB block: 256× on the hot path); the scrub
+covers those bytes on its own schedule. EC conversion verifies the WHOLE extent
+before encoding, after both the seal sync and the peer-copy, because the layout
+flip makes whatever it read canonical for the stripe. `ContentCheck` keeps
+"could not read it" (`Unavailable`) apart from "it does not match"
+(`FailedPrecondition`) — naming the wrong fault sends the operator after the
+wrong thing.
+
+**The scrub** (`spawn_content_scrub_loop`, 1 s tick) both DESCRIBES and
+VERIFIES, so rot is found with nobody reading. Paced by BYTES per shard
+(`SCRUB_DEFAULT_BYTES_PER_SEC`, 8 MiB/s, no banked burst), one block per extent
+per pass, cursor keyed by extent id. Bounded by the candidate count, not by the
+budget alone: the skip paths spend nothing and never await, and the cursor
+wraps, so an all-skipped tick would spin the shard's event loop — starving the
+very recovery whose marker caused the skip, and on shard 0 starving `df`.
+Deliberately NOT gated on the local `sealed` flag (there is no seal event on an
+EN, so that would skip exactly the rolled tails it exists for); it asks the
+manager instead, at most once per extent per ~5 min. A read failure of a
+DESCRIBED block is a finding, not noise — nothing mismatches when the bytes are
+simply gone, and `re_avali` only inspects slots already dark, so a member that
+silently shrank is otherwise invisible. Findings ride `DfResp.scrub_rot`
+(reported against the MANAGER's current eversion, because a stale local one
+makes every later finding refusable as "eversion moved") and land in the
+per-node `DoneQueues` — the manager dials only shard 0, so a per-instance queue
+would strand every other shard's findings.
+
 ### Bounded fd cache for SEALED extents (`FdLru`)
 
 Open/active extents keep their fd PINNED (`file = Some`). SEALED idle extents
@@ -1098,9 +1152,10 @@ and from other crates' CLAUDE.md); do not renumber.
       would be needed — which is why THIS note records the evidential argument
       as the reason.
     - **What closes the real gaps instead.** (a) Rot needs EN-side first-party
-      evidence: a shard-content checksum written at staging plus a background
-      scrub, reporting through the existing df channel — a future feature, and a
-      wire change to stage. (b) A missing shard file / quarantined holder is
+      evidence — see "At-rest content integrity" below, which supplies it for
+      REPLICATED extents and reports through `DfResp`. An EC extent's shard is
+      still undescribed: the sidecar covers `.dat`, and staging writes no
+      checksum. (b) A missing shard file / quarantined holder is
       first-party EN knowledge too; today's repair is an operator fence of the
       node (force-dispatches every slot → `run_ec_recovery_payload`). The
       manager side is already EC-ready for a trustworthy source: the corrupt-slot

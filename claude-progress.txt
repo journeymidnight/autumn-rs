@@ -1,12 +1,14 @@
 Date: 2026-09-05
-TaskStatus: completed
+TaskStatus: not_completed
 Task scope: (1) EC recovery 修复线，三条改动全部落地并**在生产验证**；
-  (2) AZ 迁移完成——7 个 EN 全部收敛到可用区 C。两件都已收尾，故 completed。
+  (2) AZ 迁移完成——7 个 EN 全部收敛到可用区 C。这两件都已收尾。
   EC recovery 部分:
   facd61e 分片端口寻址、715c30a 丢弃分片时同步销账、25c22fe EC 分片判定（解楔子）。
   镜像 15995c1 已滚到全部 7 台 EN + manager；线上卡了三小时的 4 个 extent 全部自愈，
   五个 recovery op 全部 succeeded，活跃队列清空，extent-health 无不健康 extent。
-  下一节记本轮；再往下是上一轮的 F-STREAM-ATREST-CKSUM 记录。
+  **但本仓库工作区里还压着 bitrot 增量 2(scrub + 隔离 + EC 前置校验),未提交、未推送,
+  等用户人工 review** —— 所以整体 not_completed。那批改动的记录见下面两节。
+  再往下是 EC recovery / AZ 迁移本轮,以及更早的 F-STREAM-ATREST-CKSUM 增量 1。
 
 【2026-09-05 收尾:不需要手动删桩，这是这轮的关键判断】
   原计划是"先删 4 个 0 字节桩、再滚 EN"。用户否掉了:"修复之后就可以自动处理这些
@@ -80,6 +82,112 @@ Task scope: (1) EC recovery 修复线，三条改动全部落地并**在生产�
   记录的那类事故形状，只是当前 peer-copy 不走这条路）、BUG-FRAME-LEN-U32-WRAP
   （`frame.rs` 的 `wire_payload_len as u32` 无上界检查，≥4 GiB 静默编出损坏的头——
   之前那次 4.29 GB 分片读的真正成因，我一度误判成 30 秒超时）。
+
+【2026-09-04 第二轮 fable 复审:专审"按第一轮意见改的东西",又抓到 2 条 HIGH】
+  **两条 HIGH 都是我修 P0 时新造的,方向一致:只想着"别把 tick 卡死",没想清楚
+  累加器和那条检查各自的生命周期。**
+
+  ① **修好的副本会被自己的 sidecar 诬告。** backfill 分块跨 tick 累加,而
+     `write_extent_checksums` 一直有的"只哈希 durable 字节"闸门,我的 backfill 绕过了。
+     于是:短副本(修复中/seal-over-reachable 合法高于本地长度)先被哈希掉前 k 块,
+     EOF 停下;peer-copy/recovery 换掉整个 `.dat` 后接着哈希 k..n ——
+     **持久化出一份"前半旧内容 + 后半新内容"、磁盘上从没存在过的描述**。
+     此后这个**刚被修好**的健康副本每轮 scrub 都校验失败、被隔离,修复路径自己制造腐化报告。
+     修两处:(a) backfill 加同一条 durable 闸门(顺带止住每 tick 一次的 EOF 读);
+     (b) `note_durable_install`(带外装入 durable 字节的唯一定义)清累加器 + 清 sidecar
+     缓存 + 校验游标归零。两条**各自**有消融变红的测试(它们在同一个场景里会互相遮掩,
+     所以第一版只有一条测试时 (a) 的消融是绿的 —— 补了"短副本一块都不许哈希"的断言才钉住)。
+
+  ② **EC 前置校验挪早了一格,把能自愈的局面变成永久 wedge。** 我上一轮把它挪到 seal
+     同步之后,但**还在 peer-copy 补齐之前** —— 而短 `.dat` 在这里是**正常状态**
+     (peer-copy 存在的理由就是 seal-over-reachable 会高于滞后成员的长度)。
+     于是读过 EOF → 被当成"校验失败"→ 拒绝转换 → manager 拿着 marker 每几秒重派、
+     该 extent 的 GC 永久被堵,而日志指认磁盘坏了。修:挪到 peer-copy **之后**;
+     并把 `verify_whole_extent_content` 的返回从 `Result<bool,String>` 换成四态
+     `ContentCheck{Clean, Undescribed, Rotten, Unreadable}` ——
+     **"读不出来"和"对不上"是两种故障、两个 verdict**(Unavailable vs FailedPrecondition),
+     混成一句话就是让人去查错的东西。
+
+  同轮修掉的 MEDIUM:
+  - **隔离绕过了 inflight ledger**(M2):EC 转换在飞时隔离会把 eversion 从它底下抬走,
+    flip 的 value-CAS 失败 → 重报 → 从隔离后的基线重算 → `new_eversion` 不再比现值大 1,
+    **layout 从 replicated 变 EC 而 eversion 不变**,缓存了该 layout 的 client 没有任何
+    信号去 refetch。改成:有任何 stream 层 op 在飞就**推迟**(与 `handle_reconcile_extents`
+    withhold verdict 同一条理由);rot 不会自愈,下一轮 scrub 会再报,推迟是免费的。
+    判断放进纯函数,**两个入口(df 心跳 + RPC)共用** —— 上一轮就是因为"只在新路径用"被抓。
+  - **探测无退避**(M3):open extent 是永久候选且永远描述不了,每趟都问一次 manager
+    ⇒ 一个 64 shard 的 EN 稳态每秒最多 256 个 extent-info RPC 打单线程 manager。
+    加 per-extent ~5 分钟冷却。
+  - **scrub 的读失败被吞在 DEBUG**(M1):截断和 EIO 是最常见的两种真实腐化,而**字节没了
+    的时候没有任何校验和会不匹配**(读到的是 EOF),`re_avali` 又只看已经暗掉的 slot ⇒
+    一个悄悄变短的完整成员对**所有**机制都不可见。改成:sidecar 证明过该 offset 曾被覆盖,
+    那么读不出来就是证据 → 上报 + ERROR;打不开 fd(盘掉线/fd 压力)只 WARN,不是内容判断。
+  - **scrub 探测臂会掉进不限速的整 extent 哈希**(M4):`apply_extent_meta_durable` 顺手写
+    sidecar,那对"观察到 seal 的控制路径"是对的(一次性、谁看见谁付),在预算 sweep 里是错的。
+    拆出 `SealDescribe{Now, Later}`,scrub 走 Later,自己按块描述。
+  - `AlreadyIsolated` 不重打标记(M6):隔离落了但 `mark_slots_corrupt` 失败 ⇒ 暗着的 slot
+    没有原因 ⇒ 默认 fenced-only 门下永不重建。scrub 每轮都会再报,让它顺手补上。
+  - 游标 `iter().find` 是 O(n)(M7)⇒ 全跳过的一趟 O(n²) 同步;换 `partition_point`。
+  - 两个 sidecar 写者共用一个 `.tmp` 路径(L3),互相把半截文件 rename 上去;改成每次调用唯一。
+  - backfill 非重入(L1):只在 `acc.len() == done` 时 push,否则块索引会整体错位。
+
+  **没做,理由留下**:`verify_whole_extent_content` 是在 encode 之外**多读一遍整个 extent**。
+  评审提的"在 encode 循环里按 stripe 验"对内部是几乎免费的(64 MiB stripe 覆盖整块),
+  但每个 shard 子区间两端的边界块仍要单独读,**算错了就是"看起来在验、其实什么也没验"**。
+  EC 转换是并发上限 1 的后台 op,先付简单版;代价已写进注释,不是没看见。
+
+  **收尾自审又抓到一条我这轮自己引入的**(记下来,因为形状和第一轮的教训一样:修复本身带 bug):
+  L3 把 sidecar 的 `.tmp` 改成每次调用唯一之后,**任何失败路径都会永久留下一个 `.tmp{seq}`**
+  —— 原来固定名字是自限的(下次 open 就 truncate 覆盖)。而会走到这些失败路径的正是**正在坏的盘**,
+  也就是最不该按次数堆文件的地方。交换方向反了。修:staging 拆成独立函数,失败统一 unlink。
+  顺带修掉同类的两条:extent 在描述过程中被删 ⇒ 落后一步的 sidecar 成为无人回收的孤儿(现在
+  持久化后发现 extent 没了就删掉);小 extent 的游标回绕**要花掉一整个 tick**(现在原地回绕)。
+
+  验证:manager lib 326 + stream lib 146 + 16 个 stream 集成二进制 + e2e(scrub_isolates_rot
+  4.3s)+ silent_corruption_rot 3/3 + corrupt_replica_rebuild 4 + recovery_loop_drives 5 +
+  re_avali_no_destroy 2 + 6 个 EC/reconcile 集成全绿;clippy 在改动处无新增。
+  **五条消融各红各的**:去 durable 闸门 / 去累加器失效 / 把 EC 检查挪回 peer-copy 之前 /
+  去截断上报 / 去 inflight 推迟。
+
+
+【2026-09-04 增量 2:探测 + 隔离全链路打通（未提交,等评审）】
+  **端到端 4.3 秒跑通**（`crates/manager/tests/scrub_isolates_rot.rs`）:
+  seal → scrub 回填 → 腐化 → **没有任何读**的情况下 scrub 发现 → df 带走 → manager 隔离
+  该 slot → recovery 有理由重建。4/4 稳定;两半各自消融变红（EN 不上报 / manager 不处理）。
+
+  组成:
+  - `crates/stream/src/extent_scrub.rs`（新）—— 纯粹的按**字节**限速（默认 8 MiB/s、
+    **不攒 burst**:闲一分钟也只有一秒额度）+ 按 **extent id** 续扫的游标（集合会在扫描中变,
+    下标会静默跳过或重复;有测试专门钉这个）。3 单测。
+  - EN 侧 scrub 循环:一趟同时**回填**没 sidecar 的和**校验**已有的;跳过 recovery/EC 在飞的;
+    每次只验一个块,大 extent 不独占 tick。
+  - **关键设计:scrub 不看本地 `sealed` 标志**。EN 上没有 seal 事件,按本地标志过滤会恰好跳过
+    它存在的理由（roll 走的 tail）。改成向 manager 问,答"已 seal"就走 `apply_extent_meta_durable`,
+    一条路同时落 seal 和 sidecar。
+  - `DfResp.scrub_rot` wire 字段 + **WIRE_VERSION 36→37**。
+    (原写 35→36 并登记指纹;pull 之后上游已把 36 用掉、并把整套指纹机制连同
+    `build.rs`/注册表删除 —— 现在只有手写的版本号,改 Archive 类型必须自己 bump。)
+  - `compute_corrupt_isolation` 抽成纯函数（6 单测:eversion 动过/EC/未 seal/非成员/已隔离/
+    **绝不隔离最后一个可用副本**）,`handle_report_corrupt_replica` **也**改成走它 ——
+    我一开始只在新路径用,那正是我说要避免的"漂移的重复实现"。
+  - EC 转换**编码前**整 extent 校验,失配则拒绝转换 —— 这一步是把"单副本损坏"变成
+    "整条 stripe 无法纠正"的唯一转折点。
+
+  **两次撞上同一类错误**:① 端到端测试里腐化 `dirs[0]` 却断言 **slot 0** —— manager 的副本
+  顺序不是注册顺序（和今早 KillThenFence 一模一样）,改成断言可用副本**计数**下降。
+  ② 上个 commit 里 `the_echo_is_quiet...` 那条测试**是 flaky 的**（并行下约 1/3 挂,
+  只捕获到 1 个事件）。与其追 ambient subscriber,把分类抽成 `classify_recovery_completion`
+  按**值**测,顺带让"成员身份不等于重建已应用"变成显式断言。6/6 连跑干净。
+
+  验证:stream 142 + 16 个集成二进制、manager 324、e2e 4/4、harness 3 条腿仍绿、clippy 无死代码。
+
+  **harness 三条腿为什么还绿**:harness 在 seal 之后**立刻**腐化,那时 scrub 还没回填,
+  没有 sidecar 可比 —— 就是设计文档里写明的 TOFU 窗口。要翻腿需要在 harness 里让 scrub
+  先跑一轮（"回填干净内容 → 出现腐化 → 被发现"才是诚实的端到端故事）。这是下一步。
+
+  **为什么留在工作区**:用户要人工 review,明确说 bitrot 的代码都不要 push。
+  代码本身是全绿的,不是半成品:11 改 2 新(+1217/-233),消融七条各自精准变红。
+
 
 【以下为上一轮记录】
 Task scope（上一轮）: F-STREAM-ATREST-CKSUM（bitrot / stream 层 at-rest 内容校验）。

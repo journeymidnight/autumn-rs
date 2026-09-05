@@ -1071,6 +1071,9 @@ impl AutumnManager {
                 message: e.to_string(),
             }));
         }
+        // Read the ledger BEFORE the store borrow: it is a different RefCell,
+        // and the decision needs both.
+        let op_in_flight = self.extent_inflight_op(req.extent_id).is_some();
         // Compute the etcd-first update under a read-only borrow (no mutation
         // until the persist succeeds — coco I5).
         let updated: Result<(MgrExtentInfo, u32), (u8, String)> = {
@@ -1126,110 +1129,41 @@ impl AutumnManager {
                     }));
                 }
             }
+            // The DECISION is shared with the scrub's heartbeat report: what
+            // may be darkened, and when refusing is mandatory, is a property of
+            // the extent, not of who is speaking. Only the AUTHORITY differs,
+            // and that is checked above — a partition server accusing another
+            // node must prove it owns the partition, whereas a node reporting
+            // its own rot needs no such proof.
             match s.extents.get(&req.extent_id) {
                 None => Err((
                     CODE_NOT_FOUND,
                     format!("extent {} not found", req.extent_id),
                 )),
-                Some(ex) if ex.eversion != req.eversion => Err((
-                    CODE_PRECONDITION,
-                    format!(
-                        "extent {} eversion {} != reported {} (concurrent op); retry",
-                        req.extent_id, ex.eversion, req.eversion
-                    ),
-                )),
-                // coco P2 #5: an EC-converted extent has shard bytes, not full
-                // replicas — `avali` bits mean shard availability and clearing
-                // one would corrupt the EC read/repair semantics. The replicated
-                // self-heal does not apply; refuse (the detect→EC-convert race or
-                // a stale PS). EC shard repair routes through recovery, not here.
-                Some(ex) if ex.ec_converted => Err((
-                    CODE_PRECONDITION,
-                    format!(
-                        "extent {} is EC-converted; replicated corrupt-replica isolation does \
-                         not apply (EC shard repair routes through recovery)",
-                        req.extent_id
-                    ),
-                )),
-                Some(ex) if !ex.sealed => Err((
-                    CODE_PRECONDITION,
-                    format!(
-                        "extent {} is OPEN; corruption isolation on an unsealed tail needs \
-                         seal-and-roll (A4, not yet implemented) — failing the report so the \
-                         PS open fails loud",
-                        req.extent_id
-                    ),
-                )),
-                Some(ex) => {
-                    let mut new_ex = ex.clone();
-                    let slots: Vec<u64> = new_ex
-                        .replicates
-                        .iter()
-                        .chain(new_ex.parity.iter())
-                        .copied()
-                        .collect();
-                    let mut cleared = 0u32;
-                    let mut cleared_mask = 0u32; // which slots this report darkened
-                    let mut found = 0u32; // reported nodes that ARE replicas
-                    for nid in &req.corrupt_node_ids {
-                        if let Some(slot) = slots.iter().position(|s| s == nid) {
-                            found += 1;
-                            // coco P2 #6: `avali` is u32 — guard the shift. K+M
-                            // is capped well below 32 today, but never UB on a
-                            // malformed/future-wide layout.
-                            if slot >= 32 {
-                                continue;
-                            }
-                            let bit = 1u32 << slot;
-                            if new_ex.avali & bit != 0 {
-                                new_ex.avali &= !bit;
-                                cleared_mask |= bit;
-                                cleared += 1;
-                            }
-                        }
-                    }
-                    if found == 0 {
-                        // coco P2 #5: NONE of the reported nodes are replicas of
-                        // this extent — a stale-layout / buggy report. Returning
-                        // OK here would falsely assert "isolated" while the node
-                        // the PS actually saw corruption from is unaddressed
-                        // (isolation-before-serving violated). Refuse so the PS
-                        // refetches ExtentInfo + retries (or fails the open loud).
-                        return Ok(rkyv_encode(&ReportCorruptReplicaResp {
-                            code: CODE_PRECONDITION,
-                            message: format!(
-                                "none of the reported corrupt nodes {:?} are replicas of extent \
-                                 {} (slots {:?}) — stale layout; PS should refetch + retry",
-                                req.corrupt_node_ids, req.extent_id, slots
-                            ),
-                        }));
-                    }
-                    if cleared == 0 {
-                        // Reported nodes ARE replicas but their avali bits are
-                        // already clear — genuine idempotent success (a retried
-                        // report after the first isolation landed).
+                Some(ex) => match crate::extent_corrupt::compute_corrupt_isolation(
+                    ex,
+                    &req.corrupt_node_ids,
+                    req.eversion,
+                    op_in_flight,
+                ) {
+                    crate::extent_corrupt::IsolationOutcome::Isolate {
+                        updated,
+                        cleared_mask,
+                    } => Ok((updated, cleared_mask)),
+                    // Reported replicas are already dark: a retried report after
+                    // the first isolation landed. Idempotent success, and it must
+                    // stay distinguishable from a refusal — the PS treats any
+                    // non-OK as "do not trust" and would fail its open.
+                    crate::extent_corrupt::IsolationOutcome::AlreadyIsolated => {
                         return Ok(rkyv_encode(&ReportCorruptReplicaResp {
                             code: CODE_OK,
                             message: "no-op (reported replica(s) already isolated)".into(),
                         }));
                     }
-                    // Defense: never isolate the LAST healthy replica — that
-                    // would make the extent unreadable. If clearing would leave
-                    // zero avali bits, refuse (all replicas reported corrupt =
-                    // unrecoverable, the PS must fail loud).
-                    if new_ex.avali == 0 {
-                        return Ok(rkyv_encode(&ReportCorruptReplicaResp {
-                            code: CODE_PRECONDITION,
-                            message: format!(
-                                "refusing to isolate the last replica(s) of extent {} (all \
-                                 reported corrupt) — unrecoverable, PS must fail loud",
-                                req.extent_id
-                            ),
-                        }));
+                    crate::extent_corrupt::IsolationOutcome::Refused { code, message } => {
+                        Err((code, message))
                     }
-                    new_ex.eversion += 1;
-                    Ok((new_ex, cleared_mask))
-                }
+                },
             }
         };
         let (updated, cleared_bits) = match updated {

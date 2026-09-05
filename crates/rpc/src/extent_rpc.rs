@@ -977,6 +977,28 @@ pub struct DfResp {
     /// (EC conversion, recovery). A sample, not a ledger: whatever is in
     /// flight at df time, empty when nothing is.
     pub op_progress: Vec<ExtentOpProgress>,
+    /// Extents whose content this node's scrub found ROTTED — its own copy
+    /// differs from what was hashed when the extent sealed.
+    ///
+    /// Drained at-most-once like `done_tasks` and `ec_done`. A node cannot
+    /// isolate itself: clearing an `avali` bit is the manager's write, and
+    /// `MSG_REPORT_CORRUPT_REPLICA` is unusable here — it CAS-validates a
+    /// PARTITION owner epoch and its contract is that the reporter confirmed
+    /// some OTHER replica is clean, and an extent node has neither. Reporting
+    /// oneself needs no such fencing: a node saying "my own copy is bad" can
+    /// only ever cost itself.
+    pub scrub_rot: Vec<ScrubRotReport>,
+}
+
+/// One extent this node found rotted at rest.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ScrubRotReport {
+    pub extent_id: u64,
+    /// The eversion this node held when it read the bad bytes. The manager
+    /// drops a report whose eversion has since moved: a concurrent recovery or
+    /// EC conversion has replaced the content the finding was about, so the
+    /// finding no longer describes anything.
+    pub eversion: u64,
 }
 
 /// RequireRecovery request: start a background recovery task.

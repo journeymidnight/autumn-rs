@@ -1,5 +1,6 @@
 use crate::conn_pool::{parse_addr, shard_addr_for_extent};
 use crate::extent_cksum;
+use crate::extent_scrub;
 use crate::extent_rpc::*;
 use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
 use std::collections::HashMap;
@@ -314,11 +315,46 @@ struct DiskFS {
 pub(crate) struct DoneQueues {
     recovery: std::sync::Arc<std::sync::Mutex<Vec<RecoveryTaskDone>>>,
     ec: std::sync::Arc<std::sync::Mutex<Vec<crate::extent_rpc::EcConvertDone>>>,
+    /// Extents a scrub found rotted, with the eversion the manager held when
+    /// it was found. Shared across the node's shards for the SAME reason the
+    /// two above are: the manager only ever dials shard 0's control port, so a
+    /// per-shard queue means every other shard's findings are logged and then
+    /// thrown away — on an EN with one shard per core, that is almost all of
+    /// them.
+    scrub_rot: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<u64, u64>>>,
 }
 
 impl DoneQueues {
     fn push_recovery(&self, d: RecoveryTaskDone) {
         self.recovery.lock().expect("recovery_done").push(d);
+    }
+    fn push_scrub_rot(&self, extent_id: u64, eversion: u64) {
+        self.scrub_rot
+            .lock()
+            .expect("scrub_rot")
+            .insert(extent_id, eversion);
+    }
+    /// Read the pending findings WITHOUT draining, for tests that assert on
+    /// what a pass found. Draining here would consume what `df` must report.
+    fn peek_scrub_rot(&self) -> Vec<crate::extent_rpc::ScrubRotReport> {
+        self.scrub_rot
+            .lock()
+            .expect("scrub_rot")
+            .iter()
+            .map(|(extent_id, eversion)| crate::extent_rpc::ScrubRotReport {
+                extent_id: *extent_id,
+                eversion: *eversion,
+            })
+            .collect()
+    }
+    fn take_scrub_rot(&self) -> Vec<crate::extent_rpc::ScrubRotReport> {
+        std::mem::take(&mut *self.scrub_rot.lock().expect("scrub_rot"))
+            .into_iter()
+            .map(|(extent_id, eversion)| crate::extent_rpc::ScrubRotReport {
+                extent_id,
+                eversion,
+            })
+            .collect()
     }
     fn push_ec(&self, d: crate::extent_rpc::EcConvertDone) {
         self.ec.lock().expect("ec_done").push(d);
@@ -1063,6 +1099,16 @@ pub(crate) struct ExtentEntry {
     pub(crate) corrupt_meta: AtomicBool,
     /// Cached `.ck` for this extent; see `CachedChecksums`.
     content_ck: RefCell<CachedChecksums>,
+    /// Next block the scrub will verify. Per-extent so a large extent is
+    /// checked a block at a time across ticks instead of monopolising one.
+    scrub_block: AtomicU64,
+    /// Scrub tick before which this extent must not cost another manager probe.
+    scrub_probe_not_before: AtomicU64,
+    /// Backfill in progress: the length being described, and the block hashes
+    /// accumulated so far. `None`/empty when not backfilling. 4 bytes per MiB,
+    /// so 64 KiB for the largest extent, and freed the moment it lands.
+    scrub_backfill_len: RefCell<Option<u64>>,
+    scrub_backfill_blocks: RefCell<Vec<u32>>,
 }
 
 impl ExtentEntry {
@@ -1177,6 +1223,17 @@ impl ExtentEntry {
         self.len.store(len, Ordering::SeqCst);
         self.coalescer.last_synced.fetch_max(len, Ordering::SeqCst);
         self.coalescer.pending_fsync.fetch_max(len, Ordering::SeqCst);
+        // The content underneath just changed, so everything derived from the
+        // OLD content is now a lie about the new one. A half-built block
+        // description would splice pre-repair blocks onto post-repair ones and
+        // persist the result as this replica's sidecar — after which the copy
+        // that was just made healthy fails its own checksum on every later
+        // scrub and gets isolated for it. Same for the cached sidecar and the
+        // verify cursor: re-read, and start again from block 0.
+        self.scrub_backfill_blocks.borrow_mut().clear();
+        *self.scrub_backfill_len.borrow_mut() = None;
+        self.scrub_block.store(0, Ordering::SeqCst);
+        *self.content_ck.borrow_mut() = CachedChecksums::NotLoaded;
     }
 
     pub(crate) fn replace_file(&self, new_file: CompioFile) {
@@ -1831,6 +1888,15 @@ async fn file_pwrite(
 
 /// Positional read (pread). See `file_pwrite` for the
 /// `Rc<CompioFile>` rationale.
+/// Did this read fail because the file is shorter than the range asked for?
+///
+/// `file_pread` is `read_exact_at`, so a range past EOF surfaces as
+/// `UnexpectedEof` rather than a short buffer.
+fn is_short_read(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
 async fn file_pread(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec<u8>> {
     let f: &CompioFile = &file;
     let buf = vec![0u8; len];
@@ -3276,6 +3342,36 @@ fn bulk_read_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
 /// confused with "looked at, and there is nothing" — the second is the common
 /// steady state for extents sealed before this existed, and re-probing the
 /// filesystem for them on every read is exactly the cost this avoids.
+/// What checking an extent's whole content against its sidecar found.
+///
+/// "Could not read it" and "it does not match" are separate answers because
+/// they name different faults and the caller owes them different verdicts:
+/// one is a disk that cannot serve, the other a disk that serves wrong bytes.
+enum ContentCheck {
+    Clean,
+    /// Nothing describes this extent. Extents sealed before the sidecar
+    /// existed are the common case; absence is never evidence of damage.
+    Undescribed,
+    Rotten(String),
+    Unreadable(String),
+}
+
+/// Ticks an extent waits before it may cost another manager probe (~5 min at
+/// the scrub's 1 s tick).
+const SCRUB_PROBE_BACKOFF_TICKS: u64 = 300;
+
+/// Whether a seal-apply may also hash the content and write its sidecar.
+///
+/// The hash is unpaced and covers the whole extent, which is right for the
+/// control paths that observe a seal (once per extent, on the thing that
+/// noticed) and wrong inside the scrub, whose entire purpose is a byte budget:
+/// reaching this from there would hash 16 GiB in one tick and call it paced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SealDescribe {
+    Now,
+    Later,
+}
+
 #[derive(Clone)]
 enum CachedChecksums {
     NotLoaded,
@@ -3662,6 +3758,7 @@ impl ExtentNode {
         // extent's manager refs hit 0 while the node was momentarily
         // unreachable.
         node.spawn_reconcile_orphans_loop();
+        node.spawn_content_scrub_loop();
 
         // Per-shard 2 s sweep on THIS shard's runtime, two jobs:
         // (1) OBS-1 gauge refresh — the manager's df probe only reaches
@@ -3751,6 +3848,435 @@ impl ExtentNode {
     /// rotation (bounded id batches per sweep, rotating through the
     /// full set over multiple sweeps) — the helper signature is
     /// already shaped for that.
+    /// Walk sealed extents in the background, describing the ones that have no
+    /// checksums yet and re-verifying the ones that do.
+    ///
+    /// Detection must not depend on someone reading. The read check only sees
+    /// blocks a read fully covers, and a cold extent is never read at all — so
+    /// without this, rot on idle data is found only when something finally
+    /// asks for it, which for archival content may be never.
+    ///
+    /// It also BACKFILLS, and that is not a secondary duty. There is no seal
+    /// event on an extent node, so a rolled tail can sit with no sidecar
+    /// indefinitely; this walk is what gives it one. Backfilling is
+    /// trust-on-first-use — content already at rest with no prior digest gets
+    /// whatever it currently holds recorded as truth — which is why the seal
+    /// path writes one as early as it can and this is the backstop, not the
+    /// primary writer.
+    fn spawn_content_scrub_loop(&self) {
+        let node = self.clone();
+        en_spawn_supervised("en_content_scrub", move || {
+            let node = node.clone();
+            async move {
+                const TICK: Duration = Duration::from_millis(1000);
+                let mut budget =
+                    extent_scrub::ScrubBudget::new(extent_scrub::SCRUB_DEFAULT_BYTES_PER_SEC);
+                let mut cursor = extent_scrub::ScrubCursor::default();
+                let mut tick: u64 = 0;
+                loop {
+                    compio::time::sleep(TICK).await;
+                    tick += 1;
+                    budget.refill(TICK.as_millis() as u64);
+                    node.scrub_once(&mut budget, &mut cursor, tick).await;
+                }
+            }
+        });
+    }
+
+    /// One scrub tick: spend the budget over as many extents as it covers.
+    async fn scrub_once(
+        &self,
+        budget: &mut extent_scrub::ScrubBudget,
+        cursor: &mut extent_scrub::ScrubCursor,
+        tick: u64,
+    ) {
+        // Snapshot the candidate ids before any await. The map is live and the
+        // walk yields on every block read, so holding an iterator across those
+        // awaits would be both a borrow hazard and a way to miss extents that
+        // arrive mid-tick.
+        let mut candidates: Vec<u64> = self
+            .extents
+            .iter()
+            .filter(|e| {
+                // Deliberately NOT gated on the local `sealed` flag. There is no
+                // seal event on an extent node — the manager seals in its own
+                // metadata and this node learns lazily — so requiring the local
+                // flag would make the sweep skip exactly the rolled tails it
+                // exists to describe. It asks the manager instead, below.
+                let v = e.value();
+                v.has_dat.load(Ordering::SeqCst)
+                    && !v.corrupt_meta.load(Ordering::SeqCst)
+                    && v.payload_location.load(Ordering::SeqCst)
+                        == PayloadLocation::InDat.as_byte()
+            })
+            .map(|e| *e.key())
+            .filter(|id| self.owns_extent(*id))
+            .collect();
+        candidates.sort_unstable();
+
+        // Bound the walk by the CANDIDATE COUNT, not by the budget alone.
+        //
+        // The skip paths below neither spend budget nor await, and the cursor
+        // wraps rather than ending, so a tick in which every candidate is
+        // skipped would spin this shard's event loop with no yield — starving
+        // the very recovery whose in-flight marker caused the skip, which means
+        // it never clears and the spin is permanent. On shard 0 it also starves
+        // `df`, so the manager declares the node Suspected. One pass per tick
+        // makes that impossible regardless of what the candidates are doing.
+        //
+        // Manager probes are capped separately: an undescribed extent costs one
+        // RPC to ask whether it is sealed, and a node with many open tails would
+        // otherwise send one per candidate per tick, forever.
+        const MAX_MANAGER_PROBES_PER_TICK: u32 = 4;
+
+        let mut probes = MAX_MANAGER_PROBES_PER_TICK;
+        let mut examined = 0usize;
+        while budget.available() > 0 && examined < candidates.len() {
+            examined += 1;
+            let Some(extent_id) = cursor.next(&candidates) else {
+                return;
+            };
+            // An extent with an op in flight is mid-change; its file set and
+            // length are not settled, and a mismatch would say more about the
+            // op than about the disk.
+            if self.recovery_inflight.contains_key(&extent_id)
+                || self.ec_convert_inflight.contains_key(&extent_id)
+            {
+                continue;
+            }
+            let Some(entry) = self.extents.get(&extent_id).map(|e| Rc::clone(e.value())) else {
+                continue;
+            };
+            // Spending nothing on one extent (open, unknown, or out of probes)
+            // must not end the tick — the next candidate may well have work.
+            self.scrub_one(extent_id, &entry, budget, &mut probes, tick)
+                .await;
+        }
+    }
+
+    /// Scrub one extent: describe it if it has no checksums, else verify a
+    /// block of it.
+    async fn scrub_one(
+        &self,
+        extent_id: u64,
+        entry: &Rc<ExtentEntry>,
+        budget: &mut extent_scrub::ScrubBudget,
+        probes: &mut u32,
+        tick: u64,
+    ) {
+        // Fast path: this node already knows the extent is sealed and already
+        // has its checksums. Verify a block, no manager round trip.
+        let known_sealed = entry.sealed.load(Ordering::SeqCst);
+        let sealed_length = entry.sealed_length.load(Ordering::SeqCst);
+        let ck = if known_sealed && sealed_length > 0 {
+            self.cached_content_checksums(extent_id, entry).await
+        } else {
+            None
+        };
+        let Some(ck) = ck else {
+            self.scrub_backfill(extent_id, entry, budget, probes, tick)
+                .await;
+            return;
+        };
+
+        // A sidecar exists, so any half-built description of this extent is
+        // now dead weight (the seal path can win that race).
+        if entry.scrub_backfill_len.borrow().is_some() {
+            entry.scrub_backfill_blocks.borrow_mut().clear();
+            *entry.scrub_backfill_len.borrow_mut() = None;
+        }
+
+        if ck.blocks.is_empty() {
+            // A sealed-empty extent describes no content.
+            return;
+        }
+        // Wrap in place rather than spending the tick on it: on a small extent
+        // the wrap is a large fraction of the cycle, and a tick that verifies
+        // nothing is a tick of coverage lost.
+        let mut block = entry.scrub_block.load(Ordering::SeqCst) as usize;
+        if block >= ck.blocks.len() {
+            block = 0;
+        }
+        let (start, end) = extent_cksum::block_range(block, ck.block_bytes, ck.sealed_length);
+        let want = end - start;
+        if budget.take(want) < want {
+            return;
+        }
+        entry.scrub_block.store(block as u64 + 1, Ordering::SeqCst);
+
+        let file = match self.extent_file(entry).await {
+            Ok(f) => f,
+            Err(e) => {
+                // Not a statement about the content: the fd could not be
+                // resolved at all (disk offline, fd pressure). Loud enough to
+                // see, never a reason to isolate a replica.
+                tracing::warn!(extent_id, error = %e, "scrub: could not open extent");
+                return;
+            }
+        };
+        let buf = match file_pread(file, start, want as usize).await {
+            Ok(b) => b,
+            Err(e) => {
+                // A block the sidecar describes cannot be read back. Short is
+                // the interesting one: the sidecar proves the extent once
+                // covered this offset, so the file has LOST its tail — the
+                // rot mode a bit-flip-only check would never see, since no
+                // checksum mismatches when the bytes are simply gone. Readers
+                // of that region get EOF and re_avali only ever inspects slots
+                // whose bit is already clear, so without this nothing at all
+                // reports it.
+                if is_short_read(&e) {
+                    tracing::error!(
+                        extent_id,
+                        block,
+                        offset = start,
+                        length = want,
+                        "SCRUB FOUND A TRUNCATED REPLICA — a block described at seal is no \
+                         longer readable, with no read having asked for it"
+                    );
+                    let eversion = self.manager_eversion_or_local(extent_id, entry).await;
+                    self.note_scrub_rot(extent_id, eversion);
+                } else {
+                    tracing::warn!(extent_id, block, error = %e, "scrub: read failed");
+                }
+                return;
+            }
+        };
+        if let Err(bad) = ck.verify_read(start, &buf) {
+            tracing::error!(
+                extent_id,
+                block = bad.block,
+                block_offset = bad.offset,
+                expected = bad.expected,
+                found = bad.found,
+                "SCRUB FOUND CONTENT ROT — this replica's bytes differ from what was hashed \
+                 at seal, with no read having asked for them"
+            );
+            let eversion = self.manager_eversion_or_local(extent_id, entry).await;
+            self.note_scrub_rot(extent_id, eversion);
+        }
+    }
+
+    /// Describe an extent that has no usable checksums yet, a block at a time.
+    ///
+    /// Incremental because the alternative does not work: the default extent
+    /// size is 16 GiB and the budget is a few MiB per second, so demanding the
+    /// whole extent in one tick means never hashing it at all — the tick's
+    /// budget is spent, nothing is read, and the same thing happens on the next
+    /// sweep forever. Partial block hashes accumulate on the entry (4 bytes per
+    /// MiB) until the extent is covered, then land as one sidecar.
+    ///
+    /// Only bytes this replica durably holds are described, and only after the
+    /// extent is known sealed. Both are refusals to guess: a description of
+    /// content that is still arriving would be a description of a file that
+    /// never existed, and it is this node's own sidecar that later condemns
+    /// its own bytes.
+    async fn scrub_backfill(
+        &self,
+        extent_id: u64,
+        entry: &Rc<ExtentEntry>,
+        budget: &mut extent_scrub::ScrubBudget,
+        probes: &mut u32,
+        tick: u64,
+    ) {
+        // Resolve the authoritative length once per backfill, not per block.
+        // This is what closes the "no seal event" gap — the sweep is the only
+        // thing that periodically asks whether a local extent became immutable.
+        // Already known sealed here? Then no probe is needed — asking the
+        // manager what this node can already see would spend the tick's probe
+        // budget to learn nothing, and would make backfill impossible on a node
+        // that has lost contact with the manager but still holds the data.
+        let locally_sealed = entry.sealed.load(Ordering::SeqCst);
+        let local_len = entry.sealed_length.load(Ordering::SeqCst);
+        // Copy the value out BEFORE matching: a `match *cell.borrow()` holds the
+        // `Ref` for the whole match, so a `borrow_mut` in any arm panics.
+        let pending_len = *entry.scrub_backfill_len.borrow();
+        let sealed_length = match pending_len {
+            Some(len) => len,
+            None if locally_sealed && local_len > 0 => {
+                *entry.scrub_backfill_len.borrow_mut() = Some(local_len);
+                local_len
+            }
+            None => {
+                // Ask at most once per extent per backoff window. An OPEN
+                // extent is a permanent candidate that can never be described,
+                // and it is answered the same way every time — without a
+                // per-extent cooldown a shard asks about each of them on every
+                // pass, forever, and a node with many open tails turns a
+                // hardening sweep into steady control-plane load on the single
+                // manager. Nothing is lost by waiting: a seal is not urgent
+                // here, and the append path learns about it far sooner.
+                if tick < entry.scrub_probe_not_before.load(Ordering::SeqCst) {
+                    return;
+                }
+                if *probes == 0 {
+                    return;
+                }
+                *probes -= 1;
+                entry
+                    .scrub_probe_not_before
+                    .store(tick + SCRUB_PROBE_BACKOFF_TICKS, Ordering::SeqCst);
+                let info = match self.extent_info_from_manager(extent_id).await {
+                    Ok(Some(i)) => i,
+                    Ok(None) => return,
+                    Err(e) => {
+                        tracing::debug!(extent_id, error = %e, "scrub: manager unreachable");
+                        return;
+                    }
+                };
+                if !info.sealed || info.sealed_length == 0 || info.ec_converted {
+                    return;
+                }
+                // Persist the seal through the one path that gets it right,
+                // but describe the content HERE, block by block against the
+                // budget — that writer hashes the whole extent in one go.
+                if let Err(e) = self
+                    .apply_extent_meta_durable_with(extent_id, entry, &info, SealDescribe::Later)
+                    .await
+                {
+                    tracing::debug!(extent_id, error = %e, "scrub: could not apply the seal");
+                    return;
+                }
+                if self
+                    .cached_content_checksums(extent_id, entry)
+                    .await
+                    .is_some()
+                {
+                    // The seal path described it; nothing left to accumulate.
+                    return;
+                }
+                *entry.scrub_backfill_len.borrow_mut() = Some(info.sealed_length);
+                info.sealed_length
+            }
+        };
+
+        // Describe only bytes this replica DURABLY holds, the same predicate
+        // the seal-time writer uses. A member whose `.dat` is short — a replica
+        // mid-repair, or one sealed-over-reachable above its own length — would
+        // otherwise get its first blocks hashed now and the rest after the
+        // repair lands, and the persisted sidecar would describe a file that
+        // never existed. It also stops re-reading past EOF once per tick
+        // forever. The repair advances this watermark, so the extent becomes
+        // describable on its own; nothing needs to remember to come back.
+        let durable = entry.coalescer.last_synced.load(Ordering::SeqCst);
+        if durable < sealed_length {
+            tracing::debug!(
+                extent_id,
+                durable,
+                sealed_length,
+                "scrub: not describing a replica that does not yet hold the sealed content"
+            );
+            return;
+        }
+        let block_bytes = extent_cksum::CK_BLOCK_BYTES;
+        let total = extent_cksum::block_count_for(sealed_length, block_bytes);
+        let file = match self.extent_file(entry).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::debug!(extent_id, error = %e, "scrub: could not open extent");
+                return;
+            }
+        };
+        while budget.available() > 0 {
+            let done = entry.scrub_backfill_blocks.borrow().len();
+            if done >= total {
+                break;
+            }
+            let (start, end) = extent_cksum::block_range(done, block_bytes, sealed_length);
+            let want = end - start;
+            if budget.take(want) < want {
+                return;
+            }
+            let buf = match file_pread(Rc::clone(&file), start, want as usize).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(extent_id, error = %e, "scrub: backfill read failed");
+                    return;
+                }
+            };
+            let crc = crc32c::crc32c(&buf);
+            let mut acc = entry.scrub_backfill_blocks.borrow_mut();
+            // Only extend the run this iteration measured. Two backfills
+            // interleaving on one entry would otherwise each push their own
+            // block `done` and shift every later block by one, describing the
+            // extent wrongly rather than failing.
+            if acc.len() == done {
+                acc.push(crc);
+            }
+        }
+
+        let blocks = entry.scrub_backfill_blocks.borrow().clone();
+        if blocks.len() < total {
+            return;
+        }
+        let ck = extent_cksum::ExtentChecksums {
+            sealed_length,
+            block_bytes,
+            blocks,
+        };
+        let disk = match self.disk_for(entry.disk_id) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!(extent_id, error = %e, "scrub: no disk for extent");
+                return;
+            }
+        };
+        let path = disk.ck_path(extent_id);
+        match self.persist_checksums(extent_id, &path, &ck).await {
+            Ok(()) => {
+                // The extent can be deleted while this is being written, and
+                // `remove_extent_files` has already unlinked the sidecar it knew
+                // about — so a sidecar landing after it belongs to nothing and
+                // no sweep will ever reap it.
+                if !self.extents.contains_key(&extent_id) {
+                    match compio::fs::remove_file(&path).await {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => tracing::warn!(
+                            extent_id,
+                            error = %e,
+                            "leaked a checksum sidecar for a deleted extent"
+                        ),
+                    }
+                    return;
+                }
+                *entry.content_ck.borrow_mut() = CachedChecksums::Present(Rc::new(ck));
+                tracing::debug!(extent_id, sealed_length, "scrub: described a sealed extent");
+            }
+            Err(e) => {
+                tracing::debug!(extent_id, error = %e, "scrub: could not persist the sidecar");
+            }
+        }
+        entry.scrub_backfill_blocks.borrow_mut().clear();
+        *entry.scrub_backfill_len.borrow_mut() = None;
+    }
+
+    /// The eversion the MANAGER currently holds, falling back to the local one.
+    ///
+    /// A finding must be reported against the authoritative value. The local
+    /// copy is refreshed only when something applies manager state here, and
+    /// every isolation, recovery and EC apply bumps it — so after any repair
+    /// anywhere on this extent a stale local value makes every later finding
+    /// refusable as "eversion moved", forever.
+    async fn manager_eversion_or_local(&self, extent_id: u64, entry: &Rc<ExtentEntry>) -> u64 {
+        match self.extent_info_from_manager(extent_id).await {
+            Ok(Some(info)) => info.eversion,
+            _ => entry.eversion.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Record rot for the manager to act on.
+    ///
+    /// The node cannot isolate itself: clearing an `avali` bit is the manager's
+    /// write, and the existing report RPC is PS-shaped (it CAS-validates a
+    /// partition owner epoch and requires the reporter to have confirmed a
+    /// DIFFERENT replica is clean — none of which an extent node has or can
+    /// know). The finding is queued for the `df` heartbeat instead, the same
+    /// at-most-once channel that already carries recovery and EC completions.
+    fn note_scrub_rot(&self, extent_id: u64, eversion: u64) {
+        self.done.push_scrub_rot(extent_id, eversion);
+    }
+
     fn spawn_reconcile_orphans_loop(&self) {
         if self.manager_endpoint.is_none() {
             // Test setups without a manager: nothing to reconcile.
@@ -4709,6 +5235,10 @@ impl ExtentNode {
                         owner: RefCell::new(OwnerMailbox::default()),
                         corrupt_meta: AtomicBool::new(corrupt_meta),
                         content_ck: RefCell::new(CachedChecksums::NotLoaded),
+                        scrub_block: AtomicU64::new(0),
+                        scrub_probe_not_before: AtomicU64::new(0),
+                        scrub_backfill_len: RefCell::new(None),
+                        scrub_backfill_blocks: RefCell::new(Vec::new()),
                         }),
                 );
                 tracing::info!(
@@ -4808,6 +5338,10 @@ impl ExtentNode {
                     owner: RefCell::new(OwnerMailbox::default()),
                     corrupt_meta: AtomicBool::new(corrupt_meta),
                     content_ck: RefCell::new(CachedChecksums::NotLoaded),
+                    scrub_block: AtomicU64::new(0),
+                    scrub_probe_not_before: AtomicU64::new(0),
+                    scrub_backfill_len: RefCell::new(None),
+                    scrub_backfill_blocks: RefCell::new(Vec::new()),
                 });
                 entry.note_shard_file(shard_index, shard_len);
                 self.extents.insert(extent_id, entry);
@@ -5378,6 +5912,10 @@ impl ExtentNode {
                 owner: RefCell::new(OwnerMailbox::default()),
                 corrupt_meta: AtomicBool::new(false),
                 content_ck: RefCell::new(CachedChecksums::NotLoaded),
+                scrub_block: AtomicU64::new(0),
+                scrub_probe_not_before: AtomicU64::new(0),
+                scrub_backfill_len: RefCell::new(None),
+                scrub_backfill_blocks: RefCell::new(Vec::new()),
             }),
         );
         self.extents
@@ -5454,6 +5992,18 @@ impl ExtentNode {
         extent_id: u64,
         extent: &Rc<ExtentEntry>,
         ex: &ExtentInfo,
+    ) -> Result<bool, String> {
+        self.apply_extent_meta_durable_with(extent_id, extent, ex, SealDescribe::Now)
+            .await
+    }
+
+    /// The same seal-apply, saying whether it may also describe the content.
+    async fn apply_extent_meta_durable_with(
+        &self,
+        extent_id: u64,
+        extent: &Rc<ExtentEntry>,
+        ex: &ExtentInfo,
+        describe: SealDescribe,
     ) -> Result<bool, String> {
         let sealed_changed = Self::apply_extent_meta(extent, ex);
         // P0-A (coco issue 2): persist whenever the resulting state is SEALED —
@@ -5560,7 +6110,7 @@ impl ExtentNode {
             // turn a hardening feature into an availability risk. This method
             // is idempotent and re-runs on every manager contact, so a missing
             // sidecar is retried rather than lost.
-            if !ex.ec_converted {
+            if !ex.ec_converted && describe == SealDescribe::Now {
                 if let Err(e) = self
                     .write_extent_checksums(extent_id, extent, ex.sealed_length)
                     .await
@@ -5689,14 +6239,59 @@ impl ExtentNode {
         ck: &extent_cksum::ExtentChecksums,
     ) -> Result<(), String> {
         let buf = ck.encode(extent_id);
+        // A per-call staging name. The seal path and the scrub can both be
+        // describing this extent (the scrub gives up when the seal wins, but
+        // only after it has already started), and one shared `.tmp` lets them
+        // rename each other's half-written file into place.
+        //
+        // The name being unique is exactly why the failure path must unlink it:
+        // a shared name is self-limiting because the next attempt truncates it,
+        // and nothing else will ever touch this one. The paths that fail here
+        // are failing disks, which is where accumulating a file per attempt is
+        // least affordable.
+        static CK_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = CK_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let mut tmp = path.to_path_buf().into_os_string();
-        tmp.push(".tmp");
+        tmp.push(format!(".tmp{seq}"));
         let tmp_path = std::path::PathBuf::from(tmp);
+        let staged = Self::stage_checksums(&tmp_path, path, buf, extent_id).await;
+        if staged.is_err() {
+            match compio::fs::remove_file(&tmp_path).await {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(
+                        extent_id,
+                        tmp = %tmp_path.display(),
+                        error = %e,
+                        "leaked a checksum staging file"
+                    );
+                }
+            }
+        }
+        staged?;
+        tracing::debug!(
+            extent_id,
+            sealed_length = ck.sealed_length,
+            blocks = ck.blocks.len(),
+            "wrote the content checksum sidecar for a sealed extent"
+        );
+        Ok(())
+    }
+
+    /// tmp → fsync → rename → parent-dir fsync. Split out so every failure in
+    /// it has one place to clean up after.
+    async fn stage_checksums(
+        tmp_path: &std::path::Path,
+        path: &std::path::Path,
+        buf: Vec<u8>,
+        extent_id: u64,
+    ) -> Result<(), String> {
         let mut f = compio::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
-            .open(&tmp_path)
+            .open(tmp_path)
             .await
             .map_err(|e| format!("open ck tmp for extent {extent_id}: {e}"))?;
         let BufResult(result, _) = f.write_all_at(buf, 0).await;
@@ -5705,7 +6300,7 @@ impl ExtentNode {
             .await
             .map_err(|e| format!("sync ck tmp for extent {extent_id}: {e}"))?;
         drop(f);
-        compio::fs::rename(&tmp_path, path)
+        compio::fs::rename(tmp_path, path)
             .await
             .map_err(|e| format!("rename ck for extent {extent_id}: {e}"))?;
         if let Some(dir) = path.parent() {
@@ -5716,13 +6311,54 @@ impl ExtentNode {
                 .await
                 .map_err(|e| format!("fsync ck dir for extent {extent_id}: {e}"))?;
         }
-        tracing::debug!(
-            extent_id,
-            sealed_length = ck.sealed_length,
-            blocks = ck.blocks.len(),
-            "wrote the content checksum sidecar for a sealed extent"
-        );
         Ok(())
+    }
+
+    /// Verify an extent's whole content against its checksums.
+    ///
+    /// Used where a mismatch must stop an operation rather than merely fail one
+    /// read: EC conversion reads this extent and turns it into parity, which
+    /// makes whatever it read canonical across the entire stripe.
+    ///
+    /// COST: this is a second full read of the extent, on top of the one the
+    /// encode itself does. Checking inside the encode loop instead would be
+    /// nearly free — a 64 MiB stripe covers whole blocks — but only for the
+    /// interior; the two edge blocks of each shard-sized sub-range still need
+    /// their own reads, and getting that arithmetic wrong verifies nothing
+    /// while looking like it verifies everything. The conversion is a
+    /// background op with a concurrency cap of one, so it pays the simple
+    /// version.
+    async fn verify_whole_extent_content(
+        &self,
+        extent_id: u64,
+        entry: &Rc<ExtentEntry>,
+    ) -> ContentCheck {
+        let Some(ck) = self.cached_content_checksums(extent_id, entry).await else {
+            return ContentCheck::Undescribed;
+        };
+        let file = match self.extent_file(entry).await {
+            Ok(f) => f,
+            Err(e) => return ContentCheck::Unreadable(e),
+        };
+        for i in 0..ck.blocks.len() {
+            let (start, end) = extent_cksum::block_range(i, ck.block_bytes, ck.sealed_length);
+            let buf = match file_pread(Rc::clone(&file), start, (end - start) as usize).await {
+                Ok(b) => b,
+                Err(e) => {
+                    return ContentCheck::Unreadable(format!(
+                        "read block {i} of extent {extent_id}: {e}"
+                    ))
+                }
+            };
+            if let Err(bad) = ck.verify_read(start, &buf) {
+                return ContentCheck::Rotten(format!(
+                    "extent {extent_id} block {} fails its content checksum \
+                     (expected {:#010x}, found {:#010x})",
+                    bad.block, bad.expected, bad.found
+                ));
+            }
+        }
+        ContentCheck::Clean
     }
 
     /// The cached `.ck` for a sealed extent, loading it at most once.
@@ -7839,6 +8475,10 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                 owner: RefCell::new(OwnerMailbox::default()),
                 corrupt_meta: AtomicBool::new(false),
                 content_ck: RefCell::new(CachedChecksums::NotLoaded),
+                scrub_block: AtomicU64::new(0),
+                scrub_probe_not_before: AtomicU64::new(0),
+                scrub_backfill_len: RefCell::new(None),
+                scrub_backfill_blocks: RefCell::new(Vec::new()),
             }),
         );
 
@@ -7955,9 +8595,17 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
         // converges via re-dispatch → the EN's idempotent-skip adopt path.
         let ec_done = self.done.take_ec();
 
+        // Drain scrub findings on the same at-most-once contract. A report lost
+        // in transit is re-found — the sweep is endless and rot does not heal —
+        // but not promptly: one block per extent per pass means a large extent
+        // on a busy shard comes back around in hours. Losing a finding costs
+        // that much delay in a rebuild, not the finding.
+        let scrub_rot = self.done.take_scrub_rot();
+
         Ok(rkyv_encode(&DfResp {
             done_tasks,
             ec_done,
+            scrub_rot,
             disk_status,
             // M1b: echo our own identity so the manager can
             // self-heal stored-location drift + detect pod-IP reuse. Empty when
@@ -9280,6 +9928,44 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                 );
             }
 
+            // Do not turn rot into parity. This coordinator is about to read
+            // its local `.dat` and encode it, and the manager's layout flip
+            // then makes those bytes canonical for the whole stripe — the one
+            // step that turns a single damaged replica into damage no other
+            // replica can correct.
+            //
+            // Placed AFTER both the seal sync and the peer-copy, deliberately,
+            // and each for its own reason. The sidecar is only readable once
+            // this node knows the extent is sealed, which for a rolled tail
+            // happens above. And a short copy is a NORMAL state here — the
+            // peer-copy exists because seal-over-reachable legitimately seals
+            // above a lagging member's length — so checking before it would
+            // read past EOF and refuse the conversion as "damaged", forever,
+            // on a coordinator that was about to repair itself.
+            //
+            // A read failure is reported as its own thing rather than folded
+            // into "fails its checksum": that message names the disk as the
+            // liar, and the manager retries a marker whose extent then never
+            // converts and never releases.
+            match self.verify_whole_extent_content(extent_id, &entry).await {
+                ContentCheck::Clean | ContentCheck::Undescribed => {}
+                ContentCheck::Rotten(why) => {
+                    tracing::error!(
+                        extent_id,
+                        "REFUSING to EC-convert an extent whose content fails its checksum — \
+                         encoding it would make the damage canonical across the stripe: {why}"
+                    );
+                    return Err((StatusCode::FailedPrecondition, why));
+                }
+                ContentCheck::Unreadable(why) => {
+                    tracing::error!(
+                        extent_id,
+                        "cannot verify this extent's content before EC-converting it: {why}"
+                    );
+                    return Err((StatusCode::Unavailable, why));
+                }
+            }
+
             {
                 // ── Phase 1 (prepare): CHUNKED RS-encode + streamed fanout ──
                 //
@@ -9664,6 +10350,26 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
             .map(|_| ())
     }
 
+    /// Run ONE scrub pass with a fixed budget, for tests that need the walk to
+    /// happen at a known point rather than on its own schedule. Returns the
+    /// extents whose rot the pass found.
+    pub async fn test_scrub_once(&self, budget_bytes: u64) -> Vec<u64> {
+        // Each call is a distinct tick. A fixed one would put every extent
+        // into its probe backoff after the first call and make a second call
+        // silently do nothing.
+        static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tick = TICK.fetch_add(SCRUB_PROBE_BACKOFF_TICKS + 1, Ordering::SeqCst) + 1;
+        let mut budget = extent_scrub::ScrubBudget::new(budget_bytes);
+        budget.refill(1000);
+        let mut cursor = extent_scrub::ScrubCursor::default();
+        self.scrub_once(&mut budget, &mut cursor, tick).await;
+        self.done
+            .peek_scrub_rot()
+            .into_iter()
+            .map(|r| r.extent_id)
+            .collect()
+    }
+
     /// Run ONE reconcile round against the manager, for integration tests that
     /// need the production path — including where the staging tick is sampled —
     /// rather than the applier alone. The real trigger is a 5-minute sweep.
@@ -10024,6 +10730,279 @@ mod sealed_append_guard_tests {
     ///
     /// The `.meta` CRC cannot do this: it covers its own 48 metadata bytes, so
     /// it still validates perfectly while the value region rots underneath it.
+    /// A rebuild landing mid-description must not leave a spliced sidecar.
+    ///
+    /// The companion to the short-replica gate, for the case the gate cannot
+    /// see: a FULL-LENGTH replica whose bytes are wrong is describable, so the
+    /// backfill starts hashing it, and a recovery rebuild then replaces the
+    /// whole file underneath. Resuming would persist the old block 0 in front
+    /// of the new blocks 1..n — a description of a file that never existed,
+    /// after which this healthy rebuilt copy is reported as rotted forever.
+    #[compio::test]
+    async fn a_rebuild_landing_mid_description_restarts_it_rather_than_splicing() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5163u64;
+        let block = extent_cksum::CK_BLOCK_BYTES as usize;
+        let good: Vec<u8> = (0..(block * 3)).map(|i| (i % 233) as u8).collect();
+        let mut damaged = good.clone();
+        damaged[..block].fill(0xCD);
+
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(damaged))
+            .await
+            .expect("write");
+        entry.has_dat.store(true, Ordering::SeqCst);
+        entry.note_durable_install(good.len() as u64);
+        entry.sealed.store(true, Ordering::SeqCst);
+        entry
+            .sealed_length
+            .store(good.len() as u64, Ordering::SeqCst);
+        entry.eversion.store(2, Ordering::SeqCst);
+
+        // One block per tick, so the description is genuinely mid-flight.
+        node.test_scrub_once(block as u64).await;
+        assert_eq!(
+            entry.scrub_backfill_blocks.borrow().len(),
+            1,
+            "the fixture needs a half-built description to interrupt"
+        );
+
+        // A recovery rebuild replaces the whole file with the canonical bytes.
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(good.clone()))
+            .await
+            .expect("rebuild");
+        entry.note_durable_install(good.len() as u64);
+
+        for _ in 0..8 {
+            assert!(
+                node.test_scrub_once(block as u64).await.is_empty(),
+                "the rebuilt copy is canonical and must never be reported"
+            );
+        }
+        let ck = node
+            .load_extent_checksums(eid, &entry, good.len() as u64)
+            .await
+            .expect("the rebuilt copy must end up described");
+        assert_eq!(
+            ck.verify_read(0, &good),
+            Ok(3),
+            "the sidecar must describe the rebuilt bytes, not a splice"
+        );
+    }
+
+    /// A replica that LOST its tail is rot, and only the scrub can say so.
+    ///
+    /// No checksum mismatches when the bytes are simply gone — the read EOFs
+    /// instead — and `re_avali` only ever inspects slots whose bit is already
+    /// clear, so a full member that silently shrank is invisible to every other
+    /// mechanism. The sidecar is the proof it once covered the offset, which is
+    /// what makes the failed read evidence rather than noise.
+    #[compio::test]
+    async fn a_replica_that_lost_its_tail_is_reported_not_logged_and_forgotten() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5162u64;
+        let block = extent_cksum::CK_BLOCK_BYTES as usize;
+        let content: Vec<u8> = (0..(block * 2)).map(|i| (i % 239) as u8).collect();
+
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(content.clone()))
+            .await
+            .expect("write");
+        entry.has_dat.store(true, Ordering::SeqCst);
+        entry.note_durable_install(content.len() as u64);
+        let ex = ExtentInfo {
+            extent_id: eid,
+            sealed: true,
+            sealed_length: content.len() as u64,
+            eversion: 2,
+            avali: 0b1,
+            ..Default::default()
+        };
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("seal");
+
+        // The tail goes away underneath a sealed, described extent.
+        let f = node.extent_file(&entry).await.expect("file");
+        f.set_len(block as u64).await.expect("truncate");
+
+        let mut found = Vec::new();
+        for _ in 0..4 {
+            found = node.test_scrub_once(8 * 1024 * 1024).await;
+            if !found.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            found,
+            vec![eid],
+            "a described block that can no longer be read is a finding"
+        );
+    }
+
+    /// A replica being REPAIRED must not have its pre-repair bytes described.
+    ///
+    /// The backfill runs a block at a time across many ticks, so a repair can
+    /// land in the middle of one. Without a durability gate it hashes the
+    /// blocks the short file happens to hold, stops at EOF, and resumes after
+    /// the repair — persisting a sidecar that is half old content and half new.
+    /// Nothing on disk ever matched it, so from then on this HEALTHY copy fails
+    /// its own checksum on every scrub and gets isolated for it: the repair
+    /// path manufacturing the corruption report.
+    #[compio::test]
+    async fn a_replica_repaired_mid_description_is_not_described_from_what_it_replaced() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5160u64;
+        let block = extent_cksum::CK_BLOCK_BYTES as usize;
+        // Two and a half blocks, so a short copy covers whole blocks and the
+        // rest arrives only with the repair.
+        let good: Vec<u8> = (0..(block * 5 / 2)).map(|i| (i % 251) as u8).collect();
+        let stale: Vec<u8> = vec![0xAB; block];
+
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(stale))
+            .await
+            .expect("write the short, pre-repair copy");
+        entry.has_dat.store(true, Ordering::SeqCst);
+        // A short replica mid-repair: sealed above what this copy holds, which
+        // is the normal state under seal-over-reachable.
+        entry.len.store(block as u64, Ordering::SeqCst);
+        entry.coalescer.last_synced.store(block as u64, Ordering::SeqCst);
+        entry.sealed.store(true, Ordering::SeqCst);
+        entry
+            .sealed_length
+            .store(good.len() as u64, Ordering::SeqCst);
+        entry.eversion.store(2, Ordering::SeqCst);
+
+        for _ in 0..4 {
+            assert!(
+                node.test_scrub_once(8 * 1024 * 1024).await.is_empty(),
+                "a short replica is not evidence of rot"
+            );
+        }
+        assert!(
+            node.load_extent_checksums(eid, &entry, good.len() as u64)
+                .await
+                .is_none(),
+            "a replica that does not hold the sealed content must not be described"
+        );
+        assert!(
+            entry.scrub_backfill_blocks.borrow().is_empty(),
+            "not one block of a short replica may be hashed: the accumulator is \
+             what a later repair would splice onto, and the reads it costs are \
+             spent re-discovering EOF on every tick"
+        );
+
+        // The repair lands: a full copy from a healthy peer.
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(good.clone()))
+            .await
+            .expect("write the repaired copy");
+        entry.note_durable_install(good.len() as u64);
+
+        for _ in 0..4 {
+            assert!(
+                node.test_scrub_once(8 * 1024 * 1024).await.is_empty(),
+                "the repaired copy is healthy and must never be reported"
+            );
+        }
+        let ck = node
+            .load_extent_checksums(eid, &entry, good.len() as u64)
+            .await
+            .expect("the repaired copy must end up described");
+        assert_eq!(
+            ck.verify_read(0, &good),
+            Ok(3),
+            "the sidecar must describe the bytes that are actually there"
+        );
+    }
+
+    /// A short coordinator must reach its peer-copy, not be refused as damaged.
+    ///
+    /// The pre-encode check exists to stop rot becoming parity, but a `.dat`
+    /// shorter than `sealed_length` is a NORMAL state here — the peer-copy two
+    /// lines below exists precisely because seal-over-reachable seals above a
+    /// lagging member. Checking first reads past EOF and calls it a checksum
+    /// failure, so the manager re-dispatches a marker whose extent can never
+    /// convert and never releases, and the log blames the disk.
+    #[compio::test]
+    async fn a_short_coordinator_is_sent_to_its_peer_copy_not_refused_as_damaged() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5161u64;
+        let block = extent_cksum::CK_BLOCK_BYTES as usize;
+        let content: Vec<u8> = (0..(block * 2)).map(|i| (i % 241) as u8).collect();
+
+        // Describe it while the copy is whole…
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        let f = node.extent_file(&entry).await.expect("file");
+        file_pwrite_chunked(f, 0, Bytes::from(content.clone()))
+            .await
+            .expect("write");
+        entry.has_dat.store(true, Ordering::SeqCst);
+        entry.note_durable_install(content.len() as u64);
+        let ex = ExtentInfo {
+            extent_id: eid,
+            sealed: true,
+            sealed_length: content.len() as u64,
+            eversion: 2,
+            avali: 0b1,
+            ..Default::default()
+        };
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("seal");
+        assert!(
+            node.load_extent_checksums(eid, &entry, content.len() as u64)
+                .await
+                .is_some(),
+            "the fixture needs a sidecar for the check to have anything to say"
+        );
+
+        // …then lose its tail, which is what the peer-copy repairs.
+        let f = node.extent_file(&entry).await.expect("file");
+        f.set_len(block as u64).await.expect("truncate");
+        entry.len.store(block as u64, Ordering::SeqCst);
+
+        let req = ConvertToEcReq {
+            extent_id: eid,
+            data_shards: 2,
+            parity_shards: 1,
+            target_addrs: vec!["127.0.0.1:1".into(), "127.0.0.1:2".into(), "127.0.0.1:3".into()],
+            eversion: 3,
+            owner_epoch: 0,
+            attempt_nonce: 0,
+        };
+        let (code, message) = node
+            .run_convert_to_ec_task(req)
+            .await
+            .expect_err("no manager is reachable, so the peer-copy cannot proceed");
+        assert_eq!(
+            code,
+            StatusCode::Unavailable,
+            "a short copy is a repairable state, not a verdict on the disk: {message}"
+        );
+        assert!(
+            message.contains("peer-copy"),
+            "the conversion must have reached the peer-copy; got {message}"
+        );
+    }
+
     #[compio::test]
     async fn sealing_records_content_checksums_that_catch_a_later_flip() {
         let dir = tempfile::tempdir().expect("tmp");
@@ -12429,6 +13408,10 @@ mod discard_shard_file_tests {
             owner: RefCell::new(OwnerMailbox::default()),
             corrupt_meta: AtomicBool::new(false),
             content_ck: RefCell::new(CachedChecksums::NotLoaded),
+            scrub_block: AtomicU64::new(0),
+            scrub_probe_not_before: AtomicU64::new(0),
+            scrub_backfill_len: RefCell::new(None),
+            scrub_backfill_blocks: RefCell::new(Vec::new()),
         }
     }
 
@@ -12561,6 +13544,10 @@ mod classify_ec_shard_tests {
             owner: RefCell::new(OwnerMailbox::default()),
             corrupt_meta: AtomicBool::new(false),
             content_ck: RefCell::new(CachedChecksums::NotLoaded),
+            scrub_block: AtomicU64::new(0),
+            scrub_probe_not_before: AtomicU64::new(0),
+            scrub_backfill_len: RefCell::new(None),
+            scrub_backfill_blocks: RefCell::new(Vec::new()),
         }
     }
 

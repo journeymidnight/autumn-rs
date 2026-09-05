@@ -14,7 +14,7 @@ one — it stores opaque bytes — and that is where the hole is.
 | stream `.meta` | CRC32C over the 48 metadata bytes | `parse_meta` | `crates/stream/src/extent_node.rs:4212` |
 | stream `.dat` content | **none** | — | — |
 | stream `.shard{i}` content | **none** | — | — |
-| background scrub | **does not exist** | — | no match for `scrub` under `crates/stream/` or `crates/manager/` |
+| background scrub | per-shard byte-paced sweep | continuously | `crates/stream/src/extent_scrub.rs` |
 
 Two consequences follow, and the second is the serious one.
 
@@ -132,12 +132,40 @@ Built:
 | **read of whole blocks** on a sealed `.dat` | fail the read; the client's existing rotation serves another replica |
 | **recovery source read** | the same — `read_bytes_chunk` sends `MSG_READ_BYTES` to the source, which lands in that same batched path, and its 256 MiB chunks cover whole blocks |
 
-Planned:
+| **EC conversion, before encoding** | refuse; do not turn corrupt bytes into parity — the layout flip makes whatever it read canonical for the whole stripe. Runs after the coordinator syncs the seal (the checksums are unreadable until this node knows the extent is sealed) AND after its peer-copy (a short `.dat` is a normal, repairable state here, and checking first reads past EOF and calls it damage). A read failure is answered as `Unavailable`, separately from a mismatch: naming the wrong fault sends the operator after the wrong thing |
+| **scrub** | report it on `DfResp`; the manager clears this replica's `avali` bit and the corrupt bitmap makes recovery rebuild it |
 
-| point | what it will do on mismatch |
-|---|---|
-| **EC conversion, before encoding** | refuse; do not turn corrupt bytes into parity. The coordinator today reads its local `.dat` unverified |
-| **scrub** | clear this replica's `avali` bit and report it on `DfResp` |
+The scrub also BACKFILLS, a block at a time across ticks. Demanding a whole
+extent per tick does not work: the default extent is 16 GiB and the budget is a
+few MiB per second, so the tick's budget is spent, nothing is read, and the same
+thing repeats forever. Partial hashes accumulate on the extent entry until the
+extent is covered, then land as one sidecar.
+
+Two refusals bound what may be described, and both exist because this node's
+own sidecar is what later condemns this node's own bytes:
+
+- **Only durable content.** A replica shorter than `sealed_length` — a copy
+  mid-repair, or one legitimately sealed above its own length — is not
+  described at all. Hashing what it holds now and the rest after the repair
+  would persist a description of a file that never existed, after which the
+  copy that was just made healthy fails its own checksum forever.
+- **A rebuild restarts the description.** Installing durable bytes out of band
+  (peer copy, recovery) clears any half-built accumulator, the cached sidecar
+  and the verify cursor, so nothing survives from the content that was
+  replaced.
+
+The scrub's own reads are the only ones under its budget. A seal observed on a
+control path (append refresh, `re_avali`, reconcile) hashes the whole extent
+right there instead — once per extent, on the thing that noticed, which is
+where that cost belongs; the scrub asks for the seal but describes the content
+itself, block by block, so reaching that writer from inside the sweep cannot
+turn a budgeted sweep into a 16 GiB hash.
+
+An extent the scrub cannot describe yet — an open tail, or one sealed empty —
+costs one manager probe and is then not asked about again for ~5 minutes. Open
+tails are permanent candidates that can never be described, so without a
+per-extent cooldown a busy node turns a hardening sweep into steady load on the
+single manager.
 
 Sub-block reads are deliberately **not** verified. Verifying a 4 KiB read would
 require reading and hashing its whole 1 MiB block — 256× amplification on the
@@ -232,7 +260,9 @@ a correctness assertion:
 
 Each leg must be shown to fail without the corresponding change.
 
-Increment 1 (the sidecar format, the seal-time write, and the read check) flips
-none of them, for a reason worth stating: with no seal event on an extent node,
-that flow never writes a sidecar, so there is nothing to verify against. The
-scrub is what makes the legs reachable, and it is also what makes them fail.
+The three legs still pass, and the reason is worth stating rather than reading
+as a gap in the checks: the harness corrupts a replica IMMEDIATELY after sealing,
+before any sweep has described it, so there is nothing to verify against. That is
+the trust-on-first-use window, not a hole in detection. Flipping them means
+letting the scrub describe the clean content first — "described, then rotted,
+then caught" — which is the sequence the feature actually claims.

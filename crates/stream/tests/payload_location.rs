@@ -415,3 +415,174 @@ async fn a_rotted_sealed_extent_is_refused_over_the_wire() {
         "refused for the wrong reason: {err}"
     );
 }
+
+/// The scrub finds rot with NOTHING reading the data.
+///
+/// This is the half the read check cannot cover: a read only verifies blocks it
+/// fully covers, and cold data is never read at all. Archival content could rot
+/// for years and be discovered only when someone finally asked for it — by
+/// which time recovery and EC have had every opportunity to make it canonical.
+#[compio::test]
+async fn the_scrub_finds_rot_with_no_one_reading() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let addr = test_helpers::pick_addr();
+    let node = test_helpers::start_node(d.path(), addr).await;
+    let conn = test_helpers::TestConn::new(addr);
+    let eid = 8802u64;
+    let content: Vec<u8> = (0..(3 * 1024 * 1024u32)).map(|i| (i % 251) as u8).collect();
+
+    assert_eq!(
+        conn.alloc_extent(eid).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    assert_eq!(
+        conn.append(eid, 1, 0, 0, content.clone()).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    node.test_seal_durable(eid, content.len() as u64, 2)
+        .await
+        .expect("seal");
+
+    // A clean sweep finds nothing, however many passes it makes.
+    for _ in 0..4 {
+        assert!(
+            node.test_scrub_once(8 * 1024 * 1024).await.is_empty(),
+            "the scrub reported rot on a clean extent"
+        );
+    }
+
+    // Rot appears in the third block. Nobody reads it.
+    let path = extent_dir(d.path(), eid).join(format!("extent-{eid}.dat"));
+    let mut rotted = content.clone();
+    rotted[2 * 1024 * 1024 + 99] ^= 0x01;
+    std::fs::write(&path, &rotted).expect("rot");
+
+    // The sweep walks a block per pass, so give it enough passes to reach the
+    // damaged one — the point is that it gets there on its own.
+    let mut found = Vec::new();
+    for _ in 0..6 {
+        found = node.test_scrub_once(8 * 1024 * 1024).await;
+        if !found.is_empty() {
+            break;
+        }
+    }
+    assert_eq!(
+        found,
+        vec![eid],
+        "the scrub did not find rot that no read would ever have surfaced"
+    );
+}
+
+/// A scrub tick must END, whatever the candidates are doing.
+///
+/// The skip paths inside the walk neither spend budget nor await, and the
+/// cursor wraps rather than finishing — so a tick where EVERY candidate is
+/// skipped once spun the shard's event loop with no yield. That starves the
+/// very recovery whose in-flight marker caused the skip, so it never clears and
+/// the spin is permanent; on shard 0 it also starves `df` and the manager
+/// declares the node Suspected. A single recovering extent on a quiet shard is
+/// enough to trigger it, which is an ordinary state, not a corner.
+#[compio::test]
+async fn a_scrub_tick_ends_even_when_every_candidate_is_skipped() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let addr = test_helpers::pick_addr();
+    let node = test_helpers::start_node(d.path(), addr).await;
+    let conn = test_helpers::TestConn::new(addr);
+    let eid = 8803u64;
+
+    assert_eq!(
+        conn.alloc_extent(eid).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    assert_eq!(
+        conn.append(eid, 1, 0, 0, vec![0x42u8; 4096]).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+
+    // The node's only extent is being recovered — so the scrub skips it, and
+    // has nothing else to move on to.
+    node.clone_recovery_inflight().insert(
+        eid,
+        autumn_stream::extent_rpc::RecoveryTask {
+            extent_id: eid,
+            replace_id: 2,
+            node_id: 1,
+            start_time: 0,
+        },
+    );
+
+    // NOTE on how this fails: the timeout below cannot actually fire against the
+    // bug it guards. A spin with no await starves the runtime, so the timer task
+    // never runs either — ablating the fix HANGS this binary until an external
+    // kill rather than failing an assertion. That is still a reliable signal (a
+    // test that never finishes is a failure everywhere), but do not read the
+    // timeout as protection; it only catches a scrub that is slow rather than
+    // stuck.
+    let done = compio::time::timeout(
+        std::time::Duration::from_secs(5),
+        node.test_scrub_once(8 * 1024 * 1024),
+    )
+    .await;
+    assert!(
+        done.is_ok(),
+        "a scrub tick whose every candidate was skipped did not finish in time"
+    );
+}
+
+/// An extent larger than one tick's budget must still get described.
+///
+/// Demanding the whole extent up front does not work: the default extent is
+/// 16 GiB and the budget is a few MiB per second, so the tick's budget is spent,
+/// nothing is read, and the same thing repeats every sweep forever — backfill
+/// silently dead for exactly the extents a real cluster holds. Hashing has to
+/// span ticks.
+#[compio::test]
+async fn a_large_extent_is_described_across_several_ticks() {
+    let d = tempfile::tempdir().expect("tempdir");
+    let addr = test_helpers::pick_addr();
+    let node = test_helpers::start_node(d.path(), addr).await;
+    let conn = test_helpers::TestConn::new(addr);
+    let eid = 8804u64;
+    // Four blocks; the budget below covers one per tick.
+    let content = vec![0x77u8; 4 * 1024 * 1024];
+
+    assert_eq!(
+        conn.alloc_extent(eid).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    assert_eq!(
+        conn.append(eid, 1, 0, 0, content.clone()).await.code,
+        autumn_stream::extent_rpc::CODE_OK
+    );
+    node.test_seal_durable(eid, content.len() as u64, 2)
+        .await
+        .expect("seal");
+
+    // Drop the sidecar the seal wrote and reopen, so the scrub faces a sealed
+    // extent it has never described — the rolled-tail case.
+    let ck = extent_dir(d.path(), eid).join(format!("extent-{eid}.ck"));
+    assert!(ck.exists(), "precondition: the seal described it");
+    std::fs::remove_file(&ck).expect("drop the sidecar");
+    drop(conn);
+    // A fresh node over the same data dir: it reloads the extent as sealed from
+    // `.meta` and has no cached view of the sidecar that is now gone.
+    let node2 = autumn_stream::ExtentNode::new(autumn_stream::ExtentNodeConfig::new(
+        d.path().to_path_buf(),
+        1,
+    ))
+    .await
+    .expect("reopen node");
+
+    // One block per tick: it must take several, and it must get there.
+    for _ in 0..8 {
+        node2.test_scrub_once(1024 * 1024).await;
+        if ck.exists() {
+            break;
+        }
+    }
+    assert!(
+        ck.exists(),
+        "an extent bigger than one tick's budget was never described — backfill \
+         cannot make partial progress"
+    );
+}
