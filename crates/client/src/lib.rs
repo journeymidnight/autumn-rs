@@ -3996,16 +3996,155 @@ impl ClusterClient {
         results
     }
 
-    /// batched deletes — pure client-side fan-out (no server `MSG_BATCH_*`),
-    /// `buffered` over the per-partition multiplexed connections. No bulk (delete is
-    /// tiny). Result `i` matches `keys[i]` (`Ok(())` even if the key didn't exist,
-    /// same as `delete`; `Err` = that item's RPC failed, others still ran).
+    /// batched deletes — one `MSG_BATCH_DELETE` per owning partition (see
+    /// `batch_delete`). No bulk variant: a delete carries no value, so there is
+    /// no tail to keep out of the rkyv payload. Result `i` matches `keys[i]`
+    /// (`Ok(())` even if the key didn't exist, same as `delete`; `Err` = that
+    /// item failed, others still ran).
     pub async fn delete_many(&self, keys: &[&[u8]]) -> Vec<std::result::Result<(), AutumnError>> {
-        // delete is a mutation → reuse the write-side concurrency cap.
-        let futs = keys
-            .iter()
-            .map(|&key| async move { self.delete(key).await });
-        fan_out_collect(futs, BATCH_PUT_DEFAULT_CONCURRENCY).await
+        self.batch_delete(keys, WriteLease::ANON).await
+    }
+
+    /// Lease-fenced `delete_many` — every key is stamped with the SAME
+    /// `(inode_hint, lease_epoch)`. A fenced key returns `AutumnError::Fenced`
+    /// in its own slot; the rest of the batch still runs.
+    pub async fn delete_many_fenced(
+        &self,
+        keys: &[&[u8]],
+        lease: WriteLease,
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        self.batch_delete(keys, lease).await
+    }
+
+    /// One `MSG_BATCH_DELETE` per owning partition.
+    ///
+    /// This used to be a pure client-side fan-out of single-key deletes. That
+    /// looked like N concurrent requests and was not: a client holds ONE
+    /// multiplexed connection per partition, and deletes usually arrive in key
+    /// order, so consecutive keys share a partition and the whole fan-out
+    /// serialised onto one connection at that connection's in-flight limit.
+    /// Measured 3.10 keys per WAL append, against ~31 for the batched put that
+    /// packs its ops into one frame.
+    ///
+    /// The win is extent-node load rather than latency: an append is a
+    /// replicated write, so ten times the appends for the same keys is ten
+    /// times the work asked of the extent nodes.
+    pub(crate) async fn batch_delete(
+        &self,
+        keys: &[&[u8]],
+        lease: WriteLease,
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        let mut results: Vec<std::result::Result<(), AutumnError>> =
+            (0..keys.len()).map(|_| Ok(())).collect();
+        // (idx, bound key). Bound exactly once, as `batch_put` does — routing
+        // and the payload both read the same bytes.
+        let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>)>> =
+            std::collections::HashMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            let bk = match self.binding.bind_key(k) {
+                Ok(b) => b,
+                Err(e) => {
+                    results[i] = Err(e);
+                    continue;
+                }
+            };
+            let part_id = match self.resolve_key(&bk).await {
+                Ok((pid, _addr)) => pid,
+                Err(e) => {
+                    results[i] = Err(AutumnError::RoutingError(e.to_string()));
+                    continue;
+                }
+            };
+            groups.entry(part_id).or_default().push((i, bk));
+        }
+        for (part_id, group) in groups {
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            let ops: Vec<partition_rpc::BatchDeleteOp> = group
+                .iter()
+                .map(|(_, k)| partition_rpc::BatchDeleteOp {
+                    key: k.clone(),
+                    inode_hint: lease.inode_hint,
+                    lease_epoch: lease.lease_epoch,
+                })
+                .collect();
+            let payload = rkyv_encode(&partition_rpc::BatchDeleteReq {
+                part_id,
+                region_epoch,
+                ops,
+            });
+            let resp_bytes = match self
+                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_DELETE, payload)
+                .await
+            {
+                Ok(b) => b,
+                Err(AutumnError::PreconditionFailed(_)) => {
+                    // Stale routing. Same fallback `batch_put` makes: refresh,
+                    // then retry this group one key at a time, because after a
+                    // split the keys may no longer share a partition and the
+                    // single-key path re-routes natively.
+                    // `delete_opts`, NOT `delete`: these keys are ALREADY
+                    // bound, and `delete` binds again -- under a scoped
+                    // binding that targets `{prefix}{prefix}{key}`, which does
+                    // not exist, and deleting a missing key reports Ok. The
+                    // batch would claim success having removed nothing. Going
+                    // through `delete_opts` also keeps the lease, so a fenced
+                    // caller stays fenced across a split.
+                    let _ = self.refresh_regions().await;
+                    for (idx, k) in group.iter() {
+                        results[*idx] = self.delete_opts(k, lease).await;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    let s = e.to_string();
+                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                        AutumnError::ConnectionError(s.clone())
+                    });
+                    continue;
+                }
+            };
+            let resp: partition_rpc::BatchDeleteResp = match rkyv_decode(&resp_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                        AutumnError::ServerError(e.clone())
+                    });
+                    continue;
+                }
+            };
+            if resp.code != partition_rpc::CODE_OK {
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    code_to_error(resp.code, resp.message.clone())
+                });
+                continue;
+            }
+            if resp.statuses.len() != group.len() {
+                // A reply that does not describe the request is not something
+                // to interpret — the two sides disagree about what was sent.
+                let mismatch = format!(
+                    "batch_delete: statuses len {} != group len {}",
+                    resp.statuses.len(),
+                    group.len()
+                );
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    AutumnError::ServerError(mismatch.clone())
+                });
+                continue;
+            }
+            for ((idx, _), status) in group.iter().zip(resp.statuses.iter()) {
+                if *status == partition_rpc::CODE_FENCED {
+                    results[*idx] = Err(AutumnError::Fenced(format!(
+                        "batch_delete op fenced (ino={}, epoch={})",
+                        lease.inode_hint, lease.lease_epoch
+                    )));
+                } else if *status != 0 {
+                    results[*idx] = Err(AutumnError::ServerError(format!(
+                        "batch_delete op status={status}"
+                    )));
+                }
+            }
+        }
+        results
     }
 
     /// batched metadata lookups — pure client-side fan-out, `buffered` over

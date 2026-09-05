@@ -192,6 +192,54 @@ pub const MSG_BATCH_PUT_BULK: u8 = 0x5A;
 /// single-writer group-commit actor.
 pub const MSG_BATCH_GET_BULK: u8 = 0x5B;
 
+/// Batched DELETE: N keys for ONE partition in a single frame.
+///
+/// `delete_many` used to be pure client-side fan-out — one `MSG_DELETE` per
+/// key, capped at `BATCH_PUT_DEFAULT_CONCURRENCY` in flight. That looked like N
+/// concurrent requests and was not: a client holds ONE multiplexed connection
+/// per partition, so keys sharing a partition queue on one connection at its
+/// in-flight limit. See the v36 entry in `WIRE_VERSION_FINGERPRINTS` for the
+/// measured keys-per-append figures this was drawn from.
+///
+/// The cost it addresses is EXTENT-NODE load rather than latency: an append is
+/// a replicated write, so more appends for the same keys is more work asked of
+/// the extent nodes. (That deletes usually arrive in key order, and so land in
+/// one partition, is inferred from how callers scan — not separately measured.)
+///
+/// Shape mirrors `MSG_BATCH_PUT` deliberately — same per-op fencing, same
+/// per-op range admission, same "one status byte per op" reply — so the two
+/// paths stay readable against each other. There is no bulk variant: a delete
+/// carries no value, so there is no tail to keep out of the rkyv payload.
+pub const MSG_BATCH_DELETE: u8 = 0x5C;
+
+/// One op inside a `BatchDeleteReq`. Carries its own fence identity because a
+/// batch may span inodes (a directory unlink walks many), exactly as
+/// `BatchPutOp` does.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchDeleteOp {
+    pub key: Vec<u8>,
+    /// See `DeleteReq.inode_hint`. 0 = anonymous (skip fencing).
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchDeleteReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub ops: Vec<BatchDeleteOp>,
+}
+
+/// Reply to `MSG_BATCH_DELETE`. Same shape as `BatchPutResp` and read the same
+/// way: `statuses[i]` is op `i`'s result, and is empty only when the failure
+/// was batch-level (wrong partition, stale epoch) rather than per-op.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchDeleteResp {
+    pub code: u8,
+    pub message: String,
+    pub statuses: Vec<u8>,
+}
+
 /// redirect GET. Same request shape as MSG_GET (`GetReq`). For a
 /// large (>= 64 KiB) full-value ValuePointer read the PS answers with a
 /// DESCRIPTOR (extent + the value's exact byte range inside the extent +
@@ -991,6 +1039,9 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_BATCH_PUT => rkyv_decode::<BatchPutReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
+        MSG_BATCH_DELETE => rkyv_decode::<BatchDeleteReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         MSG_BATCH_GET_BULK => rkyv_decode::<BatchGetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
@@ -1022,6 +1073,7 @@ mod msg_type_tests {
             MSG_PUT_BULK,
             MSG_BATCH_PUT,
             MSG_BATCH_PUT_BULK,
+            MSG_BATCH_DELETE,
             MSG_BATCH_GET_BULK,
             MSG_GET_REDIRECT,
             MSG_GET_REDIRECT_MANY,
@@ -1065,6 +1117,26 @@ mod msg_type_tests {
             }],
         });
         assert_eq!(extract_part_id(MSG_BATCH_PUT_BULK, &payload), 77);
+    }
+
+    /// Same regression class as the bulk case above, and the one the batch
+    /// delete shipped with: with no `MSG_BATCH_DELETE` arm, `extract_part_id`
+    /// falls to `_ => 0`, the PS conn layer compares 0 against the partition it
+    /// serves, and every frame comes back NotFound. Partition ids start at 1,
+    /// so the compare can never accidentally succeed -- `delete_many` fails
+    /// every key while looking like a routing problem.
+    #[test]
+    fn extract_part_id_covers_batch_delete() {
+        let payload = rkyv_encode(&BatchDeleteReq {
+            part_id: 77,
+            region_epoch: 3,
+            ops: vec![BatchDeleteOp {
+                key: b"k".to_vec(),
+                inode_hint: 0,
+                lease_epoch: 0,
+            }],
+        });
+        assert_eq!(extract_part_id(MSG_BATCH_DELETE, &payload), 77);
     }
 }
 

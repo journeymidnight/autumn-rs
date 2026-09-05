@@ -385,6 +385,19 @@ pub fn authz_check(
             }
             None
         }
+        // Every key, exactly as MSG_BATCH_PUT. Without this arm the match falls
+        // to `_ => None`, which ADMITS -- so a batched delete would reach any
+        // tenant's protected prefix with no capability at all, which is the
+        // failure this function's doc names.
+        partition_rpc::MSG_BATCH_DELETE => {
+            let r = partition_rpc::rkyv_decode::<partition_rpc::BatchDeleteReq>(payload).ok()?;
+            for op in &r.ops {
+                if let Some(d) = check_key(&op.key, principal, inner, now) {
+                    return Some(d);
+                }
+            }
+            None
+        }
         // The zero-copy batch carries its keys in ctrl exactly like the inline
         // form; only the values moved to the frame tail, and authz never looked
         // at values. `payload` here is the ctrl block.
@@ -571,6 +584,62 @@ mod tests {
     }
 
     #[test]
+    /// A batched delete must be gated key by key, like every other keyed RPC.
+    ///
+    /// This is the arm whose ABSENCE is the danger: `authz_check` ends in
+    /// `_ => None`, and `None` ADMITS. A new keyed opcode with no arm here is
+    /// not merely ungated, it is silently ungated -- there is no error, no log,
+    /// and the write succeeds against any tenant's protected prefix. The batch
+    /// delete shipped that way until this test existed.
+    ///
+    /// ABLATION: delete the `MSG_BATCH_DELETE` arm from `authz_check` and the
+    /// cross-tenant half of this test goes green, which is the whole problem.
+    #[test]
+    fn authz_check_gates_every_key_of_a_batch_delete() {
+        let inner = inner_with(vec![]);
+        let p = acme();
+        let now = 999_000;
+
+        let mine = rkyv_encode(&partition_rpc::BatchDeleteReq {
+            part_id: 1,
+            region_epoch: 0,
+            ops: vec![partition_rpc::BatchDeleteOp {
+                key: b"acme/mem/doc/1".to_vec(),
+                inode_hint: 0,
+                lease_epoch: 0,
+            }],
+        });
+        assert!(
+            authz_check(partition_rpc::MSG_BATCH_DELETE, &mine, Some(&p), &inner, now).is_none(),
+            "own-tenant key must be admitted"
+        );
+
+        // One foreign key among otherwise-permitted ones must refuse the
+        // frame: the arm returns on the FIRST denial, so a batch cannot be
+        // used to smuggle a key past a per-key check.
+        let smuggled = rkyv_encode(&partition_rpc::BatchDeleteReq {
+            part_id: 1,
+            region_epoch: 0,
+            ops: vec![
+                partition_rpc::BatchDeleteOp {
+                    key: b"acme/mem/doc/1".to_vec(),
+                    inode_hint: 0,
+                    lease_epoch: 0,
+                },
+                partition_rpc::BatchDeleteOp {
+                    key: b"other/mem/doc/1".to_vec(),
+                    inode_hint: 0,
+                    lease_epoch: 0,
+                },
+            ],
+        });
+        assert!(
+            authz_check(partition_rpc::MSG_BATCH_DELETE, &smuggled, Some(&p), &inner, now)
+                .is_some(),
+            "a cross-tenant key anywhere in the batch must refuse the frame"
+        );
+    }
+
     fn authz_check_dispatch_get_and_put() {
         let inner = inner_with(vec![]);
         let p = acme();

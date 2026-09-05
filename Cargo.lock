@@ -306,8 +306,11 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "libc",
+ "proc-macro2",
+ "quote",
  "rancor",
  "rkyv",
+ "syn",
  "thiserror 2.0.18",
  "tracing",
 ]

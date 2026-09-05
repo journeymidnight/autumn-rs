@@ -1891,18 +1891,37 @@ pub(crate) struct BatchPutAccumulator {
     /// One byte per op: 0 = OK, non-zero = error code.
     statuses: RefCell<Vec<u8>>,
     /// Count-down: starts at N, decrements per `record`. The op that
-    /// transitions it to 0 ALSO encodes + sends the BatchPutResp.
+    /// transitions it to 0 ALSO encodes + sends the response.
     remaining: Cell<usize>,
+    /// Which reply type to encode. Batched put and batched delete accumulate
+    /// identically — one status byte per op — and differ only in the rkyv
+    /// type the last op serialises. Kept as a flag rather than a second
+    /// accumulator so the counting logic cannot drift between the two.
+    kind: BatchKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchKind {
+    Put,
+    Delete,
 }
 
 impl BatchPutAccumulator {
     pub(crate) fn new(outer: oneshot::Sender<HandlerResult>, n: usize) -> Rc<Self> {
+        Self::new_kind(outer, n, BatchKind::Put)
+    }
+    pub(crate) fn new_kind(
+        outer: oneshot::Sender<HandlerResult>,
+        n: usize,
+        kind: BatchKind,
+    ) -> Rc<Self> {
         Rc::new(Self {
             outer: RefCell::new(Some(outer)),
             // Sentinel 0xff means "not yet recorded" — defensively
             // catches a bug where one op's slot is overwritten / missed.
             statuses: RefCell::new(vec![0xff; n]),
             remaining: Cell::new(n),
+            kind,
         })
     }
     pub(crate) fn record(&self, idx: usize, status: u8) {
@@ -1917,12 +1936,20 @@ impl BatchPutAccumulator {
         if r == 0 {
             if let Some(outer) = self.outer.borrow_mut().take() {
                 let statuses = self.statuses.borrow().clone();
-                let resp = partition_rpc::BatchPutResp {
-                    code: CODE_OK,
-                    message: String::new(),
-                    statuses,
+                let bytes = match self.kind {
+                    BatchKind::Put => partition_rpc::rkyv_encode(&partition_rpc::BatchPutResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        statuses,
+                    }),
+                    BatchKind::Delete => {
+                        partition_rpc::rkyv_encode(&partition_rpc::BatchDeleteResp {
+                            code: CODE_OK,
+                            message: String::new(),
+                            statuses,
+                        })
+                    }
                 };
-                let bytes = partition_rpc::rkyv_encode(&resp);
                 let _ = outer.send(Ok(bytes));
             }
         }
@@ -7221,6 +7248,19 @@ async fn handle_incoming_req(
                 let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                 return;
             }
+            partition_rpc::MSG_BATCH_DELETE => {
+                // Same refusal, its own reply type — answering a batched
+                // delete with a `BatchPutResp` would decode as garbage on the
+                // client, which is the failure mode rkyv gives no warning for.
+                let resp = partition_rpc::BatchDeleteResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry"
+                        .to_string(),
+                    statuses: Vec::new(),
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
             _ => {} // reads + SPLIT/MAINTENANCE/MERGE_FREEZE flow through
         }
     }
@@ -7281,6 +7321,17 @@ async fn handle_incoming_req(
         partition_rpc::MSG_BATCH_PUT => {
             let p = part.borrow();
             enqueue_batch_put(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
+        }
+        partition_rpc::MSG_BATCH_DELETE => {
+            let p = part.borrow();
+            enqueue_batch_delete(
                 req,
                 pending,
                 part_region_epoch,
@@ -7715,6 +7766,93 @@ fn enqueue_batch_put(
                 value: Bytes::from(op.value),
                 expires_at: op.expires_at,
             },
+            resp: WriteResponder::BatchPut {
+                accum: Rc::clone(&accum),
+                idx: i,
+            },
+        });
+    }
+}
+
+/// `MSG_BATCH_DELETE` enqueue — N deletes for one partition from one frame.
+///
+/// Structurally the same as `enqueue_batch_put` and deliberately so: per-op
+/// range admission BEFORE the fence check (a mis-routed key must not raise a
+/// floor), per-op fencing that fails only that op, and one shared accumulator
+/// that answers when the last op reports. There is no oversize check, because
+/// a delete carries no value.
+fn enqueue_batch_delete(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    part_rg: Option<&Range>,
+) {
+    let batch = match partition_rpc::rkyv_decode::<partition_rpc::BatchDeleteReq>(&req.payload) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+            return;
+        }
+    };
+    // Batch-level epoch admission. The per-op `in_range` check below is what
+    // catches a key that does not belong here; this catches a stale routing
+    // snapshot for the batch as a whole.
+    if batch.region_epoch != 0 && batch.region_epoch != part_region_epoch {
+        let _ = req.resp_tx.send(Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "stale region_epoch {} for partition {part_id_for_err} (current {part_region_epoch}) — refresh routing",
+                batch.region_epoch
+            ),
+        )));
+        return;
+    }
+    let n = batch.ops.len();
+    if n == 0 {
+        let resp = partition_rpc::BatchDeleteResp {
+            code: CODE_OK,
+            message: String::new(),
+            statuses: Vec::new(),
+        };
+        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+        return;
+    }
+    let accum = BatchPutAccumulator::new_kind(req.resp_tx, n, BatchKind::Delete);
+    for (i, op) in batch.ops.into_iter().enumerate() {
+        if let Some(rg) = part_rg {
+            if !in_range(rg, &op.key) {
+                // Status 2 = out of range, the same code the put path records,
+                // so a caller can read both batch replies with one table.
+                accum.record(i, 2);
+                continue;
+            }
+        }
+        if let Some(floors_cell) = fence_floors {
+            let bump = {
+                let mut floors = floors_cell.borrow_mut();
+                check_and_bump_fence(op.inode_hint, op.lease_epoch, &mut floors)
+            };
+            match bump {
+                Err(_) => {
+                    accum.record(i, CODE_FENCED);
+                    continue;
+                }
+                Ok(true) => {
+                    pending.push(WriteRequest {
+                        op: WriteOp::FenceBump {
+                            ino: op.inode_hint,
+                            epoch: op.lease_epoch,
+                        },
+                        resp: WriteResponder::Fence,
+                    });
+                }
+                Ok(false) => {}
+            }
+        }
+        pending.push(WriteRequest {
+            op: WriteOp::Delete { user_key: op.key },
             resp: WriteResponder::BatchPut {
                 accum: Rc::clone(&accum),
                 idx: i,
@@ -14032,5 +14170,116 @@ mod authz_enforcement_tests {
             let _ = conn.await;
             let _ = loop_h.await;
         });
+    }
+}
+
+#[cfg(test)]
+mod batch_delete_tests {
+    use super::*;
+
+    fn batch_delete_request(
+        keys: &[&[u8]],
+        region_epoch: u64,
+    ) -> (PartitionRequest, oneshot::Receiver<HandlerResult>) {
+        let req = partition_rpc::BatchDeleteReq {
+            part_id: 0,
+            region_epoch,
+            ops: keys
+                .iter()
+                .map(|k| partition_rpc::BatchDeleteOp {
+                    key: k.to_vec(),
+                    inode_hint: 0,
+                    lease_epoch: 0,
+                })
+                .collect(),
+        };
+        let payload = partition_rpc::rkyv_encode(&req);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        (
+            PartitionRequest {
+                msg_type: partition_rpc::MSG_BATCH_DELETE,
+                payload,
+                resp_tx,
+                bulk_value: None,
+            },
+            resp_rx,
+        )
+    }
+
+    /// THE POINT OF THE OPCODE. One frame carrying N keys must produce N
+    /// deletes in ONE `pending` batch, because `pending` is what a single WAL
+    /// append covers. The client-side fan-out it replaces produced one request
+    /// -- and so one append -- per key, which is where the measured 3.10 keys
+    /// per append came from.
+    ///
+    /// ABLATION: make the loop enqueue only the first op of the frame — the
+    /// one-op-per-append shape the client-side fan-out produced — and this
+    /// goes red while the admission tests below stay green.
+    #[test]
+    fn one_frame_enqueues_every_key_into_one_batch() {
+        let keys: Vec<&[u8]> = vec![b"k1", b"k2", b"k3", b"k4", b"k5"];
+        let (req, _rx) = batch_delete_request(&keys, 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        enqueue_batch_delete(req, &mut pending, 0, 0, None, None);
+
+        assert_eq!(
+            pending.len(),
+            5,
+            "5 keys in one frame must enqueue 5 ops into a single pending batch"
+        );
+        let deleted: Vec<&[u8]> = pending
+            .iter()
+            .filter_map(|w| match &w.op {
+                WriteOp::Delete { user_key } => Some(user_key.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted, keys, "every key, in order, as a Delete op");
+    }
+
+    /// An empty batch answers immediately and enqueues nothing -- it must not
+    /// build an accumulator that never fires and leaves the caller hanging.
+    #[compio::test]
+    async fn an_empty_batch_answers_without_enqueuing() {
+        let (req, rx) = batch_delete_request(&[], 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        enqueue_batch_delete(req, &mut pending, 0, 0, None, None);
+
+        assert!(pending.is_empty());
+        let bytes = rx.await.expect("responder dropped").expect("batch-level ok");
+        let resp: partition_rpc::BatchDeleteResp =
+            partition_rpc::rkyv_decode(&bytes).expect("decodes as BatchDeleteResp");
+        assert_eq!(resp.code, CODE_OK);
+        assert!(resp.statuses.is_empty());
+    }
+
+    /// A stale routing snapshot fails the batch as a WHOLE, before any op is
+    /// enqueued -- the same admission `enqueue_batch_put` makes. Deleting a
+    /// subset of a mis-routed batch would be worse than deleting none.
+    #[compio::test]
+    async fn a_stale_epoch_refuses_the_whole_batch() {
+        let keys: Vec<&[u8]> = vec![b"k1", b"k2"];
+        let (req, rx) = batch_delete_request(&keys, 7);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        // Partition is at epoch 9; the request claims 7.
+        enqueue_batch_delete(req, &mut pending, 9, 0, None, None);
+
+        assert!(pending.is_empty(), "nothing may be enqueued on a stale epoch");
+        let err = rx.await.expect("responder dropped").expect_err("must refuse");
+        assert_eq!(err.0, StatusCode::FailedPrecondition);
+    }
+
+    /// `region_epoch == 0` means "unversioned caller", and must be admitted
+    /// rather than compared -- the same escape hatch the put path has.
+    #[test]
+    fn epoch_zero_is_admitted() {
+        let keys: Vec<&[u8]> = vec![b"k1"];
+        let (req, _rx) = batch_delete_request(&keys, 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+        enqueue_batch_delete(req, &mut pending, 42, 0, None, None);
+        assert_eq!(pending.len(), 1);
     }
 }

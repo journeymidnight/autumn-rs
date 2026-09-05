@@ -349,6 +349,31 @@ Client surface: `WriteLease` + `put_fenced`/`put_bulk_fenced`/`put_many_fenced`
 daemon from `OpenedExtents.lease_version`. `MSG_STREAM_PUT` is REMOVED (0x46
 reserved).
 
+### `MSG_BATCH_DELETE` (0x5C) — server-batched Delete
+
+`BatchDeleteReq { part_id, region_epoch, ops: Vec<BatchDeleteOp{key, inode_hint,
+lease_epoch}> }`, answered by `BatchDeleteResp` (same shape as `BatchPutResp`:
+one status byte per op). `enqueue_batch_delete` mirrors `enqueue_batch_put`
+exactly — batch-level epoch admission, then per-op `in_range` recording status
+2, then per-op fencing recording `CODE_FENCED`, then `WriteOp::Delete` sharing
+one `BatchPutAccumulator` (its `BatchKind` decides which reply type the last op
+encodes). No oversize check: a delete has no value.
+
+**Adding an opcode means more than a handler.** This one shipped in review
+missing two arms in files the change never touched, and neither could be seen
+from a test that calls the enqueue function directly:
+
+- `partition_rpc::extract_part_id` — without an arm it returns 0, the conn
+  layer compares 0 against the partition it serves, and every frame comes back
+  as a NotFound misroute. Partition ids start at 1, so it never accidentally
+  matches.
+- `authz::authz_check` — without an arm the match falls to `_ => None`, and
+  `None` ADMITS. A keyed opcode with no arm is not merely ungated, it is
+  SILENTLY ungated: any connection could delete another tenant's protected
+  keys, with no error and no log.
+
+Both now have arms and a regression test that goes red without them.
+
 ### `MSG_BATCH_PUT` (0x53) — server-batched Put
 
 One frame carries `BatchPutReq { part_id, region_epoch,

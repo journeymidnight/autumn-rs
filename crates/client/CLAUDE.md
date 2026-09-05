@@ -184,13 +184,25 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   recv + one memcpy into `dest`; cancel-safe → the size-scaled timeout + replica
   failover are safe); the win over `get_many_into` is ROUTING (PS NIC egress leaves the
   large-value data path), not copy count.
-- `delete_many(keys) → Vec<Result<()>>` / `head_many(keys) → Vec<Result<KeyMeta>>` —
-  batched delete / metadata. Client-side fan-out (no server `MSG_BATCH_*`), no bulk (tiny).
-  `delete_many` uses `BATCH_PUT_DEFAULT_CONCURRENCY`, `head_many` uses
-  `BATCH_GET_DEFAULT_CONCURRENCY`. `head_many` returns `found=false` for a missing key
+- `delete_many(keys) → Vec<Result<()>>` — one `MSG_BATCH_DELETE` (0x5C) per owning
+  partition, same grouping as `put_many`. No bulk variant: a delete carries no value,
+  so there is no tail to keep out of the rkyv payload. It was a client-side fan-out of
+  single-key deletes until v36; that looked like N concurrent requests and was not,
+  because a client holds ONE multiplexed connection per partition and keys that scan
+  together land in the same partition. The gain is EXTENT-NODE load, not latency — an
+  append is a replicated write, so fewer appends for the same keys is less work asked
+  of the extent nodes.
+- `delete_many_fenced(keys, lease)` — the lease-stamped form, mirroring
+  `put_many_fenced`. A fenced key returns `AutumnError::Fenced` in its own slot.
+  ⚠️ Its stale-routing fallback must use `delete_opts` on the ALREADY-BOUND key, never
+  the public `delete`: `delete` binds again, a scoped binding then targets
+  `{prefix}{prefix}{key}`, and deleting a key that does not exist reports `Ok` — the
+  batch would claim success having removed nothing.
+- `head_many(keys) → Vec<Result<KeyMeta>>` — batched metadata, still client-side
+  fan-out at `BATCH_GET_DEFAULT_CONCURRENCY`. Returns `found=false` for a missing key
   (not `Err`).
 
-**Internal-only (`pub(crate)`):** `batch_put` — the server-batched RPC layer for writes,
+**Internal-only (`pub(crate)`):** `batch_put` / `batch_delete` — the server-batched RPC layer for writes,
 reached through `put_many`. Kept `pub(crate)` so unit tests + the delegation layer share
 one implementation; callers should not invoke directly.
 

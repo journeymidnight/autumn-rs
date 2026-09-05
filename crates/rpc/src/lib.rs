@@ -90,8 +90,8 @@ pub const WIRE_FINGERPRINT: &str = env!("AUTUMN_WIRE_FINGERPRINT");
 ///   - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
 ///     `MIN = MAX - 1` — the binary serves both forms during a rolling
 ///     window (the compat window is exactly N ↔ N-1).
-pub const WIRE_VERSION_MIN: u32 = 35;
-pub const WIRE_VERSION_MAX: u32 = 35;
+pub const WIRE_VERSION_MIN: u32 = 36;
+pub const WIRE_VERSION_MAX: u32 = 36;
 
 /// Registry pinning each declared wire version to the schema fingerprint
 /// it was declared against. The companion test fails the build's test run
@@ -527,6 +527,24 @@ pub const WIRE_VERSION_FINGERPRINTS: &[(u32, &str)] = &[
     // Previously ONE declining extent failed the WHOLE batch, measured 3.5x
     // slower than not attempting direct reads at all.
     (35, "49d0b42b87d433fd"),
+    // v36: MSG_BATCH_DELETE (0x5C) + BatchDeleteOp/BatchDeleteReq/BatchDeleteResp.
+    // NOTE the recorded value also reflects a change to HOW the fingerprint is
+    // computed (build.rs now hashes normalised tokens with doc attributes
+    // stripped, instead of the file bytes). Comparing this hex against any
+    // pre-v36 entry says nothing; only the version interval governs
+    // compatibility, and v36 refuses every earlier peer regardless.
+    // `delete_many` was a client-side fan-out of single-key deletes, which
+    // collapsed onto the one multiplexed connection its keys' partition owns:
+    // 3.10 keys per WAL append against ~31 for the batched put. Since an append
+    // is a replicated write, the cost lands on the extent nodes, not on latency.
+    //
+    // Purely ADDITIVE — no existing message changed — so post-R3 this would be
+    // MIN = MAX - 1 and roll. This tree is not post-R3: the client checks wire
+    // compatibility once at handshake and does not keep the negotiated version
+    // anywhere a call site could gate on, so it cannot decline to send 0x5C to
+    // an older peer. MIN = MAX = 36: stop-the-world, and every image with an
+    // embedded client rebuilt at this commit.
+    (36, "203dbfb79a65738c"),
 ];
 
 /// R1: peer wire-compat check, replacing WIRE-1's single-point
@@ -703,6 +721,39 @@ mod admin_token_prefix_tests {
 #[cfg(test)]
 mod wire_version_tests {
     use super::*;
+
+    /// The fingerprint must move for a schema change and NOT move for prose.
+    ///
+    /// Both halves matter, and they fail in opposite directions. Too
+    /// insensitive and a layout change ships with an unchanged fingerprint —
+    /// rkyv then decodes garbage with no error anywhere, which is what this
+    /// whole mechanism exists to prevent. Too sensitive and the check fires on
+    /// comment edits, which is not merely noisy: it has split a live cluster
+    /// mid-rollout (a translated comment in `manager_rpc.rs`), and it teaches
+    /// the reflex of refreshing the recorded hash without looking, which is how
+    /// a real change would get waved through.
+    ///
+    /// This test can only assert the cheap half — that the compiled-in value is
+    /// a well-formed hash and matches the registry. The sensitivity itself is
+    /// verified in `build.rs` by construction: it parses each schema file and
+    /// hashes the token stream with `#[doc]` attributes removed, so comments
+    /// and formatting are not inputs at all.
+    #[test]
+    fn fingerprint_covers_schema_not_prose() {
+        // Well-formed, and pinned to the registry entry for MAX (the companion
+        // test asserts the equality; this one guards the shape).
+        assert_eq!(WIRE_FINGERPRINT.len(), 16, "fingerprint is a 16-hex digest");
+        assert!(WIRE_FINGERPRINT.chars().all(|c| c.is_ascii_hexdigit()));
+        let recorded = WIRE_VERSION_FINGERPRINTS
+            .iter()
+            .find(|(v, _)| *v == WIRE_VERSION_MAX)
+            .map(|(_, fp)| *fp);
+        assert_eq!(
+            recorded,
+            Some(WIRE_FINGERPRINT),
+            "WIRE_VERSION_MAX must have a registry entry holding the current fingerprint"
+        );
+    }
 
     #[test]
     fn fingerprint_is_nonempty_hex() {
