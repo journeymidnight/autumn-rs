@@ -229,8 +229,14 @@
 - **Acceptance**: 人为在第 N 个条带打断一次 EC 重建（同进程），下一次尝试从第 N 个条带继续、
   **不重读已完成的部分**（以 peer 侧 `read_bytes` 的请求偏移为证），最终分片与未打断时逐字节相同。
   eversion 在打断期间被 bump 时，必须丢弃重来而不是续。
-- **Status**: `passes: false` (2026-09-04) — 不影响正确性（重来是安全的），是效率与恢复时间问题；
-  extent 越大越贵，而本集群的常态就是 17 GiB。
+- **Status**: `closed / wont-do` (2026-09-05，用户决定) — 不做。理由:续传不是常见情况，
+  且 extent 大小本就可控，把单元切小比在大单元内部做续传更对路。
+  这与业界做法一致：主流系统的选择是**把修复单元切小到重来很便宜**，而不是在单元内部
+  做字节级续传——Ceph 的单元是 4 MiB object，HDFS EC 是 block，失败都整体重来；
+  会 resume 的（Kafka 的 fetch offset、Raft 的 `nextIndex`）之所以能续，是因为它们的
+  续传点落在**天然可验证的完整单元边界**上，而 EC 分片的字节流中间没有这种边界。
+  Cassandra 是个印证：它默认也是重来，后来才加了 resumable bootstrap，粒度是**文件**不是字节。
+  上面那些分析（长度即进度、重做最后一条 stripe）留档，若将来 extent 尺寸策略变了可以直接取用。
 
 ### BUG-EC-RECOVERY-WEDGE — 一次失败的 EC 重建把 (节点, extent) 永久毒死
 - **Trigger** (2026-09-04，实测): EC 重建失败后，`ensure_extent` 建的本地条目留在原地；
@@ -259,8 +265,29 @@
 - **Acceptance**: 人为让一次 EC 重建失败 → 下一次派发**不返回 "already exists"**；
   重复失败十次后 marker 仍能被正常执行；全程 `holds_payload`/df 对该节点其它 shard 的
   记账不变；EN 重启后不复活楔子。
-- **Status**: `passes: false` (2026-09-04) — 当前靠"重建不再失败"(shard 路由已修) 绕开，
-  但只要有任何一次失败（网络、磁盘、被 fence 打断），这个楔子仍会出现。
+- **Status**: `passes: true` (2026-09-05) — 已按上面"正确的方向"实现。
+  `ExtentNode::classify_ec_shard(info, entry, replace_id)` 是个无 `&self` 的纯函数：
+  用 `ec_shard_read_len(sealed_length, replicates.len())`（即 `erasure::shard_size`，
+  编码器实际写入的长度）当权威值，**长度精确相等且 eversion 相符** → Complete（上报完成）；
+  缺失／偏短／偏长／eversion 不符 → 新的 `IncompleteEcShard`；
+  非成员／`want == 0`（manager 记录自相矛盾）→ 仍然 Unknown（重建必失败，谎称 incomplete
+  只会派发一次注定的失败）。
+- **为什么 `IncompleteEcShard` 不能复用既有的 `Incomplete`**: 后者的处理动作是
+  `extents.remove` + `remove_extent_files`，两半对 EC 都不安全——见上面的 (a) 与 (d)。
+  新分支**什么都不重置**，直接派发：`ensure_extent` 幂等，重建自己用 `truncate(true)`
+  开目标文件，而 `ensure_extent` 留下的 0 字节 `.dat` 由 reconcile sweep 在分片到手后回收。
+- **线上那四个（63/66/69/48）为什么会被解开（已核对代码，非推断）**:
+  `ensure_extent` 给新建条目的 eversion 是**硬编码的 1**；已封存并 EC 转换的 extent
+  其 `info.eversion` >1 ⇒ 走 eversion 分支 ⇒ `IncompleteEcShard`。即便 eversion 恰为 1，
+  `shard_file_len` 也返回 `None`，同样结论。且 `replace_id` 是**被替换的失败节点**，
+  在 `apply_recovery_done` 之前一直留在 slot 里 ⇒ `ec_shard_index` 必然查得到 ⇒
+  不会落进 Unknown。（已 apply 后 marker 又重发确实返回 Unknown，但那不是楔子：
+  manager 的 `layout_changed.is_none()` 分支会释放 marker 并停止重发。）
+- **消融**: 把分类的兜底臂改回 `Unknown`（即修复前行为），7 个新测试**红 4**，
+  含 `a_missing_shard_is_rebuildable_not_a_permanent_refusal`。autumn-stream 156 全绿。
+- **⚠️ 不含 resume**: 判为 incomplete 后是**整个分片重来**，不是从已完成字节续传。
+  见 F-EC-RECOVERY-RESUME —— 该条已按用户决定 `closed / wont-do`（续传非常见情况，
+  且 extent 大小可控），所以"重来"就是最终行为，不是欠账。
 
 ### BUG-SHARD-RECORD-GHOST — 失败的重建 unlink 了分片，却留着账上的记录
 - **Trigger** (2026-09-04，facd61e 评审发现；由 8f96626 引入): EC 重建失败的 `Err` 臂

@@ -1146,6 +1146,12 @@ impl ExtentEntry {
         self.shard_files.borrow().values().sum()
     }
 
+    /// Recorded length of one shard file, or `None` if this node holds no file
+    /// at that index.
+    fn shard_file_len(&self, shard_index: u32) -> Option<u64> {
+        self.shard_files.borrow().get(&shard_index).copied()
+    }
+
     /// replace the file handle. Safe by construction —
     /// `RefCell::borrow_mut` panics if any borrow is currently held,
     /// and concurrent readers have already cloned an `Rc<CompioFile>`
@@ -1738,8 +1744,11 @@ fn code_resp(code: u8, message: String) -> HandlerResult {
 }
 
 /// What a dispatched recovery should do about an extent this node ALREADY holds
-/// a copy of. Three states, not two: "cannot tell" must never be collapsed into
-/// "incomplete", because the action for incomplete is destructive.
+/// a copy of. "Cannot tell" must never be collapsed into "incomplete", because
+/// the action for incomplete is destructive; and "incomplete" itself splits by
+/// how much of the local copy may be reset, which is not the same question as
+/// how incomplete it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LocalCopyVerdict {
     /// Verified complete against the manager's authoritative view — adopt it and
     /// re-report done (the completion report was lost, not the data).
@@ -1749,7 +1758,34 @@ enum LocalCopyVerdict {
     /// NOT count as a member, so an incomplete copy there is referenced by no
     /// VP, no SST, and no checkpoint.
     Incomplete,
-    /// The manager was unreachable, or the extent's shape (EC'd / still open /
+    /// An EC'd extent whose local SHARD is missing, short, or stale.
+    ///
+    /// Distinct from `Incomplete` because the REMEDY differs, not the
+    /// diagnosis. `Incomplete`'s caller resets the whole local copy — drops the
+    /// entry, then `remove_extent_files` unlinks every file for the extent.
+    /// This verdict resets nothing and just dispatches.
+    ///
+    /// The reason is that the reset buys nothing here, not that it would be
+    /// unsafe: the rebuild opens its destination with `truncate(true)`, so the
+    /// only thing the reset could remove is a file the rebuild is about to
+    /// overwrite anyway. Skipping it keeps the fall-through free of any
+    /// destructive step, which is worth having on a path whose whole purpose is
+    /// to stop a wedge — a reset that goes wrong turns a stuck extent into a
+    /// lost one.
+    ///
+    /// (Two hazards that WOULD make the reset unsafe cannot occur at this
+    /// moment, and the reasoning should not be borrowed from the replication
+    /// path where they can. A conversion racing the rebuild is impossible
+    /// because the manager drains the marker for an already-converted extent
+    /// rather than converting it again (`recovery.rs`, the `ex.ec_converted ||
+    /// sealed_length == 0` guard); and this node cannot hold a valid shard at
+    /// another index because recovery candidates are filtered to NON-members
+    /// (`dispatch_recovery_task`).)
+    ///
+    /// The stray 0-byte `.dat` that `ensure_extent` leaves is reclaimed by the
+    /// reconcile sweep once the shard is in hand.
+    IncompleteEcShard,
+    /// The manager was unreachable, or the extent's shape (still open /
     /// quarantined) makes the comparison meaningless. Refuse and retry later —
     /// never destroy a copy whose completeness is unknown.
     Unknown,
@@ -7945,6 +7981,75 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
         }))
     }
 
+    /// Judge this node's local EC shard against the manager's view.
+    ///
+    /// Before this existed, every `ec_converted` extent answered `Unknown`, and
+    /// `Unknown` means "refuse". The manager treats its recovery marker as a
+    /// standing instruction and re-sends it every tick, so the refusal and the
+    /// re-dispatch fed each other forever: the pair wedged, the marker held a
+    /// rate-limiter slot, and extents that genuinely needed rebuilding queued
+    /// behind it. A failed rebuild leaves exactly the state that triggers it —
+    /// the 0-byte `.dat` stub `ensure_extent` creates — so ONE failure was
+    /// enough to wedge a (node, extent) pair permanently.
+    ///
+    /// The authoritative shard length is `ec_shard_read_len`, the same
+    /// `erasure::shard_size` the encoder wrote with, so "did the last attempt
+    /// finish" is decidable here and needs no new state. Pure and `&self`-free
+    /// so it can be tested without a manager.
+    fn classify_ec_shard(
+        info: &ExtentInfo,
+        entry: &ExtentEntry,
+        replace_id: u64,
+    ) -> LocalCopyVerdict {
+        let Ok(shard_index) = Self::ec_shard_index(info, replace_id) else {
+            // The slot to rebuild is not in the extent's node list: the task
+            // and the snapshot disagree about membership, so there is nothing
+            // to compare against. Refuse rather than guess.
+            return LocalCopyVerdict::Unknown;
+        };
+        let want = Self::ec_shard_read_len(info.sealed_length, info.replicates.len());
+        if want == 0 {
+            // `ec_converted` with sealed_length 0 or K 0 — the manager's record
+            // and this extent disagree. The rebuild refuses this shape too, so
+            // claiming "incomplete" here would only dispatch a certain failure.
+            return LocalCopyVerdict::Unknown;
+        }
+        if entry.eversion.load(Ordering::SeqCst) != info.eversion {
+            // A shard from a different generation is not this shard, whatever
+            // its length. Rebuilding is right for a stale local copy; for a
+            // LOCAL copy that is somehow newer, `run_recovery_task`'s
+            // refuse-at-start check rejects the stale snapshot cleanly and the
+            // manager re-resolves. Neither outcome is a wedge.
+            return LocalCopyVerdict::IncompleteEcShard;
+        }
+        // WHICH FILE holds the shard follows the manager's layout, exactly as
+        // the rebuild decides it. A legacy converted extent renamed its shard
+        // over `.dat` (`ec_converted = true, InDat`) and has no `shard_files`
+        // entry at all, so reading only the map would answer "incomplete" for
+        // every such extent, forever. That is not a wedge — the rebuild would
+        // be dispatched and would succeed — but it makes a lost completion
+        // report cost an outage: the legacy path opens with `set_len(0)`, so
+        // re-running a rebuild that had already finished truncates a shard that
+        // readers are currently being served.
+        let have = if PayloadLocation::from_byte(info.payload_location)
+            == PayloadLocation::InShardFile
+        {
+            entry.shard_file_len(shard_index as u32)
+        } else if entry.has_dat.load(Ordering::SeqCst) {
+            Some(entry.len.load(Ordering::SeqCst))
+        } else {
+            None
+        };
+        match have {
+            // Exact length only. A shard is fixed-size by construction, so
+            // `>=` would adopt an over-long file, and the reader — which
+            // demands this exact length from every peer — would then reject
+            // what we just reported as complete.
+            Some(len) if len == want => LocalCopyVerdict::Complete,
+            _ => LocalCopyVerdict::IncompleteEcShard,
+        }
+    }
+
     /// re-dispatch adopt for a COMPLETED-but-unreported
     /// recovery. `handle_df` hands `recovery_done` to the manager via
     /// `std::mem::take` BEFORE knowing the response was delivered (an
@@ -7959,15 +8064,15 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
     /// sweep-release re-dispatched extent 16 to the next candidate until
     /// nodes 3/5/9 all held complete-but-unadoptable local copies).
     ///
-    /// Adopt is deliberately NARROW — the bytes of a sealed replicated
-    /// extent are immutable, so a local copy that matches the manager's
-    /// authoritative snapshot (same eversion, sealed, full sealed_length,
-    /// not EC-converted, not quarantined) IS the completed recovery result;
-    /// its `.meta` was made durable by the original run (P0-D fail-closed).
-    /// Everything else (open / partial / stale-eversion / EC-shard local
-    /// state) returns false and keeps the refusal. EC-shard adopt would need
-    /// a `shard_size` comparison against the local shard — deferred until
-    /// reproduced.
+    /// Adopt is deliberately NARROW. For a REPLICATED extent the bytes of a
+    /// sealed extent are immutable, so a local copy matching the manager's
+    /// authoritative snapshot (same eversion, sealed, full sealed_length, not
+    /// quarantined) IS the completed recovery result; its `.meta` was made
+    /// durable by the original run (P0-D fail-closed). An EC'd extent is
+    /// judged by `classify_ec_shard` instead — its payload is a shard, so
+    /// `len` says nothing about it — and that is also where the EC'd extent's
+    /// "incomplete" answer comes from. Everything still unjudgeable (manager
+    /// unreachable / open / quarantined) stays `Unknown`, which means refuse.
     async fn try_adopt_completed_recovery(
         &self,
         task: &crate::extent_rpc::RecoveryTask,
@@ -7980,16 +8085,46 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
             // destroy a complete replica whenever the manager blips.
             _ => return LocalCopyVerdict::Unknown,
         };
-        if info.ec_converted || !info.sealed {
-            // An EC'd or still-open extent is not a shape this comparison can
-            // judge (EC-shard adopt needs a `shard_size` comparison; an open
-            // extent has no authoritative length). Refuse, never reset.
-            return LocalCopyVerdict::Unknown;
-        }
         if entry.corrupt_meta.load(Ordering::SeqCst) {
             // META-FAILCLOSED quarantine: never report a quarantined copy as a
             // healthy recovered replica, and never silently overwrite it — the
-            // manager's repair path owns quarantined extents.
+            // manager's repair path owns quarantined extents. Checked BEFORE
+            // the shape split so a quarantined EC'd extent is refused too.
+            //
+            // ⚠️ This refusal has NO self-heal, and it is the one shape that can
+            // still wedge the way `classify_ec_shard` exists to prevent. The
+            // flag is cleared only by `save_meta`, which the placement path
+            // refuses to run for a quarantined entry — so for a shard-only
+            // holder that lost its `.meta`, recovery (the documented healer)
+            // is exactly what stays refused, every tick. Rare: it needs the
+            // `.dat` already reclaimed AND `.meta` then lost. Left as-is
+            // deliberately rather than widened here, because letting recovery
+            // overwrite a quarantined extent is a decision about the
+            // fail-closed contract, not a detail of this comparison.
+            return LocalCopyVerdict::Unknown;
+        }
+        if info.ec_converted {
+            // An EC'd extent's local payload is a SHARD, so `len` (the `.dat`
+            // length) says nothing about it. Judged on its own terms below.
+            let verdict = Self::classify_ec_shard(&info, entry, task.replace_id);
+            if verdict == LocalCopyVerdict::Complete {
+                tracing::info!(
+                    extent_id = task.extent_id,
+                    replace_id = task.replace_id,
+                    eversion = info.eversion,
+                    sealed_length = info.sealed_length,
+                    "require_recovery: local EC shard already complete — adopting \
+                     (lost-completion re-dispatch)"
+                );
+                self.done.push_recovery(RecoveryTaskDone {
+                    task: task.clone(),
+                    ready_disk_id: entry.disk_id,
+                });
+            }
+            return verdict;
+        }
+        if !info.sealed {
+            // An open extent has no authoritative length. Refuse, never reset.
             return LocalCopyVerdict::Unknown;
         }
         let local_ev = entry.eversion.load(Ordering::SeqCst);
@@ -8098,7 +8233,23 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                     }
                     // fall through to dispatch a fresh rebuild
                 }
-                // Cannot tell (manager unreachable / EC'd / open / quarantined).
+                // An EC'd extent whose shard is missing, short, or stale.
+                // Dispatch a rebuild WITHOUT resetting anything: `ensure_extent`
+                // is idempotent and the rebuild truncates its own destination,
+                // so the reset has nothing left to do — and not doing it keeps
+                // this path, whose whole job is to clear a wedge, free of any
+                // destructive step. See `IncompleteEcShard` for why the
+                // replication path's reasons for resetting do not transfer.
+                LocalCopyVerdict::IncompleteEcShard => {
+                    tracing::warn!(
+                        extent_id = task.extent_id,
+                        replace_id = task.replace_id,
+                        "require_recovery: local EC shard is missing, short or stale \
+                         — rebuilding over the existing entry"
+                    );
+                    // fall through to dispatch a fresh rebuild
+                }
+                // Cannot tell (manager unreachable / open / quarantined).
                 // Keep refusing — destroying a copy of unknown completeness is
                 // strictly worse than making the manager retry.
                 LocalCopyVerdict::Unknown => {
@@ -8119,7 +8270,6 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                 match node.run_recovery_task(task.clone()).await {
                     Ok(done) => {
                         node.recovery_inflight.remove(&extent_id);
-            node.clear_op_progress(extent_id);
                         node.clear_op_progress(extent_id);
                         node.done.push_recovery(done);
                         return;
@@ -12362,6 +12512,227 @@ mod discard_shard_file_tests {
                 shard_index: 3,
             }),
             "bytes are still on disk, so the entry must keep advertising them"
+        );
+    }
+}
+
+#[cfg(test)]
+mod classify_ec_shard_tests {
+    use super::*;
+
+    /// K=4 data + 1 parity, sealed at `sealed_length`. `replace_id` 40 is the
+    /// parity slot (index 4); 20 is data slot index 1.
+    fn ec_info(sealed_length: u64, eversion: u64) -> ExtentInfo {
+        ExtentInfo {
+            extent_id: 7,
+            replicates: vec![10, 20, 30, 40],
+            parity: vec![50],
+            eversion,
+            sealed_length,
+            sealed: true,
+            ec_converted: true,
+            // The CoW layout: the shard lives in `extent-N.shard{i}`. NOT the
+            // default — `payload_location` defaults to 0, which is `InDat`, the
+            // legacy renamed-over-`.dat` shape covered by its own test below.
+            payload_location: autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE,
+            ..Default::default()
+        }
+    }
+
+    /// An entry holding `shard_files[index] = len`, at `eversion`.
+    fn entry_with(eversion: u64, shard: Option<(u32, u64)>) -> ExtentEntry {
+        ExtentEntry {
+            has_dat: AtomicBool::new(true),
+            payload_location: AtomicU8::new(
+                autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE,
+            ),
+            shard_files: RefCell::new(shard.into_iter().collect()),
+            file: RefCell::new(None),
+            extent_id: 7,
+            len: AtomicU64::new(0),
+            eversion: AtomicU64::new(eversion),
+            sealed_length: AtomicU64::new(0),
+            sealed: AtomicBool::new(true),
+            avali: AtomicU32::new(0),
+            owner_epoch: AtomicI64::new(0),
+            durable_owner_epoch: AtomicI64::new(0),
+            disk_id: 0,
+            coalescer: Coalescer::new(0),
+            owner: RefCell::new(OwnerMailbox::default()),
+            corrupt_meta: AtomicBool::new(false),
+            content_ck: RefCell::new(CachedChecksums::NotLoaded),
+        }
+    }
+
+    /// THE WEDGE. A failed rebuild leaves the 0-byte `.dat` stub that
+    /// `ensure_extent` created and no shard file at all. That state used to
+    /// answer `Unknown`, which means "refuse" — and because the manager
+    /// re-sends its recovery marker every tick, the refusal and the re-dispatch
+    /// fed each other forever. One failure wedged the pair permanently.
+    ///
+    /// ABLATION: make `classify_ec_shard` return `Unknown` for a missing shard
+    /// and this goes red — which is exactly the pre-fix behaviour.
+    #[test]
+    fn a_missing_shard_is_rebuildable_not_a_permanent_refusal() {
+        let info = ec_info(4096, 9);
+        let entry = entry_with(9, None);
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &entry, 20),
+            LocalCopyVerdict::IncompleteEcShard,
+            "a node holding no shard must be told to rebuild, never refused"
+        );
+    }
+
+    /// A rebuild that died mid-stream leaves a SHORT shard. Same remedy.
+    #[test]
+    fn a_short_shard_is_rebuildable() {
+        let info = ec_info(4096, 9);
+        // K=4 over 4096 bytes => 1024 per shard. 600 is a dead attempt.
+        let entry = entry_with(9, Some((1, 600)));
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &entry, 20),
+            LocalCopyVerdict::IncompleteEcShard
+        );
+    }
+
+    /// The completed-but-unreported case: exact length, matching generation.
+    /// This is the one that must NOT rebuild — re-reporting done is the whole
+    /// point of adopting.
+    #[test]
+    fn an_exact_length_shard_is_complete() {
+        let info = ec_info(4096, 9);
+        let want = ExtentNode::ec_shard_read_len(4096, 4);
+        assert_eq!(want, 1024, "K=4 over 4096 bytes");
+        let entry = entry_with(9, Some((1, want)));
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &entry, 20),
+            LocalCopyVerdict::Complete
+        );
+    }
+
+    /// Over-long is NOT complete. The reader demands this exact length from
+    /// every peer, so adopting a longer file would report as done something
+    /// every subsequent read rejects.
+    #[test]
+    fn an_over_long_shard_is_not_complete() {
+        let info = ec_info(4096, 9);
+        let entry = entry_with(9, Some((1, 1025)));
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &entry, 20),
+            LocalCopyVerdict::IncompleteEcShard
+        );
+    }
+
+    /// Right length, wrong generation: a shard from a previous life of this
+    /// extent. Length alone must not adopt it.
+    #[test]
+    fn a_stale_generation_is_never_adopted() {
+        let info = ec_info(4096, 9);
+        let entry = entry_with(8, Some((1, 1024)));
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &entry, 20),
+            LocalCopyVerdict::IncompleteEcShard,
+            "matching length at the wrong eversion is a different shard"
+        );
+    }
+
+    /// The parity slot is indexed AFTER the data slots, and the shard it holds
+    /// is the same size. Getting this wrong would compare against the wrong
+    /// file and adopt or rebuild the wrong slot.
+    #[test]
+    fn the_parity_slot_indexes_after_the_data_slots() {
+        let info = ec_info(4096, 9);
+        let entry = entry_with(9, Some((4, 1024)));
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &entry, 50),
+            LocalCopyVerdict::Complete,
+            "node 50 is parity => index 4"
+        );
+        // The same file does NOT satisfy a data slot's task.
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &entry, 20),
+            LocalCopyVerdict::IncompleteEcShard
+        );
+    }
+
+    /// Refuse, do not guess, when the task names a node the snapshot does not
+    /// list — and when the manager's own record is self-inconsistent. Both
+    /// dispatch a rebuild that is certain to fail, so `Unknown` (retry later)
+    /// is the honest answer.
+    #[test]
+    fn unjudgeable_shapes_stay_unknown() {
+        let info = ec_info(4096, 9);
+        let entry = entry_with(9, None);
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &entry, 999),
+            LocalCopyVerdict::Unknown,
+            "node 999 is not a member of this extent"
+        );
+
+        let bad = ec_info(0, 9);
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&bad, &entry, 20),
+            LocalCopyVerdict::Unknown,
+            "ec_converted with sealed_length 0 is manager-state inconsistency"
+        );
+    }
+
+    /// The LEGACY layout: a pre-CoW conversion renamed the shard over `.dat`,
+    /// so `ec_converted = true` with `payload_location = InDat` and an empty
+    /// `shard_files`. Reading only the map would call every such extent
+    /// incomplete forever — and because that path rebuilds with `set_len(0)`,
+    /// a late completion echo would truncate a shard readers are being served.
+    #[test]
+    fn a_legacy_in_dat_shard_is_judged_on_the_dat_length() {
+        let mut info = ec_info(4096, 9);
+        info.payload_location = autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT;
+
+        // Complete: the `.dat` IS the shard, at exactly shard_size.
+        let done = entry_with(9, None);
+        done.len.store(1024, Ordering::SeqCst);
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &done, 20),
+            LocalCopyVerdict::Complete
+        );
+
+        // Short `.dat` — a dead attempt.
+        let partial = entry_with(9, None);
+        partial.len.store(600, Ordering::SeqCst);
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &partial, 20),
+            LocalCopyVerdict::IncompleteEcShard
+        );
+
+        // No `.dat` at all cannot be complete, whatever `len` claims.
+        let gone = entry_with(9, None);
+        gone.len.store(1024, Ordering::SeqCst);
+        gone.has_dat.store(false, Ordering::SeqCst);
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &gone, 20),
+            LocalCopyVerdict::IncompleteEcShard
+        );
+
+        // A shard FILE does not satisfy a layout that says InDat.
+        let wrong_shape = entry_with(9, Some((1, 1024)));
+        wrong_shape.has_dat.store(false, Ordering::SeqCst);
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &wrong_shape, 20),
+            LocalCopyVerdict::IncompleteEcShard
+        );
+    }
+
+    /// A local copy NEWER than the manager's snapshot is not adoptable either.
+    /// It means the snapshot is stale; `run_recovery_task`'s refuse-at-start
+    /// then rejects it and the manager re-resolves. Rebuilding is the honest
+    /// answer here — `Complete` would report a generation the manager did not
+    /// ask for.
+    #[test]
+    fn a_newer_local_generation_is_not_adopted() {
+        let info = ec_info(4096, 9);
+        let entry = entry_with(10, Some((1, 1024)));
+        assert_eq!(
+            ExtentNode::classify_ec_shard(&info, &entry, 20),
+            LocalCopyVerdict::IncompleteEcShard
         );
     }
 }
