@@ -7,7 +7,7 @@
 //! apart: a transient conflict self-heals by re-pulling a fresh snapshot or
 //! waiting out an in-flight op and retrying, while a deterministic
 //! precondition must fail fast. Distinguishing them by a new wire code would
-//! perturb `WIRE_FINGERPRINT` and force a stop-world version bump, so the
+//! require a stop-world WIRE version bump (see `WIRE_VERSION_MIN`), so the
 //! signal rides in the message text.
 //!
 //! That makes the text load-bearing, so no caller writes it: the manager

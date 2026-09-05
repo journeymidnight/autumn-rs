@@ -4,6 +4,18 @@
 //! Message type constants are in the 0x20–0x3F range to avoid collision with
 //! ExtentService RPCs (0x01–0x0A).
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
+//  retype a field, or change what one MEANS — and you MUST bump
+//  `WIRE_VERSION_MAX` (and set `MIN = MAX`) in `crates/rpc/src/lib.rs`.
+//
+//  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
+//  forgotten bump was removed; the version integer is the only guard left,
+//  and it is maintained by hand. Forget it and two binaries claiming the same
+//  version will handshake, then decode each other's bytes as garbage — no
+//  error, no log, just wrong data. That has happened here before.
+// ═══════════════════════════════════════════════════════════════════════════
+
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use rkyv::api::high::{HighDeserializer, HighSerializer};
 use rkyv::rancor::Error as RkyvError;
@@ -1687,11 +1699,6 @@ pub struct GetClusterIdResp {
     pub message: String,
     /// UUID string. Empty when `code` != `CODE_OK`.
     pub cluster_id: String,
-    /// WIRE-1: the responding manager's `autumn_rpc::WIRE_FINGERPRINT`.
-    /// R1 relaxed the equality check to `wire_compat_check` (interval
-    /// overlap, fingerprint kept as the same-build fast path + for
-    /// diagnostics in the refusal message).
-    pub wire_fingerprint: String,
     /// R1: the responding manager's `[WIRE_VERSION_MIN, WIRE_VERSION_MAX]`.
     /// Callers refuse to join when their own interval has no overlap.
     pub wire_version_min: u32,

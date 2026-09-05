@@ -343,8 +343,7 @@ async fn verify_manager_cluster_id(manager: &str, stamped: &str) -> Result<()> {
     // site decodes its own resp and must not depend on that coupling.
     // R1: relaxed from fingerprint equality to interval overlap.
     if let Err(msg) = autumn_rpc::wire_compat_check(
-        &resp.wire_fingerprint,
-        resp.wire_version_min,
+                resp.wire_version_min,
         resp.wire_version_max,
     ) {
         anyhow::bail!(msg);

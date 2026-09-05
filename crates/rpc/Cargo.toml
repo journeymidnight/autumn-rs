@@ -30,13 +30,6 @@ thiserror.workspace = true
 futures = "0.3"
 tracing = "0.1"
 
-# Build-only: the wire fingerprint parses these schema files instead of hashing
-# their bytes, so prose edits stop moving it. See build.rs.
-[build-dependencies]
-proc-macro2 = "1"
-quote = "1"
-syn = { version = "2", features = ["full", "parsing", "printing"] }
-
 [dev-dependencies]
 libc = "0.2"
 

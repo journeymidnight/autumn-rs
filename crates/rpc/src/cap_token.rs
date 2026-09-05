@@ -13,8 +13,20 @@
 //!
 //! **This file participates in the wire fingerprint** (`build.rs` hashes it):
 //! the token layout is wire schema, so any change to `CapClaims` bumps
-//! `WIRE_FINGERPRINT` and forces a conscious `WIRE_VERSION` decision — exactly
+//! a conscious `WIRE_VERSION_MAX` bump — exactly
 //! like `manager_rpc.rs` / `partition_rpc.rs`.
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
+//  retype a field, or change what one MEANS — and you MUST bump
+//  `WIRE_VERSION_MAX` (and set `MIN = MAX`) in `crates/rpc/src/lib.rs`.
+//
+//  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
+//  forgotten bump was removed; the version integer is the only guard left,
+//  and it is maintained by hand. Forget it and two binaries claiming the same
+//  version will handshake, then decode each other's bytes as garbage — no
+//  error, no log, just wrong data. That has happened here before.
+// ═══════════════════════════════════════════════════════════════════════════
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rkyv::{Archive, Deserialize, Serialize};

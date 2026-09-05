@@ -1523,7 +1523,6 @@ impl ClusterClient {
             // R1: interval-overlap compat check (same-fingerprint fast
             // path inside; refusal message carries both intervals).
             if let Err(msg) = autumn_rpc::wire_compat_check(
-                &resp.wire_fingerprint,
                 resp.wire_version_min,
                 resp.wire_version_max,
             ) {

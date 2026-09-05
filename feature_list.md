@@ -160,6 +160,46 @@
   见下面的 BUG-WIRE36-UNDEPLOYED。它的价值在 EN 负载（delete 的 append 数是 put 的
   ~10 倍），不能再指望 cap 这条线。
 
+### F-WIRE-VERSION-BY-HAND — 指纹已删除，wire 版本号改为纯手工维护
+- **决定** (2026-09-05，用户): 删掉 schema 指纹与 registry 测试，`WIRE_VERSION_MIN/MAX`
+  由人维护。已实施：`crates/rpc/build.rs` 删除、`syn` 构建依赖移除、
+  `WIRE_FINGERPRINT` / `WIRE_VERSION_FINGERPRINTS` 清空、
+  `GetClusterIdResp.wire_fingerprint` 字段摘除（并进未部署的 v36）、
+  `wire_compat_check` 改为纯版本区间。五个 schema 文件顶部各加了警示横幅。
+- **放弃了什么，说清楚**: 指纹独占的能力只有一个——抓「改了 schema 却没抬版本号」。
+  其余全部由区间覆盖（例如那次陈旧 python wheel，它的 MAX 更低，区间检查本就会拒）。
+  这个能力现在**没有任何东西替代**，`compat_no_longer_verifies_the_peers_schema`
+  这条测试就是为了把这个洞留在代码里可见，而不是只存在于某个 commit 说明里。
+- **为什么仍然合理**: 字节哈希造成过真实停机（翻译一条中文注释劈开了滚动中的集群），
+  而误报会训练出「刷新记录值继续」的反射——那正是真实改动被放行的路径。
+  且 `MIN=MAX` 的停机纪律意味着**不会存在混版本集群**，而混版本正是静默损坏的发生条件。
+- **调研结论（2026-09-05，回答"要不要换掉 rkyv"）**:
+  - **rkyv 官方不做 schema 演进**。docs.rs 自陈 "lacks a full schema system…
+    isn't well equipped for data migration and schema upgrades"；
+    issue #164 "Schema evolution" 2021-07 开，至今 open，标签是 "new crate"。
+  - **作者自己的 protoss（rkyv 的 schema 演进 crate）已于 2024-11-11 归档**，
+    共 6 个 commit、无 release。生态里没有可用方案。
+  - 没有搜到任何用 rkyv 做**网络协议**并公开版本管理方案的项目。协议层主流是
+    Cap'n Proto / FlatBuffers / protobuf，**三者都把演进做进格式本身**（字段编号 /
+    可选字段），所以不需要外挂版本号。rkyv 没有 tag，解码就是按当前 Rust 布局读，
+    **忘记抬版本 = 静默读错**，而 protobuf 里最多是丢个字段。
+  - ⇒ 这套 `WIRE_VERSION` 不是过度设计，是在补 rkyv 缺的那一层，且无先例可抄。
+- **若将来要迁移（实测规模，非估计）**: 206 个 `Archive` 类型
+  （manager 144 / partition 45 / extent 16 / cap_token 1）、
+  `rkyv_encode` 852 处 + `rkyv_decode` 533 处。
+  **FlatBuffers 是错的方向**：它的全部价值在零拷贝访问器，而本树几乎不用——
+  `Archived*` 直接读只有 1 处，`rkyv_decode` 是 memcpy 到 `AlignedVec` 再完整反序列化成
+  owned，大数据则走帧的裸 tail 完全绕开 rkyv。为一个用不上的能力付 1,385 个调用点的改造。
+  **prost 才贴合现状**（解码产物就是 owned struct，多数调用点只换函数名），但迁移的触发
+  条件应该是「需要滚动升级、不能再停机」，而不是现在——停机纪律已经挡住了实际风险。
+- **`rkyv_decode` 改零拷贝的阻断点（2026-09-05 查清，未做）**: `HEADER_LEN=10` +
+  `CTRL_PREFIX_LEN=4` ⇒ rkyv 载荷从帧内偏移 **14** 开始，既非 16 也非 8 对齐。
+  那次 memcpy 到 `AlignedVec<16>` **正是让 `rkyv::access` 合法的前提，不是浪费**。
+  要零拷贝必须先把帧头补齐到 16 对齐（wire 改动）。且 533 个解码点的类型全变
+  （`String`→`ArchivedString` 等），而许多点拿到数据后立刻 clone 进 owned 结构、
+  零拷贝买不到东西。**并且没有任何测量指向解码是瓶颈**——今天测到的是 append 0.185 ms /
+  端到端 1.15 ms，PS 处理那 ~0.97 ms 的构成完全空白。要做应先量。
+
 ### BUG-WIRE36-UNDEPLOYED — main 上有一个未部署的破坏性 wire 版本
 - **状态** (2026-09-05): `d6a8b73` 把 `WIRE_VERSION` 抬到 **36 且 `MIN = MAX`**
   （`MSG_BATCH_DELETE` 是纯加法的 opcode，但本树握手不保存协商结果供调用点门控，

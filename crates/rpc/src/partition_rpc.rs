@@ -20,6 +20,18 @@
 //! scan auto-resolves on the next `resolve_key`. See
 //! `crates/client/CLAUDE.md` for the SDK-side loop.
 
+// ═══════════════════════════════════════════════════════════════════════════
+//  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
+//  retype a field, or change what one MEANS — and you MUST bump
+//  `WIRE_VERSION_MAX` (and set `MIN = MAX`) in `crates/rpc/src/lib.rs`.
+//
+//  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
+//  forgotten bump was removed; the version integer is the only guard left,
+//  and it is maintained by hand. Forget it and two binaries claiming the same
+//  version will handshake, then decode each other's bytes as garbage — no
+//  error, no log, just wrong data. That has happened here before.
+// ═══════════════════════════════════════════════════════════════════════════
+
 pub use crate::manager_rpc::{rkyv_decode, rkyv_encode};
 
 use rkyv::{Archive, Deserialize, Serialize};
@@ -198,8 +210,8 @@ pub const MSG_BATCH_GET_BULK: u8 = 0x5B;
 /// key, capped at `BATCH_PUT_DEFAULT_CONCURRENCY` in flight. That looked like N
 /// concurrent requests and was not: a client holds ONE multiplexed connection
 /// per partition, so keys sharing a partition queue on one connection at its
-/// in-flight limit. See the v36 entry in `WIRE_VERSION_FINGERPRINTS` for the
-/// measured keys-per-append figures this was drawn from.
+/// in-flight limit. The measured keys-per-append figures behind this live in
+/// `feature_list.md` under the single-client write-ceiling entry.
 ///
 /// The cost it addresses is EXTENT-NODE load rather than latency: an append is
 /// a replicated write, so more appends for the same keys is more work asked of

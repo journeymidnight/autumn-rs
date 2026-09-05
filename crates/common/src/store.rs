@@ -82,7 +82,7 @@ pub const OWNER_KEY_MISSING_TOKEN: &str = "does not exist";
 /// `CODE_PRECONDITION`, indistinguishable from ordinary preconditions
 /// ("stream cannot be empty after punch holes", admin-token checks, …)
 /// without a new wire code — and a new code in `manager_rpc.rs` changes
-/// `WIRE_FINGERPRINT` and forces a stop-world WIRE version bump. The
+/// a stop-world WIRE version bump (see `WIRE_VERSION_MIN`). The
 /// stream-layer `StreamClient` uses this to turn a manager-side fence into
 /// the "LockedByOther" classification that drives the PS's
 /// poison-and-reopen self-heal (reopen re-acquires a fresh owner_epoch),
