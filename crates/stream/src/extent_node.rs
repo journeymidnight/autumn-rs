@@ -1104,6 +1104,8 @@ pub(crate) struct ExtentEntry {
     scrub_block: AtomicU64,
     /// Scrub tick before which this extent must not cost another manager probe.
     scrub_probe_not_before: AtomicU64,
+    /// Current probe interval in ticks; doubles per unproductive probe.
+    scrub_probe_backoff: AtomicU64,
     /// Backfill in progress: the length being described, and the block hashes
     /// accumulated so far. `None`/empty when not backfilling. 4 bytes per MiB,
     /// so 64 KiB for the largest extent, and freed the moment it lands.
@@ -3356,9 +3358,31 @@ enum ContentCheck {
     Unreadable(String),
 }
 
-/// Ticks an extent waits before it may cost another manager probe (~5 min at
-/// the scrub's 1 s tick).
-const SCRUB_PROBE_BACKOFF_TICKS: u64 = 300;
+/// How long an extent waits before it may cost another manager probe, in
+/// scrub ticks (1 s each). EXPONENTIAL between these bounds, not a constant.
+///
+/// A constant cannot serve both questions this probe asks. "Is this open tail
+/// sealed yet?" is answered no for hours on a cold partition, and asking every
+/// pass turns a hardening sweep into steady load on the single manager. But the
+/// SAME extent seals at some point, and until this node learns that it cannot
+/// describe the content — so a flat five minutes means every seal is followed
+/// by a blind window of up to five minutes in which rot is recorded as truth
+/// and never reported again.
+///
+/// Measured: a chaos round that sealed an extent ten seconds in had no sidecar
+/// anywhere in the cluster a minute later, and a deliberately rotted replica
+/// went unreported. Every extent had been probed once, at the very start, while
+/// it was still an open tail.
+///
+/// What this does NOT fix, said plainly so nobody reads more into it: an extent
+/// still open past the ramp (8+16+…+256 ticks, about eight minutes) is sitting
+/// at the ceiling when it finally seals, and gets exactly the window the
+/// constant used to give everything. The gain is for tails that roll while
+/// young — the shape a busy partition produces — not for a cold partition's
+/// tail. Bounding THAT case needs a lower ceiling or a push from whatever does
+/// the sealing, not a different curve.
+const SCRUB_PROBE_BACKOFF_MIN_TICKS: u64 = 8;
+const SCRUB_PROBE_BACKOFF_MAX_TICKS: u64 = 300;
 
 /// Whether a seal-apply may also hash the content and write its sidecar.
 ///
@@ -3865,19 +3889,26 @@ impl ExtentNode {
     /// primary writer.
     fn spawn_content_scrub_loop(&self) {
         let node = self.clone();
+        // The tick lives OUTSIDE the supervised closure. `en_spawn_supervised`
+        // re-invokes it after a panic, so a tick declared inside would restart
+        // at 0 while every extent's `scrub_probe_not_before` keeps its absolute
+        // stamp — freezing all probing until the new counter climbed back to
+        // the old one, i.e. for as long as the node had been up. A crash in
+        // the sweep would silently disable the sweep.
+        let tick = Rc::new(Cell::new(0u64));
         en_spawn_supervised("en_content_scrub", move || {
             let node = node.clone();
+            let tick = tick.clone();
             async move {
                 const TICK: Duration = Duration::from_millis(1000);
                 let mut budget =
                     extent_scrub::ScrubBudget::new(extent_scrub::SCRUB_DEFAULT_BYTES_PER_SEC);
                 let mut cursor = extent_scrub::ScrubCursor::default();
-                let mut tick: u64 = 0;
                 loop {
                     compio::time::sleep(TICK).await;
-                    tick += 1;
+                    tick.set(tick.get() + 1);
                     budget.refill(TICK.as_millis() as u64);
-                    node.scrub_once(&mut budget, &mut cursor, tick).await;
+                    node.scrub_once(&mut budget, &mut cursor, tick.get()).await;
                 }
             }
         });
@@ -3952,6 +3983,13 @@ impl ExtentNode {
             self.scrub_one(extent_id, &entry, budget, &mut probes, tick)
                 .await;
         }
+        // Advance where the NEXT lap begins. The walk is a full lap, so without
+        // this the cursor ends each tick exactly where it started and the four
+        // manager probes go to the same four extents forever — the ones with
+        // the lowest ids, while a higher-id extent that sealed early waits
+        // behind them. The block verification is unaffected (a lap covers
+        // everything either way); this is about who gets to ask.
+        cursor.next(&candidates);
     }
 
     /// Scrub one extent: describe it if it has no checksums, else verify a
@@ -4113,9 +4151,16 @@ impl ExtentNode {
                     return;
                 }
                 *probes -= 1;
+                let prev = entry.scrub_probe_backoff.load(Ordering::SeqCst);
+                let next = if prev == 0 {
+                    SCRUB_PROBE_BACKOFF_MIN_TICKS
+                } else {
+                    (prev * 2).min(SCRUB_PROBE_BACKOFF_MAX_TICKS)
+                };
+                entry.scrub_probe_backoff.store(next, Ordering::SeqCst);
                 entry
                     .scrub_probe_not_before
-                    .store(tick + SCRUB_PROBE_BACKOFF_TICKS, Ordering::SeqCst);
+                    .store(tick + next, Ordering::SeqCst);
                 let info = match self.extent_info_from_manager(extent_id).await {
                     Ok(Some(i)) => i,
                     Ok(None) => return,
@@ -4125,6 +4170,17 @@ impl ExtentNode {
                     }
                 };
                 if !info.sealed || info.sealed_length == 0 || info.ec_converted {
+                    // Say so. A silent return here is indistinguishable from a
+                    // scrub that never ran, and that ambiguity cost an hour of
+                    // chasing the wrong cause once already.
+                    tracing::debug!(
+                        extent_id,
+                        sealed = info.sealed,
+                        sealed_length = info.sealed_length,
+                        ec = info.ec_converted,
+                        next_probe_in_ticks = next,
+                        "scrub: nothing to describe yet"
+                    );
                     return;
                 }
                 // Persist the seal through the one path that gets it right,
@@ -5237,6 +5293,7 @@ impl ExtentNode {
                         content_ck: RefCell::new(CachedChecksums::NotLoaded),
                         scrub_block: AtomicU64::new(0),
                         scrub_probe_not_before: AtomicU64::new(0),
+                        scrub_probe_backoff: AtomicU64::new(0),
                         scrub_backfill_len: RefCell::new(None),
                         scrub_backfill_blocks: RefCell::new(Vec::new()),
                         }),
@@ -5340,6 +5397,7 @@ impl ExtentNode {
                     content_ck: RefCell::new(CachedChecksums::NotLoaded),
                     scrub_block: AtomicU64::new(0),
                     scrub_probe_not_before: AtomicU64::new(0),
+                    scrub_probe_backoff: AtomicU64::new(0),
                     scrub_backfill_len: RefCell::new(None),
                     scrub_backfill_blocks: RefCell::new(Vec::new()),
                 });
@@ -5914,6 +5972,7 @@ impl ExtentNode {
                 content_ck: RefCell::new(CachedChecksums::NotLoaded),
                 scrub_block: AtomicU64::new(0),
                 scrub_probe_not_before: AtomicU64::new(0),
+                scrub_probe_backoff: AtomicU64::new(0),
                 scrub_backfill_len: RefCell::new(None),
                 scrub_backfill_blocks: RefCell::new(Vec::new()),
             }),
@@ -8477,6 +8536,7 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                 content_ck: RefCell::new(CachedChecksums::NotLoaded),
                 scrub_block: AtomicU64::new(0),
                 scrub_probe_not_before: AtomicU64::new(0),
+                scrub_probe_backoff: AtomicU64::new(0),
                 scrub_backfill_len: RefCell::new(None),
                 scrub_backfill_blocks: RefCell::new(Vec::new()),
             }),
@@ -10350,6 +10410,14 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
             .map(|_| ())
     }
 
+    /// One scrub pass at an EXPLICIT tick, for tests about the probe schedule.
+    pub async fn test_scrub_once_at(&self, budget_bytes: u64, tick: u64) {
+        let mut budget = extent_scrub::ScrubBudget::new(budget_bytes);
+        budget.refill(1000);
+        let mut cursor = extent_scrub::ScrubCursor::default();
+        self.scrub_once(&mut budget, &mut cursor, tick).await;
+    }
+
     /// Run ONE scrub pass with a fixed budget, for tests that need the walk to
     /// happen at a known point rather than on its own schedule. Returns the
     /// extents whose rot the pass found.
@@ -10358,7 +10426,7 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
         // into its probe backoff after the first call and make a second call
         // silently do nothing.
         static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let tick = TICK.fetch_add(SCRUB_PROBE_BACKOFF_TICKS + 1, Ordering::SeqCst) + 1;
+        let tick = TICK.fetch_add(SCRUB_PROBE_BACKOFF_MAX_TICKS + 1, Ordering::SeqCst) + 1;
         let mut budget = extent_scrub::ScrubBudget::new(budget_bytes);
         budget.refill(1000);
         let mut cursor = extent_scrub::ScrubCursor::default();
@@ -10792,6 +10860,63 @@ mod sealed_append_guard_tests {
             ck.verify_read(0, &good),
             Ok(3),
             "the sidecar must describe the rebuilt bytes, not a splice"
+        );
+    }
+
+    /// An open tail must be re-asked SOON, not once every five minutes.
+    ///
+    /// The probe is the only thing that tells a node one of its extents became
+    /// immutable, and it is stamped before the answer comes back — so a flat
+    /// interval means an extent asked once while still open is not asked again
+    /// for that whole interval, and everything sealed in between goes
+    /// undescribed. Undescribed content is trust-on-first-use: rot landing in
+    /// that window becomes the recorded truth and is never reported.
+    ///
+    /// Measured with a five-minute constant: a chaos round sealed an extent ten
+    /// seconds in, no node had learned it a minute later, no sidecar existed
+    /// anywhere, and a deliberately rotted replica went unreported.
+    #[compio::test]
+    async fn an_unsealed_extent_is_re_asked_on_a_doubling_schedule() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 5170u64;
+        let entry = node.ensure_extent(eid).await.expect("entry");
+        entry.has_dat.store(true, Ordering::SeqCst);
+
+        // No manager is configured, so every probe is unproductive — which is
+        // exactly the shape an open tail has, and the schedule must not depend
+        // on the answer.
+        let mut tick = 1u64;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            node.test_scrub_once_at(8 * 1024 * 1024, tick).await;
+            let interval = entry.scrub_probe_backoff.load(Ordering::SeqCst);
+            assert_eq!(
+                entry.scrub_probe_not_before.load(Ordering::SeqCst),
+                tick + interval,
+                "the next probe is scheduled one interval out"
+            );
+            seen.push(interval);
+            tick += interval;
+        }
+        assert_eq!(
+            seen,
+            vec![8, 16, 32, 64, 128, 256],
+            "the interval must START small and double; a constant leaves every \
+             seal undescribed for its whole length"
+        );
+
+        // …and it stops growing, so a permanently open tail costs no more than
+        // the old constant did in steady state.
+        for _ in 0..3 {
+            node.test_scrub_once_at(8 * 1024 * 1024, tick).await;
+            tick += entry.scrub_probe_backoff.load(Ordering::SeqCst);
+        }
+        assert_eq!(
+            entry.scrub_probe_backoff.load(Ordering::SeqCst),
+            SCRUB_PROBE_BACKOFF_MAX_TICKS
         );
     }
 
@@ -13410,6 +13535,7 @@ mod discard_shard_file_tests {
             content_ck: RefCell::new(CachedChecksums::NotLoaded),
             scrub_block: AtomicU64::new(0),
             scrub_probe_not_before: AtomicU64::new(0),
+            scrub_probe_backoff: AtomicU64::new(0),
             scrub_backfill_len: RefCell::new(None),
             scrub_backfill_blocks: RefCell::new(Vec::new()),
         }
@@ -13546,6 +13672,7 @@ mod classify_ec_shard_tests {
             content_ck: RefCell::new(CachedChecksums::NotLoaded),
             scrub_block: AtomicU64::new(0),
             scrub_probe_not_before: AtomicU64::new(0),
+            scrub_probe_backoff: AtomicU64::new(0),
             scrub_backfill_len: RefCell::new(None),
             scrub_backfill_blocks: RefCell::new(Vec::new()),
         }

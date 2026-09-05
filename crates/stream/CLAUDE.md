@@ -202,7 +202,17 @@ wraps, so an all-skipped tick would spin the shard's event loop — starving the
 very recovery whose marker caused the skip, and on shard 0 starving `df`.
 Deliberately NOT gated on the local `sealed` flag (there is no seal event on an
 EN, so that would skip exactly the rolled tails it exists for); it asks the
-manager instead, at most once per extent per ~5 min. A read failure of a
+manager instead, on a per-extent EXPONENTIAL backoff (8 scrub ticks doubling to
+300). A constant cannot serve both halves of that question: a cold partition's
+open tail answers "not sealed" for hours and must get cheap, but the same
+extent seals eventually, and until this node learns that it cannot describe the
+content — so a flat five minutes leaves every seal followed by a blind window
+of that length, inside which rot becomes the recorded truth. Measured: a chaos
+round sealed an extent ten seconds in and no node had learned it a minute
+later, with no sidecar anywhere in the cluster. The ramp bounds the window for
+a tail that rolls while young; one that stays open past ~8 minutes is already
+at the ceiling when it seals and gets the old window, which a different curve
+cannot fix. A read failure of a
 DESCRIBED block is a finding, not noise — nothing mismatches when the bytes are
 simply gone, and `re_avali` only inspects slots already dark, so a member that
 silently shrank is otherwise invisible. Findings ride `DfResp.scrub_rot`
