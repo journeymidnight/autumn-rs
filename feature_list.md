@@ -261,3 +261,72 @@
   记账不变；EN 重启后不复活楔子。
 - **Status**: `passes: false` (2026-09-04) — 当前靠"重建不再失败"(shard 路由已修) 绕开，
   但只要有任何一次失败（网络、磁盘、被 fence 打断），这个楔子仍会出现。
+
+### BUG-SHARD-RECORD-GHOST — 失败的重建 unlink 了分片，却留着账上的记录
+- **Trigger** (2026-09-04，facd61e 评审发现；由 8f96626 引入): EC 重建失败的 `Err` 臂
+  删掉了写了一半的分片文件，但没有配对调用 `forget_shard_file`。而该方法的定义处白纸黑字
+  写着契约——"Call AFTER the unlink, so the entry never advertises a file that is gone"，
+  reconcile sweep 也一直是这么配对的，唯独这条路径只做了前一半。
+- **后果**: 若 `entry.shard_files` 里本就有这个下标（重启发现补登的，或并发的
+  `write_shard_stripe_local` 写的——它与重建**共用同一个 entry**），那么记录比字节活得久：
+  `holds_payload` 继续为真、`df` 继续计一个已经不存在的文件的字节；而路由到本节点的读
+  **通过了 ownership 门**，然后在 `payload_file` 里以 `Internal` 失败——而不是干净地
+  拒绝为 `PayloadNotHere` 让调用方刷新布局。下一次 reconcile sweep 会自愈，所以是有界的。
+- **修复**: 把这对操作提成 `ExtentEntry::discard_shard_file(path, shard_index) -> bool`，
+  紧挨 `forget_shard_file` 放。两个调用点（失败重建的 `Err` 臂 + reconcile sweep 的
+  stale-shard 循环）共用它，语义就再也不会只落实一半。`NotFound` 算作"已经没了"（重试，
+  或 unlink 与更新记录之间崩溃，都会走到这里；若把它当失败，记录将永远滞留，因为此后
+  任何 unlink 都不可能成功）。**unlink 真失败则保留记录并返回 false**——这是镜像另一半：
+  字节还在盘上却不再记账，`df` 会少算，且 `InShardFile` 情形下会挡住后续的 `.dat` 回收。
+- **⚠️ 不涉及**: 条目本身（entry）**仍然不删**，理由见 BUG-EC-RECOVERY-WEDGE 的 (a)-(d)。
+  本条只修"文件没了但记录还在"，不碰楔子。
+- **Acceptance / 消融**: 3 个 `#[compio::test]`。把 `discard_shard_file` 里的
+  `forget_shard_file` 一行摘掉后，`discard_stops_advertising_the_file` 与
+  `discard_treats_not_found_as_gone` **变红**（报的正是那条诊断信息），
+  `failed_unlink_keeps_the_record` 保持绿（它守的是另一半不变量）——已实测。
+- **Status**: `passes: true` (2026-09-04) — autumn-stream 149 lib + 全部集成测试通过；
+  `autumn-rpc` 61 通过，含 `registry_pins_current_schema_to_max_version`，WIRE 指纹未变。
+
+### BUG-BULK-READ-FLATTENS-REFUSAL — bulk 读把"分片不归我"压成"extent 不可用"
+- **Trigger** (2026-09-04，评审发现，**潜伏未触发**): 非 bulk 的 `MSG_READ_BYTES` 走
+  `get_extent`，先查 `owns_extent`，不归本分片则回 `wrong_shard_err` →
+  `FailedPrecondition` 的**错误帧**，消息里点名该找哪个分片。而 `MSG_READ_BYTES_BULK`
+  在 `extent_node.rs` 的对应处只 `match Err((_code, _msg))`，发出
+  `bulk_read_head(…, CODE_ERROR, "extent unavailable", 0)` ——**把 code 和消息一起丢了**。
+  在 bulk 这条路上，路由错误与真正的不可用**无法区分**。
+- **为什么现在不咬人**: 已修好的三个 peer-copy 调用点走的是非 bulk 的
+  `read_bytes_chunk`，不经过这条路。所以是潜伏项，不是线上故障。
+- **为什么仍要记**: 这正是 CLAUDE.md 第 15 条记录的那类事故的形状——上层靠错误**类型**
+  触发 refresh/回退，而下层把类型抹平成一个笼统的失败码，于是回退逻辑变成死代码，
+  且全量单测与逐字节 e2e 都是绿的。分片路由的守卫测试目前只覆盖了非 bulk 那条臂。
+- **Scope**: bulk 臂透传 `(code, msg)`，而不是改写成 `CODE_ERROR "extent unavailable"`；
+  并把守卫测试补到 bulk 路径上。
+- **Status**: `passes: false` (2026-09-04) — 未修，已核对代码确认存在。
+
+### BUG-FRAME-LEN-U32-WRAP — ≥4 GiB 的帧静默编出一个损坏的头
+- **Trigger** (2026-09-04，实测过一次真实故障，此处补记): `frame.rs` 的
+  `Frame::encode` 与 `encode_response_with` 都把 `usize` 的 `wire_payload_len`
+  直接 `as u32` 写进头部，**没有任何上界检查**。载荷一旦 ≥ 4 GiB，长度回绕，
+  头部与实际字节数不符，对端 `FrameDecoder` 立刻 CRC 失败。
+- **实测**: EC 重建读一个 `u32::MAX + 29,421` 字节的分片时就是这样炸的——当时被误判成
+  30 秒超时，日志时间戳（两次尝试相隔 10.75 秒，而非 4×30 秒）本身就否证了超时那个说法。
+- **为什么现在不咬人**: EC 重建已改成按 stripe（默认 64 MiB）流式重建，不再发出
+  单个 >4 GiB 的读。**但编码器本身仍然无防护**——任何一条新路径只要产生大响应就会中招，
+  而且症状是"损坏的帧"，不是"清晰的错误"。
+- **对比**: 同一个函数里对 `write_payload` 写入字节数不符的检查是 **release 强制的
+  `assert_eq!`**，理由写在注释里："Fail loud rather than ship a silently-bad frame"。
+  长度上界该用同一个标准，现在却没有。
+- **Scope**: 编码前检查 `wire_payload_len > u32::MAX` 则返回错误（或按同样理由 assert），
+  让调用方分块；补一条构造超限载荷的回归测试。
+- **Status**: `passes: false` (2026-09-04) — 未修，已核对 `crates/rpc/src/frame.rs` 确认。
+
+### BUG-REBUILD-FSYNC-UNCOUNTED — 重建成功但 fsync 失败，整个分片不记账
+- **Trigger** (2026-09-04，评审发现，已核对代码): EC 重建的成功分支上，
+  `f.sync_data().await…?` 与 `fsync_staging_dir(…)?` 都在 `extent.note_shard_file(…)`
+  **之前**早退。任一个失败，盘上留下一个**完整长度**的分片文件，而条目里没有任何记录。
+- **后果**: 与 BUG-SHARD-RECORD-GHOST 相反的一半——字节在盘上却不记账，`df` 少算，
+  `holds_payload` 为假。要到重启后 `discover_shard_files` 补登才对上。
+  比 ghost 那半轻（不会把读降级成 Internal），但同样是条目与磁盘不一致。
+- **Scope**: 要么把 `note_shard_file` 提到 fsync 之前（记录"文件存在"本就不依赖它是否已持久），
+  要么在这两个 `?` 上改成先记账再返回错误。注意别和失败重建臂的 discard 语义打架。
+- **Status**: `passes: false` (2026-09-04) — 既有缺陷，未修。

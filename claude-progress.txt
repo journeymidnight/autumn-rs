@@ -1,6 +1,42 @@
 Date: 2026-09-04
 TaskStatus: not_completed
-Task scope: F-STREAM-ATREST-CKSUM（bitrot / stream 层 at-rest 内容校验）。
+Task scope: EC recovery 修复线（shard 路由 + 分片记账），**代码与测试已完成、线上未落地**，
+  所以 not_completed。镜像未重建、EN/manager 未滚动、4 个 extent 仍卡在楔子上。
+  下一节记本轮；再往下是上一轮的 F-STREAM-ATREST-CKSUM 记录。
+
+【2026-09-04/05 EC recovery：两处修复 + 线上楔子已定位到可删的桩】
+  **facd61e（已提交）**：peer 读寻址到**基础端口**而不是拥有该 extent 的分片端口。
+  `shard_count=4`，所以约 25% 靠运气能成——这正是它长期看着像"偶发网络抖动"的原因。
+  三个调用点统一走已存在的 `conn_pool::shard_addr_for_extent`（我一度自己又写了第四份，
+  且只有我那份错误处理 scheme-without-port，已删）。
+
+  **本次（待提交）**：失败重建的 `Err` 臂 unlink 了写了一半的分片，却没有配对调用
+  `forget_shard_file` —— 记录比字节活得久，`holds_payload` 与 df 一起说谎，路由到本节点的读
+  **通过 ownership 门之后**才在 `payload_file` 里以 `Internal` 失败，而不是干净地拒为
+  `PayloadNotHere`。既有缺陷（8f96626 带入），非本轮引入。修法是把这对操作提成
+  `ExtentEntry::discard_shard_file`，失败重建臂与 reconcile sweep 两个调用点共用，
+  语义不可能再只落实一半。消融实测：摘掉 `forget_shard_file` 一行，3 个测试红 2（另一个
+  守的是"unlink 失败必须保留记录"的镜像另一半，理应保持绿）。
+
+  **线上现状（01:36 实测，重要）**：不是之前以为的 3 个僵尸，是 **4 个**——63/66/69/48。
+  `ops list --active` 里 48 显示的 "rebuilding slot 1 on node 85" 是**上一次尝试留下的
+  陈旧文字**，它同样没有进展。manager 每 2 秒一轮打
+  `recovery re-dispatch refused: extent N already exists`，四条齐全。
+  盘上核实（en-5 的 69/48，en-6 的 66/63）：每个目录**只有一个 0 字节 `.dat`**，
+  没有 `.meta`、没有分片，23:32–23:35 建的。**与 BUG-EC-RECOVERY-WEDGE 猜想 (c) 完全吻合**：
+  `ensure_extent` 的桩让本地条目存在，`try_adopt_completed_recovery` 对 ec_converted
+  一律 Unknown，于是永久拒绝；而 `scan_extents` 无长度过滤，**重启也不会自愈**。
+  ⇒ 单纯滚新镜像**清不掉这四个**。正确顺序是：先删这 4 个 0 字节桩，**再**滚 EN
+  （重启重扫时桩已不在 ⇒ 无条目 ⇒ 派发被接受 ⇒ 配上已修的分片路由，重建才真能跑完）。
+
+  另外归档两条已核对代码、未修的潜伏项：BUG-BULK-READ-FLATTENS-REFUSAL（bulk 读把
+  wrong-shard 的 code+消息压成 `CODE_ERROR "extent unavailable"`，正是 CLAUDE.md 第 15 条
+  记录的那类事故形状，只是当前 peer-copy 不走这条路）、BUG-FRAME-LEN-U32-WRAP
+  （`frame.rs` 的 `wire_payload_len as u32` 无上界检查，≥4 GiB 静默编出损坏的头——
+  之前那次 4.29 GB 分片读的真正成因，我一度误判成 30 秒超时）。
+
+【以下为上一轮记录】
+Task scope（上一轮）: F-STREAM-ATREST-CKSUM（bitrot / stream 层 at-rest 内容校验）。
   **增量 1 已落地**（格式 + seal 时写 + 读时验），**增量 2（scrub）在做**，所以 not_completed。
   另按用户逐条指示关掉 8 条 backlog：12 → 4。
 

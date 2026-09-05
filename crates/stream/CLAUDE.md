@@ -133,6 +133,22 @@ NAME, so a shard staged for one index can never be *served* as another.
   0 (`len` is the `.dat` length — the shard's bytes live in `shard_files` so
   `df` doesn't double-count), and neither is the extent's `sealed_length`. No
   parseable `.meta` beside a real payload file is META-FAILCLOSED → quarantine.
+- **Dropping a shard file is ONE step, `ExtentEntry::discard_shard_file`.**
+  Unlink first, then forget — and only if the file is really gone (`NotFound`
+  counts as gone; any other unlink error keeps the record and is returned, so
+  the bytes and the accounting stay in agreement). It exists because the pair
+  used to be spelled out at each call site and the failed-rebuild path spelled
+  out only the first half: the record outlived the bytes, `holds_payload` stayed
+  true, and a read routed there cleared the ownership gate before failing inside
+  `payload_file` as `Internal` instead of refusing as `PayloadNotHere`. The
+  reverse break is just as bad — bytes on disk that nothing counts. Note the
+  forget is NOT atomic with the unlink (the unlink is awaited first), so a
+  writer recreating the same index during the await loses its record until the
+  next `note_shard_file` or restart discovery.
+  ⚠️ What cleans up a partial shard left by a FAILED rebuild is the next
+  attempt's `truncate(true)` open, or the manager reassigning the slot — **not**
+  the reconcile sweep, whose stale-shard loop filters out `want.shard_index`,
+  and for a rebuild that index is precisely the wanted one.
 - **`remove_extent_files` unlinks every `.shard{i}` found on disk**, and
   **`df`'s `extent_bytes` adds `shard_bytes()` to `len`** — a node mid-conversion
   legitimately holds both, and counting one under-reports the footprint that

@@ -1090,6 +1090,47 @@ impl ExtentEntry {
         self.shard_files.borrow_mut().remove(&shard_index);
     }
 
+    /// Unlink a shard file, then stop advertising it -- in that order, and only
+    /// if the file is really gone.
+    ///
+    /// The two steps are one invariant, which is why they live in one place
+    /// instead of being spelled out at each call site (they were, and the
+    /// failed-rebuild path spelled out only the first half). Break it either
+    /// way and the entry disagrees with the disk:
+    ///
+    /// - unlink without forgetting: `holds_payload` stays true and `df` keeps
+    ///   counting bytes that are gone, so a read routed here clears the
+    ///   ownership gate and then fails inside `payload_file` as `Internal`
+    ///   rather than refusing cleanly as `PayloadNotHere`.
+    /// - forget without unlinking: the bytes stay on disk uncounted. Where the
+    ///   forgotten index is also the one the layout wants, it additionally
+    ///   makes `holds_payload(want)` false, which gates the `.dat` reclaim.
+    ///
+    /// `NotFound` counts as gone. A failed unlink KEEPS the record and returns
+    /// the error, so the bytes and the accounting stay in agreement; what
+    /// eventually clears the file is caller-specific, so the callers say so,
+    /// not this doc.
+    ///
+    /// NOT atomic: the unlink is awaited before the record is dropped, so a
+    /// writer that recreates this same index during the await has its record
+    /// removed here while its file exists. `note_shard_file` on the next
+    /// stripe, or restart discovery, puts it back. The window is pre-existing
+    /// -- the reconcile sweep has always had it -- and is called out only
+    /// because the wording above could be read as claiming an atomic pair.
+    async fn discard_shard_file(
+        &self,
+        path: &std::path::Path,
+        shard_index: u32,
+    ) -> std::io::Result<()> {
+        match compio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        self.forget_shard_file(shard_index);
+        Ok(())
+    }
+
     fn shard_index_list(&self) -> Vec<u32> {
         self.shard_files.borrow().keys().copied().collect()
     }
@@ -4033,23 +4074,15 @@ impl ExtentNode {
                 .collect();
             for idx in stale_shards {
                 let path = disk.shard_path(p.extent_id, idx);
-                // Same rule as the `.dat` branch below: the entry may only stop
-                // advertising a file once the file is actually gone. Forgetting
-                // it after a failed unlink leaves the bytes on disk while `df`
-                // stops counting them and `holds_payload` goes false — which
-                // also blocks the later `.dat` reclaim for the InShardFile case.
-                if let Err(e) = compio::fs::remove_file(&path).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!(
-                            extent_id = p.extent_id,
-                            shard_index = idx,
-                            error = %e,
-                            "reconcile: could not unlink a stale shard file (retried next sweep)"
-                        );
-                        continue;
-                    }
+                if let Err(ue) = entry.discard_shard_file(&path, idx).await {
+                    tracing::warn!(
+                        extent_id = p.extent_id,
+                        shard_index = idx,
+                        error = %ue,
+                        "reconcile: could not unlink a stale shard file (retried next sweep)"
+                    );
+                    continue;
                 }
-                entry.forget_shard_file(idx);
                 tracing::info!(
                     extent_id = p.extent_id,
                     shard_index = idx,
@@ -6319,7 +6352,9 @@ impl ExtentNode {
                 // length, so it cannot serve wrong bytes — but after a restart
                 // `discover_shard_files` registers it at its partial length,
                 // which makes `holds_payload` and the `df` accounting lie until
-                // a reconcile unlinks it. Remove it on the way out.
+                // the next attempt truncates it (NOT until a reconcile sweep --
+                // that loop skips the layout's own `want.shard_index`, which is
+                // this one). Remove it on the way out.
                 let len = match self
                     .stream_ec_recovery_payload(&task, &extent_info, shard_index, &f)
                     .await
@@ -6327,7 +6362,29 @@ impl ExtentNode {
                     Ok(v) => v,
                     Err(e) => {
                         drop(f);
-                        let _ = compio::fs::remove_file(&path).await;
+                        // Discarding it means BOTH halves. A `shard_files`
+                        // record that predates this rebuild -- from restart
+                        // discovery, or from a concurrent
+                        // `write_shard_stripe_local` sharing this entry --
+                        // would otherwise outlive the bytes just removed.
+                        if let Err(ue) = extent.discard_shard_file(&path, shard_index as u32).await
+                        {
+                            // NOT the reconcile sweep: its stale-shard loop
+                            // filters out `want.shard_index`, and for a rebuild
+                            // that index IS the wanted one (both sides derive it
+                            // as this node's position in `replicates ++ parity`).
+                            // What actually clears a partial shard is the next
+                            // attempt's `truncate(true)` open, or the manager
+                            // reassigning the slot so placement GC takes it.
+                            tracing::warn!(
+                                extent_id = task.extent_id,
+                                shard_index,
+                                error = %ue,
+                                "failed rebuild: could not unlink the partial shard \
+                                 (the entry advertises it until the next attempt \
+                                 truncates it)"
+                            );
+                        }
                         // The ENTRY is deliberately NOT dropped here, though
                         // leaving it is what wedges this (node, extent) pair:
                         // `require_recovery` refuses whenever an entry exists
@@ -12188,6 +12245,123 @@ mod shard_routing_tests {
             differ > 100,
             "hash and modulo should disagree on most ids; got {differ} of 256 \
              — has the map been swapped back to modulo?"
+        );
+    }
+}
+
+#[cfg(test)]
+mod discard_shard_file_tests {
+    use super::*;
+
+    /// Build an entry that advertises exactly one shard file, with no fd.
+    ///
+    /// `file: None` is a legal resident state (the sealed-extent fd cache
+    /// evicts it), which is what lets this test skip opening a real
+    /// `CompioFile` — nothing on the discard path touches the fd.
+    fn entry_advertising(extent_id: u64, shard_index: u32, len: u64) -> ExtentEntry {
+        ExtentEntry {
+            has_dat: AtomicBool::new(false),
+            payload_location: AtomicU8::new(
+                autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE,
+            ),
+            shard_files: RefCell::new([(shard_index, len)].into_iter().collect()),
+            file: RefCell::new(None),
+            extent_id,
+            len: AtomicU64::new(0),
+            eversion: AtomicU64::new(1),
+            sealed_length: AtomicU64::new(len),
+            sealed: AtomicBool::new(true),
+            avali: AtomicU32::new(0),
+            owner_epoch: AtomicI64::new(0),
+            durable_owner_epoch: AtomicI64::new(0),
+            disk_id: 0,
+            coalescer: Coalescer::new(0),
+            owner: RefCell::new(OwnerMailbox::default()),
+            corrupt_meta: AtomicBool::new(false),
+            content_ck: RefCell::new(CachedChecksums::NotLoaded),
+        }
+    }
+
+    /// A discarded shard file must stop being advertised.
+    ///
+    /// ABLATION: drop the `forget_shard_file` call from `discard_shard_file`
+    /// and this goes red on the `holds_payload` assertion. That is the exact
+    /// state the failed-rebuild path used to leave behind — it unlinked the
+    /// partial shard and returned without the second half — so a read routed
+    /// to this node cleared the ownership gate and then failed inside
+    /// `payload_file` as `Internal` instead of refusing as `PayloadNotHere`.
+    #[compio::test]
+    async fn discard_stops_advertising_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("extent-7.shard3");
+        std::fs::write(&path, b"partial").expect("seed the shard file");
+
+        let entry = entry_advertising(7, 3, 7);
+        let want = PayloadRef {
+            location: PayloadLocation::InShardFile,
+            shard_index: 3,
+        };
+        assert!(entry.holds_payload(want), "precondition: entry advertises it");
+
+        entry
+            .discard_shard_file(&path, 3)
+            .await
+            .expect("unlink of an existing file must succeed");
+
+        assert!(!path.exists(), "the file must actually be unlinked");
+        assert_eq!(entry.shard_bytes(), 0, "`df` must stop counting the bytes");
+        assert!(
+            !entry.holds_payload(want),
+            "entry still advertises a shard file that is gone — `df` over-counts \
+             and a routed read fails as Internal instead of PayloadNotHere"
+        );
+    }
+
+    /// An already-absent file is "gone" too: the record must still go.
+    ///
+    /// A retried discard, or a crash between the unlink and the entry update,
+    /// lands here. Treating `NotFound` as failure would strand the record
+    /// forever, since no later unlink can ever succeed.
+    #[compio::test]
+    async fn discard_treats_not_found_as_gone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("extent-7.shard3");
+
+        let entry = entry_advertising(7, 3, 7);
+        entry
+            .discard_shard_file(&path, 3)
+            .await
+            .expect("a file that is already absent counts as gone");
+        assert!(!entry.holds_payload(PayloadRef {
+            location: PayloadLocation::InShardFile,
+            shard_index: 3,
+        }));
+    }
+
+    /// The other half of the invariant: a FAILED unlink must keep the record.
+    ///
+    /// Forgetting bytes that are still on disk is the mirror-image bug — `df`
+    /// under-counts them and, for the `InShardFile` case, the later `.dat`
+    /// reclaim is blocked. A directory standing in for the file makes
+    /// `remove_file` fail without depending on permissions (which root ignores,
+    /// and CI often runs as root).
+    #[compio::test]
+    async fn failed_unlink_keeps_the_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("extent-7.shard3");
+        std::fs::create_dir(&path).expect("stand a directory in for the file");
+
+        let entry = entry_advertising(7, 3, 7);
+        assert!(
+            entry.discard_shard_file(&path, 3).await.is_err(),
+            "remove_file on a directory must fail"
+        );
+        assert!(
+            entry.holds_payload(PayloadRef {
+                location: PayloadLocation::InShardFile,
+                shard_index: 3,
+            }),
+            "bytes are still on disk, so the entry must keep advertising them"
         );
     }
 }
