@@ -42,6 +42,38 @@ fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> Strin
 /// (Prepend `bench/perf/`), so their keys are USER keys.
 const BENCH_SCOPE: &str = "bench/perf";
 
+/// Connect one bench worker, carrying the CLI's credential if it was given.
+///
+/// The bench spawns a client PER THREAD (each needs its own compio runtime),
+/// so it cannot share the `ClusterClient` main already built. It used to call
+/// the anonymous `connect` here, which meant `--credential-file` was accepted
+/// and then ignored.
+///
+/// The resulting failure was hard to read, which is why it is written down.
+/// `connect` only contacts the MANAGER, so every worker connected fine. The
+/// puts then went to a partition server over a connection that had sent no
+/// AUTH_HELLO, and the PS authz gate rejected each one as an error frame
+/// before dispatch -- a path that logs nothing, so the PS logs stayed empty
+/// and looked like no traffic had arrived. The client retried, surfaced it as
+/// "ps_call after 10 refreshes", and the hot loop's `.is_ok()` dropped that
+/// too. All that reached the operator was "write phase produced no keys -- is
+/// the cluster running?", which points at the cluster. The cluster was fine.
+async fn bench_connect(
+    manager: &str,
+    cred: &Option<(String, Vec<u8>)>,
+) -> anyhow::Result<autumn_client::ClusterClient> {
+    match cred {
+        Some((principal, secret)) => autumn_client::ClusterClient::connect_with_credential(
+            manager,
+            BENCH_SCOPE,
+            principal.clone(),
+            secret.clone(),
+        )
+        .await,
+        None => autumn_client::ClusterClient::connect(manager, BENCH_SCOPE).await,
+    }
+}
+
 /// D7: derive the USER-space partition start keys covering the bench
 /// namespace. `all_partitions_with_range` returns WIRE ranges; the client
 /// prepends `perf/bench/`, so a bench key built off a partition's wire start
@@ -251,7 +283,9 @@ async fn cmd_ycsb(
     records: u64,
     rmw: bool,
     manager: &str,
+    cred: Option<(String, Vec<u8>)>,
 ) -> Result<()> {
+    let cred = Arc::new(cred);
     use futures::stream::StreamExt;
     use rand::{Rng, SeedableRng};
 
@@ -294,11 +328,12 @@ async fn cmd_ycsb(
     let mut load_handles = Vec::new();
     for (tid, sk) in start_keys.iter().cloned().enumerate() {
         let mgr = Arc::clone(&mgr);
+        let cred = Arc::clone(&cred);
         let load_ops = Arc::clone(&load_ops);
         let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
         load_handles.push(std::thread::spawn(move || {
             compio::runtime::RuntimeBuilder::new().build().unwrap().block_on(async move {
-                let client = match ClusterClient::connect(&mgr, BENCH_SCOPE).await {
+                let client = match bench_connect(&mgr, &cred).await {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("ycsb load thread {tid} connect error: {e}");
@@ -345,11 +380,12 @@ async fn cmd_ycsb(
     let mut run_handles = Vec::new();
     for (tid, sk) in start_keys.iter().cloned().enumerate() {
         let mgr = Arc::clone(&mgr);
+        let cred = Arc::clone(&cred);
         let run_ops = Arc::clone(&run_ops);
         let value_bytes: Vec<u8> = (0..value_size).map(|i| (i % 256) as u8).collect();
         run_handles.push(std::thread::spawn(move || -> (Vec<f64>, Vec<f64>) {
             compio::runtime::RuntimeBuilder::new().build().unwrap().block_on(async move {
-                let client = match ClusterClient::connect(&mgr, BENCH_SCOPE).await {
+                let client = match bench_connect(&mgr, &cred).await {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("ycsb run thread {tid} connect error: {e}");
@@ -443,7 +479,8 @@ async fn cmd_ycsb(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u64, value_size: usize, baseline_file: String, threshold: f64, update_baseline: bool, partitions_meta_from_flag: usize, pipeline_depth: usize, group_commit_cap: Option<usize>, bulk: usize, ramp_ms: u64, direct_read: bool, manager: &str) -> Result<()> {
+async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u64, value_size: usize, baseline_file: String, threshold: f64, update_baseline: bool, partitions_meta_from_flag: usize, pipeline_depth: usize, group_commit_cap: Option<usize>, bulk: usize, ramp_ms: u64, direct_read: bool, manager: &str, cred: Option<(String, Vec<u8>)>) -> Result<()> {
+    let cred = Arc::new(cred);
     let pipeline_depth = pipeline_depth.max(1);
     // bulk ("ucx ⟹ zerocopy") selection — ONE symmetric rule, shared
     // with the python BatchClient + `get_many_into` via `bulk_worthwhile`:
@@ -517,6 +554,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
             .collect::<Vec<u8>>();
         let depth = pipeline_depth;
 
+        let cred = Arc::clone(&cred);
         let barrier = Arc::clone(&barrier);
         let handle = std::thread::spawn(move || {
             if ramp_ms > 0 {
@@ -527,7 +565,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                 .unwrap()
                 .block_on(async move {
                     use futures::stream::StreamExt;
-                    let client = match autumn_client::ClusterClient::connect(&mgr, BENCH_SCOPE).await {
+                    let client = match bench_connect(&mgr, &cred).await {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("write thread {tid} connect error: {e}");
@@ -703,6 +741,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
         let deadline = Arc::clone(&deadline);
         let total_ops = Arc::clone(&total_ops);
         let depth = pipeline_depth;
+        let cred = Arc::clone(&cred);
         let barrier = Arc::clone(&barrier);
         let handle = std::thread::spawn(move || {
             if ramp_ms > 0 {
@@ -713,7 +752,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                 .unwrap()
                 .block_on(async move {
                     use futures::stream::StreamExt;
-                    let client = match autumn_client::ClusterClient::connect(&mgr, BENCH_SCOPE).await {
+                    let client = match bench_connect(&mgr, &cred).await {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("read thread {tid} connect error: {e}");
@@ -1007,6 +1046,27 @@ async fn main() -> Result<()> {
     //    thread → Raw here.
     //  - data-plane KV commands (put/get/del/head/ls/streams) MUST declare their
     //    scope → connect(mgr, scope); absent = migration error.
+    // ONE read of the credential file, before any network I/O, so a malformed
+    // file fails here rather than N times inside the bench's worker threads.
+    // The KV path and the bench subcommands both take it from here -- the bench
+    // needs its own copy because it builds a client per thread.
+    let cred: Option<(String, Vec<u8>)> = match &args.credential_file {
+        Some(path) => {
+            let (principal, secret) =
+                autumn_client::read_credential_file(path).context("--credential-file")?;
+            // `read_credential_file` accepts a bare hex line and reports an
+            // empty principal; its own doc says a data-plane caller must
+            // refuse that. Without this the bench would instead fail once per
+            // thread inside `mint_token`, and end at the same unhelpful
+            // "produced no keys".
+            if principal.is_empty() {
+                bail!("--credential-file: missing principal name (expected '<principal>\\n<hex>')");
+            }
+            Some((principal, secret))
+        }
+        None => None,
+    };
+
     let client = match &args.command {
         Command::PerfCheck { .. } | Command::Ycsb { .. } | Command::OpStub { .. } => {
             ClusterClient::connect_raw(&args.manager).await?
@@ -1026,25 +1086,19 @@ async fn main() -> Result<()> {
             };
             // with a credential when `--credential-file` is given
             // (principal read from the file). Fails fast if it doesn't cover `{scope}/`.
-            match &args.credential_file {
-                Some(path) => {
-                    let (principal, secret) =
-                        autumn_client::read_credential_file(path).context("--credential-file")?;
-                    if principal.is_empty() {
-                        bail!("--credential-file: missing principal name (expected '<principal>\\n<hex>')");
-                    }
-                    ClusterClient::connect_with_credential(
-                        &args.manager,
-                        scope,
-                        principal,
-                        secret,
-                    )
-                    .await?
-                }
+            match &cred {
+                Some((principal, secret)) => ClusterClient::connect_with_credential(
+                    &args.manager,
+                    scope,
+                    principal.clone(),
+                    secret.clone(),
+                )
+                .await?,
                 None => ClusterClient::connect(&args.manager, scope).await?,
             }
         }
     };
+
 
     match args.command {
         Command::OpStub { .. } => unreachable!("handled before connect"),
@@ -1250,7 +1304,7 @@ async fn main() -> Result<()> {
             ramp_ms,
             direct_read,
         } => cmd_perf_check(
-            &client, threads, duration_secs, value_size, baseline_file, threshold, update_baseline, partitions_meta_from_flag, pipeline_depth, group_commit_cap, bulk, ramp_ms, direct_read, &args.manager,
+            &client, threads, duration_secs, value_size, baseline_file, threshold, update_baseline, partitions_meta_from_flag, pipeline_depth, group_commit_cap, bulk, ramp_ms, direct_read, &args.manager, cred,
         )
         .await?,
 
@@ -1265,7 +1319,7 @@ async fn main() -> Result<()> {
             records,
             rmw,
         } => cmd_ycsb(
-            &client, threads, duration_secs, value_size, partitions, pipeline_depth, read_ratio, zipfian, records, rmw, &args.manager,
+            &client, threads, duration_secs, value_size, partitions, pipeline_depth, read_ratio, zipfian, records, rmw, &args.manager, cred,
         )
         .await?,
     }
