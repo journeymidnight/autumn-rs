@@ -14,6 +14,10 @@
 
 ## Active
 
+> **这个账本只记 autumn-rs 自己的东西。** 下游怎么被 autumn 的改动影响（例如一次 wire
+> 版本变更要求哪些内嵌客户端重建）算 autumn 的后果，该记；下游自己的缺陷、进展和上线
+> 状态不算，记在它们各自的仓库里。
+
 ### F-KV-CLIENT-30K — 单个客户端进程的 KV 写吞吐卡在 ~30K ops/s，与分区数/并发/批量都无关
 - **Trigger** (2026-09-02, 从 F-MEM-WIPE-COST 的残余里分离出来): 同一个单线程 memory-mcp
   进程，无论怎么配都拿不到超过 ~30K key/s 的写（delete 或 put）：
@@ -245,18 +249,18 @@
   `PoolName.KV` stringifies to"）、413 的 `str(pool_name) == DEFAULT_POOL_NAME`
   比较、447 的 `hit_count = {str(PoolName.KV): kv_pages}` 键名。评审在 3.9.6 与 3.13.8
   两个版本上实测确认。
-- **影响范围（未查证的那半）**: FreeToken 侧传的是普通字符串（`"dsv4_full"`/`"dsv4_window"`）
-  且只读 `kv_hit_pages`，**不受影响**。sglang 侧是否会把 enum 成员送进 `transfer.name`
-  **未查证** —— 评审只能确认 controller 是从上游调用者转发 `transfer.name` 的。若会，
-  后果是 v2 的 KV key 落到 `"PoolName.KV"` 这个段下（与 v1 不再字节一致，跨版本读不到），
+- **影响范围（未查证的那半）**: 取决于调用方往 `transfer.name` 里放什么。已知的调用方
+  都传**普通字符串**，那条路不触发。sglang 是否会送 enum 成员进来 **未查证** ——
+  评审只能确认 controller 是从上游调用者转发 `transfer.name` 的。若会，后果是 v2 的
+  KV key 落到 `"PoolName.KV"` 这个段下（与 v1 不再字节一致，跨版本读不到），
   且 `batch_exists_v2` 的结果字典键名对不上。
 - **Scope**: 三处统一改成取 `.value`（或 `PoolName.KV.value`），并加一条断言/单测把
   "v2 的 KV 段必须与 v1 字节一致"钉住 —— 那是 v2 设计时明确写下的性质
   （"v2 keys for the KV pool are byte-identical to v1's — this is additive, not a migration"）。
 - **Acceptance**: 先查证 sglang 是否真的传 enum 成员（传字符串则本条降级为整洁性修补）；
   修后在 py≥3.11 上 v1/v2 的 KV key 逐字节相同。
-- **Status**: `passes: false` (2026-09-04) — 既有缺陷，非本轮引入；当前唯一的消费者
-  （FreeToken）不触发，故不阻塞 L3 上线。
+- **Status**: `passes: false` (2026-09-04) — 既有缺陷，非本轮引入。已知调用方传字符串
+  而非 enum 成员，所以现在不触发；严重度取决于上面 sglang 那半的查证结果。
 
 ### F-RECOVERY-PROGRESS — extent recovery 不上报进度，卡死与缓慢无法区分
 - **Trigger** (2026-09-04，一次 fence 排干中发现，代价是整个诊断过程): 4 个 recovery
