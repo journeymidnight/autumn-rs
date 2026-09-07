@@ -97,6 +97,25 @@ def batch_set_v2(self, transfers: List[PoolTransfer], extra_info=None) -> dict[s
 
 MVP 阶段**只支持 `KV` pool**，hybrid 模型支持留 Phase 2+。
 
+#### key 的作用域：一条容易问错的契约
+
+三个 v2 方法里，`keys` 和 `transfer.keys` 不是一回事，写错不会报错，只会静静地
+给出别的池子的答案：
+
+- `batch_exists_v2(keys, ...)` 的 `keys` 是**主列表**，后端把它映射进**默认段**
+  （`kv`）再查。
+- 每个 sidecar `PoolTransfer` 用的探测键，是**这同一批主 key 重新映射进该池的段**
+  （`_full_key(k, pool_name)`）——不是 `transfer.keys`。
+- `transfer.keys` 只被读取**长度**，用来给 `TRAILING_PAGES` 定尾部窗口有多宽。
+
+后果是：把某个 sidecar 池的 key 当主列表传进去，得到的是**默认段**的答案。如果
+上层的 key 里不含池名（页哈希在两个池里是同一个字符串），这个错误就完全不可见——
+它会对每个"full 页已存在"的 window 页回答"已存在"，于是那一层从此不再被写入，而
+恢复时只能找到历史、找不到窗口行。
+
+要问"某个 sidecar 池已经有多少前缀"，就把它作为 sidecar 传入，读回
+`PoolTransferResult.extra_pool_hit_pages[pool_name]`。
+
 ### 2.5 Optional
 
 ```python
