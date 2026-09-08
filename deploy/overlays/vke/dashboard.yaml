@@ -80,26 +80,23 @@ spec:
   ports:
     - { name: dashboard, port: 8799, targetPort: 8799 }
 ---
-# Public read-only view of the dashboard, through the cluster's APIG.
+# The dashboard, published through the cluster's APIG. All of it.
 #
-# ONLY the read paths are routed, and that is the whole security story here.
-# `autumn-dashboard` runs with `--admin-token-file` and shells out to
-# `autumn-op`, so `/api/action` splits and merges partitions and
-# `/api/policies/{activate,upsert,delete}` flips the auto-policy switches — with
-# no authentication of its own, unlike the webui, which does its own basic auth
-# from a Secret. Publishing a catch-all `/` prefix would hand those to anyone
-# who found the URL.
+# This routes every path, including the mutating ones — `/api/action` (split,
+# merge) and `/api/policies/{activate,upsert,delete}` — because operating the
+# cluster from the dashboard is the point of having it. That was an explicit
+# call, made after the alternative was tried: routing only the read paths left
+# every button in the UI answering 404, which reads as a broken dashboard
+# rather than as a policy.
 #
-# So the paths are enumerated instead, and `/api/policies` is `Exact` on
-# purpose: as a `Prefix` it would also match `/api/policies/activate`. Anything
-# not listed has no backend at the gateway and 404s there, which is why the
-# mutating buttons in the UI do not work through this host. They still work from
-# inside the cluster (`kubectl port-forward svc/autumn-dashboard 8799`).
-#
-# What this DOES expose to anyone with the URL: cluster topology — node
-# addresses, partition layout, sizes, op history. If that is too much, the fix
-# is basic auth in the dashboard itself, the way the webui has it, not a
-# narrower path list.
+# What that means, stated plainly so nobody has to rediscover it: this is a
+# browsable public HTTPS URL with NO authentication, and `autumn-dashboard`
+# runs with `--admin-token-file` and shells out to `autumn-op`. Anyone with the
+# URL can split and merge partitions and flip the auto-policy switches, and can
+# read the cluster's topology. The dashboard has no auth of its own — unlike
+# `hermes-webui`, which does its own basic auth from a Secret. Adding the same
+# there is what would close this; a shorter path list only made the tool
+# useless without making the URL private.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -113,8 +110,10 @@ spec:
     - host: autumn-dashboard.apig.local
       http:
         paths:
-          - { path: /,               pathType: Exact,  backend: { service: { name: autumn-dashboard, port: { number: 8799 } } } }
-          - { path: /api/overview,   pathType: Exact,  backend: { service: { name: autumn-dashboard, port: { number: 8799 } } } }
-          - { path: /api/ops,        pathType: Exact,  backend: { service: { name: autumn-dashboard, port: { number: 8799 } } } }
-          - { path: /api/policies,   pathType: Exact,  backend: { service: { name: autumn-dashboard, port: { number: 8799 } } } }
-          - { path: /api/partition/, pathType: Prefix, backend: { service: { name: autumn-dashboard, port: { number: 8799 } } } }
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: autumn-dashboard
+                port:
+                  number: 8799
