@@ -1445,6 +1445,29 @@ impl PartitionMetrics {
         });
     }
 
+    /// Publish which PHASE a manager-orchestrated partition op (split / merge)
+    /// has reached.
+    ///
+    /// Deliberately reports `op_id: 0`, which `set_maintenance_progress` above
+    /// refuses: these ops do not know the manager's id for themselves, because
+    /// `SplitPartReq` has no field carrying one and adding it would be an rkyv
+    /// wire bump — a stop-the-world rollout, for a progress sample. The manager
+    /// matches on (kind, part_id) instead; the sample rides inside a
+    /// `PartitionLoad`, so it already knows the partition.
+    ///
+    /// Phases, not bytes. Split's steps cost wildly different amounts — the
+    /// flush dominates — so a byte counter sits still through the expensive one
+    /// and reads as a hang, which is the exact confusion this is here to end.
+    /// A phase index says "still flushing", and that is the true answer.
+    pub fn set_maintenance_phase(&self, kind: u8, phase: u64, phases: u64) {
+        *self.maintenance_progress.lock() = Some(manager_rpc::MaintenanceProgress {
+            op_id: 0,
+            kind,
+            done: phase,
+            total: phases,
+        });
+    }
+
     /// Drop the progress slot — the op finished (its terminal state travels in
     /// the outcome ring). Leaving a stale sample would show a finished op as
     /// forever mid-flight.
@@ -1461,6 +1484,42 @@ impl PartitionMetrics {
     /// retransmit covers a dropped report.
     pub fn snapshot_maintenance_outcomes(&self) -> Vec<manager_rpc::MaintenanceOutcome> {
         self.maintenance_outcomes.lock().iter().cloned().collect()
+    }
+}
+
+/// Clears the phase slot however its scope ends.
+///
+/// `handle_split_part` has a dozen exits — three `?` through a closure, a TTL
+/// abort, two barrier timeouts, a post-commit deadline check — and clearing at
+/// each one is a list that goes stale the first time somebody adds an early
+/// return. The cost of missing one is not a missing sample but a WRONG one: the
+/// slot rides every 5 s heartbeat afterwards, and the NEXT split on that
+/// partition spends its whole pre-freeze stretch (maintenance-gate wait, SST
+/// median scan) with no sample of its own, so the stale phase is stamped onto
+/// it — showing "frozen and drained" before it has frozen anything, and then
+/// walking backwards when the real phase 1 lands. That is precisely the
+/// misleading control plane this reporting exists to remove.
+pub struct MaintenancePhaseGuard {
+    // An owned `Arc`, not a borrow. A reference would tie the guard to a
+    // `RefCell` borrow of `PartitionData`, and this thing lives across every
+    // `.await` in the split — holding that borrow there would deadlock the
+    // single-threaded executor the first time anything else touched the
+    // partition.
+    metrics: std::sync::Arc<PartitionMetrics>,
+}
+
+impl MaintenancePhaseGuard {
+    pub fn new(metrics: std::sync::Arc<PartitionMetrics>) -> Self {
+        Self { metrics }
+    }
+    pub fn set(&self, kind: u8, phase: u64, phases: u64) {
+        self.metrics.set_maintenance_phase(kind, phase, phases);
+    }
+}
+
+impl Drop for MaintenancePhaseGuard {
+    fn drop(&mut self) {
+        self.metrics.clear_maintenance_progress();
     }
 }
 
@@ -13861,6 +13920,46 @@ mod bug_lease_2_fence_tests {
             check_and_bump_fence(42, 5, &mut floors).is_err(),
             "documented: if you call the pure-fn after a rejection, you poison the floor"
         );
+    }
+}
+
+#[cfg(test)]
+mod maintenance_phase_tests {
+    //! The phase slot must not outlive the op that set it.
+    use super::*;
+
+    #[test]
+    fn the_phase_slot_is_cleared_however_the_split_exits() {
+        let m = std::sync::Arc::new(PartitionMetrics::default());
+        {
+            let g = MaintenancePhaseGuard::new(m.clone());
+            g.set(autumn_rpc::manager_rpc::OP_KIND_SPLIT, 2, 6);
+            assert_eq!(
+                m.snapshot_maintenance_progress().len(),
+                1,
+                "a live split should be publishing a phase"
+            );
+        } // <- any exit: `?`, an early `return`, a panic unwinding
+        assert!(
+            m.snapshot_maintenance_progress().is_empty(),
+            "a stale phase rides every later heartbeat and gets stamped onto the \
+             NEXT split on this partition, which spends its whole pre-freeze \
+             stretch with no sample of its own — showing 'frozen' before it has \
+             frozen anything, then walking backwards when its real phase 1 lands"
+        );
+    }
+
+    #[test]
+    fn a_phase_carries_no_op_id_because_the_split_never_learns_one() {
+        // `SplitPartReq` has no field for it, and adding one would be an rkyv
+        // wire bump. The manager matches on (kind, part_id) instead.
+        let m = std::sync::Arc::new(PartitionMetrics::default());
+        let g = MaintenancePhaseGuard::new(m.clone());
+        g.set(autumn_rpc::manager_rpc::OP_KIND_SPLIT, 1, 6);
+        let s = m.snapshot_maintenance_progress();
+        assert_eq!(s[0].op_id, 0);
+        assert_eq!(s[0].kind, autumn_rpc::manager_rpc::OP_KIND_SPLIT);
+        assert_eq!((s[0].done, s[0].total), (1, 6));
     }
 }
 

@@ -973,6 +973,24 @@ failure reason the fire-and-forget maintenance ops used to drop.
   PS re-sends its outcome ring every heartbeat — can neither reopen a closed op
   nor resurrect one the cap evicted. `record_maint_outcome` clears the sample at
   every terminal exit, so a finished op never shows as forever mid-flight.
+- **Two ways in, because not every executor knows the op id.** `update_progress`
+  is keyed by op id and is what gc/compact/forcegc use. `split` cannot: its
+  request carries only `part_id`, and adding an id would be an rkyv struct
+  change — a wire bump, `MIN == MAX`, stop-the-world — for a progress sample. So
+  split publishes `op_id: 0` (`PartitionMetrics::set_maintenance_phase`, which
+  is a separate setter precisely because the op-id one treats 0 as "PS-local,
+  nothing to update") and the manager routes those to
+  `update_progress_by_part(kind, part_id, secondary_id, ..)`. Same shape as
+  `update_progress_by_extent`, which exists for the same reason on the EN side.
+  `merge` is orchestrated on the leader, so it calls that directly.
+  Split/merge report **phases, not bytes**: their steps cost wildly different
+  amounts and a byte counter frozen through the expensive one reads as a hang.
+  The PS holds a `MaintenancePhaseGuard` for the whole split so every exit —
+  including three `?` through a closure and two barrier timeouts — clears the
+  slot; a stale phase would otherwise be stamped onto the NEXT split on that
+  partition, which has no sample of its own until it reaches phase 1.
+  `finish` snaps a SUCCEEDED op to its total, because a split's last phases and
+  its RPC reply have no `.await` between them and no heartbeat can land there.
 - **EC convert now uses the recovery model** (dispatch ≠ completion): the
   coordinator EN ACKs "accepted" and encodes in the background;
   `node_health_loop` applies each `DfResp.ec_done` report using the etcd

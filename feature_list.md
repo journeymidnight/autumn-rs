@@ -503,6 +503,59 @@
   要么在这两个 `?` 上改成先记账再返回错误。注意别和失败重建臂的 discard 语义打架。
 - **Status**: `passes: false` (2026-09-04) — 既有缺陷，未修。
 
+### F-SPLITMERGE-PROGRESS — split/merge 全程冻结分区却不报进度，"在切"和"卡住"看起来一样
+- **Trigger** (2026-09-09，用户在 dashboard 上切了 part 44 之后问"什么算 split 完了"):
+  op 表上只有一行终态 `split succeeded ... dispatched`，中间什么都没有。而 split **全程
+  持有 `frozen_for_split`**——这段时间该分区的写是停的。运维在此期间真正要回答的问题是
+  "我的写被冻了多久、它是不是卡住了"，而控制面对此**一个字都没说**。同一次操作里还夹着
+  几次 `cannot split: partition has overlapping keys` 的失败（判据是 `has_overlap != 0`，
+  要等 compaction 消化），成功与失败交替出现，更需要能看见它走到哪一步。
+- **机制现状（已核对代码，非推测）**:
+  - 通道**已经存在**: `MaintenanceProgress { op_id, kind, done, total }` 搭在
+    `PartitionLoad.active_maintenance` 上随负载心跳走；PS 侧有
+    `maintenance_progress: Mutex<Option<..>>`（`partition-server/src/lib.rs:1416`）、setter
+    与 `snapshot_maintenance_progress()`；manager 侧 `update_progress()`
+    （`rpc_handlers.rs:4899`）**在终态之前**应用，避免样本给已关闭的 op 上色。
+  - 但只有 **compact / gc / forcegc** 在填它。split/merge 从不填。
+  - split 处理里有 **13 个 `.await`**（`rpc_handlers.rs` 1470–2120），会让出线程，
+    所以冻结期间心跳照常发得出去——采样不会堵到最后才到。
+- **Scope**:
+  1. PS 在 split 的既有阶段边界上报阶段，**六个**: 受理（等 maintenance gate + 扫描分裂点，
+     此时还没冻）→ 冻结 → 排空（compaction、GC，含 flush）→ commit_length →
+     `multi_modify_split`（元数据）→ 解冻。第一个阶段是评审补上的:gate 等待和中位数扫描
+     才是真正会等几十秒的地方，而 `has_overlap` 重试恰好落在这一段。
+     merge 四个，顺序是 **owner-lock → 冻结双方 → 六个 commit_length → `multi_modify_merge`**
+     （owner lock 在最前，且它是冻结+排空，不是 flush）。
+  2. **报阶段序号，不报字节**。各阶段代价极不均匀（flush 占大头），字节数会在 flush 上
+     长时间不动、反而像卡住；`done/total` 用阶段序号是这里唯一诚实的单位。
+     （这一条与仓库既有约定"进度是原始计数不是百分比"不冲突：消费者仍自己算比例。）
+  3. manager 加 `update_progress_by_part(kind, part_id, done, total)`，匹配该分区上
+     RUNNING 的 split/merge 条目。
+- **⚠️ 不需要动 wire，这是本条与 `F-RECOVERY-PROGRESS` 的关键分野**: `SplitPartReq` 里没有
+  `op_id`，加一个就是 rkyv 结构变更 → 版本 bump → `MIN=MAX` 全停。**不用加**——样本装在
+  `PartitionLoad` 里上来，manager 本来就知道是哪个分区，PS 报 `op_id: 0` 并由 manager 按
+  (kind, part_id) 匹配即可。这正是 `update_progress_by_extent` 已有的先例，它存在的原因
+  就是"extent node 永远不知道 manager 的 op id"。`F-RECOVERY-PROGRESS` 走 EN 的 `DfResp`，
+  那条才必须动 wire；两条不要混为一谈。
+- **Acceptance**:
+  - 对一个足够大的分区发起 split，`autumn-op ops status <id>` 的 `progress_done` 在操作
+    进行中**非递减**（心跳 5 s 一次，一个阶段会横跨多个样本，所以"严格单调"不是可达的标准），
+    并在终态等于 `progress_total`——后者靠 `finish` 对 SUCCEEDED 快照到满格，因为最后两个
+    阶段与 RPC 返回之间没有 `.await`，没有任何一次心跳能落在那里。
+    **消融: 去掉 PS 侧的上报，该断言变红**。
+  - 人为让某一阶段挂住（如注入一个不返回的 flush），进度**停在该阶段不动**，
+    且停住的位置在 `ops status` 上可见 —— 即"慢"和"卡"可区分，这是本条存在的全部理由。
+  - merge 同样两条。
+  - 单测层面: `update_progress_by_part` 只触碰 RUNNING 条目，终态条目不被样本复活
+    （与 `update_progress_by_extent` 同型，直接复用其测试形状）。
+- **Status**: `passes: false` (2026-09-09) — 已实现、单测与消融通过、docs 已更新；
+  **验收未做**（要在真集群上切一个够大的分区看进度推进与注入挂起）。
+  评审补掉的两个真缺陷:(1) split 有九条退出路径不清 slot，残留阶段会被**下一次** split
+  继承——已改为 RAII 守卫，drop 时清，覆盖所有 `?` 与 early return；
+  (2) 阶段 5/6 与 RPC 返回之间没有 `.await`，心跳采不到，SUCCEEDED 却显示中间阶段——
+  已让 `finish` 对成功的 op 快照到满格（`reconcile_outcome` 早有同款逻辑，注释里记的正是
+  EC 转换停在 75% 那次）。
+
 ### F-EXTENT-PLACEMENT — extent 分片放到哪台，两条路径两套策略，且都不看均衡
 - **Trigger** (2026-09-05，AZ 迁移实测暴露): 迁移中发现"逐台下线"会让数据**回流到还没下线的
   机器上**。查证后发现根因不是迁移顺序，而是**同一个问题在代码里有两套互不相干的答案**。

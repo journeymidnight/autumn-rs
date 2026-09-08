@@ -2165,7 +2165,21 @@ impl AutumnManager {
                     Ok(()) => ActuationResult::Terminal {
                         state: OP_STATE_SUCCEEDED,
                         error: String::new(),
-                        message: format!("split part {} dispatched", spec.part_id),
+                        // Past tense, like the merge arm below, because that is
+                        // what happened: `auto_dispatch_split` waits on the PS's
+                        // reply and bails unless it is CODE_OK, so reaching here
+                        // means the PS performed the split and acknowledged it.
+                        // "dispatched" said the opposite — handed off, outcome
+                        // unknown — and an operator reading `succeeded ...
+                        // dispatched` in the ops table reasonably concludes that
+                        // something is still pending and goes looking for the
+                        // part that finishes it. Nothing does; the metadata cut
+                        // is already in effect. (What IS still pending is
+                        // physical: the children share extents until compaction
+                        // and GC separate them, which is why their reported
+                        // sizes stay at the parent's for a while. That is not
+                        // this op.)
+                        message: format!("split part {} in two", spec.part_id),
                     },
                     Err(e) => terminal_err(format!("{e:#}")),
                 }
@@ -2479,7 +2493,7 @@ impl AutumnManager {
             anyhow::bail!("split returned code {}: {}", resp.code, resp.message);
         }
         tracing::info!(
-            "auto-split part={} dispatched OK",
+            "auto-split part={} done (PS acknowledged)",
             cand.primary_part_id
         );
         Ok(())

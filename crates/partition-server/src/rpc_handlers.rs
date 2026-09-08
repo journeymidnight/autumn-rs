@@ -1436,6 +1436,16 @@ async fn range_scan_sst_merge(
     Ok(out)
 }
 
+/// Phases a split walks, reported on the load heartbeat so the ops table can
+/// say WHERE a frozen partition is rather than only that it is frozen:
+/// 1 = accepted, waiting on the maintenance gate and choosing a split key,
+/// 2 = frozen (writes stop here), 3 = drained, 4 = `commit_length` captured,
+/// 5 = metadata cut committed, 6 = unfrozen. Phases and not bytes because the
+/// costs are wildly uneven — the gate wait, the median scan and the drain
+/// dominate — and a byte counter that sits still through the expensive step
+/// reads as a hang.
+const SPLIT_PHASES: u64 = 6;
+
 /// #6: per-attempt timeout for `multi_modify_split` in the split path. SHORT
 /// (vs the StreamClient default) so the freeze critical section stays under
 /// FREEZE_TTL — a split that COMMITS after the freeze lapsed seals the
@@ -1521,10 +1531,24 @@ pub(crate) async fn handle_split_part(
     //      cross-partition peak RAM. Inner to the gate.
     // Both RAII-held through `multi_modify_split` AND the P-sst barrier
     // ACK below.
-    let (maintenance_gate, concurrency) = {
+    let (maintenance_gate, concurrency, phase) = {
         let p = part.borrow();
-        (p.maintenance_gate.clone(), p.concurrency_ctrl.clone())
+        (
+            p.maintenance_gate.clone(),
+            p.concurrency_ctrl.clone(),
+            // Owns an Arc and clears the slot on drop, so every exit below —
+            // the three `?` through `unfreeze_on_err`, both barrier timeouts,
+            // the TTL aborts — is covered without a list that goes stale.
+            crate::MaintenancePhaseGuard::new(p.metrics.clone()),
+        )
     };
+    // Reported BEFORE the gate wait, because the gate is the first thing that
+    // can block for a long time (an in-flight compaction on this partition),
+    // and the SST median scan after it is the second. Writes are not frozen
+    // yet, but this is where a split sits when it looks stuck — including
+    // during the `has_overlap` retry loop — so leaving it unnarrated left the
+    // one question this feature answers unanswered for that whole window.
+    phase.set(manager_rpc::OP_KIND_SPLIT, 1, SPLIT_PHASES);
     let _local_maintenance_gate = maintenance_gate.acquire().await;
     let _compact_permit = concurrency.acquire_compact().await;
 
@@ -1688,6 +1712,10 @@ pub(crate) async fn handle_split_part(
                 "partition is frozen for merge; retry split after merge completes".to_string(),
             ));
         }
+        // Writes stop on this line and do not resume until the end of the
+        // function — the window an operator most needs narrated.
+        p.metrics
+            .set_maintenance_phase(manager_rpc::OP_KIND_SPLIT, 2, SPLIT_PHASES);
         p.frozen_for_split.set(Some(std::time::Instant::now()));
         *p.split_drain_ack.borrow_mut() = Some(drain_tx);
         // fix — wake partition_loop so its idle-path
@@ -1704,7 +1732,12 @@ pub(crate) async fn handle_split_part(
     // unfreeze and propagate.
     let drain_outcome = drain_rx.await;
     match drain_outcome {
-        Ok(Ok(())) => {} // drain succeeded
+        Ok(Ok(())) => {
+            // Drained. This and the flush inside it are the expensive part, so
+            // an operator watching a stuck split will usually see it stop here
+            // — which is the point: phase 2 standing still names the step.
+            phase.set(manager_rpc::OP_KIND_SPLIT, 3, SPLIT_PHASES);
+        }
         Ok(Err(msg)) => {
             // Drain hit a flush failure or TTL. Clean up.
             part.borrow().frozen_for_split.set(None);
@@ -1779,6 +1812,7 @@ pub(crate) async fn handle_split_part(
         .commit_length_with_tail(meta_stream_id)
         .await
         .map_err(|e| unfreeze_on_err(e, "meta_stream"))?;
+    phase.set(manager_rpc::OP_KIND_SPLIT, 4, SPLIT_PHASES);
     {
         let p = part.borrow();
         tracing::info!(
@@ -1996,6 +2030,7 @@ pub(crate) async fn handle_split_part(
         part.borrow().frozen_for_split.set(None);
         return Err((StatusCode::FailedPrecondition, split_err));
     }
+    phase.set(manager_rpc::OP_KIND_SPLIT, 5, SPLIT_PHASES);
 
     // #6 belt-and-braces behind the deadline-bound prevention: re-verify the
     // freeze HELD continuously through the commit. If `check_freeze_ttls`
@@ -2112,7 +2147,13 @@ pub(crate) async fn handle_split_part(
     // (this partition's) post-split rg is now in effect, and merged
     // commit_length matches the manager's sealed_length. Writes can
     // resume against the narrower range.
+    phase.set(manager_rpc::OP_KIND_SPLIT, SPLIT_PHASES, SPLIT_PHASES);
     part.borrow().frozen_for_split.set(None);
+    // The guard clears the slot as this returns. The manager snaps a SUCCEEDED
+    // op's progress to its total on `finish`, so the terminal row reads 6/6
+    // rather than whichever phase the 5 s heartbeat last caught — the last two
+    // phases have no `.await` between them and the reply, so no tick can land
+    // there.
 
     Ok(partition_rpc::rkyv_encode(&SplitPartResp {
         code: CODE_OK,

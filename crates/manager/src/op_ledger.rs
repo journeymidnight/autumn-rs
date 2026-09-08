@@ -176,6 +176,18 @@ impl OpLedger {
                 if !message.is_empty() {
                     e.message = message;
                 }
+                // Snap to complete, for the same reason `reconcile_outcome`
+                // does. An in-process op closes here the instant its RPC
+                // returns, and the last phase it published had no heartbeat
+                // window to travel in — a split's final phases are separated
+                // from the reply by no `.await` at all — so a SUCCEEDED split
+                // was left displaying whichever middle phase the 5 s tick
+                // happened to catch. A SUCCEEDED op IS done. A FAILED one keeps
+                // its last real phase, because "died at phase 3" is the whole
+                // point of publishing phases.
+                if state == OP_STATE_SUCCEEDED && e.progress_total > 0 {
+                    e.progress_done = e.progress_total;
+                }
                 e.finished_at = now_s;
                 if e.started_at == 0 {
                     e.started_at = now_s;
@@ -549,6 +561,43 @@ impl OpLedger {
         }
     }
 
+    /// Apply a progress sample for a PARTITION-scoped op the PS is executing
+    /// (split / merge).
+    ///
+    /// Keyed by partition for the same reason `update_progress_by_extent` is
+    /// keyed by extent: the executor never learns the manager's op id.
+    /// `SplitPartReq` carries only `part_id` and an optional split key, and
+    /// adding an id to it would be an rkyv struct change — a wire bump, and
+    /// with `MIN == MAX` that is a stop-the-world rollout for a progress
+    /// sample. The sample arrives inside a `PartitionLoad`, so the partition is
+    /// already known; that is enough to find the entry.
+    ///
+    /// Only a RUNNING entry is touched, so a sample that overtakes the op's
+    /// completion cannot re-animate a terminal record.
+    /// `secondary_id` narrows the match where the kind has one — a merge is
+    /// identified by (survivor, victim), and `submit` dedups on all three, so
+    /// two merges sharing a survivor can be RUNNING at once. Matching the
+    /// survivor alone would let the second one's phase 1 land on the first and
+    /// walk it backwards. Split passes 0, which is what its entry holds.
+    pub(crate) fn update_progress_by_part(
+        &mut self,
+        kind: u8,
+        part_id: u64,
+        secondary_id: u64,
+        done: u64,
+        total: u64,
+    ) {
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == kind
+                && e.part_id == part_id
+                && e.secondary_id == secondary_id
+                && e.state == OP_STATE_RUNNING
+        }) {
+            e.progress_done = done;
+            e.progress_total = total;
+        }
+    }
+
     /// TTL backstop: a RUNNING PS-executed op (compact/gc/forcegc) whose terminal
     /// outcome never came back becomes UNKNOWN, keeping `ops status` honest.
     pub(crate) fn sweep_running_ttl(&mut self, now_s: i64) {
@@ -780,6 +829,44 @@ mod tests {
         led.update_progress(999, 1, 2);
         led.update_progress(0, 1, 2);
         assert_eq!(q_one(&led, 999).state, OP_STATE_UNKNOWN);
+    }
+
+    #[test]
+    fn split_progress_is_matched_by_partition_because_the_executor_has_no_op_id() {
+        // `SplitPartReq` carries no op id — adding one would be an rkyv wire
+        // bump for a progress sample — so the PS reports `op_id: 0` and the
+        // manager finds the entry by (kind, part_id). Same reason
+        // `update_progress_by_extent` exists for extent nodes.
+        let mut led = OpLedger::new();
+        let (id, _) = led.submit(OP_KIND_SPLIT, 44, 0, vec![], "cli".into(), 0, 0);
+        led.set_running(id, 0);
+
+        led.update_progress_by_part(OP_KIND_SPLIT, 44, 0, 2, 6);
+        let r = q_one(&led, id);
+        assert_eq!((r.progress_done, r.progress_total), (2, 6));
+
+        // A later phase wins; phases only move forward in practice, but the
+        // rule is the same as every other sample: latest wins.
+        led.update_progress_by_part(OP_KIND_SPLIT, 44, 0, 4, 6);
+        assert_eq!(q_one(&led, id).progress_done, 4);
+
+        // Another partition's split must not be written here, and neither must
+        // a different kind on the same partition.
+        led.update_progress_by_part(OP_KIND_SPLIT, 45, 0, 1, 6);
+        led.update_progress_by_part(OP_KIND_GC, 44, 0, 1, 6);
+        assert_eq!(q_one(&led, id).progress_done, 4);
+
+        // The split's terminal state arrives as the RPC reply, and the PS may
+        // still have one sample in flight behind it. It must not reopen the op
+        // or move the counters — the same hazard `update_progress` guards.
+        assert!(led.reconcile_outcome(id, OP_STATE_SUCCEEDED, String::new(), String::new(), 5));
+        led.update_progress_by_part(OP_KIND_SPLIT, 44, 0, 6, 6);
+        let done = q_one(&led, id);
+        assert_eq!(done.state, OP_STATE_SUCCEEDED);
+        assert_eq!(
+            done.progress_done, 4,
+            "a phase arriving after the outcome must not touch a terminal entry"
+        );
     }
 
     /// The 30-min TTL flip to UNKNOWN must not be terminal. The PS keeps

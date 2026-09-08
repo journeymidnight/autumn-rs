@@ -70,6 +70,54 @@ autumn-op gc 7 --wait --timeout 300         # block until terminal; non-zero exi
   leader; compact/gc/forcegc run on the PS and report their terminal outcome +
   error back on the 5 s load heartbeat (so terminal state appears within
   ~5–10 s); ec-convert closes when the conversion applies.
+
+### Watching a split or merge while it runs
+
+Both **freeze the partitions for their whole duration** — writes stop — so the
+question during one is "which step is it on, and has it stopped moving". They
+report a PHASE on the load heartbeat:
+
+```bash
+autumn-op ops status <ID>        # progress_done / progress_total = phase / phases
+```
+
+| | split (6) | merge (4) |
+|---|---|---|
+| 1 | accepted; waiting on the maintenance gate, choosing a split key | owner lock held |
+| 2 | frozen — writes stop here | both partitions frozen |
+| 3 | drained (compaction + GC + flush) | all six `commit_length`s captured |
+| 4 | `commit_length` captured | metadata merge committed |
+| 5 | metadata cut committed | — |
+| 6 | unfrozen | — |
+
+Phases, not bytes, because the steps cost wildly different amounts: the gate
+wait, the median scan and the drain dominate, and a byte counter that sits still
+through them reads as a hang.
+
+**Phase 1 is where a split waits, and it is not frozen there** — it is queued
+behind an in-flight compaction on the partition, or scanning SSTs for a split
+key. A split sitting at 1 is normal and costs nothing but time.
+**Phase 2 and 3 are the frozen ones**, and they are bounded: `FREEZE_TTL` is
+30 s and the manager's split call times out at 60 s, so a split cannot sit
+frozen for minutes — it fails within one. If you see a partition frozen longer
+than that, the freeze is orphaned, not slow.
+
+Samples arrive on the 5 s heartbeat, so a split that finishes in under ~5 s may
+show no intermediate phase at all — that is not a fault.
+
+**`cannot split: partition has overlapping keys`** is not an error to chase: the
+PS refuses to split while the LSM still has overlapping key ranges
+(`has_overlap != 0`), which compaction resolves. Retry; `policy-candidates`
+shows the partition's `lsm` figure shrinking as it becomes splittable.
+
+**What "split finished" means.** The op reaching `succeeded` means the metadata
+cut is in effect and the new partition is being served — `autumn-op info` shows
+one more partition immediately. It does NOT mean the data is physically
+separated: the children share extents copy-on-write, so all of them keep
+reporting the parent's size until compaction and GC reclaim what each no longer
+needs. Do not wait for the sizes to fall, and do not re-split because they have
+not: `policy-candidates` uses `est_live` over the key range, not the physical
+extent footprint, so it stops recommending the split as soon as the cut lands.
 - **Auto-dispatched ops are tracked too.** Extent **recovery** (replica rebuild)
   is never submitted by an operator — it appears in the ledger on its own when
   the recovery loop dispatches it:

@@ -1145,6 +1145,22 @@ each `MSG_READ_BYTES` under the frame's `payload_len: u32` ceiling.
 `dispatch_partition_rpc`, so all partition-state mutations are single-writer on the
 partition thread.
 
+**It reports a phase on every load heartbeat** (`MaintenancePhaseGuard`, six
+phases; see the manager guide for why they are phases and not bytes). Two things
+about it are load-bearing:
+
+- The guard clears the slot **on drop**, not at each exit. This function has a
+  dozen ways out — three `?` through `unfreeze_on_err`, two barrier timeouts,
+  the TTL aborts — and a list of clear-sites goes stale the first time somebody
+  adds an early return. A missed one is worse than no reporting: the slot rides
+  every later heartbeat, and the NEXT split on this partition spends its whole
+  pre-freeze stretch (gate wait, median scan) with no sample of its own, so the
+  stale phase gets stamped onto it and then walks backwards.
+- Phase 1 is published **before** `maintenance_gate.acquire()`, deliberately.
+  That wait, and the SST median scan after it, are where a split actually sits —
+  including through the `has_overlap` retry loop — and it is not frozen there.
+  Phases 2–3 are the frozen ones, bounded by `FREEZE_TTL` (30 s).
+
 ```
 handle_split_part(req):
   1. Reject if part.has_overlap == 1 (run major compaction first)

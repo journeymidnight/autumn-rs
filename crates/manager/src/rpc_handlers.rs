@@ -4154,6 +4154,11 @@ impl AutumnManager {
     //     either the merge committed (PS reopens with merged state) or
     //     it didn't (PS reopens with original state).
     pub(crate) async fn handle_merge_partitions(&self, payload: Bytes) -> HandlerResult {
+        // 1 = owner lock held, 2 = both partitions frozen, 3 = all six
+        // commit_lengths captured, 4 = metadata merge committed. Phases and not
+        // bytes, for the same reason split reports phases: the steps cost
+        // wildly different amounts and a stalled byte counter reads as a hang.
+        const MERGE_PHASES: u64 = 4;
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&MergePartitionsResp {
                 code: Self::err_to_code(&err),
@@ -4244,8 +4249,26 @@ impl AutumnManager {
             "admin-merge:{}:{}",
             req.survivor_part_id, req.victim_part_id
         );
+        // Phase reporting, same purpose as split's: from the freeze below until
+        // the end, BOTH partitions stop serving writes, and one terminal row in
+        // the ops table cannot distinguish "merging" from "wedged". Merge is
+        // orchestrated here rather than on a PS, so it updates the ledger
+        // directly — but by (kind, part_id) like split, so both kinds read the
+        // same way. See F-SPLITMERGE-PROGRESS.
+        let merge_phase = |n: u64| {
+            self.ops.borrow_mut().update_progress_by_part(
+                autumn_rpc::manager_rpc::OP_KIND_MERGE,
+                req.survivor_part_id,
+                req.victim_part_id,
+                n,
+                MERGE_PHASES,
+            );
+        };
         let owner_epoch = match self.acquire_owner_epoch(&owner_key).await {
-            Ok(r) => r,
+            Ok(r) => {
+                merge_phase(1);
+                r
+            }
             Err(e) => {
                 return Ok(rkyv_encode(&MergePartitionsResp {
                     code: Self::err_to_code(&e),
@@ -4338,6 +4361,7 @@ impl AutumnManager {
                 new_log_tail_extent_id: 0,
             }));
         }
+        merge_phase(2); // both sides frozen — writes are stopped from here
         to_unfreeze.push((s_info.part_addr.clone(), req.survivor_part_id));
 
         // Capture commit_length on each of the 6 streams. Reuse the
@@ -4451,6 +4475,8 @@ impl AutumnManager {
             }));
         }
 
+        merge_phase(3); // all six commit_lengths captured under the freeze
+
         // Run the existing merge txn under the same owner-lock.
         let mmm_req = MultiModifyMergeReq {
             survivor_part_id: req.survivor_part_id,
@@ -4484,6 +4510,7 @@ impl AutumnManager {
         // Success path: leave both PSes frozen. Their region_sync_loop
         // will, on its next ~2 s tick, observe the new region state and
         // drop the frozen `PartitionData` entirely — natural unfreeze.
+        merge_phase(MERGE_PHASES); // committed; the PSs unfreeze on their next tick
         Ok(rkyv_encode(&MergePartitionsResp {
             code: CODE_OK,
             message: String::new(),
@@ -4801,10 +4828,15 @@ impl AutumnManager {
             .iter()
             .flat_map(|l| l.maintenance_outcomes.iter().cloned())
             .collect();
-        let load_progress: Vec<autumn_rpc::manager_rpc::MaintenanceProgress> = req
+        // Carry the partition with the sample. A split/merge cannot name the
+        // manager's op id — `SplitPartReq` has no field for one, and adding it
+        // would be a wire bump for a progress sample — so those report `op_id:
+        // 0` and are matched by (kind, part_id) instead. Flattening the
+        // partition away here is what used to make that impossible.
+        let load_progress: Vec<(u64, autumn_rpc::manager_rpc::MaintenanceProgress)> = req
             .partitions
             .iter()
-            .flat_map(|l| l.active_maintenance.iter().cloned())
+            .flat_map(|l| l.active_maintenance.iter().cloned().map(move |m| (l.part_id, m)))
             .collect();
         let mut p = self.policy.borrow_mut();
         // honour the configured `window_buckets / bucket_sec`
@@ -4827,10 +4859,18 @@ impl AutumnManager {
         // completion arriving in the same heartbeat cannot leave the entry
         // showing progress on a closed op — `update_progress` only touches
         // RUNNING entries, and the outcome flips it terminal afterwards.
-        for p in &load_progress {
-            self.ops
-                .borrow_mut()
-                .update_progress(p.op_id, p.done, p.total);
+        for (part_id, p) in &load_progress {
+            if p.op_id != 0 {
+                self.ops
+                    .borrow_mut()
+                    .update_progress(p.op_id, p.done, p.total);
+            } else {
+                // Split's ledger entry carries `secondary_id == 0`, and split
+                // is the only kind that reports without an op id from a PS.
+                self.ops.borrow_mut().update_progress_by_part(
+                    p.kind, *part_id, 0, p.done, p.total,
+                );
+            }
         }
         // Reconcile PS-executed op outcomes into the ledger (known op_id only,
         // idempotent) and audit each terminal transition exactly once.

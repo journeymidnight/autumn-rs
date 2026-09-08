@@ -1,3 +1,48 @@
+Date: 2026-09-09
+TaskStatus: not_completed
+Task scope: F-SPLITMERGE-PROGRESS — split/merge 全程冻结分区却不报进度。已立账、已实现、
+  单测与消融通过、docs/ops.md 已更新；**未提交、未构建、未上线**，故 not_completed。
+
+【做了什么】
+  - manager `op_ledger.rs`: 新增 `update_progress_by_part(kind, part_id, done, total)`，
+    只触碰 RUNNING 条目。
+  - manager `rpc_handlers.rs`: 心跳里的 `load_progress` 改为携带 part_id（原来 flat_map
+    把它展平丢了）；`op_id != 0` 走旧路，`== 0` 按 (kind, part_id) 匹配。
+    merge 在自己的编排里报 4 个阶段（owner lock → 双方冻结 → 六个 commit_length → 提交）。
+  - PS `lib.rs`: 新增 `set_maintenance_phase`，故意报 `op_id: 0`——已有的
+    `set_maintenance_progress` 在 op_id==0 时早退，那是给 PS 本地调度用的语义。
+  - PS `rpc_handlers.rs`: split 报 5 个阶段，成功与 `!split_ok` 两条路上清 slot。
+  - manager `lib.rs`: split 终态消息 `dispatched` → `split part {} in two`，与 merge 的
+    `merged part {} into {}` 对齐（见下）。
+
+【关键设计判断:不动 wire】
+  `SplitPartReq` 没有 op_id，加一个就是 rkyv 结构变更 → 版本 bump → MIN=MAX 全停，
+  为一条进度样本不值。样本装在 PartitionLoad 里上来，manager 本就知道分区，所以按
+  (kind, part_id) 匹配。先例是 `update_progress_by_extent`，它存在的原因一模一样。
+  这也是本条与 F-RECOVERY-PROGRESS 的分野——那条走 EN 的 DfResp，**必须**动 wire。
+
+【报阶段不报字节】
+  split 各阶段代价极不均匀（drain+flush 占大头），字节数会在贵的那步长时间不动、
+  反而像卡住。阶段序号是这里唯一诚实的单位。
+
+【dispatched 这个词是错的,已改】
+  `auto_dispatch_split` 是同步 RPC，解码后 `resp.code != CODE_OK` 就 bail，只有 PS
+  做完并确认才返回 Ok。所以看到 "dispatched" 时 PS 已经切完了；这个词读起来像
+  "已投递、结果未知"，运维会去找那个"完成它"的东西——没有。真正还没完的是物理分离
+  （共享 extent 等 compaction/GC），但那不属于这个 op，已写进 docs/ops.md。
+
+【测试】
+  op_ledger 新增 `split_progress_is_matched_by_partition_...`；两条消融都验证变红:
+  去掉 RUNNING 判定、不比 kind。manager --lib 321 passed。
+  ⚠️ 本机跑不了 `cargo test -p autumn-manager`:dev-deps 里的 autumn-fuse → fuser 需要
+  libfuse，macOS 没有。是临时注释掉那条 dev-dep 跑的，跑完已还原（git diff 为空）。
+
+Main gaps: 未做真实集群验证——验收要求"进度随时间单调增长"和"注入挂起后停在该阶段"，
+  两条都需要在真集群上切一个足够大的分区来观察。part 17 正好是待切候选
+  (est_live 53 GiB, lsm 701 MiB)，可以拿它验。
+Next steps: fable 评审回来后处理高危项 → commit → CP 构建 autumn-rs → 滚 manager+PS →
+  用 part 17 的一次真实 split 完成验收两条 → 回填 feature_list 状态。
+
 Date: 2026-09-05
 TaskStatus: not_completed
 Task scope: (1) EC recovery 修复线，三条改动全部落地并**在生产验证**；
