@@ -1,5 +1,110 @@
 Date: 2026-09-09
 TaskStatus: not_completed
+Task scope: (1) wire 37 -> 38 的三条改动（EN 失败原因走 df 心跳、seed_replay 读 marker
+  的 started_at、删除 OpRecord.attempts）；(2) EN 从单个 StatefulSet 拆成每 EN 一个
+  Deployment + 退役脚本。代码与文档已完成、单测与消融通过；**未提交、未构建、未上线**，
+  故 not_completed。
+
+【wire 38 三条】
+  - `DfResp` 新增 `op_failures: Vec<ExtentOpFailure{extent_id,kind,error_code,reason}>`，
+    按 done_tasks/ec_done/scrub_rot 已有的**至多一次排空**惯例；EN 在重试循环每次尝试
+    失败时上报（就在 `progress.set(0,0)` 旁边），manager 在 recovery.rs 消费，调
+    `record_node_op_failure`。该函数**只更新不创建**——node 报的是 manager 没在跟踪的 op
+    时，说明那个 op 已经关闭或从未存在，凭它建条目就会留下没有 marker、永远不会被关闭的
+    RUNNING 条目（理由与 `update_progress_by_extent` 完全相同）。
+    error_code 一律用 CODE_ERROR：`run_recovery_task` 返回的是 String，更细的分类只能
+    靠猜自己的散文；可动作的那半是 reason，它被整条带上来。
+  - `seed_replay` 改收 `(extent_id, started_at)`，数据来自 `MgrExtentInflightRecord`
+    （字段本来就有）。新增 `inflight_started_at_ec_recovery()`，不动
+    `inflight_snapshot_ec_recovery` 的签名——它另外 3 个调用点只问成员关系。
+  - `OpRecord.attempts` 整个删掉（含 CLI 展示、note_*_dispatch 的写入、note_ec_dispatch
+    的 `started_new` 参数——该参数只为 attempts 存在）。删它是安全的，因为它想代理的问题
+    （"在重试吗？为什么？"）现在由实时 reason 直接回答；而它在 manager 重启后从 0 重数，
+    本身就会误导。
+
+【EN workload】
+  - `deploy/scripts/en-workload.sh` 渲染每 EN 一个 Deployment + PVC；
+    `deploy/k8s/extent-node.yaml` 由它生成（头部写明重新生成的命令）。
+  - `deploy/scripts/en-decommission.sh` 封装 fence → 等排干 → remove → 删 workload，
+    通过 pod IP 解析 node_id（唯一诚实的连接键），剩余节点低于副本数则拒绝。
+  - 动机见 feature_list 的 F-EN-WORKLOAD-IDENTITY：当前状态下 `scale` 会砍错对象。
+
+【测试】
+  cargo check --workspace --exclude autumn-fuse 通过；`cargo test -p autumn-stream --lib`
+  170 passed；`cargo test -p autumn-manager --lib` 330 passed。
+  ⚠️ manager 的测试本机跑不了（dev-dep autumn-fuse -> fuser 需要 libfuse），是临时注释掉
+  那条 dev-dep 跑的，跑完已还原（git status 干净）。
+  消融两条各自变红并在还原后恢复绿：
+  (A) seed_replay 改回盖 now_s -> `seed_ec_replay_makes_inflight_ec_listable_and_closable`
+      的 "a replayed op must not look freshly started" 红；
+  (B) `record_node_op_failure` 去掉 RUNNING 判定 ->
+      `a_node_reported_failure_updates_a_running_entry_and_creates_none` 的
+      "a closed op must not be restamped" 红。
+
+【fable 评审结果】三条阻断项已修（详见 feature_list 的 F-EN-WORKLOAD-IDENTITY）：
+  STS→Deployment 迁移会两进程共盘（EN 对 data-dir 不加锁 + RWO 是节点级语义）；
+  退役脚本解析不到 Deployment 的 pod 名；vke overlay 的 patch 静默跳过。
+  另外它发现一条我完全漏了的：**`OpRecord` 被 rkyv 持久化进 etcd 的 `opLog/`**
+  （190 条，前缀在根下不是 autumn-rs/ 下——我按它的说法去查，路径它也写错了）。
+  删字段后老记录解不出来：`rkyv_decode` 失败 → warn + 跳过，不致命，但 `ops history`
+  会读空并刷 190 行 warn。已写进升级步骤：全停窗口里 `etcdctl del --prefix 'opLog/'`。
+  评审说 Cargo.lock 脏——当时不成立，但最后一次跑 manager 测试后确实脏了，已 checkout 还原。
+
+Main gaps: 未提交、未构建。上线是**全停**：wire 38 与 37 不兼容，
+  autumn-rs 与 freetoken-l3 两个镜像必须同 commit 重建（freetoken-l3 的 AUTUMN_IMAGE
+  是流水线参数，要用浏览器改）。buda-webui 无需重建（实测无 autumn 客户端）。
+Next steps: fable 评审 -> 提交 -> 构建 autumn-rs + freetoken-l3 -> 一次全停里同时做
+  升级与 EN workload 迁移 -> 用退役脚本把 en-7/en-8 摘掉落到 5 台 -> 回填两条 feature
+  的验收状态。
+  另：claude-progress.txt 已 62 KB，2026-09-05 那条 639 行、标着 not_completed 但正文说
+  两件事都已收尾——下次开工前应确认后压缩或删除（CLAUDE.md 第 12 条）。
+
+Date: 2026-09-08
+TaskStatus: not_completed
+Task scope: F-RECOVERY-PROGRESS 的 EC 分片重建这一条路径——让 `stream_ec_recovery_payload`
+  上报进度。副本恢复与 EC convert 早已上报，manager 侧消费也早已通；这条是最后缺口。
+  已实现、单测 + 消融通过、docs/ops.md 与 crates/stream/CLAUDE.md 已更新；**未提交、未上线、
+  未做真集群验收**，故 not_completed。
+
+【做了什么】（全部在 crates/stream/src/extent_node.rs）
+  - `stream_ec_recovery_payload` 拆成两半：`rebuild_ec_shard_by_stripes`（条带走查：
+    plan → 解码 → pwrite → 上报，peer 读取以闭包传入，测试可不带 peer 驱动）和
+    `fetch_ec_stripe_from_peers`（原来的 per-stripe peer 循环，逐字搬过去）。
+  - 上报点：进入走查先报 `(0, want)`；每条带 **pwrite 之后** 报 `(offset+span, want)`。
+    kind = OP_KIND_RECOVERY（manager 的 ledger 条目就是 `(OP_KIND_RECOVERY, extent_id)`，
+    op_ledger.rs:332/345/460/473 核实过）。
+  - 新增 `OpProgressGuard`（同 PS 的 `MaintenancePhaseGuard` 形状，Drop 清 slot），
+    由 recovery 重试循环持有；每次尝试开始 `set(0, 0)`。原来放弃路径（10 次重试用尽）
+    只删 `recovery_inflight` 不清 progress，是个真实漏洞，guard 顺手堵上。
+  - 不动 wire：`DfResp.op_progress` 早已存在。
+
+【进度语义的判断】
+  样本必须报在"条带写入之后"而不是"peer 回应时"：一个条带要凑齐 K 个 peer 才能解码，
+  K-1 个回应 = 0 字节输出；若按已取字节计数，一个死 peer 会让"进度"在同一 offset 上
+  看起来一直推进。`done` 停在 64 MiB 边界上不动 = 卡死信号，这是本条要交付的东西。
+
+【测试与消融】`cargo test -p autumn-stream --lib ec_rebuild_progress`，4 条：
+  逐条带样本序列与文件内容 / 缺 K peer 时冻在最后写入边界 / pwrite 失败不算进度 /
+  guard Drop 后 df 不再带样本。消融四项各自变红：去掉写后上报、上报挪到 pwrite 前、
+  去掉 (0,want) 开头样本、Drop 置空。
+
+【fable 评审】两条 must-fix 都已修：(1) docs/ops.md 写了已废弃的
+  `AUTUMN_EXTENT_RECOVERY_PARALLELISM`，改为 `--recovery-parallelism`；(2) 失败后归零
+  原来放在下一轮循环顶部，10 s 重试睡眠期间（≈2 个 df tick）slot 仍挂着已被 unlink 的
+  字节，正好是文档教运维认"卡死"的形状——现改为 Err 分支里立刻 `set(0,0)`。这条改动
+  没有单测（重试循环 10 次 × 10 s 睡眠不可单测），靠读代码核对。
+  评审指出的既有问题（本次未扩大、未修）：同一 extent 上 EC convert 与 recovery 共用一个
+  op_progress key，互相覆盖/清除；同一 extent 两个 slot 同时重建时 ledger 只有一条
+  entry，两个节点的样本互相打架。
+
+Main gaps: 真集群验收未做（分片 >1 GiB 的重建看 `ops list` 单调增长；掐断一个源 peer
+  后进度停在边界不动）。`cargo test -p autumn-manager` 本机跑不了（fuser/libfuse），
+  manager 侧本次未改。
+Next steps: fable 评审 → commit → CP 构建 → 滚 EN → 线上做一次 EC 重建完成验收两条 →
+  回填 feature_list 状态。
+
+Date: 2026-09-09
+TaskStatus: not_completed
 Task scope: F-SPLITMERGE-PROGRESS — split/merge 全程冻结分区却不报进度。已立账、已实现、
   单测与消融通过、docs/ops.md 已更新；**未提交、未构建、未上线**，故 not_completed。
 

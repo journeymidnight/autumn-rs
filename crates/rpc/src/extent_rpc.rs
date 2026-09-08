@@ -988,6 +988,36 @@ pub struct DfResp {
     /// oneself needs no such fencing: a node saying "my own copy is bad" can
     /// only ever cost itself.
     pub scrub_rot: Vec<ScrubRotReport>,
+    /// Failures this node hit while EXECUTING a recovery, drained at-most-once
+    /// like `done_tasks` / `ec_done` / `scrub_rot`. (`kind` is carried so the
+    /// channel generalises, but only the recovery retry loop reports today; EC
+    /// conversion still surfaces its reason in the next dispatch's response.)
+    ///
+    /// Without this a failure inside a rebuild reached only this node's own
+    /// log. The manager learned the reason from the NEXT dispatch's response —
+    /// and re-dispatch is on exponential backoff, so "failing" and "merely
+    /// slow" stayed indistinguishable on the control plane for as long as the
+    /// backoff ran. The progress sample says a rebuild stopped moving; this
+    /// says why, on the same 2 s heartbeat.
+    ///
+    /// A lost report costs nothing: the manager keeps its own dispatch-side
+    /// failures, and the next attempt reports again.
+    pub op_failures: Vec<ExtentOpFailure>,
+}
+
+/// One failure a node hit running an extent-scoped op.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentOpFailure {
+    pub extent_id: u64,
+    /// `manager_rpc::OP_KIND_*` — which op was running, not which op failed to
+    /// be dispatched. Dispatch failures are the manager's own to record.
+    pub kind: u8,
+    /// `CODE_*`; `0` when the node could not classify it.
+    pub error_code: u8,
+    /// The node's own words, shown verbatim to the operator. This is the only
+    /// place a per-peer reason ("peer 83 answered short", "eversion mismatch")
+    /// can reach the control plane.
+    pub reason: String,
 }
 
 /// One extent this node found rotted at rest.

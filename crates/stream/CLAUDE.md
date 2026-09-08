@@ -1257,8 +1257,30 @@ offset → drop → next. **Peak resident = one chunk**, independent of extent s
 one `sync_data` after the full write. `dest` is truncated to 0 before each
 source attempt, so a mid-stream source failure abandons that source and the next
 restarts from offset 0 (partial write discarded — no corruption). Succeeds only
-on a full `sealed_length` transfer. EC recovery (`run_ec_recovery_payload`) still
-buffers shard-sized (≈ `sealed/K`).
+on a full `sealed_length` transfer. EC recovery (`stream_ec_recovery_payload`)
+streams too: `rebuild_ec_shard_by_stripes` walks `ec_stripe_plan(want, 64 MiB)`,
+and per stripe `fetch_ec_stripe_from_peers` reads that byte range from K peers
+(exact length or refused), reconstructs the missing range, `pwrite`s it, drops
+it — peak `(K + 1) × stripe`. The walk takes the fetch as a closure so a test
+can drive it without peers.
+
+**Op progress rides `df` (`DfResp.op_progress`, keyed by extent, no op id).**
+`note_op_progress` overwrites one `(kind, done, total)` sample per extent;
+`OpProgressGuard` owns the slot for the life of a task and empties it on
+`Drop`, so an abandoned task cannot keep reporting (the recovery retry loop
+holds one across all attempts; its give-up path has no explicit clear and
+needs none). Rules the samples follow: **counts in bytes, never per byte** —
+one sample per 64 MiB stripe for EC convert and EC rebuild, one per 256 MiB
+chunk for replica copy; **EC rebuild samples AFTER the stripe is written**,
+never when the peers answer — a stripe needs K peers to decode, so a count of
+bytes fetched would move while a dead peer holds the rebuild at one offset
+forever, and `done` frozen at a stripe boundary IS the stall signal; **the
+recovery task opens with `(0, 0)`** (the ledger's "not reported" shape) and
+**resets to it the moment an attempt fails**, before the 10 s retry sleep, so
+a failed attempt's last ratio — bytes it has already unlinked — does not ride
+out the sleep or the next attempt's queue time as a fake stall. EC rebuild uses
+`OP_KIND_RECOVERY`, not a kind of its own: it is one `RecoveryTask`, and the
+manager's ledger entry for it is `(OP_KIND_RECOVERY, extent_id)`.
 
 **Stripe-wise EC convert.** RS over GF(256) is byte-wise per offset
 (`erasure::ec_encode_stripe`, byte-identical to a slice of `ec_encode`), so

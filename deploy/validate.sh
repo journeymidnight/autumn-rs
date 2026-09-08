@@ -6,8 +6,9 @@
 #   - every k8s manifest is well-formed (apiVersion/kind/metadata.name)
 #   - StatefulSet/Job selector.matchLabels ⊆ template labels (k8s hard rule)
 #   - each StatefulSet.serviceName resolves to a headless Service
-#   - the EN StatefulSet advertises its pod IP (AUTUMN_ADVERTISE_IP ← status.podIP;
-# M2 — no per-pod ClusterIP Services anymore)
+#   - the rendered EN Deployment advertises its pod IP (AUTUMN_ADVERTISE_IP ←
+#     status.podIP) and mounts its own PVC by name — no per-pod Services
+#   - shell scripts parse: entrypoint.sh, autumn-deploy, the EN scripts
 #   - Service ports line up with the entrypoint's role port defaults
 #   - kustomization.resources all exist; image name matches
 #
@@ -20,7 +21,8 @@ note() { echo "  $*"; }
 bad()  { echo "  FAIL: $*"; fail=1; }
 
 echo "== shell syntax =="
-for s in "$HERE/docker/entrypoint.sh" "$HERE/baremetal/autumn-deploy"; do
+for s in "$HERE/docker/entrypoint.sh" "$HERE/baremetal/autumn-deploy" \
+         "$HERE/scripts/en-workload.sh" "$HERE/scripts/en-decommission.sh"; do
     if bash -n "$s" 2>/dev/null; then note "OK  $(basename "$s")"; else bad "bash -n $(basename "$s")"; fi
 done
 
@@ -123,34 +125,10 @@ for kind, d in workloads:
 # M2: the EN advertises its OWN pod IP (Downward-API
 # status.podIP) and self-registers under a stable node_uuid — there are NO
 # per-pod ClusterIP Services anymore. Validate the pod-IP wiring instead:
-# the EN StatefulSet must inject AUTUMN_ADVERTISE_IP from status.podIP.
-# (Any leftover per-pod Service is still sanity-checked to target a real
-# ordinal, but it is no longer required.)
-en_ss = next((d for k, d in workloads if k == "StatefulSet" and d["metadata"]["name"] == "autumn-en"), None)
-if en_ss:
-    replicas = en_ss["spec"].get("replicas", 1)
-    valid_pods = {f"autumn-en-{i}" for i in range(replicas)}
-    perpod = [s for n, s in services.items()
-              if (s["spec"].get("selector") or {}).get("statefulset.kubernetes.io/pod-name")]
-    for s in perpod:
-        pod = s["spec"]["selector"]["statefulset.kubernetes.io/pod-name"]
-        if pod not in valid_pods:
-            bad(f"per-pod Service {s['metadata']['name']} targets '{pod}' outside replicas={replicas}")
-        else:
-            ok(f"per-pod Service {s['metadata']['name']} → {pod}")
-    # EN must advertise its pod IP via the Downward API (the M2 identity model).
-    containers = en_ss["spec"]["template"]["spec"].get("containers", [])
-    adv = None
-    for c in containers:
-        for e in (c.get("env") or []):
-            if e.get("name") == "AUTUMN_ADVERTISE_IP":
-                adv = e
-    fp = (((adv or {}).get("valueFrom") or {}).get("fieldRef") or {}).get("fieldPath")
-    if fp == "status.podIP":
-        ok("autumn-en advertises pod IP (AUTUMN_ADVERTISE_IP ← status.podIP)")
-    else:
-        bad("autumn-en StatefulSet must set AUTUMN_ADVERTISE_IP from fieldRef status.podIP")
-
+# The extent nodes are not manifests -- they are rendered per EN by
+# deploy/scripts/en-workload.sh -- so validate the renderer's output instead.
+# This used to read the `autumn-en` StatefulSet, and when the ENs stopped being
+# one the whole check silently became a no-op while still printing OK.
 # port defaults must match the entrypoint role ports
 def svc_ports(n):
     return {p["port"] for p in services.get(n, {}).get("spec", {}).get("ports", [])}
@@ -173,6 +151,65 @@ for n, s in services.items():
 
 sys.exit(rc)
 PY
+
+echo "== rendered extent node =="
+# The ENs are not kustomize resources; the renderer is the only place their pod
+# spec exists, so it is what has to be checked.
+en_rendered="$(mktemp)"
+bash "$HERE/scripts/en-workload.sh" render 7 > "$en_rendered"
+python3 - "$en_rendered" <<'ENPY' || fail=1
+import sys
+try:
+    import yaml
+except ImportError:
+    print("  FAIL: pyyaml not installed"); sys.exit(1)
+with open(sys.argv[1]) as fh:
+    docs = [d for d in yaml.safe_load_all(fh) if d]
+bad_n = 0
+def bad(m):
+    global bad_n; print(f"  FAIL: {m}"); bad_n = 1
+def ok(m): print(f"  {m}")
+
+dep = next((d for d in docs if d["kind"] == "Deployment"), None)
+pvc = next((d for d in docs if d["kind"] == "PersistentVolumeClaim"), None)
+if not dep or not pvc:
+    bad("renderer must emit both a Deployment and a PersistentVolumeClaim"); sys.exit(1)
+
+# k8s hard rule, and easy to break by hand-editing the template.
+sel = dep["spec"]["selector"]["matchLabels"]
+lbl = dep["spec"]["template"]["metadata"]["labels"]
+if all(lbl.get(k) == v for k, v in sel.items()):
+    ok("selector.matchLabels subset of template labels")
+else:
+    bad("Deployment selector.matchLabels is not a subset of the template labels")
+
+# Identity: the EN self-registers under the node_uuid on its PVC and advertises
+# whatever pod IP it currently has. Both halves must be right, or a rescheduled
+# pod either loses its identity or advertises an address nothing can dial.
+c = dep["spec"]["template"]["spec"]["containers"][0]
+adv = next((e for e in (c.get("env") or []) if e["name"] == "AUTUMN_ADVERTISE_IP"), None)
+if ((adv or {}).get("valueFrom", {}).get("fieldRef", {}).get("fieldPath")) == "status.podIP":
+    ok("advertises pod IP (AUTUMN_ADVERTISE_IP <- status.podIP)")
+else:
+    bad("EN must set AUTUMN_ADVERTISE_IP from fieldRef status.podIP")
+
+vols = {v["name"]: v for v in dep["spec"]["template"]["spec"]["volumes"]}
+claim = vols.get("data", {}).get("persistentVolumeClaim", {}).get("claimName")
+if claim == pvc["metadata"]["name"]:
+    ok(f"mounts its own claim by name ({claim})")
+else:
+    bad(f"Deployment mounts {claim!r}, renderer emitted claim {pvc['metadata']['name']!r}")
+
+# A surge pod cannot exist: ReadWriteOnce on a node-pinned local volume means
+# the replacement would wait forever for a disk its predecessor still holds.
+if dep["spec"].get("strategy", {}).get("type") == "Recreate":
+    ok("strategy Recreate (RWO on a node-pinned volume cannot be surged)")
+else:
+    bad("EN Deployment must use strategy Recreate")
+
+sys.exit(bad_n)
+ENPY
+rm -f "$en_rendered"
 
 echo "== kustomization =="
 python3 - "$HERE/k8s" <<'PY' || fail=1

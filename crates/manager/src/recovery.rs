@@ -1516,7 +1516,6 @@ impl AutumnManager {
                     extent_id,
                     e.to_string(),
                     Self::err_to_code(e),
-                    consecutive,
                     now_s2,
                     now_ms,
                 );
@@ -1835,6 +1834,26 @@ impl crate::AutumnManager {
                         p.extent_id,
                         p.done,
                         p.total,
+                    );
+                }
+
+                // Why the node's attempt failed, on the heartbeat. Applied in
+                // the same window as the progress samples and for the same
+                // reason: a failure that arrives in the same `df` as the
+                // completion must not stamp an error onto a closed entry, and
+                // `record_node_op_failure` only touches RUNNING.
+                //
+                // Before this the reason reached the manager only in the NEXT
+                // dispatch's response, which exponential backoff can defer for
+                // a long time — so a rebuild that was failing and one that was
+                // merely slow read the same on the control plane until the
+                // retry came round.
+                for f in &df.op_failures {
+                    self.ops.borrow_mut().record_node_op_failure(
+                        f.kind,
+                        f.extent_id,
+                        f.reason.clone(),
+                        f.error_code,
                     );
                 }
 
@@ -2458,7 +2477,6 @@ impl crate::AutumnManager {
                         ops.note_ec_dispatch(
                             extent_id,
                             coord,
-                            started_new,
                             marker_still_held,
                             now_s,
                             now_ms,

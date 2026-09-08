@@ -322,6 +322,16 @@ pub(crate) struct DoneQueues {
     /// thrown away — on an EN with one shard per core, that is almost all of
     /// them.
     scrub_rot: std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<u64, u64>>>,
+    /// The LATEST failure per (extent, op kind) this node hit while EXECUTING
+    /// an op, drained on the next `df`. Shared across shards for the same
+    /// reason as the queues above (the manager only dials shard 0's control
+    /// port).
+    ///
+    /// A map rather than a queue because the ledger keeps only the last reason:
+    /// a retry loop that fires ten times between two heartbeats should cost one
+    /// entry, not ten.
+    op_failures:
+        std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(u64, u8), (u8, String)>>>,
 }
 
 impl DoneQueues {
@@ -354,6 +364,25 @@ impl DoneQueues {
                 extent_id,
                 eversion,
             })
+            .collect()
+    }
+    fn push_op_failure(&self, extent_id: u64, kind: u8, error_code: u8, reason: String) {
+        self.op_failures
+            .lock()
+            .expect("op_failures")
+            .insert((extent_id, kind), (error_code, reason));
+    }
+    fn take_op_failures(&self) -> Vec<crate::extent_rpc::ExtentOpFailure> {
+        std::mem::take(&mut *self.op_failures.lock().expect("op_failures"))
+            .into_iter()
+            .map(
+                |((extent_id, kind), (error_code, reason))| crate::extent_rpc::ExtentOpFailure {
+                    extent_id,
+                    kind,
+                    error_code,
+                    reason,
+                },
+            )
             .collect()
     }
     fn push_ec(&self, d: crate::extent_rpc::EcConvertDone) {
@@ -7345,7 +7374,6 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
     ) -> Result<u64, String> {
         let data_shards = extent_info.replicates.len();
         let parity_shards = extent_info.parity.len();
-        let n = data_shards + parity_shards;
 
         let all_node_ids: Vec<u64> = extent_info
             .replicates
@@ -7369,75 +7397,77 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
 
         let nodes = self.nodes_map_from_manager().await?;
 
-        for (offset, span) in Self::ec_stripe_plan(want, Self::ec_recovery_stripe_bytes()) {
-            let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
-            let mut collected = 0usize;
-            // Per-peer failure reasons for THIS stripe. A bare `k/K` cannot say
-            // whether a peer was unreachable, rejected the eversion, or
-            // answered short, and those want opposite fixes.
-            let mut why: Vec<String> = Vec::new();
-
-            for (i, &node_id) in all_node_ids.iter().enumerate() {
-                if i == shard_index || node_id == task.node_id {
-                    continue;
-                }
-                let Some((base, shard_ports)) = nodes.get(&node_id) else {
-                    why.push(format!("shard {i} (node {node_id}): not in the manager's node map"));
-                    continue;
-                };
-                // Route to the shard that OWNS the extent. Addressing the base
-                // port sends every read to shard 0, which the peer refuses with
-                // "belongs to shard M not shard 0" -- the whole rebuild then
-                // reports 0/K with every peer healthy and the shards on disk.
-                let routed = shard_addr_for_extent(base, shard_ports, task.extent_id);
-                let addr = &routed;
-                let sock = match parse_addr(addr) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        why.push(format!("shard {i} (node {node_id} at {addr}): {e}"));
-                        continue;
-                    }
-                };
-                match Self::read_bytes_chunk(
-                    sock,
-                    addr,
-                    task.extent_id,
-                    extent_info.eversion,
+        // References, not the values: the closure must not own what the
+        // futures it returns borrow, or every stripe's future would be tied
+        // to the closure's own lifetime.
+        let nodes = &nodes;
+        let all_node_ids = &all_node_ids;
+        self.rebuild_ec_shard_by_stripes(
+            task.extent_id,
+            want,
+            Self::ec_recovery_stripe_bytes(),
+            data_shards,
+            parity_shards,
+            shard_index,
+            dst,
+            move |offset, span| {
+                self.fetch_ec_stripe_from_peers(
+                    task,
+                    extent_info,
+                    shard_index,
+                    nodes,
+                    all_node_ids,
                     offset,
                     span,
-                    PayloadRef::for_extent(extent_info.payload_location, i as u32),
+                    want,
                 )
-                .await
-                {
-                    // EXACT length. A short read is not loud on this path: the
-                    // server answers CODE_OK short, and K stripes short by the
-                    // SAME amount reconstruct without complaint — the RS
-                    // decoder only rejects shards of DIFFERING length — so a
-                    // truncated stripe would be written back as authoritative.
-                    Ok(b) if b.len() as u64 == span => {
-                        shards[i] = Some(b);
-                        collected += 1;
-                        if collected >= data_shards {
-                            break;
-                        }
-                    }
-                    Ok(b) => why.push(format!(
-                        "shard {i} (node {node_id} at {addr}): got {} of {span} bytes",
-                        b.len()
-                    )),
-                    Err(e) => why.push(format!("shard {i} (node {node_id} at {addr}): {e}")),
-                }
-            }
+            },
+        )
+        .await
+    }
 
-            if collected < data_shards {
-                return Err(format!(
-                    "EC recovery: only {collected}/{data_shards} shards available for extent {} \
-                     at [{offset}, {}) of {want}: {}",
-                    task.extent_id,
-                    offset + span,
-                    if why.is_empty() { "no peers attempted".to_string() } else { why.join("; ") }
-                ));
-            }
+    /// The stripe walk of an EC rebuild — plan, decode, write, report — with
+    /// the peer read abstracted into `fetch`.
+    ///
+    /// Split from `stream_ec_recovery_payload` so the walk can be driven by an
+    /// in-memory `fetch` in a test; the real one is `fetch_ec_stripe_from_peers`.
+    /// `fetch(offset, span)` answers with one slot per shard, this node's slot
+    /// `None`, at least `data_shards` of the others `Some` and exactly `span`
+    /// long — or an error naming why it could not.
+    ///
+    /// Progress is one sample per stripe, taken AFTER the stripe is in the
+    /// destination file, with `done` = bytes written so far. Not when the
+    /// peers answer, and never per peer response: a stripe cannot be decoded
+    /// until K peers have answered, so "K-1 of them have" is zero bytes of
+    /// output, and a count of bytes fetched would show the rebuild advancing
+    /// while one slow or dead peer holds it at the same offset for good. A
+    /// `done` frozen at a stripe boundary while the op stays RUNNING is the
+    /// stall signal this reporting exists to give; nothing here may move it
+    /// without bytes to show for it. One sample also lands before the first
+    /// read, so a rebuild that never gets its first stripe reads `0/total` —
+    /// denominator known, ratio honest — instead of "no sample" (which the
+    /// ledger cannot tell from "not started").
+    ///
+    /// Cost: one `Rc<DashMap>` write per stripe, 64 MiB by default.
+    async fn rebuild_ec_shard_by_stripes<F, Fut>(
+        &self,
+        extent_id: u64,
+        want: u64,
+        stripe: u64,
+        data_shards: usize,
+        parity_shards: usize,
+        shard_index: usize,
+        dst: &Rc<compio::fs::File>,
+        fetch: F,
+    ) -> Result<u64, String>
+    where
+        F: Fn(u64, u64) -> Fut,
+        Fut: std::future::Future<Output = Result<Vec<Option<Vec<u8>>>, String>>,
+    {
+        self.note_op_progress(extent_id, autumn_rpc::manager_rpc::OP_KIND_RECOVERY, 0, want);
+
+        for (offset, span) in Self::ec_stripe_plan(want, stripe) {
+            let shards = fetch(offset, span).await?;
 
             let rebuilt = compio::runtime::spawn_blocking(move || {
                 crate::erasure::ec_reconstruct_shard(shards, data_shards, parity_shards, shard_index)
@@ -7450,15 +7480,114 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                 return Err(format!(
                     "EC recovery: reconstructed {} bytes for a {span}-byte stripe of extent {}",
                     rebuilt.len(),
-                    task.extent_id
+                    extent_id
                 ));
             }
             file_pwrite_chunked(dst.clone(), offset, Bytes::from(rebuilt))
                 .await
                 .map_err(|e| e.to_string())?;
+            // After the write, never before it: the bytes are what is being
+            // counted. If the pwrite fails the sample stays at the previous
+            // stripe boundary, which is where the file's content stops.
+            self.note_op_progress(
+                extent_id,
+                autumn_rpc::manager_rpc::OP_KIND_RECOVERY,
+                offset + span,
+                want,
+            );
         }
 
         Ok(want)
+    }
+
+    /// Read one stripe's byte range from `data_shards` healthy peers.
+    ///
+    /// Peer selection is per stripe, not once up front, so a peer that dies
+    /// mid-rebuild is routed around exactly as it would have been on the first
+    /// stripe, rather than failing the whole shard. Fails — with every peer's
+    /// reason — if fewer than `data_shards` answered with exactly `span` bytes.
+    async fn fetch_ec_stripe_from_peers(
+        &self,
+        task: &crate::extent_rpc::RecoveryTask,
+        extent_info: &ExtentInfo,
+        shard_index: usize,
+        nodes: &HashMap<u64, (String, Vec<u16>)>,
+        all_node_ids: &[u64],
+        offset: u64,
+        span: u64,
+        want: u64,
+    ) -> Result<Vec<Option<Vec<u8>>>, String> {
+        let data_shards = extent_info.replicates.len();
+        let n = all_node_ids.len();
+        let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
+        let mut collected = 0usize;
+        // Per-peer failure reasons for THIS stripe. A bare `k/K` cannot say
+        // whether a peer was unreachable, rejected the eversion, or
+        // answered short, and those want opposite fixes.
+        let mut why: Vec<String> = Vec::new();
+
+        for (i, &node_id) in all_node_ids.iter().enumerate() {
+            if i == shard_index || node_id == task.node_id {
+                continue;
+            }
+            let Some((base, shard_ports)) = nodes.get(&node_id) else {
+                why.push(format!("shard {i} (node {node_id}): not in the manager's node map"));
+                continue;
+            };
+            // Route to the shard that OWNS the extent. Addressing the base
+            // port sends every read to shard 0, which the peer refuses with
+            // "belongs to shard M not shard 0" -- the whole rebuild then
+            // reports 0/K with every peer healthy and the shards on disk.
+            let routed = shard_addr_for_extent(base, shard_ports, task.extent_id);
+            let addr = &routed;
+            let sock = match parse_addr(addr) {
+                Ok(v) => v,
+                Err(e) => {
+                    why.push(format!("shard {i} (node {node_id} at {addr}): {e}"));
+                    continue;
+                }
+            };
+            match Self::read_bytes_chunk(
+                sock,
+                addr,
+                task.extent_id,
+                extent_info.eversion,
+                offset,
+                span,
+                PayloadRef::for_extent(extent_info.payload_location, i as u32),
+            )
+            .await
+            {
+                // EXACT length. A short read is not loud on this path: the
+                // server answers CODE_OK short, and K stripes short by the
+                // SAME amount reconstruct without complaint — the RS
+                // decoder only rejects shards of DIFFERING length — so a
+                // truncated stripe would be written back as authoritative.
+                Ok(b) if b.len() as u64 == span => {
+                    shards[i] = Some(b);
+                    collected += 1;
+                    if collected >= data_shards {
+                        break;
+                    }
+                }
+                Ok(b) => why.push(format!(
+                    "shard {i} (node {node_id} at {addr}): got {} of {span} bytes",
+                    b.len()
+                )),
+                Err(e) => why.push(format!("shard {i} (node {node_id} at {addr}): {e}")),
+            }
+        }
+
+        if collected < data_shards {
+            return Err(format!(
+                "EC recovery: only {collected}/{data_shards} shards available for extent {} \
+                 at [{offset}, {}) of {want}: {}",
+                task.extent_id,
+                offset + span,
+                if why.is_empty() { "no peers attempted".to_string() } else { why.join("; ") }
+            ));
+        }
+        Ok(shards)
     }
 
     /// 2PC Phase 1 (prepare): write a single EC shard to a staging file
@@ -7498,6 +7627,49 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
     fn clear_op_progress(&self, extent_id: u64) {
         self.op_progress.remove(&extent_id);
     }
+}
+
+/// Owns an extent's progress slot for the whole life of one op TASK — retries
+/// included — and empties it when the task ends, on success, on give-up, and
+/// on any return path added later.
+///
+/// The slot is a sample, and a sample nobody retracts is a lie that lasts.
+/// The recovery retry loop used to clear it on success only: a rebuild that
+/// burned its retries left its last ratio riding every `df` until the process
+/// restarted. The manager applies samples to a RUNNING entry only, which
+/// narrows the damage to the one place it matters — the extent's NEXT
+/// recovery, whether this node or another runs it, has its live ratio fought
+/// over by a corpse.
+///
+/// Same shape as the partition server's `MaintenancePhaseGuard`: an owned
+/// `Rc` rather than a borrow of the node, because the guard lives across
+/// every await in the task.
+struct OpProgressGuard {
+    slots: Rc<DashMap<u64, (u8, u64, u64)>>,
+    extent_id: u64,
+    kind: u8,
+}
+
+impl OpProgressGuard {
+    fn new(slots: Rc<DashMap<u64, (u8, u64, u64)>>, extent_id: u64, kind: u8) -> Self {
+        Self { slots, extent_id, kind }
+    }
+
+    /// Overwrite the sample. `(0, 0)` is the ledger's "not reported" shape —
+    /// the right thing to say at the start of an attempt whose size is not
+    /// yet known.
+    fn set(&self, done: u64, total: u64) {
+        self.slots.insert(self.extent_id, (self.kind, done, total));
+    }
+}
+
+impl Drop for OpProgressGuard {
+    fn drop(&mut self) {
+        self.slots.remove(&self.extent_id);
+    }
+}
+
+impl ExtentNode {
 
     /// Claim this node's EC staging for `extent_id` on behalf of `attempt_nonce`,
     /// or refuse if a NEWER attempt already claimed it.
@@ -8661,11 +8833,13 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
         // on a busy shard comes back around in hours. Losing a finding costs
         // that much delay in a rebuild, not the finding.
         let scrub_rot = self.done.take_scrub_rot();
+        let op_failures = self.done.take_op_failures();
 
         Ok(rkyv_encode(&DfResp {
             done_tasks,
             ec_done,
             scrub_rot,
+            op_failures,
             disk_status,
             // M1b: echo our own identity so the manager can
             // self-heal stored-location drift + detect pod-IP reuse. Empty when
@@ -8973,16 +9147,54 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
         let node = self.clone();
         compio::runtime::spawn(async move {
             let extent_id = task.extent_id;
+            // Held until this task returns, by whichever branch. The
+            // give-up path below has no explicit clear and needs none.
+            let progress = OpProgressGuard::new(
+                node.op_progress.clone(),
+                extent_id,
+                autumn_rpc::manager_rpc::OP_KIND_RECOVERY,
+            );
+            // Nothing has moved yet, and the slot has to say so BEFORE the
+            // attempt reaches its byte loop, not once it gets there: between
+            // here and the first byte sit a manager round-trip and the
+            // recovery permit. The total follows once the attempt has
+            // resolved the extent.
+            progress.set(0, 0);
             const MAX_RECOVERY_RETRIES: u32 = 10;
             for attempt in 1..=MAX_RECOVERY_RETRIES {
                 match node.run_recovery_task(task.clone()).await {
                     Ok(done) => {
                         node.recovery_inflight.remove(&extent_id);
-                        node.clear_op_progress(extent_id);
                         node.done.push_recovery(done);
                         return;
                     }
                     Err(e) => {
+                        // The failed attempt truncated or unlinked what it
+                        // wrote, so its last ratio describes bytes that are
+                        // gone. Retract it NOW, not at the top of the next
+                        // attempt: the 10 s sleep below is two manager df
+                        // ticks, and a ratio frozen on a stripe boundary with
+                        // the op RUNNING is exactly the shape the docs tell an
+                        // operator to read as a stalled peer.
+                        progress.set(0, 0);
+                        // ...and say WHY, on the same heartbeat. Otherwise this
+                        // reason reaches the manager only in the next
+                        // dispatch's response, which the backoff can defer for
+                        // a long time — leaving "failing" and "slow"
+                        // indistinguishable on the control plane meanwhile.
+                        //
+                        // The code is the generic one: `run_recovery_task`
+                        // returns a String, so anything finer would be
+                        // substring-guessing at the node's own prose. The
+                        // reason is the actionable half, and it is carried
+                        // whole — including the per-peer detail that used to
+                        // live only in this node's log.
+                        node.done.push_op_failure(
+                            extent_id,
+                            autumn_rpc::manager_rpc::OP_KIND_RECOVERY,
+                            autumn_rpc::manager_rpc::CODE_ERROR,
+                            e.to_string(),
+                        );
                         if attempt >= MAX_RECOVERY_RETRIES {
                             tracing::error!(
                                 extent_id,
@@ -9777,11 +9989,12 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
         // never got the extent op lock or never got past the first read, and the
         // difference is a deadlock versus a slow peer.
         //
-        // They are what ruled out the deadlock theory for
-        // BUG-EC-CONVERT-STALL-HEALTHY-COORD. The stall's signature used to be a
-        // marker pinned with attempts=0 and no error, because the failure only
-        // reached this node's log; it now shows rising attempts and the reason,
-        // which the manager reads off the next dispatch's response message.
+        // They are what ruled out the deadlock theory for a stall whose
+        // signature used to be a marker pinned with no error at all, because
+        // the failure only ever reached this node's log. The reason now travels
+        // two ways: off the next dispatch's response message, and — without
+        // waiting for the backoff to come round — on the `df` heartbeat as
+        // `DfResp.op_failures`.
         tracing::debug!(extent_id, new_eversion, "ec convert: waiting for the extent op lock");
         let convert_lock = self.get_or_create_extent_op_lock(extent_id);
         let _convert_guard = convert_lock.lock().await;
@@ -13847,6 +14060,269 @@ mod classify_ec_shard_tests {
         assert_eq!(
             ExtentNode::classify_ec_shard(&info, &entry, 20),
             LocalCopyVerdict::IncompleteEcShard
+        );
+    }
+}
+
+#[cfg(test)]
+mod ec_rebuild_progress_tests {
+    //! An EC rebuild reads K peers per stripe, decodes, writes — and reports.
+    //! What it reports is the part that can lie: a rebuild has no output until
+    //! a whole stripe's K peers have answered, so any number that moves before
+    //! the stripe is in the file shows a stalled rebuild advancing. These tests
+    //! drive the real stripe walk (`rebuild_ec_shard_by_stripes`) with an
+    //! in-memory peer, and read the slot the way the manager will: through the
+    //! sample it carries at the moment each stripe is asked for.
+    //!
+    //! ABLATIONS, each verified to go red: drop the post-write sample (the
+    //! sequence stays at 0); move it above the pwrite (the read-only file test
+    //! sees 2048 bytes it never got); drop the `(0, want)` opener (the first
+    //! snapshot is `None`); drop `OpProgressGuard`'s `Drop` (the df keeps
+    //! reporting a task that ended).
+    use super::*;
+    use std::cell::RefCell;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    const K: usize = 2;
+    const M: usize = 1;
+    /// The slot being rebuilt: a data shard, which is the common case.
+    const MISSING: usize = 1;
+    /// Three stripes with a short tail — the misaligned last stripe is the
+    /// one an off-by-one in the walk would mishandle.
+    const STRIPE: u64 = 2048;
+    const PAYLOAD: usize = 10_000;
+    const EID: u64 = 9107;
+
+    /// Real RS shards, so the decode in the walk is the production one.
+    fn shards() -> Rc<Vec<Vec<u8>>> {
+        let payload: Vec<u8> = (0..PAYLOAD as u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        Rc::new(crate::erasure::ec_encode(&payload, K, M).expect("encode"))
+    }
+
+    type FetchFut = Pin<Box<dyn Future<Output = Result<Vec<Option<Vec<u8>>>, String>>>>;
+
+    /// The peer stand-in. Records what the progress slot said each time a
+    /// stripe was asked for — the only way to see a SEQUENCE out of an
+    /// overwrite-only sample — and, at `fail_at`, answers the way the real
+    /// fetch does when a peer is missing.
+    fn peer(
+        node: &ExtentNode,
+        shards: Rc<Vec<Vec<u8>>>,
+        seen: Rc<RefCell<Vec<Option<(u64, u64)>>>>,
+        fail_at: Option<u64>,
+    ) -> impl Fn(u64, u64) -> FetchFut {
+        let slots = node.op_progress.clone();
+        move |offset, span| {
+            let sample = slots.get(&EID).map(|e| {
+                let (_, done, total) = *e.value();
+                (done, total)
+            });
+            seen.borrow_mut().push(sample);
+            if fail_at == Some(offset) {
+                return Box::pin(std::future::ready(Err(format!(
+                    "EC recovery: only 1/{K} shards available for extent {EID} at [{offset}, {})",
+                    offset + span
+                ))));
+            }
+            let (lo, hi) = (offset as usize, (offset + span) as usize);
+            let answer: Vec<Option<Vec<u8>>> = shards
+                .iter()
+                .enumerate()
+                .map(|(i, s)| (i != MISSING).then(|| s[lo..hi].to_vec()))
+                .collect();
+            Box::pin(std::future::ready(Ok(answer)))
+        }
+    }
+
+    async fn fresh_node(dir: &std::path::Path) -> ExtentNode {
+        ExtentNode::new(ExtentNodeConfig::new(dir.to_path_buf(), 1))
+            .await
+            .expect("node")
+    }
+
+    fn final_sample(node: &ExtentNode) -> Option<(u8, u64, u64)> {
+        node.op_progress.get(&EID).map(|e| *e.value())
+    }
+
+    #[compio::test]
+    async fn each_stripe_reports_its_bytes_once_they_are_written() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = fresh_node(dir.path()).await;
+        let path = dir.path().join("rebuilt");
+        let dst = Rc::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .await
+                .expect("dst"),
+        );
+        let shards = shards();
+        let want = ExtentNode::ec_shard_read_len(PAYLOAD as u64, K);
+        assert_eq!(want as usize, shards[0].len(), "the walk's length must be the encoder's");
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let got = node
+            .rebuild_ec_shard_by_stripes(
+                EID,
+                want,
+                STRIPE,
+                K,
+                M,
+                MISSING,
+                &dst,
+                peer(&node, shards.clone(), seen.clone(), None),
+            )
+            .await;
+        assert_eq!(got, Ok(want));
+
+        assert_eq!(
+            *seen.borrow(),
+            vec![Some((0, want)), Some((STRIPE, want)), Some((2 * STRIPE, want))],
+            "one sample per stripe, each the bytes already in the file, with the \
+             total known from the first read on"
+        );
+        assert_eq!(
+            final_sample(&node),
+            Some((autumn_rpc::manager_rpc::OP_KIND_RECOVERY, want, want)),
+            "the last stripe brings the sample to the full shard"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            shards[MISSING],
+            "the reported bytes are the rebuilt shard's bytes"
+        );
+    }
+
+    /// The stall shape. A peer that stops answering leaves the walk short of K
+    /// for the stripe it was on — and the sample must sit at the boundary of
+    /// the last stripe that DID get written, not creep toward the one that did
+    /// not. On the control plane that frozen number is how a dead source is
+    /// told from a slow one.
+    #[compio::test]
+    async fn a_stripe_short_of_k_peers_freezes_progress_at_the_last_written_boundary() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = fresh_node(dir.path()).await;
+        let path = dir.path().join("rebuilt");
+        let dst = Rc::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .await
+                .expect("dst"),
+        );
+        let shards = shards();
+        let want = ExtentNode::ec_shard_read_len(PAYLOAD as u64, K);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let got = node
+            .rebuild_ec_shard_by_stripes(
+                EID,
+                want,
+                STRIPE,
+                K,
+                M,
+                MISSING,
+                &dst,
+                peer(&node, shards.clone(), seen.clone(), Some(2 * STRIPE)),
+            )
+            .await;
+        let err = got.expect_err("a stripe short of K peers fails the rebuild");
+        assert!(err.contains("only 1/2 shards available"), "{err}");
+
+        assert_eq!(
+            final_sample(&node),
+            Some((autumn_rpc::manager_rpc::OP_KIND_RECOVERY, 2 * STRIPE, want)),
+            "progress stops at the last stripe that reached the file"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read back"),
+            shards[MISSING][..(2 * STRIPE) as usize],
+            "and that is exactly how much of the shard is on disk"
+        );
+    }
+
+    /// The honesty test. Every peer answered the first stripe, the decode
+    /// succeeded — and the write failed. Bytes that never reached the file are
+    /// not progress; a sample taken when the peers answered, rather than when
+    /// the write returned, would report 2048 bytes of a shard that holds none.
+    #[compio::test]
+    async fn bytes_that_did_not_reach_the_file_are_not_progress() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = fresh_node(dir.path()).await;
+        let path = dir.path().join("rebuilt");
+        std::fs::write(&path, b"").expect("create");
+        // Read-only: the first pwrite fails.
+        let dst = Rc::new(OpenOptions::new().read(true).open(&path).await.expect("dst"));
+        let shards = shards();
+        let want = ExtentNode::ec_shard_read_len(PAYLOAD as u64, K);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+
+        let got = node
+            .rebuild_ec_shard_by_stripes(
+                EID,
+                want,
+                STRIPE,
+                K,
+                M,
+                MISSING,
+                &dst,
+                peer(&node, shards, seen.clone(), None),
+            )
+            .await;
+        assert!(got.is_err(), "a failed pwrite fails the rebuild");
+        assert_eq!(seen.borrow().len(), 1, "the walk stops at the stripe it could not write");
+
+        assert_eq!(
+            final_sample(&node),
+            Some((autumn_rpc::manager_rpc::OP_KIND_RECOVERY, 0, want)),
+            "K peers answering is not bytes on disk; the sample must not move"
+        );
+    }
+
+    /// The task-level contract: the slot empties when the task ends, whichever
+    /// way. The give-up path of the recovery retry loop has no explicit clear —
+    /// this `Drop` is what stops an abandoned rebuild from riding every `df`
+    /// at its last ratio until the process restarts.
+    #[compio::test]
+    async fn an_ended_task_stops_reporting_without_an_explicit_clear() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = fresh_node(dir.path()).await;
+        let df = || async {
+            let resp = node
+                .handle_df(rkyv_encode(&DfReq {
+                    tasks: vec![],
+                    disk_ids: vec![],
+                }))
+                .await
+                .expect("df");
+            let r: DfResp = rkyv_decode(&resp).expect("decode DfResp");
+            r.op_progress
+                .into_iter()
+                .map(|p| (p.extent_id, p.kind, p.done, p.total))
+                .collect::<Vec<_>>()
+        };
+        let kind = autumn_rpc::manager_rpc::OP_KIND_RECOVERY;
+
+        {
+            let progress = OpProgressGuard::new(node.op_progress.clone(), EID, kind);
+            // An attempt starting: size unknown, so `0/0` — the ledger's "not
+            // reported" shape — and not the previous attempt's last ratio.
+            progress.set(0, 0);
+            assert_eq!(df().await, vec![(EID, kind, 0, 0)]);
+            progress.set(3, 8);
+            assert_eq!(df().await, vec![(EID, kind, 3, 8)]);
+            // Falls off the end the way a task that burned its retries does.
+        }
+        assert!(
+            df().await.is_empty(),
+            "a task that ended must stop reporting; a stale 3/8 outlives the task otherwise"
         );
     }
 }

@@ -951,7 +951,7 @@ failure reason the fire-and-forget maintenance ops used to drop.
 - **Auto-dispatched kinds** (`OP_KIND_RECOVERY`): extent recovery is entered by
   the recovery loop, not by a submit — `MSG_OP_SUBMIT` REFUSES it. Hooks:
   `dispatch_recovery_task` (EN accepted the rebuild) → `note_recovery_dispatch`
-  (one entry per extent, counting `attempts`); `record_dispatch_outcome`'s Err
+  (one entry per extent); `record_dispatch_outcome`'s Err
   arm → `record_recovery_failure`, which **keeps the entry RUNNING** (the loop
   retries with exponential backoff and never gives up) while carrying the last
   reason + `error_code` (`err_to_code`) + consecutive-failure count;

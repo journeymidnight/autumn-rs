@@ -299,7 +299,7 @@ rides log_stream (the WAL) and replays on reopen.
 
 ### R2 — stop the EN(s)
 `systemctl stop autumn-extent-node@*`. On k8s, R2+R3+R4 collapse into
-`kubectl apply` + `kubectl rollout restart sts/autumn-en`: one pod = one EN node =
+`kubectl apply` + `kubectl rollout restart deploy -l app.kubernetes.io/component=extent-node`: one pod = one EN node =
 all its shards, so "all shards of a node restart together" is structural.
 
 ### R3 — change the shard count

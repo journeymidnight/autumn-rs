@@ -53,7 +53,7 @@ Two constraints work in our favor:
 | `configmap.yaml` | ConfigMap | shared env; `AUTUMN_EXPECT_NODES` MUST equal EN replicas |
 | `etcd.yaml` | StatefulSet + headless Service | 1 member; PVC 1Gi on default (network) class |
 | `manager.yaml` | StatefulSet + ClusterIP + headless Services | leader-gated readiness |
-| `extent-node.yaml` | StatefulSet + headless Service | advertises pod IP; PVC 20Gi/pod on local disk |
+| `extent-node.yaml` | headless Service only (ENs are per-EN Deployments from `deploy/scripts/en-workload.sh`) | advertises pod IP; PVC 20Gi/pod on local disk |
 | `partition-server.yaml` | StatefulSet + headless Service | advertises pod IP; no PVC |
 | `bootstrap-job.yaml` | Job | guarded, run-once |
 
@@ -202,10 +202,18 @@ overlay must name a class explicitly, as the VKE example does.
 
 ## Scaling
 
-- **Extent nodes**: bump `extent-node.yaml` StatefulSet `replicas` to N and set
-  `AUTUMN_EXPECT_NODES: "N"` in the ConfigMap. That's it — ENs advertise their
-  pod IPs and self-register, so there are no per-pod Services to add. Provision
-  **more ENs than the replication factor** — with `#EN == RF` a
+- **Extent nodes**: one Deployment per EN, so adding and retiring are separate
+  verbs rather than one number.
+  - Add: `deploy/scripts/en-workload.sh apply <ordinal>` for each new EN, then
+    set `AUTUMN_EXPECT_NODES: "N"` in the ConfigMap. ENs advertise their pod IPs
+    and self-register, so there are no per-pod Services to add.
+  - Retire: `deploy/scripts/en-decommission.sh <ordinal>`, which fences the
+    node, waits for its shards to be rebuilt elsewhere, removes it from the
+    cluster, and only then deletes the workload. Deleting the workload yourself
+    looks like it worked and silently costs a replica of every shard the node
+    still held. See docs/ops.md, "Node decommission runbook".
+
+  Provision **more ENs than the replication factor** — with `#EN == RF` a
   single EN down wedges writes (can't form a fresh replica set); reads tolerate a
   down replica at any size.
 - **Partition servers**: raise `partition-server.yaml` `replicas`; each pod's

@@ -2037,7 +2037,7 @@ impl AutumnManager {
     /// original op_ids died with the previous leader; fresh "replay" ids carry
     /// the still-running work. Called on promotion; idempotent.
     pub(crate) fn seed_ec_ledger_from_inflight(&self) {
-        let (ec_inflight, recovery_inflight) = self.inflight_snapshot_ec_recovery();
+        let (ec_inflight, recovery_inflight) = self.inflight_started_at_ec_recovery();
         if ec_inflight.is_empty() && recovery_inflight.is_empty() {
             return;
         }

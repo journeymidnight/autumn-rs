@@ -289,7 +289,25 @@
 - **Acceptance**: 一次真实的 EC 分片重建（分片 >1 GiB）中，`autumn-op ops list` 显示的
   `progress_done` 随时间单调增长；把源端人为掐断后，进度**停止增长**且该状态在
   `ops list` 上可见 —— 即"卡死"和"缓慢"在控制面上可区分，不必再 exec 到节点上量 `df`。
-- **Status**: `passes: false` (2026-09-04) — 不阻塞任何功能，但它是本次排查里最贵的一个
+- **Status**: `passes: false` (2026-09-08) — **代码已实现、待真集群验收**。EN 侧
+  `stream_ec_recovery_payload` 每条带（64 MiB）在写盘之后报一次
+  `(OP_KIND_RECOVERY, extent_id, 已写字节, 分片长度)`，走既有的 `DfResp.op_progress`
+  （**未动 wire**——该字段早已存在，本条当初担心的 wire 改动已由 EC convert 那条先做掉）；
+  每次尝试开始归零、任务结束（成功/放弃）由 `OpProgressGuard` 的 Drop 清 slot。
+  单测 4 条 + 4 项消融验证变红（`cargo test -p autumn-stream`）。验收里"分片 >1 GiB
+  的真实重建、掐断源端后进度停止增长"两条要在线上集群做，尚未做。
+  （2026-09-09 续）Scope 里剩下的两半也做了，代价是 **wire 37 → 38**（全停）：
+  - **失败原因走心跳**：`DfResp` 新增 `op_failures`，EN 每次尝试失败即上报
+    `(extent_id, kind, error_code, reason)`，manager 用 `record_node_op_failure`
+    更新 RUNNING 条目。此前 EN 侧的失败只到自己的日志，manager 要等**下一次重派的
+    响应**才知道原因，而重派受指数退避控制 —— "在失败"和"只是慢"在控制面上到那时
+    才分得开。该函数**只更新不创建**（理由同 `update_progress_by_extent`）。
+  - **`seed_replay` 读 marker 的 `started_at`**：此前盖成"现在"，manager 一重启，
+    跑了四小时的 op 显示成刚开始。marker 里本来就存着（`MgrExtentInflightRecord`）。
+  - **`OpRecord.attempts` 删除**：它想代理的问题（"在重试吗？为什么？"）已被实时
+    reason 直接回答；而它在 manager 重启后从 0 重数，本身就会误导。
+  各配 1 条单测 + 消融验证变红（`cargo test -p autumn-manager --lib`，330 passed）。
+  原状态：`passes: false` (2026-09-04) — 不阻塞任何功能，但它是本次排查里最贵的一个
   缺口：有它的话，"4 小时零字节"在第一分钟就摆在眼前，而不是要靠 `df` 采样才发现。
 
 ### BUG-RECOVERY-MARKER-ORPHAN — unfence 不释放 marker，僵尸占着限流名额且完全不可见
@@ -601,3 +619,50 @@
 - **Status**: `passes: false` (2026-09-05) — 未实现。当前可用的替代手段是
   **把要腾空的节点全部一次性 fence**，靠 `hard_excluded` 把它们从候选里剔除，
   从而避免数据回流；这次迁移就是这么做的，有效但粒度粗，且解决不了稳态倾斜。
+
+### F-EN-WORKLOAD-IDENTITY — EN 的 k8s 身份与集群身份对不上，退役只能靠 `scale`
+- **Trigger** (2026-09-09，一次 7→5 缩容前的检查): 集群里 EN 是一个 `replicas=11` 的
+  StatefulSet，序号 0-10，其中活着的是 0,5,6,7,8,9,10，另外 1,2,3,4 是没有节点可调度的
+  Pending 空壳（早期拓扑的残留）。要摘掉的是 en-7 和 en-8（分片最少：30 和 21）。
+  而 StatefulSet 只有一个删除动词 `scale`，**只能从序号尾部砍** —— 缩到 5 会砍掉
+  5,6,7,8,9,10 这六台**有数据的**，留下 0 和四个**空的**。序号顺序和退役顺序毫无关系，
+  所以这个动词根本表达不了"摘掉这一台"。
+- **根因**: EN 的身份是 **PVC 上持久化的 `node_uuid`**（地址每次启动自注册，序号只是
+  volumeClaimTemplate 的下标）。`deploy/k8s/extent-node.yaml` 的注释自己就写着
+  "StatefulSet 留着只是为了 STORAGE identity"——但它同时把序号伪装成了身份，
+  而 k8s 提供的唯一缩容动词恰好绑在序号上。
+- **Scope**: 照 Rook 管 OSD 的路子，**每个 EN 一个 Deployment**，按名字挂已有的
+  `data-autumn-en-<n>` PVC（身份不变，因为身份在 PVC 上）。`strategy: Recreate` 是必须的
+  而非口味：PVC 是 RWO 且绑在某个节点的本地盘上，RollingUpdate 的 surge pod 会永远等一块
+  前任还攥着的卷。配两个脚本：`deploy/scripts/en-workload.sh`（渲染/应用，基座 manifest
+  由它生成以免漂移）与 `deploy/scripts/en-decommission.sh`（fence → 等排干 → remove →
+  删 workload，每一步都门控）。**不写 controller**——这是"便宜的那档"。
+- **Acceptance**:
+  - `en-decommission.sh --dry-run <n>` 能通过 pod IP 正确解析出 node_id 与分片数；
+    剩余节点数低于副本数时**拒绝执行**。
+  - 在真集群上用它摘掉两台 EN，落到 5 台：期间无数据丢失，`autumn-op info` 显示
+    分片重新铺开、`extent-health` 干净、所有分区照常服务。
+  - 摘完后 `deploy/k8s` 与 vke overlay 都能 `kustomize build`，且 EN 不再有任何
+    以 `scale` 为运维入口的路径。
+- **Status**: `passes: false` (2026-09-09) — 脚本与 manifest 已写、服务端 dry-run 通过
+  （已存在的 PVC 被接管而非重建）、防呆实测有效；真集群的 7→5 迁移**尚未执行**，
+  计划与 wire v38 的那次全停合并做（反正每台 EN 都要重启一遍）。
+  评审挖出三条会在真集群上出事的，均已修：
+  1. **迁移会让两个 EN 进程开同一块盘**：EN 对 data-dir **不加锁**（`flock|fs2|fd-lock`
+     全仓库为空），而 RWO 是**节点级**语义 —— 同一节点上两个 pod 可以同时挂同一个 claim，
+     PV 又是 nodeAffinity 钉在那台。`apply` 不 prune，旧 STS 不会自己消失。已在
+     docs/ops.md 写死顺序：`delete sts --cascade=orphan` → **逐台**先删 pod 等它消失、
+     再 apply 该序号的 Deployment；并写明为什么不能一次性 apply 整组。
+  2. **退役脚本解析不到 Deployment 的 pod**（名字是 `autumn-en-7-<rs>-<pod>`）：改为按
+     `autumn.dev/en-ordinal` 标签找；匹配到多于一个直接拒绝（那正是两进程共盘的信号）；
+     仍是 StatefulSet 时给出明确拒绝而不是误删。另修：健康节点计数原来用 `/Online/`
+     松匹配，会把**已 fence 正在排空**的节点算成剩余容量（auto 列仍是 Online），
+     改为 `$7=="Online" && $8=="-"`。
+  3. **vke overlay 的 patch 目标还是 StatefulSet**：kustomize 对匹配不到的 target
+     **静默跳过**，所以 build 照样成功，却产出没有 nodeSelector（会调度到 kernel-5.4
+     节点）、cpu 仍是 1 的 EN。根因是"EN 数量"根本不该由 manifest 声明——已把 EN 整个
+     移出 kustomize，由 `deploy.sh` 调渲染器创建，且**在有 EN PVC 但没有 EN Deployment
+     时拒绝猜序号**（否则会在本集群上复活退役的 1-4）。
+  附带修掉 `deploy/validate.sh`：它的 EN 检查被 `if en_ss:` 包着，EN 不再是 StatefulSet
+  后整段空转却照打 `VALIDATION OK`；改为验渲染器输出，并做了消融（把 `Recreate` 改成
+  `RollingUpdate` → `VALIDATION FAILED`）。

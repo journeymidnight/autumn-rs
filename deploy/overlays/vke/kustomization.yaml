@@ -50,19 +50,27 @@ patches:
         path: /spec/template/spec/nodeSelector
         value:
           autumn-node: "true"
-  # Scale to 5 extent nodes (base ships 3). Must keep AUTUMN_EXPECT_NODES in step.
   - target:
-      kind: StatefulSet
-      name: autumn-en
+      kind: Deployment
     patch: |-
-      - op: replace
-        path: /spec/replicas
-        value: 5
-      # 4 shards want ~4 io_uring cores; request them so the scheduler reserves
-      # room (no limit — the EN can still burst on its 12-core node).
-      - op: replace
-        path: /spec/template/spec/containers/0/resources/requests/cpu
-        value: "4"
+      - op: add
+        path: /spec/template/spec/nodeSelector
+        value:
+          autumn-node: "true"
+  # NOTE: there is no extent-node patch here, and there must not be. The ENs are
+  # not kustomize resources — `deploy.sh` renders one Deployment per EN with
+  # `deploy/scripts/en-workload.sh`, passing this overlay's nodeSelector and cpu
+  # request through AUTUMN_EN_NODESELECTOR / AUTUMN_EN_CPU. See the header of
+  # deploy/k8s/extent-node.yaml for why membership cannot be declared as a
+  # count: this cluster's ENs are 0,5,6,7,8,9,10, and both ways of writing "5
+  # extent nodes" as a manifest destroy data on it.
+  #
+  # A patch targeting `kind: StatefulSet, name: autumn-en` used to live here. It
+  # is worth knowing how it failed: kustomize SILENTLY SKIPS a patch whose
+  # target matches nothing, so after the ENs stopped being a StatefulSet the
+  # build still succeeded — and quietly produced extent nodes with no
+  # nodeSelector (schedulable onto this cluster's kernel-5.4 nodes, where
+  # io_uring needs a memlock workaround) and a 1-cpu request.
   # Run 3 partition servers so the 8 presplit partitions fan out across 3 PS
   # processes on 3 nodes (base ships 1 PS → all 8 partitions on one process,
   # ~16 partition threads oversubscribing one 12-core node → write tail under

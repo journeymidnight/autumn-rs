@@ -1900,7 +1900,6 @@ fn render_ops(ops: &[autumn_rpc::manager_rpc::OpRecord], json: bool) -> Result<(
                     "secondary_id": o.secondary_id,
                     "error": o.error,
                     "error_code": o.error_code,
-                    "attempts": o.attempts,
                     "message": o.message,
                     "requested_by": o.requested_by,
                     // Raw counts, like the wire carries them — the consumer
@@ -1934,14 +1933,6 @@ fn render_ops(ops: &[autumn_rpc::manager_rpc::OpRecord], json: bool) -> Result<(
         } else {
             "-".to_string()
         };
-        // Auto-retrying kinds carry a last-error WHILE still running, so show
-        // the attempt count + reason together — a repair looping on the same
-        // failure is the thing worth seeing.
-        let attempts = if o.attempts > 0 {
-            format!(" attempts={}", o.attempts)
-        } else {
-            String::new()
-        };
         // Progress arrives as raw counts; the percentage is derived here so the
         // operator sees both the ratio and the magnitude — "50%" alone cannot
         // distinguish two tables from fifty gigabytes.
@@ -1965,13 +1956,12 @@ fn render_ops(ops: &[autumn_rpc::manager_rpc::OpRecord], json: bool) -> Result<(
             String::new()
         };
         println!(
-            "op {:<20} {:<10} {:<9} target={}{}{}{}",
+            "op {:<20} {:<10} {:<9} target={}{}{}",
             o.op_id,
             op_kind_name(o.kind),
             op_state_name(o.state),
             target,
             progress,
-            attempts,
             tail
         );
     }

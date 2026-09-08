@@ -320,6 +320,24 @@ impl AutumnManager {
         }
     }
 
+    /// Same split as `inflight_snapshot_ec_recovery`, but carrying each
+    /// marker's `started_at` — the ledger seeds replayed entries from it so a
+    /// leader change does not reset how long the work has been running. Kept
+    /// separate because the three other callers only ask "is this extent in
+    /// flight" and have no use for the timestamp.
+    pub(crate) fn inflight_started_at_ec_recovery(&self) -> (Vec<(u64, i64)>, Vec<(u64, i64)>) {
+        let mut ec = Vec::new();
+        let mut rec = Vec::new();
+        for (id, r) in self.inflight.borrow().iter() {
+            match r.kind() {
+                Some(ExtentOpKind::ConvertToEc) => ec.push((*id, r.started_at)),
+                Some(ExtentOpKind::Recovery) => rec.push((*id, r.started_at)),
+                _ => {}
+            }
+        }
+        (ec, rec)
+    }
+
     pub(crate) fn inflight_snapshot_ec_recovery(
         &self,
     ) -> (

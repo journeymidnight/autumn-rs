@@ -1,31 +1,40 @@
-# Data plane. F-EN-DYNSHARD M0/M1a/M2: the manager keys each EN's identity on a
-# stable node_uuid (persisted on the PVC), NOT the address, and the EN
-# self-registers its live address + shard ports at EVERY startup. So the EN
-# advertises its OWN pod IP (Downward-API status.podIP): a fresh pod IP on
-# reschedule just updates the same node_uuid's location and routing follows.
-# `autumn-op format` is identity-only (no address); the EN --advertise reports
-# the location. The manager and PS dial the registered pod_ip:shard_port
-# directly — pod IPs are routable cluster-wide under every standard CNI, so
-# NO per-pod ClusterIP Service is involved in the data or control path.
+# Data plane. The manager keys each EN's identity on a stable node_uuid
+# (persisted on the PVC), NOT the address, and the EN self-registers its live
+# address + shard ports at EVERY startup. So the EN advertises its OWN pod IP
+# (Downward-API status.podIP): a fresh pod IP on reschedule just updates the
+# same node_uuid's location and routing follows. The manager and PS dial the
+# registered pod_ip:shard_port directly — pod IPs are routable cluster-wide
+# under every standard CNI, so NO per-pod ClusterIP Service is involved in the
+# data or control path.
 #
-# The per-pod ClusterIP Services (autumn-en-<ordinal>) that this manifest used
-# to ship — plus their hand-maintained shard-port lists — are GONE (M2): they
-# only existed to give a frozen-address EN a stable VIP, which the startup
-# self-register replaces. A shard-count change is now just an env edit; no
-# Service port list to keep in lockstep (see docs/k8s_deploy.md, "Multi-shard").
+# THE EXTENT NODES THEMSELVES ARE NOT IN THIS FILE, AND NOT IN KUSTOMIZE AT ALL.
+# They are created and retired by `deploy/scripts/en-workload.sh` and
+# `deploy/scripts/en-decommission.sh` — one Deployment per EN, mounting
+# `data-autumn-en-<ordinal>` by name.
 #
-# SCALING: to run N extent nodes, set the StatefulSet replicas to N and bump
-# AUTUMN_EXPECT_NODES in the ConfigMap. Nothing else. See docs/k8s_deploy.md.
+# Why membership cannot be a manifest here: an EN's identity is the node_uuid on
+# its PVC, and the live set of ENs is whatever set of PVCs the cluster has
+# accumulated — it is NOT `0..N-1`. This cluster's ENs are 0,5,6,7,8,9,10,
+# because ordinals 1-4 were retired long ago. A manifest that says "5 extent
+# nodes" cannot describe that, and the two obvious encodings both destroy data:
+# a StatefulSet with `replicas: 5` deletes the six live ENs above ordinal 4 and
+# keeps four empty ones, and a rendered list of Deployments for `0..4` silently
+# resurrects the four retired ordinals on top of their leftover PVCs.
 #
-# The StatefulSet is kept for STORAGE identity (volumeClaimTemplates pin each
-# ordinal to its PVC, which carries the node_uuid sentinel = the identity
-# anchor), NOT for network identity. The headless Service below is purely the
-# StatefulSet's serviceName; its ports are vestigial under pod-IP routing.
+# So membership is an operation, not a declaration. Adding an EN is
+# `en-workload.sh apply <ordinal>`; retiring one is `en-decommission.sh
+# <ordinal>`, which fences it, waits for the drain, removes it from the cluster
+# and only then deletes the workload. `deploy/overlays/vke/deploy.sh` calls the
+# renderer for the ordinals that overlay wants, so a fresh install still comes
+# up in one command. See docs/ops.md, "Node decommission runbook".
+#
+# The headless Service below is a stable name for the EN set; its ports are
+# vestigial under pod-IP routing.
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: autumn-en            # headless — StatefulSet serviceName only (ports vestigial)
+  name: autumn-en            # headless — a name for the set (ports vestigial)
   namespace: autumn
   labels:
     app.kubernetes.io/name: autumn
@@ -39,84 +48,19 @@ spec:
     - { name: data, port: 9101, targetPort: 9101 }
     - { name: control, port: 10101, targetPort: 10101 }
 ---
-apiVersion: apps/v1
-kind: StatefulSet
+apiVersion: v1
+kind: PersistentVolumeClaim
 metadata:
-  name: autumn-en
+  name: data-autumn-en-0
   namespace: autumn
   labels:
     app.kubernetes.io/name: autumn
     app.kubernetes.io/component: extent-node
 spec:
-  serviceName: autumn-en
-  replicas: 3
-  podManagementPolicy: Parallel   # ENs are independent; bring them up together
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: autumn
-      app.kubernetes.io/component: extent-node
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: autumn
-        app.kubernetes.io/component: extent-node
-    spec:
-      terminationGracePeriodSeconds: 30
-      enableServiceLinks: false   # binaries use ConfigMap+DNS, not service-link env vars (see manager.yaml)
-      # Spread ENs across nodes so replication-factor copies don't share a
-      # failure domain. Preferred (not required) so a single-node dev cluster
-      # (kind/minikube) still schedules all replicas. For production add a
-      # PodDisruptionBudget too.
-      affinity:
-        podAntiAffinity:
-          preferredDuringSchedulingIgnoredDuringExecution:
-            - weight: 100
-              podAffinityTerm:
-                topologyKey: kubernetes.io/hostname
-                labelSelector:
-                  matchLabels:
-                    app.kubernetes.io/name: autumn
-                    app.kubernetes.io/component: extent-node
-      containers:
-        - name: extent-node
-          image: autumn-rs:latest
-          imagePullPolicy: IfNotPresent
-          args: ["extent-node"]
-          envFrom:
-            - configMapRef: { name: autumn-config }
-          env:
-            # F-EN-DYNSHARD M2: advertise this pod's OWN IP (Downward API
-            # status.podIP). The EN self-registers its location under a stable
-            # node_uuid every startup, so a rescheduled pod's fresh IP updates
-            # the same identity — no per-pod Service, no FQDN, no phantom-node
-            # trap (all deleted, not worked around). The entrypoint passes this
-            # straight to --advertise (it is already an IP literal, no DNS).
-            - name: AUTUMN_ADVERTISE_IP
-              valueFrom:
-                fieldRef:
-                  fieldPath: status.podIP
-            - name: AUTUMN_EXTENT_DATA
-              value: /data/autumn
-          ports:
-            - { name: data, containerPort: 9101 }
-            - { name: control, containerPort: 10101 }
-          readinessProbe:
-            tcpSocket: { port: 9101 }
-            initialDelaySeconds: 5
-            periodSeconds: 5
-          volumeMounts:
-            - { name: data, mountPath: /data }
-          resources:
-            requests: { cpu: "1", memory: "1Gi" }
-  volumeClaimTemplates:
-    - metadata:
-        name: data
-      spec:
-        accessModes: ["ReadWriteOnce"]
-        # Local disk — autumn replicates across ENs itself (RF=3), so extent data
-        # must NOT sit on a self-replicating network volume. See storageclass.yaml
-        # for the pin-to-node / RF=3-handles-node-loss model.
-        storageClassName: autumn-en-local
-        resources:
-          requests:
-            storage: 20Gi     # tune to your dataset; extents land here
+  accessModes: ["ReadWriteOnce"]
+  # Local disk — autumn replicates across ENs itself, so extent data must NOT
+  # sit on a self-replicating network volume. See storageclass.yaml.
+  storageClassName: autumn-en-local
+  resources:
+    requests:
+      storage: 20Gi

@@ -125,7 +125,6 @@ impl OpLedger {
             state: OP_STATE_PENDING,
             error: String::new(),
             error_code: 0,
-            attempts: 0,
             message: String::new(),
             requested_by,
             submitted_at: now_s,
@@ -316,9 +315,9 @@ impl OpLedger {
     }
 
     /// A recovery dispatch was ACCEPTED by a target EN: create-or-refresh the
-    /// extent's RUNNING entry and count the attempt. Recovery is auto-dispatched
-    /// and retried, so one entry per extent accumulates attempts rather than
-    /// spawning an entry per try.
+    /// extent's RUNNING entry. Recovery is auto-dispatched and retried, so one
+    /// entry per extent carries the whole repair rather than spawning an entry
+    /// per try.
     pub(crate) fn note_recovery_dispatch(
         &mut self,
         extent_id: u64,
@@ -331,7 +330,6 @@ impl OpLedger {
         if let Some(e) = self.entries.iter_mut().find(|e| {
             e.kind == OP_KIND_RECOVERY && e.secondary_id == extent_id && Self::is_active(e.state)
         }) {
-            e.attempts = e.attempts.saturating_add(1);
             e.message = msg;
             e.state = OP_STATE_RUNNING;
             if e.started_at == 0 {
@@ -346,7 +344,6 @@ impl OpLedger {
             secondary_id: extent_id,
             state: OP_STATE_RUNNING,
             message: msg,
-            attempts: 1,
             requested_by: "auto-recovery".to_string(),
             submitted_at: now_s,
             started_at: now_s,
@@ -358,22 +355,7 @@ impl OpLedger {
     }
 
     /// An EC conversion dispatch reached the coordinator: refresh the extent's
-    /// RUNNING entry, and count the attempt only when a NEW conversion actually
-    /// started.
-    ///
-    /// Recovery has counted attempts and carried its last error for a long time;
-    /// EC conversion had neither, so a conversion failing on every try read as
-    /// `attempts=0, last_error=""` — indistinguishable from one that had just
-    /// begun, while the extent's GC stayed blocked behind it.
-    ///
-    /// It is NOT the twin of `note_recovery_dispatch`, and the difference
-    /// matters. Recovery dispatches only when it (re)acquires a marker, so its
-    /// attempts are rebuild starts. The EC loop re-sends every few seconds for
-    /// the whole life of the marker, and the coordinator answers CODE_OK to a
-    /// re-send it is already working on. Counting every response would inflate
-    /// `attempts` by roughly twelve a minute on a perfectly healthy multi-GiB
-    /// conversion — a number that reads as churn when nothing is wrong. So
-    /// `started_new` (a fresh accept, not an "already running") is what counts.
+    /// RUNNING entry.
     ///
     /// `create` is false when the manager no longer holds this extent's marker.
     /// The response can arrive up to a minute after the send, and a fence in
@@ -385,7 +367,6 @@ impl OpLedger {
         &mut self,
         extent_id: u64,
         coord_node_id: u64,
-        started_new: bool,
         create: bool,
         now_s: i64,
         now_ms: i64,
@@ -394,9 +375,6 @@ impl OpLedger {
         if let Some(e) = self.entries.iter_mut().find(|e| {
             e.kind == OP_KIND_EC_CONVERT && e.secondary_id == extent_id && Self::is_active(e.state)
         }) {
-            if started_new {
-                e.attempts = e.attempts.saturating_add(1);
-            }
             e.message = msg;
             e.state = OP_STATE_RUNNING;
             if e.started_at == 0 {
@@ -414,7 +392,6 @@ impl OpLedger {
             secondary_id: extent_id,
             state: OP_STATE_RUNNING,
             message: msg,
-            attempts: 1,
             requested_by: "auto-ec".to_string(),
             submitted_at: now_s,
             started_at: now_s,
@@ -445,14 +422,13 @@ impl OpLedger {
 
     /// A recovery dispatch attempt FAILED. The entry stays RUNNING (the loop
     /// retries with exponential backoff — it never gives up), carrying the last
-    /// reason + code + the consecutive-failure count, so `ops status` shows
-    /// "running, N attempts, last error: …" instead of hiding the churn.
+    /// reason + code, so `ops status` shows "running, last error: …" instead of
+    /// hiding the churn.
     pub(crate) fn record_recovery_failure(
         &mut self,
         extent_id: u64,
         reason: String,
         error_code: u8,
-        consecutive_failures: u32,
         now_s: i64,
         now_ms: i64,
     ) {
@@ -461,7 +437,6 @@ impl OpLedger {
         }) {
             e.error = reason;
             e.error_code = error_code;
-            e.attempts = consecutive_failures.max(e.attempts);
             return;
         }
         // First observation of this extent is a FAILURE (never got as far as an
@@ -475,7 +450,6 @@ impl OpLedger {
             state: OP_STATE_RUNNING,
             error: reason,
             error_code,
-            attempts: consecutive_failures.max(1),
             requested_by: "auto-recovery".to_string(),
             submitted_at: now_s,
             started_at: now_s,
@@ -495,14 +469,24 @@ impl OpLedger {
     /// `complete_ec` / `complete_recovery`. compact/gc/forcegc are PS-local (NOT
     /// in etcd) and cannot be seeded — an unknown id honestly answers UNKNOWN.
     /// Idempotent across re-promotions (skips an already-tracked extent).
+    ///
+    /// Takes each marker's OWN `started_at` rather than stamping the promotion
+    /// time. Stamping "now" reports an op that has been running for hours as
+    /// one that just began, and the age is the first thing an operator reads.
+    ///
+    /// Precisely: it is when the CURRENT marker was acquired, not when the
+    /// extent first needed repairing — a re-dispatch drains the marker and
+    /// acquires a fresh one. That is still the honest answer to "how long has
+    /// this attempt been running", which is what the ledger claims to show. `0`
+    /// (a marker written before the field existed) falls back to now.
     pub(crate) fn seed_replay(
         &mut self,
         kind: u8,
-        extent_ids: impl IntoIterator<Item = u64>,
+        extents: impl IntoIterator<Item = (u64, i64)>,
         now_s: i64,
         now_ms: i64,
     ) {
-        for extent_id in extent_ids {
+        for (extent_id, marker_started_at) in extents {
             if self
                 .entries
                 .iter()
@@ -511,19 +495,45 @@ impl OpLedger {
                 continue;
             }
             let op_id = self.next_id(now_ms);
+            let started_at = if marker_started_at > 0 { marker_started_at } else { now_s };
             self.entries.push_front(OpRecord {
                 op_id,
                 kind,
                 secondary_id: extent_id,
                 state: OP_STATE_RUNNING,
                 requested_by: "replay".to_string(),
-                submitted_at: now_s,
-                started_at: now_s,
+                submitted_at: started_at,
+                started_at,
                 ..Default::default()
             });
         }
         while self.entries.len() > OP_LEDGER_CAP {
             self.entries.pop_back();
+        }
+    }
+
+    /// A failure the EXECUTING NODE reported on its `df` heartbeat.
+    ///
+    /// Deliberately update-only. The manager records its own dispatch failures
+    /// (which can precede any node accepting the work); a node reporting about
+    /// an op this ledger does not have RUNNING is describing something already
+    /// closed or never tracked, and creating an entry from it would resurrect
+    /// ops that nothing will ever close. Same discipline as
+    /// `update_progress_by_extent`, and for the same reason.
+    pub(crate) fn record_node_op_failure(
+        &mut self,
+        kind: u8,
+        extent_id: u64,
+        reason: String,
+        error_code: u8,
+    ) {
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.kind == kind && e.secondary_id == extent_id && Self::is_active(e.state))
+        {
+            e.error = reason;
+            e.error_code = error_code;
         }
     }
 
@@ -996,39 +1006,29 @@ mod tests {
         assert_eq!(r.error, "abandoned");
     }
 
-    /// EC conversion must track what recovery tracks. A conversion failing on
-    /// every attempt used to read as attempts=0 with no error, which is
-    /// indistinguishable from one that just started — while the extent's GC
-    /// stayed blocked behind it.
+    /// EC conversion must carry what recovery carries. A conversion failing on
+    /// every try used to read as no error at all, which is indistinguishable
+    /// from one that just started — while the extent's GC stayed blocked behind
+    /// it. One entry per extent is what makes the reason findable.
     #[test]
-    fn ec_dispatch_counts_accepts_and_keeps_the_coordinators_reason() {
+    fn ec_dispatch_keeps_one_entry_and_the_coordinators_reason() {
         let mut led = OpLedger::default();
 
-        led.note_ec_dispatch(12, 7, true, true, 100, 100_000);
+        led.note_ec_dispatch(12, 7, true, 100, 100_000);
         let recs = led.query(&OpQueryReq::default());
         let r = recs.iter().find(|r| r.secondary_id == 12).expect("entry");
         assert_eq!(r.kind, OP_KIND_EC_CONVERT);
-        assert_eq!(r.attempts, 1);
         assert_eq!(r.state, OP_STATE_RUNNING);
 
-        // Re-dispatches accumulate on ONE entry rather than spawning one each.
-        for t in 1..9 {
-            led.note_ec_dispatch(12, 7, true, true, 100 + t, 100_000 + t * 1000);
+        // Re-dispatches land on ONE entry rather than spawning one each. The
+        // EC loop re-sends every few seconds for the whole life of the marker,
+        // so an entry per response would bury the extent in its own history.
+        for t in 1..20 {
+            led.note_ec_dispatch(12, 7, true, 100 + t, 100_000 + t * 1000);
         }
         let recs = led.query(&OpQueryReq::default());
         let ec: Vec<_> = recs.iter().filter(|r| r.secondary_id == 12).collect();
         assert_eq!(ec.len(), 1, "one entry per extent, not one per try");
-        assert_eq!(ec[0].attempts, 9);
-
-        // A re-send the coordinator answers with "already running" is a manager
-        // ping, not a try. Counting it would inflate a healthy multi-GiB
-        // conversion by roughly twelve a minute and read as churn.
-        for t in 9..20 {
-            led.note_ec_dispatch(12, 7, false, true, 100 + t, 100_000 + t * 1000);
-        }
-        let recs = led.query(&OpQueryReq::default());
-        let r = recs.iter().find(|r| r.secondary_id == 12).expect("entry");
-        assert_eq!(r.attempts, 9, "pings must not count as attempts");
 
         // The coordinator's reason lands on that entry, and the op stays RUNNING
         // because the dispatch loop never gives up.
@@ -1037,7 +1037,6 @@ mod tests {
         let r = recs.iter().find(|r| r.secondary_id == 12).expect("entry");
         assert!(r.error.contains("WriteShard"), "error was {:?}", r.error);
         assert_eq!(r.state, OP_STATE_RUNNING);
-        assert_eq!(r.attempts, 9, "recording a failure must not reset the count");
     }
 
     /// A dispatch response can arrive a minute after the send, and a fence in
@@ -1047,7 +1046,7 @@ mod tests {
     #[test]
     fn a_response_arriving_after_the_marker_is_gone_creates_no_phantom_entry() {
         let mut led = OpLedger::default();
-        led.note_ec_dispatch(31, 4, true, /*create=*/ false, 100, 100_000);
+        led.note_ec_dispatch(31, 4, /*create=*/ false, 100, 100_000);
         assert!(
             led.query(&OpQueryReq::default())
                 .iter()
@@ -1057,39 +1056,83 @@ mod tests {
 
         // With the marker still held it does create, and a later marker-less
         // response still refreshes that live entry.
-        led.note_ec_dispatch(31, 4, true, true, 101, 101_000);
-        led.note_ec_dispatch(31, 4, true, false, 102, 102_000);
+        led.note_ec_dispatch(31, 4, true, 101, 101_000);
+        led.note_ec_dispatch(31, 4, false, 102, 102_000);
         let recs = led.query(&OpQueryReq::default());
-        let r = recs.iter().find(|r| r.secondary_id == 31).expect("entry");
-        assert_eq!(r.attempts, 2, "refresh-only still counts a real try");
+        assert_eq!(
+            recs.iter().filter(|r| r.secondary_id == 31).count(),
+            1,
+            "the marker-less response refreshes the live entry, it does not add one"
+        );
+    }
+
+    /// The executing node's own reason, arriving on the `df` heartbeat. It may
+    /// only UPDATE: a node reporting about an op this ledger does not have
+    /// RUNNING is describing something already closed or never tracked, and an
+    /// entry conjured from a node report has no marker behind it, so nothing
+    /// would ever close it.
+    #[test]
+    fn a_node_reported_failure_updates_a_running_entry_and_creates_none() {
+        use autumn_rpc::manager_rpc::CODE_ERROR;
+        let mut led = OpLedger::new();
+
+        // Nothing tracked yet — the report is dropped, not turned into an entry.
+        led.record_node_op_failure(OP_KIND_RECOVERY, 42, "peer 83 answered short".into(), CODE_ERROR);
+        assert!(
+            led.query(&OpQueryReq::default()).is_empty(),
+            "a node report must never create an entry"
+        );
+
+        led.note_recovery_dispatch(42, 2, 7, 100, 1_000_000);
+        led.record_node_op_failure(OP_KIND_RECOVERY, 42, "peer 83 answered short".into(), CODE_ERROR);
+        let r = led
+            .query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.error, "peer 83 answered short");
+        assert_eq!(r.error_code, CODE_ERROR);
+        assert_eq!(r.state, OP_STATE_RUNNING, "a failed attempt is not a terminal state");
+
+        // Same extent, other kind: the two ops are separate entries and a
+        // report for one must not stamp the other.
+        led.record_node_op_failure(OP_KIND_EC_CONVERT, 42, "not this op".into(), CODE_ERROR);
+        let r = led
+            .query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.error, "peer 83 answered short", "kind must gate the match");
+
+        // A report that loses the race with the completion must not stamp an
+        // error onto a closed entry — the same hazard `update_progress_by_extent`
+        // guards against, arriving through the same heartbeat.
+        led.complete_recovery(42, "rebuilt".into(), 200);
+        led.record_node_op_failure(OP_KIND_RECOVERY, 42, "late report".into(), CODE_ERROR);
+        let r = led
+            .query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.state, OP_STATE_SUCCEEDED);
+        assert_ne!(r.error, "late report", "a closed op must not be restamped");
     }
 
     #[test]
-    fn recovery_lifecycle_tracks_attempts_and_last_error() {
+    fn recovery_lifecycle_keeps_one_entry_and_the_last_error() {
         let mut led = OpLedger::new();
-        // dispatch accepted → RUNNING, attempts=1
+        // dispatch accepted → RUNNING
         led.note_recovery_dispatch(42, 2, 7, 100, 1_000_000);
         let recs = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() });
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].state, OP_STATE_RUNNING);
-        assert_eq!(recs[0].attempts, 1);
         assert_eq!(recs[0].secondary_id, 42);
         assert_eq!(recs[0].requested_by, "auto-recovery");
         // a failed attempt keeps it RUNNING (the loop retries) but records the
-        // reason + code + consecutive count — the operator-actionable state.
-        led.record_recovery_failure(42, "no healthy target".into(), 3, 4, 110, 1_100_000);
+        // reason + code — the operator-actionable state.
+        led.record_recovery_failure(42, "no healthy target".into(), 3, 110, 1_100_000);
         let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
             .remove(0);
         assert_eq!(r.state, OP_STATE_RUNNING, "recovery retries; never terminal on one failure");
         assert_eq!(r.error, "no healthy target");
         assert_eq!(r.error_code, 3);
-        assert_eq!(r.attempts, 4);
-        // a re-dispatch counts another attempt on the SAME entry (one op per
-        // extent, not one per try).
+        // a re-dispatch lands on the SAME entry (one op per extent, not one per
+        // try).
         led.note_recovery_dispatch(42, 2, 9, 120, 1_200_000);
-        let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
-            .remove(0);
-        assert_eq!(r.attempts, 5);
         assert_eq!(
             led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() }).len(),
             1
@@ -1106,7 +1149,7 @@ mod tests {
     fn recovery_failure_before_any_dispatch_still_listed() {
         let mut led = OpLedger::new();
         // a repair that can't even start (no candidate) must still be visible.
-        led.record_recovery_failure(9, "all recovery candidates rejected".into(), 3, 1, 5, 5_000);
+        led.record_recovery_failure(9, "all recovery candidates rejected".into(), 3, 5, 5_000);
         let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
             .remove(0);
         assert_eq!(r.state, OP_STATE_RUNNING);
@@ -1117,14 +1160,23 @@ mod tests {
     #[test]
     fn seed_ec_replay_makes_inflight_ec_listable_and_closable() {
         let mut led = OpLedger::new();
-        led.seed_replay(OP_KIND_EC_CONVERT, [55u64, 77], 100, 1_000_000);
+        led.seed_replay(OP_KIND_EC_CONVERT, [(55u64, 40), (77, 0)], 100, 1_000_000);
         let ecs = led.query(&OpQueryReq { kind_filter: OP_KIND_EC_CONVERT, ..Default::default() });
         assert_eq!(ecs.len(), 2);
         assert!(ecs
             .iter()
             .all(|e| e.state == OP_STATE_RUNNING && e.requested_by == "replay"));
+        // The marker's OWN start time survives the leader change: 55's work
+        // began at 40, long before this promotion at 100. Stamping the
+        // promotion time would show an op that has run for an hour as one that
+        // just began, which is the first thing an operator reads. A marker with
+        // no recorded start falls back to now.
+        let e55 = ecs.iter().find(|e| e.secondary_id == 55).expect("55");
+        let e77 = ecs.iter().find(|e| e.secondary_id == 77).expect("77");
+        assert_eq!(e55.started_at, 40, "a replayed op must not look freshly started");
+        assert_eq!(e77.started_at, 100, "no recorded start falls back to now");
         // idempotent: re-seeding an already-tracked extent doesn't duplicate.
-        led.seed_replay(OP_KIND_EC_CONVERT, [55u64], 101, 1_100_000);
+        led.seed_replay(OP_KIND_EC_CONVERT, [(55u64, 40)], 101, 1_100_000);
         assert_eq!(
             led.query(&OpQueryReq { kind_filter: OP_KIND_EC_CONVERT, ..Default::default() }).len(),
             2

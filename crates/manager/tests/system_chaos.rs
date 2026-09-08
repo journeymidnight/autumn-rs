@@ -1929,13 +1929,12 @@ async fn verify_no_ops_left_in_flight(mgr: &RpcClient) -> Vec<String> {
     for op in active {
         errors.push(format!(
             "op {} kind={} target={}/{} still ACTIVE (state={}) after quiesce — \
-             attempts={} last_error={:?}",
+             last_error={:?}",
             op.op_id,
             op.kind,
             op.part_id,
             op.secondary_id,
             op.state,
-            op.attempts,
             op.error
         ));
     }

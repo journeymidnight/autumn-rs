@@ -123,11 +123,11 @@ extent footprint, so it stops recommending the split as soon as the cut lands.
   the recovery loop dispatches it:
   ```bash
   autumn-op ops list --kind recovery
-  # op 1170…  recovery  running   target=0->12 attempts=3  ERROR[3]: all recovery candidates rejected
-  # op 1170…  recovery  succeeded target=0->10 attempts=1  recovered slot onto node 1
+  # op 1170…  recovery  running   target=0->12  ERROR[4]: only 2/3 shards available (peer 83: short read)
+  # op 1170…  recovery  succeeded target=0->10  recovered slot onto node 1
   ```
   A recovery **stays `running` while it retries** (the loop backs off but never
-  gives up), carrying `attempts` and the **last** failure reason + `error_code` —
+  gives up), carrying the **last** failure reason + `error_code` —
   so a repair that is looping instead of converging is visible per-extent, not
   just in aggregate `recovery-stats`.
 - **Failover honesty**: the live ledger is leader-local (in-memory, cap 256).
@@ -920,6 +920,50 @@ time autumn-client --manager <mgr:9001> put <key-in-that-partition> v
 # CHANGES after the reopen (fresh epoch) instead of repeating.
 ```
 
+## Migrating the extent nodes off the StatefulSet
+
+One-time, for a cluster whose ENs still run as the `autumn-en` StatefulSet. The
+destination is one Deployment per EN mounting the same PVC — same `node_uuid`,
+same data, independently removable.
+
+**The hazard this order avoids: two EN processes on one data directory.** The EN
+takes no lock on its data dir, the PV is node-pinned, and ReadWriteOnce is a
+NODE-level guarantee — two pods on the SAME node may mount one claim
+simultaneously. So a Deployment must never be created while that ordinal's old
+pod is still running: both would self-register the same `node_uuid`, overwrite
+each other's advertised address, and write the same files.
+
+```bash
+# 1. Let go of the pods without stopping them. --cascade=orphan leaves every EN
+#    running and untouched; only the controller goes away. PVCs are not touched
+#    by this at all.
+kubectl -n autumn delete sts autumn-en --cascade=orphan
+
+# 2. One EN at a time. A merely-absent node does NOT trigger recovery -- the
+#    recovery loop's default `fenced_only` gate rebuilds fenced slots, not
+#    slots of a node that is briefly down -- so no fence or maintenance window
+#    is needed for a restart this short.
+for n in 0 5 6 7 8 9 10; do
+  kubectl -n autumn delete pod "autumn-en-$n" --wait=true      # must be GONE,
+  kubectl -n autumn wait --for=delete "pod/autumn-en-$n" --timeout=120s || true
+  AUTUMN_EN_IMAGE=<registry>/autumn-rs:<tag> \
+  AUTUMN_EN_CPU=4 AUTUMN_EN_NODESELECTOR=autumn-node=true \
+    deploy/scripts/en-workload.sh apply "$n"                    # ...before this
+  kubectl -n autumn rollout status "deploy/autumn-en-$n" --timeout=300s
+done
+
+# 3. The cluster must not have noticed. Same node_ids, same shard counts.
+autumn-op info | awk '$1=="node"'
+```
+
+Do NOT substitute `kubectl apply` of a rendered set for step 2's loop: applying
+all the Deployments at once creates every new pod while every old pod is still
+running, which is exactly the overlap above.
+
+If a step fails partway, the safe state is "old pod deleted, Deployment not yet
+created" — nothing is lost, the EN is simply down, and re-running the apply for
+that ordinal brings it back on its own PVC.
+
 ## Node decommission runbook (fence → drain → remove)
 
 Retiring an EN is operator-driven (HDFS-decommission style). The manager never
@@ -933,6 +977,24 @@ AO=(./target/release/autumn-op --manager 127.0.0.1:9001)
 "${AO[@]}" info                                          # 2. watch shard count → 0
 "${AO[@]}" remove 56 --by you                            # 3. remove (server-side gated)
 ```
+
+On Kubernetes, `deploy/scripts/en-decommission.sh <ordinal>` does exactly the
+above and then deletes the workload — in that order, waiting at each gate:
+
+```bash
+deploy/scripts/en-decommission.sh --dry-run 7   # resolve + preflight only
+deploy/scripts/en-decommission.sh 7             # fence → drain → remove → delete
+```
+
+It resolves the pod to its `node_id` through the pod IP, because that is the
+only join key that exists: the EN advertises its own pod IP, and the manager
+knows nothing about ordinals or workload names. It refuses when fewer nodes
+than the replica count would remain (fenced nodes are hard-excluded from
+placement, so the cluster would refuse new extent allocation — loudly, but only
+once something tries to write). It keeps the PVC unless `--delete-pvc`.
+
+Deleting the workload FIRST is the mistake this wraps: it looks like it worked,
+and silently costs a replica of every shard the node still held.
 
 What fencing triggers (all automatic):
 
@@ -1992,6 +2054,77 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   ~5 s in (the marker is acquired before encoding starts, so `--` first),
 #   advance one 64 MiB stripe at a time, and land on 100% at SUCCEEDED. The
 #   denominator is THIS node's shard, ceil(extent / K), not the whole extent.
+#   EC REBUILD progress (a recovery whose extent is ec_converted; the kind is
+#   still `recovery` — it is one RecoveryTask, so it lands on the same ledger
+#   entry a replica rebuild would): the EN samples once per 64 MiB stripe,
+#   AFTER the stripe is decoded and written — `done` = bytes of the rebuilt
+#   shard on disk, `total` = the exact shard length. A stripe needs K peers
+#   before it can be decoded, so nothing moves while peers are being read;
+#   with a 1 GiB shard expect ~16 steps, each landing on a 64 MiB boundary.
+#   Reading it in `$AO ops list --active`:
+#     `recovery running` with no ratio      an attempt just started: the slot
+#                                           is `0/0` until the EN has resolved
+#                                           the extent (manager round-trip,
+#                                           then the recovery permit — with
+#                                           the EN's `--recovery-parallelism`
+#                                           at its default of 2 a queued
+#                                           rebuild can sit here behind two
+#                                           others; that is a queue, not a
+#                                           stall);
+#     `0 / <shard bytes>`                   the walk began and the first
+#                                           stripe's K peers have not all
+#                                           answered yet;
+#     a ratio on a 64 MiB boundary that     the STALL shape. One of the K
+#     stops moving while the op stays       peers this stripe needs is not
+#     RUNNING                               answering (or answers short — the
+#                                           EN refuses a short stripe rather
+#                                           than decode it). The EN's own
+#                                           failure text names every peer it
+#                                           tried and why, and it arrives on
+#                                           the next df heartbeat — the entry
+#                                           carries it as `ERROR[4]: …` while
+#                                           still RUNNING. `kubectl logs <en>`
+#                                           is now only for the HISTORY (the
+#                                           ledger keeps the last reason, not
+#                                           every attempt's).
+#                                           A 4-hour zero-byte rebuild now
+#                                           shows as `0 / N` for four hours,
+#                                           not as a bare `running`;
+#     a ratio that drops back to 0          the attempt failed and the EN's
+#                                           retry loop (10 tries, 10 s apart)
+#                                           started the next one — the
+#                                           partial shard was unlinked, so the
+#                                           bytes really are gone. The EN
+#                                           retracts the ratio the moment the
+#                                           attempt fails, so it is `0/0`
+#                                           between attempts, then `0 / N`
+#                                           once the new attempt has resolved
+#                                           the extent. Ten of these and the
+#                                           EN gives up: the slot empties, the
+#                                           manager's marker survives and it
+#                                           re-dispatches — the ledger entry
+#                                           stays RUNNING and starts over.
+#   Not observable here: whether the K peers are SLOW rather than dead — a
+#   stripe that takes ten minutes and one that never completes look the same
+#   until the next boundary lands. Two samples a stripe apart in time tell
+#   them apart; one does not.
+# WHY the reason is on the heartbeat and not only in the retry response.
+#   A node's failure used to reach the manager only in its answer to the NEXT
+#   dispatch, and re-dispatch runs on exponential backoff — so on a repair that
+#   had been failing for a while, the reason could be minutes or hours stale,
+#   and "failing" and "merely slow" read identically until the retry came
+#   round. `DfResp.op_failures` carries it every 2 s instead. It can only
+#   UPDATE an entry the ledger already has RUNNING: a report for an op the
+#   manager is not tracking is describing something already closed, and an
+#   entry conjured from one would have no marker behind it and nothing to ever
+#   close it.
+# AFTER A MANAGER RESTART the age is real, not reset. Replayed entries take
+#   their `started_at` from the etcd marker, which records when the work began
+#   and outlives the leader that started it. What does NOT survive is the
+#   history: the ledger holds the last reason, and the manager's own
+#   dispatch-failure counters start from zero (they live in the rate limiter's
+#   in-memory backoff table, so the backoff restarts too — a badly-behaved
+#   extent gets hit hard once more before it backs off again).
 # chaos: pacing between runs is MANDATORY
 # One `system_chaos` run burns ~50k loopback ephemeral ports, and TIME-WAIT
 #   decays over ~60 s each — so back-to-back runs hit EADDRNOTAVAIL mid-run and
@@ -2147,6 +2280,28 @@ autumn-op cluster-version            # expect: still 1 (etcd replay)
 # mixed-version refusal: any pre-R1 binary against this manager fails its
 # startup check loudly ("decode GetClusterIdResp failed ... wire-schema mismatch")
 ```
+
+A wire bump also invalidates anything ALREADY WRITTEN to etcd in a wire type's
+rkyv layout, which the version handshake cannot protect: it guards
+process-to-process traffic, not bytes at rest. Today that is the op log —
+`opLog/` holds up to 2000 `OpRecord`s, and `ops history` decodes them one by
+one. A record written by the previous version fails `rkyv_decode`, and the
+reader logs `skipping an undecodable op-log record` and carries on, so nothing
+breaks — but every pre-upgrade record is skipped, one warn line each. Clear the
+prefix as part of the stop-the-world rather than reading a few thousand of
+those, and accept that `ops history` starts empty after the upgrade (it is
+diagnostic history, not cluster state — no op depends on it):
+
+```bash
+# The prefix is at the etcd ROOT, not under autumn-rs/ (verified: 190 records
+# on the live cluster). Check before you delete.
+kubectl -n autumn exec autumn-etcd-0 -- etcdctl get "" --prefix --keys-only | grep -c '^opLog/'
+kubectl -n autumn exec autumn-etcd-0 -- etcdctl del --prefix 'opLog/'
+```
+
+Do this while the managers are DOWN, in the same window as the binary swap. Any
+wire type that is also persisted needs the same treatment; `OpRecord` is the
+only one today.
 
 v28 changed the FRAME layer itself (one uniform shape:
 `[header][ctrl_len][ctrl][crc][value]`, crc over header+ctrl, raw value tails
