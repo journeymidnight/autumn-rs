@@ -498,6 +498,38 @@ client's retried split re-captures. Deterministic repro of both halves:
 `crates/manager/tests/system_roll_tails_live_writer.rs`
 (`in_flight_roll_racing_split_commit_child_still_opens`).
 
+**Placement scoring (`placement.rs`).** Allocation (`select_nodes`) and recovery
+(`dispatch_recovery_task` via `recovery_candidate_order`) answer the same
+question — of the nodes ALLOWED to hold this extent, which should — so they
+share one scorer. They did not: allocation shuffled, recovery took the lowest
+`node_id` past the rate limiter. Ascending id is an ACTIVE bias and it cost a
+migration: draining one node sent 12 of its 27 shards onto the two nodes queued
+for decommission next (smallest ids), while four empty nodes got nothing.
+
+Ranking is BANDED LEXICOGRAPHIC, not a weighted sum — utilization in 5-point
+bands, then open extents, then shards. A sum needs a constant trading bytes
+against counts that nobody can defend. **Sealed is capacity, open is load**: a
+sealed extent never grows and its bytes are already counted, while an open one
+is an append target, so a node that just took ten tails still reports almost no
+bytes and would keep winning on capacity alone. Load comes from
+`cluster_cap.per_node` (per-disk SUMS each df tick — NOT `node_max_free`, which
+is the MAX across a node's disks and is right only for "can this node take an
+extent at all") plus per-node slot counts riding the chunked `logical_stored`
+scan. No new telemetry.
+
+**Allocation samples, recovery sorts.** `pick_least_loaded` takes the best of 2
+random candidates because argmin herds — every concurrent allocation picks the
+same emptiest node. Recovery uses `order_by_load` (full sort, ties shuffled)
+because `RecoveryRateLimiter`'s `max_per_target` already spreads a burst down
+the list, so sampling there only loses accuracy. `select_nodes` re-shuffles its
+result before returning: `replicates[0]` is the append leader and chain head,
+and score order would concentrate that on the emptiest node — a different
+resource than this change is about.
+
+Scoring runs strictly AFTER the hard constraints and cannot reach past them:
+`occupied`, `hard_excluded`, online-disk, `min_alloc_free_bytes`, and the rate
+limiter, which is a gate and never a score term.
+
 **Placement hard-exclusion.** `placement_excluded_node_ids()` = Fenced ∪ Maintenance
 (overrides) ∪ Suspected (`node_states`) — threaded as `hard_excluded` into
 `select_nodes` (filtered at the top so both the count precheck and cold-leader

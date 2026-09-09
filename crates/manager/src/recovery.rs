@@ -416,6 +416,62 @@ impl AutumnManager {
         Ok(DispatchOutcome::Dispatched)
     }
 
+    /// Who may rebuild `extent_id`, least loaded first.
+    ///
+    /// Extracted so the ORDER is observable. It used to be
+    /// `sort_by_key(node_id)` inline, and the walk that consumes it stops at
+    /// the first candidate with rate-limiter headroom — so the lowest ids won
+    /// every rebuild in the cluster. Draining one node then sent 12 of its 27
+    /// shards onto the two nodes queued to be decommissioned next (they had
+    /// the smallest ids), while four brand-new empty nodes received nothing.
+    ///
+    /// A full ordering rather than one pick: the walk needs somewhere to go
+    /// when a target is capped, so every candidate must appear exactly once.
+    ///
+    /// The hard constraints are applied BEFORE scoring, so scoring never gets
+    /// the chance to overrule them: a node already holding a slot of this
+    /// extent (`occupied` — two slots on one node quietly costs a replica's
+    /// worth of fault tolerance) and a fenced / maintenance / suspected node
+    /// (`hard_excluded` — rebuilding onto one only makes work to migrate off).
+    fn recovery_candidate_order(
+        &self,
+        extent_id: u64,
+    ) -> Result<(MgrExtentInfo, Vec<MgrNodeInfo>), AppError> {
+        // Both read RefCells disjoint from the store; taken before its borrow.
+        let hard_excluded = self.placement_excluded_node_ids();
+        let placement_load = self.placement_load();
+        let (extent, all) = {
+            let s = self.store.inner.borrow();
+            let extent = s
+                .extents
+                .get(&extent_id)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
+            let occupied = Self::extent_nodes(&extent)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let all = s
+                .nodes
+                .values()
+                .filter(|n| !occupied.contains(&n.node_id))
+                .filter(|n| !hard_excluded.contains(&n.node_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (extent, all)
+        };
+        let mut by_id: std::collections::HashMap<u64, MgrNodeInfo> =
+            all.into_iter().map(|n| (n.node_id, n)).collect();
+        let ids: Vec<u64> = by_id.keys().copied().collect();
+        let ordered = crate::placement::order_by_load(
+            crate::placement::pool_for(ids, &placement_load),
+            &mut rand::thread_rng(),
+        )
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect();
+        Ok((extent, ordered))
+    }
+
     pub(crate) async fn dispatch_recovery_task(
         &self,
         extent_id: u64,
@@ -446,27 +502,7 @@ impl AutumnManager {
         // never rebuild a replica onto a fenced / maintenance /
         // suspected node — that would just create more work to migrate off.
         // Captured before the store borrow (disjoint RefCells).
-        let hard_excluded = self.placement_excluded_node_ids();
-        let (extent, candidates) = {
-            let s = self.store.inner.borrow();
-            let extent = s
-                .extents
-                .get(&extent_id)
-                .cloned()
-                .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
-            let occupied = Self::extent_nodes(&extent)
-                .into_iter()
-                .collect::<HashSet<_>>();
-            let mut all = s
-                .nodes
-                .values()
-                .filter(|n| !occupied.contains(&n.node_id))
-                .filter(|n| !hard_excluded.contains(&n.node_id))
-                .cloned()
-                .collect::<Vec<_>>();
-            all.sort_by_key(|n| n.node_id);
-            (extent, all)
-        };
+        let (extent, candidates) = self.recovery_candidate_order(extent_id)?;
 
         if candidates.is_empty() {
             return Err(AppError::Precondition(
@@ -1601,6 +1637,8 @@ impl crate::AutumnManager {
         let mut logical_cycle_ids: Vec<u64> = Vec::new();
         let mut logical_cursor: usize = 0;
         let mut logical_partial: u64 = 0;
+        // Per-node (open, total) slot counts, accumulated over the same cycle.
+        let mut slots_partial: HashMap<u64, (u64, u64)> = HashMap::new();
         loop {
             compio::time::sleep(Duration::from_secs(2)).await;
             if !self.leader.get() {
@@ -1747,10 +1785,25 @@ impl crate::AutumnManager {
                 // unrelated to the manager's allocated disk_id).
                 Self::mark_node_disks_online(&self.store, node);
                 // ENOSPC-1: stash the node's max per-disk free for the
-                // allocation free-space soft filter. Uses the df payload's
-                // aggregate only — the per-disk ids in it are EN-local and
-                // unrelated to manager disk_ids (note 7), but the
-                // MAX across disks needs no id mapping.
+                // allocation free-space soft filter.
+                //
+                // MAX, not sum, and that is right for the question it answers:
+                // "can this node still take an extent at all" is about the
+                // emptiest disk, since that is where the extent would land. It
+                // is the wrong metric for "how loaded is this node" — a node
+                // with disks `[empty, full, full, full]` reports as empty — so
+                // placement reads `cluster_cap.per_node` instead, which sums.
+                //
+                // The rationale that used to sit here said the df payload's
+                // per-disk ids were EN-local and unrelated to the manager's, so
+                // a sum would need an id mapping. That is not true. `autumn-op
+                // format` takes each disk_id from the MANAGER's register
+                // response and writes it to `{dir}/disk_id`; `DiskFS::open`
+                // reads it back, `ExtentEntry.disk_id` is that value, and
+                // `handle_df` keys `disk_status` by it. Every disk id in the
+                // system is the manager's, `ready_disk_id` included — which is
+                // also what a future per-(node, disk) placement would need, and
+                // it is not blocked.
                 let max_free = df
                     .disk_status
                     .iter()
@@ -2024,6 +2077,7 @@ impl crate::AutumnManager {
                 logical_cycle_ids = self.store.inner.borrow().extents.keys().copied().collect();
                 logical_cursor = 0;
                 logical_partial = 0;
+                slots_partial = HashMap::new();
                 if logical_cycle_ids.is_empty() {
                     // Empty cluster — commit 0 now (nothing to chunk through).
                     logical_committed = 0;
@@ -2042,6 +2096,18 @@ impl crate::AutumnManager {
                         if let Some(ex) = s.extents.get(id) {
                             if ex.refs != 0 || ex.vp_table_refs != 0 {
                                 logical_partial = logical_partial.saturating_add(ex.sealed_length);
+                                // Slot counts for placement, on the same pass
+                                // and the same liveness predicate. An extent
+                                // already at refs 0 is on its way out; counting
+                                // it would hold a node down for work the delete
+                                // loop is about to undo.
+                                for nid in ex.replicates.iter().chain(ex.parity.iter()) {
+                                    let e = slots_partial.entry(*nid).or_insert((0u64, 0u64));
+                                    e.1 += 1;
+                                    if !ex.sealed {
+                                        e.0 += 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -2052,6 +2118,12 @@ impl crate::AutumnManager {
                     logical_committed = logical_partial;
                     logical_committed_ms = now_ms;
                     logical_cycle_ids = Vec::new();
+                    // Publish whole cycles only. A partially-walked map would
+                    // report every node as holding a fraction of its slots, and
+                    // the fraction differs per node depending on where their
+                    // extents fell in the id order — a bias that looks like
+                    // load.
+                    *self.node_slot_counts.borrow_mut() = std::mem::take(&mut slots_partial);
                 }
             }
             // Σ latest PS-reported open-tail committed bytes
@@ -3298,5 +3370,219 @@ mod ec_abandon_counting_tests {
             "a re-send into a live conversion must not count, however loudly it \
              quotes an old failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_placement_tests {
+    use super::*;
+    use crate::placement::NodeLoad;
+    use crate::NodeCap;
+    use autumn_rpc::manager_rpc::{MgrExtentInfo, MgrNodeInfo};
+
+    const LOADED: [u64; 3] = [1, 3, 5];
+    const EMPTY: [u64; 4] = [102, 104, 106, 108];
+    /// Holds the slot being rebuilt, so it is `occupied` and never a candidate.
+    const DYING: u64 = 200;
+
+    /// A cluster shaped like the AZ migration that exposed this: the loaded
+    /// nodes have the LOWEST ids, the fresh empty ones the highest.
+    fn skewed_manager() -> AutumnManager {
+        let m = AutumnManager::new();
+        {
+            let mut s = m.store.inner.borrow_mut();
+            for nid in LOADED.iter().chain(EMPTY.iter()).chain([DYING].iter()) {
+                s.nodes.insert(
+                    *nid,
+                    MgrNodeInfo {
+                        node_id: *nid,
+                        address: format!("127.0.0.1:{}", 9000 + nid),
+                        disks: vec![*nid],
+                        shard_ports: vec![],
+                        control_address: String::new(),
+                        node_uuid: format!("uuid-{nid}"),
+                    },
+                );
+            }
+            s.extents.insert(
+                7,
+                MgrExtentInfo {
+                    extent_id: 7,
+                    replicates: vec![DYING],
+                    eversion: 1,
+                    refs: 1,
+                    sealed_length: 4096,
+                    sealed: true,
+                    avali: 0b1,
+                    ..Default::default()
+                },
+            );
+        }
+        {
+            let mut cap = m.cluster_cap.borrow_mut();
+            for nid in LOADED {
+                cap.per_node.push((
+                    nid,
+                    NodeCap {
+                        total: 1000,
+                        free: 100,
+                        extent_bytes: 900,
+                        online: true,
+                    },
+                ));
+            }
+            for nid in EMPTY.iter().chain([DYING].iter()) {
+                cap.per_node.push((
+                    *nid,
+                    NodeCap {
+                        total: 1000,
+                        free: 1000,
+                        extent_bytes: 0,
+                        online: true,
+                    },
+                ));
+            }
+        }
+        {
+            let mut slots = m.node_slot_counts.borrow_mut();
+            for nid in LOADED {
+                slots.insert(nid, (4, 45));
+            }
+            for nid in EMPTY {
+                slots.insert(nid, (0, 0));
+            }
+        }
+        m
+    }
+
+    /// THE REGRESSION. The rebuild must go to the empty nodes, not to the
+    /// lowest ids.
+    ///
+    /// Asserted through `recovery_candidate_order` rather than through the
+    /// scorer directly, because the scorer being right proves nothing about the
+    /// path using it — the same distinction that let an earlier bug in this
+    /// crate pass its own ablation.
+    ///
+    /// EVERY iteration, not a fraction of them: recovery orders its candidates
+    /// fully rather than sampling (the rate limiter is what spreads a burst
+    /// here), so an empty node is always first. Reverting the tail of that
+    /// function to `all.sort_by_key(|n| n.node_id)` takes this to 0.
+    #[test]
+    fn a_rebuild_goes_to_the_empty_nodes_not_the_lowest_ids() {
+        let m = skewed_manager();
+        const ITERS: usize = 200;
+        let mut to_empty = 0usize;
+        for _ in 0..ITERS {
+            let (_, order) = m.recovery_candidate_order(7).expect("order");
+            assert_eq!(
+                order.len(),
+                LOADED.len() + EMPTY.len(),
+                "the walk needs every candidate exactly once; the node holding \
+                 the slot must be the only one missing"
+            );
+            assert!(
+                !order.iter().any(|n| n.node_id == DYING),
+                "a node already holding a slot of this extent must never be a \
+                 rebuild target"
+            );
+            if EMPTY.contains(&order[0].node_id) {
+                to_empty += 1;
+            }
+        }
+        assert_eq!(
+            to_empty, ITERS,
+            "a loaded node was ordered ahead of an empty one; full ordering \
+             means this must never happen"
+        );
+    }
+
+    /// Load steers, it never overrules. A fenced node is out even when it is by
+    /// far the emptiest thing in the cluster.
+    #[test]
+    fn the_emptiest_node_is_still_refused_when_it_is_excluded() {
+        let m = skewed_manager();
+        m.node_overrides.borrow_mut().insert(
+            102,
+            autumn_rpc::manager_rpc::MgrNodeOverride {
+                node_id: 102,
+                kind: autumn_rpc::manager_rpc::NODE_OVERRIDE_FENCED,
+                set_at: 0,
+                set_by: "test".into(),
+                reason: "test".into(),
+                expire_at: 0,
+                node_uuid: "uuid-102".into(),
+            },
+        );
+        for _ in 0..50 {
+            let (_, order) = m.recovery_candidate_order(7).expect("order");
+            assert!(
+                !order.iter().any(|n| n.node_id == 102),
+                "a fenced node must not be a rebuild target however empty it is"
+            );
+        }
+    }
+
+    /// With no `df` data at all — a leader that has just won the election —
+    /// every node is unmeasured, and the order must stay unbiased rather than
+    /// collapsing back onto the id.
+    #[test]
+    fn a_cold_leader_still_spreads() {
+        let m = skewed_manager();
+        m.cluster_cap.borrow_mut().per_node.clear();
+        m.node_slot_counts.borrow_mut().clear();
+        let mut first_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let (_, order) = m.recovery_candidate_order(7).expect("order");
+            first_seen.insert(order[0].node_id);
+        }
+        assert!(
+            first_seen.len() >= 5,
+            "unmeasured nodes must tie and spread, got {first_seen:?}"
+        );
+    }
+
+    /// `placement_load` must read the per-disk SUM, not the per-disk MAX that
+    /// `node_max_free` carries — otherwise a node with one fresh disk beside
+    /// three full ones scores as empty as a node with four fresh disks.
+    #[test]
+    fn a_node_is_measured_by_its_whole_footprint() {
+        let m = AutumnManager::new();
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                total: 4000,
+                free: 1000,
+                extent_bytes: 3000,
+                online: true,
+            },
+        )];
+        m.node_max_free.borrow_mut().insert(1, 1000);
+        let load = m.placement_load();
+        assert_eq!(
+            load.get(&1).copied(),
+            Some(NodeLoad {
+                used_bytes: 3000,
+                total_bytes: 4000,
+                open_extents: 0,
+                shards: 0,
+            })
+        );
+    }
+
+    /// A node whose `df` failed this tick reports nothing trustworthy, so it
+    /// must read as unmeasured rather than as whatever it last said.
+    #[test]
+    fn a_node_whose_df_failed_is_not_measured() {
+        let m = AutumnManager::new();
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                total: 4000,
+                free: 4000,
+                extent_bytes: 0,
+                online: false,
+            },
+        )];
+        assert!(m.placement_load().get(&1).is_none());
     }
 }

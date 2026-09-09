@@ -5,6 +5,7 @@ mod extent_delete;
 pub mod extent_inflight;
 mod extent_corrupt;
 mod op_log;
+mod placement;
 mod extent_layout;
 mod fs_alloc;
 pub mod inode_lease;
@@ -838,6 +839,22 @@ pub struct AutumnManager {
     /// read-only Σ distinct sealed_length. Not persisted (volatile, rebuilt
     /// from df + scan); leader-only meaning.
     pub(crate) cluster_cap: Rc<RefCell<ClusterCapSnapshot>>,
+    /// Per node: `(open slots, total slots)`, published by the same chunked
+    /// periodic scan of `s.extents` that computes `logical_stored`.
+    ///
+    /// Rides that scan rather than being counted per placement decision:
+    /// walking every extent to place one is O(extents) on the hot path, and
+    /// the scan already pays that cost in bounded chunks.
+    ///
+    /// Staleness is a CYCLE, and a cycle is not 30 seconds at scale — the
+    /// scan walks a bounded chunk per 2 s tick, so ten million extents is
+    /// minutes between publications. Inside a burst these counts do not move,
+    /// and neither does the byte signal (5% of a node is hundreds of GB), so
+    /// the ranking is effectively frozen for its duration and the spread comes
+    /// from sampling. That is the intended shape, not a bug — the counts steer
+    /// a preference, never a correctness gate — but it is minutes, not
+    /// seconds, and sizing anything on them should assume so.
+    pub(crate) node_slot_counts: Rc<RefCell<HashMap<u64, (u64, u64)>>>,
     /// ENOSPC-1: allocation soft-avoids nodes whose max per-disk free is
     /// below this (`--min-alloc-free-bytes`, default 256 MiB; 0 =
     /// disabled). Soft: select_nodes falls back to the full healthy set
@@ -1107,6 +1124,7 @@ impl AutumnManager {
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             node_max_free: Rc::new(RefCell::new(HashMap::new())),
             cluster_cap: Rc::new(RefCell::new(ClusterCapSnapshot::default())),
+            node_slot_counts: Rc::new(RefCell::new(HashMap::new())),
             min_alloc_free_bytes: Rc::new(Cell::new(DEFAULT_MIN_ALLOC_FREE_BYTES)),
             audit_retention_days: Rc::new(Cell::new(90)),
             displaced: Rc::new(Cell::new(true)),
@@ -3735,11 +3753,22 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// available even in degraded states (e.g. cold leader before the
     /// first `df` poll has run).
     ///
-    /// pick is **shuffled** (uniform random `count`-subset) instead
-    /// of "lowest `node_id` first". The previous deterministic order
-    /// concentrated load on the first `count` nodes by ID — e.g. a 4-node
-    /// cluster {1,3,5,7} with 3-replica streams placed every extent on
-    /// {1,3,5}, leaving node 7 idle until one of the first three failed.
+    /// The pick is **load-scored** (`placement::pick_least_loaded`), which is
+    /// the same function recovery dispatch uses — one answer to "of the nodes
+    /// allowed to hold this, which should". It replaced a uniform shuffle,
+    /// which had itself replaced "lowest `node_id` first" because that order
+    /// concentrated every extent on the first `count` nodes by id. A shuffle
+    /// fixed the bias but not the outcome: it never converges, so a cluster
+    /// drifts apart and stays there (measured: 45 shards on one node against
+    /// 12 on another, same hardware).
+    ///
+    /// With an EMPTY load map every node compares equal and the pick is
+    /// distributionally identical to the old shuffle — which is what the two
+    /// long-standing distribution tests rely on. That state is narrower than
+    /// "the cold-leader path", though: the per-disk sums arrive on the first
+    /// `df` tick (~2 s) while the slot counts wait for a whole scan cycle, so a
+    /// leader that has just won ranks by utilization band with both counts at
+    /// zero. Correct, but not the same thing as unranked.
     ///
     /// `exclude_node_ids` carries the writer's per-stream "recently
     /// failed" set (30 s TTL on the client). Filter the candidate pool by
@@ -3769,10 +3798,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         online_node_ids: &HashSet<u64>,
         space_low_node_ids: &HashSet<u64>,
         hard_excluded: &HashSet<u64>,
+        load: &HashMap<u64, crate::placement::NodeLoad>,
         count: usize,
         exclude_node_ids: &[u64],
     ) -> Result<Vec<MgrNodeInfo>, AppError> {
-        use rand::seq::SliceRandom;
         // Hard-exclude up front so the count precheck AND the degraded
         // `pool = all` fallback both inherit it (all downstream pools derive
         // from `all_unfiltered`).
@@ -3829,14 +3858,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .cloned()
             .collect();
         if spacious.len() >= count {
-            let mut pool = spacious;
-            pool.shuffle(&mut rng);
-            return Ok(pool.into_iter().take(count).collect());
+            return Ok(Self::take_least_loaded(spacious, load, count, &mut rng));
         }
         if healthy.len() >= count {
-            let mut pool = healthy;
-            pool.shuffle(&mut rng);
-            return Ok(pool.into_iter().take(count).collect());
+            return Ok(Self::take_least_loaded(healthy, load, count, &mut rng));
         }
         // Degraded fallback: not enough verified-online nodes with
         // online disks. Preserve the legacy fallback —
@@ -3845,9 +3870,40 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         // the candidate per-RPC and walks alternates on failure). Cold-
         // leader case (no df sweep yet → online_node_ids empty) is
         // covered here.
-        let mut pool = all;
-        pool.shuffle(&mut rng);
-        Ok(pool.into_iter().take(count).collect())
+        Ok(Self::take_least_loaded(all, load, count, &mut rng))
+    }
+
+    /// Score `pool` and keep the `count` least loaded, as node records.
+    ///
+    /// The scoring itself is in `placement`, which never sees an
+    /// `MgrNodeInfo` — it decides between node IDS and load, and that is all it
+    /// should need to know. This is the seam that maps back.
+    ///
+    /// The result is SHUFFLED before returning, on purpose. `replicates[0]` is
+    /// not just a member: it is the append leader the writer sends to first,
+    /// and the chain head when chained append is on. Returning the picks in
+    /// score order would make the emptiest node of every extent its slot 0 —
+    /// a new, undiscussed concentration of a different resource (issue order,
+    /// and under chaining (N-1)x forwarding egress) smuggled in by a change
+    /// that is only supposed to decide WHICH nodes hold the extent. Slot order
+    /// stays random, exactly as the shuffle left it.
+    fn take_least_loaded(
+        pool: Vec<MgrNodeInfo>,
+        load: &HashMap<u64, crate::placement::NodeLoad>,
+        count: usize,
+        rng: &mut impl rand::Rng,
+    ) -> Vec<MgrNodeInfo> {
+        let mut by_id: HashMap<u64, MgrNodeInfo> =
+            pool.into_iter().map(|n| (n.node_id, n)).collect();
+        let ids: Vec<u64> = by_id.keys().copied().collect();
+        let mut chosen: Vec<MgrNodeInfo> =
+            crate::placement::pick_least_loaded(crate::placement::pool_for(ids, load), count, rng)
+                .into_iter()
+                .filter_map(|id| by_id.remove(&id))
+                .collect();
+        use rand::seq::SliceRandom;
+        chosen.shuffle(rng);
+        chosen
     }
 
     fn all_bits(size: usize) -> u32 {
@@ -3942,6 +3998,43 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// ENOSPC-1: nodes whose latest df probe showed max per-disk free
     /// BELOW the floor. Unknown nodes (no df yet) are NOT low — a cold
     /// leader must keep allocating.
+    /// What placement knows about every node right now.
+    ///
+    /// Assembled from two existing sources, neither of them new: the per-disk
+    /// SUMS `cluster_cap.per_node` publishes each `df` tick, and the slot
+    /// counts the periodic extent scan publishes each cycle.
+    ///
+    /// Note this reads the summed `NodeCap`, NOT `node_max_free`. That field is
+    /// the MAX across a node's disks, which exists only because
+    /// `space_low_node_ids` needed a free-space signal without mapping
+    /// EN-local disk ids to manager ones — as a load metric it says a node with
+    /// disks `[empty, full, full, full]` is as empty as one with four empty
+    /// disks. Correct for "can this node still take an extent at all", useless
+    /// for "how loaded is it".
+    pub(crate) fn placement_load(&self) -> HashMap<u64, crate::placement::NodeLoad> {
+        let slots = self.node_slot_counts.borrow();
+        let mut out: HashMap<u64, crate::placement::NodeLoad> = HashMap::new();
+        for (node_id, cap) in &self.cluster_cap.borrow().per_node {
+            if !cap.online {
+                // A node whose df failed this tick reports nothing trustworthy;
+                // leave it unmeasured so it sorts behind nodes we can see
+                // rather than behind a stale number that looks authoritative.
+                continue;
+            }
+            let (open, total) = slots.get(node_id).copied().unwrap_or((0, 0));
+            out.insert(
+                *node_id,
+                crate::placement::NodeLoad {
+                    used_bytes: cap.extent_bytes,
+                    total_bytes: cap.total,
+                    open_extents: open,
+                    shards: total,
+                },
+            );
+        }
+        out
+    }
+
     pub(crate) fn space_low_node_ids(&self) -> HashSet<u64> {
         let floor = self.min_alloc_free_bytes.get();
         if floor == 0 {
@@ -8222,7 +8315,7 @@ mod tests {
         let mut counts: HashMap<u64, usize> = HashMap::new();
         for _ in 0..ITERS {
             let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), &HashSet::new(), 3, &[])
+                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), &HashSet::new(), &HashMap::new(), 3, &[])
                     .unwrap();
             assert_eq!(picked.len(), 3);
             let mut ids: Vec<u64> = picked.iter().map(|n| n.node_id).collect();
@@ -8273,7 +8366,7 @@ mod tests {
         let mut first_node_seen: HashSet<u64> = HashSet::new();
         for _ in 0..200 {
             let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), &HashSet::new(), 1, &[])
+                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), &HashSet::new(), &HashMap::new(), 1, &[])
                     .unwrap();
             first_node_seen.insert(picked[0].node_id);
         }
@@ -8319,7 +8412,7 @@ mod tests {
         let low: HashSet<u64> = [7u64].into_iter().collect();
         for _ in 0..200 {
             let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online, &low, &HashSet::new(), 3, &[]).unwrap();
+                AutumnManager::select_nodes(&nodes, &disks, &online, &low, &HashSet::new(), &HashMap::new(), 3, &[]).unwrap();
             assert!(
                 picked.iter().all(|n| n.node_id != 7),
                 "space-low node 7 picked despite 3 spacious candidates"
@@ -8331,7 +8424,7 @@ mod tests {
         // on a capacity-crunched cluster, not refuse).
         let low2: HashSet<u64> = [5u64, 7].into_iter().collect();
         let picked =
-            AutumnManager::select_nodes(&nodes, &disks, &online, &low2, &HashSet::new(), 3, &[]).unwrap();
+            AutumnManager::select_nodes(&nodes, &disks, &online, &low2, &HashSet::new(), &HashMap::new(), 3, &[]).unwrap();
         assert_eq!(picked.len(), 3);
     }
 

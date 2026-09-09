@@ -1677,6 +1677,10 @@ impl AutumnManager {
         // Fenced/Maintenance/Suspected nodes are hard-excluded
         // from allocation AND the fallback walk below.
         let hard_excluded = self.placement_excluded_node_ids();
+        // Captured with the exclusion set, before the store borrow: both read
+        // RefCells disjoint from it, and taking them here keeps the borrow
+        // below purely about the mutation.
+        let placement_load = self.placement_load();
         let (stream_id, extent_id, selected) = {
             let mut s = self.store.inner.borrow_mut();
             let selected =
@@ -1686,6 +1690,7 @@ impl AutumnManager {
                     &online_node_ids,
                     &space_low_node_ids,
                     &hard_excluded,
+                    &placement_load,
                     total_replicas,
                     &[],
                 )
@@ -2385,7 +2390,9 @@ impl AutumnManager {
         // the store. See `handle_create_stream` for the same pattern.
         let online_node_ids = self.node_states.borrow().online_node_ids();
         let space_low_node_ids = self.space_low_node_ids();
-        let hard_excluded = self.placement_excluded_node_ids();        let (mut tail, selected, extent_id, data, nodes_map) = {
+        let hard_excluded = self.placement_excluded_node_ids();
+        let placement_load = self.placement_load();
+        let (mut tail, selected, extent_id, data, nodes_map) = {
             let mut s = self.store.inner.borrow_mut();
             if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
                 return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
@@ -2486,6 +2493,7 @@ impl AutumnManager {
                 &online_node_ids,
                 &space_low_node_ids,
                 &hard_excluded,
+                &placement_load,
                 data,
                 &req.exclude_node_ids,
             ) {
@@ -3722,6 +3730,10 @@ impl AutumnManager {
         let online_node_ids = self.node_states.borrow().online_node_ids();
         let space_low_node_ids = self.space_low_node_ids();
         let hard_excluded = self.placement_excluded_node_ids();
+        // Captured with the exclusion set, before the store borrow: both read
+        // RefCells disjoint from it, and taking them here keeps the borrow
+        // below purely about the mutation.
+        let placement_load = self.placement_load();
         // Phase 1: compute under borrow_mut, NO awaits inside.
         // Returns alloc-IDs reserved + selected nodes for Phase 1.5.
         struct Phase1Result {
@@ -3845,6 +3857,7 @@ impl AutumnManager {
                     &online_node_ids,
                     &space_low_node_ids,
                     &hard_excluded,
+                    &placement_load,
                     target_replicas,
                     &[],
                 )?;
