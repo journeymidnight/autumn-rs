@@ -39,16 +39,18 @@ spec:
           image: autumn-rs:latest
           # Run the binary directly (bypass the entrypoint role dispatcher, like
           # the bootstrap Job). Flags, not env — this app takes no AUTUMN_* env.
-          command:
-            - autumn-dashboard
-            - --manager
-            - autumn-manager:9001
-            - --admin-token-file
-            - /etc/autumn/authz/admin.token
-            - --listen
-            - 0.0.0.0
-            - --port
-            - "8799"
+          #
+          # Through a shell, and only to resolve the manager: autumn's Rust
+          # client dials an IP literal and does NOT resolve names, so passing
+          # `autumn-manager:9001` starts the process cleanly and then answers
+          # every query with nothing — 0 partitions, 0 servers, no error in the
+          # log. Same convention as the other roles' startup scripts.
+          command: ["/bin/sh", "-c"]
+          args:
+            - exec autumn-dashboard
+              --manager "$(getent hosts autumn-manager | awk '{print $1}'):9001"
+              --admin-token-file /etc/autumn/authz/admin.token
+              --listen 0.0.0.0 --port 8799
           ports:
             - { name: dashboard, containerPort: 8799 }
           resources:
