@@ -50,7 +50,18 @@ Task scope: (1) wire 37 -> 38 的三条改动（EN 失败原因走 df 心跳、s
   会读空并刷 190 行 warn。已写进升级步骤：全停窗口里 `etcdctl del --prefix 'opLog/'`。
   评审说 Cargo.lock 脏——当时不成立，但最后一次跑 manager 测试后确实脏了，已 checkout 还原。
 
-Main gaps: 未提交、未构建。上线是**全停**：wire 38 与 37 不兼容，
+【已上线】wire v38 全停升级 + EN 迁移 + 7→5 缩容，全部完成：
+  - 两个镜像同 commit 重建（autumn-rs c211b62 / freetoken-l3）。freetoken-l3 的
+    AUTUMN_IMAGE 是流水线 Spec 里的字符串，`volc-cp run start -param` 改不了它
+    （试过：构建绿灯但镜像仍是 v37），只能用控制台。**停机前先用一次性 pod 读
+    `/usr/local/share/autumn/client-wire-version`**，正是这一步挡下了一次白停机。
+  - 全停窗口里清掉 `opLog/` 190 条；`cluster_version` 仍是 30（未 upgrade-version）。
+  - L3 跨重启命中：升级前写入的 KV 在 v38 上被读回（hit=100%，14 页，45.8 MiB）。
+  - 两处遗漏，均已修并提交：freetoken-l3 的 `fusebin` initContainer 还钉在 v37
+    （FUSE 起不来 → 引擎读不到权重）；dashboard 的 `--manager` 用的是 DNS 名，而
+    autumn 客户端只认 IP —— 进程起得来、每个查询都返回空，日志里一个错都没有。
+
+Main gaps: F-RECOVERY-PROGRESS 的验收仍差一次真实的 EC 分片重建观察（>1 GiB、掐断源端）。上线是**全停**：wire 38 与 37 不兼容，
   autumn-rs 与 freetoken-l3 两个镜像必须同 commit 重建（freetoken-l3 的 AUTUMN_IMAGE
   是流水线参数，要用浏览器改）。buda-webui 无需重建（实测无 autumn 客户端）。
 Next steps: fable 评审 -> 提交 -> 构建 autumn-rs + freetoken-l3 -> 一次全停里同时做

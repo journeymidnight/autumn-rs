@@ -644,9 +644,17 @@
     分片重新铺开、`extent-health` 干净、所有分区照常服务。
   - 摘完后 `deploy/k8s` 与 vke overlay 都能 `kustomize build`，且 EN 不再有任何
     以 `scale` 为运维入口的路径。
-- **Status**: `passes: false` (2026-09-09) — 脚本与 manifest 已写、服务端 dry-run 通过
-  （已存在的 PVC 被接管而非重建）、防呆实测有效；真集群的 7→5 迁移**尚未执行**，
-  计划与 wire v38 的那次全停合并做（反正每台 EN 都要重启一遍）。
+- **Status**: `closed / passes: true` (2026-09-09) — **已在生产完成**，与 wire v38 的
+  全停合并做（每台 EN 本来也要重启）。实测：
+  - `delete sts --cascade=orphan` 后 7 个 pod 照常运行；全停期间删掉，再按序号建
+    Deployment，**7 个 node_id 一个不差、分片数与基线逐一相同**（41/42/38/33/30/36/21），
+    而 pod IP 全变了（如 node 9 从 .145 变成 .204）——身份确实在 PVC 上，不在序号或地址上。
+  - 退役脚本摘掉 en-8（node 108，21 分片）与 en-7（node 104，30 分片）：fence 后
+    **90 秒**排干到 0，`remove` 服务端放行，workload 才删。落到 5 台，分片自动铺平
+    （57/54/53/52/53），全程无数据丢失、无卡住的 op。
+  - 副作用一条（已修）：全停后 PS 缓存着**迁移前的 EN 地址**，打不开分区
+    （`connect 192.168.3.169:9131 timed out`）。等 EN 全部 Online 后重启 PS 即可，
+    已写进 docs/ops.md 的迁移步骤。
   评审挖出三条会在真集群上出事的，均已修：
   1. **迁移会让两个 EN 进程开同一块盘**：EN 对 data-dir **不加锁**（`flock|fs2|fd-lock`
      全仓库为空），而 RWO 是**节点级**语义 —— 同一节点上两个 pod 可以同时挂同一个 claim，
