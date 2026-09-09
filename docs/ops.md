@@ -964,34 +964,6 @@ If a step fails partway, the safe state is "old pod deleted, Deployment not yet
 created" — nothing is lost, the EN is simply down, and re-running the apply for
 that ordinal brings it back on its own PVC.
 
-## Running a throwaway cluster inside a pod
-
-`cluster.sh` is the only harness with raw kill/restart semantics, which is what
-fault injection needs — but it wants Linux and a scratch disk, and the things
-worth injecting faults into (EC rebuilds, recovery stalls) must not be injected
-into a cluster holding real data. Running it inside a pod on the same cluster
-gives both. Three things are not obvious:
-
-- **The image has no `etcd` and no `nc`.** Run etcd as a second container in the
-  pod (same network namespace, so `127.0.0.1:2379` is simply there), put a stub
-  `etcd` early in PATH so `start_proc` has something to launch, and write a
-  four-line `nc` that uses bash's `/dev/tcp` — `wait_port` only ever asks
-  "is this port open".
-- **`cluster.sh reset` cannot reset an etcd it does not own.** It wipes
-  `$AUTUMN_DATA_ROOT`, so with etcd in a sidecar the node data goes and the
-  metadata stays: the next cluster inherits extents whose files no longer
-  exist, and recoveries fail with `reopen sealed extent N: No such file or
-  directory` for reasons that have nothing to do with what you are testing.
-  Delete and recreate the whole pod between runs.
-- **`--max-extent-size-bytes` is how you get a sealed extent of a chosen size.**
-  EC conversion refuses an open extent, and the default threshold is large
-  enough that a test would have to write for a long time to roll one.
-
-`AUTUMN_PS_MAX_EXTENT_SIZE_BYTES=4831838208 bash cluster.sh reset 6` then gives
-a 4.5 GiB sealed extent, whose 4+1 shard is 1.125 GiB — big enough that a
-rebuild takes long enough to watch, and small enough to fit twice on a 40 GiB
-scratch disk.
-
 ## Node decommission runbook (fence → drain → remove)
 
 Retiring an EN is operator-driven (HDFS-decommission style). The manager never
@@ -1203,38 +1175,6 @@ AUTUMN_MEMORY_E2E_MANAGER=127.0.0.1:9001 \
 AUTUMN_MEMORY_E2E_MANAGER=127.0.0.1:9001 \
   cargo test -p autumn-memory --test scan_boundary -- --ignored --nocapture
 ```
-
-**Fact keys are flat.** The wire shape is `mem/{tenant}/{agent}/fact/{key}` —
-there is no group segment. Grouping is a convention inside the key
-(`"profile:name"`), and `list_facts(Some("profile:"), …)` range-scans exactly
-that group because `keys::q` encodes byte-by-byte and therefore preserves
-prefixes; `list_facts(None, …)` lists every fact. What to check when verifying
-by hand: **the key that comes back still carries its group**, so it can be fed
-straight back into `get_fact` / `delete_fact` —
-
-```text
-list_facts(Some("profile:")) -> [("profile:name", …), ("profile:lang", …)]
-                                  ^^^^^^^^ NOT ("name", …)
-```
-
-`e2e_full_surface` asserts exactly that. Note the group string carries its own
-terminator: `Some("profile")` (no colon) also matches `"profiles:x"`.
-
-**Legacy keys are IN range, not invisible.** A dev cluster holding keys in the
-old `fact/{namespace}/{key}` shape has them sorting *inside* the new family
-range — `fact/profile/name` is listed by `list_facts`, but its name reads back
-as `"profile/name"`, which re-encodes to `fact/profile%2Fname`, a different key.
-Rather than hand back a name whose `delete_fact` would silently delete nothing,
-`list_facts` fails the whole scan with `PreconditionFailed` naming the offending
-key. Clear them and the scan goes green:
-
-```bash
-AC="./target/release/autumn-client --manager 127.0.0.1:9001"
-$AC range --prefix 'mem/{tenant}/{agent}/fact/' --keys-only   # inspect first
-# then delete the ones with a literal `/` after `fact/`
-```
-
-No production data is affected: no shipped consumer ever wrote facts.
 
 **Manual verification (memory-mcp example — both corpora + MCP):**
 

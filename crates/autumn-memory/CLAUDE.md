@@ -16,7 +16,7 @@ search it, and walk its graph. Design + rationale: `docs/autumn_memory_plan.md`.
 | Kind | API | Storage shape |
 |---|---|---|
 | **episodic** | `append_event` / `recent_events` / `replay_session` | append-only, newest-first by key order |
-| **facts** | `put_fact` / `get_fact` / `delete_fact` / `list_facts` | flat `fact/{key}`: point-get + prefix-list, per-key TTL |
+| **facts** | `put_fact` / `get_fact` / `delete_fact` / `list_facts` | point-get + namespace-prefix-list (LangGraph `BaseStore`), per-key TTL |
 | **lexical recall (BM25-on-KV)** ✅ | `index_memory` / `delete_memory` / `search_lexical` / `get_memory` | `recall.rs` |
 | **vector recall (SPFresh-IVF-on-KV)** ✅ | `index_vector` / `train_centroids` / `search_vector` | `vector.rs` |
 | **hybrid (RRF)** ✅ | `search_hybrid` | `recall::rrf_fuse` |
@@ -91,57 +91,13 @@ rkyv, …); the core never imposes one.
 
 ```text
 mem/{tenant}/{agent}/ep/{session}/{12-byte suffix}   episodic
-mem/{tenant}/{agent}/fact/{key}                      fact (FLAT — no group segment)
+mem/{tenant}/{agent}/fact/{namespace}/{key}          fact
+mem/{tenant}/shared/{namespace}/{key}                cross-agent shared
 mem/{tenant}/{agent}/node/{id}                       graph node (authoritative)
 mem/{tenant}/{agent}/nidx/{kind}/{id}                graph by-kind index (marker)
 mem/{tenant}/{agent}/edge/{src}/{type}/{dst}         forward edge (authoritative, attrs)
 mem/{tenant}/{agent}/redge/{dst}/{type}/{src}        reverse edge index (marker/hint)
 ```
-
-**Facts are flat, and that is deliberate.** There used to be a `{namespace}`
-segment (`fact/{namespace}/{key}`, the LangGraph `BaseStore` shape). It carried
-no scope meaning — the only thing it did was give `list_facts` a scan prefix —
-and it was removed once the adapters that wanted `BaseStore` were dropped
-(`5a07a60`). It is not needed for grouping either: `q()` is a stateless
-per-byte loop, so `q(a ++ b) == q(a) ++ q(b)` — **the encoding preserves
-prefixes** — and its tokens ({one unreserved char} ∪ {`%XX`}) form a
-**prefix-free** set, since `%` is never emitted as a single-char token. That
-prefix-freeness (NOT fixed width — tokens are 1 or 3 chars) is what stops a
-prefix match landing mid-token. Grouping therefore lives in the key
-(`"profile:name"`) and `list_facts(Some("profile:"), …)` scans exactly that
-group: any depth, any separator convention, plus `None` = list all.
-
-Two things the segment gave for free and the convention does not:
-
-- **The terminator is the caller's job.** `fact/{ns}/` ended in a separator, so
-  namespace `profile` could never see `profiles`. `list_facts(Some("profile"))`
-  *does* match `"profiles:x"`. Pass the `:`.
-- **`(ns, key)` was injective; a flat key is not.** `("a","b/c")` and
-  `("a/b","c")` were distinct keys; `"a/b/c"` is one.
-
-> **Two traps, both pinned by tests.**
-> 1. `list_facts` scans with the GROUP prefix but must name with the FAMILY
->    prefix (`fact_all_prefix`). Name from the scan prefix and the returned key
->    silently loses its group, so it can no longer be fed back into `get_fact` /
->    `delete_fact` (`fact_group_scan_matches_exactly_its_group`, and the e2e
->    asserts it live).
-> 2. Old `fact/{namespace}/{key}` keys sort **inside** the new family range —
->    they are listed, not invisible — and their names do not round-trip
->    (`"profile/name"` re-encodes to `fact/profile%2Fname`). `list_facts`
->    therefore refuses the whole scan with `PreconditionFailed` via
->    `keys::fact_key_is_canonical`, instead of returning a name whose
->    `delete_fact` deletes nothing
->    (`a_legacy_namespaced_fact_key_is_in_range_but_not_canonical`).
-
-A test asserting a scan's UPPER bound must use a key that sorts AFTER the group
-prefix once ENCODED. `"prefs:theme"` does not (`e` < `o`), so it proves nothing
-about the bound; `"prog:x"` and `"profiles:x"` do.
-
-There is likewise no `shared/` family any more: `shared_key` / `shared_prefix`
-existed with zero callers and no `MemoryStore` method behind them. Cross-agent
-sharing, when it happens, follows plan §9 (event log + reducer), not an
-overwrite-style KV region — see `docs/autumn_memory_plan.md` §8.5 on lost
-updates.
 
 Graph families (`graph.rs` + `keys.rs`): a generic node/edge graph as
 **adjacency lists**, so every traversal is a prefix range-scan — `out_edges`
@@ -166,7 +122,7 @@ than adding another pair of domain verbs.
 
 - Reserved `mem/` namespace separates these from fuse / kvcache / client keys.
 - Dynamic components are **percent-encoded** (`q`/`unq`) so a `/` inside a
-  tenant/agent/session/key can't forge a separator or another
+  tenant/agent/session/namespace/key can't forge a separator or another
   agent's prefix (tested: `agent_prefix_isolation`).
 - Episodic `{suffix}` = `BE(u64::MAX - ts_ns) ++ BE(u32::MAX - counter)` →
   ascending range scan = **newest-first**; the per-store counter breaks

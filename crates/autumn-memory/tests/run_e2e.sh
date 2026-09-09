@@ -43,8 +43,7 @@ echo "[e2e] bootstrap (replication 1+0)"
   >"$WORK/bootstrap.log" 2>&1 || { echo "[e2e] FAIL bootstrap"; cat "$WORK/bootstrap.log"; exit 1; }
 
 echo "[e2e] PS psid 1 on $PS_PORT"
-# (no --data: autumn-ps takes no data dir; passing one only printed "unknown arg")
-"$BIN/autumn-ps" --psid 1 --port "$PS_PORT" --manager "$MGR" \
+"$BIN/autumn-ps" --psid 1 --port "$PS_PORT" --manager "$MGR" --data "$WORK/ps1" \
   --listen 127.0.0.1 --advertise "127.0.0.1:$PS_PORT" >"$WORK/ps1.log" 2>&1 &
 PIDS+=($!); wait_port "$PS_PORT" 20 || { echo "[e2e] FAIL PS"; tail -8 "$WORK/ps1.log"; exit 1; }
 sleep 4  # register + open partition
