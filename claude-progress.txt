@@ -1,3 +1,36 @@
+Date: 2026-09-09
+TaskStatus: completed
+Task scope: wire 37 -> 38（EN 失败原因走 df 心跳、seed_replay 读 marker 的 started_at、
+  删除 OpRecord.attempts）+ EC 分片重建上报进度 + EN 从 StatefulSet 拆成每 EN 一个
+  Deployment 并缩容 7->5。全部已实现、评审、提交、构建、上线并验收。
+
+【已上线】
+  - 镜像同 commit 重建：autumn-rs c211b62、freetoken-l3（AUTUMN_IMAGE 是流水线 Spec 里的
+    字符串，`volc-cp run start -param` 改不了它——试过，构建绿灯但镜像仍是 v37——只能用
+    控制台）。**停机前先用一次性 pod 读 `/usr/local/share/autumn/client-wire-version`**，
+    正是这一步挡下了一次白停机。
+  - 全停窗口里清掉 `opLog/` 190 条（OpRecord 是 rkyv 持久化的，删字段后老记录解不出来）。
+    cluster_version 仍是 30，未 upgrade-version。
+  - EN 迁移：7 个 node_id 一个不差、分片数与基线逐一相同，pod IP 全变——身份在 PVC 上。
+    随后用退役脚本摘掉 en-8、en-7，各约 90 秒排干，落到 5 台。
+  - 两处遗漏已修并提交：freetoken 的 fusebin initContainer 还钉在 v37（FUSE 起不来）；
+    dashboard 的 --manager 用 DNS 名而 autumn 客户端只认 IP（进程起得来、查询全空、无报错）。
+  - L3 跨升级命中：升级前写入的 KV 在 v38 上读回，hit=100%、14 页、45.8 MiB。
+
+【验收】F-RECOVERY-PROGRESS 与 F-EN-WORKLOAD-IDENTITY 均已 passes: true，细节见 feature_list。
+  EC 重建的验收在 pod 里起的一次性 6 节点集群上做（做法进了 docs/ops.md）。
+
+【遗留 PVC 已清理】6 个 PVC + 92 个 Released PV 删除，只剩 5 个 Bound。盘上目录仍在
+  （Retain + local-path 不擦）：/mnt/nvme0/local-path/pvc-*_autumn_data-autumn-en-*。
+
+【本轮的教训，写下来免得再犯】
+  - 改错仓库：流水线构建的是 FreeToken 里的 Dockerfile，我改的是 buda 里的同名文件，
+    造成三次"绿灯却毫无变化"的构建。动 CI 前先读流水线 spec 确认 sources。
+  - `git add` 前必须看 diff：本条记录的上一版就是这么被我连带删掉的。
+
+Main gaps: 无阻塞项。buda 的 webui 改动已提交（43dafdd）但镜像还是 d559e30，
+  等用户说 build 时重建一次才能在 pod 重启后存活。
+
 Date: 2026-09-08
 TaskStatus: completed
 Task scope: 删掉 autumn-memory 里 fact key 的 `{namespace}` 段——
