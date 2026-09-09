@@ -22,7 +22,11 @@ tree-sitter = "0.24"
 tree-sitter-rust = "0.23"
 
 [features]
-default = []
+# The app always carries an embedder type so the vector leg can be OFFERED; the
+# runtime decides whether it is configured. Without a feature there is no
+# `Embedder` at all, and every vector path would have to be conditionally
+# compiled out of an application whose whole job is retrieval.
+default = ["openai-embed"]
 static-embed = ["autumn-memory/static-embed"]
 # Embeddings from an external OpenAI-compatible server (--embed-url).
 openai-embed = ["autumn-memory/openai-embed"]

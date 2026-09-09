@@ -53,7 +53,10 @@ impl Corpus {
 
 pub struct Code {
     pub store: Rc<MemoryStore>,
-    pub emb: Rc<Embedder>,
+    /// `None` when no embedder is configured: the service then offers the
+    /// lexical leg only, and says so, rather than answering vector queries with
+    /// vectors that mean nothing.
+    pub emb: Option<Rc<Embedder>>,
 }
 
 impl Code {
@@ -114,7 +117,13 @@ impl Code {
         let mut out = Vec::new();
         match mode {
             "vector" | "hybrid" => {
-                let qv = self.emb.embed(q).await?;
+                let Some(emb) = self.emb.as_ref() else {
+                    anyhow::bail!(
+                        "mode `{mode}` needs an embedder; this instance has none \
+                         (start it with --embed-url, or use mode=lexical)"
+                    );
+                };
+                let qv = emb.embed(q).await?;
                 let hits = if mode == "vector" {
                     self.store.search_vector(&qv, fetch, NPROBE).await?
                 } else {

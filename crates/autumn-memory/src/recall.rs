@@ -52,10 +52,11 @@ pub(crate) fn is_stopword(t: &str) -> bool {
 ///
 /// This was always the plan — the previous version of this comment called
 /// bigrams "a future precision refinement" and said the hybrid vector leg
-/// supplied phrase-level precision in the meantime. It does not: the default
-/// embedder is `HashEmbedder`, a bag-of-words hash whose vectors carry no
-/// meaning, so `mode=auto` resolves to lexical and there is no second leg to
-/// lean on. The compensation the design assumed was never there.
+/// supplied phrase-level precision in the meantime. It does not: an embedder is
+/// optional and absent by default, so `mode=auto` resolves to lexical and there
+/// is no second leg to lean on. The compensation the design assumed was never
+/// there — and for a while it was worse than absent, supplied by a hash whose
+/// vectors carried no meaning at all.
 ///
 /// Cost: roughly 2n terms for an n-character CJK run instead of n. Postings are
 /// empty-value existence markers, so this is index entries, not bytes of value.

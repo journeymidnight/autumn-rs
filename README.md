@@ -161,8 +161,10 @@ claude mcp add autumn-memory -- cargo run -q -p memory-mcp -- 127.0.0.1:9001 --m
 ```
 
 Lexical (BM25) recall needs no embedder; vector/hybrid take a caller-supplied
-vector (`autumn-memory`'s built-in `embed` module ships a zero-dep hash embedder
-+ an optional Model2Vec static-int8 one). Design:
+vector (`autumn-memory`'s optional `embed` module supplies one: a Model2Vec
+static-int8 table, or any OpenAI-compatible `/v1/embeddings` server — llama.cpp
+on a CPU will do. Configure none and you get BM25, which is a supported way to
+run rather than a degraded one). Design:
 [`docs/autumn_memory_plan.md`](docs/autumn_memory_plan.md).
 
 ## Deployment

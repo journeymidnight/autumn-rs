@@ -220,7 +220,7 @@ fn display_path(p: &Path) -> String {
 /// `--reset` wipes stale ones whose spans moved.
 pub async fn ingest_path(
     store: &MemoryStore,
-    emb: &Embedder,
+    emb: Option<&Embedder>,
     root: &Path,
 ) -> Result<(usize, usize, usize)> {
     let mut paths = Vec::new();
@@ -303,7 +303,10 @@ pub async fn ingest_path(
                 "headings": c.headings, "start": c.start_line, "end": c.end_line,
             });
             let meta_b = serde_json::to_vec(&meta)?;
-            let vector = emb.embed(&indexed).await?;
+            let vector = match emb {
+                Some(e) => Some(e.embed(&indexed).await?),
+                None => None,
+            };
 
             let key = c.headings.join("\u{1}");
             let parent = (0..c.headings.len())
@@ -353,7 +356,9 @@ struct PendingChunk {
     id: String,
     indexed: String,
     meta_b: Vec<u8>,
-    vector: Vec<f32>,
+    /// `None` when no embedder is configured — the doc still gets its
+    /// lexical postings; only the vector leg is absent.
+    vector: Option<Vec<f32>>,
     parent: String,
 }
 
@@ -386,7 +391,9 @@ async fn write_all(
             // after its postings land, and the node should exist before an edge
             // points at it.
             store.index_memory(&w.id, &w.indexed, &w.meta_b, None).await?;
-            store.index_vector(&w.id, &w.vector, None).await?;
+            if let Some(v) = &w.vector {
+                store.index_vector(&w.id, v, None).await?;
+            }
             store.put_node(&w.id, "Section", &w.meta_b, None).await?;
             store.add_edge(&w.parent, "CONTAINS", &w.id, &[], None).await
         })

@@ -214,7 +214,7 @@ fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 /// Index every `.rs` under `root`. Returns `(files, symbols, edges)`.
 pub async fn index_path(
     store: &MemoryStore,
-    emb: &Embedder,
+    emb: Option<&Embedder>,
     root: &Path,
 ) -> Result<(usize, usize, usize)> {
     let mut parser = Parser::new();
@@ -258,16 +258,37 @@ pub async fn index_path(
         // definition — on a repo this size, thousands of them. A file is the
         // natural chunk: it bounds how many vectors are held at once, and it
         // needs no arbitrary batch size.
-        let srcs: Vec<&str> = fi.defs.iter().map(|d| d.src.as_str()).collect();
-        let vectors = emb.embed_batch(&srcs).await?;
-        for (d, vector) in fi.defs.iter().zip(vectors) {
+        let vectors = match emb {
+            Some(e) => {
+                let srcs: Vec<&str> = fi.defs.iter().map(|d| d.src.as_str()).collect();
+                let v = e.embed_batch(&srcs).await?;
+                // A short batch would silently leave the tail of this file
+                // without vectors — findable by lexical search, invisible to
+                // vector search, and nothing would say so.
+                anyhow::ensure!(
+                    v.len() == fi.defs.len(),
+                    "embedder returned {} vectors for {} texts",
+                    v.len(),
+                    fi.defs.len()
+                );
+                v
+            }
+            // No embedder: index the lexical leg and nothing else. A vector
+            // query will say the leg is absent; it will not get an empty answer
+            // that looks like "nothing matched".
+            None => Vec::new(),
+        };
+        let mut vectors = vectors.into_iter();
+        for d in &fi.defs {
             let meta = serde_json::json!({
                 "name": d.name, "kind": d.kind, "qualname": d.qualname,
                 "file": d.file, "start": d.start, "end": d.end,
             });
             let meta_b = serde_json::to_vec(&meta)?;
             store.index_memory(&d.id, &d.src, &meta_b, None).await?;
-            store.index_vector(&d.id, &vector, None).await?;
+            if let Some(vector) = vectors.next() {
+                store.index_vector(&d.id, &vector, None).await?;
+            }
             store.put_node(&d.id, d.kind, &meta_b, None).await?;
             n_sym += 1;
         }

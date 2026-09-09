@@ -1,5 +1,22 @@
 Date: 2026-09-09
 TaskStatus: completed
+Task scope: 删掉 HashEmbedder 及其配套的 is_semantic()/auto_mode 语义判定(用户拍板:
+  「一个纯粹为了绕开假数据而存在的防御机制,应该和假数据一起走」)。已实现、评审、
+  修完评审三条、四种 feature 组合零告警。
+
+【要点】
+  - 它坏在"是默认",不在它本身:向量/hybrid 不会失败,而是自信地把噪声排进前列
+    (实测 vector hit@1=0.146,hybrid 被从 0.976 拖到 0.610)。
+  - `embed` 模块整体按 feature 门控——一个总是存在的模块必须提供点什么。
+  - memory-mcp 里 Embedder 变成 Option;`/config` 的 modes 从硬编码三元组改成如实报告。
+  - 评审三条:eval 默认模式会整跑中止(高)、unreachable pattern 新告警(中)、
+    baseline.json 还写着 hash(中)。均已修,详见 feature_list。
+  - 我此前"clippy 无新增告警"的说法是错的:只查了 memory-mcp 包,没查它默认特性下的库。
+
+Main gaps: 无。
+
+Date: 2026-09-09
+TaskStatus: completed
 Task scope: autumn-memory 加 OpenAI 兼容的外部 embedding 客户端（用户：hashemb 没用，
   应用层要接 CPU 上的 llama）。已实现、评审、修完评审项、测试与消融通过；未提交前的最后一步。
 

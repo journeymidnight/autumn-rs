@@ -378,12 +378,19 @@ embedding。两条供给路径:
 
 - **生产路径 = 远程端点**:复用已在跑的 sglang/vLLM 服务一个 embed 模型,客户端发 RPC
   拿向量 → client 始终薄。**它是已有推理基础设施,不是新 memory daemon**。
-- **无模型服务时的内置 embedder**(`embed.rs`,可选):`HashEmbedder`(零依赖、
-  signed-FNV bag-of-words,确定可复现,真管道弱语义)与 `StaticTableEmbedder`
-  (`static-embed` feature,Model2Vec 式静态 int8 查表:分词 → int8 行查 → 反量化 →
-  mean-pool;**有真语义、无网络、无 GPU**)。`Embedder` 枚举分派,所有变体都吐
-  `EMBED_DIM` = 256 维 **L2 归一化**向量。这条不违反 §4 的否决项——被否的是把**神经**
-  模型加载进每个 agent 进程炸显存。
+- **内置 embedder**(`embed.rs`,按 feature 提供):`StaticTableEmbedder`
+  (`static-embed`,Model2Vec 式静态 int8 查表:分词 → int8 行查 → 反量化 →
+  mean-pool;**有真语义、无网络、无 GPU**)与 `OpenAiEmbedder`(`openai-embed`,
+  调用任何说 OpenAI `/v1/embeddings` 的服务端,比如 CPU 上的 llama.cpp)。
+  `Embedder` 枚举分派,所有变体都吐 **L2 归一化**向量;静态表是 `EMBED_DIM` = 256 维,
+  外部模型是多少就是多少(向量索引按记录存宽度)。这条不违反 §4 的否决项——被否的是把
+  **神经**模型加载进每个 agent 进程炸显存。
+
+  > 2026-09-09 修订:本节原先还列了一个 `HashEmbedder`(零依赖 signed-FNV 词袋)作为
+  > **默认**。它已被删除。计划把它写成"真管道弱语义"是准确的,但低估了"默认"二字的
+  > 代价:向量与 hybrid 检索不会失败,而是自信地把噪声排进前列(实测语料上
+  > vector 的 hit@1 = 0.146,hybrid 被它从 0.976 拖到 0.610)。没有 embedder 是一个
+  > 调用方看得见、能据以行动的状态;有一个假的不是。
 
 彻底不要 embedding 依赖 → 走纯词法腿(代价:只有字面召回)。
 

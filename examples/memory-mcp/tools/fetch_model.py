@@ -8,8 +8,9 @@ int8-quantize the matrix (one global scale) and emit:
 
     [u8;4 "M2VS"][u32 version=1][u32 vocab][u32 dim][f32 scale][i8 vocab*dim]
 
-Keeps the ~30 MB blob OUT of the repo — run once for real semantics; otherwise
-the default hash embedder needs no model.
+Keeps the ~30 MB blob OUT of the repo — run once if you want a local embedder
+with no service behind it. The alternatives are an OpenAI-compatible server
+(--embed-url) or no embedder at all, which means BM25 only.
 
     python3 tools/fetch_model.py --out model.m2vs --tokenizer-out tokenizer.json
 

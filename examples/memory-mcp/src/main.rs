@@ -26,6 +26,17 @@
 //!       [--eval-k 10] [--eval-modes lexical,hybrid] \
 //!       [--eval-baseline eval/baseline.json [--eval-update-baseline]]
 
+// This app always carries an embedder TYPE, even when none is configured at
+// runtime, so the vector paths need no conditional compilation. Without a
+// feature there is no `embed` module at all, and the error for that is an
+// unresolved import — say what it actually means instead.
+#[cfg(not(any(feature = "static-embed", feature = "openai-embed")))]
+compile_error!(
+    "memory-mcp needs an embedder feature: `openai-embed` (the default) or \
+     `static-embed`. Lexical-only is a RUNTIME state — start it without \
+     --embed-url — not a build without one."
+);
+
 use autumn_memory::embed;
 mod docs;
 mod eval;
@@ -112,23 +123,17 @@ fn opt<'a>(p: &'a P, k: &str, d: &'a str) -> &'a str {
 
 /// What `mode=auto` resolves to.
 ///
-/// It has to ask whether the EMBEDDER is semantic, not whether a vector index
-/// exists. The previous version tested `cfg["modes"].len() > 1` — but `modes` is
-/// a hardcoded `["lexical","vector","hybrid"]`, so that was a constant `true`
-/// and `auto` always meant `hybrid`; the MCP path did not even check, mapping
-/// `auto` straight to `hybrid`.
+/// What `auto` means. `hybrid` when a vector leg exists, `lexical` when it does
+/// not — because without an embedder there are no vectors to fuse, and RRF over
+/// an empty leg is just the lexical ranking with extra steps.
 ///
-/// With the default `HashEmbedder` the vector leg is noise, and RRF fusion
-/// pulls that noise into the top ranks: on a corpus of Chinese Buddhist texts,
-/// `坐禅` under `lexical` returned five on-topic passages, while the same query
-/// under the `auto` default put vector noise at ranks 1-2. Anyone who asked for
-/// nothing in particular — which is every MCP `search_docs` call — got the
-/// degraded channel.
-///
-/// An explicit `mode=vector` / `mode=hybrid` is still honoured: this only
-/// decides what "no preference" means.
-fn auto_mode(emb: &embed::Embedder) -> &'static str {
-    if emb.is_semantic() {
+/// This used to ask a harder question: whether the embedder's vectors carried
+/// meaning at all. They did not, for the default one, and fusing them pulled
+/// noise into the top ranks — on a corpus of Chinese Buddhist texts, `坐禅`
+/// under `lexical` returned five on-topic passages while `auto` put noise at
+/// ranks 1-2. That embedder is gone, so the question is gone with it.
+fn auto_mode(has_embedder: bool) -> &'static str {
+    if has_embedder {
         "hybrid"
     } else {
         "lexical"
@@ -140,7 +145,7 @@ fn auto_mode(emb: &embed::Embedder) -> &'static str {
 async fn h_search(app: &App, p: P) -> Result<Response<Body>, AppError> {
     let q = req(&p, "q")?;
     let mode = opt(&p, "mode", "auto");
-    let mode = if mode == "auto" { auto_mode(&app.code.emb) } else { mode };
+    let mode = if mode == "auto" { auto_mode(app.code.emb.is_some()) } else { mode };
     let k: usize = opt(&p, "k", "10").parse().unwrap_or(10);
     let corpus = Corpus::parse(opt(&p, "corpus", "code"));
     let hits = app.code.search(q, mode, k, corpus).await?;
@@ -439,10 +444,11 @@ fn parse_args() -> Args {
     a
 }
 
-fn build_embedder(a: &Args) -> Embedder {
-    // An external server first: if the operator named one, falling back to the
-    // hash embedder on a typo would leave a service that answers every vector
-    // query with noise and says so only in one startup line.
+/// `None` when nothing was configured. There is no fallback embedder to return:
+/// the one that used to be here produced vectors with no meaning, and being the
+/// default is what made it harmful — every vector query got a confident answer
+/// built from noise. Lexical search needs no embedder and is unaffected.
+fn build_embedder(a: &Args) -> Option<Embedder> {
     if let Some(url) = &a.embed_url {
         #[cfg(feature = "openai-embed")]
         {
@@ -462,10 +468,13 @@ fn build_embedder(a: &Args) -> Embedder {
                 }
             }
             tracing::info!("embedder: openai-compatible ({model} at {})", e.endpoint());
-            return Embedder::OpenAi(e);
+            return Some(Embedder::OpenAi(e));
         }
         #[cfg(not(feature = "openai-embed"))]
-        tracing::warn!("--embed-url {url} ignored: rebuild with --features openai-embed; using hash");
+        {
+            tracing::error!("--embed-url {url} needs --features openai-embed");
+            std::process::exit(2);
+        }
     }
     if let Some(model) = &a.embed_model {
         #[cfg(feature = "static-embed")]
@@ -474,15 +483,24 @@ fn build_embedder(a: &Args) -> Embedder {
             match embed::StaticTableEmbedder::load(model, &tok) {
                 Ok(s) => {
                     tracing::info!("embedder: static-int8 ({model})");
-                    return Embedder::Static(s);
+                    return Some(Embedder::Static(s));
                 }
-                Err(e) => tracing::warn!("static embedder failed ({e}); using hash"),
+                // Asked for by name and unusable: exiting beats serving vector
+                // queries that quietly have no vector leg behind them.
+                Err(e) => {
+                    tracing::error!("static embedder {model}: {e}");
+                    std::process::exit(2);
+                }
             }
         }
         #[cfg(not(feature = "static-embed"))]
-        tracing::warn!("--embed-model {model} ignored: rebuild with --features static-embed; using hash");
+        {
+            tracing::error!("--embed-model {model} needs --features static-embed");
+            std::process::exit(2);
+        }
     }
-    Embedder::Hash(embed::HashEmbedder)
+    tracing::info!("no embedder configured — lexical (BM25) search only");
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -536,9 +554,22 @@ async fn mcp_tool_call(code: &Code, params: &Value) -> Result<Value> {
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let s = |k: &str| args.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
     let mode = match args.get("mode").and_then(|v| v.as_str()).unwrap_or("auto") {
-        "auto" => auto_mode(&code.emb),
+        "auto" => auto_mode(code.emb.is_some()),
         m => m,
     };
+    // A mode this instance cannot serve is the caller's mistake to fix, so tell
+    // it as a tool result it can read and retry from. Letting the error bubble
+    // turns it into JSON-RPC -32603, which a client reports as "the tool
+    // failed" — the agent learns nothing it can act on. Same shape as
+    // `ingest_documents`' path-not-found below.
+    if matches!(name, "search_code" | "search_docs")
+        && matches!(mode, "vector" | "hybrid")
+        && code.emb.is_none()
+    {
+        return Ok(json!({"content":[{"type":"text",
+            "text":format!("mode `{mode}` needs an embedder and this instance has none; \
+                            retry with mode=lexical")}],"isError":true}));
+    }
     let k = args.get("k").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
     let data: Value = match name {
         "search_code" => json!(code.search(&s("query"), mode, k, Corpus::Code).await?),
@@ -556,7 +587,8 @@ async fn mcp_tool_call(code: &Code, params: &Value) -> Result<Value> {
                 return Ok(json!({"content":[{"type":"text",
                     "text":format!("path not found: {}", path.display())}],"isError":true}));
             }
-            let (files, chunks, edges) = docs::ingest_path(&code.store, &code.emb, &path).await?;
+            let (files, chunks, edges) =
+                docs::ingest_path(&code.store, code.emb.as_deref(), &path).await?;
             if chunks > 0 {
                 let r = code.store.reconcile().await?;
                 code.store
@@ -731,18 +763,25 @@ async fn run_mcp_stdio(code: &Code) -> Result<()> {
 async fn run_eval(code: &Code, a: &Args, retrained: bool) -> Result<i32> {
     let path = a.eval.as_ref().expect("called only in eval mode");
     let queries = eval::load(path)?;
-    let modes: Vec<String> = if a.eval_modes.is_empty() {
+    // Default to what this instance can actually serve. Asking for all three
+    // with no embedder configured does not produce two empty rows — the first
+    // vector query returns an error and the whole run stops, with no report and
+    // no baseline comparison. An explicitly requested `--eval-modes vector`
+    // still errors, which is right: that one was asked for.
+    let modes: Vec<String> = if !a.eval_modes.is_empty() {
+        a.eval_modes.clone()
+    } else if code.emb.is_some() {
         ["lexical", "vector", "hybrid"].iter().map(|s| s.to_string()).collect()
     } else {
-        a.eval_modes.clone()
+        println!("eval: no embedder configured — scoring the lexical leg only");
+        vec!["lexical".to_string()]
     };
     println!(
-        "eval: {} queries x {} modes, k={}, embedder={} (semantic={}), agent=mem/{}/{}",
+        "eval: {} queries x {} modes, k={}, embedder={}, agent=mem/{}/{}",
         queries.len(),
         modes.len(),
         a.eval_k,
-        code.emb.name(),
-        code.emb.is_semantic(),
+        code.emb.as_ref().map_or("none", |e| e.name()),
         a.tenant,
         a.agent,
     );
@@ -751,7 +790,7 @@ async fn run_eval(code: &Code, a: &Args, retrained: bool) -> Result<i32> {
     // goldset scored against a different corpus, or with a different embedder,
     // is a different measurement wearing the same numbers.
     report["corpus"] = json!(a.docs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
-    report["embedder"] = json!(code.emb.name());
+    report["embedder"] = json!(code.emb.as_ref().map_or("none", |e| e.name()));
     report["retrained"] = json!(retrained);
     if let Some(out) = &a.eval_out {
         std::fs::write(out, serde_json::to_vec_pretty(&report)?)?;
@@ -818,14 +857,14 @@ async fn main() -> Result<()> {
         }
             .with_page_limit(256),
     );
-    let emb = Rc::new(build_embedder(&args));
+    let emb = build_embedder(&args).map(Rc::new);
     // Ask the embedder for one vector before serving. Two things come of it:
     // a URL or model that is wrong fails HERE, at the moment of the mistake,
     // rather than on someone's first search hours later; and `dim()` has a real
     // number to report, since an external model's width is not knowable until
     // it answers and /config is a startup snapshot.
-    if emb.name() == "openai" {
-        match emb.embed("autumn-memory startup probe").await {
+    if let Some(e) = emb.as_ref().filter(|e| e.name() == "openai") {
+        match e.embed("autumn-memory startup probe").await {
             Ok(v) => tracing::info!("embedder ready: {} dims", v.len()),
             Err(e) => {
                 tracing::error!("embedder unreachable: {e}");
@@ -868,7 +907,7 @@ async fn main() -> Result<()> {
     // at its own agent and give it only `--docs`.
     if args.eval.is_none() && !args.no_index && (args.reset || args.reindex || already == 0) {
         tracing::info!("indexing {} ...", root.display());
-        let (f, s, e) = indexer::index_path(&store, &emb, &root).await?;
+        let (f, s, e) = indexer::index_path(&store, emb.as_deref(), &root).await?;
         files = f;
         symbols = s as u64;
         edges = e as u64;
@@ -893,7 +932,7 @@ async fn main() -> Result<()> {
     for d in &args.docs {
         tracing::info!("ingesting documents from {} ...", d.display());
         let t0 = std::time::Instant::now();
-        let (f, c, e) = docs::ingest_path(&store, &emb, d).await?;
+        let (f, c, e) = docs::ingest_path(&store, emb.as_deref(), d).await?;
         let ms = t0.elapsed().as_millis();
         let per = if c > 0 { ms as f64 / c as f64 } else { 0.0 };
         tracing::info!("ingested {c} chunks ({e} outline edges) from {f} files in {ms} ms ({per:.1} ms/chunk)");
@@ -915,12 +954,16 @@ async fn main() -> Result<()> {
 
     let cfg = json!({
         "tenant": args.tenant, "agent": args.agent, "manager": args.manager,
-        "embedder": emb.name(), "dim": emb.dim(),
-        // Consumed by `auto_mode`, and worth exposing: a caller comparing
-        // `mode=vector` results against `lexical` needs to know which of the
-        // two the index can actually support.
-        "embedder_semantic": emb.is_semantic(),
-        "modes": ["lexical", "vector", "hybrid"],
+        "embedder": emb.as_ref().map_or("none", |e| e.name()),
+        "dim": emb.as_ref().map_or(0, |e| e.dim()),
+        // Which modes this instance can actually serve — not a constant list.
+        // A caller that reads `["lexical","vector","hybrid"]` and then gets an
+        // error from `mode=vector` has been told the wrong thing.
+        "modes": if emb.is_some() {
+            json!(["lexical", "vector", "hybrid"])
+        } else {
+            json!(["lexical"])
+        },
         "root": root.display().to_string(),
         "files": files, "symbols": symbols, "edges": edges,
     });
@@ -933,7 +976,7 @@ async fn main() -> Result<()> {
         args.host,
         args.port,
         symbols,
-        emb.name()
+        emb.as_ref().map_or("none", |e| e.name())
     );
     cyper_axum::serve(listener, router(shared)).await?;
     Ok(())

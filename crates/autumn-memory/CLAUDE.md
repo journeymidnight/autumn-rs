@@ -30,17 +30,22 @@ isolated-cluster harness `tests/run_e2e.sh`).
 The vector/hybrid legs take a **caller-supplied** `&[f32]` (production feeds them
 from a shared sglang/vLLM endpoint — deliberately NOT an in-process model, see
 plan §11). For callers that just want a built-in embedder without a model
-server, `autumn_memory::embed` provides one: `HashEmbedder` (zero-dep, signed-FNV
-hashing — always available) and, behind the **`static-embed`** feature,
-`StaticTableEmbedder` (a Model2Vec-style int8 lookup table, needs `tokenizers`).
-Behind **`openai-embed`** there is a third: `OpenAiEmbedder`, which calls any
-server speaking OpenAI's `/v1/embeddings` — llama.cpp on spare CPU, vLLM,
-sglang, or the vendor. That is the one to reach for when the vector leg has to
-actually retrieve; the hash embedder exists to exercise the plumbing, and
-`is_semantic()` is how a caller asks which it has.
+server, `autumn_memory::embed` offers two, each behind a feature:
+`StaticTableEmbedder` (**`static-embed`**, a Model2Vec-style int8 lookup table,
+needs `tokenizers`) and `OpenAiEmbedder` (**`openai-embed`**, any server
+speaking OpenAI's `/v1/embeddings` — llama.cpp on spare CPU, vLLM, sglang, or
+the vendor).
 
-`Embedder` dispatches. Every variant emits an L2-normalized vector; the two
-built-ins emit `EMBED_DIM`, while an external model emits whatever it emits and
+There is no default, and the module does not exist without one of those
+features. A third used to live here — a signed-FNV bag of words, zero deps,
+always available — and being the DEFAULT is precisely what made it harmful: its
+vectors are deterministic but meaningless, so vector and hybrid search ranked
+noise confidently instead of failing. It also forced every caller to ask
+whether its own embedder was lying (`is_semantic()`, now gone with it). No
+embedder is an honest state that callers can act on; a fake one is not.
+
+`Embedder` dispatches. Every variant emits an L2-normalized vector; the static
+table emits `EMBED_DIM`, while an external model emits whatever it emits and
 `dim()` reports what came back (`0` before the first call — nothing can know it
 sooner). The vector index stores the width per record, so no layer needs to
 agree with 256. Errors are a local `EmbedError` (the core takes no `anyhow`
@@ -97,8 +102,8 @@ Posting-on-KV, done directly:
   measured, `慧能` (a proper name whose second character 能 is extremely common)
   returned four passages from three unrelated sutras and none from the one he
   wrote. The design had assumed the hybrid vector leg would supply phrase
-  precision; it cannot, because the default `HashEmbedder` is non-semantic and
-  `mode=auto` therefore resolves to lexical.
+  precision; it cannot when no embedder is configured, which is the default —
+  there is no vector leg at all then, and `mode=auto` resolves to lexical.
   Cost ≈ 2n index entries for an n-character CJK run (postings are empty-value
   markers, so entries not bytes). Values are opaque `meta` bytes.
 

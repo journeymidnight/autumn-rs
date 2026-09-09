@@ -1375,7 +1375,11 @@ optimum). The report records `retrained`, and `compare` prints a NOTE when
 either side of the comparison rebuilt. Do not chase a vector/hybrid delta
 across a rebuild.
 
-Reference numbers on the corpus above (`hash` embedder, k=10, 41 queries):
+Reference numbers on the corpus above (recorded when the built-in hash
+embedder was still the default — it has since been removed, so reproduce these
+with an embedder configured — without one the default run scores the lexical
+leg only and says so, since a vector query with no vector leg is an error, not
+an empty row):
 
 | mode | hit@1 | hit@5 | hit@k | MRR@k | P@k |
 |---|---|---|---|---|---|
@@ -1383,10 +1387,13 @@ Reference numbers on the corpus above (`hash` embedder, k=10, 41 queries):
 | vector  | 0.146 | 0.415 | 0.512 | 0.269 | 0.107 |
 | hybrid  | 0.610 | 1.000 | 1.000 | 0.772 | 0.485 |
 
-The vector row is the non-semantic `HashEmbedder` behaving as documented, and
-the hybrid row is the cost of fusing it with a good lexical leg — which is why
-`auto` resolves to `lexical` unless the embedder is semantic. Re-measure the
-hybrid row before changing that rule.
+That vector row is what a meaningless embedder looks like when it is measured
+instead of assumed, and the hybrid row is the cost of fusing it into a good
+lexical leg: RRF pulls noise into the top ranks, so `auto` was made to resolve
+to `lexical`. Both the embedder and that rule are gone — `auto` is now `hybrid`
+whenever an embedder exists, because one only exists if somebody configured it.
+Keep the table as the reason: it is the measurement that says a vector leg you
+did not choose is worse than none.
 
 **Check the eval is still alive** (a goldset that cannot go red is decoration).
 Disable the CJK bigram emission in `crates/autumn-memory/src/recall.rs`

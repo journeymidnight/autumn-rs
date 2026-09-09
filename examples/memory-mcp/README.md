@@ -198,13 +198,13 @@ vector/hybrid on its own — build the index once, then evaluate without
 ## Embedder
 
 The vector / hybrid legs need embeddings (autumn-memory takes caller-supplied
-vectors). Three options:
+vectors). **Configure one or you get BM25 only** — that is a supported way to
+run, not a degraded one: `/config` reports `"modes": ["lexical"]`, `auto`
+resolves to `lexical`, and `mode=vector|hybrid` returns an error saying no
+embedder is configured. Nothing pretends to have a vector leg it does not have.
 
-- **`hash`** (default) — a zero-dependency signed-hashing embedder. Real
-  plumbing, **weak semantics**: two texts on the same topic land no closer than
-  two unrelated ones, so vector and hybrid search over it return noise. It is
-  here so `cargo run` works with no model and no service — not so you can
-  retrieve with it. `is_semantic()` reports which kind you have.
+Two options:
+
 - **`static-int8`** — a Model2Vec-style static int8 lookup table (real
   semantics, no service):
 

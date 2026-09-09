@@ -21,6 +21,12 @@
 //! compio runtime. A PyO3 binding (for the Hermes / LangGraph adapters) wraps
 //! it for synchronous Python callers.
 
+// Only when a real embedder is compiled in. There is deliberately no built-in
+// fallback: a module that always exists would have to offer SOMETHING, and the
+// something it used to offer was a hash whose vectors carry no meaning — which
+// ranked noise rather than failing. No feature, no module, no vector leg; the
+// lexical leg needs none of this.
+#[cfg(any(feature = "static-embed", feature = "openai-embed"))]
 pub mod embed;
 pub mod keys;
 mod graph;

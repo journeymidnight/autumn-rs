@@ -753,3 +753,37 @@
      必须重新索引"。
   评审确认的、不改的两条：解析用 `serde_json::Value` 中转在大批量时有分配开销(可日后改
   typed struct，非阻塞)；`rustls` 特性组合独立可用，Cargo.lock 里确实没有 openssl-sys。
+
+
+### F-MEM-DROP-HASH-EMBED — 删掉那个假 embedder，连同为绕开它而存在的防御机制
+- **Trigger** (2026-09-09，用户): 「一个纯粹为了绕开假数据而存在的防御机制，应该和假数据
+  一起走，都删了，要不就是 BM25，要不就是纯语义，要不就是 hybrid」。
+- **根因**: `HashEmbedder` 本身不坏——签名 FNV 词袋，确定可复现，是条真管道。**坏在它是
+  默认**：向量与 hybrid 检索不会失败，而是自信地把噪声排进前列。实测(docs/ops.md 的
+  eval 表)vector 的 hit@1 = 0.146，hybrid 被它从 lexical 的 0.976 拖到 0.610。为绕开它，
+  代码里长出了 `is_semantic()` 和 `auto_mode()`——一个专门用来问"我自己的 embedder 是不是
+  在撒谎"的机制。
+- **Scope**: 删 `HashEmbedder`、`Embedder::Hash`、只它用的 `fnv1a`/`tokenize`、`is_semantic()`。
+  `embed` 模块整体按 feature 门控——没启用 `static-embed` 或 `openai-embed` 就没有这个模块，
+  因为一个总是存在的模块必须提供点什么。memory-mcp 里 `Embedder` 变成 `Option`：没配就只有
+  BM25，`/config` 如实报 `"modes": ["lexical"]`(此前是硬编码三元组，等于骗人)。
+- **Acceptance**: 四种 feature 组合零告警零错误；没配 embedder 时 `mode=vector|hybrid`
+  明确报错而非返回空结果；`--eval` 默认不中止。
+- **Status**: `passes: true` (2026-09-09) — 已实现并通过。四种组合(无/static/openai/两者)
+  各 0 warning 0 error，`--features openai-embed` 42 passed、默认 33 passed、workspace 零错误。
+  **评审挖出三条，均已修**：
+  1. **[高] 没配 embedder 时 `--eval` 整跑中止**——默认 modes 是硬编码三元组，第一条 vector
+     查询直接 Err 退出：无报告、无基线对比、非零退出，而 README 与 ops.md 的两条 runbook
+     命令照抄就挂。改为默认按 `emb.is_some()` 取；显式 `--eval-modes vector` 仍然报错(那是
+     调用方点名要的)。
+  2. **[中] 新增 `unreachable pattern` 告警**(embed.rs 的 `embed_batch` 兜底臂)——`Hash`
+     变体没了之后 `_` 不再可达，而这正是 memory-mcp 的默认特性集。改成具名的 cfg 分支。
+     我此前说"clippy 无新增告警"是错的：只查了 memory-mcp 这个包，没查它默认特性下的**库**。
+  3. **[中] `eval/baseline.json` 仍写着 `"embedder": "hash"`**，且 vector/hybrid 两段是那个
+     已删 embedder 产生的、永远无法复现的数字。改成 `"embedder": "none"` 并只保留 lexical 段
+     ——BM25 与 embedder 无关，那些数字仍然描述这个语料。`compare` 对基线里没有的模式会打印
+     "not in baseline"并跳过，不会误红。
+  另修：MCP 侧 `mode=vector` 无 embedder 时改为 `isError:true` 的工具结果而非 JSON-RPC
+  -32603(后者客户端会当成"工具挂了"，agent 学不到可以改用 lexical)；索引批量加长度校验
+  (短批次会静默让文件尾部的符号没有向量——词法搜得到、向量搜不到，且无人报告)；
+  漏改的三处文档(根 README、fetch_model.py、plan.md 把 hit@1 误写成 nDCG@10)已补。

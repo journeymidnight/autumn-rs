@@ -5,8 +5,6 @@
 //! sglang/vLLM endpoint. This convenience module gives callers that DON'T want
 //! to stand up a model server a built-in embedder:
 //!
-//!   * [`HashEmbedder`] — zero-dep, always available. Signed-FNV bag-of-words
-//!     hashing. Deterministic, reproducible; real plumbing, weak semantics.
 //!   * [`StaticTableEmbedder`] — a Model2Vec-style static int8 lookup table
 //!     (feature `static-embed`): tokenize → int8 row lookup → dequant →
 //!     mean-pool. Real semantics, no network, no GPU.
@@ -15,9 +13,17 @@
 //!     vendor. Real model, real cost, over the network.
 //!
 //! An enum ([`Embedder`]) dispatches between them, and every variant emits an
-//! **L2-normalized** vector so scores stay comparable. The built-in embedders
-//! emit `EMBED_DIM`; an external model emits whatever it emits, and the vector
-//! index stores the width per record, so nothing here has to agree with 256.
+//! **L2-normalized** vector so scores stay comparable. The static table emits
+//! `EMBED_DIM`; an external model emits whatever it emits, and the vector index
+//! stores the width per record, so nothing here has to agree with 256.
+//!
+//! There is no built-in fallback embedder, and that is the point. One used to
+//! live here — a signed-FNV bag of words, always available, zero dependencies —
+//! and being the DEFAULT is what made it harmful: its vectors are deterministic
+//! but carry no meaning, so vector and hybrid search over them ranked noise
+//! confidently rather than failing. Every caller then needed a way to ask
+//! whether its own embedder was lying. Having no embedder is an honest state
+//! and callers can see it; having a fake one is not.
 //!
 //! One thing this module does NOT do is stop you mixing them. Vectors written
 //! by one embedder and searched with another are silent nonsense, not an error
@@ -30,7 +36,7 @@ use std::fmt;
 pub const EMBED_DIM: usize = 256;
 
 /// Error from the (fallible) static-table embedder — loading a table/tokenizer
-/// or tokenizing. `HashEmbedder` never fails.
+/// or tokenizing, or a request to an external server.
 #[derive(Debug)]
 pub struct EmbedError(pub String);
 
@@ -54,42 +60,6 @@ fn l2_normalize(mut v: Vec<f32>) -> Vec<f32> {
         }
     }
     v
-}
-
-fn tokenize(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|t| !t.is_empty())
-        .map(|t| t.to_lowercase())
-}
-
-// ---------------------------------------------------------------------------
-// Hash embedder (default, zero deps)
-// ---------------------------------------------------------------------------
-
-pub struct HashEmbedder;
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
-}
-
-impl HashEmbedder {
-    pub fn embed(&self, text: &str) -> Vec<f32> {
-        let mut acc = vec![0.0f32; EMBED_DIM];
-        for tok in tokenize(text) {
-            let h = fnv1a(tok.as_bytes());
-            let bucket = (h % EMBED_DIM as u64) as usize;
-            acc[bucket] += if (h >> 63) & 1 == 1 { 1.0 } else { -1.0 };
-        }
-        l2_normalize(acc)
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,9 +140,7 @@ impl StaticTableEmbedder {
 /// Embeddings from an external server speaking OpenAI's `/v1/embeddings`.
 ///
 /// The point of this variant is that the model is somebody else's problem: run
-/// llama.cpp on spare CPU, point this at it, and the vector leg becomes worth
-/// using. [`HashEmbedder`] exists to exercise the plumbing, not to retrieve —
-/// see [`Embedder::is_semantic`].
+/// llama.cpp on spare CPU, and point this at it.
 #[cfg(feature = "openai-embed")]
 pub struct OpenAiEmbedder {
     client: cyper::Client,
@@ -387,8 +355,10 @@ fn parse_embeddings_response(body: &str, want: usize) -> Result<Vec<Vec<f32>>, E
 // The dispatch enum
 // ---------------------------------------------------------------------------
 
+/// Uninhabited with no feature enabled: a build that compiled in no embedder
+/// cannot produce one, and the compiler says so rather than a default that
+/// returns plausible nonsense.
 pub enum Embedder {
-    Hash(HashEmbedder),
     #[cfg(feature = "static-embed")]
     Static(StaticTableEmbedder),
     #[cfg(feature = "openai-embed")]
@@ -401,7 +371,6 @@ impl Embedder {
     /// has come back — nothing here can know it before then.
     pub fn dim(&self) -> usize {
         match self {
-            Embedder::Hash(_) => EMBED_DIM,
             #[cfg(feature = "static-embed")]
             Embedder::Static(_) => EMBED_DIM,
             #[cfg(feature = "openai-embed")]
@@ -411,30 +380,10 @@ impl Embedder {
 
     pub fn name(&self) -> &'static str {
         match self {
-            Embedder::Hash(_) => "hash",
             #[cfg(feature = "static-embed")]
             Embedder::Static(_) => "static-int8",
             #[cfg(feature = "openai-embed")]
             Embedder::OpenAi(_) => "openai",
-        }
-    }
-
-    /// Whether this embedder's vectors carry MEANING, i.e. whether nearby
-    /// vectors imply related text.
-    ///
-    /// `HashEmbedder` is a signed-FNV bag-of-words projection: deterministic and
-    /// useful for exercising the vector path, but two texts about the same topic
-    /// land no closer than two unrelated ones. Vector and hybrid search over it
-    /// return noise, so anything CHOOSING a retrieval mode on the user's behalf
-    /// must ask this rather than assume a vector index means vector search
-    /// works.
-    pub fn is_semantic(&self) -> bool {
-        match self {
-            Embedder::Hash(_) => false,
-            #[cfg(feature = "static-embed")]
-            Embedder::Static(_) => true,
-            #[cfg(feature = "openai-embed")]
-            Embedder::OpenAi(_) => true,
         }
     }
 
@@ -444,7 +393,6 @@ impl Embedder {
     /// enum exists to hide.
     pub async fn embed(&self, text: &str) -> Result<Vec<f32>, EmbedError> {
         match self {
-            Embedder::Hash(h) => Ok(h.embed(text)),
             #[cfg(feature = "static-embed")]
             Embedder::Static(s) => s.embed(text),
             #[cfg(feature = "openai-embed")]
@@ -458,7 +406,11 @@ impl Embedder {
         match self {
             #[cfg(feature = "openai-embed")]
             Embedder::OpenAi(o) => o.embed_batch(texts).await,
-            _ => {
+            // Named, not a `_` catch-all: with only the external embedder
+            // compiled in there is nothing left for a wildcard to match, and it
+            // becomes an unreachable pattern the compiler warns about.
+            #[cfg(feature = "static-embed")]
+            Embedder::Static(_) => {
                 let mut out = Vec::with_capacity(texts.len());
                 for t in texts {
                     out.push(self.embed(t).await?);
