@@ -1,5 +1,28 @@
 Date: 2026-09-09
 TaskStatus: completed
+Task scope: autumn-memory 加 OpenAI 兼容的外部 embedding 客户端（用户：hashemb 没用，
+  应用层要接 CPU 上的 llama）。已实现、评审、修完评审项、测试与消融通过；未提交前的最后一步。
+
+【要点】
+  - `OpenAiEmbedder`（feature `openai-embed`），HTTP 用 cyper（compio 原生，跑在调用方的
+    运行时上），TLS 用 rustls 而非默认 native-tls——发布镜像没有 OpenSSL 头文件。
+  - `Embedder::embed` 改为 async（三个调用点本就在 async fn 里）；新增 `embed_batch`，
+    索引循环改成按文件批量。
+  - 响应**按 `index` 归位而不是按数组顺序**：该字段存在正是因为顺序没有承诺，信任顺序会
+    让每份文档配上别人的向量，且静默（都只是 Vec<f32>）。
+  - 超时是自己加的（cyper 没有），**且必须把读 body 也包进去**：评审发现原来只包了
+    send()，"发完 header 再停住"照样无限挂。
+  - 不做混用保护（用户拍板：向量库本来就不管向量是谁产的），只在文档写明换 embedder 要重建索引。
+
+【测试】9 条新测试（6 解析 + 3 走真实 socket），`--features openai-embed` 42 passed，
+  默认特性 33 passed，默认构建不引入新依赖。三条消融各自变红并在还原后复绿：
+  信任数组顺序 / 去掉重复 index 检查 / 超时不覆盖 body 读取。
+  另如实记下一条**没有变红**的消融（去掉数量校验——短响应被第二道守卫接住），不计入。
+
+Main gaps: 无。用户接 llama 时：memory-mcp --embed-url http://llama:8080 --embed-model M
+
+Date: 2026-09-09
+TaskStatus: completed
 Task scope: F-EXTENT-PLACEMENT 的 Scope 1(统一放置打分器)。按 B 档做:manager 只选 node,
   盘由 EN 自己选。两个 commit:manager 侧打分器 / EN 侧 choose_disk(用户要求分开,便于测试)。
 

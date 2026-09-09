@@ -13,14 +13,30 @@ bytes = { workspace = true }
 # Only for the optional static-int8 embedder (`embed` module, `static-embed`
 # feature). The core + default build pull no extra deps.
 tokenizers = { version = "0.20", default-features = false, features = ["onig"], optional = true }
+# Only for the optional OpenAI-compatible embedder. cyper is the compio-native
+# HTTP client — the same family as the cyper-core this workspace already builds
+# — so the embedder runs on the caller's runtime rather than dragging a second
+# one in beside it.
+# rustls rather than the default native-tls: the release image builds without
+# OpenSSL headers, and a TLS backend that needs them turns this optional feature
+# into a build failure for everyone who enables it.
+cyper = { version = "0.8", optional = true, default-features = false, features = ["json", "rustls"] }
+serde_json = { version = "1", optional = true }
+# For a timeout around the call. cyper has none, and an embedding server that
+# accepts the connection and then says nothing would otherwise stall an index
+# run with no error and no end.
+compio = { version = "0.18", optional = true, features = ["time"] }
 
 [features]
 default = []
 # Model2Vec static-int8 embedder in `autumn_memory::embed` (needs a tokenizer).
 static-embed = ["dep:tokenizers"]
+# Embeddings from an external OpenAI-compatible server (`/v1/embeddings`):
+# llama.cpp, vLLM, sglang, or the vendor itself.
+openai-embed = ["dep:cyper", "dep:serde_json", "dep:compio"]
 
 [dev-dependencies]
-compio = { version = "0.18", features = ["macros"] }
+compio = { version = "0.18", features = ["macros", "net", "io", "time"] }
 
 [lints]
 workspace = true

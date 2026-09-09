@@ -253,14 +253,21 @@ pub async fn index_path(
     let (mut n_sym, mut n_edge) = (0usize, 0usize);
     let mut seen: HashSet<(&str, String, String)> = HashSet::new();
     for fi in &files {
-        for d in &fi.defs {
+        // One embedding call per FILE, not per symbol. With an external
+        // embedder that is the difference between one round trip and one per
+        // definition — on a repo this size, thousands of them. A file is the
+        // natural chunk: it bounds how many vectors are held at once, and it
+        // needs no arbitrary batch size.
+        let srcs: Vec<&str> = fi.defs.iter().map(|d| d.src.as_str()).collect();
+        let vectors = emb.embed_batch(&srcs).await?;
+        for (d, vector) in fi.defs.iter().zip(vectors) {
             let meta = serde_json::json!({
                 "name": d.name, "kind": d.kind, "qualname": d.qualname,
                 "file": d.file, "start": d.start, "end": d.end,
             });
             let meta_b = serde_json::to_vec(&meta)?;
             store.index_memory(&d.id, &d.src, &meta_b, None).await?;
-            store.index_vector(&d.id, &emb.embed(&d.src)?, None).await?;
+            store.index_vector(&d.id, &vector, None).await?;
             store.put_node(&d.id, d.kind, &meta_b, None).await?;
             n_sym += 1;
         }

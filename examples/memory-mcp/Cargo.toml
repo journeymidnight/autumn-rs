@@ -24,6 +24,8 @@ tree-sitter-rust = "0.23"
 [features]
 default = []
 static-embed = ["autumn-memory/static-embed"]
+# Embeddings from an external OpenAI-compatible server (--embed-url).
+openai-embed = ["autumn-memory/openai-embed"]
 
 [lints]
 workspace = true

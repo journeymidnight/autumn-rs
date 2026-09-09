@@ -198,10 +198,13 @@ vector/hybrid on its own — build the index once, then evaluate without
 ## Embedder
 
 The vector / hybrid legs need embeddings (autumn-memory takes caller-supplied
-vectors). Two options:
+vectors). Three options:
 
 - **`hash`** (default) — a zero-dependency signed-hashing embedder. Real
-  plumbing, weak semantics; makes `cargo run` work with no model file.
+  plumbing, **weak semantics**: two texts on the same topic land no closer than
+  two unrelated ones, so vector and hybrid search over it return noise. It is
+  here so `cargo run` works with no model and no service — not so you can
+  retrieve with it. `is_semantic()` reports which kind you have.
 - **`static-int8`** — a Model2Vec-style static int8 lookup table (real
   semantics, no service):
 
@@ -211,6 +214,31 @@ vectors). Two options:
   cargo run -p memory-mcp --features static-embed -- 127.0.0.1:9001 \
       --embed-model model.m2vs --tokenizer tokenizer.json
   ```
+
+- **`openai`** — any server speaking OpenAI's `/v1/embeddings`. This is the one
+  to use when the vector leg has to actually retrieve; the model can be
+  llama.cpp on spare CPU:
+
+  ```bash
+  # llama.cpp, CPU, an embedding model:
+  llama-server -m nomic-embed-text-v1.5.Q8_0.gguf --embeddings --port 8080
+
+  cargo run -p memory-mcp --features openai-embed -- 127.0.0.1:9001 \
+      --embed-url http://127.0.0.1:8080 --embed-model nomic-embed-text
+  ```
+
+  `--embed-url` takes the server root, the `/v1` prefix, or the full endpoint.
+  For a hosted model add `--embed-api-key-file FILE` — a file, because a key
+  passed as an argument is readable from `/proc/<pid>/cmdline` by anyone on the
+  host.
+
+  It asks for one vector at startup, so a wrong URL, a missing model or a bad
+  key fails immediately rather than on someone's first search. Indexing embeds
+  one batch per file rather than one request per symbol.
+
+  **Switching embedder means re-indexing.** Vectors are just `Vec<f32>`; the
+  store cannot tell which model produced them, so searching one model's index
+  with another's query vector returns confident nonsense rather than an error.
 
 ## Web UI + HTTP endpoints
 

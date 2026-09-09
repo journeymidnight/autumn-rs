@@ -114,7 +114,7 @@ impl Code {
         let mut out = Vec::new();
         match mode {
             "vector" | "hybrid" => {
-                let qv = self.emb.embed(q)?;
+                let qv = self.emb.embed(q).await?;
                 let hits = if mode == "vector" {
                     self.store.search_vector(&qv, fetch, NPROBE).await?
                 } else {

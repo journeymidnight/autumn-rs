@@ -14,6 +14,8 @@
 //!   cargo run -p memory-mcp -- [MANAGER] [--root PATH] [--docs PATH]...
 //!       [--tenant T] [--agent A] [--host H] [--port P] [--no-index] [--mcp]
 //!       [--embed-model M --tokenizer T]   (with --features static-embed)
+//!       [--embed-url URL --embed-model M [--embed-api-key-file F]]
+//!                                         (with --features openai-embed)
 //! Then open http://127.0.0.1:5100 — or point an MCP client at the stdio
 //! `--mcp` form, or at `http://127.0.0.1:5100/mcp`.
 //!
@@ -291,6 +293,8 @@ struct Args {
     mcp: bool,
     embed_model: Option<String>,
     tokenizer: Option<String>,
+    embed_url: Option<String>,
+    embed_api_key_file: Option<PathBuf>,
     /// Goldset path — presence switches the binary into evaluation mode:
     /// ingest (if `--docs`), score, report, exit. No server.
     eval: Option<PathBuf>,
@@ -380,6 +384,8 @@ fn parse_args() -> Args {
         mcp: false,
         embed_model: None,
         tokenizer: None,
+        embed_url: None,
+        embed_api_key_file: None,
         eval: None,
         eval_k: 10,
         eval_modes: Vec::new(),
@@ -408,6 +414,10 @@ fn parse_args() -> Args {
             "--mcp" => a.mcp = true,
             "--embed-model" => a.embed_model = it.next(),
             "--tokenizer" => a.tokenizer = it.next(),
+            "--embed-url" => a.embed_url = it.next(),
+            // A file, not a literal: an argv key is readable from
+            // /proc/<pid>/cmdline by anyone on the host.
+            "--embed-api-key-file" => a.embed_api_key_file = it.next().map(PathBuf::from),
             "--eval" => a.eval = it.next().map(PathBuf::from),
             "--eval-k" => a.eval_k = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.eval_k),
             "--eval-modes" => {
@@ -430,6 +440,33 @@ fn parse_args() -> Args {
 }
 
 fn build_embedder(a: &Args) -> Embedder {
+    // An external server first: if the operator named one, falling back to the
+    // hash embedder on a typo would leave a service that answers every vector
+    // query with noise and says so only in one startup line.
+    if let Some(url) = &a.embed_url {
+        #[cfg(feature = "openai-embed")]
+        {
+            let model = a.embed_model.clone().unwrap_or_else(|| "text-embedding-3-small".into());
+            let mut e = embed::OpenAiEmbedder::new(url, &model);
+            if let Some(f) = &a.embed_api_key_file {
+                // Refuse rather than continue unauthenticated. A mistyped path
+                // otherwise yields a service that 401s on every vector query
+                // and said so once, at startup, in a line nobody rereads —
+                // the same failure shape as falling back to hash on a bad URL.
+                match std::fs::read_to_string(f) {
+                    Ok(k) => e = e.with_api_key(k.trim()),
+                    Err(err) => {
+                        tracing::error!("embed api key file {}: {err}", f.display());
+                        std::process::exit(2);
+                    }
+                }
+            }
+            tracing::info!("embedder: openai-compatible ({model} at {})", e.endpoint());
+            return Embedder::OpenAi(e);
+        }
+        #[cfg(not(feature = "openai-embed"))]
+        tracing::warn!("--embed-url {url} ignored: rebuild with --features openai-embed; using hash");
+    }
     if let Some(model) = &a.embed_model {
         #[cfg(feature = "static-embed")]
         {
@@ -782,6 +819,20 @@ async fn main() -> Result<()> {
             .with_page_limit(256),
     );
     let emb = Rc::new(build_embedder(&args));
+    // Ask the embedder for one vector before serving. Two things come of it:
+    // a URL or model that is wrong fails HERE, at the moment of the mistake,
+    // rather than on someone's first search hours later; and `dim()` has a real
+    // number to report, since an external model's width is not knowable until
+    // it answers and /config is a startup snapshot.
+    if emb.name() == "openai" {
+        match emb.embed("autumn-memory startup probe").await {
+            Ok(v) => tracing::info!("embedder ready: {} dims", v.len()),
+            Err(e) => {
+                tracing::error!("embedder unreachable: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
     let code = Code {
         store: store.clone(),
         emb: emb.clone(),

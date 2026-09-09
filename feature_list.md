@@ -706,3 +706,50 @@
   附带修掉 `deploy/validate.sh`：它的 EN 检查被 `if en_ss:` 包着，EN 不再是 StatefulSet
   后整段空转却照打 `VALIDATION OK`；改为验渲染器输出，并做了消融（把 `Recreate` 改成
   `RollingUpdate` → `VALIDATION FAILED`）。
+
+### F-MEM-EXTERNAL-EMBED — 向量腿只有 hash 词袋可用，等于没有
+- **Trigger** (2026-09-09，用户): "支持的 hashemb 一点用都没有"。属实，而且代码自己早就写明了：
+  `is_semantic()` 对 `HashEmbedder` 返回 false，注释说"两段同主题的文本不会比两段无关的更近，
+  向量与 hybrid 检索返回的是噪声"。`examples/memory-mcp/src/main.rs:119` 也写着
+  "With the default HashEmbedder the vector leg is noise, and RRF fusion …"。
+  也就是说向量腿一直是通电但没接信号的状态；唯一的真语义路径是 `static-embed`
+  的离线 int8 查表，要自带模型文件和 tokenizer。
+- **Scope**: 加一个 OpenAI 兼容的外部 embedding 客户端 `OpenAiEmbedder`，feature
+  `openai-embed`（沿用 `static-embed` 的可选依赖惯例，默认构建仍零额外依赖）。
+  HTTP 用 `cyper`——compio 原生，跑在调用方的运行时上，不会在旁边再拖一个 runtime 进来；
+  TLS 用 rustls 而非默认的 native-tls，否则发布镜像没有 OpenSSL 头文件会直接编译失败。
+  `Embedder::embed` 改为 **async**（三个调用点本来就在 async fn 里），并加 `embed_batch`
+  ——端点本身是批量形状，而索引是个循环。**不做**混用保护：向量库本来就不管向量是谁产的，
+  那是调用方的契约（用户拍板）。
+- **Acceptance**:
+  - 解析层：响应按 `index` 归位而非按数组顺序；重复 index、数量不符、非数字、
+    错误体各自被拒绝并说清楚；每个向量 L2 归一化。
+  - 线路层：对真实 socket 发出的确实是 `POST /v1/embeddings`，body 带 model 与 input，
+    `dim()` 报的是服务端真实返回的宽度；**服务端接受连接后不应答时会超时而不是挂死**。
+  - 默认构建与 `--features openai-embed` 两种都要能编过，且默认构建不引入新依赖。
+- **Status**: `passes: true` (2026-09-09) — 已实现并通过。8 条单测（6 条解析 + 2 条走真实
+  socket 的端到端），`cargo test -p autumn-memory --features openai-embed` 41 passed，
+  默认特性 33 passed，clippy 在新代码上零告警。两条消融各自变红并在还原后复绿：
+  (A) 改成信任数组顺序 → 按 index 归位那条红；(B) 去掉重复 index 检查 → 该条红。
+  （另试过去掉数量校验，**没有变红**——短响应还有第二道守卫按槽位回填时接住，
+  那条校验只是让报错更准确。如实记下，不算作一条有效消融。）
+  `examples/memory-mcp` 加了 `--embed-url` / `--embed-api-key-file`（读文件而非命令行，
+  argv 里的密钥全机器可见），并把外部 embedder 排在 hash 之前——运维指定了 URL 却因为
+  拼错回落到 hash，会得到一个每次向量检索都返回噪声、而只在启动日志里说过一句的服务。
+
+  **评审挖出的四条,均已修**：
+  1. **超时只包了 `send()`**，`resp.text()` 在外面——"发完 header 再停住"是与"接受连接后
+     不说话"不同的一种挂死，原来的写法两种都防不住第二种。已把整个交换(send + 读 body)
+     一起包进 timeout，并补了"发 header 不发 body"的测试。消融变红的形态本身就是证据：
+     超时形同虚设时客户端**整整等了 30 秒**直到服务端断开，最后报的是 hyper 的 body
+     读取错误而不是超时。
+  2. **`embed_batch` 没有任何调用方**，而索引是每个符号一次往返——正是注释里警告的用法。
+     索引循环改成**按文件批量**(天然的分块边界，内存有界)。
+  3. **api key 文件读失败只 warn 然后无 key 继续**，与"URL 拼错不能静默回落"自相矛盾。
+     改为 fail-fast。同时加了启动探针：起服务前先要一个向量，URL/模型/密钥错在**当场**
+     退出，而不是等读者第一次搜索；顺带让 `/config` 的 `dim` 有真值可报(它是启动快照，
+     否则 `--no-index` 时会永远显示 0)。
+  4. `docs/ops.md` 与 `examples/memory-mcp/README.md` 未同步——已补，并写明"换 embedder
+     必须重新索引"。
+  评审确认的、不改的两条：解析用 `serde_json::Value` 中转在大批量时有分配开销(可日后改
+  typed struct，非阻塞)；`rustls` 特性组合独立可用，Cargo.lock 里确实没有 openssl-sys。

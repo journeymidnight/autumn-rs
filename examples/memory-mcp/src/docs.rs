@@ -303,7 +303,7 @@ pub async fn ingest_path(
                 "headings": c.headings, "start": c.start_line, "end": c.end_line,
             });
             let meta_b = serde_json::to_vec(&meta)?;
-            let vector = emb.embed(&indexed)?;
+            let vector = emb.embed(&indexed).await?;
 
             let key = c.headings.join("\u{1}");
             let parent = (0..c.headings.len())

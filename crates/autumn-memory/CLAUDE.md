@@ -33,9 +33,36 @@ plan §11). For callers that just want a built-in embedder without a model
 server, `autumn_memory::embed` provides one: `HashEmbedder` (zero-dep, signed-FNV
 hashing — always available) and, behind the **`static-embed`** feature,
 `StaticTableEmbedder` (a Model2Vec-style int8 lookup table, needs `tokenizers`).
-`Embedder` dispatches; all emit an `EMBED_DIM`-length L2-normalized vector.
-Errors are a local `EmbedError` (the core takes no `anyhow` dep). The `gallery`-
-style example `examples/memory-mcp` uses it.
+Behind **`openai-embed`** there is a third: `OpenAiEmbedder`, which calls any
+server speaking OpenAI's `/v1/embeddings` — llama.cpp on spare CPU, vLLM,
+sglang, or the vendor. That is the one to reach for when the vector leg has to
+actually retrieve; the hash embedder exists to exercise the plumbing, and
+`is_semantic()` is how a caller asks which it has.
+
+`Embedder` dispatches. Every variant emits an L2-normalized vector; the two
+built-ins emit `EMBED_DIM`, while an external model emits whatever it emits and
+`dim()` reports what came back (`0` before the first call — nothing can know it
+sooner). The vector index stores the width per record, so no layer needs to
+agree with 256. Errors are a local `EmbedError` (the core takes no `anyhow`
+dep). The `gallery`-style example `examples/memory-mcp` uses it.
+
+Three things about the external one that are easy to get wrong:
+
+- **`Embedder::embed` is async**, because one variant is a network call. The
+  local embedders finish without yielding; a second sync method would have
+  pushed the choice onto every call site, which is what the enum exists to hide.
+- **Rows are placed by the response's `index`, not by arrival.** The field
+  exists because the array is not promised in input order, and a server that
+  batches internally can shuffle it. Trusting the order pairs each document
+  with someone else's vector, silently — they are all just `Vec<f32>`.
+- **There is a timeout, and it had to be added here.** cyper has none, and the
+  failure that matters is not a refused connection but a server that accepts
+  and then says nothing, which would otherwise stall an index run with no error
+  and no end.
+
+Nothing stops you mixing embedders over one index: the store takes `&[f32]` and
+cannot tell whose. Vectors written by one and searched with another are silent
+nonsense, so re-index when you switch.
 
 ## Lexical recall — BM25-on-KV (`recall.rs`, plan §7 词法腿)
 

@@ -1184,6 +1184,31 @@ example (MCP server + web UI, `examples/memory-mcp/README.md`) uses the crate
 directly. Lexical (BM25) search needs no embedder; vector / hybrid use the
 optional embedder.
 
+**Which embedder, and why it matters operationally.** The default is a hash
+embedder: real plumbing, no semantics. Vector and hybrid queries over it return
+noise — not an error, not an empty list, just confidently ranked nonsense. A
+deployment that means to serve vector search needs one of the other two:
+`static-embed` (an offline int8 table, ships a model file) or `openai-embed`,
+which calls any OpenAI-compatible `/v1/embeddings` — llama.cpp on spare CPU is
+enough:
+
+```bash
+memory-mcp <manager> --embed-url http://llama:8080 --embed-model nomic-embed-text
+#          add --embed-api-key-file FILE for a hosted model (a FILE: an argv key
+#          is readable from /proc/<pid>/cmdline by anyone on the host)
+```
+
+It embeds once at startup, so a wrong URL, a missing model or an unreadable key
+file exits non-zero at that moment instead of surfacing on a reader's first
+search. `GET /config` then reports the embedder name and the width the server
+actually returned.
+
+**Switching embedder means re-indexing.** Vectors are `Vec<f32>` and the store
+cannot tell which model produced them; searching an old index with a new
+model's query vector returns plausible-looking garbage. Nothing detects this —
+there is no fingerprint, deliberately, because a vector store does not own the
+embedder.
+
 **Manual verification (Rust core):**
 
 ```bash
