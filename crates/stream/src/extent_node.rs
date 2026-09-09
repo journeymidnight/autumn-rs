@@ -278,6 +278,20 @@ pub(crate) enum DiskHealth {
 struct DiskFS {
     base_dir: PathBuf,
     disk_id: u64,
+    /// Monotonic stamp of the last time `choose_disk` picked this disk, as the
+    /// last tie-break level.
+    ///
+    /// Load-bearing against CONCURRENCY, not against bias. Creating an extent
+    /// only changes a disk's open count once the entry is inserted, and several
+    /// awaits sit between the choice and that insert (`create_dir_all`, `open`,
+    /// optionally `fallocate`, `metadata`). Tasks that overlap that window all
+    /// observe identical counts, so "picking a disk makes it lose the next
+    /// comparison" — true between sequential creations — says nothing about
+    /// simultaneous ones, and they would all pile onto the same disk. This is
+    /// stamped SYNCHRONOUSLY inside the choice, before the first await, so the
+    /// next overlapping caller already sees it. `Cell` is enough: one shard is
+    /// one thread.
+    last_picked: std::cell::Cell<u64>,
     /// SHARED across every DiskFS instance for the same physical
     /// directory in this process (coco P1: multi-shard builds one
     /// DiskFS per shard for the same dir — a shard-local health flag let
@@ -467,6 +481,7 @@ impl DiskFS {
             base_dir,
             disk_id,
             health,
+            last_picked: std::cell::Cell::new(0),
         })
     }
 
@@ -477,6 +492,7 @@ impl DiskFS {
             base_dir,
             disk_id,
             health,
+            last_picked: std::cell::Cell::new(0),
         }
     }
 
@@ -1935,6 +1951,48 @@ async fn file_pread(file: Rc<CompioFile>, offset: u64, len: usize) -> Result<Vec
     result.map_err(|e| anyhow::anyhow!(e))?;
     Ok(buf)
 }
+
+thread_local! {
+    /// Per-shard counter stamping the order `choose_disk` picked disks in.
+    ///
+    /// Thread-local because one shard is one thread and disks are
+    /// per-`ExtentNode`; shards rotate independently, which is what we want —
+    /// they are separate allocators over separate views.
+    static DISK_PICK_SEQ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How full a disk is, in bands this many percentage points wide.
+///
+/// Banded for the same reason the manager bands node utilization: a raw
+/// comparison makes capacity lexicographically dominant, so a disk 1% emptier
+/// would win however many open extents it is already carrying — and the open
+/// count is the only signal that moves when an extent is created.
+const DISK_USED_BAND_PERCENT: u64 = 5;
+
+/// Which band a disk's usage falls in; lower is emptier. An unmeasurable disk
+/// (`statvfs` gave nothing) sorts last rather than first, so a disk we cannot
+/// see is not mistaken for an empty one.
+fn used_band(total: u64, free: u64) -> u64 {
+    if total == 0 {
+        return u64::MAX;
+    }
+    let used = total.saturating_sub(free);
+    (used.saturating_mul(100) / total) / DISK_USED_BAND_PERCENT
+}
+
+/// Ranking for one candidate disk; lower is better.
+///
+/// Field ORDER is the comparison — `derive(Ord)` compares lexicographically,
+/// which is exactly the banded-levels rule and needs no weights trading bytes
+/// against counts.
+#[derive(PartialEq, Eq, PartialOrd, Ord, Debug, Clone, Copy)]
+struct DiskChoice {
+    used_band: u64,
+    open_extents: u64,
+    held_extents: u64,
+    last_picked: u64,
+}
+
 
 /// Per-call chunk size for local-disk pread/pwrite. macOS caps a single
 /// pread/pwrite at INT_MAX (~2 GiB) and Linux at 0x7ffff000 — without
@@ -4829,12 +4887,71 @@ impl ExtentNode {
             })
     }
 
-    /// Return the first ALLOCATABLE disk (Online — not Full, not
-    /// Faulted), or None. New extents must never land on a full disk;
-    /// existing extents on a full disk keep serving reads + (failing)
-    /// appends until space frees.
+    /// Which ALLOCATABLE disk (Online — not Full, not Faulted) a new extent
+    /// goes on. New extents must never land on a full disk; existing extents
+    /// on one keep serving reads + (failing) appends until space frees.
+    ///
+    /// Emptiest first, and among equally empty disks the one carrying the
+    /// fewest OPEN extents. This was `find(first allocatable)` over a
+    /// `HashMap`, which wastes no capacity — a filled disk is simply followed
+    /// by another — but picks by hash order and then sticks to that disk until
+    /// it fills.
+    ///
+    /// How much that concentrated depends on shard count, and the honest
+    /// version is narrower than "a third of the bandwidth": `disks` is a
+    /// `HashMap` with a randomly seeded hasher, so each SHARD's `find` settled
+    /// on its own arbitrary disk. A multi-shard node was therefore already
+    /// spread across disks by accident, and it is the single-shard node — and
+    /// any node whose shards happened to agree — that wrote everything to one.
+    /// Choosing deliberately makes the spread a property rather than a
+    /// coincidence, and makes it hold within one shard.
+    ///
+    /// Free space ALONE cannot decide it, and this is sharper here than a level
+    /// up: with the default `--en-prealloc-bytes` of 0, creating an extent
+    /// moves the free-space number by nothing at all, so ten allocations in a
+    /// row would all see the same emptiest disk and all choose it. (With
+    /// prealloc on, `fallocate` does claim the blocks, and free space moves —
+    /// but the ranking must not depend on that being enabled.) The open-extent
+    /// count is what a new extent changes immediately.
     fn choose_disk(&self) -> Option<Rc<DiskFS>> {
-        self.disks.values().find(|d| d.allocatable()).cloned()
+        // O(extents held by this shard), paid once per extent CREATION — i.e.
+        // once per `max_extent_size` of writes, not per append.
+        let mut open: HashMap<u64, u64> = HashMap::new();
+        let mut held: HashMap<u64, u64> = HashMap::new();
+        for e in self.extents.iter() {
+            let v = e.value();
+            *held.entry(v.disk_id).or_insert(0) += 1;
+            if !v.sealed.load(Ordering::SeqCst) {
+                *open.entry(v.disk_id).or_insert(0) += 1;
+            }
+        }
+        let mut best: Option<(DiskChoice, Rc<DiskFS>)> = None;
+        for d in self.disks.values() {
+            if !d.allocatable() {
+                continue;
+            }
+            let (total, free) = d.disk_stats();
+            let choice = DiskChoice {
+                used_band: used_band(total, free),
+                open_extents: open.get(&d.disk_id).copied().unwrap_or(0),
+                held_extents: held.get(&d.disk_id).copied().unwrap_or(0),
+                last_picked: d.last_picked.get(),
+            };
+            if best.as_ref().is_none_or(|(b, _)| choice < *b) {
+                best = Some((choice, Rc::clone(d)));
+            }
+        }
+        let picked = best.map(|(_, d)| d);
+        if let Some(d) = picked.as_ref() {
+            // Before returning, so the next caller sees it even if this one is
+            // still awaiting its way to the insert.
+            DISK_PICK_SEQ.with(|seq| {
+                let next = seq.get() + 1;
+                seq.set(next);
+                d.last_picked.set(next);
+            });
+        }
+        picked
     }
 
     /// resolve an extent's file handle, re-opening it on a cache
@@ -11131,6 +11248,107 @@ mod sealed_append_guard_tests {
             entry.scrub_probe_backoff.load(Ordering::SeqCst),
             SCRUB_PROBE_BACKOFF_MAX_TICKS
         );
+    }
+
+    /// The disk ranking, on the numbers alone.
+    ///
+    /// `choose_disk` needs real disks and real `statvfs` to exercise; this is
+    /// the part that decides, and it is the part that was wrong.
+    #[test]
+    fn a_disk_is_ranked_by_space_then_by_how_many_open_extents_it_carries() {
+        let empty = DiskChoice {
+            used_band: used_band(1000, 1000),
+            open_extents: 9,
+            held_extents: 9,
+            last_picked: 0,
+        };
+        let full = DiskChoice {
+            used_band: used_band(1000, 100),
+            open_extents: 0,
+            held_extents: 0,
+            last_picked: 0,
+        };
+        assert!(empty < full, "a whole band of free space outranks anything");
+
+        // Same band (0% vs 4% used): the write hotspot decides.
+        let quiet = DiskChoice {
+            used_band: used_band(1000, 960),
+            open_extents: 0,
+            held_extents: 40,
+            last_picked: 0,
+        };
+        let hot = DiskChoice {
+            used_band: used_band(1000, 1000),
+            open_extents: 3,
+            held_extents: 0,
+            last_picked: 0,
+        };
+        assert!(
+            quiet < hot,
+            "inside one band, the disk with fewer open extents wins — free \
+             space does not move when an extent is created, so it cannot be \
+             the only signal"
+        );
+    }
+
+    /// Overlapping creations must not all land on the same disk.
+    ///
+    /// The rotation cannot come from the open-extent count alone: several
+    /// awaits sit between `choose_disk` and the `extents` insert, so tasks that
+    /// overlap that window all see identical counts. This drives the real
+    /// function twice with nothing inserted in between — the shape of two
+    /// concurrent allocations — and the second call must pick the other disk.
+    /// Dropping the `last_picked` stamp makes both calls return disk 1.
+    #[compio::test]
+    async fn two_overlapping_creations_do_not_pick_the_same_disk() {
+        let d1 = tempfile::tempdir().expect("tmp");
+        let d2 = tempfile::tempdir().expect("tmp");
+        std::fs::write(d1.path().join("disk_id"), "1").expect("write");
+        std::fs::write(d2.path().join("disk_id"), "2").expect("write");
+        let node = ExtentNode::new(ExtentNodeConfig::new_multi(vec![
+            d1.path().to_path_buf(),
+            d2.path().to_path_buf(),
+        ]))
+        .await
+        .expect("node");
+
+        let first = node.choose_disk().expect("a disk").disk_id;
+        let second = node.choose_disk().expect("a disk").disk_id;
+        assert_ne!(
+            first, second,
+            "back-to-back choices with no insert in between must rotate"
+        );
+        // …and it keeps rotating rather than sticking on the pair.
+        assert_eq!(node.choose_disk().expect("a disk").disk_id, first);
+    }
+
+    /// An unmeasurable disk must not read as empty, or a `statvfs` failure
+    /// would make that disk the most attractive one on the node.
+    #[test]
+    fn an_unmeasurable_disk_sorts_last() {
+        assert_eq!(used_band(0, 0), u64::MAX);
+        assert!(used_band(1000, 0) < used_band(0, 0));
+    }
+
+    /// The property that removes the need for a random tie-break: choosing a
+    /// disk makes it lose the next comparison, so equals alternate.
+    #[test]
+    fn equal_disks_rotate_because_choosing_one_changes_it() {
+        let a = DiskChoice {
+            used_band: 0,
+            open_extents: 0,
+            held_extents: 0,
+            last_picked: 0,
+        };
+        let b = a;
+        assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+        // …and after `a` takes the extent it is no longer equal.
+        let a_after = DiskChoice {
+            open_extents: 1,
+            held_extents: 1,
+            ..a
+        };
+        assert!(b < a_after);
     }
 
     /// A replica that LOST its tail is rot, and only the scrub can say so.

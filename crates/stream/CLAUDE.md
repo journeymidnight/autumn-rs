@@ -66,8 +66,18 @@ has a zero there, which IS `InDat`, the documented default: same layout, no
 migration. Written only on the InDat→InShardFile transition, never on a
 quarantined extent (`save_meta` would silently clear the quarantine).
 
-`ExtentEntry` stores `disk_id` for path resolution. `choose_disk()` returns the
-first online **allocatable** disk. `df()` returns real `statvfs` stats per disk.
+`ExtentEntry` stores `disk_id` for path resolution. `choose_disk()` ranks the
+**allocatable** disks and returns the best: emptiest band first (5 points of the
+disk), then fewest OPEN extents, then fewest held, then least recently picked.
+It used to return the first allocatable disk in `HashMap` order, which stuck to
+one disk until it filled — per shard, since the map is randomly seeded, so a
+multi-shard node was already spread by accident and a single-shard one was not.
+Free space cannot decide alone: at the default `--en-prealloc-bytes` of 0,
+creating an extent moves it by nothing, so the open count is the only signal a
+new extent changes. The least-recently-picked stamp is set synchronously inside
+the choice, before the first await, because several awaits separate it from the
+`extents` insert and overlapping creations would otherwise all see identical
+counts and pick the same disk. `df()` returns real `statvfs` stats per disk.
 
 **Usage** (production formats disks + registers node identity, then the node
 self-registers its live location via `--advertise`):

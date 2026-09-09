@@ -1,5 +1,71 @@
 Date: 2026-09-09
 TaskStatus: completed
+Task scope: F-EXTENT-PLACEMENT 的 Scope 1(统一放置打分器)。按 B 档做:manager 只选 node,
+  盘由 EN 自己选。两个 commit:manager 侧打分器 / EN 侧 choose_disk(用户要求分开,便于测试)。
+
+【为什么要做】两条路径两套答案,而其中一套是主动的系统性偏置
+  - 分配 `select_nodes`:过滤后 `shuffle` 取 N —— 无偏但**不收敛**(balls-in-bins 方差固有)。
+  - 恢复 `dispatch_recovery_task`:`sort_by_key(node_id)` 后**顺序取第一个过限流的**。
+  实测代价(AZ 迁移):排空 node 5 的 27 个分片,**12 个搬到了正要下线的 node 1/3**
+  (它们 id 最小),四台全新空机一个没接到;同规格机器稳态倾斜 45 vs 12 分片。
+
+【落地】
+  - 新纯模块 `crates/manager/src/placement.rs`。分数是**分层带宽比较**不是加权和:
+    加权和要一个"十个 open tail 值几个百分点的盘"的跨单位常数,那种数只会被调到测试通过
+    为止、此后没人再看。层次 = 利用率(5 个百分点一带)→ open extent 数 → 分片数。
+  - **sealed 是容量,open 是负载**:sealed extent 不再增长、成本已计入字节;open 是 append
+    目标。刚接了十条 tail 的节点字节数几乎没动,只看容量它仍是"最空的",直到那十个填满。
+  - 分配用 **d=2 抽样**,恢复用**全排序** —— 见下面评审那条。
+  - 负载**零新增采集**:`cluster_cap.per_node`(逐盘求和,每 df tick 已经在算)+ per-node
+    open/shard 计数搭在 `logical_stored` 那趟 30s 分块游标扫描上,整圈完成才发布。
+  - EN 侧 `choose_disk`:first-fit → 看负载(commit 2)。
+
+【fable 评审抓到的,都已修】
+  ① **恢复路径上抽样是白付准确度**(我想岔了):`RecoveryRateLimiter` 的 `max_per_target=2`
+     加"被限流就跳下一个"本来就在分散突发 —— 前两个重建给最空的,接着两个给次空的。
+     那条路上不存在 herding,而 d-choices 让 7 台 3 满时仍有约 1/7 首选落在满节点。
+     抽样只在**没有限流器**的分配路径上有价值。拆成 `pick_least_loaded`(分配) /
+     `order_by_load`(恢复,先 shuffle 再稳定排序 ⇒ 同分随机而不是 HashMap 的固定任意序)。
+  ② **我"不需要随机破 tie"的论证有并发漏洞**:`choose_disk` 与 `extents.insert` 之间有多个
+     await,**重叠的创建看到同一份计数、选同一块盘**;轮转只在不重叠时成立。修法是在
+     `choose_disk` 内部、第一个 await 之前同步盖 `last_picked` 序号(shard 单线程,Cell 够)。
+  ③ **我顺手改了槽位语义而没意识到**:`select_nodes` 原返回 shuffle 列表,改成按分数排序后
+     `replicates[0]`(append leader / chain head)会系统性变成最空那台 —— 那是把另一种资源
+     (发送顺序、chain 下 N-1 倍转发出口)悄悄集中过去。选完重新 shuffle,槽位顺序维持原样。
+  ④ 两条**事实错误**:我写"三盘节点只拿 1/3 带宽"——`disks` 是随机种子 HashMap,
+     每个 shard 的 `find` 落在各自随机一块盘,多 shard 节点本来就散开,真正全压一块的是
+     单 shard 节点;我写"perf 基线用 --3disk 正因为并行盘重要"—— `--3disk` 是三个副本 EN
+     各一块 NVMe,与单机多盘无关。
+  ⑤ 口径夸大:band 单位是**节点求和**不是单盘(3.5T×3 一带 ~525GB/~30 extent,非 175GB/10);
+     slot 计数陈旧度在大集群是**分钟级**不是"一个周期";"冷 leader 行为不变"只在 df 未到的
+     头两秒成立。band 边界无迟滞也写进注释,不留给下一个人发现。
+
+【顺带查清并推翻一条注释】`recovery.rs` 里"df 载荷的 per-disk id 是 EN 本地的、和 manager
+  无关"是**错的**。链条:`autumn-op format` 从 manager 注册响应拿 disk_id → 写 `{dir}/disk_id`
+  → `DiskFS::open` 读回 → `ExtentEntry.disk_id` → `df.disk_status` 的键、`ready_disk_id`。
+  **系统里每个 disk id 都是 manager 的。** `node_max_free` 取 MAX 的**理由**建立在一个不存在
+  的 id 映射问题上。只改注释**没动行为**(MAX 对"这台还能不能收一个 extent"本来就是对的)。
+  结论:以后走 B+(manager 放到 (node, disk))并没有被这个映射挡住。
+
+【验证】manager lib 346 / stream lib 174 / rpc 59 / PS 222,stream 集成 233,
+  recovery/EC 相关集成全绿;clippy 改动处 0。**三条消融各自变红**:恢复换回
+  `sort_by_key(node_id)`、盘排序把 open 降到 held 之下、去掉 `last_picked` 盖戳。
+  一个校准 bug 是**跑出来的**:第一版阈值卡在分布均值(85%,而 1-C(3,2)/C(7,2)=85.7%),
+  一半的运行会挂,第一次就挂了 —— 统计断言的门槛要远离均值。
+
+【既有 flake,不是本次引入(做了对照)】`system_multi_split_chain::split_compact_split_
+  preserves_all_data`:baseline(改动 stash 掉)3 次挂 1,带改动 4 次挂 1,同样症状
+  `split2: cannot split: partition has overlapping keys`(CoW 后 major compaction 还没清掉
+  共享 extent,第二次 split 被拒;失败那次 10.9s 提前退出、通过的 21s)。未修,不在本次范围。
+
+Main gaps: Scope 2(`place-shard` 手动放置)与 Scope 3(`rebalance-extents`)未做。
+  Scope 1 只决定**新数据**去哪,**存量倾斜不会自己消失** —— 45 vs 12 那种要靠 Scope 3。
+  域/AZ 标签按用户 2026-09-08 决定**不做**(单 AZ 下约束永不触发 = 没有测试能覆盖的热路径
+  代码),但 `placement.rs` 里留了缝并写明:以后加它必须是「偏好 + 节点级硬底线」,
+  绝不能是「K+M 落在 K+M 个不同域」——后者在单域集群第一天就让分配全部失败。
+
+Date: 2026-09-09
+TaskStatus: completed
 Task scope: wire 37 -> 38（EN 失败原因走 df 心跳、seed_replay 读 marker 的 started_at、
   删除 OpRecord.attempts）+ EC 分片重建上报进度 + EN 从 StatefulSet 拆成每 EN 一个
   Deployment 并缩容 7->5。全部已实现、评审、提交、构建、上线并验收。

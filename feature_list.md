@@ -631,7 +631,24 @@
   - `place-shard` 指定一个合法目标 → 分片确实落在该节点；指定一个已持有该 extent 其它 slot
     的节点 → **服务端拒绝**并说明原因。
   - `rebalance-extents` 在一个人为倾斜的集群上收敛，且过程中 `extent-health` 始终干净。
-- **Status**: `passes: false` (2026-09-05) — 未实现。当前可用的替代手段是
+- **Status**: `passes: false` (2026-09-09) — **Scope 1 已实现,Scope 2/3 未动**。
+  Scope 1 落地形态(与用户 2026-09-08 讨论定稿,选 B 档:manager 只选 node,盘由 EN 自己选):
+  - 新纯模块 `crates/manager/src/placement.rs`。分数是**分层带宽比较**而非加权和 ——
+    加权和需要一个"十个 open tail 值几个百分点的盘"的跨单位常数,那个数只会被调到测试通过
+    为止;分层每层可单独测,以后插一级不用重调其它。层次:利用率(5 个百分点一带)→
+    open extent 数 → 分片数。
+  - **分配**(`select_nodes`)用 d=2 抽样,**恢复**(`recovery_candidate_order`)用全排序。
+    分开的理由是评审逼出来的:恢复路径上 `RecoveryRateLimiter` 的 `max_per_target=2`
+    加"被限流就跳下一个"本来就在分散突发,抽样只是白付准确度(7 台 3 满时约 1/7 的首选
+    仍落在满节点)。抽样只在没有限流器的分配路径上有价值。
+  - 负载来源**零新增采集**:`cluster_cap.per_node`(逐盘求和,每 df tick)+ per-node
+    open/shard 计数(搭在 `logical_stored` 那趟 30s 分块游标扫描上,整圈完成才发布)。
+  - EN 侧 `choose_disk` 从 first-fit 改成看负载(单独 commit)。
+  - 消融三条各自变红:恢复换回 `sort_by_key(node_id)`;盘排序里把 open 计数降到 held 之下;
+    去掉 `last_picked` 盖戳。
+  验收里"各节点分片数极差收敛"这一条**未做** —— 它需要 Scope 3 的再平衡器才能成立,
+  Scope 1 只决定新数据去哪,存量倾斜不会自己消失。已做的是"分片流向轻载节点"+ 消融。
+  当前可用的替代手段是
   **把要腾空的节点全部一次性 fence**，靠 `hard_excluded` 把它们从候选里剔除，
   从而避免数据回流；这次迁移就是这么做的，有效但粒度粗，且解决不了稳态倾斜。
 
