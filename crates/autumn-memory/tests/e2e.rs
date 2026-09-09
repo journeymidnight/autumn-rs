@@ -59,21 +59,52 @@ fn e2e_full_surface() {
                 "recent is newest-first"
             );
 
-            // ---- fact KV (LangGraph BaseStore model)
-            mem.put_fact("profile", "name", b"Alice", None)
+            // ---- fact KV (flat keys; grouping is a convention in the key)
+            mem.put_fact("profile:name", b"Alice", None)
                 .await
                 .expect("put_fact");
-            mem.put_fact("profile", "lang", b"rust", None)
+            mem.put_fact("profile:lang", b"rust", None)
                 .await
                 .expect("put_fact");
+            // Keys that sort AFTER the group prefix — these are what actually
+            // exercise the scan's UPPER bound. (`"prefs:theme"` alone did not:
+            // encoded, it sorts BEFORE `"profile:"`, so a scan that ignored the
+            // prefix end would still not have reached it.)
+            for k in ["prefs:theme", "prog:x", "profiles:x"] {
+                mem.put_fact(k, b"dark", None).await.expect("put_fact");
+            }
             assert_eq!(
-                mem.get_fact("profile", "name").await.expect("get_fact"),
+                mem.get_fact("profile:name").await.expect("get_fact"),
                 Some(b"Alice".to_vec())
             );
-            let facts = mem.list_facts("profile", None).await.expect("list_facts");
-            assert_eq!(facts.len(), 2, "two facts listed");
-            mem.delete_fact("profile", "lang").await.expect("delete_fact");
-            assert!(mem.get_fact("profile", "lang").await.expect("get").is_none());
+            let facts = mem
+                .list_facts(Some("profile:"), None)
+                .await
+                .expect("list_facts");
+            assert_eq!(
+                facts.len(),
+                2,
+                "group scan stops at the group's end — `prog:x` and \
+                 `profiles:x` both sort after it: {facts:?}"
+            );
+            assert!(
+                facts.iter().any(|(k, _)| k == "profile:name"),
+                "listed key is the FULL key, group included: {facts:?}"
+            );
+            // The terminator is the caller's job: drop the `:` and the scan
+            // widens to `profiles:x` too. Documented, not a bug.
+            assert_eq!(
+                mem.list_facts(Some("profile"), None).await.expect("no colon").len(),
+                3,
+                "a group string without its terminator also matches `profiles:x`"
+            );
+            assert_eq!(
+                mem.list_facts(None, None).await.expect("list_facts all").len(),
+                5,
+                "None lists every fact"
+            );
+            mem.delete_fact("profile:lang").await.expect("delete_fact");
+            assert!(mem.get_fact("profile:lang").await.expect("get").is_none());
 
             // ---- BM25-on-KV lexical recall
             // Plural folding makes the query "cat" match d1 ("cat") AND d2
@@ -151,9 +182,59 @@ fn e2e_full_surface() {
             for id in ["d1", "d2", "d3", "zh1", "zh2"] {
                 let _ = mem.delete_memory(id).await;
             }
-            mem.delete_fact("profile", "name").await.ok();
+            for k in ["profile:name", "prefs:theme", "prog:x", "profiles:x"] {
+                let _ = mem.delete_fact(k).await;
+            }
 
             println!("autumn-memory e2e: full surface OK (agent={agent})");
+        });
+}
+
+/// A key in the `fact/` range that `put_fact` could not have written — the
+/// pre-flat `fact/{namespace}/{key}` shape, planted here via the raw client —
+/// must FAIL `list_facts` rather than come back as a name that silently
+/// misbehaves. Without the `fact_key_is_canonical` guard this test goes green
+/// on the scan and the returned name `"profile/name"` addresses a different
+/// key, so the follow-up `delete_fact` deletes nothing and reports success.
+#[test]
+#[ignore = "needs a live autumn cluster (set AUTUMN_MEMORY_E2E_MANAGER)"]
+fn e2e_list_facts_refuses_a_key_it_could_not_have_written() {
+    use autumn_client::{AutumnError, ClusterClient};
+    use std::rc::Rc;
+    compio::runtime::Runtime::new()
+        .expect("compio runtime")
+        .block_on(async {
+            let agent = unique_agent();
+            let client = Rc::new(
+                ClusterClient::connect(&manager_addr(), "mem/__am_e2e").await.expect("connect"),
+            );
+            let mem = MemoryStore::with_client(client.clone(), "__am_e2e", agent.clone());
+
+            mem.put_fact("profile:name", b"Alice", None).await.expect("put_fact");
+            assert_eq!(mem.list_facts(None, None).await.expect("clean list").len(), 1);
+
+            // plant the legacy shape: `fact/` ++ "profile/name", literal `/`.
+            let mut legacy = autumn_memory::keys::fact_all_prefix("__am_e2e", &agent);
+            legacy.extend_from_slice(b"profile/name");
+            client.put(&legacy, b"stale").await.expect("plant legacy key");
+
+            match mem.list_facts(None, None).await {
+                Err(AutumnError::PreconditionFailed(msg)) => {
+                    assert!(msg.contains("profile/name"), "error names the key: {msg}");
+                }
+                other => panic!("expected PreconditionFailed naming the foreign key, got {other:?}"),
+            }
+            // the group scan that does not reach it still works
+            assert_eq!(
+                mem.list_facts(Some("profile:"), None).await.expect("bounded list").len(),
+                1,
+                "a scan whose range excludes the foreign key is unaffected"
+            );
+
+            client.delete(&legacy).await.expect("remove planted key");
+            assert_eq!(mem.list_facts(None, None).await.expect("green again").len(), 1);
+            let _ = mem.delete_fact("profile:name").await;
+            println!("autumn-memory e2e: foreign fact key refused (agent={agent})");
         });
 }
 

@@ -110,11 +110,11 @@ fn cross_tenant_isolation() {
             .await
             .expect("MemoryStore connect_with_credential");
             store
-                .put_fact("ns", "greeting", b"hello", None)
+                .put_fact("greeting", b"hello", None)
                 .await
                 .expect("put_fact under acme/mem/");
             assert_eq!(
-                store.get_fact("ns", "greeting").await.expect("get_fact"),
+                store.get_fact("greeting").await.expect("get_fact"),
                 Some(b"hello".to_vec()),
             );
 

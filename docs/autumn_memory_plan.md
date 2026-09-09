@@ -135,8 +135,7 @@ namespace 内子前缀,不是 SDK 的 tenant 概念。
 
 ```text
 情景日志:   mem/{tenant}/{agent}/ep/{session}/{12B 后缀}   → 事件 blob
-事实 KV:    mem/{tenant}/{agent}/fact/{namespace}/{key}    → 事实 blob
-共享数据:   mem/{tenant}/shared/{namespace}/{key}          → 跨 agent 共享(§9)
+事实 KV:    mem/{tenant}/{agent}/fact/{key}               → 事实 blob
 
 词法(BM25):
   权威文档:  mem/{tenant}/{agent}/doc/{doc_id}             → IndexedDoc{doc_len,terms→tf,text,meta}
@@ -157,16 +156,33 @@ namespace 内子前缀,不是 SDK 的 tenant 概念。
 
 约定:
 
-- 结构分隔符是字面 `/`;每个**动态**组件(tenant/agent/session/namespace/key/term/
-  doc_id/节点 id/边类型)都 **percent-encode**(`q`/`unq`),组件里的 `/` 伪造不出分隔符、
+- 结构分隔符是字面 `/`;每个**动态**组件(tenant/agent/session/key/term/doc_id/
+  节点 id/边类型)都 **percent-encode**(`q`/`unq`),组件里的 `/` 伪造不出分隔符、
   也钻不进别的 agent 前缀(单测 `agent_prefix_isolation` 钉住)。
+- **fact 是扁平的 `fact/{key}`,没有分组段。** `q` 是无状态的逐字节循环,所以
+  `q(a ++ b) == q(a) ++ q(b)` —— **编码保前缀**;而它的 token 集合({单个 unreserved
+  字符} ∪ {`%XX`})是**前缀无关**的(`%` 绝不作为单字符 token 出现),这才是「前缀匹配
+  落不到 token 中间」的依据(**不是**「定宽」—— token 是 1 或 3 个字符)。于是分组写进
+  key 本身(`"profile:name"`),「列出一组」= 对 `fact/` ++ `q(组)` 做 range 扫描。
+  换来任意深度、任意分隔符约定、以及「全列」(`None`);**换掉**的两件事要写明:
+  ① **分隔符归调用方**——`fact/{ns}/` 的尾随 `/` 免费保证 `profile` 看不见
+  `profiles`,扁平 key 没有,组串必须自带终止符(`Some("profile:")`);
+  ② **`(ns, key)` 原本是单射,扁平 key 不是**——`("a","b/c")` 与 `("a/b","c")` 曾是两个
+  key,`"a/b/c"` 只是一个;调用方选的分隔符必须不出现在组名里。
+  另外排序按**编码后**字节(`"a:b"` 排在 `"a-b"` 前,因为 `%` < `-`),只影响 `limit`。
+  `list_facts` 用**组前缀扫描、族前缀命名**——返回的是含组的完整 key,能直接喂回
+  `get_fact`/`delete_fact`。这是**保证**不是约定:范围内出现 `put_fact` 写不出来的 key
+  (裸字节,或旧的 `fact/{namespace}/{key}` 形态——它仍排在族范围**内**),整次扫描以
+  `PreconditionFailed` 报出该 key,而不是交回一个 `delete_fact` 会静默删空的名字
+  (单测 `fact_group_scan_matches_exactly_its_group` /
+  `a_legacy_namespaced_fact_key_is_in_range_but_not_canonical` 钉住)。
 - 情景 `{后缀}` = `BE(u64::MAX - ts_ns) ++ BE(u32::MAX - counter)` → 升序 range 扫描
   即 **newest-first**;per-store counter 打破同纳秒并列。
 - IVF 桶 id 是**定长 4 字节 BE**,所以 `ivf/{4B}{vec_id}` 按 offset 解析(那 4 字节可能
   含 `0x2F`,绝不当分隔符)。`ivf_meta/` 与 `ivf/` 不互为前缀(`ivf_` ≠ `ivf/`),所以
   vptr / 质心对桶扫描不可见。
 - 每 key 可带 **TTL**(`expires_at`,§13)。
-- **双时态**用 immutable `fact/{entity}/{valid_from}/{txid}`,「关闭旧有效期」不原地覆盖
+- **双时态**用 immutable `fact/{entity}:{valid_from}:{txid}`,「关闭旧有效期」不原地覆盖
   而是 append-only correction/interval record;一个 bitemporal update 用
   `commit_marker/txid` 标完整提交;重建历史只读 committed txid 并按 txid 去重
   (**不靠引擎 MVCC**;详见 §8.5)。
@@ -301,9 +317,10 @@ per-agent 记忆单写者,无此问题**。
 | **性能/噪声邻居** | auto-split 把热 agent 切独立核 | 部分(EN 磁盘/网络仍共享) | autumn split + (待补)配额/限流 |
 | **崩溃爆炸半径** | RF=3 + 每 partition 一段 key-range | 故障域=partition 非 agent | autumn 复制/recovery |
 
-**两级命名**:`{tenant}` = 硬边界(不同客户绝不互通);`{agent}` = 租户内软边界(私有
-`mem/{tenant}/{agent}/` vs 共享 `mem/{tenant}/shared/`,§9)。隔离与共享是同一 key
-schema 的两个区。
+**两级命名**:`{tenant}` = 硬边界(不同客户绝不互通);`{agent}` = 租户内软边界
+(`mem/{tenant}/{agent}/`)。跨 agent 共享曾计划用同级的 `mem/{tenant}/shared/` 区,
+但那套 key 从未有过调用方(`MemoryStore` 上没有对应方法),已删;真要做时按 §9 的
+event-log + reducer 语义重开,而不是照抄一个覆盖式 KV 区。
 
 **最关键、最易踩的诚实点:key 前缀只是组织,不是安全。** 客户端能伪造别的 agent 的
 key 读写。**真隔离由 autumn 服务端的 data-plane authz 提供**:PS 的 `authz_gate` 在每

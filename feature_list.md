@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-03
+**Last updated:** 2026-09-08
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -307,6 +307,21 @@
   - **`OpRecord.attempts` 删除**：它想代理的问题（"在重试吗？为什么？"）已被实时
     reason 直接回答；而它在 manager 重启后从 0 重数，本身就会误导。
   各配 1 条单测 + 消融验证变红（`cargo test -p autumn-manager --lib`，330 passed）。
+- **Status**: `closed / passes: true` (2026-09-09) — **验收两条都在真实重建上观察到了**，
+  在一个隔离的 6 节点实验集群上（做法见 docs/ops.md「在一个 pod 里跑一次性集群」）：
+  - 分片 1,207,977,696 字节（1.125 GiB，> 1 GiB）的 EC 重建，`ops list` 上
+    `progress_done` **单调增长**：`0 → 201326592 (17%) → 268435456 (22%) → …`，
+    每步都是 64 MiB 的整数倍，并显示 `rebuilding slot 0 on node 9`。
+  - 在比例首次非零的那一刻 `SIGSTOP` 掉一个源端（4+1 布局下少一个源就凑不齐 k=4）：
+    又落地一条在途的条带后，**比例在 268435456 上冻结 19 秒不动，而 op 始终 RUNNING**，
+    停在条带边界上——正是 docs/ops.md 描述的卡死形态。`SIGCONT` 之后立刻跑完，
+    证明冻结由源端造成而非崩溃。
+  - 用 `SIGSTOP` 而不是杀进程是有意的：杀掉源端会让读**立刻报错**，这次尝试随即失败、
+    进度按设计回退成"未上报"；而真正贵的那个故障（4 小时零字节）是源端**不应答**，
+    只有停住进程才复现得出来。
+  - 同轮还验证了 wire 38 那条：一个失败的重建把执行节点自己的原因实时挂在 `ops list` 上
+    （`ERROR[4]: reopen sealed extent 14: No such file or directory`），op 仍是 RUNNING。
+    此前这句话只会留在那台 EN 的日志里。
   原状态：`passes: false` (2026-09-04) — 不阻塞任何功能，但它是本次排查里最贵的一个
   缺口：有它的话，"4 小时零字节"在第一分钟就摆在眼前，而不是要靠 `df` 采样才发现。
 
