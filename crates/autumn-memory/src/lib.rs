@@ -8,8 +8,7 @@
 //! * **episodic** — an append-only, time-ordered event log per session
 //!   (newest-first by key order; [`MemoryStore::replay_session`] reverses to
 //!   chronological).
-//! * **facts** — a point-get + namespace-prefix-list KV with optional per-key
-//!   TTL (the LangGraph `BaseStore` model).
+//! * **facts** — a flat point-get + prefix-list KV with optional per-key TTL.
 //! * recall over these (lexical then vector) lands with the next phase (§7).
 //!
 //! Phase 1 deliberately needs NO embedding model and NO server-side change:
@@ -277,47 +276,69 @@ impl MemoryStore {
         self.get_values(&key_list).await
     }
 
-    // -- facts (LangGraph BaseStore model) -----------------------------------
+    // -- facts (flat `fact/{key}`; grouping is a convention in the key) -------
 
     pub async fn put_fact(
         &self,
-        namespace: &str,
         key: &str,
         value: &[u8],
         ttl: Option<u64>,
     ) -> Result<(), AutumnError> {
-        let k = keys::fact_key(&self.tenant, &self.agent, namespace, key);
+        let k = keys::fact_key(&self.tenant, &self.agent, key);
         self.put_kv(&k, value, self.ttl(ttl)).await
     }
 
-    pub async fn get_fact(
-        &self,
-        namespace: &str,
-        key: &str,
-    ) -> Result<Option<Vec<u8>>, AutumnError> {
-        let k = keys::fact_key(&self.tenant, &self.agent, namespace, key);
+    pub async fn get_fact(&self, key: &str) -> Result<Option<Vec<u8>>, AutumnError> {
+        let k = keys::fact_key(&self.tenant, &self.agent, key);
         self.client.get(&k).await
     }
 
-    pub async fn delete_fact(&self, namespace: &str, key: &str) -> Result<(), AutumnError> {
-        let k = keys::fact_key(&self.tenant, &self.agent, namespace, key);
+    pub async fn delete_fact(&self, key: &str) -> Result<(), AutumnError> {
+        let k = keys::fact_key(&self.tenant, &self.agent, key);
         self.client.delete(&k).await
     }
 
-    /// List `(key, value)` pairs in a fact namespace (prefix scan + point-get).
+    /// List `(key, value)` pairs whose key starts with `group` — `None` lists
+    /// every fact (prefix scan + batched point-get).
+    ///
+    /// Grouping is a convention inside the key (`"profile:name"`), not a key
+    /// segment; `keys::q` preserves prefixes, so this scans exactly the group.
+    /// **The group string carries its own terminator** — `Some("profile:")`
+    /// also matches `"profiles:x"` if you pass `Some("profile")`.
+    ///
+    /// The returned key is the FULL key, group included — it is measured from
+    /// the family prefix, not from the scan prefix, so it can be fed straight
+    /// back into `get_fact` / `delete_fact`. That round trip is a GUARANTEE,
+    /// not a convention: a key in this range that `put_fact` could not have
+    /// written (raw bytes, or the pre-flat `fact/{namespace}/{key}` shape,
+    /// which still sorts inside the family range) fails the scan with
+    /// `PreconditionFailed` naming it, rather than handing back a name whose
+    /// `delete_fact` would silently delete nothing.
     pub async fn list_facts(
         &self,
-        namespace: &str,
+        group: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<(String, Vec<u8>)>, AutumnError> {
-        let prefix = keys::fact_prefix(&self.tenant, &self.agent, namespace);
-        let key_list = self.scan_keys(&prefix, limit).await?;
+        let family = keys::fact_all_prefix(&self.tenant, &self.agent);
+        let scan = keys::fact_scan_prefix(&self.tenant, &self.agent, group);
+        let key_list = self.scan_keys(&scan, limit).await?;
+        if let Some(bad) = key_list
+            .iter()
+            .find(|k| !keys::fact_key_is_canonical(k, &family))
+        {
+            return Err(AutumnError::PreconditionFailed(format!(
+                "fact range holds a key this API could not have written: {:?} \
+                 — it cannot round-trip through get_fact/delete_fact. Clear the \
+                 foreign keys (see docs/ops.md, autumn-memory verification).",
+                String::from_utf8_lossy(bad)
+            )));
+        }
         let key_refs: Vec<&[u8]> = key_list.iter().map(|k| k.as_slice()).collect();
         let vals = self.client.get_many(&key_refs).await; // batched (was serial)
         let mut out = Vec::with_capacity(key_list.len());
         for (k, v) in key_list.iter().zip(vals) {
             if let Some(b) = v? {
-                out.push((keys::fact_key_name(k, &prefix), b));
+                out.push((keys::fact_key_name(k, &family), b));
             }
         }
         Ok(out)

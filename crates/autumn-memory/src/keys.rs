@@ -6,14 +6,13 @@
 //!
 //! ```text
 //! episodic:  mem/{tenant}/{agent}/ep/{session}/{suffix}   -> event bytes
-//! fact:      mem/{tenant}/{agent}/fact/{namespace}/{key}  -> fact bytes
-//! shared:    mem/{tenant}/shared/{namespace}/{key}        -> cross-agent
+//! fact:      mem/{tenant}/{agent}/fact/{key}              -> fact bytes
 //! ```
 //!
 //! Structural separators are literal `/`; every dynamic component (tenant,
-//! agent, session, namespace, fact key) is percent-encoded so a component that
-//! itself contains `/` can never be confused with a separator and break a
-//! prefix scan. The episodic `{suffix}` is a 12-byte BINARY tail
+//! agent, session, fact key) is percent-encoded so a component that itself
+//! contains `/` can never be confused with a separator and break a prefix
+//! scan. The episodic `{suffix}` is a 12-byte BINARY tail
 //!
 //! ```text
 //! suffix = BE(u64::MAX - ts_ns)  ++  BE(u32::MAX - counter)
@@ -130,41 +129,78 @@ pub fn parse_episodic_ts(key: &[u8], prefix: &[u8]) -> Option<u64> {
 }
 
 // -------------------------------------------------------------------- facts --
+// Facts are a FLAT `fact/{key}` space. There is no grouping segment: `q()` is a
+// stateless per-byte loop, so `q(a ++ b) == q(a) ++ q(b)` — the encoding
+// PRESERVES PREFIXES. And its tokens ({one unreserved char} ∪ {`%XX`}) form a
+// PREFIX-FREE set, because `%` is never emitted as a single-char token; that is
+// what rules out a prefix match landing mid-token, so `q(g)` is a prefix of
+// `q(k)` exactly when `g` is a prefix of `k`. (Not "fixed width" — tokens are
+// 1 or 3 chars. Prefix-freeness is the property the argument needs.)
+//
+// Grouping therefore lives in the key itself (`"profile:name"`) and listing a
+// group is a range scan over `fact/` ++ `q(group)`. Two things a dedicated
+// segment gave for free and a convention does NOT:
+//   * The DELIMITER IS THE CALLER'S JOB. `fact/{ns}/` ended in a separator, so
+//     namespace `profile` could never see `profiles`. A group string must carry
+//     its own terminator — `Some("profile:")`, not `Some("profile")`, which
+//     also matches `"profiles:x"`.
+//   * The old `(ns, key)` pair was injective; a flat key is not. `("a","b/c")`
+//     and `("a/b","c")` were distinct keys; `"a/b/c"` is one. Whatever
+//     separator a caller picks, it must keep it out of group names.
+// What it gains: any depth, any separator convention, and `None` lists all.
+// Ordering is over ENCODED bytes, so it is not the raw-byte order of the keys
+// (`"a:b"` sorts before `"a-b"` because `%` < `-`); only `limit` sees that.
 
-/// Prefix covering one (agent, namespace) fact set — point-get + list.
-pub fn fact_prefix(tenant: &str, agent: &str, namespace: &str) -> Vec<u8> {
+/// Prefix covering ALL of an agent's facts — the family scan range and the
+/// boundary `fact_key_name` measures from.
+pub fn fact_all_prefix(tenant: &str, agent: &str) -> Vec<u8> {
     let mut v = agent_prefix(tenant, agent);
-    v.extend_from_slice(format!("fact/{}/", q(namespace)).as_bytes());
+    v.extend_from_slice(b"fact/");
     v
 }
 
-pub fn fact_key(tenant: &str, agent: &str, namespace: &str, key: &str) -> Vec<u8> {
-    let mut v = fact_prefix(tenant, agent, namespace);
+/// Scan prefix for one group of facts: all keys starting with `group`
+/// (`None` = every fact). See the prefix-preservation note above.
+pub fn fact_scan_prefix(tenant: &str, agent: &str, group: Option<&str>) -> Vec<u8> {
+    let mut v = fact_all_prefix(tenant, agent);
+    if let Some(g) = group {
+        v.extend_from_slice(q(g).as_bytes());
+    }
+    v
+}
+
+pub fn fact_key(tenant: &str, agent: &str, key: &str) -> Vec<u8> {
+    let mut v = fact_all_prefix(tenant, agent);
     v.extend_from_slice(q(key).as_bytes());
     v
 }
 
-/// Recover the original fact key string from a stored key + its prefix.
+/// Recover the original fact key string from a stored key. `prefix` MUST be the
+/// family prefix (`fact_all_prefix`), never a group scan prefix — otherwise the
+/// returned name is missing the group it was listed under.
 pub fn fact_key_name(key: &[u8], prefix: &[u8]) -> String {
     let tail = &key[prefix.len().min(key.len())..];
     unq(&String::from_utf8_lossy(tail))
 }
 
-// ------------------------------------------------------------------- shared --
-
-/// Cross-agent shared prefix, RELATIVE to `mem/{tenant}/` (see `agent_prefix`).
-pub fn shared_prefix(_tenant: &str, namespace: Option<&str>) -> Vec<u8> {
-    let mut v = b"shared/".to_vec();
-    if let Some(ns) = namespace {
-        v.extend_from_slice(format!("{}/", q(ns)).as_bytes());
+/// Is this key a canonical `fact_key` — i.e. `fact_all_prefix` ++ `q(name)`?
+///
+/// Anything written through `put_fact` is. Something else writing raw bytes
+/// into the `fact/` range is not, and the two are NOT interchangeable: a
+/// pre-flat-schema key `fact/profile/name` still sorts inside the family range,
+/// so it is listed, but `fact_key_name` reads it as `"profile/name"` and
+/// re-encoding that gives `fact/profile%2Fname` — a different key. Handing such
+/// a name back would produce a `get_fact` that misses and a `delete_fact` that
+/// deletes nothing, both silently. `list_facts` uses this to refuse instead.
+pub fn fact_key_is_canonical(key: &[u8], family_prefix: &[u8]) -> bool {
+    if !key.starts_with(family_prefix) {
+        return false;
     }
-    v
-}
-
-pub fn shared_key(tenant: &str, namespace: &str, key: &str) -> Vec<u8> {
-    let mut v = shared_prefix(tenant, Some(namespace));
-    v.extend_from_slice(q(key).as_bytes());
-    v
+    let tail = &key[family_prefix.len()..];
+    match std::str::from_utf8(tail) {
+        Ok(t) => q(&unq(t)) == t,
+        Err(_) => false,
+    }
 }
 
 // ----------------------------------------------- recall: docs + inverted ---
@@ -456,10 +492,92 @@ mod tests {
 
     #[test]
     fn fact_key_roundtrip() {
-        let prefix = fact_prefix("acme", "agent-1", "profile");
-        let k = fact_key("acme", "agent-1", "profile", "home/address");
-        assert!(k.starts_with(&prefix));
-        assert_eq!(fact_key_name(&k, &prefix), "home/address");
+        let all = fact_all_prefix("acme", "agent-1");
+        let k = fact_key("acme", "agent-1", "home/address");
+        assert!(k.starts_with(&all));
+        assert_eq!(fact_key_name(&k, &all), "home/address");
+    }
+
+    /// The property that lets the `{namespace}` segment go away: `q` encodes
+    /// byte-by-byte, so it is a prefix homomorphism. Grouping in the key itself
+    /// scans exactly like a dedicated segment did.
+    #[test]
+    fn fact_group_scan_matches_exactly_its_group() {
+        let all = fact_all_prefix("acme", "a1");
+        let grp = fact_scan_prefix("acme", "a1", Some("profile:"));
+        assert!(grp.starts_with(&all));
+        assert_eq!(fact_scan_prefix("acme", "a1", None), all, "None = the whole family");
+
+        let inside = fact_key("acme", "a1", "profile:name");
+        assert!(inside.starts_with(&grp));
+        // the name is measured from the FAMILY prefix, so the group survives it
+        assert_eq!(fact_key_name(&inside, &all), "profile:name");
+        // ... whereas measuring from the GROUP prefix silently eats the group.
+        // That is the trap `list_facts` must not fall into: it scans with the
+        // group prefix but MUST name with the family one, so the key it hands
+        // back can be fed straight back into `get_fact` / `delete_fact`.
+        assert_eq!(fact_key_name(&inside, &grp), "name");
+
+        // a different group is not caught
+        assert!(!fact_key("acme", "a1", "prefs:theme").starts_with(&grp));
+        // ... and neither is a key that merely shares a shorter run: "profile"
+        // (no colon) must not fall inside the "profile:" group.
+        assert!(!fact_key("acme", "a1", "profile").starts_with(&grp));
+
+        // a group containing `/` (or any reserved byte) still scans exactly:
+        // `q` escapes it identically in the prefix and in the key.
+        let slashed = fact_scan_prefix("acme", "a1", Some("a/b/"));
+        assert!(fact_key("acme", "a1", "a/b/c").starts_with(&slashed));
+        assert!(!fact_key("acme", "a1", "a/bx").starts_with(&slashed));
+        // and it cannot forge a sibling group: `q("a/b/")` is not a prefix of
+        // any key under group "a" that is not itself under "a/b/".
+        assert!(!fact_key("acme", "a1", "ax").starts_with(&fact_scan_prefix("acme", "a1", Some("a/"))));
+
+        // facts stay clear of every other family in this agent's space
+        assert!(!inside.starts_with(&node_prefix("acme", "a1")));
+        assert!(!inside.starts_with(&doc_prefix("acme", "a1")));
+        assert!(!inside.starts_with(&episodic_prefix("acme", "a1", "s")));
+    }
+
+    /// The group string must carry its own terminator. The old `fact/{ns}/`
+    /// segment ended in a separator and got this for free; a flat key does not.
+    #[test]
+    fn a_group_without_its_terminator_also_matches_a_longer_group() {
+        let with = fact_scan_prefix("acme", "a1", Some("profile:"));
+        let without = fact_scan_prefix("acme", "a1", Some("profile"));
+        let sibling = fact_key("acme", "a1", "profiles:x");
+        assert!(!sibling.starts_with(&with), "`profile:` excludes `profiles:x`");
+        assert!(sibling.starts_with(&without), "`profile` does NOT — by design");
+    }
+
+    /// The pre-flat `fact/{namespace}/{key}` shape sorts INSIDE the new family
+    /// range (it is not a separate byte range), and its name does not survive a
+    /// round trip — so `list_facts` must refuse it rather than hand it back.
+    #[test]
+    fn a_legacy_namespaced_fact_key_is_in_range_but_not_canonical() {
+        let family = fact_all_prefix("acme", "a1");
+        let mut legacy = family.clone();
+        legacy.extend_from_slice(b"profile/name"); // literal `/`: pre-flat shape
+
+        assert!(legacy.starts_with(&family), "legacy keys ARE listed by the new scan");
+        assert!(!fact_key_is_canonical(&legacy, &family), "and are not round-trippable");
+
+        // proof of the silent failure it would otherwise cause:
+        let name = fact_key_name(&legacy, &family);
+        assert_eq!(name, "profile/name");
+        assert_ne!(
+            fact_key("acme", "a1", &name),
+            legacy,
+            "re-encoding the listed name addresses a DIFFERENT key — a get that \
+             misses and a delete that deletes nothing"
+        );
+
+        // everything `fact_key` writes is canonical, including nasty keys
+        for k in ["plain", "a/b", "100%", "中文/路径", "", "%2F"] {
+            let good = fact_key("acme", "a1", k);
+            assert!(fact_key_is_canonical(&good, &family), "fact_key({k:?}) must be canonical");
+            assert_eq!(fact_key_name(&good, &family), k);
+        }
     }
 
     #[test]
