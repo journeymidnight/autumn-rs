@@ -889,7 +889,7 @@ first append would overwrite committed bytes).
 |-------|-----|-------|----------------|
 | `stream_workers` | stream_id | `mpsc::Sender<StreamSubmitMsg>` | Worker exit, drop |
 | `stream_init_locks` | stream_id | `Rc<futures::lock::Mutex<bool>>` | Never |
-| `nodes_cache` | node_id | address | Replica lookup failure (lazy) |
+| `nodes_cache` | node_id | address | A node id missing from it, **or a cached address that could not be reached** — `forget_node_addr`, called from the retry loops AND from the sites that swallow a per-replica failure; rate-limited per node (note 34) |
 | `extent_info_cache` | extent_id | `ExtentInfo` | Replica lookup failure |
 
 `nodes_cache` + `extent_info_cache` use `DashMap`; `stream_workers` +
@@ -1182,6 +1182,58 @@ and from other crates' CLAUDE.md); do not renumber.
       bitmap is slot-indexed over `replicates ++ parity` and the recovery-gate
       bypass + EC shard rebuild work for shard slots — only the report entry
       point's EC refusal would need an EC-aware variant.
+
+34. **A node that MOVED is not a node that is gone — forgetting its ADDRESS is an orthogonal side effect, not a retry class.**
+    A node keeps its id across a restart (identity is the `node_uuid` on its
+    data dir), so a moved EN leaves every cached layout naming it CORRECT and
+    only `nodes_cache` wrong. The three original retry classes all end in
+    `invalidate_extent_cache` + refetch `ExtentInfo`, which returns the same
+    ids, which resolve through the same dead host — forever. Observed live: a PS
+    dialling an EN's previous pod IP for hours after every slot had
+    re-registered, every read degrading to `ec_reconstruct` and then failing
+    `0/K shards`, while `extent-health` reported all slots healthy. Pod IPs
+    change on every rollout here, so this is routine, not exotic.
+
+    Two halves, and the SECOND is the one that covers the common case:
+    - `ReadRetry::NodeAddrStale` classifies a read that FAILED OUTRIGHT, so the
+      retry re-resolves instead of returning the error. Applies when every
+      replica moved at once.
+    - `forget_node_addr(node_id)` is called at the THREE sites that SWALLOW a
+      per-replica failure: EC degrading to reconstruct, replicated failover
+      moving to the next slot, and the bulk-proxy GET path
+      (`read_value_into_pooled`). A rolling update moves ONE node at a time, so
+      the others cover for it, the read SUCCEEDS, and nothing ever reaches
+      `read_retry_action`; without this the dead address stays cached and every
+      later read to that slot pays a full connect timeout, silently, for the
+      life of the process. The GET path matters most: `replicated_read_order`
+      rotates the start by `(extent_id, offset)`, so one moved node fronts
+      roughly one read in K+M. Per node, never the whole map: `nodes_cache` is
+      shared by every stream on the client.
+
+    **A node that is DOWN must not buy a `nodes_info` per read.** Forgetting
+    heals a node that MOVED; a crashed-but-still-registered one is listed by the
+    manager at its old address, so the refresh re-inserts exactly what was
+    dropped and the cycle repeats — with `Connection refused` failing instantly,
+    a partition at thousands of GETs/s would aim thousands of manager calls/s at
+    the leader for the whole suspicion window. `forget_node_addr` is therefore
+    rate-limited per node (`NODE_ADDR_FORGET_COOLDOWN`, 30 s). This invariant
+    predates the rework and was lost in the first rewrite of this note; it is
+    load-bearing, not a nicety.
+
+    **Why a side effect and not a variant**: `ec_gather_collect` keeps only the
+    LAST error, so a gather that hit both a dead address and a typed refusal is
+    classified by whichever landed last — and a connect timeout arrives seconds
+    after a refusal arrives in milliseconds. Worse, a REUSED pod IP answers
+    instantly with an untyped `not found`, which carries no class at all. The
+    cure has to be independent of that race.
+
+    `is_connect_failure` is deliberately NARROWER than note 29's
+    `is_liveness_timeout`: the latter matches any "timed out" and would put a
+    manager round trip in front of every congested read of a healthy node.
+    **Invariant: retrying at most once still holds.** Both retry loops go
+    through `forget_for_retry` — the first draft taught only the plain read and
+    left the committed read (WAL replay, on the longest-lived client there is)
+    with the pre-fix behaviour.
 
 ---
 

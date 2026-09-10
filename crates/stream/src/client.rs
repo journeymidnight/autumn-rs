@@ -95,6 +95,16 @@ enum ReadRetry {
     PayloadNotHere,
     /// The gather came up exactly one shard short.
     GatherOneShort,
+    /// Could not reach the address we had for a node.
+    ///
+    /// The only class whose cure is NOT a fresh `ExtentInfo`. A node keeps its
+    /// id across a restart -- identity is the `node_uuid` on its data dir, not
+    /// where it happens to be running -- so a move leaves the layout perfectly
+    /// correct and only `nodes_cache` wrong. Refetching the extent returns the
+    /// same ids, which resolve through the same stale address, forever: the
+    /// pre-fix shape was a PS dialling an EN's previous pod IP long after every
+    /// slot had been re-registered, with `extent-health` showing all-green.
+    NodeAddrStale,
 }
 
 /// Spacing between a gather's two attempts.
@@ -228,9 +238,39 @@ fn read_retry_action(attempt: usize, err: &anyhow::Error) -> Option<ReadRetry> {
         Some(ReadRetry::PayloadNotHere)
     } else if is_ec_gather_one_short(err) {
         Some(ReadRetry::GatherOneShort)
+    } else if is_connect_failure(err) {
+        Some(ReadRetry::NodeAddrStale)
     } else {
         None
     }
+}
+
+/// Could we not REACH the peer, as opposed to being answered badly by it?
+///
+/// Deliberately narrower than `is_liveness_timeout`, which matches any
+/// "timed out" and would fire on a slow read of a healthy node -- refreshing
+/// the node map on those buys nothing and adds a manager round trip to every
+/// congested read. Only `ConnPool::get_client`'s two failures qualify, and both
+/// name the address they could not reach.
+pub(crate) fn is_connect_failure(err: &anyhow::Error) -> bool {
+    // `{:#}`: by the time this reaches the read loop the connect error is
+    // wrapped in whatever context the read path added.
+    let m = format!("{err:#}");
+    // `ConnPool::get_client` is the only producer of `connect <addr>...` on
+    // this path, in two shapes: a bounded-connect timeout, and the underlying
+    // io error. The tails below are that io error's unreachable-peer forms; a
+    // shape not listed here simply keeps the old behaviour (no retry), which is
+    // the safe direction for a predicate that triggers a manager round trip.
+    m.contains("connect ")
+        && (m.contains(" timed out after ")
+            // The kernel's own ETIMEDOUT, which reads differently from the
+            // bounded-connect one above and only surfaces where `tcp_syn_retries`
+            // is tuned below CONNECT_TIMEOUT.
+            || m.contains("Connection timed out")
+            || m.contains("Connection refused")
+            || m.contains("No route to host")
+            || m.contains("Network is unreachable")
+            || m.contains("Host is down"))
 }
 
 /// BUG-MGR-RETRY-CLASS: typed error for a manager RPC that ANSWERED with a
@@ -2213,6 +2253,10 @@ pub struct StreamClient {
     /// `autumn_rpc::shard_for_extent(extent_id, K)` (the canonical hash; was
     /// `extent_id % K`). Empty `shard_ports` means legacy single-thread EN.
     nodes_cache: DashMap<u64, (String, Vec<u16>)>,
+    /// When each node's address was last dropped, so a node that is DOWN
+    /// (rather than moved) cannot buy a `nodes_info` round trip per read.
+    /// See `NODE_ADDR_FORGET_COOLDOWN`.
+    node_addr_forgotten: RefCell<HashMap<u64, std::time::Instant>>,
     /// Cached ExtentInfo for read path.
     extent_info_cache: DashMap<u64, ExtentInfo>,
     /// R4 4.3: per-stream single-owner worker sender.  Spawned lazily on
@@ -2680,6 +2724,7 @@ impl StreamClient {
             max_extent_size,
             pool,
             nodes_cache: DashMap::new(),
+            node_addr_forgotten: RefCell::new(HashMap::new()),
             extent_info_cache: DashMap::new(),
             stream_workers: RefCell::new(HashMap::new()),
             stream_init_locks: RefCell::new(HashMap::new()),
@@ -3999,6 +4044,99 @@ impl StreamClient {
         self.extent_info_cache.remove(&extent_id);
     }
 
+    /// Forget the cached ADDRESS of a node we could not reach.
+    ///
+    /// Orthogonal to the extent cache and to the retry classes on purpose. A
+    /// node keeps its id across a restart (identity is the `node_uuid` on its
+    /// data dir), so a moved EN leaves every layout naming it CORRECT and only
+    /// this map wrong — refetching `ExtentInfo` returns the same ids, which
+    /// resolve through the same dead host, forever.
+    ///
+    /// Per node, never the whole map: the map is shared by every stream on this
+    /// client, so clearing it makes unrelated reads of healthy extents refetch
+    /// too, and concurrent failures each buy their own `nodes_info` round trip.
+    /// `replica_addrs_from_cache` fails on a MISSING id, and that failure is
+    /// what already drives `refresh_nodes_map` — so removing one entry is the
+    /// whole cure, with no new refresh path to keep correct.
+    /// How long one node may be forgotten again.
+    ///
+    /// A node that MOVED heals on the first refresh; a node that is DOWN does
+    /// not — the manager lists a crashed-but-registered EN with its old address,
+    /// so forgetting it makes the next resolve refetch the SAME address and the
+    /// cycle repeats. Unbounded, that is a `nodes_info` RPC and a warn line per
+    /// READ, and a `Connection refused` fails instantly, so a partition serving
+    /// thousands of GETs a second would aim thousands of manager calls a second
+    /// at the leader for as long as the node stays down. The pre-rework note 34
+    /// already carried this as an invariant and the first rewrite dropped it.
+    const NODE_ADDR_FORGET_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Forget the cached ADDRESS of a node we could not reach.
+    ///
+    /// Orthogonal to the extent cache and to the retry classes on purpose. A
+    /// node keeps its id across a restart (identity is the `node_uuid` on its
+    /// data dir), so a moved EN leaves every layout naming it CORRECT and only
+    /// this map wrong — refetching `ExtentInfo` returns the same ids, which
+    /// resolve through the same dead host, forever.
+    ///
+    /// Per node, never the whole map: the map is shared by every stream on this
+    /// client, so clearing it makes unrelated reads of healthy extents refetch
+    /// too. `replica_addrs_from_cache` fails on a MISSING id, and that failure
+    /// is what already drives `refresh_nodes_map` — so removing one entry is the
+    /// whole cure, with no new refresh path to keep correct.
+    pub(crate) fn forget_node_addr(&self, node_id: u64) {
+        let now = std::time::Instant::now();
+        {
+            let mut last = self.node_addr_forgotten.borrow_mut();
+            if let Some(&t) = last.get(&node_id) {
+                if now.duration_since(t) < Self::NODE_ADDR_FORGET_COOLDOWN {
+                    // Already forgotten recently and the address came back the
+                    // same: the node is down, not moved. Re-asking the manager
+                    // cannot change that answer.
+                    return;
+                }
+            }
+            last.insert(node_id, now);
+        }
+        if self.nodes_cache.remove(&node_id).is_some() {
+            tracing::warn!(node_id, "could not reach this node's cached address — forgetting it");
+        }
+    }
+
+    /// `forget_node_addr` for every replica of `ex`, when the error says we
+    /// could not reach one of them but not WHICH.
+    ///
+    /// Used at the sites that SWALLOW a per-replica failure — EC degrading to
+    /// reconstruct, replicated failover moving to the next slot — where the
+    /// read still succeeds and nothing ever reaches `read_retry_action`. Those
+    /// are the routine shape: a rolling update moves one node at a time, the
+    /// other replicas cover for it, and without this every later read to that
+    /// slot re-dials the dead address and waits out the full connect timeout,
+    /// silently, for the life of the process.
+    pub(crate) fn forget_unreachable_replicas(&self, ex: &ExtentInfo, err: &anyhow::Error) {
+        if !is_connect_failure(err) {
+            return;
+        }
+        for node_id in replica_node_ids(ex) {
+            self.forget_node_addr(node_id);
+        }
+    }
+
+    /// Everything a retryable read failure must forget before the next attempt.
+    ///
+    /// ONE function because there are two retry loops — the plain read and the
+    /// committed read — and they had drifted: the first draft of the
+    /// address-staleness fix taught only the plain one to drop a dead address,
+    /// so the WAL replay path kept the pre-fix behaviour. Both loops now call
+    /// this, so the pair cannot disagree again; a test could only have caught
+    /// that drift by driving a real read down each loop.
+    fn forget_for_retry(&self, extent_id: u64, ex: &ExtentInfo, err: &anyhow::Error) {
+        // Address first: the extent cache is refetched from the manager, and if
+        // the node map still held a dead address the refetched layout would
+        // resolve straight back to it.
+        self.forget_unreachable_replicas(ex, err);
+        self.invalidate_extent_cache(extent_id);
+    }
+
     /// EAGERLY raise the EN `owner_epoch` fence floor on the stream's CURRENT
     /// tail extent to `owner_epoch`, on every REACHABLE replica, WITHOUT
     /// appending (`MSG_FENCE_EXTENT`).
@@ -4201,8 +4339,25 @@ impl StreamClient {
                                 error = %format_args!("{e:#}"),
                                 "ec: gather one shard short — refreshing extent info and retrying once"
                             ),
+                            // The one class the extent cache cannot cure: the
+                            // layout is right and the ADDRESS is not. The cure
+                            // is applied below, unconditionally — see there.
+                            ReadRetry::NodeAddrStale => tracing::warn!(
+                                extent_id,
+                                error = %format_args!("{e:#}"),
+                                "could not reach a node's cached address — \
+                                 refreshing the node map and retrying once"
+                            ),
                         }
-                        self.invalidate_extent_cache(extent_id);
+                        // NOT tied to the class. `ec_gather_collect` keeps only
+                        // the LAST error, so a gather that hit both a dead
+                        // address and a typed refusal is classified by whichever
+                        // landed last — and a connect timeout arrives seconds
+                        // after a refusal arrives in milliseconds. Dropping the
+                        // address whenever the error says we could not reach the
+                        // peer, whatever class won, is what makes the cure
+                        // independent of that race.
+                        self.forget_for_retry(extent_id, &ex, &e);
                         // Only the gather pauses. The useful part of every retry
                         // here is re-planning from FRESH ExtentInfo, but a gather
                         // is a K-way read amplification, so spacing the attempts
@@ -4297,10 +4452,14 @@ impl StreamClient {
                                 extent_id,
                                 offset,
                                 error = %format_args!("{e:#}"),
-                                "committed read: refreshing extent layout and retrying once"
+                                "committed read: refreshing extent layout (and any unreachable address) and retrying once"
                             );
                         }
-                        self.invalidate_extent_cache(extent_id);
+                        // The same cure as the plain read. This loop is the WAL
+                        // replay path, which runs on a per-partition client that
+                        // lives as long as the partition is open — the longest
+                        // any cached address gets to go stale.
+                        self.forget_for_retry(extent_id, &ex, &e);
                         if kind == ReadRetry::GatherOneShort {
                             // Spaced for the reason the plain read spaces it: a
                             // gather is a K-way read amplification and replay
@@ -4526,6 +4685,19 @@ impl StreamClient {
                     // errors (connect refused mid-failover) stay debug.
                     let msg = format!("{e:#}");
                     self.extent_info_cache.remove(&extent_id);
+                    // The GET hot path swallows this the same way the failover
+                    // arm does — the next slot answers and the caller sees
+                    // `Ok(Some)`, so no retry loop ever classifies it. And
+                    // `replicated_read_order` rotates the start by
+                    // `(extent_id, offset)`, so a single moved node is on the
+                    // front of roughly one GET in K+M: without forgetting it
+                    // here, that fraction of every partition's reads pays a full
+                    // connect timeout for the life of the process.
+                    if is_connect_failure(&e) {
+                        if let Some(&node_id) = replica_node_ids(&ex).get(slot) {
+                            self.forget_node_addr(node_id);
+                        }
+                    }
                     if is_liveness_timeout(&e) {
                         timeouts += 1;
                         tracing::warn!(
@@ -4840,6 +5012,16 @@ impl StreamClient {
                 Err(e) => {
                     if self.read_err_fail_fast(&e, ex.extent_id) {
                         return Err(e);
+                    }
+                    // Failing over HIDES an unreachable address: the next slot
+                    // answers, this call returns Ok, and nothing reaches the
+                    // retry classifier — so the dead address stays cached and
+                    // every later read pays its connect timeout again. Drop it
+                    // here, where the slot names exactly which node it was.
+                    if is_connect_failure(&e) {
+                        if let Some(&node_id) = replica_node_ids(ex).get(slot) {
+                            self.forget_node_addr(node_id);
+                        }
                     }
                     last_err = e;
                 }
@@ -5319,6 +5501,17 @@ impl StreamClient {
                         error = %format_args!("{e:#}"),
                         "ec: shard read failed — degrading to reconstruct"
                     );
+                    // Reconstruct HIDES this failure: the read succeeds from the
+                    // other K and nothing reaches `read_retry_action`, so a
+                    // moved node would keep costing a full connect timeout on
+                    // every read of this extent, forever, in silence. This is
+                    // the routine shape — a rolling update moves one node at a
+                    // time and the others cover for it.
+                    if is_connect_failure(&e) {
+                        if let Some(&node_id) = node_ids.get(shard_plan[i].0) {
+                            self.forget_node_addr(node_id);
+                        }
+                    }
                     needs_reconstruct.push(i);
                 }
             }
@@ -6687,7 +6880,7 @@ mod manager_retry_tests {
     /// Client with fake manager addrs — `construct` skips
     /// `acquire_owner_lock` and the closures under test never do real IO,
     /// so no manager is contacted (same pattern as merge_ec_replay_tests).
-    fn test_client(n_mgrs: usize) -> Rc<StreamClient> {
+    pub(super) fn test_client(n_mgrs: usize) -> Rc<StreamClient> {
         let addrs = (0..n_mgrs)
             .map(|i| format!("127.0.0.1:{}", i + 1))
             .collect();
@@ -7161,6 +7354,199 @@ mod ec_gather_retry_tests {
             read_retry_action(0, &tagged),
             Some(ReadRetry::GatherOneShort),
             "the one-short verdict must survive error construction as a retryable class"
+        );
+    }
+
+    /// A node that moved is not a node that is gone.
+    ///
+    /// Identity is the `node_uuid` on the data dir, so a restarted EN keeps its
+    /// id and re-registers a new address. Every cached layout naming it stays
+    /// CORRECT — only `nodes_cache` is wrong — so refetching `ExtentInfo`
+    /// resolves the same ids through the same dead host, forever. Observed
+    /// live: a PS dialling an EN's previous pod IP for hours, degrading every
+    /// read to reconstruct, with `extent-health` reporting all slots healthy.
+    #[test]
+    fn an_unreachable_cached_address_is_its_own_retry_class() {
+        for m in [
+            // ConnPool's bounded-connect timeout — the shape actually observed.
+            "connect 192.168.3.199:9111 timed out after 5s",
+            // ...and its underlying-io-error sibling, which is what a reused
+            // address answers with once something else holds the port.
+            "connect 192.168.3.199:9111: Connection refused (os error 111)",
+        ] {
+            let err = anyhow::anyhow!("{m}").context("read_bytes_from_extent");
+            assert!(is_connect_failure(&err), "should be a connect failure: {m}");
+            assert_eq!(
+                read_retry_action(0, &err),
+                Some(ReadRetry::NodeAddrStale),
+                "an unreachable address must refresh the node map, not the extent alone: {m}"
+            );
+        }
+    }
+
+    /// The predicate has to stay narrower than `is_liveness_timeout`, which
+    /// matches any "timed out": a slow read of a healthy node must NOT drag a
+    /// `nodes_info` round trip onto the retry, and an answer we did not like is
+    /// not an address problem at all.
+    #[test]
+    fn a_slow_or_unhappy_peer_is_not_an_address_problem() {
+        for m in [
+            "call_into_pooled timed out after 5s",
+            "direct read from 1.2.3.4:9101: code=locked",
+            "eversion mismatch: cached=1 got=2",
+        ] {
+            let err = anyhow::anyhow!("{m}");
+            assert!(!is_connect_failure(&err), "must not be a connect failure: {m}");
+        }
+    }
+
+    /// Retrying at most once is the load-bearing half of the whole classifier
+    /// (see `read_retry_action`), and a new class must not opt out of it — a
+    /// refresh per attempt would put a manager round trip in front of every
+    /// read to a genuinely dead node.
+    #[test]
+    fn the_address_class_still_retries_only_once() {
+        let err = anyhow::anyhow!("connect 192.168.3.199:9111 timed out after 5s");
+        assert_eq!(read_retry_action(1, &err), None);
+    }
+
+    fn ex_with_replicas(extent_id: u64, replicates: Vec<u64>) -> ExtentInfo {
+        ExtentInfo {
+            extent_id,
+            replicates,
+            ..Default::default()
+        }
+    }
+
+    /// Both retry loops must apply the cure, and a helper test cannot see the
+    /// difference — the first draft of this fix taught only the plain read and
+    /// left the committed read (WAL replay, on the longest-lived client there
+    /// is) with the pre-fix behaviour, and every test still passed.
+    ///
+    /// No extent nodes needed: nothing listens on port 1, so every dial refuses
+    /// instantly. The PARITY id is the probe. The EC direct pass only forgets
+    /// DATA shards it actually dialled and the reconstruct's per-peer errors
+    /// forget nothing, so a parity entry can disappear only through the loop's
+    /// own `forget_for_retry`.
+    async fn assert_loop_forgets_parity(
+        read: impl std::future::Future<Output = Result<(Vec<u8>, u64)>>,
+        sc: &Rc<StreamClient>,
+    ) {
+        let _ = read.await; // the fake manager makes this fail; only cache state matters
+        assert!(
+            sc.nodes_cache.get(&99).is_none(),
+            "the retry loop must drop the unreachable parity node's address; \
+             a loop that only invalidates the extent cache re-resolves to the same dead host"
+        );
+    }
+
+    fn ec_client_with_dead_addrs() -> Rc<StreamClient> {
+        let sc = super::manager_retry_tests::test_client(1);
+        for id in [7u64, 8, 99] {
+            // Port 1: refused immediately, so the test does not wait out a
+            // connect timeout.
+            sc.nodes_cache.insert(id, ("127.0.0.1:1".into(), vec![1]));
+        }
+        let mut ex = ex_with_replicas(4242, vec![7, 8]);
+        ex.parity = vec![99];
+        ex.sealed = true;
+        ex.sealed_length = 8192;
+        ex.ec_converted = true;
+        sc.extent_info_cache.insert(4242, ex);
+        sc
+    }
+
+    /// A node that MOVED heals on the first refresh. One that is DOWN does not:
+    /// the manager lists a crashed-but-registered EN with its old address, so
+    /// the refresh re-inserts exactly what was dropped. Without a cooldown that
+    /// is a `nodes_info` round trip per READ — and a refused connect fails
+    /// instantly, so a partition serving thousands of GETs a second would aim
+    /// thousands of manager calls a second at the leader for as long as the node
+    /// stays down.
+    #[compio::test]
+    async fn a_node_that_is_down_is_not_forgotten_once_per_read() {
+        let sc = super::manager_retry_tests::test_client(1);
+        let addr = || ("10.0.0.7:9111".to_string(), vec![9111u16]);
+
+        sc.nodes_cache.insert(7, addr());
+        sc.forget_node_addr(7);
+        assert!(sc.nodes_cache.get(&7).is_none(), "the first failure drops it");
+
+        // The manager answers with the same address, because the node is
+        // registered and merely dead.
+        sc.nodes_cache.insert(7, addr());
+        sc.forget_node_addr(7);
+        assert!(
+            sc.nodes_cache.get(&7).is_some(),
+            "a second failure inside the cooldown must NOT re-ask the manager: \
+             re-forgetting cannot change an answer that is already correct"
+        );
+    }
+
+    #[compio::test]
+    async fn the_plain_read_loop_forgets_an_unreachable_address() {
+        let sc = ec_client_with_dead_addrs();
+        assert_loop_forgets_parity(sc.read_bytes_from_extent(4242, 0, 4096), &sc).await;
+    }
+
+    #[compio::test]
+    async fn the_committed_read_loop_forgets_an_unreachable_address() {
+        let sc = ec_client_with_dead_addrs();
+        assert_loop_forgets_parity(sc.read_committed_bytes_from_extent(4242, 0, 4096), &sc).await;
+    }
+
+    /// The CURE, not the classification.
+    ///
+    /// The first version of this fix classified the error correctly and then
+    /// dropped the address in ONE of the two retry loops. Every test passed:
+    /// they all stopped at `read_retry_action`. Assert the cache actually loses
+    /// the entry, or the next hole hides in the same blind spot.
+    #[compio::test]
+    async fn an_unreachable_replica_loses_its_cached_address() {
+        let sc = super::manager_retry_tests::test_client(1);
+        for id in [7u64, 8, 9] {
+            sc.nodes_cache.insert(id, ("192.168.3.199:9111".into(), vec![9111]));
+        }
+        let ex = ex_with_replicas(42, vec![7, 8, 9]);
+
+        sc.forget_unreachable_replicas(
+            &ex,
+            &anyhow::anyhow!("connect 192.168.3.199:9111 timed out after 5s"),
+        );
+        assert!(sc.nodes_cache.is_empty(), "the replicas' addresses must be dropped");
+    }
+
+    /// Only an address problem may cost an address. An answer we did not like
+    /// says nothing about where the node is, and dropping the entry there buys
+    /// a `nodes_info` round trip on every unhappy read.
+    #[compio::test]
+    async fn a_non_address_failure_leaves_the_map_alone() {
+        let sc = super::manager_retry_tests::test_client(1);
+        sc.nodes_cache.insert(7, ("10.0.0.1:9111".into(), vec![9111]));
+        let ex = ex_with_replicas(42, vec![7]);
+
+        sc.forget_unreachable_replicas(&ex, &anyhow::anyhow!("eversion mismatch: cached=1 got=2"));
+        assert_eq!(sc.nodes_cache.len(), 1);
+    }
+
+    /// A rolling update moves ONE node at a time, so the other replicas cover
+    /// for it and the read SUCCEEDS — the failure never reaches a retry loop.
+    /// The entry still has to go, or every later read of this extent re-dials
+    /// the dead address and waits out the connect timeout, silently, for the
+    /// life of the process.
+    #[compio::test]
+    async fn forgetting_is_per_node_so_a_healthy_peer_keeps_its_address() {
+        let sc = super::manager_retry_tests::test_client(1);
+        sc.nodes_cache.insert(7, ("10.0.0.7:9111".into(), vec![9111]));
+        sc.nodes_cache.insert(8, ("10.0.0.8:9111".into(), vec![9111]));
+
+        sc.forget_node_addr(7);
+
+        assert!(sc.nodes_cache.get(&7).is_none(), "the moved node is forgotten");
+        assert!(
+            sc.nodes_cache.get(&8).is_some(),
+            "a healthy peer must keep its address — clearing the whole map makes \
+             unrelated reads refetch and lets concurrent failures each buy a round trip"
         );
     }
 
