@@ -277,6 +277,22 @@ pub(crate) enum DiskHealth {
     Faulted = 2,
 }
 
+/// What a failed write says about the disk under it.
+///
+/// A state rather than the old boolean "is this a capacity error", because
+/// there are three distinguishable answers and only two of them should touch
+/// the disk's health.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum DiskErrorClass {
+    /// Out of space or quota: the disk is fine and self-heals. `Full`.
+    Capacity,
+    /// This process ran out of a resource (descriptors, memory). Nothing is
+    /// wrong with the device; leave its health alone.
+    Process,
+    /// Anything else: treat the device as broken. `Faulted`.
+    Media,
+}
+
 struct DiskFS {
     base_dir: PathBuf,
     disk_id: u64,
@@ -5037,18 +5053,53 @@ impl ExtentNode {
             .ok_or_else(|| format!("unknown disk_id {disk_id}"))
     }
 
-    /// ENOSPC-1: does this error message describe a CAPACITY condition
-    /// (disk full / quota) rather than a media/fs fault? Matched on the
-    /// std `io::Error` Display forms ("No space left on device (os error
-    /// 28)", "Disk quota exceeded (os error 122)") because several call
-    /// sites only have the stringified error (fsync coalescer waiters,
-    /// anyhow chains) — the os-error suffix survives every wrapping in
-    /// this codebase.
-    pub(crate) fn is_disk_full_error(msg: &str) -> bool {
-        msg.contains("os error 28")
-            || msg.contains("No space left")
-            || msg.contains("os error 122")
-            || msg.contains("Disk quota")
+    /// What a failed write actually indicts.
+    ///
+    /// Matched on the std `io::Error` Display forms because several call sites
+    /// only have the stringified error (fsync waiters, anyhow chains) — the
+    /// `(os error N)` suffix survives every wrapping in this codebase.
+    ///
+    /// Two classes were not enough once `Faulted` began MOVING DATA. It is
+    /// permanent until the process restarts, and the manager now rebuilds a
+    /// faulted disk's replicas elsewhere without an operator — so reading an
+    /// error that says nothing about the disk as a disk failure costs a
+    /// full-disk migration.
+    ///
+    /// The third class is the one that was missing: errors that indict the
+    /// PROCESS. Running out of file descriptors or memory fails the write, and
+    /// the caller has already rejected the operation fail-closed, but the
+    /// platter is fine. This is reachable, not hypothetical —
+    /// `write_meta_locked` opens a temp file and returns
+    /// `open meta tmp for extent N: Too many open files (os error 24)`, which
+    /// `handle_fence_extent` hands straight to the classifier.
+    pub(crate) fn classify_disk_error(msg: &str) -> DiskErrorClass {
+        // Match the CLOSING PAREN too. `io::Error` renders as
+        // `<strerror> (os error N)`, so a bare `"os error 12"` is a substring
+        // of `"os error 121)"` — EREMOTEIO, which the block layer produces from
+        // a SCSI/NVMe target error and which is exactly what this classifier
+        // exists to catch. Without the paren, errnos 120-129 (ENOMEDIUM,
+        // EMEDIUMTYPE among them) would be read as process exhaustion and a
+        // genuinely failing device would be left Online. The same shape is why
+        // EDQUOT (122) used to depend on Capacity being tested first: an
+        // ordering dependency nothing wrote down. Now no arm can shadow
+        // another.
+        let errno = |n: u32| msg.contains(&format!("(os error {n})"));
+
+        // ENOSPC / EDQUOT.
+        if errno(28) || errno(122) || msg.contains("No space left") || msg.contains("Disk quota") {
+            return DiskErrorClass::Capacity;
+        }
+        // EMFILE / ENFILE / ENOMEM. Process-level exhaustion: about this
+        // process, not about the device under it.
+        if errno(24)
+            || errno(23)
+            || errno(12)
+            || msg.contains("Too many open files")
+            || msg.contains("Cannot allocate memory")
+        {
+            return DiskErrorClass::Process;
+        }
+        DiskErrorClass::Media
     }
 
     /// Mark the disk hosting an extent after a write/persist error,
@@ -5062,24 +5113,43 @@ impl ExtentNode {
         if let Some(entry) = self.extents.get(&extent_id) {
             let disk_id = entry.disk_id;
             if let Some(disk) = self.disks.get(&disk_id) {
-                if Self::is_disk_full_error(err_msg) {
-                    if disk.health() == DiskHealth::Online {
+                match Self::classify_disk_error(err_msg) {
+                    DiskErrorClass::Capacity => {
+                        if disk.health() == DiskHealth::Online {
+                            tracing::warn!(
+                                extent_id,
+                                disk_id,
+                                "disk FULL (capacity) — new-extent allocation suspended; \
+                                 self-heals when free space returns"
+                            );
+                            disk.set_full();
+                        }
+                    }
+                    DiskErrorClass::Process => {
+                        // The write failed and the caller already rejected the
+                        // operation; the disk is not the thing that broke.
+                        // Condemning it here would suspend allocation on it and
+                        // — since the manager rebuilds a faulted disk's
+                        // replicas — migrate everything off it, permanently,
+                        // because this process momentarily ran out of a handle.
                         tracing::warn!(
                             extent_id,
                             disk_id,
-                            "disk FULL (capacity) — new-extent allocation suspended; \
-                             self-heals when free space returns"
+                            err_msg,
+                            "write failed on process-level exhaustion, not disk failure; \
+                             leaving disk health alone"
                         );
-                        disk.set_full();
                     }
-                } else if disk.online() {
-                    tracing::error!(
-                        extent_id,
-                        disk_id,
-                        err_msg,
-                        "marking disk faulted due to I/O error"
-                    );
-                    disk.set_faulted();
+                    DiskErrorClass::Media if disk.online() => {
+                        tracing::error!(
+                            extent_id,
+                            disk_id,
+                            err_msg,
+                            "marking disk faulted due to I/O error"
+                        );
+                        disk.set_faulted();
+                    }
+                    DiskErrorClass::Media => {}
                 }
             }
         }
@@ -10834,20 +10904,106 @@ mod enospc_disk_health_tests {
 
     /// ENOSPC/EDQUOT classify as capacity in every wrapping this codebase
     /// produces (typed io::Error Display, fsync-coalescer strings, anyhow
-    /// chains); everything else is a fault.
+    /// chains); process-level exhaustion is neither, and everything left is a
+    /// fault.
     #[test]
-    fn classification_matches_capacity_errors_only() {
+    fn each_class_gets_the_errors_that_belong_to_it() {
+        use DiskErrorClass::*;
+        let cls = ExtentNode::classify_disk_error;
         let enospc = std::io::Error::from_raw_os_error(28).to_string();
         let edquot = std::io::Error::from_raw_os_error(122).to_string();
         let eio = std::io::Error::from_raw_os_error(5).to_string();
-        assert!(ExtentNode::is_disk_full_error(&enospc), "{enospc}");
-        assert!(ExtentNode::is_disk_full_error(&edquot), "{edquot}");
-        assert!(ExtentNode::is_disk_full_error(&format!(
-            "write staging 42/1: {enospc}"
-        )));
-        assert!(!ExtentNode::is_disk_full_error(&eio), "{eio}");
-        assert!(!ExtentNode::is_disk_full_error("fsync coalescer canceled"));
-        assert!(!ExtentNode::is_disk_full_error("unclassified I/O failure"));
+        assert_eq!(cls(&enospc), Capacity, "{enospc}");
+        assert_eq!(cls(&edquot), Capacity, "{edquot}");
+        // The message is always wrapped by the caller; match on the substring.
+        assert_eq!(cls(&format!("write staging 42/1: {enospc}")), Capacity);
+        assert_eq!(cls(&eio), Media, "{eio}");
+        assert_eq!(cls("fsync coalescer canceled"), Media);
+        assert_eq!(cls("unclassified I/O failure"), Media);
+    }
+
+    /// EVERY real errno, checked against what we mean to say about it.
+    ///
+    /// The bug this pins: matching `"os error 12"` as a bare substring also
+    /// matches `"os error 121)"` — EREMOTEIO, which the block layer produces
+    /// from a SCSI/NVMe target error. A device error would have been filed as
+    /// process exhaustion and the failing disk left Online, which is the exact
+    /// inverse of this classifier's job. Errnos 120-129 all collided.
+    ///
+    /// A whitelist is only as good as its edges, so this walks the whole
+    /// range rather than the three values someone thought of.
+    #[test]
+    fn no_errno_is_misfiled() {
+        use DiskErrorClass::*;
+        for n in 1..=133i32 {
+            let msg = std::io::Error::from_raw_os_error(n).to_string();
+            let got = ExtentNode::classify_disk_error(&msg);
+            let want = match n {
+                28 | 122 => Capacity,
+                12 | 23 | 24 => Process,
+                _ => Media,
+            };
+            assert_eq!(got, want, "errno {n} classified {got:?}, expected {want:?} [{msg}]");
+        }
+    }
+
+    /// Running out of file descriptors is not a disk failure, and calling it
+    /// one is expensive now: `Faulted` is permanent until the process restarts
+    /// AND the manager migrates a faulted disk's replicas off it. A momentary
+    /// fd shortage would cost a whole disk's worth of rebuild.
+    ///
+    /// Reachable, not hypothetical: `write_meta_locked` opens a temp file and
+    /// returns `open meta tmp for extent N: <io error>`, which
+    /// `handle_fence_extent` hands straight to the classifier.
+    #[test]
+    fn running_out_of_handles_does_not_condemn_the_disk() {
+        use DiskErrorClass::*;
+        let cls = ExtentNode::classify_disk_error;
+        let emfile = std::io::Error::from_raw_os_error(24).to_string();
+        assert_eq!(
+            cls(&format!("open meta tmp for extent 7: {emfile}")),
+            Process,
+            "EMFILE is this process running out of handles, not a bad disk"
+        );
+        assert_eq!(
+            cls(&std::io::Error::from_raw_os_error(23).to_string()),
+            Process,
+            "ENFILE — system-wide fd exhaustion"
+        );
+        assert_eq!(
+            cls(&std::io::Error::from_raw_os_error(12).to_string()),
+            Process,
+            "ENOMEM"
+        );
+    }
+
+    /// …and the classification is actually acted on: a process-level error
+    /// must leave the disk's health untouched, where a media error faults it.
+    #[compio::test]
+    async fn a_handle_shortage_leaves_the_disk_online() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let eid = 6100u64;
+        node.ensure_extent(eid).await.expect("entry");
+        let disk = node.disk_for(1).expect("disk");
+
+        let emfile = std::io::Error::from_raw_os_error(24).to_string();
+        node.mark_disk_error_for_extent(eid, &format!("open meta tmp for extent {eid}: {emfile}"));
+        assert_eq!(
+            disk.health(),
+            DiskHealth::Online,
+            "a handle shortage must not fault the disk"
+        );
+
+        let eio = std::io::Error::from_raw_os_error(5).to_string();
+        node.mark_disk_error_for_extent(eid, &eio);
+        assert_eq!(
+            disk.health(),
+            DiskHealth::Faulted,
+            "a real I/O error still does"
+        );
     }
 
     /// Full is recoverable and gates allocation; Faulted is terminal.

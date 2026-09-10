@@ -1,6 +1,9 @@
 Date: 2026-09-10
 TaskStatus: completed
-Task scope: F-DISK-FAULTED-REBUILD —— 一块盘坏了,它上面的副本永远不会被重建。
+Task scope: 两个 commit。① F-DISK-FAULTED-REBUILD —— 一块盘坏了,它上面的副本永远不会被重建
+  (**完成**,账目已按规则删除)。② F-DISK-FAULT-CLASSIFIER 的一半 ——
+  进程级错误不再被判成磁盘故障(**未完成**,账目保留 `passes: false`,详见文末)。
+  ①的原始描述:
   用户 2026-09-09 定的边界:拓扑/tag/机架不做;Online/Full/Faulted **保持自动**,
   本轮不加运维动词。所以做的是"自动状态存在却什么都不驱动"这一半。
 
@@ -58,7 +61,29 @@ Task scope: F-DISK-FAULTED-REBUILD —— 一块盘坏了,它上面的副本永�
   `handle_df` 里一行恒等式覆盖。评审认为比它更该补的是"df 失败 ⇒ 下一 tick 不得派发"
   的组合测试 —— 那条已经补了。
 
-Main gaps: `F-DISK-FAULT-CLASSIFIER` 新立(未做):`mark_disk_error_for_extent` 把**任何**
+【同日第二个 commit:F-DISK-FAULT-CLASSIFIER 做了一半,且不是账本 Scope 里的那一半】
+  做它的理由是**它的爆炸半径是被上一个 commit 放大的** —— 我刚把 `Faulted` 变成会搬数据的
+  触发器,而设置 `Faulted` 的那个判断把任何非 ENOSPC 错误都判死、且粘到进程重启。
+  **先查可达性再改**(仓库规矩:今天复现不了的不修)。结论是可达,证据读出来的:
+  `write_meta_locked` 的 open 失败返回 `open meta tmp for extent N: Too many open files
+  (os error 24)`,`handle_fence_extent` 把它**直接**喂进分类器 ⇒ 一次 fd 短缺 = 永久判死 + 整盘搬迁。
+  改法不是加去抖,是**加第三类**:那个判断本身问错了问题 —— 它问"是不是容量错误",
+  该问"这个错误指控的是盘吗"。`Process`(EMFILE/ENFILE/ENOMEM)完全不碰盘的健康。
+
+  **评审抓到我在这次改动里新引入的反向 bug(HIGH)**:`msg.contains("os error 12")`
+  子串命中 errno **120~129**,其中 121 EREMOTEIO 正是块层 `BLK_STS_TARGET` 的映射、
+  也正是这个分类器存在的理由 —— 于是我的"修复"会让**真设备故障静默留在 Online**,
+  比 HEAD 还糟。而 122(EDQUOT)之所以还对,只是因为 Capacity 分支先被检查:
+  一个没写下来的顺序依赖。改成带右括号匹配,任何一支不再能遮蔽另一支;
+  并加了遍历 errno 1..=133 的回归测试 —— **白名单的价值全在边界上,只测想到的那三个值不算数**。
+  消融(退回裸子串)精准红在 errno 120。
+
+  **评审还指出我把账目删早了**:F-DISK-FAULT-CLASSIFIER 的 Acceptance 写的是"瞬时 I/O 错误
+  (非介质)不得判死",而我只做了一个三值白名单 —— 一次瞬时 EIO 或 `.tmp` 被清导致的 ENOENT
+  **仍然永久判死并触发整盘搬迁**。已把条目**恢复**并写明只做了一半、未做的是 Scope 1
+  的"上报前自证"。F-DISK-FAULTED-REBUILD 的 Acceptance 确实达成,按规则删除。
+
+Main gaps: `F-DISK-FAULT-CLASSIFIER` 仍未完成(只做了 Process 一类):`mark_disk_error_for_extent` 把**任何**
   非 ENOSPC 错误判成 Faulted 且粘到进程重启,没有任何去抖(对照 PS 上报要 60s 内 3 个上报者
   才做一次仅建议性的翻转)。这个分类器当初是为"停止分配"设计的,误判代价是本地可逆的;
   本轮之后它会触发整盘搬迁,代价变成集群级不可逆。方案 1(上报前自证一次小写+fsync)

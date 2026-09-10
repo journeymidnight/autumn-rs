@@ -18,68 +18,32 @@
 > 版本变更要求哪些内嵌客户端重建）算 autumn 的后果，该记；下游自己的缺陷、进展和上线
 > 状态不算，记在它们各自的仓库里。
 
-### F-DISK-FAULTED-REBUILD — 一块盘坏了,它上面的副本永远不会被重建
-- **Trigger** (2026-09-09,做完 Scope 1 后顺着"怎么下线一块盘"查出来的): 盘的健康状态
-  传到了 manager,但**只用来算容量,从不驱动任何修复**。信号在两个地方断掉,都已核代码:
-  - `mark_node_disks_online`(`recovery.rs:2207-2227`)在 df **成功**时把该节点
-    `node.disks` 里的**每一块**设成 `online = true`,**根本不读 `df.disk_status[].online`**。
-    而一台机器上有一块盘 Faulted 时 df 照样成功 ⇒ **信号被覆盖**。
-  - 即使没被覆盖也没用:恢复门(`recovery.rs:1256`)默认 `fenced_only`,只认**节点级**
-    Fenced 或已证实腐化,`continue` 掉的位置在 **per-disk 健康检查之上**。
-  - `s.disks[].online` 全库只有两个写入点(`recovery.rs:2189` / `2218`),**都是整节点粒度**;
-    EN 逐盘上报的 `online` 全库只被读一次(`recovery.rs:1822`,cluster_df 求和)。
-- **现状后果**: `Faulted` 只让 EN 本地停止分配(`allocatable()` 为 false,这半是好的)。
-  盘上已有的 extent **静默停在 RF-1**,而 manager 自己的视图说这块盘是好的 ——
-  `select_nodes` 的"至少一块 online 盘"过滤也照样把它算上。要修只能 fence **整台机器**,
-  在四盘节点上等于搬 4 倍于需要的数据。
-- **对比**: HDFS 的 decommission 同样是运维驱动的,但**盘坏了它会自动补副本**。
-  autumn 现在是连真故障都在等运维,而运维在盘这一级**连动词都没有**。
-- **Scope**:
-  1. manager 停止覆盖逐盘状态:把 `df.disk_status[].online` 应用到 `s.disks[].online`,
-     而不是 df 成功就全设 true。注意 `mark_node_disks_offline`(df 失败 ⇒ 整节点)保留 ——
-     那个语义是对的,拿不到 df 时确实不知道任何一块盘的状况。
-  2. `Faulted` **绕过恢复门**,方式与 `is_corrupt` 完全一致(`recovery.rs:1256` 那行的
-     同一个出口)。**不要**改成 `auto_disk` —— 那会把整个集群的恢复门换回旧的自动行为,
-     为一块盘付整集群的爆炸半径。
-  3. **`Full` 绝不绕过**。它是瞬时的、空间回到 5% 以上会自愈;把它当故障会在集群快满时
-     引发全域重建风暴 —— 正是恢复门存在的理由。
-- **⚠️ 风险**: 这动的是恢复门,是本仓库最容易改出 wedge 的地方之一
-  (账本里 `recovery-stuck` / `F227 写 wedge` 家族都在这附近)。
-- **Acceptance**:
-  - **先复现再改**:构造一个盘 Faulted 的集群,断言它上面的 slot **不会**被重建(证明洞存在),
-    且 manager 视图里该盘仍是 online(证明覆盖那一段);
-  - 修完后同一场景:slot **无需任何运维动作**自动重建走;
-  - **消融**:去掉 Faulted 的绕过 ⇒ 复现测试变红;
-  - **反向消融**:把一块盘置成 `Full` ⇒ **不得**触发任何重建。
-- `passes: false`
-
-### F-DISK-FAULT-CLASSIFIER — `Faulted` 的误判代价从"本地不再分配"变成了"整盘搬迁"
+### F-DISK-FAULT-CLASSIFIER — 瞬时错误被判成永久磁盘故障,而代价已经变成整盘搬迁
 - **Trigger** (2026-09-10, fable 评审在 F-DISK-FAULTED-REBUILD 里指出): 分类器
-  `mark_disk_error_for_extent`(`extent_node.rs:5059`)把**任何**非 ENOSPC/EDQUOT 的错误
-  一律置成 `Faulted`,粘住到进程重启为止(`set_faulted` 存 2;`set_full`/`try_clear_full`
-  只在 0↔1 之间 CAS)。十五个调用点,全在持久化/追加路径上。
+  `mark_disk_error_for_extent`(`extent_node.rs`)把**任何**非 ENOSPC/EDQUOT 的错误
+  一律置成 `Faulted`,粘住到进程重启为止。十九个调用点,全在持久化/追加路径上。
 - **为什么现在才要紧**: 这个分类器当初是为"停止在这块盘上分配"设计的 —— 误判的代价是本地的、
   可逆的。F-DISK-FAULTED-REBUILD 之后,同一个判断会**触发整块盘的数据搬迁**,代价变成
-  集群级且不可逆(重建走完就走完了)。而它**没有任何去抖**:对照 PS 上报那条路径,
-  需要 60 秒内 3 个上报者才肯做一次**仅仅是建议性**的翻转。
-- **未复现,评审是读代码推断的**: 会被算成 Faulted 的非介质错误包括 `write_meta_locked`
-  的 rename/open/dir-fsync 失败(如 `.tmp` 被清掉导致的 ENOENT)、staging 目录打开失败,
-  以及任何一次瞬时 `os error 5`。没找到确定可达的竞态。
-- **Scope(两条,择一或都做)**:
+  集群级且不可逆。而它**没有任何去抖**:对照 PS 上报那条路径,需要 60 秒内 3 个上报者
+  才肯做一次**仅仅是建议性**的翻转。
+- **Scope**:
   1. EN 侧在上报 `online:false` 之前**自证一次** —— 往该目录做一次小写 + fsync,过了就不报;
   2. 给运维一个清除 `Faulted` 的手段(现在只能重启 EN 进程)。
 - **⚠️ 与用户 2026-09-09 决定的关系**: 用户明确"Online/Full/Faulted 先做成自动的",
   所以第 2 条(运维动词)属于**以后**;第 1 条不引入新状态,只是让自动判断更可信,不冲突。
 - **Acceptance**: 造一次瞬时 I/O 错误(非介质) ⇒ 盘**不**被置成 Faulted、不触发重建;
   造一次持续错误 ⇒ 仍然置 Faulted 并触发。
-- **Status**: `passes: true` (2026-09-10) — 已实现并评审。落地要点与一处近失:
-  谓词 `slot_verdict(gate, fenced, corrupt, disk_faulted, disk_online)` 从派发循环里抽出
-  (原本三段内联检查,顺序就是 bug);`apply_df_disk_health` 逐盘应用 df 并做归属校验。
-  **近失(fable 抓到)**:第一版让门上那条臂读 `MgrDiskInfo.online`,而那个 bool 承载三种
-  含义 —— 节点自陈盘坏 / df 超时 / PS 上报仲裁 —— 于是**任何漏掉一次心跳的节点都会被整体重建**,
-  正好推翻 `docs/ops.md` 里滚动重启手册依赖的那条承诺。改成读独立的 `faulted_disks`
-  (内存、leader 本地、只由节点自陈写入,failover 后为空 ⇒ withhold,方向安全)。
-  四条消融各自变红,其中一条专钉这次近失。分类器的误判半径另立 F-DISK-FAULT-CLASSIFIER。
+- **Status**: `passes: false` (2026-09-10) — **只做了一半,且不是 Scope 里的那一半**。
+  已做:`classify_disk_error` 拆成三类,`Process`(EMFILE/ENFILE/ENOMEM)完全不碰盘的健康。
+  依据是读代码核实的可达路径 —— `write_meta_locked` 的 open 失败会带着
+  `Too many open files (os error 24)` 经 `handle_fence_extent` 直接进分类器。
+  **未做**:Scope 1 的"上报前自证"。一次瞬时的 EIO 或 `.tmp` 被清掉导致的 ENOENT
+  **仍然会永久判死并触发整盘搬迁**,而账本的 Acceptance 说的正是这一类。
+  同轮评审还抓到我在这次改动里**新引入**的一个反向 bug:`msg.contains("os error 12")`
+  子串命中 errno 120~129(含 EREMOTEIO —— 块层 `BLK_STS_TARGET` 的映射,正是要抓的设备错误),
+  会让真设备故障**静默留在 Online**。改成带右括号匹配,并加了遍历 errno 1..=133 的回归测试
+  (白名单的价值全在边界上,只测想到的那三个值不算数)。
+- `passes: false`
 
 ### F-DISK-REBALANCE — 机内盘间倾斜没有任何东西会纠正
 - **Trigger** (2026-09-09): `choose_disk` 现在按负载选盘(见 F-EXTENT-PLACEMENT Scope 1 的

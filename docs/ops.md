@@ -1057,6 +1057,14 @@ restart the EN. Note the EN refuses to start if a configured `--data` dir
 cannot be opened, so pull the dead dir out of the list first if the hardware is
 gone.
 
+Errors that indict the PROCESS rather than the device — running out of file
+descriptors or memory — leave disk health untouched entirely (logged as
+`write failed on process-level exhaustion`). The failing operation is still
+rejected; the disk is simply not blamed for it. Nothing escalates on its own
+from there, so **if that warning repeats, restart the EN** — a persistent
+descriptor shortage is a leak or a misconfigured `RLIMIT_NOFILE`, not something
+the node recovers from by itself.
+
 A disk that is merely **`Full`** reports `online: true` and triggers NOTHING —
 it stops taking new extents, keeps serving reads, and self-heals once free
 space is back above 5%. That distinction is what keeps a cluster running low on
