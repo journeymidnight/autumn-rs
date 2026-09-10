@@ -788,35 +788,66 @@
   (短批次会静默让文件尾部的符号没有向量——词法搜得到、向量搜不到，且无人报告)；
   漏改的三处文档(根 README、fetch_model.py、plan.md 把 hit@1 误写成 nDCG@10)已补。
 
-### BUG-SPLIT-STUCK-RETRY — 一次没做完物理分离的 split，让策略永远重试一个不可能成功的动作
-- **Trigger** (2026-09-09，用户看运维面板): 「一直在gc，gc生成了新的replicat extent，
-  然后又要EC，是不是有问题？」——现象是真的，但机制不是 GC↔EC 的环。
-- **实测到的事实**:
-  - part 168 与 part 204 **共用同一对 stream**(`log_stream_id=169`、`row_stream_id=190`，
-    `info --full` 读出)。它们是一次 split 的父子，**逻辑上切开、物理上尚未分离**。
-  - `split 168` **每个策略周期都被拒**：`cannot split: partition has overlapping keys`。
-    而 168 已 50 GiB、超过 `size>53687091200` 的阈值 —— 切不开就只会继续长，
-    于是建议每周期重发、每周期被拒，日志里排着一列相同的 refused。
-  - 两者上报的 `gc_debt_bytes` **完全相同(15371 MiB)**；part 144 报的 5727 MiB 又与
-    数小时前 168 报的数值相同。
-  - GC 本身**是正常的**，不是这个问题的原因：PS 日志有 `GC: punched extent 156, moved
-    1072 entries`、`punched extent 187, moved 0 entries`，没有失败也没有冷却跳过；
-    part 204 在几分钟内从 52.0 GB 降到 36.0 GB。EC 转换也在正常进行(extent 172、200)。
-- **推断(未逐行追代码)**: `gc_debt_bytes` 是 PS **按分区**上报的 sealed-extent 死字节
-  (`policy.rs:279`、`background.rs:1030` 的 "refresh gc_debt_bytes from the sealed-only
-  discards")。父子共用 stream 时两个分区线程扫的是同一批 sealed extent，于是同一份垃圾
-  被各算一遍 —— 与观测到的"数值完全相同"一致。相比之下 `est_live` 的 sealed 求和是
-  **dedup 过**的(同一段注释写明)，所以这条不对称看起来是遗漏而非有意。
-- **Scope**(未实现，两条独立):
-  1. 策略应当认识"这个 split 现在不可能成功"这个状态并退避，而不是每周期照发。最省事的
-     做法是把 `FailedPrecondition: overlapping keys` 记进和 GC 失败同形的冷却表；更好的
-     做法是发之前就问一次分区是否还与孩子重叠。
-  2. `gc_debt_bytes` 在共享 stream 的父子对上应当 dedup，与 `est_live` 的处理对齐；
-     否则一份垃圾会把建议同时推到两个分区上，运维看到的债务是真实值的两倍。
-- **Acceptance**: 一个物理分离未完成的父子对上，`auto-policy` 的 recent actions 里不再
-  出现连续的 `split ... refused`；两个分区报告的 `gc_debt_bytes` 之和不超过共享 stream 的
-  实际死字节。
-- **Status**: `passes: false` (2026-09-09) — 仅立账，未实现。**不阻塞任何东西**：GC 在回收、
-  EC 在转换、数据没有风险；代价是运维面板上一条永不成功的重试和一个翻倍的债务读数。
-  推动分离的手段是 compaction(最近 17、164 都 compact 成功过)，需要时可对 168/204
-  各发一次 `autumn-op compact`。
+### BUG-GC-ADVISORY-VS-SELECTION — 建议按绝对死字节，回收按死亡比例，两套判据对不上
+- **Trigger** (2026-09-09，用户看运维面板): 「一直在gc」「我怀疑是punch的洞的那个数字算错了？
+  导致老让启动gc」。方向对了——不是算错，是**两个判据不是同一个**。
+- **实测到的机制**(数字全部读自 `info --full` 与 PS 日志):
+  - 建议触发按**绝对值**：`gc_debt_bytes > gc_debt_high`(默认 1 GiB，`policy.rs:735`)。
+  - GC 选取按**比例**：`discard_bytes / sealed_length > effective_ratio`(默认 **0.4**，
+    `background.rs:1105`)。
+  - part 168/204 上真实的两个 extent：
+
+    | extent | sealed_length | dead | ratio |
+    |---|---|---|---|
+    | 190 | 16.00 GiB | 3.12 GiB | **0.195** |
+    | 169 | 15.25 GiB | 0.43 GiB | **0.028** |
+
+    两者都远低于 0.4 → 永远挑不中 → GC 每次都报 `no eligible extents to reclaim`；
+    而每分区 3.6 GiB 的绝对债务远超 1 GiB → 建议每 5 分钟重发。**一个永不收敛的循环。**
+  - 不是 replay-floor 保护：三台 PS 的日志里 `protected extent` **零条**，`holes` 在到达
+    那道保护之前就已经是空的。
+  - GC 本身正常：`GC: punched extent 156, moved 1072 entries`、`punched extent 187,
+    moved 0 entries`，没有失败也没有冷却跳过。
+- **附带的双重计数**: 168 与 204 是一次 CoW split 的父子，**共享 6 个 extent**
+  (22,169,172,188,190,200)，两个分区各自把同一份 3.6 GiB 报了一遍。运维看到的债务是真实值
+  的两倍，同一份垃圾把建议推到两个分区上，第二次 GC 必然空转。
+  (`partition_sealed_sums` 的 dedup 只在**分区内**的三条 stream 之间，跨分区没有 dedup。)
+- **Scope**(未实现):
+  1. 两套判据要对齐。合理的方向是让选取也认绝对值——一个 16 GiB extent 上的 3 GiB 死字节
+     值得回收，即使只占 19%；或者反过来让建议也认比例，但那会让真实的大块垃圾无人问津。
+     **倾向前者**：加一条 "dead_bytes > X 也算合格"的或条件，X 与 `gc_debt_high` 同源。
+  2. 共享 extent 的父子对上 `gc_debt_bytes` 要 dedup，或至少一组只发一次建议。
+- **Acceptance**: 一个 dead 3 GiB / size 16 GiB 的 extent 在默认配置下会被 GC 选中并回收；
+  共享 extent 的两个分区报告的债务之和不超过实际死字节。
+- **Status**: `passes: false` (2026-09-09) — 已定位到根因，未实现。不阻塞任何东西：数据没有
+  风险，代价是一条永不收敛的建议循环和翻倍的债务读数。
+
+  **订正**(2026-09-09)：本条最初记作 `BUG-SPLIT-STUCK-RETRY`，把机制写成"父子共用同一对
+  stream"。**那是错的**——我当时的脚本把字段列表截断在前 8 个，误把 `discards` 里的
+  extent id 当成了 stream id。实际每个分区的 stream 都是独立的(168 是 165/166/167，
+  204 是 201/202/203)，共享的是 **extent**。split 被拒是另一回事，见
+  `F-SPLIT-NEEDS-COMPACT`。
+
+### F-SPLIT-NEEDS-COMPACT — split 前需要先 compact，而策略与面板都不知道这件事
+- **Trigger** (2026-09-09，用户): 「split前要compact，dashboard或者policy要知道」。
+- **实测到的现象**: `auto-policy` 的 recent actions 里排着一列相同的拒绝：
+  `[refused] autumn-op split 168: rpc error (FailedPrecondition): cannot split: partition
+  has overlapping keys`。策略每个周期发一次、每次被拒。part 168 已 50 GiB、超过
+  `size>53687091200` 的阈值，切不开就只会继续长。
+- **为什么它不会自己好**: 拒绝来自 PS 侧的 `part.borrow().has_overlap.get() != 0`
+  (`rpc_handlers.rs:1490`)。重叠是一次 CoW split 的遗留——父子共享 extent
+  (168 与 204 共享 22,169,172,188,190,200 六个)，要靠 compaction 把各自的数据重写进
+  自己的 extent 才会消失。**而策略的冷却 `last_op_at` 只在真的产出了两个孩子之后才盖章**
+  (`rpc_handlers.rs:3686`)，被拒的 split 根本不进冷却，所以每周期照发。
+- **Scope**(未实现，三条按性价比排序):
+  1. **策略在发 split 前先发 compact**。它已经会发 major-compact 建议，缺的是
+     "这个分区想切但重叠着 → 先 compact"这条因果。
+  2. **被拒的 split 要进冷却**。最省事的做法是在拒绝路径上也盖 `last_op_at`；更准的做法是
+     发之前就问一次是否重叠(manager 手上有 `state.streams` 的 extent 集合，求交即可，
+     不需要动 wire)。
+  3. **面板要说人话**。现在只显示一条 `FailedPrecondition: overlapping keys`，读者无从知道
+     该做什么。应当显示"等待物理分离；先 compact"并给出那条命令。
+- **Acceptance**: 一个重叠未消的分区上，`auto-policy` 的 recent actions 不再出现连续的
+  `split ... refused`；面板对该分区显示的是"需要先 compact"而不是一条裸错误。
+- **Status**: `passes: false` (2026-09-09) — 仅立账，未实现。手工推动的办法是对两个分区
+  各发一次 `autumn-op compact`(最近 17、164 都 compact 成功过)。
