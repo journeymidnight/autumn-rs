@@ -7595,6 +7595,219 @@ mod tests {
         })
     }
 
+    /// Every exit from `apply_recovery_done` reaches the ledger state it owes.
+    ///
+    /// `note_recovery_dispatch` opens one entry per extent and only ever REUSES
+    /// an active one, so an entry left RUNNING by an exit that neither applies
+    /// the rebuild nor leaves anyone to report it later is never written again
+    /// — `ops status` answers "running" for a recovery that ended, for as long
+    /// as the entry survives the ring. The 30-minute TTL backstop does not
+    /// cover it: that reaps only the PS-executed kinds, deliberately, because
+    /// recovery legitimately retries while the repair is outstanding.
+    ///
+    /// Chaos found this: a round ended with a recovery op still ACTIVE after
+    /// quiesce while the extent it named was healthy and every marker released.
+    ///
+    /// Each case asserts the exit's OWN reason text and its `Result` variant,
+    /// not just the state. Four exits end FAILED, so a state-only assertion
+    /// passes even when three of them were never reached — if the pinned marker
+    /// silently failed to take, cases 3-5 would all fall into `ReleasedAttempt`
+    /// and still be FAILED. The reason text is what tells them apart.
+    ///
+    /// The last two cases are the exits that KEEP their entry on purpose: both
+    /// leave a live marker whose own executor still reports, and closing either
+    /// would end a recovery that is genuinely still running.
+    #[test]
+    fn every_apply_recovery_done_exit_leaves_the_ledger_it_owes() {
+        use autumn_rpc::manager_rpc::{
+            OP_KIND_RECOVERY, OP_STATE_FAILED, OP_STATE_RUNNING, OP_STATE_SUCCEEDED,
+        };
+
+        fn extent_with(extent_id: u64, replicates: Vec<u64>, avali: u32) -> MgrExtentInfo {
+            MgrExtentInfo {
+                extent_id,
+                replicates,
+                parity: vec![],
+                eversion: 3,
+                refs: 1,
+                vp_table_refs: 0,
+                sealed_length: 100_000,
+                sealed: true,
+                avali,
+                replicate_disks: vec![10, 11, 12],
+                parity_disks: vec![],
+                ec_converted: false,
+            }
+        }
+
+        /// What the marker holds when the completion arrives.
+        enum Pin {
+            None,
+            /// Pinned to exactly this completion — the `Apply` verdict.
+            Same,
+            /// Pinned to a different assignment.
+            Other,
+            /// An EC conversion holds the extent's ledger slot.
+            EcConvert,
+        }
+
+        // (name, layout — None = extent gone, else (replicates, avali);
+        //  marker, expected state, a substring only THIS exit writes, expects Err)
+        let cases: Vec<(&str, Option<(Vec<u64>, u32)>, Pin, u8, &str, bool)> = vec![
+            (
+                "the rebuild already landed and this is the re-send echoing back",
+                Some((vec![9, 3, 5], 0b111)),
+                Pin::None,
+                OP_STATE_SUCCEEDED,
+                "already rebuilt",
+                false,
+            ),
+            (
+                "an attempt whose marker was released while its executor kept working",
+                Some((vec![1, 3, 5], 0b111)),
+                Pin::None,
+                OP_STATE_FAILED,
+                "marker was released",
+                false,
+            ),
+            (
+                "a conversion moved the reporter to another slot mid-recovery",
+                Some((vec![9, 1, 5], 0b111)),
+                Pin::Same,
+                OP_STATE_FAILED,
+                "already in extent node list at a different slot",
+                true,
+            ),
+            (
+                "the slot this recovery targeted is no longer in the extent",
+                Some((vec![2, 3, 5], 0b111)),
+                Pin::Same,
+                OP_STATE_FAILED,
+                "replace_id 1 not in extent",
+                true,
+            ),
+            (
+                "the extent was deleted before the rebuild landed",
+                None,
+                Pin::Same,
+                OP_STATE_FAILED,
+                "removed from manager state",
+                false,
+            ),
+            (
+                "KEEP: an EC conversion in flight defers the apply, marker retained",
+                Some((vec![1, 3, 5], 0b111)),
+                Pin::EcConvert,
+                OP_STATE_RUNNING,
+                "rebuilding slot",
+                true,
+            ),
+            (
+                "KEEP: the marker names a different assignment, whose executor still reports",
+                Some((vec![1, 3, 5], 0b111)),
+                Pin::Other,
+                OP_STATE_RUNNING,
+                "rebuilding slot",
+                false,
+            ),
+            (
+                // The entry is keyed by EXTENT, not by slot, so the active one
+                // may belong to a second slot that failed dispatch in this same
+                // window and carries its own failure reason. Closing it as
+                // SUCCEEDED would report a repair that never happened and erase
+                // why. A dark slot is the signal that work is still owed.
+                "KEEP: an echo must not claim success while another slot is still dark",
+                Some((vec![9, 3, 5], 0b011)),
+                Pin::None,
+                OP_STATE_RUNNING,
+                "rebuilding slot",
+                false,
+            ),
+        ];
+
+        // Collected, not asserted per case: a bare assert stops at the first
+        // failure, and "which of the exits are wrong" is the whole answer.
+        let mut wrong: Vec<String> = Vec::new();
+        for (i, (name, layout, pin, expect_state, expect_reason, expect_err)) in
+            cases.into_iter().enumerate()
+        {
+            let verdict = run(async move {
+                let m = AutumnManager::new();
+                let extent_id = 700 + i as u64;
+                let task = RecoveryTask {
+                    extent_id,
+                    replace_id: 1,
+                    node_id: 9,
+                    start_time: 0,
+                };
+                if let Some((replicates, avali)) = layout {
+                    m.store
+                        .inner
+                        .borrow_mut()
+                        .extents
+                        .insert(extent_id, extent_with(extent_id, replicates, avali));
+                }
+                match pin {
+                    Pin::None => {}
+                    Pin::Same => m._test_mark_recovery_inflight(extent_id, task.clone()),
+                    Pin::Other => m._test_mark_recovery_inflight(
+                        extent_id,
+                        RecoveryTask {
+                            node_id: 11,
+                            ..task.clone()
+                        },
+                    ),
+                    Pin::EcConvert => m._test_mark_ec_inflight(extent_id),
+                }
+                // The dispatch that opened the entry, exactly as the dispatch
+                // loop opens it.
+                let (now_s, now_ms) = AutumnManager::now_s_ms();
+                m.ops
+                    .borrow_mut()
+                    .note_recovery_dispatch(extent_id, 0, task.node_id, now_s, now_ms);
+
+                let got = m
+                    .apply_recovery_done(RecoveryTaskDone {
+                        task,
+                        ready_disk_id: 77,
+                    })
+                    .await;
+                let got_err = got.is_err();
+
+                let rec = m
+                    .ops
+                    .borrow()
+                    .query(&OpQueryReq {
+                        kind_filter: OP_KIND_RECOVERY,
+                        ..Default::default()
+                    })
+                    .into_iter()
+                    .find(|e| e.secondary_id == extent_id)
+                    .expect("the dispatch opened an entry for this extent");
+
+                let mut bad = Vec::new();
+                if rec.state != expect_state {
+                    bad.push(format!("state={} want {expect_state}", rec.state));
+                }
+                // Message OR error: a closed-as-success exit writes its reason
+                // into `message`, an abandoned one into `error`.
+                let reason = format!("{} {}", rec.message, rec.error);
+                if !reason.contains(expect_reason) {
+                    bad.push(format!("reason {reason:?} lacks {expect_reason:?}"));
+                }
+                if got_err != expect_err {
+                    bad.push(format!("returned err={got_err} want {expect_err}"));
+                }
+                (!bad.is_empty()).then(|| format!("{name}: {}", bad.join("; ")))
+            });
+            wrong.extend(verdict);
+        }
+        assert!(
+            wrong.is_empty(),
+            "these exits did not leave the ledger they owe: {wrong:#?}"
+        );
+    }
+
     // ── eversion lost-update during EC conversion await ────────────────────
 
     fn make_ec_extent(extent_id: u64, eversion: u64) -> MgrExtentInfo {

@@ -743,6 +743,25 @@ impl AutumnManager {
         self.commit_extent_inflight_release(extent_id);
     }
 
+    /// Drive this extent's recovery ledger entry to a terminal FAILED state.
+    ///
+    /// `note_recovery_dispatch` opens one entry per extent on the way out and
+    /// only ever REUSES an active one, so an entry left RUNNING by an exit that
+    /// neither applies the rebuild nor leaves anyone to report it later is never
+    /// written again — `ops status` answers "running" for a recovery that ended,
+    /// forever. The TTL backstop does not cover this: it reaps only the
+    /// PS-executed kinds, by design, because recovery legitimately retries for
+    /// as long as the repair is outstanding.
+    ///
+    /// A no-op when no entry is active, which is the common case: the exits that
+    /// call this are reached far more often than a dispatch precedes them.
+    fn abandon_recovery_entry(&self, extent_id: u64, reason: String) {
+        let (now_s, _) = Self::now_s_ms();
+        self.ops
+            .borrow_mut()
+            .abandon_recovery(extent_id, reason, now_s);
+    }
+
     /// Read the layout and classify a completion against it.
     ///
     /// Separate from `apply_recovery_done` so the WIRING is testable: which
@@ -877,6 +896,46 @@ impl AutumnManager {
                     "recovery completion re-reported after its rebuild was already applied \
                      (a standing-instruction re-send the executor adopted); ignoring — benign"
                 );
+                // This slot's repair IS committed, so the entry a dispatch
+                // opened before the completion arrived closes as the success it
+                // describes rather than as an abandoned attempt.
+                //
+                // But ONLY when the extent has nothing left to repair. The
+                // ledger keys entries by extent, not by slot, so the active
+                // entry here need not be about this slot at all: a second slot
+                // failing dispatch in the same window opens one carrying its own
+                // failure reason (`record_recovery_failure`, which creates an
+                // entry with no marker). Writing SUCCEEDED over that would
+                // report a repair that did not happen and erase why it did not.
+                // A dark slot means the dispatch loop still owes work and will
+                // refresh the entry itself.
+                let all_slots_available = {
+                    let s = self.store.inner.borrow();
+                    match s.extents.get(&task.extent_id) {
+                        Some(ex) => {
+                            let slots = Self::extent_nodes(ex).len();
+                            let full = if slots >= 32 {
+                                u32::MAX
+                            } else {
+                                (1u32 << slots) - 1
+                            };
+                            ex.avali & full == full
+                        }
+                        // No extent to repair: nothing is outstanding.
+                        None => true,
+                    }
+                };
+                if all_slots_available {
+                    let (now_s, _) = Self::now_s_ms();
+                    self.ops.borrow_mut().complete_recovery(
+                        task.extent_id,
+                        format!(
+                            "slot on node {} was already rebuilt; duplicate completion",
+                            task.node_id
+                        ),
+                        now_s,
+                    );
+                }
                 return Ok(());
             }
             CompletionVerdict::ReleasedAttempt => {
@@ -892,6 +951,12 @@ impl AutumnManager {
                      rebuild was applied — REFUSING (an attempt whose marker was released \
                      while its executor kept working; applying it could swap the slot onto \
                      a copy the current layout does not describe)"
+                );
+                self.abandon_recovery_entry(
+                    task.extent_id,
+                    "attempt refused: its marker was released and nothing shows the rebuild \
+                     applied"
+                        .to_string(),
                 );
                 return Ok(());
             }
@@ -940,11 +1005,13 @@ impl AutumnManager {
             // delete dropped (the backward-compat dual-key path lived in
             // only).
             self.release_recovery_marker_best_effort(task.extent_id).await;
-            return Err(AppError::Precondition(format!(
+            let reason = format!(
                 "recovery target {} for extent {} already in extent node list at a different slot; \
                  likely EC conversion completed during recovery — discarding stale apply",
                 task.node_id, task.extent_id
-            )));
+            );
+            self.abandon_recovery_entry(task.extent_id, reason.clone());
+            return Err(AppError::Precondition(reason));
         }
 
         // layout_changed == None ⇒ the extent exists but
@@ -958,10 +1025,9 @@ impl AutumnManager {
         // for that window. Release now, then return.
         if layout_changed.is_none() {
             self.release_recovery_marker_best_effort(task.extent_id).await;
-            return Err(AppError::Precondition(format!(
-                "replace_id {} not in extent {}",
-                task.replace_id, task.extent_id
-            )));
+            let reason = format!("replace_id {} not in extent {}", task.replace_id, task.extent_id);
+            self.abandon_recovery_entry(task.extent_id, reason.clone());
+            return Err(AppError::Precondition(reason));
         }
 
         // etcd-first: compute updated_extent from a clone under
@@ -1045,6 +1111,10 @@ impl AutumnManager {
                     }])
                     .await;
             }
+            self.abandon_recovery_entry(
+                task.extent_id,
+                "the extent was removed from manager state before the rebuild landed".to_string(),
+            );
             return Ok(());
         };
 
