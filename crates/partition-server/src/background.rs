@@ -1030,10 +1030,15 @@ pub(crate) async fn background_maintenance_loop(
                 // refresh gc_debt_bytes from the sealed-only discards.
                 // `tick_discards` was computed once before the gate (and already
                 // yielded open_tail_dead_bytes); filter it to sealed extents in
-                // place so gc_debt = Σ reclaimable bytes on still-live SEALED
-                // log_stream extents — what an operator calls "GC debt". The open
-                // tail's dead bytes were counted above (as WAL debt), so the two
-                // gauges stay disjoint (no double-count).
+                // place so gc_debt covers still-live SEALED log_stream extents.
+                // The open tail's dead bytes were counted above (as WAL debt),
+                // so the two gauges stay disjoint (no double-count).
+                //
+                // This is the CONSERVATIVE value — every dead byte, collectable
+                // or not. The Auto arm below narrows it to what the ratio gate
+                // would actually let GC rewrite, once it has resolved the extent
+                // sizes it needs for selection anyway. This store stands for the
+                // paths that never reach that arm.
                 valid_discard(&mut tick_discards, sealed_extents);
                 let gc_debt: u64 = tick_discards.values().map(|v| (*v).max(0) as u64).sum();
                 metrics
@@ -1129,6 +1134,11 @@ pub(crate) async fn background_maintenance_loop(
                         // sealed extents at the tail of the list starve forever.
                         let mut nonempty_selected = 0usize;
                         let mut empty_selected = 0usize;
+                        // Sizes this pass actually resolved. Used after the loop
+                        // to re-derive `gc_debt_bytes` as bytes policy would
+                        // COME FOR, not merely bytes that are dead — these are
+                        // the same fetches selection needs, so it costs nothing.
+                        let mut resolved_len: HashMap<u64, u64> = HashMap::new();
                         for eid in candidates {
                             if nonempty_selected >= MAX_GC_ONCE
                                 && empty_selected >= MAX_GC_EMPTY_ONCE
@@ -1144,6 +1154,7 @@ pub(crate) async fn background_maintenance_loop(
                                     Some(l) => l,
                                     None => continue,
                                 };
+                            resolved_len.insert(eid, sealed_length);
                             if sealed_length == 0 {
                                 // a CONFIRMED sealed-empty extent — no committed
                                 // data to rewrite, just punch. `run_gc` with
@@ -1180,6 +1191,26 @@ pub(crate) async fn background_maintenance_loop(
                                 nonempty_selected += 1;
                             }
                         }
+
+                        // Re-derive the operator-facing debt as what GC would
+                        // actually reclaim. The field's own doc says "Σ
+                        // reclaimable bytes"; counting every dead byte made it
+                        // say otherwise, and the advisory believed it — firing
+                        // on 3 GiB of garbage sitting in a 16 GiB extent that
+                        // the ratio gate will never let GC rewrite, every
+                        // cooldown, forever, while GC answered "no eligible
+                        // extents to reclaim" each time.
+                        //
+                        // Unexamined extents keep their raw dead bytes: the
+                        // budget stopped the scan, so their collectability is
+                        // unknown and under-reporting would silence an advisory
+                        // for work that does exist.
+                        let collectable =
+                            collectable_debt(&discards, &resolved_len, effective_ratio);
+                        metrics
+                            .gc_debt_bytes
+                            .store(collectable, std::sync::atomic::Ordering::Relaxed);
+
                         holes
                     }
                 };
@@ -2688,6 +2719,44 @@ pub(crate) fn get_discards(readers: &[Arc<SstReader>]) -> HashMap<u64, i64> {
         }
     }
     out
+}
+
+/// Dead bytes GC would actually come for, given the ratio gate it selects by.
+///
+/// `gc_debt_bytes` is what the auto-policy fires on, and its own doc calls it
+/// "Σ reclaimable bytes". Summing every dead byte made it mean something else:
+/// on a 16 GiB extent holding 3.12 GiB of garbage — ratio 0.195 against a 0.4
+/// gate, or 0.2 once the stream-debt relief halves it — the advisory fired
+/// every cooldown and GC answered "no eligible extents to reclaim" every time.
+/// The garbage was real; the promise to collect it was not.
+///
+/// `resolved_len` holds only the extents this pass looked up. One the scan
+/// never reached keeps its raw dead bytes: its collectability is unknown, and
+/// guessing zero would silence an advisory for work that does exist.
+pub(crate) fn collectable_debt(
+    discards: &HashMap<u64, i64>,
+    resolved_len: &HashMap<u64, u64>,
+    effective_ratio: f64,
+) -> u64 {
+    discards
+        .iter()
+        .map(|(eid, dead)| {
+            let dead = (*dead).max(0) as u64;
+            match resolved_len.get(eid) {
+                Some(&len) if len > 0 => {
+                    if dead as f64 / len as f64 > effective_ratio {
+                        dead
+                    } else {
+                        0
+                    }
+                }
+                // Sealed-empty: `run_gc` skips the rewrite and punches it, so
+                // whatever it holds is free to reclaim.
+                Some(_) => dead,
+                None => dead,
+            }
+        })
+        .sum()
 }
 
 pub(crate) fn valid_discard(discards: &mut HashMap<u64, i64>, extent_ids: &[u64]) {
@@ -4845,5 +4914,57 @@ mod compaction_truncate_tests {
         let (picked, truncate_id) = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
         assert_eq!(picked.len(), 3, "all three head tables should compact");
         assert_eq!(truncate_id, 11, "head extent is drained, so it can go");
+    }
+}
+
+#[cfg(test)]
+mod collectable_debt_tests {
+    use super::collectable_debt;
+    use std::collections::HashMap;
+
+    /// The live case this was written for: extent 190 on the cluster held
+    /// 3.12 GiB dead inside 16 GiB — ratio 0.195, under both the 0.4 gate and
+    /// the 0.2 it becomes when stream-debt relief halves it. GC will not
+    /// rewrite 12.9 GiB of live data to reclaim that, so the debt gauge must
+    /// not report it as reclaimable and set the advisory asking every cooldown.
+    #[test]
+    fn garbage_below_the_ratio_gate_is_not_reported_as_debt() {
+        let dead = 3_351_453_696i64;
+        let len = 17_184_065_911u64;
+        let discards = HashMap::from([(190u64, dead)]);
+        let resolved = HashMap::from([(190u64, len)]);
+
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4), 0);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.2), 0, "0.195 < 0.2");
+        // Relax the gate below the extent's own ratio and it counts again.
+        assert_eq!(collectable_debt(&discards, &resolved, 0.1), dead as u64);
+    }
+
+    /// An extent the scan never reached keeps its bytes. Reporting zero for it
+    /// would silence the advisory for work that is there — the opposite failure,
+    /// and the worse one, since nothing else would raise it.
+    #[test]
+    fn an_extent_the_scan_never_reached_still_counts() {
+        let discards = HashMap::from([(1u64, 900i64), (2u64, 100i64)]);
+        let resolved = HashMap::from([(1u64, 1000u64)]); // 2 was never looked up
+        // 900/1000 = 0.9 > 0.4 counts; 2 is unknown so it counts too.
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4), 1000);
+    }
+
+    /// A sealed-empty extent is punched outright — no rewrite, no ratio.
+    #[test]
+    fn a_sealed_empty_extent_is_free_to_reclaim() {
+        let discards = HashMap::from([(7u64, 42i64)]);
+        let resolved = HashMap::from([(7u64, 0u64)]);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4), 42);
+    }
+
+    /// Negative discard entries are noise from concurrent accounting, not
+    /// credit against other extents' garbage.
+    #[test]
+    fn a_negative_discard_does_not_subtract_from_the_total() {
+        let discards = HashMap::from([(1u64, 900i64), (2u64, -500i64)]);
+        let resolved = HashMap::from([(1u64, 1000u64), (2u64, 1000u64)]);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4), 900);
     }
 }
