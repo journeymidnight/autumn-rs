@@ -114,6 +114,12 @@ struct ChaosConfig {
     ec_k: u32,
     ec_m: u32,
     num_ens: u32,
+    /// Disks per extent node. More than one so the nemesis loop reaches the
+    /// code that treats disks separately — `choose_disk`'s placement and
+    /// tie-breaking, and reloading extents from several disks after a restart.
+    /// With one disk per node none of that is reachable. Disk HEALTH still is
+    /// not: nothing here faults a disk (see `data_dirs`).
+    disks_per_en: u32,
     seed: u64,
     /// Comma-separated subset of action names to enable. Empty = all.
     /// Names: split,merge,ec,fence,flush,compact,gc,forcegc,kill,killfence,partition,latency
@@ -193,6 +199,7 @@ impl ChaosConfig {
             ec_k,
             ec_m,
             num_ens,
+            disks_per_en: env_u32("AUTUMN_CHAOS_DISKS_PER_EN", 2).max(1),
             seed,
             actions,
             decommission,
@@ -291,7 +298,19 @@ struct EnProcess {
     /// Toxiproxy proxy name (stable across kill/restart). Used by
     /// nemesis actions to disable/poison this EN's network link.
     proxy_name: String,
-    data_dir: PathBuf,
+    /// Every directory this EN was formatted with — one per DISK.
+    ///
+    /// A list, not one path, because an extent node is a multi-disk thing and
+    /// a harness that gives it one disk cannot reach the code that treats disks
+    /// separately at all: which disk a new extent lands on, and reloading
+    /// extents from several disks on restart.
+    ///
+    /// It does NOT make disk HEALTH reachable. These are subdirectories of one
+    /// tempdir on one filesystem, so every disk reports the same free space and
+    /// stays Online; nothing here faults one. `Full` / `Faulted` and the
+    /// rebuild of a single disk's replicas need a fault injector this harness
+    /// does not have yet.
+    data_dirs: Vec<PathBuf>,
     /// Node-id assigned by the manager after `autumn-op format`'s
     /// `register_node` call. Stable across kill/restart (sentinel files
     /// carry it).
@@ -335,7 +354,12 @@ impl EnProcess {
                 "--port",
                 &self.port.to_string(),
                 "--data",
-                self.data_dir.to_str().unwrap(),
+                &self
+                    .data_dirs
+                    .iter()
+                    .map(|d| d.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(","),
                 "--manager",
                 &manager_addr.to_string(),
                 "--listen",
@@ -382,7 +406,7 @@ fn bootstrap_en(
     proxy_port: u16,
     proxy_name: String,
     toxi: &ToxiproxyCli,
-    data_dir: PathBuf,
+    data_dirs: Vec<PathBuf>,
     log_dir: &Path,
 ) -> EnProcess {
     // 1. Create the toxiproxy proxy now, so format's advertise address
@@ -424,27 +448,29 @@ fn bootstrap_en(
         .append(true)
         .open(&format_log)
         .expect("open format log");
+    let mut format_args: Vec<String> = vec![
+        "--manager".into(),
+        manager_addr.to_string(),
+        "format".into(),
+    ];
+    format_args.extend(data_dirs.iter().map(|d| d.to_string_lossy().into_owned()));
     let status = Command::new(op_binary)
-        .args([
-            "--manager",
-            &manager_addr.to_string(),
-            "format",
-            data_dir.to_str().unwrap(),
-        ])
+        .args(&format_args)
         .stdout(Stdio::from(log_file.try_clone().unwrap()))
         .stderr(Stdio::from(log_file))
         .status()
         .expect("run autumn-op format");
     assert!(
         status.success(),
-        "autumn-op format failed for {} — see {}",
-        data_dir.display(),
+        "autumn-op format failed for {:?} — see {}",
+        data_dirs,
         format_log.display()
     );
 
     // 3. Read `node_id` from the sentinel file. Path:
-    //    <data_dir>/node_id  (raw u64 decimal text).
-    let nid_path = data_dir.join("node_id");
+    //    <disk>/node_id  (raw u64 decimal text). `format` stamps the same id
+    //    into every dir it was handed, so any one of them answers.
+    let nid_path = data_dirs[0].join("node_id");
     let nid_str = std::fs::read_to_string(&nid_path).expect("read node_id sentinel after format");
     let node_id: u64 = nid_str.trim().parse().expect("parse node_id");
 
@@ -455,7 +481,7 @@ fn bootstrap_en(
         port,
         proxy_port,
         proxy_name,
-        data_dir,
+        data_dirs,
         node_id,
         log_path: en_log,
     };
@@ -897,14 +923,22 @@ struct NemesisCtx {
     /// count. And above zero it is not sufficient either — a counted extent can
     /// be occupied by a delete or a conversion, which dispatches nothing.
     fence_stranded_sealed: Cell<usize>,
-    /// `(extent_id, node_id, en_log)` this round deliberately rotted on disk.
+    /// Replicas this round deliberately rotted on disk.
     ///
     /// Held because the damage is INVISIBLE to everything else the harness
     /// checks: the file keeps its length and the extent keeps its eversion, so
     /// per-key reads pass by rotating to a clean replica and the accounting is
     /// untouched. Only a record of what was broken can ask whether it was
     /// noticed.
-    corrupted: RefCell<Vec<(u64, u64, PathBuf)>>,
+    corrupted: RefCell<Vec<RottedReplica>>,
+    /// The most sealed, replicated extents with a REACHABLE holder that this
+    /// round ever had to choose from.
+    ///
+    /// Separates the two reasons the rot nemesis can decline: zero means it
+    /// never once had a usable target (the round sealed nothing, or every
+    /// holder was down when it looked), non-zero with nothing injected means a
+    /// usable target existed and no node ever described it.
+    rot_shape_seen: Cell<usize>,
     nemesis_events: Arc<AtomicU64>,
     nemesis_errors: Arc<AtomicU64>,
     /// Per action: how many times it was chosen, and how many times it acted.
@@ -1417,8 +1451,8 @@ async fn do_network_partition(ctx: &NemesisCtx) -> Result<String, String> {
 /// sit at rest), an EC shard repairs through a different path, and rotting the
 /// only copy tests nothing but whether the cluster can lose data.
 async fn do_corrupt_replica(ctx: &NemesisCtx) -> Result<String, String> {
-    let mut candidates = rottable_replicas(ctx).await;
-    if candidates.is_empty() {
+    let mut targets = rottable_replicas(ctx).await;
+    if targets.ready.is_empty() {
         // Nothing sealed yet — so SEAL something, through the same path the
         // manager's fence-drain uses. Declining instead would make this
         // nemesis fire only in rounds that happened to seal an extent for
@@ -1435,21 +1469,29 @@ async fn do_corrupt_replica(ctx: &NemesisCtx) -> Result<String, String> {
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 compio::time::sleep(Duration::from_secs(2)).await;
-                candidates = rottable_replicas(ctx).await;
-                if !candidates.is_empty() || Instant::now() >= deadline {
+                targets = rottable_replicas(ctx).await;
+                if !targets.ready.is_empty() || Instant::now() >= deadline {
                     break;
                 }
             }
         }
     }
+    // What the cluster had to offer, for the coverage verdict at the end of the
+    // round. Max, not last: a later tick may run while the cluster is mid-split
+    // with nothing sealed, and that must not erase what an earlier tick saw.
+    ctx.rot_shape_seen
+        .set(ctx.rot_shape_seen.get().max(targets.reachable));
     // At most ONE rotted replica per extent, ever. Two is not twice the
     // coverage, it is a different and much worse experiment: RF=3 with two
     // damaged copies is one isolation away from an extent nobody can read, and
     // the harness would be manufacturing data loss rather than a repairable
     // fault. Observed rotting all three copies of one extent in a single round.
-    let spent: Vec<u64> = ctx.corrupted.borrow().iter().map(|(e, _, _)| *e).collect();
-    let Some((extent_id, node_id, path)) =
-        candidates.iter().find(|(eid, _, _)| !spent.contains(eid)).cloned()
+    let spent: Vec<u64> = ctx.corrupted.borrow().iter().map(|r| r.extent_id).collect();
+    let Some((extent_id, node_id, path)) = targets
+        .ready
+        .iter()
+        .find(|(eid, _, _)| !spent.contains(eid))
+        .cloned()
     else {
         return Err(
             "no sealed replicated extent whose copies are all still clean".into(),
@@ -1491,9 +1533,13 @@ async fn do_corrupt_replica(ctx: &NemesisCtx) -> Result<String, String> {
         .find(|e| e.node_id == node_id)
         .map(|e| e.log_path.clone())
         .ok_or_else(|| format!("no EN process for node {node_id}"))?;
-    ctx.corrupted
-        .borrow_mut()
-        .push((extent_id, node_id, log_path));
+    ctx.corrupted.borrow_mut().push(RottedReplica {
+        extent_id,
+        node_id,
+        log_path,
+        dat_path: path.clone(),
+        rotted: buf.to_vec(),
+    });
     Ok(format!(
         "rotted {ROT_LEN} bytes at offset 0 of extent {extent_id} on node {node_id} \
          ({}) — no process was told",
@@ -1557,15 +1603,39 @@ async fn roll_open_tails(ctx: &NemesisCtx) -> u32 {
     rolled
 }
 
-/// `(extent_id, node_id, path)` triples that may be rotted right now.
-async fn rottable_replicas(ctx: &NemesisCtx) -> Vec<(u64, u64, PathBuf)> {
+/// What the cluster currently offers this nemesis.
+///
+/// Two numbers, because a decline has two very different causes and the round's
+/// verdict turns on which one it was: a cluster that sealed NOTHING is an
+/// unlucky round, while sealed extents that no node ever described is the
+/// product failing to harden its own content.
+struct RotTargets {
+    /// `(extent_id, node_id, path)` triples that may be rotted right now —
+    /// sealed, replicated, and the holder has already described the content.
+    ready: Vec<(u64, u64, PathBuf)>,
+    /// Extents of the right shape that ALSO have at least one holder this
+    /// nemesis could have used — alive, unfenced, unpartitioned — whether or
+    /// not that holder has described the content yet.
+    ///
+    /// Reachability is part of the count on purpose. Counting shape alone
+    /// blames the product for a round in which every replica of the one sealed
+    /// extent happened to be fenced or partitioned when the nemesis looked —
+    /// the same false accusation this file just had to remove from the rot
+    /// verifier.
+    reachable: usize,
+}
+
+async fn rottable_replicas(ctx: &NemesisCtx) -> RotTargets {
+    let mut targets = RotTargets {
+        ready: Vec::new(),
+        reachable: 0,
+    };
     let Ok(client) = autumn_etcd::EtcdClient::connect(&ctx.etcd_endpoint).await else {
-        return Vec::new();
+        return targets;
     };
     let Ok(resp) = client.get_prefix("extents/").await else {
-        return Vec::new();
+        return targets;
     };
-    let mut out = Vec::new();
     for kv in &resp.kvs {
         let Ok(ex) = rkyv_decode::<MgrExtentInfo>(&kv.value) else {
             continue;
@@ -1587,6 +1657,7 @@ async fn rottable_replicas(ctx: &NemesisCtx) -> Vec<(u64, u64, PathBuf)> {
         let fenced = ctx.fenced.borrow();
         let dead = ctx.dead.borrow();
         let partitioned = ctx.partitioned.borrow();
+        let mut usable_holder = false;
         for nid in &ex.replicates {
             let Some(en) = ens.iter().find(|e| e.node_id == *nid) else {
                 continue;
@@ -1598,31 +1669,52 @@ async fn rottable_replicas(ctx: &NemesisCtx) -> Vec<(u64, u64, PathBuf)> {
             {
                 continue;
             }
+            // A slot the manager has already darkened is not a usable target:
+            // its bytes are not what any read is served from, so neither the
+            // injection nor the digest that would catch it means anything.
+            let slot = ex
+                .replicates
+                .iter()
+                .position(|r| r == nid)
+                .expect("nid came from replicates");
+            if ex.avali & (1u32 << slot) == 0 {
+                continue;
+            }
+            usable_holder = true;
             // Only content this node has already DESCRIBED. Rot that lands
             // before the first digest is trust-on-first-use: the sweep records
             // the damaged bytes as truth and nothing can ever contradict them.
             // That is a documented property, not a defect, so asserting
             // detection on it would be asserting something impossible.
-            if let Some(path) = find_extent_dat(&en.data_dir, ex.extent_id) {
+            if let Some(path) = find_extent_dat(&en.data_dirs, ex.extent_id) {
                 if path.with_extension("ck").is_file() {
-                    out.push((ex.extent_id, *nid, path));
+                    targets.ready.push((ex.extent_id, *nid, path));
                 }
             }
         }
+        if usable_holder {
+            targets.reachable += 1;
+        }
     }
-    out
+    targets
 }
 
-/// The `.dat` for `extent_id` under an EN data dir, whichever hash subdir holds
-/// it. Walking beats recomputing the hash: the layout is the node's business
-/// and a harness that duplicates it silently stops finding files when it moves.
-fn find_extent_dat(data_dir: &Path, extent_id: u64) -> Option<PathBuf> {
+/// The `.dat` for `extent_id` on an EN, whichever DISK and whichever hash
+/// subdir holds it. Walking beats recomputing the hash: the layout is the
+/// node's business and a harness that duplicates it silently stops finding
+/// files when it moves. Which disk the extent landed on is likewise the node's
+/// choice, so every disk gets searched.
+fn find_extent_dat(data_dirs: &[PathBuf], extent_id: u64) -> Option<PathBuf> {
     let name = format!("extent-{extent_id}.dat");
-    let entries = std::fs::read_dir(data_dir).ok()?;
-    for e in entries.flatten() {
-        let candidate = e.path().join(&name);
-        if candidate.is_file() {
-            return Some(candidate);
+    for dir in data_dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let candidate = e.path().join(&name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -2159,7 +2251,77 @@ mod nemesis_budget_tests {
 /// Bounded-wait rather than instant, because detection is a background sweep on
 /// a byte budget and the contract is "within a bounded time", not "by the time
 /// the nemesis returns".
-async fn verify_injected_rot_was_found(corrupted: &[(u64, u64, PathBuf)]) -> Vec<String> {
+/// One replica the harness damaged, and enough to tell later whether the
+/// damage is still there.
+#[derive(Clone)]
+struct RottedReplica {
+    extent_id: u64,
+    node_id: u64,
+    /// Log of the node that owns the damaged copy — the only place the finding
+    /// can appear.
+    log_path: PathBuf,
+    /// The `.dat` written into, and the exact bytes written at offset 0.
+    dat_path: PathBuf,
+    rotted: Vec<u8>,
+}
+
+impl RottedReplica {
+    /// Are the bytes this harness wrote still on disk?
+    ///
+    /// False once the node deletes the extent (GC reclaimed it) or rebuilds it
+    /// (recovery overwrote it) — in both cases nothing damaged is left to find,
+    /// and demanding the scrub report it anyway is demanding a finding about
+    /// bytes that no longer exist.
+    fn still_damaged(&self) -> bool {
+        let Ok(mut f) = std::fs::File::open(&self.dat_path) else {
+            return false;
+        };
+        let mut buf = vec![0u8; self.rotted.len()];
+        use std::io::Read;
+        f.read_exact(&mut buf).is_ok() && buf == self.rotted
+    }
+}
+
+/// Does the layout still say this node serves those bytes?
+///
+/// The question that separates "the extent legitimately went away" from "a
+/// member's replica changed underneath a layout that still points at it".
+/// `still_damaged() == false` alone cannot tell them apart — a missing file, a
+/// short file and rewritten bytes all look identical — and calling every one of
+/// them benign is how a real silent-loss shape would slip past as a note.
+async fn layout_still_serves(ctx: &NemesisCtx, r: &RottedReplica) -> bool {
+    let Ok(client) = autumn_etcd::EtcdClient::connect(&ctx.etcd_endpoint).await else {
+        // Cannot tell. Say "no": an unreachable etcd is the harness's problem,
+        // and manufacturing a data-loss accusation out of it is the false
+        // positive this whole rewrite exists to remove.
+        return false;
+    };
+    let Ok(resp) = client.get_prefix(&format!("extents/{}", r.extent_id)).await else {
+        return false;
+    };
+    for kv in &resp.kvs {
+        let Ok(ex) = rkyv_decode::<MgrExtentInfo>(&kv.value) else {
+            continue;
+        };
+        if ex.extent_id != r.extent_id {
+            continue;
+        }
+        let Some(slot) = ex.replicates.iter().position(|n| *n == r.node_id) else {
+            // No longer a holder: whatever is on that disk is an orphan nobody
+            // reads.
+            return false;
+        };
+        // A darkened slot IS the system having noticed — the layout has already
+        // stopped serving it and a rebuild is owed.
+        return ex.avali & (1u32 << slot) != 0;
+    }
+    false
+}
+
+async fn verify_injected_rot_was_found(
+    ctx: &NemesisCtx,
+    corrupted: &[RottedReplica],
+) -> Vec<String> {
     if corrupted.is_empty() {
         return Vec::new();
     }
@@ -2173,32 +2335,64 @@ async fn verify_injected_rot_was_found(corrupted: &[(u64, u64, PathBuf)]) -> Vec
     // when the round is about to fail anyway.
     const WAIT: Duration = Duration::from_secs(180);
     let deadline = Instant::now() + WAIT;
-    let mut pending: Vec<(u64, u64, PathBuf)> = corrupted.to_vec();
+    let mut pending: Vec<RottedReplica> = corrupted.to_vec();
     loop {
-        pending.retain(|(eid, _, log)| !en_log_reports_rot(log, *eid));
+        pending.retain(|r| !en_log_reports_rot(&r.log_path, r.extent_id));
         if pending.is_empty() || Instant::now() >= deadline {
             break;
         }
         compio::time::sleep(Duration::from_secs(2)).await;
     }
-    if pending.is_empty() {
-        eprintln!(
-            "chaos: every rotted replica was found by its own node's scrub ({} injected)",
-            corrupted.len()
-        );
-        return Vec::new();
-    }
-    pending
+    // Order matters: the log is consulted FIRST, above, so a node that reported
+    // the rot and then deleted the extent is already gone from `pending` and
+    // counts as found. What is left here is damage nobody reported — and some
+    // of it is damage that no longer exists.
+    let (unreported, vanished): (Vec<_>, Vec<_>) =
+        pending.into_iter().partition(|r| r.still_damaged());
+    // "The damage is gone" is only benign when the layout agrees the bytes are
+    // gone too. If the extent still exists, this node is still one of its
+    // replicas, and its slot is still marked available, then the manager is
+    // routing reads at a file that is missing, short, or no longer what was
+    // written — and no layer said a word.
+    let mut accused: Vec<String> = unreported
         .iter()
-        .map(|(eid, nid, _)| {
+        .map(|r| {
             format!(
-                "extent {eid}'s replica on node {nid} was rotted on disk and its own node never \
-                 said so within {}s. Reads of it are served from the damaged copy whenever the \
-                 replica hash picks it",
+                "extent {}'s replica on node {} was rotted on disk, the damaged bytes are STILL \
+                 THERE, and its own node never said so within {}s. Reads of it are served from \
+                 the damaged copy whenever the replica hash picks it",
+                r.extent_id,
+                r.node_id,
                 WAIT.as_secs()
             )
         })
-        .collect()
+        .collect();
+    for r in vanished {
+        if layout_still_serves(ctx, &r).await {
+            accused.push(format!(
+                "extent {}'s replica on node {} no longer holds the injected bytes, yet the \
+                 layout still lists that node with its slot AVAILABLE and no layer said a word. \
+                 The file is missing, short, or rewritten underneath a pointer that still names \
+                 it — which is a worse finding than the rot this injection was testing for",
+                r.extent_id, r.node_id
+            ));
+        } else {
+            eprintln!(
+                "chaos: extent {}'s rotted replica on node {} was deleted or rebuilt before the \
+                 sweep reached it, and the layout agrees it is gone — nothing left for the scrub \
+                 to find, so this injection tested nothing",
+                r.extent_id, r.node_id
+            );
+        }
+    }
+    if accused.is_empty() {
+        eprintln!(
+            "chaos: every rotted replica the layout still serves was found by its own node's \
+             scrub ({} injected)",
+            corrupted.len()
+        );
+    }
+    accused
 }
 
 /// Did THIS node's scrub say THIS extent's content is wrong?
@@ -3538,9 +3732,24 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
     let log_dir = tempfile::tempdir().expect("log dir").keep();
     eprintln!("chaos: subprocess logs at {}", log_dir.display());
 
-    // Owned tempdirs (separate from ProcessGuard's borrowed PathBuf).
-    let mut en_dirs: Vec<tempfile::TempDir> = (0..cfg.num_ens)
+    // Owned tempdirs (separate from ProcessGuard's borrowed PathBuf). One
+    // tempdir per EN, holding one subdir per disk — separate directories are
+    // as far as a single-machine harness can take "separate disks", but that
+    // is the whole distinction the EN itself draws.
+    let en_dirs: Vec<tempfile::TempDir> = (0..cfg.num_ens)
         .map(|_| tempfile::tempdir().expect("en tempdir"))
+        .collect();
+    let en_disks: Vec<Vec<PathBuf>> = en_dirs
+        .iter()
+        .map(|d| {
+            (0..cfg.disks_per_en)
+                .map(|k| {
+                    let p = d.path().join(format!("disk{k}"));
+                    std::fs::create_dir_all(&p).expect("en disk dir");
+                    p
+                })
+                .collect()
+        })
         .collect();
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -3569,7 +3778,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         // Manager + PS see ONLY the proxy address — nemesis can disable
         // the proxy to simulate a network partition without killing the EN.
         let mut ens: Vec<EnProcess> = Vec::new();
-        for (i, dir) in en_dirs.iter_mut().enumerate() {
+        for (i, disks) in en_disks.iter().enumerate() {
             // ENs are killed + respawned on the SAME port mid-run; an
             // ephemeral-range port loses a race to outbound sockets while the
             // EN is down (respawn EADDRINUSE → fail-stop → permanently dead
@@ -3591,13 +3800,13 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
                 proxy_port,
                 proxy_name.clone(),
                 &toxi,
-                dir.path().to_path_buf(),
+                disks.clone(),
                 &log_dir,
             );
             eprintln!(
-                "chaos: EN[{i}] real_port={port} proxy_port={proxy_port} node_id={} dir={}",
+                "chaos: EN[{i}] real_port={port} proxy_port={proxy_port} node_id={} disks={}",
                 guard.node_id,
-                dir.path().display()
+                disks.len()
             );
             ens.push(guard);
         }
@@ -3717,6 +3926,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             proxy_faults: proxy_faults.clone(),
             action_tally: RefCell::new(Default::default()),
             corrupted: RefCell::new(Vec::new()),
+            rot_shape_seen: Cell::new(0),
             etcd_endpoint: etcd_endpoint.clone(),
             fence_stranded_sealed: Cell::new(0),
             ec_k: cfg.ec_k,
@@ -3987,14 +4197,56 @@ runs ACROSS rounds is uncovered, not unlucky.",
                 .get("CorruptReplica")
                 .copied()
                 .unwrap_or((0, 0));
+            // RE-SAMPLED here, not taken from the mid-round max, and that
+            // distinction is the whole check. A node learns an ex-tail sealed
+            // through the scrub's manager probe, whose per-extent backoff runs
+            // 8 -> 16 -> 32 -> 64 ... ticks at 1 tick/s; a tail that was open
+            // ~30 s has already been probed at +0/+8/+24 and will not ask again
+            // until +56. A roll on the round's LAST corrupt tick is therefore
+            // legitimately undescribed for longer than the 20 s that tick waits
+            // — accusing on that sample fails the round for documented paced
+            // behaviour. After the settle the answer is stable, so ask again.
+            let shaped = if chosen > 0 && corrupted.is_empty() {
+                let now = rottable_replicas(&nemesis_ctx).await;
+                if now.ready.is_empty() {
+                    now.reachable
+                } else {
+                    // Described in the meantime: the product did its job, the
+                    // round simply ran out of ticks before it could inject.
+                    0
+                }
+            } else {
+                nemesis_ctx.rot_shape_seen.get()
+            };
             if chosen > 0 && corrupted.is_empty() {
-                inflight_errors.push(format!(
-                    "CorruptReplica was chosen {chosen} time(s) and never once injected: no \
-                     sealed extent was ever described, so the rot dimension of this round is \
-                     UNCOVERED rather than passing"
-                ));
+                if shaped > 0 {
+                    // Sealed content existed and NO node ever described it.
+                    // That is the product failing to harden its own bytes, and
+                    // it is what this check was built for.
+                    inflight_errors.push(format!(
+                        "CorruptReplica was chosen {chosen} time(s) and never once injected, \
+                         and {shaped} sealed replicated extent(s) STILL have a reachable, \
+                         available holder after the settle with no digest on any of them: not \
+                         one was ever DESCRIBED, so nothing on this cluster has an at-rest \
+                         digest and the rot dimension is UNCOVERED rather than passing"
+                    ));
+                } else {
+                    // The cluster sealed nothing at all. Per this harness's own
+                    // rule a decline is per-tick and one round proves nothing —
+                    // failing here would fail a data-loss run for a coverage
+                    // gap the round never had the chance to fill. Measured on
+                    // two seeds whose rounds fired ~6 nemesis ticks and logged
+                    // `EcConvert skipped — no sealed extents` alongside.
+                    eprintln!(
+                        "chaos: NOTE CorruptReplica was chosen {chosen} time(s) and never \
+                         injected — by the settle there is either no sealed replicated extent \
+                         with an available holder, or one that HAS been described and the round \
+                         merely ran out of ticks. The rot dimension is UNCOVERED, not passing, \
+                         but nothing here is a defect"
+                    );
+                }
             }
-            inflight_errors.extend(verify_injected_rot_was_found(&corrupted).await);
+            inflight_errors.extend(verify_injected_rot_was_found(&nemesis_ctx, &corrupted).await);
         }
         if stranded > 0 {
             inflight_errors.extend(verify_fence_drove_a_recovery(&mgr, stranded).await);

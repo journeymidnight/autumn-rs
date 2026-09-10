@@ -2069,8 +2069,27 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
   cargo test -p autumn-manager --test system_chaos \
   chaos_real_kill_split_merge_ec_fence_no_data_loss -- --nocapture --ignored
 #   knobs: AUTUMN_CHAOS_SEED, _DURATION_SECS (30), _NEMESIS_INTERVAL_MS (3000),
-#          _NUM_ENS, _EC_K/_EC_M, _ACTIONS (split,merge,ec,fence,flush,compact,
-#          gc,kill,killfence,partition,latency).
+#          _NUM_ENS, _DISKS_PER_EN (2), _EC_K/_EC_M, _ACTIONS (split,merge,ec,
+#          fence,flush,compact,gc,kill,killfence,partition,latency,corrupt).
+#   MULTI-DISK: every EN is formatted with _DISKS_PER_EN directories (one
+#   tempdir per node, one subdir per disk) and started with a comma-separated
+#   --data list. What that actually covers: multi-dir format + register, extent
+#   reload across several disks on restart, and `choose_disk`'s tie-breaking
+#   (open/held extents, last-picked). What it does NOT cover: per-disk HEALTH.
+#   Both "disks" are subdirectories of one tempdir on one filesystem, so they
+#   report identical free space and both stay Online for the whole run — no
+#   nemesis faults a disk, so `Full`, `Faulted`, and the rebuild of one disk's
+#   replicas while its node stays a member are still reached only by unit tests
+#   (tracked as F-CHAOS-DISK-FAULT). Set _DISKS_PER_EN=1 to A/B a failure
+#   against the single-disk shape.
+#   KNOWN RED: `corrupt` and `ec` can land on the SAME extent — the conversion's
+#   pre-encode content check then (correctly) refuses forever while the recovery
+#   that would repair the rot is skipped for carrying an EC marker. Symptom:
+#   `EC marker on extent N still pinned after quiesce (age ~78s)` with an
+#   op-ledger `last_error` naming a content-checksum mismatch. Reproduced 3× on
+#   seed 603; tracked as BUG-ROT-BLOCKS-ITS-OWN-REPAIR. Bisect with
+#   AUTUMN_CHAOS_ACTIONS=... minus `ec`, and do NOT read it as data loss —
+#   `mismatches=0` in every observed instance.
 #   verdict-gate: a real bug = `mismatches>0` OR a not_found that REPRODUCES on
 #   DRAINED ports. A burst of not_found with `mismatches=0` after back-to-back
 #   runs is almost always loopback PORT EXHAUSTION (cumulative TIME-WAIT) — a

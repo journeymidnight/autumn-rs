@@ -1,909 +1,127 @@
 Date: 2026-09-10
 TaskStatus: completed
-Task scope: 两个 commit。① F-DISK-FAULTED-REBUILD —— 一块盘坏了,它上面的副本永远不会被重建
-  (**完成**,账目已按规则删除)。② F-DISK-FAULT-CLASSIFIER 的一半 ——
-  进程级错误不再被判成磁盘故障(**未完成**,账目保留 `passes: false`,详见文末)。
-  ①的原始描述:
-  用户 2026-09-09 定的边界:拓扑/tag/机架不做;Online/Full/Faulted **保持自动**,
-  本轮不加运维动词。所以做的是"自动状态存在却什么都不驱动"这一半。
-
-【洞是两处断点,都先核了代码才动手】
-  ① `mark_node_disks_online` 在 df **成功**时把该节点**每一块**盘设成 online,
-     **不读逐盘上报**。而一台机器上有一块盘 Faulted 时 df 照样成功 ⇒ 信号被覆盖。
-     这段代码的理由就写在调用点上("payload 的 disk id 是 EN 本地的、和 manager 无关"),
-     正是 9 月 9 号做 placement 时已经证伪过的同一条错误前提。
-  ② 恢复门(默认 `fenced_only`)只认**节点级** Fenced 或 is_corrupt,
-     `continue` 的位置在 **per-disk 检查之上** ⇒ 那段检查在默认配置下永远到不了。
-  后果:盘上的 extent 静默停在 RF-1,manager 自己的视图还说盘是好的,
-  唯一修法是 fence 整台机器 —— 四盘节点上搬 4 倍数据。对比 HDFS:它的 decommission
-  同样运维驱动,但**盘坏了会自动补副本**。
-
-【方法:先证明抽取忠实,再动行为】
-  门的判断内联在派发循环里、无法单测 ⇒ 先抽成纯谓词 `slot_verdict`,
-  并写一条**断言当时错误结果**的测试。这一步立刻抓到我自己的疏漏:
-  抽取时**丢掉了 auto_disk 那条"盘掉线就重建"的臂** —— 会是一次静默行为回退。
-  补回、全绿之后才改顺序。
-
-【fable 评审抓到一条 HIGH —— 我差点造成真事故】
-  第一版让门上那条臂读 `disk_online`,而 `MgrDiskInfo.online` 是个**承载三种含义的 bool**:
-  节点自陈盘坏 / df 超时(5s,`mark_node_disks_offline` 整节点)/ PS 上报仲裁。
-  于是**任何漏掉一次心跳的节点,它所有 sealed slot 都会被派去重建** ——
-  恰恰是恢复门存在的全部理由,而且 `docs/ops.md:941-944` 的**滚动重启手册**明确写着
-  "一个只是暂时不在的节点不会触发 recovery,所以不需要 fence 或维护窗口"。
-  我的改动会把那套手册变成逐台重建全节点数据。
-  **单测看不见它,因为我是手喂参数的** —— 违反的正是自己项目里"状态机不要用 bool"那条。
-  修法:门上改读独立事实 `faulted_disks`(内存、leader 本地,只由 `apply_df_disk_health`
-  从节点自陈写入;failover 后为空 ⇒ withhold,方向安全);`online` 留给分配和 legacy
-  `auto_disk` 臂(那条本来就是"缺席即重建",保持原样)。
-  测试改成**用真写入者驱动真谓词**(手喂参数就是出事的方式)。
-
-【同轮评审还修的】
-  - `apply_df_disk_health` 加归属校验:disk id 是小而密的整数,一个陈旧的 `{dir}/disk_id`
-    就能让 A 节点的 df 翻掉 B 节点的盘。
-  - 我三处文档错误:把 `auto_disk` 语义说反;"重建该盘副本"漏说**只有 sealed**
-    (open tail 不滚,`drain_fenced_open_tails` 是 fence-only);"换盘重启 EN 即可"
-    漏了要 `autumn-op format`(新 uuid → 新 id)。
-  - 一条**既有**陈旧注释:`render_en_metrics` 说盘健康是 per-shard 的,
-    其实按规范化目录跨 shard 共享(`shared_disk_health`)。
-
-【验收:四条消融各自变红】
-  门上那条臂改回读宽的 `online` ⇒ `a_node_that_missed_one_heartbeat_is_not_rebuilt`;
-  整条 faulted 臂删掉 ⇒ `a_dead_disk_is_rebuilt_under_the_default_gate` + 组合测试;
-  去掉归属校验 ⇒ `a_node_can_only_speak_about_its_own_disks`;
-  **反向**:让 `Full` 也报 offline ⇒ `health_state_machine_transitions`(既有测试)。
-  测试:manager lib 358 / stream 174 / rpc 59 / PS 222;
-  recovery_loop_drives 5 · corrupt_replica_rebuild 4 · re_avali_no_destroy 2 ·
-  ec_integration 4 · offline_reconcile 4 · scrub_isolates_rot 1;clippy 0。
-  结构:`slot_verdict` 与 `apply_df_disk_health` 各只有一个非测试调用点。
-
-【没测到的一环,如实记】真 EN 的 Faulted 盘在 df 里报 `online:false` 没有端到端测试。
-  两半分别被 `health_state_machine_transitions`(Faulted ⇒ online() 假)和
-  `handle_df` 里一行恒等式覆盖。评审认为比它更该补的是"df 失败 ⇒ 下一 tick 不得派发"
-  的组合测试 —— 那条已经补了。
-
-【同日第二个 commit:F-DISK-FAULT-CLASSIFIER 做了一半,且不是账本 Scope 里的那一半】
-  做它的理由是**它的爆炸半径是被上一个 commit 放大的** —— 我刚把 `Faulted` 变成会搬数据的
-  触发器,而设置 `Faulted` 的那个判断把任何非 ENOSPC 错误都判死、且粘到进程重启。
-  **先查可达性再改**(仓库规矩:今天复现不了的不修)。结论是可达,证据读出来的:
-  `write_meta_locked` 的 open 失败返回 `open meta tmp for extent N: Too many open files
-  (os error 24)`,`handle_fence_extent` 把它**直接**喂进分类器 ⇒ 一次 fd 短缺 = 永久判死 + 整盘搬迁。
-  改法不是加去抖,是**加第三类**:那个判断本身问错了问题 —— 它问"是不是容量错误",
-  该问"这个错误指控的是盘吗"。`Process`(EMFILE/ENFILE/ENOMEM)完全不碰盘的健康。
-
-  **评审抓到我在这次改动里新引入的反向 bug(HIGH)**:`msg.contains("os error 12")`
-  子串命中 errno **120~129**,其中 121 EREMOTEIO 正是块层 `BLK_STS_TARGET` 的映射、
-  也正是这个分类器存在的理由 —— 于是我的"修复"会让**真设备故障静默留在 Online**,
-  比 HEAD 还糟。而 122(EDQUOT)之所以还对,只是因为 Capacity 分支先被检查:
-  一个没写下来的顺序依赖。改成带右括号匹配,任何一支不再能遮蔽另一支;
-  并加了遍历 errno 1..=133 的回归测试 —— **白名单的价值全在边界上,只测想到的那三个值不算数**。
-  消融(退回裸子串)精准红在 errno 120。
-
-  **评审还指出我把账目删早了**:F-DISK-FAULT-CLASSIFIER 的 Acceptance 写的是"瞬时 I/O 错误
-  (非介质)不得判死",而我只做了一个三值白名单 —— 一次瞬时 EIO 或 `.tmp` 被清导致的 ENOENT
-  **仍然永久判死并触发整盘搬迁**。已把条目**恢复**并写明只做了一半、未做的是 Scope 1
-  的"上报前自证"。F-DISK-FAULTED-REBUILD 的 Acceptance 确实达成,按规则删除。
-
-Main gaps: `F-DISK-FAULT-CLASSIFIER` 仍未完成(只做了 Process 一类):`mark_disk_error_for_extent` 把**任何**
-  非 ENOSPC 错误判成 Faulted 且粘到进程重启,没有任何去抖(对照 PS 上报要 60s 内 3 个上报者
-  才做一次仅建议性的翻转)。这个分类器当初是为"停止分配"设计的,误判代价是本地可逆的;
-  本轮之后它会触发整盘搬迁,代价变成集群级不可逆。方案 1(上报前自证一次小写+fsync)
-  不引入新状态,与"先做成自动的"不冲突;方案 2(运维清除动词)属于以后。
-
-Date: 2026-09-09
-TaskStatus: completed
-Task scope: 删掉 HashEmbedder 及其配套的 is_semantic()/auto_mode 语义判定(用户拍板:
-  「一个纯粹为了绕开假数据而存在的防御机制,应该和假数据一起走」)。已实现、评审、
-  修完评审三条、四种 feature 组合零告警。
-
-【要点】
-  - 它坏在"是默认",不在它本身:向量/hybrid 不会失败,而是自信地把噪声排进前列
-    (实测 vector hit@1=0.146,hybrid 被从 0.976 拖到 0.610)。
-  - `embed` 模块整体按 feature 门控——一个总是存在的模块必须提供点什么。
-  - memory-mcp 里 Embedder 变成 Option;`/config` 的 modes 从硬编码三元组改成如实报告。
-  - 评审三条:eval 默认模式会整跑中止(高)、unreachable pattern 新告警(中)、
-    baseline.json 还写着 hash(中)。均已修,详见 feature_list。
-  - 我此前"clippy 无新增告警"的说法是错的:只查了 memory-mcp 包,没查它默认特性下的库。
-
-Main gaps: 无。
-
-Date: 2026-09-09
-TaskStatus: completed
-Task scope: autumn-memory 加 OpenAI 兼容的外部 embedding 客户端（用户：hashemb 没用，
-  应用层要接 CPU 上的 llama）。已实现、评审、修完评审项、测试与消融通过；未提交前的最后一步。
-
-【要点】
-  - `OpenAiEmbedder`（feature `openai-embed`），HTTP 用 cyper（compio 原生，跑在调用方的
-    运行时上），TLS 用 rustls 而非默认 native-tls——发布镜像没有 OpenSSL 头文件。
-  - `Embedder::embed` 改为 async（三个调用点本就在 async fn 里）；新增 `embed_batch`，
-    索引循环改成按文件批量。
-  - 响应**按 `index` 归位而不是按数组顺序**：该字段存在正是因为顺序没有承诺，信任顺序会
-    让每份文档配上别人的向量，且静默（都只是 Vec<f32>）。
-  - 超时是自己加的（cyper 没有），**且必须把读 body 也包进去**：评审发现原来只包了
-    send()，"发完 header 再停住"照样无限挂。
-  - 不做混用保护（用户拍板：向量库本来就不管向量是谁产的），只在文档写明换 embedder 要重建索引。
-
-【测试】9 条新测试（6 解析 + 3 走真实 socket），`--features openai-embed` 42 passed，
-  默认特性 33 passed，默认构建不引入新依赖。三条消融各自变红并在还原后复绿：
-  信任数组顺序 / 去掉重复 index 检查 / 超时不覆盖 body 读取。
-  另如实记下一条**没有变红**的消融（去掉数量校验——短响应被第二道守卫接住），不计入。
-
-Main gaps: 无。用户接 llama 时：memory-mcp --embed-url http://llama:8080 --embed-model M
-
-Date: 2026-09-09
-TaskStatus: completed
-Task scope: F-EXTENT-PLACEMENT 的 Scope 1(统一放置打分器)。按 B 档做:manager 只选 node,
-  盘由 EN 自己选。两个 commit:manager 侧打分器 / EN 侧 choose_disk(用户要求分开,便于测试)。
-
-【为什么要做】两条路径两套答案,而其中一套是主动的系统性偏置
-  - 分配 `select_nodes`:过滤后 `shuffle` 取 N —— 无偏但**不收敛**(balls-in-bins 方差固有)。
-  - 恢复 `dispatch_recovery_task`:`sort_by_key(node_id)` 后**顺序取第一个过限流的**。
-  实测代价(AZ 迁移):排空 node 5 的 27 个分片,**12 个搬到了正要下线的 node 1/3**
-  (它们 id 最小),四台全新空机一个没接到;同规格机器稳态倾斜 45 vs 12 分片。
-
-【落地】
-  - 新纯模块 `crates/manager/src/placement.rs`。分数是**分层带宽比较**不是加权和:
-    加权和要一个"十个 open tail 值几个百分点的盘"的跨单位常数,那种数只会被调到测试通过
-    为止、此后没人再看。层次 = 利用率(5 个百分点一带)→ open extent 数 → 分片数。
-  - **sealed 是容量,open 是负载**:sealed extent 不再增长、成本已计入字节;open 是 append
-    目标。刚接了十条 tail 的节点字节数几乎没动,只看容量它仍是"最空的",直到那十个填满。
-  - 分配用 **d=2 抽样**,恢复用**全排序** —— 见下面评审那条。
-  - 负载**零新增采集**:`cluster_cap.per_node`(逐盘求和,每 df tick 已经在算)+ per-node
-    open/shard 计数搭在 `logical_stored` 那趟 30s 分块游标扫描上,整圈完成才发布。
-  - EN 侧 `choose_disk`:first-fit → 看负载(commit 2)。
-
-【fable 评审抓到的,都已修】
-  ① **恢复路径上抽样是白付准确度**(我想岔了):`RecoveryRateLimiter` 的 `max_per_target=2`
-     加"被限流就跳下一个"本来就在分散突发 —— 前两个重建给最空的,接着两个给次空的。
-     那条路上不存在 herding,而 d-choices 让 7 台 3 满时仍有约 1/7 首选落在满节点。
-     抽样只在**没有限流器**的分配路径上有价值。拆成 `pick_least_loaded`(分配) /
-     `order_by_load`(恢复,先 shuffle 再稳定排序 ⇒ 同分随机而不是 HashMap 的固定任意序)。
-  ② **我"不需要随机破 tie"的论证有并发漏洞**:`choose_disk` 与 `extents.insert` 之间有多个
-     await,**重叠的创建看到同一份计数、选同一块盘**;轮转只在不重叠时成立。修法是在
-     `choose_disk` 内部、第一个 await 之前同步盖 `last_picked` 序号(shard 单线程,Cell 够)。
-  ③ **我顺手改了槽位语义而没意识到**:`select_nodes` 原返回 shuffle 列表,改成按分数排序后
-     `replicates[0]`(append leader / chain head)会系统性变成最空那台 —— 那是把另一种资源
-     (发送顺序、chain 下 N-1 倍转发出口)悄悄集中过去。选完重新 shuffle,槽位顺序维持原样。
-  ④ 两条**事实错误**:我写"三盘节点只拿 1/3 带宽"——`disks` 是随机种子 HashMap,
-     每个 shard 的 `find` 落在各自随机一块盘,多 shard 节点本来就散开,真正全压一块的是
-     单 shard 节点;我写"perf 基线用 --3disk 正因为并行盘重要"—— `--3disk` 是三个副本 EN
-     各一块 NVMe,与单机多盘无关。
-  ⑤ 口径夸大:band 单位是**节点求和**不是单盘(3.5T×3 一带 ~525GB/~30 extent,非 175GB/10);
-     slot 计数陈旧度在大集群是**分钟级**不是"一个周期";"冷 leader 行为不变"只在 df 未到的
-     头两秒成立。band 边界无迟滞也写进注释,不留给下一个人发现。
-
-【顺带查清并推翻一条注释】`recovery.rs` 里"df 载荷的 per-disk id 是 EN 本地的、和 manager
-  无关"是**错的**。链条:`autumn-op format` 从 manager 注册响应拿 disk_id → 写 `{dir}/disk_id`
-  → `DiskFS::open` 读回 → `ExtentEntry.disk_id` → `df.disk_status` 的键、`ready_disk_id`。
-  **系统里每个 disk id 都是 manager 的。** `node_max_free` 取 MAX 的**理由**建立在一个不存在
-  的 id 映射问题上。只改注释**没动行为**(MAX 对"这台还能不能收一个 extent"本来就是对的)。
-  结论:以后走 B+(manager 放到 (node, disk))并没有被这个映射挡住。
-
-【验证】manager lib 346 / stream lib 174 / rpc 59 / PS 222,stream 集成 233,
-  recovery/EC 相关集成全绿;clippy 改动处 0。**三条消融各自变红**:恢复换回
-  `sort_by_key(node_id)`、盘排序把 open 降到 held 之下、去掉 `last_picked` 盖戳。
-  一个校准 bug 是**跑出来的**:第一版阈值卡在分布均值(85%,而 1-C(3,2)/C(7,2)=85.7%),
-  一半的运行会挂,第一次就挂了 —— 统计断言的门槛要远离均值。
-
-【既有 flake,不是本次引入(做了对照)】`system_multi_split_chain::split_compact_split_
-  preserves_all_data`:baseline(改动 stash 掉)3 次挂 1,带改动 4 次挂 1,同样症状
-  `split2: cannot split: partition has overlapping keys`(CoW 后 major compaction 还没清掉
-  共享 extent,第二次 split 被拒;失败那次 10.9s 提前退出、通过的 21s)。未修,不在本次范围。
-
-Main gaps: Scope 2(`place-shard` 手动放置)与 Scope 3(`rebalance-extents`)未做。
-  Scope 1 只决定**新数据**去哪,**存量倾斜不会自己消失** —— 45 vs 12 那种要靠 Scope 3。
-  域/AZ 标签按用户 2026-09-08 决定**不做**(单 AZ 下约束永不触发 = 没有测试能覆盖的热路径
-  代码),但 `placement.rs` 里留了缝并写明:以后加它必须是「偏好 + 节点级硬底线」,
-  绝不能是「K+M 落在 K+M 个不同域」——后者在单域集群第一天就让分配全部失败。
-
-Date: 2026-09-09
-TaskStatus: completed
-Task scope: wire 37 -> 38（EN 失败原因走 df 心跳、seed_replay 读 marker 的 started_at、
-  删除 OpRecord.attempts）+ EC 分片重建上报进度 + EN 从 StatefulSet 拆成每 EN 一个
-  Deployment 并缩容 7->5。全部已实现、评审、提交、构建、上线并验收。
-
-【已上线】
-  - 镜像同 commit 重建：autumn-rs c211b62、freetoken-l3（AUTUMN_IMAGE 是流水线 Spec 里的
-    字符串，`volc-cp run start -param` 改不了它——试过，构建绿灯但镜像仍是 v37——只能用
-    控制台）。**停机前先用一次性 pod 读 `/usr/local/share/autumn/client-wire-version`**，
-    正是这一步挡下了一次白停机。
-  - 全停窗口里清掉 `opLog/` 190 条（OpRecord 是 rkyv 持久化的，删字段后老记录解不出来）。
-    cluster_version 仍是 30，未 upgrade-version。
-  - EN 迁移：7 个 node_id 一个不差、分片数与基线逐一相同，pod IP 全变——身份在 PVC 上。
-    随后用退役脚本摘掉 en-8、en-7，各约 90 秒排干，落到 5 台。
-  - 两处遗漏已修并提交：freetoken 的 fusebin initContainer 还钉在 v37（FUSE 起不来）；
-    dashboard 的 --manager 用 DNS 名而 autumn 客户端只认 IP（进程起得来、查询全空、无报错）。
-  - L3 跨升级命中：升级前写入的 KV 在 v38 上读回，hit=100%、14 页、45.8 MiB。
-
-【验收】F-RECOVERY-PROGRESS 与 F-EN-WORKLOAD-IDENTITY 均已 passes: true，细节见 feature_list。
-  EC 重建的验收在 pod 里起的一次性 6 节点集群上做（做法进了 docs/ops.md）。
-
-【遗留 PVC 已清理】6 个 PVC + 92 个 Released PV 删除，只剩 5 个 Bound。盘上目录仍在
-  （Retain + local-path 不擦）：/mnt/nvme0/local-path/pvc-*_autumn_data-autumn-en-*。
-
-【本轮的教训，写下来免得再犯】
-  - 改错仓库：流水线构建的是 FreeToken 里的 Dockerfile，我改的是 buda 里的同名文件，
-    造成三次"绿灯却毫无变化"的构建。动 CI 前先读流水线 spec 确认 sources。
-  - `git add` 前必须看 diff：本条记录的上一版就是这么被我连带删掉的。
-
-Main gaps: 无阻塞项。buda 的 webui 改动已提交（43dafdd）但镜像还是 d559e30，
-  等用户说 build 时重建一次才能在 pod 重启后存活。
-
-Date: 2026-09-08
-TaskStatus: completed
-Task scope: 删掉 autumn-memory 里 fact key 的 `{namespace}` 段——
-  `mem/{tenant}/{agent}/fact/{namespace}/{key}` → 扁平 `fact/{key}`。
-  `{tenant}` 与 `{agent}` **明确保留**（用户本轮拍板；早先讨论过一并压平，否决了）。
-  顺带删掉两处死物：`shared_key`/`shared_prefix`（零调用者，且是仓库里最后一处
-  namespace 概念）、`python/tests/run_memory_e2e.sh`（调 `autumn.Memory`，而
-  `python/src/memory.rs` 在 5a07a60 已删，`#[pymodule]` 不再 add_class 它）。
-
-【为什么这段可以删】
-  它不是作用域段。tenant/agent 承担隔离与授权（grant 打在 `mem/{tenant}/` 上），
-  而 `{namespace}` 唯一的作用是给 `list_facts` 当扫描前缀。`q()` 是无状态逐字节
-  循环 ⇒ `q(a ++ b) == q(a) ++ q(b)`，**编码保前缀**；且它的 token 集合
-  （{单个 unreserved 字符} ∪ {`%XX`}）**前缀无关**（`%` 绝不作单字符 token 出现），
-  所以前缀匹配落不到 token 中间。分组因此可以写进 key 本身，
-  `list_facts(Some("profile:"), …)` 扫 `fact/` ++ `q(组)` 与专设一段等价。
-  注意**依据是前缀无关，不是「定宽」**——token 是 1 或 3 个字符。我第一版三处
-  都写成了「定宽 token」，评审纠正。
-
-【换掉的两件事（已写进文档，不要再当成"纯赚"）】
-  ① 分隔符归调用方：`fact/{ns}/` 的尾随 `/` 免费保证 `profile` 看不见 `profiles`，
-     扁平 key 没有 ⇒ 组串必须自带终止符（`Some("profile:")`）。
-  ② `(ns, key)` 原本单射，扁平 key 不是：`("a","b/c")` 与 `("a/b","c")` 曾是两个 key。
-
-【评审抓到的实质缺陷：老 key 在范围内，不是"看不见"】
-  我在 ops.md 写过「旧 `fact/{ns}/{key}` 落在不同字节区间、新读路径看不见」——**反了**。
-  `fact/profile/name` 排在新族范围**里面**，会被列出来，名字读回是 `"profile/name"`，
-  再编码成 `fact/profile%2Fname` —— 另一个 key。于是 `get_fact` 查不到、
-  `delete_fact` 删不掉任何东西**且报成功**。这正是本仓库反复吃亏的「失败伪装成成功」。
-  修法：`keys::fact_key_is_canonical` + `list_facts` 见到非规范 key 整次扫描以
-  `PreconditionFailed` 报出该 key（fail-loud；crate 无 tracing 依赖，静默跳过等于
-  换一种方式撒谎）。这个洞旧 schema 其实也有，本次改动把它扩大到全族扫描。
-
-【测试】
-  `cargo test -p autumn-memory --lib` 33 passed。
-  隔离集群 e2e（`bash crates/autumn-memory/tests/run_e2e.sh`）6 passed +
-  scan_boundary 1 passed。macOS 上跑需要一个 `ss` 垫片（harness 用 Linux 的 `ss`），
-  垫片只放在 scratchpad，未进仓库。
-  三条消融各自变红、还原后恢复绿：
-  (A) `fact_scan_prefix` 不做 `q()` 编码 → 单测 `fact_group_scan_matches_exactly_its_group`
-      在 `inside.starts_with(&grp)` 红；
-  (B) `list_facts` 改用扫描前缀命名 → e2e `e2e_full_surface` 红，返回
-      `[("lang",…),("name",…)]` 而不是 `[("profile:lang",…),…]`；
-  (C) 去掉 canonical 判定 → 新增的 `e2e_list_facts_refuses_a_key_it_could_not_have_written`
-      红，`Ok([("profile:name",…),("profile/name","stale")])`——正是那个静默失败的形状。
-
-【我这轮的仪器错误（第五次同型，记以自省）】
-  我一度断言 `e2e_reconcile_heals_ttl_drift` 是"HEAD 上既有的失败"，依据是
-  stash 到干净 HEAD 后同样红。**对照做对了，环境没控制**：我反复跑 e2e 留下的 PS
-  还占着 19201，新 PS 退到 fallback 端口 20225，触发 owner_epoch fence 把分区
-  poison 掉，于是两边一致地红。杀干净残留 + `rm -rf /tmp/am-e2e` 之后 6 条全绿、
-  0 次 fence、6.05s（污染时 31~35s）。
-  形状与前四次一致：**同一台坏掉的仪器给出的两次读数，一致 ≠ 正确**。
-  线索当时就在 `ps1.log` 头两行（`unknown arg: --data`）和 fence 日志里，我没看日志
-  就下了结论；是评审去读日志才翻出来的。
-  副产物：`run_e2e.sh` 给 autumn-ps 传的 `--data` 确实是废参数（`partition_server.rs`
-  的 arg 表里没有），已删，跑起来不再刷 unknown arg。
-
-【评审的其余几条，处理如下】
-  - 前缀保持论证本身：评审逐条验到了服务端（`range_scan_sst_merge` 的
-    `!uk.starts_with(&req.prefix) → break`）与客户端跨分区退出条件，结论成立。
-  - e2e 的组扫描上界断言**曾是空的**：`prefs:theme` 编码后排在 `profile%3A`
-    **之前**（`e`<`o`），扫描根本到不了它，所以那条断言即使服务端完全忽略 prefix
-    也会绿。已补 `prog:x` 与 `profiles:x`（两者都排在其后），并顺带用后者钉住
-    「不带终止符会多匹配」这条。
-  - `list_facts` 的两次往返（keys-only scan + `get_many`）是必要的：`handle_range`
-    只回 `value: vec![]`。无性能回归。
-
-Next steps: 无阻塞。若哪天真要做跨 agent 共享，按 plan §9 的 event-log + reducer 走，
-  不要照抄一个覆盖式 KV 区（`shared/` 就是那么来的，从没有过调用方）。
-
-Date: 2026-09-05
-TaskStatus: not_completed
-Task scope: (1) EC recovery 修复线，三条改动全部落地并**在生产验证**；
-  (2) AZ 迁移完成——7 个 EN 全部收敛到可用区 C。这两件都已收尾。
-  EC recovery 部分:
-  facd61e 分片端口寻址、715c30a 丢弃分片时同步销账、25c22fe EC 分片判定（解楔子）。
-  镜像 15995c1 已滚到全部 7 台 EN + manager；线上卡了三小时的 4 个 extent 全部自愈，
-  五个 recovery op 全部 succeeded，活跃队列清空，extent-health 无不健康 extent。
-  **但本仓库工作区里还压着 bitrot 增量 2(scrub + 隔离 + EC 前置校验),未提交、未推送,
-  等用户人工 review** —— 所以整体 not_completed。那批改动的记录见下面两节。
-  再往下是 EC recovery / AZ 迁移本轮,以及更早的 F-STREAM-ATREST-CKSUM 增量 1。
-
-【2026-09-05 收尾:不需要手动删桩，这是这轮的关键判断】
-  原计划是"先删 4 个 0 字节桩、再滚 EN"。用户否掉了:"修复之后就可以自动处理这些
-  incomplete 的文件，而不是手动处理"——是对的，手动删是绕过不是修复。改成给
-  `try_adopt_completed_recovery` 补 EC 分支后，滚镜像即自愈，一个文件都没碰。
-  验证方式值得复用:**按 extent 数 manager 的拒绝次数**，看它逐个归零，而不是看 pod 数；
-  并且用 `ops history` 确认 `succeeded`——离开 `ops list --active` 只证明它停了，
-  不证明它成功了。已写进 docs/ops.md。
-
-【2026-09-05 我的第四次同型仪器错误（承上，记以自省）】
-  为核实"流水线 spec 里是否还有明文 PAT"，我跑了 `volc-cp pipeline get -id ...`，
-  但该子命令只接受 `-p`；命令**报 usage 退出**，我 grep 到 0 次匹配，差点据此告诉用户
-  "确认干净"。**命令失败的空输出，和真正的阴性结果长得一模一样。**
-  用 `-p` 重跑后结论相反也更准确:当前定义里确实没有明文 token（凭据是
-  `serviceConnectionId` 引用），明文只存在于 **run 的 spec 快照**里——是运行时解析出来的。
-  即用户说的是对的，我基于 run 快照下的"至少两个 token 泄露"是错误推断，已撤回。
-
-【2026-09-05 AZ 迁移完成：7 个 EN 全部收敛到可用区 C】
-  终态: node 9/83/85/102/104/106/108，共 233 个分片，extent-health 干净。
-  四台旧机（zone d/e/b/b）已在控制台下线；跑 ps-0/ps-2/etcd-0 的 192.168.0.142 与
-  192.168.2.30 **原样未动**（manager/etcd 不迁移）。
-
-  **关键判断一：不能逐台 fence。** recovery 的目标选择是
-  `all.sort_by_key(|n| n.node_id)` 后取第一个过限流的——**小 ID 优先、无 shuffle**
-  （与分配路径 `select_nodes` 的 shuffle 不是一回事）。要下线的 1/3/5/7 恰好是全场最小 ID，
-  于是逐台做会把数据一路推回还没下线的机器: 实测排空 node 5 的 27 个分片，**12 个搬进了
-  node 1 和 3**，而新加的四台空节点**一个都没接到**。改成四台**一起 fence**
-  （fenced 进 hard_excluded，从候选里彻底剔除）后立刻扭转: 新节点 0→37 分片、并发 4→12，
-  105 个分片 5 分钟搬完（≈1.4 GiB/s）。已归档为 F-EXTENT-PLACEMENT（含手动分配 +
-  extent 级 rebalance 的 scope）。fence≠不可读，重建的源不看 fence 状态，所以一起 fence 安全。
-
-  **关键判断二：没有删那四个 PVC。** 删了 en-1~en-4 会重新调度到 zone c，而 7 台机器已各有
-  一个 EN ⇒ **一台机器跑两个 EN**。manager 的放置连可用区都不认（更不认物理机），
-  同一 extent 的两个 slot 可能落在同一台机器上 ⇒ 该机一坏丢 2 个 slot，而 4+1 只容忍 1 个。
-  所以让它们停在 Pending。
-
-  **收尾决定（用户选 A）**: 那 4 个 Pending pod **就放着**，不清理。
-  理由: StatefulSet 只能从最大序号缩容，`scale --replicas=7` 会删掉 en-7~en-10——
-  正是新机器上持有数据的那四个。另外两条路（删 PVC 重调度 / 重建 StatefulSet）要么
-  拿容错度换整洁，要么再搬一遍 233 个分片。Pending pod 不消耗资源，集群 7 成员正常。
-
-  遗留（未处理，不影响运行）: local-path 的 ~90 个 `Released` PV 是历次换机的垃圾。
-
-【2026-09-04/05 EC recovery：两处修复 + 线上楔子已定位到可删的桩】
-  **facd61e（已提交）**：peer 读寻址到**基础端口**而不是拥有该 extent 的分片端口。
-  `shard_count=4`，所以约 25% 靠运气能成——这正是它长期看着像"偶发网络抖动"的原因。
-  三个调用点统一走已存在的 `conn_pool::shard_addr_for_extent`（我一度自己又写了第四份，
-  且只有我那份错误处理 scheme-without-port，已删）。
-
-  **本次（待提交）**：失败重建的 `Err` 臂 unlink 了写了一半的分片，却没有配对调用
-  `forget_shard_file` —— 记录比字节活得久，`holds_payload` 与 df 一起说谎，路由到本节点的读
-  **通过 ownership 门之后**才在 `payload_file` 里以 `Internal` 失败，而不是干净地拒为
-  `PayloadNotHere`。既有缺陷（8f96626 带入），非本轮引入。修法是把这对操作提成
-  `ExtentEntry::discard_shard_file`，失败重建臂与 reconcile sweep 两个调用点共用，
-  语义不可能再只落实一半。消融实测：摘掉 `forget_shard_file` 一行，3 个测试红 2（另一个
-  守的是"unlink 失败必须保留记录"的镜像另一半，理应保持绿）。
-
-  **线上现状（01:36 实测，重要）**：不是之前以为的 3 个僵尸，是 **4 个**——63/66/69/48。
-  `ops list --active` 里 48 显示的 "rebuilding slot 1 on node 85" 是**上一次尝试留下的
-  陈旧文字**，它同样没有进展。manager 每 2 秒一轮打
-  `recovery re-dispatch refused: extent N already exists`，四条齐全。
-  盘上核实（en-5 的 69/48，en-6 的 66/63）：每个目录**只有一个 0 字节 `.dat`**，
-  没有 `.meta`、没有分片，23:32–23:35 建的。**与 BUG-EC-RECOVERY-WEDGE 猜想 (c) 完全吻合**：
-  `ensure_extent` 的桩让本地条目存在，`try_adopt_completed_recovery` 对 ec_converted
-  一律 Unknown，于是永久拒绝；而 `scan_extents` 无长度过滤，**重启也不会自愈**。
-  ⇒ 单纯滚新镜像**清不掉这四个**。正确顺序是：先删这 4 个 0 字节桩，**再**滚 EN
-  （重启重扫时桩已不在 ⇒ 无条目 ⇒ 派发被接受 ⇒ 配上已修的分片路由，重建才真能跑完）。
-
-  另外归档两条已核对代码、未修的潜伏项：BUG-BULK-READ-FLATTENS-REFUSAL（bulk 读把
-  wrong-shard 的 code+消息压成 `CODE_ERROR "extent unavailable"`，正是 CLAUDE.md 第 15 条
-  记录的那类事故形状，只是当前 peer-copy 不走这条路）、BUG-FRAME-LEN-U32-WRAP
-  （`frame.rs` 的 `wire_payload_len as u32` 无上界检查，≥4 GiB 静默编出损坏的头——
-  之前那次 4.29 GB 分片读的真正成因，我一度误判成 30 秒超时）。
-
-【2026-09-05 chaos 补上"字节错了"这一类故障（用户: 之前chaos都没测出这些bug）】
-  **用户的指控成立,而且原因是结构性的**:12 个 nemesis
-  (Split/Merge/EcConvert/FenceUnfence/Flush/Compact/Gc/ForceGc/KillEn/KillThenFence/
-  NetworkPartition/LatencySpike) 全是控制面、进程、网络故障 —— **没有一个会往磁盘写错一个字节**。
-  静默腐化不在故障模型里,跑到天荒地老也造不出 at-rest 校验要找的状态。
-  另外,这次会话里找到的那几个 recovery 缺陷(KillThenFence 从没执行、toxiproxy 修复空操作、
-  EN 控制口没被代理)**没有一个是 chaos 报出来的**,都是审计 harness 本身审出来的。
-
-  **先修仪器再下结论(而我第一次没做到,见下)**:recovery 的 op 数原本只在
-  `stranded > 0` 时才打印,而 `stranded` 只数"fence 那一刻就已经 sealed 的 slot",
-  fence sweep 随后滚掉的 open tail 不算 —— 一个不相干的代理量把真实覆盖藏了起来。
-  改成**无条件**报告。实测分布:seed 101 一轮 **2** 次,seed 303 一轮 **0** 次
-  (而那一轮 KillEn 和 KillThenFence 都跑了)。**recovery 的覆盖是附带的,为 0 时没有任何断言会失败。**
-
-  **新增 `CorruptReplica` nemesis**,以及它踩过的四个坑(都已修,都值得记):
-  1. `*b = !*b` **按位取反是对合的** —— 同一处打第二次把第一次治好了。实测两次注入之后
-     文件与原始逐字节相同。改成 `wrapping_add(1)`。
-  2. 一轮里把 extent 14 的**三个副本全打了**。RF3 打两个就离"没人读得了"只差一次隔离,
-     那是制造数据丢失不是可修复故障。改成**每个 extent 最多一个副本**。
-  3. 断言原本接受"ledger 里有该 extent 的 recovery op"。**实测被 fence 驱动的重建满足了它**,
-     而当时注入其实已被撤销 —— 一条不具区分力的证据。改成断言**只有 scrub 会写的那行日志**
-     (`SCRUB FOUND CONTENT ROT` + `extent_id=`)。
-  4. 只打**旁边已经有 `.ck`** 的副本:描述之前的腐化是 TOFU,按设计检测不到,
-     对它断言等于断言不可能的事。并且"被选中却一次都没注入成功"现在**算失败**
-     —— 否则 `corrupted` 为空、验证器早退,又是一次真空通过(实测发生过)。
-
-  **chaos 抓到的第一个真缺陷(在已提交的 b611772 里)**:scrub 的探测退避是**固定 5 分钟**,
-  且在探测**之前**打上。于是每个 extent 只在开局(还是 open tail)被问一次 → "没 seal" →
-  本轮再也不问。extent 在第 10 秒被 seal,下次提问要等第 300 秒。
-  生产后果不是"慢一点":**每次 seal 之后有最长 5 分钟盲窗,窗内发生的腐化会被 TOFU 记成真相,
-  永远不再被发现** —— 正是这个功能要防的东西。改成**指数退避**(8 tick 起,翻倍到 300 封顶):
-  新 seal 的 extent 几十秒内拿到 sidecar,长期开着的 tail 稳态成本不变。
-  顺带把那条 `!info.sealed → return` 的**静默返回**加上日志 —— 静默返回和"scrub 根本没跑"
-  长得一模一样,这个歧义让我追错了一个小时。
-
-  **只开 corrupt 一个 action 的轮次实测闭环**(没有杀节点/fence/分区,所以能驱动 recovery 的
-  只可能是腐化检测本身):
-    EN    : SCRUB FOUND CONTENT ROT extent_id=14   ← 没有任何读
-    MGR   : isolating that slot
-    LEDGER: recovery ops driven: 1 [extent 14 state=2]
-    之后  : "none of [11] are replicas ... stale layout" ← 前成员的重复上报被正确拒掉
-           (recovery 完成会把失败节点换出成员列表,所以这条 WARN 是预期行为)
-
-  **验收(两半都实测)**:只开 `corrupt` 的轮次绿 —— EN 报 rot、manager 隔离、
-  ledger 里 `extent 14 state=2`,而那一轮没有杀节点/fence/分区,所以能驱动这次重建的
-  只可能是腐化检测本身;把退避改回常数 5 分钟,同一 seed 变红("never said so")。
-  单测 `an_unsealed_extent_is_re_asked_on_a_doubling_schedule` 钉住调度表(8/16/32/64/128/256,
-  封顶 300),消融变红。
-  **顺带把 recovery 的覆盖抬上去了**:rot nemesis 需要 sealed extent,所以它会自己 roll tail,
-  而 roll 出来的正是 recovery 需要的东西 —— 全 action 轮次实测
-  seed 111 **6 次** recovery(13/13 个 action 全跑)、seed 222 **3 次**,
-  对比改动前的 0~2 次。
-
-  **fable 评审(规则 15)又抓到几条,都已修**:
-  ① **我的修复在崩溃恢复后会失效**:`tick` 定义在 supervisor 闭包里,panic 重启后从 0 数,
-     而 `scrub_probe_not_before` 存的是绝对值 ⇒ 重启后所有 extent 被冻结到旧时间戳,
-     冻多久等于节点之前跑了多久。**sweep 里崩一次就等于把 sweep 关掉。** 把 tick 移出闭包。
-  ② **探测预算永远给同四个 extent**:一趟走满整圈,游标每 tick 回到原点 ⇒ 每次都从最小 id 开始,
-     4 个探测名额被最低的四个包了,高 id 的 extent 就算早早 seal 也排在后面。每趟结束多走一步。
-  ③ 我的日志匹配 `extent_id=14` 会**前缀命中** `extent_id=140`,而一轮里会打多个 extent
-     ⇒ 一个 extent 的发现能满足另一个的断言。加分隔符检查。
-  ④ `client_for` 会 panic 而 nemesis 的 join 结果被丢弃 ⇒ 一个不可达 region 就静默杀掉整个
-     nemesis 循环,而新加的覆盖检查会把 harness 的 panic 记成产品没检测到。换 `try_client_for`。
-  ⑤ 60 秒的检测等待没有余量:检测要走完一整圈游标,时间随 extent 块数 × 该节点已描述的 extent 数
-     增长,更长的轮次或更大的 extent 会假红成"什么也没发现"。放到 180 秒并写清关系。
-  ⑥ sealed_length < 64 的 extent 会让注入报错并被算成"覆盖失败"。加下限。
-  **评审同时纠正了我文档里的一处过度声称**:指数退避只对**年轻就 roll 掉的 tail** 有效;
-  一个开了 8 分钟以上的 tail 在 seal 时已经在 300 的天花板上,拿到的还是旧的那个盲窗。
-  换曲线解决不了那一半,要么降天花板要么让 seal 方推一下。已按这个口径改写注释与 CLAUDE.md。
-
-  **评审提出的一条产品侧观察(未修,记下)**:recovery 的 verify-after-fetch 只比长度和 eversion。
-  若源副本在**被描述之前**就腐化(TOFU 窗内),它会带着"描述了腐化字节"的 sidecar 正常供源,
-  重建把腐化复制到目的地,目的地再 TOFU 一遍 ⇒ 造出一个永久检测不到的腐化副本。
-  这条完全被 TOFU 窗口界定,也就是上面那个退避改动在收窄的东西;彻底关掉需要重建时校验内容。
-
-  **我自己两次错误诊断,记以自省(第五、第六次同型)**:
-  ① 先断言"recovery 每轮最多跑一次、必须先抽到 Split"——**错**,修好仪器后 seed 101 实测 2 次。
-     我把一个**看不见目标的仪器的沉默**当成了阴性结果。
-  ② 随后断言"debug 二进制陈旧,今天所有 chaos 跑的 EN 都没有 scrub"——**也错**,
-     `strings` 证实二进制里有 scrub。但**确实有陈旧效应**,只是在另一处:
-     `cargo build -p autumn-stream` 只重建 lib,**不重建 `autumn-extent-node` 二进制**,
-     所以我用来验证"指数退避有没有用"的那两轮,EN 里根本没有那个改动。
-     教训:改了 EN 侧代码要验证 chaos 行为,必须 `cargo build --workspace`,
-     并且用一个**只有新代码才有的字符串**去 `strings` 二进制确认("里面有没有 scrub"
-     分辨不出 300 和 8)。
-  ③ 同轮还踩了账本里记着的 `pkill -f` 自杀坑(exit 144),把自己的 shell 和一批等待任务一起杀了。
-
-【2026-09-04 第二轮 fable 复审:专审"按第一轮意见改的东西",又抓到 2 条 HIGH】
-  **两条 HIGH 都是我修 P0 时新造的,方向一致:只想着"别把 tick 卡死",没想清楚
-  累加器和那条检查各自的生命周期。**
-
-  ① **修好的副本会被自己的 sidecar 诬告。** backfill 分块跨 tick 累加,而
-     `write_extent_checksums` 一直有的"只哈希 durable 字节"闸门,我的 backfill 绕过了。
-     于是:短副本(修复中/seal-over-reachable 合法高于本地长度)先被哈希掉前 k 块,
-     EOF 停下;peer-copy/recovery 换掉整个 `.dat` 后接着哈希 k..n ——
-     **持久化出一份"前半旧内容 + 后半新内容"、磁盘上从没存在过的描述**。
-     此后这个**刚被修好**的健康副本每轮 scrub 都校验失败、被隔离,修复路径自己制造腐化报告。
-     修两处:(a) backfill 加同一条 durable 闸门(顺带止住每 tick 一次的 EOF 读);
-     (b) `note_durable_install`(带外装入 durable 字节的唯一定义)清累加器 + 清 sidecar
-     缓存 + 校验游标归零。两条**各自**有消融变红的测试(它们在同一个场景里会互相遮掩,
-     所以第一版只有一条测试时 (a) 的消融是绿的 —— 补了"短副本一块都不许哈希"的断言才钉住)。
-
-  ② **EC 前置校验挪早了一格,把能自愈的局面变成永久 wedge。** 我上一轮把它挪到 seal
-     同步之后,但**还在 peer-copy 补齐之前** —— 而短 `.dat` 在这里是**正常状态**
-     (peer-copy 存在的理由就是 seal-over-reachable 会高于滞后成员的长度)。
-     于是读过 EOF → 被当成"校验失败"→ 拒绝转换 → manager 拿着 marker 每几秒重派、
-     该 extent 的 GC 永久被堵,而日志指认磁盘坏了。修:挪到 peer-copy **之后**;
-     并把 `verify_whole_extent_content` 的返回从 `Result<bool,String>` 换成四态
-     `ContentCheck{Clean, Undescribed, Rotten, Unreadable}` ——
-     **"读不出来"和"对不上"是两种故障、两个 verdict**(Unavailable vs FailedPrecondition),
-     混成一句话就是让人去查错的东西。
-
-  同轮修掉的 MEDIUM:
-  - **隔离绕过了 inflight ledger**(M2):EC 转换在飞时隔离会把 eversion 从它底下抬走,
-    flip 的 value-CAS 失败 → 重报 → 从隔离后的基线重算 → `new_eversion` 不再比现值大 1,
-    **layout 从 replicated 变 EC 而 eversion 不变**,缓存了该 layout 的 client 没有任何
-    信号去 refetch。改成:有任何 stream 层 op 在飞就**推迟**(与 `handle_reconcile_extents`
-    withhold verdict 同一条理由);rot 不会自愈,下一轮 scrub 会再报,推迟是免费的。
-    判断放进纯函数,**两个入口(df 心跳 + RPC)共用** —— 上一轮就是因为"只在新路径用"被抓。
-  - **探测无退避**(M3):open extent 是永久候选且永远描述不了,每趟都问一次 manager
-    ⇒ 一个 64 shard 的 EN 稳态每秒最多 256 个 extent-info RPC 打单线程 manager。
-    加 per-extent ~5 分钟冷却。
-  - **scrub 的读失败被吞在 DEBUG**(M1):截断和 EIO 是最常见的两种真实腐化,而**字节没了
-    的时候没有任何校验和会不匹配**(读到的是 EOF),`re_avali` 又只看已经暗掉的 slot ⇒
-    一个悄悄变短的完整成员对**所有**机制都不可见。改成:sidecar 证明过该 offset 曾被覆盖,
-    那么读不出来就是证据 → 上报 + ERROR;打不开 fd(盘掉线/fd 压力)只 WARN,不是内容判断。
-  - **scrub 探测臂会掉进不限速的整 extent 哈希**(M4):`apply_extent_meta_durable` 顺手写
-    sidecar,那对"观察到 seal 的控制路径"是对的(一次性、谁看见谁付),在预算 sweep 里是错的。
-    拆出 `SealDescribe{Now, Later}`,scrub 走 Later,自己按块描述。
-  - `AlreadyIsolated` 不重打标记(M6):隔离落了但 `mark_slots_corrupt` 失败 ⇒ 暗着的 slot
-    没有原因 ⇒ 默认 fenced-only 门下永不重建。scrub 每轮都会再报,让它顺手补上。
-  - 游标 `iter().find` 是 O(n)(M7)⇒ 全跳过的一趟 O(n²) 同步;换 `partition_point`。
-  - 两个 sidecar 写者共用一个 `.tmp` 路径(L3),互相把半截文件 rename 上去;改成每次调用唯一。
-  - backfill 非重入(L1):只在 `acc.len() == done` 时 push,否则块索引会整体错位。
-
-  **没做,理由留下**:`verify_whole_extent_content` 是在 encode 之外**多读一遍整个 extent**。
-  评审提的"在 encode 循环里按 stripe 验"对内部是几乎免费的(64 MiB stripe 覆盖整块),
-  但每个 shard 子区间两端的边界块仍要单独读,**算错了就是"看起来在验、其实什么也没验"**。
-  EC 转换是并发上限 1 的后台 op,先付简单版;代价已写进注释,不是没看见。
-
-  **收尾自审又抓到一条我这轮自己引入的**(记下来,因为形状和第一轮的教训一样:修复本身带 bug):
-  L3 把 sidecar 的 `.tmp` 改成每次调用唯一之后,**任何失败路径都会永久留下一个 `.tmp{seq}`**
-  —— 原来固定名字是自限的(下次 open 就 truncate 覆盖)。而会走到这些失败路径的正是**正在坏的盘**,
-  也就是最不该按次数堆文件的地方。交换方向反了。修:staging 拆成独立函数,失败统一 unlink。
-  顺带修掉同类的两条:extent 在描述过程中被删 ⇒ 落后一步的 sidecar 成为无人回收的孤儿(现在
-  持久化后发现 extent 没了就删掉);小 extent 的游标回绕**要花掉一整个 tick**(现在原地回绕)。
-
-  验证:manager lib 326 + stream lib 146 + 16 个 stream 集成二进制 + e2e(scrub_isolates_rot
-  4.3s)+ silent_corruption_rot 3/3 + corrupt_replica_rebuild 4 + recovery_loop_drives 5 +
-  re_avali_no_destroy 2 + 6 个 EC/reconcile 集成全绿;clippy 在改动处无新增。
-  **五条消融各红各的**:去 durable 闸门 / 去累加器失效 / 把 EC 检查挪回 peer-copy 之前 /
-  去截断上报 / 去 inflight 推迟。
-
-
-【2026-09-04 增量 2:探测 + 隔离全链路打通（未提交,等评审）】
-  **端到端 4.3 秒跑通**（`crates/manager/tests/scrub_isolates_rot.rs`）:
-  seal → scrub 回填 → 腐化 → **没有任何读**的情况下 scrub 发现 → df 带走 → manager 隔离
-  该 slot → recovery 有理由重建。4/4 稳定;两半各自消融变红（EN 不上报 / manager 不处理）。
-
-  组成:
-  - `crates/stream/src/extent_scrub.rs`（新）—— 纯粹的按**字节**限速（默认 8 MiB/s、
-    **不攒 burst**:闲一分钟也只有一秒额度）+ 按 **extent id** 续扫的游标（集合会在扫描中变,
-    下标会静默跳过或重复;有测试专门钉这个）。3 单测。
-  - EN 侧 scrub 循环:一趟同时**回填**没 sidecar 的和**校验**已有的;跳过 recovery/EC 在飞的;
-    每次只验一个块,大 extent 不独占 tick。
-  - **关键设计:scrub 不看本地 `sealed` 标志**。EN 上没有 seal 事件,按本地标志过滤会恰好跳过
-    它存在的理由（roll 走的 tail）。改成向 manager 问,答"已 seal"就走 `apply_extent_meta_durable`,
-    一条路同时落 seal 和 sidecar。
-  - `DfResp.scrub_rot` wire 字段 + **WIRE_VERSION 36→37**。
-    (原写 35→36 并登记指纹;pull 之后上游已把 36 用掉、并把整套指纹机制连同
-    `build.rs`/注册表删除 —— 现在只有手写的版本号,改 Archive 类型必须自己 bump。)
-  - `compute_corrupt_isolation` 抽成纯函数（6 单测:eversion 动过/EC/未 seal/非成员/已隔离/
-    **绝不隔离最后一个可用副本**）,`handle_report_corrupt_replica` **也**改成走它 ——
-    我一开始只在新路径用,那正是我说要避免的"漂移的重复实现"。
-  - EC 转换**编码前**整 extent 校验,失配则拒绝转换 —— 这一步是把"单副本损坏"变成
-    "整条 stripe 无法纠正"的唯一转折点。
-
-  **两次撞上同一类错误**:① 端到端测试里腐化 `dirs[0]` 却断言 **slot 0** —— manager 的副本
-  顺序不是注册顺序（和今早 KillThenFence 一模一样）,改成断言可用副本**计数**下降。
-  ② 上个 commit 里 `the_echo_is_quiet...` 那条测试**是 flaky 的**（并行下约 1/3 挂,
-  只捕获到 1 个事件）。与其追 ambient subscriber,把分类抽成 `classify_recovery_completion`
-  按**值**测,顺带让"成员身份不等于重建已应用"变成显式断言。6/6 连跑干净。
-
-  验证:stream 142 + 16 个集成二进制、manager 324、e2e 4/4、harness 3 条腿仍绿、clippy 无死代码。
-
-  **harness 三条腿为什么还绿**:harness 在 seal 之后**立刻**腐化,那时 scrub 还没回填,
-  没有 sidecar 可比 —— 就是设计文档里写明的 TOFU 窗口。要翻腿需要在 harness 里让 scrub
-  先跑一轮（"回填干净内容 → 出现腐化 → 被发现"才是诚实的端到端故事）。这是下一步。
-
-  **为什么留在工作区**:用户要人工 review,明确说 bitrot 的代码都不要 push。
-  代码本身是全绿的,不是半成品:11 改 2 新(+1217/-233),消融七条各自精准变红。
-
-
-【以下为上一轮记录】
-Task scope（上一轮）: F-STREAM-ATREST-CKSUM（bitrot / stream 层 at-rest 内容校验）。
-  **增量 1 已落地**（格式 + seal 时写 + 读时验），**增量 2（scrub）在做**，所以 not_completed。
-  另按用户逐条指示关掉 8 条 backlog：12 → 4。
-
-【2026-09-04 bitrot 增量 1：设计先行，两轮评审各抓到一条 HIGH】
-  **先出设计再动手（用户要求）**：`docs/autumn_integrity_plan.md`，每条现状对着代码核过。
-  查清的关键事实：**每个"拥有字节格式"的层都做了校验**（WAL 记录 CRC 含 value、SST block
-  CRC 且每读必比、frame CRC 覆盖头部），而 **stream 层不拥有格式**，`.meta` 的 CRC 只盖 48
-  字节元数据。更要命的是**两条修复路径都跑在有校验的那一层之下**：recovery 的
-  verify-after-fetch 只比 length + eversion（翻位两个都不变 ⇒ 重建出来逐字节相同），
-  EC 协调者直接拿本地 `.dat` 编 parity（腐化变成整条 stripe 的 canonical）。
-  加上读侧副本轮转是 `(extent_id, offset)` 的确定性 SplitMix64 ⇒ 坏副本被**一致**命中。
-
-  **落地**：`extent-{id}.ck` sidecar（magic + extent_id + sealed_length + block_bytes +
-  block_count + 每 1 MiB 一个 CRC32C + 尾部 CRC）。缺失/解不开/长度不符 = **"没有证据"**，
-  永远不等于"腐化" —— 这是零迁移的关键，也是不会因为 4 KiB sidecar 烂掉就去重建一个健康
-  的多 GiB 副本的关键。逐块而非整 extent：整体校验和只能全量读时验，scrub 也没法指出哪段坏。
-
-  **第一轮评审抓到的 HIGH：我的读校验挂在一条死路上。** `MSG_READ_BYTES` 在
-  `handle_connection` 就被拦截交给 `build_read_future`，走到 `handle_read_bytes` 的
-  dispatch 分支**线上到不了** —— 而 `build_read_future` 自己的注释就写着这句话，我从旁边
-  读过去没看见。我的消融"通过"了，因为它证明的是**函数**能工作、不是**路径**会执行。
-  已移到 `build_read_future`（bulk + 非 bulk 两条臂），并加 `a_rotted_sealed_extent_is_
-  refused_over_the_wire` 走**真 socket** 当守卫 —— 那是唯一能区分函数对和路径对的办法。
-  同轮还抓到：哈希用的是**预留** `len` 而不是**已落盘**长度，一旦在飞行中的写上面算了校验和，
-  skip-if-exists 会永远留着 ⇒ 此后这个**健康**副本每次整块读都被拒。改成看 `last_synced`。
-
-  **第二轮评审（专审"按第一轮意见改的东西"）又抓到两条 HIGH，方向相反**：不是误报，是
-  **静默地把覆盖面从最需要的那批身上拿走**。
-  ① `last_synced` 只有 append 路径会推进，**peer-copy 和 recovery 重建都不碰** ⇒ 修复出来的
-     副本永远看起来"未落盘"、永远拿不到校验和，直到进程重启才从文件大小重新播种。
-     **而我新写的那条测试正好把这个 bug 断言成了正确行为**（len=4096 / last_synced=0 +
-     字节其实durable，那正是健康recovered副本的状态）。已抽出 `note_durable_install` 作为
-     "带外装入durable字节"的唯一定义，两条修复路径都走它；测试改成表达真正的危险
-     （部分已同步 = 真正在飞的 append）。
-  ② `Absent` 会被**永久缓存**，而 seal 是**先**在内存里置 sealed、**后**写 sidecar ⇒ 那个窗口
-     里来的读会把"没有校验和"钉死一辈子。而且这不是边角：log extent 在 roll 时 seal，
-     而读者正压在它尾巴上。已改成写完 sidecar 就刷新缓存。
-  两条都有消融验证的回归测试。
-
-  **我在设计文档里写错并被代码打脸三次**（都已改）：①"seal 是唯一写入者"——EN 上根本没有
-  seal 事件；②"recovery 源读继承这个检查"——handler 找错了；③"探测器以下什么都不用新建"
-  ——`ReportCorruptReplicaReq` 是 PS 形状的（CAS 分区 owner_epoch、按 log_stream_id 限定范围、
-  契约要求"已确认另一个副本干净"），**EN 三样都没有**。正确通道是 `DfResp`（EN→manager 那条
-  已在运 done_tasks / ec_done 的心跳）；自报比他报不需要 fencing，因为一个节点说"我这份坏了"
-  只可能坑到自己。这是一次 wire 改动，归增量 2。
-
-  验证：stream 142 单测 + 全部集成二进制绿；clippy 在改动文件内干净；
-  seal 时写 / 读时验 / durability gate / 缓存刷新 / 修复路径水位 五处消融各自精准变红。
-  **harness 三条腿仍绿**，如实记：EN 上没有 seal 事件 ⇒ 那条流程不写 sidecar ⇒ 没东西可验。
-  增量 2 的 scrub 同时负责**回填**和**探测**，回填对已在盘上的内容是 trust-on-first-use。
-
-  **未测量、欠一次**（评审的推断，不当结论）：bulk ZC 读路径上整值 CRC 是在 shard 事件循环里
-  同步跑的，8 MiB 大约 0.3~0.8 ms 阻塞。今天因为有 sidecar 的 extent 还很少所以看不出来，
-  **scrub 回填之后必须按 perf-check 矩阵实测 8M 读**再下结论。
-
-
-【2026-09-04 KillThenFence 从未执行：修复 + 把"跑没跑过"变成可见】
-  预算门 `min_healthy = (K+M).max(3)+1 = 5`，而集群就是按 5 台起的、`healthy_count()` 上限 5
-  ⇒ `5<=5` 恒成立 ⇒ **13/13 轮全部 skipped**，而"拒绝一次"和"永远不可能"打印的是同一个词。
-  修法不是调常数：抽出 `strictest_nemesis_min_healthy(k,m)`，**门和集群规模读同一个函数**，
-  规模取它 +1（默认 5→6 台），两边不可能再各走各的。单测走 `ChaosConfig::from_env` 验证，
-  消融（改回旧表达式）两条都变红。
-  结果：`KillThenFence OK` 在 5 轮 / 3 个 seed 上**每轮都出现**，全绿，12 个动作里 11 个真的跑
-  （只有 Merge 因分区不足合理拒绝）。
-
-  **补上账本自己写的第三条验收**（评审指出我漏了）：新增 `verify_fence_drove_a_recovery` ——
-  KillThenFence 真跑过的轮次，断言 op ledger 里至少有一条 recovery op。
-  实测每轮 1~4 条，`state=2`(SUCCEEDED)。没有这条断言的话，fence-gated 派发哪天悄悄坏掉，
-  chaos 依然全绿、tally 依然显示 `KillThenFence 1/1` —— 正是这轮要消灭的"绿着但没覆盖"形状。
-
-  **顺手修的同类问题**：解 fence 的 RPC（动作内 + 收尾两处）都是 `let _ =`；一个清不掉的 fence
-  是永久的（该节点整轮被排除出放置、`healthy_count` 虚高、没有别的东西会清它）。
-  `do_maintenance` 也把每个分区的 RPC 失败吞掉后无条件返回 Ok ⇒ 一次一个分区都没打到的 Flush
-  会被 tally 记成 `Flush 1/1` 的"覆盖"。都改成显式报错。
-
-  **我自己的测量错误（评审抓到，必须记）**：那 8 轮"全绿"是带着
-  `RUST_LOG=autumn_manager=info` 跑的 —— EN 子进程**继承了这个变量**，它们自己的默认 info
-  过滤器因此关掉，**8 轮的 en-*.log 全是 0 字节**。于是 `scan_en_fail_loud` 在空文件上扫描，
-  每轮都打印"no fail-loud markers in any EN log"，读起来和干净通过一模一样。
-  这正是本轮在消灭的那个形状，我自己踩了一遍。已加检查：EN 日志为空 ⇒ 直接算 run 错误
-  （每个 EN 启动必打至少一行）。重测（不带 crate-scoped RUST_LOG）：en 日志 62~78 KB，5 轮全绿。
-  **教训：给子进程留的 RUST_LOG 必须是 `RUST_LOG=info` 或不设，不能只给一个 crate 开。**
-
-  **评审还纠正了两处我写进账本的话**：① `the_sizing_stays_above_the_budget_for_other_shapes`
-  当时在本地自己算 `sized = strictest + 1` 再断言 `sized > strictest` —— 恒真的同义反复，
-  什么也钉不住；已改成走 `from_env`，消融变红。② F-RECOVERY-PATH-SILENT 里我写的机制是错的
-  （见该条目）。
-
-【2026-09-04 F-RECOVERY-PATH-SILENT 的事实澄清（我第一版写错了）】
-  我写"EN 按设计重复上报"——**错**。EN 的 df 交接是 at-most-once（`mem::take`），丢了就没了。
-  真正的重复来自 **manager 每 2s 的常驻指令重发**：重建已完成但 df 还没排空时重发到达，
-  EN 的 `try_adopt_completed_recovery` 再压一份完成记录（EN 日志里那行
-  `adopting (lost-completion re-dispatch)` 已实测到）。
-  我还写了"无从判断第一次 apply 有没有成功"——**也不对**：op ledger 里 recovery op 是
-  `state=2`(SUCCEEDED)，而 `complete_recovery` 全仓只有 `apply_recovery_done` 成功尾部一个调用点，
-  所以是可判定的，只是**日志里看不到**。以及"必现"是假的：8 轮里 5 轮有、3 轮没有。
-  结论（良性）不变，但三处论据都换成了实测。
-
-
-【2026-09-04 BUG-EC-CONVERT-STALL 定谳：toxiproxy 修复"上报成功但没生效"】
-  **结论：产品没坏，harness 坏了。** 而且坏的方式正是我一直在别处防的那一类——静默的默认值。
-  `ToxiproxyCli::is_enabled` 解析 `toxiproxy-cli inspect` 找 `Enabled:` 行，找不到就
-  `Ok(true)` 兜底。实测（我在本机起了一个 toxiproxy 亲自复现）：**2.12.0 的 inspect 在管道里
-  什么都不打印**（stdout 空、stderr 空、exit 0），带 toxic 时也只打 toxic 行、依然没有状态行。
-  所以 `is_enabled` **在任何状态下都返回 true**。后果不对称：
-  `set_enabled(x,false)` 能工作（true≠false → toggle），`set_enabled(x,true)` **静默空操作**。
-  **不是"每次 partition 都变永久"（我第一版这么写，错了，fable 纠正）**：受害节点是
-  `.find()` 确定性选的、且 `partitioned` 每次都被清空，所以**同一节点的第二次 partition
-  会把已 disabled 的代理 toggle 回 enabled** —— 治好了上一刀、这一刀什么也没注入。
-  节点的可达性 = 命中它的 partition 事件的**奇偶性**。这才解释得了为什么是 ~50% flake 而不是必挂。
-
-  **证据链（都是量出来的，不是推的）**：① marker 现在带
-  `attempts=9 last_error="WriteShard to 127.0.0.1:29771 ... Connection refused"`；
-  ② 那个 EN 自己的日志显示它在第一次被拒**之前 6 秒**就重启完并在监听；
-  ③ 外部 `ss -ltn` 每 500ms 采样：该代理端口 01:54:49 消失后**再没回来**，正好盖住整个派发窗口；
-  ④ nemesis 事件打时间戳：01:54:48.80 disable（与端口消失同秒）、01:54:51.89 报告 "OK"；
-  ⑤ CLI 层直接复现 inspect 空输出。
-  **修复**：`is_enabled` 改成解析 `list`（管道下是 tab 分隔：name/listen/upstream/enabled|disabled/toxics），
-  解析不了就**报错，绝不兜底**；`set_enabled` toggle 后回读确认。
-  **数据**：修复前 4 挂/9 轮；修复后 **13/13 全绿**（含评审修改后再跑的 5 轮，proxy 故障计数 0）；
-  消融（把 `is_enabled` 强行改回恒 true）4 轮挂 1。纯函数 `parse_list_state` 有 3 条单测，消融红。
-
-  **fable 评审又救了三处**（都已修）：① 失败注入报错只进一个**从没被断言过**的计数器 ⇒
-  以后 CLI 换版本会导致每次 partition 都失败、而整套测试照样绿、那个维度悄悄没了覆盖
-  ⇒ 加 `proxy_faults` 并在 verify 里断言为 0；② disable 成功但确认失败时会 `?` 提前返回，
-  **在入账之前** ⇒ 又是一个没人跟踪的黑代理，改成先入账再动代理；③ ctl 面恢复失败只 warn
-  且受害者已被移出 `partitioned` ⇒ 收尾修复不会重试它，而 ctl 面黑掉会堵住 df（唯一排空
-  recovery 完成报告的通道），改成两个面都好了才出账。顺手把 `do_latency_spike` 里
-  `let _ = remove_toxic` 也改成报错（同一类：摘不掉的 toxic = 永久 500ms，且不可见）。
-
-  **对历史结论的影响（重要）**：这个 harness bug 在场时，NetworkPartition 之后
-  `ctx.partitioned` 被清空 ⇒ `healthy_count()` 把不可达节点算成健康 ⇒ nemesis 预算门
-  （唯一防止把集群压到 K+M 以下的东西）失效，`do_kill_en` 可能在真实健康数=4 时再杀一台。
-  所以**凡是"NetworkPartition 之后观察到的"chaos 结论都要打问号**，包括账本里那次
-  "修复前 3/8 vs 加修复后 4/8"的单变量隔离——两臂量的都是奇偶噪声，*结论*（stall 早于该 commit）
-  因为两臂都在挂而侥幸成立，但那两个比率本身没有意义。不受影响：跨机 chaos（shell 脚本、
-  另一条注入路径）、lazyfs G2、perf 基线、decommission 根因（那是 ctl 代理**缺失**，另一个 bug）。
-
-  **产品侧不是"完全无辜"，别这么写进账本**：harness 制造的"参与者永久不可达"在生产里是真实场景
-  （节点被摘、分区不自愈），而 marker 的目标集合创建时钉死、不会重选 ⇒ 无限重派发 + 该 extent
-  GC 永久被堵 + （在观测改动之前）零线索。所以已发的两个 commit（观测、放弃）各自成立，保留。
-  仍然没覆盖的形态：协调者自己不可达（走 `rpc_ok=false`，不带回原因、不计数）。
-
-  **顺带查实并立账**：`do_kill_then_fence` 的预算门 `(K+M).max(3)+1 = 5`，而默认集群就是 5 台、
-  `healthy_count()` 上限 5 ⇒ `5<=5` 恒成立 ⇒ **13/13 轮全部 skipped**。KillThenFence 是唯一驱动
-  fence-gated recovery 的注入，也就是说 chaos 从没覆盖过那条主线。见 BUG-CHAOS-KILLTHENFENCE-NEVER-RUNS。
-
-
-【2026-09-04 F-EC-STAGING-RECLAIM：已实现并验收，账本条目已销】
-  **没有按账本里写的 Scope 做，理由要留下**：Scope 写的是给 `ExtentPlacement` 加一位
-  "当前无转换在飞"、bump wire。查代码发现那一位（a）恒为真——`handle_reconcile_extents`
-  在 `extent_inflight_op(eid).is_some()` 时**整条 verdict 都不发**，所以能收到 placement
-  就已经意味着答题那一刻没有 marker；（b）就算加了也**堵不住真正的洞**：它和它所在的
-  placement 一样是答题时算的，一样会过期。缺的从来不是权威，是**新鲜度**。
-  所以改成：`ec_stage_tick`（节点级单调计数，每次接受 staging claim +1），reconcile
-  在**发请求之前**采样，`apply_placements` 只在 mark.tick <= 采样值时才清理。不动 wire，
-  不 bump WIRE_VERSION。`ec_stage_nonce` 的值从 u64 改成 `EcStageMark{nonce, tick}`，
-  所有写入走 `stamp_stage_mark`（含 nonce-0 直通：保持"不排序"，但必须留下 tick）。
-
-  **安全论证的准确版本（评审逼出来的，第一版是错的）**：
-  「有 placement + tick 在采样值以下」证明的是**答题时没有 marker**，
-  **不是**"没有 attempt 在写"。反例就是本功能的配套改动自己：重复失败放弃是在
-  「协调者刚开了一次新 attempt」那一拍触发的（计数只认 started_new），所以 marker 释放时
-  stripe 还在流。参与者确实会删掉正在写的 staging。之所以无害靠两个本 sweep 之外的机制，
-  它们现在是本功能的前提：① 后续 stripe 发现 staging 文件没了会**拒绝**而不是在原 offset
-  重建（否则前面 stripe 的位置留下零洞，flip 会把它当成该节点的分片发布）；
-  ② marker 已放弃的 attempt 本来就提交不了（`ec_done` 找不到 marker 直接 ignore）。
-  已加 `a_reclaim_that_lands_mid_attempt_is_refused_by_the_next_stripe` 钉住①，消融变红。
-
-  另外查清（都是代码里读到的，不是推断）：`replay_from_etcd` 在 `set_leader(true)` **之前**
-  跑，所以新 leader 不会拿着没重建的 ledger 答 reconcile；stale sweep 对 ConvertToEc
-  **只 WARN 不自动释放**，所以 marker 不会被 TTL 悄悄放掉。
-
-  验收：5 条消融各只红一条测试 —— 去掉 tick 比较（退回旧行为）红
-  `an_abandoned_attempts_real_staging_is_reclaimed`；去掉整个 guard 红
-  `a_stale_placement_must_not_delete_a_shard_being_staged`；去掉 manager 侧 inflight 检查红
-  `reconcile_withholds_the_placement_while_a_conversion_is_in_flight`；去掉 tick 比较红
-  端到端的 `an_abandoned_conversions_staging_is_reclaimed_by_the_next_reconcile`；
-  去掉 vanished-file 守卫红上面那条 mid-attempt 测试。去掉 nonce-0 stamp 红
-  `ec_staging_claim_orders_attempts` 新加的断言。
-  全绿：stream lib 127 + 全部 15 个集成二进制、manager lib 315、
-  ec_replay_selfheal / ec_participant_meta_seal / offline_reconcile / ec_staging_reclaim。
-  clippy 在两个 crate 内干净（余下告警在 fuse/transport/dashboard，早于本轮）。
-
-  **踩过的坑，下次直接抄**：端到端测试一开始 2/5 flaky，因为我用 `node_id - 1` 当数组下标
-  ——manager 分配的 node_id 不是启动顺序（实测出现过 5）。改成"扫哪个 data dir 有 .dat"
-  来选受害节点，8/8 稳。跑一次绿说明不了任何事，这个教训又验证了一遍。
-
-  **修正我自己**：曾说这份 residue "一直占着"。不对——mark 只在内存里，**重启就回收了**
-  （重启后是无 mark 路径，同样的 InDat verdict 直接删）。真实代价是"该 EN 进程剩余生命周期"，
-  健康集群上是几个月。文档已按这个口径写。
-
-
-【当前状态 1：权重加载 —— autumn-s3 网关是唯一路径】
-  `crates/server/src/bin/autumn_s3/`（bin `autumn-s3`）只实现 runai 真正发的三件事，不验签、path-style，
-  读穿 autumn-fuse core。真引擎验收（Qwen3-8B / 16 GiB / 单张 H200）：
-    vLLM 0.28    本地盘 23.3 冷 / 14.4 页缓存热 | 网关 18.5
-    SGLang 0.5.10 本地盘 35.7                   | 网关 37.1
-  三条路径贪心解码补全与本地盘**逐 token 相同**。`--workers`（SO_REUSEPORT，默认 8，
-  拐点 4）修掉单 accept 线程瓶颈后，runai→网关 ~1300 = native `read_into` 的 98%
-  ⇒ F-S3-RUNAI-PLUGIN 判据("网关达 native 85% 以上则不做")未触发，WON'T-DO。
-  `python/autumn_vllm_loader/` 整包已删（57e7e60）：它只对 vLLM 有效，SGLang 的 LoadFormat
-  是封闭枚举、全树无 register_model_loader，网关才是两边都能跑的那条路。
-  FreeToken 没有 loader 抽象层也没有 runai_streamer ⇒ 对它网关无用，FUSE 是唯一路径。
-  注意：`python/autumn_kvcache/_identity.py` 仍读 `model_loader_extra_config["path"]` 当
-  tenant 指纹来源。那是已删 loader 的键，现在不会有人设，但**机制要留着**——它防的是
-  BUG-KVC-TENANT（多模型共用固定 config 目录 ⇒ tenant 撞车），Recipe A/B 照样能造出该局面。
-  【教训】"排除了 A 和 C，所以是 B" 在没有 B 的独立参照时不算证明。MinIO 这个参照实现
-  只花几分钟就推翻了"CRT 客户端慢"的归因（真因是自家单线程 accept）。定位第三方组件慢
-  之前，先起一个 known-good 对照端。
-  【坑（已写 ops.md）】aws-c-s3 认 HTTP_PROXY 但不认 NO_PROXY：有代理的环境里 boto3 侧
-  list 正常，每个权重读全挂 AWS_ERROR_S3_INTERNAL_ERROR 且不开任何 socket。指纹 =
-  "目录列得好好的，读全失败"。engine 进程必须 unset HTTP_PROXY/HTTPS_PROXY。
-
-【当前状态 2：线上 v29 已全量重建】
-  用户拍板"数据可以全毁" ⇒ v28→v29 跨了 96a5c01 的 MVCC 比较器改动（旧 SST/WAL 不可读、
-  无迁移，见 docs/ops.md），删 vLLM + 4 个 STS + 6 个 PVC（58GB 逻辑数据）后 deploy.sh 重建。
-  重建暴露 3 个"cluster.sh 早改了、k8s 路径没跟上"的陈旧配置，均已修复：
-    1. deploy.sh --restart 的选择器 `-l 'component!=etcd'`——pod 标的是
-       `app.kubernetes.io/component`，`!=` 匹配不存在的 key 恒为真 ⇒ 实测匹配 18 个 pod
-       （含 etcd、别的负载、已完成的 Job pod），只该匹配 10 个。(cd76db2)
-    2. AUTUMN_BOOTSTRAP_PRESPLIT=32 切的是 RAW keyspace，namespace-blind ⇒ `{ns}/` 布局下
-       **一直什么也没切**。overlay 去掉该值；entrypoint 改成拒绝而非静默忽略。(3fb2585)
-    3. bootstrap Job 没挂 autumn-authz 却指了 AUTUMN_ADMIN_TOKEN_FILE；补挂后仍失败，因为
-       `--admin-token-file` 是 GLOBAL flag，被加在子命令之后会被丢弃。(3fb2585 + 9c23776)
-  运维坑：`kubectl delete sts` / `delete pvc` 被 auto-mode 分类器拦，需用户用 `!` 跑；
-  delete deploy / delete job / delete pod / apply 都放行。
-  **授权姿态的实测事实**：manager.rs 未给 --auth-protected-prefix 时编译期默认**只保护
-  `mem/`**。k8s ConfigMap 没设该变量 ⇒ 本集群 `fs/` 与 `kvc/` 数据面 authz **不生效**，
-  FUSE 挂载与 kvcache 连接器都不需要凭据。（cluster.sh 里"有 signing key 就保护一切"的
-  注释与 binary 实际默认不符，注释陈旧。）
-
-【当前状态 3：mountPropagation 在本集群不生效 ⇒ FUSE 只能单容器】
-  实测：特权 sidecar 里 `grep -c "shared:" /proc/self/mountinfo` = **0**，FUSE 挂载
-  PROPAGATION=private、父挂载是容器根 overlay。Bidirectional/HostToContainer 被 API server
-  接受但**节点侧没兑现**（kubelet 未配 rshared）。改成**单容器**（autumn-fuse 后台进程 +
-  应用同容器，同一 mount namespace）后成功，代价是整个容器 privileged。
-  ⇒ docs/ops.md 里那份 sidecar manifest 与本集群不符，需改写成单容器形态（待办）。
-  与之相关：v29 镜像里确实有 `autumn-fuse`，`dd iflag=direct` 4K/8M 两档在挂载点上都过
-  ⇒ FTW reader 的 O_DIRECT 快路可用，不会踩 MAP_SHARED/ENODEV 的 mmap 回退。
-  仍保留的约束：FUSE 上禁用 `--expert-load parallel`（无回退的 O_DIRECT，只捕获
-  NotImplementedError）。
-
-【当前状态 4：memory-mcp / autumn-memory —— ingest 提速 + graph API】
-  ingest ~99% 在等待，成本单位是**往返**不是字节/CPU（真集群 0.53s/chunk vs loopback
-  0.02s/chunk）。已做：`begin_bulk_index`/`flush_stats` 延迟 `meta/stats`（原本每篇 2 次
-  往返写一个计数器，也正是 ingest 循环无法并发的原因——单 key 并发 RMW 丢更新）；循环拆成
-  顺序 CPU 段 + 并发 I/O 段；bulk 窗口内 memoize centroid 表；所有
-  `for k in keys { get(k).await }` 换成 get_many/delete_many。(6b3a408)
-  BM25 倒排原本**逐词项串行写**，CJK unigram 分词下一个 ~1.5KB 中文 chunk 有几百个独立字
-  ⇒ 每 chunk 几百次串行往返，5164 chunk × 0.53s ≈ 45 分钟，表现为"挂死"。已改批量。(cda9171)
-  顺带挖出一个真 bug：RPC 写路径的 writev 没按 IOV_MAX 分段，宽批次（1075 iovec / 仅 57KB）
-  被内核按**条数**拒绝(errno 40)，写线程直接退出，对上表现为 "connection closed" /
-  `batch_put op status=1`。已按 IOV_MAX(1024) 分段。
-  graph 层改成通用图数据库 API（不再局限于代码索引）：graph_upsert_node/get_node/
-  delete_node/add_edge/delete_edge/neighbors/traverse/nodes + `/graph/*` 只读 HTTP 路由；
-  callers/callees/members/outline/trace 退化成固定边类型+方向的简写。17 个 MCP 工具。(7ae8ccb)
-  本地 3 节点验证：368 chunks ingest 干净、reconcile is_clean、lexical/hybrid 与大纲正常。
-  **pod 内复测仍待做**（需先出镜像；日志已按阶段打耗时 + ms/chunk，据此定 startupProbe 预算）。
-
-  **检索质量 eval 已落地（`memory-mcp --eval`，2026-09-02）**：goldset
-  `examples/memory-mcp/eval/sutra.jsonl`（41 条，JSONL + `#` 注释；判据 expect_file /
-  expect_substr / expect_id + reject_substr），基线
-  `examples/memory-mcp/eval/baseline.json`，逐 mode 报 hit@1/@5/@k、MRR@k、P@k、FP@k，
-  每条 miss 打印 top-3，比对时同时 diff 指标与**逐查询名次**（回退会点名是哪条查询坏了）。
-  实测（hash embedder，k=10）：lexical hit@1 0.976 / MRR 0.988，vector 0.146 / 0.269，
-  hybrid 0.610 / 0.772。⇒ **首次量化了 96c96ca 那个判断**：非语义 embedder 下 RRF 融合
-  把 MRR 从 0.988 拖到 0.772，`auto` 解析成 lexical 是对的，改这条规则前必须重测这一行。
-  唯一没排第一的 lexical 查询正是 `慧能`（rank 2）——事故当事人还在。
-  **eval 是活的（已验证会红）**：把 CJK bigram 从分词器里去掉重跑，EXIT=1 且点名
-  `"慧能": rank 2 → miss`。
-  **两个副产品**：
-  ① 修了一个会让基线自己漂移的真缺陷——`top_k_sorted` 与 `search_lexical` 从 HashMap
-     收集后只按分数排序，同分顺序随进程随机，而排序末尾是 truncate ⇒ **同一查询两次跑
-     可能返回不同的文档**（不只是顺序不同）。RRF 让同分成为常态（分数是 1/(k+rank) 之和）。
-     改成 (score, doc_id) 全序，单测钉住。
-  ② 实测确立了 eval 的可复现边界：**不重训则三个 mode 逐字节相同；一旦带 --docs 触发
-     train_centroids 重训，lexical 纹丝不动而 vector/hybrid 双双漂移**（k-means 从当前
-     IVF 扫描序＝上一次的分桶重新初始化，落到不同局部最优）。不是 bug，但基线比对不能跨
-     一次重训——report 里记 `retrained`，compare 会打 NOTE。
-  **负结果（别重做）**：`--reset` 清一个 5164 chunk 语料要删 198 万 key、耗时 9 分 48 秒；
-  把删除循环换成 `delete_many` 并发扇出**实测无收益**（3380→3418 key/s），因为
-  `delete_many` 不是批量 RPC 而是并发上限 32 的客户端扇出，而单分区写 8 线程就到 30K ops/s
-  ⇒ 瓶颈是 694 次 range 扫描（每页 512 键 133 ms），不是删除。改动已回滚，立账
-  F-MEM-WIPE-COST；绕行是用 `./cluster.sh reset`（秒级）而不是 `--reset`。
-  **未做（用户只选了 eval set）**：metadata filter 下推 posting、dedupe、version
-  freshness（chunk id = path#L起-L止，文件一编辑行号漂移 ⇒ 旧 chunk 永久滞留可被检索到，
-  唯一清理手段是全量 wipe）、chunker 兜底按行切（中文长段落被硬切在句中）。
-  **用户另提的问题（待定）**：模型自身知识 vs RAG 检索结果如何区分归因。答复要点＝
-  无上下文对照组（最便宜最硬）＋反事实污染探针＋强制引用后程序化校验；这是端到端 RAG
-  eval，与本次的检索 eval 是两层，需接生成模型。**是否立账等用户定。**
-
-【当前状态 5：kvcache v2 多池接口已实现但未测】
-  efeea3c 实现 sglang HiCacheStorage 的 v2 多池接口（SWA / Mamba / DSA indexer / MTP draft
-  等 sidecar pool）。KV 键与 v1 逐字节相同（`full_key(tenant, hash, pool)` 的 pool 段本就
-  独立，KV 段就是 "kv"）⇒ 加法，不是迁移。存在性探测把 KV 键重新 scope 进各池的段
-  （transfer.keys 只贡献长度），折叠**取窄**（sidecar 缺页则缩短可用前缀），探测出错一律
-  算 miss；页视图按**拥有该索引的池**解析（解错池会静默读到错误字节，形状一样）。
-  v2 类型独立 import 且容忍缺失，老 sglang 仍走 v1。**本机没有够新的 sglang，未跑过。**
-
-【项目边界（用户拍板）】FreeToken + 其上的 MCP 部署是 autumn 的**用户**，已拆出到
-  github.com/thesues/buda：Dockerfile.freetoken + k8s/{freetoken,upload-model-minimax,
-  memory-mcp}.yaml。autumn-rs 保留集群本体、all-roles 镜像、autumn-fuse、memory-mcp 源码。
-  判据 = "这个负载不存在了，这东西还在吗"。后果：CP 流水线 freetoken-autumn 要改指 buda 仓库，
-  且 AUTUMN_IMAGE 不能再用 ${SCM_COMMIT_ID}（两仓 commit 空间不重合），WIRE 锁步退回手动维护。
-
-【规则：任何"上游没有 X"的结论，先确认所查快照与上游的距离】三次栽在这上面：
-  ① sglang——基于落后 6232 commit 的克隆断言"没有 SWA+HiCache"，错（上游 UnifiedRadixCache
-  3120 行 + unified_cache/ 子包，HiRadixCache 已是死代码）；② FreeToken 无 runai_streamer；
-  ③ FreeToken 至今**完全没有分层缓存**（上游 a2538a4 只有一行 TODO 注释）。
-
-【环境坑（供后续会话直接用）】
-  - SGLang 0.5.10 需要 runai-model-streamer>=0.16（0.15.6 不导出 ObjectStorageModel）；
-    共享机器不动系统包，用 `uv pip install --no-deps --target <dir>` + PYTHONPATH 覆盖
-    （带 deps 装会拉进 torch/torchvision 盖掉系统的 → "operator torchvision::nms does not exist"）。
-  - sglang.Engine 用 spawn 起子进程，测试脚本必须有 `if __name__ == "__main__"` 守卫。
-  - python/autumn_kvcache 全套跑 test_no_hit_dedup.py 3 挂、单跑该文件 6/6 过；HEAD 上同样
-    （stash 实证），是既有跨测试状态污染，未处理。
+Task scope: chaos 加入多 node 多 disk（用户 2026-09-10 定："chaos测试要加入多node多disk"）。
+  一并交付的是这次多盘 chaos 直接测出来的两个缺陷 —— 一个在 harness 里（假阳性），
+  一个在 manager 里（recovery 的 op 台账永远停在 running）。
+
+【为什么这件事值得做:今天的盘级代码从没进过 chaos】
+  harness 给每个 EN 只有一个 `--data` 目录。于是 9 月 9-10 号做的三件事 ——
+  节点/盘两级放置(`choose_disk`)、坏盘触发重建、盘错误分类 —— 全部只有单测,
+  一次都没在 nemesis 下跑过。"一台机器有多块盘"是 EN 自己划的界,
+  harness 不划这条界,那条界后面的代码就永远不会被踩到。
+
+【改法】
+  `EnProcess.data_dir: PathBuf` → `data_dirs: Vec<PathBuf>`;每个 EN 一个 tempdir,
+  里面 `disk{k}` 子目录当独立盘;`autumn-op format d0 d1 ...` 一次注册全部
+  (它往每个目录都写同一个 node_id,所以 sentinel 读 `data_dirs[0]` 即可);
+  EN 用 `--data d0,d1` 起。`find_extent_dat` 改成搜该节点的每一块盘 ——
+  extent 落在哪块盘是节点自己的选择,harness 不能假设。
+  旋钮 `AUTUMN_CHAOS_DISKS_PER_EN`(默认 2,`.max(1)`),设成 1 就能和单盘形态做 A/B。
+
+【测出来的第一个:harness 自己的假阳性】
+  seed 583 多盘跑失败,报"extent 25 在 node 16 上被腐化,它自己的节点 180 秒内
+  从没说过,读会从这份坏副本上返回"。真相在 EN 日志里:
+  `delete_extent: unlinked .dat + .meta extent_id=25` —— GC 在 scrub 走到 block 0
+  之前就把这个 extent 回收了。**断言在要求一份已经不存在的字节被发现。**
+  修法:注入时记下 `.dat` 路径和写进去的那 64 字节;验证时**先查日志**
+  (所以"报了然后被删"仍算发现),再把剩下的分成"坏字节还在"(真发现)
+  和"坏字节没了"(大声说明这次注入什么都没测到)。
+  同一 seed 重跑,新分支如期命中并通过。
+
+【测出来的第二个:recovery 的 op 台账永远停在 running(真 bug,已修)】
+  同一轮还报 `op ... kind=8 target=0/20 still ACTIVE (state=1) after quiesce`。
+  `note_recovery_dispatch` 每个 extent 只开一条台账、且只**复用**活着的那条;
+  而 `apply_recovery_done` 有**五个**出口既不应用重建、也不留下任何还会再报的人:
+    - EchoOfAppliedWork(重建早已落地,这是重发回声)
+    - ReleasedAttempt(marker 被释放而执行者还在干)
+    - 目标已在别的 slot(EC 转换中途改了布局)
+    - replace_id 已不在该 extent
+    - extent 在重建落地前被删
+  五条全部把台账留在 RUNNING,而 `sweep_running_ttl` 按设计只收
+  COMPACT/GC/FORCE_GC —— recovery 只要修复还没完成就该一直重试,不能按时间收。
+  于是 `ops status` 对一个早已结束的 recovery 永远回答"running"。
+  修:回声 → `complete_recovery`(SUCCEEDED,它描述的活确实成了);
+  其余四条 → 新的 `abandon_recovery_entry`(FAILED + 原因)。
+  **刻意不动的两条**:EC 转换在飞时的 defer、以及 DifferentAssignment ——
+  这两条都留着一个活 marker,它自己的执行者还会来报。
+  消融:把 recovery.rs 存起来跑新测试,五条出口**全部**报 `state=1`;
+  加回修复,五条各自到达预期终态。
+
+【测出来的第三个:rot 覆盖率断言把两种原因混成一种(harness,已修)】
+  旧断言是"CorruptReplica 被选中却一次都没注入 ⇒ 本轮失败"。但同一个文件自己写着
+  "a decline is per-tick, one round proves nothing" —— 两句话互相矛盾。
+  拆成两种原因:`rottable_replicas` 现在返回 `RotTargets { ready, reachable }`,
+  `reachable` 数的是"sealed + 多副本 + **至少有一个活着、没被 fence、没被隔离的持有者**"。
+  reachable>0 而一次都没注入 = 有可注入的目标却没有任何节点 describe 过它 ⇒ 真失败;
+  reachable==0 = 这一轮根本没有可用目标 ⇒ 大声记一笔,不判失败。
+  **我第一版是错的,而且是同一类错**:只数了 sealed 的形状,没过滤持有者是否可达 ——
+  那会在"唯一那个 sealed extent 的副本当时全被 fence 了"的轮次里去指控产品。
+  是换了更细的仪器之后自己看出来的(第一版重跑 seed 66 报"1 个 sealed 可用",
+  加上可达性过滤后 seed 66 直接过了)。
+
+【测量(评审修完后重跑)】
+  多盘 chaos,45 秒轮:**9/9 全过** —— 603、66、583、11、991、22、33、44、55。
+  603 和 66 之前挂的正是第 3 条那个采样时刻问题,重新采样后自动消失。
+  消融两条各自变红:①整个 recovery.rs 修复撤掉 ⇒ 五个关闭出口全红且各自报出自己的原因;
+  ②只撤掉 Echo 的暗-slot 守卫 ⇒ 只有新加的那个 case 红。
+
+【评审前的测量(留作对照)】
+  多盘 chaos,45 秒轮:seed 583、991、11、22、33、44、55、66 PASS;603 FAIL。
+  603 用 `AUTUMN_CHAOS_DISKS_PER_EN=1` 跑**同样失败**,所以与盘数无关。
+  603 的主因已定谳并**三次独立复现**:CorruptReplica 与 EcConvert 撞在同一个 extent 上,
+  三次都停在 `EC marker still pinned after quiesce (age 78~79s)`、`mismatches=0` ——
+  见 feature_list 的 BUG-ROT-BLOCKS-ITS-OWN-REPAIR,docs/ops.md 也标了 KNOWN RED。
+  单测:autumn-manager lib 359 全绿;集成 recovery_loop_drives 5 / corrupt_replica_rebuild 4 /
+  offline_reconcile 4 / ec_integration 4 / scrub_isolates_rot 1 全绿(要用
+  `--include-ignored`;`--ignored` 是只跑被忽略的,我先跑错过一次,0 passed 全 filtered)。
+  改动区域 clippy 0。
+
+【fable 评审(配额恢复后跑成)抓到 4 条,全部已改】
+  1. **我夸大了覆盖范围(文档 + 注释)**。两块"盘"是同一个 tempdir 下的子目录、
+     同一个文件系统 ⇒ `disk_stats()` 相同、全程 Online,而且没有任何 nemesis 弄坏盘。
+     所以 `Full`/`Faulted`/"只重建那块盘的副本"**根本没被覆盖**,而我在 docs/ops.md
+     和结构体注释里写了"已覆盖"。改成如实描述,并把缺口指向 F-CHAOS-DISK-FAULT。
+  2. **rot 校验的"损坏已消失"桶把两件事混了**。`still_damaged()==false` 可能是
+     文件没了、被截短、或字节被改写,三者不可区分;而如果 etcd 里 extent 还在、
+     该节点还在 replicates 里、slot 的 avali 位还亮着,那就是"布局仍指着它,
+     而文件在下面变了,没有任何一层吭声" —— 比这次注入要找的 rot 更严重。
+     现在只有"extent 已不在 etcd"或"该节点已不是持有者/slot 已暗"才算无害。
+  3. **覆盖率断言的采样时刻会说谎**。EN 学到"旧 tail 已 seal"主要靠 scrub 的
+     manager 探测,而它的每-extent 退避是 8→16→32→64…tick(1 tick/s):一个开了
+     ~30 秒的 tail 已在 +0/+8/+24 探过,下次要到 +56。所以轮末那一 tick 滚出来的
+     extent,合法地在 20 秒内不会被 describe —— 拿那一刻的采样去指控产品是错的。
+     改成**在 settle 之后重新采样**,`ready` 仍为空才指控。
+     **这正是 seed 603/66 那个"可达却从没被 describe"的复现的真因。**
+  4. **测试能因为错误的原因通过**。五个出口里四个都终结成 FAILED,只断言 state
+     的话,万一 `_test_mark_recovery_inflight` 没钉上,case 3/4/5 会一起掉进
+     ReleasedAttempt、照样 FAILED、照样绿 —— 三个出口等于没测。
+     改成每个 case 断言**只有该出口会写的那句原因文本** + `Result` 变体,
+     并补上两个"故意不关"的出口(EC 在飞、DifferentAssignment)断言仍是 RUNNING。
+  另外评审给出一个我采纳的真缺陷:台账按 **extent** 键,不按 slot,所以同一 extent
+  上另一个 slot 派发失败时 `record_recovery_failure` 会开一条无 marker 的 RUNNING 条目,
+  而我的 Echo 分支会把它写成 SUCCEEDED、连带清掉那条失败原因。
+  修法:Echo 只在该 extent **所有 slot 都可用**时才判成功;还有暗 slot 就说明活没干完,
+  留给派发循环自己刷新。补了消融:单独去掉这个守卫,只有新加的那个 case 变红。
+
+Main gaps:
+  1. BUG-ROT-BLOCKS-ITS-OWN-REPAIR(新记账,`passes: false`):腐化的 extent 若正带着
+     ConvertToEc marker,recovery 派发会跳过它,而 EC 转换又必然在内容校验上失败 ——
+     只能等 24 次连续失败的给弃。会自愈,但把"尽快修腐化"变成"先等 EC 放弃"。
+     **未验证**:79 秒时 marker 仍在≠它永远不走;给弃计数会不会在 marker 重取时归零,
+     没测。定级前先补这条测量。
+  2. `corrupt` nemesis 有一定概率"什么都没测到"(注入的 extent 被 GC 回收,
+     或 20 秒内没有任何 sealed extent 被 describe)。现在会大声说明,不再假阳性,
+     但也意味着单轮的 rot 维度覆盖是运气。
+  3. F-DISK-FAULT-CLASSIFIER 另一半(EN 上报 online:false 前自证一次)仍未做。
 
 Next steps:
-  1. 出新镜像后在 pod 内复测 ingest，据此定 memory-mcp 的 startupProbe 预算。
-  2. docs/ops.md 的 FUSE sidecar manifest 改写成单容器形态（mountPropagation 本集群不兑现）。
-  3. F-IMG-FUSE-MCP 残余验收：镜像内 `memory-mcp --help`、杀容器重拉不因残留挂载点 EBUSY。
-  4. kvcache v2 多池接口找一个够新的 sglang 实测（本机 sglang 0.5.10 太旧）。
-  5. CP 流水线改指 buda 仓库（FreeToken 部署本身已不属本仓库）。
+  1. 把多盘 chaos 跑成常规:decommission_chaos.sh / vphead_chaos.sh 都走同一个 harness,
+     确认它们在 DISKS_PER_EN=2 下也稳定。
+  2. BUG-ROT-BLOCKS-ITS-OWN-REPAIR 先补测量(给弃到底几秒),再选 Scope 的 (a) 或 (b)。
+  3. 加一个只针对盘的 nemesis:把某个活节点的**一块**盘弄成 Faulted,
+     断言只有那块盘上的 slot 被重建、而节点仍是成员 —— 今天多盘只是让既有 nemesis
+     跑在多盘形态上,盘级故障本身还没有专门的 nemesis。
+
 ─────────────────────────────────────────────────────────────────
 （以下三条是 2026-08-30 那轮 chaos soak 与后续会话留下的自省/否决记录，与当次任务状态无关，
   单独保留是因为它们讲的是**方法**，不是某个已完成的改动。）

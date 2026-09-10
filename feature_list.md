@@ -405,6 +405,65 @@
   最误导人的一段：4 个名额被占、日志全静默、而我据此得出过"根本没在 recovery"的错误结论。
   与 F-RECOVERY-PROGRESS 是同一处观测缺口的两个面。
 
+### F-CHAOS-DISK-FAULT — 多盘形态有了，但"一块盘坏了"本身还没有 nemesis
+- **Trigger** (2026-09-10，fable 评审确认): chaos 的 EN 现在是多盘的
+  (`AUTUMN_CHAOS_DISKS_PER_EN`,默认 2),既有 nemesis 因此第一次跑在多盘形态上。
+  但**没有任何 nemesis 会弄坏一块盘**,而且两块"盘"是同一个 tempdir 下的子目录、
+  同一个文件系统 ⇒ `disk_stats()` 返回相同数字、全程都是 Online。
+  所以多盘真正覆盖到的只有:多目录 format/注册、重启时跨盘 `load_extents`、
+  以及 `choose_disk` 的挑选与打平(open/held/last_picked)。
+  `Full` / `Faulted` 和"只重建那块盘上的 sealed slot"**依然零 chaos 覆盖**。
+  (我第一版把这三样都写进了 docs/ops.md 和结构体注释的"已覆盖"里,是**夸大**,
+  评审指出后已改成如实描述 —— 记在这里因为这正是账本存在的意义。)
+- **两条已核过的约束,写下来免得下一轮重新踩**:
+  1. **不能用"杀掉 EN → chmod 000 该盘 → 重启"**。`read_and_verify_cluster_id`
+     (crates/server/src/bin/extent_node.rs)在启动时读每个盘的 `cluster_id`,读不到就
+     `bail!` —— 整个进程起不来。那是杀节点,不是坏一块盘。
+  2. **Faulted 粘到进程重启为止**(docs/ops.md 的失败盘 runbook)。所以这个 nemesis
+     **不可逆**,不能当成每 tick 都能挑中的普通动作 —— 要么做成一轮一次的 one-shot
+     (像 decommission),要么给它自己的预算门,保证任何时刻活着的盘数仍能满足 RF。
+- **Scope**: 对一个活着的 EN,把它**某一块**盘的 hash 子目录改成不可写(`chmod 0500`),
+  让下一次在该盘上建 extent 得到 EACCES —— 走 `classify_disk_error` 的 Media 臂
+  (EACCES 既不在 Capacity 也不在 Process 名单里),EN 把该盘置 Faulted 并在 df 里
+  上报 `online:false`。注入前先快照该盘上的 extent id(每个 disk 目录下的 `extent-*.dat`)。
+- **Acceptance**: 注入后 (a) 该节点**仍是集群成员**、没有被 fence;(b) 快照里那些
+  extent 的该 slot 在限流预算内被重建到别处(manager 的 extent 布局不再指向这台的这块盘);
+  (c) 该节点**另一块**盘上的 extent 一个都没被搬;(d) 轮末的逐键校验零丢失。
+  没有 `apply_df_disk_health` + 恢复门那条 per-disk 臂时,(b) 必须是红的。
+- **Status**: `passes: false` (2026-09-10) — 本轮只交付了多盘形态本身;盘级故障注入
+  是独立的一件事,且因为不可逆需要自己的预算设计,不适合顺手塞进同一个改动。
+
+### BUG-ROT-BLOCKS-ITS-OWN-REPAIR — 腐化的 extent 若正在转 EC，修它的 recovery 派不出去
+- **Trigger** (2026-09-10，多盘 chaos 的 seed 603，**三次独立复现**): CorruptReplica 往
+  某个 extent 注了 64 字节腐化，EcConvert 随后选中**同一个** extent。
+  转换的前置内容校验（正确地）拒绝了它 ——
+  op-ledger 上写着 `last_error="extent 14 block 0 fails its content checksum
+  (expected 0xaa010c0c, found 0xf9209ac6)"` —— 然后这一轮以 `EC marker on extent 14 still
+  pinned after quiesce (age 79s)` 失败。
+- **两条路互相挡住,都能在代码里看到**:
+  (a) `recovery_dispatch_loop`（recovery.rs:1250）**跳过**任何带 ConvertToEc marker 的 extent；
+  (b) EC 转换本身在前置校验上必然失败,因为那份副本就是腐化的 —— 而能修好它的
+  只有 recovery。scrub 已经隔离了那个 slot,隔离没有用武之地。
+  解开死结的唯一出口是重复失败给弃:`EC_ABANDON_AFTER_CONSECUTIVE_FAILURES = 24`
+  (recovery.rs:39)。所以它**会**自愈,代价是 24 次派发往返 —— 而 at-rest 校验这套东西
+  存在的理由正是"腐化要尽快修掉"。
+- **已经稳定的部分**: 三轮各自独立地停在 `age 78~79s`(extent 14 一次、extent 20 两次),
+  也就是说 45 秒的 nemesis + 10 秒 settle + quiesce 走完,marker 一次都没走掉。
+  这是 seed 603 不稳定的**主因**,不是偶发。
+- **仍未验证（当作假设）**: 78 秒时 marker 还在,不等于它永远不走 —— 我没有测到它真正
+  弃给的时刻,也没有确认失败计数在 marker 释放/重取之间是否会归零(若会,给弃可能永远
+  凑不满 24)。定级前先补这一条测量。
+- **Scope**: (a) 让"参与者内容校验失败"这一类失败**立即**弃给 marker,而不是并入
+  24 次的通用预算 —— 它不是暂态的,重试不会让腐化的字节变好;
+  (b) 或者反过来,让 corrupt-slot 的强制派发绕过 (a) 那条 ConvertToEc 跳过。
+  两者选一,不要都做:同时放开会让 recovery 和 EC 在同一个 extent 上并发改布局。
+- **Acceptance**: 一条确定性测试 —— 给一个 extent 打上 corrupt slot 标记并置 ConvertToEc
+  marker,断言 recovery 在**一个** tick 内被派出(或 marker 在一次失败后即被弃给),
+  且没有该修复时同一断言是红的。chaos 侧:`corrupt` 与 `ec` 同轮启用时,
+  quiesce 后不再出现 pinned 的 EC marker。
+- **Status**: `passes: false` (2026-09-10) — 不丢数据,会自愈,但把"尽快修腐化"变成
+  "先等 EC 放弃"。同时它是 chaos seed 603 不稳定的已知来源之一。
+
 ### F-EC-RECOVERY-RESUME — EC 分片重建中断后从零重来，而进度本可以直接读出来
 - **Trigger** (2026-09-04，用户在排查 EC 重建卡死时提出): 一个 4.25 GiB 的分片在 90% 处失败，
   当前行为是**丢弃全部、从 0 重来**（失败路径删残片 + 清条目，非 EC 的 `Incomplete` 分支同样是
