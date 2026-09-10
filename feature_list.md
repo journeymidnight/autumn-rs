@@ -863,9 +863,13 @@
 - **Scope**(未实现，三条按性价比排序):
   1. **策略在发 split 前先发 compact**。它已经会发 major-compact 建议，缺的是
      "这个分区想切但重叠着 → 先 compact"这条因果。
-  2. **被拒的 split 要进冷却**。最省事的做法是在拒绝路径上也盖 `last_op_at`；更准的做法是
-     发之前就问一次是否重叠(manager 手上有 `state.streams` 的 extent 集合，求交即可，
-     不需要动 wire)。
+  2. ~~**被拒的 split 要进冷却**~~ —— **已修** (2026-09-10)。根因比预想的更简单也更普遍：
+     auto-policy 的执行循环只在 `Ok(())` 分支写 `st.cooldowns.insert(key, now)`，`Err` 分支
+     只记一条 refused 就走 —— **任何**被拒的动作都会在下一跳原样重发，不只是 split。
+     现在拒绝也起冷却，并且 `cooldowns_changed` 让这类 tick 也持久化冷却(否则 manager
+     一重启又立刻重试)。这是限流不是封禁：条件清了下个窗口自然会再拿起它。
+     ⚠️ **没有单测**：这条路径在一个带 I/O 的 async 循环里，要造一次真实的 actuation 失败
+     才测得到，靠读代码核对。manager 346 个单测仍全绿。
   3. **面板要说人话**。现在只显示一条 `FailedPrecondition: overlapping keys`，读者无从知道
      该做什么。应当显示"等待物理分离；先 compact"并给出那条命令。
 - **Acceptance**: 一个重叠未消的分区上，`auto-policy` 的 recent actions 不再出现连续的

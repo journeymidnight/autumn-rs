@@ -2406,7 +2406,8 @@ impl AutumnManager {
                 continue;
             }
             let state_snapshot = self.store.inner.borrow().clone();
-            let mut any_issued = false;
+            // Cooldowns move on refusal too, so persist when either happened.
+            let mut cooldowns_changed = false;
             for (cand, cmd, key) in actions {
                 if !self.leader.get() {
                     break; // lost leadership mid-batch — stragglers are leader-fenced anyway
@@ -2428,20 +2429,33 @@ impl AutumnManager {
                             st.cooldowns.insert(key, now);
                             st.record(now, "issued", format!("autumn-op {cmd_str} ({desc})"));
                         }
-                        any_issued = true;
+                        cooldowns_changed = true;
                         tracing::info!("auto-policy issued: autumn-op {cmd_str}");
                     }
                     Err(e) => {
-                        self.auto_policy.borrow_mut().record(
-                            now,
-                            "refused",
-                            format!("autumn-op {cmd_str}: {e}"),
-                        );
+                        // A refusal starts the cooldown as well. Only success used
+                        // to, so anything the PS turns down came back on the very
+                        // next tick — a split refused for `overlapping keys` (a
+                        // CoW split whose physical separation has not finished, and
+                        // which only compaction clears) was re-issued and re-refused
+                        // every cycle, filling the operator's action log with a
+                        // decision nothing was going to change.
+                        //
+                        // This is a rate limit, not a ban: when the condition does
+                        // clear, the next window picks the candidate up. Applied to
+                        // every failure kind, because retrying a transient error at
+                        // tick rate is not better than waiting one window either.
+                        {
+                            let mut st = self.auto_policy.borrow_mut();
+                            st.cooldowns.insert(key, now);
+                            st.record(now, "refused", format!("autumn-op {cmd_str}: {e}"));
+                        }
+                        cooldowns_changed = true;
                     }
                 }
             }
             // Best-effort persist cooldowns once per tick (not per action).
-            if any_issued {
+            if cooldowns_changed {
                 if let Err(e) = self.autopolicy_persist_cooldowns().await {
                     tracing::warn!(error = %e, "auto-policy: cooldown persist failed");
                 }
