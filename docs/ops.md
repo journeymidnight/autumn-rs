@@ -1036,6 +1036,36 @@ What fencing triggers (all automatic):
 - **Sealed extents**: the recovery loop (`fenced_only` gate, default) rebuilds
   every sealed extent's fenced slots onto healthy nodes. Includes sealed-EMPTY
   extents (0-byte membership swap).
+
+**A single FAILED DISK needs no fence.** An extent node that hits a
+non-capacity I/O error marks that disk `Faulted` and reports it `online: false`
+on its next `df`; the recovery loop then rebuilds that disk's **sealed**
+replicas elsewhere, without an operator and without touching the node's other
+disks. Fencing the node for one bad disk moves every disk's data — on a
+four-disk machine, four times the repair the failure called for.
+
+Open tails on the faulted disk are NOT rolled: the drain sweep
+(`drain_fenced_open_tails`) is fence-only. They roll on their own as the
+partition writes, and are rebuilt once sealed.
+
+Watch for `df: node reports this disk FAULTED` in the manager log, then the
+usual recovery ops in `autumn-op ops list --active`.
+
+`Faulted` is sticky until the EN process restarts. A **replaced** disk is a new
+device: re-run `autumn-op format` on it (new `disk_uuid` → new `disk_id`) and
+restart the EN. Note the EN refuses to start if a configured `--data` dir
+cannot be opened, so pull the dead dir out of the list first if the hardware is
+gone.
+
+A disk that is merely **`Full`** reports `online: true` and triggers NOTHING —
+it stops taking new extents, keeps serving reads, and self-heals once free
+space is back above 5%. That distinction is what keeps a cluster running low on
+space from rebuilding itself.
+
+**A node that is merely ABSENT still triggers nothing.** The rebuild reads a
+fact only the node itself can report about one of its own disks, not the
+node-wide `online` bit that a `df` timeout also clears — so the rolling-restart
+procedure above stands unchanged.
 - **Open tails**: recovery only rebuilds sealed extents, so the manager's drain
   sweep (every 2 s tick, 30 s per-partition cooldown) asks the owning PS to
   seal + roll any OPEN tail with a fenced replica (`MSG_ROLL_TAILS`). On a

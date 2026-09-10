@@ -170,8 +170,10 @@ static EN_SHARD_GAUGES: std::sync::Mutex<Vec<std::sync::Weak<EnShardGauges>>> =
 
 /// Render the EN's Prometheus text. Extents are summed across shards
 /// (shards own disjoint extent sets); per-disk health takes the WORST
-/// across shards (each shard holds its own `DiskFS` instance, and
-/// `mark_disk_error_for_extent` flips only the observing shard's copy):
+/// across shards. That fold is now belt-and-braces rather than load-bearing:
+/// the health cell itself is SHARED per physical directory
+/// (`shared_disk_health`, canonical-path keyed), so a flip by any shard is
+/// already visible to all of them — the comment here used to say the opposite.
 /// `autumn_en_disk_online` = 0 iff some shard sees Faulted,
 /// `autumn_en_disk_full` = 1 iff some shard sees Full (and none Faulted).
 pub fn render_en_metrics() -> String {
@@ -10856,6 +10858,14 @@ mod enospc_disk_health_tests {
         assert!(d.online() && d.allocatable());
 
         // Online -> Full: still "online" (serves reads) but not allocatable.
+        //
+        // That `online()` distinction is now LOAD-BEARING beyond this node.
+        // `handle_df` reports it, and the manager rebuilds the sealed replicas
+        // of any disk THIS node reports offline — above the recovery gate, so
+        // it happens without an operator. `Faulted` is a local I/O error that
+        // never clears without a restart, which is why it is allowed to move
+        // data. `Full` is transient and self-heals at 5% free, so reporting it
+        // offline would make a cluster running low on space rebuild itself.
         d.set_full();
         assert_eq!(d.health(), DiskHealth::Full);
         assert!(d.online());

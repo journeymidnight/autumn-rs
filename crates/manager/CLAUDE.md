@@ -390,10 +390,48 @@ persisted retry outlives the address's ownership, and extent ids restart from
 small integers in the next cluster on that host — see the stream guide's
 "Delete extent" section.
 
-**Recovery gate** `AUTUMN_MGR_RECOVERY_GATE` (default `fenced_only`): a slot is
-rebuilt only when its node's override is `Fenced`; `auto_disk` reverts to the legacy
-"rebuild on `disk.online == false`". **A slot marked CORRUPT bypasses the gate**
-(see below) — corruption is a stronger signal than what the gate waits for.
+**Recovery gate** `AUTUMN_MGR_RECOVERY_GATE` (default `fenced_only`): one
+predicate, `slot_verdict(gate, fenced, corrupt, disk_online) -> Rebuild | Probe
+| Withhold`, decides every slot. It is a function because it was three inline
+checks whose ORDER was the bug — the gate returned before anything looked at
+the disk, so under the default a slot on a DEAD disk was never considered, and
+nothing could assert on it.
+
+Three things bypass the gate, each because it is CONCLUSIVE rather than
+suggestive: an operator `Fenced` node (that is what fencing is for), a slot a
+partition owner PROVED corrupt (it replayed those bytes; `re_avali` compares
+length, which a full-length rotted replica passes), and a disk **its own node
+named faulted on its last df**. `auto_disk` keeps its legacy arm BELOW the
+gate, where the wide `online` bit still means "rebuild on absence" — opting
+into that mode is opting into that.
+
+**The faulted fact is `faulted_disks`, NOT `MgrDiskInfo.online`, and that
+distinction is the whole safety of this.** The bool carries three meanings —
+the node said this disk is faulted, the node did not answer `df` at all
+(`mark_node_disks_offline`, node-wide, on a 5 s timeout), and a quorum of
+partition servers reported the node. Only the first is evidence about a DISK.
+Reading `online` above the gate rebuilds every sealed slot of any node that
+missed one heartbeat: the storm the gate exists to prevent, and the thing the
+documented rolling-restart runbook relies on not happening. `faulted_disks` is
+in-memory, leader-local, written only by `apply_df_disk_health` from the node's
+own per-disk answer, and empty after a failover — so an unrebuilt slot is
+withheld until the owning node says again that its disk is bad.
+
+`Full` never reaches here: it is transient and self-heals at 5% free, so the EN
+reports it `online: true`. That mapping (`DiskFS::online()` is
+`health() != Faulted`) is what keeps a cluster low on space from rebuilding
+itself, and `health_state_machine_transitions` pins it.
+
+`apply_df_disk_health` also stores the payload's per-disk `online` into
+`s.disks`, and only for disks the reporting node OWNS. It used to set every one
+of the node's disks online on any successful df — on the stated grounds that
+the payload's disk ids were EN-local and unrelated to the manager's, which is
+false — and since a node with one dead disk still answers df, that overwrote
+the only fact that could repair it.
+
+Scope: SEALED extents only, like all recovery. An open tail on a faulted disk
+is not rolled (`drain_fenced_open_tails` is fence-only); it rolls as the
+partition writes and is rebuilt once sealed.
 
 **Corrupt slots (`extent_corrupt.rs`, sibling key `extentCorrupt/<id>` → u32
 bitmap).** A clear `avali` bit says a slot is not serving; it cannot say WHY,

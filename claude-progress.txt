@@ -1,3 +1,69 @@
+Date: 2026-09-10
+TaskStatus: completed
+Task scope: F-DISK-FAULTED-REBUILD —— 一块盘坏了,它上面的副本永远不会被重建。
+  用户 2026-09-09 定的边界:拓扑/tag/机架不做;Online/Full/Faulted **保持自动**,
+  本轮不加运维动词。所以做的是"自动状态存在却什么都不驱动"这一半。
+
+【洞是两处断点,都先核了代码才动手】
+  ① `mark_node_disks_online` 在 df **成功**时把该节点**每一块**盘设成 online,
+     **不读逐盘上报**。而一台机器上有一块盘 Faulted 时 df 照样成功 ⇒ 信号被覆盖。
+     这段代码的理由就写在调用点上("payload 的 disk id 是 EN 本地的、和 manager 无关"),
+     正是 9 月 9 号做 placement 时已经证伪过的同一条错误前提。
+  ② 恢复门(默认 `fenced_only`)只认**节点级** Fenced 或 is_corrupt,
+     `continue` 的位置在 **per-disk 检查之上** ⇒ 那段检查在默认配置下永远到不了。
+  后果:盘上的 extent 静默停在 RF-1,manager 自己的视图还说盘是好的,
+  唯一修法是 fence 整台机器 —— 四盘节点上搬 4 倍数据。对比 HDFS:它的 decommission
+  同样运维驱动,但**盘坏了会自动补副本**。
+
+【方法:先证明抽取忠实,再动行为】
+  门的判断内联在派发循环里、无法单测 ⇒ 先抽成纯谓词 `slot_verdict`,
+  并写一条**断言当时错误结果**的测试。这一步立刻抓到我自己的疏漏:
+  抽取时**丢掉了 auto_disk 那条"盘掉线就重建"的臂** —— 会是一次静默行为回退。
+  补回、全绿之后才改顺序。
+
+【fable 评审抓到一条 HIGH —— 我差点造成真事故】
+  第一版让门上那条臂读 `disk_online`,而 `MgrDiskInfo.online` 是个**承载三种含义的 bool**:
+  节点自陈盘坏 / df 超时(5s,`mark_node_disks_offline` 整节点)/ PS 上报仲裁。
+  于是**任何漏掉一次心跳的节点,它所有 sealed slot 都会被派去重建** ——
+  恰恰是恢复门存在的全部理由,而且 `docs/ops.md:941-944` 的**滚动重启手册**明确写着
+  "一个只是暂时不在的节点不会触发 recovery,所以不需要 fence 或维护窗口"。
+  我的改动会把那套手册变成逐台重建全节点数据。
+  **单测看不见它,因为我是手喂参数的** —— 违反的正是自己项目里"状态机不要用 bool"那条。
+  修法:门上改读独立事实 `faulted_disks`(内存、leader 本地,只由 `apply_df_disk_health`
+  从节点自陈写入;failover 后为空 ⇒ withhold,方向安全);`online` 留给分配和 legacy
+  `auto_disk` 臂(那条本来就是"缺席即重建",保持原样)。
+  测试改成**用真写入者驱动真谓词**(手喂参数就是出事的方式)。
+
+【同轮评审还修的】
+  - `apply_df_disk_health` 加归属校验:disk id 是小而密的整数,一个陈旧的 `{dir}/disk_id`
+    就能让 A 节点的 df 翻掉 B 节点的盘。
+  - 我三处文档错误:把 `auto_disk` 语义说反;"重建该盘副本"漏说**只有 sealed**
+    (open tail 不滚,`drain_fenced_open_tails` 是 fence-only);"换盘重启 EN 即可"
+    漏了要 `autumn-op format`(新 uuid → 新 id)。
+  - 一条**既有**陈旧注释:`render_en_metrics` 说盘健康是 per-shard 的,
+    其实按规范化目录跨 shard 共享(`shared_disk_health`)。
+
+【验收:四条消融各自变红】
+  门上那条臂改回读宽的 `online` ⇒ `a_node_that_missed_one_heartbeat_is_not_rebuilt`;
+  整条 faulted 臂删掉 ⇒ `a_dead_disk_is_rebuilt_under_the_default_gate` + 组合测试;
+  去掉归属校验 ⇒ `a_node_can_only_speak_about_its_own_disks`;
+  **反向**:让 `Full` 也报 offline ⇒ `health_state_machine_transitions`(既有测试)。
+  测试:manager lib 358 / stream 174 / rpc 59 / PS 222;
+  recovery_loop_drives 5 · corrupt_replica_rebuild 4 · re_avali_no_destroy 2 ·
+  ec_integration 4 · offline_reconcile 4 · scrub_isolates_rot 1;clippy 0。
+  结构:`slot_verdict` 与 `apply_df_disk_health` 各只有一个非测试调用点。
+
+【没测到的一环,如实记】真 EN 的 Faulted 盘在 df 里报 `online:false` 没有端到端测试。
+  两半分别被 `health_state_machine_transitions`(Faulted ⇒ online() 假)和
+  `handle_df` 里一行恒等式覆盖。评审认为比它更该补的是"df 失败 ⇒ 下一 tick 不得派发"
+  的组合测试 —— 那条已经补了。
+
+Main gaps: `F-DISK-FAULT-CLASSIFIER` 新立(未做):`mark_disk_error_for_extent` 把**任何**
+  非 ENOSPC 错误判成 Faulted 且粘到进程重启,没有任何去抖(对照 PS 上报要 60s 内 3 个上报者
+  才做一次仅建议性的翻转)。这个分类器当初是为"停止分配"设计的,误判代价是本地可逆的;
+  本轮之后它会触发整盘搬迁,代价变成集群级不可逆。方案 1(上报前自证一次小写+fsync)
+  不引入新状态,与"先做成自动的"不冲突;方案 2(运维清除动词)属于以后。
+
 Date: 2026-09-09
 TaskStatus: completed
 Task scope: 删掉 HashEmbedder 及其配套的 is_semantic()/auto_mode 语义判定(用户拍板:

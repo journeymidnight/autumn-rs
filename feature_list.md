@@ -18,6 +18,87 @@
 > 版本变更要求哪些内嵌客户端重建）算 autumn 的后果，该记；下游自己的缺陷、进展和上线
 > 状态不算，记在它们各自的仓库里。
 
+### F-DISK-FAULTED-REBUILD — 一块盘坏了,它上面的副本永远不会被重建
+- **Trigger** (2026-09-09,做完 Scope 1 后顺着"怎么下线一块盘"查出来的): 盘的健康状态
+  传到了 manager,但**只用来算容量,从不驱动任何修复**。信号在两个地方断掉,都已核代码:
+  - `mark_node_disks_online`(`recovery.rs:2207-2227`)在 df **成功**时把该节点
+    `node.disks` 里的**每一块**设成 `online = true`,**根本不读 `df.disk_status[].online`**。
+    而一台机器上有一块盘 Faulted 时 df 照样成功 ⇒ **信号被覆盖**。
+  - 即使没被覆盖也没用:恢复门(`recovery.rs:1256`)默认 `fenced_only`,只认**节点级**
+    Fenced 或已证实腐化,`continue` 掉的位置在 **per-disk 健康检查之上**。
+  - `s.disks[].online` 全库只有两个写入点(`recovery.rs:2189` / `2218`),**都是整节点粒度**;
+    EN 逐盘上报的 `online` 全库只被读一次(`recovery.rs:1822`,cluster_df 求和)。
+- **现状后果**: `Faulted` 只让 EN 本地停止分配(`allocatable()` 为 false,这半是好的)。
+  盘上已有的 extent **静默停在 RF-1**,而 manager 自己的视图说这块盘是好的 ——
+  `select_nodes` 的"至少一块 online 盘"过滤也照样把它算上。要修只能 fence **整台机器**,
+  在四盘节点上等于搬 4 倍于需要的数据。
+- **对比**: HDFS 的 decommission 同样是运维驱动的,但**盘坏了它会自动补副本**。
+  autumn 现在是连真故障都在等运维,而运维在盘这一级**连动词都没有**。
+- **Scope**:
+  1. manager 停止覆盖逐盘状态:把 `df.disk_status[].online` 应用到 `s.disks[].online`,
+     而不是 df 成功就全设 true。注意 `mark_node_disks_offline`(df 失败 ⇒ 整节点)保留 ——
+     那个语义是对的,拿不到 df 时确实不知道任何一块盘的状况。
+  2. `Faulted` **绕过恢复门**,方式与 `is_corrupt` 完全一致(`recovery.rs:1256` 那行的
+     同一个出口)。**不要**改成 `auto_disk` —— 那会把整个集群的恢复门换回旧的自动行为,
+     为一块盘付整集群的爆炸半径。
+  3. **`Full` 绝不绕过**。它是瞬时的、空间回到 5% 以上会自愈;把它当故障会在集群快满时
+     引发全域重建风暴 —— 正是恢复门存在的理由。
+- **⚠️ 风险**: 这动的是恢复门,是本仓库最容易改出 wedge 的地方之一
+  (账本里 `recovery-stuck` / `F227 写 wedge` 家族都在这附近)。
+- **Acceptance**:
+  - **先复现再改**:构造一个盘 Faulted 的集群,断言它上面的 slot **不会**被重建(证明洞存在),
+    且 manager 视图里该盘仍是 online(证明覆盖那一段);
+  - 修完后同一场景:slot **无需任何运维动作**自动重建走;
+  - **消融**:去掉 Faulted 的绕过 ⇒ 复现测试变红;
+  - **反向消融**:把一块盘置成 `Full` ⇒ **不得**触发任何重建。
+- `passes: false`
+
+### F-DISK-FAULT-CLASSIFIER — `Faulted` 的误判代价从"本地不再分配"变成了"整盘搬迁"
+- **Trigger** (2026-09-10, fable 评审在 F-DISK-FAULTED-REBUILD 里指出): 分类器
+  `mark_disk_error_for_extent`(`extent_node.rs:5059`)把**任何**非 ENOSPC/EDQUOT 的错误
+  一律置成 `Faulted`,粘住到进程重启为止(`set_faulted` 存 2;`set_full`/`try_clear_full`
+  只在 0↔1 之间 CAS)。十五个调用点,全在持久化/追加路径上。
+- **为什么现在才要紧**: 这个分类器当初是为"停止在这块盘上分配"设计的 —— 误判的代价是本地的、
+  可逆的。F-DISK-FAULTED-REBUILD 之后,同一个判断会**触发整块盘的数据搬迁**,代价变成
+  集群级且不可逆(重建走完就走完了)。而它**没有任何去抖**:对照 PS 上报那条路径,
+  需要 60 秒内 3 个上报者才肯做一次**仅仅是建议性**的翻转。
+- **未复现,评审是读代码推断的**: 会被算成 Faulted 的非介质错误包括 `write_meta_locked`
+  的 rename/open/dir-fsync 失败(如 `.tmp` 被清掉导致的 ENOENT)、staging 目录打开失败,
+  以及任何一次瞬时 `os error 5`。没找到确定可达的竞态。
+- **Scope(两条,择一或都做)**:
+  1. EN 侧在上报 `online:false` 之前**自证一次** —— 往该目录做一次小写 + fsync,过了就不报;
+  2. 给运维一个清除 `Faulted` 的手段(现在只能重启 EN 进程)。
+- **⚠️ 与用户 2026-09-09 决定的关系**: 用户明确"Online/Full/Faulted 先做成自动的",
+  所以第 2 条(运维动词)属于**以后**;第 1 条不引入新状态,只是让自动判断更可信,不冲突。
+- **Acceptance**: 造一次瞬时 I/O 错误(非介质) ⇒ 盘**不**被置成 Faulted、不触发重建;
+  造一次持续错误 ⇒ 仍然置 Faulted 并触发。
+- **Status**: `passes: true` (2026-09-10) — 已实现并评审。落地要点与一处近失:
+  谓词 `slot_verdict(gate, fenced, corrupt, disk_faulted, disk_online)` 从派发循环里抽出
+  (原本三段内联检查,顺序就是 bug);`apply_df_disk_health` 逐盘应用 df 并做归属校验。
+  **近失(fable 抓到)**:第一版让门上那条臂读 `MgrDiskInfo.online`,而那个 bool 承载三种
+  含义 —— 节点自陈盘坏 / df 超时 / PS 上报仲裁 —— 于是**任何漏掉一次心跳的节点都会被整体重建**,
+  正好推翻 `docs/ops.md` 里滚动重启手册依赖的那条承诺。改成读独立的 `faulted_disks`
+  (内存、leader 本地、只由节点自陈写入,failover 后为空 ⇒ withhold,方向安全)。
+  四条消融各自变红,其中一条专钉这次近失。分类器的误判半径另立 F-DISK-FAULT-CLASSIFIER。
+
+### F-DISK-REBALANCE — 机内盘间倾斜没有任何东西会纠正
+- **Trigger** (2026-09-09): `choose_disk` 现在按负载选盘(见 F-EXTENT-PLACEMENT Scope 1 的
+  第二个 commit),但那只决定**新** extent 去哪。一块盘上已有的存量倾斜不会自己消失,
+  而**没有任何机制**会把 extent 从满盘搬到空盘。
+- **为什么值得单独做**: 跨节点搬迁要过网络、要占恢复配额、要和真恢复抢优先级;
+  **机内盘间搬迁是本地拷贝** —— 不过网络、不动副本数、不需要 manager 参与、失败只是白拷一次。
+  风险比跨节点低一个量级。HDFS 正是因此把 `hdfs diskbalancer` 和集群级 `hdfs balancer`
+  做成两个独立工具。
+- **但先量再做**: 改动前 `choose_disk` 是 `HashMap` 随机序的 first-fit,**每个 shard 落在
+  各自随机一块盘**,所以多 shard 节点本来就是散开的 —— 真实倾斜有多大**未测**。
+  先量:每节点逐盘的 `extent_bytes` 极差(df 里已有),看它是否值得一个搬运机制。
+- **Scope(量完确认值得再做)**: EN 本地的一个后台任务,把 extent 从最满的盘拷到最空的盘,
+  限速、可中断;`ExtentEntry.disk_id` 与 `.meta` 同步更新;整个过程不改变 manager 视图
+  (副本数、成员、eversion 都不动)。
+- **Acceptance**: 人为造一个盘间倾斜的节点 ⇒ 收敛;搬迁过程中该 extent 始终可读;
+  中途杀 EN ⇒ 重启后不留半拉文件、账目一致。
+- `passes: false`
+
 ### F-KV-CLIENT-30K — 单个客户端进程的 KV 写吞吐卡在 ~30K ops/s，与分区数/并发/批量都无关
 - **Trigger** (2026-09-02, 从 F-MEM-WIPE-COST 的残余里分离出来): 同一个单线程 memory-mcp
   进程，无论怎么配都拿不到超过 ~30K key/s 的写（delete 或 put）：

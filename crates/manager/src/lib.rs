@@ -855,6 +855,20 @@ pub struct AutumnManager {
     /// a preference, never a correctness gate — but it is minutes, not
     /// seconds, and sizing anything on them should assume so.
     pub(crate) node_slot_counts: Rc<RefCell<HashMap<u64, (u64, u64)>>>,
+    /// Disks whose OWN node reported them faulted on its last `df`.
+    ///
+    /// Deliberately NOT `MgrDiskInfo.online`. That bool carries three meanings
+    /// — the node said this disk is faulted, the node did not answer `df` at
+    /// all, and a quorum of partition servers reported the node — and only the
+    /// first is evidence about a DISK. Reading `online` to decide a rebuild
+    /// makes every 5 s `df` timeout rebuild the whole node, which is precisely
+    /// what the recovery gate exists to prevent and what the documented
+    /// rolling-restart procedure relies on not happening.
+    ///
+    /// In memory and leader-local, rebuilt from `df` like `node_max_free`. A
+    /// new leader starts with it empty, so an unrebuilt slot is WITHHELD until
+    /// the owning node says again that its disk is bad — the safe direction.
+    pub(crate) faulted_disks: Rc<RefCell<HashSet<u64>>>,
     /// ENOSPC-1: allocation soft-avoids nodes whose max per-disk free is
     /// below this (`--min-alloc-free-bytes`, default 256 MiB; 0 =
     /// disabled). Soft: select_nodes falls back to the full healthy set
@@ -1125,6 +1139,7 @@ impl AutumnManager {
             node_max_free: Rc::new(RefCell::new(HashMap::new())),
             cluster_cap: Rc::new(RefCell::new(ClusterCapSnapshot::default())),
             node_slot_counts: Rc::new(RefCell::new(HashMap::new())),
+            faulted_disks: Rc::new(RefCell::new(HashSet::new())),
             min_alloc_free_bytes: Rc::new(Cell::new(DEFAULT_MIN_ALLOC_FREE_BYTES)),
             audit_retention_days: Rc::new(Cell::new(90)),
             displaced: Rc::new(Cell::new(true)),

@@ -1231,58 +1231,36 @@ impl AutumnManager {
                         continue;
                     }
 
-                    // under `fenced_only`, only dispatch when the
-                    // replica's owning node has an operator Fenced
-                    // override. Suspected alone is NOT enough (matches
-                    // the HDFS decommission analogue). Under `auto_disk`,
-                    // fall through to the legacy disk.online check below.
                     let is_fenced = matches!(
                         overrides.get(&node_id).map(|o| o.kind),
                         Some(NODE_OVERRIDE_FENCED)
                     );
-
-                    // under `fenced_only`, the operator must
-                    // explicitly fence before we dispatch recovery. The
-                    // backoff-from-failure path still applies once a
-                    // dispatch attempt does fire.
-                    // A slot a partition owner PROVED corrupt is rebuilt
-                    // regardless of the gate. Corruption is a stronger signal
-                    // than the conditions the gate exists to wait for — the
-                    // owner replayed those bytes and found them wrong — and
-                    // re_avali cannot repair it (it only compares length, which
-                    // a full-length rotted replica passes). Without this the
-                    // extent stays isolated at RF-1 forever with no repair path.
                     let is_corrupt = self.slot_is_corrupt(ex.extent_id, slot);
-                    if gate_mode == RecoveryGateMode::FencedOnly && !is_fenced && !is_corrupt {
-                        continue;
-                    }
-
-                    // a Fenced node MUST have all its slots
-                    // rebuilt regardless of probe outcome (the whole
-                    // point of fence is to migrate data off). Skip the
-                    // disk + probe shortcuts and dispatch immediately.
-                    if is_fenced || is_corrupt {
-                        self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
-                            .await;
-                        continue;
-                    }
-
-                    // Check per-disk health: if the disk holding this replica is
-                    // offline, dispatch recovery even if the node is reachable.
+                    // Which disk holds THIS slot, per the extent's own layout.
                     let disk_id = if slot < ex.replicate_disks.len() {
                         Some(ex.replicate_disks[slot])
                     } else {
                         let parity_slot = slot.checked_sub(ex.replicates.len());
                         parity_slot.and_then(|ps| ex.parity_disks.get(ps).copied())
                     };
-                    if let Some(did) = disk_id {
-                        if let Some(disk) = disks.get(&did) {
-                            if !disk.online {
-                                self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
-                                    .await;
-                                continue;
-                            }
+                    let disk_online = disk_id
+                        .and_then(|did| disks.get(&did))
+                        .map(|disk| disk.online);
+                    let disk_faulted =
+                        disk_id.is_some_and(|did| self.faulted_disks.borrow().contains(&did));
+
+                    // ONE place decides. It used to be three checks in a row
+                    // whose ORDER was the bug: the gate returned before
+                    // anything looked at the disk.
+                    match slot_verdict(gate_mode, is_fenced, is_corrupt, disk_faulted, disk_online)
+                    {
+                        SlotVerdict::Withhold => continue,
+                        SlotVerdict::Rebuild => {
+                            self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
+                                .await;
+                            continue;
                         }
+                        SlotVerdict::Probe => {}
                     }
 
                     if (ex.avali & bit) == 0 {
@@ -1598,6 +1576,86 @@ pub(crate) enum RecoveryGateMode {
     FencedOnly,
 }
 
+/// What the dispatch loop should do about one replica slot.
+///
+/// A state, not a bool, because "rebuild it" and "go ask whether it is alive"
+/// are different actions with different costs and the third answer — the gate
+/// says no — is not the absence of either.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SlotVerdict {
+    /// Rebuild now, without probing. The evidence is already conclusive.
+    Rebuild,
+    /// Inconclusive: fall through to the availability probe.
+    Probe,
+    /// The gate withholds it; the operator has not said to move this data.
+    Withhold,
+}
+
+/// Should this slot be rebuilt?
+///
+/// Extracted from the dispatch loop so the decision can be tested at all. It
+/// was inline, which is how it came to be wrong in a way nothing could assert
+/// on: the gate returned BEFORE the per-disk health check, so under the default
+/// `fenced_only` a slot on a dead disk was never even considered.
+///
+/// `disk_online` is `None` when the extent's layout does not name a disk for
+/// this slot (legacy records, or a slot index past `replicate_disks`), which
+/// must read as "no evidence" rather than as "dead".
+pub(crate) fn slot_verdict(
+    gate: RecoveryGateMode,
+    fenced: bool,
+    corrupt: bool,
+    disk_faulted: bool,
+    disk_online: Option<bool>,
+) -> SlotVerdict {
+    // A fenced node must have every slot moved off it — that is what fencing
+    // is for. A slot a partition owner PROVED corrupt is rebuilt regardless of
+    // the gate: the owner replayed those bytes and found them wrong, which is
+    // stronger evidence than anything the gate waits for, and `re_avali`
+    // cannot repair it (it compares length, which a full-length rotted replica
+    // passes).
+    if fenced || corrupt {
+        return SlotVerdict::Rebuild;
+    }
+    // A disk its OWN node reports faulted is conclusive under either gate, and
+    // this sits above the gate deliberately.
+    //
+    // `disk_faulted`, NOT `disk_online`. The two are not the same fact and
+    // conflating them turns this arm into a rebuild storm: `MgrDiskInfo.online`
+    // is also set false node-wide when a `df` merely times out (5 s) or when
+    // partition servers report the node, so reading it here would rebuild
+    // every sealed slot of any node that missed one heartbeat. That is exactly
+    // what the gate exists to prevent, and what the documented rolling-restart
+    // procedure relies on not happening. `disk_faulted` is written only from
+    // the node's own per-disk answer.
+    //
+    // The gate is for TRANSIENT signals — a node that stopped answering may be
+    // back in seconds, and moving its data is expensive and irreversible. A
+    // faulted disk is not one: the extent node sets `Faulted` from a local I/O
+    // error it has already suffered, and it never clears without a process
+    // restart. `Full` — the transient, self-healing state — is reported
+    // `online: true` and never lands here, which is what keeps a cluster
+    // running low on space from rebuilding itself.
+    //
+    // Below the gate, this was unreachable in the DEFAULT configuration: a
+    // dead disk left its replicas at RF-1 with the manager's own view still
+    // calling it healthy, and the only repair was fencing the whole node —
+    // four times the data movement on a four-disk machine.
+    if disk_faulted {
+        return SlotVerdict::Rebuild;
+    }
+    if gate == RecoveryGateMode::FencedOnly {
+        return SlotVerdict::Withhold;
+    }
+    // `auto_disk` is the legacy mode, and its arm is deliberately the WIDE
+    // `online` bit — including the node-wide meanings. That is what it always
+    // did; opting into it is opting into rebuilding on absence.
+    if disk_online == Some(false) {
+        return SlotVerdict::Rebuild;
+    }
+    SlotVerdict::Probe
+}
+
 impl crate::AutumnManager {
     /// unified node-health + recovery-collect loop. Merges the
     /// former `recovery_collect_loop` (2 s, recovery-target nodes only,
@@ -1779,11 +1837,18 @@ impl crate::AutumnManager {
                     DfEchoAction::Ok => {}
                 }
 
-                // a successful df proves the node reachable — promote
-                // on the call-level signal, not per-payload disk_id (the
-                // wire status keys on the extent-node's local disk_id,
-                // unrelated to the manager's allocated disk_id).
-                Self::mark_node_disks_online(&self.store, node);
+                // A successful df proves the NODE reachable, and carries what
+                // the node says about each of its DISKS. Apply the per-disk
+                // answer.
+                //
+                // This used to set every one of the node's disks online on any
+                // successful df, on the stated grounds that the payload's
+                // disk ids were EN-local and unrelated to the manager's. That
+                // is not true (see the note below), and the cost of believing
+                // it was the whole per-disk health signal: a node with one
+                // dead disk still answers df, so the manager overwrote the
+                // one fact that would have repaired it.
+                self.apply_df_disk_health(node, &df.disk_status);
                 // ENOSPC-1: stash the node's max per-disk free for the
                 // allocation free-space soft filter.
                 //
@@ -2204,24 +2269,64 @@ impl crate::AutumnManager {
     /// `online=true` on a successful df. Keys on `MgrNodeInfo.disks`
     /// (manager-allocated disk_ids) instead of the response payload's
     /// extent-node-local disk_ids, which historically failed to map.
-    fn mark_node_disks_online(
-        store: &autumn_common::MetadataStore,
+    /// Apply what a successful `df` said about each of the node's disks.
+    ///
+    /// Per disk, not per node. The extent node reports `online = false` for a
+    /// disk it has marked `Faulted` — a local I/O error it already suffered,
+    /// which does not clear without a restart — and `true` for one that is
+    /// merely `Full`, which self-heals when space returns. Those are different
+    /// facts and only one of them should move data, so the manager stores what
+    /// it was told rather than a node-wide summary of it.
+    ///
+    /// A disk the payload does not mention is left alone: absence is not
+    /// evidence. Losing the df entirely is still node-wide
+    /// (`mark_node_disks_offline`), and that is right — with no answer at all,
+    /// nothing is known about any individual disk.
+    fn apply_df_disk_health(
+        &self,
         node: &autumn_rpc::manager_rpc::MgrNodeInfo,
+        reported: &[(u64, autumn_rpc::extent_rpc::DiskStatus)],
     ) {
         if node.disks.is_empty() {
             return;
         }
-        let mut s = store.inner.borrow_mut();
-        for disk_id in &node.disks {
-            if let Some(disk) = s.disks.get_mut(disk_id) {
-                if !disk.online {
-                    disk.online = true;
-                    tracing::info!(
-                        node_id = node.node_id,
-                        disk_id,
-                        "df RPC succeeded; disk back online"
-                    );
-                }
+        let mut s = self.store.inner.borrow_mut();
+        let mut faulted = self.faulted_disks.borrow_mut();
+        for (disk_id, status) in reported {
+            // Only this node's own disks. Ids are small dense integers and a
+            // stale `{dir}/disk_id` sentinel (a dir reused without re-format
+            // after an etcd wipe — a dev and chaos reality) would otherwise let
+            // one node's `df` flip another node's disk, in either direction.
+            if !node.disks.contains(disk_id) {
+                continue;
+            }
+            // The narrow fact the rebuild decision reads: THIS node says THIS
+            // disk is faulted. Tracked apart from `online`, which is also
+            // written node-wide by paths that know nothing about any one disk.
+            let was_faulted = if status.online {
+                faulted.remove(disk_id)
+            } else {
+                !faulted.insert(*disk_id)
+            };
+            if !status.online && !was_faulted {
+                // Actionable rather than merely recorded: the dispatch loop
+                // rebuilds this disk's SEALED replicas on the next tick.
+                tracing::warn!(
+                    node_id = node.node_id,
+                    disk_id,
+                    "df: node reports this disk FAULTED — its sealed replicas will be \
+                     rebuilt elsewhere"
+                );
+            }
+            let Some(disk) = s.disks.get_mut(disk_id) else {
+                continue;
+            };
+            if disk.online == status.online {
+                continue;
+            }
+            disk.online = status.online;
+            if status.online {
+                tracing::info!(node_id = node.node_id, disk_id, "df: disk back online");
             }
         }
     }
@@ -3583,6 +3688,279 @@ mod recovery_placement_tests {
                 online: false,
             },
         )];
-        assert!(m.placement_load().get(&1).is_none());
+        assert!(!m.placement_load().contains_key(&1));
+    }
+}
+
+#[cfg(test)]
+mod slot_verdict_tests {
+    use super::{slot_verdict, RecoveryGateMode, SlotVerdict};
+
+    /// THE REGRESSION.
+    ///
+    /// A disk the extent node has locally proven dead (`Faulted`, reported as
+    /// `online: false` on its `df`) must have its replicas rebuilt without
+    /// waiting for an operator. Before this, the default gate withheld the slot
+    /// BEFORE anything looked at the disk, so the extent sat at RF-1 silently
+    /// while the manager's own view still called the disk healthy, and the only
+    /// repair was fencing the whole node — four times the data movement on a
+    /// four-disk machine.
+    ///
+    /// Moving the disk arm back below the gate takes this to `Withhold`.
+    #[test]
+    fn a_dead_disk_is_rebuilt_under_the_default_gate() {
+        assert_eq!(
+            slot_verdict(RecoveryGateMode::FencedOnly, false, false, true, Some(false)),
+            SlotVerdict::Rebuild
+        );
+    }
+
+    /// THE NEAR MISS, kept as a guard.
+    ///
+    /// `MgrDiskInfo.online` is ALSO set false node-wide when a `df` merely
+    /// times out or when partition servers report a node — signals that say
+    /// nothing about any individual disk. Reading it above the gate would
+    /// rebuild every sealed slot of any node that missed one 5 s heartbeat,
+    /// which is the storm the gate exists to prevent and which the documented
+    /// rolling-restart procedure (`docs/ops.md`, "a merely-absent node does
+    /// NOT trigger recovery") relies on not happening.
+    ///
+    /// So: a disk whose node is merely unreachable must be WITHHELD. Swapping
+    /// the arm back to `disk_online` reddens this.
+    #[test]
+    fn a_node_that_missed_one_heartbeat_is_not_rebuilt() {
+        assert_eq!(
+            slot_verdict(RecoveryGateMode::FencedOnly, false, false, false, Some(false)),
+            SlotVerdict::Withhold,
+            "offline-because-unreachable is not evidence about a disk"
+        );
+    }
+
+    /// The reverse, and the one that keeps this from being a rebuild storm: a
+    /// disk that is merely FULL must change nothing. `Full` self-heals once
+    /// space returns, and the extent node reports it as `online: true`, so it
+    /// is invisible to the verdict — a cluster running low on space must not
+    /// start rebuilding itself.
+    #[test]
+    fn a_full_disk_triggers_nothing() {
+        assert_eq!(
+            slot_verdict(RecoveryGateMode::FencedOnly, false, false, false, Some(true)),
+            SlotVerdict::Withhold
+        );
+        assert_eq!(
+            slot_verdict(RecoveryGateMode::AutoDisk, false, false, false, Some(true)),
+            SlotVerdict::Probe
+        );
+    }
+
+    #[test]
+    fn a_fenced_node_or_a_corrupt_slot_is_rebuilt_under_either_gate() {
+        for gate in [RecoveryGateMode::FencedOnly, RecoveryGateMode::AutoDisk] {
+            assert_eq!(
+                slot_verdict(gate, true, false, false, Some(true)),
+                SlotVerdict::Rebuild
+            );
+            assert_eq!(
+                slot_verdict(gate, false, true, false, Some(true)),
+                SlotVerdict::Rebuild
+            );
+        }
+    }
+
+    /// The legacy mode's disk arm, which the extraction must not drop.
+    #[test]
+    fn under_auto_disk_a_dead_disk_is_rebuilt_without_probing() {
+        assert_eq!(
+            slot_verdict(RecoveryGateMode::AutoDisk, false, false, false, Some(false)),
+            SlotVerdict::Rebuild
+        );
+    }
+
+    /// A slot whose layout names no disk must read as "no evidence", never as
+    /// dead — legacy records and any slot index past `replicate_disks`.
+    #[test]
+    fn an_unnamed_disk_is_not_evidence() {
+        assert_eq!(
+            slot_verdict(RecoveryGateMode::AutoDisk, false, false, false, None),
+            SlotVerdict::Probe
+        );
+        assert_eq!(
+            slot_verdict(RecoveryGateMode::FencedOnly, false, false, false, None),
+            SlotVerdict::Withhold
+        );
+    }
+
+    #[test]
+    fn a_healthy_slot_probes_under_auto_disk_and_is_withheld_under_fenced_only() {
+        assert_eq!(
+            slot_verdict(RecoveryGateMode::AutoDisk, false, false, false, Some(true)),
+            SlotVerdict::Probe
+        );
+        assert_eq!(
+            slot_verdict(RecoveryGateMode::FencedOnly, false, false, false, Some(true)),
+            SlotVerdict::Withhold
+        );
+    }
+}
+
+#[cfg(test)]
+mod df_disk_health_tests {
+    use super::*;
+    use autumn_rpc::extent_rpc::DiskStatus;
+    use autumn_rpc::manager_rpc::{MgrDiskInfo, MgrNodeInfo};
+
+    fn node_with_two_disks(store: &autumn_common::MetadataStore) -> MgrNodeInfo {
+        let mut s = store.inner.borrow_mut();
+        for did in [10u64, 11] {
+            s.disks.insert(
+                did,
+                MgrDiskInfo {
+                    disk_id: did,
+                    online: true,
+                    uuid: format!("uuid-{did}"),
+                },
+            );
+        }
+        MgrNodeInfo {
+            node_id: 1,
+            address: "127.0.0.1:9101".into(),
+            disks: vec![10, 11],
+            shard_ports: vec![],
+            control_address: String::new(),
+            node_uuid: "uuid-n1".into(),
+        }
+    }
+
+    fn status(online: bool) -> DiskStatus {
+        DiskStatus {
+            total: 1000,
+            free: 500,
+            online,
+            extent_bytes: 500,
+        }
+    }
+
+    /// THE OTHER HALF OF THE BUG. One dead disk does not stop a node answering
+    /// `df`, and a node-wide "everything is online" overwrote the only fact
+    /// that could have repaired it.
+    ///
+    /// Reverting this to set every `node.disks` entry online turns the whole
+    /// per-disk repair path back off, silently — the verdict above would be
+    /// correct and never reached, because it would never see `Some(false)`.
+    #[test]
+    fn a_faulted_disk_survives_a_successful_df() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+        m.apply_df_disk_health(
+            &node,
+            &[(10, status(true)), (11, status(false))],
+        );
+        let s = m.store.inner.borrow();
+        assert!(s.disks[&10].online, "the healthy disk stays online");
+        assert!(
+            !s.disks[&11].online,
+            "the node said this disk is faulted; a successful df must not \
+             overwrite that"
+        );
+    }
+
+    /// COMPOSITION, both directions. The predicate is fed by the real writers
+    /// rather than by hand — feeding it `Some(false)` and calling that "a dead
+    /// disk" is exactly how the storm below got written in the first place.
+    #[test]
+    fn an_unreachable_node_withholds_while_a_faulted_disk_rebuilds() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+
+        // (a) the node stops answering df at all.
+        AutumnManager::mark_node_disks_offline(&m.store, &node);
+        assert!(
+            !m.store.inner.borrow().disks[&10].online,
+            "the node-wide path does mark every disk offline"
+        );
+        assert!(
+            !m.faulted_disks.borrow().contains(&10),
+            "…but says nothing about any individual disk"
+        );
+        assert_eq!(
+            slot_verdict(
+                RecoveryGateMode::FencedOnly,
+                false,
+                false,
+                m.faulted_disks.borrow().contains(&10),
+                Some(m.store.inner.borrow().disks[&10].online),
+            ),
+            SlotVerdict::Withhold,
+            "a node that missed a heartbeat must not have its data rebuilt"
+        );
+
+        // (b) the node answers, and names one of its disks faulted.
+        m.apply_df_disk_health(&node, &[(10, status(true)), (11, status(false))]);
+        assert_eq!(
+            slot_verdict(
+                RecoveryGateMode::FencedOnly,
+                false,
+                false,
+                m.faulted_disks.borrow().contains(&11),
+                Some(m.store.inner.borrow().disks[&11].online),
+            ),
+            SlotVerdict::Rebuild
+        );
+        assert_eq!(
+            slot_verdict(
+                RecoveryGateMode::FencedOnly,
+                false,
+                false,
+                m.faulted_disks.borrow().contains(&10),
+                Some(m.store.inner.borrow().disks[&10].online),
+            ),
+            SlotVerdict::Withhold,
+            "its healthy sibling is untouched"
+        );
+    }
+
+    /// A `df` from one node must not be able to flip another node's disk —
+    /// disk ids are small dense integers and a stale `{dir}/disk_id` sentinel
+    /// is a real way to get a collision.
+    #[test]
+    fn a_node_can_only_speak_about_its_own_disks() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+        let mut stranger = node.clone();
+        stranger.node_id = 2;
+        stranger.disks = vec![99];
+        m.apply_df_disk_health(&stranger, &[(10, status(false))]);
+        assert!(
+            m.store.inner.borrow().disks[&10].online,
+            "node 2 does not own disk 10 and must not mark it faulted"
+        );
+        assert!(!m.faulted_disks.borrow().contains(&10));
+    }
+
+    /// The self-heal direction still works: an EN restart clears `Faulted`, the
+    /// node reports the disk online again, and the manager believes it.
+    #[test]
+    fn a_recovered_disk_comes_back_online() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+        m.apply_df_disk_health(&node, &[(11, status(false))]);
+        assert!(!m.store.inner.borrow().disks[&11].online);
+        m.apply_df_disk_health(&node, &[(11, status(true))]);
+        assert!(m.store.inner.borrow().disks[&11].online);
+    }
+
+    /// Absence is not evidence. A disk the payload does not mention keeps
+    /// whatever was known about it — losing the df ENTIRELY is what is
+    /// node-wide, and that path is unchanged.
+    #[test]
+    fn an_unmentioned_disk_is_left_alone() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+        m.apply_df_disk_health(&node, &[(11, status(false))]);
+        m.apply_df_disk_health(&node, &[(10, status(true))]);
+        assert!(
+            !m.store.inner.borrow().disks[&11].online,
+            "disk 11 was not in the second report and must keep its state"
+        );
     }
 }
