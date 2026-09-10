@@ -819,8 +819,16 @@
   2. 共享 extent 的父子对上 `gc_debt_bytes` 要 dedup，或至少一组只发一次建议。
 - **Acceptance**: 一个 dead 3 GiB / size 16 GiB 的 extent 在默认配置下会被 GC 选中并回收；
   共享 extent 的两个分区报告的债务之和不超过实际死字节。
-- **Status**: `passes: false` (2026-09-09) — 已定位到根因，未实现。不阻塞任何东西：数据没有
-  风险，代价是一条永不收敛的建议循环和翻倍的债务读数。
+- **Status**: `passes: false` (2026-09-09；2026-09-10 修了第一半) — 逐个修复中。
+  **已修**：自动 GC 派发从来不带 `gc_stream_debt`(`manager/src/lib.rs` 的
+  `actuate_maintenance` 写死 `None`)，于是"stream 级死字节超过高水位就把 per-extent 比例
+  减半"这条**本就为这种场景设计的**机制，只在运维手工敲 `--stream-debt` 时才生效。现在按
+  GC 与 FORCE_GC 两种 op 传入策略自己的 `gc_debt_high`——建议按哪个数触发，回收就按哪个数
+  放宽，两端不再各说各话。
+  **仍未修**：即便减半后是 0.2，线上最坏的 extent 是 **0.195**，差 0.005 仍然挑不中。所以
+  `gc_debt_bytes` 还得变诚实——它的文档写着"Σ **reclaimable** bytes"，而当前值把按策略
+  根本不会回收的字节也算了进去。下一步：让它只统计会被选中的 extent，建议自然就不再承诺
+  做不到的事。
 
   **订正**(2026-09-09)：本条最初记作 `BUG-SPLIT-STUCK-RETRY`，把机制写成"父子共用同一对
   stream"。**那是错的**——我当时的脚本把字段列表截断在前 8 个，误把 `discards` 里的

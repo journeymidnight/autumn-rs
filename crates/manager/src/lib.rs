@@ -1935,7 +1935,28 @@ impl AutumnManager {
                     extent_ids,
                     gc_ratio: None,
                     gc_max_size: None,
-                    gc_stream_debt: None,
+                    // Arm the halved-ratio path with the SAME number the
+                    // advisory fired on. The PS already knows to relax its
+                    // per-extent ratio gate once a stream's total dead bytes
+                    // cross `stream_debt` — that mechanism exists precisely for
+                    // "a lot of garbage spread thinly" — but the automatic path
+                    // passed None, so it only ever engaged when an operator
+                    // typed `--stream-debt` by hand.
+                    //
+                    // Leaving it unarmed made the two ends disagree: the
+                    // advisory fires on absolute dead bytes over `gc_debt_high`,
+                    // while selection asked for a ratio the same garbage could
+                    // not reach, so the policy asked every cooldown and GC
+                    // answered "no eligible extents to reclaim" every time.
+                    gc_stream_debt: if matches!(
+                        op,
+                        autumn_rpc::partition_rpc::MAINTENANCE_AUTO_GC
+                            | autumn_rpc::partition_rpc::MAINTENANCE_FORCE_GC
+                    ) {
+                        Some(self.policy.borrow().config.gc_debt_high)
+                    } else {
+                        None
+                    },
                     gc_empty_only: false,
                     op_id: 0,
                 },
