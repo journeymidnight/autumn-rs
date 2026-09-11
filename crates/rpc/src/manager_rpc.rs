@@ -1113,6 +1113,20 @@ pub struct PartitionLoad {
     /// reclaimable WAL debt. Refreshed on the PS GC tick from the persisted SST
     /// discard maps; 0 until the first tick.
     pub open_tail_dead_bytes: u64,
+    /// Mirror of the PS's `PartitionData.has_overlap`: 1 while this partition's
+    /// SSTs still carry keys outside its own range (a CoW split's children
+    /// share the parent's tables until a MAJOR compaction rewrites them), else
+    /// 0.
+    ///
+    /// On the wire because it is a PRECONDITION the manager cannot otherwise
+    /// see: `handle_split_part` refuses with `cannot split: partition has
+    /// overlapping keys` while this is 1, so a policy that advises a split
+    /// against such a partition advises an action that is certain to be
+    /// refused. `sst_out_of_range_bytes` is NOT a substitute — it is the size
+    /// of the out-of-range records, and it reads 0 for an overlapping
+    /// partition whose shared tables happen to hold no out-of-range key, which
+    /// is exactly the case a byte-count inference would wave through.
+    pub has_overlap: u32,
     /// Terminal outcomes (≤ the PS's small ring) of manager-submitted
     /// maintenance ops (compact / gc / forcegc carrying a non-zero `op_id`).
     /// Piggybacked on the 5 s heartbeat so the manager's op-ledger learns the
@@ -1360,6 +1374,27 @@ pub struct NodeOverview {
     pub extent_count: u32,
 }
 
+/// One partition server, from the manager's registry — NOT derived from the
+/// partition list.
+///
+/// The partition list can only show a PS that currently owns something, so the
+/// two states an operator most needs to see are exactly the two it cannot
+/// express: a PS that is registered and serving NOTHING, and a PS that has
+/// stopped heartbeating while its partitions still appear assigned to it.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PsOverview {
+    pub ps_id: u64,
+    /// The PS-level address it registered with (`ps_nodes`). Individual
+    /// partitions listen on their own ports; see `PartitionOverview.ps_addr`.
+    pub address: String,
+    /// Seconds since this PS's last heartbeat, or `u64::MAX` when the manager
+    /// has not seen one since it became leader (a fresh leader starts with an
+    /// empty heartbeat map, so this is "unknown", not "dead").
+    pub last_heartbeat_secs_ago: u64,
+    /// Regions currently assigned to this PS.
+    pub partition_count: u32,
+}
+
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct GetClusterOverviewResp {
     pub code: u8,
@@ -1373,6 +1408,8 @@ pub struct GetClusterOverviewResp {
     pub total_read_bytes_per_sec: u64,
     /// Distinct serving PS instances (by `ps_id`, NOT `ps_addr`).
     pub ps_count: u32,
+    /// Every REGISTERED partition server, including ones owning no partition.
+    pub ps_servers: Vec<PsOverview>,
 }
 
 // ── Extent msg_type constants (needed by manager for node calls) ──────────
@@ -1781,6 +1818,43 @@ pub struct ReportCorruptReplicaResp {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ClusterDfReq {}
 
+/// One disk of one node, as its owning node last described it on `df`.
+///
+/// The node-level rollup above SUMS these, and a sum cannot answer the
+/// questions a disk raises: which disk is full, which one its own node calls
+/// faulted, whether the bytes are spread or piled on one spindle. A node with
+/// disks `[empty, full, full, full]` rolls up as half-free.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct DiskCapWire {
+    pub disk_id: u64,
+    /// The disk's stable uuid as recorded at `autumn-op format` time (empty if
+    /// the manager has no registry row for this disk id).
+    pub uuid: String,
+    /// statvfs truth for the filesystem this disk's data dir lives on.
+    pub total: u64,
+    pub free: u64,
+    /// Σ this disk's live extent file lengths — the real autumn footprint on it.
+    pub extent_bytes: u64,
+    /// Did the node describe this disk on its last `df` at all?
+    ///
+    /// `false` = the manager's registry has this disk for this node but the
+    /// node did not report it — an operator dropped it from the EN's `--data`
+    /// list, or the node is not answering `df`. Every other field is then
+    /// meaningless (zero), and this is the ONLY state in which they are. A
+    /// disk that fails to OPEN cannot produce this: `DiskFS::open` is fallible
+    /// at EN startup, so the node does not come up at all.
+    pub reported: bool,
+    /// What the OWNING NODE said about this disk on its last `df`.
+    pub online: bool,
+    /// The node reported this disk faulted. TODAY this is the same fact as
+    /// `!online` — `faulted_disks` is written from this very `DiskStatus.online`
+    /// (`apply_df_disk_health`) — and it is carried separately because it is
+    /// the one RECOVERY keys on: `!online` at the NODE level also means "the
+    /// node did not answer df", which is not evidence about any disk, while
+    /// this is always the node's own verdict on its own disk.
+    pub faulted: bool,
+}
+
 /// Per-node capacity rollup (sum over the node's online disks).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct NodeCapWire {
@@ -1791,6 +1865,9 @@ pub struct NodeCapWire {
     pub extent_bytes: u64,
     /// false = the node's df probe failed this cycle (unknown != truly offline).
     pub online: bool,
+    /// The disks this rollup was summed from. Empty when the node's df failed
+    /// this cycle (nothing to describe), or for a node that has never answered.
+    pub disks: Vec<DiskCapWire>,
 }
 
 /// `MSG_CLUSTER_DF` response — raw u64 facts only; the consumer computes the

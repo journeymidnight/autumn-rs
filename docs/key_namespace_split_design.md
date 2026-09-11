@@ -215,10 +215,20 @@ autumn-op principal-create mem  --grant mem/   # → mem.cred  （memory-mcp）
 | ③ overview 的 `live_size` | ② 的周期性 rollup：manager sealed 和 + PS 心跳上报的 `open_tail_bytes` | manager `compute_cluster_overview_resp` |
 
 **真实活数据量介于 ① 和 ② 之间**。对 fuse / kvcache 这类几乎全部字节都在
-ValuePointer 里的负载，① 是一个缩小几十倍的影子 —— 直接拿 ① 做 split/merge
-判据会让「该分裂的永远等不到分裂、扛着几十 GB 的分区被判成 merge 候选」。
+ValuePointer 里的负载，① 是一个缩小几十倍的影子。
 
-policy 因此消费的是 `manager::policy::effective_size_bytes`：
+**两个口径分别回答两个问题，用错方向各错一次。**
+
+- **merge 的否决**与**速率触发器下面的地板**用 ②（携带字节）。拿 ① 做 merge 判据
+  会把扛着几十 GB 的分区判成 merge 候选 —— 并成一个分区之后那些字节全压在一条
+  log_stream 上。
+- **split 的硬 size 触发器用 ①（LSM 常驻）**。split 切的是 key range，而跟着
+  key range 走的只有 LSM：大 value 躺在 log_stream 里，CoW split 之后两个孩子
+  **指着同一批 extent**，不 major compact 分不开。拿 ② 做 split 触发器的代价是
+  实测过的：一个 0 iops、0 B/s、LSM 0 MiB、携带 73 GiB 的分区被每个窗口建议
+  split 一次，而 split 对它唯一的作用是买一笔 compaction 账单。
+
+携带字节由 `manager::policy::effective_size_bytes` 给出：
 
 ```
 est_live = Σ sealed_length(三条 stream, 去重)   # manager 状态
@@ -232,9 +242,8 @@ effective = max(size_bytes, est_live)
 - 纯 manager 侧计算，**零 wire 变更、零 PS 热路径成本**（四个分量都已在船上）。
 - 算术全程 saturating：三个 PS gauge 各有各的刷新节奏，刚 punch 完的 extent 会
   短暂让 debt > sealed + open_tail，钳到 0 而不是回绕，退化值经 `max` 落回 ①。
-- **两侧都取 max** 比「merge 用 est_live、split 用 max」更保守：对 split 是
-  `old ∨ new`（只增加候选），对 merge 是 `old ∧ new`（只减少候选）——
-  任一口径说「大」都能否决一次 merge、成就一次 split。
+- **两侧都取 max**：任一口径说「大」都能否决一次 merge。（split 的硬 size
+  触发器不消费它 —— 见上面的两个问题；它只用在速率触发器的地板上。）
 - 已知误差（方向安全，全是高估）：CoW 共享 extent 在两个 child 各计一次；
   row_stream 的 compact 垃圾不被扣除；`open_tail_bytes` 在 PS 首次 probe 前是 0
   （低估侧由 `max` 兜住）。
@@ -245,9 +254,17 @@ effective = max(size_bytes, est_live)
   cooldown）。**arm 基于 size 的 auto-exec 之前必须先修**：要么把 sealed 挪出
   热路径做 per-bucket 历史，要么把 size 维度整个移出去抖。
 
-阈值（`crates/manager/src/policy.rs`）：`SPLIT_SIZE_HARD = 50 GiB`、
-`MERGE_SIZE_LOW = 1 GiB`、`SPLIT_QPS_HIGH = 15K`、`MERGE_QPS_LOW = 1.5K`、
-`HOT_COLD_MIN_HOT_SIZE_BYTES = SPLIT_SIZE_HARD / 2 = 25 GiB`。
+**split 的三个触发器，各自对应一个 split 真能缓解的瓶颈**：请求率
+（一分区 = 一个 P-log 线程，~30K ops/s → `SPLIT_QPS_HIGH`）、字节率
+（一分区 = 一条 log_stream，~350 MB/s → `SPLIT_BW_HIGH`）、LSM 大小
+（compaction/memtable 的工作量，也正是切一刀真能减半的那部分 →
+`SPLIT_LSM_HARD`，口径 ①）。携带字节不是第四个。
+
+阈值（`crates/manager/src/policy.rs`）：`SPLIT_LSM_HARD = 50 GiB`（口径 ①）、
+`SPLIT_SIZE_MIN = 1 GiB`（口径 ②，速率触发器的地板）、`SPLIT_QPS_HIGH = 15K`、
+`SPLIT_BW_HIGH = 175 MiB/s`、`MERGE_SIZE_LOW = 1 GiB`、`MERGE_QPS_LOW = 1.5K`、
+`MERGE_BW_LOW = 17.5 MiB/s`（对整个 pair 求和）、
+`HOT_COLD_MIN_HOT_SIZE_BYTES = 25 GiB`（口径 ②，独立常量）。
 
 ---
 
@@ -345,7 +362,7 @@ mem agent 切点。
 
 - presplit 摊的是「文件之间 / 桶之间」，它做不到的：kvc 的模型指纹在部署时才
   出现、fs 的单个大文件内部。
-- 运行时 split 是安全网本体，它靠 `effective_size_bytes`（§5）才对大 value
+- 运行时 split 是安全网本体，它靠 §5 的速率触发器才对大 value
   负载睁眼。
 - 二者都以 §5 的口径为前提 —— 否则一个糟糕的初始切分永远等不到纠正。
 

@@ -101,6 +101,23 @@ pub fn build_overview_json(
         0.0
     };
     let raw_used = df.raw_total.saturating_sub(df.raw_free);
+    let disks_json = |n: &NodeCapWire| -> Vec<serde_json::Value> {
+        n.disks
+            .iter()
+            .map(|d| {
+                json!({
+                    "disk_id": d.disk_id,
+                    "uuid": d.uuid,
+                    "total": d.total,
+                    "free": d.free,
+                    "extent_bytes": d.extent_bytes,
+                    "reported": d.reported,
+                    "online": d.online,
+                    "faulted": d.faulted,
+                })
+            })
+            .collect()
+    };
     let per_node: Vec<serde_json::Value> = df
         .per_node
         .iter()
@@ -111,6 +128,7 @@ pub fn build_overview_json(
                 "free": n.free,
                 "extent_bytes": n.extent_bytes,
                 "online": n.online,
+                "disks": disks_json(n),
             })
         })
         .collect();
@@ -162,6 +180,12 @@ pub fn build_overview_json(
                 "override_set_by": ns.map(|x| x.override_set_by.clone()).unwrap_or_default(),
                 "override_set_at": ns.map(|x| x.override_set_at).unwrap_or(0),
                 "override_expire_at": ns.map(|x| x.override_expire_at).unwrap_or(0),
+                // Per-disk rows, from the node's own last df. The node-level
+                // total/free above are sums over these and cannot say which
+                // disk is full or which one the node calls bad.
+                "disks": dn.map(|d| disks_json(d)).unwrap_or_default(),
+                "shard_ports": ns.map(|x| x.shard_ports.clone()).unwrap_or_default(),
+                "node_uuid": ns.map(|x| x.node_uuid.clone()).unwrap_or_default(),
             })
         })
         .collect();
@@ -200,6 +224,43 @@ pub fn build_overview_json(
         .collect();
     ps_roll_vec.sort_by_key(|v| v.get("ps_id").and_then(|x| x.as_u64()).unwrap_or(0));
 
+    // Every REGISTERED partition server, enriched with what the page can only
+    // get by walking the partition list. A PS with no partitions has no row
+    // there at all, which is exactly the state worth seeing.
+    let ps_servers: Vec<serde_json::Value> = ov
+        .ps_servers
+        .iter()
+        .map(|p| {
+            let mine = ov.partitions.iter().filter(|x| x.ps_id == p.ps_id);
+            let (mut n, mut size, mut iops, mut wr, mut rd, mut ext) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+            for x in mine {
+                n += 1;
+                size += x.live_size;
+                iops += x.req_per_sec;
+                wr += x.write_bytes_per_sec;
+                rd += x.read_bytes_per_sec;
+                ext += x.total_extents as u64;
+            }
+            json!({
+                "ps_id": p.ps_id,
+                "addr": p.address,
+                // null = this leader has never seen a heartbeat from it (a
+                // fresh leader starts with an empty map). NOT "0 s ago".
+                "last_heartbeat_secs_ago": (p.last_heartbeat_secs_ago != u64::MAX)
+                    .then_some(p.last_heartbeat_secs_ago),
+                "partition_count": p.partition_count,
+                // Recomputed from the partitions the page is showing, so the
+                // count here and the list it drills into cannot disagree.
+                "n": n,
+                "size": size,
+                "req_per_sec": iops,
+                "write_bytes_per_sec": wr,
+                "read_bytes_per_sec": rd,
+                "total_extents": ext,
+            })
+        })
+        .collect();
+
     let advisories: Vec<serde_json::Value> = candidates
         .iter()
         .map(|c| {
@@ -221,6 +282,7 @@ pub fn build_overview_json(
         "nodes": nodes,
         "partitions": partitions,
         "ps_roll": ps_roll_vec,
+        "ps_servers": ps_servers,
         "part_count": ov.partitions.len(),
         "ps_count": ov.ps_count,
         "total_req_per_sec": ov.total_req_per_sec,

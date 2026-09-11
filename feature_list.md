@@ -250,9 +250,13 @@
   端到端 1.15 ms，PS 处理那 ~0.97 ms 的构成完全空白。要做应先量。
 
 ### BUG-WIRE36-UNDEPLOYED — main 上有一个未部署的破坏性 wire 版本
-- **状态** (2026-09-05): `d6a8b73` 把 `WIRE_VERSION` 抬到 **36 且 `MIN = MAX`**
+- **状态** (2026-09-05 起；2026-09-11 更新版本号): `d6a8b73` 把 `WIRE_VERSION` 抬到
+  **36 且 `MIN = MAX`**
   （`MSG_BATCH_DELETE` 是纯加法的 opcode，但本树握手不保存协商结果供调用点门控，
-  所以只能 MIN=MAX）。**代码已入库、线上仍是 35。**
+  所以只能 MIN=MAX）。**代码已入库、线上仍是 35。** 此后 main 继续往上走，现在是
+  **39**（38→39 = `PartitionLoad.has_overlap` + `NodeCapWire.disks` +
+  `GetClusterOverviewResp.ps_servers`）。**这不改变本条的性质** —— 差距变成 35→39，
+  那一次停机升级要跨的版本更多，但仍然是同一次停机。
 - **⚠️ 这是个陷阱，不是待办**：CP 流水线是从 **main 分支**构建的
   （`sources: branch: main`，`cloneDepth: 1`）。所以在这个 commit 之后，**任何一次
   例行构建产出的镜像都无法加入正在运行的 v35 集群**——握手会以
@@ -950,8 +954,9 @@
   **订正**(2026-09-09)：本条最初记作 `BUG-SPLIT-STUCK-RETRY`，把机制写成"父子共用同一对
   stream"。**那是错的**——我当时的脚本把字段列表截断在前 8 个，误把 `discards` 里的
   extent id 当成了 stream id。实际每个分区的 stream 都是独立的(168 是 165/166/167，
-  204 是 201/202/203)，共享的是 **extent**。split 被拒是另一回事，见
-  `F-SPLIT-NEEDS-COMPACT`。
+  204 是 201/202/203)，共享的是 **extent**。split 被拒是另一回事 —— CoW 孩子的 `has_overlap`
+  只有 major compaction 能清，策略现在会**改发这条 compact** 而不是发一个必被拒的
+  split(2026-09-11)。
 
 ### F-SPLIT-ADVICE-COUNTS-UNRECLAIMED — split 建议把"还没回收的垃圾"当成体积，按幻影切分区
 - **Trigger** (2026-09-11，用户把 split+EC 打开做验证时观察到): 三个模型刚被删干净，
@@ -967,7 +972,8 @@
 - **后果不是浪费而已**: split 会持有 `frozen_for_split`、真的产出两个孩子、
   两个孩子 CoW 共享 extent 并各自带上 `has_overlap`，然后需要 major compaction
   才能分开 —— 也就是说，**一次基于幻影体积的 split 会给集群留下真实的清理债**，
-  而这债又正好是 `F-SPLIT-NEEDS-COMPACT` 里那条"切不动"的来源。
+  而这债正是"切不动"的来源 —— 策略现在会改发解锁用的 major compact，
+  而不是发一个必被 `has_overlap` 拒掉的 split(2026-09-11 已实现)。
 - **与 GC 门槛的关系**: 这两条是同一个根的两个症状。GC 那条修好(门槛不再让大 extent
   的垃圾算 0)之后，`est_live` 会自动跟着变准，这一条大概率随之消失。**所以不要
   独立地给 split 加补丁**；先修 `BUG-GC-ADVISORY-VS-SELECTION`，再回来验证这一条。
@@ -981,6 +987,14 @@
   `est_live` 与 `size_bytes` 处在同一量级。
 - **Status**: `passes: false` (2026-09-11) — 仅立账。观察到的现场在
   `claude-progress.txt` 2026-09-11 (4) 那条里。
+  **补充** (2026-09-11，split 判据重设计之后): 幻影体积**不再是 split 的触发器** ——
+  硬 size 触发器改读 LSM 常驻字节，携带字节(含未回收垃圾)只剩下"速率触发器的地板"
+  与"merge 的否决"两个用途，所以本条描述的那四条 split 建议按设计不会再出现
+  (单测 `carried_payload_alone_does_not_advise_a_split`，消融验证)。**但本条不关**:
+  ①验收要求的"刚删空的集群一个周期内零 split 建议"**没有在真集群上复验**;
+  ②根因没动 —— `est_live` 仍然把未回收的垃圾全额计入，于是**merge 的否决**和
+  速率触发器的地板仍然按幻影体积判断(一个删空的分区会因为"看起来很大"而不被 merge);
+  ③因此本条说的"先修 `BUG-GC-ADVISORY-VS-SELECTION`"仍然成立。
 
 ### F-EC-STARVES-FOREGROUND-APPEND — 一个 EC 转换就能把前台写入饿到超时
 - **Trigger** (2026-09-11，追一次分区卡死时量到): 单个 16 GiB extent 的 EC 转换
@@ -1002,30 +1016,49 @@
   append fanout 的 p99 不超过 size-scaled deadline 的一半；转换本身允许变慢。
 - **Status**: `passes: false` (2026-09-11) — 仅立账。
 
-### F-SPLIT-NEEDS-COMPACT — split 前需要先 compact，而策略与面板都不知道这件事
-- **Trigger** (2026-09-09，用户): 「split前要compact，dashboard或者policy要知道」。
-- **实测到的现象**: `auto-policy` 的 recent actions 里排着一列相同的拒绝：
-  `[refused] autumn-op split 168: rpc error (FailedPrecondition): cannot split: partition
-  has overlapping keys`。策略每个周期发一次、每次被拒。part 168 已 50 GiB、超过
-  `size>53687091200` 的阈值，切不开就只会继续长。
-- **为什么它不会自己好**: 拒绝来自 PS 侧的 `part.borrow().has_overlap.get() != 0`
-  (`rpc_handlers.rs:1490`)。重叠是一次 CoW split 的遗留——父子共享 extent
-  (168 与 204 共享 22,169,172,188,190,200 六个)，要靠 compaction 把各自的数据重写进
-  自己的 extent 才会消失。**而策略的冷却 `last_op_at` 只在真的产出了两个孩子之后才盖章**
-  (`rpc_handlers.rs:3686`)，被拒的 split 根本不进冷却，所以每周期照发。
-- **Scope**(未实现，三条按性价比排序):
-  1. **策略在发 split 前先发 compact**。它已经会发 major-compact 建议，缺的是
-     "这个分区想切但重叠着 → 先 compact"这条因果。
-  2. ~~**被拒的 split 要进冷却**~~ —— **已修** (2026-09-10)。根因比预想的更简单也更普遍：
-     auto-policy 的执行循环只在 `Ok(())` 分支写 `st.cooldowns.insert(key, now)`，`Err` 分支
-     只记一条 refused 就走 —— **任何**被拒的动作都会在下一跳原样重发，不只是 split。
-     现在拒绝也起冷却，并且 `cooldowns_changed` 让这类 tick 也持久化冷却(否则 manager
-     一重启又立刻重试)。这是限流不是封禁：条件清了下个窗口自然会再拿起它。
-     ⚠️ **没有单测**：这条路径在一个带 I/O 的 async 循环里，要造一次真实的 actuation 失败
-     才测得到，靠读代码核对。manager 346 个单测仍全绿。
-  3. **面板要说人话**。现在只显示一条 `FailedPrecondition: overlapping keys`，读者无从知道
-     该做什么。应当显示"等待物理分离；先 compact"并给出那条命令。
-- **Acceptance**: 一个重叠未消的分区上，`auto-policy` 的 recent actions 不再出现连续的
-  `split ... refused`；面板对该分区显示的是"需要先 compact"而不是一条裸错误。
-- **Status**: `passes: false` (2026-09-09) — 仅立账，未实现。手工推动的办法是对两个分区
-  各发一次 `autumn-op compact`(最近 17、164 都 compact 成功过)。
+### F-MERGE-COW-STALE-SEQ — 合并两个未分离的 CoW 孩子是否会让旧值压过新值（未复现）
+- **Trigger** (2026-09-11，做 compact-before-merge 时顺带查清的事): 实测确认
+  **merge 根本不检查 `has_overlap`** —— 两侧都是 1 的一对照样合并成功，60 个 key
+  全部读回，幸存者 reopen 之后 `has_overlap` 自己重算成 0。全树唯一的 `has_overlap`
+  闸门是 `handle_split_part`。（`crates/manager/tests/system_merge.rs` 里
+  "Without this, merge would refuse with the has_overlap gate" 那句注释是错的，已改。）
+- **于是剩下一个没人回答的问题**: split 之后两个孩子的 seq 计数器各自从父亲的
+  `max_seq` 独立往上走。幸存者的 SST 里有父亲留下的 key K 的旧版本（seq 高，因为
+  split 前父亲的 seq 已经走到那里），受害者在 split 之后给 K 写了新值（seq 低，
+  因为它从同一个起点独立计数）。合并把两边的 SST 并到一起、range 变宽、
+  `has_overlap` 重算成 0 之后，**MVCC 按 seq 定胜负，旧值可能赢**。
+- **这是假设，不是事实**: 上面那次实测没有构造这个形状（没有在 split 之后对
+  受害者范围内的 key 重写）。按 [[feedback_reproduce_before_fixing_mechanism_bugs]]，
+  先复现再谈修。
+- **Scope(复现之后才谈)**: 写一个确定性 harness —— 建分区 → 写 K → split →
+  只对受害者侧写 K 的新值 → 不 compact 直接 merge → 读 K。读回旧值即坐实。
+  若坐实，修法在 merge 的 seq 处理上（重编号或取全局 max），不是在策略层加闸门。
+- **今天的策略层做了什么、没做什么**: `unblocking_compact` 会在**幸存者**还
+  overlap 时先发一次 major compact —— 那是卫生（幸存者不该扛着未分离的 CoW 表
+  跨过 range 变宽），**不是**为了堵这个洞，注释和 reason 文案都如实这么写。
+  受害者被**故意排除**：它马上就要被 merge 删掉，compact 它是白干。
+- **Acceptance**: 一个确定性复现（或一份说明为什么构造不出来的分析），据此决定修不修。
+- **Status**: `passes: false` (2026-09-11) — 仅立账，**先复现再修**。
+- `passes: false`
+
+### F-SPLIT-CARRIED-BYTES-UNBOUNDED — 大 value 分区可以无限长大，而现在没有任何判据会说话
+- **Trigger** (2026-09-11，本次 split 判据重设计的直接后果): 硬 size 触发器改读
+  **LSM 常驻字节**(`size_bytes`)之后，一个大 value 分区的携带字节(log_stream 里的
+  payload)**不再是任何 split 的触发条件**。这是故意的 —— split 切的是 key range，
+  CoW 之后两个孩子仍然指着同一批 log extent，不 major compact 就分不开 ——
+  但它留下一个没人回答的问题:一个 0 iops、0 B/s、LSM 0 MiB、携带 73 GiB 的分区
+  **可以一直长下去**，而三个速率维度全都是静的。
+- **需要先量，再决定要不要做**: 携带字节真正影响的是**分区级操作的时间** ——
+  reopen/replay、rebalance 搬迁、它三条 stream 的恢复。没有测量说明这些在 73 GiB
+  会变差到什么程度，也没有说明拐点在哪。**在量出来之前不要加判据**
+  ([[feedback_no_defensive_fixes_for_imaginary_bugs]]:"未来可能挂"不算 bug)。
+- **而且即使量出来变差了，split 也未必是解药**: 切一刀不减少携带字节(共享 extent
+  照旧)，要等 major compaction 重写 + GC 搬走活值才真的分开。真正的缓解手段是
+  compaction/GC/EC，或者把分区**搬到另一台 PS**，这两条都不是 split。
+- **Scope(量完确认值得再做)**: 测 reopen/replay 与 rebalance 搬迁时间对携带字节的
+  曲线;若确有拐点，触发的应当是那条真正有缓解作用的动作(rebalance / 强制 GC)，
+  并给它自己的 `POLICY_KIND_*`，而不是把携带字节塞回 split。
+- **Acceptance**: 一条测量曲线(携带字节 × reopen/搬迁时间)，以及据此做出的
+  "做/不做"决定被写进本条。
+- **Status**: `passes: false` (2026-09-11) — 仅立账，未实现，且**先量再做**。
+- `passes: false`

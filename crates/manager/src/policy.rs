@@ -13,21 +13,38 @@ use autumn_rpc::manager_rpc::{
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// (design doc `docs/key_namespace_split_design.md`
-/// §3.3 D3): the size metric the split/merge/hot-cold predicates compare
-/// against these thresholds is `effective_size_bytes` =
-/// `max(size_bytes, est_live)` — NOT the raw `PartitionLoad.size_bytes`
-/// (LSM-resident bytes: Σ SST len + memtable). For a VP workload
-/// (values > 4 KiB live in log_stream, the LSM holds ~24-40 B pointers)
-/// the LSM-resident figure under-reads real carried bytes by ~60×
-/// (live part 17: 741 MB LSM vs ~45 GB stream bytes), so a
-/// size-only threshold on it never fired for split and mis-flagged the
-/// cluster's LARGEST partition as a merge candidate. The threshold
-/// VALUES below are unchanged — but their physical meaning shifted from
-/// "LSM-resident bytes" to "real carried stream bytes (est_live)";
-/// recalibration is a pending operator decision (design doc §5.1,
-/// DryRun a round of `policy-candidates` first).
-pub const SPLIT_SIZE_HARD: u64 = 50 * GIB;
+/// Two size measures, two different questions, and getting them the wrong way
+/// round produced both of this module's historical misfires.
+///
+/// - `PartitionLoad.size_bytes` — **LSM-resident**: Σ SST len + memtables.
+/// - `effective_size_bytes` — **carried**: `max(size_bytes, est_live)`, which
+///   adds the large-value payload sitting in `log_stream` (a VP workload keeps
+///   only ~24-40 B pointers in the LSM, so carried runs ~60× LSM: live part 17
+///   was 741 MB LSM against ~45 GB of stream bytes).
+///
+/// **A split divides the key range, and only the LSM follows the key range.**
+/// The values do not: a CoW split leaves both children referencing the SAME
+/// log_stream extents, and nothing physically separates them until a major
+/// compaction rewrites the tables and GC relocates the live payload. So a
+/// partition carrying 73 GiB behind a 0 MiB LSM, serving no requests, gains
+/// nothing from a split except that compaction bill — which is what the
+/// carried-bytes trigger used to advise, every window, for as long as the
+/// partition existed.
+///
+/// Hence: the hard SIZE trigger reads LSM-resident bytes (`SPLIT_LSM_HARD`),
+/// and carried bytes keep their two other jobs, where the payload genuinely is
+/// what matters — the floor under the rate triggers (`SPLIT_SIZE_MIN`), and
+/// the veto on merge (`MERGE_SIZE_LOW`), since merging two fat partitions
+/// really does put all of those bytes behind one thread.
+///
+/// The 50 GiB value is unchanged from when it was applied to carried bytes.
+/// For a small-value workload the two measures are CLOSE but not equal —
+/// `est_live` also counts live `log_stream` (WAL) and meta_stream bytes on top
+/// of the row_stream SSTs — so the hard trigger now fires at the same point or
+/// slightly later for every workload, not identically. The gap is the WAL tail,
+/// not the 60× the VP case shows; the recalibration it might deserve wants a
+/// measurement on the perf cluster, not a guess here.
+pub const SPLIT_LSM_HARD: u64 = 50 * GIB;
 pub const SPLIT_SIZE_MIN: u64 = GIB;
 /// recalibrated 50K → 15K. autumn-rs's measured single-partition
 /// QPS ceiling on the perf_check workload is ~30K (one P-log thread,
@@ -37,6 +54,24 @@ pub const SPLIT_SIZE_MIN: u64 = GIB;
 /// SPLIT predicate (`req_per_sec > SPLIT_QPS_HIGH && size > SPLIT_
 /// SIZE_MIN`) was effectively dead code.
 pub const SPLIT_QPS_HIGH: u32 = 15_000;
+/// The BYTE-RATE ceiling, which for a large-value workload is the one that
+/// binds: a partition is one log_stream, measured at ~350 MB/s, and no number
+/// of requests per second describes that limit — 1 500 ops/s of 8 MiB values
+/// saturates it while reading as an idle partition to `SPLIT_QPS_HIGH`.
+///
+/// 175 MiB/s = 50 % of the measured ceiling, the same "using half its
+/// single-stream budget" rule `SPLIT_QPS_HIGH` applies to the request ceiling.
+/// Read + write summed: the stream is one pipe.
+///
+/// What "sustained" means here, precisely, because it is weaker than it sounds:
+/// the PS ships a 5-SECOND average every 5 s and the policy bucket is 60 s
+/// LAST-WINS, so "all N buckets" tests five 5-second samples taken a minute
+/// apart — 25 s of coverage across a 5-minute span, not an integral over it. A
+/// writer that bursts near each minute boundary passes; one at 170 MiB/s
+/// continuously does not. This aliasing is inherited from `SPLIT_QPS_HIGH`
+/// rather than introduced here, but byte rate on a large-value workload is
+/// burstier than request rate, so this trigger leans on it harder.
+pub const SPLIT_BW_HIGH: u64 = 175 * 1024 * 1024;
 pub const SPLIT_IMMFULL_HIGH: u32 = 10;
 pub const SPLIT_COOLDOWN_SEC: i64 = 3600;
 
@@ -46,6 +81,15 @@ pub const MERGE_SIZE_LOW: u64 = GIB;
 /// ceiling — "two adjacent cold partitions barely make a dent, merge
 /// them to free a core slot."
 pub const MERGE_QPS_LOW: u32 = 1_500;
+/// Byte-rate counterpart of `MERGE_QPS_LOW`. Without it the cold test can pass
+/// on a pair that is moving real data: 1 400 ops/s of 1 MiB values is under the
+/// QPS floor and is 1.4 GB/s, and merging them puts all of it on one log_stream.
+///
+/// Compared against the SUM over the pair and over both directions, exactly as
+/// `MERGE_QPS_LOW` sums the pair's requests — so the 10× hysteresis holds of
+/// the POST-MERGE partition (the entity a merge creates and the right one to
+/// compare against `SPLIT_BW_HIGH`), and is 20× per side.
+pub const MERGE_BW_LOW: u64 = SPLIT_BW_HIGH / 10;
 pub const MERGE_COOLDOWN_SEC: i64 = 6 * 3600;
 
 /// GC debt advisory threshold. Default 1 GiB sustained — large
@@ -126,10 +170,12 @@ pub const HOT_COLD_MIN_HOT_QPS: u32 = 10_000;
 /// `size_bytes`. Catches large-value / low-QPS workloads that QPS
 /// imbalance can't see.
 pub const HOT_COLD_SIZE_RATIO: u64 = 10;
-/// Size-dimension floor: the largest partition must exceed this to
-/// be worth flagging. Default = half of `SPLIT_SIZE_HARD` (25 GiB),
-/// i.e. already at half of the "must split" size — meaningfully big.
-pub const HOT_COLD_MIN_HOT_SIZE_BYTES: u64 = SPLIT_SIZE_HARD / 2;
+/// Size-dimension floor: the largest partition must exceed this to be worth
+/// flagging. 25 GiB of CARRIED bytes — this advisory's size dimension is about
+/// where the data sits across the PS's partitions, so unlike the split trigger
+/// it reads the payload too, and it is a standalone number rather than a
+/// fraction of a threshold that measures something else.
+pub const HOT_COLD_MIN_HOT_SIZE_BYTES: u64 = 25 * GIB;
 /// Per-PS advisory cooldown — suppress re-emission for 5 min so the
 /// operator log isn't flooded while imbalance persists.
 pub const HOT_COLD_COOLDOWN_SEC: i64 = 300;
@@ -166,13 +212,22 @@ pub const REBALANCE_MAX_MOVES_PER_TICK: u32 = 4;
 /// `tick_interval_sec` to exercise the full policy_tick_loop fast.
 #[derive(Clone, Debug)]
 pub struct PolicyConfig {
-    pub split_size_hard: u64,
+    /// LSM-RESIDENT bytes above which a partition should be split (see the
+    /// `SPLIT_LSM_HARD` doc for why this measure and not carried bytes).
+    pub split_lsm_hard: u64,
+    /// CARRIED bytes a partition must exceed before a rate trigger may split
+    /// it — a floor, not a trigger.
     pub split_size_min: u64,
     pub split_qps_high: u32,
+    /// Sustained read+write bytes/sec above which the partition's single
+    /// log_stream is the bottleneck.
+    pub split_bw_high: u64,
     pub split_immfull_high: u32,
     pub split_cooldown_sec: i64,
     pub merge_size_low: u64,
     pub merge_qps_low: u32,
+    /// Summed read+write bytes/sec below which a pair counts as cold.
+    pub merge_bw_low: u64,
     pub merge_cooldown_sec: i64,
     pub bucket_sec: i64,
     pub window_buckets: usize,
@@ -210,13 +265,15 @@ pub struct PolicyConfig {
 impl Default for PolicyConfig {
     fn default() -> Self {
         Self {
-            split_size_hard: SPLIT_SIZE_HARD,
+            split_lsm_hard: SPLIT_LSM_HARD,
             split_size_min: SPLIT_SIZE_MIN,
             split_qps_high: SPLIT_QPS_HIGH,
+            split_bw_high: SPLIT_BW_HIGH,
             split_immfull_high: SPLIT_IMMFULL_HIGH,
             split_cooldown_sec: SPLIT_COOLDOWN_SEC,
             merge_size_low: MERGE_SIZE_LOW,
             merge_qps_low: MERGE_QPS_LOW,
+            merge_bw_low: MERGE_BW_LOW,
             merge_cooldown_sec: MERGE_COOLDOWN_SEC,
             bucket_sec: POLICY_BUCKET_SEC,
             window_buckets: POLICY_WINDOW_BUCKETS,
@@ -470,11 +527,24 @@ impl PolicyEngine {
 
     /// SPLIT pass — per-partition sliding-window trigger.
     ///
-    /// For each metrics-tracked partition, requires ALL of the last
-    /// `required_buckets` to show a split trigger (size-hard, sustained
-    /// QPS-over-min-size, or imm-full-high) and the partition to be
-    /// outside its `split_cooldown_sec`. Emits one `POLICY_KIND_SPLIT`
-    /// candidate per qualifying partition.
+    /// **A split candidate must name a bottleneck a split relieves.** There are
+    /// exactly three, and each has the metric that measures it:
+    ///
+    /// | bottleneck | why one partition is the unit | metric |
+    /// |---|---|---|
+    /// | request rate | one partition = one P-log thread, ~30K ops/s | `req_per_sec` |
+    /// | byte rate | one partition = one log_stream, ~350 MB/s | `write+read_bytes_per_sec` |
+    /// | LSM size | memtable/compaction work, and it is what a key-range cut halves | `size_bytes` |
+    ///
+    /// CARRIED bytes are deliberately NOT a fourth row. The payload lives in the
+    /// shared `log_stream`; a CoW split leaves both children on the same extents
+    /// and buys nothing until a major compaction rewrites them (see
+    /// `SPLIT_LSM_HARD`). Carried bytes stay as the FLOOR under the two rate
+    /// triggers, which is the question they answer well: is there enough here
+    /// to be worth cutting at all.
+    ///
+    /// A partition that qualifies but still reports `has_overlap` yields a
+    /// COMPACT candidate instead — see `unblocking_compact`.
     fn split_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = self.config.clone();
@@ -494,41 +564,63 @@ impl PolicyEngine {
 
             let sealed_sum = sealed.get(&part_id).copied().unwrap_or(0);
             let recent = &bs[0].1;
-            let recent_eff = effective_size_bytes(sealed_sum, recent);
+            let carried = effective_size_bytes(sealed_sum, recent);
             // (design (b)): the SIZE dimension
             // is NOT debounced. `required_buckets` debounce exists to filter
-            // QPS SPIKES; size (sealed bytes) is a slow, near-monotone quantity,
-            // so demanding "all N buckets big" is the wrong abstraction — a
-            // partition that IS big should split now, thrash guarded by
-            // `split_cooldown_sec`, not wait out a window. So:
-            //   • size-hard   → evaluated ONCE on the current effective size;
-            //   • QPS / imm-full (spiky) → keep the all-N-buckets debounce;
-            //   • the size-MIN gate on the QPS trigger also reads CURRENT size
-            //     (it's a size floor, same slow-signal argument).
-            let size_hard = recent_eff > cfg.split_size_hard;
+            // RATE SPIKES; size is a slow, near-monotone quantity, so demanding
+            // "all N buckets big" is the wrong abstraction — a partition that
+            // IS big should split now, thrash guarded by `split_cooldown_sec`,
+            // not wait out a window. So:
+            //   • LSM-size    → evaluated ONCE on the current value;
+            //   • QPS / bytes-per-sec / imm-full (spiky) → all-N-buckets;
+            //   • the carried-size floor under the rate triggers also reads
+            //     CURRENT size (it's a floor, same slow-signal argument).
+            let lsm_hard = recent.size_bytes > cfg.split_lsm_hard;
             let qps_sustained = bs.iter().all(|(_, l)| l.req_per_sec > cfg.split_qps_high);
-            let qps_trigger = qps_sustained && recent_eff > cfg.split_size_min;
+            let bw_of = |l: &PartitionLoad| {
+                l.write_bytes_per_sec.saturating_add(l.read_bytes_per_sec)
+            };
+            let bw_sustained = bs.iter().all(|(_, l)| bw_of(l) > cfg.split_bw_high);
+            let big_enough = carried > cfg.split_size_min;
+            let qps_trigger = qps_sustained && big_enough;
+            let bw_trigger = bw_sustained && big_enough;
             let immfull_sustained =
                 bs.iter().all(|(_, l)| l.imm_full_per_sec > cfg.split_immfull_high);
-            if !(size_hard || qps_trigger || immfull_sustained) {
+            if !(lsm_hard || qps_trigger || bw_trigger || immfull_sustained) {
+                continue;
+            }
+            // `handle_split_part` REFUSES while the partition still carries
+            // CoW-shared out-of-range keys, and only a major compaction clears
+            // that. Advise the step that unblocks it instead of an action that
+            // cannot be taken — see `unblocking_compact`. Checked BEFORE the
+            // reason is formatted, which this path would only discard.
+            if recent.has_overlap != 0 {
+                out.extend(Self::unblocking_compact(part_id, recent, "split"));
                 continue;
             }
             // Reason names the trigger that actually fired (checked in the same
-            // priority order size-hard → imm-full → QPS) and carries both size
-            // metrics so a DryRun `policy-candidates` round can calibrate.
-            let reason = if size_hard {
+            // priority order) and carries both size metrics, so a DryRun
+            // `policy-candidates` round shows WHICH bytes drove the decision.
+            let reason = if lsm_hard {
                 format!(
-                    "size>{} (est_live {} GiB, lsm {} MiB)",
-                    cfg.split_size_hard,
-                    est_live_bytes(sealed_sum, recent) / GIB,
+                    "lsm>{} (lsm {} MiB; carries {} GiB incl. large-value payload)",
+                    cfg.split_lsm_hard,
                     recent.size_bytes / (1024 * 1024),
+                    carried / GIB,
                 )
             } else if immfull_sustained {
                 format!("imm_full_per_sec>{} sustained", cfg.split_immfull_high)
-            } else {
+            } else if qps_trigger {
                 format!(
                     "req_per_sec>{} sustained AND size>{}",
                     cfg.split_qps_high, cfg.split_size_min
+                )
+            } else {
+                format!(
+                    "bytes_per_sec>{} ({} MiB/s r+w on one log_stream) sustained AND size>{}",
+                    cfg.split_bw_high,
+                    bw_of(recent) / (1024 * 1024),
+                    cfg.split_size_min,
                 )
             };
             out.push(PolicyCandidate {
@@ -536,8 +628,10 @@ impl PolicyEngine {
                 primary_part_id: part_id,
                 secondary_part_id: 0,
                 reason,
-                // The SIZE column of `policy-candidates` — the new measure.
-                size_bytes: recent_eff,
+                // The SIZE column of `policy-candidates` stays CARRIED bytes:
+                // it answers "how big is this partition", which is the payload
+                // too. Only the TRIGGER changed measure.
+                size_bytes: carried,
                 req_per_sec: recent.req_per_sec,
                 imm_full_per_sec: recent.imm_full_per_sec,
                 same_ps: true, // not meaningful for split
@@ -545,6 +639,80 @@ impl PolicyEngine {
             });
         }
         out
+    }
+
+    /// The major compaction a blocked split/merge wants, or `None` while one is
+    /// already running on that partition.
+    ///
+    /// **Split and merge are NOT in the same position here, and the reason text
+    /// says which.** `handle_split_part` REFUSES while `has_overlap` is set, so
+    /// for split this is a hard precondition and the split is advice that
+    /// cannot be taken. Nothing refuses a MERGE on it — the only `has_overlap`
+    /// gate in the tree is that split handler — so for merge this is hygiene:
+    /// the SURVIVOR should not carry un-separated CoW tables across a range
+    /// widen. The merge would otherwise succeed.
+    ///
+    /// The refusal a blocked split earns is cheap (the check is the first thing
+    /// `handle_split_part` does after decode — one RPC round trip, no
+    /// freeze-drain), so the argument for advising the compaction instead is
+    /// not cost. It is that the split is advice nothing in the loop will ever
+    /// make actionable, and it crowds out the one action that would.
+    ///
+    /// **Only `compact_inflight` gates this, deliberately NOT the compact
+    /// cooldown.** The cooldown exists to stop the maintenance pass re-advising
+    /// on a debt LEVEL that has not moved. `has_overlap` is not a level: it is
+    /// a flag only a completed major compaction clears, so a compaction that
+    /// finished inside the cooldown window and left it set did not do the job,
+    /// and waiting out the rest of that window accomplishes nothing while the
+    /// partition produces no advisory at all.
+    ///
+    /// The op emitted is a plain `POLICY_KIND_MAJOR_COMPACT`, actuated as
+    /// `compact <part>`, which reaches the PS with `is_major: true` —
+    /// `MSG_MAINTENANCE` is the only `CompactTask` producer and hardcodes it.
+    /// `has_overlap` does NOT by itself make a compaction major; it only
+    /// suppresses the too-few-tables skip. A future minor-tier compact op would
+    /// therefore break this loop's convergence.
+    ///
+    /// KNOWN GAP, stated rather than papered over: while a major compaction IS
+    /// running, this returns `None` and the blocked partition contributes no
+    /// advisory row at all. Its state stays visible per-partition —
+    /// `autumn-op info --part N --detail` reports `has_overlap` and
+    /// `compact_inflight`, and the dashboard's partition drawer says so — but
+    /// `policy-candidates` is silent for it until that compaction lands.
+    ///
+    /// A policy with `split` on and `compact` off filters this candidate out
+    /// (`kinds_from_switches`) and NOTHING happens. That is the honest outcome
+    /// — a policy that refuses to compact cannot split a CoW child — and it is
+    /// visible, unlike a refusal loop. It is documented in `docs/ops.md`, not
+    /// in the reason string, whose job is to name the op and its target.
+    fn unblocking_compact(
+        part_id: u64,
+        recent: &PartitionLoad,
+        blocked_op: &str,
+    ) -> Option<PolicyCandidate> {
+        if recent.compact_inflight != 0 {
+            return None;
+        }
+        let why = if blocked_op == "split" {
+            "split is REFUSED until a major compaction rewrites them"
+        } else {
+            "merge is not refused on this, but the survivor should not carry them \
+             across a range widen"
+        };
+        Some(PolicyCandidate {
+            kind: POLICY_KIND_MAJOR_COMPACT,
+            primary_part_id: part_id,
+            secondary_part_id: 0,
+            reason: format!(
+                "major compaction before {blocked_op}: partition still carries \
+                 CoW-shared out-of-range keys (has_overlap), and {why}"
+            ),
+            size_bytes: recent.pending_compaction_bytes,
+            req_per_sec: recent.req_per_sec,
+            imm_full_per_sec: recent.imm_full_per_sec,
+            same_ps: true,
+            last_op_at: recent.last_compact_at,
+        })
     }
 
     /// MERGE pass — adjacent-pair sliding-window trigger.
@@ -640,12 +808,37 @@ impl PolicyEngine {
             // strict non-regression for small-value loads).
             let size_small =
                 eff_l < cfg.merge_size_low && eff_r < cfg.merge_size_low;
+            // Cold on BOTH rate dimensions. QPS alone is not cold: 1 400 ops/s
+            // of 1 MiB values passes `merge_qps_low` while moving 1.4 GB/s, and
+            // the merged partition would carry all of it on one log_stream.
             let cold_sustained = lbs.iter().zip(rbs.iter()).all(|((_, lb), (_, rb))| {
+                let bw = lb
+                    .write_bytes_per_sec
+                    .saturating_add(lb.read_bytes_per_sec)
+                    .saturating_add(rb.write_bytes_per_sec)
+                    .saturating_add(rb.read_bytes_per_sec);
                 (lb.req_per_sec + rb.req_per_sec) < cfg.merge_qps_low
+                    && bw < cfg.merge_bw_low
                     && lb.imm_full_per_sec == 0
                     && rb.imm_full_per_sec == 0
             });
             if !(size_small && cold_sustained) {
+                continue;
+            }
+            // Compact before merge — but NOT for the same reason as split, and
+            // only for the SURVIVOR.
+            //
+            // Nothing refuses a merge on `has_overlap`: a pair with both sides
+            // set merges fine, and the survivor's reopen recomputes the flag
+            // against its new wider range. So this is hygiene, not a
+            // precondition — the survivor should not carry un-separated
+            // CoW tables (and their compaction debt) across the widen.
+            //
+            // The VICTIM is deliberately excluded: it is deleted by the merge,
+            // so compacting it is work thrown away. Left (the survivor) is
+            // `primary_part_id` by construction above.
+            if recent_l.has_overlap != 0 {
+                out.extend(Self::unblocking_compact(left_id, recent_l, "merge"));
                 continue;
             }
 
@@ -664,9 +857,10 @@ impl PolicyEngine {
                 // (the old "size_sum<" wording misread as a summed check —
                 // design doc §6 correction).
                 reason: format!(
-                    "size_each<{} qps_sum<{} sustained{}",
+                    "size_each<{} qps_sum<{} bytes_sum<{} sustained{}",
                     cfg.merge_size_low,
                     cfg.merge_qps_low,
+                    cfg.merge_bw_low,
                     if !same_ps {
                         " (cross-PS, infeasible)"
                     } else {
@@ -997,7 +1191,9 @@ impl PolicyEngine {
     ///    / max(1, min(part.min_req)) >= HOT_COLD_RATIO (10)` AND the
     ///    hottest's `max_req > HOT_COLD_MIN_HOT_QPS (10_000)`.
     /// 2. **Size**: `size_bytes`. Same 10× ratio with floor
-    ///    `HOT_COLD_MIN_HOT_SIZE_BYTES (SPLIT_SIZE_HARD/2 = 25 GiB)`.
+    ///    `HOT_COLD_MIN_HOT_SIZE_BYTES` (25 GiB of CARRIED bytes — this
+    ///    advisory's size dimension is about where the data SITS, so unlike the
+    ///    split trigger it counts the large-value payload).
     ///    Catches large-value / low-QPS workloads that the QPS check
     ///    can't see.
     ///

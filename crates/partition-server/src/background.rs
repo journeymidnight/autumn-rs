@@ -599,7 +599,7 @@ pub(crate) async fn background_maintenance_loop(
                             crate::human_size(s.output_bytes)
                         );
                         if major {
-                            part.borrow().has_overlap.set(0);
+                            part.borrow().set_has_overlap(0);
                         }
                         if truncate_id != 0 {
                             let (row_stream_id, part_sc) = {

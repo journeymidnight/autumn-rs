@@ -668,6 +668,11 @@ pub(crate) struct NodeCap {
     pub extent_bytes: u64,
     /// false = the node's df probe failed this tick (unknown != truly offline).
     pub online: bool,
+    /// The per-disk rows this rollup was summed from, exactly as the node
+    /// described them — kept because the sum cannot answer a per-disk
+    /// question ("which disk is full", "which one does its node call bad"),
+    /// and the node already sends them on every df. `(disk_id, DiskStatus)`.
+    pub disks: Vec<(u64, autumn_rpc::extent_rpc::DiskStatus)>,
 }
 
 /// Cluster capacity snapshot. RAW + physical_used refreshed every tick from
@@ -1688,6 +1693,15 @@ impl AutumnManager {
         // Phase B: cluster-level region→PS imbalance advisory
         // (kind = POLICY_KIND_REBALANCE), sourced from regions + ps_nodes.
         cands.append(&mut p.compute_rebalance_advisory(state, now));
+        // One row per (kind, target). The split/merge passes can emit the
+        // unblocking major-compact for a partition the maintenance pass also
+        // flags on its own debt — same op, same cooldown key, two reasons. The
+        // actuator already collapses them (`decide_actions` dedups by
+        // `cooldown_key`), so the second row only ever reaches a human, as
+        // apparent duplicate noise. First wins, which keeps the more specific
+        // reason: the passes that know WHY the op is needed run first.
+        let mut seen: HashSet<String> = HashSet::with_capacity(cands.len());
+        cands.retain(|c| seen.insert(crate::auto_policy::cooldown_key(c)));
         // Persist the union so MSG_GET_POLICY_CANDIDATES returns all 8 kinds
         // (split, merge, gc, major_compact, hot_cold, minor_compact, ec, rebalance).
         p.advisory_cache = cands.clone();

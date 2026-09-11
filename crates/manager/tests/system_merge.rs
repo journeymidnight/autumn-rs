@@ -216,9 +216,12 @@ fn merge_split_round_trip_keys_intact() {
         }
         assert!(survivor_id != 0 && victim_id != 0 && survivor_id != victim_id);
 
-        // Major compact survivor's left child to clear its has_overlap (it
-        // inherited the wider range's SSTs via CoW). Same for the right
-        // child. Without this, merge would refuse with the has_overlap gate.
+        // Major compact both children so they are physically separated before
+        // the merge. NOT because merge is gated on `has_overlap` — it is not;
+        // the only such gate is `handle_split_part`, and a pair with both sides
+        // set merges fine. This keeps the survivor from carrying the parent's
+        // un-separated CoW tables across the range widen, so the assertions
+        // below are about the merge and not about that.
         // Use the per-partition router because the right child has its own
         // listener port.
         psr_compact(&router, survivor_id).await;
@@ -789,7 +792,7 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
 }
 
 /// fast-mode policy_tick_loop e2e for auto-SPLIT: enable auto-split
-/// with a 1-bucket / 1-second config + low SPLIT_SIZE_HARD threshold,
+/// with a 1-bucket / 1-second config + low SPLIT_LSM_HARD threshold,
 /// send synthetic high-load metrics for one partition, verify
 /// policy_tick_loop fires SPLIT automatically.
 ///
@@ -816,14 +819,14 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let manager = AutumnManager::new();
 
-        // Fast-mode: 1 bucket / 1 s tick, no cooldown, low SPLIT_SIZE_HARD
+        // Fast-mode: 1 bucket / 1 s tick, no cooldown, low SPLIT_LSM_HARD
         // (10 MiB) so a synthetic metric with size=20 MiB fires immediately.
         let mut cfg = PolicyConfig::default();
         cfg.required_buckets = 1;
         cfg.tick_interval_sec = 1;
         cfg.split_cooldown_sec = 0;
         cfg.merge_cooldown_sec = 0;
-        cfg.split_size_hard = 10 * 1024 * 1024;
+        cfg.split_lsm_hard = 10 * 1024 * 1024;
         manager.set_policy_config(cfg);
         manager.set_auto_split(true);
 
@@ -856,7 +859,7 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
         // Send synthetic HIGH-size load to trigger the size_hard split rule.
         let load = PartitionLoad {
             part_id: 9001,
-            size_bytes: 20 * 1024 * 1024, // > split_size_hard=10 MiB
+            size_bytes: 20 * 1024 * 1024, // > split_lsm_hard=10 MiB
             req_per_sec: 0,
             imm_full_per_sec: 0,
             p99_us: 0,

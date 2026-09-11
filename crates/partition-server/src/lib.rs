@@ -1397,6 +1397,15 @@ pub struct PartitionMetrics {
     /// Σ bytes of SST records whose keys fall outside the
     /// partition's current `rg` range. Only > 0 while `has_overlap == 1`.
     pub sst_out_of_range_bytes: std::sync::atomic::AtomicU64,
+    /// Cross-thread mirror of `PartitionData.has_overlap` (1 = this
+    /// partition's SSTs still carry keys outside its own range).
+    ///
+    /// `report_load_loop` runs on the MAIN thread and can only reach a
+    /// partition through this `Arc`; `PartitionData` lives on the partition's
+    /// own thread. Writers go through `PartitionData::set_has_overlap` so the
+    /// mirror cannot drift from the Cell it mirrors. The manager needs it
+    /// because `handle_split_part` refuses while it is 1.
+    pub has_overlap: std::sync::atomic::AtomicU32,
     /// bytes the next *minor* compact tick's `pickup_tables`
     /// would feed into `do_compact`. Distinct from
     /// `pending_compaction_bytes` (major). Both can be non-zero
@@ -1524,6 +1533,21 @@ impl Drop for MaintenancePhaseGuard {
 }
 
 impl PartitionData {
+    /// Set the overlap flag and its cross-thread mirror together.
+    ///
+    /// The only writer of `has_overlap`. The Cell is read on the partition
+    /// thread (the read filter, the compaction pickup, the split refusal); the
+    /// mirror is read on the main thread by `report_load_loop`, which is how
+    /// the manager learns a split would be refused. Two independent stores
+    /// would eventually disagree, and the disagreement is invisible until a
+    /// policy acts on the stale half.
+    pub(crate) fn set_has_overlap(&self, v: u32) {
+        self.has_overlap.set(v);
+        self.metrics
+            .has_overlap
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// (MED-2): get-or-insert the per-extent pin counter for `eid`.
     /// Cheap — just a HashMap lookup with lazy creation.
     pub(crate) fn pin_for(&self, eid: u64) -> std::rc::Rc<std::sync::atomic::AtomicI64> {
@@ -3794,6 +3818,10 @@ impl PartitionServer {
                         // gauge (refreshed on the GC tick; 0 until first).
                         let open_tail_dead_bytes =
                             handle.metrics.open_tail_dead_bytes.load(Relaxed);
+                        // Mirror of the partition thread's overlap flag — the
+                        // manager's split/merge advisories need it to avoid
+                        // advising an action the PS is certain to refuse.
+                        let has_overlap = handle.metrics.has_overlap.load(Relaxed);
                         manager_rpc::PartitionLoad {
                             part_id: *part_id,
                             size_bytes,
@@ -3815,6 +3843,7 @@ impl PartitionServer {
                             sealed_log_extent_count,
                             open_tail_bytes,
                             open_tail_dead_bytes,
+                            has_overlap,
                             maintenance_outcomes: handle
                                 .metrics
                                 .snapshot_maintenance_outcomes(),
@@ -6238,6 +6267,10 @@ async fn partition_thread_main(
     // nor a log_stream GC append can race the seal. See field doc.
     let maintenance_gate = CompactionGate::new(1);
 
+    metrics_arc.has_overlap.store(
+        detected_overlap as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
     let part = Rc::new(RefCell::new(PartitionData {
         part_id,
         rg,

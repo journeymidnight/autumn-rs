@@ -69,10 +69,11 @@ self-healing extents.
   survives failover), default-off until you arm it.
 - **Multi-tenant** — opt-in key-range authorization with short-TTL **Ed25519
   capability tokens** (manager as KDC, enforcement at the KV layer).
-- **Operable** — an **embedded web dashboard** served by the manager itself (no
-  separate process), declarative bare-metal deployer (systemd), Kubernetes
-  manifests, Prometheus `/metrics`, `ceph df`-style capacity accounting,
-  rolling restart with convergence gates.
+- **Operable** — a **web dashboard** (`autumn-dashboard`) with a tab per
+  question — keyspace, partitions, servers, nodes-and-disks, policy, logs —
+  declarative bare-metal deployer (systemd), Kubernetes manifests, Prometheus
+  `/metrics`, `ceph df`-style capacity accounting, rolling restart with
+  convergence gates.
 
 ## Quick start
 

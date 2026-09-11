@@ -1,3 +1,175 @@
+Date: 2026-09-11 (5)
+TaskStatus: completed
+Task scope: dashboard 五项改造（用户 2026-09-11 提的 5 点）。其中第 2 点
+  「Policy advisories 有问题，要重新思考」是核心，第 3 点「apply split/merge 前要先
+  compact，检查是不是做了」的答案是**没做**，本轮补上。
+
+【1. 面板拆 tab】examples/dashboard/static/index.html 重写成六个 tab
+  （Overview / Partitions / Servers / Nodes / Policy / Logs），tab 名进 URL hash
+  所以视图可分享。轮询只取**当前 tab 需要的** endpoint —— 每个 /api/* 都会 fork 一个
+  autumn-op 子进程，原来每 5 秒固定 3 个，现在 Partitions/Servers/Nodes 上只有 1 个。
+
+【2. split 判据重设计 —— 这是本轮的主体】
+  现象（用户截图）：part 32 携带 73.8G、9 个 extent，但 row 只有 797.8K、
+  live size 624.8K、0 iops、0 B/s，策略每个窗口发一次
+  `split part 32  size>53687091200 (est_live 73 GiB, lsm 0 MiB)`。
+  **判据错在把"携带字节"当成 split 的触发器。** split 切的是 key range，跟着 key
+  range 走的只有 LSM；大 value 躺在 log_stream 里，CoW split 之后两个孩子**指着
+  同一批 extent**，不 major compact 根本分不开。所以对这种分区，split 买不到任何
+  东西，只买到一笔 compaction 账单 —— 而那正是它每个窗口在建议的事。
+  改法（`crates/manager/src/policy.rs`）：
+  - **一条 split 建议必须点名一个 split 能缓解的瓶颈**，只有三个，各有各的度量：
+    请求率（一分区=一个 P-log 线程，~30K ops/s → `req_per_sec`）、
+    字节率（一分区=一条 log_stream，~350 MB/s → `write+read_bytes_per_sec`）、
+    LSM 大小（compaction/memtable 的工作量，也正是切一刀真能减半的那部分 →
+    `size_bytes`）。
+  - `SPLIT_SIZE_HARD` → `SPLIT_LSM_HARD`，**阈值 50 GiB 一个字节没动**，只把它量的
+    东西从 `effective_size_bytes`（含 payload）换回 `size_bytes`（LSM 常驻）。
+    小 value 负载两个度量本来就重合，所以那类负载的行为**逐位不变**，只有 VP 的
+    假阳性消失。
+  - 新增 `SPLIT_BW_HIGH` = 175 MiB/s（实测单 log_stream 天花板 ~350MB/s 的一半，
+    跟 QPS 阈值取"用掉一半预算"是同一条规则）。这条以前**完全没人看** ——
+    `write_bytes_per_sec`/`read_bytes_per_sec` 收上来了但没有任何判据消费它，
+    而 1400 ops/s × 1 MiB 对 `SPLIT_QPS_HIGH` 来说是空闲，对那条流来说是打满。
+  - 携带字节保留它真正答得好的两个问题：速率触发器下面的**地板**
+    （`SPLIT_SIZE_MIN`，太小的不值得切）和 merge 的**否决**（两个胖分区不能并成
+    一个）。`PolicyCandidate.size_bytes` 仍然报携带字节（"它有多大"就是含 payload 的）。
+  - merge 的 cold 判定补上 `MERGE_BW_LOW`（= SPLIT_BW_HIGH/10，与 QPS 同样的 10×
+    迟滞）：只看 QPS 会把 1.4 GB/s 的一对判成冷。
+  - `HOT_COLD_MIN_HOT_SIZE_BYTES` 原本写成 `SPLIT_SIZE_HARD/2`；它量的是携带字节，
+    从一个量 LSM 的阈值推导是范畴错误，改成独立的 25 GiB（值不变）。
+
+【3. split/merge 前先 compact —— 原来没做，现在做了】
+  PS 侧 `handle_split_part` 在 `has_overlap != 0` 时直接拒（`cannot split:
+  partition has overlapping keys`），而 manager **看不见这个标志**，于是策略每个
+  窗口发一次必被拒的 split。（2026-09-10 修过"被拒也进冷却"，那是限流，不是收敛。）
+  - wire 加 `PartitionLoad.has_overlap`。**刻意没有**用现成的
+    `sst_out_of_range_bytes > 0` 去推断：那是越界记录的**字节数**，一个 has_overlap=1
+    而共享表里恰好没有越界 key 的分区它读 0 —— 正是会被放行的那一种。
+  - PS 侧 `PartitionMetrics.has_overlap` 做跨线程镜像，`PartitionData::set_has_overlap`
+    是**唯一写者**（Cell 在分区线程上，report_load_loop 在主线程只够得着 metrics）。
+  - `unblocking_compact()`：split（或 merge 的任一侧）本该发，但还 overlap，就改发
+    `POLICY_KIND_MAJOR_COMPACT`，reason 写明它在给谁让路；受 `compact_inflight` 与
+    `compact_cooldown_sec` 两道闸门约束。overlap 清掉后下一个 tick 拓扑动作自己回来。
+  - 诚实地写在注释和文档里：若某个策略开了 split 却关了 compact，这条候选会被
+    `kinds_from_switches` 滤掉、**什么都不会发生**。那是对的结果，而且是**看得见的**
+    结果，不像原来的拒绝循环。（预置策略里只有 aggressive 开 split，它 compact 也开。）
+
+【4/5. Nodes 与 Servers 两个 tab —— 它们存在是因为汇总答不了它们要答的问题】
+  - `NodeCapWire.disks`（新）：逐盘 total/free/extent_bytes/online/faulted。节点级
+    total/free 是这些行的和，而 `[空, 满, 满, 满]` 的节点汇总起来是"半空"。
+    `faulted` 取自 manager 的 `faulted_disks`（= 节点自己说这块盘坏了），与 `online`
+    分开：后者还混着"节点根本没应 df"，只有前者是关于**盘**的证据。
+    数据一直在 df 里，`node_health_loop` 以前只求和，现在把逐盘行留在 `NodeCap` 上。
+  - `GetClusterOverviewResp.ps_servers`（新）：**注册在案**的每一台 PS + 心跳年龄。
+    从分区列表推导出来的服务器清单只能看见"当前拥有分区"的 PS，所以最值得看的
+    两种状态恰恰是它表达不了的：一台什么都不服务的 PS，和一台停止心跳的 PS。
+    `last_heartbeat_secs_ago = u64::MAX`（JSON null）= **本任期 leader 没见过**，
+    渲染成 unknown 而不是 dead（新 leader 的心跳表是空的）。
+
+【wire】38 → 39，`MIN = MAX`（本树纪律：停机升级）。三处加法：
+  `PartitionLoad.has_overlap`、`NodeCapWire.disks`、`GetClusterOverviewResp.ps_servers`。
+  feature_list 的 BUG-WIRE36-UNDEPLOYED 已更新：线上仍是 35，差距变成 35→39，
+  性质不变（还是同一次停机升级）。
+
+【测量】
+  - 单测：manager lib 364 / partition-server lib 226 / rpc lib 59 全绿。
+    policy 一族 62 条（新增 7 条）。
+  - 集成：`system_merge --include-ignored` 12/12（103 s）、`system_split_overlap` 4/4。
+  - **消融两条，各自变红**：①硬触发器指回 `effective_size_bytes` ⇒
+    `carried_payload_alone_does_not_advise_a_split` 红；②删掉 `split_candidates` 里
+    的 has_overlap 分支 ⇒ `overlapping_partition_gets_compact_instead_of_split` 与
+    `unblocking_compact_respects_inflight_and_cooldown` 红。
+  - **真集群 e2e（第 3 点的关键一环）**：单节点 + 双盘 EN，写 60 个 key、compact、
+    `autumn-op split 10` → 两个孩子（10 / 14）**都**报 `has_overlap=1`
+    （oor_bytes 248477 / 247680），说明新字段真的从 PS 穿过 wire 到了 manager 再到
+    `info --detail`；两边各 `compact` 一次后 **5 秒内双双回到 0**。
+  - dashboard 三条：`api_contract.sh`（真集群：页面字节 = 磁盘上的
+    index.html、/api/ops 两列、/api/overview 的 ps_servers + 两块盘、
+    /api/partition 的 has_overlap）、`render_check.js`、`tabs_smoke.js` 全过。
+  - clippy：改动区域零新增告警。
+
+【独立评审(CLAUDE.md 规则 15)】
+  **fable 跑不了**：配额在本会话已耗尽（reset 还有 ~23 小时）。**coco 也跑不了**：
+  Trae access token 过期（"log out and sign in again"），GPT-5.5 / GLM-5.1 两个模型
+  都失败。改派一个独立 agent（另起上下文、对抗式 prompt）评审，抓到 15 条，
+  **全部处理**。⚠️ **fable 那一遍仍然欠着**，配额恢复后应当补跑。
+
+  【高危 2 条，都是"我的理由和代码对不上"】
+  1. **merge 侧的 compact 是按一个并不存在的前置条件写的，而且那句话会直接印给运维。**
+     我实测坐实了：两侧 has_overlap 都是 1 的一对**照样合并成功**，60 个 key 全读回，
+     幸存者 reopen 后自己把标志重算成 0；全树唯一的 has_overlap 闸门是
+     `handle_split_part`。而我的 reason 文案写的是"merge is refused until…"。
+     改法：①文案按 op 分叉（split=硬前置/merge=卫生，明说"not refused"）；
+     ②**只 compact 幸存者** —— 受害者马上被 merge 删掉，compact 它是白干
+     （这是评审算出的真实代价，不只是措辞问题）；③新增断言:reason 必须含
+     "not refused"，且 overlap 的**受害者**不得产生 compact。
+  2. **被挡住的 split 在 compaction 期间完全看不见了。** 三条兜底
+     （unblocking / major / minor）全被同样的闸门挡掉 ⇒ `policy-candidates` 对
+     集群最大的分区**一行都不显示**，比改之前（至少还有一行 SPLIT）更差。
+     改法：`unblocking_compact` **只看 compact_inflight，不再看 compact 冷却** ——
+     冷却是为了别对没变化的**债务水位**重复建议，而 has_overlap 是**标志**，
+     一次 compaction 跑完还留着它就说明没干成，等完剩下的窗口毫无意义。
+     消融：把冷却闸门加回去 ⇒ 新测试变红。
+     **剩余缺口如实写在注释里**：compaction 真在跑的那段时间仍然没有 advisory 行，
+     状态只在 `info --part N --detail` 和面板 drawer 里。
+
+  【中危 8 条，全部是注释/文档说过头，本仓库把这个当真缺陷】
+  - "has_overlap == 1 就是让下次 compaction 变成 major 的原因" —— 错，major 来自
+     `CompactTask.is_major`，是 `MSG_MAINTENANCE` 写死 true；has_overlap 只是压掉
+     "表太少就跳过"。改成如实写，并点明：将来若加 minor 档的 compact op，这个环就不收敛了。
+  - "被拒的 split 要付一次完整的 freeze-drain" —— 错，那个检查是 handler 解码后的
+     第一句，只花一个 RPC 往返。理由改成真正成立的那条（它是永远无法被采纳的建议）。
+  - "这条注意事项已经写进 reason 文案" —— 并没有。改成如实说它在 docs/ops.md。
+  - docs/ops.md 里旧的那句"policy-candidates 用 est_live 判 split"就在新段落上面三行，
+     两句话互相打架 —— 删旧的。
+  - `SPLIT_SIZE_HARD` 改名后还有三处残留（policy.rs 的 hot/cold 文档、
+     key_namespace_split_design.md §5 的阈值表和 §3.3、被 cfg(any()) 排除的旧测试）。
+  - **"sustained"比听起来弱**：PS 报的是 5 秒均值、bucket 60 秒 last-wins，
+     所以"N 个 bucket 全触发" = **相隔一分钟的 5 个 5 秒采样**（300 秒里只覆盖 25 秒），
+     不是积分。这是从 QPS 触发器继承的走样，但大 value 的字节率比请求率更抖，
+     新触发器更依赖它 —— 写进常量文档。
+  - `MERGE_BW_LOW` 是对**整个 pair 且双向**求和：10× 迟滞对的是**合并之后**那个
+     分区（正确的比较对象），对单侧是 20×。文档没说清，补上。
+  - **"小 value 负载行为逐位不变"不精确**：`est_live` 还算上 log_stream(WAL) 与
+     meta_stream 的字节，所以硬触发器对所有负载都**同点或略晚**，不是零变化。
+     改成如实描述，并说要校准得先在 perf 机上量。
+  - merge 的 reason 文案漏了新的字节率闸门，DryRun 看不出是哪一维拦的 —— 补上。
+
+  【低危 5 条】
+  - `NodeCap.disks` 少了 `apply_df_disk_health` 那道**节点归属过滤** ⇒ 一个 sentinel
+     写错的盘会显示在别的节点名下。补上同一道过滤。
+  - `DiskCapWire.faulted` 的文档声称它与 `!online` 不同 —— 在**逐盘**这一层今天它们
+     是同一个 bit（都来自同一份 df），页面那个三态 pill 因此有一支永远走不到。
+     修法不是删掉第三态，而是**让它变成真的**：新增 `reported` 字段 ——
+     "注册表里属于这个节点、但节点这次 df 根本没提它"（运维把某个 --data 目录去掉了）。
+     这也顺手补上了评审推断的 LOW-13（我验证了它的前提是错的：`DiskFS::open` 在
+     EN 启动时是 fallible 的，开不了的盘会让整个节点起不来，不会静默消失）。
+  - 我自己新加的断言又抓到一处：未上报的盘在 autumn-bytes 那一列还印 `0B`（假零）—— 改成 —。
+  - 面板两个 drawer 在对象消失时只清了选中态、没清内容 ⇒ 已下线的 PS/节点详情
+     永远留在屏幕上。加 `clearDrawer`。
+  - split 冷却也会把"分离用的 compaction"压住一小时（评审说 arguably fine）——
+     行为不动，写进注释。
+
+  【评审判定为干净的四块】RefCell 借用（两个 compose 函数都是同步、无 await、
+  各只有一个调用方）、wire 改动完整性（所有字面构造点逐一核过）、has_overlap 镜像
+  （set_has_overlap 确是唯一写者，初始 store 在唯一构造点上）、cooldown_key 去重
+  （当前候选集无碰撞，且顺序正确）、面板 danger 门控与定时器。
+
+Main gaps:
+  - **fable 评审仍然欠着**（配额）。本轮用另一个独立 agent 顶上，15 条全处理完，
+    但按规则 15 应当在配额恢复后补跑一遍。
+  - 新立两条账：
+    `F-MERGE-COW-STALE-SEQ` —— merge 不检查 has_overlap 已坐实；由此引出的
+      "旧值按 seq 压过新值"是**假设未复现**，按 reproduce-first 先写 harness 再谈修。
+    `F-SPLIT-CARRIED-BYTES-UNBOUNDED` —— 携带字节不再触发 split 之后，全静的
+      大 value 分区可以一直长大；**先量 reopen/搬迁曲线再决定**，而且真要缓解
+      也是 compaction/GC/rebalance，不是 split。
+
+Next steps:
+  1. 配额恢复后补跑 fable 评审（或修好 coco 的 Trae 登录后跑 coco）。
+  2. 若要部署，注意 wire 已到 39 而线上是 35 —— 见 feature_list 的 BUG-WIRE36-UNDEPLOYED。
+
 Date: 2026-09-11 (4)
 TaskStatus: not_completed
 Task scope: 事故复盘 + 待办。写路径三个 bug 已修并上线(947bae0);数据损失已发生且不可逆;

@@ -9,7 +9,7 @@ Replaces tonic/gRPC to drop HTTP/2 framing and protobuf overhead on the hot path
 `Frame`/`FrameDecoder`, `StatusCode`. Servers are hand-rolled per component on
 `autumn_transport::Conn` (EN, manager, PS), not in this crate.
 
-## Wire Format (v28 — unified CRC)
+## Wire Format (unified CRC)
 
 ONE frame shape, no flag-dependent variants:
 
@@ -92,8 +92,8 @@ first frame with CrcMismatch instead of reaching the version handshake).
   mirrored (`ExtDfReq`, `ExtDeleteExtentReq`, `MgrRecoveryTask`, …): the
   manager encoded through its copy while the node decoded through
   `extent_rpc`'s, so a field added to one side only was a silent rkyv
-  mis-decode — and the fingerprint could not catch it, because both files hash
-  into the SAME one. `extent_rpc`'s `one_definition_only!` block is an identity
+  mis-decode, and a version bump could not have caught it — both copies live
+  under the same version. `extent_rpc`'s `one_definition_only!` block is an identity
   function per message that compiles only while the two paths name the same
   type, so reintroducing a mirror is a build error. A domain type that
   genuinely needs to differ from its wire form must convert at the encode site;
@@ -102,7 +102,7 @@ first frame with CrcMismatch instead of reaching the version handshake).
   manager (leader) signs short-TTL tokens with a private key, the PS verifies
   with the public key only (asymmetric — a compromised PS can verify, never
   forge), the client forwards opaque bytes. Single source of truth for the claims
-  layout, signing bytes, and domain-separation prefix; in the wire fingerprint.
+  layout, signing bytes, and domain-separation prefix; part of the wire schema.
 
 `MSG_TYPE_PING = 0xFF` is reserved; heartbeat lives in each per-component pool.
 
@@ -242,7 +242,7 @@ reads on one EN. `shard_count <= 1` / empty `shard_ports` → shard 0.
 **Changing this remaps ownership of existing extents ⇒ STOP-THE-WORLD reshard**
 (every EN shard + the manager must agree). It is byte-free (EN shards share the
 hashed on-disk data dirs — only logical ownership re-partitions on restart), needs
-no wire-struct change (lib.rs is not in the WIRE fingerprint) and no etcd reset.
+no wire-struct change (`lib.rs` is not part of the wire schema) and no etcd reset.
 Tests: `shard_for_extent_tests`.
 
 ## Admin-token payload-prefix codec
@@ -261,43 +261,47 @@ The token rides as an out-of-band prefix stripped before rkyv decode:
 `None` on a malformed prefix. The manager treats `None` as a FAILED check, never
 "run it bare" — a bare unprefixed payload can't be mistaken for a valid strip.
 
-## WIRE fingerprint + wire-version interval
+## Wire-version interval
 
-`build.rs` hashes the wire-schema sources (`manager_rpc.rs`, `partition_rpc.rs`,
-`frame.rs`, `extent_rpc.rs`, `cap_token.rs`) into `WIRE_FINGERPRINT` (16-hex
-compile-time const). Deploys are same-commit (rkyv has no cross-version compat; a
-mixed deploy fails SILENTLY with garbage decodes). Hashing the schema source (not
-the commit) keeps dev flows sane: unrelated edits don't perturb it, any
-wire-struct edit does — even a comment.
+`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX` (currently **39/39**) declare the interval this
+binary speaks. They are maintained **BY HAND**. `wire_compat_check(remote_min,
+remote_max)` is purely "do the intervals overlap"; a peer reporting `max == 0`
+(empty/pre-R1) is refused. There is no schema fingerprint — hashing the sources byte
+for byte cost more than it caught (a translated comment once split a rolling cluster,
+and each false alarm taught the reflex of refreshing the recorded value without
+looking).
 
-- **`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX`** (currently 33/33) declare the
-  interval this binary speaks. `wire_compat_check(remote_fp, remote_min,
-  remote_max)` accepts iff fingerprints are equal (same-build fast path) OR the
-  intervals overlap. A peer reporting `max == 0` (empty/pre-WIRE) is refused.
-- **`WIRE_VERSION_FINGERPRINTS`** pins each declared version to the fingerprint it
-  was declared against. The `registry_pins_current_schema_to_max_version` test
-  fails the test run whenever the schema changes without a version decision — this
-  is what makes interval overlap trustworthy. Bump rule: pre-R3 (rkyv has no
-  cross-version decode) bump `MAX` and set `MIN = MAX`; post-R3 keep `MIN = MAX-1`
-  (frozen V1 + explicit V2 msg_types, N↔N-1 window).
-- Runtime cross-check: a peer claiming a version in our registry with a DIFFERENT
-  fingerprint is refused as "wire-version fraud" — forgot-to-bump caught at
-  runtime, not just CI.
-- Exchange: the fingerprint + interval ride on `GetClusterIdResp` (filled by the
-  manager in `handle_get_cluster_id`), checked at every long-lived process's
-  startup (`ClusterClient::connect`, PS `finish_connect`). `GetClusterIdReq/Resp`
-  are FROZEN — they ARE the negotiation channel, decoded before any compat
-  decision; additions go in new msg_types. A SUCCESSFUL response failing the check
-  is a hard startup refusal; a TRANSPORT failure fetching it is best-effort
-  skipped (availability wins while the manager is briefly down — every subsequent
-  RPC fails loudly anyway).
-- `cluster_version` (manager etcd key `autumn-rs/cluster_version`, ASCII decimal)
-  is the operator-bumped feature gate: `MSG_GET_CLUSTER_VERSION` (0x4A, fresh etcd
-  read) / `MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, +1, capped at
-  `WIRE_VERSION_MAX`, value-CAS'd). Bump via `autumn-op upgrade-version` only
-  after every member runs the new binary; new wire/persisted formats gate on
-  `cluster_version >= N`. Every manager decode of the persisted value fails closed
-  (blocks leadership) when it exceeds the binary's own `WIRE_VERSION_MAX`.
+**What that leaves uncovered, stated where someone will read it:** *changed the schema
+and forgot to bump* is UNCAUGHT. rkyv has no version tag, so two binaries claiming the
+same version with different layouts handshake happily and then decode each other's
+bytes as garbage. The `compat_no_longer_verifies_the_peers_schema` test exists to keep
+that hole visible in the code. The wire schema is `manager_rpc.rs`, `partition_rpc.rs`, `frame.rs`,
+`extent_rpc.rs`, `cap_token.rs`; adding, removing, reordering or retyping any field of
+an `Archive` type in those files — or changing what an existing field MEANS — is a wire
+change.
+
+Bump rule, pre-R3 (where this tree is): bump `MAX` **and set `MIN = MAX`**. The new
+version is incompatible with everything before it, deploying it is stop-the-world, and
+every image carrying an embedded client must be rebuilt at the same commit. Post-R3
+(frozen V1 + explicit V2 msg_types) would keep `MIN = MAX - 1`; this tree is not there
+— the client runs its compat check once at connect and keeps nothing, so no call site
+can gate on the negotiated version.
+
+Exchange: the interval rides on `GetClusterIdResp` (filled by the manager in
+`handle_get_cluster_id`), checked at every long-lived process's startup
+(`ClusterClient::connect`, PS `finish_connect`). `GetClusterIdReq/Resp` are FROZEN —
+they ARE the negotiation channel, decoded before any compat decision; additions go in
+new msg_types. A SUCCESSFUL response failing the check is a hard startup refusal; a
+TRANSPORT failure fetching it is best-effort skipped (availability wins while the
+manager is briefly down — every subsequent RPC fails loudly anyway).
+
+`cluster_version` (manager etcd key `autumn-rs/cluster_version`, ASCII decimal) is the
+separate operator-bumped feature gate: `MSG_GET_CLUSTER_VERSION` (0x4A, fresh etcd
+read) / `MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, +1, capped at
+`WIRE_VERSION_MAX`, value-CAS'd). Bump via `autumn-op upgrade-version` only after every
+member runs the new binary; new wire/persisted formats gate on `cluster_version >= N`.
+Every manager decode of the persisted value fails closed (blocks leadership) when it
+exceeds the binary's own `WIRE_VERSION_MAX`.
 
 ## Notes
 

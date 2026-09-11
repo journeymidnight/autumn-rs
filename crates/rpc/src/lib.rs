@@ -101,8 +101,8 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 ///   window. This tree is NOT post-R3: the client runs its compatibility
 ///   check once at connect and keeps nothing, so no call site can gate on
 ///   the negotiated version.
-pub const WIRE_VERSION_MIN: u32 = 38;
-pub const WIRE_VERSION_MAX: u32 = 38;
+pub const WIRE_VERSION_MIN: u32 = 39;
+pub const WIRE_VERSION_MAX: u32 = 39;
 
 
 /// Peer wire-compat check: accept iff the version intervals overlap.

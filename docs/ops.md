@@ -107,8 +107,12 @@ show no intermediate phase at all — that is not a fault.
 
 **`cannot split: partition has overlapping keys`** is not an error to chase: the
 PS refuses to split while the LSM still has overlapping key ranges
-(`has_overlap != 0`), which compaction resolves. Retry; `policy-candidates`
-shows the partition's `lsm` figure shrinking as it becomes splittable.
+(`has_overlap != 0`), which a MAJOR compaction resolves. You should not see the
+auto-policy hit it any more — the flag reaches the manager on the load heartbeat
+and `policy-candidates` emits `major compaction required before split` in place
+of the split, so run that compaction (or let a policy with the `compact` switch
+on run it) and the split advisory returns on a later tick. `autumn-op info
+--part <PID> --detail` prints `has_overlap` with the same note.
 
 **What "split finished" means.** The op reaching `succeeded` means the metadata
 cut is in effect and the new partition is being served — `autumn-op info` shows
@@ -116,8 +120,30 @@ one more partition immediately. It does NOT mean the data is physically
 separated: the children share extents copy-on-write, so all of them keep
 reporting the parent's size until compaction and GC reclaim what each no longer
 needs. Do not wait for the sizes to fall, and do not re-split because they have
-not: `policy-candidates` uses `est_live` over the key range, not the physical
-extent footprint, so it stops recommending the split as soon as the cut lands.
+not: the size a split is judged on is the child's LSM, not the carried extent
+footprint (see the next paragraph), and the children are in split cooldown for
+an hour besides.
+
+**What makes the policy recommend a split at all.** Three bottlenecks, each with
+the metric that measures it — request rate (`req_per_sec`, one partition is one
+thread), byte rate (`write+read_bytes_per_sec`, one partition is one log_stream),
+and LSM size (`size_bytes`, which is what a key-range cut halves). **Carried
+bytes are NOT one of them.** A large-value partition keeps its payload in the
+shared log_stream, a CoW split leaves both children pointing at the same extents,
+and only a major compaction separates them — so a partition holding 73 GiB behind
+a 0 MiB LSM with no traffic is not a split candidate however large it looks in
+`info`. Carried bytes remain the FLOOR under the rate triggers (nothing under
+1 GiB is worth cutting) and the VETO on merge (two fat partitions must not become
+one). If a partition you expect to split is silent in `policy-candidates`, read
+its `lsm` and its bytes/sec before its total size:
+
+```bash
+autumn-op --manager $MGR --json info --part <PID> --detail \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(
+      "lsm", d["size_bytes"], "iops", d["req_per_sec"],
+      "B/s", d["write_bytes_per_sec"]+d["read_bytes_per_sec"],
+      "has_overlap", d["has_overlap"])'
+```
 - **Auto-dispatched ops are tracked too.** Extent **recovery** (replica rebuild)
   is never submitted by an operator — it appears in the ledger on its own when
   the recovery loop dispatches it:
@@ -189,10 +215,62 @@ autumn-dashboard \
 kubectl -n autumn port-forward svc/autumn-dashboard 8799:8799   # → http://localhost:8799/
 ```
 
-The page shows cluster capacity, node health, the PS→partition→extent hierarchy,
-policy advisories, and per-target action buttons. Manual actions map to the
-allow-listed `autumn-op` subcommands (`split` / `gc` / `compact` / `merge` /
-`force-ec-convert` / `rebalance`).
+**Six tabs**, with the vital signs (topology / capacity / throughput /
+controller) pinned above all of them. The tab is in the URL hash (`#nodes`), so
+a view is linkable.
+
+| Tab | What it answers |
+|-----|-----------------|
+| Overview | keyspace ribbon, fleet health roll-up, space + amplification, top advisories, what is running |
+| Partitions | PS-scoped partition list + the lazy per-partition drawer (load metrics + extents) |
+| Servers | every REGISTERED partition server, with heartbeat, load and its partitions |
+| Nodes | every extent node, with a **per-disk** table — capacity, online, faulted |
+| Policy | advisories with their full reasoning, the controller, the policy editor |
+| Logs | running ops, durable outcomes, the auto-policy action log |
+
+Manual actions map to the allow-listed `autumn-op` subcommands (`split` / `gc` /
+`compact` / `merge` / `force-ec-convert` / `rebalance`).
+
+**Manual check of the two tabs that exist for facts a roll-up cannot carry:**
+
+```bash
+# Nodes: each node's disks, individually. A node with disks [empty, full, full]
+# rolls up as two-thirds free, so the per-disk row is the only place "this one
+# is full" or "its own node calls it bad" can appear.
+autumn-op --manager $MGR --json overview | python3 -c '
+import json,sys
+for n in json.load(sys.stdin)["nodes"]:
+    print("node", n["node_id"], n["address"])
+    for d in n["disks"]:
+        print("   disk", d["disk_id"], "online" if d["online"] else "OFFLINE",
+              "FAULTED" if d["faulted"] else "", d["free"], "/", d["total"])'
+
+# Servers: the REGISTERED fleet. A PS serving no partition, or one that stopped
+# heartbeating, appears here and nowhere else (the partition list can only show
+# a PS that owns something). last_heartbeat_secs_ago = null means THIS leader
+# has never seen one — unknown, not dead.
+autumn-op --manager $MGR --json overview | python3 -c '
+import json,sys
+for p in json.load(sys.stdin)["ps_servers"]:
+    print("PS", p["ps_id"], p["addr"], "parts", p["n"],
+          "heartbeat", p["last_heartbeat_secs_ago"])'
+```
+
+**Split is refused on an un-separated CoW child, and the page says so first.**
+After a split, both children share the parent's SSTs — which carry keys outside
+each child's range — and `handle_split_part` refuses (`cannot split: partition
+has overlapping keys`) until a MAJOR compaction rewrites them. The partition
+drawer shows that precondition before the Split button is clicked, and the
+auto-policy emits the compaction *in place of* the split, so the action log
+stops filling with one refusal per window:
+
+```bash
+autumn-op --manager $MGR --json info --part <PID> --detail | grep has_overlap
+# 1 → the Policy tab shows "major compaction required before split".
+#     After `autumn-op compact <PID>` clears it, the split advisory returns.
+# NOTE: this candidate is a COMPACT, so a policy with `split` on and `compact`
+#       off filters it out and nothing happens — visible, unlike a refusal loop.
+```
 
 **Auto-rebalance switch (Phase B).** A 6th policy switch,
 `rebalance`, arms the automatic version of `autumn-op rebalance` (see "Rebalancing
@@ -2192,11 +2270,13 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   outcome, with the error text in full for a failure. A finished op must stop
 #   reporting a percentage — a repair frozen at a stale 75% is worse than none.
 #   Automated equivalent (isolated cluster + etcd, asserts the endpoint shape):
-#   `bash examples/dashboard/tests/ops_contract.sh`.
+#   `bash examples/dashboard/tests/api_contract.sh`.
 #   Dashboard: the panel shows the same numbers — verified live through
 #   GET /api/ops during a conversion (18.6% → 37.2% → 55.8% → 74.4%, then
-#   `succeeded 100%` in history). Render check without a cluster:
-#   `node examples/dashboard/tests/render_check.js`.
+#   `succeeded 100%` in history). Without a cluster:
+#   `node examples/dashboard/tests/render_check.js` (panel functions lifted out
+#   of the page) and `node examples/dashboard/tests/tabs_smoke.js` (every tab
+#   rendered under a DOM stub).
 #   LIVE EC-conversion progress: `bash scripts/ec_convert_progress.sh` — spins a
 #   4-EN cluster (EC 3+1 needs four targets), rolls a 1 GiB log extent, converts
 #   it and polls once a second. Measured 2026-08-28 on loopback: samples appear

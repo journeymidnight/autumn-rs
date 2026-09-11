@@ -48,12 +48,14 @@ when an operator needs it.
 `update_stream_ec` mutates `MgrStreamInfo.ec_data_shard / ec_parity_shard`; the
 `ec_conversion_dispatch_loop` then converts sealed extents to the new shape.
 
-### WIRE fingerprint discipline
+### WIRE version discipline
 
-Manager RPC structs are rkyv. Each wire-affecting change carries a fingerprint in
-`manager_rpc.rs`; pre-R3 the binary pins `WIRE_VERSION_MIN == WIRE_VERSION_MAX`, so
-any layout change is a **same-commit, stop-the-world deploy** (`cluster.sh reset`
-wipes etcd; there is no rolling upgrade). `GetClusterIdResp`
+Manager RPC structs are rkyv, which has no version tag and no cross-version decode.
+`WIRE_VERSION_MIN`/`MAX` in `crates/rpc/src/lib.rs` are maintained BY HAND — there is
+no fingerprint and nothing checks the bump for you. Pre-R3 the binary pins
+`MIN == MAX`, so any layout change is a **same-commit, stop-the-world deploy**
+(stop every role, swap binaries, start; etcd is never wiped — see the upgrade-safety
+note below). `GetClusterIdResp`
 (`{wire_version_min, wire_version_max, cluster_version}`, the startup handshake) is
 **FROZEN** from R1 on — never reshape it. New message-type numbers and enum variants
 (`POLICY_KIND_*`, `NODE_AUTO_STATE_*`) are **append-only**; existing numeric values
@@ -864,23 +866,63 @@ split/merged/evicted partitions and windows older than `STALE_METRICS_AGE_SEC = 
 Hot/cold band guard: a partition is "hot" only if its min ≥
 `qps_hottest / HOT_COLD_BAND_DIVISOR` (2), "cold" only if max ≤ `qps_coldest × 2`.
 
-**Size metric (`est_live`).** Raw `PartitionLoad.size_bytes` is LSM-resident bytes
-(SST + memtable) and UNDER-counts VP workloads (values > 4 KiB live in `log_stream`
-behind ValuePointers, invisible to it — a 19 GB partition can look like ~700 MB). So
-every size predicate consumes
-`effective_size_bytes = max(size_bytes, est_live_bytes)` where
-`est_live_bytes = sealed_sum + open_tail_bytes − gc_debt_bytes − open_tail_dead_bytes`
-(saturating). `max` on both sides is strictly conservative: for split `old ∨ new` only
-ADDS candidates; for merge `max < threshold` only REMOVES them, so a degraded
-`est_live` (open-tail probe not yet run) can never flag a partition the LSM metric
-still sees as big. **Never reason about split/merge off raw `size_bytes`.**
+**Two size measures, and which predicate gets which.**
+- `PartitionLoad.size_bytes` — **LSM-resident**: Σ SST len + memtables.
+- `effective_size_bytes = max(size_bytes, est_live_bytes)` — **carried**, where
+  `est_live_bytes = sealed_sum + open_tail_bytes − gc_debt_bytes − open_tail_dead_bytes`
+  (saturating). This adds the large-value payload sitting in `log_stream`, which a VP
+  workload keeps out of the LSM behind ValuePointers — carried runs ~60× LSM.
 
-**SIZE is not debounced; QPS/imm-full are.** The `required_buckets` "all N buckets must
-trigger" rule exists to filter QPS SPIKES. Size (sealed bytes) is a slow, near-monotone
-signal, so `split_candidates` / `merge_candidates` evaluate the SIZE condition ONCE on
-the CURRENT effective size (a single `sealed_sum` snapshot × the newest bucket), thrash-
-guarded by the cooldowns, while the QPS and imm-full dimensions keep the all-N-buckets
-debounce. This makes size-based auto-split/merge safe to arm.
+**A SPLIT candidate must name a bottleneck a split relieves.** There are three, and
+each has its own metric: request rate (one partition = one P-log thread, ~30K ops/s →
+`req_per_sec`), byte rate (one partition = one log_stream, ~350 MB/s →
+`write+read_bytes_per_sec`), and LSM size (compaction/memtable work, and it is what a
+key-range cut actually halves → `size_bytes`). **Carried bytes are not a fourth**: the
+payload lives in the shared log_stream, a CoW split leaves both children on the same
+extents, and nothing separates them until a major compaction rewrites the tables. A
+partition carrying 73 GiB behind a 0 MiB LSM with no load gets nothing from a split
+except that compaction bill — and the policy advised exactly that, every window, until
+`SPLIT_LSM_HARD` was pointed back at LSM bytes. Carried bytes keep their two other
+jobs, where the payload IS the question: the floor under the rate triggers
+(`SPLIT_SIZE_MIN`) and the veto on merge (`MERGE_SIZE_LOW`, since merging two fat
+partitions really does put all those bytes behind one thread).
+
+**Compact before split/merge — and the two are NOT in the same position.**
+`handle_split_part` refuses with `cannot split: partition has overlapping keys` while
+the partition's SSTs still carry keys outside its range, and only a MAJOR compaction
+clears that: for SPLIT the compaction is a hard PRECONDITION. **Nothing refuses a
+MERGE on it** — that split handler is the only `has_overlap` gate in the tree; a pair
+with both sides set merges fine and the survivor's reopen recomputes the flag against
+its new wider range. For MERGE the compaction is hygiene (the survivor should not carry
+un-separated CoW tables across the widen), and it is emitted for the SURVIVOR ONLY —
+compacting the victim is work the merge is about to delete.
+
+Both paths emit `unblocking_compact`, a plain `POLICY_KIND_MAJOR_COMPACT` whose reason
+names which of the two cases it is, instead of the topology op; the op follows on a
+later tick once the flag clears. It is gated on `compact_inflight` and deliberately NOT
+on the compact cooldown — that cooldown throttles re-advising a debt LEVEL, while
+`has_overlap` is a flag only a completed major compaction clears, so a compaction that
+finished inside the window and left it set did not do the job. KNOWN GAP: while a
+compaction IS running the partition contributes no advisory row (its state stays in
+`info --part N --detail` and the dashboard drawer).
+
+The flag reaches the manager as `PartitionLoad.has_overlap`; `sst_out_of_range_bytes`
+is NOT a substitute (it is the SIZE of the out-of-range records, and reads 0 for an
+overlapping partition whose shared tables hold no out-of-range key). If the active
+policy has `split` on and `compact` off, the candidate is filtered out by
+`kinds_from_switches` and nothing happens — the honest outcome, and a visible one,
+unlike a refusal loop.
+
+**SIZE is not debounced; the RATE dimensions are.** The `required_buckets` "all N
+buckets must trigger" rule exists to filter rate SPIKES. Size is a slow, near-monotone
+signal, so `split_candidates` / `merge_candidates` evaluate the SIZE conditions ONCE on
+the current bucket (a single `sealed_sum` snapshot), thrash-guarded by the cooldowns,
+while QPS, byte-rate and imm-full keep the all-N-buckets debounce.
+
+**One advisory row per (kind, target).** `recompute_advisory_cache` dedups the union by
+`cooldown_key`, first wins. The actuator already collapses duplicates
+(`decide_actions`), so a second row for the same op only ever reaches a human — and the
+passes that know WHY an op is needed run first, so first-wins keeps the better reason.
 
 **Sacred boundaries (operator-declared presplit cuts).** `handle_namespace_set_presplit`
 records declared points into `MgrNamespace.presplit` (etcd-first). The rule is generic —
@@ -902,13 +944,15 @@ persisted):**
 
 | Const | Default | Meaning |
 |---|---|---|
-| `SPLIT_SIZE_HARD` | 50 GiB | size-hard split trigger |
-| `SPLIT_SIZE_MIN` | 1 GiB | size floor on the QPS split trigger |
+| `SPLIT_LSM_HARD` | 50 GiB | size-hard split trigger, on **LSM-resident** bytes |
+| `SPLIT_SIZE_MIN` | 1 GiB | **carried**-size floor under the rate split triggers |
 | `SPLIT_QPS_HIGH` | 15 000 | sustained QPS split trigger (≈½ the ~30K single-partition ceiling) |
+| `SPLIT_BW_HIGH` | 175 MiB/s | sustained r+w byte-rate split trigger (½ the ~350 MB/s single-log_stream ceiling) |
 | `SPLIT_IMMFULL_HIGH` | 10 | sustained imm-full/s split trigger |
 | `SPLIT_COOLDOWN_SEC` | 3600 | |
-| `MERGE_SIZE_LOW` | 1 GiB | both sides small |
+| `MERGE_SIZE_LOW` | 1 GiB | both sides small (carried) |
 | `MERGE_QPS_LOW` | 1500 | summed cold QPS (5% of split-high) |
+| `MERGE_BW_LOW` | 17.5 MiB/s | summed cold byte rate (10× hysteresis vs `SPLIT_BW_HIGH`) |
 | `MERGE_COOLDOWN_SEC` | 21600 (6 h) | |
 | `GC_DEBT_HIGH` | 1 GiB | GC advisory |
 | `COMPACT_PENDING_HIGH` | 4 GiB | major-compact advisory |
@@ -1088,9 +1132,25 @@ holds no cluster state and drives the cluster ONLY through `autumn-op` — so th
 wire schema stays in exactly one place. It is token-gated (`--admin-token[-file]`).
 
 What survives in this crate is `dashboard_compose.rs`: the pure `/api/overview`
-composer (df + nodes + partitions + amplification + advisories), shared with
-`autumn-op overview` so the app renders the same view the manager used to serve.
-Manual actions map to the allow-listed `autumn-op` subcommands above.
+composer (df + nodes + partitions + ps_servers + amplification + advisories),
+shared with `autumn-op overview` so the app renders the same view the manager
+used to serve. Manual actions map to the allow-listed `autumn-op` subcommands
+above.
+
+Two of its fields exist because a ROLL-UP CANNOT ANSWER THE QUESTION THEY ANSWER:
+- **`nodes[].disks`** — per-disk `total/free/extent_bytes/online/faulted`, carried
+  whole (offline disks included, though the capacity sums above exclude them). The
+  node already sends these on every `df`; `node_health_loop` keeps them on
+  `NodeCap` instead of only summing. A node with disks `[empty, full, full, full]`
+  rolls up as half-free, and `faulted` — from `faulted_disks`, i.e. what the node
+  SAID about its disk — is the one health bit that is evidence about the disk
+  rather than about the node answering `df` at all.
+- **`ps_servers`** — every REGISTERED PS, from `ps_nodes` plus `ps_last_heartbeat`.
+  A list derived from the partitions can only show a PS that owns something, so
+  the two states most worth seeing (serving nothing; stopped heartbeating) are
+  exactly the two it cannot express. `last_heartbeat_secs_ago = u64::MAX` (JSON
+  `null`) means this LEADER has never seen one — a fresh leader starts with an
+  empty map, so that is "unknown", not "dead".
 
 ## GC lifetime, VP retention, both-zero reclaim
 

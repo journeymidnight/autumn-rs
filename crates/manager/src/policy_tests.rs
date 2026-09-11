@@ -13,8 +13,8 @@ use crate::policy::{
     ComputeArgs, PolicyEngine, COMPACT_COOLDOWN_SEC, COMPACT_PENDING_HIGH, EC_MIN_EXTENT_BYTES,
     GC_COOLDOWN_SEC, GC_DEBT_HIGH, MERGE_COOLDOWN_SEC, MERGE_QPS_LOW, MERGE_SIZE_LOW,
     MINOR_COMPACT_COOLDOWN_SEC, MINOR_COMPACT_PENDING_HIGH, POLICY_BUCKET_SEC,
-    POLICY_REQUIRED_BUCKETS, SPLIT_COOLDOWN_SEC, SPLIT_IMMFULL_HIGH, SPLIT_QPS_HIGH,
-    SPLIT_SIZE_HARD, SPLIT_SIZE_MIN,
+    POLICY_REQUIRED_BUCKETS, SPLIT_BW_HIGH, SPLIT_COOLDOWN_SEC, SPLIT_IMMFULL_HIGH,
+    SPLIT_LSM_HARD, SPLIT_QPS_HIGH, SPLIT_SIZE_MIN,
 };
 
 /// compatibility: the old `POLICY_KIND_COMPACT` constant maps to
@@ -52,7 +52,7 @@ fn mk_part(state: &mut MetadataState, id: u64, start: &[u8], end: &[u8]) {
 }
 
 #[test]
-fn split_size_hard_triggers() {
+fn split_lsm_hard_triggers() {
     let state = MetadataState::default();
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
@@ -62,7 +62,7 @@ fn split_size_hard_triggers() {
         POLICY_REQUIRED_BUCKETS,
         PartitionLoad {
             part_id: 7,
-            size_bytes: SPLIT_SIZE_HARD + GIB,
+            size_bytes: SPLIT_LSM_HARD + GIB,
             req_per_sec: 100,
             imm_full_per_sec: 0,
             p99_us: 0,
@@ -149,7 +149,7 @@ fn split_cooldown_blocks() {
         POLICY_REQUIRED_BUCKETS,
         PartitionLoad {
             part_id: 7,
-            size_bytes: SPLIT_SIZE_HARD + GIB,
+            size_bytes: SPLIT_LSM_HARD + GIB,
             req_per_sec: 0,
             imm_full_per_sec: 0,
             p99_us: 0,
@@ -170,7 +170,7 @@ fn split_cooldown_blocks() {
 }
 
 #[test]
-fn split_size_fires_on_current_bucket_not_debounced() {
+fn split_lsm_size_fires_on_current_bucket_not_debounced() {
     // (b): the SIZE dimension is NOT debounced.
     // A full window whose EARLIER buckets are small but whose CURRENT bucket is
     // over size-hard MUST split now — the old "all N buckets big" rule made a
@@ -182,7 +182,7 @@ fn split_size_fires_on_current_bucket_not_debounced() {
     let small = PartitionLoad { part_id: 7, size_bytes: GIB, ..Default::default() };
     let big = PartitionLoad {
         part_id: 7,
-        size_bytes: SPLIT_SIZE_HARD + GIB,
+        size_bytes: SPLIT_LSM_HARD + GIB,
         ..Default::default()
     };
     // N-1 small buckets, then the newest bucket big (push order = oldest→newest;
@@ -251,7 +251,7 @@ fn split_partial_window_no_trigger() {
         POLICY_REQUIRED_BUCKETS - 1,
         PartitionLoad {
             part_id: 7,
-            size_bytes: SPLIT_SIZE_HARD + GIB,
+            size_bytes: SPLIT_LSM_HARD + GIB,
             req_per_sec: 0,
             imm_full_per_sec: 0,
             p99_us: 0,
@@ -1375,11 +1375,15 @@ fn partition_sealed_sums_dedups_and_degrades() {
     assert_eq!(sums.get(&8).copied(), Some(0));
 }
 
-/// The headline fix: a VP-heavy partition (LSM-resident 741 MB, ~55 GiB of
-/// sealed stream bytes) reaches SPLIT_SIZE_HARD under the new measure — the old
-/// `size_bytes`-only predicate could never fire here.
+/// The live incident this rule exists for: part 32 carried ~73 GiB behind a
+/// 0 MiB LSM, served no requests and moved no bytes, and the policy advised a
+/// split every window forever. A split cuts the key range; the payload is in
+/// the shared log_stream and does not move with it.
+///
+/// ABLATION: point the hard trigger back at `effective_size_bytes` and this
+/// test goes red — it is the whole content of the change.
 #[test]
-fn est_live_vp_load_split_fires_despite_small_lsm() {
+fn carried_payload_alone_does_not_advise_a_split() {
     let mut state = MetadataState::default();
     mk_part_streams(&mut state, 17, b"", b"m", 100, 101, 102);
     mk_extent(&mut state, 1, 30 * GIB, false);
@@ -1397,7 +1401,51 @@ fn est_live_vp_load_split_fires_despite_small_lsm() {
         PartitionLoad {
             part_id: 17,
             size_bytes: 741 * 1024 * 1024, // LSM-resident: pointers only
-            req_per_sec: 100,              // low QPS — size is the only trigger
+            req_per_sec: 100,              // idle on every rate dimension
+            write_bytes_per_sec: 0,
+            read_bytes_per_sec: 0,
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &HashMap::new(),
+        now,
+    });
+    assert!(
+        out.is_empty(),
+        "55 GiB of carried payload with a 741 MiB LSM and no load is not a \
+         split candidate: {out:?}"
+    );
+}
+
+/// The same partition DOES split once a bottleneck a split relieves appears:
+/// here the byte rate, which for a large-value workload is the binding one and
+/// which no QPS threshold can see (1 400 ops/s of 1 MiB values is idle to
+/// `SPLIT_QPS_HIGH` and saturates the single log_stream).
+#[test]
+fn sustained_byte_rate_triggers_split_where_qps_cannot() {
+    let mut state = MetadataState::default();
+    mk_part_streams(&mut state, 17, b"", b"m", 100, 101, 102);
+    mk_extent(&mut state, 1, 30 * GIB, false);
+    mk_stream(&mut state, 100, (0, 0), &[1]);
+    mk_stream(&mut state, 101, (0, 0), &[]);
+    mk_stream(&mut state, 102, (0, 0), &[]);
+
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    fill_window(
+        &mut eng,
+        17,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 17,
+            size_bytes: 741 * 1024 * 1024,
+            req_per_sec: 1_400, // far below SPLIT_QPS_HIGH
+            write_bytes_per_sec: SPLIT_BW_HIGH,
+            read_bytes_per_sec: 16 * 1024 * 1024, // sum is over the threshold
             ..Default::default()
         },
         now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
@@ -1410,65 +1458,45 @@ fn est_live_vp_load_split_fires_despite_small_lsm() {
     });
     assert_eq!(out.len(), 1, "expected exactly the split candidate: {out:?}");
     assert_eq!(out[0].kind, POLICY_KIND_SPLIT);
-    assert_eq!(out[0].primary_part_id, 17);
-    // The SIZE column (candidate.size_bytes) carries the new measure.
-    assert_eq!(out[0].size_bytes, 55 * GIB);
     assert!(
-        out[0].reason.contains("est_live"),
-        "reason should expose est_live for DryRun calibration: {}",
+        out[0].reason.contains("bytes_per_sec"),
+        "reason must name the bottleneck that fired: {}",
         out[0].reason
     );
+    // The SIZE column still reports CARRIED bytes — "how big is it" includes
+    // the payload even though the trigger does not.
+    assert_eq!(out[0].size_bytes, 30 * GIB);
 }
 
-/// gc_debt / open_tail_dead are subtracted: dead bytes must not push a
-/// partition over SPLIT_SIZE_HARD. Part 7 (52 GiB gross − 3 GiB debt =
-/// 49 GiB) stays silent; part 8 (same gross, no debt) fires.
+/// A byte-rate-saturated partition too SMALL to be worth cutting stays silent:
+/// the carried floor under the rate triggers still applies, and it still
+/// subtracts dead bytes (gross 3 GiB − 2.5 GiB of debt is under 1 GiB).
 #[test]
-fn est_live_debt_subtraction_suppresses_split() {
+fn rate_trigger_respects_the_carried_floor_after_debt() {
     let mut state = MetadataState::default();
-    for (pid, log_sid, eid) in [(7u64, 100u64, 1u64), (8, 200, 2)] {
-        let (start, end) = if pid == 7 {
-            (b"a".as_ref(), b"m".as_ref())
-        } else {
-            (b"m".as_ref(), b"z".as_ref())
-        };
-        mk_part_streams(&mut state, pid, start, end, log_sid, log_sid + 1, log_sid + 2);
-        mk_extent(&mut state, eid, 49 * GIB, false);
-        mk_stream(&mut state, log_sid, (0, 0), &[eid]);
-        mk_stream(&mut state, log_sid + 1, (0, 0), &[]);
-        mk_stream(&mut state, log_sid + 2, (0, 0), &[]);
-    }
+    mk_part_streams(&mut state, 17, b"", b"m", 100, 101, 102);
+    mk_extent(&mut state, 1, 3 * GIB, false);
+    mk_stream(&mut state, 100, (0, 0), &[1]);
+    mk_stream(&mut state, 101, (0, 0), &[]);
+    mk_stream(&mut state, 102, (0, 0), &[]);
 
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let hot_but_tiny = PartitionLoad {
+        part_id: 17,
+        size_bytes: 64 * 1024 * 1024,
+        req_per_sec: SPLIT_QPS_HIGH + 1,
+        write_bytes_per_sec: SPLIT_BW_HIGH + 1,
+        gc_debt_bytes: 2 * GIB,
+        open_tail_dead_bytes: GIB / 2,
+        ..Default::default()
+    };
     fill_window(
         &mut eng,
-        7,
+        17,
         POLICY_REQUIRED_BUCKETS,
-        PartitionLoad {
-            part_id: 7,
-            size_bytes: 500 * 1024 * 1024,
-            open_tail_bytes: 3 * GIB,     // gross 52 GiB > hard...
-            gc_debt_bytes: 2 * GIB,       // ...but 3 GiB of it is dead
-            open_tail_dead_bytes: GIB,    // → est_live 49 GiB < 50 GiB
-            req_per_sec: 100,
-            ..Default::default()
-        },
-        base,
-    );
-    fill_window(
-        &mut eng,
-        8,
-        POLICY_REQUIRED_BUCKETS,
-        PartitionLoad {
-            part_id: 8,
-            size_bytes: 500 * 1024 * 1024,
-            open_tail_bytes: 3 * GIB, // gross 52 GiB, no debt → fires
-            req_per_sec: 100,
-            ..Default::default()
-        },
-        base,
+        hot_but_tiny.clone(),
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
     );
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -1476,9 +1504,33 @@ fn est_live_debt_subtraction_suppresses_split() {
         region_owners: &HashMap::new(),
         now,
     });
-    assert_eq!(out.len(), 1, "only the debt-free partition splits: {out:?}");
-    assert_eq!(out[0].primary_part_id, 8);
-    assert_eq!(out[0].size_bytes, 52 * GIB);
+    assert!(
+        out.is_empty(),
+        "500 MiB of live data is not worth cutting however hot: {out:?}"
+    );
+
+    // Drop the debt and the very same load qualifies — proving the floor, not
+    // some unrelated gate, is what suppressed it.
+    let mut eng2 = PolicyEngine::default();
+    fill_window(
+        &mut eng2,
+        17,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            gc_debt_bytes: 0,
+            open_tail_dead_bytes: 0,
+            ..hot_but_tiny
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let out2 = eng2.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &HashMap::new(),
+        now,
+    });
+    assert_eq!(out2.len(), 1, "debt-free, same load → splits: {out2:?}");
+    assert_eq!(out2[0].kind, POLICY_KIND_SPLIT);
 }
 
 /// The direction fix from the live incident: a partition whose LSM-resident
@@ -1588,4 +1640,211 @@ fn hot_cold_size_dimension_sees_est_live() {
     assert_eq!(cands[0].kind, POLICY_KIND_HOT_COLD);
     assert_eq!(cands[0].primary_part_id, 300);
     assert_eq!(cands[0].size_bytes, 60 * GIB, "SIZE column carries the new measure");
+}
+
+// ── compact-before-split / merge ─────────────────────────────────────────
+//
+// A CoW split's children share the parent's SSTs, which carry keys outside
+// each child's own range; the PS reports `has_overlap = 1` and refuses a split
+// while it is set. These tests pin that the policy advises the compaction that
+// clears it instead of an op certain to be refused.
+
+/// A genuinely split-worthy partition that still overlaps yields a COMPACT
+/// candidate, not a SPLIT.
+///
+/// ABLATION: delete the `has_overlap` branch in `split_candidates` and this
+/// goes red with a SPLIT — which is what the cluster did, once per window,
+/// against a partition nothing in the loop was going to unblock.
+#[test]
+fn overlapping_partition_gets_compact_instead_of_split() {
+    let state = MetadataState::default();
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let load = |has_overlap: u32| PartitionLoad {
+        part_id: 7,
+        size_bytes: SPLIT_LSM_HARD + GIB,
+        req_per_sec: 100,
+        pending_compaction_bytes: 2 * GIB,
+        has_overlap,
+        ..Default::default()
+    };
+
+    let mut eng = PolicyEngine::default();
+    fill_window(&mut eng, 7, POLICY_REQUIRED_BUCKETS, load(1), base);
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &HashMap::new(),
+        now,
+    });
+    assert_eq!(out.len(), 1, "one candidate, the unblocking compact: {out:?}");
+    assert_eq!(out[0].kind, POLICY_KIND_MAJOR_COMPACT);
+    assert_eq!(out[0].primary_part_id, 7);
+    assert!(
+        out[0].reason.contains("before split"),
+        "the reason must say what it unblocks: {}",
+        out[0].reason
+    );
+
+    // Overlap cleared (a major compaction ran) → the split it was waiting for.
+    let mut eng2 = PolicyEngine::default();
+    fill_window(&mut eng2, 7, POLICY_REQUIRED_BUCKETS, load(0), base);
+    let out2 = eng2.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &HashMap::new(),
+        now,
+    });
+    assert_eq!(out2.len(), 1);
+    assert_eq!(out2[0].kind, POLICY_KIND_SPLIT, "converges once separated");
+}
+
+/// The merge side compacts the SURVIVOR only.
+///
+/// Nothing refuses a merge on `has_overlap` (unlike split) — this is hygiene
+/// before the survivor's range widens. The victim is deleted by the merge, so
+/// compacting it is work thrown away, and that is the whole content of this
+/// test: an overlapping VICTIM alone must not produce a compaction.
+#[test]
+fn only_the_merge_survivor_gets_the_hygiene_compact() {
+    let mut state = MetadataState::default();
+    mk_part_streams(&mut state, 1, b"a", b"m", 100, 101, 102);
+    mk_part_streams(&mut state, 2, b"m", b"z", 200, 201, 202);
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let owners: HashMap<u64, u64> = vec![(1u64, 9u64), (2, 9)].into_iter().collect();
+    let cold = |has_overlap: u32| PartitionLoad {
+        size_bytes: 100 * 1024 * 1024,
+        req_per_sec: 1,
+        pending_compaction_bytes: GIB,
+        has_overlap,
+        ..Default::default()
+    };
+
+    // Only the VICTIM (part 2, the right side) overlaps → nothing to do for
+    // it; the merge proceeds. Compacting a partition the merge deletes is the
+    // work this excludes.
+    let mut eng = PolicyEngine::default();
+    fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, cold(0), base);
+    fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, cold(1), base);
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &owners,
+        now,
+    });
+    assert_eq!(out.len(), 1, "an overlapping victim does not block: {out:?}");
+    assert_eq!(out[0].kind, POLICY_KIND_MERGE, "the merge itself");
+
+    // The SURVIVOR (part 1, the left side) overlapping DOES divert to compact.
+    let mut eng_s = PolicyEngine::default();
+    fill_window(&mut eng_s, 1, POLICY_REQUIRED_BUCKETS, cold(1), base);
+    fill_window(&mut eng_s, 2, POLICY_REQUIRED_BUCKETS, cold(0), base);
+    let out_s = eng_s.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &owners,
+        now,
+    });
+    assert_eq!(out_s.len(), 1, "the survivor is compacted first: {out_s:?}");
+    assert_eq!(out_s[0].kind, POLICY_KIND_MAJOR_COMPACT);
+    assert_eq!(out_s[0].primary_part_id, 1, "the survivor, not the victim");
+    assert!(out_s[0].reason.contains("before merge"), "{}", out_s[0].reason);
+    assert!(
+        out_s[0].reason.contains("not refused"),
+        "the reason must not claim a precondition merge does not have: {}",
+        out_s[0].reason
+    );
+
+    // Both clean → the merge itself.
+    let mut eng2 = PolicyEngine::default();
+    fill_window(&mut eng2, 1, POLICY_REQUIRED_BUCKETS, cold(0), base);
+    fill_window(&mut eng2, 2, POLICY_REQUIRED_BUCKETS, cold(0), base);
+    let out2 = eng2.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &owners,
+        now,
+    });
+    assert_eq!(out2.len(), 1);
+    assert_eq!(out2[0].kind, POLICY_KIND_MERGE);
+}
+
+/// The unblocking compact waits for a compaction that is RUNNING, and for
+/// nothing else.
+///
+/// The compact cooldown deliberately does NOT gate it: that cooldown exists to
+/// stop the maintenance pass re-advising on a debt LEVEL that has not moved,
+/// and `has_overlap` is not a level. A compaction that finished inside the
+/// cooldown window and left the flag set did not do the job, and sitting out
+/// the rest of the window would leave the partition with no advisory at all —
+/// which is the one state worse than advising the compaction twice.
+#[test]
+fn unblocking_compact_waits_only_for_a_running_compaction() {
+    let state = MetadataState::default();
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let blocked = |compact_inflight: u32, last_compact_at: i64| PartitionLoad {
+        part_id: 7,
+        size_bytes: SPLIT_LSM_HARD + GIB,
+        req_per_sec: 100,
+        has_overlap: 1,
+        compact_inflight,
+        last_compact_at,
+        ..Default::default()
+    };
+    let run = |load: PartitionLoad| {
+        let mut eng = PolicyEngine::default();
+        fill_window(&mut eng, 7, POLICY_REQUIRED_BUCKETS, load, base);
+        eng.compute_candidates(ComputeArgs {
+            state: &state,
+            last_op_at: &HashMap::new(),
+            region_owners: &HashMap::new(),
+            now,
+        })
+    };
+    assert!(
+        run(blocked(1, 0)).is_empty(),
+        "a compaction is already running on this partition"
+    );
+    // ABLATION for the gap this closes: with a cooldown gate both of these
+    // would be empty, and the cluster's largest partition would show NOTHING
+    // in `policy-candidates` for five minutes after a compaction that failed
+    // to separate it.
+    assert_eq!(
+        run(blocked(0, now - COMPACT_COOLDOWN_SEC / 2)).len(),
+        1,
+        "a compaction that finished recently and left the flag set did not do \
+         the job; advise another rather than go silent"
+    );
+    assert_eq!(run(blocked(0, now - COMPACT_COOLDOWN_SEC - 1)).len(), 1);
+}
+
+/// A pair moving real bytes is not cold, however few requests it serves:
+/// 1 400 ops/s of 1 MiB values passes `MERGE_QPS_LOW` and is 1.4 GB/s, and the
+/// merged partition would carry all of it on one log_stream.
+#[test]
+fn byte_rate_vetoes_a_merge_that_qps_calls_cold() {
+    let mut state = MetadataState::default();
+    mk_part_streams(&mut state, 1, b"a", b"m", 100, 101, 102);
+    mk_part_streams(&mut state, 2, b"m", b"z", 200, 201, 202);
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let owners: HashMap<u64, u64> = vec![(1u64, 9u64), (2, 9)].into_iter().collect();
+    let busy = PartitionLoad {
+        size_bytes: 100 * 1024 * 1024,
+        req_per_sec: 700, // summed 1 400 — under MERGE_QPS_LOW
+        write_bytes_per_sec: 700 * 1024 * 1024,
+        ..Default::default()
+    };
+    let mut eng = PolicyEngine::default();
+    fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, busy.clone(), base);
+    fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, busy, base);
+    let out = eng.compute_candidates(ComputeArgs {
+        state: &state,
+        last_op_at: &HashMap::new(),
+        region_owners: &owners,
+        now,
+    });
+    assert!(out.is_empty(), "1.4 GB/s is not a cold pair: {out:?}");
 }

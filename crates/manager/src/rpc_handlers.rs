@@ -1996,6 +1996,63 @@ impl AutumnManager {
             };
         }
         let snap = self.cluster_cap.borrow();
+        // uuid comes from the manager's own disk registry, not from the node's
+        // df (which carries ids only); `faulted` from `faulted_disks`, which
+        // records what a node SAID about its disk and is therefore the only
+        // one of the two health bits that is evidence about the disk itself.
+        let store = self.store.inner.borrow();
+        let disks_reg = &store.disks;
+        let faulted = self.faulted_disks.borrow();
+        // Same node-ownership filter `apply_df_disk_health` applies: a stale
+        // `{dir}/disk_id` sentinel makes a node report a disk that belongs to
+        // another node, and rendering it under the reporter would put a fault
+        // on the wrong machine. Unreported registry disks are appended after,
+        // as their own state.
+        fn node_disks(
+            node_id: u64,
+            reported: &[(u64, autumn_rpc::extent_rpc::DiskStatus)],
+            store: &autumn_common::MetadataState,
+            disks_reg: &std::collections::HashMap<u64, MgrDiskInfo>,
+            faulted: &std::collections::HashSet<u64>,
+        ) -> Vec<DiskCapWire> {
+            let owned: Vec<u64> = store
+                .nodes
+                .get(&node_id)
+                .map(|n| n.disks.clone())
+                .unwrap_or_default();
+            let uuid_of = |id: &u64| disks_reg.get(id).map(|d| d.uuid.clone()).unwrap_or_default();
+            let mut out: Vec<DiskCapWire> = reported
+                .iter()
+                .filter(|(disk_id, _)| owned.contains(disk_id))
+                .map(|(disk_id, st)| DiskCapWire {
+                    disk_id: *disk_id,
+                    uuid: uuid_of(disk_id),
+                    total: st.total,
+                    free: st.free,
+                    extent_bytes: st.extent_bytes,
+                    reported: true,
+                    online: st.online,
+                    faulted: faulted.contains(disk_id),
+                })
+                .collect();
+            // A disk the registry still assigns to this node but the node did
+            // not describe. Without this row the view answering "which disk is
+            // bad" simply has one fewer disk than the node was formatted with,
+            // which is the one shape it must not render as healthy.
+            for disk_id in owned {
+                if reported.iter().any(|(d, _)| *d == disk_id) {
+                    continue;
+                }
+                out.push(DiskCapWire {
+                    disk_id,
+                    uuid: uuid_of(&disk_id),
+                    reported: false,
+                    ..Default::default()
+                });
+            }
+            out.sort_by_key(|d| d.disk_id);
+            out
+        }
         let per_node = snap
             .per_node
             .iter()
@@ -2005,6 +2062,7 @@ impl AutumnManager {
                 free: c.free,
                 extent_bytes: c.extent_bytes,
                 online: c.online,
+                disks: node_disks(*id, &c.disks, &store, disks_reg, &faulted),
             })
             .collect();
         ClusterDfResp {
@@ -5289,6 +5347,7 @@ impl AutumnManager {
                 total_write_bytes_per_sec: 0,
                 total_read_bytes_per_sec: 0,
                 ps_count: 0,
+                ps_servers: Vec::new(),
             };
         }
         let s = self.store.inner.borrow();
@@ -5402,6 +5461,35 @@ impl AutumnManager {
             .collect::<std::collections::HashSet<_>>()
             .len() as u32;
 
+        // Every REGISTERED partition server, from `ps_nodes` — not from the
+        // regions, which can only show a PS that owns something. A PS serving
+        // nothing and a PS that stopped heartbeating are both invisible in a
+        // partition-derived list, and they are the two states worth looking at.
+        let mut per_ps_parts: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
+        for r in s.regions.values() {
+            *per_ps_parts.entry(r.ps_id).or_insert(0) += 1;
+        }
+        let hb = self.ps_last_heartbeat.borrow();
+        let now = Instant::now();
+        let mut ps_servers: Vec<PsOverview> = s
+            .ps_nodes
+            .iter()
+            .map(|(ps_id, addr)| PsOverview {
+                ps_id: *ps_id,
+                address: addr.clone(),
+                // u64::MAX = never seen by THIS leader. A fresh leader starts
+                // with an empty map, so "no heartbeat yet" must not render as
+                // "0 s ago" (alive) nor be mistaken for a dead PS.
+                last_heartbeat_secs_ago: hb
+                    .get(ps_id)
+                    .map(|t| now.saturating_duration_since(*t).as_secs())
+                    .unwrap_or(u64::MAX),
+                partition_count: per_ps_parts.get(ps_id).copied().unwrap_or(0),
+            })
+            .collect();
+        ps_servers.sort_by_key(|p| p.ps_id);
+
         GetClusterOverviewResp {
             code: CODE_OK,
             message: String::new(),
@@ -5411,6 +5499,7 @@ impl AutumnManager {
             total_write_bytes_per_sec,
             total_read_bytes_per_sec,
             ps_count,
+            ps_servers,
         }
     }
 

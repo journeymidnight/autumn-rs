@@ -37,7 +37,7 @@ Apply buttons and auto-policy activate/deactivate) use it.
 
 | Route | Runs |
 |-------|------|
-| `GET /api/overview` | `autumn-op overview` (df + nodes + partitions + amplification + advisories) |
+| `GET /api/overview` | `autumn-op overview` (df + nodes with per-disk rows + partitions + ps_servers + amplification + advisories) |
 | `GET /api/partition/{id}` | `autumn-op info --part {id} --detail` |
 | `POST /api/action` | maps `{action, part_id, …}` → `split` / `gc` / `compact` / `merge` / `force-ec-convert` / `rebalance` |
 | `GET /api/policies` | `autumn-op auto-policy status` (reshaped to the page's schema) |
@@ -49,20 +49,55 @@ Apply buttons and auto-policy activate/deactivate) use it.
 The controller panel is **use** (select → DryRun / observe) → **Arm** (actuate) →
 **Stop** (Off), and the custom-policy editor (create/edit/delete) is fully wired.
 
-## Navigating the page (built for many partitions)
+## Navigating the page
 
-The layout is **partition-server-first** so it stays legible when a cluster has
-thousands of partitions:
+**Six tabs**, because the questions an operator arrives with are different
+questions and each wants the whole width. The **vital signs** (topology /
+capacity / throughput / controller) stay above the tabs — they are read first on
+every one. The tab is in the URL hash (`#nodes`), so a view is linkable.
 
-1. **Vital signs** (topology / capacity / throughput / controller) read first.
-2. The **keyspace ribbon** (−∞ → +∞) shows every partition as a segment colored
-   by its owning PS — click any segment to scope.
-3. **Partition servers** are the primary drill-in: pick a PS card and the list
-   below shows *only that server's* partitions (dozens/hundreds, not the whole
-   keyspace). **All servers** restores the full list, virtual-scrolled.
-4. Selecting a partition opens the **detail drawer** — load metrics + per-extent
-   distribution, fetched lazily on expand.
-5. **Extent nodes** (storage layer) sit at the bottom; click one for its detail.
+| Tab | Answers |
+|-----|---------|
+| **Overview** | the keyspace ribbon (−∞ → +∞, one segment per partition, colored by owning PS), a fleet health roll-up, space + amplification, the top advisories, and what is running |
+| **Partitions** | which partition — PS-scoped list + the lazy detail drawer |
+| **Servers** | which partition server — every REGISTERED PS with its heartbeat, load and partitions |
+| **Nodes** | which disk — every extent node with a per-disk table (capacity, online, faulted) |
+| **Policy** | what the controller would do — advisories with their full reasoning, and the policy editor |
+| **Logs** | what just happened — running ops, durable outcomes, and the auto-policy action log |
+
+Built for many partitions: the Partitions tab is **partition-server-first** (pick
+a PS card and the list shows *only that server's* partitions; **All servers**
+restores the full list, virtual-scrolled), and per-partition detail — extents +
+load metrics — is fetched lazily when a row is opened.
+
+**Each `/api/*` call spawns an `autumn-op` subprocess**, so the poll fetches only
+what the visible tab renders: `/api/overview` always (the vitals and every tab's
+data come from it), `/api/policies` on Overview + Policy, `/api/ops` on Overview
++ Logs.
+
+### What the Servers and Nodes tabs show that nothing else could
+
+Both exist for facts a roll-up cannot carry:
+
+- **A PS serving nothing, or one that has gone silent.** A server list derived
+  from the partitions can only show a PS that currently owns something, so those
+  are exactly the two states it cannot express. `ps_servers` comes from the
+  manager's registry plus its heartbeat map; "never seen a heartbeat" renders as
+  **unknown**, not dead — a fresh leader starts with an empty map.
+- **Which disk.** A node with disks `[empty, full, full, full]` rolls up as
+  half-free. The per-disk table separates **offline** (the node did not answer,
+  or the disk is not usable) from **faulted** (the node itself reported this disk
+  bad) — only the second is evidence about the disk, and it is what drives a
+  rebuild.
+
+### The precondition the drawer warns about
+
+A CoW split's children share the parent's SSTs, which carry keys outside each
+child's own range, and the partition server **refuses `split` until a major
+compaction rewrites them**. The drawer says so before the Split button is
+clicked, and the auto-policy advises that compaction *in place of* the split — so
+the Policy tab shows "major compaction required before split", not a split that
+would be refused once per window forever.
 
 ## Security posture
 
@@ -83,21 +118,30 @@ A manager started without `--etcd` persists no history at all. That comes back
 as `history_error` rather than an empty list, and the panel says so — an empty
 list would read as "nothing failed".
 
-Contract test (isolated cluster with its own etcd, asserts the shape and that a
-record carries the progress counts and the error text):
+## Tests
 
 ```bash
+# 1. API contract against a REAL isolated cluster (own etcd, own ports, a node
+#    with TWO disks). Asserts /api/ops' two lists + progress counts + error
+#    text, /api/overview's ps_servers and per-disk rows, and the partition
+#    detail's has_overlap. Every one of these crosses the rkyv wire, the
+#    manager compose and the autumn-op subprocess — a missing key renders as a
+#    silently blank panel, which no unit test would notice.
 cargo build --workspace
-bash examples/dashboard/tests/ops_contract.sh
-```
+bash examples/dashboard/tests/api_contract.sh
 
-Render check (no cluster, no browser) — lifts the panel's own functions out of
-`index.html` at run time and feeds them a real `/api/ops` payload, asserting an
-operator gets the percentage AND the raw counts, the bar width, the right
-target for each kind, and a failed row's reason:
-
-```bash
+# 2. Render check — no cluster, no browser. LIFTS the page's own functions out
+#    of index.html at run time (a copy would drift and pass while the page was
+#    broken) and asserts the verdicts: percentage AND raw counts, the bar width,
+#    the right target per op kind, a failed row's reason, the heartbeat
+#    classification, a faulted disk, and an advisory's full reasoning.
 node examples/dashboard/tests/render_check.js
+
+# 3. Tabs smoke — runs the page's own init and tab switching under a minimal DOM
+#    stub that REFUSES any element id the markup does not declare, then asserts
+#    each pane rendered what it exists to show. Catches a pane that throws, or a
+#    renamed container, which (2) cannot see.
+node examples/dashboard/tests/tabs_smoke.js
 ```
 
 Measured live (1 GiB extent, EC 3+1): `/api/ops` carried

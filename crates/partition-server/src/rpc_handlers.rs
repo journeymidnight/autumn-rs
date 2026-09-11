@@ -2115,7 +2115,7 @@ pub(crate) async fn handle_split_part(
         }
         p.rg = new_rg;
         if overlap {
-            p.has_overlap.set(1);
+            p.set_has_overlap(1);
         }
         p.region_epoch = p.region_epoch.saturating_add(1).max(2);
     }

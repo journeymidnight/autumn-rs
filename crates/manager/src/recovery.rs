@@ -1971,6 +1971,11 @@ impl crate::AutumnManager {
                         free: n_free,
                         extent_bytes: n_ext,
                         online: true,
+                        // Carried whole, offline disks included: an offline
+                        // disk is excluded from the CAPACITY sums above
+                        // (unusable space) but is precisely the row an
+                        // operator opens this view to find.
+                        disks: df.disk_status.clone(),
                     },
                 ));
                 // drop stale push-based failure reports so a residual
@@ -3603,6 +3608,7 @@ mod recovery_placement_tests {
                         free: 100,
                         extent_bytes: 900,
                         online: true,
+                        disks: Vec::new(),
                     },
                 ));
             }
@@ -3614,6 +3620,7 @@ mod recovery_placement_tests {
                         free: 1000,
                         extent_bytes: 0,
                         online: true,
+                        disks: Vec::new(),
                     },
                 ));
             }
@@ -3729,6 +3736,7 @@ mod recovery_placement_tests {
                 free: 1000,
                 extent_bytes: 3000,
                 online: true,
+                disks: Vec::new(),
             },
         )];
         m.node_max_free.borrow_mut().insert(1, 1000);
@@ -3756,6 +3764,7 @@ mod recovery_placement_tests {
                 free: 4000,
                 extent_bytes: 0,
                 online: false,
+                disks: Vec::new(),
             },
         )];
         assert!(!m.placement_load().contains_key(&1));

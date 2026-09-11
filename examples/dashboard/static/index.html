@@ -2,21 +2,26 @@
 <!--
   autumn-rs web dashboard — single self-contained page (no build, no deps).
   Served by the standalone `autumn-dashboard` app (examples/dashboard), which
-  proxies every /api/* call to the `autumn-op` CLI. Scales to 数千 partition /
-  数万 extent via a PARTITION-SERVER-first drill-in:
-    * pick a PS (bounded count) → the list scopes to that server's partitions
-      (dozens/hundreds), so the flat list never has to hold thousands of rows;
-    * "All servers" restores the whole keyspace, VIRTUAL-SCROLLED (only visible
-      rows in the DOM);
-    * LAZY per-partition detail (extents + load metrics fetched only on expand);
-    * keyspace ribbon (PS-colored) doubles as the picker.
+  proxies every /api/* call to the `autumn-op` CLI.
+
+  SIX TABS, because the five questions an operator arrives with are different
+  questions and each wants the whole width: where is my keyspace (Overview),
+  which partition (Partitions), which server (Servers), which disk (Nodes),
+  what will the controller do (Policy), what just happened (Logs).
+
+  Each /api/* call SPAWNS an autumn-op subprocess, so the poll only fetches
+  what the visible tab renders — /api/overview always (the header vitals and
+  the ribbon live on it), policies on Overview+Policy, ops on Overview+Logs.
+
+  Scale (数千 partition / 数万 extent) is handled on the Partitions tab by a
+  PARTITION-SERVER-first drill-in plus a virtual-scrolled list, and by LAZY
+  per-partition detail (extents + load metrics fetched only on expand).
   Endpoints:
-    GET  /api/overview            → range-sorted partitions + ps_roll + nodes + df
+    GET  /api/overview            → partitions + ps_servers + nodes(+disks) + df
     GET  /api/partition/<id>      → one partition's detail (metrics + extents)
     POST /api/action  {cmd}       → actuate one autumn-op mutation (danger mode)
     GET  /api/policies + POST /api/policies/{upsert,activate,delete}
-    GET  /api/ops                 → {live, history} — running ops with progress,
-                                    and terminal outcomes with their reason
+    GET  /api/ops                 → {live, history}
 -->
 <html lang="zh">
 <head>
@@ -54,7 +59,7 @@
 
   header { position:sticky; top:0; z-index:10; background:rgba(10,10,11,.86);
     backdrop-filter:blur(8px); border-bottom:1px solid var(--line); }
-  .hbar { padding:11px 20px; display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+  .hbar { padding:11px 20px 0; display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
   .brand { display:flex; align-items:baseline; gap:9px; }
   .brand .logo { width:9px; height:9px; border-radius:2px; background:var(--accent);
     box-shadow:0 0 0 3px #c5a05e22; transform:translateY(1px); }
@@ -74,6 +79,18 @@
   .danger input:checked + .switch { background:var(--bad); }
   .danger input:checked + .switch::after { transform:translateX(16px); background:#fff; }
   .dlbl { font-size:12px; color:var(--dim); } .danger input:checked ~ .dlbl { color:var(--bad); }
+
+  /* tab bar */
+  .tabs { display:flex; gap:2px; padding:8px 20px 0; }
+  .tab { background:none; border:none; border-bottom:2px solid transparent; color:var(--dim);
+    font:inherit; font-size:12.5px; padding:7px 13px 8px; cursor:pointer; display:flex;
+    align-items:center; gap:7px; transition:color .12s, border-color .12s; }
+  .tab:hover { color:var(--ink); }
+  .tab[aria-selected="true"] { color:var(--accent); border-bottom-color:var(--accent); font-weight:600; }
+  .tab .badge { font-size:10px; min-width:17px; text-align:center; border-radius:999px;
+    padding:0 5px; background:var(--panel2); color:var(--dim); border:1px solid var(--line); }
+  .tab .badge.hot { color:var(--warn); border-color:#cf9b5255; background:#cf9b5214; }
+  .tab .badge.bad { color:var(--bad); border-color:#c4505055; background:#c4505014; }
 
   main { padding:0 20px 40px; }
   .wrap { max-width:1160px; margin:0 auto; }
@@ -110,7 +127,7 @@
   /* partition servers — primary drill-in */
   .servers { margin:0 0 16px; }
   .ps-grid { display:flex; gap:10px; flex-wrap:wrap; }
-  .ps-card { flex:1; min-width:170px; background:var(--panel); border:1px solid var(--line);
+  .ps-card { flex:1; min-width:200px; background:var(--panel); border:1px solid var(--line);
     border-radius:10px; padding:11px 13px; cursor:pointer; text-align:left; font:inherit; color:inherit;
     transition:border-color .12s, box-shadow .12s; }
   .ps-card:hover { border-color:var(--line-active); }
@@ -125,6 +142,9 @@
   .ps-card .spread { height:4px; border-radius:2px; background:var(--line); margin-top:8px; overflow:hidden; }
   .ps-card .spread i { display:block; height:100%; }
   .ps-card.all .swatch { background:repeating-linear-gradient(45deg,var(--dim) 0 2px,transparent 2px 4px); }
+  .hb { font-size:11px; margin-left:auto; }
+  .hb.ok { color:var(--ok); } .hb.warn { color:var(--warn); } .hb.bad { color:var(--bad); }
+  .hb.unknown { color:var(--muted); }
 
   .split { display:flex; gap:16px; align-items:flex-start; }
   .listpanel { flex:1; min-width:0; background:var(--panel); border:1px solid var(--line); border-radius:10px; }
@@ -158,7 +178,7 @@
   .listempty { padding:22px 14px; color:var(--dim); text-align:center; }
 
   .drawer { width:392px; flex:none; background:var(--panel); border:1px solid var(--line);
-    border-radius:10px; padding:14px 16px; position:sticky; top:70px; max-height:82vh; overflow:auto; }
+    border-radius:10px; padding:14px 16px; position:sticky; top:118px; max-height:82vh; overflow:auto; }
   .drawer.empty { color:var(--dim); }
   .dh { display:flex; align-items:center; gap:9px; margin-bottom:3px; }
   .dh .swatch { width:9px; height:9px; border-radius:2px; }
@@ -187,9 +207,13 @@
   .tag.role-log{color:#93b8c8} .tag.role-row{color:#8fc48f} .tag.role-meta{color:#bda6d0}
   .tag.ec{background:#2a2140;color:var(--ec)} .tag.missing{color:var(--bad)}
   .egrow { flex:1; }
+  /* a precondition the operator must see BEFORE clicking an op that is refused */
+  .blocked { background:#2a2216; border:1px solid var(--warn); color:#f0d9b4; border-radius:8px;
+    padding:7px 10px; margin:10px 0; font-size:11.5px; }
 
   .panels { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .panel.wide { grid-column:1/-1; }
   .panel h2 { font-size:10px; font-weight:500; letter-spacing:.12em; text-transform:uppercase; color:var(--dim);
     margin:0 0 12px; display:flex; align-items:center; gap:8px; }
   .panel h2 .n { color:var(--muted); }
@@ -197,11 +221,14 @@
   .adv:first-of-type { border-top:none; }
   .adv .sev { width:3px; align-self:stretch; border-radius:2px; background:var(--accent-dim); }
   .adv.merge .sev{background:var(--ec)} .adv.gc .sev{background:var(--warn)} .adv.split .sev{background:var(--ok)}
+  .adv.major .sev, .adv.minor .sev{background:#5aa8a0}
   .adv .d { flex:1; font-size:12px; }
+  .adv .d .why { color:var(--dim); font-size:11.5px; display:block; }
   .empty { color:var(--dim); padding:8px 0; }
   .ctlrow { display:flex; align-items:center; gap:8px; margin-bottom:12px; font-size:12.5px; }
   .ctlrow .dot { width:8px; height:8px; border-radius:50%; }
   .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
+  .dot.unknown{background:var(--muted)}
   .pol { border:1px solid var(--line); border-radius:8px; padding:9px 11px; margin-bottom:8px; }
   .pol.active { border-color:#50a86866; background:#101512; }
   .pol .ph { display:flex; align-items:center; gap:8px; }
@@ -219,17 +246,19 @@
     border:1px solid var(--line); border-radius:6px; padding:3px 6px; font:inherit; }
   .form input[type=text]{ width:130px; } .form input[type=number]{ width:60px; }
   .swbox { display:inline-flex; align-items:center; gap:4px; color:var(--dim); }
-  .log { margin-top:6px; font-size:11.5px; max-height:150px; overflow:auto; }
+  .log { margin-top:6px; font-size:11.5px; max-height:260px; overflow:auto; }
   .log .r { padding:3px 0; border-top:1px dashed var(--line); display:flex; gap:7px; align-items:baseline; }
   .log .ts { color:var(--muted); font-size:10.5px; }
   .log .lv { font-size:10px; letter-spacing:.06em; text-transform:uppercase; }
   .log .issued{color:var(--ok)} .log .refused{color:var(--warn)} .log .error{color:var(--bad)}
+  .log .would{color:var(--dim)}
   .log .msg { color:var(--dim); flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 
-  .ennodes { margin-top:18px; }
-  .en-grid { display:flex; gap:9px; flex-wrap:wrap; margin-top:9px; }
-  .node { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 11px; min-width:150px; flex:1; cursor:pointer; }
+  .en-grid { display:flex; gap:9px; flex-wrap:wrap; }
+  .node { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 13px;
+    min-width:230px; flex:1; cursor:pointer; text-align:left; font:inherit; color:inherit; }
   .node:hover { border-color:var(--line-active); }
+  .node.sel { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
   .node .nh { display:flex; align-items:center; gap:6px; }
   .node .dot { width:7px; height:7px; border-radius:50%; }
   .node .nid { font-weight:700; }
@@ -237,6 +266,26 @@
   .node .nsub { color:var(--dim); font-size:11.5px; margin-top:4px; }
   .node .cbar { height:4px; border-radius:2px; background:var(--line); margin-top:6px; overflow:hidden; }
   .node .cbar i { display:block; height:100%; background:var(--accent-dim); }
+  .node .cbar i.hi { background:var(--warn); } .node .cbar i.crit { background:var(--bad); }
+  .node .disks { display:flex; gap:3px; margin-top:7px; }
+  .node .disks i { flex:1; height:3px; border-radius:2px; background:var(--ok); }
+  .node .disks i.off { background:var(--muted); } .node .disks i.bad { background:var(--bad); }
+
+  /* per-disk table (Nodes tab detail) */
+  table.disks { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
+  table.disks th { text-align:left; font-size:10px; font-weight:500; letter-spacing:.1em;
+    text-transform:uppercase; color:var(--muted); padding:4px 6px; border-bottom:1px solid var(--line); }
+  table.disks td { padding:5px 6px; border-bottom:1px solid var(--row); vertical-align:middle; }
+  table.disks tr:last-child td { border-bottom:none; }
+  table.disks td.num { text-align:right; font-variant-numeric:tabular-nums; }
+  table.disks .uuid { color:var(--muted); font-size:11px; }
+  .pill { font-size:10px; padding:1px 7px; border-radius:999px; border:1px solid var(--line); color:var(--dim); }
+  .pill.ok { color:var(--ok); border-color:#50a86855; }
+  .pill.bad { color:var(--bad); border-color:#c4505055; background:#c4505014; }
+  .pill.off { color:var(--muted); }
+  .minibar { height:4px; border-radius:2px; background:var(--line); overflow:hidden; min-width:60px; }
+  .minibar i { display:block; height:100%; background:var(--accent-dim); }
+  .minibar i.hi { background:var(--warn); } .minibar i.crit { background:var(--bad); }
 
   #toast { position:fixed; right:16px; bottom:16px; display:flex; flex-direction:column; gap:8px; z-index:50; }
   .t { background:var(--panel2); border:1px solid var(--line); border-left:3px solid var(--accent);
@@ -245,7 +294,8 @@
 
   @media(prefers-reduced-motion:reduce){ * { transition:none!important; } }
   @media(max-width:980px){ .split{flex-direction:column} .drawer{width:100%;position:static}
-    .vitals{grid-template-columns:1fr 1fr} .panels{grid-template-columns:1fr} }
+    .vitals{grid-template-columns:1fr 1fr} .panels{grid-template-columns:1fr}
+    .tabs{overflow-x:auto} }
 </style>
 </head>
 <body>
@@ -265,6 +315,7 @@
       <span class="dlbl" id="dangerlbl">Danger locked</span>
     </label>
   </div>
+  <div class="tabs wrap" role="tablist" id="tabbar"></div>
 </header>
 
 <main><div class="wrap">
@@ -277,75 +328,104 @@
     <div class="vital"><div class="k">Controller</div><div class="v" id="v_ctl">—</div><div class="sub" id="v_ctl_sub"></div></div>
   </div>
 
-  <section class="keyspace">
-    <div class="cap"><span class="eyebrow">Keyspace</span>
-      <span class="hint">−∞ → +∞, segment = partition, colored by owning PS — click a PS to scope the list</span></div>
-    <div class="ribbon" id="ribbon"></div>
-    <div class="ns-scale" id="scale"></div>
-    <div class="ends"><span>−∞</span><span>+∞</span></div>
+  <!-- ── OVERVIEW ─────────────────────────────────────────────────────── -->
+  <section class="pane" id="pane-overview">
+    <section class="keyspace">
+      <div class="cap"><span class="eyebrow">Keyspace</span>
+        <span class="hint">−∞ → +∞, segment = partition, colored by owning PS — click a segment to open that server's partitions</span></div>
+      <div class="ribbon" id="ribbon"></div>
+      <div class="ns-scale" id="scale"></div>
+      <div class="ends"><span>−∞</span><span>+∞</span></div>
+    </section>
+    <div class="panels">
+      <div class="panel"><h2>Fleet</h2><div id="ov_fleet"></div></div>
+      <div class="panel"><h2>Space</h2><div id="ov_space"></div></div>
+      <div class="panel"><h2>Needs attention <span id="ov_advn" class="n"></span></h2><div id="ov_adv"></div></div>
+      <div class="panel"><h2>Running now <span id="ov_opsn" class="n"></span></h2><div id="ov_ops"></div></div>
+    </div>
   </section>
 
-  <section class="servers">
-    <div class="cap"><span class="eyebrow">Partition servers</span>
-      <span class="hint">pick a server to list its partitions — the flat list doesn't scale to thousands</span></div>
-    <div class="ps-grid" id="psgrid"></div>
-  </section>
-
-  <div class="split">
-    <div class="listpanel">
-      <div class="listhead" id="listhead"></div>
-      <div class="cols">
-        <span class="c-car"></span><span class="c-ps"></span><span class="c-id">part</span>
-        <span class="c-addr">server</span><span class="c-sz">live</span><span class="c-ex">ext</span>
-        <span class="c-io">iops</span><span class="c-rng">key range</span>
+  <!-- ── PARTITIONS ───────────────────────────────────────────────────── -->
+  <section class="pane" id="pane-partitions" hidden>
+    <section class="servers">
+      <div class="cap"><span class="eyebrow">Scope</span>
+        <span class="hint">pick a server to list its partitions — the flat list doesn't scale to thousands</span></div>
+      <div class="ps-grid" id="psgrid"></div>
+    </section>
+    <div class="split">
+      <div class="listpanel">
+        <div class="listhead" id="listhead"></div>
+        <div class="cols">
+          <span class="c-car"></span><span class="c-ps"></span><span class="c-id">part</span>
+          <span class="c-addr">server</span><span class="c-sz">live</span><span class="c-ex">ext</span>
+          <span class="c-io">iops</span><span class="c-rng">key range</span>
+        </div>
+        <div id="vp"><div id="spacer"></div></div>
       </div>
-      <div id="vp"><div id="spacer"></div></div>
+      <aside class="drawer empty" id="drawer">Pick a partition to view its extents and load detail (lazy-loaded).</aside>
     </div>
-    <aside class="drawer empty" id="drawer">Pick a partition to view its extents and load detail (lazy-loaded).</aside>
-  </div>
-
-  <div class="panels">
-    <div class="panel">
-      <h2>Policy advisories <span id="advcount" class="n"></span></h2>
-      <div id="advisories"></div>
-    </div>
-    <div class="panel">
-      <h2>Auto-policy controller</h2>
-      <div class="ctlrow" id="ctlstate"></div>
-      <div id="pollist"></div>
-      <details style="margin-top:10px">
-        <summary style="cursor:pointer;color:var(--dim)">+ Create custom policy</summary>
-        <div class="form">
-          <label>name <input type="text" id="np_name" placeholder="my-policy"></label>
-          <span class="swbox"><input type="checkbox" id="sw_split"> split</span>
-          <span class="swbox"><input type="checkbox" id="sw_ec"> ec</span>
-          <span class="swbox"><input type="checkbox" id="sw_compact" checked> compact</span>
-          <span class="swbox"><input type="checkbox" id="sw_gc" checked> gc</span>
-          <span class="swbox"><input type="checkbox" id="sw_merge"> merge</span>
-          <span class="swbox"><input type="checkbox" id="sw_rebalance"> rebalance</span>
-        </div>
-        <div class="form">
-          <label>interval(s) <input type="number" id="np_interval" value="30" min="2"></label>
-          <label>cooldown(s) <input type="number" id="np_cooldown" value="180" min="0"></label>
-          <label>max/tick <input type="number" id="np_max" value="2" min="1"></label>
-          <button class="btn" id="np_save">Save policy</button>
-        </div>
-      </details>
-      <div class="subh" style="margin-top:14px">Recent auto-actions</div>
-      <div class="log" id="autolog"></div>
-    </div>
-  </div>
-
-  <section class="ops">
-    <span class="eyebrow">Maintenance ops · running now</span>
-    <div id="ops_live"></div>
-    <span class="eyebrow" style="display:block;margin-top:14px">Recent outcomes · durable history</span>
-    <div id="ops_hist"></div>
   </section>
 
-  <section class="ennodes">
-    <span class="eyebrow">Extent nodes · storage layer</span>
-    <div class="en-grid" id="nodes"></div>
+  <!-- ── SERVERS (PS) ─────────────────────────────────────────────────── -->
+  <section class="pane" id="pane-servers" hidden>
+    <div class="cap" style="margin-top:2px"><span class="eyebrow">Partition servers</span>
+      <span class="hint">every REGISTERED PS — including one serving nothing, which the partition list cannot show</span></div>
+    <div class="split">
+      <div style="flex:1;min-width:0"><div class="ps-grid" id="ps_full"></div></div>
+      <aside class="drawer empty" id="psdrawer">Pick a partition server.</aside>
+    </div>
+  </section>
+
+  <!-- ── NODES (EN + disks) ───────────────────────────────────────────── -->
+  <section class="pane" id="pane-nodes" hidden>
+    <div class="cap" style="margin-top:2px"><span class="eyebrow">Extent nodes · storage layer</span>
+      <span class="hint">the bar is node capacity; the strip under it is one mark per disk</span></div>
+    <div class="split">
+      <div style="flex:1;min-width:0"><div class="en-grid" id="nodes"></div></div>
+      <aside class="drawer empty" id="nodedrawer">Pick a node to see its disks.</aside>
+    </div>
+  </section>
+
+  <!-- ── POLICY ───────────────────────────────────────────────────────── -->
+  <section class="pane" id="pane-policy" hidden>
+    <div class="panels">
+      <div class="panel">
+        <h2>Policy advisories <span id="advcount" class="n"></span></h2>
+        <div id="advisories"></div>
+      </div>
+      <div class="panel">
+        <h2>Auto-policy controller</h2>
+        <div class="ctlrow" id="ctlstate"></div>
+        <div id="pollist"></div>
+        <details style="margin-top:10px">
+          <summary style="cursor:pointer;color:var(--dim)">+ Create custom policy</summary>
+          <div class="form">
+            <label>name <input type="text" id="np_name" placeholder="my-policy"></label>
+            <span class="swbox"><input type="checkbox" id="sw_split"> split</span>
+            <span class="swbox"><input type="checkbox" id="sw_ec"> ec</span>
+            <span class="swbox"><input type="checkbox" id="sw_compact" checked> compact</span>
+            <span class="swbox"><input type="checkbox" id="sw_gc" checked> gc</span>
+            <span class="swbox"><input type="checkbox" id="sw_merge"> merge</span>
+            <span class="swbox"><input type="checkbox" id="sw_rebalance"> rebalance</span>
+          </div>
+          <div class="form">
+            <label>interval(s) <input type="number" id="np_interval" value="30" min="2"></label>
+            <label>cooldown(s) <input type="number" id="np_cooldown" value="180" min="0"></label>
+            <label>max/tick <input type="number" id="np_max" value="2" min="1"></label>
+            <button class="btn" id="np_save">Save policy</button>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── LOGS (ops + auto-actions) ────────────────────────────────────── -->
+  <section class="pane" id="pane-logs" hidden>
+    <div class="panels">
+      <div class="panel wide"><h2>Maintenance ops · running now</h2><div id="ops_live"></div></div>
+      <div class="panel wide"><h2>Recent outcomes · durable history</h2><div id="ops_hist"></div></div>
+      <div class="panel wide"><h2>Auto-policy actions · leader-local</h2><div class="log" id="autolog"></div></div>
+    </div>
   </section>
 </div></main>
 <div id="toast"></div>
@@ -357,9 +437,14 @@ let PARTS=[];        // range-sorted compact partitions (overview)
 let FILTERED=[];     // after scope(PS) + text filter
 let NEXT_OF={};      // part_id -> range successor (adjacency-safe merge)
 let SELECTED=null;   // open part_id
-let NODES=[];        // EN node rows
+let NODES=[];        // EN node rows (with .disks)
 let PS_ROLL=[];      // per-PS rollup [{ps_id, addr, n, size}]
+let PS_SERVERS=[];   // registered PS rows (heartbeat, counts) — superset of PS_ROLL
 let SEL_PS=null;     // scope: null = all servers, else ps_id
+let SEL_PS_CARD=null;// Servers tab: which PS the drawer describes
+let SEL_NODE=null;   // Nodes tab: which node the drawer describes
+let ADVISORIES=[];
+let LIVE_OPS=[];
 const ROWH=36;
 const PSCOLORS={};
 const PALETTE=["#c5a05e","#50a868","#9d7cc9","#cf9b52","#c45050","#5aa8a0","#c77fb0","#c98a54","#7a94c0","#9ab84e"];
@@ -394,15 +479,65 @@ const showKey = s => (s==null?"":String(s)).replace(/[^\x20-\x7e]/g, c=>{
   return n>0xff ? "\\u"+n.toString(16).padStart(4,"0") : "\\x"+n.toString(16).padStart(2,"0");
 });
 const rlabel = (s,e)=>`[${showKey(s)||"-∞"}, ${showKey(e)||"+∞"})`;
+// A JS literal safe to drop inside a SINGLE-quoted HTML attribute. JSON.stringify
+// handles backslashes and double quotes; the apostrophe is the one that would end
+// the attribute early, and advisory text is server-formatted, so assuming it has
+// none is a bet with no upside.
+const jsAttr = v => JSON.stringify(v).replace(/'/g, "\\u0027");
+function agoStr(sec){
+  if(sec==null) return "unknown";
+  if(sec<60) return `${sec}s ago`;
+  if(sec<3600) return `${Math.floor(sec/60)}m ago`;
+  return `${Math.floor(sec/3600)}h ago`;
+}
 
-// ── keyspace ribbon (PS-colored, doubles as picker) ──────────────────────────
+// ── tabs ─────────────────────────────────────────────────────────────────────
+// Each tab owns a render + declares which endpoints its data comes from, so the
+// poll only spawns the autumn-op calls the visible pane actually needs.
+const TABS = [
+  {id:"overview",   label:"Overview",   needs:["overview","policies","ops"], render:renderOverviewTab},
+  {id:"partitions", label:"Partitions", needs:["overview"],                  render:renderList},
+  {id:"servers",    label:"Servers",    needs:["overview"],                  render:renderServersTab},
+  {id:"nodes",      label:"Nodes",      needs:["overview"],                  render:renderNodesTab},
+  {id:"policy",     label:"Policy",     needs:["overview","policies"],       render:renderPolicyTab},
+  {id:"logs",       label:"Logs",       needs:["ops","policies"],            render:renderLogsTab},
+];
+let TAB = (location.hash||"#overview").slice(1);
+if(!TABS.some(t=>t.id===TAB)) TAB="overview";
+function tabBadge(t){
+  if(t.id==="policy"){ const n=ADVISORIES.length; return n?`<span class="badge hot">${n}</span>`:""; }
+  if(t.id==="logs"){ const n=LIVE_OPS.length; return n?`<span class="badge">${n}</span>`:""; }
+  if(t.id==="nodes"){ const n=NODES.filter(isNodeUnhealthy).length; return n?`<span class="badge bad">${n}</span>`:""; }
+  if(t.id==="servers"){ const n=PS_SERVERS.filter(p=>psHealth(p).cls!=="ok").length; return n?`<span class="badge bad">${n}</span>`:""; }
+  if(t.id==="partitions"){ return `<span class="badge">${PARTS.length}</span>`; }
+  return "";
+}
+function renderTabBar(){
+  $("#tabbar").innerHTML = TABS.map(t=>
+    `<button class="tab" role="tab" aria-selected="${t.id===TAB}" onclick="setTab('${t.id}')">${t.label}${tabBadge(t)}</button>`
+  ).join("");
+}
+function setTab(id){
+  TAB=id; location.hash="#"+id;
+  TABS.forEach(t=>{ $("#pane-"+t.id).hidden = (t.id!==id); });
+  renderTabBar();
+  const t=TABS.find(x=>x.id===id);
+  if(t) t.render();
+  // The pane was display:none until now, so anything measured from layout
+  // (the virtual list's viewport height) read 0 and rendered nothing.
+  if(id==="partitions") renderRows();
+  refresh();  // pull whatever this tab needs and hasn't got
+}
+const tabNeeds = what => (TABS.find(t=>t.id===TAB)||{needs:[]}).needs.includes(what);
+
+// ── keyspace ribbon (PS-colored, jumps into the Partitions tab) ──────────────
 function renderRibbon(){
   const rb=$("#ribbon"); rb.className="ribbon"+(SEL_PS!=null?" scoped":"");
   rb.innerHTML = PARTS.map(p=>{
     const inps = SEL_PS!=null && p.ps_id===SEL_PS ? " inps" : "";
     const empty = (p.live_size||0)===0 ? "88" : "";
     return `<div class="seg${inps}" title="part ${p.part_id} · ${esc(p.ps_addr)} · ${fmtBytes(p.live_size)} · ${esc(rlabel(p.range_start,p.range_end))}"
-      style="flex:1;background:${psColor(p.ps_id)}${empty}" onclick='pick(${JSON.stringify(p.ps_id)})'></div>`;
+      style="flex:1;background:${psColor(p.ps_id)}${empty}" onclick='pick(${JSON.stringify(p.ps_id)},true)'></div>`;
   }).join("");
   // namespace boundary tick: first partition whose range enters an fs/kvc/mem prefix
   let idx=-1, nsName=""; for(let i=0;i<PARTS.length;i++){ const m=String(PARTS[i].range_end||"").match(/^(fs|kvc|mem)\//); if(m){ idx=i; nsName=m[1]; break; } }
@@ -411,7 +546,217 @@ function renderRibbon(){
     : "";
 }
 
-// ── partition servers (primary drill-in) ─────────────────────────────────────
+// ── Overview tab ─────────────────────────────────────────────────────────────
+function isNodeUnhealthy(n){
+  const st=n.auto_state||(n.online?"Online":"?");
+  if(st!=="Online") return true;
+  if((n.override_kind||"-")!=="-") return true;
+  return (n.disks||[]).some(d=>d.reported===false||d.faulted||!d.online);
+}
+function psHealth(p){
+  const s=p.last_heartbeat_secs_ago;
+  if(s==null) return {cls:"unknown", text:"no heartbeat seen"};
+  if(s<6)  return {cls:"ok",   text:agoStr(s)};
+  if(s<15) return {cls:"warn", text:agoStr(s)};
+  return {cls:"bad", text:agoStr(s)};
+}
+function renderOverviewTab(){
+  renderRibbon();
+  const bad=NODES.filter(isNodeUnhealthy);
+  const badDisks=NODES.flatMap(n=>(n.disks||[]).filter(d=>d.reported===false||d.faulted||!d.online));
+  const latePs=PS_SERVERS.filter(p=>psHealth(p).cls!=="ok");
+  $("#ov_fleet").innerHTML = `
+    <div class="metrics" style="margin:0;border-top:none">
+      <span class="m">extent nodes <b>${NODES.length}</b></span>
+      <span class="m">disks <b>${NODES.reduce((a,n)=>a+(n.disks||[]).length,0)}</b></span>
+      <span class="m">partition servers <b>${PS_SERVERS.length}</b></span>
+      <span class="m">partitions <b>${PARTS.length}</b></span>
+    </div>
+    ${bad.length?`<div class="adv"><span class="sev" style="background:var(--bad)"></span>
+      <span class="d">${bad.length} node${bad.length>1?"s":""} not fully healthy
+      <span class="why">${esc(bad.map(n=>"node "+n.node_id+" ("+(n.auto_state||"?")+")").join(", "))}</span></span>
+      <button class="btn xs" onclick="setTab('nodes')">Nodes</button></div>`:""}
+    ${badDisks.length?`<div class="adv"><span class="sev" style="background:var(--bad)"></span>
+      <span class="d">${badDisks.length} disk${badDisks.length>1?"s":""} faulted or unreported</span>
+      <button class="btn xs" onclick="setTab('nodes')">Nodes</button></div>`:""}
+    ${latePs.length?`<div class="adv"><span class="sev" style="background:var(--warn)"></span>
+      <span class="d">${latePs.length} partition server${latePs.length>1?"s":""} late or silent
+      <span class="why">${esc(latePs.map(p=>"PS "+p.ps_id+" — "+psHealth(p).text).join(", "))}</span></span>
+      <button class="btn xs" onclick="setTab('servers')">Servers</button></div>`:""}
+    ${(!bad.length&&!badDisks.length&&!latePs.length)?'<div class="empty">Every node, disk and server is reporting.</div>':""}`;
+
+  const df=(window.__df)||{};
+  const pct = df.raw_total ? (100*df.raw_used/df.raw_total) : 0;
+  $("#ov_space").innerHTML = df.raw_total ? `
+    <div class="minibar" style="height:6px;margin-bottom:10px"><i class="${pct>90?"crit":pct>75?"hi":""}" style="width:${pct.toFixed(1)}%"></i></div>
+    <div class="metrics" style="margin:0;border-top:none">
+      <span class="m">raw used <b>${fmtBytes(df.raw_used)}</b></span>
+      <span class="m">raw free <b>${fmtBytes(df.raw_free)}</b></span>
+      <span class="m">physical <b>${fmtBytes(df.physical_used)}</b></span>
+      <span class="m">logical <b>${fmtBytes(df.logical_footprint)}</b></span>
+      <span class="m">amplification <b>${df.amplification>0?df.amplification.toFixed(2)+"×":"n/a"}</b></span>
+      <span class="m">reclaimable <b>${fmtBytes(df.logical_wal_debt)}</b></span>
+    </div>` : '<div class="empty">No capacity report yet.</div>';
+
+  const top=ADVISORIES.slice(0,5);
+  $("#ov_advn").textContent = ADVISORIES.length?`${ADVISORIES.length}`:"";
+  $("#ov_adv").innerHTML = top.length
+    ? top.map(advRow).join("") + (ADVISORIES.length>top.length
+        ? `<div class="adv"><span class="sev" style="background:transparent"></span><span class="d" style="color:var(--dim)">+${ADVISORIES.length-top.length} more</span><button class="btn xs" onclick="setTab('policy')">Policy</button></div>` : "")
+    : '<div class="empty">No advisories — topology is settled.</div>';
+
+  $("#ov_opsn").textContent = LIVE_OPS.length?`${LIVE_OPS.length}`:"";
+  $("#ov_ops").innerHTML = LIVE_OPS.length
+    ? LIVE_OPS.slice(0,5).map(o=>`<div class="ops-row"><span class="ops-kind">${esc(o.kind)}</span>
+        <span>${esc(opsTarget(o))}</span>
+        <span class="ops-msg">${o.progress_total>0?Math.round(o.progress_done/o.progress_total*100)+"%":esc(o.message||o.state)}</span>
+        <span class="ops-when">${esc(opsAgo(o.started_at||o.submitted_at))}</span></div>`).join("")
+    : '<div class="ops-empty">Nothing running.</div>';
+}
+
+// ── Servers tab ──────────────────────────────────────────────────────────────
+function psCard(r, selected, onclick){
+  const h=psHealth(r);
+  return `<button class="ps-card${selected?" sel":""}" onclick='${onclick}'>
+    <div class="top"><span class="swatch" style="background:${psColor(r.ps_id)}"></span>
+      <span class="name">PS ${esc(r.ps_id)}</span><span class="hb ${h.cls}">♥ ${esc(h.text)}</span></div>
+    <div class="foot" style="margin-top:3px">${esc(r.addr||"")}</div>
+    <div class="big">${r.n||0} <small>partitions</small></div>
+    <div class="foot">${fmtBytes(r.size)} · ${r.req_per_sec||0} iops · W ${fmtBytes(r.write_bytes_per_sec||0)}/s · R ${fmtBytes(r.read_bytes_per_sec||0)}/s</div>
+  </button>`;
+}
+// A drawer whose subject left the cluster must stop describing it: clearing
+// only the selection leaves the last render on screen, so a decommissioned PS
+// or node keeps its detail pane forever.
+function clearDrawer(sel, msg){
+  const d=$(sel); d.classList.add("empty"); d.innerHTML=msg;
+}
+function renderServersTab(){
+  if(SEL_PS_CARD!=null && !PS_SERVERS.some(p=>p.ps_id===SEL_PS_CARD)){
+    SEL_PS_CARD=null; clearDrawer("#psdrawer","Pick a partition server.");
+  }
+  $("#ps_full").innerHTML = PS_SERVERS.length
+    ? PS_SERVERS.map(r=>psCard(r, SEL_PS_CARD===r.ps_id, `openPs(${JSON.stringify(r.ps_id)})`)).join("")
+    : '<div class="listempty">No partition server is registered.</div>';
+  if(SEL_PS_CARD!=null) renderPsDrawer(SEL_PS_CARD);
+}
+function openPs(id){ SEL_PS_CARD=id; renderServersTab(); }
+function renderPsDrawer(id){
+  const r=PS_SERVERS.find(x=>x.ps_id===id); if(!r) return;
+  const h=psHealth(r);
+  const mine=PARTS.filter(p=>p.ps_id===id);
+  const dr=$("#psdrawer"); dr.classList.remove("empty");
+  dr.innerHTML=`<div class="dh"><span class="swatch" style="background:${psColor(id)}"></span>
+      <span class="did">PS #${esc(id)}</span><span class="on">${esc(r.addr||"")}</span></div>
+    <div class="metrics">
+      <span class="m">heartbeat <b class="${h.cls==="ok"?"":""}">${esc(h.text)}</b></span>
+      <span class="m">partitions <b>${r.n||0}</b></span>
+      <span class="m">live size <b>${fmtBytes(r.size)}</b></span>
+      <span class="m">extents <b>${r.total_extents||0}</b></span>
+      <span class="m">iops <b>${r.req_per_sec||0}</b></span>
+      <span class="m">p-count (mgr) <b>${r.partition_count||0}</b></span>
+      <span class="m">write <b>${fmtBytes(r.write_bytes_per_sec||0)}/s</b></span>
+      <span class="m">read <b>${fmtBytes(r.read_bytes_per_sec||0)}/s</b></span>
+    </div>
+    ${h.cls==="bad"?`<div class="blocked">This PS has not heartbeated in ${esc(h.text)}. The manager evicts a
+      PS unseen for 10 s and reassigns its partitions; if it is still listed here, the eviction has not run yet.</div>`:""}
+    ${h.cls==="unknown"?`<div class="blocked">This leader has never seen a heartbeat from this PS — it may be a fresh
+      leader that has not observed one yet, not a dead server.</div>`:""}
+    <div class="subh">Partitions · ${mine.length}</div>
+    ${mine.length?`<div class="extlist">${mine.map(p=>`
+      <div class="ext" style="cursor:pointer" onclick='pick(${JSON.stringify(id)},true); openDetail(${p.part_id})'>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="eid">#${p.part_id}</span>
+          <span style="color:var(--dim)">${fmtBytes(p.live_size)}</span>
+          <span class="egrow"></span>
+          <span style="color:var(--dim)">${p.total_extents} ext · ${p.req_per_sec||0} iops</span>
+        </div>
+        <div style="color:var(--muted);font-size:11px;margin-top:2px">${esc(rlabel(p.range_start,p.range_end))}</div>
+      </div>`).join("")}</div>`
+      : '<div class="empty">Serving no partition.</div>'}`;
+}
+
+// ── Nodes tab ────────────────────────────────────────────────────────────────
+function nodeCard(n){
+  const st=n.auto_state||(n.online?"Online":"?");
+  const dot=st==="Online"?"ok":(st==="Suspected"?"warn":"bad");
+  const total=n.total,free=n.free,usedPct=total?100*(1-free/total):0;
+  const disks=n.disks||[];
+  const dstate=d=> d.reported===false ? ["off","not reported by the node"]
+                 : (d.faulted||!d.online) ? ["bad","FAULTED"] : ["","online"];
+  const strip=disks.length?`<div class="disks">${disks.map(d=>{
+    const [cls,label]=dstate(d);
+    return `<i class="${cls}" title="disk ${d.disk_id} — ${label}"></i>`;}).join("")}</div>`:"";
+  const ov=(n.override_kind&&n.override_kind!=="-")?` · <span style="color:var(--bad)">${esc(n.override_kind)}</span>`:"";
+  return `<button class="node${SEL_NODE===n.node_id?" sel":""}" onclick='openNode(${n.node_id})'>
+    <div class="nh"><span class="dot ${dot}"></span><span class="nid">node ${n.node_id}</span>
+      <span class="naddr">${esc(n.address||"")}</span></div>
+    <div class="nsub">${st}${ov} · ${disks.length} disk${disks.length===1?"":"s"}${n.extent_count!=null?` · ${n.extent_count} ext`:""}${total?` · ${fmtBytes(free)} free`:""}</div>
+    ${total?`<div class="cbar"><i class="${usedPct>90?"crit":usedPct>75?"hi":""}" style="width:${usedPct.toFixed(0)}%"></i></div>`:""}
+    ${strip}</button>`;
+}
+function renderNodesTab(){
+  if(SEL_NODE!=null && !NODES.some(n=>n.node_id===SEL_NODE)){
+    SEL_NODE=null; clearDrawer("#nodedrawer","Pick a node to see its disks.");
+  }
+  $("#nodes").innerHTML = NODES.length ? NODES.map(nodeCard).join("")
+    : '<div class="listempty">No extent node is registered.</div>';
+  if(SEL_NODE!=null) renderNodeDrawer(SEL_NODE);
+}
+// Three states, and each is reachable — which is the point of `reported`.
+// `faulted` and `online` are the SAME fact today (both come from the node's own
+// `DiskStatus.online`), so rendering them as two rows would invent a
+// distinction; a disk the node never described is the genuinely different one.
+function diskRow(d){
+  const used=(d.total&&d.free!=null)?d.total-d.free:null;
+  const pct=d.total?100*(1-d.free/d.total):0;
+  const state = d.reported===false ? `<span class="pill off">not reported</span>`
+              : (d.faulted || !d.online) ? `<span class="pill bad">faulted</span>`
+                                         : `<span class="pill ok">online</span>`;
+  return `<tr>
+    <td><b>#${d.disk_id}</b><div class="uuid">${esc((d.uuid||"").slice(0,12))}${(d.uuid||"").length>12?"…":""}</div></td>
+    <td>${state}</td>
+    <td class="num">${d.reported===false?'<span style="color:var(--muted)">—</span>':`${used!=null?fmtBytes(used):"-"} <span style="color:var(--muted)">/ ${d.total?fmtBytes(d.total):"-"}</span>`}</td>
+    <td style="width:90px">${d.total?`<div class="minibar"><i class="${pct>90?"crit":pct>75?"hi":""}" style="width:${pct.toFixed(0)}%"></i></div>`:""}</td>
+    <td class="num">${d.reported===false?'<span style="color:var(--muted)">—</span>':fmtBytes(d.extent_bytes)}</td>
+  </tr>`;
+}
+function renderNodeDrawer(id){
+  const n=NODES.find(x=>x.node_id===id)||{node_id:id};
+  const st=n.auto_state||(n.online?"Online":"?");
+  const dot=st==="Online"?"ok":(st==="Suspected"?"warn":"bad");
+  const total=n.total,free=n.free,usedPct=total?100*(1-free/total):0;
+  const disks=n.disks||[];
+  const ov = (n.override_kind && n.override_kind!=="-")
+    ? `<div class="errbar" style="margin-top:8px">override: <b>${esc(n.override_kind)}</b>${n.override_reason?` — ${esc(n.override_reason)}`:""}${n.override_set_by?` (by ${esc(n.override_set_by)})`:""}</div>` : "";
+  const faulted=disks.filter(d=>d.reported!==false&&(d.faulted||!d.online));
+  const unreported=disks.filter(d=>d.reported===false);
+  const dr=$("#nodedrawer"); dr.classList.remove("empty");
+  dr.innerHTML=`<div class="dh"><span class="dot ${dot}"></span><span class="did">node #${id}</span>
+      <span class="on">${esc(n.address||"")}</span></div>
+    <div class="metrics">
+      <span class="m">state <b>${esc(st)}</b></span><span class="m">heartbeat <b>${n.last_heartbeat_secs_ago!=null?agoStr(n.last_heartbeat_secs_ago):"-"}</b></span>
+      <span class="m">extent shards <b>${n.extent_count!=null?n.extent_count:"-"}</b></span><span class="m">extent bytes <b>${fmtBytes(n.extent_bytes)}</b></span>
+      <span class="m">capacity <b>${total?fmtBytes(total):"-"}</b></span><span class="m">free <b>${free!=null?fmtBytes(free):"-"}</b></span>
+      <span class="m">disk <b>${total?(usedPct.toFixed(0)+"% used"):"-"}</b></span><span class="m">suspected age <b>${n.suspected_age_secs?n.suspected_age_secs+"s":"-"}</b></span>
+    </div>${ov}
+    ${faulted.length?`<div class="blocked">${faulted.length} disk${faulted.length>1?"s":""} reported FAULTED by this node
+      (${esc(faulted.map(d=>"#"+d.disk_id).join(", "))}). Its sealed replicas are rebuilt elsewhere; the node keeps serving its other disks.</div>`:""}
+    ${unreported.length?`<div class="blocked">${unreported.length} disk${unreported.length>1?"s":""} registered to this node but
+      NOT described on its last df (${esc(unreported.map(d=>"#"+d.disk_id).join(", "))}) — the node was
+      most likely started without that data directory. Its capacity is absent from the totals above, and
+      nothing is watching it.</div>`:""}
+    <div class="subh" style="margin-top:12px">Disks · ${disks.length}</div>
+    ${disks.length?`<table class="disks"><thead><tr>
+        <th>disk</th><th>state</th><th style="text-align:right">used / total</th><th></th><th style="text-align:right">autumn</th>
+      </tr></thead><tbody>${disks.map(diskRow).join("")}</tbody></table>`
+      : '<div class="empty">This node has not reported any disk yet.</div>'}
+    ${n.node_uuid?`<div style="color:var(--muted);font-size:11px;margin-top:10px">uuid ${esc(n.node_uuid)}</div>`:""}
+    ${(n.shard_ports&&n.shard_ports.length)?`<div style="color:var(--muted);font-size:11px">shard ports ${esc(n.shard_ports.join(", "))}</div>`:""}`;
+}
+function openNode(id){ SEL_NODE=id; renderNodesTab(); }
+
+// ── partition servers (Partitions-tab scope picker) ──────────────────────────
 function psIops(ps_id){ return PARTS.filter(p=>p.ps_id===ps_id).reduce((a,p)=>a+(p.req_per_sec||0),0); }
 function renderPs(){
   const maxN = Math.max(1,...PS_ROLL.map(r=>r.n||0));
@@ -435,7 +780,8 @@ function renderPs(){
 }
 // `All servers` (ps===null) is a deliberate choice — remember it so a refresh
 // doesn't snap the scope back to the first PS.
-function pick(ps){ window.__pickedAll = (ps===null); SEL_PS = ps; renderPs(); renderRibbon(); renderList(); }
+function pick(ps, jump){ window.__pickedAll = (ps===null); SEL_PS = ps; renderPs(); renderRibbon(); renderList();
+  if(jump) setTab("partitions"); }
 
 // ── partition list, scoped to the selected server ────────────────────────────
 // The header (with its filter <input>) is rebuilt only when the PS scope
@@ -474,6 +820,7 @@ function applyFilter(){
 // header only on a scope change — a poll with the same scope leaves it (and the
 // user's filter text + focus) untouched.
 function renderList(){
+  renderPs();
   if(HEAD_PS!==SEL_PS){ renderListHead(); HEAD_PS=SEL_PS; $("#vp").scrollTop=0; }
   applyFilter();
 }
@@ -530,6 +877,14 @@ async function openDetail(pid){
     <div style="color:var(--dim);margin-top:8px">loading detail…</div>`;
   const d=await api("/api/partition/"+pid);
   const nxt=NEXT_OF[pid];
+  // A CoW split's children share the parent's SSTs until a MAJOR compaction
+  // rewrites them, and the PS REFUSES `split` for as long as it does. Say so
+  // before the click, not after the refusal.
+  const blocked = d.has_overlap
+    ? `<div class="blocked">This partition still carries CoW-shared keys outside its own range
+        (<code>has_overlap</code>${d.sst_out_of_range_bytes?`, ${fmtBytes(d.sst_out_of_range_bytes)} out of range`:""}).
+        <b>Split is refused until a major compaction separates them</b> — run Compact first.
+        The auto-policy advises the same compaction in place of the split.</div>` : "";
   // Always render the action buttons (even Danger-locked) so it's clear the ops
   // exist and a click gives feedback — act() gates on Danger with a toast rather
   // than the buttons silently not existing (which read as "nothing happens").
@@ -545,48 +900,18 @@ async function openDetail(pid){
   dr.innerHTML=`<div class="dh"><span class="swatch" style="background:${psColor(p.ps_id)}"></span>
       <span class="did">#${pid}</span><span class="on">on ${esc(p.ps_addr||"?")}</span></div>
     <div class="drng">${esc(rlabel(p.range_start,p.range_end))}</div>
+    ${blocked}
     ${acts}
     <div class="metrics">
       <span class="m">iops <b>${d.req_per_sec||0}</b></span><span class="m">p99 <b>${d.p99_us||0}µs</b></span>
       <span class="m">write <b>${fmtBytes(d.write_bytes_per_sec||0)}/s</b></span><span class="m">read <b>${fmtBytes(d.read_bytes_per_sec||0)}/s</b></span>
-      <span class="m">live size <b>${fmtBytes(d.size_bytes||p.live_size)}</b></span><span class="m">extents <b>${(d.extents||[]).length}</b></span>
+      <span class="m">live size <b>${fmtBytes(d.size_bytes!=null?d.size_bytes:p.live_size)}</b></span><span class="m">extents <b>${(d.extents||[]).length}</b></span>
       <span class="m">gc debt <b>${fmtBytes(d.gc_debt_bytes)}</b></span><span class="m">compact pend <b>${fmtBytes(d.pending_compaction_bytes)}</b></span>
       ${inflight?`<span class="m full">${inflight}</span>`:""}
     </div>
     <div class="subh">Extents · ${(d.extents||[]).length}</div>
     <div class="extlist">${(d.extents||[]).map(extChip).join("")||'<span class="empty">none</span>'}</div>
     ${(d.errors&&d.errors.length)?`<div class="errbar" style="margin-top:8px">⚠ ${esc(d.errors.join("\n"))}</div>`:""}`;
-}
-
-// ── EN nodes (storage layer) ─────────────────────────────────────────────────
-function nodeChip(n){
-  const st=n.auto_state||(n.online?"Online":"?");
-  const dot=st==="Online"?"ok":(st==="Suspected"?"warn":"bad");
-  const total=n.total,free=n.free,usedPct=total?100*(1-free/total):0;
-  return `<div class="node" onclick='openNode(${n.node_id})' title="Click for node detail">
-    <div class="nh"><span class="dot ${dot}"></span><span class="nid">node ${n.node_id}</span>
-      <span class="naddr">${esc(n.address||"")}</span></div>
-    <div class="nsub">${st}${n.extent_count!=null?` · ${n.extent_count} ext`:""}${total?` · ${fmtBytes(free)} free`:""}</div>
-    ${total?`<div class="cbar"><i style="width:${usedPct.toFixed(0)}%"></i></div>`:""}</div>`;
-}
-function openNode(id){
-  SELECTED=null; renderRows();
-  const n=NODES.find(x=>x.node_id===id)||{node_id:id};
-  const st=n.auto_state||(n.online?"Online":"?");
-  const dot=st==="Online"?"ok":(st==="Suspected"?"warn":"bad");
-  const total=n.total,free=n.free,usedPct=total?100*(1-free/total):0;
-  const ov = (n.override_kind && n.override_kind!=="-")
-    ? `<div class="errbar" style="margin-top:8px">override: <b>${esc(n.override_kind)}</b>${n.override_reason?` — ${esc(n.override_reason)}`:""}</div>` : "";
-  const dr=$("#drawer"); dr.classList.remove("empty");
-  dr.innerHTML=`<div class="dh"><span class="dot ${dot}"></span><span class="did">node #${id}</span>
-      <span class="on">${esc(n.address||"")}</span></div>
-    <div class="metrics">
-      <span class="m">state <b>${esc(st)}</b></span><span class="m">heartbeat <b>${n.last_heartbeat_secs_ago!=null?n.last_heartbeat_secs_ago+"s ago":"-"}</b></span>
-      <span class="m">extent shards <b>${n.extent_count!=null?n.extent_count:"-"}</b></span><span class="m">extent bytes <b>${fmtBytes(n.extent_bytes)}</b></span>
-      <span class="m">capacity <b>${total?fmtBytes(total):"-"}</b></span><span class="m">free <b>${free!=null?fmtBytes(free):"-"}</b></span>
-      <span class="m">disk <b>${total?(usedPct.toFixed(0)+"% used"):"-"}</b></span><span class="m">suspected age <b>${n.suspected_age_secs!=null?n.suspected_age_secs+"s":"-"}</b></span>
-    </div>${ov}
-    <div style="color:var(--dim);margin-top:10px">Hosts <b>${n.extent_count!=null?n.extent_count:"?"}</b> extent shards (replicas ∪ parity). Open a partition to see its per-extent distribution.</div>`;
 }
 
 // ── maintenance ops ──────────────────────────────────────────────────────────
@@ -601,8 +926,8 @@ function opsTarget(o){
   // kinds part_id is 0 and secondary_id is an EXTENT — rendering those as
   // "0->12" reads like a partition move that never happened.
   if(o.kind === "ec-convert" || o.kind === "recovery") return `extent ${o.secondary_id}`;
-  if(o.secondary_id) return `${o.part_id}\u2192${o.secondary_id}`;
-  return o.part_id ? String(o.part_id) : "\u2014";
+  if(o.secondary_id) return `${o.part_id}→${o.secondary_id}`;
+  return o.part_id ? String(o.part_id) : "—";
 }
 function opsAgo(ts){
   if(!ts) return "";
@@ -623,7 +948,7 @@ function renderLiveOps(ops){
     if(o.progress_total > 0){
       const pct = Math.min(100, Math.round(o.progress_done / o.progress_total * 100));
       prog = `<div><div class="bar"><i style="width:${pct}%"></i></div>
-        <div class="ops-msg" style="margin-top:3px">${pct}% \u00b7 ${o.progress_done} / ${o.progress_total}</div></div>`;
+        <div class="ops-msg" style="margin-top:3px">${pct}% · ${o.progress_done} / ${o.progress_total}</div></div>`;
     }
     return `<div class="ops-row">
       <span class="ops-kind">${esc(o.kind)}</span>
@@ -648,16 +973,28 @@ function renderOpsHistory(ops, err){
     </div>`;
   }).join("");
 }
+let OPS={live:[],history:[],history_error:null};
+function renderLogsTab(){
+  renderLiveOps(OPS.live||[]);
+  renderOpsHistory(OPS.history||[], OPS.history_error);
+  const log=(window.__polLog)||[];
+  $("#autolog").innerHTML = log.map(l=>`
+    <div class="r"><span class="ts">${new Date(l.ts*1000).toLocaleTimeString()}</span>
+      <span class="lv ${esc(l.level)}">${esc(l.level)}</span><span class="msg" title="${esc(l.msg)}">${esc(l.msg)}${l.desc?` (${esc(l.desc)})`:""}</span></div>`).join("")
+    || '<div class="empty">No recent actions.</div>';
+}
 async function loadOps(){
   let s; try{ s=await api("/api/ops"); }catch(e){ return; }
-  renderLiveOps(s.live||[]);
-  renderOpsHistory(s.history||[], s.history_error);
+  OPS=s; LIVE_OPS=s.live||[];
+  if(TAB==="logs") renderLogsTab();
+  if(TAB==="overview") renderOverviewTab();
+  renderTabBar();
 }
 
 // ── overview poll ────────────────────────────────────────────────────────────
 async function overview(){
   let s; try{ s=await api("/api/overview"); }catch(e){ return; }
-  const df=s.df||{};
+  const df=s.df||{}; window.__df=df;
   $("#v_topo").innerHTML = `${s.part_count||0} <small>partitions</small>`;
   $("#v_topo_sub").textContent = `across ${s.ps_count||0} partition server${(s.ps_count||0)!==1?"s":""}`;
   $("#v_cap").innerHTML = df.raw_total ? `${fmtBytes(df.raw_used)}<small>/${fmtBytes(df.raw_total)}</small>` : "n/a";
@@ -668,39 +1005,46 @@ async function overview(){
   $("#errs").innerHTML = (s.errors&&s.errors.length)?`<div class="errbar">⚠ ${esc(s.errors.join("\n"))}</div>`:"";
 
   NODES = s.nodes||[];
-  $("#nodes").innerHTML = NODES.map(nodeChip).join("");
-
   PARTS = s.partitions||[];
   NEXT_OF={}; for(let i=0;i<PARTS.length-1;i++) NEXT_OF[PARTS[i].part_id]=PARTS[i+1].part_id;
   // ps_roll drives the picker; ensure colors are assigned in PS order
   PS_ROLL = (s.ps_roll||[]).map(r=>({ps_id:r.ps_id, addr:r.addr, n:r.n, size:r.size}));
   PS_ROLL.forEach(r=>psColor(r.ps_id));
+  // ps_servers is the REGISTERED fleet — a superset of ps_roll, which only has
+  // the servers that currently own a partition.
+  PS_SERVERS = s.ps_servers||[];
+  PS_SERVERS.forEach(r=>psColor(r.ps_id));
+  ADVISORIES = s.advisories||[];
   // default scope: first server (drill-in by default); keep the user's choice on refresh
   if(SEL_PS!==null && !PS_ROLL.some(r=>r.ps_id===SEL_PS)) SEL_PS=null;
   if(SEL_PS===null && PS_ROLL.length>1 && !window.__pickedAll && PARTS.length>0) SEL_PS = PS_ROLL[0].ps_id;
 
-  renderRibbon(); renderPs(); renderList();
-
-  const adv=s.advisories||[];
-  $("#advcount").textContent = adv.length?`${adv.length}`:"";
-  $("#advisories").innerHTML = adv.length ? adv.map(a=>{
-    const kind=(a.kind||a.action&&a.action.action||"").toString();
-    return `<div class="adv ${esc(kind)}"><span class="sev"></span>
-      <span class="d">${esc(a.desc)}</span>
-      ${a.action?`<button class="btn" onclick='act(${JSON.stringify(a.action)},"${esc(a.desc).replace(/"/g,"")}")'>Apply</button>`
-             :`<span style="color:var(--dim)">advisory</span>`}</div>`;
-  }).join("") : '<div class="empty">No advisories — topology is settled.</div>';
+  renderTabBar();
+  const t=TABS.find(x=>x.id===TAB); if(t) t.render();
 }
 
 // ── policies / controller ────────────────────────────────────────────────────
 function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance"].map(k=>`<span class="sw-i ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
-async function loadPolicies(){
-  const st=await api("/api/policies");
+// An advisory's `desc` is "<kind> <target> <reason>" and the reason can be a
+// full sentence (the compact that must precede a blocked split says why). Split
+// it so the row leads with what to do and the reasoning sits under it.
+function advRow(a){
+  const kind=(a.kind||(a.action&&a.action.action)||"").toString();
+  const d=String(a.desc||"");
+  const m=d.match(/^(\S+\s+\S+(?:\s+\S+)?)\s{2,}(.*)$/s);
+  const head=m?m[1].trim():d, why=m?m[2].trim():"";
+  return `<div class="adv ${esc(kind)}"><span class="sev"></span>
+    <span class="d">${esc(head)}${why?`<span class="why">${esc(why)}</span>`:""}</span>
+    ${a.action?`<button class="btn" onclick='act(${jsAttr(a.action)},${jsAttr(head)})'>Apply</button>`
+           :`<span style="color:var(--dim)">advisory</span>`}</div>`;
+}
+function renderPolicyTab(){
+  $("#advcount").textContent = ADVISORIES.length?`${ADVISORIES.length}`:"";
+  $("#advisories").innerHTML = ADVISORIES.length ? ADVISORIES.map(advRow).join("")
+    : '<div class="empty">No advisories — topology is settled.</div>';
+  const st=(window.__pol)||{};
   const mode=st.mode||"off", active=st.active||"", live=mode!=="off";
   const label = mode==="armed"?"running (armed)":mode==="dry_run"?"observing (dry-run)":"stopped";
-  // controller vital
-  $("#v_ctl").innerHTML = mode==="armed" ? `<span class="up">armed</span>` : mode==="dry_run" ? `observe` : `<span class="off">off</span>`;
-  $("#v_ctl_sub").innerHTML = active?`policy <b>${esc(active)}</b>`:"no policy selected";
   let btns="";
   if(active && mode!=="armed") btns+=`<button class="btn xs" style="margin-left:8px" onclick='armCtl()'>Arm</button>`;
   if(active) btns+=`<button class="btn xs ${live?"bad":""}" style="margin-left:6px" onclick='stopCtl()'>Stop</button>`;
@@ -714,13 +1058,18 @@ async function loadPolicies(){
         <span class="pgrow"></span>
         <button class="btn xs" onclick='activate("${esc(p.name)}")'>${st.active===p.name?"active":"use"}</button>
         ${p.builtin?"":`<button class="btn xs bad" onclick='delPolicy("${esc(p.name)}")'>del</button>`}</div>
-      <div class="sws">${swLine(p.switches)}
+      <div class="sws">${swLine(p.switches||{})}
         <span class="cfg">i=${p.interval}s cd=${p.cooldown}s max=${p.max_actions}</span></div>
     </div>`).join("");
-  $("#autolog").innerHTML = (st.log||[]).map(l=>`
-    <div class="r"><span class="ts">${new Date(l.ts*1000).toLocaleTimeString()}</span>
-      <span class="lv ${l.level}">${l.level}</span><span class="msg">${esc(l.msg)}${l.desc?` (${esc(l.desc)})`:""}</span></div>`).join("")
-    || '<div class="empty">No recent actions.</div>';
+}
+async function loadPolicies(){
+  let st; try{ st=await api("/api/policies"); }catch(e){ return; }
+  window.__pol=st; window.__polLog=st.log||[];
+  const mode=st.mode||"off", active=st.active||"";
+  $("#v_ctl").innerHTML = mode==="armed" ? `<span class="up">armed</span>` : mode==="dry_run" ? `observe` : `<span class="off">off</span>`;
+  $("#v_ctl_sub").innerHTML = active?`policy <b>${esc(active)}</b>`:"no policy selected";
+  if(TAB==="policy") renderPolicyTab();
+  if(TAB==="logs") renderLogsTab();
 }
 async function activate(name){ await api("/api/policies/activate",{active:name}); loadPolicies(); }
 async function armCtl(){
@@ -738,13 +1087,23 @@ $("#np_save").onclick=async()=>{
 };
 
 // ── wiring ───────────────────────────────────────────────────────────────────
+// /api/overview is always fetched (the header vitals and every tab's data come
+// from it); the other two only when the visible tab renders them, because each
+// call spawns an autumn-op subprocess.
+function refresh(){
+  overview();
+  if(tabNeeds("policies")) loadPolicies();
+  if(tabNeeds("ops")) loadOps();
+}
 $("#vp").onscroll = renderRows;
 $("#danger").onchange = e=>{ DANGER=e.target.checked; $("#dangerlbl").textContent = DANGER?"Danger unlocked":"Danger locked";
   renderRows(); if(SELECTED!=null) openDetail(SELECTED); };
 window.onresize = renderRows;
-function schedule(){ if(TIMER) clearInterval(TIMER); const ms=+$("#interval").value; if(ms>0) TIMER=setInterval(()=>{overview(); loadPolicies(); loadOps();},ms); }
+window.onhashchange = ()=>{ const id=(location.hash||"#overview").slice(1); if(id!==TAB && TABS.some(t=>t.id===id)) setTab(id); };
+function schedule(){ if(TIMER) clearInterval(TIMER); const ms=+$("#interval").value; if(ms>0) TIMER=setInterval(refresh,ms); }
 $("#interval").onchange = schedule;
-overview(); loadPolicies(); loadOps(); schedule();
+setTab(TAB);
+schedule();
 </script>
 </body>
 </html>

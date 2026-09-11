@@ -3172,6 +3172,12 @@ async fn run_info(
                 "last_gc_at": l.last_gc_at,
                 "last_compact_at": l.last_compact_at,
                 "sealed_log_extent_count": l.sealed_log_extent_count,
+                "open_tail_bytes": l.open_tail_bytes,
+                "open_tail_dead_bytes": l.open_tail_dead_bytes,
+                // 1 = this partition's SSTs still carry keys outside its range
+                // (post-CoW-split). `split` is REFUSED while it is set, and
+                // only a major compaction clears it.
+                "has_overlap": l.has_overlap,
             });
             println!(
                 "{}",
@@ -3212,6 +3218,15 @@ async fn run_info(
                 l.last_gc_at, l.last_compact_at
             );
             println!("  sealed_log_extent_count={}", l.sealed_log_extent_count);
+            println!(
+                "  has_overlap={}{}",
+                l.has_overlap,
+                if l.has_overlap != 0 {
+                    "  (split refused until a major compaction separates the CoW-shared keys)"
+                } else {
+                    ""
+                }
+            );
         }
         return Ok(());
     }

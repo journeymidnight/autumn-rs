@@ -118,7 +118,7 @@ requests by partition id.
 │  │  meta_stream_id  ← TableLocations checkpoint      │    │
 │  │                                                   │    │
 │  │  seq_number: monotonic MVCC counter               │    │
-│  │  has_overlap: AtomicU32                           │    │
+│  │  has_overlap: Cell<u32> (mirrored to metrics)     │    │
 │  └───────────────────────────────────────────────────┘   │
 │                                                          │
 │  stream_client: Arc<StreamClient>                        │
@@ -1591,7 +1591,12 @@ Three fixes bound the restart replay window (worst case per partition =
    collect dead VP data.
 
 4. **`has_overlap` blocks split but not reads** — `range()` with `has_overlap` set
-   range-filters; `get()` does NOT filter (point lookups are exact).
+   range-filters; `get()` does NOT filter (point lookups are exact). Write it ONLY
+   through `PartitionData::set_has_overlap`, which also stores the `PartitionMetrics`
+   mirror the main thread reports to the manager (`PartitionLoad.has_overlap`, which
+   is how the policy knows a split would be refused). Two independent stores would
+   eventually disagree, and the disagreement is invisible until a policy acts on the
+   stale half.
 
 5. **No local WAL file** — logStream is the sole WAL. All writes (small and large) go
    to logStream via `append_batch`. If no checkpoint exists (tables empty AND
@@ -1680,7 +1685,11 @@ Three fixes bound the restart replay window (worst case per partition =
     each GC tick from `Σ(get_discards filtered to live sealed log extents)`),
     `pending_compaction_bytes` (each compact tick: total SST bytes if `has_overlap==1`,
     else `pickup_tables` output), `gc_inflight` / `compact_inflight` (0/1 around the
-    awaits), `last_gc_at` / `last_compact_at` (unix-epoch, drives per-kind cooldown).
+    awaits), `last_gc_at` / `last_compact_at` (unix-epoch, drives per-kind cooldown),
+    and `has_overlap` — the cross-thread mirror of the partition thread's `Cell`, which
+    `PartitionData::set_has_overlap` keeps in step. It ships because the manager's
+    split/merge advisories must not propose an op `handle_split_part` will refuse; the
+    partition thread's `Cell` is unreachable from `report_load_loop`.
     `compute_pending_compaction_bytes(part)` lives in `background.rs`.
 
     **Async-op outcome reporting.** `PartitionMetrics.maintenance_outcomes` is a
