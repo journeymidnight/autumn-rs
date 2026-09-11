@@ -2632,10 +2632,64 @@ impl ClusterClient {
                     // NEVER crc-scanned by the sender (the
                     // old call_vectored path paid a full crc32c pass over the
                     // value).
-                    match client
-                        .call_vectored_bulk(partition_rpc::MSG_PUT_BULK, vec![meta], value.clone())
-                        .await
-                    {
+                    // BOUNDED — the only production data-path call that was not.
+                    //
+                    // This reaches the PS directly instead of through
+                    // `ps_call_with_timeout`, so it never picked up
+                    // `rpc_timeout`, and `await_response` is a bare `rx.await`.
+                    // A PS that accepts writes and stops answering therefore
+                    // held the caller forever. `ps_call_bulk_multi` bounds its
+                    // batch sibling for exactly this reason, naming the `kill -9`
+                    // window; the single-value variant was simply missed.
+                    //
+                    // Measured live: twelve uploads stopped with their send
+                    // queues full (1-4 MiB each, recv 0) and zero context
+                    // switches over thirty seconds. On the PS side of those same
+                    // connections, 92 sockets held ~4.6 MiB each of UNREAD
+                    // request bytes while the PS process burned 0 CPU. So the PS
+                    // had stopped READING, not merely stopped replying — a
+                    // server-side stall this deadline does not fix and cannot.
+                    //
+                    // What it fixes is the client's response to it. At most 96
+                    // puts are in flight per process, so the 1024-deep submit
+                    // queue was never what blocked them; every one sat in a bare
+                    // `rx.await` with no deadline, which turns a stalled server
+                    // into a permanently stalled client. Now it surfaces as a
+                    // retryable error after `rpc_timeout`, and gives up after
+                    // MAX_PS_REFRESHES instead of never.
+                    //
+                    // Abandoning the call EVICTS this connection, and an
+                    // `RpcClient` has no `Drop`: its writer task is blocked in
+                    // `write_all` on a socket the peer stopped reading, so it
+                    // never sees the channel close and the queued frames stay
+                    // pinned until the peer closes. Bounded (one connection's
+                    // queue) and the same shape every other timeout path here
+                    // already has, but it is a leak, not a clean teardown.
+                    //
+                    // `call_vectored_bulk` is an `async fn`, so binding it runs
+                    // NOTHING — the whole body, encode and submit included, is
+                    // inside the deadline. That costs nothing and hides nothing:
+                    // everything before `await_response` is synchronous and
+                    // completes on the first poll, so the only thing a deadline
+                    // can actually interrupt is the wait for the reply.
+                    //
+                    // Abandoning it therefore cannot truncate a frame. The
+                    // caller only hands a message to the writer task's channel;
+                    // the `writev` happens over there and is unaffected by this
+                    // future being dropped.
+                    let call =
+                        client.call_vectored_bulk(partition_rpc::MSG_PUT_BULK, vec![meta], value.clone());
+                    let bulk_outcome = match self.rpc_timeout.get() {
+                        None => call.await,
+                        Some(t) => match compio::time::timeout(t, call).await {
+                            Ok(r) => r,
+                            Err(_) => Err(autumn_rpc::RpcError::Status {
+                                code: autumn_rpc::StatusCode::Unavailable,
+                                message: format!("MSG_PUT_BULK timed out after {t:?}"),
+                            }),
+                        },
+                    };
+                    match bulk_outcome {
                         Ok(resp_bytes) => {
                             let resp: PutResp =
                                 rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
