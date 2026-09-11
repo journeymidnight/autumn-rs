@@ -1,3 +1,34 @@
+Date: 2026-09-11 (2)
+TaskStatus: completed
+Task scope: 找到并修复分区永久卡死的真正根因——per-stream worker 的生命周期与它的
+  "tail 已初始化"标记不是同一条命,而且退出的 worker 会注销掉自己的继任者。
+  后果是三副本各截掉 1.7 GiB。已修、fable 独立评审、评审项全修、两处消融各自验证。
+
+【线上现象】
+  - 三个副本在同一时刻各丢 1.7 GiB,append 带 commit=0;随后 manager 把该 extent
+    封在 8 MiB,而节点上有 3.3 GiB(UNDER-SEAL)。
+  - 分区停止应答写入,客户端每分区堆 100-220 MiB 未读请求;无任何 WARN/ERROR。
+
+【机制(评审纠正了我第一版的说法)】
+  没有任何东西"把 commit 归零"——零从来没被覆盖过。新 worker 出生即 cursor=0,
+  而唯一会把 cursor 抬到已提交长度的 SeedCursor 就在被跳过的那次初始化里。
+    split → invalidate_stream(清 worker + 标记) → append spawn worker#2,初始化完成
+    → worker#1 这才排空退出,按 key 删掉了 #2 的条目
+    → 下次 append spawn #3,看到标记仍为 true 就跳过初始化
+    → 第一个 append 报 "no tail set" → 被当软错误重载 tail → 重试在 cursor 0 处 lease
+    → header.commit=0 → 每个副本照做,截断。
+
+【修法】
+  - 每个 worker 带 generation,两处删除都以它为门。
+  - 顺序是承重的:把"清标记"挪到 generation 检查之前,所有显而易见的测试仍然全绿,
+    但会让一个活着的 worker 在自己脚下重新初始化——两个 worker 用各自的 cursor
+    写同一个 extent,比原 bug 更糟。已用测试钉死这个顺序。
+  - "no tail set" 改为 fail-fast,不再软重试:下次再出生命周期 bug 会报错而不是截断。
+
+Main gaps: 已卡死的 3 个分区需重启清除;FTW 上传停在 dsv4 8/52、minimax 29/34。
+  EC 转换与 append 的 fsync 争用未证实(盘 34% util、CPU 1%),不作为根因。
+Next steps: 构建 → 三个 PS 并行重启 → 换新 autumnfs 重跑两个 FTW 上传。
+
 Date: 2026-09-11
 TaskStatus: completed
 Task scope: 修上传永久卡死——put_bulk 是唯一没有 deadline 的数据面调用;顺带让

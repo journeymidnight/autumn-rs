@@ -882,13 +882,13 @@ first append would overwrite committed bytes).
 | Submit mpsc cap | 256 per stream. Parked callers wake as the worker drains. |
 | Inflight cap | `AUTUMN_STREAM_INFLIGHT_CAP` (default 32); `at_cap` → CQ-only. |
 | Worker lifecycle | Spawned lazily on first `append*`; exits on channel close / `Shutdown` after draining all inflight for a final ack. |
-| Worker removal | On exit a `WorkerRemovalGuard` (via `Weak<StreamClient>`) removes the Sender; next `append*` spawns fresh. |
+| Worker removal | On exit a `WorkerRemovalGuard` (via `Weak<StreamClient>`) removes the Sender **only if the entry still carries its own generation**, and then also drops the stream's init flag; next `append*` spawns fresh AND re-initialises. See note 35. |
 | `LockedByOther` | Propagated immediately; PS owner self-evicts. |
 
 | Cache | Key | Value | Invalidated on |
 |-------|-----|-------|----------------|
-| `stream_workers` | stream_id | `mpsc::Sender<StreamSubmitMsg>` | Worker exit, drop |
-| `stream_init_locks` | stream_id | `Rc<futures::lock::Mutex<bool>>` | Never |
+| `stream_workers` | stream_id | `(generation, mpsc::Sender<StreamSubmitMsg>)` | Worker exit (own generation only), `invalidate_stream`, drop |
+| `stream_init_locks` | stream_id | `Rc<futures::lock::Mutex<bool>>` | Worker exit (same generation gate), `invalidate_stream` — NEVER outlives the worker it initialised (note 35) |
 | `nodes_cache` | node_id | address | A node id missing from it, **or a cached address that could not be reached** — `forget_node_addr`, called from the retry loops AND from the sites that swallow a per-replica failure; rate-limited per node (note 34) |
 | `extent_info_cache` | extent_id | `ExtentInfo` | Replica lookup failure |
 
@@ -1234,6 +1234,46 @@ and from other crates' CLAUDE.md); do not renumber.
     through `forget_for_retry` — the first draft taught only the plain read and
     left the committed read (WAL replay, on the longest-lived client there is)
     with the pre-fix behaviour.
+
+
+35. **The per-stream worker's lifetime and its "tail initialised" flag are ONE
+    lifetime, and an exiting worker may only unregister ITSELF.**
+    Both halves were missing, and together they truncated 1.7 GiB on each of
+    three replicas of one extent, on a single append.
+
+    A worker is spawned lazily and owns all append state; `ensure_tail_
+    initialised` is what gives it a tail and — via `current_commit` +
+    `SeedCursor` — a lease cursor at the extent's committed length. That init
+    is gated on a per-stream `bool`. A worker that skips it keeps the
+    `lease_cursor = 0` it was born with, and `header.commit = offset` means
+    the first append it sends tells every replica to truncate to zero.
+
+    Two defects made that reachable, and they compose in the order a SPLIT
+    produces (split calls `invalidate_stream` on all three streams):
+    - `WorkerRemovalGuard::drop` removed by KEY, so a worker exiting after a
+      successor had been spawned deleted the LIVE successor's entry;
+    - the init flag was keyed by stream id and cleared only by
+      `invalidate_stream`, so it outlived the worker it described.
+
+    Split → invalidate (clears both) → append spawns worker #2, which
+    initialises → worker #1 finally drains and exits, deleting #2's entry →
+    the next append spawns #3, finds the flag still true, skips init, and
+    leases from zero.
+
+    The fix tags each worker with a generation and gates BOTH removals on it.
+    The order matters: clearing the flag ahead of the generation check passes
+    every obvious test while making a LIVE worker re-initialise underneath
+    itself — two workers leasing one extent from independent cursors, which is
+    worse than the bug. `an_exiting_worker_does_not_unregister_its_successor`
+    pins that order.
+
+    **Nothing zeroes a commit on this path** — the zero is simply never
+    overwritten, which is why it left no trace. The symptom that DOES appear
+    is on the extent node: `truncating extent to the writer's commit` with
+    `commit=0`, followed by the manager sealing the extent far below what the
+    nodes hold (`BUG2 UNDER-SEAL`). `"no tail set"` is now a fail-fast error
+    rather than a soft retry, so a future lifecycle bug reports itself instead
+    of truncating. Cross-ref notes 20, 21, 22, 25a.
 
 ---
 

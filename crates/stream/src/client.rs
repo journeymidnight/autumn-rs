@@ -1625,13 +1625,48 @@ type InflightFut = std::pin::Pin<Box<dyn std::future::Future<Output = InflightRe
 struct WorkerRemovalGuard {
     sc: Weak<StreamClient>,
     stream_id: u64,
+    /// The generation of the worker this guard belongs to.
+    gen: u64,
 }
 
 impl Drop for WorkerRemovalGuard {
     fn drop(&mut self) {
-        if let Some(sc) = self.sc.upgrade() {
-            sc.stream_workers.borrow_mut().remove(&self.stream_id);
+        let Some(sc) = self.sc.upgrade() else {
+            return;
+        };
+        // Remove ONLY this worker's own entry. A bare `remove(&stream_id)`
+        // deletes whatever is under the key, which after an
+        // `invalidate_stream` is a LIVE successor: the exiting worker
+        // unregisters its replacement, the next append finds nothing and
+        // spawns a third worker, and that one starts with `tail = None`.
+        {
+            let mut workers = sc.stream_workers.borrow_mut();
+            match workers.get(&self.stream_id) {
+                Some((g, _)) if *g == self.gen => {
+                    workers.remove(&self.stream_id);
+                }
+                _ => return,
+            }
         }
+        // The "tail initialised" flag belongs to the WORKER that was
+        // initialised, not to the stream id. Left behind, it tells the next
+        // worker that its state is already seeded, so it skips
+        // `load_stream_tail` + `current_commit` + `SeedCursor` entirely and
+        // keeps the `lease_cursor = 0` it was born with. Nothing then zeroes
+        // anything — the zero was never overwritten:
+        //
+        //   1. the first `Append` fails "no tail set";
+        //   2. the public API reads that as a soft error, reloads the tail,
+        //      and sends `ResetTail`;
+        //   3. the retry leases at cursor 0, so `header.commit = 0`;
+        //   4. every replica honours it by truncating to zero.
+        //
+        // Measured live: three replicas of one extent each dropped 1.7 GiB on
+        // a single append, and the manager then sealed that extent at 8 MiB
+        // while the nodes held 3.3 GiB. `SeedCursor` is the only thing that
+        // would have set the cursor to the extent's committed length, and it
+        // rides inside the init this flag skipped.
+        sc.stream_init_locks.borrow_mut().remove(&self.stream_id);
     }
 }
 
@@ -2273,11 +2308,16 @@ pub struct StreamClient {
     /// first append* to a given stream_id.  Replaces the R3 Mutex-guarded
     /// `stream_states` DashMap — all per-stream state now lives inside
     /// the worker task.
-    stream_workers: RefCell<HashMap<u64, mpsc::Sender<StreamSubmitMsg>>>,
+    /// Per-stream worker Sender, tagged with the GENERATION that created it.
+    /// The tag is what makes `WorkerRemovalGuard` safe: a worker that exits
+    /// must remove ITS OWN entry, never whatever happens to be under the key.
+    stream_workers: RefCell<HashMap<u64, (u64, mpsc::Sender<StreamSubmitMsg>)>>,
     /// Serialises the tail-load + ResetTail for concurrent first-callers
     /// to the same stream (per-stream init lock).  After the first init,
     /// subsequent callers observe `*guard == true` and skip.
     stream_init_locks: RefCell<HashMap<u64, Rc<futures::lock::Mutex<bool>>>>,
+    /// Monotonic tag handed to each spawned per-stream worker.
+    next_worker_gen: Cell<u64>,
     /// per-stream "recently failed" node ids (`node_id → expires_at`).
     /// Shared between the per-stream worker (writes on `apply_completion`
     /// Err) and the public-API `alloc_new_extent_once` (reads + prunes
@@ -2737,6 +2777,7 @@ impl StreamClient {
             node_addr_forgotten: RefCell::new(HashMap::new()),
             extent_info_cache: DashMap::new(),
             stream_workers: RefCell::new(HashMap::new()),
+            next_worker_gen: Cell::new(0),
             stream_init_locks: RefCell::new(HashMap::new()),
             stream_bad_nodes: RefCell::new(HashMap::new()),
             failure_report_tx,
@@ -2921,18 +2962,23 @@ impl StreamClient {
     /// live-writer roll (quiesce the worker first) and the probe roll
     /// (no writer exists, a manager-side probe seal is race-free).
     fn existing_stream_worker(&self, stream_id: u64) -> Option<mpsc::Sender<StreamSubmitMsg>> {
-        self.stream_workers.borrow().get(&stream_id).cloned()
+        self.stream_workers
+            .borrow()
+            .get(&stream_id)
+            .map(|(_, tx)| tx.clone())
     }
 
     /// Get or spawn the per-stream worker, returning a cloned Sender.
     fn stream_worker_sender(&self, stream_id: u64) -> mpsc::Sender<StreamSubmitMsg> {
-        if let Some(tx) = self.stream_workers.borrow().get(&stream_id) {
+        if let Some((_, tx)) = self.stream_workers.borrow().get(&stream_id) {
             return tx.clone();
         }
         let (tx, rx) = mpsc::channel::<StreamSubmitMsg>(STREAM_SUBMIT_CAP);
+        let gen = self.next_worker_gen.get().wrapping_add(1);
+        self.next_worker_gen.set(gen);
         self.stream_workers
             .borrow_mut()
-            .insert(stream_id, tx.clone());
+            .insert(stream_id, (gen, tx.clone()));
         let pool = self.pool.clone();
         let bad_nodes = self.stream_bad_nodes_handle(stream_id);
         // clone the failure-report sender into the worker so
@@ -2945,6 +2991,7 @@ impl StreamClient {
         let guard = WorkerRemovalGuard {
             sc: self.self_weak.clone(),
             stream_id,
+            gen,
         };
         compio::runtime::spawn(async move {
             stream_worker_loop(
@@ -3491,6 +3538,25 @@ impl StreamClient {
 
                     if is_locked {
                         return Err(e);
+                    }
+
+                    // "no tail set" means this worker never ran its init, so it
+                    // still holds the `lease_cursor = 0` it was born with. The
+                    // soft path below would reload the tail and retry, and the
+                    // retry would lease at zero — `header.commit = 0` against a
+                    // live extent, which every replica honours by truncating.
+                    // That is how three replicas each dropped 1.7 GiB.
+                    //
+                    // It is also unreachable by design: every append path calls
+                    // `ensure_tail_initialised` first. So fail LOUDLY instead of
+                    // papering over it — the caller re-enters and re-initialises,
+                    // and a future lifecycle bug surfaces as an error instead of
+                    // as silent data loss.
+                    if msg.contains("no tail set") {
+                        return Err(e.context(
+                            "worker had no tail: refusing to retry, because the \
+                             retry would lease from offset 0 and truncate the tail",
+                        ));
                     }
 
                     retry += 1;
@@ -6884,6 +6950,197 @@ mod merge_ec_replay_tests {
 /// fast, and an owner-epoch fence carries the "LockedByOther" marker so the
 /// PS's poison-and-reopen self-heal re-acquires a fresh epoch.
 #[cfg(test)]
+mod worker_lifecycle_tests {
+    use super::*;
+
+    fn client() -> Rc<StreamClient> {
+        StreamClient::construct(
+            vec!["127.0.0.1:1".to_string()],
+            0,
+            "partition/40".to_string(),
+            1,
+            1 << 30,
+            Rc::new(ConnPool::new()),
+            StreamClientConfig::default(),
+        )
+    }
+
+    /// An exiting worker must unregister ITSELF, never its successor.
+    ///
+    /// The order below is the live one: a split calls `invalidate_stream`,
+    /// the next append spawns a replacement, and only then does the old
+    /// worker finish draining and drop its guard. Removing by key alone
+    /// deletes the replacement, so the append after that finds no worker and
+    /// spawns a THIRD one — which starts with `tail = None`.
+    ///
+    /// Ablation: drop the generation check in `WorkerRemovalGuard::drop` and
+    /// the successor is gone here.
+    #[compio::test]
+    async fn an_exiting_worker_does_not_unregister_its_successor() {
+        let sc = client();
+        let stream_id = 37;
+
+        let (tx_old, _rx_old) = mpsc::channel::<StreamSubmitMsg>(4);
+        let gen_old = 1;
+        sc.stream_workers
+            .borrow_mut()
+            .insert(stream_id, (gen_old, tx_old));
+        let old_guard = WorkerRemovalGuard {
+            sc: Rc::downgrade(&sc),
+            stream_id,
+            gen: gen_old,
+        };
+
+        // split
+        sc.invalidate_stream(stream_id);
+        // the next append spawns the replacement
+        let (tx_new, _rx_new) = mpsc::channel::<StreamSubmitMsg>(4);
+        let gen_new = 2;
+        sc.stream_workers
+            .borrow_mut()
+            .insert(stream_id, (gen_new, tx_new));
+        // ...and it completes its own init
+        {
+            let lock = sc.stream_init_lock(stream_id);
+            let mut g = lock.try_lock().expect("uncontended");
+            *g = true;
+        }
+
+        // the old worker finally drains and exits
+        drop(old_guard);
+
+        let still_there = sc
+            .stream_workers
+            .borrow()
+            .get(&stream_id)
+            .map(|(g, _)| *g);
+        assert_eq!(
+            still_there,
+            Some(gen_new),
+            "the exiting worker removed its live replacement; the next append \
+             will spawn a third worker with no tail and no seeded commit"
+        );
+        // And the flag clear must stay BEHIND the generation check. Clearing
+        // it unconditionally passes every other assertion here while making
+        // the LIVE successor re-initialise underneath itself — two workers
+        // leasing the same extent from independent cursors, which is worse
+        // than the bug being fixed.
+        let successor_still_seeded = {
+            let lock = sc.stream_init_lock(stream_id);
+            let g = lock.try_lock().expect("uncontended");
+            *g
+        };
+        assert!(
+            successor_still_seeded,
+            "a stale worker's guard cleared the LIVE successor's init flag"
+        );
+    }
+
+    /// The "tail is initialised" flag must not outlive the worker it
+    /// initialised.
+    ///
+    /// `ensure_tail_initialised` is what loads the tail and seeds the cursor
+    /// from `current_commit`. A flag left set makes the next worker skip all
+    /// of it and keep `tail = None` — and a worker with no tail reads the
+    /// first `ResetTail` onto the CURRENT tail as a roll to a fresh extent,
+    /// zeroing `commit` on an extent that holds real data.
+    ///
+    /// Ablation: stop clearing `stream_init_locks` in the guard and the flag
+    /// below stays `true`.
+    #[compio::test]
+    async fn a_worker_that_exits_clears_the_tail_initialised_flag() {
+        let sc = client();
+        let stream_id = 37;
+
+        let (tx, _rx) = mpsc::channel::<StreamSubmitMsg>(4);
+        sc.stream_workers.borrow_mut().insert(stream_id, (7, tx));
+        let guard = WorkerRemovalGuard {
+            sc: Rc::downgrade(&sc),
+            stream_id,
+            gen: 7,
+        };
+        // this worker completed its init
+        {
+            let lock = sc.stream_init_lock(stream_id);
+            let mut g = lock.try_lock().expect("uncontended");
+            *g = true;
+        }
+
+        drop(guard);
+
+        let seeded = {
+            let lock = sc.stream_init_lock(stream_id);
+            let g = lock.try_lock().expect("uncontended");
+            *g
+        };
+        assert!(
+            !seeded,
+            "the next worker would skip load_stream_tail + current_commit + \
+             SeedCursor and run with tail=None, which turns the first ResetTail \
+             into a roll and sets commit=0 on a non-empty extent"
+        );
+    }
+
+    /// What an UNSEEDED worker sends as `header.commit`, pinned on the state
+    /// machine itself.
+    ///
+    /// Note what does NOT happen: nothing zeroes a commit. A fresh worker is
+    /// born at zero, and `SeedCursor` — which rides inside the init a stale
+    /// flag makes it skip — is the only thing that would raise the cursor to
+    /// the extent's committed length. So the hazard is an unseeded worker
+    /// being handed a LIVE tail and leasing from zero, which is exactly what
+    /// the soft-error reload path does after "no tail set".
+    ///
+    /// The first half also pins note 22: a same-extent reload must preserve
+    /// append progress, or a seeded worker would regress the same way.
+    #[test]
+    fn an_unseeded_worker_leases_a_live_extent_from_zero() {
+        let new_state = || {
+            let (tx, _rx) = mpsc::channel::<FailureReport>(4);
+            StreamAppendState::new(
+                Rc::new(RefCell::new(HashMap::new())),
+                tx,
+                Duration::from_secs(1),
+            )
+        };
+        let mut state = new_state();
+        let tail = StreamTail {
+            extent: ExtentInfo {
+                extent_id: 269,
+                ..Default::default()
+            },
+            replica_addrs: vec!["127.0.0.1:1".to_string()],
+            replica_node_ids: vec![1],
+        };
+
+        // a seeded worker keeps its progress across a same-extent reload
+        state.apply_reset_tail(tail.clone());
+        state.commit = 1_811_951_208;
+        state.apply_reset_tail(tail.clone());
+        assert_eq!(
+            state.commit, 1_811_951_208,
+            "a same-extent reload must preserve append progress"
+        );
+
+        // A worker that skipped its init: never seeded, handed the live tail
+        // by the soft-error reload. Its lease cursor is still zero, so the
+        // first append it sends carries `header.commit = 0` — against an
+        // extent holding 1.81 GB.
+        let mut unseeded = new_state();
+        unseeded.apply_reset_tail(tail);
+        let (offset, _end) = unseeded.lease(8 * 1024 * 1024);
+        assert_eq!(
+            offset, 0,
+            "an unseeded worker leases from zero, and `header.commit = offset` \
+             is what every replica truncates to"
+        );
+        assert_eq!(
+            unseeded.commit, 0,
+            "and it has no commit of its own to contradict that"
+        );
+    }
+}
+
 mod manager_retry_tests {
     use super::*;
 
