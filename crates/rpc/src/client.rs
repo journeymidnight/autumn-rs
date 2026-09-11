@@ -5,15 +5,16 @@
 //!
 //! - **SQ (submit queue)**: callers push encoded frames into a bounded mpsc;
 //!   a single background `writer_task` owns the `WriteHalf` and drains the
-//!   queue sequentially (no write-side mutex). Back-pressure is provided by
-//!   the bounded channel.
+//!   queue sequentially (no write-side mutex). The bound REFUSES rather than
+//!   waits — a full queue means the peer stopped reading, which callers
+//!   already handle and waiting only hides.
 //! - **CQ (completion queue)**: a background `read_loop` task owns the
 //!   `ReadHalf`, decodes response frames and routes each to the matching
 //!   `oneshot::Sender<Frame>` in the `pending` inflight map.
 //!
 //! Callers never block on the wire. They insert their oneshot sender into
-//! `pending`, push a `SubmitMsg` into the submit channel (may await when the
-//! channel is full), and then await their own receiver. This decouples
+//! `pending`, push a `SubmitMsg` into the submit channel (which REFUSES rather
+//! than parks when full — see `submit`), and then await their own receiver. This decouples
 //! submission order from completion order: whichever response CQE arrives
 //! first wakes its specific caller, independent of which caller submitted
 //! first.
@@ -29,7 +30,7 @@ use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::runtime::spawn;
 use compio::BufResult;
 use futures::channel::{mpsc, oneshot};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 
 use crate::error::RpcError;
 use crate::frame::{Frame, FrameDecoder};
@@ -108,8 +109,10 @@ type ReadHalf = autumn_transport::ReadHalf;
 
 /// Capacity of the submit mpsc channel between callers and the writer task.
 ///
-/// Bounded so that callers back-pressure naturally under overload — the
-/// `submit_tx.send().await` will park until the writer_task drains one slot.
+/// Bounded, and the bound REFUSES rather than parks: 1024 undrained messages
+/// means the peer has stopped reading, which is a condition every caller here
+/// already handles (roll to a fresh extent, try another replica) and which
+/// parking hides. See `submit` for what parking cost on the live cluster.
 const SUBMIT_CHANNEL_CAP: usize = 1024;
 
 /// Submission message pushed onto the writer_task's queue.
@@ -144,8 +147,10 @@ impl SubmitMsg {
 /// All fields are !Send (single-threaded, compio thread-per-core model).
 /// `pending` uses `RefCell` with scoped borrows — never held across await.
 pub struct RpcClient {
-    /// SQ: submit channel to writer_task. `Sender::send` requires `&mut self`
-    /// so callers `clone()` before sending (cheap, `Sender` is `Arc`-backed).
+    /// SQ: submit channel to writer_task. Borrowed mutably, never cloned per
+    /// send: `futures::mpsc` grants each SENDER a slot beyond the shared
+    /// buffer, so a clone per call hands every caller its own slot and the
+    /// capacity stops applying at all (see `submit`).
     submit_tx: RefCell<mpsc::Sender<SubmitMsg>>,
     /// CQ-side inflight map: `req_id -> oneshot::Sender<Frame>`.
     /// Borrowed only briefly (insert/remove/get), never across await.
@@ -290,8 +295,8 @@ impl RpcClient {
 
     /// Send a request frame and return the oneshot receiver for the response.
     ///
-    /// On return, the frame has been queued for the writer_task (or is waiting
-    /// for a slot when the submit channel is full — natural back-pressure).
+    /// On return, the frame has been queued for the writer_task, or REFUSED
+    /// with `Unavailable` because the queue is full (see `submit`).
     /// The caller awaits the receiver to get the response frame.
     pub async fn send_frame(&self, frame: Frame) -> Result<oneshot::Receiver<Frame>, RpcError> {
         // short-circuit if the reader/writer task has already
@@ -380,7 +385,7 @@ impl RpcClient {
         bufs.extend(payload_parts);
         bufs.push(Bytes::copy_from_slice(&crc));
 
-        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }).await {
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }) {
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
@@ -436,7 +441,7 @@ impl RpcClient {
         bufs.push(Bytes::copy_from_slice(&crc));
         bufs.extend(values);
 
-        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }).await {
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }) {
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
@@ -468,7 +473,7 @@ impl RpcClient {
         bufs.push(Bytes::copy_from_slice(&crc));
         bufs.push(value);
 
-        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }).await {
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }) {
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
@@ -479,8 +484,8 @@ impl RpcClient {
     /// Send a fire-and-forget frame (no response expected).
     ///
     /// `req_id = 0` tells the remote side not to send a response frame.
-    /// Returns Ok once the frame has been queued for the writer_task
-    /// (under back-pressure from the bounded submit channel).
+    /// Returns Ok once the frame has been queued for the writer_task; a full
+    /// queue is refused with `Unavailable` rather than waited on.
     pub async fn send_oneshot(&self, msg_type: u8, payload: Bytes) -> Result<(), RpcError> {
         // short-circuit on a dead client; the submit channel may
         // still drain into a writer_task that has nowhere to read replies.
@@ -490,7 +495,7 @@ impl RpcClient {
         let req_id = 0; // req_id 0 = no response expected
         let frame = Frame::request(req_id, msg_type, payload);
         let bytes = frame.encode();
-        self.submit(SubmitMsg::Single { bytes, req_id }).await
+        self.submit(SubmitMsg::Single { bytes, req_id })
     }
 
     pub fn peer_addr(&self) -> SocketAddr {
@@ -527,25 +532,66 @@ impl RpcClient {
         bytes: Bytes,
     ) -> Result<(), RpcError> {
         self.pending.borrow_mut().insert(req_id, entry);
-        if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }).await {
-            // submit failed (writer_task exited / channel closed) — remove
-            // the pending entry so we don't leak it.
+        if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }) {
+            // submit failed (queue full, or writer_task exited / channel
+            // closed) — remove the pending entry so we don't leak it.
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
         Ok(())
     }
 
-    /// Push a SubmitMsg onto the writer_task's queue.
+    /// Hand one message to the writer task. REFUSES when the queue is full;
+    /// never parks, and never awaits — so the `RefCell` borrow cannot be held
+    /// across one, which is what the clone here used to be protecting against.
     ///
-    /// Critical: we clone the `Sender` instead of borrowing `submit_tx` across
-    /// the `.await`. Borrowing a `RefCell` across await can panic if the same
-    /// thread re-enters (e.g., another spawned task calls another RpcClient
-    /// method on the same runtime). Cloning the Sender is cheap (`Arc`-backed).
-    async fn submit(&self, msg: SubmitMsg) -> Result<(), RpcError> {
-        // Scoped borrow: clone → drop guard immediately.
-        let mut tx = self.submit_tx.borrow().clone();
-        tx.send(msg).await.map_err(|_| RpcError::ConnectionClosed)
+    /// This used to be `tx.send(msg).await`, which parks "until the writer_task
+    /// drains one slot" — and the writer task drains by writing to a socket, so
+    /// a peer that stops reading fills the socket, then this queue, and the park
+    /// has nothing to end it.
+    ///
+    /// A queue this deep is not back-pressure information: 1024 undrained
+    /// messages means the peer has stopped reading, which every caller here
+    /// already knows how to handle — a soft error that rolls to a fresh extent
+    /// or tries another replica. Parking hid exactly the signal they act on,
+    /// and it parked AFTER the message was queued, so the caller could neither
+    /// proceed nor withdraw.
+    ///
+    /// This is hardening, NOT the fix for the upload wedge that prompted it.
+    /// That wedge was `await_response` with no deadline: at most 96 puts are in
+    /// flight per uploader, so a 1024-deep queue was never what blocked them —
+    /// every one was waiting on a reply that never came. Reaching this refusal
+    /// needs more than a thousand concurrent callers on ONE connection, which
+    /// `autumnfs` cannot produce and a PS cannot either. The PS half of that
+    /// rests on a topology invariant, not on arithmetic that will stay true by
+    /// itself: each partition builds its OWN `ConnPool` and each stream caps
+    /// itself at 32 in flight. Share a pool across partitions and this refusal
+    /// becomes reachable — where `launch_append` turns a submit error into
+    /// `mark_bad_node`, so a load spike would be reported to the manager as a
+    /// node failure. An HTTP-fronted caller could reach it today.
+    ///
+    /// So the bound now does what a bound should: it refuses. Callers must treat
+    /// `Unavailable` here as retryable, which is what they already did with the
+    /// transport errors this replaces.
+    fn submit(&self, msg: SubmitMsg) -> Result<(), RpcError> {
+        // NO clone: `futures::mpsc` grants each SENDER a guaranteed slot
+        // beyond the buffer, so a fresh clone per call handed every caller its
+        // own slot — the queue then grew without limit in COUNT, and the caller
+        // parked on the flush that followed. Borrowing makes the capacity
+        // exactly `buffer + 1` and makes it refusable.
+        self.submit_tx.borrow_mut().try_send(msg).map_err(|e| {
+            if e.is_disconnected() {
+                RpcError::ConnectionClosed
+            } else {
+                RpcError::Status {
+                    code: crate::error::StatusCode::Unavailable,
+                    message: format!(
+                        "submit queue full ({SUBMIT_CHANNEL_CAP} undrained): the peer has \
+                         stopped reading"
+                    ),
+                }
+            }
+        })
     }
 }
 
@@ -896,7 +942,201 @@ fn finish_into_pooled_from_frame(
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use crate::error::StatusCode;
     use std::time::Duration;
+
+    /// A peer that ACCEPTS and never ANSWERS holds this path forever — so
+    /// every caller of it must bound it itself.
+    ///
+    /// The wait is `await_response`, not the send. The frames go out fine (the
+    /// writer task keeps draining into the socket until the peer's receive
+    /// window closes, and even then the submit queue holds 1024 more); what
+    /// never arrives is a reply, and nothing in `call_vectored_bulk` or
+    /// `await_response` carries a deadline.
+    ///
+    /// Observed live: twelve parallel uploads with 310 MiB banked in their send
+    /// queues and ZERO context switches over thirty seconds, while the same
+    /// cluster answered a fresh `put` in under a second. The wedge outlived the
+    /// condition that caused it, because nothing was left running that could
+    /// notice the condition had passed.
+    ///
+    /// This pins the SHAPE the fix uses — `compio::time::timeout` around the
+    /// whole call. Abandoning it cannot truncate a frame: the caller only hands
+    /// a message to the writer task's channel, and the `writev` happens there.
+    ///
+    /// It says nothing about `SUBMIT_CHANNEL_CAP`: at 1 MiB a frame it stops on
+    /// the FIRST call's missing reply, having queued one message against a
+    /// 1024-deep channel. The queue's own bound is pinned separately, below.
+    #[compio::test]
+    async fn a_peer_that_never_answers_holds_the_caller_until_a_deadline_ends_it() {
+        let _ = autumn_transport::current_or_init();
+
+        // Accept, then never read. Holding the socket is the whole fixture:
+        // its receive window closes, the client's send buffer fills, and the
+        // writer task stops draining the submit channel.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let accept_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let _ = stop_rx.recv_timeout(Duration::from_secs(30));
+            drop(sock);
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+
+        // Fill the socket and then the channel. One MiB per frame, more frames
+        // than the channel holds, so the tail of them cannot be drained.
+        let big = Bytes::from(vec![7u8; 1 << 20]);
+        let deadline = Duration::from_millis(300);
+        let mut timed_out = false;
+        for _ in 0..(SUBMIT_CHANNEL_CAP + 64) {
+            let call = client.call_vectored_bulk(9, vec![Bytes::from_static(b"k")], big.clone());
+            match compio::time::timeout(deadline, call).await {
+                // An inner Err would mean the SEND refused, which is a
+                // different fault with a different fix — surface it instead of
+                // letting `continue` spend the whole loop hiding it.
+                Ok(inner) => {
+                    inner.expect("the send must not be what fails here");
+                }
+                Err(_) => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+
+        let _ = stop_tx.send(());
+        accept_thread.join().expect("accept thread");
+
+        assert!(
+            timed_out,
+            "a peer that accepts and never answers must hold this path; if it \
+             did not, the fixture stopped reproducing the hazard the put_bulk \
+             deadline is there for"
+        );
+    }
+
+    /// The submit queue REFUSES at its bound — it does not park, and it does
+    /// not grow past it.
+    ///
+    /// This is the test the one above cannot be: it uses `send_vectored`, so
+    /// nothing waits on a reply and the loop actually reaches the channel, and
+    /// it yields between sends so the writer task runs — otherwise the queue
+    /// fills because the writer never got scheduled, which is a fixture
+    /// artifact rather than a peer that stopped reading.
+    ///
+    /// Ablation: with `submit` restored to `borrow().clone()` + `send().await`,
+    /// every caller gets `futures::mpsc`'s per-SENDER guaranteed slot, no
+    /// refusal ever comes, and this hangs in the loop instead — which is the
+    /// unbounded growth the live incident banked 310 MiB into.
+    #[compio::test]
+    async fn the_submit_queue_refuses_once_it_is_full() {
+        let _ = autumn_transport::current_or_init();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let accept_thread = std::thread::spawn(move || {
+            let (sock, _) = listener.accept().expect("accept");
+            let _ = stop_rx.recv_timeout(Duration::from_secs(30));
+            drop(sock);
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+
+        let big = Bytes::from(vec![7u8; 1 << 20]);
+        let mut refused = None;
+        let mut sent = 0usize;
+        for _ in 0..(SUBMIT_CHANNEL_CAP + 64) {
+            match client
+                .send_vectored(9, vec![Bytes::from_static(b"k"), big.clone()])
+                .await
+            {
+                Ok(_rx) => {
+                    sent += 1;
+                    compio::time::sleep(Duration::from_micros(10)).await;
+                }
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+        }
+        let pending_at_refusal = client.pending_count();
+
+        let _ = stop_tx.send(());
+        accept_thread.join().expect("accept thread");
+
+        let err = refused.expect(
+            "the bound must engage: a peer that never reads cannot absorb \
+             SUBMIT_CHANNEL_CAP + 64 frames of a MiB each",
+        );
+        assert!(
+            matches!(
+                err,
+                RpcError::Status {
+                    code: StatusCode::Unavailable,
+                    ..
+                }
+            ),
+            "the refusal must be retryable — callers already roll to a fresh \
+             extent or try another replica on these; got {err:?}"
+        );
+        assert!(
+            pending_at_refusal <= sent,
+            "a refused submit must roll its own `pending` entry back, or every \
+             refusal leaks one for the life of the connection; {pending_at_refusal} \
+             entries against {sent} accepted sends"
+        );
+    }
+
+    /// Cloning the sender per call DEFEATS the bound entirely — which is why
+    /// `submit` borrows it instead.
+    ///
+    /// `futures::mpsc` grants each SENDER a guaranteed slot beyond the shared
+    /// buffer. `submit` used to do `self.submit_tx.borrow().clone()`, so every
+    /// call arrived with its own slot and the capacity never applied: measured
+    /// against a peer that accepts and never reads, clone-per-call survived
+    /// 4096 sends of a MiB each without one refusal, while the borrowing form
+    /// refuses as designed.
+    ///
+    /// Pinning the mechanism itself, because reading a clone-per-send as "the
+    /// bound is safe" rather than "the bound is absent" is the easy mistake.
+    #[compio::test]
+    async fn a_cloned_sender_gets_its_own_slot_and_the_bound_stops_applying() {
+        let (tx, _rx) = mpsc::channel::<u32>(2);
+        let tx = RefCell::new(tx);
+
+        // Borrowed: the shared buffer is all there is, so it fills.
+        let mut refused_when_borrowed = false;
+        for i in 0..64u32 {
+            if tx.borrow_mut().try_send(i).is_err() {
+                refused_when_borrowed = true;
+                break;
+            }
+        }
+        assert!(
+            refused_when_borrowed,
+            "a bounded channel must refuse once its buffer is full"
+        );
+
+        // Cloned per send: each clone carries its own guaranteed slot.
+        let (tx2, _rx2) = mpsc::channel::<u32>(2);
+        let tx2 = RefCell::new(tx2);
+        let mut sent_beyond_capacity = 0;
+        for i in 0..64u32 {
+            let mut t = tx2.borrow().clone();
+            if t.try_send(i).is_ok() {
+                sent_beyond_capacity += 1;
+            }
+        }
+        assert!(
+            sent_beyond_capacity > 2,
+            "clone-per-send must be seen to exceed the declared capacity — if this \
+             stops being true, `submit` may go back to cloning"
+        );
+    }
 
     /// when the peer closes its socket without responding, the
     /// client's `read_loop` exits, `closed` flips to true, and the very

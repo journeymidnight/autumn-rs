@@ -2170,6 +2170,16 @@ async fn launch_append(
             parts.push(seg.clone());
         }
         let pool = pool.clone();
+        // The submit no longer parks: `submit()` REFUSES on a full queue
+        // (autumn-rpc), so a peer that stopped reading surfaces here as an
+        // ordinary submit error into `apply_completion`'s soft path instead of
+        // suspending this worker. Note what the old park did NOT do: replies
+        // are consumed by the connection's own spawned `read_loop`, not by this
+        // worker, so a parked worker never stopped the socket being read.
+        //
+        // The submit stays here, synchronously ordered, because per-replica TCP
+        // byte order IS this worker's submit order and the commit-truncation
+        // invariant depends on it (see the comment below).
         async move {
             let rx_res = pool.send_vectored(&addr, MSG_APPEND, parts).await;
             (addr, rx_res)
