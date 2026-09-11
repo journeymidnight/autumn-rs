@@ -32,7 +32,8 @@ use support::*;
 
 #[test]
 fn a_preemptive_roll_never_seals_below_an_acked_byte() {
-    let (mgr_addr, _mgr_guard) = start_manager();
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
     let n1_addr = pick_addr();
     let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
     let (_n1_flag, _n1_handle) =
