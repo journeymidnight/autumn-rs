@@ -1,3 +1,37 @@
+Date: 2026-09-11 (4)
+TaskStatus: not_completed
+Task scope: 事故复盘 + 待办。写路径三个 bug 已修并上线(947bae0);数据损失已发生且不可逆;
+  模型正在重新下载转换。GC 回收门槛的问题已定位但**未修**。
+
+【本次数据损失的完整链条】
+  under-seal(抢先 roll 封存在已 ack 之下,极端情况封在 0)
+  → extent 变成 sealed && sealed_length == 0
+  → sealed-empty sweep 认定"没有已 ack 的字节",合法地 punch + 删除
+  → SST 里的 VP 还指着它 → 读报 "extent N not found"
+  manager/CLAUDE.md 里对这个清理逻辑的安全性有白纸黑字的预警:
+  "这是'不存在 under-seal 这类 bug'的断言,不是结构性保证;一旦复发,
+   它会把'一个吵闹的卡死、字节还在盘上'变成'一分钟内 unlink'"。就是这样发生的。
+  损失:三个模型(dsv4-flash / minimax-m25 / bge-m3)的大文件全部不可读,已清空重下。
+
+【待办 1:GC 比例门槛对大 extent 过高(先前就存在,非本次引入)】
+  log extent 固定 16 GiB,删数据后每个里死 1-3 GiB → 比例 0.06-0.19,
+  默认门槛 0.4,于是一个都不够格;而 gc_debt 报的是真实死字节,
+  于是 advisory 一直喊、GC 一直答 "no eligible extents to reclaim"。
+  判据:`autumn-op gc --ratio 0.01 <part>` 立刻开始重写 → 确认是门槛,不是冷却、不是 EC。
+  代码注释里已记录过这个现象,但上次只修正了指标(collectable_debt 也套门槛),
+  没动门槛本身。方向:门槛应与 extent 大小挂钩(死字节绝对量也能触发),不要纯比例。
+  临时手段:--ratio 0.01 手动跑,已用它回收了约 50 GB。
+
+【待办 2:EC 与前台 append 的资源争用】
+  单个转换把 EN 推到 ~950% CPU,append 从亚毫秒涨到几百毫秒。丢唤醒/卡死修好之后
+  它不再致命,但仍会让写入变慢。未修。
+
+【已验证的修复(30 分钟观察,负载下)】
+  没有新的 sealed_length=0 出现(稳定 39)、没有 stale-extent WARN、
+  大文件读始终正常、未读请求字节归零。
+
+Next steps: dsv4 转换完成 → minimax(要等 nvme 空间)→ bge-m3 → 开 split+EC 做最终验证。
+
 Date: 2026-09-11 (3)
 TaskStatus: completed
 Task scope: 找到并修复分区永久停止应答的真正根因——抢先 roll 不 quiesce。
