@@ -1,3 +1,33 @@
+Date: 2026-09-11 (3)
+TaskStatus: completed
+Task scope: 找到并修复分区永久停止应答的真正根因——抢先 roll 不 quiesce。
+  同一竞态还藏着一个更严重的 P0:静默丢弃已 ack 的数据。两半都有消融证明的测试。
+  commit: 48c53b5。前两次诊断(worker 生命周期、imm 丢唤醒)一个是真 bug 但不是这个
+  现象的因,一个被证伪已回退(d7bb21e)。
+
+【根因】
+  抢先 roll 在一次成功 append 的 end 达到 16 GiB 时触发,直接封存并换 tail,不排空。
+  而 PS 在一条 stream 上并发跑 8 个 phase2,滚动方只是其中之一。同一时间窗两侧:
+  - 在 ResetTail **之前**完成的兄弟:被连续前缀规则 ack 成功,offset 却在封存点之上。
+    WAL 重放按 sealed_length 截断 → 已 ack 的字节在恢复时不存在。**静默丢数据**。
+  - 在 ResetTail **时仍在飞**的兄弟:完成后被套用到新 extent 的状态(commit=0),
+    落进 pending_acks 里一个永远够不到的 key,调用方的 oneshot 被永久扣住。
+    PS 的 phase2 是无界 ack_rx.await → 分区停止应答 → 连接不再读 socket。
+
+【为什么之前三次都找错】
+  没有日志(这条路径只打 debug)、读正常(读不走 worker)、EN 空闲(早就 ack 完了)、
+  撤掉负载也不恢复(sender 躺在活着的 map 里)、1600 秒超过所有下游超时(等的是
+  BTreeMap 里的一个 oneshot,不是任何 I/O)。每一条都把我推向错误的层。
+  真正收窄范围的是那条"分区收下请求后不回复"的诊断。
+
+【修法】
+  抢先 roll 走 SealCommit 排空(和其余六个发送点一致)。apply_completion 拒收
+  extent_id 不是当前 tail 的完成——这是**可达的**兜底(软错误 tail 重载无法 quiesce,
+  而且本次改动放大了它的窗口),不是不变式,注释里写明了。
+
+Main gaps: EC 转换与前台 append 的资源争用未修(单个转换吃 9.5 核);FTW 上传待重跑。
+Next steps: 构建 → 三 PS 并行重启 → 重跑上传 → 按用户要求开 EC 做验证(判据已先写死)。
+
 Date: 2026-09-11 (2)
 TaskStatus: completed
 Task scope: 找到并修复分区永久卡死的真正根因——per-stream worker 的生命周期与它的
