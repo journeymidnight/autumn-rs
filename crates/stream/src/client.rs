@@ -1931,6 +1931,51 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
         ack_tx,
     } = result;
 
+    // A completion must describe the extent the state is on. This is a real,
+    // reachable backstop — not an unreachable invariant, and not the fix.
+    //
+    // The fix is that every roller now QUIESCES before moving the worker (the
+    // `SealCommit` handshake drains `inflight`), so a roll cannot strand an
+    // append. What cannot be quiesced is the soft-error tail RELOAD: it is
+    // meant to be a same-extent refresh, but it takes its tail from a manager
+    // `StreamInfo` RPC and `apply_reset_tail` decides same-vs-different by
+    // extent id, so a reload whose RPC was served just before a concurrent
+    // roll's alloc landed moves the worker BACKWARDS onto the old extent,
+    // while completions for the new one are still in flight. Quiescing the
+    // rollers made that window wider, not narrower: a cap-hitting roll now
+    // bounces its siblings into exactly this reload path.
+    //
+    // It is loud because the failure it catches is a PERMANENT SILENT HANG,
+    // not a wrong answer. `reset_for_new_extent` sets `commit = 0`, so a
+    // completion for the other extent lands in `pending_acks` at a key the
+    // current one can never reach, holding the caller's oneshot inside a live
+    // map that no timer, retry or later ack ever touches. The partition
+    // server's Phase 2 is an unbounded `ack_rx.await`, so one such entry stops
+    // that partition answering anything: measured live at 1600 s and climbing,
+    // past every downstream deadline, extent nodes idle, nothing logged.
+    //
+    // Failing the caller is also what the seal says — these bytes are past the
+    // other extent's seal and will be discarded, they were never acked to
+    // anyone, and the caller re-drives onto the current tail, the same contract
+    // as the `failure_floor` arm in `ack`.
+    let tail_extent = state.tail.as_ref().map(|t| t.extent.extent_id);
+    if tail_extent != Some(extent_id) {
+        tracing::warn!(
+            completed_extent = extent_id,
+            tail_extent = ?tail_extent,
+            offset,
+            end,
+            "append completed on an extent the worker has left — a tail reload \
+             raced a roll; failing the caller so it re-drives on the current tail",
+        );
+        let _ = ack_tx.send(Err(anyhow!(
+            "append completed on extent {extent_id} while the worker is on \
+             {tail_extent:?}; those bytes are past that extent's seal — retry on \
+             the current tail"
+        )));
+        return;
+    }
+
     let size = end - offset;
 
     let mut success_first: Option<AppendResp> = None;
@@ -3441,8 +3486,10 @@ impl StreamClient {
     ///   3d. Err soft (retry ≤ 2) → sleep 100ms, reload tail, ResetTail; retry.
     ///   3e. Err hard → alloc + ResetTail; retry.
     ///
-    /// Invariant: ResetTail is sent AFTER the previous ack lands, so the
-    /// worker's in_flight is 0 at reset — no old-extent leases stranded on
+    /// Invariant: a `ResetTail` that moves the worker to a DIFFERENT extent
+    /// must follow a `SealCommit` drain, so no append is in flight across it.
+    /// The soft-error reload is the exception and is backstopped in
+    /// `apply_completion`; see stream CLAUDE.md note 36.
     /// the new extent.
     async fn append_payload_segments(
         &self,
@@ -3509,21 +3556,77 @@ impl StreamClient {
                     if result.end >= self.max_extent_size {
                         alloc_count += 1;
                         if alloc_count <= MAX_ALLOC_PER_APPEND {
-                            // Preemptive roll on a SUCCESSFUL cap-hitting append:
-                            // `result.end` is this append's acked end and the
-                            // clean seal boundary (later-leased appends are
-                            // beyond it → re-driven onto the new tail). end > 0
-                            // ⇒ the manager trusts it without probing.
-                            if let Ok((_, new_ext)) = self
-                                .alloc_new_extent(stream_id, Some(result.end), result.extent_id)
-                                .await
-                            {
-                                if let Ok(new_tail) = self.build_stream_tail(new_ext).await {
-                                    let mut tx_clone = tx.clone();
-                                    let _ = tx_clone
-                                        .send(StreamSubmitMsg::ResetTail { tail: new_tail })
-                                        .await;
+                            // Preemptive roll on a SUCCESSFUL cap-hitting append.
+                            //
+                            // QUIESCE FIRST, like every other roller. This used
+                            // to seal at `result.end` — this append's acked end —
+                            // on the theory that later-leased appends are beyond
+                            // it and get re-driven onto the new tail. Neither
+                            // half held, because the partition server pipelines
+                            // up to eight Phase-2 appends on one stream:
+                            //
+                            //   * an append leased behind this one can COMPLETE
+                            //     before the `ResetTail` lands. `ack` has no cap
+                            //     awareness, so it advances the contiguous prefix
+                            //     and acks that caller Ok — at an offset past the
+                            //     seal this roll is about to take. Those bytes
+                            //     are acked and then discarded: WAL replay clamps
+                            //     to `sealed_length`, so they are invisible on
+                            //     recovery. Silent loss of acked data, which is
+                            //     the one thing notes 20/22/25a exist to prevent.
+                            //   * an append still IN FLIGHT at the reset is not
+                            //     re-driven by anything. It completes afterwards
+                            //     against the fresh extent's state, where
+                            //     `commit` is 0, and parks its caller forever
+                            //     (see `apply_completion`'s stale-extent arm).
+                            //
+                            // The SealCommit handshake closes both: it drains
+                            // `inflight`, so the commit it reports covers every
+                            // completed append and none is stranded, and it sets
+                            // `sealing` so appends arriving during the roll are
+                            // bounced onto the fresh tail instead of landing past
+                            // the seal. Cost is one pipeline drain per 16 GiB per
+                            // stream.
+                            // A failure after the handshake leaves the worker
+                            // frozen (`sealing = true`) with no tail to move to.
+                            // It self-heals — the next append soft-errors twice
+                            // and the hard path runs its own seal-and-roll — but
+                            // silently, so say it happened.
+                            match self.seal_commit_watermark(stream_id, &tx).await {
+                                Ok((seal_commit, seal_eid)) => {
+                                    match self
+                                        .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
+                                        .await
+                                    {
+                                        Ok((_, new_ext)) => {
+                                            match self.build_stream_tail(new_ext).await {
+                                                Ok(new_tail) => {
+                                                    let mut tx_clone = tx.clone();
+                                                    let _ = tx_clone
+                                                        .send(StreamSubmitMsg::ResetTail {
+                                                            tail: new_tail,
+                                                        })
+                                                        .await;
+                                                }
+                                                Err(e) => tracing::warn!(
+                                                    stream_id, error = %e,
+                                                    "preemptive roll: sealed but could not build \
+                                                     the new tail; the next append re-rolls",
+                                                ),
+                                            }
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            stream_id, error = %e,
+                                            "preemptive roll: sealed but could not allocate a new \
+                                             extent; the next append re-rolls",
+                                        ),
+                                    }
                                 }
+                                Err(e) => tracing::warn!(
+                                    stream_id, error = %e,
+                                    "preemptive roll: could not quiesce the worker; the tail stays \
+                                     past its cap until the next append rolls it",
+                                ),
                             }
                         }
                     }
@@ -6107,6 +6210,99 @@ mod pipeline_tests {
         assert_eq!(state.commit, 300);
         assert_eq!(state.in_flight, 0);
         assert!(state.pending_acks.is_empty());
+    }
+
+    /// An append that completes AFTER the tail rolled beneath it must fail its
+    /// caller, not be filed against the new extent's prefix.
+    ///
+    /// This is the live wedge. The preemptive roll fires from a successful ack
+    /// without quiescing the worker, so appends already in flight on the old
+    /// extent complete afterwards. `reset_for_new_extent` has set `commit = 0`,
+    /// so such a completion's 16 GiB-scale offset can never join the new
+    /// extent's contiguous prefix: it sits in `pending_acks` holding its
+    /// caller's oneshot, nothing ever removes it, and the partition server's
+    /// Phase 2 — an unbounded `ack_rx.await` — never returns. The partition
+    /// then stops answering anything. Measured live at 1600 s and climbing,
+    /// past every downstream deadline, with the extent nodes idle.
+    ///
+    /// Ablation: drop the stale-extent arm at the top of `apply_completion`
+    /// (or call `state.ack` directly here) and the receiver below stays empty
+    /// forever while `pending_acks` holds one entry.
+    #[test]
+    fn a_completion_from_a_rolled_away_extent_fails_its_caller() {
+        let tail = |eid: u64| StreamTail {
+            extent: ExtentInfo {
+                extent_id: eid,
+                ..Default::default()
+            },
+            replica_addrs: vec!["a".to_string()],
+            replica_node_ids: vec![1],
+        };
+        let ok_frame = |offset: u64, end: u64| {
+            autumn_rpc::Frame::response(
+                0,
+                MSG_APPEND,
+                AppendResp {
+                    code: CODE_OK,
+                    offset,
+                    end,
+                }
+                .encode(),
+            )
+        };
+
+        let mut state = test_state();
+        state.apply_reset_tail(tail(7));
+
+        // Two appends in flight on extent 7, the second beyond the cap.
+        let (o_a, e_a) = state.lease(300);
+        let (o_b, e_b) = state.lease(300);
+        assert_eq!(state.in_flight, 2);
+
+        // A completes and acks; the cap-hitting roll then moves the tail to a
+        // FRESH extent without draining B.
+        state.ack(o_a, e_a, None);
+        state.apply_reset_tail(tail(8));
+        assert_eq!(state.commit, 0, "a fresh extent starts at zero");
+        assert_eq!(state.in_flight, 0, "the reset forgot the in-flight lease");
+
+        // B now completes — on extent 7, which is no longer the tail.
+        let (tx_b, mut rx_b) = oneshot::channel::<Result<AppendResult>>();
+        apply_completion(
+            &mut state,
+            InflightResult {
+                offset: o_b,
+                end: e_b,
+                extent_id: 7,
+                frames: vec![Ok(ok_frame(o_b, e_b))],
+                replica_node_ids: vec![1],
+                ack_tx: tx_b,
+            },
+        );
+
+        let got = rx_b
+            .try_recv()
+            .expect("the caller's sender must not be held")
+            .expect("the caller must be answered, not parked");
+        assert!(
+            got.is_err(),
+            "bytes past the old extent's seal must not ack as success"
+        );
+        assert!(
+            state.pending_acks.is_empty(),
+            "a stale completion must not be filed against the new extent's \
+             prefix — that entry is what holds the caller forever"
+        );
+        assert_eq!(state.commit, 0, "and it must not move the new prefix");
+        // ...and it must not have gone through the failure path, which also
+        // sends Err and leaves `pending_acks` empty — that one would poison the
+        // FRESH extent for the old one's completion.
+        assert!(!state.poisoned, "a stale completion must not poison the new tail");
+        assert_eq!(
+            state.failure_floor,
+            u64::MAX,
+            "a stale completion must not lower the new extent's failure floor"
+        );
     }
 
     fn test_state() -> StreamAppendState {

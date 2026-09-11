@@ -2551,7 +2551,7 @@ impl AutumnManager {
         } else if let Some(c) = req.seal_commit {
             // AUTHORITATIVE: the writer supplied its OWN all-replica-acked
             // commit on this tail (captured at a quiesced point via the
-            // SealCommit handshake), or a known exact end (preemptive roll).
+            // SealCommit handshake), or a drained worker commit (preemptive roll, stream note 36).
             // Seal at EXACTLY `c` and do NOT probe — even when `c == 0` (a tail
             // where nothing was ever all-acked → sealed empty). Under
             // all-replica-ACK every committed member holds >= the writer's

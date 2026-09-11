@@ -867,9 +867,17 @@ API talks to it via bounded mpsc + per-op oneshot.
 
 **Retry is in the public API**, not the worker — the worker is a pure stateful
 single-op executor. **Tail invalidation is explicit**: after any
-`alloc_new_extent` the public API sends `ResetTail` BEFORE the next Append;
-because the retry loop awaits the previous ack before resetting, `in_flight` is
-0 at the reset point (no old-extent leases stranded on the new extent).
+`alloc_new_extent` the public API sends `ResetTail` BEFORE the next Append.
+
+**Every `ResetTail` sender that can MOVE THE WORKER TO A DIFFERENT EXTENT must QUIESCE it first** (`seal_commit_
+watermark` → the `SealCommit` handshake, which drains `inflight`), so that
+`in_flight` is 0 at the reset point. The old wording said that held because
+"the retry loop awaits the previous ack before resetting" — true PER CALLER,
+and silently false once the partition server began pipelining up to
+`ps_inflight_cap` Phase-2 appends on one stream: the caller that rolls is one
+of eight, and the other seven are mid-flight. The preemptive cap-hitting roll
+was the one sender that skipped the handshake, and it cost both halves of the
+race (see note 36).
 
 **SeedCursor** initialises `commit = lease_cursor` to the replica-min
 `commit_length` when a resumed stream's tail already has data (without it the
@@ -1085,7 +1093,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
 19. **Recovery source-fetch MUST be chunked** (`copy_bytes_from_source` loops 256 MiB reads via `read_bytes_chunk`; `fetch_full_extent_from_sources` passes `extent.sealed_length`). A single `MSG_READ_BYTES length:0` on a multi-GB sealed extent trips the >2 GiB pread ceiling + oversized frame. **Caveat: `ReadBytesReq.offset` is u32 → covers extents up to 4 GiB** (guarded with an explicit error). The EC shard caller (`run_ec_recovery_payload`) keeps `total_len=0` (each shard ≈ `sealed/K`, under threshold). **Invariant:** any new full-extent fetch over `MSG_READ_BYTES` must chunk.
 
-20. **Failover seal uses the SealCommit handshake — never a public-API-tracked commit.** On same-owner failover the writer seals the failed tail at its OWN all-replica-acked commit; letting the manager probe `commit_length` can capture a speculative/un-acked byte that only one soon-dead member holds → seals at a length no replica durably retains → recovery stuck forever (phantom seal). The only SAFE commit source is the worker's serialized `state.commit` at a QUIESCED point. Mechanism: `StreamSubmitMsg::SealCommit{resp}` → the worker `drain_inflight_for_seal` (awaits every in-flight append, bounded by each one's size-scaled deadline — note 28 — so it cannot hang) → replies the final contiguous `state.commit` → sets `sealing = true` (new appends on the doomed tail get a soft error → retry onto the fresh tail; cleared by ResetTail). The 3 failover sites call `seal_commit_watermark` then `alloc_new_extent(stream, Some(commit))`; preemptive roll passes `Some(result.end)`; new-owner/sealed-tail init passes `None` (→ manager probes). `StreamAllocExtentReq.seal_commit: Option<u32>` (Some = authoritative seal at exactly c incl 0; None = probe). **Invariant: never reintroduce a public-API commit-watermark cache; the seal length must come from the worker via SealCommit.**
+20. **Failover seal uses the SealCommit handshake — never a public-API-tracked commit.** On same-owner failover the writer seals the failed tail at its OWN all-replica-acked commit; letting the manager probe `commit_length` can capture a speculative/un-acked byte that only one soon-dead member holds → seals at a length no replica durably retains → recovery stuck forever (phantom seal). The only SAFE commit source is the worker's serialized `state.commit` at a QUIESCED point. Mechanism: `StreamSubmitMsg::SealCommit{resp}` → the worker `drain_inflight_for_seal` (awaits every in-flight append, bounded by each one's size-scaled deadline — note 28 — so it cannot hang) → replies the final contiguous `state.commit` → sets `sealing = true` (new appends on the doomed tail get a soft error → retry onto the fresh tail; cleared by ResetTail). The 3 failover sites call `seal_commit_watermark` then `alloc_new_extent(stream, Some(commit))`; preemptive roll passes the drained `Some(commit)` (it used to pass `Some(result.end)`, which is failure 1 of note 36); new-owner/sealed-tail init passes `None` (→ manager probes). `StreamAllocExtentReq.seal_commit: Option<u64>` (Some = authoritative seal at exactly c incl 0; None = probe). **Invariant: never reintroduce a public-API commit-watermark cache; the seal length must come from the worker via SealCommit.**
 
     **Idempotent seal-and-roll pinned to `seal_extent_id`.** The SealCommit reply is `(commit, tail_extent_id)`; that extent id is threaded to the manager as `seal_extent_id`. `alloc_new_extent` runs under `retry_manager_call` (20×): if an attempt succeeds on the manager (seals tail T at `commit`, rolls fresh T') but its response is LOST, the retry re-sends the SAME `(commit, T)` (the worker's cached tail is still T — it never saw the lost ResetTail). The manager seals ONLY when its current tail still == `seal_extent_id` and is OPEN, else idempotent no-op — so it can NOT over-seal the now-current fresh tail T' at a stale `commit`. **Invariant: any authoritative (`Some(commit)`) alloc MUST pass the captured tail's `seal_extent_id`; only probe/`None` rolls may pass `0`.** Cross-ref: manager note 32a.
 
@@ -1278,6 +1286,63 @@ and from other crates' CLAUDE.md); do not renumber.
     is on the extent node: `truncating extent to the writer's commit` with
     `commit=0`, followed by the manager sealing the extent far below what the
     nodes hold (`BUG2 UNDER-SEAL`). Cross-ref notes 20, 21, 22, 25a.
+
+
+36. **The cap-hitting roll must QUIESCE like every other roller. Two failures,
+    opposite sides of one window.**
+    The preemptive roll fires from a SUCCESSFUL append whose `end` reached
+    `max_extent_size`, and it used to seal at that `end` and send `ResetTail`
+    without draining. Its comment said later-leased appends are "beyond it →
+    re-driven onto the new tail". Neither half was true, because the PS
+    pipelines up to `ps_inflight_cap` (8) Phase-2 appends on one stream, so the
+    roller is one caller among eight.
+
+    - **An append that completes BEFORE the reset is ACKED PAST THE SEAL.**
+      `ack` has no cap awareness: it advances the contiguous prefix and answers
+      that caller `Ok` at an offset above the `end` this roll is sealing at.
+      WAL replay clamps to `sealed_length`, so those acked bytes are invisible
+      on recovery — silent loss of acked data, the exact family notes 20/22/25a
+      exist to prevent. The window is the roller's own `alloc_new_extent`
+      manager RPC plus `build_stream_tail`, and under continuous load the
+      sibling's EN round trip is shorter than that, so this is the common case
+      at every 16 GiB boundary rather than a corner.
+    - **An append still IN FLIGHT at the reset is stranded.**
+      `reset_for_new_extent` sets `commit = 0` and clears `pending_acks`, but
+      the futures in the worker's `inflight` are untouched. Their completions
+      are then applied to the FRESH extent's state, where a 16 GiB-scale offset
+      can never join the prefix: the entry sits in `pending_acks` holding the
+      caller's oneshot, and nothing — no timer, no retry, no later ack — ever
+      removes it. The PS's Phase 2 is an unbounded `ack_rx.await`, so one such
+      entry stops that partition answering anything. Measured live: connection
+      tasks waiting 1600 s past every downstream deadline, 100-220 MiB of
+      unread requests per partition, flush and SST threads idle, extent nodes
+      idle, nothing logged above INFO, unrecoverable without a restart.
+
+    The `SealCommit` handshake closes both: the drain makes the reported commit
+    cover every completed append and leaves none stranded, and `sealing = true`
+    bounces appends arriving during the roll onto the fresh tail instead of
+    letting them land past the seal. Cost per 16 GiB per stream: one drain, plus
+    the bounced siblings each paying a 100 ms backoff and a tail reload, plus the
+    PS holding Phase 3 behind the roller for that window. Two corners come with
+    it: a sibling's failure-roll landing between the roller's ack and its
+    handshake makes the roller seal-and-roll the FRESH extent once more (no data
+    loss — the seal is the drained commit), and a roll that seals but then fails
+    to allocate leaves the worker frozen until the next append's hard path rolls
+    it (logged at WARN).
+
+    `apply_completion` additionally REFUSES a completion whose `extent_id` is
+    not the current tail's, failing that caller so it re-drives. That is a
+    REACHABLE backstop, not an unreachable invariant: the soft-error tail
+    RELOAD cannot be quiesced, and although it is meant to be a same-extent
+    refresh, it takes its tail from a manager `StreamInfo` RPC while
+    `apply_reset_tail` decides same-vs-different by extent id — so a reload
+    served just before a concurrent roll's alloc lands moves the worker
+    BACKWARDS while completions for the new extent are still in flight.
+    Quiescing the rollers WIDENS that window rather than closing it, because a
+    cap-hitting roll now bounces its siblings into exactly that reload path. It
+    also removes a latent second bug: a stale FAILED completion used to run
+    `rewind_or_poison` against the fresh extent, poisoning it for the old
+    extent's failure.
 
 ---
 
