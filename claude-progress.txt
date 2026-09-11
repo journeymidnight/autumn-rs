@@ -1,3 +1,29 @@
+Date: 2026-09-11
+TaskStatus: completed
+Task scope: 修上传永久卡死——put_bulk 是唯一没有 deadline 的数据面调用;顺带让
+  autumn-rpc 的 submit 队列的界第一次真正生效。已实现、fable 独立评审、评审项全修、
+  ablation 验证。commit: dec82be(修复) + 50b649d(硬化)。
+
+【要点】
+  - 根因不在客户端一侧。实测:12 个上传的发送队列全满(各 1-4 MiB,recv 0)、30 秒内
+    0 次上下文切换;而同一批连接的 PS 那头,92 条 socket 各压着约 4.6 MiB **没读走的**
+    请求字节,进程 0% CPU。ps-1 与 ps-2 各积压 385 MiB,ps-0 干净。
+    所以是 **PS 停止读取**,不是"回复丢了"。这一条本次没有修。
+  - 客户端修的是"对这种停摆的反应":put_bulk_opts 直接调 call_vectored_bulk 而不走
+    ps_call_with_timeout,于是 rpc_timeout 完全没生效,await_response 是裸 rx.await。
+    停摆的服务端 = 永久停摆的客户端。现在 30s 超时 → 可重试 → MAX_PS_REFRESHES 后放弃。
+  - submit 的界一直是假的:borrow().clone() + send().await,而 futures::mpsc 给每个
+    sender 一个 buffer 之外的保留槽,所以每次调用自带一个槽,队列在**数量上无界**增长,
+    然后调用方 park 在随后的 flush 上。park 在消息已入队之后 = 既不能进也不能退。
+  - 评审抓到两处我写错的注释:stream 侧"worker park 住就不再消费 CQ"这个机制**不存在**
+    (回复由连接自己 spawn 的 read_loop 消费);以及我引用了一个**从不存在的测试**。
+    两条都已删除。教训同上一轮:推断要标成推断。
+
+Main gaps: PS 为什么停止读取仍未定位。metrics 端点是空的,没有 inflight 计数。
+  ps-0(6h 前重启过)干净,另两个已跑 2d3h ——重启大概率能解,但那是治标。
+Next steps: (1) 定位 PS 侧停摆(怀疑 ps_conn_inflight_cap 达到后某个 in-flight 永不完成);
+  (2) FTW 上传要靠新二进制或 PS 重启才能推完。
+
 Date: 2026-09-10
 TaskStatus: completed
 Task scope: chaos 加入多 node 多 disk（用户 2026-09-10 定："chaos测试要加入多node多disk"）。
