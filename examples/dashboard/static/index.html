@@ -169,7 +169,7 @@
   .c-ps { width:11px; flex:none; } .c-ps i { display:block; width:9px; height:9px; border-radius:2px; }
   .c-id { width:56px; flex:none; font-weight:600; }
   .c-addr { width:148px; flex:none; color:var(--dim); font-size:12px; }
-  .c-sz { width:64px; flex:none; text-align:right; } .c-sz.zero { color:var(--muted); }
+  .c-sz { width:82px; flex:none; text-align:right; } .c-sz.zero { color:var(--muted); }
   .c-ex { width:56px; flex:none; text-align:right; color:var(--dim); font-size:12px; }
   .c-io { width:74px; flex:none; text-align:right; }
   .c-rng { flex:1; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
@@ -450,8 +450,25 @@ const PSCOLORS={};
 const PALETTE=["#c5a05e","#50a868","#9d7cc9","#cf9b52","#c45050","#5aa8a0","#c77fb0","#c98a54","#7a94c0","#9ab84e"];
 function psColor(pid){ const k=String(pid); if(!(k in PSCOLORS)) PSCOLORS[k]=PALETTE[Object.keys(PSCOLORS).length%PALETTE.length]; return PSCOLORS[k]; }
 
+// IEC suffixes, because the divisor is 1024 — a bare "G" names a different
+// quantity than the one being divided, and on a capacity panel that ambiguity
+// is the whole question.
 function fmtBytes(n){ if(n==null) return "-"; let f=n;
-  for(const u of ["B","K","M","G","T","P"]){ if(Math.abs(f)<1024||u==="P") return (u==="B"?f.toFixed(0):f.toFixed(1))+u; f/=1024; } }
+  for(const u of ["B","KiB","MiB","GiB","TiB","PiB"]){
+    if(Math.abs(f)<1024||u==="PiB") return (u==="B"?f.toFixed(0)+" B":f.toFixed(1)+" "+u); f/=1024; } }
+// Progress counts ride the wire RAW (the wire carries facts; the consumer
+// derives), so the consumer owes them a unit. FOUR kinds measure bytes — gc and
+// forcegc scan extent bytes, ec-convert counts shard bytes encoded, recovery
+// counts bytes copied — and printing those verbatim is how a 16 GiB rebuild
+// renders as `11895046144 / 17179981824`. compact counts SST data blocks and
+// split/merge count phases; showing either as bytes is wrong the other way.
+const BYTE_KINDS = new Set(["gc","forcegc","ec-convert","recovery"]);
+const COUNT_UNIT = {compact:"blocks", split:"phases", merge:"phases"};
+function fmtProgress(kind, done, total){
+  if(BYTE_KINDS.has(kind)) return `${fmtBytes(done)} / ${fmtBytes(total)}`;
+  const u = COUNT_UNIT[kind];
+  return `${done} / ${total}${u?" "+u:""}`;
+}
 function toast(msg,kind="ok"){ const d=document.createElement("div"); d.className="t "+kind; d.textContent=msg;
   $("#toast").appendChild(d); setTimeout(()=>d.remove(), kind==="bad"?12000:5000); }
 async function api(path,body){ const opt=body!==undefined?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{};
@@ -551,6 +568,9 @@ function isNodeUnhealthy(n){
   const st=n.auto_state||(n.online?"Online":"?");
   if(st!=="Online") return true;
   if((n.override_kind||"-")!=="-") return true;
+  // Did not answer df: its disks are UNKNOWN, and it has no rows to judge —
+  // without this it would read healthy until the tracker flips it Suspected.
+  if(n.online===false) return true;
   return (n.disks||[]).some(d=>d.reported===false||d.faulted||!d.online);
 }
 function psHealth(p){
@@ -660,8 +680,8 @@ function renderPsDrawer(id){
     </div>
     ${h.cls==="bad"?`<div class="blocked">This PS has not heartbeated in ${esc(h.text)}. The manager evicts a
       PS unseen for 10 s and reassigns its partitions; if it is still listed here, the eviction has not run yet.</div>`:""}
-    ${h.cls==="unknown"?`<div class="blocked">This leader has never seen a heartbeat from this PS — it may be a fresh
-      leader that has not observed one yet, not a dead server.</div>`:""}
+    ${h.cls==="unknown"?`<div class="blocked">No heartbeat is on record for this PS. Replay and registration both
+      seed one, so this is unexpected — treat it as unknown, not as dead.</div>`:""}
     <div class="subh">Partitions · ${mine.length}</div>
     ${mine.length?`<div class="extlist">${mine.map(p=>`
       <div class="ext" style="cursor:pointer" onclick='pick(${JSON.stringify(id)},true); openDetail(${p.part_id})'>
@@ -740,6 +760,8 @@ function renderNodeDrawer(id){
       <span class="m">capacity <b>${total?fmtBytes(total):"-"}</b></span><span class="m">free <b>${free!=null?fmtBytes(free):"-"}</b></span>
       <span class="m">disk <b>${total?(usedPct.toFixed(0)+"% used"):"-"}</b></span><span class="m">suspected age <b>${n.suspected_age_secs?n.suspected_age_secs+"s":"-"}</b></span>
     </div>${ov}
+    ${n.online===false?`<div class="blocked">This node did not answer its last <code>df</code>. Its per-disk
+      state is <b>unknown</b> — not healthy and not faulted — and nothing below describes the disks right now.</div>`:""}
     ${faulted.length?`<div class="blocked">${faulted.length} disk${faulted.length>1?"s":""} reported FAULTED by this node
       (${esc(faulted.map(d=>"#"+d.disk_id).join(", "))}). Its sealed replicas are rebuilt elsewhere; the node keeps serving its other disks.</div>`:""}
     ${unreported.length?`<div class="blocked">${unreported.length} disk${unreported.length>1?"s":""} registered to this node but
@@ -948,7 +970,7 @@ function renderLiveOps(ops){
     if(o.progress_total > 0){
       const pct = Math.min(100, Math.round(o.progress_done / o.progress_total * 100));
       prog = `<div><div class="bar"><i style="width:${pct}%"></i></div>
-        <div class="ops-msg" style="margin-top:3px">${pct}% · ${o.progress_done} / ${o.progress_total}</div></div>`;
+        <div class="ops-msg" style="margin-top:3px">${pct}% · ${esc(fmtProgress(o.kind, o.progress_done, o.progress_total))}</div></div>`;
     }
     return `<div class="ops-row">
       <span class="ops-kind">${esc(o.kind)}</span>

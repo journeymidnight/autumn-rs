@@ -244,8 +244,8 @@ pub fn build_overview_json(
             json!({
                 "ps_id": p.ps_id,
                 "addr": p.address,
-                // null = this leader has never seen a heartbeat from it (a
-                // fresh leader starts with an empty map). NOT "0 s ago".
+                // null = no heartbeat entry (defensive — replay and
+                // registration both seed one). Never render it as "0 s ago".
                 "last_heartbeat_secs_ago": (p.last_heartbeat_secs_ago != u64::MAX)
                     .then_some(p.last_heartbeat_secs_ago),
                 "partition_count": p.partition_count,

@@ -1388,8 +1388,10 @@ pub struct PsOverview {
     /// partitions listen on their own ports; see `PartitionOverview.ps_addr`.
     pub address: String,
     /// Seconds since this PS's last heartbeat, or `u64::MAX` when the manager
-    /// has not seen one since it became leader (a fresh leader starts with an
-    /// empty heartbeat map, so this is "unknown", not "dead").
+    /// holds no heartbeat entry for it — defensive only: `replay_from_etcd` and
+    /// `register_ps` both seed one. The flip side of the replay seed: right
+    /// after a leader change, every replayed PS reads as freshly heard from
+    /// until the 10 s eviction window has had a chance to judge it.
     pub last_heartbeat_secs_ago: u64,
     /// Regions currently assigned to this PS.
     pub partition_count: u32,
@@ -1835,14 +1837,16 @@ pub struct DiskCapWire {
     pub free: u64,
     /// Σ this disk's live extent file lengths — the real autumn footprint on it.
     pub extent_bytes: u64,
-    /// Did the node describe this disk on its last `df` at all?
+    /// Did the node describe this disk on its last `df`?
     ///
-    /// `false` = the manager's registry has this disk for this node but the
-    /// node did not report it — an operator dropped it from the EN's `--data`
-    /// list, or the node is not answering `df`. Every other field is then
-    /// meaningless (zero), and this is the ONLY state in which they are. A
-    /// disk that fails to OPEN cannot produce this: `DiskFS::open` is fallible
-    /// at EN startup, so the node does not come up at all.
+    /// `false` = the node ANSWERED df and the manager's registry assigns this
+    /// disk to it, but the answer did not mention it — typically the EN was
+    /// started without that `--data` directory. Every other field is then
+    /// meaningless (zero). A node that did not answer df at all produces NO
+    /// rows (see `NodeCapWire.disks`), not one of these per disk: "the node is
+    /// unreachable" and "this disk is missing" call for different actions. A
+    /// disk that fails to OPEN cannot produce this either — `DiskFS::open` is
+    /// fallible at EN startup, so the node does not come up.
     pub reported: bool,
     /// What the OWNING NODE said about this disk on its last `df`.
     pub online: bool,
@@ -1865,8 +1869,10 @@ pub struct NodeCapWire {
     pub extent_bytes: u64,
     /// false = the node's df probe failed this cycle (unknown != truly offline).
     pub online: bool,
-    /// The disks this rollup was summed from. Empty when the node's df failed
-    /// this cycle (nothing to describe), or for a node that has never answered.
+    /// Per-disk rows for this node. EMPTY when the node did not answer df
+    /// this cycle (it described nothing, so nothing is fabricated) or has never
+    /// answered. Otherwise: every disk it described that the registry assigns
+    /// to it, plus one `reported: false` row per assigned disk it omitted.
     pub disks: Vec<DiskCapWire>,
 }
 

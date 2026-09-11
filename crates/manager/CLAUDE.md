@@ -274,12 +274,20 @@ the serving PS moved); the PS `sync_regions_once` picks up the `ps_id` change an
 old PS drops / new PS opens. Exposed as `autumn-op rebalance [MAX_MOVES]` and as the
 auto-policy `POLICY_KIND_REBALANCE` (7) arm.
 
-**Rebalance actuation cooldown floor.** `decide_actions` floors rebalance's
-actuation cooldown at a non-configurable `REBALANCE_MIN_ACTUATION_COOLDOWN_SEC`
-(60 s). The advisory-side `rebalance_cooldown_sec` only gates EMISSION, but an
-emitted candidate lingers in `advisory_cache` for a whole policy-tick window, so a
-policy with `cooldown_sec = 0` would re-actuate the same cached candidate every tick
-→ partition-reopen storm. The floor is rebalance-only.
+**Actuation cooldown floors (rebalance + compaction).** `decide_actions` floors the
+actuation cooldown of rebalance and of BOTH compact kinds at a non-configurable 60 s
+(`REBALANCE_MIN_ACTUATION_COOLDOWN_SEC` / `COMPACT_MIN_ACTUATION_COOLDOWN_SEC`). Both
+compact kinds, because a major and a minor candidate actuate the identical `compact`
+op. Advisory-side cooldowns only gate EMISSION, and an emitted candidate lingers in
+`advisory_cache` for a whole 60 s policy-tick window while the loop ticks every
+`interval_sec` (min 2 s) — so a policy with `cooldown_sec = 0` would re-actuate the
+same cached candidate ~30 times per window: a partition-reopen storm for rebalance, a
+repeated full-SST rewrite for compaction. For compaction the floor is the only guard
+on the `unblocking_compact` path, which does not suppress on `compact_cooldown_sec` (it
+keys on a FLAG, not a debt level). The two compact kinds keep separate cooldown keys,
+so a partition with both rows is compacted at most twice per floor window. Both floors
+sit below every preset's `cooldown_sec` (120-240 s), so they can only catch a
+misconfiguration.
 
 ## PS liveness
 
@@ -1079,7 +1087,14 @@ failure reason the fire-and-forget maintenance ops used to drop.
   derives the ratio (the same rule cluster-df follows). A bare "50%" cannot
   distinguish two tables from fifty gigabytes, and an operator deciding whether
   to wait needs the magnitude; `autumn-op ops` renders both, in the unit the
-  kind actually measures (bytes for gc/forcegc, tables for compact). PS-executed
+  kind actually measures — BYTES for gc/forcegc (extent bytes scanned),
+  ec-convert (shard bytes encoded) and recovery (bytes copied); SST DATA BLOCKS
+  for compact (`merge.block_progress()`); PHASES for split/merge. Rendering a
+  byte kind as a raw count prints a 16 GiB rebuild as
+  `11895046144 / 17179981824`, and rendering blocks or phases as bytes is wrong
+  the other way; `human_bytes_or_count` (CLI) and `fmtProgress` (dashboard) are
+  the two places that decide, and they apply the same table (both append the unit
+  word for count kinds). PS-executed
   kinds publish a sample from their own loop
   (`PartitionMetrics::set_maintenance_progress`, once per GC chunk — never per
   record) which rides `PartitionLoad.active_maintenance`. `update_progress`
@@ -1138,19 +1153,24 @@ used to serve. Manual actions map to the allow-listed `autumn-op` subcommands
 above.
 
 Two of its fields exist because a ROLL-UP CANNOT ANSWER THE QUESTION THEY ANSWER:
-- **`nodes[].disks`** — per-disk `total/free/extent_bytes/online/faulted`, carried
-  whole (offline disks included, though the capacity sums above exclude them). The
-  node already sends these on every `df`; `node_health_loop` keeps them on
-  `NodeCap` instead of only summing. A node with disks `[empty, full, full, full]`
-  rolls up as half-free, and `faulted` — from `faulted_disks`, i.e. what the node
-  SAID about its disk — is the one health bit that is evidence about the disk
-  rather than about the node answering `df` at all.
+- **`nodes[].disks`** — per-disk `disk_id/uuid/total/free/extent_bytes/reported/
+  online/faulted`, filtered to disks the registry assigns to that node (the same
+  ownership filter `apply_df_disk_health` applies — a stale `{dir}/disk_id` sentinel
+  must not put a fault on the wrong machine). The node already sends these on every
+  `df`; `node_health_loop` keeps them on `NodeCap` instead of only summing. A node with
+  disks `[empty, full, full, full]` rolls up as half-free. Three states: online;
+  faulted (the node's own verdict, via `faulted_disks` — the bit recovery keys on); and
+  `reported: false` — the node ANSWERED df but omitted a disk the registry assigns to
+  it (usually a dropped `--data` dir). A node that did NOT answer df gets no rows at
+  all: "unreachable" and "disk missing" call for different actions.
 - **`ps_servers`** — every REGISTERED PS, from `ps_nodes` plus `ps_last_heartbeat`.
   A list derived from the partitions can only show a PS that owns something, so
   the two states most worth seeing (serving nothing; stopped heartbeating) are
   exactly the two it cannot express. `last_heartbeat_secs_ago = u64::MAX` (JSON
-  `null`) means this LEADER has never seen one — a fresh leader starts with an
-  empty map, so that is "unknown", not "dead".
+  `null`) means no heartbeat entry — defensive only, since `replay_from_etcd` and
+  `register_ps` both seed one. The flip side of the replay seed: right after a leader
+  change every replayed PS reads as freshly heard from until the 10 s eviction window
+  judges it.
 
 ## GC lifetime, VP retention, both-zero reclaim
 

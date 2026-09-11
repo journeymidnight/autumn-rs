@@ -82,13 +82,16 @@ Both exist for facts a roll-up cannot carry:
 - **A PS serving nothing, or one that has gone silent.** A server list derived
   from the partitions can only show a PS that currently owns something, so those
   are exactly the two states it cannot express. `ps_servers` comes from the
-  manager's registry plus its heartbeat map; "never seen a heartbeat" renders as
-  **unknown**, not dead — a fresh leader starts with an empty map.
+  manager's registry plus its heartbeat map. A PS with no heartbeat entry
+  renders as **unknown**, not dead (defensive — replay and registration both
+  seed one).
 - **Which disk.** A node with disks `[empty, full, full, full]` rolls up as
-  half-free. The per-disk table separates **offline** (the node did not answer,
-  or the disk is not usable) from **faulted** (the node itself reported this disk
-  bad) — only the second is evidence about the disk, and it is what drives a
-  rebuild.
+  half-free. Each disk is in one of three states: **online**; **faulted** — the
+  node's own verdict on its own disk, which is what drives a rebuild; and **not
+  reported** — the node answered but did not mention a disk the registry assigns
+  to it, usually because the EN was started without that data directory. A node
+  that did not answer at all shows no disk rows and says its disk state is
+  unknown — an unreachable machine is not N missing disks.
 
 ### The precondition the drawer warns about
 
@@ -96,7 +99,7 @@ A CoW split's children share the parent's SSTs, which carry keys outside each
 child's own range, and the partition server **refuses `split` until a major
 compaction rewrites them**. The drawer says so before the Split button is
 clicked, and the auto-policy advises that compaction *in place of* the split — so
-the Policy tab shows "major compaction required before split", not a split that
+the Policy tab shows "major compaction before split", not a split that
 would be refused once per window forever.
 
 ## Security posture
@@ -118,6 +121,12 @@ A manager started without `--etcd` persists no history at all. That comes back
 as `history_error` rather than an empty list, and the panel says so — an empty
 list would read as "nothing failed".
 
+**Progress counts ride the wire RAW** — the wire carries facts and the consumer
+derives the ratio — so the consumer owes them a unit. `fmtProgress` supplies it
+per kind; without it a 16 GiB rebuild renders as `11895046144 / 17179981824`.
+Byte sizes everywhere on the page use IEC suffixes (`GiB`, `MiB`), because the
+divisor is 1024 and a bare `G` names a different quantity.
+
 ## Tests
 
 ```bash
@@ -132,9 +141,11 @@ bash examples/dashboard/tests/api_contract.sh
 
 # 2. Render check — no cluster, no browser. LIFTS the page's own functions out
 #    of index.html at run time (a copy would drift and pass while the page was
-#    broken) and asserts the verdicts: percentage AND raw counts, the bar width,
-#    the right target per op kind, a failed row's reason, the heartbeat
-#    classification, a faulted disk, and an advisory's full reasoning.
+#    broken) and asserts the verdicts: percentage AND magnitude IN THE UNIT THE
+#    KIND MEASURES (bytes for gc/forcegc/ec-convert/recovery, SST data blocks
+#    for compact, phases for split/merge), the bar width, the right target per
+#    op kind, a failed row's reason, the heartbeat classification, the three
+#    disk states, and an advisory's full reasoning.
 node examples/dashboard/tests/render_check.js
 
 # 3. Tabs smoke — runs the page's own init and tab switching under a minimal DOM

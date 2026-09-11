@@ -156,19 +156,63 @@ Task scope: dashboard 五项改造（用户 2026-09-11 提的 5 点）。其中�
   （set_has_overlap 确是唯一写者，初始 store 在唯一构造点上）、cooldown_key 去重
   （当前候选集无碰撞，且顺序正确）、面板 danger 门控与定时器。
 
+
+【本会话后续(提交 e05549c 之后)】
+  - 用户要求 git pull:origin/main 多 15 个提交(stream 抢先 roll quiesce 修复、
+    PS 诊断、rpc 提交队列有界等)。仓库配置 ff-only ⇒ 把本地这 1 个提交 rebase 上去,
+    现为 **fe82703**(父 1b7bace)。唯一冲突是本文件:上游是**叠放的日期条目**,
+    其 (4) 是一次**未关闭的数据丢失事故**(含 GC 门槛待办),所以按叠放解决,
+    上游五条全部原样保留。两个自动合并的源文件与本改动无语义交集
+    (上游那边是 PS delegate 路径的诊断等待 tick + manager 一行注释)。
+    上游 8 个文件都不碰 PartitionLoad/policy/dashboard/WIRE_VERSION ⇒ 39 仍是唯一一次抬版本。
+  - 用户指出进度行显示 `69% · 11895046144 / 17179981824` 无法阅读。根因:线上刻意
+    传原始计数、由渲染方负责单位,而 CLI 的 `human_bytes_or_count` 只认 gc/forcegc,
+    漏了同样按**字节**计的 ec-convert 与 recovery(正是 16 GiB extent 那一行);面板则
+    完全没有这个函数。修:CLI 与面板(`fmtProgress`)都按 kind 选单位 ——
+    字节(gc/forcegc/ec-convert/recovery)/SST 数据块(compact)/阶段(split/merge);
+    后缀改 IEC(KiB/MiB/GiB,除数是 1024)。现显示 `69% · 11.1 GiB / 16.0 GiB`。
+    CLI 注释原写 compaction "counts tables",实为 data blocks,一并改正。
+  - 自查发现:去掉 unblocking_compact 的冷却闸门后,auto-policy 循环从 60 s 才重建一次的
+    advisory_cache 里取候选、却最快 2 s 一跳,而 `sanitize_entry` 允许 `cooldown_sec = 0`
+    ⇒ 同一条 compact 一个窗口内可被重复下发 ~30 次。按文件里已有的
+    `REBALANCE_MIN_ACTUATION_COOLDOWN_SEC` 先例加 `COMPACT_MIN_ACTUATION_COOLDOWN_SEC`
+    (60 s,低于所有预置策略的 120-240 s,只拦误配置)。消融:去掉即红。
+
+【fable 独立评审(规则 15)】
+  评审 fe82703 + stash@{0} 全部内容:无高危;中危 4、低危 4。H1/H2 修复、merge 幸存者路径、
+  node_disks 归属过滤、wire 完整性均判定正确。全部已处理(本提交):
+  - M1 compact 执行下限只按 MAJOR 键,而 minor 候选执行的是同一个 compact op ⇒
+    cooldown_sec=0 时照样风暴。下限改为覆盖两种 compact kind。消融:只留 MAJOR ⇒ 新增的
+    minor 断言变红。(第一次消融用 sed 把 candidate_to_cmd 里同样的两词也改掉了,minor 根本
+    不下发,于是假绿;改成锚定下限臂独有一行、计数断言的精确替换后才坐实。)
+  - M2 节点不应答 df 时,manager 把注册表里它的每块盘都补成 "not reported",页面再把原因写成
+    "启动时漏了 --data 目录" —— 一台宕机被说成 N 块缺盘。改为:不应答 ⇒ 无盘行;页面明说
+    "盘状态未知"。manager 侧新增 3 条单测 + 页面断言,两半消融各自变红。
+  - M3 文档与两个 JS 夹具引用的 advisory 文案代码从不输出 ⇒ 改成真实输出,漂移可被测到。
+  - M4 PS 指南说 size_bytes 无人写 —— 实为每 30 s 由 lsm_resident_bytes() 刷新
+    (SIZE_REFRESH_INTERVAL 已核),且正是 SPLIT_LSM_HARD 的输入。
+  - 低危:"新 leader 心跳表为空"的状态实际不出现(replay/register 都会预置);去掉没人上报的
+    rebalance "moves" 单位;CLI 与页面追加同一套单位词;文档字段表补 reported/uuid。
+  - L1(空表跳过路径不清 has_overlap)今天不可达:唯一的 CompactTask 生产者写死
+    is_major:true,定时器也不再 compact ⇒ 按"今天不可复现不修",只在 unblocking_compact
+    文档里记下这层耦合。
+
+【最终状态】
+  - 本地 main = fe82703 + 本修复提交,领先 origin 2 个,未 push(用户只说了 pull)。
+  - 全量:workspace check 零错误;rpc 62 / manager 367 / partition-server 226 / autumn-op 31;
+    render_check、tabs_smoke、真集群 api_contract 全过。
+  - stash@{0} 的内容已全部包含在本提交中,提交后 drop。
+
 Main gaps:
-  - **fable 评审仍然欠着**（配额）。本轮用另一个独立 agent 顶上，15 条全处理完，
-    但按规则 15 应当在配额恢复后补跑一遍。
-  - 新立两条账：
-    `F-MERGE-COW-STALE-SEQ` —— merge 不检查 has_overlap 已坐实；由此引出的
-      "旧值按 seq 压过新值"是**假设未复现**，按 reproduce-first 先写 harness 再谈修。
-    `F-SPLIT-CARRIED-BYTES-UNBOUNDED` —— 携带字节不再触发 split 之后，全静的
-      大 value 分区可以一直长大；**先量 reopen/搬迁曲线再决定**，而且真要缓解
-      也是 compaction/GC/rebalance，不是 split。
+  - fable 对其发现所做的修复本身未再评审(M1/M2 已消融验证,其余为文档);coco 仍因
+    Trae token 过期不可用。
+  - 账本新增两条(F-MERGE-COW-STALE-SEQ 未复现、F-SPLIT-CARRIED-BYTES-UNBOUNDED 待量)
+    不在本任务范围。
 
 Next steps:
-  1. 配额恢复后补跑 fable 评审（或修好 coco 的 Trae 登录后跑 coco）。
-  2. 若要部署，注意 wire 已到 39 而线上是 35 —— 见 feature_list 的 BUG-WIRE36-UNDEPLOYED。
+  1. 用户要求时 push(git push origin main)。
+  2. 部署注意 wire 39 vs 线上 35(BUG-WIRE36-UNDEPLOYED)。
+  3. 上游 (4) 的 GC 门槛待办(BUG-GC-ADVISORY-VS-SELECTION)仍开着。
 
 Date: 2026-09-11 (4)
 TaskStatus: not_completed

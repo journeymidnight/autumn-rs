@@ -60,6 +60,11 @@ const OVERVIEW = {
       // node did not describe — all three states the tab must tell apart.
       disks: [disk(2), disk(3, { faulted: true, online: false }),
               disk(4, { reported: false, online: false, total: 0, free: 0, extent_bytes: 0 })] },
+    // registered but NOT answering df: no per-disk rows at all, and the page
+    // must call its disk state unknown rather than blame a data directory.
+    { node_id: 2, address: "127.0.0.1:21102", extent_count: 0, online: false,
+      auto_state: "Suspected", last_heartbeat_secs_ago: null, suspected_age_secs: 40,
+      override_kind: "-", override_reason: "", override_set_by: "", disks: [] },
   ],
   partitions: [
     { part_id: 1, ps_id: 1, ps_addr: "127.0.0.1:21201", range_start: "", range_end: "m",
@@ -81,8 +86,8 @@ const OVERVIEW = {
   ],
   advisories: [
     { kind: "major", primary_part_id: 1, secondary_part_id: 0,
-      reason: "major compaction required before split",
-      desc: "major  part 1             major compaction required before split: partition still carries CoW-shared out-of-range keys",
+      reason: "major compaction before split: partition still carries CoW-shared out-of-range keys (has_overlap), and split is REFUSED until a major compaction rewrites them",
+      desc: "major  part 1             major compaction before split: partition still carries CoW-shared out-of-range keys (has_overlap), and split is REFUSED until a major compaction rewrites them",
       action: { action: "compact", part_id: 1 }, key: "major:1" },
   ],
 };
@@ -126,6 +131,8 @@ const settle = () => new Promise(r => setTimeout(r, 30));
     await settle();
   }
   await api.openDetail(1);
+  api.openNode(2);
+  const deadNodeDrawer = nodes.nodedrawer.innerHTML;
   api.openNode(1);
   api.openPs(2);
   await settle();
@@ -145,10 +152,17 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   want("#nodedrawer", "not reported", "…and separates a disk the node never described");
   want("#nodedrawer", "NOT described on its last df", "…with what that actually means");
   want("#nodedrawer", "uuid-2", "…and shows each disk's identity");
+  // An unreachable node is ONE fact, not N missing disks.
+  if (!deadNodeDrawer.includes("did not answer its last")) {
+    console.error("FAIL #nodedrawer(node 2): an unreachable node must say its disk state is unknown"); bad++;
+  }
+  if (deadNodeDrawer.includes("NOT described on its last df")) {
+    console.error("FAIL #nodedrawer(node 2): an unreachable node was blamed on a dropped data directory"); bad++;
+  }
   // Servers: the registered-but-silent PS, which no partition row could show.
   want("#ps_full", "PS 2", "a PS serving nothing is still listed");
   want("#psdrawer", "Serving no partition", "…and says so");
-  want("#psdrawer", "never seen a heartbeat", "…and distinguishes silent from dead");
+  want("#psdrawer", "No heartbeat is on record", "…and calls a missing entry unknown, not dead");
   // Overview: the health roll-up an operator reads first.
   want("#ov_fleet", "disk", "the fleet panel counts disks");
   want("#ov_fleet", "faulted", "…and surfaces the faulted one");
@@ -157,7 +171,7 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   want("#drawer", "Split is refused until a major compaction", "an overlapping partition warns BEFORE the click");
   want("#drawer", "Extents", "…and still shows the extents");
   // Policy + Logs.
-  want("#advisories", "major compaction required before split", "the advisory keeps its whole reason");
+  want("#advisories", "major compaction before split", "the advisory keeps its whole reason");
   want("#autolog", "overlapping keys", "the auto-policy log is on the Logs tab");
   want("#ops_live", "gc", "running ops are on the Logs tab");
   want("#ops_hist", "no address for part 1", "…and a failed op keeps its reason");

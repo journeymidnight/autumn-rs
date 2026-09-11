@@ -456,8 +456,11 @@ extent's manager `sealed_length` is 0, so an all-open-tail partition would rende
 
 INVARIANT: the probe must stay off the maintenance task's critical path (detached
 + in-flight-guarded) — a blocking `commit_length` here would gate GC/compaction on
-manager/replica latency. The sibling `size_bytes` gauge is DEAD (no writer); do
-not confuse it with `open_tail_bytes`.
+manager/replica latency. Do not confuse `open_tail_bytes` with the sibling
+`size_bytes` gauge: that one is LSM-RESIDENT bytes (Σ SST len + memtables),
+refreshed every 30 s from `lsm_resident_bytes()` and 0 until the first refresh
+after open — and it is the input to the manager's hard split trigger
+(`SPLIT_LSM_HARD`), which counts only what a key-range cut actually halves.
 
 ### `open_tail_dead_bytes` — WAL debt on the open tail
 

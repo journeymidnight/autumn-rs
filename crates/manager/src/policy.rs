@@ -575,6 +575,9 @@ impl PolicyEngine {
             //   • QPS / bytes-per-sec / imm-full (spiky) → all-N-buckets;
             //   • the carried-size floor under the rate triggers also reads
             //     CURRENT size (it's a floor, same slow-signal argument).
+            // `size_bytes` is the PS's LSM gauge, refreshed every 30 s and 0
+            // until the first refresh after a partition opens — the safe
+            // direction for a trigger: it can delay a split, never cause one.
             let lsm_hard = recent.size_bytes > cfg.split_lsm_hard;
             let qps_sustained = bs.iter().all(|(_, l)| l.req_per_sec > cfg.split_qps_high);
             let bw_of = |l: &PartitionLoad| {
@@ -666,12 +669,25 @@ impl PolicyEngine {
     /// and waiting out the rest of that window accomplishes nothing while the
     /// partition produces no advisory at all.
     ///
+    /// What still bounds re-ACTUATION, now that this no longer does: the
+    /// controller's per-target cooldown, floored at
+    /// `COMPACT_MIN_ACTUATION_COOLDOWN_SEC`. That floor is load-bearing rather
+    /// than belt-and-braces precisely because of this decision — the loop
+    /// actuates from a candidate list cached for a whole 60 s policy tick, so
+    /// a policy with `cooldown_sec = 0` would otherwise re-issue the same row
+    /// every `interval_sec`.
+    ///
     /// The op emitted is a plain `POLICY_KIND_MAJOR_COMPACT`, actuated as
     /// `compact <part>`, which reaches the PS with `is_major: true` —
     /// `MSG_MAINTENANCE` is the only `CompactTask` producer and hardcodes it.
     /// `has_overlap` does NOT by itself make a compaction major; it only
     /// suppresses the too-few-tables skip. A future minor-tier compact op would
-    /// therefore break this loop's convergence.
+    /// therefore break this loop's convergence twice over: a minor pass does
+    /// not clear the flag, and one that dropped every table while it was set
+    /// would leave it set for good — the empty-table skip in `background.rs`
+    /// returns "nothing to compact" without clearing it. Unreachable today (the
+    /// only `CompactTask` producer hardcodes `is_major: true`, and the timer arm
+    /// no longer compacts), which is why it is recorded here, not patched.
     ///
     /// KNOWN GAP, stated rather than papered over: while a major compaction IS
     /// running, this returns `None` and the blocked partition contributes no

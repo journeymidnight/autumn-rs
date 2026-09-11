@@ -29,7 +29,8 @@ const constLine = name => page.split("\n").find(l => l.startsWith(`const ${name}
 
 let OUT = {};
 const ctx = { $: sel => ({ set innerHTML(v) { OUT[sel] = v; } }) };
-const src = [escLine, constLine("jsAttr"), lift("fmtBytes"), lift("agoStr"), lift("psHealth"),
+const src = [escLine, constLine("jsAttr"), constLine("BYTE_KINDS"),
+             constLine("COUNT_UNIT"), lift("fmtBytes"), lift("fmtProgress"), lift("agoStr"), lift("psHealth"),
              lift("diskRow"), lift("advRow"), lift("opsTarget"), lift("opsAgo"),
              lift("renderLiveOps"), lift("renderOpsHistory")].join("\n");
 const now = Math.floor(Date.now() / 1000);
@@ -42,7 +43,7 @@ OUT2.disks = [
   diskRow({disk_id:4, uuid:"", total:0, free:null, extent_bytes:0, reported:true, online:false, faulted:true}),
   diskRow({disk_id:5, uuid:"deadbeef", total:0, free:0, extent_bytes:0, reported:false, online:false, faulted:false}),
 ].join("");
-OUT2.adv = advRow({kind:"major", desc:"major  part 7             major compaction required before split: still CoW-shared",
+OUT2.adv = advRow({kind:"major", desc:"major  part 7             major compaction before split: partition still carries CoW-shared out-of-range keys (has_overlap), and split is REFUSED until a major compaction rewrites them",
                    action:{action:"compact", part_id:7}});
 OUT2.jsattr = jsAttr("it's");
 ` )(ctx.$, PURE);
@@ -53,7 +54,9 @@ renderLiveOps([
   {kind:"merge",state:"running",part_id:7,secondary_id:9,
    progress_done:0,progress_total:0,started_at:${now - 2},message:"merging"},
   {kind:"gc",state:"running",part_id:7,secondary_id:0,
-   progress_done:5,progress_total:8,started_at:${now - 1},message:""}]);
+   progress_done:5,progress_total:8,started_at:${now - 1},message:""},
+  {kind:"compact",state:"running",part_id:9,secondary_id:0,
+   progress_done:3,progress_total:6,started_at:${now - 5},message:""}]);
 renderOpsHistory([
   {kind:"recovery",state:"failed",part_id:0,secondary_id:31,
    progress_done:3,progress_total:8,finished_at:${now - 9},message:"",error:"disk offline"}], null);
@@ -67,18 +70,22 @@ const want = (hay, needle, why) => {
 };
 // The percentage AND the raw counts: "74%" alone cannot tell two tables from
 // fifty gigabytes, and the magnitude is what decides whether an operator waits.
-want(live, "74% · 268435456 / 360712397", "ec-convert shows percent + raw counts");
+// The wire carries RAW counts; the panel owes them a unit. Eleven digits is
+// what this assertion exists to keep out.
+want(live, "74% · 256.0 MiB / 344.0 MiB", "ec-convert shows percent + BYTES, not raw counts");
 want(OUT["#ops_live"], 'style="width:74%"', "ec-convert draws its bar");
 // secondary_id means different things per kind — an extent must not render as
 // a partition move.
 want(live, "ec-convert extent 12", "extent-scoped kinds name their extent");
 want(live, "merge 7→9", "merge keeps survivor→victim");
-want(live, "gc 7 63% · 5 / 8", "gc shows its partition and ratio");
+want(live, "gc 7 63% · 5 B / 8 B", "gc measures bytes too");
+// …and a kind that does NOT measure bytes must not be dressed up as one.
+want(live, "compact 9 50% · 3 / 6 blocks", "compact counts SST data blocks");
 // A finished op's reason is the whole point of the history list.
 want(hist, "recovery extent 31 disk offline", "failed history row shows the reason");
 
-// A PS the leader has never heard from is UNKNOWN, not dead — a fresh leader
-// starts with an empty heartbeat map and must not paint the fleet red.
+// A PS with no heartbeat entry is UNKNOWN, not dead: the state is defensive
+// (replay and registration both seed one), and it must not paint the fleet red.
 const wantEq = (got, exp, why) => {
   if (got !== exp) { console.error(`FAIL: ${why} — got ${JSON.stringify(got)} want ${JSON.stringify(exp)}`); bad++; }
 };
@@ -92,7 +99,7 @@ wantEq(PURE.hb[3].cls, "bad", "90s is past eviction");
 const d = text(PURE.disks);
 want(d, "#3", "a healthy disk shows its id");
 want(d, "online", "…and its state");
-want(d, "1.0G", "…and its capacity");
+want(d, "1.0 GiB", "…and its capacity, in a unit that names the divisor");
 want(d, "#4 faulted", "a disk its own node calls faulted is FAULTED, not merely offline");
 want(PURE.disks, 'class="pill bad"', "faulted is styled as a fault");
 // The third state is the one the node-level rollup and the faulted bit both
@@ -100,12 +107,12 @@ want(PURE.disks, 'class="pill bad"', "faulted is styled as a fault");
 // it. Its capacity fields are meaningless, so they must not render as zeroes.
 want(d, "#5", "a registry disk the node never described is listed");
 want(d, "not reported", "…and is named as not reported, not as offline");
-if (/#5[^#]*0B/.test(d)) { console.error("FAIL: an unreported disk renders a fake 0-byte capacity"); bad++; }
+if (/#5[^#]*0 B/.test(d)) { console.error("FAIL: an unreported disk renders a fake 0-byte capacity"); bad++; }
 
 // An advisory's reason can be a whole sentence; the row must lead with the
 // action and keep the reasoning, not truncate one into the other.
 want(PURE.adv, "major  part 7", "advisory leads with kind + target");
-want(PURE.adv, "major compaction required before split", "…and keeps the whole reason");
+want(PURE.adv, "major compaction before split", "…and keeps the whole reason");
 want(PURE.adv, "Apply", "an actionable advisory offers its action");
 // The Apply handler lives in a SINGLE-quoted attribute, so an apostrophe would
 // end the attribute and break the button. No advisory target can contain one

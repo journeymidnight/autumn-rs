@@ -1720,15 +1720,29 @@ fn op_state_name(s: u8) -> &'static str {
     }
 }
 
-/// Render a progress count in the unit its kind actually measures. GC and
-/// forcegc scan bytes; compaction counts tables. Printing "3/8" for bytes, or
-/// "3.0 MB" for tables, would both be wrong in a way that misleads.
+/// Render a progress count in the unit its kind actually measures.
+///
+/// FOUR kinds measure bytes, not two: gc and forcegc scan extent bytes,
+/// ec-convert counts shard bytes encoded, and recovery counts bytes copied.
+/// Leaving the last two out printed a 16 GiB rebuild as
+/// `11895046144 / 17179981824`, which is the exact shape this helper exists to
+/// prevent — nobody reads eleven digits. compact counts SST DATA BLOCKS (see
+/// `merge.block_progress()`), and split/merge count phases; rendering either as
+/// bytes would be wrong the other way.
+///
+/// The suffixes are IEC (KiB/MiB/GiB), because the divisor is 1024. They used
+/// to read KB/MB/GB, which names a different quantity.
 fn human_bytes_or_count(kind: u8, n: u64) -> String {
-    use autumn_rpc::manager_rpc::{OP_KIND_FORCE_GC, OP_KIND_GC};
-    if kind != OP_KIND_GC && kind != OP_KIND_FORCE_GC {
+    use autumn_rpc::manager_rpc::{
+        OP_KIND_EC_CONVERT, OP_KIND_FORCE_GC, OP_KIND_GC, OP_KIND_RECOVERY,
+    };
+    if !matches!(
+        kind,
+        OP_KIND_GC | OP_KIND_FORCE_GC | OP_KIND_EC_CONVERT | OP_KIND_RECOVERY
+    ) {
         return n.to_string();
     }
-    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
     let mut i = 0;
     while v >= 1024.0 && i < UNITS.len() - 1 {
@@ -1739,6 +1753,52 @@ fn human_bytes_or_count(kind: u8, n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// The unit word for a count-measured kind, appended after the total: " blocks"
+/// for compact, " phases" for split/merge, nothing for the byte kinds (their
+/// numbers already carry a suffix). The dashboard's `fmtProgress` applies the
+/// same table, so the CLI and the page cannot disagree about what "3/6" means.
+fn progress_count_unit(kind: u8) -> &'static str {
+    use autumn_rpc::manager_rpc::{OP_KIND_COMPACT, OP_KIND_MERGE, OP_KIND_SPLIT};
+    match kind {
+        OP_KIND_COMPACT => " blocks",
+        OP_KIND_SPLIT | OP_KIND_MERGE => " phases",
+        _ => "",
+    }
+}
+
+#[cfg(test)]
+mod progress_unit_tests {
+    use super::human_bytes_or_count;
+    use autumn_rpc::manager_rpc::{
+        OP_KIND_COMPACT, OP_KIND_EC_CONVERT, OP_KIND_GC, OP_KIND_RECOVERY, OP_KIND_SPLIT,
+    };
+
+    /// The live numbers that prompted this: a 16 GiB extent mid-rebuild.
+    #[test]
+    fn byte_measured_kinds_render_as_bytes() {
+        assert_eq!(human_bytes_or_count(OP_KIND_RECOVERY, 11_895_046_144), "11.1 GiB");
+        assert_eq!(human_bytes_or_count(OP_KIND_EC_CONVERT, 17_179_981_824), "16.0 GiB");
+        assert_eq!(human_bytes_or_count(OP_KIND_GC, 1024), "1.0 KiB");
+        assert_eq!(human_bytes_or_count(OP_KIND_GC, 512), "512 B");
+    }
+
+    /// …and the kinds that do NOT measure bytes stay raw counts: "3.0 KiB"
+    /// blocks or phases would be wrong in the opposite direction.
+    #[test]
+    fn count_kinds_name_their_unit() {
+        use super::progress_count_unit;
+        assert_eq!(progress_count_unit(OP_KIND_COMPACT), " blocks");
+        assert_eq!(progress_count_unit(OP_KIND_SPLIT), " phases");
+        assert_eq!(progress_count_unit(OP_KIND_RECOVERY), "", "byte kinds carry their own suffix");
+    }
+
+    #[test]
+    fn count_measured_kinds_stay_counts() {
+        assert_eq!(human_bytes_or_count(OP_KIND_COMPACT, 3072), "3072");
+        assert_eq!(human_bytes_or_count(OP_KIND_SPLIT, 2), "2");
     }
 }
 
@@ -1940,10 +2000,11 @@ fn render_ops(ops: &[autumn_rpc::manager_rpc::OpRecord], json: bool) -> Result<(
             let pct = (o.progress_done.min(o.progress_total) as f64 / o.progress_total as f64)
                 * 100.0;
             format!(
-                " {:.0}% ({}/{})",
+                " {:.0}% ({}/{}{})",
                 pct,
                 human_bytes_or_count(o.kind, o.progress_done),
-                human_bytes_or_count(o.kind, o.progress_total)
+                human_bytes_or_count(o.kind, o.progress_total),
+                progress_count_unit(o.kind)
             )
         } else {
             String::new()

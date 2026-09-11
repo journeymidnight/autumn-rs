@@ -75,6 +75,28 @@ pub(crate) const MAX_ACTIONS_CAP: u32 = 100;
 /// over-throttles a legitimately-armed rebalance policy.
 pub(crate) const REBALANCE_MIN_ACTUATION_COOLDOWN_SEC: i64 = 60;
 
+/// The same non-configurable floor, for COMPACTION — both compact kinds,
+/// because a major and a minor candidate actuate the identical op (`compact
+/// <part>`, which the PS runs as a major compaction either way). A compaction
+/// rewrites every SST of the partition, and the loop actuates from a CACHED
+/// candidate list rebuilt only on the 60 s policy tick — so a policy with
+/// `cooldown_sec = 0` and `interval_sec = 2` would re-issue the same cached row
+/// ~30 times inside one window.
+///
+/// Emission-side cooldowns do not cover this: `unblocking_compact` does not
+/// suppress on `compact_cooldown_sec` (it keys on a FLAG, not a debt level —
+/// see its doc), and even where an advisory does suppress, a row it already
+/// emitted stays in the cache for the rest of the window.
+///
+/// The two kinds keep separate cooldown keys (`major:N` / `minor:N`), so a
+/// partition carrying both rows can be compacted at most twice per floor
+/// window — a bounded backstop, not a storm.
+///
+/// 60 s, matching rebalance and deliberately below every preset's
+/// `cooldown_sec` (120-240 s): it can only catch a misconfiguration, never
+/// throttle a correctly configured policy.
+pub(crate) const COMPACT_MIN_ACTUATION_COOLDOWN_SEC: i64 = 60;
+
 /// Clamp a (possibly hostile / corrupted) custom policy entry to safe bounds —
 /// applied on every UPSERT and on every replay of a persisted config.
 pub(crate) fn sanitize_entry(e: &mut MgrAutoPolicyEntry) {
@@ -297,10 +319,12 @@ pub(crate) fn decide_actions(
         // would re-actuate the SAME cached candidate every tick → partition
         // reopen storm (coco P1). Floor rebalance's actuation cooldown at a
         // NON-CONFIGURABLE minimum so a mis-set `cooldown_sec` can't bypass it.
-        let effective_cooldown = if c.kind == POLICY_KIND_REBALANCE {
-            cooldown_secs.max(REBALANCE_MIN_ACTUATION_COOLDOWN_SEC)
-        } else {
-            cooldown_secs
+        let effective_cooldown = match c.kind {
+            POLICY_KIND_REBALANCE => cooldown_secs.max(REBALANCE_MIN_ACTUATION_COOLDOWN_SEC),
+            POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
+                cooldown_secs.max(COMPACT_MIN_ACTUATION_COOLDOWN_SEC)
+            }
+            _ => cooldown_secs,
         };
         if now - last < effective_cooldown {
             continue; // still cooling down from a recent actuation
@@ -538,10 +562,10 @@ mod tests {
         assert_eq!(decide_actions(&cands, &cds, &enabled, 1000, 300, 5).len(), 1);
     }
 
-    /// coco P1: a policy with `cooldown_sec = 0` must NOT let the cluster-scoped
-    /// rebalance re-actuate every tick — the non-configurable floor applies.
+    /// A policy with `cooldown_sec = 0` must NOT let the cluster-scoped rebalance
+    /// re-actuate every tick — the non-configurable floor applies.
     #[test]
-    fn rebalance_actuation_is_floored_despite_zero_cooldown() {
+    fn expensive_kinds_are_floored_despite_zero_cooldown() {
         let enabled: HashSet<u8> = [POLICY_KIND_REBALANCE].into_iter().collect();
         let cands = vec![cand(POLICY_KIND_REBALANCE, 0, 0)];
         let key = cooldown_key(&cands[0]); // "rebalance:cluster"
@@ -562,7 +586,38 @@ mod tests {
             "allowed once past the floor"
         );
 
-        // A NON-rebalance kind at cooldown_sec=0 is unaffected (no floor).
+        // Compaction carries the same floor, and for the same reason: the loop
+        // actuates from a cached candidate list, and `unblocking_compact` does
+        // not suppress emission on the compact cooldown — so without it a
+        // `cooldown_sec = 0` policy re-issues one every interval tick.
+        let mc_enabled: HashSet<u8> = [POLICY_KIND_MAJOR_COMPACT].into_iter().collect();
+        let mc = vec![cand(POLICY_KIND_MAJOR_COMPACT, 7, 0)];
+        let mut mcd = HashMap::new();
+        mcd.insert("major:7".to_string(), 990i64); // 10 s ago
+        assert!(
+            decide_actions(&mc, &mcd, &mc_enabled, 1000, 0, 5).is_empty(),
+            "major compact floored despite cooldown_sec=0"
+        );
+        mcd.insert("major:7".to_string(), 1000 - COMPACT_MIN_ACTUATION_COOLDOWN_SEC - 1);
+        assert_eq!(
+            decide_actions(&mc, &mcd, &mc_enabled, 1000, 0, 5).len(),
+            1,
+            "allowed once past the floor"
+        );
+
+        // …and MINOR too: it actuates the identical `compact` op, so flooring
+        // only the major kind would leave the same storm reachable through the
+        // other row.
+        let mn_enabled: HashSet<u8> = [POLICY_KIND_MINOR_COMPACT].into_iter().collect();
+        let mn = vec![cand(POLICY_KIND_MINOR_COMPACT, 7, 0)];
+        let mut mnd = HashMap::new();
+        mnd.insert("minor:7".to_string(), 990i64);
+        assert!(
+            decide_actions(&mn, &mnd, &mn_enabled, 1000, 0, 5).is_empty(),
+            "minor compact floored despite cooldown_sec=0"
+        );
+
+        // A kind with no floor at cooldown_sec=0 is unaffected.
         let gc_enabled: HashSet<u8> = [POLICY_KIND_GC].into_iter().collect();
         let gc = vec![cand(POLICY_KIND_GC, 7, 0)];
         let mut gcd = HashMap::new();

@@ -2007,14 +2007,22 @@ impl AutumnManager {
         // `{dir}/disk_id` sentinel makes a node report a disk that belongs to
         // another node, and rendering it under the reporter would put a fault
         // on the wrong machine. Unreported registry disks are appended after,
-        // as their own state.
+        // as their own state — but only for a node that ANSWERED df.
         fn node_disks(
             node_id: u64,
+            answered: bool,
             reported: &[(u64, autumn_rpc::extent_rpc::DiskStatus)],
             store: &autumn_common::MetadataState,
             disks_reg: &std::collections::HashMap<u64, MgrDiskInfo>,
             faulted: &std::collections::HashSet<u64>,
         ) -> Vec<DiskCapWire> {
+            // A node that did not answer df described NOTHING. Backfilling its
+            // registry disks as "not reported" would turn one unreachable node
+            // into N missing disks, and send the operator to look for a
+            // dropped `--data` directory when the machine is simply down.
+            if !answered {
+                return Vec::new();
+            }
             let owned: Vec<u64> = store
                 .nodes
                 .get(&node_id)
@@ -2062,7 +2070,7 @@ impl AutumnManager {
                 free: c.free,
                 extent_bytes: c.extent_bytes,
                 online: c.online,
-                disks: node_disks(*id, &c.disks, &store, disks_reg, &faulted),
+                disks: node_disks(*id, c.online, &c.disks, &store, disks_reg, &faulted),
             })
             .collect();
         ClusterDfResp {
@@ -5478,9 +5486,9 @@ impl AutumnManager {
             .map(|(ps_id, addr)| PsOverview {
                 ps_id: *ps_id,
                 address: addr.clone(),
-                // u64::MAX = never seen by THIS leader. A fresh leader starts
-                // with an empty map, so "no heartbeat yet" must not render as
-                // "0 s ago" (alive) nor be mistaken for a dead PS.
+                // u64::MAX = no heartbeat entry for this PS. Not expected —
+                // `replay_from_etcd` and `register_ps` both seed one — but a
+                // missing entry must render as "unknown", never as "0 s ago".
                 last_heartbeat_secs_ago: hb
                     .get(ps_id)
                     .map(|t| now.saturating_duration_since(*t).as_secs())
@@ -8381,3 +8389,106 @@ mod namespace_registry_tests {
     }
 }
 // end of rpc_handlers.rs
+
+#[cfg(test)]
+mod cluster_df_disk_tests {
+    //! The per-disk rows the dashboard's Nodes tab renders. Two shapes must stay
+    //! distinct: a node that ANSWERED df but omitted a disk the registry assigns
+    //! to it (one `reported: false` row), and a node that did NOT answer (no
+    //! rows — an unreachable machine is one fact, not N missing disks).
+    use crate::{AutumnManager, NodeCap};
+    use autumn_rpc::extent_rpc::DiskStatus;
+    use autumn_rpc::manager_rpc::{MgrDiskInfo, MgrNodeInfo};
+
+    fn node(id: u64, disks: &[u64]) -> MgrNodeInfo {
+        MgrNodeInfo {
+            node_id: id,
+            address: format!("127.0.0.1:{}", 9100 + id),
+            disks: disks.to_vec(),
+            shard_ports: Vec::new(),
+            control_address: String::new(),
+            node_uuid: format!("node-{id}"),
+        }
+    }
+
+    fn up(total: u64, free: u64) -> DiskStatus {
+        DiskStatus { total, free, online: true, extent_bytes: 0 }
+    }
+
+    fn mgr_with(nodes: &[MgrNodeInfo], disk_ids: &[u64]) -> AutumnManager {
+        let m = AutumnManager::new();
+        m.leader.set(true);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            for n in nodes {
+                s.nodes.insert(n.node_id, n.clone());
+            }
+            for d in disk_ids {
+                s.disks.insert(
+                    *d,
+                    MgrDiskInfo { disk_id: *d, online: true, uuid: format!("uuid-{d}") },
+                );
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn answered_node_gets_a_row_for_the_disk_it_omitted() {
+        let m = mgr_with(&[node(1, &[10, 11])], &[10, 11]);
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                total: 100,
+                free: 50,
+                extent_bytes: 0,
+                online: true,
+                disks: vec![(10, up(100, 50))], // disk 11 is not described
+            },
+        )];
+        let resp = m.compute_cluster_df_resp();
+        let d = &resp.per_node[0].disks;
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d.iter().any(|x| x.disk_id == 10 && x.reported && x.online));
+        let missing = d.iter().find(|x| x.disk_id == 11).expect("a row for the omitted disk");
+        assert!(!missing.reported, "the omitted disk is its own state: {missing:?}");
+        assert_eq!(missing.uuid, "uuid-11", "carries the identity `format` stamped");
+    }
+
+    /// ABLATION: remove the `!answered` early return in `node_disks` and this
+    /// yields two `reported: false` rows — which the page used to present as
+    /// "started without that data directory" for a machine that is simply down.
+    #[test]
+    fn unreachable_node_gets_no_rows_not_n_missing_disks() {
+        let m = mgr_with(&[node(1, &[10, 11])], &[10, 11]);
+        m.cluster_cap.borrow_mut().per_node =
+            vec![(1, NodeCap { online: false, ..Default::default() })];
+        let resp = m.compute_cluster_df_resp();
+        assert!(
+            resp.per_node[0].disks.is_empty(),
+            "a node that did not answer df described nothing: {:?}",
+            resp.per_node[0].disks
+        );
+    }
+
+    /// A stale `{dir}/disk_id` sentinel makes a node report a disk the registry
+    /// assigns to ANOTHER node; rendering it under the reporter would put a
+    /// fault on the wrong machine. Same filter `apply_df_disk_health` applies.
+    #[test]
+    fn a_disk_owned_by_another_node_is_not_rendered_under_the_reporter() {
+        let m = mgr_with(&[node(1, &[10]), node(2, &[20])], &[10, 20]);
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                total: 200,
+                free: 100,
+                extent_bytes: 0,
+                online: true,
+                disks: vec![(10, up(100, 50)), (20, up(100, 50))],
+            },
+        )];
+        let resp = m.compute_cluster_df_resp();
+        let ids: Vec<u64> = resp.per_node[0].disks.iter().map(|d| d.disk_id).collect();
+        assert_eq!(ids, vec![10], "disk 20 belongs to node 2");
+    }
+}

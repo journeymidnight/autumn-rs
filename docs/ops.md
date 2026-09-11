@@ -109,7 +109,7 @@ show no intermediate phase at all — that is not a fault.
 PS refuses to split while the LSM still has overlapping key ranges
 (`has_overlap != 0`), which a MAJOR compaction resolves. You should not see the
 auto-policy hit it any more — the flag reaches the manager on the load heartbeat
-and `policy-candidates` emits `major compaction required before split` in place
+and `policy-candidates` emits `major compaction before split` in place
 of the split, so run that compaction (or let a policy with the `compact` switch
 on run it) and the split advisory returns on a later tick. `autumn-op info
 --part <PID> --detail` prints `has_overlap` with the same note.
@@ -266,7 +266,7 @@ stops filling with one refusal per window:
 
 ```bash
 autumn-op --manager $MGR --json info --part <PID> --detail | grep has_overlap
-# 1 → the Policy tab shows "major compaction required before split".
+# 1 → the Policy tab shows "major compaction before split".
 #     After `autumn-op compact <PID>` clears it, the split advisory returns.
 # NOTE: this candidate is a COMPACT, so a policy with `split` on and `compact`
 #       off filters it out and nothing happens — visible, unlike a refusal loop.
@@ -2265,10 +2265,15 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   design; their result is in the leader log ("op succeeded" / "op FAILED"),
 #   the audit trail and `ops history`.
 # Manual check: `$AO ops list --active` during a large compact/gc, or during an
-#   `$AO force-ec-convert` / a node rebuild, must show a percentage AND the raw
-#   counts; after it finishes, `$AO ops history --limit 5` must carry its
-#   outcome, with the error text in full for a failure. A finished op must stop
-#   reporting a percentage — a repair frozen at a stale 75% is worse than none.
+#   `$AO force-ec-convert` / a node rebuild, must show a percentage AND the
+#   magnitude IN THE UNIT THAT KIND MEASURES — `11.1 GiB / 16.0 GiB` for
+#   gc/forcegc/ec-convert/recovery, a plain count of SST data blocks for
+#   compact, of phases for split/merge. An eleven-digit byte count
+#   (`11895046144 / 17179981824`) is the bug this check exists to catch: the
+#   wire carries raw counts on purpose and the RENDERER owes them a unit.
+#   After it finishes, `$AO ops history --limit 5` must carry its outcome, with
+#   the error text in full for a failure. A finished op must stop reporting a
+#   percentage — a repair frozen at a stale 75% is worse than none.
 #   Automated equivalent (isolated cluster + etcd, asserts the endpoint shape):
 #   `bash examples/dashboard/tests/api_contract.sh`.
 #   Dashboard: the panel shows the same numbers — verified live through
