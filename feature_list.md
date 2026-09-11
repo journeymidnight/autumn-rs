@@ -953,6 +953,55 @@
   204 是 201/202/203)，共享的是 **extent**。split 被拒是另一回事，见
   `F-SPLIT-NEEDS-COMPACT`。
 
+### F-SPLIT-ADVICE-COUNTS-UNRECLAIMED — split 建议把"还没回收的垃圾"当成体积，按幻影切分区
+- **Trigger** (2026-09-11，用户把 split+EC 打开做验证时观察到): 三个模型刚被删干净，
+  集群里真实数据只剩 9.2 MB 的 buda 文档，而 auto-policy 立刻连发四条 split：
+  `split 17 (est_live 91 GiB)` / `split 164 (88 GiB)` / `split 28 (114 GiB)` /
+  `split 32 (120 GiB)`。这些分区的 LSM 只有 1-12 MB(`lsm 1 MiB` 就写在同一行里)。
+- **成因**: `effective_size_bytes = max(size_bytes, est_live_bytes)`，而
+  `est_live = sealed_sum + open_tail - gc_debt - open_tail_dead`。数据被删之后
+  `sealed_sum` 仍然是满的(extent 还在)，`gc_debt` 本应把它抵消掉 ——
+  但 `gc_debt` 是**按 0.4 比例门槛算出来的 collectable 部分**
+  (见 `BUG-GC-ADVISORY-VS-SELECTION`)，16 GiB 的 extent 里死 1-3 GiB 时它算 0。
+  于是"已删但没回收"的字节在 `est_live` 里**全额计入**，分区看起来永远是满的。
+- **后果不是浪费而已**: split 会持有 `frozen_for_split`、真的产出两个孩子、
+  两个孩子 CoW 共享 extent 并各自带上 `has_overlap`，然后需要 major compaction
+  才能分开 —— 也就是说，**一次基于幻影体积的 split 会给集群留下真实的清理债**，
+  而这债又正好是 `F-SPLIT-NEEDS-COMPACT` 里那条"切不动"的来源。
+- **与 GC 门槛的关系**: 这两条是同一个根的两个症状。GC 那条修好(门槛不再让大 extent
+  的垃圾算 0)之后，`est_live` 会自动跟着变准，这一条大概率随之消失。**所以不要
+  独立地给 split 加补丁**；先修 `BUG-GC-ADVISORY-VS-SELECTION`，再回来验证这一条。
+- **Scope**(未实现):
+  1. 先修 GC 门槛，然后**复验**：在一个刚删空的集群上，`est_live` 应当跟着掉下来，
+     split 建议不再出现。
+  2. 若仍出现，才考虑让 split 的判据不采信 `sealed_sum - gc_debt` 这条路径，
+     改用一个不依赖回收进度的量(例如 SST + 实际被引用的 VP 字节)。
+- **Acceptance**: 一个刚删空全部数据的集群，在 auto-policy armed 的情况下，
+  一个 policy 周期内**不产生任何 split 建议**；`autumn-op info` 里该分区的
+  `est_live` 与 `size_bytes` 处在同一量级。
+- **Status**: `passes: false` (2026-09-11) — 仅立账。观察到的现场在
+  `claude-progress.txt` 2026-09-11 (4) 那条里。
+
+### F-EC-STARVES-FOREGROUND-APPEND — 一个 EC 转换就能把前台写入饿到超时
+- **Trigger** (2026-09-11，追一次分区卡死时量到): 单个 16 GiB extent 的 EC 转换
+  把协调节点推到 **952% CPU**(9.5 核)，同一时刻该 EN 的 append fanout 从
+  **亚毫秒涨到 300-2454 ms**，六秒内越过 size-scaled deadline 触发软错误。
+  节点盘只有 39% util、队列不深 —— 不是带宽饱和，是 **每 stripe 在每个目标节点
+  `pwrite 64 MiB + sync_data`**，与 append 路径的 per-burst `sync_data` 抢
+  fsync 串行点。
+- **现有限流为什么不够**: `ec_convert_parallelism` 默认 1 —— 已经是"每节点一个"了。
+  限的是并发数，不是这一个转换消耗的资源。`crates/stream/CLAUDE.md` 里
+  "No bytes/s rate cap on EN(deliberate)"那段的论据是"并发上限就够"，
+  这次的数据是对那个论断的反例。
+- **严重性**: 写路径的三个 bug 修好之后它**不再致命**(不会再把分区卡死)，
+  但仍然让写入变慢，并且是那三个 bug 当初能被触发的压力来源。
+- **Scope**(未实现): 给 EC 转换一个 **bytes/s 节流**或让它的 stripe fsync
+  与前台 append 分离(例如降低 stripe 大小、或让转换走独立的 fsync 节奏)，
+  使前台 append 的 p99 在转换期间不越过 deadline。
+- **Acceptance**: 在一个持续写入的分区上跑一次 16 GiB EC 转换，
+  append fanout 的 p99 不超过 size-scaled deadline 的一半；转换本身允许变慢。
+- **Status**: `passes: false` (2026-09-11) — 仅立账。
+
 ### F-SPLIT-NEEDS-COMPACT — split 前需要先 compact，而策略与面板都不知道这件事
 - **Trigger** (2026-09-09，用户): 「split前要compact，dashboard或者policy要知道」。
 - **实测到的现象**: `auto-policy` 的 recent actions 里排着一列相同的拒绝：
