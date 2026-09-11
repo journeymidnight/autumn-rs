@@ -6709,110 +6709,6 @@ async fn partition_thread_main(
 ///     RPC response frame bytes inline on `send_ok` and drops directly
 ///     into the outer ps-conn oneshot. No inner oneshot, no Waker
 ///     cascade through a second compio task.
-/// Drain pending wake signals, THEN sample imm depth — in that order, and as
-/// one step, because the partition loop parks on those same signals with the
-/// sampled value in hand.
-///
-/// The other order loses wakeups and parks the loop forever:
-///
-///   1. sample `imm_full = true`;
-///   2. the flush loop pops an imm and sends `imm_drained`;
-///   3. the drain discards that signal as "stale";
-///   4. the loop parks on `imm_drained_rx` for a pop that already happened.
-///
-/// Nothing pops again — imm is empty now, so the flush loop has nothing left
-/// to do — and the partition stops answering writes for good while its flush
-/// thread and its SST thread sit idle. Measured live: partitions quiet for
-/// hours with every request waiting inside `delegate_round_trip`, 100-220 MiB
-/// of unread requests each, no error logged anywhere, load long gone, and only
-/// a restart clearing it.
-///
-/// Draining first makes the pairing sound: any pop after the sample leaves its
-/// signal queued, so the park returns at once. The cost is at most one
-/// spurious wake, which re-samples and parks again.
-///
-/// This is a function rather than two statements so that the ordering is not
-/// something a later edit can quietly invert: there is no way to call it and
-/// get a sample older than the drain. The exact interleaving cannot be
-/// reproduced in a unit test — it needs the pop to land between two statements
-/// of one function — so the second line of defence is the 5 s tick on both
-/// imm-full parks, which bounds ANY lost signal rather than this one.
-fn drain_wakes_then_sample_imm_full(
-    imm_cap: usize,
-    imm_drained_rx: &mut mpsc::UnboundedReceiver<()>,
-    split_wake_rx: &mut mpsc::UnboundedReceiver<()>,
-    imm_len: impl Fn() -> usize,
-) -> bool {
-    while let Some(Some(())) = imm_drained_rx.next().now_or_never() {}
-    while let Some(Some(())) = split_wake_rx.next().now_or_never() {}
-    imm_len() >= imm_cap
-}
-
-#[cfg(test)]
-mod imm_wake_ordering_tests {
-    use super::*;
-
-    /// A pop that lands WHILE the depth is being sampled must leave its wake
-    /// signal queued — because the caller is about to park on that signal
-    /// holding the `true` this call returned.
-    ///
-    /// The race is: sample says "full", the flush loop pops the last imm and
-    /// signals, the drain eats that signal as stale, and the park then waits
-    /// for a pop that already happened. Nothing pops again — imm is empty, so
-    /// the flush loop has nothing to do — and the partition stops answering
-    /// writes for good, with its flush and SST threads idle and nothing
-    /// logged. Measured live: partitions silent for hours, 100-220 MiB of
-    /// unread requests each, load long gone, only a restart clearing it.
-    ///
-    /// The pop is injected through the depth closure, which runs at exactly
-    /// the sample point, so the interleaving is the real one rather than a
-    /// model of it. Ablation: sample before draining and the signal below is
-    /// eaten, which is the wedge.
-    #[compio::test]
-    async fn a_pop_racing_the_sample_keeps_its_wake_signal() {
-        let (imm_tx, mut imm_rx) = mpsc::unbounded::<()>();
-        let (_split_tx, mut split_rx) = mpsc::unbounded::<()>();
-
-        // Depth reads as full, and reading it is what lets the pop land: the
-        // closure hands back the pre-pop depth and then performs the pop, the
-        // way the flush loop does between the loop's two statements.
-        let depth = Rc::new(Cell::new(1usize));
-        let d = depth.clone();
-        let tx = imm_tx.clone();
-        let full = drain_wakes_then_sample_imm_full(1, &mut imm_rx, &mut split_rx, move || {
-            let pre = d.get();
-            d.set(0);
-            tx.unbounded_send(()).expect("pop signal");
-            pre
-        });
-
-        assert!(full, "the sample must still report the pre-pop depth");
-        assert!(
-            imm_rx.next().now_or_never().is_some(),
-            "the pop's wake was consumed as 'stale' although it arrived during \
-             the sample this caller is about to park on — that is the wedge"
-        );
-    }
-
-    /// And a wake that was genuinely stale — queued before the call, with the
-    /// depth already reflecting it — must still be consumed, or every later
-    /// park returns instantly and the loop spins.
-    #[compio::test]
-    async fn a_stale_wake_from_before_the_call_is_consumed() {
-        let (imm_tx, mut imm_rx) = mpsc::unbounded::<()>();
-        let (_split_tx, mut split_rx) = mpsc::unbounded::<()>();
-
-        imm_tx.unbounded_send(()).expect("stale signal");
-        let full = drain_wakes_then_sample_imm_full(1, &mut imm_rx, &mut split_rx, || 0);
-
-        assert!(!full, "depth already reflects the pop");
-        assert!(
-            imm_rx.next().now_or_never().is_none(),
-            "a wake older than the sample must not survive it"
-        );
-    }
-}
-
 async fn partition_loop(
     part_id: u64,
     part: Rc<RefCell<PartitionData>>,
@@ -6887,14 +6783,11 @@ async fn partition_loop(
             }
         }
 
-        // One call, so the two steps cannot be separated or reordered — see
-        // `drain_wakes_then_sample_imm_full`, where the invariant lives.
-        let imm_full = drain_wakes_then_sample_imm_full(
-            imm_cap,
-            &mut imm_drained_rx,
-            &mut split_wake_rx,
-            || part.borrow().imm.len(),
-        );
+        // sample imm depth. `imm_full` blocks new request intake (and
+        // new batch launches). (The WAL-gap snapshot is computed where it's used,
+        // in the WAL-gap force-rotate block below — C: dropped the dead duplicate
+        // gap calc that was bound to `_gap_now` and discarded here.)
+        let imm_full = part.borrow().imm.len() >= imm_cap;
         // track imm_full back-pressure events (per-iteration; coarse
         // but matches the spec's "events/sec" semantics — per-tick rate).
         if imm_full {
@@ -6905,6 +6798,14 @@ async fn partition_loop(
         } else {
             imm_full_since = None;
         }
+
+        // drain any pending imm-pop notifications so we don't
+        // accidentally wake on a stale signal in the wait branches below.
+        while let Some(Some(())) = imm_drained_rx.next().now_or_never() {}
+        // fix — same hygiene for split freeze wakes. Stale items
+        // are harmless (the drain check itself is idempotent) but
+        // draining them keeps the wait branches from spuriously waking.
+        while let Some(Some(())) = split_wake_rx.next().now_or_never() {}
 
         let n_inflight = inflight.len();
         let at_cap = n_inflight >= cap;
@@ -6977,17 +6878,14 @@ async fn partition_loop(
             if n_inflight == 0 {
                 // Pure back-pressure wait. Race imm-pop vs drain.
                 //
-                // The 5 s tick is a SAFETY NET, not decoration. Parked here the
-                // loop stops reading `req_rx`, which is correct back-pressure
-                // and indistinguishable from a wedge — and a wedge is exactly
-                // what a lost `imm_drained` produced: partitions quiet for
-                // hours with their flush and SST threads idle, long after the
-                // load had gone, recoverable only by restart. Draining the
-                // signals before sampling `imm_full` closes the race that
-                // caused it; this tick bounds ANY future one, because a park
-                // whose only exit is a signal is a park that a single missed
-                // signal makes permanent. Waking re-samples: if imm really is
-                // full it parks again and says so once a minute.
+                // DIAGNOSTIC (not a fix): a third arm, a 5 s tick, so this park
+                // is observable. Parked here the loop stops reading `req_rx`,
+                // which is correct back-pressure but indistinguishable from the
+                // live wedge — partitions that stopped answering writes for
+                // hours, with the flush loop awake and idle. The tick only
+                // re-evaluates; if imm really is full it parks again and says
+                // so once a minute. If it DRAINED, the `imm_drained` wake was
+                // lost, and the log will show that too.
                 let stalled = imm_full_since.get_or_insert_with(std::time::Instant::now);
                 let waited = stalled.elapsed();
                 if waited.as_secs() >= 10 && waited.as_secs() % 60 < 5 {
@@ -7018,22 +6916,15 @@ async fn partition_loop(
                     Either::Right(((), _)) => continue,
                 }
             }
-            // Race imm-pop, inflight CQ, drain — plus the same 5 s safety
-            // net as the branch above. Both exits here are signals (a pop, a
-            // completion), so a single missed one parks this partition for
-            // good; the tick re-samples instead of trusting that a signal
-            // always arrives.
+            // Race imm-pop, inflight CQ, drain.
             let pop_fut = imm_drained_rx.next();
             let cfut = inflight.next();
             let drain_fut = drain_rx.next();
-            let tick = compio::time::sleep(Duration::from_secs(5));
             futures::pin_mut!(pop_fut);
             futures::pin_mut!(drain_fut);
-            futures::pin_mut!(tick);
-            match select(select(pop_fut, Box::pin(cfut)), tick).await {
-                Either::Right(((), _)) => continue,
-                Either::Left((Either::Left((_, _)), _)) => continue,
-                Either::Left((Either::Right((maybe_c, _)), _)) => {
+            match select(pop_fut, Box::pin(cfut)).await {
+                Either::Left((_, _)) => continue,
+                Either::Right((maybe_c, _)) => {
                     if let Some(c) = maybe_c {
                         handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
                         if locked_by_other.get() {

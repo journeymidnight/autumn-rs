@@ -1558,26 +1558,6 @@ Three fixes bound the restart replay window (worst case per partition =
    `flush_one_imm` signals `imm_drained_tx` after each successful `imm.pop_front()` so
    the loop wakes and resumes intake.
 
-   **The stale-signal drain MUST run before the depth sample, and the two are one
-   call — `drain_wakes_then_sample_imm_full`.** The other order loses the wake and
-   parks the partition forever: sample says full, the flush loop pops the last imm and
-   signals, the drain discards that signal as stale, and the loop parks on
-   `imm_drained_rx` for a pop that already happened. Nothing pops again — imm is empty,
-   so the flush loop has nothing to do. Measured live: partitions silent for hours with
-   every request waiting inside `delegate_round_trip`, 100-220 MiB of unread requests
-   each, flush and SST threads idle, nothing logged above INFO, load long gone, and
-   only a restart clearing it. The symptom on the client is a `put` that never returns;
-   the symptom on the server is the absence of one.
-
-   Both imm-full parks also carry a **5 s tick**. It is not decoration: a park whose
-   only exits are signals is a park that ONE missed signal makes permanent, so the tick
-   bounds any future lost wake instead of trusting that a signal always arrives. Waking
-   re-samples; if imm really is full it parks again and says so once a minute.
-
-   Tests: `imm_wake_ordering_tests`, ablation-verified — the pop is injected through the
-   depth closure, which runs at exactly the sample point, so the interleaving under test
-   is the real one.
-
 2. **WAL-gap forced rotate.** After each `partition_loop` iteration, if `gap =
    active.log_bytes() + Σ imm[i].log_bytes() > MAX_WAL_GAP` AND `imm.len() <
    MAX_IMM_DEPTH`, call `rotate_active`. INVARIANT: the gap MUST be the un-flushed LOG
