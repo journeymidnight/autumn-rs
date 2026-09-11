@@ -6643,6 +6643,9 @@ async fn partition_loop(
 
     let cap = ps_inflight_cap();
     let imm_cap = max_imm_depth();
+    // DIAGNOSTIC: when this partition first entered imm-full back-pressure and
+    // stopped reading `req_rx`. Cleared the moment imm is not full.
+    let mut imm_full_since: Option<std::time::Instant> = None;
     let wal_gap_cap = max_wal_gap();
     let mut metrics = WriteLoopMetrics::new();
     let mut pending: Vec<WriteRequest> = Vec::new();
@@ -6712,6 +6715,8 @@ async fn partition_loop(
                 .metrics
                 .imm_full_count
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            imm_full_since = None;
         }
 
         // drain any pending imm-pop notifications so we don't
@@ -6792,18 +6797,43 @@ async fn partition_loop(
         if imm_full {
             if n_inflight == 0 {
                 // Pure back-pressure wait. Race imm-pop vs drain.
+                //
+                // DIAGNOSTIC (not a fix): a third arm, a 5 s tick, so this park
+                // is observable. Parked here the loop stops reading `req_rx`,
+                // which is correct back-pressure but indistinguishable from the
+                // live wedge — partitions that stopped answering writes for
+                // hours, with the flush loop awake and idle. The tick only
+                // re-evaluates; if imm really is full it parks again and says
+                // so once a minute. If it DRAINED, the `imm_drained` wake was
+                // lost, and the log will show that too.
+                let stalled = imm_full_since.get_or_insert_with(std::time::Instant::now);
+                let waited = stalled.elapsed();
+                if waited.as_secs() >= 10 && waited.as_secs() % 60 < 5 {
+                    tracing::warn!(
+                        part_id,
+                        imm_len = part.borrow().imm.len(),
+                        imm_cap,
+                        stalled_secs = waited.as_secs(),
+                        "partition is parked in imm-full back-pressure and has \
+                         stopped reading its request channel — writes to it hang \
+                         until a flush pops an imm",
+                    );
+                }
                 let pop_fut = imm_drained_rx.next();
                 let drain_fut = drain_rx.next();
+                let tick = compio::time::sleep(Duration::from_secs(5));
                 futures::pin_mut!(pop_fut);
                 futures::pin_mut!(drain_fut);
-                match select(pop_fut, drain_fut).await {
-                    Either::Left((_, _)) => continue,
-                    Either::Right((maybe_drain, _)) => {
+                futures::pin_mut!(tick);
+                match select(select(pop_fut, drain_fut), tick).await {
+                    Either::Left((Either::Left((_, _)), _)) => continue,
+                    Either::Left((Either::Right((maybe_drain, _)), _)) => {
                         if let Some(ack) = maybe_drain {
                             drain_ack = Some(ack);
                         }
                         continue;
                     }
+                    Either::Right(((), _)) => continue,
                 }
             }
             // Race imm-pop, inflight CQ, drain.
@@ -10059,6 +10089,17 @@ async fn background_flush_loop(
 
     let cap = ps_flush_inflight_cap();
 
+    // Diagnostic for a wedge seen live: the loop wakes every FLUSH_RETRY_BACKOFF
+    // with a NON-EMPTY imm and launches nothing, silently, forever — which this
+    // code can only do when the front imm's pointer is already in
+    // `flushing_imm_ptrs` and nobody is left to remove it. Every failure path
+    // that drops a claim also logs, so a SILENT one means the claiming future
+    // was DROPPED (an RPC handler whose connection went away is the candidate).
+    // Nothing here changes behaviour; it names the state so the next wedge is
+    // diagnosable from the log instead of from /proc.
+    let mut barren_spins: u64 = 0;
+    let mut barren_since: Option<std::time::Instant> = None;
+
     loop {
         // Wait for a flush signal. Mode B fix: if imm is STILL pending (a prior
         // flush failed — e.g. row_stream append wedged on a dead replica — and
@@ -10091,6 +10132,7 @@ async fn background_flush_loop(
         }
         let mut inflight: FuturesOrdered<FlushFuture> = FuturesOrdered::new();
         let mut failed = false;
+        let mut launched_any = false;
         loop {
             // (A) Launch up to `cap` concurrent flushes. The next imm to
             // launch sits at `imm[inflight.len()]` because commit pops
@@ -10125,6 +10167,7 @@ async fn background_flush_loop(
                 };
                 match imm_at_idx {
                     Some(imm) => {
+                        launched_any = true;
                         let part_c = part.clone();
                         inflight.push_back(run_flush_async_phase(part_c, imm).boxed_local());
                     }
@@ -10168,6 +10211,44 @@ async fn background_flush_loop(
                 }
                 None => break,
             }
+        }
+
+        // Did this wake do any work? A wake that claimed nothing while imm is
+        // non-empty is the wedge signature. One line when it starts, then one
+        // per minute — enough to see it and to time it, quiet enough to leave on.
+        let (part_id_for_log, imm_len, claimed, front_busy) = {
+            let p = part.borrow();
+            let claimed = p.flushing_imm_ptrs.borrow().len();
+            let front_busy = p
+                .imm
+                .front()
+                .map(|m| {
+                    p.flushing_imm_ptrs
+                        .borrow()
+                        .contains(&(Arc::as_ptr(m) as usize))
+                })
+                .unwrap_or(false);
+            (p.part_id, p.imm.len(), claimed, front_busy)
+        };
+        if !launched_any && imm_len > 0 {
+            barren_spins += 1;
+            let since = *barren_since.get_or_insert_with(std::time::Instant::now);
+            if barren_spins == 4 || barren_spins.is_multiple_of(30) {
+                tracing::warn!(
+                    part_id = part_id_for_log,
+                    imm_len,
+                    claimed_ptrs = claimed,
+                    front_claimed = front_busy,
+                    spins = barren_spins,
+                    stalled_secs = since.elapsed().as_secs(),
+                    "flush loop is awake with a non-empty imm but claimed nothing \
+                     — if front_claimed is true the claim was leaked by a dropped \
+                     flush future and this partition will never drain",
+                );
+            }
+        } else {
+            barren_spins = 0;
+            barren_since = None;
         }
     }
 }
