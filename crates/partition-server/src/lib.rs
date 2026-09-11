@@ -5058,7 +5058,7 @@ async fn drain_bulk_writes(
         inflight.push(
             async move {
                 (
-                    delegate_round_trip(tx, req_id, msg_type, ctrl_bytes, Some(value)).await,
+                    delegate_round_trip(tx, req_id, msg_type, ctrl_bytes, Some(value), owner_part).await,
                     Vec::new(),
                 )
             }
@@ -5171,6 +5171,7 @@ async fn delegate_round_trip(
     msg_type: u8,
     payload: Bytes,
     bulk_value: Option<Bytes>,
+    owner_part: u64,
 ) -> Bytes {
     let (resp_tx, resp_rx) = oneshot::channel();
     let req = PartitionRequest {
@@ -5179,14 +5180,56 @@ async fn delegate_round_trip(
         resp_tx,
         bulk_value,
     };
-    let resp_frame = if tx.send(req).await.is_err() {
+    // DIAGNOSTIC (not a fix): both waits below are unbounded, and this function
+    // is awaited INLINE by the connection task on the bulk-write and depth-1
+    // paths — so a partition that stops answering stops that connection from
+    // reading its socket, with nothing logged on either side. The two waits fail
+    // for different reasons and the difference is the whole diagnosis:
+    //   * send  — the partition is not taking requests (its loop is parked);
+    //   * reply — the partition took this one and never answered.
+    // Report which, every 10 s, and keep waiting exactly as before.
+    let send_started = std::time::Instant::now();
+    let send_res = {
+        let mut sent = std::pin::pin!(tx.send(req));
+        loop {
+            let tick = compio::time::sleep(STUCK_INFLIGHT_REPORT_EVERY);
+            futures::pin_mut!(tick);
+            match futures::future::select(sent.as_mut(), tick).await {
+                futures::future::Either::Left((r, _)) => break r,
+                futures::future::Either::Right(((), _)) => tracing::warn!(
+                    part_id = owner_part,
+                    msg_type,
+                    waited_secs = send_started.elapsed().as_secs(),
+                    "delegate is still waiting to HAND a request to the partition \
+                     — the partition loop is not draining its request channel",
+                ),
+            }
+        }
+    };
+    let resp_frame = if send_res.is_err() {
         Frame::error(
             req_id,
             msg_type,
             autumn_rpc::RpcError::encode_status(StatusCode::Internal, "partition thread closed"),
         )
     } else {
-        match resp_rx.await {
+        let reply_started = std::time::Instant::now();
+        let mut resp_rx = std::pin::pin!(resp_rx);
+        let resp = loop {
+            let tick = compio::time::sleep(STUCK_INFLIGHT_REPORT_EVERY);
+            futures::pin_mut!(tick);
+            match futures::future::select(resp_rx.as_mut(), tick).await {
+                futures::future::Either::Left((r, _)) => break r,
+                futures::future::Either::Right(((), _)) => tracing::warn!(
+                    part_id = owner_part,
+                    msg_type,
+                    waited_secs = reply_started.elapsed().as_secs(),
+                    "delegate HANDED a request to the partition and is still \
+                     waiting for its reply — the partition took it and went quiet",
+                ),
+            }
+        };
+        match resp {
             Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
             Ok(Err((code, message))) => Frame::error(
                 req_id,
@@ -5465,7 +5508,7 @@ fn push_one_frame_to_inflight(
     inflight.push(
         async move {
             (
-                delegate_round_trip(tx, req_id, msg_type, payload, bulk_value).await,
+                delegate_round_trip(tx, req_id, msg_type, payload, bulk_value, owner_part).await,
                 Vec::new(),
             )
         }
@@ -5590,7 +5633,7 @@ async fn d1_fast_path_round_trip(
     let tx = req_tx.clone();
     let bulk_value = (!frame_value.is_empty()).then_some(frame_value);
     (
-        delegate_round_trip(tx, req_id, msg_type, payload, bulk_value).await,
+        delegate_round_trip(tx, req_id, msg_type, payload, bulk_value, owner_part).await,
         Vec::new(),
     )
 }
