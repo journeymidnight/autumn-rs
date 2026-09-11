@@ -1,61 +1,101 @@
 # autumn-rs Architecture Guide
 
-## 长任务执行规则
+## Project shape
 
-### 项目目标
-1. 底层是 `stream layer`，负责分布式文件存储与恢复。
-2. 上层是 `partition layer`，负责 table 管理与有序 KV 存储。
-3. IMPORTANT: 任何代码改动都要充分考虑性能因素。
-4. 各 crate 都维护 CLAUDE.md 作为架构总结与编码思路；改动相关代码时需同步更新对应 CLAUDE.md。
+1. The bottom layer is the `stream layer`: distributed file storage and recovery.
+2. The top layer is the `partition layer`: table management and ordered KV storage.
+3. IMPORTANT: every code change must account for performance.
+4. Each crate keeps its own `CLAUDE.md` as the architecture summary and the
+   record of why the code is shaped the way it is. When you change code, update
+   that crate's `CLAUDE.md` in the same change.
 
-### 长任务执行规则（参考 effective harness 思路）
-1. 每次开始任务前，必须先读取仓库根目录 `claude-progress.txt` 与 `feature_list.md`。
-2. 在真正编码前，先输出本任务的两份清单：
-   - 已实现的 feature/task
-   - 未实现的 feature/task
-3. 清单输出后才能开始编码。
-4. 编码完成后必须更新 `claude-progress.txt` 中的任务状态，状态值只允许两种：
+## Long-task execution rules
+
+1. Before starting any task, read `claude-progress.txt` and `feature_list.md`
+   at the repository root.
+2. Before writing any code, output two lists for this task:
+   - features/tasks already implemented
+   - features/tasks not yet implemented
+3. Coding starts only after those lists are out.
+4. When the code is done, update the task status in `claude-progress.txt`. Only
+   two values are permitted:
    - `completed`
    - `not_completed`
-5. 如果任务中断、阻塞或验证失败，状态必须写成 `not_completed`。
-6. 如果功能、测试、验证都完成，状态写成 `completed`。
-7. 采用外置记忆三件套管理长任务上下文：
-   - `feature_list.md`：记录 feature 列表、验收标准、完成状态
-   - `claude-progress.txt`：记录当前进度、阻塞点、下一步
-   - `git`：所有阶段性结果必须可回滚、可追溯
-8. `feature_list.md` 作为需求账本，任务开始后需求描述、验收步骤、测试标准不可随意改写；只允许更新完成状态字段（如 `passes` 或等价状态位）。
-9. 每次会话收尾必须完成交接闭环：
-   - 提交本阶段代码（commit）
-   - 更新 `claude-progress.txt` 与 `feature_list.md` 的状态
-   - 确保工作区状态可继续（无破坏性中间态，下一会话可直接接手）
-10. 每个 feature 必须按固定流程推进：
-    - 定义 feature（目标/边界/验收）
-    - 开发实现
-    - 执行测试验证
-    - 更新 `docs/ops.md`（手动测试/运维步骤）；若用户可见的用法变化，同步更新 `README.md`
-    - 提交 git commit，作为该 feature 的完成点
-11. `docs/ops.md` 必须持续维护，确保人工手动验证步骤始终可执行。`README.md` 保持用户导向（介绍/特性/用法，卖点=AI 架构存储 all-in-one），不堆放验证步骤。
-12. 如果claude-progress.txt,feature-list太长, 定期清理删除, 保持整洁
-13. 在注释，commit description， 尤其是代码内容里面， 不要写类似于Fxxx这种feature号
-14. commit message 里**禁止**出现 `Claude-Session: https://claude.ai/code/session_...`
-    这一行。session 链接是内部的、会失效的，对以后读 `git log` 的人毫无意义。
-    `Co-Authored-By: Claude ...` 可以保留。（已经进了历史的不要回改、不要 force-push。）
-15. **每次代码写完都要派 fable subagent 做独立评审**，在自测通过之后、写 commit 之前。
-    不是可选项。理由是实测有效：它抓到过一个自引入的高危回归——批量读的状态从
-    FLAG_ERROR 帧改成 ctrl 里的 code 之后，上层靠 `Err(PreconditionFailed)` 触发的
-    refresh+回退变成死代码，split/merge 后整组 key 直接报错，而当时全量单测和逐字节
-    e2e **全绿**。同轮还抓到漏掉的 writev 分段点和被"焊在一起"的文档注释。
-    - prompt 要给全：改了哪些文件、意图、已有的测量数字，并要求它区分
-      「代码里验证过」与「推断」。
-    - **它的推断项当假设对待**，别直接采信：它曾推断某改动在 UCX 上会更慢，实测 +61%。
-    - 评审挖出的高危项，修完要补一条能证明"没有修复时会红"的回归测试（消融验证）。
+5. If the task was interrupted, blocked, or failed verification, the status
+   must be written as `not_completed`.
+6. Only when the feature, its tests, and its verification are all finished does
+   the status become `completed`.
+7. Long-task context is carried by three external memories:
+   - `feature_list.md`: the feature list, acceptance criteria, completion state
+   - `claude-progress.txt`: current progress, blockers, next steps
+   - `git`: every intermediate result must be revertible and traceable
+8. `feature_list.md` is the requirements ledger. Once a task has started, the
+   requirement text, the acceptance steps, and the test criteria must not be
+   rewritten; only the completion field (`passes` or its equivalent) may change.
+9. Every session must end with a clean handoff:
+   - commit this stage's code
+   - update the status in `claude-progress.txt` and `feature_list.md`
+   - leave the working tree in a state the next session can pick up directly
+     (no destructive half-finished state)
+10. Every feature moves through the same sequence:
+    - define the feature (goal / boundary / acceptance)
+    - implement it
+    - run the tests and verify
+    - update `docs/ops.md` (manual test and operations steps); if user-visible
+      usage changed, update `README.md` too
+    - commit — that commit is the feature's completion point
+11. `docs/ops.md` must stay current: the manual verification steps have to remain
+    executable. `README.md` stays user-facing (intro / features / usage; the
+    pitch is all-in-one storage for AI architectures) and is not a dumping
+    ground for verification steps.
+12. When `claude-progress.txt` and `feature_list.md` grow too long, prune them.
+    Keep them tidy.
+13. Never write feature numbers of the `Fxxx` form in comments, in commit
+    descriptions, or — above all — in the code itself.
+14. A commit message must NEVER contain a
+    `Claude-Session: https://claude.ai/code/session_...` line. Session links are
+    internal, they expire, and they mean nothing to whoever reads `git log`
+    later. `Co-Authored-By: Claude ...` may stay. (Do not rewrite the history
+    that already carries one, and do not force-push over it.)
+15. **Every time code is written, dispatch a fable subagent for an independent
+    review** — after your own tests pass and before you write the commit. Use a
+    NEW subagent each time; never continue an earlier reviewer, because one
+    carrying its own previous context defends what it already concluded instead
+    of re-deriving. This is not optional. It is here because it has paid off:
+    a reviewer caught a self-introduced high-severity regression — after the
+    bulk-read status moved from a `FLAG_ERROR` frame to a code inside `ctrl`,
+    the upper layer's `Err(PreconditionFailed)`-triggered refresh-and-fallback
+    became dead code, so a whole key group failed outright after split/merge —
+    while the full unit suite and a byte-for-byte e2e run were **both green**.
+    The same round also caught a missed writev segmentation point and doc
+    comments that had been welded together.
+    - Give the prompt everything: which files changed, the intent, the numbers
+      already measured, and an instruction to separate what it VERIFIED in the
+      code from what it INFERRED.
+    - **Treat its inferences as hypotheses**, not findings: it once inferred a
+      change would be slower on UCX; measurement showed +61%.
+    - For every high-severity finding, after fixing it add a regression test
+      that demonstrably goes red without the fix (ablation).
+16. When writing code and fixing bugs, find the ROOT CAUSE. *Do not scatter
+    defensive hardening*; that only adds junk. Instrumentation is fine — a log
+    line that reports state changes nothing. A timeout, a retry tick, or a
+    rollback does, and those stay out of the tree until the cause is proven. If
+    a diagnosis is later disproven, revert the speculative fix rather than
+    keeping it because it "seems harmless".
+17. **Only the user edits this schema-level `CLAUDE.md`, by hand.** An agent
+    must never modify it on its own initiative — not to add a rule it thinks is
+    missing, not to tidy the wording, and not to restore something that looks
+    like an accidental deletion. A change here that appears to be a mistake is
+    the maintainer's deliberate edit until the maintainer says otherwise. The
+    only exception is an explicit instruction from the user to change this file.
 
+## `claude-progress.txt` conventions
 
-### claude-progress.txt 约定
-1. 文件位置：仓库根目录 `claude-progress.txt`。
-2. 文件中必须包含 `TaskStatus` 字段。
-3. `TaskStatus` 只能是 `completed` 或 `not_completed`，禁止其他值。
-4. 推荐结构示例：
+1. Location: `claude-progress.txt` at the repository root.
+2. The file must contain a `TaskStatus` field.
+3. `TaskStatus` is either `completed` or `not_completed`. No other value is
+   permitted.
+4. Suggested structure:
 ```txt
 Date: 2026-03-16
 TaskStatus: not_completed
