@@ -1626,7 +1626,7 @@ struct WorkerRemovalGuard {
     sc: Weak<StreamClient>,
     stream_id: u64,
     /// The generation of the worker this guard belongs to.
-    gen: u64,
+    worker_gen: u64,
 }
 
 impl Drop for WorkerRemovalGuard {
@@ -1642,7 +1642,7 @@ impl Drop for WorkerRemovalGuard {
         {
             let mut workers = sc.stream_workers.borrow_mut();
             match workers.get(&self.stream_id) {
-                Some((g, _)) if *g == self.gen => {
+                Some((g, _)) if *g == self.worker_gen => {
                     workers.remove(&self.stream_id);
                 }
                 _ => return,
@@ -1656,10 +1656,11 @@ impl Drop for WorkerRemovalGuard {
         // anything — the zero was never overwritten:
         //
         //   1. the first `Append` fails "no tail set";
-        //   2. the public API reads that as a soft error, reloads the tail,
-        //      and sends `ResetTail`;
-        //   3. the retry leases at cursor 0, so `header.commit = 0`;
-        //   4. every replica honours it by truncating to zero.
+        //   2. the public API read that as a soft error, reloaded the tail,
+        //      and sent `ResetTail` (that step is now fail-fast — see the
+        //      `no tail set` arm in `append_payload_segments`);
+        //   3. the retry leased at cursor 0, so `header.commit = 0`;
+        //   4. every replica honoured it by truncating to zero.
         //
         // Measured live: three replicas of one extent each dropped 1.7 GiB on
         // a single append, and the manager then sealed that extent at 8 MiB
@@ -2974,11 +2975,13 @@ impl StreamClient {
             return tx.clone();
         }
         let (tx, rx) = mpsc::channel::<StreamSubmitMsg>(STREAM_SUBMIT_CAP);
-        let gen = self.next_worker_gen.get().wrapping_add(1);
-        self.next_worker_gen.set(gen);
+        // `worker_gen`, not `gen`: the latter is a reserved keyword from
+        // edition 2024 and this workspace will migrate one day.
+        let worker_gen = self.next_worker_gen.get().wrapping_add(1);
+        self.next_worker_gen.set(worker_gen);
         self.stream_workers
             .borrow_mut()
-            .insert(stream_id, (gen, tx.clone()));
+            .insert(stream_id, (worker_gen, tx.clone()));
         let pool = self.pool.clone();
         let bad_nodes = self.stream_bad_nodes_handle(stream_id);
         // clone the failure-report sender into the worker so
@@ -2991,7 +2994,7 @@ impl StreamClient {
         let guard = WorkerRemovalGuard {
             sc: self.self_weak.clone(),
             stream_id,
-            gen,
+            worker_gen,
         };
         compio::runtime::spawn(async move {
             stream_worker_loop(
@@ -3553,6 +3556,14 @@ impl StreamClient {
                     // and a future lifecycle bug surfaces as an error instead of
                     // as silent data loss.
                     if msg.contains("no tail set") {
+                        // Clear the init flag on the way out, or this is not a
+                        // fail-fast — it is a permanent one. Re-entry reaches the
+                        // SAME worker, and `ensure_tail_initialised` would see the
+                        // flag still set and return without sending `ResetTail`,
+                        // so every later append on this stream fails too, until a
+                        // split or a restart. Dropping the flag makes the next
+                        // call re-run the init that was skipped.
+                        self.stream_init_locks.borrow_mut().remove(&stream_id);
                         return Err(e.context(
                             "worker had no tail: refusing to retry, because the \
                              retry would lease from offset 0 and truncate the tail",
@@ -6988,7 +6999,7 @@ mod worker_lifecycle_tests {
         let old_guard = WorkerRemovalGuard {
             sc: Rc::downgrade(&sc),
             stream_id,
-            gen: gen_old,
+            worker_gen: gen_old,
         };
 
         // split
@@ -7057,7 +7068,7 @@ mod worker_lifecycle_tests {
         let guard = WorkerRemovalGuard {
             sc: Rc::downgrade(&sc),
             stream_id,
-            gen: 7,
+            worker_gen: 7,
         };
         // this worker completed its init
         {
@@ -7079,6 +7090,133 @@ mod worker_lifecycle_tests {
              SeedCursor and run with tail=None, which turns the first ResetTail \
              into a roll and sets commit=0 on a non-empty extent"
         );
+        assert!(
+            sc.stream_workers.borrow().get(&stream_id).is_none(),
+            "the entry must go too — a dead Sender left in the map makes every \
+             later append fail 'worker gone' instead of spawning a replacement"
+        );
+    }
+
+    /// A worker that reports "no tail set" must fail the append AND forget the
+    /// stream's init flag.
+    ///
+    /// Without the second half the fail-fast is a permanent-fail: re-entry
+    /// reaches the SAME worker and `ensure_tail_initialised` returns early on
+    /// the still-set flag, so every later append on the stream fails too,
+    /// until a split or a restart.
+    ///
+    /// The fixture is a FAKE worker — a registered Sender whose receiver this
+    /// test drains — so the append path runs for real up to the point where
+    /// the worker answers.
+    ///
+    /// Ablation: drop the `stream_init_locks.remove` in the `no tail set` arm
+    /// and the flag below stays `true`.
+    #[compio::test]
+    async fn a_no_tail_worker_fails_the_append_and_forgets_its_init() {
+        let sc = client();
+        let stream_id = 43;
+
+        let (tx, mut rx) = mpsc::channel::<StreamSubmitMsg>(4);
+        sc.stream_workers.borrow_mut().insert(stream_id, (9, tx));
+        // pretend this worker already initialised, which is exactly the state
+        // the lifecycle bug leaves behind
+        {
+            let lock = sc.stream_init_lock(stream_id);
+            let mut g = lock.try_lock().expect("uncontended");
+            *g = true;
+        }
+
+        // the fake worker: answer the first Append the way a tail-less one does
+        compio::runtime::spawn(async move {
+            while let Some(msg) = rx.next().await {
+                if let StreamSubmitMsg::Append { ack_tx, .. } = msg {
+                    let _ = ack_tx.send(Err(anyhow!(
+                        "stream worker: no tail set (public API must send ResetTail before first Append)"
+                    )));
+                }
+            }
+        })
+        .detach();
+
+        let err = sc
+            .append_payload(stream_id, Bytes::from_static(b"x"))
+            .await
+            .expect_err("an append to a tail-less worker must fail, not retry");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to retry"),
+            "the append must fail fast rather than reload and lease from zero; got {msg}"
+        );
+
+        let still_seeded = {
+            let lock = sc.stream_init_lock(stream_id);
+            let g = lock.try_lock().expect("uncontended");
+            *g
+        };
+        assert!(
+            !still_seeded,
+            "the flag survived, so re-entry would skip init again and every \
+             later append on this stream would fail the same way forever"
+        );
+    }
+
+    /// The WIRING, through the real spawn path.
+    ///
+    /// The tests above hand-build guards, so they cannot see whether
+    /// `stream_worker_sender` actually tags each worker and hands its guard
+    /// the matching tag. Pin it end to end: spawn, split, spawn again, then
+    /// let the first worker's channel close so its guard really runs.
+    ///
+    /// Ablation: remove the tagging entirely — one constant in BOTH the map
+    /// insert and the guard — and the stale guard matches the successor's
+    /// entry and deletes it here. (Tagging only the guard with a constant is
+    /// NOT the ablation: a tag that matches nothing makes the guard remove
+    /// nothing, which no assertion can see.)
+    #[compio::test]
+    async fn the_spawn_path_tags_each_worker_and_its_guard_alike() {
+        let sc = client();
+        let stream_id = 41;
+
+        let tx_first = sc.stream_worker_sender(stream_id);
+        let gen_first = sc.stream_workers.borrow().get(&stream_id).map(|(g, _)| *g);
+        assert!(gen_first.is_some(), "spawn must register the worker");
+
+        // a split drops the registration; the flag goes with it
+        sc.invalidate_stream(stream_id);
+
+        // the next append spawns the successor, which registers a NEW tag
+        let _tx_second = sc.stream_worker_sender(stream_id);
+        let gen_second = sc.stream_workers.borrow().get(&stream_id).map(|(g, _)| *g);
+        assert_ne!(
+            gen_first, gen_second,
+            "each spawned worker must get its own generation"
+        );
+
+        // the first worker's last Sender goes away, so its loop ends and its
+        // guard runs — against a map entry that now belongs to the successor
+        drop(tx_first);
+        compio::time::sleep(Duration::from_millis(50)).await;
+
+        let survivor = sc.stream_workers.borrow().get(&stream_id).map(|(g, _)| *g);
+        assert_eq!(
+            survivor, gen_second,
+            "the first worker's guard unregistered the LIVE successor; the next \
+             append would spawn a third worker that never runs its init"
+        );
+        // And the first worker's OWN registration must be gone — a guard that
+        // matches nothing would also leave the successor alone, so presence of
+        // the successor is not on its own evidence that the gate works.
+        let gen_third = {
+            let before = sc.next_worker_gen.get();
+            let _tx = sc.stream_worker_sender(stream_id);
+            assert_eq!(
+                sc.next_worker_gen.get(),
+                before,
+                "the successor is still registered, so no new worker should spawn"
+            );
+            sc.stream_workers.borrow().get(&stream_id).map(|(g, _)| *g)
+        };
+        assert_eq!(gen_third, gen_second, "callers must reach the successor");
     }
 
     /// What an UNSEEDED worker sends as `header.commit`, pinned on the state
@@ -7088,8 +7226,9 @@ mod worker_lifecycle_tests {
     /// born at zero, and `SeedCursor` — which rides inside the init a stale
     /// flag makes it skip — is the only thing that would raise the cursor to
     /// the extent's committed length. So the hazard is an unseeded worker
-    /// being handed a LIVE tail and leasing from zero, which is exactly what
-    /// the soft-error reload path does after "no tail set".
+    /// being handed a LIVE tail and leasing from zero — which is what the
+    /// soft-error reload path did after "no tail set", before that arm was
+    /// made fail-fast.
     ///
     /// The first half also pins note 22: a same-extent reload must preserve
     /// append progress, or a seeded worker would regress the same way.

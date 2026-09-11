@@ -1267,13 +1267,17 @@ and from other crates' CLAUDE.md); do not renumber.
     worse than the bug. `an_exiting_worker_does_not_unregister_its_successor`
     pins that order.
 
+    `"no tail set"` is fail-fast AND drops the stream's init flag on the way
+    out. Dropping the flag is what makes it fail-fast rather than fail-forever:
+    re-entry reaches the SAME worker, and `ensure_tail_initialised` would
+    return early on a still-set flag, so every later append on that stream
+    would fail too until a split or a restart.
+
     **Nothing zeroes a commit on this path** — the zero is simply never
     overwritten, which is why it left no trace. The symptom that DOES appear
     is on the extent node: `truncating extent to the writer's commit` with
     `commit=0`, followed by the manager sealing the extent far below what the
-    nodes hold (`BUG2 UNDER-SEAL`). `"no tail set"` is now a fail-fast error
-    rather than a soft retry, so a future lifecycle bug reports itself instead
-    of truncating. Cross-ref notes 20, 21, 22, 25a.
+    nodes hold (`BUG2 UNDER-SEAL`). Cross-ref notes 20, 21, 22, 25a.
 
 ---
 
