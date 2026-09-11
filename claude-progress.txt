@@ -198,16 +198,26 @@ Task scope: dashboard 五项改造（用户 2026-09-11 提的 5 点）。其中�
     文档里记下这层耦合。
 
 【最终状态】
-  - 本地 main = fe82703 + 本修复提交,领先 origin 2 个,未 push(用户只说了 pull)。
-  - 全量:workspace check 零错误;rpc 62 / manager 367 / partition-server 226 / autumn-op 31;
-    render_check、tabs_smoke、真集群 api_contract 全过。
-  - stash@{0} 的内容已全部包含在本提交中,提交后 drop。
+  - 第二次 pull:上游又多两个提交(f440c40 账本新条目、08d4287 根 CLAUDE.md 重写)。
+    rebase 后本地 main = 688b32d + fbea57a,领先 origin 2 个,未 push(用户只说了 pull)。
+    冲突只在 feature_list.md —— 上游新增两条并保留 F-SPLIT-NEEDS-COMPACT,而本次把那条
+    实现掉并删除。解法:四条新条目全留、删掉已实现那条、修好指向它的交叉引用,并给
+    F-SPLIT-ADVICE-COUNTS-UNRECLAIMED 补一段**状态**(需求原文未动)——
+    幻影体积不再是 split 的触发器,但①真集群验收未复验 ②根因(GC 门槛)未动
+    ③`est_live` 仍把未回收垃圾全额计入,所以 merge 的否决与速率触发器的地板
+    仍按幻影体积判断。上游那条"先修 GC 门槛"的结论依然成立。
+  - 根 CLAUDE.md 新增规则 17(只有用户手改该文件)—— 本会话未碰它;规则 15 的
+    "每次派新的 fable subagent、不要续用旧评审"本会话是照做的。
+  - 全量(rebase 之后重跑):workspace check 零错误;rpc 62 / manager 367 /
+    partition-server 226 / autumn-op 31;render_check、tabs_smoke、真集群 api_contract 全过。
 
 Main gaps:
-  - fable 对其发现所做的修复本身未再评审(M1/M2 已消融验证,其余为文档);coco 仍因
-    Trae token 过期不可用。
-  - 账本新增两条(F-MERGE-COW-STALE-SEQ 未复现、F-SPLIT-CARRIED-BYTES-UNBOUNDED 待量)
-    不在本任务范围。
+  - fable 对其发现所做的修复本身未再评审(M1/M2 已消融验证,其余为文档改正)。
+  - coco 评审路径:用户 2026-09-11 令删除 coco skill,已删
+    (`~/.claude/skills/coco-review`,备份在本会话 scratchpad)。评审此后只走 fable。
+  - 账本里未实现的四条:本次新立两条(F-MERGE-COW-STALE-SEQ 未复现先写 harness、
+    F-SPLIT-CARRIED-BYTES-UNBOUNDED 先量再做)+ 上游两条
+    (F-SPLIT-ADVICE-COUNTS-UNRECLAIMED、F-EC-STARVES-FOREGROUND-APPEND)。
 
 Next steps:
   1. 用户要求时 push(git push origin main)。
