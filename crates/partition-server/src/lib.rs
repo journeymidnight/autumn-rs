@@ -5641,6 +5641,12 @@ async fn handle_ps_connection(
 
     const READ_BUF_SIZE: usize = 64 * 1024;
 
+    // DIAGNOSTIC label for the stuck-in-flight report below; resolved once,
+    // before the split consumes `conn`.
+    let peer_label = conn
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".to_string());
     let (reader, mut writer) = conn.into_split();
     let mut decoder = FrameDecoder::new();
     // per-connection principal, bound by a successful MSG_AUTH_HELLO
@@ -5816,9 +5822,40 @@ async fn handle_ps_connection(
         //    Pending until the completion lands) and costs ~5-10 µs/iter of
         //    polling. Matches the ExtentNode v3 fast-path branch.
         // The read future stays pinned in `read_fut`, untouched.
+        //
+        // DIAGNOSTIC (not a fix): this await is where a wedged connection sits
+        // forever. Parked here the task stops reading the socket, so the
+        // client's request bytes pile up unread and the client — which has no
+        // deadline on a bulk put — waits for a reply that is never coming.
+        // Measured live: 100-220 MiB unread per partition, for hours, with
+        // nothing logged anywhere. A tick makes the wait say what it is waiting
+        // for; it does not end the wait.
         if at_cap || n_inflight == 1 {
-            if let Some(done) = inflight.next().await {
-                push_resp(&mut tx_bufs, done);
+            let mut waited = Duration::ZERO;
+            loop {
+                let tick = compio::time::sleep(STUCK_INFLIGHT_REPORT_EVERY);
+                futures::pin_mut!(tick);
+                match select(inflight.next(), tick).await {
+                    Either::Left((done, _)) => {
+                        if let Some(done) = done {
+                            push_resp(&mut tx_bufs, done);
+                        }
+                        break;
+                    }
+                    Either::Right(((), _)) => {
+                        waited += STUCK_INFLIGHT_REPORT_EVERY;
+                        tracing::warn!(
+                            peer = %peer_label,
+                            part_id = owner_part,
+                            n_inflight,
+                            at_cap,
+                            waited_secs = waited.as_secs(),
+                            "ps-conn has been waiting for an in-flight request to \
+                             complete and is NOT reading this connection; the peer's \
+                             requests are piling up unread",
+                        );
+                    }
+                }
             }
             continue;
         }
@@ -10044,6 +10081,11 @@ where
 /// flush self-heals once the cluster recovers without needing a new-write signal.
 /// 2 s is well below the chaos settle window and far above a tight error spin.
 const FLUSH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// DIAGNOSTIC: how often a ps-conn parked on an in-flight request says so.
+/// A connection that stops reading is invisible from the server side — the
+/// evidence lives in the client's socket queue — so it reports itself.
+const STUCK_INFLIGHT_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// poison the partition after a FENCE rejection (LockedByOther) in the
 /// flush path, and WAKE the (possibly imm-full-parked) `partition_loop` via
