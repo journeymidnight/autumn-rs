@@ -562,8 +562,9 @@ mod tests {
         assert_eq!(decide_actions(&cands, &cds, &enabled, 1000, 300, 5).len(), 1);
     }
 
-    /// A policy with `cooldown_sec = 0` must NOT let the cluster-scoped rebalance
-    /// re-actuate every tick — the non-configurable floor applies.
+    /// A policy with `cooldown_sec = 0` must NOT let the expensive kinds
+    /// re-actuate every tick — the non-configurable floors apply: cluster-scoped
+    /// rebalance, and BOTH compact kinds, which actuate the identical op.
     #[test]
     fn expensive_kinds_are_floored_despite_zero_cooldown() {
         let enabled: HashSet<u8> = [POLICY_KIND_REBALANCE].into_iter().collect();

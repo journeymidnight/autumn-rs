@@ -224,6 +224,43 @@ Next steps:
   2. 部署注意 wire 39 vs 线上 35(BUG-WIRE36-UNDEPLOYED)。
   3. 上游 (4) 的 GC 门槛待办(BUG-GC-ADVISORY-VS-SELECTION)仍开着。
 
+【第二轮 fable 评审(评审"修复批次"本身)+ 本轮修复】
+  无高危;1 中危 + 3 低危。M1/M2 判定正确,借用、心跳预置、单位表(八个 kind 逐一核过)、
+  夹具与文案一致性均判 clean。
+  - **中危,而且是我写错了**: 我用"定时器臂不再做 compaction"当理由,判定
+    L1(空表跳过不清 has_overlap)"不可达"、只记文档不修。**那个理由是假的** ——
+    定时器有两处 compaction:TTL 过期跑的是 **major**,>32 SST 的 auto-trim 跑 minor,
+    两者都不走 `CompactTask`(所以"唯一生产者写死 is_major"为真但不相干)。
+    可达路径:CoW 孩子带 has_overlap=1 → 过期 major 把表全丢光(`new_readers.is_empty()`)
+    → 那条臂的 Ok 分支**从不** `set_has_overlap(0)`(只有 CompactRecv 臂做)
+    → 从此表空且标志置位 → 之后每次 compact 都走"nothing to compact"早退 →
+    **split 永远被拒**,而我加的 unblocking_compact 让策略每个窗口再发一次空转 compact,
+    只有 PS 重开才自愈。
+    修:过期 major 的 Ok 分支补 `set_has_overlap(0)`(minor 不能补 —— 它不丢越界 key)。
+    回归:`system_expiry_major_clears_overlap.rs`(真集群:TTL 写入→split→确认因 overlap 被拒
+    →只等定时器过期 major,不发任何 compact→断言拒绝理由不再是 overlap)。
+    **消融:撤掉那一行 ⇒ 变红(38s),恢复 ⇒ 绿(8s)**。
+    测试第一版写错过一次:只看 split 成/败,而过期把 key 全清后 split 会因**别的原因**失败,
+    被误读成标志仍在 —— 改成断言**拒绝理由**。
+  - 低危:`docs/ops.md` 漏改一处心跳措辞;`auto_policy` 测试文档只提 rebalance;
+    页面把"从未被探测过(Suspend)"也说成"没应答 df" ⇒ 两种情况分开措辞;
+    PS 指南"Minor Compaction(periodic, 10–20s jitter)"是陈述已删除的机制。
+  - **未修的低危**: `e862e3f` 的提交说明描述了它并不包含的 feature_list 改动(那些在 rebase
+    后进了 688b32d)。提交已入历史且非 HEAD,改它要重写三个提交的历史,收益不抵风险 —— 记在这里。
+
+【二.1 的事实(已查清,动手前)】
+  - 选取门槛在 `background.rs:1188` `ratio > effective_ratio`;默认 0.4,manager 现在传
+    `gc_stream_debt = gc_debt_high` ⇒ 减半到 **0.2**。账本目标 extent 是 3.12/16.00 = **0.195**,
+    仍然差一点,且门是严格 `>` ⇒ **那 3.12 GiB 至今收不掉**。上一轮只让 advisory 闭嘴
+    (collectable_debt 套同一比例),噪声停了,**回收没发生**,而验收要的是"被选中并回收"。
+  - `collectable_debt` 必须与选取用**同一条**谓词,否则两端又各说各话 —— 那正是本 bug 本身。
+  - **refs 不需要动 wire**:`authoritative_sealed_length` 已经对每个候选做一次
+    `get_extent_info`,返回的 `MgrExtentInfo` 上就有 `refs`。让它返回 `(sealed_length, refs)`
+    即可,零额外 RPC。(用户 2026-09-11 提:refs>1 的适当提高被 GC 概率,好让 extent 变成独占。
+    建议做成**确定性的更低门槛**而非概率;并记一个反例:兄弟分区若长期不 GC,本侧先重写
+    只是先付成本、refs 仍停在 1。)
+  - 用户已同意为绝对字节阈值**抬一次 wire**(39→40),让 X 与 `gc_debt_high` 同源。
+
 Date: 2026-09-11 (4)
 TaskStatus: not_completed
 Task scope: 事故复盘 + 待办。写路径三个 bug 已修并上线(947bae0);数据损失已发生且不可逆;

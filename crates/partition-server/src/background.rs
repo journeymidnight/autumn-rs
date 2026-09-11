@@ -703,6 +703,18 @@ pub(crate) async fn background_maintenance_loop(
                                     part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
                                     crate::human_size(s.output_bytes)
                                 );
+                                // A successful MAJOR compaction rewrote every
+                                // table without its out-of-range keys, so the
+                                // flag must follow — whichever arm ran it. Only
+                                // the dispatched-compact arm did this, and an
+                                // expiry pass that emptied a CoW child's tables
+                                // left `has_overlap` set with no table left for
+                                // a later compaction to rewrite: `split` refused
+                                // forever, the policy re-issued a no-op compact
+                                // every window, and only a PS reopen healed it.
+                                // The auto-trim arm below is MINOR and must not
+                                // clear it — it does not drop out-of-range keys.
+                                part.borrow().set_has_overlap(0);
                                 if last_extent != 0 {
                                     let (row_stream_id, part_sc) = {
                                         let p = part.borrow();

@@ -727,7 +727,14 @@ During each periodic tick, the loop checks all SST readers for
 keys, a major compaction runs on all tables (drops expired entries + tombstones),
 so TTL partitions eventually clean up without explicit triggers.
 
-### Minor Compaction (periodic, 10–20s jitter)
+### Minor compaction (`pickup_tables`) — NOT periodic any more
+
+Minor-compact-on-timer was removed; the periodic tick only refreshes gauges and
+runs the expiry-major pass. What still reaches `pickup_tables` is the defensive
+auto-trim above `MAX_SST_BEFORE_AUTO_COMPACT`, and any minor dispatched over
+`compact_rx`. A minor pass does NOT drop out-of-range keys, so — unlike a
+successful major, in every arm that runs one — it must never clear `has_overlap`.
+
 `pickup_tables` selects tables via one of two strategies:
 - **Head-extent**: if the oldest extent's tables are < 30% of total data
   (`HEAD_RATIO`), pick up to 5 (`COMPACT_N`) tables from it — clears old extents to

@@ -760,8 +760,9 @@ function renderNodeDrawer(id){
       <span class="m">capacity <b>${total?fmtBytes(total):"-"}</b></span><span class="m">free <b>${free!=null?fmtBytes(free):"-"}</b></span>
       <span class="m">disk <b>${total?(usedPct.toFixed(0)+"% used"):"-"}</b></span><span class="m">suspected age <b>${n.suspected_age_secs?n.suspected_age_secs+"s":"-"}</b></span>
     </div>${ov}
-    ${n.online===false?`<div class="blocked">This node did not answer its last <code>df</code>. Its per-disk
-      state is <b>unknown</b> — not healthy and not faulted — and nothing below describes the disks right now.</div>`:""}
+    ${n.online===false?`<div class="blocked">${st==="Suspend"
+      ? `This node has registered but no <code>df</code> probe has completed yet, so it has not described its disks.`
+      : `This node did not answer its last <code>df</code>. Its per-disk state is <b>unknown</b> — not healthy and not faulted.`}</div>`:""}
     ${faulted.length?`<div class="blocked">${faulted.length} disk${faulted.length>1?"s":""} reported FAULTED by this node
       (${esc(faulted.map(d=>"#"+d.disk_id).join(", "))}). Its sealed replicas are rebuilt elsewhere; the node keeps serving its other disks.</div>`:""}
     ${unreported.length?`<div class="blocked">${unreported.length} disk${unreported.length>1?"s":""} registered to this node but

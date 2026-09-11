@@ -422,6 +422,37 @@ pub async fn ps_flush(ps: &RpcClient, part_id: u64) {
 }
 
 /// Trigger major compaction.
+/// `ps_put` with a TTL. The plain helper pins `expires_at: 0`, and a test that
+/// needs the periodic EXPIRY-major pass to fire has to age an SST — that pass
+/// keys on `SstReader::min_expires_at`, which only a TTL'd record sets.
+pub async fn ps_put_ttl(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8], ttl_secs: u64) {
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_add(ttl_secs);
+    let payload = partition_rpc::rkyv_encode(&partition_rpc::PutReq {
+        part_id,
+        key: key.to_vec(),
+        value: value.to_vec(),
+        expires_at,
+        region_epoch: 0,
+        inode_hint: 0,
+        lease_epoch: 0,
+    });
+    let mut last_err = String::new();
+    for _ in 0..30u32 {
+        match ps.call(partition_rpc::MSG_PUT, payload.clone()).await {
+            Ok(_) => return,
+            Err(e) => {
+                last_err = format!("{e}");
+                compio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+    panic!("ps_put_ttl({part_id}) failed after retries: {last_err}");
+}
+
 pub async fn ps_compact(ps: &RpcClient, part_id: u64) {
     let resp = ps
         .call(

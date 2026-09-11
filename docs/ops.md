@@ -247,8 +247,8 @@ for n in json.load(sys.stdin)["nodes"]:
 
 # Servers: the REGISTERED fleet. A PS serving no partition, or one that stopped
 # heartbeating, appears here and nowhere else (the partition list can only show
-# a PS that owns something). last_heartbeat_secs_ago = null means THIS leader
-# has never seen one — unknown, not dead.
+# a PS that owns something). last_heartbeat_secs_ago = null means no heartbeat
+# entry at all — defensive only, since replay and registration both seed one.
 autumn-op --manager $MGR --json overview | python3 -c '
 import json,sys
 for p in json.load(sys.stdin)["ps_servers"]:

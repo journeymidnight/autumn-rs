@@ -681,13 +681,15 @@ impl PolicyEngine {
     /// `compact <part>`, which reaches the PS with `is_major: true` —
     /// `MSG_MAINTENANCE` is the only `CompactTask` producer and hardcodes it.
     /// `has_overlap` does NOT by itself make a compaction major; it only
-    /// suppresses the too-few-tables skip. A future minor-tier compact op would
-    /// therefore break this loop's convergence twice over: a minor pass does
-    /// not clear the flag, and one that dropped every table while it was set
-    /// would leave it set for good — the empty-table skip in `background.rs`
-    /// returns "nothing to compact" without clearing it. Unreachable today (the
-    /// only `CompactTask` producer hardcodes `is_major: true`, and the timer arm
-    /// no longer compacts), which is why it is recorded here, not patched.
+    /// suppresses the too-few-tables skip. What keeps THIS loop convergent is a
+    /// PS invariant: a successful MAJOR compaction clears the flag, in every arm
+    /// that runs one — the dispatched compact and the periodic expiry pass
+    /// alike. That invariant was incomplete, and the gap was reachable: an
+    /// expiry major that emptied a CoW child's tables left the flag set with no
+    /// table left for a later compaction to rewrite, so `handle_split_part`
+    /// refused forever while this advisory re-issued a no-op every window. A
+    /// MINOR pass must NOT clear it (it does not drop out-of-range keys), so any
+    /// new compaction arm has to make the same distinction.
     ///
     /// KNOWN GAP, stated rather than papered over: while a major compaction IS
     /// running, this returns `None` and the blocked partition contributes no
