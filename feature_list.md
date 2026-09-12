@@ -749,3 +749,71 @@
   代价如实记:记录存活期间 inode 恒脏、periodic_sync 每 30 s 告警、缓冲尾巴不落盘,直到
   ToApplication 调用者清掉 —— 故意取舍(响亮卡住 > 静默的洞),写在 `FlushReport` doc 里。
 - `passes: true`
+### F-SPLIT-NEEDS-COMPACT — split 前需要先 compact，而策略与面板都不知道这件事
+- **Trigger** (2026-09-09，用户): 「split前要compact，dashboard或者policy要知道」。
+- **实测到的现象**: `auto-policy` 的 recent actions 里排着一列相同的拒绝：
+  `[refused] autumn-op split 168: rpc error (FailedPrecondition): cannot split: partition
+  has overlapping keys`。策略每个周期发一次、每次被拒。part 168 已 50 GiB、超过
+  `size>53687091200` 的阈值，切不开就只会继续长。
+- **为什么它不会自己好**: 拒绝来自 PS 侧的 `part.borrow().has_overlap.get() != 0`
+  (`rpc_handlers.rs:1490`)。重叠是一次 CoW split 的遗留——父子共享 extent
+  (168 与 204 共享 22,169,172,188,190,200 六个)，要靠 compaction 把各自的数据重写进
+  自己的 extent 才会消失。**而策略的冷却 `last_op_at` 只在真的产出了两个孩子之后才盖章**
+  (`rpc_handlers.rs:3686`)，被拒的 split 根本不进冷却，所以每周期照发。
+- **Scope**(未实现，三条按性价比排序):
+  1. **策略在发 split 前先发 compact**。它已经会发 major-compact 建议，缺的是
+     "这个分区想切但重叠着 → 先 compact"这条因果。
+  2. ~~**被拒的 split 要进冷却**~~ —— **已修** (2026-09-10)。根因比预想的更简单也更普遍：
+     auto-policy 的执行循环只在 `Ok(())` 分支写 `st.cooldowns.insert(key, now)`，`Err` 分支
+     只记一条 refused 就走 —— **任何**被拒的动作都会在下一跳原样重发，不只是 split。
+     现在拒绝也起冷却，并且 `cooldowns_changed` 让这类 tick 也持久化冷却(否则 manager
+     一重启又立刻重试)。这是限流不是封禁：条件清了下个窗口自然会再拿起它。
+     ⚠️ **没有单测**：这条路径在一个带 I/O 的 async 循环里，要造一次真实的 actuation 失败
+     才测得到，靠读代码核对。manager 346 个单测仍全绿。
+  3. **面板要说人话**。现在只显示一条 `FailedPrecondition: overlapping keys`，读者无从知道
+     该做什么。应当显示"等待物理分离；先 compact"并给出那条命令。
+- **Acceptance**: 一个重叠未消的分区上，`auto-policy` 的 recent actions 不再出现连续的
+  `split ... refused`；面板对该分区显示的是"需要先 compact"而不是一条裸错误。
+- **Status**: `passes: false` (2026-09-09) — 仅立账，未实现。手工推动的办法是对两个分区
+  各发一次 `autumn-op compact`(最近 17、164 都 compact 成功过)。
+
+### F-FUSE-SINGLE-STREAM-READ-CEILING — 单流 FUSE 读约 106 MB/s，而读大小已经不是瓶颈
+- **Trigger** (2026-09-12，用户): 「为什么autumnfs读这么慢？」。一个 vLLM-Omni 扩散服务
+  从挂载读 127 GB 权重，冷启动 19 分钟。
+- **实测**（Wan2.2 I2V pod，`--direct-read true`、`--direct-io`(硬编码) ON）:
+
+  | 读者 | 守护进程侧每次读 | 吞吐 |
+  |---|---|---|
+  | `dd bs=8M count=384`（pread） | **930.3 KiB**（3072 次读 / 2791 MiB） | **106 MB/s** |
+  | 模型加载（整轮） | 74.4 KiB（1,705,984 次 / 126,993 MiB） | 171 MB/s |
+  | 模型加载（前段小文件） | 31.3 KiB | ~40 MB/s |
+
+- **一个已被证伪的诊断，记在这里以免重走**: 曾推断 "`FOPEN_DIRECT_IO` 关掉页缓存 →
+  readahead 失效 → 每次读只有 31 KiB → 落在 `BULK_MIN_BYTES`(64 KiB) 之下 → 每读还多走
+  一次 PS 代理"，并据此加了 `--direct-io` 开关。**930 KiB 那一行否定了它**：同一挂载、
+  同样开着 direct-io，`pread` 读者拿到的远在门槛之上，吞吐仍只有 106 MB/s。加载时的
+  31 KiB 是**加载器自身的访问模式**（大量小张量读），不是页错误。改动已整体回退
+  (2026-09-12)。两处本仓库既有记录当时就该读到：`docs/ops.md` 的 "`O_DIRECT` 探测成功
+  → 加载器留在 `preadv` 路径"，以及 `ops.rs` 里"内核把每个请求钳到 1 MiB、
+  `set_max_readahead` is inert either way"的实测注释——930 KiB 正是那条钳制的确认。
+- **所以真正待查的是**: 930 KiB 的请求、单流为何只有 106 MB/s。方向（未验证）:
+  单个 FUSE 读在守护进程内是否串行化（`read::prepare` 在 dispatcher 单线程上，
+  `--read-io-threads` 默认 4）；一次 1 MiB 读在 `get_many_*` 里是否被拆成按 extent 的
+  串行往返；以及并发度——模型加载有 ~8 路并发时拿到 171 MB/s，而 `autumnfs put` 侧
+  测到过 ~830 MB/s，提示吞吐来自并发而非单流。
+- **Scope**（未实现）: 先做读大小直方图 + 单流 vs N 流的对照，把"单流上限"和"并发扩展性"
+  分开量，再决定动哪一层。**不要**在没有这两组数字之前改任何默认值。
+
+### BUG-FUSE-INVAL-ON-DISPATCHER-THREAD — 失效通知在 dispatcher 线程上做阻塞写，可能死锁
+- **Trigger** (2026-09-12): 独立评审在审 `--direct-io` 时发现，**与该改动无关，是既有隐患**。
+- **代码事实**: `main.rs` 的失效闭包调用 `notifier.inval_inode(ino, 0, 0)`，fuser 侧是对
+  session fd 的同步 `write(2)`。它从 lease 轮询任务发起，跑在**同一个 compio runtime**上：
+  每个事件一次；溢出哨兵与**任何轮询传输错误**时对**每一个持有的 inode** 各一次。
+  而一个 FUSE 读要被应答，必须先由 dispatcher 跑 `read::prepare`（需要 `&mut state`）。
+- **推断的后果**（未复现）: `FUSE_NOTIFY_INVAL_INODE` 走 `invalidate_inode_pages2_range`，
+  要拿 folio 锁，而预读持有该锁直到对应 FUSE_READ 被应答。若那条读还排在桥接通道里等
+  同一个被阻塞的线程，双方互等；FUSE 无超时，读者永久 D 状态。
+  **触发场景是只读挂载也有的**：加载途中 manager 重启或连接抖动。
+- **Scope**（未实现）: 先按评审给的判据复现——`cat bigfile` 循环 + 中途重启 manager，
+  看 `autumn-fuse-compio` 线程是否停在 `folio_wait_bit`/`__lock_page`（`/proc/<pid>/task/*/wchan`）、
+  读者是否 D 状态。确认后的修法形状：把通知移到专用线程发（`Notifier` 是 `Send + Clone`）。

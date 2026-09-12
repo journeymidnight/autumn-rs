@@ -544,6 +544,38 @@ Next steps:
   - **未验**:真集群上"回收确实发生、gc_debt 随之下降"没跑过 —— 账本条目因此不关。
   - 验收后半(共享 extent 债务 dedup)**不实现**:条目自己的订正说明 dedup 会让 refs 归不了零;
     改为呈现层(extent 视图显示 refs 与共享分区),未做。
+Date: 2026-09-12
+TaskStatus: not_completed
+Task scope: 查 "autumnfs 读为什么慢"。加了 --direct-io 挂载开关，实测否定了它依据的诊断，
+  已整体回退。真正的问题仍未解决。
+
+【被证伪的诊断】
+  推断: FOPEN_DIRECT_IO 关掉页缓存 → readahead 失效 → 每次读 31 KiB
+        → 落在 BULK_MIN_BYTES(64 KiB) 之下 → 每读还多走一次 PS 代理。
+  实测: 同一挂载、direct-io 照常开着，`dd bs=8M` 在守护进程侧是 **930.3 KiB 每次读**
+        (3072 次 / 2791 MiB)，远在门槛之上，吞吐仍只有 **106 MB/s**。
+  结论: 读大小不是瓶颈；加载时的 31 KiB 是加载器自身的小张量访问模式。
+  代码改动(--direct-io 开关 + 3 条 clap 回归测试 + 文档)已 `git checkout` 回退。
+  记在 feature_list 的 F-FUSE-SINGLE-STREAM-READ-CEILING，含全部数字，以免重走。
+
+【本可以更早避免】
+  两处本仓库既有记录当时就该读: docs/ops.md 里 "O_DIRECT 探测成功 → 加载器留在 preadv
+  路径" 的实测段落(就在我正在编辑的同一文件里)，以及 ops.rs 里 "内核把每个请求钳到
+  1 MiB、set_max_readahead is inert either way" 的实测注释。930 KiB 正是后者的确认。
+
+【评审带出的既有隐患，未修】
+  BUG-FUSE-INVAL-ON-DISPATCHER-THREAD: 失效通知在 dispatcher 线程做阻塞 write(2)，
+  manager 重启/抖动时对每个持有 lease 的 inode 触发，推断可与预读的 folio 锁互等。
+  与本次改动无关，先按判据复现再谈修。
+
+【同期完成的(与本条无关)】
+  Wan2.2 I2V 上线并实测: 5s/720p = 153.7 s (4xH20，x-inference-time-s)，
+  对照 vLLM-Omni 官方 4xA100 的 117-125 s。冷启动 19 分钟、0 重启。
+  两个启动超时是真因: init_timeout(600s)/stage_init_timeout(300s) 短于 16 分钟的加载，
+  worker 全部 ready 之后 orchestrator 已经放弃 —— 不是内存也不是挂载。
+
+Next steps: 先做读大小直方图 + 单流 vs N 流对照，把"单流上限"与"并发扩展性"分开量；
+  在这两组数字出来之前不要动任何默认值。
 
 Date: 2026-09-11 (4)
 TaskStatus: not_completed
