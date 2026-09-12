@@ -1505,11 +1505,11 @@ impl ClusterClient {
         }
 
         // WIRE-1: startup wire-schema cross-check. A SUCCESSFUL response
-        // with a different fingerprint is a hard refusal (mixed
-        // same-commit deploy — rkyv would decode garbage; the stale
-        // python wheel failed exactly this way, silently). A transport
-        // failure is skipped: availability wins while the manager is
-        // briefly down, and every RPC after this would fail loudly anyway.
+        // whose wire-version interval does not overlap ours is a hard
+        // refusal (mixed same-commit deploy — rkyv would decode garbage;
+        // the stale python wheel failed exactly this way, silently). A
+        // transport failure is skipped: availability wins while the manager
+        // is briefly down, and every RPC after this would fail loudly anyway.
         if let Ok(resp_bytes) = client
             .mgr_call(MSG_GET_CLUSTER_ID, rkyv_encode(&GetClusterIdReq {}))
             .await
@@ -1520,8 +1520,8 @@ impl ClusterClient {
             let resp = rkyv_decode::<GetClusterIdResp>(&resp_bytes).map_err(|e| {
                 anyhow!("decode GetClusterIdResp failed ({e}) — possible wire-schema mismatch; rebuild from the cluster's commit")
             })?;
-            // R1: interval-overlap compat check (same-fingerprint fast
-            // path inside; refusal message carries both intervals).
+            // R1: interval-overlap compat check (refusal message carries
+            // both intervals).
             if let Err(msg) = autumn_rpc::wire_compat_check(
                 resp.wire_version_min,
                 resp.wire_version_max,
@@ -4725,7 +4725,13 @@ impl ClusterClient {
             gc_ratio: params.ratio,
             gc_max_size: params.max_size,
             gc_stream_debt: params.stream_debt,
+            gc_dead_bytes_high: params.dead_bytes_high,
             gc_empty_only: params.empty_only,
+            // The caller named its own knobs, so this is an override by
+            // definition: run exactly as asked, but never redefine what the
+            // partition's debt gauge means for every later tick. Only the
+            // manager speaks for the cluster's standing policy.
+            gc_policy_is_standing: false,
             op_id: 0,
         };
         let resp_bytes = self
@@ -4920,7 +4926,9 @@ impl ClusterClient {
                     gc_ratio: None,
                     gc_max_size: None,
                     gc_stream_debt: None,
+                    gc_dead_bytes_high: None,
                     gc_empty_only: false,
+                    gc_policy_is_standing: false,
                     op_id: 0,
                 }),
             )
@@ -4939,6 +4947,9 @@ pub struct GcAutoParams {
     pub ratio: Option<f64>,
     pub max_size: Option<u64>,
     pub stream_debt: Option<u64>,
+    /// Per-extent absolute dead-byte floor; qualifies regardless of ratio.
+    /// Ignored when `empty_only` is set.
+    pub dead_bytes_high: Option<u64>,
     pub empty_only: bool,
 }
 

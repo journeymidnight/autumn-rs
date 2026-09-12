@@ -56,7 +56,9 @@ async fn ps_forcegc(
                 gc_ratio: None,
                 gc_max_size: None,
                 gc_stream_debt: None,
+                gc_dead_bytes_high: None,
                 gc_empty_only: false,
+                gc_policy_is_standing: false,
                 op_id: 0,
             }),
         )

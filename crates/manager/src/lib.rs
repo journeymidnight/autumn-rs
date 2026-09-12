@@ -1956,39 +1956,29 @@ impl AutumnManager {
         extent_ids: Vec<u64>,
         state: &autumn_common::MetadataState,
     ) -> Result<()> {
+        // Bind BEFORE the call: as an argument the `Ref` would live until the
+        // end of the enclosing statement, which includes the `.await` below,
+        // and a `borrow_mut` landing in that window panics the manager.
+        let gc_debt_high = self.policy.borrow().config.gc_debt_high;
         let resp = self
             .send_maintenance(
-                autumn_rpc::partition_rpc::MaintenanceReq {
-                    part_id,
+                // The controller actuating its OWN config is the standing
+                // policy by definition, and a default spec names no knobs — so
+                // the helper fills both numbers from `gc_debt_high` and marks
+                // it standing. Routed through the same helper as the submitted
+                // path deliberately: two hand-maintained copies of this
+                // decision would drift, and the PS cannot tell which one it is
+                // looking at.
+                maintenance_req_for_submitted_op(
+                    &autumn_rpc::manager_rpc::OpSubmitReq {
+                        part_id,
+                        ..Default::default()
+                    },
                     op,
                     extent_ids,
-                    gc_ratio: None,
-                    gc_max_size: None,
-                    // Arm the halved-ratio path with the SAME number the
-                    // advisory fired on. The PS already knows to relax its
-                    // per-extent ratio gate once a stream's total dead bytes
-                    // cross `stream_debt` — that mechanism exists precisely for
-                    // "a lot of garbage spread thinly" — but the automatic path
-                    // passed None, so it only ever engaged when an operator
-                    // typed `--stream-debt` by hand.
-                    //
-                    // Leaving it unarmed made the two ends disagree: the
-                    // advisory fires on absolute dead bytes over `gc_debt_high`,
-                    // while selection asked for a ratio the same garbage could
-                    // not reach, so the policy asked every cooldown and GC
-                    // answered "no eligible extents to reclaim" every time.
-                    gc_stream_debt: if matches!(
-                        op,
-                        autumn_rpc::partition_rpc::MAINTENANCE_AUTO_GC
-                            | autumn_rpc::partition_rpc::MAINTENANCE_FORCE_GC
-                    ) {
-                        Some(self.policy.borrow().config.gc_debt_high)
-                    } else {
-                        None
-                    },
-                    gc_empty_only: false,
-                    op_id: 0,
-                },
+                    0,
+                    gc_debt_high,
+                ),
                 state,
             )
             .await?;
@@ -2344,16 +2334,14 @@ impl AutumnManager {
                     OP_KIND_GC => (MAINTENANCE_AUTO_GC, vec![]),
                     _ => (MAINTENANCE_FORCE_GC, spec.extent_ids.clone()),
                 };
-                let req = autumn_rpc::partition_rpc::MaintenanceReq {
-                    part_id: spec.part_id,
+                let gc_debt_high = self.policy.borrow().config.gc_debt_high;
+                let req = maintenance_req_for_submitted_op(
+                    spec,
                     op,
                     extent_ids,
-                    gc_ratio: spec.gc_ratio,
-                    gc_max_size: spec.gc_max_size,
-                    gc_stream_debt: spec.gc_stream_debt,
-                    gc_empty_only: spec.gc_empty_only,
                     op_id,
-                };
+                    gc_debt_high,
+                );
                 match self.send_maintenance(req, state).await {
                     Ok(resp) if resp.code == autumn_rpc::partition_rpc::CODE_OK => {
                         ActuationResult::Dispatched {
@@ -2625,7 +2613,9 @@ impl AutumnManager {
                         gc_ratio: None,
                         gc_max_size: None,
                         gc_stream_debt: None,
+                        gc_dead_bytes_high: None,
                         gc_empty_only: false,
+                        gc_policy_is_standing: false,
                         op_id: 0,
                     },
                 );
@@ -10012,5 +10002,135 @@ mod tests {
                  fire RE_AVALI on the parity holder indefinitely"
             );
         })
+    }
+}
+
+/// Build the PS `MaintenanceReq` for a maintenance op — BOTH manager paths use
+/// it: the auto-policy controller actuating its own config, and a submitted op.
+///
+/// One definition so the standing-vs-override decision is testable without a
+/// cluster and cannot drift between the two callers. This is the ONLY place
+/// that decides whether a GC speaks for the cluster's standing policy, and it
+/// is silent in
+/// both directions when wrong: marked standing, a one-off command redefines
+/// that partition's debt gauge for every later tick and the advisory then
+/// reads a question nobody asked; not marked, the dashboard's GC button runs a
+/// GC that cannot collect what the advisory next to it just fired on.
+pub(crate) fn maintenance_req_for_submitted_op(
+    spec: &autumn_rpc::manager_rpc::OpSubmitReq,
+    op: u8,
+    extent_ids: Vec<u64>,
+    op_id: u64,
+    gc_debt_high: u64,
+) -> autumn_rpc::partition_rpc::MaintenanceReq {
+    // Naming NO gc knob at all is a request for "the usual GC", so fill in the
+    // cluster's standing policy and say so. Naming ANY knob makes it an
+    // OVERRIDE: it runs exactly as asked, and changes nothing about the gauge.
+    //
+    // Both filled numbers are `gc_debt_high`, and that is the point. The
+    // advisory fires on absolute dead bytes over it, so selection has to be
+    // able to answer on the same terms or the two ends ask different
+    // questions — the policy asks every cooldown and GC answers "no eligible
+    // extents to reclaim" every time. `gc_stream_debt` arms the halved-ratio
+    // path for the same reason: the PS relaxes its per-extent gate once a
+    // stream's total dead bytes cross that high-water, which is exactly the
+    // "a lot of garbage spread thinly" case, and passing None left that
+    // mechanism engaged only when an operator typed `--stream-debt` by hand.
+    // A new `gc_*` field on `OpSubmitReq` MUST be added to this conjunction.
+    // Forgetting fails SILENTLY and in the dangerous direction: a request
+    // naming only the new knob still satisfies `names_no_knobs`, comes out
+    // marked standing, and redefines that partition's debt gauge for every
+    // later tick. The tests below enumerate the knobs by hand, so they would
+    // stay green.
+    let names_no_knobs = spec.gc_ratio.is_none()
+        && spec.gc_max_size.is_none()
+        && spec.gc_stream_debt.is_none()
+        && spec.gc_dead_bytes_high.is_none()
+        && !spec.gc_empty_only;
+    let standing = op == autumn_rpc::partition_rpc::MAINTENANCE_AUTO_GC && names_no_knobs;
+    autumn_rpc::partition_rpc::MaintenanceReq {
+        part_id: spec.part_id,
+        op,
+        extent_ids,
+        gc_ratio: spec.gc_ratio,
+        gc_max_size: spec.gc_max_size,
+        gc_stream_debt: if standing { Some(gc_debt_high) } else { spec.gc_stream_debt },
+        gc_dead_bytes_high: if standing {
+            Some(gc_debt_high)
+        } else {
+            spec.gc_dead_bytes_high
+        },
+        gc_empty_only: spec.gc_empty_only,
+        gc_policy_is_standing: standing,
+        op_id,
+    }
+}
+
+#[cfg(test)]
+mod submitted_gc_policy_tests {
+    use super::maintenance_req_for_submitted_op;
+    use autumn_rpc::manager_rpc::OpSubmitReq;
+    use autumn_rpc::partition_rpc::{MAINTENANCE_AUTO_GC, MAINTENANCE_FORCE_GC};
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// A bare `autumn-op gc PART`, and the dashboard's GC button, name no
+    /// knobs. They must come out carrying the cluster's standing policy — the
+    /// button is rendered right next to a GC advisory, and without the floor it
+    /// runs a GC that cannot collect the bytes that advisory fired on.
+    #[test]
+    fn a_knobless_submit_carries_the_standing_policy() {
+        let spec =
+            OpSubmitReq { part_id: 7, requested_by: "dashboard".into(), ..Default::default() };
+        let req = maintenance_req_for_submitted_op(&spec, MAINTENANCE_AUTO_GC, vec![], 99, GIB);
+        assert!(req.gc_policy_is_standing);
+        assert_eq!(req.gc_dead_bytes_high, Some(GIB), "the floor the advisory judges by");
+        assert_eq!(req.gc_stream_debt, Some(GIB));
+        assert_eq!(req.part_id, 7);
+        assert_eq!(req.op_id, 99);
+    }
+
+    /// The forgeable shape: an override carrying a perfectly REAL floor. It
+    /// must run exactly as asked and never be marked standing — otherwise the
+    /// PS latches (0.9, 100 GiB) as the gauge's question, the gauge reads 0,
+    /// and the advisory goes quiet for good.
+    #[test]
+    fn an_override_runs_verbatim_and_is_never_standing() {
+        let spec = OpSubmitReq {
+            part_id: 7,
+            gc_ratio: Some(0.9),
+            gc_dead_bytes_high: Some(100 * GIB),
+            ..Default::default()
+        };
+        let req = maintenance_req_for_submitted_op(&spec, MAINTENANCE_AUTO_GC, vec![], 1, GIB);
+        assert!(!req.gc_policy_is_standing);
+        assert_eq!(req.gc_ratio, Some(0.9), "runs exactly as asked");
+        assert_eq!(req.gc_dead_bytes_high, Some(100 * GIB), "not overwritten by config");
+        assert_eq!(req.gc_stream_debt, None);
+    }
+
+    /// EVERY knob counts, including the ones easy to forget — the ops runbook
+    /// had already dropped `--stream-debt` from its list of them.
+    #[test]
+    fn any_single_knob_makes_it_an_override() {
+        for spec in [
+            OpSubmitReq { gc_ratio: Some(0.4), ..Default::default() },
+            OpSubmitReq { gc_max_size: Some(GIB), ..Default::default() },
+            OpSubmitReq { gc_stream_debt: Some(GIB), ..Default::default() },
+            OpSubmitReq { gc_dead_bytes_high: Some(GIB), ..Default::default() },
+            OpSubmitReq { gc_empty_only: true, ..Default::default() },
+        ] {
+            let req = maintenance_req_for_submitted_op(&spec, MAINTENANCE_AUTO_GC, vec![], 0, GIB);
+            assert!(!req.gc_policy_is_standing, "a named knob must never be standing");
+        }
+    }
+
+    /// FORCE_GC names its own extents; it never speaks for cluster policy.
+    #[test]
+    fn a_force_gc_is_never_standing() {
+        let spec = OpSubmitReq { part_id: 7, extent_ids: vec![190], ..Default::default() };
+        let req =
+            maintenance_req_for_submitted_op(&spec, MAINTENANCE_FORCE_GC, vec![190], 0, GIB);
+        assert!(!req.gc_policy_is_standing);
     }
 }

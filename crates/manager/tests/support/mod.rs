@@ -405,7 +405,9 @@ pub async fn ps_flush(ps: &RpcClient, part_id: u64) {
                 gc_ratio: None,
                 gc_max_size: None,
                 gc_stream_debt: None,
+                gc_dead_bytes_high: None,
                 gc_empty_only: false,
+                gc_policy_is_standing: false,
                 op_id: 0,
             }),
         )
@@ -464,7 +466,9 @@ pub async fn ps_compact(ps: &RpcClient, part_id: u64) {
                 gc_ratio: None,
                 gc_max_size: None,
                 gc_stream_debt: None,
+                gc_dead_bytes_high: None,
                 gc_empty_only: false,
+                gc_policy_is_standing: false,
                 op_id: 0,
             }),
         )
@@ -492,7 +496,9 @@ pub async fn ps_gc(ps: &RpcClient, part_id: u64) {
                 gc_ratio: None,
                 gc_max_size: None,
                 gc_stream_debt: None,
+                gc_dead_bytes_high: None,
                 gc_empty_only: false,
+                gc_policy_is_standing: false,
                 op_id: 0,
             }),
         )

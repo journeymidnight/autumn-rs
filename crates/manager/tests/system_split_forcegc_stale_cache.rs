@@ -4,7 +4,7 @@
 //! Claim under test: the split SOURCE keeps its StreamClient (no reopen),
 //! and `handle_split_part` only `invalidate_stream`s (drops the worker) — it does
 //! NOT `invalidate_extent_cache` the manager-sealed tail. So the sealed tail could
-//! read `sealed=false` from a stale cache and `authoritative_sealed_length` would
+//! read `sealed=false` from a stale cache and `authoritative_sealed` would
 //! skip it → force-GC never reclaims it.
 //!
 //! But the sealed tail is EXCLUDED from `sealed_extents` (it's the last extent)
@@ -46,7 +46,9 @@ async fn force_gc(ps: &RpcClient, part_id: u64, extent_ids: Vec<u64>) {
                 gc_ratio: None,
                 gc_max_size: None,
                 gc_stream_debt: None,
+                gc_dead_bytes_high: None,
                 gc_empty_only: false,
+                gc_policy_is_standing: false,
                 op_id: 0,
             }),
         )
@@ -141,7 +143,7 @@ fn split_source_forcegc_reclaims_shared_tail_no_stale_open_cache() {
         force_gc(&ps, 909, sealed).await;
         compio::time::sleep(Duration::from_millis(2000)).await;
 
-        // If the cache were stale-open, `authoritative_sealed_length` would skip
+        // If the cache were stale-open, `authoritative_sealed` would skip
         // the shared tail and refs would stay 2. It must be reclaimed (relocate
         // live VPs + punch out of the SOURCE's membership) → refs drops to 1.
         sc.invalidate_extent_cache(shared_log_extent);

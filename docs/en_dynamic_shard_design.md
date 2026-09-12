@@ -170,13 +170,20 @@ All in `crates/rpc/src/manager_rpc.rs` and `crates/rpc/src/extent_rpc.rs`:
   New registrations always list their ports explicitly; `shard_addr_for_extent`
   on a 1-element vector routes identically to the empty-vector fallback.
 
-**Operational rule:** any edit to those schema files changes `WIRE_FINGERPRINT`
-and must be recorded in `WIRE_VERSION_FINGERPRINTS` with `WIRE_VERSION_MIN`/`MAX`
-bumped (`crates/rpc/src/lib.rs`; the `wire_version_registry_tests` enforce it).
+**Operational rule:** any edit to those schema files is a MANUAL
+`WIRE_VERSION_MIN`/`MAX` bump in `crates/rpc/src/lib.rs`. The two move together,
+and nothing verifies the bump for you — a forgotten one ships two binaries that
+agree on the version number, disagree on the layout, handshake happily, and then
+decode each other's bytes as garbage. Bump exactly once per commit
+(`autumn-op upgrade-version` steps `cur + 1`).
+
 Because `MgrNodeInfo` / `MgrNodeOverride` are persisted, changing their layout is
-a stop-world upgrade that requires an etcd reset (`cluster.sh reset`); rkyv's
-fail-loud decode refuses un-reset old values rather than mis-reading them, and
-there is no rollback across such a change.
+a stop-world upgrade: stop every role, swap binaries, start, with no rollback
+across the change. rkyv's decode is fail-loud, so an un-migrated old value
+refuses leadership rather than being mis-read — but note that M0 itself shipped
+NO migration for pre-`node_uuid` rows. Production etcd is never wiped, so a
+cluster predating M0 needs a one-shot migration written before upgrading; a dev
+cluster rebuilds from empty.
 
 ### 2.6 df-echo drift detection and imposter refusal
 

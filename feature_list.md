@@ -462,7 +462,55 @@
      extent 视图应显示 `refs` 与共享它的分区，让相加得到的数字不被误读成物理字节。
 - **Acceptance**: 一个 dead 3 GiB / size 16 GiB 的 extent 在默认配置下会被 GC 选中并回收；
   共享 extent 的两个分区报告的债务之和不超过实际死字节。
-- **Status**: `passes: false` (2026-09-09；2026-09-10 修了第一半) — 逐个修复中。
+- **Status**: `passes: false` (2026-09-09；2026-09-10 修了第一半；2026-09-11 修了 Scope 1) —
+  **验收前半已实现，后半按下面的订正不做，但仍未在真集群复验，所以不关。**
+  **2026-09-11**：选取侧加了绝对字节的或条件 —— `dead >= dead_bytes_high` 无论比例都合格，
+  `X` 由 manager 从 policy 自己的 `gc_debt_high` 送下来(wire 39→40 加
+  `MaintenanceReq.gc_dead_bytes_high`)，建议按哪个数触发、回收就按哪个数选取。
+  **关键是两端现在是同一个函数**:抽出 `gc_selects(dead, len, refs, ratio, abs)`，
+  选取循环与 `collectable_debt`(建议读的那个 gauge)共用它 —— 这两处曾是各写一遍的同一条
+  判断，而它们不一致正是本条 bug 本身。
+  **评审抓到我第一版把这句话说过头了**:`gc_debt_bytes` 有**两个**写入点,我只改了选取那个;
+  另一个是 5-7 秒一次的空闲刷新 tick(`Sel::GcTimeout`),它写的是"所有死字节"的裸和,
+  并且几秒内就把选取写的值覆盖掉 ⇒ 建议绝大多数时候读的仍是裸和,
+  对"死字节摊薄在多个 extent 上、每个都够不着门槛"的分区,原来的死循环**原封不动**。
+  已修:选取把它解析出来的 `(sealed_length, refs)` 与阈值发布到 `PartitionData.gc_debt_basis`,
+  空闲 tick 用同一条谓词算 —— 零额外 RPC;首次派发之前退化为裸和(高报,安全方向)。
+  另按用户 2026-09-11 的提议加了第三条:`refs > 1` 的共享 extent 把比例门槛再减半
+  (文件只有 `refs → 0` 才真删，收掉本侧引用正是让 extent 变成独占的那一步)；
+  `refs` 搭在选取本来就做的 `get_extent_info` 上，零额外 RPC；**确定性而非概率**,
+  否则运维无法回答"这个为什么没被收"。`--empty-only` 只打空洞,绝对阈值对它无意义(第四轮已删掉那个多余的抑制分支)。
+  **第二轮评审又抓到同一条被我说过头的话的另一半**(2026-09-11):basis 被**无条件**发布,
+  而 `dead_bytes_high` 是**每次派发带下来的参数**——`autumn-op gc PART`、dashboard 的 GC
+  按钮、测试 helper 都不带 floor,`--empty-only` 还带一个够不着的 INFINITY gate。于是
+  **一次手动 GC 就把 floor 从 gauge 上永久摘掉**:空闲 tick 每 5-7 秒都从这个 basis 重
+  答,那 3 GiB 永远算 0 → 建议再也不发 → manager 再也不下发 floor → 直到分区重开才恢复。
+  这是本 bug **沉默的那一半**,比它替换掉的裸和更坏(裸和至少几秒后就把错值覆盖掉)。
+  根因不是那行赋值,而是我把**单次派发的覆盖参数**当成了**分区的常驻策略**存下来。
+  修法:basis 拆成 FACTS(sealed_length/refs,任何一次 pass 都可刷新)与 POLICY(ratio/floor,
+  **只有带真实 floor 的 pass 才可定义**),`next_gc_debt_basis` 一个纯函数承载全部判断,
+  调用点退化成一次无条件赋值;从未收到过 policy 时 basis 保持 None → 退回裸和(高报,安全方向)。
+  消融:3 条新单测在去掉粘性规则后全红(12 passed / 3 failed),恢复后 15 全绿。
+  **第三轮评审抓到同一形状的第三次**(2026-09-12):我用"带了真实 floor"去**推断**"来自控制面",
+  而 CLI 能伪造这个特征——`autumn-op gc --ratio 0.9 --dead-bytes 100G PART` 带着一个货真价实的
+  floor,于是把 (0.9, 100 GiB) 钉成常驻策略,gauge 再次永久归零。同时 basis 里存的
+  `effective_ratio` 根本不是策略:它把 `stream_debt_hit`(一个关于**此刻**有多少死字节的事实)
+  烤了进去,于是 gauge 会继续报告一个早已关掉的减半,或错过一个刚打开的。
+  根因一句话:**basis 存的必须是"问题",不是某一次派发对这个问题的"答案"**。
+  修法三件:①basis 存 `(ratio_base, stream_debt, floor)`,减半在每次读取时从 live discards
+  重新推导;②"可定义策略"从推断改成**显式信号** `MaintenanceReq.gc_policy_is_standing`
+  (wire 39→40,与本轮同一次抬),只有 manager 置位;③manager 对**没带任何 knob** 的 submitted GC 用自己的
+  config 补齐并标记 standing —— 于是 dashboard 上那个紧挨着 GC 建议的按钮,第一次真的能收掉
+  建议所指的那堆字节(此前它发的是无 floor 派发,按比例门槛根本够不着)。
+  消融两条,各自只红自己那条(16 passed / 1 failed ×2),恢复后 17 全绿。
+  11 条单测(含线上真实的 3.12 GiB/16.00 GiB 与 0.43 GiB/15.25 GiB 两组)，
+  **两条消融各自变红**:去掉绝对臂 ⇒ 验收用例 + 债务一致性用例红;去掉 refs 减半 ⇒ 两条共享用例红。
+  **仍未做/未验**:
+  ① 验收原文要求"默认配置下被选中并**回收**"——单测证明了判据会选中它，
+     但**没有在一个真集群上复验**回收确实发生、`gc_debt` 随之下降;
+  ② 验收后半"共享 extent 两个分区报告的债务之和不超过实际死字节"**不实现** ——
+     见本条 2026-09-10 的订正:dedup 会让 refs 永远归不了零。按订正落到呈现层
+     (extent 视图显示 `refs` 与共享它的分区)，面板已有位置，未做。
   **已修**：自动 GC 派发从来不带 `gc_stream_debt`(`manager/src/lib.rs` 的
   `actuate_maintenance` 写死 `None`)，于是"stream 级死字节超过高水位就把 per-extent 比例
   减半"这条**本就为这种场景设计的**机制，只在运维手工敲 `--stream-debt` 时才生效。现在按

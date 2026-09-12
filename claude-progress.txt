@@ -1,3 +1,73 @@
+Date: 2026-09-12 (7)
+TaskStatus: not_completed
+Task scope: GC 门槛(台账 BUG-GC-ADVISORY-VS-SELECTION 的 Scope 1)——让"建议"与"回收"
+  用同一条判据,外加用户提的 refs>1 共享 extent 更早被收。
+
+【为什么是 not_completed】功能与测试都齐了,但台账 Acceptance 要求"一个 dead 3 GiB /
+  size 16 GiB 的 extent 在默认配置下会被 GC 选中并回收",这条**没有在真集群上复验过**。
+  按规则 5/6,验收没跑完就不能写 completed(上一轮我写成了 completed,评审指出来了)。
+
+【做了什么】选取侧加绝对字节的或条件(`dead >= dead_bytes_high`,由 manager 从自己的
+  `gc_debt_high` 下发),抽出 `gc_selects` 让选取循环与 `collectable_debt`(建议读的 gauge)
+  共用同一条谓词;`refs > 1` 把比例门槛再减半(确定性,不是概率);manager 对没带任何 knob
+  的 submitted GC 用 config 补齐 —— dashboard 的 GC 按钮现在真能收掉建议所指的字节。
+  wire 39→40(一次提交只抬一次,不留幻影版本)。
+
+【四轮 fable 评审各抓到我一句说过头的话,而且是同一形状:把"我希望成立"当成"已经成立"】
+  一轮:我说"一条谓词两端共用"——假的。`gc_debt_bytes` 有两个写入点,空闲 tick(5-7 秒)
+    写的是裸和,几秒内就覆盖选取的值。修=选取发布 basis,空闲 tick 用同一条谓词重算。
+  二轮:那个 basis 被**无条件**发布,而 floor 是每次派发带下来的参数。一次
+    `autumn-op gc PART` 就把 floor 永久摘掉 → 建议永远沉默。修=facts/policy 分开。
+  三轮:我用"带了真实 floor"**推断**"来自控制面",而 CLI 能伪造这个特征;并且存进
+    basis 的 `effective_ratio` 把 `stream_debt_hit` 这个**事实**烤成了策略。
+    修=basis 存"问题"不存"答案"(ratio_base/stream_debt/floor,减半每次重推),
+    "可定义策略"改成显式 wire 信号 `gc_policy_is_standing`。
+  四轮:核心机制判定正确(评审原话"不是第四次犯同一个错"),但抓到**同一形状的文档版**:
+    `next_gc_debt_basis` 的函数注释还写着二轮已被否掉的那条规则,就贴在与它矛盾的代码上方;
+    另外发现我把三条新测试插进了 `the_idle_refresh_...` 与**它的文档注释之间**,
+    于是那段注释(连同消融说明)开始描述另一个测试 —— 本仓库以前被抓到过的"注释焊错"同型。
+    还抓到 wire 从 39 跳到 41 留下幻影 40(`bump_cluster_version` 只认 cur+1)。
+    修:注释重写、注释归位、wire 改回 40、把 manager 侧 standing 判定抽成纯函数补 4 条单测。
+
+【验证】单测 rpc 62 / manager 371 / ps 239 / autumn-op 31;GC+overlap 四个集成套 15 条;
+  dashboard 两条;clippy 四个 crate 零 error;workspace --all-targets 干净。
+  消融两条,各自只红自己那条(16 passed / 1 failed ×2),恢复后 17 全绿。
+
+【诚实记录】纯函数的契约有消融钉死,但维护循环里**调用**它的那一行仍只靠阅读验证
+  (仓库里没有能廉价构造 PartitionData 的测试脚手架)。全部判断已挪进纯函数,
+  调用点是一次无条件赋值 —— 这是目前能做到的最好程度,不是"已经验证过"。
+
+Main gaps:
+  1. 台账 Acceptance 未在真集群复验(gc_debt 是否真的跌下来),故 entry 不关。
+  2. refs>1 减半在 split 的**父**侧空转:`extent_info_cache` 不被 split 作废,父分区
+     看到的 refs 一直是 1(两轮评审都确认了前提,后果标 INFERRED)。只在子侧生效。
+     未改——split 路径是 revert-prone 区,不凭推断动刀。评审判定"可以先不修,只要文档
+     继续把它称作权重而不是承诺"。
+  3. PS 的 `--gc-debt-high-bytes` → `set_gc_debt_high` 填了一个**没人读**的 OnceLock
+     (评审发现,既有问题)。看着像 floor 配置,其实是死旋钮。未动。
+
+  4. **标准策略会卡在陈旧值上**(第三轮评审 finding 2,判定不修):存下的 policy 只由
+     standing 派发刷新,而 standing 派发只由建议触发,建议读的又是**用这个 policy 算出来的**
+     gauge。所以一旦存下的 policy 比 manager 当前的 `gc_debt_high` 更严,它就是个不动点
+     ——gauge 低报、建议不发、没人来刷新它,直到分区重开或有人跑一次不带 knob 的
+     `autumn-op gc PART`。`None` 兜底只覆盖"从没有过 policy",不覆盖"有过但过期了"。
+     要触发需要 `gc_debt_high` **下降**,只有 `--policy-fast-mode`(1 MiB)会这样,即
+     manager 重启/换主且该 flag 两代之间不同 —— dev/chaos 才有,生产没有。结构性修法是
+     manager 在心跳回包里下发标准策略,而不是 PS 从派发里"捡"一个。加 basis TTL = 对
+     造不出来的状态做加固,按规则 16 不做。
+  5. 绝对 floor 是个**每-extent** 的数,却取自**分区总量**阈值:默认下(gc_debt_high
+     1 GiB / extent 16 GiB)一个 extent 只要 6.25% 是死的就合格,最坏每回收 1 GiB 要
+     搬 15 GiB 活数据(×MAX_GC_ONCE=3,受 128 MiB/s 准入限流)。安全但不便宜 —— 不带
+     knob 的 `gc PART` 以前基本是空操作,现在可能是几 GiB 的重写。已写进 docs/ops.md。
+
+  6. 两处设计文档仍把"刷新 fingerprint"写成 schema 改动的一部分,而那套机制早就删了:
+     `docs/autumn_integrity_plan.md:220`、`docs/ec_cow_conversion_design.md:263`。
+     与本轮无关(是别的 feature 的设计文档),本次不动,免得改动面继续扩大 —— 但它们
+     和本轮修掉的 ops.md / 记忆文件 / cap_token.rs 是**同一类**:文档承诺一道
+     已经不存在的安全网。谁下次碰那两个 feature 顺手改掉。
+
+Next steps: 真集群复验第 1 条;第 3 条要么接线要么删掉那个 flag;第 4 条若要做就走心跳下发。
+
 Date: 2026-09-11 (5)
 TaskStatus: completed
 Task scope: dashboard 五项改造（用户 2026-09-11 提的 5 点）。其中第 2 点
@@ -254,12 +324,27 @@ Next steps:
     仍然差一点,且门是严格 `>` ⇒ **那 3.12 GiB 至今收不掉**。上一轮只让 advisory 闭嘴
     (collectable_debt 套同一比例),噪声停了,**回收没发生**,而验收要的是"被选中并回收"。
   - `collectable_debt` 必须与选取用**同一条**谓词,否则两端又各说各话 —— 那正是本 bug 本身。
-  - **refs 不需要动 wire**:`authoritative_sealed_length` 已经对每个候选做一次
+  - **refs 不需要动 wire**:`authoritative_sealed` 已经对每个候选做一次
     `get_extent_info`,返回的 `MgrExtentInfo` 上就有 `refs`。让它返回 `(sealed_length, refs)`
     即可,零额外 RPC。(用户 2026-09-11 提:refs>1 的适当提高被 GC 概率,好让 extent 变成独占。
     建议做成**确定性的更低门槛**而非概率;并记一个反例:兄弟分区若长期不 GC,本侧先重写
     只是先付成本、refs 仍停在 1。)
   - 用户已同意为绝对字节阈值**抬一次 wire**(39→40),让 X 与 `gc_debt_high` 同源。
+
+【二.1 GC 门槛(本轮实现)】
+  - 症状复核:上一轮只把 advisory 弄安静了(collectable_debt 套同一比例)，**回收从没发生** ——
+    manager 传 stream_debt=gc_debt_high 让门槛减半到 0.2，而目标 extent 是 0.195，且门是严格 `>`。
+  - 改法:①绝对字节或条件,`X` 走 wire(39→40,`MaintenanceReq.gc_dead_bytes_high`),
+    由 manager 从 `gc_debt_high` 送,两端同源;②**抽出 `gc_selects` 一个纯函数**,
+    选取循环与 `collectable_debt` 共用 —— 两端各写一遍正是本 bug,共用后不可再分叉;
+    ③用户提议的 refs>1 减半(确定性,非概率;refs 搭现有 get_extent_info,零额外 RPC);
+    ④`--empty-only` 只打空洞(当时加的抑制分支第四轮证明是空操作,已删);⑤`autumn-op gc --dead-bytes`。
+  - 测量:11 条单测全绿(含线上真实两组数字);**消融两条各自变红**;
+    workspace check 0 错;rpc 62 / manager 367 / partition-server 233 / autumn-op 31;
+    三个 GC 相关集成测试全过;面板两测 + 真集群 api_contract 全过;`--dead-bytes` 已在 usage 里。
+  - **未验**:真集群上"回收确实发生、gc_debt 随之下降"没跑过 —— 账本条目因此不关。
+  - 验收后半(共享 extent 债务 dedup)**不实现**:条目自己的订正说明 dedup 会让 refs 归不了零;
+    改为呈现层(extent 视图显示 refs 与共享分区),未做。
 
 Date: 2026-09-11 (4)
 TaskStatus: not_completed

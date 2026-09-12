@@ -2300,6 +2300,10 @@ pub struct OpSubmitReq {
     pub gc_ratio: Option<f64>,
     pub gc_max_size: Option<u64>,
     pub gc_stream_debt: Option<u64>,
+    /// Per-extent ABSOLUTE dead-byte floor, forwarded to the PS. Lets an
+    /// operator say "collect a 3 GiB pile even though it is only 19% of its
+    /// extent", which no ratio this cluster runs would ever select.
+    pub gc_dead_bytes_high: Option<u64>,
     pub gc_empty_only: bool,
     /// rebalance move cap; `0` = manager default.
     pub max_moves: u32,

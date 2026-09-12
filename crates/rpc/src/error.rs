@@ -24,10 +24,10 @@ pub enum StatusCode {
     /// (which is a read-miss on an existing keyspace) so the client can treat it
     /// as TERMINAL on the write path — refreshing routing can't create the
     /// namespace, same class as `PermissionDenied`. Appended (discriminant 8) so
-    /// all prior codes stay wire-stable. NOTE: `error.rs` is intentionally NOT in
-    /// the WIRE fingerprint (build.rs hashes only manager_rpc/partition_rpc/frame/
-    /// extent_rpc/cap_token), so this addition keeps fp `76e8ba557f7fca2d`;
-    /// same-commit stop-world deploy makes the new value safe.
+    /// all prior codes stay wire-stable, and a same-commit stop-world deploy
+    /// makes the new value safe. (There is no wire FINGERPRINT registry any
+    /// more: `WIRE_VERSION_MIN`/`MAX` are bumped BY HAND and nothing verifies
+    /// that you did.)
     NamespaceUnknown = 8,
 }
 

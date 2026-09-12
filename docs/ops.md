@@ -1239,9 +1239,13 @@ manager keys the node by it:
 
 The full design (including the k8s topology and the phased milestones) is in
 [`en_dynamic_shard_design.md`](en_dynamic_shard_design.md). **Deploy note:** the
-`node_uuid` field is in-struct on the persisted `MgrNodeInfo` — a same-commit
-stop-world upgrade that requires an **etcd reset** (`cluster.sh reset`); there is
-no rolling upgrade across this change.
+`node_uuid` field is in-struct on the persisted `MgrNodeInfo`, so this is a
+same-commit stop-world upgrade: stop every role, swap binaries, start. There is
+no rolling upgrade and no rollback across it. **M0 shipped NO migration for
+pre-`node_uuid` rows** — a manager replaying them fails the rkyv decode and
+refuses to lead (fail-loud, never mis-read). Production etcd is never wiped, so
+a cluster predating M0 needs a one-shot migration written before it can upgrade;
+a dev cluster rebuilds from empty instead.
 
 ### Resharding an extent node — changing its shard count
 
@@ -1894,6 +1898,34 @@ $AO merge SURVIVOR_PART_ID VICTIM_PART_ID # add --force to cross a declared pres
 $AO rebalance [MAX_MOVES]                 # re-spread partitions across PS
 $AO compact PART_ID
 $AO gc --ratio 0.4 PART_ID                # NB: gc flags come BEFORE the partition id
+$AO gc --dead-bytes 1GiB PART_ID          # absolute floor: take an extent holding >=1 GiB dead
+#   whatever its ratio. A 16 GiB log extent with 3 GiB dead is ratio 0.195 — under
+#   the 0.4 gate and under the 0.2 it becomes with stream-debt relief — so ratio
+#   alone never reclaims it while `gc_debt` keeps the advisory firing. The
+#   controller now sends this automatically, sourced from the policy's
+#   `gc_debt_high`, so both ends judge on the same number. A shared extent
+#   (`refs > 1`) additionally gets the ratio bar halved: its FILE is only freed at
+#   `refs == 0`, so collecting one side's reference is what lets it become
+#   independently owned — though `refs` is read from a cache the PS does not
+#   invalidate on split or on a sibling's punch, so it can lag.
+#   NOTE: a bare `$AO gc PART` (and the dashboard's GC button) now carry the
+#   cluster's STANDING policy — when the request names no gc knobs at all, the
+#   manager fills the floor in from its own `gc_debt_high`, so "just GC this
+#   partition" collects what the advisory fired on. Naming ANY knob
+#   (--ratio / --dead-bytes / --max-size / --stream-debt / --empty-only) makes
+#   it an OVERRIDE:
+#   it runs exactly as asked, but it deliberately does NOT redefine what that
+#   partition's `gc_debt_bytes` gauge means for every later tick.
+#   COST of that floor: it is a PER-EXTENT number taken from a partition-total
+#   threshold, so at defaults (gc_debt_high 1 GiB, --max-extent-size-bytes
+#   16 GiB) an extent qualifies at 6.25% dead — up to ~15 GiB of live data
+#   relocated per 1 GiB reclaimed, x MAX_GC_ONCE=3 per dispatch, throttled by
+#   the 128 MiB/s GC admission cap. Safe (relocate-then-punch, never a torn
+#   read), but a bare `gc PART` on a healthy partition used to be ~a no-op and
+#   can now be a multi-GiB rewrite. Under --policy-fast-mode the floor is 1 MiB,
+#   so dev/chaos clusters will GC any extent holding >=1 MiB dead.
+#   Check what GC would actually take:
+#     $AO --json info --part PART --detail | grep gc_debt_bytes
 $AO policy-candidates                    # advisory engine output (split/merge/gc/compact/EC)
 
 # Cluster lifecycle (subshells so cwd stays at the repo root for ./cluster.sh)
@@ -2545,11 +2577,16 @@ GetClusterId version handshake, so expect transport-level errors (not the
 "wire-schema mismatch" message) in a mixed deploy. Same-commit deploys are
 unaffected.
 
-Bump discipline lives in `crates/rpc/src/lib.rs` (`WIRE_VERSION_FINGERPRINTS`
-registry): any wire-schema edit fails `cargo test -p autumn-rpc` until you
-record the new fingerprint and consciously decide MIN/MAX. Rolling back a
-binary past a `cluster_version` bump is refused at manager startup
-(fail-closed in replay).
+Bump discipline lives in `crates/rpc/src/lib.rs`, and it is MANUAL. The
+fingerprint registry that used to fail `cargo test -p autumn-rpc` on any
+wire-schema edit is GONE, so nothing detects a forgotten `WIRE_VERSION_MAX`
+bump: two binaries claiming the same version with different layouts will
+handshake happily and then decode each other's bytes as garbage. Edit any rkyv
+wire struct ⇒ bump MIN and MAX yourself (they move together — stop-the-world
+upgrades). Bump exactly ONCE per commit: `autumn-op upgrade-version` steps
+`cur + 1`, so skipping a number forces operators to run it twice for nothing.
+Rolling back a binary past a `cluster_version` bump is refused at manager
+startup (fail-closed in replay).
 
 ## Direct read on EC extents
 
@@ -3190,8 +3227,11 @@ running and the roll cannot wait, it is safe — just expect the affected extent
 to start over and the roll to be followed by several minutes of repair.
 
 Update order is EN first, then manager: the EN carries the recovery logic and a
-mixed pair handshakes fine as long as the WIRE fingerprint is unchanged (a
-fingerprint bump is a stop-the-world roll instead — see the wire lockstep note).
+mixed pair handshakes fine as long as both binaries were built from commits
+carrying the SAME `WIRE_VERSION_MIN`/`MAX` (a version bump is a stop-the-world
+roll instead — see the wire lockstep note). Check with
+`grep WIRE_VERSION crates/rpc/src/lib.rs` on both commits; nothing computes a
+fingerprint to check it for you.
 `podManagementPolicy: Parallel` on the EN set affects scaling only; updates
 still go one pod at a time, highest ordinal first.
 

@@ -65,7 +65,9 @@ fn usage() -> ! {
     eprintln!("  merge <SURVIVOR_PARTID> <VICTIM_PARTID>");
     eprintln!("  rebalance [MAX_MOVES]        actively re-spread partitions across PS (0/absent = balance fully)");
     eprintln!("  compact <PARTID>");
-    eprintln!("  gc [--ratio R] [--max-size B] [--stream-debt B] [--empty-only] <PARTID>");
+    eprintln!("  gc [--ratio R] [--max-size B] [--stream-debt B] [--dead-bytes B] [--empty-only] <PARTID>");
+    eprintln!("                               --dead-bytes: an extent with at least this many dead bytes");
+    eprintln!("                               qualifies whatever its ratio (3 GiB in a 16 GiB extent is 0.195)");
     eprintln!("  forcegc <PARTID> <EXTID>...");
     // `register-node` removed; `format` is the single per-EN setup.
     // M1c: format is IDENTITY-ONLY — it no longer takes a
@@ -410,6 +412,7 @@ pub(crate) enum Command {
         ratio: Option<f64>,
         max_size: Option<u64>,
         stream_debt: Option<u64>,
+        dead_bytes: Option<u64>,
         empty_only: bool,
     },
     ForceGc {
@@ -1593,6 +1596,7 @@ pub(crate) fn parse() -> Args {
             let mut ratio: Option<f64> = None;
             let mut max_size: Option<u64> = None;
             let mut stream_debt: Option<u64> = None;
+            let mut dead_bytes: Option<u64> = None;
             let mut empty_only = false;
             let mut part_id: Option<u64> = None;
             // One pass so flags and the PARTID appear in ANY order — the old
@@ -1626,6 +1630,14 @@ pub(crate) fn parse() -> Args {
                         }));
                         i += 1;
                     }
+                    "--dead-bytes" => {
+                        i += 1;
+                        dead_bytes = Some(parse_byte_size(val(&raw, i)).unwrap_or_else(|e| {
+                            eprintln!("--dead-bytes: {e}");
+                            std::process::exit(1);
+                        }));
+                        i += 1;
+                    }
                     "--empty-only" => {
                         empty_only = true;
                         i += 1;
@@ -1648,7 +1660,7 @@ pub(crate) fn parse() -> Args {
                 eprintln!("gc requires <PARTID>");
                 std::process::exit(1);
             };
-            Command::Gc { part_id, ratio, max_size, stream_debt, empty_only }
+            Command::Gc { part_id, ratio, max_size, stream_debt, dead_bytes, empty_only }
         }
         "forcegc" => {
             if i >= raw.len() {

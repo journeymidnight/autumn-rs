@@ -345,7 +345,9 @@ NEVER auto-released** — releasing it races the original EN dispatch and can re
 different parity assignment than the bytes that physically landed (silent EC
 corruption); operator inspects EN state and clears manually.
 
-Deploying onto pre-ledger etcd state is unsupported (`cluster.sh reset`).
+Deploying onto pre-ledger etcd state is unsupported — those keys never existed,
+so there is nothing to migrate from. That is a dev-cluster situation and NOT
+licence to wipe a real cluster's etcd; see the upgrade-safety note below.
 
 ## Recovery
 
@@ -962,7 +964,7 @@ persisted):**
 | `MERGE_QPS_LOW` | 1500 | summed cold QPS (5% of split-high) |
 | `MERGE_BW_LOW` | 17.5 MiB/s | summed cold byte rate (10× hysteresis vs `SPLIT_BW_HIGH`) |
 | `MERGE_COOLDOWN_SEC` | 21600 (6 h) | |
-| `GC_DEBT_HIGH` | 1 GiB | GC advisory |
+| `GC_DEBT_HIGH` | 1 GiB | GC advisory — AND the per-extent absolute floor selection uses. Both manager paths build their `MaintenanceReq` through `maintenance_req_for_submitted_op`, which fills `gc_dead_bytes_high` (and `gc_stream_debt`) from this value for an AUTO_GC request that names no knobs — so the advisory and the selection judge on the same number. FORCE_GC carries the spec verbatim and the PS Force arm reads neither field. Before that they did not: the advisory fired on absolute dead bytes and selection asked for a ratio, and GC answered "no eligible extents" every cooldown. |
 | `COMPACT_PENDING_HIGH` | 4 GiB | major-compact advisory |
 | `MINOR_COMPACT_PENDING_HIGH` | 512 MiB | minor-compact advisory |
 | `GC/COMPACT_COOLDOWN_SEC` | 300 | ; `MINOR_COMPACT_COOLDOWN_SEC` 120 |
@@ -1006,6 +1008,25 @@ Headless control: `MSG_AUTOPOLICY_GET/SET` + `autumn-op auto-policy
 status|activate <name> [--arm]|deactivate`. Manual per-target actions go through
 the async op-ledger below (`autumn-op split/gc/compact/merge/force-ec-convert/
 rebalance`), leader-routed — the same underlying ops the controller uses.
+
+**A submitted GC that names no knobs gets the cluster's standing policy.**
+`maintenance_req_for_submitted_op` (pure, unit-tested) decides: if the
+`OpSubmitReq` sets none of `gc_ratio`/`gc_max_size`/`gc_stream_debt`/
+`gc_dead_bytes_high`/`gc_empty_only`, the manager fills `gc_stream_debt` and
+`gc_dead_bytes_high` from its own `gc_debt_high` and marks the request
+`gc_policy_is_standing`. Naming ANY knob makes it an OVERRIDE: it runs exactly
+as asked and the flag stays false.
+
+That flag is the ONLY thing allowed to redefine the PS's `gc_debt_bytes` gauge
+(see the partition-server guide's GC section), and it is explicit because
+inference does not work: nothing about the params separates the controller from
+an operator — `autumn-op gc --ratio 0.9 --dead-bytes 100G PART` carries a
+perfectly real floor, and treating "has a floor" as "is policy" let one
+operator command silence that partition's advisory until the partition
+reopened. The fill matters for the same reason in the other direction: the
+dashboard renders a GC button beside a GC advisory, and before this a
+knob-less dispatch carried no floor, so pressing it ran a GC that could not
+collect the bytes the advisory had just fired on.
 
 ## Async op-ledger (`op_ledger.rs`)
 

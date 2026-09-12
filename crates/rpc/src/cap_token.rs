@@ -11,10 +11,10 @@
 //! canonical signing bytes, and the domain-separation prefix, so the signer
 //! (manager) and the verifier (PS) can never drift.
 //!
-//! **This file participates in the wire fingerprint** (`build.rs` hashes it):
-//! the token layout is wire schema, so any change to `CapClaims` bumps
-//! a conscious `WIRE_VERSION_MAX` bump — exactly
-//! like `manager_rpc.rs` / `partition_rpc.rs`.
+//! **The token layout is wire schema**, so any change to `CapClaims` needs a
+//! by-hand `WIRE_VERSION_MIN`/`MAX` bump — exactly like `manager_rpc.rs` /
+//! `partition_rpc.rs`, and with the same absence of a safety net: nothing
+//! computes a fingerprint any more, so a forgotten bump is undetected.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or

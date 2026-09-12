@@ -1046,20 +1046,27 @@ pub(crate) async fn background_maintenance_loop(
                 // The open tail's dead bytes were counted above (as WAL debt),
                 // so the two gauges stay disjoint (no double-count).
                 //
-                // This is the CONSERVATIVE value — every dead byte, collectable
-                // or not. The Auto arm below narrows it to what the ratio gate
-                // would actually let GC rewrite, once it has resolved the extent
-                // sizes it needs for selection anyway. This store stands for the
-                // paths that never reach that arm.
+                // Answer with the standing policy, exactly like the other two
+                // stores. This one runs on EVERY dispatch and the Force path
+                // never narrows it afterwards, so a raw sum here was a THIRD
+                // writer answering a different question than the advisory asks
+                // — the precise shape of the bug this basis exists to close.
+                // Before any standing policy has arrived it degrades to the raw
+                // sum: over-reporting can ask for work that will not qualify,
+                // but it cannot hide work that does.
                 valid_discard(&mut tick_discards, sealed_extents);
-                let gc_debt: u64 = tick_discards.values().map(|v| (*v).max(0) as u64).sum();
+                let gc_debt = {
+                    let p = part.borrow();
+                    let basis = p.gc_debt_basis.borrow();
+                    gc_debt_from_basis(&tick_discards, basis.as_ref())
+                };
                 metrics
                     .gc_debt_bytes
                     .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
 
                 // (extent_id, authoritative sealed_length) — validated ONCE at selection
                 // so the execution loop never re-reads (possibly stale) state before the
-                // destructive punch. See `authoritative_sealed_length`.
+                // destructive punch. See `authoritative_sealed`.
                 let mut holes: Vec<(u64, u64)> = match gc_task {
                     GcTask::Force { ref extent_ids, .. } => {
                         let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
@@ -1080,9 +1087,12 @@ pub(crate) async fn background_maintenance_loop(
                             // state: re-validate authoritatively. A skip (None) means the
                             // seal isn't authoritatively observable yet; the operator can
                             // re-issue once it is.
-                            if let Some(sealed_length) =
-                                authoritative_sealed_length(&part_sc, e).await
+                            if let Some((sealed_length, _refs)) =
+                                authoritative_sealed(&part_sc, e).await
                             {
+                                // Force GC is an explicit operator instruction:
+                                // it names the extents, so no ratio/refs gate
+                                // applies — only the seal must be authoritative.
                                 hs.push((e, sealed_length));
                             } else {
                                 skipped += 1;
@@ -1150,7 +1160,13 @@ pub(crate) async fn background_maintenance_loop(
                         // to re-derive `gc_debt_bytes` as bytes policy would
                         // COME FOR, not merely bytes that are dead — these are
                         // the same fetches selection needs, so it costs nothing.
-                        let mut resolved_len: HashMap<u64, u64> = HashMap::new();
+                        let mut resolved: HashMap<u64, (u64, u64)> = HashMap::new();
+                        // No `empty_only` special-case here: that mode already
+                        // `continue`s before the predicate, and it is barred
+                        // from defining the gauge's policy at the one place
+                        // that decides it (`defines_policy`, below). A second
+                        // guard here changed nothing observable.
+                        let dead_bytes_high = params.dead_bytes_high;
                         for eid in candidates {
                             if nonempty_selected >= MAX_GC_ONCE
                                 && empty_selected >= MAX_GC_EMPTY_ONCE
@@ -1158,15 +1174,15 @@ pub(crate) async fn background_maintenance_loop(
                                 break;
                             }
                             // Authoritative (never stale) sealed state — see
-                            // `authoritative_sealed_length`. `None` ⇒ unsealed/open or
+                            // `authoritative_sealed`. `None` ⇒ unsealed/open or
                             // fetch failed ⇒ NEVER GC (open extents look like
                             // `sealed_length==0` but are not empty).
-                            let sealed_length =
-                                match authoritative_sealed_length(&part_sc, eid).await {
-                                    Some(l) => l,
+                            let (sealed_length, refs) =
+                                match authoritative_sealed(&part_sc, eid).await {
+                                    Some(v) => v,
                                     None => continue,
                                 };
-                            resolved_len.insert(eid, sealed_length);
+                            resolved.insert(eid, (sealed_length, refs));
                             if sealed_length == 0 {
                                 // a CONFIRMED sealed-empty extent — no committed
                                 // data to rewrite, just punch. `run_gc` with
@@ -1197,8 +1213,13 @@ pub(crate) async fn background_maintenance_loop(
                             if discard_bytes <= 0 {
                                 continue;
                             }
-                            let ratio = discard_bytes as f64 / sealed_length as f64;
-                            if ratio > effective_ratio {
+                            if gc_selects(
+                                discard_bytes.max(0) as u64,
+                                sealed_length,
+                                refs,
+                                effective_ratio,
+                                dead_bytes_high,
+                            ) {
                                 holes.push((eid, sealed_length));
                                 nonempty_selected += 1;
                             }
@@ -1217,8 +1238,43 @@ pub(crate) async fn background_maintenance_loop(
                         // budget stopped the scan, so their collectability is
                         // unknown and under-reporting would silence an advisory
                         // for work that does exist.
-                        let collectable =
-                            collectable_debt(&discards, &resolved_len, effective_ratio);
+                        // Publish the basis so the IDLE refresh tick can answer
+                        // with the same predicate instead of the raw sum. That
+                        // tick re-arms every 5-7 s and overwrites this store, so
+                        // without it the advisory reads "every dead byte" almost
+                        // all of the time and the fire-and-refuse loop survives
+                        // for garbage spread thinly across extents. Reusing what
+                        // selection already resolved costs no extra RPC.
+                        //
+                        // EVERY writer of the gauge reads the SAME basis —
+                        // dispatch-top, this store, and the idle tick — so a
+                        // dispatch that carries
+                        // no floor can no longer answer a different question
+                        // than the one the advisory asks (`next_gc_debt_basis`).
+                        let policy = GcDebtPolicy {
+                            ratio_base: params.ratio.unwrap_or(GC_DISCARD_RATIO),
+                            stream_debt: params.stream_debt,
+                            floor: dead_bytes_high,
+                        };
+                        // Only the MANAGER may say "these params are the
+                        // standing policy"; an operator's one-off override
+                        // runs exactly as asked but never redefines what the
+                        // gauge means. `empty_only` can never be it — that
+                        // mode judges nothing but empties.
+                        let defines_policy =
+                            params.policy_is_standing && !params.empty_only;
+                        let collectable = {
+                            let p = part.borrow();
+                            let mut slot = p.gc_debt_basis.borrow_mut();
+                            let next = next_gc_debt_basis(
+                                slot.as_ref(),
+                                resolved,
+                                policy,
+                                defines_policy,
+                            );
+                            *slot = next;
+                            gc_debt_from_basis(&discards, slot.as_ref())
+                        };
                         metrics
                             .gc_debt_bytes
                             .store(collectable, std::sync::atomic::Ordering::Relaxed);
@@ -1335,7 +1391,7 @@ pub(crate) async fn background_maintenance_loop(
                 // fix MED-4: gc_inflight already latched at top of loop;
                 // hold through the punch and clear at the bottom.
                 // `sealed_length` was validated AUTHORITATIVELY at selection
-                // (`authoritative_sealed_length`) and carried here — do NOT re-read it
+                // (`authoritative_sealed`) and carried here — do NOT re-read it
                 // from the (possibly stale) extent_info cache, or the check/use split
                 // re-opens the seed=583 stale-cache punch on a sealed extent.
                 let n_holes = holes.len();
@@ -1424,7 +1480,14 @@ pub(crate) async fn background_maintenance_loop(
                     let gc_debt: u64 = if extent_ids.len() >= 2 {
                         let sealed = &extent_ids[..extent_ids.len() - 1];
                         valid_discard(&mut discards, sealed);
-                        discards.values().map(|v| (*v).max(0) as u64).sum()
+                        // Answer with the SAME predicate selection uses, from the
+                        // basis the last selection pass resolved. Before the first
+                        // dispatch there is none, and this degrades to the raw sum
+                        // — over-reporting, which is the safe direction: it can
+                        // only ask for work, never silence work that exists.
+                        let p = part.borrow();
+                        let basis = p.gc_debt_basis.borrow();
+                        gc_debt_from_basis(&discards, basis.as_ref())
                     } else {
                         0
                     };
@@ -2733,6 +2796,160 @@ pub(crate) fn get_discards(readers: &[Arc<SstReader>]) -> HashMap<u64, i64> {
     out
 }
 
+/// The debt gauge's value for one refresh, given whatever the last selection
+/// pass resolved.
+///
+/// With a basis, this is `collectable_debt` — the same predicate selection
+/// judges by. Without one (no dispatch yet this process), it falls back to the
+/// raw sum of every dead byte, which OVER-reports: the safe direction, since it
+/// can only ask for work that may not qualify, never silence work that does.
+///
+/// It exists as its own function because the idle refresh tick re-arms every
+/// 5-7 s and overwrites whatever selection stored, so this is what the advisory
+/// actually reads almost all the time.
+pub(crate) fn gc_debt_from_basis(
+    discards: &HashMap<u64, i64>,
+    basis: Option<&GcDebtBasis>,
+) -> u64 {
+    match basis {
+        Some((resolved, policy)) => {
+            // Re-derive the stream-debt relaxation HERE rather than storing a
+            // pre-halved ratio: whether the stream is over its debt high-water
+            // is a FACT about live dead bytes, and freezing one dispatch's
+            // answer to it makes the gauge go on reporting a relaxation that
+            // has since turned off (or miss one that has since turned on).
+            let stream_dead: u64 = discards.values().map(|v| (*v).max(0) as u64).sum();
+            let ratio = if policy.stream_debt.is_some_and(|hw| stream_dead >= hw) {
+                policy.ratio_base * 0.5
+            } else {
+                policy.ratio_base
+            };
+            collectable_debt(discards, resolved, ratio, policy.floor)
+        }
+        None => discards.values().map(|v| (*v).max(0) as u64).sum(),
+    }
+}
+
+/// The QUESTION the debt gauge asks — never one dispatch's ANSWER to it.
+///
+/// `stream_debt` is kept here instead of a pre-halved ratio on purpose: the
+/// halving is a fact about how much is dead RIGHT NOW, so it is re-derived on
+/// every read (`gc_debt_from_basis`). Storing the halved value froze a live
+/// fact into standing policy.
+#[derive(Clone, Debug)]
+pub(crate) struct GcDebtPolicy {
+    /// the un-halved per-extent ratio gate (`GC_DISCARD_RATIO` unless the
+    /// dispatch overrode it).
+    pub ratio_base: f64,
+    /// stream-level dead-byte high-water that halves `ratio_base`.
+    pub stream_debt: Option<u64>,
+    /// per-extent absolute dead-byte floor; shares its source with the
+    /// advisory's `gc_debt_high` so both ends ask the same question.
+    pub floor: Option<u64>,
+}
+
+/// What the debt gauge answers from: the extent FACTS a selection pass
+/// resolved (`extent_id -> (sealed_length, refs)`) plus the POLICY to judge
+/// them by.
+pub(crate) type GcDebtBasis = (HashMap<u64, (u64, u64)>, GcDebtPolicy);
+
+/// Fold a finished selection pass into the gauge's basis.
+///
+/// The two halves have different lifetimes and that distinction is the whole
+/// point. `resolved` is a fact about the world — an extent's sealed length is
+/// immutable and its refs are what they are — so every pass adopts what it
+/// just learned. The policy is the QUESTION the gauge asks, and only a pass
+/// the manager marked `gc_policy_is_standing` may set it.
+///
+/// That signal has to be EXPLICIT, because nothing about the params
+/// distinguishes the controller from an operator: a bare `autumn-op gc PART`
+/// names no knobs, while `--ratio 0.9 --dead-bytes 100G` carries a perfectly
+/// real floor. Two earlier rules were both forgeable — publish
+/// unconditionally, then publish whenever a floor was present — and each let
+/// one manual command permanently redefine the gauge: the idle tick re-answers
+/// from this basis every 5-7 s, so the 3 GiB pile inside a 16 GiB extent
+/// scored 0 forever, the advisory went quiet, the manager never sent the floor
+/// again, and the bytes were stranded until the partition reopened. That is
+/// the SILENT direction of the very loop this basis exists to close, and it is
+/// worse than the raw sum it replaced, which at least corrected itself within
+/// seconds.
+///
+/// With no standing policy ever received the basis stays `None` and the gauge
+/// degrades to the raw dead-byte sum — over-reporting, which can only ask for
+/// work that may not exist, never hide work that does. An override arriving
+/// before any standing pass therefore DISCARDS the facts it resolved rather
+/// than inventing a policy to pair them with; the cost is one tick of raw sum,
+/// which is the direction that cannot hide anything.
+pub(crate) fn next_gc_debt_basis(
+    prev: Option<&GcDebtBasis>,
+    resolved: HashMap<u64, (u64, u64)>,
+    policy: GcDebtPolicy,
+    defines_policy: bool,
+) -> Option<GcDebtBasis> {
+    if defines_policy {
+        return Some((resolved, policy));
+    }
+    prev.map(|(_, p)| (resolved, p.clone()))
+}
+
+/// Does GC come for this extent?
+///
+/// ONE definition, called by BOTH the selection loop and `collectable_debt`,
+/// which is the gauge the advisory fires on. They are the same question — "will
+/// GC reclaim these bytes" — and when they were two separate expressions they
+/// disagreed: the advisory fired on absolute dead bytes while selection asked
+/// for a ratio those bytes could never reach, so the policy asked every cooldown
+/// and GC answered "no eligible extents to reclaim" every time.
+///
+/// EVERY writer of `gc_debt_bytes` goes through it — the dispatch-top store,
+/// the selection pass, and the idle refresh tick — the last two via the basis
+/// selection publishes (the `store(0)` early exits aside, which mean "no sealed
+/// prefix, no debt"). The idle tick re-arms every 5-7 s and overwrites, so
+/// leaving ANY of them on a raw sum kept the loop alive for garbage spread
+/// thinly across extents: agreement has to hold at all three, not just at the
+/// one selection happens to write last.
+///
+/// `dead_bytes_high: Some(0)` is treated as no floor rather than "everything
+/// qualifies": a zero threshold would select every extent with a single dead
+/// byte, which is not a thing any caller means.
+///
+/// Three ways to qualify, for three different reasons:
+/// - **RATIO** — enough of the extent is dead that rewriting the remainder pays
+///   for itself. The original rule.
+/// - **ABSOLUTE** — a large enough pile is worth reclaiming even as a small
+///   fraction. 3 GiB dead inside a 16 GiB extent is 0.195, under every ratio
+///   gate ever configured here, and it is still 3 GiB. `dead_bytes_high` shares
+///   its source with the advisory's `gc_debt_high`, so the two ends cannot ask
+///   for different things.
+/// - **SHARED** — `refs > 1` means more than one stream holds this extent, and
+///   the FILE is freed only at `refs == 0`. Progress on it is worth more than
+///   the same bytes in a private extent, because it is what lets the extent
+///   become independently owned and eventually deleted, so the ratio bar is
+///   halved. DETERMINISTIC, not probabilistic: an operator must be able to
+///   answer "why was this not collected", and a coin flip has no answer.
+///   Note the limit — halving only helps if the sibling also collects its own
+///   reference; if it never runs, this side has paid a rewrite and `refs` stays
+///   at 1. It is a weighting, not a promise.
+///
+/// `sealed_length == 0` is NOT handled here: a sealed-empty extent is punched,
+/// never rewritten, and both callers treat it separately.
+pub(crate) fn gc_selects(
+    dead: u64,
+    sealed_length: u64,
+    refs: u64,
+    ratio_gate: f64,
+    dead_bytes_high: Option<u64>,
+) -> bool {
+    if dead == 0 || sealed_length == 0 {
+        return false;
+    }
+    if dead_bytes_high.is_some_and(|x| x > 0 && dead >= x) {
+        return true;
+    }
+    let gate = if refs > 1 { ratio_gate * 0.5 } else { ratio_gate };
+    (dead as f64 / sealed_length as f64) > gate
+}
+
 /// Dead bytes GC would actually come for, given the ratio gate it selects by.
 ///
 /// `gc_debt_bytes` is what the auto-policy fires on, and its own doc calls it
@@ -2742,21 +2959,22 @@ pub(crate) fn get_discards(readers: &[Arc<SstReader>]) -> HashMap<u64, i64> {
 /// every cooldown and GC answered "no eligible extents to reclaim" every time.
 /// The garbage was real; the promise to collect it was not.
 ///
-/// `resolved_len` holds only the extents this pass looked up. One the scan
+/// `resolved` holds only the extents this pass looked up, as `(sealed_length, refs)`. One the scan
 /// never reached keeps its raw dead bytes: its collectability is unknown, and
 /// guessing zero would silence an advisory for work that does exist.
 pub(crate) fn collectable_debt(
     discards: &HashMap<u64, i64>,
-    resolved_len: &HashMap<u64, u64>,
+    resolved: &HashMap<u64, (u64, u64)>,
     effective_ratio: f64,
+    dead_bytes_high: Option<u64>,
 ) -> u64 {
     discards
         .iter()
         .map(|(eid, dead)| {
             let dead = (*dead).max(0) as u64;
-            match resolved_len.get(eid) {
-                Some(&len) if len > 0 => {
-                    if dead as f64 / len as f64 > effective_ratio {
+            match resolved.get(eid) {
+                Some(&(len, refs)) if len > 0 => {
+                    if gc_selects(dead, len, refs, effective_ratio, dead_bytes_high) {
                         dead
                     } else {
                         0
@@ -3092,7 +3310,7 @@ fn bump_discards_for_dropped_entry(discards: &mut HashMap<u64, i64>, op: u8, raw
 /// `run_gc` / `punch_holes` (Auto candidate selection AND Force GC) goes through
 /// this, carrying the validated `(eid, sealed_length)` to execution — so there is
 /// no check/use split where a re-read could resurrect the stale value.
-async fn authoritative_sealed_length(part_sc: &StreamClient, eid: u64) -> Option<u64> {
+async fn authoritative_sealed(part_sc: &StreamClient, eid: u64) -> Option<(u64, u64)> {
     let info = match part_sc.get_extent_info(eid).await {
         Ok(i) => i,
         Err(e) => {
@@ -3105,7 +3323,14 @@ async fn authoritative_sealed_length(part_sc: &StreamClient, eid: u64) -> Option
     if !info.sealed {
         return None;
     }
-    Some(info.sealed_length)
+    // `refs` rides along on the info this already fetched, at zero additional
+    // RPCs — but ONLY the seal is authoritative here. `extent_info_cache` is
+    // not invalidated by a split or by a sibling's punch, so `refs` can be a
+    // first-observation snapshot: stale-low on a split parent, stale-high on a
+    // child whose sibling already collected. That is tolerable because refs
+    // only WEIGHTS a heuristic (it halves a ratio bar); it never gates
+    // correctness, and it must never be used as if it were live.
+    Some((info.sealed_length, info.refs))
 }
 
 pub(crate) async fn run_gc(
@@ -4930,26 +5155,257 @@ mod compaction_truncate_tests {
 }
 
 #[cfg(test)]
-mod collectable_debt_tests {
-    use super::collectable_debt;
+mod gc_selection_tests {
+    use super::{
+        collectable_debt, gc_debt_from_basis, gc_selects, next_gc_debt_basis, GcDebtPolicy,
+    };
     use std::collections::HashMap;
 
-    /// The live case this was written for: extent 190 on the cluster held
-    /// 3.12 GiB dead inside 16 GiB — ratio 0.195, under both the 0.4 gate and
-    /// the 0.2 it becomes when stream-debt relief halves it. GC will not
-    /// rewrite 12.9 GiB of live data to reclaim that, so the debt gauge must
-    /// not report it as reclaimable and set the advisory asking every cooldown.
+    /// What the manager actuates from its own config: the cluster's standing
+    /// GC policy.
+    fn standing() -> GcDebtPolicy {
+        GcDebtPolicy { ratio_base: 0.4, stream_debt: Some(GIB), floor: Some(GIB) }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// Extent 190 as measured on the cluster: 3.12 GiB dead inside 16 GiB.
+    const DEAD_190: u64 = 3_351_453_696;
+    const LEN_190: u64 = 17_184_065_911;
+
+    /// The acceptance case. Ratio 0.195 — under the 0.4 gate AND under the 0.2
+    /// it becomes when stream-debt relief halves it — so no ratio this cluster
+    /// runs would ever select it, and those 3.12 GiB were never reclaimed while
+    /// the advisory kept asking. A pile that size is worth collecting whatever
+    /// fraction it happens to be.
+    ///
+    /// ABLATION: drop the absolute arm from `gc_selects` and the last assert
+    /// goes red.
+    #[test]
+    fn three_gib_dead_in_a_sixteen_gib_extent_is_selected_by_the_absolute_floor() {
+        assert!(!gc_selects(DEAD_190, LEN_190, 1, 0.4, None), "ratio alone never takes it");
+        assert!(!gc_selects(DEAD_190, LEN_190, 1, 0.2, None), "nor at the halved gate");
+        assert!(gc_selects(DEAD_190, LEN_190, 1, 0.4, Some(GIB)), "3.12 GiB clears a 1 GiB floor");
+    }
+
+    /// …and the floor is a floor, not a free pass. The other extent on that
+    /// partition held 0.43 GiB in 15.25 GiB: still not worth rewriting 14.8 GiB
+    /// of live data for.
+    #[test]
+    fn a_small_pile_stays_unselected_under_the_same_floor() {
+        assert!(!gc_selects(461_373_440, 16_374_562_816, 1, 0.4, Some(GIB)));
+    }
+
+    /// A shared extent gets a lower bar. The FILE is freed only at `refs == 0`,
+    /// so collecting this side's reference is what lets the extent become
+    /// independently owned and eventually deleted — worth more than the same
+    /// bytes sitting in a private extent.
+    #[test]
+    fn a_shared_extent_clears_a_bar_a_private_one_does_not() {
+        assert!(!gc_selects(300, 1000, 1, 0.4, None), "private: 0.3 is under 0.4");
+        assert!(gc_selects(300, 1000, 2, 0.4, None), "shared: 0.3 is over the halved 0.2");
+    }
+
+    /// `empty_only` makes the gate infinite so nothing qualifies on ratio.
+    /// The predicate never sees such a candidate anyway — the loop `continue`s
+    /// on `empty_only` before reaching it — so this pins the predicate's own
+    /// behaviour, not a caller-side guard. (There used to be one suppressing
+    /// the absolute floor too; it was inert and is gone.)
+    #[test]
+    fn an_infinite_gate_admits_nothing_on_ratio() {
+        assert!(!gc_selects(999, 1000, 2, f64::INFINITY, None));
+    }
+
+    /// A dispatch that names no knobs may refresh what it resolved, but it
+    /// must not leave the gauge answering a different question than the
+    /// advisory asks.
+    ///
+    /// ABLATION: let a `defines_policy = false` pass replace the policy and
+    /// the second assert goes red.
+    #[test]
+    fn a_floorless_dispatch_refreshes_the_facts_but_never_retracts_the_floor() {
+        // Extent 190 as measured: ratio 0.195, under every gate this cluster
+        // runs, so ONLY the absolute floor ever selects it.
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+
+        // The manager's auto pass carries the standing policy.
+        let auto = next_gc_debt_basis(None, resolved.clone(), standing(), true);
+        assert_eq!(gc_debt_from_basis(&discards, auto.as_ref()), DEAD_190);
+
+        // `autumn-op gc PART` carries none, and neither does the dashboard's
+        // GC button. Such a pass may refresh what it resolved; it may not
+        // leave the gauge answering a different question than the advisory
+        // asks.
+        let bare = GcDebtPolicy { ratio_base: 0.4, stream_debt: None, floor: None };
+        let manual = next_gc_debt_basis(auto.as_ref(), resolved, bare, false);
+        assert_eq!(
+            gc_debt_from_basis(&discards, manual.as_ref()),
+            DEAD_190,
+            "a floor-less dispatch retracted the floor: the advisory goes \
+             quiet and the pile is stranded until the partition reopens"
+        );
+    }
+
+    /// An `--empty-only` sweep punches empties and judges nothing else, so it
+    /// must never become the gauge's policy. The call site is what bars it
+    /// (`defines_policy = policy_is_standing && !empty_only`); this pins the
+    /// half the fold owns — that a non-defining pass keeps the standing policy.
+    #[test]
+    fn an_empty_only_sweep_does_not_become_the_gauges_policy() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+        let auto = next_gc_debt_basis(None, resolved.clone(), standing(), true);
+        // The shape selection actually builds for such a dispatch. There is no
+        // caller-side floor suppression, so an
+        // `--empty-only --dead-bytes 100G` sweep carries a REAL floor here —
+        // which is exactly why `defines_policy`, and not the floor's presence,
+        // is what bars it. The unreachable INFINITY gate is PS-local to
+        // selection and never reaches a policy.
+        let sweep_policy =
+            GcDebtPolicy { ratio_base: 0.4, stream_debt: None, floor: Some(100 * GIB) };
+        let sweep = next_gc_debt_basis(auto.as_ref(), resolved, sweep_policy, false);
+        assert_eq!(gc_debt_from_basis(&discards, sweep.as_ref()), DEAD_190);
+    }
+
+    /// An operator override runs exactly as asked, but it must not redefine
+    /// what the gauge MEANS for every later tick. This is why "carries a real
+    /// floor" cannot stand in for "came from the controller":
+    /// `autumn-op gc --ratio 0.9 --dead-bytes 100G PART` carries a perfectly
+    /// real floor, and inferring standing policy from it strands the pile
+    /// silently — exactly the bug, one flag further back.
+    ///
+    /// ABLATION: let a floor-carrying pass define policy and this goes red.
+    #[test]
+    fn an_operator_override_never_becomes_the_standing_policy() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+        let auto = next_gc_debt_basis(None, resolved.clone(), standing(), true);
+
+        let overridden =
+            GcDebtPolicy { ratio_base: 0.9, stream_debt: None, floor: Some(100 * GIB) };
+        let after = next_gc_debt_basis(auto.as_ref(), resolved, overridden, false);
+        assert_eq!(
+            gc_debt_from_basis(&discards, after.as_ref()),
+            DEAD_190,
+            "an override's strict ratio and huge floor became the standing \
+             policy: the gauge reads 0 and the advisory never fires again"
+        );
+    }
+
+    /// The stream-debt halving is a fact about how much is dead RIGHT NOW, so
+    /// the gauge re-derives it on every read. Storing one dispatch's answer
+    /// froze a live fact into standing policy: the gauge went on reporting a
+    /// relaxation that had since turned off, or missed one that had turned on.
+    ///
+    /// ABLATION: use `policy.ratio_base` without re-deriving the halving and
+    /// the first assert goes red.
+    #[test]
+    fn the_stream_debt_halving_is_re_derived_from_live_discards() {
+        const SMALL: u64 = 1024 * 1024 * 1024;
+        // 0.293 of the extent — over the halved 0.2, under the plain 0.4.
+        let dead: u64 = 300 * 1024 * 1024;
+        let resolved: HashMap<u64, (u64, u64)> =
+            (0..4u64).map(|i| (i, (SMALL, 1u64))).collect();
+        let basis = next_gc_debt_basis(None, resolved, standing(), true);
+
+        // 4 x 300 MiB is over the high-water, so the gate halves and every
+        // extent qualifies.
+        let heavy: HashMap<u64, i64> = (0..4u64).map(|i| (i, dead as i64)).collect();
+        assert_eq!(gc_debt_from_basis(&heavy, basis.as_ref()), 4 * dead);
+
+        // The SAME basis once GC has taken most of it: one extent's 300 MiB is
+        // under the high-water, the gate is back to 0.4, and 0.293 no longer
+        // clears it.
+        let light: HashMap<u64, i64> = HashMap::from([(0u64, dead as i64)]);
+        assert_eq!(gc_debt_from_basis(&light, basis.as_ref()), 0);
+    }
+
+    /// Before any standing policy has arrived there is nothing to judge by, so
+    /// the gauge reports every dead byte. An override arriving first discards
+    /// even the facts it resolved rather than inventing a policy to pair them
+    /// with — over-reporting can ask for work that will not qualify, but it
+    /// cannot hide work that does.
+    #[test]
+    fn the_gauge_stays_on_the_raw_sum_until_a_standing_policy_has_ever_arrived() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+        // No pass has ever carried the standing policy, so there is nothing to
+        // judge by: over-report rather than guess a gate.
+        let bare = GcDebtPolicy { ratio_base: 0.4, stream_debt: None, floor: None };
+        let b = next_gc_debt_basis(None, resolved, bare, false);
+        assert!(b.is_none());
+        assert_eq!(gc_debt_from_basis(&discards, b.as_ref()), DEAD_190);
+    }
+
+    /// The idle refresh tick must answer with the same predicate selection uses.
+    /// It re-arms every 5-7 s and overwrites selection's store, so while it
+    /// reported the raw sum the advisory read "every dead byte" almost all the
+    /// time — and for garbage spread thinly across extents, each under both the
+    /// ratio and the floor, the fire-and-refuse loop survived untouched.
+    ///
+    /// ABLATION: make `gc_debt_from_basis` ignore its basis and the first
+    /// assert goes red.
+    #[test]
+    fn the_idle_refresh_answers_with_selections_predicate_not_a_raw_sum() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        // A 0.4 gate with no stream-debt relief and no floor: nothing relaxes,
+        // so 0.195 stays under it.
+        let basis = (
+            HashMap::from([(190u64, (LEN_190, 1u64))]),
+            GcDebtPolicy { ratio_base: 0.4, stream_debt: None, floor: None },
+        );
+        assert_eq!(
+            gc_debt_from_basis(&discards, Some(&basis)),
+            0,
+            "0.195 is under the gate, so GC will not come for it and the gauge must not say so"
+        );
+        // No dispatch yet: fall back to the raw sum. Over-reporting is the safe
+        // direction — it can ask for work that will not qualify, but it cannot
+        // silence work that does.
+        assert_eq!(gc_debt_from_basis(&discards, None), DEAD_190);
+    }
+
+    #[test]
+    fn nothing_qualifies_without_dead_bytes_or_a_sealed_length() {
+        assert!(!gc_selects(0, 1000, 2, 0.0, Some(GIB)));
+        assert!(!gc_selects(500, 0, 2, 0.0, Some(GIB)));
+    }
+
+    /// The whole point of one shared predicate: the debt gauge reports exactly
+    /// what selection would take. When these were two expressions they
+    /// disagreed, and the advisory asked every cooldown for work GC refused.
+    #[test]
+    fn the_debt_gauge_reports_exactly_what_selection_would_take() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+        assert!(!gc_selects(DEAD_190, LEN_190, 1, 0.4, None));
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 0);
+        assert!(gc_selects(DEAD_190, LEN_190, 1, 0.4, Some(GIB)));
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, Some(GIB)), DEAD_190);
+    }
+
+    /// Same agreement on the shared-extent arm.
+    #[test]
+    fn the_debt_gauge_follows_the_shared_extent_relaxation() {
+        let discards = HashMap::from([(1u64, 300i64)]);
+        let private = HashMap::from([(1u64, (1000u64, 1u64))]);
+        let shared = HashMap::from([(1u64, (1000u64, 2u64))]);
+        assert_eq!(collectable_debt(&discards, &private, 0.4, None), 0);
+        assert_eq!(collectable_debt(&discards, &shared, 0.4, None), 300);
+    }
+
+    /// GC will not rewrite 12.9 GiB of live data to reclaim 0.195 of an extent,
+    /// so with no absolute floor the gauge must not report it as reclaimable
+    /// and set the advisory asking every cooldown.
     #[test]
     fn garbage_below_the_ratio_gate_is_not_reported_as_debt() {
-        let dead = 3_351_453_696i64;
-        let len = 17_184_065_911u64;
-        let discards = HashMap::from([(190u64, dead)]);
-        let resolved = HashMap::from([(190u64, len)]);
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
 
-        assert_eq!(collectable_debt(&discards, &resolved, 0.4), 0);
-        assert_eq!(collectable_debt(&discards, &resolved, 0.2), 0, "0.195 < 0.2");
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 0);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.2, None), 0, "0.195 < 0.2");
         // Relax the gate below the extent's own ratio and it counts again.
-        assert_eq!(collectable_debt(&discards, &resolved, 0.1), dead as u64);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.1, None), DEAD_190);
     }
 
     /// An extent the scan never reached keeps its bytes. Reporting zero for it
@@ -4958,17 +5414,17 @@ mod collectable_debt_tests {
     #[test]
     fn an_extent_the_scan_never_reached_still_counts() {
         let discards = HashMap::from([(1u64, 900i64), (2u64, 100i64)]);
-        let resolved = HashMap::from([(1u64, 1000u64)]); // 2 was never looked up
+        let resolved = HashMap::from([(1u64, (1000u64, 1u64))]); // 2 was never looked up
         // 900/1000 = 0.9 > 0.4 counts; 2 is unknown so it counts too.
-        assert_eq!(collectable_debt(&discards, &resolved, 0.4), 1000);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 1000);
     }
 
     /// A sealed-empty extent is punched outright — no rewrite, no ratio.
     #[test]
     fn a_sealed_empty_extent_is_free_to_reclaim() {
         let discards = HashMap::from([(7u64, 42i64)]);
-        let resolved = HashMap::from([(7u64, 0u64)]);
-        assert_eq!(collectable_debt(&discards, &resolved, 0.4), 42);
+        let resolved = HashMap::from([(7u64, (0u64, 1u64))]);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 42);
     }
 
     /// Negative discard entries are noise from concurrent accounting, not
@@ -4976,7 +5432,7 @@ mod collectable_debt_tests {
     #[test]
     fn a_negative_discard_does_not_subtract_from_the_total() {
         let discards = HashMap::from([(1u64, 900i64), (2u64, -500i64)]);
-        let resolved = HashMap::from([(1u64, 1000u64), (2u64, 1000u64)]);
-        assert_eq!(collectable_debt(&discards, &resolved, 0.4), 900);
+        let resolved = HashMap::from([(1u64, (1000u64, 1u64)), (2u64, (1000u64, 1u64))]);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 900);
     }
 }

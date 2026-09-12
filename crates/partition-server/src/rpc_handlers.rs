@@ -2246,7 +2246,9 @@ pub(crate) async fn handle_maintenance(
                 ratio: req.gc_ratio,
                 max_size: req.gc_max_size,
                 stream_debt: req.gc_stream_debt,
+                dead_bytes_high: req.gc_dead_bytes_high,
                 empty_only: req.gc_empty_only,
+                policy_is_standing: req.gc_policy_is_standing,
             };
             p.gc_tx
                 .try_send(GcTask::Auto { params, op_id: req.op_id })

@@ -263,7 +263,7 @@ The token rides as an out-of-band prefix stripped before rkyv decode:
 
 ## Wire-version interval
 
-`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX` (currently **39/39**) declare the interval this
+`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX` (currently **40/40**) declare the interval this
 binary speaks. They are maintained **BY HAND**. `wire_compat_check(remote_min,
 remote_max)` is purely "do the intervals overlap"; a peer reporting `max == 0`
 (empty/pre-R1) is refused. There is no schema fingerprint — hashing the sources byte

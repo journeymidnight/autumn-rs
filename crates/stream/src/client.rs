@@ -3249,7 +3249,7 @@ impl StreamClient {
         // `alloc_new_extent` caches only the NEW tail; pre-this the OLD tail
         // lingered as its pre-seal OPEN snapshot (`sealed=false, sealed_length=0`)
         // and GC's authoritative-sealed gate (background.rs
-        // `authoritative_sealed_length`) SKIPS anything not-sealed — so the rolled
+        // `authoritative_sealed`) SKIPS anything not-sealed — so the rolled
         // extent was never reclaimed until its cache happened to refresh (a read /
         // EC-invalidate / restart): the coco P1 GC-reclamation leak.
         //
@@ -3316,7 +3316,7 @@ impl StreamClient {
     /// - We act only on the manager's AUTHORITATIVE post-seal state: the cache
     ///   entry is invalidated and re-fetched, and we require `sealed == true`
     ///   AND `sealed_length == 0` (the same immutable-`sealed` gate GC's
-    ///   `authoritative_sealed_length` trusts). If the manager's
+    ///   `authoritative_sealed` trusts). If the manager's
     ///   `already_sealed` branch preserved a PRIOR non-zero seal (the extent
     ///   holds acked data), `sealed_length != 0` and we do nothing.
     /// - `sealed_length == 0` under the seal invariants (SealCommit handshake

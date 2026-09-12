@@ -1047,6 +1047,18 @@ pub(crate) struct PartitionData {
     tables: Vec<TableMeta>,
     sst_readers: Vec<Arc<SstReader>>,
     has_overlap: Cell<u32>,
+    /// What the last GC SELECTION pass resolved — `eid -> (sealed_length, refs)`
+    /// plus the standing POLICY to judge them by — so the IDLE refresh tick can compute
+    /// `gc_debt_bytes` with the SAME predicate instead of a raw dead-byte sum.
+    ///
+    /// That tick re-arms every 5-7 s and overwrites selection's store, so
+    /// without this the advisory reads "every dead byte" almost all the time and
+    /// the fire-and-refuse loop survives for garbage spread thinly across
+    /// extents. Reusing what selection already fetched keeps it at zero extra
+    /// RPCs. `None` until the first STANDING dispatch (an operator override
+    /// arriving first leaves it `None`): the tick then falls back to the raw
+    /// sum, which over-reports — the safe direction.
+    pub(crate) gc_debt_basis: RefCell<Option<crate::background::GcDebtBasis>>,
     vp_extent_id: u64,
     vp_offset: u64,
     /// BUG2 (GC replay-floor tightening): the vp_head of
@@ -1856,6 +1868,17 @@ pub(crate) struct GcAutoParams {
     /// reclaimable bytes exceed this, the per-extent ratio is halved
     /// (so 0.4 → 0.2 etc.) for this dispatch. `None` → no relaxation.
     pub stream_debt: Option<u64>,
+    /// Per-extent ABSOLUTE dead-byte floor: an extent with at least this many
+    /// dead bytes qualifies whatever its ratio, because a big enough pile is
+    /// worth reclaiming even as a small fraction. Shares its source with the
+    /// advisory's `gc_debt_high` so both ends ask the same question. `None` →
+    /// ratio only. Ignored under `empty_only`.
+    pub dead_bytes_high: Option<u64>,
+    /// these params ARE the cluster's standing GC policy rather than a one-off
+    /// override, so this pass may (re)define the basis the debt GAUGE is
+    /// judged by. Set only by the manager — see
+    /// `MaintenanceReq.gc_policy_is_standing`.
+    pub policy_is_standing: bool,
     /// If `true`, pick ONLY `sealed_length == 0` non-tail extents.
     /// Cheapest possible GC (no rewrite, just `punch_holes`). Overrides
     /// `ratio` / `max_size` when set.
@@ -3401,9 +3424,9 @@ impl PartitionServer {
         let server = self;
 
         // WIRE-1: startup wire-schema cross-check against the manager. A
-        // successful response with a different fingerprint is a hard
-        // refusal (mixed same-commit deploy — rkyv decodes garbage
-        // silently); a transport failure is best-effort-skipped
+        // successful response whose wire-version interval does not overlap
+        // ours is a hard refusal (mixed same-commit deploy — rkyv decodes
+        // garbage silently); a transport failure is best-effort-skipped
         // (register_ps below retries through manager unavailability).
         if let Ok(resp_bytes) = server
             .pool
@@ -3420,8 +3443,8 @@ impl PartitionServer {
                 .map_err(|e| {
                     anyhow::anyhow!("decode GetClusterIdResp failed ({e}) — possible wire-schema mismatch; rebuild from the cluster's commit")
                 })?;
-            // R1: interval-overlap compat check (same-fingerprint fast
-            // path inside; refusal message carries both intervals).
+            // R1: interval-overlap compat check (refusal message carries
+            // both intervals).
             if let Err(msg) = autumn_rpc::wire_compat_check(
                 resp.wire_version_min,
                 resp.wire_version_max,
@@ -6290,6 +6313,7 @@ async fn partition_thread_main(
         tables,
         sst_readers,
         has_overlap: Cell::new(if detected_overlap { 1 } else { 0 }),
+        gc_debt_basis: RefCell::new(None),
         vp_extent_id: vp_eid,
         vp_offset: vp_off,
         // BUG2: (0,0) = conservative MIN floor until this

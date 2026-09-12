@@ -895,9 +895,9 @@ pub struct RollTailsResp {
 
 /// Maintenance operations.
 ///
-/// **Wire change (backward-incompatible)**: added four optional
-/// fields to carry auto-GC filter parameters (`gc_ratio`,
-/// `gc_max_size`, `gc_stream_debt`, `gc_empty_only`). Old binaries
+/// **Wire change (backward-incompatible)**: carries the auto-GC filter
+/// parameters (`gc_ratio`, `gc_max_size`, `gc_stream_debt`,
+/// `gc_dead_bytes_high`, `gc_empty_only`). Old binaries
 /// that still encode the 3-field shape will fail to decode against
 /// the new struct, and vice versa. Same-commit upgrade required;
 /// cluster.sh handles this by stopping all roles before restart.
@@ -918,10 +918,39 @@ pub struct MaintenanceReq {
     /// total reclaimable bytes exceed this, the per-extent ratio is
     /// halved for this dispatch.
     pub gc_stream_debt: Option<u64>,
+    /// per-extent ABSOLUTE dead-byte floor: an extent holding at least this
+    /// many dead bytes qualifies whatever its ratio. `None` → no absolute path
+    /// (ratio only).
+    ///
+    /// Its source is the advisory's `gc_debt_high`, deliberately: the advisory
+    /// fires on absolute dead bytes, so selection has to be able to answer on
+    /// the same terms. It is NOT `gc_stream_debt` — that is a STREAM-level
+    /// total that relaxes the ratio, a different judgement about a different
+    /// quantity, and folding two judgements into one number is the shape of
+    /// the bug this exists to fix. 3 GiB dead inside a 16 GiB extent is a
+    /// ratio of 0.195, under every gate, and it is still 3 GiB.
+    ///
+    /// `Some(0)` means no floor, not "take everything".
+    pub gc_dead_bytes_high: Option<u64>,
     /// only pick `sealed_length == 0` non-tail extents (cheapest
     /// possible GC — no rewrite, just punch_holes). Overrides
     /// `gc_ratio` / `gc_max_size` when true.
     pub gc_empty_only: bool,
+    /// these params ARE the cluster's standing GC policy, not a one-off
+    /// override — so the PS may adopt them as the basis its debt GAUGE is
+    /// judged by, which is what the advisory reads.
+    ///
+    /// It is an EXPLICIT signal because the alternative does not work: the PS
+    /// cannot tell a controller dispatch from an operator's
+    /// `autumn-op gc --ratio 0.9 --dead-bytes 100G PART` by looking at which
+    /// fields are populated, and guessing wrong strands garbage silently —
+    /// the gauge answers a question nobody asked, the advisory goes quiet, and
+    /// the bytes sit until the partition reopens.
+    ///
+    /// Only the manager sets it: for its own auto-policy actuation, and for a
+    /// submitted op that named no gc knobs at all (which it then fills in from
+    /// cluster config, so "just GC this partition" means the usual GC).
+    pub gc_policy_is_standing: bool,
     /// manager op-ledger correlation id. `0` = untracked (the PS-local
     /// maintenance scheduler and legacy SDK callers): the PS runs the op but
     /// records no terminal `MaintenanceOutcome`. Non-zero = the manager

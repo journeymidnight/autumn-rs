@@ -878,10 +878,13 @@ position ≥ the raised floor. `background::gc_replay_floor_tests`.
 
 Targets the **logStream** where large values (ValuePointers) are stored.
 
-**Trigger**: periodic (30–60s jitter), via `gc_tx` (capacity 1), or via the
-`Maintenance` gRPC RPC. Public methods:
-- `trigger_gc(part_id)` — enqueue `GcTask::Auto(GcAutoParams::default())`
-- `trigger_force_gc(part_id, extent_ids)` — enqueue `GcTask::Force { extent_ids }`
+**Trigger**: the `Maintenance` RPC is the ONLY thing that dispatches a GC —
+`GcTask::Auto` (`rpc_handlers.rs`, sent by the manager's auto-policy, by
+`autumn-op gc`, or by the dashboard button) and `GcTask::Force` (an explicit
+extent list). There are no `trigger_gc` / `trigger_force_gc` methods and no
+PS-local GC scheduler; all three were removed. The periodic 5-7 s tick
+(`random_delay`) dispatches NOTHING — it only refreshes the debt gauges, which
+is exactly why the basis it reads has to agree with selection (below).
 
 **Candidate selection** (Auto arm):
 1. Candidates = all `sealed_extents` (`extent_ids[..len-1]`), sorted by reclaimable
@@ -890,16 +893,93 @@ Targets the **logStream** where large values (ValuePointers) are stored.
    - `sealed_length == 0` → push to holes (empty slot, no rewrite). `run_gc(eid, 0)`
      skips the read loop and goes straight to `flush_gc_batch` (no-op) + `punch_holes`.
    - Else multi-tier filter: skip if `empty_only`; skip if `max_size` set and
-     `sealed_length > max_size`; effective `ratio = max(GC_DISCARD_RATIO,
-     params.ratio)` (halved when stream total discard ≥ `stream_debt` high-water);
-     push if `discard_bytes / sealed_length > effective_ratio`.
+     `sealed_length > max_size`; then `gc_selects(dead, sealed_length, refs,
+     effective_ratio, dead_bytes_high)` decides. `effective_ratio` starts at
+     `params.ratio` (default `GC_DISCARD_RATIO`), halved when the stream's total
+     discard ≥ the `stream_debt` high-water.
+
+     `gc_selects` is the ONE definition of "will GC take this", shared with
+     `collectable_debt` — the gauge the advisory fires on. EVERY writer of
+     `gc_debt_bytes` goes through it: the dispatch-top store (which runs on
+     every dispatch and is all the Force path ever writes), this selection
+     pass, and the idle refresh tick (`Sel::GcTimeout`, re-arms every 5-7 s) —
+     the last two via the basis selection publishes to
+     `PartitionData.gc_debt_basis`, and the `store(0)` early exits aside, which
+     mean "no sealed prefix, no debt". The idle tick overwrites selection's
+     store within seconds, so agreement has to hold at all three or the
+     advisory reads a raw dead-byte sum almost all the time.
+
+     The basis stores the QUESTION the gauge asks, never one dispatch's ANSWER
+     to it: `ratio_base`, the `stream_debt` high-water, and the absolute floor.
+     Whether the stream is over that high-water is a fact about how much is
+     dead RIGHT NOW, so the halving is re-derived on every read; storing a
+     pre-halved ratio froze a live fact into standing policy, and the gauge
+     went on reporting a relaxation that had since turned off. The extent FACTS
+     (sealed length, refs) any pass may refresh. The POLICY only a pass the
+     manager marked `gc_policy_is_standing` may define.
+
+     That signal is EXPLICIT because inference does not work. A dispatch
+     carries whatever knobs its caller passed — `autumn-op gc PART` named none,
+     `--empty-only` asks for empties only (the unreachable `INFINITY` gate is
+     PS-local, derived from that bool), and
+     `--ratio 0.9 --dead-bytes 100G` carries a perfectly real floor — so no
+     shape of the params separates the controller from an operator. Two
+     earlier rules (publish unconditionally; publish whenever a floor is
+     present) each let a one-off command permanently redefine the gauge: the
+     idle tick re-answers from the basis every 5-7 s, so the pile scored 0
+     forever, the advisory went quiet, and the bytes sat until the partition
+     reopened. That is the SILENT direction of the very loop this basis exists
+     to close, and it is worse than the raw sum it replaced — the raw sum at
+     least corrected itself within seconds. `next_gc_debt_basis`.
+
+     KNOWN LIMITATION, deliberately not patched: the stored policy is refreshed
+     only by a standing dispatch, and a standing dispatch is raised only by the
+     advisory, which reads the gauge computed FROM that stored policy. So a
+     policy STRICTER than the manager's current `gc_debt_high` is a fixed point
+     — gauge under-reports, advisory stays quiet, nothing refreshes it — until
+     the partition reopens or someone runs a bare `autumn-op gc PART`. The
+     `None` fallback covers "never had a policy", not "had one that went
+     stale". Reaching it needs `gc_debt_high` to DROP between incarnations,
+     which only `--policy-fast-mode` does (1 MiB), so it takes a manager
+     restart or failover where that flag differs — dev and chaos, not
+     production. The structural fix, if it is ever wanted, is the manager
+     pushing its standing policy on the load-heartbeat reply instead of the PS
+     latching it off a dispatch. A basis TTL would be hardening against a state
+     we cannot produce.
+
+     Agreement holds at the SELECTION predicate only. Two gates run AFTER it and
+     are invisible to the gauge: the replay-floor guard and the per-extent
+     failure cooldown. So "no eligible extents to reclaim" can still coexist
+     with a non-zero gauge — the over-report direction, bounded by the cooldown.
+
+     Selection and the gauge used to be two separate expressions and they
+     disagreed: the advisory fired on absolute
+     dead bytes while selection asked for a ratio those bytes could not reach,
+     so the policy asked every cooldown and GC answered "no eligible extents to
+     reclaim" every time. Three ways to qualify:
+     - RATIO — `dead / sealed_length > effective_ratio`, the original rule.
+     - ABSOLUTE — `dead >= dead_bytes_high`, whatever the fraction. 3 GiB inside
+       a 16 GiB extent is 0.195, under every gate this cluster runs, and it is
+       still 3 GiB. The manager sources it from the advisory's `gc_debt_high`,
+       so both ends ask the same question. `Some(0)` means no floor.
+     - SHARED — `refs > 1` halves the ratio bar. The FILE is freed only at
+       `refs == 0`, so collecting this side's reference is what lets the extent
+       become independently owned. `refs` rides on the `get_extent_info` this
+       step already does, so it costs no extra RPC — but ONLY the seal is
+       authoritative: `extent_info_cache` is not invalidated by a split or by a
+       sibling's punch, so `refs` can be stale-low on a split parent and
+       stale-high on a child whose sibling already collected. It weights a
+       heuristic; it never gates correctness. Deterministic, not
+       probabilistic: an operator must be able to answer "why was this not
+       collected". It is a weighting, not a promise — if the sibling never
+       collects, this side has paid a rewrite and `refs` stays at 1.
 3. Cap at `MAX_GC_ONCE` (3) per dispatch.
 
 INVARIANT (never punch on a stale/open `extent_info`): the destructive
 `sealed_length == 0` fast-punch branch keys on `get_extent_info(eid)`, a CACHED read.
 A now-sealed extent can linger in `extent_info_cache` as its pre-seal OPEN snapshot
 (`sealed=false, sealed_length=0`); trusting that would punch a sealed extent full of
-live ValuePointers as if empty → silent big-value loss. `authoritative_sealed_length`
+live ValuePointers as if empty → silent big-value loss. `authoritative_sealed`
 (used by BOTH Auto and Force, carrying the validated `(eid, sealed_length)` to `run_gc`
 so there is no check/use re-read split): `sealed` is IMMUTABLE once set, so a cached
 `sealed=true` is trustworthy; a candidate that reads NOT sealed is SKIPPED — refusing to
@@ -1019,10 +1099,23 @@ info`.
 
 **Multi-tier params** (`GcTask::Auto(GcAutoParams)`): `ratio: Option<f64>` (default
 0.4), `max_size: Option<u64>`, `stream_debt: Option<u64>` (halve ratio when total
-reclaimable ≥ threshold), `empty_only: bool`. External controllers compose tiers by
-issuing multiple back-to-back dispatches; the PS executes exactly the params each
-dispatch carries. `MaintenanceReq` carries `gc_ratio` / `gc_max_size` /
-`gc_stream_debt` / `gc_empty_only`.
+reclaimable ≥ threshold), `dead_bytes_high: Option<u64>` (absolute per-extent floor —
+never consulted under `empty_only`, which skips every rewrite candidate before the
+predicate), `empty_only: bool`, `policy_is_standing: bool`.
+External controllers compose tiers by issuing multiple back-to-back dispatches; the
+PS executes exactly the params each dispatch carries. `MaintenanceReq` carries
+`gc_ratio` / `gc_max_size` / `gc_stream_debt` / `gc_dead_bytes_high` /
+`gc_empty_only` / `gc_policy_is_standing`.
+
+`policy_is_standing` is the one that is NOT a tier. Every other param shapes what
+THIS dispatch collects; that one says these params ARE the cluster's standing
+policy, so the PS may also judge its debt GAUGE by them. Only the manager sets it —
+for its own auto-policy actuation, and for a submitted op that named no gc knobs at
+all, which it then fills in from cluster config so that "just GC this partition"
+means the usual GC. An operator override runs exactly as asked and changes nothing
+about what the gauge means; inferring the difference from which fields happen to be
+populated does not work, because `autumn-op gc --ratio 0.9 --dead-bytes 100G PART`
+carries a perfectly real floor.
 
 **Cooldown classification** (`classify_gc_failure_cooldown`,
 `gc_failure_cooldown: HashMap<u64, (Instant, Duration)>`): soft window (30 s) when
@@ -1550,7 +1643,7 @@ initial capacity 512 keys. Encoding: `[num_bits:4B LE][num_hashes:4B LE][bits...
 | `MAX_SKIP_LIST` | 256 MB | Maximum skip list size |
 | `MAX_WRITE_BATCH` | 256 | Max requests per group-commit batch |
 | `BLOCK_SIZE_TARGET` | 64 KB | Target SSTable block size |
-| `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC |
+| `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC. Halved when stream discard ≥ `stream_debt`, and again for a shared (`refs > 1`) extent. Bypassed entirely by `dead_bytes_high` (`MaintenanceReq.gc_dead_bytes_high`, `autumn-op gc --dead-bytes`), the absolute floor — a big pile is worth collecting at any fraction. |
 | `OP_VALUE_POINTER` | 0x80 | Op flag bit for ValuePointer entries |
 | `MAX_IMM_DEPTH` | 4 | imm queue cap; merged_loop stalls req intake when reached (RocksDB `max_write_buffer_number`). Env `AUTUMN_PS_MAX_IMM_DEPTH` ([1, 64]). |
 | `MAX_WAL_GAP` | 1 GiB | force-rotate active when `active.log_bytes() + Σ imm.log_bytes()` exceeds this. Measures the un-flushed LOG bytes (value included), NOT `mem_bytes()`. RocksDB `max_total_wal_size`. Env `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
@@ -1715,16 +1808,18 @@ Three fixes bound the restart replay window (worst case per partition =
     carries a maintenance op's failure reason back — without it, a gc/compact error
     dies in a `tracing::error!` invisible to the operator.
 
-    The PS-level `maintenance_scheduler_loop` (5 s, main thread) is the primary trigger
-    source: reads the gauges, computes `urgency = debt / threshold`, sorts desc,
-    dispatches top-K minor compactions / GCs via Send-capable trigger channels in
-    `PartitionHandle`. Skips partitions whose `req_per_sec` (from `req_count` diff)
-    exceeds `AUTUMN_PS_FG_QPS_QUOTA` (default 50K) — foreground always wins. Cooldowns
-    drive from PS-side `last_*_at`. The compact channel's `bool` payload means `is_major`
-    (true: manual `client compact`, expiry; false: scheduler routine, picks via
-    `pickup_tables`). Background loops keep their channel-receive paths but their timeout
-    branches are demoted to short metric-refresh ticks (they no longer fire compact/GC
-    off the timer, except expiry-major which the scheduler doesn't see).
+    There is NO PS-level maintenance scheduler any more — `maintenance_scheduler_loop`
+    was deleted when policy moved out of the PS (`lib.rs`, and the comment left at its
+    former site says so). NOTHING in this crate reads these gauges and dispatches off
+    them. They exist to be REPORTED: `report_load_loop` ships them and the manager's
+    advisory engine decides. What still originates work here is the partition's own
+    maintenance loop — the expiry-triggered major compaction and the defensive auto-trim
+    above `MAX_SST_BEFORE_AUTO_COMPACT` — plus whatever arrives over the `Maintenance`
+    RPC. The compact channel's `bool` payload means `is_major` (true: manual
+    `client compact`, expiry) — the channel carries `CompactTask { is_major, op_id }`,
+    not a bare bool. The GC timeout branch dispatches nothing at all; it is a
+    gauge refresh, which is exactly why the basis it reads has to agree with selection
+    (see the GC section).
 
 13. **Partition merge (manager-orchestrated, TiKV PrepareMerge + PS-side write halt).**
     The merge primitive is a manager-side atomic etcd txn (manager CLAUDE.md note 16);

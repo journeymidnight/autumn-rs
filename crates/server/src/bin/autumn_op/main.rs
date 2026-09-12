@@ -408,7 +408,7 @@ async fn run(args: Args) -> Result<()> {
         Command::Merge { survivor_part_id, victim_part_id, force } => cmd_merge(&client, args.json, args.wait, args.wait_timeout, survivor_part_id, victim_part_id, force).await?,
         Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, args.wait, args.wait_timeout, max_moves).await?,
         Command::Compact { part_id } => cmd_compact(&client, args.json, args.wait, args.wait_timeout, part_id).await?,
-        Command::Gc { part_id, ratio, max_size, stream_debt, empty_only } => cmd_gc(&client, args.json, args.wait, args.wait_timeout, part_id, ratio, max_size, stream_debt, empty_only).await?,
+        Command::Gc { part_id, ratio, max_size, stream_debt, dead_bytes, empty_only } => cmd_gc(&client, args.json, args.wait, args.wait_timeout, part_id, ratio, max_size, stream_debt, dead_bytes, empty_only).await?,
         Command::ForceGc { part_id, extent_ids } => cmd_force_gc(&client, args.json, args.wait, args.wait_timeout, part_id, extent_ids).await?,
         Command::RegisterNode => {
             // Already handled by the pre-connect stub above.
@@ -2405,6 +2405,7 @@ async fn cmd_gc(
     ratio: Option<f64>,
     max_size: Option<u64>,
     stream_debt: Option<u64>,
+    dead_bytes: Option<u64>,
     empty_only: bool,
 ) -> Result<()> {
     submit_op_cli(
@@ -2418,6 +2419,7 @@ async fn cmd_gc(
             gc_ratio: ratio,
             gc_max_size: max_size,
             gc_stream_debt: stream_debt,
+            gc_dead_bytes_high: dead_bytes,
             gc_empty_only: empty_only,
             requested_by: "cli".to_string(),
             ..Default::default()
@@ -2955,7 +2957,7 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
         // Node STATE is joined in client-side from `MSG_LIST_NODE_STATES`
         // rather than read off `NodeOverview`, which carries only
         // {node_id, address, extent_count}. Widening that struct is a wire
-        // layout change (fingerprint bump, MIN=MAX, stop-the-world) and this
+        // layout change (a by-hand MIN=MAX bump, stop-the-world) and this
         // is a display fix; one extra RPC from a CLI costs nothing.
         //
         // Showing the override is not cosmetic. During a fence-drain the
