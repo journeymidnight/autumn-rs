@@ -389,7 +389,9 @@ async fn periodic_sync(state: &mut FsState) {
     }
     tracing::debug!(count = dirty.len(), "periodic sync: flushing dirty inodes");
     for ino in &dirty {
-        if let Err(e) = write::flush_inode(state, *ino).await {
+        // Best-effort: this only logs. Consuming the sticky record here would
+        // let the application's next fsync answer success over a hole.
+        if let Err(e) = write::flush_inode(state, *ino, write::FlushReport::BestEffort).await {
             tracing::warn!(ino, error = %e, "periodic sync: flush failed");
         }
     }

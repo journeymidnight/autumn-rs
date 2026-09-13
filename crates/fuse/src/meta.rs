@@ -184,14 +184,16 @@ pub async fn get_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
 }
 
 /// Re-read inode metadata from KV, BYPASSING the cache, and refresh the cached
-/// copy if it moved.
+/// copy ONLY when KV is LARGER.
 ///
 /// The cache is pinned across opens by the kernel's dentry refcount, so a meta
 /// captured once — mid-upload, say — survives every reopen until the kernel
 /// FORGETs the dentry. That is how a mount comes to believe a 5 GB file is
 /// 64 MiB and serves clean EOF against it for twenty minutes. Callers use this
 /// where believing a stale size CORRUPTS the answer rather than merely dating
-/// it. Returns the fresh meta and whether it differed.
+/// it. Returns the fresh meta and whether the cache was refreshed — which is
+/// only ever the grew-in-KV direction; see the comment on the check itself for
+/// why the other direction must be refused.
 pub async fn get_inode_uncached(state: &mut FsState, ino: u64) -> Result<(InodeMeta, bool)> {
     let k = key::inode_key(ino);
     let value = state.kv_get(&k).await?;
@@ -199,7 +201,40 @@ pub async fn get_inode_uncached(state: &mut FsState, ino: u64) -> Result<(InodeM
         .map_err(|e| anyhow!("decode InodeMeta for ino {}: {}", ino, e))?;
     let mut changed = false;
     if let Some(is) = state.inodes.get_mut(&ino) {
-        if is.meta.size != fresh.size {
+        // ONLY adopt a LARGER size, and report only that as `changed`.
+        //
+        // This helper exists to catch a cache that is stale-SMALL — the shape
+        // that makes `read` clamp a live file to a premature EOF — so that is
+        // the one direction it may correct.
+        //
+        // The other direction is NOT "never stale": another mount truncating
+        // the file leaves this cache genuinely, wrongly large. The asymmetry is
+        // in the CONSEQUENCES, not in the evidence. A cache larger than KV is
+        // also the ordinary state of a file being written through this mount,
+        // because extents land long before the size covering them is published
+        // (fsync / release) — so the two cases are indistinguishable here, and
+        // the tie must break toward the one that cannot destroy anything.
+        // Refusing a shrink costs a stale `getattr` until the lease-version
+        // reload or FORGET, and cannot change what any read answers: the only
+        // caller is the EOF confirm, which already established
+        // `offset >= size`, so the clamp returns empty either way. Adopting a
+        // shrink, by contrast, does this:
+        //
+        // Adopting the smaller KV size there does not just date this read, it
+        // destroys data. The next write sees `cur_size < offset`, calls
+        // `clean_beyond_eof`, and DELETES every extent this inode has already
+        // landed; with no further write, `flush_inode` publishes the shrunken
+        // size and the file closes at 0. Gating on `is.dirty` would not be
+        // enough either — a size can be unpublished while the inode is
+        // momentarily clean — so the guard is the direction itself.
+        //
+        // Scope, so this is not read as more than it is: it closes the SHRINK
+        // direction only. The grow arm below still adopts `fresh` wholesale
+        // onto a possibly-dirty inode, so if two mounts could ever grow the
+        // same inode concurrently, this would publish the other's meta as
+        // ours. Exclusive per-inode write leases are what make that
+        // unreachable — not this check.
+        if fresh.size > is.meta.size {
             changed = true;
             is.meta = fresh.clone();
             // The striped extent map is COMPUTED from size, so a stale size

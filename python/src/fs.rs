@@ -474,9 +474,13 @@ impl Fs {
             if lease_revoked(st, ino) {
                 Err(format!("write lease for ino {ino} was revoked"))
             } else {
-                autumn_fuse::write::flush_inode(st, ino)
-                    .await
-                    .map_err(|e| e.to_string())
+                autumn_fuse::write::flush_inode(
+                    st,
+                    ino,
+                    autumn_fuse::write::FlushReport::ToApplication,
+                )
+                .await
+                .map_err(|e| e.to_string())
             }
         })
     }

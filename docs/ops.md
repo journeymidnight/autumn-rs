@@ -596,7 +596,31 @@ coherent (fresh-read + `forget`-on-release). Behavior-preservation gate for the
 `dispatch` Create/Unlink/init_root refactor + the M4 `lease_tasks` extraction
 (the binding shares those core steps): the fuse e2e suite must stay green —
 `cargo test -p autumn-manager --test system_fuse_read --test fuse_lease_1
---test fuse_lease_2 -- --ignored --test-threads=1`.
+--test fuse_lease_2 --test system_fuse_eof_clobber
+--test system_fuse_flush_error_sticky --test system_fuse_release_best_effort
+-- --ignored --test-threads=1`.
+
+Build the server binaries FIRST — `cargo build -p autumn-server --bins`. Two of
+these tests spawn `target/debug/autumn-ps` as a child process, and `crates/manager`
+does not depend on `autumn-server`, so `cargo test -p autumn-manager` will not
+build it: a clean checkout panics at `spawn autumn-ps`, and a dirty one silently
+runs against whatever stale binary is lying there.
+
+The last three drive `FsState` directly rather than a kernel mount, and each is
+red without its fix: `system_fuse_eof_clobber` asserts a read AT EOF leaves an
+unpublished size intact (the cache is legitimately LARGER than KV mid-write) —
+its SECOND half, that a stale-SMALL cache is still corrected, is a preservation
+guard rather than a reproduction — and the pre-fix run never reaches it at all,
+aborting at the earlier assertion, so "green either way" is a claim about what
+it guards, not a measurement;
+`system_fuse_flush_error_sticky` holds three tests, one per way the sticky
+write-back error used to be consumed by a caller that could not retire it — a
+logging-only flush, the read-after-write barrier, and the write path's own gap
+flush and truncate (the rule: only FUSE_FLUSH, FSYNC and the PyO3 flush retire
+one, because those are Linux's retirement points); and
+`system_fuse_release_best_effort` pins the case that is easiest to get wrong —
+a NON-revoked RELEASE answers the kernel with EIO yet still may not consume the
+record, because fuser drops a release error before it reaches `close()`.
 
 ## Cluster capacity — `autumn-op df`
 

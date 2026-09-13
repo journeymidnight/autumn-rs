@@ -64,11 +64,14 @@ const FLUSH_LOG_EVERY: u64 = 16;
 /// leave NOTHING in flight belongs to `drain_pending`, not here.
 ///
 /// A failed flush is recorded on the inode as well as returned, because the
-/// caller is often the dispatcher's blanket drain, which only logs. The report
-/// the application actually sees comes from `flush_inode` (fsync, release,
-/// truncate, periodic sync), which consumes that record BEFORE it would persist
-/// a size covering bytes that never landed. It cannot surface at the `write()`
-/// that started it — that call returned before the puts ran.
+/// caller is often the dispatcher's blanket drain, which only logs. The record
+/// is RETIRED at exactly the three places a writeback error is retired on
+/// Linux — FUSE_FLUSH (which the kernel sends on every `close()`), FSYNC, and
+/// the PyO3 binding's explicit flush — and they consume it BEFORE persisting a
+/// size that would cover bytes which never landed. Every other caller passes
+/// `BestEffort`; see [`FlushReport`] for why "this caller returns an error to
+/// somebody" is NOT the test. It cannot surface at the `write()` that started
+/// it either — that call returned before the puts ran.
 async fn settle_oldest(state: &mut FsState, ino: u64) -> Option<Result<()>> {
     let pending = state
         .inodes
@@ -155,6 +158,80 @@ pub async fn drain_pending(state: &mut FsState, ino: u64) -> Result<()> {
         Some(e) => Err(e),
         None => Ok(()),
     }
+}
+
+/// Whether the caller of [`flush_inode`] will hand a failure to the
+/// application, and therefore whether it may CONSUME the sticky record.
+///
+/// `flush_error` is errseq_t-shaped: one report per failure. That only works
+/// if the report reaches someone who acts on it, and three callers cannot
+/// make it reach anyone. `periodic_sync` and `Destroy` take a failure and only
+/// `tracing::warn!` it. RELEASE is the one that reads like it reports and does
+/// not: it may answer the kernel with an error, but fuser's contract is that
+/// "error values are not returned to close() or munmap() which triggered the
+/// release", so the kernel drops it — which is why EVERY release passes
+/// `BestEffort`, not just a revoked one. If any of the three consumes the
+/// record, the application's next fsync finds nothing pending, persists a size
+/// covering the missing bytes, and answers SUCCESS over a hole. That is
+/// precisely what the record exists to prevent.
+///
+/// THE PRICE, stated here because it is easy to meet and hard to diagnose:
+/// while a record stands, `flush_inode` returns from the check before it does
+/// anything — before `write_region`, before `put_inode`, before
+/// `dirty_inodes.remove`. So until a retiring caller clears it, the inode stays
+/// dirty, `periodic_sync` re-fails and re-warns every 30 s, the buffered tail
+/// is not written even after the cluster recovers, AND every operation that
+/// routes through `flush_inode` keeps failing: each read overlapping the dirty
+/// buffer, each non-contiguous write, and each truncate — which includes every
+/// `open(O_TRUNC)`, because no `ATOMIC_O_TRUNC` is negotiated so the kernel
+/// turns it into SETATTR(size=0). So the obvious recovery gesture, reopen the
+/// file and rewrite it, is blocked on exactly the inode that is stuck. That is
+/// the most likely way anyone meets this. Pre-change the first of those calls
+/// consumed the record and the second succeeded — which is precisely the
+/// silent-hole path.
+///
+/// It is retired by the next FLUSH or FSYNC, and NEITHER IS GUARANTEED: the
+/// kernel sends FUSE_FLUSH on `close()` in practice, but fuser explicitly
+/// disclaims it ("shouldn't assume that flush will always be called ... or that
+/// it will be called at all"), which is the same sentence that denies RELEASE
+/// the right to consume. Do not write that the price is bounded by the fd's
+/// life — leaning on that guarantee here while refusing it there is exactly the
+/// inconsistency this classification exists to avoid. An application that never
+/// closes and never fsyncs keeps the inode stuck for the life of the mount.
+/// That is the deliberate trade — a stuck, loud inode instead of a silent hole.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlushReport {
+    /// Retire the record here. Exactly three callers qualify, and they are
+    /// Linux's writeback-error retirement points: FUSE_FLUSH (which the kernel
+    /// sends on every `close()`), FSYNC, and the PyO3 binding's explicit
+    /// flush. errseq_t semantics — one report per failure.
+    ///
+    /// One of the three is inert today, and saying so costs nothing: a record
+    /// can only be SET by `settle_oldest`, which only runs on
+    /// `pending_flushes`, which are only pushed when `FsState::pipelined_writes`
+    /// is on — and that is the fuse MOUNT alone. So the PyO3 binding (and
+    /// `autumnfs`, and `autumn-s3`) can never hold a standing record, and its
+    /// `ToApplication` never has anything to consume. It is classified for when
+    /// that changes, not because it fires now. The useful corollary: a
+    /// front-end with no FUSE_FLUSH cannot wedge on this, because it cannot
+    /// reach the state.
+    ToApplication,
+    /// MUST NOT consume. "Does this caller return an error to somebody" is NOT
+    /// the test, and reaching for it is how three separate sites got this
+    /// wrong. Either nobody is told at all (`periodic_sync` and `Destroy` only
+    /// log; a RELEASE reply is discarded by the kernel before it reaches
+    /// `close()`), or somebody IS told at a point that does not retire a
+    /// writeback error: the read-after-write barrier, a buffered `write()`
+    /// whose gap flush fails, and `ftruncate`. Linux retires only at
+    /// fsync/close/msync, because an application that hits EIO on a read or a
+    /// write, retries it successfully, and then closes must STILL have that
+    /// close fail.
+    BestEffort,
+}
+
+/// Read this inode's recorded flush failure WITHOUT consuming it.
+fn peek_flush_error(state: &FsState, ino: u64) -> Option<String> {
+    state.inodes.get(&ino).and_then(|is| is.flush_error.clone())
 }
 
 /// Take this inode's recorded flush failure, if any. Reporting CONSUMES it —
@@ -285,7 +362,14 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
         // map, and waiting on the in-flight flush at every 1 MiB write is
         // exactly the serialization the pipelining exists to remove (measured:
         // it put the whole gain back, 242 vs the 244 it started from).
-        flush_inode(state, ino).await?;
+        //
+        // BestEffort: this `?` does hand the caller EIO, but a buffered
+        // `write()` is not where a writeback error retires — same argument as
+        // the read-after-write barrier. Consuming here would let the app retry
+        // the write (the buffer is untouched, since `flush_inode` returns
+        // before extracting it), succeed, and then have `close()` find nothing
+        // pending and publish a size over the hole.
+        flush_inode(state, ino, FlushReport::BestEffort).await?;
     }
 
     // Ensure write buffer exists
@@ -458,7 +542,10 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
 }
 
 /// Flush all buffered writes for an inode.
-pub async fn flush_inode(state: &mut FsState, ino: u64) -> Result<()> {
+///
+/// `report` says whether this caller hands a failure to the application, and
+/// so whether it may consume the sticky `flush_error` — see [`FlushReport`].
+pub async fn flush_inode(state: &mut FsState, ino: u64, report: FlushReport) -> Result<()> {
     // Drain first: this publishes the inode's size and reads the extent map,
     // and the crash-consistency rule is that extent puts ACK before a size
     // that covers them is persisted.
@@ -467,7 +554,11 @@ pub async fn flush_inode(state: &mut FsState, ino: u64) -> Result<()> {
     // dispatcher's drain already consumed, and do it BEFORE persisting a size
     // that would cover the bytes that never landed. This is the whole point of
     // `flush_error`: fsync must not answer success over a hole.
-    if let Some(msg) = take_flush_error(state, ino) {
+    let earlier = match report {
+        FlushReport::ToApplication => take_flush_error(state, ino),
+        FlushReport::BestEffort => peek_flush_error(state, ino),
+    };
+    if let Some(msg) = earlier {
         return Err(anyhow::anyhow!("earlier write flush failed: {msg}"));
     }
     drained?;
@@ -557,7 +648,12 @@ pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()
             "fuse truncate of a striped file (ino {ino}) is not supported yet; use autumnfs"
         ));
     }
-    flush_inode(state, ino).await?;
+    // BestEffort: `ftruncate` is not one of Linux's writeback-error retirement
+    // points either, and this one is the most tempting to get wrong because
+    // truncate is about to rewrite the size anyway — but it returns before it
+    // does, so consuming here loses the record and leaves the later `close()`
+    // to answer success over the hole.
+    flush_inode(state, ino, FlushReport::BestEffort).await?;
 
     // Extract old_size and inline info
     let (old_size, has_inline) = {

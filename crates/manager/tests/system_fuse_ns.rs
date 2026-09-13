@@ -108,7 +108,9 @@ fn cold_remount_reads_back_written_extents() {
                 .expect("put_inode");
             let n = write::write(&mut state, ino, 0, &data).await.expect("write");
             assert_eq!(n as usize, total, "write full length");
-            write::flush_inode(&mut state, ino).await.expect("flush");
+            write::flush_inode(&mut state, ino, write::FlushReport::ToApplication)
+                .await
+                .expect("flush");
             // state dropped here → all in-memory extent caches gone.
         }
 

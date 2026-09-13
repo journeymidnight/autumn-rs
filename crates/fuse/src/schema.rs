@@ -361,11 +361,23 @@ pub struct InodeState {
     /// A failed flush, held until someone reports it.
     ///
     /// The failure cannot be delivered to the `write` that started it — that
-    /// call returned before the puts ran — so it is kept here until a path that
-    /// MUST see it consumes it (`write::flush_inode`, i.e. fsync / release /
-    /// truncate / the periodic sync). Without this the dispatcher's drain,
-    /// which runs ahead of the fsync handler and only logs, would consume the
-    /// error first and fsync would then acknowledge success over a hole.
+    /// call returned before the puts ran — so it is kept here until one of
+    /// Linux's writeback-error RETIREMENT points consumes it: a
+    /// `write::flush_inode` marked `FlushReport::ToApplication`, which is
+    /// exactly FUSE_FLUSH (sent on every `close()`), FSYNC, and the PyO3
+    /// binding's explicit flush. Without this the dispatcher's drain, which
+    /// runs ahead of the fsync handler and only logs, would consume the error
+    /// first and fsync would then acknowledge success over a hole.
+    ///
+    /// EVERY other caller passes `BestEffort` and leaves it standing — and the
+    /// test is NOT "does this caller return an error to somebody". `RELEASE`
+    /// replies with an error the kernel drops (fuser: "error values are not
+    /// returned to close() or munmap() which triggered the release");
+    /// `periodic_sync` and `Destroy` only log; and the read-after-write
+    /// barrier, the write path's own gap flush, and `truncate` all DO hand
+    /// their caller an EIO, but none of them is a point at which a writeback
+    /// error retires. Each of those three was classified wrong at some point in
+    /// this file's history for exactly that reason.
     pub flush_error: Option<String>,
     pub dirty: bool,
     pub open_count: u32,

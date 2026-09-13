@@ -125,6 +125,7 @@ dependencies = [
  "crc32c",
  "ed25519-dalek",
  "futures",
+ "rancor",
  "rkyv",
  "thiserror",
  "tracing",

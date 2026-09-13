@@ -687,8 +687,20 @@
   不在本条预先选定。
 - **Acceptance**: 上述 e2e 在修前红、修后绿;且"缓存偏小"那个原始场景(`01e0ad7` 的目标)
   仍然被覆盖。
-- **Status**: `passes: false` (2026-09-13) — 仅立账，未复现未修。
-- `passes: false`
+- **Status**: `passes: true` (2026-09-13) — 已复现、已修、已回归。
+  **手段与当初写的不同，记下来**:本条 Acceptance 原文写的是 shell e2e(起集群+挂载+dd)，
+  实际做成了 in-process 集成测试 `crates/manager/tests/system_fuse_eof_clobber.rs` ——
+  clobber 发生在 daemon 自己的缓存里、在 FUSE 边界之下，**根本不需要内核挂载**，所以它能
+  进 CI 常驻，比原计划的一次性脚本强。(我先照原文写了一个 shell 版 repro 脚本，在手搓集群上
+  连栽 wire 版本/format/--advertise/--cpuset/pgrep 五个坑，才想起去找 `system_fuse_*` 这套
+  现成的 in-process 脚手架 —— **那个脚本已废弃删除，不在树里**,别照这段去找它。)
+  实证:pre-fix 红在 `:128`("the EOF probe clobbered the unpublished size")，post-fix 绿。
+  验收第二半("缓存偏小仍被纠正")做成同一测试里的回归护栏，它**前后都绿** —— 那是护栏不是
+  复现，如实标注。
+  修法:`get_inode_uncached` 的 `!=` 收窄成 `fresh.size > is.meta.size`(只接受"文件其实更大"
+  这一个方向)，`read.rs` 的局部 rebind 一并收进 `changed` 分支。没拿 `is.dirty` 当闸门 ——
+  size 可能在 inode 短暂 clean 时仍未发布，方向本身才是判据。
+- `passes: true`
 
 ### BUG-FUSE-FLUSH-ERROR-EATEN-BY-LOGGERS — 粘性回写错误被只打日志的路径吃掉，fsync 随后对着洞报成功
 - **Trigger** (2026-09-13，同上评审;**既有缺陷**，来自 `2949372`): `flush_error` 的设计是
@@ -701,5 +713,39 @@
 - **Scope**: 让只打日志的消费者不要消费(改成 peek 而非 take)，或让它们负责上报。
   多槽不改变暴露面(单槽时同样)。
 - **Acceptance**: 一次失败的 flush 之后，periodic_sync 先跑一轮，应用的 fsync 仍然报错。
-- **Status**: `passes: false` (2026-09-13) — 仅立账，未修。
-- `passes: false`
+- **Status**: `passes: true` (2026-09-13) — 已修、已回归，但**验收口径被替换过，必须说明**。
+  原文验收是"一次失败的 flush 之后，periodic_sync 先跑一轮，应用的 fsync 仍然报错"。
+  实测那条**在 PS 保持死亡的前提下不具鉴别力**:那时 pre-fix 的那次 fsync 也会红 —— 只是红
+  在它自己的 put 失败上。两边都红，测了等于没测。**这个限定是必须说明的**:它不是说原文验收
+  写错了，而是说我这次只在"PS 一直死着"这一种造法下试过，而那种造法恰好把两边都染红。
+  所以断言换成**修复真正改变的那个性质**:粘性记录在"只打日志"的调用者之后是否存活
+  (`crates/manager/tests/system_fuse_flush_error_sticky.rs`)，外加对称的另一半(会上报的
+  调用者确实消费掉它,否则一次失败会永远报下去)。
+  实证:pre-fix 红在 `:107`("a logging-only flush consumed the sticky record")，post-fix 绿。
+  **原文验收的危害级变体是可行的，未做,另立后续项**:把 PS 重启回来再 fsync —— 那时 pre-fix
+  的 fsync 会返回 Ok 并把 size 发布到洞上面(`put_inode` 打的是 inode key,可能落在另一个
+  分区,所以 extent 那边失败不蕴含它也失败),post-fix 则仍然报错。那才是直接钉住"对着洞报
+  成功"的那条。
+  修法:`flush_inode` 加 `FlushReport{ToApplication,BestEffort}`，只有前者 take。
+  ⚠️ **`dispatch.rs` 的 Release 一开始复用 `propagate_flush_err`(= `!revoked`)当判据,那是错的**,
+  评审抓出后改成**恒传 `BestEffort`**:fuser 的契约明说 release 的错误值"不会返回给触发它的
+  close()/munmap()",所以非撤销的 Release 同样谁都没告诉,没资格消费。连带把退化成常量的
+  `flush_report_for` 和它那两条映射单测一并删掉(其中 `normal_release_consumes_because_it_reports`
+  钉的正是这个假前提)。
+  ⚠️ **第三扇门,opus 评审抓出(本条 Scope 原文没点到它)**:`read.rs` 的 read-after-write 屏障
+  同样在消费记录,而"read-after-write barrier"正是我自己写进 `ToApplication` 注释里的。它的
+  `?` 确实把 EIO 交给了调用者,但**读不是回写错误的退休处** —— Linux errseq 只在
+  fsync/close/msync 退休一次。危害链:回读拿 EIO → 记录被吃 → 重试读成功 → close 的 fsync
+  无事待办 → size 发布到洞上面。改成 `BestEffort`;测试
+  `the_read_after_write_barrier_must_not_eat_the_sticky_flush_error`,消融红在 `:226`。
+  连带修:Release 的 `return Err(e)` 跳过 open_count/驱逐/租约释放(fuser 每 open 只发一次
+  release ⇒ 永久漏),改为延迟到块尾返回,消融红在 `:158`。
+  ⚠️ **第四、五扇门(二轮评审抓出)**:写路径自己的 **gap flush**(`write_inner` 的非连续分支)
+  与 **truncate** 同样在消费记录。它们的 `?` 确实把 EIO 交给调用者,但 buffered `write()` 与
+  `ftruncate` 都不是 Linux 的回写错误退休点。至此分类收敛成一条可陈述的规则:
+  **`ToApplication` 只有三处 = FUSE_FLUSH(close)/FSYNC/PyO3 显式 flush**,其余六处全 `BestEffort`;
+  判据是"这里是不是退休点",**不是**"这个调用者会不会把错误交给谁"——后者正是连错五处的原因。
+  消融:gap 红在 `:327`、truncate 红在 `:350`(两者红点不同,证明各自非空洞)。
+  代价如实记:记录存活期间 inode 恒脏、periodic_sync 每 30 s 告警、缓冲尾巴不落盘,直到
+  ToApplication 调用者清掉 —— 故意取舍(响亮卡住 > 静默的洞),写在 `FlushReport` doc 里。
+- `passes: true`

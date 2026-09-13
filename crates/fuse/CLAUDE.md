@@ -230,7 +230,7 @@ struct InodeState {
     meta: InodeMeta,
     write_buf: Option<WriteBuffer>,        // buf 容量 WRITE_BUF_CAP
     pending_flushes: VecDeque<PendingFlush>, // 在飞的 append flush（≤ APPEND_INFLIGHT_DEPTH）
-    flush_error: Option<String>,           // 粘性回写失败，由 flush_inode 消费上报
+    flush_error: Option<String>,           // 粘性回写失败，只由会上报的 flush_inode 消费
     dirty: bool,
     open_count: u32,
     extents: Option<Vec<(u64, u32)>>,      // 运行时 extent map（truncate 置 None）
@@ -245,12 +245,29 @@ Open 已被首 mount 写关的 inode 不会读到陈旧 `meta`）。
 ## 操作路径
 
 ### Read
-1. 脏写缓冲与读范围重叠 → 先 flush（read-after-write 一致性）。
-2. 小文件 `inline_data` → 直接返回。
-3. 加载 extent map（运行时缓存，冷启动 range-scan），条带文件先 `checked()` 校验
+1. 脏写缓冲与读范围重叠 → 先 flush（read-after-write 一致性）。这次 flush 传
+   **`FlushReport::BestEffort`**：它的 `?` 确实把 EIO 交给了调用者，但**读不是回写错误的
+   退休处**。Linux errseq 只在 fsync/close/msync 退休一次回写错误，理由就在这里——应用回读
+   自己刚写的数据、拿到 EIO、重试读成功、然后 close，如果这道屏障把粘性记录吃掉，那次 close
+   的 fsync 就会发现无事待办、把 size 发布到洞上面。读照样失败，区别只在记录是否存活。
+2. **偏移 ≥ 缓存 size 时，先向 KV 确认 EOF 再上报**（`read::prepare` 唯一一条能返回"比请求
+   少"的路径，所以偏小的 size 不是把答案变旧而是把文件**截断**，顺序读者会把空回复当成
+   文件结束、静默停下）。确认后的采纳是**单向的：只接受"其实更大"**。
+   - 判据钉在**这次读要用的 size** 上（`fresh.size > file_size`），不是钉在"缓存是否被采纳"
+     上：采纳只可能发生在 inode 已在 `state.inodes` 里的情况，而 S3 网关与 PyO3 读路径只在
+     **写**时填这张表 ⇒ 若按采纳判，这道确认对所有只读前端就是纯浪费的一次往返，还会把它们
+     原本能捡到的增长丢掉。
+   - 为什么拒绝"变小"这个方向：它**未必**不是陈旧——另一个 mount 截断文件就会留下同样的形状。
+     不对称在**后果**不在证据。变小也正是本 mount 正在写文件的常态（extent 早落地、size 未
+     发布），两者在这里无法区分,所以只能倒向不会毁东西的那边：拒绝变小只让 `getattr` 旧一会儿
+     （直到租约版本重载或 FORGET），**改变不了任何读的答案**（进到这条分支就已经
+     `offset >= size`，钳位照样返回空）；而采纳变小会让下次写看到 `cur_size < offset` →
+     `clean_beyond_eof` → **删掉自己已落地的每一个 extent**。
+3. 小文件 `inline_data` → 直接返回。
+4. 加载 extent map（运行时缓存，冷启动 range-scan），条带文件先 `checked()` 校验
    几何，为每个重叠 extent 生成 `ChunkSpec`（striped → lane key，否则 `[0x03][ino][off]`），
    sub-range = 精确重叠区间，extent 间空洞补零（稀疏语义）。
-4. 一次批量读所有 extent slice，多 extent 并发（compio spawn，spawned `execute`
+5. 一次批量读所有 extent slice，多 extent 并发（compio spawn，spawned `execute`
    不持 `&FsState`）。
 
 **`--direct-read`（默认 ON）**：`read::execute` 用 `get_many_direct` 取代
@@ -403,6 +420,18 @@ mount 打开的原因**：PyO3 的 `autumn.Fs` worker 直接调核心 op，根�
 drain 跑在 fsync handler **之前**且只打日志，会把唯一一份错误消费掉；`flush_inode` 随后看到
 没有 pending，就会持久化一个覆盖了丢失区域的 size —— **fsync 回报成功，文件里留着零洞**。
 现在 `flush_inode` 先取这个粘性错误并返回，才轮到持久化 size。
+
+**但"取"的资格按调用者分**（`flush_inode(state, ino, report)`）：只有能真正告诉应用的调用者
+传 `FlushReport::ToApplication` 才 take，其余传 `BestEffort` 只 peek。**判据不是"这个调用者会不会
+把错误交给谁"，而是"这里是不是 Linux 意义上回写错误的退休点"** —— 只有三处合格：FUSE_FLUSH
+（内核在每次 `close()` 都发）、FSYNC、写路径自己的 gap flush 与 truncate、PyO3 绑定；
+**不上报的是 periodic_sync、Destroy 和 RELEASE**。RELEASE 在这份名单里容易看反：它确实会
+回一个错误，但 fuser 的契约明说"错误值不会返回给触发 release 的 close()/munmap()"——内核把
+它丢掉，所以它和只打日志的那两个等价。`dispatch.rs` 的 `propagate_flush_err`(= `!revoked`)
+只决定**要不要回 EIO**，**不能**拿来决定能不能消费粘性记录（本轮一开始就是这么错的）。
+也别退回到"FLUSH 反正总在 RELEASE 之前"那条假设上——fuser 同一份文档明说
+"filesystems shouldn't assume that flush will always be called ... or that it will be
+called at all"，那正是这份记录存在要堵的洞。
 ⚠️ 这条的可达形状是 **extent key 和 inode key 落在不同分区**（`[0x03][ino][off]` 与
 `[0x01][ino]` 排序相隔很远，split 后必然分开）而 extent 那边不可用；租约撤销**不是**——
 `put_inode` 同样带围栏，两边一起失败。`scripts/fuse_chaos.sh` 的 fsync 守卫杀整个集群，

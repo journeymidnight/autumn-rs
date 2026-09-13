@@ -100,7 +100,9 @@ fn variable_length_extents() {
             .await
             .expect("write");
         assert_eq!(n as usize, total, "write returned full length");
-        write::flush_inode(&mut state, ino).await.expect("flush");
+        write::flush_inode(&mut state, ino, write::FlushReport::ToApplication)
+            .await
+            .expect("flush");
 
         // Layout: exactly 2 extents, keyed at logical offsets 0 and 8 MiB.
         let prefix = key::extent_prefix(ino);

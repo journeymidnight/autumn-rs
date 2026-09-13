@@ -1,3 +1,156 @@
+Date: 2026-09-13 (9)
+TaskStatus: completed
+Task scope: 修评审在 fuse 写路径上追出的两条**既有**缺陷(用户 2026-09-13 指派 "fix HIGH 和
+  MEDIUM 的问题")。两条都不是多槽引入的,是多槽评审顺带追出来的。
+
+【为什么现在是 completed】两处修复都已复现+回归验证,规则 15 的评审跑了**三轮**(见下),
+  意见全部处理完,全量测试绿,已提交。上一轮 GC 工作我提前写过 completed 被评审抓到,
+  这次是等评审过 + 提交之后才改的。
+
+【第四轮评审没派 —— 这是我的判断,记下来便于否决】三轮之后我还改过东西,但**那一轮增量里
+  没有一行功能代码**:`write.rs`/`meta.rs` 的注释、测试的注释与失败消息、账本数字、ops.md、
+  一处纯缩进。而三轮评审自己的结论正是"缺陷在**代价的文档**里,不在代码里",九个站点的分类
+  被它独立枚举后判定正确且完整。对纯文档增量再派一轮是评审散文。若判断有误,补派即可。
+
+【HIGH — EOF 读抹掉未发布的写】根因一句话:`get_inode_uncached` 用 `!=` 表达了一个本该
+  单向的判断。它存在的目的是纠正"缓存偏小"(否则 read 会把活文件截断成过早的 EOF),而
+  "缓存偏大"根本不是陈旧 —— 那是 mount 正在写文件的常态(extent 已落地、size 未发布)。
+  采纳更小的 KV size 之后:下次写看到 `cur_size < offset` → `clean_beyond_eof` → **删掉
+  自己已落地的每一个 extent**;或者没有下次写,`flush_inode` 直接发布被抹小的 size,文件
+  以 0 关闭。修法 = 收窄成 `fresh.size > is.meta.size`,`read.rs` 的 rebind 一并收进
+  `changed` 分支。实证:pre-fix 红 / post-fix 绿。
+
+【MEDIUM — 粘性回写错误被只打日志的路径吃掉】`flush_error` 是 errseq_t 式"一次报告消费
+  一次",但 `flush_inode` 有两类调用者,而它无条件 take。periodic_sync / Destroy /
+  revoked-release 三处只 `tracing::warn!`,一消费,应用下次 fsync 就找不到记录、发布覆盖
+  缺失字节的 size、**对着洞返回成功**。修法 = `FlushReport{ToApplication,BestEffort}`,
+  只有前者 take。
+
+【MEDIUM 的第二刀:我第一版的 Release 分类是错的,评审抓出后推翻重做】
+  第一版让 Release 复用既有的 `propagate_flush_err`(= 非撤销)当"能否消费"的判据,理由是
+  "会回 EIO 的 release 就算报告过了"。**那个理由不成立**:fuser 0.15.1 的 `release()` 文档
+  明写 "error values are not returned to close() or munmap() which triggered the release"
+  —— 内核把这个错误丢掉,非撤销的 release 同样谁都没告诉。我还查到它的 `flush()` 文档另有
+  两句:一句说 flush 存在的理由之一正是"文件系统想返回写错误",另一句说
+  "shouldn't assume that flush will always be called ... or that it will be called at all"
+  —— 后者直接掐死了"反正 FLUSH 总在 RELEASE 之前"这条退路。
+  所以改成 **Release 恒传 `BestEffort`**;`flush_report_for` 退化成常量,连同它那两条映射
+  单测一并删除(其中 `normal_release_consumes_because_it_reports` 钉的正是这个假前提 ——
+  我用测试把一个错误判据**焊死**了,这比没有测试更糟)。
+  现在会消费的只剩真能上报的调用者:FUSE_FLUSH(内核每次 close() 都发)、FSYNC、
+  写路径自己的 gap flush 与 truncate、PyO3 绑定。
+
+【验收口径的两处偏离,不藏着】
+  - HIGH 原文写 shell e2e,实际做成 in-process 集成测试(不需内核挂载、能进 CI,更强)。
+  - MEDIUM 原文那条验收**不具鉴别力**(PS 已杀时两边都红),换成断言粘性记录的存亡。
+  两处都写进了各自台账的 Status。
+
+【这一轮我自己的错误,值得记】同一形状犯了五次:**只锚定要改的那一行,不看它所处的块**。
+  ①插测试漏掉上方原有的 `#[test]` → 新测试注册两遍,套件虚报 56(真值 55),而且我把那个
+  虚数报给了用户;②read.rs 收 rebind 时多留一个 `}`;③把 `flush_report_for` 插在
+  `compute_release_action` 之前,把人家的 doc 焊到了我的新函数上;④枚举 flush_inode 调用点
+  时只扫 crates/fuse/src 与 python/src,整个 crates/manager/tests 没进视野,漏了两处;
+  ⑤purge() 里 `|| true` 挂在内层 kill 上而非 pgrep 上,空结果直接中止整个 driver。
+  ①③⑤ 由 clippy/编译器/脚本自身抓到,②由编译器抓到,④由我为了找测试脚手架而翻目录时撞见。
+  没有一条是我自己看出来的。可操作的纠正:在函数旁插入任何东西之前,先读它所在的整块。
+
+  **续:同一形状又犯了两次,而且第二次差点让我报出假结论。**
+  ⑥ 改 `write.rs` 的 doc 时,`old_string` 是我凭记忆重构的,与文件实际文本对不上 → Edit 直接
+    失败。这次是"没读就写",失败是响亮的,代价只是一轮。
+  ⑦ **危险的那次**:做消融时我用了一个来自**编辑之前**那次读取的行号(dispatch.rs:868)。
+    我在那之后把 `propagate_flush_err` 的 doc 从 5 行扩到 11 行,下方整体下移 6 行,868 变成
+    了一行注释。`sed` 于是打空、文件没被改动,测试照常绿 —— 而"消融无效"与"测试通过"在输出
+    上**长得一模一样**。我差一点就把这个绿当成"pre-fix 也绿 ⇒ 测试不具鉴别力"或反过来当成
+    修复有效的证据。抓到它是因为我顺手打印了"改后该行"并发现它和改前一字不差。
+    可操作的纠正:**消融必须按模式动态定位,并在跑测试前断言文件 md5 确实变了**;md5 没变
+    就中止。重做后 Release 那条测试如期变红(当时是 `:132`;后续编辑把存活断言推到 `:139`)。
+    教训的普遍形式:我原来的规矩只说"改文本前先读",但**行号会被我自己的编辑作废**,
+    而按行号操作失败时是静默的。
+
+【另一条教训】我一度断言"`FsState` 造不出来,所以这两条只能 e2e/不可测"。那对**单测**成立,
+  对**集成测试**不成立 —— `crates/manager/tests/system_fuse_*` 一直有 in-process 起集群
+  + `FsState::new` 的现成脚手架。我为此白写了一个 shell harness 并在里面栽了五个坑。
+  下次先找现成脚手架再动手。
+
+【验证】fuse 单测 **55**(不是 57 —— 那是删掉两条假前提映射测试之前的数;并且这个 55 是
+  跑出来的,又用 `grep -c '#\[test\]'` 交叉核对过,不是算出来的)。
+  三个新集成测试(全部 `#[ignore]`,in-process 驱动 `FsState`,不需内核挂载),**三条消融都是
+  真跑的,不是推理的**:
+    - `meta.rs` 的 `>` 改回 `!=` ⇒ `system_fuse_eof_clobber` 红在 `:128`
+    - `flush_inode` 恒 take ⇒ `system_fuse_flush_error_sticky` 红在 `:107`
+    - Release 站点改回 `ToApplication` ⇒ `system_fuse_release_best_effort` 红在 `:139`
+    - 延迟返回改回早退 ⇒ `system_fuse_release_best_effort` 红在 `:158`
+    - 读屏障改回 `ToApplication` ⇒ `system_fuse_flush_error_sticky` 红在 `:226`
+    - gap flush 改回 `ToApplication` ⇒ 同文件红在 `:327`
+    - truncate 改回 `ToApplication` ⇒ 同文件红在 `:350`
+  **七个红点互不相同** —— 这是判别力的证据:不是同一条断言被反复触发,而是每条消融各自钉住
+  自己那一处机制。(行号每次编辑都会移位,所以这些数字是最后一轮实测的输出,不是沿用的旧值
+  —— 我这轮已经因为沿用旧行号让一次消融静默打空过,见教训⑦。)
+  行为保持闸 10 条全绿(`system_fuse_read` / `system_fuse_ns` / `fuse_lease_1` / `fuse_lease_2`)
+  —— 我动了 dispatch 的 Release 臂和 meta,正是这几条覆盖的面。
+  编译:fuse / manager-tests / python(**workspace exclude,`--workspace` 覆盖不到,必须单独
+  check**)三处 0 error;clippy 在我动过的文件里无新增告警。
+  `python/Cargo.lock` 多出的那行 `rancor` **与本轮无关**:`crates/rpc/Cargo.toml:28` 早在
+  bfacd07 就声明了它,根 lock 也早已记录;python 持独立 lock 且自那次提交后没在 python/ 下
+  构建过,我这次 check 是第一次,于是把既有漂移补记上。
+
+【独立评审(规则 15)——fable 配额耗尽,按用户 2026-09-13 新规改派 opus subagent】
+  fable 那一遍**没跑成**:HTTP 429 credits 用尽,agent 只输出一句开场白就终止,零产出。
+  按用户新规不干等,另起**新** agent(opus)重评。它独立复核并**确认**了:两条修复方向正确、
+  fuser 引文逐字属实、规则 8 的需求原文冻结未被违反、55 条单测与 clippy 结论属实、
+  全部 `flush_inode` 调用点(**9 处生产 + 9 处测试**,我一度写成"12 处")显式带 report、
+  无 `flush_report_for` 残留。
+
+  【它抓到的、我已修的】
+  - **F1(中,真洞):`read.rs` 的 read-after-write 屏障也在消费粘性记录。** 同一个 bug 的
+    第三扇门,而且"read-after-write barrier"正是**我自己**写进 `ToApplication` 注释里的。
+    危害链:应用回读刚写的数据 → 拿 EIO → 记录被吃 → 重试读成功 → close 的 fsync 无事待办
+    → 把 size 发布到洞上面。Linux errseq 只在 fsync/close/msync 退休回写错误,不在读。
+    修 = 改 `BestEffort`(读照样失败,区别只在记录存活)。新增测试 + 消融:翻回 ToApplication
+    红在 `:226`。
+  - **F3(中):Release 的 `return Err(e)` 跳过了整段清理**(open_count、驱逐、held_leases
+    refcount、`lease::release`)。fuser 每次 open 只发一次 release ⇒ 跳过即永久:写租约被
+    一直心跳续,别的写者永远 WriteConflict。**我本来想用"FLUSH 会先把记录清掉所以不可达"
+    搪塞过去 —— 但那正是我拒绝用来支持 Release 消费记录的同一条假设,不能一边拒用一边依赖。**
+    修 = 错误延迟到块尾返回,清理照跑。消融:改回早退,`open_count` 断言红在 `:158`。
+  - **F7(低,我引入的回归):** rebind 收进 `changed` 之后,对**不填 `state.inodes` 的前端**
+    (S3 网关、PyO3 读路径)永远不 rebind —— 而修改前是无条件的。修 = 判据钉在"这次读要用的
+    size"(`fresh.size > file_size`)而非"缓存是否被采纳"。
+  - **F5/F6(低,注释说过头):** 我写"缓存比 KV 大根本不是陈旧" —— 假的,**另一个 mount 截断
+    就是**。而我自己的测试 `:163` 就这么写着,两处自相矛盾。改成如实的理由:不对称在**后果**
+    不在证据 —— 拒绝变小改变不了任何读的答案,采纳变小会删掉已落地的 extent。
+  - **F9/F10:** 账本里 `:119` 应为 `:128`、指了一个已删除的脚本;crate 指南缺 HIGH 这一半。
+
+  【它抓到的、我记录但不修的】
+  - **F2:记录存活的代价** —— inode 会一直脏、periodic_sync 每 30 s 重复告警、缓冲尾巴
+    在集群恢复后也不写,直到某个 ToApplication 调用者清掉它。这是**故意的取舍**(响亮地卡住
+    好过静默的洞),写进 `FlushReport` 的 doc。
+  - 评审另外指出 `dispatch.rs:528/666` 两处**无条件** `state.inodes.remove`,会连记录带
+    64 MiB 缓冲一起静默丢弃。既有缺陷、本轮未动,按"先复现再修"记在这里。
+
+  【F8:一个让我的绿跑可疑的发现】`cargo test -p autumn-manager` **不会**构建 `autumn-ps`
+  (crates/manager 不依赖 autumn-server),而两条测试要 spawn 它。我先前那几次绿跑用的是
+  **09-11 23:16 的旧二进制**。已重建并对新二进制全部重跑,全绿。docs/ops.md 补上构建步骤。
+
+【三轮评审各自抓到什么(趋势本身是信息)】
+  一轮(opus,fable 配额耗尽后改派):4 条代码 + 2 条账本。含真洞 F1(读屏障消费记录)。
+  二轮(opus,新 agent):又 1 条真洞 —— **第四扇门 gap flush**,连带 truncate。外加我自己
+    刚写的两条假机制注释(测试的 `!dirty`、dispatch 的"下次 release 会清理")。
+  三轮(opus,新 agent):**代码零发现**,九站点分类判定正确且完整;所有发现都在文档与账本
+    (PRICE 段自相矛盾、O_TRUNC 的真实影响面、PyO3 站点其实是死的、五处陈旧行号)。
+  收敛形状很清楚:代码发现 4 → 1 → 0。第三轮之后再改的全是散文。
+
+【本轮我自己犯并纠正的错,按同一形状归类】
+  **"行号会被我自己的编辑作废"共栽四次**:①凭记忆重构 old_string 致编辑失败(响亮);
+  ②用编辑前的行号做消融,`sed` 静默打空、文件没动而测试照常绿 —— "消融无效"与"测试通过"
+  在输出上一模一样,我差点把它当证据;③④两次把已移位的行号写进账本(`:349`→`:350`、
+  `:151`→`:158`),都是靠**重跑实测**而非推断才发现的。
+  固化的纠正:消融一律按**模式**动态定位,且跑测试前**断言 md5 确实变了**,没变就中止;
+  凡要写进账本的行号,一律取自最后一轮实测输出。
+
+Next steps: 无。本条已闭合。遗留的两项按"先复现再修"记在上面(dispatch 两处无条件
+  `state.inodes.remove`;`dirty` 先于 `put_inode` 清除的驱逐窗口),都不是本轮引入。
+
 Date: 2026-09-13 (8)
 TaskStatus: not_completed
 Task scope: 把 autumnfs 的连续写流水线搬进 fuse 写侧(用户 2026-09-13 指派)。

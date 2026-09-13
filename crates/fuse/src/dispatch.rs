@@ -100,11 +100,17 @@ pub fn check_write_allowed(
 ///   reaches 0, OR `slot.revoked` is set (revoked entries are not
 ///   recoverable — the manager already gave the lease to someone
 ///   else; keeping the entry around just confuses the next Open).
-/// - `propagate_flush_err`: the dispatcher should bubble the flush
-///   error to the kernel as EIO. True iff NOT revoked (a revoked
-///   flush is best-effort; the bytes will fence at the PS anyway
-///   via BUG-LEASE-2 once Phase 2 wires that up — surfacing it as
-///   EIO would mask the legitimate next Open + retry path).
+/// - `propagate_flush_err`: the dispatcher should answer the RELEASE
+///   with EIO rather than swallowing it. True iff NOT revoked (a
+///   revoked flush is best-effort; the bytes will fence at the PS
+///   anyway via BUG-LEASE-2 once Phase 2 wires that up — surfacing
+///   it would mask the legitimate next Open + retry path).
+///   It does NOT mean the application learns of the error: fuser's
+///   release contract is that "error values are not returned to
+///   close() or munmap()", so the kernel drops the reply either way.
+///   It therefore must NEVER be used to decide whether the sticky
+///   `flush_error` may be consumed — RELEASE always passes
+///   `FlushReport::BestEffort`.
 pub fn compute_release_action(
     held_leases: &std::collections::HashMap<u64, crate::state::FuseLease>,
     ino: u64,
@@ -240,8 +246,11 @@ pub async fn handle_request(
     //
     // Logging the error here is NOT how it gets reported — this drain runs
     // ahead of the fsync handler and would otherwise consume the only copy.
-    // `drain_pending` sticks the failure to the inode, and `flush_inode`
-    // returns it, so fsync/release/truncate still fail.
+    // `drain_pending` sticks the failure to the inode, and the next
+    // `flush_inode` marked `ToApplication` returns it, so FLUSH (which the
+    // kernel sends on every `close()`), FSYNC and truncate still fail. RELEASE
+    // is deliberately NOT in that list: fuser drops a release error before it
+    // reaches `close()`, so it may report but never consume.
     if !matches!(req, FsRequest::Write { .. }) {
         if let Err(e) = write::drain_all_pending(state).await {
             tracing::warn!(error = %e, "pending append flush failed (fsync will report it)");
@@ -265,7 +274,11 @@ pub async fn handle_request(
             // Flush all dirty inodes before shutting down
             let dirty: Vec<u64> = state.dirty_inodes.iter().copied().collect();
             for ino in dirty {
-                if let Err(e) = write::flush_inode(state, ino).await {
+                // Best-effort: this only logs, so it must not consume the
+                // sticky record (`FlushReport`).
+                if let Err(e) =
+                    write::flush_inode(state, ino, write::FlushReport::BestEffort).await
+                {
                     tracing::warn!(ino, error = %e, "destroy: flush failed");
                 }
             }
@@ -810,7 +823,7 @@ pub async fn handle_request(
             let _ = reply.send(result);
         }
         FsRequest::Flush { ino, reply } => {
-            let result = write::flush_inode(state, ino).await;
+            let result = write::flush_inode(state, ino, write::FlushReport::ToApplication).await;
             let _ = reply.send(result);
         }
         FsRequest::Release { ino, flush, reply } => {
@@ -838,22 +851,61 @@ pub async fn handle_request(
                     let held = state.held_leases.borrow();
                     compute_release_action(&held, ino, flush)
                 };
+                // A flush error bound for the kernel is DEFERRED to the end of
+                // this block, not returned from the middle of it. An early
+                // return skips the `open_count` decrement, the cache eviction,
+                // the `held_leases` refcount and `lease::release` below — and
+                // fuser sends exactly ONE release per open, so nothing ever
+                // comes back to finish the job: the write lease keeps being
+                // heartbeated and every other writer gets `WriteConflict` for
+                // the life of the mount.
+                //
+                // The skip predates this change, and it was never self-healing:
+                // `compute_release_action` derives `must_drop_entry` from
+                // `slot.refcount <= 1` taken BEFORE the decrement, and the
+                // decrement is itself inside the skipped teardown. So one
+                // skipped release offsets the refcount by one permanently —
+                // the next Open takes it to 2, that release to 1, and
+                // `must_drop_entry` is never true again, so `lease::release`
+                // is never called for the life of the mount. What this change
+                // alters is only how often the skip is reached: RELEASE used to
+                // CONSUME the record, so a later release found nothing and took
+                // the normal path; now the record stands by design.
+                let mut deferred_flush_err: Option<anyhow::Error> = None;
                 if action.must_flush {
-                    if let Err(e) = write::flush_inode(state, ino).await {
+                    // ALWAYS BestEffort — including when `propagate_flush_err`
+                    // is set. RELEASE does reply with an error, but fuser's
+                    // contract is explicit that "error values are not returned
+                    // to close() or munmap() which triggered the release": the
+                    // kernel drops it, nobody is told, so this site has no
+                    // right to consume the sticky record.
+                    //
+                    // FUSE_FLUSH is the caller that can deliver it (it runs on
+                    // every close(), and per fuser one reason it exists is "if
+                    // the filesystem wants to return write errors"). But that
+                    // is not a guarantee to lean on — the same doc warns
+                    // filesystems "shouldn't assume that flush will always be
+                    // called after some writes, or that it will be called at
+                    // all". Consuming here on the strength of that assumption
+                    // is precisely the hole this record exists to close.
+                    if let Err(e) =
+                        write::flush_inode(state, ino, write::FlushReport::BestEffort).await
+                    {
                         if action.propagate_flush_err {
-                            return Err(e);
+                            deferred_flush_err = Some(e);
+                        } else {
+                            // Revoked-flush is best-effort: log and
+                            // continue so we still drop the held_lease
+                            // entry. The bytes will fence at the PS
+                            // once BUG-LEASE-2 Phase 2 wires epoch
+                            // stamping; surfacing EIO here would
+                            // confuse a legit next-Open + retry.
+                            tracing::warn!(
+                                ino,
+                                error = %e,
+                                "R2-P0 #2: revoked-flush failed; continuing to drop entry"
+                            );
                         }
-                        // Revoked-flush is best-effort: log and
-                        // continue so we still drop the held_lease
-                        // entry. The bytes will fence at the PS
-                        // once BUG-LEASE-2 Phase 2 wires epoch
-                        // stamping; surfacing EIO here would
-                        // confuse a legit next-Open + retry.
-                        tracing::warn!(
-                            ino,
-                            error = %e,
-                            "R2-P0 #2: revoked-flush failed; continuing to drop entry"
-                        );
                     }
                 }
                 if let Some(is) = state.inodes.get_mut(&ino) {
@@ -900,7 +952,12 @@ pub async fn handle_request(
                         );
                     }
                 }
-                Ok(())
+                // Now that every teardown step above has run, hand the kernel
+                // the flush error if there was one.
+                match deferred_flush_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
             }
             .await;
             let _ = reply.send(result);
@@ -910,7 +967,7 @@ pub async fn handle_request(
             datasync: _,
             reply,
         } => {
-            let result = write::flush_inode(state, ino).await;
+            let result = write::flush_inode(state, ino, write::FlushReport::ToApplication).await;
             let _ = reply.send(result);
         }
         FsRequest::Statfs { reply } => {

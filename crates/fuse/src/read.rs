@@ -118,7 +118,17 @@ async fn prepare_inner(
             let wb_end = wb_start + wb.len as u64;
             let read_end = offset + size as u64;
             if wb.len > 0 && wb_start < read_end && wb_end > offset {
-                write::flush_inode(state, ino).await?;
+                // BestEffort, even though this `?` DOES hand the caller an
+                // error. Consuming is gated on more than "somebody sees an
+                // error": the sticky record is the writeback report, and a
+                // READ is not where a writeback failure gets retired. Linux
+                // errseq retires one only at fsync/close/msync for exactly
+                // this reason — an application reads back what it wrote, gets
+                // EIO, retries the read successfully, and closes; if this
+                // barrier had taken the record, that close's fsync would find
+                // nothing pending and publish a size over the hole. The read
+                // still fails either way; only the record survives.
+                write::flush_inode(state, ino, write::FlushReport::BestEffort).await?;
             }
         }
     }
@@ -159,8 +169,23 @@ async fn prepare_inner(
         // the cases that matter. One cache-bypassing GET is the honest test,
         // and it costs one round trip per EOF-boundary event — once at the end
         // of a sequential scan, never on an in-bounds read.
-        let (fresh, changed) = crate::meta::get_inode_uncached(state, ino).await?;
-        if changed {
+        let (fresh, _cache_adopted) = crate::meta::get_inode_uncached(state, ino).await?;
+        // Gate on the SIZE this read would use, NOT on whether the CACHE was
+        // adopted. They are different questions: adoption can only happen for
+        // an inode already in `state.inodes`, and the S3 gateway and the PyO3
+        // reader populate that map on writes only. Keying the rebind on
+        // adoption would make this confirm a pure wasted round trip for every
+        // read-only front-end, and would silently drop the growth they used to
+        // pick up here — the rebind was unconditional before this check became
+        // one-directional.
+        //
+        // One-directional for the same reason the cache adopt is, and with the
+        // same caveat: a KV size SMALLER than what this read already holds may
+        // be this mount's own unpublished writes OR another mount's truncate.
+        // Refusing it cannot change the answer — `offset >= file_size` already
+        // held, so the clamp below still returns empty — while adopting it can
+        // destroy data. See `meta::get_inode_uncached`.
+        if fresh.size > file_size {
             tracing::warn!(
                 ino,
                 offset,
@@ -168,11 +193,11 @@ async fn prepare_inner(
                 fresh_size = fresh.size,
                 "read: cached inode size was stale at EOF — refusing to truncate"
             );
+            // Rebind the whole meta, not just the size — `inline_data` below
+            // is read from it and must come from the same snapshot.
+            file_size = fresh.size;
+            meta = fresh;
         }
-        // Rebind the whole meta, not just the size — `inline_data` below is
-        // read from it and must come from the same snapshot.
-        file_size = fresh.size;
-        meta = fresh;
         if offset >= file_size {
             return Ok(ReadPlan {
                 inline_result: Some(Vec::new()),
