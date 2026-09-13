@@ -635,3 +635,71 @@
   "做/不做"决定被写进本条。
 - **Status**: `passes: false` (2026-09-11) — 仅立账，未实现，且**先量再做**。
 - `passes: false`
+
+### F-FUSE-WRITE-INFLIGHT-DEPTH — fuse 写侧多槽流水线，收益未实测
+- **Trigger** (2026-09-13，用户指派"把连续流水线搬进 fuse 写侧"): 立论起点是
+  `e58c735` 记的"mount 写 208 vs CLI 345"。**这个起点是错的** —— 208 是
+  2026-09-03 00:05 的测量，而 `2949372` 在同日 04:20 就做了单槽异步流水化，把写从
+  249 抬到 338 = CLI 345 的 98%。查出来时代码已经写完，用户指示保留代码、修掉错误论证。
+- **实际做了什么**: `InodeState.pending_flush: Option<_>` → `pending_flushes:
+  VecDeque`；规划下一批前不再无条件 drain 上一批，只在队列满时等最老的一个
+  (`write::make_room`)；`drain_pending` 改为排空**全部**槽 —— `drain_all_pending` 与
+  `flush_inode` 都依赖"排空后无在飞"，漏一个槽 = fsync 对未落地字节报成功 = 丢数据。
+  `APPEND_INFLIGHT_DEPTH = 2`。
+- **剩余空间有多大，先说清楚**: 单槽一批已经是 **8 个 extent 并发**，恰好等于
+  autumnfs 非 striped 的 `depth`=8 —— 338≈345 正是这个对等造成的。多槽把在飞 extent
+  从 8 抬到 16，找的是剩下那 ~2%。而 `934d4ee` 实测单机剩余的墙是 RF3 全副本 fsync，
+  不在客户端，所以这 2% 未必拿得到。
+- **安全性(两条都有依据)**: ① 落地顺序无关 —— `extent::upsert` 按 start 有序插入替换，
+  连续 append 批次区间互不相交；单测 `disjoint_batches_apply_the_same_in_any_order`
+  钉住，消融(把 upsert 改成 push 不排序)会红，已验。② 出错不提前返回 —— postcondition 是"队列空"，
+  提前返回会把槽留下而调用方以为已静默。**反过来也别清空队列**：`JoinHandle` 即
+  `async_task::Task`，`Drop` 调 `set_canceled()`，drop 会**取消**那次 flush。
+  (我最初引的 compio "drop 不取消"是 `spawn_blocking` 的契约，不是 `spawn` 的，已订正。)
+- **测试覆盖的边界**: 多槽本体**无**自动化覆盖 —— `ClusterClient` 三条构造路径全要连
+  manager、`FsState::from_client` 私有 ⇒ 造不出 `FsState`，而 `make_room` /
+  `drain_pending` / `settle_oldest` 都要 `&mut FsState`。只钉住了它依赖的纯函数前提；
+  没有为了凑数写 `fn should_make_room(len)->bool` 那种测 `>=` 的同义反复。
+- **Acceptance**: 同机对照实测 —— mount 写与 `autumnfs put` 同一个大文件，给出
+  `APPEND_INFLIGHT_DEPTH` = 1 与 2 的吞吐对照。若无可辨差异，改回 1（**精确回退**：
+  队列非空就等 = 原来的无条件 drain），并把结论写回本条。
+- **Status**: `passes: false` (2026-09-13) — 代码与单测完成，**收益未实测**。
+- `passes: false`
+
+### BUG-FUSE-EOF-READ-CLOBBERS-DIRTY-META — 一次 EOF 之外的读会抹掉未发布的写，然后写侧自己把已落地的 extent 删掉
+- **Trigger** (2026-09-13，fuse 多槽评审顺带追出;**既有缺陷，非多槽引入**，单槽时代同样可达):
+  `read.rs:129-175` 在 `offset >= 缓存 size` 时会 `get_inode_uncached` 然后 `meta = fresh`;
+  `meta.rs:200-210` 的 `if is.meta.size != fresh.size { is.meta = fresh; is.extents = None }`
+  **既不看 `is.dirty` 也不看方向**。原 commit(`01e0ad7`)针对的是"缓存偏小"，而"缓存比 KV 大"
+  恰恰是 mount 正在写一个文件时的**常态**。
+- **两种结局(都是静默数据损坏)**: ① 下次写在旧偏移 → `write.rs:266-271` 看到被抹小的
+  `cur_size < offset` → `clean_beyond_eof` → `extent.rs:635-641` 删掉**每一个** `s >= eof` 的
+  extent key，即所有已落地但未发布的 extent;② 不再写直接 Release → `flush_inode` 时
+  `is.dirty` 仍为 true(`get_inode_uncached` 从不清它) → `put_inode` 发布被抹小的 size →
+  **文件以 size 0 关闭**。
+- **为什么内核没挡住**: `ops.rs:264` 用 `FOPEN_DIRECT_IO`，内核不在 `i_size` 处截断读，
+  所以本机一个 EOF 处的 read 真的会走到 `read::prepare`。`tail -f` 正是这个形状
+  (SEEK_END 然后在 EOF 读)，写满 64 MiB 整数倍后的任何读者同样。
+- **Scope(先复现，再修)**: 按 [[feedback_reproduce_before_fixing_mechanism_bugs]]，
+  先要一个真复现再动刀。e2e 配方(评审给的，今日未跑): 开 `f` 写恰好 64 MiB 不 fsync 不关;
+  另一进程 `dd if=f bs=1M skip=64 count=1`(读到 0 字节，正确);关 writer;`stat f` 期望
+  64 MiB，实测应为 0。修法方向是决策(脏 inode 跳过 refresh / 只接受更大的 fresh size)，
+  不在本条预先选定。
+- **Acceptance**: 上述 e2e 在修前红、修后绿;且"缓存偏小"那个原始场景(`01e0ad7` 的目标)
+  仍然被覆盖。
+- **Status**: `passes: false` (2026-09-13) — 仅立账，未复现未修。
+- `passes: false`
+
+### BUG-FUSE-FLUSH-ERROR-EATEN-BY-LOGGERS — 粘性回写错误被只打日志的路径吃掉，fsync 随后对着洞报成功
+- **Trigger** (2026-09-13，同上评审;**既有缺陷**，来自 `2949372`): `flush_error` 的设计是
+  errseq_t 式"一次报告消费一次"，由 `flush_inode` 消费并上报。但 `main.rs:385-395`
+  (periodic_sync，每 30 s)、`dispatch.rs:264-273`(Destroy)、`dispatch.rs:841-857`
+  (revoked Release) 都调 `flush_inode`，拿到错误后**只 `tracing::warn!`**。
+- **后果**: 粘性记录就此消失;应用下一次 fsync 通过 `take_flush_error`、继续 `put_inode`、
+  **对着空洞返回成功** —— 正是 `write.rs` 与 `schema.rs` 里说这个机制存在所要防的那件事。
+  讽刺的是那两处注释还把"periodic sync"列进了"MUST see it"的消费者名单。
+- **Scope**: 让只打日志的消费者不要消费(改成 peek 而非 take)，或让它们负责上报。
+  多槽不改变暴露面(单槽时同样)。
+- **Acceptance**: 一次失败的 flush 之后，periodic_sync 先跑一轮，应用的 fsync 仍然报错。
+- **Status**: `passes: false` (2026-09-13) — 仅立账，未修。
+- `passes: false`

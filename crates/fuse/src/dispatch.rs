@@ -467,8 +467,8 @@ pub async fn handle_request(
                     InodeState {
                         meta: meta.clone(),
                         write_buf: None,
-            pending_flush: None,
-            flush_error: None,
+                        pending_flushes: std::collections::VecDeque::new(),
+                        flush_error: None,
                         dirty: false,
                         open_count: 1,
                         extents: None,
@@ -673,8 +673,8 @@ pub async fn handle_request(
                         InodeState {
                             meta,
                             write_buf: None,
-            pending_flush: None,
-            flush_error: None,
+                            pending_flushes: std::collections::VecDeque::new(),
+                            flush_error: None,
                             dirty: false,
                             open_count: 1,
                             extents: None,

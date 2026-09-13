@@ -1,3 +1,49 @@
+Date: 2026-09-13 (8)
+TaskStatus: not_completed
+Task scope: 把 autumnfs 的连续写流水线搬进 fuse 写侧(用户 2026-09-13 指派)。
+
+【为什么是 not_completed】代码齐、56 条单测全绿、消融验证过,但这个改动**唯一的目的
+  是提性能,而收益一次都没测过**。按规则 5/6,验收没跑完不能写 completed。
+
+【做了什么】`InodeState.pending_flush: Option<PendingFlush>` → `pending_flushes:
+  VecDeque`,规划下一批前不再无条件 drain 上一批,只在队列满时等最老的一个
+  (`write::make_room`);`drain_pending` 改为排空**全部**槽(`drain_all_pending` 与
+  `flush_inode` 都依赖"排空后无在飞",漏一个槽 = fsync 对未落地字节报成功 = 丢数据)。
+  `APPEND_INFLIGHT_DEPTH = 2`。
+
+【立论被我自己查翻了,必须记下来】我最初的依据是 `e58c735` 的"mount 写 208 vs CLI 345",
+  据此跟用户说"这是全仓最好捡的一块"。**错的**:208 是 2026-09-03 00:05 的测量,而
+  `2949372` 在同日 04:20 就做了单槽异步流水化,把写从 249 抬到 338 = CLI 345 的 98%。
+  机制上也对得上:单槽一批已经是 **8 个 extent 并发**,恰好等于 autumnfs 非 striped 的
+  depth=8 —— 这就是 338≈345 的原因。所以多槽是把在飞 extent 从 8 抬到 16,在剩下的
+  ~2% 里找空间,不是补 137 MiB/s 的差距。而且 `934d4ee` 实测单机剩余的墙是 RF3 全副本
+  fsync,不在客户端,这点空间未必拿得到。
+
+【安全性两条,都有依据】
+  ① 落地顺序无关:`extent::upsert` 是按 start 的有序插入替换,连续 append 批次区间互不
+    相交 ⇒ 乱序 apply 等价。单测 `disjoint_batches_apply_the_same_in_any_order` 钉住,
+    消融(把 upsert 改成 push 不排序)会红,已验。
+  ② 出错不提前返回:postcondition 是"队列空",提前返回会把槽留下而调用方以为已静默。
+    **反过来也别清空队列**:`JoinHandle` 即 `async_task::Task`,`Drop` 调 `set_canceled()`,
+    drop 会**取消**那次 flush。我最初把 compio 的"drop 不取消"当成 `spawn` 的契约并写进了
+    四处文档 —— 那句其实是 `spawn_blocking` 的,评审查出后已全部订正。这是本会话第 N 次
+    "读到一句话就当成它在说我以为的那件事"。
+
+【测试覆盖的诚实边界】多槽本体**没有**自动化覆盖:`ClusterClient` 三条构造路径全要连
+  manager,`FsState::from_client` 私有,所以造不出 FsState,而 make_room/drain_pending/
+  settle_oldest 都要 `&mut FsState`。只钉住了它依赖的纯函数前提。没有为了凑数去写
+  `fn should_make_room(len)->bool` 那种测 `>=` 的同义反复。
+
+Main gaps:
+  1. 收益未实测。要测就同机对照 `autumnfs put` 与 mount 写同一个大文件;不测就别声称有提升。
+  2. **退路已备好**:`APPEND_INFLIGHT_DEPTH = 1` 是精确回退(队列非空就等 = 原来的无条件
+     drain)。实测若无收益,改这一个数字,不用拆队列。
+  3. 顺手修了两处指向已删除常量 `APPEND_PIPELINE_DEPTH` 的文档(schema.rs 设计注释、
+     fuse/CLAUDE.md 常量表)——该常量在 extent.rs:36 早就注明删除了,是本会话遇到的
+     第 N 个"文档承诺一个代码里不存在的机制"。
+
+Next steps: 实测一次再决定保留还是把 depth 改回 1。
+
 Date: 2026-09-12 (7)
 TaskStatus: not_completed
 Task scope: GC 门槛(台账 BUG-GC-ADVISORY-VS-SELECTION 的 Scope 1)——让"建议"与"回收"

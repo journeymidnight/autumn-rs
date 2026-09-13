@@ -200,7 +200,8 @@ ino → inode 数据是 **O(log N) KV Get**（ino 编码在 key 里，LSM-tree �
 | `MAX_EXTENT` | 8 MiB | extent value 上限；写缓冲按此粒度刷；≥64 KiB 整 extent 读走 bulk |
 | `INLINE_THRESHOLD` | 4 KiB | 小文件 inline 阈值（匹配 VALUE_THROTTLE）|
 | `WRITE_BUF_EXTENTS` | 8 | 每 inode 写缓冲容量（extent 数）|
-| `WRITE_BUF_CAP` | 64 MiB | = `WRITE_BUF_EXTENTS × MAX_EXTENT`；>1 时 `write_region` 拆多 extent 由 `put_many` 按 `APPEND_PIPELINE_DEPTH` 流水 |
+| `WRITE_BUF_CAP` | 64 MiB | = `WRITE_BUF_EXTENTS × MAX_EXTENT`；>1 时 `write_region` 拆多 extent，`put_many` 按 wire key 分组后并发 fan out（`BATCH_PUT_DEFAULT_CONCURRENCY`）；extent key 互异故满并发 |
+| `APPEND_INFLIGHT_DEPTH` | 2 | 单 inode 同时在飞的 append flush 批数；1 批 = 8 个 extent 并发。未实测，见写流水化一节 |
 | `INODE_ALLOC_BATCH` | 1000 | 每批向 manager 领的 inode 数 |
 | `DEFAULT_STRIPE_LANES` | 24 | fs 未声明几何时的默认 lane 数 |
 | `ROOT_INO` | 1 | 根 inode（FUSE_ROOT_ID）|
@@ -228,6 +229,8 @@ struct StripeLayout { lanes: u8, unit_bytes: u32 }       // [0x04]stripe_geom + 
 struct InodeState {
     meta: InodeMeta,
     write_buf: Option<WriteBuffer>,        // buf 容量 WRITE_BUF_CAP
+    pending_flushes: VecDeque<PendingFlush>, // 在飞的 append flush（≤ APPEND_INFLIGHT_DEPTH）
+    flush_error: Option<String>,           // 粘性回写失败，由 flush_inode 消费上报
     dirty: bool,
     open_count: u32,
     extents: Option<Vec<(u64, u32)>>,      // 运行时 extent map（truncate 置 None）
@@ -368,6 +371,21 @@ extent map），`extent::execute_append` 只需要 `Rc<ClusterClient>`，spawn �
 64 MiB 在网络上飞的时候，dispatcher 回去继续从内核收下一批。读路径一直是这个形状
 （`read::prepare` + spawn `read::execute`），这也正是读能扇出而写不能的原因。
 实测 **249 → 338 MiB/s（+36%）**，达到 CLI 345 的 98%。
+
+**多槽（`APPEND_INFLIGHT_DEPTH`=2）**：规划下一批前不再无条件 drain 上一批，只有队列
+满了才等最老的一个（`write::make_room`）。`InodeState.pending_flushes` 因此是队列不是
+单槽。⚠️ **未实测**，而且要清楚剩余空间有多小：单槽本身就已经让**一批 8 个 extent 并发**
+在飞，这恰好等于 `autumnfs` 非 striped 的 `depth`=8 —— 338 ≈ 345 正是这个对等造成的。
+多槽把在飞 extent 从 8 抬到 16，找的是剩下那 ~2%，**不是**去补什么 137 MiB/s 的差距
+（`e58c735` 里的 208 早于本节的流水化四小时，是陈旧数字，别再引用）。这点空间能不能
+拿到还是未知：`934d4ee` 实测单机剩余的墙是 RF3 全副本 fsync，不在客户端。
+
+多槽安全性依赖两条，都验过：① `extent::upsert` 是按 start 的有序插入替换，而连续 append
+批次区间互不相交，所以**落地顺序无关**（`disjoint_batches_apply_the_same_in_any_order`
+钉住，消融会红）；② 出错不提前返回——postcondition 是"队列空"，提前返回会把槽留下而调用方以为已静默。
+**别"简化"成出错时清空队列**：`JoinHandle` 就是 `async_task::Task`，其 `Drop` 调
+`set_canceled()`，drop 一个 `PendingFlush` 会**取消**那次 flush（compio 那句"drop 不取消"
+是 `spawn_blocking` 的契约，不是 `spawn` 的——本轮我一开始就引错了这句）。
 
 不需要第二块缓冲：`plan` 里的 values 本来就是 `Bytes::copy_from_slice` 拷出来的自有数据，
 所以规划一结束缓冲就自由了。

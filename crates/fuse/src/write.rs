@@ -56,34 +56,24 @@ static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
 static WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
 const FLUSH_LOG_EVERY: u64 = 16;
 
-/// Wait for this inode's in-flight append flush, if any, and apply its
-/// extent-map updates.
+/// Await the OLDEST in-flight flush and apply its consequences. `None` when
+/// the inode has nothing in flight.
 ///
-/// EVERY path that reads the extent map, publishes the inode's size, or writes
-/// anywhere but contiguously past the buffer MUST come through here first —
-/// while a flush is pending the map is missing its extents and the bytes are
-/// not durable. The dispatcher does it for every request that is not a write
-/// (`dispatch::handle_request`), so the obligation here is only the write
-/// path's own non-contiguous shapes.
+/// Split out so the write path can free ONE slot without waiting for the whole
+/// queue — that distinction is the entire point of the queue. The obligation to
+/// leave NOTHING in flight belongs to `drain_pending`, not here.
 ///
 /// A failed flush is recorded on the inode as well as returned, because the
-/// caller here is often the dispatcher's blanket drain, which only logs. The
-/// report the application actually sees comes from `flush_inode` (fsync,
-/// release, truncate, periodic sync), which consumes that record BEFORE it
-/// would persist a size covering the bytes that never landed. Without the
-/// record, fsync answered success over a hole.
-///
-/// It cannot surface at the `write()` that started it — that call returned
-/// before the puts ran. That is ordinary writeback; the loser is a caller that
-/// ignores both later writes and `fsync`.
-pub async fn drain_pending(state: &mut FsState, ino: u64) -> Result<()> {
-    let Some(pending) = state
+/// caller is often the dispatcher's blanket drain, which only logs. The report
+/// the application actually sees comes from `flush_inode` (fsync, release,
+/// truncate, periodic sync), which consumes that record BEFORE it would persist
+/// a size covering bytes that never landed. It cannot surface at the `write()`
+/// that started it — that call returned before the puts ran.
+async fn settle_oldest(state: &mut FsState, ino: u64) -> Option<Result<()>> {
+    let pending = state
         .inodes
         .get_mut(&ino)
-        .and_then(|is| is.pending_flush.take())
-    else {
-        return Ok(());
-    };
+        .and_then(|is| is.pending_flushes.pop_front())?;
     let res = pending
         .task
         .await
@@ -113,7 +103,58 @@ pub async fn drain_pending(state: &mut FsState, ino: u64) -> Result<()> {
             }
         }
     }
-    res
+    Some(res)
+}
+
+/// Free one slot so another flush can be planned — awaits the oldest in-flight
+/// flush ONLY when the queue is already at [`APPEND_INFLIGHT_DEPTH`].
+///
+/// This replaced the unconditional drain the writer used to do before planning,
+/// which is precisely why only one batch was ever in flight.
+async fn make_room(state: &mut FsState, ino: u64) -> Result<()> {
+    let full = state
+        .inodes
+        .get(&ino)
+        .is_some_and(|is| is.pending_flushes.len() >= crate::schema::APPEND_INFLIGHT_DEPTH);
+    if !full {
+        return Ok(());
+    }
+    settle_oldest(state, ino).await.unwrap_or(Ok(()))
+}
+
+/// Await EVERY in-flight flush for this inode and apply what lands.
+///
+/// EVERY path that reads the extent map, publishes the inode's size, or writes
+/// anywhere but contiguously past the buffer MUST come through here first —
+/// while a flush is queued the map is missing its extents and the bytes are not
+/// durable. The dispatcher does it for every request that is not a write
+/// (`dispatch::handle_request`), so the obligation here is only the write
+/// path's own non-contiguous shapes.
+///
+/// `drain_all_pending` and `flush_inode` both rely on this leaving NOTHING in
+/// flight: a surviving slot means the extent map is still incomplete, and fsync
+/// would then publish a size covering bytes that never landed. That is also why
+/// it keeps draining after a failure instead of returning early — the
+/// postcondition is "queue empty", and an early return leaves slots behind
+/// while the caller concludes the inode is quiesced.
+///
+/// Do NOT "simplify" that into clearing the queue on error. `JoinHandle` is
+/// `async_task::Task`, whose `Drop` calls `set_canceled()` — dropping a
+/// `PendingFlush` CANCELS its flush, so puts it had not yet issued never go out
+/// and replies to those already in flight are never read. (`compio::runtime`'s
+/// "the task will not be cancelled even if the future is dropped" is
+/// `spawn_blocking`'s contract, not `spawn`'s — an easy sentence to misread.)
+pub async fn drain_pending(state: &mut FsState, ino: u64) -> Result<()> {
+    let mut first_err = None;
+    while let Some(res) = settle_oldest(state, ino).await {
+        if let Err(e) = res {
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 /// Take this inode's recorded flush failure, if any. Reporting CONSUMES it —
@@ -133,7 +174,7 @@ pub async fn drain_all_pending(state: &mut FsState) -> Result<()> {
     let inos: Vec<u64> = state
         .inodes
         .iter()
-        .filter(|(_, is)| is.pending_flush.is_some())
+        .filter(|(_, is)| !is.pending_flushes.is_empty())
         .map(|(ino, _)| *ino)
         .collect();
     let mut first_err = None;
@@ -311,10 +352,28 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
             let file_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
             let t_flush = std::time::Instant::now();
             let n = flush_len as u64;
-            // The previous flush must land before this one is planned: its
-            // extents are not in the map yet, and two in flight would make the
-            // failure of either impossible to attribute.
-            drain_pending(state, ino).await?;
+            // Free a slot if the queue is full. This USED to be an
+            // unconditional `drain_pending`, which is why only one batch was
+            // ever on the wire: the writer could not even PLAN batch N+1 until
+            // batch N had landed.
+            //
+            // That drain gave two reasons for itself. Neither survives.
+            //
+            // (1) "the previous flush's extents are not in the map yet" — true,
+            // but it cannot matter HERE. `plan_append_only` consults the map
+            // for exactly one question: does any extent reach past `offset`.
+            // Consecutive append batches cover DISJOINT, increasing ranges
+            // (`wb.offset` advances by precisely what it flushed), so every
+            // extent still missing from the map lies strictly BELOW this
+            // batch's offset and could not change that answer. A stale map here
+            // can only omit extents that are already behind us.
+            //
+            // (2) "two in flight make a failure impossible to attribute" — fuse
+            // does not need the attribution. `flush_error` is per-inode and
+            // errseq_t-shaped: fsync must report THAT this file had a failed
+            // writeback, not which 64 MiB of it. Disjoint ranges mean a failed
+            // batch leaves a hole and the others stay valid on their own.
+            make_room(state, ino).await?;
             let plan = extent::plan_append_only(
                 state,
                 ino,
@@ -337,7 +396,8 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
                         extent::execute_append(client, &plan).await
                     });
                     if let Some(is) = state.inodes.get_mut(&ino) {
-                        is.pending_flush = Some(crate::schema::PendingFlush { task, upserts });
+                        is.pending_flushes
+                            .push_back(crate::schema::PendingFlush { task, upserts });
                     }
                     Ok(())
                 }
@@ -474,7 +534,7 @@ async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
         InodeState {
             meta,
             write_buf: None,
-            pending_flush: None,
+            pending_flushes: std::collections::VecDeque::new(),
             flush_error: None,
             dirty: false,
             open_count: 0,

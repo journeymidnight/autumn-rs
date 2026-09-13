@@ -27,18 +27,14 @@ use crate::key;
 use crate::schema::{StripeLayout, MAX_EXTENT};
 use crate::state::FsState;
 
-/// Pipeline depth for the append-write hot path. cp / dd / model-checkpoint
-/// streamers send sequential 8 MiB extents — previously every put was awaited
-/// serially (in_flight=1) and a single-stream cp ceiling was `8 MiB / RPC_RTT`
-/// ≈ 100 MB/s. With this many in-flight puts the ceiling becomes
-/// `N × 8 MiB / RPC_RTT`, bounded by the per-PS partition's pwritev throughput.
-/// 8 is conservative — `autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY` is 32 —
-// APPEND_PIPELINE_DEPTH removed: `put_many` no longer takes a `concurrency`
-// argument. The SDK groups items by owning partition and issues one
-// MSG_BATCH_PUT (or per-op MSG_PUT_BULK for >=64 KiB values) per partition;
-// each partition's RPCs ride the multiplexed PS connection. Fuse-side
-// pipelining now happens naturally via the per-partition pipeline at the
-// PS partition_loop level.
+// There is no fuse-side per-put pipeline depth: `put_many` takes no
+// `concurrency` argument. The SDK groups items by WIRE KEY and fans the groups
+// out at `autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY` (32); a flush's extent
+// keys are all distinct, so one flush's puts are singleton groups and already
+// go out in parallel over the multiplexed PS connection.
+//
+// The depth that IS tunable sits one level up: `schema::APPEND_INFLIGHT_DEPTH`
+// bounds how many FLUSHES — not puts — an inode may have in flight at once.
 
 /// Range-scan page size when rebuilding the extent map of a large file.
 const RANGE_PAGE: u32 = 8192;
@@ -703,6 +699,40 @@ mod tests {
         let (f, n) = floor_and_next(&ext2, 0);
         assert_eq!(f, None);
         assert_eq!(n, Some(m));
+    }
+
+    /// The premise multi-slot write pipelining rests on: consecutive append
+    /// batches cover DISJOINT, increasing ranges, so applying their upserts as
+    /// they LAND is equivalent to applying them in issue order.
+    /// `InodeState.pending_flushes` may hold more than one flight precisely
+    /// because of this — the queue is drained oldest-first today, but nothing
+    /// in the extent map depends on that.
+    ///
+    /// ABLATION: make `upsert` order-sensitive (push + sort at the end, or
+    /// merge adjacent runs) and this goes red.
+    #[test]
+    fn disjoint_batches_apply_the_same_in_any_order() {
+        const E: u64 = MAX_EXTENT as u64;
+        // Two 64 MiB flushes' worth of 8 MiB extents, back to back.
+        let a: Vec<(u64, u32)> = (0..8).map(|i| (i * E, MAX_EXTENT as u32)).collect();
+        let b: Vec<(u64, u32)> = (8..16).map(|i| (i * E, MAX_EXTENT as u32)).collect();
+
+        let mut issue_order = Vec::new();
+        for &(s, l) in a.iter().chain(b.iter()) {
+            upsert(&mut issue_order, s, l);
+        }
+
+        // The SECOND flush lands first — legal once the queue holds more than
+        // one, and the case a single slot could never produce.
+        let mut landed_out_of_order = Vec::new();
+        for &(s, l) in b.iter().chain(a.iter()) {
+            upsert(&mut landed_out_of_order, s, l);
+        }
+
+        assert_eq!(issue_order, landed_out_of_order);
+        assert_eq!(issue_order.len(), 16);
+        // Still sorted, which is what `floor_and_next`'s binary search needs.
+        assert!(issue_order.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
     #[test]

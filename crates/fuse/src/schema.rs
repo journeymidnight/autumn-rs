@@ -1,5 +1,7 @@
 //! Core data types for the FUSE filesystem layer.
 
+use std::collections::VecDeque;
+
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// Decode InodeMeta from rkyv bytes.
@@ -200,9 +202,13 @@ pub const INODE_ALLOC_BATCH: u64 = 1000;
 /// `extent::write_region`. With WRITE_BUF_EXTENTS == 1 the flush is a single
 /// `put` and the cp throughput ceiling is `MAX_EXTENT / RPC_RTT` (~270 MB/s
 /// on local NVMe + TCP loopback + 3 replicas). With > 1, write_region splits
-/// into multiple extents and `put_many` pipelines them at `APPEND_PIPELINE_
-/// DEPTH` concurrency, so the ceiling scales to `WRITE_BUF_EXTENTS *
-/// MAX_EXTENT / RPC_RTT` until the EN-side disk + replica fanout saturates.
+/// into multiple extents and `put_many` groups them BY WIRE KEY, fanning the
+/// groups out concurrently (`BATCH_PUT_DEFAULT_CONCURRENCY`). A flush's extent
+/// keys are all distinct, so every extent in it goes out in parallel and the
+/// ceiling scales to `WRITE_BUF_EXTENTS * MAX_EXTENT / RPC_RTT` until the
+/// EN-side disk + replica fanout saturates. (There is no `APPEND_PIPELINE_
+/// DEPTH` — that constant was removed when `put_many` stopped taking a
+/// `concurrency` argument; see `extent.rs`.)
 ///
 /// Cost: up to `WRITE_BUF_EXTENTS * MAX_EXTENT` (64 MiB) of pre-flush RAM per
 /// actively-writing inode. For sglang-style model checkpoint cp (a handful
@@ -213,6 +219,43 @@ pub const WRITE_BUF_EXTENTS: usize = 8;
 
 /// Per-inode write buffer capacity in bytes. See [`WRITE_BUF_EXTENTS`].
 pub const WRITE_BUF_CAP: usize = WRITE_BUF_EXTENTS * MAX_EXTENT;
+
+/// How many append flushes one inode may have in flight at once.
+///
+/// `2` means one batch on the wire while the next fills. Before it, the writer
+/// drained the previous flush BEFORE it could even plan the next, so exactly
+/// one 64 MiB batch — 8 concurrent extent puts — was ever on the wire.
+///
+/// UNMEASURED, and the prize is small. The mount is NOT stuck at the
+/// 208 MiB/s recorded in `e58c735`: that number predates the single-slot
+/// pipeline by four hours, and `2949372` then took writes 249 -> 338 MiB/s,
+/// which is 98% of the `autumnfs` CLI's 345 on the same rig. One slot already
+/// puts 8 extents in flight, the same count as the CLI's non-striped `depth`
+/// (`autumnfs.rs`, `None => 8`); the two landing so close is consistent with
+/// that, though the causal link is INFERRED, not measured.
+///
+/// What depth 2 changes is narrower than "8 -> 16 in flight". The CLI's 8 is a
+/// CONTINUOUS window refilled on each completion; one fuse slot is a batch of 8
+/// behind a barrier, and the next batch cannot start until the buffer refills
+/// AND the previous batch lands. Depth 2 removes that inter-batch bubble. The
+/// prize is still small, and the CLI is a comparator rather than a proven
+/// ceiling for the mount: a non-striped fuse file is ONE partition, so the wall
+/// it meets first is the single-log_stream ceiling (~350 MB/s by this project's
+/// own measurements) — which is exactly where 338 and 345 both sit.
+/// (`934d4ee`'s RF3-all-replica-fsync wall was measured on the striped 4-lane
+/// aggregate: a different path, same conclusion that the client is not it.)
+///
+/// Deeper is NOT free and wants a measurement first: `plan_append_only` COPIES
+/// the buffer into the plan (`Bytes::copy_from_slice`), so each slot pins a
+/// live `WRITE_BUF_CAP`. At 2 that is 128 MiB in flight per actively-writing
+/// inode, on top of the 64 MiB buffer itself.
+///
+/// `1` is an EXACT revert, and that is the cheap way to settle this: at 1,
+/// `make_room` waits whenever the queue holds anything at all, which is
+/// precisely what the unconditional drain it replaced did. If a measurement
+/// ever says the extra 64 MiB buys nothing, change this digit rather than
+/// unpicking the queue.
+pub const APPEND_INFLIGHT_DEPTH: usize = 2;
 
 /// Root inode number (FUSE_ROOT_ID).
 pub const ROOT_INO: u64 = 1;
@@ -292,17 +335,29 @@ impl WriteBuffer {
 pub struct InodeState {
     pub meta: InodeMeta,
     pub write_buf: Option<WriteBuffer>,
-    /// An append flush whose puts are still in flight, with the extent-map
-    /// updates it will imply once they land. This is what lets the mount
-    /// overlap the network with the kernel: the dispatcher goes back to filling
-    /// the next buffer instead of waiting here.
+    /// Append flushes whose puts are still in flight, OLDEST FIRST, each with
+    /// the extent-map updates it will imply once it lands. This is what lets
+    /// the mount overlap the network with the kernel: the dispatcher goes back
+    /// to filling the next buffer instead of waiting here.
     ///
-    /// While this is `Some`, the extent map is INCOMPLETE and the inode's
-    /// on-disk size must not be published. Only ever set when
+    /// A QUEUE, not one slot. With a single slot the writer had to drain the
+    /// previous flush before it could even PLAN the next, so exactly one
+    /// 64 MiB batch was ever on the wire. Up to [`APPEND_INFLIGHT_DEPTH`] ride
+    /// at once now — but that single slot was itself the win that mattered
+    /// (249 -> 338 MiB/s in `2949372`); see [`APPEND_INFLIGHT_DEPTH`] for how
+    /// little is left after it.
+    ///
+    /// While this is NON-EMPTY the extent map is INCOMPLETE and the inode's
+    /// on-disk size must not be published. Only ever filled when
     /// `FsState::pipelined_writes` is on, which is the fuse MOUNT alone: its
     /// dispatcher drains ahead of every non-write request, and no other
     /// front-end has that funnel.
-    pub pending_flush: Option<PendingFlush>,
+    ///
+    /// Completion ORDER does not matter: `extent::upsert` is a sorted
+    /// insert-or-replace keyed by start offset, and consecutive batches cover
+    /// disjoint ranges, so applying them as they land is equivalent to
+    /// applying them in issue order.
+    pub pending_flushes: VecDeque<PendingFlush>,
     /// A failed flush, held until someone reports it.
     ///
     /// The failure cannot be delivered to the `write` that started it — that
