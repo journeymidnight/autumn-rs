@@ -14,6 +14,13 @@
 
 ## Active
 
+### F-CORE-DATA-PATH-NEXT — further core-path performance work
+- Trigger: The 2026-09-14 review found additional costs beyond the validated pool/receive/read-planning fixes.
+- Scope: Measure PS-to-EN repeated frame CRC and frame accumulation, then evaluate checksum reuse or append bulk framing; separately evaluate UCX rendezvous/RMA, CLI owned-buffer streaming with byte-bounded async file I/O, and filesystem random-write amplification/per-inode barriers. Preserve existing integrity and durability contracts.
+- Acceptance: Establish an isolated before/after benchmark for each candidate, keep only measured improvements, and cover authorization, cancellation, ordering, sparse data and crash consistency for the changed path. No fixed speedup assumed.
+- passes: false
+
+
 > **这个账本只记 autumn-rs 自己的东西。** 下游怎么被 autumn 的改动影响（例如一次 wire
 > 版本变更要求哪些内嵌客户端重建）算 autumn 的后果，该记；下游自己的缺陷、进展和上线
 > 状态不算，记在它们各自的仓库里。

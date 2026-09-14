@@ -660,13 +660,12 @@ Mechanics:
   Arc-Bytes (TCP).
 - Cancel-safe on both transports: `drain_bulk_writes` owns the `PooledBuf` across the
   recv (UCX `InflightSlot` drains the NIC on drop; TCP compio retains the owned
-  buffer until the read CQE lands). The d=1 fast path is skipped when
-  `drain_bulk_writes` queued a reply (`inflight.is_empty()` guard) to keep in-order
-  replies.
+  buffer until the read CQE lands). All replies use the bounded in-flight queue;
+  receiving continues below the cap even when only one operation is pending.
 
 Small writes (< 64 KiB) keep the unchanged FrameDecoder path — the only added cost
-is one `peek_header` + size-check branch per frame. `drain_bulk_writes` is SKIPPED
-when authz is ON (see authz section).
+is one `peek_header` + size-check branch per frame. Bulk receive also works with
+namespace/authz checks enabled (see authz section).
 
 ## Flush Pipeline
 
@@ -1407,9 +1406,10 @@ signing key configured cluster-wide) ⇒ the whole gate is skipped, so fuse / kv
 dev pay nothing. `enabled` flips true only after the config poll installs a keyring.
 
 INVARIANT — **ONE choke point: `authz_gate`, at the TOP of every frame dispatch,
-BEFORE routing.** Called from exactly two places — `push_one_frame_to_inflight` (the
-canonical dispatch; also covers `push_frames_to_inflight` + the idle-branch direct
-pushes) and `d1_fast_path_round_trip` (the d=1 inline path). It:
+BEFORE admission.** Called from `push_one_frame_to_inflight` and from
+`drain_bulk_writes`. Bulk receive checks the verified control before allocating a
+value slab, then checks again after receive so expiry/revocation during the await
+cannot bypass normal admission semantics. It:
 - handles `MSG_AUTH_HELLO`: `verify_auth_hello` (sig + `aud == cluster_id` +
   `nbf`/`exp`) binds the per-connection `principal: Option<BoundPrincipal>`. When
   authz is OFF, AUTH_HELLO is a no-op OK so an authz-aware client still works against
@@ -1420,11 +1420,15 @@ pushes) and `d1_fast_path_round_trip` (the d=1 inline path). It:
   (whole scan interval ⊆ one allowed prefix). Reject ⇒ a `PermissionDenied` frame is
   emitted and the frame NEVER reaches serve/delegate.
 
-**`drain_bulk_writes` is SKIPPED when authz is ON** (`!gate_active()`) — the bulk
-write-recv fast path bypasses `authz_gate`, so with authz on a large bulk write
-(`MSG_PUT_BULK` / `MSG_BATCH_PUT_BULK`) is left to the normal `FrameDecoder` path where `push_one_frame_to_inflight`'s gate
-enforces uniformly (one value copy — acceptable; large writes are rare on `mem/`).
-Never re-enable it under authz without moving the key check into it.
+**Bulk writes retain authorization and pooled receive together.** A pre-receive
+rejection leaves the frame in the decoder for normal consumption/rejection; an
+admission-time rejection replies after pooled receive and drops its value without
+enqueueing it. The inline depth-one round trip and single-inflight receive pause
+are gone: a single received frame does not establish client pipeline depth.
+Cached GET handlers that finish on their first poll append their replies directly
+to the output batch. Suspended handlers remain pinned in the in-flight queue, so
+the first poll never cancels an operation or blocks receive. A single output
+buffer uses `write_all`; multiple buffers retain the chunked vectored writer.
 
 **Two load-bearing INVARIANTS (breaking either = silent cross-tenant exposure):**
 1. Any new frame-dispatch path (a new local-serve fast path, a new inline handler off

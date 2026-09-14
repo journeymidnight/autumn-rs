@@ -238,7 +238,15 @@ async fn prepare_inner(
     if let Some(s) = &meta.stripe {
         s.checked().map_err(|e| anyhow!("read {ino}: {e}"))?;
     }
-    let ext = extent::extents_snapshot(state, ino, file_size, meta.stripe.as_ref()).await?;
+    let ext = extent::read_extents(
+        state,
+        ino,
+        file_size,
+        meta.stripe.as_ref(),
+        offset,
+        read_end,
+    )
+    .await?;
     let mut chunks: Vec<ChunkSpec> = Vec::new();
     for &(start, len) in &ext {
         let e_end = start + len as u64;

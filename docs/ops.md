@@ -26,6 +26,38 @@ and the per-crate `crates/*/CLAUDE.md`.
 
 ## Binaries & ports
 
+### Core-path performance validation
+
+Use an isolated cluster and dedicated data directories. Keep RF, partition layout,
+CPU affinity, UCX library/transport settings and dataset identical between builds.
+Wait for the PS log's `partition server serving` marker: the first listener can
+bind while other partitions are still replaying. Do not interpret that partial
+startup as a benchmark result.
+
+```sh
+cargo test -p autumn-transport --features ucx --test init
+cargo test -p autumn-client --lib
+cargo test -p autumn-partition-server --lib
+cargo test -p autumn-stream --test extent_pipeline --test extent_append_semantics
+cargo test -p autumn-fuse --lib
+cargo test -p autumn-manager --test system_fuse_read --test system_fuse_ns -- --include-ignored --test-threads=1
+
+# Requires a registered bench namespace. Load the fixed 256-key set once.
+cargo bench -p autumn-server --features ucx --bench core_path -- 127.0.0.1:29001 tcp 8388608 8 8 load
+cargo bench -p autumn-server --features ucx --bench core_path -- 127.0.0.1:29001 tcp 8388608 8 8 write
+cargo bench -p autumn-server --features ucx --bench core_path -- 127.0.0.1:29001 tcp 8388608 8 8 read
+cargo bench -p autumn-server --features ucx --bench core_path -- 127.0.0.1:29001 tcp 8388608 8 8 direct
+cargo bench -p autumn-fuse --bench read_plan -- 127.0.0.1:29001 2000
+```
+
+For UCX use the RoCE address, `ucx` argument and explicitly pinned `UCX_NET_DEVICES`;
+record `ucx_info -v`. Repeat read-only runs after writes/flushes settle. The fixed
+benchmark samples one in 16 operation latencies. The read-plan benchmark uses
+synthetic cached maps, so its timing measures planning only, not file throughput.
+`perf-check --partitions` does not create partitions and its read dataset depends
+on the preceding write count; retain it as an end-to-end smoke test, but use the
+fixed-key benchmark for comparisons sensitive to cache/SST state.
+
 | Binary | Default port | Role |
 |---|---|---|
 | `autumn-manager-server` | 9001 | Control plane (streams, partitions, recovery) |

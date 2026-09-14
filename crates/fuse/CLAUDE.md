@@ -1,5 +1,15 @@
 # autumn-fuse Architecture Guide
 
+## Range-local read planning
+
+`read::prepare` calls `extent::read_extents`: striped files calculate only the
+requested units from the inode's persisted geometry; the same global extent-count
+validation remains in `schema::striped_extent_count`. Legacy cached maps are binary
+searched and only their intersecting entries are copied. Cold legacy reads still
+scan once and retain the map when an inode cache entry exists. No read semantics or
+on-disk format changes. The `read_plan` benchmark measures cached planning across
+1/64/1024 GiB logical files separately from network/disk I/O.
+
 ## Purpose
 
 FUSE 文件系统层，将 autumn-rs KV 存储挂载为 POSIX 文件系统。设计借鉴 3FS

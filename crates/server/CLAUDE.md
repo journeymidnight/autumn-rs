@@ -1,5 +1,15 @@
 # autumn-server Crate Guide
 
+## Fixed-key core path benchmark
+
+`cargo bench -p autumn-server --features ucx --bench core_path -- <manager>
+<tcp|ucx> <bytes> <seconds> <depth> <load|write|read|direct>` uses 256 fixed keys
+under `bench/core-path`, warms each measured operation for two seconds, and fails
+on RPC errors or missing/short values. Load once before a comparison. Run both
+versions against the same data and layout: `perf-check` derives its read set from
+the preceding write phase, so its read results can change with write throughput.
+The benchmark is single-threaded and reports sampled operation latency (1/16).
+
 ## Purpose
 
 Binary-only crate: the executable entry points that wire the library crates together, plus one-off repair tooling. No library logic lives here.

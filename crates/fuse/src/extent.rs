@@ -39,6 +39,65 @@ use crate::state::FsState;
 /// Range-scan page size when rebuilding the extent map of a large file.
 const RANGE_PAGE: u32 = 8192;
 
+/// Return only extents intersecting this read. Cached legacy maps are searched
+/// in place; striped files derive their keys from the requested range instead
+/// of allocating a map proportional to the entire file.
+pub async fn read_extents(
+    state: &mut FsState,
+    ino: u64,
+    file_size: u64,
+    stripe: Option<&StripeLayout>,
+    start: u64,
+    end: u64,
+) -> Result<Vec<(u64, u32)>> {
+    if let Some(stripe) = stripe {
+        let (_, unit) = stripe.checked().map_err(|e| anyhow!(e))?;
+        crate::schema::striped_extent_count(file_size, unit).map_err(|e| anyhow!(e))?;
+        return Ok(striped_read_extents(file_size, unit, start, end));
+    }
+    if let Some(ext) = state.inodes.get(&ino).and_then(|is| is.extents.as_ref()) {
+        return Ok(overlapping_extents(ext, start, end).to_vec());
+    }
+    let ext = scan_extents(state, ino, file_size, None).await?;
+    let selected = overlapping_extents(&ext, start, end).to_vec();
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.extents = Some(ext);
+    }
+    Ok(selected)
+}
+
+fn overlapping_extents(ext: &[(u64, u32)], start: u64, end: u64) -> &[(u64, u32)] {
+    if start >= end {
+        return &ext[..0];
+    }
+    let first = ext.partition_point(|&(s, len)| s.saturating_add(len as u64) <= start);
+    let last = ext.partition_point(|&(s, _)| s < end);
+    &ext[first..last]
+}
+
+fn striped_read_extents(file_size: u64, unit: u32, start: u64, end: u64) -> Vec<(u64, u32)> {
+    let end = end.min(file_size);
+    if start >= end {
+        return Vec::new();
+    }
+    let unit = unit as u64;
+    let mut pos = start / unit * unit;
+    let mut out = Vec::new();
+    while pos < end {
+        // Match the legacy map's extent-length cap, including a persisted
+        // stripe unit larger than the current MAX_EXTENT.
+        let len = unit.min(file_size - pos).min(MAX_EXTENT as u64) as u32;
+        if pos.saturating_add(len as u64) > start {
+            out.push((pos, len));
+        }
+        match pos.checked_add(unit) {
+            Some(next) => pos = next,
+            None => break,
+        }
+    }
+    out
+}
+
 /// Return this inode's extent map (`(start, len)` sorted by start), loading the
 /// runtime cache from the KV layer when cold. Returns a clone so callers can use
 /// it without holding a borrow on `state` across `await`s.
@@ -661,6 +720,48 @@ pub async fn clean_beyond_eof(state: &mut FsState, ino: u64, eof: u64) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_selection_matches_full_scan_including_holes_and_boundaries() {
+        let ext = [(0, 4), (4, 6), (20, 8), (100, 3)];
+        for start in 0..110 {
+            for end in start..110 {
+                let expected: Vec<_> = ext
+                    .iter()
+                    .copied()
+                    .filter(|&(s, l)| start < end && s < end && s + l as u64 > start)
+                    .collect();
+                assert_eq!(overlapping_extents(&ext, start, end), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn striped_read_selection_matches_persisted_geometry() {
+        for unit in [1, 4096, MAX_EXTENT as u32, 2 * MAX_EXTENT as u32] {
+            let size = 3 * unit as u64 + 17;
+            let starts = crate::schema::striped_extent_offsets(size, unit).unwrap();
+            let full = infer_lengths(&starts, size);
+            for start in [0, 1, unit as u64 - 1, unit as u64, size - 1, size] {
+                for len in [0, 1, 4096, unit as u64 + 1] {
+                    let end = (start + len).min(size);
+                    assert_eq!(
+                        striped_read_extents(size, unit, start, end),
+                        overlapping_extents(&full, start, end)
+                    );
+                }
+            }
+        }
+        let size = 1u64 << 40;
+        assert_eq!(
+            striped_read_extents(size, MAX_EXTENT as u32, size - 4096, size),
+            vec![(size - MAX_EXTENT as u64, MAX_EXTENT as u32)]
+        );
+        assert_eq!(
+            striped_read_extents(u64::MAX, 4096, u64::MAX - 1, u64::MAX),
+            vec![(u64::MAX - 4095, 4095)]
+        );
+    }
 
     #[test]
     fn infer_lengths_contiguous() {

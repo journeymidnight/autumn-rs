@@ -1,5 +1,12 @@
 # autumn-client Crate Guide
 
+## Batched direct-read descriptor concurrency
+
+`get_many_direct` submits partition descriptor requests through `fan_out_collect`
+with `BATCH_GET_DEFAULT_CONCURRENCY`, instead of waiting for each partition in turn.
+The original item indices accompany each result. Per-partition descriptor failures
+retain the existing per-item fallback; data fan-out starts after collection.
+
 ## Purpose
 
 Client SDK for an autumn-rs cluster. Provides the ergonomic `ClusterClient` API for

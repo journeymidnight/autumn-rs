@@ -4835,13 +4835,9 @@ fn ps_conn_inflight_cap() -> usize {
     *PS_CONN_INFLIGHT_CAP_CELL.get_or_init(|| 4)
 }
 
-/// fix — observability counter for the d=1 fast path. Incremented
-/// once per inline round-trip taken by `handle_ps_connection`. Exposed for
-/// tests only; the `fetch_add` on an AtomicU64 is ~1 ns so the cost is
-/// negligible on the hot path. In production the counter only grows — no
-/// reader, no resetter — so there is no cache-line contention (single
-/// writer per conn, separate allocator-decided line for the static).
-pub(crate) static PS_FAST_PATH_HITS: std::sync::atomic::AtomicU64 =
+/// Test-only count of receive iterations carrying one complete frame.
+#[cfg(test)]
+pub(crate) static PS_SINGLE_FRAME_RECV_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 /// (W1) — count of `MSG_PUT_BULK` values recv'd straight into a registered
@@ -4852,7 +4848,7 @@ pub(crate) static PS_BULK_WRITE_RECV_HITS: std::sync::atomic::AtomicU64 =
 
 /// Workspace-wide serialization guard for tests that exercise
 /// `handle_ps_connection`. The function bumps a process-global counter
-/// (`PS_FAST_PATH_HITS`) so any parallel test using the same path
+/// (`PS_SINGLE_FRAME_RECV_HITS`) so any parallel test using the same path
 /// invalidates `write_batch_fastpath_tests`' exact-delta assertions. All such tests
 /// acquire this lock for the duration of their TCP round-trips.
 ///
@@ -4941,8 +4937,8 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Vec<Bytes>)) {
 /// UCX + TCP — drain LARGE value-separable write frames at the FRONT of
 /// `decoder`, recv'ing the raw tail straight into a `PooledBuf` instead of
 /// letting `FrameDecoder` accumulate it (which would copy the whole thing into
-/// the decoder buffer). On UCX the buffer is registered → RDMA recv, no off-wire
-/// copy; on TCP the value is recv'd via a compio owned read
+/// the decoder buffer). UCX receives into a registered, reusable slab (Stream
+/// still has its own unpack copy); TCP receives via a compio owned read
 /// (`read_exact_into_pooled`) → only the unavoidable kernel→userspace copy
 /// remains (the app-level FrameDecoder copy is gone). The frame is routed as a
 /// `PartitionRequest { payload = ctrl, bulk_value = Some(tail) }` so the enqueue
@@ -4980,6 +4976,8 @@ async fn drain_bulk_writes(
     >,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
+    authz: &crate::authz::AuthzState,
+    principal: &mut Option<crate::authz::BoundPrincipal>,
 ) -> Result<()> {
     use futures::FutureExt;
     loop {
@@ -5050,6 +5048,12 @@ async fn drain_bulk_writes(
                 .peek_ctrl(ctrl_len)
                 .expect("prologue verified => ctrl buffered"),
         );
+        // Check the verified control bytes before allocating a value slab. A
+        // refused request stays intact in the decoder and follows normal
+        // framing/dispatch, which consumes its tail and replies with the error.
+        if authz_gate(msg_type, &ctrl_bytes, req_id, authz, principal).is_some() {
+            return Ok(());
+        }
 
         // Back-pressure before adding another in-flight reply.
         while inflight.len() >= cap {
@@ -5070,7 +5074,7 @@ async fn drain_bulk_writes(
             decoder.drain_into(dest)
         };
         if reader.is_ucx() {
-            // UCX: registered RDMA recv straight into the pinned buffer.
+            // UCX Stream receive into the slab, bypassing FrameDecoder.
             let mut filled = filled;
             let (dest, reg) = pb.dest_and_reg();
             while filled < value_len {
@@ -5093,6 +5097,13 @@ async fn drain_bulk_writes(
                 })?;
         }
         let value = Bytes::from_owner(pb);
+        // Receiving may yield long enough for a namespace removal, key
+        // revocation or token expiry. Match normal dispatch's admission-time
+        // check rather than relying on the pre-receive snapshot.
+        if let Some(reply) = authz_gate(msg_type, &ctrl_bytes, req_id, authz, principal) {
+            inflight.push(async move { (reply, Vec::new()) }.boxed_local());
+            continue;
+        }
 
         // Observability: count + log-once that the bulk write-recv path is live.
         if PS_BULK_WRITE_RECV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
@@ -5121,7 +5132,7 @@ async fn drain_bulk_writes(
 }
 
 /// Mis-routed-frame error (part_id != owner_part): a `NotFound` frame, no mpsc
-/// hop. Single-sourced for `push_one_frame_to_inflight` + `d1_fast_path_round_trip`.
+/// hop. Single-sourced for `push_one_frame_to_inflight`.
 /// TODO: forward to the owning P-log's req_tx instead of synthing here.
 fn misroute_frame(req_id: u32, msg_type: u8, part_id: u64, owner_part: u64) -> Bytes {
     let err_payload = autumn_rpc::RpcError::encode_status(
@@ -5214,9 +5225,7 @@ async fn serve_read_local(
 /// Delegate a request to `partition_loop` over the same-thread mpsc and await its
 /// response, returning the encoded response frame. Single-sources the
 /// "partition thread closed" / "partition response dropped" wording shared by the
-/// three delegate sites (`drain_bulk_writes`, `push_one_frame_to_inflight`,
-/// `d1_fast_path_round_trip`). A plain `async fn` (NOT boxed) so the d=1 fast path
-/// can await it inline without the per-frame heap alloc the batching path avoids.
+/// delegate sites (`drain_bulk_writes`, `push_one_frame_to_inflight`).
 async fn delegate_round_trip(
     mut tx: mpsc::Sender<PartitionRequest>,
     req_id: u32,
@@ -5494,6 +5503,7 @@ fn push_one_frame_to_inflight(
     // connection authz runtime + per-connection bound principal.
     authz: &crate::authz::AuthzState,
     principal: &mut Option<crate::authz::BoundPrincipal>,
+    tx_bufs: &mut Vec<Bytes>,
 ) {
     use futures::FutureExt;
     let req_id = frame.req_id;
@@ -5534,10 +5544,17 @@ fn push_one_frame_to_inflight(
     ) {
         if let Some(part) = part {
             let part_c = part.clone();
-            inflight.push(
+            let mut response =
                 async move { serve_get_local(req_id, msg_type, payload, &part_c).await }
-                    .boxed_local(),
-            );
+                    .boxed_local();
+            // Cached reads often finish on the first poll. Collect their
+            // response immediately; only suspended reads need the in-flight
+            // queue. Never await here: disk/network reads must leave receive
+            // free to accept the peer's next request.
+            match response.as_mut().now_or_never() {
+                Some(done) => push_resp(tx_bufs, done),
+                None => inflight.push(response),
+            }
             return;
         }
     }
@@ -5609,7 +5626,7 @@ async fn push_frames_to_inflight(
                     }
                 }
                 push_one_frame_to_inflight(
-                    frame, req_tx, part, owner_part, inflight, authz, principal,
+                    frame, req_tx, part, owner_part, inflight, authz, principal, tx_bufs,
                 );
             }
             Some(_) => continue, // req_id == 0 fire-and-forget
@@ -5617,77 +5634,6 @@ async fn push_frames_to_inflight(
         }
     }
     Ok(())
-}
-
-/// fix — d=1 fast path.  Run a single request round-trip inline
-/// without going through `FuturesUnordered` or `Box<dyn Future>` at all.
-/// Returns the encoded response frame bytes ready for `write_all`.
-///
-/// Precondition enforced by caller: `inflight.is_empty()` and
-/// `tx_bufs.is_empty()`.  Frame must have `req_id != 0` (fire-and-forget
-/// has no reply).  Misrouted frames synth a local error frame without
-/// touching the mpsc — same ordering as the slow path.
-///
-/// This path avoids: (a) `Box::pin(async move { ... })` heap alloc,
-/// (b) `FuturesUnordered::push` pinning ceremony, (c) `FuturesUnordered::next`
-/// state-machine poll cost, (d) `write_vectored_all` with a single iov (goes
-/// through sendmsg/UIO_MAXIOV setup) in favor of `write_all` (send/write).
-/// Measured as ~6.5 % of the N=1 × d=1 write throughput on tmpfs;
-/// this restores the pre-batching baseline for the depth=1 hot path while
-/// preserving the depth≥2 batching gains.
-async fn d1_fast_path_round_trip(
-    frame: Frame,
-    req_tx: &mpsc::Sender<PartitionRequest>,
-    part: &Option<Rc<RefCell<PartitionData>>>,
-    owner_part: u64,
-    // connection authz runtime + per-connection bound principal.
-    authz: &crate::authz::AuthzState,
-    principal: &mut Option<crate::authz::BoundPrincipal>,
-) -> (Bytes, Vec<Bytes>) {
-    let req_id = frame.req_id;
-    let msg_type = frame.msg_type;
-    let mut payload = frame.payload;
-    // v28: raw value tail of a value-separable request (see
-    // push_one_frame_to_inflight).
-    let frame_value = frame.value;
-    // AUTH_HELLO bind / per-request gate (synchronous, before the
-    // first await). A handled frame returns its reply directly.
-    if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, principal) {
-        return (reply, Vec::new());
-    }
-    // (PS slice): admin gate + strip before part-id extraction.
-    if let Some(reply) = admin_ps_gate_and_strip(msg_type, &mut payload, req_id, authz) {
-        return (reply, Vec::new());
-    }
-    let part_id = partition_rpc::extract_part_id(msg_type, &payload);
-
-    if part_id != owner_part {
-        return (misroute_frame(req_id, msg_type, part_id, owner_part), Vec::new());
-    }
-
-    // (Option B): d=1 GET served locally too — same rationale as
-    // push_one_frame_to_inflight. part == None (unit tests) → delegate.
-    if matches!(
-        msg_type,
-        MSG_GET | MSG_GET_BULK | partition_rpc::MSG_BATCH_GET_BULK
-    ) {
-        if let Some(part) = part {
-            return serve_get_local(req_id, msg_type, payload, part).await;
-        }
-    }
-    // Mode B fix: d=1 RANGE / HEAD served locally too (see push_one_frame_to_inflight).
-    if msg_type == MSG_RANGE || msg_type == MSG_HEAD {
-        if let Some(part) = part {
-            return serve_read_local(req_id, msg_type, payload, part).await;
-        }
-    }
-
-    let tx = req_tx.clone();
-    let bulk_value = (!frame_value.is_empty()).then_some(frame_value);
-    (
-        delegate_round_trip(tx, req_id, msg_type, payload, bulk_value, owner_part).await,
-        Vec::new(),
-    )
 }
 
 /// Handle a single client connection on the P-log runtime.
@@ -5701,8 +5647,6 @@ async fn d1_fast_path_round_trip(
 ///   - Each loop iteration opportunistically drains ready completions into
 ///     `tx_bufs`, flushes `tx_bufs` with a SINGLE `write_vectored_all`
 ///     syscall, then races read vs inflight.next() when both are live.
-///   - At `--pipeline-depth=1` degenerates to `write_vectored_all([one_frame])`
-///     — same cost as the old `write_all(one_frame)`; no regression.
 ///   - At `--pipeline-depth ≥ N` steady state, the drain-loop collects up
 ///     to N frames per burst → one `tcp_sendmsg` instead of N → targeted
 ///     win against the 0.8-core small-frame TCP kernel overhead.
@@ -5774,7 +5718,12 @@ async fn handle_ps_connection(
         // was unreachable; a batched read reply contributes one per value.
         if !tx_bufs.is_empty() {
             let bufs = std::mem::take(&mut tx_bufs);
-            autumn_rpc::client::write_vectored_chunked(&mut writer, bufs).await?;
+            if bufs.len() == 1 {
+                let BufResult(result, _) = writer.write_all(bufs.into_iter().next().unwrap()).await;
+                result?;
+            } else {
+                autumn_rpc::client::write_vectored_chunked(&mut writer, bufs).await?;
+            }
         }
 
         // (C) Decide what to wait on.
@@ -5796,72 +5745,30 @@ async fn handle_ps_connection(
                     // front straight into a PooledBuf (UCX registered RDMA / TCP
                     // compio owned read — no FrameDecoder accumulation copy)
                     // before the normal decode buffers them. May push write
-                    // replies onto `inflight`, which disables the d=1 fast path
-                    // below (guarded by is_empty()).
-                    // when authz is ON, skip the bulk-recv fast path so a
-                    // large bulk write flows through the normal FrameDecoder path
-                    // where `push_one_frame_to_inflight`'s gate enforces the key
-                    // prefix uniformly (the bulk path bypasses that dispatch). The
-                    // perf cost (a value copy on large authz-gated writes) is
-                    // acceptable — large writes are rare on the `mem/` workload.
-                    if !authz.gate_active() {
-                        drain_bulk_writes(
-                            &mut decoder,
-                            &mut reader,
-                            &req_tx,
-                            owner_part,
-                            &mut inflight,
-                            &mut tx_bufs,
-                            cap,
-                        )
-                        .await?;
-                    }
+                    // replies onto the same bounded in-flight queue.
+                    drain_bulk_writes(
+                        &mut decoder,
+                        &mut reader,
+                        &req_tx,
+                        owner_part,
+                        &mut inflight,
+                        &mut tx_bufs,
+                        cap,
+                        &authz,
+                        &mut principal,
+                    )
+                    .await?;
 
-                    // fix — d=1 fast path: when this read yielded exactly
-                    // one full frame and nothing else is pending, run the
-                    // request→response→write inline (no FU push, no Box::pin, no
-                    // write_vectored). Measured -6.5% at d=1 from that
-                    // per-frame ceremony; this restores the baseline while keeping
-                    // the d≥2 batching gains. The engage guard below
-                    // (`more.is_none() && req_id != 0 && inflight.is_empty()`) is
-                    // load-bearing: with inflight + tx_bufs empty no earlier
-                    // reply is waiting, so the inline write preserves in-order
-                    // reply semantics for this connection.
+                    // A single complete frame says nothing about the peer's
+                    // pipeline depth. Queue it so a suspended handler cannot
+                    // prevent the next request from entering this connection.
                     let first = decoder.try_decode().map_err(|e| anyhow!(e))?;
                     if let Some(frame) = first {
                         let more = decoder.try_decode().map_err(|e| anyhow!(e))?;
-                        // `inflight.is_empty()`: drain_bulk_writes above may have
-                        // queued a write reply — if so, the d=1 inline path would
-                        // write its response ahead of that reply, breaking in-order
-                        // semantics. Fall through to the FU path in that case.
+                        #[cfg(test)]
                         if more.is_none() && frame.req_id != 0 && inflight.is_empty() {
-                            // Engage fast path.
-                            PS_FAST_PATH_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let (head, values) = d1_fast_path_round_trip(
-                                frame,
-                                &req_tx,
-                                &part,
-                                owner_part,
-                                &authz,
-                                &mut principal,
-                            )
-                            .await;
-                            // R4: a bulk reply returns its value(s) as separate
-                            // iovecs — write [head, values..] vectored, chunked
-                            // at IOV_MAX; a reply with none is a single frame
-                            // via write_all (no regression).
-                            if values.is_empty() {
-                                let BufResult(wr, _) = writer.write_all(head).await;
-                                wr?;
-                            } else {
-                                let mut bufs = Vec::with_capacity(1 + values.len());
-                                bufs.push(head);
-                                bufs.extend(values);
-                                autumn_rpc::client::write_vectored_chunked(&mut writer, bufs)
-                                    .await?;
-                            }
-                            read_fut = Some(spawn_ps_read(reader, buf));
-                            continue;
+                            PS_SINGLE_FRAME_RECV_HITS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
                         // Fall back: push the first frame (if it had a
                         // req_id) and any second frame we decoded,
@@ -5875,6 +5782,7 @@ async fn handle_ps_connection(
                                 &mut inflight,
                                 &authz,
                                 &mut principal,
+                                &mut tx_bufs,
                             );
                         }
                         if let Some(second) = more {
@@ -5887,6 +5795,7 @@ async fn handle_ps_connection(
                                     &mut inflight,
                                     &authz,
                                     &mut principal,
+                                    &mut tx_bufs,
                                 );
                             }
                         }
@@ -5910,22 +5819,10 @@ async fn handle_ps_connection(
             continue;
         }
 
-        // Await a completion alone (don't race the read) when either:
-        //  - `at_cap`: back-pressure — no room to launch more anyway; or
-        //  - `n_inflight == 1`: the client is typically waiting on THIS reply
-        //    before submitting more, so racing the read buys nothing (it stays
-        //    Pending until the completion lands) and costs ~5-10 µs/iter of
-        //    polling. Matches the ExtentNode v3 fast-path branch.
-        // The read future stays pinned in `read_fut`, untouched.
-        //
-        // DIAGNOSTIC (not a fix): this await is where a wedged connection sits
-        // forever. Parked here the task stops reading the socket, so the
-        // client's request bytes pile up unread and the client — which has no
-        // deadline on a bulk put — waits for a reply that is never coming.
-        // Measured live: 100-220 MiB unread per partition, for hours, with
-        // nothing logged anywhere. A tick makes the wait say what it is waiting
-        // for; it does not end the wait.
-        if at_cap || n_inflight == 1 {
+        // Only the explicit in-flight cap suspends receiving. A single
+        // pending operation does not imply the peer has no more work to send.
+        // Keep diagnostics for a peer whose admitted work stops completing.
+        if at_cap {
             let mut waited = Duration::ZERO;
             loop {
                 let tick = compio::time::sleep(STUCK_INFLIGHT_REPORT_EVERY);
@@ -5987,21 +5884,18 @@ async fn handle_ps_connection(
                         decoder.feed(&buf[..n]);
                         // recv large bulk-write tails into
                         // pooled buffers first (UCX registered / TCP owned read).
-                        // D7: skip when EITHER layer is on
-                        // (see the idle-branch note) so a large PUT_ZC is enforced
-                        // (Layer-A + Layer-B) on the normal FrameDecoder path.
-                        if !authz.gate_active() {
-                            drain_bulk_writes(
-                                &mut decoder,
-                                &mut reader,
-                                &req_tx,
-                                owner_part,
-                                &mut inflight,
-                                &mut tx_bufs,
-                                cap,
-                            )
-                            .await?;
-                        }
+                        drain_bulk_writes(
+                            &mut decoder,
+                            &mut reader,
+                            &req_tx,
+                            owner_part,
+                            &mut inflight,
+                            &mut tx_bufs,
+                            cap,
+                            &authz,
+                            &mut principal,
+                        )
+                        .await?;
                         push_frames_to_inflight(
                             &mut decoder,
                             &req_tx,
@@ -12266,7 +12160,7 @@ mod single_thread_write_tests {
     #[test]
     fn single_threaded_write_path_no_router() {
         // Serialize with write_batch_fastpath_tests + sqcq_tests to keep
-        // PS_FAST_PATH_HITS coherent across the test process.
+        // PS_SINGLE_FRAME_RECV_HITS coherent across the test process.
         let _g = super::ps_conn_test_lock();
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
@@ -13119,7 +13013,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
         const N_FRAMES: u32 = 100;
 
         // Hold the workspace ps-conn lock across the spawned thread so
-        // PS_FAST_PATH_HITS stays coherent for the two counter-asserting
+        // PS_SINGLE_FRAME_RECV_HITS stays coherent for the two counter-asserting
         // tests in this module.
         let _g = fast_path_counter_lock();
 
@@ -13296,32 +13190,207 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
     /// Re-exported workspace-wide lock — see `ps_conn_test_lock` above.
     /// Held across the entire write_batch_fastpath test body so concurrent
     /// `handle_ps_connection`-using tests don't race the
-    /// `PS_FAST_PATH_HITS` counter and break the exact-delta assertion.
+    /// `PS_SINGLE_FRAME_RECV_HITS` counter and break the exact-delta assertion.
     fn fast_path_counter_lock() -> parking_lot::MutexGuard<'static, ()> {
         super::ps_conn_test_lock()
     }
 
-    /// fix test — the d=1 fast path MUST engage when exactly one
-    /// frame is read from the TCP socket AND nothing else is in flight.
-    ///
-    /// We verify by sending 10 synchronous Put→reply round-trips on one
-    /// connection and asserting `PS_FAST_PATH_HITS` grows by 10.  Each
-    /// round-trip awaits the reply before sending the next, so every
-    /// read delivers exactly one frame to a ps-conn task that has just
-    /// finished writing the previous reply (inflight empty, tx_bufs
-    /// empty) — textbook fast-path conditions.
-    ///
-    /// This test also doubles as a regression guard: if a future change
-    /// re-introduces FU+Box allocation on the d=1 hot path, the hit
-    /// counter stays at 0 and the test fails.
+    fn namespace_authz() -> std::sync::Arc<crate::authz::AuthzState> {
+        let authz = crate::authz::AuthzState::new();
+        authz.install(&manager_rpc::GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: false,
+            public_keys: Vec::new(),
+            protected_prefixes: Vec::new(),
+            namespaces: vec![b"fs/".to_vec()],
+            admin_token: Vec::new(),
+            token_ttl_secs: 3600,
+            clock_skew_secs: 60,
+            cluster_id: "perf-test".to_string(),
+        });
+        std::sync::Arc::new(authz)
+    }
+
     #[test]
-    fn d1_fast_path_no_fu_allocation() {
+    fn later_request_is_received_before_the_first_reply() {
+        let _guard = fast_path_counter_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            for bulk in [false, true] {
+                let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut client = compio::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (server, _) = listener.accept().await.unwrap();
+                let (tx, mut rx) = mpsc::channel(8);
+                let conn = compio::runtime::spawn(handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    tx,
+                    None,
+                    11,
+                    namespace_authz(),
+                ));
+                let mut requests = Vec::new();
+                for id in 1..=2 {
+                    let frame = if bulk {
+                        Frame::request_zc(
+                            id,
+                            MSG_PUT_BULK,
+                            partition_rpc::encode_put_bulk_meta(11, 0, 0, b"fs/k", 0, 0),
+                            Bytes::from(vec![id as u8; 128 * 1024]),
+                        )
+                    } else {
+                        Frame::request(
+                            id,
+                            MSG_PUT,
+                            partition_rpc::rkyv_encode(&PutReq {
+                                part_id: 11,
+                                region_epoch: 0,
+                                key: b"fs/k".to_vec(),
+                                value: vec![id as u8; 4096],
+                                expires_at: 0,
+                                inode_hint: 0,
+                                lease_epoch: 0,
+                            }),
+                        )
+                    };
+                    client.write_all(frame.encode()).await.0.unwrap();
+                    // Retain the responder without replying. The next request
+                    // must enter independently of the first one's completion.
+                    let req = compio::time::timeout(Duration::from_secs(2), rx.next())
+                        .await
+                        .expect("connection stopped receiving behind its first pending request")
+                        .expect("request channel closed");
+                    if bulk {
+                        assert_eq!(req.bulk_value.as_ref().unwrap()[0], id as u8);
+                    }
+                    requests.push(req);
+                }
+                drop(requests);
+                drop(client);
+                drop(rx);
+                let _ = conn.await;
+            }
+        });
+    }
+
+    #[test]
+    fn rejected_bulk_tail_does_not_hide_the_next_frame() {
+        let _guard = fast_path_counter_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = compio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let conn = compio::runtime::spawn(handle_ps_connection(
+                autumn_transport::Conn::Tcp(server),
+                tx,
+                None,
+                11,
+                namespace_authz(),
+            ));
+            for (id, key) in [(1, &b"unknown/k"[..]), (2, &b"fs/k"[..])] {
+                let frame = Frame::request_zc(
+                    id,
+                    MSG_PUT_BULK,
+                    partition_rpc::encode_put_bulk_meta(11, 0, 0, key, 0, 0),
+                    Bytes::from(vec![id as u8; 128 * 1024]),
+                );
+                client.write_all(frame.encode()).await.0.unwrap();
+            }
+            let req = compio::time::timeout(Duration::from_secs(2), rx.next())
+                .await
+                .expect("valid request must survive a rejected bulk frame")
+                .unwrap();
+            assert_eq!(
+                req.bulk_value.as_ref().unwrap()[0],
+                2,
+                "only the authorized value is admitted"
+            );
+            drop(req);
+            drop(client);
+            drop(rx);
+            let _ = conn.await;
+        });
+    }
+
+    #[test]
+    fn bulk_receive_rechecks_namespace_after_waiting_for_value() {
+        let _guard = fast_path_counter_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = compio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (mut reader, _writer) = autumn_transport::Conn::Tcp(server).into_split();
+            let authz = namespace_authz();
+            let ctrl = partition_rpc::encode_put_bulk_meta(11, 0, 0, b"fs/k", 0, 0);
+            let value = Bytes::from(vec![0xa5; 128 * 1024]);
+            let wire = Frame::request_zc(1, MSG_PUT_BULK, ctrl, value.clone()).encode();
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&wire[..wire.len() - value.len()]);
+            let (tx, mut rx) = mpsc::channel(8);
+            let mut inflight = FuturesUnordered::new();
+            let mut replies = Vec::new();
+            let mut principal = None;
+            let receive = drain_bulk_writes(
+                &mut decoder,
+                &mut reader,
+                &tx,
+                11,
+                &mut inflight,
+                &mut replies,
+                4,
+                &authz,
+                &mut principal,
+            );
+            let send = async {
+                // join polls receive first: its initial namespace check passes
+                // and it waits for the absent tail before this config changes.
+                authz.install(&manager_rpc::GetAuthzConfigResp {
+                    code: 0,
+                    message: String::new(),
+                    enabled: false,
+                    public_keys: Vec::new(),
+                    protected_prefixes: Vec::new(),
+                    namespaces: vec![b"other/".to_vec()],
+                    admin_token: Vec::new(),
+                    token_ttl_secs: 3600,
+                    clock_skew_secs: 60,
+                    cluster_id: "perf-test".to_string(),
+                });
+                client.write_all(value).await.0.unwrap();
+            };
+            let (r, ()) = futures::join!(receive, send);
+            r.unwrap();
+            let (reply, values) = compio::time::timeout(Duration::from_secs(2), inflight.next())
+                .await
+                .expect("revoked namespace must be rejected, not delegated")
+                .unwrap();
+            assert!(values.is_empty());
+            let mut response = FrameDecoder::new();
+            response.feed(&reply);
+            assert!(response.try_decode().unwrap().unwrap().is_error());
+            assert!(
+                rx.try_next().is_err(),
+                "revoked write must not reach the partition"
+            );
+        });
+    }
+
+    /// Sequential requests must each receive a complete response and be
+    /// observed as single-frame receive iterations.
+    #[test]
+    fn sequential_single_frame_round_trips() {
         let _guard = fast_path_counter_lock();
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             // Snapshot the counter before we start — the lock ensures no
             // other fast-path-observing test is concurrently running.
-            let before = PS_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let before = PS_SINGLE_FRAME_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
 
             let listener = compio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -13395,11 +13464,11 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 assert!(!resp_frame.is_error());
             }
 
-            let after = PS_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let after = PS_SINGLE_FRAME_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
             let delta = after - before;
             assert_eq!(
                 delta, N as u64,
-                "d=1 fast path must engage exactly N={N} times; \
+                "single-frame receive must occur exactly N={N} times; \
                  observed delta={delta} (before={before}, after={after})"
             );
 
@@ -13447,7 +13516,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                     req_tx,
                     None,
                     /*owner_part=*/ 11,
-                    std::sync::Arc::new(crate::authz::AuthzState::new()),
+                    namespace_authz(),
                 )
                 .await
             });
@@ -13466,7 +13535,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 .map(|(i, v)| partition_rpc::BatchPutBulkOp {
                     inode_hint: 0,
                     lease_epoch: 0,
-                    key: format!("bpb-{i:03}").into_bytes(),
+                    key: format!("fs/bpb-{i:03}").into_bytes(),
                     value_len: v.len() as u32,
                     expires_at: 0,
                 })
@@ -13527,20 +13596,14 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
         });
     }
 
-    /// fix test — the fast path MUST NOT engage when prior frames
-    /// are still in `inflight`.  We exercise this by flooding 8 frames
-    /// in one TCP write: the first read yields 8 frames → 8 futures in
-    /// `inflight` → slow path.  Counter must not grow.
-    ///
-    /// Correctness of the gating check `inflight.is_empty()` is critical:
-    /// if the fast path engaged mid-burst, reply order would be scrambled
-    /// (fast-path reply written before earlier in-flight replies).
+    /// A burst must produce one reply per request. Most frames in this burst
+    /// should not be counted as isolated receive iterations.
     #[test]
-    fn fast_path_inactive_under_batch() {
+    fn batched_frames_receive_all_replies() {
         let _guard = fast_path_counter_lock();
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            let before = PS_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let before = PS_SINGLE_FRAME_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
 
             let listener = compio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -13607,7 +13670,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             }
             assert_eq!(seen, N);
 
-            let after = PS_FAST_PATH_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let after = PS_SINGLE_FRAME_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
             // The first read delivers all 8 frames at once (TCP on
             // loopback typically coalesces). So fast path must not
             // engage for any of them. Allow a small drift for the

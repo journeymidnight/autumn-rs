@@ -289,8 +289,7 @@ they happen — not gated on a burst boundary.
 │    3. branch on (n_inflight, at_cap):                            │
 │       n_inflight == 0 → await read alone                         │
 │       at_cap          → await completion alone (back-pressure)   │
-│       n_inflight == 1 → await completion alone (fast path)       │
-│       n_inflight > 1  → select(read, inflight.next())            │
+│       n_inflight >= 1 → select(read, inflight.next())            │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -308,13 +307,11 @@ they happen — not gated on a burst boundary.
 total_end` BEFORE returning the I/O future into FU, so overlapping same-extent
 submits compute non-overlapping `file_start` values.
 
-**Single-inflight fast path**: at client depth against one extent, every cycle
-produces ONE batch future and the client waits on responses before sending
-more, so no new reads arrive while the pwritev is in flight. The `n_inflight ==
-1` branch awaits the completion alone (racing the always-pending read costs
-~5-10 µs/cycle for no benefit). At `n_inflight > 1` (multi-extent burst or
-mixed op) the select-based race kicks in and responses stream as each
-completion lands (`cq_flushes_fast_ops_while_slow_op_runs` guards this).
+**Keep receiving below the cap:** a pending append may be waiting for fsync while
+the peer sends more. The connection must accept those requests into the extent
+owner's mailbox before the first response, allowing the next durable burst to
+coalesce them. A regression holds the mailbox busy and requires a later append to
+arrive; restoring the single-inflight pause fails it.
 
 ### Chained append (MSG_APPEND_CHAIN, default OFF)
 

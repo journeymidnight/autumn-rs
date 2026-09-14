@@ -1,5 +1,13 @@
 Date: 2026-09-14
 TaskStatus: completed
+Task scope: Core TCP/UCX client/PS/EN and filesystem read-path performance, user-authorized implementation and H200-1 testing.
+Current summary: Restored runtime-TCP pool recycling in UCX builds; namespace/authz-aware PS pooled bulk receive with post-receive revalidation; PS/EN keep receiving below caps; immediate cached GET replies avoid pending-queue work; parallel partition descriptor lookup; range-local FUSE read planning. Wire/storage formats unchanged. Added fixed-key core benchmark and read-plan benchmark.
+Verification: H200-1 dongmao-autumn, UCX 1.16.0, RF3 NVMe (/data03,/data05,/data08), four EN shards. Final combined library tests and UCX release build pass. Client 52, PS 242+1 ignored, stream 193, FUSE 57, transport init 2. Existing stream and filesystem integration suites pass; 1GiB CLI roundtrip cmp=0. Pool/PS/EN/descriptor ablations fail as expected and restored tests pass. Scoped clippy completes with existing warnings; workspace fmt has pre-existing differences, diff-check clean. No subagents used under session delegation restriction.
+Results: docs/perf_core_path_20260914.md and perf/core_path_20260914/{results,validation}.json. TCP 8MiB writes observed 287→503–529 MiB/s; UCX writes variable. Stable read-only PS/client medians essentially flat; do not claim the larger state-dependent perf-check read gains. 1TiB cached read planning ~255us→0.18–0.27us. Raw logs/baseline/final binaries preserved under /data08/dongmao-autumn-perf-20260914. Test instances stopped after validation; data preserved.
+Next steps: Deferred protocol/CRC, CLI owned-buffer pipeline, random-write layout and per-inode barriers are listed in feature_list.md. No claim of cross-host or cold-disk read throughput.
+
+Date: 2026-09-14
+TaskStatus: completed
 Task scope: 修 c4e4d64 留下的文档错误(用户 2026-09-14 指派"修复 CLAUDE.md 的文档错误")。代码分类
   是对的,文字不对:`crates/fuse/CLAUDE.md` 说"只有三处合格"却列了五处,把 gap flush 与 truncate
   列成消费粘性记录的调用者(代码里二者是 `BestEffort`);本文件下方 2026-09-13 (9) 条目

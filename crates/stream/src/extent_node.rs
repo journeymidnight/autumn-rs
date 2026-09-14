@@ -5939,22 +5939,9 @@ impl ExtentNode {
             //      iteration. FU's internal completion state is preserved
             //      regardless of whether the wrapper is dropped or awaited.
             //
-            //      The hot microbench workload (sustained request-response
-            //      pipelining at depth=64 through one extent) produces a
-            //      single inflight future at a time; the client doesn't
-            //      send more until it drains responses. We detect this
-            //      single-inflight case and skip the select overhead —
-            //      the read future stays pinned, and we just await the
-            //      completion. This preserves SQ/CQ semantics in multi-
-            //      extent scenarios (n_inflight > 1) while regaining the
-            //      per-op overhead of the old single-task hot path.
-            if n_inflight == 1 {
-                if let Some(done) = inflight.next().await {
-                    tx_bufs.extend(done);
-                }
-                continue;
-            }
-
+            // One pending request can be waiting for disk I/O while the peer
+            // is sending the next one. Keep receiving below the cap so the
+            // extent owner can group those appends into its next durable burst.
             let rfut = read_fut.take().unwrap();
             let cfut = inflight.next();
             match select(rfut, Box::pin(cfut)).await {
@@ -10895,6 +10882,52 @@ impl ExtentNode {
 #[cfg(test)]
 mod enospc_disk_health_tests {
     use super::*;
+
+    #[compio::test]
+    async fn connection_receives_while_the_extent_owner_is_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .unwrap();
+        let extent = node.ensure_extent(6100).await.unwrap();
+        // Hold the owner mailbox as if its current durable write were still
+        // pending. The connection must accept later appends independently.
+        extent.owner.borrow_mut().running = true;
+        let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = compio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let conn = compio::runtime::spawn(ExtentNode::handle_connection(
+            autumn_transport::Conn::Tcp(server),
+            node,
+        ));
+        for id in 1..=2u32 {
+            let req = AppendReq {
+                extent_id: 6100,
+                eversion: 1,
+                commit: (id as u64 - 1) * 128,
+                owner_epoch: 1,
+                payload: Bytes::from(vec![id as u8; 128]),
+            };
+            client
+                .write_all(Frame::request(id, MSG_APPEND, req.encode()).encode())
+                .await
+                .0
+                .unwrap();
+            compio::time::timeout(Duration::from_secs(2), async {
+                while extent.owner.borrow().queue.len() < id as usize {
+                    compio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("next append must reach the busy owner before its previous reply");
+        }
+        extent.owner.borrow_mut().queue.clear();
+        extent.owner.borrow_mut().running = false;
+        drop(client);
+        let _ = conn.await;
+    }
 
     /// NB: health cells are shared per-path process-wide (multi-shard
     /// coupling, coco P1) — each test must use a distinct path.

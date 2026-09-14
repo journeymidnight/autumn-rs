@@ -4,9 +4,10 @@
 //! reuse it across ops. Each `PooledBuf` owns a stable-address `Vec<u8>` plus a
 //! `RegisteredMem` over it; on drop the buffer returns to a thread-local
 //! free-list keyed by power-of-two size class (so non-uniform value sizes don't
-//! fragment unboundedly). Recv-into-`PooledBuf` then passes `reg().memh()` to
-//! `ucp_stream_recv_nbx` (`UCP_OP_ATTR_FIELD_MEMH`) for a true zero-copy
-//! receive (RDMA into the registered dest, no bounce-buffer copy-out).
+//! fragment unboundedly). Recv-into-`PooledBuf` avoids the application's frame
+//! accumulation buffer. UCX Stream still unpacks incoming AM data into the
+//! destination; registration benefits stable-address sends and PS forwarding,
+//! and does not itself make Stream receive end-to-end zero-copy.
 //!
 //! ## Why thread-local
 //! The PS runs one partition per OS thread and the EN one shard per OS thread
@@ -393,11 +394,11 @@ impl Drop for PooledBuf {
         // EVERY op, which is strictly worse than the regular reused-BytesMut
         // path (measured: 8 MiB TCP write 3× slower before this fix).
         //
-        // On **ucx** builds, an unregistered slab is the rare over-memlock-cap
-        // fallback; keep freeing those so registration is retried once pressure
-        // eases (the normal case there has `reg = Some`, which is pooled below).
+        // A UCX-capable binary can run TCP: its ordinary unregistered slabs
+        // must also be recycled. Only UCX runtime registration fallbacks are
+        // freed so registration can be retried when pressure eases.
         #[cfg(feature = "ucx")]
-        if slab.reg.is_none() {
+        if crate::runtime_transport_is_ucx() && slab.reg.is_none() {
             return;
         }
         let class = self.class;
@@ -443,14 +444,12 @@ impl Drop for PooledBuf {
                     None
                 } else {
                     // Eviction: keep `registered_bytes` in lockstep with what's
-                    // actually pinned. Every slab reaching here on a ucx build
-                    // is registered (unregistered fallbacks returned early
-                    // above); non-ucx builds compile this block out.
+                    // actually pinned. TCP slabs in a UCX-capable binary did
+                    // not contribute to either registration counter.
                     #[cfg(feature = "ucx")]
-                    {
+                    if slab.reg.is_some() {
                         p.registered_bytes = p.registered_bytes.saturating_sub(class);
-                        REGISTERED_BYTES_GAUGE
-                            .fetch_sub(class as u64, Ordering::Relaxed);
+                        REGISTERED_BYTES_GAUGE.fetch_sub(class as u64, Ordering::Relaxed);
                     }
                     Some(slab)
                 }

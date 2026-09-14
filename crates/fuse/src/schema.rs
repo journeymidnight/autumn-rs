@@ -155,6 +155,13 @@ impl StripeLayout {
 /// `unit == 0` errors rather than dividing by zero (`StripeLayout::checked()`
 /// is the normal gate, but this is a pub fn taking a bare u32).
 pub fn striped_extent_offsets(size: u64, unit: u32) -> Result<Vec<u64>, String> {
+    let count = striped_extent_count(size, unit)?;
+    let unit = unit as u64;
+    Ok((0..count).map(|i| i.saturating_mul(unit)).collect())
+}
+
+/// Validate the geometry/size without allocating the full file's extent map.
+pub(crate) fn striped_extent_count(size: u64, unit: u32) -> Result<u64, String> {
     const MAX_EXTENTS: u64 = 16 * 1024 * 1024; // 16M × 8 MiB = 128 TiB
     if unit == 0 {
         return Err("striped file has unit_bytes=0 (corrupt inode?)".to_string());
@@ -166,9 +173,7 @@ pub fn striped_extent_offsets(size: u64, unit: u32) -> Result<Vec<u64>, String> 
             "striped file size {size} too large ({count} extents > {MAX_EXTENTS} cap — corrupt inode?)"
         ));
     }
-    // count ≤ 16M and unit ≤ MAX_EXTENT-class values ⇒ i * unit stays far below
-    // u64::MAX; saturating_mul keeps that true even for an absurd stamped unit.
-    Ok((0..count).map(|i| i.saturating_mul(unit)).collect())
+    Ok(count)
 }
 
 /// Directory entry stored in KV at key `[0x02][parent_ino: u64 BE][name]`.

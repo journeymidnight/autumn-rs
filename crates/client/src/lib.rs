@@ -3235,7 +3235,7 @@ impl ClusterClient {
         // (call_ps_for_key refreshes routing natively). The batched redirect is
         // an optimization, never a correctness dependency.
         let mut descriptors: Vec<Option<GetRedirectResp>> = (0..n).map(|_| None).collect();
-        for (part_id, idxs) in groups {
+        let descriptor_calls = groups.into_iter().map(|(part_id, idxs)| {
             let region_epoch = self.lookup_epoch_for_part(part_id);
             let req_items: Vec<partition_rpc::GetRedirectItem> = idxs
                 .iter()
@@ -3254,39 +3254,33 @@ impl ClusterClient {
                 region_epoch,
                 items: req_items,
             });
-            // Both discards below used to be silent, and between them they ate
-            // the only explanation the system produced. The batch handler
-            // answers with a NAMED reason — the extent is EC-converted, or its
-            // payload is not in `.dat` — and that text died here, so a direct
-            // read failing on every single item looked like nothing at all from
-            // the client, nothing in the PS log, and nothing in the EN log (the
-            // ENs are never reached). Leaving descriptors `None` is still
-            // correct: phase C falls back per item. Just say why.
-            match self
-                .call_ps_for_part(part_id, partition_rpc::MSG_GET_REDIRECT_MANY, payload)
-                .await
-            {
-                Ok(resp_bytes) => match rkyv_decode::<partition_rpc::GetRedirectManyResp>(
-                    &resp_bytes,
-                ) {
-                    Ok(resp) => {
-                        if resp.results.len() == idxs.len() {
-                            for (&i, r) in idxs.iter().zip(resp.results.into_iter()) {
-                                descriptors[i] = Some(r);
+            async move {
+                let result = self
+                    .call_ps_for_part(part_id, partition_rpc::MSG_GET_REDIRECT_MANY, payload)
+                    .await;
+                (idxs, result)
+            }
+        });
+        for (idxs, result) in fan_out_collect(descriptor_calls, BATCH_GET_DEFAULT_CONCURRENCY).await
+        {
+            match result {
+                Ok(resp_bytes) => {
+                    match rkyv_decode::<partition_rpc::GetRedirectManyResp>(&resp_bytes) {
+                        Ok(resp) if resp.results.len() == idxs.len() => {
+                            for (i, response) in idxs.into_iter().zip(resp.results) {
+                                descriptors[i] = Some(response);
                             }
-                        } else {
-                            tracing::warn!(
-                                got = resp.results.len(),
-                                want = idxs.len(),
-                                "direct-read: batch descriptor count mismatch — per-item proxy fallback"
-                            );
                         }
+                        Ok(resp) => tracing::warn!(
+                            got = resp.results.len(), want = idxs.len(),
+                            "direct-read: batch descriptor count mismatch — per-item proxy fallback"
+                        ),
+                        Err(e) => tracing::warn!(
+                            error = %e,
+                            "direct-read: undecodable batch descriptor response — per-item proxy fallback"
+                        ),
                     }
-                    Err(e) => tracing::warn!(
-                        error = %e,
-                        "direct-read: undecodable batch descriptor response — per-item proxy fallback"
-                    ),
-                },
+                }
                 Err(e) => tracing::warn!(
                     error = %e,
                     "direct-read: batch descriptor lookup refused — per-item proxy fallback"
@@ -5283,11 +5277,129 @@ mod first_attempt_timeout_tests {
     }
 
     #[test]
+    fn direct_batch_requests_partitions_concurrently_and_keeps_item_order() {
+        use compio::io::{AsyncRead, AsyncWriteExt};
+        use futures::{
+            channel::{mpsc, oneshot},
+            StreamExt,
+        };
+        let client = client_with(Some(Duration::from_secs(5)), None);
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let (arrived_tx, mut arrived_rx) = mpsc::unbounded();
+            let mut releases = Vec::new();
+            let mut servers = Vec::new();
+            for (id, start, end, value) in [
+                (1, b"".as_slice(), b"m".as_slice(), b"left".as_slice()),
+                (2, b"m".as_slice(), b"".as_slice(), b"right".as_slice()),
+            ] {
+                let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                client
+                    .part_addrs
+                    .borrow_mut()
+                    .insert(id, listener.local_addr().unwrap().to_string());
+                client.regions.borrow_mut().push((
+                    id,
+                    MgrRegionInfo {
+                        rg: Some(MgrRange {
+                            start_key: start.to_vec(),
+                            end_key: end.to_vec(),
+                        }),
+                        part_id: id,
+                        ps_id: 1,
+                        log_stream: 1,
+                        row_stream: 2,
+                        meta_stream: 3,
+                        region_epoch: 1,
+                    },
+                ));
+                let (release_tx, release_rx) = oneshot::channel();
+                releases.push(release_tx);
+                let arrived_tx = arrived_tx.clone();
+                servers.push(compio::runtime::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut decoder = autumn_rpc::FrameDecoder::new();
+                    let mut buf = vec![0; 4096];
+                    let frame = loop {
+                        let compio::BufResult(n, back) = socket.read(buf).await;
+                        buf = back;
+                        decoder.feed(&buf[..n.unwrap()]);
+                        if let Some(frame) = decoder.try_decode().unwrap() {
+                            break frame;
+                        }
+                    };
+                    assert_eq!(frame.msg_type, MSG_GET_REDIRECT_MANY);
+                    arrived_tx.unbounded_send(id).unwrap();
+                    release_rx.await.unwrap();
+                    let resp = GetRedirectManyResp {
+                        results: vec![GetRedirectResp {
+                            code: partition_rpc::CODE_OK,
+                            message: String::new(),
+                            value: value.to_vec(),
+                            extent_id: 0,
+                            value_offset: 0,
+                            value_len: 0,
+                            eversion: 0,
+                            replica_addrs: Vec::new(),
+                            ec_data_shards: 0,
+                            ec_sealed_length: 0,
+                        }],
+                    };
+                    socket
+                        .write_all(
+                            autumn_rpc::Frame::response(
+                                frame.req_id,
+                                frame.msg_type,
+                                rkyv_encode(&resp),
+                            )
+                            .encode(),
+                        )
+                        .await
+                        .0
+                        .unwrap();
+                }));
+            }
+            let mut right = vec![0; BULK_MIN_BYTES];
+            let mut left = vec![0; BULK_MIN_BYTES];
+            let mut items = [
+                GetManyItem {
+                    key: b"z",
+                    offset: 0,
+                    length: 0,
+                    dest: &mut right,
+                },
+                GetManyItem {
+                    key: b"a",
+                    offset: 0,
+                    length: 0,
+                    dest: &mut left,
+                },
+            ];
+            let release = async {
+                let a = arrived_rx.next().await.unwrap();
+                let b = arrived_rx.next().await.unwrap();
+                assert_ne!(a, b);
+                for tx in releases {
+                    tx.send(()).unwrap();
+                }
+            };
+            let (results, ()) = compio::time::timeout(Duration::from_secs(2), async {
+                futures::join!(client.get_many_direct(&mut items), release)
+            })
+            .await
+            .expect("both partitions must receive descriptors before either replies");
+            assert_eq!(*results[0].as_ref().unwrap(), Some(5));
+            assert_eq!(*results[1].as_ref().unwrap(), Some(4));
+            assert_eq!(&right[..5], b"right");
+            assert_eq!(&left[..4], b"left");
+            for server in servers {
+                server.await;
+            }
+        });
+    }
+
+    #[test]
     fn attempt_1_falls_back_to_full_rpc_timeout() {
-        let c = client_with(
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(5)),
-        );
+        let c = client_with(Some(Duration::from_secs(30)), Some(Duration::from_secs(5)));
         assert_eq!(
             c.first_attempt_effective_timeout(1),
             Some(Duration::from_secs(30)),
