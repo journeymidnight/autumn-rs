@@ -158,6 +158,9 @@ async fn drop_recv_into_registered_mid_await_is_safe() {
 
     const LEN: usize = 256 * 1024; // big enough to be a real registered/rendezvous recv
 
+    // Regpool registration follows the selected runtime transport. Constructing
+    // UcxTransport directly does not set that process-global selection.
+    autumn_transport::init_with(autumn_transport::TransportKind::Ucx);
     let t = UcxTransport;
     let mut listener = t.bind(bind_addr()).await.unwrap();
     let bound = listener.local_addr().unwrap();

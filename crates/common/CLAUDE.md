@@ -110,3 +110,8 @@ one, since the fingerprint registry that used to is gone) and to route it into t
 1. **ID uniqueness**: all IDs (stream, extent, node, disk, partition) come from the same monotonic counter — never generate IDs outside `alloc_ids`.
 2. **Owner lock bumps on every acquire**: `acquire_owner_lock` returns a strictly higher revision each call, fencing the previous holder of the same key. The newest acquirer always wins; a process acquires once per incarnation and keeps the epoch for its lifetime. Never generate owner revisions outside this method.
 3. **Epoch fencing**: any operation that mutates stream or extent state must call `ensure_owner_epoch` first. Skipping this allows split-brain writes.
+
+## Build toolchain
+
+The workspace minimum is Rust 1.95 for compio 0.19.2. Explicit child affinity
+still runs before runtime construction; cpu_pin behavior is unchanged.

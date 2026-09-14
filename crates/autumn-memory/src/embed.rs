@@ -158,15 +158,15 @@ impl OpenAiEmbedder {
     /// `base` may be the server root, the `/v1` prefix, or the full endpoint —
     /// all three are things people paste, and guessing wrong costs a 404 that
     /// reads like the model is missing.
-    pub fn new(base: &str, model: &str) -> Self {
-        Self {
-            client: cyper::Client::new(),
+    pub fn new(base: &str, model: &str) -> Result<Self, EmbedError> {
+        Ok(Self {
+            client: cyper::Client::new().map_err(|e| EmbedError(format!("HTTP client: {e}")))?,
             url: normalize_embeddings_url(base),
             model: model.to_string(),
             api_key: None,
             timeout: std::time::Duration::from_secs(60),
             dim: std::cell::Cell::new(0),
-        }
+        })
     }
 
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
@@ -545,7 +545,7 @@ mod openai_wire_tests {
     async fn it_posts_to_v1_embeddings_and_returns_the_vector() {
         let body = r#"{"data":[{"index":0,"embedding":[0.0,3.0,4.0]}]}"#;
         let port = serve_once(body).await;
-        let e = OpenAiEmbedder::new(&format!("http://127.0.0.1:{port}"), "nomic-embed-text");
+        let e = OpenAiEmbedder::new(&format!("http://127.0.0.1:{port}"), "nomic-embed-text").expect("HTTP client");
         let v = e.embed("hello").await.expect("embed");
 
         assert_eq!(v.len(), 3);
@@ -583,6 +583,7 @@ mod openai_wire_tests {
         .detach();
 
         let e = OpenAiEmbedder::new(&format!("http://127.0.0.1:{port}"), "m")
+            .expect("HTTP client")
             .with_timeout(std::time::Duration::from_millis(300));
         let err = e.embed("hello").await.expect_err("must time out");
         assert!(err.0.contains("timed out"), "message was {}", err.0);
@@ -603,6 +604,7 @@ mod openai_wire_tests {
         .detach();
 
         let e = OpenAiEmbedder::new(&format!("http://127.0.0.1:{port}"), "m")
+            .expect("HTTP client")
             .with_timeout(std::time::Duration::from_millis(300));
         let err = e.embed("hello").await.expect_err("must time out");
         assert!(err.0.contains("timed out"), "message was {}", err.0);

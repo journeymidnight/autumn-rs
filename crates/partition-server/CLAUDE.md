@@ -2107,3 +2107,12 @@ sequence → silent data loss.
 Trigger is power-loss / bit-rot class (a process kill loses nothing un-fsynced + leaves
 the dirent). Test-only `decode_records_full` / `decode_records_with_offsets` keep the old
 skip (not on any production path).
+
+## Compio 0.19 runtime
+
+The runtime dependency is 0.19.2, requiring Rust >=1.95. The explicit child CPU
+pin remains before runtime construction; P-log and P-sst keep separate affinity.
+JoinHandle now reports JoinError::Panicked/Cancelled and still cancels on drop.
+Supervised/fail-stop tasks keep their inner catch_unwind for error reporting and
+restart/exit policy. Receive concurrency, backpressure and runtime scheduling
+settings remain unchanged. The binary can opt into prepared-replica TCP zerocopy.

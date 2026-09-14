@@ -14,7 +14,7 @@
 # BOTH stages' FROM lines can reference it.
 ARG BASE_REGISTRY=
 
-FROM ${BASE_REGISTRY}library/rust:1.93-bookworm AS builder
+FROM ${BASE_REGISTRY}library/rust:1.95-bookworm AS builder
 WORKDIR /build
 # Optional crates.io mirror for faster dependency downloads. Empty (default) →
 # official crates.io (unchanged for everyone else). Set CARGO_MIRROR to a full

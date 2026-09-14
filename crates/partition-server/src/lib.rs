@@ -9989,10 +9989,8 @@ pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> 
 /// panic killed the loop silently (e.g. heartbeats stop → manager evicts with
 /// no log on the PS side explaining why).
 ///
-/// NOTE on layered `catch_unwind`: `compio::runtime::spawn` already wraps
-/// the future in `AssertUnwindSafe(future).catch_unwind()` internally
-/// (compio-runtime-0.11.0/src/runtime/mod.rs:202); `JoinHandle<T> =
-/// Task<Result<T, Box<dyn Any + Send>>>`. That's exactly what made the
+/// NOTE on layered `catch_unwind`: compio 0.19's executor captures task
+/// panics as `JoinError::Panicked`. That's exactly what makes the
 /// silent-death possible: compio catches the panic, then
 /// `.detach()` drops the captured `Err`. The inner `catch_unwind` here is
 /// for OBSERVABILITY + RESTART decisioning (read the Result to log + sleep

@@ -3,7 +3,7 @@
 //! ## Why enum dispatch instead of trait objects
 //!
 //! Spec §3 originally drafted `Box<dyn AutumnConn>` for runtime polymorphism.
-//! That doesn't compile against compio 0.18: `compio::io::AsyncRead::read` and
+//! That doesn't compile against compio: `compio::io::AsyncRead::read` and
 //! `AsyncWrite::write` are generic over the buffer type (`B: IoBufMut`,
 //! `T: IoBuf`), and a trait with generic methods is not `dyn`-compatible.
 //!
@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 
 mod probe;
 mod tcp;
+mod zerocopy;
 #[cfg(feature = "ucx")]
 mod ucx;
 
@@ -300,13 +301,13 @@ pub enum Listener {
 }
 
 pub enum ReadHalf {
-    Tcp(compio::net::OwnedReadHalf<compio::net::TcpStream>),
+    Tcp(compio::net::TcpStream),
     #[cfg(feature = "ucx")]
     Ucx(crate::ucx::endpoint::UcxReadHalf),
 }
 
 pub enum WriteHalf {
-    Tcp(compio::net::OwnedWriteHalf<compio::net::TcpStream>),
+    Tcp(compio::net::TcpStream),
     #[cfg(feature = "ucx")]
     Ucx(crate::ucx::endpoint::UcxWriteHalf),
 }
@@ -537,6 +538,22 @@ impl ReadHalf {
         Ok(slice.into_inner())
     }
 
+}
+
+impl WriteHalf {
+    /// Send owned iovecs and await the kernel's buffer-release notification.
+    /// The caller must limit the iovec count and serialize complete frames.
+    /// UCX retains its ordinary registered-memory send path.
+    pub async fn write_vectored_all_zerocopy(&mut self, bufs: Vec<bytes::Bytes>) -> io::Result<()> {
+        match self {
+            Self::Tcp(writer) => zerocopy::write_all(writer, bufs).await,
+            #[cfg(feature = "ucx")]
+            Self::Ucx(writer) => {
+                use compio::io::AsyncWriteExt;
+                writer.write_vectored_all(bufs).await.0
+            }
+        }
+    }
 }
 
 impl compio::io::AsyncWrite for WriteHalf {

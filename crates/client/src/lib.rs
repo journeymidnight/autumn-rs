@@ -5392,7 +5392,7 @@ mod first_attempt_timeout_tests {
             assert_eq!(&right[..5], b"right");
             assert_eq!(&left[..4], b"left");
             for server in servers {
-                server.await;
+                server.await.unwrap();
             }
         });
     }

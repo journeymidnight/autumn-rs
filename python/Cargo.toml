@@ -1,4 +1,5 @@
 [package]
+rust-version = "1.95"
 name = "autumn-python"
 version = "0.1.0"
 edition = "2021"
@@ -22,7 +23,7 @@ autumn-transport = { path = "../crates/transport" }
 # `fuser`/`clap`/kernel-mount machinery out of the wheel — only the shared
 # inode-layout logic the fuse binary also uses.
 autumn-fuse = { path = "../crates/fuse", default-features = false, features = ["core"] }
-compio = { version = "0.18", features = ["runtime", "time"] }
+compio = { version = "0.19.2", features = ["runtime", "time"] }
 futures = "0.3"
 bytes = "1"
 libc = "0.2"

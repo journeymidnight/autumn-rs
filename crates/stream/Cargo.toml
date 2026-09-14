@@ -2,6 +2,7 @@
 name = "autumn-stream"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
@@ -15,7 +16,7 @@ tracing.workspace = true
 autumn-common = { path = "../common" }
 autumn-rpc = { path = "../rpc" }
 autumn-transport = { path = "../transport" }
-compio = { version = "0.18", features = ["net", "time", "macros", "dispatcher", "fs"] }
+compio = { workspace = true, features = ["net", "time", "macros", "dispatcher", "fs"] }
 libc = "0.2"
 rkyv = { version = "0.8.15", features = ["alloc"] }
 
@@ -27,7 +28,7 @@ bytes.workspace = true
 crc32c = "0.6"
 rkyv = { version = "0.8.15", features = ["alloc"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-compio = { version = "0.18", features = ["net", "time", "macros"] }
+compio = { workspace = true, features = ["net", "time", "macros"] }
 
 [[bench]]
 name = "append_bench"

@@ -319,3 +319,12 @@ exceeds the binary's own `WIRE_VERSION_MAX`.
   frame (~50B+): ~58B overhead vs ~200B+ for gRPC.
 - `tokio::sync::{Mutex,mpsc,oneshot}` are runtime-agnostic futures — they work on
   compio without a tokio Runtime.
+
+## Optional TCP zerocopy for prepared replicas
+
+set_prepared_zerocopy_min_bytes configures prepared replica frames only; zero
+(the default) disables it. The writer preserves its single sequential owner,
+IOV_MAX chunking, full CRC and pending-response handling. Ordinary RPC writes
+and UCX sends retain their paths. The threshold counts complete frame bytes.
+A timed-out caller never owns the writer's buffers; send completion alone is
+insufficient to recycle them. The transport awaits the separate release future.

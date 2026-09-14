@@ -23,6 +23,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -126,6 +127,7 @@ enum SubmitMsg {
     /// A vectored frame `[header][part0][part1]...` (used by `call_vectored`,
     /// `send_vectored`). Zero-copy for the payload parts.
     Vectored { bufs: Vec<Bytes>, req_id: u32 },
+    Prepared { bufs: Vec<Bytes>, req_id: u32 },
 }
 
 impl SubmitMsg {
@@ -133,6 +135,7 @@ impl SubmitMsg {
         match self {
             SubmitMsg::Single { req_id, .. } => *req_id,
             SubmitMsg::Vectored { req_id, .. } => *req_id,
+            SubmitMsg::Prepared { req_id, .. } => *req_id,
         }
     }
 }
@@ -406,7 +409,7 @@ impl RpcClient {
         let bufs = payload.frame_parts(req_id, msg_type);
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
-        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }) {
+        if let Err(e) = self.submit(SubmitMsg::Prepared { bufs, req_id }) {
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
@@ -630,6 +633,29 @@ impl RpcClient {
 /// so a frame is still contiguous from the peer's point of view.
 const IOV_MAX: usize = 1024;
 
+// Disabled until a deployment has measured a useful threshold on its kernel
+// and link. Applies only to prepared replica payloads, preserving other RPCs.
+static PREPARED_ZEROCOPY_MIN_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the minimum prepared frame size for TCP zerocopy. Zero disables it.
+pub fn set_prepared_zerocopy_min_bytes(bytes: usize) {
+    PREPARED_ZEROCOPY_MIN_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+async fn write_prepared(writer: &mut WriteHalf, bufs: Vec<Bytes>, size: usize) -> std::io::Result<()> {
+    let min = PREPARED_ZEROCOPY_MIN_BYTES.load(Ordering::Relaxed);
+    if min == 0 || size < min {
+        return write_vectored_chunked(writer, bufs).await;
+    }
+    let mut rest = bufs;
+    while !rest.is_empty() {
+        let tail = rest.split_off(rest.len().min(IOV_MAX));
+        writer.write_vectored_all_zerocopy(rest).await?;
+        rest = tail;
+    }
+    Ok(())
+}
+
 pub async fn write_vectored_chunked(
     writer: &mut WriteHalf,
     bufs: Vec<Bytes>,
@@ -670,7 +696,7 @@ async fn writer_task(
         // rare error branch).
         let (iov_count, total_bytes) = match &msg {
             SubmitMsg::Single { bytes, .. } => (1usize, bytes.len()),
-            SubmitMsg::Vectored { bufs, .. } => {
+            SubmitMsg::Vectored { bufs, .. } | SubmitMsg::Prepared { bufs, .. } => {
                 let total: usize = bufs.iter().map(|b| b.len()).sum();
                 (bufs.len(), total)
             }
@@ -681,6 +707,7 @@ async fn writer_task(
                 r
             }
             SubmitMsg::Vectored { bufs, .. } => write_vectored_chunked(&mut writer, bufs).await,
+            SubmitMsg::Prepared { bufs, .. } => write_prepared(&mut writer, bufs, total_bytes).await,
         };
 
         if let Err(e) = result {

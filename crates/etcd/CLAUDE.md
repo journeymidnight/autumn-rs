@@ -88,3 +88,9 @@ cargo test -p autumn-etcd --lib
 # Integration tests (requires etcd at 127.0.0.1:2379)
 cargo test -p autumn-etcd --test integration
 ```
+
+## Runtime compatibility
+
+Compio 0.19.2 pairs with cyper-core 0.9. Unary and streaming h2c connections
+use HyperStream::new_plain; no TLS negotiation is added. Detached HTTP/2 driver
+tasks retain their existing lifetime. Build with Rust 1.95 or newer.

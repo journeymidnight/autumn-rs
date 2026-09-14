@@ -1536,3 +1536,11 @@ save_meta。`load_extents` 启动重放三态 `EcCommitMarker`：Valid+eversion<
 门控。**不变量：`corrupt_meta` 的 extent 绝不 marker-replay**（marker 无
 owner_epoch，replay 会写 owner_epoch=0 → fence 旁路 + 清 quarantine = META-FAILCLOSED
 漏洞）。`remove_extent_files` 同时 unlink marker。
+
+## Compio 0.19 compatibility
+
+Compio is inherited from the workspace (0.19.2, Rust >=1.95). Prepared append
+CRC, all-replica persistence and ordering remain unchanged. For opt-in TCP
+zerocopy validation, AUTUMN_TEST_ZEROCOPY=1 enables the RPC prepared-frame
+threshold in the prepared_append integration test. AUTUMN_TEST_UCX_BIND still
+selects UCX, which keeps its existing send path even with this option enabled.

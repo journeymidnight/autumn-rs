@@ -3317,3 +3317,60 @@ kubectl -n autumn exec autumn-manager-0 -- \
 The last one matters: an op leaving `ops list --active` proves only that it
 stopped, not that it succeeded. `ops history` says `succeeded` and names the
 node the slot landed on.
+
+
+## Compio runtime upgrade verification
+
+Build the workspace and standalone Python binding with Rust 1.95 or newer.
+Compio 0.19.2 and cyper 0.9 must be resolved together; do not mix the old cyper
+family into a process using the new runtime. Check both dependency trees:
+
+```sh
+cargo tree -i compio
+cargo tree --manifest-path python/Cargo.toml -i compio
+cargo check --workspace --all-targets --features autumn-server/ucx
+cargo check --manifest-path python/Cargo.toml --features ucx
+cargo test --workspace --lib --features autumn-server/ucx -- --test-threads=1
+cargo test -p autumn-transport --features ucx --test zerocopy_tcp -- --test-threads=1
+AUTUMN_TEST_ZEROCOPY=1 cargo test -p autumn-stream --test prepared_append
+cargo build -p autumn-server --bins
+cargo test -p autumn-manager --test system_fuse_read --test system_fuse_eof_clobber \
+  --test system_fuse_flush_error_sticky --test system_fuse_release_best_effort \
+  -- --ignored --test-threads=1
+```
+
+For UCX, run prepared_append with `--features autumn-rpc/ucx` and
+`AUTUMN_TEST_UCX_BIND='[<RoCE-IP>]:0'`, plus the deployment's UCX_TLS and
+UCX_NET_DEVICES. This validates actual disk bytes and append offsets.
+The zerocopy option does not change UCX sends.
+
+`autumn-ps --tcp-zerocopy-min-bytes N` opts prepared replica TCP sends into
+zerocopy at N complete-frame bytes. Default 0 disables it and is the rollback
+switch. Send completion and buffer release are distinct; the writer waits for
+both before reuse. No wire or persisted-format version changes are involved.
+Restart with 0 to return to ordinary sends. Keep the old binaries and lockfiles
+for a dependency rollback; stop PS and wait for drain before stopping EN/manager.
+
+For CPU comparisons, core_path accepts `AUTUMN_PERF_PIDS=/path/pids.json`, a
+JSON object mapping process labels to numeric PIDs. Snapshots bracket only the
+timed, drained operation window after independent warmup; derive CPU seconds/GiB
+from completed ops times value size. These process counters exclude independent
+kernel workers, so do not describe them as whole-machine CPU efficiency.
+
+The isolated receive/scheduler experiment is:
+
+```sh
+cargo bench -p autumn-transport --bench compio_features -- ordinary default 1048576
+cargo bench -p autumn-transport --bench compio_features -- managed default 1048576
+cargo bench -p autumn-transport --bench compio_features -- multi default 1048576
+cargo bench -p autumn-transport --bench compio_features -- poll-first default 1048576
+cargo bench -p autumn-transport --bench compio_features -- ordinary single 1048576
+cargo bench -p autumn-transport --bench compio_features -- ordinary defer 1048576
+```
+
+The experiment uses CPUs 40/42 and 512 MiB per warmup/measured transfer. It
+reports combined process user/system CPU and receiver-confirmed transfer time.
+It does not configure server runtimes. SQPOLL is available only as an explicit
+`sqpoll` experiment; its kernel-thread CPU must be measured separately before
+making any efficiency claim. Compio's ordinary receive already applies adaptive
+poll-first internally, so include it in the pure-upgrade comparison.

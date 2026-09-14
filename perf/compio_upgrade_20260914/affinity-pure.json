@@ -1,0 +1,306 @@
+{
+  "en3": [
+    {
+      "name": "autumn-extent-n",
+      "cpus": "0-191"
+    },
+    {
+      "name": "extent-shard-0",
+      "cpus": "8"
+    },
+    {
+      "name": "extent-shard-1",
+      "cpus": "9"
+    },
+    {
+      "name": "extent-shard-2",
+      "cpus": "10"
+    },
+    {
+      "name": "extent-shard-3",
+      "cpus": "11"
+    },
+    {
+      "name": "iou-wrk-4014287",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014284",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014286",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014285",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014285",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014285",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014285",
+      "cpus": "0-47,96-143"
+    }
+  ],
+  "en1": [
+    {
+      "name": "autumn-extent-n",
+      "cpus": "0-191"
+    },
+    {
+      "name": "extent-shard-0",
+      "cpus": "0"
+    },
+    {
+      "name": "extent-shard-1",
+      "cpus": "1"
+    },
+    {
+      "name": "extent-shard-2",
+      "cpus": "2"
+    },
+    {
+      "name": "extent-shard-3",
+      "cpus": "3"
+    },
+    {
+      "name": "iou-wrk-4014273",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014275",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014276",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014274",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014274",
+      "cpus": "0-47,96-143"
+    }
+  ],
+  "en2": [
+    {
+      "name": "autumn-extent-n",
+      "cpus": "0-191"
+    },
+    {
+      "name": "extent-shard-0",
+      "cpus": "4"
+    },
+    {
+      "name": "extent-shard-1",
+      "cpus": "5"
+    },
+    {
+      "name": "extent-shard-2",
+      "cpus": "6"
+    },
+    {
+      "name": "extent-shard-3",
+      "cpus": "7"
+    },
+    {
+      "name": "iou-wrk-4014280",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014277",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014279",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014278",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014278",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014278",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014278",
+      "cpus": "0-47,96-143"
+    },
+    {
+      "name": "iou-wrk-4014278",
+      "cpus": "0-47,96-143"
+    }
+  ],
+  "etcd": [
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    },
+    {
+      "name": "etcd",
+      "cpus": "0-191"
+    }
+  ],
+  "ps": [
+    {
+      "name": "autumn-ps",
+      "cpus": "0-191"
+    },
+    {
+      "name": "part-13",
+      "cpus": "12"
+    },
+    {
+      "name": "part-13-sst",
+      "cpus": "13"
+    },
+    {
+      "name": "part-13",
+      "cpus": "12"
+    },
+    {
+      "name": "part-13",
+      "cpus": "12"
+    },
+    {
+      "name": "part-13-sst",
+      "cpus": "13"
+    }
+  ],
+  "manager": [
+    {
+      "name": "autumn-manager-",
+      "cpus": "0-191"
+    }
+  ]
+}

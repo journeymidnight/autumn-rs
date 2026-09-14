@@ -50,6 +50,17 @@
   - 纯升级和新能力的效果分别报告；未测真实跨机或未通过上述验证时，不标记完成。
 - **Status**: 仅完成计划记录，尚未升级依赖或实测新版。
 - `passes: false`
+- **notes** (2026-09-14 implementation): Compio 0.19.2/cyper 0.9 and Rust 1.95
+  migration implemented; workspace/Python/UCX builds and 1,052 library tests pass.
+  Prepared-send zerocopy is opt-in/default-off; partial-send, delayed-release,
+  TCP cancel/close and >1,024-iovec TCP/UCX durable append tests pass. Python/FUSE
+  and two-partition byte checks pass. 240 cluster samples and receive/scheduler
+  experiments recorded in [upgrade report](docs/perf_compio_upgrade_20260914.md).
+  No stable zerocopy benefit; receive/scheduler defaults unchanged. H200-2 is
+  offline (user confirmed), so cross-host validation is unavailable. Full kernel
+  accounting, controlled scaling, real-path receive/scheduler evaluation and
+  the residual UCX 64KiB read difference remain open; passes stays false.
+
 
 ### F-CORE-DATA-PATH-NEXT — further core-path performance work
 - Trigger: The 2026-09-14 review found additional costs beyond the validated pool/receive/read-planning fixes.

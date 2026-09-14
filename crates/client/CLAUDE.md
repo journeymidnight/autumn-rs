@@ -425,3 +425,9 @@ carried in a successful response body.
 - `autumn-rpc`: RPC client + wire codec (partition_rpc, manager_rpc).
 - `compio`: async runtime (time::sleep for retry backoff).
 - `anyhow`, `bytes`: error handling + byte buffers.
+
+## Runtime dependency
+
+Compio 0.19.2 is inherited from the workspace and requires Rust >=1.95. The
+standalone Python manifest/lockfile must resolve the same compio family. Client
+I/O strategy, pooled receive ownership and caller timeouts remain unchanged.

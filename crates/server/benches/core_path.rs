@@ -5,6 +5,40 @@ use futures::StreamExt;
 use std::cell::Cell;
 use std::time::{Duration, Instant};
 
+// Optional process list (JSON object name -> PID). Sample after warmup and
+// after draining timed operations, matching the completed-byte window.
+fn cpu_snapshot() -> serde_json::Value {
+    #[cfg(target_os = "linux")]
+    {
+        let mut pids: std::collections::BTreeMap<String, u32> = std::env::var("AUTUMN_PERF_PIDS")
+            .ok()
+            .map(|path| serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap())
+            .unwrap_or_default();
+        pids.insert("client".into(), std::process::id());
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
+        let mut values = serde_json::Map::new();
+        for (name, pid) in pids {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let fields: Vec<_> = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect();
+            values.insert(
+                name,
+                serde_json::json!({
+                    "user": fields[11].parse::<u64>().unwrap() as f64 / hz,
+                    "system": fields[12].parse::<u64>().unwrap() as f64 / hz,
+                }),
+            );
+        }
+        serde_json::Value::Object(values)
+    }
+    #[cfg(not(target_os = "linux"))]
+    serde_json::json!({})
+}
+
 async fn run(
     client: &ClusterClient,
     keys: &[Vec<u8>],
@@ -111,9 +145,11 @@ fn main() {
             return;
         }
         run(&client, &keys, &value, 2, depth, mode, false).await;
+        let cpu_before = cpu_snapshot();
         let t = Instant::now();
         let (ops, mut ns) = run(&client, &keys, &value, seconds, depth, mode, true).await;
         let wall = t.elapsed().as_secs_f64();
+        let cpu_after = cpu_snapshot();
         ns.sort_unstable();
         let pool = autumn_transport::regpool_snapshot();
         println!(
@@ -124,6 +160,7 @@ fn main() {
                 "mib_per_sec":ops as f64 * size as f64 / wall / 1048576.0,
                 "p50_us":ns[ns.len()/2] as f64 / 1000.0,
                 "p99_us":ns[(ns.len()-1)*99/100] as f64 / 1000.0,
+                "cpu_before":cpu_before, "cpu_after":cpu_after,
                 "pool_acquires":pool.acquire_total, "pool_hits":pool.hit_total
             })
         );
