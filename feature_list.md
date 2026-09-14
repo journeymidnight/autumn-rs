@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-11
+**Last updated:** 2026-09-14
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,6 +13,43 @@
 ---
 
 ## Active
+
+### F-COMPIO-UPGRADE — 升级运行时并分阶段验证 TCP 内核 CPU 降耗
+- **Trigger** (2026-09-14，用户要求记录升级计划): 当前 compio 0.18.0 /
+  compio-driver 0.11.4 / compio-runtime 0.11.0；H200-1 单 partition 写入采样的
+  内核热点是 TCP 收发复制、发送页分配与清零。新版有 send zerocopy、multishot
+  和 deferred task-run 等能力，但单纯升级不会自动让现有收发路径使用这些接口。
+  依据：[CPU 分析](docs/perf_partition_cpu_20260914.md)。
+- **Scope / 执行顺序**:
+  1. **建立基线并升级依赖**：以已合入 CRC 复用和绑核修复的版本为基线，目标
+     compio 0.19.x（已调研 0.19.1；实施时核对稳定补丁、MSRV 与子 crate 版本）。
+     在独立分支适配 breaking API、feature、buffer ownership、取消和任务生命周期；
+     同步 workspace 及独立的 `python/Cargo.toml` / `python/Cargo.lock`，检查重复
+     compio 版本。先保持现有普通收发方式、并发参数和协议，单独测纯升级效果。
+  2. **显式接入大值 send zerocopy**：优先 PS→EN 的复制发送，再评估 client→PS
+     和读响应。保留 control/value 分片和完整 CRC；buffer 必须持有到内核零拷贝
+     完成通知，不能仅凭发送完成就回池。覆盖部分发送、失败、超时、取消、连接关闭
+     和不支持时的普通发送回退。按实际内核、链路、value 大小实测启用门槛。
+  3. **分别评估接收与调度能力**：multishot/managed receive、poll-first、
+     single-issuer/deferred task-run 逐项接入、逐项 A/B；验证与 UCX eventfd
+     progress、线程 affinity、背压和完成通知的兼容。SQPOLL 仅作独立实验；
+     不能把 CPU 转移到内核线程，或 NO_IOWAIT 导致的记账变化，当作工作量减少。
+  4. **收敛交付**：只启用有稳定收益且通过正确性验证的能力；记录无收益/回退的
+     实验，保留回退到基线的路径，更新 crate 指南、`docs/ops.md` 与性能报告。
+- **Acceptance**:
+  - 固定 key 集合、独立预热、相同 RF3 / NVMe / 分区 / cpuset / NUMA / 内核 /
+    UCX 配置，分别比较「当前版本」「纯升级」「每项新能力」；单 partition 为主，
+    多 partition 验证扩展性，覆盖 4 KiB、64 KiB、1 MiB、8 MiB，读写与不同深度。
+  - TCP loopback、真实跨机 TCP、UCX 分开测；每组重复并记录吞吐、p50/p99、
+    客户端/PS/EN 用户态与内核态 CPU、独立内核工作线程 CPU、CPU 秒/GiB、
+    分配/复制及 io_uring 提交/完成指标。计数窗口与传输字节窗口必须一致；排除
+    启动重放、磁盘满和非受控后台负载，收益须超出重复测试波动，无固定百分比承诺。
+  - 回归验证帧/CRC、乱序完成与写入顺序、buffer 回池时机、取消/关闭、部分 I/O、
+    故障回退、三副本持久化、TCP/UCX 字节一致性；构建并验证 FUSE、Python 等
+    调用方。协议及存储格式保持不变；小值与 UCX 不得出现未经处理的显著回退。
+  - 纯升级和新能力的效果分别报告；未测真实跨机或未通过上述验证时，不标记完成。
+- **Status**: 仅完成计划记录，尚未升级依赖或实测新版。
+- `passes: false`
 
 ### F-CORE-DATA-PATH-NEXT — further core-path performance work
 - Trigger: The 2026-09-14 review found additional costs beyond the validated pool/receive/read-planning fixes.

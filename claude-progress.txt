@@ -1,5 +1,12 @@
 Date: 2026-09-14
 TaskStatus: completed
+Task scope: Record the compio upgrade plan in feature_list.md at the user's request.
+Current summary: Added a dedicated open task covering compio 0.19.x compatibility migration, pure-upgrade A/B, explicit send zerocopy, separate receive/scheduling experiments, CPU accounting and correctness gates. Plan recorded only; dependency upgrade remains passes:false.
+Verification: Reviewed against the CPU investigation and checked the documentation diff; no dependency or functional code changes.
+Next steps: Execute the recorded upgrade task when requested.
+
+Date: 2026-09-14
+TaskStatus: completed
 Task scope: Follow-up single-partition CPU optimization and compio upgrade assessment.
 Current summary: Retained explicit P-sst pin before compio runtime construction and PreparedPayload full-CRC reuse across >=64KiB star replicas. Wire and full transit CRC unchanged. Candidate EN pooled ctrl receive was tested and withdrawn; conn cap remains 4. No compio version change.
 Validation: H200-1 CRC CPU microbench 200x8MiB RF3 893.294ms -> 269.859ms; cluster CRC-stage 635-734 MiB/s vs 522.6 baseline, state-dependent short samples. P-sst affinity read-back corrected from parent core to assigned sibling. Common/RPC/stream/PS library suites, stream integrations, byte-exact prepared append on TCP/UCX, UCX release build pass. Affinity ablation fails. Scoped clippy completes with existing warnings. Tests stopped; data retained.
