@@ -60,6 +60,16 @@ first frame with CrcMismatch instead of reaching the version handshake).
 
 ## Modules
 
+### Prepared replica payloads
+
+`PreparedPayload` owns immutable `Bytes` segments, their total length and their
+CRC32C. `RpcClient::send_prepared` combines the CRC of each connection's distinct
+frame header with that payload CRC. The frame's bytes and full header/control
+coverage are unchanged; no wire-version change is needed. The checksum cannot
+be paired with different bytes through the public API. Large replicated stream
+appends prepare once; small or single-replica sends retain the ordinary path.
+Tests compare exact wire bytes across request IDs and reject altered payloads.
+
 - **`frame.rs`** — `Frame` (encode/decode one frame), `FrameDecoder` (streaming
   decode state machine), `HEADER_LEN=10`, `MAX_PAYLOAD_LEN`, flag bits.
   `encode_response_with` builds a framed response in one allocation.

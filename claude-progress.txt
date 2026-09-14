@@ -1,5 +1,13 @@
 Date: 2026-09-14
 TaskStatus: completed
+Task scope: Follow-up single-partition CPU optimization and compio upgrade assessment.
+Current summary: Retained explicit P-sst pin before compio runtime construction and PreparedPayload full-CRC reuse across >=64KiB star replicas. Wire and full transit CRC unchanged. Candidate EN pooled ctrl receive was tested and withdrawn; conn cap remains 4. No compio version change.
+Validation: H200-1 CRC CPU microbench 200x8MiB RF3 893.294ms -> 269.859ms; cluster CRC-stage 635-734 MiB/s vs 522.6 baseline, state-dependent short samples. P-sst affinity read-back corrected from parent core to assigned sibling. Common/RPC/stream/PS library suites, stream integrations, byte-exact prepared append on TCP/UCX, UCX release build pass. Affinity ablation fails. Scoped clippy completes with existing warnings. Tests stopped; data retained.
+Evidence: docs/perf_partition_cpu_20260914.md and perf/core_path_20260914/cpu-round2.json. Kernel stacks dominated by tcp_recvmsg copy, tcp_sendmsg copy and send-page allocation/clear. Compio 0.19.x supplies explicit zerocopy/multishot/deferred-task-run capabilities; simple version upgrade does not activate them. Upgrade A/B remains separate.
+Next steps: Core-path-next backlog retains receive optimization, explicit compio zerocopy integration and layout work; no end-to-end fixed speedup claim. No subagents under session delegation restriction.
+
+Date: 2026-09-14
+TaskStatus: completed
 Task scope: Core TCP/UCX client/PS/EN and filesystem read-path performance, user-authorized implementation and H200-1 testing.
 Current summary: Restored runtime-TCP pool recycling in UCX builds; namespace/authz-aware PS pooled bulk receive with post-receive revalidation; PS/EN keep receiving below caps; immediate cached GET replies avoid pending-queue work; parallel partition descriptor lookup; range-local FUSE read planning. Wire/storage formats unchanged. Added fixed-key core benchmark and read-plan benchmark.
 Verification: H200-1 dongmao-autumn, UCX 1.16.0, RF3 NVMe (/data03,/data05,/data08), four EN shards. Final combined library tests and UCX release build pass. Client 52, PS 242+1 ignored, stream 193, FUSE 57, transport init 2. Existing stream and filesystem integration suites pass; 1GiB CLI roundtrip cmp=0. Pool/PS/EN/descriptor ablations fail as expected and restored tests pass. Scoped clippy completes with existing warnings; workspace fmt has pre-existing differences, diff-check clean. No subagents used under session delegation restriction.

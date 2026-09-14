@@ -197,6 +197,25 @@ impl ConnPool {
         };
         self.clients.borrow().contains_key(&sock)
     }
+
+    pub async fn send_prepared(
+        &self,
+        addr: &str,
+        msg_type: u8,
+        payload: &autumn_rpc::frame::PreparedPayload,
+    ) -> Result<futures::channel::oneshot::Receiver<autumn_rpc::Frame>> {
+        let sock = parse_addr(addr)?;
+        let client = self.get_client(sock).await?;
+        match client.send_prepared(msg_type, payload).await {
+            Ok(rx) => Ok(rx),
+            Err(e) => {
+                if client.is_closed() {
+                    self.evict(sock);
+                }
+                Err(anyhow!("{e}"))
+            }
+        }
+    }
 }
 
 impl Default for ConnPool {

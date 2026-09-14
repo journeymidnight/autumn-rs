@@ -1,0 +1,5966 @@
+{
+  "measurements": {
+    "crc-1.json": {
+      "depth": 8,
+      "mib_per_sec": 733.9333623525811,
+      "mode": "write",
+      "ops": 561,
+      "ops_per_sec": 91.74167029407263,
+      "p50_us": 78024.727,
+      "p99_us": 157423.572,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 6.114996579,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 8.236892878077924,
+      "threads": [
+        {
+          "tid": "2111506",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2111590",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.21245875427827124,
+          "sys_cpu": 0.08619755173575575
+        },
+        {
+          "tid": "2111591",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2111592",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0024281000488945285,
+          "sys_cpu": 0.0036421500733417925
+        },
+        {
+          "tid": "2111593",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0012140500244472642,
+          "sys_cpu": 0.0036421500733417925
+        },
+        {
+          "tid": "2111594",
+          "name": "(iou-wrk-2111591)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2111595",
+          "name": "(iou-wrk-2111593)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2174838",
+          "name": "(iou-wrk-2111592)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2281091",
+          "name": "(iou-wrk-2111590)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.49654645999893104
+        },
+        {
+          "tid": "2330201",
+          "name": "(iou-wrk-2111590)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287117",
+          "name": "(autumn-ps)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287257",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287258",
+          "name": "(part-13)",
+          "user_cpu": 0.1991042040093513,
+          "sys_cpu": 0.583958061759134
+        },
+        {
+          "tid": "2290047",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2330017",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2330111",
+          "name": "(part-13)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2330200",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2331222",
+          "name": "(part-13)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2331223",
+          "name": "(part-13)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2105464",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2105549",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.2173149543760603,
+          "sys_cpu": 0.08741160176020302
+        },
+        {
+          "tid": "2105550",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2105552",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.006070250122236321
+        },
+        {
+          "tid": "2105553",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0024281000488945285,
+          "sys_cpu": 0.0036421500733417925
+        },
+        {
+          "tid": "2105554",
+          "name": "(iou-wrk-2105553)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2105555",
+          "name": "(iou-wrk-2105550)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2105556",
+          "name": "(iou-wrk-2105552)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2281090",
+          "name": "(iou-wrk-2105549)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.41034890826317527
+        },
+        {
+          "tid": "2330202",
+          "name": "(iou-wrk-2105549)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0012140500244472642,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117858",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117960",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.23795380479166378,
+          "sys_cpu": 0.10319425207801745
+        },
+        {
+          "tid": "2117961",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117962",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0012140500244472642,
+          "sys_cpu": 0.004856200097789057
+        },
+        {
+          "tid": "2117963",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0024281000488945285,
+          "sys_cpu": 0.0036421500733417925
+        },
+        {
+          "tid": "2117966",
+          "name": "(iou-wrk-2117961)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117967",
+          "name": "(iou-wrk-2117962)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117968",
+          "name": "(iou-wrk-2117963)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2281094",
+          "name": "(iou-wrk-2117960)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.7345002647905948
+        },
+        {
+          "tid": "2330294",
+          "name": "(iou-wrk-2117960)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2330893",
+          "name": "(iou-wrk-2117960)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        }
+      ]
+    },
+    "cap8-old-recv-2.json": {
+      "depth": 8,
+      "mib_per_sec": 765.2769766175229,
+      "mode": "write",
+      "ops": 292,
+      "ops_per_sec": 95.65962207719036,
+      "p50_us": 84192.958,
+      "p99_us": 132737.551,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 3.052489584,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 5.177085378905758,
+      "threads": [
+        {
+          "tid": "2521579",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521586",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.22406429778548106,
+          "sys_cpu": 0.11010056011872776
+        },
+        {
+          "tid": "2521588",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521590",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.001931588774012768,
+          "sys_cpu": 0.005794766322038304
+        },
+        {
+          "tid": "2521591",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.005794766322038304,
+          "sys_cpu": 0.023179065288153215
+        },
+        {
+          "tid": "2521594",
+          "name": "(iou-wrk-2521590)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521595",
+          "name": "(iou-wrk-2521588)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521598",
+          "name": "(iou-wrk-2521586)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.08498990605656179
+        },
+        {
+          "tid": "2521601",
+          "name": "(iou-wrk-2521591)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521765",
+          "name": "(iou-wrk-2521586)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.7127562576107114
+        },
+        {
+          "tid": "2522537",
+          "name": "(iou-wrk-2521586)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.001931588774012768,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2439602",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2477824",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415205",
+          "name": "(autumn-ps)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415206",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415207",
+          "name": "(part-13)",
+          "user_cpu": 0.2047484100453534,
+          "sys_cpu": 0.623903174006124
+        },
+        {
+          "tid": "2419893",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2471965",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521608",
+          "name": "(part-13)",
+          "user_cpu": 0.1448691580509576,
+          "sys_cpu": 0.001931588774012768
+        },
+        {
+          "tid": "2521763",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521580",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521599",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.23565383042955768,
+          "sys_cpu": 0.1023742050226767
+        },
+        {
+          "tid": "2521600",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521602",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.007726355096051072
+        },
+        {
+          "tid": "2521603",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.003863177548025536,
+          "sys_cpu": 0.01738429896611491
+        },
+        {
+          "tid": "2521604",
+          "name": "(iou-wrk-2521600)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521605",
+          "name": "(iou-wrk-2521602)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521606",
+          "name": "(iou-wrk-2521603)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521607",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.2221327090114683
+        },
+        {
+          "tid": "2521764",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.5698186883337666
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521581",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521584",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.22599588655949385,
+          "sys_cpu": 0.09271626115261286
+        },
+        {
+          "tid": "2521585",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521587",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.001931588774012768,
+          "sys_cpu": 0.003863177548025536
+        },
+        {
+          "tid": "2521589",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.001931588774012768,
+          "sys_cpu": 0.01738429896611491
+        },
+        {
+          "tid": "2521592",
+          "name": "(iou-wrk-2521585)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521593",
+          "name": "(iou-wrk-2521587)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521596",
+          "name": "(iou-wrk-2521589)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521597",
+          "name": "(iou-wrk-2521584)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.5543659781416644
+        },
+        {
+          "tid": "2521766",
+          "name": "(iou-wrk-2521584)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.21826953146344277
+        }
+      ]
+    },
+    "baseline-threads.json": [
+      {
+        "name": "(autumn-ps)",
+        "user": 2,
+        "sys": 4,
+        "allowed": "Cpus_allowed_list:\t0-191",
+        "user_cpu": 0.0,
+        "sys_cpu": 0.0
+      },
+      {
+        "name": "(part-13)",
+        "user": 4130,
+        "sys": 1419,
+        "allowed": "Cpus_allowed_list:\t12",
+        "user_cpu": 0.27503907619716317,
+        "sys_cpu": 0.6086663579747872
+      },
+      {
+        "name": "(part-17)",
+        "user": 539,
+        "sys": 117,
+        "allowed": "Cpus_allowed_list:\t14",
+        "user_cpu": 0.0,
+        "sys_cpu": 0.0
+      },
+      {
+        "name": "(part-17-sst)",
+        "user": 0,
+        "sys": 0,
+        "allowed": "Cpus_allowed_list:\t14",
+        "user_cpu": 0.0,
+        "sys_cpu": 0.0
+      },
+      {
+        "name": "(part-13-sst)",
+        "user": 0,
+        "sys": 0,
+        "allowed": "Cpus_allowed_list:\t12",
+        "user_cpu": 0.0,
+        "sys_cpu": 0.0
+      },
+      {
+        "name": "(part-13)",
+        "user": 120,
+        "sys": 1,
+        "allowed": "Cpus_allowed_list:\t12",
+        "user_cpu": 0.0,
+        "sys_cpu": 0.0
+      },
+      {
+        "name": "(part-13-sst)",
+        "user": 0,
+        "sys": 0,
+        "allowed": "Cpus_allowed_list:\t12",
+        "user_cpu": 0.0,
+        "sys_cpu": 0.0
+      }
+    ],
+    "nocrc-2.json": {
+      "depth": 8,
+      "mib_per_sec": 624.0003983664766,
+      "mode": "write",
+      "ops": 162,
+      "ops_per_sec": 78.00004979580957,
+      "p50_us": 99283.912,
+      "p99_us": 117056.718,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 2.076921751,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 4.2584905968979,
+      "threads": [
+        {
+          "tid": "2521579",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521586",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.15968099131071145,
+          "sys_cpu": 0.07984049565535573
+        },
+        {
+          "tid": "2521588",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521590",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.002348249872216345,
+          "sys_cpu": 0.007044749616649034
+        },
+        {
+          "tid": "2521591",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.002348249872216345,
+          "sys_cpu": 0.007044749616649034
+        },
+        {
+          "tid": "2521594",
+          "name": "(iou-wrk-2521590)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521595",
+          "name": "(iou-wrk-2521588)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521598",
+          "name": "(iou-wrk-2521586)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521601",
+          "name": "(iou-wrk-2521591)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2668254",
+          "name": "(iou-wrk-2521586)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.5565352197152738
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.002348249872216345
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2439602",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2477824",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2605290",
+          "name": "(autumn-ps-nocrc)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2605291",
+          "name": "(part-13)",
+          "user_cpu": 0.34049623147137,
+          "sys_cpu": 0.490784223293216
+        },
+        {
+          "tid": "2605292",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2609445",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2667868",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2668071",
+          "name": "(part-13)",
+          "user_cpu": 0.12210899335524994,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2668249",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521580",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521599",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.15028799182184607,
+          "sys_cpu": 0.0892334951442211
+        },
+        {
+          "tid": "2521600",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521602",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.002348249872216345,
+          "sys_cpu": 0.002348249872216345
+        },
+        {
+          "tid": "2521603",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.00939299948886538
+        },
+        {
+          "tid": "2521604",
+          "name": "(iou-wrk-2521600)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521605",
+          "name": "(iou-wrk-2521602)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521606",
+          "name": "(iou-wrk-2521603)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521764",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.3545857307046681
+        },
+        {
+          "tid": "2668251",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2668807",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521581",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521584",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.16672574092736048,
+          "sys_cpu": 0.10567124424973552
+        },
+        {
+          "tid": "2521585",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521587",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.002348249872216345,
+          "sys_cpu": 0.00469649974443269
+        },
+        {
+          "tid": "2521589",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.00469649974443269,
+          "sys_cpu": 0.007044749616649034
+        },
+        {
+          "tid": "2521592",
+          "name": "(iou-wrk-2521585)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521593",
+          "name": "(iou-wrk-2521587)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521596",
+          "name": "(iou-wrk-2521589)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521597",
+          "name": "(iou-wrk-2521584)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.18551173990509126
+        },
+        {
+          "tid": "2668253",
+          "name": "(iou-wrk-2521584)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.3710234798101825
+        }
+      ]
+    },
+    "recv-2.json": {
+      "depth": 8,
+      "mib_per_sec": 668.7191067353052,
+      "mode": "write",
+      "ops": 507,
+      "ops_per_sec": 83.58988834191315,
+      "p50_us": 74747.73,
+      "p99_us": 131944.917,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 6.06532692,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 8.236001532059163,
+      "threads": [
+        {
+          "tid": "2381024",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381029",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.021855265482812074,
+          "sys_cpu": 0.0679941592798598
+        },
+        {
+          "tid": "2381030",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381031",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.13113159289687246,
+          "sys_cpu": 0.10441960175121325
+        },
+        {
+          "tid": "2381032",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.002428362831423564,
+          "sys_cpu": 0.0036425442471353458
+        },
+        {
+          "tid": "2381041",
+          "name": "(iou-wrk-2381031)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.5888779866202143
+        },
+        {
+          "tid": "2381042",
+          "name": "(iou-wrk-2381030)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381043",
+          "name": "(iou-wrk-2381032)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381044",
+          "name": "(iou-wrk-2381029)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.03035453539279455
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.001214181415711782,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.001214181415711782,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287117",
+          "name": "(autumn-ps)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287257",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287258",
+          "name": "(part-13)",
+          "user_cpu": 0.1687712167839377,
+          "sys_cpu": 0.5257405530032017
+        },
+        {
+          "tid": "2290047",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2330017",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0072850884942706915,
+          "sys_cpu": 0.03035453539279455
+        },
+        {
+          "tid": "2374418",
+          "name": "(part-13)",
+          "user_cpu": 0.06313743361701267,
+          "sys_cpu": 0.061923252201300884
+        },
+        {
+          "tid": "2374523",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2382423",
+          "name": "(part-13)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2382424",
+          "name": "(part-13)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381025",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381033",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.015784358404253167,
+          "sys_cpu": 0.038853805302777024
+        },
+        {
+          "tid": "2381034",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381036",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.13234577431258426,
+          "sys_cpu": 0.1141330530769075
+        },
+        {
+          "tid": "2381038",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.001214181415711782,
+          "sys_cpu": 0.0036425442471353458
+        },
+        {
+          "tid": "2381045",
+          "name": "(iou-wrk-2381036)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.6107332521030264
+        },
+        {
+          "tid": "2381046",
+          "name": "(iou-wrk-2381034)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381049",
+          "name": "(iou-wrk-2381038)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381051",
+          "name": "(iou-wrk-2381033)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.03035453539279455
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381026",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381035",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.020641084067100295,
+          "sys_cpu": 0.05949488936987732
+        },
+        {
+          "tid": "2381037",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381039",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.13234577431258426,
+          "sys_cpu": 0.1080621459983486
+        },
+        {
+          "tid": "2381040",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.002428362831423564,
+          "sys_cpu": 0.0036425442471353458
+        },
+        {
+          "tid": "2381047",
+          "name": "(iou-wrk-2381037)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381048",
+          "name": "(iou-wrk-2381039)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.5913063494516378
+        },
+        {
+          "tid": "2381050",
+          "name": "(iou-wrk-2381040)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381052",
+          "name": "(iou-wrk-2381035)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.029140353977082766
+        }
+      ]
+    },
+    "nocrc-1.json": {
+      "depth": 8,
+      "mib_per_sec": 629.9138796732625,
+      "mode": "write",
+      "ops": 166,
+      "ops_per_sec": 78.73923495915781,
+      "p50_us": 94227.71,
+      "p99_us": 97522.211,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 2.1082247,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 4.25911260698922,
+      "threads": [
+        {
+          "tid": "2521579",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521586",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.1291348810776799,
+          "sys_cpu": 0.10565581179082899
+        },
+        {
+          "tid": "2521588",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521590",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.007043720786055266
+        },
+        {
+          "tid": "2521591",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0046958138573701775
+        },
+        {
+          "tid": "2521594",
+          "name": "(iou-wrk-2521590)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521595",
+          "name": "(iou-wrk-2521588)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521598",
+          "name": "(iou-wrk-2521586)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.3803609224469844
+        },
+        {
+          "tid": "2521601",
+          "name": "(iou-wrk-2521591)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0023479069286850888
+        },
+        {
+          "tid": "2668254",
+          "name": "(iou-wrk-2521586)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0023479069286850888,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2439602",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2477824",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2605290",
+          "name": "(autumn-ps-nocrc)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2605291",
+          "name": "(part-13)",
+          "user_cpu": 0.3146195284438019,
+          "sys_cpu": 0.48836464116649847
+        },
+        {
+          "tid": "2605292",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2609445",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2667868",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2668071",
+          "name": "(part-13)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2668249",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521580",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521599",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.17374511272269655,
+          "sys_cpu": 0.05869767321712722
+        },
+        {
+          "tid": "2521600",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521602",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0023479069286850888,
+          "sys_cpu": 0.007043720786055266
+        },
+        {
+          "tid": "2521603",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0046958138573701775,
+          "sys_cpu": 0.0023479069286850888
+        },
+        {
+          "tid": "2521604",
+          "name": "(iou-wrk-2521600)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521605",
+          "name": "(iou-wrk-2521602)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521606",
+          "name": "(iou-wrk-2521603)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521764",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.2981841799430063
+        },
+        {
+          "tid": "2668251",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2668252",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521581",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521584",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.16435348500795618,
+          "sys_cpu": 0.06574139400318249
+        },
+        {
+          "tid": "2521585",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521587",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0023479069286850888,
+          "sys_cpu": 0.007043720786055266
+        },
+        {
+          "tid": "2521589",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0046958138573701775
+        },
+        {
+          "tid": "2521592",
+          "name": "(iou-wrk-2521585)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521593",
+          "name": "(iou-wrk-2521587)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521596",
+          "name": "(iou-wrk-2521589)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521597",
+          "name": "(iou-wrk-2521584)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.30287999380037645
+        },
+        {
+          "tid": "2668253",
+          "name": "(iou-wrk-2521584)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        }
+      ]
+    },
+    "cap8-2.json": {
+      "depth": 8,
+      "mib_per_sec": 553.6799915905897,
+      "mode": "write",
+      "ops": 420,
+      "ops_per_sec": 69.20999894882371,
+      "p50_us": 81789.756,
+      "p99_us": 169987.052,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 6.068487305,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 8.177052100887522,
+      "threads": [
+        {
+          "tid": "2381024",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381029",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.12596226455353093,
+          "sys_cpu": 0.11740172230232009
+        },
+        {
+          "tid": "2381030",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381031",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0012229346073158343,
+          "sys_cpu": 0.004891738429263337
+        },
+        {
+          "tid": "2381032",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.01956695371705335,
+          "sys_cpu": 0.06359259958042339
+        },
+        {
+          "tid": "2381041",
+          "name": "(iou-wrk-2381031)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381042",
+          "name": "(iou-wrk-2381030)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381043",
+          "name": "(iou-wrk-2381032)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.033019234397527526
+        },
+        {
+          "tid": "2381044",
+          "name": "(iou-wrk-2381029)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.5380912272189672
+        },
+        {
+          "tid": "2479083",
+          "name": "(iou-wrk-2381029)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.05625499193652838
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0012229346073158343
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0012229346073158343,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0012229346073158343,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2439602",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2477824",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415205",
+          "name": "(autumn-ps)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415206",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415207",
+          "name": "(part-13)",
+          "user_cpu": 0.15164389130716346,
+          "sys_cpu": 0.4549316739214904
+        },
+        {
+          "tid": "2419893",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2471965",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.012229346073158344,
+          "sys_cpu": 0.06603846879505505
+        },
+        {
+          "tid": "2473539",
+          "name": "(part-13)",
+          "user_cpu": 0.06236966497310755,
+          "sys_cpu": 0.034242169004843365
+        },
+        {
+          "tid": "2478767",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2481986",
+          "name": "(part-13)",
+          "user_cpu": 0.05747792654384421,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381025",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381033",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.12596226455353093,
+          "sys_cpu": 0.16142736816569014
+        },
+        {
+          "tid": "2381034",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381036",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0012229346073158343,
+          "sys_cpu": 0.004891738429263337
+        },
+        {
+          "tid": "2381038",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.020789888324369184,
+          "sys_cpu": 0.06848433800968673
+        },
+        {
+          "tid": "2381045",
+          "name": "(iou-wrk-2381036)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381046",
+          "name": "(iou-wrk-2381034)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381049",
+          "name": "(iou-wrk-2381038)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.031796299790211695
+        },
+        {
+          "tid": "2381051",
+          "name": "(iou-wrk-2381033)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.06848433800968673
+        },
+        {
+          "tid": "2479088",
+          "name": "(iou-wrk-2381033)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.5368682926116513
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381026",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381035",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.12718519916084678,
+          "sys_cpu": 0.14063747984132094
+        },
+        {
+          "tid": "2381037",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381039",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0012229346073158343,
+          "sys_cpu": 0.006114673036579172
+        },
+        {
+          "tid": "2381040",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.008560542251210841,
+          "sys_cpu": 0.02812749596826419
+        },
+        {
+          "tid": "2381047",
+          "name": "(iou-wrk-2381037)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381050",
+          "name": "(iou-wrk-2381040)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.040356842041422536
+        },
+        {
+          "tid": "2381052",
+          "name": "(iou-wrk-2381035)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.3167400632948011
+        },
+        {
+          "tid": "2478957",
+          "name": "(iou-wrk-2381039)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2479096",
+          "name": "(iou-wrk-2381035)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.3045107172216428
+        }
+      ]
+    },
+    "baseline-write.log": "{\"depth\":8,\"mib_per_sec\":522.5894438261981,\"mode\":\"write\",\"ops\":660,\"ops_per_sec\":65.32368047827477,\"p50_us\":121012.306,\"p99_us\":141538.733,\"pool_acquires\":1,\"pool_hits\":0,\"seconds\":10.103533591,\"size\":8388608,\"transport\":\"tcp\"}",
+    "recv-1.json": {
+      "depth": 8,
+      "mib_per_sec": 810.911291914127,
+      "mode": "write",
+      "ops": 615,
+      "ops_per_sec": 101.36391148926587,
+      "p50_us": 78295.916,
+      "p99_us": 91612.818,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 6.067248106,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 8.194915843894705,
+      "threads": [
+        {
+          "tid": "2381024",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381029",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.0048810751399967585,
+          "sys_cpu": 0.009762150279993517
+        },
+        {
+          "tid": "2381030",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381031",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.15009306055490032,
+          "sys_cpu": 0.1378903727049084
+        },
+        {
+          "tid": "2381032",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0012202687849991896,
+          "sys_cpu": 0.0036608063549975686
+        },
+        {
+          "tid": "2381041",
+          "name": "(iou-wrk-2381031)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.7065356265145307
+        },
+        {
+          "tid": "2381042",
+          "name": "(iou-wrk-2381030)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381043",
+          "name": "(iou-wrk-2381032)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381044",
+          "name": "(iou-wrk-2381029)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0012202687849991896,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287117",
+          "name": "(autumn-ps)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287257",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287258",
+          "name": "(part-13)",
+          "user_cpu": 0.19158219924487277,
+          "sys_cpu": 0.6296586930595818
+        },
+        {
+          "tid": "2290047",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2330017",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2374418",
+          "name": "(part-13)",
+          "user_cpu": 0.1513133293398995,
+          "sys_cpu": 0.0024405375699983792
+        },
+        {
+          "tid": "2374523",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381025",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381033",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.0036608063549975686,
+          "sys_cpu": 0.013422956634991086
+        },
+        {
+          "tid": "2381034",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381036",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.17815924260988167,
+          "sys_cpu": 0.14277144784490517
+        },
+        {
+          "tid": "2381038",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0012202687849991896,
+          "sys_cpu": 0.0036608063549975686
+        },
+        {
+          "tid": "2381045",
+          "name": "(iou-wrk-2381036)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.7846328287544788
+        },
+        {
+          "tid": "2381046",
+          "name": "(iou-wrk-2381034)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381049",
+          "name": "(iou-wrk-2381038)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381051",
+          "name": "(iou-wrk-2381033)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381026",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381035",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.0024405375699983792,
+          "sys_cpu": 0.014643225419990274
+        },
+        {
+          "tid": "2381037",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381039",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.1659565547598898,
+          "sys_cpu": 0.12202687849991896
+        },
+        {
+          "tid": "2381040",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0036608063549975686
+        },
+        {
+          "tid": "2381047",
+          "name": "(iou-wrk-2381037)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381048",
+          "name": "(iou-wrk-2381039)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.7053153577295316
+        },
+        {
+          "tid": "2381050",
+          "name": "(iou-wrk-2381040)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381052",
+          "name": "(iou-wrk-2381035)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        }
+      ]
+    },
+    "cap8-old-recv-1.json": {
+      "depth": 8,
+      "mib_per_sec": 805.5358060152602,
+      "mode": "write",
+      "ops": 311,
+      "ops_per_sec": 100.69197575190752,
+      "p50_us": 79499.551,
+      "p99_us": 92634.227,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 3.088627447,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 5.248929531080648,
+      "threads": [
+        {
+          "tid": "2521579",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0019051503627142813
+        },
+        {
+          "tid": "2521586",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521588",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521590",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521591",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521594",
+          "name": "(iou-wrk-2521590)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521595",
+          "name": "(iou-wrk-2521588)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521598",
+          "name": "(iou-wrk-2521586)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521601",
+          "name": "(iou-wrk-2521591)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521765",
+          "name": "(iou-wrk-2521586)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0019051503627142813,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2439602",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2477824",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415205",
+          "name": "(autumn-ps)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415206",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415207",
+          "name": "(part-13)",
+          "user_cpu": 0.16955838228157105,
+          "sys_cpu": 0.5791657102651415
+        },
+        {
+          "tid": "2419893",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2471965",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0019051503627142813
+        },
+        {
+          "tid": "2521608",
+          "name": "(part-13)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521763",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521580",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0019051503627142813,
+          "sys_cpu": 0.0019051503627142813
+        },
+        {
+          "tid": "2521599",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521600",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521602",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521603",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521604",
+          "name": "(iou-wrk-2521600)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521605",
+          "name": "(iou-wrk-2521602)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521606",
+          "name": "(iou-wrk-2521603)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521607",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521764",
+          "name": "(iou-wrk-2521599)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0019051503627142813,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521581",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521584",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521585",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521587",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521589",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521592",
+          "name": "(iou-wrk-2521585)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521593",
+          "name": "(iou-wrk-2521587)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521596",
+          "name": "(iou-wrk-2521589)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521597",
+          "name": "(iou-wrk-2521584)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2521766",
+          "name": "(iou-wrk-2521584)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        }
+      ]
+    },
+    "kernel-profile.log": [
+      {
+        "count": 371,
+        "stack": ""
+      },
+      {
+        "count": 149,
+        "stack": "copy_user_enhanced_fast_string+10\n    _copy_to_iter+449\n    __skb_datagram_iter+390\n    skb_copy_datagram_iter+48\n    tcp_recvmsg_locked+1486\n    tcp_recvmsg+131\n    inet_recvmsg+82\n    io_recv+585\n    io_issue_sqe+102\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85\n    entry_SYSCALL_64_after_hwframe+110"
+      },
+      {
+        "count": 123,
+        "stack": "clear_page_erms+7\n    get_page_from_freelist+3620\n    __alloc_pages+476\n    skb_page_frag_refill+106\n    sk_page_frag_refill+29\n    tcp_sendmsg_locked+557\n    tcp_sendmsg+39\n    __sock_sendmsg+88\n    ____sys_sendmsg+639\n    __sys_sendmsg_sock+15\n    io_sendmsg+179\n    io_issue_sqe+410\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961"
+      },
+      {
+        "count": 104,
+        "stack": "copy_user_enhanced_fast_string+10\n    _copy_from_iter+277\n    tcp_sendmsg_locked+865\n    tcp_sendmsg+39\n    __sock_sendmsg+88\n    ____sys_sendmsg+639\n    __sys_sendmsg_sock+15\n    io_sendmsg+179\n    io_issue_sqe+410\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85\n    entry_SYSCALL_64_after_hwframe+110"
+      },
+      {
+        "count": 10,
+        "stack": "mod_memcg_state+32\n    mem_cgroup_charge_skmem+112\n    __sk_mem_raise_allocated+144\n    __sk_mem_schedule+51\n    tcp_wmem_schedule+52\n    tcp_sendmsg_locked+688\n    tcp_sendmsg+39\n    __sock_sendmsg+88\n    ____sys_sendmsg+639\n    __sys_sendmsg_sock+15\n    io_sendmsg+179\n    io_issue_sqe+410\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961"
+      },
+      {
+        "count": 10,
+        "stack": "copy_user_enhanced_fast_string+12\n    _copy_to_iter+449\n    __skb_datagram_iter+390\n    skb_copy_datagram_iter+48\n    tcp_recvmsg_locked+1486\n    tcp_recvmsg+131\n    inet_recvmsg+82\n    io_recv+585\n    io_issue_sqe+102\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85\n    entry_SYSCALL_64_after_hwframe+110"
+      },
+      {
+        "count": 6,
+        "stack": "get_page_from_freelist+3615\n    __alloc_pages+476\n    skb_page_frag_refill+106\n    sk_page_frag_refill+29\n    tcp_sendmsg_locked+557\n    tcp_sendmsg+39\n    __sock_sendmsg+88\n    ____sys_sendmsg+639\n    __sys_sendmsg_sock+15\n    io_sendmsg+179\n    io_issue_sqe+410\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85"
+      },
+      {
+        "count": 5,
+        "stack": "sock_rfree+25\n    tcp_recvmsg_locked+846\n    tcp_recvmsg+131\n    inet_recvmsg+82\n    io_recv+585\n    io_issue_sqe+102\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85\n    entry_SYSCALL_64_after_hwframe+110"
+      },
+      {
+        "count": 5,
+        "stack": "__check_object_size+182\n    simple_copy_to_iter+37\n    __skb_datagram_iter+390\n    skb_copy_datagram_iter+48\n    tcp_recvmsg_locked+1486\n    tcp_recvmsg+131\n    inet_recvmsg+82\n    io_recv+585\n    io_issue_sqe+102\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85\n    entry_SYSCALL_64_after_hwframe+110"
+      },
+      {
+        "count": 5,
+        "stack": "tcp_sendmsg_locked+2653\n    tcp_sendmsg+39\n    __sock_sendmsg+88\n    ____sys_sendmsg+639\n    __sys_sendmsg_sock+15\n    io_sendmsg+179\n    io_issue_sqe+410\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85\n    entry_SYSCALL_64_after_hwframe+110"
+      },
+      {
+        "count": 5,
+        "stack": "skb_release_data+71\n    napi_consume_skb+224\n    net_rx_action+253\n    handle_softirqs+212\n    do_softirq.part.0+95\n    __local_bh_enable_ip+100\n    __dev_queue_xmit+639\n    ip_finish_output2+663\n    __ip_queue_xmit+369\n    __tcp_transmit_skb+2724\n    tcp_write_xmit+1313\n    tcp_sendmsg_locked+1576\n    tcp_sendmsg+39\n    __sock_sendmsg+88"
+      },
+      {
+        "count": 5,
+        "stack": "__alloc_skb+226\n    tcp_stream_alloc_skb+40\n    tcp_sendmsg_locked+1630\n    tcp_sendmsg+39\n    __sock_sendmsg+88\n    ____sys_sendmsg+639\n    __sys_sendmsg_sock+15\n    io_sendmsg+179\n    io_issue_sqe+410\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85\n    entry_SYSCALL_64_after_hwframe+110"
+      },
+      {
+        "count": 4,
+        "stack": "net_rx_action+243\n    handle_softirqs+212\n    do_softirq.part.0+95\n    __local_bh_enable_ip+100\n    __dev_queue_xmit+639\n    ip_finish_output2+663\n    __ip_queue_xmit+369\n    __tcp_transmit_skb+2724\n    tcp_write_xmit+1313\n    tcp_sendmsg_locked+1576\n    tcp_sendmsg+39\n    __sock_sendmsg+88\n    ____sys_sendmsg+639\n    __sys_sendmsg_sock+15"
+      },
+      {
+        "count": 4,
+        "stack": "skb_release_data+248\n    __kfree_skb+32\n    tcp_ack+1917\n    tcp_rcv_established+365\n    tcp_v4_do_rcv+333\n    __release_sock+180\n    __sk_flush_backlog+33\n    tcp_sendmsg_locked+3032\n    tcp_sendmsg+39\n    __sock_sendmsg+88\n    ____sys_sendmsg+639\n    __sys_sendmsg_sock+15\n    io_sendmsg+179\n    io_issue_sqe+410"
+      },
+      {
+        "count": 3,
+        "stack": "tcp_rbtree_insert+41\n    tcp_event_new_data_sent+81\n    tcp_write_xmit+1332\n    tcp_sendmsg_locked+1576\n    tcp_sendmsg+39\n    __sock_sendmsg+88\n    ____sys_sendmsg+639\n    __sys_sendmsg_sock+15\n    io_sendmsg+179\n    io_issue_sqe+410\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85\n    entry_SYSCALL_64_after_hwframe+110"
+      },
+      {
+        "count": 3,
+        "stack": "tcp_recvmsg_locked+290\n    tcp_recvmsg+131\n    inet_recvmsg+82\n    io_recv+585\n    io_issue_sqe+102\n    io_submit_sqes+508\n    __do_sys_io_uring_enter+961\n    do_syscall_64+85\n    entry_SYSCALL_64_after_hwframe+110"
+      }
+    ],
+    "cpuset-only.log": "{\"depth\":8,\"mib_per_sec\":455.27370386516407,\"mode\":\"write\",\"ops\":577,\"ops_per_sec\":56.90921298314551,\"p50_us\":120975.855,\"p99_us\":231342.756,\"pool_acquires\":1,\"pool_hits\":0,\"seconds\":10.138955887,\"size\":8388608,\"transport\":\"tcp\"}",
+    "baseline-profile.log": [
+      {
+        "count": 500,
+        "stack": "syscall+29\n    compio_runtime::runtime::Runtime::poll_with::h23d68ff16a5a55e1+401\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2944\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 430,
+        "stack": "syscall+29\n    compio_runtime::runtime::Runtime::poll_with::h23d68ff16a5a55e1+401\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2457\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 180,
+        "stack": "crc32c::hw_x86_64::crc_u64_append::h113e79cae9367b23+14\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_stream::conn_pool::ConnPool::send_vectored::_$u7b$$u7b$closure$u7d$$u7d$::h0602acf5cce75b56+1045\n    autumn_stream::client::apply_stream_submit_msg::_$u7b$$u7b$closure$u7d$$u7d$::h3d40e9433a952d45+7729\n    _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h894b8fffa2739b6a+3640\n    async_task::raw::RawTask$LT$F$C$T$C$S$C$M$GT$::run::hf596f0ec976a47fb+267\n    compio_runtime::runtime::Runtime::run::h1ff20850291021f9+81\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2917\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 98,
+        "stack": "crc32c::hw_x86_64::crc_u64_append::h113e79cae9367b23+0\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_stream::conn_pool::ConnPool::send_vectored::_$u7b$$u7b$closure$u7d$$u7d$::h0602acf5cce75b56+1045\n    autumn_stream::client::apply_stream_submit_msg::_$u7b$$u7b$closure$u7d$$u7d$::h3d40e9433a952d45+7729\n    _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h894b8fffa2739b6a+3640\n    async_task::raw::RawTask$LT$F$C$T$C$S$C$M$GT$::run::hf596f0ec976a47fb+267\n    compio_runtime::runtime::Runtime::run::h1ff20850291021f9+81\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2917\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 72,
+        "stack": "crc32c::hw_x86_64::crc_u64_append::h113e79cae9367b23+14\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_partition_server::wal_record::encode_v1_segments::h814b1ad7bb1adc03+570\n    compio_driver::sys::iour::op::_$LT$impl$u20$compio_driver..sys..iour..OpCode$u20$for$u20$compio_driver..op..Asyncify$LT$F$C$D$GT$$GT$::call_blocking::he9f21b23e9794f78+368\n    _$LT$F$u20$as$u20$compio_driver..asyncify..Dispatchable$GT$::run::h267554686bd5f74e+87\n    std::sys::backtrace::__rust_begin_short_backtrace::he7a25a39818b3716+151\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h08399e87234b4e03+68\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 38,
+        "stack": "crc32c::hw_x86_64::crc_u64_append::h113e79cae9367b23+0\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_partition_server::wal_record::encode_v1_segments::h814b1ad7bb1adc03+570\n    compio_driver::sys::iour::op::_$LT$impl$u20$compio_driver..sys..iour..OpCode$u20$for$u20$compio_driver..op..Asyncify$LT$F$C$D$GT$$GT$::call_blocking::he9f21b23e9794f78+368\n    _$LT$F$u20$as$u20$compio_driver..asyncify..Dispatchable$GT$::run::h267554686bd5f74e+87\n    std::sys::backtrace::__rust_begin_short_backtrace::he7a25a39818b3716+151\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h08399e87234b4e03+68\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 30,
+        "stack": "syscall+29\n    0x7fe87be7f4d5\n    ucm_event_dispatch+69\n    ucm_madvise+125\n    _rjem_je_pages_purge_forced+28\n    _rjem_je_ehooks_default_zero_impl+34\n    _rjem_je_extent_commit_zero+160\n    extent_recycle+504\n    _rjem_je_ecache_alloc+59\n    pac_alloc_real+62\n    pac_alloc_impl+227\n    _rjem_je_pa_alloc+84\n    _rjem_je_arena_extent_alloc_large+177\n    _rjem_je_large_palloc+213\n    _rjem_calloc+2738\n    autumn_transport::regpool::acquire::hba56f3df8848944f+626"
+      },
+      {
+        "count": 27,
+        "stack": "crc32c::hw_x86_64::crc_u64_parallel3::hc40f664695c45bce+245\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_stream::conn_pool::ConnPool::send_vectored::_$u7b$$u7b$closure$u7d$$u7d$::h0602acf5cce75b56+1045\n    autumn_stream::client::apply_stream_submit_msg::_$u7b$$u7b$closure$u7d$$u7d$::h3d40e9433a952d45+7729\n    _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h894b8fffa2739b6a+3640\n    async_task::raw::RawTask$LT$F$C$T$C$S$C$M$GT$::run::hf596f0ec976a47fb+267\n    compio_runtime::runtime::Runtime::run::h1ff20850291021f9+81\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2917\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 20,
+        "stack": "crc32c::hw_x86_64::crc_u64_parallel3::hc40f664695c45bce+296\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_stream::conn_pool::ConnPool::send_vectored::_$u7b$$u7b$closure$u7d$$u7d$::h0602acf5cce75b56+1045\n    autumn_stream::client::apply_stream_submit_msg::_$u7b$$u7b$closure$u7d$$u7d$::h3d40e9433a952d45+7729\n    _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h894b8fffa2739b6a+3640\n    async_task::raw::RawTask$LT$F$C$T$C$S$C$M$GT$::run::hf596f0ec976a47fb+267\n    compio_runtime::runtime::Runtime::run::h1ff20850291021f9+81\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2917\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 18,
+        "stack": "crc32c::hw_x86_64::crc_u64_parallel3::hc40f664695c45bce+253\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_stream::conn_pool::ConnPool::send_vectored::_$u7b$$u7b$closure$u7d$$u7d$::h0602acf5cce75b56+1045\n    autumn_stream::client::apply_stream_submit_msg::_$u7b$$u7b$closure$u7d$$u7d$::h3d40e9433a952d45+7729\n    _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h894b8fffa2739b6a+3640\n    async_task::raw::RawTask$LT$F$C$T$C$S$C$M$GT$::run::hf596f0ec976a47fb+267\n    compio_runtime::runtime::Runtime::run::h1ff20850291021f9+81\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2917\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 16,
+        "stack": "crc32c::hw_x86_64::crc_u64_parallel3::hc40f664695c45bce+296\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_partition_server::wal_record::encode_v1_segments::h814b1ad7bb1adc03+570\n    compio_driver::sys::iour::op::_$LT$impl$u20$compio_driver..sys..iour..OpCode$u20$for$u20$compio_driver..op..Asyncify$LT$F$C$D$GT$$GT$::call_blocking::he9f21b23e9794f78+368\n    _$LT$F$u20$as$u20$compio_driver..asyncify..Dispatchable$GT$::run::h267554686bd5f74e+87\n    std::sys::backtrace::__rust_begin_short_backtrace::he7a25a39818b3716+151\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h08399e87234b4e03+68\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 12,
+        "stack": "crc32c::hw_x86_64::crc_u64_parallel3::hc40f664695c45bce+241\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_stream::conn_pool::ConnPool::send_vectored::_$u7b$$u7b$closure$u7d$$u7d$::h0602acf5cce75b56+1045\n    autumn_stream::client::apply_stream_submit_msg::_$u7b$$u7b$closure$u7d$$u7d$::h3d40e9433a952d45+7729\n    _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h894b8fffa2739b6a+3640\n    async_task::raw::RawTask$LT$F$C$T$C$S$C$M$GT$::run::hf596f0ec976a47fb+267\n    compio_runtime::runtime::Runtime::run::h1ff20850291021f9+81\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2917\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 10,
+        "stack": "crc32c::hw_x86_64::crc_u64_append::h113e79cae9367b23+13\n    crc32c::hw_x86_64::crc_u64_parallel3::hc40f664695c45bce+208\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_stream::conn_pool::ConnPool::send_vectored::_$u7b$$u7b$closure$u7d$$u7d$::h0602acf5cce75b56+1045\n    autumn_stream::client::apply_stream_submit_msg::_$u7b$$u7b$closure$u7d$$u7d$::h3d40e9433a952d45+7729\n    _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h894b8fffa2739b6a+3640\n    async_task::raw::RawTask$LT$F$C$T$C$S$C$M$GT$::run::hf596f0ec976a47fb+267\n    compio_runtime::runtime::Runtime::run::h1ff20850291021f9+81\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2917\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 9,
+        "stack": "crc32c::hw_x86_64::crc_u64_parallel3::hc40f664695c45bce+192\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_stream::conn_pool::ConnPool::send_vectored::_$u7b$$u7b$closure$u7d$$u7d$::h0602acf5cce75b56+1045\n    autumn_stream::client::apply_stream_submit_msg::_$u7b$$u7b$closure$u7d$$u7d$::h3d40e9433a952d45+7729\n    _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h894b8fffa2739b6a+3640\n    async_task::raw::RawTask$LT$F$C$T$C$S$C$M$GT$::run::hf596f0ec976a47fb+267\n    compio_runtime::runtime::Runtime::run::h1ff20850291021f9+81\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2917\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 8,
+        "stack": "crc32c::hw_x86_64::crc_u64_parallel3::hc40f664695c45bce+245\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_partition_server::wal_record::encode_v1_segments::h814b1ad7bb1adc03+570\n    compio_driver::sys::iour::op::_$LT$impl$u20$compio_driver..sys..iour..OpCode$u20$for$u20$compio_driver..op..Asyncify$LT$F$C$D$GT$$GT$::call_blocking::he9f21b23e9794f78+368\n    _$LT$F$u20$as$u20$compio_driver..asyncify..Dispatchable$GT$::run::h267554686bd5f74e+87\n    std::sys::backtrace::__rust_begin_short_backtrace::he7a25a39818b3716+151\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h08399e87234b4e03+68\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      },
+      {
+        "count": 7,
+        "stack": "crc32c::hw_x86_64::crc_u64_parallel3::hc40f664695c45bce+265\n    crc32c::hw_x86_64::crc32c::hdaf83c7076298f7a+214\n    autumn_stream::conn_pool::ConnPool::send_vectored::_$u7b$$u7b$closure$u7d$$u7d$::h0602acf5cce75b56+1045\n    autumn_stream::client::apply_stream_submit_msg::_$u7b$$u7b$closure$u7d$$u7d$::h3d40e9433a952d45+7729\n    _$LT$core..pin..Pin$LT$P$GT$$u20$as$u20$core..future..future..Future$GT$::poll::h894b8fffa2739b6a+3640\n    async_task::raw::RawTask$LT$F$C$T$C$S$C$M$GT$::run::hf596f0ec976a47fb+267\n    compio_runtime::runtime::Runtime::run::h1ff20850291021f9+81\n    std::sys::backtrace::__rust_begin_short_backtrace::h5980168b4cbd2753+2917\n    core::ops::function::FnOnce::call_once$u7b$$u7b$vtable.shim$u7d$$u7d$::h70abafcfe50d6df9+103\n    std::sys::thread::unix::Thread::new::thread_start::hc71bde616ea8b6e9+319\n    0x7fe87c05eaa4\n    0x7fe87c0ebc6c"
+      }
+    ],
+    "cap8-1.json": {
+      "depth": 8,
+      "mib_per_sec": 622.4815490985276,
+      "mode": "write",
+      "ops": 475,
+      "ops_per_sec": 77.81019363731595,
+      "p50_us": 81012.114,
+      "p99_us": 183860.893,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 6.104598611,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 8.222528220852837,
+      "threads": [
+        {
+          "tid": "2381024",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381029",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.08513196685962802,
+          "sys_cpu": 0.11432006978292907
+        },
+        {
+          "tid": "2381030",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381031",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.04134981247467648,
+          "sys_cpu": 0.05107918011577682
+        },
+        {
+          "tid": "2381032",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.002432341910275087,
+          "sys_cpu": 0.00364851286541263
+        },
+        {
+          "tid": "2381041",
+          "name": "(iou-wrk-2381031)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.20553289141824482
+        },
+        {
+          "tid": "2381042",
+          "name": "(iou-wrk-2381030)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381043",
+          "name": "(iou-wrk-2381032)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381044",
+          "name": "(iou-wrk-2381029)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.2894486873227353
+        },
+        {
+          "tid": "2479083",
+          "name": "(iou-wrk-2381029)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0012161709551375434,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0012161709551375434,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0012161709551375434,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2439602",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2477824",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415205",
+          "name": "(autumn-ps)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415206",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2415207",
+          "name": "(part-13)",
+          "user_cpu": 0.17877713040521886,
+          "sys_cpu": 0.5278181945296938
+        },
+        {
+          "tid": "2419893",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2471965",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2473539",
+          "name": "(part-13)",
+          "user_cpu": 0.12161709551375434,
+          "sys_cpu": 0.0364851286541263
+        },
+        {
+          "tid": "2478767",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2481986",
+          "name": "(part-13)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381025",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381033",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.0924289925904533,
+          "sys_cpu": 0.1009421892764161
+        },
+        {
+          "tid": "2381034",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381036",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.04743066725036419,
+          "sys_cpu": 0.04743066725036419
+        },
+        {
+          "tid": "2381038",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0012161709551375434,
+          "sys_cpu": 0.00364851286541263
+        },
+        {
+          "tid": "2381045",
+          "name": "(iou-wrk-2381036)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.20553289141824482
+        },
+        {
+          "tid": "2381046",
+          "name": "(iou-wrk-2381034)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381049",
+          "name": "(iou-wrk-2381038)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381051",
+          "name": "(iou-wrk-2381033)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.23715333625182095
+        },
+        {
+          "tid": "2479088",
+          "name": "(iou-wrk-2381033)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0012161709551375434
+        },
+        {
+          "tid": "2381026",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381035",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.08634813781476558,
+          "sys_cpu": 0.10337453118669118
+        },
+        {
+          "tid": "2381037",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381039",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.05229535107091436,
+          "sys_cpu": 0.04743066725036419
+        },
+        {
+          "tid": "2381040",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0012161709551375434,
+          "sys_cpu": 0.002432341910275087
+        },
+        {
+          "tid": "2381047",
+          "name": "(iou-wrk-2381037)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381050",
+          "name": "(iou-wrk-2381040)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2381052",
+          "name": "(iou-wrk-2381035)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.2359371652966834
+        },
+        {
+          "tid": "2478957",
+          "name": "(iou-wrk-2381039)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2479096",
+          "name": "(iou-wrk-2381035)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        }
+      ]
+    },
+    "crc-2.json": {
+      "depth": 8,
+      "mib_per_sec": 635.3096261799541,
+      "mode": "write",
+      "ops": 482,
+      "ops_per_sec": 79.41370327249426,
+      "p50_us": 87934.35,
+      "p99_us": 171340.878,
+      "pool_acquires": 1,
+      "pool_hits": 0,
+      "seconds": 6.069481464,
+      "size": 8388608,
+      "transport": "tcp",
+      "wall_total": 8.995122362859547,
+      "threads": [
+        {
+          "tid": "2111506",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2111590",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.20010845071236813,
+          "sys_cpu": 0.09004880282056567
+        },
+        {
+          "tid": "2111591",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2111592",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0011117136150687117,
+          "sys_cpu": 0.004446854460274847
+        },
+        {
+          "tid": "2111593",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0011117136150687117,
+          "sys_cpu": 0.005558568075343559
+        },
+        {
+          "tid": "2111594",
+          "name": "(iou-wrk-2111591)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2111595",
+          "name": "(iou-wrk-2111593)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2174838",
+          "name": "(iou-wrk-2111592)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2281091",
+          "name": "(iou-wrk-2111590)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.18565617371647486
+        },
+        {
+          "tid": "2330201",
+          "name": "(iou-wrk-2111590)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.45246744133296574
+        },
+        {
+          "tid": "2332205",
+          "name": "(iou-wrk-2111590)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093519",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093523",
+          "name": "(etcd)",
+          "user_cpu": 0.0011117136150687117,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093524",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093525",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093526",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093527",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093528",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093529",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093530",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093531",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093532",
+          "name": "(etcd)",
+          "user_cpu": 0.0011117136150687117,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093533",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093534",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093535",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093536",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093537",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093538",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093539",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093540",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093541",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093542",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093543",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093544",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093687",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136094",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136095",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136096",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136097",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136098",
+          "name": "(etcd)",
+          "user_cpu": 0.0011117136150687117,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136099",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136100",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2136101",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178393",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178394",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178395",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178396",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178397",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178398",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178399",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2178400",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221757",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221758",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221759",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221760",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221761",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2221762",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283800",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283801",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283802",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2283803",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327110",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327111",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2327112",
+          "name": "(etcd)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287117",
+          "name": "(autumn-ps)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287257",
+          "name": "(part-17)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2287258",
+          "name": "(part-13)",
+          "user_cpu": 0.15230476526441353,
+          "sys_cpu": 0.46914314555899633
+        },
+        {
+          "tid": "2290047",
+          "name": "(part-17-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2330017",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.008893708920549694,
+          "sys_cpu": 0.06003253521371044
+        },
+        {
+          "tid": "2330111",
+          "name": "(part-13)",
+          "user_cpu": 0.04558025821781718,
+          "sys_cpu": 0.044468544602748475
+        },
+        {
+          "tid": "2330200",
+          "name": "(part-13-sst)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2331222",
+          "name": "(part-13)",
+          "user_cpu": 0.04113340375754233,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2331223",
+          "name": "(part-13)",
+          "user_cpu": 0.04891539906302332,
+          "sys_cpu": 0.051138826293160744
+        },
+        {
+          "tid": "2105464",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2105549",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.1767624647959252,
+          "sys_cpu": 0.13562906103838285
+        },
+        {
+          "tid": "2105550",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2105552",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0022234272301374235,
+          "sys_cpu": 0.0033351408452061354
+        },
+        {
+          "tid": "2105553",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0011117136150687117,
+          "sys_cpu": 0.005558568075343559
+        },
+        {
+          "tid": "2105554",
+          "name": "(iou-wrk-2105553)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2105555",
+          "name": "(iou-wrk-2105550)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2105556",
+          "name": "(iou-wrk-2105552)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2281090",
+          "name": "(iou-wrk-2105549)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.3101680986041706
+        },
+        {
+          "tid": "2330202",
+          "name": "(iou-wrk-2105549)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.27681669015210925
+        },
+        {
+          "tid": "2332206",
+          "name": "(iou-wrk-2105549)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2332207",
+          "name": "(iou-wrk-2105549)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2093873",
+          "name": "(autumn-manager-)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117858",
+          "name": "(autumn-extent-n)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117960",
+          "name": "(extent-shard-0)",
+          "user_cpu": 0.1878796009466123,
+          "sys_cpu": 0.1422993427287951
+        },
+        {
+          "tid": "2117961",
+          "name": "(extent-shard-1)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117962",
+          "name": "(extent-shard-2)",
+          "user_cpu": 0.0033351408452061354,
+          "sys_cpu": 0.0022234272301374235
+        },
+        {
+          "tid": "2117963",
+          "name": "(extent-shard-3)",
+          "user_cpu": 0.0011117136150687117,
+          "sys_cpu": 0.004446854460274847
+        },
+        {
+          "tid": "2117966",
+          "name": "(iou-wrk-2117961)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117967",
+          "name": "(iou-wrk-2117962)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2117968",
+          "name": "(iou-wrk-2117963)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.0
+        },
+        {
+          "tid": "2281094",
+          "name": "(iou-wrk-2117960)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.43912687795214117
+        },
+        {
+          "tid": "2330294",
+          "name": "(iou-wrk-2117960)",
+          "user_cpu": 0.0,
+          "sys_cpu": 0.15452819249455094
+        }
+      ]
+    }
+  },
+  "validation": {
+    "test-prepared-final-ucx.log": "    --> crates/stream/src/client.rs:7498:19\n     |\n7498 |     pub(super) fn test_client(n_mgrs: usize) -> Rc<StreamClient> {\n     |                   ^^^^^^^^^^^\n     |\n     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: function `fence_message` is never used\n    --> crates/stream/src/client.rs:7513:8\n     |\n7513 |     fn fence_message() -> String {\n     |        ^^^^^^^^^^^^^\n\nwarning: `autumn-stream` (lib) generated 2 warnings\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.08s\n     Running tests/prepared_append.rs (target/debug/deps/prepared_append-e0e9b8a60a44adae)\n\nrunning 1 test\ntest prepared_large_appends_preserve_content_and_offsets ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s\n",
+    "test-rpc.log": "test wire_version_tests::compat_accepts_overlapping_interval_from_newer_peer ... ok\ntest shard_for_extent_tests::result_is_always_in_range ... ok\ntest wire_version_tests::compat_no_longer_verifies_the_peers_schema ... ok\ntest wire_version_tests::compat_rejects_disjoint_and_pre_r1 ... ok\ntest frame::tests::prepared_payload_preserves_full_frame_crc_for_distinct_request_ids ... ok\ntest cap_token::tests::huge_ttl_and_skew_do_not_overflow ... ok\ntest cap_token::tests::not_yet_valid_is_rejected ... ok\ntest cap_token::tests::mint_then_verify_roundtrips ... ok\ntest cap_token::tests::signature_byte_flip_fails ... ok\ntest cap_token::tests::wrong_public_key_fails ... ok\ntest cap_token::tests::expired_token_is_rejected ... ok\ntest frame::tests::pooled_ctrl_receive_checks_crc_and_leaves_following_frame ... ok\ntest client::tests::call_into_pooled_error_frame_surfaces_status ... ok\ntest client::tests::call_into_pooled_zc_error_message_round_trips ... ok\ntest client::tests::call_into_pooled_tcp_returns_filled_buffer ... ok\ntest client::tests::call_into_pooled_tcp_large_value_recv_into_pooled ... ok\ntest client::tests::closed_flag_set_after_peer_disconnect ... ok\ntest client::tests::a_peer_that_never_answers_holds_the_caller_until_a_deadline_ends_it ... ok\ntest client::tests::the_submit_queue_refuses_once_it_is_full ... ok\n\ntest result: ok. 64 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s\n",
+    "affinity-ablation.log": "\n---- cpu_pin::tests::child_can_move_off_its_parents_single_cpu stdout ----\n\nthread '<unnamed>' (2701989) panicked at crates/common/src/cpu_pin.rs:208:17:\nassertion `left == right` failed\n  left: [CoreId { id: 0 }]\n right: [CoreId { id: 1 }]\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\nthread '<unnamed>' (2701988) panicked at crates/common/src/cpu_pin.rs:214:14:\ncalled `Result::unwrap()` on an `Err` value: Any { .. }\n\nthread 'cpu_pin::tests::child_can_move_off_its_parents_single_cpu' (2701987) panicked at crates/common/src/cpu_pin.rs:217:10:\ncalled `Result::unwrap()` on an `Err` value: Any { .. }\n\n\nfailures:\n    cpu_pin::tests::child_can_move_off_its_parents_single_cpu\n\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s\n\nerror: test failed, to rerun pass `-p autumn-common --lib`",
+    "crc-micro.log": "   Compiling autumn-transport v0.1.0 (/data/dongmao_dev/autumn-rs/crates/transport)\n   Compiling autumn-rpc v0.1.0 (/data/dongmao_dev/autumn-rs/crates/rpc)\n    Finished `release` profile [optimized + debuginfo] target(s) in 20.16s\n     Running unittests src/lib.rs (target/release/deps/autumn_rpc-712d8897b868a4f0)\n\nrunning 1 test\n8MiB x 200 RF3: original_ms=893.294 prepared_ms=269.859\ntest frame::tests::replica_crc_cpu_benchmark ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 63 filtered out; finished in 1.17s\n",
+    "tests-final.log": "test extent_node::sealed_append_guard_tests::sealing_records_content_checksums_that_catch_a_later_flip ... ok\ntest extent_node::sealed_append_guard_tests::a_repeat_seal_apply_does_not_re_bless_rotted_content ... ok\ntest extent_node::recovery_idempotence_tests::unknown_completeness_still_refuses_rather_than_resetting ... ok\ntest extent_node::sealed_append_guard_tests::ec_shard_only_holder_seal_persists_without_dat ... ok\ntest extent_node::sealed_append_guard_tests::p0c_sealed_empty_survives_restart_and_rejects_append ... ok\ntest extent_node::sealed_append_guard_tests::a_replica_that_lost_its_tail_is_reported_not_logged_and_forgotten ... ok\ntest extent_node::sealed_append_guard_tests::a_rebuild_landing_mid_description_restarts_it_rather_than_splicing ... ok\ntest extent_node::concurrency_gate_tests::ec_convert_parallelism_one_serialises_acquires ... ok\ntest extent_node::concurrency_gate_tests::recovery_parallelism_two_allows_two_then_blocks_third ... ok\ntest extent_node::concurrency_gate_tests::drop_wakes_blocked_acquire ... ok\ntest extent_node::fd_lru_chaos_tests::over_cap_reload_concurrent_churn_bounded_fds_no_torn_read ... ok\ntest erasure::tests::test_encode_decode_6_3_config ... ok\ntest client::merge_ec_replay_tests::ec_committed_end_is_sealed_length_not_shard_length ... ok\ntest client::manager_retry_tests::not_leader_and_internal_retry_with_single_rotation ... ok\ntest client::manager_retry_tests::transient_precondition_does_not_rotate_manager ... ok\ntest client::manager_retry_tests::transport_errors_still_rotate_and_retry ... ok\ntest client::manager_retry_tests::transient_precondition_retries_until_it_clears ... ok\ntest extent_node::ec_shard_read_len_tests::the_read_length_is_exactly_what_the_encoder_emits ... ok\ntest erasure::tests::ec_encode_stripe_matches_whole ... ok\n\ntest result: ok. 193 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.41s\n",
+    "test-stream-integration.log": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.38s\n     Running tests/extent_append_semantics.rs (target/debug/deps/extent_append_semantics-ab0ceaaccf1f05ab)\n\nrunning 4 tests\ntest append_rejects_stale_revision ... ok\ntest batch_append_rejects_sealed_extent_with_low_commit ... ok\ntest append_with_mid_byte_commit_truncates_and_succeeds ... ok\ntest bulk_read_rejects_short_range_instead_of_short_ok ... ok\n\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s\n\n     Running tests/extent_pipeline.rs (target/debug/deps/extent_pipeline-a729967660da4c2e)\n\nrunning 5 tests\ntest seal_rejects_subsequent_appends ... ok\ntest pwritev_batch_still_coalesced ... ok\ntest appends_to_different_extents_run_concurrently ... ok\ntest concurrent_appends_preserve_offset_order_per_extent ... ok\ntest cq_flushes_fast_ops_while_slow_op_runs ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.73s\n",
+    "test-recv.log": "    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.75s\n     Running tests/extent_append_semantics.rs (target/debug/deps/extent_append_semantics-ab0ceaaccf1f05ab)\n\nrunning 4 tests\ntest bulk_read_rejects_short_range_instead_of_short_ok ... ok\ntest batch_append_rejects_sealed_extent_with_low_commit ... ok\ntest append_with_mid_byte_commit_truncates_and_succeeds ... ok\ntest append_rejects_stale_revision ... ok\n\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s\n\n     Running tests/extent_pipeline.rs (target/debug/deps/extent_pipeline-a729967660da4c2e)\n\nrunning 5 tests\ntest seal_rejects_subsequent_appends ... ok\ntest pwritev_batch_still_coalesced ... ok\ntest appends_to_different_extents_run_concurrently ... ok\ntest concurrent_appends_preserve_offset_order_per_extent ... ok\ntest cq_flushes_fast_ops_while_slow_op_runs ... ok\n\ntest result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s\n",
+    "test-prepared-ucx.log": "    --> crates/stream/src/client.rs:7498:19\n     |\n7498 |     pub(super) fn test_client(n_mgrs: usize) -> Rc<StreamClient> {\n     |                   ^^^^^^^^^^^\n     |\n     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: function `fence_message` is never used\n    --> crates/stream/src/client.rs:7513:8\n     |\n7513 |     fn fence_message() -> String {\n     |        ^^^^^^^^^^^^^\n\nwarning: `autumn-stream` (lib) generated 2 warnings\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.20s\n     Running tests/prepared_append.rs (target/debug/deps/prepared_append-e0e9b8a60a44adae)\n\nrunning 1 test\ntest prepared_large_appends_preserve_content_and_offsets ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s\n",
+    "test-partial.log": "   Compiling autumn-stream v0.1.0 (/data/dongmao_dev/autumn-rs/crates/stream)\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.74s\n     Running unittests src/lib.rs (target/debug/deps/autumn_stream-48f8c0f4fd4de957)\n\nrunning 1 test\ntest extent_node::enospc_disk_health_tests::partial_large_successor_does_not_hold_an_earlier_reply ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 193 filtered out; finished in 0.01s\n",
+    "test-prepared-tcp.log": "    --> crates/stream/src/client.rs:7498:19\n     |\n7498 |     pub(super) fn test_client(n_mgrs: usize) -> Rc<StreamClient> {\n     |                   ^^^^^^^^^^^\n     |\n     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: function `fence_message` is never used\n    --> crates/stream/src/client.rs:7513:8\n     |\n7513 |     fn fence_message() -> String {\n     |        ^^^^^^^^^^^^^\n\nwarning: `autumn-stream` (lib) generated 2 warnings\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.63s\n     Running tests/prepared_append.rs (target/debug/deps/prepared_append-b23625191855e40c)\n\nrunning 1 test\ntest prepared_large_appends_preserve_content_and_offsets ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s\n",
+    "tests-all.log": "test extent_node::sealed_append_guard_tests::a_repaired_replica_is_describable_without_a_restart ... ok\ntest extent_node::sealed_append_guard_tests::sealing_records_content_checksums_that_catch_a_later_flip ... ok\ntest extent_node::sealed_append_guard_tests::ec_shard_only_holder_seal_persists_without_dat ... ok\ntest extent_node::sealed_append_guard_tests::corrupt_meta_quarantines_extent_and_rejects_stale_append ... ok\ntest extent_node::sealed_append_guard_tests::a_replica_that_lost_its_tail_is_reported_not_logged_and_forgotten ... ok\ntest extent_node::sealed_append_guard_tests::a_replica_repaired_mid_description_is_not_described_from_what_it_replaced ... ok\ntest extent_node::sealed_append_guard_tests::a_rebuild_landing_mid_description_restarts_it_rather_than_splicing ... ok\ntest extent_node::concurrency_gate_tests::ec_convert_parallelism_one_serialises_acquires ... ok\ntest extent_node::concurrency_gate_tests::recovery_parallelism_two_allows_two_then_blocks_third ... ok\ntest extent_node::concurrency_gate_tests::drop_wakes_blocked_acquire ... ok\ntest erasure::tests::test_encode_decode_6_3_config ... ok\ntest extent_node::fd_lru_chaos_tests::over_cap_reload_concurrent_churn_bounded_fds_no_torn_read ... ok\ntest client::merge_ec_replay_tests::ec_committed_end_is_sealed_length_not_shard_length ... ok\ntest client::manager_retry_tests::not_leader_and_internal_retry_with_single_rotation ... ok\ntest client::manager_retry_tests::transient_precondition_does_not_rotate_manager ... ok\ntest client::manager_retry_tests::transient_precondition_retries_until_it_clears ... ok\ntest client::manager_retry_tests::transport_errors_still_rotate_and_retry ... ok\ntest extent_node::ec_shard_read_len_tests::the_read_length_is_exactly_what_the_encoder_emits ... ok\ntest erasure::tests::ec_encode_stripe_matches_whole ... ok\n\ntest result: ok. 194 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.53s\n",
+    "test-common.log": "     Running unittests src/lib.rs (target/debug/deps/autumn_common-566ae82062b624c7)\n\nrunning 16 tests\ntest alloc_conflict::tests::builders_pair_with_classifier ... ok\ntest alloc_conflict::tests::deterministic_preconditions_are_not_transient ... ok\ntest cpu_pin::tests::parse_cpuset_dedup ... ok\ntest cpu_pin::tests::parse_cpuset_empty_errors ... ok\ntest cpu_pin::tests::parse_cpuset_garbage_errors ... ok\ntest cpu_pin::tests::parse_cpuset_mixed ... ok\ntest cpu_pin::tests::parse_cpuset_range ... ok\ntest cpu_pin::tests::parse_cpuset_reverse_range_errors ... ok\ntest cpu_pin::tests::parse_cpuset_single ... ok\ntest metrics_http::tests::push_metric_formats_labels_and_escaping ... ok\ntest store::tests::alloc_ids_monotonic ... ok\ntest cpu_pin::tests::child_can_move_off_its_parents_single_cpu ... ok\ntest store::tests::owner_lock_reacquire_bumps_and_fences_previous_holder ... ok\ntest store::tests::owner_fence_matcher_pairs_with_producer ... ok\ntest store::tests::owner_lock_revision_validation ... ok\ntest metrics_http::tests::http_serves_rendered_text_and_404s_unknown_paths ... ok\n\ntest result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n"
+  }
+}

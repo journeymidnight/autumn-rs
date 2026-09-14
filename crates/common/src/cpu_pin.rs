@@ -173,9 +173,49 @@ pub fn affinity_set(cpu: Option<usize>) -> HashSet<usize> {
     set
 }
 
+/// Pin explicitly before constructing a runtime. A thread spawned by an
+/// already-pinned parent inherits that single CPU. compio intersects its target
+/// with the inherited mask, so it cannot move such a child to a sibling CPU.
+/// The OS still enforces the enclosing cgroup/cpuset when setting this affinity.
+pub fn pin_current(cpu: Option<usize>) -> std::io::Result<()> {
+    if let Some(id) = cpu {
+        if !core_affinity::set_for_current(core_affinity::CoreId { id }) {
+            return Err(std::io::Error::other(format!(
+                "cannot pin thread to CPU {id}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn child_can_move_off_its_parents_single_cpu() {
+        let cores = core_affinity::get_core_ids().unwrap();
+        if cores.len() < 2 {
+            return;
+        }
+        let (a, b) = (cores[0].id, cores[1].id);
+        std::thread::spawn(move || {
+            pin_current(Some(a)).unwrap();
+            std::thread::spawn(move || {
+                assert_eq!(core_affinity::get_core_ids().unwrap()[0].id, a);
+                pin_current(Some(b)).unwrap();
+                assert_eq!(
+                    core_affinity::get_core_ids().unwrap(),
+                    vec![core_affinity::CoreId { id: b }]
+                );
+            })
+            .join()
+            .unwrap();
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn parse_cpuset_single() {

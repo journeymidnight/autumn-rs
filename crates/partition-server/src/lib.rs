@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use autumn_common::cpu_pin::{affinity_set, pick_cpu_for_ord};
+use autumn_common::cpu_pin::{affinity_set, pick_cpu_for_ord, pin_current};
 use autumn_common::metrics::{duration_to_ns, ns_to_ms};
 use autumn_rpc::manager_rpc::{self, rkyv_decode, rkyv_encode, MgrRange as Range};
 use autumn_rpc::partition_rpc::{self, SstLocation, TableLocations, *};
@@ -10327,6 +10327,10 @@ fn spawn_sst_thread(
     let handle = std::thread::Builder::new()
         .name(format!("part-{part_id}-sst"))
         .spawn(move || {
+            if let Err(e) = pin_current(cpu) {
+                let _ = ready_tx.send(Err(anyhow!("P-sst CPU affinity: {e}")));
+                return;
+            }
             let rt = match compio::runtime::RuntimeBuilder::new()
                 .thread_affinity(affinity_set(cpu))
                 .build()

@@ -241,6 +241,34 @@ pub fn compute_ctrl_crc(head: &[u8], ctrl_parts: &[Bytes]) -> [u8; 4] {
     crc.to_le_bytes()
 }
 
+/// Immutable payload and its checksum, reusable across replica connections.
+/// Keeping the bytes with the checksum prevents callers from accidentally
+/// pairing a cached CRC with different data. Each frame still protects its own
+/// req_id/header and the complete payload, with identical wire bytes.
+pub struct PreparedPayload {
+    parts: Vec<Bytes>,
+    len: usize,
+    crc: u32,
+}
+
+impl PreparedPayload {
+    pub fn new(parts: Vec<Bytes>) -> Self {
+        let len = parts.iter().map(Bytes::len).sum();
+        let crc = parts.iter().fold(0, |crc, p| crc32c::crc32c_append(crc, p));
+        Self { parts, len, crc }
+    }
+
+    pub(crate) fn frame_parts(&self, req_id: u32, msg_type: u8) -> Vec<Bytes> {
+        let head = encode_vectored_head(req_id, msg_type, 0, self.len, 0);
+        let crc = crc32c::crc32c_combine(crc32c::crc32c(&head), self.crc, self.len);
+        let mut bufs = Vec::with_capacity(self.parts.len() + 2);
+        bufs.push(Bytes::copy_from_slice(&head));
+        bufs.extend(self.parts.iter().cloned());
+        bufs.push(Bytes::copy_from_slice(&crc.to_le_bytes()));
+        bufs
+    }
+}
+
 /// Build the complete head of a value-separable RESPONSE as ONE buffer:
 /// `[header][ctrl_len][code:1][message][crc]`. The caller emits the raw value
 /// as the following iovec(s); `value_len` only feeds the header's
@@ -516,6 +544,59 @@ pub enum FrameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prepared_payload_preserves_full_frame_crc_for_distinct_request_ids() {
+        for len in [0, 1, 4096, 65536, 131_079] {
+            let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let middle = len / 2;
+            let prepared = PreparedPayload::new(vec![
+                Bytes::copy_from_slice(&payload[..middle]), Bytes::new(),
+                Bytes::copy_from_slice(&payload[middle..]),
+            ]);
+            for id in [1, 17, u32::MAX] {
+                let wire = prepared.frame_parts(id, 1).concat();
+                assert_eq!(wire, Frame::request(id, 1, Bytes::copy_from_slice(&payload)).encode());
+                let mut decoder = FrameDecoder::new();
+                decoder.feed(&wire);
+                let frame = decoder.try_decode().unwrap().unwrap();
+                assert_eq!(frame.req_id, id);
+                assert_eq!(frame.payload.as_ref(), payload);
+                if len > 0 {
+                    let mut bad = wire;
+                    bad[HEADER_LEN + CTRL_PREFIX_LEN + len / 2] ^= 1;
+                    let mut decoder = FrameDecoder::new(); decoder.feed(&bad);
+                    assert!(matches!(decoder.try_decode(), Err(FrameError::CrcMismatch { .. })));
+                }
+            }
+        }
+    }
+
+    /// Isolate checksum CPU from networking/fsync. No timing assertions.
+    #[test]
+    #[ignore]
+    fn replica_crc_cpu_benchmark() {
+        use std::{hint::black_box, time::Instant};
+        let parts = vec![Bytes::from(vec![0x5a; 8 * 1024 * 1024])];
+        let runs = 200;
+        let start = Instant::now();
+        for _ in 0..runs {
+            for id in 1..=3 {
+                let head = encode_vectored_head(id, 1, 0, parts[0].len(), 0);
+                black_box(compute_ctrl_crc(&head, black_box(&parts)));
+            }
+        }
+        let original = start.elapsed();
+        let start = Instant::now();
+        for _ in 0..runs {
+            let prepared = PreparedPayload::new(black_box(parts.clone()));
+            for id in 1..=3 { black_box(prepared.frame_parts(id, 1)); }
+        }
+        let prepared = start.elapsed();
+        println!("8MiB x {runs} RF3: original_ms={:.3} prepared_ms={:.3}",
+            original.as_secs_f64()*1000.0, prepared.as_secs_f64()*1000.0);
+    }
+
 
     #[test]
     fn encode_decode_round_trip() {

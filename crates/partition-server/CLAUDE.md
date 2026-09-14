@@ -8,6 +8,11 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 
 ### Thread Model
 
+P-sst applies `cpu_pin::pin_current(cpu_bulk)` before creating its compio runtime.
+The parent P-log is already pinned, and child threads inherit that affinity;
+runtime-only pinning in compio 0.18 cannot widen the inherited mask. CPU read-back
+must show distinct P-log/P-sst cores, not merely the intended values in logs.
+
 ```
 Main compio thread (control plane + fd dispatcher)
 ├─ heartbeat_loop          ← periodic manager heartbeat

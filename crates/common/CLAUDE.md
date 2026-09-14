@@ -6,6 +6,14 @@ Shared utilities, metadata store, and error types. Used by `autumn-manager` (sto
 
 ## Modules
 
+### CPU affinity for child runtimes
+
+`pin_current` sets the requested CPU directly before runtime construction. A
+P-sst thread spawned by a pinned P-log inherits that single-core mask; compio
+0.18 intersects requested CPUs with the inherited mask and otherwise silently
+leaves P-sst on P-log's CPU. The direct set still respects OS/cgroup limits. A
+Linux regression spawns from CPU A and verifies the child actually runs on B.
+
 ### `metrics.rs` — Shared Performance Measurement Helpers
 
 Standardized helpers for periodic performance reporting across all crates. All latency fields use milliseconds (`_ms`).

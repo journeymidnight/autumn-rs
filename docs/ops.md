@@ -28,6 +28,12 @@ and the per-crate `crates/*/CLAUDE.md`.
 
 ### Core-path performance validation
 
+Replica CRC reuse and actual P-sst affinity verification are documented in
+[`perf_partition_cpu_20260914.md`](perf_partition_cpu_20260914.md), including
+TCP/UCX byte-exact integration and the isolated CRC CPU benchmark. Verify
+`Cpus_allowed_list` in `/proc/<ps-pid>/task/<tid>/status` for P-log and P-sst:
+the intended CPUs in startup logs are insufficient to establish actual pinning.
+
 Use an isolated cluster and dedicated data directories. Keep RF, partition layout,
 CPU affinity, UCX library/transport settings and dataset identical between builds.
 Wait for the PS log's `partition server serving` marker: the first listener can

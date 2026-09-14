@@ -393,6 +393,26 @@ impl RpcClient {
         Ok(rx)
     }
 
+    /// Send a replica payload whose CRC was computed once by its owner.
+    pub async fn send_prepared(
+        &self,
+        msg_type: u8,
+        payload: &crate::frame::PreparedPayload,
+    ) -> Result<oneshot::Receiver<Frame>, RpcError> {
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let bufs = payload.frame_parts(req_id, msg_type);
+        let (tx, rx) = oneshot::channel();
+        self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }) {
+            self.pending.borrow_mut().remove(&req_id);
+            return Err(e);
+        }
+        Ok(rx)
+    }
+
     /// Send a vectored request with a timeout.
     pub async fn call_vectored_timeout(
         &self,

@@ -802,6 +802,14 @@ StreamClient::connect(manager_endpoint, owner_key, max_extent_size, pool)
 
 ### Append data flow (public API drives retry)
 
+For star replication with multiple replicas and at least 64 KiB of payload,
+`launch_append` creates one `PreparedPayload` including the AppendReq header.
+Every replica combines its own RPC header with that checksum; submission order,
+full transit CRC and all-replica ACK behavior remain unchanged. This removes
+R-1 full payload scans per append. Chain and small/single-replica paths keep
+ordinary vectored sends. The EN receive path remains unchanged: a pooled ctrl
+receive candidate was tested and withdrawn for lack of stable CPU/throughput gain.
+
 ```
 append*(stream_id, payload):
   1. stream_worker_sender(stream_id): look up or lazily spawn the per-stream
