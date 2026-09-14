@@ -1,0 +1,24 @@
+{
+  "removed": [
+    "/data08/dongmao-autumn-perf-20260914",
+    "/data08/dongmao-compio-upgrade-20260914"
+  ],
+  "archive": "/data08/autumn-perf-evidence/20260914-compio-baselines-and-logs.tar.gz",
+  "archive_bytes": 113109111,
+  "free_before": 388913524736,
+  "free_after": 930120683520,
+  "net_reclaimed_bytes": 541207158784,
+  "timestamp_utc": "2026-09-14T22:43:36Z",
+  "crosshost": "H200-2 offline; full performance acceptance unfinished",
+  "replica_directories": [
+    {
+      "removed": "/data03/dongmao-autumn-perf-20260914",
+      "net_reclaimed_bytes": 163994595328
+    },
+    {
+      "removed": "/data05/dongmao-autumn-perf-20260914",
+      "net_reclaimed_bytes": 163994595328
+    }
+  ],
+  "total_net_reclaimed_bytes": 869196349440
+}

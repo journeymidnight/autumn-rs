@@ -133,7 +133,8 @@ receive cancellation fixture: creating UcxTransport alone does not select the
 runtime transport, and regpool therefore allocated an ordinary TCP slab. The
 fixture now calls init_with(Ucx) before testing registered buffer cancellation.
 
-Both isolated clusters were stopped after testing, with their data retained.
+Both isolated clusters were stopped after testing. The user requested cleanup
+on 2026-09-14; synthetic data, build trees and temporary environments were deleted.
 No subagents were used under the session's delegation restriction.
 
 ## Reproduce and rollback
@@ -142,6 +143,9 @@ Commands are in docs/ops.md under Compio runtime upgrade verification. Set
 --tcp-zerocopy-min-bytes 0 (the default) for ordinary sends. Keep baseline
 binaries/lockfiles for a runtime rollback; drain PS before stopping storage.
 
-Raw binaries, logs and runners are preserved in the container under
-/data08/dongmao-compio-upgrade-20260914. Selected machine-readable evidence is
-under perf/compio_upgrade_20260914. No cross-host results are claimed.
+Selected baseline/upgraded service binaries, lockfiles, logs and runners were
+archived and byte-verified before deleting the dated working directories:
+/data08/autumn-perf-evidence/20260914-compio-baselines-and-logs.tar.gz.
+The archive is about 108 MiB. Restore only needed files into a new bounded test
+directory; source is in git. Committed evidence remains under
+perf/compio_upgrade_20260914. Full performance acceptance remains unfinished.

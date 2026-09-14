@@ -28,7 +28,7 @@ changes, per-inode dispatcher barriers.
 
 H200-1, container `dongmao-autumn`, `/data/dongmao_dev/autumn-rs`. UCX 1.16.0.
 RF=3; one EN on each of `/data03`, `/data05`, `/data08`; four shards per EN.
-Test directories are under `dongmao-autumn-perf-20260914` on those disks.
+Test directories were under `dongmao-autumn-perf-20260914` on those disks.
 Manager port 29001, EN base 29100, PS base 29301, etcd 27379. Automatic manager
 policy is off; no EC/recovery workload was introduced. Normal flush/SST work still
 occurs and can affect measurements immediately following writes.
@@ -39,9 +39,11 @@ clients are on this host. These are **same-host RoCE results, not cross-host
 network measurements or a whole-machine throughput ceiling**. The fourth disk
 (`/data`) holds the build tree; RF3 data uses the three disks above.
 
-Raw logs, JSON and launch scripts remain on the host at
-`/data08/dongmao-autumn-perf-20260914/results` and its parent directory. Selected
-data and validation records are in `perf/core_path_20260914/`.
+The dated perf directories were removed on 2026-09-14 at the user's request.
+Selected raw logs and JSON are archived on H200-1 in
+`/data08/autumn-perf-evidence/20260914-compio-baselines-and-logs.tar.gz`.
+Committed measurements and validation remain in `perf/core_path_20260914/`.
+Synthetic data and obsolete build trees were deleted.
 
 ## Method and limitations
 

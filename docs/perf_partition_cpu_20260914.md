@@ -96,5 +96,6 @@ AUTUMN_TEST_UCX_BIND='[<RoCE-IP>]:0' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DE
   cargo test -p autumn-stream --features autumn-rpc/ucx --test prepared_append
 ```
 
-Raw logs/scripts: H200-1 /data08/dongmao-autumn-perf-20260914/cpu-round2.
+Raw logs were archived before the dated test directory was removed at the user's
+request on 2026-09-14: H200-1 /data08/autumn-perf-evidence/20260914-compio-baselines-and-logs.tar.gz.
 Selected samples and test output: perf/core_path_20260914/cpu-round2.json.

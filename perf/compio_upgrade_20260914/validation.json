@@ -89,7 +89,9 @@
     "Managed/multishot and scheduler experiments not integrated into production"
   ],
   "fixture_fix": "UCX registered cancellation test must init_with(Ucx) so regpool registers its slabs",
-  "test_processes": "both TCP and UCX isolated clusters stopped; test data preserved",
+  "test_processes": "Test clusters stopped. Dated work directories, build caches and synthetic data removed on 2026-09-14 at user request.",
   "multishot_error": "receive experiment failed: buffer ring has no available buffer\nError: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n",
-  "multipart_python": "[{\"size\": 4096, \"depth\": 1, \"seconds\": 9.399141513044015, \"operations\": 8}, {\"size\": 4096, \"depth\": 8, \"seconds\": 9.399190960917622, \"operations\": 64}, {\"size\": 65536, \"depth\": 1, \"seconds\": 9.39888220303692, \"operations\": 8}, {\"size\": 65536, \"depth\": 8, \"seconds\": 9.412407490191981, \"operations\": 64}, {\"size\": 1048576, \"depth\": 1, \"seconds\": 9.402208404848352, \"operations\": 8}, {\"size\": 1048576, \"depth\": 8, \"seconds\": 9.580626968061551, \"operations\": 64}, {\"size\": 8388608, \"depth\": 1, \"seconds\": 9.503517438890412, \"operations\": 8}, {\"size\": 8388608, \"depth\": 8, \"seconds\": 10.965364823117852, \"operations\": 64}]\nMULTIPART_PYTHON_BYTE_EXACT_OK\n"
+  "multipart_python": "[{\"size\": 4096, \"depth\": 1, \"seconds\": 9.399141513044015, \"operations\": 8}, {\"size\": 4096, \"depth\": 8, \"seconds\": 9.399190960917622, \"operations\": 64}, {\"size\": 65536, \"depth\": 1, \"seconds\": 9.39888220303692, \"operations\": 8}, {\"size\": 65536, \"depth\": 8, \"seconds\": 9.412407490191981, \"operations\": 64}, {\"size\": 1048576, \"depth\": 1, \"seconds\": 9.402208404848352, \"operations\": 8}, {\"size\": 1048576, \"depth\": 8, \"seconds\": 9.580626968061551, \"operations\": 64}, {\"size\": 8388608, \"depth\": 1, \"seconds\": 9.503517438890412, \"operations\": 8}, {\"size\": 8388608, \"depth\": 8, \"seconds\": 10.965364823117852, \"operations\": 64}]\nMULTIPART_PYTHON_BYTE_EXACT_OK\n",
+  "evidence_archive": "/data08/autumn-perf-evidence/20260914-compio-baselines-and-logs.tar.gz",
+  "cleanup_record": "cleanup.json"
 }

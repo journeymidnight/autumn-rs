@@ -1,10 +1,17 @@
 Date: 2026-09-14
+TaskStatus: completed
+Task scope: Clean dated perf artifacts from H200-1 dongmao-autumn at user request.
+Current summary: Removed /data03,/data05,/data08/dongmao-autumn-perf-20260914 and /data08/dongmao-compio-upgrade-20260914 after checking no live file references or nested mounts. Reclaimed about 809.5 GiB net. Kept 108 MiB byte-verified archive of baseline/upgraded service binaries, lockfiles, selected logs and runners under /data08/autumn-perf-evidence/20260914-compio-baselines-and-logs.tar.gz. Committed performance evidence remains intact.
+Verification: All four paths absent; disk free space checked. Cleanup record: perf/compio_upgrade_20260914/cleanup.json. Updated current evidence locations in the performance reports.
+Outstanding work: This completes cleanup only. F-COMPIO-UPGRADE remains not_completed: complete kernel CPU accounting, controlled scalability and new controlled performance comparisons were not performed. H200-2 unavailable. Do not describe the earlier short-sample experiments as full acceptance.
+
+Date: 2026-09-14
 TaskStatus: not_completed
 Task scope: Execute F-COMPIO-UPGRADE on compio-upgrade; Linux validation in H200-1 dongmao-autumn.
 Current summary: Workspace and Python upgraded to compio 0.19.2 (driver/net 0.12.5, runtime 0.12.6, executor 0.1.4), cyper 0.9 and Rust >=1.95. Adapted TCP split, h2c and fallible embedding client initialization with explicit ring provider. Added default-off prepared-replica TCP zerocopy with partial-send suffix handling, completion ownership and unsupported/resource fallback. No wire/storage changes.
 Validation: Locked workspace all-targets UCX check and release builds pass; final 1052 library tests pass (2 ignored). TCP/UCX transport suites, >1024-iovec prepared append on-disk byte checks, six FUSE cases, Python UCX wheel Fs smoke and two-partition concurrent byte-exact Python read/write pass. Corrected existing UCX cancellation fixture to select runtime UCX before requesting registered pool memory. Strict clippy/fmt failures reproduced on baseline; non-strict clippy completes. No subagents under session delegation restriction.
 Measurements: 240 cluster samples (TCP baseline/pure/zerocopy, UCX baseline/pure, identical-state UCX read reversal) and 84 receive/scheduler experiments. Loopback zerocopy no stable benefit: 8MiB/depth8 CPU s/GiB median 6.38 baseline, 6.33 pure, 6.68 zerocopy. Managed recv microbenchmark improves but not integrated; multishot ring exhausts; poll-first/single/defer no clear gain; SQPOLL not justified. All production receive/scheduler defaults unchanged, zerocopy off.
-Evidence: docs/perf_compio_upgrade_20260914.md and perf/compio_upgrade_20260914/. Full logs/binaries in /data08/dongmao-compio-upgrade-20260914. Both test clusters stopped, data retained.
+Evidence: docs/perf_compio_upgrade_20260914.md and perf/compio_upgrade_20260914/. Selected raw logs/binaries archived at /data08/autumn-perf-evidence/20260914-compio-baselines-and-logs.tar.gz; dated perf directories and synthetic data removed per user cleanup request.
 Remaining acceptance: User confirmed H200-2 offline and no cross-host environment. No full independent kernel-worker/alloc/copy/SQ/CQ accounting; mixed write stages are state-dependent; identical-state UCX 64KiB/depth8 residual ~4.5% remains unresolved; multi-partition correctness checked but not controlled scaling A/B. Full real-path managed/multishot/scheduling and client/read-response zerocopy evaluation remain. passes:false retained; this is an implementation/validation stage, not completed acceptance.
 Next steps: Resolve remaining performance gates and real-path candidates when test coverage/environment permit; default-off flag and preserved baseline provide rollback.
 
