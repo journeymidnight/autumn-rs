@@ -1,3 +1,20 @@
+Date: 2026-09-14
+TaskStatus: completed
+Task scope: 修 c4e4d64 留下的文档错误(用户 2026-09-14 指派"修复 CLAUDE.md 的文档错误")。代码分类
+  是对的,文字不对:`crates/fuse/CLAUDE.md` 说"只有三处合格"却列了五处,把 gap flush 与 truncate
+  列成消费粘性记录的调用者(代码里二者是 `BestEffort`);本文件下方 2026-09-13 (9) 条目
+  同一处旧名单;`dispatch.rs` drain 上方注释暗示 truncate 是 `ToApplication`。
+  由 pi 评审 c4e4d64 时找出。纯文档/注释,无功能代码。
+Current summary: 三处已改为与代码一致(3 ToApplication = FUSE_FLUSH/FSYNC/PyO3 flush;6 BestEffort
+  按"谁都没告诉"/"告诉了但不是退休点"两类列出);`cargo check -p autumn-fuse` 过。
+  feature_list.md:746 本来就对,未动。
+  规则 15 评审:按用户 2026-09-14 指示改用 pi-agent-review skill(近期不派 opus/fable subagent)。
+  第一轮管道码 3(filter 报两次 Connection error,模型轮次出错)⇒ 按 skill 规定作废重跑;
+  第二轮 pipeline=0、无错误轮次,结论"文字与代码一致,零发现":独立枚举 9 个调用点 = 3 take + 6 peek,
+  逐项对上新文字;核了 take/peek 语义与 FlushReport/flush_error 两处 doc。两轮都提的唯一 LOW
+  (dispatch.rs 注释没列 PyO3)不改:那段注释讲 dispatcher,PyO3 不经 dispatcher。
+Next steps: 无。
+
 Date: 2026-09-13 (9)
 TaskStatus: completed
 Task scope: 修评审在 fuse 写路径上追出的两条**既有**缺陷(用户 2026-09-13 指派 "fix HIGH 和
@@ -37,8 +54,8 @@ Task scope: 修评审在 fuse 写路径上追出的两条**既有**缺陷(用户
   所以改成 **Release 恒传 `BestEffort`**;`flush_report_for` 退化成常量,连同它那两条映射
   单测一并删除(其中 `normal_release_consumes_because_it_reports` 钉的正是这个假前提 ——
   我用测试把一个错误判据**焊死**了,这比没有测试更糟)。
-  现在会消费的只剩真能上报的调用者:FUSE_FLUSH(内核每次 close() 都发)、FSYNC、
-  写路径自己的 gap flush 与 truncate、PyO3 绑定。
+  现在会消费的只剩 Linux 回写错误的退休点:FUSE_FLUSH(内核每次 close() 都发)、FSYNC、
+  PyO3 显式 flush。gap flush 与 truncate 二轮评审后改成 `BestEffort`(见下"二轮")。
 
 【验收口径的两处偏离,不藏着】
   - HIGH 原文写 shell e2e,实际做成 in-process 集成测试(不需内核挂载、能进 CI,更强)。

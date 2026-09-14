@@ -421,11 +421,16 @@ drain 跑在 fsync handler **之前**且只打日志，会把唯一一份错误�
 没有 pending，就会持久化一个覆盖了丢失区域的 size —— **fsync 回报成功，文件里留着零洞**。
 现在 `flush_inode` 先取这个粘性错误并返回，才轮到持久化 size。
 
-**但"取"的资格按调用者分**（`flush_inode(state, ino, report)`）：只有能真正告诉应用的调用者
-传 `FlushReport::ToApplication` 才 take，其余传 `BestEffort` 只 peek。**判据不是"这个调用者会不会
-把错误交给谁"，而是"这里是不是 Linux 意义上回写错误的退休点"** —— 只有三处合格：FUSE_FLUSH
-（内核在每次 `close()` 都发）、FSYNC、写路径自己的 gap flush 与 truncate、PyO3 绑定；
-**不上报的是 periodic_sync、Destroy 和 RELEASE**。RELEASE 在这份名单里容易看反：它确实会
+**但"取"的资格按调用者分**（`flush_inode(state, ino, report)`）：传 `FlushReport::ToApplication`
+的才 take，其余传 `BestEffort` 只 peek。**判据不是"这个调用者会不会把错误交给谁"，而是"这里是不是
+Linux 意义上回写错误的退休点"** —— 只有三处合格：FUSE_FLUSH（内核在每次 `close()` 都发）、FSYNC、
+PyO3 绑定的显式 flush。其余六处全传 `BestEffort`，分两类：
+- **谁都没告诉**：periodic_sync、Destroy 只打日志；RELEASE 回的错误被内核丢掉。
+- **告诉了，但不是退休点**：read-after-write 屏障、写路径自己的 gap flush、truncate。它们的 `?`
+  确实把 EIO 交给调用者，但 Linux errseq 只在 fsync/close/msync 退休 —— 应用读/写拿到 EIO、重试
+  成功、再 close，那次 close 必须仍然失败；在这里消费，close 就找不到记录，对着洞报成功。
+
+RELEASE 在这份名单里容易看反：它确实会
 回一个错误，但 fuser 的契约明说"错误值不会返回给触发 release 的 close()/munmap()"——内核把
 它丢掉，所以它和只打日志的那两个等价。`dispatch.rs` 的 `propagate_flush_err`(= `!revoked`)
 只决定**要不要回 EIO**，**不能**拿来决定能不能消费粘性记录（本轮一开始就是这么错的）。

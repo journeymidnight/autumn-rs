@@ -246,11 +246,12 @@ pub async fn handle_request(
     //
     // Logging the error here is NOT how it gets reported — this drain runs
     // ahead of the fsync handler and would otherwise consume the only copy.
-    // `drain_pending` sticks the failure to the inode, and the next
-    // `flush_inode` marked `ToApplication` returns it, so FLUSH (which the
-    // kernel sends on every `close()`), FSYNC and truncate still fail. RELEASE
-    // is deliberately NOT in that list: fuser drops a release error before it
-    // reaches `close()`, so it may report but never consume.
+    // `drain_pending` sticks the failure to the inode. Until it is retired,
+    // every `flush_inode` fails on it; only one marked `ToApplication` — FLUSH
+    // (which the kernel sends on every `close()`) or FSYNC — retires it, while
+    // the `BestEffort` callers, truncate among them, fail and leave it standing.
+    // RELEASE is deliberately `BestEffort`: fuser drops a release error before
+    // it reaches `close()`, so it may report but never consume.
     if !matches!(req, FsRequest::Write { .. }) {
         if let Err(e) = write::drain_all_pending(state).await {
             tracing::warn!(error = %e, "pending append flush failed (fsync will report it)");
