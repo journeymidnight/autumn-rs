@@ -134,7 +134,7 @@ clock_skew_secs, admin_token, cluster_id, …}` → 本地缓存
   `check_key` / `check_range`。catch-all `_ => None`（放行）只对非 key 作用域的
   op（maintenance / split / merge / discards / diag）与 `AUTH_HELLO` 正确。
   新增一个带 key 的读写 RPC 而忘了加 arm = 一个 authz 旁路。
-  当前有 arm 的：`MSG_GET` / `MSG_GET_BULK` / `MSG_GET_REDIRECT` /
+  当前有 arm 的：`MSG_GET_BULK` / `MSG_GET_REDIRECT` /
   `MSG_GET_REDIRECT_MANY` / `MSG_HEAD` / `MSG_DELETE` / `MSG_PUT` /
   `MSG_PUT_BULK` / `MSG_RANGE` / `MSG_BATCH_PUT` / `MSG_BATCH_PUT_BULK` /
   `MSG_BATCH_GET_BULK`。

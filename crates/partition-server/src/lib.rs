@@ -1159,7 +1159,7 @@ pub(crate) struct PartitionData {
     /// before calling `multi_modify_split` so a split that would push
     /// the PS past its core budget is rejected rather than oversubscribing.
     pub(crate) partition_budget: std::sync::Arc<crate::PartitionBudget>,
-    /// (MED-2): per-extent reader-pin map. `handle_get → resolve_value`
+    /// (MED-2): per-extent reader-pin map. `handle_get_bulk → resolve_value`
     /// reads a ValuePointer from an SST, drops the partition borrow, and
     /// awaits `read_bytes_from_extent` on log_stream. Without coordination,
     /// `run_gc` could relocate the last live value off an extent and call
@@ -5134,10 +5134,10 @@ fn misroute_frame(req_id: u32, msg_type: u8, part_id: u64, owner_part: u64) -> B
     Frame::error(req_id, msg_type, err_payload).encode()
 }
 
-/// (Option B) — serve a GET / GET_ZC LOCALLY in the ps-conn task (no req_tx
-/// hop / partition_loop detour). Returns `(head, vec![value])` for MSG_GET_BULK
-/// (value-separable: value aliases the RegPool buffer, emitted as its own iovec)
-/// or `(frame, vec![])` for MSG_GET. `handle_get` borrows the partition only across
+/// (Option B) — serve a point or batched GET LOCALLY in the ps-conn task (no
+/// req_tx hop / partition_loop detour). Returns the bulk head plus the values,
+/// each aliasing its resolved read and emitted as its own iovec. The handlers
+/// borrow the partition only across
 /// synchronous code (drops it before the `resolve_value` await), so on the
 /// single-threaded P-log runtime concurrent reads never overlap a borrow with
 /// each other or with `partition_loop`'s `borrow_mut` writes.
@@ -5152,21 +5152,10 @@ async fn serve_get_local(
         // N values, each its own iovec — served here rather than through
         // partition_loop so a batched read never queues behind group commit.
         crate::rpc_handlers::handle_batch_get_bulk(req_id, payload, part).await
-    } else if msg_type == MSG_GET_BULK {
-        // handle_get_bulk never errors (status rides in the meta code).
+    } else {
+        // MSG_GET_BULK. Never errors: the status rides in the ctrl code.
         let (head, value) = crate::rpc_handlers::handle_get_bulk(req_id, payload, part).await;
         (head, vec![value])
-    } else {
-        let frame = match crate::rpc_handlers::handle_get(payload, part).await {
-            Ok(p) => Frame::response(req_id, msg_type, p),
-            Err((code, message)) => Frame::error(
-                req_id,
-                msg_type,
-                autumn_rpc::RpcError::encode_status(code, &message),
-            ),
-        }
-        .encode();
-        (frame, Vec::new())
     };
     // LAT-1: GET latency (inline serve incl. VP resolve).
     part.borrow()
@@ -5530,10 +5519,7 @@ fn push_one_frame_to_inflight(
     // partition_loop detour) — reads need a consistent PartitionData snapshot,
     // not the single-writer group-commit actor. part == None is unit-test mode →
     // fall through to the delegate.
-    if matches!(
-        msg_type,
-        MSG_GET | MSG_GET_BULK | partition_rpc::MSG_BATCH_GET_BULK
-    ) {
+    if matches!(msg_type, MSG_GET_BULK | partition_rpc::MSG_BATCH_GET_BULK) {
         if let Some(part) = part {
             let part_c = part.clone();
             let mut response =
@@ -5658,7 +5644,7 @@ async fn handle_ps_connection(
     conn: autumn_transport::Conn,
     req_tx: mpsc::Sender<PartitionRequest>,
     // (Option B): this task serves GET reads locally (in its own FU)
-    // when `Some` — `handle_get` only needs read access to PartitionData (it
+    // when `Some` — `handle_get_bulk` only needs read access to PartitionData (it
     // pulls the StreamClient from `part.stream_client` internally). Writes
     // still delegate to `partition_loop` via `req_tx`. `None` is the
     // mock-loop unit-test mode (those tests drive only writes), where GET
@@ -7380,7 +7366,7 @@ async fn handle_incoming_req(
     // enqueue helpers can perform the same TiKV-style region epoch
     // check the read handlers do. `0` from the client = "skip check"
     // (bootstrap / tests / legacy callers). Reads already perform this
-    // inside their respective handlers (`handle_get` / `handle_head`
+    // inside their respective handlers (`handle_get_bulk` / `handle_head`
     // / `handle_range` in `rpc_handlers.rs`).
     let (part_region_epoch, part_id_for_err) = {
         let p = part.borrow();
@@ -12404,7 +12390,7 @@ mod partition_listener_tests {
                     // Simulated merged_loop: echo every Put while req_rx is open.
                     let loop_handle = compio::runtime::spawn(async move {
                         while let Some(req) = req_rx.next().await {
-                            // Accept both MSG_PUT and MSG_GET; echo on Put.
+                            // Echo Puts; refuse everything else.
                             if req.msg_type == MSG_PUT {
                                 let put: PutReq =
                                     partition_rpc::rkyv_decode(&req.payload).expect("decode put");
@@ -14392,16 +14378,13 @@ mod authz_enforcement_tests {
                 .await;
             });
             // Mock partition loop: any ADMITTED request gets a canned OK
-            // (GetResp for reads, PutResp for writes). A denied request never
-            // reaches here — the authz gate short-circuits it on the conn task.
+            // (opaque bytes for reads, PutResp for writes). A denied request
+            // never reaches here — the authz gate short-circuits it on the conn
+            // task. Only the verdict (error frame or not) is asserted.
             let loop_h = compio::runtime::spawn(async move {
                 while let Some(req) = req_rx.next().await {
-                    let bytes = if req.msg_type == MSG_GET {
-                        partition_rpc::rkyv_encode(&GetResp {
-                            code: CODE_OK,
-                            message: String::new(),
-                            value: b"ok".to_vec(),
-                        })
+                    let bytes = if req.msg_type == MSG_GET_BULK {
+                        Bytes::from_static(b"ok")
                     } else {
                         let put: PutReq = partition_rpc::rkyv_decode(&req.payload).unwrap();
                         partition_rpc::rkyv_encode(&PutResp {
@@ -14426,7 +14409,7 @@ mod authz_enforcement_tests {
             let resp: AuthHelloResp = partition_rpc::rkyv_decode(&f.payload).unwrap();
             assert_eq!(resp.code, StatusCode::Ok as u8, "{}", resp.message);
 
-            // (2) GET acme/mem/doc → authorized → delegates → GetResp OK.
+            // (2) GET acme/mem/doc → authorized → delegates → OK.
             let g = partition_rpc::rkyv_encode(&GetReq {
                 part_id: 7,
                 key: b"acme/mem/doc".to_vec(),
@@ -14434,7 +14417,7 @@ mod authz_enforcement_tests {
                 length: 0,
                 region_epoch: 0,
             });
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_GET, g).await;
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_GET_BULK, g).await;
             assert!(!f.is_error(), "authorized GET should pass");
 
             // (3) GET other/mem/doc → cross-tenant → DENIED at the gate.
@@ -14445,7 +14428,7 @@ mod authz_enforcement_tests {
                 length: 0,
                 region_epoch: 0,
             });
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 3, MSG_GET, g2).await;
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 3, MSG_GET_BULK, g2).await;
             assert!(f.is_error(), "cross-tenant GET must be denied");
             let (code, _msg) = autumn_rpc::RpcError::decode_status(&f.payload);
             assert_eq!(code, StatusCode::PermissionDenied);
@@ -14488,7 +14471,7 @@ mod authz_enforcement_tests {
                 length: 0,
                 region_epoch: 0,
             });
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 6, MSG_GET, g3).await;
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 6, MSG_GET_BULK, g3).await;
             assert!(!f.is_error(), "same-tenant different-namespace should pass under the acme/ grant");
 
             drop(wr);
@@ -14522,11 +14505,7 @@ mod authz_enforcement_tests {
             let loop_h = compio::runtime::spawn(async move {
                 // Should never be reached for the protected GET.
                 while let Some(req) = req_rx.next().await {
-                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&GetResp {
-                        code: CODE_OK,
-                        message: String::new(),
-                        value: vec![],
-                    })));
+                    let _ = req.resp_tx.send(Ok(Bytes::new()));
                 }
             });
             let (mut rd, mut wr) = client.into_split();
@@ -14539,7 +14518,7 @@ mod authz_enforcement_tests {
                 length: 0,
                 region_epoch: 0,
             });
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_GET, g).await;
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_GET_BULK, g).await;
             assert!(f.is_error(), "anonymous protected GET must be denied");
             let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
             assert_eq!(code, StatusCode::PermissionDenied);

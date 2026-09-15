@@ -755,7 +755,7 @@ pub(crate) async fn background_maintenance_loop(
                 // defensive auto-compact when SST count grows
                 // past `MAX_SST_BEFORE_AUTO_COMPACT`. Per-SST bloom is
                 // tuned to 1% FPR but reads consult EVERY reader for a
-                // miss (`p.sst_readers.iter().rev()` in `handle_get`),
+                // miss (`p.sst_readers.iter().rev()` in `handle_get_bulk`),
                 // so the cumulative chance that AT LEAST ONE bloom
                 // false-positives is `1 - 0.99^N`: 39% at N=50, 63% at
                 // N=100, 87% at N=200. Each false-positive costs one
@@ -3470,7 +3470,7 @@ pub(crate) async fn run_gc(
     .await?;
 
     // (MED-2): try-acquire writer pin on this extent BEFORE punch_holes.
-    // If a `handle_get → resolve_value` reader is currently in-flight on this
+    // If a `handle_get_bulk → resolve_value` reader is currently in-flight on this
     // extent (rare race window — they typically complete in milliseconds),
     // defer this extent's GC to the next 30-60 s tick rather than letting
     // the reader return spurious NotFound bytes when the manager processes

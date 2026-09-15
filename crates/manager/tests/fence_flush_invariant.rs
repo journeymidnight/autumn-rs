@@ -363,8 +363,8 @@ fn fence_flush_invariant() {
         let mut mismatches: Vec<(Vec<u8>, u64, Option<u64>)> = Vec::new();
         for (key, (exp_seq, exp_val)) in final_expected.iter() {
             let resp = ps
-                .call(
-                    partition_rpc::MSG_GET,
+                .call_into_pooled(
+                    partition_rpc::MSG_GET_BULK,
                     partition_rpc::rkyv_encode(&partition_rpc::GetReq {
                         part_id: PART_ID,
                         key: key.clone(),
@@ -375,10 +375,8 @@ fn fence_flush_invariant() {
                 )
                 .await;
             let got_seq = match resp {
-                Ok(r) => match partition_rpc::rkyv_decode::<partition_rpc::GetResp>(&r) {
-                    Ok(g) if g.code == partition_rpc::CODE_OK => parse_value_seq(&g.value),
-                    _ => None,
-                },
+                Ok(r) if r.code == partition_rpc::CODE_OK => parse_value_seq(r.buf.filled()),
+                Ok(_) => None,
                 Err(_) => None,
             };
             if got_seq != Some(*exp_seq) {

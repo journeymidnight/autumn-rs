@@ -20,7 +20,7 @@ use autumn_rpc::manager_rpc::GetAuthzConfigResp;
 use autumn_rpc::partition_rpc::{
     self, parse_put_bulk_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
     BatchPutBulkReq, HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET_BULK,
-    MSG_BATCH_PUT, MSG_BATCH_PUT_BULK, MSG_DELETE, MSG_GET,
+    MSG_BATCH_PUT, MSG_BATCH_PUT_BULK, MSG_DELETE,
     MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_BULK, MSG_HEAD, MSG_PUT, MSG_PUT_BULK, MSG_RANGE,
     PUT_BULK_HEADER_LEN,
 };
@@ -327,7 +327,7 @@ pub fn authz_check(
     now: u64,
 ) -> Option<(StatusCode, String)> {
     match msg_type {
-        MSG_GET | MSG_GET_BULK | MSG_GET_REDIRECT => {
+        MSG_GET_BULK | MSG_GET_REDIRECT => {
             let r = partition_rpc::rkyv_decode::<GetReq>(payload).ok()?;
             check_key(&r.key, principal, inner, now)
         }
@@ -652,7 +652,7 @@ mod tests {
             length: 0,
             region_epoch: 0,
         });
-        assert!(authz_check(MSG_GET, &g, Some(&p), &inner, now).is_none());
+        assert!(authz_check(MSG_GET_BULK, &g, Some(&p), &inner, now).is_none());
         // GET cross-tenant denied
         let g2 = rkyv_encode(&GetReq {
             part_id: 1,
@@ -661,7 +661,7 @@ mod tests {
             length: 0,
             region_epoch: 0,
         });
-        assert!(authz_check(MSG_GET, &g2, Some(&p), &inner, now).is_some());
+        assert!(authz_check(MSG_GET_BULK, &g2, Some(&p), &inner, now).is_some());
         // PUT cross-tenant denied (value not copied into the assertion path)
         let put = rkyv_encode(&PutReq {
             part_id: 1,
@@ -678,7 +678,7 @@ mod tests {
         // PROTECT-EVERYTHING: authz_check assumes enabled (the caller gates on
         // `snap.enabled`), so ANY key without a token is denied — there is no
         // "empty protected ⇒ allowed" escape hatch anymore.
-        assert!(authz_check(MSG_GET, &g2, None, &inner, now).is_some());
+        assert!(authz_check(MSG_GET_BULK, &g2, None, &inner, now).is_some());
     }
 
     #[test]
@@ -949,7 +949,7 @@ mod tests {
             region_epoch: 0,
         })
         .to_vec();
-        assert!(check_layer_a(MSG_GET, &get, &inner).is_none());
+        assert!(check_layer_a(MSG_GET_BULK, &get, &inner).is_none());
     }
 
     #[test]

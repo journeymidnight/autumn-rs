@@ -246,7 +246,9 @@ both builds. Untraced fixed-work windows, 3 interleaved runs per build:
 `get` is faster at every size, most at 1–8 MiB where the removed copies dominate,
 and its CPU per GiB falls on both roles; `get_pooled` is unchanged within
 run-to-run ranges. A size-based fallback to `MSG_GET` for small values would not
-help: 4 KiB is also faster on the bulk read.
+help: 4 KiB is also faster on the bulk read. With no caller left, `MSG_GET` was
+retired in wire v41 (0x41 reserved); raw-frame tests and `ps_bench` read through
+`MSG_GET_BULK`.
 
 ## Evidence
 

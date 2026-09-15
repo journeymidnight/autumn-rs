@@ -39,7 +39,14 @@ use rkyv::{Archive, Deserialize, Serialize};
 // ── msg_type constants ───────────────────────────────────────────────────────
 
 pub const MSG_PUT: u8 = 0x40;
-pub const MSG_GET: u8 = 0x41;
+// The rkyv point read (`GetReq` -> `GetResp`, value copied into the archive)
+// was REMOVED in wire v41: every read is `MSG_GET_BULK` (0x50), whose value
+// rides as its own tail. 0x41 stays RESERVED like 0x54 below. A stale peer can
+// still send it; `extract_part_id` reads an unknown type's part_id as 0, so the
+// PS refuses it (misroute, or `unknown msg_type` behind a partition 0) without
+// decoding it. Reassigned, the same bytes could bytecheck as the new request.
+//
+//   pub const MSG_GET:        u8 = 0x41;  // RESERVED (was rkyv point read)
 pub const MSG_DELETE: u8 = 0x42;
 pub const MSG_HEAD: u8 = 0x43;
 pub const MSG_RANGE: u8 = 0x44;
@@ -111,7 +118,7 @@ pub const MSG_MERGE_FREEZE: u8 = 0x4E;
 // manager→PS vp_refs pull). Extent retention is now driven by
 // `refs` (stream membership) alone — see manager `extent_can_delete`.
 
-// value-separable GET. Same request shape as MSG_GET (GetReq); the response is
+// value-separable GET, the only point read. Request `GetReq`; the response is
 // a v28 bulk frame: ctrl = `[code: CODE_*][message]` (CRC'd with the header),
 // value = the raw value as its own tail, received by
 // `RpcClient::call_into_pooled` straight into a pooled buffer. The code byte
@@ -251,7 +258,7 @@ pub struct BatchDeleteResp {
     pub statuses: Vec<u8>,
 }
 
-/// redirect GET. Same request shape as MSG_GET (`GetReq`). For a
+/// redirect GET. Same request shape as MSG_GET_BULK (`GetReq`). For a
 /// large (>= 64 KiB) full-value ValuePointer read the PS answers with a
 /// DESCRIPTOR (extent + the value's exact byte range inside the extent +
 /// replica addresses + eversion) instead of proxying the bytes; the
@@ -261,7 +268,7 @@ pub struct BatchDeleteResp {
 /// OPTIMIZATION, never a correctness dependency: any client-side
 /// direct-read failure (eversion bumped by EC conversion, extent GC'd
 /// between redirect and read, replica down) falls back to the plain
-/// MSG_GET / MSG_GET_BULK proxy path, which re-resolves through the PS.
+/// MSG_GET_BULK proxy path, which re-resolves through the PS.
 pub const MSG_GET_REDIRECT: u8 = 0x56;
 
 /// first-frame connection authentication. The client sends a signed
@@ -732,13 +739,6 @@ pub struct GetReq {
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct GetResp {
-    pub code: u8,
-    pub message: String,
-    pub value: Vec<u8>,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DeleteReq {
     pub part_id: u64,
     pub key: Vec<u8>,
@@ -1058,7 +1058,7 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
             .unwrap_or(0),
-        MSG_GET | MSG_GET_BULK | MSG_GET_REDIRECT => rkyv_decode::<GetReq>(payload)
+        MSG_GET_BULK | MSG_GET_REDIRECT => rkyv_decode::<GetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
         MSG_GET_REDIRECT_MANY => rkyv_decode::<GetRedirectManyReq>(payload)
@@ -1121,7 +1121,6 @@ mod msg_type_tests {
     fn msg_type_constants_dont_collide() {
         let all = [
             MSG_PUT,
-            MSG_GET,
             MSG_DELETE,
             MSG_HEAD,
             MSG_RANGE,

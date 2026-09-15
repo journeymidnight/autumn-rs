@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::{self, GetRegionsResp, MgrPsDetail, MgrRegionInfo, MSG_GET_REGIONS};
 use autumn_rpc::partition_rpc::{
-    self, rkyv_decode, rkyv_encode, GetReq, GetResp, PutReq, PutResp, MSG_GET, MSG_PUT,
+    self, rkyv_decode, rkyv_encode, GetReq, PutReq, PutResp, MSG_GET_BULK, MSG_PUT,
 };
 use bytes::Bytes;
 
@@ -273,13 +273,26 @@ fn run_scenario(
                                     length: 0,
                                     region_epoch: 0,
                                 };
-                                (MSG_GET, rkyv_encode(&req))
+                                (MSG_GET_BULK, rkyv_encode(&req))
                             }
                         };
                         let ps_clone = ps.clone();
                         let t0 = Instant::now();
+                        // Every request yields its response code: a Put's is in
+                        // the rkyv body, a bulk Get's in the reply ctrl.
                         inflight.push(async move {
-                            let r = ps_clone.call(msg, payload).await;
+                            let r = if msg == MSG_PUT {
+                                ps_clone.call(msg, payload).await.map(|b| {
+                                    rkyv_decode::<PutResp>(&b)
+                                        .map(|r| r.code)
+                                        .unwrap_or(u8::MAX)
+                                })
+                            } else {
+                                ps_clone
+                                    .call_into_pooled(msg, payload)
+                                    .await
+                                    .map(|r| r.code)
+                            };
                             (r, t0.elapsed())
                         });
                     }
@@ -290,19 +303,15 @@ fn run_scenario(
 
                     match inflight.next().await {
                         Some((res, lat)) => match res {
-                            Ok(resp_bytes) => {
+                            Ok(code) => {
                                 // Validate status code to avoid silently
                                 // counting failures as throughput.
                                 let ok = match op {
-                                    Op::Put => rkyv_decode::<PutResp>(&resp_bytes)
-                                        .map(|r| r.code == partition_rpc::CODE_OK)
-                                        .unwrap_or(false),
-                                    Op::Get => rkyv_decode::<GetResp>(&resp_bytes)
-                                        .map(|r| {
-                                            r.code == partition_rpc::CODE_OK
-                                                || r.code == partition_rpc::CODE_NOT_FOUND
-                                        })
-                                        .unwrap_or(false),
+                                    Op::Put => code == partition_rpc::CODE_OK,
+                                    Op::Get => {
+                                        code == partition_rpc::CODE_OK
+                                            || code == partition_rpc::CODE_NOT_FOUND
+                                    }
                                 };
                                 if ok {
                                     ops_done += 1;
@@ -479,7 +488,7 @@ fn run_read_scenario(
                         let ps_clone = ps.clone();
                         let t0 = Instant::now();
                         inflight.push(async move {
-                            let r = ps_clone.call(MSG_GET, payload).await;
+                            let r = ps_clone.call_into_pooled(MSG_GET_BULK, payload).await;
                             (r, t0.elapsed())
                         });
                     }
@@ -487,13 +496,9 @@ fn run_read_scenario(
                         break;
                     }
                     match inflight.next().await {
-                        Some((Ok(resp_bytes), lat)) => {
-                            let ok = rkyv_decode::<GetResp>(&resp_bytes)
-                                .map(|r| {
-                                    r.code == partition_rpc::CODE_OK
-                                        || r.code == partition_rpc::CODE_NOT_FOUND
-                                })
-                                .unwrap_or(false);
+                        Some((Ok(resp), lat)) => {
+                            let ok = resp.code == partition_rpc::CODE_OK
+                                || resp.code == partition_rpc::CODE_NOT_FOUND;
                             if ok {
                                 ops_done += 1;
                                 total_lat_ns += lat.as_nanos();

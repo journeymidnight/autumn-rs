@@ -625,10 +625,9 @@ registered buffer does not remove. The seam is
   concat copy. On-the-wire bytes are identical to the concatenated form, so the
   client read path (`call_into_pooled`) is unchanged.
 
-`handle_get` (rkyv `GetResp`) copies a value three times — the `value.into()`
-conversion of a pooled `Bytes`, the rkyv encode and `Frame::encode` — so no SDK read
-issues `MSG_GET` any more (`ClusterClient::get` goes through `MSG_GET_BULK`). A
-bulk reply carries a failure as a `CODE_*` byte: translate the handler's `StatusCode`
+`MSG_GET_BULK` is the only point read (the rkyv `MSG_GET`, 0x41, is reserved since
+wire v41: it copied a value into the archive four times on this server). A bulk
+reply carries a failure as a `CODE_*` byte: translate the handler's `StatusCode`
 with `partition_rpc::code_for_status`, never `status as u8` (the spaces diverge above 3;
 a cast once turned a GC-pinned read's `Unavailable` into a terminal "value too large"). Net application copies of a VP value on `get_into` = **1**
 (the client-side pool→dest memcpy; the PS/EN hops add none beyond each
@@ -1559,7 +1558,7 @@ Each `PartitionData` carries `region_epoch: u64`, populated at open from
 `MgrRegionInfo.region_epoch` (manager bumps on every `rg` rewrite — split / merge).
 Hot-path handlers compare the request's stamped `region_epoch` against
 `p.region_epoch`; mismatch returns `StatusCode::FailedPrecondition` so the SDK's
-`Err`-arm refresh path engages. Check sites: `handle_get` / `handle_head` (before
+`Err`-arm refresh path engages. Check sites: `handle_get_bulk` / `handle_head` (before
 in_range), `handle_range` (at top — **load-bearing**: without it a stale-epoch range
 silently filters out-of-range keys and returns a partial `Ok(RangeResp)` the SDK
 can't detect), `enqueue_put` / `enqueue_delete` / `enqueue_stream_put`
@@ -1765,7 +1764,7 @@ Three fixes bound the restart replay window (worst case per partition =
 
 10. **Memtable backing = `parking_lot::RwLock<BTreeMap>`** — the active memtable has
     exactly one writer (the P-log thread's Phase 3) and N readers (ps-conn
-    `handle_get` + P-log). Correctness:
+    `handle_get_bulk` + P-log). Correctness:
     - Writer holds the write lock for one `insert_batch` call (up to 256 entries) then
       releases; subsequent readers take the read lock AFTER → linearisable
       Put-then-Get.
@@ -2035,7 +2034,7 @@ Three fixes bound the restart replay window (worst case per partition =
     a transient fence failure is logged and the open PROCEEDS (never wedge). This makes the
     append-path fence EAGER, not first-append-lazy; it does not replace it. Regression
     guard: `crates/manager/tests/system_sigstop_zombie_writer.rs` (asserts the old owner
-    can no longer cleanly ACK a stale-epoch write). The read-side `handle_get` write fence
+    can no longer cleanly ACK a stale-epoch write). The read-side `handle_get_bulk` write fence
     (a residual STALE READ before the old owner closes the reassigned partition) is a
     documented SEPARATE follow-up.
 

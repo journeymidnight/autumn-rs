@@ -97,8 +97,7 @@ the API suffix.
   before it ACKs).
 - `get(key) → Option<Vec<u8>>` / `get_range(key, offset, length)` — read, `None` if not
   found. Served by the same pooled `MSG_GET_BULK` core as `get_pooled`; the returned `Vec`
-  is the one application copy (the rkyv `MSG_GET` copied a large value six times: four on the
-  PS, two on the client). Retry classification is `call_ps_for_key`'s: NotFound is a miss,
+  is the one application copy. Retry classification is `call_ps_for_key`'s: NotFound is a miss,
   PermissionDenied/NamespaceUnknown are terminal, everything else refreshes and retries.
 - `get_pooled(key) → Option<ValueBuf>` / `get_range_pooled(key, offset, length)` —
   **bulk read, ZERO SDK-side copies** — the CORE every bulk read routes through. The value

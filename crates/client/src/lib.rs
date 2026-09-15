@@ -2767,9 +2767,7 @@ impl ClusterClient {
     ) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
         // Served by `MSG_GET_BULK`: the PS sends the value as its own iovec and
         // the read_loop receives it into a pooled buffer, so the returned `Vec`
-        // is the one application copy. The rkyv `MSG_GET` copies a large value
-        // four times on the PS (`GetResp` conversion, twice inside rkyv encode,
-        // frame encode) and twice on the client (aligned decode, deserialize).
+        // is the one application copy.
         Ok(self
             .get_range_pooled_bound(key, offset, length)
             .await?
@@ -4925,7 +4923,7 @@ pub struct GcAutoParams {
 //
 // Replaces the server-side multipart upload + multi-fragment ValuePointer
 // + GC active rewrite. Pure client-side striping over the existing
-// MSG_PUT / MSG_GET / MSG_DELETE primitives — no new server RPCs, no
+// MSG_PUT / MSG_GET_BULK / MSG_DELETE primitives — no new server RPCs, no
 // changes to the WAL / memtable / SSTable shape.
 //
 // Layout:
