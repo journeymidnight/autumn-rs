@@ -170,3 +170,11 @@ unmounted; host tracefs/security configuration is unchanged. No cross-host test
 is claimed. Full feature acceptance remains false for unavailable cross-host,
 unresolved UCX read regression/reliability and remaining production capability
 integration gates.
+
+
+Cleanup completed after evidence commit f7c75a3 and archive verification. Removed
+/data03/autumn-controlled-validation, /data05/autumn-controlled-validation and
+/data08/autumn-controlled-validation, reclaiming 29.05 GiB at final teardown (each
+successful trial had already reclaimed its dataset). No benchmark, perf, bpftrace,
+compiler or archive process remained. /data08 free space was about 866 GiB.
+The archive is 470 MiB; its SHA256 and cleanup audit are committed with the results.
