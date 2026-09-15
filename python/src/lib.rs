@@ -207,8 +207,11 @@ async fn handle_op(client: &ClusterClient, op: Op) {
             }
         }
         Op::Get { key, handle } => {
-            match client.get(&key).await {
-                Ok(Some(v)) => handle.resolve(|py| Ok(PyBytes::new(py, &v).into_any().unbind())),
+            // Pooled bulk read: the value's one copy is into the PyBytes.
+            match client.get_pooled(&key).await {
+                Ok(Some(v)) => {
+                    handle.resolve(move |py| Ok(PyBytes::new(py, &v).into_any().unbind()))
+                }
                 Ok(None) => handle.resolve(|py| Ok(py.None())),
                 Err(e) => handle.reject(e.to_string()),
             }
@@ -295,7 +298,9 @@ async fn handle_op(client: &ClusterClient, op: Op) {
             _buf_keepalive,
             handle,
         } => {
-            match client.get(&key).await {
+            // Pooled bulk read, then the one copy into the caller's buffer —
+            // only when the length matches, so a mismatch leaves it untouched.
+            match client.get_pooled(&key).await {
                 Ok(Some(v)) => {
                     if v.len() == dest_len {
                         // SAFETY: dest_ptr / dest_len come from a PyBuffer that
@@ -373,7 +378,7 @@ async fn handle_op(client: &ClusterClient, op: Op) {
             _bufs_keepalive,
             handle,
         } => {
-            let futs = keys.iter().map(|k| client.get(k));
+            let futs = keys.iter().map(|k| client.get_pooled(k));
             let results = futures::future::join_all(futs).await;
             // Any RPC error surfaces as False for that key (cache miss), never
             // an exception — sglang's prefetch budget must not be blown by a

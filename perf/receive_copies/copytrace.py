@@ -30,9 +30,9 @@ controlled.DISKS = [Path(x) / 'autumn-receive-copies' for x in ['/data03', '/dat
 controlled.MAGIC = 'autumn receive-copy accounting temporary data'
 
 SIZES = [65536, 1048576, 8388608]
-WRITES = {65536: 4096, 1048576: 512, 8388608: 128}
-READS = {65536: 8192, 1048576: 1024, 8388608: 256}
-MODES = ['write', 'read', 'direct']
+WRITES = {4096: 16384, 65536: 4096, 1048576: 512, 8388608: 128}
+READS = {4096: 65536, 65536: 8192, 1048576: 1024, 8388608: 256}
+MODES = ['write', 'read', 'direct', 'get']
 
 
 def libc_offsets():
@@ -141,6 +141,7 @@ def main():
     # Throughput/CPU comparison: untraced only, windows of several seconds.
     args.add_argument('--long', action='store_true')
     args.add_argument('--only', default='', help='comma list of SIZE:MODE windows to run')
+    args.add_argument('--sizes', default='', help='comma list of value sizes (default 64K,1M,8M)')
     a = args.parse_args()
     # Every process this driver starts inherits a fixed address layout, which
     # is what lets copies.bt return addresses resolve after the processes exit.
@@ -148,24 +149,25 @@ def main():
     libc = ctypes.CDLL(None)
     libc.personality(libc.personality(0xffffffff) | ADDR_NO_RANDOMIZE)
     (ROOT / 'results').mkdir(parents=True, exist_ok=True)
+    sizes = [int(x) for x in a.sizes.split(',')] if a.sizes else SIZES
     trial = Trial(a.version, a.transport, 1, (100 if a.long else 0) + a.repeat)
     success = False
     try:
         trial.start()
-        for size in SIZES:
+        for size in sizes:
             trial.benchmark(size, 1, 8, 'load', 0)
         window = 0
         for traced in [False] if a.long else [False, True]:
             if traced:
                 trial.start_copy_trace()
-            for size in SIZES:
+            for size in sizes:
                 for mode in MODES:
                     if a.only and f'{size}:{mode}' not in a.only.split(','):
                         continue
                     window += 1
                     count = (WRITES if mode == 'write' else READS)[size]
                     if a.long:
-                        count *= {65536: 2, 1048576: 8, 8388608: 16}[size] if mode == 'write' else 16
+                        count *= {4096: 2, 65536: 2, 1048576: 8, 8388608: 16}[size] if mode == 'write' else 16
                     if a.pilot:
                         count = 16
                     r = trial.benchmark(size, count, 8, mode, window, traced)

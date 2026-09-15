@@ -17,10 +17,9 @@
 //! 256 KiB chunks). The whole-extent reads are ≤ 8 MiB (`MAX_EXTENT`) so the
 //! `bulk_worthwhile` (≥ 64 KiB) per-extent bulk path (`MSG_GET_BULK`) engages on every
 //! full-extent read — the win that motivated the move (model-file serving).
-//! Sub-64 KiB tail/sub-range reads use the regular `MSG_GET` path (bounded by
-//! the client's 30 s `rpc_timeout`). **Tradeoff:** the bulk path has no per-call
-//! timeout (cancel-safety — the dest must outlive the recv), so a hung PS blocks
-//! a large-extent read instead of erroring after 30 s.
+//! Sub-64 KiB tail/sub-range reads take the same `MSG_GET_BULK` read; the
+//! receiver decodes a small reply instead of receiving it into the pool. Every
+//! read honors the client's `rpc_timeout` (the pooled receive is cancel-safe).
 
 use std::rc::Rc;
 
@@ -288,7 +287,7 @@ async fn prepare_inner(
 /// each extent slice its OWN disjoint `&mut` sub-slice at its absolute
 /// `dest_offset` (gaps between extents are skipped → stay zero, sparse-file
 /// semantics). The batch primitive writes each successful extent into its slice
-/// (`get_many_into`: bulk recv-into-dest for ≥ 64 KiB; `get_many_direct`: EN
+/// (`get_many_into`: bulk read then one copy into the slice; `get_many_direct`: EN
 /// direct read → copy, per-item PS-proxy fallback); a missing/short extent
 /// leaves zeros. A hard RPC/routing error on any slice surfaces as `Err` → EIO.
 /// Carve `region` — already sized to the read span and pre-zeroed by the caller

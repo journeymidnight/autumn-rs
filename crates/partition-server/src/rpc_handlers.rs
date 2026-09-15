@@ -258,7 +258,7 @@ pub(crate) async fn handle_batch_get_bulk(
             autumn_rpc::frame::encode_bulk_response_head_bytes(
                 req_id,
                 partition_rpc::MSG_BATCH_GET_BULK,
-                code as u8,
+                partition_rpc::code_for_status(code),
                 &ctrl,
                 0,
             ),
@@ -747,19 +747,19 @@ pub(crate) async fn handle_get_redirect_many(
     Ok(partition_rpc::rkyv_encode(&GetRedirectManyResp { results }))
 }
 
-/// zero-copy GET (MSG_GET_BULK): returns the response as TWO segments —
-/// `(head, value)` where `head = [CRC-less frame header][bulk meta: code +
-/// value_len + reserved]` and `value` ALIASES the RegPool buffer (R4: `Bytes::from_owner`
-/// from `resolve_value`, no copy). The ps-conn pushes `head` then `value` into
+/// value-separable GET (MSG_GET_BULK), the one read every SDK point read uses
+/// (`get`, `get_range`, `get_pooled`, `get_into`): returns the response as TWO
+/// segments — `(head, value)` where `head = [header][ctrl_len][code+message][crc]`
+/// and `value` ALIASES the resolved read (a VP read's pool buffer via
+/// `Bytes::from_owner`, no copy). The ps-conn pushes `head` then `value` into
 /// `tx_bufs` so the single `write_vectored_all` emits them as one wire frame with
-/// NO concat copy — fully zero-copy EN->PS->client. (Pre-R4 this concatenated
-/// `[meta][value]` into a Vec, copied again by `encode_v0`.)
+/// no concat copy.
 ///
-/// ALL outcomes (incl errors) map to a bulk-shaped response — the status (and,
-/// since v28, a human-readable message) rides in the CRC-protected ctrl; the
-/// SDK's get_into maps non-OK codes to refresh/retry. StatusCode discriminants
-/// align with the partition CODE_* for the GET-relevant cases
-/// (InvalidArgument=2, FailedPrecondition=3, Internal=4). So this never errors.
+/// ALL outcomes (incl errors) map to a bulk-shaped response: the code and a
+/// human-readable message ride in the CRC-protected ctrl, and the SDK refreshes
+/// and retries every code except OK/NotFound. The handler's `StatusCode` is
+/// translated with `partition_rpc::code_for_status`: the two spaces agree only
+/// up to 3, and the GC-pin `Unavailable` (5) is `CODE_VALUE_TOO_LARGE` when cast.
 pub(crate) async fn handle_get_bulk(
     req_id: u32,
     payload: Bytes,
@@ -770,7 +770,7 @@ pub(crate) async fn handle_get_bulk(
         Ok(GetOutcome::NotFound) => (CODE_NOT_FOUND, String::new(), Bytes::new()),
         // get_value (redirect=false) never yields Redirect.
         Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
-        Err((status, msg)) => (status as u8, msg, Bytes::new()),
+        Err((status, msg)) => (partition_rpc::code_for_status(status), msg, Bytes::new()),
     };
     (ps_bulk_head(req_id, code, &msg, value.len()), value)
 }

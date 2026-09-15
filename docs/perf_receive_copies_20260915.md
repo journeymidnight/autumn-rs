@@ -164,18 +164,89 @@ the windows); same-host transports only.
 
 ## Remaining copies and follow-ups
 
-- One transport copy per receiving process is inherent: the TCP kernel copy, or
-  the UCX Stream unpack. Removing the latter needs a different UCX API (AM
-  rendezvous receiving into the destination, or tag/RMA) — recorded under
-  F-CORE-DATA-PATH-NEXT.
+- One transport copy per receiving process remains: the TCP kernel copy, or the
+  UCX Stream unpack. Removing the UCX one would need a different UCX API (AM
+  rendezvous receiving into the destination, or tag/RMA); it is not pursued.
 - Bulk paths copy the value prefix that shares the 64 KiB read with the frame
   prologue (1.0x of a 64 KiB value, ~0.06x at 1 MiB).
 - The EN copies the part of a large append that arrived before its header was
   parsed (largest for 1 MiB appends); see the rejected variant.
-- The generic non-bulk `MSG_GET` copies a large value several times
-  (`handle_get` `value.into()` on a pooled `Bytes`, rkyv encode, `Frame::encode`,
-  client decode), and Python `AutumnClient.get` uses it at any size: recorded as
-  F-GENERIC-GET-COPIES, not changed here.
+- `ClusterClient::get` returns an owned `Vec`, which is its one application
+  copy; `get_pooled` / `get_into` avoid or place it (next section).
+
+## Plain GET on the bulk read
+
+`ClusterClient::get` / `get_range` used the rkyv `MSG_GET`. Its callers are not
+only Python (`Client.get` / `get_into` / `batch_get_into`): the `autumn-client
+get` CLI, autumn-memory, FUSE/autumnfs metadata reads, the gallery example,
+striped-stream chunk reads and SDK small-item fallbacks all went through it.
+Per 8 MiB value the PS copied it four times (`GetResp` conversion of the pooled
+`Bytes`, twice in rkyv encode, `Frame::encode`) and the client twice (aligned
+decode, deserialize).
+
+`get` / `get_range` now share the pooled `MSG_GET_BULK` core with `get_pooled`
+and return `to_vec()` of the pooled value. The choice between decoding a small
+reply and receiving a large one into the pool stays automatic at the receiver,
+on the reply's actual size (`read_loop`: TCP < 64 KiB decode + memcpy, otherwise
+pooled receive); the caller of `get` has no size to decide with in advance.
+Python's `get`, `get_into` and `batch_get_into` use `get_pooled` directly, and
+`get_many_into` / `get_range_direct_into` small items use `get_range_into`.
+
+Fixed on the way: a bulk reply wrote the handler's `StatusCode` into its
+`CODE_*` byte with `as u8`. The spaces diverge above 3, so a read refused while GC
+held the extent's writer pin (`Unavailable`, 5) reached `get_pooled`/`get_into`
+callers as `CODE_VALUE_TOO_LARGE` — a terminal error instead of a retry.
+`partition_rpc::code_for_status` translates it; the pooled core's retry
+classification now matches the one `get` always had (NotFound = miss, authz
+terminal, everything else refresh + retry, first-attempt timeout).
+
+Copies (base = `f1ec10e`, 2 traced trials per build, 1 KiB attribution threshold):
+
+TCP, 2 trials per build (application copies per logical byte; transport copy on the receiver):
+
+| Call | Value | PS app base | PS app new | client app base | client app new | client transport copy new |
+|---|---:|---:|---:|---:|---:|---:|
+| `get` | 4 KiB | 6.80x | 1.79x | 4.82x | 5.30x | 1.00x |
+| `get` | 64 KiB | 5.26x | 1.05x | 2.99x | 2.21x | 1.00x |
+| `get` | 1 MiB | 4.54x | 0.07x | 2.07x | 1.07x | 1.00x |
+| `get` | 8 MiB | 4.01x | 0.01x | 2.01x | 1.01x | 1.00x |
+| `get_pooled` | 64 KiB | 1.05x | 1.05x | 1.18x | 1.18x | 1.00x |
+| `get_pooled` | 8 MiB | 0.01x | 0.01x | 0.01x | 0.01x | 1.00x |
+
+UCX, 2 trials per build (application copies per logical byte; transport copy on the receiver):
+
+| Call | Value | PS app base | PS app new | client app base | client app new | client transport copy new |
+|---|---:|---:|---:|---:|---:|---:|
+| `get` | 4 KiB | 6.80x | 1.79x | 4.82x | 5.06x | 1.00x |
+| `get` | 64 KiB | 4.51x | 0.29x | 2.30x | 1.26x | 1.00x |
+| `get` | 1 MiB | 4.45x | 0.01x | 2.07x | 1.02x | 1.00x |
+| `get` | 8 MiB | 4.29x | 0.00x | 2.01x | 1.00x | 1.00x |
+| `get_pooled` | 64 KiB | 0.29x | 0.28x | 0.23x | 0.24x | 1.00x |
+| `get_pooled` | 8 MiB | 0.00x | 0.00x | 0.00x | 0.00x | 1.00x |
+
+At 4 KiB the client's two value copies are unchanged (pool, then `Vec`); the rest
+of the client figure there is benchmark and future-state moves ≥ 1 KiB present in
+both builds. Untraced fixed-work windows, 3 interleaved runs per build:
+
+| Transport | Call | Value | MiB/s base [min–max] | MiB/s new [min–max] | p99 ms base → new | PS CPU s/GiB | client CPU s/GiB |
+|---|---|---:|---:|---:|---|---|---|
+| TCP | `get` | 4 KiB | 438 [437–438] | 468 [467–469] | 0.08 → 0.08 | 2.32 → 2.13 | 2.34 → 2.19 |
+| TCP | `get` | 64 KiB | 1087 [1051–1107] | 1799 [1740–1834] | 0.58 → 0.39 | 0.90 → 0.53 | 0.56 → 0.34 |
+| TCP | `get` | 1 MiB | 822 [814–826] | 3170 [3107–3169] | 10.01 → 3.63 | 0.77 → 0.29 | 1.24 → 0.19 |
+| TCP | `get` | 8 MiB | 639 [612–642] | 2625 [2464–2650] | 122.77 → 35.43 | 0.89 → 0.34 | 1.60 → 0.21 |
+| TCP | `get_pooled` | 64 KiB | 1829 [1802–1857] | 1821 [1764–1862] | 0.39 → 0.38 | 0.53 → 0.53 | 0.31 → 0.31 |
+| TCP | `get_pooled` | 8 MiB | 2699 [2513–2742] | 2714 [2533–2740] | 34.04 → 33.99 | 0.33 → 0.32 | 0.16 → 0.16 |
+| UCX | `get` | 4 KiB | 387 [379–387] | 515 [498–518] | 0.10 → 0.08 | 2.00 → 1.70 | 1.83 → 1.46 |
+| UCX | `get` | 64 KiB | 1409 [1390–1412] | 2583 [2575–2819] | 0.51 → 0.30 | 0.70 → 0.34 | 0.45 → 0.22 |
+| UCX | `get` | 1 MiB | 1117 [1111–1221] | 4509 [4392–4509] | 12.53 → 3.05 | 0.67 → 0.17 | 0.77 → 0.17 |
+| UCX | `get` | 8 MiB | 864 [744–981] | 3244 [3215–3356] | 168.23 → 30.84 | 0.87 → 0.21 | 1.10 → 0.25 |
+| UCX | `get_pooled` | 64 KiB | 2689 [2508–2807] | 2665 [2638–2699] | 0.30 → 0.30 | 0.34 → 0.34 | 0.19 → 0.19 |
+| UCX | `get_pooled` | 8 MiB | 3447 [3401–3456] | 3358 [3347–3473] | 31.86 → 31.94 | 0.20 → 0.21 | 0.15 → 0.15 |
+
+`get` is faster at every size, most at 1–8 MiB where the removed copies dominate,
+and its CPU per GiB falls on both roles; `get_pooled` is unchanged within
+run-to-run ranges. A size-based fallback to `MSG_GET` for small values would not
+help: 4 KiB is also faster on the bulk read.
 
 ## Evidence
 

@@ -3425,6 +3425,12 @@ handling at 64 KiB that are the same in both builds.
 A `FrameDecoder::feed` frame under `handle_connection`, `handle_ps_connection`
 or `read_loop` in the analyzer's `sites` means a receive loop copies again.
 
+`ClusterClient::get` (bench mode `get`, add `--sizes 4096,65536,1048576,8388608
+--only 8388608:get,...`) is served by `MSG_GET_BULK`: the PS shows no full-value
+application copy and the client exactly one (`get_range_core`'s `to_vec`); a
+`rkyv_encode` / `GetResp` deserialize frame in `sites` means a read went back to
+the rkyv `MSG_GET`.
+
 Traced throughput is not a result (a uprobe fires on every memcpy). Keep the
 attribution threshold below one UCX AM fragment (1 KiB): UCX Stream receives
 return one fragment per call. After the run, confirm no `autumn-receive-copies`

@@ -625,8 +625,12 @@ registered buffer does not remove. The seam is
   concat copy. On-the-wire bytes are identical to the concatenated form, so the
   client read path (`call_into_pooled`) is unchanged.
 
-`handle_get` (rkyv `GetResp`, generic SDK) copies the value once (the rkyv encode
-copies regardless). Net application copies of a VP value on `get_into` = **1**
+`handle_get` (rkyv `GetResp`) copies a value three times — the `value.into()`
+conversion of a pooled `Bytes`, the rkyv encode and `Frame::encode` — so no SDK read
+issues `MSG_GET` any more (`ClusterClient::get` goes through `MSG_GET_BULK`). A
+bulk reply carries a failure as a `CODE_*` byte: translate the handler's `StatusCode`
+with `partition_rpc::code_for_status`, never `status as u8` (the spaces diverge above 3;
+a cast once turned a GC-pinned read's `Unavailable` into a terminal "value too large"). Net application copies of a VP value on `get_into` = **1**
 (the client-side pool→dest memcpy; the PS/EN hops add none beyond each
 receive's transport copy — the
 recv-into-caller-dest primitive that made it 0 was removed for cancel-safety +

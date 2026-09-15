@@ -95,7 +95,11 @@ the API suffix.
 - `put(key, value)` — write a key-value pair. Always durable: there is no
   sync flag to pass (the extent-node fsync coalescer makes every write durable
   before it ACKs).
-- `get(key) → Option<Vec<u8>>` — read, `None` if not found.
+- `get(key) → Option<Vec<u8>>` / `get_range(key, offset, length)` — read, `None` if not
+  found. Served by the same pooled `MSG_GET_BULK` core as `get_pooled`; the returned `Vec`
+  is the one application copy (the rkyv `MSG_GET` copied a large value six times: four on the
+  PS, two on the client). Retry classification is `call_ps_for_key`'s: NotFound is a miss,
+  PermissionDenied/NamespaceUnknown are terminal, everything else refreshes and retries.
 - `get_pooled(key) → Option<ValueBuf>` / `get_range_pooled(key, offset, length)` —
   **bulk read, ZERO SDK-side copies** — the CORE every bulk read routes through. The value
   arrives in a read_loop-owned RegPool buffer (`MSG_GET_BULK` + `call_into_pooled`; the UCX
@@ -169,8 +173,8 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   memcpy into `dest` — `dest` needs no registration and no special
   lifetime. Auto-routes: HOMOGENEOUS small whole-value batch (every item `offset==0`,
   `length==0`, `dest.len() < 64 KiB`) → delegates to `get_many` + memcpy into each `dest`;
-  MIXED / range / large-bulk → per-op fan-out (`MSG_GET_BULK` pooled recv when `read_len ≥ 64
-  KiB`, else `MSG_GET` + memcpy). Result `i` matches `items[i]`.
+  MIXED / range / large-bulk → per-op fan-out through `get_range_into` (`MSG_GET_BULK`
+  pooled recv + memcpy) at any size. Result `i` matches `items[i]`.
 - `get_many_direct(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` — **EN-DIRECT
   batch read.** Same dest shape as `get_many_into`, but each item with length ≥ 64 KiB is
   read STRAIGHT from an extent node (`MSG_GET_REDIRECT` descriptor →

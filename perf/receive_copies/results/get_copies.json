@@ -1,0 +1,5030 @@
+{
+ "tcp-p1-r31-getbase": {
+  "10": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 2226430512,
+     "app_copy_x": 2.074,
+     "memset": 0,
+     "memset_calls": 1025,
+     "memset_x": 0.0,
+     "page_faults": 525312,
+     "small_memcpy_bytes": 3914476,
+     "small_memcpy_calls": 26646,
+     "tcp_recv": 1073780736,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 92160,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.002,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.063,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 661269,
+     "small_memcpy_calls": 5680,
+     "tcp_recv": 20450,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 369105634,
+     "tcp_send_x": 0.344,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 451237,
+     "small_memcpy_calls": 3880,
+     "tcp_recv": 13954,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 251662994,
+     "tcp_send_x": 0.234,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 810973,
+     "small_memcpy_calls": 6967,
+     "tcp_recv": 25090,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 452993234,
+     "tcp_send_x": 0.422,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 4878123032,
+     "app_copy_x": 4.543,
+     "memset": 0,
+     "memset_calls": 1024,
+     "memset_x": 0.0,
+     "page_faults": 707,
+     "small_memcpy_bytes": 9734503,
+     "small_memcpy_calls": 97391,
+     "tcp_recv": 1073853950,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 1073840146,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::handle_ps_connection::{{closure}} @ partition-server/src/lib.rs:5714": 0.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.003,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.062
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 1048576
+  },
+  "11": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 19723353,
+     "app_copy_x": 0.009,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 1,
+     "small_memcpy_bytes": 14688654,
+     "small_memcpy_calls": 93859,
+     "tcp_recv": 2147488512,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 23040,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008,
+      "controlled_path::batch::{{closure}} @ server/benches/controlled_path.rs:72": 0.001
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 132788,
+     "small_memcpy_calls": 1136,
+     "tcp_recv": 4408,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 637535652,
+     "tcp_send_x": 0.297,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 168952,
+     "small_memcpy_calls": 1418,
+     "tcp_recv": 5568,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 805308192,
+     "tcp_send_x": 0.375,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 154684,
+     "small_memcpy_calls": 1316,
+     "tcp_recv": 4872,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 704644668,
+     "tcp_send_x": 0.328,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 17598188,
+     "app_copy_x": 0.008,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 3411244,
+     "small_memcpy_calls": 28852,
+     "tcp_recv": 2147512538,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 2147503642,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 8388608
+  },
+  "12": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 4314707504,
+     "app_copy_x": 2.009,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 1048832,
+     "small_memcpy_bytes": 980356,
+     "small_memcpy_calls": 6690,
+     "tcp_recv": 2147493376,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 23040,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 150750,
+     "small_memcpy_calls": 1385,
+     "tcp_recv": 4476,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 637536040,
+     "tcp_send_x": 0.297,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 187250,
+     "small_memcpy_calls": 1702,
+     "tcp_recv": 5636,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 805308580,
+     "tcp_send_x": 0.375,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 165718,
+     "small_memcpy_calls": 1512,
+     "tcp_recv": 4940,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 704645056,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 8615921876,
+     "app_copy_x": 4.012,
+     "memset": 0,
+     "memset_calls": 268,
+     "memset_x": 0.0,
+     "page_faults": 7683,
+     "small_memcpy_bytes": 14901931,
+     "small_memcpy_calls": 111725,
+     "tcp_recv": 2147513522,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 2157350170,
+     "tcp_send_x": 1.005,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 8388608
+  },
+  "7": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1293695874,
+     "app_copy_x": 4.819,
+     "memset": 0,
+     "memset_calls": 65537,
+     "memset_x": 0.0,
+     "page_faults": 129,
+     "small_memcpy_bytes": 220626243,
+     "small_memcpy_calls": 1507259,
+     "tcp_recv": 270925824,
+     "tcp_recv_x": 1.009,
+     "tcp_send": 5898240,
+     "tcp_send_x": 0.022,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.557,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.0,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.005
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 9168,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 24,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 22052,
+     "small_memcpy_calls": 415,
+     "tcp_recv": 762,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 741,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 9168,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 24,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 22516,
+     "small_memcpy_calls": 428,
+     "tcp_recv": 762,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 741,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 9168,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 24,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 21868,
+     "small_memcpy_calls": 417,
+     "tcp_recv": 762,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 741,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 1825570816,
+     "app_copy_x": 6.801,
+     "memset": 0,
+     "memset_calls": 65585,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 89051596,
+     "small_memcpy_calls": 918480,
+     "tcp_recv": 5900842,
+     "tcp_recv_x": 0.022,
+     "tcp_send": 270926682,
+     "tcp_send_x": 1.009,
+     "top_sites": {
+      "autumn_partition_server::Memtable::seek_user_key @ ?": 1.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.791,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.005
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 4096
+  },
+  "8": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 631157243,
+     "app_copy_x": 1.176,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 16,
+     "small_memcpy_bytes": 65321635,
+     "small_memcpy_calls": 442387,
+     "tcp_recv": 537026560,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 737280,
+     "tcp_send_x": 0.001,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.035,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 1.0,
+      "controlled_path::batch::{{closure}} @ server/benches/controlled_path.rs:72": 0.141
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4074053,
+     "small_memcpy_calls": 34882,
+     "tcp_recv": 126242,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 142647874,
+     "tcp_send_x": 0.266,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6226245,
+     "small_memcpy_calls": 53289,
+     "tcp_recv": 193058,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 218167234,
+     "tcp_send_x": 0.406,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5029829,
+     "small_memcpy_calls": 43054,
+     "tcp_recv": 155938,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 176212034,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 563091507,
+     "app_copy_x": 1.049,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 48469297,
+     "small_memcpy_calls": 529336,
+     "tcp_recv": 537764350,
+     "tcp_recv_x": 1.002,
+     "tcp_send": 537501714,
+     "tcp_send_x": 1.001,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 65536
+  },
+  "9": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1500433807,
+     "app_copy_x": 2.795,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 31978899,
+     "small_memcpy_calls": 217298,
+     "tcp_recv": 537182208,
+     "tcp_recv_x": 1.001,
+     "tcp_send": 737280,
+     "tcp_send_x": 0.001,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.035,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.619,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 3853392,
+     "small_memcpy_calls": 32004,
+     "tcp_recv": 126208,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 142647680,
+     "tcp_send_x": 0.266,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5913088,
+     "small_memcpy_calls": 48976,
+     "tcp_recv": 193024,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 218167040,
+     "tcp_send_x": 0.406,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4765008,
+     "small_memcpy_calls": 39909,
+     "tcp_recv": 155904,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 176211840,
+     "tcp_send_x": 0.328,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 2905042732,
+     "app_copy_x": 5.411,
+     "memset": 0,
+     "memset_calls": 8195,
+     "memset_x": 0.0,
+     "page_faults": 134,
+     "small_memcpy_bytes": 44288873,
+     "small_memcpy_calls": 500242,
+     "tcp_recv": 537764586,
+     "tcp_recv_x": 1.002,
+     "tcp_send": 537657406,
+     "tcp_send_x": 1.001,
+     "top_sites": {
+      "autumn_partition_server::handle_ps_connection::{{closure}} @ partition-server/src/lib.rs:5714": 0.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 1.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 65536
+  }
+ },
+ "tcp-p1-r31-getnew": {
+  "10": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1154678313,
+     "app_copy_x": 1.075,
+     "memset": 0,
+     "memset_calls": 1025,
+     "memset_x": 0.0,
+     "page_faults": 2,
+     "small_memcpy_bytes": 11045411,
+     "small_memcpy_calls": 73596,
+     "tcp_recv": 1073761280,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 92160,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.003,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.002
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 635256,
+     "small_memcpy_calls": 5274,
+     "tcp_recv": 20416,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 369105440,
+     "tcp_send_x": 0.344,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 767640,
+     "small_memcpy_calls": 6374,
+     "tcp_recv": 25056,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 452993040,
+     "tcp_send_x": 0.422,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 425024,
+     "small_memcpy_calls": 3548,
+     "tcp_recv": 13920,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 251662800,
+     "tcp_send_x": 0.234,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 70396727,
+     "app_copy_x": 0.066,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5884208,
+     "small_memcpy_calls": 64393,
+     "tcp_recv": 1073853950,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 1073820690,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.003,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.062
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 1048576
+  },
+  "11": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 19857900,
+     "app_copy_x": 0.009,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 1,
+     "small_memcpy_bytes": 14076095,
+     "small_memcpy_calls": 89987,
+     "tcp_recv": 2147488512,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 23040,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_pooled::{{closure}} @ client/src/lib.rs:3402": 0.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 3,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 138105,
+     "small_memcpy_calls": 1196,
+     "tcp_recv": 4966,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 637535730,
+     "tcp_send_x": 0.297,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 3,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 156849,
+     "small_memcpy_calls": 1356,
+     "tcp_recv": 5430,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 704644746,
+     "tcp_send_x": 0.328,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 3,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 168973,
+     "small_memcpy_calls": 1430,
+     "tcp_recv": 6126,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 805308270,
+     "tcp_send_x": 0.375,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 17597870,
+     "app_copy_x": 0.008,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 3464722,
+     "small_memcpy_calls": 29153,
+     "tcp_recv": 2147512062,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 2147503378,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 8388608
+  },
+  "12": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 2167720790,
+     "app_copy_x": 1.009,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 1,
+     "small_memcpy_bytes": 8995866,
+     "small_memcpy_calls": 57840,
+     "tcp_recv": 2147488512,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 23040,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.0,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 136832,
+     "small_memcpy_calls": 1174,
+     "tcp_recv": 4442,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 637535846,
+     "tcp_send_x": 0.297,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 152776,
+     "small_memcpy_calls": 1274,
+     "tcp_recv": 4906,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 704644862,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 170836,
+     "small_memcpy_calls": 1416,
+     "tcp_recv": 5602,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 805308386,
+     "tcp_send_x": 0.375,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 17597711,
+     "app_copy_x": 0.008,
+     "memset": 0,
+     "memset_calls": 4,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 3343958,
+     "small_memcpy_calls": 28366,
+     "tcp_recv": 2147512302,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 2147503598,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 8388608
+  },
+  "7": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1424124402,
+     "app_copy_x": 5.305,
+     "memset": 0,
+     "memset_calls": 65541,
+     "memset_x": 0.0,
+     "page_faults": 133,
+     "small_memcpy_bytes": 263637075,
+     "small_memcpy_calls": 1840443,
+     "tcp_recv": 269680640,
+     "tcp_recv_x": 1.005,
+     "tcp_send": 5898240,
+     "tcp_send_x": 0.022,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.735,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.508
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 10472,
+     "small_memcpy_calls": 216,
+     "tcp_recv": 68,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 388,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 10472,
+     "small_memcpy_calls": 216,
+     "tcp_recv": 68,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 388,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 10472,
+     "small_memcpy_calls": 216,
+     "tcp_recv": 68,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 388,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 480772096,
+     "app_copy_x": 1.791,
+     "memset": 0,
+     "memset_calls": 78,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 100112411,
+     "small_memcpy_calls": 984071,
+     "tcp_recv": 5899426,
+     "tcp_recv_x": 0.022,
+     "tcp_send": 269681026,
+     "tcp_send_x": 1.005,
+     "top_sites": {
+      "autumn_partition_server::Memtable::seek_user_key @ ?": 1.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.791
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 4096
+  },
+  "8": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 635374269,
+     "app_copy_x": 1.183,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 16,
+     "small_memcpy_bytes": 66436835,
+     "small_memcpy_calls": 449743,
+     "tcp_recv": 537026560,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 737280,
+     "tcp_send_x": 0.001,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_pooled::{{closure}} @ client/src/lib.rs:3402": 0.023,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.032,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4036604,
+     "small_memcpy_calls": 34261,
+     "tcp_recv": 126344,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 142647955,
+     "tcp_send_x": 0.266,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4935748,
+     "small_memcpy_calls": 41613,
+     "tcp_recv": 156040,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 176212115,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6078132,
+     "small_memcpy_calls": 51150,
+     "tcp_recv": 193160,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 218167315,
+     "tcp_send_x": 0.406,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 563113873,
+     "app_copy_x": 1.049,
+     "memset": 0,
+     "memset_calls": 8,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 45383896,
+     "small_memcpy_calls": 498109,
+     "tcp_recv": 537765526,
+     "tcp_recv_x": 1.002,
+     "tcp_send": 537501966,
+     "tcp_send_x": 1.001,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 65536
+  },
+  "9": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1184402939,
+     "app_copy_x": 2.206,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 16,
+     "small_memcpy_bytes": 66143507,
+     "small_memcpy_calls": 447914,
+     "tcp_recv": 537026560,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 737280,
+     "tcp_send_x": 0.001,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.046,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.032
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4063652,
+     "small_memcpy_calls": 34724,
+     "tcp_recv": 126242,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 142647874,
+     "tcp_send_x": 0.266,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4977372,
+     "small_memcpy_calls": 42200,
+     "tcp_recv": 155938,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 176212034,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6140188,
+     "small_memcpy_calls": 51964,
+     "tcp_recv": 193058,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 218167234,
+     "tcp_send_x": 0.406,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 563119915,
+     "app_copy_x": 1.049,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 44994699,
+     "small_memcpy_calls": 496652,
+     "tcp_recv": 537764826,
+     "tcp_recv_x": 1.002,
+     "tcp_send": 537501978,
+     "tcp_send_x": 1.001,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 65536
+  }
+ },
+ "tcp-p1-r32-getbase": {
+  "10": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 2226430512,
+     "app_copy_x": 2.074,
+     "memset": 0,
+     "memset_calls": 1025,
+     "memset_x": 0.0,
+     "page_faults": 525312,
+     "small_memcpy_bytes": 3914476,
+     "small_memcpy_calls": 26646,
+     "tcp_recv": 1073780736,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 92160,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.002,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.063,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 449520,
+     "small_memcpy_calls": 3856,
+     "tcp_recv": 13920,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 251662800,
+     "tcp_send_x": 0.234,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 659552,
+     "small_memcpy_calls": 5656,
+     "tcp_recv": 20416,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 369105440,
+     "tcp_send_x": 0.344,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 809264,
+     "small_memcpy_calls": 6942,
+     "tcp_recv": 25056,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 452993040,
+     "tcp_send_x": 0.422,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 4878126118,
+     "app_copy_x": 4.543,
+     "memset": 0,
+     "memset_calls": 1024,
+     "memset_x": 0.0,
+     "page_faults": 706,
+     "small_memcpy_bytes": 10192934,
+     "small_memcpy_calls": 101120,
+     "tcp_recv": 1073853950,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 1073840146,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::handle_ps_connection::{{closure}} @ partition-server/src/lib.rs:5714": 0.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.003,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.062
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 1048576
+  },
+  "11": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 19723141,
+     "app_copy_x": 0.009,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 1,
+     "small_memcpy_bytes": 14500824,
+     "small_memcpy_calls": 92637,
+     "tcp_recv": 2147488512,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 23040,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008,
+      "controlled_path::batch::{{closure}} @ server/benches/controlled_path.rs:72": 0.001
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 169653,
+     "small_memcpy_calls": 1404,
+     "tcp_recv": 5602,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 805308386,
+     "tcp_send_x": 0.375,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 133585,
+     "small_memcpy_calls": 1121,
+     "tcp_recv": 4442,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 644517862,
+     "tcp_send_x": 0.3,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 153633,
+     "small_memcpy_calls": 1304,
+     "tcp_recv": 4906,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 704644862,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 17597022,
+     "app_copy_x": 0.008,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 3660301,
+     "small_memcpy_calls": 30681,
+     "tcp_recv": 2147512062,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 2147503378,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 8388608
+  },
+  "12": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 4314707504,
+     "app_copy_x": 2.009,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 1048832,
+     "small_memcpy_bytes": 978956,
+     "small_memcpy_calls": 6690,
+     "tcp_recv": 2147493376,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 23040,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 179109,
+     "small_memcpy_calls": 1613,
+     "tcp_recv": 5602,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 805308386,
+     "tcp_send_x": 0.375,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 149033,
+     "small_memcpy_calls": 1368,
+     "tcp_recv": 4442,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 637535846,
+     "tcp_send_x": 0.297,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 162593,
+     "small_memcpy_calls": 1488,
+     "tcp_recv": 4906,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 704644862,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 8615916928,
+     "app_copy_x": 4.012,
+     "memset": 0,
+     "memset_calls": 268,
+     "memset_x": 0.0,
+     "page_faults": 4098,
+     "small_memcpy_bytes": 9489083,
+     "small_memcpy_calls": 72546,
+     "tcp_recv": 2147513522,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 2312849731,
+     "tcp_send_x": 1.077,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 8388608
+  },
+  "7": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1293695874,
+     "app_copy_x": 4.819,
+     "memset": 0,
+     "memset_calls": 65537,
+     "memset_x": 0.0,
+     "page_faults": 129,
+     "small_memcpy_bytes": 220645875,
+     "small_memcpy_calls": 1507284,
+     "tcp_recv": 270925824,
+     "tcp_recv_x": 1.009,
+     "tcp_send": 5898240,
+     "tcp_send_x": 0.022,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.557,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.0,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.005
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 17,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 14759,
+     "small_memcpy_calls": 302,
+     "tcp_recv": 626,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 466,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 17,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 14759,
+     "small_memcpy_calls": 302,
+     "tcp_recv": 626,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 466,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 17,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 14711,
+     "small_memcpy_calls": 302,
+     "tcp_recv": 626,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 466,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 1825570816,
+     "app_copy_x": 6.801,
+     "memset": 0,
+     "memset_calls": 65557,
+     "memset_x": 0.0,
+     "page_faults": 3,
+     "small_memcpy_bytes": 89124901,
+     "small_memcpy_calls": 918534,
+     "tcp_recv": 5899426,
+     "tcp_recv_x": 0.022,
+     "tcp_send": 270926210,
+     "tcp_send_x": 1.009,
+     "top_sites": {
+      "autumn_partition_server::Memtable::seek_user_key @ ?": 1.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.791,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.005
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 4096
+  },
+  "8": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 631020715,
+     "app_copy_x": 1.175,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 16,
+     "small_memcpy_bytes": 66589507,
+     "small_memcpy_calls": 450642,
+     "tcp_recv": 537026560,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 737280,
+     "tcp_send_x": 0.001,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.035,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999,
+      "controlled_path::batch::{{closure}} @ server/benches/controlled_path.rs:72": 0.141
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6094637,
+     "small_memcpy_calls": 51336,
+     "tcp_recv": 193058,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 218167234,
+     "tcp_send_x": 0.406,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4032357,
+     "small_memcpy_calls": 34213,
+     "tcp_recv": 126242,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 142647874,
+     "tcp_send_x": 0.266,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4949517,
+     "small_memcpy_calls": 41831,
+     "tcp_recv": 155938,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 176212034,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 563107460,
+     "app_copy_x": 1.049,
+     "memset": 0,
+     "memset_calls": 3,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 44938793,
+     "small_memcpy_calls": 496997,
+     "tcp_recv": 537764586,
+     "tcp_recv_x": 1.002,
+     "tcp_send": 537501758,
+     "tcp_send_x": 1.001,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 65536
+  },
+  "9": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1704871453,
+     "app_copy_x": 3.176,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 32361955,
+     "small_memcpy_calls": 219652,
+     "tcp_recv": 537182208,
+     "tcp_recv_x": 1.001,
+     "tcp_send": 737280,
+     "tcp_send_x": 0.001,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.035,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5947717,
+     "small_memcpy_calls": 49561,
+     "tcp_recv": 193058,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 218167234,
+     "tcp_send_x": 0.406,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 3885829,
+     "small_memcpy_calls": 32368,
+     "tcp_recv": 126242,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 142647874,
+     "tcp_send_x": 0.266,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4769229,
+     "small_memcpy_calls": 40040,
+     "tcp_recv": 155938,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 176212034,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 2739545389,
+     "app_copy_x": 5.103,
+     "memset": 0,
+     "memset_calls": 8197,
+     "memset_x": 0.0,
+     "page_faults": 870,
+     "small_memcpy_bytes": 44209639,
+     "small_memcpy_calls": 499015,
+     "tcp_recv": 537764824,
+     "tcp_recv_x": 1.002,
+     "tcp_send": 537657440,
+     "tcp_send_x": 1.001,
+     "top_sites": {
+      "autumn_partition_server::handle_ps_connection::{{closure}} @ partition-server/src/lib.rs:5714": 0.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 65536
+  }
+ },
+ "tcp-p1-r32-getnew": {
+  "10": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1154677041,
+     "app_copy_x": 1.075,
+     "memset": 0,
+     "memset_calls": 1025,
+     "memset_x": 0.0,
+     "page_faults": 2,
+     "small_memcpy_bytes": 10919326,
+     "small_memcpy_calls": 72806,
+     "tcp_recv": 1073761280,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 92160,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.003,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.002
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 755352,
+     "small_memcpy_calls": 6270,
+     "tcp_recv": 25056,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 452993040,
+     "tcp_send_x": 0.422,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 425056,
+     "small_memcpy_calls": 3572,
+     "tcp_recv": 13920,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 251662800,
+     "tcp_send_x": 0.234,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 634360,
+     "small_memcpy_calls": 5298,
+     "tcp_recv": 20416,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 369105440,
+     "tcp_send_x": 0.344,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 70394872,
+     "app_copy_x": 0.066,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6072003,
+     "small_memcpy_calls": 65652,
+     "tcp_recv": 1073853950,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 1073820690,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.003,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.062
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 1048576
+  },
+  "11": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 19858059,
+     "app_copy_x": 0.009,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 1,
+     "small_memcpy_bytes": 14592320,
+     "small_memcpy_calls": 93227,
+     "tcp_recv": 2147488512,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 23040,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_pooled::{{closure}} @ client/src/lib.rs:3402": 0.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 152860,
+     "small_memcpy_calls": 1288,
+     "tcp_recv": 4872,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 704644668,
+     "tcp_send_x": 0.328,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 171264,
+     "small_memcpy_calls": 1428,
+     "tcp_recv": 5568,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 805308192,
+     "tcp_send_x": 0.375,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 134804,
+     "small_memcpy_calls": 1124,
+     "tcp_recv": 4408,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 637535652,
+     "tcp_send_x": 0.297,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 17597446,
+     "app_copy_x": 0.008,
+     "memset": 0,
+     "memset_calls": 4,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 3391751,
+     "small_memcpy_calls": 28701,
+     "tcp_recv": 2147512302,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 2147503598,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 8388608
+  },
+  "12": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 2167720366,
+     "app_copy_x": 1.009,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 1,
+     "small_memcpy_bytes": 9523687,
+     "small_memcpy_calls": 61212,
+     "tcp_recv": 2147488512,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 23040,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.0,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 153024,
+     "small_memcpy_calls": 1279,
+     "tcp_recv": 4906,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 704644862,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 170012,
+     "small_memcpy_calls": 1419,
+     "tcp_recv": 5602,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 805308386,
+     "tcp_send_x": 0.375,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 135592,
+     "small_memcpy_calls": 1148,
+     "tcp_recv": 4442,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 637535846,
+     "tcp_send_x": 0.297,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 17597287,
+     "app_copy_x": 0.008,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 3262336,
+     "small_memcpy_calls": 27854,
+     "tcp_recv": 2147512062,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 2147503378,
+     "tcp_send_x": 1.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 8388608
+  },
+  "7": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1424128213,
+     "app_copy_x": 5.305,
+     "memset": 0,
+     "memset_calls": 65540,
+     "memset_x": 0.0,
+     "page_faults": 133,
+     "small_memcpy_bytes": 263618411,
+     "small_memcpy_calls": 1840383,
+     "tcp_recv": 269680640,
+     "tcp_recv_x": 1.005,
+     "tcp_send": 5898240,
+     "tcp_send_x": 0.022,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.735,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.508
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 12552,
+     "small_memcpy_calls": 264,
+     "tcp_recv": 68,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 388,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 12504,
+     "small_memcpy_calls": 263,
+     "tcp_recv": 68,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 388,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 12456,
+     "small_memcpy_calls": 262,
+     "tcp_recv": 68,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 388,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 480772096,
+     "app_copy_x": 1.791,
+     "memset": 0,
+     "memset_calls": 123,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 100037384,
+     "small_memcpy_calls": 983588,
+     "tcp_recv": 5899426,
+     "tcp_recv_x": 0.022,
+     "tcp_send": 269681026,
+     "tcp_send_x": 1.005,
+     "top_sites": {
+      "autumn_partition_server::Memtable::seek_user_key @ ?": 1.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.791
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 4096
+  },
+  "8": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 635352399,
+     "app_copy_x": 1.183,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 16,
+     "small_memcpy_bytes": 66570995,
+     "small_memcpy_calls": 450547,
+     "tcp_recv": 537026560,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 737280,
+     "tcp_send_x": 0.001,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_pooled::{{closure}} @ client/src/lib.rs:3402": 0.023,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.032,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4946976,
+     "small_memcpy_calls": 41694,
+     "tcp_recv": 155972,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 176211894,
+     "tcp_send_x": 0.328,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6109264,
+     "small_memcpy_calls": 51525,
+     "tcp_recv": 193092,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 218167094,
+     "tcp_send_x": 0.406,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4043672,
+     "small_memcpy_calls": 34378,
+     "tcp_recv": 126276,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 142647734,
+     "tcp_send_x": 0.266,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 563112230,
+     "app_copy_x": 1.049,
+     "memset": 0,
+     "memset_calls": 9,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 44975147,
+     "small_memcpy_calls": 497181,
+     "tcp_recv": 537765294,
+     "tcp_recv_x": 1.002,
+     "tcp_send": 537502094,
+     "tcp_send_x": 1.001,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 65536
+  },
+  "9": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1184401561,
+     "app_copy_x": 2.206,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 16,
+     "small_memcpy_bytes": 66132467,
+     "small_memcpy_calls": 447838,
+     "tcp_recv": 537026560,
+     "tcp_recv_x": 1.0,
+     "tcp_send": 737280,
+     "tcp_send_x": 0.001,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.046,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.032
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4979712,
+     "small_memcpy_calls": 42243,
+     "tcp_recv": 155904,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 176211840,
+     "tcp_send_x": 0.328,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6144392,
+     "small_memcpy_calls": 51949,
+     "tcp_recv": 193024,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 218167040,
+     "tcp_send_x": 0.406,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4060904,
+     "small_memcpy_calls": 34660,
+     "tcp_recv": 126208,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 142647680,
+     "tcp_send_x": 0.266,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 563115092,
+     "app_copy_x": 1.049,
+     "memset": 0,
+     "memset_calls": 3,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 44973632,
+     "small_memcpy_calls": 496225,
+     "tcp_recv": 537764586,
+     "tcp_recv_x": 1.002,
+     "tcp_send": 537501758,
+     "tcp_send_x": 1.001,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.999
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 65536
+  }
+ },
+ "ucx-p1-r31-getbase": {
+  "10": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 2213059536,
+     "app_copy_x": 2.061,
+     "memset": 0,
+     "memset_calls": 1025,
+     "memset_x": 0.0,
+     "page_faults": 29085,
+     "small_memcpy_bytes": 3551800,
+     "small_memcpy_calls": 25394,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.002,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.05,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 1073759164,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 10,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 4727312,
+     "small_memcpy_calls": 117267,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 10,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 2667080,
+     "small_memcpy_calls": 65726,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 10,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 3885992,
+     "small_memcpy_calls": 95979,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 4860214316,
+     "app_copy_x": 4.526,
+     "memset": 0,
+     "memset_calls": 1149,
+     "memset_x": 0.0,
+     "page_faults": 3634,
+     "small_memcpy_bytes": 12321151,
+     "small_memcpy_calls": 306564,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.003,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.012,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.0
+     },
+     "ucx_unpack": 1073695457,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 1048576
+  },
+  "11": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 4658974,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 269,
+     "memset_x": 0.0,
+     "page_faults": 279,
+     "small_memcpy_bytes": 3213536,
+     "small_memcpy_calls": 21044,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001,
+      "controlled_path::batch::{{closure}} @ server/benches/controlled_path.rs:72": 0.001
+     },
+     "ucx_unpack": 2147440420,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 6322433,
+     "small_memcpy_calls": 172628,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 7224685,
+     "small_memcpy_calls": 197273,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5724673,
+     "small_memcpy_calls": 156278,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 3375746,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 20,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 19547389,
+     "small_memcpy_calls": 533629,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001
+     },
+     "ucx_unpack": 2147488080,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 8388608
+  },
+  "12": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 4308480824,
+     "app_copy_x": 2.006,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 649262,
+     "small_memcpy_bytes": 1110388,
+     "small_memcpy_calls": 7854,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.005,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 2147448968,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 9168,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 21,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6330243,
+     "small_memcpy_calls": 172760,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 9168,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 21,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 7229551,
+     "small_memcpy_calls": 197378,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 9168,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 21,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5729291,
+     "small_memcpy_calls": 156332,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 9826634651,
+     "app_copy_x": 4.576,
+     "memset": 0,
+     "memset_calls": 318,
+     "memset_x": 0.0,
+     "page_faults": 13862,
+     "small_memcpy_bytes": 19555464,
+     "small_memcpy_calls": 534227,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.0
+     },
+     "ucx_unpack": 2147488512,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 8388608
+  },
+  "7": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1293695874,
+     "app_copy_x": 4.819,
+     "memset": 0,
+     "memset_calls": 65539,
+     "memset_x": 0.0,
+     "page_faults": 1668,
+     "small_memcpy_bytes": 204557827,
+     "small_memcpy_calls": 1474750,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.557,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.0,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.005
+     },
+     "ucx_unpack": 270923090,
+     "ucx_unpack_x": 1.009
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 17,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 16013,
+     "small_memcpy_calls": 317,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 17,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 16013,
+     "small_memcpy_calls": 317,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 17,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 13981,
+     "small_memcpy_calls": 270,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 1825570816,
+     "app_copy_x": 6.801,
+     "memset": 0,
+     "memset_calls": 65550,
+     "memset_x": 0.0,
+     "page_faults": 1264,
+     "small_memcpy_bytes": 77346045,
+     "small_memcpy_calls": 984018,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::Memtable::seek_user_key @ ?": 1.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.791,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.005
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 4096
+  },
+  "8": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 120821444,
+     "app_copy_x": 0.225,
+     "memset": 0,
+     "memset_calls": 8205,
+     "memset_x": 0.0,
+     "page_faults": 665,
+     "small_memcpy_bytes": 38262460,
+     "small_memcpy_calls": 251526,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.035,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.049,
+      "controlled_path::batch::{{closure}} @ server/benches/controlled_path.rs:72": 0.141
+     },
+     "ucx_unpack": 534695080,
+     "ucx_unpack_x": 0.996
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 50,
+     "small_memcpy_bytes": 6424021,
+     "small_memcpy_calls": 88282,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 70,
+     "small_memcpy_bytes": 7854061,
+     "small_memcpy_calls": 108290,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 50,
+     "small_memcpy_bytes": 5133613,
+     "small_memcpy_calls": 70318,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 154905894,
+     "app_copy_x": 0.289,
+     "memset": 0,
+     "memset_calls": 11,
+     "memset_x": 0.0,
+     "page_faults": 906,
+     "small_memcpy_bytes": 31350411,
+     "small_memcpy_calls": 513262,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.239
+     },
+     "ucx_unpack": 535068351,
+     "ucx_unpack_x": 0.997
+    }
+   },
+   "size": 65536
+  },
+  "9": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1258531766,
+     "app_copy_x": 2.344,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 908,
+     "small_memcpy_bytes": 29401571,
+     "small_memcpy_calls": 198556,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.035,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.168,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 535946244,
+     "ucx_unpack_x": 0.998
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 60,
+     "small_memcpy_bytes": 6431957,
+     "small_memcpy_calls": 88379,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 70,
+     "small_memcpy_bytes": 7856093,
+     "small_memcpy_calls": 108298,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 60,
+     "small_memcpy_bytes": 5143893,
+     "small_memcpy_calls": 70430,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 2462201807,
+     "app_copy_x": 4.586,
+     "memset": 0,
+     "memset_calls": 8545,
+     "memset_x": 0.0,
+     "page_faults": 1560,
+     "small_memcpy_bytes": 28826515,
+     "small_memcpy_calls": 487253,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.252,
+      "autumn_rpc::client::write_vectored_chunked::{{closure}} @ rpc/src/client.rs:664": 0.0
+     },
+     "ucx_unpack": 534953165,
+     "ucx_unpack_x": 0.996
+    }
+   },
+   "size": 65536
+  }
+ },
+ "ucx-p1-r31-getnew": {
+  "10": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1097208081,
+     "app_copy_x": 1.022,
+     "memset": 1048584,
+     "memset_calls": 1047,
+     "memset_x": 0.001,
+     "page_faults": 408,
+     "small_memcpy_bytes": 4519761,
+     "small_memcpy_calls": 32399,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.003,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.002
+     },
+     "ucx_unpack": 1073732523,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 2667372,
+     "small_memcpy_calls": 65720,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 4743300,
+     "small_memcpy_calls": 117386,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 3904364,
+     "small_memcpy_calls": 96211,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 14248395,
+     "app_copy_x": 0.013,
+     "memset": 0,
+     "memset_calls": 81,
+     "memset_x": 0.0,
+     "page_faults": 91,
+     "small_memcpy_bytes": 12423530,
+     "small_memcpy_calls": 307632,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.003,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.01
+     },
+     "ucx_unpack": 1073718596,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 1048576
+  },
+  "11": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 4566673,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 273,
+     "memset_x": 0.0,
+     "page_faults": 189,
+     "small_memcpy_bytes": 2430789,
+     "small_memcpy_calls": 16614,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_pooled::{{closure}} @ client/src/lib.rs:3402": 0.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001
+     },
+     "ucx_unpack": 2147443779,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 7224348,
+     "small_memcpy_calls": 197273,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 6328368,
+     "small_memcpy_calls": 172721,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5722464,
+     "small_memcpy_calls": 156226,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 3847202,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 33,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 19542415,
+     "small_memcpy_calls": 533538,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001
+     },
+     "ucx_unpack": 2147488512,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 8388608
+  },
+  "12": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 2152838040,
+     "app_copy_x": 1.002,
+     "memset": 8388616,
+     "memset_calls": 274,
+     "memset_x": 0.004,
+     "page_faults": 2189,
+     "small_memcpy_bytes": 1995534,
+     "small_memcpy_calls": 13435,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.0,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0
+     },
+     "ucx_unpack": 2147444690,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 7223636,
+     "small_memcpy_calls": 197260,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6323056,
+     "small_memcpy_calls": 172626,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5719336,
+     "small_memcpy_calls": 156186,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 3957562,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 34,
+     "memset_x": 0.0,
+     "page_faults": 21,
+     "small_memcpy_bytes": 19544920,
+     "small_memcpy_calls": 533477,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001
+     },
+     "ucx_unpack": 2147488512,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 8388608
+  },
+  "7": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1357142981,
+     "app_copy_x": 5.056,
+     "memset": 0,
+     "memset_calls": 65537,
+     "memset_x": 0.0,
+     "page_faults": 1913,
+     "small_memcpy_bytes": 247136422,
+     "small_memcpy_calls": 1831897,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.735,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.508
+     },
+     "ucx_unpack": 269675301,
+     "ucx_unpack_x": 1.005
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 17,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 14939,
+     "small_memcpy_calls": 294,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 17,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 16779,
+     "small_memcpy_calls": 338,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 17,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 16803,
+     "small_memcpy_calls": 338,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 480772096,
+     "app_copy_x": 1.791,
+     "memset": 0,
+     "memset_calls": 6721,
+     "memset_x": 0.0,
+     "page_faults": 1153,
+     "small_memcpy_bytes": 81863467,
+     "small_memcpy_calls": 1020248,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::Memtable::seek_user_key @ ?": 1.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.791
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 4096
+  },
+  "8": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 132115103,
+     "app_copy_x": 0.246,
+     "memset": 0,
+     "memset_calls": 8209,
+     "memset_x": 0.0,
+     "page_faults": 665,
+     "small_memcpy_bytes": 38760532,
+     "small_memcpy_calls": 255979,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_pooled::{{closure}} @ client/src/lib.rs:3402": 0.023,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.032,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.062
+     },
+     "ucx_unpack": 534860726,
+     "ucx_unpack_x": 0.996
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 71,
+     "small_memcpy_bytes": 7867500,
+     "small_memcpy_calls": 108580,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 48,
+     "small_memcpy_bytes": 6462396,
+     "small_memcpy_calls": 89103,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 50,
+     "small_memcpy_bytes": 5185828,
+     "small_memcpy_calls": 71143,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 147342117,
+     "app_copy_x": 0.274,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 885,
+     "small_memcpy_bytes": 29825896,
+     "small_memcpy_calls": 496851,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.225
+     },
+     "ucx_unpack": 535288439,
+     "ucx_unpack_x": 0.997
+    }
+   },
+   "size": 65536
+  },
+  "9": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 675763658,
+     "app_copy_x": 1.259,
+     "memset": 0,
+     "memset_calls": 8210,
+     "memset_x": 0.0,
+     "page_faults": 665,
+     "small_memcpy_bytes": 38206628,
+     "small_memcpy_calls": 251186,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.046,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.032
+     },
+     "ucx_unpack": 534690575,
+     "ucx_unpack_x": 0.996
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 70,
+     "small_memcpy_bytes": 7816676,
+     "small_memcpy_calls": 107900,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 50,
+     "small_memcpy_bytes": 6417956,
+     "small_memcpy_calls": 88387,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 50,
+     "small_memcpy_bytes": 5153564,
+     "small_memcpy_calls": 70763,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 155319850,
+     "app_copy_x": 0.289,
+     "memset": 0,
+     "memset_calls": 12,
+     "memset_x": 0.0,
+     "page_faults": 883,
+     "small_memcpy_bytes": 30142089,
+     "small_memcpy_calls": 508908,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.24
+     },
+     "ucx_unpack": 535190210,
+     "ucx_unpack_x": 0.997
+    }
+   },
+   "size": 65536
+  }
+ },
+ "ucx-p1-r32-getbase": {
+  "10": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 2226430512,
+     "app_copy_x": 2.074,
+     "memset": 0,
+     "memset_calls": 1025,
+     "memset_x": 0.0,
+     "page_faults": 413571,
+     "small_memcpy_bytes": 3335218,
+     "small_memcpy_calls": 23686,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.002,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.063,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 1073703210,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 3865645,
+     "small_memcpy_calls": 95671,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 2656117,
+     "small_memcpy_calls": 65590,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 4711637,
+     "small_memcpy_calls": 117009,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 4692634218,
+     "app_copy_x": 4.37,
+     "memset": 0,
+     "memset_calls": 1077,
+     "memset_x": 0.0,
+     "page_faults": 1982,
+     "small_memcpy_bytes": 12374655,
+     "small_memcpy_calls": 307351,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.003,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.012,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.0
+     },
+     "ucx_unpack": 1073699630,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 1048576
+  },
+  "11": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 4723219,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 270,
+     "memset_x": 0.0,
+     "page_faults": 298,
+     "small_memcpy_bytes": 3354243,
+     "small_memcpy_calls": 22020,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001,
+      "controlled_path::batch::{{closure}} @ server/benches/controlled_path.rs:72": 0.001
+     },
+     "ucx_unpack": 2147449533,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 5721825,
+     "small_memcpy_calls": 156229,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 7224245,
+     "small_memcpy_calls": 197272,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6324417,
+     "small_memcpy_calls": 172648,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 3653086,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 25,
+     "memset_x": 0.0,
+     "page_faults": 11,
+     "small_memcpy_bytes": 19578818,
+     "small_memcpy_calls": 533966,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001
+     },
+     "ucx_unpack": 2147488080,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 8388608
+  },
+  "12": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 4314707504,
+     "app_copy_x": 2.009,
+     "memset": 0,
+     "memset_calls": 257,
+     "memset_x": 0.0,
+     "page_faults": 516100,
+     "small_memcpy_bytes": 1214976,
+     "small_memcpy_calls": 8502,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.008,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 2147443412,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5730358,
+     "small_memcpy_calls": 156370,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 7228042,
+     "small_memcpy_calls": 197338,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 6329982,
+     "small_memcpy_calls": 172760,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 8593340324,
+     "app_copy_x": 4.002,
+     "memset": 0,
+     "memset_calls": 290,
+     "memset_x": 0.0,
+     "page_faults": 21,
+     "small_memcpy_bytes": 19563662,
+     "small_memcpy_calls": 534370,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.0
+     },
+     "ucx_unpack": 2147488512,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 8388608
+  },
+  "7": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1293699400,
+     "app_copy_x": 4.819,
+     "memset": 0,
+     "memset_calls": 65539,
+     "memset_x": 0.0,
+     "page_faults": 1641,
+     "small_memcpy_bytes": 204553103,
+     "small_memcpy_calls": 1474795,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.557,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.0,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.005
+     },
+     "ucx_unpack": 270920546,
+     "ucx_unpack_x": 1.009
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 10906,
+     "small_memcpy_calls": 220,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 10906,
+     "small_memcpy_calls": 220,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 9706,
+     "small_memcpy_calls": 192,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 1825570816,
+     "app_copy_x": 6.801,
+     "memset": 0,
+     "memset_calls": 65554,
+     "memset_x": 0.0,
+     "page_faults": 1242,
+     "small_memcpy_bytes": 77323029,
+     "small_memcpy_calls": 983745,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::Memtable::seek_user_key @ ?": 1.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.791,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::frame::Frame::encode @ ?": 1.005
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 4096
+  },
+  "8": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 121413081,
+     "app_copy_x": 0.226,
+     "memset": 0,
+     "memset_calls": 8213,
+     "memset_x": 0.0,
+     "page_faults": 672,
+     "small_memcpy_bytes": 38268494,
+     "small_memcpy_calls": 251935,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.035,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.05,
+      "controlled_path::batch::{{closure}} @ server/benches/controlled_path.rs:72": 0.141
+     },
+     "ucx_unpack": 534727697,
+     "ucx_unpack_x": 0.996
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 9,
+     "memset_x": 0.0,
+     "page_faults": 48,
+     "small_memcpy_bytes": 5230669,
+     "small_memcpy_calls": 71617,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 80,
+     "small_memcpy_bytes": 7852989,
+     "small_memcpy_calls": 108025,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 50,
+     "small_memcpy_bytes": 6390773,
+     "small_memcpy_calls": 88047,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 158904114,
+     "app_copy_x": 0.296,
+     "memset": 0,
+     "memset_calls": 3,
+     "memset_x": 0.0,
+     "page_faults": 882,
+     "small_memcpy_bytes": 31434604,
+     "small_memcpy_calls": 512269,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.247
+     },
+     "ucx_unpack": 534983257,
+     "ucx_unpack_x": 0.996
+    }
+   },
+   "size": 65536
+  },
+  "9": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1214090560,
+     "app_copy_x": 2.261,
+     "memset": 0,
+     "memset_calls": 8193,
+     "memset_x": 0.0,
+     "page_faults": 785,
+     "small_memcpy_bytes": 29644773,
+     "small_memcpy_calls": 200161,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.035,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.085,
+      "autumn_rpc::manager_rpc::rkyv_decode @ rpc/src/manager_rpc.rs:253": 1.0
+     },
+     "ucx_unpack": 536021104,
+     "ucx_unpack_x": 0.998
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 50,
+     "small_memcpy_bytes": 5240997,
+     "small_memcpy_calls": 71786,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 80,
+     "small_memcpy_bytes": 7856437,
+     "small_memcpy_calls": 108112,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 60,
+     "small_memcpy_bytes": 6394709,
+     "small_memcpy_calls": 88103,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 2383722969,
+     "app_copy_x": 4.44,
+     "memset": 0,
+     "memset_calls": 8255,
+     "memset_x": 0.0,
+     "page_faults": 902,
+     "small_memcpy_bytes": 28675390,
+     "small_memcpy_calls": 483956,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_partition_server::push_one_frame_to_inflight::{{closure}} @ ?": 1.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.251,
+      "autumn_rpc::client::write_vectored_chunked::{{closure}} @ rpc/src/client.rs:664": 0.0
+     },
+     "ucx_unpack": 534990268,
+     "ucx_unpack_x": 0.996
+    }
+   },
+   "size": 65536
+  }
+ },
+ "ucx-p1-r32-getnew": {
+  "10": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1097726745,
+     "app_copy_x": 1.022,
+     "memset": 1048584,
+     "memset_calls": 1051,
+     "memset_x": 0.001,
+     "page_faults": 401,
+     "small_memcpy_bytes": 4531704,
+     "small_memcpy_calls": 32532,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.003,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.002
+     },
+     "ucx_unpack": 1073738888,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 3889688,
+     "small_memcpy_calls": 95960,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 4744272,
+     "small_memcpy_calls": 117385,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 2660760,
+     "small_memcpy_calls": 65626,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 15289584,
+     "app_copy_x": 0.014,
+     "memset": 0,
+     "memset_calls": 67,
+     "memset_x": 0.0,
+     "page_faults": 101,
+     "small_memcpy_bytes": 12422391,
+     "small_memcpy_calls": 307802,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.003,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.011
+     },
+     "ucx_unpack": 1073706965,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 1048576
+  },
+  "11": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 4838030,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 270,
+     "memset_x": 0.0,
+     "page_faults": 320,
+     "small_memcpy_bytes": 3411672,
+     "small_memcpy_calls": 22375,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_pooled::{{closure}} @ client/src/lib.rs:3402": 0.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001
+     },
+     "ucx_unpack": 2147439944,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5720856,
+     "small_memcpy_calls": 156192,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6325800,
+     "small_memcpy_calls": 172682,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 7224508,
+     "small_memcpy_calls": 197269,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 3651937,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 24,
+     "memset_x": 0.0,
+     "page_faults": 10,
+     "small_memcpy_bytes": 19537629,
+     "small_memcpy_calls": 533517,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001
+     },
+     "ucx_unpack": 2147487216,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 8388608
+  },
+  "12": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 2152834509,
+     "app_copy_x": 1.002,
+     "memset": 8388616,
+     "memset_calls": 273,
+     "memset_x": 0.004,
+     "page_faults": 84159,
+     "small_memcpy_bytes": 2149898,
+     "small_memcpy_calls": 14391,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.0,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.0
+     },
+     "ucx_unpack": 2147444546,
+     "ucx_unpack_x": 1.0
+    },
+    "en1": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 5723852,
+     "small_memcpy_calls": 156234,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 6326156,
+     "small_memcpy_calls": 172683,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 6112,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 7227232,
+     "small_memcpy_calls": 197292,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 3691007,
+     "app_copy_x": 0.002,
+     "memset": 0,
+     "memset_calls": 24,
+     "memset_x": 0.0,
+     "page_faults": 21,
+     "small_memcpy_bytes": 19541871,
+     "small_memcpy_calls": 533492,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.0,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.001
+     },
+     "ucx_unpack": 2147488512,
+     "ucx_unpack_x": 1.0
+    }
+   },
+   "size": 8388608
+  },
+  "7": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 1357457032,
+     "app_copy_x": 5.057,
+     "memset": 0,
+     "memset_calls": 65541,
+     "memset_x": 0.0,
+     "page_faults": 1884,
+     "small_memcpy_bytes": 246831987,
+     "small_memcpy_calls": 1829881,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.735,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.508
+     },
+     "ucx_unpack": 269678056,
+     "ucx_unpack_x": 1.005
+    },
+    "en1": {
+     "app_copy": 9168,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 24,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 18711,
+     "small_memcpy_calls": 364,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 9168,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 24,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 16871,
+     "small_memcpy_calls": 320,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 9168,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 24,
+     "memset_x": 0.0,
+     "page_faults": 0,
+     "small_memcpy_bytes": 16871,
+     "small_memcpy_calls": 320,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 480772096,
+     "app_copy_x": 1.791,
+     "memset": 0,
+     "memset_calls": 7155,
+     "memset_x": 0.0,
+     "page_faults": 1144,
+     "small_memcpy_bytes": 82122635,
+     "small_memcpy_calls": 1023072,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::Memtable::seek_user_key @ ?": 1.0,
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.791
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    }
+   },
+   "size": 4096
+  },
+  "8": {
+   "mode": "read",
+   "roles": {
+    "client": {
+     "app_copy": 125371066,
+     "app_copy_x": 0.234,
+     "memset": 0,
+     "memset_calls": 8210,
+     "memset_x": 0.0,
+     "page_faults": 665,
+     "small_memcpy_bytes": 38267187,
+     "small_memcpy_calls": 251618,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_pooled::{{closure}} @ client/src/lib.rs:3402": 0.023,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.032,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.05
+     },
+     "ucx_unpack": 534700425,
+     "ucx_unpack_x": 0.996
+    },
+    "en1": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 40,
+     "small_memcpy_bytes": 5208648,
+     "small_memcpy_calls": 71530,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 58,
+     "small_memcpy_bytes": 6413952,
+     "small_memcpy_calls": 88059,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 0,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 0,
+     "memset_x": 0.0,
+     "page_faults": 81,
+     "small_memcpy_bytes": 7818008,
+     "small_memcpy_calls": 107649,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {},
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 156716818,
+     "app_copy_x": 0.292,
+     "memset": 0,
+     "memset_calls": 13,
+     "memset_x": 0.0,
+     "page_faults": 908,
+     "small_memcpy_bytes": 30148154,
+     "small_memcpy_calls": 499044,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.242
+     },
+     "ucx_unpack": 535056098,
+     "ucx_unpack_x": 0.997
+    }
+   },
+   "size": 65536
+  },
+  "9": {
+   "mode": "get",
+   "roles": {
+    "client": {
+     "app_copy": 675255479,
+     "app_copy_x": 1.258,
+     "memset": 65544,
+     "memset_calls": 8209,
+     "memset_x": 0.0,
+     "page_faults": 679,
+     "small_memcpy_bytes": 38247114,
+     "small_memcpy_calls": 251522,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_client::ClusterClient::get_bound::{{closure}} @ client/src/lib.rs:2740": 0.046,
+      "autumn_client::ClusterClient::get_range_core::{{closure}}::{{closure}} @ client/src/lib.rs:2776": 1.0,
+      "autumn_client::fan_out @ client/src/lib.rs:663": 0.0,
+      "autumn_client::fan_out::{{closure}}::{{closure}} @ client/src/lib.rs:661": 0.032
+     },
+     "ucx_unpack": 534696746,
+     "ucx_unpack_x": 0.996
+    },
+    "en1": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 14,
+     "memset_x": 0.0,
+     "page_faults": 52,
+     "small_memcpy_bytes": 5204157,
+     "small_memcpy_calls": 71746,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en2": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 60,
+     "small_memcpy_bytes": 6417060,
+     "small_memcpy_calls": 88135,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "en3": {
+     "app_copy": 3056,
+     "app_copy_x": 0.0,
+     "memset": 0,
+     "memset_calls": 7,
+     "memset_x": 0.0,
+     "page_faults": 70,
+     "small_memcpy_bytes": 7814572,
+     "small_memcpy_calls": 107609,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_stream::extent_node::process_frames_backpressured::{{closure}} @ stream/src/extent_node.rs:2660": 0.0
+     },
+     "ucx_unpack": 0,
+     "ucx_unpack_x": 0.0
+    },
+    "ps": {
+     "app_copy": 157886278,
+     "app_copy_x": 0.294,
+     "memset": 0,
+     "memset_calls": 11,
+     "memset_x": 0.0,
+     "page_faults": 882,
+     "small_memcpy_bytes": 30935705,
+     "small_memcpy_calls": 510251,
+     "tcp_recv": 0,
+     "tcp_recv_x": 0.0,
+     "tcp_send": 0,
+     "tcp_send_x": 0.0,
+     "top_sites": {
+      "autumn_partition_server::push_one_frame_to_inflight @ ?": 0.049,
+      "autumn_rpc::client::read_loop::{{closure}} @ ?": 0.245
+     },
+     "ucx_unpack": 535042616,
+     "ucx_unpack_x": 0.997
+    }
+   },
+   "size": 65536
+  }
+ }
+}

@@ -32,12 +32,14 @@ python3 perf/receive_copies/copytrace.py --version base --transport tcp --repeat
 python3 perf/receive_copies/analyze.py /data08/autumn-receive-copies/results > summary.json
 ```
 
-A trial loads 64 keys of 64 KiB, 1 MiB and 8 MiB, then runs fixed-work windows
+`--sizes` (default 64 KiB, 1 MiB, 8 MiB; 4 KiB is supported) and `--only
+SIZE:MODE,...` restrict a trial; `--long` runs untraced windows of several
+seconds for throughput/CPU. A trial loads 64 keys of each size, then runs fixed-work windows
 twice: untraced (MiB/s, p99, process CPU through host perf) and traced with
 `copies.bt`. The traced pass exists for byte accounting only: a uprobe fires on
 every memcpy call, so its throughput is not a performance result. Modes are
-`write` (`put_bulk`), `read` (`get_pooled`, PS proxy) and `direct` (`get_direct`,
-EN descriptor read).
+`write` (`put_bulk`), `read` (`get_pooled`, PS proxy), `direct` (`get_direct`,
+EN descriptor read) and `get` (`ClusterClient::get` at every size).
 
 The driver disables ASLR for itself and every process it starts (the flag is
 inherited across exec). Return addresses then resolve after the processes

@@ -1,0 +1,1202 @@
+[
+ {
+  "transport": "tcp",
+  "size": 4096,
+  "mode": "get",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r132-getbase",
+    "mib_per_sec": 438.3009908540701,
+    "p99_us": 82.017,
+    "cpu_s_per_gib": 4.6674999999999995,
+    "en_s_per_gib": 0.0025,
+    "ps_s_per_gib": 2.32,
+    "client_s_per_gib": 2.3375,
+    "cycles_u_per_gib": 5329695142.0,
+    "cycles_k_per_gib": 9065971322.25
+   },
+   {
+    "trial": "tcp-p1-r134-getbase",
+    "mib_per_sec": 437.896192205945,
+    "p99_us": 81.695,
+    "cpu_s_per_gib": 4.665,
+    "en_s_per_gib": 0.0025,
+    "ps_s_per_gib": 2.3225,
+    "client_s_per_gib": 2.3375,
+    "cycles_u_per_gib": 5327613669.25,
+    "cycles_k_per_gib": 9071433852.75
+   },
+   {
+    "trial": "tcp-p1-r135-getbase",
+    "mib_per_sec": 438.7743249084894,
+    "p99_us": 80.275,
+    "cpu_s_per_gib": 4.665,
+    "en_s_per_gib": 0.005,
+    "ps_s_per_gib": 2.3274999999999997,
+    "client_s_per_gib": 2.33,
+    "cycles_u_per_gib": 5435485829.25,
+    "cycles_k_per_gib": 8970502800.75
+   }
+  ],
+  "mib_per_sec": 438.3009908540701,
+  "p99_us": 81.695,
+  "cpu_s_per_gib": 4.665,
+  "en_s_per_gib": 0.0025,
+  "ps_s_per_gib": 2.3225,
+  "client_s_per_gib": 2.3375,
+  "cycles_u_per_gib": 5329695142.0,
+  "cycles_k_per_gib": 9065971322.25
+ },
+ {
+  "transport": "tcp",
+  "size": 4096,
+  "mode": "get",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r131-getnew",
+    "mib_per_sec": 467.67457124099406,
+    "p99_us": 77.753,
+    "cpu_s_per_gib": 4.32,
+    "en_s_per_gib": 0.0025,
+    "ps_s_per_gib": 2.13,
+    "client_s_per_gib": 2.1875,
+    "cycles_u_per_gib": 3778893917.5,
+    "cycles_k_per_gib": 9464315141.5
+   },
+   {
+    "trial": "tcp-p1-r133-getnew",
+    "mib_per_sec": 469.3921328927825,
+    "p99_us": 77.179,
+    "cpu_s_per_gib": 4.3125,
+    "en_s_per_gib": 0.0025,
+    "ps_s_per_gib": 2.13,
+    "client_s_per_gib": 2.1775,
+    "cycles_u_per_gib": 3735939010.0,
+    "cycles_k_per_gib": 9492984028.0
+   },
+   {
+    "trial": "tcp-p1-r136-getnew",
+    "mib_per_sec": 467.57753150308866,
+    "p99_us": 78.758,
+    "cpu_s_per_gib": 4.32,
+    "en_s_per_gib": 0.0,
+    "ps_s_per_gib": 2.1325000000000003,
+    "client_s_per_gib": 2.185,
+    "cycles_u_per_gib": 3737436243.25,
+    "cycles_k_per_gib": 9531405876.5
+   }
+  ],
+  "mib_per_sec": 467.67457124099406,
+  "p99_us": 77.753,
+  "cpu_s_per_gib": 4.32,
+  "en_s_per_gib": 0.0025,
+  "ps_s_per_gib": 2.13,
+  "client_s_per_gib": 2.185,
+  "cycles_u_per_gib": 3737436243.25,
+  "cycles_k_per_gib": 9492984028.0
+ },
+ {
+  "transport": "tcp",
+  "size": 65536,
+  "mode": "get",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r132-getbase",
+    "mib_per_sec": 1086.5554429590961,
+    "p99_us": 570.859,
+    "cpu_s_per_gib": 1.86875,
+    "en_s_per_gib": 0.40625,
+    "ps_s_per_gib": 0.9025,
+    "client_s_per_gib": 0.5575,
+    "cycles_u_per_gib": 2649876579.25,
+    "cycles_k_per_gib": 3025011063.25
+   },
+   {
+    "trial": "tcp-p1-r134-getbase",
+    "mib_per_sec": 1107.8439468118556,
+    "p99_us": 578.563,
+    "cpu_s_per_gib": 1.83375,
+    "en_s_per_gib": 0.4025,
+    "ps_s_per_gib": 0.88625,
+    "client_s_per_gib": 0.54375,
+    "cycles_u_per_gib": 2579103125.5,
+    "cycles_k_per_gib": 2978000720.375
+   },
+   {
+    "trial": "tcp-p1-r135-getbase",
+    "mib_per_sec": 1051.5443208445076,
+    "p99_us": 731.822,
+    "cpu_s_per_gib": 1.89625,
+    "en_s_per_gib": 0.41125,
+    "ps_s_per_gib": 0.9199999999999999,
+    "client_s_per_gib": 0.5625,
+    "cycles_u_per_gib": 2671248854.5,
+    "cycles_k_per_gib": 3094391689.875
+   }
+  ],
+  "mib_per_sec": 1086.5554429590961,
+  "p99_us": 578.563,
+  "cpu_s_per_gib": 1.86875,
+  "en_s_per_gib": 0.40625,
+  "ps_s_per_gib": 0.9025,
+  "client_s_per_gib": 0.5575,
+  "cycles_u_per_gib": 2649876579.25,
+  "cycles_k_per_gib": 3025011063.25
+ },
+ {
+  "transport": "tcp",
+  "size": 65536,
+  "mode": "get",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r131-getnew",
+    "mib_per_sec": 1740.1694874566585,
+    "p99_us": 391.882,
+    "cpu_s_per_gib": 1.305,
+    "en_s_per_gib": 0.41874999999999996,
+    "ps_s_per_gib": 0.5375,
+    "client_s_per_gib": 0.34875,
+    "cycles_u_per_gib": 826208088.25,
+    "cycles_k_per_gib": 3122599814.0
+   },
+   {
+    "trial": "tcp-p1-r133-getnew",
+    "mib_per_sec": 1798.761547580342,
+    "p99_us": 393.495,
+    "cpu_s_per_gib": 1.28625,
+    "en_s_per_gib": 0.41750000000000004,
+    "ps_s_per_gib": 0.5325,
+    "client_s_per_gib": 0.33625,
+    "cycles_u_per_gib": 809319824.0,
+    "cycles_k_per_gib": 3083632731.125
+   },
+   {
+    "trial": "tcp-p1-r136-getnew",
+    "mib_per_sec": 1834.4617341022247,
+    "p99_us": 387.077,
+    "cpu_s_per_gib": 1.2837500000000002,
+    "en_s_per_gib": 0.41625,
+    "ps_s_per_gib": 0.53,
+    "client_s_per_gib": 0.3375,
+    "cycles_u_per_gib": 808903423.625,
+    "cycles_k_per_gib": 3073725080.0
+   }
+  ],
+  "mib_per_sec": 1798.761547580342,
+  "p99_us": 391.882,
+  "cpu_s_per_gib": 1.28625,
+  "en_s_per_gib": 0.41750000000000004,
+  "ps_s_per_gib": 0.5325,
+  "client_s_per_gib": 0.3375,
+  "cycles_u_per_gib": 809319824.0,
+  "cycles_k_per_gib": 3083632731.125
+ },
+ {
+  "transport": "tcp",
+  "size": 65536,
+  "mode": "read",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r132-getbase",
+    "mib_per_sec": 1829.315825772137,
+    "p99_us": 385.665,
+    "cpu_s_per_gib": 1.25625,
+    "en_s_per_gib": 0.41375,
+    "ps_s_per_gib": 0.53125,
+    "client_s_per_gib": 0.31,
+    "cycles_u_per_gib": 723231004.375,
+    "cycles_k_per_gib": 3071382281.875
+   },
+   {
+    "trial": "tcp-p1-r134-getbase",
+    "mib_per_sec": 1857.641843668794,
+    "p99_us": 379.381,
+    "cpu_s_per_gib": 1.2475,
+    "en_s_per_gib": 0.41250000000000003,
+    "ps_s_per_gib": 0.5275,
+    "client_s_per_gib": 0.30625,
+    "cycles_u_per_gib": 718955293.625,
+    "cycles_k_per_gib": 3034291173.75
+   },
+   {
+    "trial": "tcp-p1-r135-getbase",
+    "mib_per_sec": 1802.8825625976965,
+    "p99_us": 386.552,
+    "cpu_s_per_gib": 1.2674999999999998,
+    "en_s_per_gib": 0.43000000000000005,
+    "ps_s_per_gib": 0.5287499999999999,
+    "client_s_per_gib": 0.3075,
+    "cycles_u_per_gib": 727581325.75,
+    "cycles_k_per_gib": 3095761666.375
+   }
+  ],
+  "mib_per_sec": 1829.315825772137,
+  "p99_us": 385.665,
+  "cpu_s_per_gib": 1.25625,
+  "en_s_per_gib": 0.41375,
+  "ps_s_per_gib": 0.5287499999999999,
+  "client_s_per_gib": 0.3075,
+  "cycles_u_per_gib": 723231004.375,
+  "cycles_k_per_gib": 3071382281.875
+ },
+ {
+  "transport": "tcp",
+  "size": 65536,
+  "mode": "read",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r131-getnew",
+    "mib_per_sec": 1764.6052078397581,
+    "p99_us": 379.919,
+    "cpu_s_per_gib": 1.26625,
+    "en_s_per_gib": 0.41750000000000004,
+    "ps_s_per_gib": 0.53,
+    "client_s_per_gib": 0.31875,
+    "cycles_u_per_gib": 723383170.625,
+    "cycles_k_per_gib": 3089639293.25
+   },
+   {
+    "trial": "tcp-p1-r133-getnew",
+    "mib_per_sec": 1862.4494090978885,
+    "p99_us": 381.054,
+    "cpu_s_per_gib": 1.25,
+    "en_s_per_gib": 0.41375,
+    "ps_s_per_gib": 0.5275,
+    "client_s_per_gib": 0.30874999999999997,
+    "cycles_u_per_gib": 725999712.25,
+    "cycles_k_per_gib": 3048471719.0
+   },
+   {
+    "trial": "tcp-p1-r136-getnew",
+    "mib_per_sec": 1821.4260898927516,
+    "p99_us": 393.379,
+    "cpu_s_per_gib": 1.27,
+    "en_s_per_gib": 0.42625,
+    "ps_s_per_gib": 0.53375,
+    "client_s_per_gib": 0.30874999999999997,
+    "cycles_u_per_gib": 725604462.125,
+    "cycles_k_per_gib": 3097533846.5
+   }
+  ],
+  "mib_per_sec": 1821.4260898927516,
+  "p99_us": 381.054,
+  "cpu_s_per_gib": 1.26625,
+  "en_s_per_gib": 0.41750000000000004,
+  "ps_s_per_gib": 0.53,
+  "client_s_per_gib": 0.30874999999999997,
+  "cycles_u_per_gib": 725604462.125,
+  "cycles_k_per_gib": 3089639293.25
+ },
+ {
+  "transport": "tcp",
+  "size": 1048576,
+  "mode": "get",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r132-getbase",
+    "mib_per_sec": 822.4734670580349,
+    "p99_us": 10013.231,
+    "cpu_s_per_gib": 2.381875,
+    "en_s_per_gib": 0.366875,
+    "ps_s_per_gib": 0.769375,
+    "client_s_per_gib": 1.24375,
+    "cycles_u_per_gib": 2956028806.5625,
+    "cycles_k_per_gib": 4394924752.4375
+   },
+   {
+    "trial": "tcp-p1-r134-getbase",
+    "mib_per_sec": 826.1852079346434,
+    "p99_us": 9899.693,
+    "cpu_s_per_gib": 2.33875,
+    "en_s_per_gib": 0.33625,
+    "ps_s_per_gib": 0.761875,
+    "client_s_per_gib": 1.23875,
+    "cycles_u_per_gib": 2945384317.875,
+    "cycles_k_per_gib": 4273969928.875
+   },
+   {
+    "trial": "tcp-p1-r135-getbase",
+    "mib_per_sec": 814.4058066349829,
+    "p99_us": 10241.268,
+    "cpu_s_per_gib": 2.443125,
+    "en_s_per_gib": 0.393125,
+    "ps_s_per_gib": 0.791875,
+    "client_s_per_gib": 1.25625,
+    "cycles_u_per_gib": 2970891526.5625,
+    "cycles_k_per_gib": 4562971818.8125
+   }
+  ],
+  "mib_per_sec": 822.4734670580349,
+  "p99_us": 10013.231,
+  "cpu_s_per_gib": 2.381875,
+  "en_s_per_gib": 0.366875,
+  "ps_s_per_gib": 0.769375,
+  "client_s_per_gib": 1.24375,
+  "cycles_u_per_gib": 2956028806.5625,
+  "cycles_k_per_gib": 4394924752.4375
+ },
+ {
+  "transport": "tcp",
+  "size": 1048576,
+  "mode": "get",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r131-getnew",
+    "mib_per_sec": 3107.1104739999796,
+    "p99_us": 3749.995,
+    "cpu_s_per_gib": 0.8400000000000001,
+    "en_s_per_gib": 0.36625,
+    "ps_s_per_gib": 0.285625,
+    "client_s_per_gib": 0.186875,
+    "cycles_u_per_gib": 260519960.875,
+    "cycles_k_per_gib": 2327374872.3125
+   },
+   {
+    "trial": "tcp-p1-r133-getnew",
+    "mib_per_sec": 3169.8177255422106,
+    "p99_us": 3587.447,
+    "cpu_s_per_gib": 0.8043750000000001,
+    "en_s_per_gib": 0.32875,
+    "ps_s_per_gib": 0.28687500000000005,
+    "client_s_per_gib": 0.188125,
+    "cycles_u_per_gib": 260684370.75,
+    "cycles_k_per_gib": 2219022854.875
+   },
+   {
+    "trial": "tcp-p1-r136-getnew",
+    "mib_per_sec": 3169.5426856598087,
+    "p99_us": 3632.669,
+    "cpu_s_per_gib": 0.8206249999999999,
+    "en_s_per_gib": 0.345,
+    "ps_s_per_gib": 0.28625,
+    "client_s_per_gib": 0.189375,
+    "cycles_u_per_gib": 264745761.375,
+    "cycles_k_per_gib": 2264642355.375
+   }
+  ],
+  "mib_per_sec": 3169.5426856598087,
+  "p99_us": 3632.669,
+  "cpu_s_per_gib": 0.8206249999999999,
+  "en_s_per_gib": 0.345,
+  "ps_s_per_gib": 0.28625,
+  "client_s_per_gib": 0.188125,
+  "cycles_u_per_gib": 260684370.75,
+  "cycles_k_per_gib": 2264642355.375
+ },
+ {
+  "transport": "tcp",
+  "size": 8388608,
+  "mode": "get",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r132-getbase",
+    "mib_per_sec": 642.991624526259,
+    "p99_us": 122768.109,
+    "cpu_s_per_gib": 2.9159375,
+    "en_s_per_gib": 0.4425,
+    "ps_s_per_gib": 0.879375,
+    "client_s_per_gib": 1.5915625,
+    "cycles_u_per_gib": 3110955253.15625,
+    "cycles_k_per_gib": 5869620648.5625
+   },
+   {
+    "trial": "tcp-p1-r134-getbase",
+    "mib_per_sec": 638.6040497636777,
+    "p99_us": 112306.288,
+    "cpu_s_per_gib": 2.9353125,
+    "en_s_per_gib": 0.4396875,
+    "ps_s_per_gib": 0.890625,
+    "client_s_per_gib": 1.6021875,
+    "cycles_u_per_gib": 3154772897.65625,
+    "cycles_k_per_gib": 5882959352.0625
+   },
+   {
+    "trial": "tcp-p1-r135-getbase",
+    "mib_per_sec": 612.559544889424,
+    "p99_us": 125205.124,
+    "cpu_s_per_gib": 3.03875,
+    "en_s_per_gib": 0.4509375,
+    "ps_s_per_gib": 0.9140625,
+    "client_s_per_gib": 1.6703124999999999,
+    "cycles_u_per_gib": 3232000206.53125,
+    "cycles_k_per_gib": 6123764206.34375
+   }
+  ],
+  "mib_per_sec": 638.6040497636777,
+  "p99_us": 122768.109,
+  "cpu_s_per_gib": 2.9353125,
+  "en_s_per_gib": 0.4425,
+  "ps_s_per_gib": 0.890625,
+  "client_s_per_gib": 1.6021875,
+  "cycles_u_per_gib": 3154772897.65625,
+  "cycles_k_per_gib": 5882959352.0625
+ },
+ {
+  "transport": "tcp",
+  "size": 8388608,
+  "mode": "get",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r131-getnew",
+    "mib_per_sec": 2464.15995473734,
+    "p99_us": 35689.206,
+    "cpu_s_per_gib": 1.0609375,
+    "en_s_per_gib": 0.48624999999999996,
+    "ps_s_per_gib": 0.358125,
+    "client_s_per_gib": 0.2159375,
+    "cycles_u_per_gib": 274249598.28125,
+    "cycles_k_per_gib": 2974881941.25
+   },
+   {
+    "trial": "tcp-p1-r133-getnew",
+    "mib_per_sec": 2650.1351707032327,
+    "p99_us": 34232.922,
+    "cpu_s_per_gib": 1.00625,
+    "en_s_per_gib": 0.4665625,
+    "ps_s_per_gib": 0.33093750000000005,
+    "client_s_per_gib": 0.2084375,
+    "cycles_u_per_gib": 270769898.0,
+    "cycles_k_per_gib": 2818318873.25
+   },
+   {
+    "trial": "tcp-p1-r136-getnew",
+    "mib_per_sec": 2625.087845170422,
+    "p99_us": 35426.69,
+    "cpu_s_per_gib": 1.0159375,
+    "en_s_per_gib": 0.4703125,
+    "ps_s_per_gib": 0.335,
+    "client_s_per_gib": 0.20968750000000003,
+    "cycles_u_per_gib": 272124729.90625,
+    "cycles_k_per_gib": 2844056814.78125
+   }
+  ],
+  "mib_per_sec": 2625.087845170422,
+  "p99_us": 35426.69,
+  "cpu_s_per_gib": 1.0159375,
+  "en_s_per_gib": 0.4703125,
+  "ps_s_per_gib": 0.335,
+  "client_s_per_gib": 0.20968750000000003,
+  "cycles_u_per_gib": 272124729.90625,
+  "cycles_k_per_gib": 2844056814.78125
+ },
+ {
+  "transport": "tcp",
+  "size": 8388608,
+  "mode": "read",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r132-getbase",
+    "mib_per_sec": 2699.177163230589,
+    "p99_us": 33749.813,
+    "cpu_s_per_gib": 0.9559375,
+    "en_s_per_gib": 0.46375,
+    "ps_s_per_gib": 0.3278125,
+    "client_s_per_gib": 0.16375,
+    "cycles_u_per_gib": 54709271.40625,
+    "cycles_k_per_gib": 2859501027.625
+   },
+   {
+    "trial": "tcp-p1-r134-getbase",
+    "mib_per_sec": 2742.5966907543757,
+    "p99_us": 34038.665,
+    "cpu_s_per_gib": 0.9384374999999999,
+    "en_s_per_gib": 0.45718749999999997,
+    "ps_s_per_gib": 0.31875,
+    "client_s_per_gib": 0.16125,
+    "cycles_u_per_gib": 53882092.53125,
+    "cycles_k_per_gib": 2806700052.8125
+   },
+   {
+    "trial": "tcp-p1-r135-getbase",
+    "mib_per_sec": 2513.5049415071076,
+    "p99_us": 36054.471,
+    "cpu_s_per_gib": 1.00125,
+    "en_s_per_gib": 0.4809375,
+    "ps_s_per_gib": 0.3515625,
+    "client_s_per_gib": 0.1684375,
+    "cycles_u_per_gib": 55191320.875,
+    "cycles_k_per_gib": 2986798268.78125
+   }
+  ],
+  "mib_per_sec": 2699.177163230589,
+  "p99_us": 34038.665,
+  "cpu_s_per_gib": 0.9559375,
+  "en_s_per_gib": 0.46375,
+  "ps_s_per_gib": 0.3278125,
+  "client_s_per_gib": 0.16375,
+  "cycles_u_per_gib": 54709271.40625,
+  "cycles_k_per_gib": 2859501027.625
+ },
+ {
+  "transport": "tcp",
+  "size": 8388608,
+  "mode": "read",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "tcp-p1-r131-getnew",
+    "mib_per_sec": 2533.04469355015,
+    "p99_us": 35496.96,
+    "cpu_s_per_gib": 0.9924999999999999,
+    "en_s_per_gib": 0.4759375,
+    "ps_s_per_gib": 0.3471875,
+    "client_s_per_gib": 0.16875,
+    "cycles_u_per_gib": 55108749.0625,
+    "cycles_k_per_gib": 2963885394.84375
+   },
+   {
+    "trial": "tcp-p1-r133-getnew",
+    "mib_per_sec": 2740.8912609311624,
+    "p99_us": 33195.684,
+    "cpu_s_per_gib": 0.9362499999999999,
+    "en_s_per_gib": 0.45593749999999994,
+    "ps_s_per_gib": 0.3184375,
+    "client_s_per_gib": 0.16125,
+    "cycles_u_per_gib": 53228084.3125,
+    "cycles_k_per_gib": 2804189892.65625
+   },
+   {
+    "trial": "tcp-p1-r136-getnew",
+    "mib_per_sec": 2714.176724877871,
+    "p99_us": 33989.277,
+    "cpu_s_per_gib": 0.9440625,
+    "en_s_per_gib": 0.4596875,
+    "ps_s_per_gib": 0.3221875,
+    "client_s_per_gib": 0.161875,
+    "cycles_u_per_gib": 54026224.96875,
+    "cycles_k_per_gib": 2824535087.09375
+   }
+  ],
+  "mib_per_sec": 2714.176724877871,
+  "p99_us": 33989.277,
+  "cpu_s_per_gib": 0.9440625,
+  "en_s_per_gib": 0.4596875,
+  "ps_s_per_gib": 0.3221875,
+  "client_s_per_gib": 0.161875,
+  "cycles_u_per_gib": 54026224.96875,
+  "cycles_k_per_gib": 2824535087.09375
+ },
+ {
+  "transport": "ucx",
+  "size": 4096,
+  "mode": "get",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r132-getbase",
+    "mib_per_sec": 387.3675802770327,
+    "p99_us": 100.624,
+    "cpu_s_per_gib": 3.8175,
+    "en_s_per_gib": 0.0025,
+    "ps_s_per_gib": 2.0025,
+    "client_s_per_gib": 1.81,
+    "cycles_u_per_gib": 5941128133.0,
+    "cycles_k_per_gib": 3694652354.75
+   },
+   {
+    "trial": "ucx-p1-r134-getbase",
+    "mib_per_sec": 379.66168246813015,
+    "p99_us": 102.848,
+    "cpu_s_per_gib": 3.8724999999999996,
+    "en_s_per_gib": 0.0025,
+    "ps_s_per_gib": 2.0275,
+    "client_s_per_gib": 1.835,
+    "cycles_u_per_gib": 6035649212.25,
+    "cycles_k_per_gib": 3882777971.75
+   },
+   {
+    "trial": "ucx-p1-r135-getbase",
+    "mib_per_sec": 387.44112143661954,
+    "p99_us": 100.864,
+    "cpu_s_per_gib": 3.805,
+    "en_s_per_gib": 0.0,
+    "ps_s_per_gib": 1.9700000000000002,
+    "client_s_per_gib": 1.8275,
+    "cycles_u_per_gib": 5964143041.25,
+    "cycles_k_per_gib": 3777034435.75
+   }
+  ],
+  "mib_per_sec": 387.3675802770327,
+  "p99_us": 100.864,
+  "cpu_s_per_gib": 3.8175,
+  "en_s_per_gib": 0.0025,
+  "ps_s_per_gib": 2.0025,
+  "client_s_per_gib": 1.8275,
+  "cycles_u_per_gib": 5964143041.25,
+  "cycles_k_per_gib": 3777034435.75
+ },
+ {
+  "transport": "ucx",
+  "size": 4096,
+  "mode": "get",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r131-getnew",
+    "mib_per_sec": 518.384161436127,
+    "p99_us": 82.968,
+    "cpu_s_per_gib": 3.145,
+    "en_s_per_gib": 0.0,
+    "ps_s_per_gib": 1.6875,
+    "client_s_per_gib": 1.455,
+    "cycles_u_per_gib": 4421680639.5,
+    "cycles_k_per_gib": 3472422782.25
+   },
+   {
+    "trial": "ucx-p1-r133-getnew",
+    "mib_per_sec": 515.0615038173418,
+    "p99_us": 83.377,
+    "cpu_s_per_gib": 3.1675,
+    "en_s_per_gib": 0.0025,
+    "ps_s_per_gib": 1.7025000000000001,
+    "client_s_per_gib": 1.46,
+    "cycles_u_per_gib": 4403542633.0,
+    "cycles_k_per_gib": 3383876090.25
+   },
+   {
+    "trial": "ucx-p1-r136-getnew",
+    "mib_per_sec": 498.6049340703606,
+    "p99_us": 85.904,
+    "cpu_s_per_gib": 3.255,
+    "en_s_per_gib": 0.0075,
+    "ps_s_per_gib": 1.705,
+    "client_s_per_gib": 1.535,
+    "cycles_u_per_gib": 4460486293.0,
+    "cycles_k_per_gib": 3522624363.0
+   }
+  ],
+  "mib_per_sec": 515.0615038173418,
+  "p99_us": 83.377,
+  "cpu_s_per_gib": 3.1675,
+  "en_s_per_gib": 0.0025,
+  "ps_s_per_gib": 1.7025000000000001,
+  "client_s_per_gib": 1.46,
+  "cycles_u_per_gib": 4421680639.5,
+  "cycles_k_per_gib": 3472422782.25
+ },
+ {
+  "transport": "ucx",
+  "size": 65536,
+  "mode": "get",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r132-getbase",
+    "mib_per_sec": 1409.3064216358348,
+    "p99_us": 514.36,
+    "cpu_s_per_gib": 1.53375,
+    "en_s_per_gib": 0.38125,
+    "ps_s_per_gib": 0.7012499999999999,
+    "client_s_per_gib": 0.45125,
+    "cycles_u_per_gib": 3129574431.375,
+    "cycles_k_per_gib": 1506183948.0
+   },
+   {
+    "trial": "ucx-p1-r134-getbase",
+    "mib_per_sec": 1390.291230705681,
+    "p99_us": 493.866,
+    "cpu_s_per_gib": 1.5262499999999999,
+    "en_s_per_gib": 0.37124999999999997,
+    "ps_s_per_gib": 0.705,
+    "client_s_per_gib": 0.45,
+    "cycles_u_per_gib": 3144410770.875,
+    "cycles_k_per_gib": 1444808920.0
+   },
+   {
+    "trial": "ucx-p1-r135-getbase",
+    "mib_per_sec": 1412.8693024101435,
+    "p99_us": 506.964,
+    "cpu_s_per_gib": 1.5474999999999999,
+    "en_s_per_gib": 0.39249999999999996,
+    "ps_s_per_gib": 0.7,
+    "client_s_per_gib": 0.455,
+    "cycles_u_per_gib": 3178281723.5,
+    "cycles_k_per_gib": 1483534022.875
+   }
+  ],
+  "mib_per_sec": 1409.3064216358348,
+  "p99_us": 506.964,
+  "cpu_s_per_gib": 1.53375,
+  "en_s_per_gib": 0.38125,
+  "ps_s_per_gib": 0.7012499999999999,
+  "client_s_per_gib": 0.45125,
+  "cycles_u_per_gib": 3144410770.875,
+  "cycles_k_per_gib": 1483534022.875
+ },
+ {
+  "transport": "ucx",
+  "size": 65536,
+  "mode": "get",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r131-getnew",
+    "mib_per_sec": 2819.3060307596,
+    "p99_us": 294.563,
+    "cpu_s_per_gib": 0.98375,
+    "en_s_per_gib": 0.41500000000000004,
+    "ps_s_per_gib": 0.34375,
+    "client_s_per_gib": 0.22375,
+    "cycles_u_per_gib": 1451473208.0,
+    "cycles_k_per_gib": 1376012104.875
+   },
+   {
+    "trial": "ucx-p1-r133-getnew",
+    "mib_per_sec": 2582.870994958601,
+    "p99_us": 297.685,
+    "cpu_s_per_gib": 0.9525,
+    "en_s_per_gib": 0.37749999999999995,
+    "ps_s_per_gib": 0.34,
+    "client_s_per_gib": 0.235,
+    "cycles_u_per_gib": 1410025286.75,
+    "cycles_k_per_gib": 1338239501.0
+   },
+   {
+    "trial": "ucx-p1-r136-getnew",
+    "mib_per_sec": 2575.9727480849615,
+    "p99_us": 303.613,
+    "cpu_s_per_gib": 0.9562499999999999,
+    "en_s_per_gib": 0.39375000000000004,
+    "ps_s_per_gib": 0.33875,
+    "client_s_per_gib": 0.22249999999999998,
+    "cycles_u_per_gib": 1420892577.0,
+    "cycles_k_per_gib": 1365827154.75
+   }
+  ],
+  "mib_per_sec": 2582.870994958601,
+  "p99_us": 297.685,
+  "cpu_s_per_gib": 0.9562499999999999,
+  "en_s_per_gib": 0.39375000000000004,
+  "ps_s_per_gib": 0.34,
+  "client_s_per_gib": 0.22375,
+  "cycles_u_per_gib": 1420892577.0,
+  "cycles_k_per_gib": 1365827154.75
+ },
+ {
+  "transport": "ucx",
+  "size": 65536,
+  "mode": "read",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r132-getbase",
+    "mib_per_sec": 2807.8593070598495,
+    "p99_us": 297.566,
+    "cpu_s_per_gib": 0.90875,
+    "en_s_per_gib": 0.37875,
+    "ps_s_per_gib": 0.3375,
+    "client_s_per_gib": 0.1925,
+    "cycles_u_per_gib": 1298876790.125,
+    "cycles_k_per_gib": 1308874577.875
+   },
+   {
+    "trial": "ucx-p1-r134-getbase",
+    "mib_per_sec": 2508.6631392866284,
+    "p99_us": 335.924,
+    "cpu_s_per_gib": 0.92875,
+    "en_s_per_gib": 0.37375,
+    "ps_s_per_gib": 0.36124999999999996,
+    "client_s_per_gib": 0.19125,
+    "cycles_u_per_gib": 1362174079.125,
+    "cycles_k_per_gib": 1330898907.0
+   },
+   {
+    "trial": "ucx-p1-r135-getbase",
+    "mib_per_sec": 2689.424340814379,
+    "p99_us": 302.985,
+    "cpu_s_per_gib": 0.9425,
+    "en_s_per_gib": 0.4125,
+    "ps_s_per_gib": 0.33625,
+    "client_s_per_gib": 0.19375,
+    "cycles_u_per_gib": 1324518830.625,
+    "cycles_k_per_gib": 1438406508.25
+   }
+  ],
+  "mib_per_sec": 2689.424340814379,
+  "p99_us": 302.985,
+  "cpu_s_per_gib": 0.92875,
+  "en_s_per_gib": 0.37875,
+  "ps_s_per_gib": 0.3375,
+  "client_s_per_gib": 0.1925,
+  "cycles_u_per_gib": 1324518830.625,
+  "cycles_k_per_gib": 1330898907.0
+ },
+ {
+  "transport": "ucx",
+  "size": 65536,
+  "mode": "read",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r131-getnew",
+    "mib_per_sec": 2699.7255681833385,
+    "p99_us": 303.465,
+    "cpu_s_per_gib": 0.93,
+    "en_s_per_gib": 0.39,
+    "ps_s_per_gib": 0.33625,
+    "client_s_per_gib": 0.20375000000000001,
+    "cycles_u_per_gib": 1317582796.625,
+    "cycles_k_per_gib": 1334150378.25
+   },
+   {
+    "trial": "ucx-p1-r133-getnew",
+    "mib_per_sec": 2665.012833614591,
+    "p99_us": 301.805,
+    "cpu_s_per_gib": 0.90375,
+    "en_s_per_gib": 0.36875,
+    "ps_s_per_gib": 0.34125,
+    "client_s_per_gib": 0.1925,
+    "cycles_u_per_gib": 1299584608.0,
+    "cycles_k_per_gib": 1301381258.25
+   },
+   {
+    "trial": "ucx-p1-r136-getnew",
+    "mib_per_sec": 2638.528783328342,
+    "p99_us": 308.576,
+    "cpu_s_per_gib": 0.91125,
+    "en_s_per_gib": 0.395,
+    "ps_s_per_gib": 0.3325,
+    "client_s_per_gib": 0.18375,
+    "cycles_u_per_gib": 1299554251.875,
+    "cycles_k_per_gib": 1403615894.875
+   }
+  ],
+  "mib_per_sec": 2665.012833614591,
+  "p99_us": 303.465,
+  "cpu_s_per_gib": 0.91125,
+  "en_s_per_gib": 0.39,
+  "ps_s_per_gib": 0.33625,
+  "client_s_per_gib": 0.1925,
+  "cycles_u_per_gib": 1299584608.0,
+  "cycles_k_per_gib": 1334150378.25
+ },
+ {
+  "transport": "ucx",
+  "size": 1048576,
+  "mode": "get",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r132-getbase",
+    "mib_per_sec": 1116.609114514046,
+    "p99_us": 12532.202,
+    "cpu_s_per_gib": 1.806875,
+    "en_s_per_gib": 0.358125,
+    "ps_s_per_gib": 0.673125,
+    "client_s_per_gib": 0.774375,
+    "cycles_u_per_gib": 3604242252.6875,
+    "cycles_k_per_gib": 1845176426.25
+   },
+   {
+    "trial": "ucx-p1-r134-getbase",
+    "mib_per_sec": 1111.6384489728355,
+    "p99_us": 12729.966,
+    "cpu_s_per_gib": 1.8231249999999999,
+    "en_s_per_gib": 0.3625,
+    "ps_s_per_gib": 0.679375,
+    "client_s_per_gib": 0.78,
+    "cycles_u_per_gib": 3645597882.8125,
+    "cycles_k_per_gib": 1850683782.0625
+   },
+   {
+    "trial": "ucx-p1-r135-getbase",
+    "mib_per_sec": 1221.6896577364744,
+    "p99_us": 9687.941,
+    "cpu_s_per_gib": 1.7674999999999998,
+    "en_s_per_gib": 0.36,
+    "ps_s_per_gib": 0.6699999999999999,
+    "client_s_per_gib": 0.735625,
+    "cycles_u_per_gib": 3560552588.125,
+    "cycles_k_per_gib": 1763216364.125
+   }
+  ],
+  "mib_per_sec": 1116.609114514046,
+  "p99_us": 12532.202,
+  "cpu_s_per_gib": 1.806875,
+  "en_s_per_gib": 0.36,
+  "ps_s_per_gib": 0.673125,
+  "client_s_per_gib": 0.774375,
+  "cycles_u_per_gib": 3604242252.6875,
+  "cycles_k_per_gib": 1845176426.25
+ },
+ {
+  "transport": "ucx",
+  "size": 1048576,
+  "mode": "get",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r131-getnew",
+    "mib_per_sec": 4509.262144717929,
+    "p99_us": 3047.314,
+    "cpu_s_per_gib": 0.67875,
+    "en_s_per_gib": 0.33999999999999997,
+    "ps_s_per_gib": 0.168125,
+    "client_s_per_gib": 0.17,
+    "cycles_u_per_gib": 1050125900.8125,
+    "cycles_k_per_gib": 933091185.3125
+   },
+   {
+    "trial": "ucx-p1-r133-getnew",
+    "mib_per_sec": 4509.248477020661,
+    "p99_us": 3041.581,
+    "cpu_s_per_gib": 0.684375,
+    "en_s_per_gib": 0.345,
+    "ps_s_per_gib": 0.16874999999999998,
+    "client_s_per_gib": 0.16999999999999998,
+    "cycles_u_per_gib": 1056275795.0,
+    "cycles_k_per_gib": 940889279.8125
+   },
+   {
+    "trial": "ucx-p1-r136-getnew",
+    "mib_per_sec": 4392.326923779691,
+    "p99_us": 3159.54,
+    "cpu_s_per_gib": 0.6956249999999999,
+    "en_s_per_gib": 0.351875,
+    "ps_s_per_gib": 0.170625,
+    "client_s_per_gib": 0.1725,
+    "cycles_u_per_gib": 1067703492.375,
+    "cycles_k_per_gib": 977708924.375
+   }
+  ],
+  "mib_per_sec": 4509.248477020661,
+  "p99_us": 3047.314,
+  "cpu_s_per_gib": 0.684375,
+  "en_s_per_gib": 0.345,
+  "ps_s_per_gib": 0.16874999999999998,
+  "client_s_per_gib": 0.17,
+  "cycles_u_per_gib": 1056275795.0,
+  "cycles_k_per_gib": 940889279.8125
+ },
+ {
+  "transport": "ucx",
+  "size": 8388608,
+  "mode": "get",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r132-getbase",
+    "mib_per_sec": 744.4939500153696,
+    "p99_us": 172298.045,
+    "cpu_s_per_gib": 2.57375,
+    "en_s_per_gib": 0.411875,
+    "ps_s_per_gib": 0.870625,
+    "client_s_per_gib": 1.28875,
+    "cycles_u_per_gib": 4702248266.90625,
+    "cycles_k_per_gib": 3076257019.21875
+   },
+   {
+    "trial": "ucx-p1-r134-getbase",
+    "mib_per_sec": 981.7885360764013,
+    "p99_us": 168233.078,
+    "cpu_s_per_gib": 1.9346875000000001,
+    "en_s_per_gib": 0.4246875,
+    "ps_s_per_gib": 0.8815625,
+    "client_s_per_gib": 0.6265625,
+    "cycles_u_per_gib": 4310457860.59375,
+    "cycles_k_per_gib": 1486996965.46875
+   },
+   {
+    "trial": "ucx-p1-r135-getbase",
+    "mib_per_sec": 863.9096614222824,
+    "p99_us": 149221.503,
+    "cpu_s_per_gib": 2.39,
+    "en_s_per_gib": 0.4240625,
+    "ps_s_per_gib": 0.8606250000000001,
+    "client_s_per_gib": 1.103125,
+    "cycles_u_per_gib": 4574298054.375,
+    "cycles_k_per_gib": 2627332038.09375
+   }
+  ],
+  "mib_per_sec": 863.9096614222824,
+  "p99_us": 168233.078,
+  "cpu_s_per_gib": 2.39,
+  "en_s_per_gib": 0.4240625,
+  "ps_s_per_gib": 0.870625,
+  "client_s_per_gib": 1.103125,
+  "cycles_u_per_gib": 4574298054.375,
+  "cycles_k_per_gib": 2627332038.09375
+ },
+ {
+  "transport": "ucx",
+  "size": 8388608,
+  "mode": "get",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r131-getnew",
+    "mib_per_sec": 3356.542409831504,
+    "p99_us": 30835.53,
+    "cpu_s_per_gib": 0.8553125,
+    "en_s_per_gib": 0.4134375,
+    "ps_s_per_gib": 0.2078125,
+    "client_s_per_gib": 0.23375,
+    "cycles_u_per_gib": 1423745481.59375,
+    "cycles_k_per_gib": 1062317469.75
+   },
+   {
+    "trial": "ucx-p1-r133-getnew",
+    "mib_per_sec": 3215.896216137226,
+    "p99_us": 31210.96,
+    "cpu_s_per_gib": 0.8778125,
+    "en_s_per_gib": 0.4184375,
+    "ps_s_per_gib": 0.2121875,
+    "client_s_per_gib": 0.2465625,
+    "cycles_u_per_gib": 1467124399.03125,
+    "cycles_k_per_gib": 1066987703.21875
+   },
+   {
+    "trial": "ucx-p1-r136-getnew",
+    "mib_per_sec": 3243.598536409547,
+    "p99_us": 30353.468,
+    "cpu_s_per_gib": 0.8840625000000001,
+    "en_s_per_gib": 0.42625,
+    "ps_s_per_gib": 0.2121875,
+    "client_s_per_gib": 0.24531250000000002,
+    "cycles_u_per_gib": 1471238941.375,
+    "cycles_k_per_gib": 1076306345.09375
+   }
+  ],
+  "mib_per_sec": 3243.598536409547,
+  "p99_us": 30835.53,
+  "cpu_s_per_gib": 0.8778125,
+  "en_s_per_gib": 0.4184375,
+  "ps_s_per_gib": 0.2121875,
+  "client_s_per_gib": 0.24531250000000002,
+  "cycles_u_per_gib": 1467124399.03125,
+  "cycles_k_per_gib": 1066987703.21875
+ },
+ {
+  "transport": "ucx",
+  "size": 8388608,
+  "mode": "read",
+  "version": "getbase",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r132-getbase",
+    "mib_per_sec": 3456.0828963893237,
+    "p99_us": 31243.687,
+    "cpu_s_per_gib": 0.7515625,
+    "en_s_per_gib": 0.39937500000000004,
+    "ps_s_per_gib": 0.2040625,
+    "client_s_per_gib": 0.1475,
+    "cycles_u_per_gib": 1132495474.46875,
+    "cycles_k_per_gib": 1021633014.5625
+   },
+   {
+    "trial": "ucx-p1-r134-getbase",
+    "mib_per_sec": 3401.7079461105704,
+    "p99_us": 32163.805,
+    "cpu_s_per_gib": 0.7646875,
+    "en_s_per_gib": 0.40625,
+    "ps_s_per_gib": 0.20625,
+    "client_s_per_gib": 0.1515625,
+    "cycles_u_per_gib": 1154418483.375,
+    "cycles_k_per_gib": 1042256781.9375
+   },
+   {
+    "trial": "ucx-p1-r135-getbase",
+    "mib_per_sec": 3447.1266861058484,
+    "p99_us": 31855.277,
+    "cpu_s_per_gib": 0.76,
+    "en_s_per_gib": 0.404375,
+    "ps_s_per_gib": 0.205,
+    "client_s_per_gib": 0.15000000000000002,
+    "cycles_u_per_gib": 1136317307.125,
+    "cycles_k_per_gib": 1039863918.71875
+   }
+  ],
+  "mib_per_sec": 3447.1266861058484,
+  "p99_us": 31855.277,
+  "cpu_s_per_gib": 0.76,
+  "en_s_per_gib": 0.404375,
+  "ps_s_per_gib": 0.205,
+  "client_s_per_gib": 0.15000000000000002,
+  "cycles_u_per_gib": 1136317307.125,
+  "cycles_k_per_gib": 1039863918.71875
+ },
+ {
+  "transport": "ucx",
+  "size": 8388608,
+  "mode": "read",
+  "version": "getnew",
+  "n": 3,
+  "samples": [
+   {
+    "trial": "ucx-p1-r131-getnew",
+    "mib_per_sec": 3473.6748109405494,
+    "p99_us": 30612.993,
+    "cpu_s_per_gib": 0.73,
+    "en_s_per_gib": 0.37875000000000003,
+    "ps_s_per_gib": 0.204375,
+    "client_s_per_gib": 0.14625,
+    "cycles_u_per_gib": 1136147546.71875,
+    "cycles_k_per_gib": 995732873.1875
+   },
+   {
+    "trial": "ucx-p1-r133-getnew",
+    "mib_per_sec": 3347.043305716849,
+    "p99_us": 32347.636,
+    "cpu_s_per_gib": 0.758125,
+    "en_s_per_gib": 0.3953125,
+    "ps_s_per_gib": 0.20875000000000002,
+    "client_s_per_gib": 0.1534375,
+    "cycles_u_per_gib": 1171883553.53125,
+    "cycles_k_per_gib": 1032473296.65625
+   },
+   {
+    "trial": "ucx-p1-r136-getnew",
+    "mib_per_sec": 3358.4868701133455,
+    "p99_us": 31941.047,
+    "cpu_s_per_gib": 0.771875,
+    "en_s_per_gib": 0.4084375,
+    "ps_s_per_gib": 0.206875,
+    "client_s_per_gib": 0.15562499999999999,
+    "cycles_u_per_gib": 1166677842.5,
+    "cycles_k_per_gib": 1049686107.46875
+   }
+  ],
+  "mib_per_sec": 3358.4868701133455,
+  "p99_us": 31941.047,
+  "cpu_s_per_gib": 0.758125,
+  "en_s_per_gib": 0.3953125,
+  "ps_s_per_gib": 0.206875,
+  "client_s_per_gib": 0.1534375,
+  "cycles_u_per_gib": 1166677842.5,
+  "cycles_k_per_gib": 1032473296.65625
+ }
+]
