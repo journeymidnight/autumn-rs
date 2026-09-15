@@ -29,7 +29,7 @@ pub use autumn_transport::{regpool_acquire, PooledBuf};
 /// `ValueBuf` docs): staging into a pool slab only pays off on a UCX runtime.
 pub use autumn_transport::runtime_transport_is_ucx;
 pub use error::{Result, RpcError, StatusCode};
-pub use frame::{Frame, FrameDecoder, HEADER_LEN};
+pub use frame::{Frame, FrameDecoder, ReadWindow, HEADER_LEN};
 
 /// Handler result type for RPC dispatch.
 pub type HandlerResult = std::result::Result<bytes::Bytes, (StatusCode, String)>;

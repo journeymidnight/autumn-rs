@@ -1,5 +1,6 @@
 //! Fixed-work benchmark with an external measurement barrier.
-//! controlled_path MANAGER tcp|ucx SIZE OPS DEPTH PARTITIONS load|read|write
+//! controlled_path MANAGER tcp|ucx SIZE OPS DEPTH PARTITIONS load|read|direct|write
+//! `read` goes through the partition server; `direct` reads large values from an extent node.
 use autumn_client::{alloc_value_buf, bulk_worthwhile, fan_out, ClusterClient};
 use futures::StreamExt;
 use std::{
@@ -25,6 +26,7 @@ async fn batch(
     count: usize,
     depth: usize,
     write: bool,
+    direct: bool,
     verify: bool,
 ) -> Vec<u64> {
     let requests = (0..count).map(|i| async move {
@@ -35,6 +37,12 @@ async fn batch(
                 client.put_bulk(key, value.clone()).await.unwrap();
             } else {
                 client.put(key, value).await.unwrap();
+            }
+        } else if direct && bulk_worthwhile(value.len()) {
+            let got = client.get_direct(key).await.unwrap().expect("missing key");
+            assert_eq!(got.len(), value.len());
+            if verify {
+                assert_eq!(&got[..], value.as_ref());
             }
         } else if bulk_worthwhile(value.len()) {
             let got = client.get_pooled(key).await.unwrap().expect("missing key");
@@ -92,7 +100,10 @@ fn main() {
     let partitions: usize = args[5].parse().unwrap();
     let mode = args[6].clone();
     assert!(size > 0 && count > 0 && depth > 0 && matches!(partitions, 1 | 4));
-    assert!(matches!(mode.as_str(), "load" | "read" | "write"));
+    assert!(matches!(
+        mode.as_str(),
+        "load" | "read" | "direct" | "write"
+    ));
     autumn_transport::init_with(match args[1].as_str() {
         "tcp" => autumn_transport::TransportKind::Tcp,
         "ucx" => autumn_transport::TransportKind::Ucx,
@@ -128,18 +139,20 @@ fn main() {
                 }
                 let value = buf.freeze();
                 if mode == "load" {
-                    batch(&client, &keys, &value, KEYS, depth, true, false).await;
-                    batch(&client, &keys, &value, KEYS, depth, false, true).await;
+                    batch(&client, &keys, &value, KEYS, depth, true, false, false).await;
+                    batch(&client, &keys, &value, KEYS, depth, false, false, true).await;
                 } else {
                     // Fixed warmup work and byte verification outside timing.
-                    batch(&client, &keys, &value, KEYS, depth, mode == "write", true).await;
+                    let (write, direct) = (mode == "write", mode == "direct");
+                    batch(&client, &keys, &value, KEYS, depth, write, direct, true).await;
                 }
                 ready.wait();
                 start.wait();
                 let latencies = if mode == "load" {
                     vec![]
                 } else {
-                    batch(&client, &keys, &value, count, depth, mode == "write", false).await
+                    let (write, direct) = (mode == "write", mode == "direct");
+                    batch(&client, &keys, &value, count, depth, write, direct, false).await
                 };
                 tx.send((part, latencies)).unwrap();
                 done.wait();

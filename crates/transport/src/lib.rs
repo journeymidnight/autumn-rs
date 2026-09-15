@@ -451,8 +451,8 @@ impl compio::io::AsyncRead for ReadHalf {
 }
 
 impl ReadHalf {
-    /// zero-copy recv into a pre-registered buffer (UCX only). Single
-    /// recv (may be partial). See `UcxReadHalf::recv_registered`.
+    /// recv into a pre-registered buffer (UCX only); Stream unpacks into it.
+    /// Single recv (may be partial). See `UcxReadHalf::recv_registered`.
     #[cfg(feature = "ucx")]
     pub async fn recv_registered(
         &mut self,
@@ -468,8 +468,9 @@ impl ReadHalf {
         }
     }
 
-    /// recv-into seam (UCX). `Some(reg)` → zero-copy receive via memh;
-    /// `None` (regpool over-cap fallback) → UCX recv into the slice (copy-out).
+    /// recv-into seam (UCX). `Some(reg)` → receive naming the slab's memh;
+    /// `None` (regpool over-cap fallback) → plain receive. Both are one UCX
+    /// Stream unpack into the slice.
     /// Single recv (may be partial); caller loops for read_exact semantics.
     /// TCP errors — the autumn-rpc read_loop handles TCP bulk recvs via
     /// `read_exact_into_pooled` / the normal decode + memcpy path, never this

@@ -428,12 +428,12 @@ impl compio::io::AsyncRead for UcxReadHalf {
 }
 
 impl UcxReadHalf {
-    /// zero-copy recv: `ucp_stream_recv_nbx` into `buf` with the
-    /// registered region's `memh` passed via `UCP_OP_ATTR_FIELD_MEMH`, so UCX
-    /// can RDMA directly into it (zero-copy) instead of the default copy-out
-    /// (bounce buffer → memcpy). Single recv — may return < buf.len(); the
-    /// caller loops for read_exact semantics. `buf` must lie inside `reg`'s
-    /// registered range.
+    /// `ucp_stream_recv_nbx` into `buf` with the registered region's `memh`
+    /// passed via `UCP_OP_ATTR_FIELD_MEMH`. Stream receive still unpacks the
+    /// arrived AM data into `buf` (see `ucx/mod.rs`); receiving into the final
+    /// buffer is what saves the application copy. Single recv — may return
+    /// < buf.len(); the caller loops for read_exact semantics. `buf` must lie
+    /// inside `reg`'s registered range.
     pub async fn recv_registered(
         &mut self,
         buf: &mut [u8],
@@ -668,9 +668,9 @@ pub(crate) async fn ucx_flush(ep: *mut ucp_ep) -> io::Result<()> {
     }
 }
 
-/// Raw recv into a borrowed buffer (ptr+cap), optionally with a registered
-/// `memh` for zero-copy receive. `memh.is_null()` → default copy-out path
-/// (identical to `ucx_recv`). Returns bytes received. Cancel-safe: the
+/// Raw recv into a borrowed buffer (ptr+cap), optionally naming its registered
+/// `memh`. Either way UCX Stream unpacks into the buffer; `memh.is_null()` is
+/// the same path `ucx_recv` takes. Returns bytes received. Cancel-safe: the
 /// `InflightSlot` guard drains UCX before returning; the buffer is borrowed
 /// by the caller (no ManuallyDrop leak on cancel).
 async fn ucx_recv_raw(
@@ -689,8 +689,7 @@ async fn ucx_recv_raw(
         | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
         | ucp_op_attr_t::UCP_OP_ATTR_FLAG_NO_IMM_CMPL;
     if !memh.is_null() {
-        // Zero-copy receive: tell UCX the dest is registered so it RDMAs
-        // straight in (no bounce buffer / copy-out).
+        // The dest is registered; Stream still unpacks AM data into it.
         mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_MEMH;
         params.memh = memh;
     }

@@ -446,12 +446,12 @@ pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>
         })),
         // `value.into()` (NOT `to_vec()`): bytes' `From<Bytes> for Vec<u8>`
         // RECLAIMS the underlying Vec with no copy when this `Bytes` uniquely
-        // owns a Vec-backed buffer — which is the copy-path case
-        // (`read_value_from_log` → `Bytes::from(data)` on TCP / non-pooled VP
-        // reads). `to_vec()` always copied, which regressed the generic large
-        // read by one full value memcpy after R4 made `resolve_value` return
-        // `Bytes` (caught by the perf baseline: TCP 8M read −25%). The rkyv
-        // encode below still copies once (unavoidable for the wire archive).
+        // owns a Vec-backed buffer — the fallback copy path
+        // (`read_value_from_log` → `Bytes::from(data)`). A VP value received
+        // through the pooled fast path (`Bytes::from_owner`, both transports)
+        // is NOT reclaimable: bytes' owner vtable copies it here in full. The
+        // rkyv encode below copies once more, so large values belong on
+        // `MSG_GET_BULK`, which sends the pooled `Bytes` as its own iovec.
         GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetResp {
             code: CODE_OK,
             message: String::new(),

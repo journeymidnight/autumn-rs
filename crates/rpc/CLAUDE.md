@@ -72,7 +72,8 @@ Tests compare exact wire bytes across request IDs and reject altered payloads.
 
 - **`frame.rs`** — `Frame` (encode/decode one frame), `FrameDecoder` (streaming
   decode state machine), `HEADER_LEN=10`, `MAX_PAYLOAD_LEN`, flag bits.
-  `encode_response_with` builds a framed response in one allocation.
+  `encode_response_with` builds a framed response in one allocation. Receive
+  loops read into the decoder's own buffer (see "Receiving into the decoder").
 - **`error.rs`** — `StatusCode` (Ok, NotFound, InvalidArgument,
   FailedPrecondition, Internal, Unavailable, AlreadyExists, PermissionDenied),
   `RpcError`, `encode_status`/`decode_status`.
@@ -113,6 +114,49 @@ Tests compare exact wire bytes across request IDs and reject altered payloads.
   with the public key only (asymmetric — a compromised PS can verify, never
   forge), the client forwards opaque bytes. Single source of truth for the claims
   layout, signing bytes, and domain-separation prefix; part of the wire schema.
+
+### Receiving into the decoder (`ReadWindow`)
+
+Receive loops do not read into a scratch `Vec` and `feed` it: that memcpy'd
+every received byte once more after the kernel copy (TCP) or Stream unpack
+(UCX). `FrameDecoder::read_window(max_len)` lends spare capacity of the
+decoder's own `BytesMut` to the read as a `compio::buf::Slice`;
+`finish_read(window)` takes it back with the received bytes appended. Frames
+then split zero-copy from memory the transport wrote. The lent buffer leaves
+the decoder empty until it returns, so nothing may touch the decoder while a
+read future owns the window (the EN, PS and `read_loop` only decode after the
+read completes).
+
+Window policy — each rule removes a copy that was measured, not guessed:
+- A partially buffered frame whose rest fits in the spare capacity keeps that
+  allocation; starting a fresh one would copy the partial frame.
+- At a frame boundary, reuse spare capacity while it holds a quarter of
+  `max_len`, so small frames fill one allocation instead of each reserving a
+  new one while earlier frames still share it.
+- `try_decode` reserves an incomplete frame's remaining length, so a window of
+  `front_frame_remaining()` receives the rest in place.
+- The extent node passes `max(512 KiB, front_frame_remaining())`. The part of a
+  large frame that arrived in the window before its header was parsed is
+  copied once by `try_decode`'s reserve: per replica ~0.45x (TCP) / ~0.19x (UCX)
+  for a 1 MiB append, ≤0.06x at 8 MiB. Sizing each boundary window to the previous frame removed
+  that copy but was measured SLOWER and is not used: it reserves the next
+  frame's buffer while the previous append still shares the old one, which
+  raised extent-node page faults (tens → 18–28 K per 2 GiB window) and cost
+  ~2% on UCX 8 MiB writes (3 interleaved runs each: 459–464 vs 470–477 MiB/s
+  without it). Do not reintroduce it without a better buffer lifetime.
+
+Bulk fast paths keep a fixed window for their frame (`read_loop` for a pending
+`call_into_pooled` response, the PS for `MSG_PUT_BULK` / `MSG_BATCH_PUT_BULK`):
+only the prologue and a bounded value prefix may enter the decoder, because
+the value is received into a pooled buffer. `feed` remains for tests and
+control-plane loops that are not on a data path.
+
+Cancellation on UCX: `ucx_recv` deliberately leaks an owned buffer whose read
+future is dropped mid-flight (its drain can bail out while UCX still holds the
+pointer). The leaked buffer is now the decoder's — up to one frame-sized window
+on the extent node (e.g. 8 MiB after 8 MiB appends) instead of the former fixed
+512 KiB / 64 KiB scratch `Vec`. Same sites and frequency: only a connection torn
+down with a UCX read pending.
 
 `MSG_TYPE_PING = 0xFF` is reserved; heartbeat lives in each per-component pool.
 
@@ -174,9 +218,9 @@ Pending::Frame (non-bulk call)
 Pending::IntoPooled (bulk call), response frame NOT FLAG_ERROR
   ├─ UCX                → fast path: peek_bulk_prologue (verify crc, parse
   │                       code+message), consume prologue, regpool_acquire +
-  │                       recv_into(dest, reg) — memh RDMA when the slab is
-  │                       registered (0 copies). Unconditional: recv-into is
-  │                       never worse than decode on UCX, any size.
+  │                       recv_into(dest, reg) — one Stream unpack into the
+  │                       slab (a memh does not remove it). Unconditional:
+  │                       recv-into is never worse than decode on UCX.
   └─ TCP
      ├─ payload ≥ 64 KiB → fast path: verify prologue, drain buffered value
      │  (TCP_RECV_INTO_    prefix into the PooledBuf, then one owned read

@@ -1,4 +1,4 @@
-//! thread-local pool of UCX-registered buffers for zero-copy receive.
+//! thread-local pool of UCX-registered, reusable buffers.
 //!
 //! `ucp_mem_map` is expensive (tens of µs), so we register a buffer ONCE and
 //! reuse it across ops. Each `PooledBuf` owns a stable-address `Vec<u8>` plus a

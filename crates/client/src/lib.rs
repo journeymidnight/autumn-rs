@@ -765,8 +765,8 @@ pub struct KeyMeta {
 /// fixed chunk size, or the ring-buffer slot); a value longer than `dest` is
 /// truncated to fit (the returned `Some(n)` carries the full value length).
 ///
-/// The bulk recv lands in a read_loop-owned RegPool buffer (registered on UCX —
-/// RDMA off the wire; plain recycled buffer on TCP), then ONE memcpy into
+/// The bulk recv lands in a read_loop-owned RegPool buffer (one UCX Stream
+/// unpack or TCP kernel copy), then ONE memcpy into
 /// `dest`. `dest` itself needs no registration and no special lifetime — it
 /// is a plain borrow filled after the RPC resolves.
 pub struct GetManyItem<'a> {
@@ -2311,7 +2311,7 @@ impl ClusterClient {
 
     /// `call_ps_for_part` for a request whose RESPONSE is value-separable —
     /// the reply's ctrl and its raw tail come back separately, the tail already
-    /// in a pool buffer (RDMA'd straight into it on UCX). Used by the batched
+    /// in a pool buffer (received straight into it). Used by the batched
     /// bulk read, where the tail holds every value at once.
     async fn call_ps_for_part_pooled(
         &self,
@@ -3353,8 +3353,8 @@ impl ClusterClient {
 
     /// bulk GET: read a key's value into `dest` with ONE copy. The value is
     /// recv'd into a read_loop-owned RegPool buffer (`MSG_GET_BULK` +
-    /// `RpcClient::call_into_pooled` — UCX RDMAs into the registered pool
-    /// buffer; TCP ≥ 64 KiB pays only the kernel copy, no FrameDecoder
+    /// `RpcClient::call_into_pooled` — the UCX Stream unpack or, for TCP
+    /// ≥ 64 KiB, the kernel copy lands in the pool buffer, no FrameDecoder
     /// accumulation) and then copied once into `dest`. Returns
     /// `Some(value_len)`; `dest[..value_len.min(dest.len())]` is filled —
     /// `value_len > dest.len()` means the value was TRUNCATED to fit (the
@@ -3401,9 +3401,9 @@ impl ClusterClient {
     }
 
     /// bulk GET, zero SDK-side copies: the value arrives in a read_loop-owned
-    /// RegPool buffer (`MSG_GET_BULK` + `RpcClient::call_into_pooled` — UCX
-    /// RDMAs into the registered slab; TCP ≥ 64 KiB pays only the kernel
-    /// copy) and is handed straight back as a [`ValueBuf`]. Read it in place,
+    /// RegPool buffer (`MSG_GET_BULK` + `RpcClient::call_into_pooled` — the UCX
+    /// Stream unpack or TCP kernel copy is the only copy) and is handed
+    /// straight back as a [`ValueBuf`]. Read it in place,
     /// or `freeze()` into a `Bytes` for a framework sink; dropping either
     /// returns the slab to the pool. `None` = not found.
     ///
@@ -3535,8 +3535,8 @@ impl ClusterClient {
     /// connections, amortising per-call await latency + letting the writer_task
     /// batch syscalls. Per item the bulk decision is `bulk_worthwhile(read_len)`
     /// (read_len = `length` for a sub-range, else `dest.len()`): >= 64 KiB →
-    /// `get_range_into` (`MSG_GET_BULK`, pooled recv — UCX RDMAs into the
-    /// registered pool buffer — then one copy into `dest`); else `get_range`
+    /// `get_range_into` (`MSG_GET_BULK`, pooled recv — the transport's receive
+    /// copy lands in the pool buffer — then one copy into `dest`); else `get_range`
     /// (`MSG_GET`) + one copy into `dest`.
     /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
     /// (`dest[..n.min(dest.len())]` filled; `n > dest.len()` ⇒ truncated to fit),
@@ -3550,7 +3550,7 @@ impl ClusterClient {
         // loopback). Conditions: every item is a whole-value read
         // (offset == 0 && length == 0) whose dest is below the bulk
         // threshold. Mixed / range / large-bulk inputs fall through to
-        // the per-op fan_out which keeps the bulk RDMA path.
+        // the per-op fan_out which keeps the bulk pooled-receive path.
         let homogeneous_small = !items.is_empty()
             && items.iter().all(|it| {
                 it.offset == 0 && it.length == 0 && !bulk_worthwhile(it.dest.len())
@@ -3663,9 +3663,9 @@ impl ClusterClient {
     ///   don't care to alloc dests), or values are small (< 64 KiB)
     ///   so bulk wouldn't engage anyway. SDK allocates each `Vec<u8>`.
     /// - **`get_many_into`** — when values are ≥ 64 KiB AND you have
-    ///   caller-owned dest buffers (especially `RegisteredMem` for
-    ///   UCX RDMA into pinned memory like sglang pages / torch
-    ///   tensors). True end-to-end zero-copy.
+    ///   caller-owned dest buffers (sglang pages / torch tensors). The
+    ///   value is received into a pool buffer, then copied once into the
+    ///   dest; no decode copy.
     /// Below 64 KiB both APIs do one rkyv decode-copy regardless;
     /// `get_many` saves you the dest-sizing footwork.
     ///

@@ -64,7 +64,8 @@ conn):
 ┌─ handle_ps_connection ──────────────────────────────────────────┐
 │  SQ side — persistent read future:                              │
 │    Option<LocalBoxFuture<'static, PsReadBurst>>                 │
-│    owns OwnedReadHalf + 64 KiB buf across iterations;           │
+│    owns OwnedReadHalf + decoder read window (64 KiB, or the     │
+│    rest of a large non-bulk frame) across iterations;           │
 │    NEVER dropped mid-flight (io_uring SQE stability)            │
 │                                                                 │
 │  CQ side — FuturesUnordered<LocalBoxFuture<'static, ...>>       │
@@ -595,18 +596,20 @@ req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
   response (`extent_id == 0`); `get_value` (non-redirect callers) never yields
   `GetOutcome::Redirect`. No wire-struct change → no WIRE bump.
 
-### UCX end-to-end zero-copy read (`MSG_GET_BULK`)
+### Bulk read without application copies (`MSG_GET_BULK`)
 
 The kvcache SDK's `get_into` issues `MSG_GET_BULK` so the value crosses
 `EN → PS → client` with no FrameDecoder/encode copies (the client lands it in a
-registered pool buffer, then one memcpy into the caller's dest). The seam is
+pool buffer, then one memcpy into the caller's dest). Each receiving hop still
+pays its transport copy: the TCP kernel copy, or UCX Stream's unpack, which a
+registered buffer does not remove. The seam is
 `resolve_value`/`read_value_from_log` (`background.rs`) returning **`Bytes`**, not
 `Vec<u8>`:
 - **VP value (UCX + TCP)**: `read_value_from_log` calls
   `StreamClient::read_value_into_pooled`, which recvs the value straight into a
   `RegPool` `PooledBuf` (EN emits `[bulk head][value]` as 2 `Bytes`, value aliases
-  the EN pread buffer — no encode copy). UCX recvs into a *registered* buffer
-  (RDMA); TCP recvs via a compio owned read (`read_exact_into_pooled`) — only the
+  the EN pread buffer — no encode copy). UCX Stream unpacks into the pooled
+  buffer; TCP recvs via a compio owned read (`read_exact_into_pooled`) — only the
   kernel copy, no FrameDecoder copy. The PS hands the value onward as
   `Bytes::from_owner(pb)` (aliases the pool buffer; returns to the pool when that
   `Bytes` drops after the client write completes). Falls back to the
@@ -623,17 +626,21 @@ registered pool buffer, then one memcpy into the caller's dest). The seam is
   client read path (`call_into_pooled`) is unchanged.
 
 `handle_get` (rkyv `GetResp`, generic SDK) copies the value once (the rkyv encode
-copies regardless). Net read-path value copies: VP-over-UCX `get_into` = **1**
-(the client-side pool→dest memcpy; the PS/EN hops stay 0-copy — the
+copies regardless). Net application copies of a VP value on `get_into` = **1**
+(the client-side pool→dest memcpy; the PS/EN hops add none beyond each
+receive's transport copy — the
 recv-into-caller-dest primitive that made it 0 was removed for cancel-safety +
 timeout-ability, see autumn-rpc CLAUDE "Why pooled-only"). Cancel-safety of the
 registered recv lives in the read_loop that OWNS the `PooledBuf` (returns it to
 the pool on cancel).
 
-### PS write-recv zero-copy (bulk writes, large values)
+### PS bulk write receive (large values)
 
-Symmetric on the WRITE recv side. `drain_bulk_writes` (`lib.rs`) runs in the ps-conn
-read loop right after `decoder.feed`, BEFORE the normal decode: if the FRONT frame
+Symmetric on the WRITE recv side. The ps-conn reads into the decoder's own buffer
+(`ps_read_window`; autumn-rpc "Receiving into the decoder"), and a bulk write at
+the front keeps a fixed 64 KiB window so only its prologue and a bounded prefix
+land there. `drain_bulk_writes` (`lib.rs`) runs right after the read, BEFORE the
+normal decode: if the FRONT frame
 is a bulk write whose raw tail is `>= AUTUMN_PS_BULK_RECV_MIN_BYTES` (64 KiB), it
 recvs that tail straight into a `PooledBuf` instead of letting `FrameDecoder`
 accumulate (and copy) it. BOTH value-separable write shapes qualify —
@@ -654,7 +661,8 @@ Mechanics:
   downstream) and needs none: declining does not make the bytes go away, it makes
   `FrameDecoder` reserve the same count plus a copy.
 - Consume the prologue, `drain_into` any buffered tail prefix into the
-  `PooledBuf`, recv the remainder (UCX `recv_into` registered / TCP
+  `PooledBuf` (the one application copy, ≤ one 64 KiB window — a whole 64 KiB
+  value; 0.8% of an 8 MiB one), recv the remainder (UCX `recv_into` / TCP
   `read_exact_into_pooled` owned). Nothing follows the tail (v28 removed the
   per-value CRC — value integrity is the transport's job).
 - The tail rides onward as `Bytes::from_owner(pb)` via a

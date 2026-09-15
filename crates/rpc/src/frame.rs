@@ -331,6 +331,15 @@ pub struct BulkPrologue {
     pub value_len: usize,
 }
 
+/// Spare capacity of a [`FrameDecoder`]'s own buffer, lent to one socket read.
+///
+/// A read into it lands the received bytes where the decoder will split frames
+/// from, so a frame's payload is the same memory the transport wrote: TCP's
+/// kernel copy or UCX Stream's unpack is the only copy on receive. Hand it back
+/// with [`FrameDecoder::finish_read`] before the decoder is used again; a loop
+/// that abandons the connection may drop it together with the decoder.
+pub type ReadWindow = compio::buf::Slice<BytesMut>;
+
 /// Decode state machine for reading frames from a byte stream.
 pub struct FrameDecoder {
     buf: BytesMut,
@@ -343,9 +352,55 @@ impl FrameDecoder {
         }
     }
 
-    /// Feed new data into the decoder buffer.
+    /// Feed new data into the decoder buffer. Copies `data`; a receive loop
+    /// reads through [`read_window`](Self::read_window) instead.
     pub fn feed(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
+    }
+
+    /// Lend up to `max_len` bytes of spare buffer capacity to a read.
+    ///
+    /// A partially buffered frame whose rest fits in the spare capacity keeps
+    /// filling this allocation, since moving it would copy it. Otherwise the
+    /// spare capacity is reused while it holds a quarter of `max_len`, so small
+    /// reads fill one allocation instead of each reserving a fresh one while
+    /// earlier frames still share it. An incomplete frame already reserved its
+    /// remaining length in [`try_decode`](Self::try_decode), so a `max_len` of
+    /// at least [`front_frame_remaining`](Self::front_frame_remaining)
+    /// receives the rest of that frame in place.
+    pub fn read_window(&mut self, max_len: usize) -> ReadWindow {
+        let needed = match self.front_frame_remaining() {
+            Some(rest) => rest.min(max_len),
+            None if self.buf.is_empty() => max_len / 4,
+            None => HEADER_LEN - self.buf.len(),
+        };
+        self.window(max_len, needed)
+    }
+
+    /// Lend `len` bytes of spare capacity, first reserving `len` when fewer
+    /// than `needed` are spare.
+    fn window(&mut self, len: usize, needed: usize) -> ReadWindow {
+        use compio::buf::IoBuf;
+        let filled = self.buf.len();
+        if self.buf.capacity() - filled < needed.max(1) {
+            self.buf.reserve(len);
+        }
+        let window = (self.buf.capacity() - filled).min(len);
+        std::mem::take(&mut self.buf).slice(filled..filled + window)
+    }
+
+    /// Take back the buffer lent by [`read_window`](Self::read_window); bytes
+    /// the read stored are appended to the decoder.
+    pub fn finish_read(&mut self, window: ReadWindow) {
+        use compio::buf::IntoInner;
+        debug_assert!(self.buf.is_empty(), "read window lent twice");
+        self.buf = window.into_inner();
+    }
+
+    /// Bytes still missing from the front frame once its header is buffered.
+    pub fn front_frame_remaining(&self) -> Option<usize> {
+        let (_, _, _, payload_len) = self.peek_header()?;
+        Some((HEADER_LEN + payload_len as usize).saturating_sub(self.buf.len()))
     }
 
     /// Try to decode the next complete frame from the buffer.
@@ -544,6 +599,104 @@ pub enum FrameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stand-in for a transport read: store `data` at the window start.
+    fn receive(window: &mut ReadWindow, data: &[u8]) -> *const u8 {
+        use compio::buf::{IoBufMut, SetLen};
+        let dst = window.as_uninit();
+        assert!(data.len() <= dst.len());
+        for (slot, byte) in dst.iter_mut().zip(data) {
+            slot.write(*byte);
+        }
+        let start = dst.as_ptr() as *const u8;
+        unsafe { window.set_len(data.len()) };
+        start
+    }
+
+    #[test]
+    fn read_window_receives_the_rest_of_a_frame_in_place() {
+        let payload: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
+        let wire = Frame::request(9, 1, Bytes::copy_from_slice(&payload)).encode();
+        let first = 64 * 1024;
+        let mut decoder = FrameDecoder::new();
+
+        let mut window = decoder.read_window(first);
+        receive(&mut window, &wire[..first]);
+        decoder.finish_read(window);
+        assert!(decoder.try_decode().unwrap().is_none());
+        let remaining = decoder.front_frame_remaining().unwrap();
+        assert_eq!(remaining, wire.len() - first);
+
+        let mut window = decoder.read_window(remaining);
+        let rest_at = receive(&mut window, &wire[first..]);
+        decoder.finish_read(window);
+        let frame = decoder.try_decode().unwrap().unwrap();
+
+        assert_eq!(frame.payload.as_ref(), payload.as_slice());
+        // The received tail is the payload's own memory, not a copy of it.
+        let offset = first - HEADER_LEN - CTRL_PREFIX_LEN;
+        assert_eq!(frame.payload[offset..].as_ptr(), rest_at);
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn a_partial_frame_whose_rest_fits_is_not_moved() {
+        let small = Frame::request(1, 1, Bytes::from_static(&[1; 4096])).encode();
+        let mut decoder = FrameDecoder::new();
+        let mut window = decoder.read_window(64 * 1024);
+        receive(&mut window, &small);
+        decoder.finish_read(window);
+        let held = decoder.try_decode().unwrap().unwrap(); // shares the allocation
+
+        // A frame that ends 1 KiB before the allocation does, first received
+        // 2 KiB short: its rest fits, but the spare is under a quarter window.
+        let spare = decoder.buf.capacity();
+        let big_len = spare - 1024 - HEADER_LEN - CTRL_OVERHEAD;
+        let big = Frame::request(2, 1, Bytes::from(vec![9u8; big_len])).encode();
+        let split = big.len() - 2048;
+        let mut window = decoder.read_window(64 * 1024);
+        let first_at = receive(&mut window, &big[..split]);
+        decoder.finish_read(window);
+        assert!(decoder.try_decode().unwrap().is_none());
+        assert!(decoder.buf.capacity() - decoder.buf.len() < 16 * 1024);
+
+        let mut window = decoder.read_window(64 * 1024);
+        receive(&mut window, &big[split..]);
+        decoder.finish_read(window);
+        let frame = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(
+            frame.payload.as_ptr() as usize - first_at as usize,
+            HEADER_LEN + CTRL_PREFIX_LEN
+        );
+        assert_eq!(frame.payload.len(), big_len);
+        assert_eq!(held.payload.as_ref(), &[1; 4096][..]);
+    }
+
+    #[test]
+    fn read_window_reuses_spare_capacity_while_frames_share_the_buffer() {
+        let wire = Frame::request(3, 1, Bytes::from_static(&[7; 4096])).encode();
+        let mut decoder = FrameDecoder::new();
+        let mut frames = Vec::new();
+        let mut starts = Vec::new();
+        for _ in 0..4 {
+            let mut window = decoder.read_window(64 * 1024);
+            starts.push(receive(&mut window, &wire));
+            decoder.finish_read(window);
+            frames.push(decoder.try_decode().unwrap().unwrap());
+        }
+        // Each read continued the same allocation right after the frame
+        // still referenced from the previous read.
+        for pair in starts.windows(2) {
+            assert_eq!(pair[1] as usize - pair[0] as usize, wire.len());
+        }
+        assert!(frames.iter().all(|f| f.payload.as_ref() == &[7; 4096][..]));
+
+        // Too little spare capacity left: a fresh window, earlier frames intact.
+        let before = decoder.buf.capacity();
+        let window = decoder.read_window(4 * before + 64);
+        assert!(compio::buf::IntoInner::into_inner(window).capacity() >= 4 * before + 64);
+        assert!(frames.iter().all(|f| f.payload.as_ref() == &[7; 4096][..]));
+    }
 
     #[test]
     fn prepared_payload_preserves_full_frame_crc_for_distinct_request_ids() {

@@ -1,6 +1,11 @@
-//! UCX transport — uses `ucp_stream_*_nbx` over rc_mlx5 RoCEv2 (verified
-//! in spec §12 Q1: ≥478 B payloads pick `multi-frag stream zero-copy
-//! copy-out` = rndv get zcopy).
+//! UCX transport — uses `ucp_stream_*_nbx` over rc_mlx5 RoCEv2.
+//!
+//! UCP Stream has no rendezvous protocol: a send is eager AM (bcopy, or zcopy
+//! from registered memory for large fragments), and a receive always unpacks
+//! the arrived AM fragments into the posted buffer with a memcpy
+//! (`ucp_stream_rdata_unpack` in UCX 1.16 `src/ucp/stream/stream_recv.c`). A
+//! `memh` on the receive does not avoid that copy; only posting the FINAL
+//! destination avoids a second, application-level one.
 
 pub(crate) mod endpoint;
 pub(crate) mod ffi;

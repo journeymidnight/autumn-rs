@@ -3390,3 +3390,42 @@ using a result. Every successful trial saves evidence, stops its services and
 reclaims its marked dataset; a failed trial remains for diagnosis. Archive/commit
 results before removing the final source/build tree. Do not remove the archived
 baseline evidence until all comparison work is complete.
+
+
+## Receive-copy accounting per link
+
+Answers "which process copies a value, how many times, and where": per receiving
+process, TCP kernel copy (`skb_copy_datagram_iter`), UCX Stream unpack (memcpy
+returning into libucp/libuct) and application memcpy resolved to its Rust call
+site. Run on H200-1 inside `dongmao-autumn`; details in
+`perf/receive_copies/README.md`.
+
+```sh
+# tracefs inside the container (unmount when the task ends)
+mountpoint -q /sys/kernel/tracing || mount -t tracefs nodev /sys/kernel/tracing
+# binaries: bin/<base|new>/{autumn-*,controlled_path} under /data08/autumn-receive-copies
+cargo +1.95.0 build --release -p autumn-server --features ucx --bins --bench controlled_path
+python3 perf/receive_copies/copytrace.py --version new --transport tcp --repeat 1
+python3 perf/receive_copies/copytrace.py --version new --transport ucx --repeat 1
+python3 perf/receive_copies/analyze.py /data08/autumn-receive-copies/results > summary.json
+# throughput/CPU: untraced windows of several seconds, ABBA order
+python3 perf/receive_copies/copytrace.py --long --version base --transport tcp --repeat 1
+python3 perf/receive_copies/cpu.py /data08/autumn-receive-copies/results > cpu.json
+```
+
+Expected after the decoder read-window change, per logical byte on each
+receiving process: transport copy 1.0 (TCP kernel or UCX unpack — a registered
+`memh` does not remove the UCX one); extent-node application copy ≈0 at 64 KiB
+and 8 MiB (≤0.06x per replica), ≈0.45x per replica for 1 MiB appends on TCP
+(`try_decode` reserving an append whose start arrived in the previous 512 KiB
+window); partition server and client application copy = the value prefix already
+in the 64 KiB window (1.0x for a 64 KiB value, 0.06x at 1 MiB, 0.008x at 8 MiB),
+plus ~0.15x of non-value `partition_loop` moves and ~0.14x benchmark buffer
+handling at 64 KiB that are the same in both builds.
+A `FrameDecoder::feed` frame under `handle_connection`, `handle_ps_connection`
+or `read_loop` in the analyzer's `sites` means a receive loop copies again.
+
+Traced throughput is not a result (a uprobe fires on every memcpy). Keep the
+attribution threshold below one UCX AM fragment (1 KiB): UCX Stream receives
+return one fragment per call. After the run, confirm no `autumn-receive-copies`
+data directory remains on /data03, /data05 or /data08.

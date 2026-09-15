@@ -717,8 +717,8 @@ const FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
 
 /// (PS write-recv bulk, W1): minimum `MSG_PUT_BULK` value size for which the
-/// ps-conn recvs the value straight into a registered `PooledBuf` (UCX RDMA, no
-/// off-wire copy) instead of letting the `FrameDecoder` accumulate it. Below
+/// ps-conn recvs the value straight into a `PooledBuf` (one UCX Stream unpack
+/// or TCP kernel copy) instead of letting the `FrameDecoder` accumulate it. Below
 /// this the per-op recv-into-registered overhead (regpool_acquire + memh +
 /// staged recv) exceeds the copy saved — same size-asymmetry as the read path's
 /// `BULK_MIN_BYTES`. Consulted on BOTH transports: UCX recvs into a
@@ -2307,8 +2307,8 @@ pub struct PartitionRequest {
     payload: Bytes,
     resp_tx: oneshot::Sender<HandlerResult>,
     /// (PS write-recv bulk, W1): for a LARGE `MSG_PUT_BULK`, the ps-conn
-    /// recvs the value straight into a registered `PooledBuf` (no off-wire
-    /// copy) and carries it here as a `Bytes` aliasing that buffer; `payload`
+    /// recvs the value straight into a `PooledBuf` (its only receive copy)
+    /// and carries it here as a `Bytes` aliasing that buffer; `payload`
     /// then holds only `[meta][key]`. `enqueue_put_bulk` uses this directly
     /// instead of slicing the value out of `payload` (which would require
     /// concatenating it back in — the copy we're avoiding). `None` for every
@@ -4840,8 +4840,8 @@ fn ps_conn_inflight_cap() -> usize {
 pub(crate) static PS_SINGLE_FRAME_RECV_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// (W1) — count of `MSG_PUT_BULK` values recv'd straight into a registered
-/// `PooledBuf` by `drain_bulk_writes` (the PS write-recv zero-copy path). Logged
+/// (W1) — count of `MSG_PUT_BULK` values recv'd straight into a
+/// `PooledBuf` by `drain_bulk_writes` (the PS bulk write-recv path). Logged
 /// once on first engage so operators / e2e can confirm the path is live.
 pub(crate) static PS_BULK_WRITE_RECV_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -4863,60 +4863,52 @@ pub(crate) fn ps_conn_test_lock() -> parking_lot::MutexGuard<'static, ()> {
 }
 
 /// outcome of one persistent read future iteration.  The future
-/// owns both the reader and the buffer across iterations so it can be left
-/// pinned in the event loop's `select` without ever being dropped
+/// owns both the reader and the decoder's read window across iterations so it
+/// can be left pinned in the event loop's `select` without ever being dropped
 /// mid-flight (an in-flight io_uring SQE would otherwise be cancelled,
 /// forcing the kernel to resubmit on the next poll; earlier ps-conn
 /// iterations measured this as a perf regression).
 enum PsReadBurst {
+    /// Bytes arrived; the window holds them for `FrameDecoder::finish_read`.
     Data {
-        buf: Vec<u8>,
-        n: usize,
+        window: autumn_rpc::ReadWindow,
         reader: autumn_transport::ReadHalf,
     },
-    Eof {
-        #[allow(dead_code)]
-        reader: autumn_transport::ReadHalf,
-        #[allow(dead_code)]
-        buf: Vec<u8>,
-    },
-    Err {
-        e: std::io::Error,
-        #[allow(dead_code)]
-        reader: autumn_transport::ReadHalf,
-        #[allow(dead_code)]
-        buf: Vec<u8>,
-    },
+    Eof,
+    Err { e: std::io::Error },
 }
 
 /// Build a `'static`-lifetime `LocalBoxFuture<PsReadBurst>` that reads once
-/// into `buf` and returns ownership of both reader and buf.
+/// into `window` and returns ownership of both reader and window.
 fn spawn_ps_read(
     mut reader: autumn_transport::ReadHalf,
-    buf: Vec<u8>,
+    window: autumn_rpc::ReadWindow,
 ) -> futures::future::LocalBoxFuture<'static, PsReadBurst> {
     use compio::io::AsyncRead;
     use futures::FutureExt;
     async move {
-        let BufResult(result, buf_back) = reader.read(buf).await;
+        let BufResult(result, window) = reader.read(window).await;
         match result {
-            Ok(0) => PsReadBurst::Eof {
-                reader,
-                buf: buf_back,
-            },
-            Ok(n) => PsReadBurst::Data {
-                buf: buf_back,
-                n,
-                reader,
-            },
-            Err(e) => PsReadBurst::Err {
-                e,
-                reader,
-                buf: buf_back,
-            },
+            Ok(0) => PsReadBurst::Eof,
+            Ok(_) => PsReadBurst::Data { window, reader },
+            Err(e) => PsReadBurst::Err { e },
         }
     }
     .boxed_local()
+}
+
+/// Next receive window for a ps-conn. A bulk write at the front keeps the
+/// fixed window: `drain_bulk_writes` receives its value into a pooled buffer,
+/// and only the prologue plus a bounded prefix should land in the decoder. Any
+/// other incomplete frame receives the rest of itself in place.
+fn ps_read_window(decoder: &mut FrameDecoder, fixed: usize) -> autumn_rpc::ReadWindow {
+    let len = match decoder.peek_header() {
+        Some((_, MSG_PUT_BULK | partition_rpc::MSG_BATCH_PUT_BULK, _, _)) | None => fixed,
+        Some(_) => decoder
+            .front_frame_remaining()
+            .map_or(fixed, |rest| rest.max(fixed)),
+    };
+    decoder.read_window(len)
 }
 
 /// R4 — push a completed response `(head, values)` into `tx_bufs`. `head`
@@ -5641,7 +5633,8 @@ async fn push_frames_to_inflight(
 /// **Per-conn reply batching.** The inner loop mirrors the
 /// ExtentNode R4 4.2 v3 pattern (commit `1e7e456`):
 ///   - Persistent read future (`Option<LocalBoxFuture<PsReadBurst>>`) owns
-///     reader + 64 KiB buf across iterations, never dropped mid-flight.
+///     reader + the decoder's read window (64 KiB, or the rest of a large
+///     non-bulk frame) across iterations, never dropped mid-flight.
 ///   - `FuturesUnordered<LocalBoxFuture<Bytes>>` holds in-flight
 ///     PartitionRequest → oneshot-response → encoded-frame futures.
 ///   - Each loop iteration opportunistically drains ready completions into
@@ -5700,10 +5693,9 @@ async fn handle_ps_connection(
         FuturesUnordered::new();
     let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(64);
 
-    // Persistent read future: owns reader + buf across iterations.
-    let buf = vec![0u8; READ_BUF_SIZE];
+    // Persistent read future: owns reader + read window across iterations.
     let mut read_fut: Option<LocalBoxFuture<'static, PsReadBurst>> =
-        Some(spawn_ps_read(reader, buf));
+        Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
 
     loop {
         // (A) Opportunistic drain of already-ready completions.
@@ -5736,13 +5728,13 @@ async fn handle_ps_connection(
                 .take()
                 .expect("read_fut invariant: always Some when idle");
             match rfut.await {
-                PsReadBurst::Eof { .. } => return Ok(()),
-                PsReadBurst::Err { e, .. } => return Err(e.into()),
-                PsReadBurst::Data { buf, n, mut reader } => {
-                    decoder.feed(&buf[..n]);
+                PsReadBurst::Eof => return Ok(()),
+                PsReadBurst::Err { e } => return Err(e.into()),
+                PsReadBurst::Data { window, mut reader } => {
+                    decoder.finish_read(window);
 
                     // recv any LARGE bulk-write tail(s) at the
-                    // front straight into a PooledBuf (UCX registered RDMA / TCP
+                    // front straight into a PooledBuf (UCX Stream unpack / TCP
                     // compio owned read — no FrameDecoder accumulation copy)
                     // before the normal decode buffers them. May push write
                     // replies onto the same bounded in-flight queue.
@@ -5813,7 +5805,7 @@ async fn handle_ps_connection(
                         &mut principal,
                     )
                     .await?;
-                    read_fut = Some(spawn_ps_read(reader, buf));
+                    read_fut = Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
                 }
             }
             continue;
@@ -5861,7 +5853,7 @@ async fn handle_ps_connection(
                 // internal state persists regardless of the wrapper's
                 // lifetime. Remaining completions are drained at loop top.
                 match read_result {
-                    PsReadBurst::Eof { .. } => {
+                    PsReadBurst::Eof => {
                         // Drain remaining inflight so clients get their
                         // final replies before we return.
                         while let Some(done) = inflight.next().await {
@@ -5879,9 +5871,9 @@ async fn handle_ps_connection(
                         }
                         return Ok(());
                     }
-                    PsReadBurst::Err { e, .. } => return Err(e.into()),
-                    PsReadBurst::Data { buf, n, mut reader } => {
-                        decoder.feed(&buf[..n]);
+                    PsReadBurst::Err { e } => return Err(e.into()),
+                    PsReadBurst::Data { window, mut reader } => {
+                        decoder.finish_read(window);
                         // recv large bulk-write tails into
                         // pooled buffers first (UCX registered / TCP owned read).
                         drain_bulk_writes(
@@ -5908,7 +5900,7 @@ async fn handle_ps_connection(
                             &mut principal,
                         )
                         .await?;
-                        read_fut = Some(spawn_ps_read(reader, buf));
+                        read_fut = Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
                     }
                 }
             }
@@ -8141,8 +8133,8 @@ fn enqueue_put_bulk(
         let _ = req.resp_tx.send(Err(err));
         return;
     }
-    // W1: a LARGE value was recv'd straight into a registered PooledBuf
-    // by the ps-conn (bulk_value = a Bytes aliasing it, no off-wire copy); use it
+    // W1: a LARGE value was recv'd straight into a PooledBuf by the ps-conn
+    // (bulk_value = a Bytes aliasing it, no further copy); use it
     // directly. Otherwise (small / TCP) slice the value out of `payload` as
     // before. `payload` holds only `[meta][key]` in the bulk_value case.
     let value = match req.bulk_value {

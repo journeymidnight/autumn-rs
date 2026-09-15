@@ -277,9 +277,9 @@ impl RpcClient {
     /// in-flight buffer — so a cancelled/timed-out caller can NOT leave the
     /// NIC writing a freed/recycled buffer, and the buffer is always reclaimed
     /// (handed back on success, dropped→pool on cancel — never leaked).
-    /// Returns a [`BulkResp`] (filled `PooledBuf` + status code + message). On
-    /// UCX the value RDMAs into the registered pool buffer (memh zero-copy);
-    /// on TCP the value is copied off the wire into a (plain) pool buffer.
+    /// Returns a [`BulkResp`] (filled `PooledBuf` + status code + message). The
+    /// value's one receive copy lands in the pool buffer: a UCX Stream unpack
+    /// or the TCP kernel copy.
     pub async fn call_into_pooled(
         &self,
         msg_type: u8,
@@ -749,53 +749,58 @@ async fn read_loop(
     pending: Rc<RefCell<HashMap<u32, Pending>>>,
     addr: SocketAddr,
 ) -> Result<(), RpcError> {
+    const READ_WINDOW: usize = 64 * 1024;
     let mut decoder = FrameDecoder::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let is_ucx = reader.is_ucx();
+
+    // bulk responses bypass FrameDecoder accumulation: always on UCX (recv
+    // straight into the pooled slab); on TCP only when the value is large
+    // enough to beat the batch-decoding normal path (small values fall through
+    // to finish_into_pooled_from_frame below). An ERROR frame (FLAG_ERROR —
+    // e.g. an authz PermissionDenied) carries a status envelope, not a bulk
+    // ctrl: it takes the normal decode path below, where the IntoPooled arm
+    // decodes it into an `RpcError::Status`.
+    //
+    // The value boundary needs `ctrl_len` (v28: variable-length ctrl =
+    // `[code][message]`); on TCP the gate uses the WHOLE payload (a ≥64 KiB
+    // payload of a small-ctrl frame is value-dominated), and the fast path
+    // reads ctrl_len from the verified prologue. The pending entry is checked
+    // without removing it: it must stay pending if the loop waits for more bytes.
+    let bulk_fast_path = |req_id: u32, flags: u8, payload_len: usize| {
+        (flags & crate::frame::FLAG_ERROR) == 0
+            && (is_ucx || payload_len >= TCP_RECV_INTO_POOLED_MIN_BYTES)
+            && matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_)))
+    };
 
     loop {
-        let BufResult(result, buf_back) = reader.read(buf).await;
-        buf = buf_back;
+        // Receive into the decoder's own buffer. A bulk response keeps the
+        // fixed window, so only its prologue and a bounded value prefix land
+        // here before the value is received into its pooled slab; any other
+        // incomplete frame receives the rest of itself in place.
+        let window_len = match decoder.peek_header() {
+            Some((req_id, _, flags, payload_len))
+                if !bulk_fast_path(req_id, flags, payload_len as usize) =>
+            {
+                decoder
+                    .front_frame_remaining()
+                    .map_or(READ_WINDOW, |rest| rest.max(READ_WINDOW))
+            }
+            _ => READ_WINDOW,
+        };
+        let BufResult(result, window) = reader.read(decoder.read_window(window_len)).await;
+        decoder.finish_read(window);
         let n = result?;
         if n == 0 {
             tracing::debug!(addr = %addr, "rpc connection closed by peer");
             return Ok(());
         }
 
-        decoder.feed(&buf[..n]);
-
         // Peek the next frame header so a bulk value-response can be recv'd
         // straight into its destination instead of accumulating in the
         // FrameDecoder. (Inner `break`s mean "wait for more bytes" — they
         // exit this while back to the socket read above.)
         while let Some((req_id, _mt, flags, payload_len)) = decoder.peek_header() {
-            let payload_len = payload_len as usize;
-
-            // Does a `call_into_pooled` caller await this req_id? (Checked
-            // without removing: the entry must stay pending if we `break` to
-            // wait for more bytes.)
-            let bulk_pending = matches!(
-                pending.borrow().get(&req_id),
-                Some(Pending::IntoPooled(_))
-            );
-
-            // bulk responses bypass FrameDecoder accumulation: always on UCX
-            // (the value lands zero-copy in its dest); on TCP only when the
-            // value is large enough to beat the batch-decoding normal path
-            // (small values fall through to finish_into_pooled_from_frame
-            // below). An ERROR frame (FLAG_ERROR — e.g. an authz
-            // PermissionDenied) carries a status envelope, not a bulk ctrl: it
-            // takes the normal decode path below, where the IntoPooled arm
-            // decodes it into an `RpcError::Status`.
-            //
-            // The value boundary needs `ctrl_len` (v28: variable-length ctrl =
-            // `[code][message]`); on TCP gate on the WHOLE payload first (a
-            // ≥64 KiB payload of a small-ctrl frame is value-dominated), then
-            // refine once ctrl_len is buffered.
-            let bulk_fast_path = bulk_pending
-                && (flags & crate::frame::FLAG_ERROR) == 0
-                && (reader.is_ucx() || payload_len >= TCP_RECV_INTO_POOLED_MIN_BYTES);
-
-            if bulk_fast_path {
+            if bulk_fast_path(req_id, flags, payload_len as usize) {
                 // Wait for the full prologue ([header][ctrl_len][ctrl][crc]),
                 // verify the ctrl CRC (header included),
                 // and parse the status ctrl. bulk ctrls are tiny (code+message),
@@ -934,8 +939,9 @@ enum ValueRecv {
 }
 
 /// UCX bulk value recv: drain the value's already-buffered prefix out of the
-/// decoder, then recv the remainder straight into `dest` (zero-copy via memh
-/// when `reg` is Some). `dest.len()` is the exact value length.
+/// decoder, then recv the remainder straight into `dest` (one UCX Stream
+/// unpack; `reg` names the slab's memh when registered). `dest.len()` is the
+/// exact value length.
 async fn recv_value_ucx(
     reader: &mut ReadHalf,
     decoder: &mut FrameDecoder,

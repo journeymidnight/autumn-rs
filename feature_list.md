@@ -68,11 +68,30 @@
 - **notes**: 受控验证保留了 0.19 普通跑分和 0.18 诊断采样两份崩溃证据。后续重复成功不关闭该问题。
 - `passes: false`
 
+### F-GENERIC-GET-COPIES — non-bulk GET copies a large value several times
+- **Trigger** (2026-09-15, receive-copy accounting): per link, the bulk read paths
+  now pay one transport copy plus at most a 64 KiB prefix. The generic `MSG_GET`
+  does not: `handle_get` converts the pooled VP `Bytes` with `value.into()`, which
+  bytes' owner vtable (`owned_to_vec`) copies in full; `rkyv_encode` and
+  `Frame::encode` copy it again; the client decode copies into an `AlignedVec` and
+  deserializes into a `Vec`. Python `AutumnClient.get` / `get_into` /
+  `batch_get_into` call this `ClusterClient::get` at any value size.
+- **Scope**: measure the copies and CPU of `get` against `get_pooled` at 4 KiB,
+  64 KiB, 1 MiB and 8 MiB on TCP and UCX with `perf/receive_copies`; route large
+  values through the bulk read where it is not slower for small ones, or narrow
+  the Python callers. No wire change unless measurement requires one.
+- **Acceptance**: the analyzer attributes no full-value application copy to the
+  PS or client for the chosen large-value path; small-value latency/CPU is not
+  worse beyond run-to-run spread; TCP and UCX byte-exact reads; Python binding
+  tests pass.
+- `passes: false`
+
 ### F-CORE-DATA-PATH-NEXT — further core-path performance work
 - Trigger: The 2026-09-14 review found additional costs beyond the validated pool/receive/read-planning fixes.
 - Scope: Measure PS-to-EN repeated frame CRC and frame accumulation, then evaluate checksum reuse or append bulk framing; separately evaluate UCX rendezvous/RMA, CLI owned-buffer streaming with byte-bounded async file I/O, and filesystem random-write amplification/per-inode barriers. Preserve existing integrity and durability contracts.
 - Acceptance: Establish an isolated before/after benchmark for each candidate, keep only measured improvements, and cover authorization, cancellation, ordering, sparse data and crash consistency for the changed path. No fixed speedup assumed.
 - passes: false
+- notes (2026-09-15): receive-copy accounting measured the UCX Stream unpack at exactly 1.0x of every value on every receiving process, including receives into registered pooled slabs; UCX 1.16 Stream has no rendezvous and always unpacks AM fragments into the posted buffer. Removing it needs a different UCX API (AM rendezvous with receive into the destination, or tag/RMA), which is the UCX rendezvous/RMA item above. See docs/perf_receive_copies_20260915.md.
 
 
 > **这个账本只记 autumn-rs 自己的东西。** 下游怎么被 autumn 的改动影响（例如一次 wire

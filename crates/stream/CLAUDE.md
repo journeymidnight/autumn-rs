@@ -278,7 +278,7 @@ they happen — not gated on a burst boundary.
 ```
 ┌─ ConnTask (single task, true SQ/CQ) ────────────────────────────┐
 │  SQ — persistent read future (Option<LocalBoxFuture<ReadBurst>>) │
-│    owns OwnedReadHalf + 512 KiB buf across iterations;           │
+│    owns OwnedReadHalf + the decoder's read window (≥512 KiB);    │
 │    NEVER dropped mid-flight (io_uring SQE stability)             │
 │  CQ — FuturesUnordered<Pin<Box<dyn Future<Vec<Bytes>>>>>         │
 │    cap = AUTUMN_EXTENT_INFLIGHT_CAP (default 64)                 │
@@ -302,6 +302,17 @@ they happen — not gated on a burst boundary.
 4. **Cross-extent concurrency** — batches for N different extents sit in FU
    simultaneously; the first completion's bytes flush immediately at the next
    loop top, not waiting for the slowest in-flight op.
+
+**Append receive — one copy per replica.** An append's payload rides inside the
+CRC-protected ctrl, so it cannot take a pooled bulk receive. The connection reads
+into the `FrameDecoder`'s own buffer (autumn-rpc "Receiving into the decoder"):
+the kernel copy (TCP) or UCX Stream unpack writes the bytes that
+`AppendReq::decode`, the owner mailbox and the pwritev then share by refcount,
+except the part of a large frame that arrived before its header was parsed
+(copied once when `try_decode` reserves the frame). The former 512 KiB scratch `Vec` + `FrameDecoder::feed` memcpy'd
+each payload a second time (1.0x on every replica, measured with a memcpy uprobe),
+plus jemalloc regrowth copies. The buffer of an in-flight append stays pinned
+until its pwritev + fsync complete, exactly as its decoder slice did before.
 
 **Extent-len reservation**: `build_append_future` stores `extent.len =
 total_end` BEFORE returning the I/O future into FU, so overlapping same-extent
@@ -807,8 +818,9 @@ For star replication with multiple replicas and at least 64 KiB of payload,
 Every replica combines its own RPC header with that checksum; submission order,
 full transit CRC and all-replica ACK behavior remain unchanged. This removes
 R-1 full payload scans per append. Chain and small/single-replica paths keep
-ordinary vectored sends. The EN receive path remains unchanged: a pooled ctrl
-receive candidate was tested and withdrawn for lack of stable CPU/throughput gain.
+ordinary vectored sends. A pooled ctrl receive candidate was tested and withdrawn
+for lack of stable CPU/throughput gain; see "Append receive" for what the EN
+receive does instead.
 
 ```
 append*(stream_id, payload):
