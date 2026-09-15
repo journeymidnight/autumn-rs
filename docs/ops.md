@@ -3374,3 +3374,19 @@ It does not configure server runtimes. SQPOLL is available only as an explicit
 `sqpoll` experiment; its kernel-thread CPU must be measured separately before
 making any efficiency claim. Compio's ordinary receive already applies adaptive
 poll-first internally, so include it in the pure-upgrade comparison.
+
+
+### Controlled runtime comparison after compio migration
+
+Use the fixed-work harness in `perf/controlled_validation/README.md` when
+validating CPU efficiency and partition scaling. It documents the H200-1 test
+layout, archived baseline restoration, host perf/tracefs requirements, synchronized
+measurement windows, three rotated repetitions and separate diagnostic runs.
+The older two-second core_path samples are observations, not this acceptance.
+
+Build `controlled_path` with identical source and Rust 1.95 against each runtime
+version. Validate the recorded topology and per-partition operation counts before
+using a result. Every successful trial saves evidence, stops its services and
+reclaims its marked dataset; a failed trial remains for diagnosis. Archive/commit
+results before removing the final source/build tree. Do not remove the archived
+baseline evidence until all comparison work is complete.

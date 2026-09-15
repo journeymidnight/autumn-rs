@@ -1,0 +1,13 @@
+{
+  "version": "pure compio 0.19.2",
+  "trial": "ucx-p4-r1-pure",
+  "stage": "64KiB depth1 write",
+  "error": "mlx5_1 Local protection error synd 0x4 vend 0x52 on SEND",
+  "prior": "4KiB depth8 slowed to 11MiB/s; append timeouts",
+  "status": "unresolved; UCX source unchanged between baseline and upgrade",
+  "not_counted_as_pass": true,
+  "baseline_replay": "same-work baseline trial completed",
+  "upgrade_repeat": "same-work upgrade repeat completed without abort, background allocation/flush errors present",
+  "classification": "pre-existing UCX reliability defect reproduced on both runtime versions; root cause unresolved",
+  "baseline_reproduction": "compio 0.18 baseline UCX p4 diagnostic trial also aborts with Local protection error synd 0x4 vend 0x52"
+}

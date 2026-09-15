@@ -9,6 +9,10 @@ license.workspace = true
 name = "core_path"
 harness = false
 
+[[bench]]
+name = "controlled_path"
+harness = false
+
 [[bin]]
 name = "autumn-manager-server"
 path = "src/bin/manager.rs"

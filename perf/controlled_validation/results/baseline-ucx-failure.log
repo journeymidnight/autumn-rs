@@ -1,0 +1,25 @@
+[2m2026-09-15T00:49:14.698419Z[0m [32m INFO[0m [2mautumn_partition_server[0m[2m:[0m partition write summary [3mpart_id[0m[2m=[0m21 [3mops[0m[2m=[0m1496 [3mbatches[0m[2m=[0m533 [3mops_per_sec[0m[2m=[0m1468.7890409109764 [3mavg_batch_size[0m[2m=[0m2.806754221388368 [3mfill_ratio[0m[2m=[0m0.0009136569731081927 [3mavg_phase1_ms[0m[2m=[0m0.003469157598499062 [3mavg_phase2_ms[0m[2m=[0m1.8640448874296434 [3mavg_phase3_ms[0m[2m=[0m0.006658727954971857 [3mavg_end_to_end_ms[0m[2m=[0m1.874999848030019
+[2m2026-09-15T00:49:14.698427Z[0m [32m INFO[0m [2mautumn_stream::client[0m[2m:[0m stream append summary [3mowner_key[0m[2m=[0m"partition/25" [3mops[0m[2m=[0m530 [3mretries[0m[2m=[0m0 [3mavg_lock_wait_ms[0m[2m=[0m0.0 [3mavg_extent_lookup_ms[0m[2m=[0m0.0 [3mavg_fanout_ms[0m[2m=[0m1.6803562301886792 [3mavg_total_ms[0m[2m=[0m1.6810455433962264
+[2m2026-09-15T00:49:14.698464Z[0m [32m INFO[0m [2mautumn_partition_server[0m[2m:[0m partition write summary [3mpart_id[0m[2m=[0m25 [3mops[0m[2m=[0m1362 [3mbatches[0m[2m=[0m530 [3mops_per_sec[0m[2m=[0m1345.8025503397048 [3mavg_batch_size[0m[2m=[0m2.569811320754717 [3mfill_ratio[0m[2m=[0m0.0008365271226415095 [3mavg_phase1_ms[0m[2m=[0m0.003546575471698113 [3mavg_phase2_ms[0m[2m=[0m1.682296041509434 [3mavg_phase3_ms[0m[2m=[0m0.009392275471698113 [3mavg_end_to_end_ms[0m[2m=[0m1.6963305490566039
+[dc62-p3-t302-n014:448396:0:449711] ib_mlx5_log.c:179  Local protection error on mlx5_1:1/RoCE (synd 0x4 vend 0x52 hw_synd 0/146)
+[dc62-p3-t302-n014:448396:0:449711] ib_mlx5_log.c:179  RC QP 0x61cb wqe[14668]: SEND s-- [inl len 10] [va 0x7fd0d07dd000 len 4096 lkey 0x29a8e7] [va 0x7fd128e0c0a8 len 4 lkey 0x4ff205] [va 0x7fd128e1de10 len 70 lkey 0x332c6b] [rqpn 0x61cd dlid=0 sl=0 port=1 src_path_bits=0 dgid=fdbd:dc62:3:302::14 flow_label=0x0 sgid_index=3 traffic_class=0]
+==== backtrace (tid: 449711) ====
+ 0  /usr/lib/x86_64-linux-gnu/libucs.so.0(ucs_handle_error+0x2ec) [0x7fd14fb7064c]
+ 1  /usr/lib/x86_64-linux-gnu/libucs.so.0(ucs_fatal_error_message+0xb2) [0x7fd14fb707f2]
+ 2  /usr/lib/x86_64-linux-gnu/libucs.so.0(ucs_log_default_handler+0x9d3) [0x7fd14fb75cc3]
+ 3  /usr/lib/x86_64-linux-gnu/libucs.so.0(ucs_log_dispatch+0xf6) [0x7fd14fb6e6d6]
+ 4  /usr/lib/x86_64-linux-gnu/ucx/libuct_ib.so.0(uct_ib_mlx5_completion_with_err+0x419) [0x7fd14f6e99e9]
+ 5  /usr/lib/x86_64-linux-gnu/ucx/libuct_ib.so.0(+0x4e6eb) [0x7fd14f7136eb]
+ 6  /usr/lib/x86_64-linux-gnu/ucx/libuct_ib.so.0(uct_ib_mlx5_check_completion_with_err+0x7b) [0x7fd14f6ef94b]
+ 7  /usr/lib/x86_64-linux-gnu/ucx/libuct_ib.so.0(uct_ib_mlx5_check_completion+0x3a) [0x7fd14f6ef98a]
+ 8  /usr/lib/x86_64-linux-gnu/ucx/libuct_ib.so.0(+0x4a637) [0x7fd14f70f637]
+ 9  /usr/lib/x86_64-linux-gnu/libucp.so.0(ucp_worker_progress+0x7a) [0x7fd14fc062ca]
+10  /data08/autumn-controlled-validation/bin/baseline/autumn-ps(+0x275bc6) [0x55d070065bc6]
+11  /data08/autumn-controlled-validation/bin/baseline/autumn-ps(+0x27570d) [0x55d07006570d]
+12  /data08/autumn-controlled-validation/bin/baseline/autumn-ps(+0x28700d) [0x55d07007700d]
+13  /data08/autumn-controlled-validation/bin/baseline/autumn-ps(+0x163995) [0x55d06ff53995]
+14  /data08/autumn-controlled-validation/bin/baseline/autumn-ps(+0x168927) [0x55d06ff58927]
+15  /data08/autumn-controlled-validation/bin/baseline/autumn-ps(+0x33016f) [0x55d07012016f]
+16  /usr/lib/x86_64-linux-gnu/libc.so.6(+0x9caa4) [0x7fd14f9a1aa4]
+17  /usr/lib/x86_64-linux-gnu/libc.so.6(+0x129c6c) [0x7fd14fa2ec6c]
+=================================

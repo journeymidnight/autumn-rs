@@ -1,0 +1,92 @@
+// Generated prefix initializes @role[PID] and sets the benchmark PID filter.
+// Marker calls are PR_GET_DUMPABLE queries: args 2/3 carry magic and phase.
+tracepoint:syscalls:sys_enter_prctl
+/args->option == 3 && args->arg2 == 0x41555455/
+{
+    if (args->arg3 == 2) { @role[pid] = 6; }
+    if (args->arg3 == 1) { @window = args->arg4; @active = 1; @start_ns = nsecs; }
+    if (args->arg3 == 0) { @elapsed_ns[@window] = nsecs - @start_ns; @active = 0; }
+}
+
+tracepoint:io_uring:io_uring_submit_sqe
+/@role[pid]/
+{
+    @ring_role[args->ctx] = @role[pid];
+    if (@active) {
+        @sqe[@window, @role[pid], args->opcode] = count();
+        @in_window[args->req] = @window;
+    }
+}
+
+tracepoint:io_uring:io_uring_complete
+/@active && @ring_role[args->ctx]/
+{
+    @cqe[@window, @ring_role[args->ctx], args->cflags] = count();
+    if (args->res > 0) { @cqe_positive_result[@window, @ring_role[args->ctx]] = sum(args->res); }
+    if (@in_window[args->req] == @window) { @matched_cqe[@window, @ring_role[args->ctx]] = count(); }
+    if (!(args->cflags & 2)) { delete(@in_window[args->req]); }
+}
+
+tracepoint:io_uring:io_uring_queue_async_work
+/@active && @ring_role[args->ctx]/ { @async_work[@window, @ring_role[args->ctx]] = count(); }
+
+tracepoint:syscalls:sys_enter_io_uring_enter
+/@active && @role[pid]/ { @enter_syscalls[@window, @role[pid]] = count(); }
+
+tracepoint:io_uring:io_uring_complete
+/@active && @ring_role[args->ctx] && (args->cflags & 8)/
+{ @zerocopy_notifications[@window, @ring_role[args->ctx]] = count(); }
+
+tracepoint:kmem:kmalloc
+/@active && @role[pid]/ { @kmalloc_bytes[@window, @role[pid]] = sum(args->bytes_alloc); @kmalloc_calls[@window, @role[pid]] = count(); }
+
+tracepoint:kmem:mm_page_alloc
+/@active && @role[pid]/ { @page_bytes[@window, @role[pid]] = sum(4096 << args->order); }
+
+kprobe:skb_copy_datagram_iter
+/@active && @role[pid]/ { @tcp_recv_copy_requested[@window, @role[pid]] = sum(arg3); }
+
+kprobe:skb_copy_datagram_from_iter
+/@active && @role[pid]/ { @tcp_send_copy_requested[@window, @role[pid]] = sum(arg3); }
+
+kprobe:tcp_sendmsg_locked
+/@active && @role[pid]/ { @tcp_send_requested[@window, @role[pid]] = sum(arg2); }
+
+tracepoint:sched:sched_stat_runtime
+/@active && (curtask->flags & 0x00200000)/
+{ @kernel_thread_runtime_ns[@window, pid, comm] = sum(args->runtime); }
+
+tracepoint:sched:sched_stat_runtime
+/@active && @role[pid]/
+{ @role_runtime_ns[@window, @role[pid]] = sum(args->runtime); }
+
+tracepoint:sched:sched_stat_runtime
+/@active && !@role[pid] && (cpu < 20 || (cpu >= 32 && cpu <= 34) || (cpu >= 40 && cpu <= 43))/
+{ @unrelated_selected_runtime_ns[@window, pid, comm] = sum(args->runtime); }
+
+tracepoint:irq:softirq_entry
+/@active/ { @soft_start[cpu] = nsecs; @soft_vec[cpu] = args->vec; }
+tracepoint:irq:softirq_exit
+/@active && @soft_start[cpu] >= @start_ns/
+{
+    @softirq_ns[@window, cpu, args->vec] = sum(nsecs - @soft_start[cpu]);
+    delete(@soft_start[cpu]); delete(@soft_vec[cpu]);
+}
+
+tracepoint:irq:irq_handler_entry
+/@active/ { @irq_start[cpu] = nsecs; }
+tracepoint:irq:irq_handler_exit
+/@active && @irq_start[cpu] >= @start_ns/
+{
+    @irq_ns[@window, cpu] = sum(nsecs - @irq_start[cpu]);
+    delete(@irq_start[cpu]);
+}
+
+profile:hz:99
+/@active && @role[pid]/ { @kernel_samples[@window, @role[pid], kstack(16)] = count(); }
+
+END {
+    clear(@role); clear(@ring_role); clear(@in_window);
+    clear(@soft_start); clear(@soft_vec); clear(@irq_start);
+    clear(@active); clear(@start_ns); clear(@window);
+}

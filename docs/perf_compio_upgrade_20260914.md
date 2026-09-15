@@ -1,5 +1,9 @@
 # Compio upgrade evaluation, 2026-09-14
 
+See [the later controlled validation](perf_compio_controlled_20260915.md) for fixed-work
+version/scaling comparisons and kernel accounting. This file preserves the earlier
+short-sample investigation.
+
 ## Delivery and limits
 
 The migration targets compio 0.19.2, driver/net 0.12.5, runtime 0.12.6,

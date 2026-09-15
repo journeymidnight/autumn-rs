@@ -1,0 +1,42 @@
+{
+  "tcp-p4-r10-pure-trace.stderr": {
+    "stack_id_errors": 64,
+    "other_errors": []
+  },
+  "ucx-p4-r10-pure-trace.stderr": {
+    "stack_id_errors": 39,
+    "other_errors": []
+  },
+  "tcp-p1-r10-baseline-trace.stderr": {
+    "stack_id_errors": 26,
+    "other_errors": []
+  },
+  "ucx-p4-r10-baseline-trace.stderr": {
+    "stack_id_errors": 32,
+    "other_errors": []
+  },
+  "ucx-p1-r10-baseline-trace.stderr": {
+    "stack_id_errors": 15,
+    "other_errors": []
+  },
+  "tcp-p1-r10-pure-trace.stderr": {
+    "stack_id_errors": 20,
+    "other_errors": []
+  },
+  "ucx-p1-r10-pure-trace.stderr": {
+    "stack_id_errors": 2,
+    "other_errors": []
+  },
+  "tcp-p4-r10-baseline-trace.stderr": {
+    "stack_id_errors": 62,
+    "other_errors": []
+  },
+  "tcp-p4-r10-zc-trace.stderr": {
+    "stack_id_errors": 65,
+    "other_errors": []
+  },
+  "tcp-p1-r10-zc-trace.stderr": {
+    "stack_id_errors": 29,
+    "other_errors": []
+  }
+}

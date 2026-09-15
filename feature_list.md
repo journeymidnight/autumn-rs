@@ -50,17 +50,23 @@
   - 纯升级和新能力的效果分别报告；未测真实跨机或未通过上述验证时，不标记完成。
 - **Status**: 仅完成计划记录，尚未升级依赖或实测新版。
 - `passes: false`
-- **notes** (2026-09-14 implementation): Compio 0.19.2/cyper 0.9 and Rust 1.95
-  migration implemented; workspace/Python/UCX builds and 1,052 library tests pass.
-  Prepared-send zerocopy is opt-in/default-off; partial-send, delayed-release,
-  TCP cancel/close and >1,024-iovec TCP/UCX durable append tests pass. Python/FUSE
-  and two-partition byte checks pass. 240 cluster samples and receive/scheduler
-  experiments recorded in [upgrade report](docs/perf_compio_upgrade_20260914.md).
-  No stable zerocopy benefit; receive/scheduler defaults unchanged. H200-2 is
-  offline (user confirmed), so cross-host validation is unavailable. Full kernel
-  accounting, controlled scaling, real-path receive/scheduler evaluation and
-  the residual UCX 64KiB read difference remain open; passes stays false.
+- **notes** (2026-09-15 controlled validation): Compio 0.19.2/cyper 0.9 migration
+  implemented with 1,052 library tests and TCP/UCX/Python/FUSE correctness checks.
+  Completed 480 fixed-work performance samples plus 160 typed kernel diagnostic
+  samples; all 640 window/count/affinity checks pass. See [controlled report](docs/perf_compio_controlled_20260915.md).
+  Default-off zerocopy is slower on loopback; no production receive/scheduler
+  defaults changed. UCX 64KiB p1 reads still regress ~8%; UCX local protection
+  failure reproduced on both 0.18 and 0.19, tracked separately below. Shared-host
+  noise limits whole-machine efficiency claims; sampled stacks have ID collisions.
+  H200-2 offline, cross-host unavailable. Full acceptance remains passes:false.
 
+
+### F-UCX-LOCAL-PROTECTION — 四分区 UCX SEND 间歇性本地保护错误
+- **Trigger** (2026-09-14): compio 0.19 受控四分区 UCX 写入在 mlx5_1 上出现 Local protection error (synd 0x4 vend 0x52) 并 abort；compio 0.18 基线在相同拓扑的诊断采样中也复现，说明问题早于运行时升级。失败 SEND 包含无效/失效 lkey，根因尚未确定。
+- **Scope**: 定位 UCX 1.16 stream vectored send 的 buffer ownership、注册缓存和取消完成生命周期，复现后只保留有证据的修复；不得通过加超时、重试或丢弃失败样本掩盖。
+- **Acceptance**: 可重复触发的最小用例；修复消融失败/修复后通过；四分区 TCP/UCX 字节一致性、注册 buffer 取消/复用及重复压力验证；记录吞吐和 CPU 代价。
+- **notes**: 受控验证保留了 0.19 普通跑分和 0.18 诊断采样两份崩溃证据。后续重复成功不关闭该问题。
+- `passes: false`
 
 ### F-CORE-DATA-PATH-NEXT — further core-path performance work
 - Trigger: The 2026-09-14 review found additional costs beyond the validated pool/receive/read-planning fixes.

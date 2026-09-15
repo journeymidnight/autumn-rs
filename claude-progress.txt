@@ -1,3 +1,12 @@
+Date: 2026-09-15
+TaskStatus: not_completed
+Task scope: Complete controlled performance validation before cleanup, per user follow-up.
+Current summary: Completed 480 low-overhead fixed-work samples (3 rotated repetitions) plus 160 BPF diagnostic samples and 10 idle windows, 1/4 partitions, RF3 on three separate NVMe, matching old/new benchmark source, matching Rust 1.95 and corresponding-version clients. 640/640 operation/byte/partition/affinity/window checks pass; perf counters 100% running. CPU snapshot max envelope overhead 1.955ms; BPF marker max relative error 0.001573%. Host perf and container tracefs used; test tracefs unmounted after tracing.
+Results: docs/perf_compio_controlled_20260915.md and perf/controlled_validation/results. TCP 8MiB/depth8 p1 median MiB/s baseline/pure/zc=840/898/711, CPU s/GiB=4.99/4.85/5.27. Four-partition scaling measured with fixed per-partition work. SENDMSG_ZC and matching notification CQEs confirmed; receive copies unchanged. Exact typed kernel-thread/IRQ/softirq/alloc/SQE/CQE metrics retained. Shared-host interference means system totals are not isolated efficiency gains; stack-id collisions limit optional sampled stacks. Background flush warnings retained.
+Blocking findings: UCX 64KiB p1/depth8 read median 2797->2573 MiB/s (~8% regression), unresolved. UCX mlx5 local protection error on SEND reproduced on BOTH compio 0.19 untraced and 0.18 traced p4 attempts; later repeats passed but do not erase failure. Separate F-UCX-LOCAL-PROTECTION entry created, no speculative service fix. Cross-host unavailable (H200-2 offline). Full feature passes:false remains.
+Cleanup: All benchmark/perf/bpftrace/compiler processes exited. User-reported current CPU increase verified as other SGLang/nanochat/Python/atop tasks. Raw archive verified at /data08/autumn-perf-evidence/controlled-validation-20260915.tar.gz (470MiB); final temporary source/data cleanup follows.
+Next steps: Finalize cleanup and commit evidence. Future feature acceptance still requires resolving UCX read regression/local-protection failure and remaining real-path capability/cross-host gates.
+
 Date: 2026-09-14
 TaskStatus: completed
 Task scope: Clean dated perf artifacts from H200-1 dongmao-autumn at user request.
