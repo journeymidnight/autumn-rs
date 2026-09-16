@@ -3433,3 +3433,33 @@ Traced throughput is not a result (a uprobe fires on every memcpy). Keep the
 attribution threshold below one UCX AM fragment (1 KiB): UCX Stream receives
 return one fragment per call. After the run, confirm no `autumn-receive-copies`
 data directory remains on /data03, /data05 or /data08.
+
+## Verifying that evicted RPC connections close
+
+A client evicts a pooled connection on a timeout, and the manager, PS and stream
+pools do the same. Dropping the last `Rc<RpcClient>` must close that connection:
+both background tasks are cancelled, the socket half each owned is dropped, and
+the peer receives a FIN. Before this, the reader could not end on its own (nor a
+writer with frames queued against a peer that stopped reading), so an evicted
+connection stayed ESTABLISHED on both sides — with its queued request
+values still pinned — until the process exited.
+
+Check it on a live cluster from the client side, e.g. during a PS restart or any
+window that makes the SDK evict and reconnect:
+
+```sh
+# Connections from this client to the partition servers.
+ss -tnp state established "( dport = :<ps-port> )" | grep <client-pid>
+# Count them before and after the eviction window; the count must return to the
+# number of ACTIVE connections, not keep growing with each reconnect.
+ls -l /proc/<client-pid>/fd | grep -c socket
+```
+
+A socket that stays ESTABLISHED to a peer the client no longer talks to, or an
+fd count that rises with every reconnect, means a connection was abandoned
+instead of closed. The same count on the PS side should fall as clients let go.
+
+The regression test is `cargo test -p autumn-rpc --test client_teardown --
+--test-threads=1`: it drives timeouts against a peer that never reads, then
+asserts the request buffers are freed, no ESTABLISHED socket outlives its client,
+and the peer sees EOF.

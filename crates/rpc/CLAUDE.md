@@ -195,6 +195,48 @@ Calls: `call`, `call_vectored` (vectored ctrl, zero-copy parts),
   Without it, a stale `Rc<RpcClient>` in a pool would accept submits no live
   read_loop can dispatch. Pools treat `is_closed()` as evict-and-reconnect
   (`stream::conn_pool::get_client`).
+- **The two task handles are FIELDS, never `detach()`ed.** Dropping the last
+  `Rc<RpcClient>` cancels both tasks, which drops the socket halves and closes
+  the connection. This is the ONLY teardown there is. `read_loop` is the half
+  that always outlives a detached client: it blocks in `read` until EOF, so it
+  holds an evicted connection open even when that connection is IDLE and
+  healthy — the common case, since a server status error (stale region epoch)
+  and a token renewal each evict one with nothing in flight. `writer_task`
+  outlives its client alongside the reader whenever frames are queued: it blocks
+  in `write_all` on a peer that stopped reading, pinning every queued frame
+  behind that stalled write. An idle writer does end by itself, parked on
+  `submit_rx.next()`. Detached, an evicted
+  client therefore left the socket open on BOTH sides (no FIN, so the peer keeps
+  its own socket and conn task) until the process exited. Measured over 5
+  evictions of a never-reading peer: 5 ESTABLISHED sockets and 70 MiB of pinned
+  request values, released only when the PEER closed first. Test:
+  `tests/client_teardown.rs` — ablation: detaching the READER alone reds both
+  cases, detaching the writer alone reds the queued-values case.
+
+  Cancelling a task drops its future mid-op; compio holds the op's buffer until
+  the cancel CQE, so nothing is freed under the kernel. Abandoning a half-written
+  frame is sound BECAUSE this is a teardown — the peer sees the close right
+  behind the truncated bytes, and no caller of ours is left waiting: every
+  in-repo path holds its own `Rc` across the await (`&self` for the call family,
+  `PinnedRecv` for the pipelined senders). That is a property of the call sites,
+  not an API guarantee — an outside `send_frame` user may drop the client
+  mid-await, and gets a clean `Canceled` → `ConnectionClosed`.
+
+  On UCX a cancelled transfer LEAKS its buffer by
+  design instead of freeing one UCX may still write into (`ucx_recv` /
+  `ucx_send` / `ucx_send_vectored` `ManuallyDrop`; the cancel drain can bail out
+  at its progress cap while UCX still holds the pointer): at most one in-flight
+  recv window plus one in-flight send per closed connection, the send being the
+  larger (a whole bulk frame plus its iov array) and the recv window not fixed at
+  64 KiB (`read_loop` sizes an in-progress frame's window to
+  `front_frame_remaining()`). Bounded per connection, against leaking the
+  connection itself. UCX teardown is reasoned from the code, not measured.
+
+  A pipelined caller that holds only the response receiver must PIN its
+  connection, or an unrelated task's eviction now cancels its in-flight request:
+  `stream::conn_pool::PinnedRecv` carries the `Rc` for `send_vectored` /
+  `send_prepared` (replica appends), which is what scopes a connection to the
+  work outstanding on it rather than to the pool entry.
 
 ### Zero-copy receive-into-pooled
 

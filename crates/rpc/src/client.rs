@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
-use compio::runtime::spawn;
+use compio::runtime::{spawn, JoinHandle};
 use compio::BufResult;
 use futures::channel::{mpsc, oneshot};
 use futures::StreamExt;
@@ -168,6 +168,46 @@ pub struct RpcClient {
     /// (no read_loop alive to deliver the response). Without this flag,
     /// a stale pooled client whose peer has died blocks callers forever.
     closed: Rc<Cell<bool>>,
+    /// The connection's teardown: these handles are HELD, not `detach()`ed,
+    /// so dropping the last `Rc<RpcClient>` cancels both background tasks,
+    /// which drops the socket halves and closes the connection.
+    ///
+    /// Detached, the tasks outlived every handle to them and only the PEER
+    /// could end them. `read_loop` is the one that always outlives its client:
+    /// it blocks in `read` until EOF, so it holds an evicted connection open
+    /// even when the connection is IDLE and healthy — which is the common case,
+    /// since a stale-epoch status error and a token renewal each evict one with
+    /// nothing in flight. `writer_task` joins it whenever frames are queued: it
+    /// blocks in `write_all` against a peer that stopped reading and so never
+    /// returns to notice its channel closed, pinning every queued frame behind
+    /// that stalled write. (An idle writer does end on its own — parked on
+    /// `submit_rx.next()`, it sees the channel close.) Measured before this:
+    /// five evictions of a never-reading peer held five ESTABLISHED sockets and
+    /// 70 MiB of queued values, and the peer never got a FIN, so it held its own
+    /// socket and conn task too. Everything was released only when the peer
+    /// closed first.
+    ///
+    /// Cancellation is what a compio `JoinHandle`'s drop does; the task is
+    /// scheduled, runs no further poll, and its future is dropped. That drops
+    /// an in-flight read/write op too — compio keeps the op's buffer until the
+    /// cancel CQE lands, so no buffer is freed under the kernel. Abandoning a
+    /// half-written frame is sound BECAUSE this is a teardown: the peer sees
+    /// the connection close right behind the truncated bytes, and no caller can
+    /// still be waiting (a caller holds its own `Rc`, so `Drop` cannot run
+    /// while one is in flight).
+    ///
+    /// On UCX a cancelled transfer LEAKS its buffer by design rather than free
+    /// one UCX may still be writing into (`ucx_recv` / `ucx_send` /
+    /// `ucx_send_vectored` hold it in `ManuallyDrop`, because the cancel drain
+    /// can bail out at its progress cap while UCX still holds the pointer). Per
+    /// closed connection that is at most one in-flight recv window plus one
+    /// in-flight send: the SEND is the larger of the two (a whole bulk frame —
+    /// MiBs — plus its iov array), and the recv window is not fixed at 64 KiB
+    /// either, since `read_loop` sizes an in-progress frame's window to
+    /// `front_frame_remaining()`. Bounded per connection, against leaking the
+    /// connection itself.
+    _writer_task: JoinHandle<()>,
+    _reader_task: JoinHandle<()>,
 }
 
 impl RpcClient {
@@ -204,14 +244,6 @@ impl RpcClient {
         let (submit_tx, submit_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
         let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-        let client = Rc::new(Self {
-            submit_tx: RefCell::new(submit_tx),
-            pending: pending.clone(),
-            next_id: Cell::new(1),
-            peer_addr,
-            closed: closed.clone(),
-        });
-
         // SQ: writer_task drains submit_rx and writes to the socket.
         // On exit (write error or channel-close) we set `closed` BEFORE
         // clearing `pending` so any caller racing a fresh `send_*` checks
@@ -221,17 +253,16 @@ impl RpcClient {
         // caller's `rx.await` then hangs forever (the original hang's root cause).
         let pending_for_writer = pending.clone();
         let closed_for_writer = closed.clone();
-        spawn(async move {
+        let writer_handle = spawn(async move {
             writer_task(writer, submit_rx, pending_for_writer.clone(), peer_addr).await;
             closed_for_writer.set(true);
             pending_for_writer.borrow_mut().clear();
-        })
-        .detach();
+        });
 
         // CQ: read_loop decodes response frames and dispatches via pending.
-        let pending_for_reader = pending;
-        let closed_for_reader = closed;
-        spawn(async move {
+        let pending_for_reader = pending.clone();
+        let closed_for_reader = closed.clone();
+        let reader_handle = spawn(async move {
             if let Err(e) = read_loop(reader, pending_for_reader.clone(), peer_addr).await {
                 tracing::warn!(addr = %peer_addr, error = %e, "rpc client reader exited");
             }
@@ -240,10 +271,19 @@ impl RpcClient {
             // entry that has no read_loop alive to dispatch it.
             closed_for_reader.set(true);
             pending_for_reader.borrow_mut().clear();
-        })
-        .detach();
+        });
 
-        Ok(client)
+        // The handles are FIELDS, not `detach()` — see `_writer_task`. They are
+        // this connection's only teardown.
+        Ok(Rc::new(Self {
+            submit_tx: RefCell::new(submit_tx),
+            pending,
+            next_id: Cell::new(1),
+            peer_addr,
+            closed,
+            _writer_task: writer_handle,
+            _reader_task: reader_handle,
+        }))
     }
 
     /// True when either `read_loop` or `writer_task` has exited.

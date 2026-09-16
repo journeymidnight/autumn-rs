@@ -2170,7 +2170,7 @@ enum ChainFail {
 
 struct ChainFwdJob {
     parts: Vec<Bytes>,
-    rx_back: futures::channel::oneshot::Sender<Result<futures::channel::oneshot::Receiver<Frame>>>,
+    rx_back: futures::channel::oneshot::Sender<Result<crate::conn_pool::PinnedRecv>>,
 }
 
 impl ExtentNode {
@@ -2181,7 +2181,7 @@ impl ExtentNode {
         &self,
         addr: &str,
         parts: Vec<Bytes>,
-    ) -> futures::channel::oneshot::Receiver<Result<futures::channel::oneshot::Receiver<Frame>>>
+    ) -> futures::channel::oneshot::Receiver<Result<crate::conn_pool::PinnedRecv>>
     {
         let (rx_back_tx, rx_back) = futures::channel::oneshot::channel();
         let job = ChainFwdJob {

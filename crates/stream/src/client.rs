@@ -2283,7 +2283,7 @@ async fn launch_append(
             (addr, rx_res)
         }
     });
-    let receivers: Vec<(String, Result<oneshot::Receiver<autumn_rpc::Frame>>)> =
+    let receivers: Vec<(String, Result<crate::conn_pool::PinnedRecv>)> =
         join_all(send_futs).await;
 
     // bound each replica's recv. A half-open socket whose SubmitMsg
