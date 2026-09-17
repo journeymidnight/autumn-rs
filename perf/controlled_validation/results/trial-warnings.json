@@ -1,0 +1,225 @@
+{
+  "tcp-p1-r0-baseline": [],
+  "tcp-p1-r0-pure": [],
+  "tcp-p1-r0-zc": [],
+  "tcp-p1-r1-baseline": [],
+  "tcp-p1-r1-pure": [],
+  "tcp-p1-r1-zc": [],
+  "tcp-p1-r10-baseline": [],
+  "tcp-p1-r10-pure": [],
+  "tcp-p1-r10-zc": [],
+  "tcp-p1-r2-baseline": [],
+  "tcp-p1-r2-pure": [],
+  "tcp-p1-r2-zc": [],
+  "tcp-p4-r0-baseline": [],
+  "tcp-p4-r0-pure": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:25:15.220643Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 27"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:25:15.221760Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 29"
+    }
+  ],
+  "tcp-p4-r0-zc": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:30:49.936660Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 27"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:30:49.938097Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 29"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:31:35.866063Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 37"
+    }
+  ],
+  "tcp-p4-r1-baseline": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:52:00.362875Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 26"
+    }
+  ],
+  "tcp-p4-r1-pure": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:48:02.399427Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 35"
+    }
+  ],
+  "tcp-p4-r1-zc": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:49:33.748921Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 26"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:49:43.749523Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 29"
+    }
+  ],
+  "tcp-p4-r10-baseline": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:35:52.300837Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 27"
+    }
+  ],
+  "tcp-p4-r10-pure": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:39:12.376929Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 26"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:39:12.377714Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 28"
+    }
+  ],
+  "tcp-p4-r10-zc": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:42:51.846615Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: truncate failed: precondition failed: stream changed concurrently (CAS conflict); retry with a fresh snapshot"
+    }
+  ],
+  "tcp-p4-r2-baseline": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:16:02.612801Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 26"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:16:02.613548Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 28"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:16:52.097108Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 36"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:16:52.099222Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 39"
+    }
+  ],
+  "tcp-p4-r2-pure": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:18:24.473569Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 27"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:19:09.964135Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 36"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:19:09.980041Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 37"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:19:09.998752Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: truncate failed: precondition failed: stream changed concurrently (CAS conflict); retry with a fresh snapshot"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:19:10.000120Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: truncate failed: precondition failed: stream changed concurrently (CAS conflict); retry with a fresh snapshot"
+    }
+  ],
+  "tcp-p4-r2-zc": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:13:40.280668Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 27"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:13:40.281536Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 28"
+    }
+  ],
+  "ucx-p1-r0-baseline": [],
+  "ucx-p1-r0-pure": [],
+  "ucx-p1-r1-baseline": [],
+  "ucx-p1-r1-pure": [],
+  "ucx-p1-r10-baseline": [],
+  "ucx-p1-r10-pure": [],
+  "ucx-p1-r2-baseline": [],
+  "ucx-p1-r2-pure": [],
+  "ucx-p4-r0-baseline": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:37:47.452539Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 36"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:37:47.482764Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 35"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:37:47.485230Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: truncate failed: precondition failed: stream changed concurrently (CAS conflict); retry with a fresh snapshot"
+    }
+  ],
+  "ucx-p4-r0-pure": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:39:36.623057Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 27"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-14T23:40:35.553579Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 36"
+    }
+  ],
+  "ucx-p4-r1-baseline": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:04:14.354463Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: truncate failed: precondition failed: stream changed concurrently (CAS conflict); retry with a fresh snapshot"
+    }
+  ],
+  "ucx-p4-r1-pure": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:07:12.938427Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 37"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:07:12.970595Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 35"
+    }
+  ],
+  "ucx-p4-r10-baseline": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:54:36.597490Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 27"
+    }
+  ],
+  "ucx-p4-r10-pure": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:57:43.355601Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server::background\u001b[0m\u001b[2m:\u001b[0m write batch error: log_stream append_segments: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 27"
+    }
+  ],
+  "ucx-p4-r2-baseline": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:25:10.852706Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 36"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:25:10.856294Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 37"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:25:10.857437Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 39"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:25:10.956131Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: truncate failed: precondition failed: stream changed concurrently (CAS conflict); retry with a fresh snapshot"
+    }
+  ],
+  "ucx-p4-r2-pure": [
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:27:54.018151Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 37"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:27:54.076421Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 35"
+    },
+    {
+      "file": "ps.log",
+      "line": "\u001b[2m2026-09-15T00:27:54.096838Z\u001b[0m \u001b[31mERROR\u001b[0m \u001b[2mautumn_partition_server\u001b[0m\u001b[2m:\u001b[0m background flush commit error: stream_alloc_extent failed: precondition failed: no healthy node available to allocate extent 39"
+    }
+  ]
+}

@@ -1,0 +1,57 @@
+{
+  "expected_cells": 640,
+  "actual_cells": 640,
+  "max_cpu_envelope_overhead_ms": 1.9546589999999142,
+  "problems": [],
+  "counter_running_percent_min": 100.0,
+  "trace_windows": 170,
+  "max_trace_marker_relative_error": 1.5720523470097447e-05,
+  "trace_stack_errors": {
+    "tcp-p4-r10-pure-trace.stderr": {
+      "stack_id_errors": 64,
+      "other_errors": []
+    },
+    "ucx-p4-r10-pure-trace.stderr": {
+      "stack_id_errors": 39,
+      "other_errors": []
+    },
+    "tcp-p1-r10-baseline-trace.stderr": {
+      "stack_id_errors": 26,
+      "other_errors": []
+    },
+    "ucx-p4-r10-baseline-trace.stderr": {
+      "stack_id_errors": 32,
+      "other_errors": []
+    },
+    "ucx-p1-r10-baseline-trace.stderr": {
+      "stack_id_errors": 15,
+      "other_errors": []
+    },
+    "tcp-p1-r10-pure-trace.stderr": {
+      "stack_id_errors": 20,
+      "other_errors": []
+    },
+    "ucx-p1-r10-pure-trace.stderr": {
+      "stack_id_errors": 2,
+      "other_errors": []
+    },
+    "tcp-p4-r10-baseline-trace.stderr": {
+      "stack_id_errors": 62,
+      "other_errors": []
+    },
+    "tcp-p4-r10-zc-trace.stderr": {
+      "stack_id_errors": 65,
+      "other_errors": []
+    },
+    "tcp-p1-r10-zc-trace.stderr": {
+      "stack_id_errors": 29,
+      "other_errors": []
+    }
+  },
+  "trace_counter_errors": 0,
+  "reliability_failures": [
+    "compio 0.19 UCX p4 untraced local protection error",
+    "compio 0.18 UCX p4 traced local protection error"
+  ],
+  "tracefs_mount": "container-only mount unmounted after all bpftrace processes exited"
+}

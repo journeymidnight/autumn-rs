@@ -64,7 +64,8 @@ conn):
 ┌─ handle_ps_connection ──────────────────────────────────────────┐
 │  SQ side — persistent read future:                              │
 │    Option<LocalBoxFuture<'static, PsReadBurst>>                 │
-│    owns OwnedReadHalf + 64 KiB buf across iterations;           │
+│    owns OwnedReadHalf + decoder read window (64 KiB, or the     │
+│    rest of a large non-bulk frame) across iterations;           │
 │    NEVER dropped mid-flight (io_uring SQE stability)            │
 │                                                                 │
 │  CQ side — FuturesUnordered<LocalBoxFuture<'static, ...>>       │
@@ -595,18 +596,20 @@ req.offset`, `value_len = r_len`. Single-key `get_direct` (0,0) is the
   response (`extent_id == 0`); `get_value` (non-redirect callers) never yields
   `GetOutcome::Redirect`. No wire-struct change → no WIRE bump.
 
-### UCX end-to-end zero-copy read (`MSG_GET_BULK`)
+### Bulk read without application copies (`MSG_GET_BULK`)
 
 The kvcache SDK's `get_into` issues `MSG_GET_BULK` so the value crosses
 `EN → PS → client` with no FrameDecoder/encode copies (the client lands it in a
-registered pool buffer, then one memcpy into the caller's dest). The seam is
+pool buffer, then one memcpy into the caller's dest). Each receiving hop still
+pays its transport copy: the TCP kernel copy, or UCX Stream's unpack, which a
+registered buffer does not remove. The seam is
 `resolve_value`/`read_value_from_log` (`background.rs`) returning **`Bytes`**, not
 `Vec<u8>`:
 - **VP value (UCX + TCP)**: `read_value_from_log` calls
   `StreamClient::read_value_into_pooled`, which recvs the value straight into a
   `RegPool` `PooledBuf` (EN emits `[bulk head][value]` as 2 `Bytes`, value aliases
-  the EN pread buffer — no encode copy). UCX recvs into a *registered* buffer
-  (RDMA); TCP recvs via a compio owned read (`read_exact_into_pooled`) — only the
+  the EN pread buffer — no encode copy). UCX Stream unpacks into the pooled
+  buffer; TCP recvs via a compio owned read (`read_exact_into_pooled`) — only the
   kernel copy, no FrameDecoder copy. The PS hands the value onward as
   `Bytes::from_owner(pb)` (aliases the pool buffer; returns to the pool when that
   `Bytes` drops after the client write completes). Falls back to the
@@ -622,18 +625,25 @@ registered pool buffer, then one memcpy into the caller's dest). The seam is
   concat copy. On-the-wire bytes are identical to the concatenated form, so the
   client read path (`call_into_pooled`) is unchanged.
 
-`handle_get` (rkyv `GetResp`, generic SDK) copies the value once (the rkyv encode
-copies regardless). Net read-path value copies: VP-over-UCX `get_into` = **1**
-(the client-side pool→dest memcpy; the PS/EN hops stay 0-copy — the
+`MSG_GET_BULK` is the only point read (the rkyv `MSG_GET`, 0x41, is reserved since
+wire v41: it copied a value into the archive four times on this server). A bulk
+reply carries a failure as a `CODE_*` byte: translate the handler's `StatusCode`
+with `partition_rpc::code_for_status`, never `status as u8` (the spaces diverge above 3;
+a cast once turned a GC-pinned read's `Unavailable` into a terminal "value too large"). Net application copies of a VP value on `get_into` = **1**
+(the client-side pool→dest memcpy; the PS/EN hops add none beyond each
+receive's transport copy — the
 recv-into-caller-dest primitive that made it 0 was removed for cancel-safety +
 timeout-ability, see autumn-rpc CLAUDE "Why pooled-only"). Cancel-safety of the
 registered recv lives in the read_loop that OWNS the `PooledBuf` (returns it to
 the pool on cancel).
 
-### PS write-recv zero-copy (bulk writes, large values)
+### PS bulk write receive (large values)
 
-Symmetric on the WRITE recv side. `drain_bulk_writes` (`lib.rs`) runs in the ps-conn
-read loop right after `decoder.feed`, BEFORE the normal decode: if the FRONT frame
+Symmetric on the WRITE recv side. The ps-conn reads into the decoder's own buffer
+(`ps_read_window`; autumn-rpc "Receiving into the decoder"), and a bulk write at
+the front keeps a fixed 64 KiB window so only its prologue and a bounded prefix
+land there. `drain_bulk_writes` (`lib.rs`) runs right after the read, BEFORE the
+normal decode: if the FRONT frame
 is a bulk write whose raw tail is `>= AUTUMN_PS_BULK_RECV_MIN_BYTES` (64 KiB), it
 recvs that tail straight into a `PooledBuf` instead of letting `FrameDecoder`
 accumulate (and copy) it. BOTH value-separable write shapes qualify —
@@ -654,7 +664,8 @@ Mechanics:
   downstream) and needs none: declining does not make the bytes go away, it makes
   `FrameDecoder` reserve the same count plus a copy.
 - Consume the prologue, `drain_into` any buffered tail prefix into the
-  `PooledBuf`, recv the remainder (UCX `recv_into` registered / TCP
+  `PooledBuf` (the one application copy, ≤ one 64 KiB window — a whole 64 KiB
+  value; 0.8% of an 8 MiB one), recv the remainder (UCX `recv_into` / TCP
   `read_exact_into_pooled` owned). Nothing follows the tail (v28 removed the
   per-value CRC — value integrity is the transport's job).
 - The tail rides onward as `Bytes::from_owner(pb)` via a
@@ -1547,7 +1558,7 @@ Each `PartitionData` carries `region_epoch: u64`, populated at open from
 `MgrRegionInfo.region_epoch` (manager bumps on every `rg` rewrite — split / merge).
 Hot-path handlers compare the request's stamped `region_epoch` against
 `p.region_epoch`; mismatch returns `StatusCode::FailedPrecondition` so the SDK's
-`Err`-arm refresh path engages. Check sites: `handle_get` / `handle_head` (before
+`Err`-arm refresh path engages. Check sites: `handle_get_bulk` / `handle_head` (before
 in_range), `handle_range` (at top — **load-bearing**: without it a stale-epoch range
 silently filters out-of-range keys and returns a partial `Ok(RangeResp)` the SDK
 can't detect), `enqueue_put` / `enqueue_delete` / `enqueue_stream_put`
@@ -1753,7 +1764,7 @@ Three fixes bound the restart replay window (worst case per partition =
 
 10. **Memtable backing = `parking_lot::RwLock<BTreeMap>`** — the active memtable has
     exactly one writer (the P-log thread's Phase 3) and N readers (ps-conn
-    `handle_get` + P-log). Correctness:
+    `handle_get_bulk` + P-log). Correctness:
     - Writer holds the write lock for one `insert_batch` call (up to 256 entries) then
       releases; subsequent readers take the read lock AFTER → linearisable
       Put-then-Get.
@@ -2023,7 +2034,7 @@ Three fixes bound the restart replay window (worst case per partition =
     a transient fence failure is logged and the open PROCEEDS (never wedge). This makes the
     append-path fence EAGER, not first-append-lazy; it does not replace it. Regression
     guard: `crates/manager/tests/system_sigstop_zombie_writer.rs` (asserts the old owner
-    can no longer cleanly ACK a stale-epoch write). The read-side `handle_get` write fence
+    can no longer cleanly ACK a stale-epoch write). The read-side `handle_get_bulk` write fence
     (a residual STALE READ before the old owner closes the reassigned partition) is a
     documented SEPARATE follow-up.
 
@@ -2107,3 +2118,12 @@ sequence → silent data loss.
 Trigger is power-loss / bit-rot class (a process kill loses nothing un-fsynced + leaves
 the dirent). Test-only `decode_records_full` / `decode_records_with_offsets` keep the old
 skip (not on any production path).
+
+## Compio 0.19 runtime
+
+The runtime dependency is 0.19.2, requiring Rust >=1.95. The explicit child CPU
+pin remains before runtime construction; P-log and P-sst keep separate affinity.
+JoinHandle now reports JoinError::Panicked/Cancelled and still cancels on drop.
+Supervised/fail-stop tasks keep their inner catch_unwind for error reporting and
+restart/exit policy. Receive concurrency, backpressure and runtime scheduling
+settings remain unchanged. The binary can opt into prepared-replica TCP zerocopy.

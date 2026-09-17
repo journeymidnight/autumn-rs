@@ -23,11 +23,12 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
-use compio::runtime::spawn;
+use compio::runtime::{spawn, JoinHandle};
 use compio::BufResult;
 use futures::channel::{mpsc, oneshot};
 use futures::StreamExt;
@@ -126,6 +127,7 @@ enum SubmitMsg {
     /// A vectored frame `[header][part0][part1]...` (used by `call_vectored`,
     /// `send_vectored`). Zero-copy for the payload parts.
     Vectored { bufs: Vec<Bytes>, req_id: u32 },
+    Prepared { bufs: Vec<Bytes>, req_id: u32 },
 }
 
 impl SubmitMsg {
@@ -133,6 +135,7 @@ impl SubmitMsg {
         match self {
             SubmitMsg::Single { req_id, .. } => *req_id,
             SubmitMsg::Vectored { req_id, .. } => *req_id,
+            SubmitMsg::Prepared { req_id, .. } => *req_id,
         }
     }
 }
@@ -165,6 +168,46 @@ pub struct RpcClient {
     /// (no read_loop alive to deliver the response). Without this flag,
     /// a stale pooled client whose peer has died blocks callers forever.
     closed: Rc<Cell<bool>>,
+    /// The connection's teardown: these handles are HELD, not `detach()`ed,
+    /// so dropping the last `Rc<RpcClient>` cancels both background tasks,
+    /// which drops the socket halves and closes the connection.
+    ///
+    /// Detached, the tasks outlived every handle to them and only the PEER
+    /// could end them. `read_loop` is the one that always outlives its client:
+    /// it blocks in `read` until EOF, so it holds an evicted connection open
+    /// even when the connection is IDLE and healthy — which is the common case,
+    /// since a stale-epoch status error and a token renewal each evict one with
+    /// nothing in flight. `writer_task` joins it whenever frames are queued: it
+    /// blocks in `write_all` against a peer that stopped reading and so never
+    /// returns to notice its channel closed, pinning every queued frame behind
+    /// that stalled write. (An idle writer does end on its own — parked on
+    /// `submit_rx.next()`, it sees the channel close.) Measured before this:
+    /// five evictions of a never-reading peer held five ESTABLISHED sockets and
+    /// 70 MiB of queued values, and the peer never got a FIN, so it held its own
+    /// socket and conn task too. Everything was released only when the peer
+    /// closed first.
+    ///
+    /// Cancellation is what a compio `JoinHandle`'s drop does; the task is
+    /// scheduled, runs no further poll, and its future is dropped. That drops
+    /// an in-flight read/write op too — compio keeps the op's buffer until the
+    /// cancel CQE lands, so no buffer is freed under the kernel. Abandoning a
+    /// half-written frame is sound BECAUSE this is a teardown: the peer sees
+    /// the connection close right behind the truncated bytes, and no caller can
+    /// still be waiting (a caller holds its own `Rc`, so `Drop` cannot run
+    /// while one is in flight).
+    ///
+    /// On UCX a cancelled transfer LEAKS its buffer by design rather than free
+    /// one UCX may still be writing into (`ucx_recv` / `ucx_send` /
+    /// `ucx_send_vectored` hold it in `ManuallyDrop`, because the cancel drain
+    /// can bail out at its progress cap while UCX still holds the pointer). Per
+    /// closed connection that is at most one in-flight recv window plus one
+    /// in-flight send: the SEND is the larger of the two (a whole bulk frame —
+    /// MiBs — plus its iov array), and the recv window is not fixed at 64 KiB
+    /// either, since `read_loop` sizes an in-progress frame's window to
+    /// `front_frame_remaining()`. Bounded per connection, against leaking the
+    /// connection itself.
+    _writer_task: JoinHandle<()>,
+    _reader_task: JoinHandle<()>,
 }
 
 impl RpcClient {
@@ -201,14 +244,6 @@ impl RpcClient {
         let (submit_tx, submit_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
         let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
-        let client = Rc::new(Self {
-            submit_tx: RefCell::new(submit_tx),
-            pending: pending.clone(),
-            next_id: Cell::new(1),
-            peer_addr,
-            closed: closed.clone(),
-        });
-
         // SQ: writer_task drains submit_rx and writes to the socket.
         // On exit (write error or channel-close) we set `closed` BEFORE
         // clearing `pending` so any caller racing a fresh `send_*` checks
@@ -218,17 +253,16 @@ impl RpcClient {
         // caller's `rx.await` then hangs forever (the original hang's root cause).
         let pending_for_writer = pending.clone();
         let closed_for_writer = closed.clone();
-        spawn(async move {
+        let writer_handle = spawn(async move {
             writer_task(writer, submit_rx, pending_for_writer.clone(), peer_addr).await;
             closed_for_writer.set(true);
             pending_for_writer.borrow_mut().clear();
-        })
-        .detach();
+        });
 
         // CQ: read_loop decodes response frames and dispatches via pending.
-        let pending_for_reader = pending;
-        let closed_for_reader = closed;
-        spawn(async move {
+        let pending_for_reader = pending.clone();
+        let closed_for_reader = closed.clone();
+        let reader_handle = spawn(async move {
             if let Err(e) = read_loop(reader, pending_for_reader.clone(), peer_addr).await {
                 tracing::warn!(addr = %peer_addr, error = %e, "rpc client reader exited");
             }
@@ -237,10 +271,19 @@ impl RpcClient {
             // entry that has no read_loop alive to dispatch it.
             closed_for_reader.set(true);
             pending_for_reader.borrow_mut().clear();
-        })
-        .detach();
+        });
 
-        Ok(client)
+        // The handles are FIELDS, not `detach()` — see `_writer_task`. They are
+        // this connection's only teardown.
+        Ok(Rc::new(Self {
+            submit_tx: RefCell::new(submit_tx),
+            pending,
+            next_id: Cell::new(1),
+            peer_addr,
+            closed,
+            _writer_task: writer_handle,
+            _reader_task: reader_handle,
+        }))
     }
 
     /// True when either `read_loop` or `writer_task` has exited.
@@ -274,9 +317,9 @@ impl RpcClient {
     /// in-flight buffer — so a cancelled/timed-out caller can NOT leave the
     /// NIC writing a freed/recycled buffer, and the buffer is always reclaimed
     /// (handed back on success, dropped→pool on cancel — never leaked).
-    /// Returns a [`BulkResp`] (filled `PooledBuf` + status code + message). On
-    /// UCX the value RDMAs into the registered pool buffer (memh zero-copy);
-    /// on TCP the value is copied off the wire into a (plain) pool buffer.
+    /// Returns a [`BulkResp`] (filled `PooledBuf` + status code + message). The
+    /// value's one receive copy lands in the pool buffer: a UCX Stream unpack
+    /// or the TCP kernel copy.
     pub async fn call_into_pooled(
         &self,
         msg_type: u8,
@@ -406,7 +449,7 @@ impl RpcClient {
         let bufs = payload.frame_parts(req_id, msg_type);
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
-        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }) {
+        if let Err(e) = self.submit(SubmitMsg::Prepared { bufs, req_id }) {
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
@@ -630,6 +673,29 @@ impl RpcClient {
 /// so a frame is still contiguous from the peer's point of view.
 const IOV_MAX: usize = 1024;
 
+// Disabled until a deployment has measured a useful threshold on its kernel
+// and link. Applies only to prepared replica payloads, preserving other RPCs.
+static PREPARED_ZEROCOPY_MIN_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the minimum prepared frame size for TCP zerocopy. Zero disables it.
+pub fn set_prepared_zerocopy_min_bytes(bytes: usize) {
+    PREPARED_ZEROCOPY_MIN_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+async fn write_prepared(writer: &mut WriteHalf, bufs: Vec<Bytes>, size: usize) -> std::io::Result<()> {
+    let min = PREPARED_ZEROCOPY_MIN_BYTES.load(Ordering::Relaxed);
+    if min == 0 || size < min {
+        return write_vectored_chunked(writer, bufs).await;
+    }
+    let mut rest = bufs;
+    while !rest.is_empty() {
+        let tail = rest.split_off(rest.len().min(IOV_MAX));
+        writer.write_vectored_all_zerocopy(rest).await?;
+        rest = tail;
+    }
+    Ok(())
+}
+
 pub async fn write_vectored_chunked(
     writer: &mut WriteHalf,
     bufs: Vec<Bytes>,
@@ -670,7 +736,7 @@ async fn writer_task(
         // rare error branch).
         let (iov_count, total_bytes) = match &msg {
             SubmitMsg::Single { bytes, .. } => (1usize, bytes.len()),
-            SubmitMsg::Vectored { bufs, .. } => {
+            SubmitMsg::Vectored { bufs, .. } | SubmitMsg::Prepared { bufs, .. } => {
                 let total: usize = bufs.iter().map(|b| b.len()).sum();
                 (bufs.len(), total)
             }
@@ -681,6 +747,7 @@ async fn writer_task(
                 r
             }
             SubmitMsg::Vectored { bufs, .. } => write_vectored_chunked(&mut writer, bufs).await,
+            SubmitMsg::Prepared { bufs, .. } => write_prepared(&mut writer, bufs, total_bytes).await,
         };
 
         if let Err(e) = result {
@@ -722,53 +789,58 @@ async fn read_loop(
     pending: Rc<RefCell<HashMap<u32, Pending>>>,
     addr: SocketAddr,
 ) -> Result<(), RpcError> {
+    const READ_WINDOW: usize = 64 * 1024;
     let mut decoder = FrameDecoder::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let is_ucx = reader.is_ucx();
+
+    // bulk responses bypass FrameDecoder accumulation: always on UCX (recv
+    // straight into the pooled slab); on TCP only when the value is large
+    // enough to beat the batch-decoding normal path (small values fall through
+    // to finish_into_pooled_from_frame below). An ERROR frame (FLAG_ERROR —
+    // e.g. an authz PermissionDenied) carries a status envelope, not a bulk
+    // ctrl: it takes the normal decode path below, where the IntoPooled arm
+    // decodes it into an `RpcError::Status`.
+    //
+    // The value boundary needs `ctrl_len` (v28: variable-length ctrl =
+    // `[code][message]`); on TCP the gate uses the WHOLE payload (a ≥64 KiB
+    // payload of a small-ctrl frame is value-dominated), and the fast path
+    // reads ctrl_len from the verified prologue. The pending entry is checked
+    // without removing it: it must stay pending if the loop waits for more bytes.
+    let bulk_fast_path = |req_id: u32, flags: u8, payload_len: usize| {
+        (flags & crate::frame::FLAG_ERROR) == 0
+            && (is_ucx || payload_len >= TCP_RECV_INTO_POOLED_MIN_BYTES)
+            && matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_)))
+    };
 
     loop {
-        let BufResult(result, buf_back) = reader.read(buf).await;
-        buf = buf_back;
+        // Receive into the decoder's own buffer. A bulk response keeps the
+        // fixed window, so only its prologue and a bounded value prefix land
+        // here before the value is received into its pooled slab; any other
+        // incomplete frame receives the rest of itself in place.
+        let window_len = match decoder.peek_header() {
+            Some((req_id, _, flags, payload_len))
+                if !bulk_fast_path(req_id, flags, payload_len as usize) =>
+            {
+                decoder
+                    .front_frame_remaining()
+                    .map_or(READ_WINDOW, |rest| rest.max(READ_WINDOW))
+            }
+            _ => READ_WINDOW,
+        };
+        let BufResult(result, window) = reader.read(decoder.read_window(window_len)).await;
+        decoder.finish_read(window);
         let n = result?;
         if n == 0 {
             tracing::debug!(addr = %addr, "rpc connection closed by peer");
             return Ok(());
         }
 
-        decoder.feed(&buf[..n]);
-
         // Peek the next frame header so a bulk value-response can be recv'd
         // straight into its destination instead of accumulating in the
         // FrameDecoder. (Inner `break`s mean "wait for more bytes" — they
         // exit this while back to the socket read above.)
         while let Some((req_id, _mt, flags, payload_len)) = decoder.peek_header() {
-            let payload_len = payload_len as usize;
-
-            // Does a `call_into_pooled` caller await this req_id? (Checked
-            // without removing: the entry must stay pending if we `break` to
-            // wait for more bytes.)
-            let bulk_pending = matches!(
-                pending.borrow().get(&req_id),
-                Some(Pending::IntoPooled(_))
-            );
-
-            // bulk responses bypass FrameDecoder accumulation: always on UCX
-            // (the value lands zero-copy in its dest); on TCP only when the
-            // value is large enough to beat the batch-decoding normal path
-            // (small values fall through to finish_into_pooled_from_frame
-            // below). An ERROR frame (FLAG_ERROR — e.g. an authz
-            // PermissionDenied) carries a status envelope, not a bulk ctrl: it
-            // takes the normal decode path below, where the IntoPooled arm
-            // decodes it into an `RpcError::Status`.
-            //
-            // The value boundary needs `ctrl_len` (v28: variable-length ctrl =
-            // `[code][message]`); on TCP gate on the WHOLE payload first (a
-            // ≥64 KiB payload of a small-ctrl frame is value-dominated), then
-            // refine once ctrl_len is buffered.
-            let bulk_fast_path = bulk_pending
-                && (flags & crate::frame::FLAG_ERROR) == 0
-                && (reader.is_ucx() || payload_len >= TCP_RECV_INTO_POOLED_MIN_BYTES);
-
-            if bulk_fast_path {
+            if bulk_fast_path(req_id, flags, payload_len as usize) {
                 // Wait for the full prologue ([header][ctrl_len][ctrl][crc]),
                 // verify the ctrl CRC (header included),
                 // and parse the status ctrl. bulk ctrls are tiny (code+message),
@@ -907,8 +979,9 @@ enum ValueRecv {
 }
 
 /// UCX bulk value recv: drain the value's already-buffered prefix out of the
-/// decoder, then recv the remainder straight into `dest` (zero-copy via memh
-/// when `reg` is Some). `dest.len()` is the exact value length.
+/// decoder, then recv the remainder straight into `dest` (one UCX Stream
+/// unpack; `reg` names the slab's memh when registered). `dest.len()` is the
+/// exact value length.
 async fn recv_value_ucx(
     reader: &mut ReadHalf,
     decoder: &mut FrameDecoder,

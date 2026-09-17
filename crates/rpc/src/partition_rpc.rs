@@ -39,7 +39,14 @@ use rkyv::{Archive, Deserialize, Serialize};
 // ── msg_type constants ───────────────────────────────────────────────────────
 
 pub const MSG_PUT: u8 = 0x40;
-pub const MSG_GET: u8 = 0x41;
+// The rkyv point read (`GetReq` -> `GetResp`, value copied into the archive)
+// was REMOVED in wire v41: every read is `MSG_GET_BULK` (0x50), whose value
+// rides as its own tail. 0x41 stays RESERVED like 0x54 below. A stale peer can
+// still send it; `extract_part_id` reads an unknown type's part_id as 0, so the
+// PS refuses it (misroute, or `unknown msg_type` behind a partition 0) without
+// decoding it. Reassigned, the same bytes could bytecheck as the new request.
+//
+//   pub const MSG_GET:        u8 = 0x41;  // RESERVED (was rkyv point read)
 pub const MSG_DELETE: u8 = 0x42;
 pub const MSG_HEAD: u8 = 0x43;
 pub const MSG_RANGE: u8 = 0x44;
@@ -111,13 +118,12 @@ pub const MSG_MERGE_FREEZE: u8 = 0x4E;
 // manager→PS vp_refs pull). Extent retention is now driven by
 // `refs` (stream membership) alone — see manager `extent_can_delete`.
 
-// zero-copy GET. Same request shape as MSG_GET (GetReq), but the response
-// is value-separable for recv-into-registered-dest: a CRC-less frame whose
-// payload is `[bulk meta: code(1)+value_len(4)+reserved(4)][raw value]` (see
-// autumn_rpc::client::ZC_META_LEN; the reserved field held a value crc32c
-// before it was removed). The client uses RpcClient::call_into_dest to
-// land the value straight in its registered buffer (sglang page). Generic
-// MSG_GET keeps the rkyv GetResp form.
+// value-separable GET, the only point read. Request `GetReq`; the response is
+// a v28 bulk frame: ctrl = `[code: CODE_*][message]` (CRC'd with the header),
+// value = the raw value as its own tail, received by
+// `RpcClient::call_into_pooled` straight into a pooled buffer. The code byte
+// is in THIS module's `CODE_*` space — handlers translate a handler
+// `StatusCode` with `code_for_status`, never `status as u8`.
 pub const MSG_GET_BULK: u8 = 0x50;
 
 // zero-copy PUT (client -> PS write hop). Same semantics as MSG_PUT but
@@ -252,7 +258,7 @@ pub struct BatchDeleteResp {
     pub statuses: Vec<u8>,
 }
 
-/// redirect GET. Same request shape as MSG_GET (`GetReq`). For a
+/// redirect GET. Same request shape as MSG_GET_BULK (`GetReq`). For a
 /// large (>= 64 KiB) full-value ValuePointer read the PS answers with a
 /// DESCRIPTOR (extent + the value's exact byte range inside the extent +
 /// replica addresses + eversion) instead of proxying the bytes; the
@@ -262,7 +268,7 @@ pub struct BatchDeleteResp {
 /// OPTIMIZATION, never a correctness dependency: any client-side
 /// direct-read failure (eversion bumped by EC conversion, extent GC'd
 /// between redirect and read, replica down) falls back to the plain
-/// MSG_GET / MSG_GET_BULK proxy path, which re-resolves through the PS.
+/// MSG_GET_BULK proxy path, which re-resolves through the PS.
 pub const MSG_GET_REDIRECT: u8 = 0x56;
 
 /// first-frame connection authentication. The client sends a signed
@@ -660,6 +666,27 @@ pub const CODE_REGION_EPOCH_STALE: u8 = 8;
 /// and retry.
 pub const CODE_FENCED: u8 = 9;
 
+/// The `CODE_*` byte that carries a handler `StatusCode` in a response whose
+/// ctrl holds a code instead of a frame-level error (`MSG_GET_BULK`).
+///
+/// The two spaces agree only up to 3. `StatusCode::Unavailable` is 5, which
+/// here is `CODE_VALUE_TOO_LARGE`: a raw cast turned a retryable GC-pin
+/// refusal on a bulk read into a terminal "value too large".
+pub fn code_for_status(status: crate::StatusCode) -> u8 {
+    use crate::StatusCode;
+    match status {
+        StatusCode::Ok => CODE_OK,
+        StatusCode::NotFound => CODE_NOT_FOUND,
+        StatusCode::InvalidArgument => CODE_INVALID_ARGUMENT,
+        StatusCode::FailedPrecondition => CODE_PRECONDITION,
+        StatusCode::Unavailable => CODE_UNAVAILABLE,
+        StatusCode::Internal
+        | StatusCode::AlreadyExists
+        | StatusCode::PermissionDenied
+        | StatusCode::NamespaceUnknown => CODE_ERROR,
+    }
+}
+
 // ── Request/Response types ─────────────────────────────────────────────────
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -709,13 +736,6 @@ pub struct GetReq {
     pub length: u32,
     /// See `PutReq.region_epoch`.
     pub region_epoch: u64,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct GetResp {
-    pub code: u8,
-    pub message: String,
-    pub value: Vec<u8>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -1038,7 +1058,7 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
             .and_then(|b| b.try_into().ok())
             .map(u64::from_le_bytes)
             .unwrap_or(0),
-        MSG_GET | MSG_GET_BULK | MSG_GET_REDIRECT => rkyv_decode::<GetReq>(payload)
+        MSG_GET_BULK | MSG_GET_REDIRECT => rkyv_decode::<GetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
         MSG_GET_REDIRECT_MANY => rkyv_decode::<GetRedirectManyReq>(payload)
@@ -1101,7 +1121,6 @@ mod msg_type_tests {
     fn msg_type_constants_dont_collide() {
         let all = [
             MSG_PUT,
-            MSG_GET,
             MSG_DELETE,
             MSG_HEAD,
             MSG_RANGE,

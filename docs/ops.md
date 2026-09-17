@@ -3317,3 +3317,149 @@ kubectl -n autumn exec autumn-manager-0 -- \
 The last one matters: an op leaving `ops list --active` proves only that it
 stopped, not that it succeeded. `ops history` says `succeeded` and names the
 node the slot landed on.
+
+
+## Compio runtime upgrade verification
+
+Build the workspace and standalone Python binding with Rust 1.95 or newer.
+Compio 0.19.2 and cyper 0.9 must be resolved together; do not mix the old cyper
+family into a process using the new runtime. Check both dependency trees:
+
+```sh
+cargo tree -i compio
+cargo tree --manifest-path python/Cargo.toml -i compio
+cargo check --workspace --all-targets --features autumn-server/ucx
+cargo check --manifest-path python/Cargo.toml --features ucx
+cargo test --workspace --lib --features autumn-server/ucx -- --test-threads=1
+cargo test -p autumn-transport --features ucx --test zerocopy_tcp -- --test-threads=1
+AUTUMN_TEST_ZEROCOPY=1 cargo test -p autumn-stream --test prepared_append
+cargo build -p autumn-server --bins
+cargo test -p autumn-manager --test system_fuse_read --test system_fuse_eof_clobber \
+  --test system_fuse_flush_error_sticky --test system_fuse_release_best_effort \
+  -- --ignored --test-threads=1
+```
+
+For UCX, run prepared_append with `--features autumn-rpc/ucx` and
+`AUTUMN_TEST_UCX_BIND='[<RoCE-IP>]:0'`, plus the deployment's UCX_TLS and
+UCX_NET_DEVICES. This validates actual disk bytes and append offsets.
+The zerocopy option does not change UCX sends.
+
+`autumn-ps --tcp-zerocopy-min-bytes N` opts prepared replica TCP sends into
+zerocopy at N complete-frame bytes. Default 0 disables it and is the rollback
+switch. Send completion and buffer release are distinct; the writer waits for
+both before reuse. No wire or persisted-format version changes are involved.
+Restart with 0 to return to ordinary sends. Keep the old binaries and lockfiles
+for a dependency rollback; stop PS and wait for drain before stopping EN/manager.
+
+For CPU comparisons, core_path accepts `AUTUMN_PERF_PIDS=/path/pids.json`, a
+JSON object mapping process labels to numeric PIDs. Snapshots bracket only the
+timed, drained operation window after independent warmup; derive CPU seconds/GiB
+from completed ops times value size. These process counters exclude independent
+kernel workers, so do not describe them as whole-machine CPU efficiency.
+
+The isolated receive/scheduler experiment is:
+
+```sh
+cargo bench -p autumn-transport --bench compio_features -- ordinary default 1048576
+cargo bench -p autumn-transport --bench compio_features -- managed default 1048576
+cargo bench -p autumn-transport --bench compio_features -- multi default 1048576
+cargo bench -p autumn-transport --bench compio_features -- poll-first default 1048576
+cargo bench -p autumn-transport --bench compio_features -- ordinary single 1048576
+cargo bench -p autumn-transport --bench compio_features -- ordinary defer 1048576
+```
+
+The experiment uses CPUs 40/42 and 512 MiB per warmup/measured transfer. It
+reports combined process user/system CPU and receiver-confirmed transfer time.
+It does not configure server runtimes. SQPOLL is available only as an explicit
+`sqpoll` experiment; its kernel-thread CPU must be measured separately before
+making any efficiency claim. Compio's ordinary receive already applies adaptive
+poll-first internally, so include it in the pure-upgrade comparison.
+
+
+### Controlled runtime comparison after compio migration
+
+Use the fixed-work harness in `perf/controlled_validation/README.md` when
+validating CPU efficiency and partition scaling. It documents the H200-1 test
+layout, archived baseline restoration, host perf/tracefs requirements, synchronized
+measurement windows, three rotated repetitions and separate diagnostic runs.
+The older two-second core_path samples are observations, not this acceptance.
+
+Build `controlled_path` with identical source and Rust 1.95 against each runtime
+version. Validate the recorded topology and per-partition operation counts before
+using a result. Every successful trial saves evidence, stops its services and
+reclaims its marked dataset; a failed trial remains for diagnosis. Archive/commit
+results before removing the final source/build tree. Do not remove the archived
+baseline evidence until all comparison work is complete.
+
+
+## Receive-copy accounting per link
+
+Answers "which process copies a value, how many times, and where": per receiving
+process, TCP kernel copy (`skb_copy_datagram_iter`), UCX Stream unpack (memcpy
+returning into libucp/libuct) and application memcpy resolved to its Rust call
+site. Run on H200-1 inside `dongmao-autumn`; details in
+`perf/receive_copies/README.md`.
+
+```sh
+# tracefs inside the container (unmount when the task ends)
+mountpoint -q /sys/kernel/tracing || mount -t tracefs nodev /sys/kernel/tracing
+# binaries: bin/<base|new>/{autumn-*,controlled_path} under /data08/autumn-receive-copies
+cargo +1.95.0 build --release -p autumn-server --features ucx --bins --bench controlled_path
+python3 perf/receive_copies/copytrace.py --version new --transport tcp --repeat 1
+python3 perf/receive_copies/copytrace.py --version new --transport ucx --repeat 1
+python3 perf/receive_copies/analyze.py /data08/autumn-receive-copies/results > summary.json
+# throughput/CPU: untraced windows of several seconds, ABBA order
+python3 perf/receive_copies/copytrace.py --long --version base --transport tcp --repeat 1
+python3 perf/receive_copies/cpu.py /data08/autumn-receive-copies/results > cpu.json
+```
+
+Expected after the decoder read-window change, per logical byte on each
+receiving process: transport copy 1.0 (TCP kernel or UCX unpack — a registered
+`memh` does not remove the UCX one); extent-node application copy ≈0 at 64 KiB
+and 8 MiB (≤0.06x per replica), ≈0.45x per replica for 1 MiB appends on TCP
+(`try_decode` reserving an append whose start arrived in the previous 512 KiB
+window); partition server and client application copy = the value prefix already
+in the 64 KiB window (1.0x for a 64 KiB value, 0.06x at 1 MiB, 0.008x at 8 MiB),
+plus ~0.15x of non-value `partition_loop` moves and ~0.14x benchmark buffer
+handling at 64 KiB that are the same in both builds.
+A `FrameDecoder::feed` frame under `handle_connection`, `handle_ps_connection`
+or `read_loop` in the analyzer's `sites` means a receive loop copies again.
+
+`ClusterClient::get` (bench mode `get`, add `--sizes 4096,65536,1048576,8388608
+--only 8388608:get,...`) is served by `MSG_GET_BULK`: the PS shows no full-value
+application copy and the client exactly one (`get_range_core`'s `to_vec`).
+
+Traced throughput is not a result (a uprobe fires on every memcpy). Keep the
+attribution threshold below one UCX AM fragment (1 KiB): UCX Stream receives
+return one fragment per call. After the run, confirm no `autumn-receive-copies`
+data directory remains on /data03, /data05 or /data08.
+
+## Verifying that evicted RPC connections close
+
+A client evicts a pooled connection on a timeout, and the manager, PS and stream
+pools do the same. Dropping the last `Rc<RpcClient>` must close that connection:
+both background tasks are cancelled, the socket half each owned is dropped, and
+the peer receives a FIN. Before this, the reader could not end on its own (nor a
+writer with frames queued against a peer that stopped reading), so an evicted
+connection stayed ESTABLISHED on both sides — with its queued request
+values still pinned — until the process exited.
+
+Check it on a live cluster from the client side, e.g. during a PS restart or any
+window that makes the SDK evict and reconnect:
+
+```sh
+# Connections from this client to the partition servers.
+ss -tnp state established "( dport = :<ps-port> )" | grep <client-pid>
+# Count them before and after the eviction window; the count must return to the
+# number of ACTIVE connections, not keep growing with each reconnect.
+ls -l /proc/<client-pid>/fd | grep -c socket
+```
+
+A socket that stays ESTABLISHED to a peer the client no longer talks to, or an
+fd count that rises with every reconnect, means a connection was abandoned
+instead of closed. The same count on the PS side should fall as clients let go.
+
+The regression test is `cargo test -p autumn-rpc --test client_teardown --
+--test-threads=1`: it drives timeouts against a peer that never reads, then
+asserts the request buffers are freed, no ESTABLISHED socket outlives its client,
+and the peer sees EOF.

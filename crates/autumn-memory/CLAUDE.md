@@ -347,3 +347,10 @@ BM25 monotonicity; vector cosine / kmeans / IVF in `vector.rs`). The async store
 ops + reconcile/repair are exercised e2e against a live cluster (`tests/e2e.rs`
 + the isolated-cluster harness `tests/run_e2e.sh`); `tests/scan_boundary.rs`
 pins the page-boundary dedupe (reconcile over a >page corpus counts exactly).
+
+## HTTP client initialization
+
+With cyper 0.9, OpenAiEmbedder::new returns Result<Self, EmbedError> so TLS/client
+initialization errors can be reported by the application. openai-embed explicitly
+selects compio/ring: the rustls feature alone no longer selects a crypto provider.
+The existing wire and body/header timeout tests cover this optional feature.

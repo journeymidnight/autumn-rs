@@ -146,9 +146,9 @@ async fn bulk_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
 async fn plain_read_loop(c: Rc<RpcClient>, b: Rc<Cell<u64>>, deadline: Instant) {
     // msg_type 2 ≠ MSG_READ_BYTES_BULK → server replies with a regular framed
     // response.
-    const MSG_GET: u8 = 2;
+    const MSG_ECHO: u8 = 2;
     while Instant::now() < deadline {
-        match c.call(MSG_GET, Bytes::from_static(b"r")).await {
+        match c.call(MSG_ECHO, Bytes::from_static(b"r")).await {
             Ok(resp) => b.set(b.get() + resp.len() as u64),
             Err(_) => break,
         }

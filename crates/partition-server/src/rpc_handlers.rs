@@ -141,7 +141,6 @@ pub(crate) async fn dispatch_partition_rpc(
     _revision: i64,
 ) -> HandlerResult {
     match msg_type {
-        MSG_GET => handle_get(payload, part).await,
         MSG_GET_REDIRECT => handle_get_redirect(payload, part).await,
         MSG_GET_REDIRECT_MANY => handle_get_redirect_many(payload, part).await,
         MSG_HEAD => handle_head(payload, part).await,
@@ -179,9 +178,9 @@ pub(crate) async fn dispatch_partition_rpc(
 }
 
 /// Outcome of the shared GET resolve core: the value bytes, or a not-found.
-/// `Value` is a `Bytes` that, for a VP read over UCX, ALIASES the registered
-/// RegPool buffer (R4) — `handle_get_bulk` sends it as its own iovec (no copy);
-/// `handle_get` copies it into the rkyv `GetResp` (which copies regardless).
+/// `Value` is a `Bytes` that, for a VP read, ALIASES the pooled buffer the
+/// value was received into — `handle_get_bulk` sends it as its own iovec (no
+/// copy).
 pub(crate) enum GetOutcome {
     NotFound,
     Value(Bytes),
@@ -195,10 +194,9 @@ pub(crate) enum GetOutcome {
 /// `extent_id: 0` is the shape the success path already emits when there is
 /// nothing to redirect to, and the client already handles it, so the read costs
 /// ONE round trip rather than the two a client-side proxy retry would. Answering
-/// with a `GetResp` here instead — which this used to do — is a wire-contract
-/// violation the client can only discover as an opaque rkyv decode failure,
-/// since rkyv carries no type tag to catch a handler answering msg_type X with
-/// struct Y.
+/// with any other response struct is a wire-contract violation the client can
+/// only discover as an opaque rkyv decode failure, since rkyv carries no type tag
+/// to catch a handler answering msg_type X with struct Y.
 async fn answer_get_redirect_inline(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
@@ -258,7 +256,7 @@ pub(crate) async fn handle_batch_get_bulk(
             autumn_rpc::frame::encode_bulk_response_head_bytes(
                 req_id,
                 partition_rpc::MSG_BATCH_GET_BULK,
-                code as u8,
+                partition_rpc::code_for_status(code),
                 &ctrl,
                 0,
             ),
@@ -282,7 +280,7 @@ pub(crate) async fn handle_batch_get_bulk(
     let mut values: Vec<Bytes> = Vec::with_capacity(n);
     for key in req.keys.into_iter() {
         // Route each key through `get_value` for the same VP resolution /
-        // read-pin / not-found / out-of-range semantics as a per-key MSG_GET.
+        // read-pin / not-found / out-of-range semantics as a per-key MSG_GET_BULK.
         let inner = partition_rpc::rkyv_encode(&GetReq {
             part_id: 0, // routing already done
             region_epoch: req.region_epoch,
@@ -437,31 +435,7 @@ pub(crate) async fn handle_roll_tails(
     }))
 }
 
-pub(crate) async fn handle_get(payload: Bytes, part: &Rc<RefCell<PartitionData>>) -> HandlerResult {
-    match get_value(payload, part).await? {
-        GetOutcome::NotFound => Ok(partition_rpc::rkyv_encode(&GetResp {
-            code: CODE_NOT_FOUND,
-            message: "key not found".to_string(),
-            value: vec![],
-        })),
-        // `value.into()` (NOT `to_vec()`): bytes' `From<Bytes> for Vec<u8>`
-        // RECLAIMS the underlying Vec with no copy when this `Bytes` uniquely
-        // owns a Vec-backed buffer — which is the copy-path case
-        // (`read_value_from_log` → `Bytes::from(data)` on TCP / non-pooled VP
-        // reads). `to_vec()` always copied, which regressed the generic large
-        // read by one full value memcpy after R4 made `resolve_value` return
-        // `Bytes` (caught by the perf baseline: TCP 8M read −25%). The rkyv
-        // encode below still copies once (unavoidable for the wire archive).
-        GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetResp {
-            code: CODE_OK,
-            message: String::new(),
-            value: value.into(),
-        })),
-        GetOutcome::Redirect { .. } => unreachable!("get_value never redirects"),
-    }
-}
-
-/// (MSG_GET_REDIRECT): like `handle_get`, but a large full-value VP
+/// (MSG_GET_REDIRECT): like `handle_get_bulk`, but a large full-value VP
 /// answers with a descriptor (extent + value byte range + eversion +
 /// replica addrs) so the client reads the bytes straight from an EN.
 pub(crate) async fn handle_get_redirect(
@@ -560,16 +534,11 @@ pub(crate) async fn handle_get_redirect(
                         error = %e,
                         "get_redirect: descriptor lookup failed — answering inline"
                     );
-                    // Answer in the shape THIS message type promises.
-                    //
-                    // This used to delegate to `handle_get`, which encodes a
-                    // `GetResp` — three fields where the client is decoding an
-                    // ten-field `GetRedirectResp`. rkyv carries no type tag,
-                    // so nothing catches a handler answering msg_type X with
-                    // struct Y; the client's bytecheck simply fails, and the
-                    // operator gets "rkyv decode: failed" with no hint that the
-                    // PS had already read the correct value and put it in the
-                    // response. That is a wire-contract violation, and it is
+                    // Answer in the shape THIS message type promises: a
+                    // `GetRedirectResp`. rkyv carries no type tag, so a
+                    // different response struct would fail the client's
+                    // bytecheck as "rkyv decode: failed" with no hint that the
+                    // PS had already read the correct value. This branch is
                     // reached on EVERY large read of an EC-converted extent —
                     // which an armed `balanced` auto-policy produces on any
                     // cluster with >= 5 ENs, since bootstrap defaults those to
@@ -747,19 +716,19 @@ pub(crate) async fn handle_get_redirect_many(
     Ok(partition_rpc::rkyv_encode(&GetRedirectManyResp { results }))
 }
 
-/// zero-copy GET (MSG_GET_BULK): returns the response as TWO segments —
-/// `(head, value)` where `head = [CRC-less frame header][bulk meta: code +
-/// value_len + reserved]` and `value` ALIASES the RegPool buffer (R4: `Bytes::from_owner`
-/// from `resolve_value`, no copy). The ps-conn pushes `head` then `value` into
+/// value-separable GET (MSG_GET_BULK), the one read every SDK point read uses
+/// (`get`, `get_range`, `get_pooled`, `get_into`): returns the response as TWO
+/// segments — `(head, value)` where `head = [header][ctrl_len][code+message][crc]`
+/// and `value` ALIASES the resolved read (a VP read's pool buffer via
+/// `Bytes::from_owner`, no copy). The ps-conn pushes `head` then `value` into
 /// `tx_bufs` so the single `write_vectored_all` emits them as one wire frame with
-/// NO concat copy — fully zero-copy EN->PS->client. (Pre-R4 this concatenated
-/// `[meta][value]` into a Vec, copied again by `encode_v0`.)
+/// no concat copy.
 ///
-/// ALL outcomes (incl errors) map to a bulk-shaped response — the status (and,
-/// since v28, a human-readable message) rides in the CRC-protected ctrl; the
-/// SDK's get_into maps non-OK codes to refresh/retry. StatusCode discriminants
-/// align with the partition CODE_* for the GET-relevant cases
-/// (InvalidArgument=2, FailedPrecondition=3, Internal=4). So this never errors.
+/// ALL outcomes (incl errors) map to a bulk-shaped response: the code and a
+/// human-readable message ride in the CRC-protected ctrl, and the SDK refreshes
+/// and retries every code except OK/NotFound. The handler's `StatusCode` is
+/// translated with `partition_rpc::code_for_status`: the two spaces agree only
+/// up to 3, and the GC-pin `Unavailable` (5) is `CODE_VALUE_TOO_LARGE` when cast.
 pub(crate) async fn handle_get_bulk(
     req_id: u32,
     payload: Bytes,
@@ -770,7 +739,7 @@ pub(crate) async fn handle_get_bulk(
         Ok(GetOutcome::NotFound) => (CODE_NOT_FOUND, String::new(), Bytes::new()),
         // get_value (redirect=false) never yields Redirect.
         Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
-        Err((status, msg)) => (status as u8, msg, Bytes::new()),
+        Err((status, msg)) => (partition_rpc::code_for_status(status), msg, Bytes::new()),
     };
     (ps_bulk_head(req_id, code, &msg, value.len()), value)
 }
@@ -785,8 +754,8 @@ pub(crate) fn ps_bulk_head(req_id: u32, code: u8, msg: &str, value_len: usize) -
 }
 
 /// Shared GET resolve core: epoch/range check → memtable/imm/SST lookup →
-/// VP resolve (read_value_from_log). Used by both `handle_get` (rkyv) and
-/// `handle_get_bulk` (value-separable). Carries the read metrics.
+/// VP resolve (read_value_from_log). Used by `handle_get_bulk`, the batched and
+/// redirect reads. Carries the read metrics.
 // clippy false-positive: the `part.borrow()` (`p`) is explicitly `drop(p)`-ed
 // (see below) BEFORE the only `.await` (`resolve_value`). The lint flags the
 // borrow because an await exists later in the fn; it doesn't track the drop.

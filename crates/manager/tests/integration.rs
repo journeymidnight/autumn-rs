@@ -115,11 +115,19 @@ async fn ps_put(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8]) {
     let _: partition_rpc::PutResp = partition_rpc::rkyv_decode(&resp).expect("decode PutResp");
 }
 
-/// Helper: send a GetReq to a partition server via RpcClient.
-async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::GetResp {
+/// A point read's outcome: `CODE_*`, the PS's message, and the value bytes.
+#[allow(dead_code)]
+struct GetResult {
+    code: u8,
+    message: String,
+    value: Vec<u8>,
+}
+
+/// Helper: read a key from a partition server through `MSG_GET_BULK`.
+async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> GetResult {
     let resp = ps
-        .call(
-            partition_rpc::MSG_GET,
+        .call_into_pooled(
+            partition_rpc::MSG_GET_BULK,
             partition_rpc::rkyv_encode(&partition_rpc::GetReq {
                 part_id,
                 key: key.to_vec(),
@@ -130,7 +138,11 @@ async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::GetR
         )
         .await
         .expect("get");
-    partition_rpc::rkyv_decode(&resp).expect("decode GetResp")
+    GetResult {
+        code: resp.code,
+        message: resp.message,
+        value: resp.buf.filled().to_vec(),
+    }
 }
 
 /// Helper: flush a partition via the Maintenance RPC.

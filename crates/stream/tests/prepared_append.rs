@@ -7,6 +7,9 @@ use std::time::Duration;
 
 #[compio::test]
 async fn prepared_large_appends_preserve_content_and_offsets() {
+    if std::env::var_os("AUTUMN_TEST_ZEROCOPY").is_some() {
+        autumn_rpc::client::set_prepared_zerocopy_min_bytes(1);
+    }
     let (transport, bind) = match std::env::var("AUTUMN_TEST_UCX_BIND") {
         Ok(bind) => (autumn_transport::TransportKind::Ucx, bind),
         Err(_) => (
@@ -41,10 +44,19 @@ async fn prepared_large_appends_preserve_content_and_offsets() {
     let mut replies = Vec::new();
     for i in 0..4 {
         let value = Bytes::from(vec![i as u8 + 1; size]);
-        let payload = PreparedPayload::new(vec![
-            AppendReq::encode_header(701, 1, (i * size) as u64, 1),
-            value,
-        ]);
+        let mut parts = vec![AppendReq::encode_header(701, 1, (i * size) as u64, 1)];
+        if i == 2 {
+            // Cross the RPC writer's IOV_MAX boundary inside one CRC-protected
+            // frame. Slices keep the same owned payload through each send.
+            parts.extend(
+                (0..size)
+                    .step_by(1024)
+                    .map(|start| value.slice(start..start + 1024)),
+            );
+        } else {
+            parts.push(value);
+        }
+        let payload = PreparedPayload::new(parts);
         replies.push(client.send_prepared(MSG_APPEND, &payload).await.unwrap());
     }
     for (i, reply) in replies.into_iter().enumerate() {

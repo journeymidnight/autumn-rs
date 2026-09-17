@@ -2105,62 +2105,40 @@ async fn file_pwrite_chunked(file: Rc<CompioFile>, offset: u64, data: Bytes) -> 
 
 /// Outcome of the persistent read future used by `handle_connection`.
 ///
-/// The future OWNS both the `OwnedReadHalf` and the read buffer across
-/// iterations — when it completes, these are returned here and the caller
-/// rebuilds a fresh future via `spawn_read` with the same reader and buf.
+/// The future OWNS both the `OwnedReadHalf` and the decoder's read window
+/// across iterations — when it completes, these are returned here and the
+/// caller hands the window back to the decoder and rebuilds a fresh future via
+/// `spawn_read`.
 /// Never dropping the read future mid-flight is critical: dropping it would
 /// cancel the pending io_uring SQE, which compio handles correctly but
 /// introduces SQE-resubmit oscillation that regressed perf in earlier
 /// attempts.
 enum ReadBurst {
-    /// A full read arrived. `n` bytes at `buf[..n]` are valid payload.
+    /// Bytes arrived; the window holds them for `FrameDecoder::finish_read`.
     Data {
-        buf: Vec<u8>,
-        n: usize,
+        window: autumn_rpc::ReadWindow,
         reader: autumn_transport::ReadHalf,
     },
     /// read() returned 0 (peer closed).
-    Eof {
-        #[allow(dead_code)]
-        reader: autumn_transport::ReadHalf,
-        #[allow(dead_code)]
-        buf: Vec<u8>,
-    },
+    Eof,
     /// read() errored.
-    Err {
-        e: std::io::Error,
-        #[allow(dead_code)]
-        reader: autumn_transport::ReadHalf,
-        #[allow(dead_code)]
-        buf: Vec<u8>,
-    },
+    Err { e: std::io::Error },
 }
 
 /// Build a `'static`-lifetime `LocalBoxFuture<ReadBurst>` that reads once
-/// into `buf` and returns ownership of both `reader` and `buf`.
+/// into `window` and returns ownership of both `reader` and `window`.
 fn spawn_read(
     mut reader: autumn_transport::ReadHalf,
-    buf: Vec<u8>,
+    window: autumn_rpc::ReadWindow,
 ) -> futures::future::LocalBoxFuture<'static, ReadBurst> {
     use compio::io::AsyncRead;
     use futures::FutureExt;
     async move {
-        let BufResult(result, buf_back) = reader.read(buf).await;
+        let BufResult(result, window) = reader.read(window).await;
         match result {
-            Ok(0) => ReadBurst::Eof {
-                reader,
-                buf: buf_back,
-            },
-            Ok(n) => ReadBurst::Data {
-                buf: buf_back,
-                n,
-                reader,
-            },
-            Err(e) => ReadBurst::Err {
-                e,
-                reader,
-                buf: buf_back,
-            },
+            Ok(0) => ReadBurst::Eof,
+            Ok(_) => ReadBurst::Data { window, reader },
+            Err(e) => ReadBurst::Err { e },
         }
     }
     .boxed_local()
@@ -2192,7 +2170,7 @@ enum ChainFail {
 
 struct ChainFwdJob {
     parts: Vec<Bytes>,
-    rx_back: futures::channel::oneshot::Sender<Result<futures::channel::oneshot::Receiver<Frame>>>,
+    rx_back: futures::channel::oneshot::Sender<Result<crate::conn_pool::PinnedRecv>>,
 }
 
 impl ExtentNode {
@@ -2203,7 +2181,7 @@ impl ExtentNode {
         &self,
         addr: &str,
         parts: Vec<Bytes>,
-    ) -> futures::channel::oneshot::Receiver<Result<futures::channel::oneshot::Receiver<Frame>>>
+    ) -> futures::channel::oneshot::Receiver<Result<crate::conn_pool::PinnedRecv>>
     {
         let (rx_back_tx, rx_back) = futures::channel::oneshot::channel();
         let job = ChainFwdJob {
@@ -5844,11 +5822,16 @@ impl ExtentNode {
     /// step 1 drain + step 3 select-Right repeatedly with the read future
     /// sitting pending.
     ///
-    /// ## Buffer reuse
+    /// ## Receive buffer
     ///
-    /// The read buffer is moved INTO the read future and back OUT of it via
-    /// `ReadBurst`. No per-iteration allocation — the same 512 KiB Vec is
-    /// recycled.
+    /// Each read goes into the decoder's own spare capacity
+    /// (`FrameDecoder::read_window`), so the kernel copy (TCP) or UCX Stream
+    /// unpack is the only copy of an append payload before its pwritev. Once a
+    /// frame header is buffered, the window covers that frame's remaining bytes,
+    /// which `try_decode` has already reserved. The part of a large frame that
+    /// arrived in the preceding 512 KiB window is copied once by that reserve;
+    /// sizing boundary windows to the previous frame avoided it but measured
+    /// slower on UCX (see autumn-rpc CLAUDE.md "Receiving into the decoder").
     pub async fn handle_connection(conn: autumn_transport::Conn, node: ExtentNode) -> Result<()> {
         use futures::future::{select, Either, LocalBoxFuture};
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -5872,11 +5855,16 @@ impl ExtentNode {
         // boundary.
         let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(128);
 
-        // Persistent read future: owns the reader + buf across iterations.
-        // Rebuilt after it completes (ReadBurst returns reader + buf).
-        let buf = vec![0u8; READ_BUF_SIZE];
+        // Persistent read future: owns the reader + the decoder's read window
+        // across iterations. Rebuilt after it completes.
+        let next_window = |decoder: &mut FrameDecoder| {
+            let len = decoder
+                .front_frame_remaining()
+                .map_or(READ_BUF_SIZE, |rest| rest.max(READ_BUF_SIZE));
+            decoder.read_window(len)
+        };
         let mut read_fut: Option<LocalBoxFuture<'static, ReadBurst>> =
-            Some(spawn_read(reader, buf));
+            Some(spawn_read(reader, next_window(&mut decoder)));
 
         loop {
             // (1) Opportunistic drain of any already-ready completions.
@@ -5905,10 +5893,10 @@ impl ExtentNode {
                     .take()
                     .expect("read_fut invariant: always Some when no Left branch pending");
                 match rfut.await {
-                    ReadBurst::Eof { .. } => return Ok(()),
-                    ReadBurst::Err { e, .. } => return Err(e.into()),
-                    ReadBurst::Data { buf, n, reader } => {
-                        decoder.feed(&buf[..n]);
+                    ReadBurst::Eof => return Ok(()),
+                    ReadBurst::Err { e } => return Err(e.into()),
+                    ReadBurst::Data { window, reader } => {
+                        decoder.finish_read(window);
                         process_frames_backpressured(
                             &node,
                             &mut decoder,
@@ -5917,7 +5905,7 @@ impl ExtentNode {
                             cap,
                         )
                         .await?;
-                        read_fut = Some(spawn_read(reader, buf));
+                        read_fut = Some(spawn_read(reader, next_window(&mut decoder)));
                     }
                 }
                 continue;
@@ -5947,7 +5935,7 @@ impl ExtentNode {
             match select(rfut, Box::pin(cfut)).await {
                 Either::Left((read_result, _cfut_dropped)) => {
                     match read_result {
-                        ReadBurst::Eof { .. } => {
+                        ReadBurst::Eof => {
                             // Drain and flush remaining inflight before exiting.
                             while let Some(done) = inflight.next().await {
                                 tx_bufs.extend(done);
@@ -5962,9 +5950,9 @@ impl ExtentNode {
                             }
                             return Ok(());
                         }
-                        ReadBurst::Err { e, .. } => return Err(e.into()),
-                        ReadBurst::Data { buf, n, reader } => {
-                            decoder.feed(&buf[..n]);
+                        ReadBurst::Err { e } => return Err(e.into()),
+                        ReadBurst::Data { window, reader } => {
+                            decoder.finish_read(window);
                             process_frames_backpressured(
                                 &node,
                                 &mut decoder,
@@ -5973,7 +5961,7 @@ impl ExtentNode {
                                 cap,
                             )
                             .await?;
-                            read_fut = Some(spawn_read(reader, buf));
+                            read_fut = Some(spawn_read(reader, next_window(&mut decoder)));
                         }
                     }
                 }

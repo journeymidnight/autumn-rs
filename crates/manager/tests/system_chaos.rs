@@ -785,7 +785,7 @@ async fn reader_loop(
         // wedged PS → shutdown-join stays responsive).
         let get_call = match compio::time::timeout(
             Duration::from_secs(5),
-            client.call(partition_rpc::MSG_GET, payload),
+            client.call_into_pooled(partition_rpc::MSG_GET_BULK, payload),
         )
         .await
         {
@@ -797,27 +797,28 @@ async fn reader_loop(
             }
         };
         match get_call {
-            Ok(resp) => match partition_rpc::rkyv_decode::<partition_rpc::GetResp>(&resp) {
-                Ok(r) if r.code == partition_rpc::CODE_OK => {
+            Ok(r) => match r.code {
+                partition_rpc::CODE_OK => {
+                    let value = r.buf.filled();
                     // Sanity-only live check: the value must be a
                     // `make_value(key, _)` shape — starts with "chaos-"
                     // (6) + 8B seq + ":" (1) + key + padding. We do NOT
-                    // assert `r.value == want` here because between
+                    // assert `value == want` here because between
                     // sampling `want` and the GET response landing, the
                     // writer can run *two* updates, leaving `expected[key]`
                     // at a third value — comparing the live response to
                     // either snapshot is racy. The authoritative
                     // correctness contract is the post-workload final
                     // verify, which runs AFTER writes stop + settle.
-                    let prefix_ok = r.value.len() >= 6 + 8 + 1 + key.len()
-                        && &r.value[..6] == b"chaos-"
-                        && r.value[14] == b':'
-                        && &r.value[15..15 + key.len()] == key.as_slice();
+                    let prefix_ok = value.len() >= 6 + 8 + 1 + key.len()
+                        && &value[..6] == b"chaos-"
+                        && value[14] == b':'
+                        && &value[15..15 + key.len()] == key.as_slice();
                     if !prefix_ok {
                         panic!(
                             "reader[{name}] CORRUPT shape key={:?} bytes={} (not a chaos-value)",
                             String::from_utf8_lossy(&key),
-                            r.value.len()
+                            value.len()
                         );
                     }
                     // Drop the `want` shadow so it's clear we don't use
@@ -2671,7 +2672,7 @@ async fn verify_per_key(
             // log the offending part_id so the wedge is localizable.
             let call_res = match compio::time::timeout(
                 Duration::from_secs(5),
-                client.call(partition_rpc::MSG_GET, payload),
+                client.call_into_pooled(partition_rpc::MSG_GET_BULK, payload),
             )
             .await
             {
@@ -2687,9 +2688,9 @@ async fn verify_per_key(
                 }
             };
             match call_res {
-                Ok(resp) => match partition_rpc::rkyv_decode::<partition_rpc::GetResp>(&resp) {
-                    Ok(r) if r.code == partition_rpc::CODE_OK => {
-                        got = Some(r.value);
+                Ok(r) => match r.code {
+                    partition_rpc::CODE_OK => {
+                        got = Some(r.buf.filled().to_vec());
                         break;
                     }
                     // Keep WHY the read did not succeed. Folding every non-OK
@@ -2699,17 +2700,16 @@ async fn verify_per_key(
                     // "not_found" — indistinguishable from the key genuinely
                     // not existing, which sends the next investigation after
                     // the wrong mechanism entirely.
-                    Ok(r) => last_status = Some((r.code, r.message)),
-                    Err(e) => last_status = Some((255, format!("undecodable GetResp: {e}"))),
+                    code => last_status = Some((code, r.message)),
                 },
                 Err(e) => {
-                    // A frame-level RPC error (FLAG_ERROR response / transport
-                    // failure) carries the WHY — e.g. a VP read refused with
-                    // stale_vp_offset_past_sealed_length. Swallowing it here
+                    // A frame-level RPC error (authz FLAG_ERROR response /
+                    // transport failure) carries the WHY. Swallowing it here
                     // rendered exactly that failure as "[no response —
                     // wedged/timeout]" and sent an entire investigation after
-                    // a hang that never existed. 254 = rpc-level error marker
-                    // (255 = undecodable body).
+                    // a hang that never existed. 254 = rpc-level error marker.
+                    // A handler refusal (e.g. stale_vp_offset_past_sealed_length)
+                    // arrives as a ctrl code with its message, above.
                     last_status = Some((254, format!("rpc error: {e}")));
                     compio::time::sleep(Duration::from_millis(300)).await;
                     continue;

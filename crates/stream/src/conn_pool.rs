@@ -37,6 +37,40 @@ pub struct ConnPool {
     clients: RefCell<HashMap<SocketAddr, Rc<RpcClient>>>,
 }
 
+/// A pipelined response receiver that PINS its connection.
+///
+/// The pipelined senders below hand back a receiver and keep nothing else, so
+/// the pool map held the only `Rc<RpcClient>`. Dropping the last one now closes
+/// the connection (autumn-rpc `RpcClient`'s task handles are its teardown), and
+/// eviction is a thing OTHER tasks do: one worker's replica timeout evicts the
+/// address another worker is mid-append on. Without this pin, that append's
+/// frame would be abandoned mid-`writev` and its caller would see a closed
+/// connection — an append that was about to succeed, failed by an unrelated
+/// caller's error. Holding the `Rc` here scopes the connection to the work
+/// outstanding on it rather than to the pool entry: an evicted connection goes
+/// away once its last in-flight response has landed or timed out (every caller
+/// bounds its own wait), and no new caller can reach it through the pool.
+///
+/// `#[must_use]` because the inner `oneshot::Receiver` carries it and a newtype
+/// does not inherit it: a receiver nobody awaits is a request nobody reads.
+#[must_use = "a response receiver does nothing unless you .await it"]
+pub struct PinnedRecv {
+    rx: futures::channel::oneshot::Receiver<autumn_rpc::Frame>,
+    /// Kept alive for exactly as long as the response is outstanding.
+    _conn: Rc<RpcClient>,
+}
+
+impl std::future::Future for PinnedRecv {
+    type Output = Result<autumn_rpc::Frame, futures::channel::oneshot::Canceled>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.rx).poll(cx)
+    }
+}
+
 impl ConnPool {
     pub fn new() -> Self {
         Self {
@@ -172,11 +206,14 @@ impl ConnPool {
         addr: &str,
         msg_type: u8,
         payload_parts: Vec<Bytes>,
-    ) -> Result<futures::channel::oneshot::Receiver<autumn_rpc::Frame>> {
+    ) -> Result<PinnedRecv> {
         let sock = parse_addr(addr)?;
         let client = self.get_client(sock).await?;
         match client.send_vectored(msg_type, payload_parts).await {
-            Ok(rx) => Ok(rx),
+            Ok(rx) => Ok(PinnedRecv {
+                rx,
+                _conn: client.clone(),
+            }),
             Err(e) => {
                 // matches `call`/`call_timeout` semantics — evict
                 // on submit-time error so the next call retries with a
@@ -203,11 +240,14 @@ impl ConnPool {
         addr: &str,
         msg_type: u8,
         payload: &autumn_rpc::frame::PreparedPayload,
-    ) -> Result<futures::channel::oneshot::Receiver<autumn_rpc::Frame>> {
+    ) -> Result<PinnedRecv> {
         let sock = parse_addr(addr)?;
         let client = self.get_client(sock).await?;
         match client.send_prepared(msg_type, payload).await {
-            Ok(rx) => Ok(rx),
+            Ok(rx) => Ok(PinnedRecv {
+                rx,
+                _conn: client.clone(),
+            }),
             Err(e) => {
                 if client.is_closed() {
                     self.evict(sock);

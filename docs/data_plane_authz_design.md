@@ -134,7 +134,7 @@ clock_skew_secs, admin_token, cluster_id, …}` → 本地缓存
   `check_key` / `check_range`。catch-all `_ => None`（放行）只对非 key 作用域的
   op（maintenance / split / merge / discards / diag）与 `AUTH_HELLO` 正确。
   新增一个带 key 的读写 RPC 而忘了加 arm = 一个 authz 旁路。
-  当前有 arm 的：`MSG_GET` / `MSG_GET_BULK` / `MSG_GET_REDIRECT` /
+  当前有 arm 的：`MSG_GET_BULK` / `MSG_GET_REDIRECT` /
   `MSG_GET_REDIRECT_MANY` / `MSG_HEAD` / `MSG_DELETE` / `MSG_PUT` /
   `MSG_PUT_BULK` / `MSG_RANGE` / `MSG_BATCH_PUT` / `MSG_BATCH_PUT_BULK` /
   `MSG_BATCH_GET_BULK`。
@@ -205,7 +205,7 @@ rogue client 可以绕过 PS 直连 EN 发 `MSG_READ_BYTES`，靠枚举 / 猜
 攻击者还得先猜中有效坐标。给 EN 加验签会引出「谁签」的对称困境，成本不匹配收益。
 运维上 EN 数据端口本就只在数据面子网、只对 PS 开放。
 
-正常读路径没有这条旁路：`MSG_GET`（`get`/`get_many`）**恒走 PS**，只有显式
+正常读路径没有这条旁路：`MSG_GET_BULK` / `MSG_BATCH_GET_BULK`（`get`/`get_many`）**恒走 PS**，只有显式
 opt-in 的 `get_direct` / `MSG_GET_REDIRECT` / `MSG_GET_REDIRECT_MANY` 才发
 descriptor，且只对 ≥ 64 KiB 的值给（失败自动 fallback 到 proxy get）——
 而这些 msg_type 在 `authz_check` 里同样做 `check_key`。

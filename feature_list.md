@@ -50,17 +50,46 @@
   - 纯升级和新能力的效果分别报告；未测真实跨机或未通过上述验证时，不标记完成。
 - **Status**: 仅完成计划记录，尚未升级依赖或实测新版。
 - `passes: false`
+- **notes** (2026-09-15 controlled validation): Compio 0.19.2/cyper 0.9 migration
+  implemented with 1,052 library tests and TCP/UCX/Python/FUSE correctness checks.
+  Completed 480 fixed-work performance samples plus 160 typed kernel diagnostic
+  samples; all 640 window/count/affinity checks pass. See [controlled report](docs/perf_compio_controlled_20260915.md).
+  Default-off zerocopy is slower on loopback; no production receive/scheduler
+  defaults changed. UCX 64KiB p1 reads still regress ~8%; UCX local protection
+  failure reproduced on both 0.18 and 0.19, tracked separately below. Shared-host
+  noise limits whole-machine efficiency claims; sampled stacks have ID collisions.
+  H200-2 offline, cross-host unavailable. Full acceptance remains passes:false.
 
-### F-CORE-DATA-PATH-NEXT — further core-path performance work
-- Trigger: The 2026-09-14 review found additional costs beyond the validated pool/receive/read-planning fixes.
-- Scope: Measure PS-to-EN repeated frame CRC and frame accumulation, then evaluate checksum reuse or append bulk framing; separately evaluate UCX rendezvous/RMA, CLI owned-buffer streaming with byte-bounded async file I/O, and filesystem random-write amplification/per-inode barriers. Preserve existing integrity and durability contracts.
-- Acceptance: Establish an isolated before/after benchmark for each candidate, keep only measured improvements, and cover authorization, cancellation, ordering, sparse data and crash consistency for the changed path. No fixed speedup assumed.
-- passes: false
 
+### F-UCX-LOCAL-PROTECTION — 四分区 UCX SEND 间歇性本地保护错误
+- **Trigger** (2026-09-14): compio 0.19 受控四分区 UCX 写入在 mlx5_1 上出现 Local protection error (synd 0x4 vend 0x52) 并 abort；compio 0.18 基线在相同拓扑的诊断采样中也复现，说明问题早于运行时升级。失败 SEND 包含无效/失效 lkey，根因尚未确定。
+- **Scope**: 定位 UCX 1.16 stream vectored send 的 buffer ownership、注册缓存和取消完成生命周期，复现后只保留有证据的修复；不得通过加超时、重试或丢弃失败样本掩盖。
+- **Acceptance**: 可重复触发的最小用例；修复消融失败/修复后通过；四分区 TCP/UCX 字节一致性、注册 buffer 取消/复用及重复压力验证；记录吞吐和 CPU 代价。
+- **notes**: 受控验证保留了 0.19 普通跑分和 0.18 诊断采样两份崩溃证据。后续重复成功不关闭该问题。
+- `passes: false`
 
 > **这个账本只记 autumn-rs 自己的东西。** 下游怎么被 autumn 的改动影响（例如一次 wire
 > 版本变更要求哪些内嵌客户端重建）算 autumn 的后果，该记；下游自己的缺陷、进展和上线
 > 状态不算，记在它们各自的仓库里。
+
+### F-EVICT-ON-STATUS-ERROR — 服务端一个状态错误就丢掉一条健康连接
+- **Trigger** (2026-09-16，排查 RpcClient 超时资源生命周期时发现): `ps_call_with_timeout`
+  (`crates/client/src/lib.rs`) 对任何 `RpcError` 都执行 `ps_conns.remove(ps_addr)`，其中
+  包含服务端正常返回的帧级状态错误——PS 的 `admit_region_range` 在 region epoch 陈旧时
+  回的 `FailedPrecondition`（`crates/partition-server/src/lib.rs`），以及误路由的
+  `NotFound`。连接本身是健康的：对端在正常应答。于是每次 split/merge 之后，每个
+  client × 分区监听地址都会丢掉一条可用连接并重连；token 续期的 `ps_conns.clear()`
+  是同类动作。连接泄漏本身已由 RpcClient 的 drop 关闭（tasks 取消 + socket 关闭），
+  剩下的代价是无谓的重连：TCP 握手、authz AUTH_HELLO 往返，以及拓扑变更窗口里
+  本可复用的连接被反复重建。
+- **Scope**: 区分「传输失败」与「服务端应答了一个业务/路由错误」两类错误，只有前者才
+  淘汰连接。`rpc_status_to_error` 已经保留了类型化错误，判据应当来自它而不是字符串。
+  同时检查 `ConnPool::call`/`call_timeout`（`crates/stream/src/conn_pool.rs`）和
+  manager 的 `conns.remove` 是否有同样的分类缺失。不得把重连当成掩盖手段。
+- **Acceptance**: 单元测试覆盖「服务端回状态错误后连接仍留在池中且可继续用」与
+  「传输错误仍然淘汰连接」两侧；split/merge 系统测试中统计 PS 连接建立次数，变更后
+  显著下降；陈旧 epoch 的刷新重试语义保持不变（refresh + retry 仍然发生）。
+- `passes: false`
 
 ### F-DISK-FAULT-CLASSIFIER — 瞬时错误被判成永久磁盘故障,而代价已经变成整盘搬迁
 - **Trigger** (2026-09-10, fable 评审在 F-DISK-FAULTED-REBUILD 里指出): 分类器

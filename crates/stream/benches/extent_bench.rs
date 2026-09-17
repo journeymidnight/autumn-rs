@@ -28,8 +28,8 @@ fn main() {
 
 /// Simple RPC connection for benchmarks.
 struct BenchConn {
-    reader: compio::net::OwnedReadHalf<compio::net::TcpStream>,
-    writer: compio::net::OwnedWriteHalf<compio::net::TcpStream>,
+    reader: compio::net::TcpStream,
+    writer: compio::net::TcpStream,
     decoder: FrameDecoder,
     next_id: u32,
     buf: Vec<u8>,

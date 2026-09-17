@@ -3,7 +3,7 @@
 //! ## Why enum dispatch instead of trait objects
 //!
 //! Spec §3 originally drafted `Box<dyn AutumnConn>` for runtime polymorphism.
-//! That doesn't compile against compio 0.18: `compio::io::AsyncRead::read` and
+//! That doesn't compile against compio: `compio::io::AsyncRead::read` and
 //! `AsyncWrite::write` are generic over the buffer type (`B: IoBufMut`,
 //! `T: IoBuf`), and a trait with generic methods is not `dyn`-compatible.
 //!
@@ -23,6 +23,7 @@ use std::sync::OnceLock;
 
 mod probe;
 mod tcp;
+mod zerocopy;
 #[cfg(feature = "ucx")]
 mod ucx;
 
@@ -300,13 +301,13 @@ pub enum Listener {
 }
 
 pub enum ReadHalf {
-    Tcp(compio::net::OwnedReadHalf<compio::net::TcpStream>),
+    Tcp(compio::net::TcpStream),
     #[cfg(feature = "ucx")]
     Ucx(crate::ucx::endpoint::UcxReadHalf),
 }
 
 pub enum WriteHalf {
-    Tcp(compio::net::OwnedWriteHalf<compio::net::TcpStream>),
+    Tcp(compio::net::TcpStream),
     #[cfg(feature = "ucx")]
     Ucx(crate::ucx::endpoint::UcxWriteHalf),
 }
@@ -450,8 +451,8 @@ impl compio::io::AsyncRead for ReadHalf {
 }
 
 impl ReadHalf {
-    /// zero-copy recv into a pre-registered buffer (UCX only). Single
-    /// recv (may be partial). See `UcxReadHalf::recv_registered`.
+    /// recv into a pre-registered buffer (UCX only); Stream unpacks into it.
+    /// Single recv (may be partial). See `UcxReadHalf::recv_registered`.
     #[cfg(feature = "ucx")]
     pub async fn recv_registered(
         &mut self,
@@ -467,8 +468,9 @@ impl ReadHalf {
         }
     }
 
-    /// recv-into seam (UCX). `Some(reg)` → zero-copy receive via memh;
-    /// `None` (regpool over-cap fallback) → UCX recv into the slice (copy-out).
+    /// recv-into seam (UCX). `Some(reg)` → receive naming the slab's memh;
+    /// `None` (regpool over-cap fallback) → plain receive. Both are one UCX
+    /// Stream unpack into the slice.
     /// Single recv (may be partial); caller loops for read_exact semantics.
     /// TCP errors — the autumn-rpc read_loop handles TCP bulk recvs via
     /// `read_exact_into_pooled` / the normal decode + memcpy path, never this
@@ -537,6 +539,22 @@ impl ReadHalf {
         Ok(slice.into_inner())
     }
 
+}
+
+impl WriteHalf {
+    /// Send owned iovecs and await the kernel's buffer-release notification.
+    /// The caller must limit the iovec count and serialize complete frames.
+    /// UCX retains its ordinary registered-memory send path.
+    pub async fn write_vectored_all_zerocopy(&mut self, bufs: Vec<bytes::Bytes>) -> io::Result<()> {
+        match self {
+            Self::Tcp(writer) => zerocopy::write_all(writer, bufs).await,
+            #[cfg(feature = "ucx")]
+            Self::Ucx(writer) => {
+                use compio::io::AsyncWriteExt;
+                writer.write_vectored_all(bufs).await.0
+            }
+        }
+    }
 }
 
 impl compio::io::AsyncWrite for WriteHalf {

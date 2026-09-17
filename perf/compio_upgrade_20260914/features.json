@@ -1,0 +1,758 @@
+[
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=4096 bytes=536870912 seconds=0.237167 user=0.049849 system=0.240151\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=65536 bytes=536870912 seconds=0.132389 user=0.016786 system=0.214038\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=1048576 bytes=536870912 seconds=0.092827 user=0.000198 system=0.158507\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=8388608 bytes=536870912 seconds=0.101366 user=0.004084 system=0.164147\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=4096 bytes=536870912 seconds=0.251426 user=0.048078 system=0.247847\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=65536 bytes=536870912 seconds=0.130316 user=0.015844 system=0.213301\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=1048576 bytes=536870912 seconds=0.077466 user=0.003823 system=0.144086\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=8388608 bytes=536870912 seconds=0.082230 user=0.000172 system=0.153567\n",
+    "stderr": ""
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 0,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 0,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 0,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 0,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=4096 bytes=536870912 seconds=0.262223 user=0.062326 system=0.247239\n",
+    "stderr": ""
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=65536 bytes=536870912 seconds=0.133094 user=0.003848 system=0.228971\n",
+    "stderr": ""
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=1048576 bytes=536870912 seconds=0.092937 user=0.000000 system=0.158623\n",
+    "stderr": ""
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=8388608 bytes=536870912 seconds=0.099139 user=0.004005 system=0.160556\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 4096,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=4096 bytes=536870912 seconds=0.265174 user=0.051613 system=0.255550\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 65536,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=65536 bytes=536870912 seconds=0.130155 user=0.000453 system=0.227155\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 1048576,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=1048576 bytes=536870912 seconds=0.092248 user=0.003852 system=0.154297\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 8388608,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=8388608 bytes=536870912 seconds=0.099625 user=0.000108 system=0.166600\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 4096,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=4096 bytes=536870912 seconds=0.262073 user=0.052900 system=0.253569\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 65536,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=65536 bytes=536870912 seconds=0.126773 user=0.008571 system=0.214938\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 1048576,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=1048576 bytes=536870912 seconds=0.095627 user=0.000000 system=0.163249\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 8388608,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=8388608 bytes=536870912 seconds=0.102120 user=0.004166 system=0.167015\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 4096,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=4096 bytes=536870912 seconds=0.246764 user=0.044068 system=0.408521\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 65536,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=65536 bytes=536870912 seconds=0.131325 user=0.004358 system=0.293110\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 1048576,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=1048576 bytes=536870912 seconds=0.085146 user=0.002965 system=0.189489\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 8388608,
+    "repeat": 0,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=8388608 bytes=536870912 seconds=0.093461 user=0.004075 system=0.203743\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=4096 bytes=536870912 seconds=0.194689 user=0.075181 system=0.211574\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=65536 bytes=536870912 seconds=0.132365 user=0.012029 system=0.219151\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=1048576 bytes=536870912 seconds=0.092482 user=0.000486 system=0.157502\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=8388608 bytes=536870912 seconds=0.100038 user=0.008202 system=0.158973\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=4096 bytes=536870912 seconds=0.206330 user=0.050722 system=0.239605\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=65536 bytes=536870912 seconds=0.130703 user=0.012021 system=0.210959\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=1048576 bytes=536870912 seconds=0.078013 user=0.002808 system=0.146033\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=8388608 bytes=536870912 seconds=0.082177 user=0.004142 system=0.149769\n",
+    "stderr": ""
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 1,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 1,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 1,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 1,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=4096 bytes=536870912 seconds=0.238524 user=0.037172 system=0.250020\n",
+    "stderr": ""
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=65536 bytes=536870912 seconds=0.134827 user=0.000000 system=0.234856\n",
+    "stderr": ""
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=1048576 bytes=536870912 seconds=0.091492 user=0.000000 system=0.157082\n",
+    "stderr": ""
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=8388608 bytes=536870912 seconds=0.100754 user=0.003899 system=0.163839\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 4096,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=4096 bytes=536870912 seconds=0.239071 user=0.053172 system=0.236586\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 65536,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=65536 bytes=536870912 seconds=0.131756 user=0.015698 system=0.214601\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 1048576,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=1048576 bytes=536870912 seconds=0.094092 user=0.014677 system=0.146286\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 8388608,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=8388608 bytes=536870912 seconds=0.101089 user=0.000000 system=0.168143\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 4096,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=4096 bytes=536870912 seconds=0.271546 user=0.059111 system=0.257312\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 65536,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=65536 bytes=536870912 seconds=0.144078 user=0.008138 system=0.229426\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 1048576,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=1048576 bytes=536870912 seconds=0.094927 user=0.005120 system=0.156698\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 8388608,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=8388608 bytes=536870912 seconds=0.102641 user=0.011605 system=0.160622\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 4096,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=4096 bytes=536870912 seconds=0.282368 user=0.036679 system=0.521970\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 65536,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=65536 bytes=536870912 seconds=0.133414 user=0.027453 system=0.277487\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 1048576,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=1048576 bytes=536870912 seconds=0.084985 user=0.008076 system=0.180212\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 8388608,
+    "repeat": 1,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=8388608 bytes=536870912 seconds=0.092291 user=0.000294 system=0.202489\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=4096 bytes=536870912 seconds=0.257482 user=0.044884 system=0.259101\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=65536 bytes=536870912 seconds=0.132103 user=0.004365 system=0.226056\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=1048576 bytes=536870912 seconds=0.094731 user=0.004172 system=0.156750\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=default size=8388608 bytes=536870912 seconds=0.100234 user=0.012637 system=0.153054\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=4096 bytes=536870912 seconds=0.245904 user=0.048424 system=0.240824\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=65536 bytes=536870912 seconds=0.130858 user=0.016073 system=0.213846\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=1048576 bytes=536870912 seconds=0.078057 user=0.000000 system=0.148546\n",
+    "stderr": ""
+  },
+  {
+    "mode": "managed",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=managed scheduler=default size=8388608 bytes=536870912 seconds=0.082842 user=0.000000 system=0.155136\n",
+    "stderr": ""
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 2,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 2,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 2,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "multi",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 2,
+    "returncode": 1,
+    "stdout": "",
+    "stderr": "Error: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n"
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 4096,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=4096 bytes=536870912 seconds=0.240536 user=0.036098 system=0.256133\n",
+    "stderr": ""
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 65536,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=65536 bytes=536870912 seconds=0.132610 user=0.003375 system=0.229943\n",
+    "stderr": ""
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 1048576,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=1048576 bytes=536870912 seconds=0.093337 user=0.000140 system=0.159152\n",
+    "stderr": ""
+  },
+  {
+    "mode": "poll-first",
+    "scheduler": "default",
+    "size": 8388608,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=poll-first scheduler=default size=8388608 bytes=536870912 seconds=0.100168 user=0.000000 system=0.168004\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 4096,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=4096 bytes=536870912 seconds=0.193386 user=0.022462 system=0.263713\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 65536,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=65536 bytes=536870912 seconds=0.129673 user=0.003930 system=0.224053\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 1048576,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=1048576 bytes=536870912 seconds=0.093199 user=0.006486 system=0.153979\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "single",
+    "size": 8388608,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=single size=8388608 bytes=536870912 seconds=0.099810 user=0.000000 system=0.167759\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 4096,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=4096 bytes=536870912 seconds=0.244390 user=0.076317 system=0.214084\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 65536,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=65536 bytes=536870912 seconds=0.127170 user=0.008644 system=0.216000\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 1048576,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=1048576 bytes=536870912 seconds=0.093520 user=0.004324 system=0.156684\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "defer",
+    "size": 8388608,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=defer size=8388608 bytes=536870912 seconds=0.100926 user=0.000000 system=0.170212\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 4096,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=4096 bytes=536870912 seconds=0.295260 user=0.041340 system=0.508668\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 65536,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=65536 bytes=536870912 seconds=0.154399 user=0.007712 system=0.338846\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 1048576,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=1048576 bytes=536870912 seconds=0.085037 user=0.004793 system=0.183563\n",
+    "stderr": ""
+  },
+  {
+    "mode": "ordinary",
+    "scheduler": "sqpoll",
+    "size": 8388608,
+    "repeat": 2,
+    "returncode": 0,
+    "stdout": "mode=ordinary scheduler=sqpoll size=8388608 bytes=536870912 seconds=0.164096 user=0.016238 system=0.353441\n",
+    "stderr": ""
+  }
+]

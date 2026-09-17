@@ -72,7 +72,8 @@ Tests compare exact wire bytes across request IDs and reject altered payloads.
 
 - **`frame.rs`** — `Frame` (encode/decode one frame), `FrameDecoder` (streaming
   decode state machine), `HEADER_LEN=10`, `MAX_PAYLOAD_LEN`, flag bits.
-  `encode_response_with` builds a framed response in one allocation.
+  `encode_response_with` builds a framed response in one allocation. Receive
+  loops read into the decoder's own buffer (see "Receiving into the decoder").
 - **`error.rs`** — `StatusCode` (Ok, NotFound, InvalidArgument,
   FailedPrecondition, Internal, Unavailable, AlreadyExists, PermissionDenied),
   `RpcError`, `encode_status`/`decode_status`.
@@ -114,6 +115,49 @@ Tests compare exact wire bytes across request IDs and reject altered payloads.
   forge), the client forwards opaque bytes. Single source of truth for the claims
   layout, signing bytes, and domain-separation prefix; part of the wire schema.
 
+### Receiving into the decoder (`ReadWindow`)
+
+Receive loops do not read into a scratch `Vec` and `feed` it: that memcpy'd
+every received byte once more after the kernel copy (TCP) or Stream unpack
+(UCX). `FrameDecoder::read_window(max_len)` lends spare capacity of the
+decoder's own `BytesMut` to the read as a `compio::buf::Slice`;
+`finish_read(window)` takes it back with the received bytes appended. Frames
+then split zero-copy from memory the transport wrote. The lent buffer leaves
+the decoder empty until it returns, so nothing may touch the decoder while a
+read future owns the window (the EN, PS and `read_loop` only decode after the
+read completes).
+
+Window policy — each rule removes a copy that was measured, not guessed:
+- A partially buffered frame whose rest fits in the spare capacity keeps that
+  allocation; starting a fresh one would copy the partial frame.
+- At a frame boundary, reuse spare capacity while it holds a quarter of
+  `max_len`, so small frames fill one allocation instead of each reserving a
+  new one while earlier frames still share it.
+- `try_decode` reserves an incomplete frame's remaining length, so a window of
+  `front_frame_remaining()` receives the rest in place.
+- The extent node passes `max(512 KiB, front_frame_remaining())`. The part of a
+  large frame that arrived in the window before its header was parsed is
+  copied once by `try_decode`'s reserve: per replica ~0.45x (TCP) / ~0.19x (UCX)
+  for a 1 MiB append, ≤0.06x at 8 MiB. Sizing each boundary window to the previous frame removed
+  that copy but was measured SLOWER and is not used: it reserves the next
+  frame's buffer while the previous append still shares the old one, which
+  raised extent-node page faults (tens → 18–28 K per 2 GiB window) and cost
+  ~2% on UCX 8 MiB writes (3 interleaved runs each: 459–464 vs 470–477 MiB/s
+  without it). Do not reintroduce it without a better buffer lifetime.
+
+Bulk fast paths keep a fixed window for their frame (`read_loop` for a pending
+`call_into_pooled` response, the PS for `MSG_PUT_BULK` / `MSG_BATCH_PUT_BULK`):
+only the prologue and a bounded value prefix may enter the decoder, because
+the value is received into a pooled buffer. `feed` remains for tests and
+control-plane loops that are not on a data path.
+
+Cancellation on UCX: `ucx_recv` deliberately leaks an owned buffer whose read
+future is dropped mid-flight (its drain can bail out while UCX still holds the
+pointer). The leaked buffer is now the decoder's — up to one frame-sized window
+on the extent node (e.g. 8 MiB after 8 MiB appends) instead of the former fixed
+512 KiB / 64 KiB scratch `Vec`. Same sites and frequency: only a connection torn
+down with a UCX read pending.
+
 `MSG_TYPE_PING = 0xFF` is reserved; heartbeat lives in each per-component pool.
 
 ## RpcClient — SQ/CQ architecture
@@ -151,6 +195,48 @@ Calls: `call`, `call_vectored` (vectored ctrl, zero-copy parts),
   Without it, a stale `Rc<RpcClient>` in a pool would accept submits no live
   read_loop can dispatch. Pools treat `is_closed()` as evict-and-reconnect
   (`stream::conn_pool::get_client`).
+- **The two task handles are FIELDS, never `detach()`ed.** Dropping the last
+  `Rc<RpcClient>` cancels both tasks, which drops the socket halves and closes
+  the connection. This is the ONLY teardown there is. `read_loop` is the half
+  that always outlives a detached client: it blocks in `read` until EOF, so it
+  holds an evicted connection open even when that connection is IDLE and
+  healthy — the common case, since a server status error (stale region epoch)
+  and a token renewal each evict one with nothing in flight. `writer_task`
+  outlives its client alongside the reader whenever frames are queued: it blocks
+  in `write_all` on a peer that stopped reading, pinning every queued frame
+  behind that stalled write. An idle writer does end by itself, parked on
+  `submit_rx.next()`. Detached, an evicted
+  client therefore left the socket open on BOTH sides (no FIN, so the peer keeps
+  its own socket and conn task) until the process exited. Measured over 5
+  evictions of a never-reading peer: 5 ESTABLISHED sockets and 70 MiB of pinned
+  request values, released only when the PEER closed first. Test:
+  `tests/client_teardown.rs` — ablation: detaching the READER alone reds both
+  cases, detaching the writer alone reds the queued-values case.
+
+  Cancelling a task drops its future mid-op; compio holds the op's buffer until
+  the cancel CQE, so nothing is freed under the kernel. Abandoning a half-written
+  frame is sound BECAUSE this is a teardown — the peer sees the close right
+  behind the truncated bytes, and no caller of ours is left waiting: every
+  in-repo path holds its own `Rc` across the await (`&self` for the call family,
+  `PinnedRecv` for the pipelined senders). That is a property of the call sites,
+  not an API guarantee — an outside `send_frame` user may drop the client
+  mid-await, and gets a clean `Canceled` → `ConnectionClosed`.
+
+  On UCX a cancelled transfer LEAKS its buffer by
+  design instead of freeing one UCX may still write into (`ucx_recv` /
+  `ucx_send` / `ucx_send_vectored` `ManuallyDrop`; the cancel drain can bail out
+  at its progress cap while UCX still holds the pointer): at most one in-flight
+  recv window plus one in-flight send per closed connection, the send being the
+  larger (a whole bulk frame plus its iov array) and the recv window not fixed at
+  64 KiB (`read_loop` sizes an in-progress frame's window to
+  `front_frame_remaining()`). Bounded per connection, against leaking the
+  connection itself. UCX teardown is reasoned from the code, not measured.
+
+  A pipelined caller that holds only the response receiver must PIN its
+  connection, or an unrelated task's eviction now cancels its in-flight request:
+  `stream::conn_pool::PinnedRecv` carries the `Rc` for `send_vectored` /
+  `send_prepared` (replica appends), which is what scopes a connection to the
+  work outstanding on it rather than to the pool entry.
 
 ### Zero-copy receive-into-pooled
 
@@ -174,9 +260,9 @@ Pending::Frame (non-bulk call)
 Pending::IntoPooled (bulk call), response frame NOT FLAG_ERROR
   ├─ UCX                → fast path: peek_bulk_prologue (verify crc, parse
   │                       code+message), consume prologue, regpool_acquire +
-  │                       recv_into(dest, reg) — memh RDMA when the slab is
-  │                       registered (0 copies). Unconditional: recv-into is
-  │                       never worse than decode on UCX, any size.
+  │                       recv_into(dest, reg) — one Stream unpack into the
+  │                       slab (a memh does not remove it). Unconditional:
+  │                       recv-into is never worse than decode on UCX.
   └─ TCP
      ├─ payload ≥ 64 KiB → fast path: verify prologue, drain buffered value
      │  (TCP_RECV_INTO_    prefix into the PooledBuf, then one owned read
@@ -273,7 +359,7 @@ The token rides as an out-of-band prefix stripped before rkyv decode:
 
 ## Wire-version interval
 
-`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX` (currently **40/40**) declare the interval this
+`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX` (currently **41/41**) declare the interval this
 binary speaks. They are maintained **BY HAND**. `wire_compat_check(remote_min,
 remote_max)` is purely "do the intervals overlap"; a peer reporting `max == 0`
 (empty/pre-R1) is refused. There is no schema fingerprint — hashing the sources byte
@@ -319,3 +405,12 @@ exceeds the binary's own `WIRE_VERSION_MAX`.
   frame (~50B+): ~58B overhead vs ~200B+ for gRPC.
 - `tokio::sync::{Mutex,mpsc,oneshot}` are runtime-agnostic futures — they work on
   compio without a tokio Runtime.
+
+## Optional TCP zerocopy for prepared replicas
+
+set_prepared_zerocopy_min_bytes configures prepared replica frames only; zero
+(the default) disables it. The writer preserves its single sequential owner,
+IOV_MAX chunking, full CRC and pending-response handling. Ordinary RPC writes
+and UCX sends retain their paths. The threshold counts complete frame bytes.
+A timed-out caller never owns the writer's buffers; send completion alone is
+insufficient to recycle them. The transport awaits the separate release future.

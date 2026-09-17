@@ -34,6 +34,7 @@ struct Args {
     advertise: Option<String>,
     bind_host: String,
     transport: TransportKind,
+    tcp_zerocopy_min_bytes: usize,
     cpu_start: usize,
     /// explicit list of cores this binary may pin to, taskset
     /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides
@@ -112,6 +113,7 @@ fn parse_args() -> Args {
     let mut advertise: Option<String> = None;
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
+    let mut tcp_zerocopy_min_bytes = 0;
     let mut cpu_start: usize = 0;
     let mut cpuset: Option<Vec<usize>> = None;
     // tunables — None = library default.
@@ -186,6 +188,14 @@ fn parse_args() -> Args {
                         eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
                         std::process::exit(2);
                     });
+            }
+            "--tcp-zerocopy-min-bytes" => {
+                i += 1;
+                tcp_zerocopy_min_bytes = args
+                    .get(i)
+                    .expect("--tcp-zerocopy-min-bytes requires a value")
+                    .parse()
+                    .expect("--tcp-zerocopy-min-bytes must be a byte count (0 disables)");
             }
             "--cpu-start" => {
                 i += 1;
@@ -406,6 +416,7 @@ fn parse_args() -> Args {
                 eprintln!("  --advertise <ADDR>   Advertise host for cluster discovery");
                 eprintln!("                       (the `host:port` base — port comes from --port)");
                 eprintln!("  --transport <MODE>   Transport backend: tcp (default) or ucx");
+                eprintln!("  --tcp-zerocopy-min-bytes <N>  Prepared replica sends; 0/default = off");
                 eprintln!("  --read-hedge-ms <MS> hedge delay for replicated sealed-extent");
                 eprintln!("                       reads; 0/default = hedging off (replica");
                 eprintln!("                       rotation is always on)");
@@ -456,6 +467,7 @@ fn parse_args() -> Args {
         advertise,
         bind_host,
         transport,
+        tcp_zerocopy_min_bytes,
         cpu_start,
         cpuset,
         group_commit_cap,
@@ -679,6 +691,7 @@ async fn main() -> Result<()> {
     apply_ps_tunables(&args);
 
     let _ = autumn_transport::init_with(args.transport);
+    autumn_rpc::client::set_prepared_zerocopy_min_bytes(args.tcp_zerocopy_min_bytes);
     // --cpuset (if given) is installed BEFORE any cpu_pin reader
     // fires, so the cached core list reflects the override. Otherwise
     // fall back to the legacy --cpu-start offset.

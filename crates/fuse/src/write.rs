@@ -141,8 +141,8 @@ async fn make_room(state: &mut FsState, ino: u64) -> Result<()> {
 /// postcondition is "queue empty", and an early return leaves slots behind
 /// while the caller concludes the inode is quiesced.
 ///
-/// Do NOT "simplify" that into clearing the queue on error. `JoinHandle` is
-/// `async_task::Task`, whose `Drop` calls `set_canceled()` — dropping a
+/// Do NOT "simplify" that into clearing the queue on error. Compio 0.19's
+/// `JoinHandle::drop` cancels its task — dropping a
 /// `PendingFlush` CANCELS its flush, so puts it had not yet issued never go out
 /// and replies to those already in flight are never read. (`compio::runtime`'s
 /// "the task will not be cancelled even if the future is dropped" is

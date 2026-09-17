@@ -2,6 +2,7 @@
 name = "autumn-rpc"
 version = "0.1.0"
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 
 [features]
@@ -12,7 +13,7 @@ ucx = ["autumn-transport/ucx"]
 [dependencies]
 autumn-transport = { path = "../transport" }
 bytes.workspace = true
-compio = { version = "0.18", features = ["net", "time", "macros"] }
+compio = { workspace = true, features = ["net", "time", "macros", "bytes"] }
 crc32c.workspace = true
 # Data-plane authz (F-AUTHZ-1): Ed25519 capability-token codec. The manager
 # signs (holds private key), PS verifies (holds only public key). This crate

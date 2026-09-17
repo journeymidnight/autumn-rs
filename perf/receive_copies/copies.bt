@@ -1,0 +1,58 @@
+// Receive-copy accounting per role. The driver prepends a BEGIN block that
+// sets @role[PID] (1-3 EN, 4 PS) and defines MEMMOVE / MEMSET below as the
+// resolved glibc implementation offsets (IFUNC targets, see copytrace.py).
+// The benchmark client registers itself as role 6 through the prctl marker,
+// which also opens (1) and closes (0) numbered measurement windows.
+tracepoint:syscalls:sys_enter_prctl
+/args->option == 3 && args->arg2 == 0x41555455/
+{
+    if (args->arg3 == 2) { @role[pid] = 6; }
+    if (args->arg3 == 1) { @window = args->arg4; @active = 1; @start_ns = nsecs; }
+    if (args->arg3 == 0) { @elapsed_ns[@window] = nsecs - @start_ns; @active = 0; }
+}
+
+// User-space memcpy/memmove of at least 1 KiB (UCX Stream receives and unpacks
+// one AM fragment at a time, a few KiB each). At function entry the return
+// address sits at [sp]; frame-pointer unwinding would skip that immediate
+// caller, so it is recorded separately. ASLR is off for the traced processes,
+// so the analyzer maps both to a module (UCX library = Stream unpack, libc,
+// or the Rust binary resolved to file:line with addr2line).
+uprobe:/lib/x86_64-linux-gnu/libc.so.6:MEMMOVE
+/@active && @role[pid] && arg2 >= 1024/
+{
+    $ret = *(uint64 *)reg("sp");
+    @memcpy_bytes[@window, @role[pid], $ret, ustack(raw, 8)] = sum(arg2);
+    @memcpy_calls[@window, @role[pid], $ret, ustack(raw, 8)] = count();
+}
+
+// Small copies are counted, not attributed: each still costs a uprobe trap,
+// so a change in their number explains traced-throughput differences.
+uprobe:/lib/x86_64-linux-gnu/libc.so.6:MEMMOVE
+/@active && @role[pid] && arg2 < 1024/
+{
+    @small_memcpy_calls[@window, @role[pid]] = count();
+    @small_memcpy_bytes[@window, @role[pid]] = sum(arg2);
+}
+
+uprobe:/lib/x86_64-linux-gnu/libc.so.6:MEMSET
+/@active && @role[pid]/
+{
+    @memset_calls[@window, @role[pid]] = count();
+    if (arg2 >= 16384) { @memset_bytes[@window, @role[pid]] = sum(arg2); }
+}
+
+// Kernel TCP copies. Receive: bytes copied from socket buffers into user
+// memory. Send: bytes handed to tcp_sendmsg (copied into skbs unless
+// MSG_ZEROCOPY, which this measurement does not enable).
+kprobe:skb_copy_datagram_iter
+/@active && @role[pid]/ { @tcp_recv_copy[@window, @role[pid]] = sum(arg3); }
+
+kprobe:tcp_sendmsg_locked
+/@active && @role[pid]/ { @tcp_send[@window, @role[pid]] = sum(arg2); }
+
+tracepoint:exceptions:page_fault_user
+/@active && @role[pid]/ { @user_page_faults[@window, @role[pid]] = count(); }
+
+END {
+    clear(@role); clear(@active); clear(@start_ns); clear(@window);
+}

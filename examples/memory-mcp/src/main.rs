@@ -453,7 +453,13 @@ fn build_embedder(a: &Args) -> Option<Embedder> {
         #[cfg(feature = "openai-embed")]
         {
             let model = a.embed_model.clone().unwrap_or_else(|| "text-embedding-3-small".into());
-            let mut e = embed::OpenAiEmbedder::new(url, &model);
+            let mut e = match embed::OpenAiEmbedder::new(url, &model) {
+                Ok(e) => e,
+                Err(err) => {
+                    tracing::error!("embed HTTP client: {err}");
+                    std::process::exit(2);
+                }
+            };
             if let Some(f) = &a.embed_api_key_file {
                 // Refuse rather than continue unauthenticated. A mistyped path
                 // otherwise yields a service that 401s on every vector query

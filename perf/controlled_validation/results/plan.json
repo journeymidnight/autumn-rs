@@ -1,0 +1,282 @@
+[
+  {
+    "repeat": 0,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 0,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 0,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "zc",
+    "trace": false
+  },
+  {
+    "repeat": 0,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 0,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 0,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "zc",
+    "trace": false
+  },
+  {
+    "repeat": 0,
+    "transport": "ucx",
+    "partitions": 1,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 0,
+    "transport": "ucx",
+    "partitions": 1,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 0,
+    "transport": "ucx",
+    "partitions": 4,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 0,
+    "transport": "ucx",
+    "partitions": 4,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "zc",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "zc",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "ucx",
+    "partitions": 1,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "ucx",
+    "partitions": 1,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "ucx",
+    "partitions": 4,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 1,
+    "transport": "ucx",
+    "partitions": 4,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "zc",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "zc",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "ucx",
+    "partitions": 1,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "ucx",
+    "partitions": 1,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "ucx",
+    "partitions": 4,
+    "version": "baseline",
+    "trace": false
+  },
+  {
+    "repeat": 2,
+    "transport": "ucx",
+    "partitions": 4,
+    "version": "pure",
+    "trace": false
+  },
+  {
+    "repeat": 10,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "baseline",
+    "trace": true
+  },
+  {
+    "repeat": 10,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "pure",
+    "trace": true
+  },
+  {
+    "repeat": 10,
+    "transport": "tcp",
+    "partitions": 1,
+    "version": "zc",
+    "trace": true
+  },
+  {
+    "repeat": 10,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "baseline",
+    "trace": true
+  },
+  {
+    "repeat": 10,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "pure",
+    "trace": true
+  },
+  {
+    "repeat": 10,
+    "transport": "tcp",
+    "partitions": 4,
+    "version": "zc",
+    "trace": true
+  },
+  {
+    "repeat": 10,
+    "transport": "ucx",
+    "partitions": 1,
+    "version": "baseline",
+    "trace": true
+  },
+  {
+    "repeat": 10,
+    "transport": "ucx",
+    "partitions": 1,
+    "version": "pure",
+    "trace": true
+  },
+  {
+    "repeat": 10,
+    "transport": "ucx",
+    "partitions": 4,
+    "version": "baseline",
+    "trace": true
+  },
+  {
+    "repeat": 10,
+    "transport": "ucx",
+    "partitions": 4,
+    "version": "pure",
+    "trace": true
+  }
+]

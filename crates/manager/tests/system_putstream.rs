@@ -277,10 +277,9 @@ fn get_stream_inline_value_passthrough() {
     });
 }
 
-/// `get_many_into` batched zero-copy reads. Exercises BOTH branches of
-/// the per-item bulk decision (`bulk_worthwhile(dest.len())`): a 4 KiB value (< 64 KiB
-/// → regular `MSG_GET` + copy) and a 256 KiB value (>= 64 KiB → `MSG_GET_BULK`
-/// recv-into-dest), plus a missing key (`Ok(None)`).
+/// `get_many_into` batched reads over mixed sizes: a 4 KiB value (the receiver
+/// decodes the small reply) and a 256 KiB value (received into the pool), both
+/// through `MSG_GET_BULK`, plus a missing key (`Ok(None)`).
 #[test]
 #[ignore]
 fn get_many_into_mixed_sizes() {
@@ -297,8 +296,8 @@ fn get_many_into_mixed_sizes() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 120, 12001).await;
 
-        let small = pattern(4 * 1024); // < 64 KiB → regular MSG_GET branch
-        let large = pattern(256 * 1024); // >= 64 KiB → MSG_GET_BULK branch
+        let small = pattern(4 * 1024); // < 64 KiB → small reply decoded
+        let large = pattern(256 * 1024); // >= 64 KiB → received into the pool
         cluster.put(b"k-small", &small).await.expect("put small");
         cluster.put(b"k-large", &large).await.expect("put large");
 

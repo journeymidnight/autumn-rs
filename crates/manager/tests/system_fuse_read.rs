@@ -7,8 +7,8 @@
 //!     (`[0x03][ino][off BE]`): a 10 MiB file → extents at off 0 and off 8 MiB
 //!     (`MAX_EXTENT` = 8 MiB), NOT 40 × 256 KiB chunks.
 //!   - full multi-extent read round-trips byte-exactly
-//!   - whole-extent read (8 MiB ≥ 64 KiB → bulk `MSG_GET_BULK` branch)
-//!   - small sub-range (< 64 KiB → regular `MSG_GET` branch)
+//!   - whole-extent read (8 MiB ≥ 64 KiB → value received into the pool)
+//!   - small sub-range (< 64 KiB → small reply decoded)
 //!   - cross-extent sub-range (spans the 8 MiB boundary)
 //!   - EOF-clamped read
 //!   - truncate drops the past-EOF extent + shrinks the straddling one
@@ -134,7 +134,7 @@ fn variable_length_extents() {
             .expect("extent0 read");
         assert!(e0 == data[..MAX_EXTENT], "extent0 mismatch");
 
-        // Small sub-range (4 KiB < 64 KiB → regular MSG_GET branch).
+        // Small sub-range (4 KiB < 64 KiB → small reply decoded).
         let sub = read::read(&mut state, ino, 1000, 4096)
             .await
             .expect("sub read");

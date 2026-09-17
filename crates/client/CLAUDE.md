@@ -95,11 +95,14 @@ the API suffix.
 - `put(key, value)` — write a key-value pair. Always durable: there is no
   sync flag to pass (the extent-node fsync coalescer makes every write durable
   before it ACKs).
-- `get(key) → Option<Vec<u8>>` — read, `None` if not found.
+- `get(key) → Option<Vec<u8>>` / `get_range(key, offset, length)` — read, `None` if not
+  found. Served by the same pooled `MSG_GET_BULK` core as `get_pooled`; the returned `Vec`
+  is the one application copy. Retry classification is `call_ps_for_key`'s: NotFound is a miss,
+  PermissionDenied/NamespaceUnknown are terminal, everything else refreshes and retries.
 - `get_pooled(key) → Option<ValueBuf>` / `get_range_pooled(key, offset, length)` —
   **bulk read, ZERO SDK-side copies** — the CORE every bulk read routes through. The value
-  arrives in a read_loop-owned RegPool buffer (`MSG_GET_BULK` + `call_into_pooled`; UCX
-  RDMAs into the registered slab, TCP ≥ 64 KiB pays only the kernel copy) and is handed
+  arrives in a read_loop-owned RegPool buffer (`MSG_GET_BULK` + `call_into_pooled`; the UCX
+  Stream unpack or TCP kernel copy is its only copy) and is handed
   straight back. The address-UNCONSTRAINED shape ("I just want the value"): autumnfs
   cat/get, gallery serving, any consumer without a fixed destination. Any value size.
   Honors `rpc_timeout` (pooled recv is cancel-safe).
@@ -165,12 +168,12 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
 - `get_many_into(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` — **bulk batched
   read.** Use when values ≥ 64 KiB AND you have caller-owned dest buffers (sglang pages /
   torch tensors). Each `GetManyItem` = `{key, offset, length, dest}`. The bulk recv lands
-  in a read_loop-owned RegPool buffer (UCX RDMAs into the registered slab; TCP owned
-  read), then ONE memcpy into `dest` — `dest` needs no registration and no special
+  in a read_loop-owned RegPool buffer (UCX Stream unpack; TCP owned read), then ONE
+  memcpy into `dest` — `dest` needs no registration and no special
   lifetime. Auto-routes: HOMOGENEOUS small whole-value batch (every item `offset==0`,
   `length==0`, `dest.len() < 64 KiB`) → delegates to `get_many` + memcpy into each `dest`;
-  MIXED / range / large-bulk → per-op fan-out (`MSG_GET_BULK` pooled recv when `read_len ≥ 64
-  KiB`, else `MSG_GET` + memcpy). Result `i` matches `items[i]`.
+  MIXED / range / large-bulk → per-op fan-out through `get_range_into` (`MSG_GET_BULK`
+  pooled recv + memcpy) at any size. Result `i` matches `items[i]`.
 - `get_many_direct(items: &mut [GetManyItem]) → Vec<Result<Option<usize>>>` — **EN-DIRECT
   batch read.** Same dest shape as `get_many_into`, but each item with length ≥ 64 KiB is
   read STRAIGHT from an extent node (`MSG_GET_REDIRECT` descriptor →
@@ -245,8 +248,8 @@ All four gates (this one + the two recv gates + the PS `handle_get_redirect` 64 
 deliberately one value; the dispatch table lives in autumn-rpc CLAUDE.md "read_loop
 dispatch (4-way)". Below 64 KiB the per-op registered/pooled-recv machinery costs more
 than the copy it saves AND the recv side doesn't bulk anyway, so e2e bulk doesn't engage;
-at/above it bulk wins on both transports (UCX RDMA into the registered pool slab /
-registered-send; TCP pooled recv dropping the rkyv wrap + FrameDecoder accumulation +
+at/above it bulk wins on both transports (UCX Stream unpack straight into the pool
+slab / registered-send; TCP pooled recv dropping the rkyv wrap + FrameDecoder accumulation +
 owned-`Vec` alloc).
 
 There is no `--bulk` / `bulk=` flag — call `bulk_worthwhile(size)`. The const + helper live in
@@ -425,3 +428,9 @@ carried in a successful response body.
 - `autumn-rpc`: RPC client + wire codec (partition_rpc, manager_rpc).
 - `compio`: async runtime (time::sleep for retry backoff).
 - `anyhow`, `bytes`: error handling + byte buffers.
+
+## Runtime dependency
+
+Compio 0.19.2 is inherited from the workspace and requires Rust >=1.95. The
+standalone Python manifest/lockfile must resolve the same compio family. Client
+I/O strategy, pooled receive ownership and caller timeouts remain unchanged.

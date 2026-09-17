@@ -8,7 +8,7 @@
 //!     FRESH *manager-level* owner epoch but does NOT seal the inherited
 //!     open tail and does NOT push its epoch to the EN until its first
 //!     write. So an "idle takeover" leaves the OLD revision valid at the EN.
-//!   - `handle_get` has NO server-side write fence — only the client-stamped
+//!   - `handle_get_bulk` has NO server-side write fence — only the client-stamped
 //!     `region_epoch`, which a sticky rebalance (ps_id-only move) does NOT
 //!     bump.
 //!
@@ -252,10 +252,8 @@ async fn raw_get(cli: &RpcClient, part_id: u64, key: &[u8]) -> Result<(u8, Vec<u
         length: 0,
         region_epoch: 0,
     });
-    match cli.call(partition_rpc::MSG_GET, payload).await {
-        Ok(resp) => partition_rpc::rkyv_decode::<partition_rpc::GetResp>(&resp)
-            .map(|r| (r.code, r.value))
-            .map_err(|e| format!("decode GetResp: {e}")),
+    match cli.call_into_pooled(partition_rpc::MSG_GET_BULK, payload).await {
+        Ok(resp) => Ok((resp.code, resp.buf.filled().to_vec())),
         Err(e) => Err(format!("call: {e}")),
     }
 }
@@ -637,20 +635,20 @@ fn sigstop_zombie_writer_g1() {
             );
         }
 
-        // Stale-read is the READ-side `handle_get` fence — OUT OF SCOPE for this
+        // Stale-read is the READ-side `handle_get_bulk` fence — OUT OF SCOPE for this
         // WRITE-side fix. Record it HONESTLY; do NOT assert it away. With the
         // write fenced the zombie value never lands, so a stale read of it
         // should not occur either — but if it does (a residual old-owner serving
         // window before it closes the reassigned partition), that is a DOCUMENTED
         // separate follow-up, not a failure of this fix.
         eprintln!(
-            "stale-read status (read-side handle_get, out of scope for this fix): {}",
+            "stale-read status (read-side handle_get_bulk, out of scope for this fix): {}",
             yn(stale_read)
         );
         if stale_read {
             eprintln!(
                 "NOTE: a STALE READ was still observed (old owner served a ghost value \
-                 while the survivor holds V0). That is the read-side handle_get fence — \
+                 while the survivor holds V0). That is the read-side handle_get_bulk fence — \
                  a separate follow-up — NOT regressed by this write-side fix."
             );
         }

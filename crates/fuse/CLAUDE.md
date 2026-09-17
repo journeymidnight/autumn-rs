@@ -410,8 +410,8 @@ extent map），`extent::execute_append` 只需要 `Rc<ClusterClient>`，spawn �
 多槽安全性依赖两条，都验过：① `extent::upsert` 是按 start 的有序插入替换，而连续 append
 批次区间互不相交，所以**落地顺序无关**（`disjoint_batches_apply_the_same_in_any_order`
 钉住，消融会红）；② 出错不提前返回——postcondition 是"队列空"，提前返回会把槽留下而调用方以为已静默。
-**别"简化"成出错时清空队列**：`JoinHandle` 就是 `async_task::Task`，其 `Drop` 调
-`set_canceled()`，drop 一个 `PendingFlush` 会**取消**那次 flush（compio 那句"drop 不取消"
+**别"简化"成出错时清空队列**：compio 0.19 的 `JoinHandle::drop` 仍然取消任务，
+drop 一个 `PendingFlush` 会**取消**那次 flush（compio 那句"drop 不取消"
 是 `spawn_blocking` 的契约，不是 `spawn` 的——本轮我一开始就引错了这句）。
 
 不需要第二块缓冲：`plan` 里的 values 本来就是 `Bytes::copy_from_slice` 拷出来的自有数据，

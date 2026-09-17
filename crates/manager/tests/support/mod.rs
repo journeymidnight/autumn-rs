@@ -375,11 +375,19 @@ pub async fn ps_put(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8]) {
     panic!("put failed after 30 retries: {last_err}");
 }
 
-/// Get a key's value.
-pub async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::GetResp {
+/// A point read's outcome: `CODE_*`, the PS's message, and the value bytes.
+#[allow(dead_code)]
+pub struct GetResult {
+    pub code: u8,
+    pub message: String,
+    pub value: Vec<u8>,
+}
+
+/// Get a key's value through `MSG_GET_BULK`, the read every client uses.
+pub async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> GetResult {
     let resp = ps
-        .call(
-            partition_rpc::MSG_GET,
+        .call_into_pooled(
+            partition_rpc::MSG_GET_BULK,
             partition_rpc::rkyv_encode(&partition_rpc::GetReq {
                 part_id,
                 key: key.to_vec(),
@@ -390,7 +398,11 @@ pub async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::
         )
         .await
         .expect("get");
-    partition_rpc::rkyv_decode(&resp).expect("decode GetResp")
+    GetResult {
+        code: resp.code,
+        message: resp.message,
+        value: resp.buf.filled().to_vec(),
+    }
 }
 
 /// Flush a partition's memtable.
@@ -738,7 +750,7 @@ pub async fn psr_put(router: &PsRouter, part_id: u64, key: &[u8], value: &[u8]) 
 }
 
 /// Routed `ps_get` — partition-aware.
-pub async fn psr_get(router: &PsRouter, part_id: u64, key: &[u8]) -> partition_rpc::GetResp {
+pub async fn psr_get(router: &PsRouter, part_id: u64, key: &[u8]) -> GetResult {
     let c = router.client_for(part_id).await;
     ps_get(&c, part_id, key).await
 }

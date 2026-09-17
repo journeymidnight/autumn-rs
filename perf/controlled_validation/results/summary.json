@@ -1,0 +1,6242 @@
+[
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 132.41100271849447,
+      "min": 132.20904532582878,
+      "max": 132.633587470357
+    },
+    "p50_us": {
+      "median": 28.52,
+      "min": 28.479,
+      "max": 28.577
+    },
+    "p99_us": {
+      "median": 34.228,
+      "min": 34.051,
+      "max": 35.825
+    },
+    "process_cpu_s_per_gib": {
+      "median": 7.78,
+      "min": 7.77,
+      "max": 7.8
+    },
+    "kernel_cycles_per_gib": {
+      "median": 14293080453.0,
+      "min": 14281026438.0,
+      "max": 14318816110.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 11.61,
+      "min": 9.02,
+      "max": 16.89
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 156.3984879738748,
+      "min": 154.83611923168425,
+      "max": 157.6180743308103
+    },
+    "p50_us": {
+      "median": 24.176,
+      "min": 23.937,
+      "max": 24.281
+    },
+    "p99_us": {
+      "median": 28.425,
+      "min": 28.376,
+      "max": 29.358
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.96,
+      "min": 6.91,
+      "max": 7.02
+    },
+    "kernel_cycles_per_gib": {
+      "median": 13082553224.0,
+      "min": 13057134646.0,
+      "max": 13368082349.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 10.16,
+      "min": 7.36,
+      "max": 14.2
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 156.79543085962828,
+      "min": 156.51178513773078,
+      "max": 157.18997689760334
+    },
+    "p50_us": {
+      "median": 24.106,
+      "min": 23.982,
+      "max": 24.109
+    },
+    "p99_us": {
+      "median": 28.475,
+      "min": 28.321,
+      "max": 28.824
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.949999999999999,
+      "min": 6.9399999999999995,
+      "max": 6.99
+    },
+    "kernel_cycles_per_gib": {
+      "median": 13091903902.0,
+      "min": 13063234504.0,
+      "max": 13179763786.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 8.05,
+      "min": 7.78,
+      "max": 12.01
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 13.488095306132843,
+      "min": 9.343599870445324,
+      "max": 14.26208303284907
+    },
+    "p50_us": {
+      "median": 190.203,
+      "min": 183.971,
+      "max": 192.55
+    },
+    "p99_us": {
+      "median": 3090.213,
+      "min": 2586.612,
+      "max": 7592.492
+    },
+    "process_cpu_s_per_gib": {
+      "median": 68.0,
+      "min": 67.67999999999999,
+      "max": 74.08
+    },
+    "kernel_cycles_per_gib": {
+      "median": 136473631680.0,
+      "min": 133231239392.0,
+      "max": 152708201632.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 86.88000000000001,
+      "min": 72.0,
+      "max": 103.52
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 14.181030331311657,
+      "min": 11.966154429225432,
+      "max": 14.23235669124156
+    },
+    "p50_us": {
+      "median": 176.898,
+      "min": 172.611,
+      "max": 200.794
+    },
+    "p99_us": {
+      "median": 3204.637,
+      "min": 2280.301,
+      "max": 4288.305
+    },
+    "process_cpu_s_per_gib": {
+      "median": 69.6,
+      "min": 68.64,
+      "max": 75.2
+    },
+    "kernel_cycles_per_gib": {
+      "median": 139630517584.0,
+      "min": 135504496400.0,
+      "max": 153876555184.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 96.8,
+      "min": 87.52,
+      "max": 104.47999999999999
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 13.745195216137203,
+      "min": 11.164051903863362,
+      "max": 14.708104729991858
+    },
+    "p50_us": {
+      "median": 175.886,
+      "min": 175.454,
+      "max": 184.44
+    },
+    "p99_us": {
+      "median": 2687.578,
+      "min": 2393.396,
+      "max": 7153.909
+    },
+    "process_cpu_s_per_gib": {
+      "median": 69.76,
+      "min": 67.67999999999999,
+      "max": 70.72
+    },
+    "kernel_cycles_per_gib": {
+      "median": 139234582096.0,
+      "min": 131905296224.0,
+      "max": 147035191552.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 81.28,
+      "min": 70.88,
+      "max": 90.08
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 443.06653176086905,
+      "min": 430.6264335428864,
+      "max": 444.3033465061697
+    },
+    "p50_us": {
+      "median": 69.481,
+      "min": 69.269,
+      "max": 71.152
+    },
+    "p99_us": {
+      "median": 83.555,
+      "min": 82.098,
+      "max": 84.133
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.59,
+      "min": 4.59,
+      "max": 4.720000000000001
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8832922578.0,
+      "min": 8764438992.0,
+      "max": 8993234221.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.88,
+      "min": 4.66,
+      "max": 5.18
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 439.1741254401835,
+      "min": 438.58031647496495,
+      "max": 443.42705188324805
+    },
+    "p50_us": {
+      "median": 70.468,
+      "min": 69.853,
+      "max": 70.581
+    },
+    "p99_us": {
+      "median": 80.929,
+      "min": 80.488,
+      "max": 81.879
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.640000000000001,
+      "min": 4.62,
+      "max": 4.66
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8981072131.0,
+      "min": 8841273151.0,
+      "max": 8987748273.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.5,
+      "min": 4.64,
+      "max": 6.29
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 441.21849248027127,
+      "min": 439.8105557606902,
+      "max": 445.3159464998553
+    },
+    "p50_us": {
+      "median": 70.26,
+      "min": 69.614,
+      "max": 70.453
+    },
+    "p99_us": {
+      "median": 81.075,
+      "min": 80.668,
+      "max": 81.767
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.64,
+      "min": 4.609999999999999,
+      "max": 4.65
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8862776928.0,
+      "min": 8739485454.0,
+      "max": 8884499151.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.6,
+      "min": 5.46,
+      "max": 6.069999999999999
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 41.55451719301138,
+      "min": 32.25237675096654,
+      "max": 45.49669617245657
+    },
+    "p50_us": {
+      "median": 477.295,
+      "min": 449.823,
+      "max": 493.293
+    },
+    "p99_us": {
+      "median": 7695.206,
+      "min": 6851.825,
+      "max": 11173.075
+    },
+    "process_cpu_s_per_gib": {
+      "median": 32.96,
+      "min": 30.56,
+      "max": 37.6
+    },
+    "kernel_cycles_per_gib": {
+      "median": 67722897376.0,
+      "min": 60151654080.0,
+      "max": 80594834320.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 32.8,
+      "min": 23.84,
+      "max": 36.48
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 38.694424155365745,
+      "min": 37.80590643282951,
+      "max": 50.99332454515441
+    },
+    "p50_us": {
+      "median": 493.933,
+      "min": 434.172,
+      "max": 508.282
+    },
+    "p99_us": {
+      "median": 9059.759,
+      "min": 6764.708,
+      "max": 9490.621
+    },
+    "process_cpu_s_per_gib": {
+      "median": 31.84,
+      "min": 27.52,
+      "max": 32.160000000000004
+    },
+    "kernel_cycles_per_gib": {
+      "median": 68146716496.0,
+      "min": 55087759744.0,
+      "max": 69010041088.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 31.84,
+      "min": 27.2,
+      "max": 36.48
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 39.78163101909923,
+      "min": 31.25699822517929,
+      "max": 43.58710417579353
+    },
+    "p50_us": {
+      "median": 490.68,
+      "min": 486.146,
+      "max": 492.441
+    },
+    "p99_us": {
+      "median": 7462.442,
+      "min": 4617.062,
+      "max": 12483.349
+    },
+    "process_cpu_s_per_gib": {
+      "median": 35.68,
+      "min": 33.44,
+      "max": 41.120000000000005
+    },
+    "kernel_cycles_per_gib": {
+      "median": 79256066608.0,
+      "min": 67104011600.0,
+      "max": 87734357472.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 40.96,
+      "min": 36.160000000000004,
+      "max": 73.76
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 683.0518162482452,
+      "min": 679.8811966899206,
+      "max": 690.7185490411896
+    },
+    "p50_us": {
+      "median": 90.328,
+      "min": 89.716,
+      "max": 90.65
+    },
+    "p99_us": {
+      "median": 99.832,
+      "min": 97.959,
+      "max": 99.94
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.6175,
+      "min": 1.6175,
+      "max": 1.6275
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3657960151.75,
+      "min": 3625803807.0,
+      "max": 3666797162.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.8824999999999998,
+      "min": 1.6475,
+      "max": 3.23
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 713.8027848276056,
+      "min": 711.4023248878774,
+      "max": 723.1126731601825
+    },
+    "p50_us": {
+      "median": 85.742,
+      "min": 85.554,
+      "max": 86.251
+    },
+    "p99_us": {
+      "median": 97.476,
+      "min": 91.984,
+      "max": 98.408
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.58,
+      "min": 1.5675,
+      "max": 1.5875
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3561995741.5,
+      "min": 3546466932.25,
+      "max": 3593452291.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 2.005,
+      "min": 2.0,
+      "max": 2.515
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 705.688851947226,
+      "min": 692.5923669427028,
+      "max": 725.0903635058575
+    },
+    "p50_us": {
+      "median": 86.443,
+      "min": 85.415,
+      "max": 86.861
+    },
+    "p99_us": {
+      "median": 104.336,
+      "min": 90.67,
+      "max": 107.858
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.605,
+      "min": 1.57,
+      "max": 1.615
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3631024689.75,
+      "min": 3532287980.25,
+      "max": 3636996138.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.9675,
+      "min": 1.89,
+      "max": 2.0875
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 65.81012283641047,
+      "min": 64.65366957956519,
+      "max": 91.1400385530943
+    },
+    "p50_us": {
+      "median": 479.687,
+      "min": 471.144,
+      "max": 482.088
+    },
+    "p99_us": {
+      "median": 7681.066,
+      "min": 6669.97,
+      "max": 8810.081
+    },
+    "process_cpu_s_per_gib": {
+      "median": 18.28,
+      "min": 14.64,
+      "max": 18.68
+    },
+    "kernel_cycles_per_gib": {
+      "median": 39526231722.0,
+      "min": 28454512014.0,
+      "max": 40995156606.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 17.02,
+      "min": 16.44,
+      "max": 20.8
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 69.46406700699053,
+      "min": 66.3097922430739,
+      "max": 90.925052792422
+    },
+    "p50_us": {
+      "median": 467.186,
+      "min": 447.363,
+      "max": 480.553
+    },
+    "p99_us": {
+      "median": 7923.732,
+      "min": 6743.594,
+      "max": 8693.468
+    },
+    "process_cpu_s_per_gib": {
+      "median": 17.52,
+      "min": 14.700000000000001,
+      "max": 18.96
+    },
+    "kernel_cycles_per_gib": {
+      "median": 37576064280.0,
+      "min": 28860884984.0,
+      "max": 41870305458.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 16.7,
+      "min": 14.74,
+      "max": 19.64
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 66.82729799842127,
+      "min": 63.623847605480066,
+      "max": 85.87040878897078
+    },
+    "p50_us": {
+      "median": 489.833,
+      "min": 487.023,
+      "max": 493.933
+    },
+    "p99_us": {
+      "median": 7839.823,
+      "min": 7114.844,
+      "max": 9856.302
+    },
+    "process_cpu_s_per_gib": {
+      "median": 18.900000000000002,
+      "min": 16.18,
+      "max": 20.18
+    },
+    "kernel_cycles_per_gib": {
+      "median": 40937161134.0,
+      "min": 32794055476.0,
+      "max": 45119915686.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 15.18,
+      "min": 13.46,
+      "max": 17.580000000000002
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1777.866039875596,
+      "min": 1684.7032992599295,
+      "max": 1791.9219951716575
+    },
+    "p50_us": {
+      "median": 281.904,
+      "min": 279.501,
+      "max": 283.945
+    },
+    "p99_us": {
+      "median": 378.495,
+      "min": 362.984,
+      "max": 414.317
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.295,
+      "min": 1.29,
+      "max": 1.325
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3005697149.0,
+      "min": 2987023762.75,
+      "max": 3093156416.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.3275000000000001,
+      "min": 1.305,
+      "max": 1.45
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1735.1855237952054,
+      "min": 1676.1764849183742,
+      "max": 1757.8016091254099
+    },
+    "p50_us": {
+      "median": 287.711,
+      "min": 283.856,
+      "max": 288.555
+    },
+    "p99_us": {
+      "median": 394.953,
+      "min": 391.581,
+      "max": 402.391
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.285,
+      "min": 1.2725,
+      "max": 1.305
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2992984338.0,
+      "min": 2963742587.5,
+      "max": 3052363703.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.42,
+      "min": 1.3,
+      "max": 1.5675
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1730.5631252282742,
+      "min": 1684.4072681321547,
+      "max": 1744.376533146099
+    },
+    "p50_us": {
+      "median": 287.07,
+      "min": 286.037,
+      "max": 287.563
+    },
+    "p99_us": {
+      "median": 399.396,
+      "min": 392.557,
+      "max": 404.492
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.3025,
+      "min": 1.2775,
+      "max": 1.3125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3032787226.25,
+      "min": 2965142978.5,
+      "max": 3074514147.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.35,
+      "min": 1.295,
+      "max": 1.5025
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 129.43612676798506,
+      "min": 109.0435296462995,
+      "max": 189.51581288998375
+    },
+    "p50_us": {
+      "median": 1845.393,
+      "min": 1821.908,
+      "max": 1975.736
+    },
+    "p99_us": {
+      "median": 21438.191,
+      "min": 14148.013,
+      "max": 28150.66
+    },
+    "process_cpu_s_per_gib": {
+      "median": 14.360000000000001,
+      "min": 11.84,
+      "max": 15.200000000000001
+    },
+    "kernel_cycles_per_gib": {
+      "median": 30554394974.0,
+      "min": 22830529560.0,
+      "max": 33149798276.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 12.9,
+      "min": 11.54,
+      "max": 14.86
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 141.13050613354736,
+      "min": 125.95350824816992,
+      "max": 196.24974675925012
+    },
+    "p50_us": {
+      "median": 1742.968,
+      "min": 1742.815,
+      "max": 1800.94
+    },
+    "p99_us": {
+      "median": 20782.141,
+      "min": 14393.057,
+      "max": 21904.501
+    },
+    "process_cpu_s_per_gib": {
+      "median": 13.44,
+      "min": 11.7,
+      "max": 14.76
+    },
+    "kernel_cycles_per_gib": {
+      "median": 27919550474.0,
+      "min": 22600862410.0,
+      "max": 31911323364.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 11.74,
+      "min": 11.56,
+      "max": 16.759999999999998
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 120.15907033227683,
+      "min": 114.0469526626405,
+      "max": 175.53891863130917
+    },
+    "p50_us": {
+      "median": 1944.071,
+      "min": 1921.29,
+      "max": 1978.069
+    },
+    "p99_us": {
+      "median": 19784.917,
+      "min": 15103.587,
+      "max": 23934.924
+    },
+    "process_cpu_s_per_gib": {
+      "median": 15.42,
+      "min": 12.54,
+      "max": 15.780000000000001
+    },
+    "kernel_cycles_per_gib": {
+      "median": 33188735050.0,
+      "min": 24379093674.0,
+      "max": 34839708400.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 10.280000000000001,
+      "min": 10.0,
+      "max": 11.24
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2046.583707281863,
+      "min": 1992.4992623088888,
+      "max": 2058.902116273253
+    },
+    "p50_us": {
+      "median": 482.198,
+      "min": 480.632,
+      "max": 494.272
+    },
+    "p99_us": {
+      "median": 570.358,
+      "min": 556.521,
+      "max": 580.135
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.77875,
+      "min": 0.775,
+      "max": 0.79
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2220638015.5,
+      "min": 2208623829.625,
+      "max": 2258992973.875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.81,
+      "min": 0.7999999999999999,
+      "max": 0.8425
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2055.540707920652,
+      "min": 2055.0525663882777,
+      "max": 2068.1576391590347
+    },
+    "p50_us": {
+      "median": 479.363,
+      "min": 479.028,
+      "max": 480.732
+    },
+    "p99_us": {
+      "median": 560.658,
+      "min": 557.431,
+      "max": 610.674
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.7762500000000001,
+      "min": 0.77625,
+      "max": 0.7775
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2219781774.25,
+      "min": 2212072271.5,
+      "max": 2223734319.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.82125,
+      "min": 0.8037500000000001,
+      "max": 1.2937500000000002
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2044.3920227147466,
+      "min": 1936.0475499555296,
+      "max": 2069.203191838573
+    },
+    "p50_us": {
+      "median": 481.839,
+      "min": 478.866,
+      "max": 507.444
+    },
+    "p99_us": {
+      "median": 595.213,
+      "min": 560.433,
+      "max": 618.294
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.7775,
+      "min": 0.775,
+      "max": 0.8075
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2218518331.25,
+      "min": 2217421418.25,
+      "max": 2309626913.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.79625,
+      "min": 0.7937500000000001,
+      "max": 1.06125
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 348.30715545417064,
+      "min": 320.9394968201625,
+      "max": 357.26189786136644
+    },
+    "p50_us": {
+      "median": 2518.854,
+      "min": 2474.857,
+      "max": 2593.091
+    },
+    "p99_us": {
+      "median": 16905.961,
+      "min": 15609.633,
+      "max": 21006.864
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.425,
+      "min": 5.405,
+      "max": 5.74
+    },
+    "kernel_cycles_per_gib": {
+      "median": 12360986107.5,
+      "min": 12322796069.0,
+      "max": 13365946943.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.515000000000001,
+      "min": 4.975,
+      "max": 6.0
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 348.245659691318,
+      "min": 333.91155597486846,
+      "max": 378.90050846933
+    },
+    "p50_us": {
+      "median": 2424.212,
+      "min": 2412.651,
+      "max": 2474.469
+    },
+    "p99_us": {
+      "median": 17846.4,
+      "min": 13757.07,
+      "max": 20648.888
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.535,
+      "min": 5.305000000000001,
+      "max": 5.71
+    },
+    "kernel_cycles_per_gib": {
+      "median": 12854310926.5,
+      "min": 11960009666.0,
+      "max": 13193063811.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.08,
+      "min": 5.025,
+      "max": 7.8100000000000005
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 326.62761616826873,
+      "min": 292.23719701444764,
+      "max": 347.71961140832525
+    },
+    "p50_us": {
+      "median": 2680.912,
+      "min": 2662.544,
+      "max": 2792.186
+    },
+    "p99_us": {
+      "median": 17114.342,
+      "min": 12355.255,
+      "max": 23020.13
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.83,
+      "min": 5.695,
+      "max": 6.34
+    },
+    "kernel_cycles_per_gib": {
+      "median": 13357143956.5,
+      "min": 12827978309.0,
+      "max": 14798358062.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.335,
+      "min": 3.665,
+      "max": 6.1049999999999995
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 3120.0842806977103,
+      "min": 3099.7871249192967,
+      "max": 3226.074227003621
+    },
+    "p50_us": {
+      "median": 2595.734,
+      "min": 2513.265,
+      "max": 2610.454
+    },
+    "p99_us": {
+      "median": 3670.793,
+      "min": 3475.438,
+      "max": 3717.681
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.775,
+      "min": 0.7474999999999999,
+      "max": 0.7849999999999999
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2262938962.875,
+      "min": 2171479622.25,
+      "max": 2287688966.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.7787499999999999,
+      "min": 0.735,
+      "max": 1.20125
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 3049.6740888835743,
+      "min": 3047.6337347646577,
+      "max": 3120.182081028627
+    },
+    "p50_us": {
+      "median": 2623.86,
+      "min": 2574.058,
+      "max": 2639.22
+    },
+    "p99_us": {
+      "median": 3663.805,
+      "min": 3629.688,
+      "max": 3713.323
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.77625,
+      "min": 0.75375,
+      "max": 0.7775
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2259550540.25,
+      "min": 2186623326.375,
+      "max": 2259588647.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.8049999999999999,
+      "min": 0.78125,
+      "max": 1.1275
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 3029.9413272463507,
+      "min": 2989.524348320094,
+      "max": 3151.510851575541
+    },
+    "p50_us": {
+      "median": 2643.692,
+      "min": 2554.866,
+      "max": 2670.968
+    },
+    "p99_us": {
+      "median": 3741.434,
+      "min": 3502.616,
+      "max": 3865.021
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.7825,
+      "min": 0.74375,
+      "max": 0.8037500000000001
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2274307178.375,
+      "min": 2163737756.25,
+      "max": 2347864134.875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.8075,
+      "min": 0.7537499999999999,
+      "max": 0.99375
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 654.9376553317325,
+      "min": 582.330019796474,
+      "max": 717.1639032360637
+    },
+    "p50_us": {
+      "median": 9590.531,
+      "min": 9488.875,
+      "max": 9633.741
+    },
+    "p99_us": {
+      "median": 32822.522,
+      "min": 32663.544,
+      "max": 40355.303
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.535,
+      "min": 5.4399999999999995,
+      "max": 5.595
+    },
+    "kernel_cycles_per_gib": {
+      "median": 12788582945.5,
+      "min": 12431687231.0,
+      "max": 12924025753.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.34,
+      "min": 4.47,
+      "max": 6.565
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 658.2921696162817,
+      "min": 633.0805927331919,
+      "max": 764.8599602679974
+    },
+    "p50_us": {
+      "median": 9053.949,
+      "min": 8898.714,
+      "max": 9449.521
+    },
+    "p99_us": {
+      "median": 37249.513,
+      "min": 34672.726,
+      "max": 41009.447
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.375,
+      "min": 5.25,
+      "max": 5.65
+    },
+    "kernel_cycles_per_gib": {
+      "median": 12305384674.5,
+      "min": 11956116083.0,
+      "max": 13078165061.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.23,
+      "min": 4.925,
+      "max": 6.285
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 561.0612949103685,
+      "min": 526.8259646130357,
+      "max": 638.3937020955078
+    },
+    "p50_us": {
+      "median": 11129.846,
+      "min": 10875.787,
+      "max": 11235.133
+    },
+    "p99_us": {
+      "median": 34332.948,
+      "min": 32659.974,
+      "max": 46010.342
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.11,
+      "min": 5.83,
+      "max": 6.505
+    },
+    "kernel_cycles_per_gib": {
+      "median": 14234805675.5,
+      "min": 13358225492.5,
+      "max": 15409120879.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.23,
+      "min": 4.73,
+      "max": 5.71
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1852.335531896349,
+      "min": 1835.131553623171,
+      "max": 1868.0509371664944
+    },
+    "p50_us": {
+      "median": 4290.434,
+      "min": 4262.113,
+      "max": 4320.389
+    },
+    "p99_us": {
+      "median": 4730.691,
+      "min": 4571.192,
+      "max": 4945.37
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.85375,
+      "min": 0.84875,
+      "max": 0.86
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2528384096.0,
+      "min": 2509419593.25,
+      "max": 2548029087.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.0025,
+      "min": 0.8575,
+      "max": 1.5225
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1853.4827199709857,
+      "min": 1828.7850637319596,
+      "max": 1875.5077597564148
+    },
+    "p50_us": {
+      "median": 4280.791,
+      "min": 4242.372,
+      "max": 4286.495
+    },
+    "p99_us": {
+      "median": 4846.164,
+      "min": 4645.475,
+      "max": 5231.771
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.85375,
+      "min": 0.8450000000000001,
+      "max": 0.85625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2520806771.0,
+      "min": 2498824348.625,
+      "max": 2530099676.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.9662499999999999,
+      "min": 0.87875,
+      "max": 1.5850000000000002
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1859.613096562769,
+      "min": 1823.4441311979976,
+      "max": 1864.7652326346517
+    },
+    "p50_us": {
+      "median": 4259.862,
+      "min": 4253.994,
+      "max": 4348.354
+    },
+    "p99_us": {
+      "median": 4916.172,
+      "min": 4779.987,
+      "max": 5046.591
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.85,
+      "min": 0.85,
+      "max": 0.8675
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2516141198.5,
+      "min": 2511497646.0,
+      "max": 2554370405.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.04125,
+      "min": 0.85625,
+      "max": 1.08875
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 441.4610736927991,
+      "min": 427.89903648438286,
+      "max": 443.5614164688541
+    },
+    "p50_us": {
+      "median": 17617.119,
+      "min": 17530.008,
+      "max": 17713.944
+    },
+    "p99_us": {
+      "median": 35910.689,
+      "min": 25565.784,
+      "max": 36697.978
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.715,
+      "min": 4.715,
+      "max": 4.81
+    },
+    "kernel_cycles_per_gib": {
+      "median": 11183157826.0,
+      "min": 11155458767.5,
+      "max": 11394111514.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.09,
+      "min": 4.3950000000000005,
+      "max": 5.4750000000000005
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 449.71844361238135,
+      "min": 448.38859723889004,
+      "max": 456.7621784929532
+    },
+    "p50_us": {
+      "median": 16846.195,
+      "min": 16640.633,
+      "max": 16962.619
+    },
+    "p99_us": {
+      "median": 35911.986,
+      "min": 24629.9,
+      "max": 36116.801
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.725,
+      "min": 4.640000000000001,
+      "max": 4.755
+    },
+    "kernel_cycles_per_gib": {
+      "median": 11273278082.5,
+      "min": 11054330817.0,
+      "max": 11296544169.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.5200000000000005,
+      "min": 4.275,
+      "max": 6.22
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 398.47806339142863,
+      "min": 392.23807564466887,
+      "max": 408.8855605568766
+    },
+    "p50_us": {
+      "median": 19359.563,
+      "min": 19047.117,
+      "max": 19487.428
+    },
+    "p99_us": {
+      "median": 36234.349,
+      "min": 31876.337,
+      "max": 37753.186
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.135,
+      "min": 4.995,
+      "max": 5.205
+    },
+    "kernel_cycles_per_gib": {
+      "median": 12159334234.5,
+      "min": 11775824985.5,
+      "max": 12420205255.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.385,
+      "min": 4.24,
+      "max": 5.675
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2804.12110794096,
+      "min": 2800.2468991911023,
+      "max": 2820.206607661321
+    },
+    "p50_us": {
+      "median": 22981.746,
+      "min": 22713.504,
+      "max": 22984.975
+    },
+    "p99_us": {
+      "median": 33305.107,
+      "min": 33004.382,
+      "max": 33808.893
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.9125,
+      "min": 0.90625,
+      "max": 0.9137500000000001
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2727381881.125,
+      "min": 2717835920.25,
+      "max": 2733677807.625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.9175,
+      "min": 0.9075,
+      "max": 1.28125
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2777.884798758635,
+      "min": 2772.959883155757,
+      "max": 2798.171624380983
+    },
+    "p50_us": {
+      "median": 23029.788,
+      "min": 22981.336,
+      "max": 23250.908
+    },
+    "p99_us": {
+      "median": 33264.179,
+      "min": 32870.538,
+      "max": 33862.589
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.9099999999999999,
+      "min": 0.90625,
+      "max": 0.91
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2716933853.875,
+      "min": 2708171097.875,
+      "max": 2721166861.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.9812500000000001,
+      "min": 0.975,
+      "max": 1.28875
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2780.1714145636774,
+      "min": 2726.653393698275,
+      "max": 2783.8924558855197
+    },
+    "p50_us": {
+      "median": 22976.496,
+      "min": 22902.171,
+      "max": 23639.656
+    },
+    "p99_us": {
+      "median": 33360.461,
+      "min": 33237.528,
+      "max": 34245.196
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.9137500000000001,
+      "min": 0.90875,
+      "max": 0.9225
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2721451769.375,
+      "min": 2714555231.5,
+      "max": 2753689014.625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.00375,
+      "min": 0.92625,
+      "max": 1.29
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 840.330148646197,
+      "min": 839.019083256352,
+      "max": 857.7111963491208
+    },
+    "p50_us": {
+      "median": 72005.292,
+      "min": 71140.827,
+      "max": 72012.237
+    },
+    "p99_us": {
+      "median": 114166.552,
+      "min": 102117.568,
+      "max": 114620.273
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.99,
+      "min": 4.795,
+      "max": 5.01
+    },
+    "kernel_cycles_per_gib": {
+      "median": 11870861009.0,
+      "min": 11283007948.5,
+      "max": 11884579244.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.31,
+      "min": 3.955,
+      "max": 5.1
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 897.709745495399,
+      "min": 882.0731920284468,
+      "max": 914.924429973902
+    },
+    "p50_us": {
+      "median": 66489.13,
+      "min": 66377.635,
+      "max": 69979.951
+    },
+    "p99_us": {
+      "median": 101425.917,
+      "min": 97585.119,
+      "max": 104400.235
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.845,
+      "min": 4.805000000000001,
+      "max": 5.03
+    },
+    "kernel_cycles_per_gib": {
+      "median": 11565844141.5,
+      "min": 11471052375.0,
+      "max": 12099219469.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.59,
+      "min": 3.445,
+      "max": 4.71
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 711.3346707545866,
+      "min": 698.6712715471559,
+      "max": 714.6514489792099
+    },
+    "p50_us": {
+      "median": 87545.096,
+      "min": 86823.148,
+      "max": 88140.767
+    },
+    "p99_us": {
+      "median": 132665.337,
+      "min": 119752.971,
+      "max": 140144.612
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.2700000000000005,
+      "min": 5.25,
+      "max": 5.3950000000000005
+    },
+    "kernel_cycles_per_gib": {
+      "median": 12470959360.5,
+      "min": 12429686571.0,
+      "max": 12856364161.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.97,
+      "min": 4.2,
+      "max": 5.125
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 511.07799389761766,
+      "min": 509.4751771157709,
+      "max": 512.1438246460776
+    },
+    "p50_us": {
+      "median": 29.526,
+      "min": 29.524,
+      "max": 29.596
+    },
+    "p99_us": {
+      "median": 33.851,
+      "min": 33.792,
+      "max": 34.206
+    },
+    "process_cpu_s_per_gib": {
+      "median": 7.9624999999999995,
+      "min": 7.96,
+      "max": 7.975
+    },
+    "kernel_cycles_per_gib": {
+      "median": 14550612556.75,
+      "min": 14501952649.0,
+      "max": 14587087579.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 7.635,
+      "min": 7.625,
+      "max": 7.69
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 606.4033431054205,
+      "min": 600.6250455566252,
+      "max": 611.9000226442596
+    },
+    "p50_us": {
+      "median": 24.681,
+      "min": 24.571,
+      "max": 24.719
+    },
+    "p99_us": {
+      "median": 28.996,
+      "min": 28.849,
+      "max": 29.908
+    },
+    "process_cpu_s_per_gib": {
+      "median": 7.0975,
+      "min": 7.0725,
+      "max": 7.115
+    },
+    "kernel_cycles_per_gib": {
+      "median": 13301736616.25,
+      "min": 13241397554.0,
+      "max": 13357091165.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 7.2725,
+      "min": 7.005,
+      "max": 7.965
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 609.2269950384147,
+      "min": 604.6698750107746,
+      "max": 611.756239405127
+    },
+    "p50_us": {
+      "median": 24.66,
+      "min": 24.572,
+      "max": 24.742
+    },
+    "p99_us": {
+      "median": 28.886,
+      "min": 28.745,
+      "max": 29.844
+    },
+    "process_cpu_s_per_gib": {
+      "median": 7.0725,
+      "min": 7.06,
+      "max": 7.1175
+    },
+    "kernel_cycles_per_gib": {
+      "median": 13197906186.75,
+      "min": 13197278717.75,
+      "max": 13286643125.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 7.0325,
+      "min": 6.9425,
+      "max": 7.305
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 34.90766643512011,
+      "min": 17.41744810782401,
+      "max": 43.15869864054107
+    },
+    "p50_us": {
+      "median": 259.294,
+      "min": 240.934,
+      "max": 272.164
+    },
+    "p99_us": {
+      "median": 6105.898,
+      "min": 2692.787,
+      "max": 12369.828
+    },
+    "process_cpu_s_per_gib": {
+      "median": 82.24,
+      "min": 76.19999999999999,
+      "max": 90.36
+    },
+    "kernel_cycles_per_gib": {
+      "median": 180887301192.0,
+      "min": 169121411184.0,
+      "max": 203880191264.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 60.64,
+      "min": 55.8,
+      "max": 69.12
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 38.89183153871666,
+      "min": 33.241190113418845,
+      "max": 44.66436482907271
+    },
+    "p50_us": {
+      "median": 243.459,
+      "min": 234.455,
+      "max": 246.928
+    },
+    "p99_us": {
+      "median": 4281.963,
+      "min": 2565.187,
+      "max": 6723.434
+    },
+    "process_cpu_s_per_gib": {
+      "median": 78.44,
+      "min": 77.88,
+      "max": 79.16
+    },
+    "kernel_cycles_per_gib": {
+      "median": 174463079040.0,
+      "min": 174362802704.0,
+      "max": 177775387408.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 62.04,
+      "min": 60.120000000000005,
+      "max": 69.84
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 40.16786528102299,
+      "min": 33.523408887944434,
+      "max": 44.83922344700444
+    },
+    "p50_us": {
+      "median": 246.791,
+      "min": 242.705,
+      "max": 250.029
+    },
+    "p99_us": {
+      "median": 3184.211,
+      "min": 2327.608,
+      "max": 6379.706
+    },
+    "process_cpu_s_per_gib": {
+      "median": 80.64,
+      "min": 80.4,
+      "max": 83.04
+    },
+    "kernel_cycles_per_gib": {
+      "median": 178665810180.0,
+      "min": 169649839820.0,
+      "max": 181950331944.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 59.64,
+      "min": 58.92,
+      "max": 68.24
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1753.997167165252,
+      "min": 1752.1837821319593,
+      "max": 1759.9163122670284
+    },
+    "p50_us": {
+      "median": 69.769,
+      "min": 69.589,
+      "max": 69.77
+    },
+    "p99_us": {
+      "median": 82.58,
+      "min": 82.049,
+      "max": 83.124
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.6225,
+      "min": 4.61,
+      "max": 4.635
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8727706683.0,
+      "min": 8697394385.25,
+      "max": 8745073853.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.6475,
+      "min": 4.5975,
+      "max": 4.665
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1731.3819052998094,
+      "min": 1723.5218036208637,
+      "max": 1741.6030333915023
+    },
+    "p50_us": {
+      "median": 70.973,
+      "min": 70.948,
+      "max": 70.986
+    },
+    "p99_us": {
+      "median": 81.721,
+      "min": 81.563,
+      "max": 82.155
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.6775,
+      "min": 4.675000000000001,
+      "max": 4.6899999999999995
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8934109621.0,
+      "min": 8884307992.75,
+      "max": 8980457320.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.6975,
+      "min": 4.695,
+      "max": 4.795
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1736.944966111133,
+      "min": 1731.6292992830731,
+      "max": 1742.1762688599508
+    },
+    "p50_us": {
+      "median": 70.734,
+      "min": 70.728,
+      "max": 71.045
+    },
+    "p99_us": {
+      "median": 82.733,
+      "min": 81.873,
+      "max": 84.407
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.6625,
+      "min": 4.6625,
+      "max": 4.67
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8799027900.25,
+      "min": 8789378710.25,
+      "max": 8865242274.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.6925,
+      "min": 4.6875,
+      "max": 5.5625
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 90.47294618466621,
+      "min": 82.92500083048903,
+      "max": 107.28358604260713
+    },
+    "p50_us": {
+      "median": 704.835,
+      "min": 652.775,
+      "max": 713.526
+    },
+    "p99_us": {
+      "median": 10743.921,
+      "min": 8459.963,
+      "max": 13906.071
+    },
+    "process_cpu_s_per_gib": {
+      "median": 37.08,
+      "min": 34.96,
+      "max": 38.12
+    },
+    "kernel_cycles_per_gib": {
+      "median": 82174440396.0,
+      "min": 78155007176.0,
+      "max": 86039999152.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 27.6,
+      "min": 23.240000000000002,
+      "max": 29.28
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 105.83315853257767,
+      "min": 91.35205771821411,
+      "max": 141.09602323812703
+    },
+    "p50_us": {
+      "median": 730.97,
+      "min": 668.835,
+      "max": 747.656
+    },
+    "p99_us": {
+      "median": 10357.223,
+      "min": 4129.141,
+      "max": 10485.932
+    },
+    "process_cpu_s_per_gib": {
+      "median": 39.0,
+      "min": 36.68,
+      "max": 40.96
+    },
+    "kernel_cycles_per_gib": {
+      "median": 90724024380.0,
+      "min": 81120635260.0,
+      "max": 91251835756.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 29.92,
+      "min": 24.080000000000002,
+      "max": 32.68
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 128.47027804286316,
+      "min": 118.46867419501616,
+      "max": 131.6165263355582
+    },
+    "p50_us": {
+      "median": 644.932,
+      "min": 621.894,
+      "max": 681.967
+    },
+    "p99_us": {
+      "median": 7939.281,
+      "min": 4127.97,
+      "max": 9680.513
+    },
+    "process_cpu_s_per_gib": {
+      "median": 34.76,
+      "min": 30.919999999999998,
+      "max": 34.800000000000004
+    },
+    "kernel_cycles_per_gib": {
+      "median": 73998363688.0,
+      "min": 67501568108.0,
+      "max": 77193548008.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 23.4,
+      "min": 23.240000000000002,
+      "max": 27.2
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2622.735069229438,
+      "min": 2618.64161608034,
+      "max": 2680.2793653939257
+    },
+    "p50_us": {
+      "median": 93.036,
+      "min": 92.301,
+      "max": 93.177
+    },
+    "p99_us": {
+      "median": 103.136,
+      "min": 102.732,
+      "max": 105.578
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.664375,
+      "min": 1.645,
+      "max": 1.676875
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3727540260.1875,
+      "min": 3680575331.1875,
+      "max": 3752101507.8125
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.619375,
+      "min": 1.615625,
+      "max": 1.67625
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2781.0923418946722,
+      "min": 2735.194277973971,
+      "max": 2786.9168739158117
+    },
+    "p50_us": {
+      "median": 88.45,
+      "min": 87.966,
+      "max": 89.384
+    },
+    "p99_us": {
+      "median": 100.038,
+      "min": 99.758,
+      "max": 100.871
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.61625,
+      "min": 1.598125,
+      "max": 1.626875
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3646871521.3125,
+      "min": 3609009833.125,
+      "max": 3687022248.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.61875,
+      "min": 1.586875,
+      "max": 1.748125
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2786.012750885218,
+      "min": 2719.1458762631482,
+      "max": 2792.7214406997823
+    },
+    "p50_us": {
+      "median": 88.201,
+      "min": 88.189,
+      "max": 88.271
+    },
+    "p99_us": {
+      "median": 99.251,
+      "min": 98.355,
+      "max": 101.828
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.604375,
+      "min": 1.60375,
+      "max": 1.60625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3626521539.625,
+      "min": 3615668455.0,
+      "max": 3627812092.625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.605625,
+      "min": 1.56625,
+      "max": 1.645625
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 160.91617015527956,
+      "min": 151.39219547766194,
+      "max": 164.1086970207782
+    },
+    "p50_us": {
+      "median": 587.423,
+      "min": 579.954,
+      "max": 601.87
+    },
+    "p99_us": {
+      "median": 12310.62,
+      "min": 10277.617,
+      "max": 12433.452
+    },
+    "process_cpu_s_per_gib": {
+      "median": 23.55,
+      "min": 23.48,
+      "max": 24.585
+    },
+    "kernel_cycles_per_gib": {
+      "median": 55705402041.5,
+      "min": 55427017225.5,
+      "max": 59394469134.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 14.790000000000001,
+      "min": 14.584999999999999,
+      "max": 14.92
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 160.97511423732016,
+      "min": 143.76301096796982,
+      "max": 169.98692877211064
+    },
+    "p50_us": {
+      "median": 579.285,
+      "min": 569.341,
+      "max": 583.776
+    },
+    "p99_us": {
+      "median": 11101.484,
+      "min": 10144.728,
+      "max": 14725.726
+    },
+    "process_cpu_s_per_gib": {
+      "median": 24.27,
+      "min": 23.65,
+      "max": 25.845
+    },
+    "kernel_cycles_per_gib": {
+      "median": 58057622347.0,
+      "min": 56225230474.0,
+      "max": 63122177269.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 15.705,
+      "min": 14.19,
+      "max": 17.755
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 155.96172188204838,
+      "min": 155.57590213362903,
+      "max": 182.4181373060947
+    },
+    "p50_us": {
+      "median": 599.099,
+      "min": 580.974,
+      "max": 603.421
+    },
+    "p99_us": {
+      "median": 11106.843,
+      "min": 9837.182,
+      "max": 13649.238
+    },
+    "process_cpu_s_per_gib": {
+      "median": 25.154999999999998,
+      "min": 23.36,
+      "max": 25.195
+    },
+    "kernel_cycles_per_gib": {
+      "median": 60520929588.0,
+      "min": 54927277481.0,
+      "max": 60623257418.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 18.385,
+      "min": 16.265,
+      "max": 19.82
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 6800.187930564758,
+      "min": 6761.490683053972,
+      "max": 6810.629320248238
+    },
+    "p50_us": {
+      "median": 291.206,
+      "min": 289.403,
+      "max": 291.644
+    },
+    "p99_us": {
+      "median": 414.131,
+      "min": 411.726,
+      "max": 420.538
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.333125,
+      "min": 1.33125,
+      "max": 1.33625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3120763508.3125,
+      "min": 3119618519.0625,
+      "max": 3126168153.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.34,
+      "min": 1.328125,
+      "max": 1.376875
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 6641.9463671198155,
+      "min": 6603.862919941392,
+      "max": 6704.112734402193
+    },
+    "p50_us": {
+      "median": 290.622,
+      "min": 290.417,
+      "max": 293.881
+    },
+    "p99_us": {
+      "median": 431.487,
+      "min": 426.855,
+      "max": 435.026
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.32125,
+      "min": 1.32125,
+      "max": 1.32625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3093637932.5625,
+      "min": 3088201189.5,
+      "max": 3106192450.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.31375,
+      "min": 1.2962500000000001,
+      "max": 1.3275000000000001
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 6628.985716503761,
+      "min": 6581.840495025848,
+      "max": 6635.944565477078
+    },
+    "p50_us": {
+      "median": 293.447,
+      "min": 291.713,
+      "max": 294.738
+    },
+    "p99_us": {
+      "median": 435.406,
+      "min": 431.995,
+      "max": 436.047
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.3243749999999999,
+      "min": 1.316875,
+      "max": 1.335
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3101841503.4375,
+      "min": 3089049464.9375,
+      "max": 3138211754.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.338125,
+      "min": 1.3018750000000001,
+      "max": 1.350625
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 346.76746683549175,
+      "min": 327.87270878460697,
+      "max": 496.8224336074992
+    },
+    "p50_us": {
+      "median": 2444.398,
+      "min": 2397.62,
+      "max": 2459.338
+    },
+    "p99_us": {
+      "median": 21355.798,
+      "min": 17439.489,
+      "max": 23491.819
+    },
+    "process_cpu_s_per_gib": {
+      "median": 18.265,
+      "min": 15.565000000000001,
+      "max": 18.435
+    },
+    "kernel_cycles_per_gib": {
+      "median": 42686300041.5,
+      "min": 34270075292.0,
+      "max": 43044842580.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 11.790000000000001,
+      "min": 10.63,
+      "max": 12.73
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 354.8996827040182,
+      "min": 323.03509282061884,
+      "max": 432.2364595612228
+    },
+    "p50_us": {
+      "median": 2433.453,
+      "min": 2158.929,
+      "max": 2527.288
+    },
+    "p99_us": {
+      "median": 23152.474,
+      "min": 20439.373,
+      "max": 23622.272
+    },
+    "process_cpu_s_per_gib": {
+      "median": 18.045,
+      "min": 16.405,
+      "max": 19.450000000000003
+    },
+    "kernel_cycles_per_gib": {
+      "median": 42315573198.5,
+      "min": 37371492619.5,
+      "max": 46910847917.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 10.075000000000001,
+      "min": 9.805,
+      "max": 12.965
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 388.8263619941663,
+      "min": 347.2671353182822,
+      "max": 390.31785569837007
+    },
+    "p50_us": {
+      "median": 2416.874,
+      "min": 2292.247,
+      "max": 2552.208
+    },
+    "p99_us": {
+      "median": 21848.036,
+      "min": 20828.501,
+      "max": 25296.234
+    },
+    "process_cpu_s_per_gib": {
+      "median": 17.525000000000002,
+      "min": 17.215,
+      "max": 18.575
+    },
+    "kernel_cycles_per_gib": {
+      "median": 40377697157.5,
+      "min": 39314225144.0,
+      "max": 43453204909.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 10.530000000000001,
+      "min": 10.1,
+      "max": 10.535
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 6462.8757759172195,
+      "min": 5745.477730936152,
+      "max": 6501.388381032129
+    },
+    "p50_us": {
+      "median": 566.227,
+      "min": 564.035,
+      "max": 568.289
+    },
+    "p99_us": {
+      "median": 1017.002,
+      "min": 993.647,
+      "max": 1349.58
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.8621874999999999,
+      "min": 0.8590625,
+      "max": 0.8687499999999999
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2467412730.875,
+      "min": 2462943895.21875,
+      "max": 2485299606.375
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.848125,
+      "min": 0.8478125,
+      "max": 0.905625
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 6459.622445117874,
+      "min": 5831.618314089112,
+      "max": 6468.258489591982
+    },
+    "p50_us": {
+      "median": 563.399,
+      "min": 563.298,
+      "max": 566.088
+    },
+    "p99_us": {
+      "median": 1002.535,
+      "min": 1002.49,
+      "max": 1336.312
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.8646874999999999,
+      "min": 0.8637499999999999,
+      "max": 0.865625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2471500666.625,
+      "min": 2469932337.0625,
+      "max": 2479004710.0625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.8740625,
+      "min": 0.869375,
+      "max": 1.0262499999999999
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 5778.551993547375,
+      "min": 5669.865447882855,
+      "max": 5878.788652225144
+    },
+    "p50_us": {
+      "median": 565.8,
+      "min": 563.878,
+      "max": 567.365
+    },
+    "p99_us": {
+      "median": 1357.877,
+      "min": 1333.158,
+      "max": 1373.093
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.8646875,
+      "min": 0.8640625,
+      "max": 0.8715625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2475889318.375,
+      "min": 2473007738.65625,
+      "max": 2497871912.84375
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.87625,
+      "min": 0.8678125,
+      "max": 0.9046875
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 944.1790484791849,
+      "min": 931.5498087503908,
+      "max": 1019.6601827450663
+    },
+    "p50_us": {
+      "median": 2968.057,
+      "min": 2955.989,
+      "max": 3057.889
+    },
+    "p99_us": {
+      "median": 22704.626,
+      "min": 22338.679,
+      "max": 22827.048
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.2,
+      "min": 5.985,
+      "max": 6.4262500000000005
+    },
+    "kernel_cycles_per_gib": {
+      "median": 14627031453.75,
+      "min": 14101645923.875,
+      "max": 15386519338.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.49375,
+      "min": 3.33875,
+      "max": 3.57
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 948.9540794712724,
+      "min": 920.2738099429095,
+      "max": 952.328772478863
+    },
+    "p50_us": {
+      "median": 2924.548,
+      "min": 2900.449,
+      "max": 2938.193
+    },
+    "p99_us": {
+      "median": 23500.338,
+      "min": 22982.426,
+      "max": 23957.703
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.376250000000001,
+      "min": 6.1987499999999995,
+      "max": 6.38875
+    },
+    "kernel_cycles_per_gib": {
+      "median": 15315805027.625,
+      "min": 14694716970.0,
+      "max": 15413293465.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.72375,
+      "min": 3.6575,
+      "max": 3.9050000000000002
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 872.5768111099374,
+      "min": 863.6162921575324,
+      "max": 925.8146917293162
+    },
+    "p50_us": {
+      "median": 3274.145,
+      "min": 3107.454,
+      "max": 3300.204
+    },
+    "p99_us": {
+      "median": 24190.31,
+      "min": 23955.399,
+      "max": 24534.518
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.64125,
+      "min": 6.5375,
+      "max": 6.7
+    },
+    "kernel_cycles_per_gib": {
+      "median": 15772321422.75,
+      "min": 15518674495.625,
+      "max": 15887626177.625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.845,
+      "min": 3.7025,
+      "max": 3.9362500000000002
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 10897.6673596228,
+      "min": 10173.015029101953,
+      "max": 11156.875960915011
+    },
+    "p50_us": {
+      "median": 2819.014,
+      "min": 2814.437,
+      "max": 2954.103
+    },
+    "p99_us": {
+      "median": 4558.887,
+      "min": 4375.174,
+      "max": 5075.041
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.8415625,
+      "min": 0.8165625,
+      "max": 0.8424999999999999
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2453138850.9375,
+      "min": 2376686520.71875,
+      "max": 2454500735.59375
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.8409375,
+      "min": 0.8184375,
+      "max": 0.84375
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 11231.251193354714,
+      "min": 9349.867343364229,
+      "max": 11275.11803167787
+    },
+    "p50_us": {
+      "median": 2771.1,
+      "min": 2761.3,
+      "max": 3119.39
+    },
+    "p99_us": {
+      "median": 4341.905,
+      "min": 4258.745,
+      "max": 5796.252
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.8259375,
+      "min": 0.820625,
+      "max": 0.843125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2404806114.375,
+      "min": 2386058461.6875,
+      "max": 2458647057.28125
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.850625,
+      "min": 0.8225,
+      "max": 0.896875
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 9699.860601032266,
+      "min": 9680.961385620405,
+      "max": 9918.451456485927
+    },
+    "p50_us": {
+      "median": 3050.987,
+      "min": 2997.77,
+      "max": 3081.08
+    },
+    "p99_us": {
+      "median": 5390.873,
+      "min": 5358.427,
+      "max": 5503.205
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.8309375,
+      "min": 0.8215625,
+      "max": 0.843125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2416822877.5625,
+      "min": 2388811514.65625,
+      "max": 2455687322.96875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.82875,
+      "min": 0.825625,
+      "max": 0.8540625000000001
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1455.0527181656525,
+      "min": 1332.4122365806938,
+      "max": 1477.8169124574208
+    },
+    "p50_us": {
+      "median": 14727.533,
+      "min": 14459.015,
+      "max": 16023.613
+    },
+    "p99_us": {
+      "median": 54387.918,
+      "min": 54232.162,
+      "max": 58121.247
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.3875,
+      "min": 6.3475,
+      "max": 6.4325
+    },
+    "kernel_cycles_per_gib": {
+      "median": 15216096559.0,
+      "min": 15147161202.125,
+      "max": 15326058928.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.63625,
+      "min": 3.3525,
+      "max": 3.685
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1452.6134441033266,
+      "min": 1321.393350554548,
+      "max": 1468.929097946372
+    },
+    "p50_us": {
+      "median": 14765.247,
+      "min": 14518.115,
+      "max": 15930.737
+    },
+    "p99_us": {
+      "median": 56156.848,
+      "min": 52872.49,
+      "max": 59975.694
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.38375,
+      "min": 6.31125,
+      "max": 6.4875
+    },
+    "kernel_cycles_per_gib": {
+      "median": 15258089884.375,
+      "min": 15063700968.5,
+      "max": 15555190447.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.72125,
+      "min": 3.5225,
+      "max": 4.14375
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1330.2280469453644,
+      "min": 1314.6756142885558,
+      "max": 1368.3140661865384
+    },
+    "p50_us": {
+      "median": 15837.613,
+      "min": 15594.386,
+      "max": 15924.752
+    },
+    "p99_us": {
+      "median": 58760.262,
+      "min": 56240.161,
+      "max": 60935.075
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.86,
+      "min": 6.6575,
+      "max": 6.8625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 16388145718.875,
+      "min": 15859268531.75,
+      "max": 16417614207.625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.14625,
+      "min": 4.03875,
+      "max": 4.2175
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 5708.159648746055,
+      "min": 5528.197305413502,
+      "max": 5733.884533384705
+    },
+    "p50_us": {
+      "median": 4947.016,
+      "min": 4843.298,
+      "max": 4953.133
+    },
+    "p99_us": {
+      "median": 9548.568,
+      "min": 9289.504,
+      "max": 11803.619
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.9621875,
+      "min": 0.9321875000000001,
+      "max": 0.9625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2841293302.59375,
+      "min": 2746958665.40625,
+      "max": 2841533373.78125
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.9621875,
+      "min": 0.9353125,
+      "max": 1.0228125
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 5829.011059875894,
+      "min": 5260.945609106937,
+      "max": 6033.951261256606
+    },
+    "p50_us": {
+      "median": 4958.522,
+      "min": 4853.702,
+      "max": 5000.037
+    },
+    "p99_us": {
+      "median": 9834.801,
+      "min": 8976.968,
+      "max": 12561.417
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.9600000000000001,
+      "min": 0.9453125,
+      "max": 0.9671875
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2828242015.15625,
+      "min": 2777773568.0,
+      "max": 2848997181.875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.9734375,
+      "min": 0.9671875,
+      "max": 1.1171875
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 5295.528674790348,
+      "min": 5282.330476640317,
+      "max": 5558.03480466125
+    },
+    "p50_us": {
+      "median": 4981.455,
+      "min": 4828.709,
+      "max": 4986.594
+    },
+    "p99_us": {
+      "median": 12228.91,
+      "min": 11731.981,
+      "max": 12270.729
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.9553125,
+      "min": 0.9359375,
+      "max": 0.95875
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2813624309.3125,
+      "min": 2752659009.78125,
+      "max": 2825383785.375
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.984375,
+      "min": 0.9609375,
+      "max": 0.9959375
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1250.4112904118087,
+      "min": 1226.4590969523072,
+      "max": 1258.9439929408848
+    },
+    "p50_us": {
+      "median": 23203.677,
+      "min": 22989.544,
+      "max": 23960.125
+    },
+    "p99_us": {
+      "median": 48690.868,
+      "min": 48549.027,
+      "max": 51206.347
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.58375,
+      "min": 5.58,
+      "max": 5.6625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 13186395247.5,
+      "min": 13167972758.25,
+      "max": 13375041969.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.8375,
+      "min": 3.4525,
+      "max": 4.0325
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1280.5371447151704,
+      "min": 1256.7845223471004,
+      "max": 1329.519428328835
+    },
+    "p50_us": {
+      "median": 23461.655,
+      "min": 21412.666,
+      "max": 23462.896
+    },
+    "p99_us": {
+      "median": 48480.237,
+      "min": 47561.39,
+      "max": 49271.205
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.5737499999999995,
+      "min": 5.46375,
+      "max": 5.59875
+    },
+    "kernel_cycles_per_gib": {
+      "median": 13212733857.375,
+      "min": 12902237920.75,
+      "max": 13284016444.375
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.42625,
+      "min": 3.34375,
+      "max": 3.55875
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1191.137813518009,
+      "min": 1151.2025084015759,
+      "max": 1195.135147817753
+    },
+    "p50_us": {
+      "median": 24181.742,
+      "min": 23962.596,
+      "max": 24686.335
+    },
+    "p99_us": {
+      "median": 53353.713,
+      "min": 48538.873,
+      "max": 53905.471
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.9325,
+      "min": 5.7775,
+      "max": 5.995
+    },
+    "kernel_cycles_per_gib": {
+      "median": 14048980543.125,
+      "min": 13617000737.125,
+      "max": 14223574872.125
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.85625,
+      "min": 3.83625,
+      "max": 3.93
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 8441.2360539049,
+      "min": 7206.1641633812615,
+      "max": 8523.292963030717
+    },
+    "p50_us": {
+      "median": 30137.206,
+      "min": 29831.398,
+      "max": 31652.804
+    },
+    "p99_us": {
+      "median": 46869.412,
+      "min": 45284.569,
+      "max": 64197.951
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.0928125,
+      "min": 1.0565625,
+      "max": 1.09375
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3251935392.625,
+      "min": 3135149247.0625,
+      "max": 3255837304.90625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.0846875,
+      "min": 1.055,
+      "max": 1.234375
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 8290.945610338415,
+      "min": 6828.979402976176,
+      "max": 8381.450210408368
+    },
+    "p50_us": {
+      "median": 30373.828,
+      "min": 29884.505,
+      "max": 31782.707
+    },
+    "p99_us": {
+      "median": 46712.824,
+      "min": 46145.048,
+      "max": 69728.303
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.0884375,
+      "min": 1.05875,
+      "max": 1.0953125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3231249383.375,
+      "min": 3136332738.03125,
+      "max": 3254039323.21875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.0821875,
+      "min": 1.0725,
+      "max": 1.1153125
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 7452.665237014186,
+      "min": 6920.037831758974,
+      "max": 7474.880634883952
+    },
+    "p50_us": {
+      "median": 31718.531,
+      "min": 31403.007,
+      "max": 31727.706
+    },
+    "p99_us": {
+      "median": 59024.753,
+      "min": 54430.587,
+      "max": 68479.924
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.068125,
+      "min": 1.0474999999999999,
+      "max": 1.0803125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3165391694.5625,
+      "min": 3101531960.25,
+      "max": 3205649697.15625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.0853125000000001,
+      "min": 1.0421875,
+      "max": 1.1740625
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1994.0347321553836,
+      "min": 1976.6407392142205,
+      "max": 2017.8089716309707
+    },
+    "p50_us": {
+      "median": 125006.433,
+      "min": 122251.104,
+      "max": 126060.477
+    },
+    "p99_us": {
+      "median": 166003.133,
+      "min": 163599.056,
+      "max": 174820.44
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.06125,
+      "min": 6.00375,
+      "max": 6.2225
+    },
+    "kernel_cycles_per_gib": {
+      "median": 14505044587.0,
+      "min": 14346712731.875,
+      "max": 14942608887.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.935,
+      "min": 3.46625,
+      "max": 4.125
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1991.4365268445185,
+      "min": 1989.556201163898,
+      "max": 2014.3347050737932
+    },
+    "p50_us": {
+      "median": 126648.176,
+      "min": 122337.994,
+      "max": 126922.497
+    },
+    "p99_us": {
+      "median": 179529.195,
+      "min": 171331.639,
+      "max": 184469.845
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.03625,
+      "min": 5.96875,
+      "max": 6.1075
+    },
+    "kernel_cycles_per_gib": {
+      "median": 14486065102.25,
+      "min": 14289657899.25,
+      "max": 14665089953.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.50625,
+      "min": 3.375,
+      "max": 3.54875
+    }
+  },
+  {
+    "transport": "tcp",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "zc",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1926.7662056166016,
+      "min": 1891.894228484627,
+      "max": 1998.604768448623
+    },
+    "p50_us": {
+      "median": 125449.016,
+      "min": 120839.721,
+      "max": 126657.985
+    },
+    "p99_us": {
+      "median": 189802.68,
+      "min": 172307.614,
+      "max": 207204.635
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.59375,
+      "min": 6.37,
+      "max": 6.62125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 15800579015.875,
+      "min": 15258288565.25,
+      "max": 16010580104.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.335,
+      "min": 4.0875,
+      "max": 4.67375
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 115.27849335235766,
+      "min": 113.84462639369092,
+      "max": 116.22156390141626
+    },
+    "p50_us": {
+      "median": 32.915,
+      "min": 32.899,
+      "max": 33.551
+    },
+    "p99_us": {
+      "median": 39.258,
+      "min": 38.523,
+      "max": 40.202
+    },
+    "process_cpu_s_per_gib": {
+      "median": 10.739999999999998,
+      "min": 10.67,
+      "max": 10.959999999999999
+    },
+    "kernel_cycles_per_gib": {
+      "median": 13805734137.0,
+      "min": 13620242560.0,
+      "max": 14621986855.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 13.57,
+      "min": 12.9,
+      "max": 14.91
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 130.62954591489515,
+      "min": 126.39436474970825,
+      "max": 130.82101294164553
+    },
+    "p50_us": {
+      "median": 29.471,
+      "min": 29.462,
+      "max": 30.398
+    },
+    "p99_us": {
+      "median": 33.115,
+      "min": 32.494,
+      "max": 35.297
+    },
+    "process_cpu_s_per_gib": {
+      "median": 9.370000000000001,
+      "min": 9.34,
+      "max": 9.69
+    },
+    "kernel_cycles_per_gib": {
+      "median": 12117137769.0,
+      "min": 11921080256.0,
+      "max": 13229420945.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 10.79,
+      "min": 10.2,
+      "max": 17.3
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 11.135640944575968,
+      "min": 10.73036079893747,
+      "max": 12.21224468177753
+    },
+    "p50_us": {
+      "median": 219.993,
+      "min": 217.955,
+      "max": 222.418
+    },
+    "p99_us": {
+      "median": 2949.388,
+      "min": 2451.983,
+      "max": 6237.092
+    },
+    "process_cpu_s_per_gib": {
+      "median": 79.03999999999999,
+      "min": 77.92,
+      "max": 80.64
+    },
+    "kernel_cycles_per_gib": {
+      "median": 159925093360.0,
+      "min": 158194475056.0,
+      "max": 174487412000.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 99.36,
+      "min": 82.08,
+      "max": 137.44
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 12.735277184369522,
+      "min": 11.975617351167351,
+      "max": 13.975120004328183
+    },
+    "p50_us": {
+      "median": 193.652,
+      "min": 193.07,
+      "max": 197.389
+    },
+    "p99_us": {
+      "median": 2911.75,
+      "min": 2292.965,
+      "max": 3859.915
+    },
+    "process_cpu_s_per_gib": {
+      "median": 74.56,
+      "min": 73.28,
+      "max": 76.8
+    },
+    "kernel_cycles_per_gib": {
+      "median": 145047735120.0,
+      "min": 143832052800.0,
+      "max": 164402244528.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 94.4,
+      "min": 82.56,
+      "max": 169.28
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 396.0227665598979,
+      "min": 394.4816312852817,
+      "max": 398.2725003418016
+    },
+    "p50_us": {
+      "median": 80.466,
+      "min": 80.112,
+      "max": 81.051
+    },
+    "p99_us": {
+      "median": 97.307,
+      "min": 96.501,
+      "max": 98.611
+    },
+    "process_cpu_s_per_gib": {
+      "median": 3.92,
+      "min": 3.88,
+      "max": 3.94
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3758731847.0,
+      "min": 3612388894.0,
+      "max": 3786224401.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.59,
+      "min": 3.9299999999999997,
+      "max": 5.720000000000001
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 384.54488640462375,
+      "min": 379.6343707786287,
+      "max": 386.3336141020419
+    },
+    "p50_us": {
+      "median": 83.272,
+      "min": 82.456,
+      "max": 83.776
+    },
+    "p99_us": {
+      "median": 101.618,
+      "min": 100.745,
+      "max": 102.987
+    },
+    "process_cpu_s_per_gib": {
+      "median": 3.84,
+      "min": 3.83,
+      "max": 3.86
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3795675866.0,
+      "min": 3661582696.0,
+      "max": 3944370242.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.44,
+      "min": 4.21,
+      "max": 6.640000000000001
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 28.191255533372477,
+      "min": 25.138236379484105,
+      "max": 32.810283953690565
+    },
+    "p50_us": {
+      "median": 653.649,
+      "min": 643.024,
+      "max": 733.528
+    },
+    "p99_us": {
+      "median": 7915.853,
+      "min": 5172.211,
+      "max": 13467.059
+    },
+    "process_cpu_s_per_gib": {
+      "median": 42.72,
+      "min": 41.440000000000005,
+      "max": 45.6
+    },
+    "kernel_cycles_per_gib": {
+      "median": 96462859232.0,
+      "min": 92757733104.0,
+      "max": 105165933360.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 46.72,
+      "min": 41.6,
+      "max": 70.72
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 30.43897018177887,
+      "min": 22.634017192589386,
+      "max": 32.14314012087454
+    },
+    "p50_us": {
+      "median": 614.04,
+      "min": 597.137,
+      "max": 653.206
+    },
+    "p99_us": {
+      "median": 10087.25,
+      "min": 7784.783,
+      "max": 16867.758
+    },
+    "process_cpu_s_per_gib": {
+      "median": 44.0,
+      "min": 41.44,
+      "max": 51.84
+    },
+    "kernel_cycles_per_gib": {
+      "median": 97543226064.0,
+      "min": 93938294016.0,
+      "max": 125849561056.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 60.32,
+      "min": 40.96,
+      "max": 80.96
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 839.724812158121,
+      "min": 815.789985623245,
+      "max": 848.8622142365897
+    },
+    "p50_us": {
+      "median": 72.586,
+      "min": 71.725,
+      "max": 72.621
+    },
+    "p99_us": {
+      "median": 94.767,
+      "min": 93.104,
+      "max": 194.256
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.5000000000000002,
+      "min": 1.4874999999999998,
+      "max": 1.5274999999999999
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2304683741.25,
+      "min": 2141053934.0,
+      "max": 2475266723.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.975,
+      "min": 1.6975,
+      "max": 2.4650000000000003
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 874.1073291472279,
+      "min": 872.3213168140068,
+      "max": 884.5787033303951
+    },
+    "p50_us": {
+      "median": 70.203,
+      "min": 69.646,
+      "max": 70.261
+    },
+    "p99_us": {
+      "median": 90.978,
+      "min": 90.399,
+      "max": 92.669
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.44,
+      "min": 1.415,
+      "max": 1.4425000000000001
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2235299089.25,
+      "min": 2150907186.25,
+      "max": 2373442316.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.995,
+      "min": 1.915,
+      "max": 2.6825
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 59.71452984294545,
+      "min": 56.549501482474284,
+      "max": 62.74249188064823
+    },
+    "p50_us": {
+      "median": 499.152,
+      "min": 480.544,
+      "max": 515.959
+    },
+    "p99_us": {
+      "median": 10268.196,
+      "min": 10148.652,
+      "max": 11092.201
+    },
+    "process_cpu_s_per_gib": {
+      "median": 20.3,
+      "min": 18.48,
+      "max": 21.32
+    },
+    "kernel_cycles_per_gib": {
+      "median": 43848312330.0,
+      "min": 37445885582.0,
+      "max": 46419156604.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 15.68,
+      "min": 14.84,
+      "max": 27.3
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 61.329283238503926,
+      "min": 53.429870930601396,
+      "max": 61.92352239378922
+    },
+    "p50_us": {
+      "median": 480.048,
+      "min": 471.209,
+      "max": 504.24
+    },
+    "p99_us": {
+      "median": 10686.796,
+      "min": 9603.507,
+      "max": 14586.028
+    },
+    "process_cpu_s_per_gib": {
+      "median": 20.48,
+      "min": 19.18,
+      "max": 21.74
+    },
+    "kernel_cycles_per_gib": {
+      "median": 43897563690.0,
+      "min": 39873053796.0,
+      "max": 47492342120.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 26.58,
+      "min": 16.740000000000002,
+      "max": 31.92
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2796.6905646242403,
+      "min": 2670.578420749669,
+      "max": 2903.9729784633737
+    },
+    "p50_us": {
+      "median": 171.649,
+      "min": 167.673,
+      "max": 173.739
+    },
+    "p99_us": {
+      "median": 286.877,
+      "min": 284.294,
+      "max": 295.423
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.9125000000000001,
+      "min": 0.91,
+      "max": 0.9325000000000001
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1390311030.75,
+      "min": 1261334468.25,
+      "max": 1457496828.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.9800000000000001,
+      "min": 0.9475,
+      "max": 1.3725
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2572.631530773997,
+      "min": 2381.1354036077123,
+      "max": 2578.670192687573
+    },
+    "p50_us": {
+      "median": 177.954,
+      "min": 176.324,
+      "max": 180.491
+    },
+    "p99_us": {
+      "median": 307.807,
+      "min": 305.71,
+      "max": 598.298
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.9525,
+      "min": 0.93,
+      "max": 0.9575
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1314065764.5,
+      "min": 1210829795.0,
+      "max": 1337237720.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.0025,
+      "min": 1.0,
+      "max": 1.115
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 144.26376370112376,
+      "min": 137.4237968807742,
+      "max": 145.2949622187637
+    },
+    "p50_us": {
+      "median": 1762.465,
+      "min": 1615.514,
+      "max": 1852.754
+    },
+    "p99_us": {
+      "median": 25083.624,
+      "min": 24967.459,
+      "max": 30304.583
+    },
+    "process_cpu_s_per_gib": {
+      "median": 10.719999999999999,
+      "min": 9.56,
+      "max": 10.96
+    },
+    "kernel_cycles_per_gib": {
+      "median": 22972019600.0,
+      "min": 20272097340.0,
+      "max": 23696401954.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 9.72,
+      "min": 9.08,
+      "max": 10.4
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 143.32750080451308,
+      "min": 141.8478176263473,
+      "max": 158.71419711850635
+    },
+    "p50_us": {
+      "median": 1760.415,
+      "min": 1310.741,
+      "max": 1876.29
+    },
+    "p99_us": {
+      "median": 22861.97,
+      "min": 22246.29,
+      "max": 25404.594
+    },
+    "process_cpu_s_per_gib": {
+      "median": 10.02,
+      "min": 9.38,
+      "max": 11.5
+    },
+    "kernel_cycles_per_gib": {
+      "median": 21669988370.0,
+      "min": 19736417106.0,
+      "max": 24193264568.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 9.4,
+      "min": 7.12,
+      "max": 13.34
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2372.098083479424,
+      "min": 2366.653451416702,
+      "max": 2374.3328804994767
+    },
+    "p50_us": {
+      "median": 417.245,
+      "min": 416.558,
+      "max": 417.869
+    },
+    "p99_us": {
+      "median": 466.46,
+      "min": 461.177,
+      "max": 467.371
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.55375,
+      "min": 0.55375,
+      "max": 0.555
+    },
+    "kernel_cycles_per_gib": {
+      "median": 925069694.125,
+      "min": 916659547.0,
+      "max": 929381480.875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.6325,
+      "min": 0.61125,
+      "max": 0.66125
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2338.2156602602377,
+      "min": 2232.7581229012653,
+      "max": 2353.329321695879
+    },
+    "p50_us": {
+      "median": 421.725,
+      "min": 421.139,
+      "max": 430.581
+    },
+    "p99_us": {
+      "median": 471.299,
+      "min": 468.698,
+      "max": 497.571
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.55375,
+      "min": 0.5525,
+      "max": 0.565
+    },
+    "kernel_cycles_per_gib": {
+      "median": 921824537.5,
+      "min": 907640703.25,
+      "max": 953041631.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.75875,
+      "min": 0.6275,
+      "max": 1.03
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 323.11251182783093,
+      "min": 314.94678139780746,
+      "max": 331.7497335396831
+    },
+    "p50_us": {
+      "median": 2346.18,
+      "min": 2329.027,
+      "max": 2433.154
+    },
+    "p99_us": {
+      "median": 21945.969,
+      "min": 20611.517,
+      "max": 22726.856
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.545,
+      "min": 5.3950000000000005,
+      "max": 5.62
+    },
+    "kernel_cycles_per_gib": {
+      "median": 10654079147.0,
+      "min": 10609975135.0,
+      "max": 11231317391.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 5.705,
+      "min": 4.325,
+      "max": 5.895
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 330.99117267067817,
+      "min": 317.81692117987046,
+      "max": 369.98603940963284
+    },
+    "p50_us": {
+      "median": 2224.113,
+      "min": 2202.754,
+      "max": 2317.804
+    },
+    "p99_us": {
+      "median": 21805.218,
+      "min": 21106.409,
+      "max": 23049.866
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.42,
+      "min": 5.155,
+      "max": 5.53
+    },
+    "kernel_cycles_per_gib": {
+      "median": 10464712664.0,
+      "min": 10095465944.0,
+      "max": 10716913868.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.49,
+      "min": 3.62,
+      "max": 6.725
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 4586.059714203499,
+      "min": 4325.31566731364,
+      "max": 4770.069029851331
+    },
+    "p50_us": {
+      "median": 1679.589,
+      "min": 1621.997,
+      "max": 1756.729
+    },
+    "p99_us": {
+      "median": 3327.68,
+      "min": 3101.571,
+      "max": 3654.409
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.59625,
+      "min": 0.5775,
+      "max": 0.615
+    },
+    "kernel_cycles_per_gib": {
+      "median": 907679587.625,
+      "min": 827552892.375,
+      "max": 927854423.875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.625,
+      "min": 0.62125,
+      "max": 0.6475
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 4540.130024735007,
+      "min": 4377.864308372585,
+      "max": 4759.27196038771
+    },
+    "p50_us": {
+      "median": 1687.209,
+      "min": 1622.984,
+      "max": 1706.148
+    },
+    "p99_us": {
+      "median": 3390.752,
+      "min": 3101.292,
+      "max": 3477.886
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.605,
+      "min": 0.5812499999999999,
+      "max": 0.6074999999999999
+    },
+    "kernel_cycles_per_gib": {
+      "median": 918719017.625,
+      "min": 817110085.75,
+      "max": 931090725.625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.67625,
+      "min": 0.65625,
+      "max": 0.80875
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 454.489234703238,
+      "min": 453.50806943150525,
+      "max": 468.96676803841336
+    },
+    "p50_us": {
+      "median": 15878.864,
+      "min": 15862.934,
+      "max": 15965.211
+    },
+    "p99_us": {
+      "median": 39775.303,
+      "min": 35513.999,
+      "max": 40661.131
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.47,
+      "min": 4.44,
+      "max": 4.525
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8459199051.0,
+      "min": 8420097417.0,
+      "max": 8686567786.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.295,
+      "min": 2.27,
+      "max": 4.8
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 463.002354293271,
+      "min": 461.32773651003953,
+      "max": 615.3515311796507
+    },
+    "p50_us": {
+      "median": 15338.889,
+      "min": 10273.501,
+      "max": 15764.691
+    },
+    "p99_us": {
+      "median": 40362.374,
+      "min": 37549.782,
+      "max": 43192.498
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.58,
+      "min": 4.545,
+      "max": 4.85
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8564816419.5,
+      "min": 8466503515.0,
+      "max": 9265321618.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.73,
+      "min": 2.71,
+      "max": 6.305000000000001
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2344.279765026212,
+      "min": 2282.1897963453557,
+      "max": 2354.989399008896
+    },
+    "p50_us": {
+      "median": 3369.743,
+      "min": 3365.62,
+      "max": 3432.077
+    },
+    "p99_us": {
+      "median": 3809.497,
+      "min": 3789.322,
+      "max": 4074.594
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.54125,
+      "min": 0.54,
+      "max": 0.55375
+    },
+    "kernel_cycles_per_gib": {
+      "median": 835627178.5,
+      "min": 834828413.625,
+      "max": 846930729.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.84875,
+      "min": 0.6074999999999999,
+      "max": 0.95875
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2339.626578399319,
+      "min": 2332.957033420266,
+      "max": 2340.1046204901254
+    },
+    "p50_us": {
+      "median": 3392.282,
+      "min": 3388.631,
+      "max": 3394.559
+    },
+    "p99_us": {
+      "median": 3798.399,
+      "min": 3755.061,
+      "max": 3873.61
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.5425,
+      "min": 0.54125,
+      "max": 0.545
+    },
+    "kernel_cycles_per_gib": {
+      "median": 839197169.875,
+      "min": 832166986.625,
+      "max": 839635360.375
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.0,
+      "min": 0.63875,
+      "max": 1.1187500000000001
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 501.9090755002729,
+      "min": 485.28113952318205,
+      "max": 504.9080921162104
+    },
+    "p50_us": {
+      "median": 15306.501,
+      "min": 15150.894,
+      "max": 15361.745
+    },
+    "p99_us": {
+      "median": 35742.778,
+      "min": 24226.233,
+      "max": 36703.461
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.305,
+      "min": 4.26,
+      "max": 4.3549999999999995
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8128519695.0,
+      "min": 7948068765.5,
+      "max": 8328297626.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.055,
+      "min": 3.025,
+      "max": 3.87
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 510.48444799133864,
+      "min": 484.945024383719,
+      "max": 517.3090538424276
+    },
+    "p50_us": {
+      "median": 14595.938,
+      "min": 14376.224,
+      "max": 15271.085
+    },
+    "p99_us": {
+      "median": 36573.362,
+      "min": 33014.377,
+      "max": 40099.892
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.245,
+      "min": 4.175,
+      "max": 4.53
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8021817475.0,
+      "min": 7957619825.5,
+      "max": 8580843731.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.8850000000000002,
+      "min": 2.0500000000000003,
+      "max": 4.765
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 3446.6254822605615,
+      "min": 3436.8452052357948,
+      "max": 3477.794109490048
+    },
+    "p50_us": {
+      "median": 18656.879,
+      "min": 18552.394,
+      "max": 18692.26
+    },
+    "p99_us": {
+      "median": 31778.822,
+      "min": 31154.715,
+      "max": 32088.577
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.70875,
+      "min": 0.69625,
+      "max": 0.71
+    },
+    "kernel_cycles_per_gib": {
+      "median": 915701900.0,
+      "min": 899895051.75,
+      "max": 920789720.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.72875,
+      "min": 0.71,
+      "max": 0.73375
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 3536.5003941117134,
+      "min": 3459.9235567733044,
+      "max": 3549.478847768177
+    },
+    "p50_us": {
+      "median": 18183.803,
+      "min": 18048.516,
+      "max": 18700.262
+    },
+    "p99_us": {
+      "median": 30603.689,
+      "min": 29903.669,
+      "max": 31121.143
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.70125,
+      "min": 0.695,
+      "max": 0.7025
+    },
+    "kernel_cycles_per_gib": {
+      "median": 913173842.875,
+      "min": 895300980.0,
+      "max": 917650857.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.78875,
+      "min": 0.7125,
+      "max": 1.02875
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 463.87854918463887,
+      "min": 461.6205410482021,
+      "max": 472.1537223666461
+    },
+    "p50_us": {
+      "median": 130056.701,
+      "min": 128685.761,
+      "max": 130830.093
+    },
+    "p99_us": {
+      "median": 185163.461,
+      "min": 173574.493,
+      "max": 192960.941
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.725,
+      "min": 4.72,
+      "max": 4.8100000000000005
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8702952030.0,
+      "min": 8702562735.0,
+      "max": 8908855284.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.4050000000000002,
+      "min": 3.115,
+      "max": 3.705
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 1,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 487.45607851741437,
+      "min": 481.77857681549347,
+      "max": 487.47014278401076
+    },
+    "p50_us": {
+      "median": 126372.691,
+      "min": 124828.118,
+      "max": 126387.05
+    },
+    "p99_us": {
+      "median": 171801.483,
+      "min": 167106.147,
+      "max": 174090.275
+    },
+    "process_cpu_s_per_gib": {
+      "median": 4.680000000000001,
+      "min": 4.68,
+      "max": 4.705
+    },
+    "kernel_cycles_per_gib": {
+      "median": 8731518257.5,
+      "min": 8653915548.0,
+      "max": 8801750555.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.695,
+      "min": 2.7550000000000003,
+      "max": 6.545
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 343.90885973374776,
+      "min": 340.2709553492767,
+      "max": 346.2480849492653
+    },
+    "p50_us": {
+      "median": 33.337,
+      "min": 32.812,
+      "max": 33.814
+    },
+    "p99_us": {
+      "median": 62.977,
+      "min": 60.877,
+      "max": 65.01
+    },
+    "process_cpu_s_per_gib": {
+      "median": 10.845,
+      "min": 10.745000000000001,
+      "max": 11.0325
+    },
+    "kernel_cycles_per_gib": {
+      "median": 14417112591.25,
+      "min": 14164254495.75,
+      "max": 14771026023.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 11.1,
+      "min": 10.9725,
+      "max": 11.48
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 431.17206618260764,
+      "min": 430.25768289143,
+      "max": 437.8296091944592
+    },
+    "p50_us": {
+      "median": 29.371,
+      "min": 29.367,
+      "max": 30.017
+    },
+    "p99_us": {
+      "median": 49.389,
+      "min": 49.139,
+      "max": 49.522
+    },
+    "process_cpu_s_per_gib": {
+      "median": 9.015,
+      "min": 9.002500000000001,
+      "max": 9.115
+    },
+    "kernel_cycles_per_gib": {
+      "median": 11806172603.0,
+      "min": 11724088146.75,
+      "max": 12229058190.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 9.435,
+      "min": 9.18,
+      "max": 9.805
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 29.979865395922538,
+      "min": 26.755531930225768,
+      "max": 31.732275163334645
+    },
+    "p50_us": {
+      "median": 276.649,
+      "min": 261.979,
+      "max": 280.135
+    },
+    "p99_us": {
+      "median": 6311.239,
+      "min": 6091.638,
+      "max": 7219.117
+    },
+    "process_cpu_s_per_gib": {
+      "median": 88.2,
+      "min": 83.96000000000001,
+      "max": 90.8
+    },
+    "kernel_cycles_per_gib": {
+      "median": 210301481392.0,
+      "min": 198454136960.0,
+      "max": 215613552484.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 77.92,
+      "min": 70.84,
+      "max": 80.4
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 31.88464660159097,
+      "min": 26.306277682898806,
+      "max": 33.02084252065452
+    },
+    "p50_us": {
+      "median": 263.854,
+      "min": 262.372,
+      "max": 273.29
+    },
+    "p99_us": {
+      "median": 6208.952,
+      "min": 6037.197,
+      "max": 7338.542
+    },
+    "process_cpu_s_per_gib": {
+      "median": 87.08,
+      "min": 86.08,
+      "max": 90.36
+    },
+    "kernel_cycles_per_gib": {
+      "median": 204138361180.0,
+      "min": 202219313584.0,
+      "max": 213421355232.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 73.92,
+      "min": 70.24,
+      "max": 74.48
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1165.6214291825322,
+      "min": 1158.1284822422572,
+      "max": 1176.2200958550172
+    },
+    "p50_us": {
+      "median": 76.567,
+      "min": 76.11,
+      "max": 79.347
+    },
+    "p99_us": {
+      "median": 147.915,
+      "min": 146.955,
+      "max": 149.266
+    },
+    "process_cpu_s_per_gib": {
+      "median": 3.8925,
+      "min": 3.8674999999999997,
+      "max": 3.91
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3497556974.25,
+      "min": 3488780082.75,
+      "max": 3535006284.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 4.1325,
+      "min": 3.9325,
+      "max": 4.7325
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1184.0140928109909,
+      "min": 1158.0011140587037,
+      "max": 1187.8107845584304
+    },
+    "p50_us": {
+      "median": 76.011,
+      "min": 75.719,
+      "max": 76.457
+    },
+    "p99_us": {
+      "median": 142.641,
+      "min": 142.454,
+      "max": 145.588
+    },
+    "process_cpu_s_per_gib": {
+      "median": 3.655,
+      "min": 3.6225,
+      "max": 3.6675
+    },
+    "kernel_cycles_per_gib": {
+      "median": 3216009681.5,
+      "min": 3189909027.25,
+      "max": 3216574867.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.7875,
+      "min": 3.7525,
+      "max": 3.7975000000000003
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 54.619501043130164,
+      "min": 48.394982851294536,
+      "max": 68.63013924123919
+    },
+    "p50_us": {
+      "median": 1089.113,
+      "min": 1068.121,
+      "max": 1114.769
+    },
+    "p99_us": {
+      "median": 28045.308,
+      "min": 11124.781,
+      "max": 57506.827
+    },
+    "process_cpu_s_per_gib": {
+      "median": 71.2,
+      "min": 57.199999999999996,
+      "max": 80.16
+    },
+    "kernel_cycles_per_gib": {
+      "median": 105581576572.0,
+      "min": 95014926012.0,
+      "max": 111899414528.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 70.8,
+      "min": 51.24,
+      "max": 80.52
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 4096,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 54.120645634584506,
+      "min": 48.76665502423736,
+      "max": 60.67508241942027
+    },
+    "p50_us": {
+      "median": 1127.059,
+      "min": 1101.117,
+      "max": 1180.867
+    },
+    "p99_us": {
+      "median": 20094.132,
+      "min": 14315.996,
+      "max": 27881.596
+    },
+    "process_cpu_s_per_gib": {
+      "median": 67.03999999999999,
+      "min": 66.56,
+      "max": 69.88
+    },
+    "kernel_cycles_per_gib": {
+      "median": 100083440756.0,
+      "min": 97392514128.0,
+      "max": 100701329512.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 62.04,
+      "min": 57.92,
+      "max": 64.8
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2465.6147940210444,
+      "min": 2401.477335855663,
+      "max": 2622.4771737775677
+    },
+    "p50_us": {
+      "median": 85.066,
+      "min": 84.849,
+      "max": 86.498
+    },
+    "p99_us": {
+      "median": 140.606,
+      "min": 136.344,
+      "max": 143.403
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.671875,
+      "min": 1.6675,
+      "max": 1.6725
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2537106287.5,
+      "min": 2515895192.875,
+      "max": 2543841937.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.7325,
+      "min": 1.718125,
+      "max": 2.149375
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 2557.7109018952333,
+      "min": 2537.718075174104,
+      "max": 2613.041749456854
+    },
+    "p50_us": {
+      "median": 82.988,
+      "min": 82.311,
+      "max": 83.933
+    },
+    "p99_us": {
+      "median": 144.009,
+      "min": 139.758,
+      "max": 148.577
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.6256249999999999,
+      "min": 1.59375,
+      "max": 1.6443750000000001
+    },
+    "kernel_cycles_per_gib": {
+      "median": 2549584542.75,
+      "min": 2294739278.25,
+      "max": 2663950780.0625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.66125,
+      "min": 1.6356249999999999,
+      "max": 1.68375
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 137.4262878674808,
+      "min": 131.83992954375285,
+      "max": 138.4965261527001
+    },
+    "p50_us": {
+      "median": 582.919,
+      "min": 567.448,
+      "max": 594.519
+    },
+    "p99_us": {
+      "median": 17048.983,
+      "min": 15415.234,
+      "max": 17631.93
+    },
+    "process_cpu_s_per_gib": {
+      "median": 27.119999999999997,
+      "min": 26.345,
+      "max": 27.384999999999998
+    },
+    "kernel_cycles_per_gib": {
+      "median": 64329593424.5,
+      "min": 62653908510.0,
+      "max": 65246482522.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 14.61,
+      "min": 14.5,
+      "max": 18.47
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 134.17397238694224,
+      "min": 133.99452837399858,
+      "max": 142.40892229725563
+    },
+    "p50_us": {
+      "median": 565.558,
+      "min": 558.797,
+      "max": 576.343
+    },
+    "p99_us": {
+      "median": 15879.777,
+      "min": 14661.331,
+      "max": 16623.773
+    },
+    "process_cpu_s_per_gib": {
+      "median": 26.79,
+      "min": 26.22,
+      "max": 27.005000000000003
+    },
+    "kernel_cycles_per_gib": {
+      "median": 63137424837.5,
+      "min": 61310899619.5,
+      "max": 64601006390.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 14.790000000000001,
+      "min": 14.625,
+      "max": 15.66
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 5188.990406811546,
+      "min": 5127.822902461092,
+      "max": 5838.202713257176
+    },
+    "p50_us": {
+      "median": 208.887,
+      "min": 208.677,
+      "max": 212.648
+    },
+    "p99_us": {
+      "median": 1184.039,
+      "min": 1126.621,
+      "max": 1281.12
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.1981249999999999,
+      "min": 1.134375,
+      "max": 1.2206249999999998
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1640831353.5625,
+      "min": 1543513991.5,
+      "max": 1667843519.1875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.160625,
+      "min": 1.11125,
+      "max": 1.1775
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 5345.470758890458,
+      "min": 4721.596282666036,
+      "max": 5615.651790844261
+    },
+    "p50_us": {
+      "median": 219.329,
+      "min": 218.743,
+      "max": 219.853
+    },
+    "p99_us": {
+      "median": 1134.178,
+      "min": 1123.405,
+      "max": 1207.349
+    },
+    "process_cpu_s_per_gib": {
+      "median": 1.163125,
+      "min": 1.15375,
+      "max": 1.27125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1646373725.0,
+      "min": 1568377690.0,
+      "max": 1727461741.1875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 1.145,
+      "min": 1.1175,
+      "max": 1.234375
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 308.14898601736735,
+      "min": 281.1948983201733,
+      "max": 328.9824265831556
+    },
+    "p50_us": {
+      "median": 2330.263,
+      "min": 2202.669,
+      "max": 2404.84
+    },
+    "p99_us": {
+      "median": 39417.791,
+      "min": 37718.478,
+      "max": 40460.199
+    },
+    "process_cpu_s_per_gib": {
+      "median": 13.535,
+      "min": 13.275,
+      "max": 14.274999999999999
+    },
+    "kernel_cycles_per_gib": {
+      "median": 31674111082.0,
+      "min": 29823880026.0,
+      "max": 33657902922.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 7.03,
+      "min": 6.48,
+      "max": 7.085
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 65536,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 321.4496673814164,
+      "min": 282.20946845060894,
+      "max": 323.77590869425273
+    },
+    "p50_us": {
+      "median": 2251.209,
+      "min": 2244.424,
+      "max": 2309.946
+    },
+    "p99_us": {
+      "median": 37821.268,
+      "min": 37096.511,
+      "max": 40026.157
+    },
+    "process_cpu_s_per_gib": {
+      "median": 14.01,
+      "min": 13.675,
+      "max": 15.75
+    },
+    "kernel_cycles_per_gib": {
+      "median": 32600827228.0,
+      "min": 32586651597.5,
+      "max": 38793307243.0
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 6.33,
+      "min": 5.7700000000000005,
+      "max": 6.845
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 7001.2752403645545,
+      "min": 6913.991049172254,
+      "max": 7235.552455624582
+    },
+    "p50_us": {
+      "median": 501.836,
+      "min": 498.724,
+      "max": 503.664
+    },
+    "p99_us": {
+      "median": 843.231,
+      "min": 824.98,
+      "max": 872.988
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.63125,
+      "min": 0.62875,
+      "max": 0.6315625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1072670456.65625,
+      "min": 1069145320.375,
+      "max": 1085384329.65625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.6421875,
+      "min": 0.64125,
+      "max": 0.645
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 7012.904384191333,
+      "min": 6888.9355773864945,
+      "max": 7201.431751000903
+    },
+    "p50_us": {
+      "median": 508.968,
+      "min": 508.075,
+      "max": 509.356
+    },
+    "p99_us": {
+      "median": 840.5,
+      "min": 836.688,
+      "max": 857.147
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.634375,
+      "min": 0.63375,
+      "max": 0.6378125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1068161034.15625,
+      "min": 1035765571.53125,
+      "max": 1083599134.625
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.6478125,
+      "min": 0.6428125,
+      "max": 0.653125
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 753.1945722390594,
+      "min": 684.9628094421615,
+      "max": 803.1857258218713
+    },
+    "p50_us": {
+      "median": 3119.539,
+      "min": 3074.014,
+      "max": 3196.542
+    },
+    "p99_us": {
+      "median": 28343.043,
+      "min": 28232.289,
+      "max": 33898.32
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.75,
+      "min": 6.5925,
+      "max": 7.0275
+    },
+    "kernel_cycles_per_gib": {
+      "median": 12909316908.25,
+      "min": 12413528267.375,
+      "max": 13947932385.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.99,
+      "min": 3.585,
+      "max": 4.45875
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 774.5629297231487,
+      "min": 760.8140039114468,
+      "max": 864.6638559872262
+    },
+    "p50_us": {
+      "median": 3067.767,
+      "min": 2989.387,
+      "max": 3135.313
+    },
+    "p99_us": {
+      "median": 30386.015,
+      "min": 23965.477,
+      "max": 32522.258
+    },
+    "process_cpu_s_per_gib": {
+      "median": 6.58375,
+      "min": 6.195,
+      "max": 6.7212499999999995
+    },
+    "kernel_cycles_per_gib": {
+      "median": 13021858130.75,
+      "min": 12230537717.375,
+      "max": 13098481878.125
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.8325,
+      "min": 3.5412500000000002,
+      "max": 3.905
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 10542.612575001905,
+      "min": 10440.12757212697,
+      "max": 10799.384275979364
+    },
+    "p50_us": {
+      "median": 2630.366,
+      "min": 2611.058,
+      "max": 2636.656
+    },
+    "p99_us": {
+      "median": 6125.235,
+      "min": 5768.816,
+      "max": 6602.682
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.796875,
+      "min": 0.7953125,
+      "max": 0.7993750000000001
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1097929062.6875,
+      "min": 1097585526.84375,
+      "max": 1115689837.53125
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.805625,
+      "min": 0.786875,
+      "max": 0.8075
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 10190.26950091743,
+      "min": 10186.560010581388,
+      "max": 10701.527890069669
+    },
+    "p50_us": {
+      "median": 2624.65,
+      "min": 2623.201,
+      "max": 2636.072
+    },
+    "p99_us": {
+      "median": 6598.772,
+      "min": 6077.081,
+      "max": 6624.393
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.7809375,
+      "min": 0.780625,
+      "max": 0.790625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1091578743.59375,
+      "min": 1065125437.96875,
+      "max": 1110145596.09375
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.7715625,
+      "min": 0.770625,
+      "max": 0.77875
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1088.1962053549707,
+      "min": 1080.2943048886984,
+      "max": 1091.4765944938224
+    },
+    "p50_us": {
+      "median": 25896.664,
+      "min": 25796.384,
+      "max": 26162.129
+    },
+    "p99_us": {
+      "median": 62299.366,
+      "min": 59962.398,
+      "max": 65307.407
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.515,
+      "min": 5.4875,
+      "max": 5.5562499999999995
+    },
+    "kernel_cycles_per_gib": {
+      "median": 10499402466.625,
+      "min": 10319988005.5,
+      "max": 10597939526.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.4875000000000003,
+      "min": 3.38375,
+      "max": 3.48875
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 1048576,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1075.7309196669846,
+      "min": 1043.4586515824742,
+      "max": 1096.3647975876
+    },
+    "p50_us": {
+      "median": 25929.863,
+      "min": 25538.493,
+      "max": 26005.848
+    },
+    "p99_us": {
+      "median": 65541.747,
+      "min": 56844.787,
+      "max": 66514.728
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.6225,
+      "min": 5.565,
+      "max": 5.6575
+    },
+    "kernel_cycles_per_gib": {
+      "median": 10647116264.375,
+      "min": 10533965176.625,
+      "max": 10709737929.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.15125,
+      "min": 3.08,
+      "max": 3.28875
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 6006.077380487122,
+      "min": 5831.130639957379,
+      "max": 6032.772619705024
+    },
+    "p50_us": {
+      "median": 4922.603,
+      "min": 4904.997,
+      "max": 4997.791
+    },
+    "p99_us": {
+      "median": 7104.217,
+      "min": 7008.625,
+      "max": 7189.278
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.7146875,
+      "min": 0.7103125,
+      "max": 0.7315625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 906060040.84375,
+      "min": 896689756.65625,
+      "max": 970806900.75
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.735,
+      "min": 0.7175,
+      "max": 0.743125
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 5876.943978571009,
+      "min": 5843.740301459583,
+      "max": 6095.85653212942
+    },
+    "p50_us": {
+      "median": 4922.147,
+      "min": 4869.211,
+      "max": 4991.028
+    },
+    "p99_us": {
+      "median": 7125.162,
+      "min": 7074.277,
+      "max": 7271.707
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.7175,
+      "min": 0.714375,
+      "max": 0.7303125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 920143787.21875,
+      "min": 896804744.46875,
+      "max": 970481293.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.73125,
+      "min": 0.7225,
+      "max": 0.7434375
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1170.2438685382854,
+      "min": 1130.077928402678,
+      "max": 1189.6251975623723
+    },
+    "p50_us": {
+      "median": 25898.671,
+      "min": 25570.544,
+      "max": 26674.681
+    },
+    "p99_us": {
+      "median": 52969.996,
+      "min": 50263.208,
+      "max": 56225.032
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.32375,
+      "min": 5.2775,
+      "max": 5.43
+    },
+    "kernel_cycles_per_gib": {
+      "median": 10015337789.875,
+      "min": 9902688841.75,
+      "max": 10279247426.375
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.56875,
+      "min": 3.22125,
+      "max": 3.7025
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 1,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1158.4890057672308,
+      "min": 1142.2161309413696,
+      "max": 1199.8298281003292
+    },
+    "p50_us": {
+      "median": 25824.532,
+      "min": 25700.668,
+      "max": 25898.94
+    },
+    "p99_us": {
+      "median": 52307.679,
+      "min": 47680.865,
+      "max": 58699.733
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.3175,
+      "min": 5.30375,
+      "max": 5.34625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 10158304198.75,
+      "min": 9967349275.75,
+      "max": 10171178704.875
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.19375,
+      "min": 3.12375,
+      "max": 3.6037500000000002
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 9213.38193114881,
+      "min": 9116.294519352508,
+      "max": 9289.428587856786
+    },
+    "p50_us": {
+      "median": 26445.127,
+      "min": 26361.75,
+      "max": 26715.428
+    },
+    "p99_us": {
+      "median": 52628.758,
+      "min": 48363.783,
+      "max": 53299.58
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.885,
+      "min": 0.884375,
+      "max": 0.8853125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1087979840.9375,
+      "min": 1084763027.71875,
+      "max": 1093497051.78125
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.88,
+      "min": 0.8778125,
+      "max": 0.8815625
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "read",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 9357.234096498414,
+      "min": 9135.299609407619,
+      "max": 9401.894202218706
+    },
+    "p50_us": {
+      "median": 26362.269,
+      "min": 26343.344,
+      "max": 26446.966
+    },
+    "p99_us": {
+      "median": 47231.382,
+      "min": 47230.244,
+      "max": 53820.044
+    },
+    "process_cpu_s_per_gib": {
+      "median": 0.8843749999999999,
+      "min": 0.8803125,
+      "max": 0.89625
+    },
+    "kernel_cycles_per_gib": {
+      "median": 1080819582.15625,
+      "min": 1055198291.8125,
+      "max": 1112457325.59375
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 0.8953125,
+      "min": 0.8796875000000001,
+      "max": 0.8971875
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "baseline",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1274.0657524911237,
+      "min": 1208.1171842167978,
+      "max": 1282.5130867982932
+    },
+    "p50_us": {
+      "median": 198190.239,
+      "min": 189658.576,
+      "max": 214981.347
+    },
+    "p99_us": {
+      "median": 257496.367,
+      "min": 243042.795,
+      "max": 260479.897
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.29875,
+      "min": 5.2225,
+      "max": 5.36125
+    },
+    "kernel_cycles_per_gib": {
+      "median": 9704658620.75,
+      "min": 9479264935.875,
+      "max": 9847833724.5
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.41375,
+      "min": 3.4,
+      "max": 3.76625
+    }
+  },
+  {
+    "transport": "ucx",
+    "partitions": 4,
+    "size": 8388608,
+    "depth": 8,
+    "mode": "write",
+    "version": "pure",
+    "n": 3,
+    "mib_per_sec": {
+      "median": 1296.9880717618776,
+      "min": 1273.1672822053074,
+      "max": 1538.902494659849
+    },
+    "p50_us": {
+      "median": 155844.752,
+      "min": 138885.185,
+      "max": 195833.714
+    },
+    "p99_us": {
+      "median": 241412.616,
+      "min": 203607.007,
+      "max": 249800.273
+    },
+    "process_cpu_s_per_gib": {
+      "median": 5.33,
+      "min": 5.265,
+      "max": 5.365
+    },
+    "kernel_cycles_per_gib": {
+      "median": 9858055064.375,
+      "min": 9639247281.5,
+      "max": 9972876124.25
+    },
+    "selected_cpu_busy_s_per_gib": {
+      "median": 3.25,
+      "min": 2.94875,
+      "max": 3.405
+    }
+  }
+]

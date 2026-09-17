@@ -1,0 +1,20 @@
+{
+  "bin/zc/autumn-extent-node": "01d70558399ba47e737e18cd8d0977adfb6d7491ff9554955c156ba523c9274d",
+  "bin/zc/autumn-manager-server": "6749104c5fee2dc1e886844b46b16b620f04fa4ac9705c69278e398efa90c48c",
+  "bin/zc/controlled_path": "d453430e7faee0ec7475dfcdd8b5a1acdb920516da0f847f5aff23aa6cf9df3c",
+  "bin/zc/autumn-op": "b4c0acb7f50d6c81f7ebab773689c8f8678a0ee359a0ac5cbf1cb2dcb43e779d",
+  "bin/zc/autumn-ps": "d84a95552cc0a23e71f3db1da2b3bdbba1b1ce485ed82410db17a14a2c232296",
+  "bin/zc/autumn-client": "7be22c5b87a38b9ceae462e5b2f94457b710ce113477858a930e5d78be89d425",
+  "bin/baseline/autumn-extent-node": "3754215e33371b94f38c4d5274c6123e9ae95f712b61be8eef4c3c81ca713e2e",
+  "bin/baseline/autumn-manager-server": "1dd397f0a4c99e7c2a749c463e5e77bf64dd84fc8ca2554a8d7ede94f906e625",
+  "bin/baseline/controlled_path": "4de132b969b2513d6ded12e89d8b8055756ad7346d4997046f5b257fe23bb186",
+  "bin/baseline/autumn-op": "24f4acb18433cc4515deab6f3dced81623cdeb3664e9d24a25d6d0afbefd7736",
+  "bin/baseline/autumn-ps": "d6d48fe6f7bd14b0068a1b0f45e61a93b2783e951921122358c39861ae33c546",
+  "bin/baseline/autumn-client": "a1528837dbfe65273abd58d5304ea4cda6bcb003ca3f16b7b688351edec28994",
+  "bin/pure/autumn-extent-node": "8d3707be211f9733abb164cae3e83a8bc0a2a01bdeab471674280c1a7d6ffbde",
+  "bin/pure/autumn-manager-server": "0bb9e68d8c6a4432be0ee8d134f57bcb13104e65a8817c9b84b095441735acba",
+  "bin/pure/controlled_path": "d453430e7faee0ec7475dfcdd8b5a1acdb920516da0f847f5aff23aa6cf9df3c",
+  "bin/pure/autumn-op": "3dad27f607b7a6a0ad8f3a7969b01f385ef9638b399faf6087ddeaed16a8875b",
+  "bin/pure/autumn-ps": "db0a1eccc60954eb853bbe1b298d7d921b295b7f1bb2f6da6894dff716815641",
+  "bin/pure/autumn-client": "d0ab6688feca4eb955f71b3e401f17498d9a8466b991e2776190561963865643"
+}

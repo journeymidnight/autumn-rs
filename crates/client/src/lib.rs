@@ -765,8 +765,8 @@ pub struct KeyMeta {
 /// fixed chunk size, or the ring-buffer slot); a value longer than `dest` is
 /// truncated to fit (the returned `Some(n)` carries the full value length).
 ///
-/// The bulk recv lands in a read_loop-owned RegPool buffer (registered on UCX —
-/// RDMA off the wire; plain recycled buffer on TCP), then ONE memcpy into
+/// The bulk recv lands in a read_loop-owned RegPool buffer (one UCX Stream
+/// unpack or TCP kernel copy), then ONE memcpy into
 /// `dest`. `dest` itself needs no registration and no special lifetime — it
 /// is a plain borrow filled after the RPC resolves.
 pub struct GetManyItem<'a> {
@@ -2311,7 +2311,7 @@ impl ClusterClient {
 
     /// `call_ps_for_part` for a request whose RESPONSE is value-separable —
     /// the reply's ctrl and its raw tail come back separately, the tail already
-    /// in a pool buffer (RDMA'd straight into it on UCX). Used by the batched
+    /// in a pool buffer (received straight into it). Used by the batched
     /// bulk read, where the tail holds every value at once.
     async fn call_ps_for_part_pooled(
         &self,
@@ -2744,9 +2744,9 @@ impl ClusterClient {
     /// `length == 0` means "from offset to the end of the value" (matches the
     /// underlying `GetReq` semantics). Returns None if the key is not found.
     ///
-    /// Routes through `call_ps_for_key` so the cached PS connection is dropped
-    /// on RPC error and routing is refreshed on the second attempt — same
-    /// resilience as `get`/`put`/`head` after a cluster restart.
+    /// Served by `MSG_GET_BULK` through `get_range_pooled_bound`, with the same
+    /// refresh-and-retry classification as `call_ps_for_key`; a transport error
+    /// drops the cached PS connection.
     pub async fn get_range(
         &self,
         key: &[u8],
@@ -2765,24 +2765,13 @@ impl ClusterClient {
         offset: u32,
         length: u32,
     ) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
-        let key = key.to_vec();
-        let resp_bytes = self
-            .call_ps_for_key(&key, MSG_GET, |part_id, region_epoch| {
-                rkyv_encode(&GetReq {
-                    part_id,
-                    key: key.clone(),
-                    offset,
-                    length,
-                    region_epoch,
-                })
-            })
-            .await?;
-        let resp: GetResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-        if resp.code == partition_rpc::CODE_NOT_FOUND {
-            return Ok(None);
-        }
-        check_ps_code(resp.code, &resp.message)?;
-        Ok(Some(resp.value))
+        // Served by `MSG_GET_BULK`: the PS sends the value as its own iovec and
+        // the read_loop receives it into a pooled buffer, so the returned `Vec`
+        // is the one application copy.
+        Ok(self
+            .get_range_pooled_bound(key, offset, length)
+            .await?
+            .map(|value| value.to_vec()))
     }
 
     /// GET with PS-bypass for large VP values. Issues
@@ -3091,7 +3080,7 @@ impl ClusterClient {
     /// `None` if not found. `read_len = length>0 ? length : dest.len()`:
     /// - `read_len < 64 KiB` (`!bulk_worthwhile`): no redirect — a small
     ///   value/sub-range never bypasses the PS (the redirect RTT + EN connect
-    ///   would cost more than the copy it saves). Plain proxy `get_range` + copy.
+    ///   would cost more than the copy it saves). Proxy `get_range_into`.
     /// - `read_len >= 64 KiB`: `MSG_GET_REDIRECT`. An inline answer
     ///   (`extent_id == 0`: the PS declined to redirect — small/non-VP after
     ///   resolution) is copied straight in; a descriptor drives
@@ -3107,15 +3096,7 @@ impl ClusterClient {
         let read_len = if length > 0 { length as usize } else { dest.len() };
         if !bulk_worthwhile(read_len) {
             // Small item: straight proxy, no redirect round-trip.
-            return match self.get_range(key, offset, length).await {
-                Ok(Some(v)) => {
-                    let n = v.len().min(dest.len());
-                    dest[..n].copy_from_slice(&v[..n]);
-                    Ok(Some(v.len()))
-                }
-                Ok(None) => Ok(None),
-                Err(e) => Err(e),
-            };
+            return self.get_range_into(key, offset, length, dest).await;
         }
         // D7: bind for the redirect routing/descriptor; the fallbacks
         // above/below use the original user `key` (get_range/get_range_into bind
@@ -3180,8 +3161,8 @@ impl ClusterClient {
     /// `get_direct`, same dest-based shape as `get_many_into`. Each item whose
     /// requested length is >= 64 KiB is read STRAIGHT from an EN
     /// (`MSG_GET_REDIRECT` descriptor → `read_extent_value_direct`), taking the
-    /// PS out of the large-value data path; sub-64 KiB items stay on the plain
-    /// proxy `get_range` path (mixed-size batches route per item). Per item,
+    /// PS out of the large-value data path; sub-64 KiB items stay on the proxy
+    /// `get_range_into` path (mixed-size batches route per item). Per item,
     /// ANY direct-read failure falls back to the proxy — so it degrades
     /// gracefully where ENs aren't client-reachable (one redirect RTT +
     /// fallback), which is why the DECISION to call this vs `get_many_into` is a
@@ -3353,8 +3334,8 @@ impl ClusterClient {
 
     /// bulk GET: read a key's value into `dest` with ONE copy. The value is
     /// recv'd into a read_loop-owned RegPool buffer (`MSG_GET_BULK` +
-    /// `RpcClient::call_into_pooled` — UCX RDMAs into the registered pool
-    /// buffer; TCP ≥ 64 KiB pays only the kernel copy, no FrameDecoder
+    /// `RpcClient::call_into_pooled` — the UCX Stream unpack or, for TCP
+    /// ≥ 64 KiB, the kernel copy lands in the pool buffer, no FrameDecoder
     /// accumulation) and then copied once into `dest`. Returns
     /// `Some(value_len)`; `dest[..value_len.min(dest.len())]` is filled —
     /// `value_len > dest.len()` means the value was TRUNCATED to fit (the
@@ -3401,9 +3382,9 @@ impl ClusterClient {
     }
 
     /// bulk GET, zero SDK-side copies: the value arrives in a read_loop-owned
-    /// RegPool buffer (`MSG_GET_BULK` + `RpcClient::call_into_pooled` — UCX
-    /// RDMAs into the registered slab; TCP ≥ 64 KiB pays only the kernel
-    /// copy) and is handed straight back as a [`ValueBuf`]. Read it in place,
+    /// RegPool buffer (`MSG_GET_BULK` + `RpcClient::call_into_pooled` — the UCX
+    /// Stream unpack or TCP kernel copy is the only copy) and is handed
+    /// straight back as a [`ValueBuf`]. Read it in place,
     /// or `freeze()` into a `Bytes` for a framework sink; dropping either
     /// returns the slab to the pool. `None` = not found.
     ///
@@ -3432,17 +3413,32 @@ impl ClusterClient {
         length: u32,
     ) -> std::result::Result<Option<ValueBuf>, AutumnError> {
         let key = self.binding.bind_key(key)?;
+        self.get_range_pooled_bound(&key, offset, length).await
+    }
+
+    /// `get_range_pooled` over an ALREADY-bound wire key. Every point read
+    /// comes through here, `get`/`get_range` included, so all of them share
+    /// one retry classification — the same as `call_ps_for_key`: NotFound is
+    /// a miss, PermissionDenied/NamespaceUnknown are terminal, and every other
+    /// refusal (stale epoch, GC-pinned extent, internal error) refreshes
+    /// routing and retries.
+    async fn get_range_pooled_bound(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<ValueBuf>, AutumnError> {
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
         while attempt <= MAX_PS_REFRESHES {
             let (part_id, ps_addr) = self
-                .resolve_key(&key)
+                .resolve_key(key)
                 .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             let region_epoch = self.lookup_epoch_for_part(part_id);
             let payload = rkyv_encode(&GetReq {
                 part_id,
-                key: key.clone(),
+                key: key.to_vec(),
                 offset,
                 length,
                 region_epoch,
@@ -3455,7 +3451,7 @@ impl ClusterClient {
                     // returns to the pool via the read_loop (cancel-safe,
                     // unlike the removed call_into_dest).
                     let call = client.call_into_pooled(partition_rpc::MSG_GET_BULK, payload);
-                    let outcome = match self.rpc_timeout.get() {
+                    let outcome = match self.first_attempt_effective_timeout(attempt) {
                         None => call.await,
                         Some(t) => match compio::time::timeout(t, call).await {
                             Ok(r) => r,
@@ -3471,17 +3467,10 @@ impl ClusterClient {
                                 return Ok(Some(ValueBuf::from_pooled(z.buf)));
                             }
                             partition_rpc::CODE_NOT_FOUND => return Ok(None),
-                            // Epoch stale → fall through to refresh + retry.
-                            partition_rpc::CODE_PRECONDITION
-                            | partition_rpc::CODE_REGION_EPOCH_STALE => {
-                                last_err = Some(if z.message.is_empty() {
-                                    "region epoch stale".to_string()
-                                } else {
-                                    z.message
-                                });
-                            }
-                            // v28: the bulk ctrl carries a human-readable message.
-                            other => return Err(code_to_error(other, z.message)),
+                            // Stale epoch, GC-pinned extent, internal error:
+                            // refresh + retry, as `call_ps_for_key` does for
+                            // the same refusals.
+                            other => last_err = Some(code_to_error(other, z.message).to_string()),
                         },
                         Err(e) => {
                             // Frame-level error or transport failure. (An authz
@@ -3533,11 +3522,9 @@ impl ClusterClient {
     /// callers pass `BATCH_GET_DEFAULT_CONCURRENCY` or their own tuned cap, e.g.
     /// python's `per_worker_cap`) over the per-partition multiplexed PS
     /// connections, amortising per-call await latency + letting the writer_task
-    /// batch syscalls. Per item the bulk decision is `bulk_worthwhile(read_len)`
-    /// (read_len = `length` for a sub-range, else `dest.len()`): >= 64 KiB →
-    /// `get_range_into` (`MSG_GET_BULK`, pooled recv — UCX RDMAs into the
-    /// registered pool buffer — then one copy into `dest`); else `get_range`
-    /// (`MSG_GET`) + one copy into `dest`.
+    /// batch syscalls. Every per-key read is `get_range_into` (`MSG_GET_BULK`,
+    /// pooled recv — the transport's receive copy lands in the pool buffer —
+    /// then one copy into `dest`), whatever the size.
     /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
     /// (`dest[..n.min(dest.len())]` filled; `n > dest.len()` ⇒ truncated to fit),
     /// `Ok(None)` = not found, `Err` = that item's RPC failed (others still ran).
@@ -3550,7 +3537,7 @@ impl ClusterClient {
         // loopback). Conditions: every item is a whole-value read
         // (offset == 0 && length == 0) whose dest is below the bulk
         // threshold. Mixed / range / large-bulk inputs fall through to
-        // the per-op fan_out which keeps the bulk RDMA path.
+        // the per-op fan_out which keeps the bulk pooled-receive path.
         let homogeneous_small = !items.is_empty()
             && items.iter().all(|it| {
                 it.offset == 0 && it.length == 0 && !bulk_worthwhile(it.dest.len())
@@ -3582,22 +3569,7 @@ impl ClusterClient {
             let offset = it.offset;
             let length = it.length;
             let dest: &mut [u8] = &mut *it.dest;
-            async move {
-                let read_len = if length > 0 { length as usize } else { dest.len() };
-                if bulk_worthwhile(read_len) {
-                    self.get_range_into(key, offset, length, dest).await
-                } else {
-                    match self.get_range(key, offset, length).await {
-                        Ok(Some(v)) => {
-                            let n = v.len().min(dest.len());
-                            dest[..n].copy_from_slice(&v[..n]);
-                            Ok(Some(v.len()))
-                        }
-                        Ok(None) => Ok(None),
-                        Err(e) => Err(e),
-                    }
-                }
-            }
+            async move { self.get_range_into(key, offset, length, dest).await }
         });
         fan_out_collect(futs, concurrency).await
     }
@@ -3663,9 +3635,9 @@ impl ClusterClient {
     ///   don't care to alloc dests), or values are small (< 64 KiB)
     ///   so bulk wouldn't engage anyway. SDK allocates each `Vec<u8>`.
     /// - **`get_many_into`** — when values are ≥ 64 KiB AND you have
-    ///   caller-owned dest buffers (especially `RegisteredMem` for
-    ///   UCX RDMA into pinned memory like sglang pages / torch
-    ///   tensors). True end-to-end zero-copy.
+    ///   caller-owned dest buffers (sglang pages / torch tensors). The
+    ///   value is received into a pool buffer, then copied once into the
+    ///   dest; no decode copy.
     /// Below 64 KiB both APIs do one rkyv decode-copy regardless;
     /// `get_many` saves you the dest-sizing footwork.
     ///
@@ -4951,7 +4923,7 @@ pub struct GcAutoParams {
 //
 // Replaces the server-side multipart upload + multi-fragment ValuePointer
 // + GC active rewrite. Pure client-side striping over the existing
-// MSG_PUT / MSG_GET / MSG_DELETE primitives — no new server RPCs, no
+// MSG_PUT / MSG_GET_BULK / MSG_DELETE primitives — no new server RPCs, no
 // changes to the WAL / memtable / SSTable shape.
 //
 // Layout:
@@ -5392,7 +5364,7 @@ mod first_attempt_timeout_tests {
             assert_eq!(&right[..5], b"right");
             assert_eq!(&left[..4], b"left");
             for server in servers {
-                server.await;
+                server.await.unwrap();
             }
         });
     }
@@ -5439,6 +5411,55 @@ mod first_attempt_timeout_tests {
             Some(Duration::from_secs(10)),
         );
         assert_eq!(c.first_attempt_effective_timeout(0), Some(Duration::from_secs(2)));
+    }
+}
+
+#[cfg(test)]
+mod bulk_read_status_tests {
+    use super::*;
+
+    const HANDLER_STATUSES: [StatusCode; 9] = [
+        StatusCode::Ok,
+        StatusCode::NotFound,
+        StatusCode::InvalidArgument,
+        StatusCode::FailedPrecondition,
+        StatusCode::Internal,
+        StatusCode::Unavailable,
+        StatusCode::AlreadyExists,
+        StatusCode::PermissionDenied,
+        StatusCode::NamespaceUnknown,
+    ];
+
+    /// A PS read handler reports failure as a `StatusCode`; `MSG_GET_BULK`
+    /// carries it as a `CODE_*` byte that this crate decodes with
+    /// `code_to_error`. The spaces agree only up to 3, so a raw cast made the
+    /// GC-pin `Unavailable` (5) arrive as `CODE_VALUE_TOO_LARGE` — a terminal
+    /// "value too large" for a read that one retry would have served.
+    #[test]
+    fn a_handler_status_decodes_to_the_same_meaning_on_a_bulk_read() {
+        for status in HANDLER_STATUSES {
+            let code = partition_rpc::code_for_status(status);
+            let decoded = code_to_error(code, String::new());
+            assert!(
+                !matches!(decoded, AutumnError::ValueTooLarge { .. } | AutumnError::Fenced(_)),
+                "{status:?} decoded as {decoded:?}"
+            );
+            assert_eq!(code == partition_rpc::CODE_OK, status == StatusCode::Ok);
+            assert_eq!(
+                matches!(decoded, AutumnError::NotFound),
+                status == StatusCode::NotFound,
+                "{status:?} -> {decoded:?}"
+            );
+            assert_eq!(
+                matches!(decoded, AutumnError::PreconditionFailed(_)),
+                status == StatusCode::FailedPrecondition,
+                "{status:?} -> {decoded:?}"
+            );
+        }
+        assert_eq!(
+            partition_rpc::code_for_status(StatusCode::Unavailable),
+            partition_rpc::CODE_UNAVAILABLE
+        );
     }
 }
 

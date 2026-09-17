@@ -1,0 +1,97 @@
+{
+  "environment": {
+    "host": "H200-1",
+    "container": "dongmao-autumn",
+    "kernel": "6.1.0-31-amd64",
+    "rust": "1.95.0",
+    "ucx": "1.16.0",
+    "baseline": "633a483",
+    "crosshost": "Unavailable: user confirmed H200-2 offline"
+  },
+  "tests": {
+    "test-final-libs.log": [
+      "test result: ok. 52 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s",
+      "test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 57 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+      "test result: ok. 371 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s",
+      "test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.71s",
+      "test result: ok. 242 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 14.82s",
+      "test result: ok. 63 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.32s",
+      "test result: ok. 193 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.64s",
+      "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "test-stream.log": [
+      "test result: ok. 193 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.09s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s",
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s",
+      "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.50s",
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s",
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.32s",
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.75s",
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s",
+      "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.14s",
+      "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.39s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s",
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.48s",
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.86s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ],
+    "test-zerocopy-tcp.log": [
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s"
+    ],
+    "test-prepared-wide-tcp.log": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s"
+    ],
+    "test-prepared-wide-ucx.log": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s"
+    ],
+    "test-fuse-integration.log": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 3.12s",
+      "test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 3 filtered out; finished in 1.85s"
+    ],
+    "test-fuse-integration2.log": [
+      "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 43.37s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 3.13s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 14.45s"
+    ],
+    "test-python-fs.log": [
+      "PY M2 single-instance surface OK",
+      "PY M2 CROSS-INSTANCE byte-exact OK"
+    ],
+    "test-multipart-python.log": [
+      "MULTIPART_PYTHON_BYTE_EXACT_OK"
+    ],
+    "test-final-transport2.log": [
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s",
+      "test result: ok. 7 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.61s",
+      "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s"
+    ]
+  },
+  "checks": {
+    "workspace_ucx_all_targets": "passed",
+    "python_ucx_wheel": "built, installed in isolated venv and behavior tested",
+    "strict_clippy": "failed; same baseline errors reproduced",
+    "workspace_fmt": "failed; baseline 19383 lines of pre-existing format differences",
+    "non_strict_clippy": "completed; no warnings in new zerocopy or benchmark files",
+    "locked_workspace_ucx_all_targets": "passed"
+  },
+  "limitations": [
+    "No cross-host environment",
+    "No full independent kernel-thread CPU or alloc/copy/SQ/CQ counters",
+    "Mixed write stages change WAL/SST state",
+    "Static UCX 64KiB depth8 residual ~4.5% regression not resolved",
+    "Two-partition Python correctness only, not controlled scalability A/B",
+    "Managed/multishot and scheduler experiments not integrated into production"
+  ],
+  "fixture_fix": "UCX registered cancellation test must init_with(Ucx) so regpool registers its slabs",
+  "test_processes": "Test clusters stopped. Dated work directories, build caches and synthetic data removed on 2026-09-14 at user request.",
+  "multishot_error": "receive experiment failed: buffer ring has no available buffer\nError: Os { code: 104, kind: ConnectionReset, message: \"Connection reset by peer\" }\n",
+  "multipart_python": "[{\"size\": 4096, \"depth\": 1, \"seconds\": 9.399141513044015, \"operations\": 8}, {\"size\": 4096, \"depth\": 8, \"seconds\": 9.399190960917622, \"operations\": 64}, {\"size\": 65536, \"depth\": 1, \"seconds\": 9.39888220303692, \"operations\": 8}, {\"size\": 65536, \"depth\": 8, \"seconds\": 9.412407490191981, \"operations\": 64}, {\"size\": 1048576, \"depth\": 1, \"seconds\": 9.402208404848352, \"operations\": 8}, {\"size\": 1048576, \"depth\": 8, \"seconds\": 9.580626968061551, \"operations\": 64}, {\"size\": 8388608, \"depth\": 1, \"seconds\": 9.503517438890412, \"operations\": 8}, {\"size\": 8388608, \"depth\": 8, \"seconds\": 10.965364823117852, \"operations\": 64}]\nMULTIPART_PYTHON_BYTE_EXACT_OK\n",
+  "evidence_archive": "/data08/autumn-perf-evidence/20260914-compio-baselines-and-logs.tar.gz",
+  "cleanup_record": "cleanup.json"
+}

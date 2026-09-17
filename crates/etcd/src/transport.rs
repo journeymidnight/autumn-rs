@@ -44,7 +44,7 @@ impl GrpcChannel {
         let tcp = compio::net::TcpStream::connect(sock_addr).await?;
         tcp.set_nodelay(true)?;
 
-        let stream = HyperStream::new(tcp);
+        let stream = HyperStream::new_plain(tcp);
 
         let (sender, conn) = http2::handshake::<
             CompioExecutor,
@@ -219,7 +219,7 @@ pub async fn open_streaming_call(
 
     let tcp = compio::net::TcpStream::connect(sock_addr).await?;
     tcp.set_nodelay(true)?;
-    let stream = HyperStream::new(tcp);
+    let stream = HyperStream::new_plain(tcp);
 
     let (mut sender, conn) = http2::handshake::<
         CompioExecutor,

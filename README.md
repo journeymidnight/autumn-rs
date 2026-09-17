@@ -77,7 +77,7 @@ self-healing extents.
 
 ## Quick start
 
-Prerequisites: Linux ≥ 5.15 (io_uring), Rust toolchain, `etcd` ≥ 3.5 in PATH
+Prerequisites: Linux ≥ 5.15 (io_uring), Rust ≥ 1.95, `etcd` ≥ 3.5 in PATH
 (`libfuse3-dev` only if you build the FUSE client).
 
 ```bash

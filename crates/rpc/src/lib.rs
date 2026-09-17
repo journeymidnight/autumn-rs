@@ -29,7 +29,7 @@ pub use autumn_transport::{regpool_acquire, PooledBuf};
 /// `ValueBuf` docs): staging into a pool slab only pays off on a UCX runtime.
 pub use autumn_transport::runtime_transport_is_ucx;
 pub use error::{Result, RpcError, StatusCode};
-pub use frame::{Frame, FrameDecoder, HEADER_LEN};
+pub use frame::{Frame, FrameDecoder, ReadWindow, HEADER_LEN};
 
 /// Handler result type for RPC dispatch.
 pub type HandlerResult = std::result::Result<bytes::Bytes, (StatusCode, String)>;
@@ -101,8 +101,8 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 ///   window. This tree is NOT post-R3: the client runs its compatibility
 ///   check once at connect and keeps nothing, so no call site can gate on
 ///   the negotiated version.
-pub const WIRE_VERSION_MIN: u32 = 40;
-pub const WIRE_VERSION_MAX: u32 = 40;
+pub const WIRE_VERSION_MIN: u32 = 41;
+pub const WIRE_VERSION_MAX: u32 = 41;
 
 
 /// Peer wire-compat check: accept iff the version intervals overlap.

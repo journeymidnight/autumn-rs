@@ -717,8 +717,8 @@ const FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
 
 /// (PS write-recv bulk, W1): minimum `MSG_PUT_BULK` value size for which the
-/// ps-conn recvs the value straight into a registered `PooledBuf` (UCX RDMA, no
-/// off-wire copy) instead of letting the `FrameDecoder` accumulate it. Below
+/// ps-conn recvs the value straight into a `PooledBuf` (one UCX Stream unpack
+/// or TCP kernel copy) instead of letting the `FrameDecoder` accumulate it. Below
 /// this the per-op recv-into-registered overhead (regpool_acquire + memh +
 /// staged recv) exceeds the copy saved — same size-asymmetry as the read path's
 /// `BULK_MIN_BYTES`. Consulted on BOTH transports: UCX recvs into a
@@ -1159,7 +1159,7 @@ pub(crate) struct PartitionData {
     /// before calling `multi_modify_split` so a split that would push
     /// the PS past its core budget is rejected rather than oversubscribing.
     pub(crate) partition_budget: std::sync::Arc<crate::PartitionBudget>,
-    /// (MED-2): per-extent reader-pin map. `handle_get → resolve_value`
+    /// (MED-2): per-extent reader-pin map. `handle_get_bulk → resolve_value`
     /// reads a ValuePointer from an SST, drops the partition borrow, and
     /// awaits `read_bytes_from_extent` on log_stream. Without coordination,
     /// `run_gc` could relocate the last live value off an extent and call
@@ -2307,8 +2307,8 @@ pub struct PartitionRequest {
     payload: Bytes,
     resp_tx: oneshot::Sender<HandlerResult>,
     /// (PS write-recv bulk, W1): for a LARGE `MSG_PUT_BULK`, the ps-conn
-    /// recvs the value straight into a registered `PooledBuf` (no off-wire
-    /// copy) and carries it here as a `Bytes` aliasing that buffer; `payload`
+    /// recvs the value straight into a `PooledBuf` (its only receive copy)
+    /// and carries it here as a `Bytes` aliasing that buffer; `payload`
     /// then holds only `[meta][key]`. `enqueue_put_bulk` uses this directly
     /// instead of slicing the value out of `payload` (which would require
     /// concatenating it back in — the copy we're avoiding). `None` for every
@@ -4840,8 +4840,8 @@ fn ps_conn_inflight_cap() -> usize {
 pub(crate) static PS_SINGLE_FRAME_RECV_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// (W1) — count of `MSG_PUT_BULK` values recv'd straight into a registered
-/// `PooledBuf` by `drain_bulk_writes` (the PS write-recv zero-copy path). Logged
+/// (W1) — count of `MSG_PUT_BULK` values recv'd straight into a
+/// `PooledBuf` by `drain_bulk_writes` (the PS bulk write-recv path). Logged
 /// once on first engage so operators / e2e can confirm the path is live.
 pub(crate) static PS_BULK_WRITE_RECV_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
@@ -4863,60 +4863,52 @@ pub(crate) fn ps_conn_test_lock() -> parking_lot::MutexGuard<'static, ()> {
 }
 
 /// outcome of one persistent read future iteration.  The future
-/// owns both the reader and the buffer across iterations so it can be left
-/// pinned in the event loop's `select` without ever being dropped
+/// owns both the reader and the decoder's read window across iterations so it
+/// can be left pinned in the event loop's `select` without ever being dropped
 /// mid-flight (an in-flight io_uring SQE would otherwise be cancelled,
 /// forcing the kernel to resubmit on the next poll; earlier ps-conn
 /// iterations measured this as a perf regression).
 enum PsReadBurst {
+    /// Bytes arrived; the window holds them for `FrameDecoder::finish_read`.
     Data {
-        buf: Vec<u8>,
-        n: usize,
+        window: autumn_rpc::ReadWindow,
         reader: autumn_transport::ReadHalf,
     },
-    Eof {
-        #[allow(dead_code)]
-        reader: autumn_transport::ReadHalf,
-        #[allow(dead_code)]
-        buf: Vec<u8>,
-    },
-    Err {
-        e: std::io::Error,
-        #[allow(dead_code)]
-        reader: autumn_transport::ReadHalf,
-        #[allow(dead_code)]
-        buf: Vec<u8>,
-    },
+    Eof,
+    Err { e: std::io::Error },
 }
 
 /// Build a `'static`-lifetime `LocalBoxFuture<PsReadBurst>` that reads once
-/// into `buf` and returns ownership of both reader and buf.
+/// into `window` and returns ownership of both reader and window.
 fn spawn_ps_read(
     mut reader: autumn_transport::ReadHalf,
-    buf: Vec<u8>,
+    window: autumn_rpc::ReadWindow,
 ) -> futures::future::LocalBoxFuture<'static, PsReadBurst> {
     use compio::io::AsyncRead;
     use futures::FutureExt;
     async move {
-        let BufResult(result, buf_back) = reader.read(buf).await;
+        let BufResult(result, window) = reader.read(window).await;
         match result {
-            Ok(0) => PsReadBurst::Eof {
-                reader,
-                buf: buf_back,
-            },
-            Ok(n) => PsReadBurst::Data {
-                buf: buf_back,
-                n,
-                reader,
-            },
-            Err(e) => PsReadBurst::Err {
-                e,
-                reader,
-                buf: buf_back,
-            },
+            Ok(0) => PsReadBurst::Eof,
+            Ok(_) => PsReadBurst::Data { window, reader },
+            Err(e) => PsReadBurst::Err { e },
         }
     }
     .boxed_local()
+}
+
+/// Next receive window for a ps-conn. A bulk write at the front keeps the
+/// fixed window: `drain_bulk_writes` receives its value into a pooled buffer,
+/// and only the prologue plus a bounded prefix should land in the decoder. Any
+/// other incomplete frame receives the rest of itself in place.
+fn ps_read_window(decoder: &mut FrameDecoder, fixed: usize) -> autumn_rpc::ReadWindow {
+    let len = match decoder.peek_header() {
+        Some((_, MSG_PUT_BULK | partition_rpc::MSG_BATCH_PUT_BULK, _, _)) | None => fixed,
+        Some(_) => decoder
+            .front_frame_remaining()
+            .map_or(fixed, |rest| rest.max(fixed)),
+    };
+    decoder.read_window(len)
 }
 
 /// R4 — push a completed response `(head, values)` into `tx_bufs`. `head`
@@ -5142,10 +5134,10 @@ fn misroute_frame(req_id: u32, msg_type: u8, part_id: u64, owner_part: u64) -> B
     Frame::error(req_id, msg_type, err_payload).encode()
 }
 
-/// (Option B) — serve a GET / GET_ZC LOCALLY in the ps-conn task (no req_tx
-/// hop / partition_loop detour). Returns `(head, vec![value])` for MSG_GET_BULK
-/// (value-separable: value aliases the RegPool buffer, emitted as its own iovec)
-/// or `(frame, vec![])` for MSG_GET. `handle_get` borrows the partition only across
+/// (Option B) — serve a point or batched GET LOCALLY in the ps-conn task (no
+/// req_tx hop / partition_loop detour). Returns the bulk head plus the values,
+/// each aliasing its resolved read and emitted as its own iovec. The handlers
+/// borrow the partition only across
 /// synchronous code (drops it before the `resolve_value` await), so on the
 /// single-threaded P-log runtime concurrent reads never overlap a borrow with
 /// each other or with `partition_loop`'s `borrow_mut` writes.
@@ -5160,21 +5152,10 @@ async fn serve_get_local(
         // N values, each its own iovec — served here rather than through
         // partition_loop so a batched read never queues behind group commit.
         crate::rpc_handlers::handle_batch_get_bulk(req_id, payload, part).await
-    } else if msg_type == MSG_GET_BULK {
-        // handle_get_bulk never errors (status rides in the meta code).
+    } else {
+        // MSG_GET_BULK. Never errors: the status rides in the ctrl code.
         let (head, value) = crate::rpc_handlers::handle_get_bulk(req_id, payload, part).await;
         (head, vec![value])
-    } else {
-        let frame = match crate::rpc_handlers::handle_get(payload, part).await {
-            Ok(p) => Frame::response(req_id, msg_type, p),
-            Err((code, message)) => Frame::error(
-                req_id,
-                msg_type,
-                autumn_rpc::RpcError::encode_status(code, &message),
-            ),
-        }
-        .encode();
-        (frame, Vec::new())
     };
     // LAT-1: GET latency (inline serve incl. VP resolve).
     part.borrow()
@@ -5538,10 +5519,7 @@ fn push_one_frame_to_inflight(
     // partition_loop detour) — reads need a consistent PartitionData snapshot,
     // not the single-writer group-commit actor. part == None is unit-test mode →
     // fall through to the delegate.
-    if matches!(
-        msg_type,
-        MSG_GET | MSG_GET_BULK | partition_rpc::MSG_BATCH_GET_BULK
-    ) {
+    if matches!(msg_type, MSG_GET_BULK | partition_rpc::MSG_BATCH_GET_BULK) {
         if let Some(part) = part {
             let part_c = part.clone();
             let mut response =
@@ -5641,7 +5619,8 @@ async fn push_frames_to_inflight(
 /// **Per-conn reply batching.** The inner loop mirrors the
 /// ExtentNode R4 4.2 v3 pattern (commit `1e7e456`):
 ///   - Persistent read future (`Option<LocalBoxFuture<PsReadBurst>>`) owns
-///     reader + 64 KiB buf across iterations, never dropped mid-flight.
+///     reader + the decoder's read window (64 KiB, or the rest of a large
+///     non-bulk frame) across iterations, never dropped mid-flight.
 ///   - `FuturesUnordered<LocalBoxFuture<Bytes>>` holds in-flight
 ///     PartitionRequest → oneshot-response → encoded-frame futures.
 ///   - Each loop iteration opportunistically drains ready completions into
@@ -5665,7 +5644,7 @@ async fn handle_ps_connection(
     conn: autumn_transport::Conn,
     req_tx: mpsc::Sender<PartitionRequest>,
     // (Option B): this task serves GET reads locally (in its own FU)
-    // when `Some` — `handle_get` only needs read access to PartitionData (it
+    // when `Some` — `handle_get_bulk` only needs read access to PartitionData (it
     // pulls the StreamClient from `part.stream_client` internally). Writes
     // still delegate to `partition_loop` via `req_tx`. `None` is the
     // mock-loop unit-test mode (those tests drive only writes), where GET
@@ -5700,10 +5679,9 @@ async fn handle_ps_connection(
         FuturesUnordered::new();
     let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(64);
 
-    // Persistent read future: owns reader + buf across iterations.
-    let buf = vec![0u8; READ_BUF_SIZE];
+    // Persistent read future: owns reader + read window across iterations.
     let mut read_fut: Option<LocalBoxFuture<'static, PsReadBurst>> =
-        Some(spawn_ps_read(reader, buf));
+        Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
 
     loop {
         // (A) Opportunistic drain of already-ready completions.
@@ -5736,13 +5714,13 @@ async fn handle_ps_connection(
                 .take()
                 .expect("read_fut invariant: always Some when idle");
             match rfut.await {
-                PsReadBurst::Eof { .. } => return Ok(()),
-                PsReadBurst::Err { e, .. } => return Err(e.into()),
-                PsReadBurst::Data { buf, n, mut reader } => {
-                    decoder.feed(&buf[..n]);
+                PsReadBurst::Eof => return Ok(()),
+                PsReadBurst::Err { e } => return Err(e.into()),
+                PsReadBurst::Data { window, mut reader } => {
+                    decoder.finish_read(window);
 
                     // recv any LARGE bulk-write tail(s) at the
-                    // front straight into a PooledBuf (UCX registered RDMA / TCP
+                    // front straight into a PooledBuf (UCX Stream unpack / TCP
                     // compio owned read — no FrameDecoder accumulation copy)
                     // before the normal decode buffers them. May push write
                     // replies onto the same bounded in-flight queue.
@@ -5813,7 +5791,7 @@ async fn handle_ps_connection(
                         &mut principal,
                     )
                     .await?;
-                    read_fut = Some(spawn_ps_read(reader, buf));
+                    read_fut = Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
                 }
             }
             continue;
@@ -5861,7 +5839,7 @@ async fn handle_ps_connection(
                 // internal state persists regardless of the wrapper's
                 // lifetime. Remaining completions are drained at loop top.
                 match read_result {
-                    PsReadBurst::Eof { .. } => {
+                    PsReadBurst::Eof => {
                         // Drain remaining inflight so clients get their
                         // final replies before we return.
                         while let Some(done) = inflight.next().await {
@@ -5879,9 +5857,9 @@ async fn handle_ps_connection(
                         }
                         return Ok(());
                     }
-                    PsReadBurst::Err { e, .. } => return Err(e.into()),
-                    PsReadBurst::Data { buf, n, mut reader } => {
-                        decoder.feed(&buf[..n]);
+                    PsReadBurst::Err { e } => return Err(e.into()),
+                    PsReadBurst::Data { window, mut reader } => {
+                        decoder.finish_read(window);
                         // recv large bulk-write tails into
                         // pooled buffers first (UCX registered / TCP owned read).
                         drain_bulk_writes(
@@ -5908,7 +5886,7 @@ async fn handle_ps_connection(
                             &mut principal,
                         )
                         .await?;
-                        read_fut = Some(spawn_ps_read(reader, buf));
+                        read_fut = Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
                     }
                 }
             }
@@ -7388,7 +7366,7 @@ async fn handle_incoming_req(
     // enqueue helpers can perform the same TiKV-style region epoch
     // check the read handlers do. `0` from the client = "skip check"
     // (bootstrap / tests / legacy callers). Reads already perform this
-    // inside their respective handlers (`handle_get` / `handle_head`
+    // inside their respective handlers (`handle_get_bulk` / `handle_head`
     // / `handle_range` in `rpc_handlers.rs`).
     let (part_region_epoch, part_id_for_err) = {
         let p = part.borrow();
@@ -8141,8 +8119,8 @@ fn enqueue_put_bulk(
         let _ = req.resp_tx.send(Err(err));
         return;
     }
-    // W1: a LARGE value was recv'd straight into a registered PooledBuf
-    // by the ps-conn (bulk_value = a Bytes aliasing it, no off-wire copy); use it
+    // W1: a LARGE value was recv'd straight into a PooledBuf by the ps-conn
+    // (bulk_value = a Bytes aliasing it, no further copy); use it
     // directly. Otherwise (small / TCP) slice the value out of `payload` as
     // before. `payload` holds only `[meta][key]` in the bulk_value case.
     let value = match req.bulk_value {
@@ -9989,10 +9967,8 @@ pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> 
 /// panic killed the loop silently (e.g. heartbeats stop → manager evicts with
 /// no log on the PS side explaining why).
 ///
-/// NOTE on layered `catch_unwind`: `compio::runtime::spawn` already wraps
-/// the future in `AssertUnwindSafe(future).catch_unwind()` internally
-/// (compio-runtime-0.11.0/src/runtime/mod.rs:202); `JoinHandle<T> =
-/// Task<Result<T, Box<dyn Any + Send>>>`. That's exactly what made the
+/// NOTE on layered `catch_unwind`: compio 0.19's executor captures task
+/// panics as `JoinError::Panicked`. That's exactly what makes the
 /// silent-death possible: compio catches the panic, then
 /// `.detach()` drops the captured `Err`. The inner `catch_unwind` here is
 /// for OBSERVABILITY + RESTART decisioning (read the Result to log + sleep
@@ -12414,7 +12390,7 @@ mod partition_listener_tests {
                     // Simulated merged_loop: echo every Put while req_rx is open.
                     let loop_handle = compio::runtime::spawn(async move {
                         while let Some(req) = req_rx.next().await {
-                            // Accept both MSG_PUT and MSG_GET; echo on Put.
+                            // Echo Puts; refuse everything else.
                             if req.msg_type == MSG_PUT {
                                 let put: PutReq =
                                     partition_rpc::rkyv_decode(&req.payload).expect("decode put");
@@ -14402,16 +14378,13 @@ mod authz_enforcement_tests {
                 .await;
             });
             // Mock partition loop: any ADMITTED request gets a canned OK
-            // (GetResp for reads, PutResp for writes). A denied request never
-            // reaches here — the authz gate short-circuits it on the conn task.
+            // (opaque bytes for reads, PutResp for writes). A denied request
+            // never reaches here — the authz gate short-circuits it on the conn
+            // task. Only the verdict (error frame or not) is asserted.
             let loop_h = compio::runtime::spawn(async move {
                 while let Some(req) = req_rx.next().await {
-                    let bytes = if req.msg_type == MSG_GET {
-                        partition_rpc::rkyv_encode(&GetResp {
-                            code: CODE_OK,
-                            message: String::new(),
-                            value: b"ok".to_vec(),
-                        })
+                    let bytes = if req.msg_type == MSG_GET_BULK {
+                        Bytes::from_static(b"ok")
                     } else {
                         let put: PutReq = partition_rpc::rkyv_decode(&req.payload).unwrap();
                         partition_rpc::rkyv_encode(&PutResp {
@@ -14436,7 +14409,7 @@ mod authz_enforcement_tests {
             let resp: AuthHelloResp = partition_rpc::rkyv_decode(&f.payload).unwrap();
             assert_eq!(resp.code, StatusCode::Ok as u8, "{}", resp.message);
 
-            // (2) GET acme/mem/doc → authorized → delegates → GetResp OK.
+            // (2) GET acme/mem/doc → authorized → delegates → OK.
             let g = partition_rpc::rkyv_encode(&GetReq {
                 part_id: 7,
                 key: b"acme/mem/doc".to_vec(),
@@ -14444,7 +14417,7 @@ mod authz_enforcement_tests {
                 length: 0,
                 region_epoch: 0,
             });
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_GET, g).await;
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_GET_BULK, g).await;
             assert!(!f.is_error(), "authorized GET should pass");
 
             // (3) GET other/mem/doc → cross-tenant → DENIED at the gate.
@@ -14455,7 +14428,7 @@ mod authz_enforcement_tests {
                 length: 0,
                 region_epoch: 0,
             });
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 3, MSG_GET, g2).await;
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 3, MSG_GET_BULK, g2).await;
             assert!(f.is_error(), "cross-tenant GET must be denied");
             let (code, _msg) = autumn_rpc::RpcError::decode_status(&f.payload);
             assert_eq!(code, StatusCode::PermissionDenied);
@@ -14498,7 +14471,7 @@ mod authz_enforcement_tests {
                 length: 0,
                 region_epoch: 0,
             });
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 6, MSG_GET, g3).await;
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 6, MSG_GET_BULK, g3).await;
             assert!(!f.is_error(), "same-tenant different-namespace should pass under the acme/ grant");
 
             drop(wr);
@@ -14532,11 +14505,7 @@ mod authz_enforcement_tests {
             let loop_h = compio::runtime::spawn(async move {
                 // Should never be reached for the protected GET.
                 while let Some(req) = req_rx.next().await {
-                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&GetResp {
-                        code: CODE_OK,
-                        message: String::new(),
-                        value: vec![],
-                    })));
+                    let _ = req.resp_tx.send(Ok(Bytes::new()));
                 }
             });
             let (mut rd, mut wr) = client.into_split();
@@ -14549,7 +14518,7 @@ mod authz_enforcement_tests {
                 length: 0,
                 region_epoch: 0,
             });
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_GET, g).await;
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_GET_BULK, g).await;
             assert!(f.is_error(), "anonymous protected GET must be denied");
             let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
             assert_eq!(code, StatusCode::PermissionDenied);

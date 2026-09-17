@@ -225,3 +225,33 @@ autumn-client --manager 127.0.0.1:9001 get mykey
 # Inspect cluster (op plane = autumn-op)
 autumn-op --manager 127.0.0.1:9001 info
 ```
+
+## Runtime upgrade and experiments
+
+Build with Rust >=1.95 and compio 0.19.2; the Docker builder matches this minimum.
+autumn-ps --tcp-zerocopy-min-bytes N enables only prepared replica TCP sends at
+that complete-frame size. Default 0 leaves ordinary sends active. UCX is unchanged.
+Measure on the deployment kernel/link before choosing a threshold. The optional
+AUTUMN_PERF_PIDS JSON file maps process names to PIDs for core_path: CPU snapshots
+are taken after warmup and after draining timed requests, around the same byte
+window. These are process counters, not independent kernel-worker accounting.
+
+
+## Controlled runtime performance validation
+
+The controlled_path bench runs a fixed operation count on 64 keys per partition,
+with 1 or 4 runtime threads pinned to CPUs 40 onward. Prefixes match the uniform
+hex presplit grid under bench/controlled. Load/warmup verifies bytes before timing.
+READY/go and DONE/go barriers let an external controller start/stop counters while
+workers retain their runtime and buffers. PR_GET_DUMPABLE markers carry only trace
+metadata and make no process-state changes. Panics fail the trial; the external
+controller enforces a deadline and retains failure diagnostics.
+
+perf/controlled_validation/run.py recreates RF3 on three NVMe directories for each
+trial. Counter snapshots for benchmark/server roles bracket the request window;
+the slower all-process snapshot is background audit only. Host perf uses disabled
+counters with acknowledged enable/disable. BPF separately counts kernel threads,
+softirqs, per-ring SQE/CQE, allocations and selected TCP copy call sites. These
+metrics overlap: never add softirq time to process time or double-count io-wq
+threads. Diagnose throughput with untraced runs; trace repetitions quantify probe
+overhead. matrix.py rotates version order across repetitions and stops on failure.

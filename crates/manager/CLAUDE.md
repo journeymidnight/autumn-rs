@@ -1419,3 +1419,9 @@ extents / nodes / partitions / ps_nodes / regions / part_addrs), per-disk online
 rendered string into an `Arc<RwLock<String>>` served by the shared
 `autumn_common::metrics_http` listener thread. A follower's counts are replay-stale —
 scrape `autumn_manager_leader` to pick the authoritative instance.
+
+## Runtime dependency
+
+Compio 0.19.2 and cyper-axum 0.9 are upgraded together so management HTTP and
+RPC tasks share one runtime family. Rust >=1.95 is required. The etcd h2c adapter
+uses cyper-core 0.9; manager scheduling and protocol/storage formats are unchanged.
