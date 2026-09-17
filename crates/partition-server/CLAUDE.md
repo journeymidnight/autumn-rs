@@ -2127,3 +2127,17 @@ JoinHandle now reports JoinError::Panicked/Cancelled and still cancels on drop.
 Supervised/fail-stop tasks keep their inner catch_unwind for error reporting and
 restart/exit policy. Receive concurrency, backpressure and runtime scheduling
 settings remain unchanged. The binary can opt into prepared-replica TCP zerocopy.
+
+## Retiring partition connections on reload
+
+The per-partition accept loop shares its shutdown receiver with each accepted
+connection. Closing PartitionHandle ends both the listener and its existing
+connection tasks, releasing their req_tx and PartitionData references. This is
+required on merge/reload: a connection left alive would keep serving the old
+frozen partition even after the manager published a new epoch. Client pools
+now retain healthy connections after status refusals, so teardown must be
+owned by the retiring partition rather than happen accidentally via client
+reconnection. The shared shutdown future is polled first when both it and the
+connection are ready. Normal request processing adds no per-request RPC.
+Manager's system_status_connection_reuse covers the merge/reopen window while
+an SDK client keeps its pre-merge connection and routing cache.

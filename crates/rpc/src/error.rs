@@ -60,6 +60,11 @@ pub enum RpcError {
     #[error("request cancelled")]
     Cancelled,
 
+    /// A local deadline expired without receiving a response. This is not a
+    /// peer's `Unavailable` status: pools must reconnect after this failure.
+    #[error("RPC timed out after {0:?}")]
+    Timeout(std::time::Duration),
+
     #[error("frame error: {0}")]
     Frame(#[from] crate::frame::FrameError),
 
@@ -68,6 +73,20 @@ pub enum RpcError {
 }
 
 impl RpcError {
+    /// Whether a pool should discard the connection used by this request.
+    /// A decoded status (including Unavailable) does not break the transport.
+    /// The local submit-queue refusal also uses Status and leaves it usable.
+    pub fn is_connection_error(&self) -> bool {
+        match self {
+            Self::Status { .. } => false,
+            Self::ConnectionClosed
+            | Self::Cancelled
+            | Self::Timeout(_)
+            | Self::Frame(_)
+            | Self::Io(_) => true,
+        }
+    }
+
     pub fn status(code: StatusCode, message: impl Into<String>) -> Self {
         Self::Status {
             code,

@@ -434,3 +434,16 @@ carried in a successful response body.
 Compio 0.19.2 is inherited from the workspace and requires Rust >=1.95. The
 standalone Python manifest/lockfile must resolve the same compio family. Client
 I/O strategy, pooled receive ownership and caller timeouts remain unchanged.
+
+## Connection reuse after refusals
+
+PS plain, bulk-write, multi-value and pooled-read paths classify RpcError before
+mapping it to AutumnError. Status errors retain the cached connection; transport
+failures and local timeouts evict it. Routing refresh and retry remain separate:
+a stale epoch still refreshes the region map and rebuilds the request with the
+new epoch. The SDK's manager connection uses the same classification.
+Identity changes and token renewal still clear PS connections so AUTH_HELLO
+binds the new identity/token. Keeping a status-refused connection is not a
+substitute for this authentication lifecycle.
+Tests in src/connection_tests.rs count TCP accepts and verify retry epochs;
+manager's system_status_connection_reuse exercises actual split and merge.

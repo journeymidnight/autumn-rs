@@ -6517,16 +6517,19 @@ async fn partition_thread_main(
         // each ps-conn task gets a clone of the shared authz runtime.
         let authz_for_accept = authz.clone();
         spawn_failstop(format!("accept[part {part_id}]"), async move {
-            let mut shutdown_rx = shutdown_rx;
+            // Every accepted connection belongs to this partition instance.
+            // On reload it must close too: otherwise its req_tx/part clones
+            // keep the retired, frozen partition serving stale responses.
+            let shutdown = shutdown_rx.shared();
             use futures::future::{select, Either};
             loop {
                 // Race accept against shutdown. `shutdown_rx.await`
                 // resolves when the main thread drops its sender.
                 let accept_fut = listener.accept();
                 futures::pin_mut!(accept_fut);
-                let res = match select(accept_fut, &mut shutdown_rx).await {
-                    Either::Left((r, _pending_shutdown)) => r,
-                    Either::Right((_canceled_shutdown, _pending_accept)) => {
+                let res = match select(shutdown.clone(), accept_fut).await {
+                    Either::Right((r, _pending_shutdown)) => r,
+                    Either::Left((_canceled_shutdown, _pending_accept)) => {
                         tracing::info!(part_id, "accept: shutdown signaled, exiting");
                         break;
                     }
@@ -6539,15 +6542,18 @@ async fn partition_thread_main(
                         let req_tx_conn = req_tx_for_accept.clone();
                         let part_conn = part_for_accept.clone();
                         let authz_conn = authz_for_accept.clone();
+                        let connection_shutdown = shutdown.clone();
                         compio::runtime::spawn(async move {
-                            if let Err(e) = handle_ps_connection(
+                            let serving = handle_ps_connection(
                                 conn,
                                 req_tx_conn,
                                 Some(part_conn),
                                 part_id,
                                 authz_conn,
-                            )
-                            .await
+                            );
+                            futures::pin_mut!(serving);
+                            if let Either::Right((Err(e), _)) =
+                                select(connection_shutdown, serving).await
                             {
                                 tracing::debug!(part_id, peer = %peer, error = %e, "ps connection ended");
                             }

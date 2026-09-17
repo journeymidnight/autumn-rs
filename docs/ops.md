@@ -3463,3 +3463,33 @@ The regression test is `cargo test -p autumn-rpc --test client_teardown --
 --test-threads=1`: it drives timeouts against a peer that never reads, then
 asserts the request buffers are freed, no ESTABLISHED socket outlives its client,
 and the peer sees EOF.
+
+## Verifying connection reuse after status refusals
+
+A server status error is a completed RPC: FailedPrecondition (stale epoch),
+NotFound, Unavailable and other status codes must not cause a TCP reconnect.
+Routing retries still refresh the region map. Local deadlines, EOF, bad frames
+and I/O failures must evict. Identity changes/token renewal still reconnect to
+bind the new token. A partition reload closes the retired instance's existing
+connections on the server, so they cannot keep serving a frozen old instance.
+
+Run on Linux with Rust 1.95+:
+
+    cargo test -p autumn-client -p autumn-stream -p autumn-manager --lib connection_tests
+    cargo test -p autumn-manager --test system_status_connection_reuse -- --nocapture
+    cargo test -p autumn-rpc --test client_teardown
+    cargo test -p autumn-stream --test conn_pool_pin
+
+The split/merge test starts a real manager, two extent nodes and a PS, then
+counts transparent TCP proxy accepts against the surviving partition after
+each topology change. Each phase sends six stale-epoch refusals interleaved
+with six successful reads: expect one TCP connection per phase. It also checks
+that a client with cached pre-change routing refreshes and writes successfully,
+and that both partitions' values survive the merge. A merge's brief body-level
+write refusal is polled for readiness; its retry policy is unchanged here.
+
+For ablation, temporarily make RpcError::is_connection_error return true for
+Status: the same phases report seven accepts each and the reuse assertions
+fail. Restore the classification afterwards. Removing the PS connection's
+shared shutdown wait independently strands the post-merge writer on the old
+frozen instance; the bounded merge-readiness assertion fails.

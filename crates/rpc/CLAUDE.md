@@ -200,8 +200,8 @@ Calls: `call`, `call_vectored` (vectored ctrl, zero-copy parts),
   the connection. This is the ONLY teardown there is. `read_loop` is the half
   that always outlives a detached client: it blocks in `read` until EOF, so it
   holds an evicted connection open even when that connection is IDLE and
-  healthy — the common case, since a server status error (stale region epoch)
-  and a token renewal each evict one with nothing in flight. `writer_task`
+  healthy — token renewal can evict one with nothing in flight. Before the
+  refusal-classification fix, server status errors also did so. `writer_task`
   outlives its client alongside the reader whenever frames are queued: it blocks
   in `write_all` on a peer that stopped reading, pinning every queued frame
   behind that stalled write. An idle writer does end by itself, parked on
@@ -414,3 +414,19 @@ IOV_MAX chunking, full CRC and pending-response handling. Ordinary RPC writes
 and UCX sends retain their paths. The threshold counts complete frame bytes.
 A timed-out caller never owns the writer's buffers; send completion alone is
 insufficient to recycle them. The transport awaits the separate release future.
+
+## Connection errors versus request refusals
+
+RpcError::is_connection_error distinguishes connection failure from Status.
+All decoded peer statuses (including Unavailable and Internal) leave a framed
+connection usable. Local deadlines use RpcError::Timeout(Duration), never a
+synthetic Unavailable status, so pools still evict a peer that stops responding.
+The bounded submit queue's local Unavailable refusal also leaves the connection
+usable; callers retain their existing retry/backpressure policy. This changes
+only local error types, not status codes or wire layout.
+
+A malformed bulk prologue follows ordinary frame-decode teardown: close the
+read loop and its pending receivers, yielding ConnectionClosed. It must not
+synthesize an Internal Status for local CRC failure, which would make pools
+retain a broken connection. The stream pool tests cover a corrupt 64 KiB bulk
+response and fail if that synthetic status is restored.

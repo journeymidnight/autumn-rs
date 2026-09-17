@@ -1556,3 +1556,13 @@ CRC, all-replica persistence and ordering remain unchanged. For opt-in TCP
 zerocopy validation, AUTUMN_TEST_ZEROCOPY=1 enables the RPC prepared-frame
 threshold in the prepared_append integration test. AUTUMN_TEST_UCX_BIND still
 selects UCX, which keeps its existing send path even with this option enabled.
+
+## Connection pool refusal handling
+
+ConnPool call/call_timeout/call_vectored/call_into_pooled retain connections
+when RpcError is a Status, including a peer's Unavailable. Local deadlines and
+transport failures still evict. Errors are retained as typed RpcError inside
+anyhow; their Display text is unchanged. Pipelined PinnedRecv ownership and
+submit-time closed checks remain in effect. src/connection_tests.rs verifies
+all call shapes with real status frames, subsequent successes, EOF, bad CRC,
+and local timeouts.

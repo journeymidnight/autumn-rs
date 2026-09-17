@@ -119,16 +119,18 @@ impl ConnPool {
         self.clients.borrow_mut().remove(&addr);
     }
 
-    /// Send an RPC and await the response. On error, evict the client so
-    /// the next call reconnects (matches R2 behavior semantically).
+    /// Send an RPC and await the response. Only transport failures and local
+    /// timeouts evict; a peer status error leaves the connection reusable.
     pub async fn call(&self, addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
         let client = self.get_client(sock).await?;
         match client.call(msg_type, payload).await {
             Ok(bytes) => Ok(bytes),
             Err(e) => {
-                self.evict(sock);
-                Err(anyhow!("{}", e))
+                if e.is_connection_error() {
+                    self.evict(sock);
+                }
+                Err(anyhow::Error::new(e))
             }
         }
     }
@@ -146,8 +148,10 @@ impl ConnPool {
         match client.call_timeout(msg_type, payload, timeout).await {
             Ok(bytes) => Ok(bytes),
             Err(e) => {
-                self.evict(sock);
-                Err(anyhow!("{}", e))
+                if e.is_connection_error() {
+                    self.evict(sock);
+                }
+                Err(anyhow::Error::new(e))
             }
         }
     }
@@ -169,8 +173,10 @@ impl ConnPool {
         match compio::time::timeout(timeout, fut).await {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => {
-                self.evict(sock);
-                Err(anyhow!("{}", e))
+                if e.is_connection_error() {
+                    self.evict(sock);
+                }
+                Err(anyhow::Error::new(e))
             }
             Err(_) => {
                 self.evict(sock);
@@ -191,8 +197,10 @@ impl ConnPool {
         match client.call_vectored(msg_type, payload_parts).await {
             Ok(bytes) => Ok(bytes),
             Err(e) => {
-                self.evict(sock);
-                Err(anyhow!("{}", e))
+                if e.is_connection_error() {
+                    self.evict(sock);
+                }
+                Err(anyhow::Error::new(e))
             }
         }
     }
@@ -308,3 +316,7 @@ pub fn normalize_endpoint(addr: &str) -> String {
         .trim_start_matches("https://")
         .to_string()
 }
+
+#[cfg(test)]
+#[path = "connection_tests.rs"]
+mod connection_tests;

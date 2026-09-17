@@ -519,7 +519,7 @@ impl RpcConn {
         })
     }
 
-    async fn call(&mut self, msg_type: u8, payload: Bytes) -> Result<Bytes> {
+    async fn call(&mut self, msg_type: u8, payload: Bytes) -> autumn_rpc::Result<Bytes> {
         let req_id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
 
@@ -529,15 +529,11 @@ impl RpcConn {
         result?;
 
         loop {
-            match self
-                .decoder
-                .try_decode()
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-            {
+            match self.decoder.try_decode()? {
                 Some(resp) if resp.req_id == req_id => {
                     if resp.is_error() {
                         let (code, message) = autumn_rpc::RpcError::decode_status(&resp.payload);
-                        return Err(anyhow::anyhow!("rpc error ({:?}): {}", code, message));
+                        return Err(autumn_rpc::RpcError::status(code, message));
                     }
                     return Ok(resp.payload);
                 }
@@ -550,7 +546,7 @@ impl RpcConn {
             self.read_buf = buf_back;
             let n = result?;
             if n == 0 {
-                return Err(anyhow::anyhow!("connection closed"));
+                return Err(autumn_rpc::RpcError::ConnectionClosed);
             }
             self.decoder.feed(&self.read_buf[..n]);
         }
@@ -578,11 +574,10 @@ impl ConnPool {
         // SAFETY: single-threaded compio runtime — no concurrent borrow possible.
         let conn_ptr = conn.as_ptr();
         let result = unsafe { &mut *conn_ptr }.call(msg_type, payload).await;
-        if result.is_err() {
-            // Evict broken connection so next call reconnects.
+        if result.as_ref().is_err_and(|e| e.is_connection_error()) {
             self.conns.borrow_mut().remove(&sock);
         }
-        result
+        result.map_err(anyhow::Error::new)
     }
 
     /// bound an RPC at `timeout`. Same connection / eviction
@@ -606,8 +601,10 @@ impl ConnPool {
         match result {
             Ok(Ok(bytes)) => Ok(bytes),
             Ok(Err(e)) => {
-                self.conns.borrow_mut().remove(&sock);
-                Err(e)
+                if e.is_connection_error() {
+                    self.conns.borrow_mut().remove(&sock);
+                }
+                Err(anyhow::Error::new(e))
             }
             Err(_elapsed) => {
                 // Mid-protocol: we sent a request but stopped reading.
@@ -10134,3 +10131,6 @@ mod submitted_gc_policy_tests {
         assert!(!req.gc_policy_is_standing);
     }
 }
+
+#[cfg(test)]
+mod connection_tests;

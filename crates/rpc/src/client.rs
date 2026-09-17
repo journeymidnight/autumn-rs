@@ -369,7 +369,7 @@ impl RpcClient {
         Self::await_response(rx).await
     }
 
-    /// Race `fut` against a timer; a timeout surfaces as `Unavailable`.
+    /// Race `fut` against a timer; keep local deadlines distinct from peer statuses.
     async fn with_timeout<T>(
         fut: impl std::future::Future<Output = Result<T, RpcError>>,
         timeout: Duration,
@@ -378,10 +378,7 @@ impl RpcClient {
         futures::pin_mut!(fut, timer_fut);
         match futures::future::select(fut, timer_fut).await {
             futures::future::Either::Left((result, _)) => result,
-            futures::future::Either::Right(_) => Err(RpcError::Status {
-                code: crate::error::StatusCode::Unavailable,
-                message: format!("RPC timed out after {:?}", timeout),
-            }),
+            futures::future::Either::Right(_) => Err(RpcError::Timeout(timeout)),
         }
     }
 
@@ -849,17 +846,11 @@ async fn read_loop(
                     Ok(Some(p)) => p,
                     Ok(None) => break, // need more bytes
                     Err(e) => {
-                        // Corrupt/malformed prologue: fail the caller + the
-                        // connection (stream position is unrecoverable).
-                        let msg = e.to_string();
-                        if let Some(Pending::IntoPooled(tx)) =
-                            pending.borrow_mut().remove(&req_id)
-                        {
-                            let _ = tx.send(Err(RpcError::status(
-                                crate::error::StatusCode::Internal,
-                                msg.clone(),
-                            )));
-                        }
+                        // Corrupt/malformed prologue: stream position is lost.
+                        // Let read-loop teardown close every pending receiver,
+                        // just like ordinary frame decode failure. Synthesizing
+                        // an Internal status would mislabel it as a peer refusal
+                        // and tell pools to retain the broken connection.
                         return Err(e.into());
                     }
                 };

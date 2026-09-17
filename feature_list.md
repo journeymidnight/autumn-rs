@@ -72,25 +72,6 @@
 > 版本变更要求哪些内嵌客户端重建）算 autumn 的后果，该记；下游自己的缺陷、进展和上线
 > 状态不算，记在它们各自的仓库里。
 
-### F-EVICT-ON-STATUS-ERROR — 服务端一个状态错误就丢掉一条健康连接
-- **Trigger** (2026-09-16，排查 RpcClient 超时资源生命周期时发现): `ps_call_with_timeout`
-  (`crates/client/src/lib.rs`) 对任何 `RpcError` 都执行 `ps_conns.remove(ps_addr)`，其中
-  包含服务端正常返回的帧级状态错误——PS 的 `admit_region_range` 在 region epoch 陈旧时
-  回的 `FailedPrecondition`（`crates/partition-server/src/lib.rs`），以及误路由的
-  `NotFound`。连接本身是健康的：对端在正常应答。于是每次 split/merge 之后，每个
-  client × 分区监听地址都会丢掉一条可用连接并重连；token 续期的 `ps_conns.clear()`
-  是同类动作。连接泄漏本身已由 RpcClient 的 drop 关闭（tasks 取消 + socket 关闭），
-  剩下的代价是无谓的重连：TCP 握手、authz AUTH_HELLO 往返，以及拓扑变更窗口里
-  本可复用的连接被反复重建。
-- **Scope**: 区分「传输失败」与「服务端应答了一个业务/路由错误」两类错误，只有前者才
-  淘汰连接。`rpc_status_to_error` 已经保留了类型化错误，判据应当来自它而不是字符串。
-  同时检查 `ConnPool::call`/`call_timeout`（`crates/stream/src/conn_pool.rs`）和
-  manager 的 `conns.remove` 是否有同样的分类缺失。不得把重连当成掩盖手段。
-- **Acceptance**: 单元测试覆盖「服务端回状态错误后连接仍留在池中且可继续用」与
-  「传输错误仍然淘汰连接」两侧；split/merge 系统测试中统计 PS 连接建立次数，变更后
-  显著下降；陈旧 epoch 的刷新重试语义保持不变（refresh + retry 仍然发生）。
-- `passes: false`
-
 ### F-DISK-FAULT-CLASSIFIER — 瞬时错误被判成永久磁盘故障,而代价已经变成整盘搬迁
 - **Trigger** (2026-09-10, fable 评审在 F-DISK-FAULTED-REBUILD 里指出): 分类器
   `mark_disk_error_for_extent`(`extent_node.rs`)把**任何**非 ENOSPC/EDQUOT 的错误

@@ -371,7 +371,7 @@ fn rpc_status_to_error(e: RpcError) -> AutumnError {
                 AutumnError::ServerError(message)
             }
         },
-        // Non-status RpcError (ConnectionClosed / Cancelled / Frame / Io) is a
+        // Non-status RpcError (including a local timeout) is a
         // transport failure → ConnectionError so the loops refresh + retry.
         other => AutumnError::ConnectionError(other.to_string()),
     }
@@ -1005,7 +1005,8 @@ impl ClusterClient {
         Ok(client)
     }
 
-    /// Call the current manager. On error, drop connection (auto-reconnect next time).
+    /// Call the current manager. Transport errors and local deadlines reconnect;
+    /// a peer status refusal leaves the connection usable.
     ///
     /// Honors `rpc_timeout` (default `DEFAULT_RPC_TIMEOUT`). A timeout
     /// surfaces as a transport error; `mgr_call_retry`'s
@@ -1043,8 +1044,9 @@ impl ClusterClient {
         match outcome {
             Ok(resp) => Ok(resp),
             Err(e) => {
-                // Drop connection so next call reconnects
-                *self.mgr_conn.borrow_mut() = None;
+                if e.is_connection_error() {
+                    *self.mgr_conn.borrow_mut() = None;
+                }
                 Err(anyhow!("{e}"))
             }
         }
@@ -1893,7 +1895,8 @@ impl ClusterClient {
         Ok(client)
     }
 
-    /// Call a PS. On error, drop connection (auto-reconnect next time).
+    /// Call a PS. Transport errors and local timeouts evict the connection;
+    /// peer status errors leave it pooled while routing/retry handles the refusal.
     ///
     /// Honors `rpc_timeout` (default `DEFAULT_RPC_TIMEOUT`); see the
     /// field docstring for the partition-handle-drop hang this guards
@@ -1933,18 +1936,21 @@ impl ClusterClient {
             None => call.await,
             Some(t) => match compio::time::timeout(t, call).await {
                 Ok(r) => r,
-                Err(_) => Err(autumn_rpc::RpcError::Status {
-                    code: autumn_rpc::StatusCode::Unavailable,
-                    message: format!("MSG_BATCH_PUT_BULK timed out after {t:?}"),
-                }),
+                Err(_) => Err(RpcError::Timeout(t)),
             },
         };
         match outcome {
             Ok(resp) => Ok(resp),
             Err(e) => {
-                self.ps_conns.borrow_mut().remove(ps_addr);
+                self.evict_ps_on_error(ps_addr, &e);
                 Err(anyhow::Error::new(rpc_status_to_error(e)))
             }
+        }
+    }
+
+    fn evict_ps_on_error(&self, ps_addr: &str, error: &RpcError) {
+        if error.is_connection_error() {
+            self.ps_conns.borrow_mut().remove(ps_addr);
         }
     }
 
@@ -1963,8 +1969,7 @@ impl ClusterClient {
         match outcome {
             Ok(resp) => Ok(resp),
             Err(e) => {
-                // Drop connection so next call reconnects
-                self.ps_conns.borrow_mut().remove(ps_addr);
+                self.evict_ps_on_error(ps_addr, &e);
                 // preserve the typed error inside anyhow (downcastable)
                 // instead of stringifying, so the routing-retry loops can tell
                 // a deterministic precondition from a transient routing miss.
@@ -2335,10 +2340,7 @@ impl ClusterClient {
                         None => call.await,
                         Some(t) => match compio::time::timeout(t, call).await {
                             Ok(r) => r,
-                            Err(_) => Err(autumn_rpc::RpcError::status(
-                                StatusCode::Unavailable,
-                                format!("bulk batch read timed out after {t:?}"),
-                            )),
+                            Err(_) => Err(RpcError::Timeout(t)),
                         },
                     };
                     match outcome {
@@ -2363,7 +2365,7 @@ impl ClusterClient {
                             _ => return Ok(z),
                         },
                         Err(e) => {
-                            self.ps_conns.borrow_mut().remove(&ps_addr);
+                            self.evict_ps_on_error(&ps_addr, &e);
                             // Same rule as `call_ps_for_part`: a deterministic
                             // failure (authz, malformed, misroute-to-nothing)
                             // must not burn MAX_PS_REFRESHES of backoff before
@@ -2683,10 +2685,7 @@ impl ClusterClient {
                         None => call.await,
                         Some(t) => match compio::time::timeout(t, call).await {
                             Ok(r) => r,
-                            Err(_) => Err(autumn_rpc::RpcError::Status {
-                                code: autumn_rpc::StatusCode::Unavailable,
-                                message: format!("MSG_PUT_BULK timed out after {t:?}"),
-                            }),
+                            Err(_) => Err(RpcError::Timeout(t)),
                         },
                     };
                     match bulk_outcome {
@@ -2711,7 +2710,7 @@ impl ClusterClient {
                             }
                         }
                         Err(e) => {
-                            self.ps_conns.borrow_mut().remove(&ps_addr);
+                            self.evict_ps_on_error(&ps_addr, &e);
                             last_err = Some(e.to_string());
                         }
                     }
@@ -3455,10 +3454,7 @@ impl ClusterClient {
                         None => call.await,
                         Some(t) => match compio::time::timeout(t, call).await {
                             Ok(r) => r,
-                            Err(_) => Err(autumn_rpc::RpcError::status(
-                                StatusCode::Unavailable,
-                                format!("MSG_GET_BULK timed out after {t:?}"),
-                            )),
+                            Err(_) => Err(RpcError::Timeout(t)),
                         },
                     };
                     match outcome {
@@ -3473,6 +3469,7 @@ impl ClusterClient {
                             other => last_err = Some(code_to_error(other, z.message).to_string()),
                         },
                         Err(e) => {
+                            self.evict_ps_on_error(&ps_addr, &e);
                             // Frame-level error or transport failure. (An authz
                             // denial now decodes properly — it used to be
                             // misparsed as a bulk meta by the IntoDest path.)
@@ -3492,9 +3489,6 @@ impl ClusterClient {
                                     last_err = Some(m);
                                 }
                                 other => {
-                                    // Drop the conn so the next attempt
-                                    // reconnects.
-                                    self.ps_conns.borrow_mut().remove(&ps_addr);
                                     last_err = Some(other.to_string());
                                 }
                             }
@@ -6102,3 +6096,6 @@ mod ec_shard_plan_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod connection_tests;

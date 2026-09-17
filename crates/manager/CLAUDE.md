@@ -1425,3 +1425,11 @@ scrape `autumn_manager_leader` to pick the authoritative instance.
 Compio 0.19.2 and cyper-axum 0.9 are upgraded together so management HTTP and
 RPC tasks share one runtime family. Rust >=1.95 is required. The etcd h2c adapter
 uses cyper-core 0.9; manager scheduling and protocol/storage formats are unchanged.
+
+## Outbound connection lifetime
+
+The manager's RpcConn preserves RpcError through frame decoding. ConnPool
+keeps a connection after a peer status response, and evicts after I/O, frame,
+closed-connection or timeout failures. A timed-out RpcConn remains unusable
+because its sequential protocol was interrupted. src/connection_tests.rs
+counts actual accepts and checks both ordinary and timed calls.
