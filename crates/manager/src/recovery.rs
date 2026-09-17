@@ -295,25 +295,68 @@ impl AutumnManager {
         released
     }
 
-    /// Re-send EVERY pinned Recovery marker, once per tick.
-    ///
-    /// The marker IS the work list. Previously the re-send was reachable only
-    /// through the per-slot scan below, so it fired only while that slot still
-    /// looked like it needed recovery — which makes the "standing instruction"
-    /// stop standing the moment the slot stops qualifying.
-    ///
-    /// Concretely: fence a node, recovery is dispatched and pins a marker, the
-    /// target restarts (losing its in-memory in-flight set, so nothing is
-    /// running), then the operator clears the fence. Now no slot is eligible, so
-    /// nothing re-sends; the target is Online, so nothing releases. The marker
-    /// pins that extent forever — and a pinned marker refuses EC dispatch,
-    /// `force-ec-convert`, and every PS-layer op on the extent (punch, truncate,
-    /// split, alloc), so its GC is blocked silently and indefinitely. The escape
-    /// was to re-fence, or to fence-and-remove a healthy node.
-    ///
-    /// Driving the re-send from the marker list makes the marker's life depend
-    /// on the marker alone: it is re-sent until it completes or its executor
-    /// stops being able to run it.
+    /// Release work whose source slot is healthy again (for example after
+    /// unfence). This is a state predicate, never a wall-clock expiry. Disk
+    /// faults, dark slots and corruption still require the pinned recovery.
+    pub(crate) async fn release_recovery_markers_for_healthy_slots(&self) -> Vec<u64> {
+        let ids: Vec<u64> = self.inflight.borrow().keys().copied().collect();
+        let mut released = Vec::new();
+        for extent_id in ids {
+            let Some(task) = self.extent_inflight_payload_recovery(extent_id) else {
+                continue;
+            };
+            let healthy = {
+                let s = self.store.inner.borrow();
+                s.extents.get(&extent_id).is_some_and(|ex| {
+                    let copies = Self::extent_nodes(ex);
+                    let Some(slot) = copies.iter().position(|n| *n == task.replace_id) else {
+                        return false;
+                    };
+                    let disk_id = if slot < ex.replicates.len() {
+                        ex.replicate_disks.get(slot)
+                    } else {
+                        ex.parity_disks.get(slot - ex.replicates.len())
+                    };
+                    s.nodes.contains_key(&task.replace_id)
+                        && self
+                            .node_states
+                            .borrow()
+                            .state_of(task.replace_id)
+                            .is_online()
+                        && !self.node_overrides.borrow().contains_key(&task.replace_id)
+                        && (ex.avali & (1u32 << slot)) != 0
+                        && !self.slot_is_corrupt(extent_id, slot)
+                        && disk_id.is_some_and(|id| {
+                            !self.faulted_disks.borrow().contains(id)
+                                && s.disks.get(id).is_some_and(|d| d.online)
+                        })
+                })
+            };
+            if healthy {
+                match self
+                    .drain_extent_inflight_marker(extent_id, "source slot is healthy again")
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            extent_id,
+                            replace_id = task.replace_id,
+                            target = task.node_id,
+                            "released recovery marker: source slot is healthy again"
+                        );
+                        released.push(extent_id);
+                    }
+                    Err(error) => {
+                        tracing::warn!(extent_id, %error, "failed to release obsolete recovery marker")
+                    }
+                }
+            }
+        }
+        released
+    }
+
+    /// Re-send needed work from its pinned assignment until it completes,
+    /// its executor disappears, or its source slot no longer needs rebuilding.
     async fn resend_pinned_recovery_markers(&self) {
         let pinned: Vec<u64> = self
             .inflight
@@ -346,7 +389,10 @@ impl AutumnManager {
     ///
     /// Always `Ok`: a re-send is a keep-alive, not an attempt whose failure
     /// should feed the (extent, slot) backoff.
-    async fn redispatch_pinned_recovery(&self, extent_id: u64) -> Result<DispatchOutcome, AppError> {
+    async fn redispatch_pinned_recovery(
+        &self,
+        extent_id: u64,
+    ) -> Result<DispatchOutcome, AppError> {
         let Some(task) = self.extent_inflight_payload_recovery(extent_id) else {
             // Raced with a release — the next tick re-derives from scratch.
             return Ok(DispatchOutcome::Dispatched);
@@ -355,12 +401,7 @@ impl AutumnManager {
         // Online — a keep-alive to a corpse costs the whole dispatch tick, once
         // per pinned marker. Releasing such a marker is event-driven (the node
         // going offline/fenced/removed), not this path's job.
-        if !self
-            .node_states
-            .borrow()
-            .state_of(task.node_id)
-            .is_online()
-        {
+        if !self.node_states.borrow().state_of(task.node_id).is_online() {
             return Ok(DispatchOutcome::Dispatched);
         }
         let addr = {
@@ -405,13 +446,13 @@ impl AutumnManager {
                      be re-sent every tick and holds a rate-limiter slot)",
                     r.message
                 ),
-                Err(e) => tracing::debug!(extent_id, "recovery re-dispatch decode: {e}"),
+                Err(e) => tracing::warn!(
+                    extent_id,
+                    node_id,
+                    "recovery re-dispatch decode: {e} (marker retained)"
+                ),
             },
-            Err(e) => tracing::debug!(
-                extent_id,
-                node_id,
-                "recovery re-dispatch unreachable: {e}"
-            ),
+            Err(e) => tracing::warn!(extent_id, node_id, "recovery re-dispatch unreachable: {e}"),
         }
         Ok(DispatchOutcome::Dispatched)
     }
@@ -617,7 +658,10 @@ impl AutumnManager {
                 Ok(v) => v,
                 Err(_) => {
                     if let Err(e) = self
-                        .drain_extent_inflight_marker(extent.extent_id, "the dispatch response was undecodable")
+                        .drain_extent_inflight_marker(
+                            extent.extent_id,
+                            "the dispatch response was undecodable",
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -639,7 +683,10 @@ impl AutumnManager {
                 // recovery_inflight conflict). Release marker
                 // and try next candidate.
                 if let Err(e) = self
-                    .drain_extent_inflight_marker(extent.extent_id, "the target refused the rebuild")
+                    .drain_extent_inflight_marker(
+                        extent.extent_id,
+                        "the target refused the rebuild",
+                    )
                     .await
                 {
                     tracing::warn!(
@@ -1004,7 +1051,8 @@ impl AutumnManager {
             // attempts to repair this slot. Legacy `recoveryTasks/<id>`
             // delete dropped (the backward-compat dual-key path lived in
             // only).
-            self.release_recovery_marker_best_effort(task.extent_id).await;
+            self.release_recovery_marker_best_effort(task.extent_id)
+                .await;
             let reason = format!(
                 "recovery target {} for extent {} already in extent node list at a different slot; \
                  likely EC conversion completed during recovery — discarding stale apply",
@@ -1024,8 +1072,12 @@ impl AutumnManager {
         // the stale-marker sweep (~10 min), blocking any other op on the extent
         // for that window. Release now, then return.
         if layout_changed.is_none() {
-            self.release_recovery_marker_best_effort(task.extent_id).await;
-            let reason = format!("replace_id {} not in extent {}", task.replace_id, task.extent_id);
+            self.release_recovery_marker_best_effort(task.extent_id)
+                .await;
+            let reason = format!(
+                "replace_id {} not in extent {}",
+                task.replace_id, task.extent_id
+            );
             self.abandon_recovery_entry(task.extent_id, reason.clone());
             return Err(AppError::Precondition(reason));
         }
@@ -1096,7 +1148,8 @@ impl AutumnManager {
             };
             // Release Recovery (etcd + in-memory). The legacy-key delete
             // entry was removed.
-            self.release_recovery_marker_best_effort(task.extent_id).await;
+            self.release_recovery_marker_best_effort(task.extent_id)
+                .await;
             // Then enqueue Delete (best effort — extent_delete_loop will
             // pick it up on next tick).
             if let Some(addr) = maybe_addr {
@@ -1143,7 +1196,10 @@ impl AutumnManager {
         // corrupt mark that scheduled this rebuild has been satisfied. Clearing
         // it also stops the slot from being force-dispatched every tick.
         if let Some(slot) = Self::extent_slot(&updated_extent, task.node_id) {
-            if let Err(e) = self.clear_corrupt_slot(updated_extent.extent_id, slot).await {
+            if let Err(e) = self
+                .clear_corrupt_slot(updated_extent.extent_id, slot)
+                .await
+            {
                 tracing::warn!(
                     extent_id = updated_extent.extent_id,
                     slot,
@@ -1183,6 +1239,16 @@ impl AutumnManager {
         self.record_dispatch_outcome(extent_id, slot, now_s, &res);
     }
 
+    pub(crate) fn reseed_recovery_limiter(&self) {
+        let mut lim = self.recovery_limiter.borrow_mut();
+        lim.reset_counts();
+        for rec in self.inflight.borrow().values() {
+            if let Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) = rec.unpack() {
+                lim.seed_inflight(t.replace_id, t.node_id);
+            }
+        }
+    }
+
     pub(crate) async fn recovery_dispatch_loop(self) {
         loop {
             compio::time::sleep(Duration::from_secs(2)).await;
@@ -1212,6 +1278,7 @@ impl AutumnManager {
             let now_s = Self::epoch_seconds();
 
             self.release_recovery_markers_for_dead_executors().await;
+            self.release_recovery_markers_for_healthy_slots().await;
             self.resend_pinned_recovery_markers().await;
 
             // reseed the recovery rate limiter from the inflight
@@ -1223,17 +1290,7 @@ impl AutumnManager {
             // Backoff state is preserved (reset_counts leaves it). The
             // per-candidate `try_acquire` in `dispatch_recovery_task` then
             // gates NEW dispatches against the caps on top of this baseline.
-            {
-                let mut lim = self.recovery_limiter.borrow_mut();
-                lim.reset_counts();
-                for rec in self.inflight.borrow().values() {
-                    if let Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) =
-                        rec.unpack()
-                    {
-                        lim.seed_inflight(t.replace_id, t.node_id);
-                    }
-                }
-            }
+            self.reseed_recovery_limiter();
 
             // pre-filter under the store borrow so we DON'T clone
             // extents that the loop body will skip on the next line. The
@@ -1357,7 +1414,9 @@ impl AutumnManager {
                                 )
                                 .await
                             {
-                                if let Ok(r) = rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
+                                if let Ok(r) =
+                                    rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp)
+                                {
                                     if r.code == CODE_OK {
                                         if let Err(e) =
                                             self.mark_extent_available(ex.extent_id, slot).await
@@ -1491,10 +1550,7 @@ impl AutumnManager {
                 }
                 cd.insert(part_id, now_s);
             }
-            let req = autumn_rpc::partition_rpc::RollTailsReq {
-                part_id,
-                entries,
-            };
+            let req = autumn_rpc::partition_rpc::RollTailsReq { part_id, entries };
             let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
             match self
                 .conn_pool
@@ -1632,10 +1688,7 @@ impl AutumnManager {
                 let _ = etcd.put_and_delete_txn(Vec::new(), vec![key]).await;
             }
             self.node_overrides.borrow_mut().remove(&id);
-            tracing::info!(
-                node_id = id,
-                "Maintenance override expired; auto-cleared"
-            );
+            tracing::info!(node_id = id, "Maintenance override expired; auto-cleared");
         }
     }
 }
@@ -1873,7 +1926,9 @@ impl crate::AutumnManager {
                              healing, treating df as failed"
                         );
                         Self::mark_node_disks_offline(&self.store, node);
-                        self.node_states.borrow_mut().on_heartbeat_fail(node.node_id);
+                        self.node_states
+                            .borrow_mut()
+                            .on_heartbeat_fail(node.node_id);
                         cdf_per_node.push((
                             node.node_id,
                             crate::NodeCap {
@@ -2117,8 +2172,9 @@ impl crate::AutumnManager {
                                     }
                                 }
                             }
-                            if let Err(e) =
-                                self.mark_slots_corrupt(updated.extent_id, cleared_mask).await
+                            if let Err(e) = self
+                                .mark_slots_corrupt(updated.extent_id, cleared_mask)
+                                .await
                             {
                                 tracing::warn!(
                                     extent_id = rot.extent_id,
@@ -2144,9 +2200,8 @@ impl crate::AutumnManager {
                                 .position(|s| *s == node.node_id);
                             if let Some(slot) = slot {
                                 if !self.slot_is_corrupt(rot.extent_id, slot) && slot < 32 {
-                                    if let Err(e) = self
-                                        .mark_slots_corrupt(rot.extent_id, 1u32 << slot)
-                                        .await
+                                    if let Err(e) =
+                                        self.mark_slots_corrupt(rot.extent_id, 1u32 << slot).await
                                     {
                                         tracing::warn!(
                                             extent_id = rot.extent_id,
@@ -2211,8 +2266,7 @@ impl crate::AutumnManager {
 
             // (1) Start a fresh cycle when idle AND ≥30 s since the last commit:
             // snapshot the extent id list (one O(N) borrow, just u64 copies).
-            if logical_cycle_ids.is_empty()
-                && now_ms.saturating_sub(logical_committed_ms) >= 30_000
+            if logical_cycle_ids.is_empty() && now_ms.saturating_sub(logical_committed_ms) >= 30_000
             {
                 logical_cycle_ids = self.store.inner.borrow().extents.keys().copied().collect();
                 logical_cursor = 0;
@@ -2480,9 +2534,7 @@ impl crate::AutumnManager {
     /// dedup is structural: ledger keys are unique by construction.
     /// Returns the candidates + the per-tick node-address snapshot that
     /// PHASE 2 resolves target addresses against.
-    fn collect_ec_dispatch_candidates(
-        &self,
-    ) -> (Vec<EcDispatchCandidate>, HashMap<u64, String>) {
+    fn collect_ec_dispatch_candidates(&self) -> (Vec<EcDispatchCandidate>, HashMap<u64, String>) {
         let recovery_inflight_extents: HashSet<u64> = self
             .inflight
             .borrow()
@@ -2673,6 +2725,7 @@ impl crate::AutumnManager {
             dispatch_owner_epoch_for_extent(&st, extent_id)
         };
 
+        let attempt_nonce = self.extent_inflight_nonce(extent_id);
         let payload = rkyv_encode(&ConvertToEcReq {
             extent_id,
             data_shards: data_shards as u32,
@@ -2680,7 +2733,7 @@ impl crate::AutumnManager {
             target_addrs: ec_target_addrs,
             eversion: params.new_eversion,
             owner_epoch: live_owner_epoch,
-            attempt_nonce: self.extent_inflight_nonce(extent_id),
+            attempt_nonce,
         });
 
         // 60 s ceiling so a paged-out / silently dead EN can't wedge the loop;
@@ -2704,6 +2757,16 @@ impl crate::AutumnManager {
         let mut started_new = false;
         let rpc_ok = match result {
             Ok(resp_data) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp_data) {
+                Ok(r) if r.code == autumn_rpc::extent_rpc::CODE_CONTENT_CORRUPT => {
+                    self.release_corrupt_ec_attempt(
+                        extent_id,
+                        attempt_nonce,
+                        params.target_nodes[0],
+                        &r.message,
+                    )
+                    .await;
+                    return;
+                }
                 Ok(r) if r.code == CODE_OK => {
                     // CODE_OK is "accepted", so count the ACCEPT, and read the
                     // message: the coordinator puts its previous attempt's
@@ -2726,13 +2789,7 @@ impl crate::AutumnManager {
                     {
                         let mut ops = self.ops.borrow_mut();
                         let coord = params.target_nodes.first().copied().unwrap_or(0);
-                        ops.note_ec_dispatch(
-                            extent_id,
-                            coord,
-                            marker_still_held,
-                            now_s,
-                            now_ms,
-                        );
+                        ops.note_ec_dispatch(extent_id, coord, marker_still_held, now_s, now_ms);
                         if let Some(why) = r.message.split_once("failed: ").map(|(_, w)| w) {
                             // ONE closing paren — the one this message's own
                             // wrapper added. `trim_end_matches` repeats, and the
@@ -2845,7 +2902,44 @@ impl crate::AutumnManager {
         // `finalize_ec_dispatch_after_convert`. The marker deliberately stays
         // until then, so this dispatch is a safe idempotent re-send every tick.
         if rpc_ok {
-            tracing::debug!(extent_id, "EC convert accepted by coordinator; awaiting df report");
+            tracing::debug!(
+                extent_id,
+                "EC convert accepted by coordinator; awaiting df report"
+            );
+        }
+    }
+
+    async fn release_corrupt_ec_attempt(
+        &self,
+        extent_id: u64,
+        nonce: u64,
+        coord: u64,
+        message: &str,
+    ) {
+        if self.extent_inflight_nonce(extent_id) != nonce
+            || self.extent_inflight_op(extent_id)
+                != Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        {
+            return;
+        }
+        if self
+            .abandon_ec_marker(extent_id, coord, "content_corrupt")
+            .await
+        {
+            tracing::warn!(
+                extent_id,
+                coord,
+                message,
+                "EC checksum failure: released marker for replica recovery"
+            );
+            let (now_s, _) = Self::now_s_ms();
+            self.ops.borrow_mut().complete_ec(
+                extent_id,
+                OP_STATE_FAILED,
+                "content checksum failed; yielded to recovery".into(),
+                message.into(),
+                now_s,
+            );
         }
     }
 
@@ -2926,14 +3020,33 @@ impl crate::AutumnManager {
         extent_id: u64,
         reason: &str,
     ) -> Result<(), AppError> {
-        let kind = self.extent_inflight_op(extent_id);
+        let Some(record) = self.inflight.borrow().get(&extent_id).cloned() else {
+            return Ok(());
+        };
+        let kind = record.kind();
+        let nonce = self.extent_inflight_nonce(extent_id);
         if let Some(etcd) = &self.etcd {
-            // Use `put_and_delete_txn` (one-element delete list) so the leader
-            // fence applies. A `false` return from the underlying CAS is
-            // impossible here (no extra_cmp); only NotLeader can happen and
-            // bubbles up.
-            etcd.put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(extent_id)])
-                .await?;
+            let key = Self::extent_inflight_key(extent_id);
+            if !etcd
+                .txn_fenced(
+                    vec![autumn_etcd::Cmp::value(
+                        key.as_bytes(),
+                        rkyv_encode(&record),
+                    )],
+                    vec![autumn_etcd::Op::delete(key.as_bytes())],
+                    vec![],
+                )
+                .await?
+            {
+                return Err(AppError::Precondition(
+                    "inflight marker changed during release".into(),
+                ));
+            }
+        }
+        if self.extent_inflight_nonce(extent_id) != nonce {
+            return Err(AppError::Precondition(
+                "inflight attempt changed during release".into(),
+            ));
         }
         self.commit_extent_inflight_release(extent_id);
         // Only after the marker is really gone — a failed drain above returns
@@ -3024,7 +3137,10 @@ impl crate::AutumnManager {
         // the layout does not yet say anyone holds.
         if let Some(etcd) = &self.etcd {
             let puts = vec![
-                (format!("extents/{}", extent_id), rkyv_encode(&updated).to_vec()),
+                (
+                    format!("extents/{}", extent_id),
+                    rkyv_encode(&updated).to_vec(),
+                ),
                 (
                     crate::extent_layout::extent_layout_key(extent_id),
                     vec![PayloadLocation::InShardFile.as_byte()],
@@ -3248,7 +3364,14 @@ mod df_echo_tests {
     fn different_uuid_is_imposter() {
         // Pod-IP reuse: a different process answers at this address.
         assert!(matches!(
-            classify_df_echo("uuid-A", "10.0.0.1:9101", &[9101], "uuid-B", "10.0.0.1:9101", &[9101]),
+            classify_df_echo(
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101],
+                "uuid-B",
+                "10.0.0.1:9101",
+                &[9101]
+            ),
             DfEchoAction::Imposter
         ));
     }
@@ -3554,6 +3677,103 @@ mod ec_abandon_counting_tests {
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../rpc/tests/support/status_peer.rs"]
+mod handoff_peer;
+
+#[cfg(test)]
+mod corrupt_ec_handoff_tests {
+    use super::handoff_peer as peer;
+    use super::*;
+    use crate::extent_inflight::{ExtentOpKind, ExtentOpPayload};
+
+    #[compio::test]
+    async fn corrupt_ec_reply_releases_marker_on_first_failure_and_rejects_late_reply() {
+        let peer = peer::Peer::start(|frame| {
+            peer::Reply::Frame(autumn_rpc::Frame::response(
+                frame.req_id,
+                frame.msg_type,
+                rkyv_encode(&autumn_rpc::extent_rpc::CodeResp {
+                    code: autumn_rpc::extent_rpc::CODE_CONTENT_CORRUPT,
+                    message: "content checksum failure".into(),
+                }),
+            ))
+        })
+        .await;
+        let m = AutumnManager::new();
+        let params = MgrEcDispatchInflight {
+            extent_id: 42,
+            target_nodes: vec![1, 2, 3],
+            data_shards: 2,
+            new_eversion: 2,
+            ..Default::default()
+        };
+        let ex = MgrExtentInfo {
+            extent_id: 42,
+            sealed: true,
+            sealed_length: 4096,
+            replicates: vec![1, 2, 3],
+            avali: 6,
+            eversion: 1,
+            ..Default::default()
+        };
+        m.store.inner.borrow_mut().extents.insert(42, ex.clone());
+        m.extent_corrupt_slots.borrow_mut().insert(42, 1);
+        m.acquire_extent_inflight(42, ExtentOpPayload::ConvertToEc(params.clone()))
+            .await
+            .unwrap();
+        let old_nonce = m.extent_inflight_nonce(42);
+        let recovery = || {
+            ExtentOpPayload::Recovery(RecoveryTask {
+                extent_id: 42,
+                replace_id: 1,
+                node_id: 4,
+                start_time: 0,
+            })
+        };
+        assert!(
+            m.acquire_extent_inflight(42, recovery()).await.is_err(),
+            "EC excludes recovery while live"
+        );
+        m.dispatch_one_ec_conversion(
+            EcDispatchCandidate {
+                ex,
+                stream: MgrStreamInfo {
+                    ec_data_shard: 2,
+                    ec_parity_shard: 1,
+                    ..Default::default()
+                },
+                params: params.clone(),
+            },
+            &[
+                (1, peer.addr.clone()),
+                (2, peer.addr.clone()),
+                (3, peer.addr.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .await;
+        assert_eq!(
+            m.extent_inflight_op(42),
+            None,
+            "first content failure must release, not wait for 24 retries"
+        );
+        m.acquire_extent_inflight(42, recovery()).await.unwrap();
+        m.release_corrupt_ec_attempt(42, old_nonce, 1, "late reply")
+            .await;
+        assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::Recovery));
+        m.commit_extent_inflight_release(42);
+        m.acquire_extent_inflight(42, ExtentOpPayload::ConvertToEc(params))
+            .await
+            .unwrap();
+        m.release_corrupt_ec_attempt(42, old_nonce, 1, "late reply")
+            .await;
+        assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::ConvertToEc));
+    }
+}
+
+#[cfg(test)]
 mod recovery_placement_tests {
     use super::*;
     use crate::placement::NodeLoad;
@@ -3789,7 +4009,13 @@ mod slot_verdict_tests {
     #[test]
     fn a_dead_disk_is_rebuilt_under_the_default_gate() {
         assert_eq!(
-            slot_verdict(RecoveryGateMode::FencedOnly, false, false, true, Some(false)),
+            slot_verdict(
+                RecoveryGateMode::FencedOnly,
+                false,
+                false,
+                true,
+                Some(false)
+            ),
             SlotVerdict::Rebuild
         );
     }
@@ -3809,7 +4035,13 @@ mod slot_verdict_tests {
     #[test]
     fn a_node_that_missed_one_heartbeat_is_not_rebuilt() {
         assert_eq!(
-            slot_verdict(RecoveryGateMode::FencedOnly, false, false, false, Some(false)),
+            slot_verdict(
+                RecoveryGateMode::FencedOnly,
+                false,
+                false,
+                false,
+                Some(false)
+            ),
             SlotVerdict::Withhold,
             "offline-because-unreachable is not evidence about a disk"
         );
@@ -3823,7 +4055,13 @@ mod slot_verdict_tests {
     #[test]
     fn a_full_disk_triggers_nothing() {
         assert_eq!(
-            slot_verdict(RecoveryGateMode::FencedOnly, false, false, false, Some(true)),
+            slot_verdict(
+                RecoveryGateMode::FencedOnly,
+                false,
+                false,
+                false,
+                Some(true)
+            ),
             SlotVerdict::Withhold
         );
         assert_eq!(
@@ -3876,7 +4114,13 @@ mod slot_verdict_tests {
             SlotVerdict::Probe
         );
         assert_eq!(
-            slot_verdict(RecoveryGateMode::FencedOnly, false, false, false, Some(true)),
+            slot_verdict(
+                RecoveryGateMode::FencedOnly,
+                false,
+                false,
+                false,
+                Some(true)
+            ),
             SlotVerdict::Withhold
         );
     }
@@ -3930,10 +4174,7 @@ mod df_disk_health_tests {
     fn a_faulted_disk_survives_a_successful_df() {
         let m = AutumnManager::new();
         let node = node_with_two_disks(&m.store);
-        m.apply_df_disk_health(
-            &node,
-            &[(10, status(true)), (11, status(false))],
-        );
+        m.apply_df_disk_health(&node, &[(10, status(true)), (11, status(false))]);
         let s = m.store.inner.borrow();
         assert!(s.disks[&10].online, "the healthy disk stays online");
         assert!(

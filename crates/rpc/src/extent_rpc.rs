@@ -668,6 +668,9 @@ pub const CODE_EVERSION_MISMATCH: u8 = 6;
 /// refresh its layout from the manager and retry, which converges because the
 /// manager is the authority on where an extent's payload lives.
 pub const CODE_PAYLOAD_NOT_HERE: u8 = 7;
+/// EC source content failed its stored checksum. The failed attempt has ended;
+/// release its marker so replica recovery can repair the source.
+pub const CODE_CONTENT_CORRUPT: u8 = 8;
 
 /// Which file on an extent-node holds an extent's payload.
 ///
@@ -788,6 +791,7 @@ pub fn code_description(code: u8) -> &'static str {
         CODE_EVERSION_MISMATCH => "eversion mismatch (stale client cache)",
         CODE_LOCKED_BY_OTHER => "fenced by a newer owner (stale owner_epoch)",
         CODE_PAYLOAD_NOT_HERE => "payload not in the named file on this node",
+        CODE_CONTENT_CORRUPT => "content checksum failed",
         // Callers MUST print the numeric code alongside this string. Rendering
         // every unnamed code as one generic word collapses distinct refusals
         // into the same useless message — a stale-fence rejection reading as

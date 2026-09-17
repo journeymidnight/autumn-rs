@@ -397,6 +397,7 @@ dependencies = [
  "reed-solomon-erasure",
  "rkyv",
  "tempfile",
+ "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
 ]

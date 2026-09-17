@@ -50,17 +50,21 @@ impl AutumnManager {
     /// sweep and the repeated-failure give-up — go through this txn, so there is
     /// no second way to release one.
     ///
-    /// The delete carries no compare, and what makes that safe is not local: a
-    /// dispatch response can be a minute old, so the tally that decides to
-    /// abandon must not survive a release. Every release funnels through
-    /// `commit_extent_inflight_release`, which clears it. Breaking that coupling
-    /// re-opens abandoning on a stale count.
+    /// Compare the persisted record and recheck the live attempt after the
+    /// await: a delayed reply must never release a successor's marker.
     pub(crate) async fn abandon_ec_marker(
         &self,
         extent_id: u64,
         coord_node_id: u64,
         reason: &str,
     ) -> bool {
+        let Some(record) = self.inflight.borrow().get(&extent_id).cloned() else {
+            return false;
+        };
+        if record.kind() != Some(ExtentOpKind::ConvertToEc) {
+            return false;
+        }
+        let nonce = self.extent_inflight_nonce(extent_id);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -79,15 +83,27 @@ impl AutumnManager {
                 Op::put(key.as_bytes(), &bytes),
                 Op::delete(marker_key.as_bytes()),
             ];
-            if let Err(e) = etcd.txn_fenced(vec![], ops, vec![]).await {
-                tracing::warn!(
-                    extent_id,
-                    reason,
-                    error = %e,
-                    "failed to abandon inflight marker; will retry"
-                );
-                return false;
+            match etcd
+                .txn_fenced(
+                    vec![autumn_etcd::Cmp::value(
+                        marker_key.as_bytes(),
+                        rkyv_encode(&record),
+                    )],
+                    ops,
+                    vec![],
+                )
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return false,
+                Err(e) => {
+                    tracing::warn!(extent_id, reason, error = %e, "failed to abandon inflight marker; will retry");
+                    return false;
+                }
             }
+        }
+        if self.extent_inflight_nonce(extent_id) != nonce {
+            return false;
         }
         self.commit_extent_inflight_release(extent_id);
         true

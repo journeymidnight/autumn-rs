@@ -525,7 +525,7 @@ fn recovery_per_shard() {
 #[test]
 fn a_read_addressed_to_the_wrong_shard_is_refused() {
     use autumn_rpc::shard_for_extent;
-    use autumn_stream::extent_rpc::{ReadBytesReq, ReadBytesResp, PayloadRef, MSG_READ_BYTES};
+    use autumn_stream::extent_rpc::{PayloadRef, ReadBytesReq, ReadBytesResp, MSG_READ_BYTES};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let addrs = spawn_sharded_node(tmp.path(), 3, 2);
@@ -533,55 +533,110 @@ fn a_read_addressed_to_the_wrong_shard_is_refused() {
     let base = format!("127.0.0.1:{}", shard_ports[0]);
 
     // An extent the BASE address does NOT own — the case that was failing.
-    let id = (1u64..).find(|&i| shard_for_extent(i, 2) != 0).expect("some id on shard 1");
+    let id = (1u64..)
+        .find(|&i| shard_for_extent(i, 2) != 0)
+        .expect("some id on shard 1");
     let routed = shard_addr_for_extent(&base, &shard_ports, id);
     assert_ne!(routed, base, "the test needs an extent off shard 0");
 
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let pool = ConnPool::new();
-        let r = pool
-            .call(&routed, MSG_ALLOC_EXTENT, rkyv_encode(&AllocExtentReq { extent_id: id }))
-            .await
-            .expect("alloc on the owning shard");
-        let _: AllocExtentResp = rkyv_decode(&r).expect("decode alloc");
-        let payload = b"bytes-that-live-on-shard-one";
-        let r = pool
-            .call(
-                &routed,
-                MSG_APPEND,
-                AppendReq {
-                    extent_id: id,
-                    eversion: 1,
-                    commit: 0,
-                    owner_epoch: 1,
-                    payload: Bytes::copy_from_slice(payload),
-                }
-                .encode(),
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let pool = ConnPool::new();
+            let r = pool
+                .call(
+                    &routed,
+                    MSG_ALLOC_EXTENT,
+                    rkyv_encode(&AllocExtentReq { extent_id: id }),
+                )
+                .await
+                .expect("alloc on the owning shard");
+            let _: AllocExtentResp = rkyv_decode(&r).expect("decode alloc");
+            let payload = b"bytes-that-live-on-shard-one";
+            let r = pool
+                .call(
+                    &routed,
+                    MSG_APPEND,
+                    AppendReq {
+                        extent_id: id,
+                        eversion: 1,
+                        commit: 0,
+                        owner_epoch: 1,
+                        payload: Bytes::copy_from_slice(payload),
+                    }
+                    .encode(),
+                )
+                .await
+                .expect("append on the owning shard");
+            let _ = AppendResp::decode(r).expect("decode append");
+
+            let req = ReadBytesReq::new(id, 1, 0, payload.len() as u64, PayloadRef::in_dat());
+
+            // The routed address serves it.
+            let ok = pool
+                .call(&routed, MSG_READ_BYTES, req.encode())
+                .await
+                .expect("routed read");
+            let ok = ReadBytesResp::decode(ok).expect("decode routed");
+            assert_eq!(ok.code, autumn_stream::extent_rpc::CODE_OK);
+            assert_eq!(
+                &ok.payload[..],
+                &payload[..],
+                "the owning shard served the bytes"
+            );
+
+            // The base address does not. The refusal is an RPC-level error, not a
+            // ReadBytesResp — which is why a mis-routed caller sees a transport
+            // failure and not a short read.
+            let err = pool
+                .call(&base, MSG_READ_BYTES, req.encode())
+                .await
+                .expect_err("a read to the non-owning shard must be REFUSED, not served");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("belongs to shard"),
+                "the refusal must name the owning shard so a mis-routed caller can \
+             be diagnosed; got {msg:?}"
+            );
+            let error = pool
+                .call_into_pooled(
+                    &base,
+                    autumn_stream::extent_rpc::MSG_READ_BYTES_BULK,
+                    req.encode(),
+                    Duration::from_secs(2),
+                )
+                .await
+                .expect_err("bulk must preserve the wrong-shard status");
+            assert!(matches!(error.downcast_ref::<autumn_rpc::RpcError>(),
+            Some(autumn_rpc::RpcError::Status { code: StatusCode::FailedPrecondition, message })
+                if message.contains("belongs to shard")));
+            let error = autumn_stream::read_extent_value_direct(
+                &pool,
+                &base,
+                id,
+                1,
+                0,
+                payload.len() as u64,
             )
             .await
-            .expect("append on the owning shard");
-        let _ = AppendResp::decode(r).expect("decode append");
-
-        let req = ReadBytesReq::new(id, 1, 0, payload.len() as u64, PayloadRef::in_dat());
-
-        // The routed address serves it.
-        let ok = pool.call(&routed, MSG_READ_BYTES, req.encode()).await.expect("routed read");
-        let ok = ReadBytesResp::decode(ok).expect("decode routed");
-        assert_eq!(ok.code, autumn_stream::extent_rpc::CODE_OK);
-        assert_eq!(&ok.payload[..], &payload[..], "the owning shard served the bytes");
-
-        // The base address does not. The refusal is an RPC-level error, not a
-        // ReadBytesResp — which is why a mis-routed caller sees a transport
-        // failure and not a short read.
-        let err = pool
-            .call(&base, MSG_READ_BYTES, req.encode())
+            .expect_err("direct bulk consumer must receive the typed refusal");
+            assert!(matches!(
+                error.downcast_ref::<autumn_rpc::RpcError>(),
+                Some(autumn_rpc::RpcError::Status {
+                    code: StatusCode::FailedPrecondition,
+                    ..
+                })
+            ));
+            let bytes = autumn_stream::read_extent_value_direct(
+                &pool,
+                &routed,
+                id,
+                1,
+                0,
+                payload.len() as u64,
+            )
             .await
-            .expect_err("a read to the non-owning shard must be REFUSED, not served");
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("belongs to shard"),
-            "the refusal must name the owning shard so a mis-routed caller can \
-             be diagnosed; got {msg:?}"
-        );
-    });
+            .expect("routed direct read");
+            assert_eq!(&bytes[..], payload);
+        });
 }

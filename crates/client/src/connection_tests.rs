@@ -23,6 +23,82 @@ fn client(manager: String) -> ClusterClient {
 }
 
 #[compio::test]
+async fn wrong_shard_bulk_refusal_falls_back_to_proxy() {
+    let en_calls = Rc::new(Cell::new(0));
+    let count = en_calls.clone();
+    let en = Peer::start(move |frame| {
+        assert_eq!(
+            frame.msg_type,
+            autumn_stream::extent_rpc::MSG_READ_BYTES_BULK
+        );
+        count.set(count.get() + 1);
+        Reply::Frame(autumn_rpc::Frame::error(
+            frame.req_id,
+            frame.msg_type,
+            autumn_rpc::RpcError::encode_status(
+                StatusCode::FailedPrecondition,
+                "extent belongs to shard 1",
+            ),
+        ))
+    })
+    .await;
+    let en_addr = en.addr.clone();
+    let proxy_calls = Rc::new(Cell::new(0));
+    let count = proxy_calls.clone();
+    let ps = Peer::start(move |frame| {
+        if frame.msg_type == MSG_GET_REDIRECT {
+            Reply::Frame(autumn_rpc::Frame::response(
+                frame.req_id,
+                frame.msg_type,
+                rkyv_encode(&GetRedirectResp {
+                    code: 0,
+                    message: String::new(),
+                    value: vec![],
+                    extent_id: 42,
+                    value_offset: 0,
+                    value_len: 65536,
+                    eversion: 1,
+                    replica_addrs: vec![en_addr.clone()],
+                    ec_data_shards: 0,
+                    ec_sealed_length: 0,
+                }),
+            ))
+        } else {
+            assert_eq!(frame.msg_type, MSG_GET_BULK);
+            count.set(count.get() + 1);
+            Reply::Frame(autumn_rpc::Frame::response_zc(
+                frame.req_id,
+                frame.msg_type,
+                Bytes::from_static(&[0]),
+                Bytes::from(vec![91; 65536]),
+            ))
+        }
+    })
+    .await;
+    let client = client("127.0.0.1:1".into());
+    client.regions.borrow_mut().push((1, region(1)));
+    client.part_addrs.borrow_mut().insert(1, ps.addr.clone());
+    let mut dest = vec![0; 65536];
+    for _ in 0..2 {
+        assert_eq!(
+            client
+                .get_range_direct_into(b"key", 0, 65536, &mut dest)
+                .await
+                .unwrap(),
+            Some(65536)
+        );
+        assert!(dest.iter().all(|v| *v == 91));
+    }
+    assert_eq!(en_calls.get(), 2);
+    assert_eq!(proxy_calls.get(), 2);
+    assert_eq!(
+        en.accepts.get(),
+        1,
+        "routing refusal must retain the healthy EN connection"
+    );
+}
+
+#[compio::test]
 async fn client_status_errors_preserve_connections_and_transport_failures_evict() {
     let peer = Peer::start(respond).await;
     for shape in 0..4 {

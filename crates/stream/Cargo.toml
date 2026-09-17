@@ -13,6 +13,7 @@ reed-solomon-erasure = "6"
 dashmap.workspace = true
 futures = "0.3"
 tracing.workspace = true
+thiserror.workspace = true
 autumn-common = { path = "../common" }
 autumn-rpc = { path = "../rpc" }
 autumn-transport = { path = "../transport" }

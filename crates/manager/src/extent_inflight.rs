@@ -300,7 +300,12 @@ impl AutumnManager {
         &self,
         extent_id: u64,
     ) -> Option<autumn_rpc::manager_rpc::MgrEcDispatchInflight> {
-        match self.inflight.borrow().get(&extent_id).and_then(|r| r.unpack()) {
+        match self
+            .inflight
+            .borrow()
+            .get(&extent_id)
+            .and_then(|r| r.unpack())
+        {
             Some((_, ExtentOpPayload::ConvertToEc(p))) => Some(p),
             _ => None,
         }
@@ -314,7 +319,12 @@ impl AutumnManager {
         &self,
         extent_id: u64,
     ) -> Option<autumn_rpc::manager_rpc::RecoveryTask> {
-        match self.inflight.borrow().get(&extent_id).and_then(|r| r.unpack()) {
+        match self
+            .inflight
+            .borrow()
+            .get(&extent_id)
+            .and_then(|r| r.unpack())
+        {
             Some((_, ExtentOpPayload::Recovery(t))) => Some(t),
             _ => None,
         }
@@ -685,6 +695,9 @@ impl AutumnManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use autumn_rpc::manager_rpc::{
+        MgrDiskInfo, MgrExtentInfo, MgrNodeInfo, MgrNodeOverride, NODE_OVERRIDE_FENCED,
+    };
 
     fn ec_payload(extent_id: u64) -> ExtentOpPayload {
         ExtentOpPayload::ConvertToEc(MgrEcDispatchInflight {
@@ -925,7 +938,11 @@ mod tests {
             assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
 
             let released = m.release_recovery_markers_for_dead_executors().await;
-            assert_eq!(released, vec![20], "a dead executor's marker must be released");
+            assert_eq!(
+                released,
+                vec![20],
+                "a dead executor's marker must be released"
+            );
             assert_eq!(
                 m.extent_inflight_op(20),
                 None,
@@ -968,6 +985,129 @@ mod tests {
             );
             assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
         })
+    }
+
+    #[test]
+    fn recovery_marker_unfence_releases_only_a_healthy_slot() {
+        run(async {
+            let m = AutumnManager::new();
+            m.store.inner.borrow_mut().nodes.insert(
+                1,
+                MgrNodeInfo {
+                    node_id: 1,
+                    address: "127.0.0.1:9101".into(),
+                    disks: vec![10],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: String::new(),
+                },
+            );
+            m.node_states.borrow_mut().on_heartbeat_ok(1);
+            m.store.inner.borrow_mut().disks.insert(
+                10,
+                MgrDiskInfo {
+                    disk_id: 10,
+                    online: true,
+                    uuid: String::new(),
+                },
+            );
+            m.store.inner.borrow_mut().extents.insert(
+                20,
+                MgrExtentInfo {
+                    extent_id: 20,
+                    sealed: true,
+                    replicates: vec![1],
+                    replicate_disks: vec![10],
+                    avali: 1,
+                    ..Default::default()
+                },
+            );
+            for _ in 0..10 {
+                m.node_overrides.borrow_mut().insert(
+                    1,
+                    MgrNodeOverride {
+                        node_id: 1,
+                        kind: NODE_OVERRIDE_FENCED,
+                        ..Default::default()
+                    },
+                );
+                m.acquire_extent_inflight(20, recovery_payload(20))
+                    .await
+                    .unwrap();
+                m.reseed_recovery_limiter();
+                assert_eq!(m.recovery_limiter.borrow().global_inflight, 1);
+                assert!(m
+                    .release_recovery_markers_for_healthy_slots()
+                    .await
+                    .is_empty());
+                m.node_overrides.borrow_mut().remove(&1);
+                assert_eq!(
+                    m.release_recovery_markers_for_healthy_slots().await,
+                    vec![20]
+                );
+                m.reseed_recovery_limiter();
+                let lim = m.recovery_limiter.borrow();
+                assert_eq!(lim.global_inflight, 0);
+                assert_eq!(lim.snapshot(), (vec![], vec![]));
+            }
+            m.acquire_extent_inflight(20, recovery_payload(20))
+                .await
+                .unwrap();
+            m.faulted_disks.borrow_mut().insert(10);
+            assert!(m
+                .release_recovery_markers_for_healthy_slots()
+                .await
+                .is_empty());
+            m.faulted_disks.borrow_mut().clear();
+            m.store
+                .inner
+                .borrow_mut()
+                .disks
+                .get_mut(&10)
+                .unwrap()
+                .online = false;
+            assert!(m
+                .release_recovery_markers_for_healthy_slots()
+                .await
+                .is_empty());
+            m.store
+                .inner
+                .borrow_mut()
+                .disks
+                .get_mut(&10)
+                .unwrap()
+                .online = true;
+            m.extent_corrupt_slots.borrow_mut().insert(20, 1);
+            assert!(m
+                .release_recovery_markers_for_healthy_slots()
+                .await
+                .is_empty());
+            m.extent_corrupt_slots.borrow_mut().clear();
+            m.store
+                .inner
+                .borrow_mut()
+                .extents
+                .get_mut(&20)
+                .unwrap()
+                .avali = 0;
+            assert!(m
+                .release_recovery_markers_for_healthy_slots()
+                .await
+                .is_empty());
+            {
+                let mut s = m.store.inner.borrow_mut();
+                let ex = s.extents.get_mut(&20).unwrap();
+                ex.replicates = vec![2];
+                ex.parity = vec![1];
+                ex.replicate_disks = vec![99];
+                ex.parity_disks = vec![10];
+                ex.avali = 3;
+            }
+            assert_eq!(
+                m.release_recovery_markers_for_healthy_slots().await,
+                vec![20]
+            );
+        });
     }
 
     #[test]

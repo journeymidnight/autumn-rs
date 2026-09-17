@@ -1002,3 +1002,10 @@
   （CAS 生效，消融：改成 last-writer-wins 测试变红）；list 1000+ fragment 的
   scan 延迟有基准数字；与 S3 后端跑同一基准集对比吞吐/P99。
 - **Status**: `passes: false` (2026-09-16) — 定调与范围已确认，未开工。
+
+### F-TYPED-ERRORS — 全项目统一使用 thiserror
+- **Trigger** (2026-09-17，用户): 全项目 error 使用 thiserror；先完成当前四项修复，项目级整理以后做。
+- **Scope**: 分模块梳理字符串、anyhow 和手写 Error；以 thiserror 定义可匹配的错误类型，保留 source，在 RPC/CLI 边界映射，避免业务逻辑解析 Display 文本。
+- **Acceptance**: 各模块错误分类与 source 回归通过；重试、路由刷新和连接淘汰行为保持正确；协议与持久化格式变更另行明确。
+- **notes**: 本轮仅新增自检/EC 错误使用 thiserror，不启动全项目迁移。
+- passes: false

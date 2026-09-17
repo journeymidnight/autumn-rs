@@ -1,4 +1,10 @@
 Date: 2026-09-17
+TaskStatus: not_completed
+Task scope: Disk fault self-check, obsolete recovery markers, EC corruption handoff, bulk refusal propagation.
+Current summary: Implementing in requested order. H200-1 SSH unavailable; preparing Linux Rust 1.95 tests with bounded artifacts.
+Next steps: Fixes, regressions and ablations, integration tests, documentation and commit.
+
+Date: 2026-09-17
 TaskStatus: completed
 Task scope: Keep healthy RPC connections after server status errors (F-EVICT-ON-STATUS-ERROR).
 Current summary: Implementation and feature acceptance passed. RpcError::is_connection_error classifies before AutumnError mapping; local deadlines have their own Timeout variant. SDK plain/bulk/multi-value/pooled reads and manager calls, stream pool, and manager outbound pool retain Status connections. Authentication identity/token renewal still reconnect. Two necessary companions found by real verification: retired PS partition instances now close accepted connections through the shared shutdown signal (otherwise merge leaves old frozen connections alive); malformed large bulk prologues now follow read-loop teardown rather than synthesize Internal Status.

@@ -1,12 +1,12 @@
 use crate::conn_pool::{parse_addr, shard_addr_for_extent};
 use crate::extent_cksum;
-use crate::extent_scrub;
 use crate::extent_rpc::*;
+use crate::extent_scrub;
 use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 /// Convert manager RPC ExtentInfo to local extent_rpc ExtentInfo.
@@ -289,8 +289,49 @@ pub(crate) enum DiskErrorClass {
     /// This process ran out of a resource (descriptors, memory). Nothing is
     /// wrong with the device; leave its health alone.
     Process,
-    /// Anything else: treat the device as broken. `Faulted`.
+    /// Anything else: confirm with a write/fsync probe before setting `Faulted`.
     Media,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum DiskProbeError {
+    #[error("disk write/fsync self-check failed: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("disk write/fsync self-check exceeded {0:?}")]
+    Timeout(Duration),
+}
+
+#[derive(Debug, Clone, thiserror::Error)]
+enum EcConvertError {
+    #[error("{0}")]
+    ContentCorrupt(String),
+    #[error("{code:?}: {message}")]
+    Status { code: StatusCode, message: String },
+}
+
+impl From<(StatusCode, String)> for EcConvertError {
+    fn from((code, message): (StatusCode, String)) -> Self {
+        Self::Status { code, message }
+    }
+}
+
+impl DiskProbeError {
+    fn class(&self) -> DiskErrorClass {
+        match self {
+            Self::Io(error) => match error.raw_os_error() {
+                Some(libc::ENOSPC | libc::EDQUOT) => DiskErrorClass::Capacity,
+                Some(libc::EMFILE | libc::ENFILE | libc::ENOMEM) => DiskErrorClass::Process,
+                _ => DiskErrorClass::Media,
+            },
+            Self::Timeout(_) => DiskErrorClass::Media,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    // One-shot fsync fault: 0 parks forever; a positive errno fails sync.
+    static DISK_PROBE_SYNC_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
 }
 
 struct DiskFS {
@@ -442,8 +483,7 @@ impl DoneQueues {
 /// SAME `--data` dirs, and two different nodes never do — the same reasoning
 /// `shared_disk_health` uses one field over.
 fn shared_done_queues(disks: &[(PathBuf, Option<u64>)]) -> DoneQueues {
-    static Q: std::sync::Mutex<Option<HashMap<String, DoneQueues>>> =
-        std::sync::Mutex::new(None);
+    static Q: std::sync::Mutex<Option<HashMap<String, DoneQueues>>> = std::sync::Mutex::new(None);
     let mut key_parts: Vec<String> = disks
         .iter()
         .map(|(dir, _)| {
@@ -567,6 +607,44 @@ impl DiskFS {
             .is_ok()
     }
 
+    /// Bound the whole probe, including open/unlink/write/file and directory
+    /// fsync. A stuck device must not stall the caller's error handling.
+    async fn probe_write(&self, extent_id: u64) -> Result<(), DiskProbeError> {
+        let deadline = Duration::from_secs(2);
+        compio::time::timeout(deadline, self.probe_write_inner(extent_id))
+            .await
+            .map_err(|_| DiskProbeError::Timeout(deadline))??;
+        Ok(())
+    }
+
+    /// Probe the actual hash directory, not just the disk root. Unlink the
+    /// scratch file before writing; no extent payload is modified.
+    async fn probe_write_inner(&self, extent_id: u64) -> std::io::Result<()> {
+        static NEXT_PROBE: AtomicU64 = AtomicU64::new(0);
+        let dir = self.extent_path(extent_id).parent().unwrap().to_path_buf();
+        let path = dir.join(format!(
+            ".disk-probe-{}-{}",
+            std::process::id(),
+            NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .await?;
+        compio::fs::remove_file(&path).await?;
+        file.write_all_at(vec![0xa5; 4096], 0).await.0?;
+        #[cfg(test)]
+        match DISK_PROBE_SYNC_ERROR.with(|v| v.take()) {
+            Some(0) => futures::future::pending::<()>().await,
+            Some(errno) => return Err(std::io::Error::from_raw_os_error(errno)),
+            None => {}
+        }
+        file.sync_all().await?;
+        CompioFile::open(&dir).await?.sync_all().await?;
+        Ok(())
+    }
+
     /// Low byte of crc32c over extent_id little-endian bytes → hash subdir name.
     fn hash_byte(extent_id: u64) -> u8 {
         (crc32c::crc32c(&extent_id.to_le_bytes()) & 0xFF) as u8
@@ -600,7 +678,7 @@ impl DiskFS {
         self.extent_file_path(extent_id, "ck")
     }
 
-        /// `extent-{id}.shard{i}` — this node's EC shard as an ADDITIVE file, so a
+    /// `extent-{id}.shard{i}` — this node's EC shard as an ADDITIVE file, so a
     /// conversion never has to modify or replace the `.dat` it is derived from.
     /// The index is in the NAME: a shard staged for one index can then never be
     /// served as another, whatever the caller believes.
@@ -624,7 +702,7 @@ impl DiskFS {
         self.extent_file_path(extent_id, "ec.prepared")
     }
 
-        /// unlink the `.dat`, `.meta`, and `.ec.dat` files
+    /// unlink the `.dat`, `.meta`, and `.ec.dat` files
     /// for an extent. Idempotent — `NotFound` errors on any of the
     /// three are downgraded to `Ok(())` so retries from the manager
     /// are safe. Returns Err only on a real I/O failure (permission
@@ -799,7 +877,6 @@ impl DiskFS {
         out.sort_unstable();
         out
     }
-
 }
 
 // ─── ExtentNodeConfig ─────────────────────────────────────────────────────────
@@ -936,7 +1013,7 @@ impl ExtentNodeConfig {
 
     /// See the field docs: reporting is the default; this turns it into a
     /// refusal, which is how the fleet-wide precondition is established.
-        pub fn with_manager_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+    pub fn with_manager_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.manager_endpoint = Some(endpoint.into());
         self
     }
@@ -1287,7 +1364,9 @@ impl ExtentEntry {
     pub(crate) fn note_durable_install(&self, len: u64) {
         self.len.store(len, Ordering::SeqCst);
         self.coalescer.last_synced.fetch_max(len, Ordering::SeqCst);
-        self.coalescer.pending_fsync.fetch_max(len, Ordering::SeqCst);
+        self.coalescer
+            .pending_fsync
+            .fetch_max(len, Ordering::SeqCst);
         // The content underneath just changed, so everything derived from the
         // OLD content is now a lie about the new one. A half-built block
         // description would splice pre-repair blocks onto post-repair ones and
@@ -1673,7 +1752,7 @@ pub struct ExtentNode {
     /// with no error while a conversion failed forever and the extent's GC
     /// stayed blocked behind it. Carrying the reason back on the next accept
     /// costs nothing on the wire — the response already has a message field.
-    ec_last_error: Rc<DashMap<u64, String>>,
+    ec_last_error: Rc<DashMap<u64, (u64, EcConvertError)>>,
     /// Live progress for the extent-scoped ops this node EXECUTES, keyed by
     /// extent_id → `(kind, done, total)`.
     ///
@@ -2011,7 +2090,6 @@ struct DiskChoice {
     last_picked: u64,
 }
 
-
 /// Per-call chunk size for local-disk pread/pwrite. macOS caps a single
 /// pread/pwrite at INT_MAX (~2 GiB) and Linux at 0x7ffff000 — without
 /// chunking, sealed extents > 2 GiB EINVAL on the very first syscall.
@@ -2181,8 +2259,7 @@ impl ExtentNode {
         &self,
         addr: &str,
         parts: Vec<Bytes>,
-    ) -> futures::channel::oneshot::Receiver<Result<crate::conn_pool::PinnedRecv>>
-    {
+    ) -> futures::channel::oneshot::Receiver<Result<crate::conn_pool::PinnedRecv>> {
         let (rx_back_tx, rx_back) = futures::channel::oneshot::channel();
         let job = ChainFwdJob {
             parts,
@@ -2570,8 +2647,9 @@ async fn process_frames_backpressured(
             inflight.push(build_read_future(extent, content_ck, file_rc, slots, false));
         } else if msg_type == MSG_READ_BYTES_BULK {
             // zero-copy read grouping — mirrors MSG_READ_BYTES but every
-            // response (ok + error) is bulk-shaped (`bulk_read_head` + value Bytes)
-            // so the PS's call_into_pooled always parses a bulk_ctrl.
+            // value response is bulk-shaped (`bulk_read_head` + value Bytes)
+            // while handler refusals use typed error frames, which call_into_pooled
+            // also understands before decoding bulk control data.
             let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
                 Ok(r) => r,
                 Err(_) => {
@@ -2615,10 +2693,10 @@ async fn process_frames_backpressured(
             }
             let extent = match node.get_extent(anchor_extent).await {
                 Ok(e) => e,
-                Err((_code, _msg)) => {
+                Err((code, msg)) => {
                     let bytes_list: Vec<Bytes> = slots
                         .iter()
-                        .map(|s| bulk_read_head(s.req_id, CODE_ERROR, "extent unavailable", 0))
+                        .map(|s| err_bytes(s.req_id, MSG_READ_BYTES_BULK, code, &msg))
                         .collect();
                     inflight.push(Box::pin(async move { bytes_list }));
                     continue;
@@ -2637,10 +2715,12 @@ async fn process_frames_backpressured(
             }
             let file_rc = match node.payload_file(&extent, anchor_payload).await {
                 Ok(f) => f,
-                Err(_msg) => {
+                Err(msg) => {
                     let bytes_list: Vec<Bytes> = slots
                         .iter()
-                        .map(|s| bulk_read_head(s.req_id, CODE_ERROR, "extent unavailable", 0))
+                        .map(|s| {
+                            err_bytes(s.req_id, MSG_READ_BYTES_BULK, StatusCode::Internal, &msg)
+                        })
                         .collect();
                     inflight.push(Box::pin(async move { bytes_list }));
                     continue;
@@ -3182,7 +3262,8 @@ async fn append_burst_frames(
         .ensure_fence_durable(fence_extent_id, &extent, first_revision)
         .await
     {
-        node.mark_disk_error_for_extent(fence_extent_id, &e.to_string());
+        node.mark_disk_error_for_extent(fence_extent_id, &e.to_string())
+            .await;
         tracing::error!(
             extent_id = fence_extent_id,
             error = %e,
@@ -3342,7 +3423,7 @@ async fn append_burst_frames(
         let wr = write_vectored_all_at_chunked(f, bufs, file_start).await;
         if let Err(e) = wr {
             let msg = e.to_string();
-            node.mark_disk_error_for_extent(extent_id, &msg);
+            node.mark_disk_error_for_extent(extent_id, &msg).await;
             return req_ids
                 .into_iter()
                 .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
@@ -3364,7 +3445,7 @@ async fn append_burst_frames(
             .store(total_end, Ordering::SeqCst);
         if let Err(e) = f.sync_data().await {
             let msg = e.to_string();
-            node.mark_disk_error_for_extent(extent_id, &msg);
+            node.mark_disk_error_for_extent(extent_id, &msg).await;
             return req_ids
                 .into_iter()
                 .map(|id| err_bytes(id, MSG_APPEND, StatusCode::Internal, &msg))
@@ -3533,14 +3614,11 @@ fn verify_read_content(
 /// Checked BEFORE the sidecar is consulted so a sub-block read — the hot 4 KiB
 /// case — pays nothing. Verifying one of those would mean reading and hashing
 /// its whole 1 MiB block, a 256x amplification the scrub exists to avoid.
-fn read_covers_a_full_block(
-    ck: &extent_cksum::ExtentChecksums,
-    offset: u64,
-    len: u64,
-) -> bool {
+fn read_covers_a_full_block(ck: &extent_cksum::ExtentChecksums, offset: u64, len: u64) -> bool {
     let end = offset.saturating_add(len);
     let first = offset.div_ceil(ck.block_bytes);
-    let (b_start, b_end) = extent_cksum::block_range(first as usize, ck.block_bytes, ck.sealed_length);
+    let (b_start, b_end) =
+        extent_cksum::block_range(first as usize, ck.block_bytes, ck.sealed_length);
     b_start >= offset && b_end <= end && b_end > b_start
 }
 
@@ -3675,8 +3753,7 @@ fn build_read_future(
                         // and regressed batched reads 2-5% (extent_bench d=16/64).
                         // Zero-copy only pays off once the value memcpy dominates
                         // (>= 64 KiB), which is exactly the UCX `bulk` branch above.
-                        if let Some(why) =
-                            verify_read_content(&content_ck, &req, read_offset, &buf)
+                        if let Some(why) = verify_read_content(&content_ck, &req, read_offset, &buf)
                         {
                             out.push(err_bytes(
                                 slot.req_id,
@@ -4020,8 +4097,7 @@ impl ExtentNode {
                 let v = e.value();
                 v.has_dat.load(Ordering::SeqCst)
                     && !v.corrupt_meta.load(Ordering::SeqCst)
-                    && v.payload_location.load(Ordering::SeqCst)
-                        == PayloadLocation::InDat.as_byte()
+                    && v.payload_location.load(Ordering::SeqCst) == PayloadLocation::InDat.as_byte()
             })
             .map(|e| *e.key())
             .filter(|id| self.owns_extent(*id))
@@ -4619,9 +4695,7 @@ impl ExtentNode {
                 .map(|v| *v)
                 .filter(|m| m.nonce != EC_STAGING_SEALED);
             match want.location {
-                PayloadLocation::InDat
-                    if staged.is_some_and(|m| m.tick > staging_tick_at_ask) =>
-                {
+                PayloadLocation::InDat if staged.is_some_and(|m| m.tick > staging_tick_at_ask) => {
                     // The staging arrived after the question went out, so this
                     // answer is not about it. Leaving a shard costs space;
                     // deleting a live one costs the shard. Wait for a verdict
@@ -5080,18 +5154,32 @@ impl ExtentNode {
         DiskErrorClass::Media
     }
 
-    /// Mark the disk hosting an extent after a write/persist error,
-    /// CLASSIFIED (ENOSPC-1): capacity errors (ENOSPC/EDQUOT) set `Full`
-    /// — recoverable, the 2 s sweep clears it when space frees — while
-    /// anything else sets `Faulted` (permanent until restart, the
-    /// historical "offline" semantics). Either way the disk stops
-    /// hosting NEW extents immediately and the failing op itself has
-    /// already been rejected by the caller (fail-closed, note 23/25).
-    pub(crate) fn mark_disk_error_for_extent(&self, extent_id: u64, err_msg: &str) {
-        if let Some(entry) = self.extents.get(&extent_id) {
-            let disk_id = entry.disk_id;
+    /// The original operation still fails. Only a failed, bounded write/fsync
+    /// self-check turns an unclassified I/O error into a permanent disk fault.
+    pub(crate) async fn mark_disk_error_for_extent(&self, extent_id: u64, err_msg: &str) {
+        // Release the DashMap guard before any probe awaits.
+        let disk_id = self.extents.get(&extent_id).map(|entry| entry.disk_id);
+        if let Some(disk_id) = disk_id {
             if let Some(disk) = self.disks.get(&disk_id) {
-                match Self::classify_disk_error(err_msg) {
+                if !disk.online() {
+                    return;
+                }
+                let class = match Self::classify_disk_error(err_msg) {
+                    DiskErrorClass::Media => match disk.probe_write(extent_id).await {
+                        Ok(()) => {
+                            tracing::warn!(extent_id, disk_id, err_msg,
+                                "write failed but disk write/fsync self-check passed; retaining disk health");
+                            return;
+                        }
+                        Err(probe_error) => {
+                            tracing::warn!(extent_id, disk_id, err_msg, error = %probe_error,
+                                "disk write/fsync self-check failed");
+                            probe_error.class()
+                        }
+                    },
+                    class => class,
+                };
+                match class {
                     DiskErrorClass::Capacity => {
                         if disk.health() == DiskHealth::Online {
                             tracing::warn!(
@@ -5123,12 +5211,28 @@ impl ExtentNode {
                             extent_id,
                             disk_id,
                             err_msg,
-                            "marking disk faulted due to I/O error"
+                            "disk fault confirmed by write/fsync self-check"
                         );
                         disk.set_faulted();
                     }
                     DiskErrorClass::Media => {}
                 }
+            }
+        }
+    }
+
+    async fn disk_io_result<T, E: std::fmt::Display>(
+        &self,
+        extent_id: u64,
+        result: std::result::Result<T, E>,
+        context: &str,
+    ) -> Result<T, (StatusCode, String)> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let message = format!("{context} for extent {extent_id}: {error}");
+                self.mark_disk_error_for_extent(extent_id, &message).await;
+                Err((StatusCode::Internal, message))
             }
         }
     }
@@ -5492,7 +5596,7 @@ impl ExtentNode {
                         scrub_probe_backoff: AtomicU64::new(0),
                         scrub_backfill_len: RefCell::new(None),
                         scrub_backfill_blocks: RefCell::new(Vec::new()),
-                        }),
+                    }),
                 );
                 tracing::info!(
                     "loaded extent {extent_id} from disk {}: len={len}, sealed_length={sealed_length}, eversion={eversion}",
@@ -6340,7 +6444,8 @@ impl ExtentNode {
                         error = %e,
                         "P0-A: .dat fsync failed before seal meta — disk OFFLINE, NOT persisting sealed meta",
                     );
-                    self.mark_disk_error_for_extent(extent_id, &e.to_string());
+                    self.mark_disk_error_for_extent(extent_id, &e.to_string())
+                        .await;
                     // P0-A (coco): PROPAGATE the failure (was `-> bool`, swallowed)
                     // so callers (handle_re_avali / append meta-refresh / copy)
                     // map it to an error instead of reporting CODE_OK for a replica
@@ -6385,7 +6490,7 @@ impl ExtentNode {
                     error = %e,
                     "P0-A: save_meta of sealed extent failed — disk OFFLINE (seal not durable)",
                 );
-                self.mark_disk_error_for_extent(extent_id, &e);
+                self.mark_disk_error_for_extent(extent_id, &e).await;
                 return Err(format!(
                     "save_meta of sealed extent {extent_id} failed: {e}"
                 ));
@@ -7127,9 +7232,7 @@ impl ExtentNode {
     /// aliased bootstrap's contiguous ids onto shard 0). A read sent to the
     /// base address always lands on shard 0 and is refused with
     /// "extent N belongs to shard M not shard 0".
-    async fn nodes_map_from_manager(
-        &self,
-    ) -> Result<HashMap<u64, (String, Vec<u16>)>, String> {
+    async fn nodes_map_from_manager(&self) -> Result<HashMap<u64, (String, Vec<u16>)>, String> {
         let mgr = match &self.manager_endpoint {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Err("no manager endpoint configured".to_string()),
@@ -7326,7 +7429,9 @@ impl ExtentNode {
                     }
                 };
                 f.sync_data().await.map_err(|e| e.to_string())?;
-                self.fsync_staging_dir(task.extent_id, &path).await.map_err(|(_, m)| m)?;
+                self.fsync_staging_dir(task.extent_id, &path)
+                    .await
+                    .map_err(|(_, m)| m)?;
                 extent.note_shard_file(shard_index as u32, len);
                 wrote_shard_file = true;
                 len
@@ -7399,7 +7504,8 @@ impl ExtentNode {
             // "extent already exists". The orphaned .dat is reaped by the
             // startup/periodic reconcile, the established path
             // for abandoned recovery artifacts.
-            self.mark_disk_error_for_extent(task.extent_id, &e.to_string());
+            self.mark_disk_error_for_extent(task.extent_id, &e.to_string())
+                .await;
             self.extents.remove(&task.extent_id);
             self.fd_lru.forget(task.extent_id);
             self.ec_stage_nonce.remove(&task.extent_id);
@@ -7415,38 +7521,38 @@ impl ExtentNode {
         })
     }
 
-/// How many bytes one EC shard read should ask for.
-///
-/// `0` means "read to end" — one request for the whole shard. That is what this path used to
-/// pass, on the stated assumption that a shard is "well under the chunking
-/// threshold". It is not: a shard is `ceil(sealed_length / K)`, so a full
-/// 17 GiB extent at K=4 gives ~4 GiB against a `FILE_IO_CHUNK_BYTES` of
-/// 256 MiB.
-///
-/// On the live cluster every peer read FAILED — deterministically, in under a
-/// second, on four extents, with the shards present, the layout correct and
-/// every peer reachable. Sub-second rules OUT the 30 s per-request timeout,
-/// which is what the size first suggested. The likely mechanism is the frame
-/// encoder's unguarded `payload_len as u32`: that shard is 4,294,996,716
-/// bytes = `u32::MAX + 29,421`, so the length wraps to ~29 KB, the peer ships
-/// a header that disagrees with the body, and the reader fails the CRC at
-/// once. Both mechanisms are cured the same way, and neither can be confirmed
-/// from the error this path used to produce.
-///
-/// Returning the exact length puts the read on the chunking loop, where every
-/// request is <= `FILE_IO_CHUNK_BYTES` — far from the u32 edge and inside the
-/// timeout budget. It MUST equal `erasure::shard_size` — the length the
-/// encoder actually wrote, padding included — or the reader and writer
-/// disagree about shard geometry.
-pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
-    if sealed_length == 0 || data_shards == 0 {
-        // Unreachable in production — convert refuses an unsealed extent and
-        // the manager only ever sets `ec_converted` with K >= 1 — so this is
-        // the caller's cue to fail loudly, not a shape to read to end.
-        return 0;
+    /// How many bytes one EC shard read should ask for.
+    ///
+    /// `0` means "read to end" — one request for the whole shard. That is what this path used to
+    /// pass, on the stated assumption that a shard is "well under the chunking
+    /// threshold". It is not: a shard is `ceil(sealed_length / K)`, so a full
+    /// 17 GiB extent at K=4 gives ~4 GiB against a `FILE_IO_CHUNK_BYTES` of
+    /// 256 MiB.
+    ///
+    /// On the live cluster every peer read FAILED — deterministically, in under a
+    /// second, on four extents, with the shards present, the layout correct and
+    /// every peer reachable. Sub-second rules OUT the 30 s per-request timeout,
+    /// which is what the size first suggested. The likely mechanism is the frame
+    /// encoder's unguarded `payload_len as u32`: that shard is 4,294,996,716
+    /// bytes = `u32::MAX + 29,421`, so the length wraps to ~29 KB, the peer ships
+    /// a header that disagrees with the body, and the reader fails the CRC at
+    /// once. Both mechanisms are cured the same way, and neither can be confirmed
+    /// from the error this path used to produce.
+    ///
+    /// Returning the exact length puts the read on the chunking loop, where every
+    /// request is <= `FILE_IO_CHUNK_BYTES` — far from the u32 edge and inside the
+    /// timeout budget. It MUST equal `erasure::shard_size` — the length the
+    /// encoder actually wrote, padding included — or the reader and writer
+    /// disagree about shard geometry.
+    pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
+        if sealed_length == 0 || data_shards == 0 {
+            // Unreachable in production — convert refuses an unsealed extent and
+            // the manager only ever sets `ec_converted` with K >= 1 — so this is
+            // the caller's cue to fail loudly, not a shape to read to end.
+            return 0;
+        }
+        crate::erasure::shard_size(sealed_length as usize, data_shards) as u64
     }
-    crate::erasure::shard_size(sealed_length as usize, data_shards) as u64
-}
 
     /// Which shard slot this recovery is rebuilding.
     ///
@@ -7628,13 +7734,23 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
         F: Fn(u64, u64) -> Fut,
         Fut: std::future::Future<Output = Result<Vec<Option<Vec<u8>>>, String>>,
     {
-        self.note_op_progress(extent_id, autumn_rpc::manager_rpc::OP_KIND_RECOVERY, 0, want);
+        self.note_op_progress(
+            extent_id,
+            autumn_rpc::manager_rpc::OP_KIND_RECOVERY,
+            0,
+            want,
+        );
 
         for (offset, span) in Self::ec_stripe_plan(want, stripe) {
             let shards = fetch(offset, span).await?;
 
             let rebuilt = compio::runtime::spawn_blocking(move || {
-                crate::erasure::ec_reconstruct_shard(shards, data_shards, parity_shards, shard_index)
+                crate::erasure::ec_reconstruct_shard(
+                    shards,
+                    data_shards,
+                    parity_shards,
+                    shard_index,
+                )
             })
             .await
             .map_err(|_| "EC reconstruct task panicked".to_string())?
@@ -7695,7 +7811,9 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                 continue;
             }
             let Some((base, shard_ports)) = nodes.get(&node_id) else {
-                why.push(format!("shard {i} (node {node_id}): not in the manager's node map"));
+                why.push(format!(
+                    "shard {i} (node {node_id}): not in the manager's node map"
+                ));
                 continue;
             };
             // Route to the shard that OWNS the extent. Addressing the base
@@ -7748,7 +7866,11 @@ pub(crate) fn ec_shard_read_len(sealed_length: u64, data_shards: usize) -> u64 {
                  at [{offset}, {}) of {want}: {}",
                 task.extent_id,
                 offset + span,
-                if why.is_empty() { "no peers attempted".to_string() } else { why.join("; ") }
+                if why.is_empty() {
+                    "no peers attempted".to_string()
+                } else {
+                    why.join("; ")
+                }
             ));
         }
         Ok(shards)
@@ -7816,7 +7938,11 @@ struct OpProgressGuard {
 
 impl OpProgressGuard {
     fn new(slots: Rc<DashMap<u64, (u8, u64, u64)>>, extent_id: u64, kind: u8) -> Self {
-        Self { slots, extent_id, kind }
+        Self {
+            slots,
+            extent_id,
+            kind,
+        }
     }
 
     /// Overwrite the sample. `(0, 0)` is the ledger's "not reported" shape —
@@ -7834,7 +7960,6 @@ impl Drop for OpProgressGuard {
 }
 
 impl ExtentNode {
-
     /// Claim this node's EC staging for `extent_id` on behalf of `attempt_nonce`,
     /// or refuse if a NEWER attempt already claimed it.
     ///
@@ -7876,7 +8001,8 @@ impl ExtentNode {
                 return false;
             }
         }
-        self.ec_stage_nonce.insert(extent_id, self.stamp_stage_mark(attempt_nonce));
+        self.ec_stage_nonce
+            .insert(extent_id, self.stamp_stage_mark(attempt_nonce));
         true
     }
 
@@ -7987,35 +8113,30 @@ impl ExtentNode {
             tracing::error!("{msg}");
             return Err((StatusCode::FailedPrecondition, msg));
         }
-        let staging_file = OpenOptions::new()
+        let result = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(shard_offset == 0)
             .open(&staging_path)
-            .await
-            .map_err(|e| {
-                let msg = format!("create staging {extent_id}: {e}");
-                self.mark_disk_error_for_extent(extent_id, &msg);
-                (StatusCode::Internal, msg)
-            })?;
+            .await;
+        let staging_file = self
+            .disk_io_result(extent_id, result, "create staging")
+            .await?;
 
         // staging file is local to this function — the path is unique per
         // `extent_id` and EC convert on this extent is serialised by the
         // per-extent op-lock, so a freshly-created `Rc` suffices.
         let staging_rc = Rc::new(staging_file);
         // ENOSPC-1: EC staging writes mark the disk like every other write path.
-        file_pwrite_chunked(staging_rc.clone(), shard_offset, stripe_data)
-            .await
-            .map_err(|e| {
-                let msg = format!("write staging {extent_id}/{shard_index}@{shard_offset}: {e}");
-                self.mark_disk_error_for_extent(extent_id, &msg);
-                (StatusCode::Internal, msg)
-            })?;
-        staging_rc.sync_data().await.map_err(|e| {
-            let msg = format!("sync staging {extent_id}: {e}");
-            self.mark_disk_error_for_extent(extent_id, &msg);
-            (StatusCode::Internal, msg)
-        })?;
+        let result = file_pwrite_chunked(staging_rc.clone(), shard_offset, stripe_data).await;
+        self.disk_io_result(
+            extent_id,
+            result,
+            &format!("write staging {shard_index}@{shard_offset}"),
+        )
+        .await?;
+        self.disk_io_result(extent_id, staging_rc.sync_data().await, "sync staging")
+            .await?;
         // EC-PREPARE-DURABLE: `sync_data` makes the stripe CONTENT durable; the
         // parent-dir fsync makes the staging dirent durable (idempotent across
         // stripes — only the first stripe actually creates the file).
@@ -8058,20 +8179,11 @@ impl ExtentNode {
         staging_path: &std::path::Path,
     ) -> Result<(), (StatusCode, String)> {
         if let Some(dir) = staging_path.parent() {
-            compio::fs::File::open(dir)
-                .await
-                .map_err(|e| {
-                    let msg = format!("open staging dir {extent_id}: {e}");
-                    self.mark_disk_error_for_extent(extent_id, &msg);
-                    (StatusCode::Internal, msg)
-                })?
-                .sync_all()
-                .await
-                .map_err(|e| {
-                    let msg = format!("fsync staging dir {extent_id}: {e}");
-                    self.mark_disk_error_for_extent(extent_id, &msg);
-                    (StatusCode::Internal, msg)
-                })?;
+            let file = self
+                .disk_io_result(extent_id, CompioFile::open(dir).await, "open staging dir")
+                .await?;
+            self.disk_io_result(extent_id, file.sync_all().await, "fsync staging dir")
+                .await?;
         }
         Ok(())
     }
@@ -8086,12 +8198,12 @@ impl ExtentNode {
     /// before rename, `.ec.dat` persists as a durable prepare record
     /// and the original `.dat` is intact; the manager's retry will
     /// re-send CommitEcShard to complete the conversion.
-        /// #5: complete an EC commit on `entry` — rename `.ec.dat`→`.dat` if the
+    /// #5: complete an EC commit on `entry` — rename `.ec.dat`→`.dat` if the
     /// staging file is still present (else `.dat` is already the shard from a
     /// pre-crash rename), reopen, set the post-EC atomics, and persist `.meta`.
     /// Shared by `commit_shard_local` (normal path) and the `load_extents`
     /// marker replay (crash recovery), so both produce the identical state.
-        /// #5: write the EC commit-intent marker durably (tmp→sync→rename→dir-fsync).
+    /// #5: write the EC commit-intent marker durably (tmp→sync→rename→dir-fsync).
     /// Payload = `[new_eversion: u64 LE][sealed_length: u64 LE]`.
     /// Record that a FULL prepare for `new_eversion` completed (coordinator
     /// stages itself LAST, so this also asserts every participant is staged).
@@ -8162,13 +8274,13 @@ impl ExtentNode {
         ))
     }
 
-        /// #5: read the EC commit-intent marker, distinguishing the three states the
+    /// #5: read the EC commit-intent marker, distinguishing the three states the
     /// recovery decision needs (coco P2 #3 — mirror the `.meta` NotFound-vs-
     /// corrupt fail-closed policy; a present-but-unreadable marker must NOT be
     /// silently treated as "no marker").
-        /// #5: delete the EC commit-intent marker (best-effort + dir-fsync). A
+    /// #5: delete the EC commit-intent marker (best-effort + dir-fsync). A
     /// leftover marker only causes a redundant, idempotent replay next restart.
-        // ─── RPC Handlers ────────────────────────────────────────────────────────
+    // ─── RPC Handlers ────────────────────────────────────────────────────────
 
     async fn handle_append(&self, payload: Bytes) -> HandlerResult {
         let req =
@@ -8253,7 +8365,8 @@ impl ExtentNode {
             .ensure_fence_durable(req.extent_id, &extent, req.owner_epoch)
             .await
         {
-            self.mark_disk_error_for_extent(req.extent_id, &e.to_string());
+            self.mark_disk_error_for_extent(req.extent_id, &e.to_string())
+                .await;
             tracing::error!(
                 extent_id = req.extent_id,
                 error = %e,
@@ -8355,7 +8468,7 @@ impl ExtentNode {
         };
         if let Err(e) = file_pwrite(af.clone(), start, data_payload.clone()).await {
             let msg = e.to_string();
-            self.mark_disk_error_for_extent(req.extent_id, &msg);
+            self.mark_disk_error_for_extent(req.extent_id, &msg).await;
             return Err((StatusCode::Internal, msg));
         }
         let start_offset = start;
@@ -8366,7 +8479,7 @@ impl ExtentNode {
         extent.coalescer.pending_fsync.store(end, Ordering::SeqCst);
         if let Err(e) = af.sync_data().await {
             let msg = e.to_string();
-            self.mark_disk_error_for_extent(req.extent_id, &msg);
+            self.mark_disk_error_for_extent(req.extent_id, &msg).await;
             return Err((StatusCode::Internal, msg));
         }
         extent.coalescer.last_synced.store(end, Ordering::SeqCst);
@@ -8720,7 +8833,8 @@ impl ExtentNode {
             .ensure_fence_durable(req.extent_id, &entry, req.owner_epoch)
             .await
         {
-            self.mark_disk_error_for_extent(req.extent_id, &e.to_string());
+            self.mark_disk_error_for_extent(req.extent_id, &e.to_string())
+                .await;
             tracing::error!(
                 extent_id = req.extent_id,
                 error = %e,
@@ -8886,7 +9000,7 @@ impl ExtentNode {
         // with "extent already exists" (same family as the P0-D recovery
         // path; the orphan .dat is reaped by the reconcile sweep).
         if let Err(e) = self.save_meta(req.extent_id, &entry).await {
-            self.mark_disk_error_for_extent(req.extent_id, &e);
+            self.mark_disk_error_for_extent(req.extent_id, &e).await;
             self.extents.remove(&req.extent_id);
             self.fd_lru.forget(req.extent_id);
             self.ec_stage_nonce.remove(&req.extent_id);
@@ -9077,15 +9191,14 @@ impl ExtentNode {
         // report cost an outage: the legacy path opens with `set_len(0)`, so
         // re-running a rebuild that had already finished truncates a shard that
         // readers are currently being served.
-        let have = if PayloadLocation::from_byte(info.payload_location)
-            == PayloadLocation::InShardFile
-        {
-            entry.shard_file_len(shard_index as u32)
-        } else if entry.has_dat.load(Ordering::SeqCst) {
-            Some(entry.len.load(Ordering::SeqCst))
-        } else {
-            None
-        };
+        let have =
+            if PayloadLocation::from_byte(info.payload_location) == PayloadLocation::InShardFile {
+                entry.shard_file_len(shard_index as u32)
+            } else if entry.has_dat.load(Ordering::SeqCst) {
+                Some(entry.len.load(Ordering::SeqCst))
+            } else {
+                None
+            };
         match have {
             // Exact length only. A shard is fixed-size by construction, so
             // `>=` would adopt an over-long file, and the reader — which
@@ -9662,7 +9775,12 @@ impl ExtentNode {
         // keeps `stream_extent_from_sources` — its destination is a fresh or
         // provably-incomplete replica, which has nothing to lose.
         if let Err((_, msg)) = self
-            .peer_copy_full_extent_to_dat(req.extent_id, &extent, &extent_info, extent_info.sealed_length)
+            .peer_copy_full_extent_to_dat(
+                req.extent_id,
+                &extent,
+                &extent_info,
+                extent_info.sealed_length,
+            )
             .await
         {
             return code_resp(CODE_ERROR, msg);
@@ -9680,7 +9798,7 @@ impl ExtentNode {
                 error = %e,
                 "P0-A: re_avali post-repair save_meta failed — disk OFFLINE, returning CODE_ERROR",
             );
-            self.mark_disk_error_for_extent(req.extent_id, &e);
+            self.mark_disk_error_for_extent(req.extent_id, &e).await;
             return code_resp(
                 CODE_ERROR,
                 format!(
@@ -10063,7 +10181,8 @@ impl ExtentNode {
         let prior_failure = self
             .ec_last_error
             .get(&req.extent_id)
-            .map(|e| e.value().clone());
+            .filter(|e| e.value().0 == req.attempt_nonce)
+            .map(|e| e.value().1.clone());
         if self.ec_convert_inflight.contains_key(&req.extent_id) {
             return code_resp(
                 CODE_OK,
@@ -10072,6 +10191,11 @@ impl ExtentNode {
                     None => "ec convert already running".to_string(),
                 },
             );
+        }
+        if let Some(EcConvertError::ContentCorrupt(message)) = &prior_failure {
+            // The previous task has exited and released its extent lock. Do
+            // not start another encoder before yielding the marker to repair.
+            return code_resp(CODE_CONTENT_CORRUPT, message.clone());
         }
         self.ec_convert_inflight.insert(req.extent_id, ());
 
@@ -10099,11 +10223,12 @@ impl ExtentNode {
                         "EC convert done; queued for df report"
                     );
                 }
-                Err((_, msg)) => {
+                Err(error) => {
                     // No report ⇒ the manager's marker stays ⇒ it re-dispatches
                     // on its next tick. Nothing to roll back here: the 2PC's own
                     // staging/commit markers own crash-safety.
-                    node.ec_last_error.insert(extent_id, msg.clone());
+                    let msg = error.to_string();
+                    node.ec_last_error.insert(extent_id, (attempt_nonce, error));
                     tracing::error!(
                         extent_id,
                         "EC convert failed (will be re-dispatched): {msg}"
@@ -10131,7 +10256,7 @@ impl ExtentNode {
     async fn run_convert_to_ec_task(
         &self,
         req: ConvertToEcReq,
-    ) -> std::result::Result<(), (StatusCode, String)> {
+    ) -> std::result::Result<(), EcConvertError> {
         let extent_id = req.extent_id;
         let data_shards = req.data_shards as usize;
         let parity_shards = req.parity_shards as usize;
@@ -10159,7 +10284,11 @@ impl ExtentNode {
         // two ways: off the next dispatch's response message, and — without
         // waiting for the backoff to come round — on the `df` heartbeat as
         // `DfResp.op_failures`.
-        tracing::debug!(extent_id, new_eversion, "ec convert: waiting for the extent op lock");
+        tracing::debug!(
+            extent_id,
+            new_eversion,
+            "ec convert: waiting for the extent op lock"
+        );
         let convert_lock = self.get_or_create_extent_op_lock(extent_id);
         let _convert_guard = convert_lock.lock().await;
         tracing::debug!(extent_id, "ec convert: op lock held; reading the extent");
@@ -10194,13 +10323,14 @@ impl ExtentNode {
             // conversion against a stale on-disk sidecar. ENSURE durability:
             // save_meta is idempotent; fail-closed if it still can't persist.
             if let Err(e) = self.save_meta(extent_id, &entry).await {
-                self.mark_disk_error_for_extent(extent_id, &e);
+                self.mark_disk_error_for_extent(extent_id, &e).await;
                 return Err((
                     StatusCode::Unavailable,
                     format!(
                         "extent {extent_id}: idempotent-skip .meta ensure failed (fail-closed): {e}"
                     ),
-                ));
+                )
+                    .into());
             }
             // ADOPT: already EC-converted at this eversion. Report it as DONE so
             // a completion lost before the manager's `df` pickup converges on
@@ -10297,13 +10427,13 @@ impl ExtentNode {
                     // lock + idempotency make the redo safe) and mark
                     // the disk offline (sidecar-persist I/O error).
                     if let Err(e) = self.save_meta(extent_id, &entry).await {
-                        self.mark_disk_error_for_extent(extent_id, &e);
+                        self.mark_disk_error_for_extent(extent_id, &e).await;
                         return Err((
                             StatusCode::Unavailable,
                             format!(
                                 "extent {extent_id}: seal .meta persist failed before EC convert (fail-closed): {e}"
                             ),
-                        ));
+                        ).into());
                     }
                     sealed_length = mgr_info.sealed_length;
                     tracing::info!(
@@ -10318,7 +10448,8 @@ impl ExtentNode {
                 return Err((
                     StatusCode::FailedPrecondition,
                     format!("extent {extent_id} is not sealed — cannot EC convert"),
-                ));
+                )
+                    .into());
             }
 
             // Peer-copy gap if local file is short.
@@ -10392,14 +10523,14 @@ impl ExtentNode {
                         "REFUSING to EC-convert an extent whose content fails its checksum — \
                          encoding it would make the damage canonical across the stripe: {why}"
                     );
-                    return Err((StatusCode::FailedPrecondition, why));
+                    return Err(EcConvertError::ContentCorrupt(why));
                 }
                 ContentCheck::Unreadable(why) => {
                     tracing::error!(
                         extent_id,
                         "cannot verify this extent's content before EC-converting it: {why}"
                     );
-                    return Err((StatusCode::Unavailable, why));
+                    return Err((StatusCode::Unavailable, why).into());
                 }
             }
 
@@ -10435,7 +10566,8 @@ impl ExtentNode {
                         format!(
                             "extent {extent_id}: a newer EC attempt already stages on this node"
                         ),
-                    ));
+                    )
+                        .into());
                 }
                 let mut s = 0usize;
                 while s < per_shard {
@@ -10717,7 +10849,7 @@ impl ExtentNode {
         Ok(WriteShardResp { code: CODE_OK }.encode())
     }
 
-        /// Queue an EC completion as the owning shard would, for tests that need to
+    /// Queue an EC completion as the owning shard would, for tests that need to
     /// prove the node's `df` shard drains it.
     pub fn test_push_ec_done(&self, extent_id: u64, new_eversion: u64) {
         self.done.push_ec(crate::extent_rpc::EcConvertDone {
@@ -10845,11 +10977,13 @@ impl ExtentNode {
     ) {
         let ps: Vec<manager_rpc::ExtentPlacement> = placements
             .iter()
-            .map(|(extent_id, payload_location, shard_index)| manager_rpc::ExtentPlacement {
-                extent_id: *extent_id,
-                payload_location: *payload_location,
-                shard_index: *shard_index,
-            })
+            .map(
+                |(extent_id, payload_location, shard_index)| manager_rpc::ExtentPlacement {
+                    extent_id: *extent_id,
+                    payload_location: *payload_location,
+                    shard_index: *shard_index,
+                },
+            )
             .collect();
         self.apply_placements(&ps, staging_tick_at_ask).await;
     }
@@ -10964,7 +11098,10 @@ mod enospc_disk_health_tests {
                 12 | 23 | 24 => Process,
                 _ => Media,
             };
-            assert_eq!(got, want, "errno {n} classified {got:?}, expected {want:?} [{msg}]");
+            assert_eq!(
+                got, want,
+                "errno {n} classified {got:?}, expected {want:?} [{msg}]"
+            );
         }
     }
 
@@ -11011,7 +11148,8 @@ mod enospc_disk_health_tests {
         let disk = node.disk_for(1).expect("disk");
 
         let emfile = std::io::Error::from_raw_os_error(24).to_string();
-        node.mark_disk_error_for_extent(eid, &format!("open meta tmp for extent {eid}: {emfile}"));
+        node.mark_disk_error_for_extent(eid, &format!("open meta tmp for extent {eid}: {emfile}"))
+            .await;
         assert_eq!(
             disk.health(),
             DiskHealth::Online,
@@ -11019,11 +11157,73 @@ mod enospc_disk_health_tests {
         );
 
         let eio = std::io::Error::from_raw_os_error(5).to_string();
-        node.mark_disk_error_for_extent(eid, &eio);
+        node.mark_disk_error_for_extent(eid, &eio).await;
+        assert_eq!(
+            disk.health(),
+            DiskHealth::Online,
+            "transient EIO must not fault a disk"
+        );
+        DISK_PROBE_SYNC_ERROR.with(|v| v.set(Some(libc::EIO)));
+        node.mark_disk_error_for_extent(eid, &eio).await;
         assert_eq!(
             disk.health(),
             DiskHealth::Faulted,
-            "a real I/O error still does"
+            "persistent fsync EIO must fault the disk"
+        );
+    }
+
+    #[compio::test]
+    async fn disk_probe_timeout_faults_without_blocking_error_handling() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .unwrap();
+        node.ensure_extent(6100).await.unwrap();
+        DISK_PROBE_SYNC_ERROR.with(|v| v.set(Some(0)));
+        let start = Instant::now();
+        compio::time::timeout(
+            Duration::from_secs(4),
+            node.mark_disk_error_for_extent(6100, "transient I/O error"),
+        )
+        .await
+        .expect("self-check must bound a stuck fsync");
+        assert!(start.elapsed() >= Duration::from_secs(2));
+        assert_eq!(node.disk_for(1).unwrap().health(), DiskHealth::Faulted);
+        let resp = node
+            .handle_df(rkyv_encode(&DfReq {
+                disk_ids: vec![],
+                tasks: vec![],
+            }))
+            .await
+            .unwrap();
+        let df: DfResp = rkyv_decode(&resp).unwrap();
+        assert!(
+            !df.disk_status[0].1.online,
+            "timeout must reach the manager as a disk fault"
+        );
+    }
+
+    #[compio::test]
+    async fn disk_probe_checks_the_failed_hash_directory_and_retains_faults() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .unwrap();
+        node.ensure_extent(6100).await.unwrap();
+        let disk = node.disk_for(1).unwrap();
+        let path = disk.extent_path(6100).parent().unwrap().to_path_buf();
+        let moved = path.with_extension("offline");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"broken directory").unwrap();
+        node.mark_disk_error_for_extent(6100, "I/O error").await;
+        assert_eq!(disk.health(), DiskHealth::Faulted);
+        std::fs::remove_file(&path).unwrap();
+        std::fs::rename(&moved, &path).unwrap();
+        node.mark_disk_error_for_extent(6100, "I/O error").await;
+        assert_eq!(
+            disk.health(),
+            DiskHealth::Faulted,
+            "later success must not clear a confirmed fault"
         );
     }
 
@@ -11296,7 +11496,10 @@ mod sealed_append_guard_tests {
         {
             let config = ExtentNodeConfig::new(path, 1);
             let node = ExtentNode::new(config).await.expect("node reload");
-            let entry = node.extents.get(&4242).expect("shard-only extent must reload");
+            let entry = node
+                .extents
+                .get(&4242)
+                .expect("shard-only extent must reload");
             assert!(
                 entry.sealed.load(Ordering::SeqCst),
                 "seal flag must survive the restart"
@@ -11623,7 +11826,10 @@ mod sealed_append_guard_tests {
         // A short replica mid-repair: sealed above what this copy holds, which
         // is the normal state under seal-over-reachable.
         entry.len.store(block as u64, Ordering::SeqCst);
-        entry.coalescer.last_synced.store(block as u64, Ordering::SeqCst);
+        entry
+            .coalescer
+            .last_synced
+            .store(block as u64, Ordering::SeqCst);
         entry.sealed.store(true, Ordering::SeqCst);
         entry
             .sealed_length
@@ -11726,15 +11932,22 @@ mod sealed_append_guard_tests {
             extent_id: eid,
             data_shards: 2,
             parity_shards: 1,
-            target_addrs: vec!["127.0.0.1:1".into(), "127.0.0.1:2".into(), "127.0.0.1:3".into()],
+            target_addrs: vec![
+                "127.0.0.1:1".into(),
+                "127.0.0.1:2".into(),
+                "127.0.0.1:3".into(),
+            ],
             eversion: 3,
             owner_epoch: 0,
             attempt_nonce: 0,
         };
-        let (code, message) = node
+        let error = node
             .run_convert_to_ec_task(req)
             .await
-            .expect_err("no manager is reachable, so the peer-copy cannot proceed");
+            .expect_err("peer-copy must fail");
+        let EcConvertError::Status { code, message } = error else {
+            panic!("short copy classified as corrupt")
+        };
         assert_eq!(
             code,
             StatusCode::Unavailable,
@@ -11743,6 +11956,85 @@ mod sealed_append_guard_tests {
         assert!(
             message.contains("peer-copy"),
             "the conversion must have reached the peer-copy; got {message}"
+        );
+    }
+
+    #[compio::test]
+    async fn ec_corruption_stops_before_redispatch_and_is_attempt_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .unwrap();
+        let eid = 5162;
+        let entry = node.ensure_extent(eid).await.unwrap();
+        let f = node.extent_file(&entry).await.unwrap();
+        file_pwrite_chunked(f.clone(), 0, Bytes::from(vec![42; 4096]))
+            .await
+            .unwrap();
+        entry.has_dat.store(true, Ordering::SeqCst);
+        entry.note_durable_install(4096);
+        node.apply_extent_meta_durable(
+            eid,
+            &entry,
+            &ExtentInfo {
+                extent_id: eid,
+                sealed: true,
+                sealed_length: 4096,
+                eversion: 2,
+                avali: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        file_pwrite_chunked(f, 0, Bytes::from(vec![99; 4096]))
+            .await
+            .unwrap();
+        let request = |nonce| ConvertToEcReq {
+            extent_id: eid,
+            data_shards: 2,
+            parity_shards: 1,
+            target_addrs: vec!["127.0.0.1:1".into(); 3],
+            eversion: 3,
+            owner_epoch: 0,
+            attempt_nonce: nonce,
+        };
+        node.handle_convert_to_ec(rkyv_encode(&request(7)))
+            .await
+            .unwrap();
+        compio::time::timeout(Duration::from_secs(3), async {
+            while node.ec_convert_inflight.contains_key(&eid) {
+                compio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(
+            &node.ec_last_error.get(&eid).unwrap().1,
+            EcConvertError::ContentCorrupt(_)
+        ));
+        let reply = node
+            .handle_convert_to_ec(rkyv_encode(&request(7)))
+            .await
+            .unwrap();
+        let reply: CodeResp = rkyv_decode(&reply).unwrap();
+        assert_eq!(
+            reply.code, CODE_CONTENT_CORRUPT,
+            "one failed attempt must yield to repair"
+        );
+        assert!(
+            !node.ec_convert_inflight.contains_key(&eid),
+            "refusal must not start another encoder"
+        );
+        assert!(node.get_or_create_extent_op_lock(eid).try_lock().is_some());
+        let reply = node
+            .handle_convert_to_ec(rkyv_encode(&request(8)))
+            .await
+            .unwrap();
+        let reply: CodeResp = rkyv_decode(&reply).unwrap();
+        assert_eq!(
+            reply.code, CODE_OK,
+            "a new attempt must recheck content after repair"
         );
     }
 
@@ -11832,7 +12124,9 @@ mod sealed_append_guard_tests {
             avali: 0b1,
             ..Default::default()
         };
-        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("seal");
 
         let whole = |ev: u64| {
             ReadBytesReq::new(eid, ev, 0, content.len() as u64, PayloadRef::in_dat()).encode()
@@ -11904,7 +12198,9 @@ mod sealed_append_guard_tests {
         };
         // The seal itself still succeeds — integrity metadata must never be
         // able to fail a seal.
-        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("seal");
         assert!(
             node.load_extent_checksums(eid, &entry, content.len() as u64)
                 .await
@@ -11917,7 +12213,9 @@ mod sealed_append_guard_tests {
             .coalescer
             .last_synced
             .store(content.len() as u64, Ordering::SeqCst);
-        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("re-seal");
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("re-seal");
         assert!(
             node.load_extent_checksums(eid, &entry, content.len() as u64)
                 .await
@@ -11960,7 +12258,9 @@ mod sealed_append_guard_tests {
             avali: 0b1,
             ..Default::default()
         };
-        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("seal");
         assert!(
             node.load_extent_checksums(eid, &entry, content.len() as u64)
                 .await
@@ -12010,7 +12310,9 @@ mod sealed_append_guard_tests {
             avali: 0b1,
             ..Default::default()
         };
-        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("seal");
         assert!(
             node.cached_content_checksums(eid, &entry).await.is_some(),
             "the read cache still says this extent has no checksums, so every \
@@ -12055,7 +12357,9 @@ mod sealed_append_guard_tests {
             avali: 0b1,
             ..Default::default()
         };
-        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("seal");
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("seal");
 
         // Rot appears after the seal.
         let mut rotted = content.clone();
@@ -12064,7 +12368,9 @@ mod sealed_append_guard_tests {
         std::fs::write(disk.extent_path(eid), &rotted).expect("rot the .dat");
 
         // The manager contacts this node again, as it routinely does.
-        node.apply_extent_meta_durable(eid, &entry, &ex).await.expect("re-seal");
+        node.apply_extent_meta_durable(eid, &entry, &ex)
+            .await
+            .expect("re-seal");
 
         let ck = node
             .load_extent_checksums(eid, &entry, content.len() as u64)
@@ -12075,7 +12381,11 @@ mod sealed_append_guard_tests {
             "the re-seal re-hashed the rotted bytes and blessed them; the checksum \
              must keep describing the content as it was at seal"
         );
-        assert_eq!(ck.verify_read(0, &content), Ok(1), "and still matches the real content");
+        assert_eq!(
+            ck.verify_read(0, &content),
+            Ok(1),
+            "and still matches the real content"
+        );
     }
 
     /// META-FAILCLOSED (coco prod-audit #1): a corrupt `.meta` (CRC mismatch
@@ -13073,7 +13383,6 @@ mod wire_fence_tests {
         let decoded = WriteShardReq::decode(original.encode()).unwrap();
         assert_eq!(decoded.owner_epoch, 0, "zero owner_epoch marker preserved");
     }
-
 }
 
 #[cfg(test)]
@@ -13636,8 +13945,14 @@ mod recovery_idempotence_tests {
             let eid = 42u64;
 
             assert!(node.claim_ec_staging(eid, 100), "first claim wins");
-            assert!(node.claim_ec_staging(eid, 100), "same attempt may keep staging");
-            assert!(node.claim_ec_staging(eid, 101), "a newer attempt takes over");
+            assert!(
+                node.claim_ec_staging(eid, 100),
+                "same attempt may keep staging"
+            );
+            assert!(
+                node.claim_ec_staging(eid, 101),
+                "a newer attempt takes over"
+            );
             assert!(
                 !node.claim_ec_staging(eid, 100),
                 "a superseded attempt must be refused once a newer one claimed"
@@ -13709,7 +14024,10 @@ mod recovery_idempotence_tests {
         };
 
         // The winning attempt (nonce 100) stages shard 0.
-        let resp = node.handle_write_shard(ws(100, live.clone())).await.expect("stage");
+        let resp = node
+            .handle_write_shard(ws(100, live.clone()))
+            .await
+            .expect("stage");
         assert_eq!(
             WriteShardResp::decode(resp.clone()).expect("decode").code,
             CODE_OK,
@@ -13758,8 +14076,11 @@ mod recovery_idempotence_tests {
     async fn delete_extent_refuses_a_request_addressed_to_another_node() {
         let dir = tempfile::tempdir().expect("tmp");
         let node = ExtentNode::new(
-            ExtentNodeConfig::new(dir.path().to_path_buf(), 1)
-                .with_registration("uuid-this-node", "127.0.0.1:9101", vec![]),
+            ExtentNodeConfig::new(dir.path().to_path_buf(), 1).with_registration(
+                "uuid-this-node",
+                "127.0.0.1:9101",
+                vec![],
+            ),
         )
         .await
         .expect("node");
@@ -13791,8 +14112,15 @@ mod recovery_idempotence_tests {
 
         // The rightful target still works — and so does an unspecified uuid,
         // which is how a legacy persisted retry entry arrives.
-        let resp = node.handle_delete_extent(del("uuid-this-node")).await.expect("call");
-        assert_eq!(decode_code(&resp).0, CODE_OK, "the addressed node must proceed");
+        let resp = node
+            .handle_delete_extent(del("uuid-this-node"))
+            .await
+            .expect("call");
+        assert_eq!(
+            decode_code(&resp).0,
+            CODE_OK,
+            "the addressed node must proceed"
+        );
         assert!(!path.exists(), "the extent file must be gone");
     }
 
@@ -13827,7 +14155,10 @@ mod recovery_idempotence_tests {
             let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
                 .await
                 .expect("node");
-            let resp = node.handle_write_shard(ws(100, live.clone())).await.expect("stage");
+            let resp = node
+                .handle_write_shard(ws(100, live.clone()))
+                .await
+                .expect("stage");
             assert_eq!(
                 WriteShardResp::decode(resp).expect("decode").code,
                 CODE_OK,
@@ -13843,7 +14174,9 @@ mod recovery_idempotence_tests {
             )
             .await;
             let entry = node.ensure_extent(eid).await.expect("entry");
-            node.disk_for(entry.disk_id).expect("disk").shard_path(eid, 0)
+            node.disk_for(entry.disk_id)
+                .expect("disk")
+                .shard_path(eid, 0)
         };
 
         // Restart: a fresh node over the same data dir, with no memory of the
@@ -14065,7 +14398,10 @@ mod ec_stripe_plan_tests {
                 assert!(*span > 0 && *span <= stripe, "want={want}: bad span {span}");
                 cursor += span;
             }
-            assert_eq!(cursor, want, "want={want} stripe={stripe}: plan does not reach the end");
+            assert_eq!(
+                cursor, want,
+                "want={want} stripe={stripe}: plan does not reach the end"
+            );
             assert_eq!(
                 plan.len() as u64,
                 want.div_ceil(stripe),
@@ -14133,9 +14469,7 @@ mod discard_shard_file_tests {
     fn entry_advertising(extent_id: u64, shard_index: u32, len: u64) -> ExtentEntry {
         ExtentEntry {
             has_dat: AtomicBool::new(false),
-            payload_location: AtomicU8::new(
-                autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE,
-            ),
+            payload_location: AtomicU8::new(autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE),
             shard_files: RefCell::new([(shard_index, len)].into_iter().collect()),
             file: RefCell::new(None),
             extent_id,
@@ -14178,7 +14512,10 @@ mod discard_shard_file_tests {
             location: PayloadLocation::InShardFile,
             shard_index: 3,
         };
-        assert!(entry.holds_payload(want), "precondition: entry advertises it");
+        assert!(
+            entry.holds_payload(want),
+            "precondition: entry advertises it"
+        );
 
         entry
             .discard_shard_file(&path, 3)
@@ -14270,9 +14607,7 @@ mod classify_ec_shard_tests {
     fn entry_with(eversion: u64, shard: Option<(u32, u64)>) -> ExtentEntry {
         ExtentEntry {
             has_dat: AtomicBool::new(true),
-            payload_location: AtomicU8::new(
-                autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE,
-            ),
+            payload_location: AtomicU8::new(autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_SHARD_FILE),
             shard_files: RefCell::new(shard.into_iter().collect()),
             file: RefCell::new(None),
             extent_id: 7,
@@ -14568,7 +14903,11 @@ mod ec_rebuild_progress_tests {
         );
         let shards = shards();
         let want = ExtentNode::ec_shard_read_len(PAYLOAD as u64, K);
-        assert_eq!(want as usize, shards[0].len(), "the walk's length must be the encoder's");
+        assert_eq!(
+            want as usize,
+            shards[0].len(),
+            "the walk's length must be the encoder's"
+        );
         let seen = Rc::new(RefCell::new(Vec::new()));
 
         let got = node
@@ -14587,7 +14926,11 @@ mod ec_rebuild_progress_tests {
 
         assert_eq!(
             *seen.borrow(),
-            vec![Some((0, want)), Some((STRIPE, want)), Some((2 * STRIPE, want))],
+            vec![
+                Some((0, want)),
+                Some((STRIPE, want)),
+                Some((2 * STRIPE, want))
+            ],
             "one sample per stripe, each the bytes already in the file, with the \
              total known from the first read on"
         );
@@ -14664,7 +15007,13 @@ mod ec_rebuild_progress_tests {
         let path = dir.path().join("rebuilt");
         std::fs::write(&path, b"").expect("create");
         // Read-only: the first pwrite fails.
-        let dst = Rc::new(OpenOptions::new().read(true).open(&path).await.expect("dst"));
+        let dst = Rc::new(
+            OpenOptions::new()
+                .read(true)
+                .open(&path)
+                .await
+                .expect("dst"),
+        );
         let shards = shards();
         let want = ExtentNode::ec_shard_read_len(PAYLOAD as u64, K);
         let seen = Rc::new(RefCell::new(Vec::new()));
@@ -14682,7 +15031,11 @@ mod ec_rebuild_progress_tests {
             )
             .await;
         assert!(got.is_err(), "a failed pwrite fails the rebuild");
-        assert_eq!(seen.borrow().len(), 1, "the walk stops at the stripe it could not write");
+        assert_eq!(
+            seen.borrow().len(),
+            1,
+            "the walk stops at the stripe it could not write"
+        );
 
         assert_eq!(
             final_sample(&node),
