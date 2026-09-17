@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-14
+**Last updated:** 2026-09-16
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -886,3 +886,109 @@
 - **Scope**（未实现）: 先按评审给的判据复现——`cat bigfile` 循环 + 中途重启 manager，
   看 `autumn-fuse-compio` 线程是否停在 `folio_wait_bit`/`__lock_page`（`/proc/<pid>/task/*/wchan`）、
   读者是否 D 状态。确认后的修法形状：把通知移到专用线程发（`Notifier` 是 `Send + Clone`）。
+
+### BUG-FUSE-WRITE-READ-DUAL-OPEN-EBUSY — 同挂载对同一文件"写打开时只读打开"返回 EBUSY，ffmpeg faststart 全挂
+- **Trigger** (2026-09-16，ComfyUI 线上故障定位 + 在 comfyui-autumn pod 实测复现):
+  SaveVideo 保存 mp4 必然失败 (`av.error.OSError: [Errno 16] Device or resource busy`)。
+  根因链：ffmpeg 的 MP4 faststart (`shift_data()`) 在写 trailer 时**保持写句柄、再以 O_RDONLY
+  重开同一文件**做 moov 搬移；而 FUSE 客户端 `FuseLease` 每个 ino 只有一个 `mode` 槽。
+- **实测证据** (pod `comfyui-autumn-57d759f7f-65zvm`)：PyAV 走 SaveVideo 同一代码路径，
+  5 种尺寸 100% EBUSY；去掉 faststart 全部成功；纯 Python 三种双开中
+  read+read OK、write+write OK、**write 时 read-open FAIL**——manager 侧
+  (`inode_lease.rs` 的 `acquire(READ)` 无条件插入 readers、只对"别的" writer 报
+  WriteConflict) 本来允许读写共存，拦截纯发生在 FUSE 客户端。
+- **代码事实**: `crates/fuse/src/dispatch.rs:576` Open arm
+  `if slot.mode != req_mode { return Err("lease mode mismatch ...") }` →
+  `err_to_errno` (ops.rs:458) 把 "lease mode mismatch" 映射成 EBUSY。
+- **Scope**（用户 2026-09-16 确认的形态）: `FuseLease` 按角色拆分：
+  ```rust
+  pub struct FuseLease {
+      pub writer_refs: u32,   // O_WRONLY/O_RDWR 的 fd 数
+      pub reader_refs: u32,   // O_RDONLY 的 fd 数
+      pub mode: u8,           // manager 侧当前持有的最强 lease (WRITE > READ)
+      pub lease_epoch: u64,
+      pub revoked: bool,      // 语义不变
+  }
+  ```
+  - Open: req=READ 且 writer_refs>0 ⇒ 只 bump reader_refs、零 RPC（本挂载写路径
+    自持缓存一致性，manager 不需要知道）；req=WRITE 且 reader_refs>0（升级）⇒
+    manager `acquire(WRITE)`（同 client 幂等），更新 mode/epoch；同角色 bump 不发 RPC。
+  - Release: 对应角色 refcount 减 1；writer_refs 1→0 且 reader_refs>0（降级）⇒
+    `lease::release` + `lease::acquire(READ)` 重注册为读者，避免残留读 fd 把 writer
+    槽占死挡住其他挂载的写者（tail -f 场景）；双双归零走现有 drop + release。
+  - 连带: `check_write_allowed` (writer_refs>0)、`compute_release_action`
+    （按角色 + 总 refcount 判定，签名加 role 参数）、`write_lease_for`
+    (state.rs:281, fencing 戳看 writer_refs) 三处同改；"lease mode mismatch"
+    的 EBUSY 映射成死代码按规范删除；测试 helpers (dispatch.rs:1133/1237) 适配。
+  - **先做（同改必踩）**: Lance writer 的"写 manifest 时读旧 manifest"模式与 faststart
+    同型，本条不修则 F-LANCEDB-OBJECT-STORE 的 FUSE demo 路径不可用。
+- **Acceptance**:
+  - 单测: open(W)→open(R)→close(R)→close(W) 全序列的 refcount/mode/release 决策
+    状态机；降级路径；降级中途 revoked；三个连带函数的新语义；
+    消融——恢复 mode mismatch 检查必须变红。
+  - e2e: 挂载真实 autumn-fuse，跑 PyAV faststart 复现脚本（当前 100% EBUSY）应成功；
+    回归——双挂载 reader+writer、`echo >> f` + `tail -f` 并存且写者不被挡、
+    单挂载写后读同 fd 字节一致。
+  - 端到端: ComfyUI SaveVideo (mp4 + faststart) 在 autumnfs output 上成功。
+- **Status**: `passes: false` (2026-09-16) — 已定位根因到行、方案已确认，未实现。
+- `passes: false`
+
+### F-FUSE-BIG-IO-TUNING — writeback cache + splice 零拷贝，把大 IO 的 FUSE 开销压进 5%
+- **Trigger** (2026-09-16，用户在 FUSE 性能讨论后确认的三件套之一): 实测
+  4K 随机读延迟 0.44ms 中 FUSE 跨用户态开销仅占 2–10%（~10–50μs），顺序大 IO 上
+  该比例更低；max_read 已 8MB。剩余可白拿的内核侧开关是 writeback cache 与
+  splice_read/write（fuser 支持）。
+- **Scope**: (a) 挂载选项开 writeback cache（内核页缓存回写），评估与现有
+  dirty-inode flush / lease 撤销失效语义 (`evict_revoked_held_leases`、
+  `notify_inval_inode`) 的交互——writeback 会把脏数据驻留内核，lease revoke 时的
+  内核失效路径必须保证一致性，这是主要风险点；(b) `splice_read`/`splice_write`
+  零拷贝路径接入 read_pool/write 管道；(c) 逐项 A/B，无收益即回退（同账本惯例）。
+- **Acceptance**: 固定基线对照——大文件顺序读写、8 并发读、写后 fsync 延迟，
+  每项开关单独 A/B，收益须超出重复测试波动；lease revoke 期间内核页缓存无脏数据
+  丢失（注入 revoke + 读回校验）；与 BUG-FUSE-INVAL-ON-DISPATCHER-THREAD 的
+  复现步骤联测不引入新死锁。
+- **Status**: `passes: false` (2026-09-16) — 未开工。先于 F-FUSE-IORING-PASSTHROUGH。
+- `passes: false`
+
+### F-FUSE-IORING-PASSTHROUGH — FUSE io_uring 提交 + passthrough 读直达
+- **Trigger** (2026-09-16，用户确认): Linux 6.x FUSE 支持 io_uring 提交路径与
+  passthrough 模式（读直达底层文件、跳过用户态拷贝），是"用户态实现复杂度 +
+  接近内核态大 IO 性能"的折中。fuser crate 已有实验性支持。前置依赖：
+  F-FUSE-BIG-IO-TUNING 先行（更小代价先拿大头）。
+- **Scope**: (a) 确认目标内核版本支持项（fuse.io_uring 需 6.14+ 档位，passthrough
+  需 6.x + 挂载 `-o allow_passthrough` 类选项，先在 H200-1 的实际内核上核对）；
+  (b) fuser 实验特性接入评估——读路径 passthrough 要求底层文件句柄与 FUSE inode
+  的映射，autumnfs 的"文件"是 KV/extent 聚合而非本地文件，**passthrough 只可能
+  作用于本地缓存层或 page-cache 命中路径**，先做可行性 spike 再定形态；
+  (c) io_uring 提交替换 /dev/fuse 同步 read/write 循环，与 compio runtime 的
+  事件循环共存性（F-COMPIO-UPGRADE 同族问题，共享调研结论）。
+- **Acceptance**: spike 阶段——在真实内核上证明 passthrough 对"非本地文件"形态
+  可行或不可行，结论写回本条；若可行，A/B 实测大 IO 吞吐与 4K 并发延迟，
+  收益须超波动；正确性回归同 F-FUSE-BIG-IO-TUNING。
+- **Status**: `passes: false` (2026-09-16) — 未开工；可行性未证，passthrough 与
+  非 POSIX 后端的适配形态是最大未知。
+- `passes: false`
+
+### F-LANCEDB-OBJECT-STORE — autumn 作为 LanceDB 的原生 object_store 后端
+- **Trigger** (2026-09-16，用户定调走原生 object_store 路径而非 FUSE 直跑；
+  memory 现有实现定位为"简化的 lancedb"，二者长期不竞争，memory 未来可选
+  Lance 做大向量索引后端)。立论：lance/lancedb Rust 侧底层是 Apache `object_store`
+  crate，支持自定义 ObjectStore 注入 (`ObjectStoreParams`)；lance 的存储需求
+  （不可变列式文件 + 前缀 list + manifest 原子提交）与 ordered KV + MVCC 同构，
+  CAS 语义比 S3 后端（需外挂 DynamoDB 锁）更原生。避开 FUSE 用户态开销与
+  list/stat 密集元数据路径。
+- **前置**: BUG-FUSE-WRITE-READ-DUAL-OPEN-EBUSY 先修——仅影响 FUSE demo 路径，
+  但 demo 是本条的第一步验收。
+- **Scope**: (1) FUSE demo 路径跑通 `lancedb.connect("file:///mnt/autumn/lancedb")`
+  建/写/查一张向量表（验证 rename/原子替换语义在 KV 上的表现）；
+  (2) `autumn-object-store` 适配层（新 crate，预估 1–2k 行）：`put/get/delete/list`
+  映射 KV streaming 原语，manifest 提交映射 **put-if-absent / CAS**（基于 MVCC，
+  这是整个集成唯一需要认真设计的语义点）；(3) list 性能——KV 前缀 range scan
+  在元数据文件增多后的分页延迟基准（query planning 每次 scan 目录，决定小查询
+  P99）；(4) 读写 batch 布局核对——lance 按 batch（几百 KB–几 MB）读向量，
+  与 1MB 随机读 355MB/s 的实测对上即可，4K 碎片读偏弱但 lance 文件布局规避。
+- **Acceptance**: demo 路径——表创建、追加、向量检索、删除全通过，双开修复后
+  writer+reader 并发不 EBUSY；object_store 路径——并发双 writer 提交不互相覆盖
+  （CAS 生效，消融：改成 last-writer-wins 测试变红）；list 1000+ fragment 的
+  scan 延迟有基准数字；与 S3 后端跑同一基准集对比吞吐/P99。
+- **Status**: `passes: false` (2026-09-16) — 定调与范围已确认，未开工。
