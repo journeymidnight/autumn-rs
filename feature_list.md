@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-16
+**Last updated:** 2026-09-18
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -192,6 +192,59 @@
   **本轮没有测量**：验收后半（"改动后吞吐提升可复现"）是延迟敏感的，而本机当时有 2600 个
   sglang/ray 进程、load 8+、热核散布在高低两段，按 `feedback_perf_check_cpu_gate` 隔离不出
   干净的核段 ⇒ 测出来的每操作延迟只会是噪声。等安静的机器或用 cpuset 隔离后再测。
+
+### F-CLIENT-WIRE-COMPAT — 一个版本号同时管内部协议和客户端协议，逼着所有内嵌客户端的镜像跟着重建
+- **Trigger** (2026-09-18，用户: 「关于老 stopworld 升级，然后所有依赖都需要 rebuild+升级，似乎不对」):
+  `WIRE_VERSION_MIN/MAX`（`crates/rpc/src/lib.rs:104`）把三件本该分开的事焊成了一个常量：
+  (1) **持久态**（etcd / SST / WAL）—— 全停全启 + rkyv fail-loud，跟客户端无关，这条是对的；
+  (2) **集群内部 wire**（manager↔PS↔EN）—— `MIN=MAX` 代价为零，这三个角色的二进制本来就在
+  同一次部署里一起换；(3) **客户端 wire**（SDK / python wheel / fuse daemon / kvcache /
+  s3 网关 / vLLM·ComfyUI 镜像）—— **被强行绑到 (2) 上**，这是要修的。
+- **证据，不是推演**:
+  - 最近一次 bump 42→43（`2b76620`）删的是 `MSG_APPEND_CHAIN`，一个 **EN↔EN 的消息类型，
+    客户端从来不发**。但 `MIN=MAX=43` 让每个旧 wheel 在 `ClusterClient::connect`
+    （`crates/client/src/lib.rs:1527`）硬失败。为一个客户端看不见的改动，要求所有推理镜像
+    重 build + 重 roll。同型代价 `BUG-WIRE36-UNDEPLOYED` 已经记过一次
+    （「重建每一个内嵌 autumn 客户端的镜像」）。
+  - **「全停全启」这个窗口盖不住客户端进程**。存储那三个角色是我们的；vLLM / sglang /
+    ComfyUI pod / 用户挂着的 fuse mount 不是 —— 既停不了，也不该要求跟着存储版本走。
+  - **现在两头都不对**：`client.rs:1515` 是 `if let Ok(...)`，取 `GetClusterIdResp` 的
+    transport 失败就跳过检查；而服务端**从不校验客户端版本**（`MSG_AUTH_HELLO` 不带版本
+    且是 optional，`partition-server/src/lib.rs:3482` 那处 `wire_compat_check` 是 PS 作为
+    *客户端*连 manager 时的自查）。所以 manager 短暂不可用时，版本不匹配的旧 wheel 照样连得上
+    然后静默乱解码 —— 就是 `part_id = 0` 那个事故的形状（`crates/rpc/src/lib.rs:91`）。
+    既太严（无谓的全量重建），又太松（真不匹配时可能漏过）。
+- **Scope**:
+  1. **枚举客户端面向的消息集**，并把它和内部消息集在代码里分开（不是靠注释约定）。已知它
+     不只是 `partition_rpc`：`--direct-read` 默认开，客户端直连 EN 读，所以 `extent_rpc` 的
+     **读子集**（`MSG_READ_BYTES_BULK` + `MSG_GET_REDIRECT`/`MANY` 的描述符结构）也在客户端面上；
+     再加 `frame.rs`、`cap_token.rs`、`manager_rpc` 的路由/命名空间/authz 子集
+     （`MSG_GET_CLUSTER_ID`、`MSG_GET_REGIONS`、namespace/principal/mint-token）。
+     **先量代价**：这批结构冻结（只许加 msg_type、不许改字段含义）到底拦掉多少将来的改动，
+     在拆常量之前要有个数，否则拆完只是把痛点换了个地方。
+  2. **拆成两个区间**：`CLUSTER_WIRE_*` 保持 `MIN=MAX`，内部随便 bump；`CLIENT_WIRE_*` 走
+     `MIN = MAX-N` 的兼容窗口。两个区间都仍是手工维护（`F-WIRE-VERSION-BY-HAND` 的定调不变，
+     指纹不回来）。
+  3. **校验改成服务端强制**：客户端区间随握手/第一帧上报，PS 与 manager 在**服务端**判定不重叠
+     即拒；客户端自查降级为提前给出好错误信息，而不是唯一的门。
+  4. 演进规则与升级流程分别写进 `crates/rpc/CLAUDE.md` 和 `docs/ops.md`：内部 bump = 只停存储
+     三角色；客户端 bump = 需要兼容窗口公告 + 重建内嵌客户端的镜像。
+- **Non-goals**: 不做存储集群自身的 rolling upgrade（`project_rolling_upgrade_paused` 的定调不变）；
+  持久态仍然是全停全启 + rkyv fail-loud；不换序列化格式。
+- **Acceptance**:
+  - **内部 bump 不再波及客户端**：把 `CLUSTER_WIRE_*` 抬一级而 `CLIENT_WIRE_*` 不动，用改动前
+     构建的客户端对新集群跑 put/get/range/batch/direct-read，字节精确、无拒连。
+  - **客户端面改动必须被服务端拦住**：构造一个把客户端区间伪造成窗口外的连接，断言 **PS 侧**
+     在任何 Put 落盘之前拒绝（不是客户端自己拒），并且事后读回确认没有写入。
+  - **绕过客户端自查的路径不再能写**：模拟取 `GetClusterIdResp` 的 transport 失败（今天会
+     `if let Ok` 跳过），断言写入仍被服务端拒绝。这条是今天那个洞的直接回归。
+  - **窗口内的旧客户端真的能用**：用窗口内旧 commit 构建的 python wheel（不是伪造区间）对新集群
+     跑一遍数据面，读写字节精确。
+  - Ablation，逐条确认变红后还原：合回单常量；去掉服务端校验；把 `CLIENT_WIRE_MIN` 拉回等于 MAX。
+  - `docs/ops.md` 的升级步骤可执行地区分两类 bump；`crates/rpc/CLAUDE.md` 写清哪些文件/结构
+     属于客户端面以及它们的演进规则。
+- **Status**: 仅立账，未动工。先做 Scope 1 的枚举与代价测量，再决定 2/3 的形状。
+- `passes: false`
 
 ### F-STREAM-ATREST-CKSUM — stream 层大 value 的 at-rest 内容校验 + scrub（静默腐化 G12）
 - **Trigger** (2026-08-04, chaos 缺口 loop 的 G12，已 reproduce-first 复现 harness `crates/manager/tests/silent_corruption_rot.rs`): sealed extent 的 **value 数据字节**在单副本上被静默翻位后，**全链无检测**：(a) 客户端读回坏字节仍返回 `CODE_OK`（frame CRC 明确排除 bulk value 段；`.meta` CRC 只覆盖 40B 元数据；WAL/SST CRC 是 partition 层、不覆盖 stream extent 的原始 value）；(b) recovery 从坏副本重填时 `verify` 只校 `length==sealed_length` + eversion、**不校内容** → 把腐化洗成权威；(c) EC 转换对坏字节直接编 parity → 固化成 canonical。stream 层**既无 per-extent/block content checksum、也无 scrubber**；确定性副本轮转让坏副本被一致选中（harness 里 25/64 子区间读命中）。这是**设计缺口**（数据完整性面），不是坏代码——today 的裸机盘不会自发翻位、且需要单副本静默腐化才触发，故不是"今天可复现的线上危害"，属于中期加固。
