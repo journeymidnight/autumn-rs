@@ -24,6 +24,13 @@ use crate::embed::Embedder;
 
 const NPROBE: usize = 8;
 
+/// How much of a symbol's body one SEARCH hit may carry. See `hit`.
+///
+/// 1200 characters keeps virtually every hit whole — the median is ~485 — and
+/// clips only the long tail that was eating callers' context. `get_symbol`
+/// is not subject to it.
+const MAX_SEARCH_SOURCE_CHARS: usize = 1200;
+
 /// Which corpus a search should return. Both live in the same index; the
 /// filter is on each hit's meta `kind`.
 #[derive(Clone, Copy, PartialEq)]
@@ -88,12 +95,43 @@ impl Code {
         }
     }
 
-    /// One search hit. `headings` is present only on document chunks.
-    fn hit(id: &str, m: &Value, text: &str, score: Option<f32>) -> Value {
+    /// One hit. `headings` is present only on document chunks. `max_source`
+    /// caps the body; `None` means whole.
+    ///
+    /// A SEARCH RESULT IS A SHORTLIST, NOT A DELIVERY. Every search hit used
+    /// to carry its symbol's entire body, and one body can be enormous:
+    /// measured against the autumn-rs index, `extent node replication`
+    /// answered with 7 hits and 24,608 characters of source, of which ONE hit
+    /// was 17,396 — 71% of the reply, for a single function — while the median
+    /// hit was 485. An agent that asks three such questions has spent its
+    /// context on code it never chose to read, and it cannot decline: the
+    /// bytes arrive before there is anything to decide with. Downstream this
+    /// showed up as conversations that searched fifteen times and answered
+    /// nothing.
+    ///
+    /// So SEARCH answers with an excerpt and says it is one, while
+    /// `get_symbol` — which exists to fetch one body deliberately — still
+    /// answers whole. The id needed for that is in the hit itself.
+    ///
+    /// The cut is on a CHARACTER boundary, not a byte one: this corpus has
+    /// non-ASCII comments and identifiers, and slicing a `String` mid-codepoint
+    /// panics.
+    fn hit(id: &str, m: &Value, text: &str, score: Option<f32>, max_source: Option<usize>) -> Value {
+        let source = match max_source {
+            Some(max) if text.chars().count() > max => {
+                let kept: String = text.chars().take(max).collect();
+                let dropped = text.chars().count() - max;
+                format!(
+                    "{kept}\n… [{dropped} more chars — this is a search excerpt; \
+                     call get_symbol with id={id:?} for the full body]"
+                )
+            }
+            _ => text.to_string(),
+        };
         let mut v = json!({
             "id": id, "name": m.get("name"), "kind": m.get("kind"),
             "file": m.get("file"), "start": m.get("start"), "end": m.get("end"),
-            "source": text,
+            "source": source,
         });
         if let Some(h) = m.get("headings") {
             v["headings"] = h.clone();
@@ -106,7 +144,7 @@ impl Code {
 
     pub async fn get_symbol(&self, id: &str) -> Result<Option<Value>> {
         match self.store.get_memory(id).await? {
-            Some((text, meta)) => Ok(Some(Self::hit(id, &Self::meta_of(&meta), &text, None))),
+            Some((text, meta)) => Ok(Some(Self::hit(id, &Self::meta_of(&meta), &text, None, None))),
             None => Ok(None),
         }
     }
@@ -136,7 +174,7 @@ impl Code {
                     if let Some((text, meta)) = self.store.get_memory(&id).await? {
                         let m = Self::meta_of(&meta);
                         if corpus.admits(m.get("kind").and_then(|v| v.as_str())) {
-                            out.push(Self::hit(&id, &m, &text, Some(score)));
+                            out.push(Self::hit(&id, &m, &text, Some(score), Some(MAX_SEARCH_SOURCE_CHARS)));
                         }
                     }
                 }
@@ -148,7 +186,7 @@ impl Code {
                     }
                     let m = Self::meta_of(&d.meta);
                     if corpus.admits(m.get("kind").and_then(|v| v.as_str())) {
-                        out.push(Self::hit(&d.id, &m, &d.text, Some(d.score)));
+                        out.push(Self::hit(&d.id, &m, &d.text, Some(d.score), Some(MAX_SEARCH_SOURCE_CHARS)));
                     }
                 }
             }
@@ -326,4 +364,59 @@ impl Code {
                   "docs": r.docs, "is_clean": r.is_clean()}))
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta() -> Value {
+        json!({"name": "write_bulk", "kind": "Function", "file": "src/put.rs",
+               "start": 10, "end": 900})
+    }
+
+    /// A search hit is a shortlist entry. One symbol in this corpus is 17,396
+    /// characters — 71% of a 7-hit reply — and every caller paid for it before
+    /// it could decide whether it wanted the body at all.
+    #[test]
+    fn search_hits_carry_an_excerpt_and_say_so() {
+        let body = "x".repeat(20_000);
+        let v = Code::hit("src/put.rs::write_bulk", &meta(), &body, Some(0.9),
+                          Some(MAX_SEARCH_SOURCE_CHARS));
+        let src = v["source"].as_str().unwrap();
+        assert!(src.chars().count() < MAX_SEARCH_SOURCE_CHARS + 200);
+        assert!(src.contains("more chars"), "a cut must announce itself: {src:.200}");
+        assert!(src.contains("get_symbol"), "and name how to get the rest");
+        assert!(src.contains("src/put.rs::write_bulk"), "with the id to ask for");
+    }
+
+    /// get_symbol exists to fetch one body deliberately. Capping it would
+    /// leave no way to read a long function at all.
+    #[test]
+    fn get_symbol_is_never_capped() {
+        let body = "x".repeat(20_000);
+        let v = Code::hit("id", &meta(), &body, None, None);
+        assert_eq!(v["source"].as_str().unwrap().len(), 20_000);
+    }
+
+    /// A short body is returned untouched — the median hit here is ~485 chars,
+    /// so the cap must be invisible for almost every result.
+    #[test]
+    fn a_short_body_is_untouched() {
+        let body = "fn write_bulk() {}";
+        let v = Code::hit("id", &meta(), body, Some(0.5), Some(MAX_SEARCH_SOURCE_CHARS));
+        assert_eq!(v["source"].as_str().unwrap(), body);
+    }
+
+    /// The cut is on a CHARACTER boundary. This corpus has non-ASCII comments
+    /// and identifiers, and slicing a String by byte index mid-codepoint is a
+    /// panic — which would take down the whole search, not just one hit.
+    #[test]
+    fn a_multibyte_body_does_not_panic_at_the_cut() {
+        let body = "写入路径的注释".repeat(1000);   // 3 bytes per char
+        let v = Code::hit("id", &meta(), &body, Some(0.5), Some(MAX_SEARCH_SOURCE_CHARS));
+        let src = v["source"].as_str().unwrap();
+        assert!(src.starts_with("写入路径的注释"));
+        assert!(src.contains("more chars"));
+    }
 }
