@@ -243,8 +243,48 @@
   - Ablation，逐条确认变红后还原：合回单常量；去掉服务端校验；把 `CLIENT_WIRE_MIN` 拉回等于 MAX。
   - `docs/ops.md` 的升级步骤可执行地区分两类 bump；`crates/rpc/CLAUDE.md` 写清哪些文件/结构
      属于客户端面以及它们的演进规则。
-- **Status**: 仅立账，未动工。先做 Scope 1 的枚举与代价测量，再决定 2/3 的形状。
+- **Status**: Scope 1（枚举 + 代价测量）已做完，**结论改变了 2/3 的做法顺序**，见 notes。
+  代码未动。
 - `passes: false`
+- **notes** (2026-09-18, Scope 1 完成 — 枚举与代价测量):
+  - **客户端面是可枚举的**：236 个 wire 类型里约 61 个在上面。`partition_rpc` 数据面、
+    `manager_rpc` 的路由/lease/inode/authz 子集（挂载中的 fuse daemon 就是内嵌客户端，
+    `fuse/src/dispatch.rs:1100` 的 statfs 真的会去问 manager 要 cluster-df）、`frame.rs`、
+    `cap_token.rs`，加上 `extent_rpc` 的**读子集**（`--direct-read` 默认开，SDK 经
+    `read_extent_value_direct` 直连 EN）。EC 转换 / recovery / WriteShard / df / reconcile /
+    split-merge / op-ledger / dashboard 都不在。
+  - **代价（45 个 wire 版本区间逐个分类）**：三种口径分别得到 16/46、15/45、18/45，
+    **稳定结论是约 60% 的 bump 没有改动任何内嵌客户端会解码的东西** —— 删 chained
+    replication、EC 分条转换、at-rest 腐化扫描、EN UUID 身份、fence-drain、WAL 自愈、
+    GC 可观测性、dashboard，全都逼着每个内嵌客户端镜像重建。精确计数不是承重部分，
+    不同口径都指向同一个数量级。
+  - **⚠️ 计数是下界，检测器有已证实的盲区**：它看不见"结构没变、含义变了"。`a857084`
+    (v34→35) 的提交说明自己写着「no struct change, but a v34 client reads a declined item
+    as a per-item error」—— `GetRedirectResp.code` 的语义改动，正落在 SDK 直读热路径上，
+    被我判成了"内部"。同类还有 `4a9b336`：它从 `GetClusterIdResp` 删掉了
+    `wire_fingerprint`，而 `WIRE_VERSION_MAX` 前后都是 36（改动发生在非 bump 提交里）。
+  - **推翻了原条目的一个假设 —— 换编码救不了这件事，还会更糟。** 原本以为"客户端面只许
+    加字段"配一个带 tag 的编码就能覆盖大部分。实测 16 次打断里 9 次只是加字段，看起来
+    支持这个想法；但逐条核对后，其中 `1de0005` 给 `GetRedirectResp` 加的
+    `ec_data_shards` 是个**判别位**，`replica_addrs` 的含义随它改变。rkyv 因为布局移位而
+    **响亮失败**；换成 prost，老客户端会忽略这个未知字段、解码"成功"，然后把 EC 分片地址
+    当副本地址、**静默**把分片字节当 value 读回去。9 次里只有 1 次（`a8c6afb`
+    `AllocInodesReq.volume`）是干净的"prost 本可以救"。
+  - **rkyv 加字段的失败是"有时响亮"，不是"总是响亮"**（实测，rkyv 0.8.15，走本树同款
+    `AlignedVec<16>` + checked `from_bytes`）：root 在 buffer **末尾**，所以老解码器读的是
+    新结构的后缀。`{u64,u64}` 读 `{u64,u64,u64}` 得到 `Ok` 且字段**整体错位**；
+    `{u64,u32}` 加一个 `u32` 落进尾部 padding，两个方向都 `Ok`、新字段读成 0;
+    只有带 `Vec`/`String` 的形状才因相对指针越界而报错。**"plain rkyv fail-loud 本身就给了
+    安全"这句话的适用范围比 [[project_rolling_upgrade_paused]] 记的窄** —— 那条讲的是
+    持久态重放，这里讲的是 RPC 跨版本解码，后者的响亮与否取决于结构形状。当前唯一真正的
+    围栏是版本握手本身。
+  - **⇒ 真正缺的机制不是编码，是客户端把协商结果扔了。** `crates/rpc/src/lib.rs:99` 已经
+    写明："the client runs its compatibility check once at connect and keeps nothing, so no
+    call site can gate on the negotiated version"。剩下那 ~40% 里真正无法靠编码解决的是
+    **行为/语义**改动（v26 key 布局、v34 EC 判别位、v35 decline 语义）和 v28 的帧重塑 ——
+    它们需要**调用点按协商版本分支**。没有这个能力，任何兼容窗口都开不出来，换什么编码都
+    一样。**所以 Scope 2/3 的前置不是拆常量，是先让客户端留住协商到的版本并使调用点可以
+    据此分支**；这一步小且自足，应当先做。encoding 迁移（含 prost）在这条路径上**不做**。
 
 ### F-STREAM-ATREST-CKSUM — stream 层大 value 的 at-rest 内容校验 + scrub（静默腐化 G12）
 - **Trigger** (2026-08-04, chaos 缺口 loop 的 G12，已 reproduce-first 复现 harness `crates/manager/tests/silent_corruption_rot.rs`): sealed extent 的 **value 数据字节**在单副本上被静默翻位后，**全链无检测**：(a) 客户端读回坏字节仍返回 `CODE_OK`（frame CRC 明确排除 bulk value 段；`.meta` CRC 只覆盖 40B 元数据；WAL/SST CRC 是 partition 层、不覆盖 stream extent 的原始 value）；(b) recovery 从坏副本重填时 `verify` 只校 `length==sealed_length` + eversion、**不校内容** → 把腐化洗成权威；(c) EC 转换对坏字节直接编 parity → 固化成 canonical。stream 层**既无 per-extent/block content checksum、也无 scrubber**；确定性副本轮转让坏副本被一致选中（harness 里 25/64 子区间读命中）。这是**设计缺口**（数据完整性面），不是坏代码——today 的裸机盘不会自发翻位、且需要单副本静默腐化才触发，故不是"今天可复现的线上危害"，属于中期加固。
