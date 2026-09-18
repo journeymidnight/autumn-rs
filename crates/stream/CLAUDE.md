@@ -961,9 +961,27 @@ Two invariants make this safe rather than merely present:
   must never share a batch. Both grouping sites (`MSG_READ_BYTES` and
   `MSG_READ_BYTES_BULK`) key on `(extent_id, payload_ref())`.
 
-`read_plan` returns a typed `ReadRefusal` (`EversionStale` | `PayloadNotHere`)
-rather than a bare `None`, so the two refusals reach the client as distinct
-codes and each self-heals differently.
+`read_plan` returns a typed `ReadRefusal` (`EversionStale` | `PayloadNotHere` |
+`TooLargeForOneFrame`) rather than a bare `None`, so each refusal reaches the
+client as its own code and self-heals differently.
+
+**`TooLargeForOneFrame` is a SERVER-side bound, and it has to be.** `read_plan`
+bounds a read by the FILE, a log extent is 16 GiB, `ReadBytesReq.length` is a
+u64 and `0` means to-end — so one remote request can ask for four times what
+the frame header's `payload_len: u32` can express. Most in-tree clients chunk at
+`AUTUMN_STREAM_READ_CHUNK_BYTES` (256 MiB), but not all — `ec_read_full` sends a
+whole-shard `length = 0` read and `stream_one_source` does the same with
+`total == 0`, so a 16 GiB EC extent at K=3 or K=4 is now REFUSED where it used
+to wrap. That is the same outcome, typed instead of silent; those callers have
+to chunk. And the server cannot depend on the client either way. Both other answers are worse: the length silently wrapped and the peer
+reported a CRC error on a frame that was never corrupt, and once the encoder
+asserts its ceiling (see `crates/rpc/CLAUDE.md`), an un-chunked request would
+take the extent node DOWN — trading a remotely-triggerable bad frame for a
+remotely-triggerable crash. Refusing names the fix ("chunk the read") and keeps
+the node serving; the encoder's assert is then the last resort for frames this
+node builds itself, not the thing a remote request trips. It reuses
+`CODE_PRECONDITION` rather than claiming a new code, because a new code is a
+stop-the-world deploy.
 
 **A BULK read's refusal carries the same status its plain twin does.** The bulk
 arm used to answer every `get_extent` error with `bulk_read_head(CODE_ERROR,

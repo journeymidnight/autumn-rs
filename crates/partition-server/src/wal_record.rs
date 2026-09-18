@@ -51,7 +51,6 @@ pub(crate) const V1_SENTINEL: u8 = 0xff;
 /// Inner-payload header size (op + key_len + val_len + expires_at).
 pub(crate) const PAYLOAD_HEADER: usize = 17;
 /// V1 envelope overhead = sentinel(1) + length(4) + crc(4).
-#[allow(dead_code)]
 pub(crate) const V1_ENVELOPE_OVERHEAD: usize = 9;
 
 /// Byte offset of `value` within a record, from the record's FIRST on-disk

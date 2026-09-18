@@ -409,6 +409,111 @@
 - **Scope**: 编码前检查 `wire_payload_len > u32::MAX` 则返回错误（或按同样理由 assert），
   让调用方分块；补一条构造超限载荷的回归测试。
 - **Status**: `passes: false` (2026-09-04) — 未修，已核对 `crates/rpc/src/frame.rs` 确认。
+- **Status** (2026-09-18): 已修。四个编码入口（`Frame::encode`、`encode_response_with`、
+  `encode_vectored_head`、bulk 响应头）现在统一经 `header_lens` 收窄长度，越界 **assert**
+  而不是让 `as u32` 静默回绕。三点比账本原文更进一步：
+  ① 账本只说了 `wire_payload_len`，实际 `ctrl_len as u32` 也是裸截断——现由同一处覆盖
+  （ctrl 是 payload 的一部分，所以 payload 的界先触发；单独给 ctrl 加 assert 会是死代码，
+  写了又删，改由 `header_lens` 自己计算 `wire_payload_len` 来保证这层包含关系）；
+  ② 界取 **`MAX_PAYLOAD_LEN`** 而非 `u32::MAX` —— 解码侧本来就用它拒绝
+  （`FrameError::PayloadTooLarge`），且其注释明写将来会下调为实际上限；编码侧若对着类型
+  最大值比较，那天就会编出自己对端拒收的帧；
+  ③ `encode_response_with` 的检查放在 `write_payload` 闭包**之前**，越界的调用方不必先
+  被要求产出那些字节。
+  选 assert 而非 `Result`：同文件既有先例（`write_payload` 字节数不符是 release 强制
+  `assert_eq!`，注释理由 "Fail loud rather than ship a silently-bad frame"），且改成
+  `Result` 会波及 `encode()` 的每一个调用方。
+- **只加编码侧 assert 是不够的，而且更糟（自查发现，本条最重要的一点）**：
+  `read_plan` 只把读长度夹到**文件**大小，而 log extent 固定 16 GiB、`ReadBytesReq.length`
+  是 u64 且 `length=0` 表示读到尾 —— 所以**一个远端请求就能让响应帧超过 4 GiB**。
+  改动前它回绕成损坏帧（EN 活着，对端报 CRC 错）；只加 assert 的话就变成
+  **远端可触发的 EN panic** —— 把"可远程触发的坏帧"换成"可远程触发的宕机"，净亏。
+  因此在**请求层**加了带类型的拒绝：`ReadRefusal::TooLargeForOneFrame`（复用
+  `CODE_PRECONDITION`，不新增 wire code），bulk 与非 bulk 两条路共用 `read_refusal_resp`
+  发出，调用方收到的是"超出单帧上限，请分块"而不是连接被切断。编码侧的 assert 因此
+  退化为**本节点自造帧的最后一道**不变量，而不是远端请求会撞上的那道。
+- **第二条远端可达路径（独立评审发现，比我自查那条更严重）**：PS 的
+  `MSG_BATCH_GET_BULK` 把 N 个 key 的值**聚合进一个帧**，而上游对 N **没有任何上限** ——
+  SDK 的 `get_many` 会把同分区的 key 全部塞进一个请求，单值上限 64 MiB，于是
+  几百个 8 MiB 值（model load 的典型形状）就越过 4 GiB。更要命的是
+  release profile 是 **`panic = "abort"`**，所以 assert 不是可被 `spawn_supervised`
+  接住的任务 panic，而是**整个 PS 进程中止** —— 一个 `get_many` 打掉一个节点。
+  代码库其实已经在同一文件 20 行之外为 `get_redirect_many` 写下过这个危害
+  （"model load 期间批量回退会把几百个 8 MiB 值聚成 GB 级帧"），只是 batch get 这条没设防。
+  修法：在**循环内**累计并越限即返回 —— 放在循环后会先在 PS 上物化几个 GB 的 `Bytes`；
+  返回 `CODE_PRECONDITION`，因为 SDK 对它**已有**逐 key `get_bound` 回退（原本给 stale-epoch 用的），
+  于是超限批次自动降级成 N 次小读，而不是把错误抛给调用方。
+- **`MSG_RANGE` 查过，不需要设防（核实，非推断）**：它形状相似（`RangeResp.entries` 内联、
+  只被远端 `limit: u32` 限条数、无字节上限），但 `RangeEntry.value` **恒为空**
+  （`rpc_handlers.rs` 里 `value: vec![]`）——range 只返回 key。让 batch-get 危险的那个放大器
+  （把 64 MiB 级的值内联进来）在这条路上不存在，要凑够 4 GiB 需要单次返回上亿个 key，
+  而那会先在 `out` 上 OOM，且四个在仓消费者都用小 limit 分页。按"不为复现不了的 bug 加防御"
+  不动它，把判据记在这里，免得下次有人重新推一遍。
+- **另一处收口（评审建议，已采纳）**：`header_lens` 改成自己**计算** `wire_payload_len`
+  而不是接收它。原先"ctrl 的检查不可达"只是**当前四个调用方的巧合**，第五个编码器若用别的方式
+  算长度，就会拿到一个被静默回绕的 `ctrl_len` —— 正是本条要修的 bug 上移一层。现在由构造保证。
+- **Acceptance 达成**: `frame_length_ceiling_tests` 四条 —— 越界的 vectored head 被拒、
+  越界响应在写 payload 前就被拒（闭包里放 `unreachable!`）、**恰好等于上限**的帧仍能编出
+  （边界，off-by-one 会藏在这里）、越界 ctrl 由 payload 界拒掉。消融：去掉那条 assert，
+  三条立刻变红。构造 4 GiB 载荷不需要真分配内存——这两个入口收的是**长度**而非 buffer。
+  服务端那半另有 `read_frame_ceiling_tests` 四条：16 GiB extent 的到尾读被拒、显式超限长度
+  被拒、**恰好等于上限**的读仍被服务、以及 256 MiB 常规分块不受影响（同样只设长度原子量，
+  不占磁盘）；消融去掉那个界，前两条变红。
+  PS 那半有 `batch_bulk_ceiling_tests` 三条（上限低于帧天花板且给 ctrl 留足余量、
+  恰好等于上限可服务而多一字节不可、512 个 8 MiB 值确实越界）。
+  **坦白覆盖缺口**：这三条钉的是判据与常量，**没有钉住调用点** —— 驱动真 handler 需要一个活的
+  partition 外加几 GB 的值，单测够不着。要真正钉住得写一条带可注入上限的集成测试；
+  现在靠的是那段说明"为什么必须在循环内 bail"的注释，不是测试。
+- **性能**: 每次编码多一次 `usize` 比较（`#[inline]`，与常量比，分支恒不取），相对同一函数里
+  的 memcpy + CRC 是噪声；未新增分配或拷贝。没有跑 bench —— 这台机器多租户、本地基线已过期，
+  为这种量级的改动跑出的数字不可信，理由记在此处而不是假装测过。
+- **最终形状（用户 2026-09-18 定调："所有地方都应当有 bound，能加就加，然后把 assert 删了"）**：
+  编码侧的 `assert!` 改成 `debug_assert!` —— release 是 `panic = "abort"`，留着它等于把
+  "远端可触发的坏帧"换成"远端可触发的宕机"，净亏；debug 构建（含 `cargo test`）仍会响，
+  所以回归测试照旧有效、新写的路径在开发期就被抓住。真正保护生产的界放在**每个生产者**上，
+  因为只有它们能"拒绝并继续服务"。五处全部加上，每处都是降级而非报错：
+  1. **EN 读** `READ_REPLY_MAX_VALUE_BYTES` → `ReadRefusal::TooLargeForOneFrame`，提示分块。
+     注意扣的是**两种回复形状里较大的那个**（bulk 是 `[code][空 message]`，非 bulk 的
+     `ReadBytesResp` 另占 9 字节）——我第一版只扣了帧自身的 `CTRL_OVERHEAD`，于是留下一段
+     能过检查却在编码时越界的尺寸，而当时的边界测试恰好把那个值钉成"合法"。
+  2. **PS batch get** `batch_bulk_budget_exceeded(value_bytes, keys)` → `CODE_PRECONDITION`，
+     SDK 已有的逐 key 回退接住。**把 ctrl 按 key 数算进预算**：ctrl 与值同在一个 payload，
+     只留固定余量的话，100 万个 4 KiB 的 key 值能过而 ctrl 把帧顶出去。
+     同样的错我在第 5 条上又犯了一次（只算值不算每项开销），第四轮评审抓出来，
+     现在两处都按"值 + 项数×每项开销"算。
+  3. **PS→EN group-commit append** `MAX_WRITE_BATCH_BYTES`，在取 batch 处按字节切前缀，
+     余下的留在队列里下一批发 —— 不丢不失败。这条最要紧，走的是热写路径：`pending` 只按
+     **条数**限（3072），而单个 Put 可到 64 MiB。顺带接上了早就写好却挂着
+     `#[allow(dead_code)]` 的 `WriteRequest::encoded_size()`，并修掉了那句
+     "每个在途 batch 最多 30 MB"的**假注释**（代码里从来没有这个常量）。
+  4. **`MSG_COPY_EXTENT`** `COPY_REPLY_MAX_VALUE_BYTES` → `FailedPrecondition`，
+     `size == 0` 会内联整个 extent，而 handler 对任何 peer 应答。
+  5. **`MSG_GET_REDIRECT_MANY`** `GET_REDIRECT_MANY_MAX_INLINE_BYTES` → 超预算的项改发
+     **declined**，客户端本来就会对 declined 走 proxy，于是退化成"慢一点的读"而不是失败。
+- **测试**: 编码侧 4 条（debug 下仍 should_panic）、EN 读 4 条（含**在天花板附近扫一圈、
+  真的驱动 `bulk_read_head`** 的性质测试——消融回我那版 off-by-one 即变红）、PS batch 4 条
+  （含"百万小 key 的 ctrl 必须被算进去"）、写批 3 条（超限切分、常规整批不受影响、
+  单个超限请求仍能前进）。
+- **第四轮评审（fable）的结论已全部处理**：① 第 5 处（redirect-many）的界只算了值、
+  没算**每项的 rkyv 开销**（≥69 B/项），6.5 万项 × 65,535 B 就能值合法而帧越界 —— 与第 2 处
+  同一个错，我连犯两次；现已改成"值 + 项数×每项开销"并补了消融过的测试。
+  ② `WriteRequest::encoded_size()` 比真实 WAL 记录**每条少算 17 字节**（漏了 envelope 与
+  internal key 的 8 字节时间戳），而记录条数并不受 `max_write_batch()` 限（一次 BatchPut
+  会把它所有 op 一起 push）；现按 `V1_ENVELOPE_OVERHEAD + PAYLOAD_HEADER + 8` 算准。
+  ③ 三条 `should_panic` 断的是 `debug_assert!`，`cargo test --release` 会判它们失败；
+  已加 `#[cfg(debug_assertions)]`，debug/release 两种构建都验过。
+  ④ 另修 6 处文档假话（"release-enforced"与 `debug_assert!` 自相矛盾、两个不存在的常量名、
+  "所有 in-tree 客户端都分块"、已过期的 `panic="abort"` 说法、"没有一个会让调用方直接失败"）。
+  它同时核实了**切批不会造成 wedge 或乱序**（seq 在 `start_write_batch` 内按批序分配、
+  `FuturesOrdered` 保持 Phase 3 顺序、剩余项在下一轮或关机路径必被取走），以及 manager
+  的三个 `limit` 字段都只能截断不能放大 —— 没有漏掉的生产者。
+- **切批的一个语义变化（已写进代码注释）**：跨切点的 BatchPut 不再在**单个 append 内原子持久**，
+  崩溃可能只落一半；但没有任何已 ACK 的东西会丢 —— 响应在最后一个 op 才发，半写的 BatchPut
+  还没回答过任何人。
+- **仍未钉住的**: PS 三处的**调用点**都没有测试驱动真 handler（需要活 partition + GB 级数据）；
+  钉住它们要写带可注入上限的集成测试。`MSG_RANGE` 查过不需设防（`RangeEntry.value` 恒空）。
+  一个内存向的更紧的 batch 上限（注释原本想要的 30 MB）是另一个带实测的决定，不在本条。
+- `passes: true`
 
 ### BUG-REBUILD-FSYNC-UNCOUNTED — 重建成功但 fsync 失败，整个分片不记账
 - **Trigger** (2026-09-04，评审发现，已核对代码): EC 重建的成功分支上，

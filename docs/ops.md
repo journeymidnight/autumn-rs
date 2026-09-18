@@ -3073,12 +3073,27 @@ The report is ordered so the first thing you read is the cause, not the symptom:
    vacuous over an empty expectation set, so a run that wrote nothing would
    otherwise report `0 mismatches, 0 not_found` and pass. If you see this, fix
    the workload before reading anything below it.
-3. **`WHY:`** — a scan of the EN subprocess logs for fail-loud markers
+3. **A refusal naming one frame's payload ceiling** — a reply grew past what
+   the wire format can express, so the server refused instead of building it.
+   Five producers can reach that size and each says so in its own words: an
+   extent-node read (`read range exceeds one frame's payload ceiling`), a
+   `get_many` batch (`batch of N keys exceeds one frame's payload ceiling`), a
+   `copy of N bytes from extent E`, a redirect-many item (`batch reply reached
+   one frame's payload ceiling`), and the group-commit append, which splits
+   silently and launches the remainder as the next batch. Most degrade rather
+   than fail — the batch retries per key, a declined redirect item is proxied,
+   the append splits — but the extent-node read refusal IS an error to a caller
+   that does not chunk (`ec_read_full`, `ec_reconstruct_shard_subrange`), which
+   is the honest outcome: those bytes cannot be delivered in one frame. In a DEBUG
+   build the encoder also panics on such a frame (`frame payload is N bytes,
+   over the wire format's ...`); in release it does not, deliberately, because
+   `panic = "abort"` would turn a remote request into a dead node.
+4. **`WHY:`** — a scan of the EN subprocess logs for fail-loud markers
    (`WAL-FAILSTOP`, `META-FAILCLOSED`, quarantine, stale VP, refused EC
    completions, superseded attempts, disk-offline, supervised-loop panics).
    **Their absence is the sharper finding**: the invariant broke while every
    layer believed it was fine. `logs:` gives the directory to dig in.
-4. The per-category counts and samples.
+5. The per-category counts and samples.
 
 Manager and PS run in-process, so their tracing goes to the test's own stderr,
 not to `logs:`. Only EN logs are on disk — which is the right surface anyway,

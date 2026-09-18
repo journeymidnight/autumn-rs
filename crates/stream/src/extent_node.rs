@@ -2906,6 +2906,23 @@ fn read_plan(extent: &ExtentEntry, req: &ReadBytesReq) -> Result<(u64, u64, u64)
     } else {
         req.length.min(total_len.saturating_sub(read_offset))
     };
+    // The frame that will carry these bytes has a u32 length field, and this
+    // bound is the FILE's, not the wire's — a to-end read of a 16 GiB log
+    // extent asks for four times what the header can express. Refuse here so
+    // the caller learns to chunk; the encoder's own assert is then a last
+    // resort for frames this node builds itself, not the thing a remote
+    // request trips.
+    //
+    // The budget is the payload MINUS the reply's own ctrl, and the two reply
+    // shapes do not cost the same: bulk sends `[code][message]` with an empty
+    // message (`CTRL_OVERHEAD + 1`), the non-bulk `ReadBytesResp` prefixes 9
+    // bytes of its own (`CTRL_OVERHEAD + 9`). `read_plan` does not know which
+    // one answers, so it has to budget for the larger — subtracting only
+    // `CTRL_OVERHEAD` leaves a band of sizes that pass here and then build a
+    // frame whose length wraps, which the peer reports as corruption.
+    if read_size > READ_REPLY_MAX_VALUE_BYTES {
+        return Err(ReadRefusal::TooLargeForOneFrame);
+    }
     Ok((total_len, read_offset, read_size))
 }
 
@@ -2918,6 +2935,20 @@ enum ReadRefusal {
     EversionStale,
     /// This node does not hold the payload file the request named.
     PayloadNotHere,
+    /// The range is servable but does not fit in one frame, so the caller has
+    /// to chunk it.
+    ///
+    /// `read_plan` bounds a read by the FILE, and a log extent is 16 GiB, so a
+    /// `length = 0` to-end read asks for four times what the frame header's
+    /// `payload_len: u32` can express. Every in-tree client already chunks
+    /// (`AUTUMN_STREAM_READ_CHUNK_BYTES`, 256 MiB), which is why this is not a
+    /// live failure — but the server must not depend on the client for it. The
+    /// alternative is worse in both directions: the length silently wrapped and
+    /// the peer reported a CRC error on a frame that was never corrupt, and
+    /// once the encoder asserts instead, an un-chunked request would take the
+    /// extent node down. Refusing tells the caller what to do and keeps the
+    /// node serving.
+    TooLargeForOneFrame,
 }
 
 impl ReadRefusal {
@@ -2925,6 +2956,10 @@ impl ReadRefusal {
         match self {
             Self::EversionStale => CODE_EVERSION_MISMATCH,
             Self::PayloadNotHere => CODE_PAYLOAD_NOT_HERE,
+            // No new wire code: "you asked for more than one frame can carry"
+            // is a precondition the caller can fix by chunking, and adding a
+            // code costs a stop-the-world deploy.
+            Self::TooLargeForOneFrame => CODE_PRECONDITION,
         }
     }
 
@@ -2932,9 +2967,29 @@ impl ReadRefusal {
         match self {
             Self::EversionStale => "eversion mismatch",
             Self::PayloadNotHere => "payload file not held here",
+            Self::TooLargeForOneFrame => {
+                "read range exceeds one frame's payload ceiling; chunk the read"
+            }
         }
     }
 }
+
+/// The most payload bytes a `CopyExtentResp` can inline. It is an rkyv struct
+/// with a few scalar fields beside the payload, so a megabyte of headroom under
+/// the frame ceiling covers its framing with room to spare.
+pub(crate) const COPY_REPLY_MAX_VALUE_BYTES: u64 =
+    autumn_rpc::frame::MAX_PAYLOAD_LEN as u64 - (1 << 20);
+
+/// The most value bytes a read reply can carry, for either reply shape.
+///
+/// Both go through the frame encoder's `payload_len: u32`, and both spend some
+/// of it on their own ctrl: the bulk head writes `[code][message]` with an
+/// empty message, and `ReadBytesResp` writes 9 bytes before the value. The
+/// budget is the ceiling minus the LARGER of the two, because `read_plan`
+/// decides before anything knows which shape will answer.
+pub(crate) const READ_REPLY_MAX_VALUE_BYTES: u64 = autumn_rpc::frame::MAX_PAYLOAD_LEN as u64
+    - autumn_rpc::frame::CTRL_OVERHEAD as u64
+    - 9;
 
 /// The authoritative committed length reported to a length probe — shared by
 /// `handle_commit_length` and `handle_probe_extent` (their length-source
@@ -9888,6 +9943,22 @@ impl ExtentNode {
         } else {
             req.size.min(logical_len.saturating_sub(offset))
         };
+        // `CopyExtentResp` INLINES the payload, so this answer is one frame and
+        // `size == 0` means "the whole extent" — 16 GiB for a log extent, four
+        // times what a frame's `payload_len: u32` can express. The handler
+        // answers any peer, so refuse rather than build it: the alternative is
+        // a wrapped header the peer reports as corruption. The caller asks for
+        // a range instead.
+        if size > COPY_REPLY_MAX_VALUE_BYTES {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "copy of {size} bytes from extent {} exceeds one frame's payload \
+                     ceiling; request a range",
+                    req.extent_id
+                ),
+            ));
+        }
 
         // copy serves a range of a (possibly sealed) extent —
         // re-open on miss.
@@ -15103,5 +15174,104 @@ mod ec_rebuild_progress_tests {
             df().await.is_empty(),
             "a task that ended must stop reporting; a stale 3/8 outlives the task otherwise"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_frame_ceiling_tests {
+    use super::*;
+
+    /// Only the length atomics matter to `read_plan`, so a 16 GiB extent costs
+    /// nothing on disk here.
+    async fn entry_of_len(node: &ExtentNode, extent_id: u64, len: u64) -> Rc<ExtentEntry> {
+        let entry = node.ensure_extent(extent_id).await.expect("entry");
+        entry.len.store(len, Ordering::SeqCst);
+        entry.sealed_length.store(len, Ordering::SeqCst);
+        entry.sealed.store(true, Ordering::SeqCst);
+        entry.avali.store(1, Ordering::SeqCst);
+        entry
+    }
+
+    async fn node() -> (tempfile::TempDir, ExtentNode) {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        (dir, node)
+    }
+
+    /// A to-end read of a log extent asks for the whole 16 GiB, which no frame
+    /// can carry. The server must say so rather than depend on the client
+    /// chunking: the two alternatives are a silently wrapped length — the peer
+    /// then reports a CRC error on a frame that was never corrupt — or an
+    /// encoder assert that takes this node down on a remote request.
+    #[compio::test]
+    async fn a_to_end_read_of_a_16gib_extent_is_refused_not_framed() {
+        let (_d, node) = node().await;
+        let entry = entry_of_len(&node, 9001, 16 * 1024 * 1024 * 1024).await;
+        let req = ReadBytesReq::new(9001, 1, 0, 0, PayloadRef::in_dat());
+        assert_eq!(
+            read_plan(&entry, &req).unwrap_err(),
+            ReadRefusal::TooLargeForOneFrame
+        );
+    }
+
+    /// An explicit length over the ceiling is refused for the same reason.
+    #[compio::test]
+    async fn an_explicit_oversized_length_is_refused() {
+        let (_d, node) = node().await;
+        let entry = entry_of_len(&node, 9002, 8 * 1024 * 1024 * 1024).await;
+        let req = ReadBytesReq::new(9002, 1, 0, 5 * 1024 * 1024 * 1024, PayloadRef::in_dat());
+        assert_eq!(
+            read_plan(&entry, &req).unwrap_err(),
+            ReadRefusal::TooLargeForOneFrame
+        );
+    }
+
+    /// Whatever `read_plan` ACCEPTS must actually encode. Asserting only that
+    /// a number comes back is what let an off-by-one through: the budget
+    /// subtracted the frame's own overhead but not the REPLY's ctrl, so the
+    /// largest "legal" read aborted the node inside the encoder — and on
+    /// `panic = "abort"` that is the whole process.
+    ///
+    /// So sweep the sizes around the ceiling and check the property, not one
+    /// value. The bulk head allocates only its own small buffer, so a
+    /// four-gigabyte value length costs nothing to drive for real.
+    #[compio::test]
+    async fn every_accepted_read_size_can_actually_be_framed() {
+        let (_d, node) = node().await;
+        let ceiling = autumn_rpc::frame::MAX_PAYLOAD_LEN as u64;
+        let mut accepted = 0u64;
+        for (i, len) in (ceiling - 24..=ceiling).enumerate() {
+            let entry = entry_of_len(&node, 9100 + i as u64, len).await;
+            let req = ReadBytesReq::new(9100 + i as u64, 1, 0, 0, PayloadRef::in_dat());
+            let Ok((_, _, read_size)) = read_plan(&entry, &req) else {
+                continue;
+            };
+            accepted += 1;
+            // Bulk reply: `[code][empty message]` beside the value.
+            let _ = bulk_read_head(7, CODE_OK, "", read_size as usize);
+            // Non-bulk `ReadBytesResp` spends 9 ctrl bytes before the value.
+            // Its encoder allocates the whole payload, so assert the
+            // arithmetic rather than building four gigabytes.
+            assert!(
+                read_size + 9 + autumn_rpc::frame::CTRL_OVERHEAD as u64 <= ceiling,
+                "read_plan accepted {read_size}, which the non-bulk reply cannot frame"
+            );
+        }
+        assert!(
+            accepted > 0,
+            "the sweep must actually reach accepted sizes, or it proves nothing"
+        );
+    }
+
+    /// And the ordinary chunk every in-tree client actually sends is untouched.
+    #[compio::test]
+    async fn a_256mib_chunk_is_unaffected() {
+        let (_d, node) = node().await;
+        let entry = entry_of_len(&node, 9004, 16 * 1024 * 1024 * 1024).await;
+        let req = ReadBytesReq::new(9004, 1, 0, 256 * 1024 * 1024, PayloadRef::in_dat());
+        let (_, _, read_size) = read_plan(&entry, &req).expect("the normal chunk stays legal");
+        assert_eq!(read_size, 256 * 1024 * 1024);
     }
 }

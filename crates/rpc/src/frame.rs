@@ -156,13 +156,13 @@ impl Frame {
     /// `header ++ ctrl_len ++ ctrl`.
     pub fn encode(&self) -> Bytes {
         let ctrl_len = self.payload.len();
-        let wire_payload_len = CTRL_OVERHEAD + ctrl_len + self.value.len();
-        let mut buf = BytesMut::with_capacity(HEADER_LEN + wire_payload_len);
+        let (wire_len, ctrl_len_u32) = header_lens(ctrl_len, self.value.len());
+        let mut buf = BytesMut::with_capacity(HEADER_LEN + wire_len as usize);
         buf.put_u32_le(self.req_id);
         buf.put_u8(self.msg_type);
         buf.put_u8(self.flags);
-        buf.put_u32_le(wire_payload_len as u32);
-        buf.put_u32_le(ctrl_len as u32);
+        buf.put_u32_le(wire_len);
+        buf.put_u32_le(ctrl_len_u32);
         buf.extend_from_slice(&self.payload);
         let crc = crc32c::crc32c(&buf[..HEADER_LEN + CTRL_PREFIX_LEN + ctrl_len]);
         buf.put_u32_le(crc);
@@ -183,13 +183,15 @@ impl Frame {
         payload_len: usize,
         write_payload: F,
     ) -> Bytes {
-        let wire_payload_len = CTRL_OVERHEAD + payload_len;
-        let mut buf = BytesMut::with_capacity(HEADER_LEN + wire_payload_len);
+        // Before `write_payload` runs: a caller that is over the ceiling should
+        // learn it without first being asked to produce the bytes.
+        let (wire_len, ctrl_len_u32) = header_lens(payload_len, 0);
+        let mut buf = BytesMut::with_capacity(HEADER_LEN + wire_len as usize);
         buf.put_u32_le(req_id);
         buf.put_u8(msg_type);
         buf.put_u8(FLAG_RESPONSE);
-        buf.put_u32_le(wire_payload_len as u32);
-        buf.put_u32_le(payload_len as u32);
+        buf.put_u32_le(wire_len);
+        buf.put_u32_le(ctrl_len_u32);
         let payload_start = buf.len();
         write_payload(&mut buf);
         // Release-enforced (not debug-only): a `write_payload` that appends a
@@ -209,6 +211,60 @@ impl Frame {
     }
 }
 
+/// The two length fields every encoder writes into the header, narrowed to the
+/// `u32` the wire format gives them, with the payload bound checked.
+///
+/// `as u32` on its own is a silent wrap: a payload at or past 4 GiB writes a
+/// header that disagrees with the bytes that follow it, the peer's
+/// `FrameDecoder` fails its CRC, and the symptom an operator sees is "corrupt
+/// frame", not "this response was too large". That has already cost one
+/// misdiagnosis — an EC rebuild reading a `u32::MAX + 29,421` byte shard was
+/// read as a 30 s timeout until the log timestamps (10.75 s between attempts,
+/// not 4x30 s) disproved it.
+///
+/// **Debug-only, deliberately.** An `assert!` here would be release-enforced,
+/// and release is `panic = "abort"` — so a frame this size would kill the
+/// process rather than unwind, and every producer below is reachable from a
+/// REMOTE request. Trading a corrupt frame for a dead node is not an
+/// improvement, so the bound that actually protects production lives at each
+/// producer, where it can REFUSE and keep serving:
+///
+/// - extent-node reads — `READ_REPLY_MAX_VALUE_BYTES` / `ReadRefusal::TooLargeForOneFrame`
+/// - PS batch get — `batch_bulk_budget_exceeded`
+/// - PS group-commit append — `MAX_WRITE_BATCH_BYTES`
+/// - PS redirect-many — `redirect_many_budget_exceeded`
+/// - extent-node copy — `COPY_REPLY_MAX_VALUE_BYTES`
+///
+/// What is left for the debug assert is the developer loop: a new path that
+/// forgot to chunk trips it in `cargo test` and in any debug build, which is
+/// where it is cheap to find. In release the length still narrows, so a
+/// producer nobody bounded still emits a wrapped header — that is the failure
+/// this file cannot fix on its own, and the reason the bound belongs upstream.
+///
+/// Bounded by `MAX_PAYLOAD_LEN`, the same constant the DECODER rejects on
+/// (`FrameError::PayloadTooLarge`), not by a second copy of `u32::MAX`. The two
+/// sides have to agree, and the decoder's bound is documented as one that will
+/// be lowered to a practical cap — at which point an encoder comparing against
+/// the type's maximum would happily build frames its own peer refuses.
+///
+/// It COMPUTES `wire_payload_len` rather than taking it, which is what makes
+/// one check enough: the payload always contains the ctrl, so a ctrl too large
+/// to narrow makes the payload too large first and a second assert on
+/// `ctrl_len` would be unreachable. Taking both as independent arguments made
+/// that a property of today's callers instead — a future encoder that derived
+/// the payload length some other way would get a silently wrapped `ctrl_len`,
+/// which is this very bug one level up.
+#[inline]
+fn header_lens(ctrl_len: usize, value_len: usize) -> (u32, u32) {
+    let wire_payload_len = CTRL_OVERHEAD + ctrl_len + value_len;
+    debug_assert!(
+        wire_payload_len <= MAX_PAYLOAD_LEN as usize,
+        "frame payload is {wire_payload_len} bytes, over the wire format's {MAX_PAYLOAD_LEN} \
+         byte ceiling — the caller must chunk it",
+    );
+    (wire_payload_len as u32, ctrl_len as u32)
+}
+
 /// Header + `ctrl_len` prefix for a vectored write (14 bytes). The caller
 /// follows these bytes with the ctrl parts, the 4-byte CRC trailer
 /// (`compute_ctrl_crc` over this head + the same ctrl parts), then the raw
@@ -224,9 +280,9 @@ pub fn encode_vectored_head(
     h[0..4].copy_from_slice(&req_id.to_le_bytes());
     h[4] = msg_type;
     h[5] = flags;
-    let wire_payload_len = (CTRL_OVERHEAD + ctrl_len + value_len) as u32;
-    h[6..10].copy_from_slice(&wire_payload_len.to_le_bytes());
-    h[10..14].copy_from_slice(&(ctrl_len as u32).to_le_bytes());
+    let (wire_len, ctrl_len_u32) = header_lens(ctrl_len, value_len);
+    h[6..10].copy_from_slice(&wire_len.to_le_bytes());
+    h[10..14].copy_from_slice(&ctrl_len_u32.to_le_bytes());
     h
 }
 
@@ -300,13 +356,13 @@ pub fn encode_bulk_response_head_bytes(
 ) -> Bytes {
     let message = ctrl_tail;
     let ctrl_len = 1 + message.len();
-    let wire_payload_len = CTRL_OVERHEAD + ctrl_len + value_len;
+    let (wire_len, ctrl_len_u32) = header_lens(ctrl_len, value_len);
     let mut buf = BytesMut::with_capacity(HEADER_LEN + CTRL_PREFIX_LEN + ctrl_len + CRC_LEN);
     buf.put_u32_le(req_id);
     buf.put_u8(msg_type);
     buf.put_u8(FLAG_RESPONSE);
-    buf.put_u32_le(wire_payload_len as u32);
-    buf.put_u32_le(ctrl_len as u32);
+    buf.put_u32_le(wire_len);
+    buf.put_u32_le(ctrl_len_u32);
     buf.put_u8(code);
     buf.extend_from_slice(message);
     let crc = crc32c::crc32c(&buf[..]);
@@ -1000,5 +1056,62 @@ mod tests {
         whole.extend_from_slice(&p2);
         let want = Frame::request(123, 45, Bytes::from(whole)).encode();
         assert_eq!(&wire[..], &want[..]);
+    }
+}
+
+#[cfg(test)]
+mod frame_length_ceiling_tests {
+    use super::*;
+
+    // The three `should_panic` cases below assert on a `debug_assert!`, so they
+    // are debug-only by construction — `cargo test --release` would otherwise
+    // report them as failures for behaviour that is deliberately absent there.
+
+    /// The wire format gives the payload length 32 bits. Going over it used to
+    /// be a silent `as u32` wrap: the header said one thing, the bytes said
+    /// another, and the peer reported a CRC failure — a corrupt frame where the
+    /// truth was "too large to send". These two entry points take LENGTHS
+    /// rather than buffers, so the ceiling is reachable in a test without
+    /// allocating 4 GiB.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "over the wire format's")]
+    fn a_vectored_head_over_the_ceiling_refuses_instead_of_wrapping() {
+        encode_vectored_head(1, 2, 0, 0, MAX_PAYLOAD_LEN as usize + 1);
+    }
+
+    /// And it refuses BEFORE asking the caller to produce the bytes.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "over the wire format's")]
+    fn a_response_over_the_ceiling_refuses_before_writing_the_payload() {
+        Frame::encode_response_with(1, 2, MAX_PAYLOAD_LEN as usize + 1, |_| {
+            unreachable!("write_payload must not run for a payload that cannot be framed")
+        });
+    }
+
+    /// The largest frame that still fits must encode with a header that agrees
+    /// with itself — the boundary is where an off-by-one in the check would
+    /// hide.
+    #[test]
+    fn the_largest_encodable_frame_is_still_encoded() {
+        let value_len = MAX_PAYLOAD_LEN as usize - CTRL_OVERHEAD;
+        let head = encode_vectored_head(7, 9, 0, 0, value_len);
+        assert_eq!(
+            u32::from_le_bytes(head[6..10].try_into().unwrap()),
+            MAX_PAYLOAD_LEN,
+            "the ceiling itself is legal, not one byte below it"
+        );
+    }
+
+    /// The ctrl field is narrowed by the same `as u32` and had no check of its
+    /// own either. It needs none: ctrl is part of the payload length, so an
+    /// un-framable ctrl is refused by the payload bound — pinned here because
+    /// the alternative is a second assert that can never fire.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "frame payload is")]
+    fn an_oversized_ctrl_is_refused_by_the_payload_bound() {
+        encode_vectored_head(1, 2, 0, MAX_PAYLOAD_LEN as usize + 1, 0);
     }
 }

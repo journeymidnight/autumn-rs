@@ -20,6 +20,63 @@ use bytes::Bytes;
 use crate::sstable::{AsyncMergeIterator, AsyncTableIterator, FetchMode};
 use crate::*;
 
+/// What one `MSG_BATCH_GET_BULK` answer costs per key BESIDES its value: one
+/// status byte and one u32 length, plus rkyv framing. Rounded up.
+const BATCH_GET_BULK_CTRL_BYTES_PER_KEY: usize = 8;
+
+/// Fixed allowance for the rest of a batch reply's ctrl — the empty message,
+/// the rkyv archive's own header, the frame's `CTRL_OVERHEAD`.
+const BATCH_GET_BULK_CTRL_FIXED_BYTES: usize = 4096;
+
+/// Does this batch no longer fit in one frame?
+///
+/// Both halves count. The values are the obvious half, but the ctrl — one
+/// entry per KEY — rides in the SAME payload, so a budget that reserved a
+/// fixed slice for it leaves a window at large key counts: a million keys of
+/// ~4 KiB each fits a value-only budget while its ctrl pushes the frame past
+/// the ceiling. The caller chooses the key count, so it is an input, not a
+/// constant.
+///
+/// Split out from the loop so the boundary is testable: driving the handler
+/// needs a live partition AND gigabytes of values, so what a test can pin
+/// cheaply is this arithmetic.
+#[inline]
+pub(crate) fn batch_bulk_budget_exceeded(value_bytes: usize, keys: usize) -> bool {
+    let ctrl = BATCH_GET_BULK_CTRL_FIXED_BYTES
+        .saturating_add(keys.saturating_mul(BATCH_GET_BULK_CTRL_BYTES_PER_KEY));
+    value_bytes.saturating_add(ctrl) > autumn_rpc::frame::MAX_PAYLOAD_LEN as usize
+}
+
+/// What one `MSG_GET_REDIRECT_MANY` item costs BESIDES its inlined value.
+///
+/// `GetRedirectResp` archives a code, a message, four u64s, a `Vec<String>` of
+/// replica addresses and two more scalars — ~69 bytes before any value, more
+/// with addresses. Rounded to 128.
+const GET_REDIRECT_MANY_CTRL_BYTES_PER_ITEM: usize = 128;
+
+/// Fixed allowance for the reply's own rkyv header and the frame's ctrl.
+const GET_REDIRECT_MANY_CTRL_FIXED_BYTES: usize = 4096;
+
+/// Would inlining this value push the reply past what one frame can carry?
+///
+/// The per-ITEM cost counts, not just the values. Inlined values are under the
+/// 64 KiB redirect threshold, so reaching the budget takes ~65k items — and at
+/// that count the per-item framing alone is megabytes. A fixed headroom hid
+/// that: 65,520 items of 65,535 bytes fit a value-only budget while their
+/// framing overflowed the frame, which is the exact defect this bound exists
+/// to prevent. Declined and descriptor items cost the same framing and are
+/// counted too, since `items` is the caller's number.
+#[inline]
+fn redirect_many_budget_exceeded(inlined_bytes: usize, value_len: usize, items: usize) -> bool {
+    let ctrl = GET_REDIRECT_MANY_CTRL_FIXED_BYTES
+        .saturating_add(items.saturating_mul(GET_REDIRECT_MANY_CTRL_BYTES_PER_ITEM));
+    inlined_bytes
+        .saturating_add(value_len)
+        .saturating_add(ctrl)
+        > autumn_rpc::frame::MAX_PAYLOAD_LEN as usize
+}
+
+
 /// translate VP-resolve errors into wire status codes that
 /// distinguish "data permanently lost; clean up the key" from
 /// "server bug; investigate".
@@ -275,6 +332,7 @@ pub(crate) async fn handle_batch_get_bulk(
         }
     }
     let n = req.keys.len();
+    let mut total: usize = 0;
     let mut statuses: Vec<u8> = Vec::with_capacity(n);
     let mut value_lens: Vec<u32> = Vec::with_capacity(n);
     let mut values: Vec<Bytes> = Vec::with_capacity(n);
@@ -295,12 +353,46 @@ pub(crate) async fn handle_batch_get_bulk(
             Err(_) => (2u8, Bytes::new()),
         };
         statuses.push(status);
+        // Safe only because a single inline value is capped at
+        // `AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT` (64 MiB); nothing else stops
+        // this narrowing.
         value_lens.push(value.len() as u32);
+        total += value.len();
+        // A batch answers N keys in ONE frame, and nothing upstream bounds N:
+        // the SDK's `get_many` groups EVERY same-partition key into a single
+        // request, and each value may be 64 MiB. Hundreds of 8 MiB values —
+        // the shape a model load produces, and the one `get_redirect_many`
+        // already refuses to inline for this very reason — aggregate past what
+        // the frame header's `payload_len: u32` can express.
+        //
+        // Refuse rather than build it. Encoding would assert, and release is
+        // `panic = "abort"`, so a single oversized `get_many` would take this
+        // whole partition server down — no unwind, no supervised restart. The
+        // pre-assert behaviour was no better: the length wrapped, the head
+        // declared a small payload, and the client read the value tail as
+        // garbage frames.
+        //
+        // Bail INSIDE the loop, not after it: the values are already
+        // materialised here, so a post-hoc check would hold gigabytes of
+        // `Bytes` on this node before deciding not to send them.
+        //
+        // `CODE_PRECONDITION` is deliberate — `get_many` already falls back to
+        // per-key `get_bound` on it (the stale-epoch path), so an oversized
+        // batch degrades to N small reads instead of failing the caller.
+        if batch_bulk_budget_exceeded(total, statuses.len()) {
+            return fail(
+                StatusCode::FailedPrecondition,
+                format!(
+                    "batch of {n} keys exceeds one frame's payload ceiling at key {} \
+                     ({total} bytes); retry the keys individually",
+                    statuses.len()
+                ),
+            );
+        }
         if !value.is_empty() {
             values.push(value);
         }
     }
-    let total: usize = value_lens.iter().map(|l| *l as usize).sum();
     let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchGetBulkCtrl {
         message: String::new(),
         statuses,
@@ -594,6 +686,22 @@ pub(crate) async fn handle_get_redirect_many(
         ec_data_shards: 0,
         ec_sealed_length: 0,
     };
+    // Declining an item is how this RPC already answers "you fetch it
+    // yourself" — the client's `RedirectItemAction::Proxy` arm — so it is also
+    // how the reply stays inside one frame.
+    let declined = |why: String| GetRedirectResp {
+        code: CODE_PRECONDITION,
+        message: why,
+        value: vec![],
+        extent_id: 0,
+        value_offset: 0,
+        value_len: 0,
+        eversion: 0,
+        replica_addrs: vec![],
+        ec_data_shards: 0,
+        ec_sealed_length: 0,
+    };
+    let mut inlined_bytes = 0usize;
     let mut results = Vec::with_capacity(req.items.len());
     for item in &req.items {
         let item_payload = partition_rpc::rkyv_encode(&GetReq {
@@ -605,10 +713,26 @@ pub(crate) async fn handle_get_redirect_many(
         });
         let resp = match get_value_inner(item_payload, part, true).await? {
             GetOutcome::NotFound => not_found(),
-            // Inline only ever carries a SMALL value here: get_value_inner
-            // redirects any VP sub-range ≥ 64 KiB, so a Value outcome means the
-            // value is below the redirect threshold (bounded — no batch bloat).
-            GetOutcome::Value(value) => inline(value.into()),
+            // Each inlined value is small — `get_value_inner` redirects any VP
+            // sub-range at or above the 64 KiB threshold — but the reply holds
+            // ONE PER ITEM and the SDK puts every same-partition item in one
+            // request, so the SUM is what has to be bounded. 65k items just
+            // under the threshold is a multi-gigabyte reply that no frame can
+            // carry. Past the budget, decline instead: the client already
+            // proxies a declined item, which is a slower read rather than a
+            // failed one.
+            GetOutcome::Value(value)
+                if redirect_many_budget_exceeded(inlined_bytes, value.len(), req.items.len()) =>
+            {
+                declined(format!(
+                    "batch reply reached one frame's payload ceiling after \
+                     {inlined_bytes} bytes; fetch this item directly"
+                ))
+            }
+            GetOutcome::Value(value) => {
+                inlined_bytes += value.len();
+                inline(value.into())
+            }
             GetOutcome::Redirect {
                 extent_id,
                 value_offset,
@@ -2513,5 +2637,94 @@ mod gc_pin_read_outcome_tests {
             acquire_reader_pin(pin).is_some(),
             "after the punch completes the retry must succeed"
         );
+    }
+}
+
+#[cfg(test)]
+mod batch_bulk_ceiling_tests {
+    use super::*;
+
+    const CEILING: usize = autumn_rpc::frame::MAX_PAYLOAD_LEN as usize;
+
+    /// Exactly at the ceiling is servable; one byte past is not. The boundary
+    /// is where an off-by-one hides, and the loose direction is the one that
+    /// builds a frame the wire cannot express.
+    #[test]
+    fn the_budget_is_exceeded_one_byte_past_the_ceiling() {
+        let fixed = BATCH_GET_BULK_CTRL_FIXED_BYTES;
+        assert!(!batch_bulk_budget_exceeded(0, 0));
+        assert!(!batch_bulk_budget_exceeded(CEILING - fixed, 0));
+        assert!(batch_bulk_budget_exceeded(CEILING - fixed + 1, 0));
+    }
+
+    /// The ctrl rides in the SAME payload as the values, one entry per KEY, so
+    /// the key count has to be part of the budget. A value-only budget left a
+    /// window here: a million keys of ~4 KiB fits the values while the ctrl
+    /// pushes the frame over.
+    #[test]
+    fn a_million_small_keys_are_refused_even_though_their_values_would_fit() {
+        let keys = 1_000_000;
+        let value_bytes = 4_293_000_000usize;
+        assert!(
+            value_bytes < CEILING,
+            "the values alone must fit, or this test is not about the ctrl"
+        );
+        assert!(
+            batch_bulk_budget_exceeded(value_bytes, keys),
+            "the ctrl for {keys} keys has to count against the ceiling"
+        );
+    }
+
+    /// The shape that motivates the cap: `get_many` puts every same-partition
+    /// key in one request, and a model load resolves hundreds of 8 MiB values.
+    #[test]
+    fn a_model_loads_batch_of_8mib_values_crosses_the_cap() {
+        let eight_mib = 8 * 1024 * 1024;
+        let crossing = CEILING / eight_mib + 1;
+        assert!(
+            batch_bulk_budget_exceeded(crossing * eight_mib, crossing),
+            "{crossing} values of 8 MiB must not be answerable in one frame"
+        );
+        assert!(
+            crossing < 1000,
+            "a realistic key count ({crossing}) has to reach the cap, or it is not a real guard"
+        );
+    }
+
+    /// And an ordinary batch is untouched.
+    #[test]
+    fn an_ordinary_batch_is_not_refused() {
+        assert!(!batch_bulk_budget_exceeded(512 * 8 * 1024, 512));
+    }
+
+    /// `MSG_GET_REDIRECT_MANY` has the SAME shape and needed the same fix: an
+    /// inlined value is under the 64 KiB redirect threshold, so reaching the
+    /// budget takes ~65k items — and at that count the reply's PER-ITEM rkyv
+    /// framing alone is megabytes. A value-only budget let exactly this
+    /// through, which is the defect the bound exists to prevent.
+    #[test]
+    fn a_redirect_many_reply_counts_its_per_item_framing() {
+        let items = 65_520usize;
+        let value = 65_535usize;
+        let inlined = items * value;
+        assert!(
+            inlined < autumn_rpc::frame::MAX_PAYLOAD_LEN as usize,
+            "the values alone must fit, or this test is not about the framing"
+        );
+        assert!(
+            redirect_many_budget_exceeded(inlined - value, value, items),
+            "the framing for {items} items has to count against the ceiling"
+        );
+    }
+
+    /// An ordinary redirect-many is untouched — the bound must not start
+    /// declining items that fit comfortably.
+    #[test]
+    fn an_ordinary_redirect_many_still_inlines() {
+        assert!(!redirect_many_budget_exceeded(
+            64 * 1024 * 100,
+            64 * 1024,
+            128
+        ));
     }
 }

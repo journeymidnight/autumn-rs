@@ -357,6 +357,65 @@ The token rides as an out-of-band prefix stripped before rkyv decode:
 `None` on a malformed prefix. The manager treats `None` as a FAILED check, never
 "run it bare" — a bare unprefixed payload can't be mistaken for a valid strip.
 
+## Frame length ceiling
+
+The header gives the payload length 32 bits, so a frame LARGER than
+`MAX_PAYLOAD_LEN` cannot be expressed (a frame exactly that size can — the
+encoder accepts `<=` and the decoder rejects only `>`, so the two agree
+exactly). Every encoder narrows through
+`header_lens`, which `debug_assert!`s that bound rather than letting `as u32`
+wrap silently in a debug build. A wrap is not a clean failure; the header disagrees with the
+bytes behind it and the peer reports a CRC error, so the operator is told
+"corrupt frame" when the truth is "too large to send". That has already cost one
+misdiagnosis — an EC rebuild reading a `u32::MAX + 29,421` byte shard read as a
+30 s timeout until the log timestamps disproved it.
+
+It bounds on `MAX_PAYLOAD_LEN`, the constant the DECODER already rejects on
+(`FrameError::PayloadTooLarge`), not on a second copy of `u32::MAX`: that bound
+is documented as one to be lowered to a practical cap, and an encoder comparing
+against the type's maximum would then build frames its own peer refuses.
+
+One check covers both length fields: `ctrl_len` is part of `wire_payload_len`,
+so an un-narrowable ctrl trips the payload bound first and a second assert would
+be unreachable.
+
+**The encoder's own check is DEBUG-ONLY, and that is the design.** Release is
+`panic = "abort"`, so a release assert would kill the process rather than
+unwind — and every producer of a large frame is reachable from a REMOTE
+request. Trading a corrupt frame for a dead node is not an improvement. The
+bound that protects production therefore lives at each PRODUCER, where it can
+refuse and keep serving:
+
+- the extent node's read path — `read_plan` bounds a read by the FILE and a log
+  extent is 16 GiB, so a to-end read asks for four times the ceiling;
+  `ReadRefusal::TooLargeForOneFrame` refuses it (see `crates/stream/CLAUDE.md`);
+- the partition server's `MSG_BATCH_GET_BULK` — it answers N keys in ONE frame
+  and the SDK's `get_many` groups EVERY same-partition key into one request, so
+  a few hundred 8 MiB values cross the ceiling. `batch_bulk_budget_exceeded`
+  stops the aggregation mid-loop and answers `CODE_PRECONDITION`, which the SDK
+  already handles by falling back to per-key reads.
+
+- the PS→EN group-commit append — `MAX_WRITE_BATCH_BYTES` splits the queue at
+  the take point (`pending` is bounded by request COUNT, 3072, while one Put
+  may be 64 MiB, so 65 large Puts crossed the ceiling on the hot write path).
+  The remainder stays queued and launches next, so nothing is failed;
+- `MSG_COPY_EXTENT` — `COPY_REPLY_MAX_VALUE_BYTES`; it inlines a whole extent
+  when `size == 0`, and the handler answers any peer;
+- `MSG_GET_REDIRECT_MANY` — `GET_REDIRECT_MANY_MAX_INLINE_BYTES`; items past
+  the budget are DECLINED, which the client already proxies.
+
+Each refusal names the fix and keeps the node serving; the debug assert is what
+catches a new path in `cargo test` before it ever ships. **A new
+remote-reachable producer needs its own bound — in release, nothing downstream
+will catch it for you.**
+
+Two bounds count their reply's CTRL, not just its values, because the ctrl
+rides in the same payload and its size comes from the caller: the batch get
+counts `keys × BATCH_GET_BULK_CTRL_BYTES_PER_KEY`, and the extent-node read
+budgets for the LARGER of its two reply shapes. A value-only budget leaves a
+window at large item counts — a million keys of 4 KiB fits the values and
+overflows the frame.
+
 ## Wire-version interval
 
 `WIRE_VERSION_MIN` / `WIRE_VERSION_MAX` (currently **42/42**) declare the interval this

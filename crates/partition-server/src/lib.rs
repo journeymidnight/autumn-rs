@@ -303,13 +303,36 @@ pub fn set_compact_cooldown_secs(n: i64) -> bool {
 fn max_write_batch() -> usize {
     *MAX_WRITE_BATCH_CELL.get_or_init(|| DEFAULT_MAX_WRITE_BATCH)
 }
+/// The most encoded bytes one group-commit batch may carry.
+///
+/// The batch becomes ONE `AppendReq`, and a frame's `payload_len` is a u32, so
+/// a batch past this ceiling cannot be sent at all: the length narrows, the
+/// header disagrees with the bytes, and the peer fails CRC. Nothing upstream
+/// stopped it — `pending` is bounded by request COUNT (`max_write_batch()`,
+/// 3072 by default) while a single Put may carry
+/// `AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT` (64 MiB), so 65 large Puts already
+/// cross it, and the shape that produces them — a model load — is the target
+/// workload.
+///
+/// Headroom under the ceiling covers the `AppendReq` header and per-record
+/// framing that `start_write_batch` adds on top of `encoded_size()`.
+///
+/// This is a WIRE bound, not the memory bound the `ps_inflight_cap` doc
+/// describes: it only ever splits a batch that could not have been sent, so
+/// the batching behaviour under every real workload is unchanged. A tighter,
+/// memory-oriented cap is a separate decision with its own measurements.
+pub(crate) const MAX_WRITE_BATCH_BYTES: usize =
+    autumn_rpc::frame::MAX_PAYLOAD_LEN as usize - (1 << 20);
+
 /// R4 4.4 — maximum number of P-log `append_batch` futures in flight
 /// concurrently per partition. Higher values give more pipeline depth so
 /// multiple 256-request group-commit batches overlap their replica RTT, but
-/// also raise peak memory (each in-flight batch may hold up to
-/// `MAX_WRITE_BATCH_BYTES` = 30 MB of encoded segments).
+/// also raise peak memory (each in-flight batch holds its requests' encoded
+/// segments).
 ///
-/// Default = 8 → up to 8 × 30 MB = 240 MB worst-case memory per partition.
+/// Default = 8. The per-batch memory is whatever the queued requests hold —
+/// `MAX_WRITE_BATCH_BYTES` bounds the WIRE frame, not the working set — so a
+/// burst of large Puts can exceed the figure this note used to quote.
 /// Range clamped to [1, 64]. Overridable via `set_ps_inflight_cap`.
 /// Capacity of a `PartitionServer`'s SST block cache (paged readers only).
 /// The cache ITSELF is per-`PartitionServer` (`PartitionServer::block_cache`,
@@ -2161,14 +2184,25 @@ pub(crate) struct WriteRequest {
 }
 
 impl WriteRequest {
-    #[allow(dead_code)]
+    /// Bytes this request adds to a group-commit batch's `AppendReq`.
+    ///
+    /// EXACT, not an estimate: `MAX_WRITE_BATCH_BYTES` splits the batch on this
+    /// number, so an undercount is a frame that gets built and cannot be sent.
+    /// It mirrors `wal_record::encode_v1_segments` — envelope (sentinel +
+    /// length + crc), the payload header, and the INTERNAL key, which is the
+    /// user key plus its 8-byte timestamp. The old `17 + key + value` counted
+    /// the payload header alone and was short by the envelope and the
+    /// timestamp on every record.
     fn encoded_size(&self) -> usize {
+        use crate::wal_record::{PAYLOAD_HEADER, V1_ENVELOPE_OVERHEAD};
+        const TS_LEN: usize = 8;
+        let fixed = V1_ENVELOPE_OVERHEAD + PAYLOAD_HEADER + TS_LEN;
         match &self.op {
             WriteOp::Put {
                 user_key, value, ..
-            } => 17 + user_key.len() + value.len(),
-            WriteOp::Delete { user_key } => 17 + user_key.len(),
-            WriteOp::FenceBump { .. } => 17 + 8 + 8,
+            } => fixed + user_key.len() + value.len(),
+            WriteOp::Delete { user_key } => fixed + user_key.len(),
+            WriteOp::FenceBump { .. } => fixed + 8,
         }
     }
 
@@ -6768,7 +6802,22 @@ async fn partition_loop(
         // the cap.
         let ready_to_launch = !pending.is_empty() && !at_cap && !imm_full;
         if ready_to_launch {
-            let batch = std::mem::take(&mut pending);
+            // Bound the batch by BYTES here rather than where `pending` is
+            // filled: several sites push into it, and this is the one place
+            // that decides what becomes a single `AppendReq`. Everything past
+            // the ceiling stays queued and launches as the next batch — no
+            // request is dropped or failed, it just does not ride this frame.
+            //
+            // One semantic consequence, and it is acceptable: a BatchPut whose
+            // ops straddle the cut is no longer durable in ONE append, so a
+            // crash between the two halves leaves half of it durable. Nothing
+            // ACKED is lost — the accumulator fires the client's response on
+            // the last op, so a half-written BatchPut has not answered anyone —
+            // and reaching the cut at all takes gigabytes in one call.
+            // Always take at least one, or a request larger than the cap could
+            // never make progress (it cannot be: a Put is inline-capped at
+            // 64 MiB, far below).
+            let batch = take_byte_bounded_batch(&mut pending);
             // start_write_batch is now async — small batches stay
             // inline in the future (no spawn_blocking), big batches
             // (>= PHASE1_OFFLOAD_THRESHOLD) await spawn_blocking. The
@@ -7055,8 +7104,12 @@ async fn drain_and_shutdown(
     while let Some(c) = inflight.next().await {
         handle_completion(part, metrics, locked_by_other, part_id, c).await;
     }
-    if !pending.is_empty() {
-        let batch = std::mem::take(pending);
+    // Same byte bound as the main loop, and for the same reason — this is the
+    // OTHER place a batch is taken, so a residual queue larger than one frame
+    // would go out un-split here. Loop until the queue is empty: shutdown must
+    // drain everything, it just cannot do it in one `AppendReq`.
+    while !pending.is_empty() {
+        let batch = take_byte_bounded_batch(pending);
         if let Ok(Some(mut flight)) = start_write_batch(part, batch).await {
             let r = (&mut flight.phase2_fut).await;
             let _ = finish_write_batch(part, flight.data, r).await;
@@ -7268,6 +7321,28 @@ fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64) {
 /// direct `WriteResponder` into the outer oneshot; reads (GET/HEAD/RANGE)
 /// and other ops dispatch inline. No `compio::runtime::spawn`, no inner
 /// oneshot on the write hot path.
+/// Take the longest prefix of `pending` whose encoded bytes fit one frame,
+/// leaving the rest queued. At least one request always moves, so a queue can
+/// never stall on its head.
+fn take_byte_bounded_batch(pending: &mut Vec<WriteRequest>) -> Vec<WriteRequest> {
+    let mut bytes = 0usize;
+    let mut take = 0usize;
+    for r in pending.iter() {
+        let next = bytes + r.encoded_size();
+        if take > 0 && next > MAX_WRITE_BATCH_BYTES {
+            break;
+        }
+        bytes = next;
+        take += 1;
+    }
+    if take == pending.len() {
+        std::mem::take(pending)
+    } else {
+        let rest = pending.split_off(take);
+        std::mem::replace(pending, rest)
+    }
+}
+
 async fn handle_incoming_req(
     req: PartitionRequest,
     pending: &mut Vec<WriteRequest>,
@@ -14644,5 +14719,88 @@ mod batch_delete_tests {
         let mut pending: Vec<WriteRequest> = Vec::new();
         enqueue_batch_delete(req, &mut pending, 42, 0, None, None);
         assert_eq!(pending.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod write_batch_ceiling_tests {
+    use super::*;
+
+    fn put_of(value_len: usize) -> WriteRequest {
+        let (outer, _rx) = oneshot::channel();
+        WriteRequest {
+            op: WriteOp::Put {
+                user_key: Bytes::from_static(b"k"),
+                value: Bytes::from(vec![0u8; value_len]),
+                expires_at: 0,
+            },
+            resp: WriteResponder::Put {
+                outer,
+                key: b"k".to_vec(),
+            },
+        }
+    }
+
+    /// A batch becomes ONE `AppendReq`, and `pending` is bounded by request
+    /// COUNT while a single Put may carry 64 MiB — so the queue can hold more
+    /// than a frame can express. The split leaves the remainder queued rather
+    /// than failing it.
+    #[test]
+    fn an_oversized_queue_is_split_not_sent_whole() {
+        let big = 64 * 1024 * 1024;
+        let n = MAX_WRITE_BATCH_BYTES / big + 2;
+        let mut pending: Vec<WriteRequest> = (0..n).map(|_| put_of(big)).collect();
+        let batch = take_byte_bounded_batch(&mut pending);
+
+        assert!(!batch.is_empty(), "the batch must make progress");
+        assert!(
+            batch.iter().map(|r| r.encoded_size()).sum::<usize>() <= MAX_WRITE_BATCH_BYTES,
+            "the taken batch must fit one frame"
+        );
+        assert_eq!(
+            batch.len() + pending.len(),
+            n,
+            "the remainder stays queued — nothing is dropped"
+        );
+        assert!(!pending.is_empty(), "this queue was too big to send at once");
+    }
+
+    /// The ordinary case must be untouched: a batch that fits goes whole, so
+    /// group-commit behaviour under every real workload is unchanged.
+    #[test]
+    fn a_batch_that_fits_is_taken_whole() {
+        let mut pending: Vec<WriteRequest> = (0..256).map(|_| put_of(4096)).collect();
+        let batch = take_byte_bounded_batch(&mut pending);
+        assert_eq!(batch.len(), 256);
+        assert!(pending.is_empty());
+    }
+
+    /// A single request larger than the cap still moves, or the queue would
+    /// wedge on its head forever.
+    #[test]
+    fn a_single_oversized_request_still_makes_progress() {
+        let mut pending = vec![put_of(MAX_WRITE_BATCH_BYTES + 1)];
+        let batch = take_byte_bounded_batch(&mut pending);
+        assert_eq!(batch.len(), 1);
+        assert!(pending.is_empty());
+    }
+
+    /// The shutdown drain loops on this, so it MUST shrink the queue every
+    /// call — otherwise a residual queue larger than one frame spins forever
+    /// instead of draining.
+    #[test]
+    fn every_take_shrinks_the_queue() {
+        let big = 64 * 1024 * 1024;
+        let n = MAX_WRITE_BATCH_BYTES / big * 3;
+        let mut pending: Vec<WriteRequest> = (0..n).map(|_| put_of(big)).collect();
+        let mut rounds = 0;
+        while !pending.is_empty() {
+            let before = pending.len();
+            let batch = take_byte_bounded_batch(&mut pending);
+            assert!(!batch.is_empty(), "a take that moves nothing would spin");
+            assert!(pending.len() < before, "the queue must strictly shrink");
+            rounds += 1;
+            assert!(rounds <= n, "draining must terminate");
+        }
     }
 }
