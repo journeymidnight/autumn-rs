@@ -62,13 +62,33 @@ first frame with CrcMismatch instead of reaching the version handshake).
 
 ### Prepared replica payloads
 
-`PreparedPayload` owns immutable `Bytes` segments, their total length and their
-CRC32C. `RpcClient::send_prepared` combines the CRC of each connection's distinct
-frame header with that payload CRC. The frame's bytes and full header/control
-coverage are unchanged; no wire-version change is needed. The checksum cannot
-be paired with different bytes through the public API. Large replicated stream
-appends prepare once; small or single-replica sends retain the ordinary path.
-Tests compare exact wire bytes across request IDs and reject altered payloads.
+`PreparedPayload` owns immutable `Bytes` segments and their total length.
+`frame_parts` gives each replica connection a frame carrying its own req_id,
+and the checksum cannot be paired with different bytes through the public API.
+The frame's bytes and full header/control coverage are unchanged; no
+wire-version change is needed.
+
+Every star-replicated stream append prepares, whatever its size or replica
+count — the wire bytes are identical either way, so the send site has nothing to
+choose between. What DOES vary is how each frame finishes its CRC, and
+`PreparedPayload` owns that choice because it is the only place it can be
+measured:
+
+- at or above `COMBINE_MIN_BYTES` with more than one frame, the payload is
+  scanned once and each frame's header CRC is joined on with `crc32c_combine`;
+- otherwise each frame re-scans, exactly as a per-frame vectored send did.
+
+The threshold is 1 MiB and it is large on purpose. `crc32c_combine` is a GF(2)
+matrix ladder — log(len) growth, but a constant that dwarfs a hardware CRC pass
+— so sharing a scan is a LOSS below about 512 KiB, and catastrophically so on
+small frames: 63 µs against 2.7 µs at 4 KiB RF=3. A single frame can never win
+the shared scan back however large the payload, which is why the frame count is
+an input. `replica_crc_cpu_benchmark` is the measurement; rerun it on new
+hardware before trusting the constant.
+
+Tests compare exact wire bytes against both the single-buffer and the vectored
+encoding, on both checksum arms, at each size and request ID, and reject altered
+payloads.
 
 - **`frame.rs`** — `Frame` (encode/decode one frame), `FrameDecoder` (streaming
   decode state machine), `HEADER_LEN=10`, `MAX_PAYLOAD_LEN`, flag bits.
@@ -468,9 +488,13 @@ exceeds the binary's own `WIRE_VERSION_MAX`.
 ## Optional TCP zerocopy for prepared replicas
 
 set_prepared_zerocopy_min_bytes configures prepared replica frames only; zero
-(the default) disables it. The writer preserves its single sequential owner,
-IOV_MAX chunking, full CRC and pending-response handling. Ordinary RPC writes
-and UCX sends retain their paths. The threshold counts complete frame bytes.
+(the default) disables it. Since every star-replicated append is prepared, this
+threshold is the only size cut deciding which appends go out zerocopy — a
+deployment that wants large frames only sets it there. (It is unrelated to
+`COMBINE_MIN_BYTES`, which picks a checksum strategy, not a write path.) The
+writer preserves its single sequential owner, IOV_MAX chunking, full CRC and
+pending-response handling. Ordinary RPC writes and UCX sends retain their
+paths. The threshold counts complete frame bytes.
 A timed-out caller never owns the writer's buffers; send completion alone is
 insufficient to recycle them. The transport awaits the separate release future.
 

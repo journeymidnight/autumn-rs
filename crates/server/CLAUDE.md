@@ -253,8 +253,9 @@ autumn-op --manager 127.0.0.1:9001 info
 ## Runtime upgrade and experiments
 
 Build with Rust >=1.95 and compio 0.19.2; the Docker builder matches this minimum.
-autumn-ps --tcp-zerocopy-min-bytes N enables only prepared replica TCP sends at
-that complete-frame size. Default 0 leaves ordinary sends active. UCX is unchanged.
+autumn-ps --tcp-zerocopy-min-bytes N enables replica append TCP sends at that
+complete-frame size. Every star-replicated append is prepared, so N is the only
+size cut. Default 0 leaves ordinary sends active. UCX is unchanged.
 Measure on the deployment kernel/link before choosing a threshold. The optional
 AUTUMN_PERF_PIDS JSON file maps process names to PIDs for core_path: CPU snapshots
 are taken after warmup and after draining timed requests, around the same byte

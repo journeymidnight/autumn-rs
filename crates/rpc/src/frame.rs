@@ -297,6 +297,26 @@ pub fn compute_ctrl_crc(head: &[u8], ctrl_parts: &[Bytes]) -> [u8; 4] {
     crc.to_le_bytes()
 }
 
+/// Payload big enough that sharing one scan across frames beats re-scanning.
+///
+/// `crc32c_combine` is a GF(2) matrix ladder: its cost grows with log(len) but
+/// its constant dwarfs a hardware CRC pass, so sharing a scan is a LOSS until
+/// the payload is large. Measured by `replica_crc_cpu_benchmark` on this
+/// hardware — one combine costs ~60 µs against a ~6.6 GB/s scan, so at 4 KiB
+/// RF=3 sharing a scan costs 63 µs where re-scanning costs 2.7 µs, a 23×
+/// pessimisation of the WAL append path.
+///
+/// Sharing wins iff one scan beats `N/(N-1)` combines — 1.5 combines at RF=3,
+/// 2 at RF=2, and nothing at all at RF=1, which is why the frame count decides
+/// it. Measuring the two costs separately puts the crossover near 460 KiB at
+/// RF=3 and 600 KiB at RF=2; 1 MiB is deliberately past both, because the loss
+/// curve is violently asymmetric. Below the crossover sharing costs up to 23x;
+/// above it, re-scanning costs at most ~1.3x. Sitting on the safe side of a
+/// noisy tie is nearly free, and being wrong the other way is not. The
+/// numbers are CPU-specific; rerun the benchmark before trusting them on new
+/// hardware.
+const COMBINE_MIN_BYTES: usize = 1024 * 1024;
+
 /// Immutable payload and its checksum, reusable across replica connections.
 /// Keeping the bytes with the checksum prevents callers from accidentally
 /// pairing a cached CRC with different data. Each frame still protects its own
@@ -304,23 +324,38 @@ pub fn compute_ctrl_crc(head: &[u8], ctrl_parts: &[Bytes]) -> [u8; 4] {
 pub struct PreparedPayload {
     parts: Vec<Bytes>,
     len: usize,
-    crc: u32,
+    /// `Some` only when sharing this scan across `frames` beats re-scanning;
+    /// `None` makes every `frame_parts` scan for itself, which is what a
+    /// per-frame vectored send did. Both produce the same bytes — this is
+    /// purely which arithmetic is cheaper.
+    crc: Option<u32>,
 }
 
 impl PreparedPayload {
-    pub fn new(parts: Vec<Bytes>) -> Self {
+    /// `frames` is how many frames this payload will be sent as — one per
+    /// replica. It is an input because the trade-off depends on it: the shared
+    /// scan is only amortised over the frames AFTER the first, so a single
+    /// frame can never win it back, however large the payload.
+    pub fn new(parts: Vec<Bytes>, frames: usize) -> Self {
         let len = parts.iter().map(Bytes::len).sum();
-        let crc = parts.iter().fold(0, |crc, p| crc32c::crc32c_append(crc, p));
+        let crc = (frames > 1 && len >= COMBINE_MIN_BYTES)
+            .then(|| parts.iter().fold(0, |crc, p| crc32c::crc32c_append(crc, p)));
         Self { parts, len, crc }
     }
 
     pub(crate) fn frame_parts(&self, req_id: u32, msg_type: u8) -> Vec<Bytes> {
         let head = encode_vectored_head(req_id, msg_type, 0, self.len, 0);
-        let crc = crc32c::crc32c_combine(crc32c::crc32c(&head), self.crc, self.len);
+        let crc = match self.crc {
+            Some(payload_crc) => {
+                crc32c::crc32c_combine(crc32c::crc32c(&head), payload_crc, self.len)
+                    .to_le_bytes()
+            }
+            None => compute_ctrl_crc(&head, &self.parts),
+        };
         let mut bufs = Vec::with_capacity(self.parts.len() + 2);
         bufs.push(Bytes::copy_from_slice(&head));
         bufs.extend(self.parts.iter().cloned());
-        bufs.push(Bytes::copy_from_slice(&crc.to_le_bytes()));
+        bufs.push(Bytes::copy_from_slice(&crc));
         bufs
     }
 }
@@ -754,18 +789,38 @@ mod tests {
         assert!(frames.iter().all(|f| f.payload.as_ref() == &[7; 4096][..]));
     }
 
+    /// Both checksum strategies produce the same frame. The sizes straddle
+    /// COMBINE_MIN_BYTES and the frame counts straddle 1, so each run covers
+    /// the shared-scan arm and the re-scan arm of `frame_parts`; a threshold
+    /// change that broke one arm's arithmetic could not hide behind the other.
     #[test]
     fn prepared_payload_preserves_full_frame_crc_for_distinct_request_ids() {
-        for len in [0, 1, 4096, 65536, 131_079] {
+        for len in [0, 1, 4096, 65536, 131_079, COMBINE_MIN_BYTES, COMBINE_MIN_BYTES + 7] {
+        for frames in [1, 3] {
             let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let middle = len / 2;
-            let prepared = PreparedPayload::new(vec![
+            let parts = vec![
                 Bytes::copy_from_slice(&payload[..middle]), Bytes::new(),
                 Bytes::copy_from_slice(&payload[middle..]),
-            ]);
+            ];
+            let prepared = PreparedPayload::new(parts.clone(), frames);
+            assert_eq!(
+                prepared.crc.is_some(),
+                frames > 1 && len >= COMBINE_MIN_BYTES,
+                "wrong checksum strategy at len={len} frames={frames}",
+            );
             for id in [1, 17, u32::MAX] {
                 let wire = prepared.frame_parts(id, 1).concat();
                 assert_eq!(wire, Frame::request(id, 1, Bytes::copy_from_slice(&payload)).encode());
+                // Every append prepares, so these bytes are also what the
+                // vectored send used to put on the wire for the small and
+                // single-replica frames — pinned directly, at each size and
+                // req_id, not inferred from a one-size vectored test.
+                let head = encode_vectored_head(id, 1, 0, len, 0);
+                let mut vectored = head.to_vec();
+                vectored.extend(parts.iter().flatten().copied());
+                vectored.extend_from_slice(&compute_ctrl_crc(&head, &parts));
+                assert_eq!(wire, vectored, "prepared != vectored at len={len} id={id}");
                 let mut decoder = FrameDecoder::new();
                 decoder.feed(&wire);
                 let frame = decoder.try_decode().unwrap().unwrap();
@@ -779,31 +834,80 @@ mod tests {
                 }
             }
         }
+        }
     }
 
-    /// Isolate checksum CPU from networking/fsync. No timing assertions.
+    /// Where re-scanning the payload per replica beats combining onto one
+    /// shared checksum. `crc32c_combine` is a GF(2) matrix ladder whose cost
+    /// grows with log(len) but whose CONSTANT is enormous next to a hardware
+    /// CRC — so the crossover is megabytes, not kilobytes, and it moves with
+    /// the replica count. This is the measurement `COMBINE_MIN_BYTES` is set
+    /// from; rerun it on a new CPU before trusting that constant. Isolates
+    /// checksum CPU from networking and fsync. No timing assertions.
+    ///
+    /// PRECISION: ~10% run to run, and the two loops do not observe identical
+    /// memory behaviour at multi-MiB sizes — enough that the RF=1 rows there
+    /// can report combining as CHEAPER than one scan, which is arithmetically
+    /// impossible (shared mode does that same scan and then adds to it). Read
+    /// the RF>1 rows, and measure the combine and scan costs separately if you
+    /// need the crossover to better than a factor of ~1.2.
+    ///
+    /// `cargo test --release -p autumn-rpc --lib replica_crc_cpu_benchmark
+    ///  -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn replica_crc_cpu_benchmark() {
         use std::{hint::black_box, time::Instant};
-        let parts = vec![Bytes::from(vec![0x5a; 8 * 1024 * 1024])];
-        let runs = 200;
-        let start = Instant::now();
-        for _ in 0..runs {
-            for id in 1..=3 {
-                let head = encode_vectored_head(id, 1, 0, parts[0].len(), 0);
-                black_box(compute_ctrl_crc(&head, black_box(&parts)));
+        // One 29-byte AppendReq header + the payload, as `launch_append` builds
+        // it: a zero-length append still carries a header, so `len` is never 0.
+        let hdr = Bytes::from(vec![0u8; 29]);
+        println!("{:>10} {:>3} {:>12} {:>12} {:>12} {:>10}",
+            "payload", "RF", "rescan_ns", "combine_ns", "actual_ns", "winner");
+        for len in [4096usize, 65536, 262_144, 524_288, 1_048_576, 4_194_304, 8_388_608] {
+            let parts = vec![hdr.clone(), Bytes::from(vec![0x5a; len])];
+            let total: usize = parts.iter().map(Bytes::len).sum();
+            let runs = if len >= 1_048_576 { 200 } else { 2000 };
+            for rf in [1u32, 3] {
+                // Re-scan per frame: what `send_vectored` did, and what
+                // `frame_parts` does below COMBINE_MIN_BYTES.
+                let start = Instant::now();
+                for _ in 0..runs {
+                    for id in 1..=rf {
+                        let head = encode_vectored_head(id, 1, 0, total, 0);
+                        black_box(compute_ctrl_crc(&head, black_box(&parts)));
+                    }
+                }
+                let rescan = start.elapsed().as_secs_f64() / runs as f64 * 1e9;
+                // Scan once, then combine each frame's own header CRC onto it.
+                let start = Instant::now();
+                for _ in 0..runs {
+                    let payload_crc = black_box(&parts)
+                        .iter()
+                        .fold(0, |crc, p| crc32c::crc32c_append(crc, p));
+                    for id in 1..=rf {
+                        let head = encode_vectored_head(id, 1, 0, total, 0);
+                        black_box(crc32c::crc32c_combine(
+                            crc32c::crc32c(&head),
+                            payload_crc,
+                            total,
+                        ));
+                    }
+                }
+                let combine = start.elapsed().as_secs_f64() / runs as f64 * 1e9;
+                // What the shipping code actually does at this size and RF —
+                // it should track whichever primitive above is cheaper.
+                let start = Instant::now();
+                for _ in 0..runs {
+                    let prepared = PreparedPayload::new(black_box(parts.clone()), rf as usize);
+                    for id in 1..=rf {
+                        black_box(prepared.frame_parts(id, 1));
+                    }
+                }
+                let actual = start.elapsed().as_secs_f64() / runs as f64 * 1e9;
+                let winner = if combine < rescan { "combine" } else { "rescan" };
+                println!("{len:>10} {rf:>3} {rescan:>12.0} {combine:>12.0} {actual:>12.0} {winner:>10}");
             }
         }
-        let original = start.elapsed();
-        let start = Instant::now();
-        for _ in 0..runs {
-            let prepared = PreparedPayload::new(black_box(parts.clone()));
-            for id in 1..=3 { black_box(prepared.frame_parts(id, 1)); }
-        }
-        let prepared = start.elapsed();
-        println!("8MiB x {runs} RF3: original_ms={:.3} prepared_ms={:.3}",
-            original.as_secs_f64()*1000.0, prepared.as_secs_f64()*1000.0);
     }
 
 

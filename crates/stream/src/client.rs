@@ -2228,7 +2228,7 @@ async fn launch_append(
         return;
     }
 
-    // Fire send_vectored to each replica IN PARALLEL. Each
+    // Fire send_prepared to each replica IN PARALLEL. Each
     // RpcClient's writer_task is single-writer (R4 step 4.1), so per-
     // replica TCP byte order is still determined by the order this
     // worker's submits land on each replica's submit_tx — and since
@@ -2243,28 +2243,23 @@ async fn launch_append(
     // Preserve the "all 3 slots filled with Result" shape so
     // apply_completion's error handling (first-err-wins) is unchanged
     // from the pre-parallel version: use join_all, NOT try_join_all.
-    // Large replicated appends scan their immutable ctrl payload only once.
-    // Frame-specific req_ids are combined into the CRC by each RpcClient.
-    let prepared = if size >= 64 * 1024 && tail.replica_addrs.len() > 1 {
+    // Star replication builds ONE payload for every replica, at every size:
+    // the wire bytes are identical to a per-replica vectored send, so there is
+    // nothing for this site to choose between. Whether the replicas SHARE one
+    // checksum scan or each take their own is a CPU trade-off that depends on
+    // the payload size and the replica count, and it lives inside
+    // `PreparedPayload` where it can be measured — not here. The payload
+    // segments are refcount clones either way, never copied.
+    let prepared = {
         let mut parts = Vec::with_capacity(1 + payload_parts.len());
-        parts.push(hdr.clone());
-        parts.extend(payload_parts.iter().cloned());
-        Some(autumn_rpc::frame::PreparedPayload::new(parts))
-    } else {
-        None
+        parts.push(hdr);
+        parts.extend(payload_parts);
+        autumn_rpc::frame::PreparedPayload::new(parts, tail.replica_addrs.len())
     };
     let send_futs = tail.replica_addrs.iter().map(|addr| {
         let addr = addr.clone();
-        let parts = if prepared.is_none() {
-            let mut parts = Vec::with_capacity(1 + payload_parts.len());
-            parts.push(hdr.clone());
-            parts.extend(payload_parts.iter().cloned());
-            parts
-        } else {
-            Vec::new()
-        };
         let pool = pool.clone();
-        let prepared = prepared.as_ref();
+        let prepared = &prepared;
         // The submit no longer parks: `submit()` REFUSES on a full queue
         // (autumn-rpc), so a peer that stopped reading surfaces here as an
         // ordinary submit error into `apply_completion`'s soft path instead of
@@ -2276,10 +2271,7 @@ async fn launch_append(
         // byte order IS this worker's submit order and the commit-truncation
         // invariant depends on it (see the comment below).
         async move {
-            let rx_res = match prepared {
-                Some(payload) => pool.send_prepared(&addr, MSG_APPEND, payload).await,
-                None => pool.send_vectored(&addr, MSG_APPEND, parts).await,
-            };
+            let rx_res = pool.send_prepared(&addr, MSG_APPEND, prepared).await;
             (addr, rx_res)
         }
     });

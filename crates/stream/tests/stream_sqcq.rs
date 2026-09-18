@@ -446,7 +446,7 @@ fn sq_continues_submitting_while_cq_drains() {
 
 /// Test 5: parallel 3-replica fanout.
 ///
-/// Validates that `launch_append` fires the 3 per-replica `send_vectored`
+/// Validates that `launch_append` fires the 3 per-replica `send_prepared`
 /// futures concurrently via `futures::future::join_all` rather than
 /// awaiting them sequentially. The structural proof is in the source
 /// (`join_all` over the per-replica send futures inside `launch_append`).
@@ -487,7 +487,7 @@ fn parallel_fanout_fires_3_replicas_concurrently() {
             const PAYLOAD: usize = 256;
 
             // Fire N appends concurrently — each goes through launch_append's
-            // new parallel 3-replica send_vectored fanout.
+            // parallel 3-replica send_prepared fanout.
             let handles: Vec<_> = (0..N)
                 .map(|i| {
                     let client = client.clone();

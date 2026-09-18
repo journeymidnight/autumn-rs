@@ -813,12 +813,25 @@ StreamClient::connect(manager_endpoint, owner_key, max_extent_size, pool)
 
 ### Append data flow (public API drives retry)
 
-For star replication with multiple replicas and at least 64 KiB of payload,
-`launch_append` creates one `PreparedPayload` including the AppendReq header.
-Every replica combines its own RPC header with that checksum; submission order,
-full transit CRC and all-replica ACK behavior remain unchanged. This removes
-R-1 full payload scans per append. Chain and small/single-replica paths keep
-ordinary vectored sends. A pooled ctrl receive candidate was tested and withdrawn
+`launch_append` creates one `PreparedPayload` including the AppendReq header for
+every star-replicated append, at every size and replica count, and sends it to
+each replica with `send_prepared`. The wire bytes are identical to a per-replica
+vectored send, so this site has nothing to choose between; submission order,
+full transit CRC and all-replica ACK behavior are unchanged.
+
+Whether the replicas SHARE one checksum scan is NOT decided here. It is a CPU
+trade-off that depends on payload size and replica count, it is a large loss at
+WAL sizes, and it lives inside `PreparedPayload` (`COMBINE_MIN_BYTES`, 1 MiB)
+next to the benchmark that sets it — see the rpc crate's "Prepared replica
+payloads". The replica count is passed in for that decision. A size gate at THIS
+site is the wrong shape twice over: it cannot be measured where it is written,
+and it forces a second construction path for bytes that are identical.
+
+The other size threshold on this path is the RPC writer's zerocopy opt-in
+(`--tcp-zerocopy-min-bytes`, off by default), one layer down. Chained
+replication is a separate path and still sends vectored: its frame carries a
+chain prefix and goes to one replica, so there is no second scan to save.
+A pooled ctrl receive candidate was tested and withdrawn
 for lack of stable CPU/throughput gain; see "Append receive" for what the EN
 receive does instead.
 
@@ -860,7 +873,7 @@ append*(stream_id, payload):
 │                                                                 │
 │  SQ (launch_append):                                            │
 │     - lease offset range; header.commit = offset                │
-│     - fire pool.send_vectored to each replica IN PARALLEL via    │
+│     - fire pool.send_prepared to each replica IN PARALLEL via    │
 │       join_all over the 3 per-replica futures (each replica's    │
 │       writer_task is single-writer → per-replica TCP byte order  │
 │       = lease order; inter-replica fanout order is irrelevant)   │
@@ -1050,7 +1063,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
 2. **Eversion changes on seal** — a manager seal (split, extent rolling) bumps eversion; the next append sees a mismatch, fetches updated `ExtentInfo`, and handles accordingly.
 
-3. **Parallel 3-replica fanout** — `launch_append` fires the 3 per-replica `pool.send_vectored` futures concurrently via `join_all`; one slow replica doesn't serialise the others. Per-replica TCP byte order is preserved because each `RpcClient` runs a single-writer `writer_task`; fanout order across replicas is irrelevant. `apply_completion` enforces that all replicas agree on the file-level `offset/end`.
+3. **Parallel 3-replica fanout** — `launch_append` fires the 3 per-replica `pool.send_prepared` futures concurrently via `join_all`; one slow replica doesn't serialise the others. Per-replica TCP byte order is preserved because each `RpcClient` runs a single-writer `writer_task`; fanout order across replicas is irrelevant. `apply_completion` enforces that all replicas agree on the file-level `offset/end`.
 
 4. **Durability is not a knob** — the per-extent owner does ONE `sync_data` per drained burst (`pending_fsync` before, `last_synced` after), so every append is durable before it ACKs. `sync_data` is whole-file, so one burst's fsync covers every append in that burst. There is no `--nosync` and no `must_sync` flag: the byte was removed from `AppendReq`, and `BatchPutReq` lost the last surviving copy at wire v30.
 

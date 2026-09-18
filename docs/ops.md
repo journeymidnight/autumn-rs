@@ -3446,9 +3446,10 @@ For UCX, run prepared_append with `--features autumn-rpc/ucx` and
 UCX_NET_DEVICES. This validates actual disk bytes and append offsets.
 The zerocopy option does not change UCX sends.
 
-`autumn-ps --tcp-zerocopy-min-bytes N` opts prepared replica TCP sends into
-zerocopy at N complete-frame bytes. Default 0 disables it and is the rollback
-switch. Send completion and buffer release are distinct; the writer waits for
+`autumn-ps --tcp-zerocopy-min-bytes N` opts replica append TCP sends into
+zerocopy at N complete-frame bytes. Every star-replicated append is a prepared
+send, so N alone decides which appends qualify — it is the only size cut on
+this write path. Default 0 disables it and is the rollback switch. Send completion and buffer release are distinct; the writer waits for
 both before reuse. No wire or persisted-format version changes are involved.
 Restart with 0 to return to ordinary sends. Keep the old binaries and lockfiles
 for a dependency rollback; stop PS and wait for drain before stopping EN/manager.

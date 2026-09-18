@@ -25,14 +25,22 @@ not establish that io_uring bookkeeping itself is the expensive work.
    idle in the baseline, and live repinning measured 455 MiB/s in one noisy run.
 2. Reuse immutable payload CRC across star replicas. PreparedPayload owns the
    segments, size and CRC. Each RpcClient combines its distinct frame header CRC
-   with that CRC. It saves R-1 complete scans for replicated appends >=64 KiB;
-   small/single-replica/chain sends retain their old path. Header and complete
+   with that CRC. It saves R-1 complete scans per append. Header and complete
    append transit CRC, wire layout, ordering and all-replica ACK are unchanged.
+   The >=64 KiB cut this was first measured at has since moved to 1 MiB and into
+   PreparedPayload itself: re-measuring against the re-scanning path showed
+   combining LOSES below ~512 KiB (23x at 4 KiB RF=3) and can never pay for a
+   single replica, so every append now prepares and the object picks the cheaper
+   checksum arm. Chain sends still frame their own payload.
 
-Release CRC microbenchmark: 200 x 8 MiB payloads, three distinct request IDs per
-payload, including prepared-object and iovec construction: original 893.294 ms,
-prepared 269.859 ms (69.8% less elapsed CPU-bound work). The separate byte-for-byte
-test includes empty/multi-segment payloads and corruption rejection.
+Release CRC microbenchmark: at the time this was written it measured one point,
+200 x 8 MiB payloads with three distinct request IDs, and reported original
+893.294 ms against prepared 269.859 ms (69.8% less elapsed CPU-bound work). That
+number stands for 8 MiB and is why sharing a scan is worth having; what it could
+not show is that the same arithmetic LOSES 23x at 4 KiB. `replica_crc_cpu_benchmark`
+is now a size x RF sweep for that reason and prints a table, not this pair. The
+separate byte-for-byte test includes empty/multi-segment payloads and corruption
+rejection.
 
 Cluster observations, short sequential samples (not confidence intervals):
 

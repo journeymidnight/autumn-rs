@@ -281,7 +281,7 @@ distinct contiguous offsets regardless of completion order).
 ┌─ autumn-stream stream_worker_loop                             ┐
 │    FU<3-replica-join>, cap 32, per stream_id                  │
 └─────────────┬─────────────────────────────────────────────────┘
-              ▼  pool.send_vectored per replica
+              ▼  pool.send_prepared per replica
 ┌─ autumn-rpc writer_task — single SQ per conn                  ┐
 └─────────────┬─────────────────────────────────────────────────┘
               ▼  TCP
