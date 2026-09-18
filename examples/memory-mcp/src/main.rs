@@ -518,8 +518,10 @@ fn mcp_tool_defs() -> Value {
     let id = json!({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]});
     let query = json!({"type":"object","properties":{"query":{"type":"string"},"mode":{"type":"string"},"k":{"type":"integer"}},"required":["query"]});
     json!([
-        {"name":"search_code","description":"Search the indexed codebase (mode: lexical|vector|hybrid|auto). Returns symbols with source, kind, file:line, score. Code only — use search_docs for prose.",
+        {"name":"search_code","description":"Search the indexed codebase (mode: lexical|vector|hybrid|auto). Returns WHERE each match is — id, name, kind, file, start/end lines, score — and no source. Read what you want with read_file (a line range) or get_symbol (one whole symbol). Code only; use search_docs for prose.",
          "inputSchema": query},
+        {"name":"read_file","description":"Read a line range of an indexed file: `path` relative to the indexed tree, `start`/`end` 1-based inclusive (omit for the whole file). The natural follow-up to a search hit's file+start+end. Capped at 400 lines per call; `truncated` says when the range was cut.",
+         "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"start":{"type":"integer"},"end":{"type":"integer"}},"required":["path"]}},
         {"name":"get_symbol","description":"Full text + metadata for an id — a code symbol ('src/lib.rs::MemoryStore::add_edge') or a document chunk ('docs/ops.md#L10-L42').","inputSchema":id},
         {"name":"find_callers","description":"Symbols that call `id`.","inputSchema":id},
         {"name":"find_callees","description":"Symbols that `id` calls.","inputSchema":id},
@@ -581,6 +583,11 @@ async fn mcp_tool_call(code: &Code, params: &Value) -> Result<Value> {
         "search_code" => json!(code.search(&s("query"), mode, k, Corpus::Code).await?),
         "search_docs" => json!(code.search(&s("query"), mode, k, Corpus::Docs).await?),
         "get_symbol" => code.get_symbol(&s("id")).await?.unwrap_or(Value::Null),
+        "read_file" => code.read_file(
+            &s("path"),
+            args.get("start").and_then(|v| v.as_u64()).map(|n| n as usize),
+            args.get("end").and_then(|v| v.as_u64()).map(|n| n as usize),
+        )?,
         "find_callers" => json!(code.callers(&s("id")).await?),
         "find_callees" => json!(code.callees(&s("id")).await?),
         "trace_call_path" => {
@@ -881,6 +888,7 @@ async fn main() -> Result<()> {
     let code = Code {
         store: store.clone(),
         emb: emb.clone(),
+        root: root.clone(),
     };
 
     // MCP stdio mode: speak JSON-RPC over stdin/stdout against the existing

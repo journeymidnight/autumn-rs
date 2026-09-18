@@ -14,6 +14,7 @@
 //! `members` / `outline` / `trace` remain as named shorthands for the two
 //! edge types this binary's own indexers write.
 
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -24,12 +25,11 @@ use crate::embed::Embedder;
 
 const NPROBE: usize = 8;
 
-/// How much of a symbol's body one SEARCH hit may carry. See `hit`.
-///
-/// 1200 characters keeps virtually every hit whole — the median is ~485 — and
-/// clips only the long tail that was eating callers' context. `get_symbol`
-/// is not subject to it.
-const MAX_SEARCH_SOURCE_CHARS: usize = 1200;
+/// The most lines one `read_file` may return. A search hit's span is usually
+/// tens of lines; this is only here so "read the file" cannot become a way to
+/// spend a whole context window in one call.
+const MAX_READ_LINES: usize = 400;
+
 
 /// Which corpus a search should return. Both live in the same index; the
 /// filter is on each hit's meta `kind`.
@@ -64,6 +64,10 @@ pub struct Code {
     /// lexical leg only, and says so, rather than answering vector queries with
     /// vectors that mean nothing.
     pub emb: Option<Rc<Embedder>>,
+    /// The indexed tree, and the ONLY tree `read_file` will read from. A
+    /// search hit names a file and a line span; reading it is the caller's
+    /// separate, bounded act, and this is what bounds WHERE it can read.
+    pub root: PathBuf,
 }
 
 impl Code {
@@ -95,58 +99,111 @@ impl Code {
         }
     }
 
-    /// One hit. `headings` is present only on document chunks. `max_source`
-    /// caps the body; `None` means whole.
+    /// One hit. `headings` is present only on document chunks.
     ///
-    /// A SEARCH RESULT IS A SHORTLIST, NOT A DELIVERY. Every search hit used
-    /// to carry its symbol's entire body, and one body can be enormous:
-    /// measured against the autumn-rs index, `extent node replication`
-    /// answered with 7 hits and 24,608 characters of source, of which ONE hit
-    /// was 17,396 — 71% of the reply, for a single function — while the median
-    /// hit was 485. An agent that asks three such questions has spent its
-    /// context on code it never chose to read, and it cannot decline: the
-    /// bytes arrive before there is anything to decide with. Downstream this
-    /// showed up as conversations that searched fifteen times and answered
-    /// nothing.
+    /// `body` is what the hit carries of the symbol's text: `Some` for a
+    /// deliberate single fetch (`get_symbol`), `None` for a SEARCH hit.
     ///
-    /// So SEARCH answers with an excerpt and says it is one, while
-    /// `get_symbol` — which exists to fetch one body deliberately — still
-    /// answers whole. The id needed for that is in the hit itself.
+    /// A SEARCH RESULT IS A LOCATION, NOT A DELIVERY. Every hit used to carry
+    /// the symbol's whole body, and one body can be enormous: on this index
+    /// `extent node replication` answered with 7 hits and 24,608 characters of
+    /// source, of which ONE hit was 17,396 — 71% of the reply for a single
+    /// function — while the median hit was 485. A caller asking three such
+    /// questions has spent its context on code it never chose to read, and it
+    /// cannot decline: the bytes arrive before there is anything to decide
+    /// with.
     ///
-    /// The cut is on a CHARACTER boundary, not a byte one: this corpus has
-    /// non-ASCII comments and identifiers, and slicing a `String` mid-codepoint
-    /// panics.
-    fn hit(id: &str, m: &Value, text: &str, score: Option<f32>, max_source: Option<usize>) -> Value {
-        let source = match max_source {
-            Some(max) if text.chars().count() > max => {
-                let kept: String = text.chars().take(max).collect();
-                let dropped = text.chars().count() - max;
-                format!(
-                    "{kept}\n… [{dropped} more chars — this is a search excerpt; \
-                     call get_symbol with id={id:?} for the full body]"
-                )
-            }
-            _ => text.to_string(),
-        };
+    /// Trimming to an excerpt was the first attempt and it is still the wrong
+    /// shape — an excerpt is a smaller delivery, and the caller has to take
+    /// it. So a hit now says WHERE: id, name, kind, file, and the line span.
+    /// Reading is a separate, bounded act the caller performs on purpose —
+    /// `read_file` for a line range, `get_symbol` for one whole symbol — and
+    /// it chooses how much. Dropping the body takes an 8-hit result from
+    /// 6,563 characters to 1,712.
+    fn hit(id: &str, m: &Value, body: Option<&str>, score: Option<f32>) -> Value {
         let mut v = json!({
             "id": id, "name": m.get("name"), "kind": m.get("kind"),
             "file": m.get("file"), "start": m.get("start"), "end": m.get("end"),
-            "source": source,
         });
+        if let Some(text) = body {
+            v["source"] = json!(text);
+        }
         if let Some(h) = m.get("headings") {
             v["headings"] = h.clone();
         }
-        if let Some(s) = score {
-            v["score"] = json!(s);
+        if let Some(sc) = score {
+            v["score"] = json!(sc);
         }
         v
     }
 
     pub async fn get_symbol(&self, id: &str) -> Result<Option<Value>> {
         match self.store.get_memory(id).await? {
-            Some((text, meta)) => Ok(Some(Self::hit(id, &Self::meta_of(&meta), &text, None, None))),
+            Some((text, meta)) => Ok(Some(Self::hit(id, &Self::meta_of(&meta), Some(&text), None))),
             None => Ok(None),
         }
+    }
+
+    /// A line range of one indexed file.
+    ///
+    /// The other half of "a search hit is a location": the hit says
+    /// file + start + end, and this is how the caller turns that into text —
+    /// deliberately, and at a size IT chooses, instead of being handed every
+    /// matching body whether it wanted them or not.
+    ///
+    /// Two bounds, and both matter. `MAX_READ_LINES` stops "read the file"
+    /// from being a way to spend a context window in one call. And the path
+    /// is resolved and confined to `root`: the corpus is what this server
+    /// indexes, not the pod's filesystem, so `../..` or an absolute path
+    /// cannot reach a credential mounted next door. Resolution is by
+    /// canonicalize + prefix check rather than a scan for "..", because a
+    /// symlink inside the tree reaches outside it without the string ever
+    /// containing one.
+    pub fn read_file(&self, path: &str, start: Option<usize>, end: Option<usize>) -> Result<Value> {
+        Self::read_within(&self.root, path, start, end)
+    }
+
+    /// The body of `read_file`, without the store. Reading a file has nothing
+    /// to do with the index, and keeping it free of `self` is what lets the
+    /// confinement above be tested without standing up a MemoryStore.
+    fn read_within(
+        tree: &Path,
+        path: &str,
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Result<Value> {
+        let root = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
+        let joined = if Path::new(path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            root.join(path)
+        };
+        let target = joined
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        if !target.starts_with(&root) {
+            anyhow::bail!("{path} is outside the indexed tree");
+        }
+        let text = std::fs::read_to_string(&target)
+            .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+        let lines: Vec<&str> = text.lines().collect();
+        // 1-based and inclusive, to match what a hit reports and what a human
+        // reads off an editor gutter.
+        let from = start.unwrap_or(1).max(1);
+        let to = end.unwrap_or(lines.len()).min(lines.len());
+        if from > lines.len() {
+            anyhow::bail!("{path} has {} lines; start={from} is past the end", lines.len());
+        }
+        let capped = to.min(from + MAX_READ_LINES - 1);
+        let body = lines[from - 1..capped].join("\n");
+        Ok(json!({
+            "file": path,
+            "start": from,
+            "end": capped,
+            "total_lines": lines.len(),
+            "truncated": capped < to,
+            "text": body,
+        }))
     }
 
     pub async fn search(&self, q: &str, mode: &str, k: usize, corpus: Corpus) -> Result<Vec<Value>> {
@@ -171,10 +228,14 @@ impl Code {
                     if out.len() >= k {
                         break;
                     }
-                    if let Some((text, meta)) = self.store.get_memory(&id).await? {
+                    // The body is no longer part of a hit (see `hit`), but
+                    // `get_memory` is what carries the meta the kind filter
+                    // needs; a lighter node-only read is possible and is not
+                    // worth changing retrieval semantics for late.
+                    if let Some((_text, meta)) = self.store.get_memory(&id).await? {
                         let m = Self::meta_of(&meta);
                         if corpus.admits(m.get("kind").and_then(|v| v.as_str())) {
-                            out.push(Self::hit(&id, &m, &text, Some(score), Some(MAX_SEARCH_SOURCE_CHARS)));
+                            out.push(Self::hit(&id, &m, None, Some(score)));
                         }
                     }
                 }
@@ -186,7 +247,7 @@ impl Code {
                     }
                     let m = Self::meta_of(&d.meta);
                     if corpus.admits(m.get("kind").and_then(|v| v.as_str())) {
-                        out.push(Self::hit(&d.id, &m, &d.text, Some(d.score), Some(MAX_SEARCH_SOURCE_CHARS)));
+                        out.push(Self::hit(&d.id, &m, None, Some(d.score)));
                     }
                 }
             }
@@ -375,48 +436,104 @@ mod tests {
                "start": 10, "end": 900})
     }
 
-    /// A search hit is a shortlist entry. One symbol in this corpus is 17,396
-    /// characters — 71% of a 7-hit reply — and every caller paid for it before
-    /// it could decide whether it wanted the body at all.
+    /// A search hit says WHERE. One symbol on this index is 17,396 characters
+    /// — 71% of a 7-hit reply — and every caller paid for it before it could
+    /// decide whether it wanted the body at all.
     #[test]
-    fn search_hits_carry_an_excerpt_and_say_so() {
-        let body = "x".repeat(20_000);
-        let v = Code::hit("src/put.rs::write_bulk", &meta(), &body, Some(0.9),
-                          Some(MAX_SEARCH_SOURCE_CHARS));
-        let src = v["source"].as_str().unwrap();
-        assert!(src.chars().count() < MAX_SEARCH_SOURCE_CHARS + 200);
-        assert!(src.contains("more chars"), "a cut must announce itself: {src:.200}");
-        assert!(src.contains("get_symbol"), "and name how to get the rest");
-        assert!(src.contains("src/put.rs::write_bulk"), "with the id to ask for");
+    fn a_search_hit_carries_no_body() {
+        let v = Code::hit("src/put.rs::write_bulk", &meta(), None, Some(0.9));
+        assert!(v.get("source").is_none(), "a search hit must not deliver code");
+        // What a caller needs to read it deliberately, and to cite it.
+        for f in ["id", "name", "kind", "file", "start", "end", "score"] {
+            assert!(v.get(f).is_some(), "a hit must still say {f}");
+        }
     }
 
-    /// get_symbol exists to fetch one body deliberately. Capping it would
-    /// leave no way to read a long function at all.
+    /// get_symbol is the deliberate single fetch, so it still answers whole:
+    /// dropping the body everywhere would leave no way to read a symbol at all.
     #[test]
-    fn get_symbol_is_never_capped() {
+    fn get_symbol_answers_whole() {
         let body = "x".repeat(20_000);
-        let v = Code::hit("id", &meta(), &body, None, None);
+        let v = Code::hit("id", &meta(), Some(&body), None);
         assert_eq!(v["source"].as_str().unwrap().len(), 20_000);
     }
 
-    /// A short body is returned untouched — the median hit here is ~485 chars,
-    /// so the cap must be invisible for almost every result.
-    #[test]
-    fn a_short_body_is_untouched() {
-        let body = "fn write_bulk() {}";
-        let v = Code::hit("id", &meta(), body, Some(0.5), Some(MAX_SEARCH_SOURCE_CHARS));
-        assert_eq!(v["source"].as_str().unwrap(), body);
+    /// A tree to read from, and one credential-shaped file OUTSIDE it.
+    fn corpus(name: &str) -> (PathBuf, PathBuf) {
+        // Per-test directory: these tests run in PARALLEL, and one shared path
+        // meant each one's setup deleted the others' tree mid-run — three
+        // failures that all passed when run alone.
+        let dir = std::env::temp_dir()
+            .join(format!("mmcp-read-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let root = dir.join("src");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(dir.join("fs.cred"), "SECRET").unwrap();
+        let body: String = (1..=600).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("big.rs"), &body).unwrap();
+        std::fs::write(root.join("sub/small.rs"), "a\nb\nc\n").unwrap();
+        (dir, root)
     }
 
-    /// The cut is on a CHARACTER boundary. This corpus has non-ASCII comments
-    /// and identifiers, and slicing a String by byte index mid-codepoint is a
-    /// panic — which would take down the whole search, not just one hit.
     #[test]
-    fn a_multibyte_body_does_not_panic_at_the_cut() {
-        let body = "写入路径的注释".repeat(1000);   // 3 bytes per char
-        let v = Code::hit("id", &meta(), &body, Some(0.5), Some(MAX_SEARCH_SOURCE_CHARS));
-        let src = v["source"].as_str().unwrap();
-        assert!(src.starts_with("写入路径的注释"));
-        assert!(src.contains("more chars"));
+    fn read_file_returns_the_range_the_caller_asked_for() {
+        let (dir, root) = corpus("range");
+        let v = Code::read_within(&root, "big.rs", Some(10), Some(12)).unwrap();
+        assert_eq!(v["text"], json!("line 10\nline 11\nline 12"));
+        assert_eq!(v["start"], json!(10));
+        assert_eq!(v["end"], json!(12));
+        assert_eq!(v["total_lines"], json!(600));
+        assert_eq!(v["truncated"], json!(false));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// "Read the file" must not be a way to spend a context window in one
+    /// call — the problem this whole change exists to fix.
+    #[test]
+    fn read_file_is_capped_and_says_so() {
+        let (dir, root) = corpus("capped");
+        let v = Code::read_within(&root, "big.rs", None, None).unwrap();
+        assert_eq!(v["truncated"], json!(true));
+        assert_eq!(v["end"], json!(MAX_READ_LINES as u64));
+        assert_eq!(v["text"].as_str().unwrap().lines().count(), MAX_READ_LINES);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// This server runs in a pod that mounts an autumn credential. A path
+    /// argument that escapes the indexed tree must be refused, by resolution
+    /// and not by scanning for "..": a symlink inside the tree reaches outside
+    /// it without the string ever containing one.
+    #[test]
+    fn read_file_cannot_leave_the_indexed_tree() {
+        let (dir, root) = corpus("escape");
+        for escape in ["../fs.cred", "sub/../../fs.cred", "/etc/hostname"] {
+            let r = Code::read_within(&root, escape, None, None);
+            assert!(r.is_err(), "{escape} must be refused, got {r:?}");
+        }
+        #[cfg(unix)]
+        {
+            let link = root.join("sneak");
+            std::os::unix::fs::symlink(dir.join("fs.cred"), &link).unwrap();
+            let r = Code::read_within(&root, "sneak", None, None);
+            assert!(r.is_err(), "a symlink out of the tree must be refused: {r:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_file_reports_a_start_past_the_end() {
+        let (dir, root) = corpus("past-end");
+        assert!(Code::read_within(&root, "sub/small.rs", Some(99), None).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Document chunks carry their heading path; that is provenance, not body.
+    #[test]
+    fn a_document_hit_keeps_its_heading_path() {
+        let m = json!({"name": "ops", "kind": "Section", "file": "docs/ops.md",
+                       "start": 10, "end": 42, "headings": ["Ops", "Restarts"]});
+        let v = Code::hit("docs/ops.md#L10-L42", &m, None, Some(0.5));
+        assert_eq!(v["headings"], json!(["Ops", "Restarts"]));
+        assert!(v.get("source").is_none());
     }
 }
