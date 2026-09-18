@@ -53,7 +53,18 @@ doc_lazy_continuation = "allow"
 doc_overindented_list_items = "allow"
 
 [workspace.dependencies]
-compio = "0.19.2"
+# `polling` is not a second driver, it is what makes the driver a CHOICE.
+# compio-driver's build.rs only defines `cfg(fusion)` when io-uring AND polling
+# are both on, and only the fusion driver runs `DriverType::suggest()`, which
+# probes the running kernel for the opcodes it needs and falls back to Poll when
+# they are missing. With the default features (io-uring alone) there is no probe
+# and no fallback: 0.19 submits `IORING_OP_SOCKET` (kernel 5.19+), `BIND` and
+# `LISTEN` (6.11+) unconditionally, and every node here runs 5.15 or 5.4 — the
+# socket comes back as `Bad file descriptor (os error 9)` from
+# `TcpStream::connect`, which is what wedged the manager against etcd on the
+# first attempt to deploy this upgrade. 0.18 was safe by accident: its opcode
+# set predates all three.
+compio = { version = "0.19.2", features = ["polling"] }
 anyhow = "1"
 bytes = "1"
 dashmap = "6"
