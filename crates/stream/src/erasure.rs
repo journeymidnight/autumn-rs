@@ -470,13 +470,13 @@ mod tests {
         assert_eq!(reconstructed, truth);
     }
 
-    /// verify the shard_size detection condition used by
-    /// handle_convert_to_ec to detect a crash between rename(.ec.dat → .dat)
-    /// and save_meta. After the crash, local file len == shard_size but meta
-    /// still has the old eversion. The condition is:
-    ///   local_len < sealed_length && local_len == expected_shard
+    /// A staged shard is strictly SHORTER than the extent it came from, for
+    /// every K >= 2. `handle_convert_to_ec`'s prepare-skip leans on that: it
+    /// accepts existing staging only when the file's length equals
+    /// `shard_size(sealed_length, K)`, so a full-length replica can never be
+    /// mistaken for a finished shard and skipped over.
     #[test]
-    fn shard_size_detection_for_crash_recovery() {
+    fn a_staged_shard_is_never_the_length_of_the_whole_extent() {
         for &(payload_len, data_shards) in &[
             (1024usize, 2usize),
             (4096, 3),
@@ -494,14 +494,14 @@ mod tests {
             let detected = local_len < sealed_length && local_len == expected_shard as u64;
             assert!(
                 detected,
-                "crash-recovery detection should fire for payload={payload_len}, data_shards={data_shards}"
+                "a real shard length must satisfy the skip check for payload={payload_len}, data_shards={data_shards}"
             );
 
             let not_crash = payload_len as u64;
             let not_detected = not_crash < sealed_length && not_crash == expected_shard as u64;
             assert!(
                 !not_detected,
-                "full payload should NOT trigger crash-recovery detection"
+                "a full-length replica must NOT satisfy it"
             );
         }
     }

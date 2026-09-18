@@ -113,7 +113,7 @@ processing in `handle_connection`); there is no `write_lock`.
 `resident_file()` / `extent_file()`, which clone the inner `Rc<CompioFile>`
 under a brief `RefCell::borrow()`; the clone is held by the I/O future across
 `.await`, and the borrow is released before the first `.await`. The file-replace
-path (`commit_shard_local`) uses `entry.replace_file(new)` (safe
+path (the peer-copy's atomic rename over `.dat`) uses `entry.replace_file(new)` (safe
 `RefCell::borrow_mut()` + `Rc::replace`); the old `Rc` drops only when the last
 concurrent reader releases its clone, so the fd can't dangle. `ec_conversion_
 locks` remains only as higher-level serialisation against concurrent EC
@@ -1534,7 +1534,7 @@ manager's ledger entry for it is `(OP_KIND_RECOVERY, extent_id)`.
 (`erasure::ec_encode_stripe`, byte-identical to a slice of `ec_encode`), so
 `handle_convert_to_ec` reads the K data sub-ranges at shard-offset `s`, encodes
 the M parity stripes, and streams each shard's stripe via `WriteShard` carrying
-`shard_offset: u64`; the receiver `pwrite`s into `.ec.dat` at `shard_offset` +
+`shard_offset: u64`; the receiver `pwrite`s into `.shard{i}` at `shard_offset` +
 `sync_data`s (`write_shard_stripe_local`). Peak RAM = `(K+M) ×
 EC_ENCODE_STRIPE_BYTES` (64 MiB default → ~256 MiB), independent of extent size;
 each WriteShard stays under the frame ceiling. Crash-safety: per-stripe
@@ -1542,7 +1542,9 @@ each WriteShard stays under the frame ceiling. Crash-safety: per-stripe
 coordinator writes its OWN shard-0 stripe LAST per stripe, so
 `coordinator_prepared` ⇒ every participant durably staged every stripe.
 `write_shard_stripe_local` bounds `shard_offset + stripe_len ≤ sealed_length` so
-a malformed/stale WriteShard can't balloon `.ec.dat` into a sparse file. The
+a malformed/stale WriteShard can't balloon the shard file into a sparse one — a
+shard read is bounded by that file's length, so a sparse tail is served as part
+of the shard and EC reconstruct fails on the over-long slice. The
 peer-copy (coordinator local short) streams into a TEMP file via
 `peer_copy_full_extent_to_dat` and atomic-renames over `.dat` only after a full
 copy lands (never `set_len(0)` a live replica before securing a complete copy).
@@ -1576,7 +1578,7 @@ extent DOWN while any non-excluded source was unreachable or unattempted.**
 
 ## 崩溃一致性 fail-closed 不变量
 
-三处崩溃一致性都是 fail-closed（断电/内核崩溃触发；`kill -9` 不丢已 fsync 的
+下面几处崩溃一致性都是 fail-closed（断电/内核崩溃触发；`kill -9` 不丢已 fsync 的
 page cache 或 dirent，chaos 测不到）。
 
 **META-FAILCLOSED — 损坏 `.meta` 隔离。** `load_extents` 读路径区分：(a) `.meta`
@@ -1588,26 +1590,33 @@ commit_length **全部拒绝**；`write_meta_locked` 成功持久后清 flag（r
 必 quarantine 待 manager 恢复**（否则一个本该 sealed/fenced 的 extent 重启即变
 open+epoch0，stale 低-epoch writer 绕过 fence ghost-append = split-brain）。
 
-**EC-PREPARE-DURABLE — EC 2PC staging 的父目录 fsync。** `write_shard_local`
-（prepare）写 `.ec.dat` 后 `sync_data()` + **fsync 父目录**（`fsync_staging_dir`），
-新写路径与幂等早退路径都调用（早退也要满足 durable-prepare 语义）；commit 的
-`rename(.ec.dat→.dat)` 之后同样 fsync 父目录。POSIX 下新文件的目录项不随内容
-fsync 持久，缺父目录 fsync 断电可整个丢 dirent → commit 找不到 staging → 2PC
-participant 卡死。
+**EC-STAGING-DURABLE — EC staging 的父目录 fsync。** 转换是
+copy-on-write：`write_shard_stripe_local` 把每个 stripe `pwrite` 进**附加文件**
+`extent-{id}.shard{i}`，`.dat` 全程不动。每个 stripe 写完 `sync_data()` 让内容持久，
+再 **fsync 父目录**（`fsync_staging_dir`）让**目录项**持久 —— POSIX 下新文件的名字
+不随内容 fsync 一起落盘。缺这一步，断电可能内容还在而 dirent 没了，下一个 stripe
+发现 staging 文件消失；而 `write_shard_stripe_local` 此时**拒绝**（绝不在原 offset
+重建一个文件，否则会造出带零洞的 shard 并可能被发布），于是这次 attempt 卡住，
+等 manager 重新派发。
 
-**EC-COMMIT-ATOMIC — `rename(.ec.dat→.dat)` ↔ `save_meta` 崩溃窗的 intent
-marker。** commit 是两步独立持久化（① rename+dir-fsync ② atomics+save_meta），两步
-间崩溃（`kill -9` 即可复现）→ `.dat`=shard 但 `.meta`=pre-EC，旧幂等永久卡死 + 把
-shard 当完整 value 读（损坏）。修复：`extent-{id}.ec.commit` marker
-（`[new_eversion][sealed_length]`，**rename 前**durable 写，save_meta 后删）。
-`finish_ec_commit` 共享 helper：rename-if-staging + **总是 reopen `.dat`**（同进程
-retry 可能持旧 unlink fd）+ **单调 `fetch_max` eversion**（防旧 marker 回退）+
-save_meta。`load_extents` 启动重放三态 `EcCommitMarker`：Valid+eversion<marker →
-补齐；eversion≥marker → 仅清 marker；Corrupt → **quarantine**；Absent → 跳过。
-同进程 retry 分支用 marker payload（marker 是已发布 `.dat` 的权威）+ 同样 eversion
-门控。**不变量：`corrupt_meta` 的 extent 绝不 marker-replay**（marker 无
-owner_epoch，replay 会写 owner_epoch=0 → fence 旁路 + 清 quarantine = META-FAILCLOSED
-漏洞）。`remove_extent_files` 同时 unlink marker。
+**没有 commit 阶段，所以没有 commit 崩溃窗要保护。** 旧方案是每个节点把 staging
+`rename` 覆盖 `.dat`，于是"rename 之后、`save_meta` 之前"是一个真实的崩溃窗（`.dat`
+已是 shard 而 `.meta` 还是 pre-EC），需要一个 commit-intent marker 才能修回来；更糟的是
+它会让集群停在"一部分节点已 rename、一部分没有"这个**没人能分类**的中间态，这正是
+当初 marker 卡死无法释放的根源。现在**唯一的 commit 点是 manager 那一次 layout flip**
+（`apply_ec_conversion_done`，单个 leader-fenced txn 同时改 membership / eversion /
+`avali` / `payload_location`）。在那之前什么都没提交 —— shard 只是没有任何 reader 被
+指向的附加文件 —— 所以放弃一次 attempt 的代价只是删掉几个文件。节点侧对应地**没有**
+rename、没有 `.ec.commit` marker、没有启动重放；`MSG_COMMIT_EC_SHARD` 是保留的墓碑。
+shard holder 的 seal 是在 `apply_placements` 处理 InShardFile 转移时，由
+`apply_extent_meta_durable` 一次 `save_meta` 写下（seal + location 一起）。
+
+**`.ec.prepared` 是 attempt 身份的载体。** staging 文件自己不带 attempt 信息，而
+`new_eversion` 在被释放后重发的 attempt 上会重复（它是 `live + 1`，被放弃的 attempt
+从没 bump 过 extent），所以 marker 里记的是 `[new_eversion][attempt_nonce]`，
+prepare-skip 必须**两者都匹配**才跳过重新编码。升级前留下的 8 字节旧 marker 读起来
+是"短"的，于是只会多做一次 prepare —— 永远安全。`remove_extent_files` 会连它一起
+unlink。
 
 ## Compio 0.19 compatibility
 

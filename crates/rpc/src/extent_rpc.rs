@@ -1096,10 +1096,10 @@ pub struct ConvertToEcReq {
     pub target_addrs: Vec<String>,
     pub eversion: u64,
     /// Tier 2: owner-lock owner_epoch propagated from manager.
-    /// Coord puts this into every `WriteShardReq.owner_epoch` and
-    /// `CommitEcShardReq.owner_epoch` so a fenced ex-coord whose in-flight
-    /// 2PC continues against bumped revisions on remote ENs is
-    /// rejected with `CODE_LOCKED_BY_OTHER`. `0` = legacy no-fence.
+    /// The coordinator puts this into every `WriteShardReq.owner_epoch`, so a
+    /// FENCED ex-coordinator whose conversion is still streaming stripes runs
+    /// into the bumped revision on the remote ENs and is rejected with
+    /// `CODE_LOCKED_BY_OTHER`. `0` = legacy no-fence.
     pub owner_epoch: i64,
     /// Identity of THIS conversion attempt — the etcd revision that created
     /// the manager's marker, so it is unique per attempt and monotonic across
@@ -1192,7 +1192,7 @@ impl CopyExtentResp {
 /// requested" (wire-compat).
 ///
 /// `shard_offset` (chunked EC convert): the byte offset WITHIN the shard
-/// at which `payload` is written into the staging `.ec.dat`. EC convert
+/// at which `payload` is written into the staging `.shard{i}`. EC convert
 /// streams a shard as a sequence of stripes (each `payload` ≤ a chunk) so a
 /// single RPC never exceeds the frame `payload_len: u32` ceiling — load-bearing
 /// once an extent (hence a shard) can exceed 4 GiB. `shard_offset = 0` with the

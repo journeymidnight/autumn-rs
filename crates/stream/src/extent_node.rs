@@ -687,33 +687,29 @@ impl DiskFS {
     }
 
     /// `extent-{id}.ec.prepared` — records WHICH attempt produced the current
-    /// `.ec.dat` staging (its `new_eversion`). Without it the coordinator's
-    /// "prepare already done, skip to commit" check is size-only, and the
-    /// staging of a DIFFERENT attempt (same extent + same K ⇒ same size) would
-    /// satisfy it — committing stale, possibly wrong-shard-index staging over
-    /// live replicas. Written durably at the END of a full prepare.
+    /// `.shard{i}` staging (`[new_eversion][attempt_nonce]`). The shard file on
+    /// disk carries no attempt identity of its own, and a DIFFERENT attempt on
+    /// the same extent with the same K produces the same size, so without this
+    /// the coordinator's "prepare already done, skip re-encoding" check would
+    /// be satisfied by another attempt's staging. Written durably at the END of
+    /// a full prepare.
     fn ec_prepared_marker_path(&self, extent_id: u64) -> PathBuf {
         self.extent_file_path(extent_id, "ec.prepared")
     }
 
-    /// unlink the `.dat`, `.meta`, and `.ec.dat` files
-    /// for an extent. Idempotent — `NotFound` errors on any of the
-    /// three are downgraded to `Ok(())` so retries from the manager
-    /// are safe. Returns Err only on a real I/O failure (permission
-    /// denied, etc.) so the caller can keep the entry in the
-    /// pending-delete queue and retry.
+    /// unlink every file an extent owns: `.dat`, `.meta`, `.ck`,
+    /// `.ec.prepared`, and each `.shard{i}` actually present. Idempotent —
+    /// `NotFound` on any of them is downgraded to `Ok(())` so the manager's
+    /// retries are safe. Returns Err only on a real I/O failure (permission
+    /// denied, etc.) so the caller can keep the entry in the pending-delete
+    /// queue and retry.
     ///
-    /// **`.ec.dat` staging files are now unlinked.** Previously
-    /// `remove_extent_files` only touched `.dat` + `.meta`, leaving any
-    /// `.ec.dat` from a crashed mid-conversion as a permanent orphan
-    /// (orphan-reconcile only scanned `self.extents`, not the directory).
-    /// With the mutating-op lock, a delete that races a convert is now
-    /// refused — but a CRASH mid-convert can still leave a `.ec.dat`
-    /// behind. Including it here ensures that when the manager
-    /// eventually issues `MSG_DELETE_EXTENT` for the extent (refs→0),
-    /// the staging file is also cleaned. The orphan reconcile loop
-    /// (second leg) handles the case where the extent's
-    /// `extent-{id}.dat` is already gone but `.ec.dat` survived.
+    /// Every one of them has to be here, because a file nothing unlinks is a
+    /// file nothing accounts for: it is invisible to `df` and to every
+    /// reconcile predicate, and it reappears at the next restart when
+    /// `discover_shard_files` scans the directory. A crash mid-convert is the
+    /// ordinary way to be left holding staging for an extent that is later
+    /// deleted.
     async fn remove_extent_files(&self, extent_id: u64) -> Result<()> {
         // Shard files are named per index, so the set to unlink is whatever is
         // actually on disk — a deleted extent that left a shard behind would be
@@ -798,10 +794,11 @@ impl DiskFS {
     }
 
     fn parse_extent_id(name: &str) -> Option<u64> {
-        // Reject `.ec.dat` (the ec-staging file) — that prefix
-        // also ends with ".dat" but parses as "42.ec" which fails
-        // parse::<u64>. Be explicit about the rejection so future
-        // maintainers don't accidentally match it here.
+        // Reject `.ec.dat`, the staging name of the retired rename-to-commit
+        // scheme. Nothing writes one any more, but a node upgraded across that
+        // change can still hold one, and it would parse as "42.ec" — which
+        // fails `parse::<u64>` today, so the guard is about being explicit
+        // rather than about being load-bearing.
         if name.ends_with(".ec.dat") {
             return None;
         }
@@ -814,7 +811,7 @@ impl DiskFS {
     }
 
     /// Parse `extent-{id}.shard{i}` into `(extent_id, shard_index)`. Any other
-    /// shape — including `.dat`, `.ec.dat`, and the markers — is None.
+    /// shape — including `.dat` and the markers — is None.
     fn parse_shard_file(name: &str) -> Option<(u64, u32)> {
         let rest = name.strip_prefix("extent-")?;
         let (id_str, idx_str) = rest.split_once(".shard")?;
@@ -1792,9 +1789,9 @@ pub struct ExtentNode {
     /// is invisible to the new leader, whose 5 s `ec_conversion_dispatch_loop`
     /// can fire a SECOND `EXT_MSG_CONVERT_TO_EC` before the first completes.
     /// The idempotency guard fires post-hoc (eversion bump is the last
-    /// step of the 2PC), so during the deposed leader's mid-`spawn_blocking`
-    /// `ec_encode` + `write_shard_local` window the guard does not yet
-    /// trigger and two encodes race on the same `.ec.dat` staging file —
+    /// step of the conversion), so during the deposed leader's
+    /// mid-`spawn_blocking` `ec_encode` window the guard does not yet
+    /// trigger and two encodes race on the same `.shard{i}` staging file —
     /// producing corrupted shards or sub-shard-of-sub-shard payloads
     /// (the same corruption shape). This lock serialises both dispatches
     /// on the coordinator: the second one waits, then re-runs the idempotency
@@ -1898,7 +1895,7 @@ async fn rpc_oneshot(addr: std::net::SocketAddr, msg_type: u8, payload: Bytes) -
     }
 }
 
-/// Send an EC 2PC participant control RPC (`WriteShard` / `CommitEcShard`) to a
+/// Send an EC participant control RPC (`WriteShard`) to a
 /// target node, extract its response code via `decode_code`, and map a transport
 /// error or a non-`CODE_OK` reply into a uniform `Internal` error. `label`
 /// describes the op (e.g. `"WriteShard to <addr> shard <i> @ <off>"`) so both
@@ -7856,17 +7853,7 @@ impl ExtentNode {
         Ok(shards)
     }
 
-    /// 2PC Phase 1 (prepare): write a single EC shard to a staging file
-    /// (`extent-{id}.ec.dat`), preserving the original `.dat` intact.
-    /// Called by both the coordinator (for its own shard) and the
-    /// WriteShard RPC handler (for remote shards).
-    ///
-    /// The original data file is untouched — reads continue to serve
-    /// the full replica until Phase 2 (`commit_shard_local`) renames
-    /// the staging file over it. If the process crashes after prepare
-    /// but before commit, the staging file is cleaned up on startup
-    /// and the original data remains intact for a retry.
-    /// Write one shard STRIPE into the staging `.ec.dat` at `shard_offset`
+    /// Write one shard STRIPE into the staging `.shard{i}` at `shard_offset`
     /// (chunked EC convert). The shard is streamed as a sequence of stripes so
     /// no single WriteShard RPC exceeds the frame `payload_len: u32` ceiling —
     /// load-bearing once a shard can exceed 4 GiB. `shard_offset = 0` with the
@@ -7874,10 +7861,12 @@ impl ExtentNode {
     ///
     /// Crash-safety: each stripe is `pwrite`'d at its offset and `sync_data`'d
     /// before the caller's ACK, so the durable prefix grows monotonically as
-    /// the coordinator streams stripes sequentially (await-ack per stripe). The
-    /// staging is renamed over `.dat` only by `commit_shard_local`, which the
-    /// coordinator sends ONLY after every stripe acked (coordinator writes its
-    /// OWN shard last, so coord-staging-full ⇒ all participants durably staged).
+    /// the coordinator streams stripes sequentially (await-ack per stripe).
+    /// Nothing here publishes anything: the shard is an ADDITIVE file and the
+    /// manager's layout flip is the single commit point, so an abandoned
+    /// attempt costs a delete of a file no reader is pointed at. The
+    /// coordinator writes its OWN shard last, so coord-staging-full ⇒ every
+    /// participant durably staged.
     /// `pwrite`-at-offset is idempotent, so a retry that re-streams from 0
     /// rewrites the same bytes at the same offsets. No truncate: stripes from
     /// different offsets coexist; the file grows to `shard_size` at the last.
@@ -8028,14 +8017,14 @@ impl ExtentNode {
         let stripe_len = stripe_data.len();
 
         // coco P1 bounds guard: a malformed / stale WriteShard with a huge
-        // `shard_offset` must not create an oversized sparse `.ec.dat` that a
-        // later commit would publish as `.dat` (finish_ec_commit sets
-        // entry.len/sealed_length from the file size). Every legitimate stripe
+        // `shard_offset` must not create an oversized sparse `.shard{i}`. A
+        // shard read is bounded by the FILE's length (`read_plan`), so a sparse
+        // tail is served as part of the shard and EC reconstruct fails on the
+        // over-long slice. Every legitimate stripe
         // ends at most at `shard_size = ceil(sealed_length/K) <= sealed_length`
         // (for any K >= 1), so `shard_offset + stripe_len <= sealed_length` is a
         // K-free upper bound that never rejects a valid stripe but caps the
-        // staging file at `sealed_length` — keeping finish_ec_commit's
-        // `sealed_length.max(shard_len)` from being polluted. (A tight
+        // staging file at `sealed_length`. (A tight
         // `<= ceil(sealed_length/K)` bound would need `data_shards` on the wire;
         // the loose bound is enough to stop the egregious sparse-file case.)
         let stripe_end = shard_offset.checked_add(stripe_len as u64).ok_or_else(|| {
@@ -8070,12 +8059,11 @@ impl ExtentNode {
         // attempt have to survive the open).
         //
         // The staging file carries no attempt identity, so without this a
-        // previous attempt's `.ec.dat` survives into the next one: a reissue
+        // previous attempt's shard file survives into the next one: a reissue
         // with a different K leaves attempt #1's tail bytes past attempt #2's
-        // shard end, and `finish_ec_commit` derives the published length from
-        // the FILE SIZE — so the commit would publish a `.dat` longer than the
-        // real shard (a to-end shard read then returns an over-long shard and
-        // EC reconstruct fails). Truncating at the first stripe makes each
+        // shard end, and a shard read is bounded by the FILE's length — so a
+        // to-end read returns an over-long shard and EC reconstruct fails.
+        // Truncating at the first stripe makes each
         // attempt's staging exactly its own bytes. Same-K re-prepare was only
         // ever safe because RS encode is deterministic; do not rely on that.
         // Stripe 0 creates (and truncates); a LATER stripe must find the file
@@ -8147,10 +8135,11 @@ impl ExtentNode {
     /// EC-PREPARE-DURABLE: fsync the parent directory of an EC staging file so
     /// its directory entry is durable. POSIX does not persist a new file's
     /// NAME on a host crash from a content `sync_data` alone — only an fsync of
-    /// the PARENT directory does. The 2PC commit doc promises `.ec.dat`
-    /// "persists as a durable prepare record" across a crash-before-rename;
-    /// without this a power loss could drop the dirent → commit retry finds the
-    /// staging missing → the participant is stuck. Mirrors the `.meta`
+    /// the PARENT directory does. Without it a power loss could drop the
+    /// dirent while the bytes survive, and a later stripe would find its
+    /// staging file gone — which `write_shard_stripe_local` REFUSES rather
+    /// than recreating at an offset, so the attempt is stuck until the manager
+    /// reissues it. Mirrors the `.meta`
     /// tmp→rename→parent-dir-fsync pattern in `write_meta_locked` (P0-B). Every
     /// prepare path that returns Ok calls this so the guarantee is uniform.
     async fn fsync_staging_dir(
@@ -8168,23 +8157,6 @@ impl ExtentNode {
         Ok(())
     }
 
-    /// 2PC Phase 2 (commit): atomically rename the staging file
-    /// (`extent-{id}.ec.dat`) over the original data file (`.dat`),
-    /// reopen the file handle, bump eversion, and persist metadata.
-    ///
-    /// After this call, the node serves shard data on reads. POSIX
-    /// guarantees the rename is atomic — either the old or new file
-    /// is visible, never a partial state. If the process crashes
-    /// before rename, `.ec.dat` persists as a durable prepare record
-    /// and the original `.dat` is intact; the manager's retry will
-    /// re-send CommitEcShard to complete the conversion.
-    /// #5: complete an EC commit on `entry` — rename `.ec.dat`→`.dat` if the
-    /// staging file is still present (else `.dat` is already the shard from a
-    /// pre-crash rename), reopen, set the post-EC atomics, and persist `.meta`.
-    /// Shared by `commit_shard_local` (normal path) and the `load_extents`
-    /// marker replay (crash recovery), so both produce the identical state.
-    /// #5: write the EC commit-intent marker durably (tmp→sync→rename→dir-fsync).
-    /// Payload = `[new_eversion: u64 LE][sealed_length: u64 LE]`.
     /// Record that a FULL prepare for `new_eversion` completed (coordinator
     /// stages itself LAST, so this also asserts every participant is staged).
     /// Payload = `[new_eversion: u64 LE][attempt_nonce: u64 LE]` — the nonce is
@@ -9549,9 +9521,10 @@ impl ExtentNode {
         // check only covered the recovery↔delete pair; convert
         // and re_avali could race with delete (data-loss paths
         // documented in feature_list):
-        //   - convert↔delete: delete unlinks `.dat`+`.meta` mid-encode;
-        //     convert's later `rename(.ec.dat, .dat)` resurrects an
-        //     orphan with no manager record + stale `.meta`.
+        //   - convert↔delete: delete unlinks `.dat`+`.meta` mid-encode,
+        //     and the convert then stages a `.shard{i}` for an extent the
+        //     cluster has already dropped — startup discovery rebuilds an
+        //     entry from it, so it comes back as an orphan nothing records.
         //   - re_avali↔delete: delete unlinks `.dat`; re_avali's
         //     `file_pwrite_chunked` writes to the unlinked inode
         //     (POSIX preserves open fds); bytes evaporate on fd drop.
@@ -10254,7 +10227,7 @@ impl ExtentNode {
         // in-memory and is lost on leader failover; without this lock,
         // a deposed leader's mid-conversion + new leader's redispatch
         // could both pass the idempotency guard (because eversion has not yet
-        // bumped) and race on `.ec.dat` writes. The lock entry is created
+        // bumped) and race on `.shard{i}` writes. The lock entry is created
         // lazily and lives for the lifetime of the node — bounded by the
         // number of extents ever EC-converted on this shard, which is
         // the same bound as the existing `extents` DashMap (~negligible).
@@ -10284,9 +10257,9 @@ impl ExtentNode {
         let mut sealed_length = entry.sealed_length.load(Ordering::SeqCst);
 
         // Idempotency guard: if the coordinator's eversion is already
-        // at the post-EC value, a prior 2PC completed successfully
-        // (commit_shard_local is the last step, so eversion bump means
-        // all phases finished). Return OK so the manager's
+        // at the post-EC value, a prior attempt was already committed — the
+        // eversion only reaches this node from the manager's layout flip,
+        // which is the single commit point. Return OK so the manager's
         // apply_ec_conversion_done converges. This re-check now
         // runs UNDER the per-extent lock, so a serialized second
         // dispatch reliably observes the post-bump state.
@@ -10735,9 +10708,12 @@ impl ExtentNode {
         // un-releasable. Abandoning an attempt now costs a delete of files no
         // reader is pointed at.
         //
-        // The receiving side (`handle_commit_ec_shard` / `commit_shard_local` /
-        // the `ec.commit` marker replay) is RETAINED as repair code for nodes
-        // upgraded mid-rename; it is simply never driven from here.
+        // Nothing on the receiving side implements the old scheme any more:
+        // the per-node commit handler, the rename helper and the commit-intent
+        // marker replay are all gone, and `MSG_COMMIT_EC_SHARD` is a reserved
+        // tombstone. They were briefly kept as repair code for a node upgraded
+        // mid-rename; on a development cluster with no historical data there
+        // was nothing to repair.
         tracing::info!(
             extent_id,
             new_eversion,
