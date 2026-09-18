@@ -243,6 +243,68 @@ struct InfoExtentView {
     /// or a both-zero reclaimable extent (the EXTENT10-AUTORECLAIM sweep reaps
     /// it). `refs` should equal this; a gap is a refcount leak (MERGE-REFS-LEAK).
     in_streams: usize,
+    /// The partitions holding a reference, ascending. More than one means a CoW
+    /// split left them sharing this extent: the file is unlinked at `refs == 0`,
+    /// so every sharer must drop its own reference before any space returns.
+    ///
+    /// For a LOG extent each sharer also counts this extent's dead bytes in its
+    /// own `gc_debt`, so summing debt across partitions over-states physical
+    /// bytes — by design, since the rewrite really is owed by each. The two
+    /// sides' counts start equal and DIVERGE after either one major-compacts,
+    /// which drops range-excluded VPs into that side's discards alone.
+    ///
+    /// May hold FEWER entries than `refs` when a stream referencing the extent
+    /// belongs to no live region (an orphaned stream, or the refcount gap
+    /// `in_streams` flags as a leak); the view still prints `refs` beside it.
+    shared_by_parts: Vec<u64>,
+}
+
+/// extent id -> the PARTITIONS holding a reference, ascending.
+///
+/// `refs=2` says a second holder exists; it does not say WHO, and "who" is the
+/// actionable half. A CoW split leaves parent and child referencing every
+/// extent they were cut from, the file is unlinked only at `refs == 0`, and so
+/// BOTH sides must collect their own reference before a byte comes back.
+///
+/// The same structure explains a number operators do misread: each sharer
+/// counts this extent's dead bytes in its own `gc_debt`, so summing debt across
+/// partitions over-states physical bytes. That per-partition over-count is
+/// CORRECT — each really does owe that rewrite — and de-duplicating it would be
+/// the worse bug, since one advisory for the group leaves the other reference
+/// dangling and the extent never reaches zero. The fix belongs here, in what
+/// the view says, not in the accounting.
+fn extent_sharers(
+    regions: &HashMap<u64, MgrRegionInfo>,
+    stream_map: &HashMap<u64, MgrStreamInfo>,
+) -> HashMap<u64, Vec<u64>> {
+    // Walk the partitions in id order so each holder list comes out ascending
+    // BY CONSTRUCTION. `regions` is a HashMap, so iterating it directly would
+    // order the holders by whatever the hasher gives and shuffle them between
+    // two runs of `info` against an unchanged cluster. Sorting each list
+    // afterwards would fix the output too, but this way the ordering cannot be
+    // dropped by accident — there is no second step to forget.
+    let mut part_ids: Vec<&u64> = regions.keys().collect();
+    part_ids.sort_unstable();
+
+    let mut sharers: HashMap<u64, Vec<u64>> = HashMap::new();
+    for pid in part_ids {
+        let Some(r) = regions.get(pid) else { continue };
+        for sid in [r.log_stream, r.row_stream, r.meta_stream] {
+            let Some(s) = stream_map.get(&sid) else { continue };
+            for eid in &s.extent_ids {
+                let holders = sharers.entry(*eid).or_default();
+                // One partition, one entry. A partition that reaches the same
+                // extent through two of its OWN streams is still a single
+                // holder to act on, and listing it twice would read as a
+                // second partition that does not exist — implying a reference
+                // that someone has to collect before the file is freed.
+                if holders.last() != Some(pid) {
+                    holders.push(*pid);
+                }
+            }
+        }
+    }
+    sharers
 }
 
 #[derive(Serialize)]
@@ -3007,8 +3069,19 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
 /// Scoped per-partition view (`info --part P`, no `--detail`): one
 /// `MSG_GET_REGIONS` (cheap) to resolve the partition's 3 streams + ps + range,
 /// then a SCOPED `MSG_STREAM_INFO` (only those streams) so the extent list is
-/// bounded by THIS partition — never a full-cluster extent pull. Emits the
-/// partition's `extents` array (the dashboard's lazy drawer source).
+/// bounded by THIS partition. Emits the partition's `extents` array (the
+/// dashboard's lazy drawer source).
+///
+/// ONE exception to the scoping, and it is not a cheap one: if any of this
+/// partition's extents reports `refs > 1`, naming the other holders needs
+/// every other partition's stream membership, so a second `MSG_STREAM_INFO`
+/// asks for all `3N` streams — and that response carries a clone of every
+/// membered extent in the cluster, i.e. the full-cluster pull this view
+/// otherwise avoids. It is one such pull per drawer open, not per refresh, and
+/// `refs > 1` is NOT rare on a split-grown cluster: a split shares every
+/// pre-cut extent with its sibling and the references clear only once both
+/// sides have collected. Making it cheap needs a manager-side reverse lookup
+/// (a wire change); until then this is the trade, stated rather than hoped.
 async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) -> Result<()> {
     let regions_bytes = client.mgr_call(MSG_GET_REGIONS, Bytes::new()).await.context("get regions")?;
     let regions_resp: GetRegionsResp = rkyv_decode(&regions_bytes).map_err(decode_err)?;
@@ -3052,6 +3125,37 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
                 Err(_) => Default::default(),
             },
             Err(_) => Default::default(),
+        };
+
+    // Who ELSE holds these extents. Skipped entirely while every extent here is
+    // privately held, which costs nothing to check — but see this function's
+    // doc comment before assuming that is the common case: on a split-grown
+    // cluster it is not, and the call this guard admits returns every membered
+    // extent in the cluster, because the manager has no "who holds extent E"
+    // query and the answer needs every other partition's stream membership.
+    let sharers_by_extent: std::collections::HashMap<u64, Vec<u64>> =
+        if extent_map.values().any(|e| e.refs > 1) {
+            let others: Vec<u64> = regions
+                .values()
+                .flat_map(|o| [o.log_stream, o.row_stream, o.meta_stream])
+                .collect();
+            match client
+                .mgr_call(
+                    MSG_STREAM_INFO,
+                    rkyv_encode(&StreamInfoReq { stream_ids: others }),
+                )
+                .await
+                .ok()
+                .and_then(|b| rkyv_decode::<StreamInfoResp>(&b).ok())
+                .filter(|resp| resp.code == CODE_OK)
+            {
+                Some(all) => extent_sharers(&regions, &all.streams.into_iter().collect()),
+                // Best-effort: the view still renders `refs`, just without the
+                // names. A missing list must not fail the whole panel.
+                None => Default::default(),
+            }
+        } else {
+            Default::default()
         };
 
     let ps_addr = part_addrs
@@ -3106,6 +3210,7 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
                         "replicas": replicas,
                         "refs": e.refs,
                         "eversion": e.eversion,
+                        "shared_by_parts": sharers_by_extent.get(eid).cloned().unwrap_or_default(),
                     }));
                 } else {
                     extents_json.push(serde_json::json!({
@@ -3461,6 +3566,8 @@ async fn run_info(
         }
     }
 
+    let sharers_by_extent = extent_sharers(&regions, &stream_map);
+
     if json_out {
         let nodes_view: Vec<InfoNodeView> = nodes_sorted
             .iter()
@@ -3495,6 +3602,7 @@ async fn run_info(
                     vp_table_refs: e.vp_table_refs,
                     eversion: e.eversion,
                     in_streams: stream_member_count.get(eid).copied().unwrap_or(0),
+                    shared_by_parts: sharers_by_extent.get(eid).cloned().unwrap_or_default(),
                 })
                 .collect();
             v.sort_by_key(|e| e.extent_id);
@@ -3659,8 +3767,28 @@ async fn run_info(
                     all.extend(e.parity.iter().copied());
                     format!("replicas={:?}", all)
                 };
+                // Name the OTHER holders, not just how many there are: an
+                // extent a CoW split left shared is unlinked only at
+                // `refs == 0`, so one holder releasing it returns nothing
+                // until every holder does, and "who else" is the actionable
+                // half.
+                //
+                // "drops its reference" rather than "GCs it" on purpose — GC
+                // is the mechanism for a LOG extent, while a shared row or
+                // meta extent is released by compaction's head truncate. This
+                // line does not know the role, so it names the outcome both
+                // roles share.
+                let sharers = sharers_by_extent.get(*eid).map(Vec::as_slice).unwrap_or(&[]);
+                let shared = if sharers.len() > 1 {
+                    format!(
+                        ", shared by parts {:?} — freed only once ALL of them drop it",
+                        sharers
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  extent {}: size={}{}, {}, refs={} (streams={}), vp_table_refs={}, eversion={}",
+                    "  extent {}: size={}{}, {}, refs={} (streams={}), vp_table_refs={}, eversion={}{}",
                     eid,
                     human_size(e.sealed_length),
                     tag,
@@ -3668,7 +3796,8 @@ async fn run_info(
                     e.refs,
                     in_streams,
                     e.vp_table_refs,
-                    e.eversion
+                    e.eversion,
+                    shared
                 );
             }
 
@@ -3791,3 +3920,115 @@ fn main() {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn region(part_id: u64, log: u64, row: u64, meta: u64) -> MgrRegionInfo {
+        MgrRegionInfo {
+            rg: None,
+            part_id,
+            ps_id: 1,
+            log_stream: log,
+            row_stream: row,
+            meta_stream: meta,
+            region_epoch: 1,
+        }
+    }
+
+    fn stream(stream_id: u64, extent_ids: Vec<u64>) -> MgrStreamInfo {
+        MgrStreamInfo {
+            stream_id,
+            extent_ids,
+            ..Default::default()
+        }
+    }
+
+    /// The shape a CoW split leaves behind, taken from a live 3-node cluster:
+    /// `split 13` produced child 19, and both partitions' log streams (7 and 16)
+    /// list extents 14 and 15. `refs=2` alone cannot tell an operator that 13
+    /// and 19 are the two holders, which is what they need to know to reason
+    /// about why the space has not come back.
+    #[test]
+    fn a_split_pair_names_both_holders() {
+        let regions: HashMap<u64, MgrRegionInfo> =
+            [(13, region(13, 7, 9, 11)), (19, region(19, 16, 17, 18))]
+                .into_iter()
+                .collect();
+        let streams: HashMap<u64, MgrStreamInfo> = [
+            (7, stream(7, vec![14, 15])),
+            (9, stream(9, vec![10])),
+            (11, stream(11, vec![12])),
+            (16, stream(16, vec![14, 15])),
+            (17, stream(17, vec![10])),
+            (18, stream(18, vec![12])),
+        ]
+        .into_iter()
+        .collect();
+
+        let sharers = extent_sharers(&regions, &streams);
+        // ascending and stable: `regions` is a HashMap, so an unsorted result
+        // would shuffle between two runs of `info` against the same cluster.
+        for eid in [14, 15, 10, 12] {
+            assert_eq!(sharers.get(&eid), Some(&vec![13, 19]), "extent {eid}");
+        }
+    }
+
+    /// A partition that reaches one extent through two of its OWN streams is
+    /// still a single holder. Listing it twice would read as a second partition
+    /// that does not exist — and would imply a second reference that has to be
+    /// collected before the file is freed.
+    #[test]
+    fn one_partition_reaching_an_extent_twice_is_one_holder() {
+        let regions: HashMap<u64, MgrRegionInfo> =
+            [(13, region(13, 7, 9, 11))].into_iter().collect();
+        let streams: HashMap<u64, MgrStreamInfo> = [
+            (7, stream(7, vec![5])),
+            (9, stream(9, vec![5])),
+            (11, stream(11, vec![5])),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(extent_sharers(&regions, &streams).get(&5), Some(&vec![13]));
+    }
+
+    /// Repeated splits leave one extent held by many partitions, and the list
+    /// must read the same on every run. Eight holders is the point of this
+    /// test: with two, a hash order that happens to come out ascending hides a
+    /// missing sort half the time, so the ablation has to be able to fail.
+    #[test]
+    fn many_holders_are_listed_in_partition_id_order() {
+        let ids: Vec<u64> = vec![41, 7, 13, 96, 2, 58, 19, 33];
+        let regions: HashMap<u64, MgrRegionInfo> = ids
+            .iter()
+            .map(|&pid| (pid, region(pid, pid * 10, pid * 10 + 1, pid * 10 + 2)))
+            .collect();
+        // every one of them holds extent 14, the way a chain of CoW splits
+        // leaves the extent they were all cut from.
+        let streams: HashMap<u64, MgrStreamInfo> = ids
+            .iter()
+            .map(|&pid| (pid * 10, stream(pid * 10, vec![14])))
+            .collect();
+
+        let mut expected = ids.clone();
+        expected.sort_unstable();
+        assert_eq!(extent_sharers(&regions, &streams).get(&14), Some(&expected));
+    }
+
+    /// The common case: one holder, and nothing about sharing to report.
+    #[test]
+    fn a_private_extent_has_exactly_one_holder() {
+        let regions: HashMap<u64, MgrRegionInfo> =
+            [(13, region(13, 7, 9, 11))].into_iter().collect();
+        let streams: HashMap<u64, MgrStreamInfo> =
+            [(7, stream(7, vec![8]))].into_iter().collect();
+
+        let sharers = extent_sharers(&regions, &streams);
+        assert_eq!(sharers.get(&8), Some(&vec![13]));
+        // a stream the caller did not fetch is skipped, not a panic: the scoped
+        // view asks only for the streams it needs.
+        assert_eq!(sharers.get(&99), None);
+    }
+}

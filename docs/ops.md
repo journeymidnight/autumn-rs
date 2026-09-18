@@ -749,6 +749,93 @@ Do NOT read `footprint − data` as debt — `size_bytes` is SST-only and exclud
 live VP value bytes, so it would flag a healthy VP partition as ~all-debt. A high
 `wal_debt_ratio` is the signal to run `compact` + `gc`/`forcegc` to reclaim.
 
+### Shared extents: why the space has not come back
+
+A CoW split leaves parent and child referencing the same extents. The extent
+view names the holders rather than only counting them:
+
+```
+autumn-op info --full
+  extent 14: size=4.0 GB, ..., refs=2 (streams=2), ..., shared by parts [13, 19]
+             — freed only once ALL of them GC it; whatever is dead here is
+               owed by each separately
+```
+
+Two things follow, and both are routine sources of "GC ran and nothing was
+freed":
+
+- The file is unlinked at `refs == 0`. One holder dropping its reference takes
+  `refs` from 2 to 1 and returns **no space**; the other holder has to drop it
+  too. For a log extent that means GC on both sides, and GC halves the ratio
+  gate for `refs > 1` precisely because that first, apparently useless rewrite
+  is what makes the extent independently owned. A shared row or meta extent is
+  released by compaction's head truncate instead, not by GC.
+- On a LOG extent, each holder counts its dead bytes in **its own** `gc_debt`,
+  so adding per-partition debt across a split pair does not give physical
+  bytes. That over-count is correct per partition — each really does owe the
+  rewrite — and de-duplicating it would strand the extent forever. `df` is
+  unaffected: it walks extents, not partitions, so its `WAL debt` counts each
+  extent once.
+
+If `refs` is larger than the number of partitions listed, a stream referencing
+the extent belongs to no live region — an orphaned stream, or the refcount gap
+the unscoped view tags `(refs-leak)`. Read `refs=N (streams=M)` there first.
+
+The same list is on the dashboard's partition drawer, per extent chip.
+
+### Verifying the GC advisory and GC selection agree
+
+The advisory fires on absolute dead bytes (`gc_debt_high`, default 1 GiB) and
+selection must judge by the same number. To re-check this on a live cluster you
+have to build an extent that **only the absolute arm can select** — otherwise
+the run passes without the plumbing under test being involved at all.
+
+Mind the halving. A knob-less (standing) dispatch fills `gc_stream_debt` from
+`gc_debt_high` as well as the floor, so once the stream's dead bytes cross
+1 GiB the per-extent ratio gate is **halved to 0.2**, not 0.4. An extent at,
+say, ratio 0.30 is then taken by the RATIO arm and proves nothing. The target
+is `dead ≥ 1 GiB` (clears the floor) with `dead/sealed_length < 0.2` (under the
+halved gate) — which needs an extent above ~5.4 GiB, and is the shape of the
+original incident (3.12 GiB dead in 16.00 GiB = 0.195):
+
+```bash
+# Default everything, including the 16 GiB extent seal size.
+AUTUMN_DATA_ROOT=/data05/autumn-gcverify bash cluster.sh reset 3
+AO=(autumn-op --manager 127.0.0.1:9001 --admin-token-file <DATA_ROOT>/authz/admin.token)
+AC=(autumn-client --manager 127.0.0.1:9001 --namespace bench)
+
+# 14 x 1.2 GiB seals the first log extent at 16.0 GB.
+for i in $(seq 1 14); do "${AC[@]}" put-stream key$i 1.2GiB-file; done
+"${AC[@]}" put-stream key1 other-file   # overwrite 2 of them => 2.4 GiB dead
+"${AC[@]}" put-stream key2 other-file
+"${AC[@]}" put-stream key20 any-file    # push the WAL past a flush boundary
+"${AO[@]}" compact <PART> --wait        # superseded VPs become discards
+
+"${AO[@]}" info --part <PART> --full    # discards: extent N = 2576980376
+autumn-op df                            # WAL debt: 2.4 GB dead
+# 2576980376 / 17179869184 = 0.15 — under the halved gate, over the 1 GiB floor.
+```
+
+Then run the two judgements, which differ ONLY in whether a floor is carried:
+
+- **Control** — `autumn-op gc <PART> --ratio 0.4 --stream-debt 1073741824`.
+  Any named knob makes it an override, so it carries **no floor**, while
+  `--stream-debt` reproduces the halving a standing dispatch would apply. It
+  must answer `no eligible extents to reclaim`: at ratio 0.15 neither the 0.4
+  gate nor the halved 0.2 gate can take this extent. Without this control the
+  next step proves nothing. `df` must still read `2.4 GB` afterwards — an
+  operator's one-off override must never redefine the standing gauge.
+- **Standing** — `autumn-op gc <PART>` (no knobs). The manager fills the floor
+  from `policy.gc_debt_high` and marks it standing, so the ABSOLUTE arm — the
+  only one left — takes it: `GC: punched extent N, moved <M> entries` in the PS
+  log, the extent leaves `info --full`, and `df` drops to `0 B`. Reclaiming a
+  16 GiB extent relocates ~14.6 GiB of live values; budget ~7 min.
+
+Unattended, the same thing happens through `auto-policy activate gc-only
+--arm`: the advisory needs the debt sustained over 5 buckets (~5 min at the
+default 60 s bucket), logs `GC primary=<PART> ... reason='gc_debt_bytes>...
+sustained 5m'`, and the armed controller dispatches it on a following tick.
+
 ### Per-partition size in `autumn-op info`
 
 The cluster overview's per-partition size = the manager's authoritative

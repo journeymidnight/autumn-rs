@@ -100,6 +100,30 @@ Global `--admin-token` / `--admin-token-file`: attached as a signed payload pref
 | Auto-policy controller | `auto-policy status`, `auto-policy activate <NAME> [--arm]` (`--arm` = Armed, else DryRun), `auto-policy deactivate`, `auto-policy upsert <NAME> --switches split,gc,… [--interval N --cooldown N --max N --desc "…"]` (create/replace a custom policy), `auto-policy delete <NAME>`. Leader-routed |
 | Async op-ledger | `ops status <OP_ID>` (one op, `unknown` if this leader doesn't know it), `ops list [--active] [--kind split\|merge\|rebalance\|compact\|gc\|forcegc\|ec\|recovery] [--limit N]`. The seven op triggers above submit here + print an `op_id`; global `--wait` blocks to terminal. **`recovery` is auto-dispatched** (never submitted — submit refuses it): it appears on its own and, while still `running`, carries the last failure as `ERROR[code]: reason` — including the executing node's own reason, which arrives on the `df` heartbeat rather than waiting for the next re-dispatch. Leader-routed |
 
+**Extent sharing (`info`).** Both extent views name the partitions holding a
+reference (`shared by parts [13, 19]`, JSON `shared_by_parts`), not just how
+many there are — `extent_sharers()` maps extent → holders by walking the
+regions in partition-id order, so each list is ascending BY CONSTRUCTION (no
+second sort step to forget) and does not shuffle between runs. A CoW split is
+what creates sharing, and the file is unlinked only at `refs == 0`, so the
+identities are the actionable half: one holder releasing returns no space until
+the others do. For a LOG extent it also explains a number operators misread —
+each holder counts the extent's dead bytes in its OWN `gc_debt`, so summed
+per-partition debt over-states physical bytes. That over-count is deliberate
+(de-duplicating it strands the extent below `refs == 0` forever); the fix is
+what the view SAYS. `df` is unaffected — it walks extents, not partitions.
+
+COST, because the guard is easy to misread as free: the unscoped view gets the
+mapping from data it already fetched. `run_partition_info` does not have other
+partitions' stream membership, so it spends a second `MSG_STREAM_INFO` naming
+all `3N` streams — whose response clones every membered extent in the cluster,
+the full-cluster pull that view otherwise avoids. It is guarded on some extent
+in THIS partition reporting `refs > 1`, and it is one pull per drawer open
+rather than per refresh, but `refs > 1` is common on a split-grown cluster, so
+budget for it rather than assuming the guard rarely fires. Cheap would require
+a manager-side reverse lookup, i.e. a wire change. A failed lookup degrades to
+`refs` alone rather than failing the panel.
+
 `format` is IDENTITY-ONLY: no location flags — it stamps the sentinels and registers an EMPTY location; the EN self-registers its real location. `register-node` is a migration stub that hints and exits 1 before connecting.
 
 **CLI conventions (canonical + accepted aliases).** Both binaries hand-parse args (no clap; `autumn_op/args.rs`, `autumn_client/args.rs`). Canonical subcommands are kebab-case; the old snake_case / no-separator spellings stay as accepted aliases (`policy-candidates`←`policy_candidates`/`policy`, `auto-policy`←`auto_policy`, `put-stream`←`putstream`, `get-stream`←`getstream`). Canonical flag names per concept, with the older spelling kept as an alias: `--namespace` (←`--scope`, client KV scope), `--tenant` (←`--with-tenant`, `namespace-create`), `--principal` (←`--tenant`, `mint-token`). Byte-size flags accept an optional binary suffix (`4k`/`8m`/`1gib`) across both binaries (`gc --max-size`/`--stream-debt`, `perf-check`/`ycsb --size`). Three `autumn-client` subcommands are INTERNAL zero-copy verification paths, deliberately omitted from `usage()`: `put-bulk`, `direct-get`, `bulk-get` (they mirror `put`/`get` through the ZC codepaths). NOT YET unified (follow-ups): the verb-noun vs noun-verb split (`list-nodes`/`fence-node` vs `namespace-create`), the per-command `--admin-token` duplicating the global one, and `split`'s three targeting flags (`--at`/`--at-hex`/`--at-raw-hex`).

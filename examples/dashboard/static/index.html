@@ -874,12 +874,22 @@ function renderRows(){
 
 // ── detail drawer (lazy) ─────────────────────────────────────────────────────
 function nodeAddr(id){ const n=NODES.find(x=>x.node_id===id); return n?esc(n.address):""; }
-function extChip(e){
+function extChip(e,pid){
   const cls=["ext",e.ec?"ec":""].join(" ");
   const tag=e.ec?`<span class="tag ec">EC ${esc(e.ec_shape||"")}</span>`:`<span class="tag role-${e.role}">${e.role}</span>`;
   const miss=e.missing?`<span class="tag missing">missing</span>`:"";
   const btn=(DANGER&&!e.ec&&!e.open)?`<button class="btn xs" onclick='event.stopPropagation();act({action:"force_ec_convert",extent_id:${e.extent_id}},"EC convert extent ${e.extent_id}")'>→EC</button>`:"";
   const reps=(e.replicas||[]).map(id=>`${id}${nodeAddr(id)?" ("+nodeAddr(id)+")":""}`).join(", ")||"-";
+  // A CoW split leaves both sides referencing the same extent, and the file is
+  // unlinked only at refs 0 — so name the other holders rather than only
+  // counting them: releasing here returns nothing until they release too.
+  // The debt clause is LOG-ONLY, because gc_debt is log-stream VP accounting;
+  // a shared row/meta extent has no "dead bytes" in that sense and is released
+  // by compaction's head truncate rather than by GC.
+  const sharers=(e.shared_by_parts||[]).filter(id=>id!==pid);
+  const shared=(e.shared_by_parts||[]).length>1
+    ? `<div style="color:var(--warn,#c90);font-size:11px">shared with part${sharers.length===1?"":"s"} ${sharers.join(", ")} — freed only once every holder drops it${e.role==="log"?"; each counts whatever is dead here as its own debt":""}</div>`
+    : "";
   return `<details class="${cls}">
     <summary><span class="eid">#${e.extent_id}</span>${tag}<span style="color:var(--dim)">${fmtBytes(e.size)}</span>
       <span class="egrow"></span><span style="color:var(--dim)">refs ${e.refs}</span>${miss}${btn}</summary>
@@ -888,6 +898,7 @@ function extChip(e){
       <span class="m">EC <b>${e.ec?esc(e.ec_shape||"yes"):"replicated"}</b></span><span class="m">role <b>${e.role}</b></span>
     </div>
     <div style="color:var(--dim);font-size:11px">replicas: ${reps}</div>
+    ${shared}
   </details>`;
 }
 async function openDetail(pid){
@@ -933,7 +944,7 @@ async function openDetail(pid){
       ${inflight?`<span class="m full">${inflight}</span>`:""}
     </div>
     <div class="subh">Extents · ${(d.extents||[]).length}</div>
-    <div class="extlist">${(d.extents||[]).map(extChip).join("")||'<span class="empty">none</span>'}</div>
+    <div class="extlist">${(d.extents||[]).map(e=>extChip(e,pid)).join("")||'<span class="empty">none</span>'}</div>
     ${(d.errors&&d.errors.length)?`<div class="errbar" style="margin-top:8px">⚠ ${esc(d.errors.join("\n"))}</div>`:""}`;
 }
 

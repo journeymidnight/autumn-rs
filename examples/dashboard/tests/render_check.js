@@ -32,6 +32,7 @@ const ctx = { $: sel => ({ set innerHTML(v) { OUT[sel] = v; } }) };
 const src = [escLine, constLine("jsAttr"), constLine("BYTE_KINDS"),
              constLine("COUNT_UNIT"), lift("fmtBytes"), lift("fmtProgress"), lift("agoStr"), lift("psHealth"),
              lift("diskRow"), lift("advRow"), lift("opsTarget"), lift("opsAgo"),
+             lift("nodeAddr"), lift("extChip"),
              lift("renderLiveOps"), lift("renderOpsHistory")].join("\n");
 const now = Math.floor(Date.now() / 1000);
 let PURE = {};
@@ -46,6 +47,20 @@ OUT2.disks = [
 OUT2.adv = advRow({kind:"major", desc:"major  part 7             major compaction before split: partition still carries CoW-shared out-of-range keys (has_overlap), and split is REFUSED until a major compaction rewrites them",
                    action:{action:"compact", part_id:7}});
 OUT2.jsattr = jsAttr("it's");
+// A CoW split's shared extent, and a private one. The chip must NAME the other
+// holders: refs=2 alone cannot tell an operator that collecting here frees
+// nothing until part 19 collects too.
+const NODES = [], DANGER = false;
+OUT2.extShared = extChip({extent_id:14, role:"log", size:4297548796, open:false, ec:false,
+                          refs:2, eversion:3, replicas:[5,3,1], shared_by_parts:[13,19]}, 13);
+OUT2.extMany = extChip({extent_id:14, role:"log", size:1, open:false, ec:false,
+                        refs:3, eversion:3, replicas:[5], shared_by_parts:[13,19,42]}, 13);
+// A shared ROW extent: gc_debt is log-stream accounting, and a row extent is
+// released by compaction's head truncate, so the debt sentence must not appear.
+OUT2.extRow = extChip({extent_id:10, role:"row", size:1, open:false, ec:false,
+                       refs:2, eversion:2, replicas:[5], shared_by_parts:[13,19]}, 13);
+OUT2.extPrivate = extChip({extent_id:8, role:"log", size:1, open:false, ec:false,
+                           refs:1, eversion:1, replicas:[1], shared_by_parts:[13]}, 13);
 ` )(ctx.$, PURE);
 new Function("$", src + `
 renderLiveOps([
@@ -119,6 +134,27 @@ want(PURE.adv, "Apply", "an actionable advisory offers its action");
 // today (they are "part N" / "extent N" / "cluster"), which is exactly why the
 // helper is tested directly rather than through a contrived advisory.
 wantEq(PURE.jsattr, '"it\\u0027s"', "jsAttr escapes the apostrophe");
+
+// Shared-extent chip. This is asserted on the RENDERED string, not on the
+// helper that builds it: the first version of this feature computed the line
+// correctly and never interpolated it into the template, so every other test
+// here passed while the panel showed nothing.
+want(text(PURE.extShared), "shared with part 19",
+     "a shared extent names the OTHER holder");
+want(text(PURE.extShared), "freed only once every holder drops it",
+     "…and says why releasing here alone frees nothing");
+want(text(PURE.extShared), "each counts whatever is dead here as its own debt",
+     "a shared LOG extent explains the doubled debt");
+want(text(PURE.extRow), "freed only once every holder drops it",
+     "a shared row extent still names its holders");
+if (/own debt/.test(PURE.extRow)) {
+  console.error("FAIL: a row extent claims log-stream debt it cannot have"); bad++;
+}
+want(text(PURE.extMany), "shared with parts 19, 42",
+     "several holders are listed, pluralised");
+if (/shared with/.test(PURE.extPrivate)) {
+  console.error("FAIL: a private extent claims to be shared"); bad++;
+}
 console.log("live:", live);
 console.log("hist:", hist);
 console.log(bad ? `render check FAILED (${bad})` : "render check OK");

@@ -247,9 +247,13 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     // ── put + get round-trip via autumn-client ──────────────────────
     {
         let mut cmd = Command::new(AUTUMN_CLIENT_BIN);
+        // Every KV command must declare its namespace; the client refuses
+        // without one, which is what made this test exit 2.
         cmd.args([
             "--manager",
             &mgr_addr,
+            "--namespace",
+            "fs",
             "put",
             "k1",
             val_path.to_str().unwrap(),
@@ -264,7 +268,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
 
     {
         let mut cmd = Command::new(AUTUMN_CLIENT_BIN);
-        cmd.args(["--manager", &mgr_addr, "get", "k1"]);
+        cmd.args(["--manager", &mgr_addr, "--namespace", "fs", "get", "k1"]);
         let stdout = run_or_panic("autumn-client get", cmd);
         assert_eq!(
             stdout,

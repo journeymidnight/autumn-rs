@@ -684,7 +684,7 @@
      extent 视图应显示 `refs` 与共享它的分区，让相加得到的数字不被误读成物理字节。
 - **Acceptance**: 一个 dead 3 GiB / size 16 GiB 的 extent 在默认配置下会被 GC 选中并回收；
   共享 extent 的两个分区报告的债务之和不超过实际死字节。
-- **Status**: `passes: false` (2026-09-09；2026-09-10 修了第一半；2026-09-11 修了 Scope 1) —
+- **Status**: `passes: true` (2026-09-18 真集群复验 + 呈现层落地；2026-09-09 立账；2026-09-10 修了第一半；2026-09-11 修了 Scope 1) —
   **验收前半已实现，后半按下面的订正不做，但仍未在真集群复验，所以不关。**
   **2026-09-11**：选取侧加了绝对字节的或条件 —— `dead >= dead_bytes_high` 无论比例都合格，
   `X` 由 manager 从 policy 自己的 `gc_debt_high` 送下来(wire 39→40 加
@@ -727,12 +727,11 @@
   消融两条,各自只红自己那条(16 passed / 1 failed ×2),恢复后 17 全绿。
   11 条单测(含线上真实的 3.12 GiB/16.00 GiB 与 0.43 GiB/15.25 GiB 两组)，
   **两条消融各自变红**:去掉绝对臂 ⇒ 验收用例 + 债务一致性用例红;去掉 refs 减半 ⇒ 两条共享用例红。
-  **仍未做/未验**:
-  ① 验收原文要求"默认配置下被选中并**回收**"——单测证明了判据会选中它，
-     但**没有在一个真集群上复验**回收确实发生、`gc_debt` 随之下降;
+  **~~仍未做/未验~~ 两条均已了结(2026-09-18)**:
+  ① 验收原文要求"默认配置下被选中并**回收**"——**已在真集群复验**,见下面 2026-09-18 一段;
   ② 验收后半"共享 extent 两个分区报告的债务之和不超过实际死字节"**不实现** ——
      见本条 2026-09-10 的订正:dedup 会让 refs 永远归不了零。按订正落到呈现层
-     (extent 视图显示 `refs` 与共享它的分区)，面板已有位置，未做。
+     (extent 视图显示 `refs` 与共享它的分区)，**2026-09-18 已实现**。
   **已修**：自动 GC 派发从来不带 `gc_stream_debt`(`manager/src/lib.rs` 的
   `actuate_maintenance` 写死 `None`)，于是"stream 级死字节超过高水位就把 per-extent 比例
   减半"这条**本就为这种场景设计的**机制，只在运维手工敲 `--stream-debt` 时才生效。现在按
@@ -745,6 +744,42 @@
   0.195 比例的那 3.12 GiB 不再计入债务，循环自然停止。
   4 条单测(含线上真实数字 3.12 GiB / 16 GiB 那一组)，消融验证:去掉比例判定 → 该条变红。
   **不修**：共享 extent 的"双重计数"经核实不是缺陷，见上文订正。
+
+  **2026-09-18 结项：真集群复验(验收前半)**。3 EN + 真 etcd,**全默认配置**
+  (含默认 16 GiB extent seal size,`gc_debt_high` 1 GiB,ratio 0.4)。造出
+  extent 8 = 16.0 GB sealed / **2,576,980,376 B dead** ⇒ **ratio 0.15**。
+  **关键是这个 0.15 而不是随手取的数**:standing 派发会把 `gc_stream_debt` 也按
+  `gc_debt_high` 填上,于是 stream 死字节过 1 GiB 时比例门槛**减半到 0.2** ——
+  我第一次的复验用的是 4 GiB extent / 1.2 GiB dead = 0.30,**0.30 > 0.2,
+  是比例臂选中的,绝对臂就算整条拆掉结果也一样**,那次复验什么都没证明。
+  评审(fable)抓到了这一点。0.15 同时低于 0.4 与减半后的 0.2,高于 1 GiB 地板 ⇒
+  **只有绝对臂能选中它**,这才是线上 0.195 的真实形状。
+  对照两跑只差"带不带 floor":
+  - `gc 13 --ratio 0.4 --stream-debt 1073741824`(减半生效、**无 floor**)
+    → `no eligible extents to reclaim`;事后 `df` 仍读 2.4 GB(一次手工 override
+    不得改写常驻 gauge — 本条 2026-09-11 那半"沉默的 bug"也就此第一次拿到真集群证据)。
+  - `gc 13`(不带任何 knob ⇒ manager 用 policy 的 `gc_debt_high` 补 floor 并标 standing)
+    → `GC: punched extent 8, moved 3491 entries`,搬 ~14.6 GiB 存活值,耗时 7m22s,
+    extent 从 `info --full` 消失,`df` 2.4 GB → **0 B**。
+  另外**无人值守**那条环路也复验过(4 GiB extent 那轮):`auto-policy activate gc-only --arm`
+  → 08:36:22 manager 自己发建议 `gc_debt_bytes>1073741824 (1228 MiB) sustained 5m`
+  → 08:38:30 punch → 08:38:36 gauge 归零。即本条描述的"建议每 5 分钟重发、GC 每次拒绝"
+  的死循环,现在会自己收敛。
+  **呈现层(验收后半的订正版)已实现**:`autumn-op info --full` 与
+  `info --part`(dashboard 抽屉的数据源)的 extent 视图现在**点名持有者**
+  `shared by parts [13, 19] — freed only once ALL of them drop it`,JSON 加
+  `shared_by_parts`;dashboard extent chip 同样,并且只在 `role == "log"` 时才附
+  "各自记一份债"那句(gc_debt 是 log stream 的账,row/meta 共享 extent 靠 compaction
+  的 head truncate 释放,不是 GC)。真 CoW split 上渲染验证过。
+  **代价写进文档而不是含糊过去**:`run_partition_info` 没有别的分区的 stream 成员关系,
+  所以在本分区有 `refs > 1` 时多发一次 `MSG_STREAM_INFO`(全部 3N 条 stream),
+  而 manager 对这个请求会把**集群里每个有归属的 extent** 克隆回来 —— 正是该视图平时
+  避开的那种全量拉取。评审指出"常见情况不花钱"是错的:split 长出来的集群里
+  `refs > 1` 很常见。要做便宜只能在 manager 侧加反查(动 wire),暂不做,**把代价写明**。
+  **不做**:跨 crate 的"标准派发→PS 选中"端到端单测。manager 侧
+  (`maintenance_req_for_submitted_op` standing 填 `gc_dead_bytes_high`/`gc_stream_debt`)
+  与 PS 侧判据(含"减半门槛也够不着、但够得着 1 GiB 地板"那组断言)各自都已有单测钉住,
+  中间只剩一次字段拷贝;真正没被单测覆盖的是整条线,而那正是上面这次真集群跑验的东西。
 
   **订正**(2026-09-09)：本条最初记作 `BUG-SPLIT-STUCK-RETRY`，把机制写成"父子共用同一对
   stream"。**那是错的**——我当时的脚本把字段列表截断在前 8 个，误把 `discards` 里的
@@ -790,6 +825,10 @@
   ②根因没动 —— `est_live` 仍然把未回收的垃圾全额计入，于是**merge 的否决**和
   速率触发器的地板仍然按幻影体积判断(一个删空的分区会因为"看起来很大"而不被 merge);
   ③因此本条说的"先修 `BUG-GC-ADVISORY-VS-SELECTION`"仍然成立。
+  **前置已解除**(2026-09-18)：`BUG-GC-ADVISORY-VS-SELECTION` 已结项(真集群复验:
+  16 GiB extent / 2.4 GiB dead / ratio 0.15 被绝对臂选中并回收,`gc_debt` 归零)。
+  于是本条 Scope 1 说的"复验 `est_live` 会不会跟着掉下来"**现在可以做了** ——
+  仍未做,它需要的是一个刚删空的集群 + armed auto-policy 跑满一个周期。
 
 ### F-EC-STARVES-FOREGROUND-APPEND — 一个 EC 转换就能把前台写入饿到超时
 - **Trigger** (2026-09-11，追一次分区卡死时量到): 单个 16 GiB extent 的 EC 转换
