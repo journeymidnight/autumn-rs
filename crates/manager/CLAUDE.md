@@ -366,13 +366,64 @@ self-healing without a TTL: the EN loses its in-memory `recovery_inflight`, the
 next re-send simply starts it again, and every EN answer is idempotent by
 contract (already-running → `CODE_OK`; complete local copy → re-report done;
 incomplete residue → discard + rebuild — see `crates/stream/CLAUDE.md`).
-**Release is EVENT-driven, at exactly two points:** `apply_recovery_done` (the
-work finished) and `release_recovery_markers_for_dead_executors` (level-triggered
+**Release is EVENT-driven, at exactly three points:** `apply_recovery_done` (the
+work finished), `release_recovery_markers_for_dead_executors` (level-triggered
 each tick — the pinned node is gone from `s.nodes` or no longer Online → drop the
-marker so re-derivation picks a live target). **There is deliberately NO
+marker so re-derivation picks a live target), and
+`release_recovery_markers_for_healthy_slots` (level-triggered each tick — the
+SOURCE slot no longer needs rebuilding at all). **There is deliberately NO
 wall-clock TTL**: a timeout is indistinguishable from a slow-but-progressing
 rebuild, and releasing on one races the executor still writing the copy. Never
 re-introduce a TTL, and never drain a Recovery marker on a dispatch error.
+
+The third exists because **fence CREATES markers and unfence is on no release
+path**. The two executor-shaped releases both ask about the node doing the work,
+so an operator who fenced a node and changed their mind left one zombie marker
+per slot: the work is pointless (the slot is healthy, so it can never complete)
+yet the executor is alive (so nothing retired it), and each one held a
+`RecoveryRateLimiter` slot for the life of the leader. Measured on a
+fence→unfence drain: `global 4/64`, `per_source: node 5 → 4`, and a fresh
+rebuild on another extent running normally beside them — the mechanism was
+fine, only these four had outlived their reason.
+
+Its predicate is "does this slot still need rebuilding", NOT "is the node
+un-fenced" — a disk fault, a dark `avali` bit and a corrupt-slot mark are all
+legitimate marker sources that do not care about overrides. So it asks the
+DISPATCHER's own question, through `slot_verdict` rather than a re-derivation,
+and releases only on `Withhold`: the node is registered and Online, its `avali`
+bit is set, its disk is online, and the gate would not rebuild this slot now.
+It is deliberately STRICTER than the dispatcher in one place — it counts ANY
+override as a reason to keep the marker, where the dispatcher's gate tests only
+`NODE_OVERRIDE_FENCED` — so a node moved from Fenced into Maintenance keeps its
+markers until that override clears.
+
+Two states that look healthy but must KEEP the marker, both found in review:
+- Under `auto_disk` a slot on a healthy disk verdicts `Probe`, and a `Probe`
+  slot is dispatched when the PROBE FAILS — a copy that is gone or unreadable
+  on an otherwise healthy node, which every "is it healthy" clause reads as
+  true. Releasing there re-derives the same rebuild next tick, restarting a
+  full-extent copy forever. `Withhold` is the only verdict that cannot mean
+  that, so under `auto_disk` the zombie marker is kept: holding one costs
+  capacity that `recovery-stats` shows, releasing a live one costs availability
+  that nothing shows.
+- Between a promotion and the source node's first `df`, `faulted_disks` is
+  empty and `disks/<id>` replays `online: true`, so a genuinely faulted disk
+  reads as healthy. For DISPATCH that gap is the safe direction (withhold the
+  rebuild); for RELEASE the sign flips and it would discard a real, possibly
+  mid-copy rebuild after an ordinary failover. `has_first_hand_df` gates on
+  `node_max_free`, which only a successful `df` writes and replay never seeds.
+
+A marker that spins without progressing is also visible now: the re-send logs
+refusals, undecodable replies and unreachable targets at WARN. They were all
+`debug!`, so a manager at INFO rendered a marker re-sending every 2 s as
+complete silence — during the same investigation that read as "recovery is not
+dispatching at all", which was false and cost the wrong diagnosis.
+
+`recovery_dispatch_loop` holds only the 2 s cadence and the leader gate; the
+pass itself is `recovery_dispatch_tick`, so a test can drive exactly one tick
+(`the_dispatch_tick_releases_an_obsolete_marker`). A release the loop never
+reaches is the same green-tests-dead-mechanism shape as a flattened error code,
+so the call site is pinned by a test, not just the predicate.
 
 **Residue is collected by MEMBERSHIP** (`handle_reconcile_extents`): the garbage
 list is "extents you are not in `replicates ++ parity` of", NOT "extents I have
@@ -629,6 +680,27 @@ successor is free to choose a different assignment. "Gone" means absent from the
 cluster or `Suspected`, NOT merely "not Online": a freshly registered node sits
 in `Suspend` until its first `df`, and abandoning on that makes a conversion
 that outlives one tick impossible.
+
+**A CORRUPT source abandons on the FIRST failure, not on the 24th.** The
+pre-encode content check correctly refuses a bit-rotted replica, and the
+extent's own marker is what stops recovery from repairing it
+(`recovery_dispatch_tick` skips any extent carrying a ConvertToEc marker). The
+two repairs then block each other and the only exit is
+`EC_ABANDON_AFTER_CONSECUTIVE_FAILURES`, so "repair rot promptly" became "wait
+out 24 dispatch round trips" — measured at 78-79 s of a pinned marker per chaos
+round, three reproductions, and the main source of one seed's instability. The
+coordinator now answers `CODE_CONTENT_CORRUPT` (wire code 8) and
+`release_corrupt_ec_attempt` abandons the marker at once, handing the extent to
+replica recovery. Retrying is what the generic budget is FOR — a transient peer
+or a busy disk — and corrupted bytes are the one failure a retry cannot improve,
+so they must not share it. The conversion resumes by itself: a later attempt
+carries a new nonce and re-reads the content that recovery rewrote.
+
+`abandon_ec_marker` is CAS'd on the persisted record and re-reads the attempt
+nonce after its etcd await, so a reply that was already stale when it arrived
+cannot release a SUCCESSOR's marker — the release path is now as attempt-scoped
+as the apply path (`classify_ec_done`), which it had to be the moment a single
+late reply could trigger it.
 
 **Payload location (`extent_layout.rs`).** Which FILE holds an extent's payload
 — `.dat` or `.shard{i}` — is per-extent metadata the manager owns and the EN

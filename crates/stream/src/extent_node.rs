@@ -686,12 +686,6 @@ impl DiskFS {
         self.extent_file_path(extent_id, &format!("shard{shard_index}"))
     }
 
-    /// #5 EC-COMMIT-ATOMIC: the commit-intent marker. Written durably BEFORE
-    /// `commit_shard_local` renames `.ec.dat`→`.dat`, deleted after `save_meta`.
-    /// Its presence on restart means the EC commit was interrupted between the
-    /// rename and the meta write (the `.dat` may be the shard while `.meta` is
-    /// still pre-EC); `load_extents` replays it to write the consistent `.meta`.
-    /// Payload = `[new_eversion: u64 LE][sealed_length: u64 LE]`.
     /// `extent-{id}.ec.prepared` — records WHICH attempt produced the current
     /// `.ec.dat` staging (its `new_eversion`). Without it the coordinator's
     /// "prepare already done, skip to commit" check is size-only, and the
@@ -3033,20 +3027,6 @@ async fn write_vectored_all_at_chunked(
     Ok(())
 }
 
-/// Build the async future that performs ACL + pwritev for a same-extent
-/// APPEND batch. ACL early rejections resolve the future as an immediate
-/// pre-encoded Vec<Bytes> with no I/O.
-///
-/// The returned future is polled inside `handle_connection`'s
-/// FuturesUnordered — multiple appends to DIFFERENT extents run concurrently;
-/// appends to the SAME extent are all pushed to FU in order, and since the
-/// ACL synchronously reserves `extent.len`, overlapping same-extent futures
-/// compute non-overlapping `file_start`s.
-///
-/// NOTE: reserves `extent.len` synchronously BEFORE returning the I/O future
-/// so a subsequent submit to the same extent sees the advanced len. The
-/// returned future then calls `write_vectored_at` with pwritev at the
-/// reserved offset.
 // ==================================================================
 // [owner-model] per-extent owner task (step 2: append path).
 // ==================================================================
@@ -8274,12 +8254,6 @@ impl ExtentNode {
         ))
     }
 
-    /// #5: read the EC commit-intent marker, distinguishing the three states the
-    /// recovery decision needs (coco P2 #3 — mirror the `.meta` NotFound-vs-
-    /// corrupt fail-closed policy; a present-but-unreadable marker must NOT be
-    /// silently treated as "no marker").
-    /// #5: delete the EC commit-intent marker (best-effort + dir-fsync). A
-    /// leftover marker only causes a redundant, idempotent replay next restart.
     // ─── RPC Handlers ────────────────────────────────────────────────────────
 
     async fn handle_append(&self, payload: Bytes) -> HandlerResult {
@@ -10195,6 +10169,19 @@ impl ExtentNode {
         if let Some(EcConvertError::ContentCorrupt(message)) = &prior_failure {
             // The previous task has exited and released its extent lock. Do
             // not start another encoder before yielding the marker to repair.
+            //
+            // Re-queue the rot finding on the way out. The one this attempt
+            // already queued was drained by a `df` that landed while the marker
+            // was still in flight, and the manager refuses to isolate a slot of
+            // an extent with a stream-layer op in flight — so that report was
+            // consumed and dropped. This refusal is what RELEASES the marker, so
+            // the copy queued here is the first one that can be acted on. It is
+            // an idempotent insert keyed by extent, and the manager answers an
+            // already-isolated slot with a no-op.
+            if let Some(entry) = self.extents.get(&req.extent_id).map(|e| e.clone()) {
+                let eversion = self.manager_eversion_or_local(req.extent_id, &entry).await;
+                self.note_scrub_rot(req.extent_id, eversion);
+            }
             return code_resp(CODE_CONTENT_CORRUPT, message.clone());
         }
         self.ec_convert_inflight.insert(req.extent_id, ());
@@ -10523,6 +10510,17 @@ impl ExtentNode {
                         "REFUSING to EC-convert an extent whose content fails its checksum — \
                          encoding it would make the damage canonical across the stripe: {why}"
                     );
+                    // Refusing is only half the answer. This node just read its
+                    // own sealed bytes and they did not match what was hashed at
+                    // seal — the same evidence the scrub reports, found by a
+                    // different reader — and nothing else in this path records
+                    // it. Dropping it leaves the slot dark-but-unmarked, which
+                    // under the default gate is a slot recovery will not rebuild,
+                    // so the extent waits for the scrub to rediscover the rot on
+                    // its own (paced) pass while EC keeps being re-proposed and
+                    // re-reading the whole extent to refuse again.
+                    let eversion = self.manager_eversion_or_local(extent_id, &entry).await;
+                    self.note_scrub_rot(extent_id, eversion);
                     return Err(EcConvertError::ContentCorrupt(why));
                 }
                 ContentCheck::Unreadable(why) => {
@@ -11163,6 +11161,21 @@ mod enospc_disk_health_tests {
             DiskHealth::Online,
             "transient EIO must not fault a disk"
         );
+        // Health the manager never hears about triggers nothing: `df` is the
+        // only channel that turns a local verdict into a whole-disk rebuild.
+        let resp = node
+            .handle_df(rkyv_encode(&DfReq {
+                disk_ids: vec![],
+                tasks: vec![],
+            }))
+            .await
+            .unwrap();
+        let df: DfResp = rkyv_decode(&resp).unwrap();
+        assert!(
+            df.disk_status[0].1.online,
+            "a self-check that passed must leave the disk online to the manager"
+        );
+
         DISK_PROBE_SYNC_ERROR.with(|v| v.set(Some(libc::EIO)));
         node.mark_disk_error_for_extent(eid, &eio).await;
         assert_eq!(
@@ -12027,6 +12040,38 @@ mod sealed_append_guard_tests {
             "refusal must not start another encoder"
         );
         assert!(node.get_or_create_extent_op_lock(eid).try_lock().is_some());
+
+        // Refusing is not repairing. The manager releases the marker on this
+        // refusal, but under the default gate it rebuilds a slot only when
+        // something has MARKED it — so the rot this node found has to leave the
+        // node, on the same `df` channel the scrub uses. Draining here mimics
+        // the `df` that carried the first copy away while the marker was still
+        // in flight (the manager drops a finding on an extent with an op in
+        // flight), which is why the refusal re-queues it.
+        assert_eq!(
+            node.done.take_scrub_rot()
+                .into_iter()
+                .map(|r| r.extent_id)
+                .collect::<Vec<_>>(),
+            vec![eid],
+            "the failed content check must report the rot it found"
+        );
+        let reply = node
+            .handle_convert_to_ec(rkyv_encode(&request(7)))
+            .await
+            .unwrap();
+        let reply: CodeResp = rkyv_decode(&reply).unwrap();
+        assert_eq!(reply.code, CODE_CONTENT_CORRUPT);
+        assert_eq!(
+            node.done.take_scrub_rot()
+                .into_iter()
+                .map(|r| r.extent_id)
+                .collect::<Vec<_>>(),
+            vec![eid],
+            "a refusal must re-queue the finding: the copy queued before the \
+             marker was released is the one the manager had to drop"
+        );
+
         let reply = node
             .handle_convert_to_ec(rkyv_encode(&request(8)))
             .await

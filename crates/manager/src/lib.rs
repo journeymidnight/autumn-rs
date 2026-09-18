@@ -3281,6 +3281,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             Some(v) => v,
             None => return Ok(()),
         };
+        self.forget_node_health_facts_of_the_previous_term();
 
         let c = etcd.client.clone();
 

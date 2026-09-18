@@ -95,7 +95,23 @@ impl AutumnManager {
                 .await
             {
                 Ok(true) => {}
-                Ok(false) => return false,
+                Ok(false) => {
+                    // The stored marker is not the bytes this leader holds, so
+                    // the compare can never pass and every caller — the fence
+                    // sweep, the repeated-failure give-up, the content-corrupt
+                    // release — will retry it forever. Memory only re-reads
+                    // etcd on promotion, so nothing resolves this on its own.
+                    // Say so: an unreleasable marker that logs nothing is the
+                    // silent-spin shape this whole area exists to remove.
+                    tracing::warn!(
+                        extent_id,
+                        coord_node_id,
+                        reason,
+                        "EC marker not abandoned: the persisted record differs from this \
+                         leader's; it stays held until a leader change re-reads etcd"
+                    );
+                    return false;
+                }
                 Err(e) => {
                     tracing::warn!(extent_id, reason, error = %e, "failed to abandon inflight marker; will retry");
                     return false;

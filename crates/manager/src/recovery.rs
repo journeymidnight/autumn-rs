@@ -298,7 +298,70 @@ impl AutumnManager {
     /// Release work whose source slot is healthy again (for example after
     /// unfence). This is a state predicate, never a wall-clock expiry. Disk
     /// faults, dark slots and corruption still require the pinned recovery.
+    ///
+    /// The question asked is the DISPATCHER's own: would this slot be rebuilt
+    /// if it were seen for the first time right now? Answering anything weaker
+    /// — "is the node un-fenced", say — releases rebuilds that other, equally
+    /// override-blind sources asked for. `slot_verdict` is therefore consulted
+    /// rather than re-derived, and only a `Withhold` releases: under
+    /// `auto_disk` a healthy disk still verdicts `Probe`, and a `Probe` slot is
+    /// dispatched on a FAILED probe (a copy that is gone or unreadable on an
+    /// otherwise healthy node), which every clause below reads as healthy. That
+    /// marker must be kept — releasing it mid-copy only to re-derive it next
+    /// tick restarts a full-extent rebuild forever. The cost of the
+    /// conservative answer is that `auto_disk` keeps the zombie marker this
+    /// exists to collect; it is the legacy mode, and holding a marker costs
+    /// capacity that `recovery-stats` shows, where releasing a live one costs
+    /// availability that nothing shows.
     pub(crate) async fn release_recovery_markers_for_healthy_slots(&self) -> Vec<u64> {
+        self.release_recovery_markers_for_healthy_slots_under(Self::recovery_gate_mode())
+            .await
+    }
+
+    /// Drop what only the PREVIOUS leader term learned from `df`, so a fresh
+    /// term starts with no second-hand facts about any node's disks.
+    ///
+    /// `faulted_disks` already documents itself as "a new leader starts with it
+    /// empty", and across a process restart that was simply true. Election is
+    /// in-process, though, so a manager that leads, loses its lease and leads
+    /// again keeps every entry it ever wrote — including the absence of one for
+    /// a disk that faulted while another leader held the term. Both directions
+    /// then read a stale answer: the rebuild gate sees a faulted disk as
+    /// healthy, and `has_first_hand_df` answers for a node this term has not
+    /// heard from. The next `df` refills both within a tick or two, which is
+    /// exactly the interval the withhold-until-told rule is written for.
+    pub(crate) fn forget_node_health_facts_of_the_previous_term(&self) {
+        self.node_max_free.borrow_mut().clear();
+        self.faulted_disks.borrow_mut().clear();
+    }
+
+    /// Has THIS leader term applied a `df` from this node, or is it only
+    /// repeating what it replayed?
+    ///
+    /// `faulted_disks` is leader-local and starts empty, and `disks/<id>` is
+    /// persisted `online: true` from registration and replayed that way — so
+    /// between a promotion and the node's first `df`, a slot on a genuinely
+    /// faulted disk reads exactly like a healthy one. For the DISPATCH
+    /// direction that gap is the safe one (withhold the rebuild until the node
+    /// says again that its disk is bad). Releasing inverts the sign: it would
+    /// drop a real faulted-disk marker, discarding a rebuild that may be
+    /// mid-copy, after nothing worse than an ordinary failover. `node_max_free`
+    /// is written only by a successful `df`, never seeded by replay, and
+    /// emptied at promotion by
+    /// `forget_node_health_facts_of_the_previous_term` — without that last
+    /// part it would answer for a node only some EARLIER term had heard from,
+    /// since election is in-process. Its key set is therefore the set of nodes
+    /// THIS term has heard from first-hand.
+    pub(crate) fn has_first_hand_df(&self, node_id: u64) -> bool {
+        self.node_max_free.borrow().contains_key(&node_id)
+    }
+
+    /// The gate is a parameter so a test can pin one without reaching for the
+    /// process-wide environment, which no test can own while others run.
+    pub(crate) async fn release_recovery_markers_for_healthy_slots_under(
+        &self,
+        gate: RecoveryGateMode,
+    ) -> Vec<u64> {
         let ids: Vec<u64> = self.inflight.borrow().keys().copied().collect();
         let mut released = Vec::new();
         for extent_id in ids {
@@ -317,19 +380,29 @@ impl AutumnManager {
                     } else {
                         ex.parity_disks.get(slot - ex.replicates.len())
                     };
+                    let disk_faulted =
+                        disk_id.is_some_and(|id| self.faulted_disks.borrow().contains(id));
+                    // Derived exactly as the dispatch loop derives it, so the
+                    // verdict below is answering the same question from the
+                    // same facts: `None` is "no disk record", not "offline".
+                    let disk_online = disk_id.and_then(|id| s.disks.get(id)).map(|d| d.online);
+                    let verdict = slot_verdict(
+                        gate,
+                        self.node_overrides.borrow().contains_key(&task.replace_id),
+                        self.slot_is_corrupt(extent_id, slot),
+                        disk_faulted,
+                        disk_online,
+                    );
                     s.nodes.contains_key(&task.replace_id)
+                        && self.has_first_hand_df(task.replace_id)
                         && self
                             .node_states
                             .borrow()
                             .state_of(task.replace_id)
                             .is_online()
-                        && !self.node_overrides.borrow().contains_key(&task.replace_id)
                         && (ex.avali & (1u32 << slot)) != 0
-                        && !self.slot_is_corrupt(extent_id, slot)
-                        && disk_id.is_some_and(|id| {
-                            !self.faulted_disks.borrow().contains(id)
-                                && s.disks.get(id).is_some_and(|d| d.online)
-                        })
+                        && disk_online == Some(true)
+                        && verdict == SlotVerdict::Withhold
                 })
             };
             if healthy {
@@ -1255,222 +1328,239 @@ impl AutumnManager {
             if !self.leader.get() {
                 continue;
             }
+            self.recovery_dispatch_tick().await;
+        }
+    }
 
-            // gate on `AUTUMN_MGR_RECOVERY_GATE`:
-            //   - `fenced_only` (default): trigger recovery ONLY when the
-            //     replica's node is operator-Fenced. Pre-fence transient
-            //     failures stop causing cross-node rebuilds.
-            //   - `auto_disk`: legacy behaviour (trigger on disk.online
-            //     == false). For ops who haven't yet stood up the
-            //     OP policy script.
-            let gate_mode = Self::recovery_gate_mode();
+    /// One pass of the recovery dispatch loop, split out so a test can drive
+    /// exactly one tick. The loop itself then holds only its cadence and the
+    /// leader gate, and every mechanism it drives — marker release, re-send,
+    /// limiter reseed, slot dispatch, fenced-tail drain — is reachable without
+    /// a running cluster.
+    pub(crate) async fn recovery_dispatch_tick(&self) {
+        // gate on `AUTUMN_MGR_RECOVERY_GATE`:
+        //   - `fenced_only` (default): trigger recovery ONLY when the
+        //     replica's node is operator-Fenced. Pre-fence transient
+        //     failures stop causing cross-node rebuilds.
+        //   - `auto_disk`: legacy behaviour (trigger on disk.online
+        //     == false). For ops who haven't yet stood up the
+        //     OP policy script.
+        self.recovery_dispatch_tick_under(Self::recovery_gate_mode())
+            .await
+    }
 
-            // maintenance-TTL tick — clear expired Maintenance
-            // overrides before the dispatch decision. Cheap.
-            self.tick_maintenance_ttl().await;
+    /// The gate is read ONCE per tick and threaded from here, so every decision
+    /// in one pass — release, dispatch — answers to the same mode, and a test
+    /// can pin it without the process-wide environment no test can own while
+    /// others run.
+    pub(crate) async fn recovery_dispatch_tick_under(&self, gate_mode: RecoveryGateMode) {
 
-            // snapshot operator overrides so the body's fenced-gate
-            // decision is consistent within this tick. (The node auto-state
-            // snapshot was dead — recovery dispatch gates on Fenced only;
-            // Suspected/Maintenance are consulted by the EC dispatch loop, not
-            // here — so it was removed.)
-            let overrides = self.node_overrides.borrow().clone();
-            let now_s = Self::epoch_seconds();
+        // maintenance-TTL tick — clear expired Maintenance
+        // overrides before the dispatch decision. Cheap.
+        self.tick_maintenance_ttl().await;
 
-            self.release_recovery_markers_for_dead_executors().await;
-            self.release_recovery_markers_for_healthy_slots().await;
-            self.resend_pinned_recovery_markers().await;
+        // snapshot operator overrides so the body's fenced-gate
+        // decision is consistent within this tick. (The node auto-state
+        // snapshot was dead — recovery dispatch gates on Fenced only;
+        // Suspected/Maintenance are consulted by the EC dispatch loop, not
+        // here — so it was removed.)
+        let overrides = self.node_overrides.borrow().clone();
+        let now_s = Self::epoch_seconds();
 
-            // reseed the recovery rate limiter from the inflight
-            // ledger so its counters reflect actually-in-flight recoveries.
-            // The ledger is the source of truth (survives leader failover);
-            // re-deriving every tick means no manual release bookkeeping
-            // (a completed recovery drops out of the ledger → out of the
-            // count next tick) and `recovery-stats` reports real numbers.
-            // Backoff state is preserved (reset_counts leaves it). The
-            // per-candidate `try_acquire` in `dispatch_recovery_task` then
-            // gates NEW dispatches against the caps on top of this baseline.
-            self.reseed_recovery_limiter();
+        self.release_recovery_markers_for_dead_executors().await;
+        self.release_recovery_markers_for_healthy_slots_under(gate_mode)
+            .await;
+        self.resend_pinned_recovery_markers().await;
 
-            // pre-filter under the store borrow so we DON'T clone
-            // extents that the loop body will skip on the next line. The
-            // loop body's first checks are `if ex.sealed_length == 0
-            // { continue; }` and `if ec_conversion_inflight.contains(...)
-            // { continue; }`. This previously cloned every single extent in
-            // `s.extents` (~200 B each for the 4 Vec fields) only to drop
-            // most on the floor — a 10K-extent cluster cloned 2 MB inline
-            // per 2 s tick on the manager's compio runtime, blocking
-            // heartbeat / register_ps / get_regions handlers for a few ms
-            // each tick. The ec_conversion_inflight gating is unchanged
-            // — `apply_recovery_done` / `mark_extent_available` /
-            // `handle_multi_modify_split` still re-check the set at apply
-            // time, so a stale snapshot here is safe (drops at most one
-            // tick's worth of dispatch latency on the racing extent).
-            let (extents, nodes, disks) = {
-                let s = self.store.inner.borrow();
-                // read the unified inflight ledger instead of the
-                // old `ec_conversion_inflight` HashSet. We filter for
-                // ConvertToEc specifically — recovery dispatch on an extent
-                // that's mid-Recovery or mid-Delete is handled by
-                // `dispatch_recovery_task`'s own refuse-at-start (which
-                // collapses those into the same probe).
-                let inflight = self.inflight.borrow();
-                let extents: Vec<MgrExtentInfo> = s
-                    .extents
-                    .values()
-                    .filter(|ex| {
-                        // gate on the authoritative `sealed` STATE,
-                        // NOT `sealed_length == 0`. A sealed-EMPTY extent
-                        // (`sealed = true, sealed_length = 0` — a split/merge tail
-                        // seal, or an open tail sealed by the fence drain) is a
-                        // real recovery candidate: its fenced slots must be
-                        // rebuilt so `remove` can proceed, and EN recovery handles
-                        // the 0-byte copy (`stream_extent_from_sources` returns
-                        // Ok(0) on `total == 0`, then sets the `sealed` flag).
-                        // Open tails (`!sealed`) are still skipped here — they are
-                        // drained by the fence sweep's PS-driven roll first.
-                        if !ex.sealed {
-                            return false;
-                        }
-                        !matches!(
-                            inflight.get(&ex.extent_id).and_then(|r| r.kind()),
-                            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-                        )
-                    })
-                    .cloned()
-                    .collect();
-                (extents, s.nodes.clone(), s.disks.clone())
-            };
+        // reseed the recovery rate limiter from the inflight
+        // ledger so its counters reflect actually-in-flight recoveries.
+        // The ledger is the source of truth (survives leader failover);
+        // re-deriving every tick means no manual release bookkeeping
+        // (a completed recovery drops out of the ledger → out of the
+        // count next tick) and `recovery-stats` reports real numbers.
+        // Backoff state is preserved (reset_counts leaves it). The
+        // per-candidate `try_acquire` in `dispatch_recovery_task` then
+        // gates NEW dispatches against the caps on top of this baseline.
+        self.reseed_recovery_limiter();
 
-            for ex in extents {
-                let copies = Self::extent_nodes(&ex);
-                for (slot, node_id) in copies.iter().copied().enumerate() {
-                    let bit = 1u32 << slot;
-                    let node = nodes.get(&node_id).cloned();
+        // pre-filter under the store borrow so we DON'T clone
+        // extents that the loop body will skip on the next line. The
+        // loop body's first checks are `if ex.sealed_length == 0
+        // { continue; }` and `if ec_conversion_inflight.contains(...)
+        // { continue; }`. This previously cloned every single extent in
+        // `s.extents` (~200 B each for the 4 Vec fields) only to drop
+        // most on the floor — a 10K-extent cluster cloned 2 MB inline
+        // per 2 s tick on the manager's compio runtime, blocking
+        // heartbeat / register_ps / get_regions handlers for a few ms
+        // each tick. The ec_conversion_inflight gating is unchanged
+        // — `apply_recovery_done` / `mark_extent_available` /
+        // `handle_multi_modify_split` still re-check the set at apply
+        // time, so a stale snapshot here is safe (drops at most one
+        // tick's worth of dispatch latency on the racing extent).
+        let (extents, nodes, disks) = {
+            let s = self.store.inner.borrow();
+            // read the unified inflight ledger instead of the
+            // old `ec_conversion_inflight` HashSet. We filter for
+            // ConvertToEc specifically — recovery dispatch on an extent
+            // that's mid-Recovery or mid-Delete is handled by
+            // `dispatch_recovery_task`'s own refuse-at-start (which
+            // collapses those into the same probe).
+            let inflight = self.inflight.borrow();
+            let extents: Vec<MgrExtentInfo> = s
+                .extents
+                .values()
+                .filter(|ex| {
+                    // gate on the authoritative `sealed` STATE,
+                    // NOT `sealed_length == 0`. A sealed-EMPTY extent
+                    // (`sealed = true, sealed_length = 0` — a split/merge tail
+                    // seal, or an open tail sealed by the fence drain) is a
+                    // real recovery candidate: its fenced slots must be
+                    // rebuilt so `remove` can proceed, and EN recovery handles
+                    // the 0-byte copy (`stream_extent_from_sources` returns
+                    // Ok(0) on `total == 0`, then sets the `sealed` flag).
+                    // Open tails (`!sealed`) are still skipped here — they are
+                    // drained by the fence sweep's PS-driven roll first.
+                    if !ex.sealed {
+                        return false;
+                    }
+                    !matches!(
+                        inflight.get(&ex.extent_id).and_then(|r| r.kind()),
+                        Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+                    )
+                })
+                .cloned()
+                .collect();
+            (extents, s.nodes.clone(), s.disks.clone())
+        };
 
-                    // backoff gate. If the (extent, slot) pair
-                    // has consecutive failures, skip this tick.
-                    if self
-                        .recovery_limiter
-                        .borrow()
-                        .in_backoff(ex.extent_id, slot as u32, now_s)
-                    {
+        for ex in extents {
+            let copies = Self::extent_nodes(&ex);
+            for (slot, node_id) in copies.iter().copied().enumerate() {
+                let bit = 1u32 << slot;
+                let node = nodes.get(&node_id).cloned();
+
+                // backoff gate. If the (extent, slot) pair
+                // has consecutive failures, skip this tick.
+                if self
+                    .recovery_limiter
+                    .borrow()
+                    .in_backoff(ex.extent_id, slot as u32, now_s)
+                {
+                    continue;
+                }
+
+                let is_fenced = matches!(
+                    overrides.get(&node_id).map(|o| o.kind),
+                    Some(NODE_OVERRIDE_FENCED)
+                );
+                let is_corrupt = self.slot_is_corrupt(ex.extent_id, slot);
+                // Which disk holds THIS slot, per the extent's own layout.
+                let disk_id = if slot < ex.replicate_disks.len() {
+                    Some(ex.replicate_disks[slot])
+                } else {
+                    let parity_slot = slot.checked_sub(ex.replicates.len());
+                    parity_slot.and_then(|ps| ex.parity_disks.get(ps).copied())
+                };
+                let disk_online = disk_id
+                    .and_then(|did| disks.get(&did))
+                    .map(|disk| disk.online);
+                let disk_faulted =
+                    disk_id.is_some_and(|did| self.faulted_disks.borrow().contains(&did));
+
+                // ONE place decides. It used to be three checks in a row
+                // whose ORDER was the bug: the gate returned before
+                // anything looked at the disk.
+                match slot_verdict(gate_mode, is_fenced, is_corrupt, disk_faulted, disk_online)
+                {
+                    SlotVerdict::Withhold => continue,
+                    SlotVerdict::Rebuild => {
+                        self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
+                            .await;
                         continue;
                     }
+                    SlotVerdict::Probe => {}
+                }
 
-                    let is_fenced = matches!(
-                        overrides.get(&node_id).map(|o| o.kind),
-                        Some(NODE_OVERRIDE_FENCED)
-                    );
-                    let is_corrupt = self.slot_is_corrupt(ex.extent_id, slot);
-                    // Which disk holds THIS slot, per the extent's own layout.
-                    let disk_id = if slot < ex.replicate_disks.len() {
-                        Some(ex.replicate_disks[slot])
-                    } else {
-                        let parity_slot = slot.checked_sub(ex.replicates.len());
-                        parity_slot.and_then(|ps| ex.parity_disks.get(ps).copied())
-                    };
-                    let disk_online = disk_id
-                        .and_then(|did| disks.get(&did))
-                        .map(|disk| disk.online);
-                    let disk_faulted =
-                        disk_id.is_some_and(|did| self.faulted_disks.borrow().contains(&did));
-
-                    // ONE place decides. It used to be three checks in a row
-                    // whose ORDER was the bug: the gate returned before
-                    // anything looked at the disk.
-                    match slot_verdict(gate_mode, is_fenced, is_corrupt, disk_faulted, disk_online)
-                    {
-                        SlotVerdict::Withhold => continue,
-                        SlotVerdict::Rebuild => {
-                            self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
-                                .await;
-                            continue;
-                        }
-                        SlotVerdict::Probe => {}
-                    }
-
-                    if (ex.avali & bit) == 0 {
-                        if let Some(n) = node.clone() {
-                            let base = Self::normalize_endpoint(&n.address);
-                            // re_avali on specific extent → owner shard.
-                            let addr =
-                                Self::shard_addr_for_extent(&base, &n.shard_ports, ex.extent_id);
-                            let payload = rkyv_encode(&ReAvaliReq {
-                                extent_id: ex.extent_id,
-                                eversion: ex.eversion,
-                            });
-                            // 30 s — RE_AVALI may copy the full extent
-                            // from peers if local data lags
-                            // sealed_length, so allow real work; cap to
-                            // prevent paged-out-EN wedge.
-                            if let Ok(resp) = self
-                                .conn_pool
-                                .call_timeout(
-                                    &addr,
-                                    EXT_MSG_RE_AVALI,
-                                    payload,
-                                    Duration::from_secs(30),
-                                )
-                                .await
+                if (ex.avali & bit) == 0 {
+                    if let Some(n) = node.clone() {
+                        let base = Self::normalize_endpoint(&n.address);
+                        // re_avali on specific extent → owner shard.
+                        let addr =
+                            Self::shard_addr_for_extent(&base, &n.shard_ports, ex.extent_id);
+                        let payload = rkyv_encode(&ReAvaliReq {
+                            extent_id: ex.extent_id,
+                            eversion: ex.eversion,
+                        });
+                        // 30 s — RE_AVALI may copy the full extent
+                        // from peers if local data lags
+                        // sealed_length, so allow real work; cap to
+                        // prevent paged-out-EN wedge.
+                        if let Ok(resp) = self
+                            .conn_pool
+                            .call_timeout(
+                                &addr,
+                                EXT_MSG_RE_AVALI,
+                                payload,
+                                Duration::from_secs(30),
+                            )
+                            .await
+                        {
+                            if let Ok(r) =
+                                rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp)
                             {
-                                if let Ok(r) =
-                                    rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp)
-                                {
-                                    if r.code == CODE_OK {
-                                        if let Err(e) =
-                                            self.mark_extent_available(ex.extent_id, slot).await
-                                        {
-                                            // Swallowing this left the slot's
-                                            // bit clear while the loop believed
-                                            // it had healed, so the next tick
-                                            // re-sent RE_AVALI forever.
-                                            tracing::warn!(
-                                                extent_id = ex.extent_id,
-                                                slot,
-                                                error = %e,
-                                                "re_avali reported OK but marking the slot \
-                                                 available failed; will retry next tick"
-                                            );
-                                        }
-                                        continue;
+                                if r.code == CODE_OK {
+                                    if let Err(e) =
+                                        self.mark_extent_available(ex.extent_id, slot).await
+                                    {
+                                        // Swallowing this left the slot's
+                                        // bit clear while the loop believed
+                                        // it had healed, so the next tick
+                                        // re-sent RE_AVALI forever.
+                                        tracing::warn!(
+                                            extent_id = ex.extent_id,
+                                            slot,
+                                            error = %e,
+                                            "re_avali reported OK but marking the slot \
+                                             available failed; will retry next tick"
+                                        );
                                     }
+                                    continue;
                                 }
                             }
                         }
-                        self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
-                            .await;
-                        continue;
                     }
+                    self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
+                        .await;
+                    continue;
+                }
 
-                    // Tier 2: switched from `commit_length_on_node`
-                    // (fence-gated, requires PS-owner owner_epoch) to the
-                    // dedicated fence-free `probe_extent_on_node`. The
-                    // recovery loop has no owner context and only uses
-                    // `.is_ok()` for liveness — gating it on the
-                    // owner-lock fence was always wrong (pre-Tier 2 we
-                    // worked around it by hardcoding `owner_epoch: 0` + a
-                    // server-side escape hatch; that escape silently
-                    // broke and forced this same fix).
-                    let healthy = match node {
-                        Some(n) => self
-                            .probe_extent_on_node(&n.address, ex.extent_id)
-                            .await
-                            .is_ok(),
-                        None => false,
-                    };
-                    if !healthy {
-                        self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
-                            .await;
-                    }
+                // Tier 2: switched from `commit_length_on_node`
+                // (fence-gated, requires PS-owner owner_epoch) to the
+                // dedicated fence-free `probe_extent_on_node`. The
+                // recovery loop has no owner context and only uses
+                // `.is_ok()` for liveness — gating it on the
+                // owner-lock fence was always wrong (pre-Tier 2 we
+                // worked around it by hardcoding `owner_epoch: 0` + a
+                // server-side escape hatch; that escape silently
+                // broke and forced this same fix).
+                let healthy = match node {
+                    Some(n) => self
+                        .probe_extent_on_node(&n.address, ex.extent_id)
+                        .await
+                        .is_ok(),
+                    None => false,
+                };
+                if !healthy {
+                    self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
+                        .await;
                 }
             }
-
-            // seal + roll open tails that sit on a fenced node so
-            // recovery (above) can rebuild them and `remove` can proceed. Runs
-            // each tick after the sealed-extent recovery dispatch.
-            self.drain_fenced_open_tails().await;
         }
+
+        // seal + roll open tails that sit on a fenced node so
+        // recovery (above) can rebuild them and `remove` can proceed. Runs
+        // each tick after the sealed-extent recovery dispatch.
+        self.drain_fenced_open_tails().await;
     }
 
     /// find OPEN tail extents (`!sealed`) whose replica set

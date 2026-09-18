@@ -3565,3 +3565,155 @@ It never blocks this mount's writer (the manager conflicts writers only with a
 different client's writer), and it receives a `WriterClosed` invalidation when
 this mount's last write fd closes — including the downgrade case, where the
 mount hands the writer slot back but keeps reading.
+
+## A disk fault is confirmed by a self-check before the cluster acts on it
+
+A `Faulted` verdict now migrates the whole disk, so an extent node proves the
+disk is really gone before reporting it: any error the classifier calls `Media`
+triggers one small write + fsync into the failing extent's own hash directory.
+The probe passing means the write that failed was transient — the disk keeps
+its health and the operation still fails for its caller. `Capacity`
+(ENOSPC/EDQUOT → `Full`) and `Process` (EMFILE/ENFILE/ENOMEM) never probe:
+neither is a statement about the device.
+
+    cargo test -p autumn-stream --lib enospc_disk_health
+
+What an operator sees in the EN log, at WARN:
+
+    write failed but disk write/fsync self-check passed; retaining disk health
+    disk write/fsync self-check failed                     (then, at ERROR)
+    disk fault confirmed by write/fsync self-check
+
+Only the last one reaches the manager (`df` reports `online: false`) and starts
+a rebuild. A stuck device does not stall error handling: the probe — open,
+unlink, write, file fsync and directory fsync — is bounded at 2 s in total and
+a timeout counts as a confirmed fault.
+
+For ablation, make the `Media` arm of `mark_disk_error_for_extent` fault the
+disk without probing: `a_handle_shortage_leaves_the_disk_online` then reports
+`Faulted` for a transient EIO, and `disk_probe_timeout_faults_without_blocking_
+error_handling` loses its 2 s bound.
+
+## An obsolete recovery marker is released on the tick, without a TTL
+
+Fencing a node creates one recovery marker per slot it holds. Unfencing it
+makes that work pointless — the slot is healthy again — and nothing used to
+release those markers: they held rate-limiter slots for the life of the leader
+and logged nothing while re-dispatching every 2 s.
+
+    AO=(./target/release/autumn-op --manager 127.0.0.1:9001)
+
+    "${AO[@]}" fence-node 5 --reason "marker check" --by you
+    "${AO[@]}" recovery-stats        # global/per_source/per_target now non-zero
+    "${AO[@]}" unfence 5 --by you
+    sleep 3
+    "${AO[@]}" recovery-stats        # back to 0 inflight, 0 per-source, 0 per-target
+
+Repeat ten times: nothing accumulates. The release is a state predicate, never
+a timeout — a marker is dropped only when that slot genuinely no longer needs
+rebuilding (the node is registered, Online and un-overridden, its `avali` bit is
+set, the slot is not marked corrupt, and its disk is neither faulted nor
+offline). Disk faults, dark slots and corruption keep their markers, which is
+why unfencing a node whose disk is bad releases nothing.
+
+A marker that spins without progressing is now visible: the re-dispatch logs
+refusals, undecodable replies and unreachable targets at WARN (they were all
+`debug!`, so a manager at INFO showed a 2 s loop as complete silence).
+
+Two cases deliberately keep their markers, and `recovery-stats` showing a
+non-zero count in either is correct, not a leak:
+
+- **`AUTUMN_MGR_RECOVERY_GATE=auto_disk`** (the legacy, non-default mode). There
+  a rebuild can be dispatched because an extent PROBE failed — the copy is gone
+  or unreadable on a node that is otherwise healthy — and that state is
+  indistinguishable from a slot that never needed rebuilding. Releasing it would
+  restart a full-extent copy every tick, so under that gate the marker is held.
+- **Right after a leader change**, until the source node's first `df` reaches
+  the new leader. `faulted_disks` is emptied at promotion (election is
+  in-process, so last term's entries would otherwise survive) while the
+  persisted disk record replays as `online: true`, so a faulted disk briefly
+  looks healthy; releasing then would discard a real, possibly mid-copy rebuild.
+  It clears on that node's next `df` — normally a tick or two, longer if the
+  node sits late in an iteration where an unreachable peer ahead of it spends
+  its 5 s timeout.
+
+    cargo test -p autumn-manager --lib extent_inflight
+    cargo test -p autumn-manager --test node_lifecycle --test system_recovery_loop_drives
+
+For ablation, make `release_recovery_markers_for_healthy_slots` return an empty
+vec: `recovery_marker_unfence_releases_only_a_healthy_slot` fails with the
+marker still held after the unfence.
+
+## A corrupt EC source yields to recovery instead of burning 24 retries
+
+Rot on an extent that is also mid-EC-conversion used to deadlock the two
+repairs against each other: the recovery dispatch skips any extent carrying a
+ConvertToEc marker, and the conversion's pre-encode content check fails every
+time on exactly those bytes. The only exit was the generic give-up after 24
+consecutive failures.
+
+A content-checksum failure is now answered with `CODE_CONTENT_CORRUPT` (wire
+code 8, hence `WIRE_VERSION` 42) and the marker is abandoned on the FIRST
+failure, which hands the extent to replica recovery immediately. Retrying was
+never going to make the bytes better; every other EC failure keeps the old
+budget.
+
+    cargo test -p autumn-stream --lib ec_corruption_stops
+    cargo test -p autumn-manager --lib corrupt_ec_reply
+    cargo test -p autumn-manager --test ec_integration
+
+What an operator sees:
+
+    "${AO[@]}" ops history --kind ec-convert   # state=failed
+                                              # content checksum failed; yielded to recovery
+
+and in the manager log, at WARN:
+
+    EC checksum failure: released marker for replica recovery
+
+The extent node refuses to start a second encoder after such a failure
+(`ec convert already running` is not the answer — the attempt has exited), and
+a NEW attempt nonce rechecks the content, so the conversion resumes by itself
+once recovery has rewritten the source.
+
+**Releasing the marker is only half of it.** Under the default gate recovery
+rebuilds a slot only when something has MARKED it, so the node reports the rot
+it found on the same `df` channel the scrub uses. The manager isolates the slot
+(clears its `avali` bit and records the corrupt mark); the rebuild follows on a
+later dispatch tick, where a corrupt slot verdicts `Rebuild` regardless of the
+gate:
+
+    autumn-op --manager ... extent-health      # unhealthy slots only; the rotted one appears
+    autumn-op --manager ... recovery-stats     # a rebuild in flight for it
+
+The report is re-queued on each refusal on purpose: the manager drops a finding
+for an extent that still has an op in flight, and the refusal is what releases
+that op. Without it the repair waits for the scrub to rediscover the same rot on
+its own paced pass, while EC keeps being re-proposed and re-reading the whole
+extent to refuse again.
+
+For ablation, drop the `CODE_CONTENT_CORRUPT` arm in the manager's dispatch
+reply handling: `corrupt_ec_reply_releases_marker_on_first_failure_and_rejects_
+late_reply` fails with the marker still ConvertToEc. Dropping the EN-side
+refusal instead makes `ec_corruption_stops_before_redispatch_and_is_attempt_
+scoped` see `CODE_OK` where it requires code 8.
+
+## A bulk read's refusal keeps its status code
+
+`MSG_READ_BYTES` refuses a mis-routed read with `FailedPrecondition` and a
+message naming the owning shard. `MSG_READ_BYTES_BULK` used to flatten every
+such refusal into `CODE_ERROR "extent unavailable"`, so a client could not tell
+a routing error from a genuinely unavailable extent — and the refresh-and-retry
+fallback that keys on the error TYPE became dead code on that path, with the
+whole unit suite and a byte-for-byte e2e run green.
+
+    cargo test -p autumn-stream --test shards a_read_addressed_to_the_wrong_shard_is_refused
+    cargo test -p autumn-client --lib connection_tests
+
+The shard test drives both arms against a two-shard node: the routed address
+serves the bytes, the base address refuses, and the bulk refusal must arrive as
+a typed `FailedPrecondition` whose message still contains `belongs to shard`.
+
+For ablation, restore `bulk_read_head(CODE_ERROR, "extent unavailable")` in the
+bulk `get_extent` error arm: the test fails with `code: 4` and the flattened
+message.

@@ -97,7 +97,16 @@
   子串命中 errno 120~129(含 EREMOTEIO —— 块层 `BLK_STS_TARGET` 的映射,正是要抓的设备错误),
   会让真设备故障**静默留在 Online**。改成带右括号匹配,并加了遍历 errno 1..=133 的回归测试
   (白名单的价值全在边界上,只测想到的那三个值不算数)。
-- `passes: false`
+- **Status** (2026-09-18): Scope 1 已交付。`Media` 类不再直接判死,先做一次
+  `probe_write`(小写 + fsync,探失败 extent 自己的 hash 目录,先 unlink 再写,
+  open/unlink/write/file-fsync/dir-fsync 整体 2s 上界);探针通过 ⇒ 保留盘健康(原操作照常失败),
+  探针失败或超时 ⇒ 才置 `Faulted`。验收两半都有测试:瞬时 EIO ⇒ Online **且 `df` 仍报 online**
+  (即不触发重建),注入 fsync EIO ⇒ Faulted;消融(去掉探针)两条测试变红。
+  Scope 2(运维清除 `Faulted` 的动词)仍按 2026-09-09 的决定押后,不在本轮。
+  **待测假设**(评审提出,本轮判定不改行为):探针超时算作确认故障,理论上一块"健康但饱和"的盘
+  fsync 超过 2s 就会被判死。但这不是回归 —— 改动前 Media 错误**不经任何探针直接判死**,
+  新判死集合是旧集合的子集,探针只会减少判死。真要收紧需在 fio 饱和下实测超时分布再定。
+- `passes: true`
 
 ### F-DISK-REBALANCE — 机内盘间倾斜没有任何东西会纠正
 - **Trigger** (2026-09-09): `choose_disk` 现在按负载选盘(见 F-EXTENT-PLACEMENT Scope 1 的
@@ -254,6 +263,19 @@
   最误导人的一段：4 个名额被占、日志全静默、而我据此得出过"根本没在 recovery"的错误结论。
   与"重建不上报进度"是同一处观测缺口的两个面（那条已于 2026-09-09 在真实重建上验收关闭，
   所以今天只剩本条这一面）。
+- **Status** (2026-09-18): Scope (a)(b) 均已交付。(a) `release_recovery_markers_for_healthy_slots`
+  每 tick 电平触发、无 TTL，判据是 dispatcher 自己的 `slot_verdict`（只有 `Withhold` 才释放），
+  而不是"没被 fence 就放"。(b) 重发的 refused/decode/unreachable 从 `debug!` 提到 `warn!`。
+  验收：单测含 10×fence/unfence 且限流器 global/per_source/per_target 全部归零 + 5 条"仍需重建"
+  的否定分支；另有一条测试驱动**真实的 dispatch tick**（为此把 loop 体抽成
+  `recovery_dispatch_tick`），因为只测谓词无法证明 loop 真的调用了它 —— 消融掉那一行调用即变红。
+  真集群实证（system_chaos、子进程 EN + 真 etcd、`AUTUMN_CHAOS_ACTIONS=fence`、11 轮 fence/unfence）：
+  INFO 日志可见 `released recovery marker: source slot is healthy again`（extent 20/22），
+  quiesce 后无 still-ACTIVE op，400 keys 全部校验一致。
+  **两处刻意保留 marker**（评审发现，均已加回归测试/文档）：`auto_disk` 门控下探测失败派出的重建
+  与"本就健康"不可区分，释放会导致每 tick 重启一次整 extent 拷贝；leader 刚接管、源节点首个 `df`
+  尚未到达时 `faulted_disks` 为空，此时释放会丢弃真实的故障盘重建，故以 `has_first_hand_df` 把门。
+- `passes: true`
 
 ### F-CHAOS-DISK-FAULT — 多盘形态有了，但"一块盘坏了"本身还没有 nemesis
 - **Trigger** (2026-09-10，fable 评审确认): chaos 的 EN 现在是多盘的
@@ -313,6 +335,22 @@
   quiesce 后不再出现 pinned 的 EC marker。
 - **Status**: `passes: false` (2026-09-10) — 不丢数据,会自愈,但把"尽快修腐化"变成
   "先等 EC 放弃"。同时它是 chaos seed 603 不稳定的已知来源之一。
+- **Status** (2026-09-18): 选了 Scope (a),没做 (b)（两者只能选一）。内容校验失败新增
+  `CODE_CONTENT_CORRUPT`(=8,因此 WIRE_VERSION 41→42)：EN 在同一 attempt nonce 的再次派发上
+  直接回该码且**不再起第二个 encoder**，manager `release_corrupt_ec_attempt` 首次失败即弃 marker，
+  交给副本 recovery；新 nonce 会重新校验内容，修好后转换自行恢复。顺带补了
+  `abandon_ec_marker` 的正确性：etcd `Cmp::value` CAS + await 后重核 nonce（否则一条迟到的回复
+  可能释放**后继** attempt 的 marker），CAS 失败不再静默返回、而是 warn 说明该 marker 要等换主才动。
+  **评审抓到的关键缺口（已修）**：只弃 marker 并不够 —— 默认门控下 recovery 只重建"被标记过"的 slot，
+  而 EC 前置校验发现的腐化此前**没有任何地方记录**，于是要等 scrub 自己按 8MiB/s 的节奏重新发现，
+  其间 EC 被反复提议、每次重读整个 extent 再拒绝。现在 EN 通过 scrub 同一条 `df` 通道上报
+  (`note_scrub_rot`)，且在每次拒绝时**重新入队**（manager 会丢弃"有在途 op 的 extent"的上报，
+  而这次拒绝正是释放该 op 的动作）；消融掉重新入队即变红。
+  验收：EN 侧 + manager 侧各一条确定性测试，四条消融全部验证变红；chaos 侧
+  `AUTUMN_CHAOS_ACTIONS=corrupt,ec AUTUMN_CHAOS_SEED=603` 两次（修复前后各一次）均通过，
+  日志给出完整碰撞链 —— extent 20 被注入 64 字节腐化 → 同一 extent 被选中 EC 转换 →
+  `recovery ops driven this round: 1 [extent 20 state=2]`，quiesce 后无 pinned EC marker。
+- `passes: true`
 
 ### BUG-BULK-READ-FLATTENS-REFUSAL — bulk 读把"分片不归我"压成"extent 不可用"
 - **Trigger** (2026-09-04，评审发现，**潜伏未触发**): 非 bulk 的 `MSG_READ_BYTES` 走
@@ -329,6 +367,19 @@
 - **Scope**: bulk 臂透传 `(code, msg)`，而不是改写成 `CODE_ERROR "extent unavailable"`；
   并把守卫测试补到 bulk 路径上。
 - **Status**: `passes: false` (2026-09-04) — 未修，已核对代码确认存在。
+- **Status** (2026-09-18): 已修。bulk 臂改为发**带类型的错误帧**（`err_bytes`，保留
+  `(StatusCode, message)`），与非 bulk 的 `MSG_READ_BYTES` 同形，不再压成
+  `CODE_ERROR "extent unavailable"`；另抽出 `ReadRefusal` 承载
+  `EversionStale | PayloadNotHere` 两种拒绝。守卫测试补到 bulk 路径：
+  `shards.rs` 的 `a_read_addressed_to_the_wrong_shard_is_refused` 现在同时驱动
+  plain/bulk/direct 三条臂并断言 bulk 拒绝仍是 `FailedPrecondition` 且消息里点名
+  `belongs to shard`；client 侧新增 `wrong_shard_bulk_refusal_falls_back_to_proxy`。
+  消融（还原成扁平化）两侧均变红。
+  行为差异一处（刻意，已写入 stream CLAUDE.md）：这些拒绝过去以 `Ok(非 OK 码)` 到达
+  `read_value_into_pooled` 并直接回落到 copy 路径，现在进入 `Err` 臂，会先走完其余副本再回落 ——
+  一个节点的拒绝本就不能代表其他节点；`is_connect_failure`/`is_liveness_timeout` 都不匹配这段文本，
+  故 note-29 的抑制与 note-34 的地址遗忘不受影响。
+- `passes: true`
 
 ### BUG-FRAME-LEN-U32-WRAP — ≥4 GiB 的帧静默编出一个损坏的头
 - **Trigger** (2026-09-04，实测过一次真实故障，此处补记): `frame.rs` 的

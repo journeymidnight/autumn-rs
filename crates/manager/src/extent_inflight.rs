@@ -529,19 +529,16 @@ impl AutumnManager {
             .max(60)
     }
 
-    /// RECOVERY markers get a SHORTER stale threshold than the
-    /// general (Delete) one. Override with `AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS`,
-    /// default 120s, clamped >= 30.
-    ///
-    // NOTE: the Recovery-specific stale threshold
-    // (`AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS`, default 120 s) and its helper
-    // are GONE. It existed only because a held marker froze re-dispatch, which
+    // NOTE: there is no Recovery-specific stale threshold. One existed
+    // (`AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS`, default 120 s), and it
+    // existed only because a held marker froze re-dispatch, which
     // made a timeout the sole way back — and its value had to be hand-tuned to
     // sit just past the EN's own 10 x 10 s internal give-up budget, a magic
     // number pinned to another magic number (found by decommission chaos,
     // 2026-07-10). Recovery markers are now standing instructions that are
-    // re-sent every tick, and a marker whose pinned executor is no longer online
-    // is released by `recovery_dispatch_loop` against live node state. Delete
+    // re-sent every tick, and `recovery_dispatch_loop` releases a marker against
+    // live state on either of two facts: its pinned executor is no longer
+    // online, or its source slot no longer needs rebuilding. Delete
     // keeps the general 600 s threshold (it has its own retry queue);
     // ConvertToEc stays WARN-only.
 
@@ -1003,6 +1000,10 @@ mod tests {
                 },
             );
             m.node_states.borrow_mut().on_heartbeat_ok(1);
+            // This leader has heard node 1's own `df`; without that
+            // evidence a release cannot tell a healthy disk from a
+            // faulted one it has not been told about yet.
+            m.node_max_free.borrow_mut().insert(1, 1 << 30);
             m.store.inner.borrow_mut().disks.insert(
                 10,
                 MgrDiskInfo {
@@ -1107,6 +1108,196 @@ mod tests {
                 m.release_recovery_markers_for_healthy_slots().await,
                 vec![20]
             );
+        });
+    }
+
+    /// A re-election happens in the SAME process, so "this leader has heard
+    /// the node's own `df`" is only true if promotion forgets what the
+    /// previous term heard. Without that, a manager that led before answers
+    /// for a node whose disk faulted while someone else held the term, and
+    /// releases the marker for a rebuild that is genuinely needed.
+    #[test]
+    fn promotion_forgets_the_previous_terms_df() {
+        run(async {
+            let m = AutumnManager::new();
+            m.node_max_free.borrow_mut().insert(7, 1 << 30);
+            m.faulted_disks.borrow_mut().insert(70);
+            assert!(m.has_first_hand_df(7));
+
+            m.forget_node_health_facts_of_the_previous_term();
+
+            assert!(
+                !m.has_first_hand_df(7),
+                "a fresh term must not answer for a node only an earlier term heard from"
+            );
+            assert!(
+                m.faulted_disks.borrow().is_empty(),
+                "and it must not keep the earlier term's disk verdicts either — the \
+                 field documents itself as empty at the start of a leader's life"
+            );
+        });
+    }
+
+    /// Under `auto_disk` a slot on a healthy disk is dispatched when its
+    /// PROBE fails — the copy is gone or unreadable on a node that is otherwise
+    /// perfectly well — and every "is this slot healthy" clause reads true for
+    /// it. Releasing there re-derives the same rebuild next tick, restarting a
+    /// full-extent copy forever, so that gate must keep its markers.
+    #[test]
+    fn a_probe_driven_rebuild_is_not_released_as_healthy() {
+        run(async {
+            let m = AutumnManager::new();
+            m.store.inner.borrow_mut().nodes.insert(
+                1,
+                MgrNodeInfo {
+                    node_id: 1,
+                    address: "127.0.0.1:9101".into(),
+                    disks: vec![10],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: String::new(),
+                },
+            );
+            m.node_states.borrow_mut().on_heartbeat_ok(1);
+            // This leader has heard node 1's own `df`; without that
+            // evidence a release cannot tell a healthy disk from a
+            // faulted one it has not been told about yet.
+            m.node_max_free.borrow_mut().insert(1, 1 << 30);
+            m.store.inner.borrow_mut().disks.insert(
+                10,
+                MgrDiskInfo {
+                    disk_id: 10,
+                    online: true,
+                    uuid: String::new(),
+                },
+            );
+            m.store.inner.borrow_mut().extents.insert(
+                20,
+                MgrExtentInfo {
+                    extent_id: 20,
+                    sealed: true,
+                    replicates: vec![1],
+                    replicate_disks: vec![10],
+                    avali: 1,
+                    ..Default::default()
+                },
+            );
+            m.acquire_extent_inflight(20, recovery_payload(20))
+                .await
+                .unwrap();
+            assert!(
+                m.release_recovery_markers_for_healthy_slots_under(
+                    crate::recovery::RecoveryGateMode::AutoDisk
+                )
+                .await
+                .is_empty(),
+                "auto_disk dispatches on a failed probe, and this state is \
+                 indistinguishable from that one — the marker must be kept"
+            );
+            assert_eq!(
+                m.release_recovery_markers_for_healthy_slots_under(
+                    crate::recovery::RecoveryGateMode::FencedOnly
+                )
+                .await,
+                vec![20],
+                "under the default gate nothing but an override could have \
+                 asked for this rebuild, and it is gone"
+            );
+        });
+    }
+
+    /// The release above is only worth anything if the dispatch loop reaches
+    /// it, and a call site nothing drives is exactly the shape of bug that
+    /// leaves every unit test green while the mechanism is dead. So drive one
+    /// real tick rather than the predicate.
+    #[test]
+    fn the_dispatch_tick_releases_an_obsolete_marker() {
+        run(async {
+            let m = AutumnManager::new();
+            m.store.inner.borrow_mut().nodes.insert(
+                1,
+                MgrNodeInfo {
+                    node_id: 1,
+                    address: "127.0.0.1:9101".into(),
+                    disks: vec![10],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: String::new(),
+                },
+            );
+            // The marker's pinned EXECUTOR has to be alive too, or the
+            // dead-executor release retires it first and the unfence proves
+            // nothing. Nothing listens at its address, so the tick's re-send
+            // is refused and the marker stays — which is the point.
+            m.store.inner.borrow_mut().nodes.insert(
+                9,
+                MgrNodeInfo {
+                    node_id: 9,
+                    address: "127.0.0.1:9109".into(),
+                    disks: vec![90],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: String::new(),
+                },
+            );
+            m.node_states.borrow_mut().on_heartbeat_ok(1);
+            // This leader has heard node 1's own `df`; without that
+            // evidence a release cannot tell a healthy disk from a
+            // faulted one it has not been told about yet.
+            m.node_max_free.borrow_mut().insert(1, 1 << 30);
+            m.node_states.borrow_mut().on_heartbeat_ok(9);
+            m.store.inner.borrow_mut().disks.insert(
+                10,
+                MgrDiskInfo {
+                    disk_id: 10,
+                    online: true,
+                    uuid: String::new(),
+                },
+            );
+            m.store.inner.borrow_mut().extents.insert(
+                20,
+                MgrExtentInfo {
+                    extent_id: 20,
+                    sealed: true,
+                    sealed_length: 4096,
+                    replicates: vec![1],
+                    replicate_disks: vec![10],
+                    avali: 1,
+                    ..Default::default()
+                },
+            );
+            m.node_overrides.borrow_mut().insert(
+                1,
+                MgrNodeOverride {
+                    node_id: 1,
+                    kind: NODE_OVERRIDE_FENCED,
+                    ..Default::default()
+                },
+            );
+            m.acquire_extent_inflight(20, recovery_payload(20))
+                .await
+                .unwrap();
+
+            m.recovery_dispatch_tick_under(crate::recovery::RecoveryGateMode::FencedOnly)
+                .await;
+            assert_eq!(
+                m.extent_inflight_op(20),
+                Some(ExtentOpKind::Recovery),
+                "the fence still stands, so the rebuild is still wanted"
+            );
+
+            m.node_overrides.borrow_mut().remove(&1);
+            m.recovery_dispatch_tick_under(crate::recovery::RecoveryGateMode::FencedOnly)
+                .await;
+            assert_eq!(
+                m.extent_inflight_op(20),
+                None,
+                "one tick after the unfence the marker must be gone — the loop \
+                 has to REACH the release, not merely contain it"
+            );
+            let lim = m.recovery_limiter.borrow();
+            assert_eq!(lim.global_inflight, 0);
+            assert_eq!(lim.snapshot(), (vec![], vec![]));
         });
     }
 

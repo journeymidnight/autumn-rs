@@ -965,6 +965,28 @@ Two invariants make this safe rather than merely present:
 rather than a bare `None`, so the two refusals reach the client as distinct
 codes and each self-heals differently.
 
+**A BULK read's refusal carries the same status its plain twin does.** The bulk
+arm used to answer every `get_extent` error with `bulk_read_head(CODE_ERROR,
+"extent unavailable")`, discarding both the code and the message; it now emits
+the typed error frame (`err_bytes`, preserving `(StatusCode, message)`) that
+`MSG_READ_BYTES` has always sent. A wrong-shard read is the case that made this
+load-bearing: the plain path refuses `FailedPrecondition` and NAMES the owning
+shard, which is what lets a mis-routed caller refresh and retry, while on the
+bulk path that same refusal was indistinguishable from a genuinely unavailable
+extent — so the client's refresh-and-retry became dead code for every bulk
+consumer, with the whole unit suite and a byte-for-byte e2e run green. **Never
+collapse a refusal into a generic code on one path while its sibling keeps the
+type**: the upper layer branches on the type, and the flattening is invisible
+to any test that only checks that the read failed.
+
+One consumer-visible consequence, deliberate: these refusals used to reach
+`read_value_into_pooled` as `Ok(non-OK code)` and bail straight to the copy
+path; as typed errors they enter the `Err` arm, so the read walks the remaining
+replicas before falling back. That is the right order — a refusal from ONE node
+says nothing about the others — and the fallback is unchanged. Neither
+`is_connect_failure` nor `is_liveness_timeout` matches this text, so the
+note-29 damping and the note-34 address-forgetting are untouched.
+
 **Read path** (`read_bytes_from_extent`): the start replica rotates by
 `(extent_id, offset)` hash so read IO spreads across all replicas; failover
 walks the rest in rotated order. **OPEN-tail extents rotate too** (an open
@@ -1084,6 +1106,35 @@ and from other crates' CLAUDE.md); do not renumber.
     idempotent-skip path ALSO reports done (the ADOPT case), so a completion lost
     to `df`'s at-most-once delivery converges on the next re-dispatch.
 
+    **A prior CONTENT-CORRUPT attempt is answered `CODE_CONTENT_CORRUPT` (8),
+    not by starting another encoder.** The pre-encode content check exists to
+    refuse a rotted source, but the refusal alone is not enough: the extent's own
+    ConvertToEc marker is what keeps replica recovery away from it, so a
+    coordinator that simply kept re-encoding held the extent in a deadlock —
+    both repairs blocked, exiting only via the manager's 24-failure give-up.
+    `ec_last_error` records `EcConvertError::ContentCorrupt` for the attempt
+    nonce; the next dispatch of that SAME nonce answers code 8 instead of `OK`
+    and starts nothing, which the manager reads as "release the marker so
+    recovery can repair the source". This is the one failure class that gets a
+    typed refusal rather than a retry: peers, disks and timeouts can improve on
+    the next attempt and corrupted bytes cannot. A NEW nonce re-reads the
+    content, so the conversion resumes on its own once the source is rebuilt —
+    the refusal parks the attempt, it does not disable EC on the extent.
+
+    **The refusal also REPORTS the rot** (`note_scrub_rot`, the same `df`
+    channel the scrub uses, on both the failed check and every refusal built
+    from it). Releasing the marker is necessary but not sufficient: under the
+    default gate the manager rebuilds a slot only once something has MARKED it
+    corrupt, so without a report the extent sits dark-but-unmarked and waits for
+    the scrub to rediscover the same bytes on its own paced pass, while the
+    policy re-proposes EC and each attempt re-reads the whole extent to refuse
+    again. This node just read its own sealed bytes and they did not match what
+    was hashed at seal — that is the scrub's evidence found by a different
+    reader, and the node is the only party that has it. It is re-queued on each
+    refusal because the manager DROPS a finding for an extent with a
+    stream-layer op in flight, and the refusal is what releases that op, so the
+    copy queued on the way out is the first one that can be acted on.
+
     **Attempt identity (`attempt_nonce`) rides the whole conversion.** The
     manager stamps each attempt with the etcd revision that created its marker;
     it flows `ConvertToEcReq` → `WriteShardReq` → `EcConvertDone`. Two EN-side
@@ -1129,7 +1180,8 @@ and from other crates' CLAUDE.md); do not renumber.
 
 25a. **ENOSPC: disk health is a 3-state machine (`DiskHealth`: Online / Full / Faulted), the batched-append pwritev MUST be the `_all` form, and caller-ack ⊆ contiguous commit.**
     - **Every local file write MUST be a `*_all` form (or verify the count).** `build_append_future`'s batch path uses `write_vectored_all_at` (loops until done or a real error). POSIX pwritev on a nearly-full disk writes what fits and returns a SHORT count — `Ok(n)` from a raw positional write is NOT success; a partial append fsynced+ACKED reads its unwritten reserved tail back as zeros.
-    - **Classification.** `mark_disk_error_for_extent(id, msg)` at every write/persist error site, through `classify_disk_error` → `Capacity | Process | Media`. **`Process`** (EMFILE/ENFILE/ENOMEM) touches disk health NOT AT ALL: the write failed and the caller already rejected it fail-closed, but the device is fine, and condemning it costs a full-disk migration now that the manager rebuilds a faulted disk's replicas. Reachable, not hypothetical — `write_meta_locked` opens a temp file and returns `open meta tmp for extent N: Too many open files (os error 24)` straight into this. ENOSPC/EDQUOT ⇒ `Full`: the disk stops hosting NEW extents (`choose_disk` requires `allocatable()`) but keeps serving reads + existing extents, and the per-shard 2 s sweep SELF-HEALS it to Online once free ≥ 5%. Anything else ⇒ `Faulted` (permanent until restart). Manager: `select_nodes` soft-avoids nodes below `--min-alloc-free-bytes` (default 256 MiB, 0=off) with the note-17 fallback chain intact.
+    - **Classification.** `mark_disk_error_for_extent(id, msg)` at every write/persist error site, through `classify_disk_error` → `Capacity | Process | Media`. **`Process`** (EMFILE/ENFILE/ENOMEM) touches disk health NOT AT ALL: the write failed and the caller already rejected it fail-closed, but the device is fine, and condemning it costs a full-disk migration now that the manager rebuilds a faulted disk's replicas. Reachable, not hypothetical — `write_meta_locked` opens a temp file and returns `open meta tmp for extent N: Too many open files (os error 24)` straight into this. ENOSPC/EDQUOT ⇒ `Full`: the disk stops hosting NEW extents (`choose_disk` requires `allocatable()`) but keeps serving reads + existing extents, and the per-shard 2 s sweep SELF-HEALS it to Online once free ≥ 5%. Anything else is `Media` — a claim about the DEVICE, and the only class that can reach `Faulted` (permanent until restart). Manager: `select_nodes` soft-avoids nodes below `--min-alloc-free-bytes` (default 256 MiB, 0=off) with the note-17 fallback chain intact.
+    - **`Media` is a SUSPICION until a self-check confirms it** (`DiskFS::probe_write`): one small write + fsync into the failing extent's own hash directory, and only a FAILED probe sets `Faulted`. The verdict used to be the failing operation's own errno, which was right while its cost was local and reversible ("stop allocating here") and became wrong the moment a faulted disk triggers a cluster-wide migration of everything on it: a single transient EIO, or an ENOENT from a `.tmp` swept out from under a meta write, condemned a healthy multi-TB disk permanently. A probe that PASSES leaves the health alone and the caller's operation still fails — the write that failed is not retried here, only the accusation is dropped. It probes the hash directory rather than the disk root because that is where the failure happened, and it unlinks the scratch file before writing it, so no extent payload is touched and a crash leaves nothing behind. The whole probe — open, unlink, write, file fsync, directory fsync — is bounded at 2 s, and a timeout COUNTS AS A FAULT: a device that cannot answer in two seconds is exactly the case this is for, and an unbounded probe would park the caller's error handling behind a hung disk. There is no probe on the `Capacity` or `Process` paths: neither is a claim about the device, so neither has anything to confirm.
     - **Health is SHARED per physical dir across shards** — `DiskFS.health` is an `Arc<AtomicU8>` from the process-global `shared_disk_health(base_dir)` registry (canonical-path keyed), so shard B can't keep allocating onto a disk shard A marked Full.
     - **Caller-ack ⊆ contiguous commit (the seal-chop hole).** `apply_completion` fires the caller's oneshot Ok only as the contiguous prefix advances — NOT the moment a batch completes on all replicas when a LOWER lease on the same extent already failed (the mid-pipeline hole ENOSPC produces). Otherwise the writer's `commit` stays below the hole (correct) while the roll's SealCommit CHOPS an already-acked range. On poison, `failure_floor` = first failed offset; every pending/late completion at/above it resolves Err (its replica bytes become benign un-acked duplicates). **Invariant: a caller-visible append ack implies the range is inside the contiguous all-replica-acked prefix.**
 
@@ -1381,6 +1433,14 @@ RPCs use hand-coded binary encoding; control-plane RPCs use rkyv zero-copy.
 
 AllocExtent(4), Df(5), RequireRecovery(6), ReAvali(7), CopyExtent(8),
 ConvertToEc(9), WriteShard(10), DeleteExtent(11), ReconcileExtents(0x31).
+
+**Response codes are append-only and every one of them must be NAMED.**
+`CODE_CONTENT_CORRUPT = 8` (added at `WIRE_VERSION` 42) says an EC source failed
+its stored checksum — the attempt has ended and its marker should be released
+for repair, which no other code says. Adding one is a wire event
+(`MIN == MAX`, stop-the-world), and `code_description` must learn it in the same
+change: an unnamed code renders as one generic word, which is how a stale-fence
+rejection and a corrupt-content refusal become the same useless log line.
 
 **`MSG_FENCE_EXTENT` (17) — eager owner_epoch fence, no append.** `handle_fence_
 extent` raises the per-extent `owner_epoch` fence floor to `req.owner_epoch`
