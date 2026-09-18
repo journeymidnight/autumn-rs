@@ -1717,14 +1717,6 @@ pub struct ExtentNode {
     manager_endpoint: Option<String>,
     /// ConnPool for manager RPC calls (nodes_info, extent_info, etc.)
     manager_pool: Rc<crate::ConnPool>,
-    /// per-downstream-addr chain forwarder queues. The conn loop
-    /// enqueues forwards UNBOUNDED (non-blocking — a blocking submit here
-    /// stalled the whole handle_connection loop under 8M backlog, v1 bug);
-    /// each addr's forwarder task drains sequentially, preserving
-    /// per-extent forward order (global per-addr order ⊇ per-extent order),
-    /// and hands the response receiver back through the job's oneshot so
-    /// downstream RTTs still overlap.
-    chain_fwd: Rc<RefCell<HashMap<String, futures::channel::mpsc::Sender<ChainFwdJob>>>>,
     /// Shared across every shard of this process — see `DoneQueues`.
     done: DoneQueues,
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
@@ -1842,7 +1834,6 @@ impl Clone for ExtentNode {
             metrics_gauges: self.metrics_gauges.clone(),
             manager_endpoint: self.manager_endpoint.clone(),
             manager_pool: self.manager_pool.clone(),
-            chain_fwd: self.chain_fwd.clone(),
             done: self.done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             ec_convert_inflight: self.ec_convert_inflight.clone(),
@@ -2226,71 +2217,6 @@ fn spawn_read(
 /// Back-pressure: if `inflight.len()` reaches `cap` mid-push, we await one
 /// completion before pushing more. Completions drained during back-pressure
 /// go into `tx_bufs` and are flushed by the caller after this returns.
-/// one queued chain forward — `parts` is the full MSG_APPEND_CHAIN
-/// request (prefix + AppendReq header + payload, all Bytes refs); the
-/// forwarder sends `Ok(receiver)` (or the submit error) back through
-/// `rx_back` so the chain future can await the downstream ack itself.
-/// downstream failure classification — semantic codes pass through
-/// to the writer (fencing/alloc reactions), transport faults stay generic.
-enum ChainFail {
-    Code(u8),
-    Msg(String),
-}
-
-struct ChainFwdJob {
-    parts: Vec<Bytes>,
-    rx_back: futures::channel::oneshot::Sender<Result<crate::conn_pool::PinnedRecv>>,
-}
-
-impl ExtentNode {
-    /// enqueue a chain forward to `addr` — non-blocking, in caller
-    /// order. Lazily spawns the per-addr forwarder task on this shard's
-    /// runtime (lives for the process; one per peer shard addr, ~dozens).
-    fn chain_forward_enqueue(
-        &self,
-        addr: &str,
-        parts: Vec<Bytes>,
-    ) -> futures::channel::oneshot::Receiver<Result<crate::conn_pool::PinnedRecv>> {
-        let (rx_back_tx, rx_back) = futures::channel::oneshot::channel();
-        let job = ChainFwdJob {
-            parts,
-            rx_back: rx_back_tx,
-        };
-        let mut map = self.chain_fwd.borrow_mut();
-        let tx = map.entry(addr.to_string()).or_insert_with(|| {
-            // coco P2: BOUNDED — each job pins a large payload Bytes;
-            // a slow/dead downstream must backpressure (fail fast) instead
-            // of accumulating unbounded memory. 32 jobs ≈ 256MB of 8M refs.
-            let (tx, mut rx) = futures::channel::mpsc::channel::<ChainFwdJob>(32);
-            let pool = self.manager_pool.clone();
-            let addr = addr.to_string();
-            compio::runtime::spawn(async move {
-                use futures::StreamExt;
-                while let Some(job) = rx.next().await {
-                    let res = pool.send_vectored(&addr, MSG_APPEND_CHAIN, job.parts).await;
-                    let _ = job.rx_back.send(res);
-                }
-            })
-            .detach();
-            tx
-        });
-        if let Err(e) = tx.try_send(job) {
-            // Queue full / forwarder gone: surface as an immediate chain
-            // failure (client retries; no conn-loop stall, no unbounded pin).
-            let job = e.into_inner();
-            let _ = job
-                .rx_back
-                .send(Err(anyhow::anyhow!("chain forward queue saturated")));
-        }
-        rx_back
-    }
-}
-
-/// bound for awaiting the downstream hop's ack in a chained append.
-/// Generous — covers a tail hop's pwrite + coalesced fsync under load; the
-/// writer-side append timeout (scaled by chain depth) is the outer bound.
-const CHAIN_FORWARD_TIMEOUT: Duration = Duration::from_secs(30);
-
 async fn process_frames_backpressured(
     node: &ExtentNode,
     decoder: &mut FrameDecoder,
@@ -2421,136 +2347,6 @@ async fn process_frames_backpressured(
                     }
                 }
                 out
-            }));
-        } else if msg_type == MSG_APPEND_CHAIN {
-            // chained append. One frame, one future (no same-extent
-            // grouping: chained payloads are >= 64 KiB, pwritev coalescing
-            // buys nothing). ORDERING INVARIANT: the downstream forward is
-            // SUBMITTED here, synchronously, in frame-arrival order — this
-            // socket's arrival order is the writer's lease order, and the
-            // downstream RpcClient's single writer_task preserves submit
-            // order, so every hop sees per-extent appends in lease order
-            // (same argument as the client's star fanout).
-            let req_id = frames[i].req_id;
-            i += 1;
-            let (chain, append_bytes) = match decode_chain_prefix(frames[i - 1].payload.clone()) {
-                Ok(v) => v,
-                Err(e) => {
-                    let bytes = err_bytes(req_id, MSG_APPEND_CHAIN, StatusCode::InvalidArgument, e);
-                    inflight.push(Box::pin(async move { vec![bytes] }));
-                    continue;
-                }
-            };
-            let req = match AppendReq::decode(append_bytes.clone()) {
-                Ok(r) => r,
-                Err(e) => {
-                    let bytes = err_bytes(req_id, MSG_APPEND_CHAIN, StatusCode::InvalidArgument, e);
-                    inflight.push(Box::pin(async move { vec![bytes] }));
-                    continue;
-                }
-            };
-            let extent = match node.get_extent(req.extent_id).await {
-                Ok(e) => e,
-                Err((code, msg)) => {
-                    let bytes = err_bytes(req_id, MSG_APPEND_CHAIN, code, &msg);
-                    inflight.push(Box::pin(async move { vec![bytes] }));
-                    continue;
-                }
-            };
-            backpressure!();
-
-            // Forward submit FIRST (synchronous, ordering) — then build the
-            // local append (which reserves extent.len synchronously too).
-            let fwd_rx = if chain.is_empty() {
-                None
-            } else {
-                let prefix = encode_chain_prefix(&chain[1..]);
-                // Non-blocking ordered enqueue — see chain_forward_enqueue.
-                Some(node.chain_forward_enqueue(&chain[0], vec![prefix, append_bytes.clone()]))
-            };
-            // [owner-model] the LOCAL append goes through the owner (serial
-            // writer); the downstream forward stays here on the conn task and is
-            // joined below, exactly as before.
-            let (local_tx, local_rx) = futures::channel::oneshot::channel::<Bytes>();
-            send_to_owner(
-                &node,
-                &extent,
-                ExtentMsg::Append {
-                    req,
-                    req_id,
-                    resp: local_tx,
-                },
-            );
-            inflight.push(Box::pin(async move {
-                let local_bytes = vec![match local_rx.await {
-                    Ok(f) => f,
-                    Err(_) => err_bytes(
-                        req_id,
-                        MSG_APPEND,
-                        StatusCode::Internal,
-                        "owner dropped append response",
-                    ),
-                }];
-                let fwd_ok: Result<(), ChainFail> = match fwd_rx {
-                    None => Ok(()),
-                    Some(rx_back) => match rx_back.await {
-                        Err(_) => Err(ChainFail::Msg("chain forwarder gone".to_string())),
-                        Ok(Err(e)) => Err(ChainFail::Msg(format!("chain forward submit: {e}"))),
-                        Ok(Ok(rx)) => {
-                            // Bound the downstream wait — a wedged hop must not
-                            // pin this future forever (client times out anyway).
-                            match compio::time::timeout(CHAIN_FORWARD_TIMEOUT, rx).await {
-                                Err(_) => Err(ChainFail::Msg("chain forward timeout".to_string())),
-                                Ok(Err(_)) => {
-                                    Err(ChainFail::Msg("chain forward conn closed".to_string()))
-                                }
-                                Ok(Ok(frame)) => {
-                                    if frame.is_error() {
-                                        Err(ChainFail::Msg("chain downstream error".to_string()))
-                                    } else {
-                                        match AppendResp::decode(frame.payload.clone()) {
-                                            Ok(r) if r.code == CODE_OK => Ok(()),
-                                            // coco P1: PRESERVE the downstream
-                                            // code (LockedByOther must reach the
-                                            // writer for self-eviction; NotFound
-                                            // drives alloc-new-extent) — surfaced
-                                            // below as a normal AppendResp with the
-                                            // downstream code, not a generic error.
-                                            Ok(r) => Err(ChainFail::Code(r.code)),
-                                            Err(e) => Err(ChainFail::Msg(format!(
-                                                "chain downstream decode: {e}"
-                                            ))),
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    },
-                };
-                match fwd_ok {
-                    // Both local + downstream OK → the local response frame
-                    // (success or its own error) is the chain's answer.
-                    Ok(()) => local_bytes,
-                    // Downstream returned a SEMANTIC code: pass it through as
-                    // a normal AppendResp so apply_completion's
-                    // LockedByOther / NotFound arms fire (coco P1).
-                    Err(ChainFail::Code(code)) => {
-                        let resp = AppendResp {
-                            code,
-                            offset: 0,
-                            end: 0,
-                        };
-                        vec![Frame::response(req_id, MSG_APPEND_CHAIN, resp.encode()).encode()]
-                    }
-                    Err(ChainFail::Msg(msg)) => {
-                        vec![err_bytes(
-                            req_id,
-                            MSG_APPEND_CHAIN,
-                            StatusCode::Unavailable,
-                            &format!("chain append failed downstream: {msg}"),
-                        )]
-                    }
-                }
             }));
         } else if msg_type == MSG_READ_BYTES {
             let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
@@ -3933,7 +3729,6 @@ impl ExtentNode {
             metrics_gauges,
             manager_endpoint: config.manager_endpoint,
             manager_pool: Rc::new(crate::ConnPool::new()),
-            chain_fwd: Rc::new(RefCell::new(HashMap::new())),
             done,
             recovery_inflight: Rc::new(DashMap::new()),
             ec_convert_inflight: Rc::new(DashMap::new()),

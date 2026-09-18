@@ -324,19 +324,6 @@ owner's mailbox before the first response, allowing the next durable burst to
 coalesce them. A regression holds the mailbox busy and requires a later append to
 arrive; restoring the single-inflight pause fails it.
 
-### Chained append (MSG_APPEND_CHAIN, default OFF)
-
-Large appends (>= `set_append_chain_min_bytes`, 0=off=default) ship ONE wire
-copy to replica[0], which pipelines down the chain; the single ack means every
-hop wrote (all-replica-ACK preserved; per-hop fencing/commit-truncation
-unchanged). EN keeps a per-downstream-addr forwarder task; the conn loop
-enqueues forwards UNBOUNDED in arrival order (a blocking submit there would
-stall the whole `handle_connection` under backlog), the forwarder submits
-sequentially (per-extent order ⊆ per-addr order) and hands back the response
-receiver so downstream RTTs overlap. LIMITATION: per-append store-and-forward
-stacks hop latencies; the win (writer egress 3x→1x) only exists where the
-writer NIC is the bottleneck (cross-host). Keep OFF on loopback.
-
 ### Per-extent owner (write path) — appends serialized by one task
 
 All appends to an extent are MESSAGES (`ExtentMsg::Append`) to a single
@@ -811,6 +798,30 @@ StreamClient::connect(manager_endpoint, owner_key, max_extent_size, pool)
   `Weak<StreamClient>` for the exit-removal guard without an Rc cycle. Public
   API methods take `&self`.
 
+### Replication is star-only
+
+The writer sends every replica its own copy. Chained replication —
+one copy to replica[0], forwarded hop to hop, one aggregated ack — was
+implemented and removed. It is worth knowing why, because the bandwidth
+argument for it (writer egress RF× → 1×) is real and will be proposed again.
+
+Its ack carries one status for the whole chain, and that is the problem: the
+completion has ONE frame where star replication has one per replica, so there
+is no index that says WHICH hop failed. `apply_completion` resolves the faulty
+replica by that index, so every downstream failure resolved to index 0 and
+blamed the HEAD — `mark_bad_node` plus a disk-failure report filed against a
+healthy node, while the node that actually failed stayed eligible. Measured
+throughput did not pay for that, and it was default-off and untested for its
+whole life. Restoring it means designing the failure attribution FIRST — a
+per-hop status in the ack — not the fast path.
+
+The error-frame guard in `apply_completion` is NOT part of this and must not be
+removed with it: an error payload is `[status_code][message]`, and
+`StatusCode::Unavailable` and `CODE_LOCKED_BY_OTHER` are both 5, so decoding one
+as an `AppendResp` reads a transport fault as a fencing event and poisons the
+partition. The EN still emits `Unavailable` on plain `MSG_APPEND` (seal not
+durable, manager unreachable). Chaining is only where it was first observed.
+
 ### Append data flow (public API drives retry)
 
 `launch_append` creates one `PreparedPayload` including the AppendReq header for
@@ -828,9 +839,7 @@ site is the wrong shape twice over: it cannot be measured where it is written,
 and it forces a second construction path for bytes that are identical.
 
 The other size threshold on this path is the RPC writer's zerocopy opt-in
-(`--tcp-zerocopy-min-bytes`, off by default), one layer down. Chained
-replication is a separate path and still sends vectored: its frame carries a
-chain prefix and goes to one replica, so there is no second scan to save.
+(`--tcp-zerocopy-min-bytes`, off by default), one layer down.
 A pooled ctrl receive candidate was tested and withdrawn
 for lack of stable CPU/throughput gain; see "Append receive" for what the EN
 receive does instead.
@@ -1232,7 +1241,6 @@ and from other crates' CLAUDE.md); do not renumber.
 
 28. **The append deadline is SIZE-SCALED, and a roll-away that sealed its tail EMPTY reclaims the abandoned extent.** A fixed 5 s `append_fanout_timeout` (sized for 4 KiB WAL) applied to a 256 MiB SST flush append times out while every EN durably wrote the bytes; those bytes are correctly EXCLUDED from `state.commit`, so the retry seals the tail at commit 0 and rolls, rewriting the same SST → a permanently unreclaimable `sealed_length=0` extent per iteration (invisible to all logical accounting, GC, and orphan-reconcile) → disk fill → death spiral.
     - **FIX #1 — size-scaled deadline** (`effective_append_timeout`): `deadline = min(append_fanout_timeout + payload_len / append_floor_bytes_per_sec, 600 s cap)`; threaded into `launch_append` as `AppendDeadline::for_payload`. `append_fanout_timeout` (clamped [200 ms, 60 s]) is the BASE; floor default 8 MiB/s — ~1.5 orders below measured healthy bulk, so it distinguishes "dead replica" from "slow but progressing" (4 KiB→5 s, 8 MiB→6 s, 256 MiB→37 s, 512 MiB→69 s). The 600 s cap preserves the note-17 dead-replica bound (every `InflightFut` still resolves → SealCommit drain can't hang). Tunable `with_append_floor_bytes_per_sec` [64 KiB/s, 1 GiB/s]. **Invariant: never apply a fixed deadline to an append path whose payload can span 4 KiB–512 MiB; derive from size.**
-    - **The cap MUST be applied AFTER the chain hop-multiplier.** `AppendDeadline::for_chain = (for_payload(n) × hops × 3).min(EFFECTIVE_APPEND_TIMEOUT_CAP)`. Clamping inside `for_payload` then multiplying blows past the cap (RF=3 ⇒ 600 s × 9 = 90 min), destroying boundedness — every `InflightFut` must resolve within the cap or the SealCommit handshake can hang.
     - **FIX #2 — abandoned-tail reclaim** (`reclaim_abandoned_empty_tail`, from `alloc_new_extent` after a successful roll): when a failure-roll sealed its old tail at commit **0** (`seal_commit == Some(0)`, `seal_extent_id != 0`, and the manager did NOT hand that extent back as current tail — the idempotent-no-op branch), re-fetch the authoritative post-seal `ExtentInfo` (cache invalidated) and, ONLY if `sealed == true && sealed_length == 0`, best-effort `punch_holes` it out of the stream. SAFE because caller-ack ⊆ contiguous commit (note 25a): a sealed-AT-0 extent has NO acked byte ⇒ no VP/SST/checkpoint references it. **NEVER "fix" the leak by counting timed-out bytes as committed (silent-loss trap, notes 20/22/25a); never punch anything not authoritatively sealed-empty.** Residual (punch/extent_info failure on unreachable manager still leaks one extent) → backstop: a sealed-empty sweep. Cross-ref notes 17, 20, 22; manager note 32a.
 
 29. **Reads use the same size-scaled deadline (`IoDeadline`, generalized from `AppendDeadline`).** A fixed 3 s (5 s on EC) applied to an 8 MiB transfer stormed under load. `IoDeadline` (`effective_io_timeout`, `IO_TIMEOUT_CAP`) is shared; READS use a SEPARATE (base, floor): `read_base_timeout` 3 s (every read < ~4 MiB is byte-identical to before) and `read_floor_bytes_per_sec` 4 MiB/s (looser than the 8 MiB/s append floor — a read is one replica's pread+transfer, no RF=3 fsync barrier). 8 MiB read → 5 s; 256 MiB chunk → 67 s < the 600 s cap (the cap is never binding for reads because every read RPC is chunk-bounded ≤ `read_chunk_bytes`; do NOT lower the cap below 67 s). Applied at all FIVE size-varying read sites (`read_extent_value_direct`, `read_value_into_pooled`, `read_shard_chunk_from_addr`, `ec_reconstruct_shard_subrange`, `ec_read_full`). **Retry damping on LIVENESS TIMEOUT** (`is_liveness_timeout`): the direct + bulk-proxy paths stop walking replicas after 2 timeouts and fall through to the authoritative proxy/copy path; FAST errors (eversion / GC'd / connect-refusal) keep the full rotation. **INVARIANT: any size-varying network I/O MUST derive its deadline from `IoDeadline::for_len(len)`, NEVER a fixed `Duration::from_secs(N)`.** Control-plane RPCs (commit_length, probe, stream/extent_info, alloc, punch, owner-lock) are fixed-size → a constant is correct there. Cross-ref note 28.

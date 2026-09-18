@@ -75,21 +75,11 @@ pub const MSG_PROBE_EXTENT: u8 = 14;
 /// MSG_READ_BYTES for EC / chunked / TCP.
 pub const MSG_READ_BYTES_BULK: u8 = 15;
 
-/// chained append (large-payload replication pipeline). Payload:
-///
-/// ```text
-/// [n_chain: u8][ per hop: addr_len u16 LE + addr utf8 ]...[AppendReq bytes]
-/// ```
-///
-/// The receiving EN (1) decodes the chain prefix, (2) SUBMITS the forward of
-/// `[chain minus itself][same AppendReq]` to `chain[0]` synchronously in
-/// frame-arrival order (per-extent ordering: arrival order on this socket =
-/// the writer's lease order, and the forward submit inherits it), (3) runs
-/// the local append, (4) acks only when BOTH the local write and the
-/// downstream ack succeed. `n_chain == 0` behaves exactly like MSG_APPEND.
-/// Every hop validates its own owner_epoch / eversion / commit as usual —
-/// fencing and commit-truncation are per-replica invariants, unchanged.
-pub const MSG_APPEND_CHAIN: u8 = 16;
+// 16 = MSG_APPEND_CHAIN — retired with chained replication. Its ack carried
+//      ONE status for every hop, so the writer could not tell which replica
+//      failed and blamed the head; see "Replication is star-only" in the
+//      stream crate's guide before proposing anything of this shape again.
+//      The number stays reserved — msg_type values are append-only.
 
 /// fence an extent WITHOUT appending: raise the EN's per-extent
 /// `owner_epoch` fence floor to `req.owner_epoch` (durably, across replicas).
@@ -110,45 +100,6 @@ pub const MSG_APPEND_CHAIN: u8 = 16;
 /// so the handler deliberately does NOT special-case-reject sealed.
 pub const MSG_FENCE_EXTENT: u8 = 17;
 
-/// encode the chain prefix (`[n][len+addr]...`) for MSG_APPEND_CHAIN.
-/// The full request is `[prefix][AppendReq::encode_header()][payload...]` —
-/// senders use vectored writes so the payload stays zero-copy.
-pub fn encode_chain_prefix(chain: &[String]) -> Bytes {
-    let mut buf = BytesMut::with_capacity(1 + chain.iter().map(|a| 2 + a.len()).sum::<usize>());
-    buf.put_u8(chain.len() as u8);
-    for a in chain {
-        buf.put_u16_le(a.len() as u16);
-        buf.extend_from_slice(a.as_bytes());
-    }
-    buf.freeze()
-}
-
-/// split a MSG_APPEND_CHAIN payload into `(chain, AppendReq bytes)`.
-/// The AppendReq remainder is returned as Bytes (zero-copy slice) so the
-/// forward path can re-send it without re-encoding.
-pub fn decode_chain_prefix(mut data: Bytes) -> Result<(Vec<String>, Bytes), &'static str> {
-    if data.is_empty() {
-        return Err("chain append too short");
-    }
-    let n = data.get_u8() as usize;
-    let mut chain = Vec::with_capacity(n);
-    for _ in 0..n {
-        if data.len() < 2 {
-            return Err("chain addr truncated");
-        }
-        let l = data.get_u16_le() as usize;
-        if data.len() < l {
-            return Err("chain addr truncated");
-        }
-        let addr = data.split_to(l);
-        chain.push(
-            std::str::from_utf8(&addr)
-                .map_err(|_| "chain addr not utf8")?
-                .to_string(),
-        );
-    }
-    Ok((chain, data))
-}
 // MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
 
 // ── Append (hot path) ────────────────────────────────────────────────────────
@@ -1424,45 +1375,36 @@ mod tests {
 }
 
 #[cfg(test)]
-mod chain_codec_tests {
+mod extent_rpc_codec_tests {
     use super::*;
 
+    /// The append header is hand-written binary on the durability hot path, and
+    /// `encode_header` (what the replica send site actually uses) must lay out
+    /// the same 32 bytes as the whole-request `encode`. Its only other coverage
+    /// is integration tests that would blame the network for a layout bug.
     #[test]
-    fn chain_prefix_round_trips() {
-        let chain = vec!["127.0.0.1:20002".to_string(), "[::1]:20003".to_string()];
+    fn append_req_round_trips_and_the_header_matches_the_full_encoding() {
         let req = AppendReq {
-            extent_id: 7,
+            extent_id: u64::MAX,
             eversion: 3,
-            commit: 4096,
-            owner_epoch: 9,
-            payload: Bytes::from_static(b"hello-world"),
+            commit: 5 * 1024 * 1024 * 1024, // past 4 GiB: the u64 widening
+            owner_epoch: -1,
+            payload: Bytes::from_static(b"durable bytes"),
         };
-        let mut full = BytesMut::new();
-        full.extend_from_slice(&encode_chain_prefix(&chain));
-        full.extend_from_slice(&req.encode());
-        let (got_chain, rest) = decode_chain_prefix(full.freeze()).unwrap();
-        assert_eq!(got_chain, chain);
-        let got = AppendReq::decode(rest).unwrap();
-        assert_eq!(got.extent_id, 7);
-        assert_eq!(got.commit, 4096);
-        assert_eq!(&got.payload[..], b"hello-world");
-    }
-
-    #[test]
-    fn empty_chain_is_plain_append() {
-        let req = AppendReq {
-            extent_id: 1,
-            eversion: 1,
-            commit: 0,
-            owner_epoch: 1,
-            payload: Bytes::from_static(b"x"),
-        };
-        let mut full = BytesMut::new();
-        full.extend_from_slice(&encode_chain_prefix(&[]));
-        full.extend_from_slice(&req.encode());
-        let (chain, rest) = decode_chain_prefix(full.freeze()).unwrap();
-        assert!(chain.is_empty());
-        assert_eq!(AppendReq::decode(rest).unwrap().extent_id, 1);
+        let wire = req.encode();
+        assert_eq!(wire.len(), APPEND_HEADER_LEN + req.payload.len());
+        assert_eq!(
+            &wire[..APPEND_HEADER_LEN],
+            &AppendReq::encode_header(req.extent_id, req.eversion, req.commit, req.owner_epoch)[..],
+        );
+        let got = AppendReq::decode(wire).unwrap();
+        assert_eq!(got.extent_id, u64::MAX);
+        assert_eq!(got.eversion, 3);
+        assert_eq!(got.commit, 5 * 1024 * 1024 * 1024);
+        assert_eq!(got.owner_epoch, -1);
+        assert_eq!(&got.payload[..], b"durable bytes");
+        // A header one byte short must be refused, not read past.
+        assert!(AppendReq::decode(Bytes::from(vec![0u8; APPEND_HEADER_LEN - 1])).is_err());
     }
 
     #[test]

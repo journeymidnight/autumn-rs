@@ -250,7 +250,6 @@ PS_TUNABLES=(
     "AUTUMN_PS_GC_COOLDOWN_SECS:--gc-cooldown-secs"
     "AUTUMN_PS_COMPACT_COOLDOWN_SECS:--compact-cooldown-secs"
     "AUTUMN_READ_HEDGE_MS:--read-hedge-ms"
-    "AUTUMN_APPEND_CHAIN_MIN_BYTES:--append-chain-min-bytes"
     "AUTUMN_SST_BLOCK_CACHE_BYTES:--sst-block-cache-bytes"
     "AUTUMN_PS_GC_READ_CHUNK_BYTES:--gc-read-chunk-bytes"
     "AUTUMN_PS_GC_BATCH_RECORDS:--gc-batch-records"

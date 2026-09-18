@@ -5,12 +5,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::extent_rpc::{
-    encode_chain_prefix, AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo,
-    FenceExtentReq, FenceExtentResp, PayloadLocation, PayloadRef, ProbeExtentReq, ProbeExtentResp,
-    ReadBytesReq, ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp,
-    CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND,
-    MSG_APPEND_CHAIN, MSG_COMMIT_LENGTH, MSG_FENCE_EXTENT, MSG_PROBE_EXTENT, MSG_READ_BYTES,
-    MSG_READ_BYTES_BULK, MSG_SYNCED_LENGTH, PAYLOAD_LOCATION_IN_DAT,
+    AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, FenceExtentReq,
+    FenceExtentResp, PayloadLocation, PayloadRef, ProbeExtentReq, ProbeExtentResp, ReadBytesReq,
+    ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp, CODE_EVERSION_MISMATCH,
+    CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND, MSG_COMMIT_LENGTH,
+    MSG_FENCE_EXTENT, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_BULK, MSG_SYNCED_LENGTH,
+    PAYLOAD_LOCATION_IN_DAT,
 };
 use crate::ConnPool;
 use anyhow::{anyhow, Result};
@@ -587,25 +587,6 @@ pub fn set_read_hedge_ms(ms: u64) -> bool {
 
 pub(crate) fn read_hedge_ms() -> u64 {
     *READ_HEDGE_MS_CELL.get_or_init(|| 0)
-}
-
-/// minimum total append payload (bytes) for CHAINED replication —
-/// the writer sends ONE copy to replica[0] which pipelines to the rest
-/// (PS egress 3x -> 1x for large writes). 0 = chaining disabled (always
-/// star fanout). Default 64 KiB (the bulk_worthwhile threshold). Set once
-/// at process start (`autumn-ps --append-chain-min-bytes`).
-static APPEND_CHAIN_MIN_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-
-pub fn set_append_chain_min_bytes(n: u32) -> bool {
-    APPEND_CHAIN_MIN_CELL.set(n).is_ok()
-}
-
-pub(crate) fn append_chain_min_bytes() -> u32 {
-    // Default OFF (0): chaining trades per-append latency (store-and-
-    // forward hops stack) for writer-egress bandwidth — a win only where
-    // the writer NIC is the bottleneck (cross-host). Opt in via
-    // `autumn-ps --append-chain-min-bytes 65536`.
-    *APPEND_CHAIN_MIN_CELL.get_or_init(|| 0)
 }
 
 /// (a): deterministic start-replica rotation for sealed-extent reads.
@@ -1231,18 +1212,6 @@ impl IoDeadline {
         effective_io_timeout(self.base, self.floor_bytes_per_sec, payload_len)
     }
 
-    /// chained append: the ack traverses every hop store-and-forward, so
-    /// the budget is the per-hop (already size-scaled) deadline × hops × 3.
-    ///
-    /// coco P2: the cap is applied AFTER the multiplier. Clamping only inside
-    /// `for_len` and THEN multiplying blew past it (RF=3 ⇒ 600 s × 9 =
-    /// 90 min), breaking the boundedness the whole fix rests on — EVERY
-    /// `InflightFut` must resolve within `IO_TIMEOUT_CAP` or
-    /// `drain_inflight_for_seal` / the SealCommit handshake (note 20) can hang
-    /// for that multiplied window, stalling the roll and the whole stream.
-    pub(crate) fn for_chain(&self, payload_len: u64, hops: u32) -> Duration {
-        (self.for_len(payload_len) * hops.max(1) * 3).min(IO_TIMEOUT_CAP)
-    }
 }
 
 impl StreamClientConfig {
@@ -1392,40 +1361,6 @@ mod io_deadline_tests {
         assert!(!is_liveness_timeout(&anyhow::anyhow!(
             "eversion mismatch: cached=1 got=2"
         )));
-    }
-
-    /// coco P2 regression: the chain path multiplies the per-hop deadline by
-    /// hops×3. If the cap is applied only INSIDE `for_len` (before the
-    /// multiply), a capped 600 s becomes 90 min at RF=3 — breaking the invariant
-    /// every other part of this fix rests on: EVERY `InflightFut` resolves within
-    /// `IO_TIMEOUT_CAP`, so `drain_inflight_for_seal` / SealCommit
-    /// can never hang. The cap must come AFTER the multiply.
-    #[test]
-    fn chain_deadline_stays_capped_after_the_hop_multiplier() {
-        let cfg = StreamClientConfig::default();
-        let d = IoDeadline {
-            base: cfg.append_fanout_timeout,
-            floor_bytes_per_sec: cfg.append_floor_bytes_per_sec,
-        };
-        // A payload big enough that `for_len` itself saturates the cap.
-        let huge = 64u64 * 1024 * 1024 * 1024; // 64 GiB
-        assert_eq!(d.for_len(huge), IO_TIMEOUT_CAP);
-        for hops in [1u32, 3, 5, 16] {
-            assert!(
-                d.for_chain(huge, hops) <= IO_TIMEOUT_CAP,
-                "chain deadline must stay ≤ cap after ×{hops}×3 (was the 90-min bug)"
-            );
-        }
-        // The multiplier still WIDENS a normal 256 MiB SST (store-and-forward
-        // stacks hop latencies) — it just can't escape the cap.
-        let sst = 256u64 * 1024 * 1024;
-        let per_hop = d.for_len(sst);
-        let chain = d.for_chain(sst, 3);
-        assert!(
-            chain > per_hop,
-            "chain budget must exceed the per-hop budget"
-        );
-        assert!(chain <= IO_TIMEOUT_CAP);
     }
 
     #[test]
@@ -1931,6 +1866,18 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
         ack_tx,
     } = result;
 
+    // Bad-replica attribution below resolves a node by the frame's INDEX, so
+    // these two must stay parallel. Star replication makes that structural —
+    // one frame per `replica_addrs` entry, failures included — and the one
+    // shape that broke it (a chained ack carrying one status for every hop)
+    // is gone. Stated as an assertion because the cost of it silently
+    // drifting again is blaming a healthy node for another's failure.
+    debug_assert_eq!(
+        frames.len(),
+        replica_node_ids.len(),
+        "append completion must carry one frame per replica",
+    );
+
     // A completion must describe the extent the state is on. This is a real,
     // reachable backstop — not an unreachable invariant, and not the fix.
     //
@@ -1996,14 +1943,14 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
                 break;
             }
             Ok(frame) => {
-                // chaos root-cause (coco arch P1): NEVER decode an
-                // ERROR frame's payload as AppendResp — error payloads are
-                // [status_code][message], and StatusCode::Unavailable (5)
-                // collides with CODE_LOCKED_BY_OTHER (5), so a generic
-                // chain/transport error frame masqueraded as a fencing
-                // event and POISONED the partition (the observed PS wedge
-                // when a mid-chain EN died). Route error frames through
-                // the soft-error path instead.
+                // NEVER decode an ERROR frame's payload as AppendResp — error
+                // payloads are [status_code][message], and
+                // StatusCode::Unavailable (5) collides with
+                // CODE_LOCKED_BY_OTHER (5), so a transport error
+                // masquerades as a fencing event and POISONS the partition.
+                // That is not hypothetical: it wedged a PS when the EN behind
+                // a dying replica answered with an error frame. Route error
+                // frames through the soft-error path instead.
                 if frame.is_error() {
                     err_msg = Some(format!(
                         "replica {i} error frame: {}",
@@ -2166,67 +2113,6 @@ async fn launch_append(
     // future moves a Vec<u64> rather than borrowing tail across await.
     let replica_node_ids: Vec<u64> = tail.replica_node_ids.clone();
     let hdr = AppendReq::encode_header(extent_id, tail.extent.eversion, header_commit, owner_epoch);
-
-    // chained replication for large appends: ONE wire copy to
-    // replica[0], which forwards down the chain (extent_node.rs
-    // MSG_APPEND_CHAIN). The single ack means EVERY hop wrote (the tail
-    // acks first, aggregated hop by hop) — all-replica-ACK semantics
-    // unchanged, so `state.commit` stays ground truth. Submit happens
-    // HERE, synchronously, so per-extent submit order = lease order on
-    // the head replica's socket (the head preserves it down the chain).
-    // Any hop failure surfaces as one error frame -> apply_completion's
-    // existing soft-error / seal-and-roll path. Timeout scales by chain
-    // depth (the ack traverses every hop).
-    let chain_min = append_chain_min_bytes();
-    if chain_min > 0 && size >= chain_min as u64 && tail.replica_addrs.len() >= 2 {
-        let head_addr = tail.replica_addrs[0].clone();
-        let chain: Vec<String> = tail.replica_addrs[1..].to_vec();
-        let mut parts = Vec::with_capacity(2 + payload_parts.len());
-        parts.push(encode_chain_prefix(&chain));
-        parts.push(hdr);
-        for seg in &payload_parts {
-            parts.push(seg.clone());
-        }
-        let rx_res = pool
-            .send_vectored(&head_addr, MSG_APPEND_CHAIN, parts)
-            .await;
-        // Chained acks traverse every hop with store-and-forward latency —
-        // budget generously (validated: deep 8M queues stack hop latencies).
-        // BUG-FLUSH-TIMEOUT-LEAK: the per-hop budget is already size-scaled.
-        //
-        // coco P2: the cap is applied AFTER the hop multiplier (see `for_chain`).
-        let chain_timeout = append_deadline.for_chain(size, tail.replica_addrs.len() as u32);
-        let fut = async move {
-            let res = match rx_res {
-                Err(e) => Err(anyhow!("{} chain submit error: {}", head_addr, e)),
-                Ok(rx) => {
-                    let timer = compio::time::sleep(chain_timeout);
-                    futures::pin_mut!(rx, timer);
-                    match futures::future::select(rx, timer).await {
-                        futures::future::Either::Left((Ok(frame), _)) => Ok(frame),
-                        futures::future::Either::Left((Err(_), _)) => {
-                            Err(anyhow!("{} connection closed", head_addr))
-                        }
-                        futures::future::Either::Right(_) => Err(anyhow!(
-                            "{} chain append timeout after {:?}",
-                            head_addr,
-                            chain_timeout
-                        )),
-                    }
-                }
-            };
-            InflightResult {
-                offset,
-                end,
-                extent_id,
-                frames: vec![res],
-                replica_node_ids,
-                ack_tx,
-            }
-        };
-        inflight.push(Box::pin(fut));
-        return;
-    }
 
     // Fire send_prepared to each replica IN PARALLEL. Each
     // RpcClient's writer_task is single-writer (R4 step 4.1), so per-
