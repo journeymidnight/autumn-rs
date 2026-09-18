@@ -19,8 +19,7 @@ WORKDIR /build
 # Optional crates.io mirror for faster dependency downloads. Empty (default) →
 # official crates.io (unchanged for everyone else). Set CARGO_MIRROR to a full
 # registry value and it replaces crates.io — e.g. ByteDance's sparse mirror on
-# a China/Volcengine runner (use the sparse+ prefix; all deps are crates.io, no
-# git deps):
+# a China/Volcengine runner (use the sparse+ prefix):
 #   --build-arg CARGO_MIRROR=sparse+https://rsproxy.cn/index/
 # Written to $CARGO_HOME so the repo's own .cargo/config.toml is untouched, and
 # kept before `COPY . .` so it caches independently of source. Re-declared here
@@ -33,6 +32,27 @@ RUN if [ -n "$CARGO_MIRROR" ]; then \
         '[source.mirror]' \
         "registry = \"$CARGO_MIRROR\"" \
         >> "$CARGO_HOME/config.toml"; \
+    fi
+
+# One dependency is NOT on crates.io: `[patch.crates-io]` points the compio
+# family at a fork carrying the CreateSocket fd fix (see the workspace
+# Cargo.toml). Cargo therefore has to reach github.com, which the CN build pool
+# cannot do reliably — the pipeline's own source clone goes through CP's
+# service connection, but cargo's fetch does not.
+#
+# GITHUB_MIRROR rewrites github URLs for git itself, and
+# CARGO_NET_GIT_FETCH_WITH_CLI makes cargo shell out to `git` so the rewrite is
+# in force (its bundled libgit2 fetcher does not read `insteadOf`). The default
+# is the proxy already used by other pipelines in this account; set it empty to
+# go direct:
+#   --build-arg GITHUB_MIRROR=
+#
+# This whole block goes away with the patch section it exists for.
+ARG GITHUB_MIRROR=https://ghproxy.net/https://github.com/
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN if [ -n "$GITHUB_MIRROR" ]; then \
+      git config --global url."$GITHUB_MIRROR".insteadOf https://github.com/ \
+      && echo "github via $GITHUB_MIRROR"; \
     fi
 # libfuse3-dev + pkg-config are for `-p autumn-fuse`, which builds the MOUNT
 # binary (fuser 0.15 links libfuse3). autumn-server alone would not need them —
