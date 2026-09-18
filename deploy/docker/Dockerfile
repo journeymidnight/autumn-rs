@@ -112,8 +112,15 @@ RUN cargo build --release \
 # fusermount3 setuid helper, which fuser needs both to mount and to clean up a
 # stale mount after a crashed daemon.
 FROM ${BASE_REGISTRY}library/debian:bookworm-slim
+# ca-certificates: memory-mcp builds its embedder's HTTP client with
+# `cyper::Client::new()`, which constructs a TLS connector up front and reads
+# the SYSTEM root store to do it. With no roots installed that call returns
+# `No CA certificates were loaded from the system` and the process exits 2 —
+# before it ever looks at the URL, so even an in-cluster `http://` embedder
+# cannot start. An external HTTPS embedding service (what
+# `--embed-api-key-file` exists for) needs the roots for real.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends fuse3 \
+    && apt-get install -y --no-install-recommends fuse3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 # The Rust workspace sources a consumer needs to build the Python client, so it
 # can take the client and the binaries from ONE tag and never mismatch the wire
