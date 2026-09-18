@@ -940,7 +940,42 @@
     回归——双挂载 reader+writer、`echo >> f` + `tail -f` 并存且写者不被挡、
     单挂载写后读同 fd 字节一致。
   - 端到端: ComfyUI SaveVideo (mp4 + faststart) 在 autumnfs output 上成功。
-- **Status**: `passes: false` (2026-09-16) — 已定位根因到行、方案已确认，未实现。
+- **Status**: `passes: false` (2026-09-17) — 已按确认方案实现并验证，**只差 ComfyUI
+  SaveVideo 那一条端到端**（本机没有 ComfyUI，需在 comfyui-autumn pod 上跑一次原始复现
+  脚本才闭环）。已完成：`FuseLease` 拆 `writer_refs`/`reader_refs`（`mode` = 当前在
+  manager 持有的最强租约）；Open 的 READ-on-writer 零 RPC、readers-then-writer 走
+  `acquire(WRITE)` 升级、Granted 用 `entry()` 合并不丢已开读 fd；RELEASE 经
+  `bridge`/`ops` 拿到内核回传的 open flags 按角色减计数，最后一个写 fd 关闭且仍有读者时
+  先 flush 再 `release`+`acquire(READ)` 降级；`check_write_allowed` /
+  `write_lease_for` / `compute_release_action` 改看角色计数；"lease mode mismatch" 的
+  EBUSY 臂按规范删除；PyO3 `Fs.acquire/release` 同步按角色记。
+  验证：fuse lib 63（新增 dual-open/降级/revoked 不降级/faststart 全序列纯函数状态机）；
+  真集群 `fuse_lease_1` 11（新增同挂载 dual open、降级让出 writer 槽、**跨挂载只读者共存
+  且收到 WriterClosed**）、`fuse_lease_2` 6、`bug_lease_3` 4、`system_fuse_read` 5
+  （新增第二个挂载线性读看得到追加数据）、其余 fuse system 测试全过；真实挂载 e2e
+  （release 二进制 + 3 EN + fusermount3）：dual open、`ffmpeg -movflags +faststart`
+  产出可被 ffprobe 解析的 mp4、reader 活过 writer 后追加、3 MiB 往返字节一致。
+  消融两级：把 `slot.mode != req_mode` 加回去，两条集群测试变红；用带该检查重编的
+  release 守护进程跑 e2e，T1/T2/T3 全失败且日志 3 次 "lease mode mismatch"。
+  **独立评审（fable subagent）抓到一条自引入的高危洞并已修**：降级原先不看
+  flush 结果，而 `flush_inode` 在 `write_region` 前就清零了 `wb.len`，flush 失败会留下
+  `dirty=true` + 覆盖这些字节的 `meta.size`；把 writer 槽还回去之后，别的挂载拿到写者、
+  追加，本挂载后续的 periodic sync / 读 fd FLUSH/RELEASE 会把陈旧 size 盖上去（且
+  `write_lease_for` 当时按 `writer_refs` 判、stamp 成 ANON = 不围栏），再一次 grow 的
+  `clean_beyond_eof` 就会删掉对方的 extent。修法：降级增加
+  `deferred_flush_err.is_none()` 前提，flush 失败则保持写租约（等同改动前）；
+  `write_lease_for` 改回按 `mode` 判（"还持不持有写租约"与"有没有开着的写 fd"是两个
+  问题），release 成功即把 `mode` 置 READ。回归测试
+  `a_failed_last_writer_flush_keeps_the_write_lease`（杀 PS 造真实 flush 失败，断言第二
+  个 client 的 `acquire(WRITE)` 仍是 Conflict），消融去掉该前提即变红。评审的其余项
+  （ops.md 第 3 步不可执行且走的是升级路径而非降级、真实挂载没有证据表明 RELEASE 角色
+  接对了、"TTL backstop" 措辞错误、`last_writer` 用 `<=1`、`mode` 沦为只写字段、
+  绑定无降级）均已处理：ops.md 改成两个挂载点的可执行步骤，e2e 增加 T5（第二个挂载拿到
+  writer 槽 + 守护进程日志确认降级真的发生），其余按上述改正或写进 crate 指南。
+  已知自愈状态：升级路径会让本 client 同时在 manager 的 `readers` 与 `writer` 里，
+  `release` 的 writer 分支提前返回不摘 reader，留下的幽灵 reader 由
+  `inode_lease.rs` 的 `tick_reader_expiry` 按 TTL 回收（本地 `held_leases` 条目已删，
+  不再续租），空 inode 条目随后一并丢弃。
 - `passes: false`
 
 ### F-FUSE-BIG-IO-TUNING — writeback cache + splice 零拷贝，把大 IO 的 FUSE 开销压进 5%

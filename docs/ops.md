@@ -3493,3 +3493,75 @@ Status: the same phases report seven accepts each and the reuse assertions
 fail. Restore the classification afterwards. Removing the PS connection's
 shared shutdown wait independently strands the post-merge writer on the old
 frozen instance; the bounded merge-readiness assertion fails.
+## Verifying write+read dual open on a mount (faststart / atomic-save shape)
+
+One process legitimately holds a write fd and a read fd on the same file:
+ffmpeg's MP4 faststart keeps the write handle open and reopens the file
+`O_RDONLY` to move the moov atom, and Lance's writer reads the previous manifest
+while writing the new one. The mount used to refuse the second open with EBUSY
+(`Device or resource busy`), which failed every ComfyUI SaveVideo to an autumn
+mount.
+
+Check it against a live mount:
+
+```sh
+# 1. The shape itself: a read open while a write fd is held.
+python3 - /mnt/autumn <<'PY'
+import os, sys
+p = os.path.join(sys.argv[1], "dual.bin")
+fw = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fw, b"hello")
+fr = os.open(p, os.O_RDONLY)   # EBUSY before the per-role lease refcounts
+os.close(fr); os.close(fw)
+print("dual open OK")
+PY
+
+# 2. The real path it was reported from.
+ffmpeg -nostdin -y -f lavfi -i testsrc=duration=2:size=320x240:rate=10 \
+       -c:v libx264 -pix_fmt yuv420p -movflags +faststart /mnt/autumn/faststart.mp4
+ffprobe -loglevel error -show_entries format=duration /mnt/autumn/faststart.mp4
+
+# 3. A reader outliving the writer must NOT keep the inode's writer slot.
+#    The append has to come from a SECOND MOUNT: the manager's writer slot is
+#    per CLIENT, so a same-mount append is idempotent and proves nothing.
+#    Mount a second daemon first:
+#      autumn-fuse --manager 127.0.0.1:9001 --mountpoint /mnt/autumn-b &
+python3 - /mnt/autumn <<'PY' &
+import os, sys, time
+p = os.path.join(sys.argv[1], "tailf.log")
+fw = os.open(p, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+os.write(fw, b"line one\n")
+fr = os.open(p, os.O_RDONLY)   # the reader that outlives the writer
+os.close(fw)                    # last write fd closes -> downgrade
+time.sleep(20)                  # hold the read fd open
+os.close(fr)
+PY
+sleep 3
+echo "line two" >> /mnt/autumn-b/tailf.log && echo "second mount appended after downgrade OK"
+wait
+```
+
+The downgrade logs one line per inode; its absence means the writer slot was
+never handed back (or the close was not the last write fd):
+
+```sh
+grep 'lease downgrade: writer slot released' /var/log/autumn-fuse.log
+```
+
+A failed last-writer flush deliberately does NOT downgrade — the mount keeps the
+write lease so its retried size stays fence-stamped, and the slot goes back when
+the last read fd closes. That case logs `lease downgrade: release failed` only if
+the release RPC itself failed.
+
+A refusal shows up in the daemon log as `lease mode mismatch`; that string must
+never appear — grep it when a mount reports EBUSY on open:
+
+```sh
+grep 'lease mode mismatch' /var/log/autumn-fuse.log   # expect no hits
+```
+
+Cross-machine: a read-only opener on another mount is a separate lease client.
+It never blocks this mount's writer (the manager conflicts writers only with a
+different client's writer), and it receives a `WriterClosed` invalidation when
+this mount's last write fd closes — including the downgrade case, where the
+mount hands the writer slot back but keeps reading.

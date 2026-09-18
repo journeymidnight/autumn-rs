@@ -516,12 +516,13 @@ impl Fs {
                 Ok(AcquireResult::Granted(info)) => {
                     let mut held = st.held_leases.borrow_mut();
                     let e = held.entry(ino).or_insert(FuseLease {
+                        writer_refs: 0,
+                        reader_refs: 0,
                         mode: req_mode,
-                        refcount: 0,
                         lease_epoch: info.version,
                         revoked: false,
                     });
-                    e.refcount += 1;
+                    e.add_ref(req_mode);
                     e.mode = req_mode;
                     e.lease_epoch = info.version;
                     e.revoked = false;
@@ -556,17 +557,25 @@ impl Fs {
     }
 
     /// Release one `acquire` on `ino`. Refcount-aware (mirrors the FUSE dispatch
-    /// release): only the final 1→0 release fires the manager `ReleaseLease` +
-    /// drops the local entry, so balanced acquire/release nesting keeps the
-    /// write fence intact instead of dropping it on the first release.
-    fn release(&self, py: Python<'_>, ino: u64) -> PyResult<()> {
+    /// release): only the final release of the LAST role fires the manager
+    /// `ReleaseLease` + drops the local entry, so balanced acquire/release
+    /// nesting keeps the write fence intact instead of dropping it on the
+    /// first release. `mode` names which `acquire` this undoes — a file may be
+    /// held in both roles at once, as the FUSE mount's writer+reader case is.
+    #[pyo3(signature = (ino, mode="w"))]
+    fn release(&self, py: Python<'_>, ino: u64, mode: &str) -> PyResult<()> {
+        let role = match mode.chars().next() {
+            Some('w') | Some('W') => LEASE_MODE_WRITE,
+            Some('r') | Some('R') => LEASE_MODE_READ,
+            _ => return Err(PyRuntimeError::new_err(format!("bad lease mode: {mode}"))),
+        };
         fs_blocking!(self, py, (), |st| {
             // Decide under a brief borrow (dropped before any await).
             let fire = {
                 let mut held = st.held_leases.borrow_mut();
                 match held.get_mut(&ino) {
-                    Some(l) if l.refcount > 1 => {
-                        l.refcount -= 1;
+                    Some(l) if l.total_refs() > 1 => {
+                        l.drop_ref(role);
                         false
                     }
                     Some(_) => {

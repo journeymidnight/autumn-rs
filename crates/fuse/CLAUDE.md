@@ -509,6 +509,72 @@ invalidator，binding 传 None（headless，无内核页缓存驱逐）。
 - **读一致性**：靠 fresh-read + Q1 只写租约（binding 只在写时缓存，release 时
   `forget` 驱逐 inode 缓存）。
 
+### `FuseLease` 按角色计数（writer_refs / reader_refs）
+
+**同一个文件可以同时被本挂载的一个写 fd 和一个读 fd 打开**，所以 `held_leases[ino]`
+两个 refcount 分开记：`O_WRONLY`/`O_RDWR` 记 `writer_refs`，`O_RDONLY` 记
+`reader_refs`；`mode` 记的是**本挂载当前在 manager 那边持有的最强租约**。
+
+这是 ffmpeg 的 MP4 faststart 形状：`shift_data()` 写 trailer 时**保持写句柄**、再以
+`O_RDONLY` 重开同一文件搬 moov。以前每个 ino 只有一个 `mode` 槽，Open arm 的
+`slot.mode != req_mode` 把第二次 open 拒成 EBUSY（`err_to_errno` 的
+"lease mode mismatch" 臂），ComfyUI SaveVideo 保存 mp4 **必然**失败。manager 侧从来
+允许这个组合（`acquire(READ)` 无条件插 readers，只有**别的 client** 的 writer 才
+WriteConflict）——拦截完全发生在挂载侧的簿记里。
+
+- **Open**：`req=READ` 且本挂载已持租约 ⇒ 只 bump `reader_refs`，**零 RPC**（本挂载
+  自己的写路径维护缓存一致性，manager 不需要知道）；`req=WRITE` 且 `writer_refs==0`
+  （读 fd 已开、第一个写者到来）⇒ `acquire(WRITE)` **升级**（同 client 幂等，
+  granted 则更新 mode/epoch；别的 client 持写者才 Conflict）；同角色再开只 bump。
+  Granted 一律走 `entry()` 合并而不是 `insert`——upgrade 时槽里已经有读 fd 的计数，
+  覆盖会把它们忘掉，之后那些 fd 的 RELEASE 会把计数减到 0、在 fd 还开着时把租约还掉。
+- **Release**：内核在 RELEASE 回传该 fd 的 open flags（`ops.rs` 以前丢掉了），据此
+  决定减哪个角色。`writer_refs` 1→0 而 `reader_refs>0` ⇒ **降级**：先 flush，再
+  `lease::release` + `lease::acquire(READ)` 重注册为读者。不降级的话，一个活过写进程的
+  `tail -f` 会一直占着该 inode 唯一的 writer 槽，把别的挂载的写者挡在 EBUSY 外面。
+  revoked 的槽整个丢弃、**不降级**（manager 已经把 inode 给了别人，再 acquire 等于复活
+  已经不存在的状态）。
+- **⚠️ flush 失败就不降级**（`deferred_flush_err.is_none()` 是降级的前提条件之一）。
+  写租约正是让本挂载"剩下的脏状态"能安全重试的东西，而 flush 失败会剩下不少：
+  `flush_inode` 在 `write_region` **之前**就把 `wb.len` 清零，所以字节没了而 `dirty`
+  还在、`meta.size` 仍然覆盖着它们；之后 periodic sync、读 fd 自己的 FLUSH 与 RELEASE
+  每一次都会再 put 一遍这个 size。带着这些把 writer 槽还回去，另一个挂载就能拿到写者、
+  追加、然后被本挂载那个陈旧的小 size 盖在上面——再往后一次 grow 的 `clean_beyond_eof`
+  会把超出该 size 的 extent 删掉。所以 flush 失败时**保持写租约**（等同改动前行为）：
+  槽在最后一个读 fd 关闭时归还（那次 RELEASE 会再 flush 一遍），在那之前 `mode` 保持
+  WRITE，重试的 put 照样带围栏而不是 ANON。消融：去掉这个条件，
+  `system_fuse_release_best_effort.rs` 的 `a_failed_last_writer_flush_keeps_the_write_lease`
+  变红（第二个 client 的 `acquire(WRITE)` 从 Conflict 变成 Granted）。
+- **两个字段答两个不同的问题，别混**：`check_write_allowed` 问"本挂载还有没有打开的写
+  fd"⇒ 看 `writer_refs>0`；`write_lease_for` 问"本挂载在 manager 那边**还持不持有写
+  租约**"⇒ 看 `mode == WRITE`。二者恰恰在要紧的时候分叉（flush 失败后 fd 没了但租约
+  故意留着）。`mode` 因此是**有承载力的状态**，不是 refcount 的复述：release 成功的那
+  一刻立即改成 READ（在重新 acquire 之前，免得 acquire 失败还留着一个已经不属于自己的
+  声明）。`compute_release_action` 多返回一个 `downgrade_to_read`，`must_flush` 增加
+  "最后一个写 fd"这一条；`last_writer` 用 `writer_refs == 1`（不是 `<=1`，否则一次
+  漂移会换来两次白跑的 RTT）。
+- **降级中间那个窗口的已知良性竞态**：`release` 与 `acquire(READ)` 之间若心跳恰好落在
+  中间，且本 client **不在** manager 的 readers 里（Create 或 Open(W) 起手、从未 acquire
+  过 READ 的历史），心跳会拿到 `NotHeld` 并把本地条目删掉，随后 Granted 分支的
+  `get_mut` 找不到条目 ⇒ manager 侧留一个读租约而本地无记录，按 TTL 自己过期。升级
+  历史（先 READ 后 WRITE）下本 client 仍在 readers 里，心跳返回 Renewed，碰不到这条。
+  只丢一次 RTT 与一个 TTL 内的幽灵读者，不影响正确性，故不加防御代码。
+- **PyO3 `autumn.Fs`**：`acquire(ino, mode)` / `release(ino, mode="w")` 也按角色记
+  （`release` 因此多了 mode 参数），但**绑定没有降级逻辑**：`release("w")` 在还有读者
+  时只减计数、不通知 manager，写者槽留到最后一次 release。绑定是 headless 的显式
+  lease API，没有内核 fd 生命周期，也没有 in-tree 调用方。
+- 测试：`dispatch.rs` 的纯函数状态机（dual-open / 降级 / revoked 不降级 /
+  faststart 全序列）+ `crates/manager/tests/fuse_lease_1.rs` 的真集群
+  `fuse_write_open_then_read_open_in_same_mount_coexist`、
+  `fuse_last_writer_close_downgrades_and_frees_the_writer_slot`、
+  `fuse_remote_reader_coexists_with_a_local_dual_open_and_sees_writer_closed`（消融：把
+  `slot.mode != req_mode` 拒绝加回去，前两条都红，报的正是 "lease mode mismatch"）；
+  flush 失败不降级由 `system_fuse_release_best_effort.rs` 的
+  `a_failed_last_writer_flush_keeps_the_write_lease` 钉住（杀 PS 造真实 flush 失败）。
+  真实挂载侧：两个挂载点跑 `ffmpeg -movflags +faststart` + 降级观察（守护进程要
+  `RUST_LOG=info` 才看得到 `lease downgrade: writer slot released` 那行；T1–T3 区分不了
+  "角色恒为 READ"，只有第二个挂载拿到 writer 槽才证明 RELEASE 的角色真的接对了）。
+
 ## Schema 版本戳（fail-loud）
 
 `schema::SCHEMA_VERSION` = **3**，存于 `[0x04]schema_version`（相对 key，即

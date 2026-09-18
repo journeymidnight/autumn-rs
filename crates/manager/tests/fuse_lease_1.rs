@@ -85,10 +85,13 @@ async fn dispatch_open(
         .map_err(|_| anyhow::anyhow!("reply timeout"))?
 }
 
-async fn dispatch_release(state: &mut FsState, ino: u64) -> anyhow::Result<()> {
+/// `flags` are the fd's open flags, as the kernel echoes them on RELEASE —
+/// they say which role's refcount this close drops.
+async fn dispatch_release(state: &mut FsState, ino: u64, flags: i32) -> anyhow::Result<()> {
     let (tx, rx) = bridge::reply_channel::<()>();
     let req = bridge::FsRequest::Release {
         ino,
+        flags,
         flush: false,
         reply: tx,
     };
@@ -152,7 +155,7 @@ fn fuse_two_mounts_write_lease_conflict_and_release_unblocks() {
             Some(LEASE_MODE_WRITE)
         );
         assert_eq!(
-            mount_a.held_leases.borrow().get(&ino).map(|s| s.refcount),
+            mount_a.held_leases.borrow().get(&ino).map(|s| s.total_refs()),
             Some(1)
         );
 
@@ -169,7 +172,7 @@ fn fuse_two_mounts_write_lease_conflict_and_release_unblocks() {
         assert!(mount_b.held_leases.borrow().get(&ino).is_none());
 
         // Mount A releases → B's WRITE Open now succeeds.
-        dispatch_release(&mut mount_a, ino)
+        dispatch_release(&mut mount_a, ino, /* O_RDWR = */ 2)
             .await
             .expect("A release");
         assert!(mount_a.held_leases.borrow().get(&ino).is_none());
@@ -258,18 +261,18 @@ fn fuse_refcount_only_last_release_fires_releaselease() {
             .await
             .expect("second open (refcount)");
         assert_eq!(
-            mount.held_leases.borrow().get(&ino).map(|s| s.refcount),
+            mount.held_leases.borrow().get(&ino).map(|s| s.total_refs()),
             Some(2),
             "two opens in same mount → refcount=2"
         );
 
         // First release → refcount drops to 1; manager-side lease
         // still held (proven by heartbeat round-trip below).
-        dispatch_release(&mut mount, ino)
+        dispatch_release(&mut mount, ino, /* O_RDWR = */ 2)
             .await
             .expect("first release");
         assert_eq!(
-            mount.held_leases.borrow().get(&ino).map(|s| s.refcount),
+            mount.held_leases.borrow().get(&ino).map(|s| s.total_refs()),
             Some(1),
             "first release → refcount=1, lease still held"
         );
@@ -280,7 +283,7 @@ fn fuse_refcount_only_last_release_fires_releaselease() {
         assert!(matches!(hb, HeartbeatResult::Renewed(_)));
 
         // Second release → refcount→0 → ReleaseLease fires.
-        dispatch_release(&mut mount, ino)
+        dispatch_release(&mut mount, ino, /* O_RDWR = */ 2)
             .await
             .expect("second release");
         assert!(mount.held_leases.borrow().get(&ino).is_none());
@@ -293,9 +296,20 @@ fn fuse_refcount_only_last_release_fires_releaselease() {
     });
 }
 
+/// A write fd and a read fd on the SAME file in the same mount must coexist.
+///
+/// This is ffmpeg's MP4 faststart: it keeps the write handle open and reopens
+/// the file `O_RDONLY` to move the moov atom to the front. The mount used to
+/// refuse that second open with EBUSY — one `mode` slot per inode could not
+/// describe a writer and a reader at once — so every ComfyUI SaveVideo failed
+/// with "Device or resource busy". The manager never had that limit: readers
+/// coexist with a writer, and only a DIFFERENT client's writer conflicts.
+///
+/// Ablation: restore the `slot.mode != req_mode` refusal in `dispatch`'s Open
+/// arm and the READ open below fails with "lease mode mismatch".
 #[test]
 #[ignore]
-fn fuse_mode_mismatch_in_same_mount_rejects() {
+fn fuse_write_open_then_read_open_in_same_mount_coexist() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -314,22 +328,197 @@ fn fuse_mode_mismatch_in_same_mount_rejects() {
             .expect("mount");
         dispatch::init_root(&mut mount).await.expect("init");
         let ino = 950u64;
-        seed_file(&mut mount, b"mismatch.bin", ino).await;
+        seed_file(&mut mount, b"faststart.mp4", ino).await;
 
-        // First open as WRITE.
+        // open(W) — the encoder's output handle.
         let _ = dispatch_open(&mut mount, ino, /* O_RDWR = */ 2)
             .await
             .expect("write open");
-        // Second open as READ on the same ino in the same mount →
-        // rejected (no silent downgrade).
-        let err = dispatch_open(&mut mount, ino, /* O_RDONLY = */ 0)
+        // open(R) while the writer is still open — the faststart reopen.
+        let _ = dispatch_open(&mut mount, ino, /* O_RDONLY = */ 0)
             .await
-            .err()
-            .expect("READ-after-WRITE in same mount must fail");
-        assert!(
-            err.to_string().contains("lease mode mismatch"),
-            "msg: {err}"
+            .expect("a read open alongside this mount's own writer must be allowed");
+        {
+            let held = mount.held_leases.borrow();
+            let slot = held.get(&ino).expect("lease held");
+            assert_eq!(
+                (slot.writer_refs, slot.reader_refs),
+                (1, 1),
+                "both fds are counted, in their own roles"
+            );
+            assert_eq!(
+                slot.mode, LEASE_MODE_WRITE,
+                "the mount still holds the WRITE lease while a writer fd is open"
+            );
+        }
+        // Writes keep flowing on the write fd while the reader is open.
+        assert_eq!(dispatch::check_write_allowed(&mount.held_leases.borrow(), ino), Ok(()));
+
+        // close(R) — the writer is untouched.
+        dispatch_release(&mut mount, ino, /* O_RDONLY = */ 0)
+            .await
+            .expect("release reader");
+        assert_eq!(
+            mount.held_leases.borrow().get(&ino).map(|s| (s.writer_refs, s.reader_refs)),
+            Some((1, 0))
         );
+        let hb = lease::heartbeat(&mount.client, &mount.client_id, ino)
+            .await
+            .unwrap();
+        assert!(
+            matches!(hb, HeartbeatResult::Renewed(_)),
+            "closing the reader must not release the mount's lease"
+        );
+
+        // close(W) — last fd, lease goes back.
+        dispatch_release(&mut mount, ino, /* O_RDWR = */ 2)
+            .await
+            .expect("release writer");
+        assert!(mount.held_leases.borrow().get(&ino).is_none());
+        let hb = lease::heartbeat(&mount.client, &mount.client_id, ino)
+            .await
+            .unwrap();
+        assert!(matches!(hb, HeartbeatResult::NotHeld));
+    });
+}
+
+/// Closing the last WRITE fd while a read fd stays open hands the writer slot
+/// back to the manager. Without that downgrade a `tail -f` outliving the
+/// writing process would hold the inode's single writer slot for as long as it
+/// stayed open, and every other mount's writer would get EBUSY.
+#[test]
+#[ignore]
+fn fuse_last_writer_close_downgrades_and_frees_the_writer_slot() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 143, 14301).await;
+
+        let mut mount_a = FsState::new(&mgr_addr.to_string()).await.expect("mount A");
+        dispatch::init_root(&mut mount_a).await.expect("init");
+        let mut mount_b = FsState::new(&mgr_addr.to_string()).await.expect("mount B");
+        let ino = 951u64;
+        seed_file(&mut mount_a, b"downgrade.bin", ino).await;
+
+        // A: writer + reader, then close the writer.
+        let _ = dispatch_open(&mut mount_a, ino, /* O_RDWR = */ 2)
+            .await
+            .expect("A write open");
+        let _ = dispatch_open(&mut mount_a, ino, /* O_RDONLY = */ 0)
+            .await
+            .expect("A read open");
+        dispatch_release(&mut mount_a, ino, /* O_RDWR = */ 2)
+            .await
+            .expect("A release writer");
+
+        {
+            let held = mount_a.held_leases.borrow();
+            let slot = held.get(&ino).expect("A still holds a lease for its read fd");
+            assert_eq!((slot.writer_refs, slot.reader_refs), (0, 1));
+            assert_eq!(slot.mode, LEASE_MODE_READ, "downgraded to a read lease");
+        }
+        // A's stale write fd can no longer write.
+        assert_eq!(
+            dispatch::check_write_allowed(&mount_a.held_leases.borrow(), ino),
+            Err("wrong mode")
+        );
+
+        // B can now take the writer slot even though A's reader is still open.
+        let _ = dispatch_open(&mut mount_b, ino, /* O_WRONLY = */ 1)
+            .await
+            .expect("B must get the writer slot A gave back");
+
+        dispatch_release(&mut mount_b, ino, /* O_WRONLY = */ 1)
+            .await
+            .expect("B release");
+        dispatch_release(&mut mount_a, ino, /* O_RDONLY = */ 0)
+            .await
+            .expect("A release reader");
+        assert!(mount_a.held_leases.borrow().get(&ino).is_none());
+    });
+}
+
+/// A read-only opener on ANOTHER machine is a separate client with its own
+/// lease, so the two mounts must not interfere: the remote reader neither
+/// blocks this mount's writer (the manager conflicts writers only with a
+/// DIFFERENT client's writer, never with readers) nor loses its close-to-open
+/// signal when this mount's writer closes while a local reader keeps the inode
+/// open — that downgrade goes through `lease::release`, which bumps the inode
+/// version and pushes `WriterClosed` to every registered reader.
+#[test]
+#[ignore]
+fn fuse_remote_reader_coexists_with_a_local_dual_open_and_sees_writer_closed() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 144, 14401).await;
+
+        // The "other machine": its own FsState, hence its own client identity.
+        let mut remote = FsState::new(&mgr_addr.to_string()).await.expect("remote mount");
+        dispatch::init_root(&mut remote).await.expect("init");
+        let mut local = FsState::new(&mgr_addr.to_string()).await.expect("local mount");
+        let ino = 952u64;
+        seed_file(&mut remote, b"shared.bin", ino).await;
+
+        // Remote holds the file O_RDONLY for the whole test.
+        let _ = dispatch_open(&mut remote, ino, /* O_RDONLY = */ 0)
+            .await
+            .expect("remote read open");
+        let _ = lease::poll_invalidations(&remote.client, &remote.client_id)
+            .await
+            .unwrap(); // drain
+
+        // The local mount's writer must be granted anyway: readers never take
+        // the writer slot.
+        let _ = dispatch_open(&mut local, ino, /* O_RDWR = */ 2)
+            .await
+            .expect("a remote READER must not block this mount's writer");
+        // ...and the local faststart reopen still works on top of that.
+        let _ = dispatch_open(&mut local, ino, /* O_RDONLY = */ 0)
+            .await
+            .expect("local read open alongside the local writer");
+
+        // Local writer closes; a local reader remains, so this is the DOWNGRADE
+        // path rather than a full release.
+        dispatch_release(&mut local, ino, /* O_RDWR = */ 2)
+            .await
+            .expect("local release writer");
+        assert_eq!(
+            local.held_leases.borrow().get(&ino).map(|s| (s.writer_refs, s.mode)),
+            Some((0, LEASE_MODE_READ)),
+            "downgraded, so the writer slot went back to the manager"
+        );
+
+        // The remote reader must learn that the writer closed.
+        let events = lease::poll_invalidations(&remote.client, &remote.client_id)
+            .await
+            .unwrap();
+        assert!(
+            events.iter().any(|e| e.ino == ino),
+            "the remote reader must get a close-to-open invalidation for ino {ino}; got {events:?}"
+        );
+
+        // And the writer slot is genuinely free: the remote mount can take it
+        // while its own read fd and the local read fd are still open.
+        let _ = dispatch_open(&mut remote, ino, /* O_WRONLY = */ 1)
+            .await
+            .expect("remote must be able to take the freed writer slot");
     });
 }
 

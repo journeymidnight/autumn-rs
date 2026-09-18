@@ -119,6 +119,10 @@ pub enum FsRequest {
     },
     Release {
         ino: u64,
+        /// The fd's open flags, echoed back by the kernel. They name the role
+        /// (`O_RDONLY` reader vs writer) whose refcount this close drops —
+        /// a file can be open in both roles at once.
+        flags: i32,
         flush: bool,
         reply: Reply<()>,
     },

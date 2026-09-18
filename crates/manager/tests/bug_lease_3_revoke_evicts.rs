@@ -87,8 +87,9 @@ fn force_revoke_event_is_lease_revoked_kind_and_evict_fn_clears_held_lease() {
         held.insert(
             ino,
             FuseLease {
+                writer_refs: 1,
+                reader_refs: 0,
                 mode: LEASE_MODE_WRITE,
-                refcount: 1,
                 lease_epoch: info.version,
                 revoked: false,
             },

@@ -189,3 +189,80 @@ fn variable_length_extents() {
         assert!(keys3.is_empty(), "all extents deleted");
     });
 }
+
+/// A reader on ANOTHER mount picks up data a writer appends, without
+/// reopening — the sequential-read ("tail") shape across machines.
+///
+/// File DATA never sits in either kernel's page cache (the mount replies
+/// `FOPEN_DIRECT_IO`), so every read reaches that machine's daemon. What could
+/// still go stale is the daemon's own `InodeState`: its cached `meta.size` and
+/// its cached extent map. The EOF path closes both — a read at or past the
+/// cached size re-reads the inode from KV bypassing the cache, and adopting a
+/// LARGER size also drops the cached extent map (`meta.rs`), so the rescan sees
+/// the newly appended extents. Visibility is still bounded by the WRITER
+/// flushing: bytes sitting in its 64 MiB write buffer are nobody else's yet.
+#[test]
+#[ignore]
+fn a_second_mount_sees_appended_data_on_a_linear_read() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 137, 13701).await;
+
+        let mut writer = FsState::new(&mgr_addr.to_string()).await.expect("writer mount");
+        dispatch::init_root(&mut writer).await.expect("init_root");
+        // The "other machine": its own FsState, its own caches.
+        let mut reader = FsState::new(&mgr_addr.to_string()).await.expect("reader mount");
+
+        let ino = 137u64;
+        let m = meta::new_file_meta(0o644, 0, 0);
+        meta::put_inode(&mut writer, ino, &m).await.expect("put_inode");
+
+        // First generation: write + flush, so it is durable and visible.
+        let first = pattern(1024 * 1024);
+        write::write(&mut writer, ino, 0, &first).await.expect("write 1");
+        write::flush_inode(&mut writer, ino, write::FlushReport::ToApplication)
+            .await
+            .expect("flush 1");
+
+        // The reader consumes it, which populates ITS caches (size + extent map).
+        let got = read::read(&mut reader, ino, 0, first.len() as u32)
+            .await
+            .expect("read 1");
+        assert_eq!(got, first, "first generation round-trips on the second mount");
+        // Reading at EOF returns empty, as it should.
+        let eof = read::read(&mut reader, ino, first.len() as i64, 4096)
+            .await
+            .expect("read at eof");
+        assert!(eof.is_empty(), "nothing past EOF yet");
+
+        // The writer appends a second generation and flushes it.
+        let second = pattern(512 * 1024);
+        write::write(&mut writer, ino, first.len() as i64, &second)
+            .await
+            .expect("write 2");
+        write::flush_inode(&mut writer, ino, write::FlushReport::ToApplication)
+            .await
+            .expect("flush 2");
+
+        // The reader continues its linear scan WITHOUT reopening: the EOF
+        // recheck must pick up the growth, and the rescanned extent map must
+        // make the appended bytes readable rather than reading back as zeros.
+        let grown = read::read(&mut reader, ino, first.len() as i64, second.len() as u32)
+            .await
+            .expect("read 2");
+        assert_eq!(
+            grown, second,
+            "a linear reader on another mount must see appended data, not zeros \
+             (size adopted at EOF, extent map rescanned)"
+        );
+    });
+}

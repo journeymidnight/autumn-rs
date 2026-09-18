@@ -139,8 +139,9 @@ fn per_ino_writer_close_triggers_invalidator() {
         reader.held_leases.borrow_mut().insert(
             ino,
             FuseLease {
+                writer_refs: 0,
+                reader_refs: 1,
                 mode: LEASE_MODE_READ,
-                refcount: 1,
                 lease_epoch: info.version,
                 revoked: false,
             },
@@ -227,8 +228,9 @@ fn multiple_distinct_inos_each_get_invalidated() {
             reader.held_leases.borrow_mut().insert(
                 ino,
                 FuseLease {
+                    writer_refs: 0,
+                    reader_refs: 1,
                     mode: LEASE_MODE_READ,
-                    refcount: 1,
                     lease_epoch: info.version,
                     revoked: false,
                 },

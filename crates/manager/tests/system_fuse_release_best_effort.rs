@@ -30,8 +30,10 @@ mod support;
 
 use std::time::Duration;
 
+use autumn_client::lease::{self, AcquireResult, DaemonClientId};
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
+use autumn_rpc::manager_rpc::{MgrClientId, LEASE_CLIENT_KIND_FUSE, LEASE_MODE_WRITE};
 
 use autumn_fuse::bridge::{self, FsRequest};
 use autumn_fuse::schema::WRITE_BUF_CAP;
@@ -119,6 +121,7 @@ fn release_must_not_consume_the_sticky_flush_error() {
             &mut state,
             FsRequest::Release {
                 ino,
+                flags: 2, // O_RDWR: this fd is a writer
                 flush: true,
                 reply: tx,
             },
@@ -171,6 +174,132 @@ fn release_must_not_consume_the_sticky_flush_error() {
             "the inode went CLEAN on release, so only `!dirty` stood between \
              the record and eviction — and it no longer does (eviction itself \
              is ruled out: the assert above already found the inode present)"
+        );
+    });
+}
+
+
+/// A last-writer close whose FLUSH FAILED must NOT hand the writer slot back.
+///
+/// The downgrade exists so a lingering reader does not hold the inode's single
+/// writer slot. But the write lease is also what makes this mount's leftover
+/// state safe: `flush_inode` zeroes the write buffer's length BEFORE writing it
+/// out, so a failed flush loses the bytes while `dirty` stays set and
+/// `meta.size` still covers them — and the reader fd's own FLUSH/RELEASE and
+/// the 30 s periodic sync will each put that size again. Downgrade with that
+/// pending and another mount can take the writer slot, append, and then have
+/// this mount's stale, smaller size land on top of its work; the next grow's
+/// `clean_beyond_eof` then deletes the extents past it.
+///
+/// Ablation: drop `deferred_flush_err.is_none()` from the downgrade condition
+/// in `dispatch.rs` and the acquire below is Granted instead of Conflict — the
+/// writer slot is gone while this mount still owes the cluster a size.
+#[test]
+#[ignore]
+fn a_failed_last_writer_flush_keeps_the_write_lease() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    let ps_addr = pick_addr();
+    let mut ps = {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+            register_two_nodes(&mgr, n1_addr, n2_addr, 145).await;
+            let (log, row, meta_s) = create_three_streams(&mgr).await;
+            upsert_partition(&mgr, 14501, log, row, meta_s, b"", b"\xff\xff\xff\xff").await;
+        });
+        start_partition_server_killable(145, mgr_addr, ps_addr)
+    };
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut state = FsState::new(&mgr_addr.to_string())
+            .await
+            .expect("FsState::new");
+        dispatch::init_root(&mut state).await.expect("init_root");
+        state.pipelined_writes = true;
+
+        let ino = 901u64;
+        let m = meta::new_file_meta(0o644, 0, 0);
+        meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
+
+        // The faststart shape: a write fd and a read fd on the same inode.
+        let (tx, rx) = bridge::reply_channel::<u64>();
+        dispatch::handle_request(
+            &mut state,
+            FsRequest::Open { ino, flags: 2, reply: tx },
+            None,
+        )
+        .await;
+        rx.recv().expect("open reply").expect("write open");
+        let (tx, rx) = bridge::reply_channel::<u64>();
+        dispatch::handle_request(
+            &mut state,
+            FsRequest::Open { ino, flags: 0, reply: tx },
+            None,
+        )
+        .await;
+        rx.recv().expect("open reply").expect("read open");
+
+        // Warm the extent cache so the doomed flush fails in flight, not while
+        // planning (the map scan needs the PS).
+        let warm = vec![0xCDu8; WRITE_BUF_CAP];
+        write::write(&mut state, ino, 0, &warm).await.expect("warm write");
+        write::flush_inode(&mut state, ino, write::FlushReport::ToApplication)
+            .await
+            .expect("warm flush");
+
+        ps.kill();
+
+        let doomed = vec![0xEFu8; WRITE_BUF_CAP];
+        let _ = write::write(&mut state, ino, WRITE_BUF_CAP as i64, &doomed).await;
+        assert!(
+            write::drain_pending(&mut state, ino).await.is_err(),
+            "precondition: with the PS dead the spawned flush must fail"
+        );
+
+        // Close the WRITE fd. The reader is still open, so this is the
+        // downgrade decision — taken while a flush failure stands.
+        let (tx, rx) = bridge::reply_channel::<()>();
+        dispatch::handle_request(
+            &mut state,
+            FsRequest::Release { ino, flags: 2, flush: true, reply: tx },
+            None,
+        )
+        .await;
+        let _ = rx.recv().expect("release replied");
+
+        assert_eq!(
+            state.held_leases.borrow().get(&ino).map(|s| s.mode),
+            Some(LEASE_MODE_WRITE),
+            "the mount must still claim the WRITE lease, or its retried size is \
+             stamped ANON (unfenced)"
+        );
+
+        // The manager must agree: another client cannot take the writer slot.
+        let other_cluster = ClusterClient::connect_raw(&mgr_addr.to_string())
+            .await
+            .expect("second client");
+        let other_id = DaemonClientId::from_wire(MgrClientId {
+            kind: LEASE_CLIENT_KIND_FUSE,
+            uuid: [0xbb; 16],
+            host: "other-mount".to_string(),
+        });
+        let outcome = lease::acquire(&other_cluster, &other_id, ino, LEASE_MODE_WRITE)
+            .await
+            .expect("acquire rpc");
+        assert!(
+            matches!(outcome, AcquireResult::Conflict { .. }),
+            "a failed last-writer flush must NOT release the writer slot; another \
+             mount taking it can have this mount's stale size land on its writes. \
+             got {outcome:?}"
         );
     });
 }

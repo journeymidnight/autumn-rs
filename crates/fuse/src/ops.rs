@@ -350,13 +350,14 @@ impl Filesystem for AutumnFs {
         _req: &Request<'_>,
         ino: u64,
         _fh: u64,
-        _flags: i32,
+        flags: i32,
         _lock_owner: Option<u64>,
         flush: bool,
         reply: ReplyEmpty,
     ) {
         match self.send(|r| FsRequest::Release {
             ino,
+            flags,
             flush,
             reply: r,
         }) {
@@ -455,13 +456,16 @@ fn err_to_errno(e: &anyhow::Error) -> i32 {
         libc::ENOTEMPTY
     } else if msg.contains("EISDIR") {
         libc::EISDIR
-    } else if msg.contains("EBUSY") || msg.contains("lease mode mismatch") {
-        // coco P2 #4: writer-lease conflicts and
-        // in-mount mode mismatches now surface as EBUSY so apps
-        // can distinguish "someone else holds the file" from real
-        // I/O failure. Without this mapping the lease conflict
-        // looked like an EIO and was indistinguishable from a
-        // storage outage.
+    } else if msg.contains("EBUSY") {
+        // coco P2 #4: a writer-lease conflict surfaces as EBUSY so apps can
+        // distinguish "another client holds the file" from real I/O failure.
+        // Without this mapping the conflict looked like an EIO,
+        // indistinguishable from a storage outage.
+        //
+        // The companion "lease mode mismatch" arm is GONE with the state it
+        // described: this mount refusing its own second open because one `mode`
+        // slot could not hold a writer and a reader at once. A conflict is now
+        // only ever another CLIENT's writer, which the manager reports.
         libc::EBUSY
     } else {
         // Catch-all EIO. Log the unmapped error at WARN so operators can see

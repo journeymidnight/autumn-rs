@@ -61,10 +61,13 @@ fn lease_mode_for_open(flags: i32) -> u8 {
 /// R2-P0 #3 (2026-06-06) — pure-fn lease check used by the Write
 /// arm of `FsRequest`. Three states:
 ///
-/// - `Ok(())`: held WRITE-mode lease, not revoked.
+/// - `Ok(())`: this mount holds a write fd on the inode, not revoked.
 /// - `Err("revoked")`: held entry but server-side revoked (R2-P0 #3
 ///   data-leak window — the stale writer's bytes must NOT land).
-/// - `Err("wrong mode")`: held but mode != WRITE (READ lease, etc).
+/// - `Err("wrong mode")`: held, but only read fds are open (`writer_refs == 0`
+///   — a read-only opener, or a mount that downgraded when its last write fd
+///   closed). Keyed on the ROLE COUNT rather than `mode` because `mode` also
+///   reads WRITE for the window in which a write fd is open alongside readers.
 /// - `Err("no lease")`: no entry at all — caller dropped through
 ///   Open without acquiring, or a wholesale invalidate dropped the
 ///   map. Either way, refuse the write.
@@ -79,9 +82,7 @@ pub fn check_write_allowed(
     match held_leases.get(&ino) {
         None => Err("no lease"),
         Some(slot) if slot.revoked => Err("revoked"),
-        Some(slot) if slot.mode != autumn_rpc::manager_rpc::LEASE_MODE_WRITE => {
-            Err("wrong mode")
-        }
+        Some(slot) if slot.writer_refs == 0 => Err("wrong mode"),
         Some(_) => Ok(()),
     }
 }
@@ -92,14 +93,25 @@ pub fn check_write_allowed(
 /// in-memory entry, even when the kernel passed `flush=false` and
 /// `refcount > 1`. Returns:
 ///
+/// `role` is the lease mode of the fd being closed, derived from the open
+/// flags the kernel echoes back on RELEASE. It decides WHICH refcount falls,
+/// and therefore whether this close ends the mount's write lease.
+///
 /// - `must_flush`: the dispatcher's `write::flush_inode` must run.
-///   True iff: kernel `flush=true`, OR last refcount (1→0
-///   transition), OR `slot.revoked` is set.
+///   True iff: kernel `flush=true`, OR this is the last fd of any kind, OR
+///   `slot.revoked` is set, OR it is the last WRITE fd (dirty data must reach
+///   the cluster while this mount still holds the write lease — after the
+///   downgrade below its writes would be refused).
 /// - `must_drop_entry`: the held_leases entry should be removed
-///   after the flush attempt. True iff: refcount-after-decrement
-///   reaches 0, OR `slot.revoked` is set (revoked entries are not
+///   after the flush attempt. True iff: no fd of either role is left,
+///   OR `slot.revoked` is set (revoked entries are not
 ///   recoverable — the manager already gave the lease to someone
 ///   else; keeping the entry around just confuses the next Open).
+/// - `downgrade_to_read`: the last WRITE fd closed but read fds remain. The
+///   dispatcher releases the write lease and re-acquires a READ one, so a
+///   lingering reader (`tail -f`) stops occupying the single writer slot and
+///   blocking every other mount's writer. Never set together with
+///   `must_drop_entry`.
 /// - `propagate_flush_err`: the dispatcher should answer the RELEASE
 ///   with EIO rather than swallowing it. True iff NOT revoked (a
 ///   revoked flush is best-effort; the bytes will fence at the PS
@@ -115,18 +127,29 @@ pub fn compute_release_action(
     held_leases: &std::collections::HashMap<u64, crate::state::FuseLease>,
     ino: u64,
     kernel_flush: bool,
+    role: u8,
 ) -> ReleaseAction {
     match held_leases.get(&ino) {
         None => ReleaseAction {
             must_flush: kernel_flush,
             must_drop_entry: false,
+            downgrade_to_read: false,
             propagate_flush_err: true,
         },
         Some(slot) => {
-            let last = slot.refcount <= 1;
+            let last = slot.total_refs() <= 1;
+            // `== 1`, not `<= 1`: a WRITE-role release against a slot with no
+            // writer counted is a drift, and answering it with a downgrade
+            // spends two round trips releasing and re-taking a read lease that
+            // already describes the state.
+            let last_writer =
+                role == autumn_rpc::manager_rpc::LEASE_MODE_WRITE && slot.writer_refs == 1;
             ReleaseAction {
-                must_flush: kernel_flush || last || slot.revoked,
+                must_flush: kernel_flush || last || slot.revoked || last_writer,
                 must_drop_entry: last || slot.revoked,
+                // A revoked entry is dropped whole, so there is nothing to
+                // downgrade: the next Open re-acquires from scratch.
+                downgrade_to_read: last_writer && !last && !slot.revoked,
                 propagate_flush_err: !slot.revoked,
             }
         }
@@ -137,6 +160,7 @@ pub fn compute_release_action(
 pub struct ReleaseAction {
     pub must_flush: bool,
     pub must_drop_entry: bool,
+    pub downgrade_to_read: bool,
     pub propagate_flush_err: bool,
 }
 
@@ -438,15 +462,15 @@ pub async fn handle_request(
                 let id = state.client_id.clone();
                 let acquired_version = match lease::acquire(&cluster, &id, ino, req_mode).await {
                     Ok(AcquireResult::Granted(info)) => {
-                        state.held_leases.borrow_mut().insert(
-                            ino,
-                            FuseLease {
-                                mode: req_mode,
-                                refcount: 1,
-                                lease_epoch: info.version,
-                                revoked: false,
-                            },
-                        );
+                        let mut slot = FuseLease {
+                            writer_refs: 0,
+                            reader_refs: 0,
+                            mode: req_mode,
+                            lease_epoch: info.version,
+                            revoked: false,
+                        };
+                        slot.add_ref(req_mode);
+                        state.held_leases.borrow_mut().insert(ino, slot);
                         info.version
                     }
                     Ok(AcquireResult::Conflict { manager_message }) => {
@@ -558,6 +582,20 @@ pub async fn handle_request(
                 // as `EBUSY` (mapped to ErrorKind::Other in
                 // `err_to_errno`). Refcount the lease per-mount.
                 let req_mode = lease_mode_for_open(flags);
+                // What this Open must ask the manager for, if anything:
+                //   - nothing, when this mount already holds a lease at least
+                //     as strong as `req_mode` — including a READ open while
+                //     this mount holds the WRITE lease. That pair is the
+                //     ffmpeg-faststart shape (write fd held, same file reopened
+                //     O_RDONLY to move the moov atom) and it used to be
+                //     refused with EBUSY. Nothing needs saying: the manager
+                //     lets readers coexist with a writer, and within one mount
+                //     the write path keeps its own cache coherent.
+                //   - an UPGRADE to WRITE, when read fds are open and the first
+                //     write fd arrives. Same-client `acquire(WRITE)` is
+                //     idempotent at the manager, so this is one round trip that
+                //     either grants (bumping our epoch) or reports another
+                //     client's writer as a conflict, exactly as a fresh open would.
                 let mut needs_acquire = false;
                 {
                     let mut m = state.held_leases.borrow_mut();
@@ -572,14 +610,14 @@ pub async fn handle_request(
                             m.remove(&ino);
                             needs_acquire = true;
                         }
+                        Some(slot) if req_mode == LEASE_MODE_WRITE && slot.writer_refs == 0 => {
+                            // Upgrade: readers are open, this is the first
+                            // writer. Count the fd only once the manager has
+                            // granted, below.
+                            needs_acquire = true;
+                        }
                         Some(slot) => {
-                            if slot.mode != req_mode {
-                                return Err(anyhow!(
-                                    "lease mode mismatch on ino {}: held={}, req={}",
-                                    ino, slot.mode, req_mode
-                                ));
-                            }
-                            slot.refcount = slot.refcount.saturating_add(1);
+                            slot.add_ref(req_mode);
                         }
                         None => {
                             needs_acquire = true;
@@ -601,15 +639,23 @@ pub async fn handle_request(
                     let id = state.client_id.clone();
                     match lease::acquire(&cluster, &id, ino, req_mode).await {
                         Ok(AcquireResult::Granted(info)) => {
-                            state.held_leases.borrow_mut().insert(
-                                ino,
-                                FuseLease {
-                                    mode: req_mode,
-                                    refcount: 1,
-                                    lease_epoch: info.version,
-                                    revoked: false,
-                                },
-                            );
+                            // `entry`, not `insert`: on the upgrade path the
+                            // slot already carries this mount's open read fds,
+                            // and overwriting it would forget them — their
+                            // RELEASEs would then underflow to zero and drop
+                            // the lease while fds are still open.
+                            let mut held = state.held_leases.borrow_mut();
+                            let slot = held.entry(ino).or_insert(FuseLease {
+                                writer_refs: 0,
+                                reader_refs: 0,
+                                mode: req_mode,
+                                lease_epoch: info.version,
+                                revoked: false,
+                            });
+                            slot.mode = req_mode;
+                            slot.lease_epoch = info.version;
+                            slot.revoked = false;
+                            slot.add_ref(req_mode);
                             info.version
                         }
                         Ok(AcquireResult::Conflict { manager_message }) => {
@@ -827,7 +873,12 @@ pub async fn handle_request(
             let result = write::flush_inode(state, ino, write::FlushReport::ToApplication).await;
             let _ = reply.send(result);
         }
-        FsRequest::Release { ino, flush, reply } => {
+        FsRequest::Release {
+            ino,
+            flags,
+            flush,
+            reply,
+        } => {
             let result = async {
                 // coco P1 #2 fix: writer-release
                 // MUST happen AFTER dirty data is flushed (plan
@@ -848,9 +899,12 @@ pub async fn handle_request(
                 // captures all three signals (kernel_flush /
                 // refcount-1 / revoked) into one decision tuple;
                 // see its doc for the `propagate_flush_err` nuance.
+                // The kernel echoes the fd's open flags on RELEASE, which is
+                // what says whether this close ends a writer or a reader.
+                let role = lease_mode_for_open(flags);
                 let action = {
                     let held = state.held_leases.borrow();
-                    compute_release_action(&held, ino, flush)
+                    compute_release_action(&held, ino, flush, role)
                 };
                 // A flush error bound for the kernel is DEFERRED to the end of
                 // this block, not returned from the middle of it. An early
@@ -927,7 +981,7 @@ pub async fn handle_request(
                     let mut m = state.held_leases.borrow_mut();
                     match m.get_mut(&ino) {
                         Some(slot) => {
-                            slot.refcount = slot.refcount.saturating_sub(1);
+                            slot.drop_ref(role);
                             // Drop the entry on 1→0 OR if revoked
                             // (revoked entries are not recoverable
                             // — the manager already gave the lease
@@ -942,6 +996,78 @@ pub async fn handle_request(
                         None => false,
                     }
                 };
+                // Last write fd closed, read fds still open: hand the writer
+                // slot back and re-register as a reader. The manager keeps ONE
+                // writer per inode, so holding it for a `tail -f` that outlives
+                // the writing process would block every other mount's writer
+                // until that reader closed.
+                //
+                // ONLY when the flush above actually succeeded. The write lease
+                // is what makes this mount's leftover state safe to retry, and
+                // a failed flush leaves plenty: `flush_inode` zeroes the write
+                // buffer's length BEFORE `write_region`, so the bytes are gone
+                // while `dirty` stays set and `meta.size` still covers them —
+                // and every later flush (periodic sync, the reader fd's own
+                // FLUSH and RELEASE) will put that size again. Hand the slot
+                // back with that pending, and another mount can take the
+                // writer, append, and then have this mount's stale size land on
+                // top of its work — after which the next grow's
+                // `clean_beyond_eof` deletes the extents past it. So a failed
+                // flush KEEPS the write lease (pre-change behaviour): the slot
+                // goes back when the last read fd closes, whose RELEASE flushes
+                // again, and until then `mode` stays WRITE so the retry is
+                // fence-stamped instead of ANON.
+                if action.downgrade_to_read && !release_now && deferred_flush_err.is_none() {
+                    let cluster = state.client.clone();
+                    let id = state.client_id.clone();
+                    match lease::release(&cluster, &id, ino).await {
+                        Ok(_) => {
+                            // The manager has taken the writer slot back, so
+                            // this mount must stop claiming it IMMEDIATELY —
+                            // `write_lease_for` reads `mode`, and a stale WRITE
+                            // here would stamp a fencing epoch the mount no
+                            // longer owns. Done before the re-acquire so the
+                            // re-acquire failing cannot leave the claim behind.
+                            if let Some(slot) = state.held_leases.borrow_mut().get_mut(&ino) {
+                                slot.mode = LEASE_MODE_READ;
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            ino,
+                            error = %e,
+                            "lease downgrade: release failed; this mount keeps the writer slot \
+                             until its last read fd closes"
+                        ),
+                    }
+                    match lease::acquire(&cluster, &id, ino, LEASE_MODE_READ).await {
+                        Ok(lease::AcquireResult::Granted(info)) => {
+                            if let Some(slot) = state.held_leases.borrow_mut().get_mut(&ino) {
+                                slot.mode = LEASE_MODE_READ;
+                                slot.lease_epoch = info.version;
+                            }
+                            tracing::info!(
+                                ino,
+                                lease_epoch = info.version,
+                                "lease downgrade: writer slot released, read lease kept"
+                            );
+                        }
+                        // The read lease is a coherence courtesy, not a
+                        // correctness gate: reads are served fresh and the
+                        // writer slot — the part that matters — is already
+                        // handed back. Leave the entry's refcounts alone so
+                        // the remaining fds still release cleanly.
+                        Ok(other) => tracing::warn!(
+                            ino,
+                            ?other,
+                            "lease downgrade: re-acquire as reader not granted"
+                        ),
+                        Err(e) => tracing::warn!(
+                            ino,
+                            error = %e,
+                            "lease downgrade: re-acquire as reader failed"
+                        ),
+                    }
+                }
                 if release_now {
                     let cluster = state.client.clone();
                     let id = state.client_id.clone();
@@ -1131,12 +1257,15 @@ mod bug_lease_3_fuse_tests {
     }
 
     fn lease(mode: u8) -> FuseLease {
-        FuseLease {
+        let mut l = FuseLease {
+            writer_refs: 0,
+            reader_refs: 0,
             mode,
-            refcount: 1,
             lease_epoch: 1,
             revoked: false,
-        }
+        };
+        l.add_ref(mode);
+        l
     }
 
     #[test]
@@ -1234,8 +1363,17 @@ mod r2_p0_2_3_lease_check_tests {
     use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
     use std::collections::HashMap;
 
+    /// `refcount` fds, all in `mode`'s role — the single-role shape the
+    /// pre-split tests described. Mixed-role cases build the struct directly.
     fn lease(mode: u8, refcount: u32, revoked: bool) -> FuseLease {
-        FuseLease { mode, refcount, lease_epoch: 1, revoked }
+        let writer = mode == LEASE_MODE_WRITE;
+        FuseLease {
+            writer_refs: if writer { refcount } else { 0 },
+            reader_refs: if writer { 0 } else { refcount },
+            mode,
+            lease_epoch: 1,
+            revoked,
+        }
     }
 
     // ── check_write_allowed ────────────────────────────────────
@@ -1269,16 +1407,144 @@ mod r2_p0_2_3_lease_check_tests {
         assert_eq!(check_write_allowed(&held, 7), Err("no lease"));
     }
 
+    // ── dual-open (writer + reader on the same inode) ──────────
+
+    /// One process holding a write fd and a read fd on the same file is
+    /// ffmpeg's MP4 faststart, and it must be a permitted state, not EBUSY.
+    /// A read fd opened alongside the writer does not touch `writer_refs`, so
+    /// writes keep flowing on the write fd.
+    #[test]
+    fn a_reader_opened_alongside_a_writer_does_not_disturb_the_write_path() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, false);
+        slot.add_ref(LEASE_MODE_READ); // the faststart reopen
+        assert_eq!((slot.writer_refs, slot.reader_refs), (1, 1));
+        held.insert(7, slot);
+        assert_eq!(check_write_allowed(&held, 7), Ok(()));
+    }
+
+    /// Closing the read fd of a writer+reader pair is an ordinary release:
+    /// the writer is untouched, nothing is flushed on its behalf, and the
+    /// lease stays exactly as it was.
+    #[test]
+    fn closing_the_reader_of_a_dual_open_leaves_the_writer_alone() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, false);
+        slot.add_ref(LEASE_MODE_READ);
+        held.insert(7, slot);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_READ);
+        assert_eq!(
+            action,
+            ReleaseAction {
+                must_flush: false,
+                must_drop_entry: false,
+                downgrade_to_read: false,
+                propagate_flush_err: true,
+            }
+        );
+    }
+
+    /// Closing the WRITE fd while a read fd remains must flush first and then
+    /// downgrade. Flush, because after the downgrade this mount may no longer
+    /// write; downgrade, because the manager keeps ONE writer per inode and a
+    /// surviving reader (`tail -f`) would otherwise hold that slot against
+    /// every other mount's writer.
+    #[test]
+    fn closing_the_writer_of_a_dual_open_flushes_then_downgrades() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, false);
+        slot.add_ref(LEASE_MODE_READ);
+        held.insert(7, slot);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert_eq!(
+            action,
+            ReleaseAction {
+                must_flush: true,
+                must_drop_entry: false,
+                downgrade_to_read: true,
+                propagate_flush_err: true,
+            }
+        );
+    }
+
+    /// A revoked lease is dropped whole, never downgraded: the manager has
+    /// already handed the inode to someone else, so re-acquiring a read lease
+    /// here would resurrect state that no longer exists.
+    #[test]
+    fn a_revoked_dual_open_drops_instead_of_downgrading() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, true);
+        slot.add_ref(LEASE_MODE_READ);
+        held.insert(7, slot);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert!(action.must_flush);
+        assert!(action.must_drop_entry);
+        assert!(!action.downgrade_to_read);
+    }
+
+    /// After the downgrade the mount holds only read fds, so a stray write on
+    /// the closed fd must be refused rather than ride the read lease.
+    #[test]
+    fn after_a_downgrade_writes_are_refused() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, false);
+        slot.add_ref(LEASE_MODE_READ);
+        slot.drop_ref(LEASE_MODE_WRITE);
+        slot.mode = LEASE_MODE_READ;
+        held.insert(7, slot);
+        assert_eq!(check_write_allowed(&held, 7), Err("wrong mode"));
+    }
+
+    /// The full faststart sequence: open(W), open(R), close(R), close(W).
+    /// Every step's decision is pinned, because the bug was that step two was
+    /// refused outright.
+    #[test]
+    fn the_faststart_open_close_sequence_holds_its_refcounts() {
+        let mut slot = FuseLease {
+            writer_refs: 0,
+            reader_refs: 0,
+            mode: LEASE_MODE_WRITE,
+            lease_epoch: 1,
+            revoked: false,
+        };
+        slot.add_ref(LEASE_MODE_WRITE); // open(W)
+        slot.add_ref(LEASE_MODE_READ); // open(R) — used to be EBUSY
+        assert_eq!((slot.writer_refs, slot.reader_refs, slot.total_refs()), (1, 1, 2));
+
+        let mut held = HashMap::new();
+        held.insert(7, slot);
+        // close(R): ordinary, nothing to tell the manager.
+        let a = compute_release_action(&held, 7, false, LEASE_MODE_READ);
+        assert!(!a.must_drop_entry && !a.downgrade_to_read);
+        held.get_mut(&7).unwrap().drop_ref(LEASE_MODE_READ);
+
+        // close(W): last fd of any kind — flush and release the lease.
+        let b = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert_eq!(
+            b,
+            ReleaseAction {
+                must_flush: true,
+                must_drop_entry: true,
+                downgrade_to_read: false,
+                propagate_flush_err: true,
+            }
+        );
+        held.get_mut(&7).unwrap().drop_ref(LEASE_MODE_WRITE);
+        assert_eq!(held.get(&7).unwrap().total_refs(), 0);
+    }
+
     // ── compute_release_action ─────────────────────────────────
 
     #[test]
     fn release_normal_last_refcount_flushes_and_drops() {
         let mut held = HashMap::new();
         held.insert(7, lease(LEASE_MODE_WRITE, 1, false));
-        let action = compute_release_action(&held, 7, false);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
         assert_eq!(action, ReleaseAction {
             must_flush: true,
             must_drop_entry: true,
+            // Nothing is left to downgrade to — the entry goes away whole.
+            downgrade_to_read: false,
             propagate_flush_err: true,
         });
     }
@@ -1287,10 +1553,11 @@ mod r2_p0_2_3_lease_check_tests {
     fn release_normal_non_last_refcount_no_flush() {
         let mut held = HashMap::new();
         held.insert(7, lease(LEASE_MODE_WRITE, 3, false));
-        let action = compute_release_action(&held, 7, false);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
         assert_eq!(action, ReleaseAction {
             must_flush: false,
             must_drop_entry: false,
+            downgrade_to_read: false,
             propagate_flush_err: true,
         });
     }
@@ -1299,7 +1566,7 @@ mod r2_p0_2_3_lease_check_tests {
     fn release_kernel_flush_true_always_flushes() {
         let mut held = HashMap::new();
         held.insert(7, lease(LEASE_MODE_WRITE, 3, false));
-        let action = compute_release_action(&held, 7, true);
+        let action = compute_release_action(&held, 7, true, LEASE_MODE_WRITE);
         assert!(action.must_flush);
         assert!(!action.must_drop_entry, "kernel-flush alone doesn't drop the entry");
     }
@@ -1313,10 +1580,13 @@ mod r2_p0_2_3_lease_check_tests {
         // on the eventual drop.
         let mut held = HashMap::new();
         held.insert(7, lease(LEASE_MODE_WRITE, 3, true));
-        let action = compute_release_action(&held, 7, false);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
         assert_eq!(action, ReleaseAction {
             must_flush: true,
             must_drop_entry: true,
+            // A revoked entry is dropped whole; re-acquiring a read lease for
+            // it would resurrect state the manager has already reassigned.
+            downgrade_to_read: false,
             propagate_flush_err: false,
         });
     }
@@ -1329,7 +1599,7 @@ mod r2_p0_2_3_lease_check_tests {
         // the legit next-Open-after-revoke retry path.
         let mut held = HashMap::new();
         held.insert(7, lease(LEASE_MODE_WRITE, 1, true));
-        let action = compute_release_action(&held, 7, false);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
         assert!(!action.propagate_flush_err);
     }
 
@@ -1339,13 +1609,14 @@ mod r2_p0_2_3_lease_check_tests {
         // close-with-error paths) — no entry to drop, no lease
         // bookkeeping; just honor kernel flush as before.
         let held = HashMap::new();
-        let action = compute_release_action(&held, 7, true);
+        let action = compute_release_action(&held, 7, true, LEASE_MODE_WRITE);
         assert_eq!(action, ReleaseAction {
             must_flush: true,
             must_drop_entry: false,
+            downgrade_to_read: false,
             propagate_flush_err: true,
         });
-        let action2 = compute_release_action(&held, 7, false);
+        let action2 = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
         assert!(!action2.must_flush);
     }
 }

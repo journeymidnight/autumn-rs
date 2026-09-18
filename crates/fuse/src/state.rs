@@ -16,14 +16,31 @@ use crate::schema::{InodeState, ROOT_INO};
 /// Per-inode lease bookkeeping on the fuse mount side.
 /// The `apply_invalidation` / `cache_is_stale` helpers operate on this
 /// shape (a writer-XOR-readers lease keyed per inode).
+///
+/// **Refcounts are per ROLE, because one process legitimately holds a write
+/// fd and a read fd on the same file at the same time.** ffmpeg's MP4
+/// faststart does exactly that: it keeps the write handle open and reopens the
+/// file `O_RDONLY` to move the moov atom. With a single `mode` slot the second
+/// open was refused with EBUSY, so every ComfyUI SaveVideo failed. The manager
+/// always allowed it — `acquire(READ)` inserts a reader regardless of who holds
+/// the writer, and only a DIFFERENT client's writer conflicts — so the refusal
+/// was purely this mount's bookkeeping.
 #[derive(Clone, Debug)]
 pub struct FuseLease {
-    /// `LEASE_MODE_READ` or `LEASE_MODE_WRITE`, pinned at first Open.
+    /// Open fds on this mount in each role: `O_WRONLY`/`O_RDWR` are writers,
+    /// `O_RDONLY` readers. `Release` decrements the role the fd was opened
+    /// with; the manager is told only when a ROLE empties (writer→reader
+    /// downgrade) or the inode goes fully unopened (release).
+    pub writer_refs: u32,
+    pub reader_refs: u32,
+    /// The strongest lease this mount still HOLDS AT THE MANAGER. It is not a
+    /// restatement of the refcounts: it stays `LEASE_MODE_WRITE` after the last
+    /// write fd closes if the write lease was deliberately kept (a failed
+    /// last-writer flush), and it drops to `LEASE_MODE_READ` the moment the
+    /// writer slot is actually handed back. `write_lease_for` stamps the
+    /// fencing epoch off THIS field, so it must never claim a lease the manager
+    /// has taken away.
     pub mode: u8,
-    /// Refcount across this mount's `Open` calls for the same inode.
-    /// `Release` decrements; the 1→0 transition fires `ReleaseLease`
-    /// to the manager.
-    pub refcount: u32,
     /// The lease's fencing epoch — `MgrInodeLeaseInfo.version` handed
     /// back at AcquireLease (the manager wire keeps the name `version`;
     /// every client-side cache + stamp uses `lease_epoch` uniformly:
@@ -37,13 +54,39 @@ pub struct FuseLease {
     ///     stale fd's bytes must not reach the new writer's view —
     ///     this is the client-side half of BUG-LEASE-2's fencing).
     ///   - `Release` can recognise that a flush is required even
-    ///     when the kernel passed `flush=false` AND `refcount > 1`,
-    ///     because the lease is gone server-side and the dirty
-    ///     buffer would otherwise be silently dropped on the next
-    ///     refcount→0 (no entry, no `release_now_pred`, no flush).
+    ///     when the kernel passed `flush=false` AND other fds are still
+    ///     open, because the lease is gone server-side and the dirty
+    ///     buffer would otherwise be silently dropped on the last
+    ///     release (no entry, no `release_now_pred`, no flush).
     /// Cleared on the next successful `AcquireLease` for the same
     /// ino (Open path drops the revoked entry and re-acquires).
     pub revoked: bool,
+}
+
+impl FuseLease {
+    /// Open fds in both roles. Zero means the inode is fully closed on this
+    /// mount and the manager-side lease can go.
+    pub fn total_refs(&self) -> u32 {
+        self.writer_refs.saturating_add(self.reader_refs)
+    }
+
+    /// Count one more open fd in `role` (`LEASE_MODE_WRITE` / `LEASE_MODE_READ`).
+    pub fn add_ref(&mut self, role: u8) {
+        if role == autumn_rpc::manager_rpc::LEASE_MODE_WRITE {
+            self.writer_refs = self.writer_refs.saturating_add(1);
+        } else {
+            self.reader_refs = self.reader_refs.saturating_add(1);
+        }
+    }
+
+    /// Drop one open fd in `role`.
+    pub fn drop_ref(&mut self, role: u8) {
+        if role == autumn_rpc::manager_rpc::LEASE_MODE_WRITE {
+            self.writer_refs = self.writer_refs.saturating_sub(1);
+        } else {
+            self.reader_refs = self.reader_refs.saturating_sub(1);
+        }
+    }
 }
 
 /// Central filesystem state, lives on the compio thread (single-threaded, no locks).
@@ -276,6 +319,16 @@ impl FsState {
     /// then rejects the write with `Fenced`, which is exactly the
     /// storage-side half of the revoke protocol (the client-side half is
     /// dispatch's EIO fast-fail).
+    /// Keyed on `mode`, NOT on `writer_refs` — the two answer different
+    /// questions and only `mode` answers this one. `writer_refs > 0` asks "does
+    /// this mount have an open write fd", which is what `check_write_allowed`
+    /// needs; the fencing stamp asks "does this mount still hold the WRITE
+    /// LEASE at the manager", and those diverge exactly when it matters. When a
+    /// last-writer flush FAILS, the fd is gone (`writer_refs == 0`) but the
+    /// write lease is deliberately kept (see the Release arm), and the leftover
+    /// dirty meta is retried later: keyed on `writer_refs` that retry would
+    /// stamp ANON, which tells the PS to skip fencing — an unfenced write of a
+    /// stale size, from a mount whose exclusivity nothing is checking.
     pub fn write_lease_for(&self, ino: u64) -> autumn_client::WriteLease {
         match self.held_leases.borrow().get(&ino) {
             Some(l) if l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE && l.lease_epoch != 0 => {
