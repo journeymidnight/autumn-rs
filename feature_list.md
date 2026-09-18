@@ -105,7 +105,11 @@
   Scope 2(运维清除 `Faulted` 的动词)仍按 2026-09-09 的决定押后,不在本轮。
   **待测假设**(评审提出,本轮判定不改行为):探针超时算作确认故障,理论上一块"健康但饱和"的盘
   fsync 超过 2s 就会被判死。但这不是回归 —— 改动前 Media 错误**不经任何探针直接判死**,
-  新判死集合是旧集合的子集,探针只会减少判死。真要收紧需在 fio 饱和下实测超时分布再定。
+  新判死集合是旧集合的子集,探针只会减少判死。
+  空载基线实测(2026-09-18,真实 NVMe /data05,300 次同序列 open→unlink→write4K→fsync→dir-fsync):
+  p50 0.14ms / p99 0.43ms / max 1.83ms —— 2s 预算是最差观测值的 1000 倍以上,
+  要误判需要 fsync 劣化三个数量级。饱和态尾延迟未测(本机无 fio 且多租户,压测会影响其他人),
+  且它属于"能否比旧行为更宽容"的增强,不是本次引入的缺陷。
 - `passes: true`
 
 ### F-DISK-REBALANCE — 机内盘间倾斜没有任何东西会纠正
@@ -350,6 +354,14 @@
   `AUTUMN_CHAOS_ACTIONS=corrupt,ec AUTUMN_CHAOS_SEED=603` 两次（修复前后各一次）均通过，
   日志给出完整碰撞链 —— extent 20 被注入 64 字节腐化 → 同一 extent 被选中 EC 转换 →
   `recovery ops driven this round: 1 [extent 20 state=2]`，quiesce 后无 pinned EC marker。
+- **待验证假设**（第三轮评审提出，按"先复现再修"未动代码）：`isolate_rotted_slot` 的
+  verify-at-apply 只在 `persist_extent` 的 await 之后重核 eversion，**不重核 ledger**。
+  构造：extent X 上 coordinator 腐化、另一 slot 被 fence；abandon → 隔离 → persist await
+  期间 recovery tick 恰好为那个 fenced slot 取到 Recovery marker（不 bump eversion）→
+  verify 通过 → 在有在途 op 的情况下落盘。对 Recovery marker 判断是良性的
+  （`apply_recovery_done` 在 apply 时读实时状态）；对 EC marker 才是"op 下改 eversion"的老危害，
+  而 EC 由 60s policy tick 驱动、与此不相关。该代码在 df 路径上早已如此，本次只是新增了一个
+  时序上正好落在"recovery 刚被解锁"那一刻的调用方。要修就先复现。
 - `passes: true`
 
 ### BUG-BULK-READ-FLATTENS-REFUSAL — bulk 读把"分片不归我"压成"extent 不可用"

@@ -1124,7 +1124,10 @@ mod tests {
             m.faulted_disks.borrow_mut().insert(70);
             assert!(m.has_first_hand_df(7));
 
-            m.forget_node_health_facts_of_the_previous_term();
+            // Drive PROMOTION, not the helper: a reset the promotion path
+            // never reaches is the same dead-mechanism shape as a release the
+            // loop never calls.
+            m.replay_from_etcd().await.unwrap();
 
             assert!(
                 !m.has_first_hand_df(7),

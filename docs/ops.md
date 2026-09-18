@@ -3686,14 +3686,20 @@ gate:
     autumn-op --manager ... extent-health      # unhealthy slots only; the rotted one appears
     autumn-op --manager ... recovery-stats     # a rebuild in flight for it
 
-The report is re-queued on each refusal on purpose: the manager drops a finding
-for an extent that still has an op in flight, and the refusal is what releases
-that op. Without it the repair waits for the scrub to rediscover the same rot on
-its own paced pass, while EC keeps being re-proposed and re-reading the whole
-extent to refuse again.
+The manager acts on the refusal itself, isolating the slot in the window its own
+abandon opens, so the repair does not wait for a `df` round trip. The node's
+report is the backstop for every way that call can bail out — a leader change, a
+failed persist, a lost verify-at-apply race, a refusal because another op took
+the extent — and it is re-queued on each refusal because the manager drops a finding for an extent that
+still has an op in flight — the refusal is what releases that op. Without either
+half the repair waits for the scrub to rediscover the same rot on its own paced
+pass, while EC keeps being re-proposed and re-reading the whole extent to refuse
+again.
 
-For ablation, drop the `CODE_CONTENT_CORRUPT` arm in the manager's dispatch
-reply handling: `corrupt_ec_reply_releases_marker_on_first_failure_and_rejects_
+For ablation, drop the `isolate_rotted_slot` call from
+`release_corrupt_ec_attempt`: `a_corrupt_coordinator_slot_is_isolated_when_its_
+marker_is_released` fails with the coordinator's slot still being served. Or
+drop the `CODE_CONTENT_CORRUPT` arm in the manager's dispatch reply handling: `corrupt_ec_reply_releases_marker_on_first_failure_and_rejects_
 late_reply` fails with the marker still ConvertToEc. Dropping the EN-side
 refusal instead makes `ec_corruption_stops_before_redispatch_and_is_attempt_
 scoped` see `CODE_OK` where it requires code 8.

@@ -1130,10 +1130,13 @@ and from other crates' CLAUDE.md); do not renumber.
     policy re-proposes EC and each attempt re-reads the whole extent to refuse
     again. This node just read its own sealed bytes and they did not match what
     was hashed at seal — that is the scrub's evidence found by a different
-    reader, and the node is the only party that has it. It is re-queued on each
-    refusal because the manager DROPS a finding for an extent with a
-    stream-layer op in flight, and the refusal is what releases that op, so the
-    copy queued on the way out is the first one that can be acted on.
+    reader. The manager acts on the refusal itself — it isolates the slot in the
+    window its own abandon opens — so this report is the BACKSTOP, covering
+    every way that call can bail out (a leader change, a failed persist, a lost
+    verify-at-apply race, or a refusal because another op took the extent). It is re-queued on each
+    refusal for the same reason the backstop is needed: the manager DROPS a
+    finding for an extent with a stream-layer op in flight, and the refusal is
+    what releases that op.
 
     **Attempt identity (`attempt_nonce`) rides the whole conversion.** The
     manager stamps each attempt with the etcd revision that created its marker;

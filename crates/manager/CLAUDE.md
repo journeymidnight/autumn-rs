@@ -523,7 +523,13 @@ see are congestion/absence — see `crates/stream/CLAUDE.md` note 33 for the
 full argument and what should exist instead. The bitmap + gate bypass here are
 slot-generic over `replicates ++ parity`, and the EN-side scrub is the second
 evidence source: it reports its own rot on `DfResp.scrub_rot` and
-`node_health_loop` runs the SAME decision. Self-reporting needs no fencing (a
+`node_health_loop` runs the SAME decision — `isolate_rotted_slot`, one helper
+shared by every first-hand report. The THIRD source is the EC pre-encode
+content check: `release_corrupt_ec_attempt` calls the same helper in the window
+its own abandon just opened, because isolation refuses while the extent has a
+stream-layer op in flight and that reply is what removes the op. Going through
+`df` alone would at best delay the repair by a tick, and lose the finding
+outright whenever another op takes the extent before that tick lands. Self-reporting needs no fencing (a
 node saying "my copy is bad" can only hurt itself), which is why it does not
 use the PS-shaped RPC.
 

@@ -3276,12 +3276,15 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(())
     }
 
-    async fn replay_from_etcd(&self) -> Result<()> {
+    pub(crate) async fn replay_from_etcd(&self) -> Result<()> {
+        // Ahead of the etcd check on purpose: this is the promotion point, and
+        // what it forgets is leader-term state, not etcd state. Both callers —
+        // startup and winning the election — are this process taking the role.
+        self.forget_node_health_facts_of_the_previous_term();
         let etcd = match &self.etcd {
             Some(v) => v,
             None => return Ok(()),
         };
-        self.forget_node_health_facts_of_the_previous_term();
 
         let c = etcd.client.clone();
 

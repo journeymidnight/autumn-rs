@@ -2207,109 +2207,8 @@ impl crate::AutumnManager {
                 // "behind", which `re_avali` tries to heal with a length
                 // comparison a full-length rotted replica passes.
                 for rot in df.scrub_rot {
-                    let ex = {
-                        let s = self.store.inner.borrow();
-                        s.extents.get(&rot.extent_id).cloned()
-                    };
-                    let Some(ex) = ex else {
-                        continue;
-                    };
-                    let op_in_flight = self.extent_inflight_op(rot.extent_id).is_some();
-                    match crate::extent_corrupt::compute_corrupt_isolation(
-                        &ex,
-                        &[node.node_id],
-                        rot.eversion,
-                        op_in_flight,
-                    ) {
-                        crate::extent_corrupt::IsolationOutcome::Isolate {
-                            updated,
-                            cleared_mask,
-                        } => {
-                            tracing::error!(
-                                extent_id = rot.extent_id,
-                                node_id = node.node_id,
-                                "a node's scrub found its own copy rotted at rest — isolating \
-                                 that slot so recovery rebuilds it"
-                            );
-                            if let Err(e) = self.persist_extent(&updated).await {
-                                tracing::warn!(
-                                    extent_id = rot.extent_id,
-                                    error = %e,
-                                    "could not persist the isolation of a rotted replica \
-                                     (the scrub re-reports it on its next pass)"
-                                );
-                                continue;
-                            }
-                            // Verify at apply, as the RPC path does. The persist
-                            // above is an await, and seal / split / EC dispatch /
-                            // delete handlers interleave during it; writing this
-                            // stale clone into memory would roll their work back.
-                            // The scrub re-reports on its next pass, so dropping
-                            // a raced apply costs a sweep, not the finding.
-                            {
-                                let mut s = self.store.inner.borrow_mut();
-                                match s.extents.get(&updated.extent_id) {
-                                    Some(live) if live.eversion == rot.eversion => {
-                                        s.extents.insert(updated.extent_id, updated.clone());
-                                    }
-                                    _ => {
-                                        tracing::warn!(
-                                            extent_id = rot.extent_id,
-                                            "extent changed while isolating a rotted replica; \
-                                             dropping this apply (the scrub re-reports it)"
-                                        );
-                                        continue;
-                                    }
-                                }
-                            }
-                            if let Err(e) = self
-                                .mark_slots_corrupt(updated.extent_id, cleared_mask)
-                                .await
-                            {
-                                tracing::warn!(
-                                    extent_id = rot.extent_id,
-                                    error = %e,
-                                    "isolated a rotted replica but could not record WHY; the \
-                                     scrub's next report re-drives the mark on the \
-                                     already-isolated path"
-                                );
-                            }
-                        }
-                        crate::extent_corrupt::IsolationOutcome::AlreadyIsolated => {
-                            // The bit is dark but the REASON may not be
-                            // recorded — a `mark_slots_corrupt` that failed
-                            // after the isolation landed leaves exactly this
-                            // shape, and under the default fenced-only gate an
-                            // unmarked dark slot is never rebuilt. This report
-                            // is the retry that closes it; without re-driving
-                            // here, nothing ever does.
-                            let slot = ex
-                                .replicates
-                                .iter()
-                                .chain(ex.parity.iter())
-                                .position(|s| *s == node.node_id);
-                            if let Some(slot) = slot {
-                                if !self.slot_is_corrupt(rot.extent_id, slot) && slot < 32 {
-                                    if let Err(e) =
-                                        self.mark_slots_corrupt(rot.extent_id, 1u32 << slot).await
-                                    {
-                                        tracing::warn!(
-                                            extent_id = rot.extent_id,
-                                            error = %e,
-                                            "could not record why an already-dark slot is dark"
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        crate::extent_corrupt::IsolationOutcome::Refused { message, .. } => {
-                            tracing::warn!(
-                                extent_id = rot.extent_id,
-                                node_id = node.node_id,
-                                "scrub reported rot but it cannot be acted on: {message}"
-                            );
-                        }
-                    }
+                    self.isolate_rotted_slot(rot.extent_id, node.node_id, rot.eversion, "scrub")
+                        .await;
                 }
                 for done in df.ec_done {
                     let Some(params) = self.extent_inflight_payload_ec(done.extent_id) else {
@@ -2481,6 +2380,129 @@ impl crate::AutumnManager {
                 addr = %node.address,
                 "df RPC failed; marked node disks offline"
             );
+        }
+    }
+
+    /// Act on a first-hand report that a node's own copy of `extent_id` is
+    /// rotted: isolate that slot so recovery rebuilds it.
+    ///
+    /// `reporter` is the node whose bytes were read and found wrong. Two
+    /// sources feed this and they are the same evidence class — the scrub
+    /// reading a described block on its own schedule, and the EC pre-encode
+    /// content check reading the whole extent before it would make the damage
+    /// canonical across a stripe. Neither node can isolate itself: clearing an
+    /// `avali` bit is the manager's write.
+    pub(crate) async fn isolate_rotted_slot(
+        &self,
+        extent_id: u64,
+        reporter: u64,
+        eversion: u64,
+        source: &'static str,
+    ) {
+        let ex = {
+            let s = self.store.inner.borrow();
+            s.extents.get(&extent_id).cloned()
+        };
+        let Some(ex) = ex else {
+            return;
+        };
+        let op_in_flight = self.extent_inflight_op(extent_id).is_some();
+        match crate::extent_corrupt::compute_corrupt_isolation(
+            &ex,
+            &[reporter],
+            eversion,
+            op_in_flight,
+        ) {
+            crate::extent_corrupt::IsolationOutcome::Isolate {
+                updated,
+                cleared_mask,
+            } => {
+                tracing::error!(
+                    extent_id = extent_id,
+                    node_id = reporter,
+                    source,
+                    "a node read its OWN copy and found it rotted — isolating that slot \
+                     so recovery rebuilds it"
+                );
+                if let Err(e) = self.persist_extent(&updated).await {
+                    tracing::warn!(
+                        extent_id = extent_id,
+                        error = %e,
+                        "could not persist the isolation of a rotted replica \
+                         (the scrub re-reports it on its next pass)"
+                    );
+                    return;
+                }
+                // Verify at apply, as the RPC path does. The persist
+                // above is an await, and seal / split / EC dispatch /
+                // delete handlers interleave during it; writing this
+                // stale clone into memory would roll their work back.
+                // The scrub re-reports on its next pass, so dropping
+                // a raced apply costs a sweep, not the finding.
+                {
+                    let mut s = self.store.inner.borrow_mut();
+                    match s.extents.get(&updated.extent_id) {
+                        Some(live) if live.eversion == eversion => {
+                            s.extents.insert(updated.extent_id, updated.clone());
+                        }
+                        _ => {
+                            tracing::warn!(
+                                extent_id = extent_id,
+                                "extent changed while isolating a rotted replica; \
+                                 dropping this apply (the scrub re-reports it)"
+                            );
+                            return;
+                        }
+                    }
+                }
+                if let Err(e) = self
+                    .mark_slots_corrupt(updated.extent_id, cleared_mask)
+                    .await
+                {
+                    tracing::warn!(
+                        extent_id = extent_id,
+                        error = %e,
+                        "isolated a rotted replica but could not record WHY; the \
+                         scrub's next report re-drives the mark on the \
+                         already-isolated path"
+                    );
+                }
+            }
+            crate::extent_corrupt::IsolationOutcome::AlreadyIsolated => {
+                // The bit is dark but the REASON may not be
+                // recorded — a `mark_slots_corrupt` that failed
+                // after the isolation landed leaves exactly this
+                // shape, and under the default fenced-only gate an
+                // unmarked dark slot is never rebuilt. This report
+                // is the retry that closes it; without re-driving
+                // here, nothing ever does.
+                let slot = ex
+                    .replicates
+                    .iter()
+                    .chain(ex.parity.iter())
+                    .position(|s| *s == reporter);
+                if let Some(slot) = slot {
+                    if !self.slot_is_corrupt(extent_id, slot) && slot < 32 {
+                        if let Err(e) =
+                            self.mark_slots_corrupt(extent_id, 1u32 << slot).await
+                        {
+                            tracing::warn!(
+                                extent_id = extent_id,
+                                error = %e,
+                                "could not record why an already-dark slot is dark"
+                            );
+                        }
+                    }
+                }
+            }
+            crate::extent_corrupt::IsolationOutcome::Refused { message, .. } => {
+                tracing::warn!(
+                    extent_id = extent_id,
+                    node_id = reporter,
+                    source,
+                    "a rot finding cannot be acted on: {message}"
+                );
+            }
         }
     }
 
@@ -2755,6 +2777,11 @@ impl crate::AutumnManager {
     ) {
         let EcDispatchCandidate { ex, stream, params } = cand;
         let extent_id = ex.extent_id;
+        // The eversion this dispatch is ABOUT. A content-corrupt reply is
+        // evidence about the bytes as of this layout, so the isolation is
+        // reported against it rather than against whatever is live when the
+        // reply lands — that is what the predicate's eversion guard is for.
+        let ex_eversion = ex.eversion;
         let data_shards = stream.ec_data_shard as usize;
         let parity_shards = stream.ec_parity_shard as usize;
         let total_shards = data_shards + parity_shards;
@@ -2852,6 +2879,7 @@ impl crate::AutumnManager {
                         extent_id,
                         attempt_nonce,
                         params.target_nodes[0],
+                        ex_eversion,
                         &r.message,
                     )
                     .await;
@@ -3004,6 +3032,7 @@ impl crate::AutumnManager {
         extent_id: u64,
         nonce: u64,
         coord: u64,
+        eversion: u64,
         message: &str,
     ) {
         if self.extent_inflight_nonce(extent_id) != nonce
@@ -3030,6 +3059,19 @@ impl crate::AutumnManager {
                 message.into(),
                 now_s,
             );
+            // Yielding the marker is necessary and not sufficient: under the
+            // default gate recovery rebuilds a slot only once something has
+            // MARKED it, and the coordinator read its OWN sealed bytes and
+            // found them wrong — the scrub's evidence, found by a different
+            // reader. Act on it HERE, in the window the abandon just opened:
+            // isolation refuses while the extent has a stream-layer op in
+            // flight, and this is the instant that op is gone. The node also
+            // queues the finding for its next `df`, and that copy is the
+            // backstop for EVERY way this call can bail: a leader change, a
+            // failed persist, an apply that lost the verify-at-apply race, or
+            // a refusal because another op took the extent first.
+            self.isolate_rotted_slot(extent_id, coord, eversion, "ec_content_check")
+                .await;
         }
     }
 
@@ -3850,16 +3892,94 @@ mod corrupt_ec_handoff_tests {
             "first content failure must release, not wait for 24 retries"
         );
         m.acquire_extent_inflight(42, recovery()).await.unwrap();
-        m.release_corrupt_ec_attempt(42, old_nonce, 1, "late reply")
+        m.release_corrupt_ec_attempt(42, old_nonce, 1, 1, "late reply")
             .await;
         assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::Recovery));
         m.commit_extent_inflight_release(42);
         m.acquire_extent_inflight(42, ExtentOpPayload::ConvertToEc(params))
             .await
             .unwrap();
-        m.release_corrupt_ec_attempt(42, old_nonce, 1, "late reply")
+        m.release_corrupt_ec_attempt(42, old_nonce, 1, 1, "late reply")
             .await;
         assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::ConvertToEc));
+    }
+
+    /// Releasing the marker is half the repair: under the default gate recovery
+    /// rebuilds a slot only once something has MARKED it. The coordinator read
+    /// its OWN sealed bytes and found them wrong, so the isolation happens in
+    /// the window the abandon just opened — waiting for the node's `df` copy of
+    /// the finding means waiting for a report the manager DROPS while an op is
+    /// in flight, and the op is only gone once this reply has been acted on.
+    #[compio::test]
+    async fn a_corrupt_coordinator_slot_is_isolated_when_its_marker_is_released() {
+        let peer = peer::Peer::start(|frame| {
+            peer::Reply::Frame(autumn_rpc::Frame::response(
+                frame.req_id,
+                frame.msg_type,
+                rkyv_encode(&autumn_rpc::extent_rpc::CodeResp {
+                    code: autumn_rpc::extent_rpc::CODE_CONTENT_CORRUPT,
+                    message: "extent 42 block 0 fails its content checksum".into(),
+                }),
+            ))
+        })
+        .await;
+        let m = AutumnManager::new();
+        let params = MgrEcDispatchInflight {
+            extent_id: 42,
+            target_nodes: vec![1, 2, 3],
+            data_shards: 2,
+            new_eversion: 2,
+            ..Default::default()
+        };
+        // Nothing has noticed the rot yet: every slot is available and no slot
+        // carries a corrupt mark. This is the state the EC pre-check finds when
+        // it is the FIRST reader to reach those bytes.
+        let ex = MgrExtentInfo {
+            extent_id: 42,
+            sealed: true,
+            sealed_length: 4096,
+            replicates: vec![1, 2, 3],
+            avali: 7,
+            eversion: 1,
+            ..Default::default()
+        };
+        m.store.inner.borrow_mut().extents.insert(42, ex.clone());
+        m.acquire_extent_inflight(42, ExtentOpPayload::ConvertToEc(params.clone()))
+            .await
+            .unwrap();
+
+        m.dispatch_one_ec_conversion(
+            EcDispatchCandidate {
+                ex,
+                stream: MgrStreamInfo {
+                    ec_data_shard: 2,
+                    ec_parity_shard: 1,
+                    ..Default::default()
+                },
+                params,
+            },
+            &[
+                (1, peer.addr.clone()),
+                (2, peer.addr.clone()),
+                (3, peer.addr.clone()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .await;
+
+        assert_eq!(m.extent_inflight_op(42), None, "the marker must be gone");
+        let live = m.store.inner.borrow().extents.get(&42).cloned().unwrap();
+        assert_eq!(
+            live.avali & 1,
+            0,
+            "the coordinator's slot must stop being served"
+        );
+        assert_eq!(
+            m.extent_corrupt_slots.borrow().get(&42).copied(),
+            Some(1),
+            "and the REASON must be recorded, or the default gate never rebuilds it"
+        );
     }
 }
 
