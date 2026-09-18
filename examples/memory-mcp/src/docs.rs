@@ -194,11 +194,22 @@ fn collect_docs(dir: &Path, out: &mut Vec<PathBuf>) {
             if !name.starts_with('.') && name != "target" && name != "node_modules" {
                 collect_docs(&p, out);
             }
-        } else if p
-            .extension()
-            .map(|x| x == "md" || x == "markdown" || x == "txt")
-            .unwrap_or(false)
+        } else if !name.starts_with('.')
+            && p.extension()
+                .map(|x| x == "md" || x == "markdown" || x == "txt")
+                .unwrap_or(false)
         {
+            // A DOTTED FILE IS NOT A DOCUMENT, even when its extension says so.
+            // Directories were already skipped on this rule; files were judged
+            // on the extension alone, and macOS's `tar` writes an AppleDouble
+            // sidecar for every file's extended attributes — `._ops.md` next to
+            // `ops.md`, carrying the same `.md`. The corpus this serves was
+            // packed on a Mac, so HALF the document index was resource-fork
+            // binary: 25 of 50 ids were `._*`, each one embedded and searched
+            // like prose. They scored too low to surface often, which is why
+            // nobody noticed; the cost was silent — a doubled index, doubled
+            // embedding work, and 25 chances to return a binary blob as an
+            // answer.
             out.push(p);
         }
     }
@@ -407,6 +418,33 @@ async fn write_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The corpus is packed on macOS, whose `tar` writes an AppleDouble
+    /// sidecar per file: `._ops.md` beside `ops.md`, same extension, binary
+    /// contents. Judged on the extension alone they were indexed as prose —
+    /// 25 of 50 ids in production.
+    #[test]
+    fn appledouble_sidecars_are_not_documents() {
+        let dir = std::env::temp_dir().join(format!("mmcp-docs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for f in ["ops.md", "._ops.md", "notes.txt", "._notes.txt", ".hidden.md"] {
+            std::fs::write(dir.join(f), "x").unwrap();
+        }
+        std::fs::write(dir.join("sub/deep.md"), "x").unwrap();
+        std::fs::write(dir.join("sub/._deep.md"), "x").unwrap();
+
+        let mut out = Vec::new();
+        collect_docs(&dir, &mut out);
+        let mut names: Vec<String> = out
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["deep.md", "notes.txt", "ops.md"],
+                   "only real documents, at any depth: {names:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn heading_hierarchy_and_line_spans() {
