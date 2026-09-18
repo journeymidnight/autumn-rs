@@ -41,8 +41,16 @@ impl GrpcChannel {
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid address '{}': {}", addr, e))?;
 
-        let tcp = compio::net::TcpStream::connect(sock_addr).await?;
-        tcp.set_nodelay(true)?;
+        // Each step is named. A bare `?` here reports only the OS error —
+        // "Bad file descriptor (os error 9)" with nothing to say whether the
+        // socket, the connect or the h2 handshake produced it, which is not
+        // enough to act on when the same binary works on one kernel and not
+        // another.
+        let tcp = compio::net::TcpStream::connect(sock_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("tcp connect to {addr}: {e}"))?;
+        tcp.set_nodelay(true)
+            .map_err(|e| anyhow::anyhow!("set_nodelay on {addr}: {e}"))?;
 
         let stream = HyperStream::new_plain(tcp);
 
@@ -217,8 +225,11 @@ pub async fn open_streaming_call(
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid address '{addr}': {e}"))?;
 
-    let tcp = compio::net::TcpStream::connect(sock_addr).await?;
-    tcp.set_nodelay(true)?;
+    let tcp = compio::net::TcpStream::connect(sock_addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("tcp connect to {addr}: {e}"))?;
+    tcp.set_nodelay(true)
+        .map_err(|e| anyhow::anyhow!("set_nodelay on {addr}: {e}"))?;
     let stream = HyperStream::new_plain(tcp);
 
     let (mut sender, conn) = http2::handshake::<
