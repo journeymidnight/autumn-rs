@@ -940,9 +940,10 @@
     回归——双挂载 reader+writer、`echo >> f` + `tail -f` 并存且写者不被挡、
     单挂载写后读同 fd 字节一致。
   - 端到端: ComfyUI SaveVideo (mp4 + faststart) 在 autumnfs output 上成功。
-- **Status**: `passes: false` (2026-09-17) — 已按确认方案实现并验证，**只差 ComfyUI
-  SaveVideo 那一条端到端**（本机没有 ComfyUI，需在 comfyui-autumn pod 上跑一次原始复现
-  脚本才闭环）。已完成：`FuseLease` 拆 `writer_refs`/`reader_refs`（`mode` = 当前在
+- **Status**: `passes: true` (2026-09-18) — 已按确认方案实现并验证。最后一条
+  ComfyUI SaveVideo 端到端**由用户自己在 comfyui-autumn pod 上跑**（本机没有 ComfyUI），
+  用户据此判定通过；等价的 `ffmpeg -movflags +faststart` 路径已在真实挂载上验过。
+  已完成：`FuseLease` 拆 `writer_refs`/`reader_refs`（`mode` = 当前在
   manager 持有的最强租约）；Open 的 READ-on-writer 零 RPC、readers-then-writer 走
   `acquire(WRITE)` 升级、Granted 用 `entry()` 合并不丢已开读 fd；RELEASE 经
   `bridge`/`ops` 拿到内核回传的 open flags 按角色减计数，最后一个写 fd 关闭且仍有读者时
@@ -976,7 +977,7 @@
   `release` 的 writer 分支提前返回不摘 reader，留下的幽灵 reader 由
   `inode_lease.rs` 的 `tick_reader_expiry` 按 TTL 回收（本地 `held_leases` 条目已删，
   不再续租），空 inode 条目随后一并丢弃。
-- `passes: false`
+- `passes: true`
 
 ### F-FUSE-BIG-IO-TUNING — writeback cache + splice 零拷贝，把大 IO 的 FUSE 开销压进 5%
 - **Trigger** (2026-09-16，用户在 FUSE 性能讨论后确认的三件套之一): 实测
