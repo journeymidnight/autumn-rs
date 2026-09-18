@@ -23,7 +23,36 @@ autumn-transport = { path = "../crates/transport" }
 # `fuser`/`clap`/kernel-mount machinery out of the wheel — only the shared
 # inode-layout logic the fuse binary also uses.
 autumn-fuse = { path = "../crates/fuse", default-features = false, features = ["core"] }
-compio = { version = "0.19.2", features = ["runtime", "time"] }
+# `polling` is not a second driver, it is what makes the driver a CHOICE: only
+# with io-uring AND polling does compio-driver define cfg(fusion), and only the
+# fusion driver probes the running kernel before picking. See the workspace
+# Cargo.toml for the whole story — this crate needs its own copy of both knobs
+# because it is `exclude`d from that workspace and inherits nothing from it.
+compio = { version = "0.19.2", features = ["runtime", "time", "polling"] }
 futures = "0.3"
 bytes = "1"
 libc = "0.2"
+
+# compio closes the socket its own fallback just made — see the workspace
+# Cargo.toml for the full account. This crate is `exclude`d from that workspace,
+# so the patch there does NOT reach the wheel: without this copy the PyO3 client
+# ships the broken driver and every connection it opens dies with
+# `Bad file descriptor (os error 9)`, which is what kept freetoken-l3 from
+# building its L3 tier while the servers were already fixed.
+#
+# Keep the two sections in step. Drop both once the fix is released upstream.
+[patch.crates-io]
+compio = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-buf = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-dispatcher = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-driver = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-executor = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-fs = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-io = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-log = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-macros = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-net = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-quic = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-runtime = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-tls = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-ws = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }

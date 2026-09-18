@@ -141,6 +141,7 @@ dependencies = [
  "libc",
  "reed-solomon-erasure",
  "rkyv",
+ "thiserror",
  "tracing",
 ]
 
@@ -289,8 +290,7 @@ dependencies = [
 [[package]]
 name = "compio"
 version = "0.19.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c19d81c636b0f47aa50041d25b02d9d8289a3319727a8051209f71bea10e89d6"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "compio-buf",
  "compio-dispatcher",
@@ -306,8 +306,7 @@ dependencies = [
 [[package]]
 name = "compio-buf"
 version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b51a2c35873865376ed4cdb6cfeb602b6cf569815f017ddd7bd8f86ad49b34c7"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -317,8 +316,7 @@ dependencies = [
 [[package]]
 name = "compio-dispatcher"
 version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f0d298a8606024581cb0065a07d116065f1a4683a0b1826a9b87cc816b504c8"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "compio-driver",
  "compio-runtime",
@@ -329,8 +327,7 @@ dependencies = [
 [[package]]
 name = "compio-driver"
 version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "293e8086a35f52b5002402937cf4e69b5e414917e511c29c5e7ba2cebe6ef7b3"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "bitflags 2.13.0",
  "cfg_aliases",
@@ -358,8 +355,7 @@ dependencies = [
 [[package]]
 name = "compio-executor"
 version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94961c5908b02bbb082e046968b8ee3d18995845a5c261376f0b0b5c95c87c2b"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "compio-log",
  "compio-send-wrapper",
@@ -371,8 +367,7 @@ dependencies = [
 [[package]]
 name = "compio-fs"
 version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a374c5a03bdf7ecb42894a49c3a40c22f743f8d7dc39cc21a5dd3258d8219c7"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "cfg_aliases",
  "compio-buf",
@@ -390,8 +385,7 @@ dependencies = [
 [[package]]
 name = "compio-io"
 version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3a354e085c4046dd8d2d9d514cf8c15c615eb8adf6c5f41dbf7899420457e9b"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "compio-buf",
  "futures-util",
@@ -406,8 +400,7 @@ dependencies = [
 [[package]]
 name = "compio-log"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9dd867f29de59e4eff577dfeee3744cb0a264249f3faaf11945e8be79a3c3c62"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "tracing",
 ]
@@ -415,8 +408,7 @@ dependencies = [
 [[package]]
 name = "compio-macros"
 version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc53390a911fe6b317abe66c0583723539477f81a940e124b40d462fb976674a"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "darling",
  "proc-macro-crate",
@@ -428,8 +420,7 @@ dependencies = [
 [[package]]
 name = "compio-net"
 version = "0.12.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31737ec57865d2b46284def673cd21fe478c592ca05c1e040e10d457aac6c2a8"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "compio-buf",
  "compio-driver",
@@ -449,8 +440,7 @@ dependencies = [
 [[package]]
 name = "compio-runtime"
 version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "20406f0a4e69cdd0c0a58c4a7cf51bcc965a543fb5da2fe931e970354e291ded"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
 dependencies = [
  "compio-buf",
  "compio-driver",
@@ -2174,3 +2164,18 @@ name = "zmij"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
+
+[[patch.unused]]
+name = "compio-quic"
+version = "0.8.2"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
+
+[[patch.unused]]
+name = "compio-tls"
+version = "0.10.0"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
+
+[[patch.unused]]
+name = "compio-ws"
+version = "0.4.0"
+source = "git+https://github.com/thesues/compio.git?branch=fix%2Fcreatesocket-blocking-fallback-double-own#dc195069c0816eeabd8debface9d4634c7198ee3"
