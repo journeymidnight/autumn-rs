@@ -8,60 +8,75 @@ schedule, so the cluster serves a client older than itself.
 
 ---
 
-## 1. One version integer, two intervals
+## 1. One version integer, two constants
 
-`crates/rpc/src/lib.rs` carries three constants over ONE numbering space:
+`crates/rpc/src/lib.rs` carries TWO constants over ONE numbering space:
 
 | Constant | Meaning |
 |---|---|
-| `WIRE_VERSION_MAX` | the schema this binary speaks |
-| `WIRE_VERSION_MIN` | the oldest CLUSTER peer it interoperates with — equal to `MAX` |
-| `CLIENT_WIRE_MIN` | the oldest CLIENT it serves |
+| `WIRE_VERSION` | the schema this binary speaks |
+| `MIN_CLIENT_WIRE_VERSION` | the oldest CLIENT it serves |
 
-`WIRE_VERSION_MIN == WIRE_VERSION_MAX` keeps the cluster-internal protocol
-stop-the-world: manager, PS and EN binaries swap in one window, so they never
-face a peer of another version.
+They are the two ends of the client window `[MIN_CLIENT_WIRE_VERSION,
+WIRE_VERSION]` — the same shape a MongoDB server reports to a driver as
+`minWireVersion`/`maxWireVersion`. A cluster peer is not a point in that window;
+it must speak `WIRE_VERSION` exactly (§1.1), which is what keeps the internal
+protocol stop-the-world.
 
-`CLIENT_WIRE_MIN` is the floor of the client window
-`[CLIENT_WIRE_MIN, WIRE_VERSION_MAX]`. It moves ONLY when a change breaks the
-client-facing surface, which makes it the one constant a reviewer has to look at
-to answer "does this force every embedded image to be rebuilt". Raising
-`WIRE_VERSION_MAX` alone — the common case — leaves every client inside the
-window untouched.
+There is no separate constant for the cluster floor. "The oldest peer I
+interoperate with" pinned equal to the version I speak carries no information,
+and a `MIN`/`MAX` pair whose `MIN` answers a different question than its `MAX` is
+what made the earlier three-constant spelling unreadable.
+
+`MIN_CLIENT_WIRE_VERSION` moves ONLY when a change breaks the client-facing
+surface, which makes it the one constant a reviewer has to look at to answer
+"does this force every embedded image to be rebuilt". Raising `WIRE_VERSION`
+alone — the common case — leaves every client inside the window untouched.
 
 The etcd `cluster_version` key is unrelated: it is the operator-bumped feature
-gate for persisted formats, and its code compares against `WIRE_VERSION_MAX`
-only. `CLIENT_WIRE_MIN` is a property of a binary, not of a cluster, because
-stop-the-world already makes every server agree.
+gate for persisted formats, and its code compares against `WIRE_VERSION` only.
+`MIN_CLIENT_WIRE_VERSION` is a property of a binary, not of a cluster, because
+stop-the-world already makes every server agree. The pair is the same split
+Kafka draws between `inter.broker.protocol.version` and the per-API versions a
+client negotiates, and MongoDB between `featureCompatibilityVersion` and the
+wire version.
 
 ### 1.1 The two checks are different questions
 
-`GetClusterIdResp` is frozen (§4) and has one `wire_version_min` slot, so that
-slot carries **`CLIENT_WIRE_MIN`** — the floor is what a client needs, and a
-client already deployed today reads this field with code that cannot be changed.
+`GetClusterIdResp` is frozen (§4), so its FIELD names outlive the constants they
+carry:
+
+| Frozen field | Carries |
+|---|---|
+| `wire_version_max` | `WIRE_VERSION` |
+| `wire_version_min` | `MIN_CLIENT_WIRE_VERSION` |
+
+The floor goes in the `wire_version_min` slot because the floor is what a client
+needs, and a client already deployed reads that field with code that cannot be
+changed. **The constant names and the field names are deliberately not the same
+words; both sides carry a comment saying so.**
 
 That makes the existing `wire_compat_check` interval-overlap test wrong for
-cluster peers, and the error is silent in the dangerous direction. It computes
-`lo = max(LOCAL_MIN, remote_min)`, `hi = min(LOCAL_MAX, remote_max)`, and
-accepts when `lo <= hi`. A stale PS at 44 meeting a cluster reporting `[44, 45]`
-overlaps and is ADMITTED — the handshake was the only thing enforcing
-stop-the-world, and reporting a floor dissolves it.
+cluster peers, and wrong in the dangerous direction. It computes
+`lo = max(LOCAL_MIN, remote_min)`, `hi = min(LOCAL_MAX, remote_max)`, and accepts
+when `lo <= hi`. A stale PS at 44 meeting a cluster reporting `[44, 45]` overlaps
+and is ADMITTED — the handshake was the only thing enforcing stop-the-world, and
+reporting a floor dissolves it.
 
-**INVARIANT: a cluster peer requires exact equality, a client requires
-membership.**
+**INVARIANT: a cluster peer requires equality, a client requires membership.**
 
 - PS and EN, checking the manager (`crates/partition-server/src/lib.rs`,
   `crates/server/src/bin/extent_node.rs`): admit iff
-  `resp.wire_version_max == WIRE_VERSION_MAX`.
+  `resp.wire_version_max == WIRE_VERSION`.
 - A client, checking the cluster: admit iff
-  `resp.wire_version_min <= own MAX <= resp.wire_version_max`.
+  `resp.wire_version_min <= WIRE_VERSION(client) <= resp.wire_version_max`.
 
-Overlap is the wrong shape for both and must not survive as a shared helper;
-its doc comment and the tests that encode the old relation
-(`crates/rpc/src/lib.rs`) change with it.
+Overlap is the wrong shape for both and does not survive as a shared helper; its
+doc comment and the tests that encode the old relation (`crates/rpc/src/lib.rs`)
+go with it.
 
-Without this the window cannot open at all. A cluster at `MAX = 45` with
-`CLIENT_WIRE_MIN = 44`, answering `[45, 45]` to an in-window client at 44, makes
+Without this the window cannot open at all. A cluster at `WIRE_VERSION = 45`
+with the floor at 44, answering `[45, 45]` to an in-window client at 44, makes
 that client compute `lo = 45 > hi = 44` and **refuse itself** at connect.
 
 ## 2. The client-facing surface
@@ -131,7 +146,9 @@ it changes no existing struct.
 
 It is **hand-coded fixed-layout binary**, like `ReadBytesReq` and the other
 extent hot-path codecs, NOT rkyv — `[magic: u32][client_wire_version: u32]`,
-answered with `[code: u8][server_wire_max: u32][client_wire_min: u32]`. The
+answered with `[code: u8][server_wire_version: u32][min_client_wire_version: u32]`.
+Its own field names match the constants, because unlike `GetClusterIdResp` it is
+new and nothing already deployed reads it. The
 negotiation channel is the one message whose cross-version decode cannot be
 allowed to go wrong, and rkyv's archived root sits at the END of its buffer
 (`root_position = size - size_of::<T>()`), so a decoder reading a longer peer's
@@ -154,9 +171,9 @@ affected by its existence.
 bytes — a fixed instance, asserted byte for byte; rkyv's writer zeroes padding
 before resolving, so the encoding is deterministic. A comment declaring them
 frozen has already failed once: `GetClusterIdResp` lost its `wire_fingerprint`
-field in a commit that left `WIRE_VERSION_MAX` unchanged on both sides, which no
+field in a commit that left `WIRE_VERSION` unchanged on both sides, which no
 per-bump review can see. **The test's failure message prescribes the action —
-"this is a client-facing break: raise `CLIENT_WIRE_MIN`" — and never "update the
+"this is a client-facing break: raise `MIN_CLIENT_WIRE_VERSION`" — and never "update the
 recorded bytes".** The deleted schema fingerprint failed exactly there: each
 false alarm taught the reflex of refreshing the recorded value, which is how a
 real change gets waved through. A golden vector's one false-alarm mode is an
@@ -169,7 +186,7 @@ and moves what a field MEANS. That stays a review obligation (§7).
 ## 5. Admission is scoped to the client surface, not to the connection
 
 A connection that sends no hello is treated as the version in which the hello
-was introduced. Once `CLIENT_WIRE_MIN` rises above that version, such a
+was introduced. Once `MIN_CLIENT_WIRE_VERSION` rises above that version, such a
 connection is refused — **but only for the client-surface msg_types of §2.**
 
 The scoping is not a refinement; without it the first floor move is a cluster

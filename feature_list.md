@@ -286,13 +286,14 @@
     一样。**所以 Scope 2/3 的前置不是拆常量，是先让客户端留住协商到的版本并使调用点可以
     据此分支**；这一步小且自足，应当先做。encoding 迁移（含 prost）在这条路径上**不做**。
 - **notes** (2026-09-18, Scope 2/3 设计已写 — `docs/client_wire_compat_design.md`，代码未动):
-  形状 = 一个整数三个常量（`CLIENT_WIRE_MIN` 是唯一因"打断客户端"而动的数）+ 连接级
+  形状 = 一个整数**两个**常量 `WIRE_VERSION` / `MIN_CLIENT_WIRE_VERSION`（后者是唯一因
+  "打断客户端"而动的数）+ 连接级
   `MSG_CLIENT_HELLO`（手写定长二进制，非 rkyv）+ 沉默连接按引入版本对待 + EN 那条边靠
   PS 拒发 descriptor 转 proxy（EN 不获得版本概念）。评审逼出的两条决定性修正，别再踩:
   - **`wire_compat_check` 的区间重叠判据对这两个问题是错的，而且错在危险方向。**
     集群 `[45,45]`、窗口内客户端自己 `[44,44]` ⇒ `lo=45 > hi=44` ⇒ **客户端自己拒绝自己**，
     窗口根本开不出来。唯一可行解是让冻结的 `GetClusterIdResp.wire_version_min` 槽位改载
-    `CLIENT_WIRE_MIN`（已部署的老客户端读这个字段的代码改不了）；但这样一来陈旧 PS/EN
+    `MIN_CLIENT_WIRE_VERSION`（已部署的老客户端读这个字段的代码改不了）；但这样一来陈旧 PS/EN
     也会因重叠而被放行 —— **握手本来就是 stop-the-world 的唯一执行者**。所以集群 peer 的
     判据必须改成 `resp.wire_version_max == WIRE_VERSION_MAX` 精确相等，客户端才用区间包含。
   - **拒绝必须按 msg_type 划界，不能按连接划界，否则第一次抬地板就是集群停摆。**
@@ -303,6 +304,11 @@
     出去，hello 根本够不着）；PS 侧检查必须放在 `authz_gate` 的 `!gate_active()` 早退**之上**
     （否则 authz-off 集群上永不执行）；新客户端碰到老 PS 时 hello 会因 `extract_part_id`
     的 `_ => 0` 被当成 misroute 返回 `NotFound`，客户端要把它读作"服务端早于 hello"。
+  - **常量改名**（用户 2026-09-19，本条 Acceptance 文字按规则 8 不动，此处记映射）：
+    上面 Acceptance 里的 `CLIENT_WIRE_MIN` 即现在的 `MIN_CLIENT_WIRE_VERSION`，
+    `CLUSTER_WIRE_*` / `WIRE_VERSION_MAX` 即现在的 `WIRE_VERSION`；**只改名，判据不变**。
+    原来的三常量拼法里 `WIRE_VERSION_MIN`（集群下限，钉死 == MAX）在"peer 必须精确相等"
+    这条定下来之后就是同义反复，已删 —— MIN/MAX 这对名字读起来别扭的根因就是它。
 
 ### F-STREAM-ATREST-CKSUM — stream 层大 value 的 at-rest 内容校验 + scrub（静默腐化 G12）
 - **Trigger** (2026-08-04, chaos 缺口 loop 的 G12，已 reproduce-first 复现 harness `crates/manager/tests/silent_corruption_rot.rs`): sealed extent 的 **value 数据字节**在单副本上被静默翻位后，**全链无检测**：(a) 客户端读回坏字节仍返回 `CODE_OK`（frame CRC 明确排除 bulk value 段；`.meta` CRC 只覆盖 40B 元数据；WAL/SST CRC 是 partition 层、不覆盖 stream extent 的原始 value）；(b) recovery 从坏副本重填时 `verify` 只校 `length==sealed_length` + eversion、**不校内容** → 把腐化洗成权威；(c) EC 转换对坏字节直接编 parity → 固化成 canonical。stream 层**既无 per-extent/block content checksum、也无 scrubber**；确定性副本轮转让坏副本被一致选中（harness 里 25/64 子区间读命中）。这是**设计缺口**（数据完整性面），不是坏代码——today 的裸机盘不会自发翻位、且需要单副本静默腐化才触发，故不是"今天可复现的线上危害"，属于中期加固。
