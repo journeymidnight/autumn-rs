@@ -471,12 +471,27 @@ TRANSPORT failure fetching it is best-effort skipped (availability wins while th
 manager is briefly down — every subsequent RPC fails loudly anyway).
 
 `cluster_version` (manager etcd key `autumn-rs/cluster_version`, ASCII decimal) is the
-separate operator-bumped feature gate: `MSG_GET_CLUSTER_VERSION` (0x4A, fresh etcd
-read) / `MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, +1, capped at
-`WIRE_VERSION_MAX`, value-CAS'd). Bump via `autumn-op upgrade-version` only after every
-member runs the new binary; new wire/persisted formats gate on `cluster_version >= N`.
-Every manager decode of the persisted value fails closed (blocks leadership) when it
-exceeds the binary's own `WIRE_VERSION_MAX`.
+operator-bumped ROLLBACK LATCH: `MSG_GET_CLUSTER_VERSION` (0x4A, fresh etcd read) /
+`MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, +1, capped at `WIRE_VERSION_MAX`,
+value-CAS'd). Bump via `autumn-op upgrade-version` only after every member runs the new
+binary, which is why that command prints that rollback is no longer possible.
+
+**It gates PERSISTED formats only — never a wire format.** A wire change is settled by
+the restart itself: after a stop-the-world swap every live peer speaks the same version
+and no byte of the old shape exists anywhere, so there is nothing left for a gate to
+decide. Stored bytes are still there when the cluster comes back, so what needs a gate
+is the moment it becomes safe to START WRITING a shape the previous binary cannot read
+— which is exactly "everyone is upgraded and we are not going back". `cluster_version
+>= N` is that question and no other.
+
+The cap at `WIRE_VERSION_MAX` REUSES the wire numbering so the interlock is one
+comparison; it does not make this a wire version. The interlock is the latch's other
+side: every manager decode of the persisted value fails closed (blocks leadership) when
+it exceeds the binary's own `WIRE_VERSION_MAX`, so a rolled-back binary cannot come up
+against data written past its own horizon.
+
+Nothing in the tree gates on it yet, by design — the mechanism is in place and carries
+no resident evolution code until the first persisted change actually needs it.
 
 ## Notes
 

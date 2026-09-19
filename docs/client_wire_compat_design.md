@@ -395,6 +395,31 @@ runs in the harmless direction — a bump the persisted change did not need. The
 reverse, letting the stop-the-world window stand in for a migration, is the
 trade that loses data, and no version equality check can catch it.
 
+### 9.2 `cluster_version` is the rollback latch, and it gates stored formats only
+
+It follows from §9.1. A wire change is settled by the restart, so after the swap
+there is nothing a gate could still decide. A stored-format change is not
+settled, and what it needs is a point in time after which it is safe to START
+WRITING a shape the previous binary cannot read. That point is "every member runs
+the new binary and we are not going back", which is precisely what an operator
+asserts by bumping — and why `autumn-op upgrade-version` prints that rollback is
+no longer possible.
+
+So `cluster_version >= N` answers one question, "may I write the new format yet",
+and never "which form is on the wire". The cap at the binary's own wire version
+REUSES that numbering to keep the interlock a single comparison; it does not make
+this a wire version. The interlock is the latch's other side: a manager refuses
+leadership when the persisted value exceeds what its binary knows, so a
+rolled-back binary cannot come up against data written past its horizon.
+
+Nothing gates on it today, which is the intended state — the mechanism exists and
+carries no resident evolution code until a persisted change needs it.
+
+A type that is BOTH stored and sent needs both mechanisms at once, and that is
+the §9 accident rather than a design: after the split the stored half gates on
+`cluster_version` and the sent half on version equality, each under the rule that
+fits it.
+
 Types that straddle two homes are the residue of the same accident:
 `PayloadLocation` is a wire enum (`crates/rpc/src/extent_rpc.rs`) whose
 `as_byte()` value is persisted at `.meta` byte 41, and its `from_byte`'s
