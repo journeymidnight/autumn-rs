@@ -242,6 +242,19 @@ impl Code {
         if from > lines.len() {
             anyhow::bail!("{reported} has {} lines; start={from} is past the end", lines.len());
         }
+        // An INVERTED range — end before start — is the only other way into
+        // the slice below with a start past its end, and it panicked there.
+        // A panic here is not one bad answer: `#[compio::main]` runs the
+        // server on the main thread, so the unwind takes the process with it
+        // and every other caller loses its connection mid-call. read_file on
+        // code/autumn-rs/docs/ops.md with start=160 end=50 restarted the pod
+        // four times, and the agent that asked sat out a 300 s MCP timeout
+        // for each one. Say what was wrong with the arguments instead.
+        if from > to {
+            anyhow::bail!(
+                "{reported}: start={from} is after end={to}; the range is 1-based and inclusive"
+            );
+        }
         let capped = to.min(from + MAX_READ_LINES - 1);
         let body = lines[from - 1..capped].join("\n");
         Ok(json!({
@@ -629,6 +642,23 @@ mod tests {
     fn read_file_reports_a_start_past_the_end() {
         let (dir, root) = corpus("past-end");
         assert!(Code::read_within(&root, "sub/small.rs", "sub/small.rs", Some(99), None).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An inverted range used to panic on the slice, and a panic in this
+    /// server is a process exit — one caller's bad arguments dropped every
+    /// other caller's connection. It must be an error the caller can read.
+    #[test]
+    fn read_file_refuses_an_inverted_range() {
+        let (dir, root) = corpus("inverted");
+        let r = Code::read_within(&root, "big.rs", "big.rs", Some(160), Some(50));
+        let e = r.unwrap_err().to_string();
+        assert!(e.contains("start=160") && e.contains("end=50"), "{e}");
+        // The same inversion against a file SHORTER than either bound: `end`
+        // clamps to the line count first, so this is the shape the pod died
+        // on (start past a clamped `to`, but not past the file).
+        let r = Code::read_within(&root, "sub/small.rs", "sub/small.rs", Some(3), Some(1));
+        assert!(r.is_err(), "{r:?}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
