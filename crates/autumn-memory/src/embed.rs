@@ -152,6 +152,11 @@ const EMBED_TOKEN_BUDGET: usize = 7000;
 #[cfg(feature = "openai-embed")]
 const BATCH_TOKEN_BUDGET: usize = 7000;
 
+/// How many times one embedding request is tried before the caller hears
+/// about it.
+#[cfg(feature = "openai-embed")]
+const EMBED_ATTEMPTS: u32 = 3;
+
 /// At most this many inputs per request, whatever the token estimate says.
 /// The estimate can be wrong; a count cannot.
 #[cfg(feature = "openai-embed")]
@@ -289,13 +294,36 @@ impl OpenAiEmbedder {
         // nothing recursive about the problem.
         let mut out = Vec::with_capacity(clipped.len());
         for r in batches(&clipped) {
-            out.extend(self.embed_once(&clipped[r]).await?);
+            out.extend(self.embed_with_retry(&clipped[r]).await?);
         }
         Ok(out)
     }
 
+    /// `embed_once`, retried. An index run makes thousands of these calls
+    /// over minutes, against a server that may be restarting, reloading a
+    /// model or simply dropping an idle pooled connection; one such moment
+    /// ending the whole run is a poor trade against waiting a second. The
+    /// waits are short because the caller is already slow: a run does not
+    /// get faster by failing early, it just has to start over.
+    async fn embed_with_retry(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut last: Option<EmbedError> = None;
+        for attempt in 0..EMBED_ATTEMPTS {
+            if attempt > 0 {
+                compio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+            }
+            match self.embed_once(texts).await {
+                Ok(v) => return Ok(v),
+                // Silent between attempts on purpose: this crate has no
+                // logger, and the one failure that matters — the last —
+                // reaches the caller, which does.
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| EmbedError("embeddings call failed with no error".into())))
+    }
+
     /// One request, exactly as given. `embed_batch` is what decides how much
-    /// may go in one.
+    /// may go in one, and `embed_with_retry` how many times it is tried.
     async fn embed_once(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());

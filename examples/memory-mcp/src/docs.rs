@@ -270,6 +270,8 @@ pub async fn ingest_path(
     let mut doc_nodes: Vec<(String, Vec<u8>)> = Vec::new();
     let mut n_file = 0usize;
     let mut n_unreadable = 0usize;
+    // Chunks indexed without a vector — see the call site below.
+    let mut n_novec = 0usize;
     for path in &paths {
         // A file we cannot read is REPORTED, not skipped.
         //
@@ -326,8 +328,24 @@ pub async fn ingest_path(
                 "headings": c.headings, "start": c.start_line, "end": c.end_line,
             });
             let meta_b = serde_json::to_vec(&meta)?;
+            // A chunk whose embedding will not come is still indexed
+            // lexically. Same trade as the code indexer: one hard chunk must
+            // not cost the other 7432, and `n_novec` below refuses a run
+            // where NONE of them embedded, which is an embedder that is down
+            // rather than a corpus with a hard page in it.
             let vector = match emb {
-                Some(e) => Some(e.embed(&indexed).await?),
+                Some(e) => match e.embed(&indexed).await {
+                    Ok(v) => Some(v),
+                    Err(err) => {
+                        tracing::error!(
+                            file = %relpath, lines = format!("{}-{}", c.start_line, c.end_line),
+                            error = %err,
+                            "embedding failed; indexing this chunk lexically",
+                        );
+                        n_novec += 1;
+                        None
+                    }
+                },
                 None => None,
             };
 
@@ -357,6 +375,23 @@ pub async fn ingest_path(
     }
 
     let (n_chunk, n_edge) = (work.len(), work.len());
+
+    // Same rule as an unreadable corpus: a few chunks without vectors is a
+    // degraded index worth saying out loud, ALL of them is an embedder that
+    // is not working and must not be reported as a successful ingest.
+    if emb.is_some() && n_novec > 0 {
+        anyhow::ensure!(
+            n_novec < n_chunk,
+            "ingest: not one of {n_chunk} chunk(s) embedded — the embedder is not \
+             usable, and a corpus with no vector leg is not what this was asked to build",
+        );
+        tracing::warn!(
+            chunks = n_novec,
+            of = n_chunk,
+            "ingested without vectors: findable by search_docs' lexical mode, \
+             invisible to its vector mode",
+        );
+    }
 
     // Defer the `meta/stats` read-modify-write to a single update at the end.
     // Per document it was two round trips for a counter, and — because
