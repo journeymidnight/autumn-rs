@@ -154,9 +154,20 @@ FROM ${BASE_REGISTRY}library/debian:bookworm-slim
 # trailing `/debian` or `/` is trimmed first, because that is the form mirror
 # pages advertise and pasting it verbatim would otherwise yield `/debian/debian`.
 # The old single-line sources.list is handled too, for a base image that has one.
+#
+# https is DOWNGRADED to http in this stage, and it has to be. debian-slim
+# ships no CA bundle, so apt cannot verify any TLS certificate until
+# `ca-certificates` is installed — and that package is one of the two this
+# stage installs. An https mirror here fails every index fetch with "No
+# system certificates available. Try installing ca-certificates.", which is
+# apt asking for the thing it is being run to fetch. Plain http costs nothing
+# in trust: apt verifies the archive's GPG signature either way, and the base
+# image's own default is http://deb.debian.org. The builder stage above keeps
+# whatever scheme it was given — the rust image has certificates.
 ARG APT_MIRROR=
 RUN if [ -n "$APT_MIRROR" ]; then \
       m="${APT_MIRROR%/}"; m="${m%/debian}"; m="${m%/}"; \
+      m="http://${m#*://}"; \
       sed -i -E "s#https?://deb\.debian\.org#${m}#g; s#https?://security\.debian\.org#${m}#g" \
         /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
       echo "apt via ${m}"; \
