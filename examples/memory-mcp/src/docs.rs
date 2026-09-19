@@ -215,29 +215,24 @@ fn collect_docs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Path used in doc ids: relative to the current directory when possible so
-/// ids stay short and human-readable (`docs/ops.md`, not `/data/.../ops.md`).
+/// The id a document is stored under: its autumnfs path, i.e. where the file
+/// sits relative to `base` (the mountpoint).
 ///
-/// A cwd of `/` is NOT such a directory, and stripping it is where the id
-/// stopped being either form. In a container cwd is the filesystem root
-/// unless the image sets one, so `/mnt/autumn/docs/buda/x.md` was ingested
-/// as `mnt/autumn/docs/buda/x.md` -- absolute path, no leading slash, which
-/// `read_file` then resolved against its own root and could not find. The
-/// shortening is worth keeping where it shortens something; at the root it
-/// only removes the one character that says what the path is.
-fn display_path(p: &Path) -> String {
-    display_path_from(p, std::env::current_dir().ok().as_deref())
-}
-
-/// `display_path` with the working directory passed in. The cwd is process
-/// state and the tests run in parallel, so the rule cannot be exercised by
-/// chdir-ing; this is the rule, and the function above is the one lookup.
-fn display_path_from(p: &Path, cwd: Option<&Path>) -> String {
+/// The mountpoint does not belong in an id. It used to arrive through the
+/// process's cwd — the id was "relative to the current directory when
+/// possible", which in a container means relative to `/`, which means an
+/// absolute path with its first character removed: `/mnt/autumn/docs/x.md`
+/// went in as `mnt/autumn/docs/x.md` and resolved nowhere. Passing the base
+/// in is what makes the id say what it means, and makes an index built under
+/// one mountpoint readable under another.
+fn display_path(p: &Path, base: &Path) -> String {
     let abs = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    let cwd = cwd.filter(|c| c.parent().is_some());
-    match cwd.and_then(|cwd| abs.strip_prefix(cwd).ok().map(Path::to_path_buf)) {
-        Some(rel) => rel.to_string_lossy().into_owned(),
-        None => abs.to_string_lossy().into_owned(),
+    let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    match abs.strip_prefix(&base) {
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        // Outside the base: keep the path whole rather than invent a
+        // relative form. Only a misconfigured --fs-root gets here.
+        Err(_) => abs.to_string_lossy().into_owned(),
     }
 }
 
@@ -249,6 +244,7 @@ pub async fn ingest_path(
     store: &MemoryStore,
     emb: Option<&Embedder>,
     root: &Path,
+    base: &Path,
 ) -> Result<(usize, usize, usize)> {
     let mut paths = Vec::new();
     if root.is_file() {
@@ -298,7 +294,7 @@ pub async fn ingest_path(
         if chunks.is_empty() {
             continue;
         }
-        let relpath = display_path(path);
+        let relpath = display_path(path, base);
         let fname = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -435,29 +431,19 @@ async fn write_all(
 mod tests {
     use super::*;
 
-    /// The id is what `read_file` is handed back, so it has to stay a path
-    /// that resolves. A container's cwd is `/` unless the image sets one,
-    /// and stripping that prefix turned every absolute path into a relative
-    /// one by removing its first character: `/mnt/.../x.md` was ingested as
-    /// `mnt/.../x.md`, which resolved nowhere and took the MCP server's
-    /// circuit breaker down with it after three tries.
+    /// An id is an autumnfs path: where the file is, relative to the mount,
+    /// and nothing about the mount itself. The mountpoint is a pod-spec
+    /// argument — an index that records it is only readable by a container
+    /// that happens to mount in the same place.
     #[test]
-    fn a_root_cwd_is_not_stripped_from_an_id() {
-        let file = std::env::temp_dir().join(format!("mmcp-id-{}.md", std::process::id()));
+    fn an_id_is_the_path_inside_the_filesystem() {
+        let base = std::env::temp_dir().join(format!("mmcp-id-{}", std::process::id()));
+        let dir = base.join("docs/buda");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.md");
         std::fs::write(&file, "# t\n").unwrap();
-        let abs = file.canonicalize().unwrap();
-        assert_eq!(
-            display_path_from(&file, Some(Path::new("/"))),
-            abs.to_string_lossy(),
-            "a cwd of / must leave the path absolute",
-        );
-        // A real working directory still shortens, which is the point of the
-        // relative form in the first place.
-        assert_eq!(
-            display_path_from(&file, abs.parent()),
-            abs.file_name().unwrap().to_string_lossy(),
-        );
-        let _ = std::fs::remove_file(&file);
+        assert_eq!(display_path(&file, &base), "docs/buda/x.md");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// The corpus is packed on macOS, whose `tar` writes an AppleDouble

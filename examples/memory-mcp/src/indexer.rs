@@ -216,6 +216,7 @@ pub async fn index_path(
     store: &MemoryStore,
     emb: Option<&Embedder>,
     root: &Path,
+    base: &Path,
 ) -> Result<(usize, usize, usize)> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter::Language::new(tree_sitter_rust::LANGUAGE))?;
@@ -228,8 +229,11 @@ pub async fn index_path(
         let Ok(src) = std::fs::read(path) else {
             continue;
         };
+        // Relative to the FILESYSTEM, not to the tree being indexed: a
+        // symbol id and a document id are the same kind of name, and
+        // `read_file` resolves both by joining the mountpoint back on.
         let rel = path
-            .strip_prefix(root)
+            .strip_prefix(base)
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned();

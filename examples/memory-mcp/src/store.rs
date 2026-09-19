@@ -64,18 +64,15 @@ pub struct Code {
     /// lexical leg only, and says so, rather than answering vector queries with
     /// vectors that mean nothing.
     pub emb: Option<Rc<Embedder>>,
-    /// Every tree `read_file` may read from, and nothing else. A search hit
-    /// names a file and a line span; reading it is the caller's separate,
-    /// bounded act, and this is what bounds WHERE it can read.
-    ///
-    /// A LIST, not the code root alone. `--docs` corpora live outside the
-    /// indexed tree -- in the buda deployment they are the only corpus, and
-    /// `--root` is never passed, so it defaulted to this crate's repo path
-    /// baked in at BUILD time: a directory that does not exist in the pod.
-    /// Every read of an ingested document then failed twice over, once as
-    /// `cannot read <relative id>` (joined onto the phantom root) and once as
-    /// `<abs> is outside the indexed tree` (the prefix check against it), and
-    /// the agent had no third spelling to try.
+    /// Where autumnfs is mounted. An id is a path INSIDE that filesystem, so
+    /// this is what turns one back into bytes — and the reason the id itself
+    /// carries no trace of it.
+    pub fs_root: PathBuf,
+    /// Every tree `read_file` may read from, and nothing else: the corpora
+    /// this server indexes, as they are mounted right now. A search hit names
+    /// a file and a line span; reading it is the caller's separate, bounded
+    /// act, and this is what bounds WHERE it can read. The mount as a whole
+    /// is NOT the bound — `fs/` holds more than this agent's corpus.
     pub roots: Vec<PathBuf>,
 }
 
@@ -173,7 +170,12 @@ impl Code {
     /// Widening the roots does NOT widen the reach of any one of them: a
     /// path still has to resolve inside the tree it is checked against.
     pub fn read_file(&self, path: &str, start: Option<usize>, end: Option<usize>) -> Result<Value> {
-        Self::read_within_any(&self.roots, path, start, end)
+        // The argument is an autumnfs path — the `file` a hit reports, which
+        // is an id, which is a path in the filesystem. Leading `/` optional,
+        // the same latitude autumnfs' own CLI gives.
+        let joined = self.fs_root.join(path.trim_start_matches('/'));
+        let joined = joined.to_string_lossy().into_owned();
+        Self::read_within_any(&self.roots, &joined, path, start, end)
     }
 
     /// The body of `read_file`, without the store — same reason `read_within`
@@ -181,13 +183,14 @@ impl Code {
     /// worth testing here, and it needs no MemoryStore to exercise.
     fn read_within_any(
         roots: &[PathBuf],
-        path: &str,
+        resolved: &str,
+        reported: &str,
         start: Option<usize>,
         end: Option<usize>,
     ) -> Result<Value> {
         let mut first: Option<anyhow::Error> = None;
         for root in roots {
-            match Self::read_within(root, path, start, end) {
+            match Self::read_within(root, resolved, reported, start, end) {
                 Ok(v) => return Ok(v),
                 // Keep the FIRST tree's complaint, not the last. With several
                 // roots the last one is whichever happens to be configured
@@ -198,45 +201,51 @@ impl Code {
             }
         }
         Err(first.unwrap_or_else(|| {
-            anyhow::anyhow!("cannot read {path}: this server indexes no tree to read from")
+            anyhow::anyhow!("cannot read {reported}: this server indexes no tree to read from")
         }))
     }
 
     /// The body of `read_file`, without the store. Reading a file has nothing
     /// to do with the index, and keeping it free of `self` is what lets the
     /// confinement above be tested without standing up a MemoryStore.
+    ///
+    /// `resolved` is where to look on disk; `reported` is the autumnfs path
+    /// the caller named, and the only one an error may quote — an error that
+    /// answers in mountpoints teaches the caller a spelling that is not an
+    /// id and will not be one on the next pod.
     fn read_within(
         tree: &Path,
-        path: &str,
+        resolved: &str,
+        reported: &str,
         start: Option<usize>,
         end: Option<usize>,
     ) -> Result<Value> {
         let root = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
-        let joined = if Path::new(path).is_absolute() {
-            PathBuf::from(path)
+        let joined = if Path::new(resolved).is_absolute() {
+            PathBuf::from(resolved)
         } else {
-            root.join(path)
+            root.join(resolved)
         };
         let target = joined
             .canonicalize()
-            .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("cannot read {reported}: {e}"))?;
         if !target.starts_with(&root) {
-            anyhow::bail!("{path} is outside the indexed tree");
+            anyhow::bail!("{reported} is outside the indexed corpora");
         }
         let text = std::fs::read_to_string(&target)
-            .map_err(|e| anyhow::anyhow!("cannot read {path}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("cannot read {reported}: {e}"))?;
         let lines: Vec<&str> = text.lines().collect();
         // 1-based and inclusive, to match what a hit reports and what a human
         // reads off an editor gutter.
         let from = start.unwrap_or(1).max(1);
         let to = end.unwrap_or(lines.len()).min(lines.len());
         if from > lines.len() {
-            anyhow::bail!("{path} has {} lines; start={from} is past the end", lines.len());
+            anyhow::bail!("{reported} has {} lines; start={from} is past the end", lines.len());
         }
         let capped = to.min(from + MAX_READ_LINES - 1);
         let body = lines[from - 1..capped].join("\n");
         Ok(json!({
-            "file": path,
+            "file": reported,
             "start": from,
             "end": capped,
             "total_lines": lines.len(),
@@ -517,7 +526,7 @@ mod tests {
     #[test]
     fn read_file_returns_the_range_the_caller_asked_for() {
         let (dir, root) = corpus("range");
-        let v = Code::read_within(&root, "big.rs", Some(10), Some(12)).unwrap();
+        let v = Code::read_within(&root, "big.rs", "big.rs", Some(10), Some(12)).unwrap();
         assert_eq!(v["text"], json!("line 10\nline 11\nline 12"));
         assert_eq!(v["start"], json!(10));
         assert_eq!(v["end"], json!(12));
@@ -531,7 +540,7 @@ mod tests {
     #[test]
     fn read_file_is_capped_and_says_so() {
         let (dir, root) = corpus("capped");
-        let v = Code::read_within(&root, "big.rs", None, None).unwrap();
+        let v = Code::read_within(&root, "big.rs", "big.rs", None, None).unwrap();
         assert_eq!(v["truncated"], json!(true));
         assert_eq!(v["end"], json!(MAX_READ_LINES as u64));
         assert_eq!(v["text"].as_str().unwrap().lines().count(), MAX_READ_LINES);
@@ -546,14 +555,14 @@ mod tests {
     fn read_file_cannot_leave_the_indexed_tree() {
         let (dir, root) = corpus("escape");
         for escape in ["../fs.cred", "sub/../../fs.cred", "/etc/hostname"] {
-            let r = Code::read_within(&root, escape, None, None);
+            let r = Code::read_within(&root, escape, escape, None, None);
             assert!(r.is_err(), "{escape} must be refused, got {r:?}");
         }
         #[cfg(unix)]
         {
             let link = root.join("sneak");
             std::os::unix::fs::symlink(dir.join("fs.cred"), &link).unwrap();
-            let r = Code::read_within(&root, "sneak", None, None);
+            let r = Code::read_within(&root, "sneak", "sneak", None, None);
             assert!(r.is_err(), "a symlink out of the tree must be refused: {r:?}");
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -565,9 +574,40 @@ mod tests {
     #[test]
     fn read_file_falls_through_to_a_later_root() {
         let (dir, root) = corpus("fallthrough");
-        let phantom = PathBuf::from("/nonexistent/build/machine/checkout");
-        let v = Code::read_within_any(&[phantom, root], "sub/small.rs", None, None).unwrap();
+        let phantom = PathBuf::from("/nonexistent/one");
+        let target = root.join("sub/small.rs");
+        let v = Code::read_within_any(
+            &[phantom, root],
+            &target.to_string_lossy(),
+            "sub/small.rs",
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(v["text"], json!("a\nb\nc"));
+        // The answer names the caller's path, never the mountpoint it was
+        // resolved through.
+        assert_eq!(v["file"], json!("sub/small.rs"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The property the autumnfs paths buy: the same id reads through any
+    /// mountpoint, because the mountpoint is supplied at read time and the
+    /// id carries none of it.
+    #[test]
+    fn the_same_id_reads_through_any_mountpoint() {
+        let (dir, root) = corpus("mountpoint");
+        // Two "mounts" of the same tree: the real path, and a symlink to it
+        // standing in for a container that mounted somewhere else.
+        let id = "sub/small.rs";
+        let a = Code::read_within_any(&[root.clone()], &root.join(id).to_string_lossy(), id, None, None);
+        #[cfg(unix)]
+        {
+            let alt = dir.join("elsewhere");
+            std::os::unix::fs::symlink(&root, &alt).unwrap();
+            let b = Code::read_within_any(&[root.clone()], &alt.join(id).to_string_lossy(), id, None, None);
+            assert_eq!(a.unwrap()["text"], b.unwrap()["text"]);
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -576,9 +616,10 @@ mod tests {
     #[test]
     fn more_roots_do_not_widen_any_of_them() {
         let (dir, root) = corpus("many-roots");
-        let roots = [PathBuf::from("/nonexistent/one"), root, PathBuf::from("/nonexistent/two")];
+        let roots = [PathBuf::from("/nonexistent/one"), root.clone(), PathBuf::from("/nonexistent/two")];
         for escape in ["../fs.cred", "sub/../../fs.cred", "/etc/hostname"] {
-            let r = Code::read_within_any(&roots, escape, None, None);
+            let resolved = root.join(escape.trim_start_matches('/'));
+            let r = Code::read_within_any(&roots, &resolved.to_string_lossy(), escape, None, None);
             assert!(r.is_err(), "{escape} must be refused, got {r:?}");
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -587,7 +628,7 @@ mod tests {
     #[test]
     fn read_file_reports_a_start_past_the_end() {
         let (dir, root) = corpus("past-end");
-        assert!(Code::read_within(&root, "sub/small.rs", Some(99), None).is_err());
+        assert!(Code::read_within(&root, "sub/small.rs", "sub/small.rs", Some(99), None).is_err());
         let _ = std::fs::remove_dir_all(dir);
     }
 
