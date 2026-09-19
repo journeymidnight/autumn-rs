@@ -421,6 +421,31 @@ mod wire_version_tests {
 
     /// The window ships CLOSED, so this change serves every existing client
     /// exactly what it served before. Opening it is a separate, deliberate act.
+    ///
+    /// **This is the ONE tripwire, and it carries the whole checklist**, so
+    /// whoever opens the window gets one red and one instruction rather than
+    /// several that disagree. Delete this test, and then add the assertions
+    /// that only become capable of failing once the two constants differ —
+    /// every one of them is invisible today, not merely unwritten:
+    ///
+    /// 1. **The reported pair, from a live manager.** `GetClusterIdResp`
+    ///    (and `GetClusterVersionResp`) must carry `wire_version_max ==
+    ///    WIRE_VERSION` and `wire_version_min == MIN_CLIENT_WIRE_VERSION`.
+    ///    Swapped, `cluster_peer_compat_check` refuses every PS and EN at
+    ///    startup and the reversed range refuses every client.
+    ///    `crates/manager/tests/client_wire_admission.rs` asserts only
+    ///    `is_ok()` today, which both bounds satisfy.
+    /// 2. **The hello answer's order.** `client_hello::server_hello_resp` must
+    ///    put the ceiling first. `crates/partition-server/src/lib.rs`'s live
+    ///    round trip becomes discriminating on its own; the manager has no
+    ///    twin, so add one.
+    /// 3. **The silent-connection assumption.**
+    ///    `client_hello::admit_connection` must keep reading a silent
+    ///    connection as `WIRE_VERSION_WITH_CLIENT_HELLO` and not as
+    ///    `WIRE_VERSION` — the two are the same number today, so substituting
+    ///    one for the other changes nothing anywhere and no test can see it.
+    /// 4. **The refusal text**, which must name the real window rather than
+    ///    one bound twice.
     #[test]
     fn the_client_window_is_shut_until_someone_opens_it() {
         assert_eq!(MIN_CLIENT_WIRE_VERSION, WIRE_VERSION);

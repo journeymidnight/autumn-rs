@@ -151,9 +151,15 @@ it changes no existing struct.
 
 It is **hand-coded fixed-layout binary**, like `ReadBytesReq` and the other
 extent hot-path codecs, NOT rkyv — `[magic: u32][client_wire_version: u32]`,
-answered with `[code: u8][server_wire_version: u32][min_client_wire_version: u32]`.
+answered with `[server_wire_version: u32][min_client_wire_version: u32]`.
 Its own field names match the constants, because unlike `GetClusterIdResp` it is
-new and nothing already deployed reads it. The
+new and nothing already deployed reads it.
+
+There is no status byte in that reply. A refusal is an ordinary `FLAG_ERROR`
+frame carrying `FailedPrecondition` and text, because a refusal that cannot say
+WHICH WAY ROUND the mismatch is — rebuild the client, or deploy the cluster —
+is not worth sending, and the tree already has exactly one way to carry text.
+The
 negotiation channel is the one message whose cross-version decode cannot be
 allowed to go wrong, and rkyv's archived root sits at the END of its buffer
 (`root_position = size - size_of::<T>()`), so a decoder reading a longer peer's

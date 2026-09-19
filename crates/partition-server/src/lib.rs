@@ -5461,10 +5461,7 @@ fn authz_gate(
             Frame::response(
                 req_id,
                 msg_type,
-                Bytes::copy_from_slice(&autumn_rpc::client_hello::encode_hello_resp(
-                    autumn_rpc::WIRE_VERSION,
-                    autumn_rpc::MIN_CLIENT_WIRE_VERSION,
-                )),
+                Bytes::copy_from_slice(&autumn_rpc::client_hello::server_hello_resp()),
             )
             .encode(),
         );

@@ -112,8 +112,36 @@ pub fn parse_hello_resp(payload: &[u8]) -> Option<(u32, u32)> {
 /// The refusal names the cluster's version, because the fix differs by
 /// direction and the operator needs to know which.
 pub fn admit_client(client_wire_version: u32) -> std::result::Result<(), String> {
-    let lo = crate::MIN_CLIENT_WIRE_VERSION;
-    let hi = crate::WIRE_VERSION;
+    admit_client_within(
+        crate::MIN_CLIENT_WIRE_VERSION,
+        crate::WIRE_VERSION,
+        client_wire_version,
+    )
+}
+
+/// `admit_client` with the window supplied instead of reached for.
+///
+/// The mirror of `client_compat_check(remote_min, remote_max)`, which has taken
+/// its bounds as arguments since the two checks were split. This one did not,
+/// so no caller had ever handed the SERVER predicate an open window. (The
+/// client one had: `lib.rs`'s tests pass distinct bounds. What neither had ever
+/// done is put the checked version strictly INSIDE the window — every existing
+/// open-window call sits on a boundary.)
+///
+/// What an equal pair hides is narrower than it first looks, and worth stating
+/// precisely rather than grandly. The two refusal ARMS were always
+/// distinguishable, since the branch is on `v > hi` and not on the bounds —
+/// swapping the two pieces of advice reds the older test too. What it hides is
+/// (a) the window's INTERIOR, the only client this feature was built to keep
+/// serving, which did not exist as a value; and (b) anything that reads one
+/// bound where it means the other, the refusal text included: `[{lo},{hi}]`
+/// printed as `[{hi},{hi}]` renders identically until the day the window
+/// opens.
+pub fn admit_client_within(
+    lo: u32,
+    hi: u32,
+    client_wire_version: u32,
+) -> std::result::Result<(), String> {
     if (lo..=hi).contains(&client_wire_version) {
         return Ok(());
     }
@@ -134,7 +162,67 @@ rebuild its image from a commit inside that window"
 /// connection that sent no hello, which is assumed to speak
 /// `WIRE_VERSION_WITH_CLIENT_HELLO`.
 pub fn admit_connection(conn_wire_version: Option<u32>) -> std::result::Result<(), String> {
-    admit_client(conn_wire_version.unwrap_or(WIRE_VERSION_WITH_CLIENT_HELLO))
+    admit_connection_within(
+        crate::MIN_CLIENT_WIRE_VERSION,
+        crate::WIRE_VERSION,
+        conn_wire_version,
+    )
+}
+
+/// `admit_connection` with the window supplied. See `admit_client_within`.
+pub fn admit_connection_within(
+    lo: u32,
+    hi: u32,
+    conn_wire_version: Option<u32>,
+) -> std::result::Result<(), String> {
+    admit_client_within(
+        lo,
+        hi,
+        conn_wire_version.unwrap_or(WIRE_VERSION_WITH_CLIENT_HELLO),
+    )
+}
+
+/// The version pair this binary reports, mapped onto the FROZEN field names
+/// once instead of at every site that reports it.
+///
+/// The mapping is not mechanical, which is the whole reason it has a home:
+/// `wire_version_min` does not carry a cluster minimum, it carries
+/// `MIN_CLIENT_WIRE_VERSION`, a CLIENT floor — the names were frozen before
+/// the two questions were told apart, and `GetClusterIdResp` is the
+/// negotiation channel, so they cannot be renamed. Someone filling those
+/// fields from the names alone gets it wrong.
+///
+/// The stakes are why this exists rather than the hello's. A swapped pair here
+/// reaches every partition server and extent node at startup
+/// (`cluster_peer_compat_check(resp.wire_version_max)`), every pre-hello
+/// client, `ClusterClient::connect`, and `autumn-op`: once the window opens,
+/// `max` carrying the floor refuses every server's startup check and the
+/// reversed range refuses every client. Today, with the constants equal, the
+/// swap is invisible to every test in the tree — so the answer is one site,
+/// not a test that cannot see it.
+pub struct ReportedWireVersions {
+    /// → `wire_version_min`. The oldest CLIENT served.
+    pub min: u32,
+    /// → `wire_version_max`. What this binary speaks.
+    pub max: u32,
+}
+
+pub fn reported_wire_versions() -> ReportedWireVersions {
+    ReportedWireVersions {
+        min: crate::MIN_CLIENT_WIRE_VERSION,
+        max: crate::WIRE_VERSION,
+    }
+}
+
+/// The hello response THIS server sends, built in one place for the same
+/// reason as `reported_wire_versions` — though with lower stakes, since the
+/// only production reader of `parse_hello_resp` keeps the first number and
+/// discards the second (`crates/client/src/lib.rs`). A swap here would make
+/// `negotiated_cluster_wire` the floor rather than the ceiling; nothing
+/// branches on it yet, so that is a latent wrong value, not an outage.
+pub fn server_hello_resp() -> [u8; CLIENT_HELLO_RESP_LEN] {
+    let v = reported_wire_versions();
+    encode_hello_resp(v.max, v.min)
 }
 
 /// The PS msg_types an EMBEDDED CLIENT sends — the set admission is scoped to.
@@ -290,6 +378,58 @@ mod tests {
         assert!(too_old.contains("older"), "{too_old}");
         assert!(too_old.contains("rebuild"), "{too_old}");
     }
+
+    #[test]
+    fn an_open_window_admits_its_whole_range_and_refuses_outside_it() {
+        // The configuration this feature exists for: `lo < hi`, with the
+        // checked version strictly INSIDE. No test anywhere had done that —
+        // `lib.rs` does pass the client predicate distinct bounds, but always
+        // with the version on a boundary.
+        //
+        // The two ARMS were always reachable — the branch is on `v > hi`, not
+        // on the bounds, so the existing test already drove both (confirmed by
+        // ablation: swapping the two pieces of advice reds it too). What an
+        // equal pair could not express is the interior, and a refusal message
+        // that reads one bound where it means the other.
+        let (lo, hi) = (40, 45);
+        for v in lo..=hi {
+            assert!(
+                admit_client_within(lo, hi, v).is_ok(),
+                "{v} is inside [{lo},{hi}]"
+            );
+        }
+
+        let below = admit_client_within(lo, hi, lo - 1).unwrap_err();
+        assert!(below.contains("older"), "{below}");
+        assert!(below.contains("rebuild its image"), "{below}");
+
+        let above = admit_client_within(lo, hi, hi + 1).unwrap_err();
+        assert!(above.contains("NEWER"), "{above}");
+        assert!(above.contains("deploy the cluster"), "{above}");
+
+        // Both name the window AND the cluster's own version, because the
+        // operator's next move depends on which side of it they are on. Two
+        // separate numbers that render identically while the window is shut.
+        for msg in [&below, &above] {
+            assert!(msg.contains("[40,45]"), "{msg}");
+            assert!(msg.contains("speaks 45"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn a_pre_hello_client_falls_out_of_the_window_when_the_floor_passes_it() {
+        // A silent connection is read as the version the hello arrived in, so
+        // raising the floor past that literal is exactly what stops serving
+        // every client built before the handshake existed. That is the
+        // intended effect of raising it, and it is the reason raising it is a
+        // decision about rebuilding images rather than an edit.
+        let v = WIRE_VERSION_WITH_CLIENT_HELLO;
+        assert!(admit_connection_within(v, v + 2, None).is_ok());
+        let refused = admit_connection_within(v + 1, v + 2, None).unwrap_err();
+        assert!(refused.contains("older"), "{refused}");
+        assert!(refused.contains("rebuild its image"), "{refused}");
+    }
+
 
     #[test]
     fn a_silent_connection_is_the_version_the_hello_arrived_in() {

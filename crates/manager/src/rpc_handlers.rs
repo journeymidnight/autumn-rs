@@ -296,10 +296,7 @@ impl AutumnManager {
                 Frame::response(
                     req_id,
                     msg_type,
-                    Bytes::copy_from_slice(&client_hello::encode_hello_resp(
-                        autumn_rpc::WIRE_VERSION,
-                        autumn_rpc::MIN_CLIENT_WIRE_VERSION,
-                    )),
+                    Bytes::copy_from_slice(&client_hello::server_hello_resp()),
                 )
                 .encode(),
             );
@@ -439,8 +436,8 @@ impl AutumnManager {
                 code: CODE_ERROR,
                 message: "manager not yet bootstrapped".to_string(),
                 cluster_id: String::new(),
-                wire_version_min: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
-                wire_version_max: autumn_rpc::WIRE_VERSION,
+                wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
+                wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
                 cluster_version: self.cluster_version.get(),
             }));
         }
@@ -448,8 +445,8 @@ impl AutumnManager {
             code: CODE_OK,
             message: String::new(),
             cluster_id: id,
-            wire_version_min: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
-            wire_version_max: autumn_rpc::WIRE_VERSION,
+            wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
+            wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
             cluster_version: self.cluster_version.get(),
         }))
     }
@@ -1103,8 +1100,8 @@ impl AutumnManager {
                                 code: CODE_ERROR,
                                 message: err.to_string(),
                                 cluster_version: self.cluster_version.get(),
-                                wire_version_min: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
-                                wire_version_max: autumn_rpc::WIRE_VERSION,
+                                wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
+                                wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
                             }));
                         }
                     }
@@ -1115,8 +1112,8 @@ impl AutumnManager {
             code: CODE_OK,
             message: String::new(),
             cluster_version: self.cluster_version.get(),
-            wire_version_min: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
-            wire_version_max: autumn_rpc::WIRE_VERSION,
+            wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
+            wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
         }))
     }
 
