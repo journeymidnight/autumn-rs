@@ -141,6 +141,34 @@ impl StaticTableEmbedder {
 ///
 /// The point of this variant is that the model is somebody else's problem: run
 /// llama.cpp on spare CPU, and point this at it.
+/// Token budget for one embedding input, under BGE-M3's 8192-token context
+/// with room for the server's own framing.
+#[cfg(feature = "openai-embed")]
+const EMBED_TOKEN_BUDGET: usize = 7000;
+
+/// Cut `text` to something the embedding server will accept.
+///
+/// Tokens are estimated, not counted: this crate has no tokenizer and pulling
+/// one in to guard a rare case would cost every build. The estimate weights
+/// ASCII at 1/3 of a token (English and code average ~4 chars per token) and
+/// everything else at a whole one, because CJK runs about a token per
+/// character — a single char budget cannot serve both, and the Chinese corpus
+/// is the one that would silently lose its tail under a code-shaped guess.
+/// Deliberately conservative: an input clipped a little short still embeds to
+/// something useful, while one token too many is a 500 that ends the run.
+#[cfg(feature = "openai-embed")]
+fn clip(text: &str) -> &str {
+    let mut est = 0f32;
+    for (i, ch) in text.char_indices() {
+        est += if ch.is_ascii() { 1.0 / 3.0 } else { 1.0 };
+        if est > EMBED_TOKEN_BUDGET as f32 {
+            // `char_indices` gives a boundary, so this never splits a char.
+            return &text[..i];
+        }
+    }
+    text
+}
+
 #[cfg(feature = "openai-embed")]
 pub struct OpenAiEmbedder {
     client: cyper::Client,
@@ -199,11 +227,19 @@ impl OpenAiEmbedder {
     /// One request for many texts, because the endpoint is batch-shaped and an
     /// index run is a loop. A caller that embeds one at a time pays a round
     /// trip per document.
+    ///
+    /// Inputs are CLIPPED to the model's context first — see `clip`. An
+    /// embedding server refuses an over-long input with a 500, and one such
+    /// input in a corpus is enough to end an index run that had no other
+    /// problem: a 8372-token `impl` block stopped a 200-file repo at the
+    /// first file, over and over, because the failure is fatal and the retry
+    /// starts from the same symbol.
     pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
-        let body = serde_json::json!({ "model": self.model, "input": texts });
+        let clipped: Vec<&str> = texts.iter().map(|t| clip(t)).collect();
+        let body = serde_json::json!({ "model": self.model, "input": clipped });
 
         let mut req = self
             .client
@@ -424,6 +460,29 @@ impl Embedder {
 #[cfg(all(test, feature = "openai-embed"))]
 mod openai_tests {
     use super::*;
+
+    /// Code and prose have to fit through the same budget, and the two have
+    /// token densities that differ by 3x. Whatever the estimate is, a clipped
+    /// input must stay valid UTF-8 and must not exceed the budget on the
+    /// worst input (every char a token).
+    #[test]
+    fn clip_keeps_both_alphabets_under_the_budget() {
+        let ascii = "fn f() { }\n".repeat(20_000);
+        let clipped = clip(&ascii);
+        assert!(clipped.len() < ascii.len(), "an oversized input must be cut");
+        assert!(clipped.len() <= EMBED_TOKEN_BUDGET * 3 + 1);
+
+        // One token per char, the dense case: the cut lands at a char
+        // boundary (slicing mid-char would panic) and inside the budget.
+        let cjk = "地藏菩萨本愿经".repeat(5_000);
+        let clipped = clip(&cjk);
+        assert!(clipped.chars().count() <= EMBED_TOKEN_BUDGET);
+        assert!(cjk.starts_with(clipped));
+
+        // Short inputs are handed through untouched — the common case must
+        // not pay for the guard.
+        assert_eq!(clip("hello"), "hello");
+    }
 
     /// The three shapes people paste. Getting this wrong costs a 404 that reads
     /// like a missing model rather than a wrong path.
