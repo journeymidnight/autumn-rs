@@ -59,6 +59,27 @@ RUN if [ -n "$GITHUB_MIRROR" ]; then \
 # it pulls autumn-fuse with default-features = false (key/schema modules only) —
 # but the fuse daemon is now shipped so a consumer pod can mount the `fs/`
 # namespace as a POSIX filesystem (docs/ops.md "Fuse daemon runbook").
+# Optional Debian mirror for the apt steps in this stage. Empty (default) →
+# whatever the base image ships (deb.debian.org), unchanged for everyone else.
+# On a China/Volcengine runner deb.debian.org is slow or unreachable:
+#   --build-arg APT_MIRROR=https://mirrors.ivolces.com
+#
+# Pass the HOST, not a full archive path. bookworm's sources are deb822
+# (/etc/apt/sources.list.d/debian.sources) and name the archive and the security
+# archive as two paths under ONE host:
+#   URIs: http://deb.debian.org/debian
+#   URIs: http://deb.debian.org/debian-security
+# so replacing the host alone redirects both and keeps the suffixes intact. A
+# trailing `/debian` or `/` is trimmed first, because that is the form mirror
+# pages advertise and pasting it verbatim would otherwise yield `/debian/debian`.
+# The old single-line sources.list is handled too, for a base image that has one.
+ARG APT_MIRROR=
+RUN if [ -n "$APT_MIRROR" ]; then \
+      m="${APT_MIRROR%/}"; m="${m%/debian}"; m="${m%/}"; \
+      sed -i -E "s#https?://deb\.debian\.org#${m}#g; s#https?://security\.debian\.org#${m}#g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
+      echo "apt via ${m}"; \
+    fi
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libfuse3-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -119,6 +140,38 @@ FROM ${BASE_REGISTRY}library/debian:bookworm-slim
 # before it ever looks at the URL, so even an in-cluster `http://` embedder
 # cannot start. An external HTTPS embedding service (what
 # `--embed-api-key-file` exists for) needs the roots for real.
+# Optional Debian mirror for the apt steps in this stage. Empty (default) →
+# whatever the base image ships (deb.debian.org), unchanged for everyone else.
+# On a China/Volcengine runner deb.debian.org is slow or unreachable:
+#   --build-arg APT_MIRROR=https://mirrors.ivolces.com
+#
+# Pass the HOST, not a full archive path. bookworm's sources are deb822
+# (/etc/apt/sources.list.d/debian.sources) and name the archive and the security
+# archive as two paths under ONE host:
+#   URIs: http://deb.debian.org/debian
+#   URIs: http://deb.debian.org/debian-security
+# so replacing the host alone redirects both and keeps the suffixes intact. A
+# trailing `/debian` or `/` is trimmed first, because that is the form mirror
+# pages advertise and pasting it verbatim would otherwise yield `/debian/debian`.
+# The old single-line sources.list is handled too, for a base image that has one.
+#
+# https is DOWNGRADED to http in this stage, and it has to be. debian-slim
+# ships no CA bundle, so apt cannot verify any TLS certificate until
+# `ca-certificates` is installed — and that package is one of the two this
+# stage installs. An https mirror here fails every index fetch with "No
+# system certificates available. Try installing ca-certificates.", which is
+# apt asking for the thing it is being run to fetch. Plain http costs nothing
+# in trust: apt verifies the archive's GPG signature either way, and the base
+# image's own default is http://deb.debian.org. The builder stage above keeps
+# whatever scheme it was given — the rust image has certificates.
+ARG APT_MIRROR=
+RUN if [ -n "$APT_MIRROR" ]; then \
+      m="${APT_MIRROR%/}"; m="${m%/debian}"; m="${m%/}"; \
+      m="http://${m#*://}"; \
+      sed -i -E "s#https?://deb\.debian\.org#${m}#g; s#https?://security\.debian\.org#${m}#g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
+      echo "apt via ${m}"; \
+    fi
 RUN apt-get update \
     && apt-get install -y --no-install-recommends fuse3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*

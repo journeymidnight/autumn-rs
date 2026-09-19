@@ -141,6 +141,84 @@ impl StaticTableEmbedder {
 ///
 /// The point of this variant is that the model is somebody else's problem: run
 /// llama.cpp on spare CPU, and point this at it.
+/// Token budget for one embedding input, under BGE-M3's 8192-token context
+/// with room for the server's own framing.
+#[cfg(feature = "openai-embed")]
+const EMBED_TOKEN_BUDGET: usize = 7000;
+
+/// How many estimated tokens one REQUEST may carry. The server's physical
+/// batch is 8192 tokens; a request that asks it to embed more than that in
+/// one go is refused or, worse, dropped at the connection.
+#[cfg(feature = "openai-embed")]
+const BATCH_TOKEN_BUDGET: usize = 7000;
+
+/// How many times one embedding request is tried before the caller hears
+/// about it.
+#[cfg(feature = "openai-embed")]
+const EMBED_ATTEMPTS: u32 = 3;
+
+/// At most this many inputs per request, whatever the token estimate says.
+/// The estimate can be wrong; a count cannot.
+#[cfg(feature = "openai-embed")]
+const BATCH_MAX_INPUTS: usize = 64;
+
+/// Estimated tokens for one input — see `clip` for why ASCII counts a third.
+#[cfg(feature = "openai-embed")]
+fn est_tokens(text: &str) -> usize {
+    let ascii = text.chars().filter(|c| c.is_ascii()).count();
+    let wide = text.chars().count() - ascii;
+    ascii / 3 + wide
+}
+
+/// Split `texts` into request-sized runs. Order is preserved and every input
+/// appears exactly once, because the caller matches vectors to inputs by
+/// position and a lost one leaves a symbol invisible to vector search with
+/// nothing to say so.
+#[cfg(feature = "openai-embed")]
+fn batches(texts: &[&str]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut tokens = 0usize;
+    for (i, t) in texts.iter().enumerate() {
+        let n = est_tokens(t);
+        let full = i - start >= BATCH_MAX_INPUTS;
+        let over = i > start && tokens + n > BATCH_TOKEN_BUDGET;
+        if full || over {
+            out.push(start..i);
+            start = i;
+            tokens = 0;
+        }
+        tokens += n;
+    }
+    if start < texts.len() {
+        out.push(start..texts.len());
+    }
+    out
+}
+
+/// Cut `text` to something the embedding server will accept.
+///
+/// Tokens are estimated, not counted: this crate has no tokenizer and pulling
+/// one in to guard a rare case would cost every build. The estimate weights
+/// ASCII at 1/3 of a token (English and code average ~4 chars per token) and
+/// everything else at a whole one, because CJK runs about a token per
+/// character — a single char budget cannot serve both, and the Chinese corpus
+/// is the one that would silently lose its tail under a code-shaped guess.
+/// Deliberately conservative: an input clipped a little short still embeds to
+/// something useful, while one token too many is a 500 that ends the run.
+#[cfg(feature = "openai-embed")]
+fn clip(text: &str) -> &str {
+    let mut est = 0f32;
+    for (i, ch) in text.char_indices() {
+        est += if ch.is_ascii() { 1.0 / 3.0 } else { 1.0 };
+        if est > EMBED_TOKEN_BUDGET as f32 {
+            // `char_indices` gives a boundary, so this never splits a char.
+            return &text[..i];
+        }
+    }
+    text
+}
+
 #[cfg(feature = "openai-embed")]
 pub struct OpenAiEmbedder {
     client: cyper::Client,
@@ -199,7 +277,54 @@ impl OpenAiEmbedder {
     /// One request for many texts, because the endpoint is batch-shaped and an
     /// index run is a loop. A caller that embeds one at a time pays a round
     /// trip per document.
+    ///
+    /// Inputs are CLIPPED to the model's context first — see `clip`. An
+    /// embedding server refuses an over-long input with a 500, and one such
+    /// input in a corpus is enough to end an index run that had no other
+    /// problem: a 8372-token `impl` block stopped a 200-file repo at the
+    /// first file, over and over, because the failure is fatal and the retry
+    /// starts from the same symbol.
     pub async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let clipped: Vec<&str> = texts.iter().map(|t| clip(t)).collect();
+        // One request per run, concatenated in order. A loop rather than
+        // recursion: an async fn that calls itself needs boxing, and there is
+        // nothing recursive about the problem.
+        let mut out = Vec::with_capacity(clipped.len());
+        for r in batches(&clipped) {
+            out.extend(self.embed_with_retry(&clipped[r]).await?);
+        }
+        Ok(out)
+    }
+
+    /// `embed_once`, retried. An index run makes thousands of these calls
+    /// over minutes, against a server that may be restarting, reloading a
+    /// model or simply dropping an idle pooled connection; one such moment
+    /// ending the whole run is a poor trade against waiting a second. The
+    /// waits are short because the caller is already slow: a run does not
+    /// get faster by failing early, it just has to start over.
+    async fn embed_with_retry(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        let mut last: Option<EmbedError> = None;
+        for attempt in 0..EMBED_ATTEMPTS {
+            if attempt > 0 {
+                compio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+            }
+            match self.embed_once(texts).await {
+                Ok(v) => return Ok(v),
+                // Silent between attempts on purpose: this crate has no
+                // logger, and the one failure that matters — the last —
+                // reaches the caller, which does.
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap_or_else(|| EmbedError("embeddings call failed with no error".into())))
+    }
+
+    /// One request, exactly as given. `embed_batch` is what decides how much
+    /// may go in one, and `embed_with_retry` how many times it is tried.
+    async fn embed_once(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -424,6 +549,59 @@ impl Embedder {
 #[cfg(all(test, feature = "openai-embed"))]
 mod openai_tests {
     use super::*;
+
+    /// A caller hands one file's symbols to `embed_batch` — hundreds of them
+    /// for a big source file — and the server has a physical batch of 8192
+    /// tokens. Unsplit, that request is refused or dropped at the connection
+    /// (`hyper client error (SendRequest)`), which ends the index run.
+    #[test]
+    fn batches_stay_within_one_request() {
+        let one = "x".repeat(3_000); // ~1000 estimated tokens
+        let texts: Vec<&str> = std::iter::repeat(one.as_str()).take(30).collect();
+        let runs = batches(&texts);
+        assert!(runs.len() > 1, "30k tokens must not go in one request");
+        for r in &runs {
+            let sum: usize = texts[r.clone()].iter().map(|t| est_tokens(t)).sum();
+            // One input alone may exceed the budget (clip already bounded it);
+            // two or more may not.
+            assert!(sum <= BATCH_TOKEN_BUDGET || r.len() == 1, "run {r:?} sums to {sum}");
+        }
+        // Every input exactly once, in order.
+        let covered: Vec<usize> = runs.iter().flat_map(|r| r.clone()).collect();
+        assert_eq!(covered, (0..texts.len()).collect::<Vec<_>>());
+    }
+
+    /// The count bound catches what the token estimate cannot.
+    #[test]
+    fn a_long_run_of_tiny_inputs_is_still_split() {
+        let texts: Vec<&str> = std::iter::repeat("a").take(500).collect();
+        let runs = batches(&texts);
+        assert!(runs.iter().all(|r| r.len() <= BATCH_MAX_INPUTS));
+        assert_eq!(runs.iter().map(|r| r.len()).sum::<usize>(), 500);
+    }
+
+    /// Code and prose have to fit through the same budget, and the two have
+    /// token densities that differ by 3x. Whatever the estimate is, a clipped
+    /// input must stay valid UTF-8 and must not exceed the budget on the
+    /// worst input (every char a token).
+    #[test]
+    fn clip_keeps_both_alphabets_under_the_budget() {
+        let ascii = "fn f() { }\n".repeat(20_000);
+        let clipped = clip(&ascii);
+        assert!(clipped.len() < ascii.len(), "an oversized input must be cut");
+        assert!(clipped.len() <= EMBED_TOKEN_BUDGET * 3 + 1);
+
+        // One token per char, the dense case: the cut lands at a char
+        // boundary (slicing mid-char would panic) and inside the budget.
+        let cjk = "地藏菩萨本愿经".repeat(5_000);
+        let clipped = clip(&cjk);
+        assert!(clipped.chars().count() <= EMBED_TOKEN_BUDGET);
+        assert!(cjk.starts_with(clipped));
+
+        // Short inputs are handed through untouched — the common case must
+        // not pay for the guard.
+        assert_eq!(clip("hello"), "hello");
+    }
 
     /// The three shapes people paste. Getting this wrong costs a 404 that reads
     /// like a missing model rather than a wrong path.

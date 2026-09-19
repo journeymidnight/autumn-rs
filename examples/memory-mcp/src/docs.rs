@@ -215,13 +215,24 @@ fn collect_docs(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Path used in doc ids: relative to the current directory when possible so
-/// ids stay short and human-readable (`docs/ops.md`, not `/data/.../ops.md`).
-fn display_path(p: &Path) -> String {
+/// The id a document is stored under: its autumnfs path, i.e. where the file
+/// sits relative to `base` (the mountpoint).
+///
+/// The mountpoint does not belong in an id. It used to arrive through the
+/// process's cwd — the id was "relative to the current directory when
+/// possible", which in a container means relative to `/`, which means an
+/// absolute path with its first character removed: `/mnt/autumn/docs/x.md`
+/// went in as `mnt/autumn/docs/x.md` and resolved nowhere. Passing the base
+/// in is what makes the id say what it means, and makes an index built under
+/// one mountpoint readable under another.
+fn display_path(p: &Path, base: &Path) -> String {
     let abs = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    match std::env::current_dir().ok().and_then(|cwd| abs.strip_prefix(&cwd).ok().map(Path::to_path_buf)) {
-        Some(rel) => rel.to_string_lossy().into_owned(),
-        None => abs.to_string_lossy().into_owned(),
+    let base = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    match abs.strip_prefix(&base) {
+        Ok(rel) => rel.to_string_lossy().into_owned(),
+        // Outside the base: keep the path whole rather than invent a
+        // relative form. Only a misconfigured --fs-root gets here.
+        Err(_) => abs.to_string_lossy().into_owned(),
     }
 }
 
@@ -233,6 +244,7 @@ pub async fn ingest_path(
     store: &MemoryStore,
     emb: Option<&Embedder>,
     root: &Path,
+    base: &Path,
 ) -> Result<(usize, usize, usize)> {
     let mut paths = Vec::new();
     if root.is_file() {
@@ -258,6 +270,8 @@ pub async fn ingest_path(
     let mut doc_nodes: Vec<(String, Vec<u8>)> = Vec::new();
     let mut n_file = 0usize;
     let mut n_unreadable = 0usize;
+    // Chunks indexed without a vector — see the call site below.
+    let mut n_novec = 0usize;
     for path in &paths {
         // A file we cannot read is REPORTED, not skipped.
         //
@@ -282,7 +296,7 @@ pub async fn ingest_path(
         if chunks.is_empty() {
             continue;
         }
-        let relpath = display_path(path);
+        let relpath = display_path(path, base);
         let fname = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -314,8 +328,24 @@ pub async fn ingest_path(
                 "headings": c.headings, "start": c.start_line, "end": c.end_line,
             });
             let meta_b = serde_json::to_vec(&meta)?;
+            // A chunk whose embedding will not come is still indexed
+            // lexically. Same trade as the code indexer: one hard chunk must
+            // not cost the other 7432, and `n_novec` below refuses a run
+            // where NONE of them embedded, which is an embedder that is down
+            // rather than a corpus with a hard page in it.
             let vector = match emb {
-                Some(e) => Some(e.embed(&indexed).await?),
+                Some(e) => match e.embed(&indexed).await {
+                    Ok(v) => Some(v),
+                    Err(err) => {
+                        tracing::error!(
+                            file = %relpath, lines = format!("{}-{}", c.start_line, c.end_line),
+                            error = %err,
+                            "embedding failed; indexing this chunk lexically",
+                        );
+                        n_novec += 1;
+                        None
+                    }
+                },
                 None => None,
             };
 
@@ -345,6 +375,23 @@ pub async fn ingest_path(
     }
 
     let (n_chunk, n_edge) = (work.len(), work.len());
+
+    // Same rule as an unreadable corpus: a few chunks without vectors is a
+    // degraded index worth saying out loud, ALL of them is an embedder that
+    // is not working and must not be reported as a successful ingest.
+    if emb.is_some() && n_novec > 0 {
+        anyhow::ensure!(
+            n_novec < n_chunk,
+            "ingest: not one of {n_chunk} chunk(s) embedded — the embedder is not \
+             usable, and a corpus with no vector leg is not what this was asked to build",
+        );
+        tracing::warn!(
+            chunks = n_novec,
+            of = n_chunk,
+            "ingested without vectors: findable by search_docs' lexical mode, \
+             invisible to its vector mode",
+        );
+    }
 
     // Defer the `meta/stats` read-modify-write to a single update at the end.
     // Per document it was two round trips for a counter, and — because
@@ -418,6 +465,21 @@ async fn write_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An id is an autumnfs path: where the file is, relative to the mount,
+    /// and nothing about the mount itself. The mountpoint is a pod-spec
+    /// argument — an index that records it is only readable by a container
+    /// that happens to mount in the same place.
+    #[test]
+    fn an_id_is_the_path_inside_the_filesystem() {
+        let base = std::env::temp_dir().join(format!("mmcp-id-{}", std::process::id()));
+        let dir = base.join("docs/buda");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.md");
+        std::fs::write(&file, "# t\n").unwrap();
+        assert_eq!(display_path(&file, &base), "docs/buda/x.md");
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// The corpus is packed on macOS, whose `tar` writes an AppleDouble
     /// sidecar per file: `._ops.md` beside `ops.md`, same extension, binary

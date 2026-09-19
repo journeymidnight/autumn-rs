@@ -216,6 +216,7 @@ pub async fn index_path(
     store: &MemoryStore,
     emb: Option<&Embedder>,
     root: &Path,
+    base: &Path,
 ) -> Result<(usize, usize, usize)> {
     let mut parser = Parser::new();
     parser.set_language(&tree_sitter::Language::new(tree_sitter_rust::LANGUAGE))?;
@@ -228,8 +229,11 @@ pub async fn index_path(
         let Ok(src) = std::fs::read(path) else {
             continue;
         };
+        // Relative to the FILESYSTEM, not to the tree being indexed: a
+        // symbol id and a document id are the same kind of name, and
+        // `read_file` resolves both by joining the mountpoint back on.
         let rel = path
-            .strip_prefix(root)
+            .strip_prefix(base)
             .unwrap_or(path)
             .to_string_lossy()
             .into_owned();
@@ -251,6 +255,12 @@ pub async fn index_path(
     }
 
     let (mut n_sym, mut n_edge) = (0usize, 0usize);
+    // Files indexed without vectors. Reported at the end, and a run where
+    // EVERY file lands here is a failure however many symbols it wrote: that
+    // is an embedder that is down, not a corpus with a few hard files, and a
+    // half-built index that nobody was told about is the thing this whole
+    // service must not produce.
+    let mut n_novec = 0usize;
     let mut seen: HashSet<(&str, String, String)> = HashSet::new();
     for fi in &files {
         // One embedding call per FILE, not per symbol. With an external
@@ -261,17 +271,37 @@ pub async fn index_path(
         let vectors = match emb {
             Some(e) => {
                 let srcs: Vec<&str> = fi.defs.iter().map(|d| d.src.as_str()).collect();
-                let v = e.embed_batch(&srcs).await?;
-                // A short batch would silently leave the tail of this file
-                // without vectors — findable by lexical search, invisible to
-                // vector search, and nothing would say so.
-                anyhow::ensure!(
-                    v.len() == fi.defs.len(),
-                    "embedder returned {} vectors for {} texts",
-                    v.len(),
-                    fi.defs.len()
-                );
-                v
+                // A file whose embeddings will not come is indexed WITHOUT
+                // them rather than ending the run. The embedder is already
+                // retried inside; what reaches here is a file the server
+                // would not take at all, and dropping 500 files because the
+                // 43rd has something the model chokes on is the worse
+                // outcome — the lexical leg still finds it, and the count
+                // below says how much of the corpus is vector-blind.
+                match e.embed_batch(&srcs).await {
+                    Ok(v) if v.len() == fi.defs.len() => v,
+                    Ok(v) => {
+                        // A SHORT batch is not a partial success: the vectors
+                        // are matched to symbols by position, so a missing one
+                        // shifts every vector after it onto the wrong symbol.
+                        tracing::error!(
+                            file = %fi.defs.first().map(|d| d.file.as_str()).unwrap_or("?"),
+                            got = v.len(), want = fi.defs.len(),
+                            "embedder returned the wrong number of vectors; indexing this file lexically",
+                        );
+                        n_novec += 1;
+                        Vec::new()
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            file = %fi.defs.first().map(|d| d.file.as_str()).unwrap_or("?"),
+                            error = %err,
+                            "embedding failed; indexing this file lexically",
+                        );
+                        n_novec += 1;
+                        Vec::new()
+                    }
+                }
             }
             // No embedder: index the lexical leg and nothing else. A vector
             // query will say the leg is absent; it will not get an empty answer
@@ -318,6 +348,20 @@ pub async fn index_path(
                 n_edge += 1;
             }
         }
+    }
+    if emb.is_some() && n_novec > 0 {
+        anyhow::ensure!(
+            n_novec < files.len(),
+            "every one of {} files failed to embed — the embedder is not usable, \
+             and an index with no vector leg is not what this was asked to build",
+            files.len(),
+        );
+        tracing::warn!(
+            files = n_novec,
+            of = files.len(),
+            "indexed without vectors: these are findable by search_code's lexical \
+             mode and invisible to its vector mode",
+        );
     }
     Ok((files.len(), n_sym, n_edge))
 }

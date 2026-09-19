@@ -11,18 +11,26 @@
 //! `autumn-memory` directly.
 //!
 //! Usage:
-//!   cargo run -p memory-mcp -- [MANAGER] [--root PATH] [--docs PATH]...
-//!       [--tenant T] [--agent A] [--host H] [--port P] [--no-index] [--mcp]
+//!   cargo run -p memory-mcp -- [MANAGER] [--index AUTUMNFS_DIR]... [--code]
+//!       [--fs-root MOUNTPOINT]
+//!       [--tenant T] [--agent A] [--host H] [--port P] [--mcp]
 //!       [--embed-model M --tokenizer T]   (with --features static-embed)
 //!       [--embed-url URL --embed-model M [--embed-api-key-file F]]
 //!                                         (with --features openai-embed)
+//! What it demonstrates: put files into autumn, then index them where they
+//! are. `--index` names a directory INSIDE the filesystem (`docs/buda`), not
+//! a host path, and that autumnfs path is the id every chunk and symbol is
+//! stored under. `--fs-root` says where the filesystem is mounted in this
+//! container and is the only place a mountpoint appears — an index built
+//! under one mountpoint is readable under any other.
+//!
 //! Then open http://127.0.0.1:5100 — or point an MCP client at the stdio
 //! `--mcp` form, or at `http://127.0.0.1:5100/mcp`.
 //!
 //! Retrieval-quality run (scores the ingested corpus against a labelled query
 //! set and exits — see `eval.rs`):
 //!   cargo run -p memory-mcp -- [MANAGER] --agent eval \
-//!       --docs /path/to/corpus --eval eval/sutra.jsonl \
+//!       --index path/to/corpus --eval eval/sutra.jsonl \
 //!       [--eval-k 10] [--eval-modes lexical,hybrid] \
 //!       [--eval-baseline eval/baseline.json [--eval-update-baseline]]
 
@@ -44,7 +52,7 @@ mod indexer;
 mod store;
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::Result;
@@ -62,6 +70,17 @@ use embed::Embedder;
 use store::{Code, Corpus};
 
 const LISTEN_PORT: u16 = 5100;
+
+/// Where autumnfs is expected to be mounted. A default, not a fact: the one
+/// place this string may appear is here and in `--fs-root`, never in an id.
+const DEFAULT_FS_ROOT: &str = "/mnt/autumn";
+
+/// Normalize an autumnfs path the way the filesystem's own CLI does: `/`
+/// separated, leading `/` optional. Stored ids use this spelling, so
+/// `docs/buda` and `/docs/buda` must not index the same corpus twice.
+fn fs_path(p: &str) -> String {
+    p.trim_matches('/').to_string()
+}
 
 struct App {
     code: Code,
@@ -280,9 +299,18 @@ fn router(shared: Shared) -> Router {
 
 struct Args {
     manager: String,
-    root: Option<PathBuf>,
-    /// document trees/files (`--docs`, repeatable) ingested at startup.
-    docs: Vec<PathBuf>,
+    /// Directories to index, as autumnfs paths (`--index docs/buda`,
+    /// repeatable). NOT host paths: what this server indexes is what is in
+    /// the storage, and the id it stores is this path. See `fs_root`.
+    index: Vec<String>,
+    /// Where autumnfs is mounted in THIS container. A runtime detail: it is
+    /// joined onto an `--index` path to reach the bytes and is never stored,
+    /// so an index built under one mountpoint is readable under another.
+    fs_root: PathBuf,
+    /// Also run the tree-sitter code indexer over the trees. Off by default:
+    /// prose ingest is what every corpus needs, symbols are the special case
+    /// (and the indexer speaks Rust only).
+    code: bool,
     tenant: String,
     agent: String,
     /// path to the tenant credential (from `autumn-op tenant-create`,
@@ -292,7 +320,6 @@ struct Args {
     credential_file: Option<String>,
     host: String,
     port: u16,
-    no_index: bool,
     reset: bool,
     reindex: bool,
     mcp: bool,
@@ -376,14 +403,14 @@ async fn wipe_agent(store: &MemoryStore, tenant: &str, agent: &str) -> Result<us
 fn parse_args() -> Args {
     let mut a = Args {
         manager: "127.0.0.1:9001".into(),
-        root: None,
-        docs: Vec::new(),
+        index: Vec::new(),
+        fs_root: PathBuf::from(DEFAULT_FS_ROOT),
+        code: false,
         tenant: "memory".into(),
         agent: "default".into(),
         credential_file: std::env::var("AUTUMN_CREDENTIAL_FILE").ok().filter(|s| !s.is_empty()),
         host: "127.0.0.1".into(),
         port: LISTEN_PORT,
-        no_index: false,
         reset: false,
         reindex: false,
         mcp: false,
@@ -402,18 +429,18 @@ fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--root" => a.root = it.next().map(PathBuf::from),
-            "--docs" => {
+            "--index" => {
                 if let Some(p) = it.next() {
-                    a.docs.push(PathBuf::from(p));
+                    a.index.push(fs_path(&p));
                 }
             }
+            "--fs-root" => a.fs_root = it.next().map(PathBuf::from).unwrap_or(a.fs_root),
+            "--code" => a.code = true,
             "--tenant" => a.tenant = it.next().unwrap_or(a.tenant),
             "--agent" => a.agent = it.next().unwrap_or(a.agent),
             "--credential-file" => a.credential_file = it.next(),
             "--host" => a.host = it.next().unwrap_or(a.host),
             "--port" => a.port = it.next().and_then(|s| s.parse().ok()).unwrap_or(a.port),
-            "--no-index" => a.no_index = true,
             "--reset" => a.reset = true,
             "--reindex" => a.reindex = true,
             "--mcp" => a.mcp = true,
@@ -520,14 +547,14 @@ fn mcp_tool_defs() -> Value {
     json!([
         {"name":"search_code","description":"Search the indexed codebase (mode: lexical|vector|hybrid|auto). Returns WHERE each match is — id, name, kind, file, start/end lines, score — and no source. Read what you want with read_file (a line range) or get_symbol (one whole symbol). Code only; use search_docs for prose.",
          "inputSchema": query},
-        {"name":"read_file","description":"Read a line range of an indexed file: `path` relative to the indexed tree, `start`/`end` 1-based inclusive (omit for the whole file). The natural follow-up to a search hit's file+start+end. Capped at 400 lines per call; `truncated` says when the range was cut.",
+        {"name":"read_file","description":"Read a line range of an indexed file: `path` is the `file` a search hit reports — an autumnfs path (or a document id without its #L anchor) — and `start`/`end` are 1-based inclusive (omit for the whole file). The natural follow-up to a search hit's file+start+end. Capped at 400 lines per call; `truncated` says when the range was cut.",
          "inputSchema":{"type":"object","properties":{"path":{"type":"string"},"start":{"type":"integer"},"end":{"type":"integer"}},"required":["path"]}},
         {"name":"get_symbol","description":"Full text + metadata for an id — a code symbol ('src/lib.rs::MemoryStore::add_edge') or a document chunk ('docs/ops.md#L10-L42').","inputSchema":id},
         {"name":"find_callers","description":"Symbols that call `id`.","inputSchema":id},
         {"name":"find_callees","description":"Symbols that `id` calls.","inputSchema":id},
         {"name":"trace_call_path","description":"Bounded call-path from `id` (direction out=callees, in=callers).",
          "inputSchema":{"type":"object","properties":{"id":{"type":"string"},"direction":{"type":"string"}},"required":["id"]}},
-        {"name":"ingest_documents","description":"Ingest markdown/plain-text (.md/.markdown/.txt) from `path` (file or directory, server-side) into the memory store: heading-aware chunks, BM25+vector indexed, heading hierarchy as a CONTAINS outline. Upserts by chunk id; returns counts.",
+        {"name":"ingest_documents","description":"Ingest markdown/plain-text (.md/.markdown/.txt) from `path` (an autumnfs file or directory, e.g. `docs/buda`) into the memory store: heading-aware chunks, BM25+vector indexed, heading hierarchy as a CONTAINS outline. Upserts by chunk id; returns counts.",
          "inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}},
         {"name":"search_docs","description":"Search ingested documents (mode: lexical|vector|hybrid|auto). Returns chunks with text, source file, heading path, line range, score — enough to cite 'file › headings, lines a-b'.",
          "inputSchema": query},
@@ -595,13 +622,18 @@ async fn mcp_tool_call(code: &Code, params: &Value) -> Result<Value> {
             json!(code.trace(&s("id"), dir).await?)
         }
         "ingest_documents" => {
-            let path = PathBuf::from(s("path"));
+            // An autumnfs path, like every other path this server takes: the
+            // point of the example is that the files are IN the storage, so
+            // "index this" names something there, not something a container
+            // happens to have on local disk.
+            let fs = s("path");
+            let path = code.fs_root.join(fs.trim_start_matches('/'));
             if !path.exists() {
                 return Ok(json!({"content":[{"type":"text",
-                    "text":format!("path not found: {}", path.display())}],"isError":true}));
+                    "text":format!("path not found in autumnfs: {fs}")}],"isError":true}));
             }
             let (files, chunks, edges) =
-                docs::ingest_path(&code.store, code.emb.as_deref(), &path).await?;
+                docs::ingest_path(&code.store, code.emb.as_deref(), &path, &code.fs_root).await?;
             if chunks > 0 {
                 let r = code.store.reconcile().await?;
                 code.store
@@ -802,7 +834,7 @@ async fn run_eval(code: &Code, a: &Args, retrained: bool) -> Result<i32> {
     // Stamped into the report so a baseline says what produced it: the same
     // goldset scored against a different corpus, or with a different embedder,
     // is a different measurement wearing the same numbers.
-    report["corpus"] = json!(a.docs.iter().map(|p| p.display().to_string()).collect::<Vec<_>>());
+    report["corpus"] = json!(a.index.clone());
     report["embedder"] = json!(code.emb.as_ref().map_or("none", |e| e.name()));
     report["retrained"] = json!(retrained);
     if let Some(out) = &a.eval_out {
@@ -839,14 +871,26 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
-    // Default: index autumn-rs itself (the repo root, two levels up from this crate).
-    let root = args.root.clone().unwrap_or_else(|| {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .unwrap_or(Path::new("."))
-            .to_path_buf()
-    });
+    // The corpora, as (autumnfs path, where it is mounted right now). The
+    // first half is what ends up in every id; the second half never leaves
+    // this function's descendants. An --index path that is not there is a
+    // startup error: the mount is not up, or the corpus was never uploaded,
+    // and both look identical to "ingested 0 chunks" if we carry on.
+    let trees: Vec<(String, PathBuf)> = args
+        .index
+        .iter()
+        .map(|p| (p.clone(), args.fs_root.join(p)))
+        .collect();
+    for (fs, abs) in &trees {
+        if !abs.exists() {
+            anyhow::bail!(
+                "--index {fs}: {} does not exist. Is autumnfs mounted at {} \
+                 (--fs-root), and has the corpus been put there?",
+                abs.display(),
+                args.fs_root.display(),
+            );
+        }
+    }
 
     let store = Rc::new(
         match &args.credential_file {
@@ -888,7 +932,13 @@ async fn main() -> Result<()> {
     let code = Code {
         store: store.clone(),
         emb: emb.clone(),
-        root: root.clone(),
+        // read_file takes an autumnfs path and resolves it here: join the
+        // mountpoint, then confine to the corpora this server actually
+        // indexes. The whole mount is NOT the boundary -- `fs/` holds more
+        // than this agent's corpus, and a search hit is the only thing a
+        // read is meant to follow.
+        fs_root: args.fs_root.clone(),
+        roots: trees.iter().map(|(_, abs)| abs.clone()).collect(),
     };
 
     // MCP stdio mode: speak JSON-RPC over stdin/stdout against the existing
@@ -919,14 +969,18 @@ async fn main() -> Result<()> {
     // thousands of symbols into the same agent's BM25 stats — changing idf and
     // avgdl for every document query. So eval mode never indexes code; point it
     // at its own agent and give it only `--docs`.
-    if args.eval.is_none() && !args.no_index && (args.reset || args.reindex || already == 0) {
-        tracing::info!("indexing {} ...", root.display());
-        let (f, s, e) = indexer::index_path(&store, emb.as_deref(), &root).await?;
-        files = f;
-        symbols = s as u64;
-        edges = e as u64;
-        if s > 0 {
-            store.train_centroids((s / 20).clamp(1, 64), 25, 7).await?;
+    if args.eval.is_none() && args.code && (args.reset || args.reindex || already == 0) {
+        for (fs, abs) in &trees {
+            tracing::info!("indexing code in {fs} ...");
+            let (f, s, e) = indexer::index_path(&store, emb.as_deref(), abs, &args.fs_root).await?;
+            files += f;
+            symbols += s as u64;
+            edges += e as u64;
+        }
+        if symbols > 0 {
+            store
+                .train_centroids(((symbols as usize) / 20).clamp(1, 64), 25, 7)
+                .await?;
         }
         tracing::info!("indexed {symbols} symbols, {edges} edges from {files} files");
     } else if already > 0 {
@@ -943,10 +997,10 @@ async fn main() -> Result<()> {
     // useful question is WHICH phase, and per-chunk ms is the number that
     // compares across corpora and across clusters.
     let mut doc_chunks = 0usize;
-    for d in &args.docs {
-        tracing::info!("ingesting documents from {} ...", d.display());
+    for (fs, abs) in &trees {
+        tracing::info!("ingesting documents from {fs} ...");
         let t0 = std::time::Instant::now();
-        let (f, c, e) = docs::ingest_path(&store, emb.as_deref(), d).await?;
+        let (f, c, e) = docs::ingest_path(&store, emb.as_deref(), abs, &args.fs_root).await?;
         let ms = t0.elapsed().as_millis();
         let per = if c > 0 { ms as f64 / c as f64 } else { 0.0 };
         tracing::info!("ingested {c} chunks ({e} outline edges) from {f} files in {ms} ms ({per:.1} ms/chunk)");
@@ -978,7 +1032,7 @@ async fn main() -> Result<()> {
         } else {
             json!(["lexical"])
         },
-        "root": root.display().to_string(),
+        "index": trees.iter().map(|(fs, _)| fs.clone()).collect::<Vec<_>>(),
         "files": files, "symbols": symbols, "edges": edges,
     });
 
