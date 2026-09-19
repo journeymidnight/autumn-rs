@@ -217,9 +217,25 @@ fn collect_docs(dir: &Path, out: &mut Vec<PathBuf>) {
 
 /// Path used in doc ids: relative to the current directory when possible so
 /// ids stay short and human-readable (`docs/ops.md`, not `/data/.../ops.md`).
+///
+/// A cwd of `/` is NOT such a directory, and stripping it is where the id
+/// stopped being either form. In a container cwd is the filesystem root
+/// unless the image sets one, so `/mnt/autumn/docs/buda/x.md` was ingested
+/// as `mnt/autumn/docs/buda/x.md` -- absolute path, no leading slash, which
+/// `read_file` then resolved against its own root and could not find. The
+/// shortening is worth keeping where it shortens something; at the root it
+/// only removes the one character that says what the path is.
 fn display_path(p: &Path) -> String {
+    display_path_from(p, std::env::current_dir().ok().as_deref())
+}
+
+/// `display_path` with the working directory passed in. The cwd is process
+/// state and the tests run in parallel, so the rule cannot be exercised by
+/// chdir-ing; this is the rule, and the function above is the one lookup.
+fn display_path_from(p: &Path, cwd: Option<&Path>) -> String {
     let abs = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
-    match std::env::current_dir().ok().and_then(|cwd| abs.strip_prefix(&cwd).ok().map(Path::to_path_buf)) {
+    let cwd = cwd.filter(|c| c.parent().is_some());
+    match cwd.and_then(|cwd| abs.strip_prefix(cwd).ok().map(Path::to_path_buf)) {
         Some(rel) => rel.to_string_lossy().into_owned(),
         None => abs.to_string_lossy().into_owned(),
     }
@@ -418,6 +434,31 @@ async fn write_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The id is what `read_file` is handed back, so it has to stay a path
+    /// that resolves. A container's cwd is `/` unless the image sets one,
+    /// and stripping that prefix turned every absolute path into a relative
+    /// one by removing its first character: `/mnt/.../x.md` was ingested as
+    /// `mnt/.../x.md`, which resolved nowhere and took the MCP server's
+    /// circuit breaker down with it after three tries.
+    #[test]
+    fn a_root_cwd_is_not_stripped_from_an_id() {
+        let file = std::env::temp_dir().join(format!("mmcp-id-{}.md", std::process::id()));
+        std::fs::write(&file, "# t\n").unwrap();
+        let abs = file.canonicalize().unwrap();
+        assert_eq!(
+            display_path_from(&file, Some(Path::new("/"))),
+            abs.to_string_lossy(),
+            "a cwd of / must leave the path absolute",
+        );
+        // A real working directory still shortens, which is the point of the
+        // relative form in the first place.
+        assert_eq!(
+            display_path_from(&file, abs.parent()),
+            abs.file_name().unwrap().to_string_lossy(),
+        );
+        let _ = std::fs::remove_file(&file);
+    }
 
     /// The corpus is packed on macOS, whose `tar` writes an AppleDouble
     /// sidecar per file: `._ops.md` beside `ops.md`, same extension, binary

@@ -64,10 +64,19 @@ pub struct Code {
     /// lexical leg only, and says so, rather than answering vector queries with
     /// vectors that mean nothing.
     pub emb: Option<Rc<Embedder>>,
-    /// The indexed tree, and the ONLY tree `read_file` will read from. A
-    /// search hit names a file and a line span; reading it is the caller's
-    /// separate, bounded act, and this is what bounds WHERE it can read.
-    pub root: PathBuf,
+    /// Every tree `read_file` may read from, and nothing else. A search hit
+    /// names a file and a line span; reading it is the caller's separate,
+    /// bounded act, and this is what bounds WHERE it can read.
+    ///
+    /// A LIST, not the code root alone. `--docs` corpora live outside the
+    /// indexed tree -- in the buda deployment they are the only corpus, and
+    /// `--root` is never passed, so it defaulted to this crate's repo path
+    /// baked in at BUILD time: a directory that does not exist in the pod.
+    /// Every read of an ingested document then failed twice over, once as
+    /// `cannot read <relative id>` (joined onto the phantom root) and once as
+    /// `<abs> is outside the indexed tree` (the prefix check against it), and
+    /// the agent had no third spelling to try.
+    pub roots: Vec<PathBuf>,
 }
 
 impl Code {
@@ -153,14 +162,44 @@ impl Code {
     ///
     /// Two bounds, and both matter. `MAX_READ_LINES` stops "read the file"
     /// from being a way to spend a context window in one call. And the path
-    /// is resolved and confined to `root`: the corpus is what this server
+    /// is resolved and confined to `roots`: the corpora are what this server
     /// indexes, not the pod's filesystem, so `../..` or an absolute path
     /// cannot reach a credential mounted next door. Resolution is by
     /// canonicalize + prefix check rather than a scan for "..", because a
     /// symlink inside the tree reaches outside it without the string ever
     /// containing one.
+    ///
+    /// Each root is tried in turn and the first that yields the file wins.
+    /// Widening the roots does NOT widen the reach of any one of them: a
+    /// path still has to resolve inside the tree it is checked against.
     pub fn read_file(&self, path: &str, start: Option<usize>, end: Option<usize>) -> Result<Value> {
-        Self::read_within(&self.root, path, start, end)
+        Self::read_within_any(&self.roots, path, start, end)
+    }
+
+    /// The body of `read_file`, without the store — same reason `read_within`
+    /// takes a tree instead of `self`: the root list is the whole behaviour
+    /// worth testing here, and it needs no MemoryStore to exercise.
+    fn read_within_any(
+        roots: &[PathBuf],
+        path: &str,
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Result<Value> {
+        let mut first: Option<anyhow::Error> = None;
+        for root in roots {
+            match Self::read_within(root, path, start, end) {
+                Ok(v) => return Ok(v),
+                // Keep the FIRST tree's complaint, not the last. With several
+                // roots the last one is whichever happens to be configured
+                // last, and "outside the indexed tree" naming an unrelated
+                // corpus reads as a permission verdict on a path that simply
+                // is not there.
+                Err(e) => first = first.or(Some(e)),
+            }
+        }
+        Err(first.unwrap_or_else(|| {
+            anyhow::anyhow!("cannot read {path}: this server indexes no tree to read from")
+        }))
     }
 
     /// The body of `read_file`, without the store. Reading a file has nothing
@@ -516,6 +555,31 @@ mod tests {
             std::os::unix::fs::symlink(dir.join("fs.cred"), &link).unwrap();
             let r = Code::read_within(&root, "sneak", None, None);
             assert!(r.is_err(), "a symlink out of the tree must be refused: {r:?}");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The buda deployment's shape: no `--root`, one `--docs` corpus. The
+    /// code root is then a path from the build machine that does not exist
+    /// here, and the corpus is the only tree that can answer.
+    #[test]
+    fn read_file_falls_through_to_a_later_root() {
+        let (dir, root) = corpus("fallthrough");
+        let phantom = PathBuf::from("/nonexistent/build/machine/checkout");
+        let v = Code::read_within_any(&[phantom, root], "sub/small.rs", None, None).unwrap();
+        assert_eq!(v["text"], json!("a\nb\nc"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// More roots must not mean a wider reach for any one of them: the
+    /// credential beside the corpus is still outside every tree listed.
+    #[test]
+    fn more_roots_do_not_widen_any_of_them() {
+        let (dir, root) = corpus("many-roots");
+        let roots = [PathBuf::from("/nonexistent/one"), root, PathBuf::from("/nonexistent/two")];
+        for escape in ["../fs.cred", "sub/../../fs.cred", "/etc/hostname"] {
+            let r = Code::read_within_any(&roots, escape, None, None);
+            assert!(r.is_err(), "{escape} must be refused, got {r:?}");
         }
         let _ = std::fs::remove_dir_all(dir);
     }
