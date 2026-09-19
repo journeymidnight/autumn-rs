@@ -72,12 +72,21 @@
 //!
 //! ## What this catches, and what it does not
 //!
-//! An added, removed or reordered field moves the bytes. An added field ALSO
-//! fails to compile here, because every fixture below is a struct literal and
-//! Rust requires literals to be exhaustive — so the first signal points at the
-//! field rather than at a hex string. **Never write `..Default::default()` in
-//! a fixture**: several of these types derive `Default`, and that spelling
-//! throws the exhaustiveness away and with it the compile-time half.
+//! An added, removed or reordered field moves the bytes. For the rkyv forms an
+//! added field ALSO fails to compile here, because those fixtures are struct
+//! literals and Rust requires literals to be exhaustive — so the first signal
+//! points at the field rather than at a hex string. **Never write
+//! `..Default::default()` in a fixture**: several of these types derive
+//! `Default`, and that spelling throws the exhaustiveness away and with it the
+//! compile-time half.
+//!
+//! The three hand-coded forms do NOT get that second signal, and the one most
+//! likely to grow is among them. `ReadBytesReq` is built through
+//! `ReadBytesReq::new`, and `put_bulk meta` / `bulk response head` through
+//! their encoders, so a field added and filled INSIDE those functions compiles
+//! here and is caught only by the byte diff. `ReadBytesReq` has grown a
+//! trailing field once already. Their layouts are therefore also asserted
+//! offset by offset below, which is what names the field when one moves.
 //!
 //! Retyping a field usually moves the bytes but not always — `u32` to `i32` at
 //! the same value moves nothing. And a change that leaves the bytes alone and
@@ -87,7 +96,7 @@
 
 use autumn_rpc::cap_token::CapClaims;
 use autumn_rpc::client_hello::{is_client_surface_mgr_msg, is_client_surface_ps_msg};
-use autumn_rpc::error::StatusCode;
+use autumn_rpc::error::{RpcError, StatusCode};
 use autumn_rpc::extent_rpc::{self as en, PayloadRef, ReadBytesReq};
 use autumn_rpc::frame;
 use autumn_rpc::manager_rpc::{
@@ -150,7 +159,9 @@ const GOLDEN: &[(&str, &str)] = &[
     ("ClusterDfReq", ""),
     ("ClusterDfResp", "64662d6d6573736167657468652d6469736b2d757569640061605f5e5d5c5b5a8d000000eaffffff71706f6e6d6c6b6a01007f7e7d7c7b7a02010f0e0d0c0b0a010001000000000021201f1e1d1c1b1a31302f2e2d2c2b2a41403f3e3d3c3b3a51504f4e4d4c4b4a01000000acffffff0100000000000000070000008a00000084ffffff000000001817161514131211282726252423222138373635343332314847464544434241585756555453525168676665646362617877767574737271080706050403020111100f0e0d0c0b0a78ffffff01000000"),
     ("GetRegionsReq (empty payload)", ""),
+    ("error envelope", "03776972652d76657273696f6e206d69736d61746368"),
     ("ReadBytesReq", "18171615141312112827262524232221383736353433323148474645444342410100000054535251"),
+    ("ReadBytesReq (32-byte form, predates the payload selector)", "1817161514131211282726252423222138373635343332314847464544434241"),
     ("GetRegionsResp", "726567696f6e732d6d6573736167657468652d73746172747468652d656e6400181716151413121101000000e3ffffff09000000e4ffffff070000000000000028272625242322213837363534333231484746454443424158575655545352516867666564636261787776757473727131302e302e302e313a37313030000000080706050403020111100f0e0d0c0b0a8d000000e0ffffff31302e302e302e323a3731303000000021201f1e1d1c1b1a8d000000e8ffffff070000008f00000044ffffff5cffffff01000000b4ffffff01000000d4ffffff01000000"),
 ];
 
@@ -551,6 +562,28 @@ fn forms() -> Vec<Frozen> {
             )),
             reencode: None,
         },
+        // The refusal envelope. `[status_code: u8][utf8 message]`, carried by
+        // every `FLAG_ERROR` frame from a manager, a partition server or an
+        // extent node, and decoded by every embedded client on every failure.
+        // It is keyed by no msg_type — it can answer ANY of them — which is
+        // why a msg_type-shaped inventory does not reach it.
+        //
+        // It is also what carries this mechanism's OWN refusal: a client below
+        // the floor learns which way round the mismatch is by decoding these
+        // bytes. A break here is a client that cannot read why it was refused.
+        Frozen {
+            on: &[],
+            dir: Resp,
+            what: "error envelope",
+            live: hex(&RpcError::encode_status(
+                StatusCode::FailedPrecondition,
+                "wire-version mismatch",
+            )),
+            reencode: Some(|data: &[u8]| -> Result<String, String> {
+                let (code, message) = RpcError::decode_status(data);
+                Ok(hex(&RpcError::encode_status(code, &message)))
+            }),
+        },
         // ── extent-node surface ─────────────────────────────────────────────
         //
         // `--direct-read` is on by default, so a client reads VALUE BYTES
@@ -585,6 +618,29 @@ fn forms() -> Vec<Frozen> {
                     .map_err(|e| e.to_string())?;
                 Ok(hex(&v.encode()))
             }),
+        },
+        // The short form's own bytes, not merely a claim that it exists. This
+        // is what a client built before the payload selector puts on the wire,
+        // and the only record of it — there is no encoder that emits 32 bytes
+        // any more, which is exactly why the shape needs recording rather than
+        // deriving. `reencode` is `None` for the same reason: re-encoding it
+        // yields the 40-byte form by construction, so a round trip would prove
+        // nothing. What it decodes TO is asserted field by field below.
+        Frozen {
+            on: &[(En, en::MSG_READ_BYTES_BULK)],
+            dir: Req,
+            what: "ReadBytesReq (32-byte form, predates the payload selector)",
+            live: hex(
+                &ReadBytesReq::new(
+                    0x1112131415161718,
+                    0x2122232425262728,
+                    0x3132333435363738,
+                    0x4142434445464748,
+                    PayloadRef::shard(0x51525354),
+                )
+                .encode()[..32],
+            ),
+            reencode: None,
         },
         // ── manager surface ─────────────────────────────────────────────────
         frozen!(
@@ -985,7 +1041,11 @@ fn the_numbers_a_client_interprets_are_frozen() {
     // An unknown status folds to Internal rather than panicking or aliasing a
     // real one. That fold is itself a contract: it is what lets a server append
     // a status without an old client mis-branching on it.
-    assert_eq!(StatusCode::from_u8(9), StatusCode::Internal);
+    //
+    // Pinned at 255, NOT at the next free discriminant. Pinning 9 would have
+    // gone red on `Foo = 9` — an APPEND, the one change this test's own comment
+    // calls legitimate — and a false red with a bare assert message is the
+    // shape that teaches people to edit the test instead of reading it.
     assert_eq!(StatusCode::from_u8(255), StatusCode::Internal);
     assert_eq!(
         [
@@ -1014,7 +1074,12 @@ fn the_numbers_a_client_interprets_are_frozen() {
             en::CODE_CONTENT_CORRUPT,
         ],
         [0, 1, 3, 4, 5, 6, 7, 8],
-        "extent-node CODE_* numbering — a client reads these on the direct path"
+        // An embedded client interprets exactly ONE of these: `read_extent_direct`
+        // branches on `!= CODE_OK` and renders the rest through
+        // `code_description`. The others are pinned because the partition
+        // server's `StreamClient` does branch on them and a renumbering would
+        // hit both readers at once — not because the SDK reads them.
+        "extent-node CODE_* numbering"
     );
     assert_eq!(
         [en::PAYLOAD_LOCATION_IN_DAT, en::PAYLOAD_LOCATION_IN_SHARD_FILE],

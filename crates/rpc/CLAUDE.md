@@ -565,14 +565,25 @@ would have led you to:
   and no version concept — §8 closes that edge from the PS side — which is a statement
   about ADMISSION and says nothing about whose bytes those are.
 
+- the error envelope. `[status_code: u8][utf8 message]` (`RpcError::encode_status`), on
+  every `FLAG_ERROR` frame from any of the three roles, decoded by every embedded client
+  on every failure — including this feature's own wire-version refusal, so a break there
+  is a client that cannot read why it was refused. It is keyed by no msg_type, since it
+  can answer any of them, which is why a msg_type-shaped inventory does not reach it.
+
 `ReadBytesReq` is also the tree's one message that already serves two forms, and it does
 it by LENGTH rather than by opcode: `decode` reads a 32-byte request as the form that
-predates the payload selector. Both widths are recorded.
+predates the payload selector. Both widths have their own recorded row — the short one
+has no encoder left that emits it, which is precisely why it is recorded rather than
+derived.
 
-An added, removed or reordered field moves the recorded bytes; an ADDED field also fails
-to compile there, because every fixture is a struct literal and Rust makes literals
-exhaustive, so the first signal names the field rather than a hex string. A rename also
-forces an edit there — to the fixture, never to a recorded value.
+An added, removed or reordered field moves the recorded bytes; for the rkyv forms an
+ADDED field also fails to compile there, because those fixtures are struct literals and
+Rust makes literals exhaustive, so the first signal names the field rather than a hex
+string. The three HAND-CODED forms do not get that second signal — a field added and
+filled inside `ReadBytesReq::new` or one of the two encoders compiles — so their layouts
+are asserted offset by offset instead. A rename forces an edit there too, to the
+fixture, never to a recorded value.
 
 Numbering is frozen beside the layouts: `StatusCode`, the partition and extent-node
 `CODE_*`, the payload selector, the lease kinds and invalidation reasons. A constant's

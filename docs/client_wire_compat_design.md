@@ -309,12 +309,15 @@ New opcodes are cheap here precisely because §4 stopped counting them as bumps.
 **The rule is enforced by a byte freeze, not by review.**
 `crates/rpc/tests/client_surface_freeze.rs` records the encoding of every request and
 response form behind a client-surface msg_type, plus the `CapClaims` a client decodes
-out of its own minted token and the §8 direct-read forms an EN serves. It also pins the
-NUMBERING a client interprets — `StatusCode`, both `CODE_*` families, the payload
-selector, the lease kinds — because renumbering a constant moves no byte and breaks a
-client exactly as hard as moving a field. Editing a struct in place moves the recorded
-bytes; ADDING a field also fails to compile there, because the fixtures are struct
-literals.
+out of its own minted token, the §8 direct-read forms an EN serves (both widths of
+`ReadBytesReq`), and the `[status_code][message]` error envelope — which belongs to no
+msg_type, answers all of them, and is what carries a refusal's explanation to the client
+being refused. It also pins the NUMBERING a client interprets — `StatusCode`, both
+`CODE_*` families, the payload selector, the lease kinds — because renumbering a
+constant moves no byte and breaks a client exactly as hard as moving a field. Editing a
+struct in place moves the recorded bytes; for the rkyv forms ADDING a field also fails
+to compile, because those fixtures are struct literals. The hand-coded forms get offset
+assertions instead, since a field added inside their constructor compiles.
 
 `every_client_facing_msg_type_has_a_frozen_form_in_both_directions` fails on a
 client-facing opcode lacking a recorded request OR a recorded response, so the freeze
