@@ -1425,7 +1425,28 @@ INVARIANT — **ONE choke point: `authz_gate`, at the TOP of every frame dispatc
 BEFORE admission.** Called from `push_one_frame_to_inflight` and from
 `drain_bulk_writes`. Bulk receive checks the verified control before allocating a
 value slab, then checks again after receive so expiry/revocation during the await
-cannot bypass normal admission semantics. It:
+cannot bypass normal admission semantics.
+
+Its name is historical: it is the gate for everything decided per CONNECTION rather
+than per request, and wire-version admission joined it rather than getting a second
+function precisely so the three call sites cannot drift apart. The two connection facts
+travel together in one `ConnGateState` (`principal`, `client_wire_version`) for the same
+reason — a keyed opcode with no arm has shipped from this file twice
+(`extract_part_id`, `authz_check`), and threading a second `&mut` through six sites is
+that shape again. Both fields are mutated synchronously, before any await in the calling
+dispatch, so neither borrow spans an await. It:
+
+- handles `MSG_CLIENT_HELLO` and gates the client-surface msg_types on the window
+  (`autumn_rpc::client_hello`). **This runs ABOVE the `!authz.gate_active()` early
+  return** — below it the check would not exist on an authz-off cluster, which is most
+  of them; ablated by `a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition`,
+  which drives a real `handle_ps_connection` over a real socket with authz OFF and
+  asserts the refused write never reaches the mock partition loop. A connection that
+  sent no hello is treated as the version the hello was introduced in, so every client
+  and every manager→PS control RPC predating it is unaffected. Scoping is by msg_type,
+  never by connection: `MSG_SPLIT_PART` / `MSG_MAINTENANCE` / `MSG_MERGE_FREEZE` /
+  `MSG_ROLL_TAILS` arrive on the same listeners with nothing in the frame naming the
+  sender's role.
 - handles `MSG_AUTH_HELLO`: `verify_auth_hello` (sig + `aud == cluster_id` +
   `nbf`/`exp`) binds the per-connection `principal: Option<BoundPrincipal>`. When
   authz is OFF, AUTH_HELLO is a no-op OK so an authz-aware client still works against
@@ -1453,6 +1474,10 @@ buffer uses `write_all`; multiple buffers retain the chunked vectored writer.
 2. Any new client data-plane msg_type carrying a USER KEY MUST get an arm in
    `authz_check` that extracts the key and calls `check_key`/`check_range`. The
    catch-all `_ => None` admits ungated (correct only for non-keyed admin ops).
+3. Any new CLIENT-facing msg_type MUST be classified in
+   `autumn_rpc::client_hello::is_client_surface_ps_msg`. Missing there is not a
+   permission hole but a compatibility one: the message lands outside the client
+   window silently, so a future floor move would not cover it.
 
 Wire: `MSG_AUTH_HELLO` (0x55) + `AuthHelloReq/Resp`; `StatusCode::PermissionDenied`
 (7). SDK auto-mints/renews the token and AUTH_HELLOs each PS connection

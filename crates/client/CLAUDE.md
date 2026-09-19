@@ -302,6 +302,48 @@ failover via `rotate_manager` on connection error.
 - `resolve_part_id(part_id) → ps_addr` — resolve partition to PS.
 - `all_partitions() → Vec<(part_id, ps_addr)>` — list all partitions.
 
+## Wire-version handshake
+
+Every connection the SDK OPENS sends `MSG_CLIENT_HELLO` first — `say_hello`, called from
+`mgr_client()` and `get_ps_client()` rather than from `connect()`, because
+`rotate_manager` and the `mgr_call` error arm drop a manager connection and
+`mgr_client()` silently reopens it. One round trip per NEW connection, never per
+request; connections are pooled for the client's life. On a PS it goes out BEFORE
+`AUTH_HELLO`, since the PS gates `AUTH_HELLO` itself on the window and a refused client
+should be told about its version, not about its identity.
+
+Three answers: an 8-byte OK records the cluster's version; `FailedPrecondition` is the
+SERVER refusing this client and is a hard failure carrying the server's own message;
+anything else means the server predates the hello (a PS answers an unknown msg_type
+`NotFound` — `extract_part_id` returns 0 and partition ids start at 1 — and the manager
+`InvalidArgument`), so the connection proceeds and `connect`'s `client_compat_check`
+against `GetClusterIdResp` is what applies. A transport failure is also let through: it
+surfaces on the very next call, and refusing here would make the handshake a new way for
+a healthy cluster to be unreachable.
+
+**A refusal is terminal, and it is classified in ONE place.** It arrives from OPENING
+the connection, not from the call, so it lands in each retry loop's connect-error arm —
+seven of them, each free to classify it differently, which is how the first version of
+this spent the full `MAX_PS_REFRESHES` budget (~13 s) per operation and then returned the
+refusal labelled `ConnectionError`. `ClusterClient.wire_refused` is set by `say_hello`,
+read by `refresh_and_backoff` (stop after the first attempt) and by `routing_exhausted`
+(the one shared loop tail, which replaced seven copy-pasted ones). `connect` surfaces it
+directly and does NOT walk the manager list — every manager in a cluster runs the same
+commit, so the next one answers the same thing.
+
+**It is NOT a latch.** A successful handshake clears it, so a client refused for running
+AHEAD of its cluster — the routine case, since images are built from `main` — starts
+working by itself once the cluster is deployed. Every call still makes its first attempt;
+the flag only suppresses the RETRIES within that call. A fuse daemon or an inference pod
+is not something anyone restarts to clear a flag.
+
+`negotiated_cluster_wire()` is what the servers last reported — ONE value, since
+stop-the-world means every server in a cluster speaks the same version. The client used
+to DISCARD this number, which is what made a compatibility window impossible however the
+bytes were encoded: no call site could branch on it. Nothing branches on it yet. Use it
+to decide what may be SENT; never to decide how received bytes are read, which is the
+msg_type's job so a frame stays self-describing.
+
 ## Admin-token prefixing
 
 `set_admin_token(token)` sets a per-client admin token. On send, the SDK prefixes it onto
@@ -321,6 +363,10 @@ the token is always prefixed (greppable: `is_admin_mgr_msg` / `is_admin_ps_msg`)
 - `AutumnError::RoutingError(msg)` — cannot route key.
 - `AutumnError::ConnectionError(msg)` — RPC connection failure.
 - `AutumnError::NamespaceUnknown` — Layer-A reject (terminal on write path).
+- `AutumnError::WireVersionRefused` — a server refused this client's wire version at
+  `MSG_CLIENT_HELLO`. TERMINAL, and more sharply than the two authz cases: the version
+  is compiled in, so no refresh can change the answer. Carries the SERVER's own message,
+  which names which way round the mismatch is.
 
 ## Result types
 

@@ -465,11 +465,65 @@ ahead of a cluster nobody has upgraded yet. The refusal says which way round it 
 because the fix differs (deploy the cluster vs rebuild the client).
 
 `MIN_CLIENT_WIRE_VERSION == WIRE_VERSION` today: the window admits exactly one version
-and nothing behaves differently from before it existed. Opening it needs the rest of
-`docs/client_wire_compat_design.md` — a per-connection hello, server-side admission,
-and call sites able to serve two forms. **Until then nothing validates an incoming
-client at all**: the client's own check runs at connect, is skipped when the fetch
-fails, and no server inspects a client's version.
+and nothing behaves differently from before it existed. What is still missing before it
+can be opened is call sites able to serve two forms
+(`docs/client_wire_compat_design.md` §7).
+
+### `MSG_CLIENT_HELLO` (0x5F) — the client→server half, and server-side admission
+
+`client_hello.rs`. The SDK sends it once per connection it OPENS (from `mgr_client()`
+and `get_ps_client()`, not from `connect()` — `rotate_manager` and the `mgr_call` error
+arm drop a manager connection and `mgr_client()` silently reopens it). Request
+`[magic "AUH1": u32 LE][client_wire_version: u32 LE]`; an admitted reply is
+`[server_wire_version][min_client_wire_version]`. A refusal is an ordinary error frame
+carrying `FailedPrecondition` and a message that names WHICH WAY ROUND the mismatch is,
+because the fix differs. Cost is one round trip per new connection, never per request.
+
+**Hand-coded fixed-layout binary, not rkyv, and the reason is specific.** rkyv's
+archived root sits at the END of its buffer, so a decoder reading a longer peer's struct
+reads its SUFFIX — a two-`u64` struct decoding a three-`u64` one returns `Ok` with the
+fields shifted, and a `u32` added into tail padding round-trips `Ok` in both directions
+reading zero. The one message whose job is to detect a version mismatch must not depend
+on its own shape to do it. The module is FROZEN for the same reason `GetClusterIdResp`
+is; `tests/negotiation_freeze.rs` pins all three encodings byte for byte, and its header
+says why refreshing a recorded value is the wrong response to a failure.
+
+**Admission is scoped to msg_types, never to the connection.** `is_client_surface_ps_msg`
+/ `is_client_surface_mgr_msg` are the two sets; a frame outside them is never wire-gated.
+Without that scoping the first floor move is a cluster outage: the listeners that serve
+clients also serve internal peers, that peer traffic is SILENT (PS→manager and EN→manager
+go through `ConnPool` straight to `RpcClient::connect`; manager→PS drives split /
+maintenance / merge-freeze / roll-tails the same way), and nothing in a frame says which
+role sent it. The one peer that does handshake is the extent node's startup identity
+check, which is a `ClusterClient` — always at `WIRE_VERSION`, so always admitted, and its
+two messages are un-gated regardless. `MSG_GET_CLUSTER_ID` and the hello itself are exempt — they are how a peer
+finds out what it is talking to.
+
+**`MSG_GET_REGIONS` is deliberately NOT in the manager set**, and it is the one message
+the sets cannot cover: an SDK routes with it and so does every PS's `sync_regions_once`.
+Gating it would refuse region sync fleet-wide once the floor rose. Closing it properly
+means teaching cluster peers to identify themselves — a different change, and the two
+tests pinning this say so.
+
+**The operator surface is deliberately uncovered too.** `MSG_STATUS`, stream/extent info,
+`namespace_*`, `tenant_*`, the op-ledger, autopolicy and `MSG_MULTI_MODIFY_*` stay
+reachable from a client of any version: they are `autumn-op`'s, and `autumn-op` ships
+WITH the cluster at the same commit, so a window buys it nothing. The residue is that a
+below-floor caller can still reach routing and the admin surface — both rkyv, so a
+stale `autumn-op` gets the same silent misread the data plane is now protected from.
+The trade is deliberate, not an oversight.
+
+A connection that sends no hello is treated as `WIRE_VERSION_WITH_CLIENT_HELLO` (43,
+frozen at the literal — it is a fact about history, and following `WIRE_VERSION` would
+make every silent connection look current). That is what makes the mechanism INERT on
+arrival: with the floor at 43, a client built the day before and one built from this
+commit are admitted alike.
+
+Where it runs: the PS inside `authz_gate`, **above** its `!gate_active()` early return
+(below that line it would never run on an authz-off cluster, which is most of them —
+ablated); the manager synchronously in `handle_connection`'s decode loop, before the
+per-frame spawn, because a hello and the first request can arrive in one read and a
+detached task would let the request be judged before the hello describing it.
 
 **What that leaves uncovered, stated where someone will read it:** *changed the schema
 and forgot to bump* is UNCAUGHT. rkyv has no version tag, so two binaries claiming the
@@ -485,6 +539,15 @@ the manager, PS and EN. Raise `MIN_CLIENT_WIRE_VERSION` **only** when the change
 the client-facing surface — it is the one constant answering "does this force every
 image carrying an embedded client to be rebuilt", and while the two are equal the
 answer is always yes.
+
+**A pure msg_type ADDITION is not a bump.** Until the hello landed the tree treated one
+as a bump anyway, which is what made a new opcode expensive; an old peer that never
+sends a msg_type cannot be affected by its existence. That rule change is a
+precondition, not a convenience: serving two forms of a message means giving the new
+form its own opcode, so a window can only be opened if opcodes are cheap. Adding a
+CLIENT-facing one still means classifying it in `client_hello.rs` — a data-plane
+message with no entry lands outside the window silently, which is the same shape as the
+two `extract_part_id` / `authz_check` omissions this tree has already shipped.
 
 Exchange: both numbers ride on `GetClusterIdResp` (filled by the manager in
 `handle_get_cluster_id`), checked at every long-lived process's startup

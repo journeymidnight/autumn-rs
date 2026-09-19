@@ -10,6 +10,7 @@
 
 pub mod cap_token;
 pub mod client;
+pub mod client_hello;
 pub mod error;
 pub mod extent_rpc;
 pub mod frame;
@@ -85,7 +86,15 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// The wire schema is `manager_rpc.rs`, `partition_rpc.rs`, `frame.rs`,
 /// `extent_rpc.rs` and `cap_token.rs`. Adding, removing, reordering or
 /// retyping any field of an `Archive` type in those files — or changing what
-/// an existing field MEANS — is a wire change.
+/// an existing field MEANS — is a wire change. (`client_hello.rs` is wire too,
+/// but FROZEN rather than versioned: it is the negotiation channel, so it is
+/// never edited at all.)
+///
+/// **A pure msg_type ADDITION is not a bump.** Until the hello landed the tree
+/// treated one as a bump anyway, which is what made a new opcode expensive; an
+/// old peer that never sends a msg_type cannot be affected by its existence,
+/// and §7 of `docs/client_wire_compat_design.md` needs new opcodes to be cheap
+/// because that is how a call site comes to serve two forms.
 ///
 /// What happens if you forget: rkyv has no cross-version decode and no
 /// version tag of its own. Two binaries claiming the same version with

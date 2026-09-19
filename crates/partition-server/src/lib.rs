@@ -5001,7 +5001,7 @@ async fn drain_bulk_writes(
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
     authz: &crate::authz::AuthzState,
-    principal: &mut Option<crate::authz::BoundPrincipal>,
+    conn: &mut ConnGateState,
 ) -> Result<()> {
     use futures::FutureExt;
     loop {
@@ -5075,7 +5075,7 @@ async fn drain_bulk_writes(
         // Check the verified control bytes before allocating a value slab. A
         // refused request stays intact in the decoder and follows normal
         // framing/dispatch, which consumes its tail and replies with the error.
-        if authz_gate(msg_type, &ctrl_bytes, req_id, authz, principal).is_some() {
+        if authz_gate(msg_type, &ctrl_bytes, req_id, authz, conn).is_some() {
             return Ok(());
         }
 
@@ -5124,7 +5124,7 @@ async fn drain_bulk_writes(
         // Receiving may yield long enough for a namespace removal, key
         // revocation or token expiry. Match normal dispatch's admission-time
         // check rather than relying on the pre-receive snapshot.
-        if let Some(reply) = authz_gate(msg_type, &ctrl_bytes, req_id, authz, principal) {
+        if let Some(reply) = authz_gate(msg_type, &ctrl_bytes, req_id, authz, conn) {
             inflight.push(async move { (reply, Vec::new()) }.boxed_local());
             continue;
         }
@@ -5331,16 +5331,6 @@ fn authz_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// connection-layer gate. Runs at the TOP of every frame dispatch,
-/// before routing. Handles `MSG_AUTH_HELLO` (verify + bind `*principal`) and,
-/// when authz is enabled, the per-request key-prefix + `exp` check.
-///
-/// Returns `Some(reply_bytes)` when the frame was HANDLED here — an AUTH_HELLO
-/// response or a `PermissionDenied` rejection — so the caller emits `reply` and
-/// does NOT dispatch the frame to serve/delegate. `None` = admit as usual.
-///
-/// Synchronous (no I/O): `*principal` is mutated only here, before any await in
-/// the calling dispatch fn, so the `&mut` borrow never spans an await.
 /// (PS slice): gate a cluster-mutating PS op (split /
 /// maintenance) on the admin token AND strip the token prefix so the handler
 /// decodes the bare request. Returns `Some(reject frame)` to refuse, `None` to
@@ -5389,13 +5379,109 @@ fn admin_ps_gate_and_strip(
     None
 }
 
+/// The two things this connection learned about itself, carried together so a
+/// third costs nothing and so no call site can thread one and forget the other.
+///
+/// Both are mutated SYNCHRONOUSLY inside `authz_gate`, before any await in the
+/// calling dispatch, so the `&mut` borrow never spans an await — the discipline
+/// `principal` already had, now also load-bearing for the version.
+#[derive(Default)]
+pub(crate) struct ConnGateState {
+    /// Bound by a successful `MSG_AUTH_HELLO`. `None` = anonymous (denied on
+    /// protected prefixes only).
+    pub principal: Option<crate::authz::BoundPrincipal>,
+    /// This client's wire version, from `MSG_CLIENT_HELLO`. `None` = the
+    /// connection sent no hello, which `admit_connection` reads as the version
+    /// the hello was introduced in — that is what makes admission inert for
+    /// every client built before it existed, and for the manager→PS control
+    /// RPCs, which carry no handshake.
+    pub client_wire_version: Option<u32>,
+}
+
+/// The connection-layer gate. Runs at the TOP of every frame dispatch, before
+/// routing, and is the ONE choke point for everything decided per CONNECTION
+/// rather than per request: `MSG_CLIENT_HELLO` (record + admit the client's
+/// wire version), wire-version admission on the client-surface msg_types,
+/// `MSG_AUTH_HELLO` (verify + bind the principal), and — when authz is enabled
+/// — the per-request key-prefix + `exp` check.
+///
+/// The two connection facts live in ONE `ConnGateState` deliberately. Every
+/// dispatch path already threads it here, so a new per-connection fact cannot
+/// be added to some paths and missed on others — the shape that has bitten this
+/// file twice (`extract_part_id` and `authz_check` each shipped a keyed opcode
+/// with no arm).
+///
+/// Returns `Some(reply_bytes)` when the frame was HANDLED here — a hello
+/// response, a wire-version refusal, an AUTH_HELLO response or a
+/// `PermissionDenied` rejection — so the caller emits `reply` and does NOT
+/// dispatch the frame to serve/delegate. `None` = admit as usual.
+///
+/// Synchronous (no I/O): `conn` is mutated only here, before any await in the
+/// calling dispatch fn, so the `&mut` borrow never spans an await.
 fn authz_gate(
     msg_type: u8,
     payload: &Bytes,
     req_id: u32,
     authz: &crate::authz::AuthzState,
-    principal: &mut Option<crate::authz::BoundPrincipal>,
+    conn: &mut ConnGateState,
 ) -> Option<Bytes> {
+    // Wire-version admission runs FIRST, and above the `gate_active()` early
+    // return below — under it this would never run on an authz-off cluster,
+    // which is most of them. It is scoped to the client-surface msg_types, not
+    // to the connection: the manager→PS control RPCs arrive on listeners that
+    // serve clients too, with nothing in a frame to say which role sent them.
+    if msg_type == autumn_rpc::client_hello::MSG_CLIENT_HELLO {
+        let Some(v) = autumn_rpc::client_hello::parse_hello_req(payload) else {
+            return Some(
+                Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(
+                        StatusCode::InvalidArgument,
+                        "malformed MSG_CLIENT_HELLO",
+                    ),
+                )
+                .encode(),
+            );
+        };
+        // Recorded even when it is refused: a client that ignores the refusal
+        // and sends a Put must meet the same verdict, not an unknown one.
+        conn.client_wire_version = Some(v);
+        if let Err(why) = autumn_rpc::client_hello::admit_client(v) {
+            return Some(
+                Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(StatusCode::FailedPrecondition, &why),
+                )
+                .encode(),
+            );
+        }
+        return Some(
+            Frame::response(
+                req_id,
+                msg_type,
+                Bytes::copy_from_slice(&autumn_rpc::client_hello::encode_hello_resp(
+                    autumn_rpc::WIRE_VERSION,
+                    autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+                )),
+            )
+            .encode(),
+        );
+    }
+    if autumn_rpc::client_hello::is_client_surface_ps_msg(msg_type) {
+        if let Err(why) = autumn_rpc::client_hello::admit_connection(conn.client_wire_version) {
+            return Some(
+                Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(StatusCode::FailedPrecondition, &why),
+                )
+                .encode(),
+            );
+        }
+    }
+    let principal = &mut conn.principal;
     if msg_type == MSG_AUTH_HELLO {
         // When authz is OFF, accept AUTH_HELLO as a no-op (nothing is enforced;
         // the token is simply unused) so an authz-aware client works against a
@@ -5513,9 +5599,9 @@ fn push_one_frame_to_inflight(
     inflight: &mut FuturesUnordered<
         futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>,
     >,
-    // connection authz runtime + per-connection bound principal.
+    // connection authz runtime + the per-connection facts the gate owns.
     authz: &crate::authz::AuthzState,
-    principal: &mut Option<crate::authz::BoundPrincipal>,
+    conn: &mut ConnGateState,
     tx_bufs: &mut Vec<Bytes>,
 ) {
     use futures::FutureExt;
@@ -5529,7 +5615,7 @@ fn push_one_frame_to_inflight(
     // AUTH_HELLO bind / per-request key-prefix + exp gate, BEFORE
     // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
     // ready completion; it never reaches serve/delegate.
-    if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, principal) {
+    if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, conn) {
         inflight.push(async move { (reply, Vec::new()) }.boxed_local());
         return;
     }
@@ -5622,7 +5708,7 @@ async fn push_frames_to_inflight(
     cap: usize,
     // threaded into push_one_frame_to_inflight for the per-frame gate.
     authz: &crate::authz::AuthzState,
-    principal: &mut Option<crate::authz::BoundPrincipal>,
+    conn: &mut ConnGateState,
 ) -> Result<()> {
     loop {
         match decoder.try_decode().map_err(|e| anyhow!(e))? {
@@ -5636,7 +5722,7 @@ async fn push_frames_to_inflight(
                     }
                 }
                 push_one_frame_to_inflight(
-                    frame, req_tx, part, owner_part, inflight, authz, principal, tx_bufs,
+                    frame, req_tx, part, owner_part, inflight, authz, conn, tx_bufs,
                 );
             }
             Some(_) => continue, // req_id == 0 fire-and-forget
@@ -5699,9 +5785,11 @@ async fn handle_ps_connection(
         .unwrap_or_else(|_| "?".to_string());
     let (reader, mut writer) = conn.into_split();
     let mut decoder = FrameDecoder::new();
-    // per-connection principal, bound by a successful MSG_AUTH_HELLO
-    // first frame. `None` = anonymous (denied on protected prefixes only).
-    let mut principal: Option<crate::authz::BoundPrincipal> = None;
+    // Per-connection facts the gate owns: the principal bound by a
+    // successful MSG_AUTH_HELLO, and the wire version reported by
+    // MSG_CLIENT_HELLO. Both default to "not said", which is what makes this
+    // inert for every client and internal peer that predates the hello.
+    let mut conn_state = ConnGateState::default();
 
     let cap = ps_conn_inflight_cap();
     // R4: completion = `(head, values)`; non-empty only for the bulk reads
@@ -5765,7 +5853,7 @@ async fn handle_ps_connection(
                         &mut tx_bufs,
                         cap,
                         &authz,
-                        &mut principal,
+                        &mut conn_state,
                     )
                     .await?;
 
@@ -5791,7 +5879,7 @@ async fn handle_ps_connection(
                                 owner_part,
                                 &mut inflight,
                                 &authz,
-                                &mut principal,
+                                &mut conn_state,
                                 &mut tx_bufs,
                             );
                         }
@@ -5804,7 +5892,7 @@ async fn handle_ps_connection(
                                     owner_part,
                                     &mut inflight,
                                     &authz,
-                                    &mut principal,
+                                    &mut conn_state,
                                     &mut tx_bufs,
                                 );
                             }
@@ -5820,7 +5908,7 @@ async fn handle_ps_connection(
                         &mut tx_bufs,
                         cap,
                         &authz,
-                        &mut principal,
+                        &mut conn_state,
                     )
                     .await?;
                     read_fut = Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
@@ -5903,7 +5991,7 @@ async fn handle_ps_connection(
                             &mut tx_bufs,
                             cap,
                             &authz,
-                            &mut principal,
+                            &mut conn_state,
                         )
                         .await?;
                         push_frames_to_inflight(
@@ -5915,7 +6003,7 @@ async fn handle_ps_connection(
                             &mut tx_bufs,
                             cap,
                             &authz,
-                            &mut principal,
+                            &mut conn_state,
                         )
                         .await?;
                         read_fut = Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
@@ -13394,7 +13482,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             let (tx, mut rx) = mpsc::channel(8);
             let mut inflight = FuturesUnordered::new();
             let mut replies = Vec::new();
-            let mut principal = None;
+            let mut conn_state = ConnGateState::default();
             let receive = drain_bulk_writes(
                 &mut decoder,
                 &mut reader,
@@ -13404,7 +13492,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 &mut replies,
                 4,
                 &authz,
-                &mut principal,
+                &mut conn_state,
             );
             let send = async {
                 // join polls receive first: its initial namespace check passes
@@ -14431,6 +14519,144 @@ mod authz_enforcement_tests {
             assert!(n > 0, "EOF before response");
             decoder.feed(&buf[..n]);
         }
+    }
+
+    /// A client outside the window is refused BY THE SERVER, before its write
+    /// reaches the partition — driven over a real socket through the real
+    /// `handle_ps_connection`, because the predicate having a unit test proves
+    /// nothing about the dispatch loop reaching it.
+    ///
+    /// Authz is OFF here on purpose. That is the placement assertion: the check
+    /// sits ABOVE `authz_gate`'s `!gate_active()` early return, and most
+    /// clusters (fuse, kvcache, every dev cluster) never turn authz on, so
+    /// below that line this mechanism would simply not exist for them.
+    #[test]
+    fn a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition() {
+        use autumn_rpc::client_hello;
+
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            // No signing key, no namespaces: `gate_active()` is false.
+            let authz = std::sync::Arc::new(crate::authz::AuthzState::new());
+            assert!(!authz.is_enabled(), "this test is about the authz-OFF path");
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            let delivered = Rc::new(Cell::new(0usize));
+            let put = |key: &[u8]| {
+                partition_rpc::rkyv_encode(&PutReq {
+                    part_id: 7,
+                    key: key.to_vec(),
+                    value: b"v".to_vec(),
+                    region_epoch: 0,
+                    expires_at: 0,
+                    inode_hint: 0,
+                    lease_epoch: 0,
+                })
+            };
+
+            // One connection per case; each drives the real conn task.
+            let listener = Rc::new(listener);
+            let open = |authz: std::sync::Arc<crate::authz::AuthzState>,
+                        delivered: Rc<Cell<usize>>| {
+                let listener = listener.clone();
+                async move {
+                let client = compio::net::TcpStream::connect(addr).await.unwrap();
+                let (server, _) = listener.accept().await.unwrap();
+                let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+                let conn = compio::runtime::spawn(async move {
+                    let _ = handle_ps_connection(
+                        autumn_transport::Conn::Tcp(server),
+                        req_tx,
+                        None,
+                        7,
+                        authz,
+                    )
+                    .await;
+                });
+                let loop_h = compio::runtime::spawn(async move {
+                    while let Some(req) = req_rx.next().await {
+                        delivered.set(delivered.get() + 1);
+                        let p: PutReq = partition_rpc::rkyv_decode(&req.payload).unwrap();
+                        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&PutResp {
+                            code: CODE_OK,
+                            message: String::new(),
+                            key: p.key,
+                        })));
+                    }
+                });
+                let (rd, wr) = client.into_split();
+                (rd, wr, FrameDecoder::new(), conn, loop_h)
+                }
+            };
+
+            // (1) A client one version AHEAD of this cluster. Refused at the
+            //     hello, and the refusal says which way round it is — the fix
+            //     for "too new" is to deploy, not to rebuild.
+            let (mut rd, mut wr, mut dec, _c, _l) =
+                open(authz.clone(), delivered.clone()).await;
+            let ahead = Bytes::copy_from_slice(&client_hello::encode_hello_req(
+                autumn_rpc::WIRE_VERSION + 1,
+            ));
+            let f = round_trip(
+                &mut wr,
+                &mut rd,
+                &mut dec,
+                1,
+                client_hello::MSG_CLIENT_HELLO,
+                ahead,
+            )
+            .await;
+            assert!(f.is_error(), "a client above the ceiling must be refused");
+            let (code, msg) = autumn_rpc::RpcError::decode_status(&f.payload);
+            assert_eq!(code, StatusCode::FailedPrecondition, "{msg}");
+            assert!(msg.contains("NEWER"), "{msg}");
+
+            // (2) …and the refusal STICKS for the rest of that connection. A
+            //     client that ignores it and writes anyway gets the same
+            //     verdict, and the partition never sees the request — which is
+            //     the acceptance claim: refused before any Put can land.
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_PUT, put(b"k")).await;
+            assert!(f.is_error(), "the write must be refused too");
+            let (code, msg) = autumn_rpc::RpcError::decode_status(&f.payload);
+            assert_eq!(code, StatusCode::FailedPrecondition, "{msg}");
+            assert_eq!(delivered.get(), 0, "no refused write may reach the partition");
+
+            // (3) A client AT this version is admitted, and is told what the
+            //     cluster speaks. This is the only channel for that on a PS —
+            //     the PS does not answer MSG_GET_CLUSTER_ID.
+            let (mut rd, mut wr, mut dec, _c, _l) =
+                open(authz.clone(), delivered.clone()).await;
+            let ours = Bytes::copy_from_slice(&client_hello::encode_hello_req(
+                autumn_rpc::WIRE_VERSION,
+            ));
+            let f = round_trip(
+                &mut wr,
+                &mut rd,
+                &mut dec,
+                1,
+                client_hello::MSG_CLIENT_HELLO,
+                ours,
+            )
+            .await;
+            assert!(!f.is_error(), "an in-window client must be admitted");
+            assert_eq!(
+                client_hello::parse_hello_resp(&f.payload),
+                Some((autumn_rpc::WIRE_VERSION, autumn_rpc::MIN_CLIENT_WIRE_VERSION))
+            );
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_PUT, put(b"k")).await;
+            assert!(!f.is_error(), "an admitted write must be served");
+            assert_eq!(delivered.get(), 1);
+
+            // (4) A connection that says NOTHING is served. Every client built
+            //     before the hello existed is silent, and so is every internal
+            //     peer — this is what makes the mechanism inert on arrival.
+            let (mut rd, mut wr, mut dec, _c, _l) = open(authz, delivered.clone()).await;
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_PUT, put(b"k")).await;
+            assert!(!f.is_error(), "a silent connection must still be served");
+            assert_eq!(delivered.get(), 2);
+        });
     }
 
     #[test]

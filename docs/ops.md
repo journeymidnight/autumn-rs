@@ -2684,8 +2684,21 @@ checked by two different rules, because they answer different questions:
   needs, too new and the cluster cannot speak what it will send.
 
 While the two constants are EQUAL the window admits exactly one version, so a
-client must match the cluster too. Nothing validates an incoming client yet: the
-check runs client-side at connect, and is skipped when the fetch itself fails.
+client must match the cluster too.
+
+The SERVER decides. Every connection the SDK opens sends `MSG_CLIENT_HELLO`
+first; the manager and the partition server refuse a client outside the window,
+on the client-facing message types, with a message naming which way round the
+mismatch is — rebuild the client, or deploy the cluster. The client's own check
+at connect stays as an earlier, better-worded failure, but it is not the gate:
+it is skipped when the fetch itself fails.
+
+A connection that sends NO hello is treated as wire version 43, the version the
+hello was introduced in, so every client image built before it keeps working.
+Refusal is scoped to client-facing message types, never to the connection: the
+same listeners carry partition-server and extent-node traffic, which carries no
+handshake, so a connection-scoped rule would refuse registration, heartbeats and
+reconcile as soon as the floor moved.
 
 Separately the manager persists an operator-bumped `cluster_version` in etcd
 (ASCII decimal at `autumn-rs/cluster_version`). It is the ROLLBACK LATCH and it
@@ -2712,6 +2725,24 @@ autumn-op cluster-version            # expect: still 1 (etcd replay)
 # mixed-version refusal: any pre-R1 binary against this manager fails its
 # startup check loudly ("decode GetClusterIdResp failed ... wire-schema mismatch")
 ```
+
+Server-side admission, on the same cluster. There is no flag that fakes a
+client version, so this is driven from the test that owns the mechanism — it
+opens real sockets against a real manager and a real partition-server
+connection:
+
+```bash
+cargo test -p autumn-manager --test client_wire_admission
+cargo test -p autumn-partition-server --lib \
+  a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition
+# Both assert the refusal carries FailedPrecondition and says which way round
+# the mismatch is, that it STICKS for the rest of the connection (so a client
+# ignoring it cannot write anyway), and that a silent connection is served.
+```
+
+An operator seeing a client refused in the field reads the message the server
+sent, which names both versions. `autumn-op cluster-version` prints the same
+pair from the cluster's side.
 
 A wire bump also invalidates anything ALREADY WRITTEN to etcd in a wire type's
 rkyv layout, which the version handshake cannot protect: it guards
@@ -2751,6 +2782,9 @@ handshake happily and then decode each other's bytes as garbage. Edit any rkyv
 wire struct ⇒ bump `WIRE_VERSION` yourself, and raise
 `MIN_CLIENT_WIRE_VERSION` too if the change breaks the client-facing surface —
 that one is what forces every image carrying an embedded client to be rebuilt.
+Adding a message TYPE is not a bump (an old peer that never sends it cannot be
+affected by its existence), but a new client-facing one must be classified in
+`crates/rpc/src/client_hello.rs` or it lands outside the window silently.
 Bump exactly ONCE per commit: `autumn-op upgrade-version` steps
 `cur + 1`, so skipping a number forces operators to run it twice for nothing.
 Rolling back a binary past a `cluster_version` bump is refused at manager

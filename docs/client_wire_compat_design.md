@@ -82,9 +82,11 @@ that client compute `lo = 45 > hi = 44` and **refuse itself** at connect.
 
 The window covers what an embedded client encodes or decodes:
 
-- `partition_rpc`'s data plane — Put / Get / Delete / Head / Range,
-  `MSG_PUT_BEGIN` and the stream ops, the three batch families and their bulk
-  forms, `MSG_GET_REDIRECT(_MANY)`, `AUTH_HELLO`;
+- `partition_rpc`'s data plane — Put / Get / Delete / Head / Range, the three
+  batch families and their bulk forms, `MSG_GET_REDIRECT(_MANY)`, `AUTH_HELLO`.
+  (Server-side multipart upload is retired: `MSG_PUT_BEGIN`/`CHUNK`/`COMMIT`/
+  `ABORT` are reserved opcodes with no handlers, and stream writes are ordinary
+  Puts under a striped key.);
 - `manager_rpc`'s runtime subset — `GetRegions` and the `MgrRegionInfo` /
   `MgrRange` / `MgrPsDetail` it carries, `MintToken`, `AllocInodes`, the inode
   lease and invalidation messages, `ClusterDf` (a mounted fuse daemon answers
@@ -134,8 +136,8 @@ cannot express an interval, and §2.1 forbids reshaping the header anyway).
 The two directions need different carriers:
 
 - **server → client** already has one: `GetClusterIdResp`, checked at
-  `ClusterClient::connect`. What is missing is that the client discards the
-  number instead of keeping it.
+  `ClusterClient::connect`. The client keeps the number
+  (`ClusterClient::negotiated_cluster_wire`); nothing branches on it until §7.
 - **client → server** has none. `MSG_AUTH_HELLO` cannot serve: it carries no
   version, and a client with no credential never sends it at all
   (`crates/client/src/lib.rs` sends it only when a credential is configured), so
@@ -208,14 +210,19 @@ connection is refused — **but only for the client-surface msg_types of §2.**
 
 The scoping is not a refinement; without it the first floor move is a cluster
 outage. The manager and PS listeners that serve clients also serve internal
-peers, and those peers are silent by construction: PS→manager and EN→manager go
+peers, and that peer traffic is silent: PS→manager and EN→manager go
 through `autumn_stream::ConnPool` straight to `RpcClient::connect` with no
-handshake of any kind, and manager→PS drives `MSG_SPLIT_PART`,
+handshake, and manager→PS drives `MSG_SPLIT_PART`,
 `MSG_MAINTENANCE`, `MSG_MERGE_FREEZE` and `MSG_ROLL_TAILS` the same way. Nothing
 in a frame says which role sent it. A connection-scoped refusal would therefore
 reject `register_ps`, heartbeats, `register_node`, reconcile, split, merge-freeze
 and roll-tails the moment the floor moved. Scoping by msg_type also leaves the
 89 test files that open a raw `RpcClient` to a PS or manager working unchanged.
+
+The one peer that does handshake is the extent node's startup identity check
+(`verify_manager_cluster_id` / `register_with_manager`), which is a
+`ClusterClient`. It runs at `WIRE_VERSION`, so it is always admitted, and the
+two messages it sends are un-gated anyway.
 
 `MSG_GET_CLUSTER_ID` and the hello are exempt: they are how a peer finds out
 what it is talking to.
@@ -238,8 +245,28 @@ then falls back to the §1.1 membership check, which refuses it because its own
 **INVARIANT: the server decides admission.** The client's startup self-check
 stays as an early, better-worded failure, but it cannot be the only gate: it is
 skipped when the transport fails fetching `GetClusterIdResp` (an `if let Ok`
-around the fetch), and today no server validates an incoming client at all —
-`AUTH_HELLO` carries no version and the extent node has no version code.
+around the fetch). The manager and the partition server each validate an
+incoming client; the extent node has no version code and acquires none (§8).
+
+**`MSG_GET_REGIONS` is the one message the msg_type boundary cannot cut**, and
+it was not anticipated above. An SDK routes with it and so does every partition
+server's `sync_regions_once`, so it is on BOTH surfaces at once. A PS sends no
+hello, so gating it would refuse region sync fleet-wide the moment the floor
+rose — the same outage this scoping exists to prevent, arriving through the set
+instead of through the connection. It is therefore left un-gated. What that
+leaves is a below-floor client able to fetch routing: every data-plane message
+it then sends is refused, which is where the damage would be. Closing it
+properly means giving a cluster peer a way to identify itself, which is a
+different change from this one.
+
+The OPERATOR surface is uncovered by the same kind of decision but for a
+different reason. `MSG_STATUS`, stream/extent info, `namespace_*`, `tenant_*`,
+the op-ledger, autopolicy and `MSG_MULTI_MODIFY_*` are `autumn-op`'s messages,
+and `autumn-op` ships WITH the cluster at the same commit — it is never out of
+window in practice, so maintaining a second window for it buys nothing. What
+that concedes is that a STALE `autumn-op` still decodes rkyv admin structs
+cross-version, which §4 establishes is only sometimes loud. The trade is
+recorded here rather than left to be discovered.
 
 ## 6. Where the number is kept
 

@@ -57,7 +57,18 @@ match EXACTLY, so any layout change is a **same-commit, stop-the-world deploy**
 (stop every role, swap binaries, start; etcd is never wiped — see the upgrade-safety
 note below). `GetClusterIdResp`
 (`{wire_version_min, wire_version_max, cluster_version}`, the startup handshake) is
-**FROZEN** from R1 on — never reshape it. New message-type numbers and enum variants
+**FROZEN** from R1 on — never reshape it.
+
+`handle_connection` answers `MSG_CLIENT_HELLO` (0x5F) and refuses a client-surface
+message from a connection outside this binary's client window — `client_wire_gate`,
+run SYNCHRONOUSLY in the decode loop, before the per-frame spawn: a hello and the first
+request can arrive in one read, and a detached task would let the request be judged
+before the hello describing it. Scoped to `is_client_surface_mgr_msg`, never to the
+connection, because this listener also serves every PS and EN and that traffic carries no
+handshake — a connection-scoped refusal would reject `register_ps`, heartbeats,
+`register_node` and reconcile the moment the client floor moved. `MSG_GET_CLUSTER_ID` is
+exempt (it is how a peer finds out what it is talking to), and `MSG_GET_REGIONS` is
+deliberately un-gated because a PS routes with it too. `crates/manager/tests/client_wire_admission.rs`. New message-type numbers and enum variants
 (`POLICY_KIND_*`, `NODE_AUTO_STATE_*`) are **append-only**; existing numeric values
 are frozen so external controllers can introspect the binary's mapping
 (`MSG_GET_POLICY_KIND_NAMES = 0x3B`).

@@ -18,6 +18,8 @@ fn client(manager: String) -> ClusterClient {
         first_attempt_timeout: Cell::new(None),
         auth: RefCell::new(None),
         auth_gen: Cell::new(0),
+        wire_refused: RefCell::new(None),
+        negotiated_cluster_wire: Cell::new(0),
         binding: NamespaceBinding::Raw,
     }
 }
@@ -308,9 +310,112 @@ async fn pooled_batch_status_keeps_connection_and_identity_change_clears_it() {
         .await
         .unwrap();
     assert_eq!(peer.accepts.get(), 1);
+    // Exactly one hello, on the one connection that was opened — not one per
+    // call. `say_hello` lives in `get_ps_client`, not in the call path, and
+    // this is what pins that: a per-request handshake would be a round trip on
+    // every data-plane op.
+    assert_eq!(
+        peer.hellos.get(),
+        1,
+        "the SDK sends MSG_CLIENT_HELLO once per connection it OPENS"
+    );
+
+    // A rebuilt connection handshakes again. It has to: the server's admission
+    // is per-connection, so a reconnect that skipped the hello would be judged
+    // as a silent peer rather than as this client. Evicted by hand here — the
+    // identity-change eviction below arms authentication, and this fixture has
+    // no manager to mint a token from.
+    client.ps_conns.borrow_mut().clear();
+    client
+        .ps_call(&peer.addr, ECHO, Bytes::new())
+        .await
+        .unwrap();
+    assert_eq!(peer.accepts.get(), 2);
+    assert_eq!(peer.hellos.get(), 2, "a reopened connection re-handshakes");
+
     client.set_principal_credential("new-identity", vec![]);
     assert!(
         client.ps_conns.borrow().is_empty(),
         "an identity change must still force reauthentication"
+    );
+}
+
+/// A server that refuses this client's wire version must reach the CALLER with
+/// the server's own words, and must not be retried.
+///
+/// The refusal names which way round the mismatch is — rebuild this image, or
+/// deploy the cluster — and that is the only information it carries. Both
+/// halves of this were wrong when the handshake first landed: `connect`
+/// discarded the error and reported "cannot connect to any manager", and the
+/// data path treated it as a transient connection failure and spent the full
+/// `MAX_PS_REFRESHES` budget (~13 s per operation) before handing it back
+/// mislabelled.
+#[compio::test]
+async fn a_wire_version_refusal_is_terminal_and_keeps_the_servers_words() {
+    // (1) At connect. This is the entry point every wheel, fuse mount, s3
+    //     gateway and autumn-op comes through, so it is where an operator
+    //     actually reads the message.
+    let mgr = Peer::start_refusing_hello(respond).await;
+    let Err(err) = ClusterClient::connect_raw(&mgr.addr).await else {
+        panic!("a refused client must not connect");
+    };
+    let text = format!("{err:#}");
+    assert!(
+        text.contains(HELLO_REFUSAL),
+        "the server's own refusal must survive to the caller, got: {text}"
+    );
+    assert_eq!(
+        mgr.accepts.get(),
+        1,
+        "a refusal is the same from every manager in a cluster — do not walk the list"
+    );
+
+    // (2) On the data path. A wire refusal is as terminal as PermissionDenied:
+    //     the version is compiled into this binary, so no refresh can change
+    //     the answer.
+    let ps = Peer::start_refusing_hello(respond).await;
+    let client = client("127.0.0.1:1".into());
+    client.regions.borrow_mut().push((1, region(1)));
+    client.part_addrs.borrow_mut().insert(1, ps.addr.clone());
+    let err = client
+        .get(b"k")
+        .await
+        .expect_err("a refused client must not read");
+    assert!(
+        matches!(err, AutumnError::WireVersionRefused(_)),
+        "must be typed, not flattened into a connection error: {err}"
+    );
+    assert!(format!("{err}").contains(HELLO_REFUSAL), "{err}");
+    // One attempt, not eleven. Without the short-circuit each refresh reopens
+    // the connection, so the accept count is what exposes the retry storm —
+    // and it does so without asserting on wall-clock time.
+    assert_eq!(ps.accepts.get(), 1, "a refused client must not be retried");
+}
+
+/// A refusal must NOT latch. A client refused for running AHEAD of its cluster
+/// — the routine case, since images are built from `main` — has to start
+/// working by itself the moment the cluster is deployed. A fuse daemon or an
+/// inference pod is not something anyone restarts to clear a flag.
+#[compio::test]
+async fn a_refusal_clears_when_the_cluster_catches_up() {
+    let ps = Peer::start_refusing_first_hellos(1, respond).await;
+    let client = client("127.0.0.1:1".into());
+    client.regions.borrow_mut().push((1, region(1)));
+    client.part_addrs.borrow_mut().insert(1, ps.addr.clone());
+
+    let err = client.get(b"k").await.expect_err("the first op is refused");
+    assert!(matches!(err, AutumnError::WireVersionRefused(_)), "{err}");
+
+    // Second call: a fresh connection, a fresh hello, now admitted. It must
+    // reach the peer — the flag is cleared by a successful handshake, not
+    // carried for the client's life.
+    client
+        .ps_call(&ps.addr, ECHO, Bytes::new())
+        .await
+        .expect("the client recovers once the cluster admits it");
+    assert_eq!(ps.hellos.get(), 2, "the second connection re-handshakes");
+    assert!(
+        client.wire_refused.borrow().is_none(),
+        "a successful handshake must clear the refusal"
     );
 }

@@ -66,6 +66,14 @@ pub enum AutumnError {
     /// the caller must write under a registered namespace). Distinct from
     /// `NotFound` (a read-miss) and `InvalidArgument`.
     NamespaceUnknown(String),
+    /// A server refused this client's wire version at `MSG_CLIENT_HELLO`.
+    /// TERMINAL, and more sharply so than the two above: the version is baked
+    /// into this binary, so no amount of refreshing, reconnecting or waiting
+    /// can change the answer. The message is the SERVER's own, and names which
+    /// way round the mismatch is — rebuild this image, or deploy the cluster —
+    /// which is the entire point of the refusal and is lost if it gets
+    /// flattened into a connection error.
+    WireVersionRefused(String),
 }
 
 impl std::fmt::Display for AutumnError {
@@ -74,6 +82,7 @@ impl std::fmt::Display for AutumnError {
             AutumnError::NotFound => write!(f, "key not found"),
             AutumnError::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
             AutumnError::NamespaceUnknown(msg) => write!(f, "namespace unknown: {msg}"),
+            AutumnError::WireVersionRefused(msg) => write!(f, "{msg}"),
             AutumnError::Fenced(msg) => write!(f, "write fenced (lease revoked): {msg}"),
             AutumnError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             AutumnError::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
@@ -885,6 +894,31 @@ pub struct ClusterClient {
     /// identity changed mid-connect — so a principal switch can't leave a
     /// wrong-identity-bound connection in the pool (coco P2).
     auth_gen: Cell<u64>,
+    /// The server's last wire-version REFUSAL, or `None` if the last hello was
+    /// admitted. NOT a latch: `say_hello` clears it on every successful
+    /// handshake, so a client refused for being NEWER than its cluster starts
+    /// working by itself once the cluster is deployed — no restart, which
+    /// matters for a fuse daemon nobody is watching.
+    ///
+    /// It exists because the refusal arrives from OPENING the connection, not
+    /// from the call, so it lands in each retry loop's connect-error arm —
+    /// seven of them, each free to classify it differently, which is how the
+    /// first version of this spent the full ~13 s refresh budget per operation
+    /// and then returned the refusal labelled as a connection error. One flag,
+    /// read by `refresh_and_backoff` and `routing_exhausted`, is one place to
+    /// be right instead of seven.
+    wire_refused: RefCell<Option<String>>,
+    /// The cluster's wire version, as the servers reported it — from
+    /// `GetClusterIdResp` at connect and from each `MSG_CLIENT_HELLO` reply.
+    /// `0` = nothing has answered yet.
+    ///
+    /// ONE value, not one per peer: stop-the-world means every manager, PS and
+    /// EN in a cluster speaks the same version, so a second copy could only
+    /// ever disagree by being stale. Kept because the client used to DISCARD
+    /// the negotiated number, which is what made a compatibility window
+    /// impossible however the bytes were encoded — no call site could branch on
+    /// it. Nothing branches on it yet; serving two forms is design §7.
+    negotiated_cluster_wire: Cell<u32>,
     /// D7: the namespace scope this client operates within. Set at
     /// `connect(mgr, ns, tenant)` (Scoped) or `connect_raw(mgr)` (Raw). Every
     /// scoped op binds its key through this before routing. `raw()` / `rescope`
@@ -989,6 +1023,86 @@ impl ClusterClient {
         }
     }
 
+    /// The cluster wire version the servers last reported, or `0` if none has
+    /// answered yet. Read it to branch on what the cluster can be sent; do not
+    /// use it to decide how RECEIVED bytes are read — that is the msg_type's
+    /// job, so a frame stays self-describing (design §3 / §7).
+    pub fn negotiated_cluster_wire(&self) -> u32 {
+        self.negotiated_cluster_wire.get()
+    }
+
+    /// Send `MSG_CLIENT_HELLO` on a freshly opened connection and record what
+    /// comes back.
+    ///
+    /// Sent from the two functions that OPEN connections rather than from
+    /// `connect()`, because `rotate_manager` and the `mgr_call` error arm drop
+    /// a manager connection and `mgr_client()` silently reopens it — a hello
+    /// sent once at connect would cover only the first one.
+    ///
+    /// Three answers, and the middle one is the whole reason this is not just
+    /// a version fetch:
+    /// - an 8-byte OK reply: record the cluster's version, proceed;
+    /// - `FailedPrecondition`: the SERVER refused us. Hard failure, carrying
+    ///   the server's own message, which names which way round the mismatch is;
+    /// - any other error: the server predates the hello (a PS answers an
+    ///   unknown msg_type `NotFound`, because `extract_part_id` returns 0 for
+    ///   anything it does not know and partition ids start at 1; the manager
+    ///   answers `InvalidArgument`). Proceed — `connect`'s own
+    ///   `client_compat_check` against `GetClusterIdResp` is the check that
+    ///   applies to such a cluster.
+    ///
+    /// Cost is one round trip per NEW connection, never per request: manager
+    /// and PS connections are pooled for the client's life.
+    async fn say_hello(&self, client: &RpcClient, peer: &str) -> Result<()> {
+        use autumn_rpc::client_hello;
+        let payload = Bytes::copy_from_slice(&client_hello::encode_hello_req(
+            autumn_rpc::WIRE_VERSION,
+        ));
+        // The FIRST-attempt budget, not `rpc_timeout`. A hello on a fresh
+        // connection is by definition a first attempt, and that budget exists
+        // for exactly this shape: a peer that accepts the TCP connection and
+        // then never answers. Waiting the full `rpc_timeout` here would stall
+        // every new connection behind a hung peer before the data call that
+        // has the short budget even starts.
+        let outcome = match self.first_attempt_effective_timeout(0) {
+            None => client.call(client_hello::MSG_CLIENT_HELLO, payload).await,
+            Some(t) => {
+                client
+                    .call_timeout(client_hello::MSG_CLIENT_HELLO, payload, t)
+                    .await
+            }
+        };
+        match outcome {
+            Ok(resp) => {
+                if let Some((server_wire, _min_client)) = client_hello::parse_hello_resp(&resp) {
+                    self.negotiated_cluster_wire.set(server_wire);
+                }
+                // Cleared here, which is what keeps the refusal from being a
+                // latch: a client refused for running AHEAD of its cluster
+                // recovers on its own once the cluster is deployed.
+                *self.wire_refused.borrow_mut() = None;
+                // An OK reply of the wrong shape is left alone deliberately:
+                // it cannot be this message (the server that answers it is the
+                // server that encodes it), and failing the connection on it
+                // would turn a future additive reply into an outage.
+                Ok(())
+            }
+            Err(RpcError::Status {
+                code: StatusCode::FailedPrecondition,
+                message,
+            }) => {
+                let why = format!("{peer} refused this client: {message}");
+                *self.wire_refused.borrow_mut() = Some(why.clone());
+                Err(anyhow!(AutumnError::WireVersionRefused(why)))
+            }
+            // Predates the hello, or a transport failure. A broken transport
+            // surfaces on the very next call on this connection, and refusing
+            // here instead would make the hello a new way for a healthy
+            // cluster to be unreachable.
+            Err(_) => Ok(()),
+        }
+    }
+
     /// Get or create a manager RPC connection. Auto-reconnects on failure.
     async fn mgr_client(&self) -> Result<Rc<RpcClient>> {
         {
@@ -1001,6 +1115,9 @@ impl ClusterClient {
         let client = RpcClient::connect(addr)
             .await
             .with_context(|| format!("connect manager {}", self.manager_addr()))?;
+        // Before the connection is cached, so a refused client never gets a
+        // pooled connection to send its next request down.
+        self.say_hello(&client, self.manager_addr()).await?;
         *self.mgr_conn.borrow_mut() = Some(client.clone());
         Ok(client)
     }
@@ -1487,11 +1604,21 @@ impl ClusterClient {
             first_attempt_timeout: Cell::new(Some(DEFAULT_FIRST_ATTEMPT_TIMEOUT)),
             auth: RefCell::new(None),
             auth_gen: Cell::new(0),
+            wire_refused: RefCell::new(None),
+            negotiated_cluster_wire: Cell::new(0),
             binding,
         };
 
-        // Try connecting to each manager until one responds
+        // Try connecting to each manager until one responds. A wire-version
+        // REFUSAL ends the loop immediately: every manager in a cluster runs
+        // the same commit, so the next one answers the same thing, and the
+        // message names which way round the mismatch is — the one piece of
+        // information this failure carries. Flattening it into "cannot connect
+        // to any manager" is the shape this whole handshake exists to remove,
+        // and this is the entry point every wheel, fuse mount, gateway and
+        // autumn-op comes through.
         let mut connected = false;
+        let mut last_err: Option<anyhow::Error> = None;
         for idx in 0..client.manager_addrs.len() {
             client.current_mgr.set(idx);
             match client.mgr_client().await {
@@ -1499,11 +1626,21 @@ impl ClusterClient {
                     connected = true;
                     break;
                 }
-                Err(_) => continue,
+                Err(e) => {
+                    if e.downcast_ref::<AutumnError>()
+                        .is_some_and(|a| matches!(a, AutumnError::WireVersionRefused(_)))
+                    {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                }
             }
         }
         if !connected {
-            return Err(anyhow!("cannot connect to any manager: {}", manager));
+            return match last_err {
+                Some(e) => Err(e.context(format!("cannot connect to any manager: {manager}"))),
+                None => Err(anyhow!("cannot connect to any manager: {manager}")),
+            };
         }
 
         // WIRE-1: startup wire-schema cross-check. A SUCCESSFUL response
@@ -1532,6 +1669,10 @@ impl ClusterClient {
             ) {
                 return Err(anyhow!(msg));
             }
+            // Keep what the handshake negotiated. This is also the ONLY
+            // channel on a cluster that predates `MSG_CLIENT_HELLO`, and the
+            // only one at all for the manager before any hello is sent.
+            client.negotiated_cluster_wire.set(resp.wire_version_max);
         }
 
         client.refresh_regions().await?;
@@ -1866,6 +2007,10 @@ impl ClusterClient {
         let client = RpcClient::connect(addr)
             .await
             .with_context(|| format!("connect PS {ps_addr}"))?;
+        // BEFORE the AUTH_HELLO: the PS gates AUTH_HELLO itself on the client
+        // window, so a refused client that sent its credential first would be
+        // told "wire version" about a frame it thought was about identity.
+        self.say_hello(&client, ps_addr).await?;
         // Bind this connection's principal via AUTH_HELLO before it's cached.
         if let Some(token) = token {
             let hello = rkyv_encode(&AuthHelloReq { token });
@@ -2231,10 +2376,26 @@ impl ClusterClient {
                 }
             }
         }
-        Err(AutumnError::ConnectionError(format!(
-            "ps_call after {attempt} refreshes: {}",
+        Err(self.routing_exhausted(
+            "ps_call",
+            attempt,
+            last_err,
+        ))
+    }
+
+    /// How every routing-retry loop ends. ONE place, because the seven tails
+    /// were copy-pasted and a terminal condition reaching them must not be
+    /// classified seven different ways — which is exactly what happened to the
+    /// wire-version refusal, arriving as a `ConnectionError` with the server's
+    /// message buried in it.
+    fn routing_exhausted(&self, what: &str, attempt: u32, last_err: Option<String>) -> AutumnError {
+        if let Some(why) = self.wire_refused.borrow().clone() {
+            return AutumnError::WireVersionRefused(why);
+        }
+        AutumnError::ConnectionError(format!(
+            "{what} after {attempt} refreshes: {}",
             last_err.unwrap_or_else(|| "unknown".to_string())
-        )))
+        ))
     }
 
     /// One routing-retry step shared by all four PS-call loops
@@ -2244,6 +2405,15 @@ impl ClusterClient {
     /// refresh the region cache, and return `true` to retry against the
     /// (possibly re-resolved) routing.
     async fn refresh_and_backoff(&self, attempt: &mut u32) -> bool {
+        // A wire-version refusal is the one failure no amount of refreshing can
+        // change: the version is compiled into this binary. Stop after the
+        // first attempt rather than spending the whole budget (~13 s) to arrive
+        // at the same answer. The attempt itself always happens, so a client
+        // refused for being ahead of its cluster retries — and succeeds — as
+        // soon as the cluster is deployed.
+        if self.wire_refused.borrow().is_some() {
+            return false;
+        }
         if *attempt >= MAX_PS_REFRESHES {
             return false;
         }
@@ -2310,10 +2480,11 @@ impl ClusterClient {
                 }
             }
         }
-        Err(AutumnError::ConnectionError(format!(
-            "ps_call_bulk(part {part_id}) after {attempt} refreshes: {}",
-            last_err.unwrap_or_else(|| "unknown".to_string())
-        )))
+        Err(self.routing_exhausted(
+            &format!("ps_call_bulk(part {part_id})"),
+            attempt,
+            last_err,
+        ))
     }
 
     /// `call_ps_for_part` for a request whose RESPONSE is value-separable —
@@ -2387,10 +2558,11 @@ impl ClusterClient {
                 break;
             }
         }
-        Err(AutumnError::ConnectionError(format!(
-            "ps_call_pooled(part {part_id}) after {attempt} refreshes: {}",
-            last_err.unwrap_or_else(|| "unknown".to_string())
-        )))
+        Err(self.routing_exhausted(
+            &format!("ps_call_pooled(part {part_id})"),
+            attempt,
+            last_err,
+        ))
     }
 
     async fn call_ps_for_part(
@@ -2451,10 +2623,11 @@ impl ClusterClient {
                 }
             }
         }
-        Err(AutumnError::ConnectionError(format!(
-            "ps_call(part {part_id}) after {attempt} refreshes: {}",
-            last_err.unwrap_or_else(|| "unknown".to_string())
-        )))
+        Err(self.routing_exhausted(
+            &format!("ps_call(part {part_id})"),
+            attempt,
+            last_err,
+        ))
     }
 
     // ── High-level SDK API ──────────────────────────────────────────────────
@@ -2723,10 +2896,11 @@ impl ClusterClient {
                 break;
             }
         }
-        Err(AutumnError::ConnectionError(format!(
-            "put_bulk after {attempt} refreshes: {}",
-            last_err.unwrap_or_else(|| "unknown".to_string())
-        )))
+        Err(self.routing_exhausted(
+            "put_bulk",
+            attempt,
+            last_err,
+        ))
     }
 
     /// Get a value by key. Returns None if not found.
@@ -3503,10 +3677,11 @@ impl ClusterClient {
                 break;
             }
         }
-        Err(AutumnError::ConnectionError(format!(
-            "get_range_pooled after {attempt} refreshes: {}",
-            last_err.unwrap_or_else(|| "unknown".to_string())
-        )))
+        Err(self.routing_exhausted(
+            "get_range_pooled",
+            attempt,
+            last_err,
+        ))
     }
 
     /// batched point reads — the ONE client-side fan-out primitive. (Its first
@@ -4469,9 +4644,11 @@ impl ClusterClient {
                     // generic connection failure. Keep results accumulated
                     // so far; back off → refresh → retry with same cursor.
                     if refreshes_used >= MAX_PS_REFRESHES {
-                        return Err(AutumnError::ConnectionError(format!(
-                            "range on partition {part_id} after {refreshes_used} refreshes: {e}"
-                        )));
+                        return Err(self.routing_exhausted(
+                            &format!("range on partition {part_id}"),
+                            refreshes_used,
+                            Some(e.to_string()),
+                        ));
                     }
                     refreshes_used += 1;
                     let sleep = refresh_backoff(refreshes_used);
@@ -5225,6 +5402,8 @@ mod first_attempt_timeout_tests {
                 first_attempt_timeout: Cell::new(first),
                 auth: RefCell::new(None),
                 auth_gen: Cell::new(0),
+                wire_refused: RefCell::new(None),
+                negotiated_cluster_wire: Cell::new(0),
                 binding: NamespaceBinding::Raw,
             }
         });
@@ -5287,12 +5466,32 @@ mod first_attempt_timeout_tests {
                     let (mut socket, _) = listener.accept().await.unwrap();
                     let mut decoder = autumn_rpc::FrameDecoder::new();
                     let mut buf = vec![0; 4096];
-                    let frame = loop {
+                    // The SDK opens each PS connection with MSG_CLIENT_HELLO.
+                    // It must be ANSWERED, not skipped: `get_ps_client` awaits
+                    // the reply before the connection is usable, so leaving it
+                    // unanswered would serialize the very fan-out this test
+                    // measures behind the first partition's timeout.
+                    let frame = 'outer: loop {
                         let compio::BufResult(n, back) = socket.read(buf).await;
                         buf = back;
                         decoder.feed(&buf[..n.unwrap()]);
-                        if let Some(frame) = decoder.try_decode().unwrap() {
-                            break frame;
+                        while let Some(frame) = decoder.try_decode().unwrap() {
+                            if frame.msg_type == autumn_rpc::client_hello::MSG_CLIENT_HELLO {
+                                let resp = autumn_rpc::Frame::response(
+                                    frame.req_id,
+                                    frame.msg_type,
+                                    Bytes::copy_from_slice(
+                                        &autumn_rpc::client_hello::encode_hello_resp(
+                                            autumn_rpc::WIRE_VERSION,
+                                            autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+                                        ),
+                                    ),
+                                )
+                                .encode();
+                                socket.write_all(resp).await.0.unwrap();
+                                continue;
+                            }
+                            break 'outer frame;
                         }
                     };
                     assert_eq!(frame.msg_type, MSG_GET_REDIRECT_MANY);

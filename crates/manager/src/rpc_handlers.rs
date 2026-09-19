@@ -159,6 +159,12 @@ impl AutumnManager {
         let (mut reader, mut writer) = conn.into_split();
         let mut decoder = FrameDecoder::new();
         let mut buf = vec![0u8; 64 * 1024];
+        // This connection's client wire version, from `MSG_CLIENT_HELLO`.
+        // `None` = it sent no hello, which `admit_connection` reads as the
+        // version the hello was introduced in — so every client built before
+        // it, and all internal peer traffic (PS→manager and EN→manager go
+        // through `autumn_stream::ConnPool` with no handshake), is unaffected.
+        let mut client_wire_version: Option<u32> = None;
 
         let (resp_tx, mut resp_rx) =
             futures::channel::mpsc::unbounded::<Bytes>();
@@ -193,6 +199,26 @@ impl AutumnManager {
                             let req_id = frame.req_id;
                             let msg_type = frame.msg_type;
                             let payload = frame.payload;
+                            // Version handshake + admission, SYNCHRONOUSLY in
+                            // the decode loop rather than inside the spawned
+                            // task: the per-connection value is `!Send`-free
+                            // but it is also ordering-sensitive — a hello and
+                            // the first request can arrive in one read, and a
+                            // detached task would let the request be judged
+                            // before the hello that describes it.
+                            if let Some(reply) = Self::client_wire_gate(
+                                msg_type,
+                                &payload,
+                                req_id,
+                                &mut client_wire_version,
+                            ) {
+                                // best-effort, exactly like the spawned
+                                // task's send below: a closed `resp_rx` means
+                                // the connection is already gone, and there is
+                                // no caller left to report it to.
+                                let _ = resp_tx.unbounded_send(reply);
+                                continue;
+                            }
                             let mgr_c = mgr.clone();
                             let tx = resp_tx.clone();
                             compio::runtime::spawn(async move {
@@ -226,6 +252,64 @@ impl AutumnManager {
         drop(resp_tx);
         let _ = writer_task.await;
         reader_result
+    }
+
+    /// Answer `MSG_CLIENT_HELLO`, and refuse a client-surface message from a
+    /// connection whose version falls outside this binary's client window.
+    ///
+    /// `Some(frame_bytes)` = handled here; the caller emits it and does NOT
+    /// dispatch. `None` = admit as usual.
+    ///
+    /// **Scoped to msg_types, never to the connection.** The manager's listener
+    /// serves every partition server and extent node as well as clients, and
+    /// those peers are silent by construction — nothing in a frame says which
+    /// role sent it. A connection-scoped refusal would reject `register_ps`,
+    /// heartbeats, `register_node` and reconcile the moment the client floor
+    /// moved, which is a cluster outage rather than a compatibility check.
+    /// `MSG_GET_CLUSTER_ID` is exempt for the same family of reason: it is how
+    /// a peer finds out what it is talking to.
+    fn client_wire_gate(
+        msg_type: u8,
+        payload: &Bytes,
+        req_id: u32,
+        client_wire_version: &mut Option<u32>,
+    ) -> Option<Bytes> {
+        use autumn_rpc::client_hello;
+        let refuse = |code, msg: &str| -> Option<Bytes> {
+            Some(
+                Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, msg))
+                    .encode(),
+            )
+        };
+        if msg_type == client_hello::MSG_CLIENT_HELLO {
+            let Some(v) = client_hello::parse_hello_req(payload) else {
+                return refuse(StatusCode::InvalidArgument, "malformed MSG_CLIENT_HELLO");
+            };
+            // Recorded even when refused, so a client that ignores the refusal
+            // meets the same verdict on its next frame rather than an unknown
+            // one.
+            *client_wire_version = Some(v);
+            if let Err(why) = client_hello::admit_client(v) {
+                return refuse(StatusCode::FailedPrecondition, &why);
+            }
+            return Some(
+                Frame::response(
+                    req_id,
+                    msg_type,
+                    Bytes::copy_from_slice(&client_hello::encode_hello_resp(
+                        autumn_rpc::WIRE_VERSION,
+                        autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+                    )),
+                )
+                .encode(),
+            );
+        }
+        if client_hello::is_client_surface_mgr_msg(msg_type) {
+            if let Err(why) = client_hello::admit_connection(*client_wire_version) {
+                return refuse(StatusCode::FailedPrecondition, &why);
+            }
+        }
+        None
     }
 
     async fn dispatch(&self, msg_type: u8, payload: Bytes) -> HandlerResult {

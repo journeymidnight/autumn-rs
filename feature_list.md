@@ -248,8 +248,31 @@
   `MIN_CLIENT_WIRE_VERSION`（删掉 `WIRE_VERSION_MIN`），区间重叠判据拆成 peer 精确相等 +
   客户端两端包含，三个调用点各归各位，manager 用 `MIN_CLIENT_WIRE_VERSION` 填冻结的
   `wire_version_min` 槽位。两常量相等 ⇒ **窗口关着，行为与改动前逐对相同**（评审独立推导
-  过旧判据恰好归约为新的客户端判据）。余下未做：`MSG_CLIENT_HELLO`、服务端准入、
-  调用点服务两种形式 —— 在那之前**没有任何东西校验进来的客户端**。
+  过旧判据恰好归约为新的客户端判据）。
+  **Scope 3（服务端强制）已落地**（2026-09-19，未 push）：`MSG_CLIENT_HELLO`（0x5F，
+  手写定长二进制，`client_hello.rs`，与 `GetClusterIdReq/Resp` 一同被 golden-bytes
+  冻结）+ manager `client_wire_gate`（解码循环内同步执行，在 per-frame spawn 之前）
+  + PS 端并入 `authz_gate`（在 `!gate_active()` 早退**之上**）+ SDK 在
+  `mgr_client()`/`get_ps_client()` 每开一条连接发一次 hello 并留住协商版本
+  (`negotiated_cluster_wire`)。准入按 msg_type 划界；沉默连接按引入版本 43 对待，
+  故对改动前构建的每个客户端与每个内部 peer 都**惰性**。
+  **设计没预料到的一条**：`MSG_GET_REGIONS` 同时在两个面上（SDK 路由用它，PS 的
+  `sync_regions_once` 也用它），PS 不发 hello，所以它必须留在门外，否则地板一抬就是
+  全队 region sync 停摆 —— 正是 msg_type 划界要避免的那个停摆，只是换了条路进来。
+  代价：地板以下的客户端仍能拉路由，但它之后发的每个数据面消息都会被拒。要真正堵上
+  需要让集群 peer 能自报身份，那是另一件事。两个测试钉住了这条。
+  **服务端拒绝在客户端侧必须是终止性的**（评审逼出，新增 `AutumnError::WireVersionRefused`）：
+  拒绝来自**开连接**而非调用，所以它落在七个重试循环各自的 connect-error 臂上；
+  原先 `connect` 把它吞成「cannot connect to any manager」，数据面则烧满
+  `MAX_PS_REFRESHES`（实测 11 次 accept / 28 秒一个 get）再贴上 ConnectionError 标签，
+  恰好把拒绝唯一携带的信息（往哪个方向修）丢掉。改成一个 choke point：
+  `wire_refused` 由 `say_hello` 写，`refresh_and_backoff` 与新的 `routing_exhausted`
+  读——后者替换掉七段复制粘贴的循环尾巴。**不是永久闩**：握手成功即清除，
+  且每次调用仍会真的试一次，所以跑在集群前面的客户端在集群部署后自行恢复。
+  运维面（autumn-op 的消息）**有意不纳入窗口**：它与集群同 commit 发布；代价是
+  陈旧 autumn-op 仍会跨版本解 rkyv，已写入文档而非隐含。
+  余下未做：调用点服务两种形式（设计 §7）—— 在那之前 `MIN_CLIENT_WIRE_VERSION`
+  抬不起来，窗口仍然是关着的。
 - `passes: false`
 - **notes** (2026-09-18, Scope 1 完成 — 枚举与代价测量):
   - **客户端面是可枚举的**：236 个 wire 类型里约 61 个在上面。`partition_rpc` 数据面、
