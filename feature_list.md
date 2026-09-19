@@ -244,7 +244,12 @@
   - `docs/ops.md` 的升级步骤可执行地区分两类 bump；`crates/rpc/CLAUDE.md` 写清哪些文件/结构
      属于客户端面以及它们的演进规则。
 - **Status**: Scope 1（枚举 + 代价测量）已做完，**结论改变了 2/3 的做法顺序**，见 notes。
-  代码未动。
+  **Scope 2 第一步已落地**（2026-09-19，未 push）：常量拆成 `WIRE_VERSION` /
+  `MIN_CLIENT_WIRE_VERSION`（删掉 `WIRE_VERSION_MIN`），区间重叠判据拆成 peer 精确相等 +
+  客户端两端包含，三个调用点各归各位，manager 用 `MIN_CLIENT_WIRE_VERSION` 填冻结的
+  `wire_version_min` 槽位。两常量相等 ⇒ **窗口关着，行为与改动前逐对相同**（评审独立推导
+  过旧判据恰好归约为新的客户端判据）。余下未做：`MSG_CLIENT_HELLO`、服务端准入、
+  调用点服务两种形式 —— 在那之前**没有任何东西校验进来的客户端**。
 - `passes: false`
 - **notes** (2026-09-18, Scope 1 完成 — 枚举与代价测量):
   - **客户端面是可枚举的**：236 个 wire 类型里约 61 个在上面。`partition_rpc` 数据面、

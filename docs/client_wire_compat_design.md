@@ -56,12 +56,11 @@ needs, and a client already deployed reads that field with code that cannot be
 changed. **The constant names and the field names are deliberately not the same
 words; both sides carry a comment saying so.**
 
-That makes the existing `wire_compat_check` interval-overlap test wrong for
-cluster peers, and wrong in the dangerous direction. It computes
-`lo = max(LOCAL_MIN, remote_min)`, `hi = min(LOCAL_MAX, remote_max)`, and accepts
-when `lo <= hi`. A stale PS at 44 meeting a cluster reporting `[44, 45]` overlaps
-and is ADMITTED — the handshake was the only thing enforcing stop-the-world, and
-reporting a floor dissolves it.
+Reporting a floor there is what rules out an interval-overlap test for cluster
+peers, and it fails in the dangerous direction: overlap accepts whenever
+`max(LOCAL_MIN, remote_min) <= min(LOCAL_MAX, remote_max)`, so a stale PS at 44
+meeting a cluster reporting `[44, 45]` overlaps and is ADMITTED — and this
+handshake is the only thing enforcing stop-the-world.
 
 **INVARIANT: a cluster peer requires equality, a client requires membership.**
 
@@ -71,9 +70,9 @@ reporting a floor dissolves it.
 - A client, checking the cluster: admit iff
   `resp.wire_version_min <= WIRE_VERSION(client) <= resp.wire_version_max`.
 
-Overlap is the wrong shape for both and does not survive as a shared helper; its
-doc comment and the tests that encode the old relation (`crates/rpc/src/lib.rs`)
-go with it.
+Overlap is the wrong shape for both, so there is no shared helper: the two
+questions are two functions, and each names in its refusal which of the two
+fixes applies.
 
 Without this the window cannot open at all. A cluster at `WIRE_VERSION = 45`
 with the floor at 44, answering `[45, 45]` to an in-window client at 44, makes

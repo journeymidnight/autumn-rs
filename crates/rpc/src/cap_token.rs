@@ -12,14 +12,15 @@
 //! (manager) and the verifier (PS) can never drift.
 //!
 //! **The token layout is wire schema**, so any change to `CapClaims` needs a
-//! by-hand `WIRE_VERSION_MIN`/`MAX` bump — exactly like `manager_rpc.rs` /
+//! by-hand `WIRE_VERSION` bump — exactly like `manager_rpc.rs` /
 //! `partition_rpc.rs`, and with the same absence of a safety net: nothing
 //! computes a fingerprint any more, so a forgotten bump is undetected.
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
 //  retype a field, or change what one MEANS — and you MUST bump
-//  `WIRE_VERSION_MAX` (and set `MIN = MAX`) in `crates/rpc/src/lib.rs`.
+//  `WIRE_VERSION` in `crates/rpc/src/lib.rs` — and raise
+//  `MIN_CLIENT_WIRE_VERSION` too if the change breaks the CLIENT surface.
 //
 //  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
 //  forgotten bump was removed; the version integer is the only guard left,

@@ -51,9 +51,9 @@ when an operator needs it.
 ### WIRE version discipline
 
 Manager RPC structs are rkyv, which has no version tag and no cross-version decode.
-`WIRE_VERSION_MIN`/`MAX` in `crates/rpc/src/lib.rs` are maintained BY HAND — there is
-no fingerprint and nothing checks the bump for you. Pre-R3 the binary pins
-`MIN == MAX`, so any layout change is a **same-commit, stop-the-world deploy**
+`WIRE_VERSION` in `crates/rpc/src/lib.rs` is maintained BY HAND — there is
+no fingerprint and nothing checks the bump for you. Cluster peers require it to
+match EXACTLY, so any layout change is a **same-commit, stop-the-world deploy**
 (stop every role, swap binaries, start; etcd is never wiped — see the upgrade-safety
 note below). `GetClusterIdResp`
 (`{wire_version_min, wire_version_max, cluster_version}`, the startup handshake) is
@@ -1348,10 +1348,10 @@ before the listener binds.
 
 **`cluster_version`** (`autumn-rs/cluster_version`, ASCII decimal — deliberately not
 rkyv so it outlives serialization eras). CAS-imprinted to this binary's
-`WIRE_VERSION_MAX`; `bump_cluster_version` is leader-only, exactly current+1, capped at
-`WIRE_VERSION_MAX`, value-CAS'd. `parse_cluster_version` (the only decode point) is
+`WIRE_VERSION`; `bump_cluster_version` is leader-only, exactly current+1, capped at
+`WIRE_VERSION`, value-CAS'd. `parse_cluster_version` (the only decode point) is
 **fail-closed on rollback**: it refuses a persisted value above this binary's
-`WIRE_VERSION_MAX`, so through replay an old binary can't become leader after a bump.
+`WIRE_VERSION`, so through replay an old binary can't become leader after a bump.
 
 **Upgrade safety = stop-world + rkyv fail-loud.** 生产升级 = 全停 → 换二进制 → 全起,
 etcd 永不清(绝不 `cluster.sh reset`)。安全来自 rkyv 校验式 `from_bytes`:新二进制

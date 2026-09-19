@@ -68,15 +68,18 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
     (z % shard_count as u64) as u32
 }
 
-/// The wire-version interval this binary speaks. `MAX` is the version of the
-/// schema compiled into this binary; `MIN` is the oldest peer version it can
-/// still interoperate with.
+/// The version of the wire schema compiled into this binary.
+///
+/// A CLUSTER peer must speak this exact version (`cluster_peer_compat_check`);
+/// a CLIENT must fall inside `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`
+/// (`client_compat_check`). Those are different questions and neither is an
+/// interval overlap — see the two functions.
 ///
 /// ─────────────────────────────────────────────────────────────────────────
-///  ⚠️  EDIT A WIRE STRUCT → BUMP `WIRE_VERSION_MAX`. NOTHING CHECKS THIS
-///      FOR YOU ANY MORE. There is no fingerprint and no registry test; this
-///      constant is the ONLY thing standing between a schema change and a
-///      silent corruption.
+///  ⚠️  EDIT A WIRE STRUCT → BUMP `WIRE_VERSION`. NOTHING CHECKS THIS FOR YOU
+///      ANY MORE. There is no fingerprint and no registry test; this constant
+///      is the ONLY thing standing between a schema change and a silent
+///      corruption.
 /// ─────────────────────────────────────────────────────────────────────────
 ///
 /// The wire schema is `manager_rpc.rs`, `partition_rpc.rs`, `frame.rs`,
@@ -91,21 +94,47 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// been seen here — a stale python wheel decoded `PutReq` with `part_id = 0`
 /// and every write failed with nothing anywhere pointing at the cause.
 ///
-/// How to decide the interval:
-/// - pre-R2/R3 (where this tree is): bump `MAX` **and set `MIN = MAX`**. The
-///   new version is incompatible with everything before it; deploying it is
-///   stop-the-world, and every image carrying an embedded client must be
-///   rebuilt at the same commit.
-/// - post-R3 (frozen V1 + explicit V2 msg_types): bump `MAX`, keep
-///   `MIN = MAX - 1`, so the binary serves both forms during a rolling
-///   window. This tree is NOT post-R3: the client runs its compatibility
-///   check once at connect and keeps nothing, so no call site can gate on
-///   the negotiated version.
-pub const WIRE_VERSION_MIN: u32 = 43;
-pub const WIRE_VERSION_MAX: u32 = 43;
+/// Bump it on every wire change. There is no separate "oldest cluster peer"
+/// constant: peers compare for EQUALITY, so a floor pinned to this value would
+/// say nothing.
+pub const WIRE_VERSION: u32 = 43;
+
+/// The oldest CLIENT this binary serves — the floor of the client window
+/// `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`.
+///
+/// Raise it ONLY for a change that breaks the client-facing surface, which is
+/// what makes it the one constant answering "does this force every image
+/// carrying an embedded client to be rebuilt". A client is not ours to
+/// restart: it lives inside an inference pod, a mounted fuse daemon, an s3
+/// gateway, somebody else's image. Raising `WIRE_VERSION` alone leaves every
+/// client inside the window untouched.
+///
+/// Equal to `WIRE_VERSION` here, so the window admits exactly one version and
+/// nothing behaves differently yet. Opening it needs the parts that let a call
+/// site serve two forms — see `docs/client_wire_compat_design.md`.
+///
+/// It rides in `GetClusterIdResp`'s `wire_version_min` FIELD. That struct is
+/// frozen (it is the negotiation channel, decoded before any compat decision
+/// can be made), so the field name outlives the constant it carries; the
+/// mismatch is deliberate and noted at both ends.
+pub const MIN_CLIENT_WIRE_VERSION: u32 = WIRE_VERSION;
+
+/// An inverted window would refuse every client while every server came up
+/// happy — `cluster_peer_compat_check` never looks at the floor. Checked here
+/// rather than in a test, because the test that pins the two EQUAL is meant to
+/// be deleted the day the window opens.
+const _: () = assert!(MIN_CLIENT_WIRE_VERSION <= WIRE_VERSION);
 
 
-/// Peer wire-compat check: accept iff the version intervals overlap.
+/// CLUSTER-peer compat check: accept iff the peer speaks our exact version.
+///
+/// Equality, not interval overlap, and the difference is load-bearing. The
+/// manager reports `MIN_CLIENT_WIRE_VERSION` in the `wire_version_min` slot
+/// because that is what a client needs, so an overlap test would admit a stale
+/// PS or EN sitting anywhere inside the CLIENT window — and the handshake is
+/// the only thing enforcing stop-the-world. Equality is also the honest
+/// spelling of the rule: manager, PS and EN binaries swap in one window and
+/// never face a peer of another version.
 ///
 /// Callers treat a TRANSPORT failure fetching the peer's values as
 /// best-effort-skip (the peer may be briefly down; availability wins),
@@ -121,27 +150,64 @@ pub const WIRE_VERSION_MAX: u32 = 43;
 /// which is how a real change would have been waved through anyway.
 ///
 /// The cost of removing it is real and worth stating where someone will read
-/// it: a forgotten `WIRE_VERSION_MAX` bump is now UNDETECTED. Two binaries
+/// it: a forgotten `WIRE_VERSION` bump is now UNDETECTED. Two binaries
 /// claiming the same version with different layouts will handshake happily
 /// and then decode each other's bytes as garbage. See the discipline block on
-/// `WIRE_VERSION_MIN`.
-pub fn wire_compat_check(
+/// `WIRE_VERSION`.
+pub fn cluster_peer_compat_check(remote_max: u32) -> std::result::Result<(), String> {
+    if remote_max == WIRE_VERSION {
+        return Ok(());
+    }
+    Err(format!(
+        "wire-version mismatch: this binary speaks {WIRE_VERSION}, the cluster \
+speaks {remote_max}. Cluster members must all run the SAME commit (rkyv wire \
+structs have no implicit cross-version compatibility; a mixed deploy decodes \
+garbage — and rkyv does not always fail loudly when it does). Stop every manager, partition server \
+and extent node, swap the binaries together, and start."
+    ))
+}
+
+/// CLIENT compat check: accept iff OUR version falls inside the window the
+/// cluster serves.
+///
+/// Membership, and BOTH ends refuse. Below the floor the cluster no longer
+/// keeps the behavior this client needs. Above `remote_max` the cluster cannot
+/// speak what this client will send — not a corner case here, since images are
+/// built from `main` and a wheel routinely runs ahead of a cluster nobody has
+/// upgraded yet.
+///
+/// `remote_min` arrives in `GetClusterIdResp.wire_version_min`, which carries
+/// the cluster's `MIN_CLIENT_WIRE_VERSION` (frozen field name, different
+/// constant — see `MIN_CLIENT_WIRE_VERSION`). A cluster reporting `max == 0`
+/// (empty/pre-R1) is refused.
+///
+/// This runs at connect and is a courtesy, not the gate: it is skipped when the
+/// fetch itself fails, and the design puts admission at the server. Until that
+/// lands, nothing validates an incoming client at all.
+pub fn client_compat_check(
     remote_min: u32,
     remote_max: u32,
 ) -> std::result::Result<(), String> {
-    if remote_max >= 1 && remote_min <= remote_max {
-        let lo = WIRE_VERSION_MIN.max(remote_min);
-        let hi = WIRE_VERSION_MAX.min(remote_max);
-        if lo <= hi {
-            return Ok(());
-        }
+    if (remote_min..=remote_max).contains(&WIRE_VERSION) {
+        return Ok(());
     }
+    // An empty range (`min > max`) and a pre-R1 `max == 0` both fall out of
+    // `contains` on their own; neither needs its own guard.
+    let why = if remote_max == 0 {
+        // NOT "unbootstrapped": that arm of `handle_get_cluster_id` fills both
+        // versions from the constants, so it reports real ones.
+        "the cluster reported no wire version at all — it predates the version \
+handshake"
+    } else if WIRE_VERSION > remote_max {
+        "this client is NEWER than the cluster — deploy the cluster, or build \
+the client from the cluster's commit"
+    } else {
+        "this client is older than the window the cluster still serves — \
+rebuild it from a commit inside that window"
+    };
     Err(format!(
-        "wire-version mismatch: local=[{WIRE_VERSION_MIN},{WIRE_VERSION_MAX}], \
-peer=[{remote_min},{remote_max}] — no common wire version (rkyv wire structs \
-have no implicit cross-version compatibility; a mixed deploy decodes garbage \
-silently). Upgrade one step at a time (compat window is N ↔ N-1), or rebuild \
-this binary/wheel from the cluster's commit."
+        "wire-version mismatch: this client speaks {WIRE_VERSION}, the cluster \
+serves [{remote_min},{remote_max}] — {why}."
     ))
 }
 
@@ -268,10 +334,50 @@ mod wire_version_tests {
 
 
     #[test]
-    fn compat_accepts_overlapping_interval_from_newer_peer() {
-        // Different build whose max is NEWER than anything we know,
-        // overlapping declared interval → accept (the rolling window).
-        assert!(wire_compat_check(WIRE_VERSION_MAX, WIRE_VERSION_MAX + 1).is_ok());
+    fn a_cluster_peer_must_match_exactly() {
+        assert!(cluster_peer_compat_check(WIRE_VERSION).is_ok());
+        for other in [WIRE_VERSION + 1, WIRE_VERSION - 1, 0] {
+            assert!(
+                cluster_peer_compat_check(other).is_err(),
+                "peer at {other} must be refused"
+            );
+        }
+    }
+
+    /// The reason peers cannot reuse the client rule. `wire_version_min`
+    /// carries the CLIENT floor, so anything interval-shaped would admit a
+    /// stale server sitting inside the client window — and this handshake is
+    /// the only thing enforcing stop-the-world.
+    #[test]
+    fn a_stale_server_inside_the_client_window_is_still_refused() {
+        let cluster_max = WIRE_VERSION + 2;
+        let floor = WIRE_VERSION; // a window the stale server falls inside
+        assert!(
+            client_compat_check(floor, cluster_max).is_ok(),
+            "a CLIENT at this version is in the window"
+        );
+        assert!(
+            cluster_peer_compat_check(cluster_max).is_err(),
+            "a SERVER at this version must still be refused"
+        );
+    }
+
+    #[test]
+    fn a_client_is_admitted_inside_the_window_and_refused_at_both_ends() {
+        // Inside, including both boundaries.
+        assert!(client_compat_check(WIRE_VERSION, WIRE_VERSION).is_ok());
+        assert!(client_compat_check(WIRE_VERSION - 1, WIRE_VERSION).is_ok());
+        assert!(client_compat_check(WIRE_VERSION, WIRE_VERSION + 1).is_ok());
+
+        // Below the floor.
+        let err = client_compat_check(WIRE_VERSION + 1, WIRE_VERSION + 3).unwrap_err();
+        assert!(err.contains("older than the window"), "{err}");
+
+        // ABOVE the ceiling — a wheel built from main against a lagging
+        // cluster. The message has to name which way round it is, because the
+        // fix differs: deploy the cluster, or rebuild the client.
+        let err = client_compat_check(WIRE_VERSION - 2, WIRE_VERSION - 1).unwrap_err();
+        assert!(err.contains("NEWER than the cluster"), "{err}");
     }
 
     /// A peer claiming OUR version is accepted, full stop.
@@ -289,17 +395,25 @@ mod wire_version_tests {
     /// fail first.
     #[test]
     fn compat_no_longer_verifies_the_peers_schema() {
-        assert!(wire_compat_check(WIRE_VERSION_MIN, WIRE_VERSION_MAX).is_ok());
+        assert!(cluster_peer_compat_check(WIRE_VERSION).is_ok());
+        assert!(client_compat_check(MIN_CLIENT_WIRE_VERSION, WIRE_VERSION).is_ok());
     }
 
     #[test]
-    fn compat_rejects_disjoint_and_pre_r1() {
-        // Disjoint interval → refuse with the actionable message.
-        let err = wire_compat_check(WIRE_VERSION_MAX + 1, WIRE_VERSION_MAX + 2).unwrap_err();
-        assert!(err.contains("no common wire version"), "{err}");
-        // Pre-R1 peer (zero interval) → refuse.
-        assert!(wire_compat_check(0, 0).is_err());
-        // Malformed interval (min > max) → refuse.
-        assert!(wire_compat_check(3, 2).is_err());
+    fn compat_rejects_pre_r1_and_malformed() {
+        // Pre-R1 peer (zero interval) → refuse on both paths, and say so
+        // rather than blaming the client's age.
+        assert!(cluster_peer_compat_check(0).is_err());
+        let err = client_compat_check(0, 0).unwrap_err();
+        assert!(err.contains("predates the version handshake"), "{err}");
+        // Malformed (min > max) → an empty range contains nothing → refuse.
+        assert!(client_compat_check(3, 2).is_err());
+    }
+
+    /// The window ships CLOSED, so this change serves every existing client
+    /// exactly what it served before. Opening it is a separate, deliberate act.
+    #[test]
+    fn the_client_window_is_shut_until_someone_opens_it() {
+        assert_eq!(MIN_CLIENT_WIRE_VERSION, WIRE_VERSION);
     }
 }

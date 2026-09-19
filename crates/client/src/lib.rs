@@ -1522,9 +1522,11 @@ impl ClusterClient {
             let resp = rkyv_decode::<GetClusterIdResp>(&resp_bytes).map_err(|e| {
                 anyhow!("decode GetClusterIdResp failed ({e}) — possible wire-schema mismatch; rebuild from the cluster's commit")
             })?;
-            // R1: interval-overlap compat check (refusal message carries
-            // both intervals).
-            if let Err(msg) = autumn_rpc::wire_compat_check(
+            // This is the CLIENT rule: our version must fall inside the window
+            // the cluster serves, refused at BOTH ends. Too old and the
+            // cluster no longer keeps the behavior we need; too new and it
+            // cannot speak what we will send.
+            if let Err(msg) = autumn_rpc::client_compat_check(
                 resp.wire_version_min,
                 resp.wire_version_max,
             ) {

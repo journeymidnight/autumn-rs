@@ -355,8 +355,8 @@ impl AutumnManager {
                 code: CODE_ERROR,
                 message: "manager not yet bootstrapped".to_string(),
                 cluster_id: String::new(),
-                wire_version_min: autumn_rpc::WIRE_VERSION_MIN,
-                wire_version_max: autumn_rpc::WIRE_VERSION_MAX,
+                wire_version_min: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+                wire_version_max: autumn_rpc::WIRE_VERSION,
                 cluster_version: self.cluster_version.get(),
             }));
         }
@@ -364,8 +364,8 @@ impl AutumnManager {
             code: CODE_OK,
             message: String::new(),
             cluster_id: id,
-            wire_version_min: autumn_rpc::WIRE_VERSION_MIN,
-            wire_version_max: autumn_rpc::WIRE_VERSION_MAX,
+            wire_version_min: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+            wire_version_max: autumn_rpc::WIRE_VERSION,
             cluster_version: self.cluster_version.get(),
         }))
     }
@@ -1019,8 +1019,8 @@ impl AutumnManager {
                                 code: CODE_ERROR,
                                 message: err.to_string(),
                                 cluster_version: self.cluster_version.get(),
-                                wire_version_min: autumn_rpc::WIRE_VERSION_MIN,
-                                wire_version_max: autumn_rpc::WIRE_VERSION_MAX,
+                                wire_version_min: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+                                wire_version_max: autumn_rpc::WIRE_VERSION,
                             }));
                         }
                     }
@@ -1031,8 +1031,8 @@ impl AutumnManager {
             code: CODE_OK,
             message: String::new(),
             cluster_version: self.cluster_version.get(),
-            wire_version_min: autumn_rpc::WIRE_VERSION_MIN,
-            wire_version_max: autumn_rpc::WIRE_VERSION_MAX,
+            wire_version_min: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+            wire_version_max: autumn_rpc::WIRE_VERSION,
         }))
     }
 

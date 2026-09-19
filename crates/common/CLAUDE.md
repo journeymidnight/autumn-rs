@@ -97,7 +97,7 @@ detach the matcher); `owner_fence_matcher_pairs_with_producer` tests the matcher
 against errors from the REAL producer. Over the wire a fence is just
 `CODE_PRECONDITION`; the stream `StreamClient` uses this to distinguish it from
 ordinary preconditions WITHOUT a new wire code (which would force a manual
-stop-world `WIRE_VERSION_MIN`/`MAX` bump — and nothing would catch a forgotten
+stop-world `WIRE_VERSION` bump — and nothing would catch a forgotten
 one, since the fingerprint registry that used to is gone) and to route it into the PS's
 "LockedByOther" poison-and-reopen self-heal (see stream CLAUDE.md).
 

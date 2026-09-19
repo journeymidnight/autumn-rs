@@ -26,7 +26,7 @@ pub enum StatusCode {
     /// namespace, same class as `PermissionDenied`. Appended (discriminant 8) so
     /// all prior codes stay wire-stable, and a same-commit stop-world deploy
     /// makes the new value safe. (There is no wire FINGERPRINT registry any
-    /// more: `WIRE_VERSION_MIN`/`MAX` are bumped BY HAND and nothing verifies
+    /// more: `WIRE_VERSION` is bumped BY HAND and nothing verifies
     /// that you did.)
     NamespaceUnknown = 8,
 }

@@ -31,7 +31,7 @@ fn usage() -> ! {
     eprintln!(
         "  policy-candidates            advisory split/merge/gc/compact/ec candidates"
     );
-    eprintln!("  cluster-version              persisted cluster_version + manager wire interval (R1)");
+    eprintln!("  cluster-version              persisted cluster_version + the cluster's wire version");
     eprintln!();
     eprintln!("op observability:");
     eprintln!("  ops status <id>              live state of one op, incl. progress");

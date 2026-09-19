@@ -1044,10 +1044,10 @@ pub struct AutumnManager {
     /// operator-driven feature gate — new wire
     /// forms / persisted formats versioned N may only be EMITTED once
     /// this reaches N. CAS-seeded to the first leader's
-    /// `WIRE_VERSION_MAX` by `imprint_cluster_version`; bumped only via
+    /// `WIRE_VERSION` by `imprint_cluster_version`; bumped only via
     /// `MSG_BUMP_CLUSTER_VERSION` (monotonic, exactly +1, capped at this
-    /// binary's own WIRE_VERSION_MAX). Memory-only mode starts at this
-    /// binary's WIRE_VERSION_MAX.
+    /// binary's own WIRE_VERSION). Memory-only mode starts at this
+    /// binary's WIRE_VERSION.
     pub(crate) cluster_version: Rc<Cell<u32>>,
     /// Inode-level lease registry shared between the
     /// AcquireLease / ReleaseLease / HeartbeatLease / PollInvalidations
@@ -1178,7 +1178,7 @@ impl AutumnManager {
             // R1: memory-only mode runs at this binary's max wire
             // version. Overwritten by `try_become_leader` /
             // `replay_from_etcd` when etcd is configured.
-            cluster_version: Rc::new(Cell::new(autumn_rpc::WIRE_VERSION_MAX)),
+            cluster_version: Rc::new(Cell::new(autumn_rpc::WIRE_VERSION)),
             // Empty registry; populated on
             // AcquireLease and on `replay_from_etcd`.
             inode_leases: Rc::new(RefCell::new(crate::inode_lease::LeaseRegistry::with_ttl(
@@ -2963,7 +2963,7 @@ impl AutumnManager {
 
     /// R1: parse an etcd cluster_version value (ASCII decimal) and
     /// enforce the rollback-safety bound (coco P1): a persisted value
-    /// ABOVE this binary's WIRE_VERSION_MAX means the cluster was bumped
+    /// ABOVE this binary's WIRE_VERSION means the cluster was bumped
     /// past what this binary speaks — i.e. an old binary was rolled back
     /// AFTER the bump, exactly the "a bump can never roll back" rule from design
     /// §3-R1. Fail closed: the error propagates out of replay /
@@ -2978,12 +2978,12 @@ impl AutumnManager {
             .trim()
             .parse::<u32>()
             .map_err(|e| AppError::Internal(format!("cluster_version parse: {e}")))?;
-        if v > autumn_rpc::WIRE_VERSION_MAX {
+        if v > autumn_rpc::WIRE_VERSION {
             return Err(AppError::Precondition(format!(
-                "persisted cluster_version {v} exceeds this binary's WIRE_VERSION_MAX={} — \
+                "persisted cluster_version {v} exceeds this binary's WIRE_VERSION={} — \
 this binary is OLDER than the cluster's committed format level (rollback past a \
 cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
-                autumn_rpc::WIRE_VERSION_MAX
+                autumn_rpc::WIRE_VERSION
             )));
         }
         Ok(v)
@@ -2991,7 +2991,7 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
 
     /// R1: CAS-imprint the cluster_version key in etcd. Same shape as
     /// `imprint_cluster_id`: first leader ever seeds it to its own
-    /// `WIRE_VERSION_MAX` (a fresh cluster runs at the version it was
+    /// `WIRE_VERSION` (a fresh cluster runs at the version it was
     /// born with — there is nothing older to be compatible with);
     /// subsequent leaders read the existing value. Memory-only mode
     /// keeps the `Self::new()` seed.
@@ -3011,7 +3011,7 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
             return Ok(());
         }
 
-        let fresh = autumn_rpc::WIRE_VERSION_MAX;
+        let fresh = autumn_rpc::WIRE_VERSION;
         let cmp = autumn_etcd::Cmp::create_revision(CLUSTER_VERSION_KEY.as_bytes(), 0);
         let put = autumn_etcd::Op::put(
             CLUSTER_VERSION_KEY.as_bytes(),
@@ -3117,11 +3117,11 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
                 "cluster_version bump must be exactly current+1: current={cur}, requested={to}"
             )));
         }
-        if to > autumn_rpc::WIRE_VERSION_MAX {
+        if to > autumn_rpc::WIRE_VERSION {
             return Err(AppError::Precondition(format!(
-                "cluster_version {to} exceeds this manager's WIRE_VERSION_MAX={} — upgrade \
+                "cluster_version {to} exceeds this manager's WIRE_VERSION={} — upgrade \
 the manager binaries first (design §6: bump comes AFTER all members run the new binary)",
-                autumn_rpc::WIRE_VERSION_MAX
+                autumn_rpc::WIRE_VERSION
             )));
         }
         if let Some(etcd) = &self.etcd {
@@ -9803,23 +9803,23 @@ mod tests {
     #[test]
     fn r1_bump_cluster_version_validation() {
         let m = AutumnManager::new();
-        // Memory mode seeds cluster_version = WIRE_VERSION_MAX.
-        assert_eq!(m.cluster_version.get(), autumn_rpc::WIRE_VERSION_MAX);
+        // Memory mode seeds cluster_version = WIRE_VERSION.
+        assert_eq!(m.cluster_version.get(), autumn_rpc::WIRE_VERSION);
         run(async {
             // +1 beyond this binary's max → refused (nothing to upgrade to).
             let err = m
-                .bump_cluster_version(autumn_rpc::WIRE_VERSION_MAX + 1)
+                .bump_cluster_version(autumn_rpc::WIRE_VERSION + 1)
                 .await
                 .unwrap_err();
-            assert!(err.to_string().contains("WIRE_VERSION_MAX"), "{err}");
+            assert!(err.to_string().contains("WIRE_VERSION"), "{err}");
 
             // Simulate a cluster running one version behind this binary
             // (the post-rolling-upgrade state where a bump is legal).
-            m.cluster_version.set(autumn_rpc::WIRE_VERSION_MAX - 1);
+            m.cluster_version.set(autumn_rpc::WIRE_VERSION - 1);
             // Skip (+2) and same (+0) and backwards are all refused.
             for bad in [
-                autumn_rpc::WIRE_VERSION_MAX + 1,
-                autumn_rpc::WIRE_VERSION_MAX - 1,
+                autumn_rpc::WIRE_VERSION + 1,
+                autumn_rpc::WIRE_VERSION - 1,
                 0,
             ] {
                 let err = m.bump_cluster_version(bad).await.unwrap_err();
@@ -9827,17 +9827,17 @@ mod tests {
             }
             // Exactly +1 (and within max) succeeds.
             let v = m
-                .bump_cluster_version(autumn_rpc::WIRE_VERSION_MAX)
+                .bump_cluster_version(autumn_rpc::WIRE_VERSION)
                 .await
                 .unwrap();
-            assert_eq!(v, autumn_rpc::WIRE_VERSION_MAX);
-            assert_eq!(m.cluster_version.get(), autumn_rpc::WIRE_VERSION_MAX);
+            assert_eq!(v, autumn_rpc::WIRE_VERSION);
+            assert_eq!(m.cluster_version.get(), autumn_rpc::WIRE_VERSION);
 
             // Non-leader refuses before any validation.
-            m.cluster_version.set(autumn_rpc::WIRE_VERSION_MAX - 1);
+            m.cluster_version.set(autumn_rpc::WIRE_VERSION - 1);
             m.leader.set(false);
             assert!(m
-                .bump_cluster_version(autumn_rpc::WIRE_VERSION_MAX)
+                .bump_cluster_version(autumn_rpc::WIRE_VERSION)
                 .await
                 .is_err());
             m.leader.set(true);
@@ -9845,11 +9845,11 @@ mod tests {
     }
 
     /// R1 (coco P1): a persisted cluster_version ABOVE this binary's
-    /// WIRE_VERSION_MAX is the rolled-back-past-a-bump case — every
+    /// WIRE_VERSION is the rolled-back-past-a-bump case — every
     /// decode point (replay / imprint / CAS-lost re-reads) must refuse.
     #[test]
     fn r1_parse_cluster_version_rejects_rollback_and_garbage() {
-        let max = autumn_rpc::WIRE_VERSION_MAX;
+        let max = autumn_rpc::WIRE_VERSION;
         assert_eq!(
             AutumnManager::parse_cluster_version(max.to_string().as_bytes()).unwrap(),
             max

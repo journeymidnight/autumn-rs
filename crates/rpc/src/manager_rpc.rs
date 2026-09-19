@@ -7,7 +7,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
 //  retype a field, or change what one MEANS — and you MUST bump
-//  `WIRE_VERSION_MAX` (and set `MIN = MAX`) in `crates/rpc/src/lib.rs`.
+//  `WIRE_VERSION` in `crates/rpc/src/lib.rs` — and raise
+//  `MIN_CLIENT_WIRE_VERSION` too if the change breaks the CLIENT surface.
 //
 //  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
 //  forgotten bump was removed; the version integer is the only guard left,
@@ -156,7 +157,7 @@ pub const MSG_POLL_INVALIDATIONS: u8 = 0x49;
 //
 // etcd key `autumn-rs/cluster_version`, ASCII decimal. GET servable from
 // any replica (replayed state). BUMP is leader-only, monotonic, exactly
-// +1, and capped at the manager's own WIRE_VERSION_MAX. Operators bump
+// +1, and capped at the manager's own WIRE_VERSION. Operators bump
 // via `autumn-op upgrade-version` AFTER every member binary is upgraded;
 // new wire forms / persisted formats gate on the bumped value.
 pub const MSG_GET_CLUSTER_VERSION: u8 = 0x4A;
@@ -1738,8 +1739,19 @@ pub struct GetClusterIdResp {
     pub message: String,
     /// UUID string. Empty when `code` != `CODE_OK`.
     pub cluster_id: String,
-    /// R1: the responding manager's `[WIRE_VERSION_MIN, WIRE_VERSION_MAX]`.
-    /// Callers refuse to join when their own interval has no overlap.
+    /// ⚠️ These FIELD names outlive the constants they carry. This struct is
+    /// FROZEN — it is the negotiation channel, decoded before any compat
+    /// decision can be made — so already-deployed clients read these names
+    /// with code that cannot be changed.
+    ///
+    /// `wire_version_min` carries `MIN_CLIENT_WIRE_VERSION`, the oldest CLIENT
+    /// the cluster serves; `wire_version_max` carries `WIRE_VERSION`, the
+    /// version its binaries speak. They are NOT an interval anyone overlaps:
+    /// a client checks `min <= own <= max` (`client_compat_check`), and a
+    /// cluster peer ignores `min` entirely and requires `max == WIRE_VERSION`
+    /// (`cluster_peer_compat_check`). Reporting a floor is exactly why the
+    /// peer check cannot be interval-shaped — it would admit a stale PS or EN
+    /// sitting anywhere inside the client window.
     pub wire_version_min: u32,
     pub wire_version_max: u32,
     /// R1: the persisted cluster_version (the operator-bumped feature
@@ -1772,7 +1784,7 @@ pub struct GetClusterVersionResp {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct BumpClusterVersionReq {
     /// Target version. Must equal current cluster_version + 1, and must
-    /// not exceed the manager's own WIRE_VERSION_MAX.
+    /// not exceed the manager's own WIRE_VERSION.
     pub to: u32,
 }
 

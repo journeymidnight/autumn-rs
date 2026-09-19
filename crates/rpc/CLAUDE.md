@@ -436,15 +436,40 @@ budgets for the LARGER of its two reply shapes. A value-only budget leaves a
 window at large item counts — a million keys of 4 KiB fits the values and
 overflows the frame.
 
-## Wire-version interval
+## Wire version, and the two checks over it
 
-`WIRE_VERSION_MIN` / `WIRE_VERSION_MAX` (currently **43/43**) declare the interval this
-binary speaks. They are maintained **BY HAND**. `wire_compat_check(remote_min,
-remote_max)` is purely "do the intervals overlap"; a peer reporting `max == 0`
-(empty/pre-R1) is refused. There is no schema fingerprint — hashing the sources byte
-for byte cost more than it caught (a translated comment once split a rolling cluster,
-and each false alarm taught the reflex of refreshing the recorded value without
-looking).
+`WIRE_VERSION` (currently **43**) is the schema this binary speaks.
+`MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
+**BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
+more than it caught (a translated comment once split a rolling cluster, and each false
+alarm taught the reflex of refreshing the recorded value without looking).
+
+**Two audiences, two rules, and they are not the same question.**
+
+| Asking | Check | Rule |
+|---|---|---|
+| a manager / PS / EN | `cluster_peer_compat_check(remote_max)` | `== WIRE_VERSION` |
+| a client | `client_compat_check(remote_min, remote_max)` | `remote_min <= WIRE_VERSION <= remote_max` |
+
+Peers compare for EQUALITY, so there is no "oldest cluster peer" constant — a floor
+pinned to `WIRE_VERSION` would say nothing. Equality is also what keeps the
+stop-the-world discipline enforced: the manager reports `MIN_CLIENT_WIRE_VERSION` in
+the `wire_version_min` slot because that is what a client needs, so anything
+interval-shaped would admit a stale PS or EN sitting anywhere inside the CLIENT window,
+and this handshake is the only thing checking.
+
+A client is refused at BOTH ends. Below the floor the cluster no longer keeps the
+behavior it needs; above `remote_max` the cluster cannot speak what it will send, which
+is routine rather than exotic — images are built from `main`, so a wheel often runs
+ahead of a cluster nobody has upgraded yet. The refusal says which way round it is,
+because the fix differs (deploy the cluster vs rebuild the client).
+
+`MIN_CLIENT_WIRE_VERSION == WIRE_VERSION` today: the window admits exactly one version
+and nothing behaves differently from before it existed. Opening it needs the rest of
+`docs/client_wire_compat_design.md` — a per-connection hello, server-side admission,
+and call sites able to serve two forms. **Until then nothing validates an incoming
+client at all**: the client's own check runs at connect, is skipped when the fetch
+fails, and no server inspects a client's version.
 
 **What that leaves uncovered, stated where someone will read it:** *changed the schema
 and forgot to bump* is UNCAUGHT. rkyv has no version tag, so two binaries claiming the
@@ -455,16 +480,18 @@ that hole visible in the code. The wire schema is `manager_rpc.rs`, `partition_r
 an `Archive` type in those files — or changing what an existing field MEANS — is a wire
 change.
 
-Bump rule, pre-R3 (where this tree is): bump `MAX` **and set `MIN = MAX`**. The new
-version is incompatible with everything before it, deploying it is stop-the-world, and
-every image carrying an embedded client must be rebuilt at the same commit. Post-R3
-(frozen V1 + explicit V2 msg_types) would keep `MIN = MAX - 1`; this tree is not there
-— the client runs its compat check once at connect and keeps nothing, so no call site
-can gate on the negotiated version.
+Bump rule: bump `WIRE_VERSION` on every wire change. Deploying it is stop-the-world for
+the manager, PS and EN. Raise `MIN_CLIENT_WIRE_VERSION` **only** when the change breaks
+the client-facing surface — it is the one constant answering "does this force every
+image carrying an embedded client to be rebuilt", and while the two are equal the
+answer is always yes.
 
-Exchange: the interval rides on `GetClusterIdResp` (filled by the manager in
+Exchange: both numbers ride on `GetClusterIdResp` (filled by the manager in
 `handle_get_cluster_id`), checked at every long-lived process's startup
-(`ClusterClient::connect`, PS `finish_connect`). `GetClusterIdReq/Resp` are FROZEN —
+(`ClusterClient::connect`, the PS's `finish_connect`, the EN's startup). **The FIELD names outlive
+the constants they carry**: `wire_version_max` carries `WIRE_VERSION` and
+`wire_version_min` carries `MIN_CLIENT_WIRE_VERSION`, because the struct is frozen and
+already-deployed clients read those field names with code that cannot be changed. `GetClusterIdReq/Resp` are FROZEN —
 they ARE the negotiation channel, decoded before any compat decision; additions go in
 new msg_types. A SUCCESSFUL response failing the check is a hard startup refusal; a
 TRANSPORT failure fetching it is best-effort skipped (availability wins while the
@@ -472,7 +499,7 @@ manager is briefly down — every subsequent RPC fails loudly anyway).
 
 `cluster_version` (manager etcd key `autumn-rs/cluster_version`, ASCII decimal) is the
 operator-bumped ROLLBACK LATCH: `MSG_GET_CLUSTER_VERSION` (0x4A, fresh etcd read) /
-`MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, +1, capped at `WIRE_VERSION_MAX`,
+`MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, +1, capped at `WIRE_VERSION`,
 value-CAS'd). Bump via `autumn-op upgrade-version` only after every member runs the new
 binary, which is why that command prints that rollback is no longer possible.
 
@@ -484,10 +511,10 @@ is the moment it becomes safe to START WRITING a shape the previous binary canno
 — which is exactly "everyone is upgraded and we are not going back". `cluster_version
 >= N` is that question and no other.
 
-The cap at `WIRE_VERSION_MAX` REUSES the wire numbering so the interlock is one
+The cap at `WIRE_VERSION` REUSES the wire numbering so the interlock is one
 comparison; it does not make this a wire version. The interlock is the latch's other
 side: every manager decode of the persisted value fails closed (blocks leadership) when
-it exceeds the binary's own `WIRE_VERSION_MAX`, so a rolled-back binary cannot come up
+it exceeds the binary's own `WIRE_VERSION`, so a rolled-back binary cannot come up
 against data written past its own horizon.
 
 Nothing in the tree gates on it yet, by design — the mechanism is in place and carries

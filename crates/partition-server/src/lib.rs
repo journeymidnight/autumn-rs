@@ -3477,12 +3477,10 @@ impl PartitionServer {
                 .map_err(|e| {
                     anyhow::anyhow!("decode GetClusterIdResp failed ({e}) — possible wire-schema mismatch; rebuild from the cluster's commit")
                 })?;
-            // R1: interval-overlap compat check (refusal message carries
-            // both intervals).
-            if let Err(msg) = autumn_rpc::wire_compat_check(
-                resp.wire_version_min,
-                resp.wire_version_max,
-            ) {
+            // A partition server is a CLUSTER peer, so it needs the manager's
+            // exact version. `wire_version_min` is the CLIENT floor and says
+            // nothing about whether this PS belongs in this cluster.
+            if let Err(msg) = autumn_rpc::cluster_peer_compat_check(resp.wire_version_max) {
                 return Err(anyhow::anyhow!(msg));
             }
         }

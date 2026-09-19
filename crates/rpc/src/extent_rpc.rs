@@ -8,7 +8,8 @@
 // ═══════════════════════════════════════════════════════════════════════════
 //  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
 //  retype a field, or change what one MEANS — and you MUST bump
-//  `WIRE_VERSION_MAX` (and set `MIN = MAX`) in `crates/rpc/src/lib.rs`.
+//  `WIRE_VERSION` in `crates/rpc/src/lib.rs` — and raise
+//  `MIN_CLIENT_WIRE_VERSION` too if the change breaks the CLIENT surface.
 //
 //  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
 //  forgotten bump was removed; the version integer is the only guard left,

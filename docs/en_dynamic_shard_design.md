@@ -171,8 +171,9 @@ All in `crates/rpc/src/manager_rpc.rs` and `crates/rpc/src/extent_rpc.rs`:
   on a 1-element vector routes identically to the empty-vector fallback.
 
 **Operational rule:** any edit to those schema files is a MANUAL
-`WIRE_VERSION_MIN`/`MAX` bump in `crates/rpc/src/lib.rs`. The two move together,
-and nothing verifies the bump for you — a forgotten one ships two binaries that
+`WIRE_VERSION` bump in `crates/rpc/src/lib.rs` (and a raise of
+`MIN_CLIENT_WIRE_VERSION` if the change breaks the client surface).
+Nothing verifies the bump for you — a forgotten one ships two binaries that
 agree on the version number, disagree on the layout, handshake happily, and then
 decode each other's bytes as garbage. Bump exactly once per commit
 (`autumn-op upgrade-version` steps `cur + 1`).

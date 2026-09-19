@@ -780,23 +780,26 @@ async fn cmd_cluster_version(client: &ClusterClient, json: bool) -> Result<()> {
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "cluster_version": resp.cluster_version,
-                            "manager_wire_version_min": resp.wire_version_min,
-                            "manager_wire_version_max": resp.wire_version_max,
-                            "op_wire_version_min": autumn_rpc::WIRE_VERSION_MIN,
-                            "op_wire_version_max": autumn_rpc::WIRE_VERSION_MAX,
+                            // The frozen field names; `wire_version_min`
+                            // carries the manager's MIN_CLIENT_WIRE_VERSION.
+                            "cluster_wire_version": resp.wire_version_max,
+                            "cluster_min_client_wire_version": resp.wire_version_min,
+                            "op_wire_version": autumn_rpc::WIRE_VERSION,
                         }))?
                     );
                 } else {
                     println!("cluster_version: {}", resp.cluster_version);
+                    println!("cluster wire version:   {}", resp.wire_version_max);
                     println!(
-                        "manager wire interval: [{}, {}]",
-                        resp.wire_version_min, resp.wire_version_max
+                        "oldest client served:   {}{}",
+                        resp.wire_version_min,
+                        if resp.wire_version_min == resp.wire_version_max {
+                            "  (window shut — clients must match the cluster)"
+                        } else {
+                            ""
+                        }
                     );
-                    println!(
-                        "this autumn-op binary:  [{}, {}]",
-                        autumn_rpc::WIRE_VERSION_MIN,
-                        autumn_rpc::WIRE_VERSION_MAX
-                    );
+                    println!("this autumn-op binary:  {}", autumn_rpc::WIRE_VERSION);
                     if resp.cluster_version < resp.wire_version_max {
                         println!(
                             "NOTE: manager binaries support up to v{} — `upgrade-version` can bump \

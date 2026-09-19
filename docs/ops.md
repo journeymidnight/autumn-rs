@@ -2670,17 +2670,30 @@ Idempotent: re-running on an already-balanced cluster reports `0 moves`. (An
 automatic version — the dashboard auto-policy `rebalance` switch — is
 Phase B, not yet shipped.)
 
-### cluster_version + wire-version interval (R1)
+### cluster_version + the wire version
 
-Version-skew foundation: every binary carries a wire-version
-interval `[WIRE_VERSION_MIN, WIRE_VERSION_MAX]` (crates/rpc), the startup
-check accepts interval overlap instead of WIRE-1's fingerprint equality, and
-the manager persists an operator-bumped `cluster_version` in etcd (ASCII
-decimal at `autumn-rs/cluster_version`) that gates when new wire/persisted
-formats may be emitted.
+Every binary carries `WIRE_VERSION` — the schema it speaks — and
+`MIN_CLIENT_WIRE_VERSION`, the oldest CLIENT it serves (`crates/rpc`). They are
+checked by two different rules, because they answer different questions:
+
+- a **cluster peer** (manager / PS / EN) must match `WIRE_VERSION` EXACTLY. This
+  is what makes an upgrade stop-the-world, and the startup handshake is the only
+  thing enforcing it.
+- a **client** must fall INSIDE `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`,
+  refused at both ends — too old and the cluster no longer keeps the behavior it
+  needs, too new and the cluster cannot speak what it will send.
+
+While the two constants are EQUAL the window admits exactly one version, so a
+client must match the cluster too. Nothing validates an incoming client yet: the
+check runs client-side at connect, and is skipped when the fetch itself fails.
+
+Separately the manager persists an operator-bumped `cluster_version` in etcd
+(ASCII decimal at `autumn-rs/cluster_version`). It is the ROLLBACK LATCH and it
+gates PERSISTED formats only — never a wire format, which the restart settles by
+itself. See `crates/rpc/CLAUDE.md`.
 
 ```bash
-autumn-op cluster-version            # current gate + manager/op wire intervals
+autumn-op cluster-version            # current gate + the cluster's wire version
 autumn-op upgrade-version [--to N]   # bump (default current+1) — run ONLY after
                                      # EVERY member runs the new binary; not rollbackable
 ```
@@ -2688,8 +2701,12 @@ autumn-op upgrade-version [--to N]   # bump (default current+1) — run ONLY aft
 Manual verification (all on a fresh `cluster.sh reset 3`):
 
 ```bash
-autumn-op cluster-version            # expect: cluster_version: 1, intervals [1,1]
-autumn-op upgrade-version            # expect REFUSED: 2 exceeds WIRE_VERSION_MAX=1
+autumn-op cluster-version
+#   cluster_version: 1
+#   cluster wire version:   1
+#   oldest client served:   1  (window shut — clients must match the cluster)
+#   this autumn-op binary:  1
+autumn-op upgrade-version            # expect REFUSED: 2 exceeds WIRE_VERSION=1
 bash cluster.sh restart-manager && sleep 10
 autumn-op cluster-version            # expect: still 1 (etcd replay)
 # mixed-version refusal: any pre-R1 binary against this manager fails its
@@ -2728,11 +2745,13 @@ unaffected.
 
 Bump discipline lives in `crates/rpc/src/lib.rs`, and it is MANUAL. The
 fingerprint registry that used to fail `cargo test -p autumn-rpc` on any
-wire-schema edit is GONE, so nothing detects a forgotten `WIRE_VERSION_MAX`
+wire-schema edit is GONE, so nothing detects a forgotten `WIRE_VERSION`
 bump: two binaries claiming the same version with different layouts will
 handshake happily and then decode each other's bytes as garbage. Edit any rkyv
-wire struct ⇒ bump MIN and MAX yourself (they move together — stop-the-world
-upgrades). Bump exactly ONCE per commit: `autumn-op upgrade-version` steps
+wire struct ⇒ bump `WIRE_VERSION` yourself, and raise
+`MIN_CLIENT_WIRE_VERSION` too if the change breaks the client-facing surface —
+that one is what forces every image carrying an embedded client to be rebuilt.
+Bump exactly ONCE per commit: `autumn-op upgrade-version` steps
 `cur + 1`, so skipping a number forces operators to run it twice for nothing.
 Rolling back a binary past a `cluster_version` bump is refused at manager
 startup (fail-closed in replay).
@@ -3392,7 +3411,7 @@ to start over and the roll to be followed by several minutes of repair.
 
 Update order is EN first, then manager: the EN carries the recovery logic and a
 mixed pair handshakes fine as long as both binaries were built from commits
-carrying the SAME `WIRE_VERSION_MIN`/`MAX` (a version bump is a stop-the-world
+carrying the SAME `WIRE_VERSION` (a version bump is a stop-the-world
 roll instead — see the wire lockstep note). Check with
 `grep WIRE_VERSION crates/rpc/src/lib.rs` on both commits; nothing computes a
 fingerprint to check it for you.
