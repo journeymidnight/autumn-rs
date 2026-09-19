@@ -309,6 +309,53 @@
     `CLUSTER_WIRE_*` / `WIRE_VERSION_MAX` 即现在的 `WIRE_VERSION`；**只改名，判据不变**。
     原来的三常量拼法里 `WIRE_VERSION_MIN`（集群下限，钉死 == MAX）在"peer 必须精确相等"
     这条定下来之后就是同义反复，已删 —— MIN/MAX 这对名字读起来别扭的根因就是它。
+  - **按组件归因的测量**（2026-09-19，用户问"只改一个 API 参数为什么要全停"）: 44 个版本区间里
+    真正需要 MGR+PS+EN 三者一起动的只有 **8 (18%)**，EN 本可不重启的占 **30 (68%)**；
+    只牵连 PS 的 8 次全是 client↔PS 数据面（本条窗口覆盖），只牵连 MGR 的 9 次另立
+    [[F-PERSIST-SCHEMA-OUT-OF-WIRE]]。**按"边"发版本已评估并否决**：边不是代码里存在的属性 ——
+    `ReadBytesReq` 同时服务 PS→EN、client→EN、EN→EN 三条边，按边拆会塌缩成按消息拆
+    （Kafka per-API 模型），而 45 次 bump 里真正打断客户端的只有 7 次，养不起。且它只缩短窗口
+    （EN 免 `load_extents`），不消除停机 —— PS 全体重启本身就是不可用。
+    口径同上：源码引用是代理指标，且看不见语义改动，数量级可用、单行不可引。
+
+### F-PERSIST-SCHEMA-OUT-OF-WIRE — manager 的 etcd 持久 schema 寄居在 wire schema 文件里，借走了 wire 版本号的爆炸半径
+- **Trigger** (2026-09-19，用户问"只改一个 API 的参数，升级就必须全停"时量出来的):
+  `manager_rpc.rs` 同时是**两份 schema** —— manager 的 RPC 面，和 manager 的 etcd 持久值。
+  `persist_extent`（`crates/manager/src/lib.rs:4977`）把 `MgrExtentInfo` 直接
+  `rkyv_encode` 进 etcd 的 `extents/{id}`。而「改了这五个文件里的 Archive 结构 ⇒ bump MAX
+  并令 MIN=MAX」这条规则分辨不了消息和持久值，于是**改一个只有 manager 自己读写的持久结构，
+  会逼 PS 和 EN 一起重启**，尽管两者从不解码它。EN 重启要 `load_extents` 扫每个 extent
+  文件，是停机窗口里最贵的一段。
+- **实测规模（2026-09-19，44 个 wire 版本区间逐个归因）**: 真正需要 MGR+PS+EN 三者一起动的
+  只有 **8/44 (18%)**；**EN 本可不重启的占 30/44 (68%)**；只牵连 MGR 的 9 次、只牵连 PS 的
+  8 次（后者全是 client↔PS 数据面，归 [[F-CLIENT-WIRE-COMPAT]] 的窗口）。
+- **可分离的集合比第一眼小，按"会不会逼一个独立生命周期的组件跟着改"切**: 20 个 `Mgr*`
+  类型里 —— **6 个仅 manager 内部**（`MgrEcDispatchInflight` / `MgrNodeOverride` /
+  `MgrAuditEntry` / `MgrAutoPolicyConfig` / `MgrAutoPolicyCooldowns` / `MgrTenantAccount`）、
+  **4 个仅 manager + autumn-op**（autumn-op 随集群发布，不构成约束）、4 个 PS/EN 也读
+  （`MgrExtentInfo` / `MgrStreamInfo` / `MgrRange` / `MgrRegionInfo`）、8 个内嵌客户端也读。
+  ⇒ **免费集合 = 10/20，且不是纯机械搬迁**：`MgrRegionInfo` 这类**既进 etcd 又进
+  `GetRegionsResp`**，双重身份的要么留在 wire 面，要么拆成两个表示，这是设计取舍不是搬文件。
+- **Scope**:
+  1. 把上述 10 个「不会被集群外组件解码」的类型移出五个 wire schema 文件，落到 manager 自己
+     的持久 schema 模块；`one_definition_only!` 那套防镜像的机制要覆盖到新边界。
+  2. **补上被搬走的那个守卫。** 今天"改它就要 bump wire 版本"是个**意外**生效的护栏；搬出去
+     之后如果不给替代品，就是拿一个过宽的守卫换成没有守卫。持久侧自己的纪律
+     （全停全启 + 重放 fail-loud + `cluster_version` 门）要被显式接上，且 fail-loud 对这批
+     结构是否成立要**逐个核**而不是假设 —— 见 [[project_rkyv_add_field_not_always_loud]]：
+     rkyv 加字段的响亮与否取决于结构形状，含 `Vec`/`String` 才必然报错。
+  3. 双重身份的类型（`MgrRegionInfo` 等）本轮**不动**，记录为什么。
+- **Acceptance**:
+  - 改动一个已移出的持久结构（例如给 `MgrAuditEntry` 加字段）**不需要**动 wire 版本号，且
+    PS/EN 二进制不重新编译即可继续与新 manager 互操作 —— 用一个真集群验：只换 manager
+    二进制，PS/EN 保持原进程，读写与 split/recovery 正常。
+  - 用旧 manager 写的 etcd 数据，被新 manager 就地重放成功；反向（新写旧读）按持久侧纪律
+    明确是拒绝还是兼容，并有测试钉住是哪一种。
+  - 对每个移出的结构，有一个测试证明"加字段后旧二进制重放会**响亮失败**"，或在其不成立时
+    记录该结构靠什么别的机制兜底（不得假设 fail-loud）。
+  - Ablation：把某个移出的类型搬回 wire 文件 → 上面第一条验收转红。
+- **Status**: 仅立账，未动工。与 [[F-CLIENT-WIRE-COMPAT]] 无依赖，可并行。
+- `passes: false`
 
 ### F-STREAM-ATREST-CKSUM — stream 层大 value 的 at-rest 内容校验 + scrub（静默腐化 G12）
 - **Trigger** (2026-08-04, chaos 缺口 loop 的 G12，已 reproduce-first 复现 harness `crates/manager/tests/silent_corruption_rot.rs`): sealed extent 的 **value 数据字节**在单副本上被静默翻位后，**全链无检测**：(a) 客户端读回坏字节仍返回 `CODE_OK`（frame CRC 明确排除 bulk value 段；`.meta` CRC 只覆盖 40B 元数据；WAL/SST CRC 是 partition 层、不覆盖 stream extent 的原始 value）；(b) recovery 从坏副本重填时 `verify` 只校 `length==sealed_length` + eversion、**不校内容** → 把腐化洗成权威；(c) EC 转换对坏字节直接编 parity → 固化成 canonical。stream 层**既无 per-extent/block content checksum、也无 scrubber**；确定性副本轮转让坏副本被一致选中（harness 里 25/64 子区间读命中）。这是**设计缺口**（数据完整性面），不是坏代码——today 的裸机盘不会自发翻位、且需要单副本静默腐化才触发，故不是"今天可复现的线上危害"，属于中期加固。
