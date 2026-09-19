@@ -271,8 +271,19 @@
   且每次调用仍会真的试一次，所以跑在集群前面的客户端在集群部署后自行恢复。
   运维面（autumn-op 的消息）**有意不纳入窗口**：它与集群同 commit 发布；代价是
   陈旧 autumn-op 仍会跨版本解 rkyv，已写入文档而非隐含。
-  余下未做：调用点服务两种形式（设计 §7）—— 在那之前 `MIN_CLIENT_WIRE_VERSION`
-  抬不起来，窗口仍然是关着的。
+  **设计 §7 的规则已可强制**（2026-09-19，未 push）：`client_surface_freeze.rs` 把
+  客户端面每个形式的编码逐字节记下（请求与响应两向），并冻结客户端要解释的**编号**
+  （`StatusCode`、两族 `CODE_*`、payload 选择子、lease 种类）。在此之前「新形式走新
+  msg_type」只是设计文档里的一句话，就地改 `PutReq` 没有任何东西会红 —— 窗口机制齐了
+  而纪律没有守卫。加字段在这里直接编译不过（fixture 全是穷尽的 struct literal）；
+  往客户端面集合里加 msg_type 而不冻结也会红，任一方向缺一半都算。
+  两处按 msg_type 盘点必漏的：`CapClaims`（不是任何 wire 结构的字段，但 SDK 自己解开
+  token 读 `allowed_prefixes`）与 **EN direct-read**（`--direct-read` 默认开，
+  `ReadBytesReq` 手写 40 字节 + bulk head；EN 无 hello 是**准入**决定，与这些字节属于谁无关）。
+  顺带发现 `ReadBytesReq` 是树里已经存在的两形式消息 —— 靠**长度**而非 opcode 区分，
+  32 字节按 `(InDat, 0)` 解。
+  余下未做：调用点服务两种形式（设计 §7 的另一半）—— 在那之前
+  `MIN_CLIENT_WIRE_VERSION` 抬不起来，窗口仍然是关着的。
 - `passes: false`
 - **notes** (2026-09-18, Scope 1 完成 — 枚举与代价测量):
   - **客户端面是可枚举的**：236 个 wire 类型里约 61 个在上面。`partition_rpc` 数据面、

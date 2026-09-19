@@ -306,6 +306,33 @@ it never decides how received bytes are interpreted.
 
 New opcodes are cheap here precisely because §4 stopped counting them as bumps.
 
+**The rule is enforced by a byte freeze, not by review.**
+`crates/rpc/tests/client_surface_freeze.rs` records the encoding of every request and
+response form behind a client-surface msg_type, plus the `CapClaims` a client decodes
+out of its own minted token and the §8 direct-read forms an EN serves. It also pins the
+NUMBERING a client interprets — `StatusCode`, both `CODE_*` families, the payload
+selector, the lease kinds — because renumbering a constant moves no byte and breaks a
+client exactly as hard as moving a field. Editing a struct in place moves the recorded
+bytes; ADDING a field also fails to compile there, because the fixtures are struct
+literals.
+
+`every_client_facing_msg_type_has_a_frozen_form_in_both_directions` fails on a
+client-facing opcode lacking a recorded request OR a recorded response, so the freeze
+cannot fall behind a growing surface. Per opcode alone was not enough: with one form
+sufficient, deleting a response fixture and its row left everything green, the request
+still vouching for the opcode. A deleted form is caught the other way round too — a
+recorded entry with no fixture — which is the half of this section that says an old form
+stays until the floor passes it.
+
+This is a byte freeze in a tree that deleted its schema fingerprint, and the difference
+is the surface. The fingerprint hashed SOURCE and covered the cluster-internal schema,
+where an in-place edit is the correct answer and the version number is the response, so
+it fired constantly and taught the reflex of refreshing the recorded value. Here an
+in-place edit is never the correct answer, and the record is of the encoding, so
+comments and doc edits move nothing. The residual reflex risk is a rkyv format change
+moving every value at once; the file's header names that case and its answer, because it
+is the one red the two-form rule cannot express.
+
 **`one_definition_only!` does not extend to this surface, and the reason is the
 window itself.** That guard (`crates/rpc/src/extent_rpc.rs`) is an identity
 function per message that compiles only while two modules name the SAME type, and

@@ -467,7 +467,8 @@ because the fix differs (deploy the cluster vs rebuild the client).
 `MIN_CLIENT_WIRE_VERSION == WIRE_VERSION` today: the window admits exactly one version
 and nothing behaves differently from before it existed. What is still missing before it
 can be opened is call sites able to serve two forms
-(`docs/client_wire_compat_design.md` §7).
+(`docs/client_wire_compat_design.md` §7) — the RULE for writing one is enforced, see
+below.
 
 ### `MSG_CLIENT_HELLO` (0x5F) — the client→server half, and server-side admission
 
@@ -548,6 +549,65 @@ form its own opcode, so a window can only be opened if opcodes are cheap. Adding
 CLIENT-facing one still means classifying it in `client_hello.rs` — a data-plane
 message with no entry lands outside the window silently, which is the same shape as the
 two `extract_part_id` / `authz_check` omissions this tree has already shipped.
+
+### The client surface is frozen to exact bytes
+
+`tests/client_surface_freeze.rs` records the encoding of every request and response form
+behind a client-surface msg_type, in BOTH directions, and two more that no msg_type
+would have led you to:
+
+- `CapClaims` — no field of any wire struct; it is rkyv-encoded into the opaque token.
+  The SDK decodes it out of its OWN minted token to check the namespace scope
+  (`crates/client/src/lib.rs`), so its layout is a client contract all the same.
+- the extent-node direct read. `--direct-read` is on by default, so a client takes the
+  descriptor from `GetRedirectResp` and reads value bytes straight from an EN:
+  `ReadBytesReq` (hand-coded 40 bytes) and the bulk response head. The EN has no hello
+  and no version concept — §8 closes that edge from the PS side — which is a statement
+  about ADMISSION and says nothing about whose bytes those are.
+
+`ReadBytesReq` is also the tree's one message that already serves two forms, and it does
+it by LENGTH rather than by opcode: `decode` reads a 32-byte request as the form that
+predates the payload selector. Both widths are recorded.
+
+An added, removed or reordered field moves the recorded bytes; an ADDED field also fails
+to compile there, because every fixture is a struct literal and Rust makes literals
+exhaustive, so the first signal names the field rather than a hex string. A rename also
+forces an edit there — to the fixture, never to a recorded value.
+
+Numbering is frozen beside the layouts: `StatusCode`, the partition and extent-node
+`CODE_*`, the payload selector, the lease kinds and invalidation reasons. A constant's
+VALUE is as much a client contract as a field's offset, and no encoding catches a
+renumbering — the fixtures carry `code: 7` as a literal. Pin them by NAME: asserting
+`from_u8(v) as u8 == v` passes any consistent renumbering, which an ablation confirmed.
+
+**This is the thing that makes the two-form rule real.** Before it, "a new form takes a
+new msg_type" was a sentence in a design doc, and the cheap path — edit the struct, bump
+the version — stayed open with nothing going red. The window mechanism is worth nothing
+if the next client-facing change simply walks past it.
+
+**Why a byte freeze here when the schema fingerprint was deleted.** The fingerprint
+hashed the SOURCE of every wire module and covered the cluster-internal schema, where
+editing a struct in place IS the right answer — so it fired on changes whose correct
+response was "yes, I know", and that taught the reflex of refreshing the recorded value
+without looking. Here both halves invert: on this surface an in-place edit is never the
+right answer, and what is recorded is the ENCODING, so comments, doc edits and reordered
+`use` lines move nothing. A diff in a recorded value is the rule speaking, not noise.
+
+The one shape that can still breed that reflex is a MASS red — rkyv's archived format
+moving under the whole table, through a dependency bump or a feature another crate in
+the graph turns on. The two-form rule cannot express that (there is no per-message fix),
+so the file's header states the answer outright rather than leaving it to be improvised
+under pressure: it is a `MIN_CLIENT_WIRE_VERSION` raise and a rebuild of every embedded
+client, decided deliberately, with the table re-recorded in that same commit.
+
+`every_client_facing_msg_type_has_a_frozen_form_in_both_directions` is what keeps the
+freeze from rotting: it walks both client-surface sets plus `MSG_GET_REGIONS` and the EN
+read opcode, and fails on any that lacks a recorded request or a recorded response. Per
+OPCODE was not enough and the review proved it by deleting `HeadResp`'s fixture and its
+row — the suite stayed green, because `HeadReq` went on vouching for `MSG_HEAD`, and a
+response is exactly the half an old client decodes. What the guard still cannot check is
+whether a form's declared opcodes are the ones its handler actually serves; nothing ties
+those lists to the dispatchers.
 
 Exchange: both numbers ride on `GetClusterIdResp` (filled by the manager in
 `handle_get_cluster_id`), checked at every long-lived process's startup

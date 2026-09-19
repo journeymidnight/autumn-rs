@@ -2785,6 +2785,36 @@ that one is what forces every image carrying an embedded client to be rebuilt.
 Adding a message TYPE is not a bump (an old peer that never sends it cannot be
 affected by its existence), but a new client-facing one must be classified in
 `crates/rpc/src/client_hello.rs` or it lands outside the window silently.
+
+The CLIENT-facing half of that is not manual. Every request and response form
+behind a client-surface msg_type has its encoding recorded — plus the
+capability claims the SDK decodes out of its own token, the extent-node
+direct-read forms (`--direct-read` is on by default), and the numbering of
+`StatusCode` and both `CODE_*` families — so editing one in place goes red
+rather than through:
+
+```bash
+cargo test -p autumn-rpc --test client_surface_freeze
+cargo test -p autumn-rpc --test negotiation_freeze
+# Red means a client-facing break. The fix is a NEW msg_type carrying the new
+# form with the old struct untouched — NOT an edit to the recorded bytes, and
+# not a MIN_CLIENT_WIRE_VERSION raise unless you mean to rebuild every image
+# carrying an embedded client. Read the failing file's header; it says so.
+# A msg_type added to a client-surface set with nothing recorded — in EITHER
+# direction — also fails here, so the freeze cannot fall behind a growing
+# surface.
+#
+# If EVERY value moved at once you did not change a struct: rkyv's archived
+# format did. That is a break of all forms simultaneously, so it is a
+# MIN_CLIENT_WIRE_VERSION raise and a rebuild of every embedded client, with
+# the whole table re-recorded in that commit. The file's header says so.
+```
+
+Nothing equivalent exists for the cluster-internal schema, and that is
+deliberate: there an in-place edit is the CORRECT answer (bump, stop the
+world), so a freeze would fire on every legitimate change and train the reflex
+of refreshing the record without looking — which is how the deleted fingerprint
+waved a real change through.
 Bump exactly ONCE per commit: `autumn-op upgrade-version` steps
 `cur + 1`, so skipping a number forces operators to run it twice for nothing.
 Rolling back a binary past a `cluster_version` bump is refused at manager
