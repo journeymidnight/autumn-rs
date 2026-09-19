@@ -312,49 +312,80 @@
   - **按组件归因的测量**（2026-09-19，用户问"只改一个 API 参数为什么要全停"）: 44 个版本区间里
     真正需要 MGR+PS+EN 三者一起动的只有 **8 (18%)**，EN 本可不重启的占 **30 (68%)**；
     只牵连 PS 的 8 次全是 client↔PS 数据面（本条窗口覆盖），只牵连 MGR 的 9 次另立
-    [[F-PERSIST-SCHEMA-OUT-OF-WIRE]]。**按"边"发版本已评估并否决**：边不是代码里存在的属性 ——
+    [[F-SCHEMA-HOMES]]。**按"边"发版本已评估并否决**：边不是代码里存在的属性 ——
     `ReadBytesReq` 同时服务 PS→EN、client→EN、EN→EN 三条边，按边拆会塌缩成按消息拆
     （Kafka per-API 模型），而 45 次 bump 里真正打断客户端的只有 7 次，养不起。且它只缩短窗口
     （EN 免 `load_extents`），不消除停机 —— PS 全体重启本身就是不可用。
     口径同上：源码引用是代理指标，且看不见语义改动，数量级可用、单行不可引。
+  - **判别器进字节，不进连接状态**（2026-09-19 用户指出 `one_definition_only!` 在 rolling /
+    兼容窗口面前不成立后定的）: 客户端面消息的**新版本用新 msg_type**，旧形式保留自己的
+    opcode 和结构直到地板越过它。msg_type 在帧头、解码之前就确定，响应沿用请求的 msg_type，
+    两个方向都自描述。**不能**复用同一 opcode 按连接协商版本分支 —— 那让一帧的含义取决于
+    连接状态，而 rkyv 误解码是静默的，hello 漏了就是静默按错版本解码。新 opcode 在设计 §4
+    的新规则下不算 bump，所以这条几乎免费。§3 的"版本属于连接"随之收窄：连接版本只管**准入**
+    和**服务端主动推送**（如推给 fuse 的 invalidation），不管收到的字节怎么解释。
+  - **`one_definition_only!` 分成两半**: 它抓的是"两份定义而**没有东西决定读哪一份**"
+    （当年 `ExtDfReq` 镜像），不是"有两份定义"。集群内部不做 rolling ⇒ 同一消息永不会有两个
+    版本同时在线 ⇒ 第二份定义必是镜像 ⇒ **守卫保持原样全力有效**。客户端面按构造就有两个
+    版本在线 ⇒ 重述为 **一个 (消息, 版本) 一份定义，且每份只能经由它的 msg_type 到达**。
+    我一度说"防镜像机制要延伸到新边界"，不加限定是错的 —— 延伸到客户端面会把窗口锁死。
 
-### F-PERSIST-SCHEMA-OUT-OF-WIRE — manager 的 etcd 持久 schema 寄居在 wire schema 文件里，借走了 wire 版本号的爆炸半径
-- **Trigger** (2026-09-19，用户问"只改一个 API 的参数，升级就必须全停"时量出来的):
-  `manager_rpc.rs` 同时是**两份 schema** —— manager 的 RPC 面，和 manager 的 etcd 持久值。
-  `persist_extent`（`crates/manager/src/lib.rs:4977`）把 `MgrExtentInfo` 直接
-  `rkyv_encode` 进 etcd 的 `extents/{id}`。而「改了这五个文件里的 Archive 结构 ⇒ bump MAX
-  并令 MIN=MAX」这条规则分辨不了消息和持久值，于是**改一个只有 manager 自己读写的持久结构，
-  会逼 PS 和 EN 一起重启**，尽管两者从不解码它。EN 重启要 `load_extents` 扫每个 extent
-  文件，是停机窗口里最贵的一段。
-- **实测规模（2026-09-19，44 个 wire 版本区间逐个归因）**: 真正需要 MGR+PS+EN 三者一起动的
-  只有 **8/44 (18%)**；**EN 本可不重启的占 30/44 (68%)**；只牵连 MGR 的 9 次、只牵连 PS 的
-  8 次（后者全是 client↔PS 数据面，归 [[F-CLIENT-WIRE-COMPAT]] 的窗口）。
-- **可分离的集合比第一眼小，按"会不会逼一个独立生命周期的组件跟着改"切**: 20 个 `Mgr*`
-  类型里 —— **6 个仅 manager 内部**（`MgrEcDispatchInflight` / `MgrNodeOverride` /
-  `MgrAuditEntry` / `MgrAutoPolicyConfig` / `MgrAutoPolicyCooldowns` / `MgrTenantAccount`）、
-  **4 个仅 manager + autumn-op**（autumn-op 随集群发布，不构成约束）、4 个 PS/EN 也读
-  （`MgrExtentInfo` / `MgrStreamInfo` / `MgrRange` / `MgrRegionInfo`）、8 个内嵌客户端也读。
-  ⇒ **免费集合 = 10/20，且不是纯机械搬迁**：`MgrRegionInfo` 这类**既进 etcd 又进
-  `GetRegionsResp`**，双重身份的要么留在 wire 面，要么拆成两个表示，这是设计取舍不是搬文件。
+### F-SCHEMA-HOMES — 五种 schema 应各有明确的家；今天 manager 的持久值寄居在 wire 文件里
+- **原则**（用户 2026-09-19 定）: **etcd、wire、客户端三类类型全部拆开，在明确的地方分别
+  定义。** 不按"生命周期绑定就不用拆"这种个案判断 —— 那是个每次改动都要重做、并且会烂掉的
+  判断，而 `manager_rpc.rs` 里攒下 17 个非消息类型，正是因为从来没有规则说东西该放哪。
+  按位置分家之后，"这次改动会不会逼所有内嵌镜像重建"从一道推理题变成"这个文件在不在客户端
+  schema 里"。
+- **全树盘点：每种 schema 是"谁写给谁"，载体无关**:
+  | schema | 写给谁 | 载体 | 自版本 |
+  |---|---|---|---|
+  | SST / WAL record / checkpoint | 未来的 PS（或接管的 PS） | **EN 的 extent，EN 视为不透明字节** | `MAGIC "AU7B"` + `FORMAT_VERSION` ✓ |
+  | `.meta` / `.ck` | 未来的 EN（+ recovery 的另一台 EN） | EN 本地盘 | `EXTMETA\0/\x01/\x02`，三版都还在解析 ✓ |
+  | manager 记录 | 未来的 manager | etcd | **无 —— 借 `WIRE_VERSION`** ← 唯一的窟窿 |
+  | 集群内部 wire | 活着的 peer | 网络 | `WIRE_VERSION` 精确相等 |
+  | 客户端 wire | 活着的客户端 | 网络 | 窗口（[[F-CLIENT-WIRE-COMPAT]]） |
+  **PS 对本地文件系统的引用是 0** —— 它的持久态 = manager 记录 + stream 内容。所以改 SST 格式
+  是 PS↔未来 PS 的事，EN 根本看不见，`FORMAT_VERSION` 独立于 `WIRE_VERSION` 是对的。
+  **五格里三格已经健康**，要动的只有 etcd 一格：它之所以借 wire 版本号，仅仅因为被定义成
+  rkyv 结构、住在 wire schema 文件里。这不是要发明新纪律，是去抄 `.meta` 已经在用的那套。
+- **代价（2026-09-19 实测）**: 44 个 wire 版本区间里，真正需要 MGR+PS+EN 三者一起动的只有
+  **8 (18%)**；**EN 本可不重启的占 30 (68%)**。etcd 借版本号的后果就是这个差额。
+- **持久类型权威清单**（来自 `replay_from_etcd`，manager 重放必须解码每一个）: rkyv 的 8 个 ——
+  `MgrExtentInfo`(extents/)、`MgrRegionInfo`(regions/)、`MgrStreamInfo`(streams/)、
+  `MgrNodeInfo`(nodes/)、`MgrDiskInfo`(disks/)、`MgrPartitionMeta`(partitions/)、
+  `MgrNamespace`、`MgrTenantAccount`；另有三个非 rkyv 的 key 无 schema 问题
+  （`ownerLocks/` 裸 revision、`psNodes/` UTF-8 地址、`partitionLastOp/` i64 LE）。
+  其中 `MgrRegionInfo` 和 `MgrNamespace` 同时被内嵌客户端解码。
 - **Scope**:
-  1. 把上述 10 个「不会被集群外组件解码」的类型移出五个 wire schema 文件，落到 manager 自己
-     的持久 schema 模块；`one_definition_only!` 那套防镜像的机制要覆盖到新边界。
-  2. **补上被搬走的那个守卫。** 今天"改它就要 bump wire 版本"是个**意外**生效的护栏；搬出去
-     之后如果不给替代品，就是拿一个过宽的守卫换成没有守卫。持久侧自己的纪律
-     （全停全启 + 重放 fail-loud + `cluster_version` 门）要被显式接上，且 fail-loud 对这批
-     结构是否成立要**逐个核**而不是假设 —— 见 [[project_rkyv_add_field_not_always_loud]]：
-     rkyv 加字段的响亮与否取决于结构形状，含 `Vec`/`String` 才必然报错。
-  3. 双重身份的类型（`MgrRegionInfo` 等）本轮**不动**，记录为什么。
+  1. 8 个持久类型各自在 `crates/manager/src/persist/` 有独立定义 + 自己的魔数/版本字节，
+     只有 manager 能引用；与 wire 类型之间是**显式转换**。
+  2. **转换必须穷尽**：用结构体解构（`let Mgr… { a, b, c } = x;`，不许 `..`），加字段不写
+     转换就编译失败。当年 `ExtDfReq` 镜像的教训是"两份定义而没有东西决定读哪份"，不是
+     "有两份定义"；这里判别器是显式转换函数本身。
+  3. `MgrRegionInfo` 拆三份：持久（7 字段）、PS 线上（7 字段）、**客户端路由记录（4 字段：
+     `rg` / `part_id` / `ps_id` / `region_epoch`）**。客户端生产路径从不读三个 `*_stream`
+     id —— `client/src/lib.rs` 里那 3 处只有两条注释加一个被迫编造
+     `log_stream: 1, row_stream: 2, meta_stream: 3` 的测试 fixture。拆完顺带止住 stream 层
+     id 跨层泄漏到 SDK。`MgrNamespace` 同样处理（它只有 manager + 客户端两个身份，更干净）。
+  4. `PayloadLocation` 这类跨 wire/盘 的类型各归各家：盘上那个字节的含义由 EN 的持久 schema
+     定义、由 `.meta` 魔数管，不从 wire enum 继承。今天 `from_byte` 的"unknown → InDat,
+     never an error"是条**持久化决策长在 wire 类型上**；全停全启 + 不回滚兜着，但回滚会
+     静默把分片字节当 value 服务出去。
+  5. **补上被搬走的守卫。** 今天"改它就要 bump wire 版本"是**意外**生效的护栏；搬出去不给
+     替代品就是拿过宽的守卫换成没有守卫。且 fail-loud 不得假设 —— 见
+     [[project_rkyv_add_field_not_always_loud]]，rkyv 加字段是否响亮取决于结构形状。
 - **Acceptance**:
-  - 改动一个已移出的持久结构（例如给 `MgrAuditEntry` 加字段）**不需要**动 wire 版本号，且
-    PS/EN 二进制不重新编译即可继续与新 manager 互操作 —— 用一个真集群验：只换 manager
-    二进制，PS/EN 保持原进程，读写与 split/recovery 正常。
-  - 用旧 manager 写的 etcd 数据，被新 manager 就地重放成功；反向（新写旧读）按持久侧纪律
-    明确是拒绝还是兼容，并有测试钉住是哪一种。
-  - 对每个移出的结构，有一个测试证明"加字段后旧二进制重放会**响亮失败**"，或在其不成立时
-    记录该结构靠什么别的机制兜底（不得假设 fail-loud）。
-  - Ablation：把某个移出的类型搬回 wire 文件 → 上面第一条验收转红。
-- **Status**: 仅立账，未动工。与 [[F-CLIENT-WIRE-COMPAT]] 无依赖，可并行。
+  - 改一个已分家的持久结构（例如给 `MgrAuditEntry` 加字段）**不需要**动 wire 版本号，且
+    PS/EN 二进制不重新编译即可继续互操作：真集群验，只换 manager 二进制，PS/EN 保持原进程，
+    读写与 split/recovery 正常。
+  - 给任一持久结构加一个字段而**不改**对应的转换函数 ⇒ **编译失败**（穷尽解构的 ablation）。
+  - 旧 manager 写的 etcd 数据被新 manager 就地重放成功；反向按持久侧纪律明确是拒绝还是兼容，
+    有测试钉住是哪一种。
+  - 每个持久结构有测试证明"加字段后旧二进制重放响亮失败"，或记录它靠什么别的机制兜底。
+  - 客户端拿到的路由记录不再包含任何 `*_stream` id（编译期不可达，非运行时断言）。
+  - Ablation：把某个分家出去的类型搬回 wire 文件 → 第一条验收转红。
+- **Status**: 仅立账，未动工。与 [[F-CLIENT-WIRE-COMPAT]] 的第 3 条 Scope 有交集
+  （`MgrRegionInfo` / `MgrNamespace` 的客户端那一份），其余可并行。
 - `passes: false`
 
 ### F-STREAM-ATREST-CKSUM — stream 层大 value 的 at-rest 内容校验 + scrub（静默腐化 G12）

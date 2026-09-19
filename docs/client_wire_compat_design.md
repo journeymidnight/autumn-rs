@@ -117,7 +117,11 @@ A refusal message cannot be delivered, and the hello cannot be reached. So for
 as long as a window is promised, `frame.rs` is frozen — reshaping it is a
 stop-the-world event for clients too, and the window does not soften it.
 
-## 3. The version belongs to the connection
+## 3. The negotiated version belongs to the connection
+
+It governs ADMISSION (§5) and what the server may send unprompted; it never
+decides how received bytes are read. That is the msg_type's job (§7), so a frame
+stays self-describing and nothing depends on per-connection state being right.
 
 A request carries no version field. Two reasons, and the first is decisive:
 rkyv has no optional fields, so adding `version: u32` to every client-facing
@@ -254,18 +258,48 @@ from both the frame dispatch and the bulk-write drain), including the discipline
 that makes it safe: it is mutated synchronously in the gate, before any await in
 the calling dispatch, so the borrow never spans an await.
 
-## 7. Gating a behavior
+## 7. Serving two forms
 
-A call site that must serve two forms branches on the connection's version and
-keeps the old form until the floor passes it. Each such branch names the version
-that deletes it, so the window's width is a count of behaviors somebody is
+**A new form of a client-facing message takes a NEW msg_type. The old form keeps
+its opcode and its struct, untouched, until the floor passes it.** The server
+serves both; the old struct is deleted when `MIN_CLIENT_WIRE_VERSION` rises past
+the version that introduced its successor. Each retained form names that version
+where it is defined, so the window's width is a count of forms somebody is
 maintaining rather than a number chosen in the abstract.
 
-This is the mechanism the encoding cannot supply. The changes that break a
-client and are not fixable by any framing — a key layout whose meaning changed,
-a descriptor field that re-interprets its neighbour, a per-item status that used
-to fail a whole batch — are behavioral, and a branch on the negotiated version is
-the only thing that serves both. A tagged encoding makes the additive subset
+**The discriminator is in the bytes, never in connection state.** A frame's
+msg_type sits in the header and is read before any decode, and a response echoes
+its request's msg_type, so both directions are self-describing. The alternative
+— one opcode whose meaning depends on the version recorded for that connection —
+makes a frame decodable two ways with nothing in it to say which, and rkyv
+mis-decodes SILENTLY (§4). A hello that was missed, or a per-connection value
+recorded wrongly, would then be a silent misread rather than a refusal. This is
+also what keeps §3 honest: the connection's version decides ADMISSION and what
+the server may send UNPROMPTED (a lease invalidation pushed to a fuse client);
+it never decides how received bytes are interpreted.
+
+New opcodes are cheap here precisely because §4 stopped counting them as bumps.
+
+**`one_definition_only!` does not extend to this surface, and the reason is the
+window itself.** That guard (`crates/rpc/src/extent_rpc.rs`) is an identity
+function per message that compiles only while two modules name the SAME type, and
+it exists because mirrored copies of one message — the manager encoding through
+its own `ExtDfReq` while the node decoded through `extent_rpc`'s — mis-decoded
+silently when a field landed on one side. What made that lethal was not that two
+definitions existed but that **nothing decided which one the bytes were**. The
+cluster-internal schema keeps the guard at full strength: stop-the-world means
+two versions of an internal message are never live at once, so a second
+definition there is always a mirror. On the client surface two versions ARE live
+by construction, so the invariant is restated rather than inherited:
+
+**INVARIANT: one definition per (message, version), and every definition is
+reachable only through its msg_type.** Two forms of a message are legal; two
+definitions that the same bytes could land in are not.
+
+This is the mechanism no encoding can supply. The changes that break a client
+and are not fixable by any framing — a key layout whose meaning changed, a
+descriptor field that re-interprets its neighbour, a per-item status that used to
+fail a whole batch — are behavioral. A tagged encoding makes the additive subset
 WORSE: `GetRedirectResp`'s `ec_data_shards` is a discriminator that changes what
 `replica_addrs` means, so rkyv's layout shift is what makes an old client fail
 loudly, while a decoder that skipped the unknown field would succeed and then
@@ -294,7 +328,81 @@ helpers take the address from the caller, and every caller passes
 descriptor cache anywhere in the client crate. A descriptor cache would reopen
 the edge and force a version onto the EN.
 
-## 9. What stays outside
+## 9. Five schemas, five homes
+
+Every schema in the tree is one party writing for another. The parties, not the
+medium, are what decide the discipline — a format written for a FUTURE self
+evolves under a magic and a version it carries itself; a format written for a
+LIVE peer evolves under a handshake. §9.1 is why those cannot be the same rule.
+
+| Schema | Written for | Medium | Self-versioned |
+|---|---|---|---|
+| SST / WAL record / checkpoint | a future PS (or one taking over) | an extent — the EN carries the bytes without interpreting them | `MAGIC "AU7B"` + `FORMAT_VERSION` |
+| `.meta` / `.ck` | a future EN, and an EN rebuilding from a peer | EN local disk | `EXTMETA\0` / `\x01` / `\x02`, all three still parsed |
+| manager records | a future manager | etcd | **nothing — it borrows `WIRE_VERSION`** |
+| cluster wire | a live peer | network | `WIRE_VERSION`, equality |
+| client wire | a live client | network | the window |
+
+The partition server writes NOTHING to a local filesystem; its durable state is
+manager records plus stream contents. So an SST format change is a PS-to-future-PS
+matter that the extent node never sees, which is why `FORMAT_VERSION` is already
+independent of `WIRE_VERSION` — and correctly so.
+
+Three of the five already carry their own magic and version and owe nothing to
+the wire. The manager's records are the exception, and only because they are
+defined as rkyv structs inside the wire schema files: a value no other component
+decodes therefore costs a wire bump, which under `MIN == MAX` restarts the
+partition servers and the extent nodes too. Fixing that is not a new discipline
+to invent — it is the one `.meta` already uses. It is tracked separately from
+this design.
+
+### 9.1 Why a wire change and a stored-format change are not the same event
+
+Both are "the bytes changed shape", and stop-the-world is the answer to exactly
+one of them. The difference is what happens to the OLD bytes at the moment
+everything restarts.
+
+**Wire bytes are in flight, and they die.** A request's bytes exist for the
+length of that request. Stop the world and no byte of the old shape exists
+anywhere afterwards, so the compatibility requirement is SIMULTANEITY — every
+live peer agreeing at one instant — and a restart satisfies it completely. That
+is why `WIRE_VERSION` equality is a sufficient rule and needs no migration, no
+old parser, and no format stamp.
+
+**Stored bytes survive the restart.** Everything etcd and the extent files hold
+is still there when the new binary comes up, written by the binary that just
+died. The requirement is not simultaneity but RANGE OVER TIME: the new reader
+must handle every version ever written and not since rewritten. Stopping the
+world achieves nothing here — there is no instant at which the old data stops
+existing.
+
+| | wire change | stored-format change |
+|---|---|---|
+| Who must agree | every live peer, at one instant | the writer and every future reader |
+| Does stop-the-world settle it | **yes, completely** | **no** — the old bytes are still there afterwards |
+| What it needs | a handshake plus a simultaneous swap | the new binary parses every old version (`.meta` still reads V0 and V1), or a migration plus a format stamp |
+| Rolling back | safe — stop again, put the old binaries back, nothing persists | **unsafe** — the old binary meets bytes from the future; this is what `parse_cluster_version` refuses to start on |
+| When it is got wrong | the handshake refuses: loud, at startup, before anything is served | the old bytes decode as something else, and with rkyv that is only SOMETIMES loud (§4) — the damage is to data already on disk |
+
+The last row is the one that decides how much care each deserves. A wire mistake
+costs a refused connection. A stored-format mistake is a data-corruption event,
+and it is discovered later, by a reader that had no way to know the bytes were
+not written for it.
+
+This is also why a wire bump must never be treated as cover for a persisted
+change. The manager's records get one today by accident (§9), and that accident
+runs in the harmless direction — a bump the persisted change did not need. The
+reverse, letting the stop-the-world window stand in for a migration, is the
+trade that loses data, and no version equality check can catch it.
+
+Types that straddle two homes are the residue of the same accident:
+`PayloadLocation` is a wire enum (`crates/rpc/src/extent_rpc.rs`) whose
+`as_byte()` value is persisted at `.meta` byte 41, and its `from_byte`'s
+"unknown decodes to `InDat`, never an error" is a PERSISTENCE decision living on
+a wire type. Bounded today by stop-the-world and by the no-rollback rule, and
+listed here because the byte's meaning belongs to the format that stores it.
+
+## 10. What stays outside
 
 - **Rolling upgrade of the cluster.** The manager/PS/EN protocol keeps
   `MIN == MAX`, now enforced by exact-`MAX` equality (§1.1) rather than by
