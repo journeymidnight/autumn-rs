@@ -185,6 +185,20 @@ and moves what a field MEANS. That stays a review obligation (§7).
 
 ## 5. Admission is scoped to the client surface, not to the connection
 
+A server admits a client iff its version falls INSIDE the window:
+
+```
+MIN_CLIENT_WIRE_VERSION <= client_wire_version <= WIRE_VERSION
+```
+
+Both bounds refuse, for different reasons. Below the floor, the server no longer
+keeps the behavior that client needs (§7). Above `WIRE_VERSION`, the server
+cannot speak what the client will send — and that direction is not hypothetical
+here: images are built from `main`, so a wheel routinely runs ahead of a cluster
+that has not been upgraded yet (the shape recorded as BUG-WIRE36-UNDEPLOYED).
+A ceiling refusal names the cluster's version, because the fix is to deploy or
+to rebuild, and the operator needs to know which.
+
 A connection that sends no hello is treated as the version in which the hello
 was introduced. Once `MIN_CLIENT_WIRE_VERSION` rises above that version, such a
 connection is refused — **but only for the client-surface msg_types of §2.**
