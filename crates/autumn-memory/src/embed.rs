@@ -146,6 +146,51 @@ impl StaticTableEmbedder {
 #[cfg(feature = "openai-embed")]
 const EMBED_TOKEN_BUDGET: usize = 7000;
 
+/// How many estimated tokens one REQUEST may carry. The server's physical
+/// batch is 8192 tokens; a request that asks it to embed more than that in
+/// one go is refused or, worse, dropped at the connection.
+#[cfg(feature = "openai-embed")]
+const BATCH_TOKEN_BUDGET: usize = 7000;
+
+/// At most this many inputs per request, whatever the token estimate says.
+/// The estimate can be wrong; a count cannot.
+#[cfg(feature = "openai-embed")]
+const BATCH_MAX_INPUTS: usize = 64;
+
+/// Estimated tokens for one input — see `clip` for why ASCII counts a third.
+#[cfg(feature = "openai-embed")]
+fn est_tokens(text: &str) -> usize {
+    let ascii = text.chars().filter(|c| c.is_ascii()).count();
+    let wide = text.chars().count() - ascii;
+    ascii / 3 + wide
+}
+
+/// Split `texts` into request-sized runs. Order is preserved and every input
+/// appears exactly once, because the caller matches vectors to inputs by
+/// position and a lost one leaves a symbol invisible to vector search with
+/// nothing to say so.
+#[cfg(feature = "openai-embed")]
+fn batches(texts: &[&str]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut tokens = 0usize;
+    for (i, t) in texts.iter().enumerate() {
+        let n = est_tokens(t);
+        let full = i - start >= BATCH_MAX_INPUTS;
+        let over = i > start && tokens + n > BATCH_TOKEN_BUDGET;
+        if full || over {
+            out.push(start..i);
+            start = i;
+            tokens = 0;
+        }
+        tokens += n;
+    }
+    if start < texts.len() {
+        out.push(start..texts.len());
+    }
+    out
+}
+
 /// Cut `text` to something the embedding server will accept.
 ///
 /// Tokens are estimated, not counted: this crate has no tokenizer and pulling
@@ -239,7 +284,23 @@ impl OpenAiEmbedder {
             return Ok(Vec::new());
         }
         let clipped: Vec<&str> = texts.iter().map(|t| clip(t)).collect();
-        let body = serde_json::json!({ "model": self.model, "input": clipped });
+        // One request per run, concatenated in order. A loop rather than
+        // recursion: an async fn that calls itself needs boxing, and there is
+        // nothing recursive about the problem.
+        let mut out = Vec::with_capacity(clipped.len());
+        for r in batches(&clipped) {
+            out.extend(self.embed_once(&clipped[r]).await?);
+        }
+        Ok(out)
+    }
+
+    /// One request, exactly as given. `embed_batch` is what decides how much
+    /// may go in one.
+    async fn embed_once(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let body = serde_json::json!({ "model": self.model, "input": texts });
 
         let mut req = self
             .client
@@ -460,6 +521,36 @@ impl Embedder {
 #[cfg(all(test, feature = "openai-embed"))]
 mod openai_tests {
     use super::*;
+
+    /// A caller hands one file's symbols to `embed_batch` — hundreds of them
+    /// for a big source file — and the server has a physical batch of 8192
+    /// tokens. Unsplit, that request is refused or dropped at the connection
+    /// (`hyper client error (SendRequest)`), which ends the index run.
+    #[test]
+    fn batches_stay_within_one_request() {
+        let one = "x".repeat(3_000); // ~1000 estimated tokens
+        let texts: Vec<&str> = std::iter::repeat(one.as_str()).take(30).collect();
+        let runs = batches(&texts);
+        assert!(runs.len() > 1, "30k tokens must not go in one request");
+        for r in &runs {
+            let sum: usize = texts[r.clone()].iter().map(|t| est_tokens(t)).sum();
+            // One input alone may exceed the budget (clip already bounded it);
+            // two or more may not.
+            assert!(sum <= BATCH_TOKEN_BUDGET || r.len() == 1, "run {r:?} sums to {sum}");
+        }
+        // Every input exactly once, in order.
+        let covered: Vec<usize> = runs.iter().flat_map(|r| r.clone()).collect();
+        assert_eq!(covered, (0..texts.len()).collect::<Vec<_>>());
+    }
+
+    /// The count bound catches what the token estimate cannot.
+    #[test]
+    fn a_long_run_of_tiny_inputs_is_still_split() {
+        let texts: Vec<&str> = std::iter::repeat("a").take(500).collect();
+        let runs = batches(&texts);
+        assert!(runs.iter().all(|r| r.len() <= BATCH_MAX_INPUTS));
+        assert_eq!(runs.iter().map(|r| r.len()).sum::<usize>(), 500);
+    }
 
     /// Code and prose have to fit through the same budget, and the two have
     /// token densities that differ by 3x. Whatever the estimate is, a clipped
