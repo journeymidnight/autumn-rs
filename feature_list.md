@@ -304,9 +304,27 @@
   ⇒ 验收第一条「内部 bump 不再波及客户端」与第四条「窗口内的旧客户端真的能用」**已满足**。
   开窗当场把**两条同义反复变成真断言**：常量相等时 `(min, max)` 与 `(max, min)` 是同样两个数，
   live manager 与 live PS 对这一对顺序的检查在写反时一律通过；现在两条都会红。
+  **六条验收全部满足**（2026-09-19，经独立审计逐条核对）：
+  - 第 1/4 条只能靠**真集群 + 两份不同 wire 版本的客户端构建**证明，`cargo test` 造不出来，
+    所以写成了 `scripts/client_window_verify.sh`：自动找到窗口地板对应的 commit、建 worktree、
+    跑完数据面、再抬地板做对照，最后把树、进程、worktree 全还原。**已绿跑通过。**
+    另外用 maturin 从 `2568ed7` 构建了**真 python wheel**（不是伪造区间：地板抬到 44 时
+    服务端回的是"the client speaks **43**"，报的就是 wheel 自己上报的数字），装进 venv 后
+    put/get（2KB + 9MB）/ head / **batch 64 key 逐字节校验** / range / batch_delete 全过。
+    batch 的字节精确只有 wheel 这条路证到了——`perf-check --bulk` 只计数不比字节。
+  - 第 3 条（绕过客户端自查仍被拦）**这轮才补上**：此前树里没有任何 fixture 让
+    `GetClusterIdResp` 的 fetch 失败，审计判定不满足。新增
+    `a_client_whose_self_check_was_skipped_is_still_refused_by_the_server`，
+    同一 fixture 跑两遍——fetch 传输失败则 connect 成功（跳过），fetch 成功但报窗口外则
+    connect 硬失败——用这对反差钉住"跳过"真的发生了；消融（去掉数据面的 `say_hello`）变红。
+  - 第 5 条消融「合回单常量」要**两半**才等于原状：只合常量剩两个判据，只合判据剩两个常量。
+    合常量那半今天是**编译失败**（`const` 守卫），不是测试变红。
+  **今天这个门只拦得住比集群“新”的客户端**：地板被两条 `const` 断言钉死在 43，而静默连接
+  按 43 处理，所以"低于地板"在生产里暂时不可达。机制是对的，但 Trigger 说的那个方向
+  （老 wheel 被拒）要等地板真的抬起来才会被这道门服务到。
   余下未做：调用点服务两种形式（设计 §7）—— 那是**客户端面改动**要保住老客户端时才需要的，
   不是开窗的前提。
-- `passes: false`
+- `passes: true`
 - **notes** (2026-09-18, Scope 1 完成 — 枚举与代价测量):
   - **客户端面是可枚举的**：236 个 wire 类型里约 61 个在上面。`partition_rpc` 数据面、
     `manager_rpc` 的路由/lease/inode/authz 子集（挂载中的 fuse daemon 就是内嵌客户端，

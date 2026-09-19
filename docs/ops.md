@@ -2688,6 +2688,18 @@ is 44, so a client built at either is served and an internal bump no longer
 forces every embedded client image to be rebuilt. `autumn-op cluster-version`
 prints both and says which state it is in.
 
+Proving it needs TWO builds of the client at DIFFERENT wire versions, which no
+`cargo test` can produce, so it is a script:
+
+```bash
+scripts/client_window_verify.sh          # ~3 min, cleans up after itself
+# Builds a client from the newest commit at the window's FLOOR (a real binary,
+# not a forged version), runs put / get / 9 MB bulk / EN-direct / range / batch
+# / delete against a cluster at the CEILING, then raises the floor and asserts
+# the SAME binary is refused with a message saying which way round to fix it.
+# Prints "the window is SHUT" and exits 0 if there is nothing to prove.
+```
+
 **The floor may never go BELOW 43**, and a `const` assertion makes it a compile
 error. Peer equality is enforced by each peer policing ITSELF at startup, so a
 pre-43 partition server or extent node — which checked itself with an interval

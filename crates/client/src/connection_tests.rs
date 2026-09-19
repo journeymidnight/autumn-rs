@@ -419,3 +419,109 @@ async fn a_refusal_clears_when_the_cluster_catches_up() {
         "a successful handshake must clear the refusal"
     );
 }
+
+/// The client's own version check is SKIPPED when the fetch that feeds it
+/// fails — and the write must still be refused, by the server.
+///
+/// This is the direct regression for the hole the whole feature was opened
+/// over. `connect` reads the cluster's window out of `GetClusterIdResp` behind
+/// an `if let Ok`, and a TRANSPORT failure of that one call is deliberately
+/// skipped: availability wins while a manager is briefly down. Before there was
+/// a server-side gate, that skip was a way for a version-mismatched wheel to
+/// connect during a manager blip and then write silently mis-decoded bytes —
+/// the `part_id = 0` accident's exact shape.
+///
+/// So the fixture has to make `connect` actually RUN and actually SKIP. A
+/// client built by hand (as the sibling refusal tests do) never had a check to
+/// bypass, which proves something weaker.
+///
+/// What this pins is the COMPOSITION: the self-check is skipped, and the write
+/// is refused anyway because the data path handshakes on every connection it
+/// OPENS, independently of what connect learned. The refusing peer here is a
+/// mock, so this says nothing about whether a real server refuses — that half
+/// is `a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition`
+/// in the partition server, which drives a real `handle_ps_connection` and
+/// asserts the write never reaches the partition. The ablation that reds THIS
+/// test is removing `say_hello` from `get_ps_client`.
+#[compio::test]
+async fn a_client_whose_self_check_was_skipped_is_still_refused_by_the_server() {
+    // The partition server refuses this client's wire version.
+    let ps = Peer::start_refusing_hello(respond).await;
+    let ps_addr = ps.addr.clone();
+
+    // The manager is reachable — it answers the hello and serves routing — but
+    // its `MSG_GET_CLUSTER_ID` fails. That is the blip.
+    let cluster_id_calls = Rc::new(Cell::new(0));
+    let seen = cluster_id_calls.clone();
+    let mgr = Peer::start(move |f| {
+        if f.msg_type == MSG_GET_CLUSTER_ID {
+            seen.set(seen.get() + 1);
+            return Reply::Close;
+        }
+        assert_eq!(f.msg_type, MSG_GET_REGIONS);
+        Reply::Frame(autumn_rpc::Frame::response(
+            f.req_id,
+            f.msg_type,
+            rkyv_encode(&GetRegionsResp {
+                code: 0,
+                message: String::new(),
+                regions: vec![(1, region(1))],
+                ps_details: vec![],
+                part_addrs: vec![(1, ps_addr.clone())],
+            }),
+        ))
+    })
+    .await;
+
+    let client = ClusterClient::connect_raw(&mgr.addr)
+        .await
+        .expect("a manager blip must not stop a client connecting — that is the skip");
+    assert_eq!(cluster_id_calls.get(), 1, "the fetch must have been attempted");
+
+    // Proof that what just happened was the SKIP and not a check that passed:
+    // the same fixture, with the same call SUCCEEDING and reporting a window
+    // this client is outside of, refuses at connect. One fixture, one
+    // difference — whether the fetch completes — and opposite outcomes.
+    let strict = Peer::start(move |f| {
+        if f.msg_type == MSG_GET_CLUSTER_ID {
+            return Reply::Frame(autumn_rpc::Frame::response(
+                f.req_id,
+                f.msg_type,
+                rkyv_encode(&GetClusterIdResp {
+                    code: 0,
+                    message: String::new(),
+                    cluster_id: "c".to_string(),
+                    wire_version_min: autumn_rpc::WIRE_VERSION + 5,
+                    wire_version_max: autumn_rpc::WIRE_VERSION + 6,
+                    cluster_version: 1,
+                }),
+            ));
+        }
+        unreachable!("connect must stop at the version check");
+    })
+    .await;
+    let Err(refused) = ClusterClient::connect_raw(&strict.addr).await else {
+        panic!("a SUCCESSFUL out-of-window response is a hard refusal, not a skip");
+    };
+    assert!(
+        format!("{refused:#}").contains("wire-version mismatch"),
+        "{refused:#}"
+    );
+
+    // The write. Refused by the PARTITION SERVER, not by the client's own
+    // courtesy check, which is the whole point: the gate no longer depends on
+    // a client being willing and able to police itself.
+    let err = client
+        .put(b"key", b"value")
+        .await
+        .expect_err("a below-window client must not be able to write");
+    assert!(
+        matches!(err, AutumnError::WireVersionRefused(_)),
+        "the refusal must survive typed, not flattened into a connection error: {err}"
+    );
+    assert!(
+        format!("{err}").contains(HELLO_REFUSAL),
+        "and it must carry the server's own words, which say which way round \
+         the mismatch is: {err}"
+    );
+}

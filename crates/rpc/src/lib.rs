@@ -402,16 +402,32 @@ mod wire_version_tests {
     /// the only thing enforcing stop-the-world.
     #[test]
     fn a_stale_server_inside_the_client_window_is_still_refused() {
-        let cluster_max = WIRE_VERSION + 2;
-        let floor = WIRE_VERSION; // a window the stale server falls inside
+        // The REAL window, not a synthetic one. This test used to place the
+        // stale server at `WIRE_VERSION + 2` — OUTSIDE the window — so its
+        // name claimed more than its fixture and it survived merging the two
+        // predicates back into one. With the window genuinely open the
+        // interesting server sits at the FLOOR: a client there is served, a
+        // server there must not be.
+        let (floor, ceiling) = (MIN_CLIENT_WIRE_VERSION, WIRE_VERSION);
         assert!(
-            client_compat_check(floor, cluster_max).is_ok(),
-            "a CLIENT at this version is in the window"
+            floor < ceiling,
+            "this test needs an OPEN window to mean anything, and the window \
+             just closed. If you raised the floor for a client-facing break \
+             that is expected: see `the_client_window_is_open_and_the_floor_is_\
+             where_it_belongs`, which carries the checklist. Do not delete \
+             this assertion to make the test pass."
         );
         assert!(
-            cluster_peer_compat_check(cluster_max).is_err(),
-            "a SERVER at this version must still be refused"
+            client_compat_check(floor, ceiling).is_ok(),
+            "a CLIENT inside the window is served"
         );
+        assert!(
+            cluster_peer_compat_check(floor).is_err(),
+            "a SERVER at the floor is inside the CLIENT window and must still \
+             be refused — the floor is not a licence to join"
+        );
+        // And one above the ceiling, which the old fixture was really testing.
+        assert!(cluster_peer_compat_check(ceiling + 2).is_err());
     }
 
     #[test]

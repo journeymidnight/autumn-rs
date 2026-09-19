@@ -8,10 +8,10 @@
 //! the difference between this mechanism working and it being dead code with
 //! green tests beside it.
 //!
-//! The window is OPEN by one (`[42, 43]`), so a client can now be admitted
-//! while reporting a version the cluster does not itself speak — which is the
-//! whole point — and a connection whose reported version falls OUTSIDE it must
-//! still be refused BY THE SERVER, not by the client's own courtesy check.
+//! The window is OPEN (`[43, 44]`), so a client can be admitted while reporting
+//! a version the cluster does not itself speak — which is the whole point — and
+//! a connection whose reported version falls OUTSIDE it must still be refused
+//! BY THE SERVER, not by the client's own courtesy check.
 
 mod support;
 
