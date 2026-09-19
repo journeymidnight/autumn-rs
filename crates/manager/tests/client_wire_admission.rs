@@ -8,11 +8,10 @@
 //! the difference between this mechanism working and it being dead code with
 //! green tests beside it.
 //!
-//! The window is SHUT today (`MIN_CLIENT_WIRE_VERSION == WIRE_VERSION`), so the
-//! only client that can be out of window is one reporting a different version.
-//! That is exactly the case the acceptance asks for — a connection whose
-//! reported version is outside the window must be refused BY THE SERVER, not by
-//! the client's own courtesy check.
+//! The window is OPEN by one (`[42, 43]`), so a client can now be admitted
+//! while reporting a version the cluster does not itself speak — which is the
+//! whole point — and a connection whose reported version falls OUTSIDE it must
+//! still be refused BY THE SERVER, not by the client's own courtesy check.
 
 mod support;
 
@@ -21,8 +20,8 @@ use autumn_rpc::client_hello::{
     admit_client, encode_hello_req, parse_hello_resp, MSG_CLIENT_HELLO,
 };
 use autumn_rpc::manager_rpc::{
-    rkyv_encode, ClusterDfReq, GetClusterIdReq, MSG_CLUSTER_DF, MSG_GET_CLUSTER_ID,
-    MSG_GET_REGIONS,
+    rkyv_decode, rkyv_encode, ClusterDfReq, GetClusterIdReq, GetClusterIdResp, MSG_CLUSTER_DF,
+    MSG_GET_CLUSTER_ID, MSG_GET_REGIONS,
 };
 use autumn_rpc::{RpcError, StatusCode, WIRE_VERSION};
 use bytes::Bytes;
@@ -92,12 +91,27 @@ fn the_manager_admits_clients_by_their_reported_wire_version() {
         //     connection. Gating the question on its own answer would admit
         //     nobody, and an operator staring at a refusal needs to be able to
         //     ask what the cluster actually speaks.
-        assert!(
-            c.call(MSG_GET_CLUSTER_ID, rkyv_encode(&GetClusterIdReq {}))
-                .await
-                .is_ok(),
-            "MSG_GET_CLUSTER_ID must stay answerable to a refused client"
+        let id = c
+            .call(MSG_GET_CLUSTER_ID, rkyv_encode(&GetClusterIdReq {}))
+            .await
+            .expect("MSG_GET_CLUSTER_ID must stay answerable to a refused client");
+        // And it must report the pair the RIGHT WAY ROUND. This assertion was a
+        // tautology until the window opened — the two numbers were equal, so a
+        // swapped fill produced identical bytes. It is the highest-stakes pair
+        // in the tree: `wire_version_max` is what every partition server and
+        // extent node checks for equality at startup, and the range is what
+        // every client checks itself against. Reversed, the fleet does not
+        // start and no client is served.
+        let id: GetClusterIdResp = rkyv_decode(&id).expect("decodes");
+        assert_eq!(
+            (id.wire_version_min, id.wire_version_max),
+            (
+                autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+                autumn_rpc::WIRE_VERSION
+            ),
+            "wire_version_min carries the CLIENT floor, not a cluster minimum"
         );
+
 
         // (5) A connection that says NOTHING is served. Every client built
         //     before the hello existed is silent — and so is every partition

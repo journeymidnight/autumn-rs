@@ -282,8 +282,30 @@
   `ReadBytesReq` 手写 40 字节 + bulk head；EN 无 hello 是**准入**决定，与这些字节属于谁无关）。
   顺带发现 `ReadBytesReq` 是树里已经存在的两形式消息 —— 靠**长度**而非 opcode 区分，
   32 字节按 `(InDat, 0)` 解。
-  余下未做：调用点服务两种形式（设计 §7 的另一半）—— 在那之前
-  `MIN_CLIENT_WIRE_VERSION` 抬不起来，窗口仍然是关着的。
+  **窗口已打开：`[43, 44]`**（2026-09-19）——抬天花板，不是降地板。
+  **先试了降地板到 42，绿灯通过，然后回退：它不安全。** peer 的"精确相等"是**每个 peer
+  自己在启动时执行的**，所以决定一台陈旧服务器能不能入场的，是**那台二进制里编译进去的**判据。
+  43 之前那是区间重叠（`wire_compat_check`，`f17f533` 删掉），而那些二进制把
+  `wire_version_min` 读作 **peer 下限**——它们被写出来的时候它就是。wire-42 的 PS 今天算
+  `[42,42] ∩ [43,43] = ∅` 自己拒绝；面对 `[42,43]` 它算出 `{42}` 然后**加入集群**。
+  事后没有东西接得住：`RegisterPsReq` / `RegisterNodeReq` 不带版本、也不在门控集合里。
+  那就是**内部面**的混版本集群，正是全停全启要杜绝的唯一一件事。
+  ⇒ **客户端地板永不得低于 43**，已用 `const` 断言变成编译错误
+  （`FIRST_WIRE_VERSION_WITH_PEER_EQUALITY`）。抬天花板则四个方向都安全：43 之前的 peer
+  重叠不上从 43 起步的窗口，43 及以后的 peer 要求精确相等、根本不看地板。
+  **更正 Trigger 里的一处事实**（原文按规则 8 不动）：`MSG_APPEND_CHAIN` 不是 EN↔EN，
+  42 时代的 **PS 也发它**（`459520b:crates/stream/src/client.rs:2191`）。它仍然不在客户端面上，
+  所以 Trigger 的结论不变，但"EN↔EN"这个措辞是错的。
+  **真集群验收通过，不是看 diff 推的**：用 wire-43 的 commit 构建 `autumn-client`，
+  对 wire-44 集群跑 put / get / head / 9 MiB bulk put / EN 直读 / range / delete，
+  两向字节精确。**对照组**：把地板挪到 44，同一个二进制被拒，文案为
+  "this cluster speaks 44 and serves clients [44,44], the client speaks 43 —
+  that client is older than the window this cluster still serves"。
+  ⇒ 验收第一条「内部 bump 不再波及客户端」与第四条「窗口内的旧客户端真的能用」**已满足**。
+  开窗当场把**两条同义反复变成真断言**：常量相等时 `(min, max)` 与 `(max, min)` 是同样两个数，
+  live manager 与 live PS 对这一对顺序的检查在写反时一律通过；现在两条都会红。
+  余下未做：调用点服务两种形式（设计 §7）—— 那是**客户端面改动**要保住老客户端时才需要的，
+  不是开窗的前提。
 - `passes: false`
 - **notes** (2026-09-18, Scope 1 完成 — 枚举与代价测量):
   - **客户端面是可枚举的**：236 个 wire 类型里约 61 个在上面。`partition_rpc` 数据面、

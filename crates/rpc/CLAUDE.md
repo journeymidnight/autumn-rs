@@ -438,7 +438,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **43**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **44**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -464,11 +464,41 @@ is routine rather than exotic — images are built from `main`, so a wheel often
 ahead of a cluster nobody has upgraded yet. The refusal says which way round it is,
 because the fix differs (deploy the cluster vs rebuild the client).
 
-`MIN_CLIENT_WIRE_VERSION == WIRE_VERSION` today: the window admits exactly one version
-and nothing behaves differently from before it existed. What is still missing before it
-can be opened is call sites able to serve two forms
-(`docs/client_wire_compat_design.md` §7) — the RULE for writing one is enforced, see
-below.
+**The window is OPEN: `[43, 44]`, opened by raising the CEILING.**
+
+Lowering the floor to 42 instead was implemented, verified green, and REVERTED — it is
+unsafe, and `FIRST_WIRE_VERSION_WITH_PEER_EQUALITY` is the rule that came out of it.
+Peer equality is enforced by each peer POLICING ITSELF at startup, so what decides
+whether a stale server joins is the check compiled into THAT server. Before 43 that was
+an interval OVERLAP against the reported pair (`wire_compat_check`, deleted in
+`f17f533`), and those binaries read `wire_version_min` as a PEER floor, because when
+they were written it was one. A wire-42 partition server computes
+`[42,42] ∩ [43,43] = ∅` and refuses itself today; against a reported `[42,43]` it
+computes `{42}` and JOINS. Nothing catches it afterwards — `RegisterPsReq` and
+`RegisterNodeReq` carry no version and sit outside the gate. That is a mixed-version
+cluster on the INTERNAL plane, the one thing stop-the-world exists to prevent. **The
+client floor may never go below 43**, and a `const` assertion now makes it a compile
+error.
+
+Raising the ceiling is safe in every direction: a pre-43 peer's overlap misses a window
+starting at 43, and a 43-or-later peer demands exact equality and never looks at the
+floor.
+
+**Verified on a live cluster, not argued from a diff.** A client built from the wire-43
+commit ran put / get / head / 9 MiB bulk put / EN-direct read / range / delete against a
+wire-44 cluster, byte-exact both ways. Control: with the floor moved to 44 the same
+binary is refused — "this cluster speaks 44 and serves clients [44,44], the client
+speaks 43 — that client is older than the window this cluster still serves".
+
+Opening it also turned two tautologies into real assertions. While the constants were
+equal, `(min, max)` and `(max, min)` were the same two numbers, so every check of the
+ORDER of the reported pair — in `client_wire_admission.rs`, in the partition server's
+live hello round trip — passed under a swap. Both now fail under one, which is what
+`reported_wire_versions` exists to prevent in the first place.
+
+Serving two forms of one message (`docs/client_wire_compat_design.md` §7) is a DIFFERENT
+requirement, needed when a CLIENT-FACING change must keep old clients working. It is not
+a precondition for the window; the rule for writing one is enforced, see below.
 
 ### `MSG_CLIENT_HELLO` (0x5F) — the client→server half, and server-side admission
 

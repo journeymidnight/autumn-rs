@@ -2683,8 +2683,17 @@ checked by two different rules, because they answer different questions:
   refused at both ends — too old and the cluster no longer keeps the behavior it
   needs, too new and the cluster cannot speak what it will send.
 
-While the two constants are EQUAL the window admits exactly one version, so a
-client must match the cluster too.
+The window is OPEN today: `MIN_CLIENT_WIRE_VERSION` is 43 and `WIRE_VERSION`
+is 44, so a client built at either is served and an internal bump no longer
+forces every embedded client image to be rebuilt. `autumn-op cluster-version`
+prints both and says which state it is in.
+
+**The floor may never go BELOW 43**, and a `const` assertion makes it a compile
+error. Peer equality is enforced by each peer policing ITSELF at startup, so a
+pre-43 partition server or extent node — which checked itself with an interval
+OVERLAP — reads `wire_version_min` as a peer floor and would JOIN a cluster
+whose window reached down to it. Nothing catches that afterwards: the register
+messages carry no version.
 
 The SERVER decides. Every connection the SDK opens sends `MSG_CLIENT_HELLO`
 first; the manager and the partition server refuse a client outside the window,
@@ -2715,13 +2724,16 @@ Manual verification (all on a fresh `cluster.sh reset 3`):
 
 ```bash
 autumn-op cluster-version
-#   cluster_version: 1
-#   cluster wire version:   1
-#   oldest client served:   1  (window shut — clients must match the cluster)
-#   this autumn-op binary:  1
-autumn-op upgrade-version            # expect REFUSED: 2 exceeds WIRE_VERSION=1
+#   cluster_version: 44
+#   cluster wire version:   44
+#   oldest client served:   43  (window open — any client built at 43..=44 is served)
+#   this autumn-op binary:  44
+# Verified against a real manager. The `--json` form needs the flag BEFORE the
+# subcommand and prints cluster_wire_version / cluster_min_client_wire_version:
+autumn-op --json cluster-version
+autumn-op upgrade-version            # expect REFUSED: 45 exceeds WIRE_VERSION=44
 bash cluster.sh restart-manager && sleep 10
-autumn-op cluster-version            # expect: still 1 (etcd replay)
+autumn-op cluster-version            # expect: unchanged (etcd replay)
 # mixed-version refusal: any pre-R1 binary against this manager fails its
 # startup check loudly ("decode GetClusterIdResp failed ... wire-schema mismatch")
 ```

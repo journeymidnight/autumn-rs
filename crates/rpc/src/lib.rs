@@ -106,33 +106,76 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// Bump it on every wire change. There is no separate "oldest cluster peer"
 /// constant: peers compare for EQUALITY, so a floor pinned to this value would
 /// say nothing.
-pub const WIRE_VERSION: u32 = 43;
+pub const WIRE_VERSION: u32 = 44;
 
 /// The oldest CLIENT this binary serves — the floor of the client window
 /// `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`.
 ///
-/// Raise it ONLY for a change that breaks the client-facing surface, which is
-/// what makes it the one constant answering "does this force every image
-/// carrying an embedded client to be rebuilt". A client is not ours to
-/// restart: it lives inside an inference pod, a mounted fuse daemon, an s3
-/// gateway, somebody else's image. Raising `WIRE_VERSION` alone leaves every
-/// client inside the window untouched.
+/// **43, with `WIRE_VERSION` at 44: the window is OPEN.** It was opened by
+/// raising the CEILING. Lowering this floor instead was tried, and it is
+/// UNSAFE — see `FIRST_WIRE_VERSION_WITH_PEER_EQUALITY`, which is the rule
+/// that came out of it.
 ///
-/// Equal to `WIRE_VERSION` here, so the window admits exactly one version and
-/// nothing behaves differently yet. Opening it needs the parts that let a call
-/// site serve two forms — see `docs/client_wire_compat_design.md`.
+/// Raising it is the expensive direction, and only a change that breaks the
+/// client-facing surface justifies it: this is the one constant answering
+/// "does this force every image carrying an embedded client to be rebuilt",
+/// and a client is not ours to restart — it lives inside an inference pod, a
+/// mounted fuse daemon, an s3 gateway, somebody else's image. Raising
+/// `WIRE_VERSION` alone leaves every client inside the window untouched, which
+/// is the entire point and is now a fact about the tree rather than a plan.
 ///
 /// It rides in `GetClusterIdResp`'s `wire_version_min` FIELD. That struct is
 /// frozen (it is the negotiation channel, decoded before any compat decision
 /// can be made), so the field name outlives the constant it carries; the
 /// mismatch is deliberate and noted at both ends.
-pub const MIN_CLIENT_WIRE_VERSION: u32 = WIRE_VERSION;
+///
+pub const MIN_CLIENT_WIRE_VERSION: u32 = 43;
 
 /// An inverted window would refuse every client while every server came up
-/// happy — `cluster_peer_compat_check` never looks at the floor. Checked here
-/// rather than in a test, because the test that pins the two EQUAL is meant to
-/// be deleted the day the window opens.
+/// happy — `cluster_peer_compat_check` never looks at the floor, so nothing
+/// else would notice. A `const` rather than a test because it must hold for
+/// every value either constant ever takes.
 const _: () = assert!(MIN_CLIENT_WIRE_VERSION <= WIRE_VERSION);
+
+/// The first version whose CLUSTER PEERS police themselves by EQUALITY.
+///
+/// Before this version a partition server and an extent node checked
+/// themselves with an interval OVERLAP against the pair the manager reports
+/// (`wire_compat_check`, deleted in `f17f533`). Those binaries are still on
+/// disk and still get launched — see `project_clustersh_uses_stale_release_binaries`
+/// — and they read `wire_version_min` as a PEER floor, because when they were
+/// written it was one.
+///
+/// So the floor is not only a client promise: to every pre-43 binary it is an
+/// ENTRY TICKET. Lowering it to 42 was implemented and reverted for exactly
+/// this. A stale 42 partition server computes `[42,42] ∩ [43,43] = ∅` and
+/// refuses itself today; against a reported `[42,43]` it computes `{42}` and
+/// JOINS. Nothing server-side catches it afterwards — `RegisterPsReq` and
+/// `RegisterNodeReq` carry no version, they are outside the client-surface
+/// gate, and a silent connection is read as 43 regardless. That is a
+/// mixed-version cluster on the INTERNAL plane, which is the one thing
+/// stop-the-world exists to make impossible.
+///
+/// **INVARIANT: the client floor may never go below this.** Raising the
+/// ceiling is the safe way to open the window, and it is safe in every
+/// direction: a pre-43 peer's overlap misses a window that starts at 43, and a
+/// 43-or-later peer demands exact equality and so never looks at the floor at
+/// all.
+pub const FIRST_WIRE_VERSION_WITH_PEER_EQUALITY: u32 = 43;
+
+const _: () = assert!(MIN_CLIENT_WIRE_VERSION >= FIRST_WIRE_VERSION_WITH_PEER_EQUALITY);
+
+/// A client that says nothing is assumed to speak
+/// `client_hello::WIRE_VERSION_WITH_CLIENT_HELLO`, so a floor above that
+/// number refuses every silent connection at once — every client image built
+/// before the handshake existed. That is a legitimate future act (it is what a
+/// client-facing break costs), but it is a fleet-wide one, so it may not be
+/// reached by editing a number: DELETE this line deliberately, with the
+/// announcement that goes with it.
+///
+/// Together with the assertion above, the floor is pinned at exactly 43 until
+/// someone removes one of them on purpose.
+const _: () = assert!(MIN_CLIENT_WIRE_VERSION <= client_hello::WIRE_VERSION_WITH_CLIENT_HELLO);
 
 
 /// CLUSTER-peer compat check: accept iff the peer speaks our exact version.
@@ -419,35 +462,68 @@ mod wire_version_tests {
         assert!(client_compat_check(3, 2).is_err());
     }
 
-    /// The window ships CLOSED, so this change serves every existing client
-    /// exactly what it served before. Opening it is a separate, deliberate act.
+    /// The window is OPEN: `[43, 44]`, opened by raising the CEILING.
     ///
-    /// **This is the ONE tripwire, and it carries the whole checklist**, so
-    /// whoever opens the window gets one red and one instruction rather than
-    /// several that disagree. Delete this test, and then add the assertions
-    /// that only become capable of failing once the two constants differ —
-    /// every one of them is invisible today, not merely unwritten:
-    ///
-    /// 1. **The reported pair, from a live manager.** `GetClusterIdResp`
-    ///    (and `GetClusterVersionResp`) must carry `wire_version_max ==
-    ///    WIRE_VERSION` and `wire_version_min == MIN_CLIENT_WIRE_VERSION`.
-    ///    Swapped, `cluster_peer_compat_check` refuses every PS and EN at
-    ///    startup and the reversed range refuses every client.
-    ///    `crates/manager/tests/client_wire_admission.rs` asserts only
-    ///    `is_ok()` today, which both bounds satisfy.
-    /// 2. **The hello answer's order.** `client_hello::server_hello_resp` must
-    ///    put the ceiling first. `crates/partition-server/src/lib.rs`'s live
-    ///    round trip becomes discriminating on its own; the manager has no
-    ///    twin, so add one.
-    /// 3. **The silent-connection assumption.**
-    ///    `client_hello::admit_connection` must keep reading a silent
-    ///    connection as `WIRE_VERSION_WITH_CLIENT_HELLO` and not as
-    ///    `WIRE_VERSION` — the two are the same number today, so substituting
-    ///    one for the other changes nothing anywhere and no test can see it.
-    /// 4. **The refusal text**, which must name the real window rather than
-    ///    one bound twice.
+    /// Pinned to literals so that the two silently becoming equal again — which
+    /// would take the whole window's coverage down with it — cannot pass.
+    /// **If this fails because you bumped `WIRE_VERSION`: that is correct and
+    /// expected.** Move the 44 up and leave the 43 alone; the floor rises only
+    /// for a change that breaks the client-facing surface, and the `const`
+    /// assertions beside the constants say what pins it there.
     #[test]
-    fn the_client_window_is_shut_until_someone_opens_it() {
-        assert_eq!(MIN_CLIENT_WIRE_VERSION, WIRE_VERSION);
+    fn the_client_window_is_open_and_the_floor_is_where_it_belongs() {
+        assert_eq!(MIN_CLIENT_WIRE_VERSION, 43, "read this test's comment");
+        assert_eq!(WIRE_VERSION, 44, "read this test's comment");
+    }
+
+    /// The check that actually decides whether a stale SERVER joins is the one
+    /// compiled into THAT server, not the one in this binary — and before
+    /// `FIRST_WIRE_VERSION_WITH_PEER_EQUALITY` it was an interval overlap
+    /// against the pair the manager reports. So the floor is an entry ticket to
+    /// every pre-43 binary, and this models their predicate rather than ours.
+    ///
+    /// Lowering the floor to 42 was implemented, and this is what sent it back.
+    #[test]
+    fn the_floor_never_hands_a_pre_equality_peer_a_ticket() {
+        // `wire_compat_check` as it stood at 42, verbatim in behaviour: an
+        // overlap of the peer's own [v, v] against the reported window.
+        let stale_peer_would_join =
+            |v: u32, rep_min: u32, rep_max: u32| rep_min.max(v) <= rep_max.min(v);
+
+        // What this cluster reports. No pre-equality binary overlaps it.
+        let (lo, hi) = (MIN_CLIENT_WIRE_VERSION, WIRE_VERSION);
+        for stale in 1..FIRST_WIRE_VERSION_WITH_PEER_EQUALITY {
+            assert!(
+                !stale_peer_would_join(stale, lo, hi),
+                "a wire-{stale} partition server or extent node would JOIN a \
+                 cluster reporting [{lo},{hi}] — the floor became an entry \
+                 ticket. See FIRST_WIRE_VERSION_WITH_PEER_EQUALITY."
+            );
+        }
+        // And the shape that proves the test can fail: drop the floor by one.
+        assert!(stale_peer_would_join(
+            FIRST_WIRE_VERSION_WITH_PEER_EQUALITY - 1,
+            FIRST_WIRE_VERSION_WITH_PEER_EQUALITY - 1,
+            hi
+        ));
+    }
+
+    /// A client built at the floor — the one this feature exists for, and the
+    /// first that an open window actually serves.
+    ///
+    /// It models the CLIENT's predicate as that client compiled it. A 43 client
+    /// is the first with the equality-era code, so it runs `client_compat_check`
+    /// with its own `WIRE_VERSION` of 43 against the reported pair.
+    #[test]
+    fn a_client_one_version_behind_the_cluster_is_served() {
+        let (lo, hi) = (MIN_CLIENT_WIRE_VERSION, WIRE_VERSION);
+        assert!(lo < hi, "nothing below is meaningful with the window shut");
+        // The 43 client's own check, which used to refuse it: `contains(43)`.
+        assert!((lo..=hi).contains(&MIN_CLIENT_WIRE_VERSION));
+        // This binary (the cluster's own commit) is served by its own report.
+        assert!(client_compat_check(lo, hi).is_ok());
+        // A SERVER is still held to equality — the floor is no licence to join.
+        assert!(cluster_peer_compat_check(hi).is_ok());
+        assert!(cluster_peer_compat_check(lo).is_err());
     }
 }

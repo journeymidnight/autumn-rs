@@ -794,9 +794,15 @@ async fn cmd_cluster_version(client: &ClusterClient, json: bool) -> Result<()> {
                         "oldest client served:   {}{}",
                         resp.wire_version_min,
                         if resp.wire_version_min == resp.wire_version_max {
-                            "  (window shut — clients must match the cluster)"
+                            "  (window shut — clients must match the cluster)".to_string()
                         } else {
-                            ""
+                            // An open window is the state an operator most
+                            // needs spelled out: it is what says a client image
+                            // does NOT have to be rebuilt at this commit.
+                            format!(
+                                "  (window open — any client built at {}..={} is served)",
+                                resp.wire_version_min, resp.wire_version_max
+                            )
                         }
                     );
                     println!("this autumn-op binary:  {}", autumn_rpc::WIRE_VERSION);

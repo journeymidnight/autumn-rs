@@ -43,10 +43,15 @@ pub const CLIENT_HELLO_MAGIC: u32 = u32::from_le_bytes(*b"AUH1");
 /// Following `WIRE_VERSION` would make every silent connection look current and
 /// the assumption would stop meaning anything.
 ///
-/// This is what makes server-side admission inert on arrival: on the
+/// This is what made server-side admission inert on arrival: on the
 /// introduction commit `MIN_CLIENT_WIRE_VERSION == WIRE_VERSION == 43`, so a
-/// client built the day before (silent, assumed 43) and one built from this
-/// commit (says 43) are admitted alike.
+/// client built the day before (silent, assumed 43) and one built from that
+/// commit (says 43) were admitted alike. The window has since opened DOWNWARD
+/// to `[42, 43]`, which only admits more, so silence still means served.
+///
+/// A floor above this number would refuse every silent connection at once —
+/// `lib.rs` carries a `const` assertion against that, since it is the one way
+/// to turn a routine-looking constant edit into a fleet-wide outage.
 pub const WIRE_VERSION_WITH_CLIENT_HELLO: u32 = 43;
 
 /// Request payload: `[magic: u32 LE][client_wire_version: u32 LE]`.
@@ -409,7 +414,7 @@ mod tests {
 
         // Both name the window AND the cluster's own version, because the
         // operator's next move depends on which side of it they are on. Two
-        // separate numbers that render identically while the window is shut.
+        // separate numbers that rendered identically until the window opened.
         for msg in [&below, &above] {
             assert!(msg.contains("[40,45]"), "{msg}");
             assert!(msg.contains("speaks 45"), "{msg}");
