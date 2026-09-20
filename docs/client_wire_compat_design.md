@@ -137,7 +137,8 @@ The two directions need different carriers:
 
 - **server → client** already has one: `GetClusterIdResp`, checked at
   `ClusterClient::connect`. The client keeps the number
-  (`ClusterClient::negotiated_cluster_wire`); nothing branches on it until §7.
+  (`ClusterClient::negotiated_cluster_wire`). §7 is live: `refresh_regions`
+  chooses between `MSG_GET_REGIONS` and `MSG_GET_CLIENT_REGIONS` from it.
 - **client → server** has none. `MSG_AUTH_HELLO` cannot serve: it carries no
   version, and a client with no credential never sends it at all
   (`crates/client/src/lib.rs` sends it only when a credential is configured), so

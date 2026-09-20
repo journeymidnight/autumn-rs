@@ -841,7 +841,7 @@ pub struct ClusterClient {
     /// Routing cache. Populated on `connect`, refreshed on `refresh_regions`.
     /// `RefCell` so concurrent tasks holding `Rc<ClusterClient>` can do
     /// brief lookup-and-clone borrows without blocking each other.
-    regions: RefCell<Vec<(u64, MgrRegionInfo)>>,
+    regions: RefCell<Vec<(u64, ClientRegion)>>,
     ps_details: RefCell<HashMap<u64, MgrPsDetail>>,
     /// per-partition listener addresses, indexed by `part_id`.
     /// When an entry is present, it supersedes `ps_details[ps_id].address`
@@ -1684,25 +1684,66 @@ impl ClusterClient {
         // is empty/stale — manager-HA chaos H3 black-holed every client
         // that connected to a rejoined follower first). On NOT_LEADER,
         // rotate and retry until the leader answers.
-        let mut resp: Option<GetRegionsResp> = None;
+        // WHICH OPCODE, decided once per refresh from the version the hello
+        // negotiated. `MSG_GET_CLIENT_REGIONS` returns the narrowed routing
+        // record and is the one this client wants; a cluster below
+        // `WIRE_VERSION_WITH_CLIENT_REGIONS` has no handler for it: the
+        // manager's dispatch refuses an unknown msg_type with `InvalidArgument`,
+        // so asking blind would turn every routing refresh into a hard error.
+        //
+        // `negotiated_cluster_wire` is 0 until a hello succeeds and a silent
+        // connection never raises it, so this fails CLOSED: an unknown cluster
+        // gets the old opcode, which every cluster in the window serves. That
+        // is also what keeps an old SDK working against a new cluster — the old
+        // opcode is untouched and still carries all seven fields for the PS.
+        let narrow = self.negotiated_cluster_wire.get()
+            >= autumn_rpc::WIRE_VERSION_WITH_CLIENT_REGIONS;
+        let msg = if narrow {
+            MSG_GET_CLIENT_REGIONS
+        } else {
+            MSG_GET_REGIONS
+        };
+        type Routing = (
+            Vec<(u64, ClientRegion)>,
+            Vec<(u64, MgrPsDetail)>,
+            Vec<(u64, String)>,
+        );
+        let mut resp: Option<Routing> = None;
         for _ in 0..(self.manager_addrs.len() * 3).max(3) {
             let resp_bytes = self
-                .mgr_call_retry(MSG_GET_REGIONS, Bytes::new(), 3)
+                .mgr_call_retry(msg, Bytes::new(), 3)
                 .await
                 .context("get regions")?;
-            let r: GetRegionsResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
-            if r.code == CODE_NOT_LEADER {
+            // Both forms answer under the msg_type the request named, so the
+            // decode is chosen by what we SENT, never by connection state.
+            let (code, regions, ps_details, part_addrs) = if narrow {
+                let r: ClientRegionsResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                (r.code, r.regions, r.ps_details, r.part_addrs)
+            } else {
+                let r: GetRegionsResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                (
+                    r.code,
+                    r.regions
+                        .iter()
+                        .map(|(id, v)| (*id, ClientRegion::from(v)))
+                        .collect(),
+                    r.ps_details,
+                    r.part_addrs,
+                )
+            };
+            if code == CODE_NOT_LEADER {
                 self.rotate_manager();
                 *self.mgr_conn.borrow_mut() = None;
                 compio::time::sleep(Duration::from_millis(300)).await;
                 continue;
             }
-            resp = Some(r);
+            resp = Some((regions, ps_details, part_addrs));
             break;
         }
         let resp =
             resp.ok_or_else(|| anyhow!("get regions: no leader among {:?}", self.manager_addrs))?;
-        let mut sorted: Vec<(u64, MgrRegionInfo)> = resp.regions.into_iter().collect();
+        let (regions, ps_details, part_addrs) = resp;
+        let mut sorted: Vec<(u64, ClientRegion)> = regions;
         sorted.sort_by(|a, b| {
             a.1.rg
                 .as_ref()
@@ -1738,8 +1779,8 @@ impl ClusterClient {
         }
         // Brief swap — no .await held under any borrow.
         *self.regions.borrow_mut() = sorted;
-        *self.ps_details.borrow_mut() = resp.ps_details.into_iter().collect();
-        *self.part_addrs.borrow_mut() = resp.part_addrs.into_iter().collect();
+        *self.ps_details.borrow_mut() = ps_details.into_iter().collect();
+        *self.part_addrs.borrow_mut() = part_addrs.into_iter().collect();
         Ok(())
     }
 
@@ -1751,7 +1792,7 @@ impl ClusterClient {
     ///
     /// **Why this is needed (Bug #1 fix, 2026-06-06):** right after
     /// `cluster.sh start` bootstraps a presplit cluster, the manager
-    /// returns `MgrRegionInfo` for every partition before each
+    /// returns a routing record for every partition before each
     /// partition's PS thread has bound its dedicated `base_port + ord`
     /// listener AND called `RegisterPartitionAddr`. Until that
     /// register lands, `part_addrs[part_id]` is missing → the SDK's
@@ -5471,16 +5512,13 @@ mod first_attempt_timeout_tests {
                     .insert(id, listener.local_addr().unwrap().to_string());
                 client.regions.borrow_mut().push((
                     id,
-                    MgrRegionInfo {
+                    ClientRegion {
                         rg: Some(MgrRange {
                             start_key: start.to_vec(),
                             end_key: end.to_vec(),
                         }),
                         part_id: id,
                         ps_id: 1,
-                        log_stream: 1,
-                        row_stream: 2,
-                        meta_stream: 3,
                         region_epoch: 1,
                     },
                 ));

@@ -20,7 +20,10 @@ via the shared `ConnPool`. RPC families:
   update_stream_ec, stream_info, extent_info, nodes_info, check_commit_length,
   stream_alloc_extent, stream_punch_holes, truncate, multi_modify_split,
   multi_modify_merge, merge_partitions, reconcile_extents, force_ec_convert.
-- **PartitionManager**: register_ps, upsert_partition, get_regions, heartbeat_ps,
+- **PartitionManager**: register_ps, upsert_partition, get_regions,
+  get_client_regions (`0x60` — the SAME routing answer narrowed to the four
+  fields an SDK reads; `get_regions` keeps all seven for the PS and autumn-op,
+  and both forms are served at once, see `crates/rpc/CLAUDE.md`), heartbeat_ps,
   register_partition_addr, report_partition_load, rebalance_regions.
 - **Policy/advisory**: get_policy_candidates, get_policy_kind_names,
   get_partition_detail, autopolicy_get/set (`0x54`/`0x55`).

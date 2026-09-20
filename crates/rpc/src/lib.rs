@@ -106,12 +106,13 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// Bump it on every wire change. There is no separate "oldest cluster peer"
 /// constant: peers compare for EQUALITY, so a floor pinned to this value would
 /// say nothing.
-pub const WIRE_VERSION: u32 = 44;
+pub const WIRE_VERSION: u32 = 45;
 
 /// The oldest CLIENT this binary serves — the floor of the client window
 /// `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`.
 ///
-/// **43, with `WIRE_VERSION` at 44: the window is OPEN.** It was opened by
+/// **43, with `WIRE_VERSION` at 45: the window is OPEN, and two versions
+/// wide.** It was opened by
 /// raising the CEILING. Lowering this floor instead was tried, and it is
 /// UNSAFE — see `FIRST_WIRE_VERSION_WITH_PEER_EQUALITY`, which is the rule
 /// that came out of it.
@@ -162,6 +163,25 @@ const _: () = assert!(MIN_CLIENT_WIRE_VERSION <= WIRE_VERSION);
 /// 43-or-later peer demands exact equality and so never looks at the floor at
 /// all.
 pub const FIRST_WIRE_VERSION_WITH_PEER_EQUALITY: u32 = 43;
+
+/// The version that introduced `MSG_GET_CLIENT_REGIONS` — the narrowed routing
+/// reply an embedded client gets instead of the partition server's seven-field
+/// `MgrRegionInfo`.
+///
+/// The SDK must ASK this before it sends that opcode, because a cluster below
+/// it has no handler: the manager's dispatch refuses an unknown msg_type with
+/// `InvalidArgument`, so a client that asked blind would fail every refresh. `negotiated_cluster_wire` starts at 0 and a silent connection
+/// never raises it, so `negotiated >= this` fails CLOSED — an unknown cluster
+/// gets the old `MSG_GET_REGIONS`, which every cluster in the window serves.
+///
+/// Choosing WHICH OPCODE TO SEND on the negotiated version is not the thing
+/// design §7 forbids. What it forbids is branching the INTERPRETATION of a
+/// received frame on connection state, because rkyv mis-decodes silently and a
+/// missed hello would then read bytes at the wrong version. Here the reply is
+/// self-describing: it comes back under the msg_type the request named.
+pub const WIRE_VERSION_WITH_CLIENT_REGIONS: u32 = 45;
+
+const _: () = assert!(WIRE_VERSION_WITH_CLIENT_REGIONS <= WIRE_VERSION);
 
 const _: () = assert!(MIN_CLIENT_WIRE_VERSION >= FIRST_WIRE_VERSION_WITH_PEER_EQUALITY);
 
@@ -478,7 +498,8 @@ mod wire_version_tests {
         assert!(client_compat_check(3, 2).is_err());
     }
 
-    /// The window is OPEN: `[43, 44]`, opened by raising the CEILING.
+    /// The window is OPEN: `[43, 45]`, opened by raising the CEILING and
+    /// widened again by `MSG_GET_CLIENT_REGIONS`.
     ///
     /// Pinned to literals so that the two silently becoming equal again — which
     /// would take the whole window's coverage down with it — cannot pass.
@@ -489,7 +510,7 @@ mod wire_version_tests {
     #[test]
     fn the_client_window_is_open_and_the_floor_is_where_it_belongs() {
         assert_eq!(MIN_CLIENT_WIRE_VERSION, 43, "read this test's comment");
-        assert_eq!(WIRE_VERSION, 44, "read this test's comment");
+        assert_eq!(WIRE_VERSION, 45, "read this test's comment");
     }
 
     /// The check that actually decides whether a stale SERVER joins is the one

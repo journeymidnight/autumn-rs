@@ -21,7 +21,7 @@ use autumn_rpc::client_hello::{
 };
 use autumn_rpc::manager_rpc::{
     rkyv_decode, rkyv_encode, ClusterDfReq, GetClusterIdReq, GetClusterIdResp, MSG_CLUSTER_DF,
-    MSG_GET_CLUSTER_ID, MSG_GET_REGIONS,
+    MSG_GET_CLIENT_REGIONS, MSG_GET_CLUSTER_ID, MSG_GET_REGIONS,
 };
 use autumn_rpc::{RpcError, StatusCode, WIRE_VERSION};
 use bytes::Bytes;
@@ -170,5 +170,37 @@ fn a_refused_client_can_still_reach_the_message_partition_servers_share_with_it(
                 "get_regions must not be wire-gated: {msg}"
             );
         }
+    });
+}
+
+/// The narrow routing opcode IS wire-gated, and this is the pair to the test
+/// above: `MSG_GET_REGIONS` must NOT be gated (a partition server sends it and
+/// carries no handshake), while `MSG_GET_CLIENT_REGIONS` must be (nothing but
+/// an SDK ever sends it).
+///
+/// Without this, deleting `MSG_GET_CLIENT_REGIONS` from
+/// `is_client_surface_mgr_msg` leaves every test green — the freeze records its
+/// bytes independently of the set — while a below-floor client goes on being
+/// handed routing it has no business acting on. The claim that this narrows the
+/// documented `MSG_GET_REGIONS` residue is only worth making if something
+/// fails when it stops being true.
+#[test]
+fn the_narrow_routing_opcode_is_wire_gated_while_the_shared_one_is_not() {
+    let port = pick_stable_port_pair();
+    let mgr_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    start_manager(mgr_addr);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async move {
+        let c = RpcClient::connect(mgr_addr).await.expect("connect");
+        let r = c.call(MSG_CLIENT_HELLO, hello(WIRE_VERSION + 1)).await;
+        assert!(r.is_err(), "precondition: this connection is refused");
+
+        let r = c.call(MSG_GET_CLIENT_REGIONS, Bytes::new()).await;
+        let (code, msg) = status(&r).expect("a refused connection answers with a status");
+        assert_eq!(
+            code,
+            StatusCode::FailedPrecondition,
+            "the narrow routing opcode must be refused for an out-of-window client: {msg}"
+        );
     });
 }

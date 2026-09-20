@@ -186,17 +186,19 @@ async fn client_status_errors_preserve_connections_and_transport_failures_evict(
     }
 }
 
-fn region(epoch: u64) -> MgrRegionInfo {
-    MgrRegionInfo {
+/// The routing record a client actually holds. It used to be a
+/// `MgrRegionInfo`, which forced this fixture to invent
+/// `log_stream: 1, row_stream: 2, meta_stream: 3` — three numbers no client
+/// code has ever read, present only because the wire form carried them. There
+/// is nothing to invent now.
+fn region(epoch: u64) -> ClientRegion {
+    ClientRegion {
         rg: Some(MgrRange {
             start_key: b"a".to_vec(),
             end_key: b"z".to_vec(),
         }),
         part_id: 1,
         ps_id: 1,
-        log_stream: 1,
-        row_stream: 2,
-        meta_stream: 3,
         region_epoch: epoch,
     }
 }
@@ -251,12 +253,12 @@ async fn routing_retries_keep_the_connection_for_plain_bulk_and_pooled_calls() {
             let refreshes = Rc::new(Cell::new(0));
             let count = refreshes.clone();
             let manager = Peer::start(move |f| {
-                assert_eq!(f.msg_type, MSG_GET_REGIONS);
+                assert_eq!(f.msg_type, MSG_GET_CLIENT_REGIONS);
                 count.set(count.get() + 1);
                 Reply::Frame(autumn_rpc::Frame::response(
                     f.req_id,
                     f.msg_type,
-                    rkyv_encode(&GetRegionsResp {
+                    rkyv_encode(&ClientRegionsResp {
                         code: 0,
                         message: String::new(),
                         regions: vec![(1, region(2))],
@@ -458,11 +460,11 @@ async fn a_client_whose_self_check_was_skipped_is_still_refused_by_the_server() 
             seen.set(seen.get() + 1);
             return Reply::Close;
         }
-        assert_eq!(f.msg_type, MSG_GET_REGIONS);
+        assert_eq!(f.msg_type, MSG_GET_CLIENT_REGIONS);
         Reply::Frame(autumn_rpc::Frame::response(
             f.req_id,
             f.msg_type,
-            rkyv_encode(&GetRegionsResp {
+            rkyv_encode(&ClientRegionsResp {
                 code: 0,
                 message: String::new(),
                 regions: vec![(1, region(1))],
@@ -523,5 +525,102 @@ async fn a_client_whose_self_check_was_skipped_is_still_refused_by_the_server() 
         format!("{err}").contains(HELLO_REFUSAL),
         "and it must carry the server's own words, which say which way round \
          the mismatch is: {err}"
+    );
+}
+
+/// The two-form rule, exercised from the client's side: WHICH opcode a refresh
+/// sends is decided by the version the hello negotiated, and both answers are
+/// correct behaviour rather than one being a degraded mode.
+///
+/// This is a PAIR on purpose. One fixture, one difference — the version the
+/// peer reports — and opposite outcomes. Asserting only the new opcode would
+/// pass just as well if the client had stopped consulting the negotiated
+/// version at all and simply always sent the new one, which is precisely the
+/// bug that would break every cluster older than this binary.
+///
+/// The fallback direction is the one that matters in the field: a wheel built
+/// from `main` routinely runs ahead of a cluster nobody has upgraded yet.
+#[compio::test]
+async fn which_routing_opcode_is_sent_follows_the_negotiated_version() {
+    use std::cell::RefCell;
+
+    async fn opcode_seen_by_a_cluster_reporting(wire: u32) -> u8 {
+        let seen: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
+        let record = seen.clone();
+        let peer = Peer::start_reporting_wire(wire, move |f| {
+            record.borrow_mut().push(f.msg_type);
+            // `connect`'s cluster-id self-check is not what this test is about;
+            // closing on it is what the sibling mocks do, and the hello — which
+            // is what sets the negotiated version — happens regardless.
+            if f.msg_type == MSG_GET_CLUSTER_ID {
+                return Reply::Close;
+            }
+            // Answer in whichever form was asked for; a client that sent the
+            // other one would fail to decode, which is itself the assertion.
+            if f.msg_type == MSG_GET_CLIENT_REGIONS {
+                Reply::Frame(autumn_rpc::Frame::response(
+                    f.req_id,
+                    f.msg_type,
+                    rkyv_encode(&ClientRegionsResp {
+                        code: 0,
+                        message: String::new(),
+                        regions: vec![(1, region(1))],
+                        ps_details: vec![],
+                        part_addrs: vec![],
+                    }),
+                ))
+            } else {
+                Reply::Frame(autumn_rpc::Frame::response(
+                    f.req_id,
+                    f.msg_type,
+                    rkyv_encode(&GetRegionsResp {
+                        code: 0,
+                        message: String::new(),
+                        regions: vec![(
+                            1,
+                            MgrRegionInfo {
+                                rg: Some(MgrRange {
+                                    start_key: b"a".to_vec(),
+                                    end_key: b"z".to_vec(),
+                                }),
+                                part_id: 1,
+                                ps_id: 1,
+                                // The three the narrow form drops. A cluster
+                                // this old still sends them; the client throws
+                                // them away on arrival.
+                                log_stream: 1,
+                                row_stream: 2,
+                                meta_stream: 3,
+                                region_epoch: 1,
+                            },
+                        )],
+                        ps_details: vec![],
+                        part_addrs: vec![],
+                    }),
+                ))
+            }
+        })
+        .await;
+        let client = ClusterClient::connect(&peer.addr, "fs").await.expect("connect");
+        client.refresh_regions().await.expect("refresh");
+        let routing = seen
+            .borrow()
+            .iter()
+            .copied()
+            .find(|m| *m == MSG_GET_REGIONS || *m == MSG_GET_CLIENT_REGIONS)
+            .expect("a routing request was sent");
+        routing
+    }
+
+    assert_eq!(
+        opcode_seen_by_a_cluster_reporting(autumn_rpc::WIRE_VERSION_WITH_CLIENT_REGIONS).await,
+        MSG_GET_CLIENT_REGIONS,
+        "a cluster that serves the narrow form must be asked with the new opcode"
+    );
+    assert_eq!(
+        opcode_seen_by_a_cluster_reporting(autumn_rpc::WIRE_VERSION_WITH_CLIENT_REGIONS - 1).await,
+        MSG_GET_REGIONS,
+        "a cluster one version below it has no handler for the new opcode and \
+         would refuse the frame outright"
     );
 }

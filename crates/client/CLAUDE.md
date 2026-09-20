@@ -340,9 +340,15 @@ is not something anyone restarts to clear a flag.
 `negotiated_cluster_wire()` is what the servers last reported — ONE value, since
 stop-the-world means every server in a cluster speaks the same version. The client used
 to DISCARD this number, which is what made a compatibility window impossible however the
-bytes were encoded: no call site could branch on it. Nothing branches on it yet. Use it
-to decide what may be SENT; never to decide how received bytes are read, which is the
-msg_type's job so a frame stays self-describing.
+bytes were encoded: no call site could branch on it.
+
+**It has exactly one branch today, and it is the shape the rule prescribes:**
+`refresh_regions` picks `MSG_GET_CLIENT_REGIONS` over `MSG_GET_REGIONS` when the
+cluster reports `WIRE_VERSION_WITH_CLIENT_REGIONS` or better. It decides what is
+SENT; the reply is read by the msg_type it came back under, never by connection
+state, so a frame stays self-describing. It fails CLOSED — the field is 0 until a
+hello succeeds, and 0 means the old opcode, which every cluster in the window
+serves.
 
 ## Admin-token prefixing
 
@@ -379,7 +385,8 @@ the token is always prefixed (greppable: `is_admin_mgr_msg` / `is_admin_ps_msg`)
 - Single-threaded (`Rc`/`RefCell`) — designed for the compio single-thread runtime.
 - Manager connections: round-robin failover on error, auto-reconnect.
 - PS connections: cached per-address, dropped on error, recreated on next call.
-- Routing: `GetRegions` cached at connect, refreshed on routing miss (binary search).
+- Routing: fetched at connect and refreshed on a routing miss (binary search).
+  Which opcode asks is decided per refresh from the negotiated version, above.
 
 ### Per-partition routing (part_addrs resolver)
 
@@ -405,13 +412,15 @@ indistinguishable from a true empty result.
 
 ### `region_epoch` + resume cursor
 
-The SDK stamps a `region_epoch: u64` (cached from `MgrRegionInfo.region_epoch`, bumped by
-the manager on every `rg` rewrite — split / merge) on every hot-path request. The PS
+The SDK stamps a `region_epoch: u64` (cached from the routing record's
+`region_epoch`, bumped by the manager on every `rg` rewrite — split / merge) on
+every hot-path request. The PS
 rejects with `FailedPrecondition` when the stamped epoch mismatches; `call_ps_for_key`'s
 `Err`-arm refresh path picks it up (drop conn, `refresh_regions`, retry).
 
 Wire surface:
-- `MgrRegionInfo` carries `region_epoch: u64`.
+- The routing record carries `region_epoch: u64` — `ClientRegion` on
+  `MSG_GET_CLIENT_REGIONS`, `MgrRegionInfo` on the older `MSG_GET_REGIONS`.
 - `PutReq` / `GetReq` / `DeleteReq` / `HeadReq` / `RangeReq` / `StreamPutReq` carry
   `region_epoch: u64`. Admin ops (`MaintenanceReq`, `SplitPartReq`, `MergePartReq`) are
   EXEMPT — the operator is the authoritative caller.

@@ -68,7 +68,20 @@ pub fn respond(frame: Frame) -> Reply {
 
 impl Peer {
     pub async fn start(handler: impl Fn(Frame) -> Reply + 'static) -> Self {
-        Self::start_inner(handler, 0).await
+        Self::start_inner(handler, 0, autumn_rpc::WIRE_VERSION).await
+    }
+
+    /// A peer that admits the hello but reports a CHOSEN cluster wire version
+    /// rather than this binary's. It exists because a client's decision about
+    /// which opcode to send is made from the negotiated number, and the only
+    /// honest way to test both branches is to have a peer report each — the
+    /// client's own constant is compiled in and cannot be varied.
+    #[allow(dead_code)] // only autumn-client's copy of this module uses it
+    pub async fn start_reporting_wire(
+        wire: u32,
+        handler: impl Fn(Frame) -> Reply + 'static,
+    ) -> Self {
+        Self::start_inner(handler, 0, wire).await
     }
 
     /// A peer that REFUSES every `MSG_CLIENT_HELLO` with the status a real
@@ -77,7 +90,7 @@ impl Peer {
     /// the refusal has to come from the peer.
     #[allow(dead_code)] // only autumn-client's copy of this module uses it
     pub async fn start_refusing_hello(handler: impl Fn(Frame) -> Reply + 'static) -> Self {
-        Self::start_inner(handler, usize::MAX).await
+        Self::start_inner(handler, usize::MAX, autumn_rpc::WIRE_VERSION).await
     }
 
     /// Refuses the first `n` hellos, then admits — a cluster being upgraded
@@ -87,12 +100,13 @@ impl Peer {
         n: usize,
         handler: impl Fn(Frame) -> Reply + 'static,
     ) -> Self {
-        Self::start_inner(handler, n).await
+        Self::start_inner(handler, n, autumn_rpc::WIRE_VERSION).await
     }
 
     async fn start_inner(
         handler: impl Fn(Frame) -> Reply + 'static,
         refuse_hellos: usize,
+        report_wire: u32,
     ) -> Self {
         let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -142,7 +156,7 @@ impl Peer {
                                     frame.msg_type,
                                     Bytes::copy_from_slice(
                                         &autumn_rpc::client_hello::encode_hello_resp(
-                                            autumn_rpc::WIRE_VERSION,
+                                            report_wire,
                                             autumn_rpc::MIN_CLIENT_WIRE_VERSION,
                                         ),
                                     ),

@@ -223,8 +223,12 @@ pub fn reported_wire_versions() -> ReportedWireVersions {
 /// reason as `reported_wire_versions` — though with lower stakes, since the
 /// only production reader of `parse_hello_resp` keeps the first number and
 /// discards the second (`crates/client/src/lib.rs`). A swap here would make
-/// `negotiated_cluster_wire` the floor rather than the ceiling; nothing
-/// branches on it yet, so that is a latent wrong value, not an outage.
+/// `negotiated_cluster_wire` the floor rather than the ceiling. That is no
+/// longer merely latent: `refresh_regions` branches on the number, so a swapped
+/// pair would report 43 and push every client permanently onto the OLD routing
+/// opcode. Still not an outage — the old form is SERVED, which is the whole
+/// point of two forms — but a silent fallback that no test would notice, so
+/// keep the pair built here and nowhere else.
 pub fn server_hello_resp() -> [u8; CLIENT_HELLO_RESP_LEN] {
     let v = reported_wire_versions();
     encode_hello_resp(v.max, v.min)
@@ -301,11 +305,21 @@ pub fn is_client_surface_ps_msg(msg_type: u8) -> bool {
 /// every data-plane message it then sends is refused, which is where the
 /// damage would be. Closing it properly means teaching cluster peers to
 /// identify themselves, which is a different change.
+///
+/// **`MSG_GET_CLIENT_REGIONS` IS here, and that is the residue shrinking.**
+/// The narrowed routing reply is client-only by construction — no partition
+/// server sends it, because a PS needs the stream ids the narrow form drops —
+/// so it can be gated where its dual-surface predecessor could not. A client
+/// inside the window keeps using it; one below the floor is refused here
+/// instead of being handed routing it has no business acting on. The old
+/// opcode stays un-gated for the PS's sake, so the hole is not closed, only
+/// narrowed to clients old enough to still be asking with it.
 pub fn is_client_surface_mgr_msg(msg_type: u8) -> bool {
     use manager_rpc::*;
     matches!(
         msg_type,
-        MSG_MINT_TOKEN
+        MSG_GET_CLIENT_REGIONS
+            | MSG_MINT_TOKEN
             | MSG_ALLOC_INODES
             | MSG_ACQUIRE_LEASE
             | MSG_RELEASE_LEASE
@@ -527,6 +541,12 @@ mod tests {
             assert!(is_client_surface_ps_msg(m), "ps msg {m:#x}");
         }
         for m in [
+            // The NARROW routing opcode is gated where its dual-surface
+            // predecessor could not be. Listed here because nothing else
+            // notices if it silently leaves the set: the freeze records its
+            // bytes independently, and `client_wire_admission` would go on
+            // passing while a below-floor client quietly kept its routing.
+            manager_rpc::MSG_GET_CLIENT_REGIONS,
             manager_rpc::MSG_MINT_TOKEN,
             manager_rpc::MSG_ALLOC_INODES,
             manager_rpc::MSG_ACQUIRE_LEASE,

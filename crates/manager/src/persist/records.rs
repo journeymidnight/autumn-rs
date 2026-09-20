@@ -22,8 +22,8 @@
 //! compiler forces you to update.
 
 use autumn_rpc::manager_rpc::{
-    MgrAuditEntry, MgrDiskInfo, MgrExtentInfo, MgrNamespace, MgrNodeInfo, MgrPartitionMeta,
-    MgrRange, MgrRegionInfo, MgrStreamInfo,
+    ClientRegion, MgrAuditEntry, MgrDiskInfo, MgrExtentInfo, MgrNamespace, MgrNodeInfo,
+    MgrPartitionMeta, MgrRange, MgrRegionInfo, MgrStreamInfo,
 };
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -815,6 +815,34 @@ impl From<&ExtentRecord> for MgrExtentInfo {
             replicate_disks: replicate_disks.clone(),
             parity_disks: parity_disks.clone(),
             ec_converted: *ec_converted,
+        }
+    }
+}
+
+/// The CLIENT's third form of a region: four fields, no stream ids.
+///
+/// The three `*_stream` ids are dropped by NAME rather than by `..`, so this is
+/// still an exhaustive destructure — adding a field to the record stops this
+/// compiling, and a reader can see at a glance exactly what the client is not
+/// told. That is the whole point of the narrowing: a stream id is a
+/// stream-layer identity and the SDK has never read one, so shipping them
+/// leaked a lower layer's identifiers into every embedded image.
+impl From<&RegionRecord> for ClientRegion {
+    fn from(r: &RegionRecord) -> Self {
+        let RegionRecord {
+            rg,
+            part_id,
+            ps_id,
+            log_stream: _,
+            row_stream: _,
+            meta_stream: _,
+            region_epoch,
+        } = r;
+        Self {
+            rg: rg.as_ref().map(MgrRange::from),
+            part_id: *part_id,
+            ps_id: *ps_id,
+            region_epoch: *region_epoch,
         }
     }
 }

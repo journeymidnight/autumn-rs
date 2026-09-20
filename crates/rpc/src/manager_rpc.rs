@@ -43,6 +43,17 @@ pub const MSG_MULTI_MODIFY_SPLIT: u8 = 0x2B;
 pub const MSG_REGISTER_PS: u8 = 0x2C;
 pub const MSG_UPSERT_PARTITION: u8 = 0x2D;
 pub const MSG_GET_REGIONS: u8 = 0x2E;
+
+// Routing for an embedded CLIENT. Same question `MSG_GET_REGIONS` answers, but
+// the reply carries only what routing needs — see `ClientRegion`. A SEPARATE
+// opcode rather than a second shape behind the old one, because the client
+// surface's rule is that a new version of a message takes a NEW msg_type and
+// the old form keeps its own until the floor passes it (docs/client_wire_
+// compat_design.md §7): msg_type is settled in the frame header before any
+// decode, so both directions are self-describing, whereas branching one opcode
+// on a connection's negotiated version would make a frame's meaning depend on
+// connection state — and an rkyv mis-decode is silent.
+pub const MSG_GET_CLIENT_REGIONS: u8 = 0x60;
 pub const MSG_HEARTBEAT_PS: u8 = 0x2F;
 
 // per-partition listener address registration (PS reports the
@@ -784,6 +795,76 @@ pub struct GetRegionsResp {
     /// partition. Clients prefer this over `ps_details[ps_id].address`
     /// when present, so traffic is routed to the specific partition's
     /// listener thread (Seastar-style thread-per-shard).
+    pub part_addrs: Vec<(u64, String)>,
+}
+
+/// One partition's routing, as an embedded CLIENT sees it.
+///
+/// Four fields, and the three `*_stream` ids of `MgrRegionInfo` are gone. That
+/// is not tidying: a stream id is a STREAM-LAYER identity, the SDK has never
+/// read one (its production path uses `rg`, `part_id`, `ps_id` and
+/// `region_epoch` and nothing else), and shipping them anyway leaked a lower
+/// layer's identifiers across the boundary into every embedded image. A field
+/// nobody reads is also a field nobody notices changing.
+///
+/// The PS still needs all seven — `sync_regions_once` opens a partition from
+/// its stream ids — so `MgrRegionInfo` on `MSG_GET_REGIONS` is unchanged and
+/// keeps serving the partition server and `autumn-op`, both of which ship at
+/// the cluster's own commit.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ClientRegion {
+    /// `[start_key, end_key)`; `None` = not yet assigned a range.
+    pub rg: Option<MgrRange>,
+    pub part_id: u64,
+    pub ps_id: u64,
+    /// Stamped on every data-plane request; the PS refuses a mismatch with
+    /// `FailedPrecondition` and the SDK refreshes and retries. `0` is reserved
+    /// on the wire and means "skip the check".
+    pub region_epoch: u64,
+}
+
+/// Narrow the PARTITION SERVER's form to the client's.
+///
+/// This is what a client built for the narrow form does when it finds itself
+/// talking to a cluster too old to serve it: ask with the old opcode, then drop
+/// the fields it is not allowed to look at. Keeping the discard HERE rather
+/// than at the call site means there is exactly one place where a stream id
+/// reaches a client and is thrown away, and the destructure is exhaustive, so
+/// a new field on `MgrRegionInfo` has to be classified rather than silently
+/// inherited.
+impl From<&MgrRegionInfo> for ClientRegion {
+    fn from(r: &MgrRegionInfo) -> Self {
+        let MgrRegionInfo {
+            rg,
+            part_id,
+            ps_id,
+            log_stream: _,
+            row_stream: _,
+            meta_stream: _,
+            region_epoch,
+        } = r;
+        Self {
+            rg: rg.clone(),
+            part_id: *part_id,
+            ps_id: *ps_id,
+            region_epoch: *region_epoch,
+        }
+    }
+}
+
+// --- GetClientRegions ---
+// Request: empty payload (0 bytes), same as GetRegions.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ClientRegionsResp {
+    pub code: u8,
+    pub message: String,
+    /// (part_id, ClientRegion) pairs.
+    pub regions: Vec<(u64, ClientRegion)>,
+    /// (ps_id, MgrPsDetail) pairs — id and address, nothing else.
+    pub ps_details: Vec<(u64, MgrPsDetail)>,
+    /// per-partition listener addresses (`host:port`), preferred over
+    /// `ps_details[ps_id].address` so traffic reaches the owning partition's
+    /// listener thread.
     pub part_addrs: Vec<(u64, String)>,
 }
 

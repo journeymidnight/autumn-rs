@@ -364,6 +364,7 @@ impl AutumnManager {
             MSG_REGISTER_PS => self.handle_register_ps(payload).await,
             MSG_UPSERT_PARTITION => self.handle_upsert_partition(payload).await,
             MSG_GET_REGIONS => self.handle_get_regions().await,
+            MSG_GET_CLIENT_REGIONS => self.handle_get_client_regions().await,
             MSG_HEARTBEAT_PS => self.handle_heartbeat_ps(payload).await,
             MSG_REGISTER_PARTITION_ADDR => self.handle_register_partition_addr(payload).await,
             MSG_RECONCILE_EXTENTS => self.handle_reconcile_extents(payload).await,
@@ -5785,8 +5786,31 @@ impl AutumnManager {
             }));
         }
         let s = self.store.inner.borrow();
-        // The routing table crosses to the wire here.
+        // The routing table crosses to the wire here, in the PARTITION SERVER's
+        // form — all seven fields, because `sync_regions_once` opens a
+        // partition from its stream ids. An embedded client gets the narrowed
+        // form from `handle_get_client_regions` instead.
         let regions = s.regions.iter().map(|(&id, r)| (id, r.into())).collect();
+        let (ps_details, part_addrs) = Self::routing_addresses(&s);
+        Ok(rkyv_encode(&GetRegionsResp {
+            code: CODE_OK,
+            message: String::new(),
+            regions,
+            ps_details,
+            part_addrs,
+        }))
+    }
+
+    /// The half of a routing reply that is identical whichever form asked for
+    /// it: which PS is where, and which partition listens where.
+    ///
+    /// Shared so the two handlers cannot drift. A `part_addrs` filter applied
+    /// in one and not the other would route callers differently depending on
+    /// which opcode they used — the kind of split-brain that is invisible until
+    /// one client population behaves unlike another.
+    fn routing_addresses(
+        s: &crate::store::MetadataState,
+    ) -> (Vec<(u64, MgrPsDetail)>, Vec<(u64, String)>) {
         let ps_details = s
             .ps_nodes
             .iter()
@@ -5811,7 +5835,30 @@ impl AutumnManager {
             .filter(|(pid, _)| s.regions.contains_key(*pid))
             .map(|(&pid, addr)| (pid, addr.clone()))
             .collect();
-        Ok(rkyv_encode(&GetRegionsResp {
+        (ps_details, part_addrs)
+    }
+
+    /// Routing for an embedded CLIENT — the same answer as
+    /// `handle_get_regions`, with the three stream ids dropped.
+    ///
+    /// Gated exactly as its sibling is: routing comes from a manager that can
+    /// still speak for the cluster, and an un-displaced ex-leader during an
+    /// etcd outage holds the freshest table in existence. Anything stricter
+    /// black-holes fresh clients for the length of the outage.
+    pub(crate) async fn handle_get_client_regions(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_routable() {
+            return Ok(rkyv_encode(&ClientRegionsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                regions: Vec::new(),
+                ps_details: Vec::new(),
+                part_addrs: Vec::new(),
+            }));
+        }
+        let s = self.store.inner.borrow();
+        let regions = s.regions.iter().map(|(&id, r)| (id, r.into())).collect();
+        let (ps_details, part_addrs) = Self::routing_addresses(&s);
+        Ok(rkyv_encode(&ClientRegionsResp {
             code: CODE_OK,
             message: String::new(),
             regions,

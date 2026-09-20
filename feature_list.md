@@ -494,11 +494,19 @@
   永远不匹配 ⇒ split/merge/GC/recovery 无限重试。已全部走 `persist::encode`，
   并用**真集群**验证（内存模式测试根本不走 etcd）：split / merge 均成功、
   12/12 值字节正确、重启 manager 九种记录重放干净。
-  **Scope 1 / 2 / 4 / 5 至此完成。**
-  剩余只有 **Scope 3**：把客户端拿到的 region 记录收窄成 4 字段（去掉 SDK 从不读的
-  三个 `*_stream` id）。那**改变客户端解码的内容**，属于客户端面 wire 变更，要走
-  [[F-CLIENT-WIRE-COMPAT]] 的两形式规则，不是本套机制能覆盖的 —— `passes` 因此
-  仍为 false。另：九个记录的 `FORMAT_VERSION` 都还是 1，**没有任何一次真正的 bump
+  **Scope 3（2026-09-20）**：客户端路由记录收窄成 4 字段。按 §7 的两形式规则走 ——
+  新 opcode `MSG_GET_CLIENT_REGIONS`(0x60) + `ClientRegion`(4 字段)，旧
+  `MSG_GET_REGIONS`(0x2E) + 7 字段 `MgrRegionInfo` **原封不动**继续服务 PS
+  （`sync_regions_once` 要靠那三个 stream id 开分区）、autumn-op、以及 45 以下的
+  客户端。`WIRE_VERSION` 44→45、地板仍 43、窗口 `[43,45]`。SDK 按协商版本选**发哪个
+  opcode**（不是按连接版本解释收到的字节 —— 那才是 §7 禁止的），未知时回落旧 opcode。
+  **真集群双形式同时活着已验证**：wire-44 编出来的老客户端读到了 wire-45 客户端写的
+  全部值并写回一个。
+  验收那条"编译期不可达"**成立但要说准**：客户端持有的 `ClientRegion` 里没有 stream
+  字段、类型上无法命名；但对 44 集群回退时，7 字段形式仍在进程内被解码一次（唯一一处，
+  就是那条回退臂），地板越过 45 后消失。
+  **五条 Scope 全部完成。** `passes` 仍为 false 的唯一原因是第一条 Acceptance
+  （真集群只换 manager 二进制、PS/EN 不重编译继续互操作）**尚未演示**。另：九个记录的 `FORMAT_VERSION` 都还是 1，**没有任何一次真正的 bump
   被端到端验证过**；第一次 bump 才是转换器第二步的考验(它不再是纯前缀插入，
   必须自带旧定义)。
   payload-location 那个字节的三个载体各自立家：wire（`PayloadLocation::from_wire_byte`

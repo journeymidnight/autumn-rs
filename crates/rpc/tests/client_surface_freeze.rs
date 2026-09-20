@@ -101,7 +101,8 @@ use autumn_rpc::extent_rpc::{self as en, PayloadRef, ReadBytesReq};
 use autumn_rpc::frame;
 use autumn_rpc::manager_rpc::{
     self as mgr, rkyv_decode, rkyv_encode, AcquireLeaseReq, AcquireLeaseResp, AllocInodesReq,
-    AllocInodesResp, ClusterDfReq, ClusterDfResp, DiskCapWire, GetRegionsResp, HeartbeatLeaseReq,
+    AllocInodesResp, ClientRegion, ClientRegionsResp, ClusterDfReq, ClusterDfResp, DiskCapWire,
+    GetRegionsResp, HeartbeatLeaseReq,
     HeartbeatLeaseResp, MgrClientId, MgrInodeLeaseInfo, MgrInvalidation, MgrPsDetail, MgrRange,
     MgrRegionInfo, MintTokenReq, MintTokenResp, NodeCapWire, PollInvalidationsReq,
     PollInvalidationsResp, ReleaseLeaseReq, ReleaseLeaseResp,
@@ -159,10 +160,12 @@ const GOLDEN: &[(&str, &str)] = &[
     ("ClusterDfReq", ""),
     ("ClusterDfResp", "64662d6d6573736167657468652d6469736b2d757569640061605f5e5d5c5b5a8d000000eaffffff71706f6e6d6c6b6a01007f7e7d7c7b7a02010f0e0d0c0b0a010001000000000021201f1e1d1c1b1a31302f2e2d2c2b2a41403f3e3d3c3b3a51504f4e4d4c4b4a01000000acffffff0100000000000000070000008a00000084ffffff000000001817161514131211282726252423222138373635343332314847464544434241585756555453525168676665646362617877767574737271080706050403020111100f0e0d0c0b0a78ffffff01000000"),
     ("GetRegionsReq (empty payload)", ""),
+    ("GetClientRegionsReq (empty payload)", ""),
     ("error envelope", "03776972652d76657273696f6e206d69736d61746368"),
     ("ReadBytesReq", "18171615141312112827262524232221383736353433323148474645444342410100000054535251"),
     ("ReadBytesReq (32-byte form, predates the payload selector)", "1817161514131211282726252423222138373635343332314847464544434241"),
     ("GetRegionsResp", "726567696f6e732d6d6573736167657468652d73746172747468652d656e6400181716151413121101000000e3ffffff09000000e4ffffff070000000000000028272625242322213837363534333231484746454443424158575655545352516867666564636261787776757473727131302e302e302e313a37313030000000080706050403020111100f0e0d0c0b0a8d000000e0ffffff31302e302e302e323a3731303000000021201f1e1d1c1b1a8d000000e8ffffff070000008f00000044ffffff5cffffff01000000b4ffffff01000000d4ffffff01000000"),
+    ("ClientRegionsResp", "636c69656e742d726567696f6e732d6d6573736167657468652d73746172747468652d656e640000181716151413121101000000e2ffffff09000000e3ffffff070000000000000028272625242322213837363534333231787776757473727131302e302e302e313a37313030000000080706050403020111100f0e0d0c0b0a8d000000e0ffffff31302e302e302e323a3731303000000021201f1e1d1c1b1a8d000000e8ffffff070000009600000054ffffff74ffffff01000000b4ffffff01000000d4ffffff01000000"),
 ];
 
 // ── the fixtures ────────────────────────────────────────────────────────────
@@ -865,6 +868,48 @@ fn forms() -> Vec<Frozen> {
             live: String::new(),
             reencode: None,
         },
+        // The SECOND form of the routing reply, under its own opcode. Both are
+        // live at once and both are frozen: the old one because every client
+        // below `WIRE_VERSION_WITH_CLIENT_REGIONS` still asks with it, the new
+        // one because every client at or above it does. That is what the
+        // two-form rule means in practice — the old form is not deprecated, it
+        // is SERVED, until the floor passes the version that introduced this.
+        frozen!(
+            &[(Mgr, mgr::MSG_GET_CLIENT_REGIONS)],
+            Resp,
+            ClientRegionsResp,
+            ClientRegionsResp {
+                code: 7,
+                message: "client-regions-message".to_string(),
+                regions: vec![(
+                    0x1112131415161718,
+                    ClientRegion {
+                        rg: Some(MgrRange {
+                            start_key: b"the-start".to_vec(),
+                            end_key: b"the-end".to_vec(),
+                        }),
+                        part_id: 0x2122232425262728,
+                        ps_id: 0x3132333435363738,
+                        region_epoch: 0x7172737475767778,
+                    },
+                )],
+                ps_details: vec![(
+                    0x0102030405060708,
+                    MgrPsDetail {
+                        ps_id: 0x0a0b0c0d0e0f1011,
+                        address: "10.0.0.1:7100".to_string(),
+                    },
+                )],
+                part_addrs: vec![(0x1a1b1c1d1e1f2021, "10.0.0.2:7100".to_string())],
+            }
+        ),
+        Frozen {
+            on: &[(Mgr, mgr::MSG_GET_CLIENT_REGIONS)],
+            dir: Req,
+            what: "GetClientRegionsReq (empty payload)",
+            live: String::new(),
+            reencode: None,
+        },
     ]
 }
 
@@ -968,6 +1013,9 @@ fn every_client_facing_msg_type_has_a_frozen_form_in_both_directions() {
     // sends it too and sends no hello, which is an ADMISSION decision and says
     // nothing about whose bytes these are.
     want(Mgr, mgr::MSG_GET_REGIONS, "manager MSG_GET_REGIONS".into());
+    // Its narrowed successor needs no line here: it IS inside
+    // `is_client_surface_mgr_msg` (nothing but an SDK sends it), so the walk
+    // above already demanded it.
     // The extent-node read a client issues directly. There is no set to walk
     // here — the EN has no gate and no version — so the one opcode a client
     // speaks to an EN is named outright. `--direct-read` is on by default, so

@@ -2736,14 +2736,14 @@ Manual verification (all on a fresh `cluster.sh reset 3`):
 
 ```bash
 autumn-op cluster-version
-#   cluster_version: 44
-#   cluster wire version:   44
-#   oldest client served:   43  (window open — any client built at 43..=44 is served)
-#   this autumn-op binary:  44
+#   cluster_version: 45
+#   cluster wire version:   45
+#   oldest client served:   43  (window open — any client built at 43..=45 is served)
+#   this autumn-op binary:  45
 # Verified against a real manager. The `--json` form needs the flag BEFORE the
 # subcommand and prints cluster_wire_version / cluster_min_client_wire_version:
 autumn-op --json cluster-version
-autumn-op upgrade-version            # expect REFUSED: 45 exceeds WIRE_VERSION=44
+autumn-op upgrade-version            # expect REFUSED: 46 exceeds WIRE_VERSION=45
 bash cluster.sh restart-manager && sleep 10
 autumn-op cluster-version            # expect: unchanged (etcd replay)
 # mixed-version refusal: any pre-R1 binary against this manager fails its
@@ -2767,6 +2767,15 @@ cargo test -p autumn-partition-server --lib \
 An operator seeing a client refused in the field reads the message the server
 sent, which names both versions. `autumn-op cluster-version` prints the same
 pair from the cluster's side.
+
+**The window now carries two live forms of one message, which is what it was
+built for.** At wire 45 an embedded client's routing reply dropped the three
+stream ids it never read, under a NEW opcode (`MSG_GET_CLIENT_REGIONS`); the old
+`MSG_GET_REGIONS` is untouched and still serves the partition servers,
+`autumn-op`, and any client built at 43 or 44. An SDK picks between them from
+the version the handshake negotiated, so nothing has to be rebuilt for this.
+Verified on one cluster with both: a client binary built at wire 44 read values
+a wire-45 client had written, and wrote one the wire-45 client then read.
 
 A wire bump also invalidates anything ALREADY WRITTEN to etcd in a wire type's
 rkyv layout, which the version handshake cannot protect: it guards

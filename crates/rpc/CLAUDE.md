@@ -462,7 +462,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **44**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **45**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -488,7 +488,8 @@ is routine rather than exotic — images are built from `main`, so a wheel often
 ahead of a cluster nobody has upgraded yet. The refusal says which way round it is,
 because the fix differs (deploy the cluster vs rebuild the client).
 
-**The window is OPEN: `[43, 44]`, opened by raising the CEILING.**
+**The window is OPEN: `[43, 45]`.** It was opened by raising the CEILING at
+44, and widened again at 45 when `MSG_GET_CLIENT_REGIONS` arrived.
 
 Lowering the floor to 42 instead was implemented, verified green, and REVERTED — it is
 unsafe, and `FIRST_WIRE_VERSION_WITH_PEER_EQUALITY` is the rule that came out of it.
@@ -520,9 +521,45 @@ ORDER of the reported pair — in `client_wire_admission.rs`, in the partition s
 live hello round trip — passed under a swap. Both now fail under one, which is what
 `reported_wire_versions` exists to prevent in the first place.
 
-Serving two forms of one message (`docs/client_wire_compat_design.md` §7) is a DIFFERENT
-requirement, needed when a CLIENT-FACING change must keep old clients working. It is not
-a precondition for the window; the rule for writing one is enforced, see below.
+### Two forms of one message, now live: routing
+
+`docs/client_wire_compat_design.md` §7's rule stopped being theory at wire 45.
+An embedded client's routing record dropped the three `*_stream` ids it had
+never read — stream-layer identities that leaked across the layer boundary into
+every embedded image — while the PARTITION SERVER still needs all seven,
+because `sync_regions_once` opens a partition from them.
+
+So both forms are SERVED, each under its own opcode:
+
+| opcode | reply | who asks |
+|---|---|---|
+| `MSG_GET_REGIONS` (0x2E) | `GetRegionsResp` / `MgrRegionInfo`, 7 fields | the PS, `autumn-op`, any client below 45 |
+| `MSG_GET_CLIENT_REGIONS` (0x60) | `ClientRegionsResp` / `ClientRegion`, 4 fields | an SDK at 45 or above |
+
+**A NEW msg_type, not a second shape behind the old one.** msg_type is settled
+in the frame header before any decode and a reply carries the msg_type its
+request named, so both directions are self-describing. Reusing one opcode and
+branching on the connection's negotiated version is what §7 forbids: a frame's
+meaning would then depend on connection state, and an rkyv mis-decode is silent,
+so a missed hello would read bytes at the wrong version and say nothing.
+
+Choosing WHICH opcode to SEND from the negotiated version is a different act,
+and is how the SDK decides — `negotiated_cluster_wire >=
+WIRE_VERSION_WITH_CLIENT_REGIONS`. It fails CLOSED: that field is 0 until a
+hello succeeds and a silent connection never raises it, so an unknown cluster
+gets the old opcode, which every cluster in the window serves. A client at 45
+against a cluster at 44 asks the old way and narrows the reply itself
+(`From<&MgrRegionInfo> for ClientRegion`) — the one place a stream id reaches a
+client and is thrown away.
+
+The new opcode IS inside `is_client_surface_mgr_msg`, which its predecessor
+could not be: `MSG_GET_REGIONS` is on both surfaces, so gating it would refuse
+region sync fleet-wide, while nothing but an SDK ever sends the narrow one. The
+residue that note describes is narrowed, not closed — a client old enough to
+still ask with `MSG_GET_REGIONS` remains ungated.
+
+Verified with both forms live on one cluster: a client built at wire 44 read
+values a wire-45 client had written, and wrote one the wire-45 client then read.
 
 ### `MSG_CLIENT_HELLO` (0x5F) — the client→server half, and server-side admission
 
@@ -603,6 +640,22 @@ form its own opcode, so a window can only be opened if opcodes are cheap. Adding
 CLIENT-facing one still means classifying it in `client_hello.rs` — a data-plane
 message with no entry lands outside the window silently, which is the same shape as the
 two `extract_part_id` / `authz_check` omissions this tree has already shipped.
+
+**The exception, and it is not a contradiction: an opcode a CLIENT must
+DETECT does need a bump.** `MSG_GET_CLIENT_REGIONS` added no field to any
+existing struct and still took `WIRE_VERSION` 44 → 45, because the version
+integer is the SDK's only signal that the handler exists on the other end.
+Without a bump there is no number to compare and the client has to either ask
+blind (every refresh fails against an older cluster) or never use the new form
+at all. §7 says the same thing from the other side: each retained form names the
+version that introduced it.
+
+Say the cost out loud, because it is the cost this crate's own measurement is
+about: that bump stops every PS and EN for a change neither can see — one of the
+68% of intervals where the extent node need not have moved. It buys the thing
+that matters more here, which is that no embedded client image has to be
+rebuilt. An addition NO client needs to detect — an internal opcode, or one a
+server only ever receives — still costs nothing and must not be bumped for.
 
 ### The client surface is frozen to exact bytes
 
