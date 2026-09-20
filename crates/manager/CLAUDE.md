@@ -1385,6 +1385,37 @@ etcd 永不清(绝不 `cluster.sh reset`)。安全来自 rkyv 校验式 `from_by
 错值。**Invariant: any persistent-struct change (etcd value / SST / .meta / WAL) is
 either same-rkyv-layout or ships a versioned one-time migration — never rely on reset.**
 
+**HOW that migration is delivered, for etcd values: a CONVERTER TOOL, never
+in-code compatibility** (user, 2026-09-20). A format change to a persisted
+manager record bumps that record's own `FORMAT_VERSION` and adds a step to the
+converter, which runs ONCE against a stopped cluster. The server binaries carry
+**no** dual-read, **no** retained previous schema, and **no** sniffing of a
+value's bytes to guess its format. A value that does not carry the expected
+envelope is an ERROR — the manager refuses leadership — not a "maybe it is the
+old form".
+
+The reason is that the alternative does not stay small. In-code compatibility
+means every persisted type keeps every shape it has ever had, each one reachable,
+each one needing a test, forever — and the discriminator has to be guessed from
+the bytes, which **provably cannot work here**: rkyv puts its root at the END of
+the buffer, so a persisted value BEGINS with variable-length business content. A
+namespace named `AUMG…` produces a value whose first four bytes are literally
+`41 55 4d 47`. Measured, not argued. Any "does it start with our magic" test
+misreads that record.
+
+What makes the tool cheap: a rename-only split (same field list, new type name)
+is byte-identical under rkyv — measured, `MgrExtentInfo` and an identically
+shaped `ExtentRecord` both encode to the same 152 bytes. So the first conversion
+is a pure prefix insertion: read the value, prepend the envelope, write it back.
+The tool decodes nothing and links no schema, and is idempotent by skipping any
+value that already carries the envelope.
+
+Scope, and it is a real boundary: this applies to data small and centralized
+enough to rewrite in one stopped pass — the etcd records. It does NOT apply to
+SST / WAL / checkpoint bulk inside extents, which cannot be rewritten wholesale;
+those keep `FORMAT_VERSION` plus a parser that reads the older versions, which is
+what `.meta` already does (it still parses V0, V1 and V2).
+
 **`cluster_df`** (`MSG_CLUSTER_DF`, leader-gated). Ceph-style aggregate, in-memory only,
 built inside the single `node_health_loop`: RAW + `physical_used` are summed from each
 EN's self-reported `DiskStatus.extent_bytes` every tick (owner reports, control plane
