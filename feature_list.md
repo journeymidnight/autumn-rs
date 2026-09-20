@@ -478,8 +478,13 @@
   **迁移按用户定调走树外工具**（[[feedback_persist_migration_by_tool_not_dual_read]]）：
   `migratev0_v1`，不解码、幂等、有 leader-key 前置检查，用完删。真 etcd 端到端跑通：
   裸值 → 新 manager 拒绝并点名 → 转换 → 重放成功 → 字段逐个正确。
-  **验收第 3 条的文字冲突（未改，按规矩 8）**：该行写的是新 manager"**就地**"重放旧
-  数据；按这个定调不是就地，是工具先转。文字是否要动由用户定。
+  **验收第 3 条已满足**（用户 2026-09-20 澄清了"就地"的含义：**停机 → convert 转 etcd
+  → 起新集群**，即不清 etcd、在原地改值，而不是"不经转换直接读"）。真 etcd 端到端
+  跑的就是这个流程。该行后半句"反向……有测试钉住是哪一种"的答案是**拒绝**，已钉：
+  `an_old_bare_decoder_refuses_a_value_this_build_wrote`。注意那个拒绝是**结构性但
+  偶然**的——rkyv 的 root 相对 buffer 末尾定位，所以插 6 字节后 root 照样被找到，
+  真正挡住的是对齐（整体偏移 6，root 对齐 4/8）。将来若有对齐为 1/2 的记录就没有
+  这层保护，测试会绿着但含义变弱，已写进测试注释。
   剩余：Scope 1 的另外 6 个类型、Scope 2 的其余、Scope 3（`MgrRegionInfo` 三分）、
   Scope 5。下一步的真决定是把 `MetadataState` 搬进 manager 并持有 persist 形式
   （已核实零外部引用，搬动干净，但不是文件搬家：它现在持有 wire 结构作为权威内存态）。

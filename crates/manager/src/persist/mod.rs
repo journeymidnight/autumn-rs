@@ -328,6 +328,52 @@ mod tests {
         assert!(err.contains("rolled back"), "{err}");
     }
 
+    /// The REVERSE direction, which the acceptance row asks to be decided and
+    /// pinned rather than left to chance: an OLD binary — one that decodes the
+    /// whole etcd value as bare rkyv, because it predates the envelope — meets
+    /// a value this build wrote. **The answer is REFUSE**, and this pins that
+    /// it is refuse and not "reads it and gets something".
+    ///
+    /// It is worth knowing WHY, because the obvious guess is wrong. rkyv locates
+    /// its root relative to the buffer's END, so prepending six bytes moves the
+    /// length and the root together and the root IS found — the envelope does
+    /// not hide it. What rejects the value is alignment: the whole archive is
+    /// displaced by 6, these records' roots align to 4 or 8, and `from_bytes`
+    /// answers `unaligned pointer`.
+    ///
+    /// So the refusal is STRUCTURAL but INCIDENTAL — it falls out of rkyv's
+    /// layout rules rather than from anything here defending against it. That
+    /// is fine for the guarantee we need (the upgrade is stop → convert →
+    /// start, and going backwards is unsupported), but a future record whose
+    /// archived alignment is 1 or 2 would not get it, and this test would go
+    /// green while meaning something weaker. Do not read a pass here as "old
+    /// binaries are safely locked out by design".
+    #[test]
+    fn an_old_bare_decoder_refuses_a_value_this_build_wrote() {
+        use autumn_rpc::manager_rpc::{rkyv_decode, MgrNamespace};
+
+        let record = NamespaceRecord {
+            name: "kvc".to_string(),
+            prefix: b"kvc/".to_vec(),
+            owner_tenant: Some("t1".to_string()),
+            presplit: vec![b"kvc/a".to_vec()],
+            created_at: 99,
+        };
+        let stored = encode(&record);
+
+        // Exactly what a pre-envelope manager does with the stored bytes.
+        let as_old_binary = rkyv_decode::<MgrNamespace>(&stored);
+        assert!(
+            as_old_binary.is_err(),
+            "an old binary must REFUSE a value this build wrote, not decode one"
+        );
+
+        // And this build still reads its own, so the test cannot pass merely
+        // because the fixture is malformed.
+        let back: NamespaceRecord = decode("namespace/kvc", &stored).expect("we read our own");
+        assert_eq!(back.created_at, 99);
+    }
+
     /// `RECORD_TYPE` is written into every stored value, so these numbers are
     /// frozen. Pinned BY NAME: a consistent renumbering is invisible to a round
     /// trip, and would silently re-label every record already on disk.
