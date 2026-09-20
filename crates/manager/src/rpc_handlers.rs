@@ -15,6 +15,10 @@ use compio::BufResult;
 use std::rc::Rc;
 
 use crate::{AutumnManager, ConnPool, PendingDelete};
+use crate::persist::records::NodeRecord;
+use crate::persist::records::StreamRecord;
+use crate::persist::records::PartitionRecord;
+use crate::persist::records::ExtentRecord;
 
 /// #6: RAII removal of a partition from `AutumnManager.split_inflight` on every
 /// exit path of `handle_multi_modify_split` (success + all early-return errors).
@@ -1164,7 +1168,7 @@ impl AutumnManager {
         let op_in_flight = self.extent_inflight_op(req.extent_id).is_some();
         // Compute the etcd-first update under a read-only borrow (no mutation
         // until the persist succeeds — coco I5).
-        let updated: Result<(MgrExtentInfo, u32), (u8, String)> = {
+        let updated: Result<(ExtentRecord, u32), (u8, String)> = {
             let s = self.store.inner.borrow();
             // I4 fencing: the reporter must be the current partition owner.
             let owner_key = format!("partition/{}", req.partition_id);
@@ -1637,7 +1641,7 @@ impl AutumnManager {
                 uuid_map.push((uuid.clone(), disk_id));
             }
 
-            let node = MgrNodeInfo {
+            let node = NodeRecord {
                 node_id,
                 address: req.addr,
                 disks: disk_ids,
@@ -1805,7 +1809,7 @@ impl AutumnManager {
         // even though other healthy nodes existed. Mirrors the pattern
         // in handle_stream_alloc_extent above.
         let selected_ids: HashSet<u64> = selected.iter().map(|n| n.node_id).collect();
-        let mut fallback_nodes: Vec<MgrNodeInfo> = {
+        let mut fallback_nodes: Vec<NodeRecord> = {
             let s = self.store.inner.borrow();
             s.nodes
                 .values()
@@ -1838,14 +1842,14 @@ impl AutumnManager {
             }));
         };
 
-        let stream = MgrStreamInfo {
+        let stream = StreamRecord {
             stream_id,
             extent_ids: vec![extent_id],
             ec_data_shard: ec_data,
             ec_parity_shard: ec_parity,
             replicates: req.replicates,
         };
-        let extent = MgrExtentInfo {
+        let extent = ExtentRecord {
             extent_id,
             replicates: node_ids,
             parity: vec![],
@@ -1885,8 +1889,8 @@ impl AutumnManager {
         Ok(rkyv_encode(&CreateStreamResp {
             code: CODE_OK,
             message: String::new(),
-            stream: Some(stream.clone()),
-            extent: Some(extent.clone()),
+            stream: Some((&stream).into()),
+            extent: Some((&extent).into()),
         }))
     }
 
@@ -1964,7 +1968,7 @@ impl AutumnManager {
         Ok(rkyv_encode(&UpdateStreamEcResp {
             code: CODE_OK,
             message: String::new(),
-            stream: Some(stream),
+            stream: Some((&stream).into()),
         }))
     }
 
@@ -1986,11 +1990,11 @@ impl AutumnManager {
 
         for id in ids {
             if let Some(st) = s.streams.get(&id) {
-                streams.push((id, st.clone()));
+                streams.push((id, st.into()));
                 for extent_id in &st.extent_ids {
                     member_ids.insert(*extent_id);
                     if let Some(e) = s.extents.get(extent_id) {
-                        extents.push((*extent_id, e.clone()));
+                        extents.push((*extent_id, e.into()));
                     }
                 }
             }
@@ -2003,13 +2007,13 @@ impl AutumnManager {
         // non-member at `refs==0 && vp_table_refs==0` is reclaimable (the
         // EXTENT10-AUTORECLAIM sweep reaps it); one with `vp_table_refs>0` is a
         // legacy extent retained by the upgrade-safety guard (live VPs, Stage-2
-        // migration target). `vp_table_refs` is on the wire (MgrExtentInfo) so
+        // migration target). `vp_table_refs` is on the wire (ExtentRecord) so
         // the CLI can show WHY a non-member is retained. Targeted stream_ids
         // queries (hot path, client.rs) keep the membership-only behaviour.
         if full_dump {
             for (eid, e) in s.extents.iter() {
                 if !member_ids.contains(eid) {
-                    extents.push((*eid, e.clone()));
+                    extents.push((*eid, e.into()));
                 }
             }
         }
@@ -2031,7 +2035,7 @@ impl AutumnManager {
             Some(e) => Ok(rkyv_encode(&ExtentInfoResp {
                 code: CODE_OK,
                 message: String::new(),
-                extent: Some(e.clone()),
+                extent: Some(e.into()),
                 payload_location,
             })),
             None => Ok(rkyv_encode(&ExtentInfoResp {
@@ -2045,7 +2049,8 @@ impl AutumnManager {
 
     async fn handle_nodes_info(&self) -> HandlerResult {
         let s = self.store.inner.borrow();
-        let nodes = s.nodes.iter().map(|(&id, n)| (id, n.clone())).collect();
+        // Both registries cross to the wire here, and only here.
+        let nodes = s.nodes.iter().map(|(&id, n)| (id, n.into())).collect();
         // The registry crosses to the wire here; the stored form is the record.
         let disks_info = s.disks.iter().map(|(&id, d)| (id, d.into())).collect();
         Ok(rkyv_encode(&NodesInfoResp {
@@ -2354,9 +2359,9 @@ impl AutumnManager {
             return Ok(rkyv_encode(&CheckCommitLengthResp {
                 code: CODE_OK,
                 message: String::new(),
-                stream_info: Some(stream.clone()),
+                stream_info: Some((&stream).into()),
                 end: ex.sealed_length,
-                last_ex_info: Some(ex.clone()),
+                last_ex_info: Some((&ex).into()),
             }));
         }
 
@@ -2460,9 +2465,9 @@ impl AutumnManager {
         Ok(rkyv_encode(&CheckCommitLengthResp {
             code: CODE_OK,
             message: String::new(),
-            stream_info: Some(stream.clone()),
+            stream_info: Some((&stream).into()),
             end,
-            last_ex_info: Some(ex.clone()),
+            last_ex_info: Some((&ex).into()),
         }))
     }
 
@@ -2507,8 +2512,8 @@ impl AutumnManager {
     /// (their filters differ, e.g. the exclude set).
     async fn place_extents_with_fallback(
         &self,
-        selected: &[MgrNodeInfo],
-        fallback_iter: &mut std::vec::IntoIter<MgrNodeInfo>,
+        selected: &[NodeRecord],
+        fallback_iter: &mut std::vec::IntoIter<NodeRecord>,
         extent_id: u64,
     ) -> Option<(Vec<u64>, Vec<u64>)> {
         let mut node_ids = Vec::with_capacity(selected.len());
@@ -2595,8 +2600,8 @@ impl AutumnManager {
                 return Ok(rkyv_encode(&StreamAllocExtentResp {
                     code: CODE_OK,
                     message: String::new(),
-                    stream_info: Some(stream.clone()),
-                    last_ex_info: Some(tail.clone()),
+                    stream_info: Some((&stream).into()),
+                    last_ex_info: Some((&tail).into()),
                 }));
             }
 
@@ -2634,7 +2639,7 @@ impl AutumnManager {
 
             // The new extent is allocated as an OPEN, REPLICATED extent
             // on `stream.replicates` nodes. For legacy streams persisted
-            // before `replicates` was added to MgrStreamInfo (default
+            // before `replicates` was added to StreamRecord (default
             // 0), fall back to `tail.replicates.len()`, which on a
             // pre-EC-converted tail equals the open replica count.
             let data = if stream.replicates > 0 {
@@ -2859,13 +2864,13 @@ impl AutumnManager {
         // hard-exclude fenced/maintenance/suspected at the source
         // so the `after_exclude.is_empty() → unfiltered` fallback can't re-admit
         // them either.
-        let unfiltered: Vec<MgrNodeInfo> = nodes_map
+        let unfiltered: Vec<NodeRecord> = nodes_map
             .values()
             .filter(|n| !selected_ids.contains(&n.node_id))
             .filter(|n| !hard_excluded.contains(&n.node_id))
             .cloned()
             .collect();
-        let after_exclude: Vec<MgrNodeInfo> = unfiltered
+        let after_exclude: Vec<NodeRecord> = unfiltered
             .iter()
             .filter(|n| !exclude_set.contains(&n.node_id))
             .cloned()
@@ -2898,7 +2903,7 @@ impl AutumnManager {
             return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
         };
 
-        let new_extent = MgrExtentInfo {
+        let new_extent = ExtentRecord {
             extent_id,
             replicates: node_ids[..data].to_vec(),
             parity: node_ids[data..].to_vec(),
@@ -2928,7 +2933,7 @@ impl AutumnManager {
             // value-CAS's `streams/<id>` against it, so a punch_holes/truncate
             // committing during our RTT makes our write fail → retry, instead of
             // resurrecting the removed extent.
-            let baseline = rkyv_encode(st).to_vec();
+            let baseline = crate::persist::encode(st);
             let mut stream_after = st.clone();
             stream_after.extent_ids.push(extent_id);
             (stream_after, baseline)
@@ -3048,8 +3053,8 @@ impl AutumnManager {
         Ok(rkyv_encode(&StreamAllocExtentResp {
             code: CODE_OK,
             message: String::new(),
-            stream_info: Some(stream_after.clone()),
-            last_ex_info: Some(new_extent.clone()),
+            stream_info: Some((&stream_after).into()),
+            last_ex_info: Some((&new_extent).into()),
         }))
     }
 
@@ -3104,7 +3109,7 @@ impl AutumnManager {
         removed: &HashSet<u64>,
         ec_inflight_set: &HashSet<u64>,
     ) -> (
-        Vec<MgrExtentInfo>,
+        Vec<ExtentRecord>,
         Vec<u64>,
         Vec<PendingDelete>,
         // Per-extent value-CAS baseline (`extents/<id>` == its value BEFORE this
@@ -3149,7 +3154,7 @@ impl AutumnManager {
                 // — a delete must also fail if a concurrent split bumped refs.
                 extent_cas.push((
                     format!("extents/{extent_id}"),
-                    rkyv_encode(extent).to_vec(),
+                    crate::persist::encode(extent),
                 ));
                 let mut new_ext = extent.clone();
                 if new_ext.refs <= 1 {
@@ -3196,8 +3201,8 @@ impl AutumnManager {
             let s: &crate::store::MetadataState = &guard;
             (|| -> Result<
                 (
-                    MgrStreamInfo,
-                    Vec<MgrExtentInfo>,
+                    StreamRecord,
+                    Vec<ExtentRecord>,
                     Vec<u64>,
                     Vec<PendingDelete>,
                     // CAS baseline = the stream's value BEFORE this punch
@@ -3218,7 +3223,7 @@ impl AutumnManager {
                     .get(&req.stream_id)
                     .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?
                     .clone();
-                let stream_baseline = rkyv_encode(&stream).to_vec();
+                let stream_baseline = crate::persist::encode(&stream);
 
                 // Only operate on extents that actually belong to this
                 // stream. Without this, a malformed request could decrement
@@ -3312,7 +3317,7 @@ impl AutumnManager {
                 Ok(rkyv_encode(&PunchHolesResp {
                     code: CODE_OK,
                     message: String::new(),
-                    stream: Some(stream.clone()),
+                    stream: Some((&stream).into()),
                 }))
             }
             Err(err) => Ok(rkyv_encode(&PunchHolesResp {
@@ -3344,8 +3349,8 @@ impl AutumnManager {
             let s: &crate::store::MetadataState = &guard;
             (|| -> Result<
                 (
-                    MgrStreamInfo,
-                    Vec<MgrExtentInfo>,
+                    StreamRecord,
+                    Vec<ExtentRecord>,
                     Vec<u64>,
                     Vec<PendingDelete>,
                     // CAS baseline (stream value before this truncate).
@@ -3362,7 +3367,7 @@ impl AutumnManager {
                     .get(&req.stream_id)
                     .cloned()
                     .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?;
-                let stream_baseline = rkyv_encode(&stream).to_vec();
+                let stream_baseline = crate::persist::encode(&stream);
 
                 let pos = stream
                     .extent_ids
@@ -3452,7 +3457,7 @@ impl AutumnManager {
                 Ok(rkyv_encode(&TruncateResp {
                     code: CODE_OK,
                     message: String::new(),
-                    updated_stream_info: Some(stream.clone()),
+                    updated_stream_info: Some((&stream).into()),
                 }))
             }
             Err(err) => Ok(rkyv_encode(&TruncateResp {
@@ -3553,10 +3558,10 @@ impl AutumnManager {
         let out = {
             let mut s = self.store.inner.borrow_mut();
             (|| -> Result<(
-                Vec<MgrStreamInfo>,
-                Vec<MgrExtentInfo>,
-                MgrPartitionMeta,
-                MgrPartitionMeta,
+                Vec<StreamRecord>,
+                Vec<ExtentRecord>,
+                PartitionRecord,
+                PartitionRecord,
                 HashMap<u64, u64>,
             ), AppError> {
                 Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s)?;
@@ -3690,7 +3695,7 @@ impl AutumnManager {
 
                 let mut left = src_meta.clone();
                 let mut right = src_meta;
-                left.rg = Some(MgrRange {
+                left.rg = Some(crate::persist::records::RangeRecord {
                     start_key: rg.start_key.clone(),
                     end_key: req.mid_key.clone(),
                 });
@@ -3698,7 +3703,7 @@ impl AutumnManager {
                 right.log_stream = new_log_stream;
                 right.row_stream = new_row_stream;
                 right.meta_stream = new_meta_stream;
-                right.rg = Some(MgrRange {
+                right.rg = Some(crate::persist::records::RangeRecord {
                     start_key: req.mid_key,
                     end_key: rg.end_key,
                 });
@@ -3732,22 +3737,22 @@ impl AutumnManager {
                     for st in &new_streams {
                         kvs.push((
                             format!("streams/{}", st.stream_id),
-                            rkyv_encode(st).to_vec(),
+                            crate::persist::encode(st),
                         ));
                     }
                     for ex in &modified_extents {
                         kvs.push((
                             format!("extents/{}", ex.extent_id),
-                            rkyv_encode(ex).to_vec(),
+                            crate::persist::encode(ex),
                         ));
                     }
                     kvs.push((
                         format!("partitions/{}", left.part_id),
-                        rkyv_encode(&left).to_vec(),
+                        crate::persist::encode(&left),
                     ));
                     kvs.push((
                         format!("partitions/{}", right.part_id),
-                        rkyv_encode(&right).to_vec(),
+                        crate::persist::encode(&right),
                     ));
                     // Pre-compute region entries for left and right partitions
                     // so they are included in the same atomic txn.
@@ -3757,11 +3762,11 @@ impl AutumnManager {
                         let right_region = Self::compute_region_for_partition(&s, &right);
                         kvs.push((
                             format!("regions/{}", left.part_id),
-                            rkyv_encode(&left_region).to_vec(),
+                            crate::persist::encode(&left_region),
                         ));
                         kvs.push((
                             format!("regions/{}", right.part_id),
-                            rkyv_encode(&right_region).to_vec(),
+                            crate::persist::encode(&right_region),
                         ));
                     }
                     // Stamp last_op_at on both children so the
@@ -3803,7 +3808,7 @@ impl AutumnManager {
                             .iter()
                             .filter_map(|ex| {
                                 s.extents.get(&ex.extent_id).map(|orig| {
-                                    (format!("extents/{}", ex.extent_id), rkyv_encode(orig).to_vec())
+                                    (format!("extents/{}", ex.extent_id), crate::persist::encode(orig))
                                 })
                             })
                             .collect()
@@ -3892,15 +3897,15 @@ impl AutumnManager {
         // Phase 1: compute under borrow_mut, NO awaits inside.
         // Returns alloc-IDs reserved + selected nodes for Phase 1.5.
         struct Phase1Result {
-            new_streams: Vec<MgrStreamInfo>,
-            modified_extents: Vec<MgrExtentInfo>,
-            survivor_meta: MgrPartitionMeta,
+            new_streams: Vec<StreamRecord>,
+            modified_extents: Vec<ExtentRecord>,
+            survivor_meta: PartitionRecord,
             victim_part_id: u64,
             victim_log: u64,
             victim_row: u64,
             victim_meta: u64,
             new_tail_id: u64,
-            selected_nodes: Vec<MgrNodeInfo>,
+            selected_nodes: Vec<NodeRecord>,
             new_tail_replicas: u32,
             pre_bump_eversion: HashMap<u64, u64>,
             // Item 3 (uniform CAS): value-CAS baseline for each survivor stream
@@ -4016,7 +4021,7 @@ impl AutumnManager {
                     target_replicas,
                     &[],
                 )?;
-                let new_tail = MgrExtentInfo {
+                let new_tail = ExtentRecord {
                     extent_id: new_tail_id,
                     replicates: selected.iter().map(|n| n.node_id).collect(),
                     parity: vec![],
@@ -4067,7 +4072,7 @@ impl AutumnManager {
                 .filter_map(|sid| {
                     s.streams
                         .get(&sid)
-                        .map(|st| (format!("streams/{sid}"), rkyv_encode(st).to_vec()))
+                        .map(|st| (format!("streams/{sid}"), crate::persist::encode(st)))
                 })
                 .collect();
 
@@ -4086,13 +4091,13 @@ impl AutumnManager {
                     .iter()
                     .filter_map(|ex| {
                         s.extents.get(&ex.extent_id).map(|orig| {
-                            (format!("extents/{}", ex.extent_id), rkyv_encode(orig).to_vec())
+                            (format!("extents/{}", ex.extent_id), crate::persist::encode(orig))
                         })
                     })
                     .collect();
 
                 let mut new_survivor_meta = survivor_meta.clone();
-                new_survivor_meta.rg = Some(MgrRange {
+                new_survivor_meta.rg = Some(crate::persist::records::RangeRecord {
                     start_key: s_rg.start_key,
                     end_key: v_rg.end_key,
                 });
@@ -4130,7 +4135,7 @@ impl AutumnManager {
         // On per-node failure, fall back to other healthy nodes (mirrors
         // handle_stream_alloc_extent's fallback walk).
         let p1_selected_ids: HashSet<u64> = p1.selected_nodes.iter().map(|n| n.node_id).collect();
-        let mut fallback_nodes: Vec<MgrNodeInfo> = {
+        let mut fallback_nodes: Vec<NodeRecord> = {
             let s = self.store.inner.borrow();
             s.nodes
                 .values()
@@ -4194,25 +4199,25 @@ impl AutumnManager {
             for st in &p1.new_streams {
                 kvs.push((
                     format!("streams/{}", st.stream_id),
-                    rkyv_encode(st).to_vec(),
+                    crate::persist::encode(st),
                 ));
             }
             for ex in &modified_extents {
                 kvs.push((
                     format!("extents/{}", ex.extent_id),
-                    rkyv_encode(ex).to_vec(),
+                    crate::persist::encode(ex),
                 ));
             }
             kvs.push((
                 format!("partitions/{}", p1.survivor_meta.part_id),
-                rkyv_encode(&p1.survivor_meta).to_vec(),
+                crate::persist::encode(&p1.survivor_meta),
             ));
             {
                 let s = self.store.inner.borrow();
                 let region = Self::compute_region_for_partition(&s, &p1.survivor_meta);
                 kvs.push((
                     format!("regions/{}", p1.survivor_meta.part_id),
-                    rkyv_encode(&region).to_vec(),
+                    crate::persist::encode(&region),
                 ));
             }
             kvs.push((
@@ -5738,7 +5743,7 @@ impl AutumnManager {
                 meta.part_id = id;
             }
             let pid = meta.part_id;
-            s.partitions.insert(pid, meta);
+            s.partitions.insert(pid, (&meta).into());
             Self::rebalance_regions(&mut s);
             pid
         };
@@ -5780,7 +5785,8 @@ impl AutumnManager {
             }));
         }
         let s = self.store.inner.borrow();
-        let regions = s.regions.iter().map(|(&id, r)| (id, r.clone())).collect();
+        // The routing table crosses to the wire here.
+        let regions = s.regions.iter().map(|(&id, r)| (id, r.into())).collect();
         let ps_details = s
             .ps_nodes
             .iter()
@@ -6126,7 +6132,7 @@ impl AutumnManager {
         let filter: HashSet<u64> = req.node_id_filter.iter().copied().collect();
         let (extents, overrides, snapshot) = {
             let s = self.store.inner.borrow();
-            let extents: Vec<MgrExtentInfo> = s.extents.values().cloned().collect();
+            let extents: Vec<ExtentRecord> = s.extents.values().cloned().collect();
             let overrides = self.node_overrides.borrow().clone();
             let snap = self.node_states.borrow().snapshot();
             (extents, overrides, snap)
@@ -7356,6 +7362,9 @@ mod selfheal_a5_tests {
     //! log_stream replica. Borrows then awaits; every borrow is dropped before
     //! the await (single-threaded test runtime).
     #![allow(clippy::await_holding_refcell_ref)]
+    use crate::persist::records::ExtentRecord;
+    use crate::persist::records::PartitionRecord;
+    use crate::persist::records::StreamRecord;
     use crate::AutumnManager;
     use autumn_rpc::manager_rpc::*;
     use bytes::Bytes;
@@ -7375,7 +7384,7 @@ mod selfheal_a5_tests {
             .insert(format!("partition/{part_id}"), owner_epoch);
         s.partitions.insert(
             part_id,
-            MgrPartitionMeta {
+            PartitionRecord {
                 part_id,
                 log_stream: LOG_STREAM_ID,
                 row_stream: 0,
@@ -7385,7 +7394,7 @@ mod selfheal_a5_tests {
         );
         s.streams.insert(
             LOG_STREAM_ID,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: LOG_STREAM_ID,
                 extent_ids: vec![extent_id],
                 ec_data_shard: 0,
@@ -7395,7 +7404,7 @@ mod selfheal_a5_tests {
         );
         s.extents.insert(
             extent_id,
-            MgrExtentInfo {
+            ExtentRecord {
                 extent_id,
                 replicates: vec![1, 3, 5],
                 parity: vec![],
@@ -8198,12 +8207,12 @@ mod namespace_registry_tests {
         let mut s = m.store.inner.borrow_mut();
         s.partitions.insert(
             id,
-            autumn_rpc::manager_rpc::MgrPartitionMeta {
+            crate::persist::records::PartitionRecord {
                 part_id: id,
                 log_stream: 0,
                 row_stream: 0,
                 meta_stream: 0,
-                rg: Some(autumn_rpc::manager_rpc::MgrRange {
+                rg: Some(crate::persist::records::RangeRecord {
                     start_key: start.to_vec(),
                     end_key: end.to_vec(),
                 }),
@@ -8487,10 +8496,10 @@ mod cluster_df_disk_tests {
     //! rows — an unreachable machine is one fact, not N missing disks).
     use crate::{AutumnManager, NodeCap};
     use autumn_rpc::extent_rpc::DiskStatus;
-    use autumn_rpc::manager_rpc::MgrNodeInfo;
+    use crate::persist::records::NodeRecord;
 
-    fn node(id: u64, disks: &[u64]) -> MgrNodeInfo {
-        MgrNodeInfo {
+    fn node(id: u64, disks: &[u64]) -> NodeRecord {
+        NodeRecord {
             node_id: id,
             address: format!("127.0.0.1:{}", 9100 + id),
             disks: disks.to_vec(),
@@ -8504,7 +8513,7 @@ mod cluster_df_disk_tests {
         DiskStatus { total, free, online: true, extent_bytes: 0 }
     }
 
-    fn mgr_with(nodes: &[MgrNodeInfo], disk_ids: &[u64]) -> AutumnManager {
+    fn mgr_with(nodes: &[NodeRecord], disk_ids: &[u64]) -> AutumnManager {
         let m = AutumnManager::new();
         m.leader.set(true);
         {

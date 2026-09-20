@@ -187,8 +187,11 @@ fn the_sweep_reclaims_a_tail_the_dead_writer_never_punched() {
             .await
             .expect("etcd get stream");
         let kv = raw_stream.kvs.first().expect("stream record in etcd");
-        let persisted: MgrStreamInfo = rkyv_decode(&bytes::Bytes::from(kv.value.clone()))
-            .expect("decode the persisted stream");
+        // The persisted value carries the manager's record envelope; see
+        // `support::decode_persisted_record`, which is also what keeps the
+        // chaos harness honest about these keys.
+        let persisted =
+            support::decode_persisted_stream(&format!("streams/{stream_id}"), &kv.value);
         assert!(
             !persisted.extent_ids.contains(&empty_tail),
             "etcd's membership still lists the swept extent: {:?}",

@@ -692,9 +692,8 @@ impl AutumnManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use autumn_rpc::manager_rpc::{
-        MgrExtentInfo, MgrNodeInfo, MgrNodeOverride, NODE_OVERRIDE_FENCED,
-    };
+    use crate::persist::records::{ExtentRecord, NodeRecord};
+    use autumn_rpc::manager_rpc::{MgrNodeOverride, NODE_OVERRIDE_FENCED};
 
     fn ec_payload(extent_id: u64) -> ExtentOpPayload {
         ExtentOpPayload::ConvertToEc(MgrEcDispatchInflight {
@@ -963,7 +962,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.nodes.insert(
                     9,
-                    autumn_rpc::manager_rpc::MgrNodeInfo {
+                    crate::persist::records::NodeRecord {
                         node_id: 9,
                         address: "127.0.0.1:9109".to_string(),
                         disks: vec![90],
@@ -990,7 +989,7 @@ mod tests {
             let m = AutumnManager::new();
             m.store.inner.borrow_mut().nodes.insert(
                 1,
-                MgrNodeInfo {
+                NodeRecord {
                     node_id: 1,
                     address: "127.0.0.1:9101".into(),
                     disks: vec![10],
@@ -1014,7 +1013,7 @@ mod tests {
             );
             m.store.inner.borrow_mut().extents.insert(
                 20,
-                MgrExtentInfo {
+                ExtentRecord {
                     extent_id: 20,
                     sealed: true,
                     replicates: vec![1],
@@ -1152,7 +1151,7 @@ mod tests {
             let m = AutumnManager::new();
             m.store.inner.borrow_mut().nodes.insert(
                 1,
-                MgrNodeInfo {
+                NodeRecord {
                     node_id: 1,
                     address: "127.0.0.1:9101".into(),
                     disks: vec![10],
@@ -1176,7 +1175,7 @@ mod tests {
             );
             m.store.inner.borrow_mut().extents.insert(
                 20,
-                MgrExtentInfo {
+                ExtentRecord {
                     extent_id: 20,
                     sealed: true,
                     replicates: vec![1],
@@ -1219,7 +1218,7 @@ mod tests {
             let m = AutumnManager::new();
             m.store.inner.borrow_mut().nodes.insert(
                 1,
-                MgrNodeInfo {
+                NodeRecord {
                     node_id: 1,
                     address: "127.0.0.1:9101".into(),
                     disks: vec![10],
@@ -1234,7 +1233,7 @@ mod tests {
             // is refused and the marker stays — which is the point.
             m.store.inner.borrow_mut().nodes.insert(
                 9,
-                MgrNodeInfo {
+                NodeRecord {
                     node_id: 9,
                     address: "127.0.0.1:9109".into(),
                     disks: vec![90],
@@ -1259,7 +1258,7 @@ mod tests {
             );
             m.store.inner.borrow_mut().extents.insert(
                 20,
-                MgrExtentInfo {
+                ExtentRecord {
                     extent_id: 20,
                     sealed: true,
                     sealed_length: 4096,

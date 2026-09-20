@@ -212,10 +212,12 @@ this conversion is a pure prefix insertion. That property is specific to THIS
 conversion; a later one that changes a record's fields has to vendor the old
 definition itself, because by then the tree only has the new one.
 
-Covers `mgr_audit_log/`, `tenantAccount/` and `namespace/` — the three records
-split so far. The six still living in the wire schema (extents, streams, nodes,
-disks, partitions, regions) must stay bare; adding one here before it is split
-would make the manager unable to read it.
+Covers all nine split records: `mgr_audit_log/`, `tenantAccount/`, `namespace/`,
+`extents/`, `streams/`, `nodes/`, `disks/`, `partitions/`, `regions/`. Every
+OTHER persisted key must stay bare (`opLog/`, `extent_inflight/`,
+`extentDeleteRetry/`, `node_override/`, `decommissioned/`, `inode_leases/`,
+`autoPolicy/*`, `extentLayout/`, `extentCorrupt/`, …); wrapping one without
+teaching the manager about it would make that key unreadable.
 
 Idempotent: a value already carrying `[AUMG][type][version]` is skipped, so an
 interrupted run is re-run. The summary line is the free check — on a first pass

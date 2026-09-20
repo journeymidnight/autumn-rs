@@ -8,6 +8,9 @@ use autumn_rpc::extent_rpc::PayloadLocation;
 use autumn_rpc::manager_rpc::*;
 
 use crate::{AutumnManager, PendingDelete};
+use crate::persist::records::NodeRecord;
+use crate::persist::records::StreamRecord;
+use crate::persist::records::ExtentRecord;
 
 /// The coordinator pinned by an EC dispatch marker: shard index 0 drives the
 /// conversion, so `target_nodes[0]` is the ONLY node whose completion report may
@@ -135,8 +138,8 @@ pub(crate) fn dispatch_owner_epoch_for_extent(
 /// owner_epoch) to reuse verbatim. Built by `collect_ec_dispatch_candidates`,
 /// consumed by `dispatch_one_ec_conversion`.
 struct EcDispatchCandidate {
-    ex: MgrExtentInfo,
-    stream: MgrStreamInfo,
+    ex: ExtentRecord,
+    stream: StreamRecord,
     params: MgrEcDispatchInflight,
 }
 
@@ -550,7 +553,7 @@ impl AutumnManager {
     fn recovery_candidate_order(
         &self,
         extent_id: u64,
-    ) -> Result<(MgrExtentInfo, Vec<MgrNodeInfo>), AppError> {
+    ) -> Result<(ExtentRecord, Vec<NodeRecord>), AppError> {
         // Both read RefCells disjoint from the store; taken before its borrow.
         let hard_excluded = self.placement_excluded_node_ids();
         let placement_load = self.placement_load();
@@ -573,7 +576,7 @@ impl AutumnManager {
                 .collect::<Vec<_>>();
             (extent, all)
         };
-        let mut by_id: std::collections::HashMap<u64, MgrNodeInfo> =
+        let mut by_id: std::collections::HashMap<u64, NodeRecord> =
             all.into_iter().map(|n| (n.node_id, n)).collect();
         let ids: Vec<u64> = by_id.keys().copied().collect();
         let ordered = crate::placement::order_by_load(
@@ -1248,7 +1251,7 @@ impl AutumnManager {
             // atomic put + delete txn. Releases the Recovery
             // marker in the same txn that writes the updated extent
             // state. Legacy `recoveryTasks/<id>` delete dropped.
-            let ex_payload = rkyv_encode(&updated_extent).to_vec();
+            let ex_payload = crate::persist::encode(&updated_extent);
             etcd.put_and_delete_txn(
                 vec![(format!("extents/{}", updated_extent.extent_id), ex_payload)],
                 vec![Self::extent_inflight_key(updated_extent.extent_id)],
@@ -1406,7 +1409,7 @@ impl AutumnManager {
             // `dispatch_recovery_task`'s own refuse-at-start (which
             // collapses those into the same probe).
             let inflight = self.inflight.borrow();
-            let extents: Vec<MgrExtentInfo> = s
+            let extents: Vec<ExtentRecord> = s
                 .extents
                 .values()
                 .filter(|ex| {
@@ -2359,7 +2362,7 @@ impl crate::AutumnManager {
     /// successful `df` poll.
     pub(crate) fn mark_node_disks_offline(
         store: &crate::store::MetadataStore,
-        node: &autumn_rpc::manager_rpc::MgrNodeInfo,
+        node: &crate::persist::records::NodeRecord,
     ) {
         if node.disks.is_empty() {
             return;
@@ -2507,7 +2510,7 @@ impl crate::AutumnManager {
     }
 
     /// helper: counterpart to `mark_node_disks_offline`. Flip
-    /// `online=true` on a successful df. Keys on `MgrNodeInfo.disks`
+    /// `online=true` on a successful df. Keys on `NodeRecord.disks`
     /// (manager-allocated disk_ids) instead of the response payload's
     /// extent-node-local disk_ids, which historically failed to map.
     /// Apply what a successful `df` said about each of the node's disks.
@@ -2525,7 +2528,7 @@ impl crate::AutumnManager {
     /// nothing is known about any individual disk.
     fn apply_df_disk_health(
         &self,
-        node: &autumn_rpc::manager_rpc::MgrNodeInfo,
+        node: &crate::persist::records::NodeRecord,
         reported: &[(u64, autumn_rpc::extent_rpc::DiskStatus)],
     ) {
         if node.disks.is_empty() {
@@ -3239,7 +3242,7 @@ impl crate::AutumnManager {
                 .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
             // The snapshot this decision is computed from — the flip is CAS'd
             // against it below.
-            let baseline = rkyv_encode(ex).to_vec();
+            let baseline = crate::persist::encode(ex);
 
             let mut all_disks = ex.replicate_disks.clone();
             all_disks.extend_from_slice(&extra_disk_ids);
@@ -3271,7 +3274,7 @@ impl crate::AutumnManager {
             let puts = vec![
                 (
                     format!("extents/{}", extent_id),
-                    rkyv_encode(&updated).to_vec(),
+                    crate::persist::encode(&updated),
                 ),
                 (
                     crate::extent_layout::extent_layout_key(extent_id),
@@ -3568,14 +3571,14 @@ mod ec_apply_fail_tests {
     //! deterministic model of "apply failed while this manager stays leader".
     use crate::extent_inflight::ExtentOpKind;
     use crate::AutumnManager;
-    use autumn_rpc::manager_rpc::MgrExtentInfo;
+    use crate::persist::records::ExtentRecord;
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         compio::runtime::Runtime::new().unwrap().block_on(f)
     }
 
-    fn pre_ec_extent(extent_id: u64) -> MgrExtentInfo {
-        MgrExtentInfo {
+    fn pre_ec_extent(extent_id: u64) -> ExtentRecord {
+        ExtentRecord {
             extent_id,
             replicates: vec![1, 3, 5],
             parity: vec![],
@@ -3659,7 +3662,8 @@ mod ec_apply_fail_tests {
 mod ec_dispatch_owner_epoch_tests {
     use super::dispatch_owner_epoch_for_extent;
     use crate::store::MetadataState;
-    use autumn_rpc::manager_rpc::{MgrPartitionMeta, MgrStreamInfo};
+    use crate::persist::records::StreamRecord;
+    use crate::persist::records::PartitionRecord;
 
     const EXTENT: u64 = 12;
     const PART: u64 = 9001;
@@ -3670,7 +3674,7 @@ mod ec_dispatch_owner_epoch_tests {
         let mut s = MetadataState::default();
         s.streams.insert(
             1,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 1,
                 extent_ids: vec![7, EXTENT],
                 ..Default::default()
@@ -3678,7 +3682,7 @@ mod ec_dispatch_owner_epoch_tests {
         );
         s.partitions.insert(
             PART,
-            MgrPartitionMeta {
+            PartitionRecord {
                 part_id: PART,
                 log_stream: 1,
                 row_stream: 2,
@@ -3711,7 +3715,7 @@ mod ec_dispatch_owner_epoch_tests {
         const CHILD: u64 = 9002;
         s.streams.insert(
             4,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 4,
                 extent_ids: vec![EXTENT],
                 ..Default::default()
@@ -3719,7 +3723,7 @@ mod ec_dispatch_owner_epoch_tests {
         );
         s.partitions.insert(
             CHILD,
-            MgrPartitionMeta {
+            PartitionRecord {
                 part_id: CHILD,
                 log_stream: 4,
                 row_stream: 5,
@@ -3840,7 +3844,7 @@ mod corrupt_ec_handoff_tests {
             new_eversion: 2,
             ..Default::default()
         };
-        let ex = MgrExtentInfo {
+        let ex = ExtentRecord {
             extent_id: 42,
             sealed: true,
             sealed_length: 4096,
@@ -3870,7 +3874,7 @@ mod corrupt_ec_handoff_tests {
         m.dispatch_one_ec_conversion(
             EcDispatchCandidate {
                 ex,
-                stream: MgrStreamInfo {
+                stream: StreamRecord {
                     ec_data_shard: 2,
                     ec_parity_shard: 1,
                     ..Default::default()
@@ -3934,7 +3938,7 @@ mod corrupt_ec_handoff_tests {
         // Nothing has noticed the rot yet: every slot is available and no slot
         // carries a corrupt mark. This is the state the EC pre-check finds when
         // it is the FIRST reader to reach those bytes.
-        let ex = MgrExtentInfo {
+        let ex = ExtentRecord {
             extent_id: 42,
             sealed: true,
             sealed_length: 4096,
@@ -3951,7 +3955,7 @@ mod corrupt_ec_handoff_tests {
         m.dispatch_one_ec_conversion(
             EcDispatchCandidate {
                 ex,
-                stream: MgrStreamInfo {
+                stream: StreamRecord {
                     ec_data_shard: 2,
                     ec_parity_shard: 1,
                     ..Default::default()
@@ -3988,7 +3992,8 @@ mod recovery_placement_tests {
     use super::*;
     use crate::placement::NodeLoad;
     use crate::NodeCap;
-    use autumn_rpc::manager_rpc::{MgrExtentInfo, MgrNodeInfo};
+    use crate::persist::records::ExtentRecord;
+    use crate::persist::records::NodeRecord;
 
     const LOADED: [u64; 3] = [1, 3, 5];
     const EMPTY: [u64; 4] = [102, 104, 106, 108];
@@ -4004,7 +4009,7 @@ mod recovery_placement_tests {
             for nid in LOADED.iter().chain(EMPTY.iter()).chain([DYING].iter()) {
                 s.nodes.insert(
                     *nid,
-                    MgrNodeInfo {
+                    NodeRecord {
                         node_id: *nid,
                         address: format!("127.0.0.1:{}", 9000 + nid),
                         disks: vec![*nid],
@@ -4016,7 +4021,7 @@ mod recovery_placement_tests {
             }
             s.extents.insert(
                 7,
-                MgrExtentInfo {
+                ExtentRecord {
                     extent_id: 7,
                     replicates: vec![DYING],
                     eversion: 1,
@@ -4340,9 +4345,9 @@ mod slot_verdict_tests {
 mod df_disk_health_tests {
     use super::*;
     use autumn_rpc::extent_rpc::DiskStatus;
-    use autumn_rpc::manager_rpc::MgrNodeInfo;
+    use crate::persist::records::NodeRecord;
 
-    fn node_with_two_disks(store: &crate::store::MetadataStore) -> MgrNodeInfo {
+    fn node_with_two_disks(store: &crate::store::MetadataStore) -> NodeRecord {
         let mut s = store.inner.borrow_mut();
         for did in [10u64, 11] {
             s.disks.insert(
@@ -4354,7 +4359,7 @@ mod df_disk_health_tests {
                 },
             );
         }
-        MgrNodeInfo {
+        NodeRecord {
             node_id: 1,
             address: "127.0.0.1:9101".into(),
             disks: vec![10, 11],

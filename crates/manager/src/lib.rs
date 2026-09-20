@@ -84,6 +84,11 @@ use autumn_rpc::{Frame, FrameDecoder, StatusCode};
 use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::BufResult;
+use crate::persist::records::NodeRecord;
+use crate::persist::records::StreamRecord;
+use crate::persist::records::PartitionRecord;
+use crate::persist::records::RegionRecord;
+use crate::persist::records::ExtentRecord;
 
 // ── EtcdMirror ─────────────────────────────────────────────────────────────
 
@@ -3225,38 +3230,13 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         )
     }
 
-    /// Replay helper: decode every `prefix/<id>` kv into a
-    /// `HashMap<u64, T>`, folding each parsed id into `max_id`.
-    /// Centralizes the parse-id → checked-rkyv-decode → max-id → insert
-    /// loop that `replay_from_etcd` runs identically for nodes / disks /
-    /// streams / extents / partitions. The fail-loud
-    /// `replay_decode_err` mapping (note 39 / upgrade safety: a
-    /// layout-mismatched persisted value must refuse leadership, never
-    /// decode to garbage) now lives in this single site.
-    fn replay_decode_id_map<T>(
-        kvs: &[autumn_etcd::proto::KeyValue],
-        prefix: &str,
-        max_id: &mut u64,
-    ) -> Result<HashMap<u64, T>>
-    where
-        T: rkyv::Archive,
-        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-            + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
-    {
-        let mut out = HashMap::new();
-        for kv in kvs {
-            let id = Self::parse_id_from_key(prefix, &kv.key)?;
-            let v: T = rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
-            *max_id = (*max_id).max(id);
-            out.insert(id, v);
-        }
-        Ok(out)
-    }
-
-    /// `replay_decode_id_map`'s twin for a PERSISTED record: the value is read
-    /// through `persist::decode`, which VERIFIES the envelope (magic, record
-    /// type, format version) before touching the body. Every failure refuses
+    /// The replay loop every persisted id-keyed prefix runs: parse the id, then
+    /// `persist::decode`, which VERIFIES the envelope (magic, record type,
+    /// format version) before touching the body. Every failure refuses
     /// leadership, which is the whole contract — see `persist/mod.rs`.
+    ///
+    /// Its bare-rkyv predecessor `replay_decode_id_map` is DELETED along with
+    /// the last reader that wanted one.
     fn replay_decode_persist_id_map<T>(
         kvs: &[autumn_etcd::proto::KeyValue],
         prefix: &str,
@@ -3282,7 +3262,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// keyed by node id) into `out`: clear, then per key parse the id (fail-loud
     /// via `?`) and rkyv-decode the value — a malformed payload is SKIPPED with a
     /// WARN (these are per-node localizable, so a bad one is dropped, not fatal —
-    /// unlike core metadata, which fails loud via `replay_decode_id_map`).
+    /// unlike core metadata, which fails loud via
+    /// `replay_decode_persist_id_map`).
     /// `label` names the prefix in the skip warning. Shared by `node_override/`
     /// and `decommissioned/`.
     fn replay_node_override_map(
@@ -3375,14 +3356,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         drop(c);
 
         let mut max_id = 0u64;
-        let decoded_nodes: HashMap<u64, MgrNodeInfo> =
-            Self::replay_decode_id_map(&nodes.kvs, "nodes/", &mut max_id)?;
+        let decoded_nodes: HashMap<u64, NodeRecord> =
+            Self::replay_decode_persist_id_map(&nodes.kvs, "nodes/", &mut max_id)?;
         let decoded_disks: HashMap<u64, crate::persist::records::DiskRecord> =
             Self::replay_decode_persist_id_map(&disks.kvs, "disks/", &mut max_id)?;
-        let decoded_streams: HashMap<u64, MgrStreamInfo> =
-            Self::replay_decode_id_map(&streams.kvs, "streams/", &mut max_id)?;
-        let decoded_extents: HashMap<u64, MgrExtentInfo> =
-            Self::replay_decode_id_map(&extents.kvs, "extents/", &mut max_id)?;
+        let decoded_streams: HashMap<u64, StreamRecord> =
+            Self::replay_decode_persist_id_map(&streams.kvs, "streams/", &mut max_id)?;
+        let decoded_extents: HashMap<u64, ExtentRecord> =
+            Self::replay_decode_persist_id_map(&extents.kvs, "extents/", &mut max_id)?;
 
         let mut decoded_owner_revs = HashMap::new();
         let mut max_revision = 0i64;
@@ -3401,8 +3382,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             decoded_owner_revs.insert(owner_key, rev);
         }
 
-        let decoded_partitions: HashMap<u64, MgrPartitionMeta> =
-            Self::replay_decode_id_map(&partitions.kvs, "partitions/", &mut max_id)?;
+        let decoded_partitions: HashMap<u64, PartitionRecord> =
+            Self::replay_decode_persist_id_map(&partitions.kvs, "partitions/", &mut max_id)?;
 
         let mut decoded_ps_nodes = HashMap::new();
         for kv in &ps_nodes.kvs {
@@ -3414,8 +3395,11 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let mut decoded_regions = BTreeMap::new();
         for kv in &regions.kvs {
             let id = Self::parse_id_from_key("regions/", &kv.key)?;
-            let region: MgrRegionInfo =
-                rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
+            let region: RegionRecord = crate::persist::decode(
+                &String::from_utf8_lossy(&kv.key),
+                &kv.value,
+            )
+            .map_err(Self::replay_decode_err)?;
             decoded_regions.insert(id, region);
         }
 
@@ -3878,7 +3862,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// allocation fails loudly (the caller's per-RPC fallback / client retry
     /// surfaces it) rather than placing data we'd immediately migrate off.
     fn select_nodes(
-        nodes: &HashMap<u64, MgrNodeInfo>,
+        nodes: &HashMap<u64, NodeRecord>,
         disks: &HashMap<u64, crate::persist::records::DiskRecord>,
         online_node_ids: &HashSet<u64>,
         space_low_node_ids: &HashSet<u64>,
@@ -3886,11 +3870,11 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         load: &HashMap<u64, crate::placement::NodeLoad>,
         count: usize,
         exclude_node_ids: &[u64],
-    ) -> Result<Vec<MgrNodeInfo>, AppError> {
+    ) -> Result<Vec<NodeRecord>, AppError> {
         // Hard-exclude up front so the count precheck AND the degraded
         // `pool = all` fallback both inherit it (all downstream pools derive
         // from `all_unfiltered`).
-        let all_unfiltered: Vec<MgrNodeInfo> = nodes
+        let all_unfiltered: Vec<NodeRecord> = nodes
             .values()
             .filter(|n| !hard_excluded.contains(&n.node_id))
             .cloned()
@@ -3903,7 +3887,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             )));
         }
         let exclude_set: HashSet<u64> = exclude_node_ids.iter().copied().collect();
-        let after_exclude: Vec<MgrNodeInfo> = all_unfiltered
+        let after_exclude: Vec<NodeRecord> = all_unfiltered
             .iter()
             .filter(|n| !exclude_set.contains(&n.node_id))
             .cloned()
@@ -3919,7 +3903,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         // have at least one online disk. The two filters layer naturally
         // — the state filter is the new gate, the disk filter is the
         // existing post-df health signal.
-        let healthy: Vec<MgrNodeInfo> = all
+        let healthy: Vec<NodeRecord> = all
             .iter()
             .filter(|n| online_node_ids.contains(&n.node_id))
             .filter(|n| {
@@ -3937,7 +3921,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         // healthy set — a capacity-crunched cluster should still attempt
         // allocation (the EN-side Full gate fails fast and the per-RPC
         // fallback walk takes over) rather than refuse outright.
-        let spacious: Vec<MgrNodeInfo> = healthy
+        let spacious: Vec<NodeRecord> = healthy
             .iter()
             .filter(|n| !space_low_node_ids.contains(&n.node_id))
             .cloned()
@@ -3961,7 +3945,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// Score `pool` and keep the `count` least loaded, as node records.
     ///
     /// The scoring itself is in `placement`, which never sees an
-    /// `MgrNodeInfo` — it decides between node IDS and load, and that is all it
+    /// `NodeRecord` — it decides between node IDS and load, and that is all it
     /// should need to know. This is the seam that maps back.
     ///
     /// The result is SHUFFLED before returning, on purpose. `replicates[0]` is
@@ -3973,15 +3957,15 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// that is only supposed to decide WHICH nodes hold the extent. Slot order
     /// stays random, exactly as the shuffle left it.
     fn take_least_loaded(
-        pool: Vec<MgrNodeInfo>,
+        pool: Vec<NodeRecord>,
         load: &HashMap<u64, crate::placement::NodeLoad>,
         count: usize,
         rng: &mut impl rand::Rng,
-    ) -> Vec<MgrNodeInfo> {
-        let mut by_id: HashMap<u64, MgrNodeInfo> =
+    ) -> Vec<NodeRecord> {
+        let mut by_id: HashMap<u64, NodeRecord> =
             pool.into_iter().map(|n| (n.node_id, n)).collect();
         let ids: Vec<u64> = by_id.keys().copied().collect();
-        let mut chosen: Vec<MgrNodeInfo> =
+        let mut chosen: Vec<NodeRecord> =
             crate::placement::pick_least_loaded(crate::placement::pool_for(ids, load), count, rng)
                 .into_iter()
                 .filter_map(|id| by_id.remove(&id))
@@ -4283,7 +4267,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     fn next_region_epoch(
         state: &crate::store::MetadataState,
         part_id: u64,
-        new_rg: &Option<MgrRange>,
+        new_rg: &Option<crate::persist::records::RangeRecord>,
     ) -> u64 {
         match state.regions.get(&part_id) {
             Some(r) if r.rg == *new_rg => r.region_epoch.max(1),
@@ -4353,7 +4337,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             let region_epoch = Self::next_region_epoch(state, part_id, &meta.rg);
             state.regions.insert(
                 part_id,
-                MgrRegionInfo {
+                RegionRecord {
                     rg: meta.rg.clone(),
                     part_id,
                     ps_id,
@@ -4443,8 +4427,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     fn compute_region_for_partition(
         state: &crate::store::MetadataState,
-        part: &MgrPartitionMeta,
-    ) -> MgrRegionInfo {
+        part: &PartitionRecord,
+    ) -> RegionRecord {
         let ps_id = state
             .regions
             .get(&part.part_id)
@@ -4464,7 +4448,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             })
             .unwrap_or(0);
         let region_epoch = Self::next_region_epoch(state, part.part_id, &part.rg);
-        MgrRegionInfo {
+        RegionRecord {
             rg: part.rg.clone(),
             part_id: part.part_id,
             ps_id,
@@ -4482,14 +4466,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         src_stream_id: u64,
         dst_stream_id: u64,
         sealed_length: u64,
-    ) -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>), AppError> {
+    ) -> Result<(StreamRecord, Vec<ExtentRecord>), AppError> {
         let src = state
             .streams
             .get(&src_stream_id)
             .cloned()
             .ok_or_else(|| AppError::NotFound(format!("stream {src_stream_id}")))?;
 
-        let mut dst = MgrStreamInfo {
+        let mut dst = StreamRecord {
             stream_id: dst_stream_id,
             extent_ids: vec![],
             ec_data_shard: src.ec_data_shard,
@@ -4547,7 +4531,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     ///   - victim's old tail (last victim extent) sealed at `victim_sealed`
     ///     if it was open
     ///   - new_tail is appended as-is (caller has already built its
-    ///     MgrExtentInfo via select_nodes + alloc_extent_on_node)
+    ///     ExtentRecord via select_nodes + alloc_extent_on_node)
     ///
     /// Caller (handle_multi_modify_merge) is responsible for the
     /// inflight checks before calling this.
@@ -4560,9 +4544,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// `compute_merge_streams` + `splice_streams_without_new_tail`.
     fn seal_survivor_old_tail(
         state: &crate::store::MetadataState,
-        survivor: &MgrStreamInfo,
+        survivor: &StreamRecord,
         survivor_sealed: u64,
-        modified_extents: &mut Vec<MgrExtentInfo>,
+        modified_extents: &mut Vec<ExtentRecord>,
     ) -> Result<(), AppError> {
         if let Some(&tail_id) = survivor.extent_ids.last() {
             let extent = state
@@ -4608,9 +4592,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     fn splice_victim_extents(
         state: &crate::store::MetadataState,
         survivor_set: &HashSet<u64>,
-        victim: &MgrStreamInfo,
+        victim: &StreamRecord,
         victim_sealed: u64,
-        modified_extents: &mut Vec<MgrExtentInfo>,
+        modified_extents: &mut Vec<ExtentRecord>,
     ) -> Result<(), AppError> {
         for (idx, &eid) in victim.extent_ids.iter().enumerate() {
             let extent = state
@@ -4638,8 +4622,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         victim_stream_id: u64,
         survivor_sealed: u64,
         victim_sealed: u64,
-        new_tail: MgrExtentInfo,
-    ) -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>), AppError> {
+        new_tail: ExtentRecord,
+    ) -> Result<(StreamRecord, Vec<ExtentRecord>), AppError> {
         let survivor = state
             .streams
             .get(&survivor_stream_id)
@@ -4677,7 +4661,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         );
         new_extent_ids.push(new_tail.extent_id);
 
-        let updated = MgrStreamInfo {
+        let updated = StreamRecord {
             stream_id: survivor.stream_id,
             extent_ids: new_extent_ids,
             ec_data_shard: survivor.ec_data_shard,
@@ -4700,7 +4684,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         victim_stream_id: u64,
         survivor_sealed: u64,
         victim_sealed: u64,
-    ) -> Result<(MgrStreamInfo, Vec<MgrExtentInfo>), AppError> {
+    ) -> Result<(StreamRecord, Vec<ExtentRecord>), AppError> {
         let survivor = state
             .streams
             .get(&survivor_stream_id)
@@ -4733,7 +4717,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 .filter(|e| !survivor_set.contains(e)),
         );
         Ok((
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: survivor.stream_id,
                 extent_ids: new_extent_ids,
                 ec_data_shard: survivor.ec_data_shard,
@@ -4764,17 +4748,17 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// lets this collapse to `refs == 0`. Until then the guard stays; such
     /// legacy extents are simply not reclaimed (a bounded space leak, never a
     /// loss). See manager/CLAUDE.md "VP lifetime after split".
-    fn extent_can_delete(extent: &MgrExtentInfo) -> bool {
+    fn extent_can_delete(extent: &ExtentRecord) -> bool {
         extent.refs == 0 && extent.vp_table_refs == 0
     }
 
     /// Apply computed split mutations to the in-memory store.
     fn apply_split_mutations(
         state: &mut crate::store::MetadataState,
-        new_streams: &[MgrStreamInfo],
-        modified_extents: &[MgrExtentInfo],
-        left: MgrPartitionMeta,
-        right: MgrPartitionMeta,
+        new_streams: &[StreamRecord],
+        modified_extents: &[ExtentRecord],
+        left: PartitionRecord,
+        right: PartitionRecord,
     ) {
         for ex in modified_extents {
             state.extents.insert(ex.extent_id, ex.clone());
@@ -4794,9 +4778,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     #[allow(clippy::too_many_arguments)]
     fn apply_merge_mutations(
         state: &mut crate::store::MetadataState,
-        survivor_streams: &[MgrStreamInfo],
-        modified_extents: &[MgrExtentInfo],
-        survivor_meta: MgrPartitionMeta,
+        survivor_streams: &[StreamRecord],
+        modified_extents: &[ExtentRecord],
+        survivor_meta: PartitionRecord,
         victim_part_id: u64,
         victim_log_stream: u64,
         victim_row_stream: u64,
@@ -4822,7 +4806,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Self::rebalance_regions(state);
     }
 
-    fn extent_nodes(extent: &MgrExtentInfo) -> Vec<u64> {
+    fn extent_nodes(extent: &ExtentRecord) -> Vec<u64> {
         extent
             .replicates
             .iter()
@@ -4831,7 +4815,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .collect()
     }
 
-    fn extent_slot(extent: &MgrExtentInfo, node_id: u64) -> Option<usize> {
+    fn extent_slot(extent: &ExtentRecord, node_id: u64) -> Option<usize> {
         Self::extent_nodes(extent)
             .iter()
             .position(|id| *id == node_id)
@@ -5004,9 +4988,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     // ── Etcd mirroring ─────────────────────────────────────────────────
 
-    async fn persist_extent(&self, extent: &MgrExtentInfo) -> Result<(), AppError> {
+    async fn persist_extent(&self, extent: &ExtentRecord) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let value = rkyv_encode(extent).to_vec();
+            let value = crate::persist::encode(extent);
             etcd.put_msgs_txn(vec![(format!("extents/{}", extent.extent_id), value)])
                 .await?;
         }
@@ -5062,32 +5046,24 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// field. `crates/manager/tests/apply_done_atomicity.rs` needs to plant a
     /// pre-EC extent before driving `apply_ec_conversion_done`, so this is the
     /// narrow door that keeps it working instead of reopening the whole store.
-    /// It takes the WIRE type deliberately: when extents move to a persisted
-    /// record, this one function converts and the test does not change.
+    /// It takes the WIRE type deliberately, and that paid off: when extents DID
+    /// move to a persisted record, this one function grew the conversion and
+    /// the integration test did not change at all.
     pub fn _test_seed_extent(&self, extent_id: u64, extent: MgrExtentInfo) {
-        self.store.inner.borrow_mut().extents.insert(extent_id, extent);
+        self.store
+            .inner
+            .borrow_mut()
+            .extents
+            .insert(extent_id, (&extent).into());
     }
 
     // ── Etcd mirror helpers ────────────────────────────────────────────
 
-    /// Build a `("<prefix>/<id>", rkyv_encode(value))` etcd txn entry.
-    /// Centralizes the key-format + rkyv-encode pattern repeated across the
-    /// mirror_* helpers.
-    fn kv_entry<T>(prefix: &str, id: u64, value: &T) -> (String, Vec<u8>)
-    where
-        T: for<'a> rkyv::Serialize<
-            rkyv::api::high::HighSerializer<
-                rkyv::util::AlignedVec,
-                rkyv::ser::allocator::ArenaHandle<'a>,
-                rkyv::rancor::Error,
-            >,
-        >,
-    {
-        (format!("{prefix}/{id}"), rkyv_encode(value).to_vec())
-    }
-
-    /// `kv_entry`'s twin for a PERSISTED record: same key format, but the value
-    /// goes through `persist::encode`, so it carries its envelope.
+    /// Build a `("<prefix>/<id>", persist::encode(record))` etcd txn entry.
+    /// Centralises the key format and the envelope for every persisted record.
+    ///
+    /// Its bare-rkyv predecessor `kv_entry` is DELETED: all nine records carry
+    /// an envelope now, so a writer that skipped it could only be a mistake.
     ///
     /// **Every writer of a persisted record must come through here, including a
     /// CAS BASELINE.** `Cmp::value` compares the stored bytes byte for byte, so
@@ -5112,14 +5088,14 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     async fn mirror_register_node(
         &self,
-        node: &MgrNodeInfo,
+        node: &NodeRecord,
         disks: &[crate::persist::records::DiskRecord],
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             // M0: `node.node_uuid` (the stable identity) rides
-            // inside the persisted `MgrNodeInfo` — no separate index kv.
+            // inside the persisted `NodeRecord` — no separate index kv.
             let mut kvs = Vec::with_capacity(1 + disks.len());
-            kvs.push(Self::kv_entry("nodes", node.node_id, node));
+            kvs.push(Self::persist_kv_entry("nodes", node.node_id, node));
             for disk in disks {
                 kvs.push(Self::persist_kv_entry("disks", disk.disk_id, disk));
             }
@@ -5128,9 +5104,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(())
     }
 
-    async fn mirror_stream_meta_update(&self, stream: &MgrStreamInfo) -> Result<(), AppError> {
+    async fn mirror_stream_meta_update(&self, stream: &StreamRecord) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let kvs = vec![Self::kv_entry("streams", stream.stream_id, stream)];
+            let kvs = vec![Self::persist_kv_entry("streams", stream.stream_id, stream)];
             etcd.put_msgs_txn(kvs).await?;
         }
         Ok(())
@@ -5138,13 +5114,13 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     async fn mirror_create_stream(
         &self,
-        stream: &MgrStreamInfo,
-        extent: &MgrExtentInfo,
+        stream: &StreamRecord,
+        extent: &ExtentRecord,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let kvs = vec![
-                Self::kv_entry("streams", stream.stream_id, stream),
-                Self::kv_entry("extents", extent.extent_id, extent),
+                Self::persist_kv_entry("streams", stream.stream_id, stream),
+                Self::persist_kv_entry("extents", extent.extent_id, extent),
             ];
             etcd.put_msgs_txn(kvs).await?;
         }
@@ -5159,9 +5135,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// durably persisted the tail, so skipping it loses nothing.
     async fn mirror_stream_alloc_extent(
         &self,
-        stream: &MgrStreamInfo,
-        sealed_old: Option<&MgrExtentInfo>,
-        new_extent: &MgrExtentInfo,
+        stream: &StreamRecord,
+        sealed_old: Option<&ExtentRecord>,
+        new_extent: &ExtentRecord,
         // `Some(bytes)` = value-CAS the `streams/<id>` write against the
         // membership baseline the handler read. If a concurrent punch_holes /
         // truncate / another alloc changed the stream during our etcd RTT, the
@@ -5170,11 +5146,11 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         stream_cas: Option<Vec<u8>>,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let mut kvs = vec![Self::kv_entry("streams", stream.stream_id, stream)];
+            let mut kvs = vec![Self::persist_kv_entry("streams", stream.stream_id, stream)];
             if let Some(sealed_old) = sealed_old {
-                kvs.push(Self::kv_entry("extents", sealed_old.extent_id, sealed_old));
+                kvs.push(Self::persist_kv_entry("extents", sealed_old.extent_id, sealed_old));
             }
-            kvs.push(Self::kv_entry("extents", new_extent.extent_id, new_extent));
+            kvs.push(Self::persist_kv_entry("extents", new_extent.extent_id, new_extent));
             let cas: Vec<(String, Vec<u8>)> = stream_cas
                 .map(|v| (format!("streams/{}", stream.stream_id), v))
                 .into_iter()
@@ -5186,8 +5162,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     pub(crate) async fn mirror_stream_extent_mutation(
         &self,
-        stream: &MgrStreamInfo,
-        extent_puts: &[MgrExtentInfo],
+        stream: &StreamRecord,
+        extent_puts: &[ExtentRecord],
         extent_deletes: &[u64],
         // Value-CAS baseline for the `streams/<id>` membership write
         // (see `mirror_stream_alloc_extent`).
@@ -5202,9 +5178,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let mut puts = Vec::with_capacity(1 + extent_puts.len());
-            puts.push(Self::kv_entry("streams", stream.stream_id, stream));
+            puts.push(Self::persist_kv_entry("streams", stream.stream_id, stream));
             for ex in extent_puts {
-                puts.push(Self::kv_entry("extents", ex.extent_id, ex));
+                puts.push(Self::persist_kv_entry("extents", ex.extent_id, ex));
             }
             let deletes = extent_deletes
                 .iter()
@@ -5231,10 +5207,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 kvs.push((format!("psNodes/{ps_id}"), addr.into_bytes()));
             }
             for (part_id, part) in partitions {
-                kvs.push(Self::kv_entry("partitions", part_id, &part));
+                kvs.push(Self::persist_kv_entry("partitions", part_id, &part));
             }
             for (part_id, region) in regions {
-                kvs.push(Self::kv_entry("regions", part_id, &region));
+                kvs.push(Self::persist_kv_entry("regions", part_id, &region));
             }
             etcd.put_msgs_txn(kvs).await?;
         }
@@ -5285,8 +5261,8 @@ mod tests {
         assert!(!namespace_prefix_conflicts(b"anything/", &[]));
     }
 
-    fn test_extent(extent_id: u64, refs: u64, vp_table_refs: u64) -> MgrExtentInfo {
-        MgrExtentInfo {
+    fn test_extent(extent_id: u64, refs: u64, vp_table_refs: u64) -> ExtentRecord {
+        ExtentRecord {
             extent_id,
             replicates: vec![],
             parity: vec![],
@@ -5314,7 +5290,7 @@ mod tests {
         let mut s = m.store.inner.borrow_mut();
         s.nodes.insert(
             node_id,
-            MgrNodeInfo {
+            NodeRecord {
                 node_id,
                 address: format!("127.0.0.1:{}", 9100 + node_id),
                 disks: vec![disk_id],
@@ -5932,7 +5908,7 @@ mod tests {
     #[test]
     fn extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept() {
         let m = AutumnManager::new();
-        let mk = |id: u64, refs: u64, vp: u64| MgrExtentInfo {
+        let mk = |id: u64, refs: u64, vp: u64| ExtentRecord {
             extent_id: id,
             replicates: vec![],
             parity: vec![],
@@ -5956,7 +5932,7 @@ mod tests {
             s.extents.insert(13, mk(13, 0, 0));
             s.streams.insert(
                 500,
-                MgrStreamInfo {
+                StreamRecord {
                     stream_id: 500,
                     extent_ids: vec![13],
                     ec_data_shard: 1,
@@ -6243,12 +6219,12 @@ mod tests {
             assert_eq!(r.code, CODE_OK);
 
             let req = rkyv_encode(&UpsertPartitionReq {
-                meta: MgrPartitionMeta {
+                meta: autumn_rpc::manager_rpc::MgrPartitionMeta {
                     log_stream: 1,
                     row_stream: 2,
                     meta_stream: 3,
                     part_id: 101,
-                    rg: Some(MgrRange {
+                    rg: Some(autumn_rpc::manager_rpc::MgrRange {
                         start_key: b"a".to_vec(),
                         end_key: b"z".to_vec(),
                     }),
@@ -6287,12 +6263,12 @@ mod tests {
                 (4, b"n", b"z"),
             ] {
                 let req = rkyv_encode(&UpsertPartitionReq {
-                    meta: MgrPartitionMeta {
+                    meta: autumn_rpc::manager_rpc::MgrPartitionMeta {
                         log_stream: part_id,
                         row_stream: part_id + 100,
                         meta_stream: part_id + 200,
                         part_id,
-                        rg: Some(MgrRange {
+                        rg: Some(autumn_rpc::manager_rpc::MgrRange {
                             start_key: start.to_vec(),
                             end_key: end.to_vec(),
                         }),
@@ -6332,12 +6308,12 @@ mod tests {
             for (part_id, start, end) in [(101u64, b"a" as &[u8], b"m" as &[u8]), (102, b"m", b"")]
             {
                 let req = rkyv_encode(&UpsertPartitionReq {
-                    meta: MgrPartitionMeta {
+                    meta: autumn_rpc::manager_rpc::MgrPartitionMeta {
                         log_stream: part_id,
                         row_stream: part_id + 100,
                         meta_stream: part_id + 200,
                         part_id,
-                        rg: Some(MgrRange {
+                        rg: Some(autumn_rpc::manager_rpc::MgrRange {
                             start_key: start.to_vec(),
                             end_key: end.to_vec(),
                         }),
@@ -6395,7 +6371,7 @@ mod tests {
     #[test]
     fn compute_merge_streams_extent_ids_order_and_refs() {
         let mut state = crate::store::MetadataState::default();
-        let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
+        let mk = |id: u64, refs: u64, sealed: u64| ExtentRecord {
             extent_id: id,
             replicates: vec![1],
             parity: vec![],
@@ -6413,7 +6389,7 @@ mod tests {
         state.extents.insert(11, mk(11, 1, 0));
         state.streams.insert(
             100,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 100,
                 extent_ids: vec![10, 11],
                 ec_data_shard: 1,
@@ -6425,7 +6401,7 @@ mod tests {
         state.extents.insert(21, mk(21, 1, 0));
         state.streams.insert(
             200,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 200,
                 extent_ids: vec![20, 21],
                 ec_data_shard: 1,
@@ -6471,7 +6447,7 @@ mod tests {
     #[test]
     fn splice_streams_without_new_tail_no_e_new() {
         let mut state = crate::store::MetadataState::default();
-        let mk = |id: u64, refs: u64| MgrExtentInfo {
+        let mk = |id: u64, refs: u64| ExtentRecord {
             extent_id: id,
             replicates: vec![1],
             parity: vec![],
@@ -6489,7 +6465,7 @@ mod tests {
         state.extents.insert(40, mk(40, 1));
         state.streams.insert(
             300,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 300,
                 extent_ids: vec![30],
                 ec_data_shard: 1,
@@ -6499,7 +6475,7 @@ mod tests {
         );
         state.streams.insert(
             400,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 400,
                 extent_ids: vec![40],
                 ec_data_shard: 1,
@@ -6525,7 +6501,7 @@ mod tests {
     #[test]
     fn merge_refs_leak_cow_shared_extent_dedup_and_refs() {
         let mut state = crate::store::MetadataState::default();
-        let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
+        let mk = |id: u64, refs: u64, sealed: u64| ExtentRecord {
             extent_id: id,
             replicates: vec![1],
             parity: vec![],
@@ -6546,7 +6522,7 @@ mod tests {
         state.extents.insert(60, mk(60, 1, 0)); // victim tail (open)
         state.streams.insert(
             100,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 100,
                 extent_ids: vec![10, 50],
                 ec_data_shard: 1,
@@ -6556,7 +6532,7 @@ mod tests {
         );
         state.streams.insert(
             200,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 200,
                 extent_ids: vec![10, 60],
                 ec_data_shard: 1,
@@ -6599,7 +6575,7 @@ mod tests {
     #[test]
     fn merge_refs_leak_splice_cow_shared_extent_dedup_and_refs() {
         let mut state = crate::store::MetadataState::default();
-        let mk = |id: u64, refs: u64| MgrExtentInfo {
+        let mk = |id: u64, refs: u64| ExtentRecord {
             extent_id: id,
             replicates: vec![1],
             parity: vec![],
@@ -6618,7 +6594,7 @@ mod tests {
         state.extents.insert(41, mk(41, 1)); // victim-only tail
         state.streams.insert(
             300,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 300,
                 extent_ids: vec![30, 31],
                 ec_data_shard: 1,
@@ -6628,7 +6604,7 @@ mod tests {
         );
         state.streams.insert(
             400,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 400,
                 extent_ids: vec![30, 41],
                 ec_data_shard: 1,
@@ -6670,7 +6646,7 @@ mod tests {
                 );
             }
         }
-        let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
+        let mk = |id: u64, refs: u64, sealed: u64| ExtentRecord {
             extent_id: id,
             replicates: vec![1],
             parity: vec![],
@@ -6690,7 +6666,7 @@ mod tests {
         state.extents.insert(50, mk(50, 1, 0)); // tail
         state.streams.insert(
             100,
-            MgrStreamInfo {
+            StreamRecord {
                 stream_id: 100,
                 extent_ids: vec![10, 50],
                 ec_data_shard: 1,
@@ -6756,12 +6732,12 @@ mod tests {
         // Survivor partition 1 with streams 100/101/102
         state.partitions.insert(
             1,
-            MgrPartitionMeta {
+            PartitionRecord {
                 part_id: 1,
                 log_stream: 100,
                 row_stream: 101,
                 meta_stream: 102,
-                rg: Some(MgrRange {
+                rg: Some(crate::persist::records::RangeRecord {
                     start_key: b"a".to_vec(),
                     end_key: b"m".to_vec(),
                 }),
@@ -6770,12 +6746,12 @@ mod tests {
         // Victim partition 2 with streams 200/201/202
         state.partitions.insert(
             2,
-            MgrPartitionMeta {
+            PartitionRecord {
                 part_id: 2,
                 log_stream: 200,
                 row_stream: 201,
                 meta_stream: 202,
-                rg: Some(MgrRange {
+                rg: Some(crate::persist::records::RangeRecord {
                     start_key: b"m".to_vec(),
                     end_key: b"z".to_vec(),
                 }),
@@ -6784,7 +6760,7 @@ mod tests {
         for sid in [100, 101, 102, 200, 201, 202] {
             state.streams.insert(
                 sid,
-                MgrStreamInfo {
+                StreamRecord {
                     stream_id: sid,
                     extent_ids: vec![],
                     ec_data_shard: 1,
@@ -6793,12 +6769,12 @@ mod tests {
                 },
             );
         }
-        let new_survivor_meta = MgrPartitionMeta {
+        let new_survivor_meta = PartitionRecord {
             part_id: 1,
             log_stream: 100,
             row_stream: 101,
             meta_stream: 102,
-            rg: Some(MgrRange {
+            rg: Some(crate::persist::records::RangeRecord {
                 start_key: b"a".to_vec(),
                 end_key: b"z".to_vec(),
             }),
@@ -6847,8 +6823,8 @@ mod tests {
         // Pre-existing region: part 101 is on ps 10
         state.regions.insert(
             101,
-            MgrRegionInfo {
-                rg: Some(MgrRange {
+            RegionRecord {
+                rg: Some(crate::persist::records::RangeRecord {
                     start_key: b"a".to_vec(),
                     end_key: b"z".to_vec(),
                 }),
@@ -6861,12 +6837,12 @@ mod tests {
             },
         );
 
-        let left = MgrPartitionMeta {
+        let left = PartitionRecord {
             part_id: 101,
             log_stream: 1,
             row_stream: 2,
             meta_stream: 3,
-            rg: Some(MgrRange {
+            rg: Some(crate::persist::records::RangeRecord {
                 start_key: b"a".to_vec(),
                 end_key: b"m".to_vec(),
             }),
@@ -6891,8 +6867,8 @@ mod tests {
         for part_id in [101, 102] {
             state.regions.insert(
                 part_id,
-                MgrRegionInfo {
-                    rg: Some(MgrRange {
+                RegionRecord {
+                    rg: Some(crate::persist::records::RangeRecord {
                         start_key: vec![],
                         end_key: vec![],
                     }),
@@ -6907,12 +6883,12 @@ mod tests {
         }
 
         // New partition (right child from split)
-        let right = MgrPartitionMeta {
+        let right = PartitionRecord {
             part_id: 999,
             log_stream: 50,
             row_stream: 51,
             meta_stream: 52,
-            rg: Some(MgrRange {
+            rg: Some(crate::persist::records::RangeRecord {
                 start_key: b"m".to_vec(),
                 end_key: b"z".to_vec(),
             }),
@@ -6937,8 +6913,8 @@ mod tests {
         for &(part_id, ps_id) in assignments {
             state.regions.insert(
                 part_id,
-                MgrRegionInfo {
-                    rg: Some(MgrRange {
+                RegionRecord {
+                    rg: Some(crate::persist::records::RangeRecord {
                         start_key: vec![],
                         end_key: vec![],
                     }),
@@ -7080,7 +7056,7 @@ mod tests {
                 tail_id = eid;
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![tail_id],
                         ec_data_shard: 0,
@@ -7090,7 +7066,7 @@ mod tests {
                 );
                 s.extents.insert(
                     tail_id,
-                    MgrExtentInfo {
+                    ExtentRecord {
                         extent_id: tail_id,
                         replicates: vec![1, 2, 3],
                         parity: vec![],
@@ -7198,7 +7174,7 @@ mod tests {
                 s.next_id = 100;
                 s.streams.insert(
                     1,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id: 1,
                         extent_ids: vec![10, 11, 12],
                         ec_data_shard: 0,
@@ -7209,7 +7185,7 @@ mod tests {
                 for eid in [10, 11, 12] {
                     s.extents.insert(
                         eid,
-                        MgrExtentInfo {
+                        ExtentRecord {
                             extent_id: eid,
                             replicates: vec![],
                             parity: vec![],
@@ -7228,7 +7204,7 @@ mod tests {
 
                 s.streams.insert(
                     2,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id: 2,
                         extent_ids: vec![20],
                         ec_data_shard: 0,
@@ -7238,7 +7214,7 @@ mod tests {
                 );
                 s.extents.insert(
                     20,
-                    MgrExtentInfo {
+                    ExtentRecord {
                         extent_id: 20,
                         replicates: vec![],
                         parity: vec![],
@@ -7302,7 +7278,7 @@ mod tests {
             // "replace node 1 with node 7". Applying this would produce
             // replicates=[7,3,5], parity=[7] (duplicate node 7).
             let extent_id = 20u64;
-            let ex = MgrExtentInfo {
+            let ex = ExtentRecord {
                 extent_id,
                 replicates: vec![1, 3, 5],
                 parity: vec![7],
@@ -7371,7 +7347,7 @@ mod tests {
             let m = AutumnManager::new();
 
             let extent_id = 30u64;
-            let ex = MgrExtentInfo {
+            let ex = ExtentRecord {
                 extent_id,
                 replicates: vec![1, 3, 5],
                 parity: vec![7],
@@ -7436,7 +7412,7 @@ mod tests {
             let extent_id = 31u64;
             m.store.inner.borrow_mut().extents.insert(
                 extent_id,
-                MgrExtentInfo {
+                ExtentRecord {
                     extent_id,
                     replicates: vec![1, 3, 5],
                     parity: vec![7],
@@ -7504,7 +7480,7 @@ mod tests {
             let extent_id = 32u64;
             m.store.inner.borrow_mut().extents.insert(
                 extent_id,
-                MgrExtentInfo {
+                ExtentRecord {
                     extent_id,
                     replicates: vec![1, 3, 5],
                     parity: vec![7],
@@ -7629,7 +7605,7 @@ mod tests {
             // the case the guard exists for.
             m.store.inner.borrow_mut().extents.insert(
                 extent_id,
-                MgrExtentInfo {
+                ExtentRecord {
                     extent_id,
                     replicates: vec![1, 3, 5],
                     parity: vec![],
@@ -7695,8 +7671,8 @@ mod tests {
             OP_KIND_RECOVERY, OP_STATE_FAILED, OP_STATE_RUNNING, OP_STATE_SUCCEEDED,
         };
 
-        fn extent_with(extent_id: u64, replicates: Vec<u64>, avali: u32) -> MgrExtentInfo {
-            MgrExtentInfo {
+        fn extent_with(extent_id: u64, replicates: Vec<u64>, avali: u32) -> ExtentRecord {
+            ExtentRecord {
                 extent_id,
                 replicates,
                 parity: vec![],
@@ -7882,8 +7858,8 @@ mod tests {
 
     // ── eversion lost-update during EC conversion await ────────────────────
 
-    fn make_ec_extent(extent_id: u64, eversion: u64) -> MgrExtentInfo {
-        MgrExtentInfo {
+    fn make_ec_extent(extent_id: u64, eversion: u64) -> ExtentRecord {
+        ExtentRecord {
             extent_id,
             replicates: vec![1, 3, 5],
             parity: vec![],
@@ -8117,7 +8093,7 @@ mod tests {
                 ] {
                     s.streams.insert(
                         sid,
-                        MgrStreamInfo {
+                        StreamRecord {
                             stream_id: sid,
                             extent_ids: vec![eid],
                             ec_data_shard: 0,
@@ -8127,7 +8103,7 @@ mod tests {
                     );
                     s.extents.insert(
                         eid,
-                        MgrExtentInfo {
+                        ExtentRecord {
                             extent_id: eid,
                             replicates: vec![1, 3, 5],
                             parity: vec![],
@@ -8146,12 +8122,12 @@ mod tests {
 
                 s.partitions.insert(
                     part_id,
-                    MgrPartitionMeta {
+                    PartitionRecord {
                         part_id,
                         log_stream: log_stream_id,
                         row_stream: row_stream_id,
                         meta_stream: meta_stream_id,
-                        rg: Some(MgrRange {
+                        rg: Some(crate::persist::records::RangeRecord {
                             start_key: b"a".to_vec(),
                             end_key: b"z".to_vec(),
                         }),
@@ -8218,7 +8194,7 @@ mod tests {
                     for sid in sids {
                         s.streams.insert(
                             sid,
-                            MgrStreamInfo {
+                            StreamRecord {
                                 stream_id: sid,
                                 extent_ids: vec![],
                                 ec_data_shard: 0,
@@ -8229,12 +8205,12 @@ mod tests {
                     }
                     s.partitions.insert(
                         pid,
-                        MgrPartitionMeta {
+                        PartitionRecord {
                             part_id: pid,
                             log_stream: sids[0],
                             row_stream: sids[1],
                             meta_stream: sids[2],
-                            rg: Some(MgrRange {
+                            rg: Some(crate::persist::records::RangeRecord {
                                 start_key: start,
                                 end_key: end,
                             }),
@@ -8325,7 +8301,7 @@ mod tests {
                     for (sid, eid) in sids.iter().copied().zip(eids.iter().copied()) {
                         s.streams.insert(
                             sid,
-                            MgrStreamInfo {
+                            StreamRecord {
                                 stream_id: sid,
                                 extent_ids: vec![eid],
                                 ec_data_shard: 0,
@@ -8335,7 +8311,7 @@ mod tests {
                         );
                         s.extents.insert(
                             eid,
-                            MgrExtentInfo {
+                            ExtentRecord {
                                 extent_id: eid,
                                 replicates: vec![1],
                                 parity: vec![],
@@ -8353,12 +8329,12 @@ mod tests {
                     }
                     s.partitions.insert(
                         pid,
-                        MgrPartitionMeta {
+                        PartitionRecord {
                             part_id: pid,
                             log_stream: sids[0],
                             row_stream: sids[1],
                             meta_stream: sids[2],
-                            rg: Some(MgrRange {
+                            rg: Some(crate::persist::records::RangeRecord {
                                 start_key: start,
                                 end_key: end,
                             }),
@@ -8422,7 +8398,7 @@ mod tests {
                     for (sid, eid) in sids.iter().copied().zip(eids.iter().copied()) {
                         s.streams.insert(
                             sid,
-                            MgrStreamInfo {
+                            StreamRecord {
                                 stream_id: sid,
                                 extent_ids: vec![eid],
                                 ec_data_shard: 0,
@@ -8432,7 +8408,7 @@ mod tests {
                         );
                         s.extents.insert(
                             eid,
-                            MgrExtentInfo {
+                            ExtentRecord {
                                 extent_id: eid,
                                 replicates: vec![1],
                                 parity: vec![],
@@ -8450,12 +8426,12 @@ mod tests {
                     }
                     s.partitions.insert(
                         pid,
-                        MgrPartitionMeta {
+                        PartitionRecord {
                             part_id: pid,
                             log_stream: sids[0],
                             row_stream: sids[1],
                             meta_stream: sids[2],
-                            rg: Some(MgrRange {
+                            rg: Some(crate::persist::records::RangeRecord {
                                 start_key: start,
                                 end_key: end,
                             }),
@@ -8527,7 +8503,7 @@ mod tests {
                     for (sid, eid) in sids.iter().copied().zip(eids.iter().copied()) {
                         s.streams.insert(
                             sid,
-                            MgrStreamInfo {
+                            StreamRecord {
                                 stream_id: sid,
                                 extent_ids: vec![eid],
                                 ec_data_shard: 0,
@@ -8537,7 +8513,7 @@ mod tests {
                         );
                         s.extents.insert(
                             eid,
-                            MgrExtentInfo {
+                            ExtentRecord {
                                 extent_id: eid,
                                 replicates: vec![1],
                                 parity: vec![],
@@ -8555,12 +8531,12 @@ mod tests {
                     }
                     s.partitions.insert(
                         pid,
-                        MgrPartitionMeta {
+                        PartitionRecord {
                             part_id: pid,
                             log_stream: sids[0],
                             row_stream: sids[1],
                             meta_stream: sids[2],
-                            rg: Some(MgrRange {
+                            rg: Some(crate::persist::records::RangeRecord {
                                 start_key: start,
                                 end_key: end,
                             }),
@@ -8619,13 +8595,13 @@ mod tests {
     /// always won and node 7 never showed up.
     #[test]
     fn select_nodes_distribution() {
-        let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
+        let mut nodes: HashMap<u64, NodeRecord> = HashMap::new();
         let mut disks: HashMap<u64, crate::persist::records::DiskRecord> = HashMap::new();
         for (idx, &nid) in [1u64, 3, 5, 7].iter().enumerate() {
             let did = 100 + idx as u64;
             nodes.insert(
                 nid,
-                MgrNodeInfo {
+                NodeRecord {
                     node_id: nid,
                     address: format!("127.0.0.1:{}", 9000 + nid),
                     disks: vec![did],
@@ -8678,12 +8654,12 @@ mod tests {
     /// instead of always pinging the lowest-id node first.
     #[test]
     fn select_nodes_degraded_fallback_shuffles() {
-        let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
+        let mut nodes: HashMap<u64, NodeRecord> = HashMap::new();
         let disks: HashMap<u64, crate::persist::records::DiskRecord> = HashMap::new(); // empty = nothing online
         for &nid in &[1u64, 3, 5, 7] {
             nodes.insert(
                 nid,
-                MgrNodeInfo {
+                NodeRecord {
                     node_id: nid,
                     address: format!("127.0.0.1:{}", 9000 + nid),
                     disks: vec![100 + nid],
@@ -8716,13 +8692,13 @@ mod tests {
     /// avoidance would under-fill the selection.
     #[test]
     fn enospc_select_nodes_avoids_space_low_with_fallback() {
-        let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
+        let mut nodes: HashMap<u64, NodeRecord> = HashMap::new();
         let mut disks: HashMap<u64, crate::persist::records::DiskRecord> = HashMap::new();
         for (idx, &nid) in [1u64, 3, 5, 7].iter().enumerate() {
             let did = 100 + idx as u64;
             nodes.insert(
                 nid,
-                MgrNodeInfo {
+                NodeRecord {
                     node_id: nid,
                     address: format!("127.0.0.1:{}", 9000 + nid),
                     disks: vec![did],
@@ -8820,7 +8796,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.extents.insert(
                     extent_id,
-                    MgrExtentInfo {
+                    ExtentRecord {
                         extent_id,
                         sealed_length: 4096,
                         sealed: true,
@@ -8924,7 +8900,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![leaked, live, tail],
                         ec_data_shard: 0,
@@ -8984,7 +8960,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![dupd, dupd, tail],
                         ec_data_shard: 0,
@@ -9029,7 +9005,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![leaked, tail],
                         ec_data_shard: 0,
@@ -9082,7 +9058,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![extent_id, 399],
                         ec_data_shard: 0,
@@ -9163,7 +9139,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![extent_a, extent_b, extent_c],
                         ec_data_shard: 0,
@@ -9239,7 +9215,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![extent_id, keep_id],
                         ec_data_shard: 0,
@@ -9335,7 +9311,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![extent_id, extent_keep],
                         ec_data_shard: 0,
@@ -9433,7 +9409,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![extent_a, extent_b, extent_c],
                         ec_data_shard: 0,
@@ -9510,7 +9486,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![tail_id],
                         ec_data_shard: 0,
@@ -9520,7 +9496,7 @@ mod tests {
                 );
                 s.extents.insert(
                     tail_id,
-                    MgrExtentInfo {
+                    ExtentRecord {
                         extent_id: tail_id,
                         replicates: vec![],
                         parity: vec![],
@@ -9584,7 +9560,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.nodes.insert(
                     node_id,
-                    MgrNodeInfo {
+                    NodeRecord {
                         node_id,
                         address: "127.0.0.1:9101".to_string(),
                         disks: vec![1],
@@ -9650,7 +9626,7 @@ mod tests {
                 let mut s = m.store.inner.borrow_mut();
                 s.streams.insert(
                     stream_id,
-                    MgrStreamInfo {
+                    StreamRecord {
                         stream_id,
                         extent_ids: vec![tail_id],
                         ec_data_shard: 0,
@@ -9660,7 +9636,7 @@ mod tests {
                 );
                 s.extents.insert(
                     tail_id,
-                    MgrExtentInfo {
+                    ExtentRecord {
                         extent_id: tail_id,
                         replicates: vec![],
                         parity: vec![],
@@ -9749,7 +9725,7 @@ mod tests {
                 ] {
                     s.streams.insert(
                         sid,
-                        MgrStreamInfo {
+                        StreamRecord {
                             stream_id: sid,
                             extent_ids: vec![eid],
                             ec_data_shard: 0,
@@ -9759,7 +9735,7 @@ mod tests {
                     );
                     s.extents.insert(
                         eid,
-                        MgrExtentInfo {
+                        ExtentRecord {
                             extent_id: eid,
                             replicates: vec![1, 3, 5],
                             parity: vec![],
@@ -9777,12 +9753,12 @@ mod tests {
                 }
                 s.partitions.insert(
                     part_id,
-                    MgrPartitionMeta {
+                    PartitionRecord {
                         part_id,
                         log_stream: log_stream_id,
                         row_stream: row_stream_id,
                         meta_stream: meta_stream_id,
-                        rg: Some(MgrRange {
+                        rg: Some(crate::persist::records::RangeRecord {
                             start_key: b"a".to_vec(),
                             end_key: b"z".to_vec(),
                         }),
@@ -10033,7 +10009,7 @@ mod tests {
             let extent_id = 206u64;
             // Pre-EC: 3 replicates, K data shards = 3, M parity = 0.
             // The seal path would have set avali = all_bits(3) = 0b0111.
-            let pre = MgrExtentInfo {
+            let pre = ExtentRecord {
                 extent_id,
                 replicates: vec![1, 3, 5],
                 parity: vec![],

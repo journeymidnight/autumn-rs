@@ -84,20 +84,31 @@ const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
 const RECORD_TYPE_AUDIT: u8 = 1;
 const RECORD_TYPE_TENANT_ACCOUNT: u8 = 2;
 const RECORD_TYPE_NAMESPACE: u8 = 3;
+const RECORD_TYPE_EXTENT: u8 = 4;
+const RECORD_TYPE_STREAM: u8 = 5;
+const RECORD_TYPE_NODE: u8 = 6;
 const RECORD_TYPE_DISK: u8 = 7;
+const RECORD_TYPE_PARTITION: u8 = 8;
+const RECORD_TYPE_REGION: u8 = 9;
 
 /// Every prefix this conversion covers, with the record type its values hold.
 ///
-/// The persisted types still living in the wire schema (extents, streams,
-/// nodes, partitions, regions) are NOT here — they have not been split
-/// yet, so their values are still read by the wire definitions and must stay
-/// bare. Adding one here before it is split would make the manager unable to
-/// read it.
+/// This is ALL NINE split records. Every OTHER persisted key — `opLog/`,
+/// `extent_inflight/`, `extentDeleteRetry/`, `node_override/`,
+/// `decommissioned/`, `inode_leases/`, `autoPolicy/*`, `extentLayout/`,
+/// `extentCorrupt/`, `ec_convert_advisory/` — is NOT enveloped and must stay
+/// bare: those types were already defined inside the manager crate. Wrapping
+/// one here would make the manager unable to read it.
 const PREFIXES: &[(&str, u8)] = &[
     ("mgr_audit_log/", RECORD_TYPE_AUDIT),
     ("tenantAccount/", RECORD_TYPE_TENANT_ACCOUNT),
     ("namespace/", RECORD_TYPE_NAMESPACE),
+    ("nodes/", RECORD_TYPE_NODE),
     ("disks/", RECORD_TYPE_DISK),
+    ("extents/", RECORD_TYPE_EXTENT),
+    ("streams/", RECORD_TYPE_STREAM),
+    ("partitions/", RECORD_TYPE_PARTITION),
+    ("regions/", RECORD_TYPE_REGION),
 ];
 
 struct Counts {

@@ -48,7 +48,10 @@
 //! converter pass rewrites everything, all of it in one commit — and NOT a
 //! re-record.
 
-use super::records::{AuditRecord, DiskRecord, NamespaceRecord, TenantAccountRecord};
+use super::records::{
+    AuditRecord, DiskRecord, ExtentRecord, NamespaceRecord, NodeRecord, PartitionRecord,
+    RangeRecord, RegionRecord, StreamRecord, TenantAccountRecord,
+};
 use super::{decode, encode, PersistRecord};
 
 fn hex(bytes: &[u8]) -> String {
@@ -111,9 +114,89 @@ fn disk_fixture() -> DiskRecord {
     }
 }
 
+fn node_fixture() -> NodeRecord {
+    NodeRecord {
+        node_id: 0x8182838485868788,
+        address: "address-field".to_string(),
+        // Distinct values, and distinct LENGTHS from `shard_ports`, so a swap
+        // of the two vectors cannot re-encode identically.
+        disks: vec![0x11, 0x22, 0x33],
+        shard_ports: vec![0x4455, 0x6677],
+        control_address: "control-address-field".to_string(),
+        node_uuid: "node-uuid-field".to_string(),
+    }
+}
+
+fn stream_fixture() -> StreamRecord {
+    StreamRecord {
+        stream_id: 0x9192939495969798,
+        extent_ids: vec![0xA1, 0xB2, 0xC3],
+        ec_data_shard: 4,
+        // Different from `ec_data_shard`: two adjacent u32s holding the same
+        // value make a swap of them invisible.
+        ec_parity_shard: 2,
+        replicates: 3,
+    }
+}
+
+fn partition_fixture() -> PartitionRecord {
+    PartitionRecord {
+        part_id: 0xC1C2C3C4C5C6C7C8,
+        // All three distinct, so a mis-ordered conversion shows up.
+        log_stream: 0x11,
+        row_stream: 0x22,
+        meta_stream: 0x33,
+        rg: Some(RangeRecord {
+            start_key: b"start-key".to_vec(),
+            end_key: b"end-key".to_vec(),
+        }),
+    }
+}
+
+fn region_fixture() -> RegionRecord {
+    RegionRecord {
+        rg: Some(RangeRecord {
+            start_key: b"region-start".to_vec(),
+            end_key: b"region-end".to_vec(),
+        }),
+        part_id: 0xD1,
+        ps_id: 0xD2,
+        log_stream: 0xD3,
+        row_stream: 0xD4,
+        meta_stream: 0xD5,
+        region_epoch: 0xD6,
+    }
+}
+
+fn extent_fixture() -> ExtentRecord {
+    ExtentRecord {
+        extent_id: 0xE1E2E3E4E5E6E7E8,
+        // Distinct lengths as well as contents: swapping two of these vectors
+        // must move bytes.
+        replicates: vec![3, 1, 4],
+        parity: vec![9],
+        eversion: 7,
+        refs: 2,
+        vp_table_refs: 5,
+        sealed_length: 16 * 1024 * 1024 * 1024,
+        sealed: true,
+        avali: 0b1011,
+        replicate_disks: vec![11, 12, 13],
+        parity_disks: vec![14],
+        // NOT equal to `sealed`: two adjacent bools holding the same value hide
+        // a swap of them.
+        ec_converted: false,
+    }
+}
+
 /// The recorded encodings. Read the file header before changing one.
 const AUDIT_FROZEN: &str = "41554d470101726561736f6e2d6669656c64726573756c742d6d6573736167652d6669656c6411000000000000002827262524232221383736353433323162792d6669656c648c000000c0ffffff4100000094000000c0ffffff000000005857565554535251";
 const TENANT_FROZEN: &str = "41554d47020174656e616e742d6669656c64616c7068612f626574612f00f4ffffff06000000f2ffffff050000008c000000d8ffffff030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dcc8ffffff02000000";
+const STREAM_FROZEN: &str = "41554d470501a100000000000000b200000000000000c3000000000000009897969594939291e0ffffff0300000004000000020000000300000000000000";
+const PARTITION_FROZEN: &str = "41554d47080173746172742d6b6579656e642d6b6579c8c7c6c5c4c3c2c111000000000000002200000000000000330000000000000001000000ccffffff09000000cdffffff0700000000000000";
+const REGION_FROZEN: &str = "41554d470901726567696f6e2d7374617274726567696f6e2d656e64000001000000e4ffffff0c000000e8ffffff0a00000000000000d100000000000000d200000000000000d300000000000000d400000000000000d500000000000000d600000000000000";
+const EXTENT_FROZEN: &str = "41554d47040103000000000000000100000000000000040000000000000009000000000000000b000000000000000c000000000000000d000000000000000e00000000000000e8e7e6e5e4e3e2e1b8ffffff03000000c8ffffff010000000700000000000000020000000000000005000000000000000000000004000000010000000b000000a0ffffff03000000b0ffffff010000000000000000000000";
+const NODE_FROZEN: &str = "41554d470601616464726573732d6669656c6400000011000000000000002200000000000000330000000000000055447766636f6e74726f6c2d616464726573732d6669656c646e6f64652d757569642d6669656c6488878685848382818d000000a8ffffffb0ffffff03000000c0ffffff0200000095000000bcffffff8f000000c9ffffff";
 const DISK_FROZEN: &str = "41554d470701757569642d6669656c640000000000007877767574737271000000008a000000e4ffffff00000000";
 const NAMESPACE_FROZEN: &str = "41554d4703016e616d652d6669656c647072656669782d6669656c642f6f776e65722d74656e616e742d6669656c646375742d6f6e656375742d74776f00f1ffffff07000000f0ffffff070000008a000000b8ffffffbaffffff0d0000000100000092000000bbffffffd4ffffff02000000000000006867666564636261";
 
@@ -124,6 +207,11 @@ fn the_persisted_encodings_are_frozen() {
         ("tenantAccount", hex(&encode(&tenant_fixture())), TENANT_FROZEN),
         ("namespace", hex(&encode(&namespace_fixture())), NAMESPACE_FROZEN),
         ("disk", hex(&encode(&disk_fixture())), DISK_FROZEN),
+        ("node", hex(&encode(&node_fixture())), NODE_FROZEN),
+        ("stream", hex(&encode(&stream_fixture())), STREAM_FROZEN),
+        ("partition", hex(&encode(&partition_fixture())), PARTITION_FROZEN),
+        ("region", hex(&encode(&region_fixture())), REGION_FROZEN),
+        ("extent", hex(&encode(&extent_fixture())), EXTENT_FROZEN),
     ] {
         assert_eq!(
             actual, frozen,
@@ -186,6 +274,36 @@ fn each_frozen_encoding_carries_the_version_it_was_recorded_at() {
             DiskRecord::RECORD_TYPE,
             DiskRecord::FORMAT_VERSION,
         ),
+        (
+            "node",
+            NODE_FROZEN,
+            NodeRecord::RECORD_TYPE,
+            NodeRecord::FORMAT_VERSION,
+        ),
+        (
+            "stream",
+            STREAM_FROZEN,
+            StreamRecord::RECORD_TYPE,
+            StreamRecord::FORMAT_VERSION,
+        ),
+        (
+            "partition",
+            PARTITION_FROZEN,
+            PartitionRecord::RECORD_TYPE,
+            PartitionRecord::FORMAT_VERSION,
+        ),
+        (
+            "region",
+            REGION_FROZEN,
+            RegionRecord::RECORD_TYPE,
+            RegionRecord::FORMAT_VERSION,
+        ),
+        (
+            "extent",
+            EXTENT_FROZEN,
+            ExtentRecord::RECORD_TYPE,
+            ExtentRecord::FORMAT_VERSION,
+        ),
     ] {
         assert_eq!(&frozen[0..8], "41554d47", "{name}: magic");
         assert_eq!(
@@ -202,5 +320,7 @@ fn each_frozen_encoding_carries_the_version_it_was_recorded_at() {
         );
     }
 }
+
+
 
 

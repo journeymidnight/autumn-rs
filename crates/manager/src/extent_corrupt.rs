@@ -16,7 +16,7 @@
 //! bytes and proved them wrong — so it must not need a weaker one to be acted
 //! on.
 //!
-//! Kept in a sibling key rather than widening `MgrExtentInfo`, following
+//! Kept in a sibling key rather than widening `ExtentRecord`, following
 //! `extent_layout`: that struct is the persisted `extents/<id>` value, and
 //! growing it would make every stored extent fail rkyv validation on replay,
 //! which refuses leadership rather than degrading.
@@ -26,7 +26,8 @@ use std::collections::HashMap;
 use autumn_common::AppError;
 
 use crate::AutumnManager;
-use autumn_rpc::manager_rpc::{MgrExtentInfo, CODE_PRECONDITION};
+use autumn_rpc::manager_rpc::{CODE_PRECONDITION};
+use crate::persist::records::ExtentRecord;
 
 pub(crate) const EXTENT_CORRUPT_PREFIX: &str = "extentCorrupt/";
 
@@ -45,7 +46,7 @@ pub(crate) fn extent_corrupt_key(extent_id: u64) -> String {
 pub(crate) enum IsolationOutcome {
     /// Clear these bits and bump eversion.
     Isolate {
-        updated: MgrExtentInfo,
+        updated: ExtentRecord,
         cleared_mask: u32,
     },
     /// The reported slots are already dark — a retried report after the first
@@ -66,7 +67,7 @@ pub(crate) enum IsolationOutcome {
 /// seal-and-roll; and clearing the LAST available bit would make the extent
 /// unreadable, which is worse than serving a copy known to be damaged.
 pub(crate) fn compute_corrupt_isolation(
-    ex: &MgrExtentInfo,
+    ex: &ExtentRecord,
     corrupt_node_ids: &[u64],
     reported_eversion: u64,
     op_in_flight: bool,
@@ -331,8 +332,8 @@ mod tests {
 mod isolation_tests {
     use super::*;
 
-    fn extent(avali: u32, replicates: Vec<u64>) -> MgrExtentInfo {
-        MgrExtentInfo {
+    fn extent(avali: u32, replicates: Vec<u64>) -> ExtentRecord {
+        ExtentRecord {
             extent_id: 42,
             replicates,
             parity: vec![],

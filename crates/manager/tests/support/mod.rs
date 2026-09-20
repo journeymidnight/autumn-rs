@@ -1458,3 +1458,81 @@ mod toxiproxy_list_tests {
         );
     }
 }
+
+use autumn_rpc::manager_rpc::{MgrExtentInfo, MgrStreamInfo};
+
+// ── reading the manager's persisted etcd records from a test ────────────────
+
+/// `[b"AUMG"][record_type][format_version]` — `crates/manager/src/persist`.
+/// Duplicated here because those items are `pub(crate)`: only the manager may
+/// hold a persisted record, and a test binary is outside that wall.
+pub const PERSIST_MAGIC: &[u8; 4] = b"AUMG";
+pub const PERSIST_HEADER_LEN: usize = 6;
+
+pub const RECORD_TYPE_EXTENT: u8 = 4;
+pub const RECORD_TYPE_STREAM: u8 = 5;
+
+/// Check the envelope and hand back the rkyv body.
+///
+/// Concrete rather than generic on purpose: expressing the rkyv bounds would
+/// name `rkyv::` here, and this file is `#[path]`-included by crates that do
+/// not depend on rkyv (`crates/object-store`). Two record types are ever read
+/// this way from a test, so two thin wrappers cost less than that coupling.
+fn strip_persist_envelope<'a>(
+    record_type: u8,
+    value: &'a [u8],
+) -> Result<&'a [u8], String> {
+    if value.len() < PERSIST_HEADER_LEN {
+        return Err(format!("{} bytes, too short for an envelope", value.len()));
+    }
+    if &value[0..4] != PERSIST_MAGIC {
+        return Err("no AUMG envelope — did a writer skip it?".to_string());
+    }
+    if value[4] != record_type {
+        return Err(format!("record type {} != {record_type}", value[4]));
+    }
+    Ok(&value[PERSIST_HEADER_LEN..])
+}
+
+/// Decode a persisted `extents/<id>` value read straight out of etcd.
+///
+/// **PANICS on a malformed envelope, deliberately.** A test that reads these
+/// keys and hands the bytes to a bare `rkyv_decode` gets `unaligned pointer`,
+/// because the envelope displaces the archive by six while rkyv locates its
+/// root relative to the buffer end. That failure is deterministic, so it is not
+/// a corruption risk — but it is very easy to SWALLOW, and three of the five
+/// chaos-harness sites this replaced did exactly that (`let Ok(..) = .. else
+/// { continue }`). One of them, `layout_still_serves`, would have downgraded a
+/// real "the file vanished under a layout that still serves it" accusation into
+/// the benign branch. A harness that quietly stops accusing is worse than one
+/// that fails, so there is no Option to ignore here.
+///
+/// The wire type still decodes the body because the persisted record has the
+/// identical field list. The day that stops being true, the call site wants a
+/// different assertion, not a different decoder.
+pub fn decode_persisted_extent(key: &str, value: &[u8]) -> MgrExtentInfo {
+    let body = strip_persist_envelope(RECORD_TYPE_EXTENT, value)
+        .unwrap_or_else(|e| panic!("{key}: {e}"));
+    autumn_rpc::manager_rpc::rkyv_decode(body)
+        .unwrap_or_else(|e| panic!("{key}: persisted extent body does not decode: {e}"))
+}
+
+/// The `streams/<id>` twin. See `decode_persisted_extent`.
+pub fn decode_persisted_stream(key: &str, value: &[u8]) -> MgrStreamInfo {
+    let body = strip_persist_envelope(RECORD_TYPE_STREAM, value)
+        .unwrap_or_else(|e| panic!("{key}: {e}"));
+    autumn_rpc::manager_rpc::rkyv_decode(body)
+        .unwrap_or_else(|e| panic!("{key}: persisted stream body does not decode: {e}"))
+}
+
+/// Fallible twins, for the chaos accounting sweep, which COLLECTS decode
+/// failures into its error list instead of stopping on the first one — a
+/// malformed record there is a finding to report, not a reason to abandon the
+/// round.
+pub fn try_decode_persisted_extent(value: &[u8]) -> Result<MgrExtentInfo, String> {
+    autumn_rpc::manager_rpc::rkyv_decode(strip_persist_envelope(RECORD_TYPE_EXTENT, value)?)
+}
+
+pub fn try_decode_persisted_stream(value: &[u8]) -> Result<MgrStreamInfo, String> {
+    autumn_rpc::manager_rpc::rkyv_decode(strip_persist_envelope(RECORD_TYPE_STREAM, value)?)
+}

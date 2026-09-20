@@ -99,16 +99,19 @@ pub(crate) trait PersistRecord {
 
 // ── record_type registry (frozen, append-only) ──────────────────────────────
 //
-// The three records this module currently owns. The remaining six persisted
-// types (extents, streams, nodes, disks, partitions, regions) keep their
-// numbers reserved here so that splitting them later cannot collide with a
-// number already written to disk.
+// All nine persisted records. These numbers are written into every stored
+// value, so they are FROZEN — renumbering one silently re-labels every record
+// already on disk. The next record takes 10.
 pub(crate) const RECORD_TYPE_AUDIT: u8 = 1;
 pub(crate) const RECORD_TYPE_TENANT_ACCOUNT: u8 = 2;
 pub(crate) const RECORD_TYPE_NAMESPACE: u8 = 3;
+pub(crate) const RECORD_TYPE_EXTENT: u8 = 4;
+pub(crate) const RECORD_TYPE_STREAM: u8 = 5;
+pub(crate) const RECORD_TYPE_PARTITION: u8 = 8;
+pub(crate) const RECORD_TYPE_REGION: u8 = 9;
+pub(crate) const RECORD_TYPE_NODE: u8 = 6;
 pub(crate) const RECORD_TYPE_DISK: u8 = 7;
-// RESERVED, not yet split out of the wire schema:
-//   4 = extent, 5 = stream, 6 = node, 8 = partition, 9 = region.
+// All nine persisted records are split out; the next one takes 10.
 
 /// Wrap a record in its envelope. The body is the same rkyv codec the rest of
 /// the manager uses — the envelope is what this module adds, not a new
@@ -380,8 +383,17 @@ mod tests {
     /// trip, and would silently re-label every record already on disk.
     #[test]
     fn the_record_type_numbers_are_frozen() {
+        use super::records::{
+            DiskRecord, ExtentRecord, NodeRecord, PartitionRecord, RegionRecord, StreamRecord,
+        };
         assert_eq!(AuditRecord::RECORD_TYPE, 1);
         assert_eq!(TenantAccountRecord::RECORD_TYPE, 2);
         assert_eq!(NamespaceRecord::RECORD_TYPE, 3);
+        assert_eq!(ExtentRecord::RECORD_TYPE, 4);
+        assert_eq!(StreamRecord::RECORD_TYPE, 5);
+        assert_eq!(NodeRecord::RECORD_TYPE, 6);
+        assert_eq!(DiskRecord::RECORD_TYPE, 7);
+        assert_eq!(PartitionRecord::RECORD_TYPE, 8);
+        assert_eq!(RegionRecord::RECORD_TYPE, 9);
     }
 }

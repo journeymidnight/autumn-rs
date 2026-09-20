@@ -45,7 +45,7 @@ when an operator needs it.
   namespace_list (`0x59`), namespace_set_presplit, principal_list (`0x5A`),
   get_authz_config.
 
-`update_stream_ec` mutates `MgrStreamInfo.ec_data_shard / ec_parity_shard`; the
+`update_stream_ec` mutates `persist::StreamRecord.ec_data_shard / ec_parity_shard`; the
 `ec_conversion_dispatch_loop` then converts sealed extents to the new shape.
 
 ### WIRE version discipline
@@ -155,16 +155,35 @@ an error that refuses leadership, not "maybe it is the older form" — see the
 Upgrade-safety section for why guessing from the leading bytes provably cannot
 work here.
 
-**SPLIT SO FAR: audit, tenantAccount, namespace** (types 1-3) — the three that
-are not in `MetadataState`, so this step does not touch the in-memory state.
-Types 4-9 are RESERVED for extents / streams / nodes / disks / partitions /
-regions, which still live in the wire schema and whose etcd values are still
-bare. The remaining step is bigger than a file move: `MetadataState` holds the
-WIRE structs as the manager's authoritative in-memory state, so a purely
-persistent field has nowhere to live until it holds the persisted ones — and it
-sits in `autumn-common` while the rule says only the manager may reference a
-record. Nothing outside the manager references `MetadataState` (verified), so
-moving it is clean; it is simply not this step.
+**ALL NINE ARE SPLIT.** extent=4, stream=5, node=6, disk=7, partition=8,
+region=9, audit=1, tenantAccount=2, namespace=3; the next record takes 10.
+`MetadataState` (now `src/store.rs`, moved here from `autumn-common`) holds the
+RECORDS, not the wire structs — which is what gives a purely persistent field
+somewhere to live. `RangeRecord` is a FIELD of the partition and region records
+rather than a record of its own: it has no key and no `RECORD_TYPE`, so changing
+its shape moves BOTH of their `FORMAT_VERSION`s.
+
+**Every writer goes through `persist_kv_entry` / `persist::encode`, and that
+includes every CAS BASELINE.** `Cmp::value` compares stored bytes byte for byte,
+so a baseline re-encoded without the envelope could never match a value written
+with one: every CAS would fail, and split / merge / GC / recovery would retry
+forever against a conflict that is not there. Baseline and value are the same
+function for that reason. The bare-rkyv helpers `kv_entry` and
+`replay_decode_id_map` are DELETED — with all nine records enveloped, a writer
+that skipped the envelope could only be a mistake, so the tool for making it is
+gone.
+
+Other persisted keys stay BARE and must not be wrapped: `opLog/`,
+`extent_inflight/`, `extentDeleteRetry/`, `node_override/`, `decommissioned/`,
+`inode_leases/`, `autoPolicy/*`, `extentLayout/`, `extentCorrupt/`,
+`partitionLastOp/`, `psNodes/`, `ownerLocks/`, and the three `autumn-rs/*`
+singletons. Their types already live inside this crate; wrapping one without
+adding it to the converter would make the manager unable to read it.
+
+Verified on a LIVE cluster, because no automated test executes `Cmp::value` on
+the split/merge path: real etcd + manager + EN + PS, 12 values written,
+`autumn-op split` then `merge` both succeeded with every value byte-correct
+afterwards, and a manager restart replayed all nine record kinds clean.
 
 `persist/freeze.rs` records each encoding byte for byte. It is the deliberate
 replacement for a guard that was ACCIDENTAL: while a record shared a file with
@@ -180,12 +199,12 @@ All writes go through the leader-fenced `txn_fenced` (below). On promotion
 
 | Prefix / key | Value | Notes |
 |---|---|---|
-| `nodes/<id>` | `MgrNodeInfo` | EN record; identity is `node_uuid`, not address |
-| `disks/<id>` | disk info | manager-allocated `disk_id` |
-| `streams/<id>` | `MgrStreamInfo` | membership RMW is value-CAS'd |
-| `extents/<id>` | `MgrExtentInfo` | `refs` RMW is value-CAS'd |
-| `partitions/<id>` | `MgrPartitionMeta` | key range |
-| `regions/<id>` | `MgrRegionInfo` | carries `region_epoch` |
+| `nodes/<id>` | `persist::NodeRecord` | EN record; identity is `node_uuid`, not address |
+| `disks/<id>` | `persist::DiskRecord` | manager-allocated `disk_id` |
+| `streams/<id>` | `persist::StreamRecord` | membership RMW is value-CAS'd |
+| `extents/<id>` | `persist::ExtentRecord` | `refs` RMW is value-CAS'd |
+| `partitions/<id>` | `persist::PartitionRecord` | key range |
+| `regions/<id>` | `persist::RegionRecord` | carries `region_epoch` |
 | `ps_nodes/<id>` | PS address | ephemeral fleet membership |
 | `next_id` | u64 | the ONLY id source (`alloc_ids`) |
 | `ownerLocks/<key>` | owner epoch | `owner_epoch` = the acquire's `mod_revision` |
@@ -308,7 +327,7 @@ stream; for the tail, set its sealed length at the split point, bump `eversion`,
 `refs += 1`, add. `compute_duplicate_stream` is the read-only pure form (the applier
 is `apply_split_mutations`).
 
-**`region_epoch` (TiKV-style)** on `MgrRegionInfo`, bumped through
+**`region_epoch` (TiKV-style)** on `persist::RegionRecord`, bumped through
 `next_region_epoch(state, part_id, new_rg)` by both `rebalance_regions` and
 `compute_region_for_partition`:
 - no prior region → epoch = 1 (`0` is reserved on the wire = "skip check");
@@ -588,7 +607,7 @@ regardless of `gate_mode`. `apply_recovery_done` clears the mark (the rebuilt
 slot holds fresh bytes copied from a healthy peer), and extent deletion drops
 the key alongside `extentLayout/`. **Without the mark the extent stays at RF-1
 forever**: the gate skips the slot before it ever reads `avali`, so the copy is
-isolated, unrepaired and silent. Sibling key rather than a `MgrExtentInfo` field
+isolated, unrepaired and silent. Sibling key rather than a `persist::ExtentRecord` field
 for the same reason as `extentLayout` — widening the persisted `extents/<id>`
 value breaks rkyv replay validation, which refuses leadership.
 Regression: `crates/manager/tests/system_corrupt_replica_rebuild.rs`; the
@@ -792,7 +811,7 @@ late reply could trigger it.
 **Payload location (`extent_layout.rs`).** Which FILE holds an extent's payload
 — `.dat` or `.shard{i}` — is per-extent metadata the manager owns and the EN
 obeys; the EN never infers its own role. It lives in the sibling key
-`extentLayout/<id>` (absent ⇒ `InDat`) rather than in `MgrExtentInfo`, because
+`extentLayout/<id>` (absent ⇒ `InDat`) rather than in `persist::ExtentRecord`, because
 that struct is the persisted `extents/<id>` value: widening it would make an
 existing cluster's stored extents fail rkyv validation on replay, which refuses
 leadership rather than degrading. It reaches readers on `ExtentInfoResp`
@@ -932,7 +951,7 @@ un-acked-but-replicated tail byte to committed (data *gain*, never *loss*),
 consistent with uncertain-write semantics. Do NOT add strict-mode/watermark threading
 to kill it — it trades a benign gain for a real loss risk.
 
-**Authoritative seal state.** `MgrExtentInfo.sealed: bool` is the authoritative STATE
+**Authoritative seal state.** `persist::ExtentRecord.sealed: bool` is the authoritative STATE
 (`sealed_length` is the LENGTH; invariant `sealed_length > 0 ⇒ sealed`; every
 `sealed_length =` also sets `sealed = true`). `already_sealed = tail.sealed` (NOT
 `sealed_length > 0`) so an authoritative EMPTY seal is unambiguous. "Is-sealed" reads

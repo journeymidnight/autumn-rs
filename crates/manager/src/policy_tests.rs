@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::store::MetadataState;
 use autumn_rpc::manager_rpc::{
-    MgrExtentInfo, MgrPartitionMeta, MgrRange, MgrRegionInfo, MgrStreamInfo, PartitionLoad,
+    PartitionLoad,
     POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE,
     POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_SPLIT,
 };
@@ -38,12 +38,12 @@ fn fill_window(eng: &mut PolicyEngine, part_id: u64, n: usize, load: PartitionLo
 fn mk_part(state: &mut MetadataState, id: u64, start: &[u8], end: &[u8]) {
     state.partitions.insert(
         id,
-        MgrPartitionMeta {
+        PartitionRecord {
             part_id: id,
             log_stream: 0,
             row_stream: 0,
             meta_stream: 0,
-            rg: Some(MgrRange {
+            rg: Some(crate::persist::records::RangeRecord {
                 start_key: start.to_vec(),
                 end_key: end.to_vec(),
             }),
@@ -1010,7 +1010,7 @@ fn hot_cold_advisory_emits_policy_candidate_for_client_info() {
 fn mk_stream(state: &mut MetadataState, sid: u64, ec: (u32, u32), extent_ids: &[u64]) {
     state.streams.insert(
         sid,
-        MgrStreamInfo {
+        StreamRecord {
             stream_id: sid,
             extent_ids: extent_ids.to_vec(),
             ec_data_shard: ec.0,
@@ -1023,7 +1023,7 @@ fn mk_stream(state: &mut MetadataState, sid: u64, ec: (u32, u32), extent_ids: &[
 fn mk_extent(state: &mut MetadataState, eid: u64, sealed_length: u64, ec_converted: bool) {
     state.extents.insert(
         eid,
-        MgrExtentInfo {
+        ExtentRecord {
             extent_id: eid,
             replicates: vec![1, 3, 5],
             parity: vec![],
@@ -1217,8 +1217,8 @@ fn rebal_state(ps_ids: &[u64], assignments: &[(u64, u64)]) -> MetadataState {
     for &(part_id, ps_id) in assignments {
         state.regions.insert(
             part_id,
-            MgrRegionInfo {
-                rg: Some(MgrRange { start_key: vec![], end_key: vec![] }),
+            RegionRecord {
+                rg: Some(crate::persist::records::RangeRecord { start_key: vec![], end_key: vec![] }),
                 part_id,
                 ps_id,
                 log_stream: part_id,
@@ -1286,6 +1286,10 @@ fn rebalance_advisory_disabled_when_threshold_zero() {
 // ===========================================================================
 
 use crate::policy::{effective_size_bytes, est_live_bytes, partition_sealed_sums};
+use crate::persist::records::StreamRecord;
+use crate::persist::records::PartitionRecord;
+use crate::persist::records::RegionRecord;
+use crate::persist::records::ExtentRecord;
 
 fn mk_part_streams(
     state: &mut MetadataState,
@@ -1298,12 +1302,12 @@ fn mk_part_streams(
 ) {
     state.partitions.insert(
         id,
-        MgrPartitionMeta {
+        PartitionRecord {
             part_id: id,
             log_stream: log,
             row_stream: row,
             meta_stream: meta,
-            rg: Some(MgrRange {
+            rg: Some(crate::persist::records::RangeRecord {
                 start_key: start.to_vec(),
                 end_key: end.to_vec(),
             }),
@@ -1355,7 +1359,7 @@ fn est_live_pure_fn_arithmetic_and_saturation() {
 
 /// The sealed sum dedups extents shared across the SAME partition's three
 /// streams (each extent counted once), skips extent ids with no
-/// `MgrExtentInfo`, and yields 0 for a partition with no stream state.
+/// `ExtentRecord`, and yields 0 for a partition with no stream state.
 #[test]
 fn partition_sealed_sums_dedups_and_degrades() {
     let mut state = MetadataState::default();
@@ -1363,7 +1367,7 @@ fn partition_sealed_sums_dedups_and_degrades() {
     mk_extent(&mut state, 1, 4 * GIB, false);
     mk_extent(&mut state, 2, 2 * GIB, false);
     // Extent 1 appears in BOTH log and row streams (CoW/splice shape) —
-    // counted once. Extent 999 has no MgrExtentInfo — skipped.
+    // counted once. Extent 999 has no ExtentRecord — skipped.
     mk_stream(&mut state, 100, (0, 0), &[1, 2]);
     mk_stream(&mut state, 101, (0, 0), &[1, 999]);
     mk_stream(&mut state, 102, (0, 0), &[]);

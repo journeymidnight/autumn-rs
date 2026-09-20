@@ -2800,9 +2800,11 @@ exactly one shape: **a value without the envelope is refused and the manager wil
 not take leadership.** There is no dual-read, by design — so the conversion is a
 step in the maintenance window, not something that heals itself at runtime.
 
-Three prefixes are covered so far: `mgr_audit_log/`, `tenantAccount/`,
-`namespace/`. The other six persisted types are not split yet and their values
-MUST stay bare.
+Nine prefixes are covered: `mgr_audit_log/`, `tenantAccount/`, `namespace/`,
+`extents/`, `streams/`, `nodes/`, `disks/`, `partitions/`, `regions/`. Every
+other persisted key (`opLog/`, `extent_inflight/`, `extentLayout/`,
+`extentCorrupt/`, `node_override/`, `inode_leases/`, `autoPolicy/*`, …) is NOT
+enveloped and must stay bare — the tool leaves them alone.
 
 ```bash
 # 1. STOP the cluster (managers, PSes, ENs). The converter writes etcd directly;
@@ -2812,6 +2814,12 @@ cargo run --release --bin migratev0_v1 -- --etcd http://127.0.0.1:2379 --dry-run
 #    mgr_audit_log/   converted=190    already=0
 #    tenantAccount/   converted=2      already=0
 #    namespace/       converted=3      already=0
+#    disks/           converted=6      already=0
+#    nodes/           converted=3      already=0
+#    extents/         converted=48     already=0
+#    streams/         converted=12     already=0
+#    partitions/      converted=4      already=0
+#    regions/         converted=4      already=0
 # 3. Convert:
 cargo run --release --bin migratev0_v1 -- --etcd http://127.0.0.1:2379
 # 4. Start the new binaries.

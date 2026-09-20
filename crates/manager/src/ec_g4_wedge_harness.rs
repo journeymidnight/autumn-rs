@@ -33,15 +33,16 @@
 
 use crate::extent_inflight::ExtentOpKind;
 use crate::AutumnManager;
-use autumn_rpc::manager_rpc::{MgrExtentInfo, MgrStreamInfo};
+use crate::persist::records::ExtentRecord;
+use crate::persist::records::StreamRecord;
 
 fn block_on<F: std::future::Future>(f: F) -> F::Output {
     compio::runtime::Runtime::new().unwrap().block_on(f)
 }
 
 /// A sealed, fully-replicated, pre-conversion extent (K=3 replicas, no parity).
-fn pre_ec_extent(extent_id: u64) -> MgrExtentInfo {
-    MgrExtentInfo {
+fn pre_ec_extent(extent_id: u64) -> ExtentRecord {
+    ExtentRecord {
         extent_id,
         replicates: vec![1, 3, 5],
         parity: vec![],
@@ -59,8 +60,8 @@ fn pre_ec_extent(extent_id: u64) -> MgrExtentInfo {
 
 /// A K=2 + M=1 EC stream that owns `extent_id` (what makes the extent an EC
 /// conversion candidate once a marker is enrolled).
-fn ec_stream(stream_id: u64, extent_id: u64) -> MgrStreamInfo {
-    MgrStreamInfo {
+fn ec_stream(stream_id: u64, extent_id: u64) -> StreamRecord {
+    StreamRecord {
         stream_id,
         extent_ids: vec![extent_id],
         ec_data_shard: 2,

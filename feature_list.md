@@ -485,9 +485,22 @@
   偶然**的——rkyv 的 root 相对 buffer 末尾定位，所以插 6 字节后 root 照样被找到，
   真正挡住的是对齐（整体偏移 6，root 对齐 4/8）。将来若有对齐为 1/2 的记录就没有
   这层保护，测试会绿着但含义变弱，已写进测试注释。
-  剩余：Scope 1 的另外 6 个类型、Scope 2 的其余、Scope 3（`MgrRegionInfo` 三分）、
-  Scope 5。下一步的真决定是把 `MetadataState` 搬进 manager 并持有 persist 形式
-  （已核实零外部引用，搬动干净，但不是文件搬家：它现在持有 wire 结构作为权威内存态）。
+  **Scope B（2026-09-20）**：其余六个记录（extents / streams / nodes / disks /
+  partitions / regions + 嵌套 `RangeRecord`）全部分家，`MetadataState` 已从
+  `autumn-common` 搬进 `crates/manager/src/store.rs` 并**持有 persist 记录**
+  —— 这才让"纯持久字段"有地方待。九个记录 `RECORD_TYPE` 1-9 全部冻结并按名钉住；
+  裸 rkyv 的 `kv_entry` / `replay_decode_id_map` 已删。
+  **最大风险点 CAS baseline**：`Cmp::value` 逐字节比对存量，baseline 少信封则
+  永远不匹配 ⇒ split/merge/GC/recovery 无限重试。已全部走 `persist::encode`，
+  并用**真集群**验证（内存模式测试根本不走 etcd）：split / merge 均成功、
+  12/12 值字节正确、重启 manager 九种记录重放干净。
+  **Scope 1 / 2 / 4 / 5 至此完成。**
+  剩余只有 **Scope 3**：把客户端拿到的 region 记录收窄成 4 字段（去掉 SDK 从不读的
+  三个 `*_stream` id）。那**改变客户端解码的内容**，属于客户端面 wire 变更，要走
+  [[F-CLIENT-WIRE-COMPAT]] 的两形式规则，不是本套机制能覆盖的 —— `passes` 因此
+  仍为 false。另：九个记录的 `FORMAT_VERSION` 都还是 1，**没有任何一次真正的 bump
+  被端到端验证过**；第一次 bump 才是转换器第二步的考验(它不再是纯前缀插入，
+  必须自带旧定义)。
   payload-location 那个字节的三个载体各自立家：wire（`PayloadLocation::from_wire_byte`
   改返回 `Option`，`ReadBytesReq` 直接持 resolved 值、解码时拒陌生字节）、EN 的 `.meta`
   第 41 字节（由 `EXTMETA\x02` 魔数定义合法集合，越界走既有 META-FAILCLOSED 隔离）、

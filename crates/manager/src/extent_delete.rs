@@ -29,6 +29,9 @@ use autumn_rpc::manager_rpc::*;
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::AutumnManager;
+use crate::persist::records::NodeRecord;
+use crate::persist::records::StreamRecord;
+use crate::persist::records::ExtentRecord;
 
 /// long-lived persisted retry queue for deletes whose primary
 /// retry budget (`MAX_ATTEMPTS = 60`) was exhausted. Etcd prefix. Without
@@ -260,7 +263,7 @@ impl AutumnManager {
                         pending_targets: Self::snapshot_replica_targets(&s.nodes, *eid, ex),
                         attempts: 0,
                     },
-                    rkyv_encode(ex).to_vec(),
+                    crate::persist::encode(ex),
                 ));
             }
             v
@@ -359,7 +362,7 @@ impl AutumnManager {
 
         // Plan under ONE borrow, with no await inside it: the mutation below
         // re-borrows, and the etcd CAS is what makes a concurrent change lose.
-        let plans: Vec<(u64, MgrStreamInfo, Vec<u8>, std::collections::HashSet<u64>)> = {
+        let plans: Vec<(u64, StreamRecord, Vec<u8>, std::collections::HashSet<u64>)> = {
             let s = self.store.inner.borrow();
             let mut budget = SEALED_EMPTY_SWEEP_MAX_PER_TICK;
             let mut out = Vec::new();
@@ -413,7 +416,7 @@ impl AutumnManager {
                 let removed: std::collections::HashSet<u64> = cands.into_iter().collect();
                 let mut updated = st.clone();
                 updated.extent_ids.retain(|id| !removed.contains(id));
-                out.push((*sid, updated, rkyv_encode(st).to_vec(), removed));
+                out.push((*sid, updated, crate::persist::encode(st), removed));
             }
             out
         };
@@ -640,13 +643,13 @@ impl AutumnManager {
     /// removes the extent — captures the address list before the
     /// in-memory record is gone.
     ///
-    /// Takes `&HashMap<u64, MgrNodeInfo>` (not `&MetadataState`) so it
+    /// Takes `&HashMap<u64, NodeRecord>` (not `&MetadataState`) so it
     /// composes with a concurrent `s.extents.get_mut(...)` partial
     /// borrow on the other side of the `MetadataState` struct.
     pub(crate) fn snapshot_replica_targets(
-        nodes: &HashMap<u64, MgrNodeInfo>,
+        nodes: &HashMap<u64, NodeRecord>,
         extent_id: u64,
-        extent: &MgrExtentInfo,
+        extent: &ExtentRecord,
     ) -> Vec<DeleteTarget> {
         let mut addrs = Vec::with_capacity(extent.replicates.len() + extent.parity.len());
         for nid in extent.replicates.iter().chain(extent.parity.iter()) {

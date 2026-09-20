@@ -755,7 +755,7 @@ impl PolicyEngine {
 
         // Walk partitions sorted by start_key; for each adjacent pair where
         // left.end_key == right.start_key, check both windows.
-        let mut sorted_parts: Vec<(u64, &autumn_rpc::manager_rpc::MgrPartitionMeta)> = args
+        let mut sorted_parts: Vec<(u64, &crate::persist::records::PartitionRecord)> = args
             .state
             .partitions
             .iter()

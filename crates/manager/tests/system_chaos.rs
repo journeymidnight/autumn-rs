@@ -1640,9 +1640,7 @@ async fn rottable_replicas(ctx: &NemesisCtx) -> RotTargets {
         return targets;
     };
     for kv in &resp.kvs {
-        let Ok(ex) = rkyv_decode::<MgrExtentInfo>(&kv.value) else {
-            continue;
-        };
+        let ex = support::decode_persisted_extent(&String::from_utf8_lossy(&kv.key), &kv.value);
         // Two replicas minimum: the manager refuses to darken the last
         // available slot, and rightly — an extent nobody can read is a harder
         // failure than one served from a copy known to be bad.
@@ -2307,9 +2305,7 @@ async fn layout_still_serves(ctx: &NemesisCtx, r: &RottedReplica) -> bool {
         return false;
     };
     for kv in &resp.kvs {
-        let Ok(ex) = rkyv_decode::<MgrExtentInfo>(&kv.value) else {
-            continue;
-        };
+        let ex = support::decode_persisted_extent(&String::from_utf8_lossy(&kv.key), &kv.value);
         if ex.extent_id != r.extent_id {
             continue;
         }
@@ -3129,7 +3125,7 @@ async fn sealed_extents_naming(etcd_endpoint: &str, node_id: u64) -> usize {
     };
     resp.kvs
         .iter()
-        .filter_map(|kv| rkyv_decode::<MgrExtentInfo>(&kv.value).ok())
+        .map(|kv| support::decode_persisted_extent(&String::from_utf8_lossy(&kv.key), &kv.value))
         .filter(|ex| {
             ex.sealed
                 && (ex.replicates.contains(&node_id) || ex.parity.contains(&node_id))
@@ -3401,7 +3397,7 @@ async fn accounting_snapshot_errors(etcd_endpoint: &str) -> (Vec<String>, usize,
     // below) so the comparison logic is provable without a live cluster.
     let mut stream_lists: Vec<Vec<u64>> = Vec::new();
     for kv in &stream_resp.kvs {
-        match rkyv_decode::<MgrStreamInfo>(&kv.value) {
+        match support::try_decode_persisted_stream(&kv.value) {
             Ok(info) => stream_lists.push(info.extent_ids.clone()),
             Err(e) => errors.push(format!(
                 "accounting: decode {} failed: {e}",
@@ -3421,7 +3417,7 @@ async fn accounting_snapshot_errors(etcd_endpoint: &str) -> (Vec<String>, usize,
                 continue;
             }
         };
-        match rkyv_decode::<MgrExtentInfo>(&kv.value) {
+        match support::try_decode_persisted_extent(&kv.value) {
             Ok(info) => extents.push((eid, info.refs, info.vp_table_refs)),
             Err(e) => errors.push(format!("accounting: decode extents/{eid} failed: {e}")),
         }

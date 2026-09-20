@@ -27,22 +27,19 @@ use autumn_common::store::{
     OWNER_EPOCH_MISMATCH_TOKEN, OWNER_KEY_MISSING_TOKEN, OWNER_KEY_PREFIX_TOKEN,
 };
 use autumn_common::{AppError, AppResult};
-use autumn_rpc::manager_rpc::{
-    MgrExtentInfo, MgrNodeInfo, MgrPartitionMeta, MgrRegionInfo, MgrStreamInfo,
-};
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct MetadataState {
     pub next_id: u64,
-    pub streams: HashMap<u64, MgrStreamInfo>,
-    pub extents: HashMap<u64, MgrExtentInfo>,
-    pub nodes: HashMap<u64, MgrNodeInfo>,
+    pub streams: HashMap<u64, crate::persist::records::StreamRecord>,
+    pub extents: HashMap<u64, crate::persist::records::ExtentRecord>,
+    pub nodes: HashMap<u64, crate::persist::records::NodeRecord>,
     pub disks: HashMap<u64, crate::persist::records::DiskRecord>,
     pub owner_epochs: HashMap<String, i64>,
     pub next_revision: i64,
-    pub partitions: HashMap<u64, MgrPartitionMeta>,
+    pub partitions: HashMap<u64, crate::persist::records::PartitionRecord>,
     pub ps_nodes: HashMap<u64, String>,
-    pub regions: BTreeMap<u64, MgrRegionInfo>,
+    pub regions: BTreeMap<u64, crate::persist::records::RegionRecord>,
     /// per-partition listener addresses reported by PS via
     /// `RegisterPartitionAddr`. In-memory only; rebuilt when the PS
     /// re-registers on restart. Keyed by `part_id`; value is `host:port`.
