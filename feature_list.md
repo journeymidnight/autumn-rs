@@ -1601,7 +1601,13 @@
 - **不在本条范围(补记)**: commit handler 的选择只覆盖 ListingDatabase 的
   create/open 两条路径。namespace 表(connect_namespace*、manifest_enabled)与
   clone_table 仍落到 lance 的 UnsafeCommitHandler——scheme 能解析,但提交不安全。
-- **Status**: `passes: false` (2026-09-20) — 代码已写并**全部通过类型检查**:
-  provider 对真实 lance 编译通过且 7 个单测绿,demo、fork 的 rust/lancedb 与
-  lancedb-python 均编译通过。但 wheel 未构建,**未接触任何集群**,四行验收全部
-  未跑。
+- **Status**: `passes: true` (2026-09-20) — 四行验收已在 H200-1 的一次性 RF2
+  集群上跑通。(1) Python 原生:建表/追加/向量检索/删除/并发 reader+writer 全过,
+  task root 下 `mount | grep -c` 为 0,证明不经 FUSE。(2) 两条 session 路径
+  (默认与显式 `lancedb.Session()`)均通过。(3) 注册消融:未注册 scheme 报
+  `No object store provider found for scheme`。(4) 交叉验证落盘:同一 scope
+  写前 Rust 客户端读到 objects=0,Python 写 50 行后读到 3 对象/2501 字节,键为
+  Lance 真实布局(`_transactions/`、`_versions/*.manifest`、`data/*.lance`)。
+  另:commit handler 消融红在 `200 vs 210`(丢一次 10 行 append,正是
+  UnsafeCommitHandler 的特征),还原后复绿——同一二进制路径、同一集群、各自全新
+  空 scope,唯一差异是 handler 选择那一行。

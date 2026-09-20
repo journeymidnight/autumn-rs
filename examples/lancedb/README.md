@@ -67,6 +67,14 @@ Authenticated clusters: pass `autumn_credential_file` in storage_options (or
 read_credential_file, so the labeled `principal:`/`credential:` pair that
 autumn-op principal-create prints is accepted as-is.
 
+Confirm the bytes reached Autumn from outside Python's own stack:
+
+    AUTUMN_MANAGER=... AUTUMN_OBJECT_SCOPE=... cargo run --bin scope_ls
+
+before and after a Python run. A provider that wrote nowhere would leave the
+scope empty while Python still reported rows, because Lance serves what it
+just wrote from memory.
+
 Run it BOTH ways. `--with-session` passes an explicit Session; without it,
 connect() falls back to a session it builds itself, and that is one of three
 entry points a registration change has to cover.
