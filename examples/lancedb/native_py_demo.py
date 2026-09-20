@@ -4,8 +4,8 @@ Mirrors fuse_demo.py's workload so the two are comparable, minus the hard-link
 preamble: that check exists because Lance's LOCAL store publishes manifests
 with linkat, and this path never touches a filesystem.
 
-Needs the patched wheel from patches/0001-lancedb-python-autumn-provider.patch;
-see README.md. Point it at an empty, dedicated scope: it creates and drops its
+Needs a wheel built from the lancedb fork (branch autumn-native); see
+README.md. Point it at an empty, dedicated scope: it creates and drops its
 own table.
 """
 import argparse

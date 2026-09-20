@@ -4,16 +4,24 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
+# provider/ is its own workspace root on purpose: the lancedb fork consumes it
+# as a git dependency, and keeping it a separate package is what lets Cargo
+# locate it there. Excluded here so the two roots do not nest.
+exclude = ["provider"]
 
 [dependencies]
 anyhow = "1"
 arrow-array = "58"
 arrow-schema = "58"
+autumn-lance-provider = { path = "provider" }
 autumn-object-store = { path = "../../crates/object-store" }
 futures = "0.3"
-lancedb = { git = "https://github.com/lancedb/lancedb.git", rev = "df5709efd8411b66095e29f708290a3e2c80f0fe", default-features = false, features = ["remote"] }
+# The FORK, not upstream. The demo exists to exercise the same code Python
+# will run: the autumn:// provider AND the commit-handler selection that
+# upstream gets wrong for an unknown scheme. Built against upstream it would
+# silently prove neither.
+lancedb = { git = "https://github.com/thesues/lancedb.git", branch = "autumn-native", default-features = false, features = ["remote"] }
 lance = { git = "https://github.com/lance-format/lance.git", tag = "v13.0.0-beta.6", default-features = false }
-lance-table = { git = "https://github.com/lance-format/lance.git", tag = "v13.0.0-beta.6" }
 object_store = { version = "=0.14.1", default-features = false, features = ["aws"] }
 serde_json = "1"
 bytes = "1"

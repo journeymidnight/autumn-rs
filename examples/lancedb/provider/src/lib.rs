@@ -1,11 +1,12 @@
 //! Registers the `autumn://` scheme with Lance's object-store registry.
 //!
-//! The native demo hands LanceDB a store OBJECT through the deprecated
-//! `ObjectStoreParams::object_store` field, which only a caller compiled
-//! against lance can do. A prebuilt LanceDB — the Python wheel above all —
-//! never sees that field: it resolves a store from the URL SCHEME through
-//! `ObjectStoreRegistry`. This crate is the other half, so the same adapter
-//! serves Rust and Python instead of Python falling back to a FUSE mount.
+//! Lance also lets a caller inject a store OBJECT through
+//! `ObjectStoreParams::object_store`, but that field is deprecated and only a
+//! caller compiled against lance can reach it. A prebuilt LanceDB — the Python
+//! wheel above all — never sees it and resolves a store from the URL SCHEME
+//! through `ObjectStoreRegistry`. So the scheme is the only door both
+//! languages share, and the Rust demo goes through it too rather than
+//! injecting, which is what gives this crate coverage without a wheel build.
 //!
 //! Deliberately outside the server workspace: it depends on `lance-io`, and
 //! lance pulls DataFusion behind it. That graph has no business near the

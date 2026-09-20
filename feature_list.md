@@ -1564,7 +1564,9 @@
   绑定(见下一条 commit handler),补丁形态要钉死 rev、要往上游 manifest 注入
   [patch]、要 trap 还原,全是为了绕开"不能改上游"这个本就不成立的约束。
   (3b) commit handler:为 autumn:// 在 open 与 create 两条路径上显式指定
-  `ConditionalPutCommitHandler`。(4) maturin wheel 构建步骤。(5) Python demo:
+  `ConditionalPutCommitHandler`。(3c) Rust demo 改走 provider 与 fork,与
+  Python 同一条码路——否则 provider 在 Rust 侧零覆盖,只能等 wheel 编出来才
+  暴露问题;demo 也因此不再显式指定 commit handler,那正是要被验证的东西。(4) maturin wheel 构建步骤。(5) Python demo:
   `lancedb.connect("autumn://...")`,用例对齐现有 fuse_demo.py。
 - **Acceptance**: (1) 打补丁的 wheel 装进 venv 后,`lancedb.connect("autumn://…")`
   建表/追加/向量检索/删除/并发 reader+writer 全通过,且 **不经过任何 FUSE 挂载**
@@ -1577,7 +1579,10 @@
 - **不在本条范围**: 删除 fuse_demo.py 与 docs 的 FUSE 段落(须待本条验收通过,
   且 FUSE hard-link 回归先迁入 crates/fuse 自有测试——crates/fuse 目前无
   tests/ 目录,linkat 支持的唯一端到端覆盖就是 fuse_demo.py);S3 gateway 方案。
-- **Status**: `passes: false` (2026-09-20) — 代码已写(provider crate + lancedb
-  fork 分支 autumn-native 的 commit 570c0ae3),但**一行都未编译**:provider 需
-  lance-io,wheel 需 lance+DataFusion+pyo3,本机(macOS)均不可编。四行验收全部
+- **不在本条范围(补记)**: commit handler 的选择只覆盖 ListingDatabase 的
+  create/open 两条路径。namespace 表(connect_namespace*、manifest_enabled)与
+  clone_table 仍落到 lance 的 UnsafeCommitHandler——scheme 能解析,但提交不安全。
+- **Status**: `passes: false` (2026-09-20) — 代码已写并**全部通过类型检查**:
+  provider 对真实 lance 编译通过且 7 个单测绿,demo、fork 的 rust/lancedb 与
+  lancedb-python 均编译通过。但 wheel 未构建,**未接触任何集群**,四行验收全部
   未跑。

@@ -71,8 +71,11 @@ cost has been isolated.
 - FUSE hard links inherit the filesystem's nontransactional multi-key metadata
   and per-mount mutation serialization. The one-mount demo is verified; crash-
   atomic/multi-mount namespace operations are not claimed.
-- The demo injects storage per table through the supported but deprecated
-  ObjectStoreParams field. A connection-wide autumn:// provider is not included.
+- Superseded 2026-09-20: the demo now connects through an autumn:// provider
+  registered on the session registry, not the deprecated per-table injection.
+  The commit handler is chosen by lancedb for autumn:// only on the listing
+  database's create and open paths; namespace-backed tables and clone_table
+  still fall to lance's UnsafeCommitHandler.
 - Wire version is 44: rebuild the cluster and all embedded SDK clients together.
 
 Raw evidence remains in the isolated remote logs: contract.log, native-demo4.log,

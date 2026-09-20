@@ -1,4 +1,9 @@
 //! Native LanceDB integration: no FUSE, no S3 gateway.
+//!
+//! Goes through the `autumn://` PROVIDER rather than injecting a store object,
+//! so this demo and the Python wheel exercise one code path. The injection
+//! field lance offers instead is deprecated and unreachable from a prebuilt
+//! binary, so a demo using it would prove nothing about what Python does.
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -6,16 +11,24 @@ use arrow_array::{FixedSizeListArray, Int32Array, RecordBatch, types::Float32Typ
 use arrow_schema::{DataType, Field, Schema};
 use autumn_object_store::AutumnObjectStore;
 use futures::TryStreamExt;
-use lance::{
-    dataset::{ReadParams, WriteParams},
-    io::ObjectStoreParams,
-};
-use lance_table::io::commit::ConditionalPutCommitHandler;
-use lancedb::{
-    query::{ExecutableQuery, QueryBase},
-    table::WriteOptions,
-};
+use lance::dataset::ReadParams;
+use lancedb::Session;
+use lancedb::query::{ExecutableQuery, QueryBase};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
+
+/// A session whose registry answers `autumn://`.
+///
+/// `ObjectStoreRegistry::insert` takes `&self`, so the provider goes onto the
+/// session lancedb already builds — the same thing the fork does for the
+/// Python bindings, and the reason both languages reach one adapter.
+fn autumn_session() -> Arc<Session> {
+    let session = Arc::new(Session::default());
+    session.store_registry().insert(
+        autumn_lance_provider::SCHEME,
+        Arc::new(autumn_lance_provider::AutumnStoreProvider),
+    );
+    session
+}
 
 fn batch(first: i32, count: i32) -> Result<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
@@ -45,30 +58,31 @@ fn batch(first: i32, count: i32) -> Result<RecordBatch> {
 async fn main() -> Result<()> {
     let manager = std::env::var("AUTUMN_MANAGER")?;
     let scope = std::env::var("AUTUMN_OBJECT_SCOPE")?;
+    // Kept for the assertions at the end: the demo checks what actually landed
+    // in Autumn, which needs a store of its own, independent of the one lance
+    // builds through the provider.
     let store = Arc::new(AutumnObjectStore::connect(&manager, &scope).await?);
     anyhow::ensure!(
         store.list(None).try_next().await?.is_none(),
         "demo requires an empty dedicated object scope"
     );
-    let uri = "memory:///autumn-demo";
-    let table_url = url::Url::parse("memory:///autumn-demo/vectors.lance")?;
-    let params = ObjectStoreParams {
-        object_store: Some((store.clone(), table_url.clone())),
-        ..Default::default()
-    };
-    let write = WriteOptions {
-        lance_write_params: Some(WriteParams {
-            store_params: Some(params.clone()),
-            commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
-            ..Default::default()
-        }),
-    };
-    let db = lancedb::connect(uri).execute().await?;
-    let table = db
-        .create_table("vectors", batch(0, 100)?)
-        .write_options(write.clone())
+
+    // The registry is what turns a URL scheme into a store, and it is the only
+    // door a prebuilt LanceDB has. Registering here is the same act the fork
+    // performs for the Python bindings.
+    let session = autumn_session();
+
+    let uri = format!("autumn://{manager}/autumn-demo");
+    // No commit handler is named here on purpose. Upstream lance hands an
+    // unknown scheme UnsafeCommitHandler; the fork selects ConditionalPut for
+    // autumn://, and this demo is what proves it, so spelling it out would
+    // mask the very thing under test.
+    let db = lancedb::connect(&uri)
+        .session(session.clone())
+        .storage_option(autumn_lance_provider::OPT_SCOPE, &scope)
         .execute()
         .await?;
+    let table = db.create_table("vectors", batch(0, 100)?).execute().await?;
     println!("created 100 rows");
     table.add(batch(100, 100)?).execute().await?;
     println!("appended 100 rows");
@@ -90,19 +104,16 @@ async fn main() -> Result<()> {
     table.delete("id < 10").await?;
     assert_eq!(table.count_rows(None).await?, 190);
 
-    // Reopen with a separate SDK worker and race independent Lance writers.
-    let second = Arc::new(AutumnObjectStore::connect(&manager, &scope).await?);
-    let read = ReadParams {
-        store_options: Some(ObjectStoreParams {
-            object_store: Some((second.clone(), table_url)),
-            ..Default::default()
-        }),
-        commit_handler: Some(Arc::new(ConditionalPutCommitHandler)),
-        ..Default::default()
-    };
-    let reopened = db
+    // Reopen through a SECOND connection, so the two writers below reach the
+    // table through independent sessions and stores rather than sharing one.
+    let second_db = lancedb::connect(&uri)
+        .session(autumn_session())
+        .storage_option(autumn_lance_provider::OPT_SCOPE, &scope)
+        .execute()
+        .await?;
+    let reopened = second_db
         .open_table("vectors")
-        .lance_read_params(read)
+        .lance_read_params(ReadParams::default())
         .execute()
         .await?;
     assert_eq!(reopened.count_rows(None).await?, 190);
@@ -134,7 +145,7 @@ async fn main() -> Result<()> {
     drop(table);
     drop(reopened);
     drop(db);
-    drop(second);
+    drop(second_db);
     println!(
         "vacuum reclaimed {} chunks",
         store.vacuum_quiescent().await?

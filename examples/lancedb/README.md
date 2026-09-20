@@ -1,9 +1,12 @@
 # LanceDB on Autumn
 
-The native integration uses autumn-object-store 0.14.1, matching LanceDB
-df5709efd8411b66095e29f708290a3e2c80f0fe (0.40.0-beta.3) and Lance
+The native integration uses autumn-object-store 0.14.1 against the LanceDB
+FORK (thesues/lancedb, branch autumn-native, from 0.40.0-beta.3) and Lance
 13.0.0-beta.6. The standalone workspace and lockfile keep Lance/DataFusion
 dependencies out of the Autumn server workspace.
+
+Both demos reach Autumn the same way, through the `autumn://` provider, so the
+Rust one covers what Python does without building a wheel.
 
 Use a cluster built from this branch (wire 44). Choose an **empty, dedicated**
 scope under an existing namespace. The demo creates and deletes its own table;
@@ -18,18 +21,21 @@ reopens through a separate Autumn client, then appends from two writers and
 checks that all 210 rows survive. It verifies that manifests reside in Autumn,
 deletes its objects and vacuums unreferenced chunks.
 
-The example injects ObjectStoreParams.object_store and explicitly selects
-ConditionalPutCommitHandler for creation and reopening. This API is deprecated
-upstream in favor of ObjectStoreProvider, but is supported by the pinned version.
-The example uses a memory:// URI for Lance's path parsing; bytes are written to
-the injected Autumn backend. The connection's general table-name listing remains
-the default memory backend: this demonstrates table injection, not registration
-of an autumn:// connection provider. Pass the same storage options when reopening.
+The example registers the provider on a session registry and connects with
+`autumn://<manager>/autumn-demo`, passing the scope as a storage option. It
+names NO commit handler: upstream lance hands an unknown scheme
+UnsafeCommitHandler while the fork selects ConditionalPut for autumn://, so
+spelling it out would hide the selection the demo exists to check. Its two
+writers come from two connections with separate sessions, which means two
+registries and therefore two independent stores — one session would have shared
+a cached store and weakened the race.
+
+The commit handler is selected only on the listing database's create and open
+paths. Namespace-backed tables and clone_table still fall to lance's
+UnsafeCommitHandler; do not use those against autumn:// for concurrent writes.
 
 The remote feature is enabled solely because this LanceDB revision's job.rs
 references Error::Http without a feature guard. No remote service is contacted.
-Do not reuse Create-mode WriteParams for table.add: the table already retains
-its store and commit handler, and add supplies Append mode itself.
 
 Python, natively (no FUSE):
 
