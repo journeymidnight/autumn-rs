@@ -1410,11 +1410,21 @@ is a pure prefix insertion: read the value, prepend the envelope, write it back.
 The tool decodes nothing and links no schema, and is idempotent by skipping any
 value that already carries the envelope.
 
-Scope, and it is a real boundary: this applies to data small and centralized
-enough to rewrite in one stopped pass — the etcd records. It does NOT apply to
-SST / WAL / checkpoint bulk inside extents, which cannot be rewritten wholesale;
-those keep `FORMAT_VERSION` plus a parser that reads the older versions, which is
-what `.meta` already does (it still parses V0, V1 and V2).
+The converter is an ordinary bin in the repo — `migratev<from>_v<to>`, e.g.
+`migratev44_v45` — run once by hand and then DELETED. It is reviewable and
+testable while it matters and leaves no residue afterwards; no server binary
+links it, which is what "the code carries no upgrade logic" means. The tool is
+in the tree; the compatibility is not.
+
+**Scope, and the other half of the rule: the bulk formats do not change at all.**
+SST / WAL / checkpoint inside extents are **FROZEN** (user, 2026-09-20). They are
+not versioned-and-migrated and they are not dual-read — under normal
+circumstances their format simply does not move. That is what keeps the converter
+rule affordable: the only persisted data a migration ever has to rewrite is the
+etcd records, which are small and centralized enough to convert in one stopped
+pass. A change that genuinely needs a new bulk format is an exceptional event
+with no route planned for it, and must be raised as such rather than shipped as
+a `FORMAT_VERSION` bump.
 
 **`cluster_df`** (`MSG_CLUSTER_DF`, leader-gated). Ceph-style aggregate, in-memory only,
 built inside the single `node_health_loop`: RAW + `physical_used` are summed from each

@@ -1636,6 +1636,24 @@ The last 4 bytes are `meta_len` — used by `SstReader::open` to locate the Meta
 [Entry 0]...[Entry N][entry_offsets: N×4B LE][num_entries: 4B LE][crc32c: 4B LE]
 ```
 
+### These formats are FROZEN
+
+**SST, WAL record and checkpoint formats do not change** (user, 2026-09-20).
+Not "change them with a `VERSION` bump", not "keep a parser for the old shape" —
+under normal circumstances they do not move at all.
+
+The reason is the migration rule for persisted data (`crates/manager/CLAUDE.md`,
+Upgrade safety): a persisted format change is delivered by a converter tool run
+once against a stopped cluster, never by compatibility code in the servers. That
+is affordable only while the data a migration must rewrite stays small and
+centralized — the etcd records. These bytes are the opposite: they live inside
+every extent, at terabyte scale, and cannot be rewritten wholesale by any tool.
+
+So a change that genuinely needs a new bulk layout has **no route planned for
+it** and must be raised as an exceptional event, not shipped as a `VERSION`
+bump. The `VERSION` field below stays as the tripwire that a mismatch is caught
+loudly; it is not an invitation to evolve the format.
+
 ### Entry Layout (prefix-compressed)
 ```
 [EntryHeader: 4B = overlap:u16 LE + diff_len:u16 LE][diff_key][op:1B][val_len:4B LE][expires_at:8B LE][value]
