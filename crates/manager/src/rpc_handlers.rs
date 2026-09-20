@@ -1628,7 +1628,7 @@ impl AutumnManager {
             for (idx, uuid) in req.disk_uuids.iter().enumerate() {
                 let disk_id = node_id + idx as u64 + 1;
                 disk_ids.push(disk_id);
-                let disk = MgrDiskInfo {
+                let disk = crate::persist::records::DiskRecord {
                     disk_id,
                     online: true,
                     uuid: uuid.clone(),
@@ -2046,7 +2046,8 @@ impl AutumnManager {
     async fn handle_nodes_info(&self) -> HandlerResult {
         let s = self.store.inner.borrow();
         let nodes = s.nodes.iter().map(|(&id, n)| (id, n.clone())).collect();
-        let disks_info = s.disks.iter().map(|(&id, d)| (id, d.clone())).collect();
+        // The registry crosses to the wire here; the stored form is the record.
+        let disks_info = s.disks.iter().map(|(&id, d)| (id, d.into())).collect();
         Ok(rkyv_encode(&NodesInfoResp {
             code: CODE_OK,
             message: String::new(),
@@ -2101,7 +2102,7 @@ impl AutumnManager {
             answered: bool,
             reported: &[(u64, autumn_rpc::extent_rpc::DiskStatus)],
             store: &crate::store::MetadataState,
-            disks_reg: &std::collections::HashMap<u64, MgrDiskInfo>,
+            disks_reg: &std::collections::HashMap<u64, crate::persist::records::DiskRecord>,
             faulted: &std::collections::HashSet<u64>,
         ) -> Vec<DiskCapWire> {
             // A node that did not answer df described NOTHING. Backfilling its
@@ -8486,7 +8487,7 @@ mod cluster_df_disk_tests {
     //! rows — an unreachable machine is one fact, not N missing disks).
     use crate::{AutumnManager, NodeCap};
     use autumn_rpc::extent_rpc::DiskStatus;
-    use autumn_rpc::manager_rpc::{MgrDiskInfo, MgrNodeInfo};
+    use autumn_rpc::manager_rpc::MgrNodeInfo;
 
     fn node(id: u64, disks: &[u64]) -> MgrNodeInfo {
         MgrNodeInfo {
@@ -8514,7 +8515,7 @@ mod cluster_df_disk_tests {
             for d in disk_ids {
                 s.disks.insert(
                     *d,
-                    MgrDiskInfo { disk_id: *d, online: true, uuid: format!("uuid-{d}") },
+                    crate::persist::records::DiskRecord { disk_id: *d, online: true, uuid: format!("uuid-{d}") },
                 );
             }
         }

@@ -8,7 +8,7 @@ mod op_log;
 mod placement;
 mod extent_layout;
 mod persist;
-pub mod store;
+pub(crate) mod store;
 mod fs_alloc;
 pub mod inode_lease;
 pub mod node_state;
@@ -707,7 +707,7 @@ pub(crate) struct ClusterCapSnapshot {
 
 #[derive(Clone)]
 pub struct AutumnManager {
-    pub store: MetadataStore,
+    pub(crate) store: MetadataStore,
     leader: Rc<Cell<bool>>,
     /// How often the sealed-empty backstop ticks. Adjustable for the same reason
     /// `PolicyConfig` is: a 60 s loop is invisible inside a short-lived dev or
@@ -2490,7 +2490,7 @@ impl AutumnManager {
     /// auto-dispatch SPLIT to the owning PS for a SPLIT candidate.
     /// The PS handler (`handle_split_part`) already implements the full
     /// dual-gate + auth-rg flow; we just send the RPC.
-    pub async fn auto_dispatch_split(
+    pub(crate) async fn auto_dispatch_split(
         &self,
         cand: &PolicyCandidate,
         // Explicit split point (raw key bytes) from a manual `ops` submit. `Some`
@@ -2580,7 +2580,7 @@ impl AutumnManager {
     /// Mirrors the CLI orchestration (FLUSH both → admin owner-lock →
     /// commit_lengths → multi_modify_merge). PS-side state catches up
     /// via region_sync_loop within ~2 s.
-    pub async fn auto_dispatch_merge(
+    pub(crate) async fn auto_dispatch_merge(
         &self,
         cand: &PolicyCandidate,
         state: &crate::store::MetadataState,
@@ -3253,6 +3253,31 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(out)
     }
 
+    /// `replay_decode_id_map`'s twin for a PERSISTED record: the value is read
+    /// through `persist::decode`, which VERIFIES the envelope (magic, record
+    /// type, format version) before touching the body. Every failure refuses
+    /// leadership, which is the whole contract — see `persist/mod.rs`.
+    fn replay_decode_persist_id_map<T>(
+        kvs: &[autumn_etcd::proto::KeyValue],
+        prefix: &str,
+        max_id: &mut u64,
+    ) -> Result<HashMap<u64, T>>
+    where
+        T: crate::persist::PersistRecord + rkyv::Archive,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+    {
+        let mut out = HashMap::new();
+        for kv in kvs {
+            let id = Self::parse_id_from_key(prefix, &kv.key)?;
+            let key = String::from_utf8_lossy(&kv.key);
+            let v: T = crate::persist::decode(&key, &kv.value).map_err(Self::replay_decode_err)?;
+            *max_id = (*max_id).max(id);
+            out.insert(id, v);
+        }
+        Ok(out)
+    }
+
     /// Replay a `node_override`-shaped etcd prefix (`MgrNodeOverride` values
     /// keyed by node id) into `out`: clear, then per key parse the id (fail-loud
     /// via `?`) and rkyv-decode the value — a malformed payload is SKIPPED with a
@@ -3352,8 +3377,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let mut max_id = 0u64;
         let decoded_nodes: HashMap<u64, MgrNodeInfo> =
             Self::replay_decode_id_map(&nodes.kvs, "nodes/", &mut max_id)?;
-        let decoded_disks: HashMap<u64, MgrDiskInfo> =
-            Self::replay_decode_id_map(&disks.kvs, "disks/", &mut max_id)?;
+        let decoded_disks: HashMap<u64, crate::persist::records::DiskRecord> =
+            Self::replay_decode_persist_id_map(&disks.kvs, "disks/", &mut max_id)?;
         let decoded_streams: HashMap<u64, MgrStreamInfo> =
             Self::replay_decode_id_map(&streams.kvs, "streams/", &mut max_id)?;
         let decoded_extents: HashMap<u64, MgrExtentInfo> =
@@ -3854,7 +3879,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// surfaces it) rather than placing data we'd immediately migrate off.
     fn select_nodes(
         nodes: &HashMap<u64, MgrNodeInfo>,
-        disks: &HashMap<u64, MgrDiskInfo>,
+        disks: &HashMap<u64, crate::persist::records::DiskRecord>,
         online_node_ids: &HashSet<u64>,
         space_low_node_ids: &HashSet<u64>,
         hard_excluded: &HashSet<u64>,
@@ -5030,6 +5055,19 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(())
     }
 
+    /// Seed one extent into the in-memory state. **Integration tests only.**
+    ///
+    /// `store` became crate-private when it started holding persisted records —
+    /// a type only this crate may name should not be reachable through a `pub`
+    /// field. `crates/manager/tests/apply_done_atomicity.rs` needs to plant a
+    /// pre-EC extent before driving `apply_ec_conversion_done`, so this is the
+    /// narrow door that keeps it working instead of reopening the whole store.
+    /// It takes the WIRE type deliberately: when extents move to a persisted
+    /// record, this one function converts and the test does not change.
+    pub fn _test_seed_extent(&self, extent_id: u64, extent: MgrExtentInfo) {
+        self.store.inner.borrow_mut().extents.insert(extent_id, extent);
+    }
+
     // ── Etcd mirror helpers ────────────────────────────────────────────
 
     /// Build a `("<prefix>/<id>", rkyv_encode(value))` etcd txn entry.
@@ -5048,10 +5086,34 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         (format!("{prefix}/{id}"), rkyv_encode(value).to_vec())
     }
 
+    /// `kv_entry`'s twin for a PERSISTED record: same key format, but the value
+    /// goes through `persist::encode`, so it carries its envelope.
+    ///
+    /// **Every writer of a persisted record must come through here, including a
+    /// CAS BASELINE.** `Cmp::value` compares the stored bytes byte for byte, so
+    /// a baseline re-encoded without the envelope can never match a value
+    /// written with one — every CAS would fail, and the ops that depend on them
+    /// (split, merge, GC, recovery) would retry forever against a conflict that
+    /// is not there. Baseline and value are the same function for that reason,
+    /// not for tidiness.
+    fn persist_kv_entry<T>(prefix: &str, id: u64, record: &T) -> (String, Vec<u8>)
+    where
+        T: crate::persist::PersistRecord
+            + for<'a> rkyv::Serialize<
+                rkyv::api::high::HighSerializer<
+                    rkyv::util::AlignedVec,
+                    rkyv::ser::allocator::ArenaHandle<'a>,
+                    rkyv::rancor::Error,
+                >,
+            >,
+    {
+        (format!("{prefix}/{id}"), crate::persist::encode(record))
+    }
+
     async fn mirror_register_node(
         &self,
         node: &MgrNodeInfo,
-        disks: &[MgrDiskInfo],
+        disks: &[crate::persist::records::DiskRecord],
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             // M0: `node.node_uuid` (the stable identity) rides
@@ -5059,7 +5121,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             let mut kvs = Vec::with_capacity(1 + disks.len());
             kvs.push(Self::kv_entry("nodes", node.node_id, node));
             for disk in disks {
-                kvs.push(Self::kv_entry("disks", disk.disk_id, disk));
+                kvs.push(Self::persist_kv_entry("disks", disk.disk_id, disk));
             }
             etcd.put_msgs_txn(kvs).await?;
         }
@@ -5263,7 +5325,7 @@ mod tests {
         );
         s.disks.insert(
             disk_id,
-            MgrDiskInfo {
+            crate::persist::records::DiskRecord {
                 disk_id,
                 online: true,
                 uuid: format!("uuid-{disk_id}"),
@@ -8558,7 +8620,7 @@ mod tests {
     #[test]
     fn select_nodes_distribution() {
         let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
-        let mut disks: HashMap<u64, MgrDiskInfo> = HashMap::new();
+        let mut disks: HashMap<u64, crate::persist::records::DiskRecord> = HashMap::new();
         for (idx, &nid) in [1u64, 3, 5, 7].iter().enumerate() {
             let did = 100 + idx as u64;
             nodes.insert(
@@ -8574,7 +8636,7 @@ mod tests {
             );
             disks.insert(
                 did,
-                MgrDiskInfo {
+                crate::persist::records::DiskRecord {
                     disk_id: did,
                     online: true,
                     uuid: format!("uuid-{nid}"),
@@ -8617,7 +8679,7 @@ mod tests {
     #[test]
     fn select_nodes_degraded_fallback_shuffles() {
         let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
-        let disks: HashMap<u64, MgrDiskInfo> = HashMap::new(); // empty = nothing online
+        let disks: HashMap<u64, crate::persist::records::DiskRecord> = HashMap::new(); // empty = nothing online
         for &nid in &[1u64, 3, 5, 7] {
             nodes.insert(
                 nid,
@@ -8655,7 +8717,7 @@ mod tests {
     #[test]
     fn enospc_select_nodes_avoids_space_low_with_fallback() {
         let mut nodes: HashMap<u64, MgrNodeInfo> = HashMap::new();
-        let mut disks: HashMap<u64, MgrDiskInfo> = HashMap::new();
+        let mut disks: HashMap<u64, crate::persist::records::DiskRecord> = HashMap::new();
         for (idx, &nid) in [1u64, 3, 5, 7].iter().enumerate() {
             let did = 100 + idx as u64;
             nodes.insert(
@@ -8671,7 +8733,7 @@ mod tests {
             );
             disks.insert(
                 did,
-                MgrDiskInfo {
+                crate::persist::records::DiskRecord {
                     disk_id: did,
                     online: true,
                     uuid: format!("uuid-{nid}"),

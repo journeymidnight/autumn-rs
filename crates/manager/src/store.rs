@@ -28,16 +28,16 @@ use autumn_common::store::{
 };
 use autumn_common::{AppError, AppResult};
 use autumn_rpc::manager_rpc::{
-    MgrDiskInfo, MgrExtentInfo, MgrNodeInfo, MgrPartitionMeta, MgrRegionInfo, MgrStreamInfo,
+    MgrExtentInfo, MgrNodeInfo, MgrPartitionMeta, MgrRegionInfo, MgrStreamInfo,
 };
 
 #[derive(Debug, Default, Clone)]
-pub struct MetadataState {
+pub(crate) struct MetadataState {
     pub next_id: u64,
     pub streams: HashMap<u64, MgrStreamInfo>,
     pub extents: HashMap<u64, MgrExtentInfo>,
     pub nodes: HashMap<u64, MgrNodeInfo>,
-    pub disks: HashMap<u64, MgrDiskInfo>,
+    pub disks: HashMap<u64, crate::persist::records::DiskRecord>,
     pub owner_epochs: HashMap<String, i64>,
     pub next_revision: i64,
     pub partitions: HashMap<u64, MgrPartitionMeta>,
@@ -88,12 +88,12 @@ impl MetadataState {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct MetadataStore {
+pub(crate) struct MetadataStore {
     pub inner: Rc<RefCell<MetadataState>>,
 }
 
 impl MetadataStore {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: Rc::new(RefCell::new(MetadataState {
                 next_id: 1,

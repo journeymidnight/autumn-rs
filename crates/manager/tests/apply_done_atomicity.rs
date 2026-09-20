@@ -69,11 +69,7 @@ fn apply_ec_conversion_done_atomic_success() {
         // Pre-populate the in-memory extent. `apply_ec_conversion_done`
         // reads from in-memory and writes the updated copy to etcd.
         let extent_id: u64 = 4209;
-        m.store
-            .inner
-            .borrow_mut()
-            .extents
-            .insert(extent_id, make_pre_ec_extent(extent_id));
+        m._test_seed_extent(extent_id, make_pre_ec_extent(extent_id));
 
         // Acquire the ConvertToEc marker — this writes
         // `extent_inflight/<id>` to etcd under the leader fence.
@@ -143,11 +139,7 @@ fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
             .expect("manager with etcd");
 
         let extent_id: u64 = 4210;
-        m.store
-            .inner
-            .borrow_mut()
-            .extents
-            .insert(extent_id, make_pre_ec_extent(extent_id));
+        m._test_seed_extent(extent_id, make_pre_ec_extent(extent_id));
 
         m.acquire_extent_inflight(
             extent_id,

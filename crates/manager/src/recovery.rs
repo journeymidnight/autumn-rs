@@ -4340,14 +4340,14 @@ mod slot_verdict_tests {
 mod df_disk_health_tests {
     use super::*;
     use autumn_rpc::extent_rpc::DiskStatus;
-    use autumn_rpc::manager_rpc::{MgrDiskInfo, MgrNodeInfo};
+    use autumn_rpc::manager_rpc::MgrNodeInfo;
 
     fn node_with_two_disks(store: &crate::store::MetadataStore) -> MgrNodeInfo {
         let mut s = store.inner.borrow_mut();
         for did in [10u64, 11] {
             s.disks.insert(
                 did,
-                MgrDiskInfo {
+                crate::persist::records::DiskRecord {
                     disk_id: did,
                     online: true,
                     uuid: format!("uuid-{did}"),

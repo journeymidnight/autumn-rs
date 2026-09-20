@@ -306,7 +306,7 @@ impl Default for PolicyConfig {
 /// CoW split, extents shared with the SIBLING partition are counted in
 /// full by both children until major compaction drops the shared refs.
 /// Over-estimating only delays merge / hastens split.
-pub fn partition_sealed_sums(state: &MetadataState) -> HashMap<u64, u64> {
+pub(crate) fn partition_sealed_sums(state: &MetadataState) -> HashMap<u64, u64> {
     let mut out = HashMap::with_capacity(state.partitions.len());
     for p in state.partitions.values() {
         let mut seen: HashSet<u64> = HashSet::new();
@@ -488,7 +488,7 @@ impl PolicyEngine {
     /// cooldown for evicted PSes so the entry doesn't leak forever.
     /// Called once at the top of `policy_tick_loop` before any
     /// `compute_*_advisory` runs.
-    pub fn prune_stale_metrics(&mut self, state: &MetadataState, now: i64) {
+    pub(crate) fn prune_stale_metrics(&mut self, state: &MetadataState, now: i64) {
         let known_parts: HashSet<u64> = state.partitions.keys().copied().collect();
         let known_pses: HashSet<u64> = state.regions.values().map(|r| r.ps_id).collect();
         self.metrics.retain(|part_id, window| {
@@ -508,7 +508,7 @@ impl PolicyEngine {
 }
 
 pub struct ComputeArgs<'a> {
-    pub state: &'a MetadataState,
+    pub(crate) state: &'a MetadataState,
     pub last_op_at: &'a HashMap<u64, i64>,
     /// part_id -> ps_id from regions; used to mark merge candidates
     /// `same_ps = false` when adjacent partitions live on different PSes.
@@ -1073,7 +1073,7 @@ impl PolicyEngine {
     /// negative-EV operation. Operators who still want to convert
     /// such extents can use `client set-stream-ec --stream <ID>`
     /// which bypasses the advisory layer entirely.
-    pub fn compute_ec_advisory(&self, state: &MetadataState, now: i64) -> Vec<PolicyCandidate> {
+    pub(crate) fn compute_ec_advisory(&self, state: &MetadataState, now: i64) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = &self.config;
         for stream in state.streams.values() {
@@ -1152,7 +1152,7 @@ impl PolicyEngine {
     /// candidate per tick: `kind = POLICY_KIND_REBALANCE`, primary/secondary = 0
     /// (cluster-scoped); the armed controller's actuation calls
     /// `handle_rebalance_regions` with a bounded per-tick `max_moves`.
-    pub fn compute_rebalance_advisory(
+    pub(crate) fn compute_rebalance_advisory(
         &mut self,
         state: &MetadataState,
         now: i64,

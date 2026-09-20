@@ -84,11 +84,12 @@ const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
 const RECORD_TYPE_AUDIT: u8 = 1;
 const RECORD_TYPE_TENANT_ACCOUNT: u8 = 2;
 const RECORD_TYPE_NAMESPACE: u8 = 3;
+const RECORD_TYPE_DISK: u8 = 7;
 
 /// Every prefix this conversion covers, with the record type its values hold.
 ///
-/// The six persisted types still living in the wire schema (extents, streams,
-/// nodes, disks, partitions, regions) are NOT here — they have not been split
+/// The persisted types still living in the wire schema (extents, streams,
+/// nodes, partitions, regions) are NOT here — they have not been split
 /// yet, so their values are still read by the wire definitions and must stay
 /// bare. Adding one here before it is split would make the manager unable to
 /// read it.
@@ -96,6 +97,7 @@ const PREFIXES: &[(&str, u8)] = &[
     ("mgr_audit_log/", RECORD_TYPE_AUDIT),
     ("tenantAccount/", RECORD_TYPE_TENANT_ACCOUNT),
     ("namespace/", RECORD_TYPE_NAMESPACE),
+    ("disks/", RECORD_TYPE_DISK),
 ];
 
 struct Counts {

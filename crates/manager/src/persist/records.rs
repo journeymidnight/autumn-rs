@@ -21,10 +21,13 @@
 //! only through the wire codec, and the only bridge between them is code the
 //! compiler forces you to update.
 
-use autumn_rpc::manager_rpc::{MgrAuditEntry, MgrNamespace};
+use autumn_rpc::manager_rpc::{MgrAuditEntry, MgrDiskInfo, MgrNamespace};
 use rkyv::{Archive, Deserialize, Serialize};
 
-use super::{PersistRecord, RECORD_TYPE_AUDIT, RECORD_TYPE_NAMESPACE, RECORD_TYPE_TENANT_ACCOUNT};
+use super::{
+    PersistRecord, RECORD_TYPE_AUDIT, RECORD_TYPE_DISK, RECORD_TYPE_NAMESPACE,
+    RECORD_TYPE_TENANT_ACCOUNT,
+};
 
 // ── audit log ───────────────────────────────────────────────────────────────
 
@@ -229,5 +232,57 @@ mod tests {
         assert_eq!(back.owner_tenant.as_deref(), Some("t1"));
         assert_eq!(back.presplit, vec![b"kvc/a".to_vec(), b"kvc/b".to_vec()]);
         assert_eq!(back.created_at, 1_700_000_000);
+    }
+}
+
+// ── disks ───────────────────────────────────────────────────────────────────
+
+/// `disks/<id>` — one disk on one extent node.
+///
+/// `online` is the manager's own bookkeeping, NOT the node's per-disk health
+/// verdict: it carries three different meanings (the node said faulted, the
+/// node did not answer `df` at all, a quorum of partition servers reported the
+/// node). Recovery keys on `faulted_disks`, which is in-memory and leader-local
+/// — see the recovery section of this crate's guide.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub(crate) struct DiskRecord {
+    pub disk_id: u64,
+    pub online: bool,
+    pub uuid: String,
+}
+
+impl PersistRecord for DiskRecord {
+    const RECORD_TYPE: u8 = RECORD_TYPE_DISK;
+    const FORMAT_VERSION: u8 = 1;
+    const NAME: &'static str = "disk";
+}
+
+impl From<&MgrDiskInfo> for DiskRecord {
+    fn from(d: &MgrDiskInfo) -> Self {
+        let MgrDiskInfo {
+            disk_id,
+            online,
+            uuid,
+        } = d;
+        Self {
+            disk_id: *disk_id,
+            online: *online,
+            uuid: uuid.clone(),
+        }
+    }
+}
+
+impl From<&DiskRecord> for MgrDiskInfo {
+    fn from(r: &DiskRecord) -> Self {
+        let DiskRecord {
+            disk_id,
+            online,
+            uuid,
+        } = r;
+        Self {
+            disk_id: *disk_id,
+            online: *online,
+            uuid: uuid.clone(),
+        }
     }
 }

@@ -693,7 +693,7 @@ impl AutumnManager {
 mod tests {
     use super::*;
     use autumn_rpc::manager_rpc::{
-        MgrDiskInfo, MgrExtentInfo, MgrNodeInfo, MgrNodeOverride, NODE_OVERRIDE_FENCED,
+        MgrExtentInfo, MgrNodeInfo, MgrNodeOverride, NODE_OVERRIDE_FENCED,
     };
 
     fn ec_payload(extent_id: u64) -> ExtentOpPayload {
@@ -1006,7 +1006,7 @@ mod tests {
             m.node_max_free.borrow_mut().insert(1, 1 << 30);
             m.store.inner.borrow_mut().disks.insert(
                 10,
-                MgrDiskInfo {
+                crate::persist::records::DiskRecord {
                     disk_id: 10,
                     online: true,
                     uuid: String::new(),
@@ -1168,7 +1168,7 @@ mod tests {
             m.node_max_free.borrow_mut().insert(1, 1 << 30);
             m.store.inner.borrow_mut().disks.insert(
                 10,
-                MgrDiskInfo {
+                crate::persist::records::DiskRecord {
                     disk_id: 10,
                     online: true,
                     uuid: String::new(),
@@ -1251,7 +1251,7 @@ mod tests {
             m.node_states.borrow_mut().on_heartbeat_ok(9);
             m.store.inner.borrow_mut().disks.insert(
                 10,
-                MgrDiskInfo {
+                crate::persist::records::DiskRecord {
                     disk_id: 10,
                     online: true,
                     uuid: String::new(),

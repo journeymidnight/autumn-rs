@@ -106,8 +106,9 @@ pub(crate) trait PersistRecord {
 pub(crate) const RECORD_TYPE_AUDIT: u8 = 1;
 pub(crate) const RECORD_TYPE_TENANT_ACCOUNT: u8 = 2;
 pub(crate) const RECORD_TYPE_NAMESPACE: u8 = 3;
+pub(crate) const RECORD_TYPE_DISK: u8 = 7;
 // RESERVED, not yet split out of the wire schema:
-//   4 = extent, 5 = stream, 6 = node, 7 = disk, 8 = partition, 9 = region.
+//   4 = extent, 5 = stream, 6 = node, 8 = partition, 9 = region.
 
 /// Wrap a record in its envelope. The body is the same rkyv codec the rest of
 /// the manager uses — the envelope is what this module adds, not a new
