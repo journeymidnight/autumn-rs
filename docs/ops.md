@@ -3984,7 +3984,22 @@ the task's PID files and stop only those processes; do not pkill by binary name.
 
 Set AUTUMN_MANAGER to that JSON address and AUTUMN_OBJECT_SCOPE to an empty
 sub-prefix such as fs/objects/native-demo. Run the native demo and object bench
-as documented in ../examples/lancedb/README.md. Build the FUSE binary separately,
+as documented in ../examples/lancedb/README.md.
+
+For the Python path, build the wheel from the lancedb FORK (branch
+autumn-native): cd into its python/ and run maturin build --release. Install it
+into a venv and run ../examples/lancedb/native_py_demo.py against the same
+manager and scope. Run it TWICE — once plain, once with --with-session —
+because connect() without an explicit session builds its own, and that is a
+separate registration site. To verify the scheme is actually resolved rather
+than silently falling back, drop the provider registration and re-run: it must
+fail with "No object store provider found for scheme: 'autumn'". Verify the
+commit handler too, because its failure is silent: two processes appending to
+one table must produce a CommitConflict, and reverting to UnsafeCommitHandler
+must make that check fail. With this wheel no mount is involved, so leaving the
+FUSE mount unmounted is itself the proof that this path is native.
+
+For the UNPATCHED-wheel fallback, build the FUSE binary separately,
 mount this manager at a dedicated TASK_ROOT/mount, then run fuse_demo.py with
 file:// followed by that absolute mount path plus /lancedb. Unmount only that
 path with fusermount3 -u when finished. The hard-link test must report EEXIST on

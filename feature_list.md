@@ -1527,3 +1527,52 @@
   （CAS 生效，消融：改成 last-writer-wins 测试变红）；list 1000+ fragment 的
   scan 延迟有基准数字；与 S3 后端跑同一基准集对比吞吐/P99。
 - **Status**: `passes: true` (2026-09-19) — 原生/FUSE demo、CAS 消融、分页与 MinIO 对照已验证；最终 Linux 验收和临时服务清理完成。
+
+### F-LANCEDB-PY-NATIVE — Python LanceDB 经 autumn:// provider 原生接入
+- **Trigger** (2026-09-20，用户): native 适配层已就绪后，Python 侧不应再依赖
+  FUSE。现状是两条码路——Rust 走注入的 ObjectStore，Python 走 FUSE 挂载的
+  `file://`——FUSE 那条继承文件系统的非事务多键元数据与 per-mount 串行化
+  (见 F-LANCEDB-OBJECT-STORE 的 Limits)，且只验证过单 mount。目标是一条码路
+  同时服务两端。
+- **立论依据** (2026-09-20 读 lance v13.0.0-beta.6 / lancedb df5709ef 源码核实,
+  非推测): `ObjectStoreProvider` trait (lance-io object_store/providers.rs:42)
+  与 `ObjectStoreRegistry::insert` (:418, 取 &self) 是 public;
+  `Session::store_registry()` (lance/src/session.rs:301) 可取到运行中 session 的
+  registry; `ObjectStore::new(Arc<DynObjectStore>, Url, ...)` (object_store.rs:1800)
+  是 public 构造器,可从 `Arc<dyn object_store::ObjectStore>` 构造。**对象存储这一层
+  不需要 fork lance**,补丁面收敛在 lancedb-python。
+- **但 COMMIT 这一层不然** (2026-09-20 独立 review 查出,已复核): `lance-table`
+  的 `commit_handler_from_url` 是硬编码 scheme 表,`_ => UnsafeCommitHandler`
+  (rust/lance-table/src/io/commit.rs:1193-1261)。`autumn` 不在表里,所以 Python
+  写入方拿到的是**无条件覆盖 manifest** 的 handler,适配层的 compare_put CAS
+  被整个绕过——两个 Python 进程可同时提交同一 version。Rust demo 之所以安全,
+  是因为它显式设了 `ConditionalPutCommitHandler`;Python 没有这个旋钮。
+- **Scope**: (1) `autumn-lance-provider`:独立 crate,实现 `ObjectStoreProvider`,
+  把 `autumn://` 映射到 `AutumnObjectStore`。必须在 server workspace 之外——
+  依赖 lance-io 会把 lance/DataFusion 拖进服务端依赖图。(2) URL 约定:
+  `autumn://` 的 authority/path 如何切成 manager、scope、object path,含
+  `extract_path` 与 `calculate_object_store_prefix`。(3) lancedb-python 补丁:
+  必须同时覆盖 `python/src/session.rs` 的 `new()` 与 `impl Default` 两条路,
+  **以及** `python/src/connection.rs` 不传 session 的路径(connect 的 session
+  参数可为 None,此时走 builder 自建 session,只补 Session 不生效)。以 lancedb
+  FORK(分支 autumn-native)承载,不用 build 时打补丁:改动本来就不限于 Python
+  绑定(见下一条 commit handler),补丁形态要钉死 rev、要往上游 manifest 注入
+  [patch]、要 trap 还原,全是为了绕开"不能改上游"这个本就不成立的约束。
+  (3b) commit handler:为 autumn:// 在 open 与 create 两条路径上显式指定
+  `ConditionalPutCommitHandler`。(4) maturin wheel 构建步骤。(5) Python demo:
+  `lancedb.connect("autumn://...")`,用例对齐现有 fuse_demo.py。
+- **Acceptance**: (1) 打补丁的 wheel 装进 venv 后,`lancedb.connect("autumn://…")`
+  建表/追加/向量检索/删除/并发 reader+writer 全通过,且 **不经过任何 FUSE 挂载**
+  (验收时不挂载即可证伪);(1b) **两个 Python 进程并发追加同一张表必须出现
+  CommitConflict**——原验收只有单 writer,看不见 UnsafeCommitHandler 的丢提交;
+  消融:退回 UnsafeCommitHandler 时此行必须变红;(2) 不传 session 的 `lancedb.connect()` 也能解析
+  `autumn://`——这是 scope(3) 里最容易漏的一条,须单独验;(3) 消融:移除 provider
+  注册后同一脚本必须报 "No object store provider found for scheme: 'autumn'"
+  而非静默回退;(4) 数据确实落在 autumn——用 Rust 侧 list 该 scope 核对对象数。
+- **不在本条范围**: 删除 fuse_demo.py 与 docs 的 FUSE 段落(须待本条验收通过,
+  且 FUSE hard-link 回归先迁入 crates/fuse 自有测试——crates/fuse 目前无
+  tests/ 目录,linkat 支持的唯一端到端覆盖就是 fuse_demo.py);S3 gateway 方案。
+- **Status**: `passes: false` (2026-09-20) — 代码已写(provider crate + lancedb
+  fork 分支 autumn-native 的 commit 570c0ae3),但**一行都未编译**:provider 需
+  lance-io,wheel 需 lance+DataFusion+pyo3,本机(macOS)均不可编。四行验收全部
+  未跑。

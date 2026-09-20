@@ -31,7 +31,43 @@ references Error::Http without a feature guard. No remote service is contacted.
 Do not reuse Create-mode WriteParams for table.add: the table already retains
 its store and commit handler, and add supplies Append mode itself.
 
-FUSE validation (Python package tested: lancedb 0.39.0):
+Python, natively (no FUSE):
+
+    cd ../../../lancedb && git checkout autumn-native     # the fork
+    cd python && maturin build --release --out <dir>
+    pip install <wheel>                                   # into a venv
+    python native_py_demo.py --manager 127.0.0.1:9001 --scope objects/lance-demo
+    python native_py_demo.py --manager 127.0.0.1:9001 --scope objects/lance-demo --with-session
+
+A prebuilt wheel cannot be handed a custom ObjectStore: Python LanceDB resolves
+a store from the URL SCHEME inside its own bundled Rust core, so provider/ has
+to be COMPILED IN. That is why this is a fork rather than a patch applied at
+build time — the changes are not confined to the Python bindings. Lance also
+picks a commit handler from a hard-coded scheme table and gives anything it
+does not recognise UnsafeCommitHandler, an unconditional manifest put, so the
+fork names ConditionalPutCommitHandler for autumn:// on both the open and the
+create path. Without that the adapter's compare-and-swap is bypassed and two
+Python writers can claim one version.
+
+The URL carries the manager, `autumn://<host>:<port>/<path>`, which makes a
+dataset URI self-contained. The SCOPE is a storage option instead: new_store
+receives the TABLE's url, so `autumn://mgr/objects/demo/vectors.lance` offers no
+rule for where the scope ends and the object path begins, and a segment-counting
+guess would write to the wrong prefix silently when it guessed wrong.
+
+Authenticated clusters: pass `autumn_credential_file` in storage_options (or
+--credential-file to the demo). It is read by the client's own
+read_credential_file, so the labeled `principal:`/`credential:` pair that
+autumn-op principal-create prints is accepted as-is.
+
+Run it BOTH ways. `--with-session` passes an explicit Session; without it,
+connect() falls back to a session it builds itself, and that is one of three
+entry points a registration change has to cover.
+
+FUSE validation (Python package tested: lancedb 0.39.0) — the fallback for an
+UNPATCHED wheel, and the weaker path: it inherits the filesystem's
+nontransactional multi-key metadata and per-mount serialization (see
+../../docs/lancedb_validation.md). Prefer the native route above.
 
     python examples/lancedb/fuse_demo.py file:///path/to/test-mount/lancedb
 
