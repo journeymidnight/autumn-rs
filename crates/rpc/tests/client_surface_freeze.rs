@@ -1132,7 +1132,12 @@ fn the_read_bytes_request_layout_is_frozen_field_by_field() {
     // before the payload selector sends 32 bytes, and the decoder must go on
     // reading that as the `.dat` file it meant.
     let short = ReadBytesReq::decode(bytes::Bytes::copy_from_slice(&raw[..32])).expect("decodes");
-    assert_eq!(short.payload_location, en::PAYLOAD_LOCATION_IN_DAT);
+    assert_eq!(short.payload_location, en::PayloadLocation::InDat);
+    assert_eq!(
+        short.payload_location.as_byte(),
+        en::PAYLOAD_LOCATION_IN_DAT,
+        "the short form still means byte 0 on the wire"
+    );
     assert_eq!(short.shard_index, 0);
     assert_eq!(short.extent_id, 0x1112131415161718);
     assert_eq!(short.length, 0x4142434445464748);

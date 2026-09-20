@@ -635,6 +635,24 @@ pub(crate) fn eligible_replica_slots(ex: &ExtentInfo) -> Vec<usize> {
     }
 }
 
+/// The extent's PUBLISHED payload location, or a refusal naming the byte.
+///
+/// Every read that names a payload file resolves the location here, ONCE, and
+/// carries the resolved value to each slot. A byte outside the set this build
+/// knows is a refusal rather than `.dat`: `.dat` is a positive claim about
+/// which file holds the value, and on an extent whose bytes have moved it is
+/// the shard-bytes-as-a-value corruption `PayloadRef` exists to rule out.
+fn published_payload(ex: &ExtentInfo) -> Result<PayloadLocation> {
+    ex.payload().ok_or_else(|| {
+        anyhow!(
+            "extent {}: published payload location {} names no file this build knows \
+             (this cluster speaks a layout this binary does not) — refusing the read",
+            ex.extent_id,
+            ex.payload_location
+        )
+    })
+}
+
 /// `replicates ++ parity` node ids in slot order — the SAME order that
 /// `replica_addrs_from_cache` resolves addresses in, so a read slot index maps
 /// back to its `node_id` (needed to consult the Suspected snapshot).
@@ -4613,7 +4631,7 @@ impl StreamClient {
                 ex.eversion,
                 offset,
                 want,
-                PayloadRef::for_extent(ex.payload_location, replica_idx as u32),
+                PayloadRef::for_extent(published_payload(&ex)?, replica_idx as u32),
             )
             .await?;
         Ok((bytes, committed_end, node_id))
@@ -4723,6 +4741,7 @@ impl StreamClient {
         };
         // BUG-READ-TIMEOUT-STORM: damp on liveness timeouts (see below).
         let mut timeouts = 0usize;
+        let loc = published_payload(&ex)?;
         for &slot in &order {
             let addr = &addrs[slot];
             let req = ReadBytesReq::new(
@@ -4730,7 +4749,7 @@ impl StreamClient {
                 ex.eversion,
                 offset,
                 length,
-                PayloadRef::for_extent(ex.payload_location, slot as u32),
+                PayloadRef::for_extent(loc, slot as u32),
             )
             .encode();
             match self
@@ -4948,7 +4967,7 @@ impl StreamClient {
             // backfilled, so handing out a descriptor for one would buy a round
             // of EN refusals before the proxy fallback every single time — the
             // old blanket refusal was free by comparison.
-            if PayloadLocation::from_byte(ex.payload_location) != PayloadLocation::InShardFile {
+            if ex.payload() != Some(PayloadLocation::InShardFile) {
                 return Ok(ReadDescriptor::NotDirect(NotDirect::EcNotShardAddressable));
             }
             let node_ids = replica_node_ids(&ex);
@@ -4975,7 +4994,7 @@ impl StreamClient {
         // EC layout flip, which also sets `ec_converted`. Check it anyway: if
         // that ever stops holding, the SDK must fall back to the proxy rather
         // than read `.dat` bytes that are no longer the value.
-        if PayloadLocation::from_byte(ex.payload_location) != PayloadLocation::InDat {
+        if ex.payload() != Some(PayloadLocation::InDat) {
             return Ok(ReadDescriptor::NotDirect(NotDirect::PayloadOutsideDat));
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
@@ -5080,6 +5099,7 @@ impl StreamClient {
             from = 2; // hedge already consumed order[0] and order[1]
         }
 
+        let loc = published_payload(ex)?;
         for &slot in &order[from..] {
             let addr = &addrs[slot];
             match self
@@ -5089,7 +5109,7 @@ impl StreamClient {
                     ex.eversion,
                     offset,
                     length,
-                    PayloadRef::for_extent(ex.payload_location, slot as u32),
+                    PayloadRef::for_extent(loc, slot as u32),
                 )
                 .await
             {
@@ -5147,8 +5167,9 @@ impl StreamClient {
         // Each arm asks its OWN slot for its own payload file — the two hedged
         // reads are different slots, so a single hoisted ref would ask one node
         // for the other's shard.
-        let p0 = PayloadRef::for_extent(ex.payload_location, (s0 % n) as u32);
-        let p1 = PayloadRef::for_extent(ex.payload_location, (s1 % n) as u32);
+        let loc = published_payload(ex)?;
+        let p0 = PayloadRef::for_extent(loc, (s0 % n) as u32);
+        let p1 = PayloadRef::for_extent(loc, (s1 % n) as u32);
         let Some(sc) = self.self_weak.upgrade() else {
             // Client is shutting down — plain single read, no hedge.
             return self
@@ -5524,6 +5545,7 @@ impl StreamClient {
         // Parallel scatter over the non-suspected shards only.
         // `read_shard_from_addr` borrows `&self`, which is fine because all
         // futures share the same self borrow that outlives this `await`.
+        let loc = published_payload(ex)?;
         let read_futs: Vec<_> = to_read
             .iter()
             .map(|&i| {
@@ -5535,7 +5557,7 @@ impl StreamClient {
                     ex.eversion,
                     sh_off,
                     sh_len,
-                    PayloadRef::for_extent(ex.payload_location, shard_idx as u32),
+                    PayloadRef::for_extent(loc, shard_idx as u32),
                 )
             })
             .collect();
@@ -5695,7 +5717,7 @@ impl StreamClient {
 
         let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<Vec<u8>>)>(n);
         let cached_eversion = ex.eversion;
-        let cached_location = ex.payload_location;
+        let cached_location = published_payload(ex)?;
         // BUG-READ-TIMEOUT-STORM: capture the read IoDeadline (Copy) here where
         // `self.config` is reachable — the per-shard read runs inside a spawned
         // task that only captures a cloned `pool`, not `self`.
@@ -5872,7 +5894,7 @@ impl StreamClient {
         // `read_shard_from_addr`), so a shard > 4 GiB would also overflow the
         // frame `payload_len: u32` — a pre-existing hazard, out of scope here.
         let read_dl = self.config.read_deadline();
-        let cached_location = ex.payload_location;
+        let cached_location = published_payload(ex)?;
         let shard_len = crate::erasure::shard_size(ex.sealed_length as usize, data_shards) as u64;
         for (i, addr) in addrs.into_iter().enumerate() {
             let mut tx = tx.clone();

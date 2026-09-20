@@ -2790,6 +2790,28 @@ Do this while the managers are DOWN, in the same window as the binary swap. Any
 wire type that is also persisted needs the same treatment; `OpRecord` is the
 only one today.
 
+#### Rolling BACK onto data a newer binary wrote
+
+Rollback is unsupported, and two persisted values now say so out loud rather
+than degrading into serving the wrong bytes. Both concern the per-extent
+payload location — which FILE holds an extent's bytes, `extent-{id}.dat` or
+`extent-{id}.shard{i}` — because reading that wrong is a whole value served
+from a shard, silently.
+
+- **The manager refuses leadership** if `extentLayout/<id>` names a location
+  this binary does not have. The log line names the key and the byte:
+  `extentLayout/512 names payload location 2, which this build does not have`.
+  There is no repair from the old binary — the extent's bytes really are
+  somewhere it cannot address. Go forward to the binary that wrote it.
+- **An extent node quarantines the extent** if its `.meta` names one, logging
+  `META-FAILCLOSED: .meta names a payload location this build does not have`.
+  Reads and appends on that extent are refused so the client fails over to
+  another replica; everything else on the node keeps serving.
+
+Neither can fire on a cluster that has only ever run one binary version
+forward: there are exactly two locations today, so no in-tree writer can
+produce a third byte. What they are for is the day a third is added.
+
 v28 changed the FRAME layer itself (one uniform shape:
 `[header][ctrl_len][ctrl][crc][value]`, crc over header+ctrl, raw value tails
 uncrc'd). Deploy note: a pre-v28 binary against a v28 peer fails at the FIRST

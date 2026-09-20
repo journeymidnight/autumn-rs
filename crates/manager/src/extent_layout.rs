@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 
 use autumn_common::error::AppError;
-use autumn_rpc::extent_rpc::{PayloadLocation, PAYLOAD_LOCATION_IN_DAT};
+use autumn_rpc::extent_rpc::PayloadLocation;
 
 use crate::AutumnManager;
 
@@ -30,13 +30,11 @@ pub(crate) fn extent_layout_key(extent_id: u64) -> String {
 impl AutumnManager {
     /// Where `extent_id`'s payload lives. Unknown extent ⇒ `InDat`.
     pub(crate) fn payload_location_of(&self, extent_id: u64) -> PayloadLocation {
-        PayloadLocation::from_byte(
-            self.extent_payload_location
-                .borrow()
-                .get(&extent_id)
-                .copied()
-                .unwrap_or(PAYLOAD_LOCATION_IN_DAT),
-        )
+        self.extent_payload_location
+            .borrow()
+            .get(&extent_id)
+            .copied()
+            .unwrap_or(PayloadLocation::InDat)
     }
 
     /// Publish the in-memory location AFTER the caller's txn committed, so
@@ -44,7 +42,7 @@ impl AutumnManager {
     pub(crate) fn commit_payload_location(&self, extent_id: u64, loc: PayloadLocation) {
         self.extent_payload_location
             .borrow_mut()
-            .insert(extent_id, loc.as_byte());
+            .insert(extent_id, loc);
     }
 
     /// Drop an extent's location when the extent itself is gone. Ids are never
@@ -72,32 +70,62 @@ impl AutumnManager {
     /// Rebuild the in-memory view on promotion. Only non-default entries are
     /// stored, so this map is empty on any cluster that has never converted an
     /// extent under the CoW scheme.
-    pub(crate) fn install_replayed_payload_locations(&self, decoded: HashMap<u64, u8>) {
+    pub(crate) fn install_replayed_payload_locations(
+        &self,
+        decoded: HashMap<u64, PayloadLocation>,
+    ) {
         *self.extent_payload_location.borrow_mut() = decoded;
     }
 
-    /// Decode the `extentLayout/` prefix. A malformed value is dropped with a
-    /// WARN and reads as `InDat`: refusing leadership over a byte that only
-    /// selects between two files — where the default is the pre-existing
-    /// behaviour — would trade a cosmetic inconsistency for an outage.
-    pub(crate) fn decode_extent_layout_kvs<'a>(
-        kvs: impl Iterator<Item = (u64, &'a [u8])>,
-    ) -> HashMap<u64, u8> {
+    /// Decode the `extentLayout/` prefix, FAIL-LOUD like every other persisted
+    /// value: an entry this build cannot read refuses leadership.
+    ///
+    /// It used to drop a malformed entry with a WARN and let the extent read as
+    /// `InDat`, on the stated grounds that refusing leadership "over a byte
+    /// that only selects between two files — where the default is the
+    /// pre-existing behaviour" traded an outage for a cosmetic inconsistency.
+    /// The premise is false in both halves. `InDat` is not a neutral default
+    /// here, it is a positive claim that `extent-{id}.dat` holds the payload,
+    /// published to every reader on `ExtentInfoResp`; on an extent whose bytes
+    /// have moved into a shard file that claim serves shard bytes as a whole
+    /// value. And this value is written by nothing but this cluster's own
+    /// managers, so a byte outside the set means a newer manager wrote it and
+    /// was rolled back — the case `replay_from_etcd` is fail-loud about
+    /// everywhere else, and the case the stop-the-world discipline exists for.
+    ///
+    /// ABSENT is still `InDat`, and that is untouched: no key at all is what
+    /// every extent predating the CoW scheme has, and it is the whole migration
+    /// story (see this module's header). Absent is the absence of a claim;
+    /// an unreadable byte is a claim this build cannot honour.
+    /// Takes the RAW kvs, key parsing included, so that a test of this function
+    /// covers the whole decision `replay_from_etcd` makes and only a `?`
+    /// separates the two. Parsing the key at the call site put the "drop it
+    /// quietly" shape back where a test could not see it — and a dropped key
+    /// leaves its extent reading as `InDat`, which is the same wrong claim an
+    /// unreadable value would make.
+    pub(crate) fn decode_extent_layout_kvs(
+        kvs: &[autumn_etcd::proto::KeyValue],
+    ) -> Result<HashMap<u64, PayloadLocation>, String> {
         let mut out = HashMap::new();
-        for (id, value) in kvs {
-            match value.first() {
-                Some(&b) if id != 0 => {
-                    out.insert(id, b);
-                }
-                _ => {
-                    tracing::warn!(
-                        extent_id = id,
-                        "extentLayout entry is malformed; treating the extent as InDat"
-                    );
-                }
+        for kv in kvs {
+            let id = Self::parse_id_from_key(EXTENT_LAYOUT_PREFIX, &kv.key)
+                .map_err(|e| format!("undecodable extentLayout key: {e}"))?;
+            if id == 0 {
+                return Err("extentLayout entry keyed by extent 0, which is not an extent".into());
             }
+            let Some(&b) = kv.value.first() else {
+                return Err(format!("extentLayout/{id} holds an empty value"));
+            };
+            let Some(loc) = PayloadLocation::from_wire_byte(b) else {
+                return Err(format!(
+                    "extentLayout/{id} names payload location {b}, which this build does not \
+                     have — a newer manager wrote it; refusing to lead rather than serve the \
+                     wrong file for this extent"
+                ));
+            };
+            out.insert(id, loc);
         }
-        out
+        Ok(out)
     }
 }
 
@@ -123,10 +151,21 @@ mod tests {
         );
     }
 
+    fn kv(key: &str, value: &[u8]) -> autumn_etcd::proto::KeyValue {
+        autumn_etcd::proto::KeyValue {
+            key: key.as_bytes().to_vec(),
+            value: value.to_vec(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn replay_restores_the_map() {
-        let raw: Vec<(u64, &[u8])> = vec![(7, &[1u8]), (9, &[0u8]), (11, &[])];
-        let decoded = AutumnManager::decode_extent_layout_kvs(raw.into_iter());
+        let decoded = AutumnManager::decode_extent_layout_kvs(&[
+            kv("extentLayout/7", &[1u8]),
+            kv("extentLayout/9", &[0u8]),
+        ])
+        .expect("both entries name a location this build has");
         let m = AutumnManager::new();
         m.install_replayed_payload_locations(decoded);
         assert_eq!(m.payload_location_of(7), PayloadLocation::InShardFile);
@@ -134,7 +173,47 @@ mod tests {
         assert_eq!(
             m.payload_location_of(11),
             PayloadLocation::InDat,
-            "a malformed entry must not block replay"
+            "an extent with NO entry is the migration case and still reads as .dat"
+        );
+    }
+
+    /// The reversal this module's `decode_extent_layout_kvs` doc argues for.
+    /// A location byte only a NEWER manager could have written must refuse
+    /// leadership, not read as `.dat` — `.dat` is a claim about which file
+    /// holds the value, and on a converted extent it is the wrong one.
+    #[test]
+    fn a_location_this_build_cannot_read_refuses_leadership() {
+        let err = AutumnManager::decode_extent_layout_kvs(&[
+            kv("extentLayout/7", &[1u8]),
+            kv("extentLayout/9", &[2u8]),
+        ])
+        .expect_err("byte 2 names no location this build has");
+        assert!(err.contains("extentLayout/9"), "names the entry: {err}");
+        assert!(err.contains('2'), "names the byte it could not read: {err}");
+    }
+
+    /// An EMPTY value is corruption, not a default: nothing this cluster runs
+    /// can write one, since every writer goes through `PayloadLocation`.
+    #[test]
+    fn an_empty_entry_refuses_leadership() {
+        let err = AutumnManager::decode_extent_layout_kvs(&[kv("extentLayout/7", &[])])
+            .expect_err("an empty value names nothing");
+        assert!(err.contains("extentLayout/7"), "names the entry: {err}");
+    }
+
+    /// A key this build cannot parse is refused for the SAME reason its value
+    /// would be: dropping it leaves the extent reading as `InDat`, and a
+    /// silently-skipped key is indistinguishable from an extent that never had
+    /// an entry. Pinned here rather than at the call site because the key parse
+    /// now lives inside this function — that is what keeps a test of it a test
+    /// of what replay actually does.
+    #[test]
+    fn an_unparseable_key_refuses_leadership() {
+        let err = AutumnManager::decode_extent_layout_kvs(&[kv("extentLayout/not-a-number", &[1])])
+            .expect_err("the id is not a u64");
+        assert!(
+            err.contains("undecodable extentLayout key"),
+            "says what it could not read: {err}"
         );
     }
 }

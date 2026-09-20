@@ -730,6 +730,21 @@ alongside the extent. `handle_extent_info` fills it; extent deletion drops it.
 A legacy EC extent is `ec_converted = true, InDat` — the pre-CoW scheme renamed
 each shard over `.dat` — so it keeps working with no backfill.
 
+**The stored byte is parsed ONCE, at replay, and it is fail-loud like every
+other persisted value.** `extent_payload_location` holds the RESOLVED location,
+not the byte, so no read of the map can re-answer the question. An entry naming
+a location this build does not have refuses leadership, and so does an empty
+value or an unparseable key — it can only have been written by a newer manager
+that was then rolled back, which is the case `replay_from_etcd` is fail-loud
+about everywhere else. This REVERSES the earlier rule ("drop it with a WARN and
+read the extent as `InDat`, rather than refuse leadership over a byte that only
+selects between two files"), whose premise was that `InDat` is the neutral
+default. It is not: it is a positive claim that `extent-{id}.dat` holds the
+payload, published to every reader on `ExtentInfoResp`, and on a converted
+extent it points readers at the wrong file. ABSENT is untouched and still means
+`InDat` — that is the migration story and the only reason this key can be
+sparse.
+
 **Attempt identity (`attempt_nonce`).** A conversion attempt is identified by the
 etcd revision of the txn that created its marker — taken from that txn's own
 response (`txn_fenced_revision`), held in `inflight_attempt_nonce` beside the

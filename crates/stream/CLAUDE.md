@@ -55,6 +55,19 @@ Each extent file pair:
 | 44–47 | `avali` (le u32) (V2) |
 | 48–51 | CRC32C of bytes 0–47 (V2; V1 puts a CRC of 0–39 at 40–43) |
 
+**`EXTMETA\x02` defines which bytes may appear at offset 41** — the byte's
+meaning is the sidecar's to version, exactly as `sealed` and `avali` are, and it
+is NOT inherited from `extent_rpc::PayloadLocation`. `parse_meta` refuses the
+whole record when the byte is outside that set, so the extent goes through
+META-FAILCLOSED like any other unreadable `.meta`: reads and appends refused,
+manager recovery rebuilds it. That is the rollback case — a newer binary
+committed a layout and was replaced by this one — and the alternative is reading
+it as `InDat`, which is a positive claim that `.dat` holds this node's payload on
+precisely the extents whose payload has moved somewhere this build cannot name.
+`LocalExtentMeta.payload_location` is therefore always a byte this build
+resolves, which is what makes the raw-byte comparisons downstream (the EC
+staging re-derive on load, the flip's already-committed check) safe.
+
 `payload_location` is the durable answer to "did an EC conversion COMMIT here",
 and it is the reason a restart cannot reopen the overwrite window: the manager's
 layout flip is the only commit point and there is no rename, so the staged shard
@@ -973,6 +986,23 @@ the peer's own `i` in `ec_reconstruct_shard_subrange` / `ec_read_full` /
 `run_ec_recovery_payload`. **Every peer is asked for ITS OWN shard**; before the
 file was named, EC shard recovery asked each peer for "the extent" and relied on
 that peer's `.dat` happening to be its shard.
+
+**A location this build cannot read names no file, so every path that would name
+one refuses instead of guessing.** The client resolves it ONCE per read
+(`published_payload`) and carries the resolved value to each slot; the reconcile
+sweep leaves every file of such an extent alone rather than treating them all as
+residue; the EC rebuild refuses rather than writing a shard into `.dat`;
+`classify_ec_shard` answers `Unknown`, which is already its "cannot tell →
+refuse" verdict. None of this is reachable while only two locations exist — it
+is what makes adding a third a loud event instead of a silent one.
+
+The refusal is spelled out at seven sites rather than once, and that fan-out is
+TEMPORARY and structural: `ExtentInfo.payload_location` is still a `u8` because
+`ExtentInfo` is an rkyv struct on the client surface, so retyping it would be a
+client-facing break. Once the manager's persisted types are split from their
+wire forms (`F-SCHEMA-HOMES` scopes 1-3) the byte can be resolved once at that
+boundary and these collapse into it. Do not "tidy" them meanwhile by restoring a
+shared default — the shared default IS the bug.
 
 Two invariants make this safe rather than merely present:
 - **`InDat` is ONE identity whatever the slot** (`PayloadRef::for_extent`

@@ -223,7 +223,13 @@ pub struct ReadBytesReq {
     pub eversion: u64,
     pub offset: u64,
     pub length: u64,
-    pub payload_location: u8,
+    /// Held RESOLVED, not as the raw byte. This message is hand-coded
+    /// fixed-layout, so the field's type is free — only `encode`/`decode` touch
+    /// the wire form — and keeping it typed means the one place a byte can be
+    /// unreadable is `decode`, which refuses the request. Every server path
+    /// downstream (`payload_ref`, the read batcher's anchor comparison,
+    /// `holds_payload`) then names a file it can actually name.
+    pub payload_location: PayloadLocation,
     pub shard_index: u32,
 }
 
@@ -235,7 +241,7 @@ impl ReadBytesReq {
             eversion,
             offset,
             length,
-            payload_location: payload.location.as_byte(),
+            payload_location: payload.location,
             shard_index: payload.shard_index,
         }
     }
@@ -250,7 +256,7 @@ impl ReadBytesReq {
         buf.put_u64_le(self.eversion);
         buf.put_u64_le(self.offset);
         buf.put_u64_le(self.length);
-        buf.put_u8(self.payload_location);
+        buf.put_u8(self.payload_location.as_byte());
         buf.put_slice(&[0u8; 3]);
         buf.put_u32_le(self.shard_index);
         buf.freeze()
@@ -266,13 +272,19 @@ impl ReadBytesReq {
         let length = data.get_u64_le();
         // The payload-file selector is a trailing addition, so a 32-byte
         // request decodes to `(InDat, 0)` — exactly what it meant before the
-        // field existed.
+        // field existed. That is an ABSENT field, which is a different thing
+        // from a present byte naming a file this build cannot name: the short
+        // form is a sender that never had the concept, so `.dat` is what it
+        // asked for. A byte outside the set is refused here, once, rather than
+        // folded to `.dat` at every site that later reads it.
         let (payload_location, shard_index) = if data.len() >= 8 {
             let loc = data.get_u8();
             let _pad = data.get_uint_le(3);
+            let loc = PayloadLocation::from_wire_byte(loc)
+                .ok_or("read_bytes request names an unknown payload location")?;
             (loc, data.get_u32_le())
         } else {
-            (PAYLOAD_LOCATION_IN_DAT, 0)
+            (PayloadLocation::InDat, 0)
         };
         Ok(Self {
             extent_id,
@@ -653,14 +665,42 @@ impl PayloadLocation {
         }
     }
 
-    /// An unknown byte decodes to `InDat`, never an error: it can only come
-    /// from a peer that knows a location this build does not, and the safe
-    /// reading of "I don't understand where the payload is" is the pre-existing
-    /// layout — which is also what an absent field means.
-    pub fn from_byte(b: u8) -> Self {
+    /// Reads the byte **this wire** defines. `None` = a byte outside that set.
+    ///
+    /// This used to answer `InDat` for any unrecognised byte, on the stated
+    /// grounds that it could only come from a peer knowing a location this
+    /// build does not, and that the pre-existing layout was the safe reading of
+    /// "I don't know where the payload is". Both halves were wrong:
+    ///
+    /// - **That peer cannot exist**, though NOT by the one rule it is tempting
+    ///   to cite. `cluster_peer_compat_check` covers only the manager / PS / EN
+    ///   (exact `WIRE_VERSION`). An embedded CLIENT also sends this byte, on the
+    ///   default-on direct read straight to an extent node — and **the extent
+    ///   node has no hello and no admission gate at all**. What actually holds
+    ///   is the chain: a client above the cluster's ceiling is refused by the
+    ///   manager and the PS before it can obtain the redirect descriptor a
+    ///   direct read needs, and no wire version has ever defined a third
+    ///   location. So whoever ADDS one must check that chain, not this comment:
+    ///   with a window `[43,45]` and location `2` introduced at 45, a wire-45
+    ///   client is in-window against a wire-43 cluster, and the PS gate is the
+    ///   only thing between it and an EN that would now refuse its read.
+    /// - **`InDat` is not the absence of an answer, it is a positive claim**
+    ///   that `extent-{id}.dat` holds the payload. `ExtentEntry::holds_payload`
+    ///   exists so that serving `.dat` to a request for a shard file "returns
+    ///   shard bytes as a whole value, the exact corruption the location field
+    ///   exists to rule out" — and a lenient fold hands that corruption straight
+    ///   through the check meant to stop it.
+    ///
+    /// The byte is also PERSISTED in two places, and neither inherits its
+    /// meaning from here: the manager's `extentLayout/<id>` etcd value
+    /// (`crates/manager/src/extent_layout.rs`) and the extent node's `.meta`
+    /// sidecar, whose `EXTMETA\x02` magic defines what its byte 41 may hold.
+    /// Each parses its own carrier and converts explicitly.
+    pub fn from_wire_byte(b: u8) -> Option<Self> {
         match b {
-            PAYLOAD_LOCATION_IN_SHARD_FILE => Self::InShardFile,
-            _ => Self::InDat,
+            PAYLOAD_LOCATION_IN_DAT => Some(Self::InDat),
+            PAYLOAD_LOCATION_IN_SHARD_FILE => Some(Self::InShardFile),
+            _ => None,
         }
     }
 }
@@ -707,6 +747,10 @@ impl PayloadRef {
     /// Resolve against an extent's published layout: the extent says WHERE its
     /// payload lives, the caller says WHICH shard it is reading.
     ///
+    /// Takes the location already resolved, not the raw byte, so that a caller
+    /// holding an unreadable one has to say what it does about that before it
+    /// can name a file (`ExtentInfo::payload` is where the byte is read).
+    ///
     /// The index is dropped for `InDat`, because there it names nothing: one
     /// `.dat` is the payload whatever slot the caller happens to be reading
     /// from. Normalising here — rather than at each comparison — keeps this
@@ -714,8 +758,8 @@ impl PayloadRef {
     /// they name the same file. (Without it, replicated reads of one extent
     /// from different slots would carry different indices and stop batching,
     /// even though every one of them means `.dat`.)
-    pub fn for_extent(payload_location: u8, shard_index: u32) -> Self {
-        match PayloadLocation::from_byte(payload_location) {
+    pub fn for_extent(location: PayloadLocation, shard_index: u32) -> Self {
+        match location {
             PayloadLocation::InDat => Self::in_dat(),
             PayloadLocation::InShardFile => Self::shard(shard_index),
         }
@@ -783,17 +827,28 @@ pub struct ExtentInfo {
     /// so an open / pre-conversion extent has `parity != []` but
     /// still holds full replicated data on every K+M node.
     pub ec_converted: bool,
-    /// Where each member node keeps this extent's payload
-    /// (`PayloadLocation::from_byte`). `0` = `InDat`, which is both the default
-    /// and what every extent predating this field means — the manager stores it
-    /// beside `extents/<id>` rather than inside it, so old records decode
-    /// unchanged and simply read as `InDat`.
+    /// Where each member node keeps this extent's payload. Read it through
+    /// [`ExtentInfo::payload`], never by comparing the byte. `0` = `InDat`,
+    /// which is both the default and what every extent predating this field
+    /// means — the manager stores it beside `extents/<id>` rather than inside
+    /// it, so old records decode unchanged and simply read as `InDat`.
     ///
     /// `ec_converted` says the extent's bytes ARE shards; this says which FILE
     /// they live in. The pre-CoW scheme renamed the shard over `.dat`, so a
     /// legacy converted extent is `ec_converted = true, InDat` and keeps
     /// working with no backfill.
     pub payload_location: u8,
+}
+
+impl ExtentInfo {
+    /// The published layout, resolved. `None` = the byte names a location this
+    /// build does not have, which is the one answer no caller may round down to
+    /// `.dat`: see `PayloadLocation::from_wire_byte`. Every caller that names a
+    /// payload file goes through here, so the refusal is stated once per read
+    /// path rather than per file reference.
+    pub fn payload(&self) -> Option<PayloadLocation> {
+        PayloadLocation::from_wire_byte(self.payload_location)
+    }
 }
 
 /// StreamInfo — stream ID and its ordered list of extent IDs.
@@ -1441,18 +1496,61 @@ mod extent_rpc_codec_tests {
     #[test]
     fn in_dat_has_one_identity_regardless_of_slot() {
         assert_eq!(
-            PayloadRef::for_extent(PAYLOAD_LOCATION_IN_DAT, 3),
-            PayloadRef::for_extent(PAYLOAD_LOCATION_IN_DAT, 0)
+            PayloadRef::for_extent(PayloadLocation::InDat, 3),
+            PayloadRef::for_extent(PayloadLocation::InDat, 0)
         );
         assert_ne!(
-            PayloadRef::for_extent(PAYLOAD_LOCATION_IN_SHARD_FILE, 3),
-            PayloadRef::for_extent(PAYLOAD_LOCATION_IN_SHARD_FILE, 0),
+            PayloadRef::for_extent(PayloadLocation::InShardFile, 3),
+            PayloadRef::for_extent(PayloadLocation::InShardFile, 0),
             "two shard files on one node are different files"
         );
     }
 
+    /// The byte set is closed, and the two members are pinned BY NAME — a
+    /// consistent renumbering (swapping the two constants along with every
+    /// match arm) is invisible to a round-trip assertion, and these two numbers
+    /// are on the wire and in two persisted carriers.
     #[test]
-    fn an_unknown_location_byte_reads_as_in_dat() {
-        assert_eq!(PayloadLocation::from_byte(200), PayloadLocation::InDat);
+    fn the_wire_location_byte_set_is_closed_and_numbered() {
+        assert_eq!(PAYLOAD_LOCATION_IN_DAT, 0);
+        assert_eq!(PAYLOAD_LOCATION_IN_SHARD_FILE, 1);
+        assert_eq!(
+            PayloadLocation::from_wire_byte(0),
+            Some(PayloadLocation::InDat)
+        );
+        assert_eq!(
+            PayloadLocation::from_wire_byte(1),
+            Some(PayloadLocation::InShardFile)
+        );
+        for b in 2u8..=255 {
+            assert_eq!(
+                PayloadLocation::from_wire_byte(b),
+                None,
+                "byte {b} names no location this build has, and must not fold to .dat"
+            );
+        }
+    }
+
+    /// A present-but-unreadable selector is refused at decode, so no server
+    /// path downstream can serve `.dat` to a request that asked for something
+    /// else. The SHORT form is a different case and stays accepted: it is a
+    /// sender that predates the field, and `.dat` is what it meant.
+    #[test]
+    fn a_read_naming_an_unknown_location_is_refused_at_decode() {
+        let mut buf = BytesMut::with_capacity(40);
+        buf.put_u64_le(7);
+        buf.put_u64_le(1);
+        buf.put_u64_le(0);
+        buf.put_u64_le(200);
+        buf.put_u8(200);
+        buf.put_slice(&[0u8; 3]);
+        buf.put_u32_le(0);
+        let Err(err) = ReadBytesReq::decode(buf.freeze()) else {
+            panic!("byte 200 names no file this build can serve; decode must refuse");
+        };
+        assert!(
+            err.contains("unknown payload location"),
+            "the refusal must name WHY, not read as a length/format error: {err}"
+        );
     }
 }

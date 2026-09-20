@@ -1582,6 +1582,11 @@ struct LocalExtentMeta {
     /// window for a superseded coordinator's late stripe to overwrite live
     /// data. V0/V1 records and every extent written before this field read as
     /// `InDat`, which is the documented default.
+    ///
+    /// INVARIANT: always a byte `PayloadLocation::from_wire_byte` resolves —
+    /// `parse_meta` refuses the whole record otherwise, so the raw-byte
+    /// comparisons downstream (the EC staging re-derive, the flip's
+    /// already-committed check) cannot be reading a location they do not know.
     payload_location: u8,
 }
 
@@ -4484,7 +4489,20 @@ impl ExtentNode {
         staging_tick_at_ask: u64,
     ) {
         for p in placements {
-            let want = PayloadRef::for_extent(p.payload_location, p.shard_index);
+            // A placement DELETES files — everything this extent holds that the
+            // named one is not. A location this build cannot read names no file,
+            // so there is nothing to keep and everything would be residue; skip
+            // the extent until a binary that understands the layout answers.
+            let Some(location) = PayloadLocation::from_wire_byte(p.payload_location) else {
+                tracing::warn!(
+                    extent_id = p.extent_id,
+                    payload_location = p.payload_location,
+                    "reconcile placement names a payload location this build does not have — \
+                     leaving every file of this extent alone"
+                );
+                continue;
+            };
+            let want = PayloadRef::for_extent(location, p.shard_index);
             let Some(entry) = self.extents.get(&p.extent_id).map(|e| Rc::clone(e.value())) else {
                 continue;
             };
@@ -5268,6 +5286,27 @@ impl ExtentNode {
             // buf[41] was reserved padding, so it is 0 — i.e. InDat — in every
             // record written before the field existed. Same layout, same size,
             // same CRC coverage: no migration, no version bump.
+            //
+            // **`EXTMETA\x02` defines which bytes may appear here**, and the
+            // magic is how that set is versioned — the same job it already does
+            // for `sealed` and `avali`. A byte outside it was written by a
+            // binary whose format this one does not have (a rollback), and it
+            // is NOT a padding byte to round down: `InDat` is a positive claim
+            // that `.dat` holds this node's payload, so folding an unknown
+            // location to it serves shard bytes as a whole value on exactly the
+            // extents whose payload has moved. There is no third answer worth
+            // inventing — the extent goes through META-FAILCLOSED like any
+            // other unreadable record, which refuses reads and appends and
+            // waits for the manager to rebuild it.
+            if PayloadLocation::from_wire_byte(buf[41]).is_none() {
+                tracing::error!(
+                    extent_id,
+                    payload_location = buf[41],
+                    "META-FAILCLOSED: `.meta` names a payload location this build does not \
+                     have — a newer binary wrote this record; quarantining the extent"
+                );
+                return None;
+            }
             (sealed, avali, buf[41])
         } else {
             (
@@ -6780,10 +6819,10 @@ impl ExtentNode {
         // file cannot satisfy — an EC'd extent is repaired by
         // `run_ec_recovery_payload`, which reads shards by name. Refuse loudly
         // rather than hand back a shard sized like a short read.
-        if PayloadLocation::from_byte(extent.payload_location) != PayloadLocation::InDat {
+        if extent.payload() != Some(PayloadLocation::InDat) {
             return Err(format!(
-                "extent {}: payload is not in .dat; full-extent copy does not apply",
-                extent.extent_id
+                "extent {}: payload is not in .dat (location byte {}); full-extent copy does not apply",
+                extent.extent_id, extent.payload_location
             ));
         }
         let mut attempted = 0usize;
@@ -7180,9 +7219,17 @@ impl ExtentNode {
             // legacy converted extent (shard renamed over `.dat`) keeps its
             // old shape.
             let shard_index = Self::ec_shard_index(&extent_info, task.replace_id)?;
-            if PayloadLocation::from_byte(extent_info.payload_location)
-                == PayloadLocation::InShardFile
-            {
+            // The `else` arm below writes `.dat`, so an unreadable location must
+            // not reach it: a rebuild landing in the wrong file leaves this node
+            // serving shard bytes as a whole value AND the named file missing.
+            let Some(location) = extent_info.payload() else {
+                return Err(format!(
+                    "extent {}: payload location {} names no file this build knows; \
+                     refusing to rebuild a shard into a file the layout did not name",
+                    task.extent_id, extent_info.payload_location
+                ));
+            };
+            if location == PayloadLocation::InShardFile {
                 let disk = self.disk_for(extent.disk_id)?;
                 let path = disk.shard_path(task.extent_id, shard_index as u32);
                 if let Some(parent) = path.parent() {
@@ -7625,6 +7672,17 @@ impl ExtentNode {
         want: u64,
     ) -> Result<Vec<Option<Vec<u8>>>, String> {
         let data_shards = extent_info.replicates.len();
+        // Every peer is asked for ITS OWN shard, in the file the published
+        // layout names. A location this build cannot read names no file, so
+        // there is no request to send — refuse the stripe rather than ask each
+        // peer for `.dat` and reconstruct from whatever that happens to hold.
+        let location = extent_info.payload().ok_or_else(|| {
+            format!(
+                "extent {}: payload location {} names no file this build knows; \
+                 refusing to gather an EC stripe",
+                task.extent_id, extent_info.payload_location
+            )
+        })?;
         let n = all_node_ids.len();
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
         let mut collected = 0usize;
@@ -7663,7 +7721,7 @@ impl ExtentNode {
                 extent_info.eversion,
                 offset,
                 span,
-                PayloadRef::for_extent(extent_info.payload_location, i as u32),
+                PayloadRef::for_extent(location, i as u32),
             )
             .await
             {
@@ -8987,14 +9045,20 @@ impl ExtentNode {
         // report cost an outage: the legacy path opens with `set_len(0)`, so
         // re-running a rebuild that had already finished truncates a shard that
         // readers are currently being served.
-        let have =
-            if PayloadLocation::from_byte(info.payload_location) == PayloadLocation::InShardFile {
-                entry.shard_file_len(shard_index as u32)
-            } else if entry.has_dat.load(Ordering::SeqCst) {
-                Some(entry.len.load(Ordering::SeqCst))
-            } else {
-                None
-            };
+        let Some(location) = info.payload() else {
+            // A location this build cannot read cannot say which file to
+            // measure, and the `.dat` arm below is a guess that condemns or
+            // adopts the wrong file. `Unknown` is the verdict that means
+            // exactly this, and it refuses rather than acts.
+            return LocalCopyVerdict::Unknown;
+        };
+        let have = if location == PayloadLocation::InShardFile {
+            entry.shard_file_len(shard_index as u32)
+        } else if entry.has_dat.load(Ordering::SeqCst) {
+            Some(entry.len.load(Ordering::SeqCst))
+        } else {
+            None
+        };
         match have {
             // Exact length only. A shard is fixed-size by construction, so
             // `>=` would adopt an over-long file, and the reader — which
@@ -12387,6 +12451,106 @@ mod sealed_append_guard_tests {
         }
     }
 
+    /// A `.meta` naming a payload location this build does not have must
+    /// QUARANTINE the extent, never read as `InDat` and serve `.dat`.
+    ///
+    /// This is the rollback shape: a newer binary committed a layout, wrote
+    /// the byte, and was replaced by this one. `InDat` is not the absence of an
+    /// answer — it is a positive claim that `extent-{id}.dat` holds this node's
+    /// payload — so folding an unreadable location into it hands `.dat` bytes
+    /// to a caller asking for the value on precisely the extents whose value
+    /// has moved elsewhere.
+    ///
+    /// The CRC is RECOMPUTED over the edited record, so the CRC cannot be what
+    /// refuses it and the `.dat` is left untouched and readable. The control
+    /// run is the same fixture with the byte set to `InDat` — one byte of
+    /// difference, opposite outcomes — so a fold would show up as the control
+    /// and the test agreeing.
+    #[compio::test]
+    async fn a_meta_naming_an_unknown_payload_location_quarantines_the_extent() {
+        async fn read_code_after_reload_with_location(loc_byte: u8) -> u8 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_path_buf();
+            let eid = 7311u64;
+            {
+                let node = ExtentNode::new(ExtentNodeConfig::new(path.clone(), 1))
+                    .await
+                    .expect("node1");
+                node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: eid }))
+                    .await
+                    .expect("alloc");
+                let ok = AppendResp::decode(
+                    node.handle_append(
+                        AppendReq {
+                            extent_id: eid,
+                            eversion: 1,
+                            commit: 0,
+                            owner_epoch: 10,
+                            payload: Bytes::from(vec![7u8; 64]),
+                        }
+                        .encode(),
+                    )
+                    .await
+                    .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(ok.code, CODE_OK, "the append must land before the reload");
+            }
+
+            fn find_meta(root: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+                for e in std::fs::read_dir(root).ok()?.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        if let Some(f) = find_meta(&p, name) {
+                            return Some(f);
+                        }
+                    } else if p.file_name().and_then(|s| s.to_str()) == Some(name) {
+                        return Some(p);
+                    }
+                }
+                None
+            }
+            let meta_path = find_meta(&path, &format!("extent-{eid}.meta")).expect("meta on disk");
+            let mut bytes = std::fs::read(&meta_path).expect("read meta");
+            assert_eq!(
+                bytes.len(),
+                ExtentNode::META_SIZE_V2,
+                "the fixture depends on a V2 record"
+            );
+            bytes[41] = loc_byte;
+            let crc = crc32c::crc32c(&bytes[0..ExtentNode::META_SIZE_V2 - 4]);
+            bytes[48..52].copy_from_slice(&crc.to_le_bytes());
+            std::fs::write(&meta_path, &bytes).expect("write meta");
+
+            let node = ExtentNode::new(ExtentNodeConfig::new(path.clone(), 1))
+                .await
+                .expect("node2 reload");
+            let resp = ReadBytesResp::decode(
+                node.handle_read_bytes(
+                    ReadBytesReq::new(eid, 1, 0, 64, PayloadRef::in_dat()).encode(),
+                )
+                .await
+                .unwrap(),
+            )
+            .unwrap();
+            resp.code
+        }
+
+        assert_eq!(
+            read_code_after_reload_with_location(autumn_rpc::extent_rpc::PAYLOAD_LOCATION_IN_DAT)
+                .await,
+            CODE_OK,
+            "control: the same record with a location this build HAS serves the bytes, \
+             so the refusal below is about the location byte and nothing else"
+        );
+        assert_eq!(
+            read_code_after_reload_with_location(2).await,
+            CODE_EVERSION_MISMATCH,
+            "a location this build cannot read must quarantine the extent so the \
+             client fails over, not serve `.dat` as if the payload were still there"
+        );
+    }
+
     /// P0-C (coco review #3): a sealed-EMPTY extent that has residual/ghost
     /// `.dat` bytes must report logical length 0 via commit_length AND return 0
     /// bytes on a `length=0` read — never the residual length / bytes past its
@@ -12808,6 +12972,22 @@ mod meta_crc_tests {
             ExtentNode::parse_meta(&tampered, extent_id).is_none(),
             "payload_location is CRC-protected like every other field"
         );
+
+        // A location byte only a NEWER binary could have written — a rollback.
+        // `EXTMETA\x02` defines which bytes may appear at offset 41, so this
+        // record is unreadable AS A WHOLE, not a record with one odd field:
+        // the alternative is reading it as `InDat`, which is a positive claim
+        // that `.dat` holds this node's payload on an extent whose payload has
+        // demonstrably moved somewhere this build cannot name. The CRC is
+        // recomputed over the new byte, so nothing but the value itself can
+        // refuse it.
+        for loc in [2u8, 3, 200, 255] {
+            assert!(
+                ExtentNode::parse_meta(&build_v2(loc), extent_id).is_none(),
+                "location byte {loc} names no file this build has; the record must \
+                 quarantine the extent, never read as InDat"
+            );
+        }
     }
 
     /// round-trip through V1 meta save/parse with CRC validation.

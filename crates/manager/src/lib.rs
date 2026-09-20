@@ -75,6 +75,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use autumn_common::{AppError, MetadataStore};
+use autumn_rpc::extent_rpc::PayloadLocation;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::{Frame, FrameDecoder, StatusCode};
 use bytes::Bytes;
@@ -769,7 +770,13 @@ pub struct AutumnManager {
     /// Which payload file holds each extent's bytes, for the extents that are
     /// not in the default `InDat` shape. See `extent_layout.rs`; persisted at
     /// the `extentLayout/` prefix, absent ⇒ `InDat`.
-    pub(crate) extent_payload_location: Rc<RefCell<HashMap<u64, u8>>>,
+    ///
+    /// RESOLVED, not the stored byte: the etcd value is parsed once, at replay,
+    /// and an entry this build cannot read refuses leadership there. Holding
+    /// the byte instead would put a second parse on every read of the map, and
+    /// a second parse is a second chance to answer `InDat` for a file this
+    /// build cannot name.
+    pub(crate) extent_payload_location: Rc<RefCell<HashMap<u64, PayloadLocation>>>,
     /// Per-process sequence + amortised-rotation counter for the durable
     /// op-log (see `op_log`).
     pub(crate) op_log_seq: Cell<u64>,
@@ -3567,14 +3574,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 }
             }
         }
-        self.install_replayed_payload_locations(Self::decode_extent_layout_kvs(
-            extent_layout_raw.kvs.iter().filter_map(|kv| {
-                let id =
-                    Self::parse_id_from_key(crate::extent_layout::EXTENT_LAYOUT_PREFIX, &kv.key)
-                        .ok()?;
-                Some((id, kv.value.as_slice()))
-            }),
-        ));
+        self.install_replayed_payload_locations(
+            Self::decode_extent_layout_kvs(&extent_layout_raw.kvs)
+                .map_err(Self::replay_decode_err)?,
+        );
         self.install_replayed_corrupt_slots(Self::decode_extent_corrupt_kvs(
             extent_corrupt_raw.kvs.iter().filter_map(|kv| {
                 let id =

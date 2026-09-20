@@ -463,9 +463,17 @@
   - 每个持久结构有测试证明"加字段后旧二进制重放响亮失败"，或记录它靠什么别的机制兜底。
   - 客户端拿到的路由记录不再包含任何 `*_stream` id（编译期不可达，非运行时断言）。
   - Ablation：把某个分家出去的类型搬回 wire 文件 → 第一条验收转红。
-- **Status**: 仅立账，未动工。与 [[F-CLIENT-WIRE-COMPAT]] 的第 3 条 Scope 有交集
-  （`MgrRegionInfo` / `MgrNamespace` 的客户端那一份），其余可并行。
-- `passes: false`
+- **Status**: `passes: false`（2026-09-20 开工）— **Scope 4 已落地**，其余四条未动。
+  payload-location 那个字节的三个载体各自立家：wire（`PayloadLocation::from_wire_byte`
+  改返回 `Option`，`ReadBytesReq` 直接持 resolved 值、解码时拒陌生字节）、EN 的 `.meta`
+  第 41 字节（由 `EXTMETA\x02` 魔数定义合法集合，越界走既有 META-FAILCLOSED 隔离）、
+  manager 的 `extentLayout/<id>`（解码 fail-loud，越界/空值/坏 key 一律拒绝当 leader；
+  **缺 key 仍然是 `InDat`**，那是迁移故事本身）。旧 `from_byte` 文档的前提被证伪：
+  peer 精确相等 ⇒ "只可能来自知道更多位置的 peer"不存在。**今天行为惰性**——只有两个
+  合法值，树里没有任何生产方能产出第三个字节；这条改的是加第三个位置那天会不会静默。
+  Scope 1/2/3/5（8 个持久类型分家、穷尽转换、`MgrRegionInfo`/`MgrNamespace` 三分、
+  替代守卫）仍未动，第一条 Acceptance 未跑。与 [[F-CLIENT-WIRE-COMPAT]] 的第 3 条
+  Scope 有交集（`MgrRegionInfo` / `MgrNamespace` 的客户端那一份），其余可并行。
 
 ### F-STREAM-ATREST-CKSUM — stream 层大 value 的 at-rest 内容校验 + scrub（静默腐化 G12）
 - **Trigger** (2026-08-04, chaos 缺口 loop 的 G12，已 reproduce-first 复现 harness `crates/manager/tests/silent_corruption_rot.rs`): sealed extent 的 **value 数据字节**在单副本上被静默翻位后，**全链无检测**：(a) 客户端读回坏字节仍返回 `CODE_OK`（frame CRC 明确排除 bulk value 段；`.meta` CRC 只覆盖 40B 元数据；WAL/SST CRC 是 partition 层、不覆盖 stream extent 的原始 value）；(b) recovery 从坏副本重填时 `verify` 只校 `length==sealed_length` + eversion、**不校内容** → 把腐化洗成权威；(c) EC 转换对坏字节直接编 parity → 固化成 canonical。stream 层**既无 per-extent/block content checksum、也无 scrubber**；确定性副本轮转让坏副本被一致选中（harness 里 25/64 子区间读命中）。这是**设计缺口**（数据完整性面），不是坏代码——today 的裸机盘不会自发翻位、且需要单副本静默腐化才触发，故不是"今天可复现的线上危害"，属于中期加固。

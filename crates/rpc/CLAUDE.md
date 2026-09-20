@@ -110,6 +110,30 @@ payloads.
   `FenceExtentReq`/`FenceExtentResp`) raises the per-extent `owner_epoch` fence
   floor WITHOUT appending — the eager takeover fence (`StreamClient::fence_tail`,
   the G1 zombie-writer fix; see stream CLAUDE.md note 31).
+
+  **`PayloadLocation` is the WIRE form of the location byte, and nothing else
+  inherits its meaning.** The same byte is persisted in two other carriers, each
+  versioned by its own schema: the extent node's `.meta` sidecar at offset 41,
+  governed by the `EXTMETA\x02` magic, and the manager's `extentLayout/<id>`
+  etcd value. `from_wire_byte` answers `Option` and there is no lenient fold,
+  because a peer knowing a location this build does not cannot reach these
+  decoders — but NOT for the reason the deleted comment gave. Exact
+  `WIRE_VERSION` equality covers manager/PS/EN only. An embedded CLIENT sends
+  this byte too, on the default-on direct read to an extent node, and **the EN
+  has no hello and no admission gate at all**: what holds there is that a client
+  above the cluster's ceiling never obtains the redirect descriptor a direct
+  read needs, because the manager and the PS refuse it first. Whoever adds a
+  third location must re-check THAT chain — a wire-45 client is in-window
+  against a wire-43 cluster. Folding an unreadable byte to `InDat` is not the absence
+  of an answer — `InDat` is a positive claim that `extent-{id}.dat` holds the
+  payload, so the fold hands shard bytes to a caller asking for a value on
+  exactly the extents whose payload has moved. `ReadBytesReq` therefore carries
+  the location RESOLVED (it is hand-coded fixed-layout, so only `encode`/`decode`
+  touch the byte) and refuses an unreadable one at `decode`; every other reader
+  goes through `ExtentInfo::payload`, which states the refusal once per read
+  path. An ABSENT selector is still `InDat` and always will be — a 32-byte
+  `ReadBytesReq` is a sender that predates the field, which is a different thing
+  from a present byte naming a file this build cannot name.
 - **`manager_rpc.rs`** / **`partition_rpc.rs`** — manager and PS wire schemas
   (rkyv structs + `MSG_*` constants), the most-referenced surface in the crate.
   The extent-service messages the manager sends are **re-exported** from
