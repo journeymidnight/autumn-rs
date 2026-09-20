@@ -1,9 +1,9 @@
 //! Native LanceDB integration: no FUSE, no S3 gateway.
 //!
-//! Goes through the `autumn://` PROVIDER rather than injecting a store object,
-//! so this demo and the Python wheel exercise one code path. The injection
-//! field lance offers instead is deprecated and unreachable from a prebuilt
-//! binary, so a demo using it would prove nothing about what Python does.
+//! Just connects. The fork registers the `autumn://` provider on the sessions
+//! it creates, so there is no registry to assemble here and no store to inject
+//! — which is the point: this is what any LanceDB caller writes, in Rust or in
+//! Python, and the demo is only worth something if it writes the same thing.
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -12,23 +12,8 @@ use arrow_schema::{DataType, Field, Schema};
 use autumn_object_store::AutumnObjectStore;
 use futures::TryStreamExt;
 use lance::dataset::ReadParams;
-use lancedb::Session;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path};
-
-/// A session whose registry answers `autumn://`.
-///
-/// `ObjectStoreRegistry::insert` takes `&self`, so the provider goes onto the
-/// session lancedb already builds — the same thing the fork does for the
-/// Python bindings, and the reason both languages reach one adapter.
-fn autumn_session() -> Arc<Session> {
-    let session = Arc::new(Session::default());
-    session.store_registry().insert(
-        autumn_lance_provider::SCHEME,
-        Arc::new(autumn_lance_provider::AutumnStoreProvider),
-    );
-    session
-}
 
 fn batch(first: i32, count: i32) -> Result<RecordBatch> {
     let schema = Arc::new(Schema::new(vec![
@@ -67,19 +52,13 @@ async fn main() -> Result<()> {
         "demo requires an empty dedicated object scope"
     );
 
-    // The registry is what turns a URL scheme into a store, and it is the only
-    // door a prebuilt LanceDB has. Registering here is the same act the fork
-    // performs for the Python bindings.
-    let session = autumn_session();
-
     let uri = format!("autumn://{manager}/autumn-demo");
     // No commit handler is named here on purpose. Upstream lance hands an
     // unknown scheme UnsafeCommitHandler; the fork selects ConditionalPut for
     // autumn://, and this demo is what proves it, so spelling it out would
     // mask the very thing under test.
     let db = lancedb::connect(&uri)
-        .session(session.clone())
-        .storage_option(autumn_lance_provider::OPT_SCOPE, &scope)
+        .storage_option(lancedb::AUTUMN_SCOPE_OPTION, &scope)
         .execute()
         .await?;
     let table = db.create_table("vectors", batch(0, 100)?).execute().await?;
@@ -107,8 +86,7 @@ async fn main() -> Result<()> {
     // Reopen through a SECOND connection, so the two writers below reach the
     // table through independent sessions and stores rather than sharing one.
     let second_db = lancedb::connect(&uri)
-        .session(autumn_session())
-        .storage_option(autumn_lance_provider::OPT_SCOPE, &scope)
+        .storage_option(lancedb::AUTUMN_SCOPE_OPTION, &scope)
         .execute()
         .await?;
     let reopened = second_db

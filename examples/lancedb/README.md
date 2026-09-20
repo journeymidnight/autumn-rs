@@ -21,14 +21,15 @@ reopens through a separate Autumn client, then appends from two writers and
 checks that all 210 rows survive. It verifies that manifests reside in Autumn,
 deletes its objects and vacuums unreferenced chunks.
 
-The example registers the provider on a session registry and connects with
-`autumn://<manager>/autumn-demo`, passing the scope as a storage option. It
+The example just connects: `autumn://<manager>/autumn-demo` with the scope as
+a storage option. The fork registers the provider on the sessions it creates,
+so there is no registry to assemble — in Rust or in Python. It
 names NO commit handler: upstream lance hands an unknown scheme
 UnsafeCommitHandler while the fork selects ConditionalPut for autumn://, so
 spelling it out would hide the selection the demo exists to check. Its two
-writers come from two connections with separate sessions, which means two
-registries and therefore two independent stores — one session would have shared
-a cached store and weakened the race.
+writers come from two connections, and each connect defaults its own session,
+which means two registries and therefore two independent stores — sharing one
+session would have shared a cached store and weakened the race.
 
 The commit handler is selected only on the listing database's create and open
 paths. Namespace-backed tables and clone_table still fall to lance's

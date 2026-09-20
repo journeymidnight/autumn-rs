@@ -13,7 +13,6 @@ exclude = ["provider"]
 anyhow = "1"
 arrow-array = "58"
 arrow-schema = "58"
-autumn-lance-provider = { path = "provider" }
 autumn-object-store = { path = "../../crates/object-store" }
 futures = "0.3"
 # The FORK, not upstream. The demo exists to exercise the same code Python
@@ -31,6 +30,21 @@ url = "2"
 [profile.dev]
 debug = 0
 incremental = false
+
+# The fork pins autumn-rs by git rev, so without this every autumn crate lands
+# in the graph TWICE — once from that rev, once from this working tree — with
+# two Autumn clients and two compio runtimes under them. Redirecting the git
+# source at the local paths collapses them to one copy AND makes the demo test
+# the working tree rather than a published revision, which is the only reason
+# to keep a demo in the repo at all.
+[patch."https://github.com/journeymidnight/autumn-rs.git"]
+autumn-client = { path = "../../crates/client" }
+autumn-common = { path = "../../crates/common" }
+autumn-lance-provider = { path = "provider" }
+autumn-object-store = { path = "../../crates/object-store" }
+autumn-rpc = { path = "../../crates/rpc" }
+autumn-stream = { path = "../../crates/stream" }
+autumn-transport = { path = "../../crates/transport" }
 
 [patch.crates-io]
 

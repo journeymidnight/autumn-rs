@@ -489,7 +489,6 @@ dependencies = [
  "anyhow",
  "arrow-array",
  "arrow-schema",
- "autumn-lance-provider",
  "autumn-object-store",
  "bytes",
  "futures",
@@ -4428,7 +4427,7 @@ dependencies = [
 [[package]]
 name = "lancedb"
 version = "0.40.0-beta.3"
-source = "git+https://github.com/thesues/lancedb.git?branch=autumn-native#82bc2720e33ecd66a55dd2f6bb972645c5b7e6ba"
+source = "git+https://github.com/thesues/lancedb.git?branch=autumn-native#91b5bf78b7950945e361dbc2e60499490e96c182"
 dependencies = [
  "ahash 0.8.12",
  "arrow",
@@ -4442,6 +4441,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "autumn-lance-provider",
  "base64 0.22.1",
  "bytes",
  "chrono",
