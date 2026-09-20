@@ -87,9 +87,29 @@ pub struct AutumnManager {
 }
 ```
 
-`store` (from `autumn-common`) holds streams, extents, nodes, disks, partitions,
-regions, owner revisions. Every persistent mutation is mirrored to etcd when
-`self.etcd.is_some()`.
+`store` (`src/store.rs`, moved here from `autumn-common`) holds streams,
+extents, nodes, disks, partitions, regions, owner revisions. Every persistent
+mutation is mirrored to etcd when `self.etcd.is_some()`.
+
+It moved because a persisted record is `pub(crate)` to this crate (see
+"Persisted records") and `MetadataState` is what will hold those records in
+memory — a state struct in a SHARED crate cannot hold a type only the manager
+may name. Nothing outside the manager referenced it, so no other crate changed.
+`is_owner_epoch_fence_message` deliberately stayed in `autumn-common`, because
+`autumn-stream` classifies manager rejections with it and must not depend on the
+manager; producer and matcher are held together by the shared `OWNER_*_TOKEN`
+constants plus `owner_fence_matcher_pairs_with_producer`, which came here with
+the producer and reaches across to the matcher.
+
+Invariants that came with it:
+- **ID uniqueness** — every id (stream, extent, node, disk, partition) comes
+  from one monotonic counter; never generate one outside `alloc_ids`.
+- **The owner lock bumps on EVERY acquire** — `acquire_owner_lock` returns a
+  strictly higher revision each call, fencing the previous holder. A stable
+  per-key epoch makes failback A→B→A impossible and lets two live processes
+  share one epoch (split-brain). Never mint owner revisions elsewhere.
+- **`ensure_owner_epoch` before every stream mutation** — skipping it allows
+  split-brain writes.
 
 ## Leader election
 

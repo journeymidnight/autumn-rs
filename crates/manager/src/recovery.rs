@@ -97,7 +97,7 @@ pub(crate) fn classify_ec_done(
 /// The rest of the marker (targets, disks, eversion) stays pinned — a re-derived
 /// ASSIGNMENT would corrupt EC; a re-read fence would not.
 pub(crate) fn dispatch_owner_epoch_for_extent(
-    state: &autumn_common::store::MetadataState,
+    state: &crate::store::MetadataState,
     extent_id: u64,
 ) -> i64 {
     // The MAX over every partition that references this extent, not the first
@@ -2358,7 +2358,7 @@ impl crate::AutumnManager {
     /// and a recovered node will overwrite `online=true` on the next
     /// successful `df` poll.
     pub(crate) fn mark_node_disks_offline(
-        store: &autumn_common::MetadataStore,
+        store: &crate::store::MetadataStore,
         node: &autumn_rpc::manager_rpc::MgrNodeInfo,
     ) {
         if node.disks.is_empty() {
@@ -3658,7 +3658,7 @@ mod ec_apply_fail_tests {
 #[cfg(test)]
 mod ec_dispatch_owner_epoch_tests {
     use super::dispatch_owner_epoch_for_extent;
-    use autumn_common::store::MetadataState;
+    use crate::store::MetadataState;
     use autumn_rpc::manager_rpc::{MgrPartitionMeta, MgrStreamInfo};
 
     const EXTENT: u64 = 12;
@@ -4342,7 +4342,7 @@ mod df_disk_health_tests {
     use autumn_rpc::extent_rpc::DiskStatus;
     use autumn_rpc::manager_rpc::{MgrDiskInfo, MgrNodeInfo};
 
-    fn node_with_two_disks(store: &autumn_common::MetadataStore) -> MgrNodeInfo {
+    fn node_with_two_disks(store: &crate::store::MetadataStore) -> MgrNodeInfo {
         let mut s = store.inner.borrow_mut();
         for did in [10u64, 11] {
             s.disks.insert(

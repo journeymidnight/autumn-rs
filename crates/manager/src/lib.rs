@@ -8,6 +8,7 @@ mod op_log;
 mod placement;
 mod extent_layout;
 mod persist;
+pub mod store;
 mod fs_alloc;
 pub mod inode_lease;
 pub mod node_state;
@@ -75,7 +76,8 @@ use std::str;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use autumn_common::{AppError, MetadataStore};
+use autumn_common::AppError;
+use crate::store::MetadataStore;
 use autumn_rpc::extent_rpc::PayloadLocation;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::{Frame, FrameDecoder, StatusCode};
@@ -1603,7 +1605,7 @@ impl AutumnManager {
                 s.regions.iter().map(|(id, r)| (*id, r.ps_id)).collect()
             };
             let last_op = self.last_op_at.borrow().clone();
-            let state_snapshot: autumn_common::MetadataState = (*self.store.inner.borrow()).clone();
+            let state_snapshot: crate::store::MetadataState = (*self.store.inner.borrow()).clone();
             // Recompute the full advisory cache for this tick (prune + all five
             // advisory passes + cache write) under a single policy borrow.
             let cands = self.recompute_advisory_cache(&state_snapshot, &last_op, &owners, now);
@@ -1658,7 +1660,7 @@ impl AutumnManager {
     /// separate borrow scopes in the loop body.
     fn recompute_advisory_cache(
         &self,
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         last_op: &HashMap<u64, i64>,
         owners: &HashMap<u64, u64>,
         now: i64,
@@ -1920,7 +1922,7 @@ impl AutumnManager {
     async fn send_maintenance(
         &self,
         req: autumn_rpc::partition_rpc::MaintenanceReq,
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
     ) -> Result<autumn_rpc::partition_rpc::MaintenanceResp> {
         let part_id = req.part_id;
         let ps_addr = state
@@ -1959,7 +1961,7 @@ impl AutumnManager {
         part_id: u64,
         op: u8,
         extent_ids: Vec<u64>,
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
     ) -> Result<()> {
         // Bind BEFORE the call: as an argument the `Ref` would live until the
         // end of the enclosing statement, which includes the `.await` below,
@@ -2002,7 +2004,7 @@ impl AutumnManager {
     async fn actuate_candidate(
         &self,
         cand: &PolicyCandidate,
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
     ) -> Result<()> {
         match cand.kind {
             POLICY_KIND_SPLIT => self.auto_dispatch_split(cand, None, state).await,
@@ -2201,7 +2203,7 @@ impl AutumnManager {
         &self,
         op_id: u64,
         spec: &OpSubmitReq,
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
     ) -> ActuationResult {
         let terminal_err = |e: String| ActuationResult::Terminal {
             state: OP_STATE_FAILED,
@@ -2495,7 +2497,7 @@ impl AutumnManager {
         // overrides the declared-boundary snap and is used verbatim; `None` keeps
         // the controller's snap-to-declared-boundary-else-PS-median behavior.
         explicit_at_key: Option<Vec<u8>>,
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
     ) -> Result<()> {
         // Look up the owning PS via regions + ps_nodes.
         let region = state
@@ -2581,7 +2583,7 @@ impl AutumnManager {
     pub async fn auto_dispatch_merge(
         &self,
         cand: &PolicyCandidate,
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
     ) -> Result<()> {
         let survivor_id = cand.primary_part_id;
         let victim_id = cand.secondary_part_id;
@@ -3975,7 +3977,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     fn ensure_owner_epoch(
         owner_key: &str,
         owner_epoch: i64,
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
     ) -> Result<(), AppError> {
         if owner_key.is_empty() {
             return Ok(());
@@ -4254,7 +4256,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// rkyv blob) and `rebalance_regions` (in-memory shadow). Both
     /// MUST agree or etcd ↔ memory drifts on leader failover.
     fn next_region_epoch(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         part_id: u64,
         new_rg: &Option<MgrRange>,
     ) -> u64 {
@@ -4265,7 +4267,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         }
     }
 
-    fn rebalance_regions(state: &mut autumn_common::MetadataState) {
+    fn rebalance_regions(state: &mut crate::store::MetadataState) {
         let part_ids: HashSet<u64> = state.partitions.keys().copied().collect();
         let stale: Vec<u64> = state
             .regions
@@ -4356,7 +4358,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// the coarse-but-robust signal (HBase `SimpleLoadBalancer`); a future
     /// req/s-weighted variant can reuse the same apply path.
     fn compute_rebalance_moves(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         max_moves: u32,
     ) -> Vec<RebalanceMove> {
         // Partition ids per REGISTERED PS (a region on an unregistered PS is
@@ -4415,7 +4417,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     }
 
     fn compute_region_for_partition(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         part: &MgrPartitionMeta,
     ) -> MgrRegionInfo {
         let ps_id = state
@@ -4451,7 +4453,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// Compute the mutations for duplicating a stream (CoW for split).
     /// Returns (new_stream, modified_extents) WITHOUT modifying state.
     fn compute_duplicate_stream(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         src_stream_id: u64,
         dst_stream_id: u64,
         sealed_length: u64,
@@ -4532,7 +4534,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// survivor has no extents or its tail is already sealed. Shared by
     /// `compute_merge_streams` + `splice_streams_without_new_tail`.
     fn seal_survivor_old_tail(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         survivor: &MgrStreamInfo,
         survivor_sealed: u64,
         modified_extents: &mut Vec<MgrExtentInfo>,
@@ -4579,7 +4581,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// so this never collides with the dedup. Shared by
     /// `compute_merge_streams` + `splice_streams_without_new_tail`.
     fn splice_victim_extents(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         survivor_set: &HashSet<u64>,
         victim: &MgrStreamInfo,
         victim_sealed: u64,
@@ -4606,7 +4608,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     }
 
     fn compute_merge_streams(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         survivor_stream_id: u64,
         victim_stream_id: u64,
         survivor_sealed: u64,
@@ -4668,7 +4670,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// stream's tail is just victim's last existing extent (sealed by
     /// the caller's commit_length capture).
     fn splice_streams_without_new_tail(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         survivor_stream_id: u64,
         victim_stream_id: u64,
         survivor_sealed: u64,
@@ -4743,7 +4745,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
 
     /// Apply computed split mutations to the in-memory store.
     fn apply_split_mutations(
-        state: &mut autumn_common::MetadataState,
+        state: &mut crate::store::MetadataState,
         new_streams: &[MgrStreamInfo],
         modified_extents: &[MgrExtentInfo],
         left: MgrPartitionMeta,
@@ -4766,7 +4768,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     /// rebalances regions to remove the victim's region.
     #[allow(clippy::too_many_arguments)]
     fn apply_merge_mutations(
-        state: &mut autumn_common::MetadataState,
+        state: &mut crate::store::MetadataState,
         survivor_streams: &[MgrStreamInfo],
         modified_extents: &[MgrExtentInfo],
         survivor_meta: MgrPartitionMeta,
@@ -6330,7 +6332,7 @@ mod tests {
 
     #[test]
     fn compute_merge_streams_extent_ids_order_and_refs() {
-        let mut state = autumn_common::MetadataState::default();
+        let mut state = crate::store::MetadataState::default();
         let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
             extent_id: id,
             replicates: vec![1],
@@ -6406,7 +6408,7 @@ mod tests {
 
     #[test]
     fn splice_streams_without_new_tail_no_e_new() {
-        let mut state = autumn_common::MetadataState::default();
+        let mut state = crate::store::MetadataState::default();
         let mk = |id: u64, refs: u64| MgrExtentInfo {
             extent_id: id,
             replicates: vec![1],
@@ -6460,7 +6462,7 @@ mod tests {
     /// extents to refs>0 with zero stream membership (invisible orphans).
     #[test]
     fn merge_refs_leak_cow_shared_extent_dedup_and_refs() {
-        let mut state = autumn_common::MetadataState::default();
+        let mut state = crate::store::MetadataState::default();
         let mk = |id: u64, refs: u64, sealed: u64| MgrExtentInfo {
             extent_id: id,
             replicates: vec![1],
@@ -6534,7 +6536,7 @@ mod tests {
     /// Merge refs-leak regression for the row/meta splice path (no new tail).
     #[test]
     fn merge_refs_leak_splice_cow_shared_extent_dedup_and_refs() {
-        let mut state = autumn_common::MetadataState::default();
+        let mut state = crate::store::MetadataState::default();
         let mk = |id: u64, refs: u64| MgrExtentInfo {
             extent_id: id,
             replicates: vec![1],
@@ -6592,7 +6594,7 @@ mod tests {
     // (Also a permanent regression guard against refs/membership drift.)
     #[test]
     fn merge_refs_invariant_holds_across_split_merge_cycles() {
-        fn check(state: &autumn_common::MetadataState, label: &str) {
+        fn check(state: &crate::store::MetadataState, label: &str) {
             for (eid, ex) in &state.extents {
                 let mem = state
                     .streams
@@ -6621,7 +6623,7 @@ mod tests {
             ec_converted: false,
         };
 
-        let mut state = autumn_common::MetadataState::default();
+        let mut state = crate::store::MetadataState::default();
         state.extents.insert(10, mk(10, 1, 1024)); // shared ancestor
         state.extents.insert(50, mk(50, 1, 0)); // tail
         state.streams.insert(
@@ -6636,7 +6638,7 @@ mod tests {
         );
         check(&state, "init");
 
-        let split = |state: &mut autumn_common::MetadataState, src: u64, dst: u64| {
+        let split = |state: &mut crate::store::MetadataState, src: u64, dst: u64| {
             let (dst_stream, modified) =
                 AutumnManager::compute_duplicate_stream(state, src, dst, 1024).unwrap();
             for ex in &modified {
@@ -6644,7 +6646,7 @@ mod tests {
             }
             state.streams.insert(dst, dst_stream);
         };
-        let merge = |state: &mut autumn_common::MetadataState, surv: u64, vic: u64, tail: u64| {
+        let merge = |state: &mut crate::store::MetadataState, surv: u64, vic: u64, tail: u64| {
             let new_tail = mk(tail, 1, 0);
             let (updated, modified) =
                 AutumnManager::compute_merge_streams(state, surv, vic, 4096, 8192, new_tail)
@@ -6688,7 +6690,7 @@ mod tests {
 
     #[test]
     fn apply_merge_mutations_drops_victim_entries() {
-        let mut state = autumn_common::MetadataState::default();
+        let mut state = crate::store::MetadataState::default();
         // Survivor partition 1 with streams 100/101/102
         state.partitions.insert(
             1,
@@ -6776,7 +6778,7 @@ mod tests {
 
     #[test]
     fn compute_region_keeps_existing_ps_for_left_partition() {
-        let mut state = autumn_common::MetadataState::default();
+        let mut state = crate::store::MetadataState::default();
         state.ps_nodes.insert(10, "ps10:9001".to_string());
         state.ps_nodes.insert(20, "ps20:9002".to_string());
 
@@ -6819,7 +6821,7 @@ mod tests {
 
     #[test]
     fn compute_region_assigns_least_loaded_for_new_partition() {
-        let mut state = autumn_common::MetadataState::default();
+        let mut state = crate::store::MetadataState::default();
         state.ps_nodes.insert(10, "ps10:9001".to_string());
         state.ps_nodes.insert(20, "ps20:9002".to_string());
 
@@ -6865,8 +6867,8 @@ mod tests {
     // ── region rebalance: compute_rebalance_moves ────────────────────────────
 
     /// Build a state with `ps_ids` registered and `assignments` = (part_id, ps_id).
-    fn rebal_state(ps_ids: &[u64], assignments: &[(u64, u64)]) -> autumn_common::MetadataState {
-        let mut state = autumn_common::MetadataState::default();
+    fn rebal_state(ps_ids: &[u64], assignments: &[(u64, u64)]) -> crate::store::MetadataState {
+        let mut state = crate::store::MetadataState::default();
         for &id in ps_ids {
             state.ps_nodes.insert(id, format!("ps{id}:9001"));
         }
@@ -6892,7 +6894,7 @@ mod tests {
 
     /// Apply the moves the way the handler does, then return per-PS counts.
     fn counts_after(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         moves: &[RebalanceMove],
     ) -> std::collections::BTreeMap<u64, usize> {
         let mut regions = state.regions.clone();
@@ -8531,7 +8533,7 @@ mod tests {
     /// survivor and removed for the victim.
     #[test]
     fn merge_updates_last_op_at_correctly() {
-        let mut state = autumn_common::MetadataState::default();
+        let mut state = crate::store::MetadataState::default();
         let mut m = HashMap::new();
         m.insert(1u64, 1_700_000_000i64);
         m.insert(2u64, 1_700_000_500i64);

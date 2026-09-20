@@ -2100,7 +2100,7 @@ impl AutumnManager {
             node_id: u64,
             answered: bool,
             reported: &[(u64, autumn_rpc::extent_rpc::DiskStatus)],
-            store: &autumn_common::MetadataState,
+            store: &crate::store::MetadataState,
             disks_reg: &std::collections::HashMap<u64, MgrDiskInfo>,
             faulted: &std::collections::HashSet<u64>,
         ) -> Vec<DiskCapWire> {
@@ -3059,7 +3059,7 @@ impl AutumnManager {
     /// Pure read over `s`; shared refuse-at-start by
     /// handle_stream_punch_holes + handle_truncate.
     fn refuse_if_removed_extent_inflight(
-        s: &autumn_common::MetadataState,
+        s: &crate::store::MetadataState,
         removed: &HashSet<u64>,
         recovery_inflight_set: &HashSet<u64>,
         ec_inflight_set: &HashSet<u64>,
@@ -3099,7 +3099,7 @@ impl AutumnManager {
     /// `extent_puts`. Pure read over `s` (returns clones). Shared by
     /// handle_stream_punch_holes + handle_truncate.
     pub(crate) fn compute_extent_ref_drops(
-        s: &autumn_common::MetadataState,
+        s: &crate::store::MetadataState,
         removed: &HashSet<u64>,
         ec_inflight_set: &HashSet<u64>,
     ) -> (
@@ -3192,7 +3192,7 @@ impl AutumnManager {
         // transient) leaves in-memory state unchanged.
         let out = {
             let guard = self.store.inner.borrow();
-            let s: &autumn_common::MetadataState = &guard;
+            let s: &crate::store::MetadataState = &guard;
             (|| -> Result<
                 (
                     MgrStreamInfo,
@@ -3340,7 +3340,7 @@ impl AutumnManager {
         // Etcd-first (same shape as handle_stream_punch_holes).
         let out = {
             let guard = self.store.inner.borrow();
-            let s: &autumn_common::MetadataState = &guard;
+            let s: &crate::store::MetadataState = &guard;
             (|| -> Result<
                 (
                     MgrStreamInfo,
@@ -3468,7 +3468,7 @@ impl AutumnManager {
     /// matching verify side: after the await it refuses if any of these
     /// eversions moved (a concurrent recovery / EC / punch / truncate).
     fn snapshot_stream_extent_eversions(
-        state: &autumn_common::MetadataState,
+        state: &crate::store::MetadataState,
         stream_ids: &[u64],
     ) -> HashMap<u64, u64> {
         let mut m = HashMap::new();

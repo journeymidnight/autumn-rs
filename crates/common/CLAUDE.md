@@ -61,55 +61,49 @@ Uses `thiserror`. These are converted to `tonic::Status` at the gRPC boundary in
 - `InvalidArgument` → `Status::invalid_argument`
 - `Internal` / `NotLeader` → `Status::internal`
 
-### `store.rs` — In-Memory Metadata State
+### `store.rs` — the owner-epoch fence tokens and their classifier
 
-#### `MetadataState` (inner, lock-held)
+**The metadata store MOVED OUT.** `MetadataState` / `MetadataStore` now live in
+`crates/manager/src/store.rs`. They left because the manager's persisted records
+are `pub(crate)` to that crate (see `crates/manager/CLAUDE.md`, "Persisted
+records") and `MetadataState` is what holds them in memory — a state struct in a
+shared crate cannot hold a type only the manager may name. Nothing outside the
+manager ever referenced it, so no other crate changed.
 
-Holds all cluster state in memory:
+What stays here is the part `autumn-stream` needs:
 
-| Field | Type | Purpose |
-|-------|------|---------|
-| `streams` | `HashMap<u64, StreamInfo>` | All streams |
-| `extents` | `HashMap<u64, ExtentInfo>` | All extents |
-| `nodes` | `HashMap<u64, NodeInfo>` | Registered extent nodes |
-| `disks` | `HashMap<u64, DiskInfo>` | Registered disks |
-| `owner_epochs` | `HashMap<String, i64>` | Owner lock fencing tokens |
-| `partitions` | `HashMap<u64, PartitionMeta>` | All partition metadata |
-| `ps_nodes` | `HashMap<u64, PsDetail>` | Partition server addresses |
-| `regions` | `HashMap<u64, RegionInfo>` | Partition → PS assignments |
-| `next_id` | `u64` | Monotonic ID counter |
+**`OWNER_KEY_PREFIX_TOKEN` / `OWNER_EPOCH_MISMATCH_TOKEN` / `OWNER_KEY_MISSING_TOKEN`**
+— the wire-stable spellings of an owner-epoch fence rejection.
 
-#### Key Methods
+**`is_owner_epoch_fence_message(msg) -> bool`** — the classifier. Over the wire a
+fence is just `CODE_PRECONDITION`, indistinguishable from ordinary preconditions
+("stream cannot be empty after punch holes", admin-token checks) without a new
+wire code — which would force a stop-world `WIRE_VERSION` bump that nothing
+would catch if forgotten. `StreamClient` uses this to route a fence into the
+PS's "LockedByOther" poison-and-reopen self-heal.
 
-**`alloc_ids(count: u64) -> Vec<u64>`**
-Returns `count` sequential IDs starting from `next_id`. IDs are globally unique across streams, extents, nodes, disks, and partitions — they share one counter.
-
-**`acquire_owner_lock(key: &str) -> i64`**
-Allocates a strictly higher revision on **every** call. Re-acquiring an existing key FENCES the previous holder: the old epoch fails `ensure_owner_epoch`'s equality check at the manager and sits below the new floor at the extent-node. Mirrors the etcd-backed `acquire_owner_epoch` (unconditional fenced PUT; epoch = the fresh `mod_revision`). It MUST bump on every call — an idempotent (stable-per-key) version makes ownership failback A→B→A impossible (B's higher epoch permanently fences A) and lets two live same-key processes share one epoch (split-brain).
-
-**`ensure_owner_epoch(key: &str, revision: i64) -> Result<()>`**
-Validates that the caller's revision matches the stored one. Returns `Precondition` error if not. This is the core fencing check — called on every stream-mutating operation.
-
-**`is_owner_epoch_fence_message(msg: &str) -> bool`**
-Classifier for `ensure_owner_epoch` rejection messages. Producer and matcher
-share the `OWNER_*_TOKEN` consts (single compile-time source, so a reword can't
-detach the matcher); `owner_fence_matcher_pairs_with_producer` tests the matcher
-against errors from the REAL producer. Over the wire a fence is just
-`CODE_PRECONDITION`; the stream `StreamClient` uses this to distinguish it from
-ordinary preconditions WITHOUT a new wire code (which would force a manual
-stop-world `WIRE_VERSION` bump — and nothing would catch a forgotten
-one, since the fingerprint registry that used to is gone) and to route it into the PS's
-"LockedByOther" poison-and-reopen self-heal (see stream CLAUDE.md).
-
-#### `MetadataStore` (outer wrapper)
-
-`Arc<RwLock<MetadataState>>`. Read-heavy operations hold a read lock; mutations take a write lock. The `AutumnManager` in `autumn-manager` holds this and passes it to both service implementations.
+**Producer and matcher are now in different crates, and that is safe for reasons
+that were always the real ones.** The producer
+(`autumn_manager::store::MetadataState::ensure_owner_epoch`) builds its message
+from the constants above, so a reword cannot detach the matcher; and
+`owner_fence_matcher_pairs_with_producer`, which moved to the manager crate with
+the producer, runs THIS matcher over errors the REAL producer generated. The old
+comment credited "kept ADJACENT" for that property — adjacency was never the
+mechanism, and saying so is the point of this note. Renaming or removing a token
+is still a wire-visible change for mixed-version clusters: same-commit
+stop-world only.
 
 ## Important Invariants
 
-1. **ID uniqueness**: all IDs (stream, extent, node, disk, partition) come from the same monotonic counter — never generate IDs outside `alloc_ids`.
-2. **Owner lock bumps on every acquire**: `acquire_owner_lock` returns a strictly higher revision each call, fencing the previous holder of the same key. The newest acquirer always wins; a process acquires once per incarnation and keeps the epoch for its lifetime. Never generate owner revisions outside this method.
-3. **Epoch fencing**: any operation that mutates stream or extent state must call `ensure_owner_epoch` first. Skipping this allows split-brain writes.
+1. **The token spellings are a wire contract.** Renaming or removing an
+   `OWNER_*_TOKEN` changes text a mixed-version cluster matches on; treat it
+   like a wire-schema edit.
+2. **Never re-implement the classifier.** One matcher, shared by the stream
+   crate and pinned against the real producer by a test in the manager crate.
+
+The invariants that used to be listed here — id uniqueness through `alloc_ids`,
+the owner lock bumping on every acquire, `ensure_owner_epoch` before every
+stream mutation — moved with `MetadataState` to `crates/manager/CLAUDE.md`.
 
 ## Build toolchain
 

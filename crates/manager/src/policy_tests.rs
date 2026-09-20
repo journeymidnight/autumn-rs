@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use autumn_common::MetadataState;
+use crate::store::MetadataState;
 use autumn_rpc::manager_rpc::{
     MgrExtentInfo, MgrPartitionMeta, MgrRange, MgrRegionInfo, MgrStreamInfo, PartitionLoad,
     POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE,
