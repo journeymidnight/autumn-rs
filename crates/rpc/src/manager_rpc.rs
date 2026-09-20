@@ -2553,18 +2553,15 @@ pub struct MgrInodeLeaseRecord {
 
 // ── authz wire + persisted types (manager-as-KDC) ────────────────────────────
 
-/// Persisted tenant account in etcd (`tenantAccount/<tenant>`). Replayed on
-/// leader failover. Holds only the credential HASH (never the credential) +
-/// the key prefixes this tenant may access.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct MgrTenantAccount {
-    pub tenant: String,
-    /// SHA-256 of the tenant's permanent credential. Verified (constant-time)
-    /// at mint time; the raw credential is never stored.
-    pub credential_hash: [u8; 32],
-    /// Key prefixes this tenant may access. Each MUST end with `b'/'`.
-    pub allowed_prefixes: Vec<Vec<u8>>,
-}
+// `MgrTenantAccount` used to live here, described as "persisted tenant account
+// in etcd". It is DELETED rather than kept: `tenantAccount/<tenant>` now stores
+// `persist::records::TenantAccountRecord` (manager-private, with its own format
+// version), and no message ever carried this type — `PrincipalListResp`
+// deliberately uses `PrincipalRow` so an inspection RPC cannot hand out a
+// `credential_hash`. Leaving it would have recreated the very shape this split
+// exists to remove: a second definition of a persisted record sitting in the
+// WIRE schema file, with no reader to say which one is authoritative. Removing
+// it moves no archived layout and therefore no `WIRE_VERSION`.
 
 /// `MSG_TENANT_CREATE` — admin creates/rotates a tenant account. `admin_token`
 /// is checked (constant-time) against the manager's configured admin token
@@ -2595,9 +2592,13 @@ pub struct TenantDeleteReq {
 
 // ── namespace registry types (SD-1) ──────────────────────────────────────────
 
-/// Persisted namespace registry row in etcd (`namespace/<name>`). Replayed on
-/// leader failover. Modelled on `MgrTenantAccount` (string-keyed etcd prefix +
-/// rkyv + fail-loud replay). Registry granularity = top-level family (`fs/` is
+/// Namespace registry row, as carried on the WIRE (`NamespaceListResp`).
+///
+/// **Not the persisted form.** `namespace/<name>` stores
+/// `persist::records::NamespaceRecord`, which has its own format version, and
+/// the manager converts to this type at the one point a namespace crosses to a
+/// client. Changing THIS struct is a wire change; changing what is stored is
+/// not. Registry granularity = top-level family (`fs/` is
 /// ONE row, not one per volume — the app owns the sub-structure; Layer-A only
 /// checks top-level membership). See docs/key_namespace_split_design.md.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]

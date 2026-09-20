@@ -468,7 +468,21 @@
   - 每个持久结构有测试证明"加字段后旧二进制重放响亮失败"，或记录它靠什么别的机制兜底。
   - 客户端拿到的路由记录不再包含任何 `*_stream` id（编译期不可达，非运行时断言）。
   - Ablation：把某个分家出去的类型搬回 wire 文件 → 第一条验收转红。
-- **Status**: `passes: false`（2026-09-20 开工）— **Scope 4 已落地**，其余四条未动。
+- **Status**: `passes: false`（2026-09-20 开工）— **Scope 4 + Scope A 已落地**，其余未动。
+  **Scope A（2026-09-20）**：`crates/manager/src/persist/` + 6 字节信封
+  `[AUMG][record_type][format_version]`，以及**不在 `MetadataState` 里的那三个**
+  持久类型（audit / tenantAccount / namespace）分家，`pub(crate)` 即"只有 manager
+  能引用"的编译期保证；穷尽解构转换；`persist/freeze.rs` 逐字节记录（替代被搬走的
+  "改它就要 bump wire 版本"那道意外守卫）。`MgrTenantAccount` 已从 wire 文件删除
+  （无任何消息携带它，两套 freeze 证明没有编码移动）。
+  **迁移按用户定调走树外工具**（[[feedback_persist_migration_by_tool_not_dual_read]]）：
+  `migratev0_v1`，不解码、幂等、有 leader-key 前置检查，用完删。真 etcd 端到端跑通：
+  裸值 → 新 manager 拒绝并点名 → 转换 → 重放成功 → 字段逐个正确。
+  **验收第 3 条的文字冲突（未改，按规矩 8）**：该行写的是新 manager"**就地**"重放旧
+  数据；按这个定调不是就地，是工具先转。文字是否要动由用户定。
+  剩余：Scope 1 的另外 6 个类型、Scope 2 的其余、Scope 3（`MgrRegionInfo` 三分）、
+  Scope 5。下一步的真决定是把 `MetadataState` 搬进 manager 并持有 persist 形式
+  （已核实零外部引用，搬动干净，但不是文件搬家：它现在持有 wire 结构作为权威内存态）。
   payload-location 那个字节的三个载体各自立家：wire（`PayloadLocation::from_wire_byte`
   改返回 `Option`，`ReadBytesReq` 直接持 resolved 值、解码时拒陌生字节）、EN 的 `.meta`
   第 41 字节（由 `EXTMETA\x02` 魔数定义合法集合，越界走既有 META-FAILCLOSED 隔离）、

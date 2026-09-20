@@ -189,6 +189,38 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 - **Inodes** come from the MANAGER's global counter (`alloc_inodes`) — the same crash-safe source the fuse mount and PyO3 `autumn.Fs` use, so no colliding inodes.
 - **ls / cat**: PS `handle_range` returns key-only entries, so both do a per-key `cluster.get` after the range scan (fine for one-shot CLI use). **Sizes**: files ≤4 KiB inline in the `InodeMeta`; larger go through the extent path (8 MiB chunks, `extent_key([0x03][ino BE][off BE])`).
 
+### `migratev0_v1` (`src/bin/migratev0_v1.rs`) — TEMPORARY, delete after running
+
+One-shot converter that wraps the manager's persisted etcd records in their
+`persist` envelope. **Run once against a STOPPED cluster, then delete the file
+and the `autumn-etcd` dependency it added.**
+
+```
+migratev0_v1 --etcd <http://host:2379[,…]> [--dry-run]
+```
+
+It exists because a persisted-format change is delivered by a converter, never
+by compatibility code in the servers (`crates/manager/CLAUDE.md`, "Upgrade
+safety"). The naming convention is `migratev<from>_v<to>` over the PERSIST
+format generation, not the wire version — this change moves no wire struct, so
+`WIRE_VERSION` does not move with it.
+
+**It decodes nothing.** Splitting a record out of the wire schema is a rename,
+and rkyv's layout does not depend on the type name (measured: `MgrExtentInfo`
+and an identically shaped `ExtentRecord` both encode to the same 152 bytes), so
+this conversion is a pure prefix insertion. That property is specific to THIS
+conversion; a later one that changes a record's fields has to vendor the old
+definition itself, because by then the tree only has the new one.
+
+Covers `mgr_audit_log/`, `tenantAccount/` and `namespace/` — the three records
+split so far. The six still living in the wire schema (extents, streams, nodes,
+disks, partitions, regions) must stay bare; adding one here before it is split
+would make the manager unable to read it.
+
+Idempotent: a value already carrying `[AUMG][type][version]` is skipped, so an
+interrupted run is re-run. The summary line is the free check — on a first pass
+over a populated cluster `converted` should be non-zero and `already` zero.
+
 ### `autumn-stream-cli` (`src/bin/stream_cli.rs`)
 
 Low-level stream-layer CLI for debugging; bypasses the partition layer entirely.

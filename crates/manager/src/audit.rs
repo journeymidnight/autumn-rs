@@ -12,7 +12,9 @@
 //! and deletes records older than `AUTUMN_MGR_AUDIT_RETENTION_DAYS`
 //! (default 90).
 
-use autumn_rpc::manager_rpc::{rkyv_decode, rkyv_encode, MgrAuditEntry};
+use autumn_rpc::manager_rpc::MgrAuditEntry;
+
+use crate::persist::{self, records::AuditRecord};
 
 use crate::AutumnManager;
 
@@ -41,7 +43,7 @@ impl AutumnManager {
         let seq = self.audit_seq.get().wrapping_add(1).max(1);
         self.audit_seq.set(seq);
         let key = audit_key(entry.ts_ns, seq);
-        let value = rkyv_encode(&entry).to_vec();
+        let value = persist::encode(&AuditRecord::from(&entry));
         // In-memory mode (no etcd): nothing to persist, but we still
         // increment seq so unit-test ordering matches production.
         if let Some(etcd) = &self.etcd {
@@ -86,8 +88,13 @@ impl AutumnManager {
         };
         let mut out: Vec<MgrAuditEntry> = Vec::with_capacity(raw.kvs.len());
         for kv in &raw.kvs {
-            let entry: MgrAuditEntry = match rkyv_decode(&kv.value) {
-                Ok(v) => v,
+            // Audit history is DIAGNOSTIC, so one unreadable row must not deny
+            // the rest — unlike `replay_from_etcd`, where an undecodable value
+            // is cluster state and refuses leadership. The pre-existing
+            // behaviour, kept deliberately while the envelope moved under it.
+            let key = String::from_utf8_lossy(&kv.key).into_owned();
+            let entry: MgrAuditEntry = match persist::decode::<AuditRecord>(&key, &kv.value) {
+                Ok(v) => MgrAuditEntry::from(&v),
                 Err(e) => {
                     tracing::warn!(error = %e, "skipping malformed audit entry");
                     continue;

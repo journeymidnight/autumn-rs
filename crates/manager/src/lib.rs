@@ -7,6 +7,7 @@ mod extent_corrupt;
 mod op_log;
 mod placement;
 mod extent_layout;
+mod persist;
 mod fs_alloc;
 pub mod inode_lease;
 pub mod node_state;
@@ -116,13 +117,13 @@ pub const CLUSTER_VERSION_KEY: &str = "autumn-rs/cluster_version";
 pub const INODE_LEASES_PREFIX: &str = "inode_leases/";
 
 /// etcd prefix for the KDC tenant account DB
-/// (`tenantAccount/<tenant>` → rkyv'd `MgrTenantAccount`). Replayed on leader
+/// (`tenantAccount/<tenant>` → `persist::TenantAccountRecord`). Replayed on leader
 /// failover; the credential HASH is stored, never the raw credential. The
 /// tenant name is a string suffix (percent-encoded segment), not a u64 id.
 pub const TENANT_ACCOUNT_PREFIX: &str = "tenantAccount/";
 
 /// D2: etcd prefix for the namespace registry
-/// (`namespace/<name>` → rkyv'd `MgrNamespace`). Replayed on leader failover;
+/// (`namespace/<name>` → `persist::NamespaceRecord`). Replayed on leader failover;
 /// mutated only via the admin namespace-create/delete RPCs. The three built-in
 /// families (`fs`/`kvc`/`mem`) are CAS-preregistered on first leader promotion
 /// (`seed_builtin_namespaces`). See docs/key_namespace_split_design.md.
@@ -1079,9 +1080,9 @@ pub struct AutumnManager {
     /// clock-skew leeway (seconds) advertised to the PS. Default 60.
     pub(crate) clock_skew_secs: Rc<Cell<u64>>,
     /// tenant account DB (etcd `tenantAccount/<tenant>` →
-    /// `MgrTenantAccount`). Replayed on leader failover; mutated only via the
+    /// `persist::TenantAccountRecord`). Replayed on leader failover; mutated only via the
     /// admin RPCs. Stores the credential HASH, never the raw credential.
-    pub(crate) tenant_accounts: Rc<RefCell<HashMap<String, MgrTenantAccount>>>,
+    pub(crate) tenant_accounts: Rc<RefCell<HashMap<String, persist::records::TenantAccountRecord>>>,
     /// serializes the tenant create/delete critical section
     /// (build → etcd write → in-memory apply). Handlers are spawned per-frame
     /// and interleave at the etcd await, and a tenant account's value is a
@@ -1091,9 +1092,9 @@ pub struct AutumnManager {
     /// etcd (coco P1). Low-frequency admin path → a global async mutex is free.
     pub(crate) tenant_admin_lock: Rc<futures::lock::Mutex<()>>,
     /// D2: namespace registry shadow (etcd `namespace/<name>` →
-    /// `MgrNamespace`). Replayed on leader failover; mutated only via the admin
+    /// `persist::NamespaceRecord`). Replayed on leader failover; mutated only via the admin
     /// namespace-create/delete RPCs + `seed_builtin_namespaces`. Keyed by name.
-    pub(crate) namespaces: Rc<RefCell<HashMap<String, MgrNamespace>>>,
+    pub(crate) namespaces: Rc<RefCell<HashMap<String, persist::records::NamespaceRecord>>>,
     /// D2: serializes the namespace create/delete critical section
     /// (build → etcd write → in-memory apply), mirroring `tenant_admin_lock`.
     /// Low-frequency admin path → a global async mutex is free.
@@ -3060,7 +3061,7 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
             if self.namespaces.borrow().contains_key(name) {
                 continue;
             }
-            let row = MgrNamespace {
+            let row = persist::records::NamespaceRecord {
                 name: name.to_string(),
                 prefix: format!("{name}/").into_bytes(),
                 // Existence-only until an owner is explicitly assigned.
@@ -3082,7 +3083,8 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
             // CAS-create (create_revision==0) so a promotion storm can't
             // double-write; a race loser re-reads and installs the winner's row.
             let cmp = autumn_etcd::Cmp::create_revision(key.as_bytes(), 0);
-            let put = autumn_etcd::Op::put(key.as_bytes(), rkyv_encode(&row).as_ref());
+            let encoded = persist::encode(&row);
+            let put = autumn_etcd::Op::put(key.as_bytes(), encoded.as_slice());
             match etcd.txn_fenced(vec![cmp], vec![put], vec![]).await? {
                 true => {
                     self.namespaces
@@ -3098,9 +3100,8 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
                         .await
                         .map_err(|e| AppError::Internal(format!("re-get namespace/{name}: {e}")))?;
                     if let Some(kv) = resp.kvs.first() {
-                        let existing: MgrNamespace = rkyv_decode(&kv.value).map_err(|e| {
-                            AppError::Internal(format!("decode namespace/{name}: {e}"))
-                        })?;
+                        let existing: persist::records::NamespaceRecord =
+                            persist::decode(&key, &kv.value).map_err(AppError::Internal)?;
                         self.namespaces
                             .borrow_mut()
                             .insert(name.to_string(), existing);
@@ -3457,9 +3458,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                     .strip_prefix(TENANT_ACCOUNT_PREFIX)
                     .ok_or_else(|| anyhow::anyhow!("invalid tenantAccount key: {raw}"))?
                     .to_string();
-                let acct: MgrTenantAccount = rkyv_decode(&kv.value).map_err(|e| {
-                    anyhow::anyhow!("malformed tenantAccount/{tenant}: {e}")
-                })?;
+                let acct: persist::records::TenantAccountRecord =
+                    persist::decode(raw, &kv.value).map_err(Self::replay_decode_err)?;
                 accts.insert(tenant, acct);
             }
         }
@@ -3484,8 +3484,8 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                     .strip_prefix(NAMESPACE_PREFIX)
                     .ok_or_else(|| anyhow::anyhow!("invalid namespace key: {raw}"))?
                     .to_string();
-                let row: MgrNamespace = rkyv_decode(&kv.value)
-                    .map_err(|e| anyhow::anyhow!("malformed namespace/{name}: {e}"))?;
+                let row: persist::records::NamespaceRecord =
+                    persist::decode(raw, &kv.value).map_err(Self::replay_decode_err)?;
                 // Semantic consistency — the stored fields must match the key and
                 // the naming rules the create path enforces.
                 if let Err(msg) = validate_namespace_name(&name) {

@@ -1794,7 +1794,7 @@ Notes:
 answering "which principals exist and what are they granted" meant either
 `ls $DATA_ROOT/authz/*.cred` (only what cluster.sh's turnkey path happened to
 write — nothing an operator minted by hand) or an etcd key scan
-(`etcdctl get --prefix --keys-only autumn-rs/tenantAccount/`), which shows names
+(`etcdctl get --prefix --keys-only tenantAccount/`), which shows names
 but NOT grants because the value is rkyv.
 
 ```bash
@@ -2789,6 +2789,47 @@ kubectl -n autumn exec autumn-etcd-0 -- etcdctl del --prefix 'opLog/'
 Do this while the managers are DOWN, in the same window as the binary swap. Any
 wire type that is also persisted needs the same treatment; `OpRecord` is the
 only one today.
+
+#### Converting the manager's persisted records (`migratev0_v1`)
+
+The manager's own etcd records are being split out of the wire schema so they
+carry their own version instead of borrowing `WIRE_VERSION`
+(`crates/manager/CLAUDE.md`, "Persisted records"). Each split record is stored
+inside an envelope, `[AUMG][record_type][format_version]`, and the servers speak
+exactly one shape: **a value without the envelope is refused and the manager will
+not take leadership.** There is no dual-read, by design — so the conversion is a
+step in the maintenance window, not something that heals itself at runtime.
+
+Three prefixes are covered so far: `mgr_audit_log/`, `tenantAccount/`,
+`namespace/`. The other six persisted types are not split yet and their values
+MUST stay bare.
+
+```bash
+# 1. STOP the cluster (managers, PSes, ENs). The converter writes etcd directly;
+#    a running manager would be rewriting the same keys underneath it.
+# 2. Look before you write:
+cargo run --release --bin migratev0_v1 -- --etcd http://127.0.0.1:2379 --dry-run
+#    mgr_audit_log/   converted=190    already=0
+#    tenantAccount/   converted=2      already=0
+#    namespace/       converted=3      already=0
+# 3. Convert:
+cargo run --release --bin migratev0_v1 -- --etcd http://127.0.0.1:2379
+# 4. Start the new binaries.
+```
+
+**Read the summary line — it is the check that costs nothing.** On a first pass
+over a populated cluster `converted` should be non-zero and `already` zero. The
+reverse on a first run means the tool is not looking at the cluster you think it
+is. `no records found at all` means the same thing more loudly.
+
+Re-running is safe: an already-enveloped value is skipped, so an interrupted run
+is simply run again. A failure stops at the first prefix rather than limping on,
+and nothing past that point is written.
+
+Afterwards **delete `crates/server/src/bin/migratev0_v1.rs` and the `autumn-etcd`
+line it added to `crates/server/Cargo.toml`.** The tool is meant to leave no
+residue; a converter kept around is how a one-time migration turns back into the
+permanent compatibility code this rule exists to avoid.
 
 #### Rolling BACK onto data a newer binary wrote
 

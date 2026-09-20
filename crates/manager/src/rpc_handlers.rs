@@ -676,7 +676,7 @@ impl AutumnManager {
             use rand::RngCore;
             rand::rngs::OsRng.fill_bytes(&mut cred);
         }
-        let acct = MgrTenantAccount {
+        let acct = crate::persist::records::TenantAccountRecord {
             tenant: req.tenant.clone(),
             credential_hash: crate::authz::credential_hash(&cred),
             allowed_prefixes,
@@ -689,7 +689,7 @@ impl AutumnManager {
         let key = format!("{}{}", crate::TENANT_ACCOUNT_PREFIX, req.tenant);
         if let Some(etcd) = &self.etcd {
             if let Err(err) = etcd
-                .put_msgs_txn(vec![(key, rkyv_encode(&acct).to_vec())])
+                .put_msgs_txn(vec![(key, crate::persist::encode(&acct))])
                 .await
             {
                 return Ok(rkyv_encode(&TenantCreateResp {
@@ -817,7 +817,7 @@ impl AutumnManager {
             }
         }
 
-        let row = MgrNamespace {
+        let row = crate::persist::records::NamespaceRecord {
             name: req.name.clone(),
             prefix: new_prefix,
             owner_tenant: req.owner_tenant.clone(),
@@ -827,7 +827,7 @@ impl AutumnManager {
         let key = format!("{}{}", crate::NAMESPACE_PREFIX, req.name);
         if let Some(etcd) = &self.etcd {
             if let Err(err) = etcd
-                .put_msgs_txn(vec![(key, rkyv_encode(&row).to_vec())])
+                .put_msgs_txn(vec![(key, crate::persist::encode(&row))])
                 .await
             {
                 return Ok(rkyv_encode(&NamespaceCreateResp {
@@ -901,8 +901,15 @@ impl AutumnManager {
                 namespaces: Vec::new(),
             }));
         }
-        let mut namespaces: Vec<MgrNamespace> =
-            self.namespaces.borrow().values().cloned().collect();
+        // The one place a namespace crosses to the wire. The registry holds the
+        // PERSISTED record; the response carries its wire form, and the
+        // conversion between them is the only bridge — see `persist::records`.
+        let mut namespaces: Vec<MgrNamespace> = self
+            .namespaces
+            .borrow()
+            .values()
+            .map(MgrNamespace::from)
+            .collect();
         // Stable order (by name) for deterministic CLI output.
         namespaces.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(rkyv_encode(&NamespaceListResp {
@@ -973,7 +980,7 @@ impl AutumnManager {
         if let Some(etcd) = &self.etcd {
             let key = format!("{}{}", crate::NAMESPACE_PREFIX, req.name);
             if let Err(err) = etcd
-                .put_msgs_txn(vec![(key, rkyv_encode(&updated).to_vec())])
+                .put_msgs_txn(vec![(key, crate::persist::encode(&updated))])
                 .await
             {
                 return Ok(rkyv_encode(&CodeResp {
@@ -7868,7 +7875,7 @@ mod namespace_registry_tests {
     //! the etcd replay/persist path is covered by
     //! `tests/namespace_registry_etcd.rs` (needs the etcd binary).
     #![allow(clippy::await_holding_refcell_ref)]
-    use crate::{AutumnManager, MgrNamespace};
+    use crate::AutumnManager;
     use autumn_rpc::manager_rpc::*;
     use autumn_rpc::StatusCode;
     use bytes::Bytes;
@@ -8379,7 +8386,7 @@ mod namespace_registry_tests {
         // a new `a/` would then be a `starts_with` ancestor of it → conflict.
         m.namespaces.borrow_mut().insert(
             "deep".to_string(),
-            MgrNamespace {
+            crate::persist::records::NamespaceRecord {
                 name: "deep".to_string(),
                 prefix: b"a/b/".to_vec(),
                 owner_tenant: None,

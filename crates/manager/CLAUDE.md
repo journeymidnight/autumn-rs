@@ -104,6 +104,55 @@ Lease-based (10 s TTL):
 refuses leadership (`replay_decode_err` with an actionable message) rather than
 silently decoding stale bytes into wrong values.
 
+## Persisted records (`persist/`) — the manager's own schema
+
+Five schemas exist here, each answering "who is writing to whom", and four of
+them carry their own version: SST/WAL/checkpoint (`AU7B` + `FORMAT_VERSION`),
+`.meta`/`.ck` (`EXTMETA\x02`), the cluster-internal wire (`WIRE_VERSION` exact
+equality), the client wire (the window). **The manager's records were the hole**
+— defined in `crates/rpc/src/manager_rpc.rs` under the wire-schema banner, so
+changing what the MANAGER remembers bumped the number every PS, EN and embedded
+client is judged by. Measured: of 44 wire-version intervals only 8 (18%) truly
+needed manager + PS + EN to move together, while the extent node could have
+stayed up for 30 (68%).
+
+A split record lives in `persist/records.rs`, is `pub(crate)` (the "only the
+manager may reference it" rule, enforced by the compiler), and is stored inside
+an envelope:
+
+```text
+[magic b"AUMG": 4][record_type: u8][format_version: u8][rkyv bytes …]
+```
+
+`record_type` catches a record written under the wrong key. `format_version` is
+PER RECORD — adding a field to the namespace record moves that number and
+nothing else, which is the whole point. **`RECORD_TYPE` numbers are frozen and
+append-only**; they are written into every stored value, so renumbering one
+silently re-labels every record on disk.
+
+**Decoding VERIFIES and never sniffs.** A value without the expected envelope is
+an error that refuses leadership, not "maybe it is the older form" — see the
+Upgrade-safety section for why guessing from the leading bytes provably cannot
+work here.
+
+**SPLIT SO FAR: audit, tenantAccount, namespace** (types 1-3) — the three that
+are not in `MetadataState`, so this step does not touch the in-memory state.
+Types 4-9 are RESERVED for extents / streams / nodes / disks / partitions /
+regions, which still live in the wire schema and whose etcd values are still
+bare. The remaining step is bigger than a file move: `MetadataState` holds the
+WIRE structs as the manager's authoritative in-memory state, so a purely
+persistent field has nowhere to live until it holds the persisted ones — and it
+sits in `autumn-common` while the rule says only the manager may reference a
+record. Nothing outside the manager references `MetadataState` (verified), so
+moving it is clean; it is simply not this step.
+
+`persist/freeze.rs` records each encoding byte for byte. It is the deliberate
+replacement for a guard that was ACCIDENTAL: while a record shared a file with
+the wire schema, editing it forced a `WIRE_VERSION` bump. That was far too blunt
+(it stopped every PS and EN for a change none of them could see) and removing it
+without a replacement would have been far too loose. Read that file's header
+before touching a recorded value — the answer to a red is never "re-record".
+
 ## Data model (etcd key layout)
 
 All writes go through the leader-fenced `txn_fenced` (below). On promotion
@@ -126,10 +175,10 @@ All writes go through the leader-fenced `txn_fenced` (below). On promotion
 | `partitionLastOp/<id>` | i64 LE unix | last split/merge timestamp |
 | `node_override/<id>` | `MgrNodeOverride` | Fenced / Maintenance |
 | `decommissioned/<uuid>` | tombstone | uuid-keyed, survives node delete |
-| `mgr_audit_log/<ts>_<seq>` | `MgrAuditEntry` | admin-op audit trail (90-day GC) |
+| `mgr_audit_log/<ts>_<seq>` | `persist::AuditRecord` | admin-op audit trail (90-day GC) |
 | `inode_leases/<ino>` | writer lease | reader leases are memory-only |
-| `namespace/<name>` | `MgrNamespace` | registry |
-| `tenantAccount/<name>` | `MgrTenantAccount` | authz principal DB |
+| `namespace/<name>` | `persist::NamespaceRecord` | registry |
+| `tenantAccount/<name>` | `persist::TenantAccountRecord` | authz principal DB |
 | `autoPolicy/config`, `autoPolicy/cooldowns` | policy state | leader-owned |
 | `autumn-rs/cluster_id` | UUID | CAS-imprinted once |
 | `autumn-rs/cluster_version` | ASCII decimal | format-version stamp |
@@ -163,8 +212,9 @@ disabled kid. The token codec/claims live in `autumn_rpc::cap_token` (shared
 signer/verifier). `credential_hash` = SHA-256; compares are constant-time
 (`ct_eq_32` / `ct_eq_secret`) to avoid timing/length oracles.
 
-**Principal accounts.** `tenantAccount/<name>` → `MgrTenantAccount {name,
-credential_hash, grants}`; create/delete are admin-token-gated, etcd-first,
+**Principal accounts.** `tenantAccount/<name>` → `persist::TenantAccountRecord
+{tenant, credential_hash, allowed_prefixes}` (a PERSISTED record with its own
+format version — see "Persisted records"; it has no wire twin at all); create/delete are admin-token-gated, etcd-first,
 leader-fenced, serialized on `tenant_admin_lock`. `MSG_PRINCIPAL_LIST` (`0x5A`,
 `handle_principal_list`) is leader-gated + read-only and returns
 `PrincipalRow{name, grants}` — dropping `credential_hash` is structural: an
@@ -833,7 +883,7 @@ writer). `autumn-op format` is IDENTITY-ONLY (registers with empty
 location → the node stays Suspend, unselected, until it boots and self-registers).
 
 **Audit log (`audit.rs`).** Every admin RPC wraps its return in `append_audit`
-(`mgr_audit_log/<ts_ns>_<seq>` → `MgrAuditEntry`, best-effort). `mgr_query_audit_log`
+(`mgr_audit_log/<ts_ns>_<seq>` → `persist::AuditRecord`, best-effort). `mgr_query_audit_log`
 retrieves; `audit_gc_loop` (daily, leader-only) enforces `--audit-retention-days`
 (default 90, 0 = off).
 
@@ -1039,7 +1089,7 @@ while QPS, byte-rate and imm-full keep the all-N-buckets debounce.
 passes that know WHY an op is needed run first, so first-wins keeps the better reason.
 
 **Sacred boundaries (operator-declared presplit cuts).** `handle_namespace_set_presplit`
-records declared points into `MgrNamespace.presplit` (etcd-first). The rule is generic —
+records declared points into `persist::NamespaceRecord.presplit` (etcd-first). The rule is generic —
 the manager never learns what a "lane" is; `sacred_boundary_owner(key)` returns the
 owning namespace for any declared cut, so fs lane boundaries / kvc hash buckets / mem
 agent cuts all get one predicate.
@@ -1484,7 +1534,7 @@ return EIO (never serve pre-close bytes). See `docs/autumn_fs_lease_plan.md`.
 
 ## Namespace registry
 
-Etcd string-keyed registry `namespace/<name>` → `MgrNamespace {name, prefix,
+Etcd string-keyed registry `namespace/<name>` → `persist::NamespaceRecord {name, prefix,
 owner_tenant, presplit, created_at}` (modelled 1:1 on the `tenantAccount/` DB):
 in-mem shadow, fail-loud replay, admin-token-gated create/delete (`MSG_NAMESPACE_CREATE`
 `0x57` / `DELETE` `0x58`), etcd-first + leader-fenced, serialized on `namespace_admin_lock`.
