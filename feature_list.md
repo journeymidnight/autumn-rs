@@ -395,8 +395,10 @@
     这条定下来之后就是同义反复，已删 —— MIN/MAX 这对名字读起来别扭的根因就是它。
   - **按组件归因的测量**（2026-09-19，用户问"只改一个 API 参数为什么要全停"）: 44 个版本区间里
     真正需要 MGR+PS+EN 三者一起动的只有 **8 (18%)**，EN 本可不重启的占 **30 (68%)**；
-    只牵连 PS 的 8 次全是 client↔PS 数据面（本条窗口覆盖），只牵连 MGR 的 9 次另立
-    [[F-SCHEMA-HOMES]]。**按"边"发版本已评估并否决**：边不是代码里存在的属性 ——
+    只牵连 PS 的 8 次全是 client↔PS 数据面（本条窗口覆盖），只牵连 MGR 的 9 次另立了
+    F-SCHEMA-HOMES —— 那条已于 2026-09-20 全部完成（九个持久记录各自带信封与自己的
+    `FORMAT_VERSION`），按本文件规矩 `passes: true` 即删除，记录在 git 历史与
+    `claude-progress.txt`。**按"边"发版本已评估并否决**：边不是代码里存在的属性 ——
     `ReadBytesReq` 同时服务 PS→EN、client→EN、EN→EN 三条边，按边拆会塌缩成按消息拆
     （Kafka per-API 模型），而 45 次 bump 里真正打断客户端的只有 7 次，养不起。且它只缩短窗口
     （EN 免 `load_extents`），不消除停机 —— PS 全体重启本身就是不可用。
@@ -413,112 +415,6 @@
     版本同时在线 ⇒ 第二份定义必是镜像 ⇒ **守卫保持原样全力有效**。客户端面按构造就有两个
     版本在线 ⇒ 重述为 **一个 (消息, 版本) 一份定义，且每份只能经由它的 msg_type 到达**。
     我一度说"防镜像机制要延伸到新边界"，不加限定是错的 —— 延伸到客户端面会把窗口锁死。
-
-### F-SCHEMA-HOMES — 五种 schema 应各有明确的家；今天 manager 的持久值寄居在 wire 文件里
-- **原则**（用户 2026-09-19 定）: **etcd、wire、客户端三类类型全部拆开，在明确的地方分别
-  定义。** 不按"生命周期绑定就不用拆"这种个案判断 —— 那是个每次改动都要重做、并且会烂掉的
-  判断，而 `manager_rpc.rs` 里攒下 17 个非消息类型，正是因为从来没有规则说东西该放哪。
-  按位置分家之后，"这次改动会不会逼所有内嵌镜像重建"从一道推理题变成"这个文件在不在客户端
-  schema 里"。
-- **全树盘点：每种 schema 是"谁写给谁"，载体无关**:
-  | schema | 写给谁 | 载体 | 自版本 |
-  |---|---|---|---|
-  | SST / WAL record / checkpoint | 未来的 PS（或接管的 PS） | **EN 的 extent，EN 视为不透明字节** | `MAGIC "AU7B"` + `FORMAT_VERSION` ✓ |
-  | `.meta` / `.ck` | 未来的 EN（+ recovery 的另一台 EN） | EN 本地盘 | `EXTMETA\0/\x01/\x02`，三版都还在解析 ✓ |
-  | manager 记录 | 未来的 manager | etcd | **无 —— 借 `WIRE_VERSION`** ← 唯一的窟窿 |
-  | 集群内部 wire | 活着的 peer | 网络 | `WIRE_VERSION` 精确相等 |
-  | 客户端 wire | 活着的客户端 | 网络 | 窗口（[[F-CLIENT-WIRE-COMPAT]]） |
-  **PS 对本地文件系统的引用是 0** —— 它的持久态 = manager 记录 + stream 内容。所以改 SST 格式
-  是 PS↔未来 PS 的事，EN 根本看不见，`FORMAT_VERSION` 独立于 `WIRE_VERSION` 是对的。
-  **五格里三格已经健康**，要动的只有 etcd 一格：它之所以借 wire 版本号，仅仅因为被定义成
-  rkyv 结构、住在 wire schema 文件里。这不是要发明新纪律，是去抄 `.meta` 已经在用的那套。
-- **代价（2026-09-19 实测）**: 44 个 wire 版本区间里，真正需要 MGR+PS+EN 三者一起动的只有
-  **8 (18%)**；**EN 本可不重启的占 30 (68%)**。etcd 借版本号的后果就是这个差额。
-- **持久类型权威清单**（来自 `replay_from_etcd`，manager 重放必须解码每一个）: rkyv 的 8 个 ——
-  `MgrExtentInfo`(extents/)、`MgrRegionInfo`(regions/)、`MgrStreamInfo`(streams/)、
-  `MgrNodeInfo`(nodes/)、`MgrDiskInfo`(disks/)、`MgrPartitionMeta`(partitions/)、
-  `MgrNamespace`、`MgrTenantAccount`；另有三个非 rkyv 的 key 无 schema 问题
-  （`ownerLocks/` 裸 revision、`psNodes/` UTF-8 地址、`partitionLastOp/` i64 LE）。
-  其中 `MgrRegionInfo` 和 `MgrNamespace` 同时被内嵌客户端解码。
-- **Scope**:
-  1. 8 个持久类型各自在 `crates/manager/src/persist/` 有独立定义 + 自己的魔数/版本字节，
-     只有 manager 能引用；与 wire 类型之间是**显式转换**。
-  2. **转换必须穷尽**：用结构体解构（`let Mgr… { a, b, c } = x;`，不许 `..`），加字段不写
-     转换就编译失败。当年 `ExtDfReq` 镜像的教训是"两份定义而没有东西决定读哪份"，不是
-     "有两份定义"；这里判别器是显式转换函数本身。
-  3. `MgrRegionInfo` 拆三份：持久（7 字段）、PS 线上（7 字段）、**客户端路由记录（4 字段：
-     `rg` / `part_id` / `ps_id` / `region_epoch`）**。客户端生产路径从不读三个 `*_stream`
-     id —— `client/src/lib.rs` 里那 3 处只有两条注释加一个被迫编造
-     `log_stream: 1, row_stream: 2, meta_stream: 3` 的测试 fixture。拆完顺带止住 stream 层
-     id 跨层泄漏到 SDK。`MgrNamespace` 同样处理（它只有 manager + 客户端两个身份，更干净）。
-  4. `PayloadLocation` 这类跨 wire/盘 的类型各归各家：盘上那个字节的含义由 EN 的持久 schema
-     定义、由 `.meta` 魔数管，不从 wire enum 继承。今天 `from_byte` 的"unknown → InDat,
-     never an error"是条**持久化决策长在 wire 类型上**；全停全启 + 不回滚兜着，但回滚会
-     静默把分片字节当 value 服务出去。
-  5. **补上被搬走的守卫。** 今天"改它就要 bump wire 版本"是**意外**生效的护栏；搬出去不给
-     替代品就是拿过宽的守卫换成没有守卫。且 fail-loud 不得假设 —— 见
-     [[project_rkyv_add_field_not_always_loud]]，rkyv 加字段是否响亮取决于结构形状。
-- **Acceptance**:
-  - 改一个已分家的持久结构（例如给 `MgrAuditEntry` 加字段）**不需要**动 wire 版本号，且
-    PS/EN 二进制不重新编译即可继续互操作：真集群验，只换 manager 二进制，PS/EN 保持原进程，
-    读写与 split/recovery 正常。
-  - 给任一持久结构加一个字段而**不改**对应的转换函数 ⇒ **编译失败**（穷尽解构的 ablation）。
-  - 旧 manager 写的 etcd 数据被新 manager 就地重放成功；反向按持久侧纪律明确是拒绝还是兼容，
-    有测试钉住是哪一种。
-  - 每个持久结构有测试证明"加字段后旧二进制重放响亮失败"，或记录它靠什么别的机制兜底。
-  - 客户端拿到的路由记录不再包含任何 `*_stream` id（编译期不可达，非运行时断言）。
-  - Ablation：把某个分家出去的类型搬回 wire 文件 → 第一条验收转红。
-- **Status**: `passes: false`（2026-09-20 开工）— **Scope 4 + Scope A 已落地**，其余未动。
-  **Scope A（2026-09-20）**：`crates/manager/src/persist/` + 6 字节信封
-  `[AUMG][record_type][format_version]`，以及**不在 `MetadataState` 里的那三个**
-  持久类型（audit / tenantAccount / namespace）分家，`pub(crate)` 即"只有 manager
-  能引用"的编译期保证；穷尽解构转换；`persist/freeze.rs` 逐字节记录（替代被搬走的
-  "改它就要 bump wire 版本"那道意外守卫）。`MgrTenantAccount` 已从 wire 文件删除
-  （无任何消息携带它，两套 freeze 证明没有编码移动）。
-  **迁移按用户定调走树外工具**（[[feedback_persist_migration_by_tool_not_dual_read]]）：
-  `migratev0_v1`，不解码、幂等、有 leader-key 前置检查，用完删。真 etcd 端到端跑通：
-  裸值 → 新 manager 拒绝并点名 → 转换 → 重放成功 → 字段逐个正确。
-  **验收第 3 条已满足**（用户 2026-09-20 澄清了"就地"的含义：**停机 → convert 转 etcd
-  → 起新集群**，即不清 etcd、在原地改值，而不是"不经转换直接读"）。真 etcd 端到端
-  跑的就是这个流程。该行后半句"反向……有测试钉住是哪一种"的答案是**拒绝**，已钉：
-  `an_old_bare_decoder_refuses_a_value_this_build_wrote`。注意那个拒绝是**结构性但
-  偶然**的——rkyv 的 root 相对 buffer 末尾定位，所以插 6 字节后 root 照样被找到，
-  真正挡住的是对齐（整体偏移 6，root 对齐 4/8）。将来若有对齐为 1/2 的记录就没有
-  这层保护，测试会绿着但含义变弱，已写进测试注释。
-  **Scope B（2026-09-20）**：其余六个记录（extents / streams / nodes / disks /
-  partitions / regions + 嵌套 `RangeRecord`）全部分家，`MetadataState` 已从
-  `autumn-common` 搬进 `crates/manager/src/store.rs` 并**持有 persist 记录**
-  —— 这才让"纯持久字段"有地方待。九个记录 `RECORD_TYPE` 1-9 全部冻结并按名钉住；
-  裸 rkyv 的 `kv_entry` / `replay_decode_id_map` 已删。
-  **最大风险点 CAS baseline**：`Cmp::value` 逐字节比对存量，baseline 少信封则
-  永远不匹配 ⇒ split/merge/GC/recovery 无限重试。已全部走 `persist::encode`，
-  并用**真集群**验证（内存模式测试根本不走 etcd）：split / merge 均成功、
-  12/12 值字节正确、重启 manager 九种记录重放干净。
-  **Scope 3（2026-09-20）**：客户端路由记录收窄成 4 字段。按 §7 的两形式规则走 ——
-  新 opcode `MSG_GET_CLIENT_REGIONS`(0x60) + `ClientRegion`(4 字段)，旧
-  `MSG_GET_REGIONS`(0x2E) + 7 字段 `MgrRegionInfo` **原封不动**继续服务 PS
-  （`sync_regions_once` 要靠那三个 stream id 开分区）、autumn-op、以及 45 以下的
-  客户端。`WIRE_VERSION` 44→45、地板仍 43、窗口 `[43,45]`。SDK 按协商版本选**发哪个
-  opcode**（不是按连接版本解释收到的字节 —— 那才是 §7 禁止的），未知时回落旧 opcode。
-  **真集群双形式同时活着已验证**：wire-44 编出来的老客户端读到了 wire-45 客户端写的
-  全部值并写回一个。
-  验收那条"编译期不可达"**成立但要说准**：客户端持有的 `ClientRegion` 里没有 stream
-  字段、类型上无法命名；但对 44 集群回退时，7 字段形式仍在进程内被解码一次（唯一一处，
-  就是那条回退臂），地板越过 45 后消失。
-  **五条 Scope 全部完成。** `passes` 仍为 false 的唯一原因是第一条 Acceptance
-  （真集群只换 manager 二进制、PS/EN 不重编译继续互操作）**尚未演示**。另：九个记录的 `FORMAT_VERSION` 都还是 1，**没有任何一次真正的 bump
-  被端到端验证过**；第一次 bump 才是转换器第二步的考验(它不再是纯前缀插入，
-  必须自带旧定义)。
-  payload-location 那个字节的三个载体各自立家：wire（`PayloadLocation::from_wire_byte`
-  改返回 `Option`，`ReadBytesReq` 直接持 resolved 值、解码时拒陌生字节）、EN 的 `.meta`
-  第 41 字节（由 `EXTMETA\x02` 魔数定义合法集合，越界走既有 META-FAILCLOSED 隔离）、
-  manager 的 `extentLayout/<id>`（解码 fail-loud，越界/空值/坏 key 一律拒绝当 leader；
-  **缺 key 仍然是 `InDat`**，那是迁移故事本身）。旧 `from_byte` 文档的前提被证伪：
-  peer 精确相等 ⇒ "只可能来自知道更多位置的 peer"不存在。**今天行为惰性**——只有两个
-  合法值，树里没有任何生产方能产出第三个字节；这条改的是加第三个位置那天会不会静默。
-  Scope 1/2/3/5（8 个持久类型分家、穷尽转换、`MgrRegionInfo`/`MgrNamespace` 三分、
-  替代守卫）仍未动，第一条 Acceptance 未跑。与 [[F-CLIENT-WIRE-COMPAT]] 的第 3 条
-  Scope 有交集（`MgrRegionInfo` / `MgrNamespace` 的客户端那一份），其余可并行。
 
 ### F-STREAM-ATREST-CKSUM — stream 层大 value 的 at-rest 内容校验 + scrub（静默腐化 G12）
 - **Trigger** (2026-08-04, chaos 缺口 loop 的 G12，已 reproduce-first 复现 harness `crates/manager/tests/silent_corruption_rot.rs`): sealed extent 的 **value 数据字节**在单副本上被静默翻位后，**全链无检测**：(a) 客户端读回坏字节仍返回 `CODE_OK`（frame CRC 明确排除 bulk value 段；`.meta` CRC 只覆盖 40B 元数据；WAL/SST CRC 是 partition 层、不覆盖 stream extent 的原始 value）；(b) recovery 从坏副本重填时 `verify` 只校 `length==sealed_length` + eversion、**不校内容** → 把腐化洗成权威；(c) EC 转换对坏字节直接编 parity → 固化成 canonical。stream 层**既无 per-extent/block content checksum、也无 scrubber**；确定性副本轮转让坏副本被一致选中（harness 里 25/64 子区间读命中）。这是**设计缺口**（数据完整性面），不是坏代码——today 的裸机盘不会自发翻位、且需要单副本静默腐化才触发，故不是"今天可复现的线上危害"，属于中期加固。

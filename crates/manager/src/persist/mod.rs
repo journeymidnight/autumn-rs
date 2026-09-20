@@ -196,6 +196,18 @@ mod tests {
     use super::records::{AuditRecord, NamespaceRecord, TenantAccountRecord};
     use super::*;
 
+    /// A free-text value whose own bytes spell a valid envelope: the magic,
+    /// then the record type, then the format version. This is the shape the
+    /// converter's six-byte "already done" check cannot tell from a real
+    /// envelope, and the reason `decode` must still refuse it.
+    fn impersonating_name(record_type: u8, format_version: u8, tail: &str) -> String {
+        let mut v = PERSIST_MAGIC.to_vec();
+        v.push(record_type);
+        v.push(format_version);
+        v.extend_from_slice(tail.as_bytes());
+        String::from_utf8(v).expect("magic, a small type byte and a version are all valid UTF-8")
+    }
+
     fn audit() -> AuditRecord {
         AuditRecord {
             op: 3,
@@ -281,7 +293,15 @@ mod tests {
     #[test]
     fn a_bare_value_impersonating_the_whole_envelope_is_still_refused() {
         let acct = TenantAccountRecord {
-            tenant: "AUMG\u{2}\u{1}longname".to_string(),
+            // Built from the constants, not spelled out: a fixture that
+            // hardcodes the version byte has to be hand-edited on every
+            // FORMAT_VERSION bump, and one that is forgotten stops
+            // impersonating anything while still passing.
+            tenant: impersonating_name(
+                TenantAccountRecord::RECORD_TYPE,
+                TenantAccountRecord::FORMAT_VERSION,
+                "longname",
+            ),
             credential_hash: [7u8; 32],
             allowed_prefixes: vec![b"fs/".to_vec()],
         };
@@ -301,7 +321,11 @@ mod tests {
         );
 
         let entry = AuditRecord {
-            reason: "AUMG\u{1}\u{1}operator-typed-this".to_string(),
+            reason: impersonating_name(
+                AuditRecord::RECORD_TYPE,
+                AuditRecord::FORMAT_VERSION,
+                "operator-typed-this",
+            ),
             ..audit()
         };
         let bare = autumn_rpc::manager_rpc::rkyv_encode(&entry).to_vec();
