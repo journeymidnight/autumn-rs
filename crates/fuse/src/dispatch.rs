@@ -520,6 +520,11 @@ pub async fn handle_request(
             .await;
             let _ = reply.send(result);
         }
+        FsRequest::Link { ino, parent, name, reply } => {
+            let result = dir::link(state, ino, parent, &name).await
+                .map(|meta| inode_to_attr(ino, &meta));
+            let _ = reply.send(result);
+        }
         FsRequest::Unlink {
             parent,
             name,

@@ -891,6 +891,65 @@ async fn get_value(
     get_value_inner(payload, part, false).await
 }
 
+/// Exclusive to the partition write actor after draining its pipeline.
+pub(crate) async fn compare_put(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    metrics: &mut WriteLoopMetrics,
+    locked_by_other: &Rc<std::cell::Cell<bool>>,
+) -> HandlerResult {
+    let req: ComparePutReq = rkyv_decode(&payload)
+        .map_err(|e| (StatusCode::InvalidArgument, e))?;
+    if req.value.len() > MAX_COMPARE_PUT_BYTES
+        || req.expected.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES) {
+        return Err((StatusCode::InvalidArgument, "compare_put value exceeds 64 KiB".into()));
+    }
+    let check = || {
+        let p = part.borrow();
+        check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
+        if !in_range(&p.rg, &req.key) {
+            return Err((StatusCode::InvalidArgument, "key is out of range".into()));
+        }
+        if p.frozen_for_merge.get().is_some() || p.frozen_for_split.get().is_some() {
+            return Err((StatusCode::Unavailable, "partition frozen; refresh routing".into()));
+        }
+        Ok(())
+    };
+    check()?;
+    let current = get_value(rkyv_encode(&GetReq {
+        part_id: req.part_id, key: req.key.clone(), offset: 0, length: MAX_COMPARE_PUT_BYTES as u32 + 1,
+        region_epoch: req.region_epoch,
+    }), part).await?;
+    let matches = match current {
+        GetOutcome::NotFound => req.expected.is_none(),
+        GetOutcome::Value(value) => req.expected.as_deref() == Some(value.as_ref()),
+        GetOutcome::Redirect { .. } => unreachable!("get_value does not redirect"),
+    };
+    if !matches {
+        // Body-level conflict is terminal, unlike stale-region frame errors.
+        return Ok(rkyv_encode(&PutResp {
+            code: CODE_PRECONDITION, message: "compare_put conflict".into(), key: req.key,
+        }));
+    }
+    // A paged lookup can yield while maintenance freezes or splits the range.
+    check()?;
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let batch = vec![WriteRequest {
+        op: WriteOp::Put {
+            user_key: Bytes::from(req.key.clone()), value: Bytes::from(req.value), expires_at: 0,
+        },
+        resp: WriteResponder::Put { outer: tx, key: req.key },
+    }];
+    if let Some(mut flight) = start_write_batch(part, batch).await
+        .map_err(|e| (StatusCode::Internal, e.to_string()))? {
+        let phase2_result = (&mut flight.phase2_fut).await;
+        let id = part.borrow().part_id;
+        handle_completion(part, metrics, locked_by_other, id,
+            InflightCompletion { data: flight.data, phase2_result }).await;
+    }
+    rx.await.map_err(|_| (StatusCode::Internal, "conditional writer dropped reply".into()))?
+}
+
 /// `redirect_large_vp` — when true, a FULL-value read of a VP whose
 /// value length >= AUTUMN_PS_ZC_RECV_MIN (64 KiB, the bulk_worthwhile
 /// threshold) returns `GetOutcome::Redirect` (extent + exact value byte

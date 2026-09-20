@@ -719,3 +719,11 @@ read loop and its pending receivers, yielding ConnectionClosed. It must not
 synthesize an Internal Status for local CRC failure, which would make pools
 retain a broken connection. The stream pool tests cover a corrupt 64 KiB bulk
 response and fail if that synthetic status is restored.
+
+## Conditional publication (wire 44)
+
+MSG_COMPARE_PUT (0x5D) carries part_id, region_epoch, key, optional expected bytes
+and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownership
+errors retain frame-level status for routing refresh. Both values are capped at
+64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
+Every service and embedded client must be rebuilt together for wire 44.

@@ -2643,6 +2643,31 @@ impl ClusterClient {
         self.put_bound(&bound, value).await
     }
 
+    /// Atomically replace a small value if it equals `expected`; None requires
+    /// absence. False means conflict. On an RPC error the outcome may be
+    /// ambiguous: a unique generation in the value lets callers resolve it.
+    pub async fn compare_put(
+        &self, key: &[u8], expected: Option<&[u8]>, value: &[u8],
+    ) -> std::result::Result<bool, AutumnError> {
+        let cap = partition_rpc::MAX_COMPARE_PUT_BYTES;
+        if value.len() > cap || expected.is_some_and(|v| v.len() > cap) {
+            return Err(AutumnError::InvalidArgument(format!(
+                "compare_put values exceed {cap} bytes"
+            )));
+        }
+        let key = self.binding.bind_key(key)?;
+        let response = self.call_ps_for_key(&key, partition_rpc::MSG_COMPARE_PUT, |part_id, region_epoch| {
+            rkyv_encode(&partition_rpc::ComparePutReq {
+                part_id, region_epoch, key: key.clone(),
+                expected: expected.map(<[u8]>::to_vec), value: value.to_vec(),
+            })
+        }).await?;
+        let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;
+        if response.code == partition_rpc::CODE_PRECONDITION { return Ok(false); }
+        check_ps_code(response.code, &response.message)?;
+        Ok(true)
+    }
+
     /// Internal: `put` over an ALREADY-bound wire key (no namespace binding).
     /// The public `put` binds then calls this; `raw()`/`rescope` views call it
     /// with their own key transform. D7.

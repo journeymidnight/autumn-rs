@@ -1518,4 +1518,4 @@
   writer+reader 并发不 EBUSY；object_store 路径——并发双 writer 提交不互相覆盖
   （CAS 生效，消融：改成 last-writer-wins 测试变红）；list 1000+ fragment 的
   scan 延迟有基准数字；与 S3 后端跑同一基准集对比吞吐/P99。
-- **Status**: `passes: false` (2026-09-16) — 定调与范围已确认，未开工。
+- **Status**: `passes: true` (2026-09-19) — 原生/FUSE demo、CAS 消融、分页与 MinIO 对照已验证；最终 Linux 验收和临时服务清理完成。

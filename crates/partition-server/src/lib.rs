@@ -7025,7 +7025,7 @@ async fn partition_loop(
                 match select(req_fut, wake_fut).await {
                     Either::Left((maybe_req, _)) => match maybe_req {
                         Some(req) => {
-                            handle_incoming_req(req, &mut pending, &part, &routing).await;
+                            handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
                         }
                         None => break,
                     },
@@ -7041,7 +7041,7 @@ async fn partition_loop(
                 match select(req_fut, select(wake_fut, drain_fut)).await {
                     Either::Left((maybe_req, _)) => match maybe_req {
                         Some(req) => {
-                            handle_incoming_req(req, &mut pending, &part, &routing).await;
+                            handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
                         }
                         None => break,
                     },
@@ -7082,7 +7082,7 @@ async fn partition_loop(
             match select(req_fut, Box::pin(cfut)).await {
                 Either::Left((maybe_req, _cfut_dropped)) => match maybe_req {
                     Some(req) => {
-                        handle_incoming_req(req, &mut pending, &part, &routing).await;
+                        handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
                     }
                     None => {
                         // Channel closed: drain remaining inflight, then exit.
@@ -7145,7 +7145,7 @@ async fn partition_loop(
             while pending.len() < max_write_batch() {
                 match req_rx.next().now_or_never() {
                     Some(Some(req)) => {
-                        handle_incoming_req(req, &mut pending, &part, &routing).await;
+                        handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
                     }
                     _ => break,
                 }
@@ -7431,7 +7431,40 @@ async fn handle_incoming_req(
     pending: &mut Vec<WriteRequest>,
     part: &Rc<RefCell<PartitionData>>,
     routing: &Routing,
+    inflight: &mut InflightQueue,
+    metrics: &mut WriteLoopMetrics,
+    locked_by_other: &Rc<Cell<bool>>,
 ) {
+    if req.msg_type == partition_rpc::MSG_COMPARE_PUT {
+        // This actor owns user-write admission. Drain preceding writes and
+        // retain admission across the comparison and durable publication.
+        while let Some(c) = inflight.next().await {
+            let id = part.borrow().part_id;
+            handle_completion(part, metrics, locked_by_other, id, c).await;
+        }
+        while !pending.is_empty() && !locked_by_other.get() {
+            match start_write_batch(part, take_byte_bounded_batch(pending)).await {
+                Ok(Some(mut flight)) => {
+                    let result = (&mut flight.phase2_fut).await;
+                    let id = part.borrow().part_id;
+                    handle_completion(part, metrics, locked_by_other, id,
+                        InflightCompletion { data: flight.data, phase2_result: result }).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = req.resp_tx.send(Err((StatusCode::Internal, e.to_string())));
+                    return;
+                }
+            }
+        }
+        if locked_by_other.get() {
+            let _ = req.resp_tx.send(Err((StatusCode::Unavailable, "partition writer fenced".into())));
+            return;
+        }
+        let response = rpc_handlers::compare_put(req.payload, part, metrics, locked_by_other).await;
+        let _ = req.resp_tx.send(response);
+        return;
+    }
     // bump per-partition request counter for the policy engine.
     // fix MED-3: also bump the never-reset monotonic twin used by
     // the maintenance scheduler's req_per_sec diff. Two atomic

@@ -88,6 +88,12 @@ pub enum FsRequest {
         name: OsString,
         reply: Reply<()>,
     },
+    Link {
+        ino: u64,
+        parent: u64,
+        name: OsString,
+        reply: Reply<fuser::FileAttr>,
+    },
     Open {
         ino: u64,
         flags: i32,

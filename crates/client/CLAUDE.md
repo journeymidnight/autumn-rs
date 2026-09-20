@@ -493,3 +493,12 @@ binds the new identity/token. Keeping a status-refused connection is not a
 substitute for this authentication lifecycle.
 Tests in src/connection_tests.rs count TCP accepts and verify retry epochs;
 manager's system_status_connection_reuse exercises actual split and merge.
+
+## Atomic small-value publication
+
+compare_put(key, expected, value) binds the namespace once, then sends the new
+ComparePutReq (wire 44). None requires absence; Some requires exact current-value
+equality. Both expected and new values are limited to 64 KiB. False is a body-level
+conflict and is not retried as stale routing. Transport outcomes can be ambiguous:
+callers publishing UUID generations may read back their UUID to resolve a lost ACK.
+The object-store adapter uses this for metadata publication, never bulk payloads.

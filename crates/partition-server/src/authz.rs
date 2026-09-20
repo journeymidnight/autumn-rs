@@ -25,6 +25,7 @@ use autumn_rpc::partition_rpc::{
     PUT_BULK_HEADER_LEN,
 };
 use autumn_rpc::StatusCode;
+use autumn_rpc::partition_rpc::{ComparePutReq, MSG_COMPARE_PUT};
 use ed25519_dalek::VerifyingKey;
 use parking_lot::RwLock;
 
@@ -349,6 +350,10 @@ pub fn authz_check(
             let r = partition_rpc::rkyv_decode::<DeleteReq>(payload).ok()?;
             check_key(&r.key, principal, inner, now)
         }
+        MSG_COMPARE_PUT => {
+            let r = partition_rpc::rkyv_decode::<ComparePutReq>(payload).ok()?;
+            check_key(&r.key, principal, inner, now)
+        }
         MSG_PUT => {
             // Value copied by rkyv_decode, but MSG_PUT is only used for values
             // < 64 KiB (large values go MSG_PUT_BULK, key extracted below without
@@ -462,6 +467,10 @@ pub fn check_layer_a(
         ))
     }
     match msg_type {
+        MSG_COMPARE_PUT => {
+            let r = partition_rpc::rkyv_decode::<ComparePutReq>(payload).ok()?;
+            if in_a_namespace(&r.key, &inner.namespaces) { None } else { reject(&r.key) }
+        }
         MSG_PUT => {
             let r = partition_rpc::rkyv_decode::<PutReq>(payload).ok()?;
             if in_a_namespace(&r.key, &inner.namespaces) {
@@ -835,6 +844,24 @@ mod tests {
         let inner = inner_with_namespaces(vec![b"kvc/".to_vec(), b"mem/".to_vec()]);
         assert!(check_layer_a(MSG_PUT, &put_payload(b"kvc/x"), &inner).is_none());
         assert!(check_layer_a(MSG_PUT, &put_payload(b"mem/acme/y"), &inner).is_none());
+    }
+
+    #[test]
+    fn compare_put_enforces_namespace_and_principal() {
+        let mut inner = inner_with_namespaces(vec![b"acme/".to_vec()]);
+        let principal = acme();
+        let request = |key: &[u8]| rkyv_encode(&ComparePutReq {
+            part_id: 77, region_epoch: 3, key: key.to_vec(),
+            expected: None, value: b"manifest".to_vec(),
+        });
+        let mine = request(b"acme/mem/object");
+        let other = request(b"other/mem/object");
+        assert!(check_layer_a(MSG_COMPARE_PUT, &mine, &inner).is_none());
+        assert!(matches!(check_layer_a(MSG_COMPARE_PUT, &other, &inner), Some((StatusCode::NamespaceUnknown, _))));
+        inner.enabled = true;
+        assert!(authz_check(MSG_COMPARE_PUT, &mine, Some(&principal), &inner, 999_000).is_none());
+        assert!(authz_check(MSG_COMPARE_PUT, &other, Some(&principal), &inner, 999_000).is_some());
+        assert!(authz_check(MSG_COMPARE_PUT, &mine, None, &inner, 999_000).is_some());
     }
 
     #[test]

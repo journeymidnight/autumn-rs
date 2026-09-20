@@ -2166,3 +2166,16 @@ reconnection. The shared shutdown future is polled first when both it and the
 connection are ready. Normal request processing adds no per-request RPC.
 Manager's system_status_connection_reuse covers the merge/reopen window while
 an SDK client keeps its pre-merge connection and routing cache.
+
+## Conditional metadata writes
+
+MSG_COMPARE_PUT runs inside the sole partition write actor. It drains previously
+admitted/in-flight writes before reading the visible MVCC value, then holds user
+write admission through its WAL append and ordered Phase 3 publication. This is
+partition-wide serialization for rare metadata commits; ordinary bulk writes keep
+their existing pipeline. The append uses the normal completion handler, including
+ownership-loss poisoning. The comparison lookup is bounded to 64 KiB + 1 and
+checks epoch/range/freeze both before and after I/O. SST reads, expiry, tombstones
+and GC read pins use the existing GET core. A mismatch returns a body-level
+CODE_PRECONDITION, not a stale-routing frame error. Namespace/authz apply before
+admission. UUIDs in object metadata give the adapter an ABA-free ETag.

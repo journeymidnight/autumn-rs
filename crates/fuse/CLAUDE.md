@@ -690,3 +690,21 @@ fuse 层无多 key 原子提交（完整方案 per-inode generation manifest 仍
   INTEGRITY（EN 很快重生、读全程可用），**不**测 EN-down 期间持续写（那只会撞 RF=3
   capacity wedge）。要测 EN 丢失下的写可用性须配 >RF 台 EN。单线程 fuse dispatcher +
   30s bridge `REPLY_TIMEOUT` 只把 stall 放大成 EIO，非成因；无需改 stream 层超时。
+
+## Manifest hard links
+
+Lance's local ConditionalRenameCommitHandler uses linkat(source, destination),
+then unlinks its temporary source. The default fuser callback returned EPERM,
+so table creation failed although ordinary rename worked (strace confirmed).
+Link now dispatches to dir::link: regular files only, persist the increased nlink,
+then create the destination dirent using compare_put(None). Existing destinations
+return EEXIST; a lost-ACK retry recognizing the same inode succeeds. Source unlink
+preserves the linked inode. Data is not copied. A pre-existing-target check avoids
+unnecessary inode metadata writes in the usual conflict case.
+
+This retains the filesystem's existing nontransactional namespace limitation:
+inode reference counts and directory entries are separate KV writes, and mutation
+serialization is per mount. A crash after the count update can leak a reference.
+It is suitable for the one-mount Lance demo; it does not establish crash-atomic
+or multi-mount namespace transactions. Native Lance metadata commits use the
+single-key object-store CAS and do not depend on this FUSE path.

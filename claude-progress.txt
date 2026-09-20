@@ -1,3 +1,14 @@
+Date: 2026-09-19 (8)
+TaskStatus: completed
+Task scope: F-LANCEDB-OBJECT-STORE in feat/lancedb-object-store worktree.
+Current summary: Native object_store 0.14.1 adapter, immutable generation-qualified chunks, ranged/multipart IO, paged listing, offline vacuum; SDK/PS compare_put uses the partition write actor and existing WAL (wire 44). FUSE linkat support fixes the real Lance manifest EPERM failure. Native LanceDB lifecycle/concurrent append, FUSE lifecycle/concurrent reader-writer, and matched MinIO workload verified on H200-1.
+Verification: Final Linux run at fcfc51f: native-final.exit=0 (210 final rows, 16 stored objects, vacuum 21 chunks), fuse-final.exit=0 (includes explicit link collision/source-unlink checks), contract-final.exit=0 (6 tests, 4.37 s). Final native demo verifies empty dedicated scope and table-only cleanup. Earlier local client 57 / partition-server 253 / RPC 69 library tests passed; adapter clippy has no adapter warnings. CAS ablation fails with two winners when the server comparison is bypassed, restored green.
+Performance: debug/warm-cache smoke only, RF2 Autumn vs single-copy MinIO. 1 MiB range read 1828.4 vs 1416.6 MiB/s; put 320.5 vs 774.0 MiB/s. 1100-fragment list P99 29.07 vs 54.54 ms (100 samples). Final correctness-run list p50 26.185 ms, max 26.842 ms (20 samples). Full conditions in docs/lancedb_validation.md; not production A/B.
+Isolation and cleanup: All remote work is under /data08/autumn-lancedb-20260919-01a0bb27 inside dongmao-autumn. Existing checkout, targets and services were untouched. Source sync uses git bundle into a separate checkout. Final cleanup verified mount=false and inactive task PIDs: test_cluster 3634637, FUSE 3726318, MinIO 3653969. Code, data and logs retained for inspection. No broad process-name kills or shared cluster.sh operations.
+Access: goto H200-1 first runs ORTHRUS_REGION=I18N-OG orthrus-cli demand fdbd:dc62:3:302::14 -t24, then ssh. Repeating that authorized temporary-root step succeeded; a task-specific SSH ControlMaster avoided repeated jump authentication during final verification.
+Limits: Payload GC is offline; FUSE namespace metadata is not a multi-key transaction; demo injects store per table, not an autumn:// connection provider. Initial performance data does not compare equivalent replication/durability configurations.
+Next steps: ready for review/integration from the feature worktree. No deployment or main-branch merge performed. Final evidence: TASK_ROOT/logs/{native-final,fuse-final,contract-final}.log and corresponding .exit files, plus final-cleanup.json.
+
 Date: 2026-09-19 (7)
 TaskStatus: completed
 Task scope: F-CLIENT-WIRE-COMPAT — close it out. `passes: false` -> `passes: true`, after an independent audit said do NOT flip it and named the row that was not met.

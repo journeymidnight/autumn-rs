@@ -287,6 +287,54 @@ pub async fn unlink(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()
     Ok(())
 }
 
+/// Add a name to a regular file. The directory entry is create-only so two
+/// manifest publishers cannot replace each other's winning inode.
+///
+/// Persist the reference count before the name: a crash between those writes
+/// leaks a reference instead of letting unlink of the old name destroy a
+/// published file. Like existing rename/unlink this is not a multi-key txn.
+pub async fn link(state: &mut FsState, ino: u64, parent: u64, name: &OsStr) -> Result<InodeMeta> {
+    let mut inode = get_inode(state, ino).await?;
+    if inode.mode & S_IFMT != S_IFREG {
+        return Err(anyhow!("EPERM"));
+    }
+    let mut parent_meta = get_inode(state, parent).await?;
+    if parent_meta.mode & S_IFMT != S_IFDIR {
+        return Err(anyhow!("ENOTDIR"));
+    }
+    let key = key::dirent_key(parent, name.as_encoded_bytes());
+    if state.kv_get_opt(&key).await?.is_some() {
+        return Err(anyhow!("EEXIST"));
+    }
+    let previous = inode.clone();
+    inode.nlink = inode
+        .nlink
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("EMLINK"))?;
+    let (secs, nanos) = now_ts();
+    inode.ctime_secs = secs;
+    inode.ctime_nsecs = nanos;
+    put_inode(state, ino, &inode).await?;
+    let value = schema::encode_dirent(&DirentValue {
+        child_inode: ino,
+        file_type: DT_REG,
+    });
+    let created = state.client.compare_put(&key, None, &value).await?;
+    if !created {
+        // A retry after a lost ACK can see our own inode. Never decrement a
+        // reference whose publication might already have succeeded.
+        if state.kv_get_opt(&key).await?.as_deref() != Some(value.as_slice()) {
+            put_inode(state, ino, &previous).await?;
+            return Err(anyhow!("EEXIST"));
+        }
+    }
+    parent_meta.mtime_secs = secs;
+    parent_meta.mtime_nsecs = nanos;
+    put_inode(state, parent, &parent_meta).await?;
+    *state.lookup_count.entry(ino).or_insert(0) += 1;
+    Ok(inode)
+}
+
 /// Rename a file or directory.
 pub async fn rename(
     state: &mut FsState,

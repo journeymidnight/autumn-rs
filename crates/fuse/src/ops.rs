@@ -220,6 +220,18 @@ impl Filesystem for AutumnFs {
         }
     }
 
+    fn link(&mut self, _req: &Request<'_>, ino: u64, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        match self.send(|r| FsRequest::Link {
+            ino,
+            parent,
+            name: name.to_owned(),
+            reply: r,
+        }) {
+            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Err(e) => reply.error(err_to_errno(&e)),
+        }
+    }
+
     fn create(
         &mut self,
         _req: &Request<'_>,
@@ -398,7 +410,12 @@ impl Filesystem for AutumnFs {
                 for e in entries {
                     // M1: core entries carry a DT_* byte;
                     // convert to fuser::FileType at the reply boundary.
-                    if reply.add(e.ino, e.offset, crate::attr::dt_to_filetype(e.kind), &e.name) {
+                    if reply.add(
+                        e.ino,
+                        e.offset,
+                        crate::attr::dt_to_filetype(e.kind),
+                        &e.name,
+                    ) {
                         break; // buffer full
                     }
                 }

@@ -231,6 +231,10 @@ pub const MSG_BATCH_GET_BULK: u8 = 0x5B;
 /// carries no value, so there is no tail to keep out of the rkyv payload.
 pub const MSG_BATCH_DELETE: u8 = 0x5C;
 
+/// Atomic compare-and-put, serialized through the partition write actor.
+pub const MSG_COMPARE_PUT: u8 = 0x5D;
+pub const MAX_COMPARE_PUT_BYTES: usize = 64 * 1024;
+
 /// One op inside a `BatchDeleteReq`. Carries its own fence identity because a
 /// batch may span inodes (a directory unlink walks many), exactly as
 /// `BatchPutOp` does.
@@ -721,6 +725,16 @@ pub struct PutReq {
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ComparePutReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub key: Vec<u8>,
+    /// None requires absence, Some requires exact visible-value equality.
+    pub expected: Option<Vec<u8>>,
+    pub value: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PutResp {
     pub code: u8,
     pub message: String,
@@ -1050,6 +1064,9 @@ pub struct TableLocations {
 /// Decodes the full request type based on msg_type. Returns 0 if decoding fails.
 pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
     match msg_type {
+        MSG_COMPARE_PUT => rkyv_decode::<ComparePutReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         MSG_PUT => rkyv_decode::<PutReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
