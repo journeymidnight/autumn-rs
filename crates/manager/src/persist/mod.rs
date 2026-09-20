@@ -152,7 +152,11 @@ where
             "{key}: not a persisted manager record (no {} envelope). This is what \
              an un-migrated value written before the records were split out of the \
              wire schema looks like — run `migratev0_v1` against the STOPPED \
-             cluster before starting this binary",
+             cluster before starting this binary. That bin was deleted after the \
+             2026-09-20 conversion, as a one-shot converter is meant to be; \
+             recover it with `git show \
+             fb47730e:crates/server/src/bin/migratev0_v1.rs` and rebuild it \
+             rather than writing a fresh one",
             String::from_utf8_lossy(&PERSIST_MAGIC)
         ));
     }

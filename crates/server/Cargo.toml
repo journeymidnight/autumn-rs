@@ -71,8 +71,6 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 autumn-common = { path = "../common" }
 autumn-manager = { path = "../manager" }
-# Used only by the one-shot `migratev0_v1` converter bin; remove both together.
-autumn-etcd = { path = "../etcd" }
 autumn-stream = { path = "../stream" }
 autumn-partition-server = { path = "../partition-server" }
 autumn-rpc = { path = "../rpc" }

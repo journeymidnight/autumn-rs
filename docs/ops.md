@@ -2799,54 +2799,37 @@ Do this while the managers are DOWN, in the same window as the binary swap. Any
 wire type that is also persisted needs the same treatment; `OpRecord` is the
 only one today.
 
-#### Converting the manager's persisted records (`migratev0_v1`)
+#### Converting the manager's persisted records — DONE, converter deleted
 
-The manager's own etcd records are being split out of the wire schema so they
-carry their own version instead of borrowing `WIRE_VERSION`
+The manager's own etcd records were split out of the wire schema so they carry
+their own version instead of borrowing `WIRE_VERSION`
 (`crates/manager/CLAUDE.md`, "Persisted records"). Each split record is stored
 inside an envelope, `[AUMG][record_type][format_version]`, and the servers speak
 exactly one shape: **a value without the envelope is refused and the manager will
-not take leadership.** There is no dual-read, by design — so the conversion is a
-step in the maintenance window, not something that heals itself at runtime.
+not take leadership.** There is no dual-read, by design.
 
-Nine prefixes are covered: `mgr_audit_log/`, `tenantAccount/`, `namespace/`,
+Nine prefixes were covered: `mgr_audit_log/`, `tenantAccount/`, `namespace/`,
 `extents/`, `streams/`, `nodes/`, `disks/`, `partitions/`, `regions/`. Every
 other persisted key (`opLog/`, `extent_inflight/`, `extentLayout/`,
 `extentCorrupt/`, `node_override/`, `inode_leases/`, `autoPolicy/*`, …) is NOT
-enveloped and must stay bare — the tool leaves them alone.
+enveloped and stays bare.
 
-```bash
-# 1. STOP the cluster (managers, PSes, ENs). The converter writes etcd directly;
-#    a running manager would be rewriting the same keys underneath it.
-# 2. Look before you write:
-cargo run --release --bin migratev0_v1 -- --etcd http://127.0.0.1:2379 --dry-run
-#    mgr_audit_log/   converted=190    already=0
-#    tenantAccount/   converted=2      already=0
-#    namespace/       converted=3      already=0
-#    disks/           converted=6      already=0
-#    nodes/           converted=3      already=0
-#    extents/         converted=48     already=0
-#    streams/         converted=12     already=0
-#    partitions/      converted=4      already=0
-#    regions/         converted=4      already=0
-# 3. Convert:
-cargo run --release --bin migratev0_v1 -- --etcd http://127.0.0.1:2379
-# 4. Start the new binaries.
-```
+**The one-shot converter `migratev0_v1` was run against the single production
+cluster on 2026-09-20 and then DELETED, along with the `autumn-etcd` dependency
+it had added to `crates/server`.** That is the contract a converter is held to —
+it leaves no residue, because a converter kept around is how a one-time
+migration turns back into the permanent compatibility code the rule exists to
+avoid. `git show fb47730e:crates/server/src/bin/migratev0_v1.rs` has it, and the
+section below records what it did on the live cluster.
 
-**Read the summary line — it is the check that costs nothing.** On a first pass
-over a populated cluster `converted` should be non-zero and `already` zero. The
-reverse on a first run means the tool is not looking at the cluster you think it
-is. `no records found at all` means the same thing more loudly.
+**There is nothing left to run here.** A cluster restored from a pre-2026-09-20
+etcd snapshot would need the converter again — recover it from git and rebuild
+it; do not write a fresh one from memory. What it did, for whoever has to:
+`migratev0_v1 --etcd <http://host:2379> [--dry-run]`, walking the nine prefixes
+and printing a per-prefix `converted=/already=` summary. It is idempotent (an
+already-enveloped value is skipped), so an interrupted run is simply re-run, and
+`--dry-run` writes nothing. The section below calls those the "steps above".
 
-Re-running is safe: an already-enveloped value is skipped, so an interrupted run
-is simply run again. A failure stops at the first prefix rather than limping on,
-and nothing past that point is written.
-
-Afterwards **delete `crates/server/src/bin/migratev0_v1.rs` and the `autumn-etcd`
-line it added to `crates/server/Cargo.toml`.** The tool is meant to leave no
-residue; a converter kept around is how a one-time migration turns back into the
-permanent compatibility code this rule exists to avoid.
 
 #### What the conversion looked like on the real cluster (2026-09-20)
 

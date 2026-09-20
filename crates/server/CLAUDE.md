@@ -189,39 +189,31 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 - **Inodes** come from the MANAGER's global counter (`alloc_inodes`) — the same crash-safe source the fuse mount and PyO3 `autumn.Fs` use, so no colliding inodes.
 - **ls / cat**: PS `handle_range` returns key-only entries, so both do a per-key `cluster.get` after the range scan (fine for one-shot CLI use). **Sizes**: files ≤4 KiB inline in the `InodeMeta`; larger go through the extent path (8 MiB chunks, `extent_key([0x03][ino BE][off BE])`).
 
-### `migratev0_v1` (`src/bin/migratev0_v1.rs`) — TEMPORARY, delete after running
+### `migratev0_v1` — RAN AND DELETED (2026-09-20)
 
-One-shot converter that wraps the manager's persisted etcd records in their
-`persist` envelope. **Run once against a STOPPED cluster, then delete the file
-and the `autumn-etcd` dependency it added.**
+The one-shot converter that wrapped the manager's persisted etcd records in
+their `persist` envelope. It was run against the single production cluster on
+2026-09-20 (455 records across the nine split prefixes) and then deleted with
+the `autumn-etcd` dependency it had added here, which is the whole point of a
+converter: it leaves no residue. `git show fb47730e:crates/server/src/bin/migratev0_v1.rs`
+has it if a later migration wants the shape.
 
-```
-migratev0_v1 --etcd <http://host:2379[,…]> [--dry-run]
-```
+Two things from it are worth carrying forward, because the next converter will
+need them and will NOT get the first one for free:
 
-It exists because a persisted-format change is delivered by a converter, never
-by compatibility code in the servers (`crates/manager/CLAUDE.md`, "Upgrade
-safety"). The naming convention is `migratev<from>_v<to>` over the PERSIST
-format generation, not the wire version — this change moves no wire struct, so
-`WIRE_VERSION` does not move with it.
+- **Naming is `migratev<from>_v<to>` over the PERSIST format generation**, not
+  the wire version. A persist change need not move `WIRE_VERSION` and usually
+  should not.
+- **That one decoded nothing.** Splitting a record out of the wire schema is a
+  rename, and rkyv's layout does not depend on the type name (measured:
+  `MgrExtentInfo` and an identically shaped `ExtentRecord` both encode to the
+  same 152 bytes), so it was a pure prefix insertion. A later conversion that
+  changes a record's FIELDS has to vendor the old definition itself, because by
+  then the tree only has the new one.
 
-**It decodes nothing.** Splitting a record out of the wire schema is a rename,
-and rkyv's layout does not depend on the type name (measured: `MgrExtentInfo`
-and an identically shaped `ExtentRecord` both encode to the same 152 bytes), so
-this conversion is a pure prefix insertion. That property is specific to THIS
-conversion; a later one that changes a record's fields has to vendor the old
-definition itself, because by then the tree only has the new one.
-
-Covers all nine split records: `mgr_audit_log/`, `tenantAccount/`, `namespace/`,
-`extents/`, `streams/`, `nodes/`, `disks/`, `partitions/`, `regions/`. Every
-OTHER persisted key must stay bare (`opLog/`, `extent_inflight/`,
-`extentDeleteRetry/`, `node_override/`, `decommissioned/`, `inode_leases/`,
-`autoPolicy/*`, `extentLayout/`, `extentCorrupt/`, …); wrapping one without
-teaching the manager about it would make that key unreadable.
-
-Idempotent: a value already carrying `[AUMG][type][version]` is skipped, so an
-interrupted run is re-run. The summary line is the free check — on a first pass
-over a populated cluster `converted` should be non-zero and `already` zero.
+The rule it served stands: a persisted-format change is delivered by a
+converter, never by compatibility code in the servers (`crates/manager/CLAUDE.md`,
+"Upgrade safety").
 
 ### `autumn-stream-cli` (`src/bin/stream_cli.rs`)
 
