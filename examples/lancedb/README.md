@@ -1,0 +1,60 @@
+# LanceDB on Autumn
+
+The native integration uses autumn-object-store 0.14.1, matching LanceDB
+df5709efd8411b66095e29f708290a3e2c80f0fe (0.40.0-beta.3) and Lance
+13.0.0-beta.6. The standalone workspace and lockfile keep Lance/DataFusion
+dependencies out of the Autumn server workspace.
+
+Use a cluster built from this branch (wire 44). Choose an **empty, dedicated**
+scope under an existing namespace. The demo creates and deletes its own table;
+its final offline vacuum requires no other users of the scope.
+
+Run the native demo with AUTUMN_MANAGER and AUTUMN_OBJECT_SCOPE set:
+
+    AUTUMN_MANAGER=127.0.0.1:9001 AUTUMN_OBJECT_SCOPE=objects/lance-demo cargo run --locked --manifest-path examples/lancedb/Cargo.toml --bin autumn-lancedb-demo
+
+It creates 100 vectors, appends 100, searches for id 42, deletes 10 rows,
+reopens through a separate Autumn client, then appends from two writers and
+checks that all 210 rows survive. It verifies that manifests reside in Autumn,
+deletes its objects and vacuums unreferenced chunks.
+
+The example injects ObjectStoreParams.object_store and explicitly selects
+ConditionalPutCommitHandler for creation and reopening. This API is deprecated
+upstream in favor of ObjectStoreProvider, but is supported by the pinned version.
+The example uses a memory:// URI for Lance's path parsing; bytes are written to
+the injected Autumn backend. The connection's general table-name listing remains
+the default memory backend: this demonstrates table injection, not registration
+of an autumn:// connection provider. Pass the same storage options when reopening.
+
+The remote feature is enabled solely because this LanceDB revision's job.rs
+references Error::Http without a feature guard. No remote service is contacted.
+Do not reuse Create-mode WriteParams for table.add: the table already retains
+its store and commit handler, and add supplies Append mode itself.
+
+FUSE validation (Python package tested: lancedb 0.39.0):
+
+    python examples/lancedb/fuse_demo.py file:///path/to/test-mount/lancedb
+
+This first tests create-only hard links, then creates a unique table, exercises
+CRUD/vector search and a concurrent reader/writer, and drops that table. Use a
+dedicated test mount. The local Lance backend publishes manifests with linkat,
+which requires the FUSE hard-link support shipped with this adapter.
+
+Matched object workload:
+
+    AUTUMN_MANAGER=127.0.0.1:9001 AUTUMN_OBJECT_SCOPE=objects/bench cargo run --locked --manifest-path examples/lancedb/Cargo.toml --bin object_bench -- autumn
+    AWS_ENDPOINT=http://127.0.0.1:9000 AWS_BUCKET=test-bucket AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... AWS_REGION=us-east-1 cargo run --locked --manifest-path examples/lancedb/Cargo.toml --bin object_bench -- s3
+
+Each backend runs the same c=8, 64-object reads/writes at 64 KiB, 1 MiB and
+4 MiB, then 100 full scans of 1100 fragments. Output is JSON lines with MiB/s,
+P50 and P99. Each run uses a unique prefix and deletes only its own objects.
+Autumn's retired payloads remain until offline vacuum. For performance work,
+build the client and servers in release mode and match replication/durability;
+the initial acceptance measurements are explicitly debug-build smoke baselines.
+
+See ../../docs/lancedb_validation.md for measured results and limitations, and
+../../docs/ops.md for isolated cluster and upgrade instructions.
+
+
+
+

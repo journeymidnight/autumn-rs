@@ -1,0 +1,42 @@
+[package]
+name = "autumn-lancedb-demo"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+arrow-array = "58"
+arrow-schema = "58"
+autumn-object-store = { path = "../../crates/object-store" }
+futures = "0.3"
+lancedb = { git = "https://github.com/lancedb/lancedb.git", rev = "df5709efd8411b66095e29f708290a3e2c80f0fe", default-features = false, features = ["remote"] }
+lance = { git = "https://github.com/lance-format/lance.git", tag = "v13.0.0-beta.6", default-features = false }
+lance-table = { git = "https://github.com/lance-format/lance.git", tag = "v13.0.0-beta.6" }
+object_store = { version = "=0.14.1", default-features = false, features = ["aws"] }
+serde_json = "1"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+url = "2"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[patch.crates-io]
+
+compio = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-buf = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-dispatcher = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-driver = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-executor = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-fs = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-io = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-log = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-macros = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-net = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-quic = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-runtime = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-tls = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-ws = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
