@@ -2848,6 +2848,51 @@ line it added to `crates/server/Cargo.toml`.** The tool is meant to leave no
 residue; a converter kept around is how a one-time migration turns back into the
 permanent compatibility code this rule exists to avoid.
 
+#### What the conversion looked like on the real cluster (2026-09-20)
+
+The VKE cluster went `aef13927` -> `e7a554fa`, wire 43 -> 45, in one window.
+Recorded here because three things cost time that the steps above do not warn
+about.
+
+**Count the keys BEFORE the dry-run.** The summary line only tells you the tool
+converted something; it cannot tell you it converted the right cluster's
+something. `etcdctl get <prefix> --prefix --keys-only | grep -c` over the nine
+prefixes predicted 455, the dry-run said 455, and the two agreeing is the check.
+Afterwards the re-run said `0 converted / 455 already`, and
+`regions/<id>` began `41554d47 09 01` — `AUMG`, type 9, format 1.
+
+**Wiping `opLog/` is conditional, not automatic.** The advice above assumes the
+wire bump moved `OpRecord`. Diff it first: across 43 -> 45 it was byte-identical,
+the prefix was left alone, and `ops history` afterwards decoded all 21 records
+with no skip warnings. Diff the other bare-persisted types the same way —
+`MgrExtentInflightRecord` and `MgrAutoPolicyEntry` are rkyv; `extentLayout/` and
+`extentCorrupt/` are raw bytes and can never be affected.
+
+**A stop-the-world restart concentrates every partition on one PS.** This is
+structural: `handle_register_ps` runs `rebalance_regions` when the FIRST PS
+registers, and with one PS in `ps_nodes` every region whose owner has not come
+back yet is reassigned to it. An even 8/9/7 became 24/0/0. The cure is
+`autumn-op rebalance`, which moves at most 4 regions per op — four passes to
+reach 8/8/8.
+
+```bash
+# repeat until it reports "moved 0"
+autumn-op --manager $MGR:9001 --admin-token-file F --wait rebalance 0
+```
+
+**Read the spread from `--json`, not from `info`.** A rebalance DELETES the
+stale per-partition listener addr and the new PS re-registers it a little later,
+so the text view lags: it showed 10/6/8 while `--json info` already showed
+8/8/8. The same lag makes partition SIZES read low for a few minutes after the
+partition servers come up — two partitions read 48.1 GB and 16.5 GB mid-open and
+were back at 62.3 and 31.2 GB shortly after. Neither is data loss; do not act on
+either until the numbers settle.
+
+One more, for whoever compares namespaces afterwards: a bare `autumn-client ls`
+scans from the namespace head and does not continue into later partitions, so it
+returns nothing when the head is empty even though keys exist further on. Use
+`ls --prefix` before concluding a namespace was emptied.
+
 #### Rolling BACK onto data a newer binary wrote
 
 Rollback is unsupported, and two persisted values now say so out loud rather
