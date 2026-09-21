@@ -6129,21 +6129,11 @@ async fn partition_thread_main(
     // all three streams through `part_sc` is consistent with the row_stream
     // single-writer invariant (which only governs row_stream APPENDs).
     //
-    // Best-effort + lenient: `fence_tail` returns Ok once at least one reachable
-    // replica is fenced (append is all-replica-ACK → one fenced replica already
-    // blocks the zombie). A transient failure is logged, NOT wedged — the same
-    // stance as a soft tail-init failure; the fence normally succeeds against
-    // the same ENs `commit_length` just reached above.
     for (label, sid) in [
         ("logStream", log_stream_id),
         ("rowStream", row_stream_id),
         ("metaStream", meta_stream_id),
     ] {
-        // Bounded retry: the fence is the SOLE mechanism blocking a zombie
-        // writer, so a transient EN flap right after the commit_length loop must
-        // not silently revert us to the vulnerable lazy-fence state. The ENs were
-        // provably reachable a moment ago (commit_length just succeeded), so retry
-        // a few times with a short backoff before proceeding best-effort.
         let mut fence_err = None;
         for attempt in 0..3u32 {
             match part_sc.fence_tail(sid, owner_epoch).await {
@@ -6167,14 +6157,13 @@ async fn partition_thread_main(
                 "{} takeover fence raised to E_new",
                 label
             ),
-            Some(e) => tracing::warn!(
-                part_id,
-                stream_id = sid,
-                owner_epoch,
-                error = %e,
-                "{} takeover fence failed after retries (best-effort — proceeding to open)",
-                label
-            ),
+            Some(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "partition {part_id} {label} stream {sid}: takeover fence failed after retries; refusing to open at epoch {owner_epoch}"
+                    )
+                });
+            }
         }
     }
 

@@ -205,6 +205,54 @@ fn fence_node_then_re_register_refused_before_clear() {
 }
 
 #[test]
+fn remove_retry_succeeds_and_keeps_uuid_tombstone() {
+    let manager = AutumnManager::new();
+    let registration = RegisterNodeReq {
+        addr: "127.0.0.1:9011".to_string(),
+        disk_uuids: vec!["remove-retry-disk".to_string()],
+        node_uuid: "remove-retry-node".to_string(),
+        shard_ports: vec![],
+        control_address: String::new(),
+    };
+    let registered: RegisterNodeResp = rkyv_decode(
+        &run(manager.handle_register_node(rkyv_encode(&registration))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(registered.code, CODE_OK);
+    let fenced: CodeResp = rkyv_decode(
+        &run(manager.handle_fence_node(rkyv_encode(&FenceNodeReq {
+            node_id: registered.node_id,
+            reason: "decommission".to_string(),
+            set_by: "test".to_string(),
+            force: true,
+        })))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(fenced.code, CODE_OK);
+    let remove = RemoveNodeReq {
+        node_id: registered.node_id,
+        set_by: "test".to_string(),
+    };
+    for _ in 0..3 {
+        let removed: RemoveNodeResp =
+            rkyv_decode(&run(manager.handle_remove_node(rkyv_encode(&remove))).unwrap()).unwrap();
+        assert_eq!(removed.code, CODE_OK, "{}", removed.message);
+        assert!(removed.blocking_extent_ids.is_empty());
+        assert!(removed.blocking_marker_extent_ids.is_empty());
+    }
+    let restarted: RegisterNodeResp = rkyv_decode(
+        &run(manager.handle_register_node(rkyv_encode(&RegisterNodeReq {
+            addr: "127.0.0.1:9012".to_string(),
+            ..registration
+        })))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(restarted.code, CODE_PRECONDITION, "{}", restarted.message);
+}
+
+#[test]
 fn extent_health_report_handles_empty_cluster() {
     let m = AutumnManager::new();
     let req = ExtentHealthReq {

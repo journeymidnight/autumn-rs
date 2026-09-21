@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+fuse-tests = ["dep:autumn-fuse"]
+
 [dependencies]
 anyhow.workspace = true
 autumn-common = { path = "../common" }
@@ -31,6 +34,7 @@ send_wrapper = { version = "0.6", features = ["futures"] }
 serde_json = "1"
 tracing.workspace = true
 uuid.workspace = true
+autumn-fuse = { path = "../fuse", features = ["fuse"], optional = true }
 
 [dev-dependencies]
 autumn-stream = { path = "../stream" }
@@ -38,14 +42,43 @@ autumn-partition-server = { path = "../partition-server" }
 autumn-client = { path = "../client" }
 autumn-rpc = { path = "../rpc" }
 autumn-etcd = { path = "../etcd" }
-# F244-B: fuse read-path e2e (system_fuse_read.rs) — needs the fuse modules
-# (FsState / read / meta / dispatch), behind the `fuse` feature.
-autumn-fuse = { path = "../fuse", features = ["fuse"] }
 compio = { workspace = true, features = ["net", "time", "macros"] }
 tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 crc32c = "0.6"
+
+[[test]]
+name = "system_fuse_flush_error_sticky"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "system_fuse_read"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "bug_lease_3_revoke_evicts"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "system_fuse_eof_clobber"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "system_fuse_ns"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_lease_2"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_lease_1"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "system_fuse_release_best_effort"
+required-features = ["fuse-tests"]
 
 [lints]
 workspace = true

@@ -41,7 +41,7 @@ jobs:
       # compile again; the whole workspace (sans autumn-fuse) is clippy-clean
       # under -D warnings.
       - name: Clippy (gating, FCI-01)
-        run: cargo clippy --workspace --exclude autumn-fuse --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude autumn-fuse --features autumn-manager/fuse-tests --all-targets -- -D warnings
       - name: Build
         run: cargo build --workspace --exclude autumn-fuse
       - name: Unit tests
@@ -67,4 +67,4 @@ jobs:
           sudo prlimit --pid $$ --nofile=65536:65536 || true
           # diagnostic — confirm the new limits actually took
           cat /proc/$$/limits | grep -E 'locked|files'
-          cargo test --workspace --tests --exclude autumn-fuse -- --test-threads=1
+          cargo test --workspace --tests --exclude autumn-fuse --features autumn-manager/fuse-tests -- --test-threads=1

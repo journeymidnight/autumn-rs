@@ -3333,6 +3333,25 @@ async fn authoritative_sealed(part_sc: &StreamClient, eid: u64) -> Option<(u64, 
     Some((info.sealed_length, info.refs))
 }
 
+fn ensure_gc_scan_complete(
+    extent_id: u64,
+    scanned: u64,
+    sealed_length: u64,
+    trailing_bytes: usize,
+) -> Result<()> {
+    if scanned != sealed_length {
+        return Err(anyhow!(
+            "run_gc extent {extent_id}: scanned {scanned} of {sealed_length} bytes; refusing to punch"
+        ));
+    }
+    if trailing_bytes != 0 {
+        return Err(anyhow!(
+            "run_gc extent {extent_id}: {trailing_bytes} trailing bytes did not form a complete record; refusing to punch"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn run_gc(
     part: &Rc<RefCell<PartitionData>>,
     extent_id: u64,
@@ -3392,8 +3411,11 @@ pub(crate) async fn run_gc(
         }
         let want = (sealed_length - cur).min(chunk_bytes as u64);
         let (chunk, _end) = part_sc.read_bytes_from_extent(extent_id, cur, want).await?;
-        if chunk.is_empty() {
-            break;
+        if chunk.len() as u64 != want {
+            return Err(anyhow!(
+                "run_gc extent {extent_id}: short read at {cur}: wanted {want}, got {}; refusing to punch",
+                chunk.len()
+            ));
         }
         let chunk_len = chunk.len() as u64;
         // `buf` = carry (the unconsumed record-tail preceding this chunk) ++
@@ -3444,15 +3466,7 @@ pub(crate) async fn run_gc(
         rate_ctrl.account_gc(chunk_len).await;
     }
 
-    if !carry.is_empty() {
-        // A sealed extent's record stream should be byte-aligned; a
-        // non-empty carry at the end means we either truncated mid-
-        // record or saw corruption. Don't punch in that case — log loud.
-        return Err(anyhow!(
-            "run_gc extent {extent_id}: {} trailing bytes did not form a complete record; refusing to punch",
-            carry.len()
-        ));
-    }
+    ensure_gc_scan_complete(extent_id, cur, sealed_length, carry.len())?;
 
     // Final flush: every append is made durable via the per-extent
     // coalescer, so by the time `flush_gc_batch` returns, the moved
@@ -4565,10 +4579,26 @@ mod sqcq_tests {
 
 #[cfg(test)]
 mod gc_streaming_tests {
+    use super::ensure_gc_scan_complete;
     use crate::{decode_records_full, encode_record};
 
     fn rec(op: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
         encode_record(op, key, value, 0)
+    }
+
+    #[test]
+    fn gc_refuses_record_aligned_early_eof_with_no_carry() {
+        let prefix = rec(0x80, b"mem/old", &[1; 8192]);
+        let live = rec(0x80, b"mem/live", &[2; 8192]);
+        let sealed_length = (prefix.len() + live.len()) as u64;
+        assert_eq!(decode_records_full(&prefix).len(), 1);
+        for scanned in [0, prefix.len() as u64] {
+            let error = ensure_gc_scan_complete(42, scanned, sealed_length, 0).unwrap_err();
+            assert!(error.to_string().contains("refusing to punch"));
+        }
+        assert!(ensure_gc_scan_complete(42, sealed_length, sealed_length, 0).is_ok());
+        assert!(ensure_gc_scan_complete(42, sealed_length, sealed_length, 1).is_err());
+        assert!(ensure_gc_scan_complete(42, 0, 0, 0).is_ok());
     }
 
     /// Full buffer: every record is decoded.

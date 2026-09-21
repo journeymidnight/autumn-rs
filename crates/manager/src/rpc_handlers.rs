@@ -6630,6 +6630,11 @@ impl AutumnManager {
         &self,
         req: &RemoveNodeReq,
     ) -> Result<(), (u8, String, Vec<u64>, Vec<u64>)> {
+        if self.decommissioned.borrow().contains_key(&req.node_id)
+            && !self.store.inner.borrow().nodes.contains_key(&req.node_id)
+        {
+            return Ok(());
+        }
         let cur = self.node_overrides.borrow().get(&req.node_id).cloned();
         let is_fenced = matches!(cur.as_ref().map(|o| o.kind), Some(NODE_OVERRIDE_FENCED));
         if !is_fenced {

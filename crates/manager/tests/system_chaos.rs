@@ -578,6 +578,16 @@ fn expected_rejection_note(why: &str) -> &'static str {
 /// vacuously true over an empty expectation set.
 const CHAOS_NS: &str = "mem/";
 
+fn chaos_key(prefix: u8, kid: u32) -> Vec<u8> {
+    format!("{CHAOS_NS}{}{kid:06}", prefix as char).into_bytes()
+}
+
+fn liveness_probe_key(start: &[u8], end: &[u8]) -> Option<Vec<u8>> {
+    (0..CHAOS_KEY_COUNT)
+        .flat_map(|kid| [chaos_key(b'b', kid), chaos_key(b'q', kid)])
+        .find(|key| key.as_slice() >= start && (end.is_empty() || key.as_slice() < end))
+}
+
 /// Parse a chaos key `{CHAOS_NS}{b|q}{6 ASCII digits}` → its `kid`, or None if it is not a
 /// well-formed key any writer could have produced. Used by the no-phantom range
 /// check: a range MUST NOT return a key outside this space (a malformed key, a
@@ -650,7 +660,7 @@ async fn writer_loop(
     while !stop.load(Ordering::Relaxed) {
         seq += 1;
         let kid = lcg.range(0, key_count as u64) as u32;
-        let key = format!("{CHAOS_NS}{}{:06}", key_prefix as char, kid).into_bytes();
+        let key = chaos_key(key_prefix, kid);
         let value = make_value(&key, seq);
         let part_id = topo.route(&key);
 
@@ -2755,12 +2765,6 @@ async fn verify_per_key(
 /// keep serving the already-flushed data fine while every WRITE hangs. So we
 /// must prove the cluster can still take writes after the chaos stops.
 ///
-/// For each partition we fire a burst of fresh in-range PUTs carrying 8 KiB
-/// values (above the 4 KiB VALUE_THROTTLE) so the burst applies real memtable
-/// pressure → rotation → flush → `row_stream.append` → `alloc_extent` — i.e. it
-/// exercises the exact path the recovery-stuck bug wedges, not just a memtable
-/// insert. Each PUT is bounded by a 5 s timeout.
-///
 /// A partition FAILS liveness only on an UNAMBIGUOUS wedge — either a 5 s PUT
 /// timeout (PS accepted the connection but never replied), or zero acks across
 /// the whole retry window. A partition that acks even one write is alive; this
@@ -2771,34 +2775,25 @@ async fn verify_write_liveness(router: &PsRouter, topo: &Topology) -> Vec<String
     const LIVENESS_WRITES: u64 = 50;
     let mut errors: Vec<String> = Vec::new();
     let parts = topo.snapshot();
+    let mut probed = 0usize;
+    let mut total_acked = 0u64;
     for (start, end, part_id) in parts {
         // Build an in-range, well-formed chaos key that routes to THIS
         // partition: walk the valid key space and take the first key whose
         // range contains it. (A partition created mid-split may own a sub-range
         // that no single literal key prefix covers, so we must search.)
-        let probe_key: Option<Vec<u8>> = (0..CHAOS_KEY_COUNT)
-            .flat_map(|kid| {
-                [
-                    format!("b{kid:06}").into_bytes(),
-                    format!("q{kid:06}").into_bytes(),
-                ]
-            })
-            .find(|k| {
-                k.as_slice() >= start.as_slice()
-                    && (end.is_empty() || k.as_slice() < end.as_slice())
-            });
+        let probe_key = liveness_probe_key(&start, &end);
         let Some(probe_key) = probe_key else {
-            // No representable key in this partition's range — nothing we can
-            // legitimately write here; skip (not a wedge).
+            errors.push(format!(
+                "part {part_id}: no liveness probe key in range {start:?}..{end:?}"
+            ));
             continue;
         };
+        probed += 1;
 
         let mut acked: u64 = 0;
         let mut timed_out = false;
         'burst: for i in 0..LIVENESS_WRITES {
-            // Distinct large value per write so the burst can't be coalesced
-            // into a no-op; `seq` carried at the front (verify-compatible
-            // encoding) though we don't re-read these.
             let value = make_value(&probe_key, 1_000_000 + i);
             let payload = partition_rpc::rkyv_encode(&partition_rpc::PutReq {
                 part_id,
@@ -2853,6 +2848,7 @@ async fn verify_write_liveness(router: &PsRouter, topo: &Topology) -> Vec<String
             }
         }
 
+        total_acked += acked;
         if timed_out {
             errors.push(format!(
                 "part {part_id}: WRITE WEDGE — PUT timed out (5s) after {acked}/{LIVENESS_WRITES} acked post-settle"
@@ -2863,7 +2859,102 @@ async fn verify_write_liveness(router: &PsRouter, topo: &Topology) -> Vec<String
             ));
         }
     }
+    eprintln!("liveness: probed_partitions={probed} acked_writes={total_acked}");
+    if probed == 0 || total_acked == 0 {
+        errors.push(format!(
+            "WRITE LIVENESS: insufficient evidence: probed_partitions={probed} acked_writes={total_acked}"
+        ));
+    }
     errors
+}
+
+#[test]
+fn liveness_keys_cover_full_and_split_namespace_ranges() {
+    for (start, end) in [
+        (b"mem/a".as_slice(), b"mem/z".as_slice()),
+        (b"mem/a".as_slice(), b"mem/m".as_slice()),
+        (b"mem/m".as_slice(), b"mem/z".as_slice()),
+    ] {
+        let key = liveness_probe_key(start, end).expect("must probe each partition");
+        assert!(is_valid_chaos_key(&key));
+        assert!(key.as_slice() >= start && key.as_slice() < end);
+    }
+}
+
+#[test]
+fn liveness_rejects_empty_topology() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let unused_addr = "127.0.0.1:1".parse().unwrap();
+        let router = PsRouter::new(unused_addr, unused_addr);
+        assert!(!verify_write_liveness(&router, &Topology::new()).await.is_empty());
+    });
+}
+
+#[compio::test]
+async fn liveness_rejects_readable_partition_when_every_put_fails() {
+    use autumn_rpc::frame::{Frame, FrameDecoder};
+    use compio::io::{AsyncRead, AsyncWriteExt};
+
+    let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let put_attempts = Rc::new(Cell::new(0usize));
+    let attempts = put_attempts.clone();
+    let server = compio::runtime::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let attempts = attempts.clone();
+            compio::runtime::spawn(async move {
+                let mut decoder = FrameDecoder::new();
+                loop {
+                    let (result, bytes) = socket.read(vec![0; 16384]).await.into_parts();
+                    let count = match result {
+                        Ok(0) | Err(_) => return,
+                        Ok(count) => count,
+                    };
+                    decoder.feed(&bytes[..count]);
+                    while let Some(request) = decoder.try_decode().unwrap() {
+                        let response = match request.msg_type {
+                            MSG_GET_REGIONS => Frame::response(request.req_id, request.msg_type,
+                                rkyv_encode(&GetRegionsResp {
+                                    code: CODE_OK, message: String::new(), regions: vec![],
+                                    ps_details: vec![], part_addrs: vec![(901, address.to_string())],
+                                })),
+                            partition_rpc::MSG_GET_BULK => Frame::response_zc(
+                                request.req_id, request.msg_type,
+                                bytes::Bytes::from_static(&[0]), bytes::Bytes::from_static(b"readable"),
+                            ),
+                            partition_rpc::MSG_PUT => {
+                                attempts.set(attempts.get() + 1);
+                                let put: partition_rpc::PutReq =
+                                    partition_rpc::rkyv_decode(&request.payload).unwrap();
+                                assert!(is_valid_chaos_key(&put.key));
+                                Frame::response(request.req_id, request.msg_type,
+                                    partition_rpc::rkyv_encode(&partition_rpc::PutResp {
+                                        code: partition_rpc::CODE_UNAVAILABLE,
+                                        message: "writes disabled".to_string(), key: put.key,
+                                    }))
+                            }
+                            other => panic!("unexpected request {other}"),
+                        };
+                        let (result, _) = socket.write_all(response.encode()).await.into_parts();
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }).detach();
+        }
+    });
+    let reader = RpcClient::connect(address).await.unwrap();
+    let value = ps_get(&reader, 901, b"mem/b000000").await;
+    assert_eq!(value.code, partition_rpc::CODE_OK);
+    assert_eq!(value.value, b"readable");
+    let topology = Topology::new();
+    topology.parts.borrow_mut().push((b"mem/a".to_vec(), b"mem/z".to_vec(), 901));
+    let errors = verify_write_liveness(&PsRouter::new(address, address), &topology).await;
+    assert_eq!(put_attempts.get(), 150);
+    assert!(errors.iter().any(|error| error.contains("0/50 writes acked")), "{errors:?}");
+    drop(server);
 }
 
 /// Range invariant: for each partition, walk it with `MSG_RANGE` and
@@ -3133,22 +3224,178 @@ async fn sealed_extents_naming(etcd_endpoint: &str, node_id: u64) -> usize {
         .count()
 }
 
-/// Set of all extent_ids the manager currently tracks in etcd. Used to measure
-/// PHYSICAL reclamation (deleted extents) across the final GC pass.
-async fn read_extent_id_set(etcd_endpoint: &str) -> std::collections::HashSet<u64> {
+async fn read_extent_id_set(etcd_endpoint: &str) -> Result<std::collections::HashSet<u64>, String> {
     let mut set = std::collections::HashSet::new();
-    let Ok(client) = autumn_etcd::EtcdClient::connect(etcd_endpoint).await else {
-        return set;
-    };
-    let Ok(resp) = client.get_prefix("extents/").await else {
-        return set;
-    };
+    let client = autumn_etcd::EtcdClient::connect(etcd_endpoint)
+        .await
+        .map_err(|error| format!("extent snapshot connect: {error}"))?;
+    let resp = client.get_prefix("extents/")
+        .await
+        .map_err(|error| format!("extent snapshot read: {error}"))?;
     for kv in &resp.kvs {
-        if let Some(eid) = parse_id_after_prefix(&kv.key, "extents/") {
-            set.insert(eid);
-        }
+        let extent_id = parse_id_after_prefix(&kv.key, "extents/")
+            .ok_or_else(|| format!("invalid extent metadata key: {:?}", kv.key))?;
+        set.insert(extent_id);
     }
-    set
+    Ok(set)
+}
+
+fn remaining_extent_files(
+    data_dirs: &[PathBuf],
+    candidates: &std::collections::HashSet<u64>,
+) -> Result<Vec<PathBuf>, String> {
+    fn scan(
+        directory: &Path,
+        candidates: &std::collections::HashSet<u64>,
+        remaining: &mut Vec<PathBuf>,
+    ) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                scan(&entry.path(), candidates, remaining)?;
+            } else if let Some(extent_id) = entry.file_name().to_str()
+                .and_then(|name| name.strip_prefix("extent-"))
+                .and_then(|name| name.split_once('.'))
+                .and_then(|(id, _)| id.parse::<u64>().ok())
+            {
+                if candidates.contains(&extent_id) {
+                    remaining.push(entry.path());
+                }
+            }
+        }
+        Ok(())
+    }
+    let mut remaining = Vec::new();
+    for directory in data_dirs {
+        scan(directory, candidates, &mut remaining)
+            .map_err(|error| format!("scan {}: {error}", directory.display()))?;
+    }
+    remaining.sort();
+    Ok(remaining)
+}
+
+async fn wait_for_physical_reclaim(
+    etcd_endpoint: &str,
+    data_dirs: &[PathBuf],
+    candidates: &std::collections::HashSet<u64>,
+    timeout: Duration,
+) -> Result<(), String> {
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    if data_dirs.is_empty() {
+        return Err("physical reclaim has no replica directories to inspect".to_string());
+    }
+    let client = autumn_etcd::EtcdClient::connect(etcd_endpoint)
+        .await
+        .map_err(|error| format!("delete state connect: {error}"))?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = remaining_extent_files(data_dirs, candidates)?;
+        let mut pending = Vec::new();
+        for prefix in ["extent_inflight/", "extentDeleteRetry/"] {
+            let snapshot = client.get_prefix(prefix).await
+                .map_err(|error| format!("delete state {prefix}: {error}"))?;
+            for entry in snapshot.kvs {
+                let extent_id = parse_id_after_prefix(&entry.key, prefix)
+                    .ok_or_else(|| format!("invalid delete state key: {:?}", entry.key))?;
+                if candidates.contains(&extent_id) {
+                    pending.push(String::from_utf8_lossy(&entry.key).into_owned());
+                }
+            }
+        }
+        if remaining.is_empty() && pending.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("physical reclaim incomplete: files={remaining:?}, pending={pending:?}"));
+        }
+        compio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[test]
+fn physical_reclaim_checker_finds_each_replica_and_sidecar() {
+    let directory = tempfile::tempdir().unwrap();
+    let candidates = [42u64].into_iter().collect();
+    let mut expected = Vec::new();
+    let mut disks = Vec::new();
+    for disk in ["disk-a", "disk-b"] {
+        let root = directory.path().join(disk);
+        let bucket = root.join("2a");
+        std::fs::create_dir_all(&bucket).unwrap();
+        for suffix in ["dat", "meta", "ck", "shard0", "ec.prepared"] {
+            let path = bucket.join(format!("extent-42.{suffix}"));
+            std::fs::write(&path, b"residual extent data").unwrap();
+            expected.push(path);
+        }
+        std::fs::write(bucket.join("extent-420.dat"), b"unrelated extent").unwrap();
+        disks.push(root);
+    }
+    expected.sort();
+    assert_eq!(remaining_extent_files(&disks, &candidates).unwrap(), expected);
+    for path in expected {
+        std::fs::remove_file(path).unwrap();
+    }
+    assert!(remaining_extent_files(&disks, &candidates).unwrap().is_empty());
+    assert!(remaining_extent_files(&[directory.path().join("missing")], &candidates).is_err());
+}
+
+#[compio::test]
+async fn reclaim_snapshot_failure_is_not_an_empty_extent_set() {
+    assert!(read_extent_id_set("http://127.0.0.1:1").await.is_err());
+}
+
+#[compio::test]
+async fn physical_reclaim_rejects_failed_delete_without_extent_metadata() {
+    use autumn_rpc::extent_rpc as extent;
+
+    let (_etcd, endpoint) = start_etcd().await;
+    let directory = tempfile::tempdir().unwrap();
+    let node = autumn_stream::ExtentNode::new(autumn_stream::ExtentNodeConfig::new(
+        directory.path().to_path_buf(), 1,
+    )).await.unwrap();
+    let inflight = node.clone_recovery_inflight();
+    let address = pick_addr();
+    let server = compio::runtime::spawn(async move { node.serve(address).await.unwrap(); });
+    compio::time::sleep(Duration::from_millis(100)).await;
+    let client = RpcClient::connect(address).await.unwrap();
+    let allocated: extent::AllocExtentResp = extent::rkyv_decode(&client.call(
+        extent::MSG_ALLOC_EXTENT, extent::rkyv_encode(&extent::AllocExtentReq { extent_id: 42 }),
+    ).await.unwrap()).unwrap();
+    assert_eq!(allocated.code, extent::CODE_OK);
+    inflight.insert(42, extent::RecoveryTask {
+        extent_id: 42, replace_id: 1, node_id: 2, start_time: 0,
+    });
+    let delete_request = extent::rkyv_encode(&extent::DeleteExtentReq {
+        extent_id: 42, node_uuid: String::new(),
+    });
+    let refused: extent::CodeResp = extent::rkyv_decode(&client.call(
+        extent::MSG_DELETE_EXTENT, delete_request.clone(),
+    ).await.unwrap()).unwrap();
+    assert_eq!(refused.code, extent::CODE_PRECONDITION);
+    assert!(read_extent_id_set(&endpoint).await.unwrap().is_empty());
+    let dirs = [directory.path().to_path_buf()];
+    let candidates = [42u64].into_iter().collect();
+    let error = wait_for_physical_reclaim(&endpoint, &dirs, &candidates, Duration::ZERO)
+        .await.unwrap_err();
+    assert!(error.contains("extent-42.dat"), "{error}");
+
+    inflight.remove(&42);
+    let deleted: extent::CodeResp = extent::rkyv_decode(&client.call(
+        extent::MSG_DELETE_EXTENT, delete_request,
+    ).await.unwrap()).unwrap();
+    assert_eq!(deleted.code, extent::CODE_OK);
+    let metadata = autumn_etcd::EtcdClient::connect(&endpoint).await.unwrap();
+    for key in ["extent_inflight/42", "extentDeleteRetry/42"] {
+        metadata.put(key, b"pending").await.unwrap();
+        let error = wait_for_physical_reclaim(&endpoint, &dirs, &candidates, Duration::ZERO)
+            .await.unwrap_err();
+        assert!(error.contains(key), "{error}");
+        metadata.delete(key).await.unwrap();
+    }
+    wait_for_physical_reclaim(&endpoint, &dirs, &candidates, Duration::ZERO).await.unwrap();
+    drop(server);
 }
 
 /// POSITIVE reclamation check (user ask: after GC, an extent must definitely
@@ -3170,6 +3417,7 @@ async fn verify_gc_reclaim(
     router: &PsRouter,
     topo: &Topology,
     etcd_endpoint: &str,
+    data_dirs: &[PathBuf],
 ) -> (Vec<String>, usize, usize) {
     let mut errors = Vec::new();
     // Set when any partition's force-GC reports PROTECTED extents (a pinned
@@ -3179,7 +3427,10 @@ async fn verify_gc_reclaim(
     // reclaim, e.g. a merge-consolidated survivor with ≤1 SST / ≤1 sealed log
     // extent — common under the full nemesis set, false-positive pre-fix).
     let mut any_protected = false;
-    let before = read_extent_id_set(etcd_endpoint).await;
+    let before = match read_extent_id_set(etcd_endpoint).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return (vec![error], 0, 0),
+    };
     let parts: Vec<u64> = topo.snapshot().iter().map(|p| p.2).collect();
 
     let maint = |pid: u64, op: u8, extent_ids: Vec<u64>| partition_rpc::MaintenanceReq {
@@ -3216,7 +3467,10 @@ async fn verify_gc_reclaim(
         }
         compio::time::sleep(Duration::from_secs(3)).await;
     }
-    let mid = read_extent_id_set(etcd_endpoint).await;
+    let mid = match read_extent_id_set(etcd_endpoint).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return (vec![error], 0, 0),
+    };
 
     // Force-GC every partition's sealed log extents: relocate live VPs off them +
     // punch the ones before the replay floor (incl. post-split shared log extents
@@ -3278,17 +3532,18 @@ async fn verify_gc_reclaim(
     // refs→0 delete need a few ticks to land.
     compio::time::sleep(Duration::from_secs(12)).await;
 
-    let after = read_extent_id_set(etcd_endpoint).await;
+    let after = match read_extent_id_set(etcd_endpoint).await {
+        Ok(snapshot) => snapshot,
+        Err(error) => return (vec![error], 0, 0),
+    };
+    let candidates = before.union(&mid).filter(|id| !after.contains(id)).copied().collect();
+    if let Err(error) = wait_for_physical_reclaim(etcd_endpoint, data_dirs, &candidates, Duration::from_secs(30)).await {
+        errors.push(error);
+        return (errors, 0, 0);
+    }
     let total_reclaimed = before.difference(&after).count();
     let gc_reclaimed = mid.difference(&after).count();
 
-    // Attribute to the GC WINDOW, not the whole run. `total_reclaimed` counts
-    // any shrinkage since `before`, including a background reclaim that has
-    // nothing to do with the force-GC under test — the sealed-empty sweep is one,
-    // and a single reclaim of its kind landing here would report the quiesce as
-    // working while it reclaimed nothing at all. `gc_reclaimed` is measured from
-    // `mid`, after the force-GC dispatch, so it is the narrower and honest
-    // question: did THIS phase move anything?
     if gc_reclaimed == 0 && any_protected {
         errors.push(format!(
             "GC-RECLAIM: the force-GC phase DELETED 0 extents WHILE force-GC reported \
@@ -4114,11 +4369,13 @@ runs ACROSS rounds is uncovered, not unlucky.",
         // protecting everything forever. MUTATING, so it runs AFTER the read-only
         // verifiers above.
         eprintln!("chaos: verifying GC reclaim (quiesce → compact → force-GC → delete)");
+        let reclaim_dirs: Vec<PathBuf> = nemesis_ctx.ens.borrow().iter()
+            .flat_map(|node| node.data_dirs.iter().cloned()).collect();
         let (reclaim_errors, total_reclaimed, gc_reclaimed) =
-            verify_gc_reclaim(&mgr, &router, &topo, &etcd_endpoint).await;
+            verify_gc_reclaim(&mgr, &router, &topo, &etcd_endpoint, &reclaim_dirs).await;
         eprintln!(
             "chaos: gc-reclaim: physically deleted {total_reclaimed} extent(s) \
-             (force-GC step {gc_reclaimed}), errors={}",
+             (GC time window, including concurrent background work: {gc_reclaimed}), errors={}",
             reclaim_errors.len()
         );
 

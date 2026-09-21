@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-18
+**Last updated:** 2026-09-20
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,6 +13,69 @@
 ---
 
 ## Active
+
+### F-REVIEW-R1-GC-COMPLETE-SCAN — P1 GC 完整扫描证明
+- **Trigger**: review.md R1；提前 EOF 或 record 边界短读可绕过 carry 检查并误 punch。
+- **Scope**: 每次读取必须满足 want，punch 前检查 sealed_length 和 carry。
+- **Acceptance**: 截短到 0/record 边界、有无 checksum 均拒绝 punch 或完整搬迁；重启逐字节验证 live VP。
+- `passes: false`
+- **notes** (2026-09-20): 已实现逐次 want 精确长度校验和 punch 前 sealed_length/carry 双重校验；5 条 GC streaming 单测通过，新增完整 record 边界及 offset=0 提前 EOF 回归。尚未完成真实双副本截短、checksum 两种状态及 PS 硬重启组合验收，不能按完整 R1 验收关闭。
+
+### F-REVIEW-R2-RECOVERY-ATTEMPT — P1 Recovery attempt ABA
+- **Trigger**: review.md R2；相同 target/replace 的旧完成可命中新 marker。
+- **Scope**: nonce 贯穿持久化 marker、请求、EN 去重和完成；固定源 eversion、slot、payload layout。
+- **Acceptance**: 同 assignment 的 A/B 重派、复制转 EC、目标重启后 A 均不得 apply 或删除 B。
+- `passes: false`
+- **notes** (2026-09-20): 尚未修改。需与 R4/R5 一起设计 attempt 的持久化及提交契约；RecoveryTask 被持久化 marker 直接引用，不能仅加 wire 字段而忽略旧 marker 解码兼容。
+
+### F-REVIEW-R4-REMOVE-RECOVERY — P1 退役与 Recovery 目标协调
+- **Trigger**: review.md R4；Remove 漏查 Recovery target，晚到 done 可复活已删除节点引用。
+- **Scope**: Remove blocker 覆盖 Recovery；取消 fenced target；dispatch/apply/remove 共享串行化或事务条件，校验节点和磁盘身份。
+- **Acceptance**: Fence/Remove 与已接收 done 两种顺序均无 tombstone node/disk 引用。
+- `passes: false`
+
+### F-REVIEW-R5-RECOVERY-CAS — P1 Recovery 提交锁定已验证状态
+- **Trigger**: review.md R5；leader fence 不防同 leader marker/extent 被替换。
+- **Scope**: apply 事务比较 marker identity 和 extent baseline；await 后按相同 identity 安装内存状态。
+- **Acceptance**: barrier 延迟 A 请求/响应，释放 A 创建 B 后，A 不覆盖 extent、不删除 B。
+- `passes: false`
+
+### F-REVIEW-R6-FENCE-CAPACITY — P2 Fence placement 与容量预检
+- **Trigger**: review.md R6；non-force 在没有合法 spare 时仍成功，1.2 倍容量承诺未实现。
+- **Scope**: 按 Recovery placement 排除 occupied/不可用节点；按副本或 shard 字节与实际 headroom 预留容量，缺失容量信号保守失败。
+- **Acceptance**: 无 spare、fenced/maintenance/suspected spare、容量不足均拒绝；合法目标可通过；force 保持显式覆盖。
+- `passes: false`
+
+### F-REVIEW-T3-REAL-CRASH — P2 crash 测试真正停止旧 runtime
+- **Trigger**: review.md T3；drop RpcClient 不等于杀 PS/EN。
+- **Scope**: 改用可终止 runtime 或 SIGKILL 子进程并等待退出；compact/flush 用 durable/checkpoint barrier。
+- **Acceptance**: 证明旧服务退出、故障发生于指定窗口；重启验证 ACK 数据和 tombstone。
+- `passes: false`
+
+### F-REVIEW-T4-CHAOS-GATES — P2 chaos 覆盖与历史验收
+- **Trigger**: review.md T4；动作零成功、ignored 未运行、未知结果抹掉已 ACK 历史。
+- **Scope**: 区分 smoke/定向/长跑；必需动作非零门槛；修正 full-action 脚本；专用 CI；保留 invocation/response 历史及并发允许结果。
+- **Acceptance**: 必需动作未进入/完成则失败；包含 manager/PS 故障与在线 Remove、DELETE/TTL/多 writer 的定向覆盖，CI 实际执行。
+- `passes: false`
+- **notes** (2026-09-20): 普通 manager 测试已解除对系统 FUSE 的无条件依赖；8 个 FUSE 专属目标通过 fuse-tests feature 显式启用，CI 的 clippy/integration 命令保持启用。完整 ignored chaos、动作覆盖门槛和历史 checker 尚未完成。本轮定向验证入口见 scripts/README.md。
+
+### F-REVIEW-V1-MERGE-REPLAY — 待验证：merge replay cursor 可达性
+- **Trigger**: review.md 4.1；数值模型不足以证明正常 merge 丢失数据。
+- **Scope**: 复现 raw merge、checkpoint 失败、旧状态和 sealed-empty cursor 回收；按可达性决定修复。
+- **Acceptance**: 真实调用链固定时序及 ACK 数据验证，记录可达或不可达的证据。
+- `passes: false`
+
+### F-REVIEW-V2-MARKER-RELEASE — 待验证：Recovery 清理失败状态分裂
+- **Trigger**: review.md 4.2；etcd 删除失败仍清内存，而 stale sweep 不回收 Recovery。
+- **Scope**: 复现 stale-layout/extent-removed + 一次 etcd 错误；保留可重试且 identity 安全的 marker。
+- **Acceptance**: 删除失败后内存/etcd 一致，恢复后可重派，无需 leader 切换。
+- `passes: false`
+
+### F-REVIEW-V3-COMPACT-CHECKPOINT — 待验证：checkpoint 失败后 GC 恢复链
+- **Trigger**: review.md 4.3；compact 在 checkpoint 成功前替换内存表。
+- **Scope**: 验证 checkpoint 失败、GC relocation、row truncate 与前台写入交错；证明 durable 集合完整或修复发布顺序。
+- **Acceptance**: 固定失败窗口后硬重启，所有 ACK 数据与 tombstone 正确，修复消融能变红。
+- `passes: false`
 
 ### F-COMPIO-UPGRADE — 升级运行时并分阶段验证 TCP 内核 CPU 降耗
 - **Trigger** (2026-09-14，用户要求记录升级计划): 当前 compio 0.18.0 /
