@@ -364,6 +364,7 @@ impl AutumnManager {
             MSG_REGISTER_PS => self.handle_register_ps(payload).await,
             MSG_UPSERT_PARTITION => self.handle_upsert_partition(payload).await,
             MSG_GET_REGIONS => self.handle_get_regions().await,
+            MSG_VALIDATE_RECOVERY => self.handle_validate_recovery(payload).await,
             MSG_GET_CLIENT_REGIONS => self.handle_get_client_regions().await,
             MSG_HEARTBEAT_PS => self.handle_heartbeat_ps(payload).await,
             MSG_REGISTER_PARTITION_ADDR => self.handle_register_partition_addr(payload).await,
@@ -1355,6 +1356,7 @@ impl AutumnManager {
     }
 
     pub async fn handle_register_node(&self, payload: Bytes) -> HandlerResult {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&RegisterNodeResp {
                 code: Self::err_to_code(&err),
@@ -6358,6 +6360,7 @@ impl AutumnManager {
     }
 
     pub async fn handle_set_node_maintenance(&self, payload: Bytes) -> HandlerResult {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
         if let Err(err) = self.ensure_leader() {
             return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
@@ -6433,6 +6436,7 @@ impl AutumnManager {
     }
 
     pub async fn handle_clear_node_override(&self, payload: Bytes) -> HandlerResult {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
         if let Err(err) = self.ensure_leader() {
             return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
@@ -6518,6 +6522,7 @@ impl AutumnManager {
     // tight + the unit-test surface is direct.
 
     async fn fence_node_impl(&self, req: &FenceNodeReq) -> Result<(), AppError> {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
         if !self.store.inner.borrow().nodes.contains_key(&req.node_id) {
             return Err(AppError::NotFound(format!(
                 "node {} not registered",
@@ -6573,6 +6578,26 @@ impl AutumnManager {
         // `system_locked_by_other.rs::owner_lock_fencing_rejects_stale_revision`.
         // auto-abandon EC convert markers whose coord matches
         // the freshly-fenced node.
+        let targets: Vec<u64> = self
+            .inflight
+            .borrow()
+            .iter()
+            .filter_map(|(id, r)| {
+                r.recovery_payload
+                    .as_ref()
+                    .filter(|t| t.node_id == req.node_id)
+                    .map(|_| *id)
+            })
+            .collect();
+        for id in targets {
+            // Failed durable cancellation retains a Remove blocker for retry.
+            if let Err(e) = self
+                .drain_extent_inflight_marker(id, "recovery target fenced")
+                .await
+            {
+                tracing::warn!(extent_id = id, error = %e, "recovery cancellation retained for retry");
+            }
+        }
         let _ = self.auto_abandon_for_fenced_node(req.node_id).await;
         Ok(())
     }
@@ -6630,6 +6655,7 @@ impl AutumnManager {
         &self,
         req: &RemoveNodeReq,
     ) -> Result<(), (u8, String, Vec<u64>, Vec<u64>)> {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
         if self.decommissioned.borrow().contains_key(&req.node_id)
             && !self.store.inner.borrow().nodes.contains_key(&req.node_id)
         {
@@ -6656,6 +6682,13 @@ impl AutumnManager {
             }
             let mut marker_refs: Vec<u64> = Vec::new();
             for (eid, rec) in self.inflight.borrow().iter() {
+                if rec
+                    .recovery_payload
+                    .as_ref()
+                    .is_some_and(|p| p.node_id == req.node_id)
+                {
+                    marker_refs.push(*eid);
+                }
                 if let Some((
                     crate::extent_inflight::ExtentOpKind::ConvertToEc,
                     crate::extent_inflight::ExtentOpPayload::ConvertToEc(p),
@@ -6674,7 +6707,7 @@ impl AutumnManager {
             return Err((
                 CODE_PRECONDITION,
                 format!(
-                    "node {} still referenced by {} extents and {} EC markers",
+                    "node {} still referenced by {} extents and {} recovery/EC markers",
                     req.node_id,
                     ext_refs.len(),
                     marker_refs.len()

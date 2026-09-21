@@ -14,6 +14,7 @@ pub(crate) struct InflightSnapshot {
     pub(crate) extent_id: u64,
     nonce: u64,
     record: Vec<u8>,
+    recovery_record: Option<Vec<u8>>,
 }
 
 impl AutumnManager {
@@ -38,6 +39,11 @@ impl AutumnManager {
             extent_id,
             nonce,
             record: rkyv_encode(record).to_vec(),
+            recovery_record: self
+                .recovery_attempts
+                .borrow()
+                .get(&extent_id)
+                .map(crate::persist::encode),
         })
     }
 
@@ -45,15 +51,21 @@ impl AutumnManager {
         &self,
         snapshot: &InflightSnapshot,
         mut comparisons: Vec<autumn_etcd::proto::Compare>,
-        operations: Vec<autumn_etcd::proto::RequestOp>,
+        mut operations: Vec<autumn_etcd::proto::RequestOp>,
     ) -> Result<(), AppError> {
         #[cfg(test)]
         tests::checkpoint(tests::Stage::BeforeTxn).await?;
 
+        operations.push(Op::delete(crate::recovery_attempt::key(snapshot.extent_id)));
         if let Some(etcd) = &self.etcd {
             let key = Self::extent_inflight_key(snapshot.extent_id);
             comparisons.push(Cmp::mod_revision(&key, snapshot.nonce as i64));
             comparisons.push(Cmp::value(&key, &snapshot.record));
+            if let Some(record) = &snapshot.recovery_record {
+                let key = crate::recovery_attempt::key(snapshot.extent_id);
+                comparisons.push(Cmp::mod_revision(&key, snapshot.nonce as i64));
+                comparisons.push(Cmp::value(&key, record));
+            }
             if !etcd.txn_fenced(comparisons, operations, vec![]).await? {
                 return Err(AppError::Precondition(
                     "inflight marker or extent changed before commit".into(),
@@ -89,12 +101,47 @@ impl AutumnManager {
         let key = format!("extents/{extent_id}");
         extra_operations.push(Op::put(&key, crate::persist::encode(&updated)));
         extra_operations.push(Op::delete(Self::extent_inflight_key(extent_id)));
-        self.commit_inflight_txn(
-            snapshot,
-            vec![Cmp::value(&key, &baseline)],
-            extra_operations,
-        )
-        .await?;
+        let mut comparisons = vec![Cmp::value(&key, &baseline)];
+        if snapshot.recovery_record.is_some() {
+            let task = self
+                .extent_inflight_payload_recovery(extent_id)
+                .ok_or_else(|| AppError::Precondition("recovery marker changed".into()))?;
+            let store = self.store.inner.borrow();
+            let node = store
+                .nodes
+                .get(&task.node_id)
+                .ok_or_else(|| AppError::Precondition("recovery target removed".into()))?;
+            comparisons.push(Cmp::value(
+                format!("nodes/{}", task.node_id),
+                crate::persist::encode(node),
+            ));
+            comparisons.push(Cmp::create_revision(
+                format!("{}{}", crate::NODE_OVERRIDE_PREFIX, task.node_id),
+                0,
+            ));
+            comparisons.push(Cmp::create_revision(
+                format!("{}{}", crate::DECOMMISSIONED_PREFIX, task.node_id),
+                0,
+            ));
+            let slot = AutumnManager::extent_slot(&updated, task.node_id)
+                .ok_or_else(|| AppError::Precondition("recovery slot missing".into()))?;
+            let disk_id = updated
+                .replicate_disks
+                .iter()
+                .chain(updated.parity_disks.iter())
+                .nth(slot)
+                .ok_or_else(|| AppError::Precondition("recovery disk missing".into()))?;
+            let disk = store
+                .disks
+                .get(disk_id)
+                .ok_or_else(|| AppError::Precondition("recovery disk removed".into()))?;
+            comparisons.push(Cmp::value(
+                format!("disks/{disk_id}"),
+                crate::persist::encode(disk),
+            ));
+        }
+        self.commit_inflight_txn(snapshot, comparisons, extra_operations)
+            .await?;
         let mut store = self.store.inner.borrow_mut();
         if !store
             .extents

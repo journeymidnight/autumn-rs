@@ -804,3 +804,13 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## Recovery attempt protocol (wire 46)
+
+RequireRecoveryReq and RecoveryTaskDone carry RecoveryAttempt: marker revision,
+source eversion/slot/sealed length/EC shape/payload location, target node UUID
+and disk identities. RecoveryTask itself keeps its encoding because the manager
+inflight record persists it. MSG_VALIDATE_RECOVERY (0x61, manager control plane)
+accepts RequireRecoveryReq and returns CodeResp; the EN checks it before local
+adoption or rebuild, including after restart. Internal peers must all run wire
+46. The client floor remains 43; no client-surface request or reply changed.

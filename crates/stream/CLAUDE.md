@@ -458,11 +458,22 @@ quorum-min: it neither seals nor truncates, so its worst case is a short read
 
 ### Recovery (`require_recovery` RPC)
 
+Wire 46 binds each instruction and completion to the manager marker's creation
+revision plus its immutable source/target snapshot. Dedup accepts only the same
+attempt AND task. A different attempt cannot replace a running copy. Before
+adoption or rebuild (including after restart), the EN asks the leader to validate
+the instruction via MSG_VALIDATE_RECOVERY. It checks node identity, source
+layout and the actual destination disk, and echoes the unchanged snapshot in df.
+The per-extent mutating-op lock covers adoption and the entire background copy,
+serializing it with Delete, ReAvali and EC staging. Rebuilding/adopting committed
+shard-file data closes EC staging so a released coordinator cannot overwrite it.
+The existing immutable-copy adoption rules still apply to a valid new attempt.
+
 Triggered by the manager when a replica node fails. **The request is a STANDING
 INSTRUCTION, re-sent every tick from the manager's durable marker, so every
 answer must be idempotent — a permanent refusal is a permanent wedge:**
 1. Validate the manager endpoint is configured, then answer idempotently:
-   - **already recovering this extent** → `CODE_OK` ("I am already doing exactly
+   - **already recovering this exact attempt/task** → `CODE_OK` ("I am already doing exactly
      this" is the request being satisfied — the same contract
      `handle_convert_to_ec` uses). A `CODE_PRECONDITION` here would make the
      manager drain the marker of a HEALTHY in-flight recovery and go hunting for

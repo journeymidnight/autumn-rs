@@ -42,6 +42,8 @@
 //! This file is intentionally self-contained (mirrors `update_stream_ec.rs`'s
 //! standalone helpers) so it touches no shared harness module.
 
+mod support;
+
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -358,7 +360,7 @@ fn leg_a_read_serves_silently_corrupted_sealed_bytes() {
 #[test]
 fn leg_b_recovery_launders_corruption_no_content_check() {
     let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
+    let manager_control = support::start_recovery_manager(mgr_addr);
     let mgr_str = mgr_addr.to_string();
 
     // 3 stream members + 1 spare recovery target.
@@ -370,7 +372,6 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
     start_extent_node(a1, d1.path().to_path_buf(), 1, &mgr_str);
     start_extent_node(a2, d2.path().to_path_buf(), 2, &mgr_str);
     start_extent_node(a3, d3.path().to_path_buf(), 3, &mgr_str);
-    start_extent_node(a4, d4.path().to_path_buf(), 4, &mgr_str);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect(mgr_addr).await.expect("mgr");
@@ -380,7 +381,17 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
         let n2 = register_node(&mgr, &a2.to_string(), "u2").await;
         let n3 = register_node(&mgr, &a3.to_string(), "u3").await;
         let stream_id = create_stream(&mgr, 3).await;
-        let _n4 = register_node(&mgr, &a4.to_string(), "u4").await;
+        let n4 = register_node(&mgr, &a4.to_string(), "u4").await;
+        let nodes: NodesInfoResp =
+            rkyv_decode(&mgr.call(MSG_NODES_INFO, bytes::Bytes::new()).await.unwrap()).unwrap();
+        let disk = nodes
+            .nodes
+            .iter()
+            .find(|(id, _)| *id == n4)
+            .unwrap()
+            .1
+            .disks[0];
+        start_extent_node(a4, d4.path().to_path_buf(), disk, &mgr_str);
 
         // node_id -> (addr, dir)
         let node_dir = |nid: u64| -> &Path {
@@ -441,13 +452,14 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
         let task = extent_rpc::RecoveryTask {
             extent_id,
             replace_id: reps[1],
-            node_id: 999,
+            node_id: n4,
             start_time: 0,
         };
+        let request = manager_control.instruction(task.clone()).await;
         let resp = en4
             .call(
                 extent_rpc::MSG_REQUIRE_RECOVERY,
-                extent_rpc::rkyv_encode(&extent_rpc::RequireRecoveryReq { task: task.clone() }),
+                extent_rpc::rkyv_encode(&request),
             )
             .await
             .expect("require_recovery");

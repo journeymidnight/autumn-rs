@@ -1420,6 +1420,60 @@ pub fn start_extent_node_with_manager(
     std::thread::sleep(Duration::from_millis(200));
 }
 
+/// Controlled manager: real handlers and metadata, no autonomous df consumer.
+pub struct RecoveryManagerControl(
+    std::sync::mpsc::Sender<(
+        RecoveryTask,
+        std::sync::mpsc::Sender<autumn_rpc::extent_rpc::RequireRecoveryReq>,
+    )>,
+);
+impl RecoveryManagerControl {
+    pub async fn instruction(
+        &self,
+        task: RecoveryTask,
+    ) -> autumn_rpc::extent_rpc::RequireRecoveryReq {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.0.send((task, tx)).unwrap();
+        loop {
+            match rx.try_recv() {
+                Ok(request) => return request,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    compio::time::sleep(Duration::from_millis(5)).await
+                }
+                Err(error) => panic!("manager control closed: {error}"),
+            }
+        }
+    }
+}
+
+pub fn start_recovery_manager(addr: SocketAddr) -> RecoveryManagerControl {
+    let (tx, rx) = std::sync::mpsc::channel::<(
+        RecoveryTask,
+        std::sync::mpsc::Sender<autumn_rpc::extent_rpc::RequireRecoveryReq>,
+    )>();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new();
+            manager._test_disable_background_tasks();
+            let rpc = manager.clone();
+            compio::runtime::spawn(async move {
+                rpc.serve(addr).await.unwrap();
+            })
+            .detach();
+            loop {
+                while let Ok((task, reply)) = rx.try_recv() {
+                    reply
+                        .send(manager._test_recovery_instruction(task).await.unwrap())
+                        .unwrap();
+                }
+                compio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    RecoveryManagerControl(tx)
+}
+
 #[cfg(test)]
 mod toxiproxy_list_tests {
     use super::parse_list_state;

@@ -465,6 +465,29 @@ licence to wipe a real cluster's etcd; see the upgrade-safety note below.
 
 ## Recovery
 
+Recovery instructions and completions carry a nonzero marker creation revision
+and a pinned source/target snapshot (wire 46). The source eversion, replacement
+slot, sealed length, EC shape and payload location cannot drift between dispatch
+and apply. Node UUID and the completed disk's ID/UUID must still match.
+
+The unchanged bare inflight record is paired with a new enveloped
+recoveryAttempt/<extent> record (type 10, format 1), created and deleted in the
+same transactions. Replay checks both creation revisions; missing snapshots on
+old Recovery markers cause cancellation and re-dispatch, never acceptance of an
+unidentified completion. The persisted record has its own fields and exhaustive
+wire conversions, so later wire edits do not reshape it. Its bytes are frozen in
+recovery_attempt.rs. No existing record conversion is needed for this addition.
+
+node_lifecycle_lock serializes marker acquisition and Recovery/EC publication
+with register, fence, maintenance, override clear and remove. Recovery apply's
+etcd transaction also compares node/disk bytes, absence of override/tombstone,
+marker revision/bytes and snapshot revision/bytes. The lock covers the commit
+through memory installation, not the data copy or post-commit cleanup. Fence
+cancels target Recoveries; failed cancellation remains a Remove blocker and is
+retried by the standing-instruction tick. Remove checks Recovery as well as EC
+markers. A delayed dispatch failure is scoped to the request's nonce.
+
+
 **Dispatch loop** (2 s, `recovery.rs`): scans all SEALED extents; per replica slot
 does a per-disk health check first (offline `disk_id` → dispatch immediately), then
 probes `commit_length` (or `re_avali` for known-lagging replicas). On no-response /
@@ -478,7 +501,7 @@ Online so a keep-alive to a corpse can't eat the whole dispatch tick) and **neve
 drains the marker on an RPC failure**. That is what makes an EN restart
 self-healing without a TTL: the EN loses its in-memory `recovery_inflight`, the
 next re-send simply starts it again, and every EN answer is idempotent by
-contract (already-running → `CODE_OK`; complete local copy → re-report done;
+contract (same-attempt already-running → `CODE_OK`; complete local copy → re-report done;
 incomplete residue → discard + rebuild — see `crates/stream/CLAUDE.md`).
 **Release is EVENT-driven:** `apply_recovery_done` (the
 work finished), `release_recovery_markers_for_dead_executors` (level-triggered

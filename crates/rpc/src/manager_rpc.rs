@@ -54,6 +54,8 @@ pub const MSG_GET_REGIONS: u8 = 0x2E;
 // on a connection's negotiated version would make a frame's meaning depend on
 // connection state — and an rkyv mis-decode is silent.
 pub const MSG_GET_CLIENT_REGIONS: u8 = 0x60;
+/// EN verifies a recovery instruction against the current leader before reuse.
+pub const MSG_VALIDATE_RECOVERY: u8 = 0x61;
 pub const MSG_HEARTBEAT_PS: u8 = 0x2F;
 
 // per-partition listener address registration (PS reports the

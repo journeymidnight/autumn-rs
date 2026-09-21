@@ -111,7 +111,8 @@ pub(crate) const RECORD_TYPE_PARTITION: u8 = 8;
 pub(crate) const RECORD_TYPE_REGION: u8 = 9;
 pub(crate) const RECORD_TYPE_NODE: u8 = 6;
 pub(crate) const RECORD_TYPE_DISK: u8 = 7;
-// All nine persisted records are split out; the next one takes 10.
+pub(crate) const RECORD_TYPE_RECOVERY_ATTEMPT: u8 = 10;
+// The next record takes 11.
 
 /// Wrap a record in its envelope. The body is the same rkyv codec the rest of
 /// the manager uses — the envelope is what this module adds, not a new

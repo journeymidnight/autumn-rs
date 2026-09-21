@@ -4098,3 +4098,34 @@ Attributes and historical version reads return NotSupported. Native manifest
 concurrency uses ConditionalPutCommitHandler; do not select a last-writer-wins
 commit handler. See lancedb_validation.md for acceptance evidence and the limits
 of the initial debug-build/MinIO measurements.
+
+## Recovery attempt and node retirement verification (wire 46)
+
+Stop all manager/PS/EN roles before upgrading from wire 45, then restart them
+with wire 46. Existing client binaries in the 43..46 window remain compatible.
+Existing manager record formats are unchanged; do not wipe etcd or run the old
+record converter. New Recovery markers atomically create recoveryAttempt/<id>
+(type 10, format 1). A pre-upgrade Recovery marker without this snapshot is
+cancelled and re-derived on the next dispatch tick. An unreadable snapshot or
+snapshot/marker revision mismatch refuses replay; restore a consistent backup
+and investigate instead of deleting individual keys.
+
+Fence cancels recoveries targeting the node. If cancellation cannot persist,
+Remove reports those extents in blocking_marker_extent_ids until cleanup can
+retry. If a recovery commit wins first, Remove instead reports the resulting
+membership in blocking_extent_ids. A delayed completion cannot reintroduce a
+removed node or disk. This does not change the remaining fence-capacity precheck
+backlog.
+
+Run on a host with Rust and etcd (or set AUTUMN_TEST_ETCD_BIN):
+
+~~~sh
+cargo test -p autumn-manager --lib
+cargo test -p autumn-stream -p autumn-rpc --lib
+cargo test -p autumn-manager --test recovery_attempt --test system_extent_recovery --test node_lifecycle --test apply_done_atomicity -- --include-ignored --test-threads=1
+~~~
+
+The restart test terminates and joins the target's whole runtime before starting
+a new one over the same directory. The etcd test checks atomic creation/deletion,
+replay, and same-assignment A/B reissue. Unit barriers suspend Recovery before
+commit and after its transaction response while Fence/Remove run concurrently.

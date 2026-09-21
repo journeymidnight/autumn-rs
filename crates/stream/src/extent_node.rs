@@ -1725,6 +1725,7 @@ pub struct ExtentNode {
     /// Shared across every shard of this process — see `DoneQueues`.
     done: DoneQueues,
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
+    recovery_attempts: Rc<DashMap<u64, crate::extent_rpc::RecoveryAttempt>>,
     /// Finished EC conversions awaiting pickup by the next `df` (mirrors
     /// `recovery_done` — the manager learns completion from the heartbeat,
     /// not from the dispatch RPC's return).
@@ -1841,6 +1842,7 @@ impl Clone for ExtentNode {
             manager_pool: self.manager_pool.clone(),
             done: self.done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
+            recovery_attempts: self.recovery_attempts.clone(),
             ec_convert_inflight: self.ec_convert_inflight.clone(),
             ec_last_error: self.ec_last_error.clone(),
             op_progress: self.op_progress.clone(),
@@ -3736,6 +3738,7 @@ impl ExtentNode {
             manager_pool: Rc::new(crate::ConnPool::new()),
             done,
             recovery_inflight: Rc::new(DashMap::new()),
+            recovery_attempts: Rc::new(DashMap::new()),
             ec_convert_inflight: Rc::new(DashMap::new()),
             ec_last_error: Rc::new(DashMap::new()),
             op_progress: Rc::new(DashMap::new()),
@@ -7126,6 +7129,59 @@ impl ExtentNode {
             .collect())
     }
 
+    async fn validate_recovery_instruction(
+        &self,
+        task: &crate::extent_rpc::RecoveryTask,
+        attempt: &crate::extent_rpc::RecoveryAttempt,
+    ) -> Result<(), String> {
+        let mgr = self
+            .manager_endpoint
+            .as_ref()
+            .ok_or("manager endpoint is not configured")?;
+        if attempt.nonce == 0 {
+            return Err("recovery instruction has no attempt identity".into());
+        }
+        if self.registration.node_uuid != attempt.target_uuid {
+            return Err("recovery instruction targets another node identity".into());
+        }
+        let response = self
+            .manager_pool
+            .call_timeout(
+                &crate::conn_pool::normalize_endpoint(mgr),
+                manager_rpc::MSG_VALIDATE_RECOVERY,
+                rkyv_encode(&RequireRecoveryReq {
+                    task: task.clone(),
+                    attempt: attempt.clone(),
+                }),
+                Duration::from_secs(5),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let response: CodeResp = rkyv_decode(&response)?;
+        if response.code != CODE_OK {
+            return Err(response.message);
+        }
+        Ok(())
+    }
+
+    fn recovery_source_matches(
+        info: &ExtentInfo,
+        task: &crate::extent_rpc::RecoveryTask,
+        attempt: &crate::extent_rpc::RecoveryAttempt,
+    ) -> bool {
+        info.sealed
+            && info.eversion == attempt.source_eversion
+            && info.sealed_length == attempt.sealed_length
+            && info.ec_converted == attempt.ec_converted
+            && info.payload_location == attempt.payload_location
+            && info
+                .replicates
+                .iter()
+                .chain(info.parity.iter())
+                .nth(attempt.slot as usize)
+                == Some(&task.replace_id)
+    }
+
     async fn resolve_recovery_extent(
         &self,
         task: &crate::extent_rpc::RecoveryTask,
@@ -7138,8 +7194,13 @@ impl ExtentNode {
     async fn run_recovery_task(
         &self,
         task: crate::extent_rpc::RecoveryTask,
+        attempt: crate::extent_rpc::RecoveryAttempt,
     ) -> Result<RecoveryTaskDone, String> {
+        self.validate_recovery_instruction(&task, &attempt).await?;
         let extent_info = self.resolve_recovery_extent(&task).await?;
+        if !Self::recovery_source_matches(&extent_info, &task, &attempt) {
+            return Err("recovery source layout changed".into());
+        }
 
         // refuse-at-start — if the local extent already has a fresher
         // eversion than the manager's snapshot, the recovery snapshot is stale.
@@ -7178,6 +7239,13 @@ impl ExtentNode {
         // node, so they must take the replication path even though
         // `extent_info.parity` is non-empty.
         let extent = self.ensure_extent(task.extent_id).await?;
+        if !attempt
+            .target_disks
+            .iter()
+            .any(|(id, _)| *id == extent.disk_id)
+        {
+            return Err("recovery destination disk is outside the pinned target".into());
+        }
 
         // resolve (re-open if evicted) + pin the recovery dest fd
         // once for the writeback + sync below.
@@ -7230,6 +7298,9 @@ impl ExtentNode {
                 ));
             };
             if location == PayloadLocation::InShardFile {
+                // This is already committed EC data. Released conversion
+                // coordinators may not resume staging over the rebuilt shard.
+                self.seal_ec_staging(task.extent_id);
                 let disk = self.disk_for(extent.disk_id)?;
                 let path = disk.shard_path(task.extent_id, shard_index as u32);
                 if let Some(parent) = path.parent() {
@@ -7389,9 +7460,11 @@ impl ExtentNode {
             ));
         }
 
+        self.validate_recovery_instruction(&task, &attempt).await?;
         Ok(RecoveryTaskDone {
             task,
             ready_disk_id: extent.disk_id,
+            attempt,
         })
     }
 
@@ -9096,6 +9169,7 @@ impl ExtentNode {
         &self,
         task: &crate::extent_rpc::RecoveryTask,
         entry: &Rc<ExtentEntry>,
+        attempt: &crate::extent_rpc::RecoveryAttempt,
     ) -> LocalCopyVerdict {
         let info = match self.extent_info_from_manager(task.extent_id).await {
             Ok(Some(info)) => info,
@@ -9104,6 +9178,17 @@ impl ExtentNode {
             // destroy a complete replica whenever the manager blips.
             _ => return LocalCopyVerdict::Unknown,
         };
+        if !Self::recovery_source_matches(&info, task, attempt)
+            || !attempt
+                .target_disks
+                .iter()
+                .any(|(id, _)| *id == entry.disk_id)
+        {
+            return LocalCopyVerdict::Unknown;
+        }
+        if info.payload() == Some(PayloadLocation::InShardFile) {
+            self.seal_ec_staging(task.extent_id);
+        }
         if entry.corrupt_meta.load(Ordering::SeqCst) {
             // META-FAILCLOSED quarantine: never report a quarantined copy as a
             // healthy recovered replica, and never silently overwrite it — the
@@ -9138,6 +9223,7 @@ impl ExtentNode {
                 self.done.push_recovery(RecoveryTaskDone {
                     task: task.clone(),
                     ready_disk_id: entry.disk_id,
+                    attempt: attempt.clone(),
                 });
             }
             return verdict;
@@ -9166,6 +9252,7 @@ impl ExtentNode {
         self.done.push_recovery(RecoveryTaskDone {
             task: task.clone(),
             ready_disk_id: entry.disk_id,
+            attempt: attempt.clone(),
         });
         LocalCopyVerdict::Complete
     }
@@ -9184,6 +9271,7 @@ impl ExtentNode {
         }
 
         let task = req.task;
+        let attempt = req.attempt;
 
         if self.manager_endpoint.is_none() {
             return code_resp(
@@ -9193,17 +9281,33 @@ impl ExtentNode {
         }
 
         if self.recovery_inflight.contains_key(&task.extent_id) {
-            // IDEMPOTENT ACCEPT, not a rejection. The manager treats its marker
-            // as a standing instruction and re-sends it every tick, so "I am
-            // already doing exactly this" is the request being satisfied — the
-            // same contract `handle_convert_to_ec` uses. Answering
-            // CODE_PRECONDITION here would make the manager's re-dispatch drain
-            // the marker of a HEALTHY in-flight recovery and go hunting for
-            // another candidate.
+            let same = self
+                .recovery_attempts
+                .get(&task.extent_id)
+                .is_some_and(|a| a.value() == &attempt)
+                && self
+                    .recovery_inflight
+                    .get(&task.extent_id)
+                    .is_some_and(|t| rkyv_encode(t.value()) == rkyv_encode(&task));
             return code_resp(
-                CODE_OK,
-                format!("extent {} recovery already running", task.extent_id),
+                if same { CODE_OK } else { CODE_PRECONDITION },
+                format!(
+                    "extent {} recovery already running{}",
+                    task.extent_id,
+                    if same { "" } else { " for another attempt" }
+                ),
             );
+        }
+        // Covers adoption's awaits and the entire copy, including retries.
+        let op_lock = self.get_or_create_extent_op_lock(task.extent_id);
+        let Some(_op_guard) = op_lock.try_lock() else {
+            return code_resp(
+                CODE_PRECONDITION,
+                "extent has another mutating operation".into(),
+            );
+        };
+        if let Err(error) = self.validate_recovery_instruction(&task, &attempt).await {
+            return code_resp(CODE_PRECONDITION, error);
         }
 
         if let Some(entry) = self
@@ -9214,7 +9318,10 @@ impl ExtentNode {
             // A local copy already exists. Recovery must be IDEMPOTENT here: the
             // manager treats its marker as a standing instruction and re-sends
             // it, so a permanent refusal is a permanent wedge.
-            match self.try_adopt_completed_recovery(&task, &entry).await {
+            match self
+                .try_adopt_completed_recovery(&task, &entry, &attempt)
+                .await
+            {
                 // Completed-but-unreported prior recovery (the df response
                 // carrying its RecoveryTaskDone was lost): re-report done.
                 LocalCopyVerdict::Complete => return code_resp(CODE_OK, String::new()),
@@ -9281,8 +9388,12 @@ impl ExtentNode {
         }
 
         self.recovery_inflight.insert(task.extent_id, task.clone());
+        self.recovery_attempts
+            .insert(task.extent_id, attempt.clone());
+        drop(_op_guard);
         let node = self.clone();
         compio::runtime::spawn(async move {
+            let _op_guard = op_lock.lock().await;
             let extent_id = task.extent_id;
             // Held until this task returns, by whichever branch. The
             // give-up path below has no explicit clear and needs none.
@@ -9297,11 +9408,16 @@ impl ExtentNode {
             // recovery permit. The total follows once the attempt has
             // resolved the extent.
             progress.set(0, 0);
+            let instruction = attempt;
             const MAX_RECOVERY_RETRIES: u32 = 10;
             for attempt in 1..=MAX_RECOVERY_RETRIES {
-                match node.run_recovery_task(task.clone()).await {
+                match node
+                    .run_recovery_task(task.clone(), instruction.clone())
+                    .await
+                {
                     Ok(done) => {
                         node.recovery_inflight.remove(&extent_id);
+                        node.recovery_attempts.remove(&extent_id);
                         node.done.push_recovery(done);
                         return;
                     }
@@ -9352,6 +9468,7 @@ impl ExtentNode {
                 }
             }
             node.recovery_inflight.remove(&extent_id);
+            node.recovery_attempts.remove(&extent_id);
         })
         .detach();
 
@@ -10908,6 +11025,58 @@ impl ExtentNode {
 #[cfg(test)]
 mod enospc_disk_health_tests {
     use super::*;
+
+    #[compio::test]
+    async fn recovery_dedup_requires_the_same_attempt_and_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = ExtentNode::new(
+            ExtentNodeConfig::new(dir.path().to_path_buf(), 1).with_manager_endpoint("127.0.0.1:1"),
+        )
+        .await
+        .unwrap();
+        let task = RecoveryTask {
+            extent_id: 61,
+            node_id: 9,
+            replace_id: 3,
+            start_time: 1,
+        };
+        let attempt = RecoveryAttempt {
+            nonce: 10,
+            ..Default::default()
+        };
+        node.recovery_inflight.insert(61, task.clone());
+        node.recovery_attempts.insert(61, attempt.clone());
+        let req = RequireRecoveryReq { task, attempt };
+        let response = node
+            .handle_require_recovery(rkyv_encode(&req))
+            .await
+            .unwrap();
+        assert_eq!(rkyv_decode::<CodeResp>(&response).unwrap().code, CODE_OK);
+        let mut successor = req.clone();
+        successor.attempt.nonce += 1;
+        let response = node
+            .handle_require_recovery(rkyv_encode(&successor))
+            .await
+            .unwrap();
+        assert_eq!(
+            rkyv_decode::<CodeResp>(&response).unwrap().code,
+            CODE_PRECONDITION
+        );
+        assert_eq!(
+            node.recovery_attempts.get(&61).unwrap().value(),
+            &req.attempt
+        );
+        let mut changed_task = req;
+        changed_task.task.replace_id += 1;
+        let response = node
+            .handle_require_recovery(rkyv_encode(&changed_task))
+            .await
+            .unwrap();
+        assert_eq!(
+            rkyv_decode::<CodeResp>(&response).unwrap().code,
+            CODE_PRECONDITION
+        );
+    }
 
     #[compio::test]
     async fn connection_receives_while_the_extent_owner_is_busy() {
@@ -14327,6 +14496,8 @@ mod recovery_idempotence_tests {
                 node_id: 1,
                 start_time: 0,
             },
+
+            attempt: Default::default(),
         })
     }
 

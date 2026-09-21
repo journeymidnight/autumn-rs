@@ -17,6 +17,7 @@ pub mod policy;
 #[cfg(test)]
 mod policy_tests;
 mod recovery;
+mod recovery_attempt;
 pub mod recovery_rate_limiter;
 mod rpc_handlers;
 /// Test-only merge-freeze failpoint (always 0 in production); see its doc in
@@ -757,6 +758,11 @@ pub struct AutumnManager {
     /// and `~/.claude/plans/stream-merge-split-ps-sorted-dijkstra.md` for
     /// the migration plan.
     pub(crate) inflight: Rc<RefCell<HashMap<u64, crate::extent_inflight::MgrExtentInflightRecord>>>,
+    /// Source and target snapshots persisted atomically with Recovery markers.
+    pub(crate) recovery_attempts:
+        Rc<RefCell<HashMap<u64, crate::recovery_attempt::RecoveryRecord>>>,
+    /// Serializes recovery publication with node identity and retirement.
+    pub(crate) node_lifecycle_lock: Rc<futures::lock::Mutex<()>>,
     /// Attempt identity for each live marker in `inflight`, keyed the same way:
     /// the etcd revision of the txn that CREATED that marker. Unique per
     /// attempt (a released-then-reissued marker is a different creation) and
@@ -771,10 +777,8 @@ pub struct AutumnManager {
     /// replay, blocking leadership on upgrade. etcd already stores this value
     /// as the key's `mod_revision`, so replay rebuilds the map for free.
     ///
-    /// A missing entry reads as `0` = "legacy attempt, no identity". Because
-    /// the dispatch and the completion-apply both read THIS map, a divergent
-    /// entry can only weaken the check to its pre-nonce behaviour — it can
-    /// never reject a legitimate report.
+    /// A missing revision reads as zero. Recovery refuses zero identities;
+    /// replayed legacy markers also need a source snapshot before dispatch.
     pub(crate) inflight_attempt_nonce: Rc<RefCell<HashMap<u64, u64>>>,
     /// Which payload file holds each extent's bytes, for the extents that are
     /// not in the default `InDat` shape. See `extent_layout.rs`; persisted at
@@ -1142,6 +1146,8 @@ impl AutumnManager {
             etcd: None,
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
             inflight: Rc::new(RefCell::new(HashMap::new())),
+            recovery_attempts: Rc::new(RefCell::new(HashMap::new())),
+            node_lifecycle_lock: Rc::new(futures::lock::Mutex::new(())),
             inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
             extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
             extent_corrupt_slots: Rc::new(RefCell::new(HashMap::new())),
@@ -3354,6 +3360,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         // so the active policy + mode survive leader failover.
         let autopolicy_config_kv = c.get(b"autoPolicy/config").await?;
         let autopolicy_cooldowns_kv = c.get(b"autoPolicy/cooldowns").await?;
+        let recovery_raw = c.get_prefix(crate::recovery_attempt::PREFIX).await?;
         drop(c);
 
         let mut max_id = 0u64;
@@ -3542,6 +3549,27 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         // install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.
         *self.last_op_at.borrow_mut() = decoded_last_op;
+        let mut recovery_attempts = HashMap::new();
+        for kv in &recovery_raw.kvs {
+            let id = Self::parse_id_from_key(crate::recovery_attempt::PREFIX, &kv.key)?;
+            if !extent_inflight_raw.kvs.iter().any(|marker| {
+                Self::parse_id_from_key(crate::extent_inflight::EXTENT_INFLIGHT_PREFIX, &marker.key)
+                    .ok()
+                    == Some(id)
+                    && marker.mod_revision == kv.mod_revision
+            }) {
+                return Err(anyhow::anyhow!(
+                    "recoveryAttempt/{id} does not share its marker's creation revision"
+                ));
+            }
+            let record = crate::persist::decode::<crate::recovery_attempt::RecoveryRecord>(
+                &String::from_utf8_lossy(&kv.key),
+                &kv.value,
+            )
+            .map_err(Self::replay_decode_err)?;
+            recovery_attempts.insert(id, record);
+        }
+        *self.recovery_attempts.borrow_mut() = recovery_attempts;
         // install the unified inflight ledger. Records with
         // malformed op_kind/payload combinations are dropped with a WARN
         // inside `decode_extent_inflight_kvs`. The `extent_inflight/`
@@ -5040,6 +5068,46 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         Ok(())
     }
 
+    #[doc(hidden)]
+    pub async fn _test_apply_recovery(&self, done: RecoveryTaskDone) -> Result<(), AppError> {
+        self.apply_recovery_done(done).await
+    }
+
+    #[doc(hidden)]
+    pub async fn _test_release_recovery(&self, extent_id: u64) -> Result<(), AppError> {
+        self.drain_extent_inflight_marker(extent_id, "test controlled reissue")
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn _test_replay_metadata(&self) -> Result<()> {
+        self.replay_from_etcd().await
+    }
+
+    #[doc(hidden)]
+    pub fn _test_disable_background_tasks(&self) {
+        self.runtime_started.set(true);
+    }
+
+    #[doc(hidden)]
+    pub async fn _test_recovery_instruction(
+        &self,
+        task: RecoveryTask,
+    ) -> Result<RequireRecoveryReq, AppError> {
+        let extent_id = task.extent_id;
+        self.acquire_extent_inflight(
+            extent_id,
+            crate::extent_inflight::ExtentOpPayload::Recovery(task.clone()),
+        )
+        .await?;
+        Ok(RequireRecoveryReq {
+            task,
+            attempt: self
+                .recovery_attempt(extent_id)
+                .expect("new marker snapshot"),
+        })
+    }
+
     /// Seed one extent into the in-memory state. **Integration tests only.**
     ///
     /// `store` became crate-private when it started holding persisted records —
@@ -5457,6 +5525,7 @@ mod tests {
                 start_time: 0,
             },
             ready_disk_id: 99,
+            attempt: m.recovery_attempt(extent_id).unwrap_or_default(),
         };
         run(async { m.apply_recovery_done(done).await }).expect("refusal is not an error");
         let s = m.store.inner.borrow();
@@ -5471,6 +5540,7 @@ mod tests {
     #[test]
     fn recovery_completion_matching_the_marker_applies() {
         let m = AutumnManager::new();
+        add_node_and_disk(&m, 9, 99);
         let extent_id = 43;
         {
             let mut s = m.store.inner.borrow_mut();
@@ -5491,6 +5561,7 @@ mod tests {
             m.apply_recovery_done(RecoveryTaskDone {
                 task,
                 ready_disk_id: 99,
+                attempt: m.recovery_attempt(extent_id).unwrap_or_default(),
             })
             .await
         })
@@ -5762,7 +5833,7 @@ mod tests {
             s.extents.insert(5, ex);
         }
         run(async {
-            m.acquire_extent_inflight(
+            m._test_acquire_marker(
                 5,
                 crate::extent_inflight::ExtentOpPayload::Recovery(RecoveryTask {
                     extent_id: 5,
@@ -7327,6 +7398,7 @@ mod tests {
             let done = RecoveryTaskDone {
                 task,
                 ready_disk_id: 99,
+                attempt: m.recovery_attempt(extent_id).unwrap_or_default(),
             };
             let result = m.apply_recovery_done(done).await;
 
@@ -7363,6 +7435,7 @@ mod tests {
         // node 1 → node 9 (not in extent_nodes) should succeed cleanly.
         run(async {
             let m = AutumnManager::new();
+            add_node_and_disk(&m, 9, 88);
 
             let extent_id = 30u64;
             let ex = ExtentRecord {
@@ -7392,6 +7465,7 @@ mod tests {
             let done = RecoveryTaskDone {
                 task,
                 ready_disk_id: 88,
+                attempt: m.recovery_attempt(extent_id).unwrap_or_default(),
             };
             let result = m.apply_recovery_done(done).await;
 
@@ -7427,6 +7501,7 @@ mod tests {
     fn a_repeated_recovery_completion_applies_once_and_is_benign_after() {
         run(async {
             let m = AutumnManager::new();
+            add_node_and_disk(&m, 9, 88);
             let extent_id = 31u64;
             m.store.inner.borrow_mut().extents.insert(
                 extent_id,
@@ -7455,6 +7530,7 @@ mod tests {
             let done = || RecoveryTaskDone {
                 task: task.clone(),
                 ready_disk_id: 88,
+                attempt: m.recovery_attempt(extent_id).unwrap_or_default(),
             };
 
             assert!(m.apply_recovery_done(done()).await.is_ok(), "first apply");
@@ -7532,8 +7608,12 @@ mod tests {
                     start_time: 0,
                 },
                 ready_disk_id: 88,
+                attempt: m.recovery_attempt(extent_id).unwrap_or_default(),
             };
-            assert!(m.apply_recovery_done(done).await.is_ok(), "refusal is not an error");
+            assert!(
+                m.apply_recovery_done(done).await.is_ok(),
+                "refusal is not an error"
+            );
             // The marker must SURVIVE. The refusal is only safe because the
             // assignment it names is still standing, so its own executor's
             // completion can still apply; dropping it here would strand the
@@ -7799,6 +7879,7 @@ mod tests {
         {
             let verdict = run(async move {
                 let m = AutumnManager::new();
+                add_node_and_disk(&m, 9, 77);
                 let extent_id = 700 + i as u64;
                 let task = RecoveryTask {
                     extent_id,
@@ -7836,6 +7917,7 @@ mod tests {
                     .apply_recovery_done(RecoveryTaskDone {
                         task,
                         ready_disk_id: 77,
+                        attempt: m.recovery_attempt(extent_id).unwrap_or_default(),
                     })
                     .await;
                 let got_err = got.is_err();
@@ -7903,6 +7985,7 @@ mod tests {
     fn apply_recovery_done_during_ec_inflight_defers() {
         run(async {
             let m = AutumnManager::new();
+            add_node_and_disk(&m, 9, 99);
             let extent_id = 200u64;
             m.store
                 .inner
@@ -7923,6 +8006,7 @@ mod tests {
             let done = RecoveryTaskDone {
                 task: task.clone(),
                 ready_disk_id: 99,
+                attempt: m.recovery_attempt(extent_id).unwrap_or_default(),
             };
             let result = m.apply_recovery_done(done.clone()).await;
             assert!(
@@ -7947,6 +8031,10 @@ mod tests {
             // EC clears (transitions to Recovery being the active op); retry succeeds.
             m._test_clear_inflight(extent_id);
             m._test_mark_recovery_inflight(extent_id, task);
+            let done = RecoveryTaskDone {
+                attempt: m.recovery_attempt(extent_id).unwrap(),
+                ..done
+            };
             let result = m.apply_recovery_done(done).await;
             assert!(
                 result.is_ok(),
@@ -8004,6 +8092,7 @@ mod tests {
     fn full_race_recovery_after_ec_apply() {
         run(async {
             let m = AutumnManager::new();
+            add_node_and_disk(&m, 9, 99);
             let extent_id = 202u64;
             m.store
                 .inner
@@ -8033,6 +8122,7 @@ mod tests {
             let done = RecoveryTaskDone {
                 task: task.clone(),
                 ready_disk_id: 99,
+                attempt: m.recovery_attempt(extent_id).unwrap_or_default(),
             };
             let r = m.apply_recovery_done(done.clone()).await;
             assert!(r.is_err(), "recovery must defer while EC in flight");
@@ -8054,6 +8144,14 @@ mod tests {
             // the exclusive ledger, retry rehydrates the Recovery marker (mimicking
             // recovery_collect_loop's behaviour after the EC tick cleared).
             m._test_mark_recovery_inflight(extent_id, task);
+            assert!(
+                m.apply_recovery_done(done.clone()).await.is_err(),
+                "the pre-EC completion stays stale"
+            );
+            let done = RecoveryTaskDone {
+                attempt: m.recovery_attempt(extent_id).unwrap(),
+                ..done
+            };
             let r = m.apply_recovery_done(done).await;
             assert!(
                 r.is_ok(),

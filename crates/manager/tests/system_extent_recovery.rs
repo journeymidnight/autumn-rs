@@ -194,7 +194,7 @@ fn lost_recovery_completion_redispatch_adopts_local_copy() {
     }
 
     let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
+    let manager_control = start_recovery_manager(mgr_addr);
 
     let n1_dir = tempfile::tempdir().expect("n1");
     let n2_dir = tempfile::tempdir().expect("n2");
@@ -203,16 +203,10 @@ fn lost_recovery_completion_redispatch_adopts_local_copy() {
     let n2_addr = pick_addr();
     let n3_addr = pick_addr();
 
-    // n1 + n2 are the registered stream members. n3 is the spare recovery
-    // target and is deliberately NOT registered with the manager: the
-    // manager's node_health_loop therefore never sends it a df, so n3's
-    // `recovery_done` queue is drained ONLY by this test — making the
-    // "df response lost in transit" scenario deterministic (we drain the
-    // completion ourselves and discard it, exactly what a lost response
-    // does to the manager's view).
+    // n3 is registered after allocating the stream. The controlled manager
+    // runs no df loop, so only this test drains the completion queue.
     start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
-    start_en_with_manager(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
@@ -255,6 +249,14 @@ fn lost_recovery_completion_redispatch_adopts_local_copy() {
         sc.invalidate_extent_cache(extent_id);
         let ext_info = sc.get_extent_info(extent_id).await.expect("extent info");
         let replace_id = ext_info.replicates[1];
+        let target = register_node(&mgr, &n3_addr.to_string(), "uuid-3").await;
+        let target_id = target.node_id;
+        start_en_with_manager(
+            n3_addr,
+            n3_dir.path().to_path_buf(),
+            target.disk_uuids[0].1,
+            mgr_addr,
+        );
 
         // Dispatch recovery DIRECTLY to n3 (bypassing the manager's
         // dispatch loop — n3 consults the manager only for extent_info).
@@ -262,14 +264,12 @@ fn lost_recovery_completion_redispatch_adopts_local_copy() {
         let task = ext::RecoveryTask {
             extent_id,
             replace_id,
-            node_id: 999,
+            node_id: target_id,
             start_time: 0,
         };
+        let request = manager_control.instruction(task.clone()).await;
         let resp = en3
-            .call(
-                ext::MSG_REQUIRE_RECOVERY,
-                ext::rkyv_encode(&ext::RequireRecoveryReq { task: task.clone() }),
-            )
+            .call(ext::MSG_REQUIRE_RECOVERY, ext::rkyv_encode(&request))
             .await
             .expect("require_recovery #1");
         let code: ext::CodeResp = ext::rkyv_decode(&resp).expect("decode #1");
@@ -305,10 +305,7 @@ fn lost_recovery_completion_redispatch_adopts_local_copy() {
         // "extent already exists" — candidate poisoned forever. Post-fix:
         // the EN adopts its verified-complete local copy.
         let resp = en3
-            .call(
-                ext::MSG_REQUIRE_RECOVERY,
-                ext::rkyv_encode(&ext::RequireRecoveryReq { task: task.clone() }),
-            )
+            .call(ext::MSG_REQUIRE_RECOVERY, ext::rkyv_encode(&request))
             .await
             .expect("require_recovery #2");
         let code: ext::CodeResp = ext::rkyv_decode(&resp).expect("decode #2");
@@ -330,10 +327,14 @@ fn lost_recovery_completion_redispatch_adopts_local_copy() {
             .await
             .expect("df after adopt");
         let df: ext::DfResp = ext::rkyv_decode(&resp).expect("decode df #2");
-        assert_eq!(df.done_tasks.len(), 1, "adopt must re-report RecoveryTaskDone");
+        assert_eq!(
+            df.done_tasks.len(),
+            1,
+            "adopt must re-report RecoveryTaskDone"
+        );
         assert_eq!(df.done_tasks[0].task.extent_id, extent_id);
         assert_eq!(df.done_tasks[0].task.replace_id, replace_id);
-        assert_eq!(df.done_tasks[0].task.node_id, 999);
+        assert_eq!(df.done_tasks[0].task.node_id, target_id);
     });
 }
 
@@ -443,7 +444,7 @@ fn incomplete_local_copy_is_discarded_and_rebuilt_not_refused_forever() {
     }
 
     let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
+    let manager_control = start_recovery_manager(mgr_addr);
 
     let n1_dir = tempfile::tempdir().expect("n1");
     let n2_dir = tempfile::tempdir().expect("n2");
@@ -455,9 +456,8 @@ fn incomplete_local_copy_is_discarded_and_rebuilt_not_refused_forever() {
     start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
     // n3 is the recovery target; it needs the manager endpoint so the triage can
-    // fetch the authoritative extent_info. Deliberately unregistered so only this
+    // fetch the authoritative extent_info. Background df is disabled so only this
     // test drains its `recovery_done`.
-    start_en_with_manager(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
@@ -499,7 +499,18 @@ fn incomplete_local_copy_is_discarded_and_rebuilt_not_refused_forever() {
         sc.invalidate_extent_cache(extent_id);
         let ext_info = sc.get_extent_info(extent_id).await.expect("extent info");
         let replace_id = ext_info.replicates[1];
-        assert!(ext_info.sealed_length > 0, "extent must be sealed with data");
+        let target = register_node(&mgr, &n3_addr.to_string(), "uuid-3").await;
+        let target_id = target.node_id;
+        start_en_with_manager(
+            n3_addr,
+            n3_dir.path().to_path_buf(),
+            target.disk_uuids[0].1,
+            mgr_addr,
+        );
+        assert!(
+            ext_info.sealed_length > 0,
+            "extent must be sealed with data"
+        );
 
         let en3 = RpcClient::connect(n3_addr).await.expect("connect n3");
 
@@ -520,14 +531,12 @@ fn incomplete_local_copy_is_discarded_and_rebuilt_not_refused_forever() {
         let task = ext::RecoveryTask {
             extent_id,
             replace_id,
-            node_id: 999,
+            node_id: target_id,
             start_time: 0,
         };
+        let request = manager_control.instruction(task.clone()).await;
         let resp = en3
-            .call(
-                ext::MSG_REQUIRE_RECOVERY,
-                ext::rkyv_encode(&ext::RequireRecoveryReq { task: task.clone() }),
-            )
+            .call(ext::MSG_REQUIRE_RECOVERY, ext::rkyv_encode(&request))
             .await
             .expect("require_recovery");
         let code: ext::CodeResp = ext::rkyv_decode(&resp).expect("decode require_recovery");
@@ -597,7 +606,7 @@ fn redispatch_while_running_is_an_idempotent_accept() {
     }
 
     let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
+    let manager_control = start_recovery_manager(mgr_addr);
 
     let n1_dir = tempfile::tempdir().expect("n1");
     let n2_dir = tempfile::tempdir().expect("n2");
@@ -608,7 +617,6 @@ fn redispatch_while_running_is_an_idempotent_accept() {
 
     start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
-    start_en_with_manager(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
@@ -648,15 +656,24 @@ fn redispatch_while_running_is_an_idempotent_accept() {
         sc.invalidate_extent_cache(extent_id);
         let ext_info = sc.get_extent_info(extent_id).await.expect("extent info");
         let replace_id = ext_info.replicates[1];
+        let target = register_node(&mgr, &n3_addr.to_string(), "uuid-3").await;
+        let target_id = target.node_id;
+        start_en_with_manager(
+            n3_addr,
+            n3_dir.path().to_path_buf(),
+            target.disk_uuids[0].1,
+            mgr_addr,
+        );
 
         let en3 = RpcClient::connect(n3_addr).await.expect("connect n3");
         let task = ext::RecoveryTask {
             extent_id,
             replace_id,
-            node_id: 999,
+            node_id: target_id,
             start_time: 0,
         };
-        let req = || ext::rkyv_encode(&ext::RequireRecoveryReq { task: task.clone() });
+        let request = manager_control.instruction(task.clone()).await;
+        let req = || ext::rkyv_encode(&request);
 
         let resp = en3
             .call(ext::MSG_REQUIRE_RECOVERY, req())

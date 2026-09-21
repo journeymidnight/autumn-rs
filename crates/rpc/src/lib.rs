@@ -106,7 +106,7 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// Bump it on every wire change. There is no separate "oldest cluster peer"
 /// constant: peers compare for EQUALITY, so a floor pinned to this value would
 /// say nothing.
-pub const WIRE_VERSION: u32 = 45;
+pub const WIRE_VERSION: u32 = 46;
 
 /// The oldest CLIENT this binary serves — the floor of the client window
 /// `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`.
@@ -498,19 +498,19 @@ mod wire_version_tests {
         assert!(client_compat_check(3, 2).is_err());
     }
 
-    /// The window is OPEN: `[43, 45]`, opened by raising the CEILING and
-    /// widened again by `MSG_GET_CLIENT_REGIONS`.
+    /// The window is OPEN: `[43, 46]`, opened by raising the CEILING and
+    /// widened by `MSG_GET_CLIENT_REGIONS`.
     ///
     /// Pinned to literals so that the two silently becoming equal again — which
     /// would take the whole window's coverage down with it — cannot pass.
     /// **If this fails because you bumped `WIRE_VERSION`: that is correct and
-    /// expected.** Move the 44 up and leave the 43 alone; the floor rises only
+    /// expected.** Move the ceiling up and leave the 43 alone; the floor rises only
     /// for a change that breaks the client-facing surface, and the `const`
     /// assertions beside the constants say what pins it there.
     #[test]
     fn the_client_window_is_open_and_the_floor_is_where_it_belongs() {
         assert_eq!(MIN_CLIENT_WIRE_VERSION, 43, "read this test's comment");
-        assert_eq!(WIRE_VERSION, 45, "read this test's comment");
+        assert_eq!(WIRE_VERSION, 46, "read this test's comment");
     }
 
     /// The check that actually decides whether a stale SERVER joins is the one

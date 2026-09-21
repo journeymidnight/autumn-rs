@@ -904,6 +904,21 @@ pub struct RecoveryTask {
 pub struct RecoveryTaskDone {
     pub task: RecoveryTask,
     pub ready_disk_id: u64,
+    pub attempt: RecoveryAttempt,
+}
+
+/// Immutable source and target identity for one manager-owned recovery.
+/// The nonce is the creating marker's etcd revision, never a wall-clock time.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryAttempt {
+    pub nonce: u64,
+    pub source_eversion: u64,
+    pub slot: u32,
+    pub sealed_length: u64,
+    pub ec_converted: bool,
+    pub payload_location: u8,
+    pub target_uuid: String,
+    pub target_disks: Vec<(u64, String)>,
 }
 
 /// One finished EC conversion, reported by the coordinator EN on its next `df`.
@@ -1046,6 +1061,7 @@ pub struct ScrubRotReport {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct RequireRecoveryReq {
     pub task: RecoveryTask,
+    pub attempt: RecoveryAttempt,
 }
 
 /// Generic code + message response for control-plane RPCs.

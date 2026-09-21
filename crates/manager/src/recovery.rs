@@ -496,7 +496,12 @@ impl AutumnManager {
             }
         };
         let node_id = task.node_id;
-        let payload = rkyv_encode(&RequireRecoveryReq { task });
+        let Some(attempt) = self.recovery_attempt(extent_id) else {
+            self.drain_extent_inflight_marker(extent_id, "legacy recovery has no source snapshot")
+                .await?;
+            return Ok(DispatchOutcome::Dispatched);
+        };
+        let payload = rkyv_encode(&RequireRecoveryReq { task, attempt });
         match self
             .conn_pool
             .call_timeout(
@@ -693,7 +698,11 @@ impl AutumnManager {
                 Err(other) => return Err(other),
             }
 
-            let payload = rkyv_encode(&RequireRecoveryReq { task });
+            let attempt = self.recovery_attempt(extent_id).ok_or_else(|| {
+                AppError::Precondition("recovery cancelled before dispatch".into())
+            })?;
+            let dispatched_nonce = attempt.nonce;
+            let payload = rkyv_encode(&RequireRecoveryReq { task, attempt });
             // 30 s ceiling — REQUIRE_RECOVERY only kicks off the
             // background `run_recovery_task` on the EN; the EN returns
             // OK immediately. A paged-out / dead EN otherwise wedges
@@ -717,7 +726,11 @@ impl AutumnManager {
                     // on the next tick and the EN-side check will idempotently
                     // refuse the duplicate.
                     if let Err(e) = self
-                        .drain_extent_inflight_marker(extent.extent_id, "dispatch RPC failed")
+                        .drain_recovery_dispatch(
+                            extent.extent_id,
+                            dispatched_nonce,
+                            "dispatch RPC failed",
+                        )
                         .await
                     {
                         tracing::warn!(
@@ -734,12 +747,16 @@ impl AutumnManager {
                     continue;
                 }
             };
+            if self.extent_inflight_nonce(extent_id) != dispatched_nonce {
+                return Ok(DispatchOutcome::Dispatched);
+            }
             let r: autumn_rpc::extent_rpc::CodeResp = match rkyv_decode(&resp) {
                 Ok(v) => v,
                 Err(_) => {
                     if let Err(e) = self
-                        .drain_extent_inflight_marker(
+                        .drain_recovery_dispatch(
                             extent.extent_id,
+                            dispatched_nonce,
                             "the dispatch response was undecodable",
                         )
                         .await
@@ -763,8 +780,9 @@ impl AutumnManager {
                 // recovery_inflight conflict). Release marker
                 // and try next candidate.
                 if let Err(e) = self
-                    .drain_extent_inflight_marker(
+                    .drain_recovery_dispatch(
                         extent.extent_id,
+                        dispatched_nonce,
                         "the target refused the rebuild",
                     )
                     .await
@@ -843,6 +861,20 @@ impl AutumnManager {
         ))
     }
 
+    async fn drain_recovery_dispatch(
+        &self,
+        extent_id: u64,
+        nonce: u64,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        if self.extent_inflight_nonce(extent_id) != nonce {
+            return Err(AppError::Precondition(
+                "recovery dispatch belongs to a released attempt".into(),
+            ));
+        }
+        self.drain_extent_inflight_marker(extent_id, reason).await
+    }
+
     fn stale_recovery_reason(&self, task: &RecoveryTask) -> Option<String> {
         let store = self.store.inner.borrow();
         let Some(extent) = store.extents.get(&task.extent_id) else {
@@ -856,14 +888,24 @@ impl AutumnManager {
                 task.replace_id, task.extent_id
             ));
         };
-        Self::extent_nodes(extent)
+        if Self::extent_nodes(extent)
             .iter()
             .enumerate()
             .any(|(index, node_id)| index != slot && *node_id == task.node_id)
-            .then(|| format!(
+        {
+            return Some(format!(
                 "recovery target {} for extent {} already in extent node list at a different slot",
                 task.node_id, task.extent_id
-            ))
+            ));
+        }
+        drop(store);
+        let Some(attempt) = self.recovery_attempt(task.extent_id) else {
+            return Some("recovery marker has no versioned source snapshot".into());
+        };
+        if let Err(error) = self.validate_recovery_attempt(task, &attempt, None) {
+            return Some(error.to_string());
+        }
+        None
     }
 
     async fn retire_stale_recovery(
@@ -956,6 +998,7 @@ impl AutumnManager {
         done_task: RecoveryTaskDone,
     ) -> Result<(), AppError> {
         let task = &done_task.task;
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
 
         // if EC conversion is in flight for this extent,
         // defer the recovery apply. apply_ec_conversion_done would
@@ -1127,6 +1170,13 @@ impl AutumnManager {
             }
         }
 
+        // A same-assignment predecessor may never touch its successor.
+        if self.recovery_attempt(task.extent_id).as_ref() != Some(&done_task.attempt)
+            || done_task.attempt.nonce == 0
+        {
+            return Err(AppError::Precondition("recovery attempt changed".into()));
+        }
+
         // precheck — if `task.node_id` is already present in this
         // extent at a slot OTHER than the failed `replace_id`, the layout
         // has changed since dispatch (typically EC conversion completed
@@ -1145,6 +1195,7 @@ impl AutumnManager {
                 .borrow()
                 .extents
                 .contains_key(&task.extent_id);
+            drop(_lifecycle);
             self.retire_stale_recovery(task, &reason).await?;
             return if removed {
                 Ok(())
@@ -1152,6 +1203,7 @@ impl AutumnManager {
                 Err(AppError::Precondition(reason))
             };
         }
+        self.validate_recovery_attempt(task, &done_task.attempt, Some(done_task.ready_disk_id))?;
         let snapshot = self.snapshot_inflight(
             task.extent_id,
             crate::extent_inflight::ExtentOpKind::Recovery,
@@ -1206,6 +1258,7 @@ impl AutumnManager {
         };
         self.commit_inflight_extent(&snapshot, baseline, updated_extent.clone(), vec![])
             .await?;
+        drop(_lifecycle);
         // The rebuilt slot holds fresh bytes copied from a healthy peer, so the
         // corrupt mark that scheduled this rebuild has been satisfied. Clearing
         // it also stops the slot from being force-dispatched every tick.
@@ -3081,7 +3134,7 @@ impl crate::AutumnManager {
     /// `force-ec-convert` of that extent a no-op that reports success, with no
     /// escape short of a leader restart. Closing here, at the single funnel,
     /// covers every present and future drop path.
-    async fn drain_extent_inflight_marker(
+    pub(crate) async fn drain_extent_inflight_marker(
         &self,
         extent_id: u64,
         reason: &str,
@@ -3133,6 +3186,19 @@ impl crate::AutumnManager {
         data_shards: usize,
         new_eversion: u64,
     ) -> Result<(), AppError> {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
+        if target_nodes.iter().any(|id| {
+            self.decommissioned.borrow().contains_key(id)
+                || self
+                    .node_overrides
+                    .borrow()
+                    .get(id)
+                    .is_some_and(|o| o.kind == NODE_OVERRIDE_FENCED)
+        }) {
+            return Err(AppError::Precondition(
+                "EC target fenced or removed before apply".into(),
+            ));
+        }
         // TEST-ONLY (G4 harness): one-shot transient failure BEFORE any etcd /
         // leadership interaction — a faithful model of "apply's etcd txn blipped
         // while this manager stayed leader". No-op in production builds.
@@ -3795,7 +3861,7 @@ mod corrupt_ec_handoff_tests {
             None,
             "first content failure must release, not wait for 24 retries"
         );
-        m.acquire_extent_inflight(42, recovery()).await.unwrap();
+        m._test_acquire_marker(42, recovery()).await.unwrap();
         m.release_corrupt_ec_attempt(42, old_nonce, 1, 1, "late reply")
             .await;
         assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::Recovery));
@@ -4421,7 +4487,7 @@ mod recovery_cleanup_retry_tests {
                 start_time: 1,
             };
             manager
-                .acquire_extent_inflight(extent_id, ExtentOpPayload::Recovery(task))
+                ._test_acquire_marker(extent_id, ExtentOpPayload::Recovery(task))
                 .await
                 .unwrap();
 

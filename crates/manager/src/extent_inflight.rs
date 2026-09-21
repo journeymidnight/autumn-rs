@@ -211,12 +211,31 @@ impl AutumnManager {
         extent_id: u64,
         payload: ExtentOpPayload,
     ) -> Result<(), AppError> {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
         if self.inflight.borrow().contains_key(&extent_id) {
             return Err(AppError::Precondition(format!(
                 "extent {extent_id} already has an in-flight op (in-memory)"
             )));
         }
 
+        if let ExtentOpPayload::ConvertToEc(params) = &payload {
+            if params.target_nodes.iter().any(|id| {
+                self.decommissioned.borrow().contains_key(id)
+                    || self
+                        .node_overrides
+                        .borrow()
+                        .get(id)
+                        .is_some_and(|o| o.kind == autumn_rpc::manager_rpc::NODE_OVERRIDE_FENCED)
+            }) {
+                return Err(AppError::Precondition(
+                    "EC target fenced or removed before dispatch".into(),
+                ));
+            }
+        }
+        let recovery = match &payload {
+            ExtentOpPayload::Recovery(task) => Some(self.capture_recovery_attempt(task)?),
+            _ => None,
+        };
         let record = MgrExtentInflightRecord::new(extent_id, payload, (*self.instance_id).clone());
 
         // The attempt nonce is this creation's etcd revision, so it must come
@@ -227,7 +246,14 @@ impl AutumnManager {
             let value = rkyv_encode(&record).to_vec();
             let extra_cmp = vec![Cmp::create_revision(key.as_bytes(), 0)];
             let put_op = autumn_etcd::Op::put(key.as_bytes(), &value);
-            match etcd.txn_fenced_revision(extra_cmp, vec![put_op]).await? {
+            let mut puts = vec![put_op];
+            if let Some(record) = &recovery {
+                puts.push(autumn_etcd::Op::put(
+                    crate::recovery_attempt::key(extent_id),
+                    crate::persist::encode(record),
+                ));
+            }
+            match etcd.txn_fenced_revision(extra_cmp, puts).await? {
                 Some(rev) => rev as u64,
                 None => {
                     return Err(AppError::Precondition(format!(
@@ -241,6 +267,11 @@ impl AutumnManager {
             s.next_revision as u64
         };
 
+        if let Some(recovery) = recovery {
+            self.recovery_attempts
+                .borrow_mut()
+                .insert(extent_id, recovery);
+        }
         self.inflight.borrow_mut().insert(extent_id, record);
         self.inflight_attempt_nonce
             .borrow_mut()
@@ -264,6 +295,7 @@ impl AutumnManager {
     /// succeeded (etcd-first invariant per `crates/manager/CLAUDE.md`
     /// programming note 1).
     pub(crate) fn commit_extent_inflight_release(&self, extent_id: u64) {
+        self.recovery_attempts.borrow_mut().remove(&extent_id);
         self.inflight.borrow_mut().remove(&extent_id);
         self.inflight_attempt_nonce.borrow_mut().remove(&extent_id);
         // The consecutive-failure tally belongs to the marker, not the extent.
@@ -370,6 +402,24 @@ impl AutumnManager {
         (ec, rec)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn _test_acquire_marker(
+        &self,
+        extent_id: u64,
+        payload: ExtentOpPayload,
+    ) -> Result<(), AppError> {
+        if self.inflight.borrow().contains_key(&extent_id) {
+            return Err(AppError::Precondition("test marker already exists".into()));
+        }
+        match payload {
+            ExtentOpPayload::Recovery(task) => {
+                self._test_mark_recovery_inflight(extent_id, task);
+                Ok(())
+            }
+            other => self.acquire_extent_inflight(extent_id, other).await,
+        }
+    }
+
     /// Test-only convenience: simulate that `extent_id` is in flight with
     /// a ConvertToEc op. Replaces today's
     /// `m.ec_conversion_inflight.borrow_mut().insert(extent_id)` pattern in
@@ -401,6 +451,31 @@ impl AutumnManager {
     /// `_test_mark_ec_inflight` but inserts a Recovery payload.
     #[cfg(test)]
     pub(crate) fn _test_mark_recovery_inflight(&self, extent_id: u64, task: RecoveryTask) {
+        let mut attempt = self
+            .capture_recovery_attempt(&task)
+            .map(|r| autumn_rpc::extent_rpc::RecoveryAttempt::from(&r))
+            .unwrap_or_default();
+        // Some ledger tests inject an already-stale marker. Describe the
+        // source as far as the fixture allows without changing store state.
+        if let Some(ex) = self.store.inner.borrow().extents.get(&extent_id) {
+            attempt.source_eversion = ex.eversion;
+            attempt.sealed_length = ex.sealed_length;
+            attempt.ec_converted = ex.ec_converted;
+            attempt.slot = Self::extent_slot(ex, task.replace_id).unwrap_or(0) as u32;
+            attempt.payload_location = self.payload_location_of(extent_id) as u8;
+        }
+        let nonce = {
+            let mut s = self.store.inner.borrow_mut();
+            s.next_revision += 1;
+            s.next_revision as u64
+        };
+        self.inflight_attempt_nonce
+            .borrow_mut()
+            .insert(extent_id, nonce);
+        self.recovery_attempts.borrow_mut().insert(
+            extent_id,
+            crate::recovery_attempt::RecoveryRecord::from(attempt),
+        );
         let payload = ExtentOpPayload::Recovery(task);
         let record = MgrExtentInflightRecord::new(extent_id, payload, "test".to_string());
         self.inflight.borrow_mut().insert(extent_id, record);
@@ -756,7 +831,7 @@ mod tests {
                 .await
                 .expect("first acquire");
             let err = m
-                .acquire_extent_inflight(42, recovery_payload(42))
+                ._test_acquire_marker(42, recovery_payload(42))
                 .await
                 .expect_err("second acquire must fail");
             assert!(matches!(err, AppError::Precondition(_)), "got {err:?}");
@@ -826,7 +901,7 @@ mod tests {
             m.commit_extent_inflight_release(42);
             assert_eq!(m.extent_inflight_op(42), None);
             // Re-acquire after release works.
-            m.acquire_extent_inflight(42, recovery_payload(42))
+            m._test_acquire_marker(42, recovery_payload(42))
                 .await
                 .expect("re-acquire");
             assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::Recovery));
@@ -928,7 +1003,7 @@ mod tests {
             let m = AutumnManager::new();
             // `recovery_payload` pins node_id = 9, which is not registered here
             // — i.e. the executor is gone as far as the manager can tell.
-            m.acquire_extent_inflight(20, recovery_payload(20))
+            m._test_acquire_marker(20, recovery_payload(20))
                 .await
                 .expect("recovery");
             assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
@@ -954,7 +1029,7 @@ mod tests {
     fn recovery_marker_survives_while_its_executor_is_online() {
         run(async {
             let m = AutumnManager::new();
-            m.acquire_extent_inflight(20, recovery_payload(20))
+            m._test_acquire_marker(20, recovery_payload(20))
                 .await
                 .expect("recovery");
             // Register node 9 and drive it to Online the way a heartbeat does.
@@ -1031,7 +1106,7 @@ mod tests {
                         ..Default::default()
                     },
                 );
-                m.acquire_extent_inflight(20, recovery_payload(20))
+                m._test_acquire_marker(20, recovery_payload(20))
                     .await
                     .unwrap();
                 m.reseed_recovery_limiter();
@@ -1050,7 +1125,7 @@ mod tests {
                 assert_eq!(lim.global_inflight, 0);
                 assert_eq!(lim.snapshot(), (vec![], vec![]));
             }
-            m.acquire_extent_inflight(20, recovery_payload(20))
+            m._test_acquire_marker(20, recovery_payload(20))
                 .await
                 .unwrap();
             m.faulted_disks.borrow_mut().insert(10);
@@ -1184,7 +1259,7 @@ mod tests {
                     ..Default::default()
                 },
             );
-            m.acquire_extent_inflight(20, recovery_payload(20))
+            m._test_acquire_marker(20, recovery_payload(20))
                 .await
                 .unwrap();
             assert!(
@@ -1276,7 +1351,15 @@ mod tests {
                     ..Default::default()
                 },
             );
-            m.acquire_extent_inflight(20, recovery_payload(20))
+            m.store.inner.borrow_mut().disks.insert(
+                90,
+                crate::persist::records::DiskRecord {
+                    disk_id: 90,
+                    online: true,
+                    ..Default::default()
+                },
+            );
+            m._test_acquire_marker(20, recovery_payload(20))
                 .await
                 .unwrap();
 
@@ -1311,7 +1394,7 @@ mod tests {
             m.acquire_extent_inflight(10, ec_payload(10))
                 .await
                 .expect("ec");
-            m.acquire_extent_inflight(20, recovery_payload(20))
+            m._test_acquire_marker(20, recovery_payload(20))
                 .await
                 .expect("recovery");
             m.acquire_extent_inflight(30, delete_payload(30))

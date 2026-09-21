@@ -21,19 +21,6 @@
 - `passes: false`
 - **notes** (2026-09-20): 已实现逐次 want 精确长度校验和 punch 前 sealed_length/carry 双重校验；5 条 GC streaming 单测通过，新增完整 record 边界及 offset=0 提前 EOF 回归。尚未完成真实双副本截短、checksum 两种状态及 PS 硬重启组合验收，不能按完整 R1 验收关闭。
 
-### F-REVIEW-R2-RECOVERY-ATTEMPT — P1 Recovery attempt ABA
-- **Trigger**: review.md R2；相同 target/replace 的旧完成可命中新 marker。
-- **Scope**: nonce 贯穿持久化 marker、请求、EN 去重和完成；固定源 eversion、slot、payload layout。
-- **Acceptance**: 同 assignment 的 A/B 重派、复制转 EC、目标重启后 A 均不得 apply 或删除 B。
-- `passes: false`
-- **notes** (2026-09-20): 尚未修改。需与 R4/R5 一起设计 attempt 的持久化及提交契约；RecoveryTask 被持久化 marker 直接引用，不能仅加 wire 字段而忽略旧 marker 解码兼容。
-
-### F-REVIEW-R4-REMOVE-RECOVERY — P1 退役与 Recovery 目标协调
-- **Trigger**: review.md R4；Remove 漏查 Recovery target，晚到 done 可复活已删除节点引用。
-- **Scope**: Remove blocker 覆盖 Recovery；取消 fenced target；dispatch/apply/remove 共享串行化或事务条件，校验节点和磁盘身份。
-- **Acceptance**: Fence/Remove 与已接收 done 两种顺序均无 tombstone node/disk 引用。
-- `passes: false`
-
 ### F-REVIEW-R6-FENCE-CAPACITY — P2 Fence placement 与容量预检
 - **Trigger**: review.md R6；non-force 在没有合法 spare 时仍成功，1.2 倍容量承诺未实现。
 - **Scope**: 按 Recovery placement 排除 occupied/不可用节点；按副本或 shard 字节与实际 headroom 预留容量，缺失容量信号保守失败。
