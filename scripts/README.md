@@ -56,3 +56,16 @@ cargo test -p autumn-manager --test recovery_attempt --test system_extent_recove
 ~~~
 
 包含真实 etcd 的 marker/snapshot 同事务、重放及相同 assignment 重派，以及目标 runtime 真正退出并重启后拒绝旧请求。manager 库内的 recovery_attempt 测试覆盖 Fence/Remove 两种提交顺序和取消失败 blocker。Linux 全目标/FUSE 检查仍需对应系统依赖。
+
+macOS 本地编译需要 macFUSE 的库/头文件和 pkg-config 工具。安装 macFUSE 本身
+不提供 pkg-config；缺少该命令时可安装 Homebrew 的 pkgconf。验证及编译入口：
+
+~~~sh
+pkg-config --modversion fuse
+pkg-config --libs --cflags fuse
+cargo check --workspace --lib --bins --tests --features autumn-manager/fuse-tests
+cargo test -p autumn-fuse --lib
+~~~
+
+macFUSE 的 fuse.pc 默认位于 /usr/local/lib/pkgconfig，Homebrew pkgconf 的默认
+搜索路径包含该目录。以上命令不运行真实内核挂载，也不包含 Linux 专用 benchmarks。
