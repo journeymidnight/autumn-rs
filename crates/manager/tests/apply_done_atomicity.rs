@@ -69,7 +69,9 @@ fn apply_ec_conversion_done_atomic_success() {
         // Pre-populate the in-memory extent. `apply_ec_conversion_done`
         // reads from in-memory and writes the updated copy to etcd.
         let extent_id: u64 = 4209;
-        m._test_seed_extent(extent_id, make_pre_ec_extent(extent_id));
+        m._test_seed_persisted_extent(extent_id, make_pre_ec_extent(extent_id))
+            .await
+            .expect("seed extent");
 
         // Acquire the ConvertToEc marker — this writes
         // `extent_inflight/<id>` to etcd under the leader fence.
@@ -139,7 +141,19 @@ fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
             .expect("manager with etcd");
 
         let extent_id: u64 = 4210;
-        m._test_seed_extent(extent_id, make_pre_ec_extent(extent_id));
+        m._test_seed_persisted_extent(extent_id, make_pre_ec_extent(extent_id))
+            .await
+            .expect("seed extent");
+        let aux = autumn_etcd::EtcdClient::connect(&etcd_endpoint)
+            .await
+            .expect("aux etcd client");
+        let baseline_extent = aux
+            .get(format!("extents/{extent_id}"))
+            .await
+            .expect("read baseline extent")
+            .kvs[0]
+            .value
+            .clone();
 
         m.acquire_extent_inflight(
             extent_id,
@@ -151,9 +165,6 @@ fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
         // Externally depose M1 — overwrite the leader key with a different
         // instance_id. Leader fence on the next etcd write txn (from M1)
         // will fail; the whole apply txn must atomically reject.
-        let aux = autumn_etcd::EtcdClient::connect(&etcd_endpoint)
-            .await
-            .expect("aux etcd client");
         let _ = aux.delete(LEADER_KEY.as_bytes()).await;
         aux.put(LEADER_KEY.as_bytes(), b"impostor-leader")
             .await
@@ -182,18 +193,76 @@ fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
             "I3: marker must survive a fence-rejected apply (atomicity)"
         );
 
-        // `extents/<id>` was never written (no pre-test put on this
-        // extent), so the failed apply must not have created it.
+        // The seeded pre-EC extent must remain byte-for-byte unchanged.
         let post_extent = aux
             .get(format!("extents/{}", extent_id).as_bytes())
             .await
             .expect("get extents/<id>");
-        assert!(
-            !post_extent
-                .kvs
-                .iter()
-                .any(|kv| kv.key == format!("extents/{}", extent_id).into_bytes()),
-            "I3: extents/<id> must not be written when apply txn fence-fails"
+        assert_eq!(post_extent.kvs.len(), 1);
+        assert_eq!(
+            post_extent.kvs[0].value, baseline_extent,
+            "I3: extents/<id> must not change when apply txn fence-fails"
         );
+    });
+}
+
+#[test]
+#[ignore] // requires embedded etcd (go runtime)
+fn identical_reissued_marker_has_new_identity_and_rejects_old_apply() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (_etcd_guard, etcd_endpoint) = start_etcd().await;
+        let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()])
+            .await
+            .expect("manager with etcd");
+        let extent_id = 4211;
+        manager
+            ._test_seed_persisted_extent(extent_id, make_pre_ec_extent(extent_id))
+            .await
+            .expect("seed extent");
+        manager
+            .acquire_extent_inflight(
+                extent_id,
+                ExtentOpPayload::ConvertToEc(make_dispatch_record(extent_id)),
+            )
+            .await
+            .expect("acquire first marker");
+
+        let aux = autumn_etcd::EtcdClient::connect(&etcd_endpoint)
+            .await
+            .expect("aux etcd client");
+        let marker_key = extent_inflight_key(extent_id);
+        let first = aux.get(&marker_key).await.expect("read first marker");
+        assert_eq!(first.kvs.len(), 1);
+        let first_revision = first.kvs[0].mod_revision;
+        let identical_value = first.kvs[0].value.clone();
+
+        aux.delete(&marker_key).await.expect("release first marker");
+        aux.put(&marker_key, &identical_value)
+            .await
+            .expect("create byte-identical successor marker");
+        let successor = aux.get(&marker_key).await.expect("read successor marker");
+        assert_eq!(successor.kvs.len(), 1);
+        assert_ne!(
+            successor.kvs[0].mod_revision, first_revision,
+            "a byte-identical marker is still a different attempt"
+        );
+
+        let result = manager
+            .apply_ec_conversion_done(extent_id, vec![1, 3, 5, 7], vec![70], 3, 4)
+            .await;
+        assert!(result.is_err(), "the old apply must lose the marker revision CAS");
+
+        let marker_after = aux.get(&marker_key).await.expect("read marker after refusal");
+        assert_eq!(marker_after.kvs.len(), 1, "the successor marker was deleted");
+        assert_eq!(marker_after.kvs[0].value, identical_value);
+        let extent_after = aux
+            .get(format!("extents/{extent_id}"))
+            .await
+            .expect("read extent after refusal");
+        let extent = support::decode_persisted_extent(
+            &format!("extents/{extent_id}"),
+            &extent_after.kvs[0].value,
+        );
+        assert!(!extent.ec_converted, "the stale apply changed the extent");
     });
 }

@@ -43,6 +43,10 @@ let resp = keeper.keep_alive().await?;         // send one keepalive, get respon
 client.lease_revoke(grant.id).await?;          // revoke lease
 ```
 
+`Cmp::mod_revision(key, rev)` is the attempt-identity compare for keys that may
+be deleted and recreated with byte-identical values. `Cmp::value` alone cannot
+distinguish those two lifetimes.
+
 ## gRPC Framing
 
 Manual 5-byte frame: `[compress:0][length:4 BE]` + protobuf body.

@@ -3,6 +3,7 @@ pub mod authz;
 pub mod ec_abandon;
 mod extent_delete;
 pub mod extent_inflight;
+mod inflight_commit;
 mod extent_corrupt;
 mod op_log;
 mod placement;
@@ -5057,6 +5058,23 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .insert(extent_id, (&extent).into());
     }
 
+    /// Seed and persist one extent for integration tests that exercise an etcd
+    /// compare against `extents/<id>`.
+    #[doc(hidden)]
+    pub async fn _test_seed_persisted_extent(
+        &self,
+        extent_id: u64,
+        extent: MgrExtentInfo,
+    ) -> Result<(), AppError> {
+        let extent: ExtentRecord = (&extent).into();
+        self.store
+            .inner
+            .borrow_mut()
+            .extents
+            .insert(extent_id, extent.clone());
+        self.persist_extent(&extent).await
+    }
+
     // ── Etcd mirror helpers ────────────────────────────────────────────
 
     /// Build a `("<prefix>/<id>", persist::encode(record))` etcd txn entry.
@@ -10024,6 +10042,21 @@ mod tests {
                 ec_converted: false,
             };
             m.store.inner.borrow_mut().extents.insert(extent_id, pre);
+            m.acquire_extent_inflight(
+                extent_id,
+                crate::extent_inflight::ExtentOpPayload::ConvertToEc(
+                    MgrEcDispatchInflight {
+                        extent_id,
+                        target_nodes: vec![1, 3, 5, 7],
+                        extra_disk_ids: vec![70],
+                        data_shards: 3,
+                        new_eversion: 4,
+                        owner_epoch: 0,
+                    },
+                ),
+            )
+            .await
+            .expect("acquire EC marker");
 
             // EC convert with K=3, M=1; coordinator picked node 7 / disk 70
             // as the new parity holder.

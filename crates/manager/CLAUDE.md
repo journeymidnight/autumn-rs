@@ -436,6 +436,17 @@ Invariants:
 - **I5** every extent-mutating handler calls `extent_inflight_op` before
   clone-for-decision (one helper, not five sets).
 
+Recovery and EC commits share `inflight_commit`: snapshot the marker before the
+first await, then compare both its persisted bytes and its etcd `mod_revision`
+in the same transaction as the extent value-CAS and marker delete. The bytes
+bind the assignment; the revision distinguishes a delete-and-recreate with
+identical bytes. After the await, the same identity is checked again before
+installing memory state, so a delayed response cannot release or overwrite a
+successor attempt. Marker-only release uses the same identity check. A failed
+durable Recovery cleanup keeps the in-memory marker; the standing-instruction
+tick recognizes stale layout again and retries without requiring a leader
+change.
+
 **Stale sweep** (`extent_inflight_stale_sweep_loop`): tick
 `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS` (default 60 s, floor 1); stale threshold
 `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS` (default 600 s, floor 60). `started_at`
@@ -469,12 +480,15 @@ self-healing without a TTL: the EN loses its in-memory `recovery_inflight`, the
 next re-send simply starts it again, and every EN answer is idempotent by
 contract (already-running → `CODE_OK`; complete local copy → re-report done;
 incomplete residue → discard + rebuild — see `crates/stream/CLAUDE.md`).
-**Release is EVENT-driven, at exactly three points:** `apply_recovery_done` (the
+**Release is EVENT-driven:** `apply_recovery_done` (the
 work finished), `release_recovery_markers_for_dead_executors` (level-triggered
 each tick — the pinned node is gone from `s.nodes` or no longer Online → drop the
 marker so re-derivation picks a live target), and
 `release_recovery_markers_for_healthy_slots` (level-triggered each tick — the
-SOURCE slot no longer needs rebuilding at all). **There is deliberately NO
+SOURCE slot no longer needs rebuilding at all). The standing-instruction tick
+also retires a marker whose extent disappeared, source slot was replaced, or
+target became a member at another slot; this makes a failed durable cleanup
+self-retrying. **There is deliberately NO
 wall-clock TTL**: a timeout is indistinguishable from a slow-but-progressing
 rebuild, and releasing on one races the executor still writing the copy. Never
 re-introduce a TTL, and never drain a Recovery marker on a dispatch error.

@@ -64,7 +64,13 @@ impl AutumnManager {
         if record.kind() != Some(ExtentOpKind::ConvertToEc) {
             return false;
         }
-        let nonce = self.extent_inflight_nonce(extent_id);
+        let snapshot = match self.snapshot_inflight(extent_id, ExtentOpKind::ConvertToEc) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!(extent_id, %error, "cannot snapshot EC marker for release");
+                return false;
+            }
+        };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -78,47 +84,12 @@ impl AutumnManager {
         let key = advisory_key(extent_id);
         let marker_key = format!("{}{}", EXTENT_INFLIGHT_PREFIX, extent_id);
         let bytes = rkyv_encode(&advisory).to_vec();
-        if let Some(etcd) = &self.etcd {
-            let ops = vec![
-                Op::put(key.as_bytes(), &bytes),
-                Op::delete(marker_key.as_bytes()),
-            ];
-            match etcd
-                .txn_fenced(
-                    vec![autumn_etcd::Cmp::value(
-                        marker_key.as_bytes(),
-                        rkyv_encode(&record),
-                    )],
-                    ops,
-                    vec![],
-                )
-                .await
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    // The stored marker is not the bytes this leader holds, so
-                    // the compare can never pass and every caller — the fence
-                    // sweep, the repeated-failure give-up, the content-corrupt
-                    // release — will retry it forever. Memory only re-reads
-                    // etcd on promotion, so nothing resolves this on its own.
-                    // Say so: an unreleasable marker that logs nothing is the
-                    // silent-spin shape this whole area exists to remove.
-                    tracing::warn!(
-                        extent_id,
-                        coord_node_id,
-                        reason,
-                        "EC marker not abandoned: the persisted record differs from this \
-                         leader's; it stays held until a leader change re-reads etcd"
-                    );
-                    return false;
-                }
-                Err(e) => {
-                    tracing::warn!(extent_id, reason, error = %e, "failed to abandon inflight marker; will retry");
-                    return false;
-                }
-            }
-        }
-        if self.extent_inflight_nonce(extent_id) != nonce {
+        let ops = vec![
+            Op::put(key.as_bytes(), &bytes),
+            Op::delete(marker_key.as_bytes()),
+        ];
+        if let Err(error) = self.commit_inflight_txn(&snapshot, vec![], ops).await {
+            tracing::warn!(extent_id, reason, %error, "failed to abandon inflight marker; will retry");
             return false;
         }
         self.commit_extent_inflight_release(extent_id);

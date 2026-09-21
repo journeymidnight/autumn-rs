@@ -379,6 +379,18 @@ pub async fn watch_key_until_delete(endpoint: &str, key: &[u8]) -> Result<()> {
 pub struct Cmp;
 
 impl Cmp {
+    /// Compare a key's latest modification revision with an exact revision.
+    /// This distinguishes delete-and-recreate from an unchanged value.
+    pub fn mod_revision(key: impl AsRef<[u8]>, revision: i64) -> Compare {
+        Compare {
+            result: 0,
+            target: 2,
+            key: key.as_ref().to_vec(),
+            target_union: Some(TargetUnion::ModRevision(revision)),
+            ..Default::default()
+        }
+    }
+
     /// Compare create_revision of a key equals the given value (0 = key does not exist).
     pub fn create_revision(key: impl AsRef<[u8]>, rev: i64) -> Compare {
         Compare {
@@ -516,5 +528,15 @@ mod tests {
             normalize_endpoint("https://etcd.local:2379"),
             "etcd.local:2379"
         );
+    }
+
+    #[test]
+    fn mod_revision_compare_targets_the_exact_lifetime() {
+        let compare = Cmp::mod_revision(b"extent_inflight/7", 42);
+        assert_eq!(compare.target, 2);
+        assert!(matches!(
+            compare.target_union,
+            Some(TargetUnion::ModRevision(42))
+        ));
     }
 }

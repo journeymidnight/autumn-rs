@@ -473,6 +473,10 @@ impl AutumnManager {
             // Raced with a release — the next tick re-derives from scratch.
             return Ok(DispatchOutcome::Dispatched);
         };
+        if let Some(reason) = self.stale_recovery_reason(&task) {
+            self.retire_stale_recovery(&task, &reason).await?;
+            return Ok(DispatchOutcome::Dispatched);
+        }
         // Don't spend a timeout on a node the manager already knows is not
         // Online — a keep-alive to a corpse costs the whole dispatch tick, once
         // per pinned marker. Releasing such a marker is event-driven (the node
@@ -839,31 +843,59 @@ impl AutumnManager {
         ))
     }
 
-    /// best-effort Recovery inflight-marker release. Drops the etcd
-    /// `extent_inflight/<id>` marker and the in-memory marker. The etcd delete
-    /// is best-effort: a transient failure is WARN-logged, NOT propagated —
-    /// the in-memory marker is released regardless so the extent isn't blocked,
-    /// and the stale-marker sweep (~10 min ceiling) reclaims the etcd
-    /// marker. Propagating (`?`) would skip the in-memory release + each
-    /// caller's follow-up cleanup (e.g. the extent-removed branch's
-    /// `enqueue_pending_deletes`) — a worse regression than a transient
-    /// recovery-cleanup retry that is already backstopped by the sweep +
-    /// node-startup reconcile. (Dedups the 3 byte-identical release blocks in
-    /// `apply_recovery_done`'s ec-inflight / slot-gone / extent-removed paths.)
-    async fn release_recovery_marker_best_effort(&self, extent_id: u64) {
-        if let Some(etcd) = &self.etcd {
-            if let Err(e) = etcd
-                .put_and_delete_txn(Vec::new(), vec![Self::extent_inflight_key(extent_id)])
-                .await
-            {
-                tracing::warn!(
-                    extent_id,
-                    error = %e,
-                    "recovery inflight marker etcd-release failed; in-memory released, stale-marker sweep reclaims the etcd marker"
-                );
+    fn stale_recovery_reason(&self, task: &RecoveryTask) -> Option<String> {
+        let store = self.store.inner.borrow();
+        let Some(extent) = store.extents.get(&task.extent_id) else {
+            return Some(
+                "the extent was removed from manager state before the rebuild landed".into(),
+            );
+        };
+        let Some(slot) = Self::extent_slot(extent, task.replace_id) else {
+            return Some(format!(
+                "replace_id {} not in extent {}",
+                task.replace_id, task.extent_id
+            ));
+        };
+        Self::extent_nodes(extent)
+            .iter()
+            .enumerate()
+            .any(|(index, node_id)| index != slot && *node_id == task.node_id)
+            .then(|| format!(
+                "recovery target {} for extent {} already in extent node list at a different slot",
+                task.node_id, task.extent_id
+            ))
+    }
+
+    async fn retire_stale_recovery(
+        &self,
+        task: &RecoveryTask,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        let maybe_addr = {
+            let store = self.store.inner.borrow();
+            if store.extents.contains_key(&task.extent_id) {
+                None
+            } else {
+                store.nodes.get(&task.node_id).map(|node| {
+                    let base = Self::normalize_endpoint(&node.address);
+                    Self::shard_addr_for_extent(&base, &node.shard_ports, task.extent_id)
+                })
             }
+        };
+        self.drain_extent_inflight_marker(task.extent_id, reason)
+            .await?;
+        if let Some(addr) = maybe_addr {
+            self.enqueue_pending_deletes(vec![PendingDelete {
+                extent_id: task.extent_id,
+                pending_targets: vec![crate::extent_delete::DeleteTarget {
+                    addr,
+                    node_uuid: String::new(),
+                }],
+                attempts: 0,
+            }])
+            .await?;
         }
-        self.commit_extent_inflight_release(extent_id);
+        Ok(())
     }
 
     /// Drive this extent's recovery ledger entry to a terminal FAILED state.
@@ -935,14 +967,11 @@ impl AutumnManager {
         // and NOT re-delivered — the "retry next tick" the old comment
         // promised does not happen. Convergence is via the dispatch loop
         // re-evaluating the now-EC'd extent's per-slot health and re-recovering
-        // any genuinely-missing shard. (An older comment here credited the
-        // stale-marker sweep with releasing the kept marker on a ~10 min
-        // ceiling; that sweep no longer touches Recovery markers at all —
-        // release is event-driven now — so it was describing a mechanism that
-        // had been deleted.) A manager-side completion-retry queue would converge
-        // faster but is a new mechanism in a revert-prone path — deferred
-        // until the slow-convergence is reproduced as real harm (stale-marker
-        // sweep + orphan-reconcile backstop correctness today).
+        // any genuinely-missing shard. Recovery markers are standing
+        // instructions: the dispatch loop re-sends a valid marker and retries
+        // cleanup of a marker whose layout became stale. A manager-side
+        // completion-retry queue would converge faster but is deferred until
+        // the slow-convergence is reproduced as real harm.
         // reads the unified ledger via `extent_inflight_op`.
         if matches!(
             self.extent_inflight_op(task.extent_id),
@@ -1109,54 +1138,24 @@ impl AutumnManager {
         // Discard the stale task (memory + etcd) so the dedup check in
         // `dispatch_recovery_task` doesn't permanently block future
         // attempts to repair this slot.
-        let layout_changed = {
-            let s = self.store.inner.borrow();
-            match s.extents.get(&task.extent_id) {
-                Some(ex) => Self::extent_slot(ex, task.replace_id).map(|slot| {
-                    Self::extent_nodes(ex)
-                        .iter()
-                        .enumerate()
-                        .any(|(i, &id)| i != slot && id == task.node_id)
-                }),
-                None => Some(false),
-            }
-        };
-        if matches!(layout_changed, Some(true)) {
-            // release the Recovery marker so the dedup check in
-            // dispatch_recovery_task doesn't permanently block future
-            // attempts to repair this slot. Legacy `recoveryTasks/<id>`
-            // delete dropped (the backward-compat dual-key path lived in
-            // only).
-            self.release_recovery_marker_best_effort(task.extent_id)
-                .await;
-            let reason = format!(
-                "recovery target {} for extent {} already in extent node list at a different slot; \
-                 likely EC conversion completed during recovery — discarding stale apply",
-                task.node_id, task.extent_id
-            );
-            self.abandon_recovery_entry(task.extent_id, reason.clone());
-            return Err(AppError::Precondition(reason));
+        if let Some(reason) = self.stale_recovery_reason(task) {
+            let removed = !self
+                .store
+                .inner
+                .borrow()
+                .extents
+                .contains_key(&task.extent_id);
+            self.retire_stale_recovery(task, &reason).await?;
+            return if removed {
+                Ok(())
+            } else {
+                Err(AppError::Precondition(reason))
+            };
         }
-
-        // layout_changed == None ⇒ the extent exists but
-        // `task.replace_id` is no longer in any slot (extent_slot
-        // returned None above). This case previously fell through to
-        // the apply block where the inner `slot None` branch did
-        // `return Err(...)` from inside borrow_mut WITHOUT releasing
-        // the Recovery marker — violating invariant I3 (every
-        // acquire has a matching release). The marker survived until
-        // the stale-marker sweep (~10 min), blocking any other op on the extent
-        // for that window. Release now, then return.
-        if layout_changed.is_none() {
-            self.release_recovery_marker_best_effort(task.extent_id)
-                .await;
-            let reason = format!(
-                "replace_id {} not in extent {}",
-                task.replace_id, task.extent_id
-            );
-            self.abandon_recovery_entry(task.extent_id, reason.clone());
-            return Err(AppError::Precondition(reason));
-        }
+        let snapshot = self.snapshot_inflight(
+            task.extent_id,
+            crate::extent_inflight::ExtentOpKind::Recovery,
+        )?;
 
         // etcd-first: compute updated_extent from a clone under
         // read-only borrow. The borrow_mut block previously mutated
@@ -1167,15 +1166,14 @@ impl AutumnManager {
         // Replay rolled in-memory back later, but during the window other
         // mutating handlers could derive their snapshots from the
         // "fake-applied" state.
-        let updated_extent = {
+        let (updated_extent, baseline) = {
             let s = self.store.inner.borrow();
             match s.extents.get(&task.extent_id) {
                 Some(ex) => {
                     let slot = match Self::extent_slot(ex, task.replace_id) {
                         Some(v) => v,
-                        // Unreachable under single-threaded compio: the
-                        // layout_changed.is_none() branch above
-                        // already covered this. Kept as defense.
+                        // The stale-layout check above already covered this.
+                        // Kept as defense against a future refactor.
                         None => {
                             return Err(AppError::Precondition(format!(
                                 "replace_id {} not in extent {}",
@@ -1201,73 +1199,13 @@ impl AutumnManager {
                     }
                     new_ex.avali |= 1u32 << slot;
                     new_ex.eversion += 1;
-                    Some(new_ex)
+                    (new_ex, crate::persist::encode(ex))
                 }
-                None => None,
+                None => return Err(AppError::NotFound(format!("extent {}", task.extent_id))),
             }
         };
-
-        let Some(updated_extent) = updated_extent else {
-            // The extent was removed from manager state before recovery
-            // completed. Release the Recovery marker, then
-            // enqueue a targeted delete for the recovering node so the
-            // resurrected on-disk files are reaped promptly instead of
-            // waiting for the 5-minute orphan-reconcile sweep. Recovery
-            // release MUST happen before the Delete acquire because the
-            // ledger is exclusive-per-extent.
-            let maybe_addr: Option<String> = {
-                let s = self.store.inner.borrow();
-                s.nodes.get(&task.node_id).map(|n| {
-                    let base = Self::normalize_endpoint(&n.address);
-                    Self::shard_addr_for_extent(&base, &n.shard_ports, task.extent_id)
-                })
-            };
-            // Release Recovery (etcd + in-memory). The legacy-key delete
-            // entry was removed.
-            self.release_recovery_marker_best_effort(task.extent_id)
-                .await;
-            // Then enqueue Delete (best effort — extent_delete_loop will
-            // pick it up on next tick).
-            if let Some(addr) = maybe_addr {
-                let _ = self
-                    .enqueue_pending_deletes(vec![PendingDelete {
-                        extent_id: task.extent_id,
-                        pending_targets: vec![crate::extent_delete::DeleteTarget {
-                            addr,
-                            node_uuid: String::new(),
-                        }],
-                        attempts: 0,
-                    }])
-                    .await;
-            }
-            self.abandon_recovery_entry(
-                task.extent_id,
-                "the extent was removed from manager state before the rebuild landed".to_string(),
-            );
-            return Ok(());
-        };
-
-        if let Some(etcd) = &self.etcd {
-            // atomic put + delete txn. Releases the Recovery
-            // marker in the same txn that writes the updated extent
-            // state. Legacy `recoveryTasks/<id>` delete dropped.
-            let ex_payload = crate::persist::encode(&updated_extent);
-            etcd.put_and_delete_txn(
-                vec![(format!("extents/{}", updated_extent.extent_id), ex_payload)],
-                vec![Self::extent_inflight_key(updated_extent.extent_id)],
-            )
+        self.commit_inflight_extent(&snapshot, baseline, updated_extent.clone(), vec![])
             .await?;
-        }
-
-        // only AFTER etcd success do we apply to in-memory.
-        // (This was previously the borrow_mut block above; now the
-        // borrow_mut here is the sole in-memory write.)
-        {
-            let mut s = self.store.inner.borrow_mut();
-            s.extents
-                .insert(updated_extent.extent_id, updated_extent.clone());
-        }
-        self.commit_extent_inflight_release(updated_extent.extent_id);
         // The rebuilt slot holds fresh bytes copied from a healthy peer, so the
         // corrupt mark that scheduled this rebuild has been satisfied. Clearing
         // it also stops the slot from being force-dispatched every tick.
@@ -2140,12 +2078,10 @@ impl crate::AutumnManager {
                     // is delivered exactly once (the EN mem::take's it from
                     // recovery_done), so on ANY error this completion is gone —
                     // there is no immediate re-delivery. Convergence for the
-                    // kept-marker cases is via the stale-marker sweep +
-                    // re-dispatch (see the match arms). We surface the error so
+                    // kept-marker cases is via standing-instruction re-dispatch
+                    // (see the match arms). We surface the error so
                     // it is never silent; we deliberately do NOT add a
-                    // manager-side completion-retry queue (the stale-marker sweep
-                    // backstops correctness; the slow-convergence harm is bounded
-                    // and unreproduced — a reproduce-first follow-up).
+                    // manager-side completion-retry queue.
                     if let Err(e) = self.apply_recovery_done(done).await {
                         match e {
                             AppError::Precondition(_) => {
@@ -2153,12 +2089,11 @@ impl crate::AutumnManager {
                                 // gone) — marker released, completion correctly
                                 // dropped; OR EC-in-flight defer — marker kept,
                                 // completion dropped (the EN mem::take'd it once),
-                                // convergence via the stale-marker sweep + re-dispatch on the
-                                // EC'd extent. NOT an immediate completion-retry.
-                                tracing::trace!(error = %e, "apply_recovery_done deferred/stale (benign); converges via sweep / re-dispatch");
+                                // convergence via re-dispatch on the EC'd extent.
+                                tracing::trace!(error = %e, "apply_recovery_done deferred/stale (benign); converges via re-dispatch");
                             }
                             _ => {
-                                tracing::warn!(error = %e, "apply_recovery_done failed (etcd); inflight marker retained — converges via stale-marker sweep");
+                                tracing::warn!(error = %e, "apply_recovery_done failed (etcd); inflight marker retained for retry");
                             }
                         }
                     }
@@ -3112,11 +3047,7 @@ impl crate::AutumnManager {
             )
             .await
         {
-            Ok(()) => {
-                // apply's atomic put_and_delete_txn already removed the etcd
-                // marker; drop the in-memory shadow to match.
-                self.commit_extent_inflight_release(extent_id);
-            }
+            Ok(()) => {}
             Err(e) => {
                 // Leadership-retained apply failure: keep the marker so the
                 // next dispatch tick re-dispatches (idempotent).
@@ -3158,37 +3089,22 @@ impl crate::AutumnManager {
         let Some(record) = self.inflight.borrow().get(&extent_id).cloned() else {
             return Ok(());
         };
-        let kind = record.kind();
-        let nonce = self.extent_inflight_nonce(extent_id);
-        if let Some(etcd) = &self.etcd {
-            let key = Self::extent_inflight_key(extent_id);
-            if !etcd
-                .txn_fenced(
-                    vec![autumn_etcd::Cmp::value(
-                        key.as_bytes(),
-                        rkyv_encode(&record),
-                    )],
-                    vec![autumn_etcd::Op::delete(key.as_bytes())],
-                    vec![],
-                )
-                .await?
-            {
-                return Err(AppError::Precondition(
-                    "inflight marker changed during release".into(),
-                ));
-            }
-        }
-        if self.extent_inflight_nonce(extent_id) != nonce {
-            return Err(AppError::Precondition(
-                "inflight attempt changed during release".into(),
-            ));
-        }
+        let kind = record
+            .kind()
+            .ok_or_else(|| AppError::Precondition("invalid inflight kind".into()))?;
+        let snapshot = self.snapshot_inflight(extent_id, kind)?;
+        self.commit_inflight_txn(
+            &snapshot,
+            vec![],
+            vec![autumn_etcd::Op::delete(Self::extent_inflight_key(extent_id))],
+        )
+        .await?;
         self.commit_extent_inflight_release(extent_id);
         // Only after the marker is really gone — a failed drain above returns
         // early and leaves the entry RUNNING, which is then accurate.
         let (now_s, _) = Self::now_s_ms();
         match kind {
-            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc) => {
+            crate::extent_inflight::ExtentOpKind::ConvertToEc => {
                 self.ops.borrow_mut().complete_ec(
                     extent_id,
                     autumn_rpc::manager_rpc::OP_STATE_FAILED,
@@ -3197,14 +3113,14 @@ impl crate::AutumnManager {
                     now_s,
                 );
             }
-            Some(crate::extent_inflight::ExtentOpKind::Recovery) => {
+            crate::extent_inflight::ExtentOpKind::Recovery => {
                 self.ops.borrow_mut().abandon_recovery(
                     extent_id,
                     format!("recovery abandoned: {reason}"),
                     now_s,
                 );
             }
-            _ => {}
+            crate::extent_inflight::ExtentOpKind::Delete => {}
         }
         Ok(())
     }
@@ -3270,36 +3186,20 @@ impl crate::AutumnManager {
         // transaction: a location published separately from the layout it
         // belongs to would, for the width of the gap, send readers to a file
         // the layout does not yet say anyone holds.
-        if let Some(etcd) = &self.etcd {
-            let puts = vec![
-                (
-                    format!("extents/{}", extent_id),
-                    crate::persist::encode(&updated),
-                ),
-                (
-                    crate::extent_layout::extent_layout_key(extent_id),
-                    vec![PayloadLocation::InShardFile.as_byte()],
-                ),
-            ];
-            // Value-CAS against the snapshot the decision was made on. The
-            // per-extent inflight ledger already serialises stream-layer ops on
-            // this extent, so a concurrent mutation should be impossible —
-            // state that dependency rather than leaving it implicit, because
-            // the cost of being wrong is a recovery slot swap or a seal being
-            // clobbered by a flip computed from a stale clone.
-            etcd.put_delete_txn_cas(
-                puts,
-                vec![Self::extent_inflight_key(extent_id)],
-                vec![(format!("extents/{}", extent_id), baseline)],
-            )
-            .await?;
-        }
-
-        // only after etcd success do we apply to in-memory.
-        {
-            let mut s = self.store.inner.borrow_mut();
-            s.extents.insert(extent_id, updated);
-        }
+        let snapshot = self.snapshot_inflight(
+            extent_id,
+            crate::extent_inflight::ExtentOpKind::ConvertToEc,
+        )?;
+        self.commit_inflight_extent(
+            &snapshot,
+            baseline,
+            updated,
+            vec![autumn_etcd::Op::put(
+                crate::extent_layout::extent_layout_key(extent_id),
+                [PayloadLocation::InShardFile.as_byte()],
+            )],
+        )
+        .await?;
         self.commit_payload_location(extent_id, PayloadLocation::InShardFile);
 
         // Close any op-ledger EC-convert entry for this extent (authoritative —
@@ -4497,5 +4397,56 @@ mod df_disk_health_tests {
             !m.store.inner.borrow().disks[&11].online,
             "disk 11 was not in the second report and must keep its state"
         );
+    }
+}
+
+#[cfg(test)]
+mod recovery_cleanup_retry_tests {
+    use autumn_common::AppError;
+    use autumn_rpc::manager_rpc::RecoveryTask;
+
+    use crate::extent_inflight::{ExtentOpKind, ExtentOpPayload};
+    use crate::inflight_commit::tests::{arm, Stage};
+    use crate::AutumnManager;
+
+    #[test]
+    fn failed_stale_recovery_cleanup_keeps_marker_and_next_tick_retries() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new();
+            let extent_id = 9201;
+            let task = RecoveryTask {
+                extent_id,
+                replace_id: 3,
+                node_id: 9,
+                start_time: 1,
+            };
+            manager
+                .acquire_extent_inflight(extent_id, ExtentOpPayload::Recovery(task))
+                .await
+                .unwrap();
+
+            arm(Stage::BeforeTxn, || {
+                Err(AppError::Internal(
+                    "test-injected marker cleanup failure".into(),
+                ))
+            });
+            let first = manager.redispatch_pinned_recovery(extent_id).await;
+            assert!(first.is_err(), "the injected durable cleanup failure must surface");
+            assert_eq!(
+                manager.extent_inflight_op(extent_id),
+                Some(ExtentOpKind::Recovery),
+                "a failed durable delete must keep the in-memory marker"
+            );
+
+            manager
+                .redispatch_pinned_recovery(extent_id)
+                .await
+                .expect("the next tick retries cleanup");
+            assert_eq!(
+                manager.extent_inflight_op(extent_id),
+                None,
+                "cleanup must converge without a leader restart"
+            );
+        });
     }
 }

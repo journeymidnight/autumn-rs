@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-20
+**Last updated:** 2026-09-21
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -34,12 +34,6 @@
 - **Acceptance**: Fence/Remove 与已接收 done 两种顺序均无 tombstone node/disk 引用。
 - `passes: false`
 
-### F-REVIEW-R5-RECOVERY-CAS — P1 Recovery 提交锁定已验证状态
-- **Trigger**: review.md R5；leader fence 不防同 leader marker/extent 被替换。
-- **Scope**: apply 事务比较 marker identity 和 extent baseline；await 后按相同 identity 安装内存状态。
-- **Acceptance**: barrier 延迟 A 请求/响应，释放 A 创建 B 后，A 不覆盖 extent、不删除 B。
-- `passes: false`
-
 ### F-REVIEW-R6-FENCE-CAPACITY — P2 Fence placement 与容量预检
 - **Trigger**: review.md R6；non-force 在没有合法 spare 时仍成功，1.2 倍容量承诺未实现。
 - **Scope**: 按 Recovery placement 排除 occupied/不可用节点；按副本或 shard 字节与实际 headroom 预留容量，缺失容量信号保守失败。
@@ -63,12 +57,6 @@
 - **Trigger**: review.md 4.1；数值模型不足以证明正常 merge 丢失数据。
 - **Scope**: 复现 raw merge、checkpoint 失败、旧状态和 sealed-empty cursor 回收；按可达性决定修复。
 - **Acceptance**: 真实调用链固定时序及 ACK 数据验证，记录可达或不可达的证据。
-- `passes: false`
-
-### F-REVIEW-V2-MARKER-RELEASE — 待验证：Recovery 清理失败状态分裂
-- **Trigger**: review.md 4.2；etcd 删除失败仍清内存，而 stale sweep 不回收 Recovery。
-- **Scope**: 复现 stale-layout/extent-removed + 一次 etcd 错误；保留可重试且 identity 安全的 marker。
-- **Acceptance**: 删除失败后内存/etcd 一致，恢复后可重派，无需 leader 切换。
 - `passes: false`
 
 ### F-REVIEW-V3-COMPACT-CHECKPOINT — 待验证：checkpoint 失败后 GC 恢复链
