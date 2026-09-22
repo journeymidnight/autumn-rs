@@ -197,10 +197,3 @@ Details: [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md).
 ## License
 
 Apache-2.0 — see [`LICENSE`](LICENSE).
-
-
-### LanceDB over FUSE
-
-Community LanceDB works against an Autumn FUSE mount through its normal local
-filesystem backend; Autumn does not add a LanceDB-specific storage interface.
-See [the Python example](examples/lancedb/README.md) for setup and validation.

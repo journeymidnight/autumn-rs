@@ -4043,23 +4043,6 @@ bulk `get_extent` error arm: the test fails with `code: 4` and the flattened
 message.
 
 
-## LanceDB over FUSE validation
-
-Use the published community `lancedb` Python package. Build `autumn-fuse`, mount
-the `fs/` namespace at a dedicated path, and pass a directory inside that mount
-to `lancedb.connect`. No LanceDB fork or custom object-store provider is used.
-
-Run `examples/lancedb/fuse_demo.py` with a `file://` URI inside the mount. The
-script first checks the create-only hard-link operation used to publish Lance
-manifests: a destination collision must report `EEXIST`, and unlinking the
-source must preserve the destination. It then checks table creation, append,
-vector search, deletion, a concurrent reader/writer, and cleanup.
-
-Wait for every LanceDB process to exit before unmounting. Unmount only the
-task-owned mount path with `fusermount3 -u` on Linux or `umount` where
-appropriate. Full commands and the tested boundary are in
-`../examples/lancedb/README.md` and `lancedb_validation.md`.
-
 ## Recovery attempt and node retirement verification (wire 46)
 
 Stop all manager/PS/EN roles before upgrading from wire 45, then restart them

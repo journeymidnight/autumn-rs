@@ -1567,11 +1567,3 @@
   另:commit handler 消融红在 `200 vs 210`(丢一次 10 行 append,正是
   UnsafeCommitHandler 的特征),还原后复绿——同一二进制路径、同一集群、各自全新
   空 scope,唯一差异是 handler 选择那一行。
-
-### F-LANCEDB-FUSE-ONLY — 社区 LanceDB 经 Autumn FUSE 接入
-- **Decision** (2026-09-21): 移除 `autumn-object-store`、原生 provider、Rust demo
-  和 fork wheel 路径。仓库只保留社区 Python `lancedb` 经 `autumn-fuse` 挂载目录
-  访问的示例，避免在 Autumn 中维护 LanceDB 专用存储接口。
-- **Acceptance**: `fuse_demo.py` 检查 manifest 所需 hard-link create-only 语义，
-  并完成建表、追加、向量检索、删除、并发读写与清理。
-- **Status**: `passes: true`（沿用 2026-09-19 的真实 FUSE 验收结果）。
