@@ -706,5 +706,4 @@ This retains the filesystem's existing nontransactional namespace limitation:
 inode reference counts and directory entries are separate KV writes, and mutation
 serialization is per mount. A crash after the count update can leak a reference.
 It is suitable for the one-mount Lance demo; it does not establish crash-atomic
-or multi-mount namespace transactions. Native Lance metadata commits use the
-single-key object-store CAS and do not depend on this FUSE path.
+or multi-mount namespace transactions.

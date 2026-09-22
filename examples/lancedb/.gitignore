@@ -1,4 +1,2 @@
-# Root .gitignore anchors /target, so it does not reach here. This directory
-# holds two separate workspaces (the demo and provider/), each with its own
-# target/, and both are build output.
+.venv/
 target/

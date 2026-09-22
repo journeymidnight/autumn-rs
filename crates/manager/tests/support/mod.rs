@@ -1529,8 +1529,8 @@ pub const RECORD_TYPE_STREAM: u8 = 5;
 /// Check the envelope and hand back the rkyv body.
 ///
 /// Concrete rather than generic on purpose: expressing the rkyv bounds would
-/// name `rkyv::` here, and this file is `#[path]`-included by crates that do
-/// not depend on rkyv (`crates/object-store`). Two record types are ever read
+/// name `rkyv::` here, and this file is `#[path]`-included by test crates that
+/// do not necessarily depend on rkyv. Two record types are ever read
 /// this way from a test, so two thin wrappers cost less than that coupling.
 fn strip_persist_envelope<'a>(
     record_type: u8,

@@ -1505,7 +1505,8 @@
   writer+reader 并发不 EBUSY；object_store 路径——并发双 writer 提交不互相覆盖
   （CAS 生效，消融：改成 last-writer-wins 测试变红）；list 1000+ fragment 的
   scan 延迟有基准数字；与 S3 后端跑同一基准集对比吞吐/P99。
-- **Status**: `passes: true` (2026-09-19) — 原生/FUSE demo、CAS 消融、分页与 MinIO 对照已验证；最终 Linux 验收和临时服务清理完成。
+- **Status**: `retired` (2026-09-21) — 历史验收已完成；实现随后按产品决策删除，
+  LanceDB 统一走 FUSE。
 
 ### F-LANCEDB-PY-NATIVE — Python LanceDB 经 autumn:// provider 原生接入
 - **Trigger** (2026-09-20，用户): native 适配层已就绪后，Python 侧不应再依赖
@@ -1556,7 +1557,7 @@
 - **不在本条范围(补记)**: commit handler 的选择只覆盖 ListingDatabase 的
   create/open 两条路径。namespace 表(connect_namespace*、manifest_enabled)与
   clone_table 仍落到 lance 的 UnsafeCommitHandler——scheme 能解析,但提交不安全。
-- **Status**: `passes: true` (2026-09-20) — 四行验收已在 H200-1 的一次性 RF2
+- **Status**: `retired` (2026-09-21) — 以下为删除前的历史验收记录。四行验收曾在 H200-1 的一次性 RF2
   集群上跑通。(1) Python 原生:建表/追加/向量检索/删除/并发 reader+writer 全过,
   task root 下 `mount | grep -c` 为 0,证明不经 FUSE。(2) 两条 session 路径
   (默认与显式 `lancedb.Session()`)均通过。(3) 注册消融:未注册 scheme 报
@@ -1566,3 +1567,11 @@
   另:commit handler 消融红在 `200 vs 210`(丢一次 10 行 append,正是
   UnsafeCommitHandler 的特征),还原后复绿——同一二进制路径、同一集群、各自全新
   空 scope,唯一差异是 handler 选择那一行。
+
+### F-LANCEDB-FUSE-ONLY — 社区 LanceDB 经 Autumn FUSE 接入
+- **Decision** (2026-09-21): 移除 `autumn-object-store`、原生 provider、Rust demo
+  和 fork wheel 路径。仓库只保留社区 Python `lancedb` 经 `autumn-fuse` 挂载目录
+  访问的示例，避免在 Autumn 中维护 LanceDB 专用存储接口。
+- **Acceptance**: `fuse_demo.py` 检查 manifest 所需 hard-link create-only 语义，
+  并完成建表、追加、向量检索、删除、并发读写与清理。
+- **Status**: `passes: true`（沿用 2026-09-19 的真实 FUSE 验收结果）。

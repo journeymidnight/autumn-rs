@@ -510,4 +510,4 @@ ComparePutReq (wire 44). None requires absence; Some requires exact current-valu
 equality. Both expected and new values are limited to 64 KiB. False is a body-level
 conflict and is not retried as stale routing. Transport outcomes can be ambiguous:
 callers publishing UUID generations may read back their UUID to resolve a lost ACK.
-The object-store adapter uses this for metadata publication, never bulk payloads.
+FUSE uses this for create-only directory-entry publication, never bulk payloads.

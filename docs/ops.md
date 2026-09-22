@@ -4043,61 +4043,22 @@ bulk `get_extent` error arm: the test fails with `code: 4` and the flattened
 message.
 
 
-## LanceDB native object store and FUSE validation
+## LanceDB over FUSE validation
 
-Build every Autumn server and embedded client from the same revision: the
-compare-put protocol requires wire 44. Provision an existing namespace and give
-the object store a dedicated sub-prefix. Do not point it at FUSE's binary inode
-keyspace. The object-store payload layout is separate from the filesystem layout.
+Use the published community `lancedb` Python package. Build `autumn-fuse`, mount
+the `fs/` namespace at a dedicated path, and pass a directory inside that mount
+to `lancedb.connect`. No LanceDB fork or custom object-store provider is used.
 
-For automated real-service contract tests:
+Run `examples/lancedb/fuse_demo.py` with a `file://` URI inside the mount. The
+script first checks the create-only hard-link operation used to publish Lance
+manifests: a destination collision must report `EEXIST`, and unlinking the
+source must preserve the destination. It then checks table creation, append,
+vector search, deletion, a concurrent reader/writer, and cleanup.
 
-    cargo test -p autumn-object-store --test contract -- --nocapture --test-threads=1
-
-To run demos without touching another checkout or service, create a git bundle
-from the task branch, transfer it to a new remote directory, then git clone that
-bundle. Set CARGO_TARGET_DIR and TMPDIR to directories inside that task root.
-Do not use cluster.sh start/stop on a shared host: its fixed service ports and
-log locations can conflict with other work. Instead build and launch:
-
-    cargo build -p autumn-object-store --example test_cluster
-    "$CARGO_TARGET_DIR/debug/examples/test_cluster" "$TASK_ROOT/cluster.json"
-
-The example starts an RF2 cluster on dynamically selected loopback ports, stores
-its temporary data under TMPDIR, and writes its manager address and PID to the
-JSON file. Terminating that exact process stops its in-process services. Preserve
-the task's PID files and stop only those processes; do not pkill by binary name.
-
-Set AUTUMN_MANAGER to that JSON address and AUTUMN_OBJECT_SCOPE to an empty
-sub-prefix such as fs/objects/native-demo. Run the native demo and object bench
-as documented in ../examples/lancedb/README.md.
-
-For the Python path, build the wheel from the lancedb FORK (branch
-autumn-native): cd into its python/ and run maturin build --release. Install it
-into a venv and run ../examples/lancedb/native_py_demo.py against the same
-manager and scope. Run it TWICE — once plain, once with --with-session —
-because connect() without an explicit session builds its own, and that is a
-separate registration site. To verify the scheme is actually resolved rather
-than silently falling back, drop the provider registration and re-run: it must
-fail with "No object store provider found for scheme: 'autumn'". Verify the
-commit handler too, because its failure is silent: two processes appending to
-one table must produce a CommitConflict, and reverting to UnsafeCommitHandler
-must make that check fail. With this wheel no mount is involved, so leaving the
-FUSE mount unmounted is itself the proof that this path is native.
-
-For the UNPATCHED-wheel fallback, build the FUSE binary separately,
-mount this manager at a dedicated TASK_ROOT/mount, then run fuse_demo.py with
-file:// followed by that absolute mount path plus /lancedb. Unmount only that
-path with fusermount3 -u when finished. The hard-link test must report EEXIST on
-a destination collision and the destination must survive source unlink.
-
-ObjectStore deletes only remove metadata. To reclaim old payloads, stop EVERY
-reader and writer for that scope, drop outstanding GetResult streams, then call
-AutumnObjectStore::vacuum_quiescent(). This is not online garbage collection.
-Attributes and historical version reads return NotSupported. Native manifest
-concurrency uses ConditionalPutCommitHandler; do not select a last-writer-wins
-commit handler. See lancedb_validation.md for acceptance evidence and the limits
-of the initial debug-build/MinIO measurements.
+Wait for every LanceDB process to exit before unmounting. Unmount only the
+task-owned mount path with `fusermount3 -u` on Linux or `umount` where
+appropriate. Full commands and the tested boundary are in
+`../examples/lancedb/README.md` and `lancedb_validation.md`.
 
 ## Recovery attempt and node retirement verification (wire 46)
 

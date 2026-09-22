@@ -12,7 +12,6 @@ members = [
   "crates/transport/ucx-sys-mini",
   "crates/fuse",
   "crates/autumn-memory",
-  "crates/object-store",
   "examples/gallery",
   "examples/memory-mcp",
   "examples/dashboard",
@@ -29,7 +28,7 @@ default-members = [
   "crates/fuse",
   "crates/autumn-memory",
 ]
-exclude = ["python", "examples/lancedb"]
+exclude = ["python"]
 resolver = "2"
 
 [workspace.package]

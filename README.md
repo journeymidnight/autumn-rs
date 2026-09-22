@@ -199,13 +199,8 @@ Details: [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md).
 Apache-2.0 — see [`LICENSE`](LICENSE).
 
 
-### LanceDB storage backend
+### LanceDB over FUSE
 
-The Rust autumn-object-store crate implements Apache object_store for Autumn KV,
-including ranged reads, multipart uploads, paginated listing and atomic
-create/update for Lance manifests. LanceDB retains its query and vector-index
-implementation while Autumn provides distributed storage. See
-[the native LanceDB example](examples/lancedb/README.md) for connection setup,
-concurrent-writer verification and the FUSE demo. Object payload reclamation is
-currently offline; [validation results](docs/lancedb_validation.md) describe the
-supported boundary and measured baseline.
+Community LanceDB works against an Autumn FUSE mount through its normal local
+filesystem backend; Autumn does not add a LanceDB-specific storage interface.
+See [the Python example](examples/lancedb/README.md) for setup and validation.
