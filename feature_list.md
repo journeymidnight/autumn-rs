@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-21
+**Last updated:** 2026-09-23
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -1487,6 +1487,30 @@
   收益须超波动；正确性回归同 F-FUSE-BIG-IO-TUNING。
 - **Status**: `passes: false` (2026-09-16) — 未开工；可行性未证，passthrough 与
   非 POSIX 后端的适配形态是最大未知。
+- `passes: false`
+
+### F-LANCEDB-S3-GATEWAY — 补齐 LanceDB 所需的 S3 API
+- **Trigger** (2026-09-23，用户要求): `autumn-s3` 当前只提供 ListObjectsV2、GET 和 HEAD，
+  LanceDB 无法通过 `s3://` endpoint 建表和写表。目标是让现成的 LanceDB S3 客户端直接
+  读写 autumn，无须修改 LanceDB 或使用 FUSE。
+- **Scope**: 保留现有 `s3://<bucket>/<key>` 到 `fs/<bucket>/<key>` 的映射，补齐
+  LanceDB 实际使用的对象操作：PutObject（含 `If-None-Match: *`、`If-Match` 条件）、
+  DeleteObject、DeleteObjects 批量删除、CopyObject，以及大对象的
+  CreateMultipartUpload / UploadPart / CompleteMultipartUpload / AbortMultipartUpload；
+  完善现有 HeadObject、GetObject（Range 与条件读取）、ListObjectsV2 的兼容性，
+  并支持客户端实际发出的 bucket 存在性检查。以固定版本的 LanceDB/Lance 和其
+  S3 `object_store` 请求轨迹核对上述清单，发现缺项时补入同一 feature。
+  Multipart 分片完成前不可作为最终 key 可见；条件写入必须由底层原子比较操作保证，
+  不能用先 HEAD 后 PUT。错误响应、ETag、分页和 XML 需能被客户端解析。
+- **Boundary**: bucket 由 `fs/` 一级目录预先创建；本条不承诺 CreateBucket、ACL、
+  versioning、虚拟主机寻址或 SigV4 验签。网关维持现有鉴权模型；这些能力若实际被
+  固定版本的 LanceDB 调用，再按请求轨迹纳入范围，不以“理论上 S3 支持”扩张协议面。
+- **Acceptance**: 使用固定版本的 Python LanceDB 指向网关 endpoint，在预建 bucket 上
+  完成建表、追加、重开读取、向量检索、删除和 vacuum；小对象与超过单次 PUT 阈值的
+  数据文件均字节一致。两个独立写者并发提交同一张表时不得静默丢提交，冲突必须
+  通过条件写入反馈给 LanceDB；取消或失败的 multipart 不得发布不完整对象。
+  验证 DeleteObjects、CopyObject、分页 list、Range/条件 GET、缺失 key 与条件失败
+  的 SDK 可解析响应；网关重启后已完成对象仍可读，现有模型加载只读用例回归通过。
 - `passes: false`
 
 ### F-LANCEDB-OBJECT-STORE — autumn 作为 LanceDB 的原生 object_store 后端
