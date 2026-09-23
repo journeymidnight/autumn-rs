@@ -638,6 +638,54 @@ static EC_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
 static DIRECT_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Outcome of ONE attempt to serve a read from a redirect descriptor.
+enum DirectReadOutcome {
+    Value(bytes::Bytes),
+    /// Every replica refused fast with a layout-staleness refusal and no
+    /// liveness anomaly: the descriptor was built from a pre-EC-conversion
+    /// cached ExtentInfo. Healable — see `read_descriptor_with_stale_heal`.
+    StaleLayout,
+    Failed,
+}
+
+/// EN refusal text for `CODE_EVERSION_MISMATCH` (eversion bumped at the EC
+/// flip) / `CODE_PAYLOAD_NOT_HERE` (the pre-conversion `.dat` was reclaimed).
+/// Both are fast typed refusals, so healing them is cheaper than the proxy
+/// fallback. String-matched like the timeout classifier.
+fn is_stale_layout_refusal(msg: &str) -> bool {
+    msg.contains("eversion mismatch") || msg.contains("payload not in the named file")
+}
+
+#[cfg(test)]
+mod stale_layout_refusal_tests {
+    use super::is_stale_layout_refusal;
+
+    // The two EN refusal texts `read_extent_direct` stringifies from
+    // `code_description` — the exact messages the extent-713 shape produced.
+    #[test]
+    fn the_two_stale_refusals_match() {
+        assert!(is_stale_layout_refusal(
+            "direct read from 1.2.3.4:1 extent=713: code=6 (eversion mismatch (stale client cache))"
+        ));
+        assert!(is_stale_layout_refusal(
+            "direct read from 1.2.3.4:1 extent=713: code=7 (payload not in the named file on this node)"
+        ));
+    }
+
+    #[test]
+    fn everything_else_does_not() {
+        assert!(!is_stale_layout_refusal(
+            "direct read from 1.2.3.4:1 extent=713: operation timed out"
+        ));
+        assert!(!is_stale_layout_refusal(
+            "direct read from 1.2.3.4:1 extent=713: code=8 (content checksum failed)"
+        ));
+        assert!(!is_stale_layout_refusal(
+            "connect 1.2.3.4:1: connection refused"
+        ));
+    }
+}
+
 /// default in-flight concurrency for `get_many_into` (sliding-window pipeline
 /// over the per-partition multiplexed connections). Mirrors the stream worker's
 /// inflight cap; modest to dodge the UCX rendezvous cliff on large batches.
@@ -3069,12 +3117,78 @@ impl ClusterClient {
         if resp.extent_id == 0 {
             return Ok(Some(bytes::Bytes::from(resp.value)));
         }
-        if let Some(v) = self.read_from_descriptor(&resp).await {
+        if let Some(v) = self
+            .read_descriptor_with_stale_heal(&key_v, 0, 0, &resp)
+            .await
+        {
             return Ok(Some(v));
         }
         // All replicas failed → proxy fallback re-resolves through the PS
         // (fresh VP after GC rewrite / fresh eversion after EC conversion).
         Ok(self.get(key).await?.map(bytes::Bytes::from))
+    }
+
+    /// Serve a read from a redirect descriptor, healing the one known
+    /// descriptor-staleness mode. The PS's `extent_info_cache` is
+    /// pull-invalidated (the manager's EC flip writes etcd, notifies nobody),
+    /// so a PS that served the extent pre-flip hands out a stale replicated
+    /// descriptor until something makes it refetch. The proxy path heals
+    /// itself (`read_bytes_from_extent` refetches on `EversionStale`); this
+    /// gives the descriptor path the same cure, client-side:
+    /// 1-byte proxy probe (PS read path refetches as a side effect) → re-send
+    /// `MSG_GET_REDIRECT` once → direct read again. Any failure returns `None`
+    /// and the caller's proxy fallback runs as before. One heal per read.
+    async fn read_descriptor_with_stale_heal(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+        first: &GetRedirectResp,
+    ) -> Option<bytes::Bytes> {
+        match self.read_from_descriptor(first).await {
+            DirectReadOutcome::Value(v) => Some(v),
+            DirectReadOutcome::Failed => None,
+            DirectReadOutcome::StaleLayout => {
+                static HEAL_ANNOUNCED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !HEAL_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        extent_id = first.extent_id,
+                        "direct read hit a pre-EC-conversion cached descriptor; \
+                         healing with a 1-byte proxy probe + one re-redirect"
+                    );
+                } else {
+                    tracing::debug!(
+                        extent_id = first.extent_id,
+                        "stale descriptor; healing with a 1-byte proxy probe + one re-redirect"
+                    );
+                }
+                // Best-effort: the probe heals the PS cache as a side effect.
+                let mut probe = [0u8; 1];
+                let _ = self.get_range_into(key, offset, 1, &mut probe).await;
+                let key_v = self.binding.bind_key(key).ok()?;
+                let resp_bytes = self
+                    .call_ps_for_key(&key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
+                        rkyv_encode(&GetReq {
+                            part_id,
+                            key: key_v.clone(),
+                            offset,
+                            length,
+                            region_epoch,
+                        })
+                    })
+                    .await
+                    .ok()?;
+                let resp: GetRedirectResp = rkyv_decode(&resp_bytes).ok()?;
+                if resp.code != partition_rpc::CODE_OK || resp.extent_id == 0 {
+                    return None;
+                }
+                match self.read_from_descriptor(&resp).await {
+                    DirectReadOutcome::Value(v) => Some(v),
+                    _ => None,
+                }
+            }
+        }
     }
 
     /// Serve a read from whatever the descriptor turned out to describe.
@@ -3083,7 +3197,7 @@ impl ClusterClient {
     /// and differ only by `ec_data_shards`, so a call site that reached for the
     /// replicated reader directly would read shard bytes as a value. There are
     /// three such call sites and this is the only thing they should call.
-    async fn read_from_descriptor(&self, resp: &GetRedirectResp) -> Option<bytes::Bytes> {
+    async fn read_from_descriptor(&self, resp: &GetRedirectResp) -> DirectReadOutcome {
         if resp.ec_data_shards > 0 {
             return self.read_ec_shards(resp).await;
         }
@@ -3101,7 +3215,7 @@ impl ClusterClient {
     /// can. That is also why the descriptor is refused up front when a shard's
     /// node is Suspected: unlike a replicated read there is no second copy to
     /// rotate to, and finding that out via a timeout is the expensive way.
-    async fn read_ec_shards(&self, resp: &GetRedirectResp) -> Option<bytes::Bytes> {
+    async fn read_ec_shards(&self, resp: &GetRedirectResp) -> DirectReadOutcome {
         let Some(plan) = ec_shard_plan(
             resp.ec_sealed_length,
             resp.ec_data_shards,
@@ -3116,10 +3230,10 @@ impl ClusterClient {
                 len = resp.value_len,
                 "EC direct read: range not serviceable from data shards — proxying"
             );
-            return None;
+            return DirectReadOutcome::Failed;
         };
         if plan.is_empty() {
-            return Some(bytes::Bytes::new());
+            return DirectReadOutcome::Value(bytes::Bytes::new());
         }
         if resp.replica_addrs.len() < resp.ec_data_shards as usize {
             // Positional by shard index: a short list means some shard has no
@@ -3131,7 +3245,7 @@ impl ClusterClient {
                 "EC descriptor has fewer addresses than data shards — proxying \
                  (positional mapping cannot be trusted)"
             );
-            return None;
+            return DirectReadOutcome::Failed;
         }
         let futs = plan.iter().map(|&(shard, off, len)| async move {
             autumn_stream::read_extent_shard_direct(
@@ -3154,6 +3268,7 @@ impl ClusterClient {
                 // concatenated here would be silently wrong data, not an error.
                 Ok(b) => out.extend_from_slice(&b),
                 Err(e) => {
+                    let msg = format!("{e:#}");
                     // Loud once, then debug — the same shape as the replicated
                     // path's fallback warning, and for the same reason: falling
                     // back is correct but SLOW, and on an EC-armed cluster this
@@ -3176,7 +3291,10 @@ impl ClusterClient {
                             "EC direct read failed on a shard — falling back to the PS proxy"
                         );
                     }
-                    return None;
+                    if is_stale_layout_refusal(&msg) {
+                        return DirectReadOutcome::StaleLayout;
+                    }
+                    return DirectReadOutcome::Failed;
                 }
             }
         }
@@ -3198,28 +3316,31 @@ impl ClusterClient {
                 "EC direct read"
             );
         }
-        Some(out.freeze())
+        DirectReadOutcome::Value(out.freeze())
     }
 
     /// Shared EN-direct-read replica loop for `MSG_GET_REDIRECT` descriptors
     /// (`get_direct` + `get_many_direct`). Reads the exact
     /// byte range `[resp.value_offset, +resp.value_len)` from a replica, trying
     /// them in a `(extent, value_offset)`-rotated order with failover. Returns
-    /// `Some(value)` on the first success, or `None` when EVERY replica failed
-    /// (or there are none) so the caller can proxy-fall-back. Never a short read
+    /// `Value` on the first success; `StaleLayout` when every replica refused
+    /// fast with a layout-staleness refusal and no timeout (the healable
+    /// pre-EC-conversion descriptor); `Failed` otherwise so the caller can
+    /// proxy-fall-back. Never a short read
     /// (`read_extent_value_direct` treats `got < value_len` under CODE_OK as an
     /// error → next replica → proxy). Caller must have already handled the
     /// inline (`extent_id == 0`) case.
     async fn read_redirect_replicas(
         &self,
         resp: &GetRedirectResp,
-    ) -> Option<bytes::Bytes> {
+    ) -> DirectReadOutcome {
         let n = resp.replica_addrs.len();
         if n == 0 {
-            return None;
+            return DirectReadOutcome::Failed;
         }
         let start = (resp.extent_id ^ (resp.value_offset << 32)) as usize % n;
         let mut saw_timeout = false;
+        let mut saw_stale = false;
         // BUG-READ-TIMEOUT-STORM: damp the retry on LIVENESS TIMEOUTS. The
         // pre-fix loop walked ALL replicas at a fresh full (now size-scaled)
         // deadline on any failure, then the caller ran a full proxy read — so a
@@ -3243,7 +3364,7 @@ impl ClusterClient {
             )
             .await
             {
-                Ok(v) => return Some(v),
+                Ok(v) => return DirectReadOutcome::Value(v),
                 Err(e) => {
                     // A TIMEOUT is a liveness anomaly (dead endpoint /
                     // stuck peer) that silently costs the op the full RPC
@@ -3269,6 +3390,9 @@ impl ClusterClient {
                             break;
                         }
                     } else {
+                        if is_stale_layout_refusal(&msg) {
+                            saw_stale = true;
+                        }
                         tracing::debug!(
                             extent_id = resp.extent_id,
                             addr = %addr,
@@ -3311,7 +3435,11 @@ impl ClusterClient {
                 );
             }
         }
-        None
+        // ALL-stale (no timeout) is the healable pre-EC-conversion descriptor.
+        if saw_stale && !saw_timeout {
+            return DirectReadOutcome::StaleLayout;
+        }
+        DirectReadOutcome::Failed
     }
 
     /// read one key's sub-range `[offset, offset+length)`
@@ -3389,7 +3517,10 @@ impl ClusterClient {
             dest[..n].copy_from_slice(&v[..n]);
             return Ok(Some(v.len()));
         }
-        if let Some(v) = self.read_from_descriptor(&resp).await {
+        if let Some(v) = self
+            .read_descriptor_with_stale_heal(&key_v, offset, length, &resp)
+            .await
+        {
             let n = v.len().min(dest.len());
             dest[..n].copy_from_slice(&v[..n]);
             return Ok(Some(v.len()));
@@ -3563,7 +3694,10 @@ impl ClusterClient {
                 Ok(Some(v.len()))
             }
             RedirectItemAction::Descriptor => {
-                if let Some(v) = self.read_from_descriptor(resp).await {
+                if let Some(v) = self
+                    .read_descriptor_with_stale_heal(key, offset, length, resp)
+                    .await
+                {
                     let nn = v.len().min(dest.len());
                     dest[..nn].copy_from_slice(&v[..nn]);
                     return Ok(Some(v.len()));

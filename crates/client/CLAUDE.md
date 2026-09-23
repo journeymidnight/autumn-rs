@@ -1,5 +1,21 @@
 # autumn-client Crate Guide
 
+## Direct-read stale-descriptor heal
+
+`read_descriptor_with_stale_heal` wraps `read_from_descriptor` at all three
+descriptor call sites (`get_direct`, `get_range_direct_into`,
+`apply_redirect_desc`). The PS's `extent_info_cache` is pull-invalidated — the
+manager's EC layout flip writes etcd and notifies nobody — so a PS that served
+an extent before its EC conversion hands out a stale REPLICATED descriptor
+(3 `.dat` addrs, old eversion) until something makes it refetch; every EN then
+refuses the direct read in milliseconds and the read silently takes the slow
+proxy path. The heal classifies that shape (`DirectReadOutcome::StaleLayout`:
+all replicas refused fast with an eversion-mismatch / payload-not-here text,
+no timeout), runs a 1-byte proxy probe (the PS's own read path refetches on
+`EversionStale` as a side effect), re-sends `MSG_GET_REDIRECT` once, and reads
+direct again. Any failure returns `None` and the caller's proxy fallback runs
+as before — the redirect stays an optimization, never a correctness dependency.
+
 ## Batched direct-read descriptor concurrency
 
 `get_many_direct` submits partition descriptor requests through `fan_out_collect`
