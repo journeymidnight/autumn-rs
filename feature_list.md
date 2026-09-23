@@ -106,6 +106,12 @@
 - **notes**: 受控验证保留了 0.19 普通跑分和 0.18 诊断采样两份崩溃证据。后续重复成功不关闭该问题。
 - `passes: false`
 
+### F-DEAD-PEER-DETECT — 半开/假死对端让客户端读路径永久 wedge（fuse 每读必 EIO）
+- **Trigger** (2026-09-22, 线上 H3 视频采样故障定位): EC convert 期间网络抖动后，freetoken-l3/mm2 的 fuse 挂载数据读全部 30s 超时回 EIO、持续数小时不自愈；comfyui 挂载同病但数小时后自愈。现场证据（/proc/net/tcp）：连接全 EST、tx/rx queue=0、无重传——TCP 层健康，应用层会话死。PS 代理路径（PyO3 客户端）同区间秒读，数据本体完好；`extent-health --all` 181 extent 无一 unhealthy。根因链：(a) `RpcClient::is_closed()` 只在本端 read_loop 见到传输错误时置位，半开连接永远 false，`ConnPool::get_client` 每次放行死连接；(b) 读超时（本地 timer）虽归为 connection error 会 evict，但一次 evict 只清一条 addr，且 (c) read-pool worker 的 ClusterClient 终身复用（read_pool.rs 文件头明说），job 撞 `REPLY_TIMEOUT`(30s) 只回 EIO 不复位连接——每条读重新烧满 30s 再 EIO，无限循环。UCX 侧同病更重：`UCP_ERR_HANDLING_MODE_NONE` 主动禁用了 RC 死对端检测（endpoint.rs：PEER 模式在 rc_mlx5 高 fan-out 下误杀活 EP），无任何心跳，且 EP Drop 故意不 close（NONE 下 FORCE 被拒、FLUSH 死锁），evict 后底层 EP 活到进程退出。业界同款：Ceph rbd 2026-07 修的 #76202（OSD 用户态 wedge、TCP 健康、rbd 永久 D-state，Cloudflare 提交），修法即应用层 ping watchdog；gRPC A18、TiKV、Cloudflare 均以应用层/短周期探测替代内核 2h keepalive 默认。
+- **Scope**: 修改落点在 rpc 层，受益者是全仓库 5 处独立连接池（它们都建在同一传输上）：(1) `stream::ConnPool`（StreamClient PS→EN、ClusterClient 的 en_pool 直读、read-pool worker）；(2) `ClusterClient` 的 `ps_conns`/`mgr_conn`（所有 SDK 客户端）；(3) manager 自带的 `RpcConn`/`ConnPool`（manager→EN：df/recovery/EC-convert 派发——本次故障的触发面，手写 frame 循环不走 RpcClient，需单独接）；(4) fuse read-pool worker 的 ClusterClient（终身复用，wedge 不自愈的直接元凶）；(5) etcd（h2c/tonic 自带 keepalive，不动）。具体：(a) rpc 层新增传输无关的应用层 ping：新 msg_type，client 周期性 echo，deadline 内无响应 → 标记连接死亡 + evict + 下次重连；server 侧事件循环顺带回答（不新增线程）；RpcClient 上的存活标记接口让 (1)(2)(4) 共享同一套逻辑。(b) read-pool worker 撞 `REPLY_TIMEOUT` 时 evict 该 worker 池内全部数据面连接（不只回 EIO）。(c) manager 的 RpcConn 接入同一 ping。明确不做：TCP socket option 调优（被 ping 覆盖且更弱）、UCX PEER 模式重评（独立高风险，见 endpoint.rs 误杀记录，留给 baremetal UCX 上线前的独立 feature）。
+- **Acceptance**: (a) 故障注入：SIGSTOP 一个 EN 进程（TCP 健康、用户态死）后，fuse 读在 ping 周期 + 重连时间内恢复（非 30s×∞ EIO），SIGCONT 后数据读回字节正确；(b) 消融：去掉 ping watchdog 或 worker-evict，(a) 变红（永久 EIO）；(c) TCP 与 UCX 两种传输下 (a) 都成立；(d) 正常负载下 ping 开销可忽略（记录 QPS/带宽/CPU 代价）；(e) 长跑无误杀：24h 稳态跑 ping 不 evict 健康连接。
+- `passes: false`
+
 > **这个账本只记 autumn-rs 自己的东西。** 下游怎么被 autumn 的改动影响（例如一次 wire
 > 版本变更要求哪些内嵌客户端重建）算 autumn 的后果，该记；下游自己的缺陷、进展和上线
 > 状态不算，记在它们各自的仓库里。
