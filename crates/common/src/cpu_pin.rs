@@ -106,6 +106,9 @@ fn available_cpu_cores() -> &'static [usize] {
         if let Some(over) = CPU_SET_OVERRIDE.get() {
             return over.clone();
         }
+        if !PLATFORM_PINS {
+            return Vec::new();
+        }
         let mut v: Vec<usize> = core_affinity::get_core_ids()
             .map(|ids| ids.into_iter().map(|c| c.id).collect())
             .unwrap_or_default();
@@ -113,6 +116,19 @@ fn available_cpu_cores() -> &'static [usize] {
         v
     })
 }
+
+/// Whether this OS can bind a thread to one core. macOS cannot: it has only
+/// affinity hints, `core_affinity::set_for_current` always fails there, yet
+/// `get_core_ids` still reports every core. Auto-detection therefore finds
+/// nothing to pin to on such a platform, which is what "no affinity support"
+/// means for every caller. An explicit `--cpuset` is still honoured and fails
+/// loudly, since the operator asked for it.
+const PLATFORM_PINS: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "windows",
+    target_os = "freebsd"
+));
 
 /// number of cores available for pinning in the resolved cpuset.
 /// Used by PS for partition-budget gating and by EN for default shard

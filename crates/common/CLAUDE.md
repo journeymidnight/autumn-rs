@@ -14,6 +14,13 @@ P-sst thread spawned by a pinned P-log inherits that single-core mask; compio
 leaves P-sst on P-log's CPU. The direct set still respects OS/cgroup limits. A
 Linux regression spawns from CPU A and verifies the child actually runs on B.
 
+Auto-detection pins only where the OS can bind a thread to a core (Linux,
+Android, Windows, FreeBSD). macOS has affinity hints only: `get_core_ids`
+lists every core but `set_for_current` always fails, so once a failed pin
+became fatal a PS on macOS could open no partition at all. There the detected
+set is empty — nothing pinned, one EN shard — and an explicit `--cpuset`
+still fails loudly because the operator asked for it.
+
 ### `metrics.rs` — Shared Performance Measurement Helpers
 
 Standardized helpers for periodic performance reporting across all crates. All latency fields use milliseconds (`_ms`).
