@@ -274,6 +274,8 @@ pub fn is_client_surface_ps_msg(msg_type: u8) -> bool {
             | MSG_GET_REDIRECT
             | MSG_GET_REDIRECT_MANY
             | MSG_AUTH_HELLO
+            | MSG_COMPARE_PUT
+            | MSG_COMPARE_WRITE
     )
 }
 
@@ -537,6 +539,8 @@ mod tests {
             partition_rpc::MSG_GET_REDIRECT,
             partition_rpc::MSG_GET_REDIRECT_MANY,
             partition_rpc::MSG_AUTH_HELLO,
+            partition_rpc::MSG_COMPARE_PUT,
+            partition_rpc::MSG_COMPARE_WRITE,
         ] {
             assert!(is_client_surface_ps_msg(m), "ps msg {m:#x}");
         }

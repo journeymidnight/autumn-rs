@@ -74,6 +74,10 @@ pub enum AutumnError {
     /// which is the entire point of the refusal and is lost if it gets
     /// flattened into a connection error.
     WireVersionRefused(String),
+    /// The cluster this client negotiated with is too old to serve the
+    /// requested operation (it has no handler for the opcode). TERMINAL until
+    /// the cluster is upgraded.
+    Unsupported(String),
 }
 
 impl std::fmt::Display for AutumnError {
@@ -83,6 +87,7 @@ impl std::fmt::Display for AutumnError {
             AutumnError::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
             AutumnError::NamespaceUnknown(msg) => write!(f, "namespace unknown: {msg}"),
             AutumnError::WireVersionRefused(msg) => write!(f, "{msg}"),
+            AutumnError::Unsupported(msg) => write!(f, "unsupported by this cluster: {msg}"),
             AutumnError::Fenced(msg) => write!(f, "write fenced (lease revoked): {msg}"),
             AutumnError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             AutumnError::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
@@ -2749,6 +2754,52 @@ impl ClusterClient {
             rkyv_encode(&partition_rpc::ComparePutReq {
                 part_id, region_epoch, key: key.clone(),
                 expected: expected.map(<[u8]>::to_vec), value: value.to_vec(),
+            })
+        }).await?;
+        let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;
+        if response.code == partition_rpc::CODE_PRECONDITION { return Ok(false); }
+        check_ps_code(response.code, &response.message)?;
+        Ok(true)
+    }
+
+    /// Fenced conditional write: when the key's visible value equals
+    /// `expected` (`None` = absent), write `value` (`None` = delete it).
+    /// `Ok(false)` = the expectation did not hold and nothing was written.
+    ///
+    /// A non-anonymous `lease` is fence-checked BEFORE the comparison and a
+    /// raised floor is made durable even when the comparison fails, so a call
+    /// whose expectation cannot hold is a pure floor bump for the key's
+    /// partition. A stale epoch returns `AutumnError::Fenced`.
+    ///
+    /// As with `compare_put`, an RPC error can leave the outcome ambiguous;
+    /// callers that retry need a value unique to their attempt to tell their
+    /// own success from someone else's.
+    pub async fn compare_write(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        value: Option<&[u8]>,
+        lease: WriteLease,
+    ) -> std::result::Result<bool, AutumnError> {
+        let negotiated = self.negotiated_cluster_wire.get();
+        if negotiated < autumn_rpc::WIRE_VERSION_WITH_COMPARE_WRITE {
+            return Err(AutumnError::Unsupported(format!(
+                "compare_write needs cluster wire >= {}, negotiated {negotiated}",
+                autumn_rpc::WIRE_VERSION_WITH_COMPARE_WRITE
+            )));
+        }
+        let cap = partition_rpc::MAX_COMPARE_PUT_BYTES;
+        if value.is_some_and(|v| v.len() > cap) || expected.is_some_and(|v| v.len() > cap) {
+            return Err(AutumnError::InvalidArgument(format!(
+                "compare_write values exceed {cap} bytes"
+            )));
+        }
+        let key = self.binding.bind_key(key)?;
+        let response = self.call_ps_for_key(&key, partition_rpc::MSG_COMPARE_WRITE, |part_id, region_epoch| {
+            rkyv_encode(&partition_rpc::CompareWriteReq {
+                part_id, region_epoch, key: key.clone(),
+                expected: expected.map(<[u8]>::to_vec), value: value.map(<[u8]>::to_vec),
+                inode_hint: lease.inode_hint, lease_epoch: lease.lease_epoch,
             })
         }).await?;
         let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;

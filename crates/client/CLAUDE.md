@@ -527,3 +527,9 @@ equality. Both expected and new values are limited to 64 KiB. False is a body-le
 conflict and is not retried as stale routing. Transport outcomes can be ambiguous:
 callers publishing UUID generations may read back their UUID to resolve a lost ACK.
 FUSE uses this for create-only directory-entry publication, never bulk payloads.
+
+compare_write(key, expected, value, lease) is the fenced form (wire 47): `value`
+None deletes, a non-anonymous lease is fence-checked before the comparison, and
+a raised floor persists even when the comparison fails. Refused client-side with
+`AutumnError::Unsupported` when the negotiated cluster wire is below
+`WIRE_VERSION_WITH_COMPARE_WRITE`; the S3 gateway's publication path needs it.

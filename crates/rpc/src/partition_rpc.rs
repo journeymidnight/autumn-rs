@@ -235,6 +235,18 @@ pub const MSG_BATCH_DELETE: u8 = 0x5C;
 pub const MSG_COMPARE_PUT: u8 = 0x5D;
 pub const MAX_COMPARE_PUT_BYTES: usize = 64 * 1024;
 
+/// Fenced compare-and-write: `MSG_COMPARE_PUT` plus a conditional DELETE and a
+/// lease fence. Serialized through the partition write actor like its sibling.
+///
+/// The fence is checked before the comparison and a raised floor is persisted
+/// even when the comparison then fails. That makes the op usable as a pure
+/// floor bump: a recovering owner that takes over a dead one's lease sends it
+/// with its newer epoch and an expectation that cannot match, and from then on
+/// the dead owner's late writes to that partition are refused whatever their
+/// key. Sent only to a cluster negotiated at `WIRE_VERSION_WITH_COMPARE_WRITE`
+/// or later; an older partition server has no handler for it.
+pub const MSG_COMPARE_WRITE: u8 = 0x5E;
+
 /// One op inside a `BatchDeleteReq`. Carries its own fence identity because a
 /// batch may span inodes (a directory unlink walks many), exactly as
 /// `BatchPutOp` does.
@@ -734,6 +746,23 @@ pub struct ComparePutReq {
     pub value: Vec<u8>,
 }
 
+/// `MSG_COMPARE_WRITE` request. Replied with `PutResp`: `CODE_OK` when the
+/// write was applied, `CODE_PRECONDITION` when `expected` did not hold,
+/// `CODE_FENCED` when the stamped epoch is below the partition's floor.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct CompareWriteReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub key: Vec<u8>,
+    /// None requires absence, Some requires exact visible-value equality.
+    pub expected: Option<Vec<u8>>,
+    /// Some writes this value; None deletes the key.
+    pub value: Option<Vec<u8>>,
+    /// Fence identity, as in `PutReq`. 0 = anonymous (no fence check).
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
+}
+
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PutResp {
     pub code: u8,
@@ -1065,6 +1094,9 @@ pub struct TableLocations {
 pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
     match msg_type {
         MSG_COMPARE_PUT => rkyv_decode::<ComparePutReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_COMPARE_WRITE => rkyv_decode::<CompareWriteReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
         MSG_PUT => rkyv_decode::<PutReq>(payload)

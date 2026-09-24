@@ -462,7 +462,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **45**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **47**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -488,8 +488,9 @@ is routine rather than exotic — images are built from `main`, so a wheel often
 ahead of a cluster nobody has upgraded yet. The refusal says which way round it is,
 because the fix differs (deploy the cluster vs rebuild the client).
 
-**The window is OPEN: `[43, 45]`.** It was opened by raising the CEILING at
-44, and widened again at 45 when `MSG_GET_CLIENT_REGIONS` arrived.
+**The window is OPEN: `[43, 47]`.** It was opened by raising the CEILING at
+44, and widened again at 45 when `MSG_GET_CLIENT_REGIONS` arrived and at 47 when
+`MSG_COMPARE_WRITE` did (46 moved only cluster-internal forms).
 
 Lowering the floor to 42 instead was implemented, verified green, and REVERTED — it is
 unsafe, and `FIRST_WIRE_VERSION_WITH_PEER_EQUALITY` is the rule that came out of it.
@@ -804,6 +805,16 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## Fenced conditional write (wire 47)
+
+MSG_COMPARE_WRITE (0x5E) is MSG_COMPARE_PUT plus a conditional DELETE (`value:
+None`) and a fence identity (`inode_hint`, `lease_epoch`), replied with PutResp:
+CODE_OK applied, CODE_PRECONDITION comparison failed, CODE_FENCED stamped epoch
+below the partition's floor. A pure opcode addition, but the SDK needs a version
+to gate on — an older PS has no handler — so `WIRE_VERSION_WITH_COMPARE_WRITE` =
+47 and the client refuses to send it to a cluster negotiated below that
+(`AutumnError::Unsupported`). The client window stays [43, 47].
 
 ## Recovery attempt protocol (wire 46)
 

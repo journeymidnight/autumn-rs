@@ -1286,7 +1286,53 @@ pub(crate) struct PartitionData {
     /// records the floor alongside the value, replay rebuilds
     /// the map) — tracked separately, see feature_list.md
     /// BUG-LEASE-2.
-    pub(crate) fence_floors: RefCell<HashMap<u64, u64>>,
+    pub(crate) fence_floors: FenceFloors,
+}
+
+/// Per-ino fence floors: what has been ADMITTED and what is DURABLE.
+///
+/// The two diverge whenever a request raises the admitted floor and then
+/// fails before its `OP_FENCE_BUMP` record commits — a GC pin during a
+/// conditional write's read, a split freezing the range across that await,
+/// a failed append. The client retries at the same epoch; judged against the
+/// admitted floor alone that retry raises nothing, queues no record, and its
+/// write is acknowledged while the floor exists only in memory. A crash then
+/// loses a floor that an acknowledged write depended on. So admission checks
+/// the admitted floor, and the need for a record is judged against the
+/// durable one.
+#[derive(Default)]
+pub(crate) struct FenceFloors {
+    admitted: RefCell<HashMap<u64, u64>>,
+    durable: RefCell<HashMap<u64, u64>>,
+}
+
+impl FenceFloors {
+    /// Floors recovered at open (checkpoint + replayed records) are durable.
+    pub(crate) fn recovered(floors: HashMap<u64, u64>) -> Self {
+        FenceFloors {
+            admitted: RefCell::new(floors.clone()),
+            durable: RefCell::new(floors),
+        }
+    }
+
+    /// Admission check for a write stamped `(inode_hint, epoch)`. `Ok(true)`
+    /// means the caller must queue an `OP_FENCE_BUMP` record ahead of the
+    /// admitted write. See `check_and_bump_fence`.
+    pub(crate) fn check_and_bump(&self, inode_hint: u64, epoch: u64) -> Result<bool, String> {
+        check_and_bump_fence(
+            inode_hint,
+            epoch,
+            &mut self.admitted.borrow_mut(),
+            &self.durable.borrow(),
+        )
+    }
+
+    /// An `OP_FENCE_BUMP` record for `(ino, epoch)` committed.
+    pub(crate) fn mark_durable(&self, ino: u64, epoch: u64) {
+        let mut durable = self.durable.borrow_mut();
+        let f = durable.entry(ino).or_insert(0);
+        *f = (*f).max(epoch);
+    }
 }
 
 /// LAT-1: fixed-bucket latency histogram (Prometheus-shape). Recording
@@ -6318,7 +6364,7 @@ async fn partition_thread_main(
         // BUG-LEASE-2 Phase 1: in-memory fence floors per ino; restart wipes.
         // BUG-LEASE-2 Phase 2: recovered from the meta checkpoint snapshot
         // + replayed OP_FENCE_BUMP records — floors survive PS restarts.
-        fence_floors: RefCell::new(recovered_floors),
+        fence_floors: FenceFloors::recovered(recovered_floors),
     }));
 
     // Drop the extra clones held locally: the ones stored in PartitionData
@@ -7407,6 +7453,19 @@ fn take_byte_bounded_batch(pending: &mut Vec<WriteRequest>) -> Vec<WriteRequest>
         bytes = next;
         take += 1;
     }
+    // A fence record is queued immediately ahead of the write it admitted and
+    // must commit in the same batch: split apart, a failed append of the
+    // record's batch and a successful one of the write's would acknowledge
+    // the write with no durable floor behind it. Move a trailing record into
+    // the next batch with its write — or, when the record is all this batch
+    // holds, take its write along as a single oversized request already is.
+    if take < pending.len() && matches!(pending[take - 1].op, WriteOp::FenceBump { .. }) {
+        if take > 1 {
+            take -= 1;
+        } else {
+            take = 2;
+        }
+    }
     if take == pending.len() {
         std::mem::take(pending)
     } else {
@@ -7424,7 +7483,7 @@ async fn handle_incoming_req(
     metrics: &mut WriteLoopMetrics,
     locked_by_other: &Rc<Cell<bool>>,
 ) {
-    if req.msg_type == partition_rpc::MSG_COMPARE_PUT {
+    if req.msg_type == partition_rpc::MSG_COMPARE_PUT || req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
         // This actor owns user-write admission. Drain preceding writes and
         // retain admission across the comparison and durable publication.
         while let Some(c) = inflight.next().await {
@@ -7450,7 +7509,11 @@ async fn handle_incoming_req(
             let _ = req.resp_tx.send(Err((StatusCode::Unavailable, "partition writer fenced".into())));
             return;
         }
-        let response = rpc_handlers::compare_put(req.payload, part, metrics, locked_by_other).await;
+        let response = if req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
+            rpc_handlers::compare_write(req.payload, part, metrics, locked_by_other).await
+        } else {
+            rpc_handlers::compare_put(req.payload, part, metrics, locked_by_other).await
+        };
         let _ = req.resp_tx.send(response);
         return;
     }
@@ -7762,28 +7825,27 @@ async fn handle_incoming_req(
 /// check + floor bump. Pure so it's unit-testable without booting
 /// the partition server. Mirrors the same shape as the region_epoch
 /// check: `inode_hint == 0` (the default) ⇒ skip fencing entirely
-/// (KV CLI, anonymous writes, bootstrap, tests). Otherwise: floor =
-/// `fence_floors.get(&inode_hint).copied().unwrap_or(0)`, reject if
-/// `stamped_epoch < floor`, else bump floor to
-/// `max(floor, stamped_epoch)` and return Ok.
-///
-/// **Phase 1 limitation:** in-memory only. A PS restart wipes the
-/// floors → a stale-epoch RPC from a previously-revoked writer
-/// would slip through during the post-restart warm-up window.
-/// Phase 2 will persist via WAL.
-/// Returns `Ok(true)` when the call RAISED the floor (Phase 2: the caller
-/// must then queue a `WriteOp::FenceBump` record ahead of the admitted
-/// write so the new floor is durable no later than the write's ACK).
-/// `Ok(false)` = admitted without raising (stamped == floor, or anonymous).
+/// (KV CLI, anonymous writes, bootstrap, tests). Otherwise reject if
+/// `stamped_epoch` is below the ADMITTED floor, else raise the admitted
+/// floor to `max(floor, stamped_epoch)`. Persistence is the caller's job,
+/// driven by the return value below.
+/// Returns `Ok(true)` when the stamped epoch is above the DURABLE floor:
+/// the caller must then queue a `WriteOp::FenceBump` record ahead of the
+/// admitted write so the floor is durable no later than the write's ACK.
+/// `Ok(false)` = admitted and already durable (or anonymous). Judging this
+/// against the admitted floor instead lost the record whenever a request
+/// raised the floor and failed before its record committed: the retry at
+/// the same epoch raised nothing and was acknowledged with no record at all.
 pub(crate) fn check_and_bump_fence(
     inode_hint: u64,
     stamped_epoch: u64,
-    fence_floors: &mut HashMap<u64, u64>,
+    admitted: &mut HashMap<u64, u64>,
+    durable: &HashMap<u64, u64>,
 ) -> Result<bool, String> {
     if inode_hint == 0 {
         return Ok(false);
     }
-    let floor = fence_floors.get(&inode_hint).copied().unwrap_or(0);
+    let floor = admitted.get(&inode_hint).copied().unwrap_or(0);
     if stamped_epoch < floor {
         return Err(format!(
             "BUG-LEASE-2: fenced write ino={} stamped_epoch={} < floor={}",
@@ -7791,10 +7853,9 @@ pub(crate) fn check_and_bump_fence(
         ));
     }
     if stamped_epoch > floor {
-        fence_floors.insert(inode_hint, stamped_epoch);
-        return Ok(true);
+        admitted.insert(inode_hint, stamped_epoch);
     }
-    Ok(false)
+    Ok(stamped_epoch > durable.get(&inode_hint).copied().unwrap_or(0))
 }
 
 /// region-epoch + in_range admission shared by `enqueue_put` /
@@ -7843,7 +7904,7 @@ fn enqueue_put(
     // unit tests that exercise the enqueue path without a full
     // PartitionData. Production dispatcher always passes
     // `Some(&part.borrow().fence_floors)`.
-    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    fence_floors: Option<&FenceFloors>,
     // BUG-LEASE-2 Phase 2 (coco P1 #1): partition range for the
     // in_range admission check, which must run BEFORE the fence check
     // so a mis-routed write can never raise (and now PERSIST) the
@@ -7892,10 +7953,7 @@ fn enqueue_put(
             // and shouldn't be writing anymore. Anonymous writes
             // (inode_hint == 0) skip the check entirely.
             if let Some(floors_cell) = fence_floors {
-                let bump = {
-                    let mut floors = floors_cell.borrow_mut();
-                    check_and_bump_fence(put_req.inode_hint, put_req.lease_epoch, &mut floors)
-                };
+                let bump = floors_cell.check_and_bump(put_req.inode_hint, put_req.lease_epoch);
                 match bump {
                     Err(msg) => {
                         let resp = PutResp {
@@ -7958,7 +8016,7 @@ fn enqueue_batch_put(
     part_region_epoch: u64,
     part_id_for_err: u64,
     // BUG-LEASE-2 Phase 2: per-op fencing (None only in unit tests).
-    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    fence_floors: Option<&FenceFloors>,
     part_rg: Option<&Range>,
 ) {
     let batch = match partition_rpc::rkyv_decode::<partition_rpc::BatchPutReq>(&req.payload) {
@@ -8022,10 +8080,7 @@ fn enqueue_batch_put(
         // the whole batch BEFORE any fence bump — same poison-ordering
         // rule as enqueue_put.)
         if let Some(floors_cell) = fence_floors {
-            let bump = {
-                let mut floors = floors_cell.borrow_mut();
-                check_and_bump_fence(op.inode_hint, op.lease_epoch, &mut floors)
-            };
+            let bump = floors_cell.check_and_bump(op.inode_hint, op.lease_epoch);
             match bump {
                 Err(_msg) => {
                     accum.record(i, CODE_FENCED);
@@ -8069,7 +8124,7 @@ fn enqueue_batch_delete(
     pending: &mut Vec<WriteRequest>,
     part_region_epoch: u64,
     part_id_for_err: u64,
-    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    fence_floors: Option<&FenceFloors>,
     part_rg: Option<&Range>,
 ) {
     let batch = match partition_rpc::rkyv_decode::<partition_rpc::BatchDeleteReq>(&req.payload) {
@@ -8113,10 +8168,7 @@ fn enqueue_batch_delete(
             }
         }
         if let Some(floors_cell) = fence_floors {
-            let bump = {
-                let mut floors = floors_cell.borrow_mut();
-                check_and_bump_fence(op.inode_hint, op.lease_epoch, &mut floors)
-            };
+            let bump = floors_cell.check_and_bump(op.inode_hint, op.lease_epoch);
             match bump {
                 Err(_) => {
                     accum.record(i, CODE_FENCED);
@@ -8159,7 +8211,7 @@ fn enqueue_batch_put_bulk(
     pending: &mut Vec<WriteRequest>,
     part_region_epoch: u64,
     part_id_for_err: u64,
-    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    fence_floors: Option<&FenceFloors>,
     part_rg: Option<&Range>,
 ) {
     let batch =
@@ -8231,10 +8283,7 @@ fn enqueue_batch_put_bulk(
             }
         }
         if let Some(floors_cell) = fence_floors {
-            let bump = {
-                let mut floors = floors_cell.borrow_mut();
-                check_and_bump_fence(op.inode_hint, op.lease_epoch, &mut floors)
-            };
+            let bump = floors_cell.check_and_bump(op.inode_hint, op.lease_epoch);
             match bump {
                 Err(_msg) => {
                     accum.record(i, CODE_FENCED);
@@ -8279,7 +8328,7 @@ fn enqueue_put_bulk(
     // BUG-LEASE-2 Phase 2: the bulk meta now carries `inode_hint` /
     // `lease_epoch` (PUT_BULK_HEADER_LEN 28 -> 44); same fencing semantics
     // as enqueue_put, same admission ordering (range -> size -> fence).
-    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    fence_floors: Option<&FenceFloors>,
     part_rg: Option<&Range>,
 ) {
     let Some(meta) = partition_rpc::parse_put_bulk_meta(&req.payload) else {
@@ -8330,10 +8379,7 @@ fn enqueue_put_bulk(
     // R2-P1 #5 ordering: a rejected oversized write must not poison the
     // floor) — mirrors enqueue_put exactly.
     if let Some(floors_cell) = fence_floors {
-        let bump = {
-            let mut floors = floors_cell.borrow_mut();
-            check_and_bump_fence(meta.inode_hint, meta.lease_epoch, &mut floors)
-        };
+        let bump = floors_cell.check_and_bump(meta.inode_hint, meta.lease_epoch);
         match bump {
             Err(msg) => {
                 let resp = PutResp {
@@ -8376,7 +8422,7 @@ fn enqueue_delete(
     part_region_epoch: u64,
     part_id_for_err: u64,
     // BUG-LEASE-2 Phase 2 (coco P1 #3): deletes are fenced like puts.
-    fence_floors: Option<&RefCell<HashMap<u64, u64>>>,
+    fence_floors: Option<&FenceFloors>,
     part_rg: Option<&Range>,
 ) {
     match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
@@ -8394,10 +8440,7 @@ fn enqueue_delete(
                 return;
             }
             if let Some(floors_cell) = fence_floors {
-                let bump = {
-                    let mut floors = floors_cell.borrow_mut();
-                    check_and_bump_fence(del_req.inode_hint, del_req.lease_epoch, &mut floors)
-                };
+                let bump = floors_cell.check_and_bump(del_req.inode_hint, del_req.lease_epoch);
                 match bump {
                     Err(msg) => {
                         let resp = DeleteResp {
@@ -9689,12 +9732,14 @@ pub(crate) fn in_range(rg: &Range, key: &[u8]) -> bool {
 /// fencing them is correct whether or not E's write committed. The
 /// fail-direction is closed (over-fencing of provably-revoked writers
 /// only); the dangerous direction (floor LOSS) is what the WAL-before-ACK
-/// pairing prevents. Tracking a separate "durable floor" would add a
-/// pending/committed dual state for zero correctness gain against correct
-/// clients (bogus epochs from buggy clients are excluded by the coco P1 #1
-/// admission ordering + frame CRC).
+/// pairing prevents — and that pairing needs the DURABLE floor tracked
+/// separately (`FenceFloors`): a request that raised the admitted floor and
+/// failed before its record committed left a same-epoch retry with nothing to
+/// raise, so it was acknowledged with no record anywhere. The snapshot here
+/// still takes the admitted floors, for the reason above.
 pub(crate) fn snapshot_fence_floors(p: &PartitionData) -> Vec<(u64, u64)> {
     p.fence_floors
+        .admitted
         .borrow()
         .iter()
         .map(|(&ino, &epoch)| (ino, epoch))
@@ -14262,7 +14307,16 @@ mod bug_lease_2_fence_tests {
     //! WITHOUT booting a partition server: in-memory map mutation
     //! against synthetic inputs.
 
-    use super::check_and_bump_fence;
+    use super::FenceFloors;
+
+    /// The admission half: judged against an empty durable map.
+    fn check_and_bump_fence(
+        hint: u64,
+        epoch: u64,
+        floors: &mut HashMap<u64, u64>,
+    ) -> Result<bool, String> {
+        super::check_and_bump_fence(hint, epoch, floors, &HashMap::new())
+    }
     use std::collections::HashMap;
 
     #[test]
@@ -14372,6 +14426,30 @@ mod bug_lease_2_fence_tests {
             check_and_bump_fence(42, 5, &mut floors).is_err(),
             "documented: if you call the pure-fn after a rejection, you poison the floor"
         );
+    }
+
+    /// A request raises the admitted floor and fails before its record
+    /// commits; the client retries at the SAME epoch. The retry must still
+    /// queue a record — the admitted floor is not durable. Before the durable
+    /// floor existed this returned `false`, and the retry's write was
+    /// acknowledged with no record at all.
+    #[test]
+    fn a_retry_after_a_lost_record_queues_another() {
+        let floors = FenceFloors::default();
+        assert_eq!(floors.check_and_bump(42, 10), Ok(true));
+        // ... the record never commits ...
+        assert_eq!(floors.check_and_bump(42, 10), Ok(true), "retry must re-queue the record");
+        floors.mark_durable(42, 10);
+        assert_eq!(floors.check_and_bump(42, 10), Ok(false));
+        assert!(floors.check_and_bump(42, 9).is_err());
+    }
+
+    #[test]
+    fn recovered_floors_are_durable() {
+        let floors = FenceFloors::recovered(HashMap::from([(42, 10)]));
+        assert_eq!(floors.check_and_bump(42, 10), Ok(false));
+        assert_eq!(floors.check_and_bump(42, 11), Ok(true));
+        assert!(floors.check_and_bump(42, 9).is_err());
     }
 }
 
@@ -15016,6 +15094,32 @@ mod write_batch_ceiling_tests {
         let batch = take_byte_bounded_batch(&mut pending);
         assert_eq!(batch.len(), 256);
         assert!(pending.is_empty());
+    }
+
+    fn fence_bump() -> WriteRequest {
+        WriteRequest { op: WriteOp::FenceBump { ino: 7, epoch: 3 }, resp: WriteResponder::Fence }
+    }
+
+    /// A fence record never ends a batch that leaves its write behind: if
+    /// the two were split, the record's batch could fail while the write's
+    /// commits, acknowledging the write with no durable floor.
+    #[test]
+    fn a_fence_record_rides_with_its_write() {
+        let big = MAX_WRITE_BATCH_BYTES / 4;
+        // Three writes fill the batch to just under the cap, the fence fits
+        // after them, its write does not.
+        let mut pending: Vec<WriteRequest> =
+            vec![put_of(big), put_of(big), put_of(big), fence_bump(), put_of(big)];
+        let batch = take_byte_bounded_batch(&mut pending);
+        assert!(!matches!(batch.last().unwrap().op, WriteOp::FenceBump { .. }));
+        assert_eq!(batch.len(), 3);
+        assert!(matches!(pending[0].op, WriteOp::FenceBump { .. }));
+        assert_eq!(pending.len(), 2);
+        // A batch holding only the record takes its write along.
+        let mut pending = vec![fence_bump(), put_of(MAX_WRITE_BATCH_BYTES + 1), put_of(1)];
+        let batch = take_byte_bounded_batch(&mut pending);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(pending.len(), 1);
     }
 
     /// A single request larger than the cap still moves, or the queue would

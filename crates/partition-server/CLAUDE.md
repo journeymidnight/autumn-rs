@@ -337,10 +337,14 @@ fence` — a rejected request must NEVER raise or persist the floor (else a reje
 oversized write could poison the floor).
 
 Persistence — floors survive restart / reschedule:
-- **WAL**: when `check_and_bump_fence` returns `Ok(true)` (raised), the dispatcher
+- **WAL**: when `check_and_bump_fence` returns `Ok(true)` (the stamped epoch is
+  above the DURABLE floor — see `FenceFloors` below), the dispatcher
   queues `WriteOp::FenceBump { ino, epoch }` (`WriteResponder::Fence`, no client
-  reply) BEFORE the admitted write — same group-commit pipeline ⇒ the floor is
-  durable no later than the write's ACK. WAL record op `OP_FENCE_BUMP` (0x08),
+  reply) BEFORE the admitted write — same group-commit BATCH ⇒ the floor is
+  durable no later than the write's ACK. `take_byte_bounded_batch` never ends a
+  batch on a fence record whose write it leaves behind: split apart, a failed
+  append of the record's batch and a successful one of the write's would ACK the
+  write with no durable floor. WAL record op `OP_FENCE_BUMP` (0x08),
   key = ino BE8 (skips in_range), value = epoch LE8. It NEVER enters the memtable
   (Phase 3 filter) or SSTs; GC's VP scan skips it (no VP bit).
 - **Checkpoint**: `TableLocations.fence_floors` snapshot, captured under the SAME
@@ -2197,3 +2201,26 @@ checks epoch/range/freeze both before and after I/O. SST reads, expiry, tombston
 and GC read pins use the existing GET core. A mismatch returns a body-level
 CODE_PRECONDITION, not a stale-routing frame error. Namespace/authz apply before
 admission. UUIDs in object metadata give the adapter an ABA-free ETag.
+
+MSG_COMPARE_WRITE shares that handler (`compare_write_inner`; MSG_COMPARE_PUT is
+the unfenced, value-only case of it). Order: epoch/range/freeze, then the fence
+check-and-bump, then the comparison, then the write — a misrouted request never
+raises a floor. A floor the request raised is persisted as an OP_FENCE_BUMP
+record whether or not the comparison holds, and a failed comparison is reported
+only after that record is durable (the reply rides the batch's last record).
+That makes a compare that cannot hold a pure, durable floor bump for the key's
+partition: a recovering owner uses it to fence out a dead owner's late writes.
+A conditional delete writes a tombstone through the same batch. Covered by
+`crates/manager/tests/compare_write.rs` (PS killed -9 after the bump; ablating
+the fence-only record lets the stale write through).
+
+Fence floors are two maps (`FenceFloors`): ADMITTED (checked on every stamped
+write) and DURABLE (raised when an `OP_FENCE_BUMP` record commits in Phase 3,
+and seeded at open from checkpoint + replay). The need for a record is judged
+against the durable floor. Judging it against the admitted one lost records:
+a request that raised the floor and failed before its record committed (a GC
+pin during a conditional write's read, a split freezing the range across that
+await, a failed append) left the same-epoch retry with nothing to raise, so
+the retry's write was acknowledged with no record anywhere and a crash lost
+the floor. Every enqueue path shares this, not only the conditional write.
+`a_retry_after_a_lost_record_queues_another` is the regression.

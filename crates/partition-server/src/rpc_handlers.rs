@@ -892,6 +892,7 @@ async fn get_value(
 }
 
 /// Exclusive to the partition write actor after draining its pipeline.
+/// `MSG_COMPARE_PUT` is `MSG_COMPARE_WRITE` with a value and no fence.
 pub(crate) async fn compare_put(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
@@ -900,7 +901,44 @@ pub(crate) async fn compare_put(
 ) -> HandlerResult {
     let req: ComparePutReq = rkyv_decode(&payload)
         .map_err(|e| (StatusCode::InvalidArgument, e))?;
-    if req.value.len() > MAX_COMPARE_PUT_BYTES
+    compare_write_inner(
+        CompareWriteReq {
+            part_id: req.part_id,
+            region_epoch: req.region_epoch,
+            key: req.key,
+            expected: req.expected,
+            value: Some(req.value),
+            inode_hint: 0,
+            lease_epoch: 0,
+        },
+        part,
+        metrics,
+        locked_by_other,
+    )
+    .await
+}
+
+/// `MSG_COMPARE_WRITE`. Exclusive to the partition write actor after draining
+/// its pipeline, so no other write can land between the comparison and the
+/// write it guards.
+pub(crate) async fn compare_write(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    metrics: &mut WriteLoopMetrics,
+    locked_by_other: &Rc<std::cell::Cell<bool>>,
+) -> HandlerResult {
+    let req: CompareWriteReq = rkyv_decode(&payload)
+        .map_err(|e| (StatusCode::InvalidArgument, e))?;
+    compare_write_inner(req, part, metrics, locked_by_other).await
+}
+
+async fn compare_write_inner(
+    req: CompareWriteReq,
+    part: &Rc<RefCell<PartitionData>>,
+    metrics: &mut WriteLoopMetrics,
+    locked_by_other: &Rc<std::cell::Cell<bool>>,
+) -> HandlerResult {
+    if req.value.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES)
         || req.expected.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES) {
         return Err((StatusCode::InvalidArgument, "compare_put value exceeds 64 KiB".into()));
     }
@@ -916,6 +954,16 @@ pub(crate) async fn compare_put(
         Ok(())
     };
     check()?;
+    // Fence before comparing, and only after the range check so a misrouted
+    // request can never raise a floor. A raised floor is made durable below
+    // whether or not the comparison holds.
+    let fence = part.borrow().fence_floors.check_and_bump(req.inode_hint, req.lease_epoch);
+    let raised = match fence {
+        Ok(raised) => raised,
+        Err(message) => {
+            return Ok(rkyv_encode(&PutResp { code: CODE_FENCED, message, key: req.key }));
+        }
+    };
     let current = get_value(rkyv_encode(&GetReq {
         part_id: req.part_id, key: req.key.clone(), offset: 0, length: MAX_COMPARE_PUT_BYTES as u32 + 1,
         region_epoch: req.region_epoch,
@@ -925,21 +973,39 @@ pub(crate) async fn compare_put(
         GetOutcome::Value(value) => req.expected.as_deref() == Some(value.as_ref()),
         GetOutcome::Redirect { .. } => unreachable!("get_value does not redirect"),
     };
-    if !matches {
-        // Body-level conflict is terminal, unlike stale-region frame errors.
-        return Ok(rkyv_encode(&PutResp {
-            code: CODE_PRECONDITION, message: "compare_put conflict".into(), key: req.key,
-        }));
-    }
     // A paged lookup can yield while maintenance freezes or splits the range.
     check()?;
+    // The reply rides the batch's last record: the guarded write when the
+    // comparison holds, else the floor bump alone, so a failed comparison is
+    // reported only once a raised floor is durable.
     let (tx, rx) = futures::channel::oneshot::channel();
-    let batch = vec![WriteRequest {
-        op: WriteOp::Put {
-            user_key: Bytes::from(req.key.clone()), value: Bytes::from(req.value), expires_at: 0,
-        },
-        resp: WriteResponder::Put { outer: tx, key: req.key },
-    }];
+    let mut replier = Some(WriteResponder::Put { outer: tx, key: req.key.clone() });
+    let mut batch = Vec::with_capacity(2);
+    if raised {
+        batch.push(WriteRequest {
+            op: WriteOp::FenceBump { ino: req.inode_hint, epoch: req.lease_epoch },
+            resp: if matches { WriteResponder::Fence } else { replier.take().expect("unused") },
+        });
+    }
+    if matches {
+        let resp = replier.take().expect("unused");
+        batch.push(match req.value {
+            Some(value) => WriteRequest {
+                op: WriteOp::Put {
+                    user_key: Bytes::from(req.key.clone()), value: Bytes::from(value), expires_at: 0,
+                },
+                resp,
+            },
+            None => WriteRequest { op: WriteOp::Delete { user_key: req.key.clone() }, resp },
+        });
+    }
+    let conflict = || Ok(rkyv_encode(&PutResp {
+        code: CODE_PRECONDITION, message: "compare_put conflict".into(), key: req.key.clone(),
+    }));
+    if batch.is_empty() {
+        // Body-level conflict is terminal, unlike stale-region frame errors.
+        return conflict();
+    }
     if let Some(mut flight) = start_write_batch(part, batch).await
         .map_err(|e| (StatusCode::Internal, e.to_string()))? {
         let phase2_result = (&mut flight.phase2_fut).await;
@@ -947,7 +1013,8 @@ pub(crate) async fn compare_put(
         handle_completion(part, metrics, locked_by_other, id,
             InflightCompletion { data: flight.data, phase2_result }).await;
     }
-    rx.await.map_err(|_| (StatusCode::Internal, "conditional writer dropped reply".into()))?
+    let reply = rx.await.map_err(|_| (StatusCode::Internal, "conditional writer dropped reply".into()))??;
+    if matches { Ok(reply) } else { conflict() }
 }
 
 /// `redirect_large_vp` — when true, a FULL-value read of a VP whose

@@ -1943,6 +1943,8 @@ pub(crate) async fn finish_write_batch(
         let mut cumulative: u64 = 0;
         let mut idx: usize = 0;
         let responders_ref = &mut responders;
+        let mut durable_bumps: Vec<(u64, u64)> = Vec::new();
+        let durable_bumps_ref = &mut durable_bumps;
         let iter = valid.into_iter().filter_map(move |entry| {
             let record_offset = base_offset + cumulative;
             cumulative += record_sizes[idx] as u64;
@@ -1953,6 +1955,12 @@ pub(crate) async fn finish_write_batch(
             // nothing enters the memtable. (Offset accounting above must
             // still advance: record_sizes is aligned over ALL entries.)
             if entry.op == crate::OP_FENCE_BUMP {
+                if let (Ok(ino), Ok(epoch)) = (
+                    <[u8; 8]>::try_from(entry.user_key.as_ref()),
+                    <[u8; 8]>::try_from(entry.value.as_ref()),
+                ) {
+                    durable_bumps_ref.push((u64::from_be_bytes(ino), u64::from_le_bytes(epoch)));
+                }
                 responders_ref.push(entry.resp);
                 return None;
             }
@@ -1999,6 +2007,11 @@ pub(crate) async fn finish_write_batch(
         });
 
         p.active.insert_batch(iter);
+        // The fence records in this batch are committed: their floors are
+        // durable now.
+        for (ino, epoch) in durable_bumps {
+            p.fence_floors.mark_durable(ino, epoch);
+        }
         // Phase 3 committed these keys to the memtable — release their in-flight
         // marks now, under THIS borrow (NO await between the insert and the
         // release), so a concurrent GC value-relocation always sees each key in
