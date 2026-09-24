@@ -158,3 +158,127 @@ Complete 发布映射，数据留在原处，不生成一份合并后的正文�
 活跃上传、取消、清理结果及 Complete 元数据／正文 I/O 的可观测性。
 
 原 feature 验收项全部保留；本次用户新增的正文零 I/O 和混合访问要求作为补充记录。
+
+## 9. 实现设计（2026-09-24 细化）
+
+本节把第 3–5 节落到具体的 key、状态机与原语上，是后续各步实现与评审的共同依据。
+固定客户端 `lancedb==0.39.0` 的真实请求轨迹见 `scripts/lancedb_s3/`：它只用到
+Range GET、ListObjectsV2（带/不带 delimiter）、PutObject、`If-None-Match: *`
+的 PutObject（manifest 提交，冲突方收到 412 后用 HEAD/GET 核对）、HeadObject、
+DeleteObjects（带 Content-MD5）和 5 MiB 分片的 multipart。CopyObject、
+DeleteObject、`If-Match`、Abort 与 HeadBucket 没有出现，但仍按原验收实现。
+
+### 9.1 已落地的原语
+
+- **`MSG_COMPARE_WRITE`（wire 47）**：带围栏的条件 put/delete。先查围栏、再比较、
+  再写；请求抬高的 floor 无论比较成败都持久化，失败的比较在 floor 落盘后才返回。
+  因此"期望值不可能成立"的一次调用就是对该 key 所在分区的纯 floor 抬升——恢复方接管
+  死会话的租约后，用它把死会话的迟到写挡在外面。
+- **有序、可续的 ListObjectsV2** 与分页 `readdir`：按 S3 字节序遍历、从 token 续读，
+  每页代价约为一页条目加 token 路径每层一次扫描；无上限、无整树重走。
+
+### 9.2 FS 格式 v4（`SCHEMA_VERSION` 3 → 4，离线转换）
+
+`InodeMeta` 增加两个字段（rkyv 布局改变，按仓库惯例用一次性 `migratev3_v4`
+转换器改写全部 `[0x01]` inode，转换完删除，不留兼容代码）：
+
+- `generation: u64`：内容代数。任何改变内容的操作（flush 写入数据、truncate、
+  分段映射替换）都加一。S3 ETag = `ino` 与 `generation` 的十六进制拼接，同大小、
+  同秒重写也会变。
+- `segments: Option<SegmentRoot>`：`Some` 表示文件内容由分段映射定义，此时文件自身
+  不再有 `[0x03]` extent、`inline_data` 与 `stripe` 均为 `None`。
+
+分段映射：`SegmentRoot { map_id, count, page_starts: Vec<u64> }`；页不可变，存于
+`[0x05][map_id BE][page u32 BE]`，每页至多 1024 个
+`Segment { off, len, data_ino, data_off, lanes, unit }`（逻辑区间 → 数据对象的局部
+偏移）。`map_id` 由 inode 分配器发号，全局唯一。映射引用数据对象的逻辑身份
+（`data_ino` + 几何），不引用磁盘位置。区间之间的空隙是洞，读零。
+
+**数据对象**：一个 part（或一次分段修改写入的新数据）独占一个 `data_ino`，不挂任何
+目录、不出现在 listing。数据按 `unit`（= `MAX_EXTENT`）稠密写在
+`[0x03][lane][data_ino][off]`，`lane = (off/unit + data_ino) % lanes`——按
+`data_ino` 错开起始 lane，否则 5 MiB 的 Lance 分片全部落在 lane 0。因为稠密，读映射
+覆盖的区间时每个 key 必须存在：**缺 key 报错，不当稀疏洞读零**（`ChunkSpec.strict`）。
+
+### 9.3 分段文件的读与改
+
+- 读：`read::prepare` 按页加载与请求区间相交的段（页不可变，按 `(map_id, page)`
+  缓存），为每段生成指向数据对象的 strict chunk；跨 part 的 Range 自然拆开，条带与 EN
+  直读不变。
+- 改（FUSE / Python / 其它核心写入方共用 `write::flush_inode` →
+  `extent::write_region`）：被写区间 `[off, off+n)` 写成一个新数据对象 D；新映射 =
+  旧映射在该区间内被 D 替换（`splice`）；新页写在新 `map_id` 下；最后带围栏
+  `put_inode` 发布新 root、size 与 generation。**不读旧数据、不做 RMW、不整体物化**。
+  truncate 只裁剪映射；随后扩展的区域没有段，读零，旧数据不会重新暴露。
+- 回收：写入方在创建新数据前先记 `[0x04]segc/[file_ino][map_id]`（本次新增的
+  `map_id` 与数据对象）。回收者持有 EXCLUSIVE 租约（见 9.5，证明此刻没有其它读写者）
+  并对 inode key 所在分区做一次围栏抬升后，以文件**当前**映射为唯一真相：记录里不等于
+  当前 `map_id` 的页、不被当前映射引用的数据对象都是垃圾，删掉后删记录。这对任意
+  次数的修改与任意崩溃点都成立，不需要逐步对账。
+
+### 9.4 命名空间发布与会话
+
+- **会话**：每个发布方（每个网关 worker）持有一个会话 inode `S` 的 WRITE 租约并由
+  既有心跳续期，登记 `[0x04]sess/[S]`。它发起的全部数据写与发布 CAS 都以 `(S, epoch)`
+  为围栏。
+- **意图记录**：每个未完成的操作在开始写数据前登记 `[0x04]pend/[S]/[obj]`（PUT/Copy：
+  目标父目录、名字、新 inode N、期望的旧 dirent；UploadPart：upload id、分片号、数据
+  对象；Complete：upload id）。操作完成后删除。
+- **PUT / Copy**：分配新 inode N，写数据与 inode meta，然后对 dirent 做
+  `compare_write(expected=旧 dirent 或 None, value=N)`（`If-None-Match: *` 即
+  expected=None；`If-Match` 先核对旧 inode 的 ETag，CAS 本身保证核对之后 dirent 未被
+  换过）。条件不成立返回 412 并回收 N。CAS 在应答丢失后重试时可能把自己已成功的发布
+  报成冲突：dirent 值里的 N 对这次尝试唯一，所以返回 412 前先回读 dirent，指向 N 即
+  视为成功。父目录按需逐级 put-if-absent 创建，已存在的同名目录直接复用。被替换的旧
+  inode 走退役回收（9.5）。
+- **死会话恢复**：扫描 `sess/` 的任一方对 `S` 做非强制 `acquire(WRITE)`：Conflict 表示
+  会话还活着；Granted 表示原持有者的租约已过期、manager 已把版本抬高，此时恢复方对 fs
+  命名空间的每个分区做一次纯 floor 抬升（`fence_all(S, epoch)`），从此死会话的任何迟到
+  写都会被拒，然后逐条按"dirent 是否已指向 N"决定补完或回收，最后删 `sess/[S]`。
+- **目录删除**：S3 的空"目录"不应出现在 delimiter listing 里；目录不随对象删除而
+  删除（删目录与并发创建之间没有多 key 事务），由 listing 在生成 CommonPrefix 前确认
+  该子树仍含对象。
+
+### 9.5 租约模式（manager，wire 48）
+
+在 READ / WRITE 之外新增：
+
+| 模式 | 用途 | 与其它客户端已持有者的冲突 |
+|------|------|------|
+| STABLE | S3 GET / Copy 源读取期间固定内容 | 与 WRITE、REPLACE、EXCLUSIVE 冲突 |
+| REPLACE | PUT/Copy/Complete 替换 dirent 期间 | 与 WRITE、REPLACE、EXCLUSIVE 冲突；不挡 READ/STABLE |
+| EXCLUSIVE | 回收已不可达或分段修改遗留的数据 | 与任何持有者冲突 |
+
+WRITE 与 STABLE 互斥，因此 GET 期间 FUSE/Python 的写打开立即 EBUSY，反之亦然；
+PUT 在替换期间持有旧 inode 的 REPLACE，已有写者时立即 409。REPLACE 与 EXCLUSIVE
+复用 writer 槽（持久化为普通 writer 记录；failover 后按 WRITE 恢复，只会更保守）。
+STABLE 与 READ 一样不持久化，由 30 s TTL 与心跳维持。网关按请求计数持有 STABLE，
+同一 worker 的并发 GET 共享一次 acquire，最后一个请求结束后释放。
+
+不可达 inode 的回收（unlink、rename 覆盖、S3 覆盖/删除）先写 `rmtomb`，再尝试
+EXCLUSIVE：拿到才删数据，拿不到留给扫描方重试——打开中的文件与进行中的读取因此不会
+被抽掉数据。本挂载自己仍打开着的 inode 在最后一次 close 时再回收。Python `autumn.Fs`
+的写入必须持有 WRITE 租约，关闭无租约修改旁路。
+
+### 9.6 Multipart 状态机
+
+- 记录：`[0x04]mpu/[id]` = `{target, state, ...}`，`state ∈ Open | Completing{frozen} |
+  Completed | Aborted`；分片 `[0x04]mpu/[id]/p/[part BE]` = `{data_ino, size, etag,
+  crc32c, lanes, unit, attempt}`；分配 `[0x04]mpu/[id]/a/[data_ino]`。
+- UploadPart：确认 Open → 登记 pend 与 alloc → 写数据对象（边写边算 CRC32C；ETag 由
+  CRC32C、大小与 `data_ino` 组成，因此同时标识这一次上传尝试；只有请求带 Content-MD5
+  时才另算 MD5 并校验，不让每个分片都付 MD5 的单核代价）→ CAS 替换分片记录 → 再读
+  状态：仍 Open 则删 pend（数据归 upload），
+  否则自清。被同号重传替换下来的旧分片不在此处删除，留给终态清理——这样迟到或失败的
+  请求永远删不到冻结清单里的数据。
+- Complete：读分片记录、按请求清单核对编号顺序/大小/ETag → CAS `Open → Completing
+  {frozen}` → 写文件 inode（`segments` 指向由冻结清单直接生成的映射页）→ 按条件对
+  dirent 做 `compare_write` 发布 → CAS `Completing → Completed` → 清理。整个过程只
+  读写元数据：**分片正文零读、零写**，数据对象原地成为最终文件的段。条件失败回到 Open。
+- Abort：CAS `Open → Aborted` 后回收；遇到 `Completing` 且 Complete 方会话仍活着则
+  409，会话已死则先做死会话恢复再判定；遇到 `Completed` 返回 `NoSuchUpload`。
+- 终态清理：alloc 中不在冻结清单里的数据对象回收（冻结清单中的只删 alloc 记录，
+  所有权已转给文件）；其 pend 仍属活会话的暂留，由该会话自清。全部处理完才删分片记录与
+  upload 记录。
+- Complete 的正文零 I/O 由数据路径计数器（extent put/get 字节数）与"正文 I/O 失败注入"
+  两种方式验证（第 7 节）。

@@ -1,0 +1,12 @@
+[project]
+name = "autumn-lancedb-s3-check"
+version = "0"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "lancedb==0.39.0",
+    "pyarrow",
+    "numpy",
+    "pandas",
+    "moto[server]>=5.2.3",
+    "boto3>=1.43.102",
+]
