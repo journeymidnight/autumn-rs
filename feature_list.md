@@ -1511,6 +1511,13 @@
   通过条件写入反馈给 LanceDB；取消或失败的 multipart 不得发布不完整对象。
   验证 DeleteObjects、CopyObject、分页 list、Range/条件 GET、缺失 key 与条件失败
   的 SDK 可解析响应；网关重启后已完成对象仍可读，现有模型加载只读用例回归通过。
+- **用户补充要求与计划** (2026-09-24): 详见
+  [LanceDB S3 gateway 实施计划](docs/lancedb_s3_gateway_plan.md)。
+  **硬性验收：CompleteMultipartUpload 不读取、不复制、不重写任何分片正文**；
+  通过共享 FS 分段映射完成元数据拼接，禁止后台全量合并或首次访问／修改时全量转换。
+  使用数据路径计数、正文 I/O 故障注入及冷启动测试验证。支持 S3、FUSE、Python Fs
+  混合访问；已有写者占用立即报冲突，S3 GET 期间禁止原地修改；允许统一协议和格式升级。
+  Abort 必须阻止迟到分片及发布，并支持重启后继续清理；不得误删已完成对象的组成数据。
 - `passes: false`
 
 ### F-LANCEDB-OBJECT-STORE — autumn 作为 LanceDB 的原生 object_store 后端
