@@ -244,16 +244,45 @@ stays correct.
 
 `Delete` sends `WriteOp::Delete{user_key}`, writes `op = 2` (tombstone).
 
-### Natural batching
+### Natural batching, with one gate against fragmentation
 
-`partition_loop` launches whatever `pending` holds as soon as a pipeline slot is
-free (`!at_cap && !imm_full`) — no minimum-batch gate. Batch size adapts to
-arrival-rate × in-flight latency (group-commit style). Fragmentation is prevented
-STRUCTURALLY: ps-conn tasks share the P-log thread and enqueue a whole TCP burst
-into req_rx before partition_loop is polled, and the (E) drain pulls the entire
-channel into `pending` (up to MAX_WRITE_BATCH) each iteration, so a naturally-full
-burst still launches as ONE batch. `--min-pipeline-batch` is parsed but a
-deprecated no-op.
+`take_launch_batch` is the single place that decides whether `partition_loop`
+launches a batch now and what rides in it. With nothing in flight it launches
+whatever `pending` holds, at once — an idle partition never holds an op back.
+With a batch already in flight it launches only when `pending` has reached
+`MIN_PIPELINED_BATCH` (8); otherwise the ops wait for that batch to complete and
+ride the next one together. Batch size still adapts to arrival-rate × in-flight
+latency (group-commit style); the gate only refuses to split one burst in two.
+
+WHY the gate is back (an earlier `pending >= 256` gate was removed as
+unreachable, and this section then claimed fragmentation was "prevented
+structurally" because a TCP burst is enqueued in full before the loop is polled):
+that claim stopped holding with the compio 0.19 runtime. Under the perf bench a
+partition serves two client connections, each admitted 4 ops at a time by the
+ps-conn cap; the new runtime wakes the loop for each connection's frames
+separately, and the unconditional launch turned every 8-op burst into two 4-op
+appends. The EN serializes appends to one extent, so the second append overlapped
+nothing and cost a whole extra append. Measured at that one commit, everything
+else equal: avg batch 6.2 → 4.1, EN write time per append unchanged, 4K write
+throughput -25..30%. `write_batch_ceiling_tests::a_batch_in_flight_holds_a_partial_burst_until_it_is_whole`
+goes red without the gate. The cost of the gate is bounded by one in-flight
+append: an op it holds would have queued behind that append on the EN anyway.
+
+The gate alone is not enough, and the first measurement said so: avg batch
+stayed at exactly 4.00 with ~0.7 batches in flight. The two connections had
+settled into strict alternation — A's 4 complete, B's 4 (held while A was in
+flight) launch the instant `n_inflight` hits 0, A's refill lands ~100 µs later
+and is held behind B's, and so on forever; nothing re-synchronizes them. So a
+completion opens a `LAUNCH_COALESCE_WINDOW` (200 µs): with nothing in flight
+and a partial burst pending, (B0) waits for more requests until the window
+closes, then launches. That lets A's refill join B's ops, both are acked
+together, both refill together, and the loop stays in lock-step (measured:
+avg batch 8.00, p50 1.15-1.58 → 0.96-0.99 ms). The window applies only after a
+completion — an idle partition still launches at once — and every launch
+clears it.
+
+`--min-pipeline-batch` is parsed but a deprecated no-op; the threshold and the
+window are constants, not knobs.
 
 ### In-order Phase 3 commit
 

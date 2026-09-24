@@ -3120,6 +3120,29 @@ cluster, runs tcp/ucx × 4K/8M and compares each leg against
 baseline and p99 ≤ 2×). The `--min-pipeline-batch` PS flag is deprecated
 (parsed, warns, no effect) — batch sizing is adaptive and needs no tuning knob.
 
+**Check the group-commit batch size, not just ops/s.** On this host a single
+perf-check sample of 4K write ops/s swings 30-50% run to run (same binary), so
+ops/s alone cannot tell a write-pipeline regression from noise; the batch size
+can. While a 4K write leg runs, the PS logs one `partition write summary` line
+per partition per second; the ops-weighted `avg_batch_size` over the write phase
+is the number to compare:
+
+```bash
+sed 's/\x1b\[[0-9;]*m//g' /tmp/autumn-rs-logs/ps.log | grep 'partition write summary' \
+  | awk '{for(i=1;i<=NF;i++){split($i,a,"="); if(a[1]=="ops")o=a[2]; if(a[1]=="avg_batch_size")b=a[2]}
+          if(o+0>50){O+=o; B+=b*o}} END{printf "avg_batch=%.2f over %d ops\n", B/O, O}'
+```
+
+With the default bench (16 threads × depth 8 over 8 partitions, 2 connections per
+partition, `--conn-inflight-cap` 4) expect **≈8**: both connections' admitted
+ops ride one append (measured 8.00 / 7.99 on two runs). **≈4** means the loop is
+launching on one connection's worth — the fragmentation that
+`MIN_PIPELINED_BATCH` + `LAUNCH_COALESCE_WINDOW` in `partition_loop` exist to
+prevent (it cost 25-30% of 4K write throughput when the compio 0.19 runtime
+changed the wake-up order; see the partition-server guide, "Natural batching").
+Copy `ps.log` out before the next leg starts — `perf_check.sh` wipes
+`/tmp/autumn-rs-logs/` between legs.
+
 ## Inode-lease + close-to-open coherence (in flight)
 
 Multi-mount / multi-daemon coherence for `autumn-fuse` and

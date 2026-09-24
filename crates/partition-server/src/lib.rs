@@ -324,6 +324,29 @@ fn max_write_batch() -> usize {
 pub(crate) const MAX_WRITE_BATCH_BYTES: usize =
     autumn_rpc::frame::MAX_PAYLOAD_LEN as usize - (1 << 20);
 
+/// A batch launched while another is already in flight must carry at least
+/// this many ops. The EN serializes appends to one extent, so a second batch
+/// does not overlap the first — it adds a whole append (~1 ms) of its own.
+/// Under the perf bench a partition serves two client connections × the PS
+/// per-connection admission of 4 = 8 ops; launching on the first
+/// connection's 4 split every burst into two 4-op appends and cost 25-30% of
+/// 4K write throughput (see `partition_loop` (B)). An idle partition
+/// (nothing in flight) launches whatever it holds at once — the gate only
+/// ever delays an op that would have queued behind the in-flight append on
+/// the EN anyway.
+pub(crate) const MIN_PIPELINED_BATCH: usize = 8;
+
+/// How long `partition_loop` waits, right after a batch completes, for the
+/// refill that batch's acks just triggered before launching a partial burst
+/// with nothing in flight. Without it the two connections a partition serves
+/// settle into strict alternation: A's 4 ops complete, B's 4 (held while A was
+/// in flight) launch instantly, A's refill lands ~100 µs later and is held
+/// behind B's — every batch is one connection's worth, forever. One window
+/// after a completion lets A's refill join B's, both are acked together, both
+/// refill together, and the loop stays in lock-step from then on. It applies
+/// only after a completion: an idle partition still launches at once.
+pub(crate) const LAUNCH_COALESCE_WINDOW: Duration = Duration::from_micros(200);
+
 /// R4 4.4 — maximum number of P-log `append_batch` futures in flight
 /// concurrently per partition. Higher values give more pipeline depth so
 /// multiple 256-request group-commit batches overlap their replica RTT, but
@@ -6770,6 +6793,9 @@ async fn partition_loop(
     let wal_gap_cap = max_wal_gap();
     let mut metrics = WriteLoopMetrics::new();
     let mut pending: Vec<WriteRequest> = Vec::new();
+    // End of the coalescing window opened by the most recent completion; see
+    // `LAUNCH_COALESCE_WINDOW` and (B0) below. Cleared by every launch.
+    let mut coalesce_deadline: Option<Instant> = None;
     // set when `drain_rx` delivered a request; once set, stop
     // pulling new items from `req_rx` and head for the tail-drain block.
     let mut drain_ack: Option<oneshot::Sender<()>> = None;
@@ -6819,6 +6845,7 @@ async fn partition_loop(
         // is already ready without blocking.
         while let Some(Some(c)) = inflight.next().now_or_never() {
             handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+            coalesce_deadline = Some(Instant::now() + LAUNCH_COALESCE_WINDOW);
             if locked_by_other.get() {
                 break 'outer;
             }
@@ -6851,45 +6878,66 @@ async fn partition_loop(
         let n_inflight = inflight.len();
         let at_cap = n_inflight >= cap;
 
-        // (B) Launch a new batch whenever the pipeline has room
-        // (natural batching). `pending` holds everything the SQ had
-        // delivered as of the last (E) drain, so this ships the largest
-        // batch currently available; requests arriving while it is in
-        // flight accumulate into the next batch — batch size adapts to
-        // the arrival rate times the in-flight latency, group-commit
-        // style. The legacy gate (`n_inflight == 0 || pending >=
-        // MIN_PIPELINE_BATCH(256)`) made the pipeline lock-step whenever
-        // per-partition concurrency < 256: after the first launch,
-        // pending could never reach 256, so the loop waited for the
-        // WHOLE pipeline to drain before launching again — effective
-        // depth=1 (the background.rs comment documented this
-        // and pushed it onto an `AUTUMN_PS_MIN_BATCH` knob nobody set).
-        // The R3 Task 5b fragmentation concern (splitting a naturally
-        // full burst into tiny batches) is prevented structurally, not
-        // by the gate: ps-conn bursts enqueue every frame into req_rx
-        // before this same-thread task is polled, and (E) drains the
-        // whole channel into `pending` each iteration, so a full burst
-        // still launches as ONE batch. When imm is full, do not
-        // launch — the next batch's Phase 3 maybe_rotate would exceed
-        // the cap.
-        let ready_to_launch = !pending.is_empty() && !at_cap && !imm_full;
-        if ready_to_launch {
-            // Bound the batch by BYTES here rather than where `pending` is
-            // filled: several sites push into it, and this is the one place
-            // that decides what becomes a single `AppendReq`. Everything past
-            // the ceiling stays queued and launches as the next batch — no
-            // request is dropped or failed, it just does not ride this frame.
-            //
-            // One semantic consequence, and it is acceptable: a BatchPut whose
-            // ops straddle the cut is no longer durable in ONE append, so a
-            // crash between the two halves leaves half of it durable. Nothing
-            // ACKED is lost — the accumulator fires the client's response on
-            // the last op, so a half-written BatchPut has not answered anyone —
-            // and reaching the cut at all takes gigabytes in one call.
-            // Always take at least one, or a request larger than the cap could
-            // never make progress (it cannot be: a Put is inline-capped at
-            // 64 MiB, far below).
-            let batch = take_byte_bounded_batch(&mut pending);
+        // (B0) Coalescing window. Nothing in flight, a PARTIAL burst pending,
+        // and a batch completed within `LAUNCH_COALESCE_WINDOW`: the acks that
+        // completion sent are about to bring the other connection's refill,
+        // so wait for it (or the window) before launching. Requests that
+        // arrive meanwhile are taken in and the check repeats; the deadline
+        // bounds the total wait. A partition with no recent completion is
+        // idle and skips straight to (B) — this never delays a lone op on a
+        // quiet partition, only one that would otherwise split a burst.
+        if n_inflight == 0 && !pending.is_empty() && pending.len() < MIN_PIPELINED_BATCH {
+            if let Some(deadline) = coalesce_deadline {
+                let now = Instant::now();
+                if now < deadline {
+                    let req_fut = req_rx.next();
+                    let window = compio::time::sleep(deadline - now);
+                    futures::pin_mut!(req_fut, window);
+                    match select(req_fut, window).await {
+                        Either::Left((Some(req), _)) => {
+                            handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
+                            continue;
+                        }
+                        Either::Left((None, _)) => break,
+                        Either::Right(((), _)) => coalesce_deadline = None,
+                    }
+                } else {
+                    coalesce_deadline = None;
+                }
+            }
+        }
+
+        // (B) Launch a new batch when the pipeline has room. `pending` holds
+        // everything the SQ had delivered as of the last (E) drain, so a
+        // launch ships the largest batch currently available; requests
+        // arriving while it is in flight accumulate into the next batch —
+        // batch size adapts to arrival rate × in-flight latency,
+        // group-commit style. With nothing in flight the launch is
+        // unconditional. With a batch already in flight `take_launch_batch`
+        // refuses to FRAGMENT: it holds a small `pending` until it reaches
+        // `MIN_PIPELINED_BATCH` or the in-flight batch completes and (A)/(D)
+        // bring the loop back here with n_inflight == 0.
+        //
+        // WHY the gate exists again (an earlier one, `pending >= 256`, was
+        // removed as unreachable): the EN serializes appends to one extent,
+        // so a second small batch overlaps nothing and costs a whole extra
+        // append. The claim that replaced the gate — "a burst is enqueued in
+        // full before this task is polled, so it cannot be split" — stopped
+        // holding with the compio 0.19 runtime: the two connections a
+        // partition serves under the perf bench now wake this loop one at a
+        // time, and the unconditional launch turned every 8-op burst into two
+        // 4-op appends (measured at that one commit: avg batch 6.2 → 4.1, EN
+        // write time unchanged, 4K write throughput -25..30%).
+        //
+        // When imm is full, do not launch — the next batch's Phase 3
+        // maybe_rotate would exceed the cap.
+        let launch = if at_cap || imm_full {
+            None
+        } else {
+            take_launch_batch(&mut pending, n_inflight)
+        };
+        if let Some(batch) = launch {
+            coalesce_deadline = None;
             // start_write_batch is now async — small batches stay
             // inline in the future (no spawn_blocking), big batches
             // (>= PHASE1_OFFLOAD_THRESHOLD) await spawn_blocking. The
@@ -6917,6 +6965,7 @@ async fn partition_loop(
         if at_cap {
             if let Some(c) = inflight.next().await {
                 handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                coalesce_deadline = Some(Instant::now() + LAUNCH_COALESCE_WINDOW);
                 if locked_by_other.get() {
                     break;
                 }
@@ -6983,6 +7032,7 @@ async fn partition_loop(
                 Either::Right((maybe_c, _)) => {
                     if let Some(c) = maybe_c {
                         handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                        coalesce_deadline = Some(Instant::now() + LAUNCH_COALESCE_WINDOW);
                         if locked_by_other.get() {
                             break;
                         }
@@ -7088,6 +7138,7 @@ async fn partition_loop(
                 Either::Right((maybe_c, _req_dropped)) => {
                     if let Some(c) = maybe_c {
                         handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                        coalesce_deadline = Some(Instant::now() + LAUNCH_COALESCE_WINDOW);
                         if locked_by_other.get() {
                             break;
                         }
@@ -7413,6 +7464,27 @@ fn take_byte_bounded_batch(pending: &mut Vec<WriteRequest>) -> Vec<WriteRequest>
         let rest = pending.split_off(take);
         std::mem::replace(pending, rest)
     }
+}
+
+/// The one place that decides whether `partition_loop` launches a batch NOW
+/// and what rides in it. `None` = keep waiting: nothing is pending, or a batch
+/// is already in flight and `pending` is below `MIN_PIPELINED_BATCH` — too
+/// small to be worth a second serialized append on the EN (see the (B)
+/// comment in `partition_loop`). What does launch is bounded by BYTES via
+/// `take_byte_bounded_batch`: everything past the frame ceiling stays queued
+/// for the next batch, nothing is dropped or failed, and at least one request
+/// always moves. One accepted consequence of that cut: a BatchPut whose ops
+/// straddle it is no longer durable in ONE append, so a crash between the
+/// halves leaves half of it durable — nothing ACKED is lost, because the
+/// accumulator answers the client only on its last op.
+fn take_launch_batch(
+    pending: &mut Vec<WriteRequest>,
+    n_inflight: usize,
+) -> Option<Vec<WriteRequest>> {
+    if pending.is_empty() || (n_inflight > 0 && pending.len() < MIN_PIPELINED_BATCH) {
+        return None;
+    }
+    Some(take_byte_bounded_batch(pending))
 }
 
 async fn handle_incoming_req(
@@ -14982,6 +15054,36 @@ mod write_batch_ceiling_tests {
                 key: b"k".to_vec(),
             },
         }
+    }
+
+    /// The shape that cost 25-30% of 4K write throughput after the compio 0.19
+    /// upgrade: with one batch in flight, the two connections a partition
+    /// serves deliver their 4 admitted ops in two separate wake-ups. An
+    /// unconditional launch ships the first 4 alone (this assertion is what
+    /// goes red without the gate: `Some(4)` instead of `None`); the gate holds
+    /// them until the second 4 arrive and ships all 8 as one append. An idle
+    /// partition is never held back, and an empty queue never launches.
+    #[test]
+    fn a_batch_in_flight_holds_a_partial_burst_until_it_is_whole() {
+        let mut pending: Vec<WriteRequest> = (0..4).map(|_| put_of(4096)).collect();
+        assert!(
+            take_launch_batch(&mut pending, 1).is_none(),
+            "one connection's 4 ops must not launch behind an in-flight batch"
+        );
+        assert_eq!(pending.len(), 4, "held ops stay queued, in order");
+
+        pending.extend((0..4).map(|_| put_of(4096)));
+        let batch = take_launch_batch(&mut pending, 1).expect("a whole burst launches");
+        assert_eq!(batch.len(), MIN_PIPELINED_BATCH, "both connections' ops ride ONE append");
+        assert!(pending.is_empty());
+
+        pending.push(put_of(4096));
+        assert_eq!(
+            take_launch_batch(&mut pending, 0).map(|b| b.len()),
+            Some(1),
+            "nothing in flight: a lone op launches immediately"
+        );
+        assert!(take_launch_batch(&mut pending, 0).is_none(), "empty queue, no launch");
     }
 
     /// A batch becomes ONE `AppendReq`, and `pending` is bounded by request

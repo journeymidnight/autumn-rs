@@ -14,6 +14,36 @@
 
 ## Active
 
+### BUG-GROUP-COMMIT-SPLIT-AFTER-RUNTIME-UPGRADE — compio 0.19 之后 PS 的 group-commit 批被拆成两半，4K 写吞吐 -25..30%
+- **Trigger** (2026-09-22，用户："4K write 太差了"): `perf_check.sh --tcp --3disk` 4K 写
+  报 61% 基线。先排除的：CPU 租户（绑核后不变）、磁盘（`fsync_isolated` 三盘健康）、authz
+  （没开）、分区数/shards（日志核过 8/8）、客户端发请求方式（两版都是逐 op `put` +
+  滑动窗口）。单样本吞吐二分被噪声骗了两次（同一二进制三次采样 32K-49K），最后靠
+  同一天同机的三采样中位数 A/B（基线提交 `31cbbed` 53.3K vs HEAD 36.8K）坐实差距为真。
+- **根因（VERIFIED）**: 批大小信号在 `c48bb5f`（compio 运行时升级）上干净翻转：升级前一刻
+  `633a483` 平均批 6.24 / phase2 0.886 ms，升级后 4.13 / 1.38 ms，EN 侧 pwrite+sync
+  不变（0.30-0.45 ms）。机制：每分区 2 条客户端连接 × 每连接准入 4 = 8 个 op；旧运行时
+  两条连接的帧在同一 tick 里被一次 drain 攒成一批，新运行时分两次唤醒，`partition_loop`
+  的无条件发车把每个 8-op burst 拆成两个 4-op append，而 EN 对同一 extent 的 append 串行。
+  `--conn-inflight-cap 16` 能靠加深流水线补回来（56.3K），证明是准入/分批而非 EN。
+- **Scope**: `partition_loop` (B) 加发车门槛 `MIN_PIPELINED_BATCH`(8)：有批在飞时不为
+  不足 8 个 op 发第二批（`take_launch_batch`）；加完成后的合并窗口
+  `LAUNCH_COALESCE_WINDOW`(200 µs)：在飞为零且 burst 不完整时等 acks 触发的 refill 再发车
+  （只有门槛时两条连接严格交替、批仍是 4.00——窗口是让它们重新同步的那一步）。空闲分区
+  不受影响。评审按用户指示跳过。
+- **Acceptance**: 同一探针下 HEAD 平均批 3.97 → **8.00 / 7.99**（两轮），p50 1.15-1.58 →
+  0.96-0.99 ms，写 41.5-42K → 48.3K / 44.5K；单测
+  `a_batch_in_flight_holds_a_partial_burst_until_it_is_whole` 去掉门槛即红；
+  `cargo test -p autumn-partition-server --lib` 256 全绿。`docs/ops.md` 记了批大小的
+  可执行检查（比 ops/s 稳得多的回归信号）。
+- **仍未收口（本条不含）**: ① 每次 append 的 PS↔EN 往返在升级后仍多 0.2-0.3 ms
+  （同批大小下 fan-out 1.01 → 1.21 ms，EN 磁盘时间相同），是剩余差距的来源，归属运行时
+  /transport 层，未定位；② presplit 出的 8 个子分区 log 尾都是 sealed 空 CoW extent，
+  首次写 8 路并发 `alloc_new_extent` 每轮有 3 路被 manager 拒（"no healthy node
+  available"），整批失败后靠客户端 100 ms 退避重试，成本小但每轮必现；③ `conn-inflight-cap`
+  保持 4 的注释只用读基准论证过，写路径从未测。
+- `passes: true`
+
 ### F-REVIEW-R1-GC-COMPLETE-SCAN — P1 GC 完整扫描证明
 - **Trigger**: review.md R1；提前 EOF 或 record 边界短读可绕过 carry 检查并误 punch。
 - **Scope**: 每次读取必须满足 want，punch 前检查 sealed_length 和 carry。
