@@ -7,12 +7,14 @@
 
 use std::rc::Rc;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use autumn_fuse::dir::DirChild;
 use autumn_fuse::read::{self, ReadPlan};
-use autumn_fuse::schema::{DT_DIR, DT_REG};
+use autumn_fuse::schema::{self, DT_DIR};
 use autumn_fuse::state::FsState;
-use autumn_fuse::{dir, meta};
+use autumn_fuse::{dir, key, meta};
 
+use crate::listing::{list_page, DirSource, Item};
 use crate::s3::ObjectRow;
 
 /// `FsState` is `!Send` by design (it holds `Rc`s into the compio runtime), so
@@ -30,11 +32,6 @@ use crate::s3::ObjectRow;
 /// `execute` (no state, does the I/O). Only `prepare` takes the lock, so the
 /// actual chunk fan-out of concurrent GETs still overlaps.
 pub type Fs = Rc<futures::lock::Mutex<FsState>>;
-
-/// Cap on how many tree entries one undelimited (recursive) listing will walk.
-/// A model directory is tens of files; this only guards against someone
-/// listing the root of a large tree with no delimiter.
-const MAX_WALK: usize = 100_000;
 
 /// A file's identity as S3 reports it.
 pub struct Stat {
@@ -74,6 +71,16 @@ pub async fn list_buckets(fs: &Fs) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Only first-level directories are buckets; a file with the same name is not.
+pub async fn bucket_exists(fs: &Fs, bucket: &str) -> Result<bool> {
+    let Some(ino) = resolve(fs, &format!("/{bucket}")).await? else {
+        return Ok(false);
+    };
+    let mut st = fs.lock().await;
+    let m = meta::get_inode(&mut st, ino).await?;
+    Ok(m.mode & 0o170_000 == 0o040_000)
+}
+
 /// Stat one object. `None` means no such key (or the key names a directory,
 /// which is not an object).
 pub async fn stat(fs: &Fs, bucket: &str, key: &str) -> Result<Option<Stat>> {
@@ -101,6 +108,21 @@ pub struct Listing {
     pub next_token: Option<String>,
 }
 
+/// Reads directories for the listing walk, taking the state lock per page.
+struct FsDirs<'a>(&'a Fs);
+
+impl DirSource for FsDirs<'_> {
+    async fn children(&mut self, dir: u64, from: &[u8], limit: u32) -> Result<(Vec<DirChild>, Option<Vec<u8>>)> {
+        let mut st = self.0.lock().await;
+        dir::list_children(&mut st, dir, from, limit).await
+    }
+
+    async fn lookup(&mut self, dir: u64, names: &[Vec<u8>]) -> Result<Vec<DirChild>> {
+        let mut st = self.0.lock().await;
+        dir::lookup_children(&mut st, dir, names).await
+    }
+}
+
 /// List a bucket. `delimiter` is honoured only for the `/` case that S3
 /// clients actually use; any other delimiter falls back to a flat listing,
 /// which is a superset and keeps `s3_glob`'s client-side filter correct.
@@ -112,120 +134,55 @@ pub async fn list_objects(
     start_after: Option<&str>,
     max_keys: usize,
 ) -> Result<Option<Listing>> {
-    if resolve(fs, &format!("/{bucket}")).await?.is_none() {
+    if !bucket_exists(fs, bucket).await? {
         return Ok(None);
     }
-
-    // Split the prefix at its last `/`: everything before it names a real
-    // directory to start from, everything after is a filename filter. This is
-    // what turns `prefix=llama/model-` into "readdir llama/, keep model-*"
-    // instead of a walk of the whole bucket.
-    let (dir_part, name_part) = match prefix.rfind('/') {
-        Some(i) => (&prefix[..=i], &prefix[i + 1..]),
-        None => ("", prefix),
+    // The prefix up to its last `/` names the directory to start from; the
+    // rest filters names in it. A missing directory is an empty listing.
+    let dir_part = &prefix[..prefix.rfind('/').map_or(0, |i| i + 1)];
+    let Some(root) = resolve(fs, &format!("/{bucket}/{dir_part}")).await? else {
+        return Ok(Some(Listing { rows: Vec::new(), common_prefixes: Vec::new(), next_token: None }));
     };
+    let recursive = delimiter != Some("/");
+    let (items, next_token) =
+        list_page(&mut FsDirs(fs), root, prefix, recursive, start_after, max_keys).await?;
 
-    let mut keys: Vec<String> = Vec::new();
-    let mut common: Vec<String> = Vec::new();
-
-    if delimiter == Some("/") {
-        let base = format!("/{bucket}/{dir_part}");
-        if let Some(ino) = resolve(fs, &base).await? {
-            let mut st = fs.lock().await;
-            for e in dir::readdir(&mut st, ino, 0).await? {
-                let name = e.name.to_string_lossy().into_owned();
-                if name == "." || name == ".." || !name.starts_with(name_part) {
+    let inos: Vec<u64> = items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Object { ino, .. } => Some(*ino),
+            Item::Prefix(_) => None,
+        })
+        .collect();
+    let metas = {
+        let st = fs.lock().await;
+        let keys: Vec<Vec<u8>> = inos.iter().map(|&i| key::inode_key(i)).collect();
+        let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        st.client.get_many(&refs).await
+    };
+    let mut metas = metas.into_iter();
+    let (mut rows, mut common_prefixes) = (Vec::new(), Vec::new());
+    for item in items {
+        match item {
+            Item::Prefix(p) => common_prefixes.push(p),
+            Item::Object { key, ino } => {
+                let m = metas.next().expect("one meta per object");
+                // An object deleted since the walk read its name is gone; the
+                // token still resumes after it.
+                let Some(bytes) = m.map_err(|e| anyhow!("KV get inode {ino}: {e}"))? else {
                     continue;
-                }
-                match e.kind {
-                    DT_DIR => common.push(format!("{dir_part}{name}/")),
-                    DT_REG => keys.push(format!("{dir_part}{name}")),
-                    _ => {}
-                }
-            }
-        }
-    } else {
-        walk(fs, bucket, dir_part, prefix, &mut keys).await?;
-    }
-
-    keys.sort();
-    common.sort();
-
-    // Both `continuation-token` and `start-after` mean the same thing here:
-    // resume strictly after this key. Using the key itself as the token keeps
-    // paging stateless.
-    if let Some(after) = start_after {
-        keys.retain(|k| k.as_str() > after);
-        common.retain(|p| p.as_str() > after);
-    }
-
-    let truncated = keys.len() > max_keys;
-    keys.truncate(max_keys);
-    let next_token = if truncated { keys.last().cloned() } else { None };
-
-    // Stat is one lookup per key; a model directory is tens of files, and the
-    // inode cache absorbs repeats within a session.
-    let mut rows = Vec::with_capacity(keys.len());
-    for k in keys {
-        if let Some(s) = stat(fs, bucket, &k).await? {
-            rows.push(ObjectRow {
-                key: k,
-                size: s.size,
-                mtime_secs: s.mtime_secs,
-                etag: s.etag,
-            });
-        }
-    }
-
-    Ok(Some(Listing {
-        rows,
-        common_prefixes: common,
-        next_token,
-    }))
-}
-
-/// Depth-first walk under `dir_part`, collecting every regular file whose key
-/// starts with `prefix`.
-async fn walk(
-    fs: &Fs,
-    bucket: &str,
-    dir_part: &str,
-    prefix: &str,
-    out: &mut Vec<String>,
-) -> Result<()> {
-    let mut stack = vec![dir_part.to_string()];
-    let mut seen = 0usize;
-
-    while let Some(rel) = stack.pop() {
-        let Some(ino) = resolve(fs, &format!("/{bucket}/{rel}")).await? else {
-            continue;
-        };
-        let entries = {
-            let mut st = fs.lock().await;
-            dir::readdir(&mut st, ino, 0).await?
-        };
-        for e in entries {
-            let name = e.name.to_string_lossy().into_owned();
-            if name == "." || name == ".." {
-                continue;
-            }
-            seen += 1;
-            if seen > MAX_WALK {
-                tracing::warn!(
-                    bucket, prefix, MAX_WALK,
-                    "listing truncated at the walk cap; use a delimiter or a narrower prefix"
-                );
-                return Ok(());
-            }
-            let key = format!("{rel}{name}");
-            match e.kind {
-                DT_DIR => stack.push(format!("{key}/")),
-                DT_REG if key.starts_with(prefix) => out.push(key),
-                _ => {}
+                };
+                let m = schema::decode_inode_meta(&bytes).map_err(|e| anyhow!("inode {ino}: {e}"))?;
+                rows.push(ObjectRow {
+                    key,
+                    size: m.size,
+                    mtime_secs: m.mtime_secs,
+                    etag: etag(ino, m.size, m.mtime_secs),
+                });
             }
         }
     }
-    Ok(())
+    Ok(Some(Listing { rows, common_prefixes, next_token }))
 }
 
 /// Plan a read of `[offset, offset+len)`. Holds the state lock only for the

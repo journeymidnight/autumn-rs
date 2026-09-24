@@ -189,7 +189,7 @@ key `[0x02][parent_ino BE][name]`，两个字段：`child_inode`、`file_type`
 | FUSE 操作 | KV 操作 |
 |-----------|---------|
 | `lookup(parent, name)` | 1× Get dirent + 1× Get inode |
-| `readdir(ino)` | 1× Range(prefix=[0x02][ino BE]) |
+| `readdir(ino)` | paginated Range(prefix=[0x02][ino BE]) + one batched get per page |
 | `getattr(ino)` | 1× Get inode |
 | `mkdir`/`create(parent, name)` | 1× Put inode + 1× Put dirent + 1× Put parent inode (nlink) |
 | `unlink(parent, name)` | 1× Get dirent + 1× Delete dirent + tombstone + N× Delete extent + 1× Delete inode |
@@ -458,7 +458,11 @@ called at all"，那正是这份记录存在要堵的洞。
 
 ### 目录操作
 - **lookup**：Get dirent → Get inode。
-- **readdir**：dirent 前缀 Range scan。
+- **readdir**：dirent 前缀 Range scan，按 key 分页直到读完；单页 4096 项不是
+  目录大小上限。每页从上一页末 key 的后继（`key + 0x00`）继续，offset 是名字序
+  位置。`readdir_bounded` 限制单次返回条数：内核每次只取一个 reply buffer（约百项）
+  再从末 offset 续读，若每次都读完剩余目录，大目录就是平方级的 get。offset 之前的
+  名字只扫 key、不取 value；返回的条目用 `list_children` 一次 `get_many` 取 dirent。
 - **mkdir**：alloc inode + Put meta + Put dirent + parent nlink。
 - **rename**：Delete old dirent + Put new dirent（非原子，v1 限制；rename-over 见
   UNLINK-1）。

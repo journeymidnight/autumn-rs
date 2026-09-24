@@ -18,6 +18,7 @@
 //! so lane striping, EN-direct reads and authz all apply unchanged. This is an
 //! adapter over the partition layer, not a second data plane.
 
+mod listing;
 mod objects;
 mod s3;
 
@@ -117,6 +118,15 @@ async fn list_buckets(fs: &Fs) -> Response {
     }
 }
 
+/// `HEAD /{bucket}` — the existence probe used by S3 clients.
+async fn head_bucket(fs: &Fs, bucket: String) -> Response {
+    match objects::bucket_exists(fs, &bucket).await {
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => S3Error::no_such_bucket(bucket).into_response(),
+        Err(e) => S3Error::internal(e.to_string(), bucket).into_response(),
+    }
+}
+
 /// `GET /{bucket}` — `ListObjectsV2`. `list-type=1` (the legacy listing) is
 /// answered with the same body; the fields v2 adds are additive and no client
 /// we serve asks for v1.
@@ -127,7 +137,6 @@ async fn list_objects(fs: &Fs, bucket: String, q: HashMap<String, String>) -> Re
     let max_keys = q
         .get("max-keys")
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|n| *n > 0)
         .unwrap_or(DEFAULT_MAX_KEYS)
         .min(DEFAULT_MAX_KEYS);
     // The continuation token IS the last key of the previous page, so paging
@@ -323,9 +332,14 @@ fn router(fs: Fs) -> Router {
         SendWrapper::new(async move { list_buckets(&f).await })
     });
     let f = SendWrapper::new(fs.clone());
+    let g = SendWrapper::new(fs.clone());
     let bucket_route = get(move |Path(b): Path<String>, Query(q): Query<HashMap<String, String>>| {
         let f = f.clone();
         SendWrapper::new(async move { list_objects(&f, b, q).await })
+    })
+    .head(move |Path(b): Path<String>| {
+        let g = g.clone();
+        SendWrapper::new(async move { head_bucket(&g, b).await })
     });
     let f = SendWrapper::new(fs.clone());
     let g = SendWrapper::new(fs);

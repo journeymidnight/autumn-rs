@@ -3522,6 +3522,18 @@ aws --endpoint-url http://127.0.0.1:9100 s3 ls
 aws --endpoint-url http://127.0.0.1:9100 s3 ls s3://models/llama/
 aws --endpoint-url http://127.0.0.1:9100 s3 cp s3://models/llama/config.json -
 
+# Bucket existence probe. A pre-created `fs/models` directory answers 200;
+# a missing bucket answers 404.
+curl -s -o /dev/null -w '%{http_code}\n' -I http://127.0.0.1:9100/models
+
+# A page counts both files and child prefixes toward max-keys. Keys come back
+# in S3 byte order (`d.txt` before `d/`, `d0` after it) with no directory-size
+# or walk cap; each page resumes from its token rather than re-walking the tree.
+# When testing a large directory, follow NextContinuationToken until
+# IsTruncated is false and compare against the expected key set.
+aws --endpoint-url http://127.0.0.1:9100 s3api list-objects-v2 \
+    --bucket models --delimiter / --max-keys 2
+
 # 3. Ranged read (what the streamer actually issues) must answer 206 with an
 #    exact Content-Range:
 curl -s -D- -o /dev/null -H 'Range: bytes=0-7' \

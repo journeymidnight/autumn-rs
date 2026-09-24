@@ -16,6 +16,9 @@ use crate::schema::InodeState;
 use crate::state::{FsState, FuseLease};
 use crate::write;
 
+/// Directory entries fetched per kernel READDIR call.
+const READDIR_BATCH: usize = 256;
+
 /// Derive the lease mode from POSIX open flags. The
 /// fuse `open` callback supplies `flags` directly (`O_RDONLY` /
 /// `O_WRONLY` / `O_RDWR`). Treat any non-read-only opener as a
@@ -420,7 +423,9 @@ pub async fn handle_request(
             let _ = reply.send(result);
         }
         FsRequest::Readdir { ino, offset, reply } => {
-            let result = dir::readdir(state, ino, offset).await;
+            // One kernel reply buffer holds roughly a hundred entries; the
+            // kernel asks again from the last offset for the rest.
+            let result = dir::readdir_bounded(state, ino, offset, READDIR_BATCH).await;
             let _ = reply.send(result);
         }
         FsRequest::Rename {

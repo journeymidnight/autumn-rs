@@ -384,6 +384,24 @@ impl FsState {
         Ok(r.entries.into_iter().map(|e| e.key).collect())
     }
 
+    /// `kv_range_keys` plus whether the scan may hold more keys after this
+    /// page. Use this rather than `keys.len() == limit` to decide whether to
+    /// continue: the client deduplicates keys across partitions after the
+    /// limit is reached, so a page can come back short while more remain.
+    pub async fn kv_range_page(
+        &mut self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: u32,
+    ) -> Result<(Vec<Vec<u8>>, bool)> {
+        let r = self
+            .client
+            .range(prefix, start, limit)
+            .await
+            .map_err(|e| anyhow!("KV range: {e}"))?;
+        Ok((r.entries.into_iter().map(|e| e.key).collect(), r.has_more))
+    }
+
     /// Check if a key exists (uses Head RPC).
     pub async fn kv_exists(&mut self, k: &[u8]) -> Result<bool> {
         let meta = self

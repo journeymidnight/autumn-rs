@@ -77,8 +77,105 @@ pub async fn resolve(state: &mut FsState, path: &str) -> Result<Option<u64>> {
     Ok(Some(ino))
 }
 
-/// Read directory entries.
+/// Dirent-key page size for directory scans.
+const DIR_PAGE: u32 = 4096;
+
+/// One stored directory entry.
+pub struct DirChild {
+    pub name: Vec<u8>,
+    pub ino: u64,
+    /// `DT_REG` / `DT_DIR` / `DT_LNK`.
+    pub kind: u8,
+}
+
+/// Up to `limit` children of `dir` whose names are `>= from`, in name order,
+/// plus where to resume: the successor of the last name SCANNED, or `None`
+/// once the scan is exhausted. Resuming from the scan rather than from the
+/// last child returned matters when every scanned entry was deleted before
+/// its value was read — resuming from the survivors would end the directory
+/// there.
+///
+/// The values arrive in one batched get per partition rather than one
+/// round trip per entry. A dirent removed between the key scan and the get
+/// is skipped, since the name no longer exists; any other per-entry error
+/// fails the call, because a listing that silently drops a live entry is
+/// the one answer a caller cannot detect.
+pub async fn list_children(
+    state: &mut FsState,
+    dir: u64,
+    from: &[u8],
+    limit: u32,
+) -> Result<(Vec<DirChild>, Option<Vec<u8>>)> {
+    let prefix = key::dirent_prefix(dir);
+    let mut start = prefix.clone();
+    start.extend_from_slice(from);
+    let (keys, has_more) = state.kv_range_page(&prefix, &start, limit).await?;
+    let resume = match keys.last() {
+        Some(last) if has_more => {
+            let (_, name) = key::parse_dirent_key(last).ok_or_else(|| anyhow!("bad dirent key"))?;
+            Some(name_successor(name))
+        }
+        _ => None,
+    };
+    let children = get_children(state, dir, keys).await?;
+    Ok((children, resume))
+}
+
+/// The children of `dir` with exactly these names, in the given order,
+/// skipping names that do not exist. One batched get.
+pub async fn lookup_children(state: &mut FsState, dir: u64, names: &[Vec<u8>]) -> Result<Vec<DirChild>> {
+    let keys = names.iter().map(|n| key::dirent_key(dir, n)).collect();
+    get_children(state, dir, keys).await
+}
+
+async fn get_children(state: &mut FsState, dir: u64, keys: Vec<Vec<u8>>) -> Result<Vec<DirChild>> {
+    let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    let values = state.client.get_many(&refs).await;
+    let mut out = Vec::with_capacity(keys.len());
+    for (k, v) in keys.iter().zip(values) {
+        let Some(v) = v.map_err(|e| anyhow!("KV get dirent: {e}"))? else {
+            continue;
+        };
+        let Some((parent, name)) = key::parse_dirent_key(k) else {
+            continue;
+        };
+        debug_assert_eq!(parent, dir);
+        let d: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
+        out.push(DirChild {
+            name: name.to_vec(),
+            ino: d.child_inode,
+            kind: d.file_type,
+        });
+    }
+    Ok(out)
+}
+
+/// The smallest name strictly greater than `name` (range starts are inclusive).
+pub fn name_successor(name: &[u8]) -> Vec<u8> {
+    let mut next = name.to_vec();
+    next.push(0);
+    next
+}
+
+/// Read every directory entry after `offset`.
 pub async fn readdir(state: &mut FsState, ino: u64, offset: i64) -> Result<Vec<ReaddirEntry>> {
+    readdir_bounded(state, ino, offset, usize::MAX).await
+}
+
+/// Read at most `max` directory entries after `offset`.
+///
+/// Offsets are positions in name order (`.` = 1, `..` = 2, children from 3),
+/// so resuming at an offset has to count the names before it. That count
+/// scans keys only; values are fetched just for the entries returned. The
+/// FUSE mount passes a bound because the kernel takes one reply buffer per
+/// call and asks again from the last offset, so fetching the rest of a large
+/// directory on every call would be quadratic.
+pub async fn readdir_bounded(
+    state: &mut FsState,
+    ino: u64,
+    offset: i64,
+    max: usize,
+) -> Result<Vec<ReaddirEntry>> {
     let mut entries = Vec::new();
 
     if offset <= 0 {
@@ -99,35 +196,46 @@ pub async fn readdir(state: &mut FsState, ino: u64, offset: i64) -> Result<Vec<R
     }
 
     let prefix = key::dirent_prefix(ino);
-    let keys = state.kv_range_keys(&prefix, &prefix, 4096).await?;
-
-    for (i, k) in keys.into_iter().enumerate() {
-        let entry_offset = (i as i64) + 3;
-        if entry_offset <= offset {
-            continue;
+    // Skip whole pages of names that precede `offset` without fetching values.
+    let mut skip = (offset - 2).max(0) as usize;
+    let mut index = 0usize;
+    let mut from: Vec<u8> = Vec::new();
+    while skip > 0 {
+        let mut start = prefix.clone();
+        start.extend_from_slice(&from);
+        let want = skip.min(DIR_PAGE as usize) as u32;
+        let (keys, has_more) = state.kv_range_page(&prefix, &start, want).await?;
+        let Some(last) = keys.last() else {
+            return Ok(entries);
+        };
+        index += keys.len();
+        skip -= keys.len();
+        let (_, name) = key::parse_dirent_key(last).ok_or_else(|| anyhow!("bad dirent key"))?;
+        from = name_successor(name);
+        if !has_more {
+            return Ok(entries);
         }
+    }
 
-        let (_, name_bytes) = match key::parse_dirent_key(&k) {
-            Some(parsed) => (parsed.0, parsed.1.to_vec()),
-            None => continue,
-        };
-
-        let v = match state.kv_get(&k).await {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let dirent: DirentValue = match schema::decode_dirent(&v) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        let name = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(name_bytes) };
-
-        entries.push(ReaddirEntry {
-            ino: dirent.child_inode,
-            offset: entry_offset,
-            kind: dirent.file_type,
-            name,
-        });
+    while entries.len() < max {
+        let want = (max - entries.len()).min(DIR_PAGE as usize) as u32;
+        let (children, resume) = list_children(state, ino, &from, want).await?;
+        for c in children {
+            index += 1;
+            // SAFETY: names are stored as the OS-encoded bytes they were
+            // created from.
+            let name = unsafe { std::ffi::OsString::from_encoded_bytes_unchecked(c.name) };
+            entries.push(ReaddirEntry {
+                ino: c.ino,
+                offset: index as i64 + 2,
+                kind: c.kind,
+                name,
+            });
+        }
+        match resume {
+            Some(next) => from = next,
+            None => break,
+        }
     }
 
     Ok(entries)

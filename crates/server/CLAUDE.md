@@ -134,10 +134,31 @@ Read-only, unauthenticated S3 endpoint over the `fs/` tree, in its own process.
 It exists so inference engines with no loader plugin seam (SGLang, FreeToken)
 can stream weights through their built-in `--load-format runai_streamer`, which
 speaks S3 and nothing else; every other S3 tool reads autumn through it as a
-side effect. Serves only what that streamer issues — `ListObjectsV2`, ranged
-`GetObject`, whole `GetObject` — and answers every mutating verb with a
-parseable S3 `NotImplemented`. Requests are served whatever their
-`Authorization` header says, including none.
+side effect. Serves `ListObjectsV2`, `HeadBucket`, ranged/whole `GetObject`,
+and `HeadObject`. Answers mutating verbs with a parseable S3 `NotImplemented`.
+Requests are served whatever their `Authorization` header says, including none.
+
+- **Listing (`listing.rs`) walks in S3 key order and resumes at the token.**
+  Keys are raw-byte ordered and a directory `d` owns every `d/...` key, while
+  dirents are stored in NAME order; they disagree about names that extend `d`
+  with a byte below `/` (`d.txt` sorts before `d/`), so the walk holds a
+  directory back until the scan passes `d/`. A page starts from its
+  continuation token and skips subtrees that sort before it. Inside a
+  directory the scan starts at the token's own name, and the only earlier
+  names that can still sort after the token — directories named by a proper
+  prefix of it followed by a byte below `/` (`part` for `part-00500`) — are
+  fetched by name in one batched lookup. Starting the scan at that stem
+  instead made page k of a `part-NNNNN` directory scan about k pages. So a page
+  costs about a page of entries plus one scan and one lookup per token path
+  level. An earlier version walked the whole subtree on every page and then
+  sorted, and capped the walk at 100k entries, first silently truncating and
+  then failing with a retryable 500; neither remains. Objects and common
+  prefixes count together toward `max-keys`; the token is the last key on the
+  page. Scans resume from the last name SCANNED, so entries deleted between a
+  scan and its value fetch cannot end a directory early. Names that are not
+  UTF-8 are left out: they cannot be S3 keys, and a lossy token would stop
+  comparing with its own name and repeat a page forever. Stats for a page are
+  one batched get of the listed inodes.
 
 ```
 autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
