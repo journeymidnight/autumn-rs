@@ -611,7 +611,9 @@ pub async fn recover_dead_sessions(state: &mut FsState) -> Result<usize> {
     Ok(recovered)
 }
 
-async fn recover_session(state: &mut FsState, s: u64, lease: WriteLease) -> Result<()> {
+/// Finish or undo every operation session `s` left, then remove the session.
+/// The caller holds `s`'s lease (`lease`), taken over from its dead owner.
+pub(crate) async fn recover_session(state: &mut FsState, s: u64, lease: WriteLease) -> Result<()> {
     fence_all(state, lease).await?;
     let prefix = key::pending_prefix(s);
     loop {
@@ -640,6 +642,13 @@ async fn recover_session(state: &mut FsState, s: u64, lease: WriteLease) -> Resu
                     if holder == successor {
                         drop_name_of(state, ino).await?;
                     }
+                }
+                PendingOp::Part { upload, part, data_ino } => {
+                    crate::multipart::recover_part(state, s, upload, part, data_ino, lease).await?;
+                }
+                PendingOp::Complete { upload } => {
+                    let (_, new_ino) = key::parse_pending_key(k).ok_or_else(|| anyhow!("pending key {k:?}"))?;
+                    crate::multipart::recover_complete(state, s, upload, new_ino, lease).await?;
                 }
             }
             state.kv_delete_fenced(k, lease).await?;

@@ -199,6 +199,14 @@ pub enum PendingOp {
     /// name still, or another session's file) says this swap did not land,
     /// and whoever moved the name retired `ino` themselves.
     Retire { parent: u64, name: Vec<u8>, ino: u64, successor: Option<u64> },
+    /// Writing data object `data_ino` as part `part` of `upload`. Kept iff
+    /// the upload owns it: open with the part record naming it, or frozen
+    /// into the file a Complete is publishing or has published.
+    Part { upload: u64, part: u32, data_ino: u64 },
+    /// Completing `upload` into the inode this record is keyed by. Finished
+    /// iff the dirent names that inode; otherwise undone and the upload
+    /// reopened.
+    Complete { upload: u64 },
 }
 
 pub fn encode_pending(p: &PendingOp) -> Vec<u8> {
@@ -206,6 +214,57 @@ pub fn encode_pending(p: &PendingOp) -> Vec<u8> {
 }
 
 pub fn decode_pending(bytes: &[u8]) -> Result<PendingOp, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// Where a multipart upload is. Every transition is a `compare_write` on the
+/// upload record, so a Complete and an Abort race to exactly one winner.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum UploadState {
+    Open,
+    /// Being published as inode `new_ino` by `session`, from exactly the data
+    /// objects in `frozen` (list order).
+    Completing { new_ino: u64, session: u64, frozen: Vec<u64> },
+    /// Published as `new_ino`, which owns the objects in `frozen`. The record
+    /// is deleted once the upload's leftovers are.
+    Completed { new_ino: u64, frozen: Vec<u64> },
+    Aborted,
+}
+
+/// `key::upload_key`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct UploadRecord {
+    /// Where Complete publishes the file.
+    pub parent: u64,
+    pub name: Vec<u8>,
+    /// The S3 key, for listings.
+    pub key: Vec<u8>,
+    pub state: UploadState,
+}
+
+/// `key::upload_part_key`: the part's current data object.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PartRecord {
+    pub data_ino: u64,
+    pub size: u64,
+    pub crc32c: u32,
+    pub lanes: u8,
+    pub unit: u32,
+}
+
+pub fn encode_upload(r: &UploadRecord) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(r).to_vec()
+}
+
+pub fn decode_upload(bytes: &[u8]) -> Result<UploadRecord, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+pub fn encode_part(r: &PartRecord) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(r).to_vec()
+}
+
+pub fn decode_part(bytes: &[u8]) -> Result<PartRecord, String> {
     autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
 }
 

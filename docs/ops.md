@@ -3692,6 +3692,21 @@ Not supported, by design: PUT/DELETE, multipart, versioning, ACLs,
 virtual-host addressing (use path-style, which is what `--endpoint-url`
 selects), and SigV4 verification. Anything else answers `NotImplemented`.
 
+Multipart and conditional publish exist in the `autumn-fs` core but are not
+routed through the gateway yet. Verify the core against an in-process cluster
+(no libfuse needed; the run sleeps ~33 s so a session lease expires):
+
+```bash
+cargo test -p autumn-manager --test system_multipart --test system_publish -- --include-ignored
+```
+
+`system_multipart` proves CompleteMultipartUpload is metadata-only: it deletes
+every part body before Complete, then checks that no `[0x03]` data key changed
+and that the file's map names the parts' own objects. It also covers the
+Complete/Abort race, a part that lands after Abort, a publish whose outcome is
+unknown (left for recovery, not undone), and a dead session's part and
+Complete.
+
 Gotchas:
 - **`HTTP_PROXY` silently swallows the streamer.** The Run:ai streamer's S3
   backend is aws-c-s3 (the CRT client), which honours `HTTP_PROXY`/`HTTPS_PROXY`

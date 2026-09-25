@@ -30,6 +30,7 @@
 | `read.rs` / `write.rs` | 分块读组装 / 写缓冲 + flush |
 | `segment.rs` | 分段文件：映射拼接/裁剪/读计划（纯函数）、数据对象与映射页读写、`reclaim` |
 | `publish.rs` | 新 inode 整文件发布（条件 CAS）、删除、会话与死会话恢复、`fence_all` |
+| `multipart.rs` | S3 multipart：上传状态机、分片写入、元数据级 Complete、Abort、清理与死会话恢复 |
 | `lease_tasks.rs` | per-session lease 后台任务（heartbeat + invalidation poll + revoked 驱逐）|
 | `state.rs` | `FsState`（ClusterClient、inode 批次游标、lease 簿记、`direct_read`）|
 
@@ -495,6 +496,59 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   另一个链接还指着的 inode。`flush_inode` 在 `put_inode` 之前就清掉 `dirty`，FUSE_FLUSH 的
   put 失败后 RELEASE 看不到失败，分段 inode 的缓存不会被丢——下次 Open 按版本重建能兜住，
   PyO3 会读到 strict 错误（不是零）。
+
+### S3 multipart（`multipart.rs`）
+
+**Complete 不读、不拷、不重写任何分片正文**：每个分片写成自己的不可变数据对象
+（`ObjectStream`，和分段文件同一种对象），Complete 只读分片记录，写新文件的 `segc/` 记录、
+映射和 inode，再经 `publish_inode` 发布名字——工作量随分片数增长，与字节数无关。测试先
+删光所有分片正文再 Complete，并比对 Complete 前后的全部 `[0x03]` key，证明它一个 data key
+都没碰。
+
+- **状态机只经 CAS 迁移**：`[0x04]mpu/[id]` → `UploadRecord{parent,name,key,state}`，
+  `Open → Completing{new_ino,session,frozen} → Completed{new_ino,frozen}`，或
+  `Open → Aborted`，每一步都是对该记录的 `compare_write`，所以 Complete 与 Abort 只有一个
+  赢家。`frozen` 是 Complete 冻结的数据对象列表：之后迟到或失败的 UploadPart 写出的对象
+  不在其中，既混不进文件，也不会被当成文件的一部分删掉。
+- **数据对象的归属**：分片记录 `[0x04]mpp/[id][part]` 指向该分片**当前**的对象；上传创建
+  过的每个对象都先记在 `[0x04]mpa/[id][session][obj]`（写对象之前、随对象增长重写），
+  包括被同一分片号重试取代的。Open 时上传拥有全部；Complete 另在文件下记 `segc/`，文件
+  接管 `frozen` 里的对象。终态上传的 `cleanup` 删掉所有**不在** `frozen` 里的对象——
+  被取代的重试、Complete 列表没列的分片、Abort 后的一切——但跳过仍有 pending 记录的
+  （某个活会话还在写，由它自己看到上传已非 Open 后清理）；只要还有这种对象，上传记录就
+  留着给下一次 `sweep_uploads`。`mpa/` key 里带会话，就是为了能问"这个会话还在写它吗"。
+- **ETag = hex(对象号) ++ hex(CRC32C)**：每次尝试的对象号都不同，Complete 列表只能点名
+  客户端亲眼看到成功的那一次。
+- **会话与恢复**：每个 UploadPart 和 Complete 写任何东西之前都在会话下记
+  `PendingOp::Part{upload,part,data_ino}` / `PendingOp::Complete{upload}`（后者按新文件
+  inode 为 key）。`recover_session` 的两个分支：Part —— 上传拥有该对象（Open 且分片记录
+  指向它，或在 `frozen` 里）就留，否则删；Complete —— 状态是本会话、本 inode 的
+  Completing 时，名字指向该 inode 就推进到 Completed 并清理，否则撤销并重开上传。Abort
+  遇到别人的 Completing：那个会话活着就 Busy，死了就当场恢复它再看一次。
+- **发布是提交点，与 `publish.rs` 同一条规矩**：名字换过去之后的任何步骤（改 Completed、
+  删 pending、清理）都不能让 Complete 失败，只记 WARN 留给重试 / 恢复 / 扫描。发布返回
+  `PublishError::Other`（结果未知：在途请求之后仍可能落地）时**不撤销**，上传留在本会话
+  的 Completing、pending 记录保留；否则一个之后落地的名字会指向已删的 inode
+  （消融：对 Other 也撤销，`system_multipart` 断言上传仍是 Completing 处变红）。确定没
+  发布的错误（条件不成立、Busy、目录挡路、发布前的写失败）才撤销。
+- **本会话的重试能收尾**：上传停在本会话的 Completing 时，重试 Complete 先看名字——已指向
+  那个文件就推进到 Completed 并返回它（消融：一律 Busy，`system_multipart` 变红）；否则
+  分不清是在途未落地还是撤销失败，返回 Busy，等会话恢复。
+- **清理的代价**：`frozen` 转成 `HashSet` 再逐条比对 `mpa/` 记录（最多 10000 分片 ×
+  若干重试，线性）；`sweep_uploads` 翻完所有上传页，不只第一页（前 256 个 Open 上传挡不住
+  后面的终态上传）。
+- **已知限制**：
+  - `sweep_uploads`、`recover_dead_sessions` 目前只有测试调用，网关的周期任务尚未接入；
+    网关的 multipart HTTP 路由也尚未接入。
+  - 上传记录一 Completed 就被清理删掉，所以成功之后才到的 Complete 重试（丢了回复）得到
+    NoSuchUpload 而不是原来的结果。AWS 对这种重试会返回成功，对象存储客户端的重试因此会
+    失败；需要时给 Completed 记录留一段保留期。
+  - `create` 不记 pending：会话在建完记录后死掉，留下的 Open 上传没有分片也不会被自动
+    清理（S3 用 lifecycle 的 AbortIncompleteMultipartUpload 处理这种情况，这里还没有）。
+  - Complete 进行中收到的 UploadPart 回 Busy；若该 Complete 随后失败并重开上传，这个分片
+    已被删掉，客户端需要重传。
+  - `PendingOp` 在末尾新增了两个变体，已有变体的判别值不变。v4 树只在本地开发集群上用过，
+    生产集群仍是 v3，没有旧的 pending 记录需要转换。
 
 ### 不可达 inode 的回收要等持有者
 

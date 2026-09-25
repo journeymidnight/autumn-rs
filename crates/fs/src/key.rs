@@ -306,6 +306,79 @@ pub fn pending_prefix(session: u64) -> Vec<u8> {
     k
 }
 
+/// `(session, obj)` of a pending-operation key.
+pub fn parse_pending_key(key: &[u8]) -> Option<(u64, u64)> {
+    let p = super_key(b"pend/");
+    if key.len() == p.len() + 16 && key.starts_with(&p) {
+        let s = u64::from_be_bytes(key[p.len()..p.len() + 8].try_into().unwrap());
+        let obj = u64::from_be_bytes(key[p.len() + 8..].try_into().unwrap());
+        Some((s, obj))
+    } else {
+        None
+    }
+}
+
+/// A multipart upload: `[0x04]mpu/[id BE]` → `schema::UploadRecord`.
+pub fn upload_key(id: u64) -> Vec<u8> {
+    let mut k = upload_prefix();
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// Every upload.
+pub fn upload_prefix() -> Vec<u8> {
+    super_key(b"mpu/")
+}
+
+pub fn parse_upload_key(key: &[u8]) -> Option<u64> {
+    let p = upload_prefix();
+    (key.len() == p.len() + 8 && key.starts_with(&p))
+        .then(|| u64::from_be_bytes(key[p.len()..].try_into().unwrap()))
+}
+
+/// One part of an upload: `[0x04]mpp/[id BE][part BE]` → `schema::PartRecord`.
+pub fn upload_part_key(id: u64, part: u32) -> Vec<u8> {
+    let mut k = upload_part_prefix(id);
+    k.extend_from_slice(&part.to_be_bytes());
+    k
+}
+
+pub fn upload_part_prefix(id: u64) -> Vec<u8> {
+    let mut k = super_key(b"mpp/");
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// Every data object an upload ever created, superseded retries included:
+/// `[0x04]mpa/[id BE][session BE][data_ino BE]` → `schema::SegcRecord`.
+/// Written before the object (and rewritten as it grows), so a terminal
+/// upload's cleanup finds everything. The session is in the key so cleanup
+/// can ask whether that session still has the object in flight.
+pub fn upload_alloc_key(id: u64, session: u64, data_ino: u64) -> Vec<u8> {
+    let mut k = upload_alloc_prefix(id);
+    k.extend_from_slice(&session.to_be_bytes());
+    k.extend_from_slice(&data_ino.to_be_bytes());
+    k
+}
+
+pub fn upload_alloc_prefix(id: u64) -> Vec<u8> {
+    let mut k = super_key(b"mpa/");
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// `(session, data_ino)` of an allocation key.
+pub fn parse_upload_alloc_key(key: &[u8]) -> Option<(u64, u64)> {
+    let p = super_key(b"mpa/");
+    if key.len() == p.len() + 24 && key.starts_with(&p) {
+        let s = u64::from_be_bytes(key[p.len() + 8..p.len() + 16].try_into().unwrap());
+        let d = u64::from_be_bytes(key[p.len() + 16..].try_into().unwrap());
+        Some((s, d))
+    } else {
+        None
+    }
+}
+
 pub fn unlink_tombstone_prefix() -> Vec<u8> {
     super_key(b"rmtomb/")
 }
@@ -351,6 +424,23 @@ mod tests {
         assert!(sv.starts_with(&[PREFIX_SUPER]));
         assert!(!sv.starts_with(&unlink_tombstone_prefix()));
         assert_eq!(parse_unlink_tombstone(&sv), None);
+    }
+
+    #[test]
+    fn multipart_keys_roundtrip_and_stay_apart() {
+        assert_eq!(parse_pending_key(&pending_key(7, 9)), Some((7, 9)));
+        assert_eq!(parse_upload_key(&upload_key(0xABCD)), Some(0xABCD));
+        let a = upload_alloc_key(5, 6, 7);
+        assert!(a.starts_with(&upload_alloc_prefix(5)));
+        assert_eq!(parse_upload_alloc_key(&a), Some((6, 7)));
+        // One upload's prefixes never cover another's records.
+        assert!(!upload_part_key(5, 1).starts_with(&upload_part_prefix(6)));
+        assert!(!upload_alloc_key(50, 1, 1).starts_with(&upload_alloc_prefix(5)));
+        // The upload scan sees only upload records.
+        for k in [upload_part_key(5, 1), a, pending_key(5, 5), session_key(5)] {
+            assert!(!k.starts_with(&upload_prefix()));
+            assert_eq!(parse_upload_key(&k), None);
+        }
     }
 
     #[test]

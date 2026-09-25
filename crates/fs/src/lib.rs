@@ -17,6 +17,7 @@ pub mod geom;
 pub mod key;
 pub mod lease_tasks;
 pub mod meta;
+pub mod multipart;
 pub mod publish;
 pub mod read;
 pub mod schema;
