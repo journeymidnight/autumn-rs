@@ -149,21 +149,20 @@ async fn scan_extents(
     let mut starts: Vec<u64> = Vec::new();
     let mut start_key = prefix.clone();
     loop {
-        let keys = state.kv_range_keys(&prefix, &start_key, RANGE_PAGE).await?;
-        let got = keys.len();
+        let (keys, has_more) = state.kv_range_page(&prefix, &start_key, RANGE_PAGE).await?;
         for k in &keys {
             if let Some((_, off)) = key::parse_extent_key(k) {
                 starts.push(off);
             }
         }
-        if got < RANGE_PAGE as usize {
-            break;
+        // Resume past the last RETURNED key, not the last parsed one: 18-byte
+        // striped / data-object keys can share this 9-byte prefix (lane 0 of
+        // an inode numbered `ino << 8 | x`), and a page made only of those
+        // would otherwise never move the cursor.
+        match (has_more, keys.last()) {
+            (true, Some(last)) => start_key = crate::dir::name_successor(last),
+            _ => break,
         }
-        // Advance strictly past the last start: extent_key(ino, last+1) is the
-        // smallest valid 17-byte key > the last returned extent key, so the
-        // inclusive range `start` excludes it without re-reading.
-        let last_off = starts.last().copied().unwrap_or(0);
-        start_key = key::extent_key(ino, last_off.saturating_add(1));
     }
     starts.sort_unstable();
     starts.dedup();
@@ -268,12 +267,12 @@ pub async fn plan_append_only(
         return Ok(None);
     }
     // A striped inode is not this path's business (the mount refuses striped
-    // writes upstream); bail rather than compute lane keys here.
+    // writes upstream), nor is a segmented one (its writes splice the map);
+    // bail rather than compute extent keys here.
     if state
         .inodes
         .get(&ino)
-        .and_then(|is| is.meta.stripe.as_ref())
-        .is_some()
+        .is_some_and(|is| is.meta.stripe.is_some() || is.meta.segments.is_some())
     {
         return Ok(None);
     }
@@ -341,6 +340,9 @@ pub async fn write_region(
 ) -> Result<()> {
     if data.is_empty() {
         return Ok(());
+    }
+    if state.inodes.get(&ino).is_some_and(|is| is.meta.segments.is_some()) {
+        return crate::segment::write_file_range(state, ino, offset, data).await;
     }
     let mut ext = extents_snapshot(state, ino, file_size, None).await?;
     // BUG-LEASE-8 (coco P1): leftover extents from a crashed shrink must
@@ -509,13 +511,74 @@ async fn flush_appends(
 pub async fn remove_unreachable_inode(state: &mut FsState, ino: u64) -> Result<()> {
     let tk = crate::key::unlink_tombstone_key(ino);
     state.kv_put(&tk, b"1").await?;
-    delete_all_extents(state, ino).await?;
-    let ik = crate::key::inode_key(ino);
-    let _ = state.kv_delete(&ik).await;
-    let _ = state.kv_delete(&tk).await;
-    state.inodes.remove(&ino);
-    state.dirty_inodes.remove(&ino);
+    // Open here: POSIX keeps an unlinked file's data until its last close,
+    // and that close retries (`FsState::unlinked_open`).
+    if state.held_leases.borrow().contains_key(&ino) {
+        state.unlinked_open.insert(ino);
+        return Ok(());
+    }
+    reclaim_unreachable(state, ino).await?;
     Ok(())
+}
+
+/// Delete an unreachable inode's data, inode key and tombstone — once no
+/// other client holds any lease on it. Returns `false`, leaving the
+/// tombstone for a later sweep, while one does: another mount with the file
+/// open, or an S3 GET in progress, must not have the data pulled from under
+/// it. The removal is stamped with the EXCLUSIVE lease's epoch.
+pub async fn reclaim_unreachable(state: &mut FsState, ino: u64) -> Result<bool> {
+    use autumn_client::lease::{self, AcquireResult};
+    let cluster = state.client.clone();
+    let id = state.client_id.clone();
+    let epoch = match lease::acquire(&cluster, &id, ino, autumn_rpc::manager_rpc::LEASE_MODE_EXCLUSIVE)
+        .await
+        .map_err(|e| anyhow!("reclaim {ino}: {e}"))?
+    {
+        AcquireResult::Granted(info) => info.version,
+        AcquireResult::Conflict { .. } | AcquireResult::RevokePending { .. } => return Ok(false),
+    };
+    let lease = autumn_client::WriteLease { inode_hint: ino, lease_epoch: epoch };
+    // Re-acquiring as the same client re-checks every other holder. EXCLUSIVE
+    // is not persisted, so a manager failover forgets it (or replays it as a
+    // plain WRITE, if this client held one) and other clients can then be
+    // granted; exclusivity is confirmed again before each phase that deletes.
+    let still_exclusive = || async {
+        matches!(
+            lease::acquire(&cluster, &id, ino, autumn_rpc::manager_rpc::LEASE_MODE_EXCLUSIVE).await,
+            Ok(AcquireResult::Granted(_))
+        )
+    };
+    let res = async {
+        // A segmented file's data is whatever its reclaim records name; with
+        // the file gone, all of it goes. On a replay the inode may already be
+        // gone, and then the records are consulted whatever it was; a plain
+        // file that still exists has none, so the scan is skipped.
+        let plain = match state.kv_get_opt(&crate::key::inode_key(ino)).await? {
+            Some(b) => crate::schema::decode_inode_meta(&b).is_ok_and(|m| m.segments.is_none()),
+            None => false,
+        };
+        if !plain {
+            crate::segment::reclaim(state, ino, None, lease).await?;
+            let _ = state.kv_delete_fenced(&crate::key::segment_garbage_key(ino), lease).await;
+        }
+        if !still_exclusive().await {
+            return anyhow::Ok(false);
+        }
+        delete_all_extents_with(state, ino, lease).await?;
+        if !still_exclusive().await {
+            return anyhow::Ok(false);
+        }
+        let _ = state.kv_delete_fenced(&crate::key::inode_key(ino), lease).await;
+        state.kv_delete(&crate::key::unlink_tombstone_key(ino)).await?;
+        state.inodes.remove(&ino);
+        state.dirty_inodes.remove(&ino);
+        anyhow::Ok(true)
+    }
+    .await;
+    if let Err(e) = lease::release(&cluster, &id, ino).await {
+        tracing::warn!(ino, error = %e, "reclaim: releasing the exclusive lease failed; TTL revoke is the backstop");
+    }
+    res
 }
 
 /// UNLINK-1: mount-time replay of interrupted unlinks. Returns the
@@ -533,13 +596,15 @@ pub async fn sweep_unlink_tombstones(state: &mut FsState) -> Result<usize> {
         for k in &keys {
             if let Some(ino) = crate::key::parse_unlink_tombstone(k) {
                 last_ino = ino;
-                if let Err(e) = remove_unreachable_inode(state, ino).await {
-                    tracing::warn!(
-                        ino,
-                        "unlink tombstone replay failed (retried next mount): {e}"
-                    );
-                } else {
-                    n += 1;
+                // Still open here: its last close reclaims it.
+                if state.held_leases.borrow().contains_key(&ino) {
+                    continue;
+                }
+                match reclaim_unreachable(state, ino).await {
+                    Ok(true) => n += 1,
+                    // Held elsewhere; the next sweep retries.
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(ino, "unlink tombstone replay failed (retried next sweep): {e}"),
                 }
             }
         }
@@ -556,6 +621,16 @@ pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
     // fenced under the held WRITE lease (anonymous when none is held —
     // unlink without an open writer is a metadata-path operation).
     let lease = state.write_lease_for(ino);
+    delete_all_extents_with(state, ino, lease).await
+}
+
+/// `delete_all_extents` stamped with an explicit lease (a reclaim holds an
+/// EXCLUSIVE lease that is not one of this session's open-file leases).
+pub async fn delete_all_extents_with(
+    state: &mut FsState,
+    ino: u64,
+    lease: autumn_client::WriteLease,
+) -> Result<()> {
     // a striped inode's extents live under `[0x03][lane][ino][off]`,
     // NOT scannable by the `[0x03][ino]` prefix — a range-scan would MISS them and
     // leak. Look up stripe+size (cached from the caller's get_inode; on
@@ -597,19 +672,17 @@ pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
     let prefix = key::extent_prefix(ino);
     let mut start_key = prefix.clone();
     loop {
-        let keys = state.kv_range_keys(&prefix, &start_key, RANGE_PAGE).await?;
-        let got = keys.len();
-        let mut last_off = 0u64;
+        let (keys, has_more) = state.kv_range_page(&prefix, &start_key, RANGE_PAGE).await?;
         for k in &keys {
-            if let Some((_, off)) = key::parse_extent_key(k) {
-                last_off = off;
+            if key::parse_extent_key(k).is_some() {
                 let _ = state.kv_delete_fenced(k, lease).await;
             }
         }
-        if got < RANGE_PAGE as usize {
-            break;
+        // Past the last RETURNED key (see `scan_extents`).
+        match (has_more, keys.last()) {
+            (true, Some(last)) => start_key = crate::dir::name_successor(last),
+            _ => break,
         }
-        start_key = key::extent_key(ino, last_off.saturating_add(1));
     }
     invalidate(state, ino);
     Ok(())
@@ -675,18 +748,17 @@ pub async fn clean_beyond_eof(state: &mut FsState, ino: u64, eof: u64) -> Result
     let mut starts: Vec<u64> = Vec::new();
     let mut start_key = prefix.clone();
     loop {
-        let keys = state.kv_range_keys(&prefix, &start_key, RANGE_PAGE).await?;
-        let got = keys.len();
+        let (keys, has_more) = state.kv_range_page(&prefix, &start_key, RANGE_PAGE).await?;
         for k in &keys {
             if let Some((_, off)) = key::parse_extent_key(k) {
                 starts.push(off);
             }
         }
-        if got < RANGE_PAGE as usize {
-            break;
+        // Past the last RETURNED key (see `scan_extents`).
+        match (has_more, keys.last()) {
+            (true, Some(last)) => start_key = crate::dir::name_successor(last),
+            _ => break,
         }
-        let last_off = starts.last().copied().unwrap_or(0);
-        start_key = key::extent_key(ino, last_off.saturating_add(1));
     }
     starts.sort_unstable();
     starts.dedup();

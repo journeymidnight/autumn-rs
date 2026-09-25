@@ -159,6 +159,29 @@ pub struct FsState {
     /// would miss the in-flight flush's extents and return zeros for bytes the
     /// write acknowledged.
     pub pipelined_writes: bool,
+
+    /// Segment-map pages fetched for reads. Pages are immutable, so a cached
+    /// page is never stale; see `segment::load_range`.
+    pub segment_pages: crate::segment::PageCache,
+
+    /// The filesystem's declared stripe geometry, read once per session when
+    /// the first data object is written.
+    pub stripe_geom: Option<crate::schema::StripeLayout>,
+
+    /// Unreachable inodes this session still had open when their last name
+    /// went: their data is reclaimed at the last close, not at the unlink.
+    pub unlinked_open: HashSet<u64>,
+
+    /// This session's publishing-session inode (`publish::session_lease`).
+    pub session: Option<u64>,
+
+    /// Segmented files this session changed (each marked `segg/` first);
+    /// reclaimed at the last close (`segment::reclaim_live`).
+    pub segment_garbage: HashSet<u64>,
+
+    /// Where the next `segment::sweep_garbage` page starts, so markers held
+    /// elsewhere cannot keep the sweep from ever reaching the rest.
+    pub garbage_sweep_from: Option<Vec<u8>>,
 }
 
 impl FsState {
@@ -224,7 +247,9 @@ impl FsState {
         Ok(Self::from_client(client, host))
     }
 
-    fn from_client(client: ClusterClient, host: String) -> Self {
+    /// Wrap an already-connected client (scoped to `fs`). `host` seeds the
+    /// lease identity. For tools that connect themselves, like `autumnfs`.
+    pub fn from_client(client: ClusterClient, host: String) -> Self {
         Self {
             client: Rc::new(client),
             inodes: HashMap::new(),
@@ -239,6 +264,12 @@ impl FsState {
             kernel_invalidator: RefCell::new(None),
             direct_read: false,
             pipelined_writes: false,
+            segment_pages: crate::segment::PageCache::new(),
+            stripe_geom: None,
+            unlinked_open: HashSet::new(),
+            session: None,
+            segment_garbage: HashSet::new(),
+            garbage_sweep_from: None,
         }
     }
 

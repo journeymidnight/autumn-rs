@@ -38,6 +38,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 rkyv = { version = "0.8", features = ["alloc"] }
+crc32c.workspace = true
 # Two floors, both load-bearing:
 #   abi-7-12 — `Notifier::inval_inode` / `inval_entry`, so the per-mount
 #     invalidation poll loop can drop the kernel's attribute + page cache on a

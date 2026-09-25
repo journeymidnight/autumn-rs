@@ -254,6 +254,7 @@ dependencies = [
  "bytes",
  "clap",
  "compio",
+ "crc32c",
  "crossbeam-channel",
  "fuser",
  "futures",

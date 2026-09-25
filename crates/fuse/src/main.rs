@@ -383,6 +383,14 @@ fn main() -> Result<()> {
 }
 
 async fn periodic_sync(state: &mut FsState) {
+    // Unreachable inodes whose data waited for another client to let go.
+    // Cheap when there are none: one empty range scan.
+    if let Err(e) = autumn_fuse::extent::sweep_unlink_tombstones(state).await {
+        tracing::warn!(error = %e, "periodic sync: tombstone sweep failed");
+    }
+    if let Err(e) = autumn_fuse::segment::sweep_garbage(state).await {
+        tracing::warn!(error = %e, "periodic sync: segment garbage sweep failed");
+    }
     let dirty: Vec<u64> = state.dirty_inodes.iter().copied().collect();
     if dirty.is_empty() {
         return;

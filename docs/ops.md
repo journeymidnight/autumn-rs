@@ -3495,6 +3495,40 @@ Three traps this script exists to encode, all of which cost a run to find:
   makes the final check fail as `connect PS … failed`, which reads like a
   data-plane break and is not one.
 
+## fs schema v3 → v4 upgrade (segmented files)
+
+v4 adds `generation` and `segments` to every inode. It is a stop-the-world
+change of the `fs/` tree, converted in place by `migratev3_v4`; nothing is
+reset and no file data is touched. It ships with wire 48, so the cluster
+binaries swap in the same window.
+
+```bash
+# 0. Stop EVERY fs client: fuse mounts, autumn-s3 gateways, Python autumn.Fs
+#    users, autumnfs. An old binary does not check the stamp and misreads v4
+#    inodes, silently.
+# 1. Swap and restart manager / PS / EN on the new build (etcd kept).
+# 2. Check the stamp and count what will convert:
+migratev3_v4 --manager $MGR --dry-run
+#    "fs has no schema stamp": the tree was built by autumnfs or the S3 gateway
+#    alone (they did not stamp before v4) and its inodes are v3 — add
+#    --unstamped-is-v3 to this and the next command.
+# 3. Convert. Prints "converted N inodes; fs schema is now v4". Safe to rerun
+#    after an interruption: it resumes from [0x04]migrate_v4_cursor.
+migratev3_v4 --manager $MGR
+migratev3_v4 --manager $MGR            # again: "already v4; nothing to do"
+# 4. Spot-check with the NEW autumnfs, then start the clients on the new build.
+autumnfs --manager $MGR ls /
+autumnfs --manager $MGR cat /some/file | sha256sum
+```
+
+A new fs client against an unconverted tree refuses to start ("on-disk fs
+schema version 3 != supported 4"), and against an unstamped populated tree says
+to run the converter — it never stamps over existing inodes. (A pre-release v4
+build did stamp v4 over an unstamped v3 tree; every new client then fails with
+"decode inode". Repair: put the stamp back to 3, then convert —
+`printf '\0\0\0\0\0\0\0\3' > v3; autumn-client --namespace fs put "$(printf '\x04schema_version')" v3`.) Delete the
+`migratev3_v4` bin once the one cluster is converted, as with `migratev0_v1`.
+
 ## S3 gateway — serving autumn weights to engines with no loader plugin
 
 `autumn-s3` is a read-only, unauthenticated S3 endpoint over the `fs/` tree. It

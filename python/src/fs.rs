@@ -589,10 +589,25 @@ impl Fs {
             if fire {
                 let cluster = st.client.clone();
                 let id = st.client_id.clone();
-                lease::release(&cluster, &id, ino)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| format!("release ino {ino}: {e}"))
+                match lease::release(&cluster, &id, ino).await {
+                    Err(e) => Err(format!("release ino {ino}: {e}")),
+                    // The last release of a file unlinked or changed while
+                    // held: the same deferred reclaim the FUSE mount runs at
+                    // last close. A conflict leaves it to a sweep.
+                    Ok(_) if st.unlinked_open.remove(&ino) => {
+                        autumn_fuse::extent::reclaim_unreachable(st, ino)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("reclaim ino {ino}: {e}"))
+                    }
+                    Ok(_) if st.segment_garbage.contains(&ino) => {
+                        autumn_fuse::segment::reclaim_live(st, ino)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| format!("reclaim ino {ino}: {e}"))
+                    }
+                    Ok(_) => Ok(()),
+                }
             } else {
                 Ok(())
             }

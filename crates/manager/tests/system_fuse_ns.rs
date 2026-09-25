@@ -206,3 +206,34 @@ fn readdir_pages_past_one_range_page() {
         }
     });
 }
+
+/// A tree that holds inodes but no schema stamp was built by a pre-v4 tool
+/// that never stamped (autumnfs, the S3 gateway); its inodes are v3. The core
+/// must refuse it rather than stamp the current version over them — which it
+/// did, on a live conversion, before this check.
+#[test]
+#[ignore]
+fn an_unstamped_populated_tree_is_refused_not_stamped() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 140, 14001).await;
+        let mut state = FsState::new(&mgr_addr.to_string()).await.expect("mount");
+        // Some inode, as an unstamping tool would have left it.
+        state.kv_put(&autumn_fuse::key::inode_key(1), b"v3 bytes").await.unwrap();
+        let err = meta::ensure_root(&mut state).await.expect_err("must refuse");
+        assert!(err.to_string().contains("no schema stamp"), "{err}");
+        assert_eq!(
+            state.kv_get_opt(&autumn_fuse::key::schema_version_key()).await.unwrap(),
+            None,
+            "nothing stamped"
+        );
+    });
+}

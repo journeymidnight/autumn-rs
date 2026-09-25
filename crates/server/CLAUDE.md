@@ -205,10 +205,30 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 | `get <REMOTE> <LOCAL>` | Download to local file (`-` = stdout) |
 | `rm <PATH>` | Remove a file or empty directory |
 
+- **Built on an `FsState`** since v4: `ensure_root` is the core's, so the CLI
+  verifies the schema stamp (its own copy never did, and a v3 CLI misreads v4
+  inodes), and `rm` is the core's `unlink`/`rmdir` (tombstoned removal, segment
+  reclaim, deferral while another client holds the file) instead of a third copy
+  that deleted extents before the name. `cat`/`get` of a segmented file plan
+  from its map and fail on a missing data extent.
 - **Namespace-first binding**: connects via `ClusterClient::connect(mgr, "fs")`, so the binding prepends `fs/` to every relative fuse key (and strips it off range results) — the same single global keyspace a fuse mount uses, so writes here are visible to a mount. No `--tenant`; this CLI sees the whole `fs/` namespace.
 - **Authz**: `--credential-file` (`<principal>\n<hex>`, from `autumn-op principal-create`) is REQUIRED when the cluster protects `fs/` (connects via `connect_with_credential`, fails fast if the credential doesn't cover `fs/`); omit on an authz-off cluster.
 - **Inodes** come from the MANAGER's global counter (`alloc_inodes`) — the same crash-safe source the fuse mount and PyO3 `autumn.Fs` use, so no colliding inodes.
 - **ls / cat**: PS `handle_range` returns key-only entries, so both do a per-key `cluster.get` after the range scan (fine for one-shot CLI use). **Sizes**: files ≤4 KiB inline in the `InodeMeta`; larger go through the extent path (8 MiB chunks, `extent_key([0x03][ino BE][off BE])`).
+
+### `migratev3_v4` — the fs schema v3 → v4 converter (run once, then delete)
+
+Rewrites every `[0x01][ino]` of the `fs/` tree from the v3 `InodeMeta` (vendored
+in the tool) to v4 (`generation = 1`, `segments = None`); dirents, extents and
+inode numbers are untouched, and the `[0x04]schema_version` stamp moves to 4
+LAST. Resumable: the last converted key is kept in `[0x04]migrate_v4_cursor`,
+so an interrupted run continues instead of decoding converted values as v3.
+`--dry-run` decodes everything and writes nothing; `--unstamped-is-v3` accepts
+a populated tree with no stamp (built by autumnfs or the S3 gateway, which did
+not stamp before v4). Stop every fs client first — an old binary does not check
+the stamp and misreads v4 inodes. Verified on a local cluster: 6715 inodes,
+listings and file bytes identical before and after, rerun a no-op. Runbook in
+`docs/ops.md`.
 
 ### `migratev0_v1` — RAN AND DELETED (2026-09-20)
 

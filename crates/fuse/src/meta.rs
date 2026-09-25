@@ -57,6 +57,8 @@ pub fn new_file_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
         inline_data: None,
         symlink_target: None,
         stripe: None,
+        generation: 1,
+        segments: None,
     }
 }
 
@@ -78,6 +80,8 @@ pub fn new_dir_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
         inline_data: None,
         symlink_target: None,
         stripe: None,
+        generation: 1,
+        segments: None,
     }
 }
 
@@ -124,11 +128,13 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
             // everything under `fs/{tenant}/{volume}/…`, i.e. relative keys that
             // begin with a volume-name byte (`[a-z0-9._-]`, all ≥ 0x2d). Our own
             // keys begin with a type byte (0x01–0x04). So if ANY relative key
-            // ≥ 0x05 exists, this tenant holds old volume-scoped data that our
+            // ≥ 0x06 exists, this tenant holds old volume-scoped data that our
             // `fs/{tenant}/…` keys would SHADOW — mounting would silently show an
             // empty FS and write a second dataset. Refuse loudly instead
             // (the deploy is a stop-world reset; wipe or migrate first).
-            let stragglers = state.kv_range_keys(b"", b"\x05", 1).await?;
+            // (0x05 is the v4 segment-page prefix, so the first byte no layout
+            // of ours uses is 0x06.)
+            let stragglers = state.kv_range_keys(b"", b"\x06", 1).await?;
             if !stragglers.is_empty() {
                 return Err(anyhow!(
                     "fs/{{tenant}}/ has no schema stamp but holds keys from the \
@@ -136,6 +142,21 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
                      (it would shadow that data as an empty FS). Wipe/reset this \
                      tenant's fs keyspace or run against a matching build.",
                     String::from_utf8_lossy(&stragglers[0])
+                ));
+            }
+            // Nor may it be a tree some other writer populated without ever
+            // stamping it: the `autumnfs` CLI and the S3 gateway did not stamp
+            // before v4, so a tree they alone built holds v3 inodes and no
+            // stamp. Stamping the current version over those would declare
+            // them readable as a layout they are not.
+            let inodes = state.kv_range_keys(&[0x01], &[0x01], 1).await?;
+            if !inodes.is_empty() {
+                return Err(anyhow!(
+                    "fs/ holds inodes but no schema stamp — it was built by a tool that \
+                     did not stamp (autumnfs or the S3 gateway before v4), so its \
+                     inodes are v3. Refusing to stamp v{} over them: convert it with \
+                     `migratev3_v4 --unstamped-is-v3`.",
+                    schema::SCHEMA_VERSION
                 ));
             }
             state

@@ -89,6 +89,7 @@ dependencies = [
  "autumn-transport",
  "bytes",
  "compio",
+ "crc32c",
  "libc",
  "rkyv",
  "tracing",

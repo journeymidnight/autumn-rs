@@ -8,6 +8,7 @@
 //! | 0x02   | Dir entry     | [0x02][parent_ino: u64 BE][name bytes]    |
 //! | 0x03   | File extent   | [0x03][ino: u64 BE][logical_off: u64 BE]  |
 //! | 0x04   | FS superblock | [0x04][field bytes]                       |
+//! | 0x05   | Segment page  | [0x05][map_id: u64 BE][page: u32 BE]      |
 //!
 //! data is stored as **variable-length extents** keyed by their logical
 //! byte offset (was fixed 256 KiB chunks keyed by chunk index). BigEndian
@@ -18,6 +19,7 @@ const PREFIX_INODE: u8 = 0x01;
 const PREFIX_DIRENT: u8 = 0x02;
 const PREFIX_EXTENT: u8 = 0x03;
 const PREFIX_SUPER: u8 = 0x04;
+const PREFIX_SEGMENT_PAGE: u8 = 0x05;
 
 /// Encode inode metadata key: `[0x01][ino BE]`
 pub fn inode_key(ino: u64) -> Vec<u8> {
@@ -134,6 +136,27 @@ pub fn parse_striped_extent_key(key: &[u8]) -> Option<(u8, u64, u64)> {
     }
 }
 
+/// A data object's extent key: `[0x03][lane][data_ino][off]` with the lane
+/// rotated by `data_ino` (see `schema::Segment`). `off` is `unit`-aligned.
+pub fn data_extent_key(data_ino: u64, off: u64, lanes: u8, unit: u32) -> Vec<u8> {
+    let lane = ((off / unit as u64 + data_ino) % lanes as u64) as u8;
+    let mut key = Vec::with_capacity(18);
+    key.push(PREFIX_EXTENT);
+    key.push(lane);
+    key.extend_from_slice(&data_ino.to_be_bytes());
+    key.extend_from_slice(&off.to_be_bytes());
+    key
+}
+
+/// A segment-map page: `[0x05][map_id BE][page BE]`.
+pub fn segment_page_key(map_id: u64, page: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(13);
+    key.push(PREFIX_SEGMENT_PAGE);
+    key.extend_from_slice(&map_id.to_be_bytes());
+    key.extend_from_slice(&page.to_be_bytes());
+    key
+}
+
 /// The lane-partition split boundary (RELATIVE key `[0x03][lane]`). Splitting the
 /// fs partition at each of `[0x03][1]..[0x03][N]` yields N lane partitions:
 /// lane 0 = `[start, [0x03][1])` (also holds 0x01/0x02 metadata + legacy
@@ -192,6 +215,94 @@ pub fn stripe_geom_key() -> Vec<u8> {
 pub fn unlink_tombstone_key(ino: u64) -> Vec<u8> {
     let mut k = super_key(b"rmtomb/");
     k.extend_from_slice(&ino.to_be_bytes());
+    k
+}
+
+/// A segmented file's reclaim record: `[0x04]segc/[file_ino BE][id BE]`,
+/// one per data object or paged map the file has ever created. Written
+/// before the object or pages themselves, so nothing a crash leaves behind is
+/// unfindable; reclaim deletes what the file's current map no longer names.
+pub fn segc_key(file_ino: u64, id: u64) -> Vec<u8> {
+    let mut k = segc_prefix(file_ino);
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// Marker that segmented file `ino` has garbage to reclaim:
+/// `[0x04]segg/[ino BE]`. Written when a change drops data objects or a map
+/// the file still has records for; the sweep reclaims under EXCLUSIVE and
+/// deletes it.
+pub fn segment_garbage_key(ino: u64) -> Vec<u8> {
+    let mut k = segment_garbage_prefix();
+    k.extend_from_slice(&ino.to_be_bytes());
+    k
+}
+
+pub fn segment_garbage_prefix() -> Vec<u8> {
+    super_key(b"segg/")
+}
+
+pub fn parse_segment_garbage_key(key: &[u8]) -> Option<u64> {
+    let p = segment_garbage_prefix();
+    (key.len() == p.len() + 8 && key.starts_with(&p))
+        .then(|| u64::from_be_bytes(key[p.len()..].try_into().unwrap()))
+}
+
+/// All reclaim records of one file.
+pub fn segc_prefix(file_ino: u64) -> Vec<u8> {
+    let mut k = super_key(b"segc/");
+    k.extend_from_slice(&file_ino.to_be_bytes());
+    k
+}
+
+/// Every file's reclaim records.
+pub fn segc_all_prefix() -> Vec<u8> {
+    super_key(b"segc/")
+}
+
+/// `(file_ino, id)` of a reclaim record key.
+pub fn parse_segc_key(key: &[u8]) -> Option<(u64, u64)> {
+    let p = segc_all_prefix();
+    if key.len() == p.len() + 16 && key.starts_with(&p) {
+        let f = u64::from_be_bytes(key[p.len()..p.len() + 8].try_into().unwrap());
+        let id = u64::from_be_bytes(key[p.len() + 8..].try_into().unwrap());
+        Some((f, id))
+    } else {
+        None
+    }
+}
+
+/// A publishing session: `[0x04]sess/[session_ino BE]`. Its owner holds a
+/// WRITE lease on `session_ino`; the record is how a sweeper finds sessions
+/// whose owner died.
+pub fn session_key(session: u64) -> Vec<u8> {
+    let mut k = super_key(b"sess/");
+    k.extend_from_slice(&session.to_be_bytes());
+    k
+}
+
+pub fn session_prefix() -> Vec<u8> {
+    super_key(b"sess/")
+}
+
+pub fn parse_session_key(key: &[u8]) -> Option<u64> {
+    let p = session_prefix();
+    (key.len() == p.len() + 8 && key.starts_with(&p))
+        .then(|| u64::from_be_bytes(key[p.len()..].try_into().unwrap()))
+}
+
+/// An operation a session has in progress: `[0x04]pend/[session BE][obj BE]`.
+/// Written before the operation writes anything, deleted once it is done or
+/// undone; a dead session's records say what to finish or roll back.
+pub fn pending_key(session: u64, obj: u64) -> Vec<u8> {
+    let mut k = pending_prefix(session);
+    k.extend_from_slice(&obj.to_be_bytes());
+    k
+}
+
+pub fn pending_prefix(session: u64) -> Vec<u8> {
+    let mut k = super_key(b"pend/");
+    k.extend_from_slice(&session.to_be_bytes());
     k
 }
 

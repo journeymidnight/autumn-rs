@@ -338,7 +338,9 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
     // like legitimate in-file data (its RMW would merge the write into
     // the stale value and expose pre-shrink bytes in the sparse hole).
     // Cold path: only fires on a beyond-EOF write (offset > size).
-    {
+    // A segmented file has no extents beyond its map for a grow to expose.
+    let segmented = state.inodes.get(&ino).is_some_and(|is| is.meta.segments.is_some());
+    if !segmented {
         let cur_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
         if offset as u64 > cur_size {
             // Reads and rewrites the extent map, so nothing may be in flight.
@@ -534,6 +536,8 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
         let (s, ns) = now_ts();
         is.meta.mtime_secs = s;
         is.meta.mtime_nsecs = ns;
+        // A new content version, persisted with the size at the next flush.
+        is.meta.generation += 1;
         is.dirty = true;
     }
     state.dirty_inodes.insert(ino);
@@ -615,7 +619,7 @@ pub async fn flush_inode(state: &mut FsState, ino: u64, report: FlushReport) -> 
 }
 
 /// Ensure the inode is loaded in the cache.
-async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
+pub(crate) async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
     if state.inodes.contains_key(&ino) {
         return Ok(());
     }
@@ -637,7 +641,27 @@ async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
 }
 
 /// Truncate a file to the given size.
+///
+/// A segmented file is changed only under a WRITE lease. `open(O_TRUNC)` and
+/// path `truncate(2)` reach here before (or without) any open, so when this
+/// session holds nothing on the file the lease is taken for this one change.
 pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()> {
+    if !crate::segment::needs_transient_write(state, ino).await? {
+        return truncate_held(state, ino, new_size).await;
+    }
+    crate::segment::hold_transient_write(state, ino).await?;
+    let res = truncate_held(state, ino, new_size).await;
+    if res.is_err() {
+        // The cached map may name pages the failed put never published, and
+        // which the reclaim below is about to delete.
+        state.inodes.remove(&ino);
+        state.dirty_inodes.remove(&ino);
+    }
+    crate::segment::drop_transient_write(state, ino).await;
+    res
+}
+
+async fn truncate_held(state: &mut FsState, ino: u64, new_size: u64) -> Result<()> {
     ensure_inode_cached(state, ino).await?;
     // (coco P1): fuse truncate of a striped file would run the legacy
     // range-scan extent cleanup, which finds no `[0x03][lane]…` keys → leaks the
@@ -687,7 +711,12 @@ pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()
         }
     }
 
-    if new_size > old_size {
+    let segmented = state.inodes.get(&ino).is_some_and(|is| is.meta.segments.is_some());
+    if segmented {
+        // Clip the map; a later extension is a hole. The data the clip drops
+        // stays until reclaim, which waits for readers of the older map.
+        crate::segment::truncate_file(state, ino, new_size).await?;
+    } else if new_size > old_size {
         // GROW (coco P1): reap any leftover extents beyond the old EOF
         // BEFORE the size expands over them — the residue of a crashed
         // shrink's cleanup window would otherwise re-enter the readable
@@ -706,11 +735,14 @@ pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()
         is.meta.mtime_nsecs = ns;
         is.meta.ctime_secs = s;
         is.meta.ctime_nsecs = ns;
+        if !segmented {
+            is.meta.generation += 1;
+        }
         is.meta.clone()
     };
     put_inode(state, ino, &meta).await?;
 
-    if new_size < old_size {
+    if new_size < old_size && !segmented {
         // Cleanup AFTER the commit: delete extents past the new EOF +
         // shorten the straddling one (variable-length extents
         // keyed by logical offset). The truncate is already COMMITTED

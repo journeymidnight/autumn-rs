@@ -26,6 +26,10 @@ name = "autumn-ps"
 path = "src/bin/partition_server.rs"
 
 [[bin]]
+name = "migratev3_v4"
+path = "src/bin/migratev3_v4.rs"
+
+[[bin]]
 name = "autumn-client"
 path = "src/bin/autumn_client/main.rs"
 

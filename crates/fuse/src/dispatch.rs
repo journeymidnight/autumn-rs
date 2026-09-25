@@ -356,7 +356,34 @@ pub async fn handle_request(
             mtime,
             reply,
         } => {
+            // A size change of a segmented file this mount holds nothing on
+            // (`open(O_TRUNC)` arrives as this SETATTR before the OPEN, and
+            // `truncate(2)` never opens) runs under a WRITE lease taken for
+            // the whole request, so the trailing inode put below is fenced
+            // too, not only the truncate's own.
+            let transient = match size {
+                Some(_) => crate::segment::needs_transient_write(state, ino).await,
+                None => Ok(false),
+            };
+            let transient = match transient {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return true;
+                }
+            };
+            if transient {
+                if let Err(e) = crate::segment::hold_transient_write(state, ino).await {
+                    let _ = reply.send(Err(e));
+                    return true;
+                }
+            }
             let result = async {
+                // Size first: the truncate writes its own meta, and the edits
+                // below apply to the result rather than being overwritten by it.
+                if let Some(s) = size {
+                    write::truncate(state, ino, s).await?;
+                }
                 let mut meta = get_inode(state, ino).await?;
                 if let Some(m) = mode {
                     meta.mode = (meta.mode & S_IFMT) | (m & 0o7777);
@@ -366,11 +393,6 @@ pub async fn handle_request(
                 }
                 if let Some(g) = gid {
                     meta.gid = g;
-                }
-                if let Some(s) = size {
-                    write::truncate(state, ino, s).await?;
-                    // Re-fetch after truncate
-                    meta = get_inode(state, ino).await?;
                 }
                 // Resolve a SetAttr time (explicit timestamp or "now") into
                 // the meta's secs/nsecs pair — identical for atime and mtime.
@@ -401,6 +423,15 @@ pub async fn handle_request(
                 Ok(inode_to_attr(ino, &meta))
             }
             .await;
+            if transient {
+                if result.is_err() {
+                    // The cached map may name pages no put published, which
+                    // the reclaim in the release is about to delete.
+                    state.inodes.remove(&ino);
+                    state.dirty_inodes.remove(&ino);
+                }
+                crate::segment::drop_transient_write(state, ino).await;
+            }
             let _ = reply.send(result);
         }
         FsRequest::Mkdir {
@@ -937,6 +968,9 @@ pub async fn handle_request(
                 // CONSUME the record, so a later release found nothing and took
                 // the normal path; now the record stands by design.
                 let mut deferred_flush_err: Option<anyhow::Error> = None;
+                // Revoked or not: a failed flush leaves a cached map no put
+                // published, which matters below once the lease is gone.
+                let mut flush_failed = false;
                 if action.must_flush {
                     // ALWAYS BestEffort — including when `propagate_flush_err`
                     // is set. RELEASE does reply with an error, but fuser's
@@ -956,6 +990,7 @@ pub async fn handle_request(
                     if let Err(e) =
                         write::flush_inode(state, ino, write::FlushReport::BestEffort).await
                     {
+                        flush_failed = true;
                         if action.propagate_flush_err {
                             deferred_flush_err = Some(e);
                         } else {
@@ -1087,6 +1122,29 @@ pub async fn handle_request(
                             error = %e,
                             "ReleaseLease failed; TTL revoke is the backstop"
                         );
+                    }
+                    // A segmented change is published only under the WRITE
+                    // lease that covered its new objects, and that lease is
+                    // gone now. A cached map the failed flush never published
+                    // names objects the reclaim below deletes: drop it, so the
+                    // next open reads the map from KV.
+                    if flush_failed
+                        && state.inodes.get(&ino).is_some_and(|is| is.meta.segments.is_some())
+                    {
+                        state.inodes.remove(&ino);
+                        state.dirty_inodes.remove(&ino);
+                    }
+                    // The last close of a file unlinked while open: its data
+                    // can go now, unless another client still holds it — then
+                    // the tombstone stays for the periodic sweep.
+                    if state.unlinked_open.remove(&ino) {
+                        if let Err(e) = crate::extent::reclaim_unreachable(state, ino).await {
+                            tracing::warn!(ino, error = %e, "reclaim at last close failed; the sweep retries");
+                        }
+                    } else if state.segment_garbage.contains(&ino) {
+                        if let Err(e) = crate::segment::reclaim_live(state, ino).await {
+                            tracing::warn!(ino, error = %e, "segment reclaim at last close failed; the sweep retries");
+                        }
                     }
                 }
                 // Now that every teardown step above has run, hand the kernel

@@ -26,7 +26,11 @@ pub mod lease_tasks;
 #[cfg(feature = "core")]
 pub mod meta;
 #[cfg(feature = "core")]
+pub mod publish;
+#[cfg(feature = "core")]
 pub mod read;
+#[cfg(feature = "core")]
+pub mod segment;
 #[cfg(feature = "core")]
 pub mod state;
 #[cfg(feature = "core")]

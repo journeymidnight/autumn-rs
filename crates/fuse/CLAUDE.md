@@ -215,7 +215,7 @@ ino → inode 数据是 **O(log N) KV Get**（ino 编码在 key 里，LSM-tree �
 | `INODE_ALLOC_BATCH` | 1000 | 每批向 manager 领的 inode 数 |
 | `DEFAULT_STRIPE_LANES` | 24 | fs 未声明几何时的默认 lane 数 |
 | `ROOT_INO` | 1 | 根 inode（FUSE_ROOT_ID）|
-| `SCHEMA_VERSION` | 3 | 见下 fail-loud |
+| `SCHEMA_VERSION` | 4 | 见下 fail-loud |
 | `DT_REG`/`DT_DIR`/`DT_LNK` | 8/4/10 | 目录项类型 |
 
 ## 核心数据结构
@@ -482,6 +482,8 @@ core` 可独立编译，唯一额外依赖 libc；返回裸 `InodeMeta`/`DT_*`�
 | `dir.rs` | lookup/readdir/mkdir/rmdir/rename/create/unlink/resolve —— 返回 `(ino, InodeMeta)` / DT_* 条目 |
 | `extent.rs` | 变长 extent 寻址/写/RMW/截断/删除/`clean_beyond_eof`/`remove_unreachable_inode` |
 | `read.rs` / `write.rs` | 分块读组装 / 写缓冲 + flush |
+| `segment.rs` | 分段文件：映射拼接/裁剪/读计划（纯函数）、数据对象与映射页读写、`reclaim` |
+| `publish.rs` | 新 inode 整文件发布（条件 CAS）、删除、会话与死会话恢复、`fence_all` |
 | `lease_tasks.rs` | per-session lease 后台任务（heartbeat + invalidation poll + revoked 驱逐；fuser-free）|
 | `state.rs` | `FsState`（ClusterClient、inode 批次游标、lease 簿记、`direct_read`）|
 
@@ -579,9 +581,121 @@ WriteConflict）——拦截完全发生在挂载侧的簿记里。
   `RUST_LOG=info` 才看得到 `lease downgrade: writer slot released` 那行；T1–T3 区分不了
   "角色恒为 READ"，只有第二个挂载拿到 writer 槽才证明 RELEASE 的角色真的接对了）。
 
+## 分段文件（segmented files，v4）
+
+S3 multipart 的 Complete 必须**不读、不拷、不重写任何分片正文**，所以文件内容可以是
+一张"逻辑区间 → 数据对象"的映射（`InodeMeta.segments`，`segment.rs`）：
+
+- **数据对象**：一次写入、不可变、不挂目录。按 `unit`（= `MAX_EXTENT`）**稠密**写在
+  `[0x03][lane][data_ino][off]`，`lane = (off/unit + data_ino) % lanes`——按对象错开起始
+  lane，否则每个 5 MiB 的分片都只有一个 extent，全压在 lane 0。稠密意味着映射覆盖的区间
+  每个 key 都必须存在：读到缺失或短值是**丢数据**，`ChunkSpec.strict` 让读报错而不是按稀疏
+  语义补零（消融：关掉 strict，删一个 extent 后读回全零）。
+- **映射**：≤ `INLINE_SEGMENTS`(64) 段内联在 inode 里（单 PUT 对象、一般 Lance 数据文件
+  读时零额外 RPC）；更大的分页存 `[0x05][map_id][page]`，页不可变，按 `(map_id, page)`
+  缓存在 `FsState.segment_pages`，读只取所涉页。
+- **写**：`extent::write_region` 对分段 inode 转到 `segment::write_file_range`——缓冲区
+  `[off, off+n)` 写成一个新数据对象，映射里该区间被替换（`splice`，被切开的旧段只调整
+  `off/len/data_off`），新页写在新 `map_id` 下，flush 末尾的 inode put 是唯一提交点。
+  **不读旧数据、无 RMW、不整体物化**。流水化 append 不走分段文件。truncate 只 `clip`
+  映射，之后扩展的区域是洞、读零，不会重新暴露被截掉的字节。
+- **generation**：每次内容变化加一（write 调用、truncate、映射替换），与 inode 号一起
+  构成 S3 ETag，同大小同秒重写也会变。
+- **回收**：每个数据对象 / 分页映射在写入**之前**先记 `[0x04]segc/[file][id]`（带删除它
+  所需的长度与几何），所以崩溃留下的东西都找得到。`segment::reclaim(current)` 以文件
+  **当前**映射为唯一真相：记录里当前映射不再引用的对象、不是当前 `map_id` 的页一律删掉，
+  仍被引用的记录保留给以后的修改。这对任意次修改、任意崩溃点都成立，不需要逐次对账。
+  调用方必须独占该文件（EXCLUSIVE 租约），否则持有旧映射的读者会被抽掉数据。
+- **活文件的回收**：每次修改在写任何对象/分页**之前**先写 `[0x04]segg/[ino]` 标记（每会话
+  每文件一次 put，记进 `FsState.segment_garbage`）。不只在"确知丢了引用"时写：写了但没发布
+  的对象（崩溃、inode put 失败）也是垃圾，而别的路径永远不会去找它——`sweep_garbage` 只看
+  标记。本会话最后一次 close 时（FUSE RELEASE、Python `release`）和扫描（`periodic_sync` 每
+  30 s，每次一页 1024 个标记，游标 `garbage_sweep_from` 轮转，被别处持有的标记挡不住后面的）
+  用 `segment::reclaim_live`：取 EXCLUSIVE，**从 KV 重读**当前映射（绝不用缓存——别的会话
+  可能已发布更新的映射，旧映射会把新对象判成垃圾），回收，删标记。有别的持有者就留着标记。
+  `reclaim_live` 无论结果都把 ino 从本会话集合里去掉：之后可能是别的会话回收并删了标记，
+  留着的集合项会让本会话下一次修改跳过打标记。
+- **修改分段文件必须持有 WRITE 租约**（`held_write_lease`，否则 EBUSY）：租约挡住回收，
+  新对象已写而引用它的映射尚未发布的窗口里，回收会把它当垃圾删掉。FUSE 打开即持有；Python
+  的裸 `write` 对分段文件因此要先 `acquire`（普通文件不变），且 `write()` 本身会成功、到
+  flush 才 EBUSY，缓冲的字节随该错误丢弃。
+- **路径 truncate 自己取租约**：没协商 `ATOMIC_O_TRUNC`，内核把 `open(O_TRUNC)` 变成 OPEN
+  之前的 SETATTR(size)，`truncate(2)` 则根本不 open。本会话对该文件什么都没持有时取一次性
+  WRITE（`segment::hold_transient_write`，被别人持有 = EBUSY），改完即还并就地回收。FUSE
+  SETATTR 把**整个请求**包在这个租约里（末尾那次 inode put 也要带围栏）；核心
+  `write::truncate` 自己也会取，供 Python / autumnfs。否则 `cp`/`echo >`/编辑器覆盖 S3 写出
+  的文件全都 EBUSY（`a_path_truncate_takes_its_own_lease`，消融即红）。
+  **取到租约后丢掉缓存的 inode、从 KV 重读**：没打开的文件缓存可能早于别的会话的改写
+  （只有 Open 会按租约版本判陈旧），从陈旧映射裁剪再发布，随后的回收会把别人的对象当垃圾
+  删掉——从"EBUSY"变成了"删数据"（`a_path_truncate_reads_the_map_under_its_lease`，消融：
+  不重读则读到已删对象）。本挂载以只读打开着该文件时（`tail -f`）仍是 EBUSY。
+- **flush 失败的最后一次 close 丢掉分段 inode 的缓存**（无论租约是否已被 revoke）：租约此刻
+  已还，缓存里没发布的映射所指的对象马上会被回收；留着它，重开读到的是已删对象，periodic
+  sync 还会以 ANON 把它 put 回去。下次 open 从 KV 读映射。
+- **代价（有意的取舍，未实测）**：每个就地修改分段文件的会话多一次标记 put；最后一次 close
+  的回收是 EXCLUSIVE acquire + 读映射 + 扫该文件全部 `segc/` 记录（仍被引用的记录永不删，
+  扫描 O(对象数)）。S3 写出的 Lance 文件是写一次、走 `publish` 不走这里，所以可接受；若出现
+  "对多分片大对象反复小改"的负载，改成：标记用 `compare_put(None)` 知道是不是自己建的、
+  本地记"是否丢过引用 / 有失败的 put"，干净时 close 只删标记。
+- 读到的段先 `Segment::checked()`：损坏的 0 lanes/unit 或溢出报错，不在除法里 panic 掉挂载。
+
+### 整文件发布（`publish.rs`，S3 PUT / Copy / Complete / Delete 的核心）
+
+新文件写进**新 inode**（`NewFile`），对谁都不可见，然后一次带围栏的 `compare_write` 把
+dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（期望指向那个 inode）由 PS
+判定，不是先读后写。读者只会看到旧文件或新文件的全部。ETag = hex(ino) ++ hex(generation)。
+
+- **会话**：一切写入带会话 inode 上 WRITE 租约的 epoch；每个操作写任何东西之前先记
+  `[0x04]pend/[S][obj]`。会话死后 `recover_dead_sessions` 夺取其租约（epoch 升高）、
+  `fence_all` 把每个 fs 分区对该会话的围栏抬到新 epoch（先 `refresh_regions`，并重复到
+  一轮找不到新分区为止：长寿客户端的缓存可能早于一次 split，split 之后才抬的地板子分区
+  没有），再按 dirent 指向谁完成或撤销每个记录。**调用方是 S3 网关的周期任务**（尚未接入；
+  在那之前只有测试调用它，死会话的记录与会话 key 会一直留着）。活会话自己留下的记录（结果
+  未知的交换）只在它死后才被处理。
+- **CAS 是提交点**，之后的一切都不能让发布失败：替换/删除之前先记
+  `PendingOp::Retire{parent,name,ino,successor}`（`successor` = 要换上的新 inode，删除为
+  `None`），CAS 落地后退掉旧 inode（`drop_name_of`），成功才删记录；失败留给恢复（以前退旧
+  inode 出错会让 `NewFile::publish` 撤销一个**已经发布**的文件，dirent 悬空——
+  `system_publish` 里损坏旧 inode 的那段，消融即红）。
+- **恢复只在 dirent 恰好是 `successor` 时退旧 inode**：别的会话把名字换走时已经自己退过
+  一次，再退一次对 nlink=2 的 inode（Lance manifest 经 FUSE 硬链接）就是删掉另一个名字还指着
+  的文件（`a_retire_whose_swap_lost_leaves_a_linked_inode_alone`，消融：按"dirent 不再指向
+  它"判定即红）。记录用 `compare_write(None)` 只建不覆盖：结果未知的上一次交换留下的记录
+  原样保留，`end_swap` 只删本次建的——否则后一次失败的重试会删掉前一次仍可能落地的记录。
+- **结果未知 ≠ 没落地**：CAS 的 RPC 出错时回读 dirent，是新值就算成功；否则返回
+  `PublishError::Other`，调用方**不撤销**（在途请求之后仍可能落地），记录留给恢复。只有
+  PreconditionFailed / NoSuchKey / Busy / NotAFile 这些确定结果才撤销。
+- **REPLACE 持有期间才核对 `If-Match` 的 generation**：先读后取租约，中间别的写者可以改完
+  并释放。旧 inode 此时已不存在（别的发布者抢先换掉）= PreconditionFailed。本 client 自己对旧 inode 持有写租约也算冲突（manager 允许同 client 在自己的
+  WRITE 上取 REPLACE）。
+- 已知限制：FUSE 的 unlink/rename 是无条件 KV 操作，与网关同名并发时后者赢；恢复按"dirent
+  是否指向它"判定，发布者在 CAS 与删记录之间崩溃、且恢复前有人把该名 rename 走，会被误判为
+  未发布而撤销；`Retire` 在"已减 nlink、未删记录"时崩溃，恢复会再减一次，nlink=2 时即删掉
+  另一个链接还指着的 inode。`flush_inode` 在 `put_inode` 之前就清掉 `dirty`，FUSE_FLUSH 的
+  put 失败后 RELEASE 看不到失败，分段 inode 的缓存不会被丢——下次 Open 按版本重建能兜住，
+  PyO3 会读到 strict 错误（不是零）。
+
+### 不可达 inode 的回收要等持有者
+
+`remove_unreachable_inode`（unlink / rename 覆盖）先写 `rmtomb`，然后：本会话仍打开
+着 → 记进 `FsState.unlinked_open`，最后一次 close（FUSE RELEASE）时再回收；否则
+`reclaim_unreachable` 取 **EXCLUSIVE** 租约——别的客户端还持有任何租约（另一个挂载打开
+着、S3 GET 在读）就 Conflict，墓碑留给扫描（挂载时 + `periodic_sync` 每 30 s 一次）。
+拿到才删数据，删除以该租约 epoch 围栏；各删除阶段之间以同一客户端重新 acquire
+EXCLUSIVE，再确认一次独占（manager failover 会把它重放成普通 WRITE，放进读者）。已知不是
+分段文件的 inode 跳过 segc 记录扫描。以前 unlink 立即删数据，别的挂载上打开着的文件会读到
+洞。REPLACE/EXCLUSIVE 不持久化，所以每次 unlink 多两次 manager 内存 RTT、没有 etcd 写。
+测试 `system_segmented.rs::reclaim_waits_for_other_holders`（消融：跳过租约，持有期间数据
+被删）、`unlinked_while_open_here_is_reclaimed_at_last_close`。
+
+legacy extent 前缀扫描（`scan_extents`、`clean_beyond_eof`、`delete_all_extents_with`）
+从**最后返回的 key** 的后继续扫，而不是从最后解析出的 offset：18 字节的条带 / 数据对象 key
+（lane 0、inode 号 = `ino << 8 | x`）会落在 17 字节的 legacy 前缀里，一整页都是这种 key 时
+旧游标永远不前进。
+
 ## Schema 版本戳（fail-loud）
 
-`schema::SCHEMA_VERSION` = **3**，存于 `[0x04]schema_version`（相对 key，即
+`schema::SCHEMA_VERSION` = **4**，存于 `[0x04]schema_version`（相对 key，即
 `fs/[0x04]schema_version`）。`meta::ensure_schema_version` 在 mount（`ensure_root`
 入口）缺则戳、有则核对、**不符则 fail-loud 拒挂**（防未来不兼容布局静默读写坏数据）。
 - v1 = pre-namespace 裸 key（从不戳）。
@@ -589,6 +703,13 @@ WriteConflict）——拦截完全发生在挂载侧的簿记里。
 - v3 = lane striping：`InodeMeta` 加 `stripe` 字段（rkyv 布局变，v2 inode 字节解不出），
   大文件走 lane-striped key。v2→v3 stop-world reset，无 in-place 迁移；小/legacy 文件
   仍 `stripe=None` + `[0x03][ino][off]`。BUMP whenever 布局/编码不兼容变更。
+- v4 = 分段文件 + 内容代数：`InodeMeta` 加 `generation`、`segments`。用一次性离线工具
+  `migratev3_v4` 原地转换（每个 inode 保留编号/链接/字节，得到 `generation=1`、
+  `segments=None`，最后才改戳），不 reset。
+- **缺戳 ≠ 新树**：只有一个 inode 都没有才算新树并盖当前版本；有 inode 却无戳，是 v4 以前
+  不盖戳的工具（`autumnfs`、S3 网关）建的，inode 是 v3——拒绝挂载并指向
+  `migratev3_v4 --unstamped-is-v3`。以前会直接盖 v4，在本地实测转换时把一棵 v3 树变得
+  整棵不可读（`an_unstamped_populated_tree_is_refused_not_stamped`）。
 
 ## 配置（CLI）
 

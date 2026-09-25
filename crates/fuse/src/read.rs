@@ -57,6 +57,10 @@ pub struct ChunkSpec {
     pub offset: u32,
     pub length: u32,
     pub dest_offset: usize,
+    /// The slice lies inside a segmented file's data object, which is written
+    /// densely: an absent or short value there is lost data, so the read fails
+    /// instead of zero-filling. Plain extents stay sparse (`false`).
+    pub strict: bool,
 }
 
 /// Phase 1: dispatcher-side synchronous-ish prep. Holds `&mut state` briefly for
@@ -229,6 +233,36 @@ async fn prepare_inner(
         });
     }
 
+    // Segmented file: plan straight from the map onto its data objects.
+    if let Some(map) = &meta.segments {
+        let segs = crate::segment::load_range(
+            &state.client,
+            &mut state.segment_pages,
+            map,
+            offset,
+            read_end,
+        )
+        .await
+        .map_err(|e| anyhow!("read {ino}: {e}"))?;
+        let chunks = crate::segment::plan_reads(&segs, offset, read_end)
+            .into_iter()
+            .map(|r| ChunkSpec {
+                key: r.key,
+                offset: r.offset,
+                length: r.length,
+                dest_offset: r.dest_offset,
+                strict: true,
+            })
+            .collect();
+        return Ok(ReadPlan {
+            inline_result: None,
+            actual_size,
+            client: state.client.clone(),
+            direct_read: state.direct_read,
+            chunks,
+        });
+    }
+
     // Variable-extent read: load the extent map and plan each extent that
     // overlaps `[offset, read_end)`. Routing happens later inside `get_many_into`
     // (cached binary search per key) — `execute` needs no `&state`.
@@ -267,6 +301,7 @@ async fn prepare_inner(
             offset: (ov_start - start) as u32,
             length: (ov_end - ov_start) as u32,
             dest_offset: (ov_start - offset) as usize,
+            strict: false,
         });
     }
 
@@ -341,10 +376,21 @@ async fn fill_region(
     drop(items); // release the &mut borrows of `region`
 
     // Propagate a hard RPC/routing failure (an earlier design surfaced this at
-    // prepare-time as EIO); `Ok(None)` (missing extent) stays sparse-zero-filled.
-    for r in &results {
-        if let Err(e) = r {
-            return Err(anyhow!("extent read failed: {e}"));
+    // prepare-time as EIO); `Ok(None)` (missing extent) stays sparse-zero-filled
+    // for a plain file, and is lost data for a segmented one.
+    for (c, r) in chunks.iter().zip(&results) {
+        match r {
+            Err(e) => return Err(anyhow!("extent read failed: {e}")),
+            Ok(got) if c.strict && got.is_none_or(|n| n < c.length as usize) => {
+                return Err(anyhow!(
+                    "segmented read: data extent {:?} [{}, +{}) returned {:?} bytes",
+                    c.key,
+                    c.offset,
+                    c.length,
+                    got
+                ));
+            }
+            Ok(_) => {}
         }
     }
     Ok(())

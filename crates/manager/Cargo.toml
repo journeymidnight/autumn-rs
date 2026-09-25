@@ -69,6 +69,14 @@ name = "system_fuse_ns"
 required-features = ["fuse-tests"]
 
 [[test]]
+name = "system_segmented"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "system_publish"
+required-features = ["fuse-tests"]
+
+[[test]]
 name = "fuse_lease_2"
 required-features = ["fuse-tests"]
 

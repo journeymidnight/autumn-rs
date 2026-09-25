@@ -36,8 +36,12 @@ use std::path::PathBuf;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 
+use std::os::unix::ffi::OsStrExt;
+
 use autumn_client::ClusterClient;
 use autumn_fuse::key;
+use autumn_fuse::state::FsState;
+use autumn_fuse::{dir, meta, segment};
 use autumn_fuse::schema::{
     self, DirentValue, InodeMeta, StripeLayout, DT_DIR, DT_LNK, DT_REG, INLINE_THRESHOLD,
     MAX_EXTENT, ROOT_INO,
@@ -163,10 +167,14 @@ fn main() -> Result<()> {
 
         // Bootstrap the fuse root inode (ino 1) if it's missing — a cluster that
         // has never mounted the fuse fs or used `autumn.Fs` has no root, so
-        // `resolve()` from ROOT_INO would fail `ENOENT inode 1`. `autumn.Fs` /
-        // the fuse mount call `ensure_root` on connect; autumnfs must too, so it
-        // works standalone against a fresh cluster (e.g. uploading model weights).
-        ensure_root(&cluster).await?;
+        // `resolve()` from ROOT_INO would fail `ENOENT inode 1`. The core's
+        // `ensure_root` also verifies (or stamps) the filesystem's schema
+        // version, so this build refuses a layout it cannot read instead of
+        // decoding it wrong — which the CLI's own copy of this step never did.
+        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "autumnfs".to_string());
+        let mut state = FsState::from_client(cluster, format!("autumnfs-{host}"));
+        meta::ensure_root(&mut state).await?;
+        let cluster = state.client.clone();
 
         match args.cmd {
             Cmd::Ls { path, long } => cmd_ls(&cluster, &path, long).await,
@@ -179,7 +187,7 @@ fn main() -> Result<()> {
             Cmd::Get { remote, local } => {
                 cmd_get(&cluster, &remote, &local, args.direct_read).await
             }
-            Cmd::Rm { path } => cmd_rm(&cluster, &path).await,
+            Cmd::Rm { path } => cmd_rm(&mut state, &path).await,
             Cmd::Touch { path } => cmd_touch(&cluster, &path).await,
         }
     })
@@ -284,6 +292,8 @@ fn new_file_meta() -> InodeMeta {
         inline_data: None,
         symlink_target: None,
         stripe: None,
+        generation: 1,
+        segments: None,
     }
 }
 
@@ -304,27 +314,9 @@ fn new_dir_meta() -> InodeMeta {
         inline_data: None,
         symlink_target: None,
         stripe: None,
+        generation: 1,
+        segments: None,
     }
-}
-
-/// Create the fuse root inode (ino 1) if it doesn't exist yet — the standalone
-/// equivalent of `autumn_fuse::meta::ensure_root` (which needs an `FsState`).
-/// Idempotent: a no-op when the root already exists.
-async fn ensure_root(cluster: &ClusterClient) -> Result<()> {
-    let rk = key::inode_key(ROOT_INO);
-    if cluster
-        .get(&rk)
-        .await
-        .map_err(|e| anyhow!("root inode get: {e}"))?
-        .is_none()
-    {
-        let meta = new_dir_meta();
-        cluster
-            .put(&rk, &schema::encode_inode_meta(&meta))
-            .await
-            .map_err(|e| anyhow!("root inode put: {e}"))?;
-    }
-    Ok(())
 }
 
 // ─── ls ─────────────────────────────────────────────────────────────────────
@@ -578,6 +570,9 @@ async fn read_file_to_writer(
         out.write_all(inline).context("write inline to output")?;
         return Ok(());
     }
+    if let Some(map) = &meta.segments {
+        return read_segmented_to_writer(cluster, ino, meta.size, map, out, direct_read).await;
+    }
     // Collect every extent key (offset-sorted), then fetch values a window at a
     // time. Extent keys are ≤ 18 B and extents are ≤ 8 MiB, so the full key list
     // is tiny even for a huge file, and the extra latency-before-first-byte is
@@ -685,6 +680,63 @@ async fn read_file_to_writer(
             out.write_all(&buf[..n]).context("write extent to output")?;
             written += n as u64;
         }
+    }
+    out.flush().context("flush output")?;
+    Ok(())
+}
+
+/// A segmented file, a window at a time: plan each window from the map and
+/// fetch its data extents in one batch. Mapped ranges must come back whole
+/// (a data object is dense); holes are written as zeros.
+async fn read_segmented_to_writer(
+    cluster: &ClusterClient,
+    ino: u64,
+    size: u64,
+    map: &schema::SegmentMap,
+    out: &mut dyn Write,
+    direct_read: bool,
+) -> Result<()> {
+    const WINDOW: u64 = (GET_WINDOW_MIN_EXTENTS * MAX_EXTENT) as u64;
+    let mut pages = segment::PageCache::new();
+    let mut buf = vec![0u8; WINDOW as usize];
+    let mut pos = 0u64;
+    while pos < size {
+        let end = (pos + WINDOW).min(size);
+        let segs = segment::load_range(cluster, &mut pages, map, pos, end).await?;
+        let plan = segment::plan_reads(&segs, pos, end);
+        let region = &mut buf[..(end - pos) as usize];
+        region.fill(0);
+        let mut rest = &mut region[..];
+        let mut consumed = 0usize;
+        let mut dests = Vec::with_capacity(plan.len());
+        let mut sorted: Vec<&segment::DataRead> = plan.iter().collect();
+        sorted.sort_by_key(|r| r.dest_offset);
+        for r in &sorted {
+            let (_, after) = rest.split_at_mut(r.dest_offset - consumed);
+            let (head, tail) = after.split_at_mut(r.length as usize);
+            dests.push(head);
+            rest = tail;
+            consumed = r.dest_offset + r.length as usize;
+        }
+        let mut items: Vec<autumn_client::GetManyItem> = sorted
+            .iter()
+            .zip(dests)
+            .map(|(r, dest)| autumn_client::GetManyItem { key: &r.key, offset: r.offset, length: r.length, dest })
+            .collect();
+        let res = if direct_read {
+            cluster.get_many_direct(&mut items).await
+        } else {
+            cluster.get_many_into(&mut items).await
+        };
+        drop(items);
+        for (r, got) in sorted.iter().zip(res) {
+            match got {
+                Ok(Some(n)) if n == r.length as usize => {}
+                other => bail!("read {ino}: data extent {:?} returned {other:?}", r.key),
+            }
+        }
+        out.write_all(region).context("write to output")?;
+        pos = end;
     }
     out.flush().context("flush output")?;
     Ok(())
@@ -983,106 +1035,29 @@ async fn cmd_touch(cluster: &ClusterClient, path: &str) -> Result<()> {
 
 // ─── rm ─────────────────────────────────────────────────────────────────────
 
-async fn cmd_rm(cluster: &ClusterClient, path: &str) -> Result<()> {
-    let (ino, parent_ino, name, meta) = resolve(cluster, path).await?;
-    if parent_ino == 0 {
+/// Remove a file or an empty directory through the FS core, so the CLI
+/// gets the same unlink as every other front-end: the tombstoned removal of
+/// an unreachable inode, and the reclaim of a segmented file's data objects.
+async fn cmd_rm(state: &mut FsState, path: &str) -> Result<()> {
+    let comps = split_path(path);
+    let Some((leaf, parents)) = comps.split_last() else {
         bail!("refusing to remove root");
-    }
-    if is_dir(&meta) {
-        // Refuse non-empty directories.
-        let prefix = key::dirent_prefix(ino);
-        let resp = cluster
-            .range(&prefix, &prefix, 1)
-            .await
-            .map_err(|e| anyhow!("dir empty check: {e}"))?;
-        if !resp.entries.is_empty() {
-            bail!("directory not empty");
-        }
-        // Delete the directory inode, the dirent in the parent, and decrement
-        // parent's nlink (the dropped "..").
-        cluster
-            .delete(&key::dirent_key(parent_ino, &name))
-            .await
-            .map_err(|e| anyhow!("delete dirent: {e}"))?;
-        cluster
-            .delete(&key::inode_key(ino))
-            .await
-            .map_err(|e| anyhow!("delete inode: {e}"))?;
-        // Bump parent nlink down.
-        if let Some(iv) = cluster
-            .get(&key::inode_key(parent_ino))
-            .await
-            .map_err(|e| anyhow!("parent get: {e}"))?
-        {
-            if let Ok(mut pm) = schema::decode_inode_meta(&iv) {
-                pm.nlink = pm.nlink.saturating_sub(1);
-                let _ = cluster
-                    .put(
-                        &key::inode_key(parent_ino),
-                        &schema::encode_inode_meta(&pm),
-                    )
-                    .await;
-            }
-        }
-        return Ok(());
-    }
-    if !is_reg(&meta) {
-        bail!("unsupported file type");
-    }
-    // Delete extents (if any), then dirent, then inode if nlink would hit 0.
-    if meta.inline_data.is_none() {
-        if let Some(s) = &meta.stripe {
-            // striped extents live under `[0x03][lane][ino][off]`,
-            // spread across lane partitions — a `[0x03][ino]` scan would MISS
-            // them (leak). Compute + delete each key (same enumeration the read
-            // path uses: stride = the file's PERSISTED unit_bytes, up to size).
-            let (lanes, unit) = s.checked().map_err(|e| anyhow!("rm {ino}: {e}"))?;
-            // coco P3: bounded enumeration (corrupt huge size can't wrap / OOM).
-            for off in
-                schema::striped_extent_offsets(meta.size, unit).map_err(|e| anyhow!("rm {ino}: {e}"))?
-            {
-                let ek = key::extent_key_striped(ino, off, lanes, unit);
-                cluster.delete(&ek).await.map_err(|e| anyhow!("delete extent: {e}"))?;
-            }
-        } else {
-            let prefix = key::extent_prefix(ino);
-            let mut start = prefix.clone();
-            const PAGE: u32 = 256;
-            loop {
-                let resp = cluster
-                    .range(&prefix, &start, PAGE)
-                    .await
-                    .map_err(|e| anyhow!("extent range: {e}"))?;
-                for entry in &resp.entries {
-                    cluster
-                        .delete(&entry.key)
-                        .await
-                        .map_err(|e| anyhow!("delete extent: {e}"))?;
-                }
-                match next_range_cursor(&resp.entries, PAGE) {
-                    Some(next) => start = next,
-                    None => break,
-                }
-            }
-        }
-    }
-    cluster
-        .delete(&key::dirent_key(parent_ino, &name))
-        .await
-        .map_err(|e| anyhow!("delete dirent: {e}"))?;
-    if meta.nlink <= 1 {
-        let _ = cluster
-            .delete(&key::inode_key(ino))
-            .await
-            .map_err(|e| anyhow!("delete inode: {e}"));
+    };
+    let parent_path: Vec<String> = parents.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+    let parent = dir::resolve(state, &format!("/{}", parent_path.join("/")))
+        .await?
+        .ok_or_else(|| anyhow!("ENOENT: {path}"))?;
+    let name = std::ffi::OsStr::from_bytes(leaf);
+    let (_, m) = dir::lookup_opt(state, parent, name)
+        .await?
+        .ok_or_else(|| anyhow!("ENOENT: {path}"))?;
+    if is_dir(&m) {
+        dir::rmdir(state, parent, name).await
+    } else if is_reg(&m) {
+        dir::unlink(state, parent, name).await
     } else {
-        let mut m = meta.clone();
-        m.nlink -= 1;
-        let _ = cluster
-            .put(&key::inode_key(ino), &schema::encode_inode_meta(&m))
-            .await;
+        bail!("unsupported file type")
     }
-    Ok(())
 }
 
 #[cfg(test)]

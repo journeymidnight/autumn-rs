@@ -101,6 +101,131 @@ pub struct InodeMeta {
     /// beyond the single-stream ceiling. Immutable once set; the reader branches
     /// on this to pick the key layout, so old files stay correct with no migration.
     pub stripe: Option<StripeLayout>,
+    /// Content generation: raised by every change to the file's bytes (a
+    /// flushed write, a truncate, a replaced segment map). Together with the
+    /// inode number it identifies one version of the content, which is what
+    /// the S3 gateway's ETag is — so a same-size rewrite within one second
+    /// still changes it. v4.
+    pub generation: u64,
+    /// `Some`: the file's bytes are defined by this map of logical ranges onto
+    /// data objects, and the file owns no `[0x03]` extents of its own
+    /// (`inline_data` and `stripe` are `None`). A multipart upload completes
+    /// into this form without touching the parts' bytes. v4.
+    pub segments: Option<SegmentMap>,
+}
+
+/// One logical range of a segmented file: `[off, off+len)` of the file is
+/// `[data_off, data_off+len)` of data object `data_ino`.
+///
+/// A data object is written once, densely, in `unit`-sized extents at
+/// `[0x03][lane][data_ino][o]` for `o` = 0, unit, 2·unit, … with
+/// `lane = (o/unit + data_ino) % lanes` (`key::data_extent_key`). Dense means a
+/// reader knows every key a covered range needs, so a MISSING key is an error
+/// rather than a sparse hole. The lane rotates with `data_ino` because objects
+/// are usually smaller than one unit: without it every 5 MiB multipart part
+/// would put its only extent on lane 0.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub off: u64,
+    pub len: u64,
+    pub data_ino: u64,
+    pub data_off: u64,
+    pub lanes: u8,
+    pub unit: u32,
+}
+
+impl Segment {
+    pub fn end(&self) -> u64 {
+        self.off + self.len
+    }
+
+    /// Validate a segment read from storage before its geometry divides or
+    /// its offsets add: a corrupt zero or an overflow must be an error, not
+    /// a panic that takes the mount down (as `StripeLayout::checked`).
+    pub fn checked(&self) -> Result<(), String> {
+        if self.lanes == 0 || self.unit == 0 || self.len == 0 {
+            return Err(format!("corrupt segment {self:?}"));
+        }
+        if self.off.checked_add(self.len).is_none() || self.data_off.checked_add(self.len).is_none() {
+            return Err(format!("segment overflows: {self:?}"));
+        }
+        Ok(())
+    }
+}
+
+/// A segmented file's map, sorted by `off`, non-overlapping; gaps are holes
+/// and read as zeros.
+///
+/// Small maps live `inline` in the inode (a single-PUT object has one
+/// segment, a Lance data file a dozen), so reading them costs nothing extra.
+/// Larger maps are paged: page `i` is `[0x05][map_id][i]`, immutable, holding
+/// at most `SEGMENT_PAGE` segments; `page_starts[i]` is its first segment's
+/// `off`, so a read loads only the pages its range touches.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct SegmentMap {
+    pub inline: Vec<Segment>,
+    /// 0 for an inline map.
+    pub map_id: u64,
+    pub page_starts: Vec<u64>,
+    /// Total segments, inline or paged.
+    pub count: u64,
+}
+
+/// What a reclaim record (`key::segc_key`) names, with what it takes to
+/// delete it without consulting any map.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum SegcRecord {
+    Object { len: u64, lanes: u8, unit: u32 },
+    Pages { count: u32 },
+}
+
+pub fn encode_segc(r: &SegcRecord) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(r).to_vec()
+}
+
+pub fn decode_segc(bytes: &[u8]) -> Result<SegcRecord, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// A session's operation in progress (`key::pending_key`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum PendingOp {
+    /// Publishing new inode `new_ino` as `parent`/`name`. Finished iff the
+    /// dirent names `new_ino`; otherwise `new_ino` and its data are undone.
+    Publish { parent: u64, name: Vec<u8>, new_ino: u64 },
+    /// Taking `parent`/`name` away from inode `ino`, handing it to
+    /// `successor` (a replace) or to nobody (a delete). Once the dirent holds
+    /// exactly that, the name is dropped from `ino`. Anything else (the old
+    /// name still, or another session's file) says this swap did not land,
+    /// and whoever moved the name retired `ino` themselves.
+    Retire { parent: u64, name: Vec<u8>, ino: u64, successor: Option<u64> },
+}
+
+pub fn encode_pending(p: &PendingOp) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(p).to_vec()
+}
+
+pub fn decode_pending(bytes: &[u8]) -> Result<PendingOp, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// Segments kept inline in the inode before a map is paged.
+pub const INLINE_SEGMENTS: usize = 64;
+
+/// Segments per map page.
+pub const SEGMENT_PAGE: usize = 1024;
+
+/// Decode one segment-map page.
+pub fn decode_segment_page(bytes: &[u8]) -> Result<Vec<Segment>, String> {
+    if bytes.is_empty() {
+        return Err("empty segment page".to_string());
+    }
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// Encode one segment-map page.
+pub fn encode_segment_page(segments: &Vec<Segment>) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(segments).to_vec()
 }
 
 /// per-file stripe geometry. An extent at logical offset `off` lives
@@ -285,8 +410,14 @@ pub const ROOT_INO: u64 = 1;
 ///   Stop-world reset from v2 (no in-place migration; old files would decode
 ///   wrong). Small / legacy files keep `stripe=None` + the `[0x03][ino][off]` key.
 ///
+/// - **v4** = segmented files and content generations: `InodeMeta` gains
+///   `generation` and `segments` (rkyv layout change). Converted in place by
+///   the one-shot `migratev3_v4` tool against a stopped filesystem — every
+///   inode keeps its number, links and bytes, and gains `generation = 1` and
+///   `segments = None` — rather than by a reset.
+///
 /// BUMP this whenever the key layout / value encoding changes incompatibly.
-pub const SCHEMA_VERSION: u64 = 3;
+pub const SCHEMA_VERSION: u64 = 4;
 
 // File type constants (from libc)
 pub const DT_REG: u8 = 8;
