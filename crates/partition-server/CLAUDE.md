@@ -69,7 +69,7 @@ conn):
 │    NEVER dropped mid-flight (io_uring SQE stability)            │
 │                                                                 │
 │  CQ side — FuturesUnordered<LocalBoxFuture<'static, ...>>       │
-│    cap = AUTUMN_PS_CONN_INFLIGHT_CAP (default 64)               │
+│    cap = --conn-inflight-cap (default 4)                        │
 │    each future: clone req_tx → send PartitionRequest →          │
 │                 await oneshot resp → encode Frame::response     │
 │                                                                 │
@@ -210,7 +210,11 @@ partition_loop (per partition):
 
   Loop (per iteration):
     (A) drain ready completions via inflight.next().now_or_never()
-        → run Phase 3 (memtable insert + WriteResponder::send_ok) each
+        → run Phase 3 (memtable insert + WriteResponder::send_ok) each,
+          arm the CoalesceWindow (held ops + frames answered)
+    (B0) if n_inflight == 0 and the window holds (pending below its target,
+          deadline not passed): select(req_rx.next, sleep) — take the request
+          and re-check, or let the window run out
     (B) if pending.non_empty && !at_cap && !imm_full:
           launch_new_batch:
             Phase 1: validate, seq-assign, encode WAL records
@@ -257,16 +261,28 @@ latency (group-commit style); the gate only refuses to split one burst in two.
 WHY the gate is back (an earlier `pending >= 256` gate was removed as
 unreachable, and this section then claimed fragmentation was "prevented
 structurally" because a TCP burst is enqueued in full before the loop is polled):
-that claim stopped holding with the compio 0.19 runtime. Under the perf bench a
-partition serves two client connections, each admitted 4 ops at a time by the
-ps-conn cap; the new runtime wakes the loop for each connection's frames
-separately, and the unconditional launch turned every 8-op burst into two 4-op
-appends. The EN serializes appends to one extent, so the second append overlapped
-nothing and cost a whole extra append. Measured at that one commit, everything
-else equal: avg batch 6.2 → 4.1, EN write time per append unchanged, 4K write
-throughput -25..30%. `write_batch_ceiling_tests::a_batch_in_flight_holds_a_partial_burst_until_it_is_whole`
+that claim does not hold. Under the perf bench a partition serves two client
+connections, each admitted 4 ops at a time by the ps-conn cap; the loop wakes
+for each connection's frames separately, and the unconditional launch turned
+every 8-op burst into two 4-op appends. The EN serializes appends to one extent,
+so the second append overlapped nothing and cost a whole extra append. Measured
+on cores the box's other tenants were pinned away from (4K, 8 partitions, depth
+8, three interleaved samples per side): without the gate avg batch 4.4 on compio
+0.18 and 3.9 on 0.19, with it 8.00 on both; write throughput 56K → 74K ops/s on
+0.18 and 53K → 75K on 0.19 (+30%).
+`write_batch_ceiling_tests::a_batch_in_flight_holds_a_partial_burst_until_it_is_whole`
 goes red without the gate. The cost of the gate is bounded by one in-flight
 append: an op it holds would have queued behind that append on the EN anyway.
+
+How this was first seen matters, because the first reading was wrong. On the
+shared box, with the cluster pinned to cores the sglang tenants were also using,
+the 0.18 loop was descheduled often enough that both connections' frames piled
+up by accident (avg batch 6.2), and the 0.19 upgrade — a prompter wake-up —
+dropped that to 4.1. That looked like a runtime regression and was recorded as
+one. It was not: with the tenants out of the way neither runtime keeps a burst
+whole, and with the gate the two are equal (74K vs 72K medians). A perf number
+taken while a tenant shares the cluster's cores is not comparable to anything
+(`docs/ops.md`, "Pin the cluster away from the tenants first").
 
 The gate alone is not enough, and the first measurement said so: avg batch
 stayed at exactly 4.00 with ~0.7 batches in flight. The two connections had
@@ -274,12 +290,29 @@ settled into strict alternation — A's 4 complete, B's 4 (held while A was in
 flight) launch the instant `n_inflight` hits 0, A's refill lands ~100 µs later
 and is held behind B's, and so on forever; nothing re-synchronizes them. So a
 completion opens a `LAUNCH_COALESCE_WINDOW` (200 µs): with nothing in flight
-and a partial burst pending, (B0) waits for more requests until the window
+and a partial refill pending, (B0) waits for more requests until the window
 closes, then launches. That lets A's refill join B's ops, both are acked
-together, both refill together, and the loop stays in lock-step (measured:
-avg batch 8.00, p50 1.15-1.58 → 0.96-0.99 ms). The window applies only after a
-completion — an idle partition still launches at once — and every launch
-clears it.
+together, both refill together, and the loop stays in lock-step.
+
+What the window waits FOR is sized by `CoalesceWindow`, not by a fixed count.
+Every client frame a completion answers releases one admission slot on its
+connection, and each slot refills with one frame of at least one op; so the ops
+already held at the completion plus the frames answered is a count `pending` is
+guaranteed to reach once every refill has landed. The window holds only while
+`pending` is below that target (`held + answered`, accumulating across
+completions inside one window, reset by every launch). It counts FRAMES
+answered (`WriteResponder::send_ok` says whether it answered one), not ops: a
+batch-put frame's N ops are one slot and get one reply on the last op, a fence
+record answers nobody — counting ops made a batch-put writer's next, smaller
+frame wait, and a fenced writer's first op after each lease wait. The first version used `MIN_PIPELINED_BATCH` as the target, and a
+lone writer — one connection, one op at a time, which is autumnfs writing one
+file — paid the whole window on every op: at depth 1, p50 0.30 → 0.43 ms and
+15.4K → 12.3K ops/s. With the sized target its refill (target 1) launches the
+instant it arrives, a single connection refilling its 4 admitted ops launches
+at 4, and the desynchronized pair (4 held + 4 acked) waits for the second
+refill and re-locks at 8.
+`the_window_waits_for_the_acked_refill_not_a_fixed_count` goes red with the
+fixed target.
 
 `--min-pipeline-batch` is parsed but a deprecated no-op; the threshold and the
 window are constants, not knobs.
