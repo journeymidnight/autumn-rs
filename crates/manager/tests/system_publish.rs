@@ -237,3 +237,52 @@ fn a_retire_whose_swap_lost_leaves_a_linked_inode_alone() {
         assert_eq!(read_name(&mut rescuer, 1, "h2").await.unwrap(), body);
     });
 }
+
+/// A dead session behind more live ones than one page of session records
+/// (a large gateway fleet: 8 workers each) is still found and recovered.
+#[test]
+#[ignore]
+fn a_dead_session_behind_a_page_of_live_ones_is_recovered() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1 = pick_addr();
+    let n2 = pick_addr();
+    start_extent_node(n1, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot(mgr_addr, n1, n2, 153, 15301).await;
+        let mgr = mgr_addr.to_string();
+        let mut st = FsState::new(&mgr).await.expect("mount");
+        meta::ensure_root(&mut st).await.expect("init_root");
+
+        // 1030 live sessions, all held by one client, all sorting first.
+        let mut fleet = FsState::new(&mgr).await.expect("fleet");
+        for _ in 0..1030 {
+            let s = meta::alloc_inode(&mut fleet).await.unwrap();
+            let granted = lease::acquire(&fleet.client, &fleet.client_id, s, autumn_rpc::manager_rpc::LEASE_MODE_WRITE)
+                .await
+                .unwrap();
+            assert!(matches!(granted, lease::AcquireResult::Granted(_)));
+            fleet.kv_put(&key::session_key(s), b"fleet").await.unwrap();
+        }
+
+        // A session that died with a file half written: its number comes
+        // from a later batch, so its record sorts after all of them.
+        let mut dead = FsState::new(&mgr).await.expect("dead");
+        let mut f = publish::NewFile::begin(&mut dead, 1, b"orphan").await.unwrap();
+        f.write(&mut dead, b"never published").await.unwrap();
+        f.finish(&mut dead).await.unwrap();
+        let s = dead.session.unwrap();
+        assert!(fleet.session.is_none() && s > 1030);
+        lease::release(&dead.client, &dead.client_id, s).await.unwrap();
+
+        let mut rescuer = FsState::new(&mgr).await.expect("rescuer");
+        assert_eq!(publish::recover_dead_sessions(&mut rescuer).await.unwrap(), 1, "only the dead one");
+        assert_eq!(rescuer.kv_get_opt(&key::pending_key(s, f.ino)).await.unwrap(), None, "its write undone");
+        assert_eq!(rescuer.kv_get_opt(&key::inode_key(f.ino)).await.unwrap(), None);
+        assert_eq!(rescuer.kv_get_opt(&key::session_key(s)).await.unwrap(), None);
+    });
+}

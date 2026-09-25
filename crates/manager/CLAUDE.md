@@ -1685,7 +1685,16 @@ duplicated batches under concurrent allocators). Etcd mode: authoritative counte
 `fs_next_inode_key(volume)` (strict BE u64; malformed → refuse loudly). Every grant is a
 read → `txn_fenced` value-CAS loop (leader fence prepended, so a deposed leader's grant
 loses the txn — no double-grant across a transition); first-create uses the
-create_revision==0 pattern; no in-memory cache (failover needs no replay hook). Migration
+create_revision==0 pattern; no in-memory cache (failover needs no replay hook). Grants
+are **queued in the manager** (`fs_alloc_turn`, an async mutex held around the CAS loop):
+only the leader writes the counter, so without the queue the conflicts were the leader's
+own concurrent requests, and a burst of 64 allocators — eight 8-worker S3 gateways
+writing for the first time — exhausted the 16 CAS attempts
+(`fs_alloc_inodes::a_burst_of_allocators_is_all_granted`, red without the queue). The CAS
+remains for a deposed leader still writing. A grant is two etcd round trips (get, txn) per
+~1000 inodes, so the queue caps grants at roughly one per two etcd RTTs (not measured).
+During an etcd outage queued grants fail one after another rather than together.
+Migration
 floor: the request carries the legacy KV counter value; the grant never returns a base
 below it (`max(cur, floor)`) and the counter never rewinds. This is deliberately NOT
 `alloc_ids` (that numbers manager entities replayed from etcd prefixes; inode numbers

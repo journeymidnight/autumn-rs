@@ -210,3 +210,30 @@ fn etcd_counter_is_cas_backed_and_follower_refuses() {
         );
     });
 }
+
+/// A fleet asking at once — 64 allocators on their own connections, which
+/// is what eight 8-worker S3 gateways writing for the first time look like.
+/// Every one must be granted, disjointly: the leader's own concurrent grants
+/// must not use up each other's CAS attempts.
+#[test]
+#[ignore] // requires embedded etcd
+fn a_burst_of_allocators_is_all_granted() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (_etcd_guard, etcd_endpoint) = start_etcd().await;
+        let mgr_addr = pick_addr();
+        start_etcd_manager(mgr_addr, etcd_endpoint);
+        compio::time::sleep(Duration::from_secs(2)).await;
+        let mut conns = Vec::new();
+        for _ in 0..64 {
+            conns.push(RpcClient::connect(mgr_addr).await.expect("connect"));
+        }
+        let resps = futures::future::join_all(conns.iter().map(|c| alloc(c, 1000, 0))).await;
+        let mut ranges = Vec::new();
+        for r in &resps {
+            assert_eq!(r.code, CODE_OK, "grant refused under a burst: {}", r.message);
+            ranges.push((r.base, r.base + 1000));
+        }
+        ranges.sort();
+        assert!(ranges.windows(2).all(|w| w[0].1 <= w[1].0), "overlapping grants");
+    });
+}

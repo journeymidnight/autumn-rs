@@ -9,11 +9,15 @@
 //! other monotonic token (owner_epoch, lease_epoch) — as a leader-fenced
 //! **etcd CAS** on `autumn-rs/fs/next_inode`.
 //!
-//! Concurrency model: the CAS loop re-reads the counter and retries on
-//! conflict, so any number of concurrent `AllocInodes` grants receive
-//! disjoint `[base, base+count)` ranges; the leader fence inside
-//! `txn_fenced` means a deposed leader's grant loses the txn instead of
-//! double-granting across a leader transition.
+//! Concurrency model: the manager grants one at a time
+//! (`AutumnManager::fs_alloc_turn`), and each grant is a CAS on the counter
+//! inside the leader fence. Only the leader writes the counter, so the queue
+//! is what keeps concurrent grants from conflicting: with the CAS alone, the
+//! leader's own concurrent requests raced each other, and a burst of 64
+//! allocators (eight 8-worker S3 gateways writing for the first time) ran
+//! requests out of their CAS attempts. The CAS stays for what the queue
+//! cannot see — a deposed leader still writing — and the fence inside
+//! `txn_fenced` makes that grant lose the txn instead of double-granting.
 //!
 //! Migration: requests carry a `floor` — the legacy KV counter value read by
 //! the fuse mount. The grant never returns a base below the floor, so a
@@ -86,9 +90,9 @@ pub(crate) fn valid_alloc_volume(v: &[u8]) -> bool {
 /// crate DAG).
 pub(crate) const FS_FIRST_ALLOCATABLE_INO: u64 = 2;
 
-/// CAS retry budget. Contention is per-batch (one grant per ~1000 inodes per
-/// allocator), so even pathological mount storms resolve in a few rounds;
-/// exceeding this indicates something systemically wrong — fail loudly.
+/// CAS retry budget. Grants are queued in the manager, so a conflict means
+/// another writer of the counter (a deposed leader); exceeding this
+/// indicates something systemically wrong — fail loudly.
 const MAX_CAS_ATTEMPTS: u32 = 16;
 
 impl AutumnManager {
@@ -107,6 +111,8 @@ impl AutumnManager {
         match &self.etcd {
             None => Ok(alloc_from_map(&self.fs_next_inode, volume, count, floor)),
             Some(etcd) => {
+                // Two etcd round trips (get, txn) per grant of ~1000 inodes.
+                let _turn = self.fs_alloc_turn.lock().await;
                 etcd.alloc_fs_inodes_cas(&fs_next_inode_key(volume), count, floor)
                     .await
             }
@@ -148,10 +154,9 @@ impl EtcdMirror {
     ) -> Result<u64, AppError> {
         for attempt in 0..MAX_CAS_ATTEMPTS {
             if attempt > 0 {
-                // Linear backoff on CAS conflict (coco P3): each round some
-                // writer commits, so N conflicters finish in ≤ N rounds; the
-                // spread just de-synchronizes their re-reads under a mount
-                // storm. Bounded await (3 ms × attempt ≤ 45 ms).
+                // Linear backoff on CAS conflict, which with grants queued
+                // means another writer of the counter (a deposed leader).
+                // Bounded await (3 ms × attempt ≤ 45 ms).
                 compio::time::sleep(std::time::Duration::from_millis(3 * attempt as u64)).await;
             }
             let got = self

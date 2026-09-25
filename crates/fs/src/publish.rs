@@ -635,10 +635,25 @@ pub async fn fence_all(state: &mut FsState, lease: WriteLease) -> Result<()> {
 /// is safe.
 pub async fn recover_dead_sessions(state: &mut FsState) -> Result<usize> {
     let prefix = key::session_prefix();
-    let (keys, _) = state.kv_range_page(&prefix, &prefix, 1024).await?;
+    let mut from = prefix.clone();
+    let mut recovered = 0;
+    // Every page: live sessions — a gateway fleet has one per worker — must
+    // not hide the dead ones behind them.
+    loop {
+        let (keys, has_more) = state.kv_range_page(&prefix, &from, 1024).await?;
+        recovered += recover_page(state, &keys).await;
+        match (has_more, keys.last()) {
+            (true, Some(last)) => from = crate::dir::name_successor(last),
+            _ => return Ok(recovered),
+        }
+    }
+}
+
+/// Take over and recover each dead session among `keys`. Returns how many.
+async fn recover_page(state: &mut FsState, keys: &[Vec<u8>]) -> usize {
     let mut recovered = 0;
     for k in keys {
-        let Some(s) = key::parse_session_key(&k) else { continue };
+        let Some(s) = key::parse_session_key(k) else { continue };
         if Some(s) == state.session {
             continue;
         }
@@ -660,7 +675,7 @@ pub async fn recover_dead_sessions(state: &mut FsState) -> Result<usize> {
             Err(e) => tracing::warn!(session = s, error = %e, "session recovery incomplete; retried next sweep"),
         }
     }
-    Ok(recovered)
+    recovered
 }
 
 /// Finish or undo every operation session `s` left, then remove the session.

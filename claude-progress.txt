@@ -1,3 +1,12 @@
+Date: 2026-09-25 (7)
+TaskStatus: completed
+Task scope: "这2个risk看来不难修，fix" — the two multi-gateway risks found while answering "如果有多个gateway同时启动呢?".
+Current summary: (1) manager inode grants: the leader's own concurrent MSG_ALLOC_INODES raced each other's etcd CAS; a 64-allocator burst failed with "16 CAS attempts exhausted". Now an async mutex (`AutumnManager::fs_alloc_turn`) queues grants; the CAS stays for a deposed leader. (2) `publish::recover_dead_sessions` read only the first 1024 `sess/` records, so dead sessions behind >1024 live ones (≈110+ gateways at 9 sessions each) were never recovered; now pages through all.
+Review (opus, independent): no correctness finding; fixed doc nits (a grant is 2 etcd round trips, stale backoff comment, 9 sessions per gateway → ~113 gateways fill a page). Noted: during an etcd outage queued grants now fail serially; the paging test holds 1030 leases without heartbeat (fine unless setup exceeds 30 s).
+Verification: both regression tests reproduced red on the old code first, green after: fs_alloc_inodes::a_burst_of_allocators_is_all_granted (etcd, 64 connections × 1000) and system_publish::a_dead_session_behind_a_page_of_live_ones_is_recovered (1030 live sessions before one dead). manager lib 418, autumn-fs 27, fs_alloc_inodes 7, system_publish 6, system_multipart, leader_fence 4 pass. The multi-gateway e2e from the question (3 gateways × 8 workers started together; 96-PUT burst 0 errors; SDK suite 70/70 on all three at once; cross-gateway Complete retry, 24-way If-None-Match race = 1 winner, GET on B vs DELETE on A intact; kill -9 of A mid-body undone by B/C ~31 s later) ran before these fixes.
+Main gaps: system_manager_failover has 2 failures (NamespaceUnknown in the test helper's puts) that fail identically on HEAD without this change — pre-existing, not investigated.
+Next steps: none for this task.
+
 Date: 2026-09-25 (6)
 TaskStatus: completed
 Task scope: the two gateway gaps the user asked for — "Complete retry ... returns NoSuchUpload (实在困难也可以不实现)" and "Aborts and large deletes ... 是不是有lock的问题，必须解决".

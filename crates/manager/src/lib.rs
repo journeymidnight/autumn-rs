@@ -768,6 +768,9 @@ pub struct AutumnManager {
     /// that counter numbers stream/extent/partition ENTITIES replayed from
     /// etcd prefixes; inode numbers are fs-layer data with their own key.
     pub(crate) fs_next_inode: Rc<RefCell<HashMap<Vec<u8>, u64>>>,
+    /// Serializes this manager's inode grants (`fs_alloc::alloc_fs_inodes`),
+    /// so its own concurrent requests never race each other's CAS.
+    pub(crate) fs_alloc_turn: Rc<futures::lock::Mutex<()>>,
     runtime_started: Rc<Cell<bool>>,
     /// true once `serve()`'s listener is actually BOUND and
     /// accepting. The UCX listener bind can retry through a killed
@@ -1088,6 +1091,7 @@ impl AutumnManager {
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
             fs_next_inode: Rc::new(RefCell::new(HashMap::new())),
+            fs_alloc_turn: Rc::new(futures::lock::Mutex::new(())),
             runtime_started: Rc::new(Cell::new(false)),
             serving: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),

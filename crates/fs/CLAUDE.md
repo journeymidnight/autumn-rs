@@ -472,7 +472,10 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   `fence_all` 把每个 fs 分区对该会话的围栏抬到新 epoch（先 `refresh_regions`，并重复到
   一轮找不到新分区为止：长寿客户端的缓存可能早于一次 split，split 之后才抬的地板子分区
   没有），再按 dirent 指向谁完成或撤销每个记录。**调用方是 S3 网关的清扫线程**（每
-  `--sweep-interval-secs` 一次）。活会话自己留下的记录（结果未知的交换）只在它死后才被
+  `--sweep-interval-secs` 一次）。它翻完 `sess/` 的每一页：网关每台 9 个活会话（8 个 worker +
+  回收线程），只读第一页（1024）时，约 113 台以上的网关集群会让排在后面的死会话永远没人恢复
+  （`system_publish::a_dead_session_behind_a_page_of_live_ones_is_recovered`，只读一页即红）。
+  每个活会话每轮一次 manager acquire（被拒即跳过）。活会话自己留下的记录（结果未知的交换）只在它死后才被
   处理。持有会话的一方必须跑租约心跳（`spawn_lease_background_tasks`），否则会话租约
   30 s 后过期，清扫方会接管并围栏掉它还在写的一切。
 - **CAS 是提交点**，之后的一切都不能让发布失败：替换/删除之前先记
