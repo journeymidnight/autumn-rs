@@ -38,7 +38,10 @@ self-healing extents.
 - **Storage data model** — ordered KV (put/get/delete/range, MVCC, streaming
   put/get for large values) via `autumn-client` CLI or the Rust/Python SDK, plus
   a **POSIX filesystem** (`autumn-fuse`) and a programmatic **`autumn.Fs`** Python
-  binding (same shared inode layout) for models, datasets and checkpoints.
+  binding (same shared inode layout) for models, datasets and checkpoints, and
+  an **S3 endpoint** (`autumn-s3`) over the same files: reads, writes with
+  `If-None-Match`/`If-Match`, copy, delete and multipart uploads whose Complete
+  moves no bytes — so S3-native tools such as LanceDB keep their data on autumn.
 - **Inference KV cache** — `autumn-kvcache` implements the sglang / vLLM
   **HiCache L3** storage-backend API (pure Python adapter, no extra daemon);
   verified end-to-end against real models with correct cross-instance

@@ -49,7 +49,7 @@ async fn boot(mgr_addr: std::net::SocketAddr, n1: std::net::SocketAddr, n2: std:
 async fn upload_part(st: &mut FsState, upload: u64, part: u32, data: &[u8]) -> Result<(String, u64), MultipartError> {
     let mut w = PartWriter::begin(st, upload, part).await?;
     for chunk in data.chunks(3 << 20) {
-        w.write(st, chunk).await?;
+        w.write(&st.client, chunk).await?;
     }
     w.finish(st).await
 }
@@ -212,7 +212,7 @@ fn multipart_complete_is_metadata_only_and_races_resolve() {
         // ── Abort wins: no Complete afterwards, data reclaimed; a late part
         //    cleans up after itself ──
         let mut late = PartWriter::begin(&mut st, up, 3).await.unwrap();
-        late.write(&mut st, &pattern(2 * mib, 30)).await.unwrap();
+        late.write(&st.client, &pattern(2 * mib, 30)).await.unwrap();
         multipart::abort(&mut st, up).await.expect("abort");
         assert!(matches!(late.finish(&mut st).await, Err(MultipartError::NoSuchUpload)));
         assert!(matches!(
@@ -290,7 +290,7 @@ fn multipart_complete_is_metadata_only_and_races_resolve() {
         let (fe1, _) = upload_part(&mut st, up, 1, &pattern(mib, 50)).await.unwrap();
         let mut dead = FsState::new(&mgr).await.expect("mount2");
         let mut orphan = PartWriter::begin(&mut dead, up, 2).await.unwrap();
-        orphan.write(&mut dead, &pattern(4 * mib, 51)).await.unwrap();
+        orphan.write(&dead.client, &pattern(4 * mib, 51)).await.unwrap();
         let dead_session = dead.session.unwrap();
         // The dead session had also started completing: its record and
         // Completing state exist, the name was never published.

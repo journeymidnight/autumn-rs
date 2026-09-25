@@ -130,13 +130,92 @@ a manager-side reverse lookup, i.e. a wire change. A failed lookup degrades to
 
 ### `autumn-s3` (`src/bin/autumn_s3/`)
 
-Read-only, unauthenticated S3 endpoint over the `fs/` tree, in its own process.
-It exists so inference engines with no loader plugin seam (SGLang, FreeToken)
-can stream weights through their built-in `--load-format runai_streamer`, which
-speaks S3 and nothing else; every other S3 tool reads autumn through it as a
-side effect. Serves `ListObjectsV2`, `HeadBucket`, ranged/whole `GetObject`,
-and `HeadObject`. Answers mutating verbs with a parseable S3 `NotImplemented`.
-Requests are served whatever their `Authorization` header says, including none.
+Unauthenticated S3 endpoint over the `fs/` tree, in its own process. It began
+read-only, so inference engines with no loader plugin seam (SGLang, FreeToken)
+could stream weights through their built-in `--load-format runai_streamer`; it
+now also writes, so a stock S3 client (LanceDB's `object_store`) can create and
+update data on autumn. Serves `ListObjectsV2`, `HeadBucket`, ranged/whole and
+conditional `GetObject`/`HeadObject`, `PutObject` (`If-None-Match: *`,
+`If-Match`), `CopyObject`, `DeleteObject` (`If-Match`), `DeleteObjects`, and
+Create/UploadPart/Complete/AbortMultipartUpload. Everything else answers a
+parseable S3 `NotImplemented` (UploadPartCopy, ListParts, ListMultipartUploads,
+versioning, ACLs). Object metadata (`Content-Type`, `x-amz-meta-*`) is not
+stored. Requests are served whatever their `Authorization` header says,
+including none.
+
+- **Writes are `autumn-fs`, not a second implementation** (`write.rs`). A PUT
+  or Copy is a `publish::NewFile` published with one fenced compare-and-write
+  on its dirent, so `If-None-Match: *` and `If-Match` are decided by the
+  partition server; multipart is `autumn_fs::multipart` (Complete touches no
+  part body). An object written here is a file to the mount and to
+  `autumn.Fs`, and vice versa. The ETag is inode + content generation
+  (`publish::etag`), so it changes on a same-size same-second rewrite and an
+  `If-Match` names exactly one version; a tag this gateway did not issue names
+  no version (412, or 404 when there is no object).
+- **The worker's state lock is held only for the stateful steps.** Begin,
+  finish, publish and namespace lookups take it; a request body streams into
+  its data object through the client alone (`NewFile::start_object` +
+  `write_streamed`, `PartWriter::write`). Before this a 64 MiB batch put would
+  have held the lock and stalled every other request on the worker. A body of
+  declared length at most the inline threshold is written under the lock (no
+  I/O: it is buffered into the inode).
+- **Nothing unfinished outlives its request.** An unpublished file and an
+  unfinished part sit in a guard whose `Drop` undoes them, which also covers a
+  client disconnect dropping the request future mid-await. Without it the
+  pending record would stay under the worker's session, which is alive, so no
+  recovery would ever look at it.
+- **A GET pins what it streams** (`objects::open_pinned`). It takes a STABLE
+  lease before reading the metadata, so the headers and every byte are one
+  version, and no other client can write it in place or reclaim its data
+  until the body is done or the client goes away. A delete or overwrite still
+  succeeds at once — only the data waits (verified: a 40 MiB GET survives a
+  delete and a replace mid-body, 4/4; with the manager lease released right
+  after the pin it broke at 17.5 MB). The pin lives in `held_leases`
+  (`reader_refs` counts this worker's requests), which gives it three things:
+  the shared heartbeat renews it; `remove_unreachable_inode` on the SAME worker
+  defers to `unlinked_open` instead of reclaiming under it, which matters
+  because a client's own EXCLUSIVE is never stopped by its own pin; and the
+  release reclaims those deferred inodes. The last request's release waits
+  2 s (`PIN_LINGER`) so the sequential ranged GETs of the streamer and of Lance
+  scans share one manager acquire; a mount writer is refused EBUSY during that
+  linger. A writer holding the file makes the GET a 503 `SlowDown`, which SDKs
+  retry. A pin the heartbeat finds gone ends the body with an error rather than
+  risk a changed file.
+- **Conditional reads** follow RFC 9110 order (If-Match, else
+  If-Unmodified-Since; If-None-Match, else If-Modified-Since), which is what S3
+  does; `Last-Modified` is an IMF-fixdate (it was ISO 8601, which is not an
+  HTTP date).
+- **Bodies**: `aws-chunked` (current AWS SDKs' default, to carry a trailing
+  checksum) is decoded without copying; chunk signatures and trailing
+  checksums are not verified, like SigV4. `Content-MD5` is checked only when
+  sent, so an ordinary PUT pays no single-core MD5 over its bytes.
+- **Keys** map to paths: parent directories are created on write; a key
+  ending in `/` is a directory (an empty PUT of it creates the directory);
+  empty, `.` and `..` components are `InvalidArgument`. Deleting an object
+  leaves its directories (there is no multi-key transaction between removing
+  a directory and a concurrent create under it), so an emptied directory still
+  lists as a common prefix.
+- **Background sweeps** run on their own thread and `FsState`
+  (`--sweep-interval-secs`, default 30, 0 = off): dead publishing sessions are
+  taken over, fenced and finished or undone; terminal multipart uploads,
+  unlinked files and segment garbage are reclaimed. All idempotent, safe in
+  several gateways at once. Every worker also runs the lease heartbeat — the
+  publishing session lapses after 30 s without it, and a sweeper would then
+  recover it and fence out its writes. Verified by `kill -9` of the gateway
+  mid-PUT and mid-UploadPart with 29 data keys already written: after a
+  restart the sweeper reclaimed every one of them and the pending records, and
+  the upload stayed usable.
+- **Known limits.** Aborting an upload and deleting a large object reclaim
+  their data inside the request, under the worker's lock. DeleteObjects deletes
+  its keys one at a time. A Complete retried after it succeeded (a lost reply)
+  gets `NoSuchUpload`, where AWS answers success. A publish whose outcome is
+  unknown is settled only when the worker's session is recovered, i.e. after a
+  gateway restart; until then a retry of that Complete on the same worker is
+  `ConditionalRequestConflict`.
+- SDK check: `scripts/s3_write_check.py` (boto3; every API above, the error
+  codes the SDK parses, a racing-creators round that must leave exactly one
+  winner — ablated by ignoring `If-None-Match`, which made all eight win). See
+  `docs/ops.md`.
 
 - **Listing (`listing.rs`) walks in S3 key order and resumes at the token.**
   Keys are raw-byte ordered and a directory `d` owns every `d/...` key, while
@@ -163,7 +242,7 @@ Requests are served whatever their `Authorization` header says, including none.
 ```
 autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
           [--host <daemon-identity>] [--credential-file <path>]
-          [--direct-read true|false]
+          [--direct-read true|false] [--sweep-interval-secs 30]
 ```
 
 - Reads go through `autumn-fs` — the same crate the fuse mount and the PyO3
@@ -173,7 +252,7 @@ autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
   runtime, its own `FsState` and an SO_REUSEPORT listener on the same port. One
   thread caps an AWS-CRT client at ~40% of the read path; the knee is at 4.
 - `--host` names the daemon identity each worker registers under (the entrypoint
-  passes `s3-$HOSTNAME`); workers append their index.
+  passes `s3-$HOSTNAME`); workers append their index and the sweeper `-sweep`.
 - Being a binary of this package rather than an example also means a plain
   `cargo build --release` produces it — examples were never in
   `default-members`, so it used to be skipped, which is the shape of the

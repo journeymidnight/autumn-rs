@@ -25,7 +25,7 @@ use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 
 use autumn_client::lease::{self, AcquireResult};
-use autumn_client::WriteLease;
+use autumn_client::{ClusterClient, WriteLease};
 use autumn_rpc::manager_rpc::{LEASE_MODE_REPLACE, LEASE_MODE_WRITE};
 
 use crate::key;
@@ -165,19 +165,42 @@ impl NewFile {
     /// Append `data`.
     pub async fn write(&mut self, state: &mut FsState, data: &[u8]) -> Result<()> {
         if let Some(o) = &mut self.object {
-            return o.write(state, data).await;
+            return o.write(&state.client, data).await;
         }
         self.small.extend_from_slice(data);
         if self.small.len() > schema::INLINE_THRESHOLD {
-            let ino = self.ino;
-            // Recorded under the new file, so an undo — or a reclaim once
-            // published — finds it.
-            let mut o = segment::ObjectStream::new(state, |d| key::segc_key(ino, d), self.lease).await?;
-            let held = self.small.split();
-            o.write(state, &held).await?;
-            self.object = Some(o);
+            self.start_object(state).await?;
         }
         Ok(())
+    }
+
+    /// Give the file its data object now rather than when it outgrows the
+    /// inline threshold, so every later [`NewFile::write_streamed`] needs only
+    /// the client. For a writer that knows the file is not small (a PUT whose
+    /// length exceeds the threshold, or is unknown) and does not want to hold
+    /// the `FsState` while the body arrives.
+    pub async fn start_object(&mut self, state: &mut FsState) -> Result<()> {
+        if self.object.is_some() {
+            return Ok(());
+        }
+        let ino = self.ino;
+        // Recorded under the new file, so an undo — or a reclaim once
+        // published — finds it.
+        let mut o = segment::ObjectStream::new(state, |d| key::segc_key(ino, d), self.lease).await?;
+        let held = self.small.split();
+        o.write(&state.client, &held).await?;
+        self.object = Some(o);
+        Ok(())
+    }
+
+    /// Append `data` through the client alone. Only after
+    /// [`NewFile::start_object`]: the inline buffer would need the `FsState`
+    /// to spill into an object.
+    pub async fn write_streamed(&mut self, client: &ClusterClient, data: &[u8]) -> Result<()> {
+        match &mut self.object {
+            Some(o) => o.write(client, data).await,
+            None => Err(anyhow!("write_streamed before start_object")),
+        }
     }
 
     /// Write the rest and the inode. Returns the inode's metadata, which is
@@ -193,7 +216,7 @@ impl NewFile {
                 }
             }
             Some(o) => {
-                let (len, _) = o.finish(state).await?;
+                let (len, _) = o.finish(&state.client).await?;
                 m.size = len;
                 m.segments = Some(SegmentMap { inline: vec![o.segment(0)], map_id: 0, page_starts: Vec::new(), count: 1 });
             }
@@ -329,8 +352,15 @@ async fn hold_for_swap(
     lease: WriteLease,
 ) -> std::result::Result<bool, PublishError> {
     // The manager lets a client replace over its own WRITE; this session's
-    // own open writer is just as much a conflict.
-    if state.held_leases.borrow().contains_key(&o) {
+    // own open writer is just as much a conflict. Only a WRITER: a reader or
+    // an S3 GET's STABLE pin held here does not stop a replace, exactly as the
+    // same holders on another client do not.
+    let own_writer = state
+        .held_leases
+        .borrow()
+        .get(&o)
+        .is_some_and(|l| l.writer_refs > 0 || l.mode == LEASE_MODE_WRITE);
+    if own_writer {
         return Err(PublishError::Busy(format!("inode {o} is open for writing by this client")));
     }
     hold_replace(state, o).await?;

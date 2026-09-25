@@ -471,9 +471,10 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   `[0x04]pend/[S][obj]`。会话死后 `recover_dead_sessions` 夺取其租约（epoch 升高）、
   `fence_all` 把每个 fs 分区对该会话的围栏抬到新 epoch（先 `refresh_regions`，并重复到
   一轮找不到新分区为止：长寿客户端的缓存可能早于一次 split，split 之后才抬的地板子分区
-  没有），再按 dirent 指向谁完成或撤销每个记录。**调用方是 S3 网关的周期任务**（尚未接入；
-  在那之前只有测试调用它，死会话的记录与会话 key 会一直留着）。活会话自己留下的记录（结果
-  未知的交换）只在它死后才被处理。
+  没有），再按 dirent 指向谁完成或撤销每个记录。**调用方是 S3 网关的清扫线程**（每
+  `--sweep-interval-secs` 一次）。活会话自己留下的记录（结果未知的交换）只在它死后才被
+  处理。持有会话的一方必须跑租约心跳（`spawn_lease_background_tasks`），否则会话租约
+  30 s 后过期，清扫方会接管并围栏掉它还在写的一切。
 - **CAS 是提交点**，之后的一切都不能让发布失败：替换/删除之前先记
   `PendingOp::Retire{parent,name,ino,successor}`（`successor` = 要换上的新 inode，删除为
   `None`），CAS 落地后退掉旧 inode（`drop_name_of`），成功才删记录；失败留给恢复（以前退旧
@@ -488,8 +489,16 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   `PublishError::Other`，调用方**不撤销**（在途请求之后仍可能落地），记录留给恢复。只有
   PreconditionFailed / NoSuchKey / Busy / NotAFile 这些确定结果才撤销。
 - **REPLACE 持有期间才核对 `If-Match` 的 generation**：先读后取租约，中间别的写者可以改完
-  并释放。旧 inode 此时已不存在（别的发布者抢先换掉）= PreconditionFailed。本 client 自己对旧 inode 持有写租约也算冲突（manager 允许同 client 在自己的
-  WRITE 上取 REPLACE）。
+  并释放。旧 inode 此时已不存在（别的发布者抢先换掉）= PreconditionFailed。本 client 自己对旧
+  inode 的**写者**也算冲突（manager 允许同 client 在自己的 WRITE 上取 REPLACE）：只看
+  `writer_refs > 0` 或 `mode == WRITE`。以前是 `held_leases` 里有这个 inode 就算冲突，于是同一
+  网关 worker 上一个正在进行的 GET（它的 STABLE pin 也记在 `held_leases`）会让覆盖它的 PUT
+  得到 409，而换一个 worker 就能成功——别的客户端的读者和 STABLE 本来就不挡 REPLACE。
+- **流式写入只需要 client**：`ObjectStream::write/finish` 取 `&ClusterClient`，不取
+  `&mut FsState`。`NewFile::start_object` 让新文件一开始就有数据对象，之后
+  `write_streamed(client, ..)` 不碰 `FsState`；`PartWriter::write` 同理。共享一个 `FsState`
+  的调用方（S3 网关每个 worker）因此可以只在 begin / finish / publish 时持锁，请求体的数据
+  写入不挡同一 worker 上的其它请求。
 - 已知限制：FUSE 的 unlink/rename 是无条件 KV 操作，与网关同名并发时后者赢；恢复按"dirent
   是否指向它"判定，发布者在 CAS 与删记录之间崩溃、且恢复前有人把该名 rename 走，会被误判为
   未发布而撤销；`Retire` 在"已减 nlink、未删记录"时崩溃，恢复会再减一次，nlink=2 时即删掉
@@ -538,8 +547,9 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   若干重试，线性）；`sweep_uploads` 翻完所有上传页，不只第一页（前 256 个 Open 上传挡不住
   后面的终态上传）。
 - **已知限制**：
-  - `sweep_uploads`、`recover_dead_sessions` 目前只有测试调用，网关的周期任务尚未接入；
-    网关的 multipart HTTP 路由也尚未接入。
+  - 网关的清扫线程调 `sweep_uploads` 与 `recover_dead_sessions`；HTTP 路由见
+    `crates/server/CLAUDE.md` 的 `autumn-s3` 一节。Abort 在请求内同步回收全部分片正文，
+    大上传的 Abort 会在网关 worker 的锁内做完这些删除。
   - 上传记录一 Completed 就被清理删掉，所以成功之后才到的 Complete 重试（丢了回复）得到
     NoSuchUpload 而不是原来的结果。AWS 对这种重试会返回成功，对象存储客户端的重试因此会
     失败；需要时给 Completed 记录留一段保留期。

@@ -3622,13 +3622,16 @@ build did stamp v4 over an unstamped v3 tree; every new client then fails with
 `printf '\0\0\0\0\0\0\0\3' > v3; autumn-client --namespace fs put "$(printf '\x04schema_version')" v3`.) Delete the
 `migratev3_v4` bin once the one cluster is converted, as with `migratev0_v1`.
 
-## S3 gateway — serving autumn weights to engines with no loader plugin
+## S3 gateway — reading and writing autumn over S3
 
-`autumn-s3` is a read-only, unauthenticated S3 endpoint over the `fs/` tree. It
-exists so SGLang and FreeToken — neither of which has a loader plugin seam —
-can use their built-in `--load-format runai_streamer` to stream weights
-concurrently, with no engine patches. `aws s3` and every other S3 client work
-against it too.
+`autumn-s3` is an unauthenticated S3 endpoint over the `fs/` tree. It began so
+SGLang and FreeToken — neither of which has a loader plugin seam — could use
+their built-in `--load-format runai_streamer` to stream weights concurrently,
+with no engine patches; it now also writes (PUT, Copy, Delete, DeleteObjects,
+multipart, conditional writes and reads), so a stock S3 client such as
+LanceDB's can keep its data on autumn. `aws s3` and every other S3 client work
+against it too. An object written through it is a file to a fuse mount and to
+`autumn.Fs`, and the other way round.
 
 Buckets are the first level under `fs/`: `s3://models/llama/x.safetensors` is
 autumn `fs/models/llama/x.safetensors`.
@@ -3688,13 +3691,64 @@ python -m sglang.launch_server --model-path s3://models/llama \
 # zero-copy) unless you are A/B-ing the two.
 ```
 
-Not supported, by design: PUT/DELETE, multipart, versioning, ACLs,
-virtual-host addressing (use path-style, which is what `--endpoint-url`
-selects), and SigV4 verification. Anything else answers `NotImplemented`.
+### Writing through the gateway
 
-Multipart and conditional publish exist in the `autumn-fs` core but are not
-routed through the gateway yet. Verify the core against an in-process cluster
-(no libfuse needed; the run sleeps ~33 s so a session lease expires):
+```bash
+export AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=x AWS_EC2_METADATA_DISABLED=true
+E=http://127.0.0.1:9100
+# The bucket is a first-level directory and must exist; the gateway does not
+# create buckets. Parent directories under it are created on write.
+autumnfs --manager 127.0.0.1:9001 mkdir /tables
+aws --endpoint-url $E s3 cp ./data.lance s3://tables/t1/data/0.lance     # multipart above 8 MiB
+aws --endpoint-url $E s3api put-object --bucket tables --key t1/_versions/1.manifest \
+    --body m.bin --if-none-match '*'          # 412 PreconditionFailed if it exists
+aws --endpoint-url $E s3 rm s3://tables/t1/data/0.lance
+```
+
+`--sweep-interval-secs` (default 30, `0` = off) runs the background sweeps on a
+thread of their own: publishing sessions of a gateway that died are taken over
+and their half-done writes finished or undone, and aborted/completed uploads,
+unlinked files and segment garbage are reclaimed. Every gateway may run them.
+
+Statuses a client should expect beyond the usual: `412 PreconditionFailed` for
+a failed `If-None-Match: *` / `If-Match`; `409 ConditionalRequestConflict` when
+a mount has the file open for writing, or another Complete of the same upload
+is running; `503 SlowDown` for a GET while a mount writes the file in place
+(SDKs retry it). Not supported: UploadPartCopy, ListParts,
+ListMultipartUploads, versioning, ACLs, object metadata (`Content-Type`,
+`x-amz-meta-*` are not stored), virtual-host addressing (use path-style, which
+is what `--endpoint-url` selects), and SigV4 verification. Anything else
+answers `NotImplemented`.
+
+**Verify the write APIs with a real SDK.** Needs a running cluster, a gateway
+and an existing bucket; `uv` fetches boto3. Every API above is checked, with
+the error codes the SDK parses, plus a racing-creators round that must leave
+exactly one winner (the pattern LanceDB commits with):
+
+```bash
+autumnfs --manager 127.0.0.1:9001 mkdir /s3check
+autumn-s3 --manager 127.0.0.1:9001 --port 9100 --sweep-interval-secs 10 &
+env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
+    uv run --with boto3 python scripts/s3_write_check.py --endpoint http://127.0.0.1:9100 --bucket s3check
+#   → "all checks passed"; --race-only runs just the racing round
+```
+
+**Verify a gateway crash leaves nothing behind.** Start a large PUT (and an
+UploadPart) that sends slowly, `kill -9` the gateway mid-body, restart it, and
+wait past the 30 s session lease plus one sweep. The gateway log shows
+`recovered dead publishing sessions`; the object was never published (HEAD
+404); the upload is still usable; and a scan of the `fs/` superblock records
+(`[0x04]pend/`, `[0x04]mpa/`, `[0x04]segc/`) and data keys (`[0x03]`) is back to
+what it was before the PUT started — the half-written body is deleted, not
+just forgotten.
+
+**Verify a GET keeps its object.** Stream a 40 MiB GET slowly and, from other
+connections, DELETE the key and PUT a new object at it mid-body. The GET must
+still return all 40 MiB byte-identical; the deleted data is reclaimed a few
+seconds after the GET ends (its `[0x04]rmtomb/` record disappears).
+
+Multipart and conditional publish live in `autumn-fs`; their system tests need
+no gateway and no libfuse (the run sleeps ~33 s so a session lease expires):
 
 ```bash
 cargo test -p autumn-manager --test system_multipart --test system_publish -- --include-ignored
@@ -3725,7 +3779,8 @@ Gotchas:
 - **path-style only.** A client configured for virtual-host addressing resolves
   `bucket.host` and never reaches the gateway.
 - **An undelimited listing walks the tree.** `aws s3 ls --recursive` from a
-  bucket root is capped at 100k entries and logs a warning; prefer a prefix.
+  bucket root visits every directory below it, a page at a time; prefer a
+  prefix.
 - **Listing costs one inode lookup per key** (for size/mtime). Fine for a model
   directory; not a directory-crawler substitute.
 

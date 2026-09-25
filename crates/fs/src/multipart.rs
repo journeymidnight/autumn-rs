@@ -43,7 +43,7 @@ use std::collections::HashSet;
 use anyhow::{anyhow, Result};
 
 use autumn_client::lease::{self, AcquireResult};
-use autumn_client::WriteLease;
+use autumn_client::{ClusterClient, WriteLease};
 use autumn_rpc::manager_rpc::LEASE_MODE_WRITE;
 
 use crate::key;
@@ -175,14 +175,16 @@ impl PartWriter {
         Ok(PartWriter { upload, part, lease, stream })
     }
 
-    pub async fn write(&mut self, state: &mut FsState, data: &[u8]) -> Result<()> {
-        self.stream.write(state, data).await
+    /// Append `data`. Needs only the client, so the caller may hold the
+    /// `FsState` just for `begin` and `finish`.
+    pub async fn write(&mut self, client: &ClusterClient, data: &[u8]) -> Result<()> {
+        self.stream.write(client, data).await
     }
 
     /// Write the rest and make this the part's current data. Returns the
     /// part's ETag and size.
     pub async fn finish(mut self, state: &mut FsState) -> std::result::Result<(String, u64), MultipartError> {
-        let (size, crc32c) = self.stream.finish(state).await?;
+        let (size, crc32c) = self.stream.finish(&state.client).await?;
         let d = self.stream.data_ino;
         let rec = PartRecord { data_ino: d, size, crc32c, lanes: self.stream.lanes, unit: self.stream.unit };
         // A plain put: a retry of the same part number replaces the record,

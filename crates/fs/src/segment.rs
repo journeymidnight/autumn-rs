@@ -368,20 +368,26 @@ impl ObjectStream {
         })
     }
 
-    pub async fn write(&mut self, state: &mut FsState, data: &[u8]) -> Result<()> {
+    /// Append `data`. Needs only the client, not the `FsState`, so a caller
+    /// that shares one state between many requests (the S3 gateway) can
+    /// stream a body without holding the state for the network writes.
+    pub async fn write(&mut self, client: &ClusterClient, data: &[u8]) -> Result<()> {
         self.crc = crc32c::crc32c_append(self.crc, data);
         self.pending.extend_from_slice(data);
         let batch = self.unit as usize * STREAM_UNITS;
         while self.pending.len() >= batch {
             let chunk = self.pending.split_to(batch).freeze();
-            self.put_units(state, chunk).await?;
+            self.put_units(client, chunk).await?;
         }
         Ok(())
     }
 
-    async fn put_units(&mut self, state: &mut FsState, chunk: Bytes) -> Result<()> {
+    async fn put_units(&mut self, client: &ClusterClient, chunk: Bytes) -> Result<()> {
         let rec = SegcRecord::Object { len: self.written + chunk.len() as u64, lanes: self.lanes, unit: self.unit };
-        state.kv_put_fenced(&self.record_key, &schema::encode_segc(&rec), self.lease).await?;
+        client
+            .put_fenced(&self.record_key, &schema::encode_segc(&rec), self.lease)
+            .await
+            .map_err(|e| anyhow!("KV put: {e}"))?;
         let unit = self.unit as usize;
         let mut keys = Vec::new();
         let mut vals = Vec::new();
@@ -393,7 +399,7 @@ impl ObjectStream {
             off += n;
         }
         let items: Vec<(&[u8], Bytes, u64)> = keys.iter().zip(vals).map(|(k, v)| (k.as_slice(), v, 0u64)).collect();
-        for r in state.client.put_many_fenced(&items, self.lease).await {
+        for r in client.put_many_fenced(&items, self.lease).await {
             r.map_err(|e| anyhow!("data object {}: {e}", self.data_ino))?;
         }
         self.written += chunk.len() as u64;
@@ -401,10 +407,10 @@ impl ObjectStream {
     }
 
     /// Write the rest. Returns `(length, crc32c)`.
-    pub async fn finish(&mut self, state: &mut FsState) -> Result<(u64, u32)> {
+    pub async fn finish(&mut self, client: &ClusterClient) -> Result<(u64, u32)> {
         let rest = self.pending.split().freeze();
         if !rest.is_empty() {
-            self.put_units(state, rest).await?;
+            self.put_units(client, rest).await?;
         }
         Ok((self.written, self.crc))
     }
