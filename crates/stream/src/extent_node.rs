@@ -2524,6 +2524,13 @@ async fn process_frames_backpressured(
             // place: every slot in this batch names the same file.
             let content_ck = node.cached_content_checksums(anchor_extent, &extent).await;
             inflight.push(build_read_future(extent, content_ck, file_rc, slots, true));
+        } else if msg_type == autumn_rpc::MSG_TYPE_PING {
+            // Keepalive: answered here, not through `dispatch`, so a reply
+            // never waits behind back-pressure or a slow control RPC — the
+            // client judges this connection by whether bytes come back.
+            let pong = Frame::response(frames[i].req_id, msg_type, Bytes::new());
+            tx_bufs.push(pong.encode());
+            i += 1;
         } else {
             // Control RPC — no hot-path grouping. Build a future that
             // dispatches and encodes one response frame.

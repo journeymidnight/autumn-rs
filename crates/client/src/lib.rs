@@ -1154,8 +1154,9 @@ impl ClusterClient {
     /// Get or create a manager RPC connection. Auto-reconnects on failure.
     async fn mgr_client(&self) -> Result<Rc<RpcClient>> {
         {
+            // Closed = replace, the same rule as `get_ps_client`.
             let guard = self.mgr_conn.borrow();
-            if let Some(c) = guard.as_ref() {
+            if let Some(c) = guard.as_ref().filter(|c| !c.is_closed()) {
                 return Ok(c.clone());
             }
         }
@@ -2087,8 +2088,11 @@ impl ClusterClient {
         };
         let gen = self.auth_gen.get();
         {
+            // A closed entry (peer gone, or silent past the keepalive) is
+            // skipped here and replaced below, instead of failing one more
+            // call before `evict_ps_on_error` removes it.
             let conns = self.ps_conns.borrow();
-            if let Some(c) = conns.get(ps_addr) {
+            if let Some(c) = conns.get(ps_addr).filter(|c| !c.is_closed()) {
                 return Ok(c.clone());
             }
         }

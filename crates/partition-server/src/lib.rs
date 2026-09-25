@@ -5696,6 +5696,13 @@ fn push_one_frame_to_inflight(
     // split off by the decoder; thread it into the delegate as bulk_value so
     // enqueue_put_bulk uses it directly (payload = [meta][key] only).
     let frame_value = frame.value;
+    // Keepalive, before the authz gate and routing: it names no partition and
+    // carries no data, and a connection that has not said hello yet must still
+    // be able to prove the peer alive.
+    if msg_type == autumn_rpc::MSG_TYPE_PING {
+        tx_bufs.push(Frame::response(req_id, msg_type, Bytes::new()).encode());
+        return;
+    }
     // AUTH_HELLO bind / per-request key-prefix + exp gate, BEFORE
     // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
     // ready completion; it never reaches serve/delegate.
@@ -13292,6 +13299,53 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             assert!(
                 p >= 2,
                 "peak concurrent in-flight = {p}, expected >= 2 for batched write"
+            );
+        });
+    }
+
+    /// The keepalive ping is answered by the connection loop itself — before
+    /// the authz gate (a connection that has not said hello must still prove
+    /// the PS alive) and without ever reaching the partition loop. An answer
+    /// of `unknown msg_type` would keep the client's connection alive too,
+    /// but as a refusal it would also be a log line per idle connection.
+    #[test]
+    fn keepalive_ping_is_answered_by_the_connection_loop() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(4);
+            let authz = std::sync::Arc::new(crate::authz::AuthzState::new());
+            authz.install(&autumn_rpc::manager_rpc::GetAuthzConfigResp {
+                enabled: true,
+                ..Default::default()
+            });
+            let _conn = compio::runtime::spawn(handle_ps_connection(
+                autumn_transport::Conn::Tcp(server),
+                req_tx,
+                None,
+                9,
+                authz,
+            ));
+            let client = autumn_rpc::client::RpcClient::from_conn(
+                autumn_transport::Conn::Tcp(client),
+                addr,
+            )
+            .expect("client");
+            let pong = client
+                .call(autumn_rpc::MSG_TYPE_PING, Bytes::new())
+                .await
+                .expect("ping must be answered as a success");
+            assert!(pong.is_empty());
+            assert!(
+                req_rx.try_next().is_err(),
+                "a ping must never reach the partition loop"
             );
         });
     }

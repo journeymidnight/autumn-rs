@@ -100,6 +100,14 @@ overhead (32–63 B PutResp headers): ~N× fewer kernel TCP traversals per Put.
 caps memory per pathological client (a large pipeline burst all targeting one
 partition).
 
+**Keepalive ping** (`autumn_rpc::MSG_TYPE_PING`) is answered first thing in
+`push_one_frame_to_inflight`, straight into `tx_bufs`: no partition, no authz, no
+inflight slot. Clients close a connection that shows no sign of life for ~10 s
+(autumn-rpc CLAUDE.md "Dead-peer detection"), so an idle connection must be able
+to prove the loop alive. The loop does NOT read while at its in-flight cap, so a
+ping cannot be answered then — a connection with 4 requests stalled ≥ 8 s can be
+closed by its client (the SDK's own 5 s first-attempt timeout already does so).
+
 **Mis-routed frames** (`part_id != owner_part`) synthesise an immediate
 `NotFound` error frame onto inflight — no mpsc hop. With per-partition listeners
 each `handle_ps_connection` serves only frames whose `part_id == owner_part`; a
@@ -1484,7 +1492,10 @@ signing key configured cluster-wide) ⇒ the whole gate is skipped, so fuse / kv
 dev pay nothing. `enabled` flips true only after the config poll installs a keyring.
 
 INVARIANT — **ONE choke point: `authz_gate`, at the TOP of every frame dispatch,
-BEFORE admission.** Called from `push_one_frame_to_inflight` and from
+BEFORE admission.** The single exception is the keepalive ping, answered just
+above it: it names no partition, carries and returns no data, and an un-helloed
+connection must be able to prove the PS alive (test
+`keepalive_ping_is_answered_by_the_connection_loop` runs with authz ON). Called from `push_one_frame_to_inflight` and from
 `drain_bulk_writes`. Bulk receive checks the verified control before allocating a
 value slab, then checks again after receive so expiry/revocation during the await
 cannot bypass normal admission semantics.

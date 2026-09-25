@@ -30,8 +30,7 @@ rancor = { version = "0.1", features = ["alloc"] }
 thiserror.workspace = true
 futures = "0.3"
 tracing = "0.1"
-
-[dev-dependencies]
+# `TCP_INFO` for the keepalive's ACK-progress signal (`client::AckProbe`).
 libc = "0.2"
 
 [[bench]]

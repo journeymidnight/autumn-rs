@@ -82,10 +82,8 @@ use autumn_common::AppError;
 use crate::store::MetadataStore;
 use autumn_rpc::extent_rpc::PayloadLocation;
 use autumn_rpc::manager_rpc::*;
-use autumn_rpc::{Frame, FrameDecoder, StatusCode};
+use autumn_rpc::StatusCode;
 use bytes::Bytes;
-use compio::io::{AsyncRead, AsyncWriteExt};
-use compio::BufResult;
 use crate::persist::records::NodeRecord;
 use crate::persist::records::StreamRecord;
 use crate::persist::records::PartitionRecord;
@@ -504,68 +502,17 @@ impl EtcdMirror {
 
 // ── ConnPool (single-threaded compio, Rc-based) ────────────────────────────
 
-/// Minimal connection pool for manager → extent node calls.
-/// Duplicates the pattern from stream::conn_pool to avoid manager→stream dep.
-struct RpcConn {
-    reader: autumn_transport::ReadHalf,
-    writer: autumn_transport::WriteHalf,
-    decoder: FrameDecoder,
-    next_id: u32,
-    read_buf: Vec<u8>,
-}
-
-impl RpcConn {
-    async fn connect(addr: SocketAddr) -> Result<Self> {
-        let conn = autumn_transport::current_or_init().connect(addr).await?;
-        if let Some(s) = conn.as_tcp() {
-            s.set_nodelay(true)?;
-        }
-        let (reader, writer) = conn.into_split();
-        Ok(Self {
-            reader,
-            writer,
-            decoder: FrameDecoder::new(),
-            next_id: 1,
-            read_buf: vec![0u8; 64 * 1024],
-        })
-    }
-
-    async fn call(&mut self, msg_type: u8, payload: Bytes) -> autumn_rpc::Result<Bytes> {
-        let req_id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1).max(1);
-
-        let frame = Frame::request(req_id, msg_type, payload);
-        let data = frame.encode();
-        let BufResult(result, _) = self.writer.write_all(data).await;
-        result?;
-
-        loop {
-            match self.decoder.try_decode()? {
-                Some(resp) if resp.req_id == req_id => {
-                    if resp.is_error() {
-                        let (code, message) = autumn_rpc::RpcError::decode_status(&resp.payload);
-                        return Err(autumn_rpc::RpcError::status(code, message));
-                    }
-                    return Ok(resp.payload);
-                }
-                Some(_) => continue,
-                None => {}
-            }
-
-            let BufResult(result, buf_back) =
-                self.reader.read(std::mem::take(&mut self.read_buf)).await;
-            self.read_buf = buf_back;
-            let n = result?;
-            if n == 0 {
-                return Err(autumn_rpc::RpcError::ConnectionClosed);
-            }
-            self.decoder.feed(&self.read_buf[..n]);
-        }
-    }
-}
-
+/// Connection pool for manager → extent node calls: one multiplexed
+/// `RpcClient` per address, so these connections get the same dead-peer
+/// detection (`autumn_rpc::client::Keepalive`) as every other pool in the tree.
+///
+/// This used to be a hand-rolled sequential connection with its own frame
+/// loop, which no keepalive reached — and it is the pool the manager's
+/// recovery, df and EC-conversion dispatch run on. It also aliased one
+/// `&mut RpcConn` across tasks through a raw pointer: two tasks calling the
+/// same node concurrently each read the other's replies off one socket.
 pub(crate) struct ConnPool {
-    conns: RefCell<HashMap<SocketAddr, Rc<RefCell<RpcConn>>>>,
+    conns: RefCell<HashMap<SocketAddr, Rc<autumn_rpc::client::RpcClient>>>,
 }
 
 impl ConnPool {
@@ -575,27 +522,27 @@ impl ConnPool {
         }
     }
 
+    /// Only transport failures and local timeouts evict; a peer status error
+    /// leaves the connection pooled.
+    fn settle(&self, sock: SocketAddr, result: autumn_rpc::Result<Bytes>) -> Result<Bytes> {
+        result.map_err(|e| {
+            if e.is_connection_error() {
+                self.conns.borrow_mut().remove(&sock);
+            }
+            anyhow::Error::new(e)
+        })
+    }
+
     #[allow(dead_code)]
     async fn call(&self, addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        // Get or create the connection. We must drop the Rc<RefCell> borrow
-        // before the async call to avoid holding RefMut across await.
-        // Since we're single-threaded compio, there's no concurrent access.
-        let conn = self.get_or_connect(sock).await?;
-        // SAFETY: single-threaded compio runtime — no concurrent borrow possible.
-        let conn_ptr = conn.as_ptr();
-        let result = unsafe { &mut *conn_ptr }.call(msg_type, payload).await;
-        if result.as_ref().is_err_and(|e| e.is_connection_error()) {
-            self.conns.borrow_mut().remove(&sock);
-        }
-        result.map_err(anyhow::Error::new)
+        let client = self.get_or_connect(sock).await?;
+        let result = client.call(msg_type, payload).await;
+        self.settle(sock, result)
     }
 
-    /// bound an RPC at `timeout`. Same connection / eviction
-    /// semantics as `call`; on the timeout branch we deliberately evict
-    /// because the underlying connection is now mid-protocol (we sent a
-    /// request but stopped reading) and reusing it could deadlock the
-    /// next caller waiting on an unrelated response.
+    /// bound an RPC at `timeout`. A timeout evicts, like any other local
+    /// transport verdict: the next call gets a fresh connection.
     async fn call_timeout(
         &self,
         addr: &str,
@@ -604,43 +551,27 @@ impl ConnPool {
         timeout: std::time::Duration,
     ) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        let conn = self.get_or_connect(sock).await?;
-        // SAFETY: single-threaded compio runtime — no concurrent borrow possible.
-        let conn_ptr = conn.as_ptr();
-        let result =
-            compio::time::timeout(timeout, unsafe { &mut *conn_ptr }.call(msg_type, payload)).await;
-        match result {
-            Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(e)) => {
-                if e.is_connection_error() {
-                    self.conns.borrow_mut().remove(&sock);
-                }
-                Err(anyhow::Error::new(e))
-            }
-            Err(_elapsed) => {
-                // Mid-protocol: we sent a request but stopped reading.
-                // Reusing this conn could starve the next caller.
-                self.conns.borrow_mut().remove(&sock);
-                Err(anyhow::anyhow!("rpc to {addr} timed out after {timeout:?}"))
-            }
-        }
+        let client = self.get_or_connect(sock).await?;
+        let result = client.call_timeout(msg_type, payload, timeout).await;
+        self.settle(sock, result)
     }
 
-    async fn get_or_connect(&self, addr: SocketAddr) -> Result<Rc<RefCell<RpcConn>>> {
-        if let Some(conn) = self.conns.borrow().get(&addr) {
-            return Ok(conn.clone());
+    async fn get_or_connect(&self, addr: SocketAddr) -> Result<Rc<autumn_rpc::client::RpcClient>> {
+        if let Some(client) = self.conns.borrow().get(&addr) {
+            if !client.is_closed() {
+                return Ok(client.clone());
+            }
         }
         // (1A): bound the TCP connect. `call_timeout` wraps only the
         // request future, NOT this connect — a hung connect to a dead /
         // firewalled peer would wedge the calling background loop forever
         // despite call_timeout. Default 5 s, env AUTUMN_MGR_CONNECT_TIMEOUT_MS.
         let connect_to = connect_timeout();
-        let raw = compio::time::timeout(connect_to, RpcConn::connect(addr))
+        let client = compio::time::timeout(connect_to, autumn_rpc::client::RpcClient::connect(addr))
             .await
             .map_err(|_| anyhow::anyhow!("connect to {addr} timed out after {connect_to:?}"))??;
-        let conn = Rc::new(RefCell::new(raw));
-        self.conns.borrow_mut().insert(addr, conn.clone());
-        Ok(conn)
+        self.conns.borrow_mut().insert(addr, client.clone());
+        Ok(client)
     }
 }
 

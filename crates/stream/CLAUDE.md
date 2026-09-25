@@ -1709,6 +1709,20 @@ zerocopy validation, AUTUMN_TEST_ZEROCOPY=1 enables the RPC prepared-frame
 threshold in the prepared_append integration test. AUTUMN_TEST_UCX_BIND still
 selects UCX, which keeps its existing send path even with this option enabled.
 
+## Keepalive ping (server side) and dead-peer eviction (client side)
+
+`process_frames_backpressured` answers `autumn_rpc::MSG_TYPE_PING` straight into
+`tx_bufs` — ahead of `dispatch` and without an inflight slot — so every
+`RpcClient`'s keepalive (autumn-rpc CLAUDE.md "Dead-peer detection") sees the
+connection loop alive. At its in-flight cap (64) the loop stops reading and a ping
+waits with everything else; 64 requests stalled ≥ 8 s on one connection can get
+that connection closed by its client. For a PS→EN append connection that close
+arrives at `launch_append` as a connection error — the same path a replica
+timeout takes (`mark_bad_node`, failure report, roll to a fresh extent) — rather
+than the appends being waited out. No measurement has shown an EN stalling that
+long; if one does, the choice is a longer `Keepalive` for the stream pool. `ConnPool::get_client` already replaces an
+`is_closed()` client, which now includes one closed for silence.
+
 ## Connection pool refusal handling
 
 ConnPool call/call_timeout/call_vectored/call_into_pooled retain connections

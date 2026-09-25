@@ -2244,6 +2244,36 @@ P-log`; delete all PS pods in parallel to rebuild.)
 
 ## Chaos suites
 
+### Dead peer behind a healthy connection (`fuse_dead_peer_chaos.sh`)
+
+A connection whose peer stopped answering while TCP still reports it ESTABLISHED
+must not wedge fuse reads. The client closes a connection that has shown no sign
+of life for 8–10 s (TCP; ~10–12 s on UCX) — no byte back, and on TCP no new ACKs
+while more of its bytes wait unsent behind them; it pings after 2 s of silence —
+and logs
+`rpc peer stopped answering … addr=<peer>`; that line should name only peers you
+actually faulted.
+
+```bash
+# TCP: both scenarios on one cluster (~6 min). Needs python3; mounts /mnt/autumn-fuse-dpd.
+AUTUMN_DATA_ROOT=/data05/autumn-dpd ./scripts/fuse_dead_peer_chaos.sh
+# Every read pass reads all files concurrently, so the fault is detected through
+# live traffic, not in a quiet gap.
+#   mgr-freeze: the mount reaches the manager through scripts/freeze_proxy.py; its
+#               open flows are frozen (sockets kept open, nothing forwarded) and every
+#               partition is split, so reads need a region refresh over a dead flow.
+#   en-stop:    SIGSTOP one extent node for 90 s.
+# UCX (en-stop only — the relay cannot carry UCX); build with the ucx feature first:
+cargo build --release -p autumn-server -p autumn-fuse --bins --features autumn-server/ucx,autumn-fuse/ucx
+AUTUMN_BIND_HOST='[<RoCE IP>]' AUTUMN_TRANSPORT=ucx ./scripts/fuse_dead_peer_chaos.sh
+```
+
+Pass = every read after the 30 s grace window succeeds sha-exact, and every file
+reads back sha-exact once the fault is lifted. Expected shape: mgr-freeze worst
+read ~10 s, then sub-second; en-stop worst read ~18 s. A mgr-freeze run where every
+read is `ERR` after 30 s is the wedge this guards against. The script kills only
+what it started.
+
 ```bash
 # PS-failover chaos (2 PSes, kill one -> partitions must migrate, zero loss):
 cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
