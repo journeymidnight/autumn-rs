@@ -152,13 +152,22 @@ including none.
   (`publish::etag`), so it changes on a same-size same-second rewrite and an
   `If-Match` names exactly one version; a tag this gateway did not issue names
   no version (412, or 404 when there is no object).
-- **The worker's state lock is held only for the stateful steps.** Begin,
-  finish, publish and namespace lookups take it; a request body streams into
-  its data object through the client alone (`NewFile::start_object` +
-  `write_streamed`, `PartWriter::write`). Before this a 64 MiB batch put would
-  have held the lock and stalled every other request on the worker. A body of
-  declared length at most the inline threshold is written under the lock (no
-  I/O: it is buffered into the inode).
+- **The worker's state lock is held only for metadata steps; bytes never
+  move under it.** Begin, the inode put, publish and namespace lookups take
+  it. A request body streams into its data object through the client alone
+  (`NewFile::start_object` + `write_streamed`, then `flush_streamed` for the
+  tail before the lock is taken; UploadPart needs the lock only for its
+  begin). Deleting data is handed to the reclaimer thread (below): a DELETE,
+  an overwrite, an Abort and a Complete's leftovers write their durable intent
+  (a tombstone, the terminal upload state) under the lock and return. A
+  cancelled request's own unpublished objects are deleted through the client.
+  Measured with `--workers 1` on a local 3-EN cluster: a 1000 MiB DELETE
+  answers in 4 ms and a 200-part Abort in 3 ms, and a small HEAD on the same
+  worker stays under 3 ms meanwhile (idle 1 ms). With the deletes under the
+  lock that HEAD waited out the whole delete, 30 ms and 58 ms, and it grows
+  with the object. A body of declared length at most the inline
+  threshold is written under the lock (no I/O: it is buffered into the
+  inode).
 - **Nothing unfinished outlives its request.** An unpublished file and an
   unfinished part sit in a guard whose `Drop` undoes them, which also covers a
   client disconnect dropping the request future mid-await. Without it the
@@ -195,23 +204,42 @@ including none.
   leaves its directories (there is no multi-key transaction between removing
   a directory and a concurrent create under it), so an emptied directory still
   lists as a common prefix.
-- **Background sweeps** run on their own thread and `FsState`
-  (`--sweep-interval-secs`, default 30, 0 = off): dead publishing sessions are
-  taken over, fenced and finished or undone; terminal multipart uploads,
-  unlinked files and segment garbage are reclaimed. All idempotent, safe in
-  several gateways at once. Every worker also runs the lease heartbeat — the
-  publishing session lapses after 30 s without it, and a sweeper would then
-  recover it and fence out its writes. Verified by `kill -9` of the gateway
-  mid-PUT and mid-UploadPart with 29 data keys already written: after a
-  restart the sweeper reclaimed every one of them and the pending records, and
-  the upload stayed usable.
-- **Known limits.** Aborting an upload and deleting a large object reclaim
-  their data inside the request, under the worker's lock. DeleteObjects deletes
-  its keys one at a time. A Complete retried after it succeeded (a lost reply)
-  gets `NoSuchUpload`, where AWS answers success. A publish whose outcome is
-  unknown is settled only when the worker's session is recovered, i.e. after a
-  gateway restart; until then a retry of that Complete on the same worker is
-  `ConditionalRequestConflict`.
+- **The reclaimer thread** (`reclaim_worker`) has its own `FsState` and its
+  own client identity, and does two things. It takes what the workers hand it
+  over a channel (`FsState::reclaim_later`: files left unreachable, terminal
+  uploads) and reclaims it at once. Every `--sweep-interval-secs` (default 30;
+  0 turns off only the periodic sweeps) it takes over, fences and finishes or
+  undoes dead publishing sessions, and reclaims terminal multipart uploads,
+  unlinked files and segment garbage. A separate identity is the point: a
+  worker's own GET pin would not stop its own EXCLUSIVE, but it does stop the
+  reclaimer's. For the same reason a worker hands a file over only after
+  releasing its own REPLACE on it, and a file deleted while this worker streams
+  it is handed over when the pin is released (~2 s after the GET, measured).
+  A hand-off lost to a crash is found again by the sweeps, because the worker
+  made it durable first. All idempotent, safe in several gateways at once.
+  Every worker also runs the lease heartbeat. Without it the publishing
+  session lapses after 30 s, and a sweeper would then recover it and fence out
+  its writes. Verified by `kill -9` of the gateway mid-PUT and mid-UploadPart
+  with 29 data keys already written: after a restart the sweeper reclaimed
+  every one of them and the pending records, and the upload stayed usable.
+- **A Complete retried after it succeeded** (the SDK lost the reply) gets the
+  same 200 and ETag, as from S3, for an hour after the upload finished. The
+  answer holds even if the object has since been replaced or deleted
+  (`multipart::complete` keeps it in `[0x04]mpc/`, see `crates/fs/CLAUDE.md`).
+  The key is checked inside `complete`, so another key with the same upload id
+  is `NoSuchUpload`.
+- **Any gateway thread stopping ends the process** (`spawn_role`). A worker
+  returns only on error, and the reclaimer returns only when every worker is
+  gone. A dead reclaimer in a live process would go on deleting names while
+  nothing reclaimed their bytes.
+- **Known limits.** DeleteObjects deletes its keys one at a time (each is
+  metadata only). What a hand-off cannot reclaim yet waits for a periodic
+  sweep: a file another worker, gateway or mount still holds; an aborted or
+  completed upload with a part still in flight; a file parked for a pin that
+  the heartbeat found lost. With `--sweep-interval-secs 0` this gateway never
+  reclaims those; only another gateway that runs sweeps does. A publish whose outcome is unknown is settled only when the worker's
+  session is recovered, i.e. after a gateway restart; until then a retry of that
+  Complete on the same worker is `ConditionalRequestConflict`.
 - SDK check: `scripts/s3_write_check.py` (boto3; every API above, the error
   codes the SDK parses, a racing-creators round that must leave exactly one
   winner — ablated by ignoring `If-None-Match`, which made all eight win). See

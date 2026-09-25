@@ -3705,10 +3705,20 @@ aws --endpoint-url $E s3api put-object --bucket tables --key t1/_versions/1.mani
 aws --endpoint-url $E s3 rm s3://tables/t1/data/0.lance
 ```
 
-`--sweep-interval-secs` (default 30, `0` = off) runs the background sweeps on a
-thread of their own: publishing sessions of a gateway that died are taken over
-and their half-done writes finished or undone, and aborted/completed uploads,
-unlinked files and segment garbage are reclaimed. Every gateway may run them.
+Each gateway runs one reclaimer thread with its own client identity. A
+DELETE, an overwrite or an Abort only records what to reclaim and returns; the
+reclaimer deletes the bytes right away, off the serving workers' locks. A file
+deleted while a GET streams it is reclaimed when that GET's pin is released,
+about 2 s after the GET ends. Every `--sweep-interval-secs` (default 30; `0`
+turns off only these periodic sweeps) the same thread also takes over the
+publishing sessions of a gateway that died and finishes or undoes their
+half-done writes, and reclaims whatever the hand-offs could not: aborted or
+completed uploads, unlinked files another client was still holding, and
+segment garbage. Every gateway may run them.
+
+A CompleteMultipartUpload retried after it succeeded (a lost reply) gets the
+same 200 and ETag for an hour, as from S3, even if the object has since been
+replaced or deleted.
 
 Statuses a client should expect beyond the usual: `412 PreconditionFailed` for
 a failed `If-None-Match: *` / `If-Match`; `409 ConditionalRequestConflict` when
@@ -3731,6 +3741,26 @@ autumn-s3 --manager 127.0.0.1:9001 --port 9100 --sweep-interval-secs 10 &
 env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy \
     uv run --with boto3 python scripts/s3_write_check.py --endpoint http://127.0.0.1:9100 --bucket s3check
 #   → "all checks passed"; --race-only runs just the racing round
+```
+
+It includes the retried Complete: after success, again with `If-None-Match: *`,
+and after the object was replaced, each time the original ETag.
+
+**Verify a delete does not hold up the worker.** One worker, so every request
+shares its lock; the periodic sweeps are pushed out of the way, so only the
+hand-off can reclaim:
+
+```bash
+autumnfs --manager 127.0.0.1:9001 mkdir /stall
+autumn-s3 --manager 127.0.0.1:9001 --port 9100 --workers 1 --sweep-interval-secs 3600 &
+NO_PROXY=127.0.0.1 no_proxy=127.0.0.1 \
+    uv run --with boto3 python scripts/s3_stall_check.py --endpoint http://127.0.0.1:9100 --bucket stall
+#   → DELETE of a 1000 MiB object and Abort of a 200-part upload in a few ms, and
+#     "PASS worst HEAD during the deletes" (local 3-EN cluster: < 3 ms, idle 1 ms;
+#     with the deletes under the lock the HEAD waited 30 ms / 58 ms)
+AC=(autumn-client --manager 127.0.0.1:9001 --namespace fs)
+for p in $'\x04rmtomb/' $'\x04mpu/' $'\x04mpa/' $'\x04pend/'; do "${AC[@]}" ls --prefix "$p" --limit 1000 | wc -l; done
+#   → all 0 a second later: the reclaimer deleted everything without a sweep
 ```
 
 **Verify a gateway crash leaves nothing behind.** Start a large PUT (and an

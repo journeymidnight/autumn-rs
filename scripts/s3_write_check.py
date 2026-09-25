@@ -218,6 +218,15 @@ def main():
     ok(g["Body"].read() == b"".join(parts)[5 * MIB - 10:5 * MIB + 10], "a Range across two parts")
     ok(err_code(s3.upload_part, Bucket=b, Key=key, UploadId=up, PartNumber=4, Body=b"x") == (404, "NoSuchUpload"),
        "a part for a completed upload is NoSuchUpload")
+    # A Complete whose reply was lost is retried by the SDK: S3 answers it again.
+    again = s3.complete_multipart_upload(Bucket=b, Key=key, UploadId=up, MultipartUpload={"Parts": listing}, IfNoneMatch="*")
+    ok(again["ETag"] == r["ETag"], "a Complete retried after it succeeded gets the same ETag (If-None-Match: * included)")
+    s3.put_object(Bucket=b, Key=key, Body=b"replaced")
+    again = s3.complete_multipart_upload(Bucket=b, Key=key, UploadId=up, MultipartUpload={"Parts": listing})
+    ok(again["ETag"] == r["ETag"], "...also after the object was replaced, and the retry changes nothing")
+    ok(s3.get_object(Bucket=b, Key=key)["Body"].read() == b"replaced", "the replacement stays")
+    ok(err_code(s3.complete_multipart_upload, Bucket=b, Key=p + "mp/elsewhere", UploadId=up,
+                MultipartUpload={"Parts": listing}) == (404, "NoSuchUpload"), "the answer is only for the upload's own key")
 
     up = s3.create_multipart_upload(Bucket=b, Key=p + "mp/small")["UploadId"]
     e1 = s3.upload_part(Bucket=b, Key=p + "mp/small", UploadId=up, PartNumber=1, Body=b"a" * MIB)["ETag"]

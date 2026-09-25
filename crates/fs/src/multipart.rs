@@ -49,14 +49,18 @@ use autumn_rpc::manager_rpc::LEASE_MODE_WRITE;
 use crate::key;
 use crate::meta;
 use crate::publish::{self, Condition, PublishError};
-use crate::schema::{self, InodeMeta, PartRecord, PendingOp, SegcRecord, Segment, UploadRecord, UploadState, DT_REG};
+use crate::schema::{self, PartRecord, PendingOp, SegcRecord, Segment, UploadRecord, UploadState, DT_REG};
 use crate::segment;
-use crate::state::FsState;
+use crate::state::{FsState, Reclaim};
 
 /// Smallest part S3 accepts anywhere but last.
 pub const MIN_PART: u64 = 5 << 20;
 /// Highest part number S3 allows.
 pub const MAX_PART_NUMBER: u32 = 10_000;
+/// How long a finished Complete's answer outlives its upload record, so a
+/// retry whose first reply was lost still gets it. SDK retries give up
+/// within minutes (`object_store`: 3 min by default).
+pub const COMPLETED_RETENTION_SECS: u64 = 3600;
 
 /// Why a multipart operation did not happen, in the terms S3 reports.
 #[derive(Debug)]
@@ -112,8 +116,8 @@ fn etag_matches(given: &str, rec: &PartRecord) -> bool {
     given.trim().trim_matches('"') == part_etag(rec.data_ino, rec.crc32c)
 }
 
-async fn load(state: &mut FsState, upload: u64) -> Result<Option<(Vec<u8>, UploadRecord)>> {
-    let Some(bytes) = state.kv_get_opt(&key::upload_key(upload)).await? else {
+async fn load(client: &ClusterClient, upload: u64) -> Result<Option<(Vec<u8>, UploadRecord)>> {
+    let Some(bytes) = client.get(&key::upload_key(upload)).await.map_err(|e| anyhow!("KV get: {e}"))? else {
         return Ok(None);
     };
     let rec = schema::decode_upload(&bytes).map_err(|e| anyhow!("upload {upload}: {e}"))?;
@@ -123,7 +127,7 @@ async fn load(state: &mut FsState, upload: u64) -> Result<Option<(Vec<u8>, Uploa
 /// The upload's record, for a gateway checking that a request names the
 /// upload's own key.
 pub async fn get(state: &mut FsState, upload: u64) -> Result<Option<UploadRecord>> {
-    Ok(load(state, upload).await?.map(|(_, r)| r))
+    Ok(load(&state.client, upload).await?.map(|(_, r)| r))
 }
 
 /// Start an upload that Complete will publish as `parent`/`name`. `s3_key`
@@ -162,7 +166,7 @@ impl PartWriter {
             return Err(MultipartError::InvalidPart(part));
         }
         let lease = publish::session_lease(state).await?;
-        match load(state, upload).await? {
+        match load(&state.client, upload).await? {
             Some((_, r)) if r.state == UploadState::Open => {}
             other => return Err(not_open(other.as_ref().map(|(_, r)| &r.state))),
         }
@@ -182,30 +186,35 @@ impl PartWriter {
     }
 
     /// Write the rest and make this the part's current data. Returns the
-    /// part's ETag and size.
-    pub async fn finish(mut self, state: &mut FsState) -> std::result::Result<(String, u64), MultipartError> {
-        let (size, crc32c) = self.stream.finish(&state.client).await?;
+    /// part's ETag and size. Needs only the client, like `write`.
+    pub async fn finish(mut self, client: &ClusterClient) -> std::result::Result<(String, u64), MultipartError> {
+        let (size, crc32c) = self.stream.finish(client).await?;
         let d = self.stream.data_ino;
         let rec = PartRecord { data_ino: d, size, crc32c, lanes: self.stream.lanes, unit: self.stream.unit };
         // A plain put: a retry of the same part number replaces the record,
         // and the object it named stays recorded for the terminal cleanup.
-        state
-            .kv_put_fenced(&key::upload_part_key(self.upload, self.part), &schema::encode_part(&rec), self.lease)
-            .await?;
+        client
+            .put_fenced(&key::upload_part_key(self.upload, self.part), &schema::encode_part(&rec), self.lease)
+            .await
+            .map_err(|e| anyhow!("KV put: {e}"))?;
         // Did the upload stay open until the part landed? A Complete that
         // froze its list before this put does not name `d`.
-        let now = load(state, self.upload).await?;
+        let now = load(client, self.upload).await?;
         if now.as_ref().is_some_and(|(_, r)| owns(&r.state, d, true)) {
-            state.kv_delete_fenced(&key::pending_key(self.lease.inode_hint, d), self.lease).await?;
+            client
+                .delete_fenced(&key::pending_key(self.lease.inode_hint, d), self.lease)
+                .await
+                .map_err(|e| anyhow!("KV delete: {e}"))?;
             return Ok((part_etag(d, crc32c), size));
         }
-        drop_part_object(state, self.upload, self.part, self.lease.inode_hint, d, self.lease).await?;
+        drop_part_object(client, self.upload, self.part, self.lease.inode_hint, d, self.lease).await?;
         Err(not_open(now.as_ref().map(|(_, r)| &r.state)))
     }
 
-    /// Discard this part (a failed or cancelled request).
-    pub async fn abort(self, state: &mut FsState) -> Result<()> {
-        drop_part_object(state, self.upload, self.part, self.lease.inode_hint, self.stream.data_ino, self.lease).await
+    /// Discard this part (a failed or cancelled request). Needs only the
+    /// client: the object is this request's own and nobody reads it.
+    pub async fn abort(self, client: &ClusterClient) -> Result<()> {
+        drop_part_object(client, self.upload, self.part, self.lease.inode_hint, self.stream.data_ino, self.lease).await
     }
 }
 
@@ -223,53 +232,75 @@ fn owns(state: &UploadState, d: u64, named: bool) -> bool {
 /// Delete data object `d` written by session `s` for `part`, with its
 /// allocation record, the part record if it still names `d`, and the
 /// pending record. Idempotent.
-async fn drop_part_object(state: &mut FsState, upload: u64, part: u32, s: u64, d: u64, lease: WriteLease) -> Result<()> {
+async fn drop_part_object(client: &ClusterClient, upload: u64, part: u32, s: u64, d: u64, lease: WriteLease) -> Result<()> {
     let pk = key::upload_part_key(upload, part);
-    if let Some(cur) = state.kv_get_opt(&pk).await? {
+    if let Some(cur) = client.get(&pk).await.map_err(|e| anyhow!("KV get: {e}"))? {
         let r = schema::decode_part(&cur).map_err(|e| anyhow!("part {upload}/{part}: {e}"))?;
         if r.data_ino == d {
-            state.client.compare_write(&pk, Some(&cur), None, lease).await.map_err(|e| anyhow!("{e}"))?;
+            client.compare_write(&pk, Some(&cur), None, lease).await.map_err(|e| anyhow!("{e}"))?;
         }
     }
-    delete_allocated(state, upload, s, d, lease).await?;
-    state.kv_delete_fenced(&key::pending_key(s, d), lease).await
+    delete_allocated(client, upload, s, d, lease).await?;
+    client.delete_fenced(&key::pending_key(s, d), lease).await.map_err(|e| anyhow!("KV delete: {e}"))
 }
 
 /// Delete an upload's data object `d` (written by session `s`) and its
 /// allocation record, which says how long it can be. The record goes last,
 /// so a crash in between leaves it for a retry.
-async fn delete_allocated(state: &mut FsState, upload: u64, s: u64, d: u64, lease: WriteLease) -> Result<()> {
+async fn delete_allocated(client: &ClusterClient, upload: u64, s: u64, d: u64, lease: WriteLease) -> Result<()> {
     let ak = key::upload_alloc_key(upload, s, d);
-    if let Some(bytes) = state.kv_get_opt(&ak).await? {
+    if let Some(bytes) = client.get(&ak).await.map_err(|e| anyhow!("KV get: {e}"))? {
         if let SegcRecord::Object { len, lanes, unit } =
             schema::decode_segc(&bytes).map_err(|e| anyhow!("alloc {upload}/{d}: {e}"))?
         {
-            segment::delete_object(&state.client, d, len, lanes, unit, lease).await?;
+            segment::delete_object(client, d, len, lanes, unit, lease).await?;
         }
-        state.kv_delete_fenced(&ak, lease).await?;
+        client.delete_fenced(&ak, lease).await.map_err(|e| anyhow!("KV delete: {e}"))?;
     }
     Ok(())
 }
 
 // ── complete ─────────────────────────────────────────────────────────────────
 
+/// What a Complete answers: the file it published, at the version it
+/// published. The file is new, so that is its first generation — also for a
+/// retry answered after the file was changed or deleted, as S3 answers it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Completed {
+    pub ino: u64,
+    pub generation: u64,
+}
+
+fn completed(ino: u64) -> Completed {
+    Completed { ino, generation: meta::FIRST_GENERATION }
+}
+
 /// Publish the listed parts, in order, as the upload's file if `cond` holds.
-/// Only metadata is read and written. Returns the file's inode and meta.
+/// Only metadata is read and written. `s3_key` must be the key the upload
+/// was created for.
+///
+/// A retry of a Complete that already succeeded gets the same answer: from
+/// the upload record while it lasts, then for [`COMPLETED_RETENTION_SECS`]
+/// from the record `cleanup` leaves behind.
 pub async fn complete(
     state: &mut FsState,
     upload: u64,
+    s3_key: &[u8],
     list: &[(u32, String)],
     cond: Condition,
-) -> std::result::Result<(u64, InodeMeta), MultipartError> {
+) -> std::result::Result<Completed, MultipartError> {
     let lease = publish::session_lease(state).await?;
     let s = lease.inode_hint;
-    let Some((cur, rec)) = load(state, upload).await? else {
-        return Err(MultipartError::NoSuchUpload);
+    let Some((cur, rec)) = load(&state.client, upload).await? else {
+        return completed_earlier(state, upload, s3_key).await;
     };
+    if rec.key != s3_key {
+        return Err(MultipartError::NoSuchUpload);
+    }
     match &rec.state {
         UploadState::Open => {}
         // A retry whose earlier attempt succeeded but lost its reply.
-        UploadState::Completed { new_ino, .. } => return completed_file(state, &rec, *new_ino).await,
+        UploadState::Completed { new_ino, .. } => return Ok(completed(*new_ino)),
         // This session's own earlier Complete stopped here: its publish had
         // an unknown outcome, or what follows a landed publish failed. The
         // dirent says which; only a landed one can be finished now.
@@ -277,7 +308,7 @@ pub async fn complete(
             let (n, frozen) = (*new_ino, frozen.clone());
             if names_file(state, &rec, n).await? {
                 settle(state, upload, &rec, n, frozen, lease).await;
-                return Ok((n, meta::get_inode_uncached(state, n).await?.0));
+                return Ok(completed(n));
             }
             return Err(MultipartError::Busy("an earlier Complete of this upload has an unknown outcome".into()));
         }
@@ -305,16 +336,16 @@ pub async fn complete(
         .map_err(|e| anyhow!("complete {upload}: {e}"))?;
     if !swapped {
         state.kv_delete_fenced(&key::pending_key(s, new_ino), lease).await?;
-        return Err(match load(state, upload).await? {
+        return Err(match load(&state.client, upload).await? {
             Some((_, r)) => not_open(Some(&r.state)),
             None => MultipartError::NoSuchUpload,
         });
     }
 
     match write_and_publish(state, &rec, new_ino, &parts, cond, lease).await {
-        Ok(m) => {
+        Ok(()) => {
             settle(state, upload, &completing, new_ino, frozen, lease).await;
-            Ok((new_ino, m))
+            Ok(completed(new_ino))
         }
         // The swap may still land: nothing is undone, and the upload stays
         // Completing under this session's pending record.
@@ -371,7 +402,7 @@ async fn write_and_publish(
     parts: &[PartRecord],
     cond: Condition,
     lease: WriteLease,
-) -> std::result::Result<InodeMeta, MultipartError> {
+) -> std::result::Result<(), MultipartError> {
     // The file owns the objects from here: a later overwrite or unlink of it
     // reclaims them through these records.
     let mut rkeys = Vec::with_capacity(parts.len());
@@ -407,8 +438,7 @@ async fn write_and_publish(
         .map_err(|e| match e {
             PublishError::Busy(m) => MultipartError::Busy(m),
             other => MultipartError::Publish(other),
-        })?;
-    Ok(m)
+        })
 }
 
 /// Whether the upload's name currently names `new_ino`.
@@ -435,6 +465,15 @@ async fn settle(
     }
     if let Err(e) = state.kv_delete_fenced(&key::pending_key(lease.inode_hint, new_ino), lease).await {
         tracing::warn!(upload, error = %e, "dropping a Complete's pending record failed; recovery drops it");
+    }
+    cleanup_now_or_later(state, upload, lease).await;
+}
+
+/// Reclaim a terminal upload: through the background reclaimer if the state
+/// has one, else here. Failures are left to the sweep.
+async fn cleanup_now_or_later(state: &mut FsState, upload: u64, lease: WriteLease) {
+    if state.defer_reclaim(Reclaim::Upload(upload)) {
+        return;
     }
     if let Err(e) = cleanup(state, upload, lease).await {
         tracing::warn!(upload, error = %e, "multipart cleanup incomplete; the sweep retries");
@@ -468,15 +507,17 @@ async fn finish_completed(
     Ok(())
 }
 
-async fn completed_file(
-    state: &mut FsState,
-    rec: &UploadRecord,
-    new_ino: u64,
-) -> std::result::Result<(u64, InodeMeta), MultipartError> {
-    if !names_file(state, rec, new_ino).await? {
+/// A Complete of an upload whose record is gone: the answer of the Complete
+/// that finished it, if that was recent enough to be remembered.
+async fn completed_earlier(state: &mut FsState, upload: u64, s3_key: &[u8]) -> std::result::Result<Completed, MultipartError> {
+    let Some(bytes) = state.kv_get_opt(&key::completed_upload_key(upload)).await? else {
+        return Err(MultipartError::NoSuchUpload);
+    };
+    let c = schema::decode_completed(&bytes).map_err(|e| anyhow!("completed upload {upload}: {e}"))?;
+    if c.key != s3_key {
         return Err(MultipartError::NoSuchUpload);
     }
-    Ok((new_ino, meta::get_inode_uncached(state, new_ino).await?.0))
+    Ok(completed(c.new_ino))
 }
 
 /// Undo an unpublished Complete: the file's records, map pages and inode go
@@ -505,7 +546,7 @@ async fn undo_complete(state: &mut FsState, upload: u64, new_ino: u64, lease: Wr
         }
     }
     state.kv_delete_fenced(&key::inode_key(new_ino), lease).await?;
-    if let Some((cur, rec)) = load(state, upload).await? {
+    if let Some((cur, rec)) = load(&state.client, upload).await? {
         if matches!(rec.state, UploadState::Completing { new_ino: n, .. } if n == new_ino) {
             let open = UploadRecord { state: UploadState::Open, ..rec };
             state
@@ -521,13 +562,13 @@ async fn undo_complete(state: &mut FsState, upload: u64, new_ino: u64, lease: Wr
 // ── abort ────────────────────────────────────────────────────────────────────
 
 /// Abort an upload. Once this returns no Complete can publish it; its data
-/// is reclaimed now or, for parts still being written, by their writers and
-/// the sweep. A Completed upload is `NoSuchUpload`; one being completed by a
-/// live session is `Busy`.
+/// is reclaimed now (or by the state's background reclaimer) or, for parts
+/// still being written, by their writers and the sweep. A Completed upload
+/// is `NoSuchUpload`; one being completed by a live session is `Busy`.
 pub async fn abort(state: &mut FsState, upload: u64) -> std::result::Result<(), MultipartError> {
     let lease = publish::session_lease(state).await?;
     loop {
-        let Some((cur, rec)) = load(state, upload).await? else {
+        let Some((cur, rec)) = load(&state.client, upload).await? else {
             return Err(MultipartError::NoSuchUpload);
         };
         match &rec.state {
@@ -553,9 +594,7 @@ pub async fn abort(state: &mut FsState, upload: u64) -> std::result::Result<(), 
                 continue;
             }
         }
-        if let Err(e) = cleanup(state, upload, lease).await {
-            tracing::warn!(upload, error = %e, "multipart cleanup incomplete; the sweep retries");
-        }
+        cleanup_now_or_later(state, upload, lease).await;
         return Ok(());
     }
 }
@@ -581,10 +620,11 @@ async fn take_over_dead(state: &mut FsState, s: u64) -> Result<bool> {
 /// Reclaim a terminal upload: every data object it recorded that is not
 /// frozen into its file, then its part records and the upload record. An
 /// object a session is still writing (its pending record exists) is left to
-/// that session, and so is the upload record, for a later sweep. Returns
-/// whether the upload is gone.
+/// that session, and so is the upload record, for a later sweep. A completed
+/// upload leaves what its Complete answered behind (`remember_completed`).
+/// Returns whether the upload is gone.
 pub async fn cleanup(state: &mut FsState, upload: u64, lease: WriteLease) -> Result<bool> {
-    let Some((cur, rec)) = load(state, upload).await? else {
+    let Some((cur, rec)) = load(&state.client, upload).await? else {
         return Ok(true);
     };
     let frozen: HashSet<u64> = match &rec.state {
@@ -605,7 +645,7 @@ pub async fn cleanup(state: &mut FsState, upload: u64, lease: WriteLease) -> Res
             } else if state.kv_get_opt(&key::pending_key(s, d)).await?.is_some() {
                 left += 1;
             } else {
-                delete_allocated(state, upload, s, d, lease).await?;
+                delete_allocated(&state.client, upload, s, d, lease).await?;
             }
         }
         match (has_more, keys.last()) {
@@ -627,6 +667,9 @@ pub async fn cleanup(state: &mut FsState, upload: u64, lease: WriteLease) -> Res
             break;
         }
     }
+    if let UploadState::Completed { new_ino, .. } = &rec.state {
+        remember_completed(state, upload, &rec.key, *new_ino, lease).await?;
+    }
     state
         .client
         .compare_write(&key::upload_key(upload), Some(&cur), None, lease)
@@ -634,9 +677,64 @@ pub async fn cleanup(state: &mut FsState, upload: u64, lease: WriteLease) -> Res
         .map_err(|e| anyhow!("upload {upload}: {e}"))
 }
 
-/// Finish the cleanup of every terminal upload. Returns the uploads removed.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// Keep a completed upload's answer for [`COMPLETED_RETENTION_SECS`] after
+/// its record goes. The expiry entry is written first, so no answer is ever
+/// left without one.
+async fn remember_completed(state: &mut FsState, upload: u64, s3_key: &[u8], new_ino: u64, lease: WriteLease) -> Result<()> {
+    let deadline = now_secs() + COMPLETED_RETENTION_SECS;
+    state.kv_put_fenced(&key::completed_expiry_key(deadline, upload), b"", lease).await?;
+    let c = schema::CompletedUpload { key: s3_key.to_vec(), new_ino };
+    state
+        .kv_put_fenced(&key::completed_upload_key(upload), &schema::encode_completed(&c), lease)
+        .await
+}
+
+/// Forget completed uploads' answers whose retention has passed. Reads only
+/// the expiry entries that are due. Returns how many were forgotten.
+pub async fn expire_completed(state: &mut FsState, now_secs: u64) -> Result<usize> {
+    let lease = publish::session_lease(state).await?;
+    let prefix = key::completed_expiry_prefix();
+    let mut n = 0;
+    loop {
+        let (keys, has_more) = state.kv_range_page(&prefix, &prefix, 256).await?;
+        let due: Vec<(&Vec<u8>, u64)> = keys
+            .iter()
+            .filter_map(|k| key::parse_completed_expiry_key(k).map(|(t, id)| (k, t, id)))
+            .take_while(|(_, t, _)| *t <= now_secs)
+            .map(|(k, _, id)| (k, id))
+            .collect();
+        if due.is_empty() {
+            return Ok(n);
+        }
+        // The answer goes before its expiry entry, so a crash in between
+        // leaves the entry to retry.
+        let answers: Vec<Vec<u8>> = due.iter().map(|(_, id)| key::completed_upload_key(*id)).collect();
+        let refs: Vec<&[u8]> = answers.iter().map(Vec::as_slice).collect();
+        for r in state.client.delete_many_fenced(&refs, lease).await {
+            r.map_err(|e| anyhow!("completed uploads: {e}"))?;
+        }
+        let entries: Vec<&[u8]> = due.iter().map(|(k, _)| k.as_slice()).collect();
+        for r in state.client.delete_many_fenced(&entries, lease).await {
+            r.map_err(|e| anyhow!("completed upload expiries: {e}"))?;
+        }
+        n += due.len();
+        if due.len() < keys.len() || !has_more {
+            return Ok(n);
+        }
+    }
+}
+
+/// Finish the cleanup of every terminal upload, and forget completed
+/// uploads' answers whose retention has passed. Returns the uploads removed.
 /// Open and completing uploads are passed over, never touched.
 pub async fn sweep_uploads(state: &mut FsState) -> Result<usize> {
+    if let Err(e) = expire_completed(state, now_secs()).await {
+        tracing::warn!(error = %e, "expiring completed uploads failed; retried next sweep");
+    }
     let lease = publish::session_lease(state).await?;
     let prefix = key::upload_prefix();
     let mut from = prefix.clone();
@@ -670,7 +768,7 @@ pub(crate) async fn recover_part(
     d: u64,
     lease: WriteLease,
 ) -> Result<()> {
-    let keep = match load(state, upload).await? {
+    let keep = match load(&state.client, upload).await? {
         Some((_, r)) => {
             let named = match state.kv_get_opt(&key::upload_part_key(upload, part)).await? {
                 Some(b) => schema::decode_part(&b).map_err(|e| anyhow!("part {upload}/{part}: {e}"))?.data_ino == d,
@@ -681,7 +779,7 @@ pub(crate) async fn recover_part(
         None => false,
     };
     if !keep {
-        drop_part_object(state, upload, part, s, d, lease).await?;
+        drop_part_object(&state.client, upload, part, s, d, lease).await?;
     }
     Ok(())
 }
@@ -689,7 +787,7 @@ pub(crate) async fn recover_part(
 /// A dead session was completing `upload` into `new_ino`: finish it if the
 /// name was published, else undo it and reopen the upload.
 pub(crate) async fn recover_complete(state: &mut FsState, s: u64, upload: u64, new_ino: u64, lease: WriteLease) -> Result<()> {
-    let Some((_, rec)) = load(state, upload).await? else { return Ok(()) };
+    let Some((_, rec)) = load(&state.client, upload).await? else { return Ok(()) };
     let UploadState::Completing { new_ino: n, session, frozen } = &rec.state else {
         return Ok(());
     };

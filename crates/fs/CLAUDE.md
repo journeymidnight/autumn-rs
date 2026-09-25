@@ -32,7 +32,7 @@
 | `publish.rs` | 新 inode 整文件发布（条件 CAS）、删除、会话与死会话恢复、`fence_all` |
 | `multipart.rs` | S3 multipart：上传状态机、分片写入、元数据级 Complete、Abort、清理与死会话恢复 |
 | `lease_tasks.rs` | per-session lease 后台任务（heartbeat + invalidation poll + revoked 驱逐）|
-| `state.rs` | `FsState`（ClusterClient、inode 批次游标、lease 簿记、`direct_read`）|
+| `state.rs` | `FsState`（ClusterClient、inode 批次游标、lease 簿记、`direct_read`、`reclaim_later` 回收交接）|
 
 不变量：本 crate **不依赖 fuser**，也不认识任何内核回复类型；core→fuser 的转换只在
 `autumn-fuse` 的 `attr.rs`。PyO3 绑定用一个专属 compio worker 线程独占 `!Send` 的
@@ -496,9 +496,29 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   得到 409，而换一个 worker 就能成功——别的客户端的读者和 STABLE 本来就不挡 REPLACE。
 - **流式写入只需要 client**：`ObjectStream::write/finish` 取 `&ClusterClient`，不取
   `&mut FsState`。`NewFile::start_object` 让新文件一开始就有数据对象，之后
-  `write_streamed(client, ..)` 不碰 `FsState`；`PartWriter::write` 同理。共享一个 `FsState`
-  的调用方（S3 网关每个 worker）因此可以只在 begin / finish / publish 时持锁，请求体的数据
-  写入不挡同一 worker 上的其它请求。
+  `write_streamed(client, ..)` 不碰 `FsState`，`flush_streamed(client)` 把对象里缓冲的尾巴
+  （最多一批 8 个 unit = 64 MiB）也写出去，`finish` 就只剩 inode 一次 put；
+  `PartWriter::write/finish/abort` 与 `NewFile::abort`（撤销未发布文件，`segment::reclaim_except`）
+  同样只要 client。共享一个 `FsState` 的调用方（S3 网关每个 worker）因此只在 begin、inode
+  put、publish 时持锁，字节从不在锁内移动。
+- **回收可以交给后台**（`FsState.reclaim_later: Option<Box<dyn Fn(Reclaim)>>`，只有网关 worker
+  设置）：`Reclaim::Inode(ino)` / `Reclaim::Upload(id)`。设置后 `retire`（覆盖、删除、Complete
+  覆盖旧对象）只写墓碑（`extent::tombstone_unreachable`），**释放 REPLACE 之后**才经
+  `extent::reclaim_now_or_later` 交出；`multipart::abort` 与 Complete 的 `settle` 交出上传
+  清理（`cleanup_now_or_later`）。交出之前持久状态已经写好（墓碑、终态上传记录），交接丢失
+  只是等下一次扫描。接收方必须是**另一个 client 身份**：manager 不拿本 client 的 STABLE 挡
+  本 client 自己的 EXCLUSIVE，同一身份在锁外回收，会删掉本 worker 在名字消失后才 pin 住的
+  GET 正在读的数据；换身份后 pin 按普通租约冲突挡住它。也正因如此，交出必须在本 client 放掉
+  它对该 inode 的租约之后——否则自己的 REPLACE 让接收方的 EXCLUSIVE 冲突，回收落到扫描。
+  未设置（FUSE、Python、系统测试）时一律当场回收，`remove_unreachable_inode` 行为不变；
+  死会话恢复的 Retire 分支也当场回收。`retire` 的当场回收失败只记 WARN、照常删掉 Retire
+  记录（以前错误会留下记录给会话恢复）：墓碑已经写好，扫描会找到它，恢复再走一遍反而会
+  踩到"已减 nlink 再减一次"那条已知限制。
+  交接只覆盖"现在就能回收"的情况，下面几种仍要靠周期扫描（`--sweep-interval-secs 0` 时本
+  网关永远不回收，只能等别的开着扫描的网关）：别的 worker / 网关 / 挂载还持有的文件（交出后
+  EXCLUSIVE 冲突，墓碑留着）；终态上传里仍有活会话 pending 的对象（`cleanup` 留下上传记录）；
+  心跳发现 pin 已丢（`NotHeld`）时直接从 `held_leases` 删掉、不经释放路径，`unlinked_open`
+  里的该 inode 不会被交出。
 - 已知限制：FUSE 的 unlink/rename 是无条件 KV 操作，与网关同名并发时后者赢；恢复按"dirent
   是否指向它"判定，发布者在 CAS 与删记录之间崩溃、且恢复前有人把该名 rename 走，会被误判为
   未发布而撤销；`Retire` 在"已减 nlink、未删记录"时崩溃，恢复会再减一次，nlink=2 时即删掉
@@ -543,16 +563,26 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
 - **本会话的重试能收尾**：上传停在本会话的 Completing 时，重试 Complete 先看名字——已指向
   那个文件就推进到 Completed 并返回它（消融：一律 Busy，`system_multipart` 变红）；否则
   分不清是在途未落地还是撤销失败，返回 Busy，等会话恢复。
+- **成功之后的重试得到同一个答案**（S3 也是这样；SDK 丢了回复会重试）：`complete(state,
+  upload, s3_key, ..)` 返回 `Completed{ino, generation}`。上传是 Completed 就直接答，不再看名字
+  是否仍指向该文件（之后被覆盖、删除也一样答原 ETag）。`cleanup` 删上传记录之前先写
+  `[0x04]mpx/[deadline BE][id]`（到期索引）再写 `[0x04]mpc/[id]` = `CompletedUpload{key,
+  new_ino}`，记录没了时 `completed_earlier` 按它回答，并核对 S3 key。保留
+  `COMPLETED_RETENTION_SECS` = 1 h（SDK 重试几分钟内放弃，`object_store` 默认 3 min）；
+  `sweep_uploads` 里的 `expire_completed` 从 `mpx/` 头开始扫、遇到第一条未到期即停，**只读到期
+  的条目**，所以保留的记录再多也不增加每轮扫描成本（放在 `mpu/` 里会让每 30 s 的扫描逐条读
+  它们）。generation 取 `meta::FIRST_GENERATION`：Complete 发布的永远是全新 inode。两个清理者
+  同时收尾，或清理在写完答案、删上传记录之前崩溃后重来，都会多写一条到期索引：较早的那条
+  到期时删掉答案，所以这时保留期从第一次写答案算起，可能短于记录真正消失后的 1 h（网关停了
+  50 min 再起，重试窗口只剩约 10 min）。不会答错，也碰不到活数据。
+  消融：跳过 `remember_completed`，`system_multipart` 在重试处变红。
 - **清理的代价**：`frozen` 转成 `HashSet` 再逐条比对 `mpa/` 记录（最多 10000 分片 ×
   若干重试，线性）；`sweep_uploads` 翻完所有上传页，不只第一页（前 256 个 Open 上传挡不住
   后面的终态上传）。
 - **已知限制**：
-  - 网关的清扫线程调 `sweep_uploads` 与 `recover_dead_sessions`；HTTP 路由见
-    `crates/server/CLAUDE.md` 的 `autumn-s3` 一节。Abort 在请求内同步回收全部分片正文，
-    大上传的 Abort 会在网关 worker 的锁内做完这些删除。
-  - 上传记录一 Completed 就被清理删掉，所以成功之后才到的 Complete 重试（丢了回复）得到
-    NoSuchUpload 而不是原来的结果。AWS 对这种重试会返回成功，对象存储客户端的重试因此会
-    失败；需要时给 Completed 记录留一段保留期。
+  - 网关的回收线程调 `sweep_uploads`、`recover_dead_sessions`，并接收 worker 交出的
+    `Reclaim`；HTTP 路由见 `crates/server/CLAUDE.md` 的 `autumn-s3` 一节。
+  - 保留期过后才到的重试仍是 NoSuchUpload。
   - `create` 不记 pending：会话在建完记录后死掉，留下的 Open 上传没有分片也不会被自动
     清理（S3 用 lifecycle 的 AbortIncompleteMultipartUpload 处理这种情况，这里还没有）。
   - Complete 进行中收到的 UploadPart 回 Busy；若该 Complete 随后失败并重开上传，这个分片

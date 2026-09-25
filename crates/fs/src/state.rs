@@ -13,6 +13,18 @@ use autumn_client::ClusterClient;
 
 use crate::schema::{InodeState, ROOT_INO};
 
+/// Reclamation a caller hands to a background reclaimer instead of doing it
+/// inline (`FsState::reclaim_later`). Each one names durable state that
+/// already says what to reclaim — a tombstone, a terminal upload record — so
+/// a hand-off that is lost only delays the work until the next sweep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Reclaim {
+    /// A tombstoned unreachable inode (`extent::reclaim_unreachable`).
+    Inode(u64),
+    /// An aborted or completed multipart upload (`multipart::cleanup`).
+    Upload(u64),
+}
+
 /// Per-inode lease bookkeeping on the fuse mount side.
 /// The `apply_invalidation` / `cache_is_stale` helpers operate on this
 /// shape (a writer-XOR-readers lease keyed per inode).
@@ -182,6 +194,13 @@ pub struct FsState {
     /// Where the next `segment::sweep_garbage` page starts, so markers held
     /// elsewhere cannot keep the sweep from ever reaching the rest.
     pub garbage_sweep_from: Option<Vec<u8>>,
+
+    /// Where data reclamation goes instead of running inline, for a caller
+    /// that shares this state between requests behind one lock (the S3
+    /// gateway): an abort or a delete then records its intent and returns,
+    /// and the reclaimer — its own state, its own client identity — deletes
+    /// the bytes without holding anyone's lock. `None` reclaims inline.
+    pub reclaim_later: Option<Box<dyn Fn(Reclaim)>>,
 }
 
 impl FsState {
@@ -270,6 +289,19 @@ impl FsState {
             session: None,
             segment_garbage: HashSet::new(),
             garbage_sweep_from: None,
+            reclaim_later: None,
+        }
+    }
+
+    /// Hand `r` to the background reclaimer, if this state has one. `false`
+    /// means the caller reclaims inline.
+    pub fn defer_reclaim(&self, r: Reclaim) -> bool {
+        match &self.reclaim_later {
+            Some(f) => {
+                f(r);
+                true
+            }
+            None => false,
         }
     }
 

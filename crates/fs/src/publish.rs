@@ -203,6 +203,16 @@ impl NewFile {
         }
     }
 
+    /// Write whatever the data object still buffers, through the client
+    /// alone, so [`NewFile::finish`] then writes only the inode. For a caller
+    /// that holds the `FsState` behind a shared lock only for `finish`.
+    pub async fn flush_streamed(&mut self, client: &ClusterClient) -> Result<()> {
+        if let Some(o) = &mut self.object {
+            o.finish(client).await?;
+        }
+        Ok(())
+    }
+
     /// Write the rest and the inode. Returns the inode's metadata, which is
     /// what the file will be once published. Still invisible.
     pub async fn finish(&mut self, state: &mut FsState) -> Result<InodeMeta> {
@@ -239,23 +249,27 @@ impl NewFile {
             // and the session's recovery decides by what the dirent names.
             Err(e @ PublishError::Other(_)) => Err(e),
             Err(e) => {
-                undo_new_file(state, self.ino, self.lease).await?;
+                undo_new_file(&state.client, self.ino, self.lease).await?;
                 Err(e)
             }
         }
     }
 
-    /// Discard an unpublished file (a failed or cancelled upload).
-    pub async fn abort(self, state: &mut FsState) -> Result<()> {
-        undo_new_file(state, self.ino, self.lease).await
+    /// Discard an unpublished file (a failed or cancelled upload). Needs only
+    /// the client: nobody else can see the file.
+    pub async fn abort(self, client: &ClusterClient) -> Result<()> {
+        undo_new_file(client, self.ino, self.lease).await
     }
 }
 
 /// Delete an unpublished inode, its data and its pending record.
-async fn undo_new_file(state: &mut FsState, ino: u64, lease: WriteLease) -> Result<()> {
-    segment::reclaim(state, ino, None, lease).await?;
-    state.kv_delete_fenced(&key::inode_key(ino), lease).await?;
-    state.kv_delete_fenced(&key::pending_key(lease.inode_hint, ino), lease).await?;
+async fn undo_new_file(client: &ClusterClient, ino: u64, lease: WriteLease) -> Result<()> {
+    segment::reclaim_except(client, ino, &Default::default(), 0, lease).await?;
+    client.delete_fenced(&key::inode_key(ino), lease).await.map_err(|e| anyhow!("KV delete: {e}"))?;
+    client
+        .delete_fenced(&key::pending_key(lease.inode_hint, ino), lease)
+        .await
+        .map_err(|e| anyhow!("KV delete: {e}"))?;
     Ok(())
 }
 
@@ -410,7 +424,12 @@ async fn retire(state: &mut FsState, parent: u64, name: &[u8], o: u64, lease: Wr
     let r = drop_name_of(state, o).await;
     release_lease(state, o).await;
     match r {
-        Ok(()) => {
+        Ok(reclaim) => {
+            // After the release: this client's REPLACE would stop a
+            // background reclaimer, which is another client.
+            if reclaim {
+                crate::extent::reclaim_now_or_later(state, o).await;
+            }
             if let Err(e) = state.kv_delete_fenced(&key::pending_key(lease.inode_hint, o), lease).await {
                 tracing::warn!(ino = o, error = %e, "dropping a retire record failed");
             }
@@ -470,19 +489,22 @@ pub async fn delete_name(
     }
 }
 
-/// A name of inode `ino` is gone: count it down, and once none remain retire
-/// the inode (tombstoned; data reclaimed once no other client holds it).
-async fn drop_name_of(state: &mut FsState, ino: u64) -> Result<()> {
+/// A name of inode `ino` is gone: count it down, and once none remain
+/// tombstone the inode. Returns whether its data is the caller's to reclaim
+/// now (`extent::reclaim_now_or_later`); the tombstone keeps it found if
+/// that never happens.
+async fn drop_name_of(state: &mut FsState, ino: u64) -> Result<bool> {
     let Some(bytes) = state.kv_get_opt(&key::inode_key(ino)).await? else {
-        return Ok(());
+        return Ok(false);
     };
     let mut m = schema::decode_inode_meta(&bytes).map_err(|e| anyhow!("inode {ino}: {e}"))?;
     if m.nlink <= 1 {
         state.inodes.remove(&ino);
-        crate::extent::remove_unreachable_inode(state, ino).await
+        crate::extent::tombstone_unreachable(state, ino).await
     } else {
         m.nlink -= 1;
-        meta::put_inode(state, ino, &m).await
+        meta::put_inode(state, ino, &m).await?;
+        Ok(false)
     }
 }
 
@@ -669,8 +691,8 @@ pub(crate) async fn recover_session(state: &mut FsState, s: u64, lease: WriteLea
                     // exactly `successor`; any other holder retired `ino`
                     // itself, and dropping a name from it again could delete
                     // an inode another link still names.
-                    if holder == successor {
-                        drop_name_of(state, ino).await?;
+                    if holder == successor && drop_name_of(state, ino).await? {
+                        crate::extent::reclaim_unreachable(state, ino).await?;
                     }
                 }
                 PendingOp::Part { upload, part, data_ino } => {

@@ -7,10 +7,15 @@
 //! server, never by a read followed by a write; multipart is
 //! `autumn_fs::multipart`, whose Complete touches no part body.
 //!
-//! **The state lock is held only for the stateful steps** (begin, finish,
-//! publish, namespace lookups). A request body streams into its data object
-//! through the client alone, so a large PUT or UploadPart does not stall the
-//! other requests this worker is serving.
+//! **The state lock is held only for metadata steps** (begin, the inode put,
+//! publish, namespace lookups; a body of at most the inline threshold is
+//! buffered into the inode under it). No data I/O happens under it: a request
+//! body — its tail included — streams into its data object through the
+//! client alone; a delete, an overwrite, an Abort and a Complete's leftovers record
+//! what to reclaim and hand it to the background reclaimer
+//! (`FsState::reclaim_later`); a cancelled request's own objects are deleted
+//! through the client. So a large PUT, UploadPart, delete or Abort does not
+//! stall the other requests this worker is serving.
 //!
 //! **Nothing unfinished is left behind by a request that goes away.** An
 //! unpublished file or an unfinished part is held by a guard that undoes it
@@ -20,6 +25,7 @@
 //! ever look at it.
 
 use std::collections::{HashMap, VecDeque};
+use std::rc::Rc;
 
 use axum::body::{Body, BodyDataStream, Bytes};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -256,9 +262,10 @@ async fn xml_body(h: &HeaderMap, body: Body, res: &str) -> Result<String, S3Erro
 
 // ── guards for unfinished writes ───────────────────────────────────────────
 
-/// A new file that is not published yet; dropped unpublished, it is undone.
+/// A new file that is not published yet; dropped unpublished, it is undone
+/// through the client, without the state lock.
 struct Unpublished {
-    fs: Fs,
+    client: Rc<ClusterClient>,
     file: Option<NewFile>,
 }
 
@@ -271,10 +278,9 @@ impl Unpublished {
 impl Drop for Unpublished {
     fn drop(&mut self) {
         if let Some(f) = self.file.take() {
-            let fs = self.fs.clone();
+            let client = self.client.clone();
             compio::runtime::spawn(async move {
-                let mut st = fs.lock().await;
-                if let Err(e) = f.abort(&mut st).await {
+                if let Err(e) = f.abort(&client).await {
                     tracing::warn!(error = %e, "undoing an unpublished PUT failed; the session's recovery finishes it");
                 }
             })
@@ -283,19 +289,19 @@ impl Drop for Unpublished {
     }
 }
 
-/// A part being uploaded; dropped unfinished, it is discarded.
+/// A part being uploaded; dropped unfinished, it is discarded through the
+/// client, without the state lock.
 struct UnfinishedPart {
-    fs: Fs,
+    client: Rc<ClusterClient>,
     part: Option<PartWriter>,
 }
 
 impl Drop for UnfinishedPart {
     fn drop(&mut self) {
         if let Some(p) = self.part.take() {
-            let fs = self.fs.clone();
+            let client = self.client.clone();
             compio::runtime::spawn(async move {
-                let mut st = fs.lock().await;
-                if let Err(e) = p.abort(&mut st).await {
+                if let Err(e) = p.abort(&client).await {
                     tracing::warn!(error = %e, "discarding an unfinished part failed; the upload's cleanup finishes it");
                 }
             })
@@ -320,17 +326,20 @@ async fn parent_for_write(st: &mut FsState, bucket: &str, dirs: &[&str], res: &s
 
 /// Begin a new file under `parent`; `large` gives it its data object now, so
 /// the body can stream in through the client alone.
-async fn begin_file(fs: &Fs, st: &mut FsState, parent: u64, name: &str, large: bool, res: &str) -> Result<Unpublished, S3Error> {
+async fn begin_file(st: &mut FsState, parent: u64, name: &str, large: bool, res: &str) -> Result<Unpublished, S3Error> {
     let f = NewFile::begin(st, parent, name.as_bytes()).await.map_err(|e| internal(e, res))?;
-    let mut w = Unpublished { fs: fs.clone(), file: Some(f) };
+    let mut w = Unpublished { client: st.client.clone(), file: Some(f) };
     if large {
         w.file().start_object(st).await.map_err(|e| internal(e, res))?;
     }
     Ok(w)
 }
 
-/// Finish and publish; returns the new object's ETag and mtime.
+/// Finish and publish; returns the new object's ETag and mtime. The data
+/// object's buffered tail (up to a batch of units) goes out before the lock.
 async fn finish_and_publish(fs: &Fs, mut w: Unpublished, cond: Condition, res: &str) -> Result<(String, i64), S3Error> {
+    let client = w.client.clone();
+    w.file().flush_streamed(&client).await.map_err(|e| internal(e, res))?;
     let mut st = fs.lock().await;
     let m = w.file().finish(&mut st).await.map_err(|e| internal(e, res))?;
     // From here `publish` owns the outcome: it undoes a publish that
@@ -375,7 +384,7 @@ async fn put(fs: &Fs, bucket: &str, key: &str, h: &HeaderMap, body: Body, res: &
     let (mut w, client) = {
         let mut st = fs.lock().await;
         let parent = parent_for_write(&mut st, bucket, &dirs, res).await?;
-        (begin_file(fs, &mut st, parent, name, !small, res).await?, st.client.clone())
+        (begin_file(&mut st, parent, name, !small, res).await?, st.client.clone())
     };
     while let Some(chunk) = body.next().await? {
         if small {
@@ -426,7 +435,7 @@ async fn copy_object(fs: &Fs, bucket: &str, key: &str, src: &str, h: &HeaderMap,
     let (mut w, client) = {
         let mut st = fs.lock().await;
         let parent = parent_for_write(&mut st, bucket, &dirs, res).await?;
-        (begin_file(fs, &mut st, parent, name, large, res).await?, st.client.clone())
+        (begin_file(&mut st, parent, name, large, res).await?, st.client.clone())
     };
     let mut off = 0u64;
     while off < size {
@@ -561,20 +570,20 @@ pub async fn upload_part(fs: &Fs, bucket: String, key: String, q: HashMap<String
                 .ok_or_else(|| S3Error::invalid_argument("partNumber must be a number", &res))?;
             let id = upload_id(&q, &res)?;
             let mut body = BodyReader::new(&h, body, &res)?;
-            let (mut w, client): (UnfinishedPart, std::rc::Rc<ClusterClient>) = {
+            let mut w = {
                 let mut st = fs.lock().await;
                 check_upload(&mut st, id, &res).await?;
                 let p = PartWriter::begin(&mut st, id, part).await.map_err(|e| multipart_error(e, &res))?;
-                (UnfinishedPart { fs: fs.clone(), part: Some(p) }, st.client.clone())
+                UnfinishedPart { client: st.client.clone(), part: Some(p) }
             };
             while let Some(chunk) = body.next().await? {
                 let p = w.part.as_mut().expect("taken only to finish");
-                p.write(&client, &chunk).await.map_err(|e| internal(e, &res))?;
+                p.write(&w.client, &chunk).await.map_err(|e| internal(e, &res))?;
             }
             body.verify()?;
+            // Only the begin needed the state; the rest is the client's.
             let p = w.part.take().expect("not yet taken");
-            let mut st = fs.lock().await;
-            let (etag, _) = p.finish(&mut st).await.map_err(|e| multipart_error(e, &res))?;
+            let (etag, _) = p.finish(&w.client).await.map_err(|e| multipart_error(e, &res))?;
             let mut resp = StatusCode::OK.into_response();
             resp.headers_mut().insert(header::ETAG, quoted_etag(&etag));
             Ok(resp)
@@ -584,7 +593,8 @@ pub async fn upload_part(fs: &Fs, bucket: String, key: String, q: HashMap<String
 }
 
 /// `POST /{bucket}/{key}?uploadId=X`: CompleteMultipartUpload. Reads and
-/// writes metadata only.
+/// writes metadata only. A retry of one that succeeded (its reply lost) gets
+/// the same answer, as from S3; `multipart::complete` checks the key.
 pub async fn complete_multipart(fs: &Fs, bucket: String, key: String, q: HashMap<String, String>, h: HeaderMap, body: Body) -> Response {
     let res = resource(&bucket, &key);
     respond(
@@ -594,15 +604,17 @@ pub async fn complete_multipart(fs: &Fs, bucket: String, key: String, q: HashMap
             let x = xml_body(&h, body, &res).await?;
             let list = s3::parse_complete_xml(&x).map_err(|m| S3Error::malformed_xml(m, &res))?;
             let mut st = fs.lock().await;
-            check_upload(&mut st, id, &res).await?;
-            let (ino, m) = multipart::complete(&mut st, id, &list, cond).await.map_err(|e| multipart_error(e, &res))?;
-            Ok(xml(s3::complete_multipart_xml(&bucket, &key, &objects::etag(ino, m.generation))))
+            let done = multipart::complete(&mut st, id, res.as_bytes(), &list, cond)
+                .await
+                .map_err(|e| multipart_error(e, &res))?;
+            Ok(xml(s3::complete_multipart_xml(&bucket, &key, &objects::etag(done.ino, done.generation))))
         }
         .await,
     )
 }
 
-/// `DELETE /{bucket}/{key}?uploadId=X`: AbortMultipartUpload.
+/// `DELETE /{bucket}/{key}?uploadId=X`: AbortMultipartUpload. Moves the
+/// upload to Aborted and hands its data to the background reclaimer.
 pub async fn abort_multipart(fs: &Fs, bucket: String, key: String, q: HashMap<String, String>) -> Response {
     let res = resource(&bucket, &key);
     respond(

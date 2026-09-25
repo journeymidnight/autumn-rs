@@ -38,7 +38,9 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use autumn_fs::state::FsState;
+use autumn_fs::state::{FsState, Reclaim};
+use futures::channel::mpsc;
+use futures::StreamExt;
 use send_wrapper::SendWrapper;
 
 use objects::{Fs, OpenError};
@@ -106,7 +108,7 @@ fn parse_args() -> Result<Args> {
                     "autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000]\n\
                      \x20            [--host <daemon-identity>] [--credential-file <path>]\n\
                      \x20            [--direct-read true|false] [--workers N]\n\
-                     \x20            [--sweep-interval-secs 30]  (0 = no background sweeps)"
+                     \x20            [--sweep-interval-secs 30]  (0 = no periodic sweeps)"
                 );
                 std::process::exit(0);
             }
@@ -376,19 +378,25 @@ async fn connect_state(args: &Args, host: String, credential: Option<(String, Ve
 }
 
 /// Serve on one thread: its own compio runtime, its own `FsState` (so workers
-/// share no lock), its own listener.
+/// share no lock), its own listener. Data reclamation goes to `reclaims`.
 fn serve_worker(
     idx: usize,
     args: &Args,
     credential: Option<(String, Vec<u8>)>,
     addr: SocketAddr,
+    reclaims: mpsc::UnboundedSender<Reclaim>,
 ) -> Result<()> {
     let rt = compio::runtime::Runtime::new().context("compio runtime")?;
     rt.block_on(async move {
         // A distinct daemon identity per worker: the manager keys its lease
         // registry on it, and two workers sharing one would look like a single
         // client reconnecting.
-        let state = connect_state(args, format!("{}-{idx}", args.host), credential).await?;
+        let mut state = connect_state(args, format!("{}-{idx}", args.host), credential).await?;
+        state.reclaim_later = Some(Box::new(move |r| {
+            if reclaims.unbounded_send(r).is_err() {
+                tracing::warn!(?r, "the reclaimer is gone; the next sweep reclaims this");
+            }
+        }));
         let fs: Fs = Rc::new(futures::lock::Mutex::new(state));
 
         let listener = compio::net::TcpListener::from_std(reuseport_listener(addr)?)?;
@@ -397,45 +405,120 @@ fn serve_worker(
     })
 }
 
-/// The background sweeps, on a thread of their own so a long one never holds
-/// a serving worker's state lock:
-/// - publishing sessions whose owner died (another gateway, or this one
-///   before a restart) are taken over, fenced, and their operations finished
-///   or undone;
-/// - aborted and completed multipart uploads are reclaimed;
-/// - unlinked files whose data another client was still holding, and
-///   segmented files' dropped objects, are reclaimed once nobody holds them.
+/// The reclaimer, on a thread of its own so deleting data never holds a
+/// serving worker's state lock:
+/// - what the workers hand over (`FsState::reclaim_later`): files a delete or
+///   an overwrite left unreachable, and aborted or completed multipart
+///   uploads, reclaimed as soon as they arrive. The worker has already made
+///   each durable (a tombstone, a terminal upload record), so a hand-off
+///   that is lost — a crash — is picked up by a sweep;
+/// - every `--sweep-interval-secs` (0: never), the sweeps: publishing
+///   sessions whose owner died (another gateway, or this one before a
+///   restart) are taken over, fenced, and their operations finished or
+///   undone; terminal multipart uploads, unlinked files whose data another
+///   client was still holding, and segmented files' dropped objects are
+///   reclaimed once nobody holds them.
 ///
-/// Every sweep is idempotent and safe to run in several gateways at once.
-fn sweep_worker(args: &Args, credential: Option<(String, Vec<u8>)>) -> Result<()> {
+/// It is its own client, so a GET a worker is streaming (its pin) stops the
+/// reclaim of that file the way any other client's would; that is also why a
+/// worker releases its own leases on a file before handing it over. Every
+/// step is idempotent and safe to run in several gateways at once.
+fn reclaim_worker(
+    args: &Args,
+    credential: Option<(String, Vec<u8>)>,
+    mut reclaims: mpsc::UnboundedReceiver<Reclaim>,
+) -> Result<()> {
     let rt = compio::runtime::Runtime::new().context("compio runtime")?;
     rt.block_on(async move {
         let mut st = connect_state(args, format!("{}-sweep", args.host), credential).await?;
-        let every = std::time::Duration::from_secs(args.sweep_interval_secs);
+        let every = (args.sweep_interval_secs > 0).then(|| std::time::Duration::from_secs(args.sweep_interval_secs));
+        let mut next_sweep = every.map(|d| std::time::Instant::now() + d);
+        // Until every worker has exited.
+        let mut open = true;
         loop {
-            compio::time::sleep(every).await;
-            match autumn_fs::publish::recover_dead_sessions(&mut st).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(sessions = n, "recovered dead publishing sessions"),
-                Err(e) => tracing::warn!(error = %e, "session recovery sweep failed"),
+            // A due sweep goes first, so a steady stream of hand-offs cannot
+            // put it off.
+            if next_sweep.is_some_and(|at| std::time::Instant::now() >= at) {
+                sweep(&mut st).await;
+                next_sweep = every.map(|d| std::time::Instant::now() + d);
+                continue;
             }
-            match autumn_fs::multipart::sweep_uploads(&mut st).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(uploads = n, "reclaimed finished multipart uploads"),
-                Err(e) => tracing::warn!(error = %e, "multipart upload sweep failed"),
+            let handed = match (open, next_sweep) {
+                (true, None) => reclaims.next().await,
+                (true, Some(at)) => {
+                    let wait = std::pin::pin!(compio::time::sleep(at.saturating_duration_since(std::time::Instant::now())));
+                    match futures::future::select(reclaims.next(), wait).await {
+                        futures::future::Either::Left((r, _)) => r,
+                        futures::future::Either::Right(_) => continue,
+                    }
+                }
+                (false, Some(at)) => {
+                    compio::time::sleep(at.saturating_duration_since(std::time::Instant::now())).await;
+                    continue;
+                }
+                (false, None) => return Ok(()),
+            };
+            let Some(first) = handed else {
+                open = false;
+                continue;
+            };
+            // Everything already queued, once each.
+            let mut batch = vec![first];
+            let mut seen = std::collections::HashSet::from([first]);
+            while let Ok(r) = reclaims.try_recv() {
+                if seen.insert(r) {
+                    batch.push(r);
+                }
             }
-            match autumn_fs::extent::sweep_unlink_tombstones(&mut st).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(inodes = n, "reclaimed unlinked files"),
-                Err(e) => tracing::warn!(error = %e, "unlink tombstone sweep failed"),
-            }
-            match autumn_fs::segment::sweep_garbage(&mut st).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(files = n, "reclaimed segment garbage"),
-                Err(e) => tracing::warn!(error = %e, "segment garbage sweep failed"),
+            for r in batch {
+                reclaim(&mut st, r).await;
             }
         }
     })
+}
+
+async fn sweep(st: &mut FsState) {
+    match autumn_fs::publish::recover_dead_sessions(st).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(sessions = n, "recovered dead publishing sessions"),
+        Err(e) => tracing::warn!(error = %e, "session recovery sweep failed"),
+    }
+    match autumn_fs::multipart::sweep_uploads(st).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(uploads = n, "reclaimed finished multipart uploads"),
+        Err(e) => tracing::warn!(error = %e, "multipart upload sweep failed"),
+    }
+    match autumn_fs::extent::sweep_unlink_tombstones(st).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(inodes = n, "reclaimed unlinked files"),
+        Err(e) => tracing::warn!(error = %e, "unlink tombstone sweep failed"),
+    }
+    match autumn_fs::segment::sweep_garbage(st).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(files = n, "reclaimed segment garbage"),
+        Err(e) => tracing::warn!(error = %e, "segment garbage sweep failed"),
+    }
+}
+
+/// Reclaim one hand-off. A file still held by another client (a GET on
+/// another worker or gateway, a mount) keeps its tombstone for the sweep.
+async fn reclaim(st: &mut FsState, r: Reclaim) {
+    match r {
+        Reclaim::Inode(ino) => match autumn_fs::extent::reclaim_unreachable(st, ino).await {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!(ino, "an unlinked file is still held elsewhere; the sweep reclaims it"),
+            Err(e) => tracing::warn!(ino, error = %e, "reclaiming an unlinked file failed; the sweep retries"),
+        },
+        Reclaim::Upload(id) => {
+            let r = match autumn_fs::publish::session_lease(st).await {
+                Ok(lease) => autumn_fs::multipart::cleanup(st, id, lease).await.map(|_| ()),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = r {
+                tracing::warn!(upload = id, error = %e, "multipart cleanup failed; the sweep retries");
+            }
+        }
+    }
 }
 
 /// Wrap a handler future for axum. compio runs each worker on one thread, so
@@ -574,7 +657,8 @@ fn main() -> Result<()> {
         "autumn-s3 (unauthenticated) on http://{addr}"
     );
 
-    let mut handles = Vec::with_capacity(args.workers);
+    let (reclaim_tx, reclaim_rx) = mpsc::unbounded();
+    let (exit_tx, exit_rx) = std::sync::mpsc::channel();
     for idx in 0..args.workers {
         let args = Args {
             manager: args.manager.clone(),
@@ -587,13 +671,11 @@ fn main() -> Result<()> {
             sweep_interval_secs: args.sweep_interval_secs,
         };
         let cred = credential.clone();
-        handles.push(
-            std::thread::Builder::new()
-                .name(format!("autumn-s3-{idx}"))
-                .spawn(move || serve_worker(idx, &args, cred, addr))?,
-        );
+        let tx = reclaim_tx.clone();
+        spawn_role(format!("autumn-s3-{idx}"), exit_tx.clone(), move || serve_worker(idx, &args, cred, addr, tx))?;
     }
-    if args.sweep_interval_secs > 0 {
+    drop(reclaim_tx);
+    {
         let sweep_args = Args {
             manager: args.manager.clone(),
             listen: args.listen.clone(),
@@ -605,19 +687,42 @@ fn main() -> Result<()> {
             sweep_interval_secs: args.sweep_interval_secs,
         };
         let cred = credential.clone();
-        handles.push(
-            std::thread::Builder::new()
-                .name("autumn-s3-sweep".into())
-                .spawn(move || sweep_worker(&sweep_args, cred))?,
-        );
+        spawn_role("autumn-s3-sweep".into(), exit_tx.clone(), move || reclaim_worker(&sweep_args, cred, reclaim_rx))?;
     }
-    // A worker only returns on error; surface the first one and let the process
-    // die rather than silently serving on fewer threads than asked for.
-    for h in handles {
-        match h.join() {
-            Ok(r) => r?,
-            Err(_) => bail!("a gateway worker thread panicked"),
+    // No thread returns while the gateway is healthy: a worker only on error,
+    // the reclaimer only once every worker is gone. The first to stop ends the
+    // process rather than let it serve on fewer threads than asked for, or —
+    // the reclaimer — keep deleting names while nothing reclaims their data.
+    let (name, r) = exit_rx.recv().context("every gateway thread vanished")?;
+    match r {
+        Ok(()) => bail!("{name} stopped"),
+        Err(e) => Err(e.context(format!("{name} stopped"))),
+    }
+}
+
+/// Run `f` on a thread named `name`; its result, or a panic, is reported on
+/// `exited`.
+fn spawn_role(
+    name: String,
+    exited: std::sync::mpsc::Sender<(String, Result<()>)>,
+    f: impl FnOnce() -> Result<()> + Send + 'static,
+) -> Result<()> {
+    /// Reports a panic: `Drop` runs while the thread unwinds.
+    struct Report(Option<(String, std::sync::mpsc::Sender<(String, Result<()>)>)>);
+    impl Drop for Report {
+        fn drop(&mut self) {
+            if let Some((name, tx)) = self.0.take() {
+                // Fails only when `main` has already stopped listening.
+                tx.send((name, Err(anyhow::anyhow!("panicked")))).ok();
+            }
         }
     }
+    std::thread::Builder::new().name(name.clone()).spawn(move || {
+        let mut report = Report(Some((name, exited)));
+        let r = f();
+        if let Some((name, tx)) = report.0.take() {
+            tx.send((name, r)).ok();
+        }
+    })?;
     Ok(())
 }

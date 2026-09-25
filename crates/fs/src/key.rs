@@ -379,6 +379,39 @@ pub fn parse_upload_alloc_key(key: &[u8]) -> Option<(u64, u64)> {
     }
 }
 
+/// What a Complete answered, kept for a while after its upload record is
+/// gone: `[0x04]mpc/[id BE]` → `schema::CompletedUpload`.
+pub fn completed_upload_key(id: u64) -> Vec<u8> {
+    let mut k = super_key(b"mpc/");
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// When a completed-upload record expires: `[0x04]mpx/[deadline secs BE][id
+/// BE]` → empty. Ordered by deadline, so expiring is a scan of what is due.
+pub fn completed_expiry_key(deadline_secs: u64, id: u64) -> Vec<u8> {
+    let mut k = completed_expiry_prefix();
+    k.extend_from_slice(&deadline_secs.to_be_bytes());
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+pub fn completed_expiry_prefix() -> Vec<u8> {
+    super_key(b"mpx/")
+}
+
+/// `(deadline_secs, id)` of an expiry key.
+pub fn parse_completed_expiry_key(key: &[u8]) -> Option<(u64, u64)> {
+    let p = completed_expiry_prefix();
+    if key.len() == p.len() + 16 && key.starts_with(&p) {
+        let t = u64::from_be_bytes(key[p.len()..p.len() + 8].try_into().unwrap());
+        let id = u64::from_be_bytes(key[p.len() + 8..].try_into().unwrap());
+        Some((t, id))
+    } else {
+        None
+    }
+}
+
 pub fn unlink_tombstone_prefix() -> Vec<u8> {
     super_key(b"rmtomb/")
 }
@@ -433,6 +466,10 @@ mod tests {
         let a = upload_alloc_key(5, 6, 7);
         assert!(a.starts_with(&upload_alloc_prefix(5)));
         assert_eq!(parse_upload_alloc_key(&a), Some((6, 7)));
+        let x = completed_expiry_key(1000, 9);
+        assert_eq!(parse_completed_expiry_key(&x), Some((1000, 9)));
+        assert!(completed_expiry_key(999, u64::MAX) < x, "ordered by deadline first");
+        assert!(completed_upload_key(9) != upload_key(9));
         // One upload's prefixes never cover another's records.
         assert!(!upload_part_key(5, 1).starts_with(&upload_part_prefix(6)));
         assert!(!upload_alloc_key(50, 1, 1).starts_with(&upload_alloc_prefix(5)));

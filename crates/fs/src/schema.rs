@@ -242,6 +242,25 @@ pub struct UploadRecord {
     pub state: UploadState,
 }
 
+/// `key::completed_upload_key`: what a finished Complete answered, so a retry
+/// whose first reply was lost gets the same answer after the upload record
+/// is gone.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CompletedUpload {
+    /// The S3 key the upload was for.
+    pub key: Vec<u8>,
+    /// The file the Complete published.
+    pub new_ino: u64,
+}
+
+pub fn encode_completed(r: &CompletedUpload) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(r).to_vec()
+}
+
+pub fn decode_completed(bytes: &[u8]) -> Result<CompletedUpload, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
 /// `key::upload_part_key`: the part's current data object.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct PartRecord {

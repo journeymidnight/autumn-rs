@@ -501,24 +501,41 @@ async fn flush_appends(
     Ok(())
 }
 
-/// Delete every data extent of an inode (used by `unlink`). Range-scan + delete;
-/// needs no length info, so it does not touch the runtime cache beyond
-/// invalidating it.
 /// UNLINK-1: remove an UNREACHABLE inode's data under an intent
 /// tombstone — extents, the inode key, then the tombstone itself. Used
 /// by unlink and rename-over-existing once the last dirent is gone, and
 /// replayed by `sweep_unlink_tombstones` after a crash. Idempotent.
 pub async fn remove_unreachable_inode(state: &mut FsState, ino: u64) -> Result<()> {
-    let tk = crate::key::unlink_tombstone_key(ino);
-    state.kv_put(&tk, b"1").await?;
-    // Open here: POSIX keeps an unlinked file's data until its last close,
-    // and that close retries (`FsState::unlinked_open`).
+    if tombstone_unreachable(state, ino).await? {
+        reclaim_unreachable(state, ino).await?;
+    }
+    Ok(())
+}
+
+/// Write the tombstone of an inode that just became unreachable. Returns
+/// whether its data can be reclaimed now: not while this session has it open
+/// — POSIX keeps an unlinked file's data until its last close, and that
+/// close reclaims it (`FsState::unlinked_open`).
+pub async fn tombstone_unreachable(state: &mut FsState, ino: u64) -> Result<bool> {
+    state.kv_put(&crate::key::unlink_tombstone_key(ino), b"1").await?;
     if state.held_leases.borrow().contains_key(&ino) {
         state.unlinked_open.insert(ino);
-        return Ok(());
+        return Ok(false);
     }
-    reclaim_unreachable(state, ino).await?;
-    Ok(())
+    Ok(true)
+}
+
+/// Reclaim a tombstoned inode through the state's background reclaimer if it
+/// has one, else here. The reclaimer is another client, so any lease this
+/// client still holds on `ino` stops it: release those first. A conflict or
+/// a failure leaves the tombstone for the sweep.
+pub async fn reclaim_now_or_later(state: &mut FsState, ino: u64) {
+    if state.defer_reclaim(crate::state::Reclaim::Inode(ino)) {
+        return;
+    }
+    if let Err(e) = reclaim_unreachable(state, ino).await {
+        tracing::warn!(ino, error = %e, "reclaiming an unlinked file failed; the sweep retries");
+    }
 }
 
 /// Delete an unreachable inode's data, inode key and tombstone — once no

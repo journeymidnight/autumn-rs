@@ -39,6 +39,9 @@ pub fn now_ts() -> (i64, u32) {
     (d.as_secs() as i64, d.subsec_nanos())
 }
 
+/// The content generation of a newly created file.
+pub const FIRST_GENERATION: u64 = 1;
+
 /// Create a new regular file inode.
 pub fn new_file_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
     let (secs, nsecs) = now_ts();
@@ -57,7 +60,7 @@ pub fn new_file_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
         inline_data: None,
         symlink_target: None,
         stripe: None,
-        generation: 1,
+        generation: FIRST_GENERATION,
         segments: None,
     }
 }

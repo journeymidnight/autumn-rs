@@ -673,13 +673,28 @@ pub async fn reclaim(state: &mut FsState, file_ino: u64, current: Option<&Segmen
         ),
         None => (Default::default(), 0),
     };
+    reclaim_except(&state.client, file_ino, &live_objects, live_map, lease).await
+}
+
+/// Delete every object and map page `file_ino` recorded except the objects
+/// in `live_objects` and the pages of `live_map` (0: none), with their
+/// records. Needs only the client.
+pub async fn reclaim_except(
+    client: &ClusterClient,
+    file_ino: u64,
+    live_objects: &std::collections::BTreeSet<u64>,
+    live_map: u64,
+    lease: WriteLease,
+) -> Result<usize> {
     let prefix = key::segc_prefix(file_ino);
     let mut from = prefix.clone();
     let mut reclaimed = 0;
     loop {
-        let (keys, has_more) = state.kv_range_page(&prefix, &from, 1024).await?;
+        let r = client.range(&prefix, &from, 1024).await.map_err(|e| anyhow!("KV range: {e}"))?;
+        let has_more = r.has_more;
+        let keys: Vec<Vec<u8>> = r.entries.into_iter().map(|e| e.key).collect();
         let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-        let values = state.client.get_many(&refs).await;
+        let values = client.get_many(&refs).await;
         let mut done: Vec<&[u8]> = Vec::new();
         for (k, v) in keys.iter().zip(values) {
             let Some((_, id)) = key::parse_segc_key(k) else { continue };
@@ -687,10 +702,10 @@ pub async fn reclaim(state: &mut FsState, file_ino: u64, current: Option<&Segmen
             let rec = schema::decode_segc(&bytes).map_err(|e| anyhow!("reclaim record {file_ino}/{id}: {e}"))?;
             match rec {
                 SegcRecord::Object { len, lanes, unit } if !live_objects.contains(&id) => {
-                    delete_object(&state.client, id, len, lanes, unit, lease).await?;
+                    delete_object(client, id, len, lanes, unit, lease).await?;
                 }
                 SegcRecord::Pages { count } if id != live_map => {
-                    delete_pages(&state.client, id, count, lease).await?;
+                    delete_pages(client, id, count, lease).await?;
                 }
                 _ => continue,
             }
@@ -698,7 +713,7 @@ pub async fn reclaim(state: &mut FsState, file_ino: u64, current: Option<&Segmen
         }
         // A record goes only after what it names, so a crash in between
         // leaves the record to retry.
-        for r in state.client.delete_many_fenced(&done, lease).await {
+        for r in client.delete_many_fenced(&done, lease).await {
             r.map_err(|e| anyhow!("reclaim records of {file_ino}: {e}"))?;
         }
         reclaimed += done.len();

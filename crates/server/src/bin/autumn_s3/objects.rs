@@ -223,8 +223,8 @@ fn unpin_locked(fs: &Fs, st: &mut FsState, ino: u64) {
 
 /// Hand an unused pin back, then reclaim the file if it became unreachable
 /// while pinned here: a replace or delete on this worker defers that
-/// (`FsState::unlinked_open`), because this client's own EXCLUSIVE would not
-/// be stopped by its own pin.
+/// (`FsState::unlinked_open`) rather than hand the reclaimer a file this
+/// worker is still streaming.
 async fn release_if_idle(st: &mut FsState, ino: u64) {
     let idle = st
         .held_leases
@@ -240,10 +240,8 @@ async fn release_if_idle(st: &mut FsState, ino: u64) {
         tracing::warn!(ino, error = %e, "releasing a GET pin failed; its TTL ends it");
     }
     if st.unlinked_open.remove(&ino) {
-        // A conflict or failure leaves the tombstone for the sweeper.
-        if let Err(e) = autumn_fs::extent::reclaim_unreachable(st, ino).await {
-            tracing::warn!(ino, error = %e, "reclaiming a file unlinked while pinned failed; the sweep retries");
-        }
+        // Released above, so this client no longer stops the reclaimer.
+        autumn_fs::extent::reclaim_now_or_later(st, ino).await;
     }
 }
 
