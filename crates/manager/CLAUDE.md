@@ -1162,6 +1162,22 @@ signal, so `split_candidates` / `merge_candidates` evaluate the SIZE conditions 
 the current bucket (a single `sealed_sum` snapshot), thrash-guarded by the cooldowns,
 while QPS, byte-rate and imm-full keep the all-N-buckets debounce.
 
+**Major compaction has two reasons, and the second exists because deletes are
+invisible to the first.** BACKLOG is `pending_compaction_bytes >
+COMPACT_PENDING_HIGH` sustained. SETTLE is `PartitionLoad.unsettled_deletes > 0`
+with the count unchanged across the whole window. A delete reaches GC only
+through a compaction's discard, and for large values the LSM stays a few KB
+however many GiB were deleted, so BACKLOG never fires and an idle partition
+kept every deleted byte forever — its `est_live` never fell either, so the merge
+veto and the split rate-floor kept reading phantom size. "Unchanged" means the
+burst has ended: a partition that keeps deleting (cache eviction) would
+otherwise be told to compact every cooldown, and one burst needs one
+compaction. Same candidate kind, same switch, same inflight/cooldown gates; the
+PS flushes its memtable before any major compaction, so the compaction reaches
+the deletes wherever they sit, and a success zeroes the count. Real cluster: a
+partition emptied of 270×64 MiB values and nothing else happening went from
+`est_live` 16.88 GiB stuck forever to SETTLE → GC → reclaimed, unattended.
+
 **One advisory row per (kind, target).** `recompute_advisory_cache` dedups the union by
 `cooldown_key`, first wins. The actuator already collapses duplicates
 (`decide_actions`), so a second row for the same op only ever reaches a human — and the
@@ -1198,7 +1214,7 @@ persisted):**
 | `MERGE_BW_LOW` | 17.5 MiB/s | summed cold byte rate (10× hysteresis vs `SPLIT_BW_HIGH`) |
 | `MERGE_COOLDOWN_SEC` | 21600 (6 h) | |
 | `GC_DEBT_HIGH` | 1 GiB | GC advisory — AND the per-extent absolute floor selection uses. Both manager paths build their `MaintenanceReq` through `maintenance_req_for_submitted_op`, which fills `gc_dead_bytes_high` (and `gc_stream_debt`) from this value for an AUTO_GC request that names no knobs — so the advisory and the selection judge on the same number. FORCE_GC carries the spec verbatim and the PS Force arm reads neither field. Before that they did not: the advisory fired on absolute dead bytes and selection asked for a ratio, and GC answered "no eligible extents" every cooldown. |
-| `COMPACT_PENDING_HIGH` | 4 GiB | major-compact advisory |
+| `COMPACT_PENDING_HIGH` | 4 GiB | major-compact advisory (BACKLOG); SETTLE has no threshold — any unsettled delete, once none new for the window |
 | `MINOR_COMPACT_PENDING_HIGH` | 512 MiB | minor-compact advisory |
 | `GC/COMPACT_COOLDOWN_SEC` | 300 | ; `MINOR_COMPACT_COOLDOWN_SEC` 120 |
 | `EC_MIN_EXTENT_BYTES` | 64 MiB | below this, EC's encode+fanout costs outweigh savings |

@@ -1152,7 +1152,7 @@ async fn get_value_inner(
             return Ok(GetOutcome::NotFound);
         }
     };
-    if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
+    if op == crate::OP_TOMBSTONE || (expires_at > 0 && expires_at <= now_secs()) {
         record_read(0, false, 0);
         return Ok(GetOutcome::NotFound);
     }
@@ -1301,7 +1301,7 @@ pub(crate) async fn handle_head(
             }))
         }
     };
-    if op == 2 || (expires_at > 0 && expires_at <= now_secs()) {
+    if op == crate::OP_TOMBSTONE || (expires_at > 0 && expires_at <= now_secs()) {
         return Ok(partition_rpc::rkyv_encode(&HeadResp {
             code: CODE_NOT_FOUND,
             message: "key not found".to_string(),
@@ -1636,7 +1636,7 @@ async fn range_scan_sst_merge(
         }
         last_user_key = Some(uk.to_vec());
 
-        if item.op == 2 {
+        if item.op == crate::OP_TOMBSTONE {
             continue;
         }
         if item.expires_at > 0 && item.expires_at <= now {
@@ -2324,7 +2324,8 @@ pub(crate) async fn handle_split_part(
             end_key: mid.clone(),
         };
         let mut overlap = false;
-        for reader in &p.sst_readers {
+        // A block-less SST (a compaction's discards-only output) holds no key.
+        for reader in p.sst_readers.iter().filter(|r| r.block_count() > 0) {
             let sk = parse_key(reader.smallest_key());
             let bk = parse_key(reader.biggest_key());
             if !in_range(&new_rg, sk) || !in_range(&new_rg, bk) {

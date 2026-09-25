@@ -969,10 +969,21 @@ impl PolicyEngine {
     }
 
     /// Major-compaction maintenance sub-check. Emits a
-    /// `POLICY_KIND_MAJOR_COMPACT` candidate when no compaction is
-    /// inflight, the partition is outside `compact_cooldown_sec`, and
-    /// ALL recent buckets sustain
-    /// `pending_compaction_bytes > compact_pending_high`.
+    /// `POLICY_KIND_MAJOR_COMPACT` candidate when no compaction is inflight,
+    /// the partition is outside `compact_cooldown_sec`, and ALL recent buckets
+    /// show one of two reasons:
+    ///
+    /// - BACKLOG: `pending_compaction_bytes > compact_pending_high`.
+    /// - SETTLE: deletes no major compaction has seen yet
+    ///   (`unsettled_deletes > 0`) and none new across the window. A delete
+    ///   reaches GC only through a compaction's discard, and for large values
+    ///   the LSM stays a few KB however many GiB were deleted — so BACKLOG
+    ///   never fires, and an idle partition keeps every deleted byte forever
+    ///   (its `est_live` never falls either). "None new" means the burst has
+    ///   ended: a partition that keeps deleting (cache eviction) would
+    ///   otherwise be told to compact every cooldown, and one burst needs one
+    ///   compaction. The PS flushes the memtable before a major compaction, so
+    ///   the compaction covers these deletes wherever they sit.
     fn major_compact_advisory(
         part_id: u64,
         bs: &[&(i64, PartitionLoad)],
@@ -980,32 +991,52 @@ impl PolicyEngine {
         now: i64,
     ) -> Option<PolicyCandidate> {
         let recent = &bs[0].1;
-        if recent.compact_inflight == 0
-            && (recent.last_compact_at == 0
-                || now - recent.last_compact_at >= cfg.compact_cooldown_sec)
-            && bs
-                .iter()
-                .all(|(_, l)| l.pending_compaction_bytes > cfg.compact_pending_high)
+        if recent.compact_inflight != 0
+            || (recent.last_compact_at != 0
+                && now - recent.last_compact_at < cfg.compact_cooldown_sec)
         {
-            Some(PolicyCandidate {
-                kind: POLICY_KIND_MAJOR_COMPACT,
-                primary_part_id: part_id,
-                secondary_part_id: 0,
-                reason: format!(
+            return None;
+        }
+        let window_min = cfg.required_buckets * cfg.bucket_sec as usize / 60;
+        let (reason, size_bytes) = if bs
+            .iter()
+            .all(|(_, l)| l.pending_compaction_bytes > cfg.compact_pending_high)
+        {
+            (
+                format!(
                     "pending_compaction_bytes>{} ({} MiB) sustained {}m",
                     cfg.compact_pending_high,
                     recent.pending_compaction_bytes / (1024 * 1024),
-                    cfg.required_buckets * cfg.bucket_sec as usize / 60,
+                    window_min,
                 ),
-                size_bytes: recent.pending_compaction_bytes,
-                req_per_sec: recent.req_per_sec,
-                imm_full_per_sec: recent.imm_full_per_sec,
-                same_ps: true,
-                last_op_at: recent.last_compact_at,
-            })
+                recent.pending_compaction_bytes,
+            )
+        } else if recent.unsettled_deletes > 0
+            && bs
+                .iter()
+                .all(|(_, l)| l.unsettled_deletes == recent.unsettled_deletes)
+        {
+            (
+                format!(
+                    "{} deletes not yet compacted, none new in {}m",
+                    recent.unsettled_deletes, window_min,
+                ),
+                recent.size_bytes,
+            )
         } else {
-            None
-        }
+            return None;
+        };
+        Some(PolicyCandidate {
+            kind: POLICY_KIND_MAJOR_COMPACT,
+            primary_part_id: part_id,
+            secondary_part_id: 0,
+            reason,
+            size_bytes,
+            req_per_sec: recent.req_per_sec,
+            imm_full_per_sec: recent.imm_full_per_sec,
+            same_ps: true,
+            last_op_at: recent.last_compact_at,
+        })
     }
 
     /// Minor-compaction maintenance sub-check. Independent from

@@ -3355,6 +3355,9 @@ async fn run_info(
                 // (post-CoW-split). `split` is REFUSED while it is set, and
                 // only a major compaction clears it.
                 "has_overlap": l.has_overlap,
+                // Deletes no major compaction has covered yet; their freed
+                // bytes are invisible to GC until one does.
+                "unsettled_deletes": l.unsettled_deletes,
             });
             println!(
                 "{}",
@@ -3395,6 +3398,15 @@ async fn run_info(
                 l.last_gc_at, l.last_compact_at
             );
             println!("  sealed_log_extent_count={}", l.sealed_log_extent_count);
+            println!(
+                "  unsettled_deletes={}{}",
+                l.unsettled_deletes,
+                if l.unsettled_deletes != 0 {
+                    "  (not yet reclaimable: needs a major compaction)"
+                } else {
+                    ""
+                }
+            );
             println!(
                 "  has_overlap={}{}",
                 l.has_overlap,

@@ -593,3 +593,32 @@ mod window_tests {
         assert!(r.decode_block_from_window(&win, start_rel, 0).is_err());
     }
 }
+
+/// A major compaction that drops every entry still has to hand its discard map
+/// on, so it writes an SST with no entries at all. Every reader must treat that
+/// as "no keys here" rather than trip over the missing block.
+#[cfg(test)]
+mod discards_only_tests {
+    use super::*;
+    use crate::sstable::builder::SstBuilder;
+    use crate::sstable::iterator::TableIterator;
+
+    #[test]
+    fn an_sst_without_entries_carries_its_discards_and_holds_no_key() {
+        let mut b = SstBuilder::new(7, 4096);
+        b.set_discards(HashMap::from([(7u64, 16 << 30)]));
+        let r = Arc::new(SstReader::from_bytes(Bytes::from(b.finish())).expect("reader"));
+
+        assert_eq!(r.discards, HashMap::from([(7u64, 16 << 30)]));
+        assert_eq!(r.block_count(), 0);
+        assert_eq!(r.seq_num(), 0);
+        assert!(!r.bloom_may_contain(b"any-key"));
+        assert!(crate::background::lookup_in_sst(&r, b"any-key").is_none());
+
+        let mut it = TableIterator::new(r.clone());
+        it.rewind();
+        assert!(!it.valid());
+        it.seek(&crate::key_with_ts(b"any-key", u64::MAX));
+        assert!(!it.valid());
+    }
+}

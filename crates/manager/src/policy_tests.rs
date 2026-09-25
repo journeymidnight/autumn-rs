@@ -1852,3 +1852,100 @@ fn byte_rate_vetoes_a_merge_that_qps_calls_cold() {
     });
     assert!(out.is_empty(), "1.4 GB/s is not a cold pair: {out:?}");
 }
+
+// ---------------------------------------------------------------------------
+// major compaction: settling deletes on an idle partition
+// ---------------------------------------------------------------------------
+
+/// The live shape: 270 deleted 64 MiB values, an LSM of a few KB, nothing else
+/// happening. The backlog reason can never see it (`pending_compaction_bytes`
+/// is ~0), so without the settle reason no compaction — and therefore no
+/// discard, no GC debt and no GC — ever follows.
+#[test]
+fn an_idle_partition_with_uncompacted_deletes_is_advised_a_major_compaction() {
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    fill_window(
+        &mut eng,
+        13,
+        POLICY_REQUIRED_BUCKETS,
+        PartitionLoad {
+            part_id: 13,
+            size_bytes: 40 * 1024,
+            unsettled_deletes: 270,
+            ..Default::default()
+        },
+        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+    );
+    let out = eng.compute_maintenance_advisory(now);
+    let cs: Vec<_> = out
+        .iter()
+        .filter(|c| c.kind == POLICY_KIND_MAJOR_COMPACT)
+        .collect();
+    assert_eq!(cs.len(), 1, "{out:?}");
+    assert_eq!(cs[0].primary_part_id, 13);
+    assert!(cs[0].reason.contains("270 deletes"), "{}", cs[0].reason);
+}
+
+/// A partition that keeps deleting — cache eviction — must not be told to
+/// compact every cooldown: the advice waits until the burst has ended.
+#[test]
+fn deletes_still_arriving_do_not_advise_a_major_compaction() {
+    let mut eng = PolicyEngine::default();
+    let now = 1_700_000_000;
+    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    for i in 0..POLICY_REQUIRED_BUCKETS {
+        eng.metrics.entry(13).or_default().push(
+            base + i as i64 * POLICY_BUCKET_SEC,
+            PartitionLoad {
+                part_id: 13,
+                unsettled_deletes: 100 * (i as u64 + 1),
+                ..Default::default()
+            },
+        );
+    }
+    let out = eng.compute_maintenance_advisory(now);
+    assert!(
+        out.iter().all(|c| c.kind != POLICY_KIND_MAJOR_COMPACT),
+        "{out:?}"
+    );
+}
+
+/// The settle reason obeys the same gates as the backlog one.
+#[test]
+fn settling_deletes_respects_the_compaction_cooldown_and_inflight() {
+    let now = 1_700_000_000;
+    for load in [
+        PartitionLoad {
+            part_id: 13,
+            unsettled_deletes: 270,
+            last_compact_at: now - 10,
+            ..Default::default()
+        },
+        PartitionLoad {
+            part_id: 13,
+            unsettled_deletes: 270,
+            compact_inflight: 1,
+            ..Default::default()
+        },
+        PartitionLoad {
+            part_id: 13,
+            unsettled_deletes: 0,
+            ..Default::default()
+        },
+    ] {
+        let mut eng = PolicyEngine::default();
+        fill_window(
+            &mut eng,
+            13,
+            POLICY_REQUIRED_BUCKETS,
+            load.clone(),
+            now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        );
+        let out = eng.compute_maintenance_advisory(now);
+        assert!(
+            out.iter().all(|c| c.kind != POLICY_KIND_MAJOR_COMPACT),
+            "{load:?} → {out:?}"
+        );
+    }
+}

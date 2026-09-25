@@ -491,7 +491,6 @@ pub(crate) async fn background_maintenance_loop(
                         continue;
                     }
                 }
-                let tbls = part.borrow().tables.clone();
                 let metrics = part.borrow().metrics.clone();
                 // fix MED-4: latch compact_inflight=1 at dequeue,
                 // not after gate.acquire(). The scheduler reads
@@ -516,7 +515,49 @@ pub(crate) async fn background_maintenance_loop(
                         .compact_inflight
                         .store(0, std::sync::atomic::Ordering::Relaxed);
                 };
-                if tbls.len() < 2 && part.borrow().has_overlap.get() == 0 {
+                // A MAJOR compaction flushes the memtable first, under the
+                // same gate + permit its do_compact holds. Deletes live in the
+                // memtable until a flush, and a flush only happens on size or
+                // on the WAL gap — so on an idle partition a major compaction
+                // would otherwise run over SSTs that hold no tombstone at all,
+                // discard nothing, and leave every value those deletes killed
+                // unreclaimable (no discard ⇒ no GC debt ⇒ no GC). The flush
+                // precedes the table snapshot so the new SST is in it.
+                // `settling` = the deletes this compaction covers; read in the
+                // same synchronous step as the flush's rotate, so a delete that
+                // lands during the compaction stays counted.
+                let mut major_guards = None;
+                let mut settling = 0u64;
+                if major {
+                    let gate = maintenance_gate.acquire().await;
+                    let permit = concurrency_ctrl.acquire_compact().await;
+                    settling = metrics
+                        .unsettled_deletes
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) = crate::flush_memtable_locked(&part).await {
+                        let es = format!("flush before major compaction: {e}");
+                        tracing::error!("compaction: {es}");
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            es,
+                            String::new(),
+                        );
+                        refresh_metrics(&part);
+                        stamp_last_compact();
+                        clear_compact_inflight();
+                        continue;
+                    }
+                    major_guards = Some((gate, permit));
+                }
+                let tbls = part.borrow().tables.clone();
+                // A single table can still hold a delete together with the
+                // value it killed (both flushed from one memtable), and only a
+                // major compaction drops that pair — so a major one that is
+                // settling deletes never skips on table count.
+                if tbls.len() < 2 && part.borrow().has_overlap.get() == 0 && settling == 0 {
                     tracing::info!(
                         "compact part {}: skipped (major={}) — tables={}, has_overlap=0",
                         part_id,
@@ -583,10 +624,16 @@ pub(crate) async fn background_maintenance_loop(
                 // `handle_split_part` on this partition (split holds this gate
                 // from before commit_length through multi_modify_split so no
                 // `compact_row_append` from us can race the seal).
-                let _local_gate = maintenance_gate.acquire().await;
-                // PS-wide concurrency permit — limits cross-partition
-                // peak RAM (each do_compact holds ~2x SST bytes).
-                let _permit = concurrency_ctrl.acquire_compact().await;
+                // (A major compaction took both before its flush, above.)
+                let _guards = match major_guards {
+                    Some(g) => g,
+                    // PS-wide concurrency permit — limits cross-partition
+                    // peak RAM (each do_compact holds ~2x SST bytes).
+                    None => (
+                        maintenance_gate.acquire().await,
+                        concurrency_ctrl.acquire_compact().await,
+                    ),
+                };
                 // compact_inflight already latched at top of recv arm.
                 let result = do_compact(&part, compact_tbls, major, compact_op_id).await;
                 match result {
@@ -600,6 +647,7 @@ pub(crate) async fn background_maintenance_loop(
                         );
                         if major {
                             part.borrow().set_has_overlap(0);
+                            settle_deletes(&metrics, settling);
                         }
                         if truncate_id != 0 {
                             let (row_stream_id, part_sc) = {
@@ -1666,7 +1714,7 @@ pub(crate) async fn start_write_batch(
                     value,
                     expires_at,
                 } => (user_key, 1u8, value, expires_at),
-                WriteOp::Delete { user_key } => (Bytes::from(user_key), 2u8, Bytes::new(), 0u64),
+                WriteOp::Delete { user_key } => (Bytes::from(user_key), crate::OP_TOMBSTONE, Bytes::new(), 0u64),
                 // BUG-LEASE-2 Phase 2: fence-floor bump record. key = raw
                 // ino bytes (NOT a user key — skips in_range below), value
                 // = epoch. Never inserted into the memtable (Phase 3 skips
@@ -1953,6 +2001,8 @@ pub(crate) async fn finish_write_batch(
         let responders_ref = &mut responders;
         let mut durable_bumps: Vec<(u64, u64)> = Vec::new();
         let durable_bumps_ref = &mut durable_bumps;
+        let mut deletes: u64 = 0;
+        let deletes_ref = &mut deletes;
         let iter = valid.into_iter().filter_map(move |entry| {
             let record_offset = base_offset + cumulative;
             cumulative += record_sizes[idx] as u64;
@@ -2009,12 +2059,20 @@ pub(crate) async fn finish_write_batch(
                 }
             };
 
+            if entry.op == crate::OP_TOMBSTONE {
+                *deletes_ref += 1;
+            }
             let write_size = (entry.user_key.len() + mem_entry.value.len() + 32) as u64;
             responders_ref.push(entry.resp);
             Some((entry.internal_key, mem_entry, write_size))
         });
 
         p.active.insert_batch(iter);
+        if deletes > 0 {
+            p.metrics
+                .unsettled_deletes
+                .fetch_add(deletes, std::sync::atomic::Ordering::Relaxed);
+        }
         // The fence records in this batch are committed: their floors are
         // durable now.
         for (ino, epoch) in durable_bumps {
@@ -2062,6 +2120,17 @@ pub(crate) async fn finish_write_batch(
 // ---------------------------------------------------------------------------
 // Compaction
 // ---------------------------------------------------------------------------
+
+/// A major compaction covered `settled` deletes: take them off
+/// `unsettled_deletes`. Saturating, because a partition reopened while one ran
+/// re-seeds the counter from its replayed memtable.
+pub(crate) fn settle_deletes(metrics: &crate::PartitionMetrics, settled: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    metrics
+        .unsettled_deletes
+        .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(settled)))
+        .expect("the update closure never declines");
+}
 
 /// snapshot how many SSTable bytes the next compact tick would
 /// consume. `has_overlap == 1` means major compaction is mandated and
@@ -2579,7 +2648,7 @@ pub(crate) async fn do_compact(
         }
 
         if major {
-            if raw_op == 2 {
+            if raw_op == crate::OP_TOMBSTONE {
                 bump_discards_for_dropped_entry(&mut discards, raw_op, &raw_value);
                 entries_discarded += 1;
                 continue;
@@ -2633,15 +2702,18 @@ pub(crate) async fn do_compact(
 
     valid_discard(&mut discards, &log_extent_ids);
 
-    // Final chunk: attach aggregated discards before finalize. If the
-    // builder is empty (loop yielded zero kept entries OR the last
-    // entry's chunk-emit consumed the previous in-progress builder and
-    // the loop exited before pushing a new entry — only possible if the
-    // merge iterator went invalid right after an emit), then there's no
-    // last chunk to attach to; pin discards to the most recently emitted
-    // reader's TableMeta instead. This case is rare but keeps GC's
-    // discard-driven extent reclamation correct.
-    if !current_builder.is_empty() {
+    // Final chunk: attach the aggregated discards. `discards` began as the
+    // INPUT tables' own maps, and the swap below removes those tables — so
+    // whatever does not ride out on an output SST is gone, and GC can never
+    // again learn that those bytes died. The trailing builder is empty only
+    // when no entry was kept at all (every in-loop emit is followed by adding
+    // the entry that triggered it) — a major compaction over a partition whose
+    // data was all deleted, the one whose whole log is garbage. The discards
+    // then get an SST of their own with no entries (its seq is 0,
+    // like the MetaBlock recovery reads back: an SST's seq is the newest entry
+    // it holds). The readers skip it — its bloom has no key and it has no
+    // block — and the overlap checks ignore it, having no key out of range.
+    if !current_builder.is_empty() || !discards.is_empty() {
         let mut builder = std::mem::replace(
             &mut current_builder,
             SstBuilder::new(compact_vp_eid, compact_vp_off),
@@ -2656,19 +2728,6 @@ pub(crate) async fn do_compact(
             &mut new_readers,
         )
         .await?;
-    } else if !new_readers.is_empty() {
-        // Rare boundary case: the loop's last item exactly tipped the chunk
-        // size budget, so the in-loop emit consumed the builder and the loop
-        // exited with an empty trailing builder. With no final chunk to carry
-        // the aggregated discards, defer them to the next major compaction
-        // that touches one of these output SSTs — the same outcome as a no-op
-        // set_discards on an empty builder. If this ever becomes a GC blocker,
-        // emit a tiny discards-only SST here instead.
-        tracing::debug!(
-            "compact: last chunk emit consumed builder before loop exit; \
-             discards (extents={}) deferred to next compaction",
-            discards.len()
-        );
     }
 
     let output_tables = new_readers.len();
@@ -4116,7 +4175,7 @@ pub(crate) fn finalize_unique_user_keys(
     }
     seen.into_iter()
         .filter_map(|(uk, (op, expires_at))| {
-            if op == 2 {
+            if op == crate::OP_TOMBSTONE {
                 return None;
             }
             if expires_at > 0 && expires_at <= now {

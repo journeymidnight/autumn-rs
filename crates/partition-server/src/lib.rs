@@ -789,6 +789,9 @@ fn record_carries_value_pointer(op: u8, value_len: usize) -> bool {
 /// (`op & OP_VALUE_POINTER == 0`).
 const OP_FENCE_BUMP: u8 = 0x08;
 
+/// Record op of a delete (the low bits; `OP_VALUE_POINTER` is a flag above).
+const OP_TOMBSTONE: u8 = 2;
+
 /// backstop TTL for `PartitionData.frozen_for_merge`. The manager's
 /// merge orchestrator (`handle_merge_partitions`) commits in <1 s on the
 /// happy path and explicitly unfreezes on rollback. This TTL fires only
@@ -933,6 +936,15 @@ impl Memtable {
 
     fn is_empty(&self) -> bool {
         self.data.read().is_empty()
+    }
+    /// Tombstones held here. A full walk — only for seeding
+    /// `PartitionMetrics::unsettled_deletes` from the replayed memtable at open.
+    fn tombstone_count(&self) -> u64 {
+        self.data
+            .read()
+            .values()
+            .filter(|e| e.op & 0x7f == OP_TOMBSTONE)
+            .count() as u64
     }
     fn mem_bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
@@ -1569,6 +1581,25 @@ pub struct PartitionMetrics {
     pub minor_compact_pending_bytes: std::sync::atomic::AtomicU64,
     /// count of sealed log_stream extents (informational).
     pub sealed_log_extent_count: std::sync::atomic::AtomicU32,
+    /// Deletes this partition took that no MAJOR compaction has seen yet.
+    ///
+    /// A delete frees nothing on its own: the value it kills is reclaimable
+    /// only once a compaction drops the superseded entry and records the
+    /// discard that GC reads. On an idle partition nothing else gets it there —
+    /// the tombstones sit in the memtable (it rotates on size or on the WAL
+    /// gap, and a few thousand deletes reach neither), and the size-driven
+    /// compaction advisories never fire for an LSM of a few KB, however many
+    /// GiB of large values the deletes killed. The manager's policy reads this
+    /// to advise the one major compaction that settles such a partition.
+    ///
+    /// Bumped per delete as it enters the memtable; seeded at open from the
+    /// replayed memtable. A successful major compaction subtracts what it
+    /// covered (the count taken as it flushed), so deletes that arrive during
+    /// the compaction stay counted. Deletes that had already been flushed to an
+    /// SST before a reopen — a restart, or the reopen that follows a split or
+    /// merge (their freeze drain flushes the memtable) — are not counted again:
+    /// the counter is not persisted.
+    pub unsettled_deletes: std::sync::atomic::AtomicU64,
     /// Terminal outcomes of manager-submitted maintenance ops (compact/gc/
     /// forcegc carrying a non-zero op_id) — a bounded ring copied onto the load
     /// heartbeat so the manager's op-ledger learns the state + error string that
@@ -4010,6 +4041,8 @@ impl PartitionServer {
                         // manager's split/merge advisories need it to avoid
                         // advising an action the PS is certain to refuse.
                         let has_overlap = handle.metrics.has_overlap.load(Relaxed);
+                        let unsettled_deletes =
+                            handle.metrics.unsettled_deletes.load(Relaxed);
                         manager_rpc::PartitionLoad {
                             part_id: *part_id,
                             size_bytes,
@@ -4032,6 +4065,7 @@ impl PartitionServer {
                             open_tail_bytes,
                             open_tail_dead_bytes,
                             has_overlap,
+                            unsettled_deletes,
                             maintenance_outcomes: handle
                                 .metrics
                                 .snapshot_maintenance_outcomes(),
@@ -6410,6 +6444,10 @@ async fn partition_thread_main(
 
     metrics_arc.has_overlap.store(
         detected_overlap as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    metrics_arc.unsettled_deletes.store(
+        recovered_active.tombstone_count(),
         std::sync::atomic::Ordering::Relaxed,
     );
     let part = Rc::new(RefCell::new(PartitionData {
@@ -9038,7 +9076,10 @@ async fn recover_partition(
             }
             loc_to_last_seq.insert((loc.extent_id, loc.offset, loc.len), tbl_last_seq);
 
-            if !detected_overlap {
+            // An SST with no block holds no key (a compaction's discards-only
+            // output), so none out of range — and its empty key bounds would
+            // otherwise read as out of every range.
+            if !detected_overlap && reader.block_count() > 0 {
                 let sk = parse_key(reader.smallest_key());
                 let bk = parse_key(reader.biggest_key());
                 if !in_range(rg, sk) || !in_range(rg, bk) {
@@ -15433,5 +15474,24 @@ mod write_batch_ceiling_tests {
             rounds += 1;
             assert!(rounds <= n, "draining must terminate");
         }
+    }
+}
+
+#[cfg(test)]
+mod unsettled_delete_seed_tests {
+    use super::*;
+
+    /// A reopened partition seeds `unsettled_deletes` from its replayed
+    /// memtable: tombstones count, a put — large value behind a pointer or
+    /// not — does not.
+    #[test]
+    fn the_replayed_memtable_counts_its_tombstones() {
+        let m = Memtable::new();
+        let entry = |op: u8| MemEntry { op, value: vec![1; 24], expires_at: 0 };
+        m.insert(key_with_ts(b"a", 1), entry(1), 1);
+        m.insert(key_with_ts(b"b", 2), entry(1 | OP_VALUE_POINTER), 1);
+        m.insert(key_with_ts(b"a", 3), entry(OP_TOMBSTONE), 1);
+        m.insert(key_with_ts(b"c", 4), entry(OP_TOMBSTONE), 1);
+        assert_eq!(m.tombstone_count(), 2);
     }
 }

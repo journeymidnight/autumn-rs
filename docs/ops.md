@@ -836,6 +836,43 @@ Unattended, the same thing happens through `auto-policy activate gc-only
 default 60 s bucket), logs `GC primary=<PART> ... reason='gc_debt_bytes>...
 sustained 5m'`, and the armed controller dispatches it on a following tick.
 
+### Verifying that an emptied partition reclaims its space unattended
+
+A delete frees nothing until a major compaction drops the value it killed and
+records the discard GC reads. On an idle partition the tombstones stay in the
+memtable, so the policy advises that compaction from the partition's
+`unsettled_deletes` once no new delete has arrived for the whole window
+(`N deletes not yet compacted, none new in 5m`), and the PS flushes its
+memtable before compacting. Check it end to end, deleting EVERYTHING — the
+compaction then keeps no entry, and its discards must still reach GC:
+
+```bash
+AUTUMN_DATA_ROOT=/data05/<scratch> AUTUMN_EXTENT_BASE_PORT=21000 bash cluster.sh reset 3
+AO=(autumn-op --manager 127.0.0.1:9001 --admin-token-file <DATA_ROOT>/authz/admin.token)
+AC=(autumn-client --manager 127.0.0.1:9001 --namespace bench)
+
+head -c $((64<<20)) /dev/urandom > /tmp/v64
+for i in $(seq 1 270); do "${AC[@]}" put big$i /tmp/v64; done   # seals a 16 GiB log extent
+for i in $(seq 1 270); do "${AC[@]}" del big$i; done
+"${AO[@]}" auto-policy activate aggressive --arm
+
+"${AO[@]}" --json info --part <PART> --detail   # unsettled_deletes: 270, gc_debt_bytes: 0
+"${AO[@]}" policy-candidates                    # after ~5 min: major <PART> "270 deletes not yet compacted ..."
+```
+
+Do NOT use `put-stream` for this: `autumn-client del` on a streamed key deletes
+only its 28-byte head and leaves every chunk key live.
+
+Expected, measured on a 3-EN cluster (270 × 64 MiB + 200 small keys, all
+deleted): the SETTLE compaction ~4.5 min after the last delete
+(`compact part N: major, input=17 tables, output=1 tables, kept=0,
+discarded=940` — the one output is the entry-less SST carrying the discards);
+`unsettled_deletes` 0, `gc_debt_bytes` 16 GiB, and `est_live` = sealed + open
+tail − gc_debt − open_tail_dead = 0 against an LSM of 0; the GC advisory 5 min
+later and `GC: punched extent N, moved 0 entries` ~4 min after that. No split
+candidate at any point. Before the fix this partition kept `est_live` at
+16.88 GiB with no candidate of any kind, indefinitely.
+
 ### Per-partition size in `autumn-op info`
 
 The cluster overview's per-partition size = the manager's authoritative

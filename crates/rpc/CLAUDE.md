@@ -901,6 +901,17 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## Unsettled deletes in the load report (wire 49)
+
+`PartitionLoad` gains `unsettled_deletes: u64` — deletes no major compaction
+has covered yet, the input to the manager's SETTLE compaction reason
+(`crates/manager/CLAUDE.md`, "Policy engine"). `PartitionLoad` travels PS →
+manager in the load report and manager → autumn-op in `GetPartitionDetailResp`;
+neither message is on the client surface, so the window only raises its ceiling
+to [43, 49] — but an autumn-op built at wire 48 is still ADMITTED by that window
+and would misdecode the shifted struct, so it is rebuilt with the cluster like
+every other binary.
+
 ## Lease modes (wire 48)
 
 `AcquireLeaseReq.mode` gains `LEASE_MODE_STABLE` (3), `LEASE_MODE_REPLACE` (4)

@@ -1212,6 +1212,15 @@ pub struct PartitionLoad {
     /// partition whose shared tables happen to hold no out-of-range key, which
     /// is exactly the case a byte-count inference would wave through.
     pub has_overlap: u32,
+    /// Deletes this partition took that no MAJOR compaction has seen yet
+    /// (`PartitionMetrics::unsettled_deletes`). A delete's freed bytes reach
+    /// GC only through a compaction's discard, and for large values the LSM
+    /// that the size-driven compaction advisories measure stays a few KB no
+    /// matter how many GiB were deleted — this is the only signal that a
+    /// major compaction would free anything. Not persisted: deletes already
+    /// flushed to an SST before a reopen (PS restart, split, merge) are not
+    /// counted again.
+    pub unsettled_deletes: u64,
     /// Terminal outcomes (≤ the PS's small ring) of manager-submitted
     /// maintenance ops (compact / gc / forcegc carrying a non-zero `op_id`).
     /// Piggybacked on the 5 s heartbeat so the manager's op-ledger learns the

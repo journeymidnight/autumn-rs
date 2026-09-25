@@ -849,6 +849,47 @@ Runs `do_compact(major=false)`.
 (op=2), expired entries, out-of-range keys (overlap cleanup), and clears
 `has_overlap` on success.
 
+**A dispatched major compaction flushes the memtable first** (under the same
+`maintenance_gate` + compact permit as its `do_compact`, before the table
+snapshot). A delete frees nothing until a compaction drops the value it killed
+and records the discard GC reads — and the memtable rotates only on size or on
+the WAL gap, so on an idle partition a few thousand deletes never leave it. A
+major compaction over SSTs alone then discarded nothing: measured on a real
+cluster, 270 deleted 64 MiB values sat unreclaimable indefinitely
+(`kept=256, discarded=0`), and the same compaction after a forced rotation
+discarded all 540 entries and GC reclaimed the 16 GiB extent unattended. A major
+compaction that is settling deletes also never skips on "fewer than 2 tables":
+a value and its delete flushed from one memtable are a single table, and only a
+major compaction drops that pair. Cost: every dispatched major now flushes, so
+one on a quiet partition with a non-empty memtable writes one more SST and
+rewrites it where it used to skip — bounded by the LSM size and by the
+compaction cooldown.
+
+`PartitionMetrics.unsettled_deletes` counts deletes no major compaction has
+covered: bumped per delete in Phase 3, seeded at open from the replayed
+memtable (`Memtable::tombstone_count`, one walk), and reduced on success by the
+count read in the same synchronous step as the flush's rotate — so deletes that
+land during the compaction stay counted. Deletes already flushed to an SST
+before a reopen are not re-counted (not persisted) — a restart, and also the
+reopen after a split or merge, whose freeze drain flushes. Such a partition
+settles only through another compaction; a merge of an emptied partition is
+vetoed by its phantom size until it settles, so that race is narrow. It ships as
+`PartitionLoad.unsettled_deletes`; the manager's policy advises the settling
+major compaction from it (manager guide, "Policy engine").
+
+**The discard map always gets an output table.** `do_compact` seeds `discards`
+from the INPUT tables' own maps and the swap removes those tables, so a map that
+does not ride out on an output SST is gone for good. When every entry is dropped
+(a major compaction over a partition whose data was all deleted — exactly the
+one whose whole log is garbage) there used to be no output and the map was
+thrown away, taking the inputs' earlier discards with it. Now it gets an SST
+with no entries: seq 0, bloom with no key (point reads skip it before any
+block), zero blocks (iterators bounds-check `block_count()`). Its key bounds are
+empty, so both overlap checks — at open and in split's re-evaluation — skip
+block-less SSTs; otherwise the empty key reads as out of every range and splits
+are refused. `sstable::reader::discards_only_tests`,
+`crates/manager/tests/system_compact_settles_deletes.rs` (reopen included).
+
 ### `do_compact` Logic (streaming)
 ```
   1. Read lock: collect SstReaders for selected tables, sort newest-first by last_seq
@@ -1829,9 +1870,11 @@ Three fixes bound the restart replay window (worst case per partition =
    size-tiered paths before modifying compaction selection.
 
 3. **Discard map pipeline**: compaction drops a VP entry → accumulates size in a local
-   `discard` map → attaches to the last output SST's MetaBlock → persisted to
-   metaStream → aggregated by GC from all SstReaders. Break any link and GC won't
-   collect dead VP data.
+   `discard` map → attaches to the last output SST's MetaBlock (an entry-less SST
+   when nothing was kept) → persisted to metaStream → aggregated by GC from all
+   SstReaders. Break any link and GC won't collect dead VP data. Upstream of all
+   of it: a delete still in the memtable is invisible to compaction, which is why
+   a major compaction flushes first.
 
 4. **`has_overlap` blocks split but not reads** — `range()` with `has_overlap` set
    range-filters; `get()` does NOT filter (point lookups are exact). Write it ONLY
@@ -1929,6 +1972,7 @@ Three fixes bound the restart replay window (worst case per partition =
     `pending_compaction_bytes` (each compact tick: total SST bytes if `has_overlap==1`,
     else `pickup_tables` output), `gc_inflight` / `compact_inflight` (0/1 around the
     awaits), `last_gc_at` / `last_compact_at` (unix-epoch, drives per-kind cooldown),
+    `unsettled_deletes` (deletes no major compaction has covered — see Compaction),
     and `has_overlap` — the cross-thread mirror of the partition thread's `Cell`, which
     `PartitionData::set_has_overlap` keeps in step. It ships because the manager's
     split/merge advisories must not propose an op `handle_split_part` will refuse; the
