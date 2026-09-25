@@ -1,3 +1,10 @@
+Date: 2026-09-25 (10)
+TaskStatus: not_completed
+Task scope: F-SPLIT-ADVICE-COUNTS-UNRECLAIMED real-cluster check (emptied cluster + armed auto-policy).
+Current summary: zero split advice holds; est_live does NOT fall — deletes on an idle partition never reach GC (tombstones stay in the memtable; no time-based flush; compaction advisories sized by LSM bytes). Forced rotation + compaction proved the rest of the chain works unattended. Details in the feature_list entry.
+Main gaps: the fix needs a design decision (idle flush + compaction trigger) — asked the user. Test cluster still up at AUTUMN_DATA_ROOT=/data05/autumn-splitphantom (ports 21001-3, manager 9001); /data05/v64.splitphantom is a 64 MiB scratch file.
+Next steps: implement the chosen fix, redo the emptied-cluster run.
+
 Date: 2026-09-25 (9)
 TaskStatus: completed
 Task scope: "清理feature list" — feature_list.md holds the open backlog only; entries that reached passes: true had been left in.

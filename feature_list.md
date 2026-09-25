@@ -404,6 +404,22 @@
   16 GiB extent / 2.4 GiB dead / ratio 0.15 被绝对臂选中并回收,`gc_debt` 归零)。
   于是本条 Scope 1 说的"复验 `est_live` 会不会跟着掉下来"**现在可以做了** ——
   仍未做,它需要的是一个刚删空的集群 + armed auto-policy 跑满一个周期。
+  **真集群复验(2026-09-25)：验收前半过，后半不过；根因不是 split 判据，是删除到不了 GC。**
+  3 EN + 真 etcd，默认配置(16 GiB extent)，单分区，`aggressive --arm`。写 270×64 MiB + 200 个
+  48 KiB 文档，然后删掉全部 270 个大 value：
+  - 删后 7 分钟、7 个 policy 周期:**零 split 建议**(验收前半成立)；但 `est_live` 恒为
+    16.88 GiB 而 LSM 0.05 MiB(验收后半不成立)，且**没有任何候选** —— 不 GC、不 compact。
+  - 根因:270 个 tombstone 只在 memtable 里。memtable 只按大小或 2 GiB WAL 差轮转,
+    270 个小删除两样都够不着 ⇒ 永不 flush。此时手工 major compaction:`kept=256, discarded=0`
+    (SST 里只有 VP，没有 tombstone)。discard 只由 compaction 产生 ⇒ `gc_debt` 恒 0 ⇒ `est_live`
+    恒满 ⇒ 空间永不回收。flush 之后也还差一环:compaction 建议按 LSM 字节(major 4 GiB /
+    minor 512 MiB)，一个几 KB 的 tombstone SST 永远够不着。
+  - 对照:再写 34×64 MiB 触发 WAL 差轮转，手工 compact ⇒ `discarded=540`;随后无人值守
+    `gc_debt` 16 GiB → `est_live` 2.13 GiB(正是存活的 34×64 MiB) → 5 分钟后 armed 策略自行派 GC →
+    extent 8 被 punch。**下游全链路正常，缺的只是 flush 与 compaction 这两环。**
+  - 顺带:`autumn-client del` 对 `put-stream` 写入的 key 只删 28 字节 meta，4000+ chunk key
+    留存(SDK 有 `delete_stream`，CLI 没接)。第一次复验因此无效，已换单 key value 重做。
+  - Scope 2(改 split 判据)**不做** —— split 本就不读携带字节；要修的是"空闲分区的删除到不了 GC"。
 
 ### F-EC-STARVES-FOREGROUND-APPEND — 一个 EC 转换就能把前台写入饿到超时
 - **Trigger** (2026-09-11，追一次分区卡死时量到): 单个 16 GiB extent 的 EC 转换
