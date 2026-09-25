@@ -197,6 +197,7 @@ COPY --from=builder \
     /build/target/release/autumn-fuse \
     /build/target/release/memory-mcp \
     /build/target/release/autumn-s3 \
+    /build/target/release/migratev3_v4 \
     /usr/local/bin/
 COPY deploy/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
