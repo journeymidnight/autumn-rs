@@ -47,8 +47,13 @@ RUN if [ -n "$CARGO_MIRROR" ]; then \
 # go direct:
 #   --build-arg GITHUB_MIRROR=
 #
-# This whole block goes away with the patch section it exists for.
-ARG GITHUB_MIRROR=https://ghproxy.net/https://github.com/
+# The proxy must answer the git-upload-pack POST anonymously. ghproxy.net —
+# the proxy other pipelines in this account used — started returning 401 on
+# the POST while GET info/refs still answers 200: probes and ls-remote pass,
+# then every real fetch prompts for a username and dies (measured 2026-09-26;
+# ghfast.top and gh-proxy.com both answer 200). This whole block goes away
+# with the patch section it exists for.
+ARG GITHUB_MIRROR=https://ghfast.top/https://github.com/
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN if [ -n "$GITHUB_MIRROR" ]; then \
       git config --global url."$GITHUB_MIRROR".insteadOf https://github.com/ \
