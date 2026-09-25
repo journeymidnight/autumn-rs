@@ -3614,13 +3614,31 @@ autumnfs --manager $MGR ls /
 autumnfs --manager $MGR cat /some/file | sha256sum
 ```
 
-A new fs client against an unconverted tree refuses to start ("on-disk fs
-schema version 3 != supported 4"), and against an unstamped populated tree says
+A new fs client against an unconverted tree refuses to start ("on-disk fs schema
+version 3 != supported 4"), and against an unstamped populated tree says
 to run the converter — it never stamps over existing inodes. (A pre-release v4
 build did stamp v4 over an unstamped v3 tree; every new client then fails with
 "decode inode". Repair: put the stamp back to 3, then convert —
-`printf '\0\0\0\0\0\0\0\3' > v3; autumn-client --namespace fs put "$(printf '\x04schema_version')" v3`.) Delete the
-`migratev3_v4` bin once the one cluster is converted, as with `migratev0_v1`.
+`printf '\0\0\0\0\0\0\0\3' > v3; autumn-client --namespace fs put "$(printf '\x04schema_version')" v3`.) The converter ships in the image
+(Dockerfile COPY; added after the first rollout found it missing from
+/usr/local/bin) and stays until every cluster is on v4.
+
+Field notes from the wire-48 rollout (2026-09-26):
+
+- The converter needs an IP:port for --manager — `ClusterClient::connect` does
+  not resolve names ("invalid socket address syntax"). In k8s use the
+  `autumn-manager` Service's ClusterIP, or the pod IP.
+- The k8s fs clients fail LOUD and visibly: memory-mcp / code-index-mcp
+  crashloop with the 3 != 4 error above — that is the signal the tree is not
+  converted yet, not a new bug. Fix the tree, restart the pod.
+- After the stop-the-world the auto-policy's rebalance cooldown can hold every
+  partition on one PS indefinitely (REBALANCE candidate logged every tick,
+  `primary=0 secondary=0`, nothing moves). The unblock is the manual op, as
+  many times as it takes:
+  `autumn-op --manager $MGR --admin-token-file /etc/autumn/authz/admin.token rebalance --wait`
+  — each call moves up to 4; rerun until the per-PS counts differ by ≤1.
+  Convergence check (no two partitions share an address):
+  `autumn-op --manager $MGR info | awk '$1=="part" && $3=="ps" {print $4}' | sort | uniq -d`
 
 ## S3 gateway — reading and writing autumn over S3
 
