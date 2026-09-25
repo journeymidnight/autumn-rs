@@ -169,8 +169,9 @@ pub const MSG_POLL_INVALIDATIONS: u8 = 0x49;
 // ── R1 rolling upgrade: persisted cluster_version (design §3-R1) ──────────
 //
 // etcd key `autumn-rs/cluster_version`, ASCII decimal. GET servable from
-// any replica (replayed state). BUMP is leader-only, monotonic, exactly
-// +1, and capped at the manager's own WIRE_VERSION. Operators bump
+// any replica (replayed state). BUMP is leader-only, monotonic FORWARD
+// (a jump over several versions is fine — the latch is one-way, not
+// one-step), capped at the manager's own WIRE_VERSION. Operators bump
 // via `autumn-op upgrade-version` AFTER every member binary is upgraded;
 // new wire forms / persisted formats gate on the bumped value.
 pub const MSG_GET_CLUSTER_VERSION: u8 = 0x4A;

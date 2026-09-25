@@ -2758,8 +2758,9 @@ itself. See `crates/rpc/CLAUDE.md`.
 
 ```bash
 autumn-op cluster-version            # current gate + the cluster's wire version
-autumn-op upgrade-version [--to N]   # bump (default current+1) — run ONLY after
-                                     # EVERY member runs the new binary; not rollbackable
+autumn-op upgrade-version [--to N]   # bump (default current+1); a forward jump over
+                                     # several versions is one command, never backward — run
+                                     # ONLY after EVERY member runs the new binary; not rollbackable
 ```
 
 Manual verification (all on a fresh `cluster.sh reset 3`):
@@ -2977,10 +2978,10 @@ deliberate: there an in-place edit is the CORRECT answer (bump, stop the
 world), so a freeze would fire on every legitimate change and train the reflex
 of refreshing the record without looking — which is how the deleted fingerprint
 waved a real change through.
-Bump exactly ONCE per commit: `autumn-op upgrade-version` steps
-`cur + 1`, so skipping a number forces operators to run it twice for nothing.
-Rolling back a binary past a `cluster_version` bump is refused at manager
-startup (fail-closed in replay).
+Bump exactly ONCE per commit: `autumn-op upgrade-version` moves forward only
+(a jump over several missed bumps is one command — the latch is one-way, not
+one-step; backward is refused). Rolling back a binary past a `cluster_version`
+bump is refused at manager startup (fail-closed in replay).
 
 ## Direct read on EC extents
 

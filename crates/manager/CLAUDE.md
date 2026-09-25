@@ -1503,7 +1503,8 @@ before the listener binds.
 
 **`cluster_version`** (`autumn-rs/cluster_version`, ASCII decimal — deliberately not
 rkyv so it outlives serialization eras). CAS-imprinted to this binary's
-`WIRE_VERSION`; `bump_cluster_version` is leader-only, exactly current+1, capped at
+`WIRE_VERSION`; `bump_cluster_version` is leader-only, forward-only (a jump over
+several versions is one command — the latch is one-way, not one-step), capped at
 `WIRE_VERSION`, value-CAS'd. `parse_cluster_version` (the only decode point) is
 **fail-closed on rollback**: it refuses a persisted value above this binary's
 `WIRE_VERSION`, so through replay an old binary can't become leader after a bump.

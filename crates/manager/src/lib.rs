@@ -3066,12 +3066,19 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
     /// The etcd write is a value-CAS against the CURRENT version so two
     /// racing bumps can't both land (the loser sees the txn fail and
     /// re-reads).
+    ///
+    /// The latch is ONE-WAY, not one-STEP: any forward target within this
+    /// binary's WIRE_VERSION is accepted, so an operator catching up several
+    /// versions runs one command instead of a loop of cur+1 calls. Downward
+    /// and equal are refused — the latch exists to say "new formats are now
+    /// on disk", and old binaries must never come back past it.
     pub(crate) async fn bump_cluster_version(&self, to: u32) -> Result<u32, AppError> {
         self.ensure_leader()?;
         let cur = self.cluster_version.get();
-        if to != cur + 1 {
+        if to <= cur {
             return Err(AppError::Precondition(format!(
-                "cluster_version bump must be exactly current+1: current={cur}, requested={to}"
+                "cluster_version is a one-way latch and never moves back or stands still: \
+                 current={cur}, requested={to}"
             )));
         }
         if to > autumn_rpc::WIRE_VERSION {
@@ -9907,19 +9914,17 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("WIRE_VERSION"), "{err}");
 
-            // Simulate a cluster running one version behind this binary
+            // Simulate a cluster running several versions behind this binary
             // (the post-rolling-upgrade state where a bump is legal).
-            m.cluster_version.set(autumn_rpc::WIRE_VERSION - 1);
-            // Skip (+2) and same (+0) and backwards are all refused.
-            for bad in [
-                autumn_rpc::WIRE_VERSION + 1,
-                autumn_rpc::WIRE_VERSION - 1,
-                0,
-            ] {
+            m.cluster_version.set(autumn_rpc::WIRE_VERSION - 3);
+            // Same and backwards are refused: the latch is one-WAY, not
+            // one-STEP — a forward jump is the point.
+            for bad in [autumn_rpc::WIRE_VERSION - 3, autumn_rpc::WIRE_VERSION - 5] {
                 let err = m.bump_cluster_version(bad).await.unwrap_err();
-                assert!(err.to_string().contains("exactly current+1"), "{err}");
+                assert!(err.to_string().contains("one-way latch"), "{err}");
             }
-            // Exactly +1 (and within max) succeeds.
+            // A forward jump straight to this binary's max succeeds — no
+            // cur+1 loop required.
             let v = m
                 .bump_cluster_version(autumn_rpc::WIRE_VERSION)
                 .await

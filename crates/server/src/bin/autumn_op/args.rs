@@ -40,8 +40,9 @@ fn usage() -> ! {
     eprintln!("                               durable terminal history from etcd, newest first");
     eprintln!();
     eprintln!("upgrade versioning:");
-    eprintln!("  upgrade-version [--to N]     bump cluster_version (default current+1); run ONLY");
-    eprintln!("                               after every member binary is upgraded; not rollbackable");
+    eprintln!("  upgrade-version [--to N]     bump cluster_version to N (default current+1); forward jumps");
+    eprintln!("                               allowed, never backward; run ONLY after every member binary");
+    eprintln!("                               is upgraded; not rollbackable");
     eprintln!();
     eprintln!("node-lifecycle admin commands:");
     eprintln!("  fence-node <id> --reason \"...\" --by alice [--force]");

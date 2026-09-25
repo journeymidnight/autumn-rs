@@ -180,6 +180,7 @@ decode each other's bytes as garbage. Bump exactly once per commit
 
 Because `MgrNodeInfo` / `MgrNodeOverride` are persisted, changing their layout is
 a stop-world upgrade: stop every role, swap binaries, start, with no rollback
+(`autumn-op upgrade-version --to N` may jump straight to N; it never moves back).
 across the change. rkyv's decode is fail-loud, so an un-migrated old value
 refuses leadership rather than being mis-read — but note that M0 itself shipped
 NO migration for pre-`node_uuid` rows. Production etcd is never wiped, so a
