@@ -54,13 +54,10 @@ name = "autumn-s3"
 path = "src/bin/autumn_s3/main.rs"
 
 [dependencies]
-# autumnfs reuses the ungated `key` + `schema` modules. `default-features = false`
-# skips the fuser/libc/clap fuse-mount deps; we only need the bookkeeping
-# structs + KV-key encoders, no kernel-side FUSE plumbing.
-# `core` = the fuser-FREE filesystem layer (same one the PyO3 `autumn.Fs`
-# binding uses). `autumnfs` needs only key/schema/geom, which sit outside the
-# gate; `autumn-s3` reads through the full core.
-autumn-fuse = { path = "../fuse", default-features = false, features = ["core"] }
+# The `fs/` tree (the same layer the fuse mount and the PyO3 `autumn.Fs`
+# binding use): `autumnfs`, `autumn-s3`, `migratev3_v4` and `autumn-op`'s
+# stripe-geometry declaration. No kernel-mount code comes with it.
+autumn-fs = { path = "../fs" }
 # `autumn-s3` only. rustc never links an `--extern` crate a binary does not
 # reference, so the other six binaries in this package pay build time, not size
 # — measured on debug builds, where there is no LTO to credit for it.

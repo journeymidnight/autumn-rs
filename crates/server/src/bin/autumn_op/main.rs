@@ -2203,15 +2203,15 @@ async fn cmd_presplit(
     // fail-to-declare leaves boundaries with no declaration, i.e. silently
     // unstriped files forever — the exact failure class this feature removes.
     if let PresplitRule::FsLanes { lanes, .. } = rule {
-        let layout = autumn_fuse::schema::StripeLayout {
+        let layout = autumn_fs::schema::StripeLayout {
             lanes: *lanes,
-            unit_bytes: autumn_fuse::schema::MAX_EXTENT as u32,
+            unit_bytes: autumn_fs::schema::MAX_EXTENT as u32,
         };
         // `client` here is connect_raw (no binding), so the wire key carries the
         // `fs/` namespace prefix explicitly — same bytes a scoped fs client
         // produces from the relative `[0x04]stripe_geom`.
         let mut k = b"fs/".to_vec();
-        k.extend_from_slice(&autumn_fuse::key::stripe_geom_key());
+        k.extend_from_slice(&autumn_fs::key::stripe_geom_key());
         // UX-fix (M5): read-before-write guard. The declared geometry is
         // now the sole authority for every future file's stripe width, and this
         // put OVERWRITES it. A stray `presplit --namespace fs --lanes 2` would
@@ -2224,7 +2224,7 @@ async fn cmd_presplit(
             .await
             .map_err(|e| anyhow!("presplit: read existing stripe geometry: {e}"))?
         {
-            if let Ok(existing) = autumn_fuse::schema::decode_stripe_geom(&existing_bytes) {
+            if let Ok(existing) = autumn_fs::schema::decode_stripe_geom(&existing_bytes) {
                 if *lanes < existing.lanes && !force {
                     bail!(
                         "presplit --namespace fs --lanes {lanes}: fs already declares {} lanes — \
@@ -2236,7 +2236,7 @@ async fn cmd_presplit(
             }
         }
         client
-            .put(&k, &autumn_fuse::schema::encode_stripe_geom(&layout))
+            .put(&k, &autumn_fs::schema::encode_stripe_geom(&layout))
             .await
             .map_err(|e| anyhow!("presplit: declare fs stripe geometry: {e}"))?;
         if !json {

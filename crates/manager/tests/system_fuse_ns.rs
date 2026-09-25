@@ -30,8 +30,8 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 
-use autumn_fuse::state::FsState;
-use autumn_fuse::{dispatch, meta, read, write};
+use autumn_fs::state::FsState;
+use autumn_fs::{meta, read, write};
 
 use support::*;
 
@@ -102,7 +102,7 @@ fn cold_remount_reads_back_written_extents() {
             let mut state = FsState::new(&mgr)
                 .await
                 .expect("mount1");
-            dispatch::init_root(&mut state).await.expect("init_root");
+            meta::ensure_root(&mut state).await.expect("init_root");
             meta::put_inode(&mut state, ino, &meta::new_file_meta(0o644, 0, 0))
                 .await
                 .expect("put_inode");
@@ -119,7 +119,7 @@ fn cold_remount_reads_back_written_extents() {
             .await
             .expect("mount2");
         // init_root is idempotent — root already exists, this is a no-op.
-        dispatch::init_root(&mut state2).await.expect("init_root2");
+        meta::ensure_root(&mut state2).await.expect("init_root2");
         let back = read::read(&mut state2, ino, 0, total as u32)
             .await
             .expect("cold read");
@@ -153,8 +153,8 @@ fn readdir_pages_past_one_range_page() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 139, 13901).await;
         let mut state = FsState::new(&mgr_addr.to_string()).await.expect("mount");
-        dispatch::init_root(&mut state).await.expect("init_root");
-        let (dir, _) = autumn_fuse::dir::mkdir(&mut state, 1, std::ffi::OsStr::new("big"), 0o755)
+        meta::ensure_root(&mut state).await.expect("init_root");
+        let (dir, _) = autumn_fs::dir::mkdir(&mut state, 1, std::ffi::OsStr::new("big"), 0o755)
             .await
             .expect("mkdir");
 
@@ -163,13 +163,13 @@ fn readdir_pages_past_one_range_page() {
         let mut names: Vec<String> = (0..4300).map(|i| format!("f{i:05}")).collect();
         names.extend(["p", "p0", "p00", "p000"].map(String::from));
         names.sort();
-        let dv = autumn_fuse::schema::encode_dirent(&autumn_fuse::schema::DirentValue {
+        let dv = autumn_fs::schema::encode_dirent(&autumn_fs::schema::DirentValue {
             child_inode: 7,
-            file_type: autumn_fuse::schema::DT_REG,
+            file_type: autumn_fs::schema::DT_REG,
         });
         let keys: Vec<Vec<u8>> = names
             .iter()
-            .map(|n| autumn_fuse::key::dirent_key(dir, n.as_bytes()))
+            .map(|n| autumn_fs::key::dirent_key(dir, n.as_bytes()))
             .collect();
         let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
             .iter()
@@ -179,7 +179,7 @@ fn readdir_pages_past_one_range_page() {
             r.expect("put dirent");
         }
 
-        let all = autumn_fuse::dir::readdir(&mut state, dir, 0).await.expect("readdir");
+        let all = autumn_fs::dir::readdir(&mut state, dir, 0).await.expect("readdir");
         let got: Vec<String> = all.iter().skip(2).map(|e| e.name.to_string_lossy().into_owned()).collect();
         assert_eq!(got, names, "unbounded readdir lists every entry once, in order");
         let offsets: Vec<i64> = all.iter().map(|e| e.offset).collect();
@@ -188,7 +188,7 @@ fn readdir_pages_past_one_range_page() {
         for (batch, take) in [(256usize, 100usize), (4096, 4096), (97, 97), (5000, 4095)] {
             let (mut seen, mut offset) = (Vec::new(), 0i64);
             loop {
-                let page = autumn_fuse::dir::readdir_bounded(&mut state, dir, offset, batch)
+                let page = autumn_fs::dir::readdir_bounded(&mut state, dir, offset, batch)
                     .await
                     .expect("readdir_bounded");
                 assert!(page.len() <= batch);
@@ -227,11 +227,11 @@ fn an_unstamped_populated_tree_is_refused_not_stamped() {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 140, 14001).await;
         let mut state = FsState::new(&mgr_addr.to_string()).await.expect("mount");
         // Some inode, as an unstamping tool would have left it.
-        state.kv_put(&autumn_fuse::key::inode_key(1), b"v3 bytes").await.unwrap();
+        state.kv_put(&autumn_fs::key::inode_key(1), b"v3 bytes").await.unwrap();
         let err = meta::ensure_root(&mut state).await.expect_err("must refuse");
         assert!(err.to_string().contains("no schema stamp"), "{err}");
         assert_eq!(
-            state.kv_get_opt(&autumn_fuse::key::schema_version_key()).await.unwrap(),
+            state.kv_get_opt(&autumn_fs::key::schema_version_key()).await.unwrap(),
             None,
             "nothing stamped"
         );

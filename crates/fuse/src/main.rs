@@ -16,8 +16,8 @@ use tracing_subscriber::EnvFilter;
 use autumn_fuse::bridge::FuseBridge;
 use autumn_fuse::dispatch;
 use autumn_fuse::ops::AutumnFs;
-use autumn_fuse::state::FsState;
-use autumn_fuse::write;
+use autumn_fs::state::FsState;
+use autumn_fs::write;
 
 #[derive(Parser)]
 #[command(
@@ -385,10 +385,10 @@ fn main() -> Result<()> {
 async fn periodic_sync(state: &mut FsState) {
     // Unreachable inodes whose data waited for another client to let go.
     // Cheap when there are none: one empty range scan.
-    if let Err(e) = autumn_fuse::extent::sweep_unlink_tombstones(state).await {
+    if let Err(e) = autumn_fs::extent::sweep_unlink_tombstones(state).await {
         tracing::warn!(error = %e, "periodic sync: tombstone sweep failed");
     }
-    if let Err(e) = autumn_fuse::segment::sweep_garbage(state).await {
+    if let Err(e) = autumn_fs::segment::sweep_garbage(state).await {
         tracing::warn!(error = %e, "periodic sync: segment garbage sweep failed");
     }
     let dirty: Vec<u64> = state.dirty_inodes.iter().copied().collect();

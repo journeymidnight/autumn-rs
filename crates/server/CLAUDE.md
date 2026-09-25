@@ -166,8 +166,8 @@ autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
           [--direct-read true|false]
 ```
 
-- Reads go through `autumn-fuse`'s `core` layer — the same one the PyO3
-  `autumn.Fs` binding uses — so lane striping, EN-direct reads and authz apply
+- Reads go through `autumn-fs` — the same crate the fuse mount and the PyO3
+  `autumn.Fs` binding use — so lane striping, EN-direct reads and authz apply
   unchanged. An adapter over the partition layer, not a second data plane.
 - `--workers` (default `min(cores, 8)`) accept threads, each with its own compio
   runtime, its own `FsState` and an SO_REUSEPORT listener on the same port. One

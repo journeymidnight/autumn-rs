@@ -45,7 +45,7 @@ cargo test -p autumn-transport --features ucx --test init
 cargo test -p autumn-client --lib
 cargo test -p autumn-partition-server --lib
 cargo test -p autumn-stream --test extent_pipeline --test extent_append_semantics
-cargo test -p autumn-fuse --lib
+cargo test -p autumn-fs -p autumn-fuse --lib
 cargo test -p autumn-manager --test system_fuse_read --test system_fuse_ns -- --include-ignored --test-threads=1
 
 # Requires a registered bench namespace. Load the fixed 256-key set once.
@@ -53,7 +53,7 @@ cargo bench -p autumn-server --features ucx --bench core_path -- 127.0.0.1:29001
 cargo bench -p autumn-server --features ucx --bench core_path -- 127.0.0.1:29001 tcp 8388608 8 8 write
 cargo bench -p autumn-server --features ucx --bench core_path -- 127.0.0.1:29001 tcp 8388608 8 8 read
 cargo bench -p autumn-server --features ucx --bench core_path -- 127.0.0.1:29001 tcp 8388608 8 8 direct
-cargo bench -p autumn-fuse --bench read_plan -- 127.0.0.1:29001 2000
+cargo bench -p autumn-fs --bench read_plan -- 127.0.0.1:29001 2000
 ```
 
 For UCX use the RoCE address, `ucx` argument and explicitly pinned `UCX_NET_DEVICES`;
@@ -610,7 +610,7 @@ client-reachable each item falls back to the proxy and the client logs one WARN.
 
 ## Python `autumn.Fs` — shared inode-layout binding
 
-`autumn.Fs` is a PyO3 binding over the **same** fuser-free FS core the
+`autumn.Fs` is a PyO3 binding over the **same** `autumn-fs` crate the
 `autumn-fuse` mount runs on (inode/dirent/extent layout) — it's the programmatic
 file surface (the `autumn-s3` gateway reads model weights through it). Headless
 correctness (self-contained isolated memory-mode cluster — builds the wheel,

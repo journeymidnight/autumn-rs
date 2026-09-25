@@ -4,7 +4,7 @@
 # Deterministically reproduces / guards against the autumn-fuse RMW corruption:
 # a PARTIAL in-place overwrite (a write whose offset lands INSIDE an existing
 # extent) must read-modify-write that extent's value
-# (`crates/fuse/src/extent.rs::write_region`). If that read (`kv_get`) hard-
+# (`crates/fs/src/extent.rs::write_region`). If that read (`kv_get`) hard-
 # errors during a brief PS unavailability and the error is SWALLOWED
 # (`unwrap_or_default`), the code zero-fills the untouched prefix, TRUNCATES the
 # untouched suffix, and `put`s the result — fabricating zeros / dropping bytes

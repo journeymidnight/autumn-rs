@@ -25,9 +25,9 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 
-use autumn_fuse::schema::WRITE_BUF_CAP;
-use autumn_fuse::state::FsState;
-use autumn_fuse::{dispatch, meta, read, write};
+use autumn_fs::schema::WRITE_BUF_CAP;
+use autumn_fs::state::FsState;
+use autumn_fs::{meta, read, write};
 
 use support::*;
 
@@ -65,7 +65,7 @@ fn a_logging_only_caller_must_not_eat_the_sticky_flush_error() {
         let mut state = FsState::new(&mgr_addr.to_string())
             .await
             .expect("FsState::new");
-        dispatch::init_root(&mut state).await.expect("init_root");
+        meta::ensure_root(&mut state).await.expect("init_root");
         // The sticky record only arises on the mount's pipelined path, which is
         // the only front-end with the dispatcher drain that makes it safe.
         state.pipelined_writes = true;
@@ -169,7 +169,7 @@ fn the_read_after_write_barrier_must_not_eat_the_sticky_flush_error() {
         let mut state = FsState::new(&mgr_addr.to_string())
             .await
             .expect("FsState::new");
-        dispatch::init_root(&mut state).await.expect("init_root");
+        meta::ensure_root(&mut state).await.expect("init_root");
         state.pipelined_writes = true;
 
         let ino = 1000u64;
@@ -280,7 +280,7 @@ fn the_write_path_flushes_must_not_eat_the_sticky_flush_error() {
         let mut state = FsState::new(&mgr_addr.to_string())
             .await
             .expect("FsState::new");
-        dispatch::init_root(&mut state).await.expect("init_root");
+        meta::ensure_root(&mut state).await.expect("init_root");
         state.pipelined_writes = true;
 
         let ino = 1100u64;

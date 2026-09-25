@@ -244,11 +244,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "autumn-fs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "autumn-client",
+ "autumn-rpc",
+ "bytes",
+ "compio",
+ "crc32c",
+ "libc",
+ "rkyv",
+ "tracing",
+]
+
+[[package]]
 name = "autumn-fuse"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "autumn-client",
+ "autumn-fs",
  "autumn-rpc",
  "autumn-transport",
  "bytes",
@@ -273,6 +289,7 @@ dependencies = [
  "autumn-client",
  "autumn-common",
  "autumn-etcd",
+ "autumn-fs",
  "autumn-fuse",
  "autumn-partition-server",
  "autumn-rpc",
@@ -354,7 +371,7 @@ dependencies = [
  "anyhow",
  "autumn-client",
  "autumn-common",
- "autumn-fuse",
+ "autumn-fs",
  "autumn-manager",
  "autumn-partition-server",
  "autumn-rpc",

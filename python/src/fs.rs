@@ -1,10 +1,9 @@
-//! Python binding for the shared FUSE filesystem core (`autumn.Fs`).
+//! Python binding for the shared filesystem (`autumn.Fs`).
 //!
-//! M2. A SYNCHRONOUS, blocking façade over the fuser-FREE FS core
-//! (`autumn_fuse` built with `--features core`): meta/dir/extent/read/write ops
-//! on the shared inode layout (`0x01` inode / `0x02` dirent / `0x03` extent),
-//! plus the reusable `autumn_client::lease` primitives. This is the SAME Rust
-//! core the `autumn-fuse` kernel mount runs on — the logic is NOT reimplemented
+//! M2. A SYNCHRONOUS, blocking façade over `autumn-fs`: meta/dir/extent/read/
+//! write ops on the shared inode layout (`0x01` inode / `0x02` dirent / `0x03`
+//! extent), plus the reusable `autumn_client::lease` primitives. This is the
+//! SAME Rust code the `autumn-fuse` kernel mount runs on — the logic is NOT reimplemented
 //! in Python, so a file created through `Fs` is byte-identical through the mount
 //! (and vice versa), with no drift.
 //!
@@ -30,9 +29,9 @@
 use std::sync::Mutex;
 
 use autumn_client::lease::{self, AcquireResult, HeartbeatResult};
-use autumn_fuse::meta::{S_IFDIR, S_IFLNK, S_IFMT};
-use autumn_fuse::schema::{DT_DIR, DT_LNK, DT_REG};
-use autumn_fuse::state::{FsState, FuseLease};
+use autumn_fs::meta::{S_IFDIR, S_IFLNK, S_IFMT};
+use autumn_fs::schema::{DT_DIR, DT_LNK, DT_REG};
+use autumn_fs::state::{FsState, FuseLease};
 use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
 use futures::channel::mpsc::{unbounded, UnboundedSender};
 use futures::future::LocalBoxFuture;
@@ -192,7 +191,7 @@ impl Fs {
                     state.direct_read = direct_read;
                     // Ensure the shared root inode exists (the fuse mount does
                     // this in its Init; the binding is a co-equal front-end).
-                    if let Err(e) = autumn_fuse::meta::ensure_root(&mut state).await {
+                    if let Err(e) = autumn_fs::meta::ensure_root(&mut state).await {
                         let _ = ready_tx.send(Err(format!("ensure_root: {e}")));
                         return;
                     }
@@ -201,7 +200,7 @@ impl Fs {
                     // heartbeat held write leases so a long write doesn't lose
                     // its lease, and poll invalidations so a preempted lease is
                     // marked revoked. Spawned on this worker's compio runtime.
-                    autumn_fuse::lease_tasks::spawn_lease_background_tasks(&state, None);
+                    autumn_fs::lease_tasks::spawn_lease_background_tasks(&state, None);
                     let _ = ready_tx.send(Ok(()));
                     // Sequential job processing: one `&mut FsState` borrow at a
                     // time (no concurrent borrow), so core ops that hold `&mut`
@@ -233,7 +232,7 @@ impl Fs {
     /// Resolve an absolute path to its inode number, or `None` if absent.
     fn resolve(&self, py: Python<'_>, path: String) -> PyResult<PyObject> {
         let r: Option<u64> = fs_blocking!(self, py, Option<u64>, |st| {
-            autumn_fuse::dir::resolve(st, &path)
+            autumn_fs::dir::resolve(st, &path)
                 .await
                 .map_err(|e| e.to_string())
         })?;
@@ -248,7 +247,7 @@ impl Fs {
     /// float seconds). Raises on a missing/unreadable inode.
     fn getattr(&self, py: Python<'_>, ino: u64) -> PyResult<PyObject> {
         let info: InodeInfo = fs_blocking!(self, py, InodeInfo, |st| {
-            autumn_fuse::meta::get_inode(st, ino)
+            autumn_fs::meta::get_inode(st, ino)
                 .await
                 .map(|m| InodeInfo {
                     ino,
@@ -281,7 +280,7 @@ impl Fs {
     /// `DT_DIR`=4, `DT_REG`=8, `DT_LNK`=10). `.`/`..` are excluded.
     fn readdir(&self, py: Python<'_>, ino: u64) -> PyResult<PyObject> {
         let entries: Vec<(String, u64, u8)> = fs_blocking!(self, py, Vec<(String, u64, u8)>, |st| {
-            autumn_fuse::dir::readdir(st, ino, 0)
+            autumn_fs::dir::readdir(st, ino, 0)
                 .await
                 .map(|es| {
                     es.into_iter()
@@ -314,7 +313,7 @@ impl Fs {
     fn lookup(&self, py: Python<'_>, parent: u64, name: String) -> PyResult<PyObject> {
         let r: Option<(u64, u8)> = fs_blocking!(self, py, Option<(u64, u8)>, |st| {
             let osname = std::ffi::OsStr::new(&name);
-            autumn_fuse::dir::lookup_opt(st, parent, osname)
+            autumn_fs::dir::lookup_opt(st, parent, osname)
                 .await
                 .map(|opt| opt.map(|(ino, meta)| (ino, kind_of(meta.mode))))
                 .map_err(|e| e.to_string())
@@ -340,7 +339,7 @@ impl Fs {
     fn mkdir(&self, py: Python<'_>, parent: u64, name: String, mode: u32) -> PyResult<u64> {
         fs_blocking!(self, py, u64, |st| {
             let osname = std::ffi::OsStr::new(&name);
-            autumn_fuse::dir::mkdir(st, parent, osname, mode)
+            autumn_fs::dir::mkdir(st, parent, osname, mode)
                 .await
                 .map(|(ino, _)| ino)
                 .map_err(|e| e.to_string())
@@ -352,7 +351,7 @@ impl Fs {
     fn create(&self, py: Python<'_>, parent: u64, name: String, mode: u32) -> PyResult<u64> {
         fs_blocking!(self, py, u64, |st| {
             let osname = std::ffi::OsStr::new(&name);
-            autumn_fuse::dir::create(st, parent, osname, mode)
+            autumn_fs::dir::create(st, parent, osname, mode)
                 .await
                 .map(|(ino, _)| ino)
                 .map_err(|e| e.to_string())
@@ -363,7 +362,7 @@ impl Fs {
     fn unlink(&self, py: Python<'_>, parent: u64, name: String) -> PyResult<()> {
         fs_blocking!(self, py, (), |st| {
             let osname = std::ffi::OsStr::new(&name);
-            autumn_fuse::dir::unlink(st, parent, osname)
+            autumn_fs::dir::unlink(st, parent, osname)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -373,7 +372,7 @@ impl Fs {
     fn rmdir(&self, py: Python<'_>, parent: u64, name: String) -> PyResult<()> {
         fs_blocking!(self, py, (), |st| {
             let osname = std::ffi::OsStr::new(&name);
-            autumn_fuse::dir::rmdir(st, parent, osname)
+            autumn_fs::dir::rmdir(st, parent, osname)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -391,7 +390,7 @@ impl Fs {
         fs_blocking!(self, py, (), |st| {
             let on = std::ffi::OsStr::new(&old_name);
             let nn = std::ffi::OsStr::new(&new_name);
-            autumn_fuse::dir::rename(st, old_parent, on, new_parent, nn)
+            autumn_fs::dir::rename(st, old_parent, on, new_parent, nn)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -402,7 +401,7 @@ impl Fs {
     /// Read up to `size` bytes at `offset` from inode `ino`.
     fn read(&self, py: Python<'_>, ino: u64, offset: i64, size: u32) -> PyResult<PyObject> {
         let v: Vec<u8> = fs_blocking!(self, py, Vec<u8>, |st| {
-            autumn_fuse::read::read(st, ino, offset, size)
+            autumn_fs::read::read(st, ino, offset, size)
                 .await
                 .map_err(|e| e.to_string())
         })?;
@@ -436,7 +435,7 @@ impl Fs {
             // stack for this whole blocking call; the worker holds the only
             // `&mut` to that memory while the caller is parked in `recv_block`.
             let dest = unsafe { std::slice::from_raw_parts_mut(dest_ptr as *mut u8, dest_len) };
-            autumn_fuse::read::read_into(st, ino, offset, dest)
+            autumn_fs::read::read_into(st, ino, offset, dest)
                 .await
                 .map_err(|e| e.to_string())
         })
@@ -449,7 +448,7 @@ impl Fs {
             if lease_revoked(st, ino) {
                 Err(format!("write lease for ino {ino} was revoked"))
             } else {
-                autumn_fuse::write::write(st, ino, offset, &data)
+                autumn_fs::write::write(st, ino, offset, &data)
                     .await
                     .map_err(|e| e.to_string())
             }
@@ -474,10 +473,10 @@ impl Fs {
             if lease_revoked(st, ino) {
                 Err(format!("write lease for ino {ino} was revoked"))
             } else {
-                autumn_fuse::write::flush_inode(
+                autumn_fs::write::flush_inode(
                     st,
                     ino,
-                    autumn_fuse::write::FlushReport::ToApplication,
+                    autumn_fs::write::FlushReport::ToApplication,
                 )
                 .await
                 .map_err(|e| e.to_string())
@@ -491,7 +490,7 @@ impl Fs {
             if lease_revoked(st, ino) {
                 Err(format!("write lease for ino {ino} was revoked"))
             } else {
-                autumn_fuse::write::truncate(st, ino, size)
+                autumn_fs::write::truncate(st, ino, size)
                     .await
                     .map_err(|e| e.to_string())
             }
@@ -595,13 +594,13 @@ impl Fs {
                     // held: the same deferred reclaim the FUSE mount runs at
                     // last close. A conflict leaves it to a sweep.
                     Ok(_) if st.unlinked_open.remove(&ino) => {
-                        autumn_fuse::extent::reclaim_unreachable(st, ino)
+                        autumn_fs::extent::reclaim_unreachable(st, ino)
                             .await
                             .map(|_| ())
                             .map_err(|e| format!("reclaim ino {ino}: {e}"))
                     }
                     Ok(_) if st.segment_garbage.contains(&ino) => {
-                        autumn_fuse::segment::reclaim_live(st, ino)
+                        autumn_fs::segment::reclaim_live(st, ino)
                             .await
                             .map(|_| ())
                             .map_err(|e| format!("reclaim ino {ino}: {e}"))

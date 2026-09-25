@@ -27,9 +27,10 @@ use autumn_rpc::manager_rpc::{
     MgrClientId, LEASE_CLIENT_KIND_FUSE, LEASE_MODE_READ, LEASE_MODE_WRITE,
 };
 
-use autumn_fuse::schema::{self, DirentValue, DT_REG, ROOT_INO};
-use autumn_fuse::state::FsState;
-use autumn_fuse::{bridge, dispatch, key, meta};
+use autumn_fs::schema::{self, DirentValue, DT_REG, ROOT_INO};
+use autumn_fs::state::FsState;
+use autumn_fs::{key, meta};
+use autumn_fuse::{bridge, dispatch};
 
 use support::*;
 

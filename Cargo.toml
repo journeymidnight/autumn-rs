@@ -10,6 +10,7 @@ members = [
   "crates/client",
   "crates/transport",
   "crates/transport/ucx-sys-mini",
+  "crates/fs",
   "crates/fuse",
   "crates/autumn-memory",
   "examples/gallery",
@@ -25,6 +26,7 @@ default-members = [
   "crates/partition-server",
   "crates/server",
   "crates/client",
+  "crates/fs",
   "crates/fuse",
   "crates/autumn-memory",
 ]

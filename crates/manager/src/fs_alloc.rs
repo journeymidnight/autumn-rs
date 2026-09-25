@@ -82,8 +82,8 @@ pub(crate) fn valid_alloc_volume(v: &[u8]) -> bool {
 
 /// First allocatable inode number: fuse's `ROOT_INO` (1) is preassigned to
 /// the filesystem root and never allocated. Kept in sync with
-/// `autumn_fuse::schema::ROOT_INO` by value (a fuse dep here would invert
-/// the crate DAG).
+/// `autumn_fs::schema::ROOT_INO` by value (an fs dep here would invert the
+/// crate DAG).
 pub(crate) const FS_FIRST_ALLOCATABLE_INO: u64 = 2;
 
 /// CAS retry budget. Contention is per-batch (one grant per ~1000 inodes per

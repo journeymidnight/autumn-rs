@@ -80,13 +80,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "autumn-fuse"
+name = "autumn-fs"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "autumn-client",
  "autumn-rpc",
- "autumn-transport",
  "bytes",
  "compio",
  "crc32c",
@@ -100,7 +99,7 @@ name = "autumn-python"
 version = "0.1.0"
 dependencies = [
  "autumn-client",
- "autumn-fuse",
+ "autumn-fs",
  "autumn-rpc",
  "autumn-transport",
  "bytes",
@@ -120,6 +119,7 @@ dependencies = [
  "crc32c",
  "ed25519-dalek",
  "futures",
+ "libc",
  "rancor",
  "rkyv",
  "thiserror",

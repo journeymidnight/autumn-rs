@@ -11,9 +11,9 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 
-use autumn_fuse::schema::{SegmentMap, MAX_EXTENT};
-use autumn_fuse::state::FsState;
-use autumn_fuse::{dispatch, key, meta, read, segment, write};
+use autumn_fs::schema::{SegmentMap, MAX_EXTENT};
+use autumn_fs::state::FsState;
+use autumn_fs::{key, meta, read, segment, write};
 
 use support::*;
 
@@ -54,7 +54,7 @@ async fn hold_write(st: &mut FsState, ino: u64) -> u64 {
     };
     st.held_leases.borrow_mut().insert(
         ino,
-        autumn_fuse::state::FuseLease {
+        autumn_fs::state::FuseLease {
             writer_refs: 1,
             reader_refs: 0,
             mode: autumn_rpc::manager_rpc::LEASE_MODE_WRITE,
@@ -107,7 +107,7 @@ fn segmented_files_splice_read_page_and_reclaim() {
         let _admin = boot_cluster(mgr_addr, n1, n2, 141, 14101).await;
         let mgr = mgr_addr.to_string();
         let mut st = FsState::new(&mgr).await.expect("mount");
-        dispatch::init_root(&mut st).await.expect("init_root");
+        meta::ensure_root(&mut st).await.expect("init_root");
 
         let ino = 500u64;
         let mut m = meta::new_file_meta(0o644, 0, 0);
@@ -224,9 +224,9 @@ fn reclaim_waits_for_other_holders() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1, n2, 142, 14201).await;
         let mut st = FsState::new(&mgr_addr.to_string()).await.expect("mount");
-        dispatch::init_root(&mut st).await.expect("init_root");
+        meta::ensure_root(&mut st).await.expect("init_root");
         let name = std::ffi::OsStr::new("f");
-        let (ino, _) = autumn_fuse::dir::create(&mut st, 1, name, 0o644).await.expect("create");
+        let (ino, _) = autumn_fs::dir::create(&mut st, 1, name, 0o644).await.expect("create");
         let mut m = meta::get_inode(&mut st, ino).await.unwrap();
         m.segments = Some(SegmentMap::default());
         meta::put_inode(&mut st, ino, &m).await.unwrap();
@@ -237,8 +237,8 @@ fn reclaim_waits_for_other_holders() {
 
         // Unlinked while this session holds it: nothing goes until the last
         // close, and then everything does.
-        autumn_fuse::dir::link(&mut st, ino, 1, std::ffi::OsStr::new("g")).await.expect("second name");
-        autumn_fuse::dir::unlink(&mut st, 1, std::ffi::OsStr::new("g")).await.expect("drop a name");
+        autumn_fs::dir::link(&mut st, ino, 1, std::ffi::OsStr::new("g")).await.expect("second name");
+        autumn_fs::dir::unlink(&mut st, 1, std::ffi::OsStr::new("g")).await.expect("drop a name");
         let data_key0 = key::data_extent_key(s0.data_ino, 0, s0.lanes, s0.unit);
         assert!(st.kv_get_opt(&data_key0).await.unwrap().is_some());
         drop_write(&mut st, ino).await;
@@ -250,14 +250,14 @@ fn reclaim_waits_for_other_holders() {
             lease::acquire(&st.client, &reader, ino, autumn_rpc::manager_rpc::LEASE_MODE_READ).await.unwrap(),
             AcquireResult::Granted(_)
         ));
-        autumn_fuse::dir::unlink(&mut st, 1, name).await.expect("unlink");
+        autumn_fs::dir::unlink(&mut st, 1, name).await.expect("unlink");
         assert!(st.kv_get_opt(&data_key).await.unwrap().is_some(), "data kept while held");
         assert!(st.kv_get_opt(&tomb).await.unwrap().is_some(), "tombstone waits");
-        assert_eq!(autumn_fuse::extent::sweep_unlink_tombstones(&mut st).await.unwrap(), 0);
+        assert_eq!(autumn_fs::extent::sweep_unlink_tombstones(&mut st).await.unwrap(), 0);
         assert!(st.kv_get_opt(&data_key).await.unwrap().is_some(), "sweep defers too");
 
         lease::release(&st.client, &reader, ino).await.unwrap();
-        assert_eq!(autumn_fuse::extent::sweep_unlink_tombstones(&mut st).await.unwrap(), 1);
+        assert_eq!(autumn_fs::extent::sweep_unlink_tombstones(&mut st).await.unwrap(), 1);
         assert_eq!(st.kv_get_opt(&data_key).await.unwrap(), None, "data reclaimed");
         assert_eq!(st.kv_get_opt(&key::inode_key(ino)).await.unwrap(), None, "inode gone");
         assert_eq!(st.kv_get_opt(&tomb).await.unwrap(), None, "tombstone gone");
@@ -282,9 +282,9 @@ fn unlinked_while_open_here_is_reclaimed_at_last_close() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1, n2, 143, 14301).await;
         let mut st = FsState::new(&mgr_addr.to_string()).await.expect("mount");
-        dispatch::init_root(&mut st).await.expect("init_root");
+        meta::ensure_root(&mut st).await.expect("init_root");
         let name = std::ffi::OsStr::new("open-f");
-        let (ino, _) = autumn_fuse::dir::create(&mut st, 1, name, 0o644).await.expect("create");
+        let (ino, _) = autumn_fs::dir::create(&mut st, 1, name, 0o644).await.expect("create");
         let mut m = meta::get_inode(&mut st, ino).await.unwrap();
         m.segments = Some(SegmentMap::default());
         meta::put_inode(&mut st, ino, &m).await.unwrap();
@@ -294,16 +294,16 @@ fn unlinked_while_open_here_is_reclaimed_at_last_close() {
         let s0 = meta::get_inode(&mut st, ino).await.unwrap().segments.unwrap().inline[0].clone();
         let data_key = key::data_extent_key(s0.data_ino, 0, s0.lanes, s0.unit);
 
-        autumn_fuse::dir::unlink(&mut st, 1, name).await.expect("unlink");
+        autumn_fs::dir::unlink(&mut st, 1, name).await.expect("unlink");
         assert!(st.unlinked_open.contains(&ino));
         assert!(st.kv_get_opt(&data_key).await.unwrap().is_some(), "open here: data kept");
-        assert_eq!(autumn_fuse::extent::sweep_unlink_tombstones(&mut st).await.unwrap(), 0, "the sweep leaves it too");
+        assert_eq!(autumn_fs::extent::sweep_unlink_tombstones(&mut st).await.unwrap(), 0, "the sweep leaves it too");
         assert_eq!(read_all(&mut st, ino, model.len()).await, model, "still readable through the open handle");
 
         // The last close.
         drop_write(&mut st, ino).await;
         assert!(st.unlinked_open.remove(&ino));
-        assert!(autumn_fuse::extent::reclaim_unreachable(&mut st, ino).await.unwrap());
+        assert!(autumn_fs::extent::reclaim_unreachable(&mut st, ino).await.unwrap());
         assert_eq!(st.kv_get_opt(&data_key).await.unwrap(), None);
         assert_eq!(st.kv_get_opt(&key::inode_key(ino)).await.unwrap(), None);
     });
@@ -330,8 +330,8 @@ fn a_path_truncate_takes_its_own_lease() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1, n2, 144, 14401).await;
         let mut st = FsState::new(&mgr_addr.to_string()).await.expect("mount");
-        dispatch::init_root(&mut st).await.expect("init_root");
-        let (ino, _) = autumn_fuse::dir::create(&mut st, 1, std::ffi::OsStr::new("t"), 0o644).await.expect("create");
+        meta::ensure_root(&mut st).await.expect("init_root");
+        let (ino, _) = autumn_fs::dir::create(&mut st, 1, std::ffi::OsStr::new("t"), 0o644).await.expect("create");
         let mut m = meta::get_inode(&mut st, ino).await.unwrap();
         m.segments = Some(SegmentMap::default());
         meta::put_inode(&mut st, ino, &m).await.unwrap();
@@ -395,8 +395,8 @@ fn a_path_truncate_reads_the_map_under_its_lease() {
         let _admin = boot_cluster(mgr_addr, n1, n2, 145, 14501).await;
         let mgr = mgr_addr.to_string();
         let mut a = FsState::new(&mgr).await.expect("mount a");
-        dispatch::init_root(&mut a).await.expect("init_root");
-        let (ino, _) = autumn_fuse::dir::create(&mut a, 1, std::ffi::OsStr::new("s"), 0o644).await.expect("create");
+        meta::ensure_root(&mut a).await.expect("init_root");
+        let (ino, _) = autumn_fs::dir::create(&mut a, 1, std::ffi::OsStr::new("s"), 0o644).await.expect("create");
         let mut m = meta::get_inode(&mut a, ino).await.unwrap();
         m.segments = Some(SegmentMap::default());
         meta::put_inode(&mut a, ino, &m).await.unwrap();

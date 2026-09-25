@@ -1,3 +1,11 @@
+Date: 2026-09-25 (3)
+TaskStatus: completed
+Task scope: user decision — "用autumn-fs一个crate，另外是autumn-fuse和s3的依赖autumn-fs". Split the fuser-free filesystem layer (the old `core` feature of autumn-fuse) into its own crate before multipart goes in, since multipart and the S3 gateway have nothing to do with the kernel mount.
+Current summary: new crate `crates/fs` (autumn-fs): key/schema/geom/dir/extent/lease_tasks/meta/publish/read/segment/state/write + the read_plan bench, moved with git mv. autumn-fuse is mount-only (attr/bridge/dispatch/ops/read_pool/main), depends on autumn-fs, and lost its `core`/`fuse` features (`ucx` kept). autumn-server (autumnfs, autumn-s3, migratev3_v4, autumn-op) and the PyO3 binding depend on autumn-fs directly. Manager: autumn-fs is a dev-dependency; seven filesystem tests (system_publish, system_segmented, system_fuse_ns/read/eof_clobber/flush_error_sticky, bug_lease_3) no longer need `fuse-tests` or libfuse and call `meta::ensure_root` (what `dispatch::init_root` wrapped); only fuse_lease_1/2 and system_fuse_release_best_effort still need `fuse-tests`. crates/fuse/CLAUDE.md split into crates/fs/CLAUDE.md (filesystem sections moved verbatim) + a mount-only guide. python/Cargo.lock also picked up autumn-rpc's `libc`, which an earlier upstream commit had left stale.
+Verification: cargo check fs/fuse/server all-targets clean; fs 26 + fuse 42 unit tests pass (HEAD's crates/fuse had 68); manager tests compile with and without fuse-tests; python/ cargo check clean; the ten affected manager system tests pass with --include-ignored (60 tests). Independent review skipped on the user's instruction.
+Main gaps: none for the split. Multipart is next: the integrated draft is in `git stash` ("multipart WIP before autumn-fs split") and must be re-applied under crates/fs.
+Next steps: apply the multipart WIP to crates/fs, run system_multipart, commit.
+
 Date: 2026-09-25 (2)
 TaskStatus: not_completed
 Task scope: "fix F-DEAD-PEER-DETECT" — connections whose peer stopped answering while TCP looks healthy wedged fuse reads (30 s EIO for hours, 2026-09-22 incident).

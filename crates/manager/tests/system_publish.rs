@@ -1,4 +1,4 @@
-//! Whole-file publication (`autumn_fuse::publish`), the S3 gateway's PUT /
+//! Whole-file publication (`autumn_fs::publish`), the S3 gateway's PUT /
 //! Copy / delete core, against a live in-process cluster: conditional
 //! publish decided by the partition server, replaced files reclaimed, races
 //! on directory creation, a busy in-place writer refused, and a dead
@@ -13,9 +13,9 @@ use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::LEASE_MODE_WRITE;
 
-use autumn_fuse::publish::{self, Condition, NewFile, PublishError};
-use autumn_fuse::state::FsState;
-use autumn_fuse::{dir, dispatch, key, meta, read};
+use autumn_fs::publish::{self, Condition, NewFile, PublishError};
+use autumn_fs::state::FsState;
+use autumn_fs::{dir, key, meta, read};
 
 use support::*;
 
@@ -81,7 +81,7 @@ fn publish_conditions_replace_delete_and_dead_sessions() {
         let _admin = boot(mgr_addr, n1, n2, 151, 15101).await;
         let mgr = mgr_addr.to_string();
         let mut st = FsState::new(&mgr).await.expect("mount");
-        dispatch::init_root(&mut st).await.expect("init_root");
+        meta::ensure_root(&mut st).await.expect("init_root");
 
         // Nested directories, created by two sessions racing: one inode.
         let mut other = FsState::new(&mgr).await.expect("mount2");
@@ -155,7 +155,7 @@ fn publish_conditions_replace_delete_and_dead_sessions() {
         let own = put(&mut st, dir_ino, "own.lance", b"v1", Condition::None).await.unwrap();
         st.held_leases.borrow_mut().insert(
             own,
-            autumn_fuse::state::FuseLease { writer_refs: 1, reader_refs: 0, mode: LEASE_MODE_WRITE, lease_epoch: 1, revoked: false },
+            autumn_fs::state::FuseLease { writer_refs: 1, reader_refs: 0, mode: LEASE_MODE_WRITE, lease_epoch: 1, revoked: false },
         );
         assert!(matches!(put(&mut st, dir_ino, "own.lance", b"v2", Condition::None).await, Err(PublishError::Busy(_))));
         st.held_leases.borrow_mut().remove(&own);
@@ -210,7 +210,7 @@ fn a_retire_whose_swap_lost_leaves_a_linked_inode_alone() {
         let _admin = boot(mgr_addr, n1, n2, 152, 15201).await;
         let mgr = mgr_addr.to_string();
         let mut st = FsState::new(&mgr).await.expect("mount");
-        dispatch::init_root(&mut st).await.expect("init_root");
+        meta::ensure_root(&mut st).await.expect("init_root");
         let body = pattern(1 << 20, 7);
         let linked = put(&mut st, 1, "h", &body, Condition::None).await.unwrap();
         dir::link(&mut st, linked, 1, std::ffi::OsStr::new("h2")).await.expect("hard link");
@@ -222,8 +222,8 @@ fn a_retire_whose_swap_lost_leaves_a_linked_inode_alone() {
         let lease = publish::session_lease(&mut dead).await.unwrap();
         let s = lease.inode_hint;
         let never_published = meta::alloc_inode(&mut dead).await.unwrap();
-        let op = autumn_fuse::schema::PendingOp::Retire { parent: 1, name: b"h".to_vec(), ino: linked, successor: Some(never_published) };
-        dead.kv_put_fenced(&key::pending_key(s, linked), &autumn_fuse::schema::encode_pending(&op), lease).await.unwrap();
+        let op = autumn_fs::schema::PendingOp::Retire { parent: 1, name: b"h".to_vec(), ino: linked, successor: Some(never_published) };
+        dead.kv_put_fenced(&key::pending_key(s, linked), &autumn_fs::schema::encode_pending(&op), lease).await.unwrap();
         lease::release(&dead.client, &dead.client_id, s).await.unwrap();
 
         // Meanwhile another session replaced `h`, retiring `linked` once.

@@ -23,9 +23,9 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 
-use autumn_fuse::schema::MAX_EXTENT;
-use autumn_fuse::state::FsState;
-use autumn_fuse::{dispatch, extent, key, meta, read, write};
+use autumn_fs::schema::MAX_EXTENT;
+use autumn_fs::state::FsState;
+use autumn_fs::{extent, key, meta, read, write};
 
 use support::*;
 
@@ -83,7 +83,7 @@ fn variable_length_extents() {
         let mut state = FsState::new(&mgr_addr.to_string())
             .await
             .expect("FsState::new");
-        dispatch::init_root(&mut state).await.expect("init_root");
+        meta::ensure_root(&mut state).await.expect("init_root");
 
         // 10 MiB file → two variable-length extents: [0, 8 MiB) + [8 MiB, 10 MiB).
         let total = 10 * 1024 * 1024usize;
@@ -218,7 +218,7 @@ fn a_second_mount_sees_appended_data_on_a_linear_read() {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 137, 13701).await;
 
         let mut writer = FsState::new(&mgr_addr.to_string()).await.expect("writer mount");
-        dispatch::init_root(&mut writer).await.expect("init_root");
+        meta::ensure_root(&mut writer).await.expect("init_root");
         // The "other machine": its own FsState, its own caches.
         let mut reader = FsState::new(&mgr_addr.to_string()).await.expect("reader mount");
 

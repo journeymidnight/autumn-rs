@@ -1,0 +1,31 @@
+[package]
+name = "autumn-fs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The `fs/` tree itself: its key and value layout, namespace and data-path
+# operations, segmented files, whole-file publication and the publishing
+# sessions. No kernel-mount machinery: the fuse mount (`autumn-fuse`), the S3
+# gateway, `autumnfs` and the PyO3 `autumn.Fs` binding are all front-ends over
+# this one implementation.
+
+[[bench]]
+name = "read_plan"
+harness = false
+
+[dependencies]
+autumn-rpc = { path = "../rpc" }
+autumn-client = { path = "../client" }
+
+anyhow.workspace = true
+bytes.workspace = true
+tracing = "0.1"
+rkyv = { version = "0.8", features = ["alloc"] }
+crc32c.workspace = true
+# getuid/getgid for new inodes, and the S_IF* mode bits.
+libc = "0.2"
+# The core already runs on a compio runtime through ClusterClient; it also
+# spawns the per-session lease heartbeat/poll tasks (`lease_tasks`).
+compio = { workspace = true, features = ["runtime", "time", "io", "net"] }

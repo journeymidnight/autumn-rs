@@ -148,7 +148,7 @@ unsafe impl Send for FsRequest {}
 /// A single readdir entry. The struct lives in the
 /// fuser-free core (`schema::ReaddirEntry`, `kind` = `DT_*` byte);
 /// re-exported here so `bridge::ReaddirEntry` callers keep compiling.
-pub use crate::schema::ReaddirEntry;
+pub use autumn_fs::schema::ReaddirEntry;
 
 /// Simplified statfs data.
 pub struct StatfsData {

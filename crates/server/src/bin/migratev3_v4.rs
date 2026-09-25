@@ -22,8 +22,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use rkyv::{Archive, Deserialize, Serialize};
 
 use autumn_client::ClusterClient;
-use autumn_fuse::key;
-use autumn_fuse::schema::{self, InodeMeta, StripeLayout};
+use autumn_fs::key;
+use autumn_fs::schema::{self, InodeMeta, StripeLayout};
 
 /// `InodeMeta` as schema v3 stored it. rkyv's layout depends on the field
 /// list, not the type name, so this decodes v3 bytes exactly.
@@ -124,7 +124,7 @@ async fn run(c: &ClusterClient, dry_run: bool, unstamped_is_v3: bool) -> Result<
     let mut start = match c.get(&cursor_key()).await.map_err(|e| anyhow!("{e}"))? {
         Some(last) => {
             println!("resuming after {}", hex(&last));
-            autumn_fuse::dir::name_successor(&last)
+            autumn_fs::dir::name_successor(&last)
         }
         _ => prefix.clone(),
     };
@@ -156,7 +156,7 @@ async fn run(c: &ClusterClient, dry_run: bool, unstamped_is_v3: bool) -> Result<
         if !r.has_more {
             break;
         }
-        start = autumn_fuse::dir::name_successor(&last);
+        start = autumn_fs::dir::name_successor(&last);
     }
     if dry_run {
         println!("dry run: {converted} inodes decode as v3 and would convert; nothing written");

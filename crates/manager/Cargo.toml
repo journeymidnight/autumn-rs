@@ -34,9 +34,13 @@ send_wrapper = { version = "0.6", features = ["futures"] }
 serde_json = "1"
 tracing.workspace = true
 uuid.workspace = true
-autumn-fuse = { path = "../fuse", features = ["fuse"], optional = true }
+autumn-fuse = { path = "../fuse", optional = true }
 
 [dev-dependencies]
+# The `fs/` tree, for the filesystem, publish and multipart system tests. It
+# needs no libfuse, so those tests build everywhere; only the three that drive
+# the mount's dispatch loop need `fuse-tests`.
+autumn-fs = { path = "../fs" }
 autumn-stream = { path = "../stream" }
 autumn-partition-server = { path = "../partition-server" }
 autumn-client = { path = "../client" }
@@ -47,34 +51,6 @@ tempfile = "3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 crc32c = "0.6"
-
-[[test]]
-name = "system_fuse_flush_error_sticky"
-required-features = ["fuse-tests"]
-
-[[test]]
-name = "system_fuse_read"
-required-features = ["fuse-tests"]
-
-[[test]]
-name = "bug_lease_3_revoke_evicts"
-required-features = ["fuse-tests"]
-
-[[test]]
-name = "system_fuse_eof_clobber"
-required-features = ["fuse-tests"]
-
-[[test]]
-name = "system_fuse_ns"
-required-features = ["fuse-tests"]
-
-[[test]]
-name = "system_segmented"
-required-features = ["fuse-tests"]
-
-[[test]]
-name = "system_publish"
-required-features = ["fuse-tests"]
 
 [[test]]
 name = "fuse_lease_2"

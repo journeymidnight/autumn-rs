@@ -47,7 +47,7 @@ cargo test -p autumn-manager --test apply_done_atomicity -- --ignored --test-thr
 
 2026-09-21 的 Recovery/EC 提交回归覆盖：请求提交前及事务响应后创建字节相同的后继 marker，旧 apply 均不得改写内存或删除后继；真实 etcd 删除并重建相同 marker 后 revision CAS 拒绝旧 EC apply；Recovery marker 清理失败时保留内存状态，下一 dispatch tick 无需 leader 切换即可重试成功。
 
-该命令运行非 ignored 的 checker 和定向测试，不等于运行完整 chaos。FUSE 专属测试需要系统 FUSE 开发库，并显式加 `--features fuse-tests`；CI 保留此 feature 的编译和运行覆盖。
+该命令运行非 ignored 的 checker 和定向测试，不等于运行完整 chaos。驱动挂载派发循环的三个测试（`fuse_lease_1`、`fuse_lease_2`、`system_fuse_release_best_effort`）需要系统 FUSE 开发库，并显式加 `--features fuse-tests`；其余文件系统测试只依赖 `autumn-fs`，不需要；CI 保留此 feature 的编译和运行覆盖。
 
 Recovery attempt / Fence / Remove 的 wire-46 验证入口：
 
@@ -64,7 +64,7 @@ macOS 本地编译需要 macFUSE 的库/头文件和 pkg-config 工具。安装 
 pkg-config --modversion fuse
 pkg-config --libs --cflags fuse
 cargo check --workspace --lib --bins --tests --features autumn-manager/fuse-tests
-cargo test -p autumn-fuse --lib
+cargo test -p autumn-fs -p autumn-fuse --lib
 ~~~
 
 macFUSE 的 fuse.pc 默认位于 /usr/local/lib/pkgconfig，Homebrew pkgconf 的默认

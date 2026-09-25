@@ -50,7 +50,7 @@ use futures::StreamExt;
 use autumn_client::ClusterClient;
 
 use crate::bridge::REPLY_TIMEOUT;
-use crate::read::{self, ChunkSpec, ReadPlan};
+use autumn_fs::read::{self, ChunkSpec, ReadPlan};
 
 /// How long to wait for a worker to connect before mounting without it. The
 /// mount is already live at that point — see the note in `ReadPool::new`.

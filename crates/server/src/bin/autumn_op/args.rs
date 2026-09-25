@@ -1915,7 +1915,7 @@ pub(crate) fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Split keys aimed at the autumn-fuse keyspace
-/// (`crates/fuse/src/key.rs` — `[0x01]inode_meta`, `[0x02]dirent`,
+/// (`crates/fs/src/key.rs` — `[0x01]inode_meta`, `[0x02]dirent`,
 /// `[0x03]file_extent`, `[0x04]super`). The bulk of fuse data is
 /// the `[0x03][ino BE][logical_off BE]` file extents — they outsize
 /// the other prefixes by orders of magnitude on real model-serving

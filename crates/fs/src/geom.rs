@@ -7,10 +7,8 @@
 //! autonomously — so deriving a durable per-file property from a mutable
 //! placement artifact drifted silently.
 //!
-//! This module is UNGATED (like `key` / `schema`) so `autumnfs`, which imports
-//! `autumn-fuse` with `default-features = false` to skip the fuser/libc
-//! kernel-side deps, shares the exact same reader as the mount. One
-//! implementation, no drift — the duplication this replaces is what let the CLI
+//! `autumnfs` shares this exact reader with the mount. One implementation, no
+//! drift — the duplication this replaces is what let the CLI
 //! hardcode the wire prefix `b"fs/"`, a byte string that has already changed
 //! twice (tenant-first, then Option 3).
 //!

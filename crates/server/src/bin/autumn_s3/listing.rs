@@ -22,8 +22,8 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
 use anyhow::Result;
-use autumn_fuse::dir::DirChild;
-use autumn_fuse::schema::{DT_DIR, DT_REG};
+use autumn_fs::dir::DirChild;
+use autumn_fs::schema::{DT_DIR, DT_REG};
 
 /// Where the walk reads directories from.
 pub trait DirSource {
@@ -303,7 +303,7 @@ mod tests {
                 .collect();
             self.scanned += out.len();
             let resume = (out.len() == limit as usize)
-                .then(|| autumn_fuse::dir::name_successor(&out.last().expect("full").name));
+                .then(|| autumn_fs::dir::name_successor(&out.last().expect("full").name));
             if std::mem::take(&mut self.vanish_next_scan) {
                 return Ok((Vec::new(), resume));
             }

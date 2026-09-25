@@ -56,7 +56,7 @@ RUN if [ -n "$GITHUB_MIRROR" ]; then \
     fi
 # libfuse3-dev + pkg-config are for `-p autumn-fuse`, which builds the MOUNT
 # binary (fuser 0.15 links libfuse3). autumn-server alone would not need them —
-# it pulls autumn-fuse with default-features = false (key/schema modules only) —
+# it depends on autumn-fs, which has no libfuse dependency —
 # but the fuse daemon is now shipped so a consumer pod can mount the `fs/`
 # namespace as a POSIX filesystem (docs/ops.md "Fuse daemon runbook").
 # Optional Debian mirror for the apt steps in this stage. Empty (default) →
@@ -90,7 +90,7 @@ COPY . .
 # autumn-dashboard is the standalone web UI (examples/dashboard); it embeds its
 # HTML via include_str!, so the binary alone is self-contained, and it drives the
 # cluster only through the autumn-op we already ship.
-# autumn-fuse is the FUSE mount daemon (default features = the `fuse` feature).
+# autumn-fuse is the FUSE mount daemon.
 # memory-mcp is the stdio MCP server over autumn-memory; it ships so an agent
 # pod (hermes) can register it as a local stdio MCP server instead of needing a
 # long-running HTTP/SSE MCP daemon (docs/autumn_memory_plan.md §12).

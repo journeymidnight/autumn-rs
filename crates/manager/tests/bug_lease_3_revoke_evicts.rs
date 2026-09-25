@@ -27,8 +27,8 @@ use autumn_rpc::manager_rpc::{
     MgrClientId, LEASE_CLIENT_KIND_FUSE, LEASE_INVAL_LEASE_REVOKED, LEASE_MODE_WRITE,
 };
 
-use autumn_fuse::dispatch::evict_revoked_held_leases;
-use autumn_fuse::state::FuseLease;
+use autumn_fs::lease_tasks::evict_revoked_held_leases;
+use autumn_fs::state::FuseLease;
 
 use support::pick_addr;
 

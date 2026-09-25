@@ -26,9 +26,9 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 
-use autumn_fuse::schema::{self, WRITE_BUF_CAP};
-use autumn_fuse::state::FsState;
-use autumn_fuse::{dispatch, key, meta, read, write};
+use autumn_fs::schema::{self, WRITE_BUF_CAP};
+use autumn_fs::state::FsState;
+use autumn_fs::{key, meta, read, write};
 
 use support::*;
 
@@ -73,7 +73,7 @@ fn eof_read_must_not_clobber_unpublished_size() {
         let mut state = FsState::new(&mgr_addr.to_string())
             .await
             .expect("FsState::new");
-        dispatch::init_root(&mut state).await.expect("init_root");
+        meta::ensure_root(&mut state).await.expect("init_root");
 
         let ino = 700u64;
         let m = meta::new_file_meta(0o644, 0, 0);

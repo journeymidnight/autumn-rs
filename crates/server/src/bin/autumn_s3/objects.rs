@@ -8,11 +8,11 @@
 use std::rc::Rc;
 
 use anyhow::{anyhow, Result};
-use autumn_fuse::dir::DirChild;
-use autumn_fuse::read::{self, ReadPlan};
-use autumn_fuse::schema::{self, DT_DIR};
-use autumn_fuse::state::FsState;
-use autumn_fuse::{dir, key, meta};
+use autumn_fs::dir::DirChild;
+use autumn_fs::read::{self, ReadPlan};
+use autumn_fs::schema::{self, DT_DIR};
+use autumn_fs::state::FsState;
+use autumn_fs::{dir, key, meta};
 
 use crate::listing::{list_page, DirSource, Item};
 use crate::s3::ObjectRow;

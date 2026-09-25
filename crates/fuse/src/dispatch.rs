@@ -8,13 +8,13 @@ use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
 
 use crate::attr::inode_to_attr;
 use crate::bridge::*;
-use crate::dir;
-use crate::meta::*;
-use crate::read;
+use autumn_fs::dir;
+use autumn_fs::meta::*;
+use autumn_fs::read;
 use crate::read_pool::{ReadJob, ReadPool};
-use crate::schema::InodeState;
-use crate::state::{FsState, FuseLease};
-use crate::write;
+use autumn_fs::schema::InodeState;
+use autumn_fs::state::{FsState, FuseLease};
+use autumn_fs::write;
 
 /// Directory entries fetched per kernel READDIR call.
 const READDIR_BATCH: usize = 256;
@@ -79,7 +79,7 @@ fn lease_mode_for_open(flags: i32) -> u8 {
 /// hot path; the dispatcher wraps it in an `anyhow!` for the
 /// `FsRequest::Write` reply.
 pub fn check_write_allowed(
-    held_leases: &std::collections::HashMap<u64, crate::state::FuseLease>,
+    held_leases: &std::collections::HashMap<u64, autumn_fs::state::FuseLease>,
     ino: u64,
 ) -> Result<(), &'static str> {
     match held_leases.get(&ino) {
@@ -127,7 +127,7 @@ pub fn check_write_allowed(
 ///   `flush_error` may be consumed — RELEASE always passes
 ///   `FlushReport::BestEffort`.
 pub fn compute_release_action(
-    held_leases: &std::collections::HashMap<u64, crate::state::FuseLease>,
+    held_leases: &std::collections::HashMap<u64, autumn_fs::state::FuseLease>,
     ino: u64,
     kernel_flush: bool,
     role: u8,
@@ -219,10 +219,10 @@ pub fn notify_inval_inode_failed_for(
 }
 
 // M4: the per-session lease background tasks (heartbeat +
-// invalidation poll) moved to the fuser-free `crate::lease_tasks` so the PyO3
+// invalidation poll) moved to the fuser-free `autumn_fs::lease_tasks` so the PyO3
 // `autumn.Fs` binding shares them. Re-exported here so `main.rs` +
 // this module's unit tests reference them unchanged.
-pub use crate::lease_tasks::{
+pub use autumn_fs::lease_tasks::{
     evict_revoked_held_leases, invalidate_kernel_cache_for_events, spawn_lease_background_tasks,
     InodeInvalidator,
 };
@@ -291,7 +291,7 @@ pub async fn handle_request(
             // tombstoned inodes are unreachable by invariant, so the
             // sweep can delete their data unconditionally. Best-effort:
             // a failed sweep retries at the next mount.
-            match crate::extent::sweep_unlink_tombstones(state).await {
+            match autumn_fs::extent::sweep_unlink_tombstones(state).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(reaped = n, "unlink tombstone sweep"),
                 Err(e) => tracing::warn!("unlink tombstone sweep failed: {e}"),
@@ -362,7 +362,7 @@ pub async fn handle_request(
             // the whole request, so the trailing inode put below is fenced
             // too, not only the truncate's own.
             let transient = match size {
-                Some(_) => crate::segment::needs_transient_write(state, ino).await,
+                Some(_) => autumn_fs::segment::needs_transient_write(state, ino).await,
                 None => Ok(false),
             };
             let transient = match transient {
@@ -373,7 +373,7 @@ pub async fn handle_request(
                 }
             };
             if transient {
-                if let Err(e) = crate::segment::hold_transient_write(state, ino).await {
+                if let Err(e) = autumn_fs::segment::hold_transient_write(state, ino).await {
                     let _ = reply.send(Err(e));
                     return true;
                 }
@@ -430,7 +430,7 @@ pub async fn handle_request(
                     state.inodes.remove(&ino);
                     state.dirty_inodes.remove(&ino);
                 }
-                crate::segment::drop_transient_write(state, ino).await;
+                autumn_fs::segment::drop_transient_write(state, ino).await;
             }
             let _ = reply.send(result);
         }
@@ -1138,11 +1138,11 @@ pub async fn handle_request(
                     // can go now, unless another client still holds it — then
                     // the tombstone stays for the periodic sweep.
                     if state.unlinked_open.remove(&ino) {
-                        if let Err(e) = crate::extent::reclaim_unreachable(state, ino).await {
+                        if let Err(e) = autumn_fs::extent::reclaim_unreachable(state, ino).await {
                             tracing::warn!(ino, error = %e, "reclaim at last close failed; the sweep retries");
                         }
                     } else if state.segment_garbage.contains(&ino) {
-                        if let Err(e) = crate::segment::reclaim_live(state, ino).await {
+                        if let Err(e) = autumn_fs::segment::reclaim_live(state, ino).await {
                             tracing::warn!(ino, error = %e, "segment reclaim at last close failed; the sweep retries");
                         }
                     }
@@ -1313,7 +1313,7 @@ mod bug_lease_3_fuse_tests {
     //! daemon's `bug_lease_3_tests`. Default-CI.
 
     use super::evict_revoked_held_leases;
-    use crate::state::FuseLease;
+    use autumn_fs::state::FuseLease;
     use autumn_rpc::manager_rpc::{
         MgrInvalidation, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED,
         LEASE_INVAL_WILL_REVOKE_IN, LEASE_INVAL_WRITER_CLOSED, LEASE_MODE_READ, LEASE_MODE_WRITE,
@@ -1427,7 +1427,7 @@ mod r2_p0_2_3_lease_check_tests {
     //! ioring `inode_open_locks` style.
 
     use super::{check_write_allowed, compute_release_action, ReleaseAction};
-    use crate::state::FuseLease;
+    use autumn_fs::state::FuseLease;
     use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
     use std::collections::HashMap;
 

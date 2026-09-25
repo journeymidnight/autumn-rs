@@ -18,11 +18,9 @@ pyo3 = { version = "0.24", features = ["extension-module"] }
 autumn-client = { path = "../crates/client" }
 autumn-rpc = { path = "../crates/rpc" }
 autumn-transport = { path = "../crates/transport" }
-# F-FS-UNIFY M2: the fuser-FREE filesystem core (meta/dir/extent/read/write/
-# state) behind the `autumn.Fs` PyO3 binding. `default-features = false` keeps
-# `fuser`/`clap`/kernel-mount machinery out of the wheel — only the shared
-# inode-layout logic the fuse binary also uses.
-autumn-fuse = { path = "../crates/fuse", default-features = false, features = ["core"] }
+# The `fs/` tree behind the `autumn.Fs` PyO3 binding: the same layer the fuse
+# mount and the S3 gateway use, with no kernel-mount machinery in the wheel.
+autumn-fs = { path = "../crates/fs" }
 # `polling` is not a second driver, it is what makes the driver a CHOICE: only
 # with io-uring AND polling does compio-driver define cfg(fusion), and only the
 # fusion driver probes the running kernel before picking. See the workspace

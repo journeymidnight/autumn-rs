@@ -14,7 +14,7 @@
 //! need dummy credentials set, because the AWS SDK's credential chain runs
 //! before the request is ever sent.
 //!
-//! Reads go through the same `autumn-fuse` core the `autumn.Fs` binding uses,
+//! Reads go through `autumn-fs`, the same layer the `autumn.Fs` binding uses,
 //! so lane striping, EN-direct reads and authz all apply unchanged. This is an
 //! adapter over the partition layer, not a second data plane.
 
@@ -34,7 +34,7 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use autumn_fuse::state::FsState;
+use autumn_fs::state::FsState;
 use send_wrapper::SendWrapper;
 
 use objects::Fs;

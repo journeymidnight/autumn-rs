@@ -36,9 +36,10 @@ use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::{MgrClientId, LEASE_CLIENT_KIND_FUSE, LEASE_MODE_WRITE};
 
 use autumn_fuse::bridge::{self, FsRequest};
-use autumn_fuse::schema::WRITE_BUF_CAP;
-use autumn_fuse::state::FsState;
-use autumn_fuse::{dispatch, meta, write};
+use autumn_fs::schema::WRITE_BUF_CAP;
+use autumn_fs::state::FsState;
+use autumn_fs::{meta, write};
+use autumn_fuse::dispatch;
 
 use support::*;
 

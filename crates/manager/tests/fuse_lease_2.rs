@@ -39,9 +39,9 @@ use autumn_rpc::manager_rpc::{
 };
 
 use autumn_fuse::dispatch::{self, InodeInvalidator};
-use autumn_fuse::schema::{self, DirentValue, DT_REG, ROOT_INO};
-use autumn_fuse::state::{FsState, FuseLease};
-use autumn_fuse::{key, meta};
+use autumn_fs::schema::{self, DirentValue, DT_REG, ROOT_INO};
+use autumn_fs::state::{FsState, FuseLease};
+use autumn_fs::{key, meta};
 
 use support::*;
 

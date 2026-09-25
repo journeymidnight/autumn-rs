@@ -3,7 +3,7 @@
 //!
 //! Skips the `autumn-fuse` kernel mount; talks directly to the
 //! autumn-rs cluster via [`autumn_client::ClusterClient`]
-//! using the [`autumn_fuse::key`] + [`autumn_fuse::schema`] modules — the same
+//! using the [`autumn_fs::key`] + [`autumn_fs::schema`] modules — the same
 //! KV layout the fuse mount uses, so a write here is visible to a fuse mount
 //! pointed at the same cluster and vice versa.
 //!
@@ -39,10 +39,10 @@ use clap::{Parser, Subcommand};
 use std::os::unix::ffi::OsStrExt;
 
 use autumn_client::ClusterClient;
-use autumn_fuse::key;
-use autumn_fuse::state::FsState;
-use autumn_fuse::{dir, meta, segment};
-use autumn_fuse::schema::{
+use autumn_fs::key;
+use autumn_fs::state::FsState;
+use autumn_fs::{dir, meta, segment};
+use autumn_fs::schema::{
     self, DirentValue, InodeMeta, StripeLayout, DT_DIR, DT_LNK, DT_REG, INLINE_THRESHOLD,
     MAX_EXTENT, ROOT_INO,
 };
@@ -971,7 +971,7 @@ async fn publish_file(
 ///   * it hardcoded the wire prefix `b"fs/"` in a CLI, a byte string that has
 ///     already changed twice (tenant-first, then Option 3).
 async fn declared_stripe_geom(cluster: &ClusterClient) -> Result<StripeLayout> {
-    autumn_fuse::geom::read_stripe_geom(cluster).await
+    autumn_fs::geom::read_stripe_geom(cluster).await
 }
 
 async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Result<()> {

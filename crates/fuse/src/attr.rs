@@ -12,8 +12,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use fuser::FileAttr;
 
-use crate::meta::{S_IFDIR, S_IFLNK, S_IFMT};
-use crate::schema::{InodeMeta, DT_DIR, DT_LNK};
+use autumn_fs::meta::{S_IFDIR, S_IFLNK, S_IFMT};
+use autumn_fs::schema::{InodeMeta, DT_DIR, DT_LNK};
 
 /// Convert InodeMeta to fuser::FileAttr.
 pub fn inode_to_attr(ino: u64, meta: &InodeMeta) -> FileAttr {

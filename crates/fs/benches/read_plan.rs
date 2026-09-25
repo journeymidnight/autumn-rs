@@ -1,10 +1,10 @@
 //! Isolate cached filesystem read planning from network and disk throughput.
-//! cargo bench -p autumn-fuse --bench read_plan -- <manager> [iterations]
+//! cargo bench -p autumn-fs --bench read_plan -- <manager> [iterations]
 use std::collections::VecDeque;
 use std::hint::black_box;
 use std::time::Instant;
 
-use autumn_fuse::{
+use autumn_fs::{
     meta, read,
     schema::{InodeState, StripeLayout, MAX_EXTENT},
     state::FsState,
