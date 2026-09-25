@@ -1,3 +1,10 @@
+Date: 2026-09-25 (9)
+TaskStatus: completed
+Task scope: "清理feature list" — feature_list.md holds the open backlog only; entries that reached passes: true had been left in.
+Current summary: deleted 13 closed entries (1600 -> 664 lines): ten at passes: true (F-DISK-FAULT-CLASSIFIER, F-CLIENT-WIRE-COMPAT, BUG-RECOVERY-MARKER-ORPHAN, BUG-ROT-BLOCKS-ITS-OWN-REPAIR, BUG-BULK-READ-FLATTENS-REFUSAL, BUG-FRAME-LEN-U32-WRAP, BUG-GC-ADVISORY-VS-SELECTION, BUG-FUSE-EOF-READ-CLOBBERS-DIRTY-META, BUG-FUSE-FLUSH-ERROR-EATEN-BY-LOGGERS, BUG-FUSE-WRITE-READ-DUAL-OPEN-EBUSY), the two retired LanceDB entries (F-LANCEDB-OBJECT-STORE, F-LANCEDB-PY-NATIVE), and BUG-WIRE36-UNDEPLOYED, whose trap (main ahead of the deployed wire) ended with the wire-48 stop-the-world rollout. Git history is the record. Open entries untouched; references to deleted names inside them stay as written (rule 8).
+Main gaps: none. F-SPLIT-ADVICE-COUNTS-UNRECLAIMED is unblocked (its prerequisite was the GC advisory bug) and still needs its real-cluster check.
+Next steps: none for this task.
+
 Date: 2026-09-26
 TaskStatus: completed
 Task scope: rollout autumn-rs wire 48 / cluster_version 48 to the VKE cluster, and switch lance-mcp from the FUSE mount to the autumn-s3 gateway (no re-digest).
