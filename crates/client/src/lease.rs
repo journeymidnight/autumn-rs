@@ -27,7 +27,8 @@ use autumn_rpc::manager_rpc::{
     rkyv_decode, rkyv_encode, AcquireLeaseReq, AcquireLeaseResp, HeartbeatLeaseReq,
     HeartbeatLeaseResp, MgrClientId, MgrInodeLeaseInfo, MgrInvalidation, PollInvalidationsReq,
     PollInvalidationsResp, ReleaseLeaseReq, ReleaseLeaseResp, CODE_NOT_FOUND, CODE_NOT_LEADER,
-    CODE_OK, CODE_PRECONDITION, CODE_REVOKE_PENDING, LEASE_CLIENT_KIND_IORING, LEASE_MODE_READ,
+    CODE_OK, CODE_PRECONDITION, CODE_REVOKE_PENDING, LEASE_CLIENT_KIND_IORING,
+    LEASE_MODE_EXCLUSIVE, LEASE_MODE_READ, LEASE_MODE_REPLACE, LEASE_MODE_STABLE,
     LEASE_MODE_WRITE, MSG_ACQUIRE_LEASE, MSG_HEARTBEAT_LEASE, MSG_POLL_INVALIDATIONS,
     MSG_RELEASE_LEASE,
 };
@@ -112,6 +113,10 @@ pub enum LeaseError {
     Manager { code: u8, message: String },
     #[error("transport: {0}")]
     Transport(String),
+    /// Refused by this SDK before sending: the negotiated cluster is too old
+    /// to know the requested mode.
+    #[error("unsupported by this cluster: {0}")]
+    Unsupported(String),
 }
 
 const RETRY: u32 = 3;
@@ -132,8 +137,8 @@ async fn lease_call<R>(
     decode(&bytes).map_err(|e| LeaseError::Transport(format!("decode: {e}")))
 }
 
-/// Acquire a `(mode = LEASE_MODE_READ | LEASE_MODE_WRITE)` lease on
-/// `ino`. The manager auto-rotates / reconnects internally
+/// Acquire a lease on `ino` in `mode` (`LEASE_MODE_READ`, `_WRITE`, and on a
+/// wire-48 cluster `_STABLE`, `_REPLACE`, `_EXCLUSIVE`). The manager auto-rotates / reconnects internally
 /// (`mgr_call_retry`). On WRITE conflict, returns
 /// `AcquireResult::Conflict` so the caller can map it to `EBUSY` /
 /// `EAGAIN`.
@@ -176,9 +181,24 @@ async fn acquire_inner(
     force: bool,
 ) -> Result<AcquireResult, LeaseError> {
     debug_assert!(
-        mode == LEASE_MODE_READ || mode == LEASE_MODE_WRITE,
-        "lease mode must be READ or WRITE"
+        matches!(
+            mode,
+            LEASE_MODE_READ | LEASE_MODE_WRITE | LEASE_MODE_STABLE | LEASE_MODE_REPLACE
+                | LEASE_MODE_EXCLUSIVE
+        ),
+        "unknown lease mode {mode}"
     );
+    // An older manager answers an unknown mode with a generic invalid-argument
+    // code; say what is actually missing instead.
+    if mode != LEASE_MODE_READ && mode != LEASE_MODE_WRITE {
+        let negotiated = cluster.negotiated_cluster_wire();
+        if negotiated < autumn_rpc::WIRE_VERSION_WITH_LEASE_MODES {
+            return Err(LeaseError::Unsupported(format!(
+                "lease mode {mode} needs cluster wire >= {}, negotiated {negotiated}",
+                autumn_rpc::WIRE_VERSION_WITH_LEASE_MODES
+            )));
+        }
+    }
     let req = AcquireLeaseReq {
         client: client.as_wire().clone(),
         ino,

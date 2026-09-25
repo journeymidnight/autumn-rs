@@ -6909,7 +6909,11 @@ impl AutumnManager {
                 writer_present,
                 ttl_secs,
             } => {
-                // Etcd-first: writer leases persist; reader leases don't.
+                // Etcd-first: WRITE leases persist; reader leases don't, and
+                // neither do REPLACE and EXCLUSIVE — they last one name swap
+                // or one reclaim, and persisting them put two etcd writes on
+                // every S3 overwrite and every unlink. What a failover loses
+                // is in the crate guide.
                 if req.mode == LEASE_MODE_WRITE {
                     let record = self
                         .inode_leases
@@ -6967,6 +6971,14 @@ impl AutumnManager {
                     message: format!(
                         "writer lease held by kind={held_by_kind} host={held_by_host}"
                     ),
+                    lease: None,
+                }))
+            }
+            crate::inode_lease::AcquireOutcome::HolderConflict { what } => {
+                drop(deferred_pushes);
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_PRECONDITION,
+                    message: format!("lease refused: another client holds a {what} lease"),
                     lease: None,
                 }))
             }
@@ -7152,8 +7164,10 @@ impl AutumnManager {
                     let is_writer = {
                         let reg = self.inode_leases.borrow();
                         let me = crate::inode_lease::ClientKey::from_wire(&req.client);
+                        // Only a WRITE holder has a record to refresh.
                         reg.inodes
                             .get(&req.ino)
+                            .filter(|s| s.writer_kind == crate::inode_lease::WriterKind::Write)
                             .and_then(|s| s.writer.as_ref().map(|w| w == &me))
                             .unwrap_or(false)
                     };

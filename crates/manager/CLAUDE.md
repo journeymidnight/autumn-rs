@@ -1606,6 +1606,50 @@ Invariants (enforced by code structure):
   waits up to `LONG_POLL_WAIT` = 10 s, breaking "writer close → reader sees bytes within
   ~ms").
 
+**Lease modes beyond READ/WRITE (wire 48).** The S3 gateway needs three more,
+and the fuse mount and Python binding meet them as ordinary conflicts:
+
+| Mode | Used for | Refused while ANOTHER client holds |
+|---|---|---|
+| READ | an open read fd | EXCLUSIVE |
+| STABLE | an S3 GET pinning the content | WRITE, EXCLUSIVE |
+| WRITE | an in-place writer | WRITE, REPLACE, EXCLUSIVE, STABLE |
+| REPLACE | an S3 overwrite swapping the inode out of its name | WRITE, REPLACE, EXCLUSIVE |
+| EXCLUSIVE | reclaiming the inode's data | anything |
+
+A client never excludes itself. WRITE, REPLACE and EXCLUSIVE share the single
+writer slot (`InodeLeaseState.writer_kind`); only a plain WRITE may use the
+force-preempt path, only against another plain WRITE (a REPLACE or EXCLUSIVE
+holder is never deposed mid-swap or mid-reclaim —
+`force_write_never_deposes_replace_or_exclusive`), and a forced WRITE still
+yields to a stable reader. STABLE
+entries live beside `readers`, memory-only with the same TTL and heartbeat.
+A forced WRITE is refused outright (`HolderConflict`) while a stable reader
+exists, before any grace window opens.
+
+**What a manager failover loses, stated because the modes promise exclusion.**
+Only WRITE is persisted (`inode_leases/<ino>`); REPLACE and EXCLUSIVE are
+memory-only like readers. They last one name swap or one reclaim, and persisting
+them cost two etcd writes on every S3 overwrite and every unlink. A slot held as
+WRITE that its owner re-acquires as EXCLUSIVE keeps its WRITE record, so a
+replay brings it back as WRITE. After a failover an in-progress EXCLUSIVE is
+gone: a READ can be granted mid-reclaim. The reclaimer re-acquires EXCLUSIVE
+(same client, so every other holder is re-checked) between its delete phases,
+which narrows but does not close that window; it only matters for an
+UNREACHABLE inode, which a client can open only through a stale cached handle.
+A lost REPLACE lets an in-place writer open the old inode mid-swap; its writes
+land in an inode that is about to become unreachable. STABLE entries are
+memory-only and vanish on failover: a WRITE can then be granted while a GET is
+still streaming. The gateway treats a heartbeat `NotHeld` on a stable lease as
+"abort the response"; a GET shorter than one heartbeat interval cannot notice.
+Closing either gap needs the kind persisted or a post-failover write grace.
+
+Stable readers receive no invalidation pushes: the only foreign writer they can
+coexist with is REPLACE, which does not change their content. A same-client
+WRITE → EXCLUSIVE upgrade keeps the epoch, so a client must drain its own writes
+before reclaiming. Matrix: `mode_matrix_across_clients`; wire path:
+`crates/manager/tests/lease_modes.rs`.
+
 Consumer-side coherence rules (design rationale for the fuse consumer): a subscribe
 disconnect / overflow sentinel must drop EVERY held lease + cached fd (partial
 invalidation is a footgun); a cache-stale Read must reload extents before serving or

@@ -32,7 +32,8 @@ use std::time::{Duration, Instant};
 use autumn_rpc::manager_rpc::{
     MgrClientId, MgrInodeLeaseRecord, MgrInvalidation,
     LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_WILL_REVOKE_IN, LEASE_INVAL_WRITER_CLOSED,
-    LEASE_MODE_READ, LEASE_MODE_WRITE,
+    LEASE_MODE_EXCLUSIVE, LEASE_MODE_READ, LEASE_MODE_REPLACE, LEASE_MODE_STABLE,
+    LEASE_MODE_WRITE,
 };
 
 /// Default writer-lease TTL (seconds). Same magnitude as
@@ -76,17 +77,52 @@ impl ClientKey {
     }
 }
 
+/// What the holder of the writer slot is doing. The slot is single
+/// either way; the kind decides which OTHER holders it tolerates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriterKind {
+    /// In-place modification: excludes stable readers.
+    Write,
+    /// Swapping the inode out of its name (an S3 overwrite): excludes other
+    /// writers only, so a GET in progress on the old content keeps going.
+    Replace,
+    /// Reclaiming the inode's data: excludes every other holder.
+    Exclusive,
+}
+
+impl WriterKind {
+    fn from_mode(mode: u8) -> Option<Self> {
+        match mode {
+            LEASE_MODE_WRITE => Some(WriterKind::Write),
+            LEASE_MODE_REPLACE => Some(WriterKind::Replace),
+            LEASE_MODE_EXCLUSIVE => Some(WriterKind::Exclusive),
+            _ => None,
+        }
+    }
+}
+
 /// One inode's lease state. Single writer XOR many readers
 /// concurrently; readers may coexist with the writer (reads through
 /// an open file remain legal — the writer's flush-before-close
 /// ordering, plan §6.2, keeps coherence intact).
+///
+/// Stable readers are readers that pin the content: while any is held no
+/// OTHER client may hold the slot as `Write` or `Exclusive`, and they are
+/// refused while another client does. An S3 GET holds one for the length of
+/// the request. Like readers they are memory-only.
 #[derive(Clone, Debug)]
 pub struct InodeLeaseState {
     pub ino: u64,
     pub writer: Option<ClientKey>,
+    /// Meaningful only while `writer` is `Some`. Not persisted: a replayed
+    /// writer record comes back as `Write`, which excludes at least as much
+    /// as `Replace` and less than `Exclusive` — the one it weakens is a
+    /// reclaim, which re-checks under a fresh acquire anyway.
+    pub writer_kind: WriterKind,
     pub writer_diag_host: String,
     pub writer_expires_at: Option<Instant>,
     pub readers: BTreeMap<ClientKey, Instant>,
+    pub stable: BTreeMap<ClientKey, Instant>,
     pub version: u64,
     /// Deadline after which a force-acquire that's
     /// already pushed `WillRevokeIn` to the current writer will be
@@ -102,11 +138,37 @@ impl InodeLeaseState {
         InodeLeaseState {
             ino,
             writer: None,
+            writer_kind: WriterKind::Write,
             writer_diag_host: String::new(),
             writer_expires_at: None,
             readers: BTreeMap::new(),
+            stable: BTreeMap::new(),
             version: 1,
             pending_revoke_at: None,
+        }
+    }
+
+    /// No holder of any kind remains.
+    fn is_idle(&self) -> bool {
+        self.writer.is_none() && self.readers.is_empty() && self.stable.is_empty()
+    }
+
+    /// Why a request for the writer slot as `kind` by `me` must be refused
+    /// because of holders OTHER than `me` that are not in the slot.
+    fn slot_blocked_by_readers(&self, me: &ClientKey, kind: WriterKind) -> Option<&'static str> {
+        let other = |m: &BTreeMap<ClientKey, Instant>| m.keys().any(|k| k != me);
+        match kind {
+            WriterKind::Replace => None,
+            WriterKind::Write => other(&self.stable).then_some("stable reader"),
+            WriterKind::Exclusive => {
+                if other(&self.stable) {
+                    Some("stable reader")
+                } else if other(&self.readers) {
+                    Some("reader")
+                } else {
+                    None
+                }
+            }
         }
     }
 }
@@ -121,6 +183,9 @@ pub enum AcquireOutcome {
         writer_present: bool,
         ttl_secs: u32,
     },
+    /// Rejected because another client holds a reader-side lease this
+    /// request cannot coexist with (`what` = "stable reader" or "reader").
+    HolderConflict { what: &'static str },
     /// Rejected because another client holds the writer lease.
     WriteConflict {
         held_by_kind: u8,
@@ -451,7 +516,8 @@ impl LeaseRegistry {
         now: Instant,
         pushes: &mut DeferredPushes,
     ) -> AcquireOutcome {
-        if mode != LEASE_MODE_READ && mode != LEASE_MODE_WRITE {
+        let slot_kind = WriterKind::from_mode(mode);
+        if slot_kind.is_none() && mode != LEASE_MODE_READ && mode != LEASE_MODE_STABLE {
             return AcquireOutcome::InvalidMode;
         }
         let ttl = self.lease_ttl;
@@ -468,21 +534,33 @@ impl LeaseRegistry {
 
         {
             let state = self.inode_or_create(ino);
-            match mode {
-                LEASE_MODE_WRITE => {
-                    let other_writer = match &state.writer {
-                        Some(existing) if existing != &me => Some(existing.clone()),
-                        _ => None,
-                    };
+            let other_writer = match &state.writer {
+                Some(existing) if existing != &me => Some(existing.clone()),
+                _ => None,
+            };
+            let writer_conflict = |state: &InodeLeaseState| AcquireOutcome::WriteConflict {
+                held_by_kind: state.writer.as_ref().map_or(0, |w| w.kind),
+                held_by_host: state.writer_diag_host.clone(),
+            };
+            match slot_kind {
+                Some(kind) => {
                     if let Some(other) = other_writer {
-                        // Another writer holds the slot.
-                        if !force {
+                        // Another writer holds the slot. Only a plain WRITE
+                        // may preempt it, and only another plain WRITE: a
+                        // replace or a reclaim never takes the slot, and one
+                        // in progress is never deposed mid-swap or mid-delete.
+                        if !force || kind != WriterKind::Write || state.writer_kind != WriterKind::Write {
                             return AcquireOutcome::WriteConflict {
                                 held_by_kind: other.kind,
                                 held_by_host: state.writer_diag_host.clone(),
                             };
                         }
-                        // Force-acquire path.
+                        // Force-acquire path. A stable reader is never
+                        // preempted, so refuse before opening a grace window
+                        // the holder would be told about but never lose.
+                        if let Some(what) = state.slot_blocked_by_readers(&me, kind) {
+                            return AcquireOutcome::HolderConflict { what };
+                        }
                         match state.pending_revoke_at {
                             None => {
                                 // Start the grace window. Push
@@ -512,7 +590,13 @@ impl LeaseRegistry {
                                 };
                             }
                             Some(_) => {
-                                // Grace expired → force-revoke.
+                                // Grace expired. Stable readers are not
+                                // preempted: a GET in progress keeps its
+                                // pinned content.
+                                if let Some(what) = state.slot_blocked_by_readers(&me, kind) {
+                                    return AcquireOutcome::HolderConflict { what };
+                                }
+                                // Force-revoke.
                                 state.writer = None;
                                 state.writer_diag_host.clear();
                                 state.writer_expires_at = None;
@@ -521,6 +605,7 @@ impl LeaseRegistry {
                                 deposed_writer = Some((other, state.version));
                                 // Now grant the WRITE to the new client.
                                 state.writer = Some(me.clone());
+                                state.writer_kind = kind;
                                 state.writer_diag_host = client.host.clone();
                                 state.writer_expires_at = Some(now + ttl);
                                 grant_outcome = AcquireOutcome::Granted {
@@ -531,9 +616,13 @@ impl LeaseRegistry {
                             }
                         }
                     } else {
-                        // Same writer re-acquiring OR no writer:
-                        // grant (idempotent for same writer).
+                        if let Some(what) = state.slot_blocked_by_readers(&me, kind) {
+                            return AcquireOutcome::HolderConflict { what };
+                        }
+                        // Same writer re-acquiring (possibly as another
+                        // kind) OR no writer: grant.
                         state.writer = Some(me.clone());
+                        state.writer_kind = kind;
                         state.writer_diag_host = client.host.clone();
                         state.writer_expires_at = Some(now + ttl);
                         // A successful WRITE acquire clears any
@@ -546,7 +635,25 @@ impl LeaseRegistry {
                         };
                     }
                 }
-                LEASE_MODE_READ => {
+                None if mode == LEASE_MODE_STABLE => {
+                    // Pinning the content excludes another client's
+                    // in-place writer or reclaim; an in-flight replace only
+                    // moves the name away and leaves this content intact.
+                    if other_writer.is_some() && state.writer_kind != WriterKind::Replace {
+                        return writer_conflict(state);
+                    }
+                    state.stable.insert(me.clone(), now + ttl);
+                    grant_outcome = AcquireOutcome::Granted {
+                        version: state.version,
+                        writer_present: state.writer.is_some(),
+                        ttl_secs,
+                    };
+                }
+                None => {
+                    // READ: only a reclaim in progress refuses a reader.
+                    if other_writer.is_some() && state.writer_kind == WriterKind::Exclusive {
+                        return writer_conflict(state);
+                    }
                     state.readers.insert(me.clone(), now + ttl);
                     grant_outcome = AcquireOutcome::Granted {
                         version: state.version,
@@ -554,7 +661,6 @@ impl LeaseRegistry {
                         ttl_secs,
                     };
                 }
-                _ => unreachable!(),
             }
         }
 
@@ -636,7 +742,7 @@ impl LeaseRegistry {
                 new_version: state.version.wrapping_add(1),
             };
         }
-        if state.readers.contains_key(&me) {
+        if state.readers.contains_key(&me) || state.stable.contains_key(&me) {
             return ReleaseOutcome::ReaderReleased;
         }
         ReleaseOutcome::NotHeld
@@ -665,7 +771,7 @@ impl LeaseRegistry {
             // the borrow ends.
             let readers: Vec<ClientKey> = state.readers.keys().cloned().collect();
             // Avoid empty entries leaking memory.
-            let inode_clean = state.writer.is_none() && state.readers.is_empty();
+            let inode_clean = state.is_idle();
             let ino_copy = state.ino;
             if inode_clean {
                 self.inodes.remove(&ino);
@@ -679,9 +785,8 @@ impl LeaseRegistry {
             return ReleaseOutcome::WriterClosed { new_version };
         }
 
-        if state.readers.remove(&me).is_some() {
-            let inode_clean = state.writer.is_none() && state.readers.is_empty();
-            if inode_clean {
+        if state.readers.remove(&me).is_some() || state.stable.remove(&me).is_some() {
+            if state.is_idle() {
                 self.inodes.remove(&ino);
             }
             return ReleaseOutcome::ReaderReleased;
@@ -711,7 +816,7 @@ impl LeaseRegistry {
                 ttl_secs,
             };
         }
-        if let Some(deadline) = state.readers.get_mut(&me) {
+        if let Some(deadline) = state.readers.get_mut(&me).or(state.stable.get_mut(&me)) {
             *deadline = now + ttl;
             return HeartbeatOutcome::Renewed {
                 version: state.version,
@@ -879,8 +984,16 @@ impl LeaseRegistry {
                 pending_pushes.push((r.clone(), plan.ino, state.version));
             }
         }
-        for (target, ino, ver) in pending_pushes {
+        // The high-water mark must move with EVERY revoke, not only those
+        // with readers to notify: an expired writer with no readers leaves an
+        // idle entry that `tick_reader_expiry` drops, and the next acquire
+        // re-creates it from `last_version`. Recording it only beside the
+        // pushes handed the next writer the dead writer's own epoch, so the
+        // partition servers' fence could not tell the two apart.
+        for &(ino, ver) in &committed {
             self.remember_version(ino, ver);
+        }
+        for (target, ino, ver) in pending_pushes {
             self.push_invalidation(&target, ino, ver, InvalidationReason::LeaseRevoked);
         }
         committed
@@ -896,7 +1009,8 @@ impl LeaseRegistry {
         let mut to_drop_inodes: Vec<u64> = Vec::new();
         for (&ino, state) in self.inodes.iter_mut() {
             state.readers.retain(|_, deadline| *deadline > now);
-            if state.writer.is_none() && state.readers.is_empty() {
+            state.stable.retain(|_, deadline| *deadline > now);
+            if state.is_idle() {
                 to_drop_inodes.push(ino);
             }
         }
@@ -984,6 +1098,7 @@ impl LeaseRegistry {
         match snapshot {
             Some(s) => {
                 entry.writer = s.writer;
+                entry.writer_kind = s.writer_kind;
                 entry.writer_diag_host = s.writer_diag_host;
                 entry.writer_expires_at = s.writer_expires_at;
                 // Restore the preempt window too
@@ -1004,7 +1119,7 @@ impl LeaseRegistry {
                 entry.writer_diag_host.clear();
                 entry.writer_expires_at = None;
                 entry.pending_revoke_at = None;
-                if entry.readers.is_empty() {
+                if entry.is_idle() {
                     self.inodes.remove(&ino);
                 }
             }
@@ -1026,6 +1141,7 @@ impl LeaseRegistry {
         let s = self.inode_or_create(ino);
         s.version = s.version.max(recorded);
         s.writer = Some(key);
+        s.writer_kind = WriterKind::Write;
         s.writer_diag_host = rec.writer.host.clone();
         s.writer_expires_at = Some(now + remaining);
         // Seed the shadow so any subsequent release/revoke that drops
@@ -1142,6 +1258,168 @@ mod tests {
 
     fn reg() -> LeaseRegistry {
         LeaseRegistry::with_ttl(Duration::from_secs(30))
+    }
+
+    fn granted(o: AcquireOutcome) -> bool {
+        matches!(o, AcquireOutcome::Granted { .. })
+    }
+
+    /// The whole cross-client matrix: `held` by client A, then `req` by B.
+    /// Same-client combinations are always granted (a client's own holds
+    /// never exclude it) and are checked separately below.
+    #[test]
+    fn mode_matrix_across_clients() {
+        use LEASE_MODE_EXCLUSIVE as X;
+        use LEASE_MODE_READ as R;
+        use LEASE_MODE_REPLACE as P;
+        use LEASE_MODE_STABLE as S;
+        use LEASE_MODE_WRITE as W;
+        // (held, requested, granted?)
+        let table = [
+            (R, R, true), (R, S, true), (R, W, true), (R, P, true), (R, X, false),
+            (S, R, true), (S, S, true), (S, W, false), (S, P, true), (S, X, false),
+            (W, R, true), (W, S, false), (W, W, false), (W, P, false), (W, X, false),
+            (P, R, true), (P, S, true), (P, W, false), (P, P, false), (P, X, false),
+            (X, R, false), (X, S, false), (X, W, false), (X, P, false), (X, X, false),
+        ];
+        for (held, req, want) in table {
+            let mut r = reg();
+            let now = Instant::now();
+            let (a, b) = (cid(1, 1, "a"), cid(2, 2, "b"));
+            assert!(granted(r.acquire(&a, 9, held, now)), "held={held}");
+            let got = granted(r.acquire(&b, 9, req, now));
+            assert_eq!(got, want, "held={held} requested={req}");
+        }
+    }
+
+    #[test]
+    fn a_client_never_excludes_itself() {
+        let modes = [
+            LEASE_MODE_READ,
+            LEASE_MODE_STABLE,
+            LEASE_MODE_WRITE,
+            LEASE_MODE_REPLACE,
+            LEASE_MODE_EXCLUSIVE,
+        ];
+        for held in modes {
+            for req in modes {
+                let mut r = reg();
+                let now = Instant::now();
+                let a = cid(1, 1, "a");
+                assert!(granted(r.acquire(&a, 9, held, now)));
+                assert!(granted(r.acquire(&a, 9, req, now)), "held={held} requested={req}");
+            }
+        }
+    }
+
+    /// A stable reader keeps its content through a force preempt, before and
+    /// after the grace window. (A REPLACE in the slot, the other holder that
+    /// tolerates foreign stable readers, is never preempted at all.)
+    #[test]
+    fn force_write_does_not_preempt_a_stable_reader() {
+        let mut r = LeaseRegistry::with_ttl_and_revoke_grace(Duration::from_secs(30), Duration::ZERO);
+        let now = Instant::now();
+        // A writer that is also streaming the file out (one client never
+        // excludes itself): the only way a plain WRITE and a stable reader
+        // share an inode.
+        let (w, f) = (cid(1, 1, "writer"), cid(3, 3, "force"));
+        assert!(granted(r.acquire(&w, 9, LEASE_MODE_WRITE, now)));
+        assert!(granted(r.acquire(&w, 9, LEASE_MODE_STABLE, now)));
+        // Refused outright — no grace window is opened, so the holder is
+        // never told it will be revoked when it will not be.
+        assert_eq!(
+            r.acquire_with_force(&f, 9, LEASE_MODE_WRITE, true, now),
+            AcquireOutcome::HolderConflict { what: "stable reader" }
+        );
+        assert_eq!(r.inodes[&9].pending_revoke_at, None);
+        let later = now + Duration::from_millis(1);
+        assert!(!granted(r.acquire_with_force(&f, 9, LEASE_MODE_WRITE, true, later)));
+        assert_eq!(r.inodes[&9].writer.as_ref(), Some(&ClientKey::from_wire(&w)));
+    }
+
+    /// Force preempts only a plain WRITE: a swap or a reclaim in progress
+    /// keeps its slot however long the forcing writer waits.
+    #[test]
+    fn force_write_never_deposes_replace_or_exclusive() {
+        let mut r = LeaseRegistry::with_ttl_and_revoke_grace(Duration::from_secs(30), Duration::ZERO);
+        let now = Instant::now();
+        let later = now + Duration::from_millis(5);
+        let f = cid(3, 3, "force");
+        for (ino, mode) in [(9u64, LEASE_MODE_REPLACE), (10, LEASE_MODE_EXCLUSIVE)] {
+            let h = cid(ino as u8, ino as u8, "holder");
+            assert!(granted(r.acquire(&h, ino, mode, now)));
+            for t in [now, later] {
+                assert!(matches!(
+                    r.acquire_with_force(&f, ino, LEASE_MODE_WRITE, true, t),
+                    AcquireOutcome::WriteConflict { .. }
+                ));
+            }
+            assert_eq!(r.inodes[&ino].writer.as_ref(), Some(&ClientKey::from_wire(&h)));
+        }
+        // A plain WRITE is still preempted: grace window, then the revoke.
+        let w = cid(4, 4, "writer");
+        assert!(granted(r.acquire(&w, 11, LEASE_MODE_WRITE, now)));
+        assert!(matches!(
+            r.acquire_with_force(&f, 11, LEASE_MODE_WRITE, true, now),
+            AcquireOutcome::RevokePending { .. }
+        ));
+        assert!(granted(r.acquire_with_force(&f, 11, LEASE_MODE_WRITE, true, later)));
+    }
+
+    /// A writer whose lease expires with nobody else on the inode: the entry
+    /// is dropped, and the next writer must still get a HIGHER epoch than the
+    /// dead one stamped — otherwise its late writes pass every fence.
+    #[test]
+    fn an_expired_lone_writer_is_fenced_by_the_next_one() {
+        let mut r = reg();
+        let now = Instant::now();
+        let (dead, next) = (cid(1, 1, "dead"), cid(2, 2, "next"));
+        let AcquireOutcome::Granted { version: v_dead, .. } = r.acquire(&dead, 9, LEASE_MODE_WRITE, now) else {
+            panic!("grant")
+        };
+        let later = now + Duration::from_secs(31);
+        assert_eq!(r.tick(later).len(), 1, "revoked");
+        assert!(!r.inodes.contains_key(&9), "idle entry dropped");
+        let AcquireOutcome::Granted { version: v_next, .. } = r.acquire(&next, 9, LEASE_MODE_WRITE, later) else {
+            panic!("grant")
+        };
+        assert!(v_next > v_dead, "next writer's epoch {v_next} must exceed the dead writer's {v_dead}");
+    }
+
+    /// Stable readers heartbeat and expire like readers, and an inode whose
+    /// only holder is a stable reader is dropped once it goes.
+    #[test]
+    fn stable_readers_renew_expire_and_release() {
+        let mut r = reg();
+        let now = Instant::now();
+        let g = cid(2, 2, "get");
+        assert!(granted(r.acquire(&g, 9, LEASE_MODE_STABLE, now)));
+        assert!(matches!(r.heartbeat(&g, 9, now + Duration::from_secs(20)), HeartbeatOutcome::Renewed { .. }));
+        r.tick(now + Duration::from_secs(40));
+        assert!(r.inodes.contains_key(&9), "renewed at 20 s, alive at 40 s");
+        r.tick(now + Duration::from_secs(60));
+        assert!(!r.inodes.contains_key(&9), "expired stable reader leaves no entry");
+        assert!(granted(r.acquire(&g, 9, LEASE_MODE_STABLE, now)));
+        assert_eq!(r.release(&g, 9), ReleaseOutcome::ReaderReleased);
+        assert!(!r.inodes.contains_key(&9));
+    }
+
+    /// Only WRITE is persisted, and a record carries no kind: a WRITE its
+    /// owner upgraded to EXCLUSIVE replays as a plain WRITE, which still
+    /// refuses stable readers and other writers but admits readers.
+    #[test]
+    fn a_replayed_writer_is_a_plain_write() {
+        let mut r = reg();
+        let now = Instant::now();
+        let (a, b) = (cid(1, 1, "a"), cid(2, 2, "b"));
+        assert!(granted(r.acquire(&a, 9, LEASE_MODE_WRITE, now)));
+        assert!(granted(r.acquire(&a, 9, LEASE_MODE_EXCLUSIVE, now)));
+        let rec = r.writer_record(9).expect("slot held");
+        let mut fresh = reg();
+        fresh.install_persisted_writer(rec, now);
+        assert_eq!(fresh.inodes[&9].writer_kind, WriterKind::Write);
+        assert!(!granted(fresh.acquire(&b, 9, LEASE_MODE_STABLE, now)));
+        assert!(granted(fresh.acquire(&b, 9, LEASE_MODE_READ, now)));
     }
 
     #[test]

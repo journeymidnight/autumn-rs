@@ -1178,8 +1178,11 @@ fn the_numbers_a_client_interprets_are_frozen() {
             mgr::LEASE_INVAL_LEASE_REVOKED,
             mgr::LEASE_INVAL_META_CHANGED,
             mgr::LEASE_INVAL_WILL_REVOKE_IN,
+            mgr::LEASE_MODE_STABLE,
+            mgr::LEASE_MODE_REPLACE,
+            mgr::LEASE_MODE_EXCLUSIVE,
         ],
-        [1, 2, 1, 2, 1, 2, 3, 4],
+        [1, 2, 1, 2, 1, 2, 3, 4, 3, 4, 5],
         "lease kinds, modes and invalidation reasons"
     );
 }

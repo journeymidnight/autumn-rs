@@ -2025,6 +2025,18 @@ pub const LEASE_CLIENT_KIND_IORING: u8 = 2;
 /// Lease mode (Read or Write). Wire-stable; APPEND-only.
 pub const LEASE_MODE_READ: u8 = 1;
 pub const LEASE_MODE_WRITE: u8 = 2;
+/// Pin the content (an S3 GET): refused while another client holds the slot
+/// as WRITE or EXCLUSIVE, and refuses their WRITE/EXCLUSIVE while held.
+/// Memory-only like READ. Wire 48.
+pub const LEASE_MODE_STABLE: u8 = 3;
+/// The writer slot, for swapping the inode out of its name (an S3 overwrite):
+/// excludes other writers only, so readers and stable readers keep going.
+/// Memory-only. Wire 48.
+pub const LEASE_MODE_REPLACE: u8 = 4;
+/// The writer slot, for reclaiming the inode's data: granted only when no
+/// other client holds any lease on it, and refuses every new one while held.
+/// Memory-only. Wire 48.
+pub const LEASE_MODE_EXCLUSIVE: u8 = 5;
 
 /// Invalidation kind (push reason). Wire-stable; APPEND-only.
 pub const LEASE_INVAL_WRITER_CLOSED: u8 = 1;
@@ -2070,7 +2082,8 @@ pub struct MgrInodeLeaseInfo {
 pub struct AcquireLeaseReq {
     pub client: MgrClientId,
     pub ino: u64,
-    /// `LEASE_MODE_READ` or `LEASE_MODE_WRITE`.
+    /// One of `LEASE_MODE_READ`, `_WRITE`, and from wire 48 `_STABLE`,
+    /// `_REPLACE`, `_EXCLUSIVE`.
     pub mode: u8,
     /// Lease preemption: when true, the manager starts a revocation
     /// of any current writer (pushes `LEASE_INVAL_WILL_REVOKE_IN`
