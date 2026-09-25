@@ -22,7 +22,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
@@ -105,6 +105,9 @@ enum Pending {
     IntoPooled(oneshot::Sender<Result<BulkResp, RpcError>>),
 }
 
+/// The sender a `call_into_pooled` caller awaits.
+type BulkWaiter = oneshot::Sender<Result<BulkResp, RpcError>>;
+
 type WriteHalf = autumn_transport::WriteHalf;
 type ReadHalf = autumn_transport::ReadHalf;
 
@@ -128,6 +131,9 @@ enum SubmitMsg {
     /// `send_vectored`). Zero-copy for the payload parts.
     Vectored { bufs: Vec<Bytes>, req_id: u32 },
     Prepared { bufs: Vec<Bytes>, req_id: u32 },
+    /// A keepalive ping. Written like `Single`; the writer counts it once it
+    /// is on the wire, which is when the keepalive starts timing the reply.
+    Ping { bytes: Bytes, req_id: u32 },
 }
 
 impl SubmitMsg {
@@ -136,7 +142,68 @@ impl SubmitMsg {
             SubmitMsg::Single { req_id, .. } => *req_id,
             SubmitMsg::Vectored { req_id, .. } => *req_id,
             SubmitMsg::Prepared { req_id, .. } => *req_id,
+            SubmitMsg::Ping { req_id, .. } => *req_id,
         }
+    }
+}
+
+/// How a connection notices a peer that has stopped answering.
+///
+/// A peer can be dead while its transport is not: a frozen or wedged process
+/// whose kernel still ACKs, a flow a middlebox dropped without a RST, a UCX
+/// endpoint running with peer-failure detection off. None of those ever
+/// produce the read or write error that `closed` used to wait for, so the
+/// connection stayed "open" for as long as the process lived, and every caller
+/// found out one timeout at a time — or never, when an outer deadline
+/// cancelled the call before its own timeout could evict it.
+///
+/// The rule is about SILENCE, not about the ping: any byte received resets the
+/// clock, so a connection whose replies arrive at least every `interval` never
+/// pings, and a peer that is slow on one request but answers others — or the
+/// ping — is never judged. After `interval` without a sign of life the client
+/// queues `MSG_TYPE_PING`; once the silence has lasted `dead_after` in all
+/// (TCP), or `dead_after` since the ping was written (UCX), the connection is
+/// closed — `is_closed()` turns true, every request waiting
+/// on it fails with `ConnectionClosed` at once, and pools evict it so callers
+/// retry elsewhere without spending their own deadlines. Signs of life and the
+/// exact timing are in `keepalive_task`: any received byte, and on TCP the peer
+/// ACKing our bytes while more wait unsent behind them (a slow link, not a dead
+/// peer).
+///
+/// Any reply to the ping proves the peer alive, including an error frame: a
+/// server that predates `MSG_TYPE_PING` answers `unknown msg_type`, which
+/// counts just the same. That is why the ping needs no wire-version bump.
+///
+/// What the rule cannot tell apart from death, and so may close: a peer whose
+/// connection loop reads nothing for `dead_after` because it is back-pressured
+/// at its per-connection in-flight cap (PS: 4, EN: 64) and every one of those
+/// requests is stalled. The SDK's first attempt already evicts a PS connection
+/// after 5 s in that state, so this adds nothing there.
+#[derive(Clone, Copy, Debug)]
+pub struct Keepalive {
+    /// Silence after which a ping is queued, and the tick of the whole check.
+    pub interval: Duration,
+    /// How long the silence may last, counted from the first silent tick (TCP)
+    /// or from the ping being written (no TCP counters: UCX), before the peer
+    /// is judged dead.
+    pub dead_after: Duration,
+}
+
+impl Keepalive {
+    /// A dead peer is found 8–10 s after its last sign of life (TCP; ~10–12 s
+    /// without the TCP counters): under the 30 s the
+    /// SDK's `rpc_timeout` and the fuse `REPLY_TIMEOUT` allow a whole request,
+    /// so a request stuck on a dead connection fails in time for its caller to
+    /// retry elsewhere. Idle healthy connections pay one empty frame each way
+    /// every ~4 s.
+    pub const DEFAULT: Keepalive = Keepalive {
+        interval: Duration::from_secs(2),
+        dead_after: Duration::from_secs(8),
+    };
+
+    fn unanswered_ticks_to_dead(&self) -> u64 {
+        let interval = self.interval.as_nanos().max(1);
+        self.dead_after.as_nanos().div_ceil(interval).max(1) as u64
     }
 }
 
@@ -208,6 +275,16 @@ pub struct RpcClient {
     /// connection itself.
     _writer_task: JoinHandle<()>,
     _reader_task: JoinHandle<()>,
+    /// The caller of the bulk value receive `read_loop` is in the middle of,
+    /// if any. Its entry left `pending` when the receive began, so
+    /// `close_silent_peer` releases it from here. Deliberately not by
+    /// cancelling the reader: on UCX that receive writes into a borrowed pool
+    /// slab, and a cancel that does not complete would hand the slab back to
+    /// the pool while UCX may still write into it.
+    receiving: Rc<RefCell<Option<BulkWaiter>>>,
+    /// Watches for a silent peer (see `Keepalive`). Holds only a `Weak` to the
+    /// client, so it never keeps a connection alive, and ends with it.
+    _keepalive_task: JoinHandle<()>,
 }
 
 impl RpcClient {
@@ -225,6 +302,15 @@ impl RpcClient {
         Self::from_conn(conn, addr)
     }
 
+    /// `connect` with a non-default `Keepalive` (tests shorten it).
+    pub async fn connect_with(addr: SocketAddr, keepalive: Keepalive) -> Result<Rc<Self>, RpcError> {
+        let conn = autumn_transport::current_or_init().connect(addr).await?;
+        if let Some(s) = conn.as_tcp() {
+            s.set_nodelay(true)?;
+        }
+        Self::from_conn_with(conn, addr, keepalive)
+    }
+
     /// Build an RpcClient from an already-connected `autumn_transport::Conn`.
     ///
     /// Spawns two background tasks on the current compio runtime:
@@ -238,6 +324,24 @@ impl RpcClient {
         conn: autumn_transport::Conn,
         peer_addr: SocketAddr,
     ) -> Result<Rc<Self>, RpcError> {
+        Self::from_conn_with(conn, peer_addr, Keepalive::DEFAULT)
+    }
+
+    /// `from_conn` with an explicit `Keepalive`.
+    pub fn from_conn_with(
+        conn: autumn_transport::Conn,
+        peer_addr: SocketAddr,
+        keepalive: Keepalive,
+    ) -> Result<Rc<Self>, RpcError> {
+        // Taken before the split; valid while either half lives, which the
+        // keepalive checks through `closed` (see `keepalive_task`).
+        #[cfg(target_os = "linux")]
+        let ack_probe = conn.as_tcp().map(|s| {
+            use std::os::fd::AsRawFd;
+            AckProbe(s.as_raw_fd())
+        });
+        #[cfg(not(target_os = "linux"))]
+        let ack_probe: Option<AckProbe> = None;
         let (reader, writer) = conn.into_split();
         let pending: Rc<RefCell<HashMap<u32, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
 
@@ -253,17 +357,41 @@ impl RpcClient {
         // caller's `rx.await` then hangs forever (the original hang's root cause).
         let pending_for_writer = pending.clone();
         let closed_for_writer = closed.clone();
+        // Bumped by `writer_task` each time a keepalive ping reaches the socket.
+        let pings_on_wire: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let pings_for_writer = pings_on_wire.clone();
         let writer_handle = spawn(async move {
-            writer_task(writer, submit_rx, pending_for_writer.clone(), peer_addr).await;
+            writer_task(
+                writer,
+                submit_rx,
+                pending_for_writer.clone(),
+                pings_for_writer,
+                peer_addr,
+            )
+            .await;
             closed_for_writer.set(true);
             pending_for_writer.borrow_mut().clear();
         });
 
         // CQ: read_loop decodes response frames and dispatches via pending.
+        // Bumped by `read_loop` for every read that returns bytes; the
+        // keepalive only compares it between ticks.
+        let rx_progress: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let receiving: Rc<RefCell<Option<BulkWaiter>>> = Rc::new(RefCell::new(None));
         let pending_for_reader = pending.clone();
         let closed_for_reader = closed.clone();
+        let progress_for_reader = rx_progress.clone();
+        let receiving_for_reader = receiving.clone();
         let reader_handle = spawn(async move {
-            if let Err(e) = read_loop(reader, pending_for_reader.clone(), peer_addr).await {
+            if let Err(e) = read_loop(
+                reader,
+                pending_for_reader.clone(),
+                progress_for_reader,
+                receiving_for_reader,
+                peer_addr,
+            )
+            .await
+            {
                 tracing::warn!(addr = %peer_addr, error = %e, "rpc client reader exited");
             }
             // set closed BEFORE clearing pending so subsequent
@@ -275,7 +403,7 @@ impl RpcClient {
 
         // The handles are FIELDS, not `detach()` — see `_writer_task`. They are
         // this connection's only teardown.
-        Ok(Rc::new(Self {
+        Ok(Rc::new_cyclic(|weak| Self {
             submit_tx: RefCell::new(submit_tx),
             pending,
             next_id: Cell::new(1),
@@ -283,6 +411,14 @@ impl RpcClient {
             closed,
             _writer_task: writer_handle,
             _reader_task: reader_handle,
+            receiving,
+            _keepalive_task: spawn(keepalive_task(
+                weak.clone(),
+                rx_progress,
+                pings_on_wire,
+                ack_probe,
+                keepalive,
+            )),
         }))
     }
 
@@ -567,6 +703,44 @@ impl RpcClient {
         self.pending.borrow().len()
     }
 
+    /// Queue one `MSG_TYPE_PING`; `false` when it could not be queued (the
+    /// submit queue is full or the client is closed). Nobody awaits the reply:
+    /// its only job is to make the peer send bytes, which `read_loop` counts;
+    /// the pending entry exists so the reply is routed and dropped like any
+    /// other.
+    fn send_ping(&self) -> bool {
+        if self.closed.get() {
+            return false;
+        }
+        let req_id = self.next_req_id();
+        let (tx, _rx) = oneshot::channel();
+        let bytes = Frame::request(req_id, crate::MSG_TYPE_PING, Bytes::new()).encode();
+        self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
+        if self.submit(SubmitMsg::Ping { bytes, req_id }).is_err() {
+            self.pending.borrow_mut().remove(&req_id);
+            return false;
+        }
+        true
+    }
+
+    /// Close the connection from our side: `closed` first, so no new request
+    /// can enter, then every waiting caller is released — the ones in
+    /// `pending` by the clear, and a bulk value receive already in progress by
+    /// dropping its sender from `receiving`. The socket itself goes when the
+    /// last `Rc` does (pools evict on `is_closed`).
+    fn close_silent_peer(&self, silent_for: Duration) {
+        tracing::warn!(
+            addr = %self.peer_addr,
+            silent_ms = silent_for.as_millis() as u64,
+            in_flight = self.pending.borrow().len(),
+            "rpc peer stopped answering (no byte back, no ACK progress while bytes \
+             waited unsent, ping unanswered or unsendable); closing the connection"
+        );
+        self.closed.set(true);
+        self.pending.borrow_mut().clear();
+        drop(self.receiving.borrow_mut().take());
+    }
+
     /// Assign the next request id. Request id 0 is reserved for fire-and-forget
     /// so we skip it on wraparound.
     fn next_req_id(&self) -> u32 {
@@ -711,6 +885,159 @@ pub async fn write_vectored_chunked(
     Ok(())
 }
 
+/// The kernel's view of how the peer is taking our bytes, for a TCP
+/// connection's fd. It separates a slow LINK from a dead peer: while a large
+/// frame is still in our send buffer or in flight, nothing comes back and a
+/// ping queued behind it cannot be answered, but the peer's kernel keeps
+/// ACKing as the bytes arrive.
+///
+/// An ACK alone proves nothing, though: a stopped process's kernel ACKs every
+/// new request until its receive window fills — thousands of small frames. So
+/// ACK progress counts only while bytes of ours are queued UNSENT behind the
+/// peer's window or our congestion window (`tcpi_notsent_bytes > 0`), which is
+/// the slow-link shape. "Some bytes in flight" (`tcpi_unacked`) is not enough:
+/// the frozen peer's kernel delays each ACK up to ~40 ms, so under steady small
+/// traffic one segment is nearly always in flight at sample time.
+///
+/// The probe also cannot see bytes the peer has received and not read, which
+/// is exactly what a stopped process looks like.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct AckProbe(std::os::fd::RawFd);
+
+struct AckSample {
+    /// `tcpi_bytes_acked`: every byte of ours the peer has ACKed, ever.
+    bytes_acked: u64,
+    /// `tcpi_notsent_bytes > 0`: bytes of ours still in the send buffer,
+    /// behind the peer's window or the congestion window.
+    backlog: bool,
+}
+
+impl AckProbe {
+    /// `None` when the kernel does not report the counters (older than 4.6 or
+    /// not Linux); the keepalive then works from received bytes alone.
+    #[cfg(target_os = "linux")]
+    fn sample(&self) -> Option<AckSample> {
+        // `struct tcp_info` up to `tcpi_notsent_bytes`. glibc's definition in
+        // the `libc` crate stops before `tcpi_bytes_acked`; the kernel ABI only
+        // ever appends fields, and the returned length says whether these were
+        // filled.
+        #[repr(C)]
+        #[derive(Default)]
+        struct TcpInfoPrefix {
+            _u8s: [u8; 8],
+            _u32s: [u32; 24],
+            _pacing_rate: u64,
+            _max_pacing_rate: u64,
+            bytes_acked: u64,
+            _bytes_received: u64,
+            _segs_out: u32,
+            _segs_in: u32,
+            notsent_bytes: u32,
+        }
+        let mut info = TcpInfoPrefix::default();
+        let mut len = std::mem::size_of::<TcpInfoPrefix>() as libc::socklen_t;
+        // SAFETY: `info` is a plain-old-data buffer of `len` bytes; the kernel
+        // writes at most `len` bytes and reports how many.
+        let rc = unsafe {
+            libc::getsockopt(
+                self.0,
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                (&mut info as *mut TcpInfoPrefix).cast(),
+                &mut len,
+            )
+        };
+        let filled = std::mem::offset_of!(TcpInfoPrefix, notsent_bytes) + 4;
+        (rc == 0 && len as usize >= filled).then_some(AckSample {
+            bytes_acked: info.bytes_acked,
+            backlog: info.notsent_bytes > 0,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn sample(&self) -> Option<AckSample> {
+        None
+    }
+}
+
+/// Keepalive task: queues a ping after each silent `interval`, and closes the
+/// connection once the peer has shown no sign of life for `dead_after`.
+///
+/// Signs of life: any byte received — which also retires the ping — and, on
+/// TCP, the peer's kernel ACKing more of our bytes while more are queued
+/// behind them (`AckProbe`), which covers a large frame crossing a slow link.
+///
+/// Without the TCP counters (UCX), silent ticks are counted only once our ping
+/// has been WRITTEN: the writer is sequential, so a ping queued behind a large
+/// frame waits for that frame, and the wait says nothing about the peer. A
+/// writer stuck behind a peer that stopped reading then never gets the ping
+/// out, and that case stays with the callers' own deadlines, as before.
+///
+/// Timing from the last sign of life: TCP closes after 8–10 s (counting starts
+/// at the first silent tick, the one that queues the ping); UCX after ~10–12 s
+/// (counting starts once the ping is written).
+///
+/// Every fd sample is taken right after a `closed` check with no await
+/// between: either half's task sets `closed` when it ends, and dropping the
+/// client cancels this task with it, so the fd is always the connection's.
+///
+/// It upgrades its `Weak` only between awaits, so it never holds the last
+/// strong reference across a suspension: the client can be dropped at any
+/// sleep, and then the upgrade fails and the task ends.
+async fn keepalive_task(
+    client: Weak<RpcClient>,
+    rx_progress: Rc<Cell<u64>>,
+    pings_on_wire: Rc<Cell<u64>>,
+    ack_probe: Option<AckProbe>,
+    cfg: Keepalive,
+) {
+    let dead_ticks = cfg.unanswered_ticks_to_dead();
+    let mut seen_rx = rx_progress.get();
+    let mut seen_acked: Option<u64> = None;
+    // `pings_on_wire` when our ping was queued; `None` = none outstanding.
+    let mut queued_at: Option<u64> = None;
+    let mut unanswered_ticks: u64 = 0;
+    loop {
+        compio::time::sleep(cfg.interval).await;
+        let Some(client) = client.upgrade() else {
+            return;
+        };
+        if client.closed.get() {
+            return;
+        }
+        let sample = ack_probe.as_ref().and_then(AckProbe::sample);
+        let acked_more = match (&sample, seen_acked) {
+            (Some(now), Some(before)) => now.bytes_acked > before && now.backlog,
+            _ => false,
+        };
+        seen_acked = sample.as_ref().map(|s| s.bytes_acked);
+        let rx = rx_progress.get();
+        if rx != seen_rx {
+            seen_rx = rx;
+            queued_at = None;
+            unanswered_ticks = 0;
+            continue;
+        }
+        if queued_at.is_none() && client.send_ping() {
+            queued_at = Some(pings_on_wire.get());
+        }
+        if acked_more {
+            unanswered_ticks = 0;
+            continue;
+        }
+        // One ping outstanding at a time and the writer is FIFO, so a count
+        // past the mark is ours.
+        let ping_on_wire = matches!(queued_at, Some(mark) if pings_on_wire.get() > mark);
+        if sample.is_some() || ping_on_wire {
+            unanswered_ticks += 1;
+            if unanswered_ticks >= dead_ticks {
+                client.close_silent_peer(cfg.interval * unanswered_ticks as u32);
+                return;
+            }
+        }
+    }
+}
+
 /// SQ task: owns WriteHalf, drains the submit queue, writes to the socket.
 ///
 /// Sequential writes preserve per-caller submit order on the wire. If a
@@ -722,6 +1049,7 @@ async fn writer_task(
     mut writer: WriteHalf,
     mut submit_rx: mpsc::Receiver<SubmitMsg>,
     pending: Rc<RefCell<HashMap<u32, Pending>>>,
+    pings_on_wire: Rc<Cell<u64>>,
     peer_addr: SocketAddr,
 ) {
     while let Some(msg) = submit_rx.next().await {
@@ -731,15 +1059,16 @@ async fn writer_task(
         // to the exact shape of the Vectored message. Negligible cost
         // (2 integer ops per msg; the logging formatter only runs on the
         // rare error branch).
+        let is_ping = matches!(msg, SubmitMsg::Ping { .. });
         let (iov_count, total_bytes) = match &msg {
-            SubmitMsg::Single { bytes, .. } => (1usize, bytes.len()),
+            SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => (1usize, bytes.len()),
             SubmitMsg::Vectored { bufs, .. } | SubmitMsg::Prepared { bufs, .. } => {
                 let total: usize = bufs.iter().map(|b| b.len()).sum();
                 (bufs.len(), total)
             }
         };
         let result = match msg {
-            SubmitMsg::Single { bytes, .. } => {
+            SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => {
                 let BufResult(r, _) = writer.write_all(bytes).await;
                 r
             }
@@ -774,6 +1103,9 @@ async fn writer_task(
             }
             return;
         }
+        if is_ping {
+            pings_on_wire.set(pings_on_wire.get() + 1);
+        }
     }
 
     // submit_rx closed (all Senders dropped / RpcClient dropped). Exit cleanly.
@@ -784,6 +1116,8 @@ async fn writer_task(
 async fn read_loop(
     mut reader: ReadHalf,
     pending: Rc<RefCell<HashMap<u32, Pending>>>,
+    rx_progress: Rc<Cell<u64>>,
+    receiving: Rc<RefCell<Option<BulkWaiter>>>,
     addr: SocketAddr,
 ) -> Result<(), RpcError> {
     const READ_WINDOW: usize = 64 * 1024;
@@ -831,6 +1165,7 @@ async fn read_loop(
             tracing::debug!(addr = %addr, "rpc connection closed by peer");
             return Ok(());
         }
+        rx_progress.set(rx_progress.get().wrapping_add(1));
 
         // Peek the next frame header so a bulk value-response can be recv'd
         // straight into its destination instead of accumulating in the
@@ -880,17 +1215,29 @@ async fn read_loop(
                         // READ_LOOP acquires + owns the buffer: on caller-cancel
                         // the send below fails and `pb` drops → pool (no leak);
                         // the cancellable caller never owns the in-flight buffer.
+                        // The sender waits in `receiving` for the receive, where
+                        // a keepalive close can release it; taken back after,
+                        // it may already be gone.
+                        *receiving.borrow_mut() = Some(tx);
+                        let finish = |outcome: Result<BulkResp, RpcError>| {
+                            let waiter = receiving.borrow_mut().take();
+                            if let Some(tx) = waiter {
+                                let _ = tx.send(outcome);
+                            }
+                        };
                         let mut pb = autumn_transport::regpool_acquire(value_len);
                         if reader.is_ucx() {
                             let (dest, reg) = pb.dest_and_reg();
-                            match recv_value_ucx(&mut reader, &mut decoder, dest, reg).await {
+                            match recv_value_ucx(&mut reader, &mut decoder, dest, reg, &rx_progress)
+                                .await
+                            {
                                 ValueRecv::Done => {}
                                 ValueRecv::PeerClosed => {
-                                    let _ = tx.send(Err(RpcError::ConnectionClosed));
+                                    finish(Err(RpcError::ConnectionClosed));
                                     return Ok(());
                                 }
                                 ValueRecv::Failed(e) => {
-                                    let _ = tx.send(Err(e.into()));
+                                    finish(Err(e.into()));
                                     return Err(RpcError::ConnectionClosed);
                                 }
                             }
@@ -901,15 +1248,17 @@ async fn read_loop(
                                 let (dest, _reg) = pb.dest_and_reg();
                                 decoder.drain_into(dest)
                             };
-                            match reader.read_exact_into_pooled(pb, filled, value_len).await {
+                            match read_value_tcp(&mut reader, pb, filled, value_len, &rx_progress)
+                                .await
+                            {
                                 Ok(p) => pb = p,
                                 Err(e) => {
-                                    let _ = tx.send(Err(e.into()));
+                                    finish(Err(e.into()));
                                     return Err(RpcError::ConnectionClosed);
                                 }
                             }
                         }
-                        let _ = tx.send(Ok(BulkResp {
+                        finish(Ok(BulkResp {
                             buf: pb,
                             code,
                             message,
@@ -969,6 +1318,31 @@ enum ValueRecv {
     Failed(std::io::Error),
 }
 
+/// Largest step of a TCP bulk value receive between two keepalive progress
+/// marks. One `read_exact` over a whole 256 MiB read chunk would count as a
+/// single event at its END, so a slow-but-flowing transfer longer than
+/// `Keepalive::dead_after` would look like a silent peer. 4 MiB is at least
+/// one kernel receive per step anyway, so the split adds no syscalls that
+/// matter.
+const TCP_VALUE_PROGRESS_STEP: usize = 4 * 1024 * 1024;
+
+/// TCP bulk value recv into the pool buffer, `[filled, value_len)`.
+async fn read_value_tcp(
+    reader: &mut ReadHalf,
+    mut pb: autumn_transport::PooledBuf,
+    mut filled: usize,
+    value_len: usize,
+    rx_progress: &Cell<u64>,
+) -> std::io::Result<autumn_transport::PooledBuf> {
+    while filled < value_len {
+        let upto = value_len.min(filled + TCP_VALUE_PROGRESS_STEP);
+        pb = reader.read_exact_into_pooled(pb, filled, upto).await?;
+        rx_progress.set(rx_progress.get().wrapping_add(1));
+        filled = upto;
+    }
+    Ok(pb)
+}
+
 /// UCX bulk value recv: drain the value's already-buffered prefix out of the
 /// decoder, then recv the remainder straight into `dest` (one UCX Stream
 /// unpack; `reg` names the slab's memh when registered). `dest.len()` is the
@@ -978,12 +1352,16 @@ async fn recv_value_ucx(
     decoder: &mut FrameDecoder,
     dest: &mut [u8],
     reg: Option<&autumn_transport::RegisteredMem>,
+    rx_progress: &Cell<u64>,
 ) -> ValueRecv {
     let mut filled = decoder.drain_into(dest);
     while filled < dest.len() {
         match reader.recv_into(&mut dest[filled..], reg).await {
             Ok(0) => return ValueRecv::PeerClosed,
-            Ok(k) => filled += k,
+            Ok(k) => {
+                rx_progress.set(rx_progress.get().wrapping_add(1));
+                filled += k
+            }
             Err(e) => return ValueRecv::Failed(e),
         }
     }

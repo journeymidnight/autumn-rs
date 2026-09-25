@@ -352,5 +352,10 @@ pins the page-boundary dedupe (reconcile over a >page corpus counts exactly).
 
 With cyper 0.9, OpenAiEmbedder::new returns Result<Self, EmbedError> so TLS/client
 initialization errors can be reported by the application. openai-embed explicitly
-selects compio/ring: the rustls feature alone no longer selects a crypto provider.
-The existing wire and body/header timeout tests cover this optional feature.
+selects compio/ring: the rustls feature alone no longer selects a crypto provider,
+and without it an `https://` embedder panics on its first handshake instead of
+returning an error — fatal under this workspace's `panic = "abort"`.
+`an_https_embedder_fails_without_panicking` is an ablation-verified regression
+test for that (goes red if `compio/ring` is dropped from the feature). The
+existing wire and body/header timeout tests cover the rest of this optional
+feature.

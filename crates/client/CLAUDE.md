@@ -313,7 +313,10 @@ failover via `rotate_manager` on connection error.
 - `mgr_call(msg_type, payload)` — raw manager RPC.
 - `mgr_call_retry(msg_type, payload, max_retries)` — with round-robin retry.
 - `ps_call(ps_addr, msg_type, payload)` — raw PS RPC.
-- `get_ps_client(ps_addr)` — get/create PS connection.
+- `get_ps_client(ps_addr)` — get/create PS connection. Both this cache and
+  `mgr_client()`'s skip a client whose `is_closed()` is true and open a fresh one,
+  so a connection the rpc keepalive judged silent (autumn-rpc CLAUDE.md "Dead-peer
+  detection") is replaced before the next call rather than failing it first.
 - `resolve_key(key) → (part_id, ps_addr)` — route key to partition.
 - `resolve_part_id(part_id) → ps_addr` — resolve partition to PS.
 - `all_partitions() → Vec<(part_id, ps_addr)>` — list all partitions.

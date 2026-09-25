@@ -1516,15 +1516,19 @@ pub(crate) struct InflightCompletion {
 
 /// Consume one completion: run Phase 3 (memtable insert + client reply),
 /// update metrics, and surface `LockedByOther` via the shared flag so the
-/// main loop can terminate the partition.
+/// main loop can terminate the partition. Returns how many client frames were
+/// just answered — the admission slots this completion released, which is how
+/// the loop's `CoalesceWindow` sizes the refill it waits for. A failed batch
+/// answers nothing here — its clients get an error and back off, so no refill
+/// is coming.
 pub(crate) async fn handle_completion(
     part: &Rc<RefCell<PartitionData>>,
     metrics: &mut WriteLoopMetrics,
     locked_by_other: &Rc<Cell<bool>>,
     part_id: u64,
     c: InflightCompletion,
-) {
-    match finish_write_batch(part, c.data, c.phase2_result).await {
+) -> usize {
+    let acked = match finish_write_batch(part, c.data, c.phase2_result).await {
         Ok(stats) => {
             // LAT-1: every op in a group-committed batch experienced the
             // batch's end-to-end latency — observe `ops` at that value.
@@ -1533,7 +1537,9 @@ pub(crate) async fn handle_completion(
                 .metrics
                 .write_lat
                 .observe_n(stats.end_to_end_ns, stats.ops);
-            metrics.record(stats)
+            let acked = stats.replies as usize;
+            metrics.record(stats);
+            acked
         }
         Err(e) => {
             if is_locked_by_other(&e) {
@@ -1542,9 +1548,11 @@ pub(crate) async fn handle_completion(
             } else {
                 tracing::error!("write batch error: {e}");
             }
+            0
         }
-    }
+    };
     metrics.maybe_report(part_id);
+    acked
 }
 
 // ---------------------------------------------------------------------------
@@ -2033,12 +2041,16 @@ pub(crate) async fn finish_write_batch(
 
     // Send replies AFTER releasing the partition borrow so a poorly-timed
     // executor wake on the waking ps-conn can't re-enter PartitionData.
+    let mut replies = 0u64;
     for resp in responders {
-        resp.send_ok();
+        if resp.send_ok() {
+            replies += 1;
+        }
     }
 
     Ok(BatchStats {
         ops: batch_ops,
+        replies,
         batch_size: batch_ops,
         phase1_ns: bd.phase1_ns,
         phase2_ns: duration_to_ns(phase2_elapsed),

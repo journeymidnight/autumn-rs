@@ -1746,8 +1746,17 @@ uses cyper-core 0.9; manager scheduling and protocol/storage formats are unchang
 
 ## Outbound connection lifetime
 
-The manager's RpcConn preserves RpcError through frame decoding. ConnPool
-keeps a connection after a peer status response, and evicts after I/O, frame,
-closed-connection or timeout failures. A timed-out RpcConn remains unusable
-because its sequential protocol was interrupted. src/connection_tests.rs
+`ConnPool` (manager → extent node: df, recovery, EC-conversion dispatch,
+deletes) holds one multiplexed `autumn_rpc::client::RpcClient` per address.
+It keeps a connection after a peer status response, evicts after I/O, frame,
+closed-connection or timeout failures, and replaces a cached client whose
+`is_closed()` is true — which now includes a peer the rpc keepalive judged
+silent (see autumn-rpc CLAUDE.md "Dead-peer detection"). src/connection_tests.rs
 counts actual accepts and checks both ordinary and timed calls.
+
+This pool used to be a hand-rolled sequential connection with its own frame
+loop. No keepalive reached it, so a connection to a node that had stopped
+answering was only ever found by each caller's own timeout, one call at a
+time. It also handed one `&mut RpcConn` to every task through a raw pointer:
+two tasks calling the same node concurrently read each other's replies off one
+socket. Do not reintroduce a private connection type here.

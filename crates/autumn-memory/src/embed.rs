@@ -787,4 +787,25 @@ mod openai_wire_tests {
         let err = e.embed("hello").await.expect_err("must time out");
         assert!(err.0.contains("timed out"), "message was {}", err.0);
     }
+
+    /// An `https://` embedder must fail as an error, not a panic. rustls needs
+    /// a process-level crypto provider, and cyper's rustls backend enables
+    /// none: without `compio/ring` in the `openai-embed` feature the TLS
+    /// handshake panics ("Could not automatically determine the process-level
+    /// CryptoProvider"), which under `panic = "abort"` kills memory-mcp on its
+    /// first embed call. The listener accepts and says nothing, so the call
+    /// gets as far as building the TLS client and then fails on the handshake.
+    #[compio::test]
+    async fn an_https_embedder_fails_without_panicking() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        compio::runtime::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(stream);
+        })
+        .detach();
+        let e = OpenAiEmbedder::new(&format!("https://127.0.0.1:{port}"), "nomic-embed-text")
+            .expect("HTTP client");
+        assert!(e.embed("hello").await.is_err());
+    }
 }

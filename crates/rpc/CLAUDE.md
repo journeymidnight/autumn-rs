@@ -202,7 +202,101 @@ on the extent node (e.g. 8 MiB after 8 MiB appends) instead of the former fixed
 512 KiB / 64 KiB scratch `Vec`. Same sites and frequency: only a connection torn
 down with a UCX read pending.
 
-`MSG_TYPE_PING = 0xFF` is reserved; heartbeat lives in each per-component pool.
+## Dead-peer detection (`Keepalive`, `MSG_TYPE_PING = 0xFF`)
+
+A peer can be dead while its transport is not: a frozen or wedged process whose
+kernel still ACKs, a flow a middlebox dropped without a RST, a UCX endpoint with
+peer-failure detection off (`UCP_ERR_HANDLING_MODE_NONE`, see transport). None of
+those produce the read/write error `closed` used to wait for. The 2026-09-22
+incident was this: fuse reads answered EIO after 30 s for hours over connections
+that were ESTABLISHED with empty queues.
+
+Every `RpcClient` runs a third held task, `keepalive_task`, and the rule is about
+SILENCE. Signs of life: any byte received (`read_loop` bumps `rx_progress` on every
+read, each UCX `recv_into`, each 4 MiB step of a TCP bulk value — `read_value_tcp`);
+and on TCP, the peer's kernel ACKing more of our bytes WHILE more are queued unsent
+behind them — `AckProbe`, `TCP_INFO` `tcpi_bytes_acked` / `tcpi_notsent_bytes`,
+read through a local `repr(C)` prefix because the `libc` crate's glibc `tcp_info`
+stops early. After `interval` (2 s)
+with no sign the client queues `MSG_TYPE_PING`; once the silence has lasted
+`dead_after` (8 s),
+`close_silent_peer` sets `closed`, clears `pending`, releases a bulk value receive
+already under way (its sender waits in `receiving`, outside `pending`), and logs
+`rpc peer stopped answering`. The socket goes when the pool drops the client.
+TCP: closed 8–10 s after the last sign of life (the count starts at the tick that
+queues the ping); UCX: ~10–12 s (the count starts once the ping is written). Every pool replaces
+the client on `is_closed()` — `stream::ConnPool`, the manager's `ConnPool`, the
+SDK's `ps_conns` / `mgr_conn`.
+
+- **Why ACKs count only with a send backlog.** Nothing comes back while a
+  large frame crosses a slow link, and the ping queued behind it cannot be
+  answered until the frame is through. Timing from when the ping was queued — or
+  even handed to the socket: this host autotunes up to 32 MiB of send AND of
+  receive buffer — closed healthy connections mid-transfer, on every retry alike
+  (`a_large_request_on_a_slow_link_is_not_mistaken_for_death`). But a stopped
+  process's kernel ACKs every NEW request until its receive window fills —
+  thousands of small frames — so an ACK is evidence only while more of our bytes
+  wait UNSENT behind it (`tcpi_notsent_bytes > 0`: window- or cwnd-limited, the
+  slow-link shape). "Some bytes in flight" (`tcpi_unacked`) is not enough: the
+  frozen peer's kernel delays each ACK up to ~40 ms, so under steady small traffic
+  a segment is nearly always in flight at sample time
+  (`caller_traffic_to_a_frozen_peer_does_not_keep_it_alive`,
+  `steady_small_requests_to_a_frozen_peer_do_not_keep_it_alive`: each earlier
+  rule kept a frozen peer alive as long as callers kept sending). A heavy sender
+  to a frozen peer does keep a backlog while the peer's receive buffer fills, so
+  its close waits for that fill (≤ 32 MiB here) plus 8 s. Bytes the peer received
+  and has not read are invisible to both signals — which is what a stopped
+  process looks like, and is meant to be closed.
+- **Never lock `SO_SNDBUF` on an rpc socket.** The slow-link exemption needs
+  unsent bytes to exist: autotuning sizes the send buffer at about twice the
+  congestion window, so a window-limited transfer always leaves a backlog. A
+  fixed buffer smaller than the window would put everything in flight and make a
+  slow link read as silence.
+- **Why the close does not cancel the reader.** On UCX the bulk receive writes
+  into a borrowed pool slab; a cancel that does not complete (the drain bails at
+  its progress cap) would hand the slab back to the pool while UCX may still write
+  into it. The waiting caller is released from `receiving` instead
+  (`a_bulk_receive_frozen_mid_value_is_released_by_the_close`).
+- **UCX has no ACK counter**: silent ticks count only once the ping has been
+  WRITTEN (`pings_on_wire`, bumped by `writer_task`), so a ping queued behind a
+  large frame waits for it; a writer stuck behind a peer that stopped reading
+  never gets the ping out, and that case stays with the callers' own deadlines.
+  Same without `TCP_INFO` (non-Linux).
+- **What it cannot tell apart from death:** a server connection loop back-pressured
+  at its in-flight cap (PS 4, EN 64) with every one of those requests stalled
+  ≥ `dead_after` — it stops reading, so nothing is answered. The SDK's first
+  attempt already evicts a PS connection after 5 s in that state; for PS→EN it
+  takes 64 appends stalled ≥ 8 s on one connection, and the close then reaches
+  `launch_append` as a connection error (see stream CLAUDE.md).
+- **Why not rely on each caller's timeout.** A caller's timeout evicts only if IT
+  fires. The SDK's manager call uses the full 30 s `rpc_timeout`, and the fuse
+  read that makes it is bounded by a 30 s `REPLY_TIMEOUT` that started earlier —
+  so the outer timer always cancelled the call first, the dead connection was
+  never evicted, and every later read (stale routing → region refresh → the same
+  connection) did the same. `scripts/fuse_dead_peer_chaos.sh` scenario
+  `mgr-freeze` reproduces it: every read EIO for the whole run before this,
+  worst read 10.2 s then ≤0.2 s after.
+- **A connection whose replies arrive at least every `interval` never pings.** A
+  peer that is slow on one request but answers others (or the ping) is never
+  judged; tests
+  `a_slow_request_on_an_answering_peer_is_not_mistaken_for_death`,
+  `an_idle_connection_stays_open_whatever_the_peer_answers_the_ping_with`.
+- **Servers answer in the decode loop**, never through a dispatch that can queue:
+  EN `process_frames_backpressured` (straight into `tx_bufs`), PS
+  `push_one_frame_to_inflight` (before the authz gate — the ping names no
+  partition and carries no data, and an un-helloed connection must still prove
+  the peer alive), manager `handle_connection`.
+- **No wire-version bump.** Any reply proves the peer alive, including the
+  `unknown msg_type` error an older server sends; the client never inspects it.
+- **Cost.** Loaded connections: one `Cell` increment per socket read, no ping.
+  Idle connections: an 18-byte frame each way every ~4 s. Every TCP connection:
+  one `TCP_INFO` getsockopt per 2 s tick.
+- **UCX.** Detection works (verified with SIGSTOP), but the evicted endpoint is
+  still leaked by design (`UCP_ERR_HANDLING_MODE_NONE`, see transport); PEER
+  mode is a separate decision.
+- The task holds a `Weak<RpcClient>` and upgrades only between awaits, so it never
+  keeps a connection alive and never drops the last `Rc` (its own `JoinHandle`)
+  from inside itself.
 
 ## RpcClient — SQ/CQ architecture
 

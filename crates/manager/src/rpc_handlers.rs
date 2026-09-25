@@ -203,6 +203,15 @@ impl AutumnManager {
                             let req_id = frame.req_id;
                             let msg_type = frame.msg_type;
                             let payload = frame.payload;
+                            // Keepalive: answered in the decode loop, never
+                            // spawned, so it proves this loop is reading.
+                            if msg_type == autumn_rpc::MSG_TYPE_PING {
+                                let pong = Frame::response(req_id, msg_type, Bytes::new());
+                                // best-effort, like every reply here: a closed
+                                // `resp_rx` means the connection is gone.
+                                let _ = resp_tx.unbounded_send(pong.encode());
+                                continue;
+                            }
                             // Version handshake + admission, SYNCHRONOUSLY in
                             // the decode loop rather than inside the spawned
                             // task: the per-connection value is `!Send`-free

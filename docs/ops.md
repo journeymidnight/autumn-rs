@@ -2244,6 +2244,36 @@ P-log`; delete all PS pods in parallel to rebuild.)
 
 ## Chaos suites
 
+### Dead peer behind a healthy connection (`fuse_dead_peer_chaos.sh`)
+
+A connection whose peer stopped answering while TCP still reports it ESTABLISHED
+must not wedge fuse reads. The client closes a connection that has shown no sign
+of life for 8–10 s (TCP; ~10–12 s on UCX) — no byte back, and on TCP no new ACKs
+while more of its bytes wait unsent behind them; it pings after 2 s of silence —
+and logs
+`rpc peer stopped answering … addr=<peer>`; that line should name only peers you
+actually faulted.
+
+```bash
+# TCP: both scenarios on one cluster (~6 min). Needs python3; mounts /mnt/autumn-fuse-dpd.
+AUTUMN_DATA_ROOT=/data05/autumn-dpd ./scripts/fuse_dead_peer_chaos.sh
+# Every read pass reads all files concurrently, so the fault is detected through
+# live traffic, not in a quiet gap.
+#   mgr-freeze: the mount reaches the manager through scripts/freeze_proxy.py; its
+#               open flows are frozen (sockets kept open, nothing forwarded) and every
+#               partition is split, so reads need a region refresh over a dead flow.
+#   en-stop:    SIGSTOP one extent node for 90 s.
+# UCX (en-stop only — the relay cannot carry UCX); build with the ucx feature first:
+cargo build --release -p autumn-server -p autumn-fuse --bins --features autumn-server/ucx,autumn-fuse/ucx
+AUTUMN_BIND_HOST='[<RoCE IP>]' AUTUMN_TRANSPORT=ucx ./scripts/fuse_dead_peer_chaos.sh
+```
+
+Pass = every read after the 30 s grace window succeeds sha-exact, and every file
+reads back sha-exact once the fault is lifted. Expected shape: mgr-freeze worst
+read ~10 s, then sub-second; en-stop worst read ~18 s. A mgr-freeze run where every
+read is `ERR` after 30 s is the wedge this guards against. The script kills only
+what it started.
+
 ```bash
 # PS-failover chaos (2 PSes, kill one -> partitions must migrate, zero loss):
 cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
@@ -3119,6 +3149,69 @@ cluster, runs tcp/ucx × 4K/8M and compares each leg against
 `perf/perf_baseline_<transport>_p8_d8_s<size>.json`; a leg passes when ops/s ≥ 80% of
 baseline and p99 ≤ 2×). The `--min-pipeline-batch` PS flag is deprecated
 (parsed, warns, no effect) — batch sizing is adaptive and needs no tuning knob.
+
+**Pin the cluster away from the tenants first.** This box is shared with
+inference jobs (sglang, Ray), and a perf number taken while the cluster shares
+cores with them is not comparable to anything — not to the committed baseline,
+not to a run an hour later. On 2026-09-24 a full day of 4K-write samples
+(33-48K ops/s, "a regression") came from a cluster pinned to NUMA node 0 next to
+sglang's schedulers and a 100%-busy python; the same binaries on quiet node-1
+cores gave 67-84K. Contention also distorts the batch-size signal below: a
+descheduled loop finds both connections' frames piled up and reports a bigger
+batch than it would on quiet cores. Before every perf run:
+
+```bash
+# 30 s of per-CPU busy% — any core above a few percent belongs to someone else
+awk 'NR==FNR{if($1~/^cpu[0-9]/){a[$1]=$2+$3+$4+$6+$7+$8; t[$1]=$2+$3+$4+$5+$6+$7+$8}; next}
+     $1~/^cpu[0-9]/{n=substr($1,4)+0; b=$2+$3+$4+$6+$7+$8; tt=$2+$3+$4+$5+$6+$7+$8;
+     u=100*(b-a[$1])/(tt-t[$1]); if(u>3) printf "%d:%.0f%% ", n, u}' /proc/stat <(sleep 30; cat /proc/stat); echo
+# the tenants' hot threads, where they run and what they are allowed to run on
+ps -eLo pcpu,psr,tid,comm --sort=-pcpu | awk '$1>20' | head -20
+taskset -pc <tid>
+# NUMA halves and hyperthread siblings: keep EN and PS on ONE node, and never
+# put two of our processes on the two siblings of one physical core
+lscpu | grep 'NUMA node[0-9]'; cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list
+```
+
+Then hand `cluster.sh` an explicit layout on the quiet node (EN cpuset length
+must equal `AUTUMN_EXTENT_SHARDS`; the PS needs ≥ 2 cores per partition; ranges
+may be comma lists). The layout that worked on 2026-09-25 with sglang pinned to
+node 0 (`0-47,96-143`) and its stragglers on 54/58/70/71/76/77/82/94 of node 1:
+
+```bash
+export AUTUMN_EN1_CPUSET=59-66 AUTUMN_EN2_CPUSET=83-90 AUTUMN_EN3_CPUSET=72-75,78-81 \
+       AUTUMN_PS_CPUSET=48-53,55-57,67-69,91-93,95 AUTUMN_EXTENT_SHARDS=8
+```
+
+The bench client stays unpinned (a pinned loopback client is its own artifact),
+so read ops/s move with where the client lands relative to the PS's node
+(≈1.3M with the PS on node 0, ≈0.5M on node 1 on this box): compare reads only
+within one layout. Interleave A and B runs (A B A B …) so tenant drift hits both
+sides alike, and record the tenants' hot threads at the start and end of every
+run next to the numbers.
+
+**Check the group-commit batch size, not just ops/s.** On this host a single
+perf-check sample of 4K write ops/s swings 30-50% run to run (same binary), so
+ops/s alone cannot tell a write-pipeline regression from noise; the batch size
+can. While a 4K write leg runs, the PS logs one `partition write summary` line
+per partition per second; the ops-weighted `avg_batch_size` over the write phase
+is the number to compare:
+
+```bash
+sed 's/\x1b\[[0-9;]*m//g' /tmp/autumn-rs-logs/ps.log | grep 'partition write summary' \
+  | awk '{for(i=1;i<=NF;i++){split($i,a,"="); if(a[1]=="ops")o=a[2]; if(a[1]=="avg_batch_size")b=a[2]}
+          if(o+0>50){O+=o; B+=b*o}} END{printf "avg_batch=%.2f over %d ops\n", B/O, O}'
+```
+
+With the default bench (16 threads × depth 8 over 8 partitions, 2 connections per
+partition, `--conn-inflight-cap` 4) expect **≈8**: both connections' admitted
+ops ride one append (8.00 on every isolated run). **≈4** means the loop is
+launching on one connection's worth — the fragmentation that
+`MIN_PIPELINED_BATCH` + `CoalesceWindow` in `partition_loop` exist to prevent
+(with the tenants pinned away: 4.4 → 8.00, 56K → 74K 4K-write ops/s; see the
+partition-server guide, "Natural batching").
+Copy `ps.log` out before the next leg starts — `perf_check.sh` wipes
+`/tmp/autumn-rs-logs/` between legs.
 
 ## Inode-lease + close-to-open coherence (in flight)
 

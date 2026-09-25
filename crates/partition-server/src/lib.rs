@@ -324,6 +324,81 @@ fn max_write_batch() -> usize {
 pub(crate) const MAX_WRITE_BATCH_BYTES: usize =
     autumn_rpc::frame::MAX_PAYLOAD_LEN as usize - (1 << 20);
 
+/// A batch launched while another is already in flight must carry at least
+/// this many ops. The EN serializes appends to one extent, so a second batch
+/// does not overlap the first — it adds a whole append of its own. Under the
+/// perf bench a partition serves two client connections × the PS
+/// per-connection admission of 4 = 8 ops; launching on the first
+/// connection's 4 split every burst into two 4-op appends (see
+/// `partition_loop` (B)). Measured with the tenants pinned away, 4K writes
+/// over 8 partitions: average batch 4.4 without the gate, 8.00 with it, +30%
+/// write throughput. An idle partition (nothing in flight) launches whatever
+/// it holds at once — the gate only ever delays an op that would have queued
+/// behind the in-flight append on the EN anyway.
+pub(crate) const MIN_PIPELINED_BATCH: usize = 8;
+
+/// How long `partition_loop` waits, right after a batch completes, for the
+/// refill that batch's acks just triggered before launching a partial burst
+/// with nothing in flight. Without it the two connections a partition serves
+/// settle into strict alternation: A's 4 ops complete, B's 4 (held while A was
+/// in flight) launch instantly, A's refill lands ~100 µs later and is held
+/// behind B's — every batch is one connection's worth, forever. One window
+/// after a completion lets A's refill join B's, both are acked together, both
+/// refill together, and the loop stays in lock-step from then on.
+///
+/// WHAT the window waits for is sized by `CoalesceWindow`, never by a fixed
+/// count. A fixed `MIN_PIPELINED_BATCH` target made a lone writer — one
+/// connection, one op at a time, which is autumnfs writing one file — sit out
+/// the whole window on every op for a refill that was already complete:
+/// +0.13 ms p50 and -20% throughput at depth 1.
+pub(crate) const LAUNCH_COALESCE_WINDOW: Duration = Duration::from_micros(200);
+
+/// The coalescing window `partition_loop` opens after a completion, and the
+/// size of the refill it waits for.
+///
+/// Every client frame a completion answers releases one admission slot on
+/// its connection (`ps_conn_inflight_cap`), and each slot refills with one
+/// frame of at least one op. So the ops already held at the completion (a
+/// burst partner's, taken in while the batch was in flight) plus the frames
+/// answered is a count `pending` is guaranteed to reach once every refill has
+/// landed — the window holds a launch only while `pending` is below that
+/// target and the deadline has not passed. Completions inside one window add
+/// up; a launch closes it. A lone writer's refill launches the instant it
+/// arrives (target 1), one connection refilling its 4 admitted ops in one
+/// read launches at 4, and two desynchronized connections (4 held + 4
+/// answered) wait for the second refill and re-lock at 8. Counting frames,
+/// not ops, is what keeps a batch-put stream and a fence record honest: a
+/// 50-op batch frame answered is one slot, and its writer's next frame —
+/// whatever its size — launches at once; a fence record answers nobody and
+/// counts for nothing.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CoalesceWindow {
+    deadline: Option<Instant>,
+    target: usize,
+}
+
+impl CoalesceWindow {
+    /// A completion just answered `acked` client frames while `held` ops were
+    /// pending.
+    pub(crate) fn arm(&mut self, held: usize, acked: usize, now: Instant) {
+        let open = self.deadline.is_some_and(|d| now < d);
+        self.target = if open { self.target } else { held } + acked;
+        self.deadline = Some(now + LAUNCH_COALESCE_WINDOW);
+    }
+
+    /// A batch launched, or the window ran out: nothing left to wait for.
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// With `pending` ops queued and nothing in flight: how much longer to
+    /// wait for the refill before launching. `None` means launch now.
+    pub(crate) fn holds(&self, pending: usize, now: Instant) -> Option<Duration> {
+        let deadline = self.deadline?;
+        (pending > 0 && pending < self.target && now < deadline).then(|| deadline - now)
+    }
+}
+
 /// R4 4.4 — maximum number of P-log `append_batch` futures in flight
 /// concurrently per partition. Higher values give more pipeline depth so
 /// multiple 256-request group-commit batches overlap their replica RTT, but
@@ -2099,7 +2174,9 @@ impl BatchPutAccumulator {
             kind,
         })
     }
-    pub(crate) fn record(&self, idx: usize, status: u8) {
+    /// Record one op's status. Returns whether this was the op that answered
+    /// the client — the batch's single reply goes out with its last op.
+    pub(crate) fn record(&self, idx: usize, status: u8) -> bool {
         {
             let mut s = self.statuses.borrow_mut();
             if let Some(slot) = s.get_mut(idx) {
@@ -2126,8 +2203,10 @@ impl BatchPutAccumulator {
                     }
                 };
                 let _ = outer.send(Ok(bytes));
+                return true;
             }
         }
+        false
     }
 }
 
@@ -2163,8 +2242,12 @@ pub(crate) enum WriteResponder {
 
 impl WriteResponder {
     /// Reply success (batch committed). Encodes the appropriate RPC response
-    /// frame bytes and forwards them to the outer ps-conn oneshot.
-    pub(crate) fn send_ok(self) {
+    /// frame bytes and forwards them to the outer ps-conn oneshot. Returns
+    /// whether a client frame was answered — one admission slot released on
+    /// its connection: always for a Put or Delete, only on the last op of a
+    /// batch frame, never for a fence record. `CoalesceWindow` sizes the
+    /// refill it waits for by that count.
+    pub(crate) fn send_ok(self) -> bool {
         match self {
             WriteResponder::Put { outer, key } => {
                 let bytes = partition_rpc::rkyv_encode(&PutResp {
@@ -2173,6 +2256,7 @@ impl WriteResponder {
                     key,
                 });
                 let _ = outer.send(Ok(bytes));
+                true
             }
             WriteResponder::Delete { outer, key } => {
                 let bytes = partition_rpc::rkyv_encode(&DeleteResp {
@@ -2181,11 +2265,10 @@ impl WriteResponder {
                     key,
                 });
                 let _ = outer.send(Ok(bytes));
+                true
             }
-            WriteResponder::BatchPut { accum, idx } => {
-                accum.record(idx, 0);
-            }
-            WriteResponder::Fence => {}
+            WriteResponder::BatchPut { accum, idx } => accum.record(idx, 0),
+            WriteResponder::Fence => false,
         }
     }
 
@@ -2275,6 +2358,10 @@ impl WriteRequest {
 #[derive(Debug, Default)]
 pub(crate) struct BatchStats {
     ops: u64,
+    /// Client frames answered by this batch — its ops minus the fence
+    /// records and minus all but the last op of every batch frame. What
+    /// `CoalesceWindow` counts, because it is what released admission slots.
+    replies: u64,
     batch_size: u64,
     phase1_ns: u64,
     phase2_ns: u64,
@@ -5655,6 +5742,13 @@ fn push_one_frame_to_inflight(
     // split off by the decoder; thread it into the delegate as bulk_value so
     // enqueue_put_bulk uses it directly (payload = [meta][key] only).
     let frame_value = frame.value;
+    // Keepalive, before the authz gate and routing: it names no partition and
+    // carries no data, and a connection that has not said hello yet must still
+    // be able to prove the peer alive.
+    if msg_type == autumn_rpc::MSG_TYPE_PING {
+        tx_bufs.push(Frame::response(req_id, msg_type, Bytes::new()).encode());
+        return;
+    }
     // AUTH_HELLO bind / per-request key-prefix + exp gate, BEFORE
     // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
     // ready completion; it never reaches serve/delegate.
@@ -6816,6 +6910,9 @@ async fn partition_loop(
     let wal_gap_cap = max_wal_gap();
     let mut metrics = WriteLoopMetrics::new();
     let mut pending: Vec<WriteRequest> = Vec::new();
+    // The coalescing window opened by the most recent completion; see
+    // `CoalesceWindow` and (B0) below. Closed by every launch.
+    let mut window = CoalesceWindow::default();
     // set when `drain_rx` delivered a request; once set, stop
     // pulling new items from `req_rx` and head for the tail-drain block.
     let mut drain_ack: Option<oneshot::Sender<()>> = None;
@@ -6864,7 +6961,8 @@ async fn partition_loop(
         // (A) Opportunistic CQ drain — run Phase 3 for every completion that
         // is already ready without blocking.
         while let Some(Some(c)) = inflight.next().now_or_never() {
-            handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+            let acked = handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+            window.arm(pending.len(), acked, Instant::now());
             if locked_by_other.get() {
                 break 'outer;
             }
@@ -6897,45 +6995,64 @@ async fn partition_loop(
         let n_inflight = inflight.len();
         let at_cap = n_inflight >= cap;
 
-        // (B) Launch a new batch whenever the pipeline has room
-        // (natural batching). `pending` holds everything the SQ had
-        // delivered as of the last (E) drain, so this ships the largest
-        // batch currently available; requests arriving while it is in
-        // flight accumulate into the next batch — batch size adapts to
-        // the arrival rate times the in-flight latency, group-commit
-        // style. The legacy gate (`n_inflight == 0 || pending >=
-        // MIN_PIPELINE_BATCH(256)`) made the pipeline lock-step whenever
-        // per-partition concurrency < 256: after the first launch,
-        // pending could never reach 256, so the loop waited for the
-        // WHOLE pipeline to drain before launching again — effective
-        // depth=1 (the background.rs comment documented this
-        // and pushed it onto an `AUTUMN_PS_MIN_BATCH` knob nobody set).
-        // The R3 Task 5b fragmentation concern (splitting a naturally
-        // full burst into tiny batches) is prevented structurally, not
-        // by the gate: ps-conn bursts enqueue every frame into req_rx
-        // before this same-thread task is polled, and (E) drains the
-        // whole channel into `pending` each iteration, so a full burst
-        // still launches as ONE batch. When imm is full, do not
-        // launch — the next batch's Phase 3 maybe_rotate would exceed
-        // the cap.
-        let ready_to_launch = !pending.is_empty() && !at_cap && !imm_full;
-        if ready_to_launch {
-            // Bound the batch by BYTES here rather than where `pending` is
-            // filled: several sites push into it, and this is the one place
-            // that decides what becomes a single `AppendReq`. Everything past
-            // the ceiling stays queued and launches as the next batch — no
-            // request is dropped or failed, it just does not ride this frame.
-            //
-            // One semantic consequence, and it is acceptable: a BatchPut whose
-            // ops straddle the cut is no longer durable in ONE append, so a
-            // crash between the two halves leaves half of it durable. Nothing
-            // ACKED is lost — the accumulator fires the client's response on
-            // the last op, so a half-written BatchPut has not answered anyone —
-            // and reaching the cut at all takes gigabytes in one call.
-            // Always take at least one, or a request larger than the cap could
-            // never make progress (it cannot be: a Put is inline-capped at
-            // 64 MiB, far below).
-            let batch = take_byte_bounded_batch(&mut pending);
+        // (B0) Coalescing window. Nothing in flight, a PARTIAL refill pending,
+        // and a batch completed within `LAUNCH_COALESCE_WINDOW`: the acks that
+        // completion sent are still bringing ops — `CoalesceWindow` knows how
+        // many — so wait for them (or the window) before launching. Requests
+        // that arrive meanwhile are taken in and the check repeats; the
+        // deadline bounds the total wait. A partition with no recent
+        // completion is idle and skips straight to (B), and a refill that is
+        // already whole — a lone writer's next op — is never held.
+        if n_inflight == 0 {
+            if let Some(wait) = window.holds(pending.len(), Instant::now()) {
+                let req_fut = req_rx.next();
+                let timer = compio::time::sleep(wait);
+                futures::pin_mut!(req_fut, timer);
+                match select(req_fut, timer).await {
+                    Either::Left((Some(req), _)) => {
+                        handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
+                        continue;
+                    }
+                    Either::Left((None, _)) => break,
+                    Either::Right(((), _)) => window.clear(),
+                }
+            }
+        }
+
+        // (B) Launch a new batch when the pipeline has room. `pending` holds
+        // everything the SQ had delivered as of the last (E) drain, so a
+        // launch ships the largest batch currently available; requests
+        // arriving while it is in flight accumulate into the next batch —
+        // batch size adapts to arrival rate × in-flight latency,
+        // group-commit style. With nothing in flight the launch is
+        // unconditional. With a batch already in flight `take_launch_batch`
+        // refuses to FRAGMENT: it holds a small `pending` until it reaches
+        // `MIN_PIPELINED_BATCH` or the in-flight batch completes and (A)/(D)
+        // bring the loop back here with n_inflight == 0.
+        //
+        // WHY the gate exists again (an earlier one, `pending >= 256`, was
+        // removed as unreachable): the EN serializes appends to one extent,
+        // so a second small batch overlaps nothing and costs a whole extra
+        // append. The claim that replaced the gate — "a burst is enqueued in
+        // full before this task is polled, so it cannot be split" — does not
+        // hold: the two connections a partition serves under the perf bench
+        // wake this loop one at a time, and the unconditional launch splits
+        // an 8-op burst into two 4-op appends. Measured with the tenants
+        // pinned away: average batch 4.4 without the gate, 8.00 with it,
+        // +30% 4K write throughput. Under CPU contention the loop is
+        // descheduled often enough that both connections' frames pile up by
+        // accident (6.2 per batch), which is how a runtime upgrade first
+        // exposed this as a "regression".
+        //
+        // When imm is full, do not launch — the next batch's Phase 3
+        // maybe_rotate would exceed the cap.
+        let launch = if at_cap || imm_full {
+            None
+        } else {
+            take_launch_batch(&mut pending, n_inflight)
+        };
+        if let Some(batch) = launch {
+            window.clear();
             // start_write_batch is now async — small batches stay
             // inline in the future (no spawn_blocking), big batches
             // (>= PHASE1_OFFLOAD_THRESHOLD) await spawn_blocking. The
@@ -6962,7 +7079,8 @@ async fn partition_loop(
         // (C) Pipeline full — only CQ can progress.
         if at_cap {
             if let Some(c) = inflight.next().await {
-                handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                let acked = handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                window.arm(pending.len(), acked, Instant::now());
                 if locked_by_other.get() {
                     break;
                 }
@@ -7028,7 +7146,8 @@ async fn partition_loop(
                 Either::Left((_, _)) => continue,
                 Either::Right((maybe_c, _)) => {
                     if let Some(c) = maybe_c {
-                        handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                        let acked = handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                        window.arm(pending.len(), acked, Instant::now());
                         if locked_by_other.get() {
                             break;
                         }
@@ -7133,7 +7252,8 @@ async fn partition_loop(
                 },
                 Either::Right((maybe_c, _req_dropped)) => {
                     if let Some(c) = maybe_c {
-                        handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                        let acked = handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                        window.arm(pending.len(), acked, Instant::now());
                         if locked_by_other.get() {
                             break;
                         }
@@ -7472,6 +7592,27 @@ fn take_byte_bounded_batch(pending: &mut Vec<WriteRequest>) -> Vec<WriteRequest>
         let rest = pending.split_off(take);
         std::mem::replace(pending, rest)
     }
+}
+
+/// The one place that decides whether `partition_loop` launches a batch NOW
+/// and what rides in it. `None` = keep waiting: nothing is pending, or a batch
+/// is already in flight and `pending` is below `MIN_PIPELINED_BATCH` — too
+/// small to be worth a second serialized append on the EN (see the (B)
+/// comment in `partition_loop`). What does launch is bounded by BYTES via
+/// `take_byte_bounded_batch`: everything past the frame ceiling stays queued
+/// for the next batch, nothing is dropped or failed, and at least one request
+/// always moves. One accepted consequence of that cut: a BatchPut whose ops
+/// straddle it is no longer durable in ONE append, so a crash between the
+/// halves leaves half of it durable — nothing ACKED is lost, because the
+/// accumulator answers the client only on its last op.
+fn take_launch_batch(
+    pending: &mut Vec<WriteRequest>,
+    n_inflight: usize,
+) -> Option<Vec<WriteRequest>> {
+    if pending.is_empty() || (n_inflight > 0 && pending.len() < MIN_PIPELINED_BATCH) {
+        return None;
+    }
+    Some(take_byte_bounded_batch(pending))
 }
 
 async fn handle_incoming_req(
@@ -13207,6 +13348,53 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
         });
     }
 
+    /// The keepalive ping is answered by the connection loop itself — before
+    /// the authz gate (a connection that has not said hello must still prove
+    /// the PS alive) and without ever reaching the partition loop. An answer
+    /// of `unknown msg_type` would keep the client's connection alive too,
+    /// but as a refusal it would also be a log line per idle connection.
+    #[test]
+    fn keepalive_ping_is_answered_by_the_connection_loop() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(4);
+            let authz = std::sync::Arc::new(crate::authz::AuthzState::new());
+            authz.install(&autumn_rpc::manager_rpc::GetAuthzConfigResp {
+                enabled: true,
+                ..Default::default()
+            });
+            let _conn = compio::runtime::spawn(handle_ps_connection(
+                autumn_transport::Conn::Tcp(server),
+                req_tx,
+                None,
+                9,
+                authz,
+            ));
+            let client = autumn_rpc::client::RpcClient::from_conn(
+                autumn_transport::Conn::Tcp(client),
+                addr,
+            )
+            .expect("client");
+            let pong = client
+                .call(autumn_rpc::MSG_TYPE_PING, Bytes::new())
+                .await
+                .expect("ping must be answered as a success");
+            assert!(pong.is_empty());
+            assert!(
+                req_rx.try_next().is_err(),
+                "a ping must never reach the partition loop"
+            );
+        });
+    }
+
     /// test 3 — Back-pressure at cap.  The env knob
     /// `AUTUMN_PS_CONN_INFLIGHT_CAP` lowers the cap so we can exercise the
     /// back-pressure branch in `push_frames_to_inflight`.  We set cap to 4,
@@ -15060,6 +15248,102 @@ mod write_batch_ceiling_tests {
                 key: b"k".to_vec(),
             },
         }
+    }
+
+    /// The shape that fragmented every burst: with one batch in flight, the
+    /// two connections a partition serves deliver their 4 admitted ops in two
+    /// separate wake-ups. An unconditional launch ships the first 4 alone
+    /// (this assertion is what goes red without the gate: `Some(4)` instead
+    /// of `None`); the gate holds them until the second 4 arrive and ships
+    /// all 8 as one append. An idle partition is never held back, and an
+    /// empty queue never launches.
+    #[test]
+    fn a_batch_in_flight_holds_a_partial_burst_until_it_is_whole() {
+        let mut pending: Vec<WriteRequest> = (0..4).map(|_| put_of(4096)).collect();
+        assert!(
+            take_launch_batch(&mut pending, 1).is_none(),
+            "one connection's 4 ops must not launch behind an in-flight batch"
+        );
+        assert_eq!(pending.len(), 4, "held ops stay queued, in order");
+
+        pending.extend((0..4).map(|_| put_of(4096)));
+        let batch = take_launch_batch(&mut pending, 1).expect("a whole burst launches");
+        assert_eq!(batch.len(), MIN_PIPELINED_BATCH, "both connections' ops ride ONE append");
+        assert!(pending.is_empty());
+
+        pending.push(put_of(4096));
+        assert_eq!(
+            take_launch_batch(&mut pending, 0).map(|b| b.len()),
+            Some(1),
+            "nothing in flight: a lone op launches immediately"
+        );
+        assert!(take_launch_batch(&mut pending, 0).is_none(), "empty queue, no launch");
+    }
+
+    /// The window waits for the refill a completion's acks are bringing, sized
+    /// by those acks plus what was already held — never for a fixed count.
+    /// The first assertion is what goes red under a fixed
+    /// `MIN_PIPELINED_BATCH` target: a lone writer's refill (1 op) sat out
+    /// the whole window on every op.
+    #[test]
+    fn the_window_waits_for_the_acked_refill_not_a_fixed_count() {
+        let t0 = Instant::now();
+        let mut w = CoalesceWindow::default();
+
+        // Lone writer: 1 op acked, nothing held — its refill is whole at 1.
+        w.arm(0, 1, t0);
+        assert!(w.holds(1, t0).is_none(), "a lone writer's refill launches at once");
+
+        // One connection refilling its 4 admitted ops: whole at 4.
+        w.clear();
+        w.arm(0, 4, t0);
+        assert!(w.holds(3, t0).is_some());
+        assert!(w.holds(4, t0).is_none());
+
+        // Desynchronized pair: B's 4 held while A's 4 were in flight, A's 4
+        // acked — B's wait for A's refill, and the pair re-locks at 8.
+        w.clear();
+        w.arm(4, 4, t0);
+        assert!(w.holds(4, t0).is_some(), "B's 4 wait for A's refill");
+        assert!(w.holds(8, t0).is_none());
+
+        // Two completions inside one window add up.
+        w.clear();
+        w.arm(0, 4, t0);
+        w.arm(0, 4, t0 + Duration::from_micros(50));
+        let t1 = t0 + Duration::from_micros(60);
+        assert!(w.holds(4, t1).is_some());
+        assert!(w.holds(8, t1).is_none());
+
+        // The deadline bounds every wait; a launch closes the window; and
+        // nothing pending is nothing to hold.
+        w.clear();
+        w.arm(0, 8, t0);
+        assert!(w.holds(4, t0 + LAUNCH_COALESCE_WINDOW).is_none());
+        w.arm(0, 8, t0);
+        w.clear();
+        assert!(w.holds(4, t0).is_none());
+        w.arm(0, 8, t0);
+        assert!(w.holds(0, t0).is_none());
+    }
+
+    /// What the window counts is client frames answered, because that is what
+    /// releases admission slots: a Put is one, a fence record is none, and a
+    /// batch frame's N ops are one — on the last op. Counting ops instead
+    /// made a batch-put writer's next, smaller frame wait, and a fenced
+    /// writer's first op after each lease wait, for refills that were whole.
+    #[test]
+    fn a_reply_is_counted_per_client_frame_not_per_op() {
+        let (outer, _rx) = oneshot::channel();
+        assert!(WriteResponder::Put { outer, key: b"k".to_vec() }.send_ok());
+        assert!(!WriteResponder::Fence.send_ok());
+
+        let (outer, _rx) = oneshot::channel();
+        let accum = BatchPutAccumulator::new(outer, 3);
+        let ops: Vec<bool> = (0..3)
+            .map(|idx| WriteResponder::BatchPut { accum: accum.clone(), idx }.send_ok())
+            .collect();
+        assert_eq!(ops, [false, false, true], "one reply, on the batch's last op");
     }
 
     /// A batch becomes ONE `AppendReq`, and `pending` is bounded by request
