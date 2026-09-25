@@ -6,6 +6,15 @@ Verification: live cluster all 22 pods 1/1 Running; 25 partitions across 3 PS; c
 Main gaps: lance-mcp pipeline has no push webhook (run started manually; next push needs a manual run again or a webhook). The old-fuse clients now on 874a0bac fusebin but comfyui-autumn's manifest is not in git (patched live with kubectl set image; only its repo copy would drift). auto-policy rebalance cooldown gating a stop-the-world recovery remains unfixed in code (documented workaround in docs/ops.md).
 Next steps: watch the first real code-index/memory workload after the upgrade; delete the migratev3_v4 bin from the image once every cluster is on v4.
 
+Date: 2026-09-25 (8)
+TaskStatus: completed
+Task scope: "查一下" the 2 system_manager_failover failures left in entry (7); user chose a real failover (option A).
+Current summary: test-only rot, no product bug. (1) An etcd leader seeds fs/ kvc/ mem/, which turns on the PS Layer-A check, so the tests' bare keys (k-00, d-00) got NamespaceUnknown; keys moved under mem/ (as system_chaos already did). (2) Hidden behind (1): a standby answers GET_REGIONS with NOT_LEADER by design (manager-HA H3), but the tests read the replayed regions from standby M2 and never failed over. Now M1 is a stoppable etcd manager; `fail_over` stops it (runtime dropped, lease left to expire, 10 s TTL) and waits for M2 to serve GET_REGIONS as leader, then asserts on those regions. Test 1 also checks the standby refuses CREATE_STREAM/GET_REGIONS and the new leader accepts CREATE_STREAM. The PS (knows only M1, would process::exit after ~90 s of failed heartbeats) is stopped at the end of each test.
+Verification: 2/2 pass, ~11 s, 6 consecutive runs. Ablation: without stopping M1 both go red ("M2 did not take over within 30 s").
+Review (opus, independent): no high finding; verified runtime drop tears down keepalive/election tasks and regions on M2 can only come from etcd replay. Taken: stop the orphaned PS, panic if serve ends on its own, fix ShutdownFlag doc ("dropping signals shutdown" was false). Not taken: moving the helper into support/ (optional).
+Main gaps: none. (Unrelated, pre-existing: `cargo clippy` fails in autumn-rpc on "this impl can be derived".)
+Next steps: none for this task.
+
 Date: 2026-09-25 (7)
 TaskStatus: completed
 Task scope: "这2个risk看来不难修，fix" — the two multi-gateway risks found while answering "如果有多个gateway同时启动呢?".

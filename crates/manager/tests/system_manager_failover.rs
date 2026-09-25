@@ -1,6 +1,10 @@
 //! System test — manager leader failover preserves full state.
 //! System test — manager crash during split, state consistent.
 //!
+//! Both tests stop the leader M1 for real and read the state back from M2
+//! once M2 has taken over: a standby answers `GET_REGIONS` with NOT_LEADER,
+//! so a standby's replayed regions are not observable over the wire.
+//!
 //! These tests spawn the `etcd` binary (override via `AUTUMN_TEST_ETCD_BIN`).
 //! Marked `#[ignore]` so CI without etcd skips them — run explicitly:
 //!   cargo test -p autumn-manager --test system_manager_failover -- --ignored
@@ -17,16 +21,70 @@ use autumn_rpc::partition_rpc;
 
 use support::*;
 
-fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
-    std::thread::spawn(move || {
+/// Start an etcd-backed manager whose thread ends when the flag is set. Ending
+/// the thread drops its runtime, so its leader keepalive stops without revoking
+/// the lease: to the standby this is a crash, and the leader key goes away when
+/// the lease expires.
+fn start_etcd_manager_stoppable(
+    mgr_addr: SocketAddr,
+    etcd_endpoint: String,
+) -> (ShutdownFlag, std::thread::JoinHandle<()>) {
+    let flag = ShutdownFlag::new();
+    let flag_thread = flag.clone();
+    let handle = std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint])
                 .await
                 .expect("new manager with etcd");
-            let _ = manager.serve(mgr_addr).await;
+            let serve = manager.serve(mgr_addr);
+            let stop = async {
+                while !flag_thread.is_shutdown() {
+                    compio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            futures::pin_mut!(serve, stop);
+            if let futures::future::Either::Left((r, _)) =
+                futures::future::select(serve, stop).await
+            {
+                panic!("manager serve ended on its own: {r:?}");
+            }
         });
     });
     std::thread::sleep(Duration::from_millis(300));
+    (flag, handle)
+}
+
+fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
+    // Never stopped: the handle and flag are dropped, the thread serves on.
+    drop(start_etcd_manager_stoppable(mgr_addr, etcd_endpoint));
+}
+
+/// Stop M1 and wait until M2 serves routing as the leader. M1's lease has a
+/// 10 s TTL, so the handover takes about that long.
+async fn fail_over(
+    m1: (ShutdownFlag, std::thread::JoinHandle<()>),
+    mgr2: &RpcClient,
+) -> GetRegionsResp {
+    let (flag, handle) = m1;
+    flag.shutdown();
+    handle.join().expect("join M1");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let regions = get_regions(mgr2).await;
+        if regions.code == CODE_OK {
+            return regions;
+        }
+        assert_eq!(
+            regions.code, CODE_NOT_LEADER,
+            "M2 get_regions: {}",
+            regions.message
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "M2 did not take over within 30 s of M1 stopping"
+        );
+        compio::time::sleep(Duration::from_millis(200)).await;
+    }
 }
 
 // ── Manager failover preserves full state ───────────────────────
@@ -39,7 +97,7 @@ fn manager_failover_preserves_streams_and_partitions() {
 
         // Start M1, extent nodes
         let mgr1_addr = pick_addr();
-        start_etcd_manager(mgr1_addr, etcd_endpoint.clone());
+        let m1 = start_etcd_manager_stoppable(mgr1_addr, etcd_endpoint.clone());
         let mgr1 = RpcClient::connect(mgr1_addr).await.expect("connect mgr1");
 
         let n1_dir = tempfile::tempdir().expect("n1");
@@ -57,14 +115,17 @@ fn manager_failover_preserves_streams_and_partitions() {
 
         // Write data via PS connected to M1
         let ps_addr = pick_addr();
-        start_partition_server(91, mgr1_addr, ps_addr);
+        let ps_stop = start_partition_server_stoppable(91, mgr1_addr, ps_addr);
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
+        // An etcd-backed leader seeds the built-in namespaces, which turns on
+        // the PS's Layer-A check: a key under no registered namespace fails
+        // with NamespaceUnknown. `mem/` is a built-in, so no registration.
         for i in 0..10 {
             ps_put(
                 &ps,
                 801,
-                format!("k-{i:02}").as_bytes(),
+                format!("mem/k-{i:02}").as_bytes(),
                 format!("v-{i}").as_bytes(),
             )
             .await;
@@ -95,14 +156,7 @@ fn manager_failover_preserves_streams_and_partitions() {
             "M2 should have all 3 streams from replay"
         );
 
-        // M2 should have the partition
-        let regions = get_regions(&mgr2).await;
-        assert!(
-            regions.regions.iter().any(|(_, r)| r.part_id == 801),
-            "M2 should have partition 801 from etcd replay"
-        );
-
-        // M2 is a follower, so writes should be rejected
+        // M2 is a standby: it refuses both writes and routing.
         let resp = mgr2
             .call(
                 MSG_CREATE_STREAM,
@@ -119,6 +173,36 @@ fn manager_failover_preserves_streams_and_partitions() {
             cr.code, CODE_NOT_LEADER,
             "writes on follower must be rejected"
         );
+        assert_eq!(get_regions(&mgr2).await.code, CODE_NOT_LEADER);
+
+        // M1 dies; M2 takes over with the partition it replayed.
+        let regions = fail_over(m1, &mgr2).await;
+        assert!(
+            regions.regions.iter().any(|(_, r)| r.part_id == 801),
+            "M2 should have partition 801 from etcd replay"
+        );
+        let resp = mgr2
+            .call(
+                MSG_CREATE_STREAM,
+                rkyv_encode(&CreateStreamReq {
+                    replicates: 2,
+                    ec_data_shard: 2,
+                    ec_parity_shard: 0,
+                }),
+            )
+            .await
+            .expect("create on new leader");
+        let cr: CreateStreamResp = rkyv_decode(&resp).expect("decode");
+        assert_eq!(
+            cr.code, CODE_OK,
+            "new leader must accept writes: {}",
+            cr.message
+        );
+
+        // The PS knew only M1 and exits the process once its heartbeats have
+        // failed for long enough; stop it before that can happen.
+        ps_stop.0.shutdown();
+        ps_stop.1.join().expect("join PS");
     });
 }
 
@@ -132,7 +216,7 @@ fn manager_crash_during_split_state_consistent() {
 
         // M1 + extent nodes
         let mgr1_addr = pick_addr();
-        start_etcd_manager(mgr1_addr, etcd_endpoint.clone());
+        let m1 = start_etcd_manager_stoppable(mgr1_addr, etcd_endpoint.clone());
         let mgr1 = RpcClient::connect(mgr1_addr).await.expect("connect mgr1");
 
         let n1_dir = tempfile::tempdir().expect("n1");
@@ -149,14 +233,14 @@ fn manager_crash_during_split_state_consistent() {
 
         // PS writes and splits via M1
         let ps_addr = pick_addr();
-        start_partition_server(92, mgr1_addr, ps_addr);
+        let ps_stop = start_partition_server_stoppable(92, mgr1_addr, ps_addr);
         let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
 
         for i in 0..10 {
             ps_put(
                 &ps,
                 901,
-                format!("d-{i:02}").as_bytes(),
+                format!("mem/d-{i:02}").as_bytes(),
                 format!("v-{i}").as_bytes(),
             )
             .await;
@@ -167,7 +251,10 @@ fn manager_crash_during_split_state_consistent() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 901, at_key: None }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
+                    part_id: 901,
+                    at_key: None,
+                }),
             )
             .await
             .expect("split");
@@ -201,7 +288,8 @@ fn manager_crash_during_split_state_consistent() {
 
         let mgr2 = RpcClient::connect(mgr2_addr).await.expect("connect mgr2");
 
-        let regions2 = get_regions(&mgr2).await;
+        // M1 dies after the split; M2 takes over.
+        let regions2 = fail_over(m1, &mgr2).await;
         assert_eq!(
             regions2.regions.len(),
             2,
@@ -235,5 +323,10 @@ fn manager_crash_during_split_state_consistent() {
             3,
             "original streams should survive split replay"
         );
+
+        // The PS knew only M1 and exits the process once its heartbeats have
+        // failed for long enough; stop it before that can happen.
+        ps_stop.0.shutdown();
+        ps_stop.1.join().expect("join PS");
     });
 }

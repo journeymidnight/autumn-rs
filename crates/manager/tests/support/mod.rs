@@ -21,7 +21,7 @@ use autumn_stream::{ExtentNode, ExtentNodeConfig};
 
 /// A handle that allows controlled shutdown of a component running on
 /// a separate thread. The component checks `is_shutdown()` periodically
-/// and exits when true. Dropping the handle signals shutdown.
+/// and exits when true. Dropping the handle does NOT signal shutdown.
 #[derive(Clone)]
 pub struct ShutdownFlag(pub Arc<AtomicBool>);
 
