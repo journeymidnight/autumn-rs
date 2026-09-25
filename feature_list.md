@@ -118,6 +118,7 @@
   - (d):TCP p8 d8 cpuset 隔离、7 对交替 A/B:4K 写中位 HEAD 48.0K / 修复 47.1K,4K 读中位 504K / 599K(两侧都有塌陷点,噪声内),8M 写/读无差。热路径代价:每次 socket read 一次 Cell 自增;每 TCP 连接每 2 s 一次 getsockopt;空闲连接每 ~4 s 一对 18 B 帧。CPU 未单独量。
   - 已知残余:服务端到达在途上限(PS 4 / EN 64)停读时无法回 ping,全部请求卡 ≥8 s 可能被关;UCX 写者卡在不读的对端后面时 ping 发不出,交给调用方自身超时。
   - **(e) 24h 无误杀长跑未做**,故仍 `passes: false`。
+- **Decision** (2026-09-25,用户): worker-evict 不做——keepalive 已在连接层消除"外层超时抢先取消、死连接不被驱逐"的根因,mgr-freeze 无它即全绿,属于不必要的防御。Scope (b) 与 Acceptance (b) 中关于 worker-evict 的半条视为不适用;剩余未完成项只有 (e)。
 - `passes: false`
 
 > **这个账本只记 autumn-rs 自己的东西。** 下游怎么被 autumn 的改动影响（例如一次 wire
