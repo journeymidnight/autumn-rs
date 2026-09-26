@@ -168,7 +168,19 @@ NAME, so a shard staged for one index can never be *served* as another.
   forget is NOT atomic with the unlink (the unlink is awaited first), so a
   writer recreating the same index during the await loses its record until the
   next `note_shard_file` or restart discovery.
-  ⚠️ What cleans up a partial shard left by a FAILED rebuild is the next
+- **A rebuilt shard is recorded only after it is durable, and a rebuild that
+  does not get there is discarded** (`land_rebuilt_shard`). `note_shard_file`
+  is the node claiming the shard, so it runs after the content `sync_data`
+  AND the directory fsync, never before. On any failure — the rebuild itself,
+  either fsync — the file is unlinked and its record dropped through
+  `discard_shard_file`. Stopping at "don't record it" is not enough: restart
+  discovery registers whatever is on disk at its length, with no memory that
+  its fsync failed, so an unsynced shard left behind is claimed at the next
+  boot. Test:
+  `a_shard_whose_fsync_failed_is_discarded_not_recorded` (a symlink to
+  `/dev/null` makes the real `fdatasync` fail with EINVAL; ablation-verified
+  red).
+  ⚠️ What cleans up a shard file the discard could NOT unlink is the next
   attempt's `truncate(true)` open, or the manager reassigning the slot — **not**
   the reconcile sweep, whose stale-shard loop filters out `want.shard_index`,
   and for a rebuild that index is precisely the wanted one.

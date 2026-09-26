@@ -7324,67 +7324,12 @@ impl ExtentNode {
                         .await
                         .map_err(|e| format!("create rebuilt shard {}: {e}", task.extent_id))?,
                 );
-                // A failure mid-rebuild used to be free: the old code produced
-                // the whole payload before touching the destination. Streaming
-                // writes as it goes, so an error now leaves a PARTIAL shard
-                // file. A retry truncates it and a reader rejects it by exact
-                // length, so it cannot serve wrong bytes — but after a restart
-                // `discover_shard_files` registers it at its partial length,
-                // which makes `holds_payload` and the `df` accounting lie until
-                // the next attempt truncates it (NOT until a reconcile sweep --
-                // that loop skips the layout's own `want.shard_index`, which is
-                // this one). Remove it on the way out.
-                let len = match self
+                let written = self
                     .stream_ec_recovery_payload(&task, &extent_info, shard_index, &f)
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => {
-                        drop(f);
-                        // Discarding it means BOTH halves. A `shard_files`
-                        // record that predates this rebuild -- from restart
-                        // discovery, or from a concurrent
-                        // `write_shard_stripe_local` sharing this entry --
-                        // would otherwise outlive the bytes just removed.
-                        if let Err(ue) = extent.discard_shard_file(&path, shard_index as u32).await
-                        {
-                            // NOT the reconcile sweep: its stale-shard loop
-                            // filters out `want.shard_index`, and for a rebuild
-                            // that index IS the wanted one (both sides derive it
-                            // as this node's position in `replicates ++ parity`).
-                            // What actually clears a partial shard is the next
-                            // attempt's `truncate(true)` open, or the manager
-                            // reassigning the slot so placement GC takes it.
-                            tracing::warn!(
-                                extent_id = task.extent_id,
-                                shard_index,
-                                error = %ue,
-                                "failed rebuild: could not unlink the partial shard \
-                                 (the entry advertises it until the next attempt \
-                                 truncates it)"
-                            );
-                        }
-                        // The ENTRY is deliberately NOT dropped here, though
-                        // leaving it is what wedges this (node, extent) pair:
-                        // `require_recovery` refuses whenever an entry exists
-                        // that it cannot classify, and for an ec_converted
-                        // extent `try_adopt_completed_recovery` answers Unknown
-                        // every time. Dropping it is still the wrong cure —
-                        // `handle_write_shard` shares this entry, so an EC
-                        // conversion that assigned this node as parity mid-
-                        // rebuild (a case the manager documents) would lose the
-                        // shard it just recorded, and `ec_stage_nonce` is the
-                        // guard that refuses a superseded coordinator's write.
-                        // Unwedging needs the EC arm of
-                        // `try_adopt_completed_recovery` — see the ledger.
-                        return Err(e);
-                    }
-                };
-                f.sync_data().await.map_err(|e| e.to_string())?;
-                self.fsync_staging_dir(task.extent_id, &path)
-                    .await
-                    .map_err(|(_, m)| m)?;
-                extent.note_shard_file(shard_index as u32, len);
+                    .await;
+                let len = self
+                    .land_rebuilt_shard(&extent, f, &path, shard_index as u32, written)
+                    .await?;
                 wrote_shard_file = true;
                 len
             } else {
@@ -7568,6 +7513,77 @@ impl ExtentNode {
             offset += span;
         }
         out
+    }
+
+    /// Make a rebuilt shard file durable, THEN record it; on any failure,
+    /// discard it. `written` is the rebuild's own result.
+    ///
+    /// The record comes last because `note_shard_file` is this node claiming
+    /// the shard — `holds_payload` routes reads here on its strength and `df`
+    /// counts it — and a shard whose content or dirent fsync failed is not one
+    /// this node holds. Leaving the file behind is not the answer either:
+    /// after a restart `discover_shard_files` registers whatever is on disk at
+    /// its length, with no memory of the failed fsync, so an unsynced shard
+    /// would be claimed then. Every failure — a partial rebuild, a failed
+    /// `sync_data`, a failed directory fsync — therefore ends the same way:
+    /// unlink the file and drop any record of this index. A record can predate
+    /// this rebuild (restart discovery, or a concurrent
+    /// `write_shard_stripe_local` sharing the entry), and the truncating open
+    /// already destroyed the bytes it described.
+    ///
+    /// The ENTRY is deliberately kept, though leaving it is what wedges this
+    /// (node, extent) pair: `require_recovery` refuses whenever an entry exists
+    /// that it cannot classify, and for an ec_converted extent
+    /// `try_adopt_completed_recovery` answers Unknown every time. Dropping it
+    /// is still the wrong cure — `handle_write_shard` shares this entry, so an
+    /// EC conversion that assigned this node as parity mid-rebuild (a case the
+    /// manager documents) would lose the shard it just recorded, and
+    /// `ec_stage_nonce` is the guard that refuses a superseded coordinator's
+    /// write. Unwedging needs the EC arm of `try_adopt_completed_recovery`.
+    async fn land_rebuilt_shard(
+        &self,
+        extent: &ExtentEntry,
+        f: Rc<CompioFile>,
+        path: &std::path::Path,
+        shard_index: u32,
+        written: Result<u64, String>,
+    ) -> Result<u64, String> {
+        let durable = async {
+            let len = written?;
+            f.sync_data()
+                .await
+                .map_err(|e| format!("sync rebuilt shard {}: {e}", extent.extent_id))?;
+            self.fsync_staging_dir(extent.extent_id, path)
+                .await
+                .map_err(|(_, m)| m)?;
+            Ok::<u64, String>(len)
+        }
+        .await;
+        drop(f);
+        let e = match durable {
+            Ok(len) => {
+                extent.note_shard_file(shard_index, len);
+                return Ok(len);
+            }
+            Err(e) => e,
+        };
+        if let Err(ue) = extent.discard_shard_file(path, shard_index).await {
+            // NOT the reconcile sweep: its stale-shard loop filters out
+            // `want.shard_index`, and for a rebuild that index IS the wanted
+            // one (both sides derive it as this node's position in
+            // `replicates ++ parity`). What actually clears the file is the
+            // next attempt's `truncate(true)` open, or the manager reassigning
+            // the slot so placement GC takes it.
+            tracing::warn!(
+                extent_id = extent.extent_id,
+                shard_index,
+                error = %ue,
+                "failed rebuild: could not unlink the shard file \
+                 (it stays on disk, with any earlier record of this index, \
+                 until the next attempt truncates it)"
+            );
+        }
+        Err(e)
     }
 
     /// Rebuild an EC shard by streaming: for each stripe, read that byte range
@@ -14822,6 +14838,108 @@ mod discard_shard_file_tests {
             }),
             "bytes are still on disk, so the entry must keep advertising them"
         );
+    }
+
+    async fn test_node(dir: &std::path::Path) -> Rc<ExtentNode> {
+        let config = ExtentNodeConfig::new(dir.to_path_buf(), 1);
+        Rc::new(ExtentNode::new(config).await.expect("ExtentNode::new"))
+    }
+
+    async fn open_for_rebuild(path: &std::path::Path) -> Rc<CompioFile> {
+        Rc::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .await
+                .expect("open the rebuild destination"),
+        )
+    }
+
+    /// A rebuilt shard whose fsync FAILED must be neither recorded nor left on
+    /// disk — and a record that predates the rebuild must go with it.
+    ///
+    /// Recording it would claim a shard that is not durable; leaving the file
+    /// would let restart discovery claim it later. The destination is a symlink
+    /// to `/dev/null`, which accepts the open and the writes but answers
+    /// `fdatasync` with EINVAL: a real kernel failure on the real call, with
+    /// no injection point in the code under test. Linux only: `/dev/null` has
+    /// no fsync there, while other kernels may answer it with success.
+    ///
+    /// ABLATION: return the fsync error before the discard (the shape this
+    /// replaced — `sync_data().await?` ahead of `note_shard_file`) and this
+    /// goes red: the symlink stays and the stale record keeps advertising 999
+    /// bytes.
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn a_shard_whose_fsync_failed_is_discarded_not_recorded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = test_node(&dir.path().join("node")).await;
+        let path = dir.path().join("extent-7.shard3");
+        std::os::unix::fs::symlink("/dev/null", &path).expect("symlink to /dev/null");
+
+        // A record from before this rebuild (restart discovery, or a
+        // concurrent staging write sharing the entry).
+        let entry = entry_advertising(7, 3, 999);
+        let f = open_for_rebuild(&path).await;
+        let err = node
+            .land_rebuilt_shard(&entry, f, &path, 3, Ok(4096))
+            .await
+            .expect_err("fdatasync on /dev/null must fail");
+        assert!(err.contains("sync rebuilt shard"), "unexpected error: {err}");
+
+        assert!(
+            std::fs::symlink_metadata(&path).is_err(),
+            "the unsynced shard file is still on disk; restart discovery would claim it"
+        );
+        assert!(
+            !entry.holds_payload(PayloadRef {
+                location: PayloadLocation::InShardFile,
+                shard_index: 3,
+            }),
+            "entry still advertises a shard whose fsync failed"
+        );
+        assert_eq!(entry.shard_bytes(), 0, "`df` still counts the discarded shard");
+        assert!(std::path::Path::new("/dev/null").exists());
+    }
+
+    /// A failed rebuild takes the same exit as a failed fsync.
+    #[compio::test]
+    async fn a_failed_rebuild_is_discarded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = test_node(&dir.path().join("node")).await;
+        let path = dir.path().join("extent-7.shard3");
+
+        let entry = entry_advertising(7, 3, 999);
+        let f = open_for_rebuild(&path).await;
+        let err = node
+            .land_rebuilt_shard(&entry, f, &path, 3, Err("peer gone".into()))
+            .await
+            .expect_err("the rebuild's error must come back");
+        assert_eq!(err, "peer gone");
+        assert!(!path.exists(), "the partial shard must be unlinked");
+        assert_eq!(entry.shard_bytes(), 0);
+    }
+
+    /// The success path records the shard at its rebuilt length, after the
+    /// file and its directory entry are synced.
+    #[compio::test]
+    async fn a_durable_shard_is_recorded_at_its_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let node = test_node(&dir.path().join("node")).await;
+        let path = dir.path().join("extent-7.shard3");
+
+        let entry = entry_advertising(7, 3, 999);
+        let f = open_for_rebuild(&path).await;
+        std::fs::write(&path, vec![0xabu8; 4096]).expect("write the rebuilt bytes");
+        let len = node
+            .land_rebuilt_shard(&entry, f, &path, 3, Ok(4096))
+            .await
+            .expect("a durable shard lands");
+        assert_eq!(len, 4096);
+        assert_eq!(std::fs::metadata(&path).expect("shard file").len(), 4096);
+        assert_eq!(entry.shard_bytes(), 4096, "recorded at the rebuilt length");
     }
 }
 

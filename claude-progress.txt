@@ -1,3 +1,12 @@
+Date: 2026-09-26 (4)
+TaskStatus: completed
+Task scope: BUG-REBUILD-FSYNC-UNCOUNTED (user: "这个可以", after correcting the diagnosis: sync first, then record).
+Current summary: the ledger's Scope was wrong — both of its fixes recorded the shard before or regardless of fsync. Sync-then-record was already the right order; the real defect was that a failed content/dir fsync in the EC shard rebuild returned early, leaving the file on disk (restart discovery would register it at its length) and any earlier record of the index in place. New ExtentNode::land_rebuilt_shard: sync_data -> fsync_staging_dir -> note_shard_file; any failure (rebuild, either fsync) -> discard_shard_file (unlink + forget) -> Err. Content-fsync error now reads "sync rebuilt shard {id}: ..." (nothing matches on it). Ledger entry deleted. docs/ops.md unchanged (no operator-visible step).
+Verification: autumn-stream lib 207 pass (3 new: a_shard_whose_fsync_failed_is_discarded_not_recorded — symlink to /dev/null makes the real fdatasync fail with EINVAL, linux-only; a_failed_rebuild_is_discarded; a_durable_shard_is_recorded_at_its_length). Ablation (fsync error returned before the discard) -> red "the unsynced shard file is still on disk". Stream integration tests pass; manager ec_failover / ec_staging_reclaim / ec_participant_meta_seal / ec_replay_selfheal pass.
+Review (opus, independent): no high/medium. Taken: warn text on a failed unlink, linux-only cfg on the /dev/null test, history sentence dropped from crates/stream/CLAUDE.md. Not taken: a test pinning note-after-sync ordering (needs a hook between steps; enforced by code shape); the content sync_data still does not mark the disk (pre-existing, unlike the staging path's disk_io_result).
+Main gaps: system_recovery_loop_drives::fencing_a_member_rebuilds_the_slot_when_a_spare_node_exists fails ("fenced node 3 is still a member ... after 30 s") identically on HEAD without this change — replicated RF=2 path, pre-existing, not investigated.
+Next steps: none for this task.
+
 Date: 2026-09-26 (3)
 TaskStatus: completed
 Task scope: the user closed F-LANCEDB-S3-GATEWAY (entry deleted, 63bfe5b) and asked for BUG-FUSE-INVAL-ON-DISPATCHER-THREAD.

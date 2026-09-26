@@ -235,18 +235,6 @@
 - **Status**: `passes: false` (2026-09-10) — 本轮只交付了多盘形态本身;盘级故障注入
   是独立的一件事,且因为不可逆需要自己的预算设计,不适合顺手塞进同一个改动。
 
-### BUG-REBUILD-FSYNC-UNCOUNTED — 重建成功但 fsync 失败，整个分片不记账
-- **Trigger** (2026-09-04，评审发现，已核对代码): EC 重建的成功分支上，
-  `f.sync_data().await…?` 与 `fsync_staging_dir(…)?` 都在 `extent.note_shard_file(…)`
-  **之前**早退。任一个失败，盘上留下一个**完整长度**的分片文件，而条目里没有任何记录。
-- **后果**: 条目与磁盘不一致的另一半——字节在盘上却不记账，`df` 少算，
-  `holds_payload` 为假。要到重启后 `discover_shard_files` 补登才对上。
-  比它的对偶（失败重建 unlink 了分片却留着账上的记录，那半已于 2026-09-04 修掉）轻，
-  不会把读降级成 Internal，但同样是条目与磁盘不一致。
-- **Scope**: 要么把 `note_shard_file` 提到 fsync 之前（记录"文件存在"本就不依赖它是否已持久），
-  要么在这两个 `?` 上改成先记账再返回错误。注意别和失败重建臂的 discard 语义打架。
-- **Status**: `passes: false` (2026-09-04) — 既有缺陷，未修。
-
 ### F-SPLITMERGE-PROGRESS — split/merge 全程冻结分区却不报进度，"在切"和"卡住"看起来一样
 - **Trigger** (2026-09-09，用户在 dashboard 上切了 part 44 之后问"什么算 split 完了"):
   op 表上只有一行终态 `split succeeded ... dispatched`，中间什么都没有。而 split **全程
