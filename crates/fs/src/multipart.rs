@@ -160,8 +160,14 @@ pub struct PartWriter {
 
 impl PartWriter {
     /// Begin part `part` of an open upload. Records itself under the session
-    /// before anything is written.
-    pub async fn begin(state: &mut FsState, upload: u64, part: u32) -> std::result::Result<Self, MultipartError> {
+    /// before anything is written. `declared` is the part's length when the
+    /// caller knows it, so its object's record goes out once, up front.
+    pub async fn begin(
+        state: &mut FsState,
+        upload: u64,
+        part: u32,
+        declared: Option<u64>,
+    ) -> std::result::Result<Self, MultipartError> {
         if !(1..=MAX_PART_NUMBER).contains(&part) {
             return Err(MultipartError::InvalidPart(part));
         }
@@ -171,24 +177,27 @@ impl PartWriter {
             other => return Err(not_open(other.as_ref().map(|(_, r)| &r.state))),
         }
         let s = lease.inode_hint;
-        let stream = segment::ObjectStream::new(state, |d| key::upload_alloc_key(upload, s, d), lease).await?;
+        let mut stream = segment::ObjectStream::new(state, |d| key::upload_alloc_key(upload, s, d), lease).await?;
         let op = PendingOp::Part { upload, part, data_ino: stream.data_ino };
         state
             .kv_put_fenced(&key::pending_key(s, stream.data_ino), &schema::encode_pending(&op), lease)
             .await?;
+        if let Some(n) = declared {
+            stream.declare(n);
+        }
         Ok(PartWriter { upload, part, lease, stream })
     }
 
-    /// Append `data`. Needs only the client, so the caller may hold the
-    /// `FsState` just for `begin` and `finish`.
-    pub async fn write(&mut self, client: &ClusterClient, data: &[u8]) -> Result<()> {
-        self.stream.write(client, data).await
+    /// Append `data`. Needs no `FsState`, so the caller may hold it just for
+    /// `begin`.
+    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.stream.write(data).await
     }
 
     /// Write the rest and make this the part's current data. Returns the
     /// part's ETag and size. Needs only the client, like `write`.
     pub async fn finish(mut self, client: &ClusterClient) -> std::result::Result<(String, u64), MultipartError> {
-        let (size, crc32c) = self.stream.finish(client).await?;
+        let (size, crc32c) = self.stream.finish().await?;
         let d = self.stream.data_ino;
         let rec = PartRecord { data_ino: d, size, crc32c, lanes: self.stream.lanes, unit: self.stream.unit };
         // A plain put: a retry of the same part number replaces the record,
@@ -212,8 +221,10 @@ impl PartWriter {
     }
 
     /// Discard this part (a failed or cancelled request). Needs only the
-    /// client: the object is this request's own and nobody reads it.
-    pub async fn abort(self, client: &ClusterClient) -> Result<()> {
+    /// client: the object is this request's own and nobody reads it. Its
+    /// writes still in flight settle first, so none lands after the delete.
+    pub async fn abort(mut self, client: &ClusterClient) -> Result<()> {
+        self.stream.settle().await;
         drop_part_object(client, self.upload, self.part, self.lease.inode_hint, self.stream.data_ino, self.lease).await
     }
 }

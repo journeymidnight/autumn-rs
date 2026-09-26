@@ -325,30 +325,56 @@ async fn parent_for_write(st: &mut FsState, bucket: &str, dirs: &[&str], res: &s
 }
 
 /// Begin a new file under `parent`; `large` gives it its data object now, so
-/// the body can stream in through the client alone.
-async fn begin_file(st: &mut FsState, parent: u64, name: &str, large: bool, res: &str) -> Result<Unpublished, S3Error> {
+/// the body can stream in through the client alone. `declared` is the body's
+/// length when the request says it.
+async fn begin_file(
+    st: &mut FsState,
+    parent: u64,
+    name: &str,
+    large: bool,
+    declared: Option<u64>,
+    res: &str,
+) -> Result<Unpublished, S3Error> {
     let f = NewFile::begin(st, parent, name.as_bytes()).await.map_err(|e| internal(e, res))?;
     let mut w = Unpublished { client: st.client.clone(), file: Some(f) };
     if large {
-        w.file().start_object(st).await.map_err(|e| internal(e, res))?;
+        w.file().start_object(st, declared).await.map_err(|e| internal(e, res))?;
     }
     Ok(w)
 }
 
+/// Where a finish-and-publish spent its time, for the PUT breakdown.
+#[derive(Default)]
+struct PublishTimes {
+    flush: std::time::Duration,
+    lock: std::time::Duration,
+    finish: std::time::Duration,
+    publish: std::time::Duration,
+}
+
 /// Finish and publish; returns the new object's ETag and mtime. The data
-/// object's buffered tail (up to a batch of units) goes out before the lock.
-async fn finish_and_publish(fs: &Fs, mut w: Unpublished, cond: Condition, res: &str) -> Result<(String, i64), S3Error> {
-    let client = w.client.clone();
-    w.file().flush_streamed(&client).await.map_err(|e| internal(e, res))?;
+/// object's buffered tail goes out before the lock.
+async fn finish_and_publish(fs: &Fs, mut w: Unpublished, cond: Condition, res: &str) -> Result<(String, i64, PublishTimes), S3Error> {
+    let mut t = PublishTimes::default();
+    let mut at = std::time::Instant::now();
+    let mut lap = |d: &mut std::time::Duration| {
+        *d = at.elapsed();
+        at = std::time::Instant::now();
+    };
+    w.file().flush_streamed().await.map_err(|e| internal(e, res))?;
+    lap(&mut t.flush);
     let mut st = fs.lock().await;
+    lap(&mut t.lock);
     let m = w.file().finish(&mut st).await.map_err(|e| internal(e, res))?;
+    lap(&mut t.finish);
     // From here `publish` owns the outcome: it undoes a publish that
     // certainly did not happen and leaves one whose outcome is unknown to
     // the session's recovery.
     let f = w.file.take().expect("not yet taken");
     let ino = f.ino;
     f.publish(&mut st, cond).await.map_err(|e| publish_error(e, res))?;
-    Ok((objects::etag(ino, m.generation), m.mtime_secs))
+    lap(&mut t.publish);
+    Ok((objects::etag(ino, m.generation), m.mtime_secs, t))
 }
 
 /// `PUT /{bucket}/{key}`: PutObject, or CopyObject when the request names a
@@ -381,21 +407,34 @@ async fn put(fs: &Fs, bucket: &str, key: &str, h: &HeaderMap, body: Body, res: &
     };
     // Unknown length (a chunked body) is treated as large.
     let small = body.expected_len().is_some_and(|n| n <= INLINE_THRESHOLD as u64);
-    let (mut w, client) = {
+    let t0 = std::time::Instant::now();
+    let mut w = {
         let mut st = fs.lock().await;
         let parent = parent_for_write(&mut st, bucket, &dirs, res).await?;
-        (begin_file(&mut st, parent, name, !small, res).await?, st.client.clone())
+        begin_file(&mut st, parent, name, !small, body.expected_len(), res).await?
     };
+    let t_begin = t0.elapsed();
     while let Some(chunk) = body.next().await? {
         if small {
             let mut st = fs.lock().await;
             w.file().write(&mut st, &chunk).await.map_err(|e| internal(e, res))?;
         } else {
-            w.file().write_streamed(&client, &chunk).await.map_err(|e| internal(e, res))?;
+            w.file().write_streamed(&chunk).await.map_err(|e| internal(e, res))?;
         }
     }
     body.verify()?;
-    let (etag, _) = finish_and_publish(fs, w, cond, res).await?;
+    let t_body = t0.elapsed();
+    let (etag, _, t) = finish_and_publish(fs, w, cond, res).await?;
+    tracing::debug!(
+        key = res,
+        begin_ms = t_begin.as_secs_f64() * 1e3,
+        body_ms = (t_body - t_begin).as_secs_f64() * 1e3,
+        flush_ms = t.flush.as_secs_f64() * 1e3,
+        lock_ms = t.lock.as_secs_f64() * 1e3,
+        finish_ms = t.finish.as_secs_f64() * 1e3,
+        publish_ms = t.publish.as_secs_f64() * 1e3,
+        "PUT breakdown"
+    );
     let mut resp = StatusCode::OK.into_response();
     resp.headers_mut().insert(header::ETAG, quoted_etag(&etag));
     Ok(resp)
@@ -432,10 +471,10 @@ async fn copy_object(fs: &Fs, bucket: &str, key: &str, src: &str, h: &HeaderMap,
         return Err(S3Error::precondition_failed(src_res));
     }
     let large = size > INLINE_THRESHOLD as u64;
-    let (mut w, client) = {
+    let mut w = {
         let mut st = fs.lock().await;
         let parent = parent_for_write(&mut st, bucket, &dirs, res).await?;
-        (begin_file(&mut st, parent, name, large, res).await?, st.client.clone())
+        begin_file(&mut st, parent, name, large, Some(size), res).await?
     };
     let mut off = 0u64;
     while off < size {
@@ -449,14 +488,14 @@ async fn copy_object(fs: &Fs, bucket: &str, key: &str, src: &str, h: &HeaderMap,
             return Err(S3Error::internal("the copy source ended early", src_res));
         }
         if large {
-            w.file().write_streamed(&client, &buf).await.map_err(|e| internal(e, res))?;
+            w.file().write_streamed(&buf).await.map_err(|e| internal(e, res))?;
         } else {
             let mut st = fs.lock().await;
             w.file().write(&mut st, &buf).await.map_err(|e| internal(e, res))?;
         }
         off += buf.len() as u64;
     }
-    let (etag, mtime) = finish_and_publish(fs, w, cond, res).await?;
+    let (etag, mtime, _) = finish_and_publish(fs, w, cond, res).await?;
     drop(opened);
     Ok(xml(s3::copy_object_xml(&etag, mtime)))
 }
@@ -573,12 +612,14 @@ pub async fn upload_part(fs: &Fs, bucket: String, key: String, q: HashMap<String
             let mut w = {
                 let mut st = fs.lock().await;
                 check_upload(&mut st, id, &res).await?;
-                let p = PartWriter::begin(&mut st, id, part).await.map_err(|e| multipart_error(e, &res))?;
+                let p = PartWriter::begin(&mut st, id, part, body.expected_len())
+                    .await
+                    .map_err(|e| multipart_error(e, &res))?;
                 UnfinishedPart { client: st.client.clone(), part: Some(p) }
             };
             while let Some(chunk) = body.next().await? {
                 let p = w.part.as_mut().expect("taken only to finish");
-                p.write(&w.client, &chunk).await.map_err(|e| internal(e, &res))?;
+                p.write(&chunk).await.map_err(|e| internal(e, &res))?;
             }
             body.verify()?;
             // Only the begin needed the state; the rest is the client's.

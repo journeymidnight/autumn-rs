@@ -3819,6 +3819,33 @@ for p in $'\x04rmtomb/' $'\x04mpu/' $'\x04mpa/' $'\x04pend/'; do "${AC[@]}" ls -
 #   → all 0 a second later: the reclaimer deleted everything without a sweep
 ```
 
+**Measure PUT throughput, and see where a PUT spends its time.** Concurrent
+PUTs are bounded by the partitions the `fs/` lanes live on, so look at those
+first; a single stream is bounded by receiving its body plus writing its last
+8 MiB unit.
+
+```bash
+autumn-op --manager 127.0.0.1:9001 info        # how many partitions own fs/[0x03][lane]?
+# On a fresh cluster, BEFORE loading data (a data-bearing partition refuses):
+autumn-op --manager 127.0.0.1:9001 --wait presplit --namespace fs --lanes 24 --parts 4 \
+    --admin-token-file $DATA_ROOT/authz/admin.token
+autumnfs --manager 127.0.0.1:9001 mkdir /bench
+RUST_LOG=info,autumn_s3::write=debug autumn-s3 --manager 127.0.0.1:9001 --port 9100 > s3.log 2>&1 &
+for c in 1 8 32; do
+  NO_PROXY=127.0.0.1 python3 scripts/s3_put_bench.py --conc $c --count $((c<8?16:c*8)) --prefix c$c
+done
+#   local 3-EN, 4 lane partitions: conc 1 ~270 MiB/s, conc 8 ~430, conc 32 ~550
+#   (with fs/ in ONE partition conc 8 stays ~290 — the partition, not the gateway)
+grep 'PUT breakdown' s3.log | tail -3
+#   begin/flush/lock/finish/publish/body in ms; for 16 MiB the metadata steps
+#   (begin + finish + publish) total about 1 ms, the rest is body and data.
+```
+
+The per-PUT win of the streaming pipeline shows only against the previous
+binary on the same cluster, alternated (ABAB), each gateway stopped by its PID:
+SO_REUSEPORT lets a stale gateway on the same port keep taking connections,
+and `pkill -x autumn-s3` does not match a binary renamed `autumn-s3.old`.
+
 **Verify a gateway crash leaves nothing behind.** Start a large PUT (and an
 UploadPart) that sends slowly, `kill -9` the gateway mid-body, restart it, and
 wait past the 30 s session lease plus one sweep. The gateway log shows

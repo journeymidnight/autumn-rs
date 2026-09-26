@@ -168,6 +168,22 @@ including none.
   with the object. A body of declared length at most the inline
   threshold is written under the lock (no I/O: it is buffered into the
   inode).
+- **PUT throughput.** A body's 8 MiB units go out as each fills, up to 8 in
+  flight, while the rest arrives. The object's record goes out in the
+  background, at most 64 MiB ahead of what was written; the declared length
+  (`Content-Length`, or `x-amz-decoded-content-length` for aws-chunked) can
+  only cap it, never enlarge it, because nothing here verifies a request and
+  reclaiming walks every key the record allows (`ObjectStream`,
+  `crates/fs/CLAUDE.md`). A single stream is
+  therefore bounded by receiving the body plus writing its LAST unit. Local
+  3-EN A/B, alternating binaries: 16 MiB 228 -> 259 MiB/s, 128 MiB 256 -> 408.
+  Concurrent PUTs are bounded by the partitions the lanes live on, not by the
+  gateway: 8 x 16 MiB is 291 MiB/s with `fs/` in one partition and 433 with
+  `presplit --namespace fs --lanes 24 --parts 4`, same binary — so on a slow
+  cluster check `autumn-op info` for the `fs/` lane partitions first.
+  `RUST_LOG=autumn_s3::write=debug` logs a `PUT breakdown` line per PUT
+  (begin, body, flush, lock, finish, publish in ms); the metadata steps total
+  under 1 ms of a 16 MiB PUT.
 - **Nothing unfinished outlives its request.** An unpublished file and an
   unfinished part sit in a guard whose `Drop` undoes them, which also covers a
   client disconnect dropping the request future mid-await. Without it the

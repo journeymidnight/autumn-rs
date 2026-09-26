@@ -213,6 +213,7 @@ ino → inode 数据是 **O(log N) KV Get**（ino 编码在 key 里，LSM-tree �
 | `INLINE_THRESHOLD` | 4 KiB | 小文件 inline 阈值（匹配 VALUE_THROTTLE）|
 | `WRITE_BUF_EXTENTS` | 8 | 每 inode 写缓冲容量（extent 数）|
 | `WRITE_BUF_CAP` | 64 MiB | = `WRITE_BUF_EXTENTS × MAX_EXTENT`；>1 时 `write_region` 拆多 extent，`put_many` 按 wire key 分组后并发 fan out（`BATCH_PUT_DEFAULT_CONCURRENCY`）；extent key 互异故满并发 |
+| `STREAM_INFLIGHT` | 8 | 流式数据对象（S3 PUT / UploadPart）同时在飞的 unit put 数，见"数据对象是连续流水线" |
 | `APPEND_INFLIGHT_DEPTH` | 2 | 单 inode 同时在飞的 append flush 批数；1 批 = 8 个 extent 并发。未实测，见写流水化一节 |
 | `INODE_ALLOC_BATCH` | 1000 | 每批向 manager 领的 inode 数 |
 | `DEFAULT_STRIPE_LANES` | 24 | fs 未声明几何时的默认 lane 数 |
@@ -497,13 +498,46 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   `writer_refs > 0` 或 `mode == WRITE`。以前是 `held_leases` 里有这个 inode 就算冲突，于是同一
   网关 worker 上一个正在进行的 GET（它的 STABLE pin 也记在 `held_leases`）会让覆盖它的 PUT
   得到 409，而换一个 worker 就能成功——别的客户端的读者和 STABLE 本来就不挡 REPLACE。
-- **流式写入只需要 client**：`ObjectStream::write/finish` 取 `&ClusterClient`，不取
-  `&mut FsState`。`NewFile::start_object` 让新文件一开始就有数据对象，之后
-  `write_streamed(client, ..)` 不碰 `FsState`，`flush_streamed(client)` 把对象里缓冲的尾巴
-  （最多一批 8 个 unit = 64 MiB）也写出去，`finish` 就只剩 inode 一次 put；
-  `PartWriter::write/finish/abort` 与 `NewFile::abort`（撤销未发布文件，`segment::reclaim_except`）
-  同样只要 client。共享一个 `FsState` 的调用方（S3 网关每个 worker）因此只在 begin、inode
-  put、publish 时持锁，字节从不在锁内移动。
+- **流式写入不需要 `FsState`**：`ObjectStream` 在 `new` 时从 `FsState` 拿一份
+  `Rc<ClusterClient>`，之后 `write/finish` 不取任何参数。`NewFile::start_object` 让新文件一开始
+  就有数据对象，之后 `write_streamed(..)` 不碰 `FsState`，`flush_streamed()` 把缓冲的尾巴写出去
+  并等所有在飞的 put，`finish` 就只剩 inode 一次 put；`PartWriter::write/finish/abort` 与
+  `NewFile::abort`（撤销未发布文件，`segment::reclaim_except`）同样不要 `FsState`。共享一个
+  `FsState` 的调用方（S3 网关每个 worker）因此只在 begin、inode put、publish 时持锁，字节从不在
+  锁内移动。
+- **数据对象是连续流水线**（`ObjectStream`）：每个 unit（= `MAX_EXTENT`）一攒满就 spawn 一个
+  put，最多 `STREAM_INFLIGHT`=8 个在飞，满了只等最老的那个，**没有批间屏障**，所以 body 还在到达时
+  前面的 unit 已经在写。以前是攒满 8 个 unit（64 MiB）才发一批、整批落地才回去收 body，body 接收
+  与写入完全串行。本机 3-EN、4 lane 分区、urllib 客户端、交替 A/B：16 MiB 单流 228 → 259 MiB/s
+  （p50 68 → 58 ms），128 MiB 单流 256 → 408 MiB/s；8 并发 413 → 434，那里瓶颈在后端（1 分区时
+  291，4 分区 433，同一份代码）。在飞的 put 是 spawn 出去的任务，不 poll 也会前进；
+  compio 0.19 drop `JoinHandle` 会取消任务。
+- **记录永远领先于数据**：`segc/`（或上传的 `mpa/`）记录说这个对象最多多长，撤销/回收按它删。
+  不变量是**任何数据 put 发出之前，记录已持久地覆盖它的末尾**（`ensure_recorded`）。记录最多领先
+  已写末尾 `STREAM_INFLIGHT` 个 unit（64 MiB），用掉一半余量就提前再抬（约每 5 个 unit 一次），同一
+  时刻只有一个抬高在飞，所以落地有序。调用方知道长度时（`start_object(state, Some(n))`、
+  `PartWriter::begin(.., Some(n))`，网关传 Content-Length / `x-amz-decoded-content-length`），
+  `declare` 在后台先把记录写到 `min(n, 64 MiB)`，和第一个 unit 的接收重叠——≤64 MiB 的对象因此
+  只写一次记录。**声明的长度只能封顶、不能撑大记录**：回收要按记录枚举每个 key
+  （`object_extents` 整表物化），网关不验签，一个 `Content-Length: 2^64-1` 加断开就会让撤销去建
+  2^41 个 key、把整个网关进程拖垮（评审发现，测试里 `u64::MAX` 那段，去掉封顶即红）。记录比数据长
+  只会让删除多碰几个不存在的 key；`finish` 等完所有 put 之后把它修到精确长度。
+  测试 `a_streamed_object_records_ahead_of_its_writes` 每写一块就读持久记录、断言它不落后于已发出的
+  put（让 put 不等记录即红）。
+- **撤销先 settle**：`write` 返回时它的 put 可能还在飞，所以 `NewFile::abort` / `PartWriter::abort`
+  先 `ObjectStream::settle`（等在飞的 put 与记录抬高），再按记录删；失败路径（`fail`）同样先 settle。
+  它堵的是 **put 任务自己的重试**：client 对每个 PS 一条连接、PS 按到达顺序解码写，所以先发的 put
+  总在后发的 delete 之前落地（这也是去掉 settle 的消融**没有变红**的原因）；但 put 遇到超时或
+  PreconditionFailed（分区刚 split）会 refresh 后重发（`put_bulk_opts` / `batch_put` 的回退），那次
+  重发可以落在删除之后。旧代码 `write` 等完 put 才返回，这条按构造成立；流水线打破了它，settle 把它
+  恢复，只在失败路径有代价。
+  **句柄就地 await、落定后才移出**（`settle_oldest` / `settle_raise`）：compio 0.19 drop
+  `JoinHandle` 会取消任务；先 `pop` 再 await，请求在那个 await 上被取消（客户端断开）时任务被取消、
+  `settle` 也看不见它，已经上线的 put / 记录可能落在回收之后。
+- **网关 PUT 的分段计时**留在代码里：`RUST_LOG=autumn_s3::write=debug` 每个 PUT 打一行
+  `PUT breakdown`（begin/body/flush/lock/finish/publish 毫秒）。16 MiB、单流实测：begin 0.4、
+  body 19.6、写数据 50、finish 0.2、publish 0.4——元数据合计不到 1 ms，所以"合并 inode put 与删
+  pending"没有做：两者分处提交点（dirent CAS）两侧，本来也无法合并。
 - **回收可以交给后台**（`FsState.reclaim_later: Option<Box<dyn Fn(Reclaim)>>`，只有网关 worker
   设置）：`Reclaim::Inode(ino)` / `Reclaim::Upload(id)`。设置后 `retire`（覆盖、删除、Complete
   覆盖旧对象）只写墓碑（`extent::tombstone_unreachable`），**释放 REPLACE 之后**才经

@@ -15,6 +15,7 @@ use autumn_rpc::manager_rpc::LEASE_MODE_WRITE;
 
 use autumn_fs::publish::{self, Condition, NewFile, PublishError};
 use autumn_fs::state::FsState;
+use autumn_fs::schema::{self, SegcRecord, MAX_EXTENT};
 use autumn_fs::{dir, key, meta, read};
 
 use support::*;
@@ -284,5 +285,125 @@ fn a_dead_session_behind_a_page_of_live_ones_is_recovered() {
         assert_eq!(rescuer.kv_get_opt(&key::pending_key(s, f.ino)).await.unwrap(), None, "its write undone");
         assert_eq!(rescuer.kv_get_opt(&key::inode_key(f.ino)).await.unwrap(), None);
         assert_eq!(rescuer.kv_get_opt(&key::session_key(s)).await.unwrap(), None);
+    });
+}
+
+/// The data object's record at `[0x04]segc/[file]`: its object id and the
+/// length it allows; `None` before it is written.
+async fn object_record(st: &mut FsState, file: u64) -> Option<(u64, u64)> {
+    let p = key::segc_prefix(file);
+    let (rows, _) = st.kv_range_page(&p, &p, 10).await.unwrap();
+    if rows.is_empty() {
+        return None;
+    }
+    assert_eq!(rows.len(), 1, "one data object");
+    let (_, id) = key::parse_segc_key(&rows[0]).unwrap();
+    let v = st.kv_get_opt(&rows[0]).await.unwrap().unwrap();
+    match schema::decode_segc(&v).unwrap() {
+        SegcRecord::Object { len, .. } => Some((id, len)),
+        other => panic!("not an object record: {other:?}"),
+    }
+}
+
+/// Every data key in the tree.
+async fn data_keys(st: &mut FsState) -> Vec<Vec<u8>> {
+    let p = vec![0x03u8];
+    let mut out = Vec::new();
+    let mut from = p.clone();
+    loop {
+        let (rows, more) = st.kv_range_page(&p, &from, 1000).await.unwrap();
+        if let Some(last) = rows.last() {
+            from = dir::name_successor(last);
+        }
+        out.extend(rows);
+        if !more {
+            return out;
+        }
+    }
+}
+
+/// A streamed body (the S3 gateway's PUT) keeps many unit puts in flight
+/// while more of it arrives. The object's record must stay ahead of every
+/// put — declared up front or raised as the body grows — and end at the
+/// exact length; an abort with puts still in flight must leave nothing.
+#[test]
+#[ignore]
+fn a_streamed_object_records_ahead_of_its_writes() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1 = pick_addr();
+    let n2 = pick_addr();
+    start_extent_node(n1, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot(mgr_addr, n1, n2, 154, 15401).await;
+        let mut st = FsState::new(&mgr_addr.to_string()).await.expect("mount");
+        meta::ensure_root(&mut st).await.expect("init_root");
+        let dir = publish::ensure_dirs(&mut st, 1, &[b"bkt"]).await.unwrap();
+        let unit = MAX_EXTENT;
+
+        // (body, declared): unknown over more than the in-flight window, so
+        // the record is raised again mid-body; exact; and too short.
+        let cases = [
+            (10 * unit + 12345, None),
+            (3 * unit + 12345, Some((3 * unit + 12345) as u64)),
+            (3 * unit + 12345, Some(unit as u64)),
+        ];
+        for (i, (body, declared)) in cases.into_iter().enumerate() {
+            let name = format!("o{i}");
+            let data = pattern(body, 10 + i as u64);
+            let mut f = NewFile::begin(&mut st, dir, name.as_bytes()).await.unwrap();
+            f.start_object(&mut st, declared).await.unwrap();
+            let mut handed = 0;
+            for chunk in data.chunks(1_000_003) {
+                f.write_streamed(chunk).await.unwrap();
+                handed += chunk.len();
+                // Every full unit is put by now, so the record must already
+                // cover it — durably, not just requested.
+                let issued = (handed / unit * unit) as u64;
+                if issued > 0 {
+                    let rec = object_record(&mut st, f.ino).await.map_or(0, |r| r.1);
+                    assert!(rec >= issued, "record {rec} behind the puts issued ({issued}), {declared:?}");
+                }
+            }
+            f.flush_streamed().await.unwrap();
+            f.finish(&mut st).await.unwrap();
+            let ino = f.ino;
+            f.publish(&mut st, Condition::Absent).await.unwrap();
+            assert_eq!(read_name(&mut st, dir, &name).await.unwrap(), data, "{declared:?}");
+            assert_eq!(object_record(&mut st, ino).await.unwrap().1, body as u64, "record trimmed to the length, {declared:?}");
+        }
+
+        // A declared length is not trusted to size the record: the record stays
+        // within the in-flight window of what was written, so an absurd
+        // Content-Length cannot make the abort walk 2^41 keys.
+        let before = data_keys(&mut st).await;
+        let mut f = NewFile::begin(&mut st, dir, b"liar").await.unwrap();
+        f.start_object(&mut st, Some(u64::MAX)).await.unwrap();
+        f.write_streamed(&pattern(2 * unit, 7)).await.unwrap();
+        let rec = object_record(&mut st, f.ino).await.unwrap().1;
+        assert!(rec <= 10 * unit as u64, "record {rec} past the window of 2 written units");
+        f.abort(&st.client.clone()).await.unwrap();
+        assert_eq!(data_keys(&mut st).await, before, "data keys left behind by the abort");
+
+        // Abort with puts in flight: everything the stream wrote is deleted.
+        // The abort comes right after the writes, while their puts are out.
+        let before = data_keys(&mut st).await;
+        let total = 4 * unit as u64;
+        let mut f = NewFile::begin(&mut st, dir, b"aborted").await.unwrap();
+        f.start_object(&mut st, Some(total)).await.unwrap();
+        // Three full units: each put is issued, none is waited for.
+        f.write_streamed(&pattern(3 * unit, 99)).await.unwrap();
+        let ino = f.ino;
+        f.abort(&st.client.clone()).await.unwrap();
+        // A put the abort did not wait for would land after its delete.
+        compio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(data_keys(&mut st).await, before, "data keys left behind by the abort");
+        let p = key::segc_prefix(ino);
+        assert!(st.kv_range_page(&p, &p, 10).await.unwrap().0.is_empty(), "record reclaimed");
+        assert_eq!(st.kv_get_opt(&key::inode_key(ino)).await.unwrap(), None);
     });
 }

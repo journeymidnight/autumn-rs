@@ -47,9 +47,9 @@ async fn boot(mgr_addr: std::net::SocketAddr, n1: std::net::SocketAddr, n2: std:
 }
 
 async fn upload_part(st: &mut FsState, upload: u64, part: u32, data: &[u8]) -> Result<(String, u64), MultipartError> {
-    let mut w = PartWriter::begin(st, upload, part).await?;
+    let mut w = PartWriter::begin(st, upload, part, Some(data.len() as u64)).await?;
     for chunk in data.chunks(3 << 20) {
-        w.write(&st.client, chunk).await?;
+        w.write(chunk).await?;
     }
     w.finish(&st.client).await
 }
@@ -222,7 +222,7 @@ fn multipart_complete_is_metadata_only_and_races_resolve() {
             multipart::complete(&mut st, up, b"bkt/data/c.lance", &[(1, s1.clone()), (5, s2.clone())], Condition::None).await,
             Err(MultipartError::InvalidPart(5))
         ));
-        assert!(matches!(PartWriter::begin(&mut st, up, 0).await, Err(MultipartError::InvalidPart(0))));
+        assert!(matches!(PartWriter::begin(&mut st, up, 0, None).await, Err(MultipartError::InvalidPart(0))));
         // A failed condition reopens the upload.
         let (only, _) = (s2.clone(), ());
         assert!(matches!(
@@ -234,8 +234,8 @@ fn multipart_complete_is_metadata_only_and_races_resolve() {
 
         // ── Abort wins: no Complete afterwards, data reclaimed; a late part
         //    cleans up after itself ──
-        let mut late = PartWriter::begin(&mut st, up, 3).await.unwrap();
-        late.write(&st.client, &pattern(2 * mib, 30)).await.unwrap();
+        let mut late = PartWriter::begin(&mut st, up, 3, None).await.unwrap();
+        late.write(&pattern(2 * mib, 30)).await.unwrap();
         multipart::abort(&mut st, up).await.expect("abort");
         assert!(matches!(late.finish(&st.client).await, Err(MultipartError::NoSuchUpload)));
         assert!(matches!(
@@ -353,8 +353,8 @@ fn multipart_complete_is_metadata_only_and_races_resolve() {
         let up = multipart::create(&mut st, d, b"f.lance", b"bkt/data/f.lance").await.unwrap();
         let (fe1, _) = upload_part(&mut st, up, 1, &pattern(mib, 50)).await.unwrap();
         let mut dead = FsState::new(&mgr).await.expect("mount2");
-        let mut orphan = PartWriter::begin(&mut dead, up, 2).await.unwrap();
-        orphan.write(&dead.client, &pattern(4 * mib, 51)).await.unwrap();
+        let mut orphan = PartWriter::begin(&mut dead, up, 2, None).await.unwrap();
+        orphan.write(&pattern(4 * mib, 51)).await.unwrap();
         let dead_session = dead.session.unwrap();
         // The dead session had also started completing: its record and
         // Completing state exist, the name was never published.

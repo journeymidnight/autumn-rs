@@ -165,21 +165,23 @@ impl NewFile {
     /// Append `data`.
     pub async fn write(&mut self, state: &mut FsState, data: &[u8]) -> Result<()> {
         if let Some(o) = &mut self.object {
-            return o.write(&state.client, data).await;
+            return o.write(data).await;
         }
         self.small.extend_from_slice(data);
         if self.small.len() > schema::INLINE_THRESHOLD {
-            self.start_object(state).await?;
+            self.start_object(state, None).await?;
         }
         Ok(())
     }
 
     /// Give the file its data object now rather than when it outgrows the
-    /// inline threshold, so every later [`NewFile::write_streamed`] needs only
-    /// the client. For a writer that knows the file is not small (a PUT whose
+    /// inline threshold, so every later [`NewFile::write_streamed`] needs no
+    /// `FsState`. For a writer that knows the file is not small (a PUT whose
     /// length exceeds the threshold, or is unknown) and does not want to hold
-    /// the `FsState` while the body arrives.
-    pub async fn start_object(&mut self, state: &mut FsState) -> Result<()> {
+    /// the `FsState` while the body arrives. `declared` is the file's length
+    /// when the writer knows it: the object's record then goes out once, in
+    /// the background, instead of ahead of the writes.
+    pub async fn start_object(&mut self, state: &mut FsState, declared: Option<u64>) -> Result<()> {
         if self.object.is_some() {
             return Ok(());
         }
@@ -187,28 +189,32 @@ impl NewFile {
         // Recorded under the new file, so an undo — or a reclaim once
         // published — finds it.
         let mut o = segment::ObjectStream::new(state, |d| key::segc_key(ino, d), self.lease).await?;
+        if let Some(n) = declared {
+            o.declare(n);
+        }
         let held = self.small.split();
-        o.write(&state.client, &held).await?;
+        o.write(&held).await?;
         self.object = Some(o);
         Ok(())
     }
 
-    /// Append `data` through the client alone. Only after
+    /// Append `data` with no `FsState`. Only after
     /// [`NewFile::start_object`]: the inline buffer would need the `FsState`
     /// to spill into an object.
-    pub async fn write_streamed(&mut self, client: &ClusterClient, data: &[u8]) -> Result<()> {
+    pub async fn write_streamed(&mut self, data: &[u8]) -> Result<()> {
         match &mut self.object {
-            Some(o) => o.write(client, data).await,
+            Some(o) => o.write(data).await,
             None => Err(anyhow!("write_streamed before start_object")),
         }
     }
 
-    /// Write whatever the data object still buffers, through the client
-    /// alone, so [`NewFile::finish`] then writes only the inode. For a caller
-    /// that holds the `FsState` behind a shared lock only for `finish`.
-    pub async fn flush_streamed(&mut self, client: &ClusterClient) -> Result<()> {
+    /// Write whatever the data object still buffers and wait for every put,
+    /// with no `FsState`, so [`NewFile::finish`] then writes only the inode.
+    /// For a caller that holds the `FsState` behind a shared lock only for
+    /// `finish`.
+    pub async fn flush_streamed(&mut self) -> Result<()> {
         if let Some(o) = &mut self.object {
-            o.finish(client).await?;
+            o.finish().await?;
         }
         Ok(())
     }
@@ -226,7 +232,7 @@ impl NewFile {
                 }
             }
             Some(o) => {
-                let (len, _) = o.finish(&state.client).await?;
+                let (len, _) = o.finish().await?;
                 m.size = len;
                 m.segments = Some(SegmentMap { inline: vec![o.segment(0)], map_id: 0, page_starts: Vec::new(), count: 1 });
             }
@@ -256,8 +262,12 @@ impl NewFile {
     }
 
     /// Discard an unpublished file (a failed or cancelled upload). Needs only
-    /// the client: nobody else can see the file.
-    pub async fn abort(self, client: &ClusterClient) -> Result<()> {
+    /// the client: nobody else can see the file. Its writes still in flight
+    /// settle first, so none lands after the delete.
+    pub async fn abort(mut self, client: &ClusterClient) -> Result<()> {
+        if let Some(o) = &mut self.object {
+            o.settle().await;
+        }
         undo_new_file(client, self.ino, self.lease).await
     }
 }

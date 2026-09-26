@@ -332,24 +332,51 @@ async fn record(state: &mut FsState, file_ino: u64, id: u64, rec: &SegcRecord, l
         .await
 }
 
-/// A data object written as a stream: full units go out in parallel
-/// batches as they fill, so a large body is never held in memory. Before
-/// each batch, the record at `record_key` is raised to the length the object
-/// may reach once the batch lands, so whoever undoes or reclaims it deletes
-/// exactly what can exist. A CRC32C of the bytes is kept on the way through.
+/// A data object written as a stream: each unit goes out the moment it
+/// fills, up to [`STREAM_INFLIGHT`] at once, with no barrier between them, so
+/// the writes overlap the arrival of the rest of the body and a large body is
+/// never held in memory.
+///
+/// The record at `record_key` bounds what may exist: no data put is issued
+/// past the length the record durably allows, so whoever undoes or reclaims
+/// the object deletes everything that can be there. The record never allows
+/// more than `STREAM_INFLIGHT` units past the end written, whatever the writer
+/// declares — reclaiming an object walks every key its record allows, so a
+/// record taken from an untrusted length could name billions — and it is
+/// raised again once half that headroom is used (every fifth unit). A
+/// declared length ([`ObjectStream::declare`]) caps it: a body within that
+/// window is recorded once, in the background while its first unit is still
+/// arriving. Only one raise is ever in flight, so raises land in order. A
+/// CRC32C of the bytes is kept on the way through.
 pub struct ObjectStream {
     pub data_ino: u64,
     pub lanes: u8,
     pub unit: u32,
+    client: Rc<ClusterClient>,
     record_key: Vec<u8>,
     lease: WriteLease,
+    /// The length the durable record allows.
+    recorded: u64,
+    /// The length the writer said the object will have.
+    declared: Option<u64>,
+    /// The record raise in flight, and the length it raises to.
+    raising: Option<(u64, compio::runtime::JoinHandle<Result<()>>)>,
+    /// Data puts in flight, oldest first.
+    inflight: std::collections::VecDeque<compio::runtime::JoinHandle<Result<()>>>,
+    /// The first failure; every later call returns it.
+    failed: Option<String>,
     pending: bytes::BytesMut,
+    /// Bytes handed to data puts.
     written: u64,
     crc: u32,
 }
 
-/// Units put per batch while streaming.
-const STREAM_UNITS: usize = 8;
+/// Data puts in flight per stream (one unit each).
+const STREAM_INFLIGHT: usize = 8;
+
+fn task_result<T, E: std::fmt::Debug>(r: std::result::Result<Result<T>, E>, what: &str) -> Result<T> {
+    r.unwrap_or_else(|e| Err(anyhow!("{what} task: {e:?}")))
+}
 
 impl ObjectStream {
     /// A new, empty object whose record will live at `record_key`.
@@ -360,57 +387,195 @@ impl ObjectStream {
             data_ino,
             lanes,
             unit,
+            client: state.client.clone(),
             record_key: record_key(data_ino),
             lease,
+            recorded: 0,
+            declared: None,
+            raising: None,
+            inflight: std::collections::VecDeque::new(),
+            failed: None,
             pending: bytes::BytesMut::new(),
             written: 0,
             crc: 0,
         })
     }
 
-    /// Append `data`. Needs only the client, not the `FsState`, so a caller
-    /// that shares one state between many requests (the S3 gateway) can
-    /// stream a body without holding the state for the network writes.
-    pub async fn write(&mut self, client: &ClusterClient, data: &[u8]) -> Result<()> {
+    /// The object will be `len` bytes: start recording it now (up to the
+    /// window), in the background, so the first data put does not wait for
+    /// it. A body that turns out longer still works (the record is raised
+    /// again); a shorter one leaves the record over-long until
+    /// [`ObjectStream::finish`] trims it, and an over-long record only makes a
+    /// delete touch keys that are not there.
+    pub fn declare(&mut self, len: u64) {
+        self.declared = Some(len);
+        let to = self.record_target(self.written);
+        if to > self.recorded && self.raising.is_none() {
+            self.raising = Some((to, self.spawn_record(to)));
+        }
+    }
+
+    /// What to raise the record to for writes up to `end`: the window past
+    /// it, but no further than a declared length that covers it.
+    fn record_target(&self, end: u64) -> u64 {
+        let window = end + STREAM_INFLIGHT as u64 * self.unit as u64;
+        match self.declared {
+            Some(n) if n >= end => n.min(window),
+            _ => window,
+        }
+    }
+
+    fn spawn_record(&self, len: u64) -> compio::runtime::JoinHandle<Result<()>> {
+        let rec = SegcRecord::Object { len, lanes: self.lanes, unit: self.unit };
+        let (client, key, lease) = (self.client.clone(), self.record_key.clone(), self.lease);
+        compio::runtime::spawn(async move {
+            client
+                .put_fenced(&key, &schema::encode_segc(&rec), lease)
+                .await
+                .map_err(|e| anyhow!("KV put: {e}"))
+        })
+    }
+
+    /// Wait until the record durably allows `end`, starting a raise if the
+    /// one in flight (if any) does not reach it. The next raise starts once
+    /// half the window is used, so it lands before the writes need it.
+    async fn ensure_recorded(&mut self, end: u64) -> Result<()> {
+        while end > self.recorded {
+            match self.settle_raise().await {
+                Some(r) => r?,
+                None => {
+                    let to = self.record_target(end);
+                    self.raising = Some((to, self.spawn_record(to)));
+                }
+            }
+        }
+        let half = STREAM_INFLIGHT as u64 * self.unit as u64 / 2;
+        let to = self.record_target(end);
+        if self.raising.is_none() && self.recorded - end < half && to > self.recorded {
+            self.raising = Some((to, self.spawn_record(to)));
+        }
+        Ok(())
+    }
+
+    // A handle is awaited where it sits and removed only once it settled:
+    // dropped at that await (a request cancelled), it would cancel its task,
+    // and `settle` could no longer wait for a put already on the wire.
+
+    /// Wait for the oldest data put; `None` when none is in flight.
+    async fn settle_oldest(&mut self) -> Option<Result<()>> {
+        let h = self.inflight.front_mut()?;
+        let r = task_result(h.await, "data put");
+        self.inflight.pop_front();
+        Some(r)
+    }
+
+    /// Wait for the record raise in flight; `None` when there is none.
+    async fn settle_raise(&mut self) -> Option<Result<()>> {
+        let (to, h) = self.raising.as_mut()?;
+        let to = *to;
+        let r = task_result(h.await, "record");
+        self.raising = None;
+        if r.is_ok() {
+            self.recorded = to;
+        }
+        Some(r)
+    }
+
+    fn check(&self) -> Result<()> {
+        match &self.failed {
+            Some(e) => Err(anyhow!("data object {}: {e}", self.data_ino)),
+            None => Ok(()),
+        }
+    }
+
+    /// Record the first failure, then let everything in flight settle before
+    /// returning it.
+    async fn fail(&mut self, e: anyhow::Error) -> anyhow::Error {
+        self.failed.get_or_insert_with(|| format!("{e:#}"));
+        self.settle().await;
+        e
+    }
+
+    /// Wait for every put and record raise in flight, whatever their
+    /// outcome. An undo must come after this: it deletes what the record
+    /// names, and a put still in flight could land after that delete.
+    pub async fn settle(&mut self) {
+        while let Some(r) = self.settle_oldest().await {
+            if let Err(e) = r {
+                tracing::debug!(data_ino = self.data_ino, error = %e, "a data put failed while settling");
+            }
+        }
+        if let Some(Err(e)) = self.settle_raise().await {
+            tracing::debug!(data_ino = self.data_ino, error = %e, "a record raise failed while settling");
+        }
+    }
+
+    /// Put `chunk` (at most one unit) at the current end, after the oldest
+    /// put when [`STREAM_INFLIGHT`] are already out.
+    async fn issue(&mut self, chunk: Bytes) -> Result<()> {
+        if self.inflight.len() >= STREAM_INFLIGHT {
+            if let Some(Err(e)) = self.settle_oldest().await {
+                return Err(self.fail(e).await);
+            }
+        }
+        let end = self.written + chunk.len() as u64;
+        if let Err(e) = self.ensure_recorded(end).await {
+            return Err(self.fail(e).await);
+        }
+        let k = key::data_extent_key(self.data_ino, self.written, self.lanes, self.unit);
+        let (client, lease, data_ino) = (self.client.clone(), self.lease, self.data_ino);
+        self.inflight.push_back(compio::runtime::spawn(async move {
+            let r = client.put_many_fenced(&[(k.as_slice(), chunk, 0u64)], lease).await;
+            match r.into_iter().next() {
+                Some(Ok(())) => Ok(()),
+                Some(Err(e)) => Err(anyhow!("data object {data_ino}: {e}")),
+                None => Err(anyhow!("data object {data_ino}: no reply")),
+            }
+        }));
+        self.written = end;
+        Ok(())
+    }
+
+    /// Append `data`. Needs only the client this stream was made with, not
+    /// the `FsState`, so a caller that shares one state between many
+    /// requests (the S3 gateway) can stream a body without holding the state
+    /// for the network writes. A put that fails is reported by a later call.
+    pub async fn write(&mut self, data: &[u8]) -> Result<()> {
+        self.check()?;
         self.crc = crc32c::crc32c_append(self.crc, data);
         self.pending.extend_from_slice(data);
-        let batch = self.unit as usize * STREAM_UNITS;
-        while self.pending.len() >= batch {
-            let chunk = self.pending.split_to(batch).freeze();
-            self.put_units(client, chunk).await?;
-        }
-        Ok(())
-    }
-
-    async fn put_units(&mut self, client: &ClusterClient, chunk: Bytes) -> Result<()> {
-        let rec = SegcRecord::Object { len: self.written + chunk.len() as u64, lanes: self.lanes, unit: self.unit };
-        client
-            .put_fenced(&self.record_key, &schema::encode_segc(&rec), self.lease)
-            .await
-            .map_err(|e| anyhow!("KV put: {e}"))?;
         let unit = self.unit as usize;
-        let mut keys = Vec::new();
-        let mut vals = Vec::new();
-        let mut off = 0;
-        while off < chunk.len() {
-            let n = unit.min(chunk.len() - off);
-            keys.push(key::data_extent_key(self.data_ino, self.written + off as u64, self.lanes, self.unit));
-            vals.push(chunk.slice(off..off + n));
-            off += n;
+        while self.pending.len() >= unit {
+            let chunk = self.pending.split_to(unit).freeze();
+            self.issue(chunk).await?;
         }
-        let items: Vec<(&[u8], Bytes, u64)> = keys.iter().zip(vals).map(|(k, v)| (k.as_slice(), v, 0u64)).collect();
-        for r in client.put_many_fenced(&items, self.lease).await {
-            r.map_err(|e| anyhow!("data object {}: {e}", self.data_ino))?;
-        }
-        self.written += chunk.len() as u64;
         Ok(())
     }
 
-    /// Write the rest. Returns `(length, crc32c)`.
-    pub async fn finish(&mut self, client: &ClusterClient) -> Result<(u64, u32)> {
+    /// Write the rest and wait for every put. The record is trimmed to the
+    /// exact length when it allows more, which only happens once every put
+    /// has landed. Returns `(length, crc32c)`; calling it again is a no-op.
+    pub async fn finish(&mut self) -> Result<(u64, u32)> {
+        self.check()?;
         let rest = self.pending.split().freeze();
         if !rest.is_empty() {
-            self.put_units(client, rest).await?;
+            self.issue(rest).await?;
+        }
+        while let Some(r) = self.settle_oldest().await {
+            if let Err(e) = r {
+                return Err(self.fail(e).await);
+            }
+        }
+        if let Some(Err(e)) = self.settle_raise().await {
+            return Err(self.fail(e).await);
+        }
+        if self.recorded > self.written {
+            let rec = SegcRecord::Object { len: self.written, lanes: self.lanes, unit: self.unit };
+            self.client
+                .put_fenced(&self.record_key, &schema::encode_segc(&rec), self.lease)
+                .await
+                .map_err(|e| anyhow!("KV put: {e}"))?;
+            self.recorded = self.written;
         }
         Ok((self.written, self.crc))
     }
