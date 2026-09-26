@@ -157,8 +157,7 @@ fn main() -> Result<()> {
 
     // Build the fuse Session UP FRONT so we can
     // grab a `Notifier` BEFORE the compio thread starts. The
-    // notifier is `Clone + Send`; we ship one clone to the compio
-    // thread (wrapped in the `InodeInvalidator` Rc-Fn closure) so
+    // notifier goes to the invalidation thread (`inval.rs`) so
     // the invalidation poll loop can drop the kernel's attribute
     // + page cache on per-ino `WriterClosed` / `LeaseRevoked`
     // events. Without this, a reader app on host B continues to
@@ -205,18 +204,17 @@ fn main() -> Result<()> {
     tracing::info!(mountpoint = %mountpoint.display(), "mounting filesystem");
     let mut session = fuser::Session::new(fs, &mountpoint, &options)?;
     let notifier = session.notifier();
+    // Never on the compio thread: the notify blocks on pages whose reads
+    // only that thread can answer (see `inval.rs`).
+    let (inval_tx, inval_results) =
+        autumn_fuse::inval::spawn(move |ino| notifier.inval_inode(ino, 0, 0))
+            .context("spawn invalidation thread")?;
 
     // Start the compio thread
     let manager_addr = args.manager.clone();
     let compio_handle = std::thread::Builder::new()
         .name("autumn-fuse-compio".to_string())
         .spawn(move || {
-            // Move `notifier` into this thread; the
-            // `InodeInvalidator` Rc-Fn closure constructed below
-            // wraps it inside the compio runtime (which is
-            // single-threaded so the Rc trait object never
-            // crosses threads after this point).
-            let notifier = notifier;
             compio::runtime::Runtime::new().unwrap().block_on(async {
                 // Connect to cluster (scoped to `fs/{tenant}/`); with an authz
                 // credential when `--credential-file` was given.
@@ -297,37 +295,19 @@ fn main() -> Result<()> {
                 .await;
                 let read_pool = (!read_pool.is_empty()).then_some(read_pool);
 
-                // Build the invalidator that the
-                // poll loop calls per WriterClosed/LeaseRevoked
-                // event. `inval_inode(ino, 0, 0)` drops both
-                // attribute and the full data range — kernel
-                // re-fetches via our dispatcher on the next read.
-                //
-                // BUG-LEASE-6 (P2 #7, 2026-06-06) — fail-closed
-                // tracking. On `inval_inode` error, record the ino
-                // in `state.notify_inval_failed` so the Open/Read
-                // arms can force a fresh `get_inode` reload + retry
-                // the kernel notify on the next syscall. On
-                // success, REMOVE the entry — every Open-triggered
-                // retry runs this closure too, so a successful
-                // retry naturally clears the sticky flag.
-                let notify_failed_h = state.notify_inval_failed.clone();
-                let invalidator: dispatch::InodeInvalidator =
-                    std::rc::Rc::new(move |ino: u64| {
-                        match notifier.inval_inode(ino, 0, 0) {
-                            Ok(()) => {
-                                notify_failed_h.borrow_mut().remove(&ino);
-                            }
-                            Err(e) => {
-                                notify_failed_h.borrow_mut().insert(ino);
-                                tracing::warn!(
-                                    ino,
-                                    error = %e,
-                                    "BUG-LEASE-6: notify_inval_inode failed; marked sticky for retry on next Open"
-                                );
-                            }
-                        }
-                    });
+                // The invalidator the poll loop calls per
+                // WriterClosed/LeaseRevoked event queues the ino for the
+                // invalidation thread, whose `inval_inode(ino, 0, 0)` drops
+                // both attribute and the full data range — kernel re-fetches
+                // via our dispatcher on the next read. Its outcomes land in
+                // `state.notify_inval_failed` (BUG-LEASE-6, fail-closed): a
+                // failed ino is reloaded and re-notified on its next Open.
+                let invalidator = autumn_fuse::inval::invalidator(inval_tx);
+                compio::runtime::spawn(autumn_fuse::inval::record_results(
+                    inval_results,
+                    state.notify_inval_failed.clone(),
+                ))
+                .detach();
 
                 // Spawn per-mount lease heartbeat +
                 // invalidation poll loops. They share the compio

@@ -540,19 +540,20 @@
 - **Scope**（未实现）: 在加载期抓一次读大小直方图（守护进程侧按 size 分桶计数），
   确认 74 KiB 是加载器发出的还是我们内部拆的。若是后者，合并相邻 extent 的读是直接收益。
 
-### BUG-FUSE-INVAL-ON-DISPATCHER-THREAD — 失效通知在 dispatcher 线程上做阻塞写，可能死锁
-- **Trigger** (2026-09-12): 独立评审在审 `--direct-io` 时发现，**与该改动无关，是既有隐患**。
-- **代码事实**: `main.rs` 的失效闭包调用 `notifier.inval_inode(ino, 0, 0)`，fuser 侧是对
-  session fd 的同步 `write(2)`。它从 lease 轮询任务发起，跑在**同一个 compio runtime**上：
-  每个事件一次；溢出哨兵与**任何轮询传输错误**时对**每一个持有的 inode** 各一次。
-  而一个 FUSE 读要被应答，必须先由 dispatcher 跑 `read::prepare`（需要 `&mut state`）。
-- **推断的后果**（未复现）: `FUSE_NOTIFY_INVAL_INODE` 走 `invalidate_inode_pages2_range`，
-  要拿 folio 锁，而预读持有该锁直到对应 FUSE_READ 被应答。若那条读还排在桥接通道里等
-  同一个被阻塞的线程，双方互等；FUSE 无超时，读者永久 D 状态。
-  **触发场景是只读挂载也有的**：加载途中 manager 重启或连接抖动。
-- **Scope**（未实现）: 先按评审给的判据复现——`cat bigfile` 循环 + 中途重启 manager，
-  看 `autumn-fuse-compio` 线程是否停在 `folio_wait_bit`/`__lock_page`（`/proc/<pid>/task/*/wchan`）、
-  读者是否 D 状态。确认后的修法形状：把通知移到专用线程发（`Notifier` 是 `Send + Clone`）。
+### BUG-FUSE-SIGKILL-DURING-NOTIFY — notify 等预读页时被 SIGKILL，守护进程成不可杀僵尸、挂载点无人服务
+- **Trigger** (2026-09-26，修内核失效死锁时独立评审在宿主上发现，已核实): 失效通知改到
+  `autumn-fuse-inval` 线程后，它等预读页是正常的瞬态。此时 SIGKILL：能应答那条 FUSE_READ 的
+  线程全死，等待线程 D 状态不可中断，`/dev/fuse` fd 要等所有线程退出才释放（释放才 abort
+  连接）⇒ 永久僵尸（`Z` + 一个线程停在 `fuse_reverse_inval_inode → folio_wait_bit_common`），
+  AutoUnmount 也不触发（fusermount3 的 socket 同在 fd 表里）。`scripts/fuse_inval_deadlock.sh`
+  早期版本用 `kill -9` 收尾，修前修后每跑一次留一个；fusectl abort 后立即退出。
+  前提：被杀时刻有预读中的页缓存页（mmap-private / create fd），即原死锁的同一类负载。
+- **Scope**: 让 SIGTERM（k8s 先发的那个）走优雅卸载：守护进程活着的时候卸载，在途 notify 能等到
+  自己的读被应答再返回，然后 Destroy 正常退出。SIGKILL 本身无法处理，不在范围内。
+- **Acceptance**: 在 `fuse_inval_deadlock.sh` 负载运行中向读挂载守护进程发 SIGTERM（不做 fusectl
+  abort）：进程在有界时间内退出、挂载点被卸掉、`/sys/fs/fuse/connections` 下不残留该连接；
+  对照（去掉处理）同样操作留下僵尸。
+- `passes: false`
 
 ### F-FUSE-BIG-IO-TUNING — writeback cache + splice 零拷贝，把大 IO 的 FUSE 开销压进 5%
 - **Trigger** (2026-09-16，用户在 FUSE 性能讨论后确认的三件套之一): 实测
@@ -570,6 +571,9 @@
   复现步骤联测不引入新死锁。
 - **Status**: `passes: false` (2026-09-16) — 未开工。先于 F-FUSE-IORING-PASSTHROUGH。
 - `passes: false`
+- **notes** (2026-09-26): BUG-FUSE-INVAL-ON-DISPATCHER-THREAD 已修并关账，它的复现步骤就是
+  `scripts/fuse_inval_deadlock.sh`（docs/ops.md「Kernel cache invalidation must not wedge a
+  mount」）。writeback cache 会让页缓存多出脏页，联测时这条脚本必须仍然通过。
 
 ### F-FUSE-IORING-PASSTHROUGH — FUSE io_uring 提交 + passthrough 读直达
 - **Trigger** (2026-09-16，用户确认): Linux 6.x FUSE 支持 io_uring 提交路径与

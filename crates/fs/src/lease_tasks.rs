@@ -15,10 +15,14 @@
 use crate::state::FsState;
 
 /// Callback the per-session invalidation poll loop runs for
-/// every per-ino `WriterClosed` / `LeaseRevoked` event. In the fuse mount this
-/// is `notifier.inval_inode(ino, 0, 0)` against the live `fuser::Session`'s
-/// `Notifier`, dropping the kernel's attribute + page cache for the ino so the
-/// next syscall reaches the dispatcher.
+/// every per-ino `WriterClosed` / `LeaseRevoked` event. In the fuse mount it
+/// queues the ino for the mount's invalidation thread, whose
+/// `notifier.inval_inode(ino, 0, 0)` drops the kernel's attribute + page cache
+/// for the ino so the next syscall reaches the dispatcher.
+///
+/// It must return without waiting for the kernel: the notify blocks on pages
+/// whose reads only this runtime's dispatcher can answer, so a callback that
+/// waited would wedge the mount (`autumn-fuse`'s `inval.rs`).
 ///
 /// Boxed as a trait object on `Rc` because the compio runtime is
 /// single-threaded — `Rc` is enough; no `Send` needed — and the callback is

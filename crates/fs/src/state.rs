@@ -133,18 +133,22 @@ pub struct FsState {
 
     /// BUG-LEASE-6 (P2 #7, 2026-06-06) — sticky set of inos whose
     /// most recent `notify_inval_inode` kernel call FAILED. The
-    /// poll-loop invalidator writes to this set on error; the
-    /// Open/Read arms check it and force a fresh `get_inode`
-    /// reload + retry `notify_inval_inode` for any sticky-failed
-    /// ino, so a transient kernel-notification failure can't
-    /// indefinitely strand readers on stale page-cache contents.
-    /// On the retry succeeding the entry is removed.
+    /// mount writes each notify's outcome here (a failure inserts,
+    /// a success removes); the Open arm checks it and forces a
+    /// fresh `get_inode` reload + queues `notify_inval_inode` again
+    /// for any sticky-failed ino, so a transient kernel-notification
+    /// failure can't indefinitely strand readers on stale page-cache
+    /// contents. Outcomes arrive after the notify runs, so the set
+    /// lags the kernel by the queue: an Open racing a failure that
+    /// is not recorded yet skips the retry, and the next Open makes
+    /// it.
     pub notify_inval_failed: Rc<RefCell<std::collections::HashSet<u64>>>,
 
     /// BUG-LEASE-6 (P2 #7) — clone of the per-mount kernel
-    /// `Notifier::inval_inode` closure, kept here so the Open
-    /// arm can retry the notify when `notify_inval_failed`
-    /// contains the ino. `None` in tests + headless contexts
+    /// invalidator (queues `Notifier::inval_inode` on the mount's
+    /// invalidation thread), kept here so the Open arm can retry
+    /// the notify when `notify_inval_failed` contains the ino.
+    /// `None` in tests + headless contexts
     /// (no live `fuser::Session`) — the Open arm short-circuits
     /// to "drop the cached InodeState" and skips the kernel
     /// retry. The closure type is the same `Rc<dyn Fn(u64)>`

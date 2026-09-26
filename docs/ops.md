@@ -2281,6 +2281,49 @@ P-log`; delete all PS pods in parallel to rebuild.)
 
 ## Chaos suites
 
+### Kernel cache invalidation must not wedge a mount (`fuse_inval_deadlock.sh`)
+
+A mount drops the kernel's page cache for a file when another client's writer
+closes it. The kernel serves that by locking every cached page of the file, and a
+page under readahead stays locked until the mount answers its read — so the
+invalidation must never be sent from the thread that answers reads. The script
+makes that race as likely as it gets: one mount re-faults a private mmap of a
+64 MiB file in a loop (plain `read(2)` never hits the page cache — opens are
+direct-io — so `cat` loops cannot trigger it), while a second mount opens the
+same file for write and closes it as fast as it can, one WriterClosed event per
+close.
+
+```bash
+# ~2 min per run. Mounts /mnt/autumn-fuse-inval-r and /mnt/autumn-fuse-inval-w.
+AUTUMN_DATA_ROOT=/data05/autumn-inval ./scripts/fuse_inval_deadlock.sh
+# Reads prepared AND executed on the dispatcher (the shape most likely to wedge):
+READ_IO_THREADS=0 AUTUMN_DATA_ROOT=/data05/autumn-inval ./scripts/fuse_inval_deadlock.sh
+```
+
+Pass = first a probe: one writer close must take the file's page cache on the
+reader mount from ~100% resident to ≤10% within 5 s (mincore; fuser reports a notify for an
+inode the kernel does not know as success, so only the page cache can show that
+notifies land). Then the race: the reader's pass counter never stalls for 15 s,
+every pass hashes to the seeded file, the writer keeps closing, the reader mount
+logs at least 1000 invalidation events, and no kernel notify fails. A/B an older
+build with `FUSE_BIN=<path>`. Healthy shape over 60 s: ~170 passes, ~150 k events. A wedge
+prints the reader mount's threads: `autumn-fuse-com  D  folio_wait_bit_common`
+plus the reader in D with `filemap_fault` in its stack is this deadlock.
+
+Killing the daemon does NOT free a wedged mount. A daemon SIGKILLed while a
+notify waits on a readahead page stays a zombie (a thread in D at
+`folio_wait_bit_common`, main thread `Z`) and its mount keeps no server behind
+it; with the fix this can still happen if the kill lands mid-notify. The script
+tears down by aborting the connection first. To clear one by hand:
+
+```bash
+mountpoint -q /sys/fs/fuse/connections || mount -t fusectl none /sys/fs/fuse/connections
+# The minor from mountinfo — NOT `mountpoint -d`/stat, which blocks on a wedged mount.
+# For a detached mount, match the connection dir's ctime to the daemon's start time.
+awk -v m=<mountpoint> '$5 == m { print $3 }' /proc/self/mountinfo   # -> 0:<minor>
+echo 1 > /sys/fs/fuse/connections/<minor>/abort   # the zombie exits at once
+```
+
 ### Dead peer behind a healthy connection (`fuse_dead_peer_chaos.sh`)
 
 A connection whose peer stopped answering while TCP still reports it ESTABLISHED

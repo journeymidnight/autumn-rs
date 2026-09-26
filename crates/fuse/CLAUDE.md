@@ -20,6 +20,7 @@
 | `ops.rs` | `fuser::Filesystem` trait 实现（readdir 在 reply 边界做 DT_*→FileType）|
 | `dispatch.rs` | compio 侧派发循环（lookup/mkdir 在此转 FileAttr；lease 三方法 `pub use` 自 `autumn_fs::lease_tasks`）|
 | `read_pool.rs` | 读 I/O 线程池（N 个独立 compio runtime + 各自的 ClusterClient；`ReadJob` 载 `fuser::ReplyData` 跨线程）|
+| `inval.rs` | 内核缓存失效线程（`autumn-fuse-inval`：`inval_inode` 在这里发，结果回派发 runtime 记 sticky 集）|
 
 不变量：新的 core→fuser 转换一律进 `attr.rs`；文件系统逻辑一律进 `autumn-fs`，不在
 这里另写一份（挂载、S3 网关、Python 绑定必须读写同一份格式）。
@@ -204,6 +205,44 @@ WriteConflict）——拦截完全发生在挂载侧的簿记里。
   真实挂载侧：两个挂载点跑 `ffmpeg -movflags +faststart` + 降级观察（守护进程要
   `RUST_LOG=info` 才看得到 `lease downgrade: writer slot released` 那行；T1–T3 区分不了
   "角色恒为 READ"，只有第二个挂载拿到 writer 槽才证明 RELEASE 的角色真的接对了）。
+
+### 内核缓存失效只在 `autumn-fuse-inval` 线程上发（`inval.rs`）
+
+`Notifier::inval_inode` 是对 `/dev/fuse` 的**同步** write(2)，内核处理它时要锁住该
+inode 的每一个缓存页（`invalidate_inode_pages2_range`）。预读中的页一直锁着，直到
+对应的 FUSE_READ 被应答——而**每个** FUSE_READ 都要先经派发线程 `prepare`（读池只
+接 `execute`）。所以在派发线程上发这个 write，就是自己等自己：读者 D 状态、挂载点
+从此不再应答任何请求（FUSE 没有超时）。以前就是这么发的（lease 轮询任务与 Open 臂
+都在派发 runtime 上直接调闭包）。
+
+实测（`scripts/fuse_inval_deadlock.sh`，修前二进制）：第 1～2 个 WriterClosed 事件就
+卡死，`autumn-fuse-com` 线程停在 `folio_wait_bit_common`（D），读者同样；
+`--read-io-threads 0` 和默认 4 都一样。修后同一脚本 90 s 各跑过 ~23 万个事件、
+~250 轮整文件校验，零卡顿、字节全对。
+
+- **怎么才会有被锁的缓存页**：Open 应答带 `FOPEN_DIRECT_IO`，普通 `read(2)` 不进页缓存，
+  所以 `cat` 循环**触发不了**。进页缓存的是：`MAP_PRIVATE` mmap（6.1 内核对 direct-io
+  文件允许私有映射，缺页走 filemap 预读）、以及 `create` 返回的 fd（应答 flags 为 0）。
+  脚本的读者就是私有映射反复缺页。
+- **形状**：派发 runtime 只把 ino 塞进 std channel；专用线程调 `inval_inode`，在那里阻塞
+  无害（派发线程空着，能去应答持锁的那条读）；每个结果按序经 futures channel 回到派发
+  runtime，由 `record_results` 写 `notify_inval_failed`（失败置 sticky、成功清除）。
+- **不许等失效落地再应答请求**：在 handler 里 await 结果，等于把派发循环挂住——跟阻塞
+  write 把线程挂住是同一个死锁。所以 Open 臂对 sticky ino 的重试是**只入队**，结果
+  以后再清 sticky；以前那句"retry succeeded on Open"的同步判断因此移到 `record_result`。
+- 线程不 join：所有 sender 丢掉（compio runtime 退出）就自然结束；卸载之后也没有值得
+  送达的失效。
+- **⚠️ 剩下的一个坑：notify 正等着预读页时被 SIGKILL**。能应答那条读的线程都死了，等待的
+  线程不可中断，而 `/dev/fuse` fd 要等**所有**线程退出才释放（释放才会 abort 连接、才会
+  放开那页）——守护进程永远是僵尸，挂载点背后没有服务（就是 AutoUnmount 注释里那五台
+  节点的形状）。实测：脚本早期版本用 `kill -9` 收尾，修前修后每跑一次都留下一个，线程停在
+  `fuse_reverse_inval_inode → invalidate_inode_pages2_range → folio_wait_bit_common`；
+  `echo 1 > /sys/fs/fuse/connections/<minor>/abort` 后立即退出。前提是被杀那一刻有预读中
+  的页缓存页，也就是原来会直接死锁的那种 mmap-private 负载，所以修后严格更好。根治要让
+  SIGTERM 走优雅卸载，记在账本 BUG-FUSE-SIGKILL-DURING-NOTIFY。
+- 测试：`inval.rs` 单测钉"invalidator 不等 notify 就返回"（notify 只在调用返回后才被放行，
+  内联就会等满超时并报错）、结果保序、失败/成功对 sticky 集的作用；端到端是那个脚本
+  （需要真挂载，不能进 cargo test）。
 
 ## 配置（CLI）
 
