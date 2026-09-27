@@ -20,6 +20,10 @@ mime_guess = "2"
 futures = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "bmp", "webp"] }
 tempfile = "3"
+sha2 = "0.10"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

@@ -23,12 +23,33 @@ if your cluster runs elsewhere.
 
 ## Range Reads
 
-`GET /get/{name}` parses RFC 7233 byte ranges (`bytes=N-`, `bytes=N-M`,
-`bytes=-N`) and streams the response in 4 MiB chunks back to the client.
-`/get/` serves the **inline** uploads (images / PDFs / text); chunked
-streaming keeps resident memory O(chunk) regardless of file size. Videos are
-not served here — they're stored striped and the transcoder reads the source
-back over the SDK's `get_stream` (see "Large Videos" / "Video Pipeline").
+`GET /get/{name}` accepts single byte ranges (`bytes=N-`, `bytes=N-M`,
+`bytes=-N`) for **inline** uploads (images / PDFs / text). It reads one complete
+value and computes its ETag before slicing a range from those same bytes.
+This keeps the validator consistent with the body during overwrites, but costs
+O(value size) memory and a full KV read even for HEAD, 304, or a small range.
+The storage `head` API currently has no content version for cheaper validation.
+Videos return 404 here — they're stored striped and only the transcoder reads
+the source over the SDK's `get_stream` (see "Large Videos" / "Video Pipeline").
+
+## HTTP caching
+
+- The embedded HTML (including inline CSS / JS), original files, thumbnails
+  (including SVG and original-image fallback), HLS playlists and segments use
+  `Cache-Control: no-cache` with a strong SHA-256 content ETag.
+- `If-None-Match` supports lists, weak comparison and `*`; matching GET / HEAD
+  requests return an empty 304. A deleted resource returns 404, and different
+  content uploaded under the same name gets a different ETag, even at the same
+  length. Validators are computed after reading the resource, with no separate
+  persistent validator cache.
+- Range responses use the full representation's ETag. Only a matching strong
+  `If-Range` tag permits a partial response; stale tags, weak tags and dates
+  cause a full 200. HEAD ignores Range. Unsupported or invalid ranges retain
+  the existing full-200 fallback.
+- Dynamic APIs (including list, metadata, transcode status, metrics, upload and
+  delete results) and errors use `Cache-Control: no-store`.
+- These filename-based URLs can be reused after deletion or upload, so none
+  uses `immutable`. The external hls.js CDN controls its own cache headers.
 
 ## Storage Layout
 

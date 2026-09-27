@@ -4612,3 +4612,71 @@ The restart test terminates and joins the target's whole runtime before starting
 a new one over the same directory. The etcd test checks atomic creation/deletion,
 replay, and same-assignment A/B reissue. Unit barriers suspend Recovery before
 commit and after its transaction response while Fence/Remove run concurrently.
+
+
+## Gallery HTTP cache validation
+
+Run `cargo test -p gallery` for conditional-response and router-policy tests.
+With a gallery already listening at `http://localhost:5001`, use a disposable
+filename for the upload/delete sequence below (it deliberately replaces and
+then removes that filename). Python 3 standard library is sufficient:
+
+```bash
+python3 - <<'PYTHON'
+import urllib.request as request
+import urllib.error
+
+base = "http://localhost:5001"
+name = "gallery-cache-verification.txt"
+
+def call(path, method="GET", headers=None, data=None):
+    req = request.Request(base + path, data=data, headers=headers or {}, method=method)
+    try:
+        response = request.urlopen(req)
+    except urllib.error.HTTPError as error:
+        response = error
+    with response:
+        return response.status, response.headers, response.read()
+
+def upload(content):
+    boundary = "gallery-cache-check-boundary"
+    data = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+            f'filename="{name}"\r\nContent-Type: text/plain\r\n\r\n').encode()
+    data += content + f"\r\n--{boundary}--\r\n".encode()
+    status, headers, _ = call("/put/", "POST",
+        {"Content-Type": f"multipart/form-data; boundary={boundary}"}, data)
+    assert status == 200 and headers["Cache-Control"] == "no-store"
+
+status, headers, _ = call("/")
+assert status == 200 and headers["Cache-Control"] == "no-cache"
+assert call("/", headers={"If-None-Match": headers["ETag"]})[0] == 304
+upload(b"old")
+status, headers, data = call("/get/" + name)
+assert status == 200 and data == b"old"
+tag = headers["ETag"]
+conditional = {"If-None-Match": tag}
+assert call("/get/" + name, headers=conditional)[0] == 304
+status, headers, _ = call("/del/" + name, "DELETE")
+assert status == 200 and headers["Cache-Control"] == "no-store"
+assert call("/get/" + name, headers=conditional)[0] == 404
+upload(b"new")
+status, headers, data = call("/get/" + name, headers=conditional)
+assert status == 200 and data == b"new" and headers["ETag"] != tag
+status, _, data = call("/get/" + name,
+    headers={"Range": "bytes=0-0", "If-Range": tag})
+assert status == 200 and data == b"new"
+status, headers, data = call("/get/" + name,
+    headers={"Range": "bytes=0-0", "If-Range": headers["ETag"]})
+assert status == 206 and data == b"n" and headers["Content-Range"] == "bytes 0-0/3"
+assert call("/get/temporary.mp4")[0] == 404
+assert call("/list/")[1]["Cache-Control"] == "no-store"
+assert call("/del/" + name, "DELETE")[0] == 200
+print("gallery cache checks passed")
+PYTHON
+```
+
+For a real uploaded image, repeat the ETag/If-None-Match check against
+`/thumb/<name>` (including an SVG and a malformed image that triggers original
+fallback). For a completed video, check `/hls/<name>/index.m3u8` and one listed
+TS segment. Both initial 200 and conditional 304 responses must carry `no-cache`
+and the same ETag. Video originals always return 404 from `/get/`.

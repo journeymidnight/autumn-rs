@@ -13,6 +13,14 @@ Current summary: the 4 MiB default was picked with the safetensors loader pinned
 Verification: new binary without the flag -> read_ahead_kb 2048 after the first open; 1 ms one-way single core 720/739, nine cores 1265/1095 MiB/s. Review (opus, independent): no code issue; doc findings applied (mechanism marked unverified, single-core cost stated, ranges widened, one-thread model removed, 0 ms cells measured).
 Main gaps: 2 MiB is not proven collapse-free for other models; max_background not re-measured at 2 MiB.
 Next steps: F-FUSE-DAEMON-PREFETCH.
+Date: 2026-09-27 (8)
+TaskStatus: completed
+Task scope: gallery HTTP caching — no-cache plus ETag for the embedded page and readable media, no-store for dynamic APIs/errors, reject transient video originals over HTTP.
+Current summary: shared SHA-256 conditional-response helper for index, inline originals, SVG/JPEG/fallback thumbnails and HLS playlists/segments. GET/HEAD If-None-Match (weak/list/wildcard) yields empty 304 with full-representation Content-Length to avoid Axum's empty-body length inference. If-Range requires a matching strong tag; HEAD ignores Range. Outer middleware covers router/extractor errors. /get rejects video extensions with 404 before storage access. No immutable URLs or persistent validator sidecars.
+Verification: cargo test -p gallery: 13 passed (8 existing and 5 cache/router regressions); git diff --check clean; manual verification Python in docs/ops.md syntax-checked. Reviewed response branches and Axum Content-Length behavior locally. No live cluster, browser, or upload/delete integration run in this task.
+Performance boundary: original HTTP reads now use one pooled full-value read plus SHA-256 and slice ranges from the same bytes, replacing 4 MiB range streaming. O(value size) memory/full KV read even for HEAD, 304 or small ranges; storage head has no content version. HLS/thumb already read full values. Video upload/transcode streaming remains bounded. Documented in gallery README and architecture guide.
+Main gaps: none for this HTTP policy change; live manual recipe is provided but not executed. feature_list.md contains open backlog only, so no completed entry retained.
+Next steps: deploy/restart gallery when desired; optional live checks per docs/ops.md.
 
 Date: 2026-09-27 (7)
 TaskStatus: completed

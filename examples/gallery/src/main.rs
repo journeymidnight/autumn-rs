@@ -8,12 +8,15 @@ use anyhow::{anyhow, Context, Result};
 use autumn_client::{AutumnError, ClusterClient, STRIPE_CHUNK_SIZE};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path};
-use axum::http::{HeaderMap, Response, StatusCode};
+use axum::http::{HeaderMap, Method, Response, StatusCode};
+
 use axum::routing::{delete, get, post};
 use axum::Router;
 use image::codecs::jpeg::JpegEncoder;
 use image::ImageReader;
 use send_wrapper::SendWrapper;
+
+mod cache;
 
 // `ClusterClient` is built for `Rc`-shared concurrent use: all hot-path
 // methods take `&self`, internal mutability is `RefCell`-scoped, and no
@@ -100,8 +103,7 @@ const META_PREFIX: &str = ".meta/";
 const THUMB_WIDTH: u32 = 320;
 const THUMB_QUALITY: u8 = 80;
 const LISTEN_PORT: u16 = 5001;
-// Chunk size for streaming /get/{name} responses and for downloading
-// source video to a temp file before transcoding.
+// Chunk size for downloading source video to a temp file before transcoding.
 const RANGE_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
 // gallery's keys are RELATIVE to the client's namespace binding
@@ -931,12 +933,16 @@ async fn recover_pending_transcodes(client: Client, map: TranscodeMap) {
 // ---------------------------------------------------------------------------
 
 fn ok_response(body: impl Into<Body>) -> Response<Body> {
-    Response::builder().body(body.into()).unwrap()
+    Response::builder()
+        .header("cache-control", "no-store")
+        .body(body.into())
+        .unwrap()
 }
 
 fn error_response(status: StatusCode, msg: String) -> Response<Body> {
     Response::builder()
         .status(status)
+        .header("cache-control", "no-store")
         .body(Body::from(msg))
         .unwrap()
 }
@@ -953,12 +959,14 @@ fn json_response(body: String) -> Response<Body> {
 // HTTP handlers (each returns SendWrapper future for axum Send bound)
 // ---------------------------------------------------------------------------
 
-async fn index_handler() -> Response<Body> {
-    Response::builder()
-        .header("content-type", "text/html; charset=utf-8")
-        .header("cache-control", "no-cache")
-        .body(Body::from(include_str!("../static/index.html")))
-        .unwrap()
+async fn index_handler(headers: HeaderMap, method: Method) -> Response<Body> {
+    cache::response(
+        &headers,
+        &method,
+        "text/html; charset=utf-8",
+        bytes::Bytes::from_static(include_bytes!("../static/index.html")),
+        false,
+    )
 }
 
 /// Stream one multipart field straight into a striped value via
@@ -1165,125 +1173,35 @@ fn parse_byte_range(s: &str, total: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
-/// Build a streaming `Body` that fetches `[start, end_inclusive]` of `name`
-/// from the cluster in `RANGE_CHUNK_BYTES`-sized pieces. The producer task
-/// runs on the local compio runtime; chunks travel over a Send-able mpsc so
-/// `Body::from_stream` can hold them across the axum (Send) boundary.
-///
-/// This replaces the previous "one giant `get_range`" path: ffmpeg sends
-/// `Range: bytes=0-` for sequential reads, so a 1 GiB upload used to allocate
-/// a 1 GiB Vec (plus an autumn-rpc payload of the same size) before the HTTP
-/// body emitted any frame. Now first byte ships after one chunk's RTT and
-/// resident memory stays O(chunk).
-fn stream_kv_range(
-    client: Client,
-    metrics: MetricsRef,
-    name: String,
-    start: u64,
-    end_inclusive: u64,
-) -> Body {
-    use futures::channel::mpsc;
-    use futures::SinkExt;
-
-    let total_len = end_inclusive - start + 1;
-    // Cap=2 gives one chunk in flight on the wire while the consumer drains
-    // another; bigger buffers just waste memory without improving throughput.
-    let (mut tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
-
-    let producer = SendWrapper::new(async move {
-        let mut off: u64 = start;
-        let mut remaining: u64 = total_len;
-        while remaining > 0 {
-            let take = remaining.min(RANGE_CHUNK_BYTES as u64) as u32;
-            let t0 = Instant::now();
-            let res = client
-                .get_range(file_key(&name).as_bytes(), off as u32, take)
-                .await;
-            let dt = elapsed_ms(t0);
-            match res {
-                Ok(Some(bytes)) => {
-                    let n = bytes.len() as u64;
-                    metrics.borrow_mut().record_get(dt, n);
-                    if n == 0 {
-                        break;
-                    }
-                    if tx.send(Ok(bytes::Bytes::from(bytes))).await.is_err() {
-                        return; // client disconnected
-                    }
-                    off = off.saturating_add(n);
-                    remaining = remaining.saturating_sub(n);
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    let err = std::io::Error::other(format!("get_range: {e}"));
-                    let _ = tx.send(Err(err)).await;
-                    return;
-                }
-            }
-        }
-    });
-    compio::runtime::spawn(producer).detach();
-
-    Body::from_stream(rx)
-}
-
 async fn get_handler_inner(
     client: &Client,
     metrics: &MetricsRef,
     name: String,
     headers: HeaderMap,
+    method: Method,
 ) -> Response<Body> {
+    if is_video_ext(&ext_of(&name)) {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "video originals are not served; use HLS".into(),
+        );
+    }
     let mime = mime_guess::from_path(&name)
         .first_or_octet_stream()
         .to_string();
-
-    // One head() per request: lets us 404 cleanly, validate the requested
-    // range, and emit a correct `Content-Range` total (Safari rejects
-    // `bytes X-Y/*`, see the existing comment retained from the previous
-    // implementation).
-    let total_size: u64 = match client.head(file_key(&name).as_bytes()).await {
-        Ok(meta) if meta.found => meta.value_length,
-        Ok(_) => return error_response(StatusCode::NOT_FOUND, "not found".into()),
-        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("head: {e}")),
-    };
-
-    let parsed_range = headers
-        .get("range")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| parse_byte_range(s, total_size));
-
-    let (start, end_inclusive, status, content_range) = match parsed_range {
-        Some((s, e)) => (
-            s,
-            e,
-            StatusCode::PARTIAL_CONTENT,
-            Some(format!("bytes {s}-{e}/{total_size}")),
-        ),
-        None if total_size == 0 => {
-            return Response::builder()
-                .header("content-type", &mime)
-                .header("accept-ranges", "bytes")
-                .header("cache-control", "no-cache")
-                .header("content-length", 0)
-                .body(Body::empty())
-                .unwrap();
+    // The storage head() API exposes no content version. Read one value so
+    // the strong validator and every returned range describe the same bytes.
+    let t0 = Instant::now();
+    match client.get_pooled(file_key(&name).as_bytes()).await {
+        Ok(Some(value)) => {
+            metrics
+                .borrow_mut()
+                .record_get(elapsed_ms(t0), value.len() as u64);
+            cache::response(&headers, &method, &mime, value.freeze(), true)
         }
-        None => (0, total_size - 1, StatusCode::OK, None),
-    };
-
-    let length = end_inclusive - start + 1;
-    let body = stream_kv_range(client.clone(), metrics.clone(), name, start, end_inclusive);
-
-    let mut builder = Response::builder()
-        .status(status)
-        .header("content-type", &mime)
-        .header("accept-ranges", "bytes")
-        .header("cache-control", "no-cache")
-        .header("content-length", length);
-    if let Some(cr) = content_range {
-        builder = builder.header("content-range", cr);
+        Ok(None) => error_response(StatusCode::NOT_FOUND, "not found".into()),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
     }
-    builder.body(body).unwrap()
 }
 
 async fn cleanup_derived(client: &Client, name: &str) {
@@ -1373,7 +1291,7 @@ async fn list_handler_inner(client: &Client) -> Response<Body> {
             }
             Response::builder()
                 .header("content-type", "text/plain; charset=utf-8")
-                .header("cache-control", "no-cache")
+                .header("cache-control", "no-store")
                 .body(Body::from(keys.join("\n")))
                 .unwrap()
         }
@@ -1461,6 +1379,8 @@ async fn hls_handler_inner(
     metrics: &MetricsRef,
     name: String,
     file: String,
+    headers: HeaderMap,
+    method: Method,
 ) -> Response<Body> {
     // Whitelist the file portion so a stray "../" can't escape the HLS prefix.
     if file.contains('/') || file.contains("..") || file.is_empty() {
@@ -1482,12 +1402,7 @@ async fn hls_handler_inner(
             } else {
                 "application/octet-stream"
             };
-            Response::builder()
-                .header("content-type", ct)
-                .header("cache-control", "no-cache")
-                .header("content-length", v.len())
-                .body(Body::from(v))
-                .unwrap()
+            cache::response(&headers, &method, ct, bytes::Bytes::from(v), true)
         }
         Ok(None) => error_response(StatusCode::NOT_FOUND, "hls not found".into()),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get hls: {e}")),
@@ -1527,6 +1442,8 @@ async fn thumb_handler_inner(
     client: &Client,
     metrics: &MetricsRef,
     name: String,
+    headers: HeaderMap,
+    method: Method,
 ) -> Response<Body> {
     let ext = ext_of(&name);
 
@@ -1542,11 +1459,7 @@ async fn thumb_handler_inner(
         return match res {
             Ok(Some(vb)) => {
                 metrics.borrow_mut().record_get(dt, vb.len() as u64);
-                Response::builder()
-                    .header("content-type", "image/svg+xml")
-                    .header("cache-control", "no-cache")
-                    .body(Body::from(vb.freeze()))
-                    .unwrap()
+                cache::response(&headers, &method, "image/svg+xml", vb.freeze(), true)
             }
             Ok(None) => error_response(StatusCode::NOT_FOUND, "not found".into()),
             Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
@@ -1574,12 +1487,7 @@ async fn thumb_handler_inner(
         Ok(Some(vb)) => {
             metrics.borrow_mut().record_get(dt, vb.len() as u64);
             let body = vb.freeze();
-            return Response::builder()
-                .header("content-type", "image/jpeg")
-                .header("cache-control", "no-cache")
-                .header("content-length", body.len())
-                .body(Body::from(body))
-                .unwrap();
+            return cache::response(&headers, &method, "image/jpeg", body, true);
         }
         Ok(None) => { /* fall through */ }
         Err(e) => {
@@ -1636,10 +1544,13 @@ async fn thumb_handler_inner(
             let mime = mime_guess::from_path(&name)
                 .first_or_octet_stream()
                 .to_string();
-            return Response::builder()
-                .header("content-type", mime)
-                .body(Body::from(original))
-                .unwrap();
+            return cache::response(
+                &headers,
+                &method,
+                &mime,
+                bytes::Bytes::from(original),
+                true,
+            );
         }
         Err(_) => {
             return error_response(
@@ -1664,12 +1575,7 @@ async fn thumb_handler_inner(
         .detach();
     }
 
-    Response::builder()
-        .header("content-type", "image/jpeg")
-        .header("cache-control", "no-cache")
-        .header("content-length", thumb.len())
-        .body(Body::from(thumb))
-        .unwrap()
+    cache::response(&headers, &method, "image/jpeg", thumb, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1723,13 +1629,15 @@ async fn main() -> Result<()> {
     });
 
     let cm = SendWrapper::new((client.clone(), metrics.clone()));
-    let get_route = get(move |Path(name): Path<String>, headers: HeaderMap| {
-        let cm = cm.clone();
-        SendWrapper::new(async move {
-            let (c, m) = (&cm.0, &cm.1);
-            get_handler_inner(c, m, name, headers).await
-        })
-    });
+    let get_route = get(
+        move |Path(name): Path<String>, headers: HeaderMap, method: Method| {
+            let cm = cm.clone();
+            SendWrapper::new(async move {
+                let (c, m) = (&cm.0, &cm.1);
+                get_handler_inner(c, m, name, headers, method).await
+            })
+        },
+    );
 
     let c = SendWrapper::new(client.clone());
     let del_route = delete(move |Path(name): Path<String>| {
@@ -1750,22 +1658,26 @@ async fn main() -> Result<()> {
     });
 
     let cm = SendWrapper::new((client.clone(), metrics.clone()));
-    let thumb_route = get(move |Path(name): Path<String>| {
-        let cm = cm.clone();
-        SendWrapper::new(async move {
-            let (c, m) = (&cm.0, &cm.1);
-            thumb_handler_inner(c, m, name).await
-        })
-    });
+    let thumb_route = get(
+        move |Path(name): Path<String>, headers: HeaderMap, method: Method| {
+            let cm = cm.clone();
+            SendWrapper::new(async move {
+                let (c, m) = (&cm.0, &cm.1);
+                thumb_handler_inner(c, m, name, headers, method).await
+            })
+        },
+    );
 
     let cm = SendWrapper::new((client.clone(), metrics.clone()));
-    let hls_route = get(move |Path((name, file)): Path<(String, String)>| {
-        let cm = cm.clone();
-        SendWrapper::new(async move {
-            let (c, m) = (&cm.0, &cm.1);
-            hls_handler_inner(c, m, name, file).await
-        })
-    });
+    let hls_route = get(
+        move |Path((name, file)): Path<(String, String)>, headers: HeaderMap, method: Method| {
+            let cm = cm.clone();
+            SendWrapper::new(async move {
+                let (c, m) = (&cm.0, &cm.1);
+                hls_handler_inner(c, m, name, file, headers, method).await
+            })
+        },
+    );
 
     let ct = SendWrapper::new((client.clone(), transcodes.clone()));
     let status_route = get(move |Path(name): Path<String>| {
@@ -1818,7 +1730,8 @@ async fn main() -> Result<()> {
         .route("/metrics/", metrics_route)
         // Streamed uploads keep resident memory O(chunk) regardless of size,
         // so this only bounds pathological inputs, not real videos. 64 GiB.
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024 * 1024)); // 64 GiB
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024 * 1024))
+        .layer(axum::middleware::map_response(cache::default_no_store));
 
     let listener = compio::net::TcpListener::bind(format!("0.0.0.0:{LISTEN_PORT}")).await?;
     tracing::info!("Gallery listening on http://0.0.0.0:{LISTEN_PORT}");
