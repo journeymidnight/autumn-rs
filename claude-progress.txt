@@ -13,6 +13,15 @@ Current summary: the 4 MiB default was picked with the safetensors loader pinned
 Verification: new binary without the flag -> read_ahead_kb 2048 after the first open; 1 ms one-way single core 720/739, nine cores 1265/1095 MiB/s. Review (opus, independent): no code issue; doc findings applied (mechanism marked unverified, single-core cost stated, ranges widened, one-thread model removed, 0 ms cells measured).
 Main gaps: 2 MiB is not proven collapse-free for other models; max_background not re-measured at 2 MiB.
 Next steps: F-FUSE-DAEMON-PREFETCH.
+Date: 2026-09-27 (9)
+TaskStatus: completed
+Task scope: correct gallery cache policy after review — per-request ETags only for HTML/CSS/JS; uploaded media use Last-Modified metadata; transient MP4 remains private.
+Current summary: the served HTML now references `/static/app.css` and `/static/app.js`, extracted from the existing single source file at request time; all three independently hash their response bytes and use no-cache + ETag. Inline originals, SVG/image/video thumbnails, m3u8 and every HLS segment use no-cache + Last-Modified: uploaded_at for original/image artifacts and shared transcoded_at for one video transcode. Dynamic APIs and all errors remain no-store. /get keeps rejecting video extensions. Original non-video reads are back on the bounded 4 MiB get_range stream; HEAD/304 only fetch head plus the small uploaded_at KV. Before any replacement upload, old timestamp validators and thumbnail are synchronously removed so a failed best-effort metadata write cannot leave a stale validator attached to new bytes.
+Verification: cargo test -p gallery: the existing 8 tests pass; no cache-specific unit tests retained because this is example code, per user direction. rustfmt completed, git diff --check clean, the docs/ops.md direct HTTP verification script syntax-checks, and an in-memory extraction check confirms the served HTML references both assets and the extracted JavaScript parses. Code-path review checked the actual frontend: queued/transcoding video remains blank and done video uses HLS; get_stream remains internal to the transcoder. No live cluster/browser run.
+Performance boundary: static assets deliberately compute SHA-256 on each request. Media validation avoids body hashing; original GET ranges stream in 4 MiB chunks. Each media request adds one small metadata KV read. Each upload synchronously clears two timestamp keys and the old thumbnail before writing.
+Main gaps: none for the requested policy; legacy objects without uploaded_at/transcoded_at safely return 200 without Last-Modified. Live checks remain available in docs/ops.md.
+Next steps: restart/deploy gallery when desired and run the direct HTTP recipe against a live cluster.
+
 Date: 2026-09-27 (8)
 TaskStatus: completed
 Task scope: gallery HTTP caching — no-cache plus ETag for the embedded page and readable media, no-store for dynamic APIs/errors, reject transient video originals over HTTP.

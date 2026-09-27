@@ -24,32 +24,30 @@ if your cluster runs elsewhere.
 ## Range Reads
 
 `GET /get/{name}` accepts single byte ranges (`bytes=N-`, `bytes=N-M`,
-`bytes=-N`) for **inline** uploads (images / PDFs / text). It reads one complete
-value and computes its ETag before slicing a range from those same bytes.
-This keeps the validator consistent with the body during overwrites, but costs
-O(value size) memory and a full KV read even for HEAD, 304, or a small range.
-The storage `head` API currently has no content version for cheaper validation.
+`bytes=-N`) for **inline** uploads (images / PDFs / text) and streams selected
+ranges from Autumn in 4 MiB chunks. Cache validation reads the small
+`.meta/<name>/uploaded_at` KV; it does not read the file body for a 304.
 Videos return 404 here — they're stored striped and only the transcoder reads
 the source over the SDK's `get_stream` (see "Large Videos" / "Video Pipeline").
 
 ## HTTP caching
 
-- The embedded HTML (including inline CSS / JS), original files, thumbnails
-  (including SVG and original-image fallback), HLS playlists and segments use
-  `Cache-Control: no-cache` with a strong SHA-256 content ETag.
-- `If-None-Match` supports lists, weak comparison and `*`; matching GET / HEAD
-  requests return an empty 304. A deleted resource returns 404, and different
-  content uploaded under the same name gets a different ETag, even at the same
-  length. Validators are computed after reading the resource, with no separate
-  persistent validator cache.
-- Range responses use the full representation's ETag. Only a matching strong
-  `If-Range` tag permits a partial response; stale tags, weak tags and dates
-  cause a full 200. HEAD ignores Range. Unsupported or invalid ranges retain
-  the existing full-200 fallback.
+- The HTML response references separately served `/static/app.css` and
+  `/static/app.js`. All three use `Cache-Control: no-cache`; each request hashes
+  that response's bytes for a strong ETag. Matching `If-None-Match` returns 304.
+- Original files, thumbnails (including SVG and original-image fallback), HLS
+  playlists and every HLS segment use `no-cache` plus `Last-Modified`. Originals
+  and image thumbnails use `uploaded_at`; video thumbnails and every artifact
+  from one HLS transcode share `transcoded_at`. If a legacy object lacks that
+  metadata, it is served as 200 without `Last-Modified`.
+- Matching `If-Modified-Since` returns 304 only after the requested resource is
+  confirmed to exist. A matching `If-Range` date permits a partial response;
+  a stale date causes a full 200. HEAD ignores Range. Unsupported or invalid
+  ranges retain the existing full-200 fallback.
 - Dynamic APIs (including list, metadata, transcode status, metrics, upload and
   delete results) and errors use `Cache-Control: no-store`.
-- These filename-based URLs can be reused after deletion or upload, so none
-  uses `immutable`. The external hls.js CDN controls its own cache headers.
+- No gallery URL uses `immutable`. The external hls.js CDN controls its own
+  cache headers.
 
 ## Storage Layout
 

@@ -1644,12 +1644,12 @@ dependencies = [
  "compio",
  "cyper-axum",
  "futures",
+ "httpdate",
  "image",
  "mime_guess",
  "send_wrapper",
  "sha2",
  "tempfile",
- "tower",
  "tracing",
  "tracing-subscriber",
 ]

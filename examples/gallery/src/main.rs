@@ -142,6 +142,31 @@ fn meta_prefix(name: &str) -> String {
     format!("{ROOT}{META_PREFIX}{name}/")
 }
 
+fn meta_key(name: &str, field: &str) -> String {
+    format!("{}{field}", meta_prefix(name))
+}
+
+async fn meta_time(client: &Client, name: &str, field: &str) -> Option<std::time::SystemTime> {
+    let value = client.get(meta_key(name, field).as_bytes()).await.ok()??;
+    let seconds = std::str::from_utf8(&value).ok()?.parse().ok();
+    cache::system_time(seconds)
+}
+
+async fn clear_cache_state(client: &Client, name: &str) -> Result<()> {
+    let keys = [
+        meta_key(name, "uploaded_at"),
+        meta_key(name, "transcoded_at"),
+        thumb_key(name),
+    ];
+    for key in keys {
+        match client.delete(key.as_bytes()).await {
+            Ok(()) | Err(AutumnError::NotFound) => {}
+            Err(error) => return Err(anyhow!("clear stale cache state {key}: {error}")),
+        }
+    }
+    Ok(())
+}
+
 /// Read image dimensions from the header only (`into_dimensions`, no full
 /// decode). `None` for non-images / undecodable headers.
 fn image_dims(data: &[u8]) -> Option<(u32, u32)> {
@@ -255,10 +280,7 @@ async fn backfill_file_meta(client: &Client, name: &str) -> Option<Vec<(&'static
     }
 
     // Original gone — a transcoded video is identified by its HLS playlist.
-    let playlist = client
-        .head(hls_playlist_key(name).as_bytes())
-        .await
-        .ok()?;
+    let playlist = client.head(hls_playlist_key(name).as_bytes()).await.ok()?;
     if !playlist.found {
         return None;
     }
@@ -266,10 +288,7 @@ async fn backfill_file_meta(client: &Client, name: &str) -> Option<Vec<(&'static
         ("name", name.to_string()),
         ("ext", ext_of(name)),
         ("kind", "video".to_string()),
-        (
-            "content_type",
-            "application/vnd.apple.mpegurl".to_string(),
-        ),
+        ("content_type", "application/vnd.apple.mpegurl".to_string()),
     ];
     // Sum the HLS payload so the file shows a size (matches the fresh-transcode
     // `size_bytes`/`hls_segments` fields). `range` only lists keys, so fetch
@@ -426,7 +445,10 @@ fn probe_duration_secs(input: &str) -> Option<f64> {
     if !out.status.success() {
         return None;
     }
-    let d = String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().ok()?;
+    let d = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<f64>()
+        .ok()?;
     (d.is_finite() && d > 0.0).then_some(d)
 }
 
@@ -601,8 +623,13 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
     // keyframes are sparser than `seg_secs` (copy can only cut on a keyframe);
     // the re-encode pass forces segment-boundary keyframes so it can't recur.
     let mut reencode_reason: Option<String> = None;
-    if let Err(err) = run_hls_ffmpeg(input_str, &playlist, &segments, HlsEncodeMode::Copy, seg_secs)
-    {
+    if let Err(err) = run_hls_ffmpeg(
+        input_str,
+        &playlist,
+        &segments,
+        HlsEncodeMode::Copy,
+        seg_secs,
+    ) {
         reencode_reason = Some(format!("copy path failed: {err}"));
     } else {
         let big = max_ts_bytes(dir);
@@ -626,8 +653,14 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
                 }
             }
         }
-        run_hls_ffmpeg(input_str, &playlist, &segments, HlsEncodeMode::Reencode, seg_secs)
-            .context("run ffmpeg hls reencode after copy fallback")?;
+        run_hls_ffmpeg(
+            input_str,
+            &playlist,
+            &segments,
+            HlsEncodeMode::Reencode,
+            seg_secs,
+        )
+        .context("run ffmpeg hls reencode after copy fallback")?;
     }
     tracing::info!(
         hls_ms = t1.elapsed().as_millis(),
@@ -959,13 +992,74 @@ fn json_response(body: String) -> Response<Body> {
 // HTTP handlers (each returns SendWrapper future for axum Send bound)
 // ---------------------------------------------------------------------------
 
+const INDEX_SOURCE: &str = include_str!("../static/index.html");
+
+struct AppAssets {
+    before_style: &'static str,
+    css: &'static str,
+    between_style_and_script: &'static str,
+    js: &'static str,
+    after_script: &'static str,
+}
+
+fn app_assets() -> AppAssets {
+    let style_start = INDEX_SOURCE.find("<style>").expect("inline style");
+    let style_end = INDEX_SOURCE[style_start..]
+        .find("</style>")
+        .map(|offset| style_start + offset)
+        .expect("inline style end");
+    let script_start = INDEX_SOURCE[style_end..]
+        .find("<script>\n")
+        .map(|offset| style_end + offset)
+        .expect("inline application script");
+    let script_end = INDEX_SOURCE[script_start..]
+        .find("</script>")
+        .map(|offset| script_start + offset)
+        .expect("inline application script end");
+    AppAssets {
+        before_style: &INDEX_SOURCE[..style_start],
+        css: &INDEX_SOURCE[style_start + "<style>".len()..style_end],
+        between_style_and_script: &INDEX_SOURCE[style_end + "</style>".len()..script_start],
+        js: &INDEX_SOURCE[script_start + "<script>".len()..script_end],
+        after_script: &INDEX_SOURCE[script_end + "</script>".len()..],
+    }
+}
+
+fn app_html() -> bytes::Bytes {
+    let assets = app_assets();
+    let mut html = String::with_capacity(
+        assets.before_style.len()
+            + assets.between_style_and_script.len()
+            + assets.after_script.len()
+            + 128,
+    );
+    html.push_str(assets.before_style);
+    html.push_str("<link rel=\"stylesheet\" href=\"/static/app.css\">");
+    html.push_str(assets.between_style_and_script);
+    html.push_str("<script src=\"/static/app.js\"></script>");
+    html.push_str(assets.after_script);
+    bytes::Bytes::from(html)
+}
+
 async fn index_handler(headers: HeaderMap, method: Method) -> Response<Body> {
-    cache::response(
+    cache::static_response(&headers, &method, "text/html; charset=utf-8", app_html())
+}
+
+async fn css_handler(headers: HeaderMap, method: Method) -> Response<Body> {
+    cache::static_response(
         &headers,
         &method,
-        "text/html; charset=utf-8",
-        bytes::Bytes::from_static(include_bytes!("../static/index.html")),
-        false,
+        "text/css; charset=utf-8",
+        bytes::Bytes::from_static(app_assets().css.as_bytes()),
+    )
+}
+
+async fn js_handler(headers: HeaderMap, method: Method) -> Response<Body> {
+    cache::static_response(
+        &headers,
+        &method,
+        "text/javascript; charset=utf-8",
+        bytes::Bytes::from_static(app_assets().js.as_bytes()),
     )
 }
 
@@ -1061,6 +1155,17 @@ async fn put_handler_inner(
 
         let ext = ext_of(&filename);
 
+        // A cache timestamp is a validator now, not just display metadata.
+        // Remove any prior generation before replacing bytes. If its deletion
+        // cannot be confirmed, abort rather than risk validating new content
+        // with an old Last-Modified value.
+        if let Err(error) = clear_cache_state(client, &filename).await {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("upload: {error}"),
+            );
+        }
+
         if is_video_ext(&ext) {
             // Videos are the large uploads and are never served via /get/ (the
             // frontend plays them through HLS), so store them striped and read
@@ -1114,9 +1219,13 @@ async fn put_handler_inner(
             if autumn_client::runtime_transport_is_ucx() {
                 let mut vb = autumn_client::alloc_value_buf(data.len());
                 vb.as_mut_slice().copy_from_slice(&data);
-                client.put_bulk(file_key(&filename).as_bytes(), vb.freeze()).await
+                client
+                    .put_bulk(file_key(&filename).as_bytes(), vb.freeze())
+                    .await
             } else {
-                client.put_bulk(file_key(&filename).as_bytes(), data.clone()).await
+                client
+                    .put_bulk(file_key(&filename).as_bytes(), data.clone())
+                    .await
             }
         } else {
             client.put(file_key(&filename).as_bytes(), &data).await
@@ -1128,10 +1237,8 @@ async fn put_handler_inner(
         metrics.borrow_mut().record_put(dt, bytes);
 
         // Persist the file's metadata as small (<4 KiB) KV pairs next to the
-        // upload, then invalidate the cached thumbnail so /thumb rebuilds.
-        // Both swept by cleanup_derived on delete.
+        // upload. Both are swept by cleanup_derived on delete.
         write_file_meta(client, &filename, &data).await;
-        let _ = client.delete(thumb_key(&filename).as_bytes()).await;
         return ok_response(filename);
     }
     error_response(StatusCode::BAD_REQUEST, "no file field".into())
@@ -1173,6 +1280,54 @@ fn parse_byte_range(s: &str, total: u64) -> Option<(u64, u64)> {
     Some((start, end))
 }
 
+fn stream_kv_range(
+    client: Client,
+    metrics: MetricsRef,
+    name: String,
+    start: u64,
+    end_inclusive: u64,
+) -> Body {
+    use futures::channel::mpsc;
+    use futures::SinkExt;
+
+    let total_len = end_inclusive - start + 1;
+    let (mut tx, rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(2);
+    let producer = SendWrapper::new(async move {
+        let mut offset = start;
+        let mut remaining = total_len;
+        while remaining > 0 {
+            let take = remaining.min(RANGE_CHUNK_BYTES as u64) as u32;
+            let t0 = Instant::now();
+            let result = client
+                .get_range(file_key(&name).as_bytes(), offset as u32, take)
+                .await;
+            let elapsed = elapsed_ms(t0);
+            match result {
+                Ok(Some(value)) => {
+                    let len = value.len() as u64;
+                    metrics.borrow_mut().record_get(elapsed, len);
+                    if len == 0 {
+                        break;
+                    }
+                    if tx.send(Ok(bytes::Bytes::from(value))).await.is_err() {
+                        return;
+                    }
+                    offset = offset.saturating_add(len);
+                    remaining = remaining.saturating_sub(len);
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    let error = std::io::Error::other(format!("get_range: {error}"));
+                    let _ = tx.send(Err(error)).await;
+                    return;
+                }
+            }
+        }
+    });
+    compio::runtime::spawn(producer).detach();
+    Body::from_stream(rx)
+}
+
 async fn get_handler_inner(
     client: &Client,
     metrics: &MetricsRef,
@@ -1186,22 +1341,56 @@ async fn get_handler_inner(
             "video originals are not served; use HLS".into(),
         );
     }
+    let head = match client.head(file_key(&name).as_bytes()).await {
+        Ok(head) if head.found => head,
+        Ok(_) | Err(AutumnError::NotFound) => {
+            return error_response(StatusCode::NOT_FOUND, "not found".into())
+        }
+        Err(error) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("head: {error}"))
+        }
+    };
+    let modified = meta_time(client, &name, "uploaded_at").await;
     let mime = mime_guess::from_path(&name)
         .first_or_octet_stream()
         .to_string();
-    // The storage head() API exposes no content version. Read one value so
-    // the strong validator and every returned range describe the same bytes.
-    let t0 = Instant::now();
-    match client.get_pooled(file_key(&name).as_bytes()).await {
-        Ok(Some(value)) => {
-            metrics
-                .borrow_mut()
-                .record_get(elapsed_ms(t0), value.len() as u64);
-            cache::response(&headers, &method, &mime, value.freeze(), true)
-        }
-        Ok(None) => error_response(StatusCode::NOT_FOUND, "not found".into()),
-        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
+    if let Some(response) =
+        cache::metadata_response(&headers, &method, &mime, head.value_length, modified, true)
+    {
+        return response;
     }
+    let mut builder = cache::media_builder(&mime, head.value_length, modified, true);
+    if head.value_length == 0 {
+        return builder.body(Body::empty()).unwrap();
+    }
+    let range = if cache::if_range_matches(&headers, modified) {
+        headers
+            .get("range")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_byte_range(value, head.value_length))
+    } else {
+        None
+    };
+    let (start, end, status) = range
+        .map(|(start, end)| (start, end, StatusCode::PARTIAL_CONTENT))
+        .unwrap_or((0, head.value_length - 1, StatusCode::OK));
+    builder = builder.status(status);
+    cache::set_content_length(&mut builder, end - start + 1);
+    if status == StatusCode::PARTIAL_CONTENT {
+        builder = builder.header(
+            "content-range",
+            format!("bytes {start}-{end}/{}", head.value_length),
+        );
+    }
+    builder
+        .body(stream_kv_range(
+            client.clone(),
+            metrics.clone(),
+            name,
+            start,
+            end,
+        ))
+        .unwrap()
 }
 
 async fn cleanup_derived(client: &Client, name: &str) {
@@ -1210,10 +1399,7 @@ async fn cleanup_derived(client: &Client, name: &str) {
     // Sweep every prefix-scoped artifact for this file: HLS segments and the
     // per-file metadata KV written at upload time.
     for prefix in [hls_dir_prefix(name), meta_prefix(name)] {
-        let scan = match client
-            .range(prefix.as_bytes(), b"", u32::MAX)
-            .await
-        {
+        let scan = match client.range(prefix.as_bytes(), b"", u32::MAX).await {
             Ok(r) => r,
             Err(_) => continue,
         };
@@ -1325,10 +1511,7 @@ async fn transcoding_list_handler_inner(transcodes: &TranscodeMap) -> Response<B
 /// still resolve. 404 only when the file itself doesn't exist.
 async fn meta_handler_inner(client: &Client, name: String) -> Response<Body> {
     let prefix = meta_prefix(&name);
-    let scan = match client
-        .range(prefix.as_bytes(), b"", u32::MAX)
-        .await
-    {
+    let scan = match client.range(prefix.as_bytes(), b"", u32::MAX).await {
         Ok(r) => r,
         Err(e) => {
             return error_response(
@@ -1342,7 +1525,10 @@ async fn meta_handler_inner(client: &Client, name: String) -> Response<Body> {
         match backfill_file_meta(client, &name).await {
             Some(fields) => {
                 write_meta_fields(client, &name, &fields).await;
-                fields.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect()
             }
             None => return error_response(StatusCode::NOT_FOUND, "not found".into()),
         }
@@ -1356,7 +1542,10 @@ async fn meta_handler_inner(client: &Client, name: String) -> Response<Body> {
             .zip(vals)
             .map(|(k, vr)| {
                 let key = String::from_utf8_lossy(k).to_string();
-                let field = key.strip_prefix(prefix.as_str()).unwrap_or(&key).to_string();
+                let field = key
+                    .strip_prefix(prefix.as_str())
+                    .unwrap_or(&key)
+                    .to_string();
                 let val = match vr {
                     Ok(Some(v)) => String::from_utf8_lossy(&v).to_string(),
                     _ => String::new(),
@@ -1387,22 +1576,40 @@ async fn hls_handler_inner(
         return error_response(StatusCode::BAD_REQUEST, "invalid hls path".into());
     }
     let key = hls_key(&name, &file);
+    let ct = if file.ends_with(".m3u8") {
+        "application/vnd.apple.mpegurl"
+    } else if file.ends_with(".ts") {
+        "video/mp2t"
+    } else if file.ends_with(".m4s") || file.ends_with(".mp4") {
+        "video/iso.segment"
+    } else {
+        "application/octet-stream"
+    };
+    let head = match client.head(key.as_bytes()).await {
+        Ok(head) if head.found => head,
+        Ok(_) | Err(AutumnError::NotFound) => {
+            return error_response(StatusCode::NOT_FOUND, "hls not found".into())
+        }
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("head hls: {error}"),
+            )
+        }
+    };
+    let modified = meta_time(client, &name, "transcoded_at").await;
+    if let Some(response) =
+        cache::metadata_response(&headers, &method, ct, head.value_length, modified, true)
+    {
+        return response;
+    }
     let t0 = Instant::now();
     let res = client.get(key.as_bytes()).await;
     let dt = elapsed_ms(t0);
     match res {
         Ok(Some(v)) => {
             metrics.borrow_mut().record_get(dt, v.len() as u64);
-            let ct = if file.ends_with(".m3u8") {
-                "application/vnd.apple.mpegurl"
-            } else if file.ends_with(".ts") {
-                "video/mp2t"
-            } else if file.ends_with(".m4s") || file.ends_with(".mp4") {
-                "video/iso.segment"
-            } else {
-                "application/octet-stream"
-            };
-            cache::response(&headers, &method, ct, bytes::Bytes::from(v), true)
+            cache::media_response(&headers, &method, ct, bytes::Bytes::from(v), modified, true)
         }
         Ok(None) => error_response(StatusCode::NOT_FOUND, "hls not found".into()),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get hls: {e}")),
@@ -1418,9 +1625,7 @@ async fn transcode_status_handler_inner(
         return json_response(s.to_json());
     }
     // Not in memory — derive from KV. Playlist present ⇒ Done.
-    let playlist = client
-        .head(hls_playlist_key(&name).as_bytes())
-        .await;
+    let playlist = client.head(hls_playlist_key(&name).as_bytes()).await;
     match playlist {
         Ok(meta) if meta.found => json_response(TranscodeStatus::Done.to_json()),
         Ok(_) | Err(AutumnError::NotFound) => {
@@ -1449,17 +1654,45 @@ async fn thumb_handler_inner(
 
     // SVG: no point rasterizing — just serve the original bytes.
     if is_svg_ext(&ext) {
+        let key = file_key(&name);
+        let head = match client.head(key.as_bytes()).await {
+            Ok(head) if head.found => head,
+            Ok(_) | Err(AutumnError::NotFound) => {
+                return error_response(StatusCode::NOT_FOUND, "not found".into())
+            }
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("head: {error}"))
+            }
+        };
+        let modified = meta_time(client, &name, "uploaded_at").await;
+        if let Some(response) = cache::metadata_response(
+            &headers,
+            &method,
+            "image/svg+xml",
+            head.value_length,
+            modified,
+            true,
+        ) {
+            return response;
+        }
         let t0 = Instant::now();
         // demo: address-unconstrained read → get_pooled hands the
         // recv'd pool buffer straight back (zero SDK-side copies); freeze()
         // aliases it as the response body, and the slab returns to the pool
         // when hyper finishes writing it.
-        let res = client.get_pooled(file_key(&name).as_bytes()).await;
+        let res = client.get_pooled(key.as_bytes()).await;
         let dt = elapsed_ms(t0);
         return match res {
             Ok(Some(vb)) => {
                 metrics.borrow_mut().record_get(dt, vb.len() as u64);
-                cache::response(&headers, &method, "image/svg+xml", vb.freeze(), true)
+                cache::media_response(
+                    &headers,
+                    &method,
+                    "image/svg+xml",
+                    vb.freeze(),
+                    modified,
+                    true,
+                )
             }
             Ok(None) => error_response(StatusCode::NOT_FOUND, "not found".into()),
             Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get: {e}")),
@@ -1479,20 +1712,48 @@ async fn thumb_handler_inner(
     // Cache hit fast path (videos rely on this — their thumbs are written
     // by the transcode pipeline; this handler never invokes ffmpeg for
     // videos anymore).
-    let t0 = Instant::now();
-    // demo: pooled read + freeze — see the SVG branch above.
-    let cache_res = client.get_pooled(key.as_bytes()).await;
-    let dt = elapsed_ms(t0);
-    match cache_res {
-        Ok(Some(vb)) => {
-            metrics.borrow_mut().record_get(dt, vb.len() as u64);
-            let body = vb.freeze();
-            return cache::response(&headers, &method, "image/jpeg", body, true);
+    let cached_head = match client.head(key.as_bytes()).await {
+        Ok(head) if head.found => Some(head),
+        Ok(_) | Err(AutumnError::NotFound) => None,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("head thumb: {error}"),
+            )
         }
-        Ok(None) => { /* fall through */ }
-        Err(e) => {
-            return error_response(StatusCode::INTERNAL_SERVER_ERROR, format!("get thumb: {e}"))
+    };
+    if let Some(cached_head) = cached_head {
+        let field = if is_video {
+            "transcoded_at"
+        } else {
+            "uploaded_at"
+        };
+        let modified = meta_time(client, &name, field).await;
+        if let Some(response) = cache::metadata_response(
+            &headers,
+            &method,
+            "image/jpeg",
+            cached_head.value_length,
+            modified,
+            true,
+        ) {
+            return response;
         }
+        let t0 = Instant::now();
+        // demo: pooled read + freeze — see the SVG branch above.
+        return match client.get_pooled(key.as_bytes()).await {
+            Ok(Some(vb)) => {
+                metrics
+                    .borrow_mut()
+                    .record_get(elapsed_ms(t0), vb.len() as u64);
+                cache::media_response(&headers, &method, "image/jpeg", vb.freeze(), modified, true)
+            }
+            Ok(None) => error_response(StatusCode::NOT_FOUND, "thumbnail disappeared".into()),
+            Err(error) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("get thumb: {error}"),
+            ),
+        };
     }
 
     if is_video {
@@ -1544,11 +1805,13 @@ async fn thumb_handler_inner(
             let mime = mime_guess::from_path(&name)
                 .first_or_octet_stream()
                 .to_string();
-            return cache::response(
+            let modified = meta_time(client, &name, "uploaded_at").await;
+            return cache::media_response(
                 &headers,
                 &method,
                 &mime,
                 bytes::Bytes::from(original),
+                modified,
                 true,
             );
         }
@@ -1564,6 +1827,7 @@ async fn thumb_handler_inner(
     // response ships the JPEG bytes to the client without waiting on the
     // cache put.
     let thumb = bytes::Bytes::from(thumb);
+    let modified = meta_time(client, &name, "uploaded_at").await;
     {
         let client = client.clone();
         let thumb = thumb.clone();
@@ -1575,7 +1839,7 @@ async fn thumb_handler_inner(
         .detach();
     }
 
-    cache::response(&headers, &method, "image/jpeg", thumb, true)
+    cache::media_response(&headers, &method, "image/jpeg", thumb, modified, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1609,8 +1873,7 @@ async fn main() -> Result<()> {
     let client: Client = Rc::new(match std::env::var("AUTUMN_CREDENTIAL_FILE") {
         Ok(path) if !path.is_empty() => {
             let (principal, secret) = autumn_client::read_credential_file(&path)?;
-            ClusterClient::connect_with_credential(&manager, &scope, principal, secret)
-                .await?
+            ClusterClient::connect_with_credential(&manager, &scope, principal, secret).await?
         }
         _ => ClusterClient::connect(&manager, &scope).await?,
     });
@@ -1718,6 +1981,8 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/", get(index_handler))
+        .route("/static/app.css", get(css_handler))
+        .route("/static/app.js", get(js_handler))
         .route("/put/", put_route)
         .route("/get/{name}", get_route)
         .route("/thumb/{name}", thumb_route)
@@ -1762,7 +2027,10 @@ mod tests {
         let file = 1024u64 * 1024 * 1024;
         let dur = 200.0;
         let secs = pick_hls_time(file, Some(dur));
-        assert!(secs < HLS_TIME_MAX_SECS, "expected a reduced duration, got {secs}");
+        assert!(
+            secs < HLS_TIME_MAX_SECS,
+            "expected a reduced duration, got {secs}"
+        );
         assert!(secs >= HLS_TIME_MIN_SECS);
         let bytes_per_sec = file as f64 / dur;
         let seg_bytes = secs * bytes_per_sec;
