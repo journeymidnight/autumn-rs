@@ -1825,6 +1825,27 @@ Notes:
   a fixed window would have quietly lost read parallelism once lanes were
   over-provisioned relative to partitions.
 
+### Merge refuses a partition that still carries its parent's tables
+
+After a split, each child keeps referencing the parent's SSTs, which hold keys on
+BOTH sides of the cut (`has_overlap = 1`). A merge refuses while EITHER side is in
+that state: the merged partition would re-expose one side's stale copies over the
+other's own history — values from before the split, and keys deleted after it.
+Only a major compaction of that side separates it. The auto-policy does this by
+itself (it advises `major compaction before merge` for each overlapping side);
+by hand:
+
+```bash
+$AO info --part 12 --detail | grep has_overlap     # 1 = still carries parent tables
+$AO --wait merge 12 13
+# → cannot merge: partition has overlapping keys (CoW tables from a split); major-compact it first
+$AO --wait compact 12 ; $AO --wait compact 13     # both sides, not just the survivor
+$AO info --part 13 --detail | grep has_overlap     # 0 on both (load heartbeat, ~5 s lag)
+$AO --wait merge 12 13
+```
+
+Regression: `cargo test -p autumn-manager --test system_merge still_carrying`.
+
 ## Inspecting authz: who exists and what may they touch
 
 `principal-create` / `principal-delete` shipped without a listing, so until now

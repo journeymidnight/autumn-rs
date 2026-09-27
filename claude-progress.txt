@@ -1,3 +1,11 @@
+Date: 2026-09-27 (2)
+TaskStatus: completed
+Task scope: user "按照你建议的1，2，3，4顺序做", step 1 — correct stale ledger entries and settle F-MERGE-COW-STALE-SEQ.
+Current summary: the seq hypothesis is unreachable (only the write path and GC relocation stamp seqs; both skip out-of-range keys), but review found the same symptom through TABLE ORDER: merging a CoW child that still carries the parent's tables re-exposes its out-of-range keys over the sibling's history (pre-split values; keys deleted after the split come back permanently once the sibling's major compaction dropped the tombstone). Reproduced in both directions. Fix: MSG_MERGE_FREEZE refuses while has_overlap != 0 on either side; the policy compacts every overlapping side before a merge (the victim included). Ledger: F-MERGE-COW-STALE-SEQ closed (deleted); stale notes on F-SPLIT-NEEDS-COMPACT / F-STREAM-ATREST-CKSUM; new F-MERGE-REPLAY-OUT-OF-RANGE (reviewer hypothesis, restart probes negative); T4 note that transport_chaos.sh is broken on HEAD.
+Verification: system_merge merge_refuses_{victim,survivor}_still_carrying_parent_tables green; ablations — gate removed → both red; gate removed and merge forced through → wrong reads in both directions; rollback removed → survivor-direction red; policy victim-skip → every_overlapping_merge_side_gets_compacted_first red. manager lib 421, partition-server lib 265, system_status_connection_reuse 3/3. Two independent fable reviews.
+Main gaps: scripts/transport_chaos.sh E7b separation step not run (script broken on HEAD, see T4 note).
+Next steps: step 2 (FUSE SIGTERM), step 3 (F-REVIEW-R6), step 4 (cluster acceptance batch).
+
 Date: 2026-09-27
 TaskStatus: completed
 Task scope: "删除过期注释" — three stale TODOs in crates/stream/src/extent_node.rs (handle_append, handle_re_avali, handle_copy_extent) claiming the manager extent_info / eversion-refresh RPC was not implemented.

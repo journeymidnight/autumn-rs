@@ -469,6 +469,20 @@ else
     write_liveness "e7a"
 
     MERGE_S="${E7PARTS[0]}"; MERGE_V="${E7PARTS[1]}"
+    # A merge is refused at the freeze while either side still carries its
+    # parent's tables (has_overlap), and a refusal would leave the manager
+    # kill below landing in nothing. Separate both sides first.
+    for p in "$MERGE_S" "$MERGE_V"; do "${AOC[@]}" compact "$p" >/dev/null 2>&1; done
+    separated=0
+    for _ in $(seq 1 30); do
+        n=0
+        for p in "$MERGE_S" "$MERGE_V"; do
+            "${AOC[@]}" info --part "$p" --detail 2>/dev/null | grep -q 'has_overlap=0' && n=$((n+1))
+        done
+        [ "$n" -eq 2 ] && { separated=1; break; }
+        sleep 2
+    done
+    [ "$separated" -eq 1 ] || fail "E7b: parts $MERGE_S/$MERGE_V still overlap after compaction; the merge would be refused before any freeze"
     say "E7b: merge $MERGE_V into $MERGE_S + kill manager mid-freeze"
     ( "${AOC[@]}" merge "$MERGE_S" "$MERGE_V" >/dev/null 2>&1 ) &
     sleep 0.3

@@ -3411,7 +3411,7 @@ async fn run_info(
                 "  has_overlap={}{}",
                 l.has_overlap,
                 if l.has_overlap != 0 {
-                    "  (split refused until a major compaction separates the CoW-shared keys)"
+                    "  (split and merge refused until a major compaction separates the CoW-shared keys)"
                 } else {
                     ""
                 }

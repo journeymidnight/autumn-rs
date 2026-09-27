@@ -1703,14 +1703,16 @@ fn overlapping_partition_gets_compact_instead_of_split() {
     assert_eq!(out2[0].kind, POLICY_KIND_SPLIT, "converges once separated");
 }
 
-/// The merge side compacts the SURVIVOR only.
+/// The merge side compacts EVERY overlapping side, the victim included.
 ///
-/// Nothing refuses a merge on `has_overlap` (unlike split) — this is hygiene
-/// before the survivor's range widens. The victim is deleted by the merge, so
-/// compacting it is work thrown away, and that is the whole content of this
-/// test: an overlapping VICTIM alone must not produce a compaction.
+/// The PS refuses a merge while either side has `has_overlap`: the victim's
+/// tables become the merged partition's, so an un-separated victim re-exposes
+/// its stale out-of-range keys just as an un-separated survivor does.
+///
+/// ABLATION: skip the victim (`recent_r`) and the victim-only case goes red
+/// with a MERGE — the op the PS refuses, forever, since nothing else compacts it.
 #[test]
-fn only_the_merge_survivor_gets_the_hygiene_compact() {
+fn every_overlapping_merge_side_gets_compacted_first() {
     let mut state = MetadataState::default();
     mk_part_streams(&mut state, 1, b"a", b"m", 100, 101, 102);
     mk_part_streams(&mut state, 2, b"m", b"z", 200, 201, 202);
@@ -1724,54 +1726,38 @@ fn only_the_merge_survivor_gets_the_hygiene_compact() {
         has_overlap,
         ..Default::default()
     };
+    // (survivor = part 1 overlaps, victim = part 2 overlaps) → the compacts.
+    let run = |left: u32, right: u32| {
+        let mut eng = PolicyEngine::default();
+        fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, cold(left), base);
+        fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, cold(right), base);
+        eng.compute_candidates(ComputeArgs {
+            state: &state,
+            last_op_at: &HashMap::new(),
+            region_owners: &owners,
+            now,
+        })
+    };
+    let compacted = |out: &[autumn_rpc::manager_rpc::PolicyCandidate]| {
+        assert!(
+            out.iter().all(|c| c.kind == POLICY_KIND_MAJOR_COMPACT),
+            "no merge while a side overlaps: {out:?}"
+        );
+        for c in out {
+            assert!(c.reason.contains("before merge") && c.reason.contains("REFUSED"), "{}", c.reason);
+        }
+        let mut parts: Vec<u64> = out.iter().map(|c| c.primary_part_id).collect();
+        parts.sort_unstable();
+        parts
+    };
 
-    // Only the VICTIM (part 2, the right side) overlaps → nothing to do for
-    // it; the merge proceeds. Compacting a partition the merge deletes is the
-    // work this excludes.
-    let mut eng = PolicyEngine::default();
-    fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, cold(0), base);
-    fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, cold(1), base);
-    let out = eng.compute_candidates(ComputeArgs {
-        state: &state,
-        last_op_at: &HashMap::new(),
-        region_owners: &owners,
-        now,
-    });
-    assert_eq!(out.len(), 1, "an overlapping victim does not block: {out:?}");
-    assert_eq!(out[0].kind, POLICY_KIND_MERGE, "the merge itself");
+    assert_eq!(compacted(&run(0, 1)), vec![2], "an overlapping victim is compacted too");
+    assert_eq!(compacted(&run(1, 0)), vec![1]);
+    assert_eq!(compacted(&run(1, 1)), vec![1, 2], "both sides at once");
 
-    // The SURVIVOR (part 1, the left side) overlapping DOES divert to compact.
-    let mut eng_s = PolicyEngine::default();
-    fill_window(&mut eng_s, 1, POLICY_REQUIRED_BUCKETS, cold(1), base);
-    fill_window(&mut eng_s, 2, POLICY_REQUIRED_BUCKETS, cold(0), base);
-    let out_s = eng_s.compute_candidates(ComputeArgs {
-        state: &state,
-        last_op_at: &HashMap::new(),
-        region_owners: &owners,
-        now,
-    });
-    assert_eq!(out_s.len(), 1, "the survivor is compacted first: {out_s:?}");
-    assert_eq!(out_s[0].kind, POLICY_KIND_MAJOR_COMPACT);
-    assert_eq!(out_s[0].primary_part_id, 1, "the survivor, not the victim");
-    assert!(out_s[0].reason.contains("before merge"), "{}", out_s[0].reason);
-    assert!(
-        out_s[0].reason.contains("not refused"),
-        "the reason must not claim a precondition merge does not have: {}",
-        out_s[0].reason
-    );
-
-    // Both clean → the merge itself.
-    let mut eng2 = PolicyEngine::default();
-    fill_window(&mut eng2, 1, POLICY_REQUIRED_BUCKETS, cold(0), base);
-    fill_window(&mut eng2, 2, POLICY_REQUIRED_BUCKETS, cold(0), base);
-    let out2 = eng2.compute_candidates(ComputeArgs {
-        state: &state,
-        last_op_at: &HashMap::new(),
-        region_owners: &owners,
-        now,
-    });
-    assert_eq!(out2.len(), 1);
-    assert_eq!(out2[0].kind, POLICY_KIND_MERGE);
+    let out = run(0, 0);
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].kind, POLICY_KIND_MERGE, "both separated → the merge itself");
 }
 
 /// The unblocking compact waits for a compaction that is RUNNING, and for

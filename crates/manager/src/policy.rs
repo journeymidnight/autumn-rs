@@ -647,19 +647,18 @@ impl PolicyEngine {
     /// The major compaction a blocked split/merge wants, or `None` while one is
     /// already running on that partition.
     ///
-    /// **Split and merge are NOT in the same position here, and the reason text
-    /// says which.** `handle_split_part` REFUSES while `has_overlap` is set, so
-    /// for split this is a hard precondition and the split is advice that
-    /// cannot be taken. Nothing refuses a MERGE on it — the only `has_overlap`
-    /// gate in the tree is that split handler — so for merge this is hygiene:
-    /// the SURVIVOR should not carry un-separated CoW tables across a range
-    /// widen. The merge would otherwise succeed.
+    /// Both ops refuse while `has_overlap` is set: `handle_split_part`, and the
+    /// PS's `MSG_MERGE_FREEZE` on EITHER side of a merge (an un-separated side
+    /// re-exposes its out-of-range keys over its sibling's history once the
+    /// range widens — partition-server CLAUDE.md, "Merge requires both sides
+    /// physically separated"). So the op is advice that cannot be taken until
+    /// the compaction lands.
     ///
-    /// The refusal a blocked split earns is cheap (the check is the first thing
-    /// `handle_split_part` does after decode — one RPC round trip, no
-    /// freeze-drain), so the argument for advising the compaction instead is
-    /// not cost. It is that the split is advice nothing in the loop will ever
-    /// make actionable, and it crowds out the one action that would.
+    /// Either refusal is cheap (split checks first thing after decode; merge
+    /// refuses at the freeze, before any drain), so the argument for advising
+    /// the compaction instead is not cost. It is that the op is advice nothing
+    /// in the loop will ever make actionable, and it crowds out the one action
+    /// that would.
     ///
     /// **Only `compact_inflight` gates this, deliberately NOT the compact
     /// cooldown.** The cooldown exists to stop the maintenance pass re-advising
@@ -711,19 +710,14 @@ impl PolicyEngine {
         if recent.compact_inflight != 0 {
             return None;
         }
-        let why = if blocked_op == "split" {
-            "split is REFUSED until a major compaction rewrites them"
-        } else {
-            "merge is not refused on this, but the survivor should not carry them \
-             across a range widen"
-        };
         Some(PolicyCandidate {
             kind: POLICY_KIND_MAJOR_COMPACT,
             primary_part_id: part_id,
             secondary_part_id: 0,
             reason: format!(
                 "major compaction before {blocked_op}: partition still carries \
-                 CoW-shared out-of-range keys (has_overlap), and {why}"
+                 CoW-shared out-of-range keys (has_overlap), and {blocked_op} is \
+                 REFUSED until a major compaction rewrites them"
             ),
             size_bytes: recent.pending_compaction_bytes,
             req_per_sec: recent.req_per_sec,
@@ -843,20 +837,17 @@ impl PolicyEngine {
             if !(size_small && cold_sustained) {
                 continue;
             }
-            // Compact before merge — but NOT for the same reason as split, and
-            // only for the SURVIVOR.
-            //
-            // Nothing refuses a merge on `has_overlap`: a pair with both sides
-            // set merges fine, and the survivor's reopen recomputes the flag
-            // against its new wider range. So this is hygiene, not a
-            // precondition — the survivor should not carry un-separated
-            // CoW tables (and their compaction debt) across the widen.
-            //
-            // The VICTIM is deliberately excluded: it is deleted by the merge,
-            // so compacting it is work thrown away. Left (the survivor) is
-            // `primary_part_id` by construction above.
-            if recent_l.has_overlap != 0 {
-                out.extend(Self::unblocking_compact(left_id, recent_l, "merge"));
+            // Compact before merge, EACH side that overlaps: the merge refuses
+            // while either does (see `unblocking_compact`). The victim is not
+            // spared for being deleted — its tables become the merged
+            // partition's, stale out-of-range keys included.
+            if recent_l.has_overlap != 0 || recent_r.has_overlap != 0 {
+                if recent_l.has_overlap != 0 {
+                    out.extend(Self::unblocking_compact(left_id, recent_l, "merge"));
+                }
+                if recent_r.has_overlap != 0 {
+                    out.extend(Self::unblocking_compact(right_id, recent_r, "merge"));
+                }
                 continue;
             }
 

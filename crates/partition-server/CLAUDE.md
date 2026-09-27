@@ -2034,6 +2034,25 @@ Three fixes bound the restart replay window (worst case per partition =
     (each `PartitionData` is `Rc<RefCell<>>`, `!Send`) that a PS-orchestrated design
     would need.
 
+    **Merge requires both sides physically separated (`has_overlap == 0`).** The
+    `MSG_MERGE_FREEZE` handler refuses with PRECONDITION otherwise, before freezing.
+    A CoW child's tables still hold keys outside its range, and only the SIBLING knows
+    how stale they are. The merged partition unions both sources' tables in meta-stream
+    order (survivor's extents, then victim's; first occurrence of a shared table wins)
+    and a point read takes the first hit newest-table-first, so an un-separated side
+    re-exposes its out-of-range keys over the sibling's own history: pre-split values
+    read back, and a key the sibling deleted after the split comes back PERMANENTLY once
+    the sibling's major compaction has dropped the tombstone (the next seq-ordered
+    compaction of the merged partition fixes the overwritten keys but has nothing to
+    stop the resurrected one). Both directions are real — survivor-only compaction
+    leaves the victim's record pointing at the parent table; victim-only compaction
+    leaves it in the survivor's. With both sides separated the two sources' key sets are
+    disjoint and neither table order nor per-source seq counters matter. Regression:
+    `merge_refuses_{victim,survivor}_still_carrying_parent_tables` (`crates/manager/tests/system_merge.rs`).
+    The low-level `MSG_MULTI_MODIFY_MERGE` txn has no PS in the loop and does not check;
+    every production path (client, `autumn-op merge`, the policy) goes through
+    `MSG_MERGE_PARTITIONS`, which freezes both sides.
+
 14. **Background-loop supervision — no loop dies silently; durability loops fail-stop.**
     Every PS background loop runs under a supervisor wrapper, never a bare
     `spawn(..).detach()` (which swallows panics → a dead loop with no signal). Two

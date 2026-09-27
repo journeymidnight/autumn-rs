@@ -1130,18 +1130,18 @@ jobs, where the payload IS the question: the floor under the rate triggers
 (`SPLIT_SIZE_MIN`) and the veto on merge (`MERGE_SIZE_LOW`, since merging two fat
 partitions really does put all those bytes behind one thread).
 
-**Compact before split/merge — and the two are NOT in the same position.**
+**Compact before split/merge — both refuse while `has_overlap` is set.**
 `handle_split_part` refuses with `cannot split: partition has overlapping keys` while
-the partition's SSTs still carry keys outside its range, and only a MAJOR compaction
-clears that: for SPLIT the compaction is a hard PRECONDITION. **Nothing refuses a
-MERGE on it** — that split handler is the only `has_overlap` gate in the tree; a pair
-with both sides set merges fine and the survivor's reopen recomputes the flag against
-its new wider range. For MERGE the compaction is hygiene (the survivor should not carry
-un-separated CoW tables across the widen), and it is emitted for the SURVIVOR ONLY —
-compacting the victim is work the merge is about to delete.
+the partition's SSTs still carry keys outside its range, and the PS's `MSG_MERGE_FREEZE`
+refuses a merge (`cannot merge: …`) while EITHER side does; only a MAJOR compaction
+clears the flag. For merge the victim is not exempt for being deleted: its tables become
+the merged partition's, and an un-separated side re-exposes its out-of-range keys over
+the sibling's history — pre-split values, and keys the sibling deleted after the split
+(partition-server CLAUDE.md, "Merge requires both sides physically separated"). So the
+merge pass emits the compaction for EVERY overlapping side of the pair.
 
 Both paths emit `unblocking_compact`, a plain `POLICY_KIND_MAJOR_COMPACT` whose reason
-names which of the two cases it is, instead of the topology op; the op follows on a
+names the op it unblocks, instead of the topology op; the op follows on a
 later tick once the flag clears. It is gated on `compact_inflight` and deliberately NOT
 on the compact cooldown — that cooldown throttles re-advising a debt LEVEL, while
 `has_overlap` is a flag only a completed major compaction clears, so a compaction that

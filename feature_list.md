@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-26
+**Last updated:** 2026-09-27
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -39,6 +39,11 @@
 - **Acceptance**: 必需动作未进入/完成则失败；包含 manager/PS 故障与在线 Remove、DELETE/TTL/多 writer 的定向覆盖，CI 实际执行。
 - `passes: false`
 - **notes** (2026-09-20): 普通 manager 测试已解除对系统 FUSE 的无条件依赖；8 个 FUSE 专属目标通过 fuse-tests feature 显式启用，CI 的 clippy/integration 命令保持启用。完整 ignored chaos、动作覆盖门槛和历史 checker 尚未完成。本轮定向验证入口见 scripts/README.md。
+- **notes** (2026-09-27): `scripts/transport_chaos.sh` 在 HEAD 上整体跑不起来——自 `67728e4`
+  起 `autumn-client` 的 KV 命令必须带 `--namespace`，脚本没带，seed 全部失败，后续 E1–E7 的
+  断言因此没有意义。同日 merge 加了分离闸门，E7b 前补了"两侧 compact + 等 `has_overlap=0`"
+  （否则 freeze 直接拒、manager kill 落空），**这一步未实跑**。另：该脚本开机时 `kill -9` 本机
+  所有 `autumn-*`/`etcd` 进程，多租户机器上会杀掉别的工作树的进程。
 
 ### F-REVIEW-V1-MERGE-REPLAY — 待验证：merge replay cursor 可达性
 - **Trigger**: review.md 4.1；数值模型不足以证明正常 merge 丢失数据。
@@ -179,6 +184,10 @@
   要靠增量 2 的 scrub 回填才够得着。剩余：scrub（探测 + 回填 + 经 `DfResp` 上报）、
   EC 转换前置校验、EC 分片的 at-rest 覆盖。
   原始定调保留 — **backlog（用户定调 2026-08-04「g12 放到 backlog 里面」）**：已 reproduce（harness 未提交/已提交见 chaos 套件 `b15168c`），本轮**不实现**，留账本记录。cross-ref memory `project_chaos_gap_loop_findings`（G12 条）。真要动之前先确认触发条件（单副本静默腐化）是否已在真实硬件/线上出现过。
+- **notes** (2026-09-27): 上面的 Status 已过期 —— 增量 2 已在 main:scrub(`extent_scrub.rs`,
+  含 sidecar 回填、经 `DfResp.scrub_rot` 上报、manager 隔离该副本)与 EC 转换前置校验
+  (`e0b8861`,后续 `1ffaa93` / `5720408` 修过)。剩余:EC `.shard{i}` 的 at-rest 内容校验
+  (`docs/autumn_integrity_plan.md` 表中仍为 none),以及本条 Acceptance 的逐条复核。
 
 ### F-EN-SHARD-AUTO — default EN shard count to CPU cores (format-side), not a hand-set env
 - **Trigger** (2026-07-13, user: "EN 分片确实是核数导向,但目前是手动 env,不是自动...对于集群配置有好处,记下来,以后做"): EN sharding IS core-oriented — `AUTUMN_EXTENT_SHARDS` should track io_uring cores (one shard = `extent_id % shard_count`), but it's a MANUAL env (default 1). Operators must hand-count cores AND keep three things in lockstep. It is NOT a simple "read `available_parallelism()` in the EN" because shard_count is coupled through a chain: **(a)** EN ports are static/registered-once — `autumn-op format --shard-ports <csv>` stamps the N ports into etcd and the manager routes by that list forever (stream CLAUDE.md "EN ports are FUNDAMENTALLY static"); a runtime-auto shard count would desync from etcd → manager black-holes shards 1..N. **(b)** the k8s overlay Service must enumerate exactly `shard_count` data+control ports (`9101+i*10` / `10101+i*10`); auto-shard needs the Service port list generated too. **(c)** `AUTUMN_EXPECT_NODES` / presplit sizing are tuned against the shard fan-out.
@@ -371,29 +380,27 @@
   append fanout 的 p99 不超过 size-scaled deadline 的一半；转换本身允许变慢。
 - **Status**: `passes: false` (2026-09-11) — 仅立账。
 
-### F-MERGE-COW-STALE-SEQ — 合并两个未分离的 CoW 孩子是否会让旧值压过新值（未复现）
-- **Trigger** (2026-09-11，做 compact-before-merge 时顺带查清的事): 实测确认
-  **merge 根本不检查 `has_overlap`** —— 两侧都是 1 的一对照样合并成功，60 个 key
-  全部读回，幸存者 reopen 之后 `has_overlap` 自己重算成 0。全树唯一的 `has_overlap`
-  闸门是 `handle_split_part`。（`crates/manager/tests/system_merge.rs` 里
-  "Without this, merge would refuse with the has_overlap gate" 那句注释是错的，已改。）
-- **于是剩下一个没人回答的问题**: split 之后两个孩子的 seq 计数器各自从父亲的
-  `max_seq` 独立往上走。幸存者的 SST 里有父亲留下的 key K 的旧版本（seq 高，因为
-  split 前父亲的 seq 已经走到那里），受害者在 split 之后给 K 写了新值（seq 低，
-  因为它从同一个起点独立计数）。合并把两边的 SST 并到一起、range 变宽、
-  `has_overlap` 重算成 0 之后，**MVCC 按 seq 定胜负，旧值可能赢**。
-- **这是假设，不是事实**: 上面那次实测没有构造这个形状（没有在 split 之后对
-  受害者范围内的 key 重写）。按 [[feedback_reproduce_before_fixing_mechanism_bugs]]，
-  先复现再谈修。
-- **Scope(复现之后才谈)**: 写一个确定性 harness —— 建分区 → 写 K → split →
-  只对受害者侧写 K 的新值 → 不 compact 直接 merge → 读 K。读回旧值即坐实。
-  若坐实，修法在 merge 的 seq 处理上（重编号或取全局 max），不是在策略层加闸门。
-- **今天的策略层做了什么、没做什么**: `unblocking_compact` 会在**幸存者**还
-  overlap 时先发一次 major compact —— 那是卫生（幸存者不该扛着未分离的 CoW 表
-  跨过 range 变宽），**不是**为了堵这个洞，注释和 reason 文案都如实这么写。
-  受害者被**故意排除**：它马上就要被 merge 删掉，compact 它是白干。
-- **Acceptance**: 一个确定性复现（或一份说明为什么构造不出来的分析），据此决定修不修。
-- **Status**: `passes: false` (2026-09-11) — 仅立账，**先复现再修**。
+### F-MERGE-REPLAY-OUT-OF-RANGE — 重放不按 range 过滤，可能让已分离的孩子重新带上兄弟的 key（未复现）
+- **Trigger** (2026-09-27，merge 分离闸门的独立评审提出，推断): merge 现在要求两侧
+  `has_overlap == 0`（`MSG_MERGE_FREEZE` 拒绝），这个标志只从 SST 算（split 时与 open 时）。
+  但 reopen 的 WAL 重放**不做 `in_range` 过滤**，唯一的跳过是 `ts <= extent_dedup`
+  （`partition-server/src/lib.rs` `recover_partition` 重放段）；而每个来源的 dedup 取该
+  checkpoint 记录里**仍能解析**的 SST 的 `last_seq` 最大值，解析不到时为 0，major compaction
+  丢掉最新条目又会压低输出表的 `last_seq`。推断链：祖先有 ≥2 个非空 meta extent（或 meta
+  尾被 roll 过）⇒ 最早的 checkpoint vp 在后来的父记录之前 ⇒ 孩子 major compaction 之后那些
+  区间按 0 或偏低的值去重 ⇒ 任何一次 reopen 都把兄弟那半的父记录重新插进孩子的 memtable
+  ⇒ `has_overlap` 仍是 0，下一次 flush（包括 merge freeze 自己的 drain flush）写出带越界 key
+  的 SST ⇒ merge 放行后与本次修掉的现象相同。
+- **已做的复现尝试（阴性）**: split → 两侧写/删 → 两侧 major compact → PS 优雅重启 / SIGKILL
+  重启 → merge → 读，D/K/J/R 全部正确（一次父 flush、一个 meta extent 的形状，最早 vp 在所有
+  父记录之后，构造不出推断链的前提）。另观察到：一侧的删除若是它 checkpoint 前的最后一条
+  记录，未设闸门的 merge 之后该 key 读 NOT_FOUND——与"被 compaction 丢掉的 tombstone 在
+  reopen 时被重放"一致，是同一机制的无害一面。
+- **Scope（复现之后才谈）**: 造出 ≥2 个 meta extent 的祖先（强制 meta roll，或多级 split），
+  走完上面的链；若坐实，根因修法是重放时对每条记录做一次 `in_range(rg)` 过滤（同时去掉被
+  重放的 tombstone），不是再加一个标志。
+- **Acceptance**: 一个确定性复现（或一份说明为什么前提不可达的分析），据此决定修不修；修则
+  消融能变红。
 - `passes: false`
 
 ### F-SPLIT-CARRIED-BYTES-UNBOUNDED — 大 value 分区可以无限长大，而现在没有任何判据会说话
@@ -475,6 +482,12 @@
   `split ... refused`；面板对该分区显示的是"需要先 compact"而不是一条裸错误。
 - **Status**: `passes: false` (2026-09-09) — 仅立账，未实现。手工推动的办法是对两个分区
   各发一次 `autumn-op compact`(最近 17、164 都 compact 成功过)。
+- **notes** (2026-09-27): 上面的 Status 已过期 —— 三条 Scope 都已在代码里:(1) 策略对仍
+  `has_overlap` 的 split 候选改发 major compact(`crates/manager/src/policy.rs` 的
+  `unblocking_compact`);(2) 拒绝起冷却(`9cd04a0`);(3) 面板在
+  Split 按钮前按 `has_overlap` 警告,建议行写明"split 被拒直到 major compaction 重写"
+  (`688b32d`)。剩下的只是验收:真集群上一个重叠未消的分区,recent actions 不再连续出现
+  `split refused`。
 
 ### F-FUSE-READ-LATENCY-NOT-BANDWIDTH — 每次读约 4ms 固定成本；挂载能到 1.3 GB/s，慢的是加载器的读粒度
 - **Trigger** (2026-09-12，用户): 「为什么autumnfs读这么慢？」。一个 vLLM-Omni 扩散服务

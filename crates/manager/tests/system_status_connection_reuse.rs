@@ -156,7 +156,20 @@ fn split_merge_status_refusals_reuse_healthy_connections() {
             admin.compact(1801).await.unwrap();
             admin.compact(right).await.unwrap();
             let pre_merge_epoch = observer.lookup_epoch_for_part(1801);
-            admin.merge_partitions(1801, right, true).await.unwrap();
+            // `compact` only enqueues; the merge refuses until both children's
+            // major compactions have separated them from the parent's tables.
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                match admin.merge_partitions(1801, right, true).await {
+                    Ok(()) => break,
+                    Err(AutumnError::ServerError(m))
+                        if m.contains("overlapping keys") && std::time::Instant::now() < deadline =>
+                    {
+                        compio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                    Err(e) => panic!("merge: {e}"),
+                }
+            }
             // Merge returns before the PS unfreezes. Plain put currently exposes
             // that body-level refusal; wait for readiness without changing its
             // retry policy as part of connection-lifetime verification.

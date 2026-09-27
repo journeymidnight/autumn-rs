@@ -7920,6 +7920,24 @@ async fn handle_incoming_req(
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
                 }
+                // A partition still holding CoW tables from a split carries
+                // keys outside its range, whose staleness only its sibling
+                // knows. The merge widens the range over them and they read
+                // back — pre-split values, and deleted keys whose tombstone a
+                // sibling's major compaction dropped (CLAUDE.md, "Merge
+                // requires both sides physically separated"). Checked once,
+                // here: the flag only rises at split / open, and a frozen
+                // partition cannot split.
+                if p.has_overlap.get() != 0 {
+                    let resp = MergeFreezeResp {
+                        code: CODE_PRECONDITION,
+                        message: "cannot merge: partition has overlapping keys (CoW tables \
+                                  from a split); major-compact it first"
+                            .to_string(),
+                    };
+                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                    return;
+                }
                 p.frozen_for_merge.set(Some(std::time::Instant::now()));
                 *p.freeze_drain_ack.borrow_mut() = Some(req.resp_tx);
             }

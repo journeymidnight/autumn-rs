@@ -1600,6 +1600,232 @@ fn split_merge_split_with_interleaved_writes() {
     });
 }
 
+/// A merge must refuse a CoW child that still carries the parent's tables.
+///
+/// After a split each child's tables still hold keys OUTSIDE its range, and
+/// only its sibling knows how stale they are. The merged partition unions both
+/// sources' tables and a point read takes the first hit newest-table-first, so
+/// an un-separated child re-exposes pre-split values over the sibling's history —
+/// and a key the sibling deleted after the split, whose tombstone the sibling's
+/// major compaction already dropped, comes back for good. Whichever side is left
+/// un-compacted, the merge must be refused until it is, and then read correctly.
+fn merge_refuses_unseparated_cow_child(compact_survivor_first: bool) {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 83).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        const PART: u64 = 1201;
+        upsert_partition(&mgr, PART, log, row, meta, b"a", b"z").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(83, mgr_addr, ps_addr);
+        let ps = RpcClient::connect(ps_addr).await.unwrap();
+        let router = PsRouter::new(mgr_addr, ps_addr);
+
+        // Survivor range [a, m): D is rewritten, J deleted after the split.
+        // Victim range [m, z): K is rewritten, R deleted after the split.
+        const D: &[u8] = b"d-rewritten";
+        const J: &[u8] = b"j-deleted";
+        const K: &[u8] = b"q-rewritten";
+        const R: &[u8] = b"r-deleted";
+        for k in [D, J, K, R] {
+            ps_put(&ps, PART, k, b"OLD").await;
+        }
+        ps_flush(&ps, PART).await;
+
+        let resp = ps
+            .call(
+                partition_rpc::MSG_SPLIT_PART,
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
+                    part_id: PART,
+                    at_key: Some(b"m".to_vec()),
+                }),
+            )
+            .await
+            .expect("split call");
+        let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).unwrap();
+        assert_eq!(sr.code, partition_rpc::CODE_OK, "split: {}", sr.message);
+        assert!(
+            poll_until_async(Duration::from_secs(10), Duration::from_millis(200), || async {
+                let r = get_regions(&mgr).await;
+                r.regions.len() == 2 && r.part_addrs.len() == 2
+            })
+            .await,
+            "right child never registered"
+        );
+        let survivor = PART;
+        let victim = get_regions(&mgr)
+            .await
+            .regions
+            .iter()
+            .map(|(pid, _)| *pid)
+            .find(|pid| *pid != survivor)
+            .unwrap();
+
+        let delete = |part: u64, key: &'static [u8]| {
+            let router = &router;
+            async move {
+                let c = router.client_for(part).await;
+                let r = ps_delete(&c, part, key).await;
+                assert_eq!(r.code, partition_rpc::CODE_OK, "delete: {}", r.message);
+            }
+        };
+        // Each delete precedes a put. With the delete as a side's LAST record,
+        // the deleted key read NOT_FOUND after an ungated merge — the reopen
+        // replays that tombstone — which hides the resurrection this checks for.
+        delete(survivor, J).await;
+        psr_put(&router, survivor, D, b"NEW").await;
+        delete(victim, R).await;
+        psr_put(&router, victim, K, b"NEW").await;
+        psr_flush(&router, survivor).await;
+        psr_flush(&router, victim).await;
+
+        let pool = std::rc::Rc::new(autumn_stream::ConnPool::new());
+        let sc = autumn_stream::StreamClient::connect(
+            &mgr_addr.to_string(),
+            "test-merge-separation".to_string(),
+            1 << 20,
+            pool,
+        )
+        .await
+        .expect("connect sc");
+        // A major compaction of these few keys leaves exactly one table, and it
+        // drops the out-of-range keys along with the child's own tombstone.
+        let compact_and_wait = |part: u64| {
+            let (mgr, router, sc) = (&mgr, &router, &sc);
+            async move {
+                psr_compact(router, part).await;
+                let meta_stream = get_regions(mgr)
+                    .await
+                    .regions
+                    .iter()
+                    .find(|(pid, _)| *pid == part)
+                    .map(|(_, r)| r.meta_stream)
+                    .unwrap();
+                assert!(
+                    poll_until_async(Duration::from_secs(15), Duration::from_millis(250), || async {
+                        matches!(
+                            sc.read_last_extent_data(meta_stream).await,
+                            Ok(Some(raw)) if decode_last_table_locations(raw.as_slice()).locs.len() == 1
+                        )
+                    })
+                    .await,
+                    "major compaction of partition {part} never settled to one table"
+                );
+            }
+        };
+        let merge = || async {
+            let bytes = mgr
+                .call(
+                    MSG_MERGE_PARTITIONS,
+                    rkyv_encode(&MergePartitionsReq {
+                        survivor_part_id: survivor,
+                        victim_part_id: victim,
+                        force: false,
+                    }),
+                )
+                .await
+                .unwrap();
+            rkyv_decode::<MergePartitionsResp>(&bytes).unwrap()
+        };
+
+        let (first, second) = if compact_survivor_first {
+            (survivor, victim)
+        } else {
+            (victim, survivor)
+        };
+        compact_and_wait(first).await;
+        let refused = merge().await;
+        assert!(
+            refused.code != CODE_OK && refused.message.contains("overlapping keys"),
+            "merge with partition {second} still un-separated must be refused on has_overlap, \
+             got code {} {:?}",
+            refused.code,
+            refused.message
+        );
+        assert_eq!(get_regions(&mgr).await.regions.len(), 2, "a refused merge changed the topology");
+        // The side that was frozen before the other refused must be thawed:
+        // a partition left frozen would only show on its next write.
+        for (part, key) in [(survivor, &b"b-after-refusal"[..]), (victim, &b"s-after-refusal"[..])] {
+            assert!(
+                try_psr_put(&router, part, key, b"x").await.is_ok(),
+                "partition {part} still refuses writes after the refused merge"
+            );
+        }
+
+        compact_and_wait(second).await;
+        let merged = merge().await;
+        assert_eq!(merged.code, CODE_OK, "merge of separated children: {}", merged.message);
+        assert!(
+            poll_until_async(Duration::from_secs(10), Duration::from_millis(200), || async {
+                get_regions(&mgr).await.regions.len() == 1
+            })
+            .await,
+            "merge never settled to one partition"
+        );
+
+        // Until the survivor reopens over the widened range, its frozen
+        // pre-merge instance still answers reads for [a, m) — from its own
+        // tables, which would pass this test for the wrong reason. A victim-range
+        // key reading OK is what proves the reopen.
+        assert!(
+            poll_until_async(Duration::from_secs(15), Duration::from_millis(250), || async {
+                psr_get(&router, survivor, K).await.code == partition_rpc::CODE_OK
+            })
+            .await,
+            "the survivor never reopened over the merged range"
+        );
+        let check = |when: &'static str| {
+            let router = &router;
+            async move {
+            for (key, want) in [(D, Some(&b"NEW"[..])), (K, Some(&b"NEW"[..])), (J, None), (R, None)] {
+                let got = psr_get(router, survivor, key).await;
+                match want {
+                    Some(v) => assert!(
+                        got.code == partition_rpc::CODE_OK && got.value == v,
+                        "{when}: {} reads code {} {:?}, want NEW",
+                        String::from_utf8_lossy(key),
+                        got.code,
+                        String::from_utf8_lossy(&got.value)
+                    ),
+                    None => assert_eq!(
+                        got.code,
+                        partition_rpc::CODE_NOT_FOUND,
+                        "{when}: deleted {} came back as {:?}",
+                        String::from_utf8_lossy(key),
+                        String::from_utf8_lossy(&got.value)
+                    ),
+                }
+            }
+            }
+        };
+        check("after merge").await;
+        // A seq-ordered merge of every table: what a point read cannot show.
+        compact_and_wait(survivor).await;
+        check("after merge + major compaction").await;
+    });
+}
+
+#[test]
+fn merge_refuses_victim_still_carrying_parent_tables() {
+    merge_refuses_unseparated_cow_child(true);
+}
+
+#[test]
+fn merge_refuses_survivor_still_carrying_parent_tables() {
+    merge_refuses_unseparated_cow_child(false);
+}
+
 /// Routes a key to its current partition via GetRegions. Returns None
 /// if no partition's range covers the key (transient during merge).
 async fn resolve_part_id_for_key(mgr: &RpcClient, key: &[u8]) -> Option<u64> {
