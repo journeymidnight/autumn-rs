@@ -803,8 +803,8 @@ fn main() -> Result<()> {
             .name(format!("extent-shard-{shard_idx}"))
             .spawn(move || {
                 let shard_main = std::panic::AssertUnwindSafe(move || -> Result<()> {
+                    autumn_common::cpu_pin::pin_current(cpu).context("pin extent shard")?;
                     let rt = compio::runtime::RuntimeBuilder::new()
-                        .thread_affinity(autumn_common::affinity_set(cpu))
                         .build()
                         .context("create compio runtime")?;
                     tracing::info!(shard_idx, ?cpu, "extent-shard runtime ready");
@@ -955,8 +955,8 @@ fn main() -> Result<()> {
 
 fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
     let cpu = autumn_common::pick_cpu_for_ord(0);
+    autumn_common::cpu_pin::pin_current(cpu).context("pin extent node")?;
     let rt = compio::runtime::RuntimeBuilder::new()
-        .thread_affinity(autumn_common::affinity_set(cpu))
         .build()
         .context("create compio runtime")?;
     tracing::info!(?cpu, "extent-node (single-shard) runtime ready");

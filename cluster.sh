@@ -278,25 +278,45 @@ compute_shard_config() {
     [[ "$SHARD_STRIDE" =~ ^[0-9]+$ ]] && (( SHARD_STRIDE >= 1 )) || SHARD_STRIDE=10
 }
 
-# Detect the available CPU count in a portable way (Linux + macOS).
-# Returns 0 if no probe succeeded — caller should treat 0 as "unknown,
-# don't bother with affinity".
-detect_cpu_count() {
-    local n
-    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
-    if [[ -z "$n" ]]; then n="$(nproc 2>/dev/null || true)"; fi
-    if [[ -z "$n" ]]; then n="$(sysctl -n hw.ncpu 2>/dev/null || true)"; fi
-    [[ "$n" =~ ^[0-9]+$ ]] || n=0
-    echo "$n"
+# The cores the auto layout slices, ascending. `start` takes them from its own
+# Cpus_allowed_list, so a `taskset`/cgroup-restricted launcher lays the cluster
+# out INSIDE its mask, and saves them in the snapshot (AUTUMN_ALLOWED_CPUS) so a
+# later start-node / restart-node from another shell reuses the same layout
+# (load_cluster_config). Empty where threads cannot be pinned (macOS has affinity
+# hints only; the binaries fail on an explicit --cpuset there) — no --cpuset is
+# passed at all. The binaries pin with sched_setaffinity, so a core number
+# outside their cgroup would stop them at startup: never hand out absolute
+# numbers, always slices of this list.
+# AUTUMN_ALLOWED_CPUS is an OUTPUT (snapshot) only: start/restart/reset overwrite
+# it from their own mask. To restrict the layout, run them under taskset.
+# set_allowed_cpus LIST — LIST is a taskset-style list ("0-3,8").
+set_allowed_cpus() {
+    local seg c
+    ALLOWED_CPUS=()
+    for seg in ${1//,/ }; do
+        for (( c = ${seg%-*}; c <= ${seg#*-}; c++ )); do ALLOWED_CPUS+=("$c"); done
+    done
+}
+ALLOWED_CPUS=()
+if [[ -r /proc/self/status ]]; then
+    set_allowed_cpus "$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+fi
+
+# allowed_cpu_slice START COUNT — cores ALLOWED_CPUS[START .. START+COUNT-1]
+# as a --cpuset comma list.
+allowed_cpu_slice() {
+    local IFS=,
+    echo "${ALLOWED_CPUS[*]:$1:$2}"
 }
 
-# Decide whether to pass --cpu-start to extent-nodes / PS. Sets the global
-# AFFINITY_ENABLED=1|0 and (when enabled) leaves the calculated cpu_start
-# values to the launchers. Compatible across macOS and Linux:
-#   - macOS: core_affinity in our Rust code is best-effort; passing
-#     --cpu-start is harmless. We still gate by detected core count.
-#   - Linux with taskset: nproc honors the cpuset, so the gate triggers
-#     correctly under restricted cgroups.
+detect_cpu_count() {
+    echo "${#ALLOWED_CPUS[@]}"
+}
+
+# Decide whether to pass an auto --cpuset to extent-nodes / PS. Sets the global
+# AFFINITY_ENABLED=1|0; the launchers then slice ALLOWED_CPUS. macOS (no
+# ALLOWED_CPUS) is always disabled; under taskset/cgroups the gate counts
+# only the allowed cores.
 # Heuristic: need REPLICAS*SHARDS cores for EN side + 2*PS_PARTS_HINT for
 # PS (P-log + P-sst per partition). PS_PARTS_HINT defaults to 8 (matches
 # perf_check.sh default partition count); override via
@@ -309,7 +329,7 @@ compute_affinity_decision() {
     required=$(( REPLICAS * SHARDS + 2 * ps_hint ))
     if (( detected == 0 )); then
         AFFINITY_ENABLED=0
-        echo "[cluster] affinity: disabled (could not detect CPU count)"
+        echo "[cluster] affinity: disabled (no pinnable cores on this platform)"
     elif (( detected < required )); then
         AFFINITY_ENABLED=0
         echo "[cluster] affinity: disabled (detected $detected cores < required $required = ${REPLICAS}*${SHARDS} EN + 2*${ps_hint} PS)"
@@ -334,7 +354,6 @@ launch_extent_node() {
     # override per node via AUTUMN_EN${i}_CPUSET (taskset syntax).
     # PS gets the remaining cores after all EN ranges (see launch_ps).
     local cpu_start=$(( (i - 1) * SHARDS ))
-    local cpu_end=$(( cpu_start + SHARDS - 1 ))
     local -a cpu_args=()
     local en_cpuset_var="AUTUMN_EN${i}_CPUSET"
     if [[ -n "${!en_cpuset_var:-}" ]]; then
@@ -361,13 +380,14 @@ launch_extent_node() {
             die "$en_cpuset_var='$_spec' has $_count cores but AUTUMN_EXTENT_SHARDS=$SHARDS — they MUST match (EN shards = cpuset_len)"
         fi
     elif (( ${AFFINITY_ENABLED:-0} == 1 )); then
-        cpu_args=(--cpuset "${cpu_start}-${cpu_end}")
+        cpu_args=(--cpuset "$(allowed_cpu_slice "$cpu_start" "$SHARDS")")
     fi
     # Without --cpuset the EN auto-detects all cores via core_affinity,
     # which on a dev box would spawn many shards — for the SHARDS=1
-    # legacy default we still want one shard. Bound it with taskset.
-    if [[ ${#cpu_args[@]} -eq 0 ]] && (( SHARDS == 1 )); then
-        cpu_args=(--cpuset "0")
+    # legacy default we still want one shard: the first allowed core. (On
+    # macOS nothing is detected, so no --cpuset already means one shard.)
+    if [[ ${#cpu_args[@]} -eq 0 ]] && (( SHARDS == 1 )) && (( ${#ALLOWED_CPUS[@]} > 0 )); then
+        cpu_args=(--cpuset "${ALLOWED_CPUS[0]}")
     fi
     # shellcheck disable=SC2046  # intentional word splitting on commas
     mkdir -p $(echo "$disk_arg" | tr ',' ' ')
@@ -440,15 +460,16 @@ launch_ps() {
     local ps_hint="${AUTUMN_PS_PARTS_HINT:-8}"
     [[ "$ps_hint" =~ ^[0-9]+$ ]] && (( ps_hint >= 1 )) || ps_hint=8
     local ps_cpu_start=$(( REPLICAS * SHARDS ))
-    local ps_cpu_end=$(( ps_cpu_start + 2 * ps_hint - 1 ))
     local -a cpu_args=()
     local affinity_msg="affinity=off"
     if [[ -n "${AUTUMN_PS_CPUSET:-}" ]]; then
         cpu_args=(--cpuset "$AUTUMN_PS_CPUSET")
         affinity_msg="cpuset=${AUTUMN_PS_CPUSET}"
     elif (( ${AFFINITY_ENABLED:-0} == 1 )); then
-        cpu_args=(--cpuset "${ps_cpu_start}-${ps_cpu_end}")
-        affinity_msg="cpuset=${ps_cpu_start}-${ps_cpu_end} (max_parts=$ps_hint)"
+        local ps_cpus
+        ps_cpus="$(allowed_cpu_slice "$ps_cpu_start" $(( 2 * ps_hint )))"
+        cpu_args=(--cpuset "$ps_cpus")
+        affinity_msg="cpuset=${ps_cpus} (max_parts=$ps_hint)"
     fi
     # operator-set AUTUMN_* env vars are translated explicitly to
     # per-binary CLI flags here — Rust libraries no longer read env
@@ -756,6 +777,7 @@ load_cluster_config() {
     # re-derive after sourcing so a persisted AUTUMN_PS_BASE_PORT
     # (saved by save_cluster_config) takes effect for start-ps/stop-ps.
     PS_BASE_PORT="${AUTUMN_PS_BASE_PORT:-9301}"
+    [[ -n "${AUTUMN_ALLOWED_CPUS:-}" ]] && set_allowed_cpus "$AUTUMN_ALLOWED_CPUS"
     compute_shard_config
     compute_affinity_decision
     apply_ucx_env_defaults
@@ -884,6 +906,12 @@ do_start() {
 
     # when AUTUMN_EXTENT_SHARDS is set, launch each extent-node
     # with K shards (see compute_shard_config + launch_extent_node above).
+    # The layout's core list goes into the snapshot with the AUTUMN_* env.
+    unset AUTUMN_ALLOWED_CPUS
+    if (( ${#ALLOWED_CPUS[@]} > 0 )); then
+        AUTUMN_ALLOWED_CPUS="$(allowed_cpu_slice 0 ${#ALLOWED_CPUS[@]})"
+        export AUTUMN_ALLOWED_CPUS
+    fi
     compute_shard_config
     compute_affinity_decision
     if (( SHARDS > 1 )); then

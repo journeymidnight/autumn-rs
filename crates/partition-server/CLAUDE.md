@@ -8,10 +8,14 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 
 ### Thread Model
 
-P-sst applies `cpu_pin::pin_current(cpu_bulk)` before creating its compio runtime.
-The parent P-log is already pinned, and child threads inherit that affinity;
-runtime-only pinning in compio 0.18 cannot widen the inherited mask. CPU read-back
-must show distinct P-log/P-sst cores, not merely the intended values in logs.
+P-log applies `cpu_pin::pin_current(cpu_log)` and P-sst `pin_current(cpu_bulk)`
+before creating their compio runtimes; a failure is reported through the
+partition's ready channel, so the partition does not open. compio's own
+`thread_affinity` is not used: it only narrows the inherited mask (P-sst inherits
+P-log's single core; a `taskset`-launched PS inherits the launcher's cores) and
+silently binds nothing when the target is outside it (`crates/common/CLAUDE.md`).
+CPU read-back must show the `--cpuset` cores, not merely the intended values in
+logs.
 
 ```
 Main compio thread (control plane + fd dispatcher)

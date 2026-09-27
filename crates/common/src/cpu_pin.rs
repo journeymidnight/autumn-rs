@@ -27,7 +27,6 @@
 //! `--cpuset` and `--cpu-start` are mutually exclusive at the CLI layer;
 //! when both are present the binary refuses to start.
 
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
@@ -179,20 +178,14 @@ pub fn pick_cpu_for_ord(zero_based_ord: usize) -> Option<usize> {
     Some(cores[idx])
 }
 
-/// Build a `HashSet` containing exactly `cpu` (or empty if `None`), ready to
-/// hand to `compio::runtime::RuntimeBuilder::thread_affinity`.
-pub fn affinity_set(cpu: Option<usize>) -> HashSet<usize> {
-    let mut set = HashSet::new();
-    if let Some(c) = cpu {
-        set.insert(c);
-    }
-    set
-}
-
-/// Pin explicitly before constructing a runtime. A thread spawned by an
-/// already-pinned parent inherits that single CPU. compio intersects its target
-/// with the inherited mask, so it cannot move such a child to a sibling CPU.
-/// The OS still enforces the enclosing cgroup/cpuset when setting this affinity.
+/// Pin the calling thread to `cpu` (no-op for `None`). Every work-unit thread
+/// calls this before building its runtime; nothing pins through compio's
+/// `RuntimeBuilder::thread_affinity`, because compio intersects the target with
+/// the mask the thread inherited and silently binds nothing when they are
+/// disjoint. A launcher wrapped in `taskset -c A,B` (or a pinned parent thread)
+/// then voided every `--cpuset`, with each thread still logging its "assigned"
+/// core. `sched_setaffinity` moves the thread anywhere the enclosing
+/// cgroup/cpuset allows, and a core outside that is an error, not a skip.
 pub fn pin_current(cpu: Option<usize>) -> std::io::Result<()> {
     if let Some(id) = cpu {
         if !core_affinity::set_for_current(core_affinity::CoreId { id }) {

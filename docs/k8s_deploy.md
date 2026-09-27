@@ -223,14 +223,19 @@ overlay must name a class explicitly, as the VKE example does.
 
 ## Multi-shard extent nodes
 
-By default each EN runs **one shard** (`--cpuset 0`) — a single io_uring core
+By default each EN runs **one shard**, pinned to the first core the container
+may run on — a single io_uring core
 serves all its extent traffic. Under sustained durable writes (RF=3 + fsync),
 adding partitions scales write throughput until that **one EN core** becomes the
 wall (benchmarked here: write flattens ~65k ops/s past 16 partitions). Giving
 each EN more shards spreads its extents (`shard = extent_id % N`) across N cores.
 
 The entrypoint exposes this via **`AUTUMN_EXTENT_SHARDS`** (default 1). When > 1
-it sizes the EN to cores `0..N-1`. `format` is
+it sizes the EN to the container's first N allowed cores (`Cpus_allowed_list`;
+host cores `0..N-1` when the kubelet does not use the static CPU manager, the
+granted cores when it does — the EN refuses a `--cpuset` core outside its cgroup,
+so a hardcoded `0..N-1` would crash-loop there). `AUTUMN_EXTENT_CPUSET` overrides.
+`format` is
 identity-only now — the EN binary itself self-registers all N shard ports at
 startup (via its own `--advertise`, which now carries the **pod IP**), and the
 manager/PS dial `pod_ip:shard_port` directly. Shard `i` binds data port

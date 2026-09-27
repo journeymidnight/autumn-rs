@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use autumn_common::cpu_pin::{affinity_set, pick_cpu_for_ord, pin_current};
+use autumn_common::cpu_pin::{pick_cpu_for_ord, pin_current};
 use autumn_common::metrics::{duration_to_ns, ns_to_ms};
 use autumn_rpc::manager_rpc::{self, rkyv_decode, rkyv_encode, MgrRange as Range};
 use autumn_rpc::partition_rpc::{self, SstLocation, TableLocations, *};
@@ -4688,8 +4688,11 @@ impl PartitionServer {
         let join = std::thread::Builder::new()
             .name(format!("part-{part_id}"))
             .spawn(move || {
+                if let Err(e) = pin_current(cpu_log) {
+                    let _ = ready_tx.send(Err(anyhow!("P-log CPU affinity: {e}")));
+                    return;
+                }
                 let rt = compio::runtime::RuntimeBuilder::new()
-                    .thread_affinity(affinity_set(cpu_log))
                     .build()
                     .expect("create compio runtime");
                 tracing::info!(part_id, cpu_log = ?cpu_log, cpu_bulk = ?cpu_bulk, "P-log thread runtime ready");
@@ -4730,15 +4733,15 @@ impl PartitionServer {
             })
             .context("spawn partition thread")?;
 
-        // Wait for the partition thread to bind its listener and register
-        // with the manager. If either step fails, bubble the error up so
+        // Wait for the partition thread to pin itself, bind its listener and
+        // register with the manager. If any step fails, bubble the error up so
         // `sync_regions_once` reports the failure (operator-visible; no
         // silent skip).
         let actual_advertise = match ready_rx.await {
             Ok(Ok(addr)) => addr,
             Ok(Err(e)) => {
                 return Err(e.context(format!(
-                    "partition {part_id} failed to bind listener on {listen_addr} or register addr"
+                    "partition {part_id} failed to pin its thread, bind listener on {listen_addr} or register addr"
                 )));
             }
             Err(_canceled) => {
@@ -10738,10 +10741,7 @@ fn spawn_sst_thread(
                 let _ = ready_tx.send(Err(anyhow!("P-sst CPU affinity: {e}")));
                 return;
             }
-            let rt = match compio::runtime::RuntimeBuilder::new()
-                .thread_affinity(affinity_set(cpu))
-                .build()
-            {
+            let rt = match compio::runtime::RuntimeBuilder::new().build() {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::error!(part_id, error = %e, "bulk thread runtime init failed");

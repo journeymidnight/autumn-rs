@@ -3198,6 +3198,28 @@ taskset -pc <tid>
 lscpu | grep 'NUMA node[0-9]'; cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list
 ```
 
+**Where `taskset` on the launcher lands things.** The children inherit its mask.
+The auto layout (no `AUTUMN_*_CPUSET`) is carved out of that mask: `taskset -c
+60-95 cluster.sh start 3` puts the ENs on 60, 61, 62… and the PS after them.
+`start-node`/`restart-node`/`start-ps` reuse those cores from the snapshot;
+`start`/`restart`/`reset` lay the cluster out afresh from the mask of the shell
+that runs them, so wrap those in the same `taskset`. Explicit
+`AUTUMN_EN{i}_CPUSET` / `AUTUMN_PS_CPUSET` are used as given, even outside the
+mask: the work-unit threads (EN shards, P-log, P-sst) `sched_setaffinity` there,
+while everything unpinned — main and accept threads, the manager, etcd — stays on
+the launcher's cores. So with an explicit layout, do not wrap the launcher. A
+core outside the process's cgroup stops the EN (and keeps that PS partition from
+opening). Check after every start that the threads really are where the layout
+says:
+
+```bash
+for p in $(pgrep -x autumn-extent-n; pgrep -x autumn-ps); do
+  for t in /proc/$p/task/*; do echo "$p $(cat $t/comm) $(awk '/Cpus_allowed_list/{print $2}' $t/status)"; done
+done | grep -E ' (extent-shard-[0-9]+|autumn-extent-n|part-[0-9]+(-sst)?) '
+# autumn-extent-n is pinned only in a single-shard EN (its runtime is the main
+# thread); listener-part-* and other helper threads are not pinned.
+```
+
 Then hand `cluster.sh` an explicit layout on the quiet node (EN cpuset length
 must equal `AUTUMN_EXTENT_SHARDS`; the PS needs ≥ 2 cores per partition; ranges
 may be comma lists). The layout that worked on 2026-09-25 with sglang pinned to

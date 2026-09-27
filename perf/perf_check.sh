@@ -324,10 +324,10 @@ start_cluster_for() {
         # fix: default to AUTUMN_EXTENT_SHARDS=4 so each EN process has 4
         # cores serving extent traffic (single-shard mode put all 3-replica
         # writes through 3 cores total — EN became the wall at >100k ops/s).
-        # Caller can override via env. With our current cpu-start formula
-        # (EN_i: (i-1)*SHARDS, PS: REPLICAS*SHARDS) 4 shards × 3 replicas = 12
-        # EN cores then PS partitions take 2N cores after — fits any
-        # reasonably-sized host's cpuset.
+        # Caller can override via env. cluster.sh's auto layout slices the
+        # launcher's allowed cores (EN_i from index (i-1)*SHARDS, PS from
+        # REPLICAS*SHARDS): 4 shards × 3 replicas = 12 EN cores, then the PS
+        # takes 2N cores after — fits any reasonably-sized host's cpuset.
         # --3disk: spread the 3 replicas across /data03, /data05, /data08
         # (three independent NVMes) instead of one disk → fsync work
         # parallelises across hardware. Without this flag, all 3 replicas

@@ -41,6 +41,26 @@ TRANSPORT="${AUTUMN_TRANSPORT:-tcp}"
 # address helpers
 # ---------------------------------------------------------------------------
 
+# first_allowed_cpus N — the first N cores this container may run on, as a
+# comma list. The EN pins each shard with sched_setaffinity and REFUSES to start
+# on a core outside its cgroup cpuset, so the default cannot be host cores 0..N-1:
+# under the kubelet's static CPU manager a pod's cores are whatever it was
+# granted (e.g. 12-15). Without the static policy every host core is allowed and
+# this yields 0..N-1, as before.
+first_allowed_cpus() {
+    local n="$1" list seg lo hi c
+    local -a cores=()
+    list="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+    for seg in ${list//,/ }; do
+        lo="${seg%-*}"; hi="${seg#*-}"
+        for (( c = lo; c <= hi; c++ )); do cores+=("$c"); done
+    done
+    (( ${#cores[@]} >= n )) \
+        || die "AUTUMN_EXTENT_SHARDS=$n but this container may only run on ${#cores[@]} cores ($list)"
+    local IFS=,
+    echo "${cores[*]:0:n}"
+}
+
 # Wrap bare IPv6 literals in brackets so "host:port" strings survive
 # SocketAddr::parse on the Rust side.
 bracket_host() {
@@ -181,9 +201,7 @@ run_extent_node() {
     [[ "$shards" =~ ^[0-9]+$ && "$shards" -ge 1 ]] \
         || die "AUTUMN_EXTENT_SHARDS must be a positive integer"
     local cpuset="${AUTUMN_EXTENT_CPUSET:-}"
-    if [[ -z "$cpuset" ]]; then
-        (( shards == 1 )) && cpuset="0" || cpuset="0-$((shards - 1))"
-    fi
+    [[ -n "$cpuset" ]] || cpuset="$(first_allowed_cpus "$shards")"
 
     wait_for_manager "$mgr"
 
@@ -213,9 +231,9 @@ run_extent_node() {
         # M1a: self-register the live location + shard ports at
         # every startup — required now that `format` no longer stamps one.
         --advertise "${adv}:${port}"
-        # Shard count == cpuset length (EN). Default cpuset "0" = single
-        # shard; AUTUMN_EXTENT_SHARDS=N gives cores 0..N-1. See the sharding
-        # block above and docs/k8s_deploy.md "Multi-shard extent nodes".
+        # Shard count == cpuset length (EN). Default: the container's first
+        # AUTUMN_EXTENT_SHARDS allowed cores (first_allowed_cpus). See the
+        # sharding block above and docs/k8s_deploy.md "Multi-shard extent nodes".
         --cpuset "$cpuset"
     )
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9601)

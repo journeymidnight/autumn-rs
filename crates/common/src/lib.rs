@@ -6,8 +6,7 @@ pub mod metrics_http;
 pub mod store;
 
 pub use cpu_pin::{
-    affinity_set, cpuset_explicit, cpuset_len, parse_cpuset, pick_cpu_for_ord, set_cpu_offset,
-    set_cpuset,
+    cpuset_explicit, cpuset_len, parse_cpuset, pick_cpu_for_ord, set_cpu_offset, set_cpuset,
 };
 pub use error::{AppError, AppResult};
 pub use store::is_owner_epoch_fence_message;

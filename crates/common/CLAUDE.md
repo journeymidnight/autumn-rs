@@ -8,11 +8,20 @@ Shared utilities, metadata store, and error types. Used by `autumn-manager` (sto
 
 ### CPU affinity for child runtimes
 
-`pin_current` sets the requested CPU directly before runtime construction. A
-P-sst thread spawned by a pinned P-log inherits that single-core mask; compio
-0.18 intersects requested CPUs with the inherited mask and otherwise silently
-leaves P-sst on P-log's CPU. The direct set still respects OS/cgroup limits. A
-Linux regression spawns from CPU A and verifies the child actually runs on B.
+Every work-unit thread (P-log, P-sst, each EN shard, the single-shard EN's
+main thread) calls `pin_current` before building its runtime. Nothing pins
+through compio's `RuntimeBuilder::thread_affinity`: compio intersects the
+requested CPUs with the mask the thread inherited and binds nothing when they
+are disjoint, with no error. A thread spawned by a pinned parent (P-sst under
+P-log) inherits one CPU, and a process started as `taskset -c A,B` inherits
+A,B — so a whole cluster launched that way ran on two cores while every thread
+logged its `--cpuset` core (write throughput 500-560 MiB/s against 2.7 GiB/s
+pinned correctly, same box). `pin_current` is `sched_setaffinity`: it moves the
+thread anywhere the cgroup/cpuset allows, and a core outside that is a startup
+error, never a skip. A Linux unit test spawns from CPU A and checks the child
+reaches B; `crates/server/tests/cpuset_pinning.rs` starts the real EN (multi-
+and single-shard) and PS binaries under `taskset -c <launcher>` and reads every
+thread's `Cpus_allowed_list` back.
 
 Auto-detection pins only where the OS can bind a thread to a core (Linux,
 Android, Windows, FreeBSD). macOS has affinity hints only: `get_core_ids`

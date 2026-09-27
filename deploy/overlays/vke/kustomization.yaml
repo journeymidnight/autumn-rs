@@ -127,7 +127,7 @@ patches:
       # F-EN-DYNSHARD M2: the EN self-registers all 4 shard ports at startup and
       # the manager/PS dial the pod IP directly — no per-pod Service port list to
       # keep in lockstep anymore (the old 8-port patch is gone). Just set the
-      # shard count; the entrypoint sizes the cpuset to 0-3.
+      # shard count; the entrypoint pins them to the pod's first 4 allowed cores.
       - op: add
         path: /data/AUTUMN_EXTENT_SHARDS
         value: "4"

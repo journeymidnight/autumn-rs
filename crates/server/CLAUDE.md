@@ -41,6 +41,11 @@ autumn-extent-node --data DIR[,DIR2,...] [--port 9101] [--manager 127.0.0.1:9001
 - `--data`: directory holding extent files (`extent-{id}.dat` + `extent-{id}.meta`); comma-separated or repeated for a multi-disk EN.
 - `--advertise HOST:PORT` is **REQUIRED whenever `--manager` is given** (`main()` bails otherwise) — a `--manager` run that self-registered nothing would sit at an empty location forever. HOST must be an IP (DNS-free); PORT must equal `--port`. `--manager`-less offline/test runs are exempt.
 - **Self-registration**: at startup (after cluster-id verification, before serving) the EN registers its live address + shard ports with the manager, keyed by its stable `node_uuid`. The manager updates the location IN PLACE, so a reshard or fresh pod IP is picked up on the next boot — the **EN, not `format`, is the sole source of location**. `handle_df` echoes the identity so `node_health_loop` self-heals drift.
+- **Pinning**: each shard thread (the main thread when there is one shard)
+  `sched_setaffinity`s to its `--cpuset` core before building its runtime, and a
+  core outside the process's cgroup/cpuset stops the EN at startup. It used to go
+  through compio's `thread_affinity`, which silently kept the launcher's mask
+  (`crates/common/CLAUDE.md`); `tests/cpuset_pinning.rs` covers EN and PS.
 - **Static shard ports**: shard count = the `--cpuset` / `--cpu-start` core count; sibling shard *i* listens on `port + i * shard_stride` (`--shard-stride`, default 10). Control ports default to `port + 1000` (override `--control-port`).
 - **Requires pre-formatting**: each `--data` dir MUST be formatted by `autumn-op format` first — the EN refuses to start without the sentinel files (`cluster_id`, `disk_uuid`, `node_id`, `disk_id`, `node_uuid`). It cross-checks each dir's `cluster_id`, then fetches the manager's via `MSG_GET_CLUSTER_ID` and refuses on mismatch. `disk_id` comes from the sentinel; `--disk-id` and `--shards` are migration-error stubs (exit 2).
 

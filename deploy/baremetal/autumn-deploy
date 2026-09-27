@@ -539,12 +539,24 @@ _format_and_start_ens() {
         on_host "$host" "mkdir -p $dirs_sp"
         log "format en$i ($host:$port, dirs=$dirs)"
         on_host "$host" "'$BIN_DIR/autumn-op' --manager '$MANAGER_FIRST' --transport '$TRANSPORT' format $dirs_sp"
+        # One shard, pinned to AUTUMN_EXTENT_CPUSET or else the host's first
+        # allowed core. Not a hardcoded 0: the EN refuses a --cpuset core
+        # outside its cgroup (a container without core 0 would never start).
+        # macOS has no /proc and cannot pin: no --cpuset there, which is one
+        # unpinned shard. The probe runs in the ssh session; a systemd EN runs
+        # in system.slice, so this assumes the slices are not given disjoint
+        # AllowedCPUs (if they are, set AUTUMN_EXTENT_CPUSET; a wrong core
+        # fails the unit loudly at startup).
+        local cpu="${AUTUMN_EXTENT_CPUSET:-}"
+        [[ -n "$cpu" ]] || cpu="$(on_host "$host" "awk '/^Cpus_allowed_list:/ {split(\$2, a, /[,-]/); print a[1]}' /proc/self/status 2>/dev/null || true")"
+        local -a cpu_args=()
+        [[ -n "$cpu" ]] && cpu_args=(--cpuset "$cpu")
         # F-EN-DYNSHARD M1a: --advertise is now REQUIRED with --manager — the
         # EN self-registers its live address + shard ports at every startup.
         svc_start "$host" "en$i" "$DATA_ROOT" "$BIN_DIR/autumn-extent-node" \
             --port "$port" --data "$dirs" --manager "$MANAGER_FIRST" \
             --listen "$ph" --advertise "$(bracket_ip_static "$host"):$port" \
-            --transport "$TRANSPORT" --cpuset "${AUTUMN_EXTENT_CPUSET:-0}"
+            --transport "$TRANSPORT" ${cpu_args[@]:+"${cpu_args[@]}"}
     done
     sleep 3
 }
