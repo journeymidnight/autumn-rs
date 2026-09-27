@@ -578,16 +578,23 @@ generation from the PS and keeps them only if it is the one seen last time. So a
 second load of the same weights is served from memory, and `MAP_SHARED` mmaps
 (Python's `mmap.mmap(fd, 0)`) work.
 
-**`--readahead-kb` (default 4096)** sets the mount's page-cache readahead
+**`--readahead-kb` (default 2048)** sets the mount's page-cache readahead
 window (`/sys/class/bdi/<dev>/read_ahead_kb`, written on the first open — FUSE
 INIT can only lower it, and the kernel re-applies INIT's value when it answers).
-An mmap loader (safetensors `load_file`) waits for one window per page fault, so
-on a network path the window is its throughput: measured at 4 ms per read,
-128 KiB gave 108 MiB/s, 4 MiB 823 MiB/s. Check it after mounting:
+An mmap loader (safetensors `load_file`) has about one window in flight per
+faulting thread, so on a network path the window is most of its throughput.
+Measured at 4 ms per read: a loader pinned to one core got 108 MiB/s at 128 KiB,
+720-740 at 2 MiB and 823 at 4 MiB; the same loader on nine cores got 1095-1334
+at 2 MiB but only 124-188 at 4 MiB — the daemon received the same bytes as ~10x
+as many ~36 KiB READs (why they fragment is not established). Bigger is not
+safer, and 2 MiB is not proven safe for every model: if a load is far slower
+than expected, compare the daemon's READ count against the file size. With no
+network latency 2 MiB costs 12-22% on nine cores against 128 KiB-1 MiB. Check
+it after mounting:
 
 ```bash
 cat /sys/class/bdi/$(awk '$5=="/mnt/autumn"{print $3}' /proc/self/mountinfo)/read_ahead_kb
-# 4096 once anything has been opened (128 before the first open)
+# 2048 once anything has been opened (128 before the first open)
 ```
 
 The mount fails to start if the sysfs file cannot be opened (a read-only `/sys`
@@ -2390,9 +2397,12 @@ dd if=/mnt/autumn-ra/<file> of=/dev/null bs=64K count=200 iflag=direct   # ~4 ms
 Then, per window: `echo <kb> > /sys/class/bdi/<dev>/read_ahead_kb`, evict the
 file (`os.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)`), and time
 `safetensors.torch.load_file` plus a copy of every tensor (`load_file` alone is
-lazy — it maps, and reads nothing until a tensor is touched). Expect at 1 ms
-one-way: 128 KiB ≈ 108 MiB/s, 4 MiB ≈ 820 MiB/s; a second load without evicting
-≈ 1.7 GiB/s with the daemon reading nothing. Remove with `tc qdisc del`,
+lazy — it maps, and reads nothing until a tensor is touched). Run it both with
+the loader pinned to one core (`taskset -c N`) and on several: torch copies with
+several threads, and the two want different windows. Expect at 1 ms one-way,
+one core: 128 KiB ≈ 108 MiB/s, 2 MiB ≈ 720-740; nine cores: 2 MiB ≈ 1100-1330,
+4 MiB collapses to ~150 (the daemon then sees ~10x more, ~36 KiB READs); a second
+load without evicting reads nothing through the daemon. Remove with `tc qdisc del`,
 `ip netns del autumnra`.
 
 ### Kernel cache invalidation must not wedge a mount (`fuse_inval_deadlock.sh`)

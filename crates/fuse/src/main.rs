@@ -102,11 +102,18 @@ struct Args {
     /// Readahead window of the mount, in KiB, written to the mount's
     /// `/sys/class/bdi/<dev>/read_ahead_kb` once it is mounted (FUSE INIT can
     /// only lower the kernel's 128 KiB default). An mmap page fault reads this
-    /// window around the faulting page and waits for it, so an mmap loader
-    /// (safetensors) gets about one window per round trip. Set on the first
-    /// open (INIT would overwrite an earlier write); a mount that cannot open
-    /// the sysfs file fails. `0` leaves the kernel default alone.
-    #[arg(long, default_value_t = 4096)]
+    /// window around the faulting page, so it bounds how much a faulting thread
+    /// has in flight; on a high-latency path it is most of what an mmap loader
+    /// (safetensors) gets. Set on the first open (INIT would overwrite an
+    /// earlier write); a mount that cannot open the sysfs file fails. `0`
+    /// leaves the kernel default alone.
+    ///
+    /// 2048, not larger: with the loader on nine cores, a 4 MiB window measured
+    /// 124-188 MiB/s at 4 ms per read — the daemon got the same bytes in ~10x
+    /// as many, ~36 KiB READs — where 2 MiB gave 1095-1334. Why the READs
+    /// fragment is not established (`crates/fuse/CLAUDE.md`). A single-threaded
+    /// loader does ~11% better at 4 MiB; the collapse is the worse risk.
+    #[arg(long, default_value_t = 2048)]
     readahead_kb: u32,
 }
 

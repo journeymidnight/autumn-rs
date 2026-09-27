@@ -3,9 +3,9 @@
 //! FUSE INIT can only lower readahead below the kernel's bdi default (128 KiB),
 //! so the one way to raise it is `/sys/class/bdi/<major:minor>/read_ahead_kb`
 //! of the mount's anonymous device. A page fault on an mmap reads this window
-//! around the faulting page, synchronously, one fault at a time — so on a
-//! high-latency path the window, not the mount's bandwidth, sets what an
-//! mmap loader (safetensors) gets.
+//! around the faulting page, so it bounds what each faulting thread has in
+//! flight — on a high-latency path the window, not the mount's bandwidth, is
+//! most of what an mmap loader (safetensors) gets.
 //!
 //! WHEN matters: the kernel applies the INIT reply as `min(bdi, negotiated)`,
 //! overwriting anything written to sysfs before INIT was answered — measured,

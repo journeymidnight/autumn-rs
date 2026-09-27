@@ -124,7 +124,7 @@ cp model.safetensors /mnt/autumn/        # a regular filesystem, backed by the c
 
 Reads go through the kernel page cache and stay cached across opens until the
 file changes, so a second load of the same weights comes from memory, and mmap
-loaders (`safetensors.torch.load_file`) get a 4 MiB readahead window per page
+loaders (`safetensors.torch.load_file`) get a 2 MiB readahead window per page
 fault (`--readahead-kb`).
 
 Full runbook (mount verification, stale-mount cleanup, RDMA env, k8s

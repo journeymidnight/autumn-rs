@@ -1,3 +1,11 @@
+Date: 2026-09-27 (8)
+TaskStatus: completed
+Task scope: user "改" — the fuse mount's default kernel readahead window (--readahead-kb) 4096 -> 2048. Supersedes the "default 4096 / picked 4 MiB" in entry (7).
+Current summary: the 4 MiB default was picked with the safetensors loader pinned to one core. With the loader on nine cores, 4 MiB collapsed at 4 ms per read to 124-188 MiB/s (the daemon got the same 1930 MiB as 52-63k READs instead of ~5k); 2 MiB gave 1095-1334. Cost of 2 MiB stated in the docs: one core 720-740 vs 823 at 4 MiB (1 ms), 515-517 vs 705 at 16 MiB (2 ms); zero latency nine cores 1727-1762 vs 1979-2213 at 1 MiB/128 KiB. Why READs fragment is a guess, marked as such. Also defined F-FUSE-DAEMON-PREFETCH in feature_list.md (next task).
+Verification: new binary without the flag -> read_ahead_kb 2048 after the first open; 1 ms one-way single core 720/739, nine cores 1265/1095 MiB/s. Review (opus, independent): no code issue; doc findings applied (mechanism marked unverified, single-core cost stated, ranges widened, one-thread model removed, 0 ms cells measured).
+Main gaps: 2 MiB is not proven collapse-free for other models; max_background not re-measured at 2 MiB.
+Next steps: F-FUSE-DAEMON-PREFETCH.
+
 Date: 2026-09-27 (7)
 TaskStatus: completed
 Task scope: user — mmap loaders (safetensors load_file) are slow on the fuse mount; use the kernel page cache fully (FOPEN_KEEP_CACHE, updates while open come from lease invalidations) and raise readahead.
