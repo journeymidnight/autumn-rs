@@ -767,13 +767,13 @@ record, because fuser drops a release error before it reaches `close()`.
 
 ## Cluster capacity — `autumn-op df`
 
-Ceph-`ceph df`-style aggregate capacity. RAW + autumn `physical_used` are summed
-from every extent node's `df` report (each EN self-reports the REAL on-disk byte
-count of its extents — replicas, EC shards, open tails — no amplification
-formula); `STORED(sealed)` is the manager's de-amplified Σ distinct
+Ceph-`ceph df`-style aggregate capacity. RAW and autumn `physical_used` are
+summed from every extent node's `df` report. RAW total/free are statvfs capacity
+truth; `physical_used` is the diagnostic sum of extent file lengths (replicas,
+EC shards and open tails). `STORED(sealed)` is the manager's de-amplified Σ distinct
 `sealed_length`. Because EC makes usable LOGICAL capacity a RANGE (cold EC
-1.25–1.33× vs hot 3-replica), `df` shows the empirical `AMPLIFICATION`
-(`physical_used / stored`) plus the writable estimate as a range
+1.25–1.33× vs hot 3-replica), `df` shows raw-capacity `AMPLIFICATION`
+(`raw used / logical size`) plus the writable estimate as a range
 `[raw_free/3 .. raw_free/best_ec]`:
 
 ```bash
@@ -789,17 +789,20 @@ The same snapshot backs FUSE `statfs`: `df -h <mountpoint>` reflects real
 backend capacity (conservatively, at the 3-replica factor) instead of a fixed
 placeholder.
 
-### Amplification in `df` = physical / footprint, not physical / sealed
+### Amplification in `df` = raw used / logical extent size
 
-`amplification` = `physical_used / (logical_stored_sealed + logical_open_tail)`
-≈ the real replication/EC factor (~3× for 3-replica, lower with EC). The
-denominator MUST include `logical_open_tail`: `physical_used` counts the
-open-tail bytes (largely LIVE large-value / VP data in the open log tail — the
-SST only holds pointers), so dividing by sealed-only inflates amp ~15× (a
-3-replica cluster read 45× when a partition's data lived in open tails). The
-human `df` prints the breakdown `logical: sealed=… + open_tail=… = footprint …`.
-A high `amp` (>> replication factor) now genuinely means an EC/replication issue,
-not just un-sealed data.
+`amplification` = `(raw_total - raw_free) /
+(logical_stored_sealed + logical_open_tail)`. The numerator is the capacity
+actually consumed on the EN filesystems. The denominator is one de-amplified
+copy of every live extent: distinct sealed extent size plus committed open
+extent size. A 4+1-only layout is therefore about 1.25×, three replicas about
+3×, and a mixture should sit between them on dedicated EN filesystems.
+
+`physical_used` remains visible as `extent_files`: it sums EN-maintained file
+lengths and is useful for diagnosis, but sparse/punched-file accounting may
+diverge from statvfs capacity consumption, so it is not the amp numerator. A
+high raw amp can also include non-Autumn bytes when EN data directories share a
+filesystem with other workloads. The human `df` prints `sealed + open = size`.
 
 ### `amplification` far above the replication factor — the sealed-empty leak
 
@@ -1029,7 +1032,7 @@ Pick by workload:
 | **Small-value, high churn** (all values inline < 4 KiB, heavy overwrite/delete) | row_stream IS the data; dead SST bytes pile up | **lower to 1–4 GiB.** row_stream truncates far sooner; log_stream GC also gets finer-grained. Cost: more extents → more manager/etcd metadata + more append RPCs. |
 | **Mixed / unsure** | — | leave the 16 GiB default; only lower if `autumn-op df` amplification or a partition's `info --part` shows row_stream disk held well above its live size for a sustained period. |
 
-How to see whether it's biting you: `autumn-op df` reports the physical/logical
+How to see whether it's biting you: `autumn-op df` reports raw-capacity/logical-size
 amplification; a single partition's held-vs-live gap shows in `autumn-op info
 --part <ID>` (live size probes the EN). If a small-value partition's on-disk
 row_stream sits far above its live SST bytes and stays there across several

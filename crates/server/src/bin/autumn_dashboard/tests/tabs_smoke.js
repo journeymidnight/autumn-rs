@@ -47,7 +47,8 @@ const OVERVIEW = {
   errors: [],
   df: {
     raw_total: 7558601064448, raw_used: 6866850758656, raw_free: 691750305792,
-    physical_used: 4096, logical_footprint: 2048, logical_wal_debt: 512,
+    physical_used: 4096, logical_size: 3433425379328, logical_footprint: 3433425379328,
+    logical_wal_debt: 512,
     amplification: 2.0, node_count_online: 1,
     per_node: [{ node_id: 1, total: 7558601064448, free: 691750305792, extent_bytes: 4096, online: true, disks: [disk(2), disk(3)] }],
   },
@@ -171,6 +172,8 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   want("#ov_fleet", "disk", "the fleet panel counts disks");
   want("#ov_fleet", "faulted", "…and surfaces the faulted one");
   want("#ov_space", "raw used", "the space panel reports capacity");
+  want("#ov_space", "raw amplification", "the ratio names its raw-capacity numerator");
+  want("#ov_space", "logical extent size", "the denominator is named explicitly");
   // Partitions: the precondition warning, before the Split button is clicked.
   want("#drawer", "Split is refused until a major compaction", "an overlapping partition warns BEFORE the click");
   want("#drawer", "Extents", "…and still shows the extents");

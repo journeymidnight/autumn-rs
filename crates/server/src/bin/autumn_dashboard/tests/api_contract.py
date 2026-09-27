@@ -129,6 +129,11 @@ def run():
                 return v if v.get('ps_servers') and v.get('partitions') and v['ps_servers'][0]['partition_count'] > 0 else None
             v = eventually(overview_ready)
             assert not v.get('errors'), v.get('errors')
+            capacity = v['df']
+            logical = capacity['logical_stored_sealed'] + capacity['logical_open_tail']
+            assert capacity['logical_size'] == logical
+            expected_amp = capacity['raw_used'] / logical if logical else 0
+            assert abs(capacity['amplification'] - expected_amp) < 1e-12
             server = v['ps_servers'][0]
             assert {'ps_id','addr','last_heartbeat_secs_ago','partition_count','n','size','req_per_sec','write_bytes_per_sec','read_bytes_per_sec','total_extents'} <= server.keys()
             assert server['last_heartbeat_secs_ago'] is not None and server['last_heartbeat_secs_ago'] < 60

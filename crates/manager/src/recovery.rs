@@ -41,6 +41,16 @@ fn ec_accept_started_new(message: &str) -> bool {
 /// un-reclaimable garbage.
 const EC_ABANDON_AFTER_CONSECUTIVE_FAILURES: u32 = 24;
 
+/// The manager-side contribution to logical size. Open extent length comes
+/// from the PS commit-length probe, never from `sealed_length`.
+fn sealed_extent_logical_size(sealed: bool, sealed_length: u64) -> u64 {
+    if sealed {
+        sealed_length
+    } else {
+        0
+    }
+}
+
 /// Why a coordinator's `ec_done` report may not be applied to the live marker.
 /// Applying the wrong one flips the layout onto targets that hold no shards,
 /// after which cleanup deletes the last full replicas — so every rejection here
@@ -1915,9 +1925,9 @@ impl crate::AutumnManager {
                 s.nodes.clone()
             };
 
-            // cluster-df: accumulate this tick's RAW + physical-used snapshot
-            // (the EN self-reports its real per-disk extent_bytes; manager
-            // only sums — no amplification formula, no extent scan here).
+            // cluster-df: accumulate this tick's RAW + extent-file snapshot.
+            // RAW is statvfs capacity truth. The EN also reports per-disk
+            // extent file lengths for diagnosis; manager only sums them.
             let mut cdf_raw_total = 0u64;
             let mut cdf_raw_free = 0u64;
             let mut cdf_physical_used = 0u64;
@@ -2087,8 +2097,8 @@ impl crate::AutumnManager {
                 self.node_max_free
                     .borrow_mut()
                     .insert(node.node_id, max_free);
-                // cluster-df: sum this node's ONLINE-disk capacity + real
-                // extent footprint (excludes offline disks — unusable space).
+                // cluster-df: sum this node's ONLINE-disk capacity + diagnostic
+                // extent file lengths (excludes offline disks — unusable space).
                 let mut n_total = 0u64;
                 let mut n_free = 0u64;
                 let mut n_ext = 0u64;
@@ -2269,7 +2279,14 @@ impl crate::AutumnManager {
                     for id in &logical_cycle_ids[logical_cursor..end] {
                         if let Some(ex) = s.extents.get(id) {
                             if ex.refs != 0 || ex.vp_table_refs != 0 {
-                                logical_partial = logical_partial.saturating_add(ex.sealed_length);
+                                // The logical scan owns SEALED extents. OPEN
+                                // extents are measured by the PS commit-length
+                                // probe below; keeping the state gate explicit
+                                // prevents a stale/non-zero open sealed_length
+                                // from being counted twice.
+                                logical_partial = logical_partial.saturating_add(
+                                    sealed_extent_logical_size(ex.sealed, ex.sealed_length),
+                                );
                                 // Slot counts for placement, on the same pass
                                 // and the same liveness predicate. An extent
                                 // already at refs 0 is on its way out; counting
@@ -2300,11 +2317,10 @@ impl crate::AutumnManager {
                     *self.node_slot_counts.borrow_mut() = std::mem::take(&mut slots_partial);
                 }
             }
-            // Σ latest PS-reported open-tail committed bytes
-            // across partitions (cheap — one back()-of-window read per
-            // partition). physical_used INCLUDES these bytes, so the amp
-            // denominator adds them to the sealed logical scan. Open tails are
-            // refs=1 partition-private → simple sum, no CoW dedup.
+            // Σ latest PS-reported open-tail committed bytes across partitions
+            // (cheap — one back()-of-window read per partition). Added to the
+            // sealed scan to form logical extent size. Open tails are refs=1
+            // partition-private → simple sum, no CoW dedup.
             let logical_open_tail: u64 = {
                 let pol = self.policy.borrow();
                 pol.metrics
@@ -3430,6 +3446,17 @@ mod ec_done_attempt_tests {
             classify_ec_done(&marker(5), 400, COORD, &done(5, 0)),
             Err(EcDoneRejection::DifferentAttempt)
         );
+    }
+}
+
+#[cfg(test)]
+mod logical_capacity_tests {
+    use super::sealed_extent_logical_size;
+
+    #[test]
+    fn sealed_scan_never_counts_an_open_extent_length() {
+        assert_eq!(sealed_extent_logical_size(true, 4_096), 4_096);
+        assert_eq!(sealed_extent_logical_size(false, 4_096), 0);
     }
 }
 

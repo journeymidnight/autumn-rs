@@ -15,6 +15,22 @@ use autumn_rpc::manager_rpc::{
 };
 use serde_json::json;
 
+/// Raw-capacity amplification: bytes consumed on the EN filesystems divided by
+/// the de-amplified extent payload size. `logical_size` is the sum of distinct
+/// sealed extent sizes plus committed open extent sizes.
+///
+/// `physical_used` is kept as a diagnostic field, but it is not this ratio's
+/// numerator: it is an EN-maintained sum of extent file lengths and can diverge
+/// from statvfs capacity consumption (sparse/punched files and filesystem
+/// allocation are the important examples).
+pub fn raw_capacity_amplification(raw_used: u64, logical_size: u64) -> f64 {
+    if logical_size == 0 {
+        0.0
+    } else {
+        raw_used as f64 / logical_size as f64
+    }
+}
+
 use crate::auto_policy::{cooldown_key, describe_candidate, policy_kind_str};
 
 /// Node auto-state byte → the string the page shows.
@@ -93,14 +109,12 @@ pub fn build_overview_json(
         errors.push(format!("overview: {}", ov.message));
     }
 
-    // Empirical amplification = physical / logical FOOTPRINT (sealed + open-tail).
-    let logical_footprint = df.logical_stored.saturating_add(df.logical_open_tail);
-    let amp = if logical_footprint > 0 {
-        df.physical_used as f64 / logical_footprint as f64
-    } else {
-        0.0
-    };
     let raw_used = df.raw_total.saturating_sub(df.raw_free);
+    // User-visible amplification is raw filesystem capacity consumed per one
+    // logical extent byte. Logical size = sealed extents + committed open
+    // extents, each de-amplified. A 4+1-only cluster is ~1.25x; RF3 is ~3x.
+    let logical_size = df.logical_stored.saturating_add(df.logical_open_tail);
+    let amp = raw_capacity_amplification(raw_used, logical_size);
     let disks_json = |n: &NodeCapWire| -> Vec<serde_json::Value> {
         n.disks
             .iter()
@@ -139,10 +153,12 @@ pub fn build_overview_json(
         "physical_used": df.physical_used,
         "logical_stored_sealed": df.logical_stored,
         "logical_open_tail": df.logical_open_tail,
-        "logical_footprint": logical_footprint,
+        "logical_size": logical_size,
+        // Kept for dashboard API compatibility; same value and definition.
+        "logical_footprint": logical_size,
         "logical_wal_debt": df.logical_wal_debt,
-        "wal_debt_ratio": if logical_footprint > 0 {
-            df.logical_wal_debt as f64 / logical_footprint as f64
+        "wal_debt_ratio": if logical_size > 0 {
+            df.logical_wal_debt as f64 / logical_size as f64
         } else {
             0.0
         },
@@ -292,4 +308,66 @@ pub fn build_overview_json(
         "errors": errors,
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::{build_overview_json, raw_capacity_amplification};
+    use autumn_rpc::manager_rpc::{
+        ClusterDfResp, GetClusterOverviewResp, ListNodeStatesResp, CODE_OK,
+    };
+
+    #[test]
+    fn raw_amplification_matches_ec_replication_and_mixed_layouts() {
+        assert_eq!(raw_capacity_amplification(5, 4), 1.25, "4+1 EC");
+        assert_eq!(raw_capacity_amplification(3, 1), 3.0, "three replicas");
+        assert_eq!(raw_capacity_amplification(17, 8), 2.125, "mixed layout");
+        assert_eq!(
+            raw_capacity_amplification(123, 0),
+            0.0,
+            "empty logical size is n/a"
+        );
+    }
+
+    /// Regression for the dashboard's impossible 0.35x: `physical_used` was
+    /// 350 against logical 1000 even though statvfs said raw used was 1250.
+    /// Restoring the old numerator makes this assertion read 0.35, not 1.25.
+    #[test]
+    fn overview_uses_raw_used_not_extent_file_lengths() {
+        let df = ClusterDfResp {
+            code: CODE_OK,
+            message: String::new(),
+            raw_total: 2_000,
+            raw_free: 750,
+            physical_used: 350,
+            logical_stored: 900,
+            logical_open_tail: 100,
+            logical_wal_debt: 0,
+            node_count: 5,
+            last_update_ms: 0,
+            logical_last_update_ms: 0,
+            per_node: Vec::new(),
+        };
+        let overview = GetClusterOverviewResp {
+            code: CODE_OK,
+            message: String::new(),
+            partitions: Vec::new(),
+            nodes: Vec::new(),
+            total_req_per_sec: 0,
+            total_write_bytes_per_sec: 0,
+            total_read_bytes_per_sec: 0,
+            ps_count: 0,
+            ps_servers: Vec::new(),
+        };
+        let states = ListNodeStatesResp {
+            code: CODE_OK,
+            message: String::new(),
+            nodes: Vec::new(),
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&build_overview_json(&df, overview, &states, &[], 0)).unwrap();
+        assert_eq!(value["df"]["raw_used"], 1_250);
+        assert_eq!(value["df"]["logical_size"], 1_000);
+        assert_eq!(value["df"]["amplification"], 1.25);
+    }
 }

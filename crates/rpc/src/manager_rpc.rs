@@ -193,7 +193,7 @@ pub const MSG_REPORT_CORRUPT_REPLICA: u8 = 0x4C;
 // physical-used come from summing each EN's `df` report (the EN is the data
 // owner; physical_used = Σ real extent file bytes, no amplification formula);
 // logical_stored is the manager's read-only Σ distinct sealed_length. The wire
-// carries only raw u64 facts — amplification factor / writable range / EC
+// carries only raw u64 facts — raw-used amplification / writable range / EC
 // shape are computed by the consumer (autumn-op df, fuse statfs), never sent
 // as floats. See docs / plan: cluster capacity is a RANGE under EC, so the
 // single point-estimate is left to the display layer.
@@ -1982,8 +1982,9 @@ pub struct NodeCapWire {
 }
 
 /// `MSG_CLUSTER_DF` response — raw u64 facts only; the consumer computes the
-/// amplification factor (`physical_used / logical_stored`) and the writable
-/// RANGE (`[raw_free/3, raw_free/best_ec_factor]`). No floats on the wire.
+/// amplification factor (`(raw_total - raw_free) / logical extent size`) and
+/// the writable RANGE (`[raw_free/3, raw_free/best_ec_factor]`). No floats on
+/// the wire.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct ClusterDfResp {
     pub code: u8,
@@ -1991,20 +1992,17 @@ pub struct ClusterDfResp {
     /// Σ all online disks' raw capacity / free (statvfs truth).
     pub raw_total: u64,
     pub raw_free: u64,
-    /// Σ all nodes' `extent_bytes` — exact autumn physical footprint
-    /// (replicas + EC shards + open tails, no amplification formula).
+    /// Σ all nodes' `extent_bytes` — extent file lengths
+    /// (replicas + EC shards + open tails). Diagnostic only: sparse/punched
+    /// files may differ from statvfs capacity consumption.
     pub physical_used: u64,
     /// Manager's read-only Σ distinct sealed_length (de-amplified, sealed-only).
     pub logical_stored: u64,
     /// Σ PS-reported open-tail committed bytes across all
     /// partitions (log + row + meta OPEN tails, one copy — open tails are
-    /// refs=1 partition-private, so no CoW dedup needed). physical_used
-    /// INCLUDES these bytes (they are largely LIVE large-value / VP data
-    /// sitting in the open log tail), so the amplification MUST use
-    /// `logical_stored + logical_open_tail` as the denominator — otherwise a
-    /// partition whose data lives in open tails inflates amp ~15× (physical
-    /// counts the open bytes, sealed-only logical drops them). 0 until the PS
-    /// reports (falls back to sealed-only).
+    /// refs=1 partition-private, so no CoW dedup needed). Together with
+    /// `logical_stored`, this is the logical-size denominator for raw-capacity
+    /// amplification. 0 until the PS reports (falls back to sealed-only).
     pub logical_open_tail: u64,
     /// Σ reclaimable DEAD bytes across all partitions — sealed
     /// (`PartitionLoad.gc_debt_bytes`) + open-tail

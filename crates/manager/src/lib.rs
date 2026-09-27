@@ -616,12 +616,12 @@ pub(crate) struct NodeCap {
 
 /// Cluster capacity snapshot. RAW + physical_used refreshed every tick from
 /// df; logical_stored from a periodic read-only scan. Display layer derives
-/// the amplification factor and the EC-dependent writable RANGE.
+/// raw-used/logical-size amplification and the EC-dependent writable RANGE.
 #[derive(Default, Clone)]
 pub(crate) struct ClusterCapSnapshot {
     pub raw_total: u64,
     pub raw_free: u64,
-    /// Σ all nodes' extent_bytes (exact physical footprint, no formula).
+    /// Σ all nodes' extent file lengths (diagnostic, no formula).
     pub physical_used: u64,
     /// Online EN count (df-reachable this tick) — bounds best EC shape.
     pub node_count: u64,
@@ -630,7 +630,7 @@ pub(crate) struct ClusterCapSnapshot {
     pub logical_stored: u64,
     /// Σ PS-reported open-tail committed bytes across
     /// partitions (one copy). Refreshed every tick from the policy load
-    /// window (cheap sum). The amp denominator is `logical_stored + this`.
+    /// window (cheap sum). Logical size is `logical_stored + this`.
     pub logical_open_tail: u64,
     /// Σ reclaimable dead bytes across partitions — sealed
     /// (`PartitionLoad.gc_debt_bytes`) + open-tail (`open_tail_dead_bytes`).

@@ -883,19 +883,15 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
 async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
     let r = client.cluster_df().await?;
     let raw_used = r.raw_total.saturating_sub(r.raw_free);
-    // Logical FOOTPRINT = sealed data + open-tail committed bytes (one copy).
-    // physical_used counts open-tail bytes (largely live VP/log data), so amp
-    // MUST divide by the footprint, not sealed-only — else an all-open-tail
-    // (VP/log-heavy) cluster shows a ~15× inflated amp.
-    let logical_footprint = r.logical_stored.saturating_add(r.logical_open_tail);
-    // Empirical replication/EC amplification (physical_used / logical
-    // footprint): the REAL current cold/hot mix. ~3× for 3-replica, lower with
-    // EC. n/a when nothing is stored yet.
-    let amp = if logical_footprint > 0 {
-        r.physical_used as f64 / logical_footprint as f64
-    } else {
-        0.0
-    };
+    // Logical size = distinct sealed extents + committed open extents (one
+    // copy). Amplification uses real raw filesystem capacity consumed, so a
+    // 4+1-only cluster is ~1.25x and RF3 is ~3x. `physical_used` remains a
+    // diagnostic sum of extent file lengths, not the capacity numerator.
+    let logical_size = r.logical_stored.saturating_add(r.logical_open_tail);
+    let amp = autumn_manager::dashboard_compose::raw_capacity_amplification(
+        raw_used,
+        logical_size,
+    );
     // Writable logical estimate is a RANGE under EC: best EC shape is
     // K = min(4, node_count-1) data shards + 1 parity → factor
     // (K+1)/K; worst is 3-replica. Point estimate uses the empirical
@@ -927,8 +923,8 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
     // gc_debt + open-tail dead bytes. Earlier, a log-heavy /
     // all-open-tail partition's open-tail debt was invisible (df only had
     // sealed gc_debt). physical_used carries these bytes until GC punches them.
-    let wal_debt_ratio = if logical_footprint > 0 {
-        r.logical_wal_debt as f64 / logical_footprint as f64
+    let wal_debt_ratio = if logical_size > 0 {
+        r.logical_wal_debt as f64 / logical_size as f64
     } else {
         0.0
     };
@@ -956,7 +952,8 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
                 "physical_used": r.physical_used,
                 "logical_stored_sealed": r.logical_stored,
                 "logical_open_tail": r.logical_open_tail,
-                "logical_footprint": logical_footprint,
+                "logical_size": logical_size,
+                "logical_footprint": logical_size,
                 "logical_wal_debt": r.logical_wal_debt,
                 "wal_debt_ratio": wal_debt_ratio,
                 "amplification": amp,
@@ -984,19 +981,19 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
             human_size(r.raw_free),
         );
         println!(
-            "AUTUMN:  phys_used={:<10} footprint={:<10} amplification={}",
+            "AUTUMN:  extent_files={:<10} logical_size={:<10} raw_amplification={}",
             human_size(r.physical_used),
-            human_size(logical_footprint),
+            human_size(logical_size),
             amp_str,
         );
         println!(
-            "         logical: sealed={} + open_tail={} = footprint {}",
+            "         logical: sealed={} + open={} = size {}",
             human_size(r.logical_stored),
             human_size(r.logical_open_tail),
-            human_size(logical_footprint),
+            human_size(logical_size),
         );
         println!(
-            "         WAL debt: {} dead ({:.1}% of footprint, GC-reclaimable; incl. open-tail)",
+            "         WAL debt: {} dead ({:.1}% of logical size, GC-reclaimable; incl. open)",
             human_size(r.logical_wal_debt),
             wal_debt_ratio * 100.0,
         );

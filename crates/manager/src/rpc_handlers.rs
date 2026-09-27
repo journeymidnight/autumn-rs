@@ -2080,8 +2080,8 @@ impl AutumnManager {
 
     /// cluster-df (MSG_CLUSTER_DF): leader-only read of the in-memory capacity
     /// snapshot `node_health_loop` maintains. Raw u64 facts only — the
-    /// consumer (autumn-op df / fuse statfs) computes the amplification factor
-    /// (`physical_used/logical_stored`) and the EC-dependent writable RANGE.
+    /// consumer (autumn-op df / dashboard) computes raw-used/logical-size
+    /// amplification and the EC-dependent writable RANGE.
     /// No scan / no compute here (done off the request path); O(per_node).
     /// Pure builder for the cluster-df capacity snapshot (no encode). Shared by
     /// the `MSG_CLUSTER_DF` handler and the in-process embedded dashboard

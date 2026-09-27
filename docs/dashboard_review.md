@@ -76,3 +76,16 @@ candidate such as `ps_id=3 size_ratio=45 hot=[32] cold=[21]` renders as a PS 3
 partition-size imbalance: 45x largest/smallest, large partition 32, small
 partition 21, sustained across five one-minute samples. It is labeled
 information-only because hot/cold has no actuation command.
+
+## Raw-capacity amplification correction — 2026-09-27
+
+The dashboard showed an impossible 0.35x on a cluster whose layouts range from
+4+1 EC to three replicas. The consumer was dividing EN-maintained extent file
+lengths by logical size. `amp` now means raw filesystem capacity consumed
+(`raw_total - raw_free`) divided by logical extent size (distinct sealed extent
+sizes plus committed open extent sizes). The manager's scan explicitly counts
+only sealed extents; open lengths come from the PS commit-length probes.
+`physical_used` remains available as the separately labeled `extent files`
+diagnostic. A regression fixture uses raw used 1250, logical size 1000 and
+extent file lengths 350: the result must be 1.25x, while the old formula is
+0.35x. The same helper drives dashboard overview and `autumn-op df`.

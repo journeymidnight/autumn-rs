@@ -1,3 +1,12 @@
+Date: 2026-09-27 (13)
+TaskStatus: completed
+Task scope: correct dashboard/CLI amplification to raw used capacity divided by logical extent size.
+Current summary: root cause was the consumer formula: it used EN-maintained extent file lengths as the numerator, which is not raw filesystem capacity and can diverge under sparse/punched files and allocation. Dashboard overview and autumn-op df now share raw_capacity_amplification: (raw_total - raw_free) / (distinct sealed extent size + committed open extent size). The manager scan explicitly gates the sealed contribution on ex.sealed; open lengths come only from PS commit-length probes. JSON adds logical_size while preserving logical_footprint as a compatibility alias. UI labels the diagnostic old numerator as extent files and the ratio as raw amplification. No wire or persisted-format change.
+Verification: manager lib 432/432 passed. Focused regressions prove 4+1=1.25x, RF3=3x, mixed=2.125x, zero logical=n/a, an open extent cannot enter the sealed sum, and the reported old shape raw_used=1250/physical_used=350/logical=1000 produces 1.25x rather than 0.35x. autumn-server all binaries built; three dashboard JS checks passed; real isolated etcd/manager/two-disk EN/PS/dashboard API passed including served-page bytes and amplification = raw_used/logical_size. Manager and server changed targets pass strict Clippy after allowing only pre-existing unrelated warnings; unmodified workspace-wide rustfmt drift remains.
+Review: self-review checked the EN statvfs and extent-file sources, sealed/open accounting, JSON compatibility, writable estimate consumer and UI labels. No subagent dispatched under the current user restriction on delegation.
+Main gaps: none for this formula. On dedicated EN filesystems a 4+1/RF3 mix should be 1.25x-3x; the value is deliberately not clamped, so other filesystem consumers, delayed logical refresh or unreclaimed space remain visible as an out-of-range result.
+Next steps: rebuild/redeploy manager and autumn-dashboard for the corrected live value. No push or deployment performed.
+
 Date: 2026-09-27 (12)
 TaskStatus: completed
 Task scope: simplify dashboard policy controls so starting a policy does not require selecting it first.

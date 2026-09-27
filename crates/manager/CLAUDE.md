@@ -1581,8 +1581,9 @@ built inside the single `node_health_loop`: RAW + `physical_used` are summed fro
 EN's self-reported `DiskStatus.extent_bytes` every tick (owner reports, control plane
 sums — no manager-side counters); `logical_stored` is a periodic (~30 s) read-only scan
 of `s.extents` (`Σ distinct sealed_length` skipping both-zero). The wire carries only
-raw u64 facts; the amplification factor and EC-dependent writable range are computed by
-the consumer.
+raw u64 facts; raw-used/logical-size amplification and the EC-dependent writable range
+are computed by the consumer. `physical_used` remains a diagnostic sum of extent file
+lengths, not the amplification numerator.
 
 **Overview / df open-tail rules.** `compute_cluster_overview_resp`'s per-partition
 `live_size` = `Σ distinct extents' sealed_length` (manager-authoritative) **plus** the
@@ -1590,9 +1591,9 @@ latest PS-reported `open_tail_bytes` — an OPEN extent's manager `sealed_length
 a log-heavy / major-compacted partition whose data lives in open tails would otherwise
 render 0 B. **Invariant: never re-introduce a sealed-length-only `live_size`.** For
 cluster-df, `ClusterCapSnapshot.logical_open_tail` companions `logical_stored`, and the
-amplification MUST be `physical_used / (logical_stored + logical_open_tail)` — sealed-
-only inflates it ~15×. **Invariant: any physical/logical ratio must compare like
-scopes.** (Overview double-counts CoW-shared extents across siblings; df open tails are
+amplification is `(raw_total - raw_free) / (logical_stored + logical_open_tail)`.
+The numerator is statvfs capacity consumed; the denominator is distinct sealed extent
+size plus committed open extent size. (Overview double-counts CoW-shared extents across siblings; df open tails are
 `refs=1` partition-private, so no CoW dedup — different views.)
 
 ## Inode leases (fuse close-to-open coherence)

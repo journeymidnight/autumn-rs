@@ -628,9 +628,9 @@ function renderOverviewTab(){
     <div class="metrics" style="margin:0;border-top:none">
       <span class="m">raw used <b>${fmtBytes(df.raw_used)}</b></span>
       <span class="m">raw free <b>${fmtBytes(df.raw_free)}</b></span>
-      <span class="m">physical <b>${fmtBytes(df.physical_used)}</b></span>
-      <span class="m">logical <b>${fmtBytes(df.logical_footprint)}</b></span>
-      <span class="m">amplification <b>${df.amplification>0?df.amplification.toFixed(2)+"×":"n/a"}</b></span>
+      <span class="m">extent files <b>${fmtBytes(df.physical_used)}</b></span>
+      <span class="m">logical extent size <b>${fmtBytes(df.logical_size??df.logical_footprint)}</b></span>
+      <span class="m">raw amplification <b>${df.amplification>0?df.amplification.toFixed(2)+"×":"n/a"}</b></span>
       <span class="m">reclaimable <b>${fmtBytes(df.logical_wal_debt)}</b></span>
     </div>` : '<div class="empty">No capacity report yet.</div>';
 
@@ -1058,7 +1058,7 @@ async function overview(){
   $("#v_topo").innerHTML = `${s.part_count||0} <small>partitions</small>`;
   $("#v_topo_sub").textContent = `across ${s.ps_count||0} partition server${(s.ps_count||0)!==1?"s":""}`;
   $("#v_cap").innerHTML = df.raw_total ? `${fmtBytes(df.raw_used)}<small>/${fmtBytes(df.raw_total)}</small>` : "n/a";
-  $("#v_cap_sub").innerHTML = df.raw_total ? `${fmtBytes(df.raw_free)} free · amp <b>${df.amplification>0?df.amplification.toFixed(2)+"×":"n/a"}</b>` : "";
+  $("#v_cap_sub").innerHTML = df.raw_total ? `${fmtBytes(df.raw_free)} free · raw amp <b>${df.amplification>0?df.amplification.toFixed(2)+"×":"n/a"}</b>` : "";
   $("#v_thr").innerHTML = `${s.total_req_per_sec||0} <small>iops</small>`;
   $("#v_thr_sub").innerHTML = `W <b>${fmtBytes(s.total_write_bytes_per_sec||0)}/s</b> · R <b>${fmtBytes(s.total_read_bytes_per_sec||0)}/s</b>`;
   $("#age").textContent = "updated "+new Date((s.ts||Date.now()/1000)*1000).toLocaleTimeString();

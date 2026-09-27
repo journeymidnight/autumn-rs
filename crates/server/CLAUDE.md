@@ -105,6 +105,10 @@ No new dependency, wire format, or data-path work is added by this integration.
   information-only diagnosis (never an action): the page decodes its compact
   reason into the affected PS, dimension, ratio, large/busy side, small/quiet
   side and the five-minute observation window.
+- Capacity `amp` is raw filesystem capacity consumed divided by logical extent
+  size (`distinct sealed_length + committed open length`). The same helper is
+  used by `autumn-op df`; `physical_used` is displayed only as diagnostic
+  extent-file length. A 4+1-only layout is about 1.25x and RF3 about 3x.
 - Each CLI invocation uses a blocking worker plus stdout/stderr reader threads;
   its existing 30-second child deadline stays in place. This is control-plane
   overhead, outside client/PS/EN data traffic. Multiple browsers still incur
