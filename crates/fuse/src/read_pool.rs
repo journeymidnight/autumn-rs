@@ -41,8 +41,10 @@
 //! same property with its two per-partition stream clients). It also means N
 //! manager connections at mount time.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use futures::channel::{mpsc, oneshot};
 use futures::StreamExt;
@@ -50,6 +52,7 @@ use futures::StreamExt;
 use autumn_client::ClusterClient;
 
 use crate::bridge::REPLY_TIMEOUT;
+use crate::prefetch::{Admitted, Detector, Lookup, PrefetchCache, Served, Stats};
 use autumn_fs::read::{self, ChunkSpec, ReadPlan};
 
 /// How long to wait for a worker to connect before mounting without it. The
@@ -64,13 +67,38 @@ pub struct ReadJob {
     pub actual_size: usize,
     pub direct_read: bool,
     pub reply: fuser::ReplyData,
+    /// `(ino, generation, offset)` when prefetch is on: the worker tries the
+    /// prefetched blocks before the cluster.
+    pub prefetch_key: Option<(u64, u64, u64)>,
+}
+
+/// One block to fetch ahead of a reader, already admitted to the cache; the
+/// slot releases the block if the job is dropped unfinished.
+pub struct PrefetchJob {
+    pub slot: Admitted,
+    pub chunks: Vec<ChunkSpec>,
+    pub actual_size: usize,
+    pub direct_read: bool,
+}
+
+enum WorkerMsg {
+    Read(ReadJob),
+    Prefetch(PrefetchJob),
+}
+
+/// Daemon-side readahead state (`prefetch.rs`): the detector is the
+/// dispatcher's alone, the cache is shared with every worker.
+pub struct Prefetch {
+    pub detector: RefCell<Detector>,
+    pub cache: Arc<PrefetchCache>,
 }
 
 /// Handle to the worker set. Lives on the dispatcher thread (hence the plain
 /// `Cell` for round-robin — never shared).
 pub struct ReadPool {
-    txs: Vec<mpsc::UnboundedSender<ReadJob>>,
+    txs: Vec<mpsc::UnboundedSender<WorkerMsg>>,
     next: Cell<usize>,
+    prefetch: Option<Prefetch>,
 }
 
 impl ReadPool {
@@ -86,18 +114,22 @@ impl ReadPool {
         threads: usize,
         manager_addr: &str,
         credential: Option<(String, Vec<u8>)>,
+        prefetch_budget_bytes: u64,
     ) -> Self {
         let mut txs = Vec::with_capacity(threads);
         let mut readies = Vec::with_capacity(threads);
+        let cache = (threads > 0 && prefetch_budget_bytes > 0)
+            .then(|| Arc::new(PrefetchCache::new(prefetch_budget_bytes)));
 
         for idx in 0..threads {
-            let (tx, rx) = mpsc::unbounded::<ReadJob>();
+            let (tx, rx) = mpsc::unbounded::<WorkerMsg>();
             let (ready_tx, ready_rx) = oneshot::channel::<Result<(), String>>();
             let addr = manager_addr.to_string();
             let cred = credential.clone();
+            let worker_cache = cache.clone();
             match std::thread::Builder::new()
                 .name(format!("autumn-fuse-rd{idx}"))
-                .spawn(move || worker_main(idx, addr, cred, rx, ready_tx))
+                .spawn(move || worker_main(idx, addr, cred, worker_cache, rx, ready_tx))
             {
                 Ok(_handle) => {
                     // Deliberately not joined. The workers exit on their own
@@ -147,9 +179,35 @@ impl ReadPool {
                 "read pool ready (each worker owns its own compio runtime and cluster client)"
             );
         }
+        let prefetch = cache.filter(|_| !live.is_empty()).map(|cache| {
+            spawn_prefetch_sweeper(cache.clone());
+            tracing::info!(budget_mib = prefetch_budget_bytes >> 20, "daemon readahead on");
+            Prefetch { detector: RefCell::new(Detector::default()), cache }
+        });
         Self {
             txs: live,
             next: Cell::new(0),
+            prefetch,
+        }
+    }
+
+    pub fn prefetch(&self) -> Option<&Prefetch> {
+        self.prefetch.as_ref()
+    }
+
+    /// The file closed or was forgotten: drop its fronts and its blocks.
+    pub fn forget(&self, ino: u64) {
+        if let Some(p) = &self.prefetch {
+            p.detector.borrow_mut().forget(ino);
+            p.cache.drop_file(ino);
+        }
+    }
+
+    /// Hand an admitted block to a worker. With no live worker the job is
+    /// dropped here, and its slot releases the block (its READs go to the cluster).
+    pub fn submit_prefetch(&self, job: PrefetchJob) {
+        if submit_round_robin(&self.txs, &self.next, WorkerMsg::Prefetch(job)).is_err() {
+            tracing::debug!("prefetch: no read worker took the block; released");
         }
     }
 
@@ -174,8 +232,66 @@ impl ReadPool {
     /// try the next, so one dead thread degrades throughput instead of failing
     /// every N-th read.
     pub fn submit(&self, job: ReadJob) -> Result<(), ReadJob> {
-        submit_round_robin(&self.txs, &self.next, job)
+        match submit_round_robin(&self.txs, &self.next, WorkerMsg::Read(job)) {
+            Ok(()) => Ok(()),
+            Err(WorkerMsg::Read(job)) => Err(job),
+            Err(WorkerMsg::Prefetch(_)) => unreachable!("submit_round_robin returns what it was given"),
+        }
     }
+}
+
+/// Drop idle prefetched blocks once a second; every ten seconds, log the
+/// counters if they moved. Runs on the dispatcher runtime.
+fn spawn_prefetch_sweeper(cache: Arc<PrefetchCache>) {
+    compio::runtime::spawn(async move {
+        let mut logged = Stats::default();
+        let mut tick = 0u64;
+        loop {
+            compio::time::sleep(Duration::from_secs(1)).await;
+            cache.sweep(Instant::now());
+            tick += 1;
+            let s = cache.stats();
+            if tick % 10 == 0 && s != logged {
+                tracing::info!(
+                    hits = s.hits,
+                    waits = s.waits,
+                    misses = s.misses,
+                    admitted = s.admitted,
+                    refused = s.refused,
+                    failed = s.failed,
+                    wasted_mib = s.wasted_bytes >> 20,
+                    used_mib = cache.used() >> 20,
+                    "daemon readahead"
+                );
+                logged = s;
+            }
+        }
+    })
+    .detach();
+}
+
+/// Answer a READ from prefetched blocks, waiting for any still being fetched.
+async fn from_prefetch(
+    cache: &PrefetchCache,
+    ino: u64,
+    generation: u64,
+    offset: u64,
+    len: u64,
+) -> Option<Served> {
+    // A READ spans at most a few blocks; each can make it wait once.
+    for _ in 0..4 {
+        match cache.lookup(ino, generation, offset, len) {
+            Lookup::Hit(served) => return Some(served),
+            Lookup::Miss => return None,
+            Lookup::Wait(rx) => match rx.await {
+                Ok(()) => {}
+                // The block was dropped (its fetch failed, or the generation
+                // moved): the next lookup misses.
+                Err(oneshot::Canceled) => {}
+            },
+        }
+    }
+    None
 }
 
 /// The routing itself, split out from `submit` so it can be tested without a
@@ -268,7 +384,8 @@ fn worker_main(
     idx: usize,
     manager_addr: String,
     credential: Option<(String, Vec<u8>)>,
-    mut rx: mpsc::UnboundedReceiver<ReadJob>,
+    cache: Option<Arc<PrefetchCache>>,
+    mut rx: mpsc::UnboundedReceiver<WorkerMsg>,
     ready_tx: oneshot::Sender<Result<(), String>>,
 ) {
     let rt = match compio::runtime::RuntimeBuilder::new().build() {
@@ -299,39 +416,76 @@ fn worker_main(
             return;
         }
 
-        while let Some(job) = rx.next().await {
+        while let Some(msg) = rx.next().await {
             let client = client.clone();
             // SPAWN, never await inline: a worker that ran one job at a time
             // would cap concurrency at the thread count, which is far below what
             // a single runtime already delivers. The point of the pool is more
             // CPU for the same concurrency, not less concurrency.
-            compio::runtime::spawn(async move {
-                let plan = ReadPlan {
-                    inline_result: None,
-                    actual_size: job.actual_size,
-                    client,
-                    chunks: job.chunks,
-                    direct_read: job.direct_read,
-                };
-                // BOUNDED, for the same reason the dispatcher's version is: this
-                // is the one FUSE op answered off the request loop, so it is the
-                // one that can leave the kernel waiting forever.
-                match compio::time::timeout(REPLY_TIMEOUT, read::execute(plan)).await {
-                    Ok(Ok(data)) => job.reply.data(&data),
-                    Ok(Err(e)) => {
-                        tracing::warn!(error = %e, "fuse read execute failed");
-                        job.reply.error(libc::EIO);
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            timeout_secs = REPLY_TIMEOUT.as_secs(),
-                            "fuse read timed out — replying EIO"
-                        );
-                        job.reply.error(libc::EIO);
-                    }
+            match msg {
+                WorkerMsg::Read(job) => {
+                    let cache = cache.clone();
+                    compio::runtime::spawn(async move {
+                        let ReadJob { chunks, actual_size, direct_read, reply, prefetch_key } = job;
+                        let answer = async {
+                            if let (Some(cache), Some((ino, generation, offset))) = (&cache, prefetch_key) {
+                                if let Some(served) =
+                                    from_prefetch(cache, ino, generation, offset, actual_size as u64).await
+                                {
+                                    return Ok(served);
+                                }
+                            }
+                            let plan = ReadPlan {
+                                inline_result: None,
+                                actual_size,
+                                client,
+                                chunks,
+                                direct_read,
+                            };
+                            read::execute(plan).await.map(Served::Owned)
+                        };
+                        // BOUNDED, for the same reason the dispatcher's version
+                        // is: this is the one FUSE op answered off the request
+                        // loop, so it is the one that can leave the kernel
+                        // waiting forever. The bound covers a wait on a block.
+                        match compio::time::timeout(REPLY_TIMEOUT, answer).await {
+                            Ok(Ok(served)) => reply.data(served.bytes()),
+                            Ok(Err(e)) => {
+                                tracing::warn!(error = %e, "fuse read execute failed");
+                                reply.error(libc::EIO);
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    timeout_secs = REPLY_TIMEOUT.as_secs(),
+                                    "fuse read timed out — replying EIO"
+                                );
+                                reply.error(libc::EIO);
+                            }
+                        }
+                    })
+                    .detach();
                 }
-            })
-            .detach();
+                WorkerMsg::Prefetch(job) => {
+                    compio::runtime::spawn(async move {
+                        let PrefetchJob { slot, chunks, actual_size, direct_read } = job;
+                        let (ino, block) = (slot.ino(), slot.block());
+                        let plan = ReadPlan { inline_result: None, actual_size, client, chunks, direct_read };
+                        let data = match compio::time::timeout(REPLY_TIMEOUT, read::execute(plan)).await {
+                            Ok(Ok(data)) => Some(data),
+                            Ok(Err(e)) => {
+                                tracing::debug!(ino, block, error = %e, "prefetch fetch failed");
+                                None
+                            }
+                            Err(_) => {
+                                tracing::debug!(ino, block, "prefetch fetch timed out");
+                                None
+                            }
+                        };
+                        slot.complete(data);
+                    })
+                    .detach();
+                }
+            }
         }
         tracing::info!(idx, "read pool worker exiting (channel closed)");
     });

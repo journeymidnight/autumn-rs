@@ -488,6 +488,13 @@
   新增"预取进行中另一个挂载改写同一文件"必须读到新字节，关掉失效丢块时变红；
   `fuse_inval_deadlock.sh` 仍过。
 - `passes: false`
+- **notes** (2026-09-27): 已实现并按用户决定**默认开**合入（`--prefetch-mem-mb 1024`）。验收对照：
+  单流 `dd` 0.69 → 1.7 GB/s、vLLM Qwen 7.9 → 4.8 s、真实 MiniMax-H3（vLLM-Omni TP4）243 → 203 s
+  （配 `--disable-multithread-weight-load` 197 s）、4K 随机读 p99 不变、真挂载 PREFETCH 在两层
+  generation 检查一起消融时变红、`fuse_inval_deadlock.sh` 过。**未达成的两项**：(1) mmap 冷加载
+  并非处处更高——零延迟单核 −12%/多核 −37%，合成的多线程 CPU 拷贝 1/2 ms −25%/−38%（开着时内核
+  READ 多一倍多、更碎，原因未在内核核实）；(2) "RSS 不超预算"只对预取块成立（预算 128 MiB 时 RSS
+  峰值 287 MiB）。写路径不经过预读，未单独复测。
 
 ### BUG-FUSE-CACHED-META-AFTER-LEASE-LOSS — lease 丢了之后缓存的 meta / 页没有人再失效（未复现）
 - **Trigger** (2026-09-27，挂载改走页缓存那次的独立评审推断，读代码得出): 挂载走页缓存之后

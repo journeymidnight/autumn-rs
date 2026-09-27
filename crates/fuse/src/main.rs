@@ -115,6 +115,16 @@ struct Args {
     /// loader does ~11% better at 4 MiB; the collapse is the worse risk.
     #[arg(long, default_value_t = 2048)]
     readahead_kb: u32,
+
+    /// Memory the daemon may hold for its own readahead, in MiB: blocks fetched
+    /// in parallel ahead of a sequential reader, answered from memory when the
+    /// kernel's READs reach them (`prefetch.rs`). A cap, not a reservation —
+    /// a block is freed once the kernel has read it, after 5 s unread, or when
+    /// its file closes; a block that does not fit is not fetched. On UCX this is
+    /// on top of the read threads' registered buffer pools. `0` turns it off;
+    /// it needs `--read-io-threads` > 0.
+    #[arg(long, default_value_t = 1024)]
+    prefetch_mem_mb: u64,
 }
 
 fn main() -> Result<()> {
@@ -321,6 +331,7 @@ fn main() -> Result<()> {
                     args.read_io_threads,
                     &manager_addr,
                     pool_credential,
+                    args.prefetch_mem_mb << 20,
                 )
                 .await;
                 let read_pool = (!read_pool.is_empty()).then_some(read_pool);

@@ -11,7 +11,8 @@ use crate::bridge::*;
 use autumn_fs::dir;
 use autumn_fs::meta::*;
 use autumn_fs::read;
-use crate::read_pool::{ReadJob, ReadPool};
+use crate::prefetch;
+use crate::read_pool::{PrefetchJob, ReadJob, ReadPool};
 use autumn_fs::schema::InodeState;
 use autumn_fs::state::{FsState, FuseLease};
 use autumn_fs::write;
@@ -189,6 +190,58 @@ pub fn inode_cache_needs_reload(cached_version: u64, acquired_version: u64) -> b
     acquired_version > 0 && cached_version < acquired_version
 }
 
+/// Plan the blocks ahead of a sequential reader of `ino` and hand them to the
+/// read workers (`prefetch.rs`). A block the budget cannot take is skipped —
+/// its READs go to the cluster as they would without prefetch.
+async fn prefetch_ahead(state: &mut FsState, pool: &ReadPool, ino: u64, offset: u64, len: u64) {
+    let Some(pf) = pool.prefetch() else {
+        return;
+    };
+    let Some(is) = state.inodes.get(&ino) else {
+        return;
+    };
+    // A file this mount is writing changes generation with every write; its
+    // blocks would be dropped before anybody read them.
+    if is.dirty || is.write_buf.as_ref().is_some_and(|wb| wb.len > 0) {
+        return;
+    }
+    let (generation, size) = (is.meta.generation, is.meta.size);
+    let fetches = pf.detector.borrow_mut().on_read(ino, generation, offset, len, size);
+    let mut fetches = fetches.into_iter();
+    while let Some(prefetch::Fetch { block, already_read }) = fetches.next() {
+        let want = prefetch::BLOCK.min(size - block);
+        let plan = match read::prepare(state, ino, block as i64, want as u32).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                // Not fetched: let later READs ask for this block and the rest.
+                tracing::debug!(ino, block, error = %e, "prefetch: planning failed");
+                let mut detector = pf.detector.borrow_mut();
+                detector.unissue(ino, block);
+                for rest in fetches {
+                    detector.unissue(ino, rest.block);
+                }
+                return;
+            }
+        };
+        // Inline data, holes and EOF cost no round trip: nothing to fetch ahead.
+        if plan.inline_result.is_some() || plan.chunks.is_empty() {
+            continue;
+        }
+        let Some(slot) = pf.cache.reserve(ino, generation, block, plan.actual_size as u64, already_read)
+        else {
+            // Refused (budget) or already there; a refused block may fit later.
+            pf.detector.borrow_mut().unissue(ino, block);
+            continue;
+        };
+        pool.submit_prefetch(PrefetchJob {
+            slot,
+            chunks: plan.chunks,
+            actual_size: plan.actual_size,
+            direct_read: plan.direct_read,
+        });
+    }
+}
+
 /// Open reply flag: the kernel keeps the inode's page cache across this open
 /// instead of dropping it (`fuse_finish_open`).
 pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;
@@ -358,6 +411,9 @@ pub async fn handle_request(
                     // The kernel inode, and its pages, are gone.
                     state.page_cache_generation.remove(&ino);
                     state.meta_invalidated.borrow_mut().remove(&ino);
+                    if let Some(pool) = pool {
+                        pool.forget(ino);
+                    }
                     // Evict from cache if not open
                     if let Some(is) = state.inodes.get(&ino) {
                         if is.open_count == 0 && !is.dirty {
@@ -862,11 +918,20 @@ pub async fn handle_request(
                         fuse_reply.data(&inline);
                         return true;
                     }
+                    let actual_size = plan.actual_size;
+                    // `prepare` just read the meta through `get_inode`, so this
+                    // is the generation the prefetched blocks must match.
+                    let generation = state.inodes.get(&ino).map(|is| is.meta.generation);
+                    let prefetch_key = match (pool.and_then(|p| p.prefetch()), generation) {
+                        (Some(_), Some(generation)) => Some((ino, generation, offset as u64)),
+                        _ => None,
+                    };
                     let job = ReadJob {
                         chunks: plan.chunks,
-                        actual_size: plan.actual_size,
+                        actual_size,
                         direct_read: plan.direct_read,
                         reply: fuse_reply,
+                        prefetch_key,
                     };
                     // Back on this runtime when there is no pool, or when every
                     // worker's channel is closed (a dead thread). The job is
@@ -917,6 +982,10 @@ pub async fn handle_request(
                             }
                         })
                         .detach();
+                    }
+                    // After the READ is on its way, so planning never delays it.
+                    if let Some(pool) = pool {
+                        prefetch_ahead(state, pool, ino, offset as u64, actual_size as u64).await;
                     }
                 }
                 Err(e) => {
@@ -1069,6 +1138,13 @@ pub async fn handle_request(
                 }
                 if let Some(is) = state.inodes.get_mut(&ino) {
                     is.open_count = is.open_count.saturating_sub(1);
+                    // Nobody reads through this mount any more (an mmap holds
+                    // its file, so RELEASE comes after the munmap).
+                    if is.open_count == 0 {
+                        if let Some(pool) = pool {
+                            pool.forget(ino);
+                        }
+                    }
                     // Evict from cache if no longer open and not dirty
                     if is.open_count == 0
                         && !is.dirty

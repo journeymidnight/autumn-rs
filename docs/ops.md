@@ -600,6 +600,38 @@ cat /sys/class/bdi/$(awk '$5=="/mnt/autumn"{print $3}' /proc/self/mountinfo)/rea
 The mount fails to start if the sysfs file cannot be opened (a read-only `/sys`
 in an unprivileged container); `--readahead-kb 0` keeps the kernel default.
 
+**`--prefetch-mem-mb` (default 1024; `0` turns it off)** is the daemon's own
+readahead: when a file is read in sequence it fetches the blocks ahead of the
+reader in parallel and answers the kernel's READs from memory. It is a cap, not
+a reservation (a block is freed once read, after 5 s unread, when its file
+closes, or when the file's content changes; a block that does not fit is simply
+not fetched). It bounds the prefetched blocks only — reads the daemon serves
+from the cluster hold their own buffers (measured: budget 128 MiB, RSS peak
+287 MiB; budget 1024 MiB, six parallel readers, RSS peak 578 MiB). Measured at 4 ms per
+read: single-stream `dd` 0.69 → 1.7 GB/s; vLLM loading Qwen3-VL-4B 7.9 → 4.8 s;
+the vLLM-Omni load path on a bf16 DiT 1.05 → 1.44 GiB/s, **1.96 GiB/s with
+`--disable-multithread-weight-load`**. It makes some loads slower: with no
+network latency, and for fp32 checkpoints converted on the CPU (a multi-threaded
+copy). Turn it off there.
+
+**Loading weights for vLLM-Omni (MiniMax-H3, Wan):** a bf16 checkpoint loads
+fastest with `vllm serve … --omni --disable-multithread-weight-load` (the
+daemon's readahead then sees one sequential stream). Measured on real
+MiniMax-H3 (4×H200, TP4, `--task-type fl2va`, 4 ms per read, data put with
+`autumnfs put` into 24 lanes): model loading 364 s before the page-cache change,
+243 s with it, 203 s with daemon readahead, 197 s adding
+`--disable-multithread-weight-load` (local NVMe: 132 s). Without daemon
+readahead that flag makes it slower (286 s). An fp32 checkpoint loaded
+as bf16 is bound by the fault pattern of the CPU conversion (measured
+~330 MiB/s at 4 ms per read) — warm the page cache first, on the same mount:
+
+```bash
+find /mnt/autumn/<model_dir> -name '*.safetensors' | xargs -P8 -n1 cat > /dev/null
+```
+
+Measured: 53 GiB warmed in 18 s (3.0 GiB/s), then loaded in 9 s. The pages count
+against the memory cgroup of the process that reads them.
+
 **`O_DIRECT` opens DO work** (measured 2026-09-01, VKE, kernel 5.15):
 
 ```bash
@@ -2369,10 +2401,15 @@ while A has the file closed — no lease, no invalidation — and A's next open 
 the new bytes), HELD (A holds an fd; B rewrites; A's same fd sees the new bytes
 within 5 s), TAIL (A holds an fd read to EOF; B appends; A's same fd reads past
 the old EOF within 5 s — the kernel learns the size only from GETATTR), LOCAL (two fds and a mapping on one mount agree), MMAPW (bytes stored
-through A's writable shared mapping are what B reads). To see it discriminate,
+through A's writable shared mapping are what B reads), PREFETCH (A reads 16 MiB
+of a 64 MiB file in sequence so the daemon prefetches ahead; B rewrites it; A's
+same fd reads the new bytes past 16 MiB within 3 s). To see it discriminate,
 point `FUSE_BIN` at a build whose `open_keeps_page_cache` ignores the generation
 (`lease_was_held || recorded.is_some()`): REOPEN and MMAPW fail with old bytes;
-on one whose `meta::get_inode` ignores `meta_invalidated`, TAIL stays at the old EOF.
+on one whose `meta::get_inode` ignores `meta_invalidated`, TAIL stays at the old EOF;
+on one whose `PrefetchCache` ignores the generation in both `admit` and `lookup`,
+PREFETCH reads the old bytes (either check alone still passes: the other one
+drops the old blocks first).
 The script stops this tree's cluster (`cluster.sh stop` kills every
 `target/release` cluster process), so run nothing else from the tree meanwhile.
 

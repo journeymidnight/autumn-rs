@@ -125,7 +125,9 @@ cp model.safetensors /mnt/autumn/        # a regular filesystem, backed by the c
 Reads go through the kernel page cache and stay cached across opens until the
 file changes, so a second load of the same weights comes from memory, and mmap
 loaders (`safetensors.torch.load_file`) get a 2 MiB readahead window per page
-fault (`--readahead-kb`).
+fault (`--readahead-kb`). The daemon also reads ahead of sequential readers in
+parallel (`--prefetch-mem-mb`, on by default), so a single-stream reader gets
+the mount's parallel bandwidth.
 
 Full runbook (mount verification, stale-mount cleanup, RDMA env, k8s
 DaemonSet): [`docs/ops.md`](docs/ops.md#fuse-daemon-runbook).

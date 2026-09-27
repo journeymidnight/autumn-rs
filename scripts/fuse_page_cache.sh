@@ -18,6 +18,11 @@
 #           same fd must read the appended bytes past the old EOF within
 #           HELD_SECS (the size A's kernel asks for after the invalidation has
 #           to be the new one).
+#   PREFETCH: A reads the first 16 MiB of a 64 MiB file in sequence, so the
+#           daemon fetches blocks ahead of it; B rewrites the file and closes;
+#           within 3 s (under the prefetch cache's 5 s idle expiry, so expiry
+#           cannot pass it) A's same fd must read the NEW bytes past 16 MiB, not
+#           the blocks fetched before the rewrite.
 #   LOCAL:  on A alone, bytes written through one fd are what another fd and a
 #           shared mapping read.
 #   MMAPW:  on A, a store through a writable shared mapping, then munmap and
@@ -151,6 +156,32 @@ HOLDER=$!
 for i in $(seq 1 100); do [ -e "$WORK/tailflag.ready" ] && break; sleep 0.1; done
 cat "$WORK/tail" >> "$MNT_B/f.bin"; touch "$WORK/tailflag.written"
 wait "$HOLDER" && say "TAIL ok ($(cat "$WORK/tail.log"))" || fail "TAIL: $(cat "$WORK/tail.log")"
+HOLDER=""
+
+# PREFETCH
+head -c $((64 << 20)) /dev/urandom > "$WORK/p1"; head -c $((64 << 20)) /dev/urandom > "$WORK/p2"
+cp "$WORK/p1" "$MNT_B/p.bin"; sync
+python3 - "$MNT_A/p.bin" "$WORK/p2" "$WORK/pf" > "$WORK/pf.log" 2>&1 <<'EOF' &
+import os, sys, time
+path, newf, flag = sys.argv[1:4]
+new = open(newf, "rb").read()
+fd = os.open(path, os.O_RDONLY)
+for off in range(0, 16 << 20, 1 << 20):
+    os.pread(fd, 1 << 20, off)
+time.sleep(1)  # the blocks ahead land
+open(flag + ".ready", "w").close()
+while not os.path.exists(flag + ".written"): time.sleep(0.05)
+deadline = time.time() + 3
+while time.time() < deadline:
+    if os.pread(fd, 32 << 20, 16 << 20) == new[16 << 20:48 << 20]:
+        print("new bytes past the prefetch front"); sys.exit(0)
+    time.sleep(0.1)
+print("still old bytes past the prefetch front"); sys.exit(1)
+EOF
+HOLDER=$!
+for i in $(seq 1 100); do [ -e "$WORK/pf.ready" ] && break; sleep 0.1; done
+rewrite "$MNT_B/p.bin" "$WORK/p2"; touch "$WORK/pf.written"
+wait "$HOLDER" && say "PREFETCH ok ($(cat "$WORK/pf.log"))" || fail "PREFETCH: $(cat "$WORK/pf.log")"
 HOLDER=""
 
 # LOCAL

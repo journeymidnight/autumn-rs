@@ -20,6 +20,7 @@
 | `ops.rs` | `fuser::Filesystem` trait 实现（readdir 在 reply 边界做 DT_*→FileType）|
 | `dispatch.rs` | compio 侧派发循环（lookup/mkdir 在此转 FileAttr；lease 三方法 `pub use` 自 `autumn_fs::lease_tasks`）|
 | `read_pool.rs` | 读 I/O 线程池（N 个独立 compio runtime + 各自的 ClusterClient；`ReadJob` 载 `fuser::ReplyData` 跨线程）|
+| `prefetch.rs` | 守护进程预读：派发线程上的顺序检测（`Detector`）+ 读线程共享的预取块缓存（`PrefetchCache`）|
 | `inval.rs` | 内核缓存失效线程（`autumn-fuse-inval`：`inval_inode` 在这里发，结果回派发 runtime 记 sticky 集）|
 | `readahead.rs` | 挂载的预读窗口：INIT 时打开 `/sys/class/bdi/<dev>/read_ahead_kb`，第一个 open 时写入 |
 
@@ -249,6 +250,77 @@ HEAD（direct-io、128 KiB）单核 1 ms 108 MiB/s；8 进程同时加载同一�
 0 字节）。注意 8 进程**同时**起步时 HEAD 也只从远端读一遍（私有映射共用页缓存），收益来自
 窗口，不是字节数。
 
+### 守护进程预读（`prefetch.rs`，`--prefetch-mem-mb`，默认 1024，默认开）
+
+内核预读每个缺页线程只有约一个窗口在飞，单流读者每个窗口付一次往返；同一挂载 8 线程并行
+`pread` 在每读 4 ms 下能到 1.6–2.7 GB/s，挂载本身不是瓶颈。这一层给任何读者那个深度：派发线程
+在 Read 臂**先把读请求发出去**，再看它是不是某条顺序前沿的延续、规划前方的块
+（`dispatch.rs::prefetch_ahead` → `read::prepare` 规划每块）；块由读线程取进共享的
+`PrefetchCache`；读请求在读线程上先查缓存，命中就从内存答，块还在取就等它（`Lookup::Wait`，
+整个应答仍在 `REPLY_TIMEOUT` 里）。
+
+**判定与窗口**（`Detector`）——每条都是实测逼出来的：
+- 前沿按**实际读到的字节**判定：≥3 MiB 且读过的字节不少于所跨范围的一半才预取。按"连续几次"
+  判定时，4K 随机读偶尔几次落在一起就被当成顺序，p99 从 2.2 ms 变成 24.7 ms（它们去等 4 MiB 块）。
+- 容差 2 MiB（一个内核窗口）：内核同一窗口的几个 READ 并发发出、到达有乱序。
+- 窗口**随已读字节放大**，至少 1 块（4 MiB）最多 64 MiB。safetensors 加载先碰每个张量的头
+  （每处 2–4 MiB、跳 32–86 MiB）再逐个拷贝：一上来就预取满窗口时取了 1.7 倍文件（1.4 GB 没人读）。
+- 每文件最多 16 条前沿（9 个线程缺页时 8 条会被反复挤掉）；同一代里一个块只要一次。
+- **没有"读者都走过就释放"**：那条规则把第二遍（拷贝阶段）要回来读的块全放掉了。
+
+**内存**：块只活在"取回"到"内核读走"之间（之后页缓存里有），守护进程占的约等于每个活跃读者
+前方的窗口。预算是上限不是预留：放不下的块不取，读请求照常去集群，**读永不因预算阻塞**。
+释放：读满（前沿起点所在的块，前沿自己已从集群读过的那段在接纳时就记为已读，否则永远读不满——
+实测这种块两秒内把 1 GiB 预算占满、拒绝了 168 块）、5 s 没人读、文件关闭（`open_count` 归零或
+FORGET）、generation 变了。块是普通堆内存：传输层注册池只管接收缓冲，UCX 下总内存 = 预算 + 每
+读线程注册池。
+
+**一致性（两层 generation 检查）**：块带规划时的 generation，读请求带 `read::prepare` 刚看到的
+generation（`get_inode` 在失效标记后会重读；本挂载写会抬 generation）。`lookup` 发现不一致就丢掉
+这个文件的块；`admit` 接纳新一代的块时也清掉旧一代。实测只消融 `lookup` 那层时真挂载 PREFETCH
+仍过——改写后第一个读请求一发出，派发线程就为新一代 `admit`，旧块在读线程查缓存前已被清掉；两层
+一起消融才变红（A 读到改写前预取的字节）。陈旧窗口与页缓存相同：别处写者关闭的失效到达之前。
+
+**实测**（netns + veth，单向 1 ms ≈ pod 每读 4 ms；开 vs `--prefetch-mem-mb 0`，交替）：
+
+| 负载 | 关 | 开 |
+|---|---|---|
+| 单流 `dd` | 0.69 GB/s | 1.7 GB/s（2 ms：0.41 → 1.6） |
+| 串行 1 MiB `O_DIRECT` | 211–214 MB/s | 2.1 GB/s |
+| vLLM `eager`（`read()` 整个读） | 368–375 | 482–495（2 ms：267 → 488） |
+| vLLM 默认加载 Qwen3-VL-4B（bf16，8.27 GiB） | 7.85–7.90 s | 4.77–4.78 s |
+| vLLM-Omni 加载路径，bf16 DiT 替身（26.6 GiB） | 1051–1055 MiB/s | 1434–1449 |
+| 同上 + `--disable-multithread-weight-load` | 1126–1127 | **1961–1969** |
+| vLLM-Omni 路径，Wan fp32→bf16（53.2 GiB） | 323–340 | 372–438 |
+| 4K 随机读 p99 | 2.16–2.20 ms | 2.16–2.24 ms |
+
+**真实 MiniMax-H3**（vLLM-Omni main、4×H200 TP4、`--task-type fl2va`，数据用 `autumnfs put -P8`
+写进 24 lane / 24 分区，1 ms，每格一次）："Model loading took"：页缓存改动之前 364 s；关预读 243 s；
+开预读 203 s；开预读 + `--disable-multithread-weight-load` **197 s**；本地 NVMe 参照 132 s。
+关预读时 `--disable-multithread-weight-load` 反而 286 s——两者要一起用。开预读省的时间大半在
+"读权重之前"那段（VAE 用 `safe_open` 逐张量读，137 → 100 s）。早先按单进程替身等比推算的
+"改动前约 19 分钟"被这次实测推翻（TP4 下各 rank 并行、只读自己的切片）。
+
+**内存**：6 个 5 GB 文件并行顺序读 3263 MiB/s，RSS 峰值 578 MiB（预算 1024）；预算压到 128 MiB：
+拒绝 4914 块、读照常（2932 MiB/s），RSS 峰值 287 MiB——预算只管预取块，走集群的读自己的结果
+缓冲不在其内。
+
+**生命周期**：被接纳的块由 `Admitted` 持有，`complete` 交出字节；没完成就被丢弃（worker 死了
+带走队列里的任务、没有 worker 接）时析构里释放块、唤醒等待者——否则这块永远"取数中"，每个
+碰到它的读都要等满 30 s `REPLY_TIMEOUT` 再 EIO（评审发现；单测去掉析构里的释放即红）。被预算
+拒绝或规划失败的块从 `issued` 撤回（`Detector::unissue`），预算空出后还能再要。
+
+**会变差的**（默认开是用户的决定，按 JuiceFS / mountpoint-s3 的惯例；低延迟或这类负载用
+`--prefetch-mem-mb 0`）：零延迟下 mmap 加载单核 −12%、多核 −37%、`dd` −5%；合成的"9 核 CPU
+`copy_`"mmap 加载 1/2 ms 下 −25%/−38%（开着时内核发来的 READ 多一倍多、更碎：13.7k 对 ~5k，
+为什么会碎未在内核核实）；Wan fp32 配 vLLM `prefetch` 策略 1893–1927 → 1721–1790。
+**mmap 单线程加载的上限在内核缺页路径**：零延迟不预取单核也只有约 945，页缓存全热约 1740——
+守护进程预读省掉的只是每次 READ 的网络往返，不是缺页本身。
+
+守卫：`prefetch.rs` 单测 20 条（判定、随机读不触发、窗口放大、已读记账、跨块拼接、等待与唤醒、
+失败、`Admitted` 丢弃释放、`unissue`、两层 generation、预算、短尾块、空闲清理）；`scripts/fuse_page_cache.sh` 的 PREFETCH（
+两层 generation 检查一起消融时变红）。
+
 ### `FuseLease` 按角色计数（writer_refs / reader_refs）
 
 **同一个文件可以同时被本挂载的一个写 fd 和一个读 fd 打开**，所以 `held_leases[ino]`
@@ -368,7 +440,7 @@ inode 的每一个缓存页（`invalidate_inode_pages2_range`）。预读中的�
 则 fail-fast）、`--allow-other`（default false）、`--transport`（`tcp`/`ucx`，须与
 cluster 一致）、`--direct-read`（default true）、`--read-io-threads`（default 4；
 `0` = 全部读留在派发线程，即池子之前的行为）、`--readahead-kb`（default 2048；`0` = 内核默认
-128 KiB）。内核缓存 `attr_timeout` /
+128 KiB）、`--prefetch-mem-mb`（default 1024；`0` = 关掉守护进程预读；需要读线程池）。内核缓存 `attr_timeout` /
 `entry_timeout` = 30s、`negative_timeout` = 5s；周期脏 inode sync 间隔 30s（`main.rs`）。
 
 ## 关键依赖文件
