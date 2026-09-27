@@ -1,3 +1,11 @@
+Date: 2026-09-27
+TaskStatus: completed
+Task scope: "删除过期注释" — three stale TODOs in crates/stream/src/extent_node.rs (handle_append, handle_re_avali, handle_copy_extent) claiming the manager extent_info / eversion-refresh RPC was not implemented.
+Current summary: each sat directly above a call to extent_info_from_manager, a complete MSG_EXTENT_INFO round trip; they dated from the first server-binary commit. Three comment lines deleted, nothing else.
+Verification: cargo build -p autumn-stream passes (comment-only change). Review (opus, independent): diff is exactly the three lines; the manager handler exists; no separate eversion-refresh RPC was ever meant; no doc claims the RPC is missing.
+Main gaps: none.
+Next steps: none for this task.
+
 Date: 2026-09-26 (4)
 TaskStatus: completed
 Task scope: BUG-REBUILD-FSYNC-UNCOUNTED (user: "这个可以", after correcting the diagnosis: sync first, then record).

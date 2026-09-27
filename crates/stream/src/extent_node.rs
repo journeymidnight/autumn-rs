@@ -8248,7 +8248,6 @@ impl ExtentNode {
         // In the common case (eversions match) we trust local atomics -- no RPC needed.
         let local_eversion = extent.eversion.load(Ordering::SeqCst);
         if req.eversion > local_eversion {
-            // TODO: manager RPC for eversion refresh not yet implemented
             match self.extent_info_from_manager(req.extent_id).await {
                 Ok(Some(ex)) => {
                     // fsync on 0→sealed transition so the
@@ -9677,7 +9676,6 @@ impl ExtentNode {
             }
         };
 
-        // TODO: manager RPC for extent_info not yet implemented
         let extent_info = match self.extent_info_from_manager(req.extent_id).await {
             Ok(Some(ex)) => ex,
             Ok(None) => {
@@ -9828,7 +9826,6 @@ impl ExtentNode {
         let extent = self.get_extent(req.extent_id).await?;
         let mut logical_len = extent.len.load(Ordering::SeqCst);
 
-        // TODO: manager RPC for extent_info not yet implemented
         match self.extent_info_from_manager(req.extent_id).await {
             Ok(Some(ex)) => {
                 // fsync on 0→sealed transition.
