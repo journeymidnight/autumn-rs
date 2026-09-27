@@ -1,3 +1,12 @@
+Date: 2026-09-27 (6)
+TaskStatus: completed
+Task scope: user asked to record the EN wire-auth finding in the ledger and push: "这个EN面需要wire auth的记录到feature list里面push".
+Current summary: docs-only. New entry F-EN-WIRE-AUTH in feature_list.md — EN's wire face has no auth at all: design doc §9 records only the client direct-read bypass as accepted (WON'T-DO), but a client that legitimately receives one GetRedirectResp descriptor (en_addr, extent_id, eversion) can then send MSG_APPEND / MSG_COMMIT_LENGTH / MSG_DELETE_EXTENT / MSG_FENCE_EXTENT / MSG_ALLOC_EXTENT / MSG_COPY_EXTENT / MSG_CONVERT_TO_EC / MSG_WRITE_SHARD on the same bare connection — a rogue client can destroy every tenant's data integrity. Recorded the discussed shape: two-tier by op class, reusing the existing Ed25519 keyring — (1) node token (typ autumn.node.v1, separate CAP_DOMAIN) issued by the manager at PS/EN registration, verified once per connection by the EN against the keyring it already polls via MSG_GET_AUTHZ_CONFIG, per-request cost zero, opt-in like PS; (2) data reads stay open (WON'T-DO kept), at most "any valid cap token" to stop anonymous actors; NO per-extent tenant scoping (extent ids are not tenant-decidable and churn with split/merge/GC — per-extent caps would blow mint frequency and token size). Scope includes adding the destructive-op surface to the design doc's threat model before implementing.
+Verification: none needed (ledger entry only; no code, no behaviour change).
+Review: not dispatched — no code written (rule 15 covers code changes).
+Main gaps: none.
+Next steps: implementation per the entry's Scope, starting with the threat-model doc addition.
+
 Date: 2026-09-27 (5)
 TaskStatus: completed
 Task scope: step 4 — real-cluster acceptance batch for three entries whose code was done: F-SPLITMERGE-PROGRESS, F-SPLIT-NEEDS-COMPACT, F-FUSE-WRITE-INFLIGHT-DEPTH.

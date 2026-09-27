@@ -202,6 +202,35 @@
 - **Acceptance**: a fresh deploy with no `AUTUMN_EXTENT_SHARDS` set brings up one shard per core, `format` registers the matching ports, the Service exposes them, and the manager routes to all shards; the manual env still overrides.
 - **Status**: `passes: false` (2026-07-13) — recorded for later per user. Deploy/format-layer change (entrypoint + format + overlay), NOT an EN-process change; the coupling chain above is the reason it's "manual by design" today, not a bug.
 
+### F-EN-WIRE-AUTH — EN wire 面无鉴权：破坏性 op（APPEND/DELETE/FENCE/…）对任何内网对端开放
+- **Trigger** (2026-09-27, 设计讨论: "安全的话，EN 最好也有 auth"): `data_plane_authz_design.md`
+  §9 只把 **client 直读旁路**（大值 `MSG_READ_BYTES` 直连 EN）记为明确接受（WON'T-DO），
+  但读旁路与破坏面来自同一事实：EN 不区分对端。client 通过一次 `GetRedirectResp`
+  descriptor 就合法拿到 `(en_addr, extent_id, eversion)`，之后在同一个裸连接上不仅能读，
+  还能发 `MSG_APPEND`（往别人的 extent 追加垃圾）、`MSG_COMMIT_LENGTH`（谎报长度）、
+  `MSG_DELETE_EXTENT` / `MSG_FENCE_EXTENT` / `MSG_ALLOC_EXTENT` / `MSG_COPY_EXTENT` /
+  `MSG_CONVERT_TO_EC` / `MSG_WRITE_SHARD`——一个流氓 client 能毁掉**所有租户**的数据完整性。
+  这是未在威胁模型里讨论过的面，比已接受的读旁路更值得先修。
+- **形状（已讨论）**: 不照搬 PS 的 tenant-prefix 模型——EN 的操作单位是 extent_id，
+  不租户可判定，且 extent 随 split/merge/GC 高频生灭，per-extent capability 会让 mint
+  频率与 token 尺寸崩掉。改为**按操作等级分两层，复用现有 Ed25519 keyring**：
+  (1) 破坏性/管理 op 要求"节点 token"——manager 在 PS/EN 注册时签发
+  `typ: "autumn.node.v1"` 的同族 token（复用 `cap_token.rs` 全套 codec，domain 分开），
+  EN 轮询现成 `MSG_GET_AUTHZ_CONFIG` 拿公钥，连接级验一次绑 principal，之后每请求零开销
+  （与 PS 的 AUTH_HELLO 同构；opt-in 同 PS：manager 不配 key 文件则全关）；
+  (2) 数据读保持开放（维持 WON'T-DO），最多做到"持任意有效 cap token 即可读"挡匿名
+  actor；**不做** per-extent 租户隔离（需 PS 持签名权或逐读 mint，改变信任模型，
+  可信内网前提下不值）。性能账：验签只在建连时一次（~几十 µs），数据面零新增。
+- **Scope**: (a) 先把"破坏性 op 无鉴权可达"补进 `data_plane_authz_design.md` 的威胁模型
+  节（读旁路已有记录，写/删面没有）；(b) 节点 token 的签发（manager）、分发（PS/EN
+  注册路径）、EN 侧连接级验证与 op 分级 gate；(c) EN 侧拒绝指标（复用 `AuthReject`
+  分类）；(d) 消融：去掉 gate 后一个未认证 client 能 APPEND/DELETE 成功。
+- **Acceptance**: 开启后未持节点 token 的连接发 `MSG_DELETE_EXTENT` / `MSG_APPEND` /
+  `MSG_FENCE_EXTENT` 等被拒且按类上报 metric；持 token 的 PS/manager 数据路径行为
+  逐字节不变（建连多一次验签，吞吐回归不劣化）；authz 未配置时行为与现状完全一致；
+  消融测试在无 gate 时变红。
+- **Status**: `passes: false` (2026-09-27) — 仅记录，未开始。
+
 ### BUG-KVC-POOLNAME-STR — `str(PoolName.KV)` 在 py≥3.11 得到 `'PoolName.KV'` 而非 `'kv'`
 - **Trigger** (2026-09-04, fable 评审 L3 接口解析改动时顺带发现，**在本次改动之外**):
   `PoolName` 是 `(str, Enum)`。py≤3.10 的 `str()` 返回值 `'kv'`，**py≥3.11 返回限定名
