@@ -4444,7 +4444,7 @@ impl AutumnManager {
         // the ops table cannot distinguish "merging" from "wedged". Merge is
         // orchestrated here rather than on a PS, so it updates the ledger
         // directly — but by (kind, part_id) like split, so both kinds read the
-        // same way. See F-SPLITMERGE-PROGRESS.
+        // same way.
         let merge_phase = |n: u64| {
             self.ops.borrow_mut().update_progress_by_part(
                 autumn_rpc::manager_rpc::OP_KIND_MERGE,

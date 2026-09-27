@@ -214,7 +214,7 @@ ino → inode 数据是 **O(log N) KV Get**（ino 编码在 key 里，LSM-tree �
 | `WRITE_BUF_EXTENTS` | 8 | 每 inode 写缓冲容量（extent 数）|
 | `WRITE_BUF_CAP` | 64 MiB | = `WRITE_BUF_EXTENTS × MAX_EXTENT`；>1 时 `write_region` 拆多 extent，`put_many` 按 wire key 分组后并发 fan out（`BATCH_PUT_DEFAULT_CONCURRENCY`）；extent key 互异故满并发 |
 | `STREAM_INFLIGHT` | 8 | 流式数据对象（S3 PUT / UploadPart）同时在飞的 unit put 数，见"数据对象是连续流水线" |
-| `APPEND_INFLIGHT_DEPTH` | 2 | 单 inode 同时在飞的 append flush 批数；1 批 = 8 个 extent 并发。未实测，见写流水化一节 |
+| `APPEND_INFLIGHT_DEPTH` | 2 | 单 inode 同时在飞的 append flush 批数；1 批 = 8 个 extent 并发。实测比 1 快 ~6%，见写流水化一节 |
 | `INODE_ALLOC_BATCH` | 1000 | 每批向 manager 领的 inode 数 |
 | `DEFAULT_STRIPE_LANES` | 24 | fs 未声明几何时的默认 lane 数 |
 | `ROOT_INO` | 1 | 根 inode（FUSE_ROOT_ID）|
@@ -326,11 +326,14 @@ extent map），`extent::execute_append` 只需要 `Rc<ClusterClient>`，spawn �
 
 **多槽（`APPEND_INFLIGHT_DEPTH`=2）**：规划下一批前不再无条件 drain 上一批，只有队列
 满了才等最老的一个（`write::make_room`）。`InodeState.pending_flushes` 因此是队列不是
-单槽。⚠️ **未实测**，而且要清楚剩余空间有多小：单槽本身就已经让**一批 8 个 extent 并发**
-在飞，这恰好等于 `autumnfs` 非 striped 的 `depth`=8 —— 338 ≈ 345 正是这个对等造成的。
-多槽把在飞 extent 从 8 抬到 16，找的是剩下那 ~2%，**不是**去补什么 137 MiB/s 的差距
-（`e58c735` 里的 208 早于本节的流水化四小时，是陈旧数字，别再引用）。这点空间能不能
-拿到还是未知：`934d4ee` 实测单机剩余的墙是 RF3 全副本 fsync，不在客户端。
+单槽。剩余空间本来就小：单槽已经让**一批 8 个 extent 并发**在飞，恰好等于 `autumnfs`
+非 striped 的 `depth`=8；多槽去掉的是批与批之间的空泡，**不是**去补什么 137 MiB/s 的差距
+（`e58c735` 里的 208 早于本节的流水化四小时，是陈旧数字，别再引用）。
+**实测（2026-09-27）**：绑核（NUMA node1：每个 EN 一核 48/49/50、PS 52-59、fuse 60-67、
+写者 68）的本机 3-EN RF3 集群，4 GiB `dd bs=8M conv=fsync` 写进挂载，depth 2 与 1 交替 6 对、
+两种先后顺序各 3 对：**6 对全是 depth 2 快**，六对均值 284.7 vs 266.3 MiB/s（+6.9%），与同轮
+`autumnfs put` 同一文件持平（283.5）。这台绑核装置比上面 338/345 那组慢，单槽在它上面只到
+CLI 的 ~94%，缺的 ~6% 就是批间空泡。收益小但可辨，所以保持 2。
 
 多槽安全性依赖两条，都验过：① `extent::upsert` 是按 start 的有序插入替换，而连续 append
 批次区间互不相交，所以**落地顺序无关**（`disjoint_batches_apply_the_same_in_any_order`

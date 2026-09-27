@@ -143,6 +143,24 @@ than that, the freeze is orphaned, not slow.
 Samples arrive on the 5 s heartbeat, so a split that finishes in under ~5 s may
 show no intermediate phase at all — that is not a fault.
 
+To see "slow" and "stuck" tell themselves apart on a dev cluster (3 ENs at RF3,
+so every EN holds a replica), stall one EN while the op runs. Keep the stall under
+the 30 s `FREEZE_TTL`, and for a merge under the ~10 s soft timeout too, or the EN
+turns suspected and the merge's new log tail cannot be placed:
+
+```bash
+DR=${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}
+AO=(autumn-op --admin-token-file "$DR/authz/admin.token")   # before the subcommand
+EN=$(cat "$DR/pids/node2.pid")
+kill -STOP $EN; "${AO[@]}" split <PID>         # or: merge <S> <V>; prints "submitted … op <ID>"
+"${AO[@]}" ops status <ID>                     # sits at 1/6 or 2/6 (merge: 1/4) while stopped
+kill -CONT $EN                                 # → succeeded 6/6 (4/4) within a second
+```
+Measured 2026-09-27: split held 1/6–2/6 through a 15 s stall and finished 6/6
+0.3 s after SIGCONT; merge held 1/4 through 7 s and finished 4/4. Split's phases
+come from the PS (`set_maintenance_phase`), merge's from the manager's
+orchestrator; with either report removed, the same run shows no phase at all.
+
 **`cannot split: partition has overlapping keys`** is not an error to chase: the
 PS refuses to split while the LSM still has overlapping key ranges
 (`has_overlap != 0`), which a MAJOR compaction resolves. You should not see the

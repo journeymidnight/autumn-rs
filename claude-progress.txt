@@ -1,3 +1,11 @@
+Date: 2026-09-27 (5)
+TaskStatus: completed
+Task scope: step 4 — real-cluster acceptance batch for three entries whose code was done: F-SPLITMERGE-PROGRESS, F-SPLIT-NEEDS-COMPACT, F-FUSE-WRITE-INFLIGHT-DEPTH.
+Current summary: all three accepted and deleted from the ledger. Split progress: 0 → 1/6 (or 2/6) held through a 15 s SIGSTOP of an EN → 6/6 at success, 0.3 s after SIGCONT; merge: 1/4 through a 7 s stall → 4/4 (a 12 s stall made the EN suspected and the merge failed at 3/4 on "not enough nodes" — correct behaviour); ablations — split: PS set_maintenance_phase made a no-op → no phase ever shown (0/0 through a 15 s stall); merge: manager merge_phase made a no-op → 0/0 through a 7 s stall. Split-needs-compact: fast-mode policy + aggressive armed + 20K QPS on two overlapping children → "major compaction before split" candidates, compactions issued, then the splits; zero "[refused]" in the action log; the dashboard renders the same advisory string (its render_check/tabs_smoke tests pin it) — not looked at live. Merge gate also confirmed on the real cluster ("cannot merge: partition has overlapping keys" on an un-compacted pair). Fuse depth: six A/B pairs, three per order, depth 2 won all six (284.7 vs 266.3 MiB/s, +6.9%), equal to autumnfs put (283.5) — kept at 2. Docs: ops.md stall recipe; fs CLAUDE.md + schema.rs doc carry the numbers.
+Verification: runs above (logs in session scratchpad). A first acceptance attempt was contaminated by an orphaned transport_chaos run (TaskStop left the script alive; it respawned a same-psid PS and a manager on 9001) — discarded, everything torn down, rerun clean; fuse SIGTERM script also re-confirmed clean (HEAD PASS, old build FAIL round 4).
+Main gaps: none for these three.
+Next steps: remaining backlog per feature_list.md.
+
 Date: 2026-09-27 (4)
 TaskStatus: completed
 Task scope: step 3 — F-REVIEW-R6: a non-force fence must prove recovery can move the node's slots.

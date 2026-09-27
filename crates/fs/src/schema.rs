@@ -434,7 +434,15 @@ pub const WRITE_BUF_CAP: usize = WRITE_BUF_EXTENTS * MAX_EXTENT;
 /// drained the previous flush BEFORE it could even plan the next, so exactly
 /// one 64 MiB batch — 8 concurrent extent puts — was ever on the wire.
 ///
-/// UNMEASURED, and the prize is small. The mount is NOT stuck at the
+/// MEASURED (2026-09-27, loopback 3-EN RF3 cluster pinned to one core per EN,
+/// 4 GiB `dd bs=8M conv=fsync` into the mount, six A/B pairs, three in each
+/// order): depth 2 beat depth 1 in every pair, 284.7 vs 266.3 MiB/s over all
+/// six (+6.9%), and matched `autumnfs put` of the same file on the same runs
+/// (283.5 mean). Small, as expected — but real, so it stays at 2. That rig is
+/// slower than the one the figures below come from (338 / 345); on it one slot
+/// reached ~94% of the CLI, and the inter-batch bubble is the missing ~6%.
+///
+/// Where it comes from: the mount is NOT stuck at the
 /// 208 MiB/s recorded in `e58c735`: that number predates the single-slot
 /// pipeline by four hours, and `2949372` then took writes 249 -> 338 MiB/s,
 /// which is 98% of the `autumnfs` CLI's 345 on the same rig. One slot already
@@ -453,16 +461,15 @@ pub const WRITE_BUF_CAP: usize = WRITE_BUF_EXTENTS * MAX_EXTENT;
 /// (`934d4ee`'s RF3-all-replica-fsync wall was measured on the striped 4-lane
 /// aggregate: a different path, same conclusion that the client is not it.)
 ///
-/// Deeper is NOT free and wants a measurement first: `plan_append_only` COPIES
+/// Deeper is NOT free and wants its own measurement: `plan_append_only` COPIES
 /// the buffer into the plan (`Bytes::copy_from_slice`), so each slot pins a
 /// live `WRITE_BUF_CAP`. At 2 that is 128 MiB in flight per actively-writing
-/// inode, on top of the 64 MiB buffer itself.
+/// inode, on top of the 64 MiB buffer itself — and depth 2 already matches the
+/// CLI's continuous window, the comparator, on that rig.
 ///
-/// `1` is an EXACT revert, and that is the cheap way to settle this: at 1,
-/// `make_room` waits whenever the queue holds anything at all, which is
-/// precisely what the unconditional drain it replaced did. If a measurement
-/// ever says the extra 64 MiB buys nothing, change this digit rather than
-/// unpicking the queue.
+/// `1` is an EXACT revert (at 1, `make_room` waits whenever the queue holds
+/// anything at all, which is precisely what the unconditional drain it
+/// replaced did), and it is what the A/B above ran as the baseline.
 pub const APPEND_INFLIGHT_DEPTH: usize = 2;
 
 /// Root inode number (FUSE_ROOT_ID).
