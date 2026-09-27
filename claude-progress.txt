@@ -1,3 +1,12 @@
+Date: 2026-09-27 (4)
+TaskStatus: completed
+Task scope: step 3 — F-REVIEW-R6: a non-force fence must prove recovery can move the node's slots.
+Current summary: check_capacity_for_fence used to ask only whether some other node had an online disk. It now applies recovery's own target filters per extent (not occupied, not fenced/maintenance/suspected), requires one target with df-reported room for the shard, and the union of receivers to report 1.2x the bytes; a node without a df row counts as no room. --force unchanged. e2e_lifecycle's non-force fence now waits for the nodes' first df. Ledger: R6 deleted; new BUG-E2E-FENCE-RECOVERY-STALLS (pre-existing, fails on HEAD).
+Review (fable, independent): no high finding; applied — "no capacity report yet" named separately from "full", re-fencing a fenced node skips the precheck (lost-reply retry), open tails counted as 0 documented, wording, tests for an online=false df row and an EC extent.
+Verification: 8 unit tests (fence_precheck_tests) covering no spare / fenced / maintenance / suspected spare / no room for the shard / no capacity signal / total under 1.2x / legal target passes / force overrides / re-fence idempotent / EC shard. Ablations: skipping the already-fenced short-circuit → force test red; dropping the exclusion set → fenced/maintenance/suspected red; dropping the occupied filter → 4 red; summing all eligible nodes' free (first implementation) → total-margin test red. manager lib 429 green. e2e fence now passes its precheck; its recovery wait fails on HEAD too (recorded).
+Main gaps: none for R6.
+Next steps: step 4 (cluster acceptance batch).
+
 Date: 2026-09-27 (3)
 TaskStatus: completed
 Task scope: step 2 — BUG-FUSE-SIGKILL-DURING-NOTIFY: SIGTERM must not leave a zombie daemon behind the mount.

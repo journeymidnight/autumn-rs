@@ -21,12 +21,6 @@
 - `passes: false`
 - **notes** (2026-09-20): 已实现逐次 want 精确长度校验和 punch 前 sealed_length/carry 双重校验；5 条 GC streaming 单测通过，新增完整 record 边界及 offset=0 提前 EOF 回归。尚未完成真实双副本截短、checksum 两种状态及 PS 硬重启组合验收，不能按完整 R1 验收关闭。
 
-### F-REVIEW-R6-FENCE-CAPACITY — P2 Fence placement 与容量预检
-- **Trigger**: review.md R6；non-force 在没有合法 spare 时仍成功，1.2 倍容量承诺未实现。
-- **Scope**: 按 Recovery placement 排除 occupied/不可用节点；按副本或 shard 字节与实际 headroom 预留容量，缺失容量信号保守失败。
-- **Acceptance**: 无 spare、fenced/maintenance/suspected spare、容量不足均拒绝；合法目标可通过；force 保持显式覆盖。
-- `passes: false`
-
 ### F-REVIEW-T3-REAL-CRASH — P2 crash 测试真正停止旧 runtime
 - **Trigger**: review.md T3；drop RpcClient 不等于杀 PS/EN。
 - **Scope**: 改用可终止 runtime 或 SIGKILL 子进程并等待退出；compact/flush 用 durable/checkpoint barrier。
@@ -44,6 +38,19 @@
   断言因此没有意义。同日 merge 加了分离闸门，E7b 前补了"两侧 compact + 等 `has_overlap=0`"
   （否则 freeze 直接拒、manager kill 落空），**这一步未实跑**。另：该脚本开机时 `kill -9` 本机
   所有 `autumn-*`/`etcd` 进程，多租户机器上会杀掉别的工作树的进程。
+
+### BUG-E2E-FENCE-RECOVERY-STALLS — `e2e_fence_triggers_recovery_dispatch` 在 HEAD 上失败：fence 之后恢复 60 s 内没换掉副本
+- **Trigger** (2026-09-27，做 fence 预检时跑到): `cargo test -p autumn-manager --test e2e_lifecycle
+  e2e_fence_triggers_recovery_dispatch`（未标 ignore）在 `cd8a956` 上连续失败：3 个真 EN、RF2
+  extent 追加并 seal 后 fence 一个成员（此时 fence 返回 OK），轮询 60 s，
+  `recovery did not replace fenced victim N with healthy_target M`。与 fence 预检的改动无关
+  （改动前的 HEAD 同样失败；改动后测试多了一步等 df 上报）。
+- **未查**: 是恢复派发没发生、EN 执行失败，还是完成没被收回来。测试设了
+  `AUTUMN_MGR_RECOVERY_GATE=fenced_only`，代码仍读这个 env。
+- **Scope**: 先定位卡在哪一段（manager 日志的 dispatch / EN 的 recovery_done / apply），
+  再按根因修。
+- **Acceptance**: 该测试稳定通过；若根因在生产路径，修复要有消融。
+- `passes: false`
 
 ### F-REVIEW-V1-MERGE-REPLAY — 待验证：merge replay cursor 可达性
 - **Trigger**: review.md 4.1；数值模型不足以证明正常 merge 丢失数据。

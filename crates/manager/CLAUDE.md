@@ -934,7 +934,11 @@ wire-stable. `select_nodes` ANDs Online-state AND online-disk filters.
 **Operator overrides (etcd-persisted, `node_override/`).** `mgr_fence_node` /
 `mgr_set_node_maintenance` / `mgr_clear_node_override` / `mgr_remove_node`.
 `MgrNodeOverride` (keyed by node_id, carrying `node_uuid`) is the cleanup trigger.
-`mgr_fence_node`: capacity precheck unless `--force`, write the override, then
+`mgr_fence_node`: precheck unless `--force` (`check_capacity_for_fence`: every extent
+on the node needs a recovery target under `recovery_candidate_order`'s own filters —
+not `occupied`, not fenced/maintenance/suspected — one of them with df-reported room
+for its shard, and those receivers together 1.2x the bytes; no df row = no room),
+write the override, then
 `auto_abandon_for_fenced_node` sweeps ConvertToEc markers whose `target_nodes[0]` is
 the fenced node (atomic delete + `ec_convert_advisory/` for follow-up). Fencing an EN
 must NOT fence PS partition owners (writer fencing on takeover is

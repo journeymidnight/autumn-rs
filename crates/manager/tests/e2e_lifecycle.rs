@@ -319,8 +319,24 @@ fn e2e_fence_triggers_recovery_dispatch() {
             .copied()
             .expect("should have at least one non-replica candidate");
 
+        // The non-force fence counts a node without a df report as having no
+        // room, so wait for every node's first capacity report.
+        assert!(
+            poll_until_async(Duration::from_secs(30), Duration::from_millis(250), || async {
+                let Ok(bytes) = mgr.call(MSG_CLUSTER_DF, rkyv_encode(&ClusterDfReq {})).await else {
+                    return false;
+                };
+                let Ok(df) = rkyv_decode::<ClusterDfResp>(&bytes) else { return false };
+                [id1, id2, id3].iter().all(|id| {
+                    df.per_node.iter().any(|n| n.node_id == *id && n.online && n.free > 0)
+                })
+            })
+            .await,
+            "the nodes never reported their capacity"
+        );
+
         // Fence the victim. The capacity check should pass because we
-        // have a healthy alternative (healthy_target).
+        // have a healthy alternative (healthy_target) with room.
         let resp = fence(&mgr, victim_id, "e2e simulated failure", false).await;
         assert_eq!(resp.code, CODE_OK, "fence: {}", resp.message);
 

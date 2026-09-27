@@ -1270,6 +1270,21 @@ AO=(./target/release/autumn-op --manager 127.0.0.1:9001)
 "${AO[@]}" remove 56 --by you                            # 3. remove (server-side gated)
 ```
 
+Step 1 refuses (PRECONDITION) unless recovery could actually move every slot off
+the node: each extent on it needs a target that holds none of its other slots
+and is not fenced, in maintenance or suspected; one such target must report
+room for that extent's shard; and the nodes that may receive the slots must
+together report 1.2x the bytes to move. A node that has not answered `df` yet
+(right after registration, or unreachable) counts as having no room. The message
+names the extent, the byte shortfall, or the nodes that have not reported
+capacity yet (a freshly elected manager needs one df round, a few seconds,
+before a non-force fence can pass). Open tails count as 0 bytes — they are
+sealed at their real length only as the fence drains them — so a node holding
+many large open tails needs more headroom than the check asks for. Re-sending
+a fence for a node already fenced skips the check. `--force` skips the check — for when
+the loss of redundancy is intended (e.g. the node is already dead and there is
+no spare); the slots then stay degraded until a spare appears.
+
 On Kubernetes, `deploy/scripts/en-decommission.sh <ordinal>` does exactly the
 above and then deletes the workload — in that order, waiting at each gate:
 
@@ -4458,8 +4473,7 @@ Fence cancels recoveries targeting the node. If cancellation cannot persist,
 Remove reports those extents in blocking_marker_extent_ids until cleanup can
 retry. If a recovery commit wins first, Remove instead reports the resulting
 membership in blocking_extent_ids. A delayed completion cannot reintroduce a
-removed node or disk. This does not change the remaining fence-capacity precheck
-backlog.
+removed node or disk.
 
 Run on a host with Rust and etcd (or set AUTUMN_TEST_ETCD_BIN):
 

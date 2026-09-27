@@ -53,6 +53,11 @@ impl Drop for SplitInflightGuard {
 /// costs a retry, never data.)
 const MERGE_FREEZE_COMMIT_DEADLINE: Duration = Duration::from_secs(15);
 
+/// A non-force fence needs the nodes that may receive its slots to report this
+/// multiple (1.2x) of the bytes it moves off, so recovery does not fill them.
+const FENCE_HEADROOM_NUM: u64 = 12;
+const FENCE_HEADROOM_DEN: u64 = 10;
+
 /// Test-only failpoint: sleep this many ms between the commit_length capture and
 /// the merge txn inside `handle_merge_partitions`, simulating a paused/slow
 /// coordinator so the freeze-budget guard can be exercised deterministically.
@@ -6538,8 +6543,15 @@ impl AutumnManager {
                 req.node_id
             )));
         }
-        // #5 capacity precheck (unless --force).
-        if !req.force {
+        // Precheck unless --force, or unless this is a retry of a fence that
+        // already landed (a lost reply must not turn into a refusal because a
+        // spare's df happened to time out this tick). The rest still runs: its
+        // cancellations are the part a retry exists to finish.
+        let already_fenced = matches!(
+            self.node_overrides.borrow().get(&req.node_id).map(|o| o.kind),
+            Some(NODE_OVERRIDE_FENCED)
+        );
+        if !req.force && !already_fenced {
             self.check_capacity_for_fence(req.node_id)?;
         }
         // Persist the override. Capture the node's stable
@@ -6611,41 +6623,95 @@ impl AutumnManager {
         Ok(())
     }
 
-    /// #5: refuse fence if the cluster doesn't have enough
-    /// remaining free space to absorb the node's data. Returns
-    /// Precondition when the safety factor (default 1.2x) is not met.
+    /// Refuse a non-force fence that recovery could not carry out.
+    ///
+    /// Fencing hands every slot on the node to recovery, which rebuilds each
+    /// one on a node that is neither already a member of that extent
+    /// (`occupied`) nor fenced / maintenance / suspected — the same filters
+    /// `recovery_candidate_order` applies. So the check is per extent: each
+    /// must have such a target, and one of them must have room for its
+    /// shard; and the nodes that may receive them must together report
+    /// `FENCE_HEADROOM_*` (1.2x) the bytes to move. A node without a capacity signal this tick
+    /// (no df row, or its probe failed) counts as zero free — no signal is
+    /// not room. `--force` skips all of it.
     fn check_capacity_for_fence(&self, node_id: u64) -> Result<(), AppError> {
+        let mut excluded = self.placement_excluded_node_ids();
+        excluded.insert(node_id);
+        let free: HashMap<u64, u64> = self
+            .cluster_cap
+            .borrow()
+            .per_node
+            .iter()
+            .filter(|(_, c)| c.online)
+            .map(|(id, c)| (*id, c.free))
+            .collect();
         let s = self.store.inner.borrow();
-        // Sum sealed_length of extents that have any slot on this node.
-        let mut data_to_migrate: u64 = 0;
+        let eligible: Vec<u64> = s
+            .nodes
+            .keys()
+            .copied()
+            .filter(|id| !excluded.contains(id))
+            .collect();
+        let free_of = |id: &u64| free.get(id).copied().unwrap_or(0);
+        let mut to_move: u64 = 0;
+        // Nodes that are a legal target for at least one of the slots: the
+        // only ones whose free space the rebuilds can use.
+        let mut receivers: HashSet<u64> = HashSet::new();
         for ex in s.extents.values() {
-            if Self::extent_nodes(ex).contains(&node_id) {
-                // Per-shard size for EC, full size for replication.
-                let shard_size =
-                    if ex.ec_converted && !ex.replicates.is_empty() && !ex.parity.is_empty() {
-                        let k = ex.replicates.len() as u64;
-                        ex.sealed_length.div_ceil(k.max(1))
-                    } else {
-                        ex.sealed_length
-                    };
-                data_to_migrate = data_to_migrate.saturating_add(shard_size);
+            let occupied = Self::extent_nodes(ex);
+            if !occupied.contains(&node_id) {
+                continue;
             }
+            // Per-shard size for EC, full size for replication.
+            let shard_size =
+                if ex.ec_converted && !ex.replicates.is_empty() && !ex.parity.is_empty() {
+                    let k = ex.replicates.len() as u64;
+                    ex.sealed_length.div_ceil(k.max(1))
+                } else {
+                    ex.sealed_length
+                };
+            let targets: Vec<u64> = eligible
+                .iter()
+                .copied()
+                .filter(|id| !occupied.contains(id))
+                .collect();
+            if targets.is_empty() {
+                return Err(AppError::Precondition(format!(
+                    "extent {} has no recovery target: its other slots are on {:?}, and no \
+                     other node exists or every other one is fenced, in maintenance or \
+                     suspected (use --force to override)",
+                    ex.extent_id,
+                    occupied.iter().filter(|id| **id != node_id).collect::<Vec<_>>()
+                )));
+            }
+            if !targets.iter().any(|id| free_of(id) >= shard_size) {
+                // Say which it is: "no report yet" (a new leader before its
+                // first df, or a timed-out probe) reads nothing like "full".
+                let unreported: Vec<u64> =
+                    targets.iter().copied().filter(|id| !free.contains_key(id)).collect();
+                return Err(AppError::Precondition(if unreported.len() == targets.len() {
+                    format!(
+                        "extent {}: no capacity report yet from its recovery targets {:?} \
+                         (df not answered this tick); retry shortly or use --force",
+                        ex.extent_id, targets
+                    )
+                } else {
+                    format!(
+                        "extent {}: no recovery target {:?} reports {} free bytes for its \
+                         shard (no report from {:?}) (use --force to override)",
+                        ex.extent_id, targets, shard_size, unreported
+                    )
+                }));
+            }
+            to_move = to_move.saturating_add(shard_size);
+            receivers.extend(targets);
         }
-        // Estimate remaining capacity from disk metadata; treat missing
-        // sizes as 0 (conservative — refuses if we have no signal).
-        // The MgrDiskInfo struct doesn't track free bytes today, so we
-        // do a coarse "is there at least one online disk on a different
-        // node?" check — recovery dispatch needs >= 1 healthy target.
-        let has_alt_targets = s.nodes.values().any(|n| {
-            n.node_id != node_id
-                && n.disks
-                    .iter()
-                    .any(|did| s.disks.get(did).map(|d| d.online).unwrap_or(false))
-        });
-        if !has_alt_targets && data_to_migrate > 0 {
+        let headroom: u64 = receivers.iter().map(free_of).sum();
+        let needed = to_move.saturating_mul(FENCE_HEADROOM_NUM) / FENCE_HEADROOM_DEN;
+        if headroom < needed {
             return Err(AppError::Precondition(format!(
-                "no healthy target nodes available to receive ~{} bytes from node {} (use --force to override)",
-                data_to_migrate, node_id
+                "moving {to_move} bytes off node {node_id} needs {needed} free on the \
+                 nodes that may receive them; they report {headroom} (use --force to override)"
             )));
         }
         Ok(())
@@ -8696,5 +8762,217 @@ mod cluster_df_disk_tests {
         let resp = m.compute_cluster_df_resp();
         let ids: Vec<u64> = resp.per_node[0].disks.iter().map(|d| d.disk_id).collect();
         assert_eq!(ids, vec![10], "disk 20 belongs to node 2");
+    }
+}
+
+#[cfg(test)]
+mod fence_precheck_tests {
+    //! A non-force fence must be refused unless recovery could rebuild every
+    //! slot on the node: a legal target per extent (not a member, not
+    //! fenced / maintenance / suspected), room for its shard, and 1.2x the
+    //! bytes in total across the eligible nodes.
+    use super::*;
+    use crate::persist::records::{ExtentRecord, NodeRecord};
+    use crate::NodeCap;
+
+    /// Nodes `nodes`, one RF2 extent per `(id, [a, b], sealed_length)`, and a
+    /// df row with `free` bytes for each node listed in `free`.
+    fn cluster(nodes: &[u64], extents: &[(u64, [u64; 2], u64)], free: &[(u64, u64)]) -> AutumnManager {
+        cluster_with(nodes, extents, &free.iter().map(|(n, f)| (*n, *f, true)).collect::<Vec<_>>())
+    }
+
+    /// As `cluster`, with each df row's `online` flag given: a probe that
+    /// failed this tick leaves `online: false`, not a missing row.
+    fn cluster_with(
+        nodes: &[u64],
+        extents: &[(u64, [u64; 2], u64)],
+        free: &[(u64, u64, bool)],
+    ) -> AutumnManager {
+        let m = AutumnManager::new();
+        {
+            let mut s = m.store.inner.borrow_mut();
+            for nid in nodes {
+                s.nodes.insert(
+                    *nid,
+                    NodeRecord {
+                        node_id: *nid,
+                        address: format!("127.0.0.1:{}", 9000 + nid),
+                        disks: vec![*nid],
+                        shard_ports: vec![],
+                        control_address: String::new(),
+                        node_uuid: format!("uuid-{nid}"),
+                    },
+                );
+            }
+            for (eid, reps, len) in extents {
+                s.extents.insert(
+                    *eid,
+                    ExtentRecord {
+                        extent_id: *eid,
+                        replicates: reps.to_vec(),
+                        eversion: 1,
+                        refs: 1,
+                        sealed_length: *len,
+                        sealed: true,
+                        avali: 0b11,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        m.cluster_cap.borrow_mut().per_node = free
+            .iter()
+            .map(|(nid, f, online)| {
+                (
+                    *nid,
+                    NodeCap { total: 1 << 40, free: *f, extent_bytes: 0, online: *online, disks: Vec::new() },
+                )
+            })
+            .collect();
+        m
+    }
+
+    fn set_override(m: &AutumnManager, node_id: u64, kind: u8) {
+        m.node_overrides.borrow_mut().insert(
+            node_id,
+            MgrNodeOverride {
+                node_id,
+                kind,
+                set_at: 0,
+                set_by: "test".into(),
+                reason: String::new(),
+                expire_at: 0,
+                node_uuid: String::new(),
+            },
+        );
+    }
+
+    fn refused(m: &AutumnManager, node_id: u64) -> String {
+        match m.check_capacity_for_fence(node_id) {
+            Err(AppError::Precondition(msg)) => msg,
+            other => panic!("fence of {node_id} must be refused, got {other:?}"),
+        }
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn a_legal_target_with_room_passes() {
+        let m = cluster(&[1, 2, 3], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB), (3, 10 * GIB)]);
+        m.check_capacity_for_fence(1).expect("node 3 can take extent 7's slot");
+    }
+
+    /// The review's case: an RF2 extent already on the only two nodes.
+    #[test]
+    fn no_spare_is_refused() {
+        let m = cluster(&[1, 2], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB)]);
+        assert!(refused(&m, 1).contains("extent 7 has no recovery target"));
+    }
+
+    #[test]
+    fn a_spare_that_is_fenced_in_maintenance_or_suspected_does_not_count() {
+        for how in ["fenced", "maintenance", "suspected"] {
+            let m = cluster(&[1, 2, 3], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB), (3, 10 * GIB)]);
+            match how {
+                "fenced" => set_override(&m, 3, NODE_OVERRIDE_FENCED),
+                "maintenance" => set_override(&m, 3, NODE_OVERRIDE_MAINTENANCE),
+                _ => {
+                    // Zero soft timeout: one failure after a verified-alive
+                    // heartbeat makes the node Suspected at once.
+                    let mut st = m.node_states.borrow_mut();
+                    *st = crate::node_state::NodeStateTracker::new(std::time::Duration::ZERO);
+                    st.on_heartbeat_ok(3);
+                    st.on_heartbeat_fail(3);
+                    assert!(st.suspected_node_ids().contains(&3));
+                }
+            }
+            assert!(
+                refused(&m, 1).contains("no recovery target"),
+                "a {how} spare was counted as a target"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_without_room_for_the_shard_is_refused() {
+        let m = cluster(&[1, 2, 3], &[(7, [1, 2], 4 * GIB)], &[(1, 10 * GIB), (2, 10 * GIB), (3, GIB)]);
+        assert!(refused(&m, 1).contains("free bytes for its shard"));
+    }
+
+    /// No df row for the only spare, or a row whose probe failed this tick:
+    /// unknown capacity is not room, and the message says it is unknown.
+    #[test]
+    fn a_target_without_a_capacity_signal_is_refused() {
+        let absent = cluster(&[1, 2, 3], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB)]);
+        assert!(refused(&absent, 1).contains("no capacity report yet"));
+        let failed = cluster_with(
+            &[1, 2, 3],
+            &[(7, [1, 2], GIB)],
+            &[(1, 10 * GIB, true), (2, 10 * GIB, true), (3, 10 * GIB, false)],
+        );
+        assert!(refused(&failed, 1).contains("no capacity report yet"));
+    }
+
+    /// An EC extent moves one shard (sealed_length / K), and its parity nodes
+    /// are members too, so they are not targets.
+    #[test]
+    fn an_ec_extent_needs_room_for_one_shard_off_its_members() {
+        let m = cluster(&[1, 2, 3, 4, 5], &[], &[(4, 3 * GIB), (5, GIB)]);
+        m.store.inner.borrow_mut().extents.insert(
+            9,
+            ExtentRecord {
+                extent_id: 9,
+                replicates: vec![1, 2],
+                parity: vec![3],
+                ec_converted: true,
+                eversion: 1,
+                refs: 1,
+                sealed_length: 4 * GIB,
+                sealed: true,
+                avali: 0b111,
+                ..Default::default()
+            },
+        );
+        // Shard = 2 GiB: node 4 has room, node 3 (parity) is a member.
+        m.check_capacity_for_fence(1).expect("node 4 takes the 2 GiB shard");
+        m.cluster_cap.borrow_mut().per_node.retain(|(id, _)| *id != 4);
+        let msg = refused(&m, 1);
+        assert!(msg.contains("free bytes for its shard"), "{msg}");
+    }
+
+    /// Each shard fits the spare on its own; together, with the 1.2x margin,
+    /// they do not.
+    #[test]
+    fn the_total_needs_the_headroom_margin() {
+        let m = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], 5 * GIB), (8, [1, 2], 5 * GIB)],
+            &[(1, 100 * GIB), (2, 100 * GIB), (3, 11 * GIB)],
+        );
+        assert!(refused(&m, 1).contains("needs"), "10 GiB to move against 11 GiB free is under 1.2x");
+        let roomy = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], 5 * GIB), (8, [1, 2], 5 * GIB)],
+            &[(1, 100 * GIB), (2, 100 * GIB), (3, 12 * GIB)],
+        );
+        roomy.check_capacity_for_fence(1).expect("12 GiB covers 10 GiB at 1.2x");
+    }
+
+    /// `--force` is the explicit override: the same no-spare cluster fences.
+    #[test]
+    fn force_skips_the_check() {
+        let m = cluster(&[1, 2], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB)]);
+        let call = |force: bool| {
+            let req = FenceNodeReq { node_id: 1, reason: "t".into(), set_by: "t".into(), force };
+            let bytes = compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(m.handle_fence_node(rkyv_encode(&req)))
+                .expect("fence");
+            rkyv_decode::<CodeResp>(&bytes).expect("decode").code
+        };
+        assert_eq!(call(false), CODE_PRECONDITION);
+        assert_eq!(call(true), CODE_OK);
+        // A retry of a fence that landed does not re-run the precheck.
+        assert_eq!(call(false), CODE_OK, "re-fencing a fenced node must stay idempotent");
     }
 }
