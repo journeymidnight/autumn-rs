@@ -400,6 +400,13 @@ called at all"，那正是这份记录存在要堵的洞。
 per-session lease 后台任务（5s heartbeat 续所有 held lease + 持久 invalidation
 long-poll + `LeaseRevoked` 驱逐）在 `lease_tasks.rs`（core）；mount 传真 kernel
 invalidator，binding 传 None（headless，无内核页缓存驱逐）。
+`FsState.page_cache_generation` 只有挂载用：挂载跨 open 保留内核页缓存，没持 lease 的 Open
+用 `meta::fetch_inode`（直读 KV、不碰 `state.inodes`）拿 `generation` 与这张表比，决定保不保留
+（见 `crates/fuse/CLAUDE.md`「页缓存」）。
+`FsState.meta_invalidated`：轮询循环收到某 ino 的失效事件（或 poll 失败 / overflow 丢掉全部
+held lease）就标记它，`meta::get_inode` 遇到标记时从 KV 重读一次——缓存的 meta 不再活过
+别处的写者关闭。本会话持写 lease 或 inode 脏时不重读（缓存的 size 可能领先 KV，收下更小的
+就是 `get_inode_uncached` 说的删数据）。挂载与 binding 都经过这里。
 
 - **写写围栏**：写路径 `acquire(WRITE)` 环绕；冲突时 fsspec facade 抛
   `BlockingIOError`，被抢占租约标 revoked、`write` 对 revoked 租约快失败（无租约的

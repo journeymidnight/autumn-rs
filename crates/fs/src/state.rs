@@ -156,6 +156,24 @@ pub struct FsState {
     /// the alias here to avoid a dispatch ↔ state circular dep.
     pub kernel_invalidator: RefCell<Option<Rc<dyn Fn(u64)>>>,
 
+    /// The content `generation` the kernel's page cache of each inode was
+    /// last known to hold, read fresh from the PS at an Open that held no
+    /// lease. The mount answers opens with `FOPEN_KEEP_CACHE`, so cached pages
+    /// outlive the last close — and with it the lease, so no invalidation
+    /// reaches this mount for writes made after that. The next lease-less
+    /// Open keeps the cache only if the generation still matches. Dropped
+    /// when the kernel forgets the inode (its pages go with it). FUSE only.
+    pub page_cache_generation: HashMap<u64, u64>,
+
+    /// Inodes whose cached `InodeState.meta` a manager invalidation has
+    /// overtaken (another client's writer closed, or this session's lease
+    /// state was lost), filled by the invalidation poll loop and consumed by
+    /// `meta::get_inode`, which re-reads the meta from KV once. Without it a
+    /// cached size outlives an append made elsewhere: the kernel, reading
+    /// through its page cache, asks GETATTR for the size and never sends a
+    /// READ past the answer.
+    pub meta_invalidated: Rc<RefCell<HashSet<u64>>>,
+
     /// when true, whole-extent reads (≥ 64 KiB) bypass the PS
     /// and read straight from an extent node (`get_many_direct`); otherwise the
     /// PS-proxied bulk path (`get_many_into`). Topology-dependent (needs the fuse
@@ -285,6 +303,8 @@ impl FsState {
             invalidations: Rc::new(RefCell::new(InvalidationMap::new())),
             notify_inval_failed: Rc::new(RefCell::new(HashSet::new())),
             kernel_invalidator: RefCell::new(None),
+            page_cache_generation: HashMap::new(),
+            meta_invalidated: Rc::new(RefCell::new(HashSet::new())),
             direct_read: false,
             pipelined_writes: false,
             segment_pages: crate::segment::PageCache::new(),

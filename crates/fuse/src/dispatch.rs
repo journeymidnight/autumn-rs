@@ -189,6 +189,33 @@ pub fn inode_cache_needs_reload(cached_version: u64, acquired_version: u64) -> b
     acquired_version > 0 && cached_version < acquired_version
 }
 
+/// Open reply flag: the kernel keeps the inode's page cache across this open
+/// instead of dropping it (`fuse_finish_open`).
+pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+
+/// Whether an Open may keep the kernel's cached pages of the inode.
+///
+/// - While this mount held a lease before the Open, every other client's
+///   write reached it as an invalidation, so the pages are as current as
+///   the mount's open fds see them.
+/// - Without one, pages from before the last close may predate writes this
+///   mount never heard of: keep them only if the generation read fresh at
+///   this Open (`fresh`) is the one recorded when they were last vouched for
+///   (`recorded`). `None` for `fresh` means it could not be read.
+/// - A failed kernel invalidation (`sticky_inval_failed`) means the pages may
+///   be stale whatever the lease says.
+pub fn open_keeps_page_cache(
+    sticky_inval_failed: bool,
+    lease_was_held: bool,
+    recorded: Option<u64>,
+    fresh: Option<u64>,
+) -> bool {
+    if sticky_inval_failed {
+        return false;
+    }
+    lease_was_held || (fresh.is_some() && recorded == fresh)
+}
+
 /// BUG-LEASE-6 (P2 #7, 2026-06-06) — pure-fn predicate used by the
 /// Open / Read arms to detect that the per-mount kernel
 /// `notify_inval_inode` call FAILED for this ino during the most
@@ -328,6 +355,9 @@ pub async fn handle_request(
                 *count = count.saturating_sub(nlookup);
                 if *count == 0 {
                     state.lookup_count.remove(&ino);
+                    // The kernel inode, and its pages, are gone.
+                    state.page_cache_generation.remove(&ino);
+                    state.meta_invalidated.borrow_mut().remove(&ino);
                     // Evict from cache if not open
                     if let Some(is) = state.inodes.get(&ino) {
                         if is.open_count == 0 && !is.dirty {
@@ -620,8 +650,10 @@ pub async fn handle_request(
                 //     either grants (bumping our epoch) or reports another
                 //     client's writer as a conflict, exactly as a fresh open would.
                 let mut needs_acquire = false;
+                let lease_was_held;
                 {
                     let mut m = state.held_leases.borrow_mut();
+                    lease_was_held = m.get(&ino).is_some_and(|slot| !slot.revoked);
                     match m.get_mut(&ino) {
                         Some(slot) if slot.revoked => {
                             // R2-P0 #3 — the prior lease was revoked
@@ -711,6 +743,38 @@ pub async fn handle_request(
                         .unwrap_or(0)
                 };
 
+                // Read after the acquire: a writer that closes later
+                // invalidates this mount; one that closed earlier has
+                // already published its generation. A failed read only
+                // costs the cached pages.
+                let fresh_meta = if lease_was_held {
+                    None
+                } else {
+                    match fetch_inode(state, ino).await {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            tracing::warn!(ino, error = %e, "open: generation unreadable; dropping the page cache");
+                            None
+                        }
+                    }
+                };
+                let fresh_generation = fresh_meta.as_ref().map(|m| m.generation);
+                let keep_cache = open_keeps_page_cache(
+                    sticky_failed,
+                    lease_was_held,
+                    state.page_cache_generation.get(&ino).copied(),
+                    fresh_generation,
+                );
+                match fresh_generation {
+                    Some(g) => {
+                        state.page_cache_generation.insert(ino, g);
+                    }
+                    None if !lease_was_held => {
+                        state.page_cache_generation.remove(&ino);
+                    }
+                    None => {}
+                }
+
                 // BUG-LEASE-7: now publish to the per-inode cache.
                 // If a cached entry exists AND its `cached_version`
                 // is older than the freshly-acquired lease version,
@@ -750,7 +814,10 @@ pub async fn handle_request(
                         is.cached_version = acquired_version;
                     }
                 } else {
-                    let meta = get_inode(state, ino).await?;
+                    let meta = match fresh_meta {
+                        Some(m) => m,
+                        None => get_inode(state, ino).await?,
+                    };
                     state.inodes.insert(
                         ino,
                         InodeState {
@@ -765,7 +832,8 @@ pub async fn handle_request(
                         },
                     );
                 }
-                Ok(ino) // use ino as file handle
+                // ino is the file handle.
+                Ok((ino, if keep_cache { FOPEN_KEEP_CACHE } else { 0 }))
             }
             .await;
             let _ = reply.send(result);
@@ -990,6 +1058,15 @@ pub async fn handle_request(
                         }
                     }
                 }
+                // A write fd closing after a clean flush: the kernel's pages
+                // hold what this mount wrote under its write lease, and the
+                // generation it just published names that content — so the
+                // next lease-less Open can keep them.
+                if role == LEASE_MODE_WRITE && !flush_failed {
+                    if let Some(is) = state.inodes.get(&ino).filter(|is| !is.dirty) {
+                        state.page_cache_generation.insert(ino, is.meta.generation);
+                    }
+                }
                 if let Some(is) = state.inodes.get_mut(&ino) {
                     is.open_count = is.open_count.saturating_sub(1);
                     // Evict from cache if no longer open and not dirty
@@ -1194,6 +1271,34 @@ pub async fn handle_request(
         }
     }
     true // continue processing
+}
+
+#[cfg(test)]
+mod page_cache_tests {
+    use super::open_keeps_page_cache;
+
+    /// The cluster-boot suite (`fuse_page_cache.rs`) is `#[ignore]`d; the
+    /// decision table runs by default here.
+    #[test]
+    fn keep_only_what_a_lease_or_a_matching_generation_vouches_for() {
+        // (sticky, held, recorded, fresh) -> keep
+        let table = [
+            (false, true, None, None, true),
+            (true, true, Some(3), None, false),
+            (false, false, Some(3), Some(3), true),
+            (false, false, Some(3), Some(4), false),
+            (false, false, None, Some(3), false),
+            (false, false, Some(3), None, false), // generation unreadable
+            (true, false, Some(3), Some(3), false),
+        ];
+        for (sticky, held, recorded, fresh, want) in table {
+            assert_eq!(
+                open_keeps_page_cache(sticky, held, recorded, fresh),
+                want,
+                "sticky={sticky} held={held} recorded={recorded:?} fresh={fresh:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

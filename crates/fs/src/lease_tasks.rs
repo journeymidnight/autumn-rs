@@ -133,6 +133,7 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
     let id_p = state.client_id.clone();
     let held_p = state.held_leases.clone();
     let inv_p = state.invalidations.clone();
+    let stale_p = state.meta_invalidated.clone();
     let invalidator_p = invalidator;
     compio::runtime::spawn(async move {
         loop {
@@ -150,6 +151,9 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                             "invalidation"
                         );
                     }
+                    stale_p
+                        .borrow_mut()
+                        .extend(events.iter().map(|ev| ev.ino).filter(|&ino| ino != 0));
                     // Drop the kernel's attribute + page cache for each non-zero
                     // ino (ino=0 is the overflow sentinel, handled below).
                     if let Some(inv) = &invalidator_p {
@@ -178,6 +182,7 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                         let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
                         held_p.borrow_mut().clear();
                         inv_p.borrow_mut().clear();
+                        stale_p.borrow_mut().extend(drained.iter().copied());
                         if let Some(inv) = &invalidator_p {
                             for ino in &drained {
                                 inv(*ino);
@@ -200,6 +205,7 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                     let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
                     held_p.borrow_mut().clear();
                     inv_p.borrow_mut().clear();
+                    stale_p.borrow_mut().extend(drained.iter().copied());
                     if let Some(inv) = &invalidator_p {
                         for ino in &drained {
                             inv(*ino);

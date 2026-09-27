@@ -193,18 +193,49 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
     }
 }
 
-/// Fetch inode metadata from KV store (or cache).
+/// Fetch inode metadata from the cache, or from KV when it is not cached or
+/// an invalidation has overtaken the cached copy (`FsState::meta_invalidated`).
+///
+/// The cached copy stays authoritative while this session holds the inode's
+/// write lease (not revoked) or has it dirty: nobody else can change the file
+/// then, so a mark (a `WillRevokeIn` to us) says nothing about its content —
+/// and this session's size may be ahead of KV's (flush clears `dirty` before
+/// its put lands; a failed put leaves it so). Adopting KV's smaller size there
+/// is the data loss `get_inode_uncached` describes. The mark is taken BEFORE
+/// the read, so an event arriving during it marks the inode again; a failed
+/// read puts it back and returns the error.
 pub async fn get_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
-    // Check cache first
     if let Some(is) = state.inodes.get(&ino) {
-        return Ok(is.meta.clone());
+        let own_writer = state.held_leases.borrow().get(&ino).is_some_and(|l| {
+            l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE && !l.revoked
+        });
+        if is.dirty || own_writer || !state.meta_invalidated.borrow().contains(&ino) {
+            return Ok(is.meta.clone());
+        }
     }
-    // Fetch from KV
-    let k = key::inode_key(ino);
-    let value = state.kv_get(&k).await?;
-    let meta: InodeMeta = schema::decode_inode_meta(&value)
-        .map_err(|e| anyhow!("decode InodeMeta for ino {}: {}", ino, e))?;
-    Ok(meta)
+    let marked = state.meta_invalidated.borrow_mut().remove(&ino);
+    let fresh = match fetch_inode(state, ino).await {
+        Ok(m) => m,
+        Err(e) => {
+            if marked {
+                state.meta_invalidated.borrow_mut().insert(ino);
+            }
+            return Err(e);
+        }
+    };
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.meta = fresh.clone();
+        // The striped extent map is computed from size; drop it with the meta.
+        is.extents = None;
+    }
+    Ok(fresh)
+}
+
+/// Read inode metadata from KV, ignoring and not touching the cache.
+pub async fn fetch_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
+    let value = state.kv_get(&key::inode_key(ino)).await?;
+    schema::decode_inode_meta(&value)
+        .map_err(|e| anyhow!("decode InodeMeta for ino {}: {}", ino, e))
 }
 
 /// Re-read inode metadata from KV, BYPASSING the cache, and refresh the cached
@@ -219,10 +250,7 @@ pub async fn get_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
 /// only ever the grew-in-KV direction; see the comment on the check itself for
 /// why the other direction must be refused.
 pub async fn get_inode_uncached(state: &mut FsState, ino: u64) -> Result<(InodeMeta, bool)> {
-    let k = key::inode_key(ino);
-    let value = state.kv_get(&k).await?;
-    let fresh: InodeMeta = schema::decode_inode_meta(&value)
-        .map_err(|e| anyhow!("decode InodeMeta for ino {}: {}", ino, e))?;
+    let fresh = fetch_inode(state, ino).await?;
     let mut changed = false;
     if let Some(is) = state.inodes.get_mut(&ino) {
         // ONLY adopt a LARGER size, and report only that as `changed`.

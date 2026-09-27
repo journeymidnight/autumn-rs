@@ -85,9 +85,9 @@ struct Args {
     /// eight separate CLI processes on the same files — so 87% of that at four
     /// threads, and a rerun of the same cell landed 5186-5396 (95-99%). Going
     /// higher was not measured. Single-stream reads showed no trend across any
-    /// of these settings; a synchronous reader is latency-bound because the
-    /// kernel does not appear to issue concurrent FUSE reads for one, which is
-    /// also why every readahead knob measured flat.
+    /// of these settings (measured when opens were direct-io, so a synchronous
+    /// `read` reached the mount one request at a time; readahead now fans a
+    /// single reader out, see `--readahead-kb`).
     ///
     /// Each thread carries its own registered-buffer pool, capped per thread
     /// (`REGPOOL_CAP_BYTES`, 512 MiB by default), so raising this raises the
@@ -98,6 +98,16 @@ struct Args {
     /// one manager connection and one connection pool per thread.
     #[arg(long, default_value_t = 4)]
     read_io_threads: usize,
+
+    /// Readahead window of the mount, in KiB, written to the mount's
+    /// `/sys/class/bdi/<dev>/read_ahead_kb` once it is mounted (FUSE INIT can
+    /// only lower the kernel's 128 KiB default). An mmap page fault reads this
+    /// window around the faulting page and waits for it, so an mmap loader
+    /// (safetensors) gets about one window per round trip. Set on the first
+    /// open (INIT would overwrite an earlier write); a mount that cannot open
+    /// the sysfs file fails. `0` leaves the kernel default alone.
+    #[arg(long, default_value_t = 4096)]
+    readahead_kb: u32,
 }
 
 fn main() -> Result<()> {
@@ -201,7 +211,12 @@ fn main() -> Result<()> {
     }
 
     let shutdown_tx = tx.clone();
-    let fs = AutumnFs::new(tx);
+    // Resolved before mounting: once mounted, resolving the path would stat
+    // the mount's root, and nothing answers until `session.run`.
+    let mountpoint_abs = std::fs::canonicalize(&mountpoint)
+        .with_context(|| format!("resolve mountpoint {}", mountpoint.display()))?;
+    let readahead = (args.readahead_kb > 0).then_some((mountpoint_abs, args.readahead_kb));
+    let fs = AutumnFs::new(tx, readahead);
     tracing::info!(mountpoint = %mountpoint.display(), "mounting filesystem");
     let mut session = fuser::Session::new(fs, &mountpoint, &options)?;
     let notifier = session.notifier();

@@ -232,7 +232,7 @@ fn a_failed_last_writer_flush_keeps_the_write_lease() {
         meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
 
         // The faststart shape: a write fd and a read fd on the same inode.
-        let (tx, rx) = bridge::reply_channel::<u64>();
+        let (tx, rx) = bridge::reply_channel::<(u64, u32)>();
         dispatch::handle_request(
             &mut state,
             FsRequest::Open { ino, flags: 2, reply: tx },
@@ -240,7 +240,7 @@ fn a_failed_last_writer_flush_keeps_the_write_lease() {
         )
         .await;
         rx.recv().expect("open reply").expect("write open");
-        let (tx, rx) = bridge::reply_channel::<u64>();
+        let (tx, rx) = bridge::reply_channel::<(u64, u32)>();
         dispatch::handle_request(
             &mut state,
             FsRequest::Open { ino, flags: 0, reply: tx },

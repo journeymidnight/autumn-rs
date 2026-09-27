@@ -97,7 +97,7 @@ pub enum FsRequest {
     Open {
         ino: u64,
         flags: i32,
-        reply: Reply<u64>, // fh
+        reply: Reply<(u64, u32)>, // (fh, FOPEN_* flags)
     },
     /// **Async-reply Read** — does NOT use the std::mpsc reply channel.
     /// Instead, the fuser-side `ReplyData` is shipped across the bridge

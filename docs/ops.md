@@ -570,13 +570,28 @@ replacement container. It reads `/proc/mounts` (pure VFS metadata, never blocks)
 and unmounts lazily (`fusermount3 -uz`). Env → flag: `AUTUMN_MANAGER`, `AUTUMN_FUSE_MOUNTPOINT`,
 `AUTUMN_CREDENTIAL_FILE`, `AUTUMN_FUSE_DIRECT_READ`, `AUTUMN_FUSE_ALLOW_OTHER`.
 
-⚠️ **The mount sets `FOPEN_DIRECT_IO` on every open** (`crates/fuse/src/ops.rs`),
-so the kernel serves no page cache for it — and a **`MAP_SHARED` mmap of a file
-on this mount fails with `ENODEV`** (the kernel refuses shared mappings on a
-direct_io FUSE file). Readers that mmap must use `MAP_PRIVATE`, or read with
-`pread`/`preadv`. This bites model loaders: a loader that falls back to
-`mmap.mmap(fd, 0)` (Python's default is `MAP_SHARED`) will fail on this mount
-even though plain reads work.
+**Reads go through the kernel page cache, and cached pages survive a reopen**
+(`FOPEN_KEEP_CACHE`) unless the file may have changed: an open that finds this
+mount already holding the file's lease keeps them (other clients' writes reach a
+lease holder as invalidations); an open without one reads the file's content
+generation from the PS and keeps them only if it is the one seen last time. So a
+second load of the same weights is served from memory, and `MAP_SHARED` mmaps
+(Python's `mmap.mmap(fd, 0)`) work.
+
+**`--readahead-kb` (default 4096)** sets the mount's page-cache readahead
+window (`/sys/class/bdi/<dev>/read_ahead_kb`, written on the first open — FUSE
+INIT can only lower it, and the kernel re-applies INIT's value when it answers).
+An mmap loader (safetensors `load_file`) waits for one window per page fault, so
+on a network path the window is its throughput: measured at 4 ms per read,
+128 KiB gave 108 MiB/s, 4 MiB 823 MiB/s. Check it after mounting:
+
+```bash
+cat /sys/class/bdi/$(awk '$5=="/mnt/autumn"{print $3}' /proc/self/mountinfo)/read_ahead_kb
+# 4096 once anything has been opened (128 before the first open)
+```
+
+The mount fails to start if the sysfs file cannot be opened (a read-only `/sys`
+in an unprivileged container); `--readahead-kb 0` keeps the kernel default.
 
 **`O_DIRECT` opens DO work** (measured 2026-09-01, VKE, kernel 5.15):
 
@@ -585,11 +600,8 @@ dd if=<file on mount> of=/dev/null bs=4096 count=1 iflag=direct   # OK
 dd if=<file on mount> of=/dev/null bs=8M   count=1 iflag=direct   # OK
 ```
 
-That matters for weight loaders that probe `O_DIRECT` once and fall back to
-mmap on failure — the probe succeeds here, so they stay on the `preadv` path and
-never reach the `MAP_SHARED` trap above. Verify it on a new kernel/topology
-before relying on it; the two behaviours are independent (the FUSE `direct_io`
-flag is about the page cache, `O_DIRECT` is about the opener's request).
+An `O_DIRECT` reader bypasses the page cache and gets no readahead: each read
+is one round trip, so it needs large reads or concurrency to be fast.
 
 ### `--direct-read` — bypass the PS for large reads
 
@@ -2335,6 +2347,54 @@ P-log`; delete all PS pods in parallel to rebuild.)
 
 ## Chaos suites
 
+### Page cache: no stale reads across mounts (`fuse_page_cache.sh`)
+
+Two mounts of one cluster, A reads and B writes, every rewrite the same size (so
+only the content generation tells old from new):
+
+```bash
+AUTUMN_DATA_ROOT=/data05/autumn-pc ./scripts/fuse_page_cache.sh
+```
+
+Pass = every line `ok`, then `PASS`: SHARED (a `MAP_SHARED` mmap works), KEEP
+(pages read through A are still resident after A reopens), REOPEN (B rewrites
+while A has the file closed — no lease, no invalidation — and A's next open reads
+the new bytes), HELD (A holds an fd; B rewrites; A's same fd sees the new bytes
+within 5 s), TAIL (A holds an fd read to EOF; B appends; A's same fd reads past
+the old EOF within 5 s — the kernel learns the size only from GETATTR), LOCAL (two fds and a mapping on one mount agree), MMAPW (bytes stored
+through A's writable shared mapping are what B reads). To see it discriminate,
+point `FUSE_BIN` at a build whose `open_keeps_page_cache` ignores the generation
+(`lease_was_held || recorded.is_some()`): REOPEN and MMAPW fail with old bytes;
+on one whose `meta::get_inode` ignores `meta_invalidated`, TAIL stays at the old EOF.
+The script stops this tree's cluster (`cluster.sh stop` kills every
+`target/release` cluster process), so run nothing else from the tree meanwhile.
+
+### Readahead under latency (safetensors load)
+
+Emulate a network path without touching the host's `lo`: run the cluster in a
+netns and delay only its veth.
+
+```bash
+ip netns add autumnra
+ip link add veth-ra0 type veth peer name veth-ra1
+ip link set veth-ra1 netns autumnra
+ip addr add 10.231.0.1/24 dev veth-ra0 && ip link set veth-ra0 up
+ip netns exec autumnra sh -c 'ip addr add 10.231.0.2/24 dev veth-ra1; ip link set veth-ra1 up; ip link set lo up'
+AUTUMN_BIND_HOST=10.231.0.2 AUTUMN_EXTENT_BASE_PORT=20000 ip netns exec autumnra bash cluster.sh start 3
+./target/release/autumn-fuse --manager 10.231.0.2:9001 --mountpoint /mnt/autumn-ra --transport tcp &
+tc qdisc add dev veth-ra0 root netem delay 1ms limit 100000
+ip netns exec autumnra tc qdisc add dev veth-ra1 root netem delay 1ms limit 100000
+dd if=/mnt/autumn-ra/<file> of=/dev/null bs=64K count=200 iflag=direct   # ~4 ms per read
+```
+
+Then, per window: `echo <kb> > /sys/class/bdi/<dev>/read_ahead_kb`, evict the
+file (`os.posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED)`), and time
+`safetensors.torch.load_file` plus a copy of every tensor (`load_file` alone is
+lazy — it maps, and reads nothing until a tensor is touched). Expect at 1 ms
+one-way: 128 KiB ≈ 108 MiB/s, 4 MiB ≈ 820 MiB/s; a second load without evicting
+≈ 1.7 GiB/s with the daemon reading nothing. Remove with `tc qdisc del`,
+`ip netns del autumnra`.
+
 ### Kernel cache invalidation must not wedge a mount (`fuse_inval_deadlock.sh`)
 
 A mount drops the kernel's page cache for a file when another client's writer
@@ -2342,8 +2402,8 @@ closes it. The kernel serves that by locking every cached page of the file, and 
 page under readahead stays locked until the mount answers its read — so the
 invalidation must never be sent from the thread that answers reads. The script
 makes that race as likely as it gets: one mount re-faults a private mmap of a
-64 MiB file in a loop (plain `read(2)` never hits the page cache — opens are
-direct-io — so `cat` loops cannot trigger it), while a second mount opens the
+64 MiB file in a loop, dropping the cache between passes so each pass goes
+through readahead, while a second mount opens the
 same file for write and closes it as fast as it can, one WriterClosed event per
 close.
 

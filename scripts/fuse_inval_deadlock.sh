@@ -8,11 +8,9 @@
 # FUSE_READ, neither can move: the reader sits in D state and the mount answers
 # nothing again (FUSE has no timeout).
 #
-# Opens are answered with FOPEN_DIRECT_IO, so plain read(2) never puts pages in
-# the cache. What does is a MAP_PRIVATE mmap (the kernel allows it on a
-# direct-io file and pages it through the cache) — the reader here is exactly
-# that: re-fault a 64 MiB private mapping in a loop, dropping the cache between
-# passes so every pass goes through readahead.
+# Every read goes through the page cache; the reader here re-faults a 64 MiB
+# private mapping in a loop, dropping the cache between passes so every pass
+# goes through readahead — the most pages locked under readahead at once.
 #
 # The invalidations come from a SECOND mount that opens the same file for
 # write and closes it, over and over: every close releases the write lease,

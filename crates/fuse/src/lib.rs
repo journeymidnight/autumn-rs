@@ -4,7 +4,8 @@
 //! `autumn-fs`. This crate is only what a kernel mount adds: the
 //! `fuser::Filesystem` impl (`ops`), the fuser<->compio channel (`bridge`),
 //! the dispatch loop (`dispatch`), the kernel cache invalidation thread
-//! (`inval`), the read I/O pool (`read_pool`), and the
+//! (`inval`), the read I/O pool (`read_pool`), the mount's readahead window
+//! (`readahead`), and the
 //! ONLY place core types convert to `fuser` reply types (`attr`).
 
 pub mod attr;
@@ -13,6 +14,7 @@ pub mod dispatch;
 pub mod inval;
 pub mod ops;
 pub mod read_pool;
+pub mod readahead;
 
 /// Re-export `fuser` so downstream test crates (autumn-manager
 /// inode-lease tests) can name the bridge-handler reply types

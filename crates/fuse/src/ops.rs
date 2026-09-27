@@ -4,6 +4,7 @@
 //! channel, and blocks waiting for the reply from the compio thread.
 
 use std::ffi::OsStr;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use fuser::{
@@ -16,15 +17,37 @@ use crate::bridge::*;
 /// FUSE attr/entry cache TTL (from 3FS: 30s).
 const TTL: Duration = Duration::from_secs(30);
 
+/// Background requests (readahead READs) the kernel keeps in flight.
+const MAX_BACKGROUND: u16 = 64;
+
 /// The FUSE filesystem implementation. Lives on fuser threads.
 /// Sends all requests to the compio thread via the bridge channel.
 pub struct AutumnFs {
     tx: futures::channel::mpsc::UnboundedSender<FsRequest>,
+    /// `(absolute mountpoint, KiB)` for `readahead.rs`; `None` keeps the
+    /// kernel default.
+    readahead: Option<(PathBuf, u32)>,
+    /// The `read_ahead_kb` file opened during INIT, written on the first open.
+    pending_readahead: Option<std::fs::File>,
 }
 
 impl AutumnFs {
-    pub fn new(tx: futures::channel::mpsc::UnboundedSender<FsRequest>) -> Self {
-        Self { tx }
+    pub fn new(
+        tx: futures::channel::mpsc::UnboundedSender<FsRequest>,
+        readahead: Option<(PathBuf, u32)>,
+    ) -> Self {
+        Self { tx, readahead, pending_readahead: None }
+    }
+
+    /// Called by open and create: the first one after INIT sets the window.
+    fn apply_readahead(&mut self) {
+        let (Some(file), Some((_, kb))) = (self.pending_readahead.take(), &self.readahead) else {
+            return;
+        };
+        match crate::readahead::write(file, *kb) {
+            Ok(()) => tracing::info!(kb, "mount readahead set"),
+            Err(e) => tracing::error!(kb, error = %e, "setting the mount readahead failed"),
+        }
     }
 
     fn send<T>(&self, make_req: impl FnOnce(Reply<T>) -> FsRequest) -> anyhow::Result<T> {
@@ -58,13 +81,34 @@ impl Filesystem for AutumnFs {
         // for 4 GiB either way. (Linux 6.10+ makes that clamp a sysctl, so it
         // is the ceiling on this kernel, not a constant of the protocol.)
         //
-        // `set_max_readahead` is a DIFFERENT story and is inert either way:
-        // `KernelConfig::new` caps it at whatever the kernel offered in its own
-        // INIT, and the setter returns `Err` above that — swallowed here. It is
-        // kept because it costs nothing and becomes real if a mount ever
-        // negotiates a larger readahead, not because it does anything today.
-        let _ = config.set_max_readahead(16 * 1024 * 1024);
+        // Readahead is NOT negotiated here: INIT can only lower it (the kernel
+        // offers its bdi default, 128 KiB, and takes the min). The mount
+        // raises it through sysfs on the first open (`readahead.rs`).
+        if let Some((mountpoint, kb)) = &self.readahead {
+            match crate::readahead::open(mountpoint) {
+                Ok(file) => self.pending_readahead = Some(file),
+                Err(e) => {
+                    tracing::error!(
+                        kb,
+                        mountpoint = %mountpoint.display(),
+                        error = %e,
+                        "cannot set the mount readahead (--readahead-kb 0 keeps the kernel default)"
+                    );
+                    return Err(libc::EIO);
+                }
+            }
+        }
         let _ = config.set_max_write(1024 * 1024);
+        // A readahead window is sent as background READs of up to 1 MiB each,
+        // and the kernel stops issuing async readahead once the background
+        // queue reaches the congestion threshold — fuser's defaults (16, 12)
+        // would cap a 16 MiB window at 12 requests in flight.
+        if let Err(nearest) = config.set_max_background(MAX_BACKGROUND) {
+            tracing::warn!(nearest, "kernel refused max_background");
+        }
+        if let Err(nearest) = config.set_congestion_threshold(MAX_BACKGROUND * 3 / 4) {
+            tracing::warn!(nearest, "kernel refused congestion_threshold");
+        }
         match self.send(|reply| FsRequest::Init { reply }) {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -242,6 +286,7 @@ impl Filesystem for AutumnFs {
         flags: i32,
         reply: ReplyCreate,
     ) {
+        self.apply_readahead();
         match self.send(|r| FsRequest::Create {
             parent,
             name: name.to_owned(),
@@ -255,25 +300,16 @@ impl Filesystem for AutumnFs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
+        self.apply_readahead();
         match self.send(|r| FsRequest::Open {
             ino,
             flags,
             reply: r,
         }) {
-            // FOPEN_DIRECT_IO (= 1) — bypass kernel page cache so every
-            // user-space `read()` reaches our dispatcher. Without this,
-            // pages are cached after the first access and ~99% of reads
-            // never round-trip to autumn-fuse, masking any improvement
-            // from concurrent dispatch / parallel chunk fetch.
-            //
-            // Trade-off: removes the kernel page cache as a free
-            // accelerator for repeat reads. For workloads that benefit
-            // from page caching (e.g. hot key reread loops), this hurts.
-            // The right long-term tuning is to expose this as a mount
-            // option (`--direct-io`) so users can pick. For now we
-            // default to direct_io because measurement-without-it gives
-            // misleading "free" throughput numbers.
-            Ok(fh) => reply.opened(fh, 1),
+            // Every open goes through the kernel page cache; whether the
+            // cached pages survive this open is the dispatcher's call
+            // (`open_keeps_page_cache`).
+            Ok((fh, open_flags)) => reply.opened(fh, open_flags),
             Err(e) => reply.error(err_to_errno(&e)),
         }
     }

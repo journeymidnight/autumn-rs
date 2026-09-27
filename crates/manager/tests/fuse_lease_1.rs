@@ -69,13 +69,13 @@ async fn seed_file(state: &mut FsState, name: &[u8], ino: u64) {
     state.kv_put(&dk, &dv).await.expect("put dirent");
 }
 
-/// Open via the dispatch path. Returns Result<u64 /* fh */, anyhow::Error>.
+/// Open via the dispatch path. Returns Result<(fh, FOPEN_* flags), anyhow::Error>.
 async fn dispatch_open(
     state: &mut FsState,
     ino: u64,
     flags: i32,
-) -> anyhow::Result<u64> {
-    let (tx, rx) = bridge::reply_channel::<u64>();
+) -> anyhow::Result<(u64, u32)> {
+    let (tx, rx) = bridge::reply_channel::<(u64, u32)>();
     let req = bridge::FsRequest::Open {
         ino,
         flags,
@@ -150,7 +150,7 @@ fn fuse_two_mounts_write_lease_conflict_and_release_unblocks() {
         let fh_a = dispatch_open(&mut mount_a, ino, /* O_RDWR = */ 2)
             .await
             .expect("A open write");
-        assert_eq!(fh_a, ino);
+        assert_eq!(fh_a.0, ino);
         assert_eq!(
             mount_a.held_leases.borrow().get(&ino).map(|s| s.mode),
             Some(LEASE_MODE_WRITE)
@@ -181,7 +181,7 @@ fn fuse_two_mounts_write_lease_conflict_and_release_unblocks() {
         let fh_b = dispatch_open(&mut mount_b, ino, /* O_RDWR = */ 2)
             .await
             .expect("B open write after A release");
-        assert_eq!(fh_b, ino);
+        assert_eq!(fh_b.0, ino);
     });
 }
 

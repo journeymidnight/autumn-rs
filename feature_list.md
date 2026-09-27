@@ -460,6 +460,30 @@
 - **Scope**（未实现）: 在加载期抓一次读大小直方图（守护进程侧按 size 分桶计数），
   确认 74 KiB 是加载器发出的还是我们内部拆的。若是后者，合并相邻 extent 的读是直接收益。
 
+- **notes** (2026-09-27): 对 **mmap 加载器** 上面"不是页错误"的结论不成立：safetensors
+  `load_file` 是 `MAP_PRIVATE`，缺页按预读窗口（当时 128 KiB）同步读，每次缺页一个往返；
+  netns+veth netem 复现 pod 的 4 ms/读后，冷加载 108 MiB/s，窗口 4 MiB 时 823 MiB/s。
+  已由挂载走页缓存 + `--readahead-kb`（commit 见 git log）处理；`pread` 小块读者那部分结论不变。
+
+### BUG-FUSE-CACHED-META-AFTER-LEASE-LOSS — lease 丢了之后缓存的 meta / 页没有人再失效（未复现）
+- **Trigger** (2026-09-27，挂载改走页缓存那次的独立评审推断，读代码得出): 挂载走页缓存之后
+  两个既有窗口的暴露面变大。(a) 心跳 `NotHeld`（manager 在 poll 仍正常时忘了这个 lease，如
+  TTL 过期）只删 `held_leases` 条目，不调内核 invalidator、不标 `meta_invalidated`：仍开着
+  的 fd 继续信任旧页，之后的写者关闭也不会再推给本挂载。(b) manager 重启后 lease version
+  从 1 重来，`inode_cache_needs_reload` 的 `cached < acquired` 比较失效；dentry 仍在（
+  `InodeState` 被 lookup 计数钉住）的已关闭 inode 再次打开时，Open 已经现读了 meta
+  （`fresh_meta`）却只在未缓存时才用，GETATTR 继续答旧 size。poll 失败路径（manager 重启时
+  通常先走到）已经会标记全部 held ino，所以 (b) 只剩"重启期间本挂载未持 lease"的 inode。
+  (c) PyO3 `acquire("r")` 在已持写的 inode 上无条件把 `mode` 改成 READ（`python/src/fs.rs`
+  acquire 分支）：之后 `write_lease_for` 发 ANON 写，`get_inode` 的"本会话是写者"豁免也失效。
+  既有问题，挂载侧读 open 只 `add_ref` 不改 mode。
+- **Scope（复现之后才谈）**: (a) 让心跳在 manager 仍在线时收到 NotHeld（停心跳超过 TTL 再
+  恢复）；(b) 挂载 A 读后关闭（dentry 保留）→ 重启 manager → B 追加 → A 重开后 `stat`。
+  坐实再修：(a) NotHeld 与 poll 失败同样处理；(b) Open 手里的 `fresh_meta` 在 inode 不脏时
+  直接替换缓存的 meta；(c) 绑定写 → 读 acquire 只加引用、不降 mode（与挂载一致）。
+- **Acceptance**: 各自确定性复现（或证伪），修则消融能变红。
+- `passes: false`
+
 ### BUG-FUSE-UMOUNT-JOIN-HANG — 普通卸载后守护进程可能永不退出（未复现）
 - **Trigger** (2026-09-27，SIGTERM 优雅退出的独立评审读代码发现，既有问题): `umount` /
   `fusermount -u` 之后 `Session::run` 因 ENODEV 返回，`main` 接着 `compio_handle.join()`；
@@ -492,6 +516,9 @@
 - **notes** (2026-09-26): BUG-FUSE-INVAL-ON-DISPATCHER-THREAD 已修并关账，它的复现步骤就是
   `scripts/fuse_inval_deadlock.sh`（docs/ops.md「Kernel cache invalidation must not wedge a
   mount」）。writeback cache 会让页缓存多出脏页，联测时这条脚本必须仍然通过。
+- **notes** (2026-09-27): 挂载已不用 `FOPEN_DIRECT_IO`，读写都走页缓存
+  （写是无 writeback cache 的直写，吞吐与 direct-io 持平 272.8 vs 272.8 MB/s）；`max_background`
+  已是 64。本条剩 writeback cache 与 splice；writeback 联测还要加 `scripts/fuse_page_cache.sh`。
 
 ### F-FUSE-IORING-PASSTHROUGH — FUSE io_uring 提交 + passthrough 读直达
 - **Trigger** (2026-09-16，用户确认): Linux 6.x FUSE 支持 io_uring 提交路径与

@@ -193,10 +193,12 @@ fn variable_length_extents() {
 /// A reader on ANOTHER mount picks up data a writer appends, without
 /// reopening — the sequential-read ("tail") shape across machines.
 ///
-/// File DATA never sits in either kernel's page cache (the mount replies
-/// `FOPEN_DIRECT_IO`), so every read reaches that machine's daemon. What could
-/// still go stale is the daemon's own `InodeState`: its cached `meta.size` and
-/// its cached extent map. The EOF path closes both — a read at or past the
+/// This drives the daemon's read path directly, below any kernel page cache:
+/// a read that reaches the daemon at or past its cached size. (Through a real
+/// mount the kernel sends no READ past the size GETATTR gave it; that half is
+/// `fuse_page_cache.rs` and the TAIL step of `scripts/fuse_page_cache.sh`.)
+/// What could go stale here is the daemon's own `InodeState`: its cached
+/// `meta.size` and its cached extent map. The EOF path closes both — a read at or past the
 /// cached size re-reads the inode from KV bypassing the cache, and adopting a
 /// LARGER size also drops the cached extent map (`meta.rs`), so the rescan sees
 /// the newly appended extents. Visibility is still bounded by the WRITER
