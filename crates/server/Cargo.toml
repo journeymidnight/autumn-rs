@@ -34,6 +34,10 @@ name = "autumn-client"
 path = "src/bin/autumn_client/main.rs"
 
 [[bin]]
+name = "autumn-dashboard"
+path = "src/bin/autumn_dashboard/main.rs"
+
+[[bin]]
 name = "autumn-op"
 path = "src/bin/autumn_op/main.rs"
 

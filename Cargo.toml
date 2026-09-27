@@ -13,7 +13,6 @@ members = [
   "crates/fs",
   "crates/fuse",
   "examples/gallery",
-  "examples/dashboard",
 ]
 default-members = [
   "crates/common",

@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <!--
   autumn-rs web dashboard — single self-contained page (no build, no deps).
-  Served by the standalone `autumn-dashboard` app (examples/dashboard), which
+  Served by the standalone `autumn-dashboard` app (crates/server/src/bin/autumn_dashboard), which
   proxies every /api/* call to the `autumn-op` CLI.
 
   SIX TABS, because the five questions an operator arrives with are different
@@ -471,19 +471,33 @@ function fmtProgress(kind, done, total){
 }
 function toast(msg,kind="ok"){ const d=document.createElement("div"); d.className="t "+kind; d.textContent=msg;
   $("#toast").appendChild(d); setTimeout(()=>d.remove(), kind==="bad"?12000:5000); }
-async function api(path,body){ const opt=body!==undefined?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{};
-  const r=await fetch(path,opt); return r.json(); }
+// Refreshes can outpace a slow autumn-op call. Share only identical reads;
+// mutations always issue their own request and are never replayed.
+const READS = new Map();
+function api(path,body){
+  if(body===undefined && READS.has(path)) return READS.get(path);
+  const pending=(async()=>{
+    const opt=body!==undefined?{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}:{};
+    const response=await fetch(path,opt);
+    const result=await response.json();
+    if(!response.ok || result.error || result.ok===false)
+      throw new Error(result.error||result.output||`HTTP ${response.status}`);
+    return result;
+  })();
+  if(body!==undefined) return pending;
+  const read=pending.finally(()=>READS.delete(path));
+  READS.set(path,read);
+  return read;
+}
+async function mutate(path,body,label){
+  try{ await api(path,body); toast(label,"ok"); return true; }
+  catch(e){ toast("Failed: "+e.message,"bad"); return false; }
+}
 async function act(action,label){
   if(!DANGER){ toast("Turn on the Danger switch first to operate the cluster","bad"); return; }
   if(!confirm(`Confirm?\n\n  ${label||action.action}\n`)) return;
-  const r=await api("/api/action",action);
-  // The /api/action reply is {ok, output}: output carries autumn-op's stdout on
-  // success and its FULL stderr (the manager's precondition/refusal message, or
-  // a timeout note) on failure. Surface that verbatim — never "unknown" — so the
-  // real reason (e.g. "cannot split: partition has overlapping keys",
-  // "refusing to merge …: sacred boundary", "timed out after 30s") is visible.
-  if(r.ok){ toast("Issued: "+(label||action.action),"ok"); setTimeout(()=>{overview(); if(SELECTED!=null) openDetail(SELECTED);},600); }
-  else toast("Failed: "+(label?label+" — ":"")+(r.output||r.error||"unknown reason (no output)"),"bad");
+  if(await mutate("/api/action",action,"Issued: "+(label||action.action)))
+    setTimeout(()=>{overview(); if(SELECTED!=null) openDetail(SELECTED);},600);
 }
 const esc = s => (s==null?"":String(s)).replace(/[<>&"]/g,c=>({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;"}[c]));
 // Keys carry non-printable bytes (e.g. an fs range boundary is `fs/\x03\x01`).
@@ -500,7 +514,7 @@ const rlabel = (s,e)=>`[${showKey(s)||"-∞"}, ${showKey(e)||"+∞"})`;
 // handles backslashes and double quotes; the apostrophe is the one that would end
 // the attribute early, and advisory text is server-formatted, so assuming it has
 // none is a bet with no upside.
-const jsAttr = v => JSON.stringify(v).replace(/'/g, "\\u0027");
+const jsAttr = v => JSON.stringify(v).replace(/[<>&']/g,c=>"\\u"+c.charCodeAt(0).toString(16).padStart(4,"0"));
 function agoStr(sec){
   if(sec==null) return "unknown";
   if(sec<60) return `${sec}s ago`;
@@ -909,7 +923,10 @@ async function openDetail(pid){
     <span class="did">#${pid}</span><span class="on">on ${esc(p.ps_addr||"?")}</span></div>
     <div class="drng">${esc(rlabel(p.range_start,p.range_end))}</div>
     <div style="color:var(--dim);margin-top:8px">loading detail…</div>`;
-  const d=await api("/api/partition/"+pid);
+  let d;
+  try{ d=await api("/api/partition/"+pid); }
+  catch(e){ if(SELECTED===pid) dr.textContent="Detail unavailable: "+e.message; return; }
+  if(SELECTED!==pid) return;
   const nxt=NEXT_OF[pid];
   // A CoW split's children share the parent's SSTs until a MAJOR compaction
   // rewrites them, and the PS REFUSES `split` for as long as it does. Say so
@@ -1018,7 +1035,11 @@ function renderLogsTab(){
     || '<div class="empty">No recent actions.</div>';
 }
 async function loadOps(){
-  let s; try{ s=await api("/api/ops"); }catch(e){ return; }
+  let s; try{ s=await api("/api/ops"); }catch(e){
+    if(TAB==="logs") $("#ops_live").textContent="Operations unavailable: "+e.message;
+    if(TAB==="overview") $("#ov_ops").textContent="Operations unavailable: "+e.message;
+    return;
+  }
   OPS=s; LIVE_OPS=s.live||[];
   if(TAB==="logs") renderLogsTab();
   if(TAB==="overview") renderOverviewTab();
@@ -1027,7 +1048,10 @@ async function loadOps(){
 
 // ── overview poll ────────────────────────────────────────────────────────────
 async function overview(){
-  let s; try{ s=await api("/api/overview"); }catch(e){ return; }
+  let s; try{ s=await api("/api/overview"); }catch(e){
+    $("#age").textContent="update failed";
+    $("#errs").textContent="Overview unavailable: "+e.message; return;
+  }
   const df=s.df||{}; window.__df=df;
   $("#v_topo").innerHTML = `${s.part_count||0} <small>partitions</small>`;
   $("#v_topo_sub").textContent = `across ${s.ps_count||0} partition server${(s.ps_count||0)!==1?"s":""}`;
@@ -1076,6 +1100,11 @@ function renderPolicyTab(){
   $("#advcount").textContent = ADVISORIES.length?`${ADVISORIES.length}`:"";
   $("#advisories").innerHTML = ADVISORIES.length ? ADVISORIES.map(advRow).join("")
     : '<div class="empty">No advisories — topology is settled.</div>';
+  if(window.__polError){
+    $("#ctlstate").textContent="Controller state unavailable: "+window.__polError;
+    $("#pollist").innerHTML="";
+    return;
+  }
   const st=(window.__pol)||{};
   const mode=st.mode||"off", active=st.active||"", live=mode!=="off";
   const label = mode==="armed"?"running (armed)":mode==="dry_run"?"observing (dry-run)":"stopped";
@@ -1090,14 +1119,21 @@ function renderPolicyTab(){
       <div class="ph"><span class="pn">${esc(p.name)}</span>
         <span class="tagb">${p.builtin?"preset":"custom"}</span><span class="desc">· ${esc(p.desc)}</span>
         <span class="pgrow"></span>
-        <button class="btn xs" onclick='activate("${esc(p.name)}")'>${st.active===p.name?"active":"use"}</button>
-        ${p.builtin?"":`<button class="btn xs bad" onclick='delPolicy("${esc(p.name)}")'>del</button>`}</div>
+        <button class="btn xs" onclick='activate(${jsAttr(p.name)})'>${st.active===p.name?"active":"use"}</button>
+        ${p.builtin?"":`<button class="btn xs bad" onclick='delPolicy(${jsAttr(p.name)})'>del</button>`}</div>
       <div class="sws">${swLine(p.switches||{})}
         <span class="cfg">i=${p.interval}s cd=${p.cooldown}s max=${p.max_actions}</span></div>
     </div>`).join("");
 }
 async function loadPolicies(){
-  let st; try{ st=await api("/api/policies"); }catch(e){ return; }
+  let st; try{ st=await api("/api/policies"); }catch(e){
+    window.__polError=e.message;
+    $("#v_ctl").textContent="unknown";
+    $("#v_ctl_sub").textContent=e.message;
+    if(TAB==="policy") renderPolicyTab();
+    return;
+  }
+  window.__polError=null;
   window.__pol=st; window.__polLog=st.log||[];
   const mode=st.mode||"off", active=st.active||"";
   $("#v_ctl").innerHTML = mode==="armed" ? `<span class="up">armed</span>` : mode==="dry_run" ? `observe` : `<span class="off">off</span>`;
@@ -1105,19 +1141,36 @@ async function loadPolicies(){
   if(TAB==="policy") renderPolicyTab();
   if(TAB==="logs") renderLogsTab();
 }
-async function activate(name){ await api("/api/policies/activate",{active:name}); loadPolicies(); }
-async function armCtl(){
-  const st=await api("/api/policies"); if(!st.active) return;
-  if(!confirm("Arm the auto-policy controller?\nIt will periodically run split/ec/compact/gc/merge/rebalance on the cluster per the active policy.")) return;
-  await api("/api/policies/activate",{active:st.active,enabled:true}); loadPolicies();
+async function activate(name){
+  await mutate("/api/policies/activate",{active:name},"Observing policy: "+name);
+  await loadPolicies();
 }
-async function stopCtl(){ await api("/api/policies/activate",{enabled:false}); loadPolicies(); }
-async function delPolicy(name){ if(confirm(`Delete policy "${name}"?`)){ await api("/api/policies/delete",{name}); loadPolicies(); } }
+async function armCtl(){
+  let st;
+  try{ st=await api("/api/policies"); }
+  catch(e){ toast("Cannot arm: "+e.message,"bad"); return; }
+  if(!st.active) return;
+  if(!confirm("Arm the auto-policy controller?\nIt will periodically run split/ec/compact/gc/merge/rebalance on the cluster per the active policy.")) return;
+  await mutate("/api/policies/activate",{active:st.active,enabled:true},"Controller armed");
+  await loadPolicies();
+}
+async function stopCtl(){
+  await mutate("/api/policies/activate",{enabled:false},"Controller stopped");
+  await loadPolicies();
+}
+async function delPolicy(name){
+  if(confirm(`Delete policy "${name}"?`)){
+    await mutate("/api/policies/delete",{name},"Policy deleted: "+name);
+    await loadPolicies();
+  }
+}
 $("#np_save").onclick=async()=>{
   const name=$("#np_name").value.trim(); if(!name){ toast("Enter a policy name","bad"); return; }
   const switches={split:$("#sw_split").checked,ec:$("#sw_ec").checked,compact:$("#sw_compact").checked,gc:$("#sw_gc").checked,merge:$("#sw_merge").checked,rebalance:$("#sw_rebalance").checked};
-  const r=await api("/api/policies/upsert",{name,switches,interval:+$("#np_interval").value,cooldown:+$("#np_cooldown").value,max_actions:+$("#np_max").value});
-  if(r.error){ toast(r.error,"bad"); } else { toast("Policy saved: "+name,"ok"); $("#np_name").value=""; loadPolicies(); }
+  if(await mutate("/api/policies/upsert",{name,switches,interval:+$("#np_interval").value,cooldown:+$("#np_cooldown").value,max_actions:+$("#np_max").value},"Policy saved: "+name)){
+    $("#np_name").value="";
+  }
+  await loadPolicies();
 };
 
 // ── wiring ───────────────────────────────────────────────────────────────────

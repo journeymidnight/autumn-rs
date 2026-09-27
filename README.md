@@ -69,7 +69,8 @@ erasure-coded, self-healing extents.
   survives failover), default-off until you arm it.
 - **Multi-tenant** — opt-in key-range authorization with short-TTL **Ed25519
   capability tokens** (manager as KDC, enforcement at the KV layer).
-- **Operable** — a **web dashboard** (`autumn-dashboard`) with a tab per
+- **Operable** — a **web dashboard** ([`autumn-dashboard`](crates/server/src/bin/autumn_dashboard/README.md),
+  built with `autumn-server`) with a tab per
   question — keyspace, partitions, servers, nodes-and-disks, policy, logs —
   declarative bare-metal deployer (systemd), Kubernetes manifests, Prometheus
   `/metrics`, `ceph df`-style capacity accounting, rolling restart with

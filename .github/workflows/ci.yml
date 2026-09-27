@@ -44,6 +44,15 @@ jobs:
         run: cargo clippy --workspace --exclude autumn-fuse --features autumn-manager/fuse-tests --all-targets -- -D warnings
       - name: Build
         run: cargo build --workspace --exclude autumn-fuse
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Dashboard contracts
+        run: |
+          node crates/server/src/bin/autumn_dashboard/tests/render_check.js
+          node crates/server/src/bin/autumn_dashboard/tests/tabs_smoke.js
+          node crates/server/src/bin/autumn_dashboard/tests/policy_controls.js
+          bash crates/server/src/bin/autumn_dashboard/tests/api_contract.sh
       - name: Unit tests
         run: cargo test --workspace --lib --exclude autumn-fuse
       - name: Integration tests

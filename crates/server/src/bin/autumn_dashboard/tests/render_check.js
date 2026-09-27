@@ -7,7 +7,7 @@
 // no browser here, so `$` is stubbed to capture innerHTML; this checks the
 // render logic and the strings, not pixels.
 //
-//   node examples/dashboard/tests/render_check.js
+//   node crates/server/src/bin/autumn_dashboard/tests/render_check.js
 const fs = require("fs");
 const path = require("path");
 const page = fs.readFileSync(

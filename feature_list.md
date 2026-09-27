@@ -14,6 +14,13 @@
 
 ## Active
 
+### BUG-POLICY-ACTIVATE-ATOMIC — policy 名称与模式切换跨两次 RPC
+- **Trigger** (2026-09-27 dashboard review): `autumn-op auto-policy activate` 先 SET_ACTIVE 后 SET_MODE；manager 的 SET_ACTIVE 保留旧 mode。旧模式为 Armed 时，选择本应 DryRun 的新 policy 会先继承 Armed；第二次请求失败会留下部分更新，其他操作者也可在两次调用之间交错。
+- **Scope**: 在 manager 提供一次持久化事务中的 name+mode 更新，让 CLI/dashboard 共用；明确已有 wire 的兼容/升级要求。不能仅换两次 RPC 的顺序或靠 dashboard 本地锁掩盖。
+- **Acceptance**: Armed→选择新 policy 的 DryRun 更新只发布一份完整配置；注入持久化失败、leader 切换与并发操作者，不出现部分配置或误 arm 其他 policy；消融测试失败。
+- `passes: false`
+- **notes**: 两次 RPC 与 manager 保留旧 mode 已按代码核实；窗口内真实误派发尚未复现。本次 dashboard 迁移不改这个跨层契约。
+
 ### F-REVIEW-R1-GC-COMPLETE-SCAN — P1 GC 完整扫描证明
 - **Trigger**: review.md R1；提前 EOF 或 record 边界短读可绕过 carry 检查并误 punch。
 - **Scope**: 每次读取必须满足 want，punch 前检查 sealed_length 和 carry。

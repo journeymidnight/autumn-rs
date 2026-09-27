@@ -26,7 +26,7 @@ mod rpc_handlers;
 pub use rpc_handlers::MERGE_TEST_PAUSE_MS;
 
 // Pure `/api/overview` composer, shared with `autumn-op overview` so the
-// standalone dashboard app (examples/dashboard) can render the same view the
+// standalone dashboard app (crates/server/src/bin/autumn_dashboard) can render the same view the
 // manager used to serve. The manager itself no longer serves a web UI — only
 // the leader-fenced auto-policy controller below survives in-process.
 pub mod dashboard_compose;

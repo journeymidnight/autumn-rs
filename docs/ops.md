@@ -249,16 +249,18 @@ autumn-op auto-policy deactivate             # mode → Off
 Presets (safest → most aggressive): `gc-only`, `maintenance`, `space-reclaim`,
 `balanced`, `aggressive`.
 
-## Web dashboard (standalone app)
+## Web dashboard (server component)
 
-The manager **no longer serves a web UI**. The dashboard is a standalone app,
-`examples/dashboard` (the `autumn-dashboard` binary), which holds no cluster
+The dashboard is a separate process built by the `autumn-server` package,
+`crates/server/src/bin/autumn_dashboard` (the `autumn-dashboard` binary), which holds no cluster
 state and drives the cluster ONLY through `autumn-op` (so the wire schema stays
-in one place). It is **token-gated** — the admin token is required and forwarded
+in one place). The admin token is required for manager mutations and forwarded
 to every `autumn-op` call; read-only views ignore it, mutations (per-target Apply
 buttons + auto-policy activate/deactivate) use it.
 
 ```bash
+# Build both formal server binaries.
+cargo build -p autumn-server --bin autumn-dashboard --bin autumn-op
 # autumn-op must be on PATH (or pass --autumn-op /path/to/autumn-op).
 autumn-dashboard \
   --manager 127.0.0.1:9001 \
@@ -349,11 +351,36 @@ kill -9 <leader-manager-pid>                        # crash the leader
 autumn-op auto-policy status                         # → STILL mode=armed active=gc-only
 ```
 
-**Security posture (documented non-goal):** the dashboard app's HTTP port has no
-per-request auth/TLS (same as the manager's `--metrics-port`). The admin token
-gates *mutations* against the manager, not access to the page — so pair a
-network-reachable dashboard with network ACLs (or bind `--listen 127.0.0.1` +
-tunnel). On k8s it is an internal ClusterIP, reachable only via port-forward.
+**HTTP access:** the dashboard has no per-request authentication or TLS.
+Anyone who can reach it can submit controls using the server's admin token;
+that token protects the manager RPC, not the dashboard caller. The VKE overlay
+also publishes all paths through APIG Ingress, so its ClusterIP Service does
+not imply private access. Preserve network controls or bind `--listen 127.0.0.1`
+and tunnel. HTTP authentication is an existing non-goal retained in this move.
+
+**Policy feedback:** rejected writes show the manager's reason and retain the
+editor input; failed status queries display `unknown`. Select means DryRun,
+Arm means Armed, and Stop means Off. The existing CLI selects the policy and
+sets its mode with separate RPCs: after a partial failure, refresh status and
+verify the actual name/mode before operating again. Review details and the
+remaining transaction gap: [dashboard review](dashboard_review.md).
+
+**Automated verification** (local isolated processes, also run in CI):
+
+```bash
+cargo build -p autumn-server --bins
+node crates/server/src/bin/autumn_dashboard/tests/render_check.js
+node crates/server/src/bin/autumn_dashboard/tests/tabs_smoke.js
+node crates/server/src/bin/autumn_dashboard/tests/policy_controls.js
+bash crates/server/src/bin/autumn_dashboard/tests/api_contract.sh
+```
+
+The API harness requires `etcd` and Python 3, discovers Cargo's target directory
+(or accepts `AUTUMN_BIN_DIR`), allocates temporary data and a free port band,
+and terminates only children it spawned. It checks served HTML bytes, disk/PS
+fields, partition detail, nonempty durable operation history, policy
+create/observe/arm/stop/delete with all switches off, invalid payloads, and
+manager failure propagation.
 
 ## Fuse daemon runbook
 
@@ -2469,12 +2496,12 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   the error text in full for a failure. A finished op must stop reporting a
 #   percentage — a repair frozen at a stale 75% is worse than none.
 #   Automated equivalent (isolated cluster + etcd, asserts the endpoint shape):
-#   `bash examples/dashboard/tests/api_contract.sh`.
+#   `bash crates/server/src/bin/autumn_dashboard/tests/api_contract.sh`.
 #   Dashboard: the panel shows the same numbers — verified live through
 #   GET /api/ops during a conversion (18.6% → 37.2% → 55.8% → 74.4%, then
 #   `succeeded 100%` in history). Without a cluster:
-#   `node examples/dashboard/tests/render_check.js` (panel functions lifted out
-#   of the page) and `node examples/dashboard/tests/tabs_smoke.js` (every tab
+#   `node crates/server/src/bin/autumn_dashboard/tests/render_check.js` (panel functions lifted out
+#   of the page) and `node crates/server/src/bin/autumn_dashboard/tests/tabs_smoke.js` (every tab
 #   rendered under a DOM stub).
 #   LIVE EC-conversion progress: `bash scripts/ec_convert_progress.sh` — spins a
 #   4-EN cluster (EC 3+1 needs four targets), rolls a 1 GiB log extent, converts

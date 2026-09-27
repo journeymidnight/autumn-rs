@@ -9,11 +9,11 @@
 // renamed container is caught instead of silently painting nothing).
 //
 // The fixtures below are a REAL /api/* capture from
-// `bash examples/dashboard/tests/api_contract.sh`, edited only to add the
+// `bash crates/server/src/bin/autumn_dashboard/tests/api_contract.sh`, edited only to add the
 // unhappy states a healthy scratch cluster never produces: a faulted disk, a
 // silent partition server, an overlapping partition, an advisory.
 //
-//   node examples/dashboard/tests/tabs_smoke.js
+//   node crates/server/src/bin/autumn_dashboard/tests/tabs_smoke.js
 const fs = require("fs"), path = require("path");
 const html = fs.readFileSync(path.join(__dirname, "..", "static", "index.html"), "utf8");
 const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
@@ -116,7 +116,7 @@ const POLICIES = {
   log: [{ ts: Math.floor(Date.now() / 1000), level: "refused", msg: "autumn-op split 168: overlapping keys" }],
 };
 const payload = { "/api/overview": OVERVIEW, "/api/ops": OPS, "/api/policies": POLICIES };
-const fetchStub = async p => ({ json: async () => payload[p] ?? PART });
+const fetchStub = async p => ({ ok: true, json: async () => payload[p] ?? PART });
 
 const api = new Function(
   "document", "location", "window", "fetch", "setInterval", "clearInterval", "setTimeout", "confirm",

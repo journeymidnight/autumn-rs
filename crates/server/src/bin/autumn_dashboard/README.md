@@ -1,18 +1,21 @@
 # autumn-dashboard
 
-The autumn-rs web dashboard as a **standalone app** — a small
+The autumn-rs web dashboard is a **server component** in `autumn-server`.
+It runs as its own process: a small
 [`cyper-axum`](https://crates.io/crates/cyper-axum) server that serves the
 single-page UI (`static/index.html`) and proxies every `/api/*` call to the
 `autumn-op` CLI (`--json`). It holds no cluster state and makes no direct manager
 RPC: the wire schema stays in exactly one place (`autumn-op`).
 
 The leader-fenced **auto-policy controller** is NOT here — it stays inside
-`autumn-manager` (crash-safe, leader-owned). This app is presentation only; its
+`autumn-manager` (crash-safe, leader-owned). This component exposes operator
+controls; its
 policy panel drives the controller through `autumn-op auto-policy …`.
 
 ## Run
 
 ```bash
+cargo build -p autumn-server --bin autumn-dashboard --bin autumn-op
 # autumn-op must be on PATH (or pass --autumn-op /path/to/autumn-op)
 autumn-dashboard \
   --manager 127.0.0.1:9001 \
@@ -20,7 +23,7 @@ autumn-dashboard \
   --port 8799            # then open http://<host>:8799
 ```
 
-The **admin token is required** (the dashboard is token-gated) and is forwarded
+The **admin token is required for manager mutations** and is forwarded
 to every `autumn-op` call — read-only views ignore it, mutations (the per-target
 Apply buttons and auto-policy activate/deactivate) use it.
 
@@ -47,7 +50,13 @@ Apply buttons and auto-policy activate/deactivate) use it.
 | `POST /api/policies/delete` | `autumn-op auto-policy delete <name>` |
 
 The controller panel is **use** (select → DryRun / observe) → **Arm** (actuate) →
-**Stop** (Off), and the custom-policy editor (create/edit/delete) is fully wired.
+**Stop** (Off), and the custom-policy editor supports create/replace/delete. Policy names must be
+nonblank and must not start with `-` (they are CLI positional arguments).
+`switches` must be a boolean object using the six listed names; omitted switches
+are off. Optional `interval` is an integer >= 2, `cooldown` an unsigned integer,
+and `max_actions` an integer in 1..=100. Invalid requests return HTTP 400.
+Manager refusals return HTTP 502 with the CLI output; the page displays the
+reason and retains failed edits. Failed status reads display **unknown**.
 
 ## Navigating the page
 
@@ -71,7 +80,8 @@ restores the full list, virtual-scrolled), and per-partition detail — extents 
 load metrics — is fetched lazily when a row is opened.
 
 **Each `/api/*` call spawns an `autumn-op` subprocess**, so the poll fetches only
-what the visible tab renders: `/api/overview` always (the vitals and every tab's
+what the visible tab renders (concurrent identical reads in one page share a
+single request): `/api/overview` always (the vitals and every tab's
 data come from it), `/api/policies` on Overview + Policy, `/api/ops` on Overview
 + Logs.
 
@@ -104,9 +114,13 @@ would be refused once per window forever.
 
 ## Security posture
 
-Same as `--metrics-port`: no per-request auth/TLS on the dashboard port itself —
-pair exposure with network ACLs. The admin token gates *mutations* against the
-manager, not access to the page.
+The dashboard HTTP port has **no per-request authentication or TLS**. Anyone
+who can reach it can read cluster state and submit mutations using the server
+admin token. The VKE overlay includes an APIG Ingress for all paths; ClusterIP
+does not make that route private. Use network access controls or a loopback
+bind and tunnel. HTTP authentication remains outside this migration, following
+the existing access contract. See [the review](../../../../../docs/dashboard_review.md)
+for this boundary and the existing non-atomic CLI policy activation.
 
 ## Maintenance-ops panel
 
@@ -136,8 +150,8 @@ divisor is 1024 and a bare `G` names a different quantity.
 #    detail's has_overlap. Every one of these crosses the rkyv wire, the
 #    manager compose and the autumn-op subprocess — a missing key renders as a
 #    silently blank panel, which no unit test would notice.
-cargo build --workspace
-bash examples/dashboard/tests/api_contract.sh
+cargo build -p autumn-server --bins
+bash crates/server/src/bin/autumn_dashboard/tests/api_contract.sh
 
 # 2. Render check — no cluster, no browser. LIFTS the page's own functions out
 #    of index.html at run time (a copy would drift and pass while the page was
@@ -146,13 +160,16 @@ bash examples/dashboard/tests/api_contract.sh
 #    for compact, phases for split/merge), the bar width, the right target per
 #    op kind, a failed row's reason, the heartbeat classification, the three
 #    disk states, and an advisory's full reasoning.
-node examples/dashboard/tests/render_check.js
+node crates/server/src/bin/autumn_dashboard/tests/render_check.js
 
 # 3. Tabs smoke — runs the page's own init and tab switching under a minimal DOM
 #    stub that REFUSES any element id the markup does not declare, then asserts
 #    each pane rendered what it exists to show. Catches a pane that throws, or a
 #    renamed container, which (2) cannot see.
-node examples/dashboard/tests/tabs_smoke.js
+node crates/server/src/bin/autumn_dashboard/tests/tabs_smoke.js
+
+# 4. Failed policy mutations/status, unusual names, and overlapping refreshes.
+node crates/server/src/bin/autumn_dashboard/tests/policy_controls.js
 ```
 
 Measured live (1 GiB extent, EC 3+1): `/api/ops` carried

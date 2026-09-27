@@ -1,17 +1,17 @@
-//! autumn-rs web dashboard — standalone example app.
+//! autumn-rs web dashboard — server component.
 //!
 //! Serves the single-page UI (`static/index.html`) and proxies every `/api/*`
 //! call to the `autumn-op` CLI (`--json`), so the manager wire schema stays in
 //! exactly one place and the dashboard needs no direct RPC or `autumn-*` crate
 //! dep. The leader-fenced auto-policy CONTROLLER stays in the manager; this app
-//! is presentation only.
+//! exposes the operator controls without owning controller state.
 //!
 //! Usage:
 //!   autumn-dashboard --manager H:P [--transport tcp|ucx] [--port 8799]
 //!                    [--listen 0.0.0.0] [--autumn-op autumn-op]
 //!                    (--admin-token TOK | --admin-token-file FILE)
 //!
-//! The admin token is REQUIRED (the dashboard is token-gated) and forwarded to
+//! The admin token is REQUIRED for upstream manager mutations and forwarded to
 //! every `autumn-op` call; read-only ops ignore it, mutations (the Apply buttons
 //! and auto-policy) use it.
 
@@ -26,8 +26,9 @@ use axum::http::{Response, StatusCode};
 use axum::routing::{get, post};
 use axum::Router;
 use send_wrapper::SendWrapper;
+use serde::Deserialize;
 
-const INDEX_HTML: &str = include_str!("../static/index.html");
+const INDEX_HTML: &str = include_str!("static/index.html");
 const USAGE: &str = "usage: autumn-dashboard --manager H:P [--transport tcp|ucx] \
 [--port 8799] [--listen 0.0.0.0] [--autumn-op autumn-op] \
 (--admin-token TOK | --admin-token-file FILE)";
@@ -151,7 +152,10 @@ fn passthrough(out: String, ok: bool) -> Response<Body> {
     if ok {
         json_resp(StatusCode::OK, out)
     } else {
-        json_resp(StatusCode::BAD_GATEWAY, serde_json::json!({ "error": out }).to_string())
+        json_resp(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({ "error": out }).to_string(),
+        )
     }
 }
 
@@ -164,14 +168,18 @@ const SWITCH_ORDER: [&str; 6] = ["split", "ec", "compact", "gc", "merge", "rebal
 /// `interval_sec`/`cooldown_sec` → `interval`/`cooldown`; add `switch_order`.
 fn reshape_policies(out: String, ok: bool) -> Response<Body> {
     if !ok {
-        return json_resp(StatusCode::BAD_GATEWAY, serde_json::json!({ "error": out }).to_string());
+        return json_resp(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({ "error": out }).to_string(),
+        );
     }
     let v: serde_json::Value = match serde_json::from_str(&out) {
         Ok(v) => v,
         Err(e) => {
             return json_resp(
                 StatusCode::BAD_GATEWAY,
-                serde_json::json!({ "error": format!("autumn-op status: bad json: {e}") }).to_string(),
+                serde_json::json!({ "error": format!("autumn-op status: bad json: {e}") })
+                    .to_string(),
             )
         }
     };
@@ -204,7 +212,7 @@ fn reshape_policies(out: String, ok: bool) -> Response<Body> {
         "enabled": mode != "off",
         "mode": mode,
         "active": v.get("active").cloned().unwrap_or_else(|| serde_json::json!("")),
-        "allow_mutations": v.get("allow_mutations").cloned().unwrap_or_else(|| serde_json::json!(true)),
+        "allow_mutations": v.get("allow_mutations").cloned().unwrap_or(serde_json::json!(true)),
         "policies": policies,
         "switch_order": SWITCH_ORDER,
         "log": v.get("log").cloned().unwrap_or_else(|| serde_json::json!([])),
@@ -212,17 +220,41 @@ fn reshape_policies(out: String, ok: bool) -> Response<Body> {
     json_resp(StatusCode::OK, body.to_string())
 }
 
-/// The controller's currently-active policy name (`""` if none / on error) —
-/// so a bare Arm toggle (no explicit policy) can target it.
-async fn current_active_policy(cfg: &Config) -> String {
-    let (out, ok) = cfg.run_op(vec!["auto-policy".into(), "status".into()]).await;
-    if !ok {
-        return String::new();
-    }
-    serde_json::from_str::<serde_json::Value>(&out)
-        .ok()
-        .and_then(|v| v.get("active").and_then(|x| x.as_str()).map(|s| s.to_string()))
-        .unwrap_or_default()
+/// A policy name becomes a positional CLI argument; leading flags would be
+/// interpreted by autumn-op's parser instead of naming a policy.
+fn valid_policy_name(name: &str) -> bool {
+    !name.trim().is_empty() && !name.starts_with('-')
+}
+
+fn bad_request(message: &str) -> Response<Body> {
+    json_resp(
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({"error": message}).to_string(),
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivatePolicy {
+    active: Option<String>,
+    enabled: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicyName {
+    name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpsertPolicy {
+    name: String,
+    switches: std::collections::BTreeMap<String, bool>,
+    interval: Option<u64>,
+    cooldown: Option<u64>,
+    max_actions: Option<u32>,
+    desc: Option<String>,
 }
 
 async fn index() -> Response<Body> {
@@ -255,7 +287,9 @@ async fn ops(cfg: &Config) -> Response<Body> {
         }
         let v: serde_json::Value =
             serde_json::from_str(&out).map_err(|e| format!("autumn-op ops: bad json: {e}"))?;
-        Ok(v.get("ops").cloned().unwrap_or_else(|| serde_json::json!([])))
+        Ok(v.get("ops")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])))
     };
 
     let (live_out, live_ok) = cfg
@@ -264,7 +298,10 @@ async fn ops(cfg: &Config) -> Response<Body> {
     let live = match arr(live_out, live_ok) {
         Ok(v) => v,
         Err(e) => {
-            return json_resp(StatusCode::BAD_GATEWAY, serde_json::json!({ "error": e }).to_string())
+            return json_resp(
+                StatusCode::BAD_GATEWAY,
+                serde_json::json!({ "error": e }).to_string(),
+            )
         }
     };
 
@@ -299,24 +336,38 @@ async fn partition(cfg: &Config, id: String) -> Response<Body> {
     // Numeric id only — never interpolate a raw path segment into argv.
     let pid: u64 = match id.parse() {
         Ok(x) => x,
-        Err(_) => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"bad partition id"}"#.into()),
+        Err(_) => {
+            return json_resp(
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"bad partition id"}"#.into(),
+            )
+        }
     };
     // The page's detail drawer wants ONE flat object: PartitionLoad metrics AND
     // the per-extent list. autumn-op splits these across two views — `--detail`
     // gives the metrics, the plain scoped view gives `extents[]` — so fetch both
     // and merge. (Neither alone renders the drawer completely.)
     let (dout, dok) = cfg
-        .run_op(vec!["info".into(), "--part".into(), pid.to_string(), "--detail".into()])
+        .run_op(vec![
+            "info".into(),
+            "--part".into(),
+            pid.to_string(),
+            "--detail".into(),
+        ])
         .await;
     if !dok {
-        return json_resp(StatusCode::BAD_GATEWAY, serde_json::json!({ "error": dout }).to_string());
+        return json_resp(
+            StatusCode::BAD_GATEWAY,
+            serde_json::json!({ "error": dout }).to_string(),
+        );
     }
     let mut detail: serde_json::Value = match serde_json::from_str(&dout) {
         Ok(v) => v,
         Err(e) => {
             return json_resp(
                 StatusCode::BAD_GATEWAY,
-                serde_json::json!({ "error": format!("autumn-op detail: bad json: {e}") }).to_string(),
+                serde_json::json!({ "error": format!("autumn-op detail: bad json: {e}") })
+                    .to_string(),
             )
         }
     };
@@ -352,7 +403,11 @@ async fn action(cfg: &Config, body: Bytes) -> Response<Body> {
             vec!["merge".into(), part.to_string(), victim.to_string()]
         }
         "force_ec_convert" if extent > 0 => {
-            vec!["force-ec-convert".into(), "--extent".into(), extent.to_string()]
+            vec![
+                "force-ec-convert".into(),
+                "--extent".into(),
+                extent.to_string(),
+            ]
         }
         "rebalance" => vec!["rebalance".into()],
         _ => {
@@ -364,13 +419,19 @@ async fn action(cfg: &Config, body: Bytes) -> Response<Body> {
     };
     let (out, ok) = cfg.run_op(args).await;
     json_resp(
-        if ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY },
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_GATEWAY
+        },
         serde_json::json!({ "ok": ok, "output": out }).to_string(),
     )
 }
 
 async fn policies(cfg: &Config) -> Response<Body> {
-    let (out, ok) = cfg.run_op(vec!["auto-policy".into(), "status".into()]).await;
+    let (out, ok) = cfg
+        .run_op(vec!["auto-policy".into(), "status".into()])
+        .await;
     reshape_policies(out, ok)
 }
 
@@ -381,36 +442,61 @@ async fn policies(cfg: &Config) -> Response<Body> {
 ///   `{enabled:true}`  (no name)  → arm the CURRENT active policy
 ///   `{enabled:false}`            → `deactivate`  (Off)
 async fn policies_activate(cfg: &Config, body: Bytes) -> Response<Body> {
-    let v: serde_json::Value = match serde_json::from_slice(&body) {
+    let request: ActivatePolicy = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"bad json"}"#.into()),
+        Err(e) => return bad_request(&e.to_string()),
     };
-    let explicit = v.get("active").and_then(|x| x.as_str()).map(|s| s.to_string());
-    let enabled = v.get("enabled").and_then(|x| x.as_bool());
-    let args: Vec<String> = if enabled == Some(false) {
+    if request.active.is_none() && request.enabled.is_none() {
+        return bad_request("active or enabled is required");
+    }
+    if request
+        .active
+        .as_deref()
+        .is_some_and(|n| !valid_policy_name(n))
+    {
+        return bad_request("invalid policy name");
+    }
+    let args = if request.enabled == Some(false) {
         vec!["auto-policy".into(), "deactivate".into()]
     } else {
-        // Selecting or arming: resolve the target policy. Explicit `active` wins;
-        // a bare Arm toggle falls back to the controller's current active policy.
-        let name = match explicit {
+        let name = match request.active {
             Some(n) => n,
-            None => current_active_policy(cfg).await,
+            None => {
+                let (out, ok) = cfg
+                    .run_op(vec!["auto-policy".into(), "status".into()])
+                    .await;
+                if !ok {
+                    return passthrough(out, false);
+                }
+                let status: serde_json::Value = match serde_json::from_str(&out) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return passthrough(format!("autumn-op status: bad json: {e}"), false)
+                    }
+                };
+                status
+                    .get("active")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string()
+            }
         };
-        if name.is_empty() {
-            return json_resp(
-                StatusCode::BAD_REQUEST,
-                r#"{"error":"no active policy — select one first"}"#.into(),
-            );
+        if !valid_policy_name(&name) {
+            return bad_request("no valid active policy — select one first");
         }
-        let mut a = vec!["auto-policy".into(), "activate".into(), name];
-        if enabled == Some(true) {
-            a.push("--arm".into());
+        let mut args = vec!["auto-policy".into(), "activate".into(), name];
+        if request.enabled == Some(true) {
+            args.push("--arm".into());
         }
-        a
+        args
     };
     let (out, ok) = cfg.run_op(args).await;
     json_resp(
-        if ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY },
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_GATEWAY
+        },
         serde_json::json!({ "ok": ok, "output": out }).to_string(),
     )
 }
@@ -419,44 +505,56 @@ async fn policies_activate(cfg: &Config, body: Bytes) -> Response<Body> {
 /// `{name, switches:{split,ec,…}, interval, cooldown, max_actions}`; map it onto
 /// `autumn-op auto-policy upsert <name> --switches <csv> --interval N …`.
 async fn policies_upsert(cfg: &Config, body: Bytes) -> Response<Body> {
-    let v: serde_json::Value = match serde_json::from_slice(&body) {
+    let request: UpsertPolicy = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"bad json"}"#.into()),
+        Err(e) => return bad_request(&e.to_string()),
     };
-    let name = match v.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
-        Some(n) => n.to_string(),
-        None => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"policy name required"}"#.into()),
-    };
-    let sw = v.get("switches");
+    if !valid_policy_name(&request.name) {
+        return bad_request("invalid policy name");
+    }
+    if request
+        .switches
+        .keys()
+        .any(|k| !SWITCH_ORDER.contains(&k.as_str()))
+    {
+        return bad_request("unknown policy switch");
+    }
+    if request.interval.is_some_and(|n| n < 2)
+        || request.max_actions.is_some_and(|n| !(1..=100).contains(&n))
+    {
+        return bad_request("interval must be >= 2 and max_actions must be in 1..=100");
+    }
     let enabled: Vec<&str> = SWITCH_ORDER
         .iter()
         .copied()
-        .filter(|k| sw.and_then(|s| s.get(*k)).and_then(|b| b.as_bool()) == Some(true))
+        .filter(|k| request.switches.get(*k) == Some(&true))
         .collect();
-    let mut args = vec!["auto-policy".into(), "upsert".into(), name];
-    // Always send --switches (even empty) so an all-off edit is explicit, not a
-    // "keep previous" no-op.
-    args.push("--switches".into());
-    args.push(enabled.join(","));
-    if let Some(iv) = v.get("interval").and_then(|x| x.as_u64()) {
-        args.push("--interval".into());
-        args.push(iv.to_string());
+    let mut args = vec![
+        "auto-policy".into(),
+        "upsert".into(),
+        request.name,
+        "--switches".into(),
+        enabled.join(","),
+    ];
+    if let Some(n) = request.interval {
+        args.extend(["--interval".into(), n.to_string()]);
     }
-    if let Some(cd) = v.get("cooldown").and_then(|x| x.as_u64()) {
-        args.push("--cooldown".into());
-        args.push(cd.to_string());
+    if let Some(n) = request.cooldown {
+        args.extend(["--cooldown".into(), n.to_string()]);
     }
-    if let Some(mx) = v.get("max_actions").and_then(|x| x.as_u64()) {
-        args.push("--max".into());
-        args.push(mx.to_string());
+    if let Some(n) = request.max_actions {
+        args.extend(["--max".into(), n.to_string()]);
     }
-    if let Some(d) = v.get("desc").and_then(|x| x.as_str()) {
-        args.push("--desc".into());
-        args.push(d.to_string());
+    if let Some(desc) = request.desc {
+        args.extend(["--desc".into(), desc]);
     }
     let (out, ok) = cfg.run_op(args).await;
     json_resp(
-        if ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY },
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_GATEWAY
+        },
         serde_json::json!({ "ok": ok, "output": out }).to_string(),
     )
 }
@@ -464,17 +562,22 @@ async fn policies_upsert(cfg: &Config, body: Bytes) -> Response<Body> {
 /// `POST /api/policies/delete` — remove a custom policy: `{name}` →
 /// `autumn-op auto-policy delete <name>`.
 async fn policies_delete(cfg: &Config, body: Bytes) -> Response<Body> {
-    let v: serde_json::Value = match serde_json::from_slice(&body) {
+    let request: PolicyName = match serde_json::from_slice(&body) {
         Ok(v) => v,
-        Err(_) => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"bad json"}"#.into()),
+        Err(e) => return bad_request(&e.to_string()),
     };
-    let name = match v.get("name").and_then(|x| x.as_str()).filter(|s| !s.is_empty()) {
-        Some(n) => n.to_string(),
-        None => return json_resp(StatusCode::BAD_REQUEST, r#"{"error":"policy name required"}"#.into()),
-    };
-    let (out, ok) = cfg.run_op(vec!["auto-policy".into(), "delete".into(), name]).await;
+    if !valid_policy_name(&request.name) {
+        return bad_request("invalid policy name");
+    }
+    let (out, ok) = cfg
+        .run_op(vec!["auto-policy".into(), "delete".into(), request.name])
+        .await;
     json_resp(
-        if ok { StatusCode::OK } else { StatusCode::BAD_GATEWAY },
+        if ok {
+            StatusCode::OK
+        } else {
+            StatusCode::BAD_GATEWAY
+        },
         serde_json::json!({ "ok": ok, "output": out }).to_string(),
     )
 }
@@ -534,7 +637,9 @@ fn parse_args() -> Result<(Config, String, u16)> {
     }
     let admin_token = match admin_token {
         Some(t) if !t.is_empty() => t,
-        _ => bail!("--admin-token or --admin-token-file is REQUIRED (the dashboard is token-gated)\n{USAGE}"),
+        _ => {
+            bail!("--admin-token or --admin-token-file is REQUIRED for manager mutations\n{USAGE}")
+        }
     };
     Ok((
         Config {

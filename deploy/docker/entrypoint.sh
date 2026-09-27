@@ -117,7 +117,7 @@ run_manager() {
     # separate arming flag). (cluster.sh / chaos / perf never set this env, so
     # they stay Off — dev/test unaffected.) Override:
     # AUTUMN_AUTO_POLICY_DEFAULT=<preset|off> to change/disable the seeded policy.
-    # The web dashboard is a separate app (examples/dashboard → the autumn-
+    # The web dashboard is a separate app (crates/server/src/bin/autumn_dashboard → the autumn-
     # dashboard binary), not started here; deploy it on its own (e.g. the vke
     # overlay's dashboard.yaml).
     _auto_policy="${AUTUMN_AUTO_POLICY_DEFAULT:-balanced}"

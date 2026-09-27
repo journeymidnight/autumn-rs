@@ -603,7 +603,7 @@ launch_manager() {
     if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
         mgr_extra="$mgr_extra --metrics-port 9591"
     fi
-    # The web dashboard is a separate app now (examples/dashboard → the
+    # The web dashboard is a separate app now (crates/server/src/bin/autumn_dashboard → the
     # autumn-dashboard binary); cluster.sh does not start it. Run it by hand
     # against this cluster's manager + admin token when you want the UI.
     # unlike the deploy layer (entrypoint / autumn-deploy

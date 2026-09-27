@@ -92,7 +92,7 @@ COPY . .
 # -p autumn-server builds exactly the server binaries. TCP transport only — the
 # ucx feature is deliberately off (RDMA-in-k8s needs hostNetwork + device
 # plugins; see docs/k8s_deploy.md).
-# autumn-dashboard is the standalone web UI (examples/dashboard); it embeds its
+# autumn-dashboard is the standalone web UI (crates/server/src/bin/autumn_dashboard); it embeds its
 # HTML via include_str!, so the binary alone is self-contained, and it drives the
 # cluster only through the autumn-op we already ship.
 # autumn-fuse is the FUSE mount daemon.
@@ -100,7 +100,7 @@ COPY . .
 # along with -p autumn-server); it serves model loaders and S3-native tools such
 # as LanceDB. See docs/model_loading.md and examples/lancedb-s3.
 RUN cargo build --release \
-    -p autumn-server -p autumn-dashboard -p autumn-fuse
+    -p autumn-server -p autumn-fuse
 
 # Ship the SOURCE the Python client is built from, in this image.
 #

@@ -505,7 +505,7 @@ _start_managers() {
     # ARMED steady-state maintenance — the `balanced` policy is seeded Armed on a
     # fresh cluster and auto-runs gc + compaction + EC + rebalance (no separate
     # arming flag). AUTUMN_AUTO_POLICY_DEFAULT=<preset|off> changes/disables it.
-    # The web dashboard is a separate app (examples/dashboard → the autumn-
+    # The web dashboard is a separate app (crates/server/src/bin/autumn_dashboard → the autumn-
     # dashboard binary); run it yourself against this manager + admin token —
     # `autumn-dashboard --manager <host>:9001 --admin-token-file <tok> --port 8799`.
     _auto_policy="${AUTUMN_AUTO_POLICY_DEFAULT:-balanced}"

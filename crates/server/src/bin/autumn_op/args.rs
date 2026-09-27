@@ -323,7 +323,7 @@ pub(crate) enum Command {
     },
     PolicyCandidates,
     /// Full dashboard overview JSON (df + nodes + partitions + amp + advisories).
-    /// Always emits JSON; consumed by the standalone dashboard (examples/dashboard).
+    /// Always emits JSON; consumed by the standalone dashboard (crates/server/src/bin/autumn_dashboard).
     Overview,
     /// Headless control of the leader-fenced auto-policy controller.
     /// `action` = status | activate | deactivate | upsert | delete. The upsert

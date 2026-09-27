@@ -27,7 +27,7 @@ autumn-manager-server [--port 9001] [--listen 0.0.0.0] [--transport tcp|ucx] [--
 - Without `--etcd`: in-memory only (metadata lost on restart, no leader election). With `--etcd`: persistent — connects, replays state, runs the leader-election loop.
 - Serves `StreamManagerService` + `PartitionManagerService` on the same port, plus gRPC reflection.
 - `--metrics-port <P>` / `--metrics-listen <H>`: opt-in Prometheus `/metrics` (unauthenticated; pin to 127.0.0.1 when the RPC plane is on 0.0.0.0).
-- The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy activate --arm`). The **web dashboard is no longer served by the manager** — it is a standalone app (`examples/dashboard`) that talks to the manager only through `autumn-op`. Runbook: `docs/ops.md`.
+- The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy activate --arm`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op`. Runbook: `docs/ops.md`.
 - Authz (opt-in): `--auth-signing-key-file <FILE>` enables data-plane authz (keys from `autumn-op gen-signing-key`). `--admin-token` / `--admin-token-file` gate the tenancy/authz admin RPCs (refused without one). `--auth-protected-prefix <P>` (repeatable) marks default-DENY prefixes. `--auth-token-ttl-secs` / `--auth-clock-skew-secs` tune minted tokens.
 
 ### `autumn-extent-node` (`src/bin/extent_node.rs`)
@@ -78,6 +78,31 @@ autumn-client --manager 127.0.0.1:9001 <COMMAND>
 **Rule:** `autumn-client` MUST NOT call `mgr_call(MSG_*)` for admin / observability RPCs — that keeps data-plane CLI churn from dragging operator tooling along. Greppable invariant: `grep -rcE 'mgr_call\(MSG_' crates/server/src/bin/autumn_client/` must be 0. New op-data needs go through shared-library extraction or subprocess delegation, not direct manager calls.
 
 **Key routing**: `resolve_key(key)` calls `GetRegions()`, binary-searches sorted partitions by `start_key`, returns `(part_id, ps_addr)`, connects lazily via `PartitionKvClient`.
+
+### `autumn-dashboard` (`src/bin/autumn_dashboard/`)
+
+Formal server binary with embedded HTML, built by `cargo build -p autumn-server`.
+It remains a separate process: all cluster reads and writes invoke the sibling
+`autumn-op` CLI, while policy evaluation and actuation stay in the manager.
+No new dependency, wire format, or data-path work is added by this integration.
+
+- `--manager`, `--transport`, `--port` (8799), `--listen` (0.0.0.0),
+  `--autumn-op`, and required `--admin-token[-file]` retain their CLI meanings.
+  The token authorizes the **upstream manager**, not HTTP callers. HTTP remains
+  unauthenticated, including the VKE APIG route; see `docs/dashboard_review.md`.
+- Policy write bodies are typed; invalid booleans, integers, switch names and
+  option-like policy names fail before spawning the CLI. HTML event arguments
+  encode both JS strings and HTML delimiters/entities.
+- The page checks HTTP errors and `{ok:false}` before success feedback, marks
+  failed policy status as unknown, and shares concurrent reads per URL. A stale
+  partition detail response cannot replace the selected partition's drawer.
+- Each CLI invocation uses a blocking worker plus stdout/stderr reader threads;
+  its existing 30-second child deadline stays in place. This is control-plane
+  overhead, outside client/PS/EN data traffic. Multiple browsers still incur
+  separate requests.
+- Tests live alongside this binary: `tests/{render_check,tabs_smoke,policy_controls}.js`
+  and `tests/api_contract.sh` (Python harness, real etcd/manager/EN/PS, allocated
+  temporary data and ports, cleanup only of children it spawned). CI runs all.
 
 ### `autumn-op` (`src/bin/autumn_op/`)
 

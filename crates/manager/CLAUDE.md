@@ -1416,9 +1416,9 @@ failure reason the fire-and-forget maintenance ops used to drop.
 
 The manager **no longer serves a web UI** — the old in-manager `dashboard.rs`
 (axum over `cyper_axum::serve` + `include_str!` HTML) is gone. The dashboard is
-now a standalone app, `examples/dashboard` (the `autumn-dashboard` binary), which
+now a standalone app, `crates/server/src/bin/autumn_dashboard` (the `autumn-dashboard` binary), which
 holds no cluster state and drives the cluster ONLY through `autumn-op` — so the
-wire schema stays in exactly one place. It is token-gated (`--admin-token[-file]`).
+wire schema stays in exactly one place. It requires `--admin-token[-file]` for upstream manager mutations; the dashboard HTTP port itself has no authentication.
 
 What survives in this crate is `dashboard_compose.rs`: the pure `/api/overview`
 composer (df + nodes + partitions + ps_servers + amplification + advisories),

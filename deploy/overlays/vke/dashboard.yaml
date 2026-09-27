@@ -1,15 +1,14 @@
-# examples/dashboard as a standalone in-cluster app.
+# crates/server/src/bin/autumn_dashboard as a standalone in-cluster app.
 #
 # The manager NO LONGER serves the dashboard. This small Deployment runs the
 # `autumn-dashboard` binary (same image), which holds no cluster state and drives
 # the cluster ONLY through `autumn-op` — the wire schema stays in one place. It
-# talks to the manager Service (`autumn-manager`, leader-gated) and is gated on
-# the admin token from the `autumn-authz` Secret (created once by deploy.sh).
+# talks to the leader-gated manager Service (`autumn-manager`). Upstream
+# mutations use the admin token from the `autumn-authz` Secret.
 #
-# ClusterIP only — reachable in-cluster / via `kubectl port-forward svc/autumn-
-# dashboard 8799`, NEVER from the internet (no NodePort/LoadBalancer). The admin
-# token gates mutations; there is no per-request auth on the port itself, so pair
-# exposure with network ACLs.
+# The Service is ClusterIP, but the APIG Ingress below also exposes all paths.
+# The admin token authorizes upstream mutations; there is no HTTP caller auth.
+# Pair exposure with network access controls.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -60,8 +59,8 @@ spec:
               mountPath: /etc/autumn/authz
               readOnly: true
       volumes:
-        # REQUIRED (not optional): the dashboard is token-gated, so no Secret =
-        # no dashboard. deploy.sh provisions autumn-authz once before apply.
+        # REQUIRED: no upstream admin token means no dashboard.
+        # deploy.sh provisions autumn-authz once before apply.
         - name: authz
           secret:
             secretName: autumn-authz
