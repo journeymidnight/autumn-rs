@@ -105,7 +105,7 @@ def run():
                 except RuntimeError:
                     return False
             eventually(leader)
-            for d in ('en/d0', 'en/d1', 'ps'):
+            for d in ('en/d0', 'en/d1'):
                 (work/d).mkdir(parents=True)
             op('format', work/'en/d0', work/'en/d1')
             cpu = str(min(os.sched_getaffinity(0))) if hasattr(os, 'sched_getaffinity') else '0'
@@ -118,7 +118,7 @@ def run():
             eventually(disks_ready)
             op('bootstrap', '--replication', '1+0')
             spawn('ps', [str(BIN/'autumn-ps'), '--psid', '1', '--port', str(ps), '--manager', address,
-                '--data', str(work/'ps'), '--listen', '127.0.0.1', '--advertise', f'127.0.0.1:{ps}'])
+                '--listen', '127.0.0.1', '--advertise', f'127.0.0.1:{ps}'])
             eventually(lambda: ready(ps))
             spawn('dashboard', [str(BIN/'autumn-dashboard'), '--manager', address, '--autumn-op', str(BIN/'autumn-op'),
                 '--port', str(dash), '--listen', '127.0.0.1', '--admin-token', 'dashboard-test-token'])
@@ -157,6 +157,12 @@ def run():
                 http(route, body, expected=400)
             config = {'name':name,'switches':switches,'interval':2,'cooldown':0,'max_actions':1}
             assert http('/api/policies/upsert', config)['ok']
+            initial = http('/api/policies')
+            assert initial['mode'] == 'off' and not initial['active']
+            # Start selects and runs in one HTTP request, without a prior Observe.
+            assert http('/api/policies/activate', {'active':name, 'enabled':True})['ok']
+            started = http('/api/policies')
+            assert (started['mode'], started['active']) == ('armed', name)
             assert http('/api/policies/activate', {'active':name})['ok']
             state = http('/api/policies')
             assert (state['mode'], state['active']) == ('dry_run', name)

@@ -93,9 +93,18 @@ No new dependency, wire format, or data-path work is added by this integration.
 - Policy write bodies are typed; invalid booleans, integers, switch names and
   option-like policy names fail before spawning the CLI. HTML event arguments
   encode both JS strings and HTML delimiters/entities.
+- Each policy row offers Start (`{active:name, enabled:true}`) and optional
+  Observe (`{active:name}`); the controller's Stop sends `{enabled:false}`.
+  Start's confirmation names the clicked policy and needs no status prefetch
+  or prior selection. Running / Observing / Stopped are presentation labels
+  for the existing Armed / DryRun / Off modes; no backend contract change.
 - The page checks HTTP errors and `{ok:false}` before success feedback, marks
   failed policy status as unknown, and shares concurrent reads per URL. A stale
   partition detail response cannot replace the selected partition's drawer.
+- The first Policy panel is named Operational advisories. Hot/cold is an
+  information-only diagnosis (never an action): the page decodes its compact
+  reason into the affected PS, dimension, ratio, large/busy side, small/quiet
+  side and the five-minute observation window.
 - Each CLI invocation uses a blocking worker plus stdout/stderr reader threads;
   its existing 30-second child deadline stays in place. This is control-plane
   overhead, outside client/PS/EN data traffic. Multiple browsers still incur

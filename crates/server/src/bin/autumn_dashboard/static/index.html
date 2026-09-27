@@ -190,6 +190,7 @@
   .btn { background:#202024; color:var(--ink); border:1px solid var(--line); border-radius:6px;
     padding:4px 10px; font:inherit; font-size:12px; cursor:pointer; transition:border-color .12s, color .12s; }
   .btn:hover { border-color:var(--accent); }
+  .btn:disabled { opacity:.55; cursor:default; border-color:var(--line); }
   .btn.warn:hover { border-color:var(--warn); color:var(--warn); }
   .btn.bad { color:var(--bad); } .btn.bad:hover { border-color:var(--bad); }
   .btn.xs { padding:1px 6px; font-size:11px; }
@@ -390,11 +391,12 @@
   <section class="pane" id="pane-policy" hidden>
     <div class="panels">
       <div class="panel">
-        <h2>Policy advisories <span id="advcount" class="n"></span></h2>
+        <h2>Operational advisories <span id="advcount" class="n"></span></h2>
         <div id="advisories"></div>
       </div>
       <div class="panel">
         <h2>Auto-policy controller</h2>
+        <p style="color:var(--dim);font-size:12px">Start runs a policy automatically. Observe previews actions without executing them. Only one policy runs at a time.</p>
         <div class="ctlrow" id="ctlstate"></div>
         <div id="pollist"></div>
         <details style="margin-top:10px">
@@ -1083,11 +1085,37 @@ async function overview(){
 
 // ── policies / controller ────────────────────────────────────────────────────
 function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance"].map(k=>`<span class="sw-i ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
+// Hot/cold is a diagnosis, not an executable policy candidate. Turn its compact
+// wire-oriented reason into the decision an operator can actually make.
+function hotColdAdvisory(a){
+  const reason=String(a.reason||""), ps=(reason.match(/\bps_id=(\d+)/)||[])[1]||"?";
+  const dimension=(key,label,hotLabel,coldLabel)=>{
+    const m=reason.match(new RegExp(`\\b${key}_ratio=(\\d+) hot=\\[([^\\]]*)\\] cold=\\[([^\\]]*)\\]`));
+    if(!m) return null;
+    const parts=s=>s.trim()?s.split(",").map(x=>`part ${x.trim()}`).join(", "):"none";
+    return {label, ratio:m[1], ratioLabel:key==="qps"?"highest/lowest":"largest/smallest",
+            hot:`${hotLabel}: ${parts(m[2])}`, cold:`${coldLabel}: ${parts(m[3])}`};
+  };
+  const dims=[dimension("qps","request rate","busy","quiet"),
+              dimension("size","partition size","large","small")].filter(Boolean);
+  if(!dims.length) return {title:`PS ${ps} hot/cold imbalance`,
+    detail:`${reason}. Information only — no operation runs automatically.`};
+  const title=`PS ${ps} ${dims.map(d=>d.label).join(" and ")} imbalance`;
+  const facts=dims.map(d=>`${d.ratio}× ${d.ratioLabel} · ${d.hot} · ${d.cold}`).join("; ");
+  const detail=`${facts}. Sustained across five 1-minute policy samples. Information only — no operation runs automatically; inspect whether to split a large/busy partition or merge eligible small/quiet neighbors.`;
+  return {title,detail};
+}
 // An advisory's `desc` is "<kind> <target> <reason>" and the reason can be a
 // full sentence (the compact that must precede a blocked split says why). Split
 // it so the row leads with what to do and the reasoning sits under it.
 function advRow(a){
   const kind=(a.kind||(a.action&&a.action.action)||"").toString();
+  if(kind==="hotcold"){
+    const h=hotColdAdvisory(a);
+    return `<div class="adv ${esc(kind)}"><span class="sev"></span>
+      <span class="d">${esc(h.title)}<span class="why">${esc(h.detail)}</span></span>
+      <span style="color:var(--dim)">Information only</span></div>`;
+  }
   const d=String(a.desc||"");
   const m=d.match(/^(\S+\s+\S+(?:\s+\S+)?)\s{2,}(.*)$/s);
   const head=m?m[1].trim():d, why=m?m[2].trim():"";
@@ -1107,19 +1135,19 @@ function renderPolicyTab(){
   }
   const st=(window.__pol)||{};
   const mode=st.mode||"off", active=st.active||"", live=mode!=="off";
-  const label = mode==="armed"?"running (armed)":mode==="dry_run"?"observing (dry-run)":"stopped";
+  const label = mode==="armed"?"Running":mode==="dry_run"?"Observing":"Stopped";
   let btns="";
-  if(active && mode!=="armed") btns+=`<button class="btn xs" style="margin-left:8px" onclick='armCtl()'>Arm</button>`;
-  if(active) btns+=`<button class="btn xs ${live?"bad":""}" style="margin-left:6px" onclick='stopCtl()'>Stop</button>`;
+  if(live) btns+=`<button class="btn xs ${live?"bad":""}" style="margin-left:6px" onclick='stopCtl()'>Stop</button>`;
   $("#ctlstate").innerHTML = `<span class="dot ${live?"ok":"bad"}"></span>
-    controller <b>${label}</b> ${active?`· active <b>${esc(active)}</b>`:"· no policy selected"}
+    controller <b>${label}</b> ${active?`· ${live?"policy":"last policy"} <b>${esc(active)}</b>`:""}
     <span class="grow"></span>${btns}`;
   $("#pollist").innerHTML = (st.policies||[]).map(p=>`
-    <div class="pol ${st.active===p.name?"active":""}">
+    <div class="pol ${live && active===p.name?"active":""}">
       <div class="ph"><span class="pn">${esc(p.name)}</span>
         <span class="tagb">${p.builtin?"preset":"custom"}</span><span class="desc">· ${esc(p.desc)}</span>
         <span class="pgrow"></span>
-        <button class="btn xs" onclick='activate(${jsAttr(p.name)})'>${st.active===p.name?"active":"use"}</button>
+        <button class="btn xs" onclick='startPolicy(${jsAttr(p.name)})' ${active===p.name && mode==="armed"?"disabled":""}>${active===p.name && mode==="armed"?"Running":"Start"}</button>
+        <button class="btn xs" onclick='observePolicy(${jsAttr(p.name)})' ${active===p.name && mode==="dry_run"?"disabled":""}>${active===p.name && mode==="dry_run"?"Observing":"Observe"}</button>
         ${p.builtin?"":`<button class="btn xs bad" onclick='delPolicy(${jsAttr(p.name)})'>del</button>`}</div>
       <div class="sws">${swLine(p.switches||{})}
         <span class="cfg">i=${p.interval}s cd=${p.cooldown}s max=${p.max_actions}</span></div>
@@ -1136,22 +1164,18 @@ async function loadPolicies(){
   window.__polError=null;
   window.__pol=st; window.__polLog=st.log||[];
   const mode=st.mode||"off", active=st.active||"";
-  $("#v_ctl").innerHTML = mode==="armed" ? `<span class="up">armed</span>` : mode==="dry_run" ? `observe` : `<span class="off">off</span>`;
-  $("#v_ctl_sub").innerHTML = active?`policy <b>${esc(active)}</b>`:"no policy selected";
+  $("#v_ctl").innerHTML = mode==="armed" ? `<span class="up">running</span>` : mode==="dry_run" ? `observing` : `<span class="off">stopped</span>`;
+  $("#v_ctl_sub").innerHTML = active?`${mode==="off"?"last policy":"policy"} <b>${esc(active)}</b>`:"no policy running";
   if(TAB==="policy") renderPolicyTab();
   if(TAB==="logs") renderLogsTab();
 }
-async function activate(name){
+async function observePolicy(name){
   await mutate("/api/policies/activate",{active:name},"Observing policy: "+name);
   await loadPolicies();
 }
-async function armCtl(){
-  let st;
-  try{ st=await api("/api/policies"); }
-  catch(e){ toast("Cannot arm: "+e.message,"bad"); return; }
-  if(!st.active) return;
-  if(!confirm("Arm the auto-policy controller?\nIt will periodically run split/ec/compact/gc/merge/rebalance on the cluster per the active policy.")) return;
-  await mutate("/api/policies/activate",{active:st.active,enabled:true},"Controller armed");
+async function startPolicy(name){
+  if(!confirm(`Start policy "${name}"?\nThe controller will automatically execute this policy's enabled actions.\nThis replaces the currently running or observed policy.`)) return;
+  await mutate("/api/policies/activate",{active:name,enabled:true},"Started policy: "+name);
   await loadPolicies();
 }
 async function stopCtl(){

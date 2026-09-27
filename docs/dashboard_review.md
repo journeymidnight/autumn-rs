@@ -57,3 +57,22 @@ has one blocking worker and two pipe-reader threads, and polls child exit every
 50 ms with the existing 30-second deadline. Browser read coalescing bounds
 repeated refreshes within one page; separate users still generate separate
 processes. No throughput improvement is claimed for the directory move.
+
+## Policy controls follow-up — 2026-09-27
+
+The old page made the operator select a policy into DryRun before offering
+Arm. Each policy now has direct Start and optional Observe actions; Stop
+stops the current controller. Start sends the clicked name and `enabled:true`
+in one HTTP request, with no prior selection or active-policy lookup. Labels
+show Running / Observing / Stopped. This uses the existing HTTP/CLI interface;
+the name/mode RPC transaction finding above remains open.
+
+The user explicitly confirmed retaining existing HTTP access and recording its
+risk while fixing functionality; authentication is not part of this work.
+
+The same follow-up separates controller policies from manager diagnoses. The
+former "Policy advisories" panel is now "Operational advisories". A hot/cold
+candidate such as `ps_id=3 size_ratio=45 hot=[32] cold=[21]` renders as a PS 3
+partition-size imbalance: 45x largest/smallest, large partition 32, small
+partition 21, sustained across five one-minute samples. It is labeled
+information-only because hot/cold has no actuation command.

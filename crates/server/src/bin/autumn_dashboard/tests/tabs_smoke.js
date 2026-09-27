@@ -89,6 +89,10 @@ const OVERVIEW = {
       reason: "major compaction before split: partition still carries CoW-shared out-of-range keys (has_overlap), and split is REFUSED until a major compaction rewrites them",
       desc: "major  part 1             major compaction before split: partition still carries CoW-shared out-of-range keys (has_overlap), and split is REFUSED until a major compaction rewrites them",
       action: { action: "compact", part_id: 1 }, key: "major:1" },
+    { kind: "hotcold", primary_part_id: 32, secondary_part_id: 21,
+      reason: "ps_id=3 size_ratio=45 hot=[32] cold=[21]",
+      desc: "hotcold part 32 ps_id=3 size_ratio=45 hot=[32] cold=[21]",
+      action: null, key: "hotcold:32" },
   ],
 };
 const PART = {
@@ -172,6 +176,8 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   want("#drawer", "Extents", "…and still shows the extents");
   // Policy + Logs.
   want("#advisories", "major compaction before split", "the advisory keeps its whole reason");
+  want("#advisories", "PS 3 partition size imbalance", "hot/cold is rendered in operator language");
+  want("#advisories", "Information only", "hot/cold says it cannot execute an operation");
   want("#autolog", "overlapping keys", "the auto-policy log is on the Logs tab");
   want("#ops_live", "gc", "running ops are on the Logs tab");
   want("#ops_hist", "no address for part 1", "…and a failed op keeps its reason");

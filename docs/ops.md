@@ -359,11 +359,22 @@ not imply private access. Preserve network controls or bind `--listen 127.0.0.1`
 and tunnel. HTTP authentication is an existing non-goal retained in this move.
 
 **Policy feedback:** rejected writes show the manager's reason and retain the
-editor input; failed status queries display `unknown`. Select means DryRun,
-Arm means Armed, and Stop means Off. The existing CLI selects the policy and
+editor input; failed status queries display `unknown`. Each policy's **Start**
+button selects that named policy and runs it after confirmation, even if none
+was previously selected. **Observe** selects the named policy in DryRun for
+preview only; it is optional. **Stop** means Off. Status labels are
+Running / Observing / Stopped. The existing CLI selects the policy and
 sets its mode with separate RPCs: after a partial failure, refresh status and
 verify the actual name/mode before operating again. Review details and the
 remaining transaction gap: [dashboard review](dashboard_review.md).
+
+The first Policy panel is **Operational advisories**, separate from the
+controller's selectable policies. A hot/cold row is information-only: over the
+last five one-minute samples, partitions on one PS remained at least 10x apart
+in QPS (hot side at least 10,000 QPS) or carried size (large side at least
+25 GiB). It names both sides and the measured ratio. It does not map to an
+operation; investigate whether a hot/large partition should split or eligible
+cold/small neighbors should merge.
 
 **Automated verification** (local isolated processes, also run in CI):
 

@@ -31,7 +31,7 @@ let OUT = {};
 const ctx = { $: sel => ({ set innerHTML(v) { OUT[sel] = v; } }) };
 const src = [escLine, constLine("jsAttr"), constLine("BYTE_KINDS"),
              constLine("COUNT_UNIT"), lift("fmtBytes"), lift("fmtProgress"), lift("agoStr"), lift("psHealth"),
-             lift("diskRow"), lift("advRow"), lift("opsTarget"), lift("opsAgo"),
+             lift("diskRow"), lift("hotColdAdvisory"), lift("advRow"), lift("opsTarget"), lift("opsAgo"),
              lift("nodeAddr"), lift("extChip"),
              lift("renderLiveOps"), lift("renderOpsHistory")].join("\n");
 const now = Math.floor(Date.now() / 1000);
@@ -46,6 +46,12 @@ OUT2.disks = [
 ].join("");
 OUT2.adv = advRow({kind:"major", desc:"major  part 7             major compaction before split: partition still carries CoW-shared out-of-range keys (has_overlap), and split is REFUSED until a major compaction rewrites them",
                    action:{action:"compact", part_id:7}});
+OUT2.hotcold = advRow({kind:"hotcold", primary_part_id:32, secondary_part_id:21,
+                       reason:"ps_id=3 size_ratio=45 hot=[32] cold=[21]",
+                       desc:"hotcold part 32 ps_id=3 size_ratio=45 hot=[32] cold=[21]", action:null});
+OUT2.hotcoldBoth = advRow({kind:"hotcold", primary_part_id:8, secondary_part_id:4,
+                           reason:"ps_id=2 qps_ratio=12 hot=[8, 9] cold=[4] size_ratio=20 hot=[8] cold=[4, 5]",
+                           desc:"", action:null});
 OUT2.jsattr = jsAttr("it's");
 // A CoW split's shared extent, and a private one. The chip must NAME the other
 // holders: refs=2 alone cannot tell an operator that collecting here frees
@@ -129,6 +135,20 @@ if (/#5[^#]*0 B/.test(d)) { console.error("FAIL: an unreported disk renders a fa
 want(PURE.adv, "major  part 7", "advisory leads with kind + target");
 want(PURE.adv, "major compaction before split", "…and keeps the whole reason");
 want(PURE.adv, "Apply", "an actionable advisory offers its action");
+const hotcold = text(PURE.hotcold);
+want(hotcold, "PS 3 partition size imbalance", "hot/cold names the affected PS and measured dimension");
+want(hotcold, "45× largest/smallest", "hot/cold explains the ratio");
+want(hotcold, "large: part 32", "hot/cold explains the hot side without jargon");
+want(hotcold, "small: part 21", "hot/cold explains the cold side without jargon");
+want(hotcold, "five 1-minute policy samples", "hot/cold states its observation window");
+want(hotcold, "Information only", "hot/cold says it cannot execute an operation");
+if (/\bhotcold\b|\bhot=|\bcold=/.test(hotcold)) {
+  console.error("FAIL: hot/cold leaks wire-oriented jargon into the operator explanation"); bad++;
+}
+const hotcoldBoth = text(PURE.hotcoldBoth);
+want(hotcoldBoth, "request rate and partition size imbalance", "both triggering dimensions are named");
+want(hotcoldBoth, "busy: part 8, part 9", "QPS hot list is decoded");
+want(hotcoldBoth, "small: part 4, part 5", "size cold list is decoded");
 // The Apply handler lives in a SINGLE-quoted attribute, so an apostrophe would
 // end the attribute and break the button. No advisory target can contain one
 // today (they are "part N" / "extent N" / "cluster"), which is exactly why the

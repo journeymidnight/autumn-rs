@@ -1,3 +1,12 @@
+Date: 2026-09-27 (12)
+TaskStatus: completed
+Task scope: simplify dashboard policy controls so starting a policy does not require selecting it first.
+Current summary: each policy now has direct Start and optional Observe actions; Stop controls the running/observed policy. Start confirms the clicked name and sends {active:name, enabled:true} as its first and only write, with no prior selection or status lookup. Labels are Running / Observing / Stopped. The formerly opaque Policy advisories panel is Operational advisories; hot/cold rows decode the PS, triggering dimension, ratio, both partition sets, five-minute window, and explicitly say information-only. For the reported row: PS 3 has a sustained size imbalance, 45x largest/smallest, large part 32 and small part 21.
+Verification: dashboard binary rebuilt; render_check, tabs_smoke and policy_controls passed. The controls test pins direct one-write Start, confirmation/cancellation, Observe/Stop payloads, all three labels, special-name escaping and existing error behavior. The real isolated etcd/manager/two-disk EN/PS/dashboard contract passed and proves Off -> the named policy in Armed via one HTTP request, then DryRun/Off/delete. The served-page byte check passed after the final rebuild. Removed an obsolete --data argument from the PS harness invocation after it logged as unknown. No production deployment.
+Review: source self-review covered render state, confirmation, request ordering, stale responses and hot/cold parsing. No subagent dispatched under the current user restriction on delegation. Existing non-atomic manager RPC behavior remains tracked separately as BUG-POLICY-ACTIVATE-ATOMIC; this UI change does not claim to fix it.
+Main gaps: none for the requested UI flow and explanation. HTTP access stays unchanged per user confirmation. The hot/cold advisory is intentionally not actionable because the manager exposes no single safe operation for it.
+Next steps: rebuild/redeploy autumn-dashboard to see the new controls and advisory wording. No push or deployment performed.
+
 Date: 2026-09-27 (11)
 TaskStatus: completed
 Task scope: review dashboard before promoting it from examples into autumn-server, and fix confirmed dashboard defects.

@@ -49,8 +49,14 @@ Apply buttons and auto-policy activate/deactivate) use it.
 | `POST /api/policies/upsert` | `autumn-op auto-policy upsert <name> --switches … --interval … …` |
 | `POST /api/policies/delete` | `autumn-op auto-policy delete <name>` |
 
-The controller panel is **use** (select → DryRun / observe) → **Arm** (actuate) →
-**Stop** (Off), and the custom-policy editor supports create/replace/delete. Policy names must be
+Each policy has a **Start** button: confirm the named policy to select it and
+run its enabled actions immediately. **Observe** is an optional preview that
+logs proposed actions without executing them; it is not a prerequisite for
+Start. **Stop** stops the current controller. Only one policy runs at a time;
+starting or observing another replaces the current selection. The page shows
+**Running / Observing / Stopped** and disables the current mode's button.
+
+The custom-policy editor supports create/replace/delete. Policy names must be
 nonblank and must not start with `-` (they are CLI positional arguments).
 `switches` must be a boolean object using the six listed names; omitted switches
 are off. Optional `interval` is an integer >= 2, `cooldown` an unsigned integer,
@@ -78,6 +84,13 @@ Built for many partitions: the Partitions tab is **partition-server-first** (pic
 a PS card and the list shows *only that server's* partitions; **All servers**
 restores the full list, virtual-scrolled), and per-partition detail — extents +
 load metrics — is fetched lazily when a row is opened.
+
+The Policy tab calls its first panel **Operational advisories** because those
+rows are diagnoses, not controller policies. In particular, `hotcold` means
+partitions on one PS have stayed at least 10x apart in request rate or carried
+size across five one-minute samples (with a 10,000 QPS or 25 GiB hot-side
+floor). It is information-only: the row names the PS, ratio, and busy/quiet or
+large/small partitions, but never dispatches an operation by itself.
 
 **Each `/api/*` call spawns an `autumn-op` subprocess**, so the poll fetches only
 what the visible tab renders (concurrent identical reads in one page share a
