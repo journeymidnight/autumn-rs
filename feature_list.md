@@ -541,19 +541,17 @@
 - **Scope**（未实现）: 在加载期抓一次读大小直方图（守护进程侧按 size 分桶计数），
   确认 74 KiB 是加载器发出的还是我们内部拆的。若是后者，合并相邻 extent 的读是直接收益。
 
-### BUG-FUSE-SIGKILL-DURING-NOTIFY — notify 等预读页时被 SIGKILL，守护进程成不可杀僵尸、挂载点无人服务
-- **Trigger** (2026-09-26，修内核失效死锁时独立评审在宿主上发现，已核实): 失效通知改到
-  `autumn-fuse-inval` 线程后，它等预读页是正常的瞬态。此时 SIGKILL：能应答那条 FUSE_READ 的
-  线程全死，等待线程 D 状态不可中断，`/dev/fuse` fd 要等所有线程退出才释放（释放才 abort
-  连接）⇒ 永久僵尸（`Z` + 一个线程停在 `fuse_reverse_inval_inode → folio_wait_bit_common`），
-  AutoUnmount 也不触发（fusermount3 的 socket 同在 fd 表里）。`scripts/fuse_inval_deadlock.sh`
-  早期版本用 `kill -9` 收尾，修前修后每跑一次留一个；fusectl abort 后立即退出。
-  前提：被杀时刻有预读中的页缓存页（mmap-private / create fd），即原死锁的同一类负载。
-- **Scope**: 让 SIGTERM（k8s 先发的那个）走优雅卸载：守护进程活着的时候卸载，在途 notify 能等到
-  自己的读被应答再返回，然后 Destroy 正常退出。SIGKILL 本身无法处理，不在范围内。
-- **Acceptance**: 在 `fuse_inval_deadlock.sh` 负载运行中向读挂载守护进程发 SIGTERM（不做 fusectl
-  abort）：进程在有界时间内退出、挂载点被卸掉、`/sys/fs/fuse/connections` 下不残留该连接；
-  对照（去掉处理）同样操作留下僵尸。
+### BUG-FUSE-UMOUNT-JOIN-HANG — 普通卸载后守护进程可能永不退出（未复现）
+- **Trigger** (2026-09-27，SIGTERM 优雅退出的独立评审读代码发现，既有问题): `umount` /
+  `fusermount -u` 之后 `Session::run` 因 ENODEV 返回，`main` 接着 `compio_handle.join()`；
+  派发循环只在收到 `FsRequest::Destroy` 或 `rx.next() == None` 时退出。此刻 bridge 的 sender
+  还活着（`main` 里的 `bridge`、`Session` 内 `AutumnFs` 的那份），而 `Session::drop`（会发
+  Destroy）要到 join 之后才跑。推断（内核知识，未在本机核实）：非 fuseblk 挂载内核不发
+  FUSE_DESTROY ⇒ join 永远等下去，进程在没有挂载的情况下每 30 s 跑一次 `periodic_sync`。
+  SIGTERM 现在能把它救出来（信号线程发 Destroy）。
+- **Scope（复现之后才谈）**: 挂载 → `umount` → 看守护进程是否退出；若坐实，修法是 join 之前
+  `drop(session)`（一行），并在脚本里加一条卸载后进程必须退出的断言。
+- **Acceptance**: 确定性复现（或证伪），修则消融能变红。
 - `passes: false`
 
 ### F-FUSE-BIG-IO-TUNING — writeback cache + splice 零拷贝，把大 IO 的 FUSE 开销压进 5%

@@ -13,7 +13,7 @@ use clap::Parser;
 use futures::StreamExt;
 use tracing_subscriber::EnvFilter;
 
-use autumn_fuse::bridge::FuseBridge;
+use autumn_fuse::bridge::{FsRequest, FuseBridge};
 use autumn_fuse::dispatch;
 use autumn_fuse::ops::AutumnFs;
 use autumn_fs::state::FsState;
@@ -200,21 +200,29 @@ fn main() -> Result<()> {
         options.push(fuser::MountOption::AllowOther);
     }
 
+    let shutdown_tx = tx.clone();
     let fs = AutumnFs::new(tx);
     tracing::info!(mountpoint = %mountpoint.display(), "mounting filesystem");
     let mut session = fuser::Session::new(fs, &mountpoint, &options)?;
     let notifier = session.notifier();
+    // Before any thread exists: every thread inherits the mask, so only
+    // `shutdown_on_signal`'s `sigwait` ever takes SIGTERM / SIGINT. (The mount
+    // creates none; its fusermount3 helper blocks every signal on its own.)
+    let term_signals = block_term_signals().context("block SIGTERM/SIGINT")?;
     // Never on the compio thread: the notify blocks on pages whose reads
     // only that thread can answer (see `inval.rs`).
-    let (inval_tx, inval_results) =
+    let (inval_tx, inval_results, inval_gate) =
         autumn_fuse::inval::spawn(move |ino| notifier.inval_inode(ino, 0, 0))
             .context("spawn invalidation thread")?;
+    // Never sent on: the sender drops when the compio thread ends, however it ends.
+    let (compio_done_tx, compio_done_rx) = std::sync::mpsc::channel::<()>();
 
     // Start the compio thread
     let manager_addr = args.manager.clone();
     let compio_handle = std::thread::Builder::new()
         .name("autumn-fuse-compio".to_string())
         .spawn(move || {
+            let _compio_done = compio_done_tx;
             compio::runtime::Runtime::new().unwrap().block_on(async {
                 // Connect to cluster (scoped to `fs/{tenant}/`); with an authz
                 // credential when `--credential-file` was given.
@@ -350,6 +358,14 @@ fn main() -> Result<()> {
         })
         .context("spawn compio thread")?;
 
+    let unmounter = session.unmount_callable();
+    std::thread::Builder::new()
+        .name("autumn-fuse-signal".to_string())
+        .spawn(move || {
+            shutdown_on_signal(term_signals, inval_gate, shutdown_tx, compio_done_rx, unmounter)
+        })
+        .context("spawn signal thread")?;
+
     // Run the fuse session loop on the main thread. Blocks until
     // unmount.
     session.run()?;
@@ -360,6 +376,61 @@ fn main() -> Result<()> {
     let _ = compio_handle.join();
 
     Ok(())
+}
+
+/// SIGTERM (what Kubernetes sends first) and SIGINT, blocked in the calling
+/// thread and so in every thread spawned after it.
+fn block_term_signals() -> std::io::Result<libc::sigset_t> {
+    // SAFETY: plain libc calls on a local sigset_t.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        match libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()) {
+            0 => Ok(set),
+            rc => Err(std::io::Error::from_raw_os_error(rc)),
+        }
+    }
+}
+
+/// Exit on SIGTERM / SIGINT without leaving a zombie behind the mount.
+///
+/// The default action kills every thread at once, and a thread that is inside
+/// `inval_inode` waiting on a readahead page cannot die: it waits on a read only
+/// the dispatcher could answer, and the `/dev/fuse` fd whose release would
+/// abort the connection outlives it (see `inval.rs`). So the order is:
+///   1. close the invalidation gate — waits out the notify in flight while the
+///      session loop and the dispatcher still answer its read;
+///   2. Destroy the dispatcher, which flushes dirty inodes, and wait for it;
+///   3. unmount (lazy), and exit. Exit closes `/dev/fuse`, which aborts the
+///      connection for any process still holding a file open on it.
+fn shutdown_on_signal(
+    signals: libc::sigset_t,
+    inval_gate: autumn_fuse::inval::InvalGate,
+    shutdown_tx: futures::channel::mpsc::UnboundedSender<FsRequest>,
+    compio_done: std::sync::mpsc::Receiver<()>,
+    mut unmounter: fuser::SessionUnmounter,
+) {
+    let mut signal: libc::c_int = 0;
+    // SAFETY: `signals` is a valid, initialised set; `signal` is a valid out-pointer.
+    let rc = unsafe { libc::sigwait(&signals, &mut signal) };
+    if rc != 0 {
+        tracing::error!(error = %std::io::Error::from_raw_os_error(rc), "sigwait failed; SIGTERM will not unmount");
+        return;
+    }
+    tracing::info!(signal, "shutting down: draining kernel invalidations");
+    inval_gate.close();
+    tracing::info!("flushing dirty inodes");
+    if shutdown_tx.unbounded_send(FsRequest::Destroy).is_err() {
+        tracing::warn!("dispatcher already gone; nothing to flush");
+    }
+    compio_done.recv().unwrap_err();
+    tracing::info!("unmounting");
+    if let Err(e) = unmounter.unmount() {
+        tracing::error!(error = %e, "unmount failed");
+    }
+    std::process::exit(0);
 }
 
 async fn periodic_sync(state: &mut FsState) {

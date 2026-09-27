@@ -230,19 +230,29 @@ inode 的每一个缓存页（`invalidate_inode_pages2_range`）。预读中的�
 - **不许等失效落地再应答请求**：在 handler 里 await 结果，等于把派发循环挂住——跟阻塞
   write 把线程挂住是同一个死锁。所以 Open 臂对 sticky ino 的重试是**只入队**，结果
   以后再清 sticky；以前那句"retry succeeded on Open"的同步判断因此移到 `record_result`。
-- 线程不 join：所有 sender 丢掉（compio runtime 退出）就自然结束；卸载之后也没有值得
-  送达的失效。
-- **⚠️ 剩下的一个坑：notify 正等着预读页时被 SIGKILL**。能应答那条读的线程都死了，等待的
-  线程不可中断，而 `/dev/fuse` fd 要等**所有**线程退出才释放（释放才会 abort 连接、才会
-  放开那页）——守护进程永远是僵尸，挂载点背后没有服务（就是 AutoUnmount 注释里那五台
-  节点的形状）。实测：脚本早期版本用 `kill -9` 收尾，修前修后每跑一次都留下一个，线程停在
-  `fuse_reverse_inval_inode → invalidate_inode_pages2_range → folio_wait_bit_common`；
-  `echo 1 > /sys/fs/fuse/connections/<minor>/abort` 后立即退出。前提是被杀那一刻有预读中
-  的页缓存页，也就是原来会直接死锁的那种 mmap-private 负载，所以修后严格更好。根治要让
-  SIGTERM 走优雅卸载，记在账本 BUG-FUSE-SIGKILL-DURING-NOTIFY。
+- 线程不 join：所有 sender 丢掉、结果流丢掉或 `InvalGate` 关闭时自然结束。
+- **退出前必须先关 `InvalGate`（SIGTERM / SIGINT，`main.rs::shutdown_on_signal`）**。
+  notify 正等着预读页时整个进程被杀（默认动作一次杀光所有线程），能应答那条读的线程都死了，
+  等待的线程不可中断，而 `/dev/fuse` fd 要等**所有**线程退出才释放（释放才会 abort 连接、
+  才会放开那页）——守护进程成僵尸、挂载点背后没有服务（AutoUnmount 注释里那五台节点的
+  形状），线程停在 `fuse_reverse_inval_inode → invalidate_inode_pages2_range →
+  folio_wait_bit_common`。实测：不带处理的构建，负载中 SIGTERM 10 轮留 4 个僵尸。
+  所以两个信号在任何线程创建之前被屏蔽（线程继承掩码；挂载本身不建线程，fusermount3
+  帮手进程自己屏蔽全部信号），由 `autumn-fuse-signal` 线程 `sigwait` 独占，顺序是：
+  ① 关 gate——失效线程在每次 notify 期间持锁，拿到锁就等于在途 notify 已被应答
+  （session 循环和派发线程这时都还在服务），之后不再发新的；② 给派发线程发 Destroy
+  （flush 脏 inode）并等它结束；③ lazy 卸载；④ `process::exit`，关掉 `/dev/fuse`，
+  仍开着文件的进程随连接 abort。同类负载的单集群多轮复验：不带处理 10 轮 4 僵尸，带处理
+  20 轮 0；提交的脚本 8 轮全过，不带处理的构建在第 1、2 轮即失败。
+  代价：启动阶段（连集群 + 等 ready，最长约 60 s）收到的 SIGTERM 要等启动走完才退出——
+  Destroy 只在派发循环里被消费；这期间还没有 lease 任务、不会有 notify 在途，宽限期到了
+  被 SIGKILL 也是干净的。第二个 SIGTERM 不起作用（信号一直屏蔽，只 `sigwait` 一次）。
+  **SIGKILL 跳过这一步，照样会留僵尸**（被杀时刻有预读中的页缓存页才会：mmap-private
+  或 create 的 fd），只能 `echo 1 > /sys/fs/fuse/connections/<minor>/abort` 清。
 - 测试：`inval.rs` 单测钉"invalidator 不等 notify 就返回"（notify 只在调用返回后才被放行，
-  内联就会等满超时并报错）、结果保序、失败/成功对 sticky 集的作用；端到端是那个脚本
-  （需要真挂载，不能进 cargo test）。
+  内联就会等满超时并报错）、结果保序、失败/成功对 sticky 集的作用、"关 gate 会等在途
+  notify 且之后不再发"（把放锁挪到 notify 之前即变红）；端到端是那个脚本（需要真挂载，
+  不能进 cargo test），它的 TERM 段在竞争进行中连发 `TERM_ROUNDS` 轮 SIGTERM。
 
 ## 配置（CLI）
 

@@ -2315,7 +2315,7 @@ same file for write and closes it as fast as it can, one WriterClosed event per
 close.
 
 ```bash
-# ~2 min per run. Mounts /mnt/autumn-fuse-inval-r and /mnt/autumn-fuse-inval-w.
+# ~3 min per run. Mounts /mnt/autumn-fuse-inval-r and /mnt/autumn-fuse-inval-w.
 AUTUMN_DATA_ROOT=/data05/autumn-inval ./scripts/fuse_inval_deadlock.sh
 # Reads prepared AND executed on the dispatcher (the shape most likely to wedge):
 READ_IO_THREADS=0 AUTUMN_DATA_ROOT=/data05/autumn-inval ./scripts/fuse_inval_deadlock.sh
@@ -2331,11 +2331,25 @@ build with `FUSE_BIN=<path>`. Healthy shape over 60 s: ~170 passes, ~150 k event
 prints the reader mount's threads: `autumn-fuse-com  D  folio_wait_bit_common`
 plus the reader in D with `filemap_fault` in its stack is this deadlock.
 
-Killing the daemon does NOT free a wedged mount. A daemon SIGKILLed while a
-notify waits on a readahead page stays a zombie (a thread in D at
-`folio_wait_bit_common`, main thread `Z`) and its mount keeps no server behind
-it; with the fix this can still happen if the kill lands mid-notify. The script
-tears down by aborting the connection first. To clear one by hand:
+The script then sends SIGTERM to the reader daemon `TERM_ROUNDS` times (default
+8, each on a fresh reader mount) while the race still runs: every daemon must be
+fully gone within `TERM_SECS` (30), its mount and FUSE connection with it. The
+daemon drains the notify in flight before exiting; a build without that (A/B via
+`FUSE_BIN`) left a zombie in 4 of 10 rounds of the same load, and failed this
+script in round 1 or 2 — one round is not enough to tell the two apart. Each
+round first waits for the fresh mount to log 100 invalidation events. Log lines
+of a clean shutdown: `shutting down: draining kernel invalidations` →
+`flushing dirty inodes` → `unmounting`. A SIGTERM during startup (connecting,
+waiting for the cluster, up to ~60 s) exits only once startup finishes; a
+second SIGTERM does nothing — escalate with SIGKILL, which is safe then because
+no invalidation runs before startup completes.
+
+SIGKILL skips that drain. A daemon SIGKILLed while a notify waits on a readahead
+page stays a zombie (a thread in D at `folio_wait_bit_common`, main thread `Z`)
+and its mount keeps no server behind it — so stop mounts with SIGTERM (what
+Kubernetes sends first), and keep the pod's grace period long enough for the
+dirty-inode flush. The script tears down by aborting the connection first. To
+clear a zombie by hand:
 
 ```bash
 mountpoint -q /sys/fs/fuse/connections || mount -t fusectl none /sys/fs/fuse/connections

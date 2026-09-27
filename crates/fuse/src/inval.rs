@@ -19,21 +19,23 @@
 //! awaiting it inside a handler holds the dispatch loop just as the blocking
 //! write held the thread.
 //!
-//! What this does not cover: a SIGKILL while a notify waits on a readahead
-//! page. The threads that would answer that read die, the waiting one is
-//! uninterruptible, and the `/dev/fuse` fd — whose release aborts the
-//! connection and would free the page — is only released once every thread has
-//! exited. The daemon stays a zombie and the mount keeps no server behind it
-//! until the connection is aborted by hand
-//! (`echo 1 > /sys/fs/fuse/connections/<minor>/abort`). It requires page-cache
-//! pages under readahead at the moment of the kill — a private mmap or a
-//! create fd, the same workload that used to deadlock outright.
+//! Exiting while a notify waits on a readahead page leaves a zombie: the
+//! threads that would answer that read die, the waiting one is uninterruptible,
+//! and the `/dev/fuse` fd — whose release aborts the connection and would free
+//! the page — is only released once every thread has exited. The mount then
+//! keeps no server behind it until the connection is aborted by hand
+//! (`echo 1 > /sys/fs/fuse/connections/<minor>/abort`). So shutdown closes the
+//! [`InvalGate`] first: it returns once the notify in flight, if any, has been
+//! answered — the dispatcher is still serving — and no notify starts after it.
+//! A SIGKILL skips that step and still leaves the zombie, when it lands while
+//! page-cache pages are under readahead (a private mmap or a create fd, the
+//! same workload that used to deadlock outright).
 
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io;
 use std::rc::Rc;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver};
 use futures::StreamExt;
@@ -43,28 +45,52 @@ use crate::dispatch::InodeInvalidator;
 /// One notify's outcome, reported back to the dispatch runtime.
 pub type InvalResult = (u64, io::Result<()>);
 
+/// Shuts the invalidation thread for process exit. The thread holds the lock
+/// across each notify, so taking it waits out the one in flight.
+#[derive(Clone)]
+pub struct InvalGate(Arc<Mutex<bool>>);
+
+impl InvalGate {
+    /// Returns once no notify is in flight; none starts afterwards. Inos still
+    /// queued are dropped — nothing is left to serve the pages they would drop.
+    pub fn close(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+    }
+}
+
 /// Start the invalidation thread around `notify` (the mount passes
 /// `|ino| notifier.inval_inode(ino, 0, 0)`). Returns the sender the dispatch
-/// runtime queues inos on and the stream of outcomes.
+/// runtime queues inos on, the stream of outcomes, and the gate shutdown
+/// closes before exiting.
 ///
-/// The thread ends when every sender is gone or the outcome stream is dropped.
-/// Nobody joins it: at unmount there is nothing left worth delivering.
-pub fn spawn<F>(mut notify: F) -> io::Result<(mpsc::Sender<u64>, UnboundedReceiver<InvalResult>)>
+/// The thread ends when every sender is gone, the outcome stream is dropped or
+/// the gate is closed. Nobody joins it.
+pub fn spawn<F>(
+    mut notify: F,
+) -> io::Result<(mpsc::Sender<u64>, UnboundedReceiver<InvalResult>, InvalGate)>
 where
     F: FnMut(u64) -> io::Result<()> + Send + 'static,
 {
     let (ino_tx, ino_rx) = mpsc::channel::<u64>();
     let (result_tx, result_rx) = unbounded::<InvalResult>();
+    let gate = InvalGate(Arc::new(Mutex::new(false)));
+    let closed = gate.0.clone();
     std::thread::Builder::new()
         .name("autumn-fuse-inval".to_string())
         .spawn(move || {
             for ino in ino_rx {
-                if result_tx.unbounded_send((ino, notify(ino))).is_err() {
+                let closed = closed.lock().unwrap_or_else(PoisonError::into_inner);
+                if *closed {
+                    break;
+                }
+                let result = notify(ino);
+                drop(closed);
+                if result_tx.unbounded_send((ino, result)).is_err() {
                     break;
                 }
             }
         })?;
-    Ok((ino_tx, result_rx))
+    Ok((ino_tx, result_rx, gate))
 }
 
 /// The `InodeInvalidator` the lease tasks and the Open arm call: queue the ino
@@ -119,7 +145,7 @@ mod tests {
     #[test]
     fn the_invalidator_does_not_wait_for_the_notify() {
         let (release_tx, release_rx) = mpsc::channel::<()>();
-        let (ino_tx, mut results) = spawn(move |_ino| {
+        let (ino_tx, mut results, _gate) = spawn(move |_ino| {
             release_rx
                 .recv_timeout(Duration::from_secs(5))
                 .map_err(|_| io::Error::other("the invalidator waited for the notify"))
@@ -139,7 +165,7 @@ mod tests {
     /// the notify's own result.
     #[test]
     fn outcomes_come_back_in_order() {
-        let (ino_tx, results) = spawn(|ino| {
+        let (ino_tx, results, _gate) = spawn(|ino| {
             if ino % 2 == 0 {
                 Err(io::Error::from_raw_os_error(libc::ENOENT))
             } else {
@@ -158,6 +184,48 @@ mod tests {
             .map(|(ino, r)| (ino, r.is_ok()))
             .collect();
         assert_eq!(got, vec![(1, true), (2, false), (3, true), (4, false)]);
+    }
+
+    /// Closing the gate waits for the notify in flight, and no notify runs
+    /// after it — so the process can exit with no thread inside the kernel.
+    #[test]
+    fn closing_the_gate_waits_out_the_notify_in_flight_and_stops_the_rest() {
+        let (entered_tx, entered_rx) = mpsc::channel::<u64>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (ino_tx, results, gate) = spawn(move |ino| {
+            entered_tx.send(ino).unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(5))
+                .map_err(|_| io::Error::other("never released"))
+        })
+        .unwrap();
+        let invalidate = invalidator(ino_tx);
+
+        invalidate(1);
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        let (closed_tx, closed_rx) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            gate.close();
+            closed_tx.send(()).unwrap();
+        });
+        assert!(
+            closed_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "close returned while a notify was still in flight"
+        );
+        release_tx.send(()).unwrap();
+        closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        invalidate(2);
+        drop(invalidate);
+        let got: Vec<u64> = futures::executor::block_on(results.collect::<Vec<_>>())
+            .into_iter()
+            .map(|(ino, r)| {
+                r.unwrap();
+                ino
+            })
+            .collect();
+        assert_eq!(got, vec![1], "a notify ran after the gate closed");
+        assert!(entered_rx.try_recv().is_err());
     }
 
     #[test]

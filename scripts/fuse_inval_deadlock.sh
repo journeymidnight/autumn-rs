@@ -28,6 +28,16 @@
 #           keeps that page locked, and the reader's next pass faults on it.
 #   INTACT: every pass hashes to the seeded file's sha256 (the writer never
 #           writes bytes, so this catches corruption, not stale reads).
+#   TERM:   SIGTERM to the reader daemon WHILE the race still runs (what
+#           Kubernetes sends first, and no fusectl abort) ends it within
+#           TERM_SECS: every thread gone, the mount and its FUSE connection
+#           gone. The default action kills every thread at once and leaves a
+#           zombie whenever a notify is waiting on a readahead page — measured
+#           4 rounds in 10 on a build without the handler — so the check runs
+#           TERM_ROUNDS rounds, each on a fresh reader mount, to discriminate.
+#           Each later round's reader HASHES the mapping rather than copying it:
+#           with a plain copy the handler-less build passed 8 rounds of 8 (the
+#           faster consumer leaves far fewer readahead pages locked at the kill).
 # A stall dumps the reader mount's threads (state + wchan) and the reader's
 # kernel stack before failing.
 #
@@ -43,7 +53,7 @@
 #
 # Usage: AUTUMN_DATA_ROOT=/data05/autumn-inval ./scripts/fuse_inval_deadlock.sh
 #   DURATION=60 STALL_SECS=15 FILE_MIB=64 READ_IO_THREADS=4 (0 = reads on the
-#   dispatcher, the shape most likely to wedge)
+#   dispatcher, the shape most likely to wedge) TERM_SECS=30 TERM_ROUNDS=8
 #   FUSE_BIN=<path> runs another autumn-fuse build (A/B against an older one)
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -52,7 +62,7 @@ BIN="$ROOT/target/release"; FUSE_BIN="${FUSE_BIN:-$BIN/autumn-fuse}"
 MGR="127.0.0.1:9001"
 MNT_R="${MNT_R:-/mnt/autumn-fuse-inval-r}"; MNT_W="${MNT_W:-/mnt/autumn-fuse-inval-w}"
 DURATION="${DURATION:-60}"; STALL_SECS="${STALL_SECS:-15}"; FILE_MIB="${FILE_MIB:-64}"
-READ_IO_THREADS="${READ_IO_THREADS:-4}"; MIN_EVENTS="${MIN_EVENTS:-1000}"
+READ_IO_THREADS="${READ_IO_THREADS:-4}"; MIN_EVENTS="${MIN_EVENTS:-1000}"; TERM_SECS="${TERM_SECS:-30}"; TERM_ROUNDS="${TERM_ROUNDS:-8}"
 WORK="$(mktemp -d /tmp/fuse_inval.XXXXXX)"; FAIL=0
 FUSE_R=""; FUSE_W=""; CONN_R=""; CONN_W=""; READER=""; WRITER=""; PROBE_PID=""
 FUSECTL=/sys/fs/fuse/connections
@@ -63,6 +73,10 @@ umnt(){ local m="$1" i; for i in 1 2 3 4 5 6; do grep -q " $m " /proc/mounts || 
 # The FUSE connection number of a mount = the minor of its device. Read from
 # mountinfo, never by stat: a stat of a wedged mount blocks.
 conn_of(){ awk -v m="$1" '$5 == m { split($3, d, ":"); print d[2] }' /proc/self/mountinfo | tail -1; }
+# Gone, or every thread a zombie. An exited daemon stays Z until reaped; the
+# failure is a Z leader with a thread still alive (in D, inside a notify).
+exited(){ local t st; [ -d "/proc/$1" ] || return 0
+  for t in /proc/"$1"/task/*; do st=$(awk '{print $3}' "$t/stat" 2>/dev/null); [ -z "$st" ] || [ "$st" = Z ] || return 1; done; }
 cleanup(){
   local p c i; for p in $WRITER $READER $PROBE_PID; do kill -9 "$p" 2>/dev/null; done
   mountpoint -q "$FUSECTL" || mount -t fusectl none "$FUSECTL" 2>/dev/null
@@ -239,5 +253,46 @@ say "reader passes=$passes writer closes=$closes invalidation events at the read
 notify_errs=$(grep -c -e 'notify_inval_inode failed' -e 'invalidation thread is gone' "$WORK/fuse_r.log" 2>/dev/null)
 [ "${notify_errs:-0}" -eq 0 ] || fail "$notify_errs kernel notifies did not land: $(grep -m1 -e 'notify_inval_inode failed' -e 'invalidation thread is gone' "$WORK/fuse_r.log")"
 [ "$passes" -gt 0 ] || fail "the reader never finished a pass"
+
+# TERM: the writer keeps running, so notifies keep arriving at the reader mount
+# while its reader re-faults. Round 1 signals the daemon the race ran on; each
+# later round mounts a fresh one and restarts the reader on it.
+term_round(){ local r="$1" i
+  if [ "$r" -gt 1 ]; then
+    FUSE_R=$(mount_fuse "$MNT_R" "r$r" --read-io-threads "$READ_IO_THREADS") || { fail "TERM round $r: remount"; return 1; }
+    CONN_R=$(conn_of "$MNT_R")
+    python3 - "$MNT_R/f.bin" > "$WORK/term_reader_$r.log" 2>&1 <<'REFAULT' &
+import hashlib, mmap, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+mm = mmap.mmap(fd, os.fstat(fd).st_size, flags=mmap.MAP_PRIVATE, prot=mmap.PROT_READ)
+while True:
+    mm.madvise(mmap.MADV_DONTNEED)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    hashlib.sha256(mm).digest()
+REFAULT
+    READER=$!; disown "$READER"
+    # A round whose mount never saw notifies tests nothing: wait for them.
+    for i in $(seq 1 40); do
+      [ "$(grep -c 'lease_tasks.* invalidation ' "$WORK/fuse_r$r.log" 2>/dev/null)" -ge 100 ] && break; sleep 0.25
+    done
+    [ "$(grep -c 'lease_tasks.* invalidation ' "$WORK/fuse_r$r.log" 2>/dev/null)" -ge 100 ] \
+      || { fail "TERM round $r: the fresh reader mount saw < 100 invalidation events in 10 s; the round would test nothing"; return 1; }
+  fi
+  kill -TERM "$FUSE_R"
+  for i in $(seq 1 $((TERM_SECS * 4))); do exited "$FUSE_R" && break; sleep 0.25; done
+  if ! exited "$FUSE_R"; then
+    fail "TERM round $r: reader daemon $FUSE_R still has live threads ${TERM_SECS}s after SIGTERM"
+    dump_stall; return 1
+  fi
+  kill -9 "$READER" 2>/dev/null
+  for i in $(seq 1 20); do [ -e "$FUSECTL/$CONN_R" ] || break; sleep 0.25; done
+  [ -z "$(conn_of "$MNT_R")" ] || { fail "TERM round $r: the daemon exited but $MNT_R is still mounted"; return 1; }
+  [ -e "$FUSECTL/$CONN_R" ] && { fail "TERM round $r: the daemon exited but FUSE connection $CONN_R is still there"; return 1; }
+  return 0
+}
+if [ $FAIL -eq 0 ]; then
+  for r in $(seq 1 "$TERM_ROUNDS"); do term_round "$r" || break; done
+  [ $FAIL -eq 0 ] && say "TERM: $TERM_ROUNDS SIGTERMs mid-race; each daemon exited, its mount and connection gone"
+fi
 [ $FAIL -eq 0 ] && say "PASS ($WORK)" || say "FAILED ($WORK)"
 exit $FAIL

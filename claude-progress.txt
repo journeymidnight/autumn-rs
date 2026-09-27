@@ -1,3 +1,11 @@
+Date: 2026-09-27 (3)
+TaskStatus: completed
+Task scope: step 2 — BUG-FUSE-SIGKILL-DURING-NOTIFY: SIGTERM must not leave a zombie daemon behind the mount.
+Current summary: SIGTERM/SIGINT are blocked before any thread exists and taken by an `autumn-fuse-signal` thread (sigwait): close the new InvalGate (the invalidation thread holds its lock across each notify, so closing waits out the notify in flight while the dispatcher still answers its read; none starts after) → Destroy the dispatcher (drain + flush dirty inodes) → lazy unmount → exit. fuse_inval_deadlock.sh gained a TERM stage: TERM_ROUNDS (8) SIGTERMs mid-race, each on a fresh reader mount that must first log 100 invalidation events; each daemon must be fully gone with its mount and connection. Ledger entry deleted; new BUG-FUSE-UMOUNT-JOIN-HANG (reviewer inference, pre-existing, unreproduced).
+Verification: fuse lib 42 green; gate unit test goes red when the lock is released before the notify. Same load, one cluster, N rounds: handler-less build 4/10 zombies (Z leader + D thread in folio_wait_bit_common), new build 0/20. Committed script: new build PASS three times; handler-less build FAILED three times (rounds 1, 2, 3). Independent fable review, findings applied (per-round event gate, docs).
+Main gaps: SIGKILL still leaves the zombie when it lands mid-notify (unfixable in-process; documented).
+Next steps: step 3 (F-REVIEW-R6), step 4 (cluster acceptance batch).
+
 Date: 2026-09-27 (2)
 TaskStatus: completed
 Task scope: user "按照你建议的1，2，3，4顺序做", step 1 — correct stale ledger entries and settle F-MERGE-COW-STALE-SEQ.
