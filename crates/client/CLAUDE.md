@@ -41,7 +41,7 @@ Constructors:
   strips it back off returned range keys, so it **cannot** touch anything outside its
   keyspace — scope is locked by construction, not merely checked (no assert/validate
   mode). Each `/`-delimited `scope` segment must match `[a-z0-9._-]+`; the FIRST is the
-  namespace (Layer-A checks it). Built-in key builders (`fuse/key.rs`, `memory/keys.rs`,
+  namespace (Layer-A checks it). Built-in key builders (`fuse/key.rs`,
   `kvc/_keys.py`) emit keys RELATIVE to `{scope}/` (the binding owns the prefix) so
   there is no double-prefix.
 - **`connect_raw(mgr)`** — admin/unscoped (`Raw` binding, no client prefixing) for

@@ -33,13 +33,12 @@ Rules per chunk:
 | 12 | crates/manager — tests/ light dedup skim | ~18600 | done | 602a532 (4 dead harness helpers deleted); BIG deferred item: 32-file cluster-prologue consolidation, see findings log |
 | 13 | crates/server (binaries) | 8170 | done | ded2d65 (never_loop fix, split-ranges tail ×2, range-cursor ×3, rebindings; deferred items in findings log) |
 | 14 | crates/fuse | 4731 | done | ded2d65 (dead sync_task.rs module deleted, needs_reload wired into Open arm, 4 dead fns, PREFIX_EXTENT rename, apply_time ×2) |
-| 15 | crates/autumn-memory | 2334 | done | ded2d65 (clean per agent; 1 clippy if-let) |
-| 16 | examples/gallery | 1837 | done | reviewed (agent): only D3 base_meta_fields ×2 — example-code, logged as optional |
-| 17 | python/ (bindings + memory + adapters) | 5762 | done | 553fc34 (2 dead fns + dead _zc field + batch v1 dedup; adapters/memory/mcp/ops scripts agent-verified clean) |
+| 15 | examples/gallery | 1837 | done | reviewed (agent): only D3 base_meta_fields ×2 — example-code, logged as optional |
+| 16 | python/ | 5762 | done | 553fc34 (2 dead fns + dead _zc field + batch v1 dedup; remaining adapters agent-verified clean) |
 
 Status values: todo | in_progress | done
 
-**ALL 17 CHUNKS DONE (2026-07-02).** Remaining work lives only in the findings
+**ALL 16 RETAINED CHUNKS DONE (2026-07-02).** Remaining work lives only in the findings
 log below: deferred items with documented reasons (wire-fingerprint files,
 extent_node append-protocol dedup needing chaos validation, the 32-file test
 prologue consolidation, cross-binary CLI shapes, and assorted logged-optional

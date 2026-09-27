@@ -626,9 +626,9 @@ launch_manager() {
     if [[ "${AUTUMN_AUTH:-}" != "0" && -s "$DATA_ROOT/authz/signing.key" ]]; then
         AUTUMN_AUTH=1
     fi
-    # Turnkey authz: AUTUMN_AUTH=1 auto-provisions a signing key + admin token and
-    # protects mem/ & gallery/, feeding the AUTUMN_AUTH_* block below (per-example
-    # tenant credentials are minted post-bootstrap). Files live under
+    # Turnkey authz: AUTUMN_AUTH=1 auto-provisions a signing key + admin token,
+    # feeding the AUTUMN_AUTH_* block below (the gallery credential is minted
+    # post-bootstrap). Files live under
     # $DATA_ROOT/authz/ and survive restart; `reset` wipes + regenerates them.
     # The ADMIN TOKEN is independent of data-plane authz and is now provisioned
     # UNCONDITIONALLY. They gate different planes — the admin token gates
@@ -1038,12 +1038,10 @@ do_start() {
         wait_port "$PS_BASE_PORT" "partition 0 listener" 60
     fi
 
-    # Turnkey authz (AUTUMN_AUTH=1): register the gallery namespace + mint the
-    # per-example tenant credentials into $DATA_ROOT/authz/. Idempotent — a
-    # tenant whose .cred already exists is left alone so restarts keep working.
-    # The examples read their cred via AUTUMN_CREDENTIAL_FILE / --credential-file:
-    #   memory-mcp --credential-file $DATA_ROOT/authz/memory.cred
-    #   AUTUMN_CREDENTIAL_FILE=$DATA_ROOT/authz/gallery.cred gallery <mgr>
+    # Turnkey authz (AUTUMN_AUTH=1): register the gallery namespace and mint its
+    # credential into $DATA_ROOT/authz/. Idempotent — an existing credential is
+    # retained so restarts keep working. The example reads it through
+    # AUTUMN_CREDENTIAL_FILE.
     # BUG-BENCH-NS-UNREGISTERED: register `bench` on EVERY cluster, not just an
     # authz one. Layer-A is active whenever the namespace registry is non-empty —
     # and bootstrap always seeds fs/kvc/mem — so it runs even with authz OFF and
@@ -1078,11 +1076,10 @@ do_start() {
         # default (no all-ns master key). Cred file = two-line `principal:`/
         # `credential:` form (read_credential_file carries the name).
         #   fs/  → fuse mount / autumnfs        kvc/ → kvcache loader
-        #   gallery/ → gallery example          mem/memory/ → memory-mcp
+        #   gallery/ → gallery example
         for _spec in "fs fs/ $_az/fs.cred" \
                      "kvc kvc/ $_az/kvc.cred" \
-                     "gallery gallery/ $_az/gallery.cred" \
-                     "memory mem/memory/ $_az/memory.cred"; do
+                     "gallery gallery/ $_az/gallery.cred"; do
             read -r _p _grant _out <<< "$_spec"
             [[ -s "$_out" ]] && continue
             "${_ao[@]}" --json principal-create --principal "$_p" --grant "$_grant" --admin-token "$_atok" \
@@ -1092,7 +1089,6 @@ do_start() {
         done
         echo "[cluster] authz ON: signing key + admin token + per-family creds in $_az/"
         echo "[cluster]   fuse/autumnfs: --credential-file $_az/fs.cred"
-        echo "[cluster]   memory-mcp: --credential-file $_az/memory.cred"
         echo "[cluster]   gallery: AUTUMN_CREDENTIAL_FILE=$_az/gallery.cred"
     fi
 

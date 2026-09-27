@@ -1658,9 +1658,8 @@ at the window boundary.
 another window from `Excluded(bound)` — and keeps going; it never returns a
 short page because it ran out of window. `has_more` stays `out.len() == limit`
 and a short page still means the prefix is exhausted. Reporting truncation
-instead silently drops keys two ways, both verified in-repo: four consumers
-(`wipe_agent`, `MemoryStore::scan_keys`, two fuse extent loops) page by
-`n < limit` and never read `has_more`, so they stop early; and
+instead silently drops keys two ways, both verified in-repo: the two fuse
+extent loops page by `n < limit` and never read `has_more`, so they stop early; and
 `ClusterClient::range` advances its cursor to the partition's END key on a page
 it believes complete, so a truncated page in a non-last partition leaves a
 permanent gap in the middle of the scan.
@@ -1684,9 +1683,8 @@ after key K, pass `K ++ 0x00` — exact for arbitrary user keys, because:
   after every MVCC version of K and at-or-before every version of every later
   user key — a real `K ++ 0x00 ++ …` key included (start is inclusive).
 
-Nothing is double-counted and nothing is skipped. `MemoryStore::scan_keys`
-and `memory-mcp`'s `wipe_agent` paginate this way;
-`crates/autumn-memory/tests/scan_boundary.rs` pins the page-boundary property.
+Nothing is double-counted and nothing is skipped. The range paging tests pin
+the page-boundary property.
 
 History: under the old separator encoding (raw-byte order over
 `user ++ 0x00 ++ suffix`) this idiom was a trap — `K ++ 0x00` seeked BEFORE

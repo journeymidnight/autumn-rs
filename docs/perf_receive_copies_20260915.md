@@ -178,7 +178,7 @@ the windows); same-host transports only.
 
 `ClusterClient::get` / `get_range` used the rkyv `MSG_GET`. Its callers are not
 only Python (`Client.get` / `get_into` / `batch_get_into`): the `autumn-client
-get` CLI, autumn-memory, FUSE/autumnfs metadata reads, the gallery example,
+get` CLI, FUSE/autumnfs metadata reads, the gallery example,
 striped-stream chunk reads and SDK small-item fallbacks all went through it.
 Per 8 MiB value the PS copied it four times (`GetResp` conversion of the pooled
 `Bytes`, twice in rkyv encode, `Frame::encode`) and the client twice (aligned

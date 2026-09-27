@@ -1,26 +1,25 @@
 # autumn-rs
 
-**One storage engine for the AI stack — from the storage data model, through
-inference KV cache, all the way to agent memory.**
+**One storage engine for AI data — models, datasets, vector tables and
+inference KV cache on one data plane.**
 
-Running an AI platform usually means operating a zoo of storage systems: an
-object store or NFS for models and datasets, a cache tier for inference KV, a
-vector database for agent memory. **autumn-rs collapses that zoo into one
-distributed engine.** It is a Rust storage engine architecturally inspired by
+Running an AI platform usually means operating separate storage systems for
+models, datasets, vector tables and inference KV cache. **autumn-rs provides
+one distributed data plane underneath their native interfaces.** It is a Rust
+storage engine architecturally inspired by
 the **Windows Azure Storage (WAS)** paper — a *stream layer* of replicated,
 append-only extents underneath an ordered-KV *partition layer* — and every
 AI-facing surface is a thin client on that single data plane:
 
 ```
-   Files & checkpoints      Inference KV cache        Agent memory
-   ┌────────────────┐   ┌──────────────────────┐   ┌─────────────────────────┐
-   │  autumn-fuse   │   │   autumn-kvcache     │   │      autumn-memory      │
-   │  POSIX mount   │   │ sglang / vLLM        │   │ episodic + facts +      │
-   │                │   │ HiCache L3 backend   │   │ BM25/vector/hybrid      │
-   └───────┬────────┘   └──────────┬───────────┘   │ web UI + MCP (examples) │
-           │                       │               └───────────┬─────────────┘
-           │        ┌──────────────┘                           │
-           ▼        ▼                                          ▼
+   Files & checkpoints       Vector tables          Inference KV cache
+   ┌────────────────┐   ┌──────────────────────┐   ┌──────────────────────┐
+   │  autumn-fuse   │   │ LanceDB over S3     │   │   autumn-kvcache     │
+   │  POSIX mount   │   │ stock client        │   │ sglang / vLLM        │
+   └───────┬────────┘   └──────────┬───────────┘   │ HiCache L3 backend   │
+           │                       │               └──────────┬───────────┘
+           │        ┌──────────────┘                          │
+           ▼        ▼                                         ▼
    ┌──────────────────────────────────────────────────────────────────┐
    │        partition layer  (ordered KV, LSM, split/merge)          │
    │        stream layer     (replicated extents, EC, no local WAL)  │
@@ -28,9 +27,9 @@ AI-facing surface is a thin client on that single data plane:
         autumn-client CLI/SDK · autumn-manager (etcd-backed control plane)
 ```
 
-One replication story, one capacity pool, one ops surface — model files, KV
-cache pages, and agent memories all land in the same replicated, erasure-coded,
-self-healing extents.
+One replication story, one capacity pool, one ops surface — model files,
+LanceDB tables and KV-cache pages all land in the same replicated,
+erasure-coded, self-healing extents.
 
 ## Highlights
 
@@ -46,12 +45,10 @@ self-healing extents.
   **HiCache L3** storage-backend API (pure Python adapter, no extra daemon);
   verified end-to-end against real models with correct cross-instance
   prefix-cache hits.
-- **Agent memory** — `autumn-memory`: episodic logs, a fact store, an
-  associative graph, and retrieval that combines **BM25** (CJK-aware), **IVF
-  vector search**, and **hybrid RRF** — entirely client-side on plain KV. A
-  Rust example app (web UI + **MCP** `--mcp` stdio) sits on it — `memory-mcp`
-  ingests code (this repo's own source) and/or markdown docs; recall P99 ≈ 25 ms
-  on the agent turn loop.
+- **Vector tables** — stock LanceDB connects through `autumn-s3`; the pinned
+  example covers create, append, reopen, vector search, filtering, concurrent
+  commits, optimize/vacuum and byte verification without a custom LanceDB
+  build or an Autumn-specific query layer.
 
 **The engine underneath:**
 - **Fast by construction** — thread-per-core on io_uring (compio), custom binary
@@ -157,26 +154,20 @@ caches survive restarts and are shared across inference instances. Setup +
 design: [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md),
 [`docs/hicache_l3_interface.md`](docs/hicache_l3_interface.md).
 
-### Agent memory — MCP server + web UI
+### LanceDB — vector tables over S3
 
-**`examples/memory-mcp`** sits on `autumn-memory` (an MCP `--mcp` stdio mode, so
-any MCP host — Claude Code/Desktop, Cursor — gets the same tools, plus an Axum
-web UI): it puts a corpus into autumn — a Rust codebase (tree-sitter symbols +
-call graph) and/or markdown documents (heading-aware chunks + outline) — and
-serves retrieval back (lexical / vector / hybrid search, graph walks:
-callers / callees / trace for code, document outlines for prose).
+Run the stock Python LanceDB client against `autumn-s3`; no patched client or
+Autumn-specific index implementation is required. The bucket must already
+exist as a first-level directory in the shared `fs/` tree.
 
 ```bash
-cargo run -p memory-mcp -- 127.0.0.1:9001 --docs docs   # ingest docs/ + code, web UI at :5100
-claude mcp add autumn-memory -- cargo run -q -p memory-mcp -- 127.0.0.1:9001 --mcp
+cd examples/lancedb-s3
+uv sync
+uv run python workload.py http://127.0.0.1:9100 tables demo
 ```
 
-Lexical (BM25) recall needs no embedder; vector/hybrid take a caller-supplied
-vector (`autumn-memory`'s optional `embed` module supplies one: a Model2Vec
-static-int8 table, or any OpenAI-compatible `/v1/embeddings` server — llama.cpp
-on a CPU will do. Configure none and you get BM25, which is a supported way to
-run rather than a degraded one). Design:
-[`docs/autumn_memory_plan.md`](docs/autumn_memory_plan.md).
+The workload and the captured request contract are documented in
+[`examples/lancedb-s3/README.md`](examples/lancedb-s3/README.md).
 
 ## Deployment
 
@@ -201,7 +192,7 @@ Details: [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md).
 - [`CLAUDE.md`](CLAUDE.md) + `crates/*/CLAUDE.md` — architecture: stream layer
   commit protocol & fencing, LSM partition server, control plane, transports
 - [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md) / [`docs/k8s_deploy.md`](docs/k8s_deploy.md) — deployment guides
-- [`docs/autumn_memory_plan.md`](docs/autumn_memory_plan.md) / [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md) / [`docs/data_plane_authz_design.md`](docs/data_plane_authz_design.md) — subsystem designs
+- [`docs/lancedb_s3_gateway_plan.md`](docs/lancedb_s3_gateway_plan.md) / [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md) / [`docs/data_plane_authz_design.md`](docs/data_plane_authz_design.md) — subsystem designs
 - [`feature_list.md`](feature_list.md) — the feature ledger
 
 ## License

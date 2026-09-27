@@ -1,17 +1,16 @@
 # LanceDB S3 gateway 实施计划
 
 日期：2026-09-24。关联需求：`feature_list.md` 的 F-LANCEDB-S3-GATEWAY。
-状态：计划已记录，功能尚未实现。本计划替代讨论中的流式合并方案。
+状态：已实现；固定版本客户端验收入口已保留。本计划记录设计与验收依据。
 
 ## 1. 目标、现状与已确认约定
 
 让官方 Python LanceDB 通过 `s3://<bucket>/<key>` 直接读写 autumn，并支持
 S3、FUSE、Python Fs 对同一路径并发操作。
 
-已实现：独立 `autumn-s3` 进程、现有 FS 路径映射、基础 GET／HEAD／ListObjectsV2、
-流式读取及 EN 直接读取路径。
-
-未实现：S3 写入 API、共享原子发布、分段文件布局、multipart 生命周期及本计划验收。
+已实现：独立 `autumn-s3` 进程、现有 FS 路径映射、GET／HEAD／ListObjectsV2、
+写入 API、共享原子发布、分段文件布局、multipart 生命周期、流式读取及 EN
+直接读取路径。固定版本的官方 LanceDB 验收入口位于 `examples/lancedb-s3/`。
 
 用户确认的约定：
 
@@ -21,7 +20,6 @@ S3、FUSE、Python Fs 对同一路径并发操作。
 - 已有写者占用目标时立即返回冲突，不等待、不抢占。
 - S3 GET 期间固定文件内容；FUSE／Python Fs 原地修改立即报忙。
 - 允许统一升级协议、文件系统格式、manager、PS 和全部前端。
-- 本次只记录计划，不执行实现或部署。
 
 ## 2. 硬性验收：Complete 不访问分片正文
 
@@ -162,7 +160,7 @@ Complete 发布映射，数据留在原处，不生成一份合并后的正文�
 ## 9. 实现设计（2026-09-24 细化）
 
 本节把第 3–5 节落到具体的 key、状态机与原语上，是后续各步实现与评审的共同依据。
-固定客户端 `lancedb==0.39.0` 的真实请求轨迹见 `scripts/lancedb_s3/`：它只用到
+固定客户端 `lancedb==0.39.0` 的真实请求轨迹见 `examples/lancedb-s3/`：它只用到
 Range GET、ListObjectsV2（带/不带 delimiter）、PutObject、`If-None-Match: *`
 的 PutObject（manifest 提交，冲突方收到 412 后用 HEAD/GET 核对）、HeadObject、
 DeleteObjects（带 Content-MD5）和 5 MiB 分片的 multipart。CopyObject、

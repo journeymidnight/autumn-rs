@@ -30,7 +30,7 @@ wire key = {ns}/[relative]
 |---|---|---|
 | `fs/` | 裸类型字节：`[0x01][ino BE]`（inode meta）、`[0x02][parent BE][name]`（dirent）、`[0x03][lane][ino BE][off BE]`（条带数据）、`[0x04][field]`（superblock，含 `stripe_geom` 与 `rmtomb/` unlink 墓碑） | `crates/fuse/src/key.rs` |
 | `kvc/` | `{model}[_{fingerprint}][_{tp}][_pp{pp}]/…/{sha256-hex}/{layer}` | `python/autumn_kvcache/autumn_kvcache/_keys.py` |
-| `mem/` | `{agent}/ep\|fact\|doc\|idx\|…/…`，动态组件百分号编码（`keys::q`）；`fact/` 是扁平的 `fact/{key}`，分组靠 key 本身（`q` 保前缀） | `crates/autumn-memory/src/keys.rs` |
+| `mem/` | 保留的内置通用 namespace；应用自行定义相对 key | `autumn-client` |
 | 其余（`bench/`、`gallery/`、用户自建） | 任意字节 | `autumn-op namespace-create` |
 
 内置三族（`fs` / `kvc` / `mem`）由首任 leader 的 `seed_builtin_namespaces`
@@ -43,9 +43,9 @@ grant 的粒度取决于该 ns 的相对 key 形态，实现与运维时**必须
 
 | | 路径段型 ns | 二进制型 ns |
 |---|---|---|
-| 例 | `mem/{agent}/…`、`kvc/{model}/…`、`gallery/…` | fuse `fs/[0x01][ino]…` |
+| 例 | `mem/{app}/…`、`kvc/{model}/…`、`gallery/…` | fuse `fs/[0x01][ino]…` |
 | 相对 key 开头 | ASCII 段（`agent7/…`） | 定长二进制记录 |
-| ns 内子前缀 grant | **有意义**（`mem/agent7/` 真能切开一片子空间） | **无意义**（`fs/models/` 里的 `/models/` 是 `[0x02]` 记录内的 dirent 名字，不是 key 前缀 → 匹配零个 key，连接期 `validate_credential_scope` 还会拒） |
+| ns 内子前缀 grant | **有意义**（`mem/app7/` 真能切开一片子空间） | **无意义**（`fs/models/` 里的 `/models/` 是 `[0x02]` 记录内的 dirent 名字，不是 key 前缀 → 匹配零个 key，连接期 `validate_credential_scope` 还会拒） |
 | 隔离手段 | 授不同子前缀 | **只能整 ns 授（`fs/`）；要多棵互隔离的树 → 开多个 ns**（`fsA`/`fsB` 各自注册） |
 
 **二进制型 ns 的取舍（明写）**：`fs/` 是一棵全局树、唯一的授权单位。任何持
@@ -72,7 +72,7 @@ client.rescope("kvc") / client.raw()                 // 换作用域视图，共
 
 - **Scoped 永远 Prepend**：`bind_key` = `prefix ++ user_key`，作用域**由构造锁定**
   而不是「事后校验」—— scoped client **拿不到**自己 keyspace 之外的东西。
-  内置 key builder（fuse / memory / kvcache）吐的是**相对 key**（不含 ns 段），
+  内置 key builder（fuse / kvcache）吐的是**相对 key**（不含 ns 段），
   前缀归 binding。
 - **range 三重钳制**：`bind_prefix` 拼前缀、cursor seed 不低于下界、
   `upper_cap()` 给上界 = 把 prefix 尾字节 `/`(0x2f) 换成后继 `0`(0x30)，
@@ -85,8 +85,8 @@ client.rescope("kvc") / client.raw()                 // 换作用域视图，共
   （`acme/sub` + `mem` → `acme/sub/mem/`，或 `//mem`）。
 
 **哪一段归 binding、哪一段归 builder，每个 app 声明一次**（写进各自的
-CLAUDE.md）。反例：grant = `mem/agent7/` 而 memory builder 又自吐 `agent7/…`，
-会拼出 `mem/agent7/agent7/…` 的双段 key。
+CLAUDE.md）。反例：grant = `mem/app7/` 而 app builder 又自吐 `app7/…`，
+会拼出 `mem/app7/app7/…` 的双段 key。
 
 ### 1.4 大值条带的 chunk key
 
@@ -192,7 +192,7 @@ token；prod 集群两层全开。
 ```bash
 autumn-op principal-create fs   --grant fs/    # → fs.cred   （fuse / autumnfs）
 autumn-op principal-create kvc  --grant kvc/   # → kvc.cred  （kvcache loader）
-autumn-op principal-create mem  --grant mem/   # → mem.cred  （memory-mcp）
+autumn-op principal-create app  --grant mem/app/   # → app.cred
 ```
 
 - **数据面只出示凭据**，没有 `--tenant` / `--principal` flag：principal 名字随

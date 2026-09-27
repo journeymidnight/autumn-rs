@@ -136,6 +136,9 @@ payloads.
   from a present byte naming a file this build cannot name.
 - **`manager_rpc.rs`** / **`partition_rpc.rs`** — manager and PS wire schemas
   (rkyv structs + `MSG_*` constants), the most-referenced surface in the crate.
+  `RangeReq.start` is inclusive; callers resume strictly after a returned key
+  with `key ++ 0x00`, which remains before every larger user key under the
+  internal-key comparator.
   The extent-service messages the manager sends are **re-exported** from
   `extent_rpc`, never redefined: `AllocExtentReq/Resp`, `ConvertToEcReq`,
   `DeleteExtentReq`, `DfReq/Resp`, `ReAvaliReq`, `RequireRecoveryReq`,

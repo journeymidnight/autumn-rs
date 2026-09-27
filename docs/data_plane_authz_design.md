@@ -37,8 +37,8 @@ client 误读 / 串写别的 namespace 的数据。**不防**：网络 MITM / �
 被攻破的 manager（manager 沦陷 = 全盘沦陷，它控制分区与路由，本就出局）。
 
 namespace 段是 `[a-z0-9._-]+` 的单路径段（连接时 `is_valid_scope_segment`
-校验），`mem/` 内部各动态组件另做百分号编码（`autumn_memory::keys::q`）——
-所以 `{ns}/` 是一个**不可伪造**的边界。
+校验），所以 `{ns}/` 是一个**不可伪造**的边界；应用若在 namespace 内继续
+分层，仍须对动态路径段做无歧义编码。
 
 ## 3. 为什么是非对称（不是对称）
 

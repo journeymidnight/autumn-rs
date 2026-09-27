@@ -119,7 +119,7 @@ impl std::error::Error for AutumnError {}
 /// scoped op ALWAYS PREPENDS the scope prefix to the user key before routing, so
 /// a scoped client **cannot** touch anything outside its own keyspace — scope is
 /// locked by construction, not merely checked. The built-in key builders
-/// (fuse / memory / kvcache) emit keys RELATIVE to the scope prefix (the binding
+/// (fuse / kvcache) emit keys RELATIVE to the scope prefix (the binding
 /// owns the prefix). `Raw` (`connect_raw` / `raw()`) applies NO client-side
 /// prefixing — for admin / cross-namespace tooling — but the PS still enforces
 /// Layer-A/B, so `raw()` only bypasses the CLIENT clamp, never authorization.
@@ -870,9 +870,8 @@ struct CachedToken {
     exp: u64,
 }
 
-/// the client's tenant identity (permanent credential) + the current
-/// short-TTL token minted from it. One `ClusterClient` = one principal (the
-/// design: `MemoryStore` is per-`(tenant, agent)`, each with its own client).
+/// the client's principal identity (permanent credential) + the current
+/// short-TTL token minted from it. One `ClusterClient` carries one principal.
 struct ClientAuth {
     /// The principal identity (credential owner) used to mint tokens.
     principal: String,

@@ -833,9 +833,8 @@ pub struct RangeReq {
     /// breaks ties), so the seek lands after every MVCC version of K and
     /// before every version of every later key — a real key that IS
     /// `K ++ 0x00 ++ …` included (inclusive start, nothing skipped, nothing
-    /// double-counted). `MemoryStore::scan_keys` and `memory-mcp`'s
-    /// `wipe_agent` paginate exactly that way; the page-boundary property is
-    /// pinned by `crates/autumn-memory/tests/scan_boundary.rs`.
+    /// double-counted). Range clients paginate exactly that way; unit and
+    /// integration tests pin the page-boundary property.
     ///
     /// (Under the older separator encoding — `user ++ 0x00 ++ suffix`
     /// compared as raw bytes — this idiom double-counted the boundary key

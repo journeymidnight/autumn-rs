@@ -3,8 +3,8 @@
 
 The gallery example used to write bare keys (`<file>`, `.thumb/…`, `.hls/…`,
 `.meta/…`) at the root of the shared keyspace, so its whole-store list scan
-walked EVERY key in the cluster — and stalled once another app (autumn-memory
-under `mem/`, kvcache under `kvc/`) had written a lot. The example now namespaces
+walked EVERY key in the cluster — and stalled once other applications under
+`mem/` and `kvc/` had written a lot. The example now namespaces
 everything under `gallery/`. This script renames the old keys so an existing
 gallery keeps working after the upgrade.
 
@@ -18,7 +18,7 @@ What migrates:
 
 What is SKIPPED (and why):
   * `gallery/…`       — already migrated
-  * `mem/…`, `kvc/…`  — other apps' namespaces, not ours
+  * `mem/…`, `kvc/…`  — other applications' namespaces, not ours
   * bare `<name>` with a VIDEO extension — a striped-upload original whose chunks
     live in the SDK's reserved namespace and can't be renamed by a plain get/put.
     A FINISHED video's playable form is its `.hls/…` (which DOES migrate); only an
@@ -40,8 +40,8 @@ ROOT = "gallery/"
 DERIVED_PREFIXES = (".thumb/", ".hls/", ".meta/")
 VIDEO_EXTS = {"mp4", "webm", "ogg", "mov", "m4v"}
 # Whitelist of gallery inline-file extensions. Bare keys are ONLY migrated when
-# they match this — so foreign bare keys (e.g. autumn-memory's percent-encoded
-# `crates%2F…%3A%3A…` symbol keys, which happen to sit at the root) are never
+# they match this — so foreign bare keys (including percent-encoded keys that
+# happen to sit at the root) are never
 # touched. Gallery stores raw filenames, so a bare key containing '%' or '/' is
 # by construction NOT gallery's and is skipped.
 GALLERY_EXTS = {

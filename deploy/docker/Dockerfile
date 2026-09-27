@@ -96,15 +96,11 @@ COPY . .
 # HTML via include_str!, so the binary alone is self-contained, and it drives the
 # cluster only through the autumn-op we already ship.
 # autumn-fuse is the FUSE mount daemon.
-# memory-mcp is the stdio MCP server over autumn-memory; it ships so an agent
-# pod (hermes) can register it as a local stdio MCP server instead of needing a
-# long-running HTTP/SSE MCP daemon (docs/autumn_memory_plan.md §12).
-# autumn-s3 is the read-only S3 gateway (a binary of the autumn-server crate,
-# so it comes along with -p autumn-server); it lets engines
-# with no loader plugin seam (SGLang, FreeToken) stream weights via their
-# built-in runai_streamer. See docs/model_loading.md Recipe C.
+# autumn-s3 is the S3 gateway (a binary of the autumn-server crate, so it comes
+# along with -p autumn-server); it serves model loaders and S3-native tools such
+# as LanceDB. See docs/model_loading.md and examples/lancedb-s3.
 RUN cargo build --release \
-    -p autumn-server -p autumn-dashboard -p autumn-fuse -p memory-mcp
+    -p autumn-server -p autumn-dashboard -p autumn-fuse
 
 # Ship the SOURCE the Python client is built from, in this image.
 #
@@ -138,13 +134,6 @@ RUN cargo build --release \
 # fusermount3 setuid helper, which fuser needs both to mount and to clean up a
 # stale mount after a crashed daemon.
 FROM ${BASE_REGISTRY}library/debian:bookworm-slim
-# ca-certificates: memory-mcp builds its embedder's HTTP client with
-# `cyper::Client::new()`, which constructs a TLS connector up front and reads
-# the SYSTEM root store to do it. With no roots installed that call returns
-# `No CA certificates were loaded from the system` and the process exits 2 —
-# before it ever looks at the URL, so even an in-cluster `http://` embedder
-# cannot start. An external HTTPS embedding service (what
-# `--embed-api-key-file` exists for) needs the roots for real.
 # Optional Debian mirror for the apt steps in this stage. Empty (default) →
 # whatever the base image ships (deb.debian.org), unchanged for everyone else.
 # On a China/Volcengine runner deb.debian.org is slow or unreachable:
@@ -195,7 +184,6 @@ COPY --from=builder \
     /build/target/release/autumnfs \
     /build/target/release/autumn-dashboard \
     /build/target/release/autumn-fuse \
-    /build/target/release/memory-mcp \
     /build/target/release/autumn-s3 \
     /build/target/release/migratev3_v4 \
     /usr/local/bin/

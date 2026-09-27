@@ -180,8 +180,8 @@ fn range_never_resurrects_a_key_whose_tombstone_is_past_the_window() {
 /// The window must be INVISIBLE on the wire: a short page still means "that is
 /// everything", because callers page by exactly that.
 ///
-/// `wipe_agent`, `MemoryStore::scan_keys` and the fuse extent loops all break on
-/// `n < limit` and never read `has_more`, and `ClusterClient::range` advances its
+/// The fuse extent loops break on `n < limit` and never read `has_more`, and
+/// `ClusterClient::range` advances its
 /// cursor to the partition's END key on a page it believes complete. So a page
 /// that stops at the window's edge does not merely cost a round trip — it ends
 /// those scans early, or jumps a gap.

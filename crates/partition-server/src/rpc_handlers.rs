@@ -1375,8 +1375,7 @@ pub(crate) async fn handle_range(
     //
     // INVARIANT: the window MUST NOT change what a page reports. `has_more` is
     // `out.len() == limit` and a short page still means "prefix exhausted",
-    // because four in-repo consumers page by exactly that (`wipe_agent`,
-    // `MemoryStore::scan_keys`, and the fuse extent/tombstone loops all break
+    // because the fuse extent/tombstone loops page by exactly that (they break
     // on `n < limit` and never read `has_more`), and `ClusterClient::range`
     // advances its cursor to the partition's END key on any page it believes
     // complete. Reporting truncation instead of hiding it silently drops keys

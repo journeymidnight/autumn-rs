@@ -13,8 +13,6 @@ and the per-crate `crates/*/CLAUDE.md`.
 - [Disk-full (ENOSPC) behavior](#disk-full-enospc-behavior)
 - [WAL replay self-heal](#wal-replay-self-heal-log_stream-bit-rot--truncated-replica)
 - [Read route-around for Suspected nodes](#read-route-around-for-suspected-nodes)
-- [autumn-memory verification](#autumn-memory-verification)
-- [Retrieval-quality eval (`memory-mcp --eval`)](#retrieval-quality-eval-memory-mcp---eval)
 - [Direct read on EC extents](#direct-read-on-ec-extents)
 - [A/B-ing a wire-path change](#ab-ing-a-wire-path-change-and-the-three-traps-that-fake-the-answer)
 - [Data-plane authz setup](#data-plane-authz-setup)
@@ -73,12 +71,12 @@ fixed-key benchmark for comparisons sensitive to cache/SST state.
 | `autumn-op` | — | Admin CLI (bootstrap/split/merge/compact/gc/info/df/format) |
 | `autumn-stream-cli` | — | Low-level stream debugging |
 | `autumn-fuse` | — | FUSE mount of the `fs/` namespace (entrypoint role `fuse`) |
+| `autumn-s3` | 9000; examples use 9100 | S3-compatible gateway over the shared `fs/` tree |
 | `autumn-dashboard` | 8799 | Standalone web UI (drives the cluster via `autumn-op`) |
-| `memory-mcp` | 5100 (HTTP mode) | autumn-memory retrieval; `--mcp` = stdio MCP server |
 
 All of the above ship in the container image (`deploy/docker/Dockerfile`);
 `entrypoint.sh` dispatches `manager|extent-node|ps|bootstrap|fuse`, and anything
-else is exec'd verbatim, so `autumn-dashboard` / `memory-mcp` / the CLIs run as
+else is exec'd verbatim, so `autumn-dashboard` / `autumn-s3` / the CLIs run as
 plain commands.
 
 `autumn-client --help` / `autumn-op --help` lists subcommands. (The standalone
@@ -447,8 +445,8 @@ containers:
       - { name: cred, mountPath: /etc/autumn/cred, readOnly: true }
 ```
 
-It costs privileged on the whole container, and it is what the live `memory-mcp`
-deployment uses.
+It costs privileged on the whole container; prefer the S3 gateway for clients
+that already speak S3.
 
 **The sidecar form needs something from the NODE that many clusters do not
 give you.** Check before designing around it — from a privileged pod:
@@ -1564,264 +1562,6 @@ Requirements / caveats:
   df-echo check (M1b) WARNs if the stored location drifts and refuses to serve
   an imposter that reused the node's IP under a different uuid.
 
-## autumn-memory verification
-
-`crates/autumn-memory` turns the cluster into an AI-agent-memory backend
-(episodic logs, fact KV, BM25 + vector + hybrid retrieval, a graph). Design:
-[`autumn_memory_plan.md`](autumn_memory_plan.md); crate guide:
-`crates/autumn-memory/CLAUDE.md`. Consumers are Rust — the `memory-mcp`
-example (MCP server + web UI, `examples/memory-mcp/README.md`) uses the crate
-directly. Lexical (BM25) search needs no embedder; vector / hybrid use the
-optional embedder.
-
-**Which embedder, and why it matters operationally.** The default is a hash
-embedder: real plumbing, no semantics. Vector and hybrid queries over it return
-noise — not an error, not an empty list, just confidently ranked nonsense. A
-deployment that means to serve vector search needs one of the other two:
-`static-embed` (an offline int8 table, ships a model file) or `openai-embed`,
-which calls any OpenAI-compatible `/v1/embeddings` — llama.cpp on spare CPU is
-enough:
-
-```bash
-memory-mcp <manager> --embed-url http://llama:8080 --embed-model nomic-embed-text
-#          add --embed-api-key-file FILE for a hosted model (a FILE: an argv key
-#          is readable from /proc/<pid>/cmdline by anyone on the host)
-```
-
-It embeds once at startup, so a wrong URL, a missing model or an unreadable key
-file exits non-zero at that moment instead of surfacing on a reader's first
-search. `GET /config` then reports the embedder name and the width the server
-actually returned.
-
-**Switching embedder means re-indexing.** Vectors are `Vec<f32>` and the store
-cannot tell which model produced them; searching an old index with a new
-model's query vector returns plausible-looking garbage. Nothing detects this —
-there is no fingerprint, deliberately, because a vector store does not own the
-embedder.
-
-**Manual verification (Rust core):**
-
-```bash
-cargo build --workspace                    # build the debug binaries first
-cargo test -p autumn-memory                # pure unit tests (keys / BM25 / IVF / RRF)
-
-# Full e2e against an ISOLATED throwaway cluster (memory-only manager, 1 EN,
-# 1 PS, loopback, no etcd — does not touch any other cluster; tears down after):
-bash crates/autumn-memory/tests/run_e2e.sh
-#   → "===== e2e exit: 0 =====" and "test e2e_full_surface ... ok"
-
-# Or run the e2e against an already-running cluster:
-AUTUMN_MEMORY_E2E_MANAGER=127.0.0.1:9001 \
-  cargo test -p autumn-memory --test e2e -- --ignored --nocapture
-
-# Page-boundary regression (reconcile over a >page corpus counts exactly):
-AUTUMN_MEMORY_E2E_MANAGER=127.0.0.1:9001 \
-  cargo test -p autumn-memory --test scan_boundary -- --ignored --nocapture
-```
-
-**Fact keys are flat.** The wire shape is `mem/{tenant}/{agent}/fact/{key}` —
-there is no group segment. Grouping is a convention inside the key
-(`"profile:name"`), and `list_facts(Some("profile:"), …)` range-scans exactly
-that group because `keys::q` encodes byte-by-byte and therefore preserves
-prefixes; `list_facts(None, …)` lists every fact. What to check when verifying
-by hand: **the key that comes back still carries its group**, so it can be fed
-straight back into `get_fact` / `delete_fact` —
-
-```text
-list_facts(Some("profile:")) -> [("profile:name", …), ("profile:lang", …)]
-                                  ^^^^^^^^ NOT ("name", …)
-```
-
-`e2e_full_surface` asserts exactly that. Note the group string carries its own
-terminator: `Some("profile")` (no colon) also matches `"profiles:x"`.
-
-**Legacy keys are IN range, not invisible.** A dev cluster holding keys in the
-old `fact/{namespace}/{key}` shape has them sorting *inside* the new family
-range — `fact/profile/name` is listed by `list_facts`, but its name reads back
-as `"profile/name"`, which re-encodes to `fact/profile%2Fname`, a different key.
-Rather than hand back a name whose `delete_fact` would silently delete nothing,
-`list_facts` fails the whole scan with `PreconditionFailed` naming the offending
-key. Clear them and the scan goes green:
-
-```bash
-AC="./target/release/autumn-client --manager 127.0.0.1:9001"
-$AC range --prefix 'mem/{tenant}/{agent}/fact/' --keys-only   # inspect first
-# then delete the ones with a literal `/` after `fact/`
-```
-
-No production data is affected: no shipped consumer ever wrote facts.
-
-**Manual verification (memory-mcp example — both corpora + MCP):**
-
-```bash
-./cluster.sh start 3
-# code corpus (one crate for speed) + this repo's markdown docs:
-./target/release/memory-mcp 127.0.0.1:9001 --root crates/autumn-memory --docs docs &
-
-curl -s http://127.0.0.1:5100/stats
-#   → {"docs":554,"edges":882,"is_clean":true,"symbols":573}  (counts move with the corpus)
-curl -s 'http://127.0.0.1:5100/search?q=add%20a%20graph%20edge&corpus=code&mode=lexical&k=3'
-#   → code symbols only (e.g. src/lib.rs::MemoryStore::add_edge)
-curl -s 'http://127.0.0.1:5100/search?q=turnkey%20authz%20credentials&corpus=docs&mode=lexical&k=3'
-#   → doc chunks with file + heading path + line range (e.g. docs/ops.md#L1127-L1179)
-curl -s 'http://127.0.0.1:5100/members?id=docs/ops.md'      # document outline root
-
-# MCP stdio round-trip (initialize / tools/list / a doc search):
-printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search_docs","arguments":{"query":"leader election","k":2}}}' \
-  | ./target/release/memory-mcp 127.0.0.1:9001 --mcp 2>/dev/null
-#   → serverInfo name "memory-mcp"; 17 tools; chunk hits with headings + line spans
-
-# Graph database — nodes/edges with NO relation to code or documents. The point
-# of the check is that arbitrary kinds and edge types round-trip, and that
-# deleting a node takes its edges with it (`is_clean` stays true).
-printf '%s\n' \
-  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"graph_upsert_node","arguments":{"id":"person:ada","kind":"Person","attrs":{"born":1815}}}}' \
-  '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"graph_upsert_node","arguments":{"id":"machine:engine","kind":"Machine"}}}' \
-  '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"graph_add_edge","arguments":{"src":"person:ada","type":"WROTE_NOTES_ON","dst":"machine:engine","attrs":{"year":1843}}}}' \
-  '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"graph_neighbors","arguments":{"id":"machine:engine","direction":"in"}}}' \
-  '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"graph_delete_node","arguments":{"id":"person:ada"}}}' \
-  '{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"graph_delete_node","arguments":{"id":"machine:engine"}}}' \
-  | ./target/release/memory-mcp 127.0.0.1:9001 --mcp --no-index 2>/dev/null
-#   → id 5 returns the edge with its type, attrs {"year":1843} and the far node
-curl -s http://127.0.0.1:5100/stats     # is_clean still true after the deletes
-
-# Read half over HTTP (writes go through MCP, so no GET mutates):
-curl -s 'http://127.0.0.1:5100/graph/nodes?kind=Document&limit=2'
-curl -s 'http://127.0.0.1:5100/graph/neighbors?id=docs/ops.md&type=CONTAINS&limit=1'
-curl -s 'http://127.0.0.1:5100/graph/traverse?id=docs/ops.md&max_depth=1&max_nodes=2'
-./cluster.sh stop
-```
-
-**Ingest throughput must be measured against a REAL cluster, never loopback.**
-Ingest is round-trip-bound, so loopback (~0.02 s/chunk) hides the cost that
-dominates in a pod (~0.53 s/chunk before batching, i.e. ~45 min for a
-5164-chunk corpus, which reads as a hang). To time it where it counts, run the
-ingest from inside the cluster:
-
-Startup ingest logs each phase's elapsed time, so a pod's own log is the
-measurement — no separate harness:
-
-```bash
-kubectl -n autumn logs deploy/memory-mcp | grep -E 'ms/chunk|reconcile \+ train'
-#   → ingested 5164 chunks (5164 outline edges) from 31 files in ... ms (... ms/chunk)
-#   → reconcile + train_centroids in ... ms
-```
-
-Re-measure with `--reindex` (rebuilds the code corpus) or by pointing `--docs`
-at a fresh corpus; a re-ingest of unchanged docs is an upsert and stays
-representative of the write path.
-
-If a change makes this slower, look for a `for k in keys { get(k).await }` loop
-first — see "Round trips are the cost model" in `crates/autumn-memory/CLAUDE.md`.
-A bulk ingest must also bracket itself with `begin_bulk_index()` /
-`flush_stats()`; skipping the flush leaves `meta/stats` understating the corpus
-until `repair_stats` runs (and `/stats` will show it).
-
-## Retrieval-quality eval (`memory-mcp --eval`)
-
-Every knob on the retrieval path — the tokenizer, BM25's `k1`/`b`, RRF fusion,
-which leg `auto` picks, `NPROBE`, the centroid count, chunk size and overlap —
-used to be tuned by argument, with the unit tests unable to tell whether a
-change made search better or worse. Two incidents were caught by a person
-reading results, not by a test. `--eval` scores a labelled query set against an
-ingested corpus and compares it to a committed baseline.
-
-Goldset: `examples/memory-mcp/eval/sutra.jsonl` (41 queries, JSONL + `#`
-comments; each query labels relevance by `expect_file` / `expect_substr` /
-`expect_id`, and may mark known-wrong hits with `reject_substr`).
-Baseline: `examples/memory-mcp/eval/baseline.json`.
-Corpus used for the committed baseline: `/data/dongmao_dev/md` — 17 Chinese
-Buddhist books, 6 MB, 5164 chunks. It is deliberately NOT in the repo (size and
-provenance); point `--docs` at your own copy and re-baseline if it differs.
-
-```bash
-cargo build --release -p memory-mcp
-AUTUMN_DATA_ROOT=/tmp/autumn-eval ./cluster.sh reset 1
-
-# 1. Build the index ONCE (ingest + reconcile + train_centroids), then score it.
-./target/release/memory-mcp 127.0.0.1:9001 --agent eval \
-    --docs /data/dongmao_dev/md --eval examples/memory-mcp/eval/sutra.jsonl
-#   → ingested 5164 chunks ... (12.9 ms/chunk on loopback)
-#   → mode=lexical  hit@1 0.976  hit@5 1.000  hit@k 1.000  MRR@k 0.988 ...
-
-# 2. Every later run reuses that index — no --docs. THIS is the reproducible
-#    loop, and the one a baseline comparison is valid across.
-./target/release/memory-mcp 127.0.0.1:9001 --agent eval \
-    --eval examples/memory-mcp/eval/sutra.jsonl \
-    --eval-baseline examples/memory-mcp/eval/baseline.json
-echo $?   # 0 = no regression, 1 = something got worse
-```
-
-**Passing `--docs` retrains the IVF centroids, and that alone moves
-vector/hybrid.** Measured on this corpus: with no retrain, all three modes are
-byte-identical across runs; with a retrain, lexical is unchanged while vector
-and hybrid both shift (k-means re-initialises from the current IVF scan order —
-the previous training's bucketing — so it settles into a different local
-optimum). The report records `retrained`, and `compare` prints a NOTE when
-either side of the comparison rebuilt. Do not chase a vector/hybrid delta
-across a rebuild.
-
-Reference numbers on the corpus above (recorded when the built-in hash
-embedder was still the default — it has since been removed, so reproduce these
-with an embedder configured — without one the default run scores the lexical
-leg only and says so, since a vector query with no vector leg is an error, not
-an empty row):
-
-| mode | hit@1 | hit@5 | hit@k | MRR@k | P@k |
-|---|---|---|---|---|---|
-| lexical | 0.976 | 1.000 | 1.000 | 0.988 | 0.712 |
-| vector  | 0.146 | 0.415 | 0.512 | 0.269 | 0.107 |
-| hybrid  | 0.610 | 1.000 | 1.000 | 0.772 | 0.485 |
-
-That vector row is what a meaningless embedder looks like when it is measured
-instead of assumed, and the hybrid row is the cost of fusing it into a good
-lexical leg: RRF pulls noise into the top ranks, so `auto` was made to resolve
-to `lexical`. Both the embedder and that rule are gone — `auto` is now `hybrid`
-whenever an embedder exists, because one only exists if somebody configured it.
-Keep the table as the reason: it is the measurement that says a vector leg you
-did not choose is worse than none.
-
-**Check the eval is still alive** (a goldset that cannot go red is decoration).
-Disable the CJK bigram emission in `crates/autumn-memory/src/recall.rs`
-(the `if let Some(prev) = prev_cjk` block in the tokenizer), rebuild, ingest
-into a scratch agent, and score against the baseline:
-
-```bash
-./target/release/memory-mcp 127.0.0.1:9001 --agent eval-nobigram \
-    --docs /data/dongmao_dev/md --eval examples/memory-mcp/eval/sutra.jsonl \
-    --eval-modes lexical --eval-baseline examples/memory-mcp/eval/baseline.json
-#   → EXIT=1, and: WORSE lexical "慧能": rank 2 → miss
-```
-
-`--eval-update-baseline` overwrites the baseline instead of comparing. Use it
-only when the corpus or goldset changed on purpose — a baseline that updates
-itself records the regression instead of catching it.
-
-**Getting a clean agent.** `--reset` deletes the agent's keys, and a document
-corpus is mostly BM25 postings — 5164 chunks is ~2 million keys. Measured on a
-local 3-node cluster: **70 s**, or ~29k keys/s. It is now delete-bound, not
-scan-bound — `memory-mcp` logs a `wipe breakdown` line (pages / scan_ms /
-delete_ms) at the end of every wipe, and the split is ~2.8 s of scanning to
-~68 s of deleting.
-
-That ~30k keys/s is NOT a partition ceiling, despite looking like one: splitting
-the namespace four ways (data verified spread 46/21/13/20%), raising the delete
-fan-out from 32 to 256, and growing the page from 512 to 4096 keys each moved it
-by less than 10%, and the ingest that writes the same keys lands at the same
-rate. See `F-KV-CLIENT-30K` in the feature list — do not "fix" this by adding
-partitions.
-
-It used to take ~10 minutes at 3.4k keys/s, and the difference is worth knowing
-if you are reading an older run: the range scan was re-snapshotting the whole
-memtable on every page (see the partition-server guide, "Range memtable
-window"), which also made a `delete_many` batching experiment look worthless at
-the time. `./cluster.sh reset 1` is still the fastest way to a clean slate if
-you do not need the rest of the cluster's data.
-
 ## fs stripe geometry: lanes vs partitions
 
 Large-file striping spreads one file's extents across N **lanes** so a single
@@ -2061,7 +1801,7 @@ distinct prefixes, not requests.
 
 ## Data-plane authz setup
 
-Server-side key-range authorization for the `mem/` namespace
+Server-side key-range authorization for registered namespaces
 (`data_plane_authz_design.md`): the manager acts as a KDC that mints
 short-TTL Ed25519 capability tokens; the PS verifies them per connection
 (`AUTH_HELLO`) and enforces per request. **OPT-IN** — with no signing key
@@ -2072,33 +1812,22 @@ authz-off, anonymous, zero hot-path cost).
 
 `cluster.sh` auto-provisions the whole authz bring-up so the examples work
 end-to-end. `AUTUMN_AUTH=1` generates a signing key + admin token under
-`$DATA_ROOT/authz/`, protects `mem/` & `gallery/`, registers the `gallery`
-namespace, and mints per-example tenant credentials:
+`$DATA_ROOT/authz/`, registers the `gallery` namespace, and mints credentials
+for `fs/`, `kvc/` and `gallery/`:
 
 ```bash
-AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,admin.token,memory.cred,gallery.cred}
-
-# memory-mcp (mem/memory/, protected) — pass its tenant credential:
-./target/release/memory-mcp --credential-file /tmp/autumn-rs/authz/memory.cred
+AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,admin.token,fs.cred,kvc.cred,gallery.cred}
 
 # gallery (gallery/gallery/, protected) — Scoped client, credential via env:
 AUTUMN_CREDENTIAL_FILE=/tmp/autumn-rs/authz/gallery.cred \
   ./target/release/gallery 127.0.0.1:9001
 ```
 
-Both examples now bind a namespace scope (`{ns}/{tenant}/`, prepended by the SDK)
-and auth via `--credential-file` / `AUTUMN_CREDENTIAL_FILE` (the SDK auto-mints
-short-TTL tokens). Override the scope with `AUTUMN_NAMESPACE` / `AUTUMN_TENANT`
-(gallery) or `--tenant` (memory-mcp). Tune protection with
-`AUTUMN_AUTH_PROTECTED_PREFIXES` (default `mem/,gallery/`); an unprotected
-namespace needs no credential.
+The example binds its namespace scope and authenticates through
+`AUTUMN_CREDENTIAL_FILE`; the SDK auto-mints short-TTL tokens. Override the
+scope with `AUTUMN_NAMESPACE` / `AUTUMN_TENANT`.
 
 ```bash
-# 0) One-shot cross-tenant e2e against an ISOLATED throwaway authz cluster
-#    (gen key → manager with authz → two tenants → verify isolation):
-bash crates/autumn-memory/tests/run_authz_e2e.sh
-#   → "AUTHZ E2E OK: cross-tenant isolation + anon deny + ungated + MemoryStore pass-through"
-
 # 1) Generate a signing key (LOCAL, no cluster needed) + an admin token file:
 ./target/release/autumn-op gen-signing-key --kid 1 > /path/signing.key
 printf '%s' "$(openssl rand -hex 24)" > /path/admin.token
@@ -2118,10 +1847,9 @@ $AO principal-create --principal acme --grant mem/acme/ --admin-token-file /path
 # `--admin-token[-file]` and `--credential-file` work BEFORE or AFTER the
 # subcommand — position does not matter (it used to, differently per command).
 
-# 4) Use it from the SDK / autumn-memory (auto-mints + renews tokens,
-#    AUTH_HELLOs each PS connection; principal read from the credential file):
+# 4) Use it from the SDK (auto-mints + renews tokens, AUTH_HELLOs each PS
+#    connection; principal read from the credential file):
 #      ClusterClient::connect_with_credential(mgr, "mem/acme", principal, secret)
-#      MemoryStore::connect_with_credential(mgr, "acme", agent, principal, secret)
 #    Cross-scope / anonymous access to a protected prefix fails PermissionDenied.
 
 # Ops: mint a token by hand / revoke a principal:
@@ -3591,7 +3319,7 @@ dest: `fs.read_into(ino, off, memoryview(buf))` byte-equals `fs.read(ino, off, n
 data-plane authz automatically. **Protect-everything (tenant-first, 2026-07-19):**
 with a signing key present, EVERY tenant-scoped write requires a token — there is
 no protected-prefix list; a credential grants a key prefix — a whole namespace
-(`fs/`) or an in-namespace sub-prefix (`mem/hermes/`). The key layout is
+(`fs/`) or an in-namespace sub-prefix (`mem/app/`). The key layout is
 `{ns}/…` (NO tenant segment; see §8).
 
 - **`deploy/baremetal/autumn-deploy start`** generates a signing key + admin
@@ -3615,9 +3343,8 @@ no protected-prefix list; a credential grants a key prefix — a whole namespace
 
 ### Manual runbook (custom principals, or a non-deploy setup)
 
-Client-side wiring: PyO3 `Client.connect(scope=,principal=,credential=)` +
-`BatchClient(scope=,principal=,credential=)`, hermes provider
-`AUTUMN_MEMORY_CREDENTIAL_FILE`. Everything below is the OPERATIONAL enablement
+Client-side wiring: PyO3 `Client.connect(scope=,principal=,credential=)` and
+`BatchClient(scope=,principal=,credential=)`. Everything below is the OPERATIONAL enablement
 for a principal the deploy layer did NOT auto-provision. Gradual-rollout axis:
 credentials-first (steps 1–4 are harmless with authz off), prefix-enforcement
 last (step 5).
@@ -3626,32 +3353,30 @@ last (step 5).
 # 1. one-time: signing key (KEEP SAFE; k8s: put it in a Secret)
 autumn-op gen-signing-key > /secrets/autumn-auth-signing.key
 
-# 2. create the PRINCIPAL. Grant an in-namespace sub-prefix (`mem/hermes/`) or a
+# 2. create the PRINCIPAL. Grant an in-namespace sub-prefix (`mem/app/`) or a
 #    whole namespace (`fs/`). principal-create prints the two-line
 #    principal:/credential: form (shown ONCE) — redirect it STRAIGHT to the
 #    credential file (the reader parses the name + hex from it):
-autumn-op --manager $M principal-create --principal hermes \
-    --grant "mem/hermes/" --admin-token-file /secrets/admin.token \
-  > /secrets/hermes.cred
+autumn-op --manager $M principal-create --principal app \
+    --grant "mem/app/" --admin-token-file /secrets/admin.token \
+  > /secrets/app.cred
 
-# 3. hermes/memory clients: mount the Secret, set
-#    AUTUMN_MEMORY_TENANT=hermes  (the mem sub-prefix)
-#    AUTUMN_MEMORY_CREDENTIAL_FILE=/secrets/hermes.cred
-#    (harmless while authz is off — credential is simply unused)
-
-# 4. verify mint works BEFORE enforcing (minting is a manager RPC, unaffected by
+# 3. Verify mint works BEFORE enforcing (minting is a manager RPC, unaffected by
 #    whether the PS is enforcing yet — safe to run while authz is off):
-autumn-op --manager $M mint-token --principal hermes \
-    --credential-file /secrets/hermes.cred   # must print a token
+autumn-op --manager $M mint-token --principal app \
+    --credential-file /secrets/app.cred   # must print a token
 
-# 5. ARM: manager gets --auth-signing-key-file (or env
+# 4. ARM: manager gets --auth-signing-key-file (or env
 #    AUTUMN_AUTH_SIGNING_KEY_FILE via entrypoint). PROTECT-EVERYTHING: the signing
 #    key alone arms enforcement of EVERY namespaced write — there is no
 #    protected-prefix list. Restart manager; PS picks it up via 5s authz poll.
 
-# 6. verify enforcement: a credential-less write must fail
-autumn-client --manager $M --namespace mem put x /tmp/f  # expect PermissionDenied
-# hermes mem round-trip must still pass (it now carries the credential)
+# 5. Verify enforcement: a credential-less write must fail, while the scoped
+#    client carrying app.cred succeeds.
+printf data > /tmp/authz-value
+autumn-client --manager $M --namespace mem put x /tmp/authz-value  # expect PermissionDenied
+autumn-client --manager $M --namespace mem/app \
+    --credential-file /secrets/app.cred put x /tmp/authz-value
 ```
 
 Rollback = remove the signing-key flag and restart the manager (no key =
@@ -3884,7 +3609,7 @@ Field notes from the wire-48 rollout (2026-09-26):
 - The converter needs an IP:port for --manager — `ClusterClient::connect` does
   not resolve names ("invalid socket address syntax"). In k8s use the
   `autumn-manager` Service's ClusterIP, or the pod IP.
-- The k8s fs clients fail LOUD and visibly: memory-mcp / code-index-mcp
+- The k8s fs clients fail LOUD and visibly: code-index-mcp and other clients
   crashloop with the 3 != 4 error above — that is the signal the tree is not
   converted yet, not a new bug. Fix the tree, restart the pod.
 - After the stop-the-world the auto-policy's rebalance cooldown can hold every
@@ -3913,7 +3638,7 @@ autumn `fs/models/llama/x.safetensors`.
 ```bash
 # 1. Run it next to the engine (per-GPU-node sidecar keeps the RDMA hop long
 #    and the HTTP hop on loopback).
-autumn-s3 --manager 127.0.0.1:9000 --port 9100 \
+autumn-s3 --manager 127.0.0.1:9001 --port 9100 \
           --credential-file /secrets/fs.cred      # omit when authz is off
 # --workers N (default 8, capped at core count) — accept threads, SO_REUSEPORT.
 # One thread caps an AWS-CRT client at ~40% of the read path; the knee is at 4.
@@ -3978,6 +3703,22 @@ aws --endpoint-url $E s3api put-object --bucket tables --key t1/_versions/1.mani
     --body m.bin --if-none-match '*'          # 412 PreconditionFailed if it exists
 aws --endpoint-url $E s3 rm s3://tables/t1/data/0.lance
 ```
+
+### LanceDB acceptance workload
+
+The maintained example uses the stock, pinned Python client and exercises
+create, append, multipart, reopen, vector search, filtering, concurrent
+commits, optimize/vacuum, byte verification and drop:
+
+```bash
+cd examples/lancedb-s3
+uv sync
+uv run python workload.py http://127.0.0.1:9100 tables smoke
+# → WORKLOAD OK
+```
+
+See [`../examples/lancedb-s3/README.md`](../examples/lancedb-s3/README.md) for
+the request-trace recorder and compatibility contract.
 
 Each gateway runs one reclaimer thread with its own client identity. A
 DELETE, an overwrite or an Abort only records what to reclaim and returns; the

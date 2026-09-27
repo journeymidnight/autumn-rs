@@ -1,11 +1,25 @@
-# LanceDB over the S3 gateway — pinned client, request trace, workload
+# LanceDB over Autumn S3
+
+This example uses the stock Python LanceDB client against `autumn-s3`. It is
+both a runnable introduction and the compatibility workload for the S3 surface;
+there is no custom LanceDB build or Autumn-specific query layer.
+
+Start an Autumn cluster and gateway, then create the bucket as a first-level
+directory in the shared `fs/` tree:
+
+```sh
+cargo build --release -p autumn-server -p autumn-fuse
+./cluster.sh start 3
+./target/release/autumnfs --manager 127.0.0.1:9001 mkdir /tables
+./target/release/autumn-s3 --manager 127.0.0.1:9001 --port 9100 &
+```
 
 The client is pinned: `lancedb==0.39.0` (it bundles Lance 12.0.0), resolved in
 `uv.lock`. Use `uv run` from this directory so the locked environment is used,
 never a locally modified LanceDB.
 
 ```sh
-cd scripts/lancedb_s3
+cd examples/lancedb-s3
 uv sync
 
 # Workload: create, append, a multipart-sized append, reopen, vector search,
