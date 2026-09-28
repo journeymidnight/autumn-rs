@@ -38,6 +38,7 @@ run_one_capture() {
     echo "[R2] capture $label  (partitions=$partitions, filter=${thread_filter:-<none>}, duration=${duration}s)"
 
     export AUTUMN_DATA_ROOT=/dev/shm/autumn-rs
+    export AUTUMN_EXTENT_DIRECT_IO=0   # tmpfs: no O_DIRECT
     if (( partitions > 1 )); then
         export AUTUMN_BOOTSTRAP_PRESPLIT="${partitions}:hexstring"
     else

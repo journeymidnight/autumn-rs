@@ -412,7 +412,7 @@ Append(AppendReq via autumn-rpc binary frame):
      "Per-extent owner (write path)"). Appends are messages to ONE owner task
      per extent, so the write is single-writer by construction:
        - write_append_burst(start, payload)     (see note 25a: MUST be *_all;
-         buffered pwritev, or O_DIRECT under --direct-io — next section)
+         buffered pwritev, or O_DIRECT for bursts >= 1 MiB — next section)
        - ONE sync_data per drained burst: pending_fsync.store(end) BEFORE the
          fsync, last_synced.store(end) AFTER — the two watermarks are all that
          remains of the old Coalescer struct. Every burst fsyncs
@@ -426,9 +426,11 @@ Returning `end=N` means all data in `0..N` is written. Step 5 (commit-based
 truncation) is the consistency key: the data files themselves are the journal,
 replacing a WAL.
 
-### Direct I/O for large bursts (`--direct-io`, `direct_io.rs`)
+### Direct I/O for large bursts (`direct_io.rs`)
 
-Off by default. With it, step 6's write goes through `write_append_burst`, used
+On by default in the `autumn-extent-node` binary on Linux (`--no-direct-io`
+turns it off; `ExtentNodeConfig` itself defaults to off, so in-process tests and
+embedders opt in with `with_direct_io`). Step 6's write goes through `write_append_burst`, used
 by BOTH append paths (the owner's `append_burst_frames` and the non-batched
 `handle_append`): a burst of at least `DIRECT_IO_MIN_BYTES` (1 MiB) writes its
 4 KiB-aligned part with O_DIRECT, and everything else stays the buffered
@@ -456,11 +458,13 @@ over-allocated `Vec` offset to 4 KiB (no `unsafe`), filled and written in 8 MiB
 pieces, with a few pooled per shard thread; the copy that used to happen in the
 kernel (into the page cache) happens there instead.
 
-**A filesystem without O_DIRECT fails startup.** Non-Linux fails
-`ExtentNode::new`, and so does a data dir whose `disk_id` sentinel (written by
+**A filesystem without O_DIRECT fails startup.** With direct I/O on, non-Linux
+fails `ExtentNode::new` (the binary is always off there, so only a library caller
+setting `with_direct_io(true)` gets this far), and so does a data dir whose `disk_id` sentinel (written by
 `autumn-op format`, read by every EN start anyway) cannot be opened read-only
 with O_DIRECT (`direct_io::check`) — EINVAL from a filesystem that has none,
-e.g. tmpfs before Linux 6.6. Without it, such a node would start, and every
+e.g. tmpfs before Linux 6.6; the error names `--no-direct-io`, the way to run
+on such a filesystem (`perf_check.sh --shm` passes it). Without the check, such a node would start, and every
 burst of 1 MiB or more would fail at the reopen while the disk's buffered
 self-check keeps passing, so the disk would stay allocatable and large writes
 would fail for good. The check writes nothing, so a full, failing or
@@ -499,14 +503,19 @@ the page cache, so an immediate read hits the disk (2.5 GB/s instead of
 TOTAL, so a coalesced burst of many small WAL appends goes direct too — and
 the log stream is exactly where a GET reads a value shortly after its PUT.
 Other writers of `.dat` (recovery, re_avali, the peer copy) and EC shard
-staging stay buffered.
+staging stay buffered. It is the default anyway because the write gain holds at
+every load measured and a node that needs fresh data from memory can say
+`--no-direct-io`, while a buffered default makes every node pay the page-cache
+copy and writeback out of its own cores.
 
 Tests: `direct_io::tests` (every head/tail alignment, multi-chunk bursts,
 byte-exact content and exact size; removing the head read-back turns three of
 them red), `direct_io_appends_land_byte_exact` (both append paths route through
 O_DIRECT — a burst that silently went buffered fails it),
 `direct_io_on_tmpfs_follows_the_filesystem` (starts iff tmpfs itself takes
-O_DIRECT; red with the flag dropped from the check),
+O_DIRECT; red with the flag dropped from the check), `direct_io_default`
+in autumn-server (the real binary logs `direct-io on` with no flag and not with
+`--no-direct-io`; red with the binary default back to off),
 `check_opens_the_sentinel_with_o_direct`, `direct_write_error_keeps_the_disk_class`,
 and `disk_probe_survives_a_leftover_scratch_file` (the disk self-check, note
 25a: a scratch name left by a crash with the same pid — a container EN is often
@@ -885,7 +894,7 @@ is where bytes/s + iops limits matter.
 | `--recovery-parallelism` | `AUTUMN_EXTENT_RECOVERY_PARALLELISM` | 2 | [1, 16] |
 | `--ec-stripe-bytes` | `AUTUMN_EXTENT_EC_STRIPE_BYTES` (test override) | 64 MiB | [1 MiB, 1 GiB] |
 | `--fd-cache-cap` | `AUTUMN_EXTENT_FD_CACHE_CAP` | 4096 | floored 64, clamped by shard count |
-| `--direct-io` | `AUTUMN_EXTENT_DIRECT_IO=1` | off | Linux only; startup O_DIRECT open of each `disk_id` |
+| `--no-direct-io` | `AUTUMN_EXTENT_DIRECT_IO=0` (only 0 or 1) | on (Linux), off elsewhere | startup O_DIRECT open of each `disk_id` while on |
 
 `--ec-stripe-bytes` (process-global, `set_ec_encode_stripe_bytes`, OnceLock
 first-call-wins; precedence flag > env > default) is the chunked EC-convert

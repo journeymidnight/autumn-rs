@@ -551,10 +551,15 @@ _format_and_start_ens() {
         [[ -n "$cpu" ]] || cpu="$(on_host "$host" "awk '/^Cpus_allowed_list:/ {split(\$2, a, /[,-]/); print a[1]}' /proc/self/status 2>/dev/null || true")"
         local -a cpu_args=()
         [[ -n "$cpu" ]] && cpu_args=(--cpuset "$cpu")
-        # AUTUMN_EXTENT_DIRECT_IO=1: O_DIRECT append bursts (Linux; the EN
-        # refuses to start if a data dir does not accept O_DIRECT).
+        # O_DIRECT append bursts are the EN's default on Linux (it refuses to
+        # start if a data dir does not accept O_DIRECT); AUTUMN_EXTENT_DIRECT_IO=0
+        # turns them off.
         local -a dio_args=()
-        [[ "${AUTUMN_EXTENT_DIRECT_IO:-0}" == "1" ]] && dio_args=(--direct-io)
+        case "${AUTUMN_EXTENT_DIRECT_IO:-1}" in
+            1) ;;
+            0) dio_args=(--no-direct-io) ;;
+            *) die "AUTUMN_EXTENT_DIRECT_IO must be 0 or 1, got '$AUTUMN_EXTENT_DIRECT_IO'" ;;
+        esac
         # F-EN-DYNSHARD M1a: --advertise is now REQUIRED with --manager — the
         # EN self-registers its live address + shard ports at every startup.
         svc_start "$host" "en$i" "$DATA_ROOT" "$BIN_DIR/autumn-extent-node" \

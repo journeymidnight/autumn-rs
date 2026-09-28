@@ -400,11 +400,16 @@ launch_extent_node() {
     if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
         metrics_args=(--metrics-port "$(( 9600 + i ))")
     fi
-    # AUTUMN_EXTENT_DIRECT_IO=1 → --direct-io (O_DIRECT for append bursts
-    # >= 1 MiB). The data dirs must take O_DIRECT (a filesystem that refuses
-    # it, e.g. tmpfs before Linux 6.6, makes the EN refuse to start).
+    # O_DIRECT for append bursts >= 1 MiB is the EN's default on Linux; the
+    # data dirs must take it (a filesystem that refuses it, e.g. tmpfs before
+    # Linux 6.6, makes the EN refuse to start). AUTUMN_EXTENT_DIRECT_IO=0 →
+    # --no-direct-io (page cache for every write).
     local -a dio_args=()
-    [[ "${AUTUMN_EXTENT_DIRECT_IO:-0}" == "1" ]] && dio_args=(--direct-io)
+    case "${AUTUMN_EXTENT_DIRECT_IO:-1}" in
+        1) ;;
+        0) dio_args=(--no-direct-io) ;;
+        *) die "AUTUMN_EXTENT_DIRECT_IO must be 0 or 1, got '$AUTUMN_EXTENT_DIRECT_IO'" ;;
+    esac
     start_proc "node$i" \
         "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
         --listen "$BIND_HOST" --transport "$TRANSPORT" \

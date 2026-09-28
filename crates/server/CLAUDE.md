@@ -39,6 +39,7 @@ autumn-extent-node --data DIR[,DIR2,...] [--port 9101] [--manager 127.0.0.1:9001
 ```
 
 - `--data`: directory holding extent files (`extent-{id}.dat` + `extent-{id}.meta`); comma-separated or repeated for a multi-disk EN.
+- **Direct I/O is on by default on Linux** (append bursts >= 1 MiB go O_DIRECT; off elsewhere): the default lives here in the binary, not in `ExtentNodeConfig` (off there). `--no-direct-io` turns it off — needed on a data dir that refuses O_DIRECT (tmpfs before Linux 6.6), which otherwise stops the EN at startup. There is no flag to turn it on: it is the Linux default, and elsewhere there is no O_DIRECT path. Covered by `tests/direct_io_default.rs`; design in `crates/stream/CLAUDE.md`.
 - `--advertise HOST:PORT` is **REQUIRED whenever `--manager` is given** (`main()` bails otherwise) — a `--manager` run that self-registered nothing would sit at an empty location forever. HOST must be an IP (DNS-free); PORT must equal `--port`. `--manager`-less offline/test runs are exempt.
 - **Self-registration**: at startup (after cluster-id verification, before serving) the EN registers its live address + shard ports with the manager, keyed by its stable `node_uuid`. The manager updates the location IN PLACE, so a reshard or fresh pod IP is picked up on the next boot — the **EN, not `format`, is the sole source of location**. `handle_df` echoes the identity so `node_health_loop` self-heals drift.
 - **Pinning**: each shard thread (the main thread when there is one shard)

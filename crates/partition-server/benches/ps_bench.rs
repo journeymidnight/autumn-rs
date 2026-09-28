@@ -6,7 +6,7 @@
 //!
 //! ```bash
 //! bash cluster.sh clean
-//! AUTUMN_DATA_ROOT=/dev/shm/autumn-rs bash cluster.sh start 3
+//! AUTUMN_DATA_ROOT=/dev/shm/autumn-rs AUTUMN_EXTENT_DIRECT_IO=0 bash cluster.sh start 3
 //! cargo bench --bench ps_bench -p autumn-partition-server
 //! ```
 //!

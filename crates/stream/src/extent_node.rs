@@ -942,9 +942,10 @@ pub struct ExtentNodeConfig {
     /// `None` = not self-registered (`--advertise` unset) → the manager skips
     /// the echo-based drift-heal / imposter checks.
     pub registration: Option<NodeRegistration>,
-    /// `--direct-io`: append bursts of 1 MiB and more write their aligned
-    /// part with O_DIRECT (see `direct_io`). Off by default, Linux only; a data
-    /// directory whose `disk_id` cannot be opened O_DIRECT stops the node —
+    /// Append bursts of 1 MiB and more write their aligned part with O_DIRECT
+    /// (see `direct_io`). Linux only. Off in this config; the
+    /// `autumn-extent-node` binary turns it on unless given `--no-direct-io`. A
+    /// data directory whose `disk_id` cannot be opened O_DIRECT stops the node —
     /// including one built with `ExtentNodeConfig::new`, which reads no
     /// `disk_id`, so a caller turning this on there must write one.
     pub direct_io: bool,
@@ -2915,7 +2916,7 @@ pub(crate) async fn write_vectored_all_at_chunked(
 }
 
 /// Write one append burst (`bufs` concatenated) at `at`, `_all` semantics.
-/// With `--direct-io`, a burst of at least `DIRECT_IO_MIN_BYTES` bypasses the
+/// With direct I/O on, a burst of at least `DIRECT_IO_MIN_BYTES` bypasses the
 /// page cache for its aligned part (see `direct_io`); everything else is the
 /// buffered `pwritev`. Durability is still the caller's one `sync_data`.
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
@@ -3752,9 +3753,10 @@ impl ExtentNode {
             let disk_id = disk.disk_id;
             disk_map.insert(disk_id, Rc::new(disk));
         }
-        // No silent fallback: a node asked for O_DIRECT on a filesystem that
+        // No silent fallback: a node running with O_DIRECT on a filesystem that
         // does not support it refuses to start, rather than fail every large
-        // append at runtime while the disk still looks healthy.
+        // append at runtime while the disk still looks healthy. The binary has
+        // it on by default, so the message names the way to turn it off.
         if config.direct_io {
             #[cfg(target_os = "linux")]
             for disk in disk_map.values() {
@@ -3762,11 +3764,15 @@ impl ExtentNode {
                 crate::direct_io::check(&disk.base_dir)
                     .await
                     .with_context(|| {
-                        format!("--direct-io: cannot open {dir}/disk_id with O_DIRECT")
+                        format!(
+                            "direct I/O: cannot open {dir}/disk_id with O_DIRECT \
+                             (a filesystem without it, e.g. tmpfs before Linux 6.6, \
+                             needs --no-direct-io)"
+                        )
                     })?;
             }
             #[cfg(not(target_os = "linux"))]
-            anyhow::bail!("--direct-io is only supported on Linux");
+            anyhow::bail!("direct I/O is only supported on Linux");
             #[cfg(target_os = "linux")]
             tracing::info!(
                 shard_idx = config.shard_idx,
@@ -11501,7 +11507,7 @@ mod enospc_disk_health_tests {
 mod sealed_append_guard_tests {
     use super::*;
 
-    /// `--direct-io` reaches both append paths: a burst of 1 MiB and more goes
+    /// Direct I/O reaches both append paths: a burst of 1 MiB and more goes
     /// through O_DIRECT, a smaller one does not, and either way the file holds
     /// exactly the acked bytes with an exact size (its size IS the extent's
     /// length after a restart).
@@ -11603,7 +11609,7 @@ mod sealed_append_guard_tests {
         ));
     }
 
-    /// A node on tmpfs starts with `--direct-io` exactly when tmpfs itself
+    /// A node on tmpfs starts with direct I/O on exactly when tmpfs itself
     /// takes O_DIRECT (it refuses before Linux 6.6, accepts and buffers
     /// after), so the check really asks the filesystem.
     #[cfg(target_os = "linux")]
@@ -11623,7 +11629,7 @@ mod sealed_append_guard_tests {
             Ok(_) => assert!(fs_takes_it, "started although tmpfs refuses O_DIRECT"),
             Err(e) => {
                 assert!(!fs_takes_it, "refused although tmpfs takes O_DIRECT: {e:#}");
-                assert!(format!("{e:#}").contains("with O_DIRECT"), "{e:#}");
+                assert!(format!("{e:#}").contains("needs --no-direct-io"), "{e:#}");
             }
         }
     }

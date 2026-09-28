@@ -85,9 +85,10 @@ struct Args {
     /// max resident SEALED-extent fds cached per shard. `None` =
     /// library default (4096). Bounds open fds on a node with many extents.
     fd_cache_cap: Option<usize>,
-    /// `--direct-io`: append bursts of 1 MiB and more bypass the page cache
-    /// for their aligned part. Linux only; startup fails if any data dir's
-    /// filesystem refuses O_DIRECT.
+    /// Append bursts of 1 MiB and more bypass the page cache for their aligned
+    /// part. On by default on Linux (off elsewhere, where there is no O_DIRECT
+    /// path); `--no-direct-io` turns it off. While on, startup fails if any
+    /// data dir's filesystem refuses O_DIRECT.
     direct_io: bool,
     /// Per-thread regpool cap (pinned/registered bytes). `None` = library
     /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB].
@@ -132,7 +133,7 @@ fn parse_args() -> Args {
     let mut inflight_cap: Option<usize> = None;
     let mut ec_stripe_bytes: Option<usize> = None;
     let mut fd_cache_cap: Option<usize> = None;
-    let mut direct_io = false;
+    let mut direct_io = cfg!(target_os = "linux");
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut advertise: Option<String> = None;
 
@@ -238,7 +239,7 @@ fn parse_args() -> Args {
                 ec_stripe_bytes =
                     Some(args[i].parse().expect("--ec-stripe-bytes must be a number"));
             }
-            "--direct-io" => direct_io = true,
+            "--no-direct-io" => direct_io = false,
             "--fd-cache-cap" => {
                 i += 1;
                 fd_cache_cap =

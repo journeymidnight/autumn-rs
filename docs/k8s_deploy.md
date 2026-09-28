@@ -250,10 +250,11 @@ Changing the shard count for a **running** cluster is a **stop-the-world reshard
 (the file layout is hash-subdir'd, shard-independent); only routing remaps. See
 the reshard runbook in `docs/ops.md` and `scripts/reshard_chaos.sh`.
 
-`AUTUMN_EXTENT_DIRECT_IO=1` makes the entrypoint pass `--direct-io` (O_DIRECT for
-append bursts of 1 MiB and more). The EN volume must be a filesystem that takes
-O_DIRECT: a tmpfs `emptyDir` (`medium: Memory`) refuses it before Linux 6.6 (the EN
-then refuses to start) and only pretends from 6.6 on (it buffers anyway). Trade-offs and verification: "Direct I/O on the extent nodes" in
+The EN writes append bursts of 1 MiB and more with O_DIRECT by default, so the EN
+volume must be a filesystem that takes O_DIRECT: a tmpfs `emptyDir` (`medium:
+Memory`) refuses it before Linux 6.6 (the EN then refuses to start) and only
+pretends from 6.6 on (it buffers anyway). `AUTUMN_EXTENT_DIRECT_IO=0` makes the
+entrypoint pass `--no-direct-io` (page cache for every write). Trade-offs and verification: "Direct I/O on the extent nodes" in
 `docs/ops.md`.
 
 ## Using the cluster

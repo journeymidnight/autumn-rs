@@ -224,6 +224,9 @@ done
 
 if (( USE_SHM )); then
     export AUTUMN_DATA_ROOT="/dev/shm/autumn-rs"
+    # tmpfs refuses O_DIRECT before Linux 6.6 (and buffers it after), so
+    # the ENs run without direct I/O here.
+    export AUTUMN_EXTENT_DIRECT_IO=0
     STORAGE_LABEL="RAM tmpfs (/dev/shm)"
     STORAGE_SUFFIX="_shm"
 else

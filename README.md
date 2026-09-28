@@ -178,11 +178,12 @@ The workload and the captured request contract are documented in
 | `deploy/k8s/` | Kubernetes — one image, kustomize base, guarded bootstrap Job; local-disk ENs, network-volume etcd | [`docs/k8s_deploy.md`](docs/k8s_deploy.md) |
 | `cluster.sh` | dev / chaos / perf **testing only** (raw process kill for fault injection) | [`docs/ops.md`](docs/ops.md) |
 
-Extent nodes on Linux can write large appends around the page cache with
-`--direct-io` (launchers: `AUTUMN_EXTENT_DIRECT_IO=1`; off by default). Large writes
-got 37-54% faster in a cluster test, but data just written is then read from disk
-rather than memory — see "Direct I/O on the extent nodes" in
-[`docs/ops.md`](docs/ops.md) before turning it on.
+Extent nodes on Linux write large appends around the page cache by default
+(O_DIRECT; `--no-direct-io`, or `AUTUMN_EXTENT_DIRECT_IO=0` in the launchers,
+turns it off). Large writes got 37-54% faster in a cluster test, but data just
+written is then read from disk rather than memory, and the data directories must
+be on a filesystem that takes O_DIRECT (not tmpfs before Linux 6.6) — see
+"Direct I/O on the extent nodes" in [`docs/ops.md`](docs/ops.md).
 
 UCX (RDMA) builds are opt-in: `cargo build --release -p autumn-server --features ucx`.
 With `TRANSPORT=ucx`, the launchers (`autumn-deploy`, `cluster.sh`) set the UCX env

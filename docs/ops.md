@@ -1097,20 +1097,21 @@ some bytes fit) as success — a partial value was ACKed and read back
 zero-padded. Fixed with the write-all form; the invariant is documented
 in `crates/stream/CLAUDE.md` note 25a.
 
-## Direct I/O on the extent nodes (`--direct-io`)
+## Direct I/O on the extent nodes
 
-Off by default. `AUTUMN_EXTENT_DIRECT_IO=1` makes `cluster.sh`, the k8s
-entrypoint and `autumn-deploy` pass `--direct-io`: append bursts of 1 MiB and
-more write their 4 KiB-aligned part with O_DIRECT; the sub-block tail and every
-smaller burst stay buffered, and every burst is still fsynced before it is
-ACKed. The `.dat` size stays byte-exact (it is the extent's length after a
+On by default on Linux (off elsewhere): append bursts of 1 MiB and more write
+their 4 KiB-aligned part with O_DIRECT; the sub-block tail and every smaller
+burst stay buffered, and every burst is still fsynced before it is ACKed.
+`--no-direct-io` turns it off (page cache for every write);
+`AUTUMN_EXTENT_DIRECT_IO=0` makes `cluster.sh`, the k8s entrypoint and
+`autumn-deploy` pass it, and `perf_check.sh --shm` sets it itself. The `.dat` size stays byte-exact (it is the extent's length after a
 restart). Design: `crates/stream/CLAUDE.md`, "Direct I/O for large bursts".
 
 What to expect (3-node RF3 cluster on one host, NVMe with power-loss
 protection, ext4, 8 partitions, 2 shards per EN with their io_uring workers
 confined to those cores, same-period A/B):
 
-| | buffered (default) | `--direct-io` |
+| | `--no-direct-io` | direct (default) |
 |---|---|---|
 | 8 MiB write, 16 clients x depth 8 | 1296-1317 MB/s | 2000-2026 MB/s (+54%) |
 | 1 MiB write, 1 client, depth 1 | 308-323 MB/s, p50 2.8 ms | 429-432 MB/s, p50 2.0 ms |
@@ -1120,18 +1121,23 @@ confined to those cores, same-period A/B):
 | reading 8 MiB values right after writing them | 8.1 GB/s | 6.3 GB/s (from disk, not page cache) |
 | 4 KiB write | within noise | within noise (bursts rarely reach 1 MiB) |
 
-The cost is read-after-write: turn it on where freshly written data is not
-read back at once. Numbers taken before the io_uring workers were confined to
+The cost is read-after-write: turn it off where freshly written data is read
+back at once. Numbers taken before the io_uring workers were confined to
 `--cpuset` showed buffered ahead by 4-7.5% — it was then using ~4 cores outside
 the ENs' cpusets; compare only runs from the same build.
 
 Requirements and failure modes:
-- Linux only; the EN refuses the flag elsewhere.
+- Linux only; elsewhere it is always off.
 - At startup the EN opens each data dir's `disk_id` read-only with O_DIRECT
   (nothing is written). A filesystem without O_DIRECT (tmpfs before Linux 6.6,
-  such as a k8s `emptyDir` with `medium: Memory`) stops the EN with
-  `--direct-io: cannot open <dir>/disk_id with O_DIRECT`. The cost is one
-  open() per disk per shard. Without the flag nothing is checked.
+  such as `/dev/shm` or a k8s `emptyDir` with `medium: Memory`) stops the EN with
+  `direct I/O: cannot open <dir>/disk_id with O_DIRECT (... needs
+  --no-direct-io)`; start it with `--no-direct-io` there. The cost is one
+  open() per disk per shard. With `--no-direct-io` nothing is checked.
+  The same applies to scratch data: `cluster.sh` defaults to `/tmp/autumn-rs`
+  and several integration tests put EN data under the system temp dir, so on a
+  host whose `/tmp` is tmpfs on a kernel before 6.6 point `AUTUMN_DATA_ROOT` /
+  `TMPDIR` at a real filesystem, or set `AUTUMN_EXTENT_DIRECT_IO=0`.
 - A filesystem that accepts O_DIRECT and quietly buffers it (ext4
   `data=journal`, tmpfs from Linux 6.6) passes the check; confirm the direct path
   is really taken (below).
@@ -1141,7 +1147,7 @@ Requirements and failure modes:
 Verify on a running EN:
 
 ```bash
-# 1. the flag took: one line per shard
+# 1. it is on: one line per shard (absent under --no-direct-io)
 grep 'direct-io on' /tmp/autumn-rs-logs/node1.log
 # 2. writes really go direct: count kernel direct-IO calls per process while
 #    writing large values (>= 1 MiB); the EN pids should show thousands
@@ -1150,7 +1156,7 @@ autumn-client --manager 127.0.0.1:9001 perf-check --threads 16 --duration 8 --si
 # 3. bytes survive a restart: put odd sizes, restart the whole cluster, compare
 for sz in 5000 1048577 3145851 17829887; do head -c $sz /dev/urandom > /tmp/v$sz
   autumn-client --manager 127.0.0.1:9001 --namespace bench put dio-$sz /tmp/v$sz; done
-AUTUMN_EXTENT_DIRECT_IO=1 ./cluster.sh restart 3 --3disk   # wait for 'partition server serving'
+./cluster.sh restart 3 --3disk   # wait for 'partition server serving'
 for sz in 5000 1048577 3145851 17829887; do
   autumn-client --manager 127.0.0.1:9001 --namespace bench get dio-$sz | cmp - /tmp/v$sz && echo ok $sz; done
 ```

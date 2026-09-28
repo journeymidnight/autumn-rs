@@ -23,7 +23,8 @@ REPS="${REPS:-3}"
 
 case "$STORAGE_MODE" in
     shm)                CLUSTER_FLAGS="";                  REPLICAS=3
-                        export AUTUMN_DATA_ROOT="/dev/shm/autumn-rs" ;;
+                        export AUTUMN_DATA_ROOT="/dev/shm/autumn-rs"
+                        export AUTUMN_EXTENT_DIRECT_IO=0 ;;  # tmpfs: no O_DIRECT
     3disk)              CLUSTER_FLAGS="--3disk";           REPLICAS=3
                         export AUTUMN_DATA_ROOT="/tmp/autumn-rs" ;;
     multidisk-1node)    CLUSTER_FLAGS="--multidisk-1node"; REPLICAS=1

@@ -1,5 +1,7 @@
-//! Append writes that bypass the page cache (`--direct-io`). Linux only: the
-//! module is compiled only there, and the node refuses the flag elsewhere.
+//! Append writes that bypass the page cache (on by default in the
+//! `autumn-extent-node` binary; `--no-direct-io` turns it off). Linux only: the
+//! module is compiled only there, and a node configured for it elsewhere refuses
+//! to start.
 //!
 //! An extent's length after a restart is the `.dat` file's size, and the
 //! commit protocol takes that length as the node's committed end — so the
