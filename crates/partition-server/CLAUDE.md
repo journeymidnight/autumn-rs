@@ -15,7 +15,9 @@ partition's ready channel, so the partition does not open. compio's own
 P-log's single core; a `taskset`-launched PS inherits the launcher's cores) and
 silently binds nothing when the target is outside it (`crates/common/CLAUDE.md`).
 CPU read-back must show the `--cpuset` cores, not merely the intended values in
-logs.
+logs. Both then call `cpu_pin::confine_io_workers(&rt)`, so that runtime's
+io_uring worker threads (`iou-wrk-*`) stay inside the PS's `--cpuset` too
+(`crates/common/CLAUDE.md`).
 
 ```
 Main compio thread (control plane + fd dispatcher)

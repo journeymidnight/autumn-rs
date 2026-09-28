@@ -1107,21 +1107,23 @@ ACKed. The `.dat` size stays byte-exact (it is the extent's length after a
 restart). Design: `crates/stream/CLAUDE.md`, "Direct I/O for large bursts".
 
 What to expect (3-node RF3 cluster on one host, NVMe with power-loss
-protection, ext4, 8 partitions, 2 shards per EN, 16 x depth-8 clients of
-8 MiB puts, same-period A/B):
+protection, ext4, 8 partitions, 2 shards per EN with their io_uring workers
+confined to those cores, same-period A/B):
 
 | | buffered (default) | `--direct-io` |
 |---|---|---|
-| 8 MiB write | 1970-2028 MB/s | 1870-1984 MB/s (4-7.5% lower) |
-| EN CPU during it | 8.6 cores | 4.0 cores |
-| whole machine | ~13 cores | ~7.6 cores |
-| reading those values right back | 8.1 GB/s | 6.3 GB/s (from disk, not page cache) |
-| 4 KiB write | 48-60k ops/s | 47-71k ops/s (noise; bursts rarely reach 1 MiB) |
+| 8 MiB write, 16 clients x depth 8 | 1296-1317 MB/s | 2000-2026 MB/s (+54%) |
+| 1 MiB write, 1 client, depth 1 | 308-323 MB/s, p50 2.8 ms | 429-432 MB/s, p50 2.0 ms |
+| 8 MiB write, 1 client, depth 1 | 371-375 MB/s, p50 19.5 ms | 514-520 MB/s, p50 14 ms |
+| 8 MiB write, 2 clients, depth 1 | 647-653 MB/s | 989-1017 MB/s |
+| EN CPU at full load | 4.2 cores | 3.7 cores |
+| reading 8 MiB values right after writing them | 8.1 GB/s | 6.3 GB/s (from disk, not page cache) |
+| 4 KiB write | within noise | within noise (bursts rarely reach 1 MiB) |
 
-So it is a CPU trade: turn it on where extent-node CPU is the constraint (many
-disks per node) and data is not read back right after it is written. On a
-single disk with only one or two writers the direct path was 2-3.5x faster in
-a microbenchmark; in the cluster above it was not.
+The cost is read-after-write: turn it on where freshly written data is not
+read back at once. Numbers taken before the io_uring workers were confined to
+`--cpuset` showed buffered ahead by 4-7.5% — it was then using ~4 cores outside
+the ENs' cpusets; compare only runs from the same build.
 
 Requirements and failure modes:
 - Linux only; the EN refuses the flag elsewhere.
@@ -3279,6 +3281,25 @@ done | grep -E ' (extent-shard-[0-9]+|autumn-extent-n|part-[0-9]+(-sst)?) '
 # autumn-extent-n is pinned only in a single-shard EN (its runtime is the main
 # thread); listener-part-* and other helper threads are not pinned.
 ```
+
+The io_uring worker threads of those runtimes (`iou-wrk-*`) must be inside the
+same cores. They exist only once the ring has punted work (buffered writes,
+fsync), so check while the cluster is writing:
+
+```bash
+for p in $(pgrep -x autumn-extent-n; pgrep -x autumn-ps); do
+  for t in /proc/$p/task/*; do c=$(cat $t/comm); [[ $c == iou-wrk* ]] &&
+    echo "$p $c $(awk '/Cpus_allowed_list/{print $2}' $t/status)"; done
+done | sort -k3 | uniq -c -f2
+# every list inside that process's --cpuset. A whole NUMA node (e.g.
+# 48-95,144-191) means the registration failed: look for "cannot confine
+# io_uring worker threads" in the log (Linux < 5.14, or --cpuset cores outside
+# the process's cgroup).
+```
+
+Without this, an EN's page-cache copy and writeback ran on up to four more
+cores than its `--cpuset` — buffered write throughput measured before the fix
+(~2.0 GB/s for 3 ENs x 2 cores) is not comparable with after (~1.27 GB/s).
 
 Then hand `cluster.sh` an explicit layout on the quiet node (EN cpuset length
 must equal `AUTUMN_EXTENT_SHARDS`; the PS needs ≥ 2 cores per partition; ranges

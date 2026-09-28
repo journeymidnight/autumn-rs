@@ -4695,6 +4695,7 @@ impl PartitionServer {
                 let rt = compio::runtime::RuntimeBuilder::new()
                     .build()
                     .expect("create compio runtime");
+                autumn_common::cpu_pin::confine_io_workers(&rt);
                 tracing::info!(part_id, cpu_log = ?cpu_log, cpu_bulk = ?cpu_bulk, "P-log thread runtime ready");
                 rt.block_on(async move {
                     if let Err(e) = partition_thread_main(
@@ -10749,6 +10750,7 @@ fn spawn_sst_thread(
                     return;
                 }
             };
+            autumn_common::cpu_pin::confine_io_workers(&rt);
             tracing::info!(part_id, ?cpu, "P-sst thread runtime ready");
             rt.block_on(async move {
                 let pool = Rc::new(ConnPool::new());

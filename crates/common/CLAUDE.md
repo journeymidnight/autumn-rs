@@ -23,6 +23,30 @@ reaches B; `crates/server/tests/cpuset_pinning.rs` starts the real EN (multi-
 and single-shard) and PS binaries under `taskset -c <launcher>` and reads every
 thread's `Cpus_allowed_list` back.
 
+**The runtime's io_uring workers go on the same cores** (`confine_io_workers`,
+called right after each work-unit runtime is built). io_uring runs what it
+cannot complete inline — buffered writes, fsync — on worker threads
+(`iou-wrk-*`) that take the whole NUMA node's cores on 6.1 (all allowed cores from about 6.4), not the
+creating thread's affinity; only `IORING_REGISTER_IOWQ_AFF` or a cgroup cpuset
+(on kernels where io-wq honours it — 6.1 here does) confines them. So
+`--cpuset` meant "the work-unit threads" and not "this process": an EN given six
+cores ran four more cores of page-cache copy and writeback outside them (write
+~2.0 GB/s buffered; confined to its cores by a cgroup cpuset it made ~1.27 GB/s).
+The registration applies to the CALLING task's io-wq, which is why it happens
+on the work-unit thread itself. Cores registered: the explicit `--cpuset`, or the
+detected cores from `--cpu-start` on — the pool the work units are pinned from.
+Linux before 5.14 lacks the call, and newer kernels refuse cores outside the
+task's cgroup cpuset (a PS `--cpuset` wider than its cgroup): one WARN,
+workers unconfined (isolation, not correctness). The polling driver has no io_uring workers. Tests:
+`io_workers_follow_the_registered_cores` (unit; red without the registration —
+the workers take the node's 96 cores) and the `iou-wrk` check in
+`crates/server/tests/cpuset_pinning.rs` (real EN; red with the EN calls removed).
+Only the pinned work-unit runtimes register; the PS main runtime and other
+unpinned threads are not confined. Not covered either: compio's
+`spawn_blocking` pool threads are spawned from the work-unit thread and inherit
+its ONE core, so blocking work (EN fallocate, PS SST building) shares that core
+instead of the `--cpuset`.
+
 Auto-detection pins only where the OS can bind a thread to a core (Linux,
 Android, Windows, FreeBSD). macOS has affinity hints only: `get_core_ids`
 lists every core but `set_for_current` always fails, so once a failed pin

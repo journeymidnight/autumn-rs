@@ -9,9 +9,14 @@ license.workspace = true
 anyhow.workspace = true
 autumn-rpc = { path = "../rpc" }
 core_affinity = "0.8"
+compio.workspace = true
+libc = "0.2"
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+compio = { workspace = true, features = ["fs"] }
 
 [lints]
 workspace = true

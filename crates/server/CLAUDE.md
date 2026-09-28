@@ -45,7 +45,9 @@ autumn-extent-node --data DIR[,DIR2,...] [--port 9101] [--manager 127.0.0.1:9001
   `sched_setaffinity`s to its `--cpuset` core before building its runtime, and a
   core outside the process's cgroup/cpuset stops the EN at startup. It used to go
   through compio's `thread_affinity`, which silently kept the launcher's mask
-  (`crates/common/CLAUDE.md`); `tests/cpuset_pinning.rs` covers EN and PS.
+  (`crates/common/CLAUDE.md`); `tests/cpuset_pinning.rs` covers EN and PS. The
+  runtime then registers the `--cpuset` for its io_uring worker threads
+  (`confine_io_workers`), which would otherwise run on the whole NUMA node.
 - **Static shard ports**: shard count = the `--cpuset` / `--cpu-start` core count; sibling shard *i* listens on `port + i * shard_stride` (`--shard-stride`, default 10). Control ports default to `port + 1000` (override `--control-port`).
 - **Requires pre-formatting**: each `--data` dir MUST be formatted by `autumn-op format` first — the EN refuses to start without the sentinel files (`cluster_id`, `disk_uuid`, `node_id`, `disk_id`, `node_uuid`). It cross-checks each dir's `cluster_id`, then fetches the manager's via `MSG_GET_CLUSTER_ID` and refuses on mismatch. `disk_id` comes from the sentinel; `--disk-id` and `--shards` are migration-error stubs (exit 2).
 

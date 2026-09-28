@@ -480,13 +480,18 @@ Measured, same-period A/B, ext4 on NVMe with power-loss protection:
   0.9 GiB/s on the copy-then-writeback chain), level to +27% on a saturated
   disk, 4-9x less CPU per GiB. Below 1 MiB the tail's second serial write eats
   the gain, hence the gate.
-- 3-node cluster (RF3, 8 partitions, 2 shards per EN, 8 MiB puts, ~2 GB/s, not
-  disk-bound): EN CPU 8.6 -> 4.0 cores, whole machine ~5.5 cores less, but
-  write throughput 4-7.5% LOWER and put p50 ~8% higher; reading the values back
-  right after writing them was ~22% slower (8.1 -> 6.3 GB/s). Where the write
-  loss comes from is not established (candidates: the bounce copy now runs on
-  the shard thread instead of in io-wq workers; 8 MiB pieces are written one
-  after another). That is why it is opt-in.
+- 3-node cluster (RF3, 3 NVMe, 8 partitions, 2 shards per EN, io_uring
+  workers confined to each EN's cores — see `crates/common/CLAUDE.md`):
+  16 x depth-8 8 MiB puts 1296/1317 -> 2000/2026 MB/s (+54%); low load
+  (depth 1) 1 MiB x1 client 308-323 -> 429-432 (+37%), x2 510-520 -> 748-763,
+  8 MiB x1 371-375 -> 514-520 (+39%), x2 647-653 -> 989-1017 (+54%); put p50
+  1 MiB 2.8 -> 2.0 ms, 8 MiB 19.5 -> 14 ms. EN CPU at full load 4.2 -> 3.7 cores
+  (buffered spends ~2.2 of its cores in io_uring workers copying into the page
+  cache and writing back). Smaller gains than the single-disk 2-3.5x because a
+  put also pays client, PS, network and three-replica fan-out, which neither
+  mode changes; the saving per 8 MiB write on the EN (~5.5 ms) matches it.
+- Reading values back right after writing them: 8.1 -> 6.3 GB/s (from disk,
+  not page cache).
 
 What it always costs is read-after-write: a just written range is no longer in
 the page cache, so an immediate read hits the disk (2.5 GB/s instead of

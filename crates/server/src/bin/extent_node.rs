@@ -815,6 +815,7 @@ fn main() -> Result<()> {
                     let rt = compio::runtime::RuntimeBuilder::new()
                         .build()
                         .context("create compio runtime")?;
+                    autumn_common::cpu_pin::confine_io_workers(&rt);
                     tracing::info!(shard_idx, ?cpu, "extent-shard runtime ready");
                     rt.block_on(async move {
                         let addr = autumn_transport::format_listen_addr(&bind_host, listen_port)
@@ -968,6 +969,7 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
     let rt = compio::runtime::RuntimeBuilder::new()
         .build()
         .context("create compio runtime")?;
+    autumn_common::cpu_pin::confine_io_workers(&rt);
     tracing::info!(?cpu, "extent-node (single-shard) runtime ready");
     // control port defaults to port + 1000.
     let ctl_port = args.control_port.unwrap_or(args.port + 1000);

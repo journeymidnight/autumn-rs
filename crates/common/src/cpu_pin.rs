@@ -197,6 +197,98 @@ pub fn pin_current(cpu: Option<usize>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Keep `rt`'s io_uring worker threads (`iou-wrk-*`) on the cores this
+/// process pins its work to. Call it on the work-unit thread, right after
+/// building that thread's runtime: io_uring's workers belong to the calling
+/// task, so the registration covers exactly this runtime's.
+///
+/// `pin_current` binds the work-unit thread, but io_uring runs what it cannot
+/// complete inline — buffered writes, fsync — on its own worker threads, and
+/// those take the whole NUMA node's cores, not the creating thread's affinity.
+/// Only a cgroup cpuset or `IORING_REGISTER_IOWQ_AFF` confines them. Without
+/// this, an extent node given six `--cpuset` cores was measured running four
+/// more cores of page-cache copy and writeback outside them — `--cpuset`
+/// silently meant "the shard threads", not "this process".
+///
+/// Linux before 5.14 has no such registration, and newer kernels refuse cores
+/// outside the task's cgroup cpuset: one WARN, and the workers stay where the
+/// kernel puts them (isolation lost, not correctness). Nothing to do on the
+/// polling driver, which has no io_uring workers, or off Linux.
+pub fn confine_io_workers(rt: &compio::runtime::Runtime) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if !rt.driver_type().is_iouring() {
+            return;
+        }
+        let cores = io_worker_cores();
+        if cores.is_empty() {
+            return;
+        }
+        if let Err(e) = register_io_worker_cores(rt.as_raw_fd(), &cores) {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    error = %e,
+                    ?cores,
+                    "cannot confine io_uring worker threads to the cpuset \
+                     (Linux < 5.14, or cpuset cores outside the cgroup's); \
+                     --cpuset binds only the work-unit threads"
+                )
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = rt;
+}
+
+/// The cores work units are pinned from: the explicit `--cpuset`, or the
+/// detected cores from `--cpu-start` on (to the end of the mask, like the pool
+/// `pick_cpu_for_ord` draws from — it can include a co-located process's cores).
+#[cfg(target_os = "linux")]
+fn io_worker_cores() -> Vec<usize> {
+    let cores = available_cpu_cores();
+    if CPU_SET_OVERRIDE.get().is_some() {
+        return cores.to_vec();
+    }
+    let offset = CPU_OFFSET.load(Ordering::Relaxed);
+    cores.get(offset..).unwrap_or_default().to_vec()
+}
+
+/// `IORING_REGISTER_IOWQ_AFF`: the io-wq of the CALLING task (the one that
+/// owns `ring`) runs its workers on `cores` only.
+#[cfg(target_os = "linux")]
+fn register_io_worker_cores(ring: std::os::fd::RawFd, cores: &[usize]) -> std::io::Result<()> {
+    const IORING_REGISTER_IOWQ_AFF: libc::c_uint = 17;
+    // SAFETY: cpu_set_t is plain bits; all-zero is the empty set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    let mut any = false;
+    for &c in cores.iter().filter(|&&c| c < libc::CPU_SETSIZE as usize) {
+        // SAFETY: `c` is below CPU_SETSIZE, so the bit is inside `set`.
+        unsafe { libc::CPU_SET(c, &mut set) };
+        any = true;
+    }
+    if !any {
+        return Err(std::io::Error::other(
+            "no core below CPU_SETSIZE to register",
+        ));
+    }
+    // SAFETY: `set` outlives the call, and the length passed is its size.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_io_uring_register,
+            ring,
+            IORING_REGISTER_IOWQ_AFF,
+            &set as *const libc::cpu_set_t,
+            std::mem::size_of::<libc::cpu_set_t>(),
+        )
+    };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -264,5 +356,56 @@ mod tests {
     fn parse_cpuset_garbage_errors() {
         assert!(parse_cpuset("a").is_err());
         assert!(parse_cpuset("1-x").is_err());
+    }
+
+    /// Registered cores reach the io_uring workers that the runtime spawns
+    /// for punted work (buffered writes, fsync) — without it they take the
+    /// whole NUMA node.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn io_workers_follow_the_registered_cores() {
+        let target = core_affinity::get_core_ids().unwrap().last().unwrap().id;
+        std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            let rt = compio::runtime::Runtime::new().unwrap();
+            assert!(
+                rt.driver_type().is_iouring(),
+                "io_uring unavailable here; this test needs it"
+            );
+            register_io_worker_cores(rt.as_raw_fd(), &[target]).unwrap();
+            // SAFETY: gettid has no preconditions.
+            let me = unsafe { libc::gettid() };
+            let dir = std::env::temp_dir().join(format!("iowq-aff-{me}"));
+            rt.block_on(async {
+                use compio::io::AsyncWriteAtExt;
+                let mut f = compio::fs::File::create(&dir).await.unwrap();
+                for i in 0..64u64 {
+                    f.write_all_at(vec![7u8; 1 << 16], i << 16).await.0.unwrap();
+                    f.sync_data().await.unwrap();
+                }
+            });
+            let mut workers = Vec::new();
+            for task in std::fs::read_dir("/proc/self/task").unwrap().flatten() {
+                let comm = std::fs::read_to_string(task.path().join("comm")).unwrap_or_default();
+                if comm.trim() != format!("iou-wrk-{me}") {
+                    continue;
+                }
+                let status = std::fs::read_to_string(task.path().join("status")).unwrap();
+                let list = status
+                    .lines()
+                    .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+                    .unwrap()
+                    .trim()
+                    .to_string();
+                workers.push(parse_cpuset(&list).unwrap());
+            }
+            std::fs::remove_file(&dir).unwrap();
+            assert!(!workers.is_empty(), "no io_uring worker was spawned");
+            for w in workers {
+                assert_eq!(w, vec![target]);
+            }
+        })
+        .join()
+        .unwrap();
     }
 }

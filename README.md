@@ -179,10 +179,10 @@ The workload and the captured request contract are documented in
 | `cluster.sh` | dev / chaos / perf **testing only** (raw process kill for fault injection) | [`docs/ops.md`](docs/ops.md) |
 
 Extent nodes on Linux can write large appends around the page cache with
-`--direct-io` (launchers: `AUTUMN_EXTENT_DIRECT_IO=1`; off by default). It halves the
-extent nodes' write CPU, but data just written is then read from disk rather than
-memory, and write throughput came out a few percent lower in a cluster test — see
-"Direct I/O on the extent nodes" in [`docs/ops.md`](docs/ops.md) before turning it on.
+`--direct-io` (launchers: `AUTUMN_EXTENT_DIRECT_IO=1`; off by default). Large writes
+got 37-54% faster in a cluster test, but data just written is then read from disk
+rather than memory — see "Direct I/O on the extent nodes" in
+[`docs/ops.md`](docs/ops.md) before turning it on.
 
 UCX (RDMA) builds are opt-in: `cargo build --release -p autumn-server --features ucx`.
 With `TRANSPORT=ucx`, the launchers (`autumn-deploy`, `cluster.sh`) set the UCX env

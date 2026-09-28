@@ -310,5 +310,39 @@ fn cpuset_moves_threads_off_a_narrower_launcher_mask() {
         "P-sst"
     );
 
+    // io_uring's worker threads (`iou-wrk-*`) run the work the ring punts —
+    // buffered writes, fsync — and take the NUMA node's cores unless the
+    // runtime registers the cpuset for them. Opening the partition allocated
+    // extents on the EN, so its shards have punted work by now.
+    let en_workers = io_workers(en.pid());
+    eprintln!(
+        "iou-wrk: en={} single={} ps={}",
+        en_workers.len(),
+        io_workers(single.pid()).len(),
+        io_workers(ps.pid()).len()
+    );
+    assert!(!en_workers.is_empty(), "the EN spawned no io_uring worker");
+    for (pid, cpuset, what) in [
+        (en.pid(), vec![en_a, en_b], "EN"),
+        (single.pid(), vec![en_single], "single-shard EN"),
+        (ps.pid(), vec![p_log, p_sst], "PS"),
+    ] {
+        for w in io_workers(pid) {
+            assert!(
+                w.iter().all(|c| cpuset.contains(c)),
+                "{what}: io_uring worker allowed on {w:?}, outside --cpuset {cpuset:?}"
+            );
+        }
+    }
+
     drop((ps, single, en));
+}
+
+/// `Cpus_allowed_list` of every io_uring worker thread of `pid`.
+fn io_workers(pid: u32) -> Vec<Vec<usize>> {
+    thread_affinities(pid)
+        .into_iter()
+        .filter(|(comm, _)| comm.starts_with("iou-wrk"))
+        .map(|(_, cores)| cores)
+        .collect()
 }
