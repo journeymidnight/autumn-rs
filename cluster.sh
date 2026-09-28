@@ -400,12 +400,18 @@ launch_extent_node() {
     if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
         metrics_args=(--metrics-port "$(( 9600 + i ))")
     fi
+    # AUTUMN_EXTENT_DIRECT_IO=1 → --direct-io (O_DIRECT for append bursts
+    # >= 1 MiB). The data dirs must take O_DIRECT (a filesystem that refuses
+    # it, e.g. tmpfs before Linux 6.6, makes the EN refuse to start).
+    local -a dio_args=()
+    [[ "${AUTUMN_EXTENT_DIRECT_IO:-0}" == "1" ]] && dio_args=(--direct-io)
     start_proc "node$i" \
         "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
         --listen "$BIND_HOST" --transport "$TRANSPORT" \
         --advertise "${BIND_HOST}:$port" \
         ${stride_args[@]:+"${stride_args[@]}"} \
         ${metrics_args[@]:+"${metrics_args[@]}"} \
+        ${dio_args[@]:+"${dio_args[@]}"} \
         ${cpu_args[@]:+"${cpu_args[@]}"}
     wait_port "$port" "node$i"
 }

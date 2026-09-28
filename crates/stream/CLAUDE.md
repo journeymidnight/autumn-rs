@@ -411,7 +411,8 @@ Append(AppendReq via autumn-rpc binary frame):
   6. Write payload (Direct path, serialized by the per-extent OWNER — see
      "Per-extent owner (write path)"). Appends are messages to ONE owner task
      per extent, so the write is single-writer by construction:
-       - write_vectored_all_at(start, payload)   (see note 25a: MUST be *_all)
+       - write_append_burst(start, payload)     (see note 25a: MUST be *_all;
+         buffered pwritev, or O_DIRECT under --direct-io — next section)
        - ONE sync_data per drained burst: pending_fsync.store(end) BEFORE the
          fsync, last_synced.store(end) AFTER — the two watermarks are all that
          remains of the old Coalescer struct. Every burst fsyncs
@@ -424,6 +425,89 @@ Append(AppendReq via autumn-rpc binary frame):
 Returning `end=N` means all data in `0..N` is written. Step 5 (commit-based
 truncation) is the consistency key: the data files themselves are the journal,
 replacing a WAL.
+
+### Direct I/O for large bursts (`--direct-io`, `direct_io.rs`)
+
+Off by default. With it, step 6's write goes through `write_append_burst`, used
+by BOTH append paths (the owner's `append_burst_frames` and the non-batched
+`handle_append`): a burst of at least `DIRECT_IO_MIN_BYTES` (1 MiB) writes its
+4 KiB-aligned part with O_DIRECT, and everything else stays the buffered
+`pwritev`. The burst's single `sync_data` is unchanged and still the ACK gate.
+
+**The file is never padded.** An extent's length after a restart is the `.dat`
+size (`load_extents`), and that length is what the commit protocol takes as
+this replica's committed end; padding to a block boundary would be read back as
+data and silently diverge the replicas. So a burst `[start, end)` is written as
+`[a0, start)` read back from the page cache and copied in front of the payload,
+`[a0, floor(end))` O_DIRECT from a bounce buffer, then — only after that
+completes — the sub-block tail `[floor(end), end)` buffered. The two forbidden
+orders are a buffered head with a direct body (the direct write can reach the
+disk while the head is still dirty: zeros inside the file size after a crash)
+and the tail before the body (the file size covers bytes not yet written). The
+rewritten head bytes are already durable from the previous burst, so rewriting
+them with the same content is harmless.
+
+The O_DIRECT descriptor is reopened per burst through `/proc/self/fd/<fd>` of
+the resident buffered fd, so it names the same inode whatever was renamed over
+the path, stays out of `FdLru`'s one-fd-per-extent accounting, and needs no
+invalidation when the fd is evicted or replaced. The cost is one open/close per
+direct burst and one extra fd per extent while its burst is in flight. The bounce buffer is an
+over-allocated `Vec` offset to 4 KiB (no `unsafe`), filled and written in 8 MiB
+pieces, with a few pooled per shard thread; the copy that used to happen in the
+kernel (into the page cache) happens there instead.
+
+**A filesystem without O_DIRECT fails startup.** Non-Linux fails
+`ExtentNode::new`, and so does a data dir whose `disk_id` sentinel (written by
+`autumn-op format`, read by every EN start anyway) cannot be opened read-only
+with O_DIRECT (`direct_io::check`) — EINVAL from a filesystem that has none,
+e.g. tmpfs before Linux 6.6. Without it, such a node would start, and every
+burst of 1 MiB or more would fail at the reopen while the disk's buffered
+self-check keeps passing, so the disk would stay allocatable and large writes
+would fail for good. The check writes nothing, so a full, failing or
+read-only disk can never be mistaken for a filesystem without O_DIRECT. What it
+does not check: the 4 KiB write alignment (only a device with logical blocks
+above 4 KiB refuses it, as an EINVAL on the first large append, never as bad
+bytes) and a filesystem that ACCEPTS O_DIRECT and quietly buffers it (ext4
+`data=journal`, inline-data inodes, tmpfs from 6.6): bytes are right, only the
+saving is gone — check with bpftrace (`kprobe:__iomap_dio_rw`, count by pid)
+while writing. Startup logs `direct-io on` per shard. A runtime direct-write
+error says `O_DIRECT append burst at <offset>: ...`, errno text kept for the
+disk-error classifier.
+
+Measured, same-period A/B, ext4 on NVMe with power-loss protection:
+- Single-disk microbenchmark: at 1 MiB and above the direct path is 2-3.5x
+  faster with one or two writers per disk (buffered single-stream tops out near
+  0.9 GiB/s on the copy-then-writeback chain), level to +27% on a saturated
+  disk, 4-9x less CPU per GiB. Below 1 MiB the tail's second serial write eats
+  the gain, hence the gate.
+- 3-node cluster (RF3, 8 partitions, 2 shards per EN, 8 MiB puts, ~2 GB/s, not
+  disk-bound): EN CPU 8.6 -> 4.0 cores, whole machine ~5.5 cores less, but
+  write throughput 4-7.5% LOWER and put p50 ~8% higher; reading the values back
+  right after writing them was ~22% slower (8.1 -> 6.3 GB/s). Where the write
+  loss comes from is not established (candidates: the bounce copy now runs on
+  the shard thread instead of in io-wq workers; 8 MiB pieces are written one
+  after another). That is why it is opt-in.
+
+What it always costs is read-after-write: a just written range is no longer in
+the page cache, so an immediate read hits the disk (2.5 GB/s instead of
+~34 GB/s from cache in the microbenchmark). The gate is on the burst
+TOTAL, so a coalesced burst of many small WAL appends goes direct too — and
+the log stream is exactly where a GET reads a value shortly after its PUT.
+Other writers of `.dat` (recovery, re_avali, the peer copy) and EC shard
+staging stay buffered.
+
+Tests: `direct_io::tests` (every head/tail alignment, multi-chunk bursts,
+byte-exact content and exact size; removing the head read-back turns three of
+them red), `direct_io_appends_land_byte_exact` (both append paths route through
+O_DIRECT — a burst that silently went buffered fails it),
+`direct_io_on_tmpfs_follows_the_filesystem` (starts iff tmpfs itself takes
+O_DIRECT; red with the flag dropped from the check),
+`check_opens_the_sentinel_with_o_direct`, `direct_write_error_keeps_the_disk_class`,
+and `disk_probe_survives_a_leftover_scratch_file` (the disk self-check, note
+25a: a scratch name left by a crash with the same pid — a container EN is often
+pid 1 — meant EEXIST, classified Media, a healthy disk faulted; the name is now
+cleared first). The tests
+write under the crate directory, not `/tmp`, because `/tmp` may be tmpfs.
 
 ### Commit protocol — all-replica, NO quorum
 
@@ -796,6 +880,7 @@ is where bytes/s + iops limits matter.
 | `--recovery-parallelism` | `AUTUMN_EXTENT_RECOVERY_PARALLELISM` | 2 | [1, 16] |
 | `--ec-stripe-bytes` | `AUTUMN_EXTENT_EC_STRIPE_BYTES` (test override) | 64 MiB | [1 MiB, 1 GiB] |
 | `--fd-cache-cap` | `AUTUMN_EXTENT_FD_CACHE_CAP` | 4096 | floored 64, clamped by shard count |
+| `--direct-io` | `AUTUMN_EXTENT_DIRECT_IO=1` | off | Linux only; startup O_DIRECT open of each `disk_id` |
 
 `--ec-stripe-bytes` (process-global, `set_ec_encode_stripe_bytes`, OnceLock
 first-call-wins; precedence flag > env > default) is the chunked EC-convert

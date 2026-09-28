@@ -85,6 +85,10 @@ struct Args {
     /// max resident SEALED-extent fds cached per shard. `None` =
     /// library default (4096). Bounds open fds on a node with many extents.
     fd_cache_cap: Option<usize>,
+    /// `--direct-io`: append bursts of 1 MiB and more bypass the page cache
+    /// for their aligned part. Linux only; startup fails if any data dir's
+    /// filesystem refuses O_DIRECT.
+    direct_io: bool,
     /// Per-thread regpool cap (pinned/registered bytes). `None` = library
     /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB].
     ucx_regpool_cap_bytes: Option<usize>,
@@ -128,6 +132,7 @@ fn parse_args() -> Args {
     let mut inflight_cap: Option<usize> = None;
     let mut ec_stripe_bytes: Option<usize> = None;
     let mut fd_cache_cap: Option<usize> = None;
+    let mut direct_io = false;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut advertise: Option<String> = None;
 
@@ -233,6 +238,7 @@ fn parse_args() -> Args {
                 ec_stripe_bytes =
                     Some(args[i].parse().expect("--ec-stripe-bytes must be a number"));
             }
+            "--direct-io" => direct_io = true,
             "--fd-cache-cap" => {
                 i += 1;
                 fd_cache_cap =
@@ -290,6 +296,7 @@ fn parse_args() -> Args {
         inflight_cap,
         ec_stripe_bytes,
         fd_cache_cap,
+        direct_io,
         ucx_regpool_cap_bytes,
         metrics_port,
         metrics_listen,
@@ -312,7 +319,7 @@ fn apply_extent_tunables(
     if let Some(n) = args.inflight_cap {
         cfg = cfg.with_inflight_cap(n);
     }
-    cfg
+    cfg.with_direct_io(args.direct_io)
 }
 
 /// async manager cross-check. Connects to the manager once,
@@ -791,6 +798,7 @@ fn main() -> Result<()> {
         let ec_par = args.ec_convert_parallelism;
         let rec_par = args.recovery_parallelism;
         let inflight = args.inflight_cap;
+        let direct_io = args.direct_io;
         // Fail-stop: any shard exit (Err / panic / unexpected clean return)
         // calls `std::process::exit(1)` directly. The join loop below is
         // therefore unreachable in steady state — its only role is to park
@@ -890,6 +898,7 @@ fn main() -> Result<()> {
                         if let Some(n) = inflight {
                             cfg = cfg.with_inflight_cap(n);
                         }
+                        cfg = cfg.with_direct_io(direct_io);
 
                         tracing::info!(
                             shard_idx,

@@ -240,6 +240,8 @@ run_extent_node() {
     # bound resident sealed-extent fds (default 4096 in the
     # binary). env→flag in the shell layer, never read in Rust.
     [[ -n "${AUTUMN_EXTENT_FD_CACHE_CAP:-}" ]] && args+=(--fd-cache-cap "$AUTUMN_EXTENT_FD_CACHE_CAP")
+    # O_DIRECT for append bursts >= 1 MiB; the data volume must accept it.
+    [[ "${AUTUMN_EXTENT_DIRECT_IO:-0}" == "1" ]] && args+=(--direct-io)
     log "exec autumn-extent-node ${args[*]}"
     exec autumn-extent-node "${args[@]}"
 }

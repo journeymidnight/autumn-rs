@@ -627,6 +627,14 @@ impl DiskFS {
             std::process::id(),
             NEXT_PROBE.fetch_add(1, Ordering::Relaxed)
         ));
+        // A crash between create and unlink leaves this name behind, and a
+        // container EN is often pid 1 with the counter starting over: the
+        // next self-check to draw it would fail EEXIST — classified Media,
+        // faulting a healthy disk. The name is ours; clear it first.
+        match compio::fs::remove_file(&path).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -934,6 +942,12 @@ pub struct ExtentNodeConfig {
     /// `None` = not self-registered (`--advertise` unset) → the manager skips
     /// the echo-based drift-heal / imposter checks.
     pub registration: Option<NodeRegistration>,
+    /// `--direct-io`: append bursts of 1 MiB and more write their aligned
+    /// part with O_DIRECT (see `direct_io`). Off by default, Linux only; a data
+    /// directory whose `disk_id` cannot be opened O_DIRECT stops the node —
+    /// including one built with `ExtentNodeConfig::new`, which reads no
+    /// `disk_id`, so a caller turning this on there must write one.
+    pub direct_io: bool,
 }
 
 impl ExtentNodeConfig {
@@ -949,6 +963,7 @@ impl ExtentNodeConfig {
             recovery_parallelism: 2,
             inflight_cap: 64,
             registration: None,
+            direct_io: false,
         }
     }
 
@@ -965,6 +980,7 @@ impl ExtentNodeConfig {
             recovery_parallelism: 2,
             inflight_cap: 64,
             registration: None,
+            direct_io: false,
         }
     }
 
@@ -977,6 +993,12 @@ impl ExtentNodeConfig {
     /// recovery parallelism setter. Clamped to [1, 16].
     pub fn with_recovery_parallelism(mut self, n: usize) -> Self {
         self.recovery_parallelism = n.clamp(1, 16);
+        self
+    }
+
+    /// See the `direct_io` field.
+    pub fn with_direct_io(mut self, on: bool) -> Self {
+        self.direct_io = on;
         self
     }
 
@@ -1829,6 +1851,8 @@ pub struct ExtentNode {
     /// M1b: this EN's own identity, echoed in `handle_df`
     /// (default/empty when `--advertise` was not passed).
     registration: Rc<NodeRegistration>,
+    /// `ExtentNodeConfig.direct_io`, checked at construction.
+    direct_io: bool,
 }
 
 impl Clone for ExtentNode {
@@ -1856,6 +1880,7 @@ impl Clone for ExtentNode {
             concurrency_ctrl: self.concurrency_ctrl.clone(),
             inflight_cap: self.inflight_cap,
             registration: self.registration.clone(),
+            direct_io: self.direct_io,
         }
     }
 }
@@ -2864,7 +2889,7 @@ fn batch_append_reject(
 /// every byte lands or a real error surfaces), and the offset advances by exactly
 /// the bytes the previous chunks carried, so the concatenation on disk is
 /// identical to what one giant pwritev would have written.
-async fn write_vectored_all_at_chunked(
+pub(crate) async fn write_vectored_all_at_chunked(
     // `mut` on the BINDING, not the file: the trait method takes `&mut self` and
     // the impl is on `&File`, so what has to be mutable is the reference.
     mut f: &CompioFile,
@@ -2887,6 +2912,36 @@ async fn write_vectored_all_at_chunked(
         rest = tail;
     }
     Ok(())
+}
+
+/// Write one append burst (`bufs` concatenated) at `at`, `_all` semantics.
+/// With `--direct-io`, a burst of at least `DIRECT_IO_MIN_BYTES` bypasses the
+/// page cache for its aligned part (see `direct_io`); everything else is the
+/// buffered `pwritev`. Durability is still the caller's one `sync_data`.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+async fn write_append_burst(
+    f: &CompioFile,
+    bufs: Vec<Bytes>,
+    at: u64,
+    direct_io: bool,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if direct_io
+        && bufs.iter().map(|b| b.len() as u64).sum::<u64>() >= crate::direct_io::DIRECT_IO_MIN_BYTES
+    {
+        return crate::direct_io::write_burst_direct(f, bufs, at)
+            .await
+            .map_err(|e| direct_write_error(at, e));
+    }
+    write_vectored_all_at_chunked(f, bufs, at).await
+}
+
+/// Say that a failed append went through the direct path. The errno text stays
+/// in the message because that is what `classify_disk_error` reads: an ENOSPC
+/// must still mark the disk Full, not suspect the media.
+#[cfg(target_os = "linux")]
+fn direct_write_error(at: u64, e: std::io::Error) -> std::io::Error {
+    std::io::Error::new(e.kind(), format!("O_DIRECT append burst at {at}: {e}"))
 }
 
 // ==================================================================
@@ -3262,7 +3317,7 @@ async fn append_burst_frames(
         // zeros). The `_all` form loops until every byte is written or a
         // real error (ENOSPC once nothing fits) surfaces — errors here
         // reject the batch, never ack.
-        let wr = write_vectored_all_at_chunked(f, bufs, file_start).await;
+        let wr = write_append_burst(f, bufs, file_start, node.direct_io).await;
         if let Err(e) = wr {
             let msg = e.to_string();
             node.mark_disk_error_for_extent(extent_id, &msg).await;
@@ -3697,6 +3752,28 @@ impl ExtentNode {
             let disk_id = disk.disk_id;
             disk_map.insert(disk_id, Rc::new(disk));
         }
+        // No silent fallback: a node asked for O_DIRECT on a filesystem that
+        // does not support it refuses to start, rather than fail every large
+        // append at runtime while the disk still looks healthy.
+        if config.direct_io {
+            #[cfg(target_os = "linux")]
+            for disk in disk_map.values() {
+                let dir = disk.base_dir.display();
+                crate::direct_io::check(&disk.base_dir)
+                    .await
+                    .with_context(|| {
+                        format!("--direct-io: cannot open {dir}/disk_id with O_DIRECT")
+                    })?;
+            }
+            #[cfg(not(target_os = "linux"))]
+            anyhow::bail!("--direct-io is only supported on Linux");
+            #[cfg(target_os = "linux")]
+            tracing::info!(
+                shard_idx = config.shard_idx,
+                min_burst_bytes = crate::direct_io::DIRECT_IO_MIN_BYTES,
+                "direct-io on: append bursts at or above min_burst_bytes write their aligned part with O_DIRECT"
+            );
+        }
 
         // Observability batch 1: register this instance's gauge slot —
         // the registry holds a Weak, so a dropped/failed-init node is
@@ -3764,6 +3841,7 @@ impl ExtentNode {
             ),
             inflight_cap: config.inflight_cap.max(1),
             registration: Rc::new(config.registration.unwrap_or_default()),
+            direct_io: config.direct_io,
         };
 
         // Load existing extents from all disks.
@@ -8415,7 +8493,9 @@ impl ExtentNode {
                 "extent sealed (fd evicted) — retry on a fresh tail".to_string(),
             ));
         };
-        if let Err(e) = file_pwrite(af.clone(), start, data_payload.clone()).await {
+        if let Err(e) =
+            write_append_burst(&af, vec![data_payload.clone()], start, self.direct_io).await
+        {
             let msg = e.to_string();
             self.mark_disk_error_for_extent(req.extent_id, &msg).await;
             return Err((StatusCode::Internal, msg));
@@ -11280,6 +11360,27 @@ mod enospc_disk_health_tests {
         );
     }
 
+    /// A self-check scratch name left by an earlier boot of the same pid (a
+    /// crash between create and unlink) must not fail the self-check — that
+    /// would read as a media fault and fault a healthy disk.
+    #[compio::test]
+    async fn disk_probe_survives_a_leftover_scratch_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .unwrap();
+        node.ensure_extent(6200).await.unwrap();
+        let disk = node.disk_for(1).unwrap();
+        let hash_dir = disk.extent_path(6200).parent().unwrap().to_path_buf();
+        for n in 0..1024 {
+            let name = format!(".disk-probe-{}-{n}", std::process::id());
+            std::fs::write(hash_dir.join(name), b"stale").unwrap();
+        }
+        disk.probe_write(6200)
+            .await
+            .expect("stale scratch name failed the self-check");
+    }
+
     #[compio::test]
     async fn disk_probe_timeout_faults_without_blocking_error_handling() {
         let dir = tempfile::tempdir().unwrap();
@@ -11399,6 +11500,133 @@ mod enospc_disk_health_tests {
 #[cfg(test)]
 mod sealed_append_guard_tests {
     use super::*;
+
+    /// `--direct-io` reaches both append paths: a burst of 1 MiB and more goes
+    /// through O_DIRECT, a smaller one does not, and either way the file holds
+    /// exactly the acked bytes with an exact size (its size IS the extent's
+    /// length after a restart).
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn direct_io_appends_land_byte_exact() {
+        use crate::direct_io::DIRECT_BYTES;
+        // Not /tmp: it may be tmpfs, which refuses O_DIRECT.
+        let dir = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).expect("tempdir");
+        std::fs::write(dir.path().join("disk_id"), b"1").unwrap();
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1).with_direct_io(true);
+        let node = ExtentNode::new(config).await.expect("ExtentNode::new");
+        node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: 77 }))
+            .await
+            .expect("alloc");
+        let payload = |seed: u8, n: usize| {
+            Bytes::from(
+                (0..n)
+                    .map(|i| (i as u8).wrapping_mul(31) ^ seed)
+                    .collect::<Vec<u8>>(),
+            )
+        };
+        let req = |commit: u64, p: &Bytes| AppendReq {
+            extent_id: 77,
+            eversion: 1,
+            commit,
+            owner_epoch: 0,
+            payload: p.clone(),
+        };
+        let mut want: Vec<u8> = Vec::new();
+
+        // Non-batched path: a small append stays buffered, a large one at an
+        // unaligned offset goes direct.
+        for p in [payload(1, 1001), payload(2, (1 << 20) + 333)] {
+            let before = DIRECT_BYTES.with(|c| c.get());
+            let r = AppendResp::decode(
+                node.handle_append(req(want.len() as u64, &p).encode())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(r.code, CODE_OK);
+            let direct = DIRECT_BYTES.with(|c| c.get()) - before;
+            assert_eq!(
+                direct > 0,
+                p.len() >= 1 << 20,
+                "direct bytes {direct} for {} B",
+                p.len()
+            );
+            want.extend_from_slice(&p);
+        }
+
+        // Owner burst path: three contiguous appends, 1 MiB+ in total.
+        let parts = [payload(3, 5), payload(4, 700_000), payload(5, 400_001)];
+        let mut commit = want.len() as u64;
+        let slots: Vec<AppendSlot> = parts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let s = AppendSlot {
+                    req: req(commit, p),
+                    req_id: i as u32,
+                };
+                commit += p.len() as u64;
+                s
+            })
+            .collect();
+        let before = DIRECT_BYTES.with(|c| c.get());
+        let extent = node.extents.get(&77).unwrap().clone();
+        let frames = append_burst_frames(node.clone(), extent, slots).await.await;
+        assert_eq!(frames.len(), 3);
+        assert!(
+            DIRECT_BYTES.with(|c| c.get()) > before,
+            "burst did not go direct"
+        );
+        for p in &parts {
+            want.extend_from_slice(p);
+        }
+
+        let path = dir
+            .path()
+            .join(format!("{:02x}", DiskFS::hash_byte(77)))
+            .join("extent-77.dat");
+        let got = std::fs::read(&path).unwrap();
+        assert_eq!(got.len(), want.len(), "file size must be the acked length");
+        assert!(got == want, "file content differs from the acked appends");
+    }
+
+    /// The direct path's error context must not hide the errno from the disk
+    /// classifier: a full disk has to read as Capacity, not as a media fault.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_write_error_keeps_the_disk_class() {
+        let e = direct_write_error(4096, std::io::Error::from_raw_os_error(libc::ENOSPC));
+        assert!(e.to_string().starts_with("O_DIRECT append burst at 4096: "));
+        assert!(matches!(
+            ExtentNode::classify_disk_error(&e.to_string()),
+            DiskErrorClass::Capacity
+        ));
+    }
+
+    /// A node on tmpfs starts with `--direct-io` exactly when tmpfs itself
+    /// takes O_DIRECT (it refuses before Linux 6.6, accepts and buffers
+    /// after), so the check really asks the filesystem.
+    #[cfg(target_os = "linux")]
+    #[compio::test]
+    async fn direct_io_on_tmpfs_follows_the_filesystem() {
+        use std::os::unix::fs::OpenOptionsExt;
+        let dir = tempfile::tempdir_in("/dev/shm").expect("tempdir on tmpfs");
+        let fs_takes_it = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(dir.path().join("raw"))
+            .is_ok();
+        std::fs::write(dir.path().join("disk_id"), b"1").unwrap();
+        let config = ExtentNodeConfig::new(dir.path().to_path_buf(), 1).with_direct_io(true);
+        match ExtentNode::new(config).await {
+            Ok(_) => assert!(fs_takes_it, "started although tmpfs refuses O_DIRECT"),
+            Err(e) => {
+                assert!(!fs_takes_it, "refused although tmpfs takes O_DIRECT: {e:#}");
+                assert!(format!("{e:#}").contains("with O_DIRECT"), "{e:#}");
+            }
+        }
+    }
 
     /// handle_append returns CODE_PRECONDITION when sealed_length > 0.
     ///

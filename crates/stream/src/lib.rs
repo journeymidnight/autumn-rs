@@ -2,6 +2,8 @@ pub mod client;
 pub mod conn_pool;
 pub mod erasure;
 pub mod extent_node;
+#[cfg(target_os = "linux")]
+mod direct_io;
 mod extent_cksum;
 mod extent_scrub;
 /// extent_rpc relocated to autumn-rpc (joins manager_rpc /

@@ -85,6 +85,12 @@ Instance derivation: `en<i>` binds `EN_BASE_PORT+i`; `ps<i>` gets `psid i+1` and
 base `PS_BASE_PORT+i*PS_PORT_STRIDE`. Run multiple isolated clusters on one host
 by also setting `ETCD_CLIENT_BASE_PORT` / `ETCD_PEER_BASE_PORT`.
 
+`AUTUMN_EXTENT_DIRECT_IO=1` (in the topology file or the environment) starts the
+extent nodes with `--direct-io`: append bursts of 1 MiB and more bypass the page
+cache. Linux only, and every EN data dir must accept O_DIRECT or that EN refuses
+to start. Trade-offs and how to verify it: "Direct I/O on the extent nodes" in
+[`ops.md`](ops.md).
+
 ## Commands
 
 ```bash

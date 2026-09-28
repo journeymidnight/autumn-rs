@@ -1097,6 +1097,66 @@ some bytes fit) as success — a partial value was ACKed and read back
 zero-padded. Fixed with the write-all form; the invariant is documented
 in `crates/stream/CLAUDE.md` note 25a.
 
+## Direct I/O on the extent nodes (`--direct-io`)
+
+Off by default. `AUTUMN_EXTENT_DIRECT_IO=1` makes `cluster.sh`, the k8s
+entrypoint and `autumn-deploy` pass `--direct-io`: append bursts of 1 MiB and
+more write their 4 KiB-aligned part with O_DIRECT; the sub-block tail and every
+smaller burst stay buffered, and every burst is still fsynced before it is
+ACKed. The `.dat` size stays byte-exact (it is the extent's length after a
+restart). Design: `crates/stream/CLAUDE.md`, "Direct I/O for large bursts".
+
+What to expect (3-node RF3 cluster on one host, NVMe with power-loss
+protection, ext4, 8 partitions, 2 shards per EN, 16 x depth-8 clients of
+8 MiB puts, same-period A/B):
+
+| | buffered (default) | `--direct-io` |
+|---|---|---|
+| 8 MiB write | 1970-2028 MB/s | 1870-1984 MB/s (4-7.5% lower) |
+| EN CPU during it | 8.6 cores | 4.0 cores |
+| whole machine | ~13 cores | ~7.6 cores |
+| reading those values right back | 8.1 GB/s | 6.3 GB/s (from disk, not page cache) |
+| 4 KiB write | 48-60k ops/s | 47-71k ops/s (noise; bursts rarely reach 1 MiB) |
+
+So it is a CPU trade: turn it on where extent-node CPU is the constraint (many
+disks per node) and data is not read back right after it is written. On a
+single disk with only one or two writers the direct path was 2-3.5x faster in
+a microbenchmark; in the cluster above it was not.
+
+Requirements and failure modes:
+- Linux only; the EN refuses the flag elsewhere.
+- At startup the EN opens each data dir's `disk_id` read-only with O_DIRECT
+  (nothing is written). A filesystem without O_DIRECT (tmpfs before Linux 6.6,
+  such as a k8s `emptyDir` with `medium: Memory`) stops the EN with
+  `--direct-io: cannot open <dir>/disk_id with O_DIRECT`. The cost is one
+  open() per disk per shard. Without the flag nothing is checked.
+- A filesystem that accepts O_DIRECT and quietly buffers it (ext4
+  `data=journal`, tmpfs from Linux 6.6) passes the check; confirm the direct path
+  is really taken (below).
+- A direct write failing at runtime is logged as `O_DIRECT append burst at
+  <offset>: ...`.
+
+Verify on a running EN:
+
+```bash
+# 1. the flag took: one line per shard
+grep 'direct-io on' /tmp/autumn-rs-logs/node1.log
+# 2. writes really go direct: count kernel direct-IO calls per process while
+#    writing large values (>= 1 MiB); the EN pids should show thousands
+bpftrace -e 'kprobe:__iomap_dio_rw { @[pid, comm] = count(); } interval:s:10 { exit(); }' &
+autumn-client --manager 127.0.0.1:9001 perf-check --threads 16 --duration 8 --size 8388608
+# 3. bytes survive a restart: put odd sizes, restart the whole cluster, compare
+for sz in 5000 1048577 3145851 17829887; do head -c $sz /dev/urandom > /tmp/v$sz
+  autumn-client --manager 127.0.0.1:9001 --namespace bench put dio-$sz /tmp/v$sz; done
+AUTUMN_EXTENT_DIRECT_IO=1 ./cluster.sh restart 3 --3disk   # wait for 'partition server serving'
+for sz in 5000 1048577 3145851 17829887; do
+  autumn-client --manager 127.0.0.1:9001 --namespace bench get dio-$sz | cmp - /tmp/v$sz && echo ok $sz; done
+```
+
+When comparing buffered and direct yourself, alternate the two in the same
+period (A/B/A/B): this host's NVMe throughput drifts by tens of percent over
+hours (IOMMU IOVA allocator state), which swamps the difference.
+
 ## WAL replay self-heal (log_stream bit-rot / truncated replica)
 
 Partition open replays `log_stream`. If a sealed extent's serving replica
