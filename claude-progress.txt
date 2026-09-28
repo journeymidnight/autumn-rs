@@ -1,3 +1,12 @@
+Date: 2026-09-28 (6)
+TaskStatus: completed
+Task scope: user report "UCX 启动检查可能误报成功": the EN logged "listening" before ExtentNode::new (O_DIRECT check), cluster.sh's UCX wait grepped that line, so an EN that then died on a data dir refusing O_DIRECT was reported up.
+Current summary: serve_with_control takes an on_bound callback run after its listener(s) are bound (UCX now binds the data listener inline too). The binary logs "autumn-extent-node ready" once per process: multi-shard collects one signal per shard over a channel, single-shard logs from on_bound; the premature "listening" lines are gone. cluster.sh wait_port: nodes on both transports wait for the ready line (the TCP nc probe saw only shard 0, and shard count can exceed $SHARDS without --cpuset), node budget 220 x 0.5 s (UCX busy-device bind retries up to 90 s), and every wait with a pid file dies at once with "<name> (pid N) exited during startup" when the process is gone (etcd included: a foreign etcd on 2379 is no longer accepted as ok).
+Verification: ablation with HEAD's cluster.sh + HEAD binaries (ucx build), UCX, data on /dev/shm, 2 shards: all 3 nodes "ok" while every EN had died on the O_DIRECT error; new: stops at node1 "EXITED" (16 s). Positive: UCX and TCP x 1/2 shards start, "ready" exactly once per node; 8-partition perf-check smoke on TCP (60K W / 1.15M R) and UCX. cargo check --workspace --tests clean; direct_io_default passes.
+Review: opus (no high; applied: node wait budget raised above the UCX busy-bind retry, stale stream CLAUDE.md claim of a 10x200 ms retry in accept_loop_on, server CLAUDE.md wording). Left: "partition 0 listener" wait has no pid (PS death there still times out); wait message still prints a port for nodes.
+Main gaps: none.
+Next steps: none.
+
 Date: 2026-09-28 (5)
 TaskStatus: completed
 Task scope: user "线上有 BUG，fuse daemon 修改 sysfs，容器里面不能修改" → "--readahead-kb 这个参数不要了，就不要动 sysfs，在 ops.md 让用户自救 set readahead 才是标准做法".

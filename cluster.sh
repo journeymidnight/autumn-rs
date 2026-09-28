@@ -201,26 +201,39 @@ wait_port() {
     local host="${4:-${BIND_HOST//[\[\]]/}}"
     echo -n "[cluster] waiting for $name on :$port (host=$host)..."
     sleep 3
-    if [[ "$TRANSPORT" == "ucx" ]]; then
-        local log=""
-        local pattern=""
+    # A process started under this name that exits during startup (bad flag,
+    # data dir that refuses O_DIRECT, bind failure) fails the wait at once
+    # instead of being reported up or timing out.
+    local pid="" pf
+    pf="$(pid_file "$name")"
+    [[ -f "$pf" ]] && pid="$(cat "$pf")"
+    # Readiness from the log instead of a port probe:
+    # - an extent node on either transport: "autumn-extent-node ready" is
+    #   logged once EVERY shard has opened its disks and bound its listeners
+    #   (the port probe only saw shard 0, and the EN may run more shards
+    #   than $SHARDS when no --cpuset is passed);
+    # - the others under UCX, whose listeners a TCP probe cannot see.
+    local log="" pattern=""
+    case "$name" in
+        node*) log="$LOG_DIR/${name}.log"; pattern="autumn-extent-node ready" ;;
+    esac
+    if [[ -z "$log" && "$TRANSPORT" == "ucx" ]]; then
         case "$name" in
             manager) log="$LOG_DIR/manager.log"; pattern="manager listening" ;;
-            node*) log="$LOG_DIR/${name}.log"; pattern="autumn-extent-node listening|extent-node shard listening" ;;
             partition*) log="$LOG_DIR/ps.log"; pattern="partition listener bound" ;;
             ps) log="$LOG_DIR/ps.log"; pattern="partition server serving" ;;
         esac
-        if [[ -n "$log" ]]; then
-            for _ in $(seq 1 "$retries"); do
-                if [[ -f "$log" ]] && grep -Eq "$pattern" "$log"; then echo " ok"; return 0; fi
-                sleep 0.5
-            done
-            echo " TIMEOUT"
-            die "$name did not start in time (port $port)"
-        fi
     fi
-    for _ in $(seq 1 $retries); do
-        if nc -z "$host" "$port" 2>/dev/null; then echo " ok"; return 0; fi
+    for _ in $(seq 1 "$retries"); do
+        if [[ -n "$pid" ]] && ! proc_alive "$pid"; then
+            echo " EXITED"
+            die "$name (pid $pid) exited during startup — see $LOG_DIR/${name}.log"
+        fi
+        if [[ -n "$log" ]]; then
+            if [[ -f "$log" ]] && grep -Eq "$pattern" "$log"; then echo " ok"; return 0; fi
+        elif nc -z "$host" "$port" 2>/dev/null; then
+            echo " ok"; return 0
+        fi
         sleep 0.5
     done
     echo " TIMEOUT"
@@ -418,7 +431,10 @@ launch_extent_node() {
         ${metrics_args[@]:+"${metrics_args[@]}"} \
         ${dio_args[@]:+"${dio_args[@]}"} \
         ${cpu_args[@]:+"${cpu_args[@]}"}
-    wait_port "$port" "node$i"
+    # "ready" comes after every shard scanned its extents and bound; a UCX bind
+    # retries a busy device (a restart inside TIME_WAIT) for up to 90 s. A dead
+    # EN fails the wait at once, so the long budget only covers a slow start.
+    wait_port "$port" "node$i" 220
 }
 
 # Format one extent-node's data dir(s) ($1 = 1-indexed). Calls

@@ -775,6 +775,10 @@ fn main() -> Result<()> {
     // runtime + io_uring + TcpListener + ExtentNode instance. Each shard
     // pins to one core via the shared `pick_cpu_for_ord` helper.
     let mut joins = Vec::with_capacity(shards as usize);
+    // Each shard reports once its listeners are bound (after `ExtentNode::new`
+    // opened its disks and passed the O_DIRECT check). The node is ready only
+    // when all of them did; a shard that fails first exits the process.
+    let (bound_tx, bound_rx) = std::sync::mpsc::channel::<()>();
     for shard_idx in 0..shards {
         let data_dirs = args.data_dirs.clone();
         let manager = args.manager.clone();
@@ -800,6 +804,7 @@ fn main() -> Result<()> {
         let rec_par = args.recovery_parallelism;
         let inflight = args.inflight_cap;
         let direct_io = args.direct_io;
+        let bound_tx = bound_tx.clone();
         // Fail-stop: any shard exit (Err / panic / unexpected clean return)
         // calls `std::process::exit(1)` directly. The join loop below is
         // therefore unreachable in steady state — its only role is to park
@@ -902,17 +907,15 @@ fn main() -> Result<()> {
                         }
                         cfg = cfg.with_direct_io(direct_io);
 
-                        tracing::info!(
-                            shard_idx,
-                            addr = %addr,
-                            ctl_addr = %ctl_addr,
-                            "extent-node shard listening"
-                        );
-
                         let node = ExtentNode::new(cfg)
                             .await
                             .with_context(|| format!("create ExtentNode shard {shard_idx}"))?;
-                        node.serve_with_control(addr, ctl_addr).await
+                        node.serve_with_control(addr, ctl_addr, move || {
+                            bound_tx
+                                .send(())
+                                .expect("main holds bound_rx for the process lifetime");
+                        })
+                        .await
                     })
                 });
                 match std::panic::catch_unwind(shard_main) {
@@ -952,6 +955,14 @@ fn main() -> Result<()> {
     // fail-stop on it. (Only shard 0 is awaited: another shard exiting
     // cleanly without process::exit would go unnoticed, same as the previous
     // loop form, which also never reached index 1.)
+    drop(bound_tx);
+    if (0..shards).all(|_| bound_rx.recv().is_ok()) {
+        tracing::info!(
+            shards,
+            first_port = shard_ports[0],
+            "autumn-extent-node ready: every shard's listeners are bound"
+        );
+    }
     if let Some(j) = joins.into_iter().next() {
         let _ = j.join();
         tracing::error!(
@@ -1021,14 +1032,15 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
         // parallelism / inflight-cap tunables.
         let config = apply_extent_tunables(config, &args);
 
-        tracing::info!(
-            data_addr = %addr,
-            ctl_addr = %ctl_addr,
-            "autumn-extent-node listening"
-        );
-
         let node = ExtentNode::new(config).await.context("create ExtentNode")?;
-        node.serve_with_control(addr, ctl_addr).await?;
+        node.serve_with_control(addr, ctl_addr, || {
+            tracing::info!(
+                data_addr = %addr,
+                ctl_addr = %ctl_addr,
+                "autumn-extent-node ready: listeners are bound"
+            );
+        })
+        .await?;
         Ok(())
     })
 }

@@ -5723,10 +5723,16 @@ impl ExtentNode {
     /// (data online, control silently dead) used to flip `online=true`
     /// at the manager while every control RPC (ALLOC / RECOVERY / DELETE /
     /// RE_AVALI) blackholed — fail-stop is safer than a degraded node.
+    ///
+    /// `on_bound` runs once every listener this node serves is bound, just
+    /// before the accept loops start — the node's readiness point (the
+    /// binary logs "autumn-extent-node ready" from it once all shards got
+    /// there; launchers wait for that line).
     pub async fn serve_with_control(
         &self,
         data_addr: SocketAddr,
         control_addr: SocketAddr,
+        on_bound: impl FnOnce(),
     ) -> Result<()> {
         // separate control listener. Under UCX a second ucp_listener on
         // the same RoCE device fails to bind ("Device is busy" / "Address
@@ -5741,7 +5747,12 @@ impl ExtentNode {
                 data_addr = %data_addr,
                 "UCX: control RPCs share the data listener (no separate control listener)"
             );
-            return self.accept_loop(data_addr, "data").await;
+            let listener = autumn_transport::current_or_init()
+                .bind(data_addr)
+                .await
+                .with_context(|| format!("bind data listener {data_addr}"))?;
+            on_bound();
+            return self.accept_loop_on(listener, data_addr, "data").await;
         }
         // Bind BOTH listeners up front. Either bind failing is fatal:
         // the caller's `?` propagates the io error and the process exits.
@@ -5769,6 +5780,7 @@ impl ExtentNode {
             }
         })
         .detach();
+        on_bound();
         self.accept_loop_on(data_listener, data_addr, "data").await
     }
 

@@ -1157,6 +1157,9 @@ Requirements and failure modes:
   `direct I/O: cannot open <dir>/disk_id with O_DIRECT (... needs
   --no-direct-io)`; start it with `--no-direct-io` there. The cost is one
   open() per disk per shard. With `--no-direct-io` nothing is checked.
+  The EN logs `autumn-extent-node ready` only after every shard passed this
+  check and bound its listeners; `cluster.sh` waits for that line and stops at
+  once with `nodeN (pid ...) exited during startup` when the EN died instead.
   The same applies to scratch data: `cluster.sh` defaults to `/tmp/autumn-rs`
   and several integration tests put EN data under the system temp dir, so on a
   host whose `/tmp` is tmpfs on a kernel before 6.6 point `AUTUMN_DATA_ROOT` /

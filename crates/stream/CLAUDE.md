@@ -680,10 +680,16 @@ DOES have monotonic-next fallback.)
 
 EN port conflicts are OPERATIONAL HYGIENE, not a runtime mechanism bug: another
 tenant squatting → operator picks a different `--port`; own old process not yet
-released → the existing 10 × 200 ms retry budget in `accept_loop_on` covers it;
+released → TCP binds with `SO_REUSEADDR` (compio), and UCX `UcxListener::bind`
+retries a busy device 30 × 3 s;
 port inside `ip_local_port_range` → operator picks a port below 32768.
 Fail-stop with `bind data listener <addr>: <io error>` is correct; the operator
 fixes the config and restarts.
+
+`serve_with_control(data, control, on_bound)` binds the listener(s) — both under
+TCP, the data one only under UCX (control shares it) — then calls `on_bound`
+before either accept loop starts. That is the node's readiness point: the binary
+logs `autumn-extent-node ready` from it once all shards got there.
 
 ### Delete extent (`MSG_DELETE_EXTENT = 11`)
 
