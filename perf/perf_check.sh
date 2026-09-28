@@ -8,17 +8,20 @@
 #   value size     = {4K, 8M}
 # → 4 cluster restarts (size is client-side only; inner-loop).
 #
+# UCX legs need AUTUMN_BIND_HOST set to a RoCE NIC IP (see the UCX block
+# below); on 127.0.0.1 the script refuses them, so run `--tcp` there. The
+# committed baselines come from two invocations: `--tcp` on 127.0.0.1 and
+# `--ucx` with the RoCE bind — docs/ops.md, next to the perf matrix.
+#
 # Client concurrency: `--threads 16` by default (override with --threads N).
 # Total in-flight = threads × pipeline-depth. Keep threads low (≤ ~32) and
 # scale via pipeline-depth — this is thread-per-core-correct on the client
 # side AND keeps each partition's single-threaded UCX worker on the PS
 # in its supported region (see "UCX cliff" note below).
-# At 16t × d=8 = 128 in-flight the 2×2×2×2 matrix reaches:
-#   TCP p=8 × 16t × d=8 × 4 KB → 142 k write / 1.11 M read
-#   UCX p=8 × 16t × d=8 × 4 KB → 129 k write / 764 k read
-# 8 MB payload is where UCX rc_mlx5 zero-copy starts beating TCP loopback
-# memcpy — the rndv-get-zcopy handshake gets amortized over a much larger
-# DMA; at 4 KB it's pure overhead (see the UCX notes §12).
+# At 16t × d=8 = 128 in-flight, 3 disks, 8 partitions (baselines of
+# 2026-09-28): TCP 4 KB 55 k write / 583 k read ops/s, 8 MB 2.4 / 7.5 GB/s;
+# UCX over RoCE 4 KB 18 k / 964 k, 8 MB 2.2 / 5.0 GB/s. UCX 4 KB writes pay
+# an rc round trip per small append.
 #
 # UCX cliff (post fix(ucx): drop UcxEp close-on-Drop, 2026-04-29). Each
 # PS partition runs a single-threaded UCX worker. The cliff is set by
@@ -45,7 +48,7 @@
 # region and should not be used as performance signal.
 #
 # Usage:
-#   ./perf_check.sh                       # default 2×2×2×2 matrix on disk
+#   ./perf_check.sh                       # default matrix on disk (UCX legs need AUTUMN_BIND_HOST)
 #   ./perf_check.sh --shm                 # matrix on RAM tmpfs
 #   ./perf_check.sh --tcp                 # tcp only (still all inner axes)
 #   ./perf_check.sh --ucx                 # ucx only
@@ -75,42 +78,6 @@ ulimit -n 65536 2>/dev/null || true
 # concurrent pinned). Child processes (cluster.sh → manager/node/ps
 # daemons) inherit this limit, so set it here to cover everything.
 ulimit -l unlimited 2>/dev/null || true
-
-# UCX workaround: this environment blocks BOTH the SysV and POSIX
-# shared-memory transports on the > eager-threshold path:
-#   sysv:  `mm_sysv.c:59  shmat(shmid=...) failed: Invalid argument`
-#          (IPC namespace denies shmat)
-#   posix: `mm_posix.c:233 open(file_name=/proc/<peer_pid>/fd/<N>) failed:
-#           No such file or directory`
-#          (peer-fd visibility through /proc restricted)
-# Either one being chosen by UCX for an 8 MB rendezvous causes the send
-# to wedge for tens of seconds. Excluding both lets UCX fall back to
-# `cma` (zero-copy syscall, 17+ GB/s in ucx_perftest) for intra-host
-# bulk + `tcp` for control. Respects caller-provided UCX_TLS.
-# UCX_TLS: POSITIVE transport list only (no ^ negation — leading ^ negates
-# the WHOLE list and a non-leading ^x is silently ignored as a literal name;
-# both bit us on 2026-06-10). UCX_TLS is a CAPABILITY SET, not a priority
-# list: ucp_worker_create eagerly opens an iface (CQ/SRQ/QP machinery via
-# DEVX ioctls) for EVERY allowed transport x device at creation time —
-# transport selection per peer happens later, at ep wireup. So listing
-# rc_mlx5 costs 10-IB-device iface creation per worker even if all traffic
-# ends up on posix shm (the 2026-06-10 t256 creation-storm collapse was
-# exactly this cost under a spinlock). Pick by scenario:
-#
-#   loopback bench (this script's default): posix,cma,tcp,self
-#     - posix shm carries PS->EN appends: 69K write / 969K read 4K t16,
-#       vs 8.3K write with shm disabled.
-#     - no IB transports -> worker creation skips all 10 RoCE devices
-#       (cheap creation; high client thread counts stay viable).
-#   RoCE-bound cluster: rc_mlx5,ud_mlx5,tcp,self — NEVER add posix/cma
-#     (2026-07-03 sweep: the posix large-message path stalls concurrent
-#     >=64K transfers — 3s timeout storms / apparent write wedges; one rc
-#     list serves BOTH intra-host (rc loopback, 8M read 8 GB/s) and
-#     cross-host traffic. The earlier "combined posix,cma,rc..." advice is
-#     REFUTED.) MUST pin UCX_NET_DEVICES on both ends (auto-select hangs);
-#     cluster.sh now derives these defaults from the bind address.
-: "${UCX_TLS:=posix,cma,tcp,self}"
-export UCX_TLS
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # perf/ layout: baselines live beside this script (SCRIPT_DIR); the repo
@@ -239,6 +206,48 @@ else
     STORAGE_SUFFIX=""
 fi
 
+# UCX: ONE rule, single host or multi-host (the same one cluster.sh's
+# apply_ucx_env_defaults applies) — bind a RoCE NIC IP and run
+# UCX_TLS=rc_mlx5,ud_mlx5,tcp,self with a pinned UCX_NET_DEVICES, on the
+# cluster AND this bench client. There is no loopback UCX configuration:
+# 127.0.0.1 has no RoCE GID, and the posix shm path it falls back to stalls
+# concurrent >=64K transfers (8 MiB writes at ~130 MB/s, p50 4 s). POSITIVE
+# lists only (a leading ^ negates the whole list, a later ^x is ignored).
+# On this box: AUTUMN_BIND_HOST='[fdbd:dc62:3:300::14]' (eth1 = mlx5_2, the
+# storage NIC; mlx5_1 is the GPU's). Unlike cluster.sh (fixed mlx5_1:1
+# default), an unset UCX_NET_DEVICES is derived here from the bind IP and
+# exported, so the cluster inherits it. TCP legs in the same invocation use
+# the same bind address.
+if [[ " $TRANSPORT_LIST " == *" ucx "* ]]; then
+    ucx_host="${AUTUMN_BIND_HOST:-127.0.0.1}"
+    ucx_host="${ucx_host//[\[\]]/}"
+    if [[ "$ucx_host" == "127.0.0.1" || "$ucx_host" == "::1" || "$ucx_host" == "localhost" ]]; then
+        echo "[perf-check] UCX needs a RoCE NIC IP, not $ucx_host: set AUTUMN_BIND_HOST" \
+             "(e.g. '[fdbd:dc62:3:300::14]' with UCX_NET_DEVICES=mlx5_2:1 on this box)," \
+             "or run --tcp only" >&2
+        exit 2
+    fi
+    export UCX_TLS="${UCX_TLS:-rc_mlx5,ud_mlx5,tcp,self}"
+    # Default the device to the RDMA port whose netdev carries the bind IP,
+    # so the bench measures the NIC it binds.
+    if [[ -z "${UCX_NET_DEVICES:-}" ]]; then
+        for ib in /sys/class/infiniband/*; do
+            for nd in "$ib"/device/net/*; do
+                [[ -e "$nd" ]] || continue
+                if ip -o addr show dev "$(basename "$nd")" 2>/dev/null | grep -qF " $ucx_host/"; then
+                    UCX_NET_DEVICES="$(basename "$ib"):1"
+                fi
+            done
+        done
+        [[ -n "${UCX_NET_DEVICES:-}" ]] || {
+            echo "[perf-check] no RDMA device carries $ucx_host; set UCX_NET_DEVICES" >&2
+            exit 2
+        }
+    fi
+    export UCX_NET_DEVICES
+    echo "[perf-check] ucx env: UCX_TLS=$UCX_TLS UCX_NET_DEVICES=$UCX_NET_DEVICES bind=$AUTUMN_BIND_HOST"
+fi
+
 # build with the ucx feature when any UCX run is requested.
 NEED_UCX_FEATURE=0
 for t in $TRANSPORT_LIST; do
@@ -255,25 +264,37 @@ else
         | grep -E "^(Compiling|Finished|error)" || true
 fi
 
-# Wait until extent-node ports (9101..9103) have no lingering sockets in
-# either direction (server-side LISTEN/TIME_WAIT *or* client-side TIME_WAIT
-# with peer=:910x). UCX's ucp_listener_create empirically refuses to bind
-# while client-side TIME_WAITs targeting the same port still exist, so we
-# must wait for both columns to clear. Bounded so a stuck socket can't
-# stall the matrix forever.
+# Wait until the cluster's fixed ports — the manager (9001), the extent-node
+# grid (AUTUMN_EXTENT_BASE_PORT + node + shard*stride, 9101..9173 with the
+# defaults and 8 shards) and the PS listeners (AUTUMN_PS_BASE_PORT onwards)
+# — have no lingering sockets in either direction (server-side LISTEN/TIME_WAIT *or* client-side TIME_WAIT with
+# the port as peer). UCX's ucp_listener_create empirically refuses to bind
+# while client-side TIME_WAITs targeting the same port still exist, and the
+# TIME_WAITs of UCX-accepted sockets (no SO_REUSEADDR) make even a TCP EN's
+# SO_REUSEADDR bind fail with EADDRINUSE — watching only the shard-0 ports
+# let a TCP cluster start after a UCX one while shard 7's port was still
+# held, and that EN fail-stopped; a UCX manager started over 9001's
+# TIME_WAITs outlived cluster.sh's start timeout the same way. Bounded so a
+# stuck socket can't stall the matrix forever.
 await_ports_clear() {
     # 180s cap — TCP runs can pile up many client-side TIME_WAITs that need
     # to age out before UCX's ucp_listener_create (no SO_REUSEADDR) succeeds.
+    local en_base="${AUTUMN_EXTENT_BASE_PORT:-9100}"
+    local shards="${AUTUMN_EXTENT_SHARDS:-8}" stride="${AUTUMN_EXTENT_SHARD_STRIDE:-10}"
+    local en_lo=$(( en_base + 1 )) en_hi=$(( en_base + 3 + (shards - 1) * stride ))
+    local ps_lo="${AUTUMN_PS_BASE_PORT:-9301}"
+    local ps_hi=$(( ps_lo + 64 ))
     local deadline=$((SECONDS + 180))
     while (( SECONDS < deadline )); do
-        if ! ss -tan 2>/dev/null \
-                | awk 'NR>1 {print $4; print $5}' \
-                | grep -qE ':(9101|9102|9103)$'; then
+        if ! ss -tan 2>/dev/null | awk -v el="$en_lo" -v eh="$en_hi" -v pl="$ps_lo" -v ph="$ps_hi" '
+                NR > 1 { for (f = 4; f <= 5; f++) { n = split($f, a, ":"); p = a[n] + 0
+                         if (p == 9001 || (p >= el && p <= eh) || (p >= pl && p <= ph)) found = 1 } }
+                END { exit !found }'; then
             return 0
         fi
         sleep 5
     done
-    echo "[perf-check] WARN: 9101..9103 still have lingering sockets after 180s"
+    echo "[perf-check] WARN: ports 9001, $en_lo-$en_hi, $ps_lo-$ps_hi still have lingering sockets after 180s"
 }
 
 # Inner runner: starts cluster under given AUTUMN_TRANSPORT + presplit, runs

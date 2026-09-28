@@ -3237,10 +3237,27 @@ cargo test -p autumn-manager --test system_gc_multiversion_same_extent
 ```
 
 **Write-pipeline changes (e.g. natural batching) are verified with the perf matrix**
-(`./perf/perf_check.sh --3disk --partitions 8` — builds release, starts a fresh 3-replica
-cluster, runs tcp/ucx × 4K/8M and compares each leg against
-`perf/perf_baseline_<transport>_p8_d8_s<size>.json`; a leg passes when ops/s ≥ 80% of
-baseline and p99 ≤ 2×). The `--min-pipeline-batch` PS flag is deprecated
+(`perf/perf_check.sh` builds release, starts a fresh 3-replica cluster, runs 4K and 8M
+and compares each leg against `perf/perf_baseline_<transport>_p8_d8_s<size>.json`; a leg
+passes when ops/s ≥ 80% of baseline and p99 ≤ 2×). TCP and UCX run as two invocations,
+because UCX — on one host as on many — binds a RoCE NIC IP with
+`UCX_TLS=rc_mlx5,ud_mlx5,tcp,self` and a pinned `UCX_NET_DEVICES` (the script refuses
+UCX on 127.0.0.1; there is no loopback UCX configuration):
+
+```bash
+export AUTUMN_DATA_ROOT=/data05/autumn-rs AUTUMN_EXTENT_SHARDS=8   # plus the cpusets below
+./perf/perf_check.sh --3disk --partitions 8 --tcp
+AUTUMN_BIND_HOST='[fdbd:dc62:3:300::14]' UCX_NET_DEVICES=mlx5_2:1 \
+  ./perf/perf_check.sh --3disk --partitions 8 --ucx      # eth1 = mlx5_2, the storage NIC
+```
+
+The committed baselines (2026-09-28) were taken this way with direct I/O on (the EN
+default) and the io_uring workers confined: TCP with the cluster on node-1 cores
+(EN 48-55/56-63/64-71, PS 72-87), UCX on the NIC's node 0 (EN 8-15/16-23/24-31,
+PS 32-47); each file is the median-write run of three. TCP 4K 54.9K write / 583K
+read ops/s, 8M 2.4 GB/s write / 7.5 GB/s read; UCX 4K 18.3K / 964K, 8M 2.2 / 5.0
+GB/s — UCX 4K writes are slow because every small append pays an rc round trip,
+which the old posix-shm baselines hid. The `--min-pipeline-batch` PS flag is deprecated
 (parsed, warns, no effect) — batch sizing is adaptive and needs no tuning knob.
 
 **Pin the cluster away from the tenants first.** This box is shared with

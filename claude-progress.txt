@@ -1,3 +1,13 @@
+Date: 2026-09-28 (4)
+TaskStatus: completed
+Task scope: user "重录 perf 基线" (after O_DIRECT became the EN default, entry (3)).
+Current summary: the four canonical baselines perf/perf_baseline_{tcp,ucx}_p8_d8_s{4k,8m}.json re-recorded: --3disk, 8 partitions, 8 shards/EN, direct I/O on, iou-wrk confined; TCP cluster on node-1 cores (EN 48-55/56-63/64-71, PS 72-87), UCX on node 0 next to mlx5_2 (EN 8-15/16-23/24-31, PS 32-47); each file is the median-write run of three. TCP 4K 54.9K W / 583K R, 8M 2410 / 7457 MB/s; UCX (RoCE, rc_mlx5) 4K 18.3K / 964K, 8M 2154 / 4976 MB/s. Legacy baseline files (perf_baseline.json, _p32_, _shm) untouched.
+perf_check.sh fixes found on the way: (1) await_ports_clear watched only 9101-9103; with 8 shards the ENs use 9101-9173 and the TIME_WAITs of UCX-accepted sockets (no SO_REUSEADDR) blocked a following TCP EN's bind (shard 7, EADDRINUSE, fail-stop) — now waits for 9001, 91xx, 93xx. (2) its UCX default was UCX_TLS=posix,cma,tcp,self on 127.0.0.1, bypassing cluster.sh's refusal of loopback UCX; the posix large-message path stalled every 8M write leg (~130 MB/s, p50 4 s) with direct I/O on AND off (4-round A/B), so not an O_DIRECT effect. Now: UCX legs require a non-loopback AUTUMN_BIND_HOST and get rc_mlx5,ud_mlx5,tcp,self + UCX_NET_DEVICES (cluster.sh's rule). My detour A/B-ing loopback UCX_TLS variants was wasted work; the rule is now at the top of the perf-check skill.
+Verification: all 3+3 runs per transport started and completed after the fixes; the script refuses --ucx on loopback.
+Review: opus #1 (no high; applied: port wait derived from AUTUMN_EXTENT_BASE_PORT/shards/stride/AUTUMN_PS_BASE_PORT instead of fixed 91xx/93xx, UCX_NET_DEVICES derived from the bind IP (was the GPU NIC mlx5_1 default), stale posix-era header numbers and default-invocation text); opus #2 on that delta (no high; comment wording fixed).  Low items left: non-numeric port env aborts under set -u; dual-port HCAs map to :1.
+Main gaps: scripts/transport_chaos.sh and scripts/manager_ha_chaos.sh still default UCX_TLS=posix,cma,tcp,self on loopback (not changed). UCX 4K write (18K) is far below TCP (55K) — every small append pays an rc round trip; not investigated.
+Next steps: none required.
+
 Date: 2026-09-28 (3)
 TaskStatus: completed
 Task scope: user "需要代码里面先默认开，然后再重新录制 baseline" + "就留一个 --no-direct-io" — make EN O_DIRECT the default before re-recording perf baselines.
