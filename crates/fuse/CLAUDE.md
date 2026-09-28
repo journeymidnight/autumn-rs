@@ -22,7 +22,6 @@
 | `read_pool.rs` | 读 I/O 线程池（N 个独立 compio runtime + 各自的 ClusterClient；`ReadJob` 载 `fuser::ReplyData` 跨线程）|
 | `prefetch.rs` | 守护进程预读：派发线程上的顺序检测（`Detector`）+ 读线程共享的预取块缓存（`PrefetchCache`）|
 | `inval.rs` | 内核缓存失效线程（`autumn-fuse-inval`：`inval_inode` 在这里发，结果回派发 runtime 记 sticky 集）|
-| `readahead.rs` | 挂载的预读窗口：INIT 时打开 `/sys/class/bdi/<dev>/read_ahead_kb`，第一个 open 时写入 |
 
 不变量：新的 core→fuser 转换一律进 `attr.rs`；文件系统逻辑一律进 `autumn-fs`，不在
 这里另写一份（挂载、S3 网关、Python 绑定必须读写同一份格式）。
@@ -199,15 +198,17 @@ await 期间到来的新事件会重新标记，不会被随后的清除抹掉�
 （真挂载，SHARED/KEEP/REOPEN/HELD/TAIL/LOCAL/MMAPW；不校验 generation 的构建上 REOPEN 与
 MMAPW 变红，`get_inode` 无视标记的构建上 TAIL 变红）。
 
-### 预读窗口（`readahead.rs`，`--readahead-kb`，默认 2048）与 `max_background`
+### 预读窗口（守护进程不碰）与 `max_background`
 
 mmap 缺页按页缓存预读窗口（bdi `read_ahead_kb`）以缺页处为中心读一窗，外加异步预读标记
 提前取下一窗；每个缺页线程在飞的量由窗口决定，高延迟下它就是加载器能拿到的大部分吞吐（不是
-简单的 窗口 ÷ 延迟：单核 2 MiB、每读 4 ms 实测 735，高于 2 MiB ÷ 4 ms ≈ 512）。**INIT 只能把它调小**（内核给出 128 KiB，取 min），所以
-抬高只能写 sysfs——**而且必须在 INIT 应答之后**：内核处理 INIT 应答时把 bdi 设成
-`min(当前, 协商值)`，挂载后立刻写的 16384 实测读回 128。所以 `init()` 里打开 sysfs 文件
-（打不开 → 挂载失败，`--readahead-kb 0` 可关），第一个 open/create 时写入（任何读都在某次
-open 之后）。
+简单的 窗口 ÷ 延迟：单核 2 MiB、每读 4 ms 实测 735，高于 2 MiB ÷ 4 ms ≈ 512）。**INIT 只能把它调小**（内核给出 128 KiB，取 min），
+抬高只能写 sysfs。**守护进程不写 sysfs**：容器里 `/sys` 除非 privileged 否则只读，以前默认
+`--readahead-kb 2048` 在 INIT 里打开 sysfs 文件、打不开就让 INIT 失败，线上 kubectl 拉起的非特权
+pod 因此整个挂载不可用（每个操作 ECONNREFUSED；只读 bind `/sys` 复现过）。现在参数和
+`readahead.rs` 都删了，挂载一律从内核默认 128 KiB 起步；要 2 MiB 由运维在挂载完成**之后**
+（先 stat 一下挂载点，INIT 应答会覆盖更早的写）自己写 bdi —— 步骤在 `docs/ops.md`
+"Readahead window"，实测写 2048 后 create/read 不会被改回。
 
 `max_background` 64 / 拥塞阈值 48：一窗按 ≤1 MiB 的后台 READ 发出，fuser 默认 16/12 时
 超过 12 个在途内核就不再发异步预读。同为 16 MiB 窗口，HEAD（16/12）655–659 vs 本构建
@@ -439,8 +440,7 @@ inode 的每一个缓存页（`invalidate_inode_pages2_range`）。预读中的�
 `--credential-file`（authz 保护 `fs/` 时必需；`<principal>\n<hex>`，覆盖不到 `fs/`
 则 fail-fast）、`--allow-other`（default false）、`--transport`（`tcp`/`ucx`，须与
 cluster 一致）、`--direct-read`（default true）、`--read-io-threads`（default 4；
-`0` = 全部读留在派发线程，即池子之前的行为）、`--readahead-kb`（default 2048；`0` = 内核默认
-128 KiB）、`--prefetch-mem-mb`（default 1024；`0` = 关掉守护进程预读；需要读线程池）。内核缓存 `attr_timeout` /
+`0` = 全部读留在派发线程，即池子之前的行为）、`--prefetch-mem-mb`（default 1024；`0` = 关掉守护进程预读；需要读线程池）。内核缓存 `attr_timeout` /
 `entry_timeout` = 30s、`negative_timeout` = 5s；周期脏 inode sync 间隔 30s（`main.rs`）。
 
 ## 关键依赖文件

@@ -86,8 +86,8 @@ struct Args {
     /// threads, and a rerun of the same cell landed 5186-5396 (95-99%). Going
     /// higher was not measured. Single-stream reads showed no trend across any
     /// of these settings (measured when opens were direct-io, so a synchronous
-    /// `read` reached the mount one request at a time; readahead now fans a
-    /// single reader out, see `--readahead-kb`).
+    /// `read` reached the mount one request at a time; the daemon's prefetch,
+    /// `--prefetch-mem-mb`, now fans a single sequential reader out).
     ///
     /// Each thread carries its own registered-buffer pool, capped per thread
     /// (`REGPOOL_CAP_BYTES`, 512 MiB by default), so raising this raises the
@@ -98,23 +98,6 @@ struct Args {
     /// one manager connection and one connection pool per thread.
     #[arg(long, default_value_t = 4)]
     read_io_threads: usize,
-
-    /// Readahead window of the mount, in KiB, written to the mount's
-    /// `/sys/class/bdi/<dev>/read_ahead_kb` once it is mounted (FUSE INIT can
-    /// only lower the kernel's 128 KiB default). An mmap page fault reads this
-    /// window around the faulting page, so it bounds how much a faulting thread
-    /// has in flight; on a high-latency path it is most of what an mmap loader
-    /// (safetensors) gets. Set on the first open (INIT would overwrite an
-    /// earlier write); a mount that cannot open the sysfs file fails. `0`
-    /// leaves the kernel default alone.
-    ///
-    /// 2048, not larger: with the loader on nine cores, a 4 MiB window measured
-    /// 124-188 MiB/s at 4 ms per read — the daemon got the same bytes in ~10x
-    /// as many, ~36 KiB READs — where 2 MiB gave 1095-1334. Why the READs
-    /// fragment is not established (`crates/fuse/CLAUDE.md`). A single-threaded
-    /// loader does ~11% better at 4 MiB; the collapse is the worse risk.
-    #[arg(long, default_value_t = 2048)]
-    readahead_kb: u32,
 
     /// Memory the daemon may hold for its own readahead, in MiB: blocks fetched
     /// in parallel ahead of a sequential reader, answered from memory when the
@@ -228,12 +211,7 @@ fn main() -> Result<()> {
     }
 
     let shutdown_tx = tx.clone();
-    // Resolved before mounting: once mounted, resolving the path would stat
-    // the mount's root, and nothing answers until `session.run`.
-    let mountpoint_abs = std::fs::canonicalize(&mountpoint)
-        .with_context(|| format!("resolve mountpoint {}", mountpoint.display()))?;
-    let readahead = (args.readahead_kb > 0).then_some((mountpoint_abs, args.readahead_kb));
-    let fs = AutumnFs::new(tx, readahead);
+    let fs = AutumnFs::new(tx);
     tracing::info!(mountpoint = %mountpoint.display(), "mounting filesystem");
     let mut session = fuser::Session::new(fs, &mountpoint, &options)?;
     let notifier = session.notifier();

@@ -54,8 +54,8 @@ pub const BLOCK: u64 = 4 << 20;
 pub const WINDOW: u64 = 64 << 20;
 /// A READ this close to a front continues it: the kernel sends the READs of a
 /// readahead window concurrently, so they arrive slightly out of order. One
-/// kernel window (`--readahead-kb` default); 4 MiB let random 4 KiB reads of a
-/// 2 GB file pass as sequential often enough to put their p99 at 24.7 ms —
+/// kernel window (the 2 MiB `read_ahead_kb` docs/ops.md recommends); 4 MiB
+/// let random 4 KiB reads of a 2 GB file pass as sequential often enough to put their p99 at 24.7 ms —
 /// they waited for a 4 MiB block where a direct read takes 2 ms.
 const FRONT_TOLERANCE: u64 = 2 << 20;
 /// Bytes a front must actually have read before it prefetches, and they must

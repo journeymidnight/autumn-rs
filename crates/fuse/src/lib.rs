@@ -5,8 +5,8 @@
 //! `fuser::Filesystem` impl (`ops`), the fuser<->compio channel (`bridge`),
 //! the dispatch loop (`dispatch`), the kernel cache invalidation thread
 //! (`inval`), the read I/O pool (`read_pool`), daemon-side readahead
-//! (`prefetch`), the mount's kernel readahead window (`readahead`), and the
-//! ONLY place core types convert to `fuser` reply types (`attr`).
+//! (`prefetch`), and the ONLY place core types convert to `fuser` reply types
+//! (`attr`).
 
 pub mod attr;
 pub mod bridge;
@@ -15,7 +15,6 @@ pub mod inval;
 pub mod ops;
 pub mod prefetch;
 pub mod read_pool;
-pub mod readahead;
 
 /// Re-export `fuser` so downstream test crates (autumn-manager
 /// inode-lease tests) can name the bridge-handler reply types

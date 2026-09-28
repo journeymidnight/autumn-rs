@@ -614,27 +614,50 @@ generation from the PS and keeps them only if it is the one seen last time. So a
 second load of the same weights is served from memory, and `MAP_SHARED` mmaps
 (Python's `mmap.mmap(fd, 0)`) work.
 
-**`--readahead-kb` (default 2048)** sets the mount's page-cache readahead
-window (`/sys/class/bdi/<dev>/read_ahead_kb`, written on the first open — FUSE
-INIT can only lower it, and the kernel re-applies INIT's value when it answers).
+**Readahead window.** The daemon never touches it: the mount starts with the
+kernel default, 128 KiB, and raising it is an operator step. FUSE INIT can only
+lower the window, so the one way up is the mount's
+`/sys/class/bdi/<dev>/read_ahead_kb` — which a container's `/sys` refuses unless
+the pod is privileged, so the daemon leaves it alone rather than fail or guess.
 An mmap loader (safetensors `load_file`) has about one window in flight per
 faulting thread, so on a network path the window is most of its throughput.
 Measured at 4 ms per read: a loader pinned to one core got 108 MiB/s at 128 KiB,
 720-740 at 2 MiB and 823 at 4 MiB; the same loader on nine cores got 1095-1334
 at 2 MiB but only 124-188 at 4 MiB — the daemon received the same bytes as ~10x
-as many ~36 KiB READs (why they fragment is not established). Bigger is not
-safer, and 2 MiB is not proven safe for every model: if a load is far slower
-than expected, compare the daemon's READ count against the file size. With no
-network latency 2 MiB costs 12-22% on nine cores against 128 KiB-1 MiB. Check
-it after mounting:
+as many ~36 KiB READs (why they fragment is not established). So 2 MiB is the
+value to set, not larger, and it is not proven safe for every model: if a load
+is far slower than expected, compare the daemon's READ count against the file
+size. With no network latency 2 MiB costs 12-22% on nine cores against
+128 KiB-1 MiB.
+
+Set it after the mount is up, from wherever `/sys` is writable — the host, or a
+privileged pod (`kubectl exec <pod> -- grep ' /sys ' /proc/mounts` says `rw` or
+`ro`). Touch the mountpoint first: the kernel sets the window from the INIT
+reply, which overwrites anything written before the daemon answered.
 
 ```bash
-cat /sys/class/bdi/$(awk '$5=="/mnt/autumn"{print $3}' /proc/self/mountinfo)/read_ahead_kb
-# 2048 once anything has been opened (128 before the first open)
+MP=/mnt/autumn
+stat "$MP" >/dev/null                                    # INIT has been answered
+DEV=$(awk -v m="$MP" '$5==m{print $3}' /proc/self/mountinfo | tail -1)
+echo 2048 > /sys/class/bdi/$DEV/read_ahead_kb
+cat /sys/class/bdi/$DEV/read_ahead_kb                    # 2048
 ```
 
-The mount fails to start if the sysfs file cannot be opened (a read-only `/sys`
-in an unprivileged container); `--readahead-kb 0` keeps the kernel default.
+It lasts as long as that mount: a restarted daemon is a new mount with a new
+`<dev>` back at 128 KiB, so the step belongs wherever the mount is (re)made. Run
+it in the daemon's container, or from the host through the daemon's own mount
+namespace (a different container, or the host, may not see the mount at all):
+
+```bash
+PID=<autumn-fuse pid>                  # one per mount; pgrep -x autumn-fuse lists them all
+stat /proc/$PID/root/mnt/autumn >/dev/null
+DEV=$(awk '$5=="/mnt/autumn"{print $3}' /proc/$PID/mountinfo | tail -1)
+echo 2048 > /sys/class/bdi/$DEV/read_ahead_kb   # the bdi is one kernel object
+```
+
+Without it everything works; mmap
+loads are just slower, and the daemon's own readahead (`--prefetch-mem-mb`,
+below) still covers sequential readers.
 
 **`--prefetch-mem-mb` (default 1024; `0` turns it off)** is the daemon's own
 readahead: when a file is read in sequence it fetches the blocks ahead of the

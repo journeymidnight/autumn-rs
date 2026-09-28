@@ -4,7 +4,6 @@
 //! channel, and blocks waiting for the reply from the compio thread.
 
 use std::ffi::OsStr;
-use std::path::PathBuf;
 use std::time::Duration;
 
 use fuser::{
@@ -24,30 +23,11 @@ const MAX_BACKGROUND: u16 = 64;
 /// Sends all requests to the compio thread via the bridge channel.
 pub struct AutumnFs {
     tx: futures::channel::mpsc::UnboundedSender<FsRequest>,
-    /// `(absolute mountpoint, KiB)` for `readahead.rs`; `None` keeps the
-    /// kernel default.
-    readahead: Option<(PathBuf, u32)>,
-    /// The `read_ahead_kb` file opened during INIT, written on the first open.
-    pending_readahead: Option<std::fs::File>,
 }
 
 impl AutumnFs {
-    pub fn new(
-        tx: futures::channel::mpsc::UnboundedSender<FsRequest>,
-        readahead: Option<(PathBuf, u32)>,
-    ) -> Self {
-        Self { tx, readahead, pending_readahead: None }
-    }
-
-    /// Called by open and create: the first one after INIT sets the window.
-    fn apply_readahead(&mut self) {
-        let (Some(file), Some((_, kb))) = (self.pending_readahead.take(), &self.readahead) else {
-            return;
-        };
-        match crate::readahead::write(file, *kb) {
-            Ok(()) => tracing::info!(kb, "mount readahead set"),
-            Err(e) => tracing::error!(kb, error = %e, "setting the mount readahead failed"),
-        }
+    pub fn new(tx: futures::channel::mpsc::UnboundedSender<FsRequest>) -> Self {
+        Self { tx }
     }
 
     fn send<T>(&self, make_req: impl FnOnce(Reply<T>) -> FsRequest) -> anyhow::Result<T> {
@@ -81,23 +61,11 @@ impl Filesystem for AutumnFs {
         // for 4 GiB either way. (Linux 6.10+ makes that clamp a sysctl, so it
         // is the ceiling on this kernel, not a constant of the protocol.)
         //
-        // Readahead is NOT negotiated here: INIT can only lower it (the kernel
-        // offers its bdi default, 128 KiB, and takes the min). The mount
-        // raises it through sysfs on the first open (`readahead.rs`).
-        if let Some((mountpoint, kb)) = &self.readahead {
-            match crate::readahead::open(mountpoint) {
-                Ok(file) => self.pending_readahead = Some(file),
-                Err(e) => {
-                    tracing::error!(
-                        kb,
-                        mountpoint = %mountpoint.display(),
-                        error = %e,
-                        "cannot set the mount readahead (--readahead-kb 0 keeps the kernel default)"
-                    );
-                    return Err(libc::EIO);
-                }
-            }
-        }
+        // Readahead is NOT negotiated here, and the daemon never touches it:
+        // INIT can only lower it (the kernel offers its bdi default, 128 KiB,
+        // and takes the min), and raising it means writing sysfs, which a
+        // container's read-only /sys refuses. Raising it is the operator's
+        // step after the mount is up (docs/ops.md, "Readahead window").
         let _ = config.set_max_write(1024 * 1024);
         // A readahead window is sent as background READs of up to 1 MiB each,
         // and the kernel stops issuing async readahead once the background
@@ -286,7 +254,6 @@ impl Filesystem for AutumnFs {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        self.apply_readahead();
         match self.send(|r| FsRequest::Create {
             parent,
             name: name.to_owned(),
@@ -300,7 +267,6 @@ impl Filesystem for AutumnFs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        self.apply_readahead();
         match self.send(|r| FsRequest::Open {
             ino,
             flags,

@@ -1,3 +1,12 @@
+Date: 2026-09-28 (5)
+TaskStatus: completed
+Task scope: user "线上有 BUG，fuse daemon 修改 sysfs，容器里面不能修改" → "--readahead-kb 这个参数不要了，就不要动 sysfs，在 ops.md 让用户自救 set readahead 才是标准做法".
+Current summary: autumn-fuse defaulted to --readahead-kb 2048 and opened /sys/class/bdi/<dev>/read_ahead_kb inside FUSE INIT; a failed open returned EIO from INIT. A kubectl pod without privileged has a read-only /sys, so the mount came up dead (every op ECONNREFUSED). Removed the flag, readahead.rs (open/write/mountinfo parsing + 4 tests) and the INIT/open/create hooks; the daemon never touches sysfs and the mount runs on the kernel default (128 KiB). docs/ops.md "Readahead window" now gives the operator step: stat the mountpoint (INIT answered), read <dev> from mountinfo (from the host: /proc/<autumn-fuse pid>/mountinfo), echo 2048 > /sys/class/bdi/<dev>/read_ahead_kb, with the measurements behind 2 MiB. entrypoint.sh unchanged (user).
+Verification: autumn-fuse lib 63/63 (4 removed with readahead.rs). Real mounts on a TCP test cluster: old binary (HEAD) with /sys remounted read-only (bind,ro in a private mount ns) → INIT error "cannot set the mount readahead ... Read-only file system", create/read "Connection refused" (bug reproduced); an intermediate build with the flag optional + warning verified all three cases before the user asked for full removal. Final binary: mount works, read_ahead_kb stays 128, no sysfs access in the log; the documented manual step (stat, echo 2048) reads back 2048 and survives create/read.
+Review: opus (no high/medium; applied: host-side step stats the mount through /proc/<pid>/root and names one daemon pid, stale "kernel readahead fans a reader out" comment, comment wrap). Left: prefetch FRONT_TOLERANCE (2 MiB) was sized for the old 2 MiB window, looser than needed at 128 KiB — not re-measured.
+Main gaps: mounts that relied on the old 2 MiB default now load mmap models slower until the operator sets the window (documented, measured 108 vs 720-740 MiB/s single-core at 4 ms latency). Passing --readahead-kb now fails argument parsing (clap) — no in-repo launcher passes it.
+Next steps: none.
+
 Date: 2026-09-28 (4)
 TaskStatus: completed
 Task scope: user "重录 perf 基线" (after O_DIRECT became the EN default, entry (3)).
