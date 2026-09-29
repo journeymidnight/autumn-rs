@@ -680,15 +680,11 @@ async fn do_ps_restart(ctx: &NemesisCtx, graceful: bool) -> Result<String, Strin
     }
     let log_path = ctx.ps.borrow().log_path.clone();
     let stop_from = log_len(&log_path);
-    // A drain with an empty memtable writes no checkpoint, so a partition
-    // still carrying more than one checkpoint record (a merge not flushed
-    // since) keeps them, and its reopen replays from the older one — the
-    // known post-merge gap. Found here, before the stop.
-    let multi_record = if graceful {
-        multi_record_partitions(ctx).await
-    } else {
-        Vec::new()
-    };
+    // Not before a SIGKILL: waiting for ready there would keep the crash from
+    // ever landing inside a reopen.
+    if graceful {
+        record_unmerged_checkpoints(ctx, "before a SIGTERM restart").await;
+    }
     let stop_note = if graceful {
         match stop_ps_gracefully(&ctx.ps).await {
             Ok(d) => format!("drained and exited in {:.1} s", d.as_secs_f64()),
@@ -712,8 +708,9 @@ async fn do_ps_restart(ctx: &NemesisCtx, graceful: bool) -> Result<String, Strin
         Ok(d) => {
             if drain_clean {
                 let assigned = get_regions(&ctx.mgr).await.regions.len();
-                check_clean_stop_replay(ctx, &log_since(&log_path, spawn_from), assigned, &multi_record);
+                check_clean_stop_replay(ctx, &log_since(&log_path, spawn_from), assigned);
             }
+            record_unmerged_checkpoints(ctx, &format!("after a {kind} restart")).await;
             let mut p = ctx.ps.borrow_mut();
             if graceful {
                 p.restarts.0 += 1;
@@ -785,26 +782,49 @@ async fn roll_row_tails(mgr: &RpcClient, sc: &StreamClient, router: &PsRouter) -
     Ok(format!("rolled {rolled} row tail(s)"))
 }
 
-/// Partitions whose meta stream holds more than one checkpoint record.
-async fn multi_record_partitions(ctx: &NemesisCtx) -> Vec<u64> {
-    let mut out = Vec::new();
+/// Once the PS is ready — every partition open at its current epoch, so a
+/// merge survivor has finished its reopen — each meta stream must hold one
+/// checkpoint record. A merge splices in one per source, and the survivor's
+/// open replaces them; two left behind mean every later open replays the
+/// victim's WAL again.
+async fn record_unmerged_checkpoints(ctx: &NemesisCtx, when: &str) {
+    let ps_id = ctx.ps.borrow().ps_id;
+    if let Err(e) = wait_ps_ready(&ctx.mgr, ps_id).await {
+        ctx.ps_failures.borrow_mut().push(format!("{when}: {e}"));
+        return;
+    }
+    // A flush appends its record and then truncates the meta stream, so one
+    // reading can catch two records for a moment. Count a partition only when
+    // a second reading, 300 ms later, still shows more than one.
     for (part_id, r) in &get_regions(&ctx.mgr).await.regions {
-        if checkpoint_sst_extents(&ctx.sc, r.meta_stream)
-            .await
-            .is_some_and(|records| records.len() > 1)
-        {
-            out.push(*part_id);
+        let mut records = 0;
+        for _ in 0..2 {
+            records = match checkpoint_sst_extents(&ctx.sc, r.meta_stream).await {
+                Some(rs) => rs.len(),
+                None => {
+                    eprintln!("chaos: NOTE {when}: part {part_id}'s meta stream could not be read; its records went unchecked");
+                    0
+                }
+            };
+            if records <= 1 {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(300)).await;
+        }
+        if records > 1 {
+            ctx.ps_failures.borrow_mut().push(format!(
+                "{when}: part {part_id} is open with {records} checkpoint records; its open \
+                 should have merged them into one"
+            ));
         }
     }
-    out
 }
 
 /// After a clean graceful stop, every partition the new process opened must
 /// have replayed next to nothing. A replay line missing for any assigned
 /// partition fails too: the check would otherwise pass on a log it cannot
-/// read. Partitions still carrying several checkpoint records (`multi_record`)
-/// are the known post-merge gap: reported, not failed.
-fn check_clean_stop_replay(ctx: &NemesisCtx, log: &str, assigned: usize, multi_record: &[u64]) {
+/// read.
+fn check_clean_stop_replay(ctx: &NemesisCtx, log: &str, assigned: usize) {
     let volumes = replay_volumes(log);
     let seen: std::collections::BTreeSet<u64> = volumes.iter().map(|(p, _)| *p).collect();
     if seen.len() < assigned {
@@ -815,10 +835,6 @@ fn check_clean_stop_replay(ctx: &NemesisCtx, log: &str, assigned: usize, multi_r
         ));
     }
     for (part_id, bytes) in volumes {
-        if multi_record.contains(&part_id) {
-            ctx.max_multi_record_replay.set(ctx.max_multi_record_replay.get().max(bytes));
-            continue;
-        }
         ctx.max_clean_replay.set(ctx.max_clean_replay.get().max(bytes));
         if bytes > CLEAN_STOP_REPLAY_LIMIT {
             ctx.ps_failures.borrow_mut().push(format!(
@@ -906,7 +922,8 @@ async fn bulk_load(
 /// The row-stream extent of every SST the checkpoint records list, as
 /// recovery reads them: the last valid record of each meta-stream extent
 /// (`read_all_table_locations`; a merged partition carries one per source until
-/// its first flush). `None` when a meta extent cannot be read right now.
+/// its survivor's open replaces them). `None` when a meta extent cannot be read
+/// right now.
 async fn checkpoint_sst_extents(sc: &StreamClient, meta_stream: u64) -> Option<Vec<Vec<u64>>> {
     let info = sc.get_stream_info(meta_stream).await.ok()?;
     let mut out = Vec::new();
@@ -1499,7 +1516,7 @@ async fn reader_loop(
 
 // ── Nemesis ────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Action {
     Split,
     Merge,
@@ -1655,9 +1672,6 @@ struct NemesisCtx {
     /// partition replayed after one.
     clean_replay_checks: Cell<u64>,
     max_clean_replay: Cell<u64>,
-    /// The most a partition still carrying several checkpoint records (the
-    /// post-merge gap) replayed after a clean graceful stop. Reported only.
-    max_multi_record_replay: Cell<u64>,
 }
 
 impl NemesisCtx {
@@ -1734,6 +1748,40 @@ async fn do_merge(ctx: &NemesisCtx) -> Result<String, String> {
     compio::time::sleep(Duration::from_millis(3000)).await;
     refresh_topology(&ctx.mgr, &ctx.topo).await;
     Ok(format!("merge {survivor} <- {victim}"))
+}
+
+/// One merge after the writers stopped, so that no flush follows it: the only
+/// thing that can leave the survivor with one checkpoint record is its own
+/// open, which the check after the final crash restart then reads. While the
+/// writers run, their flushes merge the records within seconds and hide a
+/// missing merge at open. A round that ended with one partition splits it
+/// first, even when `split` is not among the configured actions. A side still
+/// carrying a split parent's keys refuses the merge, so both are compacted and
+/// the merge retried.
+async fn final_merge(ctx: &NemesisCtx) -> Result<String, String> {
+    refresh_topology(&ctx.mgr, &ctx.topo).await;
+    if ctx.topo.snapshot().len() < 2 {
+        do_maintenance(ctx, partition_rpc::MAINTENANCE_COMPACT, "compact").await?;
+        compio::time::sleep(Duration::from_secs(5)).await;
+        do_split(ctx).await.map_err(|e| format!("split before it: {e}"))?;
+    }
+    const ATTEMPTS: usize = 5;
+    let mut last = String::new();
+    for attempt in 1..=ATTEMPTS {
+        match do_merge(ctx).await {
+            Ok(m) => return Ok(m),
+            Err(e) => last = e,
+        }
+        if attempt == ATTEMPTS {
+            break;
+        }
+        do_maintenance(ctx, partition_rpc::MAINTENANCE_COMPACT, "compact")
+            .await
+            .map_err(|e| format!("{last}; then {e}"))?;
+        compio::time::sleep(Duration::from_secs(5)).await;
+        refresh_topology(&ctx.mgr, &ctx.topo).await;
+    }
+    Err(last)
 }
 
 async fn do_ec_convert(ctx: &NemesisCtx) -> Result<String, String> {
@@ -5038,7 +5086,6 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             max_row_extents: Cell::new(0),
             clean_replay_checks: Cell::new(0),
             max_clean_replay: Cell::new(0),
-            max_multi_record_replay: Cell::new(0),
         });
         let n = compio::runtime::spawn({
             let ctx = nemesis_ctx.clone();
@@ -5130,6 +5177,16 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             }
         }
 
+        if cfg.actions.contains(&Action::Merge) {
+            match final_merge(&nemesis_ctx).await {
+                Ok(m) => eprintln!("chaos: final merge with the writers stopped: {m}"),
+                Err(e) => eprintln!(
+                    "chaos: NOTE no merge with the writers stopped ({e}); one checkpoint record \
+                     per merge survivor is checked only where no flush followed a merge"
+                ),
+            }
+        }
+
         eprintln!("chaos: settle 10 s before verify");
         compio::time::sleep(Duration::from_secs(10)).await;
 
@@ -5152,6 +5209,9 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         }
         refresh_topology(&mgr, &topo).await;
         record_checkpoint_violations(&nemesis_ctx, "before verify").await;
+        if final_reopen.is_ok() {
+            record_unmerged_checkpoints(&nemesis_ctx, "after the final crash restart").await;
+        }
         // A partition that never reopened cannot be verified: its reads retry
         // until the outer timeout. Fail here, with what the round recorded.
         if final_reopen.is_err() {
@@ -5452,14 +5512,6 @@ runs ACROSS rounds is uncovered, not unlucky.",
                 nemesis_ctx.clean_replay_checks.get(),
                 nemesis_ctx.max_clean_replay.get()
             );
-            if nemesis_ctx.max_multi_record_replay.get() > 0 {
-                eprintln!(
-                    "chaos: NOTE a partition still carrying several checkpoint records (a merge \
-                     not flushed since) replayed {} bytes after a clean graceful stop — the known \
-                     post-merge gap, not failed",
-                    nemesis_ctx.max_multi_record_replay.get()
-                );
-            }
             let psterm_ran = nemesis_ctx
                 .action_tally
                 .borrow()

@@ -2471,6 +2471,18 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 # "replay after clean graceful stops: checked N restart(s), most any partition
 # replayed B bytes". Measured: HEAD 0 bytes over 12 restarts; the PS before
 # 0a7e85d replayed up to 69 MB on the same seed, growing with every restart.
+# Before every restart and after the final one, once the PS is ready (every
+# partition open at its current epoch, so a merge survivor has reopened), each
+# meta stream must hold ONE checkpoint record: a merge splices in one per
+# source and the survivor's open replaces them. Two left behind mean every
+# later open replays the victim's WAL (926 KB measured before the fix).
+# While the writers run their flushes merge the records within seconds, so a
+# round with `merge` enabled also merges once after the writers stop (splitting
+# first if one partition is left, compacting until the merge is accepted): no
+# flush follows it, and the check after the final crash restart sees what the
+# survivor's open alone left. A PS with that step disabled fails there on every
+# seed tried ("part N is open with 2 checkpoint records").
+# Deterministic form: cargo test -p autumn-manager --test system_merge_single_checkpoint
 # Two more actions shape the row stream: `rollrow` seals and rolls every
 # partition's row tail (the fence-drain path), `flushburst` flushes every
 # partition 8 times so the PS's own size-tiered trim (past 32 SSTs) runs.

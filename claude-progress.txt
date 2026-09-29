@@ -1,3 +1,12 @@
+Date: 2026-09-29 (7)
+TaskStatus: completed
+Task scope: user "所以merge以后，应该生成新的TableLocations啊！，所以就应该只有一个" (BUG-MERGE-MULTI-CHECKPOINT).
+Current summary: recover_partition also returns how many checkpoint records it read. open_partition, before the partition serves, replaces several (a merge's sources) with one (publish_merged_checkpoint): a non-empty memtable is flushed; an empty one gets a record listing the loaded tables with the committed log tail as cursor, save_table_locs_raw truncates the meta stream to it, durable_ckpt_vp is set from it. A crash before the append repeats it at the next open. Chaos: the multi-record exemption is gone; before SIGTERM restarts, after every restart and after the final crash restart, once the PS is ready, every meta stream must hold one record (two reads 300 ms apart). A round with merge enabled merges once more after the writers stop (split first if one partition is left, compact until accepted), because running writers flush the records together within seconds and hid the missing step.
+Verification: new system_merge_single_checkpoint (one record once the survivor serves; graceful restart replays < 64 KiB; red with the step ablated). partition-server lib 270; 21 manager suites incl. ignored (merge, merge_freeze_lostupdate, crash_mid_flush/compact, ps_recovery, ps_crash_takeover, restart_replay_cursor, gc_floor_durable_ckpt, row_truncate_*, split_*, ...). Chaos merge-weighted mix 180 s: fix seeds 1, 2 green; an autumn-ps with the step disabled red on seeds 1, 2, 3 ("part 9001 is open with 2 checkpoint records"). Without the final merge the ablated binary passed one of two rounds.
+Review: fable (no high; applied: no readiness wait before SIGKILL so a crash can still land inside a reopen, double read for the append/truncate window, comments, open-step list), opus on the final-merge delta (no high; applied: keep the merge refusal in the error, no compact after the last attempt, refresh topology first, unreadable meta noted, wording).
+Main gaps: a full default-set round (seed 23) failed on the known physical-reclaim residue (BUG-CHAOS-RECLAIM-RESIDUE), unrelated.
+Next steps: BUG-CHAOS-RECLAIM-RESIDUE when the user wants it.
+
 Date: 2026-09-29 (6)
 TaskStatus: completed
 Task scope: user "bulk-load phase 的确需要，但是sst的最大参数要改，可以从理论上出1b" + "MAX_SKIP_LIST不对，因为没有SKIP_LIST了" (F-CHAOS-PS-RESTART: chaos must reproduce 1b).

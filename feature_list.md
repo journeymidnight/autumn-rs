@@ -23,6 +23,12 @@
 - **notes** (2026-09-29, 用户 "Check replay volume after graceful restarts"): 已加。drain 干净（PS 日志无 flush failed / drain channel cancelled / drain timed out / thread join deadline）的 `psterm` 之后，新进程每个分区的 "log replay done ... bytes" 必须 ≤ 1 MiB，且每个分区都要有这行（缺行即失败）。同种子同配比：HEAD 12 次优雅重启最多 0 字节（绿）；8a4b12a（1a 修复前，只补了这行日志）最多 59–69 MB（红）。仍带多条 checkpoint 记录的分区（merge 后未再 flush——drain 在 memtable 为空时不写 checkpoint）豁免、单独报告：HEAD 的 merge 密集轮实测 926 KB，这个已知缺口是真的。
 - **notes** (2026-09-29, 用户 "bulk-load phase 的确需要，但是sst的最大参数要改，可以从理论上出1b"): 已达成。PS 新增 `--flush-mem-bytes`，删掉 `MAX_SKIP_LIST`（已无 skiplist），所有 compaction 尺寸都由 flush 大小推出；chaos 的 PS 用 256 KiB，负载前加 bulk 阶段（6000 个冷 key、6 批各约一个 memtable、每批 flush、每 2 批滚 row tail）。同配比 seeds 1-3：35d0baf（只补了该 flag）三轮全报 CHECKPOINT VIOLATION，seed 3 随后有分区再也打不开；HEAD 三轮零违例、优雅重启回放 0 字节、6400 key 全对；全动作集 seeds 21/22 全绿。另修：最后一次崩溃重启若有分区打不开立即判失败（原来 verify 会重试到 30 分钟超时）；liveness 探针覆盖只含冷 key 的分区。
 
+### BUG-MERGE-MULTI-CHECKPOINT — merge 后 survivor 留着多条 checkpoint，每次重启都重放 victim 的 WAL
+- **Trigger** (2026-09-29 用户): "所以merge以后，应该生成新的TableLocations啊！，所以就应该只有一个"。merge 把两边的 meta stream 拼进 survivor，恢复读每个 meta extent 的最后一条，得到两条 checkpoint，从较早的游标（survivor 的）一路重放拼在后面的全部 victim log extent；直到 survivor 下一次 flush 才合成一条，而 memtable 为空时 drain 不 flush，于是每次重启都重放（chaos 实测 926 KB）。
+- **Scope**: survivor 打开时（恢复之后、开始服务之前）若发现多于一条 checkpoint，立即发布一条合并后的：memtable 非空就 flush，空则直接写一条列出全部 SST、游标为 log 尾的记录，meta stream 截到一条。chaos 断言 PS ready 时每个分区只有一条。
+- **Acceptance**: 确定性测试：merge 后 survivor 服务时 meta stream 只有一条记录，优雅重启回放 < 64 KiB，消融变红；chaos merge 密集配比 HEAD 绿、消融二进制红；merge/split/恢复相关集成测试全过。
+- `passes: true`
+
 ### BUG-CHAOS-RECLAIM-RESIDUE — chaos 的物理回收检查在 fence 后重建的节点上留有旧副本
 - **Trigger** (2026-09-29，加 PS 重启 chaos 时发现): 全动作集 system_chaos 7 轮里 4 轮 `verify_gc_reclaim` 报 `physical reclaim incomplete`，残留文件都在被 KillThenFence/fence 过、随后由 recovery 在别处重建了副本的节点上（例：extent 22 在 node 1）。旧版与新版 PS 都出现。
 - **Scope**: 查清是检查过严（删除只发给当前成员，非成员残留靠 EN reconcile：3 轮 × 5 min 才收）还是产品缺陷（被替换下来的副本该在重建完成时就删），据此修检查或修产品。

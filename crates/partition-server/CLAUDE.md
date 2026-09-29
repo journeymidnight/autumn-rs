@@ -1046,10 +1046,10 @@ to the position of `PartitionData.durable_ckpt_vp` when it resolves.
 meta_stream checkpoint — set in `commit_flush_outcome_inner` AFTER
 `save_table_locs_raw` returns Ok, and seeded at open from the recovered
 checkpoint's cursor when there is exactly ONE checkpoint record (it is durable
-and recovery replays from it). With two records (a merge not yet flushed) it
-starts at `(0,0)` — the MIN — until the first flush collapses meta_stream to one
-record: punching log extents while two sources' dedup regions are computed from
-extent positions would shift them. A compaction's ack does not set it: its
+and recovery replays from it). With several (a merge's sources) the open
+publishes one merged record before serving and sets it from that; until the
+append acks it is `(0,0)` — the MIN: punching log extents while two sources'
+dedup regions are computed from extent positions would shift them. A compaction's ack does not set it: its
 append may ack after a newer flush's and move the floor back; the next flush
 covers it. Every log record strictly
 below a durable checkpoint vp is in that checkpoint's persisted SST set (or
@@ -1542,7 +1542,9 @@ stay gate-first to match split, else `acquire_compact ↔ maintenance_gate` cycl
   6. Log final state (`open_partition: ready` with tables/sst_readers/has_overlap/
      max_seq/vp_extent_id/vp_offset)
   7. Spawn P-sst OS thread (flush_worker_loop on own compio runtime)
-  8. Spawn P-log background tasks on this thread (maintenance loop, flush loop,
+  8. More than one checkpoint record (a merge's sources): publish one merged record
+     before serving (`publish_merged_checkpoint`; flushes a non-empty memtable)
+  9. Spawn P-log background tasks on this thread (maintenance loop, flush loop,
      accept loop, dispatch)
 ```
 
@@ -2113,6 +2115,16 @@ Three fixes bound the restart replay window (worst case per partition =
     Recovery on success: the merge txn deletes victim's region and widens survivor's;
     `region_sync_loop` sees both on its next ~2 s tick, drops the frozen `PartitionData`
     for victim, reopens survivor with `frozen_for_merge = None` (no explicit unfreeze).
+    The splice leaves one checkpoint record per source in the survivor's meta stream,
+    and recovery replays from the earliest cursor — the survivor's — through every
+    victim log extent spliced in after it. So the survivor's open, before it serves,
+    replaces them with one (`publish_merged_checkpoint`): a non-empty memtable is
+    flushed; an empty one (the drained case) gets a record listing the loaded tables
+    with the log tail as its cursor, and `save_table_locs_raw` truncates meta_stream to
+    the extent holding it. This is what the first flush used to do; the drain writes
+    no checkpoint when the memtable is empty, so until then every restart replayed the
+    victim's WAL. A crash before the append leaves the records and the next open
+    repeats it. Regression: `crates/manager/tests/system_merge_single_checkpoint.rs`.
     Recovery on failure: manager sends `MSG_MERGE_FREEZE { freeze: false }` rollback; the
     FREEZE_TTL backstop fires if even that fails. Merge wallclock is ~2–3 s (bounded by
     the region_sync tick) but write loss is 0. This model avoids cross-thread plumbing

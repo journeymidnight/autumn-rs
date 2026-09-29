@@ -1209,12 +1209,13 @@ pub(crate) struct PartitionData {
     /// region safely (proof: [[gc_replay_floor]] + the flush vp_head content-
     /// boundary invariant). Seeded at open from the recovered checkpoint's
     /// cursor when there is exactly ONE checkpoint record: it is durable, and
-    /// recovery replays from it. With two (a merge not yet flushed) it stays at
-    /// the conservative MIN until this incarnation's first flush publish, which
-    /// collapses meta_stream to one record — punching log extents while two
-    /// sources' dedup regions are computed from extent positions would shift
-    /// them. A compaction's ack does not set it: its append may ack after a
-    /// newer flush's, which would move the floor back; the next flush covers it.
+    /// recovery replays from it. With several (a merge's sources) the open
+    /// publishes one merged record before serving (`publish_merged_checkpoint`)
+    /// and sets this from it; until then it is the conservative MIN — punching
+    /// log extents while two sources' dedup regions are computed from extent
+    /// positions would shift them. A compaction's ack does not set it: its
+    /// append may ack after a newer flush's, which would move the floor back;
+    /// the next flush covers it.
     durable_ckpt_vp: Cell<(u64, u64)>,
     stream_client: Rc<StreamClient>,
     /// This partition's SST block cache, owned by the `PartitionServer` and
@@ -6450,6 +6451,7 @@ async fn partition_thread_main(
         recovered_active,
         recovered_floors,
         recovered_ckpt_vp,
+        ckpt_records,
     ) = recover_partition(
             part_id,
             &rg,
@@ -6614,6 +6616,14 @@ async fn partition_thread_main(
     drop(flush_req_tx);
     drop(row_append_tx);
     drop(row_invalidate_tx);
+
+    // A merge leaves one checkpoint per source in the meta stream. Publish the
+    // merged one before serving, so every later open replays from one cursor.
+    if ckpt_records > 1 {
+        publish_merged_checkpoint(&part)
+            .await
+            .with_context(|| format!("partition {part_id}: merge {ckpt_records} checkpoints into one"))?;
+    }
 
     // Spawn background loops on this thread's compio runtime.
     //
@@ -8980,6 +8990,7 @@ async fn recover_partition(
     Memtable,
     HashMap<u64, u64>,
     Option<(u64, u64)>,
+    usize,
 )> {
     let mut tables: Vec<TableMeta> = Vec::new();
     let mut sst_readers: Vec<Arc<SstReader>> = Vec::new();
@@ -9029,8 +9040,8 @@ async fn recover_partition(
     // The checkpoint's cursor, for GC's replay floor, when there is exactly
     // one checkpoint and its cursor names an extent still in the log. It is
     // durable (recovery just read it), and everything below it is in its
-    // SSTs. With two (a merge not yet flushed) GC waits for the first flush to
-    // collapse them — see the `durable_ckpt_vp` field doc.
+    // SSTs. With two (a merge's sources) the open publishes a merged one
+    // before serving — see the `durable_ckpt_vp` field doc.
     let single_ckpt_vp = match meta_records.as_slice() {
         [r] if r.vp_extent_id != 0 && first_pos_by_eid.contains_key(&r.vp_extent_id) => {
             Some((r.vp_extent_id, r.vp_offset))
@@ -9844,6 +9855,7 @@ async fn recover_partition(
         active,
         fence_floors,
         single_ckpt_vp,
+        meta_records.len(),
     ))
 }
 
@@ -10523,6 +10535,34 @@ pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<F
 /// most ~1–2 times before either claiming a freshly-released imm
 /// ourselves or observing `Empty`.
 const FLUSH_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Replace the several checkpoint records recovery found (one per merge
+/// source) with one. A non-empty memtable is flushed, which publishes it; an
+/// empty one means the SSTs hold everything below the log tail, so the record
+/// names them with the tail as its cursor. `save_table_locs_raw` then
+/// truncates the meta stream to the extent holding it. A crash before the
+/// append leaves the old records, and the next open does this again.
+async fn publish_merged_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
+    if !part.borrow().active.is_empty() {
+        flush_memtable_locked(part).await?;
+        return Ok(());
+    }
+    let (sc, log_stream_id, meta_stream_id, tables, vp, floors) = {
+        let p = part.borrow();
+        (
+            p.stream_client.clone(),
+            p.log_stream_id,
+            p.meta_stream_id,
+            p.tables.clone(),
+            (p.vp_extent_id, p.vp_offset),
+            snapshot_fence_floors(&p),
+        )
+    };
+    let log_extent_count = sc.get_stream_info(log_stream_id).await?.extent_ids.len() as u32;
+    save_table_locs_raw(&sc, meta_stream_id, &tables, vp.0, vp.1, log_extent_count, floors).await?;
+    part.borrow().durable_ckpt_vp.set(vp);
+    Ok(())
+}
 
 pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
     {
