@@ -50,8 +50,9 @@ use sstable::TableIterator;
 // Constants
 // ---------------------------------------------------------------------------
 
+/// Memtable rotation threshold, and so the size of an SST a flush writes.
+/// Compaction reads its own sizes off the same value (`flush_mem_bytes`).
 pub(crate) const FLUSH_MEM_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_SKIP_LIST: u64 = 256 * 1024 * 1024;
 const WRITE_CHANNEL_CAP: usize = 1024;
 const DEFAULT_MAX_WRITE_BATCH: usize = WRITE_CHANNEL_CAP * 3;
 
@@ -161,7 +162,10 @@ pub fn set_max_extent_size_bytes(n: u64) -> bool {
         .set(n.clamp(1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
         .is_ok()
 }
-/// Test/tuning hook: memtable rotation threshold. Clamp [4 KiB, 1 GiB].
+/// Memtable rotation threshold = the SST size a flush writes (`--flush-mem-bytes`).
+/// Compaction sizes follow it: size-tiered skips tables of half of it or more,
+/// a pick holds up to twice it, and an output SST is cut at twice it. Clamp
+/// [4 KiB, 1 GiB].
 pub fn set_flush_mem_bytes(n: u64) -> bool {
     FLUSH_MEM_BYTES_CELL
         .set(n.clamp(4 * 1024, 1024 * 1024 * 1024))
@@ -593,8 +597,8 @@ const COMPACT_N: usize = 5;
 pub(crate) fn ps_major_compact_parallelism() -> usize {
     // D-r7-recal: bumped 1 → 4. The original RAM-cap default was
     // overly conservative — a single compact's spawn_blocking SST
-    // buffer is bounded at ~256 MB (MAX_SKIP_LIST), so 4 concurrent
-    // compacts peak at ~2 GB RSS, well within modern server budgets.
+    // buffer is bounded at 2x the flush size (512 MiB at the default),
+    // so 4 concurrent compacts peak at ~2 GB RSS, well within modern server budgets.
     // The 1 default created a structural bottleneck: with N partitions
     // doing sustained 4K writes (~27 MB/s flush per partition × 16 =
     // 432 MB/s aggregate flush input), a serialized single compact at

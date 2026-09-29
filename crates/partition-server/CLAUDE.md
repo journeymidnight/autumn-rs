@@ -839,7 +839,7 @@ successful major, in every arm that runs one — it must never clear `has_overla
   data (`HEAD_RATIO`), pick up to 5 (`COMPACT_N`) tables from it, to empty old
   extents so the row stream can be truncated.
 - **Size-tiered**: sort tables by sequence, find consecutive "small" tables
-  (< 32MB = `COMPACT_RATIO * MAX_SKIP_LIST`), pick up to `COMPACT_N`.
+  (< `COMPACT_RATIO` × the flush size = 128 MiB by default), pick up to `COMPACT_N`.
 
 Runs `do_compact(major=false)`. `pickup_tables` only SELECTS; it says nothing
 about truncation (next section).
@@ -946,7 +946,7 @@ are refused. `sstable::reader::discards_only_tests`,
        - Range filter: skip keys outside partition range
        - Discard tracking: when dropping VP entries, accumulate {extent_id → bytes}
        - Major filter: skip tombstones and expired entries
-       - If current SstBuilder size > 2 × MAX_SKIP_LIST: finalize, append to
+       - If current SstBuilder size > 2 × the flush size: finalize, append to
          row_stream, push (TableMeta, SstReader) into new_readers, start fresh
        - Otherwise SstBuilder.add(key, op, value, expires_at)
        - After loop: attach aggregated discards to final SstBuilder, finalize,
@@ -1436,6 +1436,7 @@ A per-partition `GcRateLimiter` survives as a deprecated inner cap layered befor
 | `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | **4** | PS-wide compact concurrency (`compact_max`) |
 | `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | **4** | PS-wide gc concurrency (`gc_max`) |
 | `--max-extent-size-bytes` | — | **16 GiB** | per-extent seal threshold to each partition's `StreamClient` (clamp [1 GiB, 64 GiB]) |
+| `--flush-mem-bytes` | — | **256 MiB** | memtable rotation size; every compaction size derives from it (clamp [4 KiB, 1 GiB]) |
 
 `0` on any rate flag = unlimited for that dimension (per-dimension opt-out).
 
@@ -1902,8 +1903,7 @@ initial capacity 512 keys. Encoding: `[num_bits:4B LE][num_hashes:4B LE][bits...
 | Constant | Value | Meaning |
 |----------|-------|---------|
 | `VALUE_THROTTLE` | 4 KB | Large value threshold (store as VP) |
-| `FLUSH_MEM_BYTES` | 256 MB | Memtable size trigger for rotation |
-| `MAX_SKIP_LIST` | 256 MB | Maximum skip list size |
+| `FLUSH_MEM_BYTES` | 256 MB | Memtable size trigger for rotation (`--flush-mem-bytes`). Compaction scales off it: size-tiered skips tables ≥ ½ of it, a pick holds ≤ 2× it, an output SST is cut at 2× it. One setting, so a test can shrink every SST size together and reach many-SST shapes with little data |
 | `MAX_WRITE_BATCH` | 256 | Max requests per group-commit batch |
 | `BLOCK_SIZE_TARGET` | 64 KB | Target SSTable block size |
 | `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC. Halved when stream discard ≥ `stream_debt`, and again for a shared (`refs > 1`) extent. Bypassed entirely by `dead_bytes_high` (`MaintenanceReq.gc_dead_bytes_high`, `autumn-op gc --dead-bytes`), the absolute floor — a big pile is worth collecting at any fraction. |

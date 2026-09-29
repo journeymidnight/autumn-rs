@@ -98,7 +98,7 @@ pub const MERGE_COOLDOWN_SEC: i64 = 6 * 3600;
 pub const GC_DEBT_HIGH: u64 = GIB;
 /// major-compaction debt advisory threshold. Default 4 GiB — higher
 /// than GC because compact's pending bytes naturally accumulate to
-/// MAX_SKIP_LIST × N tables before the periodic loop fires.
+/// flush-size × N tables before the periodic loop fires.
 pub const COMPACT_PENDING_HIGH: u64 = 4 * GIB;
 /// GC advisory cooldown. Once an advisory fires for a partition,
 /// suppress re-emission for 5 min so operators can react without

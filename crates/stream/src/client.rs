@@ -1122,7 +1122,7 @@ pub struct StreamClientConfig {
     /// to distinguish "dead replica" from "slow but progressing", not to
     /// estimate typical latency. 4 KiB WAL → +0.5 ms (unchanged); 8 MiB →
     /// 6 s (matches the measured degraded p99); 256 MiB SST → 37 s; 512 MiB
-    /// compaction output (2 × MAX_SKIP_LIST) → 69 s.
+    /// compaction output (2 × the flush size) → 69 s.
     pub append_floor_bytes_per_sec: u64,
     pub read_chunk_bytes: u64,
     /// BUG-READ-TIMEOUT-STORM: the READ side of the size-scaled I/O deadline
@@ -1418,7 +1418,7 @@ mod io_deadline_tests {
             "256 MiB SST deadline must be ≥ base + payload/floor ({want:?}), got {d_sst:?}"
         );
 
-        // do_compact finalizes SSTs at 2 × MAX_SKIP_LIST = 512 MiB — the
+        // do_compact finalizes SSTs at 2 × the flush size = 512 MiB — the
         // deadline must keep scaling, not plateau at a hand-picked constant.
         let d_compact = effective_io_timeout(
             cfg.append_fanout_timeout,

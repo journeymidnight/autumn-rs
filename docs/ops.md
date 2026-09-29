@@ -2478,14 +2478,22 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 # warnings" counts partitions a graceful stop left unflushed (one PS log line
 # per partition; the WAL replays them; counted, not failed).
 # Run an older PS against today's checks with AUTUMN_CHAOS_PS_BIN=<path>.
-# Known limit: this workload does NOT reproduce the truncation bug fixed in
-# 8a4b12a even against that commit's parent — eight rounds, 0 violations. Its
-# shape needs a size-tiered pass that skips >= 128 MiB SSTs (bulk ingest, then
-# trickle), and chaos values are 256 B / 8 KiB. That bug is pinned by
-# system_row_truncate_live_refs; the check here guards the invariant itself.
+# The PS runs with --flush-mem-bytes 256 KiB (AUTUMN_CHAOS_PS_FLUSH_BYTES; 0 =
+# the PS default, 256 MiB). Every compaction size scales from it, so small
+# chaos values reach the shapes production reaches with 256 MiB memtables.
+# Before the workload a bulk phase (AUTUMN_CHAOS_BULK=1, the default) writes
+# 6000 cold keys `c000000..c005999` in 6 bursts of about one memtable, flushes
+# each burst, and rolls the row tail every 2: large SSTs spread over several
+# row extents, which size-tiered compaction then skips while the workload's
+# small flushes pile up. That is the production shape of the truncation bug
+# fixed in 8a4b12a. Measured with the mix below, seeds 1-3: the parent of
+# 8a4b12a gets a CHECKPOINT VIOLATION on all three (on seed 3 a partition then
+# stops reopening); HEAD gets 0 violations, 0 bytes replayed, and no lost key.
+# A final crash restart that leaves a partition closed fails the round at once
+# (verify cannot read it).
 cargo build --workspace --bins
 AUTUMN_CHAOS_SEED=1 AUTUMN_CHAOS_DURATION_SECS=180 AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1000 \
-  AUTUMN_CHAOS_ACTIONS=rollrow,flush,rollrow,flush,rollrow,flush,rollrow,flush,flushburst,flushburst,flushburst,compact,split,merge,pskill,psterm \
+  AUTUMN_CHAOS_ACTIONS=rollrow,flush,flushburst,rollrow,flush,flushburst,rollrow,flushburst,compact,split,merge,pskill,psterm \
   cargo test -p autumn-manager --test system_chaos chaos_real -- --ignored --nocapture
 # vp_head multi-seed chaos: several seeds through the
 # same system_chaos harness,

@@ -53,6 +53,7 @@ struct Args {
     /// Clamped to [1 GiB, 64 GiB]. Bigger = fewer extents = less manager/etcd
     /// metadata pressure at scale (enabled by the u64-offset widening).
     max_extent_size_bytes: Option<u64>,
+    flush_mem_bytes: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
     major_compact_parallelism: Option<usize>,
     gc_parallelism: Option<usize>,
@@ -122,6 +123,7 @@ fn parse_args() -> Args {
     let mut max_imm_depth: Option<usize> = None;
     let mut max_wal_gap: Option<u64> = None;
     let mut max_extent_size_bytes: Option<u64> = None;
+    let mut flush_mem_bytes: Option<u64> = None;
     let mut shutdown_timeout_ms: Option<u64> = None;
     let mut major_compact_parallelism: Option<usize> = None;
     let mut gc_parallelism: Option<usize> = None;
@@ -246,6 +248,10 @@ fn parse_args() -> Args {
                 i += 1;
                 max_extent_size_bytes =
                     Some(args[i].parse().expect("--max-extent-size-bytes u64 bytes"));
+            }
+            "--flush-mem-bytes" => {
+                i += 1;
+                flush_mem_bytes = Some(args[i].parse().expect("--flush-mem-bytes u64 bytes"));
             }
             "--shutdown-timeout-ms" => {
                 i += 1;
@@ -414,6 +420,10 @@ fn parse_args() -> Args {
                 eprintln!("  --max-extent-size-bytes <N>  Per-extent seal threshold");
                 eprintln!("                       [default: 16 GiB, clamp 1-64 GiB]. Bigger =");
                 eprintln!("                       fewer extents = less manager metadata pressure.");
+                eprintln!("  --flush-mem-bytes <N>  Memtable size = SST size a flush writes;");
+                eprintln!("                       compaction sizes follow it [default: 256 MiB,");
+                eprintln!("                       clamp 4 KiB-1 GiB]. Tests shrink it to reach");
+                eprintln!("                       many-SST shapes with little data.");
                 eprintln!(
                     "  --cpu-start <N>      First core to pin partition threads to [default: 0]"
                 );
@@ -468,6 +478,7 @@ fn parse_args() -> Args {
         max_imm_depth,
         max_wal_gap,
         max_extent_size_bytes,
+        flush_mem_bytes,
         shutdown_timeout_ms,
         major_compact_parallelism,
         gc_parallelism,
@@ -527,6 +538,9 @@ fn apply_ps_tunables(args: &Args) {
     }
     if let Some(n) = args.max_extent_size_bytes {
         ps::set_max_extent_size_bytes(n);
+    }
+    if let Some(n) = args.flush_mem_bytes {
+        ps::set_flush_mem_bytes(n);
     }
     if let Some(n) = args.shutdown_timeout_ms {
         ps::set_shutdown_timeout_ms(n);

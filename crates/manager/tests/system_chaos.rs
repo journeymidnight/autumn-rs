@@ -129,6 +129,11 @@ struct ChaosConfig {
     /// not: nothing here faults a disk (see `data_dirs`).
     disks_per_en: u32,
     seed: u64,
+    /// `AUTUMN_CHAOS_PS_FLUSH_BYTES` (default 256 KiB, 0 = the PS default):
+    /// the PS's `--flush-mem-bytes`, which scales every SST size.
+    ps_flush_bytes: u64,
+    /// `AUTUMN_CHAOS_BULK` (default 1): run the bulk phase (`bulk_load`).
+    bulk: bool,
     /// Comma-separated subset of action names to enable. Empty = all.
     /// Names: split,merge,ec,fence,flush,compact,gc,forcegc,kill,killfence,partition,latency,
     /// corrupt,psterm,pskill,rollrow,flushburst
@@ -214,6 +219,8 @@ impl ChaosConfig {
             num_ens,
             disks_per_en: env_u32("AUTUMN_CHAOS_DISKS_PER_EN", 2).max(1),
             seed,
+            ps_flush_bytes: env_u64("AUTUMN_CHAOS_PS_FLUSH_BYTES", 256 * 1024),
+            bulk: env_u64("AUTUMN_CHAOS_BULK", 1) != 0,
             actions,
             decommission,
         }
@@ -423,6 +430,8 @@ struct PsProcess {
     addr: SocketAddr,
     manager_addr: SocketAddr,
     log_path: PathBuf,
+    /// `--flush-mem-bytes`, when set.
+    flush_bytes: Option<u64>,
     /// Restarts actually carried out, `(graceful, crash)`.
     restarts: (u64, u64),
 }
@@ -439,7 +448,11 @@ impl PsProcess {
             .append(true)
             .open(&self.log_path)
             .expect("open PS log");
-        let child = Command::new(&self.binary)
+        let mut cmd = Command::new(&self.binary);
+        if let Some(n) = self.flush_bytes {
+            cmd.args(["--flush-mem-bytes", &n.to_string()]);
+        }
+        let child = cmd
             .args([
                 "--psid",
                 &self.ps_id.to_string(),
@@ -724,11 +737,15 @@ async fn do_ps_restart(ctx: &NemesisCtx, graceful: bool) -> Result<String, Strin
 /// Nemesis: seal and roll each partition's row-stream tail through its PS
 /// (`MSG_ROLL_TAILS`, the fence-drain path), so later flushes land in new extents.
 async fn do_roll_row(ctx: &NemesisCtx) -> Result<String, String> {
-    let regions = get_regions(&ctx.mgr).await;
+    roll_row_tails(&ctx.mgr, &ctx.sc, &ctx.router).await
+}
+
+async fn roll_row_tails(mgr: &RpcClient, sc: &StreamClient, router: &PsRouter) -> Result<String, String> {
+    let regions = get_regions(mgr).await;
     let mut rolled = 0u32;
     let mut last_err = String::new();
     for (part_id, r) in &regions.regions {
-        let tail = match ctx.sc.get_stream_info(r.row_stream).await {
+        let tail = match sc.get_stream_info(r.row_stream).await {
             Ok(info) => match info.extent_ids.last() {
                 Some(&t) => t,
                 None => continue,
@@ -738,7 +755,7 @@ async fn do_roll_row(ctx: &NemesisCtx) -> Result<String, String> {
                 continue;
             }
         };
-        let client = match ctx.router.try_client_for(*part_id).await {
+        let client = match router.try_client_for(*part_id).await {
             Ok(c) => c,
             Err(e) => {
                 last_err = e;
@@ -812,6 +829,76 @@ fn check_clean_stop_replay(ctx: &NemesisCtx, log: &str, assigned: usize, multi_r
         }
     }
     ctx.clean_replay_checks.set(ctx.clean_replay_checks.get() + 1);
+}
+
+/// Bulk phase: load every cold key once, before the nemesis, in bursts of
+/// about one memtable each, flushing after each burst and rolling the row
+/// stream every `BULK_BURSTS_PER_EXTENT` bursts. This leaves full-size SSTs
+/// spread over several row extents — the tables size-tiered compaction skips
+/// (half the flush size or more), so the small ones the workload flushes later
+/// are merged around them and land out of row-stream order. That is the
+/// history the truncation bug fixed in 8a4b12a needed, and with the PS run at a
+/// small `--flush-mem-bytes` it costs a few MiB instead of gigabytes.
+async fn bulk_load(
+    mgr: &RpcClient,
+    sc: &StreamClient,
+    router: &PsRouter,
+    topo: &Topology,
+    expected: &RefCell<HashMap<Vec<u8>, Vec<u8>>>,
+) {
+    let per_burst = COLD_KEY_COUNT / BULK_BURSTS;
+    for burst in 0..BULK_BURSTS {
+        for kid in burst * per_burst..(burst + 1) * per_burst {
+            let key = chaos_key(b'c', kid);
+            let value = make_value(&key, 1);
+            let part_id = topo.route(&key);
+            let client = router.client_for(part_id).await;
+            let resp = client
+                .call(
+                    partition_rpc::MSG_PUT,
+                    partition_rpc::rkyv_encode(&partition_rpc::PutReq {
+                        part_id,
+                        key: key.clone(),
+                        value: value.clone(),
+                        expires_at: 0,
+                        region_epoch: 0,
+                        inode_hint: 0,
+                        lease_epoch: 0,
+                    }),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("bulk put {kid}: {e}"));
+            let r: partition_rpc::PutResp = partition_rpc::rkyv_decode(&resp).expect("decode PutResp");
+            assert_eq!(r.code, partition_rpc::CODE_OK, "bulk put {kid} refused: {}", r.message);
+            expected.borrow_mut().insert(key, value);
+        }
+        for (_, _, part_id) in topo.snapshot() {
+            let client = router.client_for(part_id).await;
+            client
+                .call(
+                    partition_rpc::MSG_MAINTENANCE,
+                    partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
+                        part_id,
+                        op: partition_rpc::MAINTENANCE_FLUSH,
+                        extent_ids: vec![],
+                        gc_ratio: None,
+                        gc_max_size: None,
+                        gc_stream_debt: None,
+                        gc_dead_bytes_high: None,
+                        gc_empty_only: false,
+                        gc_policy_is_standing: false,
+                        op_id: 0,
+                    }),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("bulk flush: {e}"));
+        }
+        if (burst + 1) % BULK_BURSTS_PER_EXTENT == 0 {
+            roll_row_tails(mgr, sc, router)
+                .await
+                .unwrap_or_else(|e| panic!("bulk roll: {e}"));
+        }
+    }
 }
 
 // ── Checkpoint ⊆ row stream ────────────────────────────────────────────
@@ -1069,6 +1156,16 @@ async fn refresh_topology(mgr: &RpcClient, topo: &Topology) {
 /// truth: keys are exactly `{CHAOS_NS}{b|q}{kid:06}` for `kid in [0, CHAOS_KEY_COUNT)`.
 const CHAOS_KEY_COUNT: u32 = 200;
 
+/// Cold keys: written once by the bulk phase, before the nemesis starts, and
+/// never overwritten — `{CHAOS_NS}c{kid:06}`. Their only copy sits in old SSTs,
+/// so a lost SST shows as a missing key; the overwritten `b`/`q` keys cannot
+/// show that, their newest version always lives in the memtable or a new SST.
+const COLD_KEY_COUNT: u32 = 6000;
+/// Bulk-phase shape: bursts of cold keys, each about one memtable, flushed
+/// on its own, with a row-stream roll after every `BULK_BURSTS_PER_EXTENT`.
+const BULK_BURSTS: u32 = 6;
+const BULK_BURSTS_PER_EXTENT: u32 = 2;
+
 /// Annotate a write-failure reason that is EXPECTED given how this harness
 /// drives the cluster, so nobody re-investigates it as a defect.
 ///
@@ -1110,10 +1207,11 @@ fn chaos_key(prefix: u8, kid: u32) -> Vec<u8> {
 fn liveness_probe_key(start: &[u8], end: &[u8]) -> Option<Vec<u8>> {
     (0..CHAOS_KEY_COUNT)
         .flat_map(|kid| [chaos_key(b'b', kid), chaos_key(b'q', kid)])
+        .chain((0..COLD_KEY_COUNT).map(|kid| chaos_key(b'c', kid)))
         .find(|key| key.as_slice() >= start && (end.is_empty() || key.as_slice() < end))
 }
 
-/// Parse a chaos key `{CHAOS_NS}{b|q}{6 ASCII digits}` → its `kid`, or None if it is not a
+/// Parse a chaos key `{CHAOS_NS}{b|q|c}{6 ASCII digits}` → its `kid`, or None if it is not a
 /// well-formed key any writer could have produced. Used by the no-phantom range
 /// check: a range MUST NOT return a key outside this space (a malformed key, a
 /// kid the writers never use, or a sibling key leaked across a split/merge
@@ -1121,7 +1219,7 @@ fn liveness_probe_key(start: &[u8], end: &[u8]) -> Option<Vec<u8>> {
 fn chaos_kid(key: &[u8]) -> Option<u32> {
     let key = key.strip_prefix(CHAOS_NS.as_bytes())?;
     if key.len() == 7
-        && (key[0] == b'b' || key[0] == b'q')
+        && (key[0] == b'b' || key[0] == b'q' || key[0] == b'c')
         && key[1..].iter().all(u8::is_ascii_digit)
     {
         std::str::from_utf8(&key[1..]).ok()?.parse::<u32>().ok()
@@ -1132,7 +1230,9 @@ fn chaos_kid(key: &[u8]) -> Option<u32> {
 
 /// True iff `key` is a key a writer could legitimately have written.
 fn is_valid_chaos_key(key: &[u8]) -> bool {
-    matches!(chaos_kid(key), Some(kid) if kid < CHAOS_KEY_COUNT)
+    let cold = key.get(CHAOS_NS.len()) == Some(&b'c');
+    let limit = if cold { COLD_KEY_COUNT } else { CHAOS_KEY_COUNT };
+    matches!(chaos_kid(key), Some(kid) if kid < limit)
 }
 
 fn make_value(key: &[u8], seq: u64) -> Vec<u8> {
@@ -4572,6 +4672,15 @@ async fn run_terminal_decommission(
     ))
 }
 
+/// A split can land inside the bulk phase's cold keys, leaving a partition
+/// that holds nothing else. The liveness check must still find it a key.
+#[test]
+fn liveness_probe_key_covers_a_cold_only_partition() {
+    let start = chaos_key(b'c', 600);
+    let end = chaos_key(b'c', 1400);
+    assert_eq!(liveness_probe_key(&start, &end), Some(start));
+}
+
 /// The replay check reads the PS's own coloured log: `tracing` wraps field
 /// names in escapes, so a parser that did not strip them would find nothing
 /// and the check would pass on every round.
@@ -4795,6 +4904,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             addr: ps_addr,
             manager_addr: mgr_addr,
             log_path: log_dir.join("ps-91.log"),
+            flush_bytes: (cfg.ps_flush_bytes > 0).then_some(cfg.ps_flush_bytes),
             restarts: (0, 0),
         });
         ps.borrow_mut().spawn();
@@ -4816,6 +4926,15 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         refresh_topology(&mgr, &topo).await;
         let expected: Rc<RefCell<HashMap<Vec<u8>, Vec<u8>>>> =
             Rc::new(RefCell::new(HashMap::new()));
+        if cfg.bulk {
+            let t0 = Instant::now();
+            bulk_load(&mgr, &sc, &router, &topo, &expected).await;
+            eprintln!(
+                "chaos: bulk phase loaded {COLD_KEY_COUNT} cold keys in {BULK_BURSTS} flushed bursts, \
+                 rolling the row stream every {BULK_BURSTS_PER_EXTENT}, in {:.1} s",
+                t0.elapsed().as_secs_f64()
+            );
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let writes_acked = Arc::new(AtomicU64::new(0));
@@ -5020,7 +5139,8 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         // checkpoint again, and the readers only ask for newest values.
         eprintln!("chaos: crash-restarting the PS; every partition must reopen");
         nemesis_ctx.ps.borrow_mut().kill();
-        match respawn_ps(&nemesis_ctx.ps, &mgr, Instant::now()).await {
+        let final_reopen = respawn_ps(&nemesis_ctx.ps, &mgr, Instant::now()).await;
+        match &final_reopen {
             Ok(d) => eprintln!(
                 "chaos: every partition reopened, confirmed {:.1} s after the kill",
                 d.as_secs_f64()
@@ -5032,6 +5152,17 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         }
         refresh_topology(&mgr, &topo).await;
         record_checkpoint_violations(&nemesis_ctx, "before verify").await;
+        // A partition that never reopened cannot be verified: its reads retry
+        // until the outer timeout. Fail here, with what the round recorded.
+        if final_reopen.is_err() {
+            let mut why: Vec<String> = nemesis_ctx.ps_failures.borrow().clone();
+            why.extend(nemesis_ctx.checkpoint_violations.borrow().iter().cloned());
+            panic!(
+                "chaos verify FAILED — a partition never reopened, so verify cannot run:\n  {}\nlogs: {}",
+                why.join("\n  "),
+                log_dir.display()
+            );
+        }
 
         // -------- Terminal decommission (AUTUMN_CHAOS_DECOMMISSION=1) --------
         // Runs on the SETTLED cluster (all ENs back online, no in-flight chaos) —

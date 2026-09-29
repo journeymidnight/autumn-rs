@@ -1,3 +1,12 @@
+Date: 2026-09-29 (6)
+TaskStatus: completed
+Task scope: user "bulk-load phase 的确需要，但是sst的最大参数要改，可以从理论上出1b" + "MAX_SKIP_LIST不对，因为没有SKIP_LIST了" (F-CHAOS-PS-RESTART: chaos must reproduce 1b).
+Current summary: MAX_SKIP_LIST removed; every compaction size (size-tiered throttle, pickup capacity, output chunk) derives from flush_mem_bytes(), identical at the 256 MiB default. autumn-ps gets --flush-mem-bytes. system_chaos runs the PS at 256 KiB (AUTUMN_CHAOS_PS_FLUSH_BYTES) and, before the workload, a bulk phase (AUTUMN_CHAOS_BULK): 6000 cold keys in 6 bursts of about one memtable, each flushed, row tail rolled every 2 bursts — big SSTs over several row extents that size-tiered skips, the production shape of 1b. Harness: the round fails at once when the final crash restart leaves a partition closed (was: verify retried until the 30 min timeout); the liveness probe also uses cold keys (splits now land inside them).
+Verification: same mix, seeds 1-3, 180 s: 35d0baf (flag only) CHECKPOINT VIOLATION on all three, seed 3 then a partition never reopened; HEAD 0 violations, 0 bytes replayed after clean graceful stops, 6400 keys correct, all invariants OK. Full default set seeds 21/22 with bulk on: OK. partition-server lib 270, manager lib 442, system_row_truncate_live_refs, system_row_truncate_queued_flush, system_flush_race_vp_head, system_chaos unit tests 20.
+Review: fable (no high; applied: welded doc comment on the new test, the two 8 KiB-flush tests re-run, CLI table row, 2x-flush-size comment wording, log dir in the fail-fast panic).
+Main gaps: the post-merge checkpoint (two records until the survivor's first flush) — user: "merge以后，应该生成新的TableLocations啊！，所以就应该只有一个"; next task. BUG-CHAOS-RECLAIM-RESIDUE open.
+Next steps: write a single merged TableLocations at the survivor's first open after a merge; chaos asserts one record after every merge and drops the multi-record exemption.
+
 Date: 2026-09-29 (5)
 TaskStatus: completed
 Task scope: user "Check replay volume after graceful restarts" (F-CHAOS-PS-RESTART follow-up: chaos coverage for the 1a replay bug).

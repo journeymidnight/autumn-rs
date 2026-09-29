@@ -608,7 +608,7 @@ pub(crate) async fn background_maintenance_loop(
                 let compact_tbls = if major {
                     tbls.clone()
                 } else {
-                    pickup_tables(&tbls, 2 * MAX_SKIP_LIST)
+                    pickup_tables(&tbls, 2 * crate::flush_mem_bytes())
                 };
                 // Skip when the size-tiered selector couldn't pick a mergeable
                 // pair (minor only) or when there's literally nothing to
@@ -842,7 +842,7 @@ pub(crate) async fn background_maintenance_loop(
                         == 0
                 {
                     let tbls = part.borrow().tables.clone();
-                    let compact_tbls = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+                    let compact_tbls = pickup_tables(&tbls, 2 * crate::flush_mem_bytes());
                     if compact_tbls.len() >= 2 {
                         // Per-partition maintenance_gate (see main arm above).
                         let _local_gate = maintenance_gate.acquire().await;
@@ -2153,7 +2153,7 @@ pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>
     if overlap == 1 {
         return tbls.iter().map(|t| t.estimated_size).sum();
     }
-    let compact_tbls = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+    let compact_tbls = pickup_tables(&tbls, 2 * crate::flush_mem_bytes());
     compact_tbls.iter().map(|t| t.estimated_size).sum()
 }
 
@@ -2212,7 +2212,7 @@ pub(crate) fn refresh_metrics(part: &Rc<RefCell<PartitionData>>) {
     metrics.sst_out_of_range_bytes.store(sst_oor, Relaxed);
 
     let minor_pending: u64 = if overlap == 0 {
-        let picked = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+        let picked = pickup_tables(&tbls, 2 * crate::flush_mem_bytes());
         picked.iter().map(|t| t.estimated_size).sum()
     } else {
         0
@@ -2380,7 +2380,7 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> Vec<Tabl
     // Size-tiered rule
     let mut tbls_sorted = tables.to_vec();
     tbls_sorted.sort_by_key(|t| t.last_seq);
-    let throttle = (COMPACT_RATIO * MAX_SKIP_LIST as f64).round() as u64;
+    let throttle = (COMPACT_RATIO * crate::flush_mem_bytes() as f64).round() as u64;
     let mut compact_tbls: Vec<TableMeta> = Vec::new();
     let mut i = 0usize;
     while i < tbls_sorted.len() {
@@ -2649,7 +2649,7 @@ pub(crate) async fn do_compact(
     );
 
     let now = now_secs();
-    let max_chunk = 2 * MAX_SKIP_LIST as usize;
+    let max_chunk = 2 * crate::flush_mem_bytes() as usize;
 
     // yield to other tasks on this compio runtime every
     // COMPACT_YIELD_EVERY entries. Formerly the merge loop ran up to
@@ -3332,7 +3332,7 @@ impl GcRateLimiter {
 /// promoted from `gc_yield_now` (was GC-only) to a crate-private
 /// helper and now also called from `do_compact`'s merge loop every
 /// `COMPACT_YIELD_EVERY` entries (1000) — formerly the inline merge
-/// loop ran up to `2 * MAX_SKIP_LIST = 512 MiB` of entries with NO
+/// loop ran up to 2x the flush size (512 MiB at the default) of entries with NO
 /// `.await`, blocking the P-log compio runtime for ~1-2 SECONDS on
 /// large compactions. Client puts/gets to the same partition stalled
 /// for that duration. Heartbeat (PS-main runtime) was unaffected —
@@ -5359,7 +5359,7 @@ mod compaction_truncate_tests {
             t(11, 7, 300 * MB),
             t(12, 8, 10 * MB),
         ];
-        let picked = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
+        let picked = pickup_tables(&tables, 2 * crate::flush_mem_bytes());
         assert_eq!(picked.len(), 2, "precondition: the head rule takes extent 10's tables");
         let live = live_after(&tables, &picked, 12);
         let cut = row_truncate_point(&row_stream, &live);
@@ -5373,7 +5373,7 @@ mod compaction_truncate_tests {
     fn a_partly_consumed_head_extent_is_kept() {
         let mut tables: Vec<TableMeta> = (0..8).map(|i| t(10, i + 1, 10 * MB)).collect();
         tables.push(t(11, 100, 4 * 1024 * MB));
-        let picked = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
+        let picked = pickup_tables(&tables, 2 * crate::flush_mem_bytes());
         assert!(!picked.is_empty() && picked.len() < 8, "precondition");
         let live = live_after(&tables, &picked, 11);
         assert_eq!(row_truncate_point(&[10, 11], &live), None);
@@ -5383,7 +5383,7 @@ mod compaction_truncate_tests {
     fn a_fully_consumed_head_extent_is_dropped() {
         let mut tables: Vec<TableMeta> = (0..3).map(|i| t(10, i + 1, 10 * MB)).collect();
         tables.push(t(11, 100, 4 * 1024 * MB));
-        let picked = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
+        let picked = pickup_tables(&tables, 2 * crate::flush_mem_bytes());
         assert_eq!(picked.len(), 3);
         let live = live_after(&tables, &picked, 12);
         assert_eq!(row_truncate_point(&[10, 11, 12], &live), Some(11));
