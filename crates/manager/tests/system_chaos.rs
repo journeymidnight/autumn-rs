@@ -14,6 +14,8 @@
 //!      step, and once more after a final PS crash restart, every SST a
 //!      partition's checkpoint lists must sit in an extent its row stream
 //!      still has.
+//!      After a graceful PS stop that flushed everything, no partition may
+//!      replay more than 1 MiB of WAL on reopen.
 //!
 //! **Real process kills.** ENs run as `autumn-extent-node` SUBPROCESSES
 //! (formatted via `autumn-op format` first), so SIGKILL exercises the
@@ -604,6 +606,56 @@ async fn respawn_ps(ps: &RefCell<PsProcess>, mgr: &RpcClient, stopped_at: Instan
     Ok(stopped_at.elapsed())
 }
 
+/// After a graceful stop that flushed every partition, reopening one replays
+/// at most this much WAL. The checkpoint's cursor then sits at the log's end;
+/// what little is left is the drain's own records. Replaying far more means
+/// recovery started from an older cursor — the production restart that read
+/// 15.75 GB for one partition.
+const CLEAN_STOP_REPLAY_LIMIT: u64 = 1024 * 1024;
+
+/// Lines the PS logs when a graceful stop leaves a partition unflushed; its
+/// WAL then replays on restart, which is expected.
+///
+/// Not every skip is logged: `shutdown()` passes silently over a partition
+/// with no drain channel or a dead thread. Such a partition replays on
+/// restart with no marker, and this check reports it as a failure.
+const UNCLEAN_DRAIN_MARKERS: [&str; 4] = [
+    "graceful shutdown: flush failed",
+    "graceful shutdown: drain channel cancelled",
+    "drain timed out",
+    "thread join deadline",
+];
+
+fn log_len(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// The log written since `from`, colour codes removed.
+fn log_since(path: &Path, from: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut raw = Vec::new();
+    if let Ok(mut f) = std::fs::File::open(path) {
+        if f.seek(SeekFrom::Start(from)).is_ok() {
+            let _ = f.read_to_end(&mut raw);
+        }
+    }
+    strip_ansi(&String::from_utf8_lossy(&raw))
+}
+
+/// `(part_id, bytes)` of every "log replay done" line: what each partition
+/// opened by this process read from its WAL.
+fn replay_volumes(log: &str) -> Vec<(u64, u64)> {
+    let field = |line: &str, name: &str| -> Option<u64> {
+        line.split_whitespace()
+            .find_map(|tok| tok.strip_prefix(name))
+            .and_then(|v| v.trim_end_matches(',').parse().ok())
+    };
+    log.lines()
+        .filter(|l| l.contains("log replay done"))
+        .filter_map(|l| Some((field(l, "part_id=")?, field(l, "bytes=")?)))
+        .collect()
+}
+
 /// Nemesis: stop the PS gracefully (SIGTERM) or crash it (SIGKILL), start it
 /// again, and wait for every partition to reopen. A drain that overruns or a
 /// partition that never reopens is recorded as a failure of the round, not a
@@ -613,6 +665,17 @@ async fn do_ps_restart(ctx: &NemesisCtx, graceful: bool) -> Result<String, Strin
     if !ctx.ps.borrow().is_running() {
         return Err("PS is not running".to_string());
     }
+    let log_path = ctx.ps.borrow().log_path.clone();
+    let stop_from = log_len(&log_path);
+    // A drain with an empty memtable writes no checkpoint, so a partition
+    // still carrying more than one checkpoint record (a merge not flushed
+    // since) keeps them, and its reopen replays from the older one — the
+    // known post-merge gap. Found here, before the stop.
+    let multi_record = if graceful {
+        multi_record_partitions(ctx).await
+    } else {
+        Vec::new()
+    };
     let stop_note = if graceful {
         match stop_ps_gracefully(&ctx.ps).await {
             Ok(d) => format!("drained and exited in {:.1} s", d.as_secs_f64()),
@@ -626,8 +689,18 @@ async fn do_ps_restart(ctx: &NemesisCtx, graceful: bool) -> Result<String, Strin
         "killed".to_string()
     };
     let stopped_at = Instant::now();
+    let spawn_from = log_len(&log_path);
+    let drain_clean = graceful
+        && stop_note.starts_with("drained")
+        && !log_since(&log_path, stop_from)
+            .lines()
+            .any(|l| UNCLEAN_DRAIN_MARKERS.iter().any(|m| l.contains(m)));
     match respawn_ps(&ctx.ps, &ctx.mgr, stopped_at).await {
         Ok(d) => {
+            if drain_clean {
+                let assigned = get_regions(&ctx.mgr).await.regions.len();
+                check_clean_stop_replay(ctx, &log_since(&log_path, spawn_from), assigned, &multi_record);
+            }
             let mut p = ctx.ps.borrow_mut();
             if graceful {
                 p.restarts.0 += 1;
@@ -693,6 +766,52 @@ async fn do_roll_row(ctx: &NemesisCtx) -> Result<String, String> {
         return Err(format!("rolled no row tail (last: {last_err})"));
     }
     Ok(format!("rolled {rolled} row tail(s)"))
+}
+
+/// Partitions whose meta stream holds more than one checkpoint record.
+async fn multi_record_partitions(ctx: &NemesisCtx) -> Vec<u64> {
+    let mut out = Vec::new();
+    for (part_id, r) in &get_regions(&ctx.mgr).await.regions {
+        if checkpoint_sst_extents(&ctx.sc, r.meta_stream)
+            .await
+            .is_some_and(|records| records.len() > 1)
+        {
+            out.push(*part_id);
+        }
+    }
+    out
+}
+
+/// After a clean graceful stop, every partition the new process opened must
+/// have replayed next to nothing. A replay line missing for any assigned
+/// partition fails too: the check would otherwise pass on a log it cannot
+/// read. Partitions still carrying several checkpoint records (`multi_record`)
+/// are the known post-merge gap: reported, not failed.
+fn check_clean_stop_replay(ctx: &NemesisCtx, log: &str, assigned: usize, multi_record: &[u64]) {
+    let volumes = replay_volumes(log);
+    let seen: std::collections::BTreeSet<u64> = volumes.iter().map(|(p, _)| *p).collect();
+    if seen.len() < assigned {
+        ctx.ps_failures.borrow_mut().push(format!(
+            "after a clean graceful stop the new PS logged \"log replay done\" for {} of {assigned} \
+             partitions — the replay check could not see the rest",
+            seen.len()
+        ));
+    }
+    for (part_id, bytes) in volumes {
+        if multi_record.contains(&part_id) {
+            ctx.max_multi_record_replay.set(ctx.max_multi_record_replay.get().max(bytes));
+            continue;
+        }
+        ctx.max_clean_replay.set(ctx.max_clean_replay.get().max(bytes));
+        if bytes > CLEAN_STOP_REPLAY_LIMIT {
+            ctx.ps_failures.borrow_mut().push(format!(
+                "part {part_id} replayed {bytes} bytes of WAL after a clean graceful stop \
+                 (limit {CLEAN_STOP_REPLAY_LIMIT}): recovery started from an older cursor \
+                 than the drain's checkpoint"
+            ));
+        }
+    }
+    ctx.clean_replay_checks.set(ctx.clean_replay_checks.get() + 1);
 }
 
 // ── Checkpoint ⊆ row stream ────────────────────────────────────────────
@@ -1432,6 +1551,13 @@ struct NemesisCtx {
     /// The most extents any row stream had when checked. A cut past a live SST
     /// needs at least two; a round that never got there tested nothing here.
     max_row_extents: Cell<usize>,
+    /// Graceful restarts whose replay volume was checked, and the most any
+    /// partition replayed after one.
+    clean_replay_checks: Cell<u64>,
+    max_clean_replay: Cell<u64>,
+    /// The most a partition still carrying several checkpoint records (the
+    /// post-merge gap) replayed after a clean graceful stop. Reported only.
+    max_multi_record_replay: Cell<u64>,
 }
 
 impl NemesisCtx {
@@ -4446,6 +4572,31 @@ async fn run_terminal_decommission(
     ))
 }
 
+/// The replay check reads the PS's own coloured log: `tracing` wraps field
+/// names in escapes, so a parser that did not strip them would find nothing
+/// and the check would pass on every round.
+#[test]
+fn replay_volumes_parse_a_coloured_ps_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("ps.log");
+    let line = |part: u64, bytes: u64| {
+        format!(
+            "\u{1b}[2m2026-09-29T10:00:00Z\u{1b}[0m \u{1b}[32m INFO\u{1b}[0m \
+             \u{1b}[2mautumn_partition_server\u{1b}[0m\u{1b}[2m:\u{1b}[0m log replay done \
+             \u{1b}[3mpart_id\u{1b}[0m\u{1b}[2m=\u{1b}[0m{part} \u{1b}[3mstart_extent\u{1b}[0m\u{1b}[2m=\u{1b}[0m7 \
+             \u{1b}[3mbytes\u{1b}[0m\u{1b}[2m=\u{1b}[0m{bytes} \u{1b}[3mrecords_kept\u{1b}[0m\u{1b}[2m=\u{1b}[0m0\n"
+        )
+    };
+    std::fs::write(&path, format!("{}unrelated line bytes=5\n", line(9001, 0))).unwrap();
+    let from = log_len(&path);
+    std::fs::write(
+        &path,
+        format!("{}unrelated line bytes=5\n{}{}", line(9001, 0), line(9001, 4096), line(9002, 3 << 20)),
+    )
+    .unwrap();
+    assert_eq!(replay_volumes(&log_since(&path, from)), vec![(9001, 4096), (9002, 3 << 20)]);
+}
+
 /// The checkpoint check must fire on the state it exists for, not only stay
 /// quiet on healthy runs: a checkpoint naming an extent its row stream does
 /// not have. Written the way `save_table_locs_raw` writes one.
@@ -4766,6 +4917,9 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             checkpoint_violations: RefCell::new(Default::default()),
             checkpoint_checks: Cell::new(0),
             max_row_extents: Cell::new(0),
+            clean_replay_checks: Cell::new(0),
+            max_clean_replay: Cell::new(0),
+            max_multi_record_replay: Cell::new(0),
         });
         let n = compio::runtime::spawn({
             let ctx = nemesis_ctx.clone();
@@ -5158,13 +5312,34 @@ runs ACROSS rounds is uncovered, not unlucky.",
             let ps_log = std::fs::read_to_string(log_dir.join("ps-91.log")).unwrap_or_default();
             let unclean = ps_log
                 .lines()
-                .filter(|l| {
-                    l.contains("graceful shutdown: flush failed")
-                        || l.contains("drain timed out")
-                        || l.contains("thread join deadline")
-                })
+                .filter(|l| UNCLEAN_DRAIN_MARKERS.iter().any(|m| l.contains(m)))
                 .count();
             eprintln!("chaos: PS drain warnings (flush failed / timed out / join deadline): {unclean}");
+            eprintln!(
+                "chaos: replay after clean graceful stops: checked {} restart(s), most any \
+                 partition replayed {} bytes (limit {CLEAN_STOP_REPLAY_LIMIT})",
+                nemesis_ctx.clean_replay_checks.get(),
+                nemesis_ctx.max_clean_replay.get()
+            );
+            if nemesis_ctx.max_multi_record_replay.get() > 0 {
+                eprintln!(
+                    "chaos: NOTE a partition still carrying several checkpoint records (a merge \
+                     not flushed since) replayed {} bytes after a clean graceful stop — the known \
+                     post-merge gap, not failed",
+                    nemesis_ctx.max_multi_record_replay.get()
+                );
+            }
+            let psterm_ran = nemesis_ctx
+                .action_tally
+                .borrow()
+                .get("PsTerm")
+                .is_some_and(|(_, ok)| *ok > 0);
+            if psterm_ran && nemesis_ctx.clean_replay_checks.get() == 0 {
+                eprintln!(
+                    "chaos: NOTE graceful restarts ran but none drained cleanly, so replay \
+                     volume was checked on none — that dimension is UNCOVERED this round"
+                );
+            }
             let (graceful, crash) = nemesis_ctx.ps.borrow().restarts;
             eprintln!(
                 "chaos: PS restarts completed: {graceful} graceful, {crash} crash (plus the \

@@ -1,3 +1,12 @@
+Date: 2026-09-29 (5)
+TaskStatus: completed
+Task scope: user "Check replay volume after graceful restarts" (F-CHAOS-PS-RESTART follow-up: chaos coverage for the 1a replay bug).
+Current summary: after a `psterm` whose drain was clean (stop returned "drained" and the PS log since the SIGTERM has none of the four unclean-drain markers), the replay check parses every "recover_partition: log replay done ... bytes=N" line the new process wrote (ANSI stripped): each partition must replay <= 1 MiB and every assigned partition must have a line, else the round fails. Partitions that still carried more than one checkpoint record at the stop (a merge not flushed since — the drain writes no checkpoint when the memtable is empty) are exempt and reported on their own line.
+Verification: system_chaos unit tests 19 pass incl. replay_volumes_parse_a_coloured_ps_log. Same seed/mix (psterm-weighted, 150 s): HEAD 12 clean graceful restarts, max 0 bytes, green (twice); 8a4b12a (pre-1a) plus only the log line: max 69 MB / 59 MB, red. Merge-heavy HEAD round: 10 checked, 0 bytes; one exempt merged survivor replayed 926 KB.
+Review: opus (high: known post-merge gap would fail the round → exempt + report; medium: "drain channel cancelled" marker missing, zero checks passed silently, per-partition coverage; low: reuse strip_ansi; all applied). Silent skips in shutdown() (no drain channel / dead thread) log nothing; the coverage rule reports them as failures.
+Main gaps: the post-merge replay gap is real on HEAD (926 KB measured, bounded by the victim's log since the merge) — fixing it (drain writes a checkpoint for a multi-record partition) is a product change, not done. Chaos still does not reproduce 1b (bulk-ingest phase undecided).
+Next steps: user to decide on the post-merge drain checkpoint and the bulk-ingest chaos phase.
+
 Date: 2026-09-29 (4)
 TaskStatus: not_completed
 Task scope: user "chaos test为什么之前没有覆盖1a，1b的问题，需要加chaos测试" → "先不管perf check，chaos还是要增加 1. checkpoint 与 row stream的结构检查 2. PS 真进程和两种重启， 然后开始跑chaos测试" (F-CHAOS-PS-RESTART).

@@ -20,6 +20,7 @@
 - **Acceptance**: HEAD 上多个种子全绿，两种重启都实际执行；重启后 ready 超时、drain 超时、结构违例都判失败；用修复前的 `autumn-ps`（35d0baf）跑，结构检查或重开能报出 1b 的问题，打不出则记录原因；`docs/ops.md` chaos 章节写明。
 - `passes: false`
 - **notes** (2026-09-29): 已实现并提交。HEAD 上 PS 重启/结构检查在全部 10 轮里零违例、两种重启都执行；另加 `rollrow`、`flushburst` 两个动作塑造 row stream。**未达成**：用 35d0baf 的 `autumn-ps` 跑 8 轮（多种动作配比，row stream 到 15 个 extent）零违例——1b 的形状要 size-tiered 跳过 ≥128 MiB 的大 SST（先大批写入再零星写），chaos 的 256 B / 8 KiB 值造不出来；1b 由 system_row_truncate_live_refs 钉住，检查器本身由 `checkpoint_check_reports_an_sst_outside_the_row_stream` 证明会报（消融变红）。全动作集轮次 7 轮里 4 轮挂在既有的 "physical reclaim incomplete"（见 BUG-CHAOS-RECLAIM-RESIDUE），与本改动无关（旧新 PS 都出现）。是否加"大批写入"脚本化阶段待用户定。
+- **notes** (2026-09-29, 用户 "Check replay volume after graceful restarts"): 已加。drain 干净（PS 日志无 flush failed / drain channel cancelled / drain timed out / thread join deadline）的 `psterm` 之后，新进程每个分区的 "log replay done ... bytes" 必须 ≤ 1 MiB，且每个分区都要有这行（缺行即失败）。同种子同配比：HEAD 12 次优雅重启最多 0 字节（绿）；8a4b12a（1a 修复前，只补了这行日志）最多 59–69 MB（红）。仍带多条 checkpoint 记录的分区（merge 后未再 flush——drain 在 memtable 为空时不写 checkpoint）豁免、单独报告：HEAD 的 merge 密集轮实测 926 KB，这个已知缺口是真的。
 
 ### BUG-CHAOS-RECLAIM-RESIDUE — chaos 的物理回收检查在 fence 后重建的节点上留有旧副本
 - **Trigger** (2026-09-29，加 PS 重启 chaos 时发现): 全动作集 system_chaos 7 轮里 4 轮 `verify_gc_reclaim` 报 `physical reclaim incomplete`，残留文件都在被 KillThenFence/fence 过、随后由 recovery 在别处重建了副本的节点上（例：extent 22 在 node 1）。旧版与新版 PS 都出现。

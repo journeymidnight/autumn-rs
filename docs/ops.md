@@ -2464,6 +2464,13 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 # production loss: 28 of 37 SSTs in truncated extents). The summary line
 # "PS restarts completed ... row streams reached N extent(s)" says how much of
 # that the round exercised; N = 1 means no cut could have been tested.
+# After a `psterm` whose drain flushed everything (no drain warning in the PS
+# log), every partition the new process opens must replay <= 1 MiB of WAL
+# ("log replay done ... bytes=N"); more means recovery started from a cursor
+# older than the drain's checkpoint (the 190 s production reopen). Summary:
+# "replay after clean graceful stops: checked N restart(s), most any partition
+# replayed B bytes". Measured: HEAD 0 bytes over 12 restarts; the PS before
+# 0a7e85d replayed up to 69 MB on the same seed, growing with every restart.
 # Two more actions shape the row stream: `rollrow` seals and rolls every
 # partition's row tail (the fence-drain path), `flushburst` flushes every
 # partition 8 times so the PS's own size-tiered trim (past 32 SSTs) runs.
