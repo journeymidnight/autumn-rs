@@ -976,6 +976,16 @@ while staying ≤ the live cursor → strictly safer. `log_extent_ids` is a hard
 abort is before any row_stream append so nothing is half-published.
 `background::compaction_vp_head_tests`.
 
+The meta CHECKPOINT the compaction publishes is not the output stamp: it is the
+same position-MAX over the output stamp AND every table left in the partition
+(`checkpoint_vp_head`, taken under the borrow that snapshots the table list). A
+minor compaction (the >32-SST auto-trim, size-tiered) takes the OLDEST small
+tables while a newer flush's SST stays live; publishing only the inputs' MAX moved
+the partition's replay cursor back behind that flush, and the next open replayed
+every WAL byte since. Safe for the same reason as the stamp: every listed table is
+durable, flushes commit in order, so all WAL below the newest listed boundary is in
+the listed set. `crates/manager/tests/system_restart_replay_cursor.rs`.
+
 ### Flush stamps the imm's ROTATION-time vp_head
 
 INVARIANT: `rotate_active` captures `p.vp_*` at the FREEZE instant (the imm's true
@@ -1021,10 +1031,11 @@ the replay window.
 `gc_replay_floor` / `gc_extent_punchable` (used for both Auto and Force): compute
 `replay_floor_pos = min` stream-position (FIRST-occurrence index into
 `log_extent_ids`, matching recovery's `first_pos_by_eid` for CoW-shared extents)
-over the live SSTs' vp_heads. The floor == recovery's `chosen_pos` exactly; the
-single-task merge makes the in-memory `sst_readers` it reads match the durable
-checkpoint recovery loads. `floor=0` (protect all non-empty) when no vp_head
-resolves.
+over the live SSTs' vp_heads — the FALLBACK floor, used only while no durable
+checkpoint cursor is known (below). `floor=0` (protect all non-empty) when no
+vp_head resolves. The rule in one line: **the floor is the latest durable
+checkpoint's cursor; the MIN over SST vp_heads only when there is none** —
+the same order recovery uses to pick its replay start (next section).
 
 **Raise the floor to the durably-ACKed flush checkpoint vp**
 (`gc_floor_raise_to_durable_ckpt`, a `max`): the MIN-over-live-SST floor is
@@ -1032,9 +1043,15 @@ over-conservative (drags back to the OLDEST live SST's vp_head, so GC can't recl
 the fully-covered `[MIN, newest-flush-vp)` region). After `gc_replay_floor`, raise
 to the position of `PartitionData.durable_ckpt_vp` when it resolves.
 `durable_ckpt_vp` is the vp_head of the newest FLUSH-published, **durably-ACKed**
-meta_stream checkpoint of THIS incarnation — set ONLY in
-`commit_flush_outcome_inner` AFTER `save_table_locs_raw` returns Ok, `(0,0)` until
-then, NOT seeded from the recovered checkpoint at open. Every log record strictly
+meta_stream checkpoint — set in `commit_flush_outcome_inner` AFTER
+`save_table_locs_raw` returns Ok, and seeded at open from the recovered
+checkpoint's cursor when there is exactly ONE checkpoint record (it is durable
+and recovery replays from it). With two records (a merge not yet flushed) it
+starts at `(0,0)` — the MIN — until the first flush collapses meta_stream to one
+record: punching log extents while two sources' dedup regions are computed from
+extent positions would shift them. A compaction's ack does not set it: its
+append may ack after a newer flush's and move the floor back; the next flush
+covers it. Every log record strictly
 below a durable checkpoint vp is in that checkpoint's persisted SST set (or
 compaction-dead), so `[MIN, durable-vp)` is safe to punch.
 
@@ -1044,12 +1061,26 @@ derived from in-memory state (`p.vp_*`, or a MAX over live `sst_readers` vp_head
 could run AHEAD of what a crash-time recovery loads — GC punches `[V_old, V_new)`,
 the process crashes before the `V_new` checkpoint acks, recovery loads the `V_old`
 checkpoint (whose SSTs don't cover `[V_old, V_new)`) → silent loss. The ack-gated
-`durable_ckpt_vp` is immune. `recover_partition` is deliberately NOT changed to
-raise its replay start (the naive "MIN→MAX" deletes the `chosen_pos==MAX` no-replay
-rescue): the recovery-read half self-resolves — once GC punches the covered prefix
-those extents vanish from `log_extent_ids`, the punched SSTs' vp_heads become
-unresolvable, recovery skips them, and `chosen_pos` lands at the first surviving
-position ≥ the raised floor. `background::gc_replay_floor_tests`.
+`durable_ckpt_vp` is immune. `background::gc_replay_floor_tests`.
+
+### Recovery replay start = the checkpoint's cursor
+
+`recover_partition` starts replay at the EARLIEST (by stream position) cursor among
+the loaded checkpoint records (one per source after a merge; one otherwise). The
+vp_heads stamped on the SSTs a record lists do NOT lower it: the record's cursor is
+at or past all of them (flush FIFO + `checkpoint_vp_head`), so they could only move
+the start back. They stand in only for a record whose own cursor does not resolve
+(`vp_extent_id == 0`, or its extent left the stream); with no cursor at all the
+whole-log `chosen_pos==MAX` fallback still applies. Why: one old SST that no
+compaction touched anchored every open at its own flush, and GC never punches a
+log extent holding live large values, so nothing ever moved that anchor — an open
+after a CLEAN drain re-read the whole WAL since (observed: ~190 s, a 15.75 GB tail
+extent read from an 780 MB-old cursor). The earlier rejection of "MIN→MAX" was
+about a MAX over SST stamps, which can land where no durable checkpoint says; this
+is the checkpoint itself, the same invariant GC's durable raise rests on.
+`recover_partition: log replay done` logs the real start, bytes, records kept vs
+already covered, and time; `replay_read_bytes(part_id)` exposes the bytes to tests.
+`crates/manager/tests/system_restart_replay_cursor.rs`.
 
 ## GC (Garbage Collection)
 
@@ -1905,10 +1936,13 @@ Three fixes bound the restart replay window (worst case per partition =
    with the memtable through `rotate_active` into imm, and disappears from the sum when
    the imm flushes (durable in an SST → no replay needed). A fresh active starts at 0.
 
-3. **Graceful shutdown.** `PartitionServer::shutdown()` sends a `oneshot::Sender<()>`
-   per partition through `drain_tx`. `partition_loop` picks it up via select, sets
-   `drain_ack`, exits the main loop, runs the tail-drain (in-flight + pending), rotates
-   `active`, loops `flush_one_imm` until imm empties, replies on the oneshot, exits.
+3. **Graceful shutdown.** `PartitionServer::shutdown()` sends a `DrainAck`
+   (`oneshot::Sender<Result<(), String>>`) per partition through `drain_tx`.
+   `partition_loop` picks it up via select, sets `drain_ack`, exits the main loop, runs
+   the tail-drain (in-flight + pending), rotates `active`, loops `flush_one_imm` until
+   imm empties or a flush fails, replies with that outcome, exits. `shutdown()` logs
+   `drained`, `flush failed ... replay on restart: <error>`, or `drain timed out` per
+   partition — a failed flush used to reply the same as a clean one.
    `serve_until_shutdown(addr, shutdown_signal)` wraps `serve()` with a future the
    binary drives from SIGTERM/SIGINT. `cluster.sh stop` waits up to 60 s before SIGKILL.
 

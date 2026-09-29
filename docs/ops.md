@@ -1249,6 +1249,33 @@ still won't reclaim" case. Guard:
 `crates/manager/tests/system_recovery_vp_seed.rs`. The vp_head is now a true
 content boundary on every path (flush, compaction, and recovery).
 
+### How much WAL a partition open replays — and why a clean restart replays ~none
+
+Recovery replays the log from the **checkpoint's cursor** (the `vp` in the
+meta-stream `TableLocations` record), not from the oldest SST's stamp. A clean
+stop (SIGTERM: the drain flushes every memtable and writes a checkpoint naming
+the log tail) therefore replays close to nothing; a crash replays only what was
+written since the last flush. Compaction never moves the checkpoint's cursor
+back. Every open logs what it did:
+
+```bash
+grep "log replay done" <ps.log>
+# part_id=21 start_extent=30 start_offset=63966480 extents=1 bytes=0 records_kept=0 records_covered=0 elapsed_ms=0
+```
+
+`bytes` is WAL read; `records_kept` went into the memtable (not yet in any SST);
+`records_covered` were already in SSTs and were read for nothing. A large
+`records_covered` after a clean stop would mean the start was pulled back again.
+The drain's own outcome is in the stopping PS's log, one line per partition:
+`graceful shutdown: drained`, `graceful shutdown: flush failed ... replay on
+restart: <error>`, or `graceful shutdown: drain timed out`.
+
+Manual check (any cluster): put a few keys and stop/start the PS once (the drain
+makes an early SST), put ~60 x 1 MiB, SIGTERM the PS, start it, then:
+`grep "log replay done" <ps.log> | tail` must show `bytes` near 0 for the
+partition holding the data. Regression tests:
+`crates/manager/tests/system_restart_replay_cursor.rs`.
+
 ### Row-stream truncation never drops an SST the checkpoint lists
 
 After a compaction the PS drops the row-stream extents ahead of the first extent

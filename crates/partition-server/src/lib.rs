@@ -115,6 +115,10 @@ static FLUSH_TEST_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// Lets a test wait for a flush to DURABLY complete instead of sleeping. Bumped
 /// once per `commit_flush_outcome` success; read via `flush_commit_count`.
 static FLUSH_COMMITS: AtomicU64 = AtomicU64::new(0);
+/// Log-stream bytes recovery replay has read, per partition, since process
+/// start. Tests take the delta across a reopen to see how much WAL it walked.
+static REPLAY_READ_BYTES: std::sync::Mutex<std::collections::BTreeMap<u64, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Test sync-point: when set, `finish_write_batch` parks BEFORE its memtable
 /// insert (Phase 3). It models a Put that is seq-assigned (Phase 1) + WAL-durable
@@ -177,6 +181,12 @@ fn flush_test_paused() -> bool {
 /// Tests poll this for deterministic flush completion. See `FLUSH_COMMITS`.
 pub fn flush_commit_count() -> u64 {
     FLUSH_COMMITS.load(Ordering::Relaxed)
+}
+/// Log-stream bytes recovery replay has read for `part_id` since process
+/// start. See `REPLAY_READ_BYTES`.
+pub fn replay_read_bytes(part_id: u64) -> u64 {
+    let m = REPLAY_READ_BYTES.lock().unwrap_or_else(|e| e.into_inner());
+    m.get(&part_id).copied().unwrap_or(0)
 }
 /// Test sync-point: parks `handle_split_part` AFTER its commit-length
 /// captures + P-sst barrier, BEFORE `multi_modify_split` — the window where a
@@ -1193,10 +1203,14 @@ pub(crate) struct PartitionData {
     /// never landed → silent loss. This ack-gated value lets GC raise its
     /// replay floor to reclaim the fully-covered `[MIN-over-SST-vps, this)`
     /// region safely (proof: [[gc_replay_floor]] + the flush vp_head content-
-    /// boundary invariant). Deliberately NOT seeded from the recovered
-    /// checkpoint at open — a fresh incarnation stays at the conservative MIN
-    /// floor until its own first flush publish (which also collapses meta_stream
-    /// to one record, closing the post-merge two-source region-shift window).
+    /// boundary invariant). Seeded at open from the recovered checkpoint's
+    /// cursor when there is exactly ONE checkpoint record: it is durable, and
+    /// recovery replays from it. With two (a merge not yet flushed) it stays at
+    /// the conservative MIN until this incarnation's first flush publish, which
+    /// collapses meta_stream to one record — punching log extents while two
+    /// sources' dedup regions are computed from extent positions would shift
+    /// them. A compaction's ack does not set it: its append may ack after a
+    /// newer flush's, which would move the floor back; the next flush covers it.
     durable_ckpt_vp: Cell<(u64, u64)>,
     stream_client: Rc<StreamClient>,
     /// This partition's SST block cache, owned by the `PartitionServer` and
@@ -2534,11 +2548,11 @@ struct PartitionHandle {
     /// can take/drop it explicitly.
     #[allow(dead_code)]
     shutdown_tx: Option<oneshot::Sender<()>>,
-    /// graceful drain signal. Main thread sends a
-    /// `oneshot::Sender<()>` through it to ask the partition to flush
-    /// active+imm and reply when done. Dropped during shutdown so the
-    /// `mpsc::Receiver` end inside the partition thread observes EOF.
-    drain_tx: Option<mpsc::UnboundedSender<oneshot::Sender<()>>>,
+    /// graceful drain signal. Main thread sends a `DrainAck` through it to
+    /// ask the partition to flush active+imm and reply when done. Dropped
+    /// during shutdown so the `mpsc::Receiver` end inside the partition thread
+    /// observes EOF.
+    drain_tx: Option<mpsc::UnboundedSender<DrainAck>>,
     /// Address (`host:port`) the partition is listening on. Reported to
     /// the manager via `MSG_REGISTER_PARTITION_ADDR` on open, and
     /// re-reported by the part_addr self-heal in `sync_regions_once` whenever
@@ -4679,10 +4693,10 @@ impl PartitionServer {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
         // graceful drain signal. Main thread (`PartitionServer::
-        // shutdown()`) sends a `oneshot::Sender<()>` through `drain_tx` to
-        // ask the partition to rotate active + flush all imm and reply
-        // when done, BEFORE dropping `shutdown_tx`.
-        let (drain_tx, drain_rx) = mpsc::unbounded::<oneshot::Sender<()>>();
+        // shutdown()`) sends a `DrainAck` through `drain_tx` to ask the
+        // partition to rotate active + flush all imm and reply when done,
+        // BEFORE dropping `shutdown_tx`.
+        let (drain_tx, drain_rx) = mpsc::unbounded::<DrainAck>();
 
         // Report bind + registration success/failure back to the caller,
         // so we can fail loudly and reclaim the ordinal if needed.
@@ -4808,10 +4822,10 @@ impl PartitionServer {
     }
 
     /// graceful shutdown. For each open partition:
-    ///   1. Send a `oneshot::Sender<()>` via `drain_tx`. The partition's
+    ///   1. Send a `DrainAck` via `drain_tx`. The partition's
     ///      `partition_loop` stops pulling new requests, drains
     ///      inflight, rotates `active`, calls `flush_one_imm` until imm
-    ///      is empty, then replies on the oneshot.
+    ///      is empty (or a flush fails), then replies with the outcome.
     ///   2. Await the oneshot with `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS`
     ///      deadline. On timeout, log a warning and skip — the SIGKILL
     ///      fallback (and on-restart logStream replay) keeps correctness.
@@ -4872,7 +4886,7 @@ impl PartitionServer {
         );
 
         // Send drain signals + collect oneshot receivers.
-        let mut drain_rxs: Vec<(u64, oneshot::Receiver<()>)> = Vec::new();
+        let mut drain_rxs: Vec<(u64, oneshot::Receiver<Result<(), String>>)> = Vec::new();
         {
             let mut parts = self.partitions.borrow_mut();
             for &pid in &part_ids {
@@ -4882,7 +4896,7 @@ impl PartitionServer {
                 let Some(drain_tx) = handle.drain_tx.as_ref() else {
                     continue;
                 };
-                let (ack_tx, ack_rx) = oneshot::channel::<()>();
+                let (ack_tx, ack_rx) = oneshot::channel();
                 if drain_tx.unbounded_send(ack_tx).is_ok() {
                     drain_rxs.push((pid, ack_rx));
                 }
@@ -4896,8 +4910,15 @@ impl PartitionServer {
                 let sleep_fut = compio::time::sleep(timeout);
                 futures::pin_mut!(sleep_fut);
                 match select(ack_rx, sleep_fut).await {
-                    Either::Left((Ok(_), _)) => {
+                    Either::Left((Ok(Ok(())), _)) => {
                         tracing::info!(part_id = pid, "graceful shutdown: drained");
+                    }
+                    Either::Left((Ok(Err(e)), _)) => {
+                        tracing::warn!(
+                            part_id = pid,
+                            "graceful shutdown: flush failed, the unflushed writes stay in the \
+                             WAL and replay on restart: {e}",
+                        );
                     }
                     Either::Left((Err(_), _)) => {
                         tracing::warn!(part_id = pid, "graceful shutdown: drain channel cancelled");
@@ -6285,7 +6306,7 @@ async fn partition_thread_main(
     advertise_host: String,
     ready_tx: oneshot::Sender<Result<String>>,
     shutdown_rx: oneshot::Receiver<()>,
-    drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    drain_rx: mpsc::UnboundedReceiver<DrainAck>,
     cpu_bulk: Option<usize>,
     metrics_arc: std::sync::Arc<PartitionMetrics>,
     block_cache: std::sync::Arc<crate::sstable::BlockCache>,
@@ -6415,8 +6436,17 @@ async fn partition_thread_main(
     }
 
     // Recovery: read metaStream → rowStream → logStream replay
-    let (tables, sst_readers, max_seq, vp_eid, vp_off, detected_overlap, recovered_active, recovered_floors) =
-        recover_partition(
+    let (
+        tables,
+        sst_readers,
+        max_seq,
+        vp_eid,
+        vp_off,
+        detected_overlap,
+        recovered_active,
+        recovered_floors,
+        recovered_ckpt_vp,
+    ) = recover_partition(
             part_id,
             &rg,
             log_stream_id,
@@ -6546,9 +6576,10 @@ async fn partition_thread_main(
         gc_debt_basis: RefCell::new(None),
         vp_extent_id: vp_eid,
         vp_offset: vp_off,
-        // BUG2: (0,0) = conservative MIN floor until this
-        // incarnation's first flush commit acks (see the field doc).
-        durable_ckpt_vp: Cell::new((0, 0)),
+        // BUG2: the recovered checkpoint's cursor when it is the only one,
+        // else (0,0) = the conservative MIN floor until this incarnation's
+        // first flush commit acks (see the field doc).
+        durable_ckpt_vp: Cell::new(recovered_ckpt_vp.unwrap_or((0, 0))),
         stream_client: part_sc.clone(),
         block_cache: block_cache.clone(),
         flush_req_tx: flush_req_tx.clone(),
@@ -7008,7 +7039,7 @@ async fn partition_loop(
     mut req_rx: mpsc::Receiver<PartitionRequest>,
     mut imm_drained_rx: mpsc::UnboundedReceiver<()>,
     mut split_wake_rx: mpsc::UnboundedReceiver<()>,
-    mut drain_rx: mpsc::UnboundedReceiver<oneshot::Sender<()>>,
+    mut drain_rx: mpsc::UnboundedReceiver<DrainAck>,
     locked_by_other: Rc<Cell<bool>>,
     routing: Routing,
 ) {
@@ -7027,7 +7058,7 @@ async fn partition_loop(
     let mut window = CoalesceWindow::default();
     // set when `drain_rx` delivered a request; once set, stop
     // pulling new items from `req_rx` and head for the tail-drain block.
-    let mut drain_ack: Option<oneshot::Sender<()>> = None;
+    let mut drain_ack: Option<DrainAck> = None;
     // fix: set once `drain_rx` returns EOF (the PartitionHandle was
     // dropped — region_sync reopened/removed this partition). The handle's
     // `drain_tx` drops BEFORE the ps-conn-held `req_tx` clones do, so for a
@@ -7449,7 +7480,7 @@ async fn drain_and_shutdown(
     locked_by_other: &Rc<Cell<bool>>,
     inflight: &mut InflightQueue,
     pending: &mut Vec<WriteRequest>,
-    drain_ack: Option<oneshot::Sender<()>>,
+    drain_ack: Option<DrainAck>,
 ) {
     while let Some(c) = inflight.next().await {
         handle_completion(part, metrics, locked_by_other, part_id, c).await;
@@ -7472,24 +7503,30 @@ async fn drain_and_shutdown(
             let mut p = part.borrow_mut();
             rotate_active(&mut p);
         }
-        loop {
+        let flushed = loop {
             match flush_one_imm(part).await {
                 Ok(FlushStep::Flushed) => continue,
-                Ok(FlushStep::Empty) => break,
+                Ok(FlushStep::Empty) => break Ok(()),
                 Ok(FlushStep::Busy) => {
                     compio::time::sleep(FLUSH_BUSY_RETRY_INTERVAL).await;
                     continue;
                 }
-                Err(e) => {
-                    tracing::error!(part_id, "graceful drain flush_one_imm: {e:#}");
-                    break;
-                }
+                Err(e) => break Err(format!("{e:#}")),
             }
+        };
+        match &flushed {
+            Ok(()) => tracing::info!(part_id, "graceful drain complete"),
+            Err(e) => tracing::error!(part_id, "graceful drain flush failed: {e}"),
         }
-        let _ = ack.send(());
-        tracing::info!(part_id, "graceful drain complete");
+        // The receiver is gone only when shutdown() stopped waiting (its
+        // deadline passed); it has already logged the timeout.
+        let _ = ack.send(flushed);
     }
 }
+
+/// A graceful drain's reply: `Ok` once every memtable is flushed, `Err` with
+/// the flush error otherwise (the unflushed writes stay in the WAL).
+type DrainAck = oneshot::Sender<Result<(), String>>;
 
 /// Inflight queue type for `partition_loop`'s Phase 2 group-commit futures.
 /// `FuturesOrdered` (not Unordered) so Phase 3 yields in launch = seq order —
@@ -8938,6 +8975,7 @@ async fn recover_partition(
     bool,
     Memtable,
     HashMap<u64, u64>,
+    Option<(u64, u64)>,
 )> {
     let mut tables: Vec<TableMeta> = Vec::new();
     let mut sst_readers: Vec<Arc<SstReader>> = Vec::new();
@@ -8984,8 +9022,22 @@ async fn recover_partition(
         first_pos_by_eid.entry(eid).or_insert(pos);
     }
 
+    // The checkpoint's cursor, for GC's replay floor, when there is exactly
+    // one checkpoint and its cursor names an extent still in the log. It is
+    // durable (recovery just read it), and everything below it is in its
+    // SSTs. With two (a merge not yet flushed) GC waits for the first flush to
+    // collapse them — see the `durable_ckpt_vp` field doc.
+    let single_ckpt_vp = match meta_records.as_slice() {
+        [r] if r.vp_extent_id != 0 && first_pos_by_eid.contains_key(&r.vp_extent_id) => {
+            Some((r.vp_extent_id, r.vp_offset))
+        }
+        _ => None,
+    };
     // Selected start position into log_extent_ids; usize::MAX = not chosen.
     let mut chosen_pos: usize = usize::MAX;
+    // SSTs listed by a checkpoint whose own cursor does not resolve. Only
+    // their stamped vp_heads may stand in for it (below).
+    let mut cursorless_locs: HashSet<(u64, u64, u64)> = HashSet::new();
     // merge: declared at outer scope so the replay loop can compute
     // per-meta_record source_max_seq below.
     let mut loc_to_last_seq: HashMap<(u64, u64, u64), u64> = HashMap::new();
@@ -9009,17 +9061,17 @@ async fn recover_partition(
         // The correct ordering is by stream POSITION (index into
         // extent_ids), not by extent_id value.
         for r in &meta_records {
-            if r.vp_extent_id == 0 {
-                continue; // empty / not-yet-flushed checkpoint
-            }
-            let pos = match first_pos_by_eid.get(&r.vp_extent_id) {
-                Some(&p) => p,
-                None => {
-                    // vp_head references an extent no longer in the
-                    // stream (post-merge GC or out-of-band truncate).
-                    // Skip — there's nothing to walk from there.
-                    continue;
-                }
+            let resolved = if r.vp_extent_id == 0 {
+                None // empty / not-yet-flushed checkpoint
+            } else {
+                // None = the vp_head names an extent no longer in the stream
+                // (post-merge GC, a reclaimed sealed-empty tail, out-of-band
+                // truncate) — nothing to walk from there.
+                first_pos_by_eid.get(&r.vp_extent_id).copied()
+            };
+            let Some(pos) = resolved else {
+                cursorless_locs.extend(r.locs.iter().map(|l| (l.extent_id, l.offset, l.len)));
+                continue;
             };
             // Prefer earlier position; tie-break with smaller offset.
             let cur_off = if chosen_pos == usize::MAX {
@@ -9179,16 +9231,20 @@ async fn recover_partition(
                 }
             }
 
-            // Per-SST vp_head bookkeeping: each SstReader's
-            // vp_extent_id/vp_offset records "where in log_stream this
-            // SST's VPs were written" — used post-recovery to seed
-            // the partition's vp_head for future flushes (the position
-            // past which the next flush will reference). We want the
-            // EARLIEST stream position across all loaded SSTs so the
-            // partition's running vp_head doesn't accidentally advance
-            // past WAL records that some SST referenced. Same
-            // position-vs-extent_id correctness consideration as above.
-            if let Some(&reader_pos) = first_pos_by_eid.get(&reader.vp_extent_id) {
+            // An SST's stamped vp_head is the content boundary of the flush
+            // (or the newest compaction input) that produced it. A checkpoint
+            // whose cursor resolves already covers every SST it lists — it is
+            // at or past all their boundaries — so their stamps could only
+            // pull the replay start back, never make it safer: one old SST
+            // that no compaction touched made every open re-read all the WAL
+            // written since its flush (`system_restart_replay_cursor`). The
+            // stamps stand in only for a checkpoint whose own cursor is gone.
+            // Same position-vs-extent_id consideration as above.
+            let stands_in = cursorless_locs.contains(&(loc.extent_id, loc.offset, loc.len));
+            if let Some(&reader_pos) = first_pos_by_eid
+                .get(&reader.vp_extent_id)
+                .filter(|_| stands_in)
+            {
                 let cur_pos = first_pos_by_eid
                     .get(&recovered_vp_eid)
                     .copied()
@@ -9421,6 +9477,11 @@ async fn recover_partition(
     // ⇒ no rotation ⇒ the seed is inert there).
     let mut tail_eid = recovered_vp_eid;
     let mut tail_off = recovered_vp_off;
+    let replay_started = std::time::Instant::now();
+    let mut replay_bytes: u64 = 0;
+    let mut replay_kept: u64 = 0;
+    let mut replay_covered: u64 = 0;
+    let replay_extent_count = replay_extents.as_ref().map_or(0, |e| e.len());
     if let Some(extents) = replay_extents {
         for (extent_pos, eid, start_off) in extents {
             let extent_dedup = dedup_at(extent_pos);
@@ -9476,6 +9537,7 @@ async fn recover_partition(
                 }
             };
             let got = data.len();
+            replay_bytes += got as u64;
             // Bytes still committed from cur_off, and how many THIS chunk should
             // have yielded. `expected < got` is impossible (the read clamps to
             // committed_end); `got < expected` = the serving replica TRUNCATED
@@ -9616,8 +9678,10 @@ async fn recover_partition(
                     continue;
                 }
                 if ts <= extent_dedup {
+                    replay_covered += 1;
                     continue;
                 }
+                replay_kept += 1;
 
                 let record_extent_off = buf_base + buf_off as u64;
                 // BUG1: the un-flushed LOG bytes this
@@ -9703,6 +9767,26 @@ async fn recover_partition(
             } // chunk loop
         }
     }
+    *REPLAY_READ_BYTES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(_part_id)
+        .or_insert(0) += replay_bytes;
+    // Where the replay really started (the trace line above is written before
+    // the SSTs are loaded) and what it cost: an open that is slow here is slow
+    // because of WAL volume, and `covered` says how much of it the SSTs
+    // already held.
+    tracing::info!(
+        part_id = _part_id,
+        start_extent = recovered_vp_eid,
+        start_offset = recovered_vp_off,
+        extents = replay_extent_count,
+        bytes = replay_bytes,
+        records_kept = replay_kept,
+        records_covered = replay_covered,
+        elapsed_ms = replay_started.elapsed().as_millis() as u64,
+        "recover_partition: log replay done"
+    );
 
     // WAL self-heal A5: isolate every corrupt replica we worked around during
     // replay BEFORE this partition serves (design I1 — isolation-before-serving;
@@ -9755,6 +9839,7 @@ async fn recover_partition(
         detected_overlap,
         active,
         fence_floors,
+        single_ckpt_vp,
     ))
 }
 

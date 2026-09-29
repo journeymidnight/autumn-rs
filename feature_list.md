@@ -21,6 +21,12 @@
 - `passes: true`
 - **notes** (2026-09-29): "有待 flush 的 imm 时跳过本轮截断" 经评审改为：每个排队 imm 在冻结时记下当时最新表所在的 extent 作为下界，截断不越过它（持续写入时 imm 几乎总在排队，跳过会让死 SST 永不回收）。
 
+### F-PS-RESTART-REPLAY — 优雅停止后重启不应长时间回放 WAL；drain 确认要如实
+- **Trigger** (2026-09-29 用户，线上): 分区 32 打开约 190 s 几乎全在 recover_partition；回放从 extent 573 的 780 MB 开始扫到尾部（尾 extent 已提交约 15.75 GB）。另：flush 出错后 drain 仍回"排空完成"。
+- **Scope**: (1) drain 确认带上 flush 结果，shutdown 如实记日志；(2) 恢复的回放起点取 checkpoint 记录的游标，不再被任何一个旧 SST 的游标拉回；(3) compaction 发布的 checkpoint 游标不得早于它快照里最新表的游标；(4) 恢复记录实际回放起点、读量与耗时。
+- **Acceptance**: 旧 SST + 大量已 flush 的 WAL + 优雅停止后重启，回放量≈0（修前可复现为整段）；compaction 之后 checkpoint 游标不倒退；flush 出错时 shutdown 日志不再说 drained；消融变红；已有恢复/merge/GC 回归测试全绿。
+- `passes: true`
+
 ### F-PS-READY — PS 就绪 = 所有分配给它的分区都已打开
 - **Trigger** (2026-09-29 用户): autumn-op 看 PS 状态只看心跳通不通；PS 必须把所有分区都打开后才算 ready。
 - **Scope**: PS 心跳上报已打开分区 `(part_id, region_epoch)`；manager 内存保存并在 overview 给出 `open_count` 与唯一的 `ready` 定义；autumn-op info / dashboard 显示；cluster.sh 与 autumn-deploy 启动等待改为等 ready。

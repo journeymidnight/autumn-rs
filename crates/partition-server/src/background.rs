@@ -239,13 +239,10 @@ pub(crate) fn gc_extent_punchable(
 /// `p.vp_*` (the live cursor, which sat past the un-flushed tail — the loss the
 /// regression reproduces).
 ///
-/// Residual (separate, deferred follow-up): an SST whose flush RACED writes has a
-/// vp_head slightly AHEAD of its own content (the flush snapshots the live cursor
-/// at claim time, not the imm's rotation boundary), so MAX can over-advance in
-/// that narrow case. The clean fix is to record each imm's true content boundary
-/// at rotation; until then MAX is never worse than the pre-fix live-cursor stamp
-/// (MAX(inputs) ≤ live cursor always) and the oldest live SST masks the flush-side
-/// gap outside of a major compaction.
+/// A flush stamps its imm's rotation-time boundary (`imm_vp_heads`), so every
+/// input's vp_head is exactly its content boundary and the MAX never runs ahead.
+/// The checkpoint the compaction publishes takes the same MAX over every table
+/// left in the partition, not just these inputs (`checkpoint_vp_head`).
 ///
 /// Fallback when no input vp_head resolves in the current log (all zero, or their
 /// extents already gone): replay from the FIRST log extent at offset 0 — the
@@ -287,6 +284,32 @@ pub(crate) fn compaction_output_vp_head(
             None => (0, 0),
         },
     }
+}
+
+/// The replay cursor a compaction's checkpoint publishes: the newest content
+/// boundary among the compaction's own output stamp and every table left in the
+/// partition (`p` is the post-swap state, borrowed together with the table
+/// snapshot the checkpoint lists).
+///
+/// The output stamp alone is the newest INPUT's boundary. A minor compaction
+/// takes older tables while a newer flush's SST stays live, so publishing only
+/// that stamp moved the partition's checkpoint back behind the newer flush, and
+/// the next open replayed everything since (`system_restart_replay_cursor`). Every
+/// table the checkpoint lists is already durable in the row stream, and flushes
+/// commit in order, so all WAL below the newest boundary among them is in the
+/// listed set — the same argument as `compaction_output_vp_head`, taken over the
+/// whole set instead of the inputs. A boundary in an extent `log_extent_ids`
+/// (fetched before the merge) does not name yet is skipped, which only errs early.
+fn checkpoint_vp_head(
+    p: &crate::PartitionData,
+    output_vp_head: (u64, u64),
+    log_extent_ids: &[u64],
+) -> (u64, u64) {
+    compaction_output_vp_head(
+        std::iter::once(output_vp_head)
+            .chain(p.sst_readers.iter().map(|r| (r.vp_extent_id, r.vp_offset))),
+        log_extent_ids,
+    )
 }
 
 pub(crate) async fn background_maintenance_loop(
@@ -2805,6 +2828,8 @@ pub(crate) async fn do_compact(
         remove_compacted_tables(&mut p, &compact_keys);
         let tables_snapshot = p.tables.clone();
         let floors_snapshot = crate::snapshot_fence_floors(&p);
+        let (ckpt_vp_eid, ckpt_vp_off) =
+            checkpoint_vp_head(&p, (compact_vp_eid, compact_vp_off), &log_extent_ids);
         drop(p);
         // invariant — DO NOT introduce an `.await` between the
         // borrow_mut drop above and the mpsc send inside
@@ -2819,8 +2844,8 @@ pub(crate) async fn do_compact(
             &part_sc,
             meta_stream_id,
             &tables_snapshot,
-            compact_vp_eid,
-            compact_vp_off,
+            ckpt_vp_eid,
+            ckpt_vp_off,
             log_extent_ids.len() as u32,
             floors_snapshot,
         )
@@ -2845,7 +2870,7 @@ pub(crate) async fn do_compact(
     drop(readers);
     drop(readers_with_meta);
 
-    let (tables_snapshot, floors_snapshot) = {
+    let (tables_snapshot, floors_snapshot, (ckpt_vp_eid, ckpt_vp_off)) = {
         let mut p = part.borrow_mut();
         // locate the position of the OLDEST input table BEFORE
         // removing the compaction inputs. The compaction output
@@ -2871,7 +2896,11 @@ pub(crate) async fn do_compact(
             p.sst_readers.insert(idx, reader);
             p.tables.insert(idx, tbl_meta);
         }
-        (p.tables.clone(), crate::snapshot_fence_floors(&p))
+        (
+            p.tables.clone(),
+            crate::snapshot_fence_floors(&p),
+            checkpoint_vp_head(&p, (compact_vp_eid, compact_vp_off), &log_extent_ids),
+        )
     };
 
     // invariant — see flush_one_imm in lib.rs for the full
@@ -2881,8 +2910,8 @@ pub(crate) async fn do_compact(
         &part_sc,
         meta_stream_id,
         &tables_snapshot,
-        compact_vp_eid,
-        compact_vp_off,
+        ckpt_vp_eid,
+        ckpt_vp_off,
         log_extent_ids.len() as u32,
         floors_snapshot,
     )
