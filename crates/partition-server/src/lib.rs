@@ -3713,6 +3713,15 @@ impl PartitionServer {
         Ok(server)
     }
 
+    /// The core budget as the manager places by it: `0` when the budget is
+    /// off (no `--cpuset`), so the manager treats this PS as capacity-unknown.
+    fn slot_cap(&self) -> u32 {
+        match self.partition_budget.max {
+            usize::MAX => 0,
+            n => u32::try_from(n).unwrap_or(u32::MAX),
+        }
+    }
+
     async fn register_ps(&self) -> Result<()> {
         let address = self
             .advertise_addr
@@ -3721,6 +3730,7 @@ impl PartitionServer {
         let req = manager_rpc::rkyv_encode(&manager_rpc::RegisterPsReq {
             ps_id: self.ps_id,
             address,
+            slot_cap: self.slot_cap(),
         });
         // 10 s — register_ps is one in-memory insert + etcd mirror on
         // manager. Bounded so PS startup doesn't trap waiting for a
@@ -3775,7 +3785,10 @@ impl PartitionServer {
         ticker.tick().await; // first tick is immediate
         loop {
             ticker.tick().await;
-            let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq { ps_id: self.ps_id });
+            let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq {
+                ps_id: self.ps_id,
+                slot_cap: self.slot_cap(),
+            });
             // 5 s — heartbeat is fired every 2 s; we tolerate up to 5
             // consecutive failures (~10 s) before exiting. A 5 s
             // ceiling keeps each tick tight; a missed beat shows up

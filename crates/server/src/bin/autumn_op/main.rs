@@ -3002,6 +3002,12 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
             serde_json::to_string_pretty(&serde_json::json!({
                 "part_count": parts.len(),
                 "ps_count": ps_count,
+                "ps_servers": resp.ps_servers.iter().map(|p| serde_json::json!({
+                    "ps_id": p.ps_id,
+                    "address": p.address,
+                    "partition_count": p.partition_count,
+                    "slot_cap": (p.slot_cap > 0).then_some(p.slot_cap),
+                })).collect::<Vec<_>>(),
                 "total_req_per_sec": resp.total_req_per_sec,
                 "total_write_bytes_per_sec": resp.total_write_bytes_per_sec,
                 "total_read_bytes_per_sec": resp.total_read_bytes_per_sec,
@@ -3051,6 +3057,25 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
                     );
                 }
             }
+        }
+        // `used/cap` core slots per PS; `cap` is `?` for a PS with no
+        // `--cpuset` (or one the manager has not heard since it became
+        // leader). The PS refuses to open partitions past its cap.
+        println!("partition servers:");
+        for p in &resp.ps_servers {
+            let cap = match p.slot_cap {
+                0 => "?".to_string(),
+                c => c.to_string(),
+            };
+            let over = if p.slot_cap > 0 && p.partition_count > p.slot_cap {
+                "  <- over its cpuset: the extra partitions are not opened (ps=unknown)"
+            } else {
+                ""
+            };
+            println!(
+                "  ps {:>6} {:<20} {:>4}/{:<4} slots{}",
+                p.ps_id, p.address, p.partition_count, cap, over
+            );
         }
         println!("nodes:");
         for n in &resp.nodes {

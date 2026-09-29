@@ -1270,6 +1270,25 @@ fn rebalance_advisory_respects_cooldown() {
     assert_eq!(eng.compute_rebalance_advisory(&state, later).len(), 1);
 }
 
+/// The advisory asks the same question the moves answer. A full 2-slot cpuset
+/// PS next to a capacity-unknown PS holding 10 is a count gap of 8, but no
+/// move improves it, so an advisory would only repeat every cooldown.
+#[test]
+fn rebalance_advisory_follows_slot_caps_not_raw_counts() {
+    let mut assignments: Vec<(u64, u64)> = (100..102).map(|p| (p, 1)).collect();
+    assignments.extend((200..210).map(|p| (p, 2)));
+    let mut state = rebal_state(&[1, 2], &assignments);
+    state.ps_slot_caps.insert(1, 2);
+    let mut eng = PolicyEngine::default();
+    assert!(eng.compute_rebalance_advisory(&state, 1000).is_empty());
+
+    // Give PS 1 room for three more and the same layout is out of balance.
+    state.ps_slot_caps.insert(1, 5);
+    let out = eng.compute_rebalance_advisory(&state, 1000);
+    assert_eq!(out.len(), 1);
+    assert!(out[0].reason.contains("1:2/5 2:10/?"), "{}", out[0].reason);
+}
+
 #[test]
 fn rebalance_advisory_disabled_when_threshold_zero() {
     let assignments: Vec<(u64, u64)> = (100..132).map(|p| (p, 3)).collect();

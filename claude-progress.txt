@@ -1,9 +1,11 @@
 Date: 2026-09-29
 TaskStatus: not_completed
 Task scope: F-PS-CORE-CAPACITY (feature_list.md) — place partitions by PS core capacity (--cpuset = slot_cap = cpuset_len/2), allow oversubscription with floating threads confined to the cpuset, manager resolves overflow by move -> merge (post-merge <= 1/4 of split thresholds) -> alert, never seesaw split/merge.
-Current summary: design agreed with user and recorded in feature_list.md; no code yet.
-Main gaps: stage 1 (capacity reporting + capacity-aware placement/rebalance), stage 2 (PS: drop hard refusals, float in cpuset mask, decouple port ord from core slot, promote on free slot), stage 3 (overflow planner + anti-seesaw rules).
-Next steps: stage 1 — decide how capacity survives manager failover (registration vs heartbeat), then implement placement order in compute_region_for_partition / rebalance_regions / compute_rebalance_moves.
+Current summary: stage 1 done and committed. PS reports slot_cap on register + every heartbeat (wire 50, client floor 43 unchanged); manager keeps caps in memory only (replay clears, heartbeat restores, eviction drops); crates/manager/src/ps_placement.rs ranks free cpuset slot > capacity-unknown > least overfilled, used by rebalance_regions / compute_region_for_partition / compute_rebalance_moves / rebalance advisory; moves only strictly improve and never target a full cpuset PS; info + dashboard show used/cap.
+Verification: manager lib 441 pass, rpc 87, partition-server 265, system_ps_failover + system_lost_reply_idempotency pass; ablations red (count-only placement: 4 tests; Over-target moves: 1 test); live etcd+manager+EN+3 PS incl. manager kill -9/restart: 4/4 placement checks pass (steps in docs/ops.md "Which PS a partition goes on").
+Review: fable — applied: no rebalance onto a full cpuset PS (would close a serving partition under the PS refusal), overflow wording (not opened, not "not pinned"), docs. Deferred to stage 3: advisory band hides overflow smaller than the threshold.
+Main gaps: stage 2 (PS: drop the two hard refusals, float overflow threads in the cpuset mask, decouple port ord from core slot, promote on a freed slot), stage 3 (overflow planner + anti-seesaw rules).
+Next steps: stage 2. When the PS refusal goes, revisit the "never target a full cpuset PS" rule and the overflow wording in autumn-op/dashboard.
 
 Date: 2026-09-28 (6)
 TaskStatus: completed

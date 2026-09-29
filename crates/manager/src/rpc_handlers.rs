@@ -5605,6 +5605,7 @@ impl AutumnManager {
                     .map(|t| now.saturating_duration_since(*t).as_secs())
                     .unwrap_or(u64::MAX),
                 partition_count: per_ps_parts.get(ps_id).copied().unwrap_or(0),
+                slot_cap: s.ps_slot_caps.get(ps_id).copied().unwrap_or(0),
             })
             .collect();
         ps_servers.sort_by_key(|p| p.ps_id);
@@ -5717,6 +5718,16 @@ impl AutumnManager {
         Self::code_resp(CODE_OK, String::new())
     }
 
+    /// Keep a PS's reported core capacity; `0` (no `--cpuset`) is stored as
+    /// absence so `ps_placement` sees exactly the PS that have one.
+    fn record_slot_cap(s: &mut crate::store::MetadataState, ps_id: u64, slot_cap: u32) {
+        if slot_cap == 0 {
+            s.ps_slot_caps.remove(&ps_id);
+        } else {
+            s.ps_slot_caps.insert(ps_id, slot_cap);
+        }
+    }
+
     pub(crate) async fn handle_register_ps(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Self::code_resp(Self::err_to_code(&err), err.to_string());
@@ -5728,6 +5739,7 @@ impl AutumnManager {
         {
             let mut s = self.store.inner.borrow_mut();
             s.ps_nodes.insert(ps_id, req.address);
+            Self::record_slot_cap(&mut s, ps_id, req.slot_cap);
             Self::rebalance_regions(&mut s);
         }
         self.ps_last_heartbeat
@@ -5898,8 +5910,12 @@ impl AutumnManager {
         let req: HeartbeatPsReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let known = {
-            let s = self.store.inner.borrow();
-            s.ps_nodes.contains_key(&req.ps_id)
+            let mut s = self.store.inner.borrow_mut();
+            let known = s.ps_nodes.contains_key(&req.ps_id);
+            if known {
+                Self::record_slot_cap(&mut s, req.ps_id, req.slot_cap);
+            }
+            known
         };
         if known {
             self.ps_last_heartbeat

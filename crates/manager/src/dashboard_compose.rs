@@ -265,6 +265,9 @@ pub fn build_overview_json(
                 "last_heartbeat_secs_ago": (p.last_heartbeat_secs_ago != u64::MAX)
                     .then_some(p.last_heartbeat_secs_ago),
                 "partition_count": p.partition_count,
+                // null = no `--cpuset` on that PS, or not heard from since
+                // this manager became leader.
+                "slot_cap": (p.slot_cap > 0).then_some(p.slot_cap),
                 // Recomputed from the partitions the page is showing, so the
                 // count here and the list it drills into cannot disagree.
                 "n": n,

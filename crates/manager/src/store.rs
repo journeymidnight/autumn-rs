@@ -44,6 +44,10 @@ pub(crate) struct MetadataState {
     /// `RegisterPartitionAddr`. In-memory only; rebuilt when the PS
     /// re-registers on restart. Keyed by `part_id`; value is `host:port`.
     pub part_addrs: HashMap<u64, String>,
+    /// `slot_cap` each PS reports on register and heartbeat (only non-zero
+    /// values are kept). In-memory only: a new leader relearns it within one
+    /// heartbeat, and until then ranks the PS as capacity-unknown.
+    pub ps_slot_caps: HashMap<u64, u32>,
 }
 
 impl MetadataState {

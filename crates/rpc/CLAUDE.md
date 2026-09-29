@@ -904,6 +904,15 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## PS core slots (wire 50)
+
+`RegisterPsReq` and `HeartbeatPsReq` gain `slot_cap: u32` — the partitions a PS
+can pin to cores, `cpuset_len / 2` under an explicit `--cpuset`, `0` without one.
+`PsOverview` carries it back to autumn-op and the dashboard. None of the three
+is on the client surface, so the window's ceiling rises to [43, 50] and the
+floor stays; autumn-op is rebuilt with the cluster as for wire 49. Placement by
+these caps is in `crates/manager/CLAUDE.md`, "Rebalance".
+
 ## Unsettled deletes in the load report (wire 49)
 
 `PartitionLoad` gains `unsettled_deletes: u64` — deletes no major compaction

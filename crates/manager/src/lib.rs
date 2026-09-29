@@ -7,6 +7,7 @@ mod inflight_commit;
 mod extent_corrupt;
 mod op_log;
 mod placement;
+mod ps_placement;
 mod extent_layout;
 mod persist;
 pub(crate) mod store;
@@ -3373,6 +3374,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             s.next_revision = s.next_revision.max(max_revision);
             s.partitions = decoded_partitions;
             s.ps_nodes = decoded_ps_nodes;
+            // Caps are in-memory only; whatever an earlier term held may be
+            // stale. The next heartbeat of each PS brings them back.
+            s.ps_slot_caps.clear();
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
@@ -4189,6 +4193,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 let mut s = self.store.inner.borrow_mut();
                 for ps_id in &dead_ps {
                     s.ps_nodes.remove(ps_id);
+                    s.ps_slot_caps.remove(ps_id);
                 }
                 Self::rebalance_regions(&mut s);
             }
@@ -4267,12 +4272,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             return;
         }
 
-        let mut load: HashMap<u64, usize> = state.ps_nodes.keys().map(|&id| (id, 0)).collect();
-        for region in state.regions.values() {
-            if let Some(cnt) = load.get_mut(&region.ps_id) {
-                *cnt += 1;
-            }
-        }
+        // Regions stay where they are while their PS is registered; only a
+        // partition with no region, or one whose PS left, is placed.
+        let mut load = crate::ps_placement::loads(state);
 
         let mut ids: Vec<u64> = part_ids.into_iter().collect();
         ids.sort_unstable();
@@ -4283,26 +4285,15 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 None => continue,
             };
 
-            let ps_id = if let Some(r) = state.regions.get(&part_id) {
-                if state.ps_nodes.contains_key(&r.ps_id) {
-                    r.ps_id
-                } else {
-                    match load.iter().min_by_key(|(_, &cnt)| cnt).map(|(&id, _)| id) {
-                        Some(id) => {
-                            *load.entry(id).or_insert(0) += 1;
-                            id
-                        }
-                        None => continue,
-                    }
-                }
-            } else {
-                match load.iter().min_by_key(|(_, &cnt)| cnt).map(|(&id, _)| id) {
+            let ps_id = match state.regions.get(&part_id) {
+                Some(r) if state.ps_nodes.contains_key(&r.ps_id) => r.ps_id,
+                _ => match crate::ps_placement::pick_home(state, &load) {
                     Some(id) => {
                         *load.entry(id).or_insert(0) += 1;
                         id
                     }
                     None => continue,
-                }
+                },
             };
 
             let region_epoch = Self::next_region_epoch(state, part_id, &meta.rg);
@@ -4321,79 +4312,20 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         }
     }
 
-    /// compute the moves that bring the per-PS partition
-    /// COUNT as even as possible — repeatedly reassign one partition from the
-    /// most-loaded registered PS to the least-loaded, stopping when the gap is
-    /// ≤ 1 (perfectly balanced up to the remainder) or `max_moves` is reached
-    /// (`0` = unbounded). Unlike `rebalance_regions` (which keeps a registered
-    /// PS's regions STICKY), this ACTIVELY moves regions off an overloaded PS —
-    /// the WAS-PM / TiKV-PD `balance-region` behaviour.
+    /// Moves that bring placement to the ranking in `ps_placement`: fill free
+    /// cpuset slots, balance capacity-unknown PS by count, drain overfilled
+    /// PS — stopping when no move ranks strictly better (`max_moves == 0` =
+    /// unbounded). Unlike `rebalance_regions` (which keeps a registered PS's
+    /// regions STICKY), this ACTIVELY moves regions — the TiKV-PD
+    /// `balance-region` behaviour.
     ///
-    /// PURE + DETERMINISTIC (a dry-run matches the applied set): only PS in
-    /// `ps_nodes` participate; ties on load break by lowest `ps_id`; the
-    /// partition moved off the most-loaded PS is its largest `part_id`. The
-    /// caller applies each move by rewriting `regions[part_id].ps_id`.
-    ///
-    /// Count-based (not load/QPS-based) by design for v1 — partition count is
-    /// the coarse-but-robust signal (HBase `SimpleLoadBalancer`); a future
-    /// req/s-weighted variant can reuse the same apply path.
+    /// PURE + DETERMINISTIC (a dry-run matches the applied set). The caller
+    /// applies each move by rewriting `regions[part_id].ps_id`.
     fn compute_rebalance_moves(
         state: &crate::store::MetadataState,
         max_moves: u32,
     ) -> Vec<RebalanceMove> {
-        // Partition ids per REGISTERED PS (a region on an unregistered PS is
-        // the eviction path's job, not ours; it isn't a movable source here).
-        let mut by_ps: HashMap<u64, Vec<u64>> =
-            state.ps_nodes.keys().map(|&id| (id, Vec::new())).collect();
-        for (part_id, region) in &state.regions {
-            if let Some(v) = by_ps.get_mut(&region.ps_id) {
-                v.push(*part_id);
-            }
-        }
-        if by_ps.len() < 2 {
-            return Vec::new(); // nothing to balance across
-        }
-        for v in by_ps.values_mut() {
-            v.sort_unstable(); // largest part_id is popped first (deterministic)
-        }
-        let cap = if max_moves == 0 {
-            usize::MAX
-        } else {
-            max_moves as usize
-        };
-        let mut moves = Vec::new();
-        while moves.len() < cap {
-            // most-loaded (ties → lowest ps_id), least-loaded (ties → lowest ps_id)
-            let most = by_ps
-                .iter()
-                .map(|(id, v)| (v.len(), std::cmp::Reverse(*id)))
-                .max()
-                .map(|(_, r)| r.0);
-            let least = by_ps
-                .iter()
-                .map(|(id, v)| (v.len(), *id))
-                .min_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)))
-                .map(|(_, id)| id);
-            let (Some(most), Some(least)) = (most, least) else {
-                break;
-            };
-            if most == least {
-                break;
-            }
-            let most_n = by_ps[&most].len();
-            let least_n = by_ps[&least].len();
-            if most_n <= least_n + 1 {
-                break; // balanced: gap of 1 is the irreducible remainder
-            }
-            let part_id = by_ps.get_mut(&most).unwrap().pop().unwrap();
-            by_ps.get_mut(&least).unwrap().push(part_id);
-            moves.push(RebalanceMove {
-                part_id,
-                from_ps: most,
-                to_ps: least,
-            });
-        }
-        moves
+        crate::ps_placement::rebalance_moves(state, max_moves)
     }
 
     fn compute_region_for_partition(
@@ -4406,16 +4338,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .filter(|r| state.ps_nodes.contains_key(&r.ps_id))
             .map(|r| r.ps_id)
             .or_else(|| {
-                let mut load: HashMap<u64, usize> =
-                    state.ps_nodes.keys().map(|&id| (id, 0)).collect();
-                for region in state.regions.values() {
-                    if let Some(cnt) = load.get_mut(&region.ps_id) {
-                        *cnt += 1;
-                    }
-                }
-                load.into_iter()
-                    .min_by_key(|&(_, cnt)| cnt)
-                    .map(|(id, _)| id)
+                crate::ps_placement::pick_home(state, &crate::ps_placement::loads(state))
             })
             .unwrap_or(0);
         let region_epoch = Self::next_region_epoch(state, part.part_id, &part.rg);
@@ -6244,6 +6167,7 @@ mod tests {
             let req = rkyv_encode(&RegisterPsReq {
                 ps_id: 11,
                 address: "127.0.0.1:9955".to_string(),
+                slot_cap: 0,
             });
             let resp = m.handle_register_ps(req).await.unwrap();
             let r: CodeResp = rkyv_decode(&resp).unwrap();
@@ -6281,6 +6205,7 @@ mod tests {
                 let req = rkyv_encode(&RegisterPsReq {
                     ps_id,
                     address: format!("127.0.0.1:999{ps_id}"),
+                    slot_cap: 0,
                 });
                 let resp = m.handle_register_ps(req).await.unwrap();
                 let r: CodeResp = rkyv_decode(&resp).unwrap();
@@ -6323,6 +6248,72 @@ mod tests {
         })
     }
 
+    /// The caps reach placement through the real handlers: register carries
+    /// one, a heartbeat (which is all a new leader gets) replaces it, and the
+    /// overview reports it. Count balancing would split 4 partitions 2/2; a
+    /// 3-slot cpuset PS next to a capacity-unknown one must take 3 first.
+    #[test]
+    fn placement_follows_reported_slot_caps() {
+        run(async {
+            let m = AutumnManager::new();
+            for (ps_id, slot_cap) in [(10u64, 3u32), (20, 0)] {
+                let req = rkyv_encode(&RegisterPsReq {
+                    ps_id,
+                    address: format!("127.0.0.1:999{ps_id}"),
+                    slot_cap,
+                });
+                m.handle_register_ps(req).await.unwrap();
+            }
+            let upsert = |part_id: u64, start: &[u8], end: &[u8]| {
+                rkyv_encode(&UpsertPartitionReq {
+                    meta: autumn_rpc::manager_rpc::MgrPartitionMeta {
+                        log_stream: part_id,
+                        row_stream: part_id + 100,
+                        meta_stream: part_id + 200,
+                        part_id,
+                        rg: Some(autumn_rpc::manager_rpc::MgrRange {
+                            start_key: start.to_vec(),
+                            end_key: end.to_vec(),
+                        }),
+                    },
+                })
+            };
+            for (part_id, start, end) in [
+                (1u64, b"a" as &[u8], b"e" as &[u8]),
+                (2, b"e", b"j"),
+                (3, b"j", b"n"),
+                (4, b"n", b"z"),
+            ] {
+                m.handle_upsert_partition(upsert(part_id, start, end)).await.unwrap();
+            }
+            let count_on = |ps: u64| {
+                m.store.inner.borrow().regions.values().filter(|r| r.ps_id == ps).count()
+            };
+            assert_eq!((count_on(10), count_on(20)), (3, 1));
+
+            // PS 20 now reports 4 slots on its heartbeat: it has 3 free, PS 10
+            // none, so the next partition goes to PS 20.
+            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 20, slot_cap: 4 });
+            m.handle_heartbeat_ps(req).await.unwrap();
+            m.handle_upsert_partition(upsert(5, b"z", b"")).await.unwrap();
+            assert_eq!(count_on(20), 2);
+
+            // A heartbeat from an unregistered PS records nothing.
+            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 99, slot_cap: 8 });
+            m.handle_heartbeat_ps(req).await.unwrap();
+            assert!(!m.store.inner.borrow().ps_slot_caps.contains_key(&99));
+
+            let resp = m.handle_get_cluster_overview().await.unwrap();
+            let ov: GetClusterOverviewResp = rkyv_decode(&resp).unwrap();
+            let caps: Vec<(u64, u32, u32)> = ov
+                .ps_servers
+                .iter()
+                .map(|p| (p.ps_id, p.partition_count, p.slot_cap))
+                .collect();
+            assert_eq!(caps, vec![(10, 3, 3), (20, 2, 4)]);
+        })
+    }
+
     #[test]
     fn ps_eviction_reassigns_regions() {
         run(async {
@@ -6332,6 +6323,7 @@ mod tests {
                 let req = rkyv_encode(&RegisterPsReq {
                     ps_id,
                     address: addr.to_string(),
+                    slot_cap: 0,
                 });
                 m.handle_register_ps(req).await.unwrap();
             }
@@ -6381,12 +6373,13 @@ mod tests {
             let req = rkyv_encode(&RegisterPsReq {
                 ps_id: 55,
                 address: "ps55:9055".to_string(),
+                slot_cap: 0,
             });
             m.handle_register_ps(req).await.unwrap();
 
             compio::time::sleep(Duration::from_millis(10)).await;
 
-            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 55 });
+            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 55, slot_cap: 0 });
             m.handle_heartbeat_ps(req).await.unwrap();
 
             let hb = m.ps_last_heartbeat.borrow();

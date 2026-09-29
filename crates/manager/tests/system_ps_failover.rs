@@ -135,6 +135,7 @@ fn ps_heartbeat_timeout_triggers_reassignment() {
         let req = rkyv_encode(&RegisterPsReq {
             ps_id: 41,
             address: "fake:9201".to_string(),
+            slot_cap: 0,
         });
         let resp = mgr.call(MSG_REGISTER_PS, req).await.expect("register PS1");
         let r: CodeResp = rkyv_decode(&resp).expect("decode");
@@ -155,6 +156,7 @@ fn ps_heartbeat_timeout_triggers_reassignment() {
         let req = rkyv_encode(&RegisterPsReq {
             ps_id: 42,
             address: "fake:9202".to_string(),
+            slot_cap: 0,
         });
         let resp = mgr.call(MSG_REGISTER_PS, req).await.expect("register PS2");
         let r: CodeResp = rkyv_decode(&resp).expect("decode");
@@ -175,7 +177,7 @@ fn ps_heartbeat_timeout_triggers_reassignment() {
         for _ in 0..12 {
             compio::time::sleep(Duration::from_secs(2)).await;
             // Send heartbeat for PS2 but NOT PS1
-            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 42 });
+            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 42, slot_cap: 0 });
             let _ = mgr.call(MSG_HEARTBEAT_PS, req).await;
         }
 

@@ -767,6 +767,9 @@ pub struct MultiModifySplitReq {
 pub struct RegisterPsReq {
     pub ps_id: u64,
     pub address: String,
+    /// Partitions this PS can pin to cores: `cpuset_len / 2` under an explicit
+    /// `--cpuset`, `0` when it was started without one (capacity unknown).
+    pub slot_cap: u32,
 }
 // Response: CodeResp
 
@@ -875,6 +878,9 @@ pub struct ClientRegionsResp {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct HeartbeatPsReq {
     pub ps_id: u64,
+    /// Same as `RegisterPsReq::slot_cap`. Repeated on every beat because the
+    /// manager keeps it in memory only: a new leader learns it from here.
+    pub slot_cap: u32,
 }
 // Response: CodeResp
 
@@ -1489,6 +1495,9 @@ pub struct PsOverview {
     pub last_heartbeat_secs_ago: u64,
     /// Regions currently assigned to this PS.
     pub partition_count: u32,
+    /// Core-pinned partition slots this PS reported; `0` = no `--cpuset`, or
+    /// not yet heard from since this manager became leader.
+    pub slot_cap: u32,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

@@ -1166,11 +1166,12 @@ impl PolicyEngine {
     }
 
     /// Phase B: a CLUSTER-level advisory (not per-partition
-    /// or per-extent) — emitted when the per-PS partition-count spread exceeds
-    /// `rebalance_gap_threshold` and we're outside the cluster cooldown. Sourced
-    /// directly from `regions` + `ps_nodes` (the same inputs `compute_rebalance_moves`
-    /// uses), NOT from PartitionLoad windows — partition COUNT is the signal, and
-    /// the manager knows it authoritatively without any PS report. At most ONE
+    /// or per-extent) — emitted when placement is out of balance by more than
+    /// `rebalance_gap_threshold` (see `ps_placement::imbalanced`) and we're
+    /// outside the cluster cooldown. Sourced from `regions`, `ps_nodes` and
+    /// `ps_slot_caps` (the same inputs `compute_rebalance_moves` uses), NOT
+    /// from PartitionLoad windows — partition COUNT against core slots is the
+    /// signal. At most ONE
     /// candidate per tick: `kind = POLICY_KIND_REBALANCE`, primary/secondary = 0
     /// (cluster-scoped); the armed controller's actuation calls
     /// `handle_rebalance_regions` with a bounded per-tick `max_moves`.
@@ -1183,33 +1184,25 @@ impl PolicyEngine {
         if cfg.rebalance_gap_threshold == 0 || state.ps_nodes.len() < 2 {
             return Vec::new(); // advisory disabled, or nothing to balance across
         }
-        // Per REGISTERED-PS partition counts (registered PS start at 0).
-        let mut counts: HashMap<u64, usize> =
-            state.ps_nodes.keys().map(|&id| (id, 0usize)).collect();
-        for region in state.regions.values() {
-            if let Some(c) = counts.get_mut(&region.ps_id) {
-                *c += 1;
-            }
-        }
-        let max = counts.values().copied().max().unwrap_or(0);
-        let min = counts.values().copied().min().unwrap_or(0);
-        if max.saturating_sub(min) <= cfg.rebalance_gap_threshold {
+        // The same ranking `compute_rebalance_moves` uses, with the source
+        // giving up `rebalance_gap_threshold` partitions instead of one: among
+        // capacity-unknown PS that is "max − min count > threshold", and it
+        // never fires on a spread the moves would leave alone (a full cpuset
+        // PS next to a busier capacity-unknown one).
+        if !crate::ps_placement::imbalanced(state, cfg.rebalance_gap_threshold) {
             return Vec::new(); // balanced within the hysteresis band
         }
         if now.saturating_sub(self.last_rebalance_at) < cfg.rebalance_cooldown_sec {
             return Vec::new(); // still cooling down from a recent emission
         }
         self.last_rebalance_at = now;
-        let mut sorted: Vec<(u64, usize)> = counts.into_iter().collect();
-        sorted.sort_unstable();
         vec![PolicyCandidate {
             kind: POLICY_KIND_REBALANCE,
             primary_part_id: 0,   // cluster-scoped, not a single partition
             secondary_part_id: 0,
             reason: format!(
-                "per-PS partition counts {:?} spread max-min={} > {}",
-                sorted,
-                max - min,
+                "per-PS partitions/slots [{}] out of balance by more than {}",
+                crate::ps_placement::describe(state),
                 cfg.rebalance_gap_threshold,
             ),
             size_bytes: 0,

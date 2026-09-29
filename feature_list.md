@@ -35,6 +35,7 @@
   - 阶段 2：分区数超过 `cpuset_len/2` 时全部可服务；浮动线程的亲和掩码等于 cpuset（读 `/proc/<pid>/task/*/status` 的 `Cpus_allowed_list`）；关闭一个绑核分区后，一个浮动分区在有限时间内变为单核绑定；split 在 PS 满时不再被拒。
   - 阶段 3：超卖时产生迁移或满足 1/4 上限的 merge；构造在阈值边界抖动的负载，断言 N 个 tick 内同一 key range 的 split+merge 次数 ≤ 1；无冷对时只告警不动作；各规则消融能变红。
 - `passes: false`
+- **notes** (2026-09-29): 阶段 1 完成——PS 注册/心跳上报 `slot_cap`（wire 50），manager 内存保存、换主清空待心跳补回；`ps_placement.rs` 统一排序，放置/split 右孩子/驱逐重放/rebalance/告警共用；rebalance 只做严格改进的移动且不移到已满 cpuset PS（PS 硬拒仍在，移过去会关掉一个在服务的分区）；`info`/dashboard 显示 used/cap。真实集群（etcd+manager+EN+3 PS，含 manager kill -9 重启）4 项放置检查全过；单测消融变红。阶段 3 待处理：告警的滞回带（`rebalance_gap_threshold`）让超卖少于阈值的 cpuset PS 永远当不了源——手动 `rebalance` 能修，自动策略不会（旧按数量的告警同样如此，非回归）；超卖处理 planner 要让 Over 源绕过这个带。
 
 ### BUG-POLICY-ACTIVATE-ATOMIC — policy 名称与模式切换跨两次 RPC
 - **Trigger** (2026-09-27 dashboard review): `autumn-op auto-policy activate` 先 SET_ACTIVE 后 SET_MODE；manager 的 SET_ACTIVE 保留旧 mode。旧模式为 Armed 时，选择本应 DryRun 的新 policy 会先继承 Armed；第二次请求失败会留下部分更新，其他操作者也可在两次调用之间交错。

@@ -267,6 +267,7 @@ async fn register_dummy_ps(mgr: &RpcClient, ps_id: u64) {
             rkyv_encode(&RegisterPsReq {
                 ps_id,
                 address: "127.0.0.1:1".to_string(),
+                slot_cap: 0,
             }),
         )
         .await

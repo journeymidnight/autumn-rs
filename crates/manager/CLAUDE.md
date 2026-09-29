@@ -363,19 +363,57 @@ and reopens the survivor = natural unfreeze); on error best-effort unfreeze. PS-
 
 ### Rebalance
 
+**Every PS choice goes through one ranking, `ps_placement.rs`.** A PS started
+with `--cpuset` has `cpuset_len / 2` core slots and reports them as `slot_cap` on
+register AND on every heartbeat; a PS without one reports `0` (capacity unknown).
+The manager keeps them in `MetadataState::ps_slot_caps`, **in memory only** —
+not etcd, so no persisted record changes: `replay_from_etcd` clears them and each
+PS's next heartbeat (≤ 2 s) brings its cap back; until then that PS ranks as
+capacity-unknown. Eviction drops the cap with the PS. The ranking, best first:
+
+1. a cpuset PS with a free slot, most free slots first;
+2. a capacity-unknown PS, fewest partitions first;
+3. a full cpuset PS, lowest fill it would reach, `(used + 1) / cap`.
+
+Tier 3 exists so a placement always has an answer: the manager never refuses
+and reserves nothing. The PS still refuses to open a partition past its budget
+(it shows `ps=unknown` until moved), so a placement there waits for a move. Ties break by lowest `ps_id` (the old count-based pick
+iterated a `HashMap`, so its ties were arbitrary).
+
+A rebalance move is made only when the target's seat ranks STRICTLY better
+than the seat the partition leaves (`seat(to, used)` < `seat(from, used - 1)`),
+and never onto a full cpuset PS: under the PS's refusal such a move only trades
+which PS leaves a partition unopened, and the partition moved (the source's
+largest `part_id`) may be one that was serving.
+Each move therefore replaces one element of the cluster's multiset of seats by a
+strictly smaller one; over a finite state space that cannot cycle, so rebalance
+never moves a partition back and forth — the property is structural, not a
+cooldown. Considering only the worst source and the best target is complete,
+because a seat never improves as `used` grows.
+`rebalance_reaches_a_fixed_point_from_every_small_start` checks termination and
+the fixed point over every 3-PS configuration with caps 0–3 and 0–5 partitions
+each. Among capacity-unknown PS all of this reduces exactly to the previous
+count balancing (gap ≤ 1).
+
 `rebalance_regions` is **STICKY, not a balancer**: it keeps a region on any
-still-registered PS (only refreshing `rg`) and assigns unassigned ones least-loaded.
+still-registered PS (only refreshing `rg`) and places unassigned ones by the
+ranking above.
 Called eagerly after `register_ps`, `upsert_partition`, `multi_modify_split` (safe
 because idempotent). The `rg` refresh on keep is critical — otherwise `GetRegions`
 returns a stale pre-split range.
 
-The active balancer is `compute_rebalance_moves(state, max_moves)` (pure, greedy
-most-loaded → least-loaded until the per-PS count gap ≤ 1, deterministic ties):
+The active balancer is `compute_rebalance_moves(state, max_moves)` (pure; moves
+until no move ranks strictly better — see the ranking above; deterministic ties):
 `handle_rebalance_regions` rewrites each moved region's `ps_id` in-memory then
 `mirror_partition_snapshot`. `rg` is unchanged so `region_epoch` is NOT bumped (only
 the serving PS moved); the PS `sync_regions_once` picks up the `ps_id` change and the
 old PS drops / new PS opens. Exposed as `autumn-op rebalance [MAX_MOVES]` and as the
-auto-policy `POLICY_KIND_REBALANCE` (7) arm.
+auto-policy `POLICY_KIND_REBALANCE` (7) arm. The advisory asks the moves' own
+question with a hysteresis band: it fires when a move would still rank strictly
+better after its source gave up `rebalance_gap_threshold` partitions
+(`ps_placement::imbalanced`) — among capacity-unknown PS exactly the old
+"max − min count > threshold", and silent on a count gap no move would touch
+(a full cpuset PS beside a busier capacity-unknown one).
 
 **Actuation cooldown floors (rebalance + compaction).** `decide_actions` floors the
 actuation cooldown of rebalance and of BOTH compact kinds at a non-configurable 60 s
@@ -395,7 +433,8 @@ misconfiguration.
 ## PS liveness
 
 `ps_last_heartbeat: Arc<Mutex<HashMap<u64, Instant>>>` (ephemeral, not persisted).
-`register_ps` seeds a timestamp; the PS calls `heartbeat_ps` every 2 s;
+`register_ps` seeds a timestamp; the PS calls `heartbeat_ps` every 2 s (both
+carry `slot_cap`, recorded only for a registered PS — see "Rebalance");
 `ps_liveness_check_loop` (2 s) evicts a PS not seen in 10 s — fenced
 `put_and_delete_txn(delete psNodes/<id>)` then `rebalance_regions`. On eviction
 `handle_heartbeat_ps` returns `CODE_NOT_FOUND` so the PS re-registers +
@@ -1444,7 +1483,9 @@ Two of its fields exist because a ROLL-UP CANNOT ANSWER THE QUESTION THEY ANSWER
   `null`) means no heartbeat entry — defensive only, since `replay_from_etcd` and
   `register_ps` both seed one. The flip side of the replay seed: right after a leader
   change every replayed PS reads as freshly heard from until the 10 s eviction window
-  judges it.
+  judges it. Each row also carries `slot_cap` (JSON `null` = no `--cpuset`, or
+  not heard from since this manager became leader); `autumn-op info` prints
+  `used/cap slots` per PS and flags a PS past its cap.
 
 ## GC lifetime, VP retention, both-zero reclaim
 

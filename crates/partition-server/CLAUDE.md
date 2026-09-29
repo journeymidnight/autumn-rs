@@ -15,7 +15,11 @@ partition's ready channel, so the partition does not open. compio's own
 P-log's single core; a `taskset`-launched PS inherits the launcher's cores) and
 silently binds nothing when the target is outside it (`crates/common/CLAUDE.md`).
 CPU read-back must show the `--cpuset` cores, not merely the intended values in
-logs. Both then call `cpu_pin::confine_io_workers(&rt)`, so that runtime's
+logs. The same budget (`cpuset_len / 2`, from `compute_partition_budget_cap`) is
+reported to the manager as `slot_cap` on `register_ps` and on every heartbeat
+(`0` when `--cpuset` was not given); the manager places partitions by it
+(`crates/manager/CLAUDE.md`, "Rebalance"). The PS still refuses to open a
+partition or split past its budget. Both then call `cpu_pin::confine_io_workers(&rt)`, so that runtime's
 io_uring worker threads (`iou-wrk-*`) stay inside the PS's `--cpuset` too
 (`crates/common/CLAUDE.md`).
 

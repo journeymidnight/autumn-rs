@@ -2796,9 +2796,11 @@ autumn-op --manager <MGR> rebalance 5           # throttle: at most 5 moves this
 autumn-op --manager <MGR> rebalance --json      # machine-readable {moved, moves[]}
 ```
 
-The manager reassigns partitions most-loaded-PS → least-loaded-PS until the
-per-PS count gap is ≤ 1 (count-based, like HBase `SimpleLoadBalancer` / WAS PM /
-TiKV-PD `balance-region`). Each move rewrites the region's `ps_id`; the old PS's
+The manager reassigns partitions until no move would place one strictly better
+(see "Which PS a partition goes on" below). Among PS started without `--cpuset`
+that is plain count balancing, gap ≤ 1 (like HBase `SimpleLoadBalancer` /
+TiKV-PD `balance-region`); a `--cpuset` PS is filled up to its core slots and no
+further while any capacity-unknown PS remains. Each move rewrites the region's `ps_id`; the old PS's
 `region_sync_loop` closes the partition and the new PS opens it (~2 s tick +
 that partition's recover_partition). The key RANGE doesn't change (no
 `region_epoch` bump); clients re-resolve the moved partition's listener via the
@@ -2817,6 +2819,47 @@ autumn-op --manager <MGR> info | grep '  part' | awk '{print $4}' | sort | uniq 
 Idempotent: re-running on an already-balanced cluster reports `0 moves`. (An
 automatic version — the dashboard auto-policy `rebalance` switch — is
 Phase B, not yet shipped.)
+
+### Which PS a partition goes on (core slots)
+
+A PS started with `--cpuset <N cores>` has `N / 2` core slots (each partition
+pins P-log and P-sst to one core each). A new partition, a split's right child,
+and a partition whose PS was evicted all go to, in order:
+
+1. a `--cpuset` PS with a free slot — the most free slots first (absolute
+   count, not fraction: a 1-slot PS is used only once the larger ones are
+   down to 1 free);
+2. a PS started without `--cpuset` — the fewest partitions first;
+3. only if every PS is a full `--cpuset` PS: the one it overfills least — and
+   that PS will not open it until `rebalance` or a freed slot moves it.
+   `rebalance` never moves a partition onto a full `--cpuset` PS.
+
+See the slots:
+
+```bash
+autumn-op --manager <MGR> info            # "partition servers:" → "ps 2 ... 1/2 slots"
+autumn-op --manager <MGR> --json info     # ps_servers[].slot_cap (null = no --cpuset)
+```
+
+`?` / `null` means the PS has no `--cpuset`, or the manager has not heard its
+heartbeat since becoming leader. The caps live only in manager memory, so for
+~2 s after a manager restart or failover every PS shows `?` and is placed as
+capacity-unknown; the next heartbeat restores them. A PS still refuses to open
+a partition or split past its own budget (`refusing to open partition — PS core
+budget exhausted` in its log; the partition shows `ps=unknown`).
+
+Manual verification (throwaway etcd + manager + 1 EN + 3 PS; PS1 `--cpuset`
+2 cores = 1 slot, PS2 4 cores = 2 slots, PS3 none):
+
+```bash
+autumn-op --manager $MGR bootstrap --replication 1+0   # → on PS2 (2 free)
+autumn-op --manager $MGR split <P> --at-raw-hex 6d     # child → PS1 (1 free each, lower id)
+# kill -9 the manager, restart it on the same etcd, wait 3 s
+autumn-op --manager $MGR info                          # PS1 1/1, PS2 1/2, PS3 0/?
+autumn-op --manager $MGR split <P> --at-raw-hex 66     # child → PS2 (free slot beats empty PS3)
+# kill -9 PS1, wait 15 s for eviction
+autumn-op --manager $MGR info                          # PS1's partition → PS3 (PS2 is full)
+```
 
 ### cluster_version + the wire version
 
