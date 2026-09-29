@@ -14,6 +14,13 @@
 
 ## Active
 
+### F-PS-READY — PS 就绪 = 所有分配给它的分区都已打开
+- **Trigger** (2026-09-29 用户): autumn-op 看 PS 状态只看心跳通不通；PS 必须把所有分区都打开后才算 ready。
+- **Scope**: PS 心跳上报已打开分区 `(part_id, region_epoch)`；manager 内存保存并在 overview 给出 `open_count` 与唯一的 `ready` 定义；autumn-op info / dashboard 显示；cluster.sh 与 autumn-deploy 启动等待改为等 ready。
+- **Acceptance**: 新启动/split/重启过程中显示非 ready，全部打开后 ready；超出 cpuset 预算的 PS 永不 ready；优雅停止后立即非 ready；kill -9 后 6 s 内转 silent；消融（忽略 epoch、注册不清除、去掉停机上报）变红。
+- `passes: true`
+- **notes** (2026-09-29): wire 51；kill -9 后到新进程注册前（≤6 s）旧报告仍显示 ready，manager 无更早信号，已写入文档。
+
 ### F-PS-CORE-CAPACITY — 分区放置按 PS 核容量；允许超卖，manager 感知并按策略消解
 - **Trigger** (2026-09-29 用户讨论): `--cpuset` 下每个分区占 2 核（P-log + P-sst），PS 容量 = `cpuset_len/2`，但 manager 放置分区只看各 PS 的 region 数（`compute_region_for_partition`、`rebalance_regions`、`compute_rebalance_moves` 三处），完全不知道核容量。PS 侧预算门是硬拒：`sync_regions_once` 满了拒开（分区一直 `ps=unknown`），`handle_split_part` 满了拒 split，且检查的是父分区所在 PS，而右孩子由 manager 派到最少 region 的 PS，可能不是本机。超出核数的线程 `pick_cpu_for_ord` 返回 `None` 不绑核，继承进程掩码，可能跑出 cpuset 抢 EN/其他租户的核。
 - **设计定案（用户确认）**:

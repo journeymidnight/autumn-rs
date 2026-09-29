@@ -662,22 +662,23 @@ _start_ps() {
     wait_ps_ready
 }
 
-# Wait until at least one partition is served with a registered PS address.
-# On (re)start the PS re-opens partitions and re-registers their per-partition
-# addresses; until it does, a client GetRegions can return a range with no
-# routable PS ("key is out of range"). Poll info for a partition that has both
-# a part_id and a non-empty ps_addr.
+# Wait until every PS is `ready` in `info`: its latest heartbeat reported every
+# partition assigned to it open. A heartbeat alone comes long before that — on
+# (re)start each partition replays its log before it serves, and until then a
+# client can be routed to a range nobody serves.
 wait_ps_ready() {
-    local i out
-    for (( i = 0; i < 60; i++ )); do
-        out="$(op --json info 2>/dev/null || true)"
-        if grep -q '"part_id"' <<<"$out" && grep -Eq '"ps_addr": "[0-9[]' <<<"$out"; then
-            log "partition(s) served — PS ready"
+    local i out ready want=${#PS_HOSTS[@]}
+    for (( i = 0; i < 120; i++ )); do
+        out="$(op info 2>/dev/null || true)"
+        ready=$(grep -Ec '^  ps .* slots  ready' <<<"$out" || true)
+        if (( ready >= want )); then
+            log "all $want PS ready (every assigned partition open)"
             return 0
         fi
         sleep 1
     done
-    log "WARN: PS partitions not fully registered after 60s (routing may be briefly stale)"
+    log "WARN: only $ready of $want PS ready after 120s:"
+    sed -n '/^partition servers:/,/^nodes:/p' <<<"$out" | sed '$d' >&2
 }
 
 # F-AUTHZ-BUILTIN: authz is ON by default at the DEPLOY layer (the dev/test

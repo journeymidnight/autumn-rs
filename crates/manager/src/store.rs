@@ -20,7 +20,7 @@
 //! survive the split intact; only the two being visible on one screen is lost.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use autumn_common::store::{
@@ -48,6 +48,10 @@ pub(crate) struct MetadataState {
     /// values are kept). In-memory only: a new leader relearns it within one
     /// heartbeat, and until then ranks the PS as capacity-unknown.
     pub ps_slot_caps: HashMap<u64, u32>,
+    /// `(part_id, region_epoch)` each PS's latest heartbeat reported open.
+    /// In-memory only, like `ps_slot_caps`; absent = no report since the PS
+    /// registered or this manager became leader.
+    pub ps_open_parts: HashMap<u64, HashSet<(u64, u64)>>,
 }
 
 impl MetadataState {

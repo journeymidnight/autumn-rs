@@ -881,6 +881,10 @@ pub struct HeartbeatPsReq {
     /// Same as `RegisterPsReq::slot_cap`. Repeated on every beat because the
     /// manager keeps it in memory only: a new leader learns it from here.
     pub slot_cap: u32,
+    /// `(part_id, region_epoch)` of every partition this PS has open and
+    /// serving right now. The manager compares it with the regions it assigned
+    /// to judge the PS ready; like `slot_cap` it is kept in memory only.
+    pub open_parts: Vec<(u64, u64)>,
 }
 // Response: CodeResp
 
@@ -1498,6 +1502,26 @@ pub struct PsOverview {
     /// Core-pinned partition slots this PS reported; `0` = no `--cpuset`, or
     /// not yet heard from since this manager became leader.
     pub slot_cap: u32,
+    /// How many of the `partition_count` assigned partitions the PS's latest
+    /// heartbeat reported open at their current region epoch; `None` = no
+    /// heartbeat with that report since the PS registered or this manager
+    /// became leader.
+    pub open_count: Option<u32>,
+}
+
+impl PsOverview {
+    /// A heartbeat older than this no longer vouches for the open set it
+    /// carried (the PS beats every 2 s; the manager evicts at 10 s).
+    pub const READY_MAX_HEARTBEAT_AGE_SECS: u64 = 6;
+
+    /// Ready = serving everything the manager assigned it: a recent heartbeat
+    /// reported every assigned partition open at its current epoch. A live
+    /// heartbeat alone says nothing about the partitions — they open after
+    /// registration, one recovery each.
+    pub fn ready(&self) -> bool {
+        self.last_heartbeat_secs_ago < Self::READY_MAX_HEARTBEAT_AGE_SECS
+            && self.open_count == Some(self.partition_count)
+    }
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

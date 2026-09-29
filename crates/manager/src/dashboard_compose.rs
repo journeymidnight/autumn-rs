@@ -268,6 +268,10 @@ pub fn build_overview_json(
                 // null = no `--cpuset` on that PS, or not heard from since
                 // this manager became leader.
                 "slot_cap": (p.slot_cap > 0).then_some(p.slot_cap),
+                // null = no open-partition report yet (just registered, or
+                // this manager just became leader).
+                "open_count": p.open_count,
+                "ready": p.ready(),
                 // Recomputed from the partitions the page is showing, so the
                 // count here and the list it drills into cannot disagree.
                 "n": n,

@@ -541,7 +541,7 @@ function tabBadge(t){
   if(t.id==="policy"){ const n=ADVISORIES.length; return n?`<span class="badge hot">${n}</span>`:""; }
   if(t.id==="logs"){ const n=LIVE_OPS.length; return n?`<span class="badge">${n}</span>`:""; }
   if(t.id==="nodes"){ const n=NODES.filter(isNodeUnhealthy).length; return n?`<span class="badge bad">${n}</span>`:""; }
-  if(t.id==="servers"){ const n=PS_SERVERS.filter(p=>psHealth(p).cls!=="ok").length; return n?`<span class="badge bad">${n}</span>`:""; }
+  if(t.id==="servers"){ const n=PS_SERVERS.filter(p=>psHealth(p).cls!=="ok"||!p.ready).length; return n?`<span class="badge bad">${n}</span>`:""; }
   if(t.id==="partitions"){ return `<span class="badge">${PARTS.length}</span>`; }
   return "";
 }
@@ -596,11 +596,19 @@ function psHealth(p){
   if(s<15) return {cls:"warn", text:agoStr(s)};
   return {cls:"bad", text:agoStr(s)};
 }
+// A heartbeat only says the process is up; partitions open after it, one
+// recovery each. `ready` = the latest beat reported every assigned one open.
+function psOpenText(p){
+  if(p.ready) return "ready";
+  if(p.open_count==null) return "awaiting report";
+  return `opening ${p.open_count}/${p.partition_count||0}`;
+}
 function renderOverviewTab(){
   renderRibbon();
   const bad=NODES.filter(isNodeUnhealthy);
   const badDisks=NODES.flatMap(n=>(n.disks||[]).filter(d=>d.reported===false||d.faulted||!d.online));
   const latePs=PS_SERVERS.filter(p=>psHealth(p).cls!=="ok");
+  const openingPs=PS_SERVERS.filter(p=>psHealth(p).cls==="ok"&&!p.ready);
   $("#ov_fleet").innerHTML = `
     <div class="metrics" style="margin:0;border-top:none">
       <span class="m">extent nodes <b>${NODES.length}</b></span>
@@ -619,7 +627,11 @@ function renderOverviewTab(){
       <span class="d">${latePs.length} partition server${latePs.length>1?"s":""} late or silent
       <span class="why">${esc(latePs.map(p=>"PS "+p.ps_id+" — "+psHealth(p).text).join(", "))}</span></span>
       <button class="btn xs" onclick="setTab('servers')">Servers</button></div>`:""}
-    ${(!bad.length&&!badDisks.length&&!latePs.length)?'<div class="empty">Every node, disk and server is reporting.</div>':""}`;
+    ${openingPs.length?`<div class="adv"><span class="sev" style="background:var(--warn)"></span>
+      <span class="d">${openingPs.length} partition server${openingPs.length>1?"s":""} not serving every partition assigned
+      <span class="why">${esc(openingPs.map(p=>"PS "+p.ps_id+" — "+psOpenText(p)).join(", "))}</span></span>
+      <button class="btn xs" onclick="setTab('servers')">Servers</button></div>`:""}
+    ${(!bad.length&&!badDisks.length&&!latePs.length&&!openingPs.length)?'<div class="empty">Every node, disk and server is reporting.</div>':""}`;
 
   const df=(window.__df)||{};
   const pct = df.raw_total ? (100*df.raw_used/df.raw_total) : 0;
@@ -656,6 +668,7 @@ function psCard(r, selected, onclick){
   return `<button class="ps-card${selected?" sel":""}" onclick='${onclick}'>
     <div class="top"><span class="swatch" style="background:${psColor(r.ps_id)}"></span>
       <span class="name">PS ${esc(r.ps_id)}</span><span class="hb ${h.cls}">♥ ${esc(h.text)}</span></div>
+    <div class="foot" style="margin-top:3px">${esc(psOpenText(r))}</div>
     <div class="foot" style="margin-top:3px">${esc(r.addr||"")}</div>
     <div class="big">${r.n||0} <small>partitions</small></div>
     <div class="foot">${fmtBytes(r.size)} · ${r.req_per_sec||0} iops · W ${fmtBytes(r.write_bytes_per_sec||0)}/s · R ${fmtBytes(r.read_bytes_per_sec||0)}/s</div>
@@ -686,6 +699,7 @@ function renderPsDrawer(id){
       <span class="did">PS #${esc(id)}</span><span class="on">${esc(r.addr||"")}</span></div>
     <div class="metrics">
       <span class="m">heartbeat <b class="${h.cls==="ok"?"":""}">${esc(h.text)}</b></span>
+      <span class="m">partitions open <b>${esc(psOpenText(r))}</b></span>
       <span class="m">partitions <b>${r.n||0}</b></span>
       <span class="m">live size <b>${fmtBytes(r.size)}</b></span>
       <span class="m">extents <b>${r.total_extents||0}</b></span>

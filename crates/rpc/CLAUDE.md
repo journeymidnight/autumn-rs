@@ -904,6 +904,15 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## PS readiness (wire 51)
+
+`HeartbeatPsReq` gains `open_parts: Vec<(u64, u64)>` — `(part_id,
+region_epoch)` of every partition the PS has open — and `PsOverview` gains
+`open_count: Option<u32>` plus `PsOverview::ready()`, the one definition of a PS
+serving everything it was assigned (`crates/manager/CLAUDE.md`, "PS liveness").
+Neither is on the client surface: the ceiling rises to [43, 51], the floor
+stays, and autumn-op is rebuilt with the cluster.
+
 ## PS core slots (wire 50)
 
 `RegisterPsReq` and `HeartbeatPsReq` gain `slot_cap: u32` — the partitions a PS

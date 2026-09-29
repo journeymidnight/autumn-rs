@@ -3377,6 +3377,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             // Caps are in-memory only; whatever an earlier term held may be
             // stale. The next heartbeat of each PS brings them back.
             s.ps_slot_caps.clear();
+            s.ps_open_parts.clear();
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
@@ -4194,6 +4195,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 for ps_id in &dead_ps {
                     s.ps_nodes.remove(ps_id);
                     s.ps_slot_caps.remove(ps_id);
+                    s.ps_open_parts.remove(ps_id);
                 }
                 Self::rebalance_regions(&mut s);
             }
@@ -6293,13 +6295,13 @@ mod tests {
 
             // PS 20 now reports 4 slots on its heartbeat: it has 3 free, PS 10
             // none, so the next partition goes to PS 20.
-            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 20, slot_cap: 4 });
+            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 20, slot_cap: 4, open_parts: Vec::new() });
             m.handle_heartbeat_ps(req).await.unwrap();
             m.handle_upsert_partition(upsert(5, b"z", b"")).await.unwrap();
             assert_eq!(count_on(20), 2);
 
             // A heartbeat from an unregistered PS records nothing.
-            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 99, slot_cap: 8 });
+            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 99, slot_cap: 8, open_parts: Vec::new() });
             m.handle_heartbeat_ps(req).await.unwrap();
             assert!(!m.store.inner.borrow().ps_slot_caps.contains_key(&99));
 
@@ -6311,6 +6313,79 @@ mod tests {
                 .map(|p| (p.ps_id, p.partition_count, p.slot_cap))
                 .collect();
             assert_eq!(caps, vec![(10, 3, 3), (20, 2, 4)]);
+        })
+    }
+
+    /// A heartbeat alone does not make a PS ready: it must report every
+    /// partition assigned to it open at the current region epoch. A stale
+    /// epoch (a split the PS has not reloaded yet) or a partition assigned
+    /// elsewhere does not count, and re-registering forgets the report.
+    #[test]
+    fn ps_ready_needs_every_assigned_partition_open_at_its_epoch() {
+        run(async {
+            let m = AutumnManager::new();
+            let register = |ps_id: u64| {
+                rkyv_encode(&RegisterPsReq {
+                    ps_id,
+                    address: format!("127.0.0.1:999{ps_id}"),
+                    slot_cap: 0,
+                })
+            };
+            m.handle_register_ps(register(10)).await.unwrap();
+            for (part_id, start, end) in [(1u64, b"a" as &[u8], b"m" as &[u8]), (2, b"m", b"")] {
+                let req = rkyv_encode(&UpsertPartitionReq {
+                    meta: autumn_rpc::manager_rpc::MgrPartitionMeta {
+                        log_stream: part_id,
+                        row_stream: part_id + 100,
+                        meta_stream: part_id + 200,
+                        part_id,
+                        rg: Some(autumn_rpc::manager_rpc::MgrRange {
+                            start_key: start.to_vec(),
+                            end_key: end.to_vec(),
+                        }),
+                    },
+                });
+                m.handle_upsert_partition(req).await.unwrap();
+            }
+            // Registered after the partitions: regions stay put, it holds none.
+            m.handle_register_ps(register(20)).await.unwrap();
+            let epoch = |part_id: u64| m.store.inner.borrow().regions[&part_id].region_epoch;
+            let beat = |ps_id: u64, open_parts: Vec<(u64, u64)>| {
+                rkyv_encode(&HeartbeatPsReq { ps_id, slot_cap: 0, open_parts })
+            };
+            let m = &m;
+            let ps = |ps_id: u64| async move {
+                let resp = m.handle_get_cluster_overview().await.unwrap();
+                let ov: GetClusterOverviewResp = rkyv_decode(&resp).unwrap();
+                let p = ov.ps_servers.into_iter().find(|p| p.ps_id == ps_id).unwrap();
+                (p.partition_count, p.open_count, p.ready())
+            };
+
+            // Registered and heartbeat-fresh, but no report yet.
+            assert_eq!(ps(10).await, (2, None, false));
+            m.handle_heartbeat_ps(beat(10, vec![])).await.unwrap();
+            assert_eq!(ps(10).await, (2, Some(0), false));
+            // A partition assigned elsewhere does not count.
+            m.handle_heartbeat_ps(beat(10, vec![(1, epoch(1)), (7, 1)])).await.unwrap();
+            assert_eq!(ps(10).await, (2, Some(1), false));
+            m.handle_heartbeat_ps(beat(10, vec![(1, epoch(1)), (2, epoch(2))])).await.unwrap();
+            assert_eq!(ps(10).await, (2, Some(2), true));
+
+            // The region moves on (a split bumps its epoch); the PS still has
+            // the old one open until its next sync reloads it.
+            let old = epoch(2);
+            m.store.inner.borrow_mut().regions.get_mut(&2).unwrap().region_epoch = old + 1;
+            m.handle_heartbeat_ps(beat(10, vec![(1, epoch(1)), (2, old)])).await.unwrap();
+            assert_eq!(ps(10).await, (2, Some(1), false));
+
+            // Nothing assigned: ready once it has reported.
+            assert_eq!(ps(20).await, (0, None, false));
+            m.handle_heartbeat_ps(beat(20, vec![])).await.unwrap();
+            assert_eq!(ps(20).await, (0, Some(0), true));
+
+            // A restarted PS re-registers: its old report is gone.
+            m.handle_register_ps(register(10)).await.unwrap();
+            assert_eq!(ps(10).await, (2, None, false));
         })
     }
 
@@ -6379,7 +6454,7 @@ mod tests {
 
             compio::time::sleep(Duration::from_millis(10)).await;
 
-            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 55, slot_cap: 0 });
+            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 55, slot_cap: 0, open_parts: Vec::new() });
             m.handle_heartbeat_ps(req).await.unwrap();
 
             let hb = m.ps_last_heartbeat.borrow();

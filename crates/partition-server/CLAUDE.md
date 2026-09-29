@@ -1527,6 +1527,12 @@ drained for process exit.
 
 ## Heartbeat must outlive `sync_regions_once`
 
+Every heartbeat also reports `open_parts` (`(part_id, region_epoch)` of each
+handle whose thread is alive; empty once `shutting_down`), and `shutdown()`
+sends one such beat before draining. That is what the manager judges readiness
+by — an early heartbeat is exactly why liveness alone cannot mean ready
+(`crates/manager/CLAUDE.md`, "PS liveness").
+
 `finish_connect` spawns `heartbeat_loop` immediately after `register_ps` succeeds,
 BEFORE the (potentially 10+ s with hundreds of MiB unflushed WAL) `sync_regions_once`
 — else the first heartbeat lands AFTER the manager's `PS_DEAD_TIMEOUT` (10 s) evicts

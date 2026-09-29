@@ -309,7 +309,8 @@ autumn-op --manager $MGR --json overview | python3 -c '
 import json,sys
 for p in json.load(sys.stdin)["ps_servers"]:
     print("PS", p["ps_id"], p["addr"], "parts", p["n"],
-          "heartbeat", p["last_heartbeat_secs_ago"])'
+          "heartbeat", p["last_heartbeat_secs_ago"],
+          "ready" if p["ready"] else "open %s/%s" % (p["open_count"], p["partition_count"]))'
 ```
 
 **Split is refused on an un-separated CoW child, and the page says so first.**
@@ -2841,6 +2842,25 @@ autumn-op --manager <MGR> info            # "partition servers:" → "ps 2 ... 1
 autumn-op --manager <MGR> --json info     # ps_servers[].slot_cap (null = no --cpuset)
 ```
 
+The state after `slots` says whether the PS serves what it was assigned:
+
+| state | meaning |
+|-------|---------|
+| `ready` | its last heartbeat (< 6 s old) reported every assigned partition open at its current epoch |
+| `opening n/m` | `n` of its `m` partitions are open; the rest are recovering, refused (over its cpuset), or not yet reloaded after a split |
+| `awaiting report` | registered, but no heartbeat since (just started, or this manager just became leader) |
+| `silent Ns` | no heartbeat for `N` ≥ 6 s; the manager evicts it at 10 s |
+
+A heartbeat alone is not readiness: the PS starts beating before its partitions
+replay their logs. Wait for `ready` (`--json info`: `ps_servers[].ready`) before
+driving traffic after a start. `cluster.sh` start / `start-ps` and
+`autumn-deploy` do; `cluster.sh` FAILS the start (after 120 s, printing the
+`partition servers:` lines) when the PS cannot open every partition — e.g. more
+partitions than its `--cpuset` has slots, which it refuses to open. The rest of
+the cluster is left running for inspection; `cluster.sh stop` cleans up. A PS stopped with SIGTERM reports nothing open as it starts
+draining; one killed with `kill -9` still reads `ready` until its replacement
+registers or its last heartbeat is 6 s old.
+
 `?` / `null` means the PS has no `--cpuset`, or the manager has not heard its
 heartbeat since becoming leader. The caps live only in manager memory, so for
 ~2 s after a manager restart or failover every PS shows `?` and is placed as
@@ -2859,6 +2879,21 @@ autumn-op --manager $MGR info                          # PS1 1/1, PS2 1/2, PS3 0
 autumn-op --manager $MGR split <P> --at-raw-hex 66     # child → PS2 (free slot beats empty PS3)
 # kill -9 PS1, wait 15 s for eviction
 autumn-op --manager $MGR info                          # PS1's partition → PS3 (PS2 is full)
+```
+
+Manual verification of readiness (throwaway etcd + manager + 1 EN + PS1 with
+`--cpuset` 4 cores = 2 slots):
+
+```bash
+autumn-op --manager $MGR bootstrap --replication 1+0   # PS1: opening 0/1 → ready
+autumn-op --manager $MGR split <P> --at-raw-hex 6d     # PS1: opening 0/2 → opening 1/2 → ready
+# SIGTERM PS1 and wait for it to exit
+autumn-op --manager $MGR info                          # PS1: opening 0/2 (not ready)
+# start PS1 again                                      # awaiting report / opening → ready
+# kill -9 PS1, wait 7 s
+autumn-op --manager $MGR info                          # PS1: silent 7s
+# start PS1 with --cpuset of 2 cores (1 slot)
+autumn-op --manager $MGR info                          # PS1 2/1 slots, opening 1/2, over its cpuset
 ```
 
 ### cluster_version + the wire version

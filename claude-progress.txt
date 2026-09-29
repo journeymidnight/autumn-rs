@@ -1,3 +1,12 @@
+Date: 2026-09-29 (2)
+TaskStatus: completed
+Task scope: F-PS-READY — user "op 检查 ps 的状态，必须 PS 完全打开所有的 part 之后才算 ready，但是现在只要 heartbeat 通了就行".
+Current summary: HeartbeatPsReq carries open_parts (part_id, region_epoch) of live handles, empty once shutting_down; shutdown() sends one such beat before draining (wire 51, client floor 43). Manager keeps MetadataState::ps_open_parts in memory (register/eviction drop, replay clears); PsOverview.open_count + PsOverview::ready() (hb < 6 s && open_count == partition_count). autumn-op info shows ready / opening n/m / awaiting report / silent Ns, JSON adds open_count/ready; dashboard warns on heartbeating-but-not-ready PS. cluster.sh wait_ps_ready (start, bootstrap, presplit, start-ps; replaces the fixed 3 s/partition sleep; dies after 120 s) and autumn-deploy wait for every PS ready.
+Verification: manager lib 442, rpc 87, partition-server 265, autumn-server bins, system_ps_failover + system_lost_reply_idempotency pass; check --workspace --tests clean; dashboard tabs smoke OK. Ablations red: epoch ignored, register not clearing (unit test); shutdown beat removed (live check). Live etcd+manager+EN+PS: 5/5 (bootstrap/split transitions, SIGTERM -> not ready, restart -> ready, kill -9 -> silent 7s, over-cap -> opening 1/2). cluster.sh release: fresh start with presplit 4, stop-ps/start-ps (4 s), full restart all ok.
+Review: fable (no high; applied: dashboard fixture + api_contract keys, shutdown beat logs a non-OK reply, ops.md says cluster.sh start fails when a PS cannot open everything). Left: stale autumn-op admitted by the client window would misdecode PsOverview (same as wire 50; rule = rebuild autumn-op with the cluster); an in-flight regular beat landing after the shutdown beat can re-report the full set for <=2 s; api_contract.py not run (needs a live dashboard).
+Main gaps: none.
+Next steps: none for this task; F-PS-CORE-CAPACITY stage 2 remains.
+
 Date: 2026-09-29
 TaskStatus: not_completed
 Task scope: F-PS-CORE-CAPACITY (feature_list.md) — place partitions by PS core capacity (--cpuset = slot_cap = cpuset_len/2), allow oversubscription with floating threads confined to the cpuset, manager resolves overflow by move -> merge (post-merge <= 1/4 of split thresholds) -> alert, never seesaw split/merge.

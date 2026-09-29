@@ -3722,6 +3722,22 @@ impl PartitionServer {
         }
     }
 
+    /// `(part_id, region_epoch)` of every partition open and serving here —
+    /// the heartbeat's claim the manager judges readiness by. A handle whose
+    /// thread has exited is not serving; `sync_regions_once` drops it on its
+    /// next tick. A draining PS serves nothing it could be restarted into.
+    fn open_parts(&self) -> Vec<(u64, u64)> {
+        if self.shutting_down.get() {
+            return Vec::new();
+        }
+        self.partitions
+            .borrow()
+            .iter()
+            .filter(|(_, h)| !h.join.as_ref().is_some_and(|j| j.is_finished()))
+            .map(|(id, h)| (*id, h.opened_with.lock().4))
+            .collect()
+    }
+
     async fn register_ps(&self) -> Result<()> {
         let address = self
             .advertise_addr
@@ -3788,6 +3804,7 @@ impl PartitionServer {
             let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq {
                 ps_id: self.ps_id,
                 slot_cap: self.slot_cap(),
+                open_parts: self.open_parts(),
             });
             // 5 s — heartbeat is fired every 2 s; we tolerate up to 5
             // consecutive failures (~10 s) before exiting. A 5 s
@@ -4805,6 +4822,38 @@ impl PartitionServer {
         // to drain (both run on this single-threaded runtime, but drains
         // await across ticks).
         self.shutting_down.set(true);
+        // Tell the manager now that nothing here is serving, so a restart's
+        // readiness wait cannot read this process's last report as the new
+        // one's. The regular beat would say the same within 2 s — usually after
+        // a quick drain has already exited.
+        let beat = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq {
+            ps_id: self.ps_id,
+            slot_cap: self.slot_cap(),
+            open_parts: self.open_parts(),
+        });
+        match self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_HEARTBEAT_PS,
+                beat,
+                Duration::from_secs(2),
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|b| {
+                manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&b).map_err(|e| e.to_string())
+            }) {
+            Ok(r) if r.code == manager_rpc::CODE_OK => {}
+            Ok(r) => tracing::warn!(
+                code = r.code,
+                "graceful shutdown: manager did not take the drain report: {}",
+                r.message
+            ),
+            Err(e) => {
+                tracing::warn!("graceful shutdown: could not report the drain to the manager: {e}")
+            }
+        }
 
         let timeout = Duration::from_millis(shutdown_timeout_ms());
         let part_ids: Vec<u64> = self.partitions.borrow().keys().copied().collect();

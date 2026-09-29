@@ -78,12 +78,12 @@ const OVERVIEW = {
   ps_roll: [{ ps_id: 1, addr: "127.0.0.1:21201", n: 2, size: 1048576 }],
   ps_servers: [
     { ps_id: 1, addr: "127.0.0.1:21201", last_heartbeat_secs_ago: 1, partition_count: 2,
-      n: 2, size: 1048576, req_per_sec: 12, write_bytes_per_sec: 1048576,
+      open_count: 2, ready: true, n: 2, size: 1048576, req_per_sec: 12, write_bytes_per_sec: 1048576,
       read_bytes_per_sec: 2097152, total_extents: 6 },
     // registered, serving nothing, and silent — the state the partition list
     // cannot express and the reason ps_servers is on the wire at all.
     { ps_id: 2, addr: "127.0.0.1:21203", last_heartbeat_secs_ago: null, partition_count: 0,
-      n: 0, size: 0, req_per_sec: 0, write_bytes_per_sec: 0, read_bytes_per_sec: 0, total_extents: 0 },
+      open_count: null, ready: false, n: 0, size: 0, req_per_sec: 0, write_bytes_per_sec: 0, read_bytes_per_sec: 0, total_extents: 0 },
   ],
   advisories: [
     { kind: "major", primary_part_id: 1, secondary_part_id: 0,

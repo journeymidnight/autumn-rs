@@ -240,6 +240,28 @@ wait_port() {
     die "$name did not start in time (port $port)"
 }
 
+# Wait until the PS is `ready` in `autumn-op info`: its latest heartbeat
+# reported every partition assigned to it open. A listening port or a
+# heartbeat comes long before that — each partition replays its log first.
+wait_ps_ready() {
+    local secs="${1:-60}" pid="" pf out="" i
+    pf="$(pid_file ps)"
+    [[ -f "$pf" ]] && pid="$(cat "$pf")"
+    echo -n "[cluster] waiting for the PS to open every assigned partition..."
+    for (( i = 0; i < secs * 2; i++ )); do
+        if [[ -n "$pid" ]] && ! proc_alive "$pid"; then
+            echo " EXITED"
+            die "ps (pid $pid) exited during startup — see $LOG_DIR/ps.log"
+        fi
+        out="$("$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" info 2>/dev/null || true)"
+        if grep -Eq '^  ps .* slots  ready' <<<"$out"; then echo " ok"; return 0; fi
+        sleep 0.5
+    done
+    echo " TIMEOUT"
+    sed -n '/^partition servers:/,/^nodes:/p' <<<"$out" | sed '$d' >&2
+    die "ps did not open its partitions in ${secs}s"
+}
+
 # ---------------------------------------------------------------------------
 # disk helpers
 # ---------------------------------------------------------------------------
@@ -981,8 +1003,8 @@ do_start() {
         else
             echo "[cluster] skipping bootstrap (already done — preserving data; use 'reset' for a fresh cluster)"
         fi
-        # Give PS a moment to sync regions and re-bind listeners on restart.
         wait_port "$PS_BASE_PORT" ps 60
+        wait_ps_ready 120
     else
         # Auto-select EC shape (FOPS-02).
         #
@@ -1074,23 +1096,7 @@ do_start() {
         [[ -r "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]] && _boot_admin=( --admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE" )
         "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" "${_boot_admin[@]}" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
-        # Wait for PS to pick up the new partition(s) and finish opening them.
-        # Each partition's open() runs stream commit_length calls serially against
-        # the server-level stream_client, so total time scales with partition count.
-        # Budget ~3s per partition (empirically sufficient at bootstrap time).
-        local n_parts=1
-        if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
-            n_parts="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
-            [[ "$n_parts" =~ ^[0-9]+$ ]] || n_parts=1
-        fi
-        local wait_secs=$(( 3 * n_parts ))
-        (( wait_secs < 3 )) && wait_secs=3
-        echo "[cluster] waiting ${wait_secs}s for PS to open ${n_parts} partition(s)..."
-        sleep "$wait_secs"
-        # confirm the first partition's listener is actually up.
-        # The per-partition listener on :$PS_BASE_PORT only exists
-        # once partition 0 has been opened and registered with the mgr.
-        wait_port "$PS_BASE_PORT" "partition 0 listener" 60
+        wait_ps_ready 120
     fi
 
     # Turnkey authz (AUTUMN_AUTH=1): register the gallery namespace and mint its
@@ -1117,6 +1123,7 @@ do_start() {
                 presplit --namespace bench --tenant perf --count "$_bparts" \
                 --admin-token "$_btok" \
                 || echo "[cluster] warning: bench presplit into $_bparts failed (bench will use 1 partition)"
+            wait_ps_ready 120
         fi
     fi
 
@@ -1207,10 +1214,10 @@ do_start_ps() {
         die "ps already running (pid $(cat "$pf"))"
     fi
     launch_ps
-    # Per-partition listener on :$PS_BASE_PORT only comes up after partition 0
-    # opens. Wait for it so a recovery test can `start-ps` and
+    # Every assigned partition open, so a recovery test can `start-ps` and
     # immediately drive traffic.
     wait_port "$PS_BASE_PORT" ps 60
+    wait_ps_ready 120
 }
 
 do_stop_ps() {

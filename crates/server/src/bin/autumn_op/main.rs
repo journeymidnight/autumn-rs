@@ -3007,6 +3007,10 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
                     "address": p.address,
                     "partition_count": p.partition_count,
                     "slot_cap": (p.slot_cap > 0).then_some(p.slot_cap),
+                    "last_heartbeat_secs_ago": (p.last_heartbeat_secs_ago != u64::MAX)
+                        .then_some(p.last_heartbeat_secs_ago),
+                    "open_count": p.open_count,
+                    "ready": p.ready(),
                 })).collect::<Vec<_>>(),
                 "total_req_per_sec": resp.total_req_per_sec,
                 "total_write_bytes_per_sec": resp.total_write_bytes_per_sec,
@@ -3060,7 +3064,9 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
         }
         // `used/cap` core slots per PS; `cap` is `?` for a PS with no
         // `--cpuset` (or one the manager has not heard since it became
-        // leader). The PS refuses to open partitions past its cap.
+        // leader). The PS refuses to open partitions past its cap. The state
+        // says whether it serves all of them: a PS answers heartbeats long
+        // before its partitions have recovered.
         println!("partition servers:");
         for p in &resp.ps_servers {
             let cap = match p.slot_cap {
@@ -3073,8 +3079,13 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
                 ""
             };
             println!(
-                "  ps {:>6} {:<20} {:>4}/{:<4} slots{}",
-                p.ps_id, p.address, p.partition_count, cap, over
+                "  ps {:>6} {:<20} {:>4}/{:<4} slots  {:<18}{}",
+                p.ps_id,
+                p.address,
+                p.partition_count,
+                cap,
+                ps_state(p),
+                over
             );
         }
         println!("nodes:");
@@ -3095,6 +3106,23 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One word on whether a PS serves what it was assigned; `ready` is the
+/// only state a start-up or readiness check should accept.
+fn ps_state(p: &PsOverview) -> String {
+    if p.last_heartbeat_secs_ago == u64::MAX {
+        "no heartbeat".to_string()
+    } else if p.last_heartbeat_secs_ago >= PsOverview::READY_MAX_HEARTBEAT_AGE_SECS {
+        format!("silent {}s", p.last_heartbeat_secs_ago)
+    } else if p.ready() {
+        "ready".to_string()
+    } else {
+        match p.open_count {
+            None => "awaiting report".to_string(),
+            Some(n) => format!("opening {n}/{}", p.partition_count),
+        }
+    }
 }
 
 /// Scoped per-partition view (`info --part P`, no `--detail`): one

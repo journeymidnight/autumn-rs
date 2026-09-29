@@ -5586,8 +5586,18 @@ impl AutumnManager {
         // partition-derived list, and they are the two states worth looking at.
         let mut per_ps_parts: std::collections::HashMap<u64, u32> =
             std::collections::HashMap::new();
+        // Of those, how many the PS last reported open at the current epoch.
+        let mut per_ps_open: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
         for r in s.regions.values() {
             *per_ps_parts.entry(r.ps_id).or_insert(0) += 1;
+            if s
+                .ps_open_parts
+                .get(&r.ps_id)
+                .is_some_and(|open| open.contains(&(r.part_id, r.region_epoch)))
+            {
+                *per_ps_open.entry(r.ps_id).or_insert(0) += 1;
+            }
         }
         let hb = self.ps_last_heartbeat.borrow();
         let now = Instant::now();
@@ -5606,6 +5616,10 @@ impl AutumnManager {
                     .unwrap_or(u64::MAX),
                 partition_count: per_ps_parts.get(ps_id).copied().unwrap_or(0),
                 slot_cap: s.ps_slot_caps.get(ps_id).copied().unwrap_or(0),
+                open_count: s
+                    .ps_open_parts
+                    .contains_key(ps_id)
+                    .then(|| per_ps_open.get(ps_id).copied().unwrap_or(0)),
             })
             .collect();
         ps_servers.sort_by_key(|p| p.ps_id);
@@ -5740,6 +5754,9 @@ impl AutumnManager {
             let mut s = self.store.inner.borrow_mut();
             s.ps_nodes.insert(ps_id, req.address);
             Self::record_slot_cap(&mut s, ps_id, req.slot_cap);
+            // A (re)registering PS has opened nothing this manager knows of;
+            // its first heartbeat says what it has.
+            s.ps_open_parts.remove(&ps_id);
             Self::rebalance_regions(&mut s);
         }
         self.ps_last_heartbeat
@@ -5914,6 +5931,8 @@ impl AutumnManager {
             let known = s.ps_nodes.contains_key(&req.ps_id);
             if known {
                 Self::record_slot_cap(&mut s, req.ps_id, req.slot_cap);
+                s.ps_open_parts
+                    .insert(req.ps_id, req.open_parts.into_iter().collect());
             }
             known
         };

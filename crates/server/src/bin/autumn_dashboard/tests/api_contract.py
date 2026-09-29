@@ -135,7 +135,7 @@ def run():
             expected_amp = capacity['raw_used'] / logical if logical else 0
             assert abs(capacity['amplification'] - expected_amp) < 1e-12
             server = v['ps_servers'][0]
-            assert {'ps_id','addr','last_heartbeat_secs_ago','partition_count','n','size','req_per_sec','write_bytes_per_sec','read_bytes_per_sec','total_extents'} <= server.keys()
+            assert {'ps_id','addr','last_heartbeat_secs_ago','partition_count','n','size','req_per_sec','write_bytes_per_sec','read_bytes_per_sec','total_extents','open_count','ready'} <= server.keys()
             assert server['last_heartbeat_secs_ago'] is not None and server['last_heartbeat_secs_ago'] < 60
             disks = v['nodes'][0]['disks']
             assert len(disks) == 2 and len({d['disk_id'] for d in disks}) == 2

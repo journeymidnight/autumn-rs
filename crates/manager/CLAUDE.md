@@ -446,6 +446,22 @@ The PS spawns its `heartbeat_loop` in `finish_connect` (NOT `serve()`, which onl
 runs after every assigned partition finishes WAL replay — that can exceed the
 eviction window).
 
+**Alive is not ready.** Because the heartbeat starts before any partition has
+recovered, a fresh heartbeat says only that the process is up. Every heartbeat
+also carries `open_parts` — `(part_id, region_epoch)` of each partition the PS
+has open with a live thread, empty once it starts a graceful drain (which sends
+one extra beat at once). The manager keeps the latest set per PS in
+`MetadataState::ps_open_parts`, in memory only like the slot caps: replay
+clears it, eviction drops it, and `register_ps` drops it, so a restarted process
+never inherits its predecessor's report. The overview's `open_count` counts the
+PS's assigned regions whose `(part_id, region_epoch)` is in that set (`None` =
+no report yet); an epoch mismatch — a split the PS has not reloaded — does not
+count. `PsOverview::ready()` = heartbeat younger than 6 s AND `open_count ==
+partition_count`; autumn-op, the dashboard, `cluster.sh` and `autumn-deploy`
+all use it. After a `kill -9` the old report still reads ready until the new
+process registers or the heartbeat turns 6 s old — there is no signal the
+manager could see sooner.
+
 ## Extent in-flight ledger (unified)
 
 One etcd-backed ledger `extent_inflight/<id>` keyed by extent_id replaces all
@@ -1485,7 +1501,10 @@ Two of its fields exist because a ROLL-UP CANNOT ANSWER THE QUESTION THEY ANSWER
   change every replayed PS reads as freshly heard from until the 10 s eviction window
   judges it. Each row also carries `slot_cap` (JSON `null` = no `--cpuset`, or
   not heard from since this manager became leader); `autumn-op info` prints
-  `used/cap slots` per PS and flags a PS past its cap.
+  `used/cap slots` per PS and flags a PS past its cap. `open_count` and `ready`
+  (see "PS liveness") say whether it serves everything assigned to it; the page
+  lists a heartbeating PS that is not ready as "not serving every partition
+  assigned".
 
 ## GC lifetime, VP retention, both-zero reclaim
 
