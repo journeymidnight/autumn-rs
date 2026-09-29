@@ -174,6 +174,15 @@ pub fn set_flush_mem_bytes(n: u64) -> bool {
 pub(crate) fn flush_mem_bytes() -> u64 {
     FLUSH_MEM_BYTES_CELL.get().copied().unwrap_or(FLUSH_MEM_BYTES)
 }
+/// Maximum entry bytes emitted into one SST by compaction and merge recovery.
+/// Keep both paths on the same P-SST sizing policy.
+pub(crate) fn max_sst_bytes() -> u64 {
+    flush_mem_bytes().saturating_mul(2)
+}
+/// Approximate encoded bytes used to enforce the per-SST output budget.
+pub(crate) fn sst_entry_bytes(key_len: usize, value_len: usize) -> usize {
+    key_len.saturating_add(value_len).saturating_add(20)
+}
 /// Test sync-point control — see `FLUSH_TEST_PAUSE`. Only tests call this.
 pub fn set_flush_test_pause(paused: bool) {
     FLUSH_TEST_PAUSE.store(paused, Ordering::Relaxed);
@@ -10224,6 +10233,64 @@ pub(crate) fn rotate_active(part: &mut PartitionData) {
     let _ = part.flush_tx.unbounded_send(());
 }
 
+/// Queue a recovered memtable as bounded immutable chunks before publishing a
+/// merged checkpoint.
+///
+/// A post-merge recovery can replay tens of GiB of WAL into one memtable.
+/// Feeding that memtable to the normal flush path would build one equally large
+/// SST, bypassing the normal P-SST output-size policy (and the RPC's u32 payload
+/// length). Split only this recovery-time memtable at the same MAX_SST used by
+/// compaction, then let the ordinary P-SST append path place each SST. The
+/// complete output may occupy any number of newly allocated extents as the row
+/// stream rolls. Every chunk is stamped with the recovered log tail: the final
+/// checkpoint names all chunks atomically, so together they cover every
+/// replayed record up to that cursor.
+fn split_memtable_by_bytes(recovered: Memtable, max_chunk_bytes: u64) -> Vec<Memtable> {
+    debug_assert!(max_chunk_bytes > 0);
+    let Memtable { data, .. } = recovered;
+    let entries = data.into_inner();
+    let mut chunks = Vec::new();
+    let mut chunk = Memtable::new();
+    for (key, entry) in entries {
+        let entry_bytes = sst_entry_bytes(key.0.len(), entry.value.len()) as u64;
+        if !chunk.is_empty()
+            && chunk.mem_bytes().saturating_add(entry_bytes) > max_chunk_bytes
+        {
+            chunks.push(chunk);
+            chunk = Memtable::new();
+        }
+        chunk.insert(key.0, entry, entry_bytes);
+    }
+
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
+}
+
+/// Drain P-sst's row-stream appends, seal the current tail, and make a fresh
+/// extent the tail. The P-sst worker owns the only row-stream StreamClient, so
+/// callers must use this barrier rather than allocating through P-log.
+pub(crate) async fn seal_and_roll_row_tail(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
+    let (row_stream_id, mut barrier_tx) = {
+        let p = part.borrow();
+        (p.row_stream_id, p.row_invalidate_tx.clone())
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    barrier_tx
+        .send(RowInvalidateBarrierReq {
+            row_stream_id,
+            seal_and_roll: true,
+            resp_tx,
+        })
+        .await
+        .map_err(|_| anyhow!("row tail barrier closed"))?;
+    resp_rx
+        .await
+        .map_err(|_| anyhow!("row tail barrier ACK dropped"))??;
+    Ok(())
+}
+
 pub(crate) fn maybe_rotate(part: &mut PartitionData) {
     if part.active.mem_bytes() >= flush_mem_bytes() {
         rotate_active(part);
@@ -10546,7 +10613,92 @@ const FLUSH_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 /// append leaves the old records, and the next open does this again.
 async fn publish_merged_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
     if !part.borrow().active.is_empty() {
-        flush_memtable_locked(part).await?;
+        // A merged recovery differs from an ordinary P-SST flush only here:
+        // start its MAX_SST-sized outputs on a fresh extent. Later appends may
+        // roll onto further new extents through the normal stream policy.
+        seal_and_roll_row_tail(part)
+            .await
+            .context("merge recovery: roll row tail before flush")?;
+
+        let (
+            recovered,
+            vp_eid,
+            vp_off,
+            row_stream_id,
+            log_stream_id,
+            meta_stream_id,
+            mut flush_req_tx,
+            part_sc,
+        ) = {
+            let mut p = part.borrow_mut();
+            let recovered = std::mem::replace(&mut p.active, Memtable::new());
+            (
+                recovered,
+                p.vp_extent_id,
+                p.vp_offset,
+                p.row_stream_id,
+                p.log_stream_id,
+                p.meta_stream_id,
+                p.flush_req_tx.clone(),
+                p.stream_client.clone(),
+            )
+        };
+
+        if vp_eid != 0 && vp_off > 0 {
+            part_sc.await_log_synced_to(vp_eid, vp_off).await?;
+        }
+
+        // Use the ordinary P-sst FlushReq for every normal-sized SST. Do not
+        // call commit_flush_outcome per chunk: that would publish the final WAL
+        // cursor before every recovered chunk was durable. Like compaction,
+        // append all output SSTs first and commit their locations atomically in
+        // one checkpoint below.
+        let mut outputs = Vec::new();
+        for chunk in split_memtable_by_bytes(recovered, max_sst_bytes().max(1)) {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            flush_req_tx
+                .send(FlushReq {
+                    imm: Arc::new(chunk),
+                    vp_eid,
+                    vp_off,
+                    row_stream_id,
+                    resp_tx,
+                })
+                .await
+                .map_err(|_| anyhow!("bulk thread dropped merge-recovery flush channel"))?;
+            outputs.push(
+                resp_rx
+                    .await
+                    .map_err(|_| anyhow!("bulk thread dropped merge-recovery flush response"))??,
+            );
+        }
+
+        let log_extent_count = part_sc
+            .get_stream_info(log_stream_id)
+            .await?
+            .extent_ids
+            .len() as u32;
+        let (tables, floors) = {
+            let mut p = part.borrow_mut();
+            for (meta, reader) in outputs {
+                p.tables.push(meta);
+                p.sst_readers.push(Arc::new(reader));
+            }
+            (p.tables.clone(), snapshot_fence_floors(&p))
+        };
+        save_table_locs_raw(
+            &part_sc,
+            meta_stream_id,
+            &tables,
+            vp_eid,
+            vp_off,
+            log_extent_count,
+            floors,
+        )
+        .await?;
+        part.borrow().durable_ckpt_vp.set((vp_eid, vp_off));
+        crate::background::refresh_metrics(part);
+        FLUSH_COMMITS.fetch_add(1, Ordering::Relaxed);
         return Ok(());
     }
     let (sc, log_stream_id, meta_stream_id, tables, vp, floors) = {
@@ -11982,6 +12134,78 @@ mod tests {
             200,
         );
         assert_eq!(mt.mem_bytes(), 300);
+    }
+
+    #[test]
+    fn recovered_memtable_split_preserves_order_and_entries() {
+        let mt = Memtable::new();
+        for seq in 1..=5u64 {
+            let key = key_with_ts(format!("k{seq}").as_bytes(), seq);
+            let value = vec![seq as u8; 16];
+            let entry_bytes = key.len() as u64 + value.len() as u64 + 32;
+            mt.insert(
+                key,
+                MemEntry {
+                    op: 1,
+                    value,
+                    expires_at: seq * 10,
+                },
+                entry_bytes,
+            );
+        }
+        let expected = mt.snapshot_sorted();
+
+        // Each entry is 46 bytes, so this produces 2 + 2 + 1 entries.
+        let chunks = split_memtable_by_bytes(mt, 92);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|chunk| chunk.mem_bytes() <= 92));
+
+        let actual: Vec<IterItem> = chunks
+            .iter()
+            .flat_map(Memtable::snapshot_sorted)
+            .collect();
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.iter()) {
+            assert_eq!(actual.key, expected.key);
+            assert_eq!(actual.op, expected.op);
+            assert_eq!(actual.value, expected.value);
+            assert_eq!(actual.expires_at, expected.expires_at);
+        }
+    }
+
+    #[test]
+    fn recovered_memtable_split_preserves_versions_across_boundary() {
+        let mt = Memtable::new();
+        for (user_key, seq) in [
+            (b"a".as_ref(), 1u64),
+            (b"k", 1),
+            (b"k", 2),
+            (b"k", 3),
+            (b"z", 1),
+        ] {
+            let key = key_with_ts(user_key, seq);
+            let value = vec![seq as u8; 8];
+            let entry_bytes = sst_entry_bytes(key.len(), value.len()) as u64;
+            mt.insert(
+                key,
+                MemEntry {
+                    op: 1,
+                    value,
+                    expires_at: 0,
+                },
+                entry_bytes,
+            );
+        }
+
+        let chunks = split_memtable_by_bytes(mt, 74);
+        assert!(chunks.len() >= 3, "the k versions must cross a boundary");
+        let versions: Vec<u64> = chunks
+            .iter()
+            .flat_map(Memtable::snapshot_sorted)
+            .filter(|item| parse_key(&item.key) == b"k")
+            .map(|item| parse_ts(&item.key))
+            .collect();
+        assert_eq!(versions, vec![3, 2, 1]);
     }
 
     // under the RwLock<BTreeMap> design the memtable has ONE writer

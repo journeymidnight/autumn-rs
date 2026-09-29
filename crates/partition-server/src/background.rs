@@ -2617,19 +2617,8 @@ pub(crate) async fn do_compact(
         // The maintenance gate excludes split, and compact_inflight makes
         // merge freeze wait. Only P-sst may seal its row writer; the barrier
         // drains appends before rolling and admits queued flushes afterwards.
-        let mut barrier_tx = part.borrow().row_invalidate_tx.clone();
-        let (resp_tx, resp_rx) = oneshot::channel();
-        barrier_tx
-            .send(crate::RowInvalidateBarrierReq {
-                row_stream_id,
-                seal_and_roll: true,
-                resp_tx,
-            })
+        crate::seal_and_roll_row_tail(part)
             .await
-            .map_err(|_| anyhow::anyhow!("major compact: row barrier closed"))?;
-        resp_rx
-            .await
-            .map_err(|_| anyhow::anyhow!("major compact: row barrier ACK dropped"))?
             .map_err(|e| anyhow::anyhow!("major compact: roll row tail: {e:#}"))?;
     }
 
@@ -2687,7 +2676,7 @@ pub(crate) async fn do_compact(
     );
 
     let now = now_secs();
-    let max_chunk = 2 * crate::flush_mem_bytes() as usize;
+    let max_chunk = crate::max_sst_bytes() as usize;
 
     // yield to other tasks on this compio runtime every
     // COMPACT_YIELD_EVERY entries. Formerly the merge loop ran up to
@@ -2791,7 +2780,7 @@ pub(crate) async fn do_compact(
             chunk_last_seq = raw_ts;
         }
 
-        let entry_size = raw_key.len() + raw_value.len() + 20;
+        let entry_size = crate::sst_entry_bytes(raw_key.len(), raw_value.len());
         if current_size + entry_size > max_chunk && !current_builder.is_empty() {
             // Finalize this chunk inline. Intermediate chunks carry NO
             // discards; only the final chunk after the loop attaches the
