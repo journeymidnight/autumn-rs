@@ -14,26 +14,6 @@
 
 ## Active
 
-### F-ROW-TRUNCATE-LIVE-REFS — compaction 截断 row stream 不得删除仍被 checkpoint 引用的 extent
-- **Trigger** (2026-09-29 用户，线上): 最新 checkpoint 引用 37 个 SST，其中 28 个位于已被删除的 extent 996、1029、1034，row stream 只剩 1066，分区无法打开，数据丢失。
-- **Scope**: 截断点不再由表序推出，改为按 row stream 物理顺序取第一个被现存表引用的 extent；major、minor、过期 major、auto-trim 共用一个函数；有待 flush 的 imm 时跳过本轮截断；每次截断记日志；`pickup_tables` 只负责选表。
-- **Acceptance**: 线上表序（大 SST 被跳过、合并输出插回旧位置）在旧逻辑下单测复现为删除仍被引用的 extent，新逻辑不删；消融变红；多 extent row stream 上 auto-trim 加 major 之后，checkpoint 列出的 SST 全在 stream 中，死前缀被删，重启后数据完整。
-- `passes: true`
-- **notes** (2026-09-29): "有待 flush 的 imm 时跳过本轮截断" 经评审改为：每个排队 imm 在冻结时记下当时最新表所在的 extent 作为下界，截断不越过它（持续写入时 imm 几乎总在排队，跳过会让死 SST 永不回收）。
-
-### F-PS-RESTART-REPLAY — 优雅停止后重启不应长时间回放 WAL；drain 确认要如实
-- **Trigger** (2026-09-29 用户，线上): 分区 32 打开约 190 s 几乎全在 recover_partition；回放从 extent 573 的 780 MB 开始扫到尾部（尾 extent 已提交约 15.75 GB）。另：flush 出错后 drain 仍回"排空完成"。
-- **Scope**: (1) drain 确认带上 flush 结果，shutdown 如实记日志；(2) 恢复的回放起点取 checkpoint 记录的游标，不再被任何一个旧 SST 的游标拉回；(3) compaction 发布的 checkpoint 游标不得早于它快照里最新表的游标；(4) 恢复记录实际回放起点、读量与耗时。
-- **Acceptance**: 旧 SST + 大量已 flush 的 WAL + 优雅停止后重启，回放量≈0（修前可复现为整段）；compaction 之后 checkpoint 游标不倒退；flush 出错时 shutdown 日志不再说 drained；消融变红；已有恢复/merge/GC 回归测试全绿。
-- `passes: true`
-
-### F-PS-READY — PS 就绪 = 所有分配给它的分区都已打开
-- **Trigger** (2026-09-29 用户): autumn-op 看 PS 状态只看心跳通不通；PS 必须把所有分区都打开后才算 ready。
-- **Scope**: PS 心跳上报已打开分区 `(part_id, region_epoch)`；manager 内存保存并在 overview 给出 `open_count` 与唯一的 `ready` 定义；autumn-op info / dashboard 显示；cluster.sh 与 autumn-deploy 启动等待改为等 ready。
-- **Acceptance**: 新启动/split/重启过程中显示非 ready，全部打开后 ready；超出 cpuset 预算的 PS 永不 ready；优雅停止后立即非 ready；kill -9 后 6 s 内转 silent；消融（忽略 epoch、注册不清除、去掉停机上报）变红。
-- `passes: true`
-- **notes** (2026-09-29): wire 51；kill -9 后到新进程注册前（≤6 s）旧报告仍显示 ready，manager 无更早信号，已写入文档。
-
 ### F-PS-CORE-CAPACITY — 分区放置按 PS 核容量；允许超卖，manager 感知并按策略消解
 - **Trigger** (2026-09-29 用户讨论): `--cpuset` 下每个分区占 2 核（P-log + P-sst），PS 容量 = `cpuset_len/2`，但 manager 放置分区只看各 PS 的 region 数（`compute_region_for_partition`、`rebalance_regions`、`compute_rebalance_moves` 三处），完全不知道核容量。PS 侧预算门是硬拒：`sync_regions_once` 满了拒开（分区一直 `ps=unknown`），`handle_split_part` 满了拒 split，且检查的是父分区所在 PS，而右孩子由 manager 派到最少 region 的 PS，可能不是本机。超出核数的线程 `pick_cpu_for_ord` 返回 `None` 不绑核，继承进程掩码，可能跑出 cpuset 抢 EN/其他租户的核。
 - **设计定案（用户确认）**:
