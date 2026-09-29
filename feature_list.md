@@ -42,6 +42,13 @@
 - **Acceptance**: 确定性测试：merge 后 survivor 服务时 meta stream 只有一条记录，优雅重启回放 < 64 KiB，消融变红；chaos merge 密集配比 HEAD 绿、消融二进制红；merge/split/恢复相关集成测试全过。
 - `passes: true`
 
+### F-SST-DELETION-COUNT — SST 记删除条目数，按 TiKV 规则自动 major compaction
+- **Trigger** (2026-09-29 用户): 线上删除约 1317 万 key 后重启删除进程，第一次从头 range 扫过这些 tombstone，首页 4096 key 用了 185.4 秒。本地复现：扫描耗时正比于未被 compaction 清掉的 tombstone 及其遮住的旧值；一次 major 后同一页 2.9 s → 29 ms。持续删除时 SETTLE（要求窗口内无新删除）不触发，`unsettled_deletes` 只在内存、重启清零。用户定："在 SST 里记 tombstone 数，改SST格式，这个是必要的"；"DeleteRange还是太困难，不做"；"做删除计数，和RocksDB 和 TiKV 一个规则"；"写一个临时的convert_sst的binary，stopworld->convert_sst->start-new-version"。
+- **Scope**: SST MetaBlock 格式 v2，记 `num_entries` / `num_deletions`，服务端只认 v2（v1 报错并提示跑 convert_sst）；PS 周期 tick 按 TiKV 规则（tombstone ≥ 10000 且 ≥ 全部条目 30%，检查间隔 5 分钟）自动发起 major compaction；分区打开时 `unsettled_deletes` 计入 SST 里的 tombstone；临时二进制 `convert_sst`：全停 PS 后把每个分区 checkpoint 引用的 SST 重写成 v2、发布新 checkpoint、截断 row stream，可中断重跑。
+- **Acceptance**: v2 编解码单测，v1 被拒；集成测试：删除 ≥ 1 万 key 并 flush 后，无外部触发，PS 自己做 major，tombstone 被清、range 首页变快，消融变红；重启后删除数不丢；convert_sst 在真实进程集群上把 v1 数据转成 v2，新 PS 打开后全部 key 可读（含 split 后 CoW 共享 SST、merge 后分区），重跑幂等；`docs/ops.md` 写明升级步骤。
+- `passes: true`
+- **notes** (2026-09-29): 已实现，本地提交、未 push（用户"最后也先别push"）。system_deletion_triggered_compaction 三项消融均变红（规则关掉、打开时不计 SST tombstone、跳过的 major 不结算）；真实进程端到端：旧 PS 经 merge + split 写 v1 数据，新 PS 拒开并提示 convert_sst，转换 38 个 SST，重跑为空操作，11000 个 key 逐字节正确、range 恰好列出 8200 个存活 key。线上集群尚未转换；转换完成后删掉 convert_sst、Dockerfile 那行和 sst_convert 模块。
+
 ### BUG-CHAOS-RECLAIM-RESIDUE — chaos 的物理回收检查在 fence 后重建的节点上留有旧副本
 - **Trigger** (2026-09-29，加 PS 重启 chaos 时发现): 全动作集 system_chaos 7 轮里 4 轮 `verify_gc_reclaim` 报 `physical reclaim incomplete`，残留文件都在被 KillThenFence/fence 过、随后由 recovery 在别处重建了副本的节点上（例：extent 22 在 node 1）。旧版与新版 PS 都出现。
 - **Scope**: 查清是检查过严（删除只发给当前成员，非成员残留靠 EN reconcile：3 轮 × 5 min 才收）还是产品缺陷（被替换下来的副本该在重建完成时就删），据此修检查或修产品。

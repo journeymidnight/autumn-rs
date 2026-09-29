@@ -826,6 +826,42 @@ During each periodic tick, the loop checks all SST readers for
 keys, a major compaction runs on all tables (drops expired entries + tombstones),
 so TTL partitions eventually clean up without explicit triggers.
 
+### Deletion-Triggered Major Compaction (automatic)
+
+Every `--deletion-compact-check-secs` (default 300 s, TiKV's
+`region-compact-check-interval`; the first check runs on the first tick after
+open) the periodic tick sums `num_entries` / `num_deletions` over the
+partition's SSTs and applies TiKV's rule (`region-compact-min-tombstones` /
+`region-compact-tombstones-percent`, the region-level form of RocksDB's
+`CompactOnDeletionCollector`): at least **10 000** tombstones AND tombstones at
+least **30%** of all entries → it enqueues a major compaction on `compact_tx`,
+exactly as a dispatched one, so that arm's memtable flush and
+`unsettled_deletes` settlement apply. Memtable deletes are not counted (TiKV
+counts SST properties only); they join the sum at the next flush.
+
+Why: a range scan reads every tombstone and every value it shadows until a major
+compaction drops them. On a real cluster a job deleted ~13 M keys while it kept
+deleting, so the manager's SETTLE advisory (which waits for the deletes to stop,
+and needs auto-policy armed) never fired; after the job restarted, its first
+range page walked all 13 M tombstones for 185 s. Measured locally: 500 k deleted
+4 KB keys, first page 2.9 s → 29 ms after one major compaction. The rule bounds
+the rewrite cost: a compaction runs only once tombstones are a large share of
+what it rewrites, and a successful major leaves none.
+`crates/manager/tests/system_deletion_triggered_compaction.rs` (12 000 deletes
+flushed, no external trigger, the partition settles itself; red with the rule
+disabled).
+
+The expiry major (and a minor compaction's shadowing) drops tombstones without
+settling `unsettled_deletes`; the next dispatched major — which never skips a
+single SST, see below — rewrites the table and settles them
+(`a_major_after_an_expiry_pass_settles_the_deletes_it_dropped`).
+
+Cost to know: every partition evaluates the rule on its first tick after open,
+so after a restart the tombstone-heavy ones all queue a major at once
+(serialized by `major_compact_parallelism`); a partition that keeps putting and
+deleting can re-cross 30% within an interval and rewrite itself each time, as
+TiKV's would.
+
 ### Minor compaction (`pickup_tables`) — NOT periodic any more
 
 Minor-compact-on-timer was removed; the periodic tick only refreshes gauges and
@@ -933,13 +969,12 @@ suite checks its old floor survives alongside the new output tail.
 
 `PartitionMetrics.unsettled_deletes` counts deletes no major compaction has
 covered: bumped per delete in Phase 3, seeded at open from the replayed
-memtable (`Memtable::tombstone_count`, one walk), and reduced on success by the
-count read in the same synchronous step as the flush's rotate — so deletes that
-land during the compaction stay counted. Deletes already flushed to an SST
-before a reopen are not re-counted (not persisted) — a restart, and also the
-reopen after a split or merge, whose freeze drain flushes. Such a partition
-settles only through another compaction; a merge of an emptied partition is
-vetoed by its phantom size until it settles, so that race is narrow. It ships as
+memtable (`Memtable::tombstone_count`, one walk) plus the loaded SSTs'
+`num_deletions`, and reduced on success by the count read in the same
+synchronous step as the flush's rotate — so deletes that land during the
+compaction stay counted. The SST term is what makes deletes flushed before a
+restart, split or merge still count (the counter itself is not persisted; red
+without it in `system_deletion_triggered_compaction`). It ships as
 `PartitionLoad.unsettled_deletes`; the manager's policy advises the settling
 major compaction from it (manager guide, "Policy engine").
 
@@ -1490,6 +1525,7 @@ A per-partition `GcRateLimiter` survives as a deprecated inner cap layered befor
 | `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | **4** | PS-wide gc concurrency (`gc_max`) |
 | `--max-extent-size-bytes` | — | **16 GiB** | per-extent seal threshold to each partition's `StreamClient` (clamp [1 GiB, 64 GiB]) |
 | `--flush-mem-bytes` | — | **256 MiB** | memtable rotation size; every compaction size derives from it (clamp [4 KiB, 1 GiB]) |
+| `--deletion-compact-check-secs` | — | **300** | how often each partition evaluates the deletion-trigger rule (clamp [1, 86400]) |
 
 `0` on any rate flag = unlimited for that dimension (per-dimension opt-out).
 
@@ -1892,23 +1928,28 @@ The last 4 bytes are `meta_len` — used by `SstReader::open` to locate the Meta
 [Entry 0]...[Entry N][entry_offsets: N×4B LE][num_entries: 4B LE][crc32c: 4B LE]
 ```
 
-### These formats are FROZEN
+### These formats do not evolve; a change is an exceptional event
 
-**SST, WAL record and checkpoint formats do not change** (user, 2026-09-20).
-Not "change them with a `VERSION` bump", not "keep a parser for the old shape" —
-under normal circumstances they do not move at all.
+**SST, WAL record and checkpoint formats do not change in the normal course of
+work** (user, 2026-09-20). Not "change them with a `VERSION` bump", not "keep a
+parser for the old shape".
 
 The reason is the migration rule for persisted data (`crates/manager/CLAUDE.md`,
 Upgrade safety): a persisted format change is delivered by a converter tool run
-once against a stopped cluster, never by compatibility code in the servers. That
-is affordable only while the data a migration must rewrite stays small and
-centralized — the etcd records. These bytes are the opposite: they live inside
-every extent, at terabyte scale, and cannot be rewritten wholesale by any tool.
+once against a stopped cluster, never by compatibility code in the servers.
+These bytes live inside every extent, at terabyte scale, so rewriting them is a
+decision of its own, taken by the user for one specific need.
 
-So a change that genuinely needs a new bulk layout has **no route planned for
-it** and must be raised as an exceptional event, not shipped as a `VERSION`
-bump. The `VERSION` field below stays as the tripwire that a mismatch is caught
-loudly; it is not an invitation to evolve the format.
+It has been taken once: MetaBlock **v2** (2026-09-29, user: "在 SST 里记
+tombstone 数，改SST格式，这个是必要的") added `num_entries` / `num_deletions`
+for the deletion-triggered compaction. Delivery followed the rule — stop every
+PS, run `convert_sst` (`crates/server/CLAUDE.md`), start the new PS — and the
+server reads **only v2**: a v1 MetaBlock fails to decode with an error naming
+`convert_sst`, so an unconverted partition does not open. The data blocks did
+not change; the converter rebuilds each SST from them with the current builder
+(`sst_convert::rebuild_sst`, deleted with the tool). The `VERSION` field is the
+tripwire that makes a mismatch loud; the decoder also refuses missing or
+trailing MetaBlock bytes.
 
 ### Entry Layout (prefix-compressed)
 ```
@@ -1917,9 +1958,9 @@ loudly; it is not an invitation to evolve the format.
 `overlap` = bytes shared with the block's **base key** (first key of the block, stored
 in the MetaBlock index). Only the diff suffix is stored (prefix compression).
 
-### MetaBlock Layout
+### MetaBlock Layout (v2)
 ```
-MAGIC "AU7B" (4B) | VERSION (2B)
+MAGIC "AU7B" (4B) | VERSION (2B) = 2
 num_blocks (4B)
   per block: [key_len:2B][base_key][relative_offset:4B][block_len:4B]
 bloom_len (4B) | bloom_data
@@ -1927,13 +1968,18 @@ smallest_key_len (2B) | smallest_key
 biggest_key_len (2B) | biggest_key
 estimated_size (8B)
 seq_num (8B)
-vp_extent_id (8B) | vp_offset (4B)
+vp_extent_id (8B) | vp_offset (8B)
+vp_dep_count (4B) | vp_deps (8B each, inert)
 compression_type (1B, always 0)
 discard_count (4B)
   per entry: [extent_id:8B][size:i64 8B]
 min_expires_at (8B, 0 = no expiring keys)
+num_entries (8B)    every entry, tombstones and shadowed versions included
+num_deletions (8B)  tombstone entries
 crc32c (4B)
 ```
+Every field is mandatory; the decoder rejects any other version, a short
+payload and trailing bytes.
 
 ### Bloom Filter
 Double hashing with xxh3: `h1 = xxh3_64(user_key)`, `h2 =

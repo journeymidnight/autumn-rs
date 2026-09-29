@@ -4329,6 +4329,53 @@ stopped, not that it succeeded. `ops history` says `succeeded` and names the
 node the slot landed on.
 
 
+## SST MetaBlock v1 → v2 upgrade (deletion-triggered compaction)
+
+MetaBlock v2 records each SST's entry and tombstone counts; with them every PS
+major-compacts a partition whose SSTs hold >= 10 000 tombstones that are >= 30%
+of all entries (TiKV's rule, checked every `--deletion-compact-check-secs`,
+default 300). The new `autumn-ps` reads only v2 and will not open a partition
+that still has a v1 SST (its log says `SST MetaBlock format v1 ... run
+convert_sst`), so the upgrade is stop the world → convert → start. Nothing else
+changes: WAL, checkpoint and etcd records are untouched, the manager and the
+extent nodes keep running throughout, and the wire version is unchanged.
+
+```bash
+# 0. Build or pull the new image; convert_sst ships in it next to autumn-ps.
+# 1. Stop EVERY autumn-ps (graceful SIGTERM). Leave manager and ENs up.
+#    convert_sst refuses to run while any PS heartbeated in the last 10 s.
+# 2. See what will be converted (reads and rebuilds, writes no data):
+convert_sst --manager $MGR --dry-run
+#    per partition: "converted N SSTs (bytes, entries, tombstones)".
+#    "N checkpoint records": a merge whose survivor never opened since —
+#    start the OLD autumn-ps once, wait for `autumn-op info` to say ready,
+#    stop it, rerun.
+# 3. Convert. Every partition is independent; a failure names the partition and
+#    the rest still convert. Safe to rerun after an interruption or a failure.
+convert_sst --manager $MGR [--parallel 4] [--max-extent-size-bytes <as the PS>]
+convert_sst --manager $MGR    # again: "0 SSTs converted, N already v2"
+# 4. Start the new autumn-ps; wait until `autumn-op info` shows every PS ready.
+#    Then `autumn-op rebalance` as after any stop-the-world restart.
+```
+
+Cost: the tool reads every live SST once and writes it back once (the row
+stream roughly doubles until each partition's truncate at the end of its own
+conversion), so budget the time of copying the LSM-resident bytes — large
+values behind value pointers stay in the log stream and are not copied. Split
+siblings that still share SSTs each write their own full copy (out-of-range keys
+included), so a CoW-heavy cluster needs more free space than that; there is no
+space pre-check — a partition that hits ENOSPC fails on its own and a rerun
+finishes it.
+
+Checking the rule afterwards: a partition that crossed it logs `tombstones
+reached the deletion-trigger rule; scheduling a major compaction` with the
+entry and tombstone sums, then the usual `compact part N: major ...` line.
+`system_deletion_triggered_compaction` is the deterministic test:
+`cargo test -p autumn-manager --test system_deletion_triggered_compaction`.
+
+Once every cluster is converted, delete `convert_sst`, its Dockerfile line and
+`autumn_partition_server::sst_convert`.
+
 ## Compio runtime upgrade verification
 
 Build the workspace and standalone Python binding with Rust 1.95 or newer.

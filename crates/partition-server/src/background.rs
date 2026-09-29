@@ -78,6 +78,48 @@ fn is_frozen_for_maintenance(part: &Rc<RefCell<PartitionData>>) -> bool {
 /// on workloads where external policy hasn't kept up. Not tunable
 /// because it's a mechanism-level defensive bound, not a policy knob.
 const MAX_SST_BEFORE_AUTO_COMPACT: usize = 32;
+/// Deletion-triggered major compaction, TiKV's rule (`region-compact-min-
+/// tombstones` / `region-compact-tombstones-percent`, the region-level form of
+/// RocksDB's `CompactOnDeletionCollector`): compact when the partition's SSTs
+/// hold at least this many tombstones AND tombstones are at least this percent
+/// of all their entries. A range scan reads every tombstone and every value it
+/// shadows until a major compaction drops both, so without this a partition
+/// that keeps deleting makes every scan over the deleted keys pay for all of
+/// them (measured: 13 M tombstones, 185 s for the first page after a restart).
+const DELETION_COMPACT_MIN_TOMBSTONES: u64 = 10_000;
+const DELETION_COMPACT_TOMBSTONES_PERCENT: u64 = 30;
+/// How often the rule is evaluated (TiKV's `region-compact-check-interval`).
+/// It also bounds how often it can compact a partition that keeps deleting.
+const DELETION_COMPACT_CHECK_SECS_DEFAULT: u64 = 300;
+static DELETION_COMPACT_CHECK_SECS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// `autumn-ps --deletion-compact-check-secs`. First call wins.
+pub fn set_deletion_compact_check_secs(secs: u64) -> bool {
+    if !(1..=86_400).contains(&secs) {
+        return false;
+    }
+    DELETION_COMPACT_CHECK_SECS_CELL.set(secs).is_ok()
+}
+
+fn deletion_compact_check_interval() -> Duration {
+    Duration::from_secs(
+        *DELETION_COMPACT_CHECK_SECS_CELL.get_or_init(|| DELETION_COMPACT_CHECK_SECS_DEFAULT),
+    )
+}
+
+/// TiKV's rule over the sums of `num_entries` / `num_deletions`.
+fn deletions_need_compaction(entries: u64, deletions: u64) -> bool {
+    deletions >= DELETION_COMPACT_MIN_TOMBSTONES
+        && deletions.saturating_mul(100) >= entries.saturating_mul(DELETION_COMPACT_TOMBSTONES_PERCENT)
+}
+
+/// `(Σ num_entries, Σ num_deletions)` over the partition's live SSTs.
+pub(crate) fn sst_entry_counts(p: &crate::PartitionData) -> (u64, u64) {
+    p.sst_readers
+        .iter()
+        .fold((0, 0), |(e, d), r| (e + r.num_entries, d + r.num_deletions))
+}
+
 // process-global setter cells for the background.rs knobs.
 // Each was formerly an inner static OnceLock+env read; now lifted to
 // module scope with paired pub setters that the autumn-ps binary calls
@@ -357,6 +399,9 @@ pub(crate) async fn background_maintenance_loop(
     // first iteration, then every SIZE_REFRESH_INTERVAL).
     let mut next_size_refresh_at = Instant::now();
     const SIZE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+    // First check on the first tick, so a partition that opens with
+    // tombstone-heavy SSTs is compacted without waiting a whole interval.
+    let mut next_deletion_check_at = Instant::now();
 
     loop {
         use std::future::Future;
@@ -833,6 +878,34 @@ pub(crate) async fn background_maintenance_loop(
                         metrics
                             .compact_inflight
                             .store(0, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
+
+                if Instant::now() >= next_deletion_check_at {
+                    next_deletion_check_at = Instant::now() + deletion_compact_check_interval();
+                    let (entries, deletions) = sst_entry_counts(&part.borrow());
+                    if deletions_need_compaction(entries, deletions) {
+                        tracing::info!(
+                            part_id,
+                            entries,
+                            deletions,
+                            "compaction: tombstones reached the deletion-trigger rule; \
+                             scheduling a major compaction"
+                        );
+                        // The dispatched-major arm flushes the memtable first
+                        // and settles `unsettled_deletes`. This loop is the
+                        // channel's only consumer, so the task is picked up on
+                        // the next select.
+                        let mut tx = part.borrow().compact_tx.clone();
+                        if let Err(e) = tx.try_send(crate::CompactTask {
+                            is_major: true,
+                            op_id: 0,
+                        }) {
+                            if e.is_disconnected() {
+                                break;
+                            }
+                        }
                         continue;
                     }
                 }
@@ -2219,9 +2292,9 @@ pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>
 ///   `pickup_tables` output when `has_overlap == 0`. 0 when overlap is
 ///   set (a major would run instead, accounted for in
 ///   `pending_compaction_bytes`).
-/// - `sst_tombstone_bytes`: left at 0. Computing it without an SST
-///   on-disk aggregate (which would require a format bump) means
-///   scanning every block — expensive on the hot refresh path. The
+/// - `sst_tombstone_bytes`: left at 0. The MetaBlock counts tombstones
+///   (`num_deletions`, which the deletion trigger uses) but not their
+///   bytes; bytes would mean scanning every block on the refresh path. The
 ///   advisory layer treats 0 as "no signal" for this dimension.
 /// - `sealed_log_extent_count`: left at 0. The PS doesn't keep a
 ///   cached log-stream extent count without an RPC; future stages
@@ -5797,5 +5870,25 @@ mod gc_selection_tests {
         let discards = HashMap::from([(1u64, 900i64), (2u64, -500i64)]);
         let resolved = HashMap::from([(1u64, (1000u64, 1u64)), (2u64, (1000u64, 1u64))]);
         assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 900);
+    }
+}
+
+#[cfg(test)]
+mod deletion_trigger_tests {
+    use super::*;
+
+    #[test]
+    fn tikv_rule_needs_both_the_count_and_the_share() {
+        // Below the count: never, however dominant.
+        assert!(!deletions_need_compaction(9_999, 9_999));
+        // Enough tombstones, but under 30% of the entries.
+        assert!(!deletions_need_compaction(100_000, 29_999));
+        // Exactly both thresholds.
+        assert!(deletions_need_compaction(100_000, 30_000));
+        assert!(deletions_need_compaction(10_000, 10_000));
+        // The production shape: every key written, flushed, then deleted.
+        assert!(deletions_need_compaction(26_000_000, 13_000_000));
+        // Empty partition.
+        assert!(!deletions_need_compaction(0, 0));
     }
 }

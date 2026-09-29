@@ -54,6 +54,7 @@ struct Args {
     /// metadata pressure at scale (enabled by the u64-offset widening).
     max_extent_size_bytes: Option<u64>,
     flush_mem_bytes: Option<u64>,
+    deletion_compact_check_secs: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
     major_compact_parallelism: Option<usize>,
     gc_parallelism: Option<usize>,
@@ -124,6 +125,7 @@ fn parse_args() -> Args {
     let mut max_wal_gap: Option<u64> = None;
     let mut max_extent_size_bytes: Option<u64> = None;
     let mut flush_mem_bytes: Option<u64> = None;
+    let mut deletion_compact_check_secs: Option<u64> = None;
     let mut shutdown_timeout_ms: Option<u64> = None;
     let mut major_compact_parallelism: Option<usize> = None;
     let mut gc_parallelism: Option<usize> = None;
@@ -252,6 +254,14 @@ fn parse_args() -> Args {
             "--flush-mem-bytes" => {
                 i += 1;
                 flush_mem_bytes = Some(args[i].parse().expect("--flush-mem-bytes u64 bytes"));
+            }
+            "--deletion-compact-check-secs" => {
+                i += 1;
+                deletion_compact_check_secs = Some(
+                    args[i]
+                        .parse()
+                        .expect("--deletion-compact-check-secs u64 seconds"),
+                );
             }
             "--shutdown-timeout-ms" => {
                 i += 1;
@@ -424,6 +434,11 @@ fn parse_args() -> Args {
                 eprintln!("                       compaction sizes follow it [default: 256 MiB,");
                 eprintln!("                       clamp 4 KiB-1 GiB]. Tests shrink it to reach");
                 eprintln!("                       many-SST shapes with little data.");
+                eprintln!("  --deletion-compact-check-secs <N>");
+                eprintln!("                       How often each partition checks whether its");
+                eprintln!("                       SSTs hold >= 10000 tombstones and >= 30% of");
+                eprintln!("                       entries, and if so major-compacts itself");
+                eprintln!("                       [default: 300, clamp 1-86400].");
                 eprintln!(
                     "  --cpu-start <N>      First core to pin partition threads to [default: 0]"
                 );
@@ -479,6 +494,7 @@ fn parse_args() -> Args {
         max_wal_gap,
         max_extent_size_bytes,
         flush_mem_bytes,
+        deletion_compact_check_secs,
         shutdown_timeout_ms,
         major_compact_parallelism,
         gc_parallelism,
@@ -541,6 +557,12 @@ fn apply_ps_tunables(args: &Args) {
     }
     if let Some(n) = args.flush_mem_bytes {
         ps::set_flush_mem_bytes(n);
+    }
+    if let Some(n) = args.deletion_compact_check_secs {
+        if !ps::background::set_deletion_compact_check_secs(n) {
+            eprintln!("--deletion-compact-check-secs {n}: must be 1-86400");
+            std::process::exit(2);
+        }
     }
     if let Some(n) = args.shutdown_timeout_ms {
         ps::set_shutdown_timeout_ms(n);

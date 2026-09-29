@@ -401,6 +401,47 @@ the stamp and misreads v4 inodes. Verified on a local cluster: 6715 inodes,
 listings and file bytes identical before and after, rerun a no-op. Runbook in
 `docs/ops.md`.
 
+### `convert_sst` — SST MetaBlock v1 → v2 converter (run once, then delete)
+
+MetaBlock v2 adds `num_entries` / `num_deletions` (the PS's deletion-triggered
+compaction reads them; `crates/partition-server/CLAUDE.md`, "SSTable Format").
+The new `autumn-ps` reads only v2, so the upgrade is stop every PS (manager and
+ENs stay up) → `convert_sst --manager HOST:PORT` → start the new PS.
+
+Per partition it takes the partition's owner lock `partition/<id>` (bumping it,
+as a PS open does), checks commit length and fences the row and meta tails,
+reads the checkpoint, and for each listed SST whose MetaBlock is v1 reads it,
+parses the v1 MetaBlock (vendored in the tool), rebuilds it from its data blocks
+with the current builder (`autumn_partition_server::sst_convert::rebuild_sst`),
+refuses unless the rebuild has the same key range, seq, `vp_deps` and
+`min_expires_at`, and appends it to the row stream. Then one checkpoint naming
+the rebuilt SSTs, every other field unchanged, and the PS's truncate rule on the
+row stream (cut before the first extent, in stream order, a listed SST is in).
+
+- Refuses to start while any PS heartbeated in the last 10 s (waits up to 30 s).
+- Refuses a partition holding more than one checkpoint record (a merge whose
+  survivor has not opened since, or its own run stopped between publishing and
+  truncating when the meta tail had to roll): open it once with the previous
+  PS first, which reads v2 as well and publishes one record.
+- Truncates like the PS's `row_truncate_point`, and cuts nothing when a listed
+  SST's extent is missing from the row stream.
+- Resumable: the checkpoint is replaced only after every SST is appended, and
+  the version field says which SSTs are done, so a rerun converts what is left
+  and a finished partition only repeats the truncate.
+- A split child whose SSTs are shared with its sibling gets its own copy; the
+  shared extents go when both have truncated.
+- `--dry-run` reads and rebuilds everything and writes no data (it still
+  takes each partition's owner lock, which fences nothing on a stopped cluster). `--part ID`
+  (repeatable) limits it; `--parallel N` (default 4) converts N partitions at
+  once; `--max-extent-size-bytes` should match the PS's.
+
+Verified with real processes (in-process manager + EN, previous and new
+`autumn-ps` as children): v1 data written through a merge and a split, the new
+PS refusing it, dry run, conversion of 38 SSTs (both split children), rerun a
+no-op, then all 11 000 keys byte-correct, deletes still deleted, range listing
+every live key once. Delete the tool and `sst_convert` once the cluster is
+converted.
+
 ### `migratev0_v1` — RAN AND DELETED (2026-09-20)
 
 The one-shot converter that wrapped the manager's persisted etcd records in

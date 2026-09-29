@@ -54,6 +54,9 @@ pub struct SstReader {
     pub discards: HashMap<u64, i64>,
     /// Earliest non-zero expires_at across all entries (0 = no expiring keys).
     pub min_expires_at: u64,
+    /// `MetaBlock.num_entries` / `num_deletions`.
+    pub num_entries: u64,
+    pub num_deletions: u64,
     sst_base: u64,
     /// Decoded block cache — avoids re-decoding (CRC + memcpy) on repeated reads.
     /// Mutex (not RefCell) so SstReader is Sync and can be shared across
@@ -124,6 +127,8 @@ impl SstReader {
             estimated_size: meta.estimated_size,
             discards: meta.discards,
             min_expires_at: meta.min_expires_at,
+            num_entries: meta.num_entries,
+            num_deletions: meta.num_deletions,
             sst_base: 0,
             block_cache: Mutex::new(Vec::new()),
             source: SstSource::Paged {
@@ -166,6 +171,8 @@ impl SstReader {
             estimated_size: meta.estimated_size,
             discards: meta.discards,
             min_expires_at: meta.min_expires_at,
+            num_entries: meta.num_entries,
+            num_deletions: meta.num_deletions,
             sst_base: sst_base as u64,
             block_cache: Mutex::new(vec![None; num_blocks]),
             source: SstSource::Resident(data),

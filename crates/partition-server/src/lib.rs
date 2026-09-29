@@ -5,6 +5,7 @@ pub mod authz;
 pub mod background;
 mod rpc_handlers;
 mod sstable;
+pub mod sst_convert;
 mod wal_record;
 
 use background::*;
@@ -1628,12 +1629,11 @@ pub struct PartitionMetrics {
     /// to advise the one major compaction that settles such a partition.
     ///
     /// Bumped per delete as it enters the memtable; seeded at open from the
-    /// replayed memtable. A successful major compaction subtracts what it
+    /// replayed memtable plus the tombstones the loaded SSTs record
+    /// (`num_deletions`), so deletes flushed before a restart, split or merge
+    /// are still counted. A successful major compaction subtracts what it
     /// covered (the count taken as it flushed), so deletes that arrive during
-    /// the compaction stay counted. Deletes that had already been flushed to an
-    /// SST before a reopen — a restart, or the reopen that follows a split or
-    /// merge (their freeze drain flushes the memtable) — are not counted again:
-    /// the counter is not persisted.
+    /// the compaction stay counted.
     pub unsettled_deletes: std::sync::atomic::AtomicU64,
     /// Terminal outcomes of manager-submitted maintenance ops (compact/gc/
     /// forcegc carrying a non-zero op_id) — a bounded ring copied onto the load
@@ -6566,8 +6566,12 @@ async fn partition_thread_main(
         detected_overlap as u32,
         std::sync::atomic::Ordering::Relaxed,
     );
+    // The SSTs' own tombstone counts make this survive a reopen: before
+    // `num_deletions` existed, deletes flushed before a restart, split or
+    // merge were forgotten and SETTLE never saw them.
+    let sst_tombstones: u64 = sst_readers.iter().map(|r| r.num_deletions).sum();
     metrics_arc.unsettled_deletes.store(
-        recovered_active.tombstone_count(),
+        recovered_active.tombstone_count() + sst_tombstones,
         std::sync::atomic::Ordering::Relaxed,
     );
     let part = Rc::new(RefCell::new(PartitionData {

@@ -320,6 +320,7 @@ dependencies = [
  "bytes",
  "clap",
  "compio",
+ "crc32c",
  "cyper-axum",
  "futures",
  "libc",

@@ -1633,15 +1633,16 @@ testable while it matters and leaves no residue afterwards; no server binary
 links it, which is what "the code carries no upgrade logic" means. The tool is
 in the tree; the compatibility is not.
 
-**Scope, and the other half of the rule: the bulk formats do not change at all.**
-SST / WAL / checkpoint inside extents are **FROZEN** (user, 2026-09-20). They are
-not versioned-and-migrated and they are not dual-read — under normal
-circumstances their format simply does not move. That is what keeps the converter
-rule affordable: the only persisted data a migration ever has to rewrite is the
-etcd records, which are small and centralized enough to convert in one stopped
-pass. A change that genuinely needs a new bulk format is an exceptional event
-with no route planned for it, and must be raised as such rather than shipped as
-a `FORMAT_VERSION` bump.
+**Scope, and the other half of the rule: the bulk formats do not evolve.**
+SST / WAL / checkpoint inside extents do not change in the normal course of
+work (user, 2026-09-20), and they are never dual-read. That is what keeps the
+converter rule affordable: the persisted data a migration normally rewrites is
+the etcd records, small and centralized enough to convert in one stopped pass.
+A change that genuinely needs a new bulk format is an exceptional event the user
+decides. The one taken so far — SST MetaBlock v2, adding entry and tombstone
+counts (2026-09-29) — was delivered the same way as any other: a one-off
+`convert_sst` run against the stopped cluster, and a server that reads only the
+new version (`crates/server/CLAUDE.md`).
 
 **`cluster_df`** (`MSG_CLUSTER_DF`, leader-gated). Ceph-style aggregate, in-memory only,
 built inside the single `node_health_loop`: RAW + `physical_used` are summed from each

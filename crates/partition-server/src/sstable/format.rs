@@ -6,7 +6,10 @@ use bytes::Bytes;
 pub const BLOCK_SIZE_TARGET: usize = 64 * 1024; // 64 KB
 pub const MAX_ENTRIES_PER_BLOCK: usize = 1000;
 pub const MAGIC: u32 = 0x4155_3742; // "AU7B"
-pub const FORMAT_VERSION: u16 = 1;
+/// The only MetaBlock version this build reads or writes. v2 added
+/// `num_entries` / `num_deletions`; a v1 SST is refused, and the one-off
+/// `convert_sst` tool rewrites them with the cluster stopped.
+pub const FORMAT_VERSION: u16 = 2;
 /// 13 bytes per SST entry's value section: op(1) + val_len(4) + expires_at(8).
 pub const ENTRY_VALUE_HEADER: usize = 13;
 
@@ -80,6 +83,12 @@ pub struct MetaBlock {
     /// Earliest non-zero expires_at across all entries in this SSTable.
     /// 0 means no entries have expiry set.
     pub min_expires_at: u64,
+    /// Every entry in the SST, tombstones and shadowed versions included
+    /// (RocksDB's `num_entries` table property).
+    pub num_entries: u64,
+    /// Tombstone entries (RocksDB's `num_deletions`). The PS compares the sum
+    /// of both over its tables to decide a deletion-triggered compaction.
+    pub num_deletions: u64,
 }
 
 impl MetaBlock {
@@ -118,6 +127,8 @@ impl MetaBlock {
         }
         // min_expires_at: earliest non-zero expiry timestamp (0 = none)
         buf.extend_from_slice(&self.min_expires_at.to_le_bytes());
+        buf.extend_from_slice(&self.num_entries.to_le_bytes());
+        buf.extend_from_slice(&self.num_deletions.to_le_bytes());
         // CRC32C covers everything above
         let crc = crc32c::crc32c(&buf);
         buf.extend_from_slice(&crc.to_le_bytes());
@@ -144,7 +155,13 @@ impl MetaBlock {
         if magic != MAGIC {
             return Err(anyhow!("MetaBlock magic mismatch: {magic:#x}"));
         }
-        let _version = read_u16(payload, &mut c)?;
+        let version = read_u16(payload, &mut c)?;
+        if version != FORMAT_VERSION {
+            return Err(anyhow!(
+                "SST MetaBlock format v{version}, this build reads only v{FORMAT_VERSION}: \
+                 stop the cluster and run convert_sst"
+            ));
+        }
         let num_blocks = read_u32(payload, &mut c)? as usize;
 
         let mut block_offsets = Vec::with_capacity(num_blocks);
@@ -178,24 +195,23 @@ impl MetaBlock {
             vp_deps.push(read_u64(payload, &mut c)?);
         }
         // skip compression_type byte
-        c += 1;
-        // Discard map (optional — old SSTs without discards will have nothing left to read)
-        let mut discards = HashMap::new();
-        if c + 4 <= payload.len() {
-            let discard_count = read_u32(payload, &mut c)? as usize;
-            for _ in 0..discard_count {
-                let eid = read_u64(payload, &mut c)?;
-                let sz = read_i64(payload, &mut c)?;
-                discards.insert(eid, sz);
-            }
+        read_bytes(payload, &mut c, 1)?;
+        let discard_count = read_u32(payload, &mut c)? as usize;
+        let mut discards = HashMap::with_capacity(discard_count);
+        for _ in 0..discard_count {
+            let eid = read_u64(payload, &mut c)?;
+            let sz = read_i64(payload, &mut c)?;
+            discards.insert(eid, sz);
         }
-
-        // min_expires_at (optional — old SSTs without this field get 0)
-        let min_expires_at = if c + 8 <= payload.len() {
-            read_u64(payload, &mut c)?
-        } else {
-            0
-        };
+        let min_expires_at = read_u64(payload, &mut c)?;
+        let num_entries = read_u64(payload, &mut c)?;
+        let num_deletions = read_u64(payload, &mut c)?;
+        if c != payload.len() {
+            return Err(anyhow!(
+                "MetaBlock: {} trailing bytes after the last field",
+                payload.len() - c
+            ));
+        }
 
         Ok(MetaBlock {
             block_offsets,
@@ -209,6 +225,8 @@ impl MetaBlock {
             vp_deps,
             discards,
             min_expires_at,
+            num_entries,
+            num_deletions,
         })
     }
 }
@@ -411,11 +429,10 @@ fn read_bytes(data: &[u8], c: &mut usize, len: usize) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn meta_block_round_trip_preserves_vp_deps() {
+    fn sample_meta() -> MetaBlock {
         let mut discards = HashMap::new();
         discards.insert(11, 123);
-        let meta = MetaBlock {
+        MetaBlock {
             block_offsets: vec![BlockOffset {
                 key: b"k".to_vec(),
                 relative_offset: 7,
@@ -431,13 +448,49 @@ mod tests {
             vp_deps: vec![21, 48, 52],
             discards,
             min_expires_at: 1234,
-        };
+            num_entries: 5000,
+            num_deletions: 1700,
+        }
+    }
 
-        let decoded = MetaBlock::decode(&meta.encode()).unwrap();
+    #[test]
+    fn meta_block_round_trip_preserves_every_field() {
+        let decoded = MetaBlock::decode(&sample_meta().encode()).unwrap();
         assert_eq!(decoded.vp_deps, vec![21, 48, 52]);
         assert_eq!(decoded.vp_extent_id, 52);
         assert_eq!(decoded.vp_offset, 4096);
         assert_eq!(decoded.discards.get(&11), Some(&123));
         assert_eq!(decoded.min_expires_at, 1234);
+        assert_eq!(decoded.num_entries, 5000);
+        assert_eq!(decoded.num_deletions, 1700);
+    }
+
+    /// The same MetaBlock as v1 wrote it: version 1 and no counts. The CRC is
+    /// valid, so only the version can refuse it.
+    fn as_v1(v2: &[u8]) -> Vec<u8> {
+        let mut payload = v2[..v2.len() - 4 - 16].to_vec();
+        payload[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let crc = crc32c::crc32c(&payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        payload
+    }
+
+    #[test]
+    fn a_v1_meta_block_is_refused_with_the_conversion_hint() {
+        let err = MetaBlock::decode(&as_v1(&sample_meta().encode()))
+            .err()
+            .expect("a v1 MetaBlock must not decode")
+            .to_string();
+        assert!(err.contains("v1") && err.contains("convert_sst"), "{err}");
+    }
+
+    #[test]
+    fn a_v2_meta_block_missing_its_counts_is_refused() {
+        let mut bytes = as_v1(&sample_meta().encode());
+        let n = bytes.len();
+        bytes[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let crc = crc32c::crc32c(&bytes[..n - 4]);
+        bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        assert!(MetaBlock::decode(&bytes).is_err());
     }
 }

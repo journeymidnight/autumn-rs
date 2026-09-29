@@ -41,6 +41,8 @@ pub struct SstBuilder {
     vp_deps: BTreeSet<u64>,
     /// Earliest non-zero expires_at seen across all entries.
     min_expires_at: u64,
+    num_entries: u64,
+    num_deletions: u64,
 }
 
 impl SstBuilder {
@@ -63,6 +65,8 @@ impl SstBuilder {
             discards: HashMap::new(),
             vp_deps: BTreeSet::new(),
             min_expires_at: 0,
+            num_entries: 0,
+            num_deletions: 0,
         }
     }
 
@@ -90,6 +94,10 @@ impl SstBuilder {
         }
 
         // Track metadata
+        self.num_entries += 1;
+        if op & 0x7f == crate::OP_TOMBSTONE {
+            self.num_deletions += 1;
+        }
         let ts = crate::parse_ts(internal_key);
         if ts > self.seq_num {
             self.seq_num = ts;
@@ -177,6 +185,8 @@ impl SstBuilder {
             vp_deps: self.vp_deps.into_iter().collect(),
             discards: self.discards,
             min_expires_at: self.min_expires_at,
+            num_entries: self.num_entries,
+            num_deletions: self.num_deletions,
         };
         let meta_bytes = meta.encode();
         let meta_len = meta_bytes.len() as u32;
@@ -399,5 +409,24 @@ mod tests {
         }
 
         assert_eq!(seen, keys);
+    }
+
+    #[test]
+    fn the_meta_block_counts_entries_and_deletions() {
+        let mut b = SstBuilder::new(0, 0);
+        let mut vp = vec![0u8; crate::VALUE_POINTER_SIZE];
+        vp[0] = 7;
+        b.add(&ikey(b"a", 9), 1, b"v", 0);
+        b.add(&ikey(b"a", 3), 1, b"old", 0);
+        b.add(&ikey(b"b", 8), crate::OP_TOMBSTONE, b"", 0);
+        b.add(&ikey(b"b", 2), 1 | crate::OP_VALUE_POINTER, &vp, 0);
+        b.add(&ikey(b"c", 7), crate::OP_TOMBSTONE, b"", 0);
+        let reader = SstReader::from_bytes(bytes::Bytes::from(b.finish())).expect("reader");
+        assert_eq!(reader.num_entries, 5);
+        assert_eq!(reader.num_deletions, 2);
+
+        let empty = SstReader::from_bytes(bytes::Bytes::from(SstBuilder::new(0, 0).finish()))
+            .expect("empty reader");
+        assert_eq!((empty.num_entries, empty.num_deletions), (0, 0));
     }
 }
