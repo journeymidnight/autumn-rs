@@ -2451,8 +2451,37 @@ what it started.
 ```bash
 # PS-failover chaos (2 PSes, kill one -> partitions must migrate, zero loss):
 cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
+# system_chaos itself: in-process manager, real subprocess ENs + etcd +
+# toxiproxy, and the PS as a real `autumn-ps` child (log: <log dir>/ps-91.log).
+# Two nemesis actions restart it: `psterm` (SIGTERM -> drain -> exit -> start
+# -> wait until every partition is open; a drain over 150 s fails the round)
+# and `pskill` (SIGKILL -> start -> wait). Before verify it is crash-restarted
+# once more, so every partition reopens from what is durable after the round;
+# one that is not open within 120 s fails the round. After every nemesis step
+# and before verify, a checkpoint check reads each partition's checkpoints the
+# way recovery does (last record of every meta-stream extent) and fails the
+# round if one lists an SST in an extent the row stream no longer has (the
+# production loss: 28 of 37 SSTs in truncated extents). The summary line
+# "PS restarts completed ... row streams reached N extent(s)" says how much of
+# that the round exercised; N = 1 means no cut could have been tested.
+# Two more actions shape the row stream: `rollrow` seals and rolls every
+# partition's row tail (the fence-drain path), `flushburst` flushes every
+# partition 8 times so the PS's own size-tiered trim (past 32 SSTs) runs.
+# Actions may repeat in AUTUMN_CHAOS_ACTIONS to weight them. "PS drain
+# warnings" counts partitions a graceful stop left unflushed (one PS log line
+# per partition; the WAL replays them; counted, not failed).
+# Run an older PS against today's checks with AUTUMN_CHAOS_PS_BIN=<path>.
+# Known limit: this workload does NOT reproduce the truncation bug fixed in
+# 8a4b12a even against that commit's parent — eight rounds, 0 violations. Its
+# shape needs a size-tiered pass that skips >= 128 MiB SSTs (bulk ingest, then
+# trickle), and chaos values are 256 B / 8 KiB. That bug is pinned by
+# system_row_truncate_live_refs; the check here guards the invariant itself.
+cargo build --workspace --bins
+AUTUMN_CHAOS_SEED=1 AUTUMN_CHAOS_DURATION_SECS=180 AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1000 \
+  AUTUMN_CHAOS_ACTIONS=rollrow,flush,rollrow,flush,rollrow,flush,rollrow,flush,flushburst,flushburst,flushburst,compact,split,merge,pskill,psterm \
+  cargo test -p autumn-manager --test system_chaos chaos_real -- --ignored --nocapture
 # vp_head multi-seed chaos: several seeds through the
-# in-process system_chaos harness (real subprocess ENs + etcd + toxiproxy),
+# same system_chaos harness,
 # nemesis focused on split/merge/compact/FORCEGC (+ gc/flush/EN-kill). forcegc
 # bypasses the discard-ratio gate to punch specific sealed extents -> the maximal
 # stress on the PS replay-floor guard; a wrong vp_head would let it punch a live

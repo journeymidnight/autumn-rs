@@ -14,6 +14,19 @@
 
 ## Active
 
+### F-CHAOS-PS-RESTART — chaos 覆盖 PS 真进程重启与 checkpoint / row stream 结构检查
+- **Trigger** (2026-09-29 用户): "chaos test为什么之前没有覆盖1a，1b的问题，需要加chaos测试" → "先不管perf check，chaos还是要增加 1. checkpoint 与 row stream的结构检查 2. PS 真进程和两种重启， 然后开始跑chaos测试"。之前 system_chaos 的 PS 在测试进程内、从不重启，读的都是反复覆盖的最新值，没有任何检查核对 checkpoint 引用的 SST 是否还在 row stream 里。
+- **Scope**: system_chaos 的 PS 改为 `autumn-ps` 子进程（二进制可替换，便于拿旧版本 A/B）；新增 nemesis 动作 `psterm`（SIGTERM → drain 退出 → 重启 → 等 ready）与 `pskill`（SIGKILL → 重启 → 等 ready）；每个 nemesis 动作之后与 verify 之前，对每个分区检查：恢复会读的 checkpoint（每个 meta extent 的最后一条）列出的 SST 所在 extent 都还在 row stream 里；verify 前再做一次崩溃重启，全部分区必须重新打开；传输出错的写按结果不确定处理。
+- **Acceptance**: HEAD 上多个种子全绿，两种重启都实际执行；重启后 ready 超时、drain 超时、结构违例都判失败；用修复前的 `autumn-ps`（35d0baf）跑，结构检查或重开能报出 1b 的问题，打不出则记录原因；`docs/ops.md` chaos 章节写明。
+- `passes: false`
+- **notes** (2026-09-29): 已实现并提交。HEAD 上 PS 重启/结构检查在全部 10 轮里零违例、两种重启都执行；另加 `rollrow`、`flushburst` 两个动作塑造 row stream。**未达成**：用 35d0baf 的 `autumn-ps` 跑 8 轮（多种动作配比，row stream 到 15 个 extent）零违例——1b 的形状要 size-tiered 跳过 ≥128 MiB 的大 SST（先大批写入再零星写），chaos 的 256 B / 8 KiB 值造不出来；1b 由 system_row_truncate_live_refs 钉住，检查器本身由 `checkpoint_check_reports_an_sst_outside_the_row_stream` 证明会报（消融变红）。全动作集轮次 7 轮里 4 轮挂在既有的 "physical reclaim incomplete"（见 BUG-CHAOS-RECLAIM-RESIDUE），与本改动无关（旧新 PS 都出现）。是否加"大批写入"脚本化阶段待用户定。
+
+### BUG-CHAOS-RECLAIM-RESIDUE — chaos 的物理回收检查在 fence 后重建的节点上留有旧副本
+- **Trigger** (2026-09-29，加 PS 重启 chaos 时发现): 全动作集 system_chaos 7 轮里 4 轮 `verify_gc_reclaim` 报 `physical reclaim incomplete`，残留文件都在被 KillThenFence/fence 过、随后由 recovery 在别处重建了副本的节点上（例：extent 22 在 node 1）。旧版与新版 PS 都出现。
+- **Scope**: 查清是检查过严（删除只发给当前成员，非成员残留靠 EN reconcile：3 轮 × 5 min 才收）还是产品缺陷（被替换下来的副本该在重建完成时就删），据此修检查或修产品。
+- **Acceptance**: 结论有证据；修后全动作集多种子不再因此失败，且真实泄漏仍会被检查抓到。
+- `passes: false`
+
 ### F-PS-CORE-CAPACITY — 分区放置按 PS 核容量；允许超卖，manager 感知并按策略消解
 - **Trigger** (2026-09-29 用户讨论): `--cpuset` 下每个分区占 2 核（P-log + P-sst），PS 容量 = `cpuset_len/2`，但 manager 放置分区只看各 PS 的 region 数（`compute_region_for_partition`、`rebalance_regions`、`compute_rebalance_moves` 三处），完全不知道核容量。PS 侧预算门是硬拒：`sync_regions_once` 满了拒开（分区一直 `ps=unknown`），`handle_split_part` 满了拒 split，且检查的是父分区所在 PS，而右孩子由 manager 派到最少 region 的 PS，可能不是本机。超出核数的线程 `pick_cpu_for_ord` 返回 `None` 不绑核，继承进程掩码，可能跑出 cpuset 抢 EN/其他租户的核。
 - **设计定案（用户确认）**:

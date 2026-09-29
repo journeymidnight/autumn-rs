@@ -6,18 +6,21 @@
 //!   2. *Nemesis* — independent task that injects faults on a schedule:
 //!      split / merge / EC convert / flush / compact / GC /
 //!      fence+unfence / **real process SIGKILL** of an extent node /
-//!      kill-then-fence (operator declares dead node).
+//!      kill-then-fence (operator declares dead node) / PS restart,
+//!      graceful (SIGTERM) or crash (SIGKILL).
 //!   3. *Checker* — at end of run, verify every acked put still
 //!      reads back the correct value, AND that `range()` per partition
-//!      returns every expected key in that range.
+//!      returns every expected key in that range. After every nemesis
+//!      step, and once more after a final PS crash restart, every SST a
+//!      partition's checkpoint lists must sit in an extent its row stream
+//!      still has.
 //!
 //! **Real process kills.** ENs run as `autumn-extent-node` SUBPROCESSES
 //! (formatted via `autumn-op format` first), so SIGKILL exercises the
 //! same disk-state-recovery + df-failure path as a production crash.
-//! Manager + PS stay in-process for simplicity — the failure scenarios
-//! we care about (fence + recovery + EC convert + split/merge) all
-//! exercise EN-side persistence, which is the surface this test
-//! validates.
+//! The PS is an `autumn-ps` subprocess too: a PS that never restarts never
+//! reopens a partition from its checkpoint, so a checkpoint naming a lost
+//! SST stays invisible. The manager stays in-process.
 //!
 //! **Build requirements.** This test needs:
 //!   - The workspace binaries at `target/debug/` — run `cargo build
@@ -36,6 +39,8 @@
 //!   - AUTUMN_CHAOS_SEED (default = system time millis)
 //!   - AUTUMN_CHAOS_NUM_ENS (default = one ABOVE the strictest nemesis budget,
 //!     i.e. (K+M).max(3) + 2; a cluster sized AT a budget can never satisfy it)
+//!   - AUTUMN_CHAOS_PS_BIN (default target/debug/autumn-ps) — run another
+//!     PS build, e.g. an older one, against today's checks
 //!
 //! Run:
 //!     cargo build --workspace
@@ -59,6 +64,7 @@ use autumn_manager::AutumnManager;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc;
+use autumn_stream::{ConnPool, StreamClient};
 
 use support::*;
 
@@ -122,7 +128,8 @@ struct ChaosConfig {
     disks_per_en: u32,
     seed: u64,
     /// Comma-separated subset of action names to enable. Empty = all.
-    /// Names: split,merge,ec,fence,flush,compact,gc,forcegc,kill,killfence,partition,latency
+    /// Names: split,merge,ec,fence,flush,compact,gc,forcegc,kill,killfence,partition,latency,
+    /// corrupt,psterm,pskill,rollrow,flushburst
     /// Useful for bisecting which action triggers a failure.
     actions: Vec<Action>,
     /// `AUTUMN_CHAOS_DECOMMISSION=1` runs a terminal node-decommission phase
@@ -181,6 +188,10 @@ impl ChaosConfig {
                     "partition" => Action::NetworkPartition,
                     "latency" => Action::LatencySpike,
                     "corrupt" => Action::CorruptReplica,
+                    "psterm" => Action::PsTerm,
+                    "pskill" => Action::PsKill,
+                    "rollrow" => Action::RollRow,
+                    "flushburst" => Action::FlushBurst,
                     other => panic!("unknown action name: {other}"),
                 })
                 .collect(),
@@ -386,6 +397,401 @@ impl Drop for EnProcess {
     fn drop(&mut self) {
         self.kill();
     }
+}
+
+// ── PsProcess: managed subprocess PS ───────────────────────────────────
+
+/// The partition server as a child `autumn-ps`, so the nemesis can stop it the
+/// two ways production does: SIGTERM (a graceful drain that tries to flush
+/// every partition before exit — a failed or timed-out flush is only logged,
+/// and the WAL replays it) and SIGKILL (only what was durable survives). An
+/// in-process PS can do neither, and never restarting is why no round ever
+/// reopened a partition from its checkpoint: an SST lost from the row stream
+/// stayed invisible, because the running PS never looked for it again and the
+/// readers only ever asked for the newest version of an overwritten key.
+///
+/// `AUTUMN_CHAOS_PS_BIN` swaps the binary, so the same round can run an older
+/// PS against today's checks.
+struct PsProcess {
+    child: Option<Child>,
+    binary: PathBuf,
+    ps_id: u64,
+    /// Base port; the partition listeners bind `base + ord` above it, so the
+    /// range above must stay free across restarts (`pick_stable_ps_base`).
+    addr: SocketAddr,
+    manager_addr: SocketAddr,
+    log_path: PathBuf,
+    /// Restarts actually carried out, `(graceful, crash)`.
+    restarts: (u64, u64),
+}
+
+impl PsProcess {
+    fn is_running(&self) -> bool {
+        self.child.is_some()
+    }
+
+    fn spawn(&mut self) {
+        assert!(self.child.is_none(), "PS must be stopped before it is spawned");
+        let log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log_path)
+            .expect("open PS log");
+        let child = Command::new(&self.binary)
+            .args([
+                "--psid",
+                &self.ps_id.to_string(),
+                "--manager",
+                &self.manager_addr.to_string(),
+                "--port",
+                &self.addr.port().to_string(),
+                "--bind-host",
+                &self.addr.ip().to_string(),
+                "--advertise",
+                &self.addr.to_string(),
+            ])
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn autumn-ps");
+        self.child = Some(child);
+    }
+
+    /// SIGKILL and reap.
+    fn kill(&mut self) {
+        if let Some(mut c) = self.child.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    fn send_sigterm(&self) -> Result<(), String> {
+        let pid = self.child.as_ref().ok_or("PS is not running")?.id();
+        let out = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output()
+            .map_err(|e| format!("run kill -TERM {pid}: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "kill -TERM {pid}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+
+    /// Reap the child if it has exited.
+    fn reap(&mut self) -> Option<std::process::ExitStatus> {
+        let status = self.child.as_mut()?.try_wait().ok().flatten()?;
+        self.child = None;
+        Some(status)
+    }
+}
+
+impl Drop for PsProcess {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// A base port below the ephemeral range with `span` free ports above it. A
+/// restarted PS binds the same `base + ord` listeners again; one in the
+/// ephemeral range could lose that port to an outbound socket while the PS is
+/// down, as the EN ports did (`pick_stable_port_pair`).
+fn pick_stable_ps_base(span: u16) -> SocketAddr {
+    use std::net::TcpListener;
+    let floor: u16 = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
+        .unwrap_or(32768);
+    let hi = floor.saturating_sub(span + 1).max(4001);
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos() as u16;
+    for _ in 0..2000 {
+        seed = seed.wrapping_mul(31421).wrapping_add(6927);
+        let base = 3000 + (seed % (hi - 3000));
+        let held: Vec<TcpListener> = (0..=span)
+            .map_while(|i| TcpListener::bind(("127.0.0.1", base + i)).ok())
+            .collect();
+        if held.len() == span as usize + 1 {
+            return SocketAddr::from(([127, 0, 0, 1], base));
+        }
+    }
+    panic!("pick_stable_ps_base: no free run of {span} ports below the ephemeral range");
+}
+
+/// The longest a graceful stop may take. The PS's own worst case is about
+/// 122 s (a drain beat, 60 s of flush, 60 s to join the partition threads); a
+/// drain still running past this is a finding, not slowness.
+const PS_DRAIN_LIMIT: Duration = Duration::from_secs(150);
+/// The longest a restarted PS may take to open every partition assigned to it.
+const PS_READY_LIMIT: Duration = Duration::from_secs(120);
+
+/// SIGTERM the PS and wait for it to exit on its own.
+async fn stop_ps_gracefully(ps: &RefCell<PsProcess>) -> Result<Duration, String> {
+    let t0 = Instant::now();
+    let sent = ps.borrow().send_sigterm();
+    if let Err(e) = sent {
+        ps.borrow_mut().kill();
+        return Err(format!("{e}; killed instead"));
+    }
+    loop {
+        let exited = ps.borrow_mut().reap();
+        if let Some(status) = exited {
+            return if status.success() {
+                Ok(t0.elapsed())
+            } else {
+                Err(format!("PS exited with {status} after SIGTERM"))
+            };
+        }
+        if t0.elapsed() > PS_DRAIN_LIMIT {
+            ps.borrow_mut().kill();
+            return Err(format!(
+                "PS still draining {PS_DRAIN_LIMIT:?} after SIGTERM; killed"
+            ));
+        }
+        compio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Wait until the manager reports `ps_id` ready: heartbeating, with every
+/// partition assigned to it open at its current epoch.
+///
+/// Call it only once the previous process's report has aged out. The manager
+/// keeps a killed PS's last report until the new process registers, so for
+/// `READY_MAX_HEARTBEAT_AGE_SECS` after the old one stopped, "ready" may still
+/// describe the dead process.
+async fn wait_ps_ready(mgr: &RpcClient, ps_id: u64) -> Result<Duration, String> {
+    let t0 = Instant::now();
+    let mut last = String::from("no overview yet");
+    while t0.elapsed() < PS_READY_LIMIT {
+        match mgr
+            .call(MSG_GET_CLUSTER_OVERVIEW, rkyv_encode(&GetClusterOverviewReq {}))
+            .await
+        {
+            Ok(resp) => match rkyv_decode::<GetClusterOverviewResp>(&resp) {
+                Ok(o) => match o.ps_servers.iter().find(|p| p.ps_id == ps_id) {
+                    Some(p) if p.ready() => return Ok(t0.elapsed()),
+                    Some(p) => {
+                        last = format!(
+                            "open {:?} of {} partitions, last heartbeat {} s ago",
+                            p.open_count, p.partition_count, p.last_heartbeat_secs_ago
+                        )
+                    }
+                    None => last = "not registered".to_string(),
+                },
+                Err(e) => last = format!("decode overview: {e}"),
+            },
+            Err(e) => last = format!("overview rpc: {e}"),
+        }
+        compio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!("PS {ps_id} not ready {PS_READY_LIMIT:?} after its restart: {last}"))
+}
+
+/// Start a stopped PS again and wait until it serves everything assigned to it.
+async fn respawn_ps(ps: &RefCell<PsProcess>, mgr: &RpcClient, stopped_at: Instant) -> Result<Duration, String> {
+    let ps_id = ps.borrow().ps_id;
+    ps.borrow_mut().spawn();
+    let stale = Duration::from_secs(PsOverview::READY_MAX_HEARTBEAT_AGE_SECS + 1);
+    if let Some(left) = stale.checked_sub(stopped_at.elapsed()) {
+        compio::time::sleep(left).await;
+    }
+    wait_ps_ready(mgr, ps_id).await?;
+    Ok(stopped_at.elapsed())
+}
+
+/// Nemesis: stop the PS gracefully (SIGTERM) or crash it (SIGKILL), start it
+/// again, and wait for every partition to reopen. A drain that overruns or a
+/// partition that never reopens is recorded as a failure of the round, not a
+/// skipped action: that is exactly what a checkpoint naming a lost SST does.
+async fn do_ps_restart(ctx: &NemesisCtx, graceful: bool) -> Result<String, String> {
+    let kind = if graceful { "SIGTERM" } else { "SIGKILL" };
+    if !ctx.ps.borrow().is_running() {
+        return Err("PS is not running".to_string());
+    }
+    let stop_note = if graceful {
+        match stop_ps_gracefully(&ctx.ps).await {
+            Ok(d) => format!("drained and exited in {:.1} s", d.as_secs_f64()),
+            Err(e) => {
+                ctx.ps_failures.borrow_mut().push(format!("graceful stop: {e}"));
+                e
+            }
+        }
+    } else {
+        ctx.ps.borrow_mut().kill();
+        "killed".to_string()
+    };
+    let stopped_at = Instant::now();
+    match respawn_ps(&ctx.ps, &ctx.mgr, stopped_at).await {
+        Ok(d) => {
+            let mut p = ctx.ps.borrow_mut();
+            if graceful {
+                p.restarts.0 += 1;
+            } else {
+                p.restarts.1 += 1;
+            }
+            Ok(format!(
+                "{kind} restart: {stop_note}; every partition open, confirmed {:.1} s after \
+                 (the check waits out the old report first)",
+                d.as_secs_f64()
+            ))
+        }
+        Err(e) => {
+            let msg = format!("after a {kind} restart: {e}");
+            ctx.ps_failures.borrow_mut().push(msg.clone());
+            Err(msg)
+        }
+    }
+}
+
+/// Nemesis: seal and roll each partition's row-stream tail through its PS
+/// (`MSG_ROLL_TAILS`, the fence-drain path), so later flushes land in new extents.
+async fn do_roll_row(ctx: &NemesisCtx) -> Result<String, String> {
+    let regions = get_regions(&ctx.mgr).await;
+    let mut rolled = 0u32;
+    let mut last_err = String::new();
+    for (part_id, r) in &regions.regions {
+        let tail = match ctx.sc.get_stream_info(r.row_stream).await {
+            Ok(info) => match info.extent_ids.last() {
+                Some(&t) => t,
+                None => continue,
+            },
+            Err(e) => {
+                last_err = format!("row stream {}: {e}", r.row_stream);
+                continue;
+            }
+        };
+        let client = match ctx.router.try_client_for(*part_id).await {
+            Ok(c) => c,
+            Err(e) => {
+                last_err = e;
+                continue;
+            }
+        };
+        let resp = client
+            .call(
+                partition_rpc::MSG_ROLL_TAILS,
+                partition_rpc::rkyv_encode(&partition_rpc::RollTailsReq {
+                    part_id: *part_id,
+                    entries: vec![(r.row_stream, tail)],
+                }),
+            )
+            .await;
+        match resp.map_err(|e| e.to_string()).and_then(|b| {
+            partition_rpc::rkyv_decode::<partition_rpc::RollTailsResp>(&b).map_err(|e| e.to_string())
+        }) {
+            Ok(r) if r.code == partition_rpc::CODE_OK => rolled += r.rolled,
+            Ok(r) => last_err = format!("part {part_id}: code {} {}", r.code, r.message),
+            Err(e) => last_err = format!("part {part_id}: {e}"),
+        }
+    }
+    if rolled == 0 {
+        return Err(format!("rolled no row tail (last: {last_err})"));
+    }
+    Ok(format!("rolled {rolled} row tail(s)"))
+}
+
+// ── Checkpoint ⊆ row stream ────────────────────────────────────────────
+
+/// The row-stream extent of every SST the checkpoint records list, as
+/// recovery reads them: the last valid record of each meta-stream extent
+/// (`read_all_table_locations`; a merged partition carries one per source until
+/// its first flush). `None` when a meta extent cannot be read right now.
+async fn checkpoint_sst_extents(sc: &StreamClient, meta_stream: u64) -> Option<Vec<Vec<u64>>> {
+    let info = sc.get_stream_info(meta_stream).await.ok()?;
+    let mut out = Vec::new();
+    for &eid in &info.extent_ids {
+        let (payload, _) = sc.read_bytes_from_extent(eid, 0, 0).await.ok()?;
+        let mut last: Option<Vec<u64>> = None;
+        let mut buf = payload.as_slice();
+        while buf.len() >= 4 {
+            let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+            if 4 + len > buf.len() {
+                break;
+            }
+            // A record that does not decode is skipped past, as recovery does.
+            if let Ok(t) = partition_rpc::rkyv_decode::<partition_rpc::TableLocations>(&buf[4..4 + len]) {
+                last = Some(t.locs.iter().map(|l| l.extent_id).collect());
+            }
+            buf = &buf[4 + len..];
+        }
+        if let Some(l) = last {
+            out.push(l);
+        }
+    }
+    Some(out)
+}
+
+/// Every SST a partition's checkpoint lists must sit in an extent its row
+/// stream still has, or the partition cannot reopen — the production loss
+/// where the checkpoint listed 37 SSTs and 28 of them were in extents a
+/// compaction had truncated. Returns one line per partition in that state.
+///
+/// A compaction publishes a new checkpoint and then truncates, so a reading
+/// taken across that step can look wrong for a moment. A partition counts only
+/// when its checkpoints read the same before and after its row stream was read;
+/// one that keeps changing is left for the next check.
+/// `parts` = `(part_id, row_stream, meta_stream)`.
+async fn checkpoint_violations(
+    sc: &StreamClient,
+    parts: &[(u64, u64, u64)],
+    max_row_extents: &Cell<usize>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for &(part_id, row_stream, meta_stream) in parts {
+        for _ in 0..5 {
+            let Some(before) = checkpoint_sst_extents(sc, meta_stream).await else {
+                break;
+            };
+            let Ok(row) = sc.get_stream_info(row_stream).await else {
+                break;
+            };
+            let Some(after) = checkpoint_sst_extents(sc, meta_stream).await else {
+                break;
+            };
+            if before != after {
+                compio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+            max_row_extents.set(max_row_extents.get().max(row.extent_ids.len()));
+            let mut missing: Vec<u64> = before
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|e| !row.extent_ids.contains(e))
+                .collect();
+            missing.sort_unstable();
+            missing.dedup();
+            if !missing.is_empty() {
+                out.push(format!(
+                    "part {part_id}: checkpoint lists SSTs in extents {missing:?} that row stream {} ({:?}) no longer has",
+                    row_stream, row.extent_ids
+                ));
+            }
+            break;
+        }
+    }
+    out
+}
+
+/// Run the check and keep each distinct violation once.
+async fn record_checkpoint_violations(ctx: &NemesisCtx, when: &str) {
+    let parts: Vec<(u64, u64, u64)> = get_regions(&ctx.mgr)
+        .await
+        .regions
+        .iter()
+        .map(|(part_id, r)| (*part_id, r.row_stream, r.meta_stream))
+        .collect();
+    for v in checkpoint_violations(&ctx.sc, &parts, &ctx.max_row_extents).await {
+        if ctx.checkpoint_violations.borrow_mut().insert(v.clone()) {
+            eprintln!("chaos: CHECKPOINT VIOLATION ({when}): {v}");
+        }
+    }
+    ctx.checkpoint_checks.set(ctx.checkpoint_checks.get() + 1);
 }
 
 /// Format a fresh EN dir via `autumn-op format`, then spawn an
@@ -735,9 +1141,31 @@ async fn writer_loop(
                     note(&format!("PutResp decode failed: {e}"));
                 }
             },
-            Err(e) => {
+            // A status is the server's answer that the put was refused —
+            // except `Internal`, which is what a failed WAL append reports:
+            // one replica can time out after its write landed, and the record
+            // is then replayed on reopen. That case falls through as uncertain.
+            Err(e @ autumn_rpc::RpcError::Status { .. })
+                if !matches!(
+                    e,
+                    autumn_rpc::RpcError::Status {
+                        code: autumn_rpc::StatusCode::Internal,
+                        ..
+                    }
+                ) =>
+            {
                 writes_failed.fetch_add(1, Ordering::Relaxed);
                 note(&format!("put RPC failed: {e}"));
+                compio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(e) => {
+                // No answer: the connection broke after the put was sent — a
+                // PS killed between its append and its reply, typically. The
+                // value may be durable, so the key's state is uncertain, as on
+                // a timeout.
+                expected.borrow_mut().remove(&key);
+                writes_failed.fetch_add(1, Ordering::Relaxed);
+                note(&format!("put RPC failed (outcome uncertain): {e}"));
                 compio::time::sleep(Duration::from_millis(50)).await;
             }
         }
@@ -867,6 +1295,21 @@ enum Action {
     NetworkPartition,
     LatencySpike,
     CorruptReplica,
+    /// SIGTERM the PS (graceful drain), start it again, wait for every partition.
+    PsTerm,
+    /// SIGKILL the PS, start it again, wait for every partition.
+    PsKill,
+    /// Seal and roll every partition's row-stream tail. A cut past a live SST
+    /// needs a row stream of several extents with SSTs landing in different
+    /// ones; an EN failure or a fence-drain rolls it in production, but a
+    /// round rarely does that often enough to reach the shape.
+    RollRow,
+    /// Flush every partition several times in a row. A partition under steady
+    /// writes piles up SSTs until the PS's own size-tiered compaction trims
+    /// them (past 32), and that pick — a subset, not every table — is where
+    /// table order and row-stream order part ways. A round's single flushes
+    /// between compactions never get there.
+    FlushBurst,
 }
 
 /// The healthy-node count the STRICTEST nemesis insists on before it will act.
@@ -900,6 +1343,10 @@ const ALL_ACTIONS: &[Action] = &[
     Action::NetworkPartition,
     Action::LatencySpike,
     Action::CorruptReplica,
+    Action::PsTerm,
+    Action::PsKill,
+    Action::RollRow,
+    Action::FlushBurst,
 ];
 
 struct NemesisCtx {
@@ -971,6 +1418,20 @@ struct NemesisCtx {
     proxy_faults: Arc<AtomicU64>,
     ec_k: u32,
     ec_m: u32,
+    /// The partition server, a child process the PS nemesis stops and starts.
+    ps: RefCell<PsProcess>,
+    /// Drains that overran and restarts after which a partition never
+    /// reopened. Each fails the round.
+    ps_failures: RefCell<Vec<String>>,
+    /// Reads meta and row streams for the checkpoint check.
+    sc: Rc<StreamClient>,
+    /// Distinct checkpoint-vs-row-stream violations seen (fail the round).
+    checkpoint_violations: RefCell<std::collections::BTreeSet<String>>,
+    /// How many times the checkpoint check ran.
+    checkpoint_checks: Cell<u64>,
+    /// The most extents any row stream had when checked. A cut past a live SST
+    /// needs at least two; a round that never got there tested nothing here.
+    max_row_extents: Cell<usize>,
 }
 
 impl NemesisCtx {
@@ -1951,14 +2412,47 @@ async fn nemesis_loop(
                 Action::NetworkPartition => do_network_partition(&ctx).await,
                 Action::LatencySpike => do_latency_spike(&ctx).await,
                 Action::CorruptReplica => do_corrupt_replica(&ctx).await,
+                Action::PsTerm => do_ps_restart(&ctx, true).await,
+                Action::PsKill => do_ps_restart(&ctx, false).await,
+                Action::RollRow => do_roll_row(&ctx).await,
+                Action::FlushBurst => {
+                    let mut done = Vec::new();
+                    let mut last = Ok(String::new());
+                    for _ in 0..8 {
+                        last = do_maintenance(&ctx, partition_rpc::MAINTENANCE_FLUSH, "flush").await;
+                        if let Ok(m) = &last {
+                            done.push(m.clone());
+                        }
+                        compio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    if done.is_empty() {
+                        last
+                    } else {
+                        Ok(format!("{} of 8 flush rounds delivered", done.len()))
+                    }
+                }
             }
         };
-        let result = match compio::time::timeout(Duration::from_secs(30), dispatch).await {
+        // A PS restart bounds its own drain and reopen; give it room for both.
+        let limit = match action {
+            Action::PsTerm | Action::PsKill => PS_DRAIN_LIMIT + PS_READY_LIMIT + Duration::from_secs(30),
+            _ => Duration::from_secs(30),
+        };
+        let result = match compio::time::timeout(limit, dispatch).await {
             Ok(r) => r,
             Err(_) => Err(format!(
-                "{action:?} TIMED OUT (30s) — PS/orchestration wedged?"
+                "{action:?} TIMED OUT ({limit:?}) — PS/orchestration wedged?"
             )),
         };
+        // A restart cut off by the timeout can leave the PS stopped; that is
+        // a failed restart, not a declined action.
+        if matches!(action, Action::PsTerm | Action::PsKill) {
+            if let Err(msg) = &result {
+                if msg.contains("TIMED OUT") {
+                    ctx.ps_failures.borrow_mut().push(msg.clone());
+                }
+            }
+        }
         ctx.nemesis_events.fetch_add(1, Ordering::Relaxed);
         {
             let mut tally = ctx.action_tally.borrow_mut();
@@ -1975,6 +2469,9 @@ async fn nemesis_loop(
                 eprintln!("nemesis: {action:?} skipped — {msg}");
             }
         }
+        // Flush, compaction, split and merge all rewrite the checkpoint and
+        // may truncate the row stream; check what they left after each step.
+        record_checkpoint_violations(&ctx, &format!("after {action:?}")).await;
     }
     eprintln!("nemesis stopped");
 }
@@ -3949,6 +4446,55 @@ async fn run_terminal_decommission(
     ))
 }
 
+/// The checkpoint check must fire on the state it exists for, not only stay
+/// quiet on healthy runs: a checkpoint naming an extent its row stream does
+/// not have. Written the way `save_table_locs_raw` writes one.
+#[test]
+fn checkpoint_check_reports_an_sst_outside_the_row_stream() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let en = pick_addr();
+    let dir = tempfile::tempdir().expect("tempdir");
+    start_extent_node(en, dir.path().to_path_buf(), 1);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("mgr");
+        let _ = register_node(&mgr, &en.to_string(), "uuid-ckpt-check").await;
+        let row = create_stream(&mgr, 1).await;
+        let meta = create_stream(&mgr, 1).await;
+        let sc = StreamClient::connect(
+            &mgr_addr.to_string(),
+            "ckpt-check-test".to_string(),
+            128 * 1024 * 1024,
+            Rc::new(ConnPool::new()),
+        )
+        .await
+        .expect("stream client");
+        let row_extent = sc.get_stream_info(row).await.expect("row info").extent_ids[0];
+        let write = |extent_id: u64| {
+            let locs = partition_rpc::TableLocations {
+                locs: vec![partition_rpc::SstLocation { extent_id, offset: 0, len: 10 }],
+                ..Default::default()
+            };
+            let payload = partition_rpc::rkyv_encode(&locs);
+            let mut data = (payload.len() as u32).to_le_bytes().to_vec();
+            data.extend_from_slice(&payload);
+            data
+        };
+        let parts = [(1u64, row, meta)];
+        let seen = Cell::new(0);
+
+        sc.append(meta, &write(row_extent)).await.expect("append checkpoint");
+        assert!(checkpoint_violations(&sc, &parts, &seen).await.is_empty());
+
+        // The latest record in the extent is the one recovery reads.
+        sc.append(meta, &write(987_654)).await.expect("append checkpoint");
+        let v = checkpoint_violations(&sc, &parts, &seen).await;
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].contains("987654"), "{v:?}");
+        assert_eq!(seen.get(), 1);
+    });
+}
+
 #[test]
 #[ignore]
 fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
@@ -3969,6 +4515,10 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
 
     let op_binary = binary_path("autumn-op");
     let en_binary = binary_path("autumn-extent-node");
+    let ps_binary = std::env::var("AUTUMN_CHAOS_PS_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| binary_path("autumn-ps"));
+    eprintln!("chaos: PS binary {}", ps_binary.display());
 
     // -------- Real etcd (binary subprocess; kept alive by guard) --------
     let (_etcd_guard, etcd_endpoint) = compio::runtime::Runtime::new()
@@ -4084,11 +4634,31 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         // The range must bracket the namespaced keys, not the bare ones.
         upsert_partition(&mgr, part_id, log, row, meta, b"mem/a", b"mem/z").await;
 
-        // -------- Start PS (in-process) --------
-        let ps_addr = pick_addr();
-        start_partition_server(91, mgr_addr, ps_addr);
-        compio::time::sleep(Duration::from_millis(2500)).await;
+        // -------- Start PS (child process) --------
+        // 64 ports: one listener per partition, and splits add partitions.
+        let ps_addr = pick_stable_ps_base(64);
+        let ps = RefCell::new(PsProcess {
+            child: None,
+            binary: ps_binary.clone(),
+            ps_id: 91,
+            addr: ps_addr,
+            manager_addr: mgr_addr,
+            log_path: log_dir.join("ps-91.log"),
+            restarts: (0, 0),
+        });
+        ps.borrow_mut().spawn();
+        if let Err(e) = wait_ps_ready(&mgr, 91).await {
+            panic!("chaos: PS never came up: {e} (log {})", log_dir.join("ps-91.log").display());
+        }
         let router = Rc::new(PsRouter::new(mgr_addr, ps_addr));
+        let sc = StreamClient::connect(
+            &mgr_addr.to_string(),
+            "chaos-checkpoint-check".to_string(),
+            128 * 1024 * 1024,
+            Rc::new(ConnPool::new()),
+        )
+        .await
+        .expect("stream client for the checkpoint check");
 
         // -------- Workload state --------
         let topo = Rc::new(Topology::new());
@@ -4190,6 +4760,12 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             fence_stranded_sealed: Cell::new(0),
             ec_k: cfg.ec_k,
             ec_m: cfg.ec_m,
+            ps,
+            ps_failures: RefCell::new(Vec::new()),
+            sc,
+            checkpoint_violations: RefCell::new(Default::default()),
+            checkpoint_checks: Cell::new(0),
+            max_row_extents: Cell::new(0),
         });
         let n = compio::runtime::spawn({
             let ctx = nemesis_ctx.clone();
@@ -4273,9 +4849,35 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             }
         }
 
+        // The PS must be up for verify. A restart that failed mid-round left
+        // it stopped, and that failure is already recorded.
+        if !nemesis_ctx.ps.borrow().is_running() {
+            if let Err(e) = respawn_ps(&nemesis_ctx.ps, &mgr, Instant::now()).await {
+                nemesis_ctx.ps_failures.borrow_mut().push(format!("before verify: {e}"));
+            }
+        }
+
         eprintln!("chaos: settle 10 s before verify");
         compio::time::sleep(Duration::from_secs(10)).await;
+
+        // Reopen every partition from what is durable after the round's
+        // flushes, compactions, splits and merges. A checkpoint naming an SST
+        // its row stream lost fails here: the running PS never reads the
+        // checkpoint again, and the readers only ask for newest values.
+        eprintln!("chaos: crash-restarting the PS; every partition must reopen");
+        nemesis_ctx.ps.borrow_mut().kill();
+        match respawn_ps(&nemesis_ctx.ps, &mgr, Instant::now()).await {
+            Ok(d) => eprintln!(
+                "chaos: every partition reopened, confirmed {:.1} s after the kill",
+                d.as_secs_f64()
+            ),
+            Err(e) => nemesis_ctx
+                .ps_failures
+                .borrow_mut()
+                .push(format!("final crash restart: {e}")),
+        }
         refresh_topology(&mgr, &topo).await;
+        record_checkpoint_violations(&nemesis_ctx, "before verify").await;
 
         // -------- Terminal decommission (AUTUMN_CHAOS_DECOMMISSION=1) --------
         // Runs on the SETTLED cluster (all ENs back online, no in-flight chaos) —
@@ -4542,6 +5144,38 @@ runs ACROSS rounds is uncovered, not unlucky.",
             }
         }
         let mut workload_errors: Vec<String> = Vec::new();
+        // PS restarts and the checkpoint check. A drain that overran, a
+        // partition that never reopened, or a checkpoint naming an extent the
+        // row stream no longer has.
+        let mut persist_errors: Vec<String> = nemesis_ctx.ps_failures.borrow().clone();
+        persist_errors.extend(nemesis_ctx.checkpoint_violations.borrow().iter().cloned());
+        {
+            // Exit 0 after SIGTERM does not mean every partition flushed: the
+            // PS logs a failed or timed-out flush and exits anyway, and the WAL
+            // replays what was left. Counted, not failed — under EN faults a
+            // flush can fail for good reason — so a round says how often it
+            // actually took the clean path.
+            let ps_log = std::fs::read_to_string(log_dir.join("ps-91.log")).unwrap_or_default();
+            let unclean = ps_log
+                .lines()
+                .filter(|l| {
+                    l.contains("graceful shutdown: flush failed")
+                        || l.contains("drain timed out")
+                        || l.contains("thread join deadline")
+                })
+                .count();
+            eprintln!("chaos: PS drain warnings (flush failed / timed out / join deadline): {unclean}");
+            let (graceful, crash) = nemesis_ctx.ps.borrow().restarts;
+            eprintln!(
+                "chaos: PS restarts completed: {graceful} graceful, {crash} crash (plus the \
+                 final crash restart); checkpoint check ran {} time(s), {} violation(s), \
+                 row streams reached {} extent(s); PS log {}",
+                nemesis_ctx.checkpoint_checks.get(),
+                nemesis_ctx.checkpoint_violations.borrow().len(),
+                nemesis_ctx.max_row_extents.get(),
+                log_dir.join("ps-91.log").display()
+            );
+        }
         // A harness that cannot work its own proxies did not run the test it
         // reports. This is not a cluster invariant — it is the precondition for
         // trusting every invariant below, and it has to be an ASSERTION rather
@@ -4607,6 +5241,7 @@ runs ACROSS rounds is uncovered, not unlucky.",
         }
 
         if !workload_errors.is_empty()
+            || !persist_errors.is_empty()
             || !inflight_errors.is_empty()
             || !mismatches.is_empty()
             || !not_found.is_empty()
@@ -4635,11 +5270,16 @@ runs ACROSS rounds is uncovered, not unlucky.",
                 )
             };
             panic!(
-                "chaos verify FAILED\nWHY: {why}\nworkload: {}\nlogs: {}\n— mismatches={} not_found={} range_errors={} liveness_errors={} accounting_errors={} reclaim_errors={} inflight_errors={} post_reclaim(mismatches={} not_found={} accounting={})\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}\naccounting_errors: {}\nreclaim_errors: {}\ninflight_errors: {}\npost_reclaim_mismatches: {}\npost_reclaim_not_found: {}\npost_reclaim_accounting: {}",
+                "chaos verify FAILED\nWHY: {why}\nworkload: {}\nPS restarts / checkpoints: {}\nlogs: {}\n— mismatches={} not_found={} range_errors={} liveness_errors={} accounting_errors={} reclaim_errors={} inflight_errors={} post_reclaim(mismatches={} not_found={} accounting={})\nmismatches: {}\nnot_found: {}\nrange_errors: {}\nliveness_errors: {}\naccounting_errors: {}\nreclaim_errors: {}\ninflight_errors: {}\npost_reclaim_mismatches: {}\npost_reclaim_not_found: {}\npost_reclaim_accounting: {}",
                 if workload_errors.is_empty() {
                     format!("acked={acked_total} failed={failed_total}")
                 } else {
                     workload_errors.join("; ")
+                },
+                if persist_errors.is_empty() {
+                    "ok".to_string()
+                } else {
+                    persist_errors.join("; ")
                 },
                 log_dir.display(),
                 mismatches.len(),
