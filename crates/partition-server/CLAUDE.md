@@ -891,6 +891,12 @@ via `MSG_ROLL_TAILS`, auto-trim + major, reopen) and
 major truncates anyway, the queued keys survive a reopen). Each truncate logs
 `row stream: dropped the extents no live table references` with the cut.
 
+No-op dispatched compactions retry the same safe prefix cut under the
+maintenance gate. They first publish the current table snapshot with a replay
+cursor from durable checkpoint / SST boundaries (never the active WAL tail): a
+previous failed compaction may already have swapped the in-memory table list
+without publishing it. If that checkpoint fails, truncation is not attempted.
+
 ### Major Compaction (`compact_tx`, e.g. after overlap detected)
 `do_compact(major=true)`: processes all tables, additionally drops tombstones
 (op=2), expired entries, out-of-range keys (overlap cleanup), and clears
@@ -905,12 +911,25 @@ major compaction over SSTs alone then discarded nothing: measured on a real
 cluster, 270 deleted 64 MiB values sat unreclaimable indefinitely
 (`kept=256, discarded=0`), and the same compaction after a forced rotation
 discarded all 540 entries and GC reclaimed the 16 GiB extent unattended. A major
-compaction that is settling deletes also never skips on "fewer than 2 tables":
-a value and its delete flushed from one memtable are a single table, and only a
-major compaction drops that pair. Cost: every dispatched major now flushes, so
+compaction never skips a single SST, even with no overlap or unsettled-delete
+hint: it can be the only live bytes in a large dead row extent. A value and its
+delete flushed from one memtable also need that rewrite to drop the pair.
+Cost: every dispatched major now flushes, so
 one on a quiet partition with a non-empty memtable writes one more SST and
 rewrites it where it used to skip — bounded by the LSM size and by the
 compaction cooldown.
+
+Every non-empty major (including expiry) rolls the row tail through P-sst's
+`RowInvalidateBarrierReq` before writing output. The worker drains all inflight
+appends, seals/rolls its own StreamClient, then ACKs `Result<()>`; a failed roll
+aborts the compaction, and `roll_tails` counts only successful rolls. Split's
+invalidate-only barrier also checks this result. The maintenance gate and
+`compact_inflight` keep split/merge from sealing concurrently. Queued flushes
+may still retain an old extent through their rotation-time floor; rolling does
+not permit blindly truncating everything before the new tail. A failed compact
+leaves old extents intact. Regression: `system_row_truncate_live_refs` repeats a
+single-SST major after reopen and verifies another reopen; the queued-flush
+suite checks its old floor survives alongside the new output tail.
 
 `PartitionMetrics.unsettled_deletes` counts deletes no major compaction has
 covered: bumped per delete in Phase 3, seeded at open from the replayed

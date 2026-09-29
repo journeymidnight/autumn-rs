@@ -1,3 +1,12 @@
+Date: 2026-09-29 (8)
+TaskStatus: completed
+Task scope: major compaction writes into a fresh row extent, including a single SST, then safely truncates dead prefix extents. User requested no assistant attribution in commits; rollout remains on hold.
+Current summary: do_compact(major=true), including expiry, sends a P-sst seal/roll barrier before output. The barrier drains appends and ACKs Result; failures abort major and are not counted by roll_tails. Removed the single-SST major skip. No-op dispatched compaction republishes the table checkpoint with a safe replay cursor before retrying prefix truncation, so an earlier failed checkpoint cannot make it drop referenced SSTs. Existing live-table/queued-flush floors still constrain every cut.
+Verification: partition-server lib 271 passed, 1 existing ignored. system_row_truncate_live_refs (empty no-op, two single-SST rewrites after reopen, another reopen with all 33 keys), system_row_truncate_queued_flush, system_crash_mid_compact including ignored, system_merge_freeze_lostupdate, system_roll_tails_live_writer, system_merge_single_checkpoint all passed locally. Four ablations fail at their intended assertions: no roll, skip single SST, no no-op truncate, false barrier success. diff --check clean. H200-1 SSH rejected by jump-host authentication, so tests used the local macOS runtime.
+Review: manually checked the P-sst single-writer path, freeze/gate ordering, concurrent flush retention, checkpoint ordering, and all barrier callers. No subagents per user instruction.
+Main gaps: an extra system_restart_replay_cursor graceful-shutdown check failed (the other replay-cursor test passed). Trace proves drain completes, then region-sync reopens the drained partition; existing by-value shutting_down Cell in cloned PartitionServers is the cause. Unmodified HEAD passed two individual runs, so timing determines whether this race surfaces. Recorded separately as BUG-PS-SHUTDOWN-CLONE; not folded into row reclamation. Production was not changed.
+Next steps: rollout only when the user requests it. Investigate the separately recorded shutdown race before relying on graceful-stop timing.
+
 Date: 2026-09-29 (7)
 TaskStatus: completed
 Task scope: user "所以merge以后，应该生成新的TableLocations啊！，所以就应该只有一个" (BUG-MERGE-MULTI-CHECKPOINT).

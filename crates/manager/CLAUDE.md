@@ -1851,3 +1851,8 @@ answering was only ever found by each caller's own timeout, one call at a
 time. It also handed one `&mut RpcConn` to every task through a raw pointer:
 two tasks calling the same node concurrently read each other's replies off one
 socket. Do not reintroduce a private connection type here.
+
+Row-reclamation regressions: `system_row_truncate_live_refs` checks empty-major
+prefix cleanup and repeated single-SST majors after reopen, then reopens again
+and reads every key. `system_row_truncate_queued_flush` expects the queued
+rotation floor and the major's fresh tail to coexist until the flush commits.

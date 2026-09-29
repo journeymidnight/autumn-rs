@@ -143,6 +143,20 @@ fn compaction_drops_only_unreferenced_row_extents() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let ps = RpcClient::connect(ps_addr).await.expect("ps");
         let sc = stream_client(mgr_addr).await;
+        // Empty major is a no-op rewrite, but must retry prefix truncation.
+        roll_row(&ps, &sc, row).await;
+        roll_row(&ps, &sc, row).await;
+        let empty_tail = *row_extents(&sc, row).await.last().unwrap();
+        ps_compact(&ps, PART).await;
+        let t0 = Instant::now();
+        while row_extents(&sc, row).await != vec![empty_tail] {
+            assert!(
+                t0.elapsed() < Duration::from_secs(15),
+                "empty major did not truncate"
+            );
+            compio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(checkpoint(&sc, meta).await.locs.is_empty());
         // R1: two SSTs. R2: thirty. R3: one — the 33rd, past the PS's own
         // auto-trim trigger, whose head rule takes R1's two tables.
         let mut i = 0u32;
@@ -194,7 +208,58 @@ fn compaction_drops_only_unreferenced_row_extents() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let t0 = Instant::now();
         let ps = loop {
-            assert!(t0.elapsed() < Duration::from_secs(60), "partition did not reopen");
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "partition did not reopen"
+            );
+            if let Ok(ps) = RpcClient::connect(ps_addr).await {
+                if ps_get(&ps, PART, b"k000").await.code == CODE_OK {
+                    break ps;
+                }
+            }
+            compio::time::sleep(Duration::from_millis(200)).await;
+        };
+        // After reopening, one SST and no in-memory unsettled-delete hint:
+        // a major must still move that SST out of its old tail. Do it twice
+        // to catch the former single-table no-op as well as a missing roll.
+        let sc = stream_client(mgr_addr).await;
+        for _ in 0..2 {
+            let before = row_extents(&sc, row).await;
+            assert_eq!(before.len(), 1);
+            assert_eq!(checkpoint(&sc, meta).await.locs.len(), 1);
+            ps_compact(&ps, PART).await;
+            let t0 = Instant::now();
+            loop {
+                let after = row_extents(&sc, row).await;
+                if after.len() == 1 && after != before {
+                    break;
+                }
+                assert!(
+                    t0.elapsed() < Duration::from_secs(15),
+                    "single-SST major did not replace its old extent: {before:?} -> {after:?}"
+                );
+                compio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert_checkpoint_covered(&sc, row, meta, "single SST after reopen").await;
+        }
+        for i in 0..33u32 {
+            let r = ps_get(&ps, PART, format!("k{i:03}").as_bytes()).await;
+            assert_eq!(r.code, CODE_OK, "k{i:03} lost");
+            assert_eq!(r.value, format!("v{i}").into_bytes());
+        }
+    });
+    stop_ps(&stop, join);
+
+    let ps_addr = pick_addr();
+    let stop = Arc::new(AtomicBool::new(false));
+    let join = spawn_ps(mgr_addr, ps_addr, stop.clone());
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let t0 = Instant::now();
+        let ps = loop {
+            assert!(
+                t0.elapsed() < Duration::from_secs(60),
+                "partition did not reopen"
+            );
             if let Ok(ps) = RpcClient::connect(ps_addr).await {
                 if ps_get(&ps, PART, b"k000").await.code == CODE_OK {
                     break ps;
@@ -204,7 +269,7 @@ fn compaction_drops_only_unreferenced_row_extents() {
         };
         for i in 0..33u32 {
             let r = ps_get(&ps, PART, format!("k{i:03}").as_bytes()).await;
-            assert_eq!(r.code, CODE_OK, "k{i:03} lost");
+            assert_eq!(r.code, CODE_OK, "k{i:03} lost after single-SST rewrite");
             assert_eq!(r.value, format!("v{i}").into_bytes());
         }
     });

@@ -14,6 +14,13 @@
 
 ## Active
 
+### BUG-PS-SHUTDOWN-CLONE — background region sync can reopen a drained partition
+- **Trigger** (2026-09-29 major-row-reclaim verification): `system_restart_replay_cursor::graceful_restart_replays_only_past_the_checkpoint` hit its 30 s shutdown deadline; trace showed "graceful drain complete" followed by region sync reopening the same partition.
+- **Cause**: `PartitionServer` derives Clone, but `shutting_down: Cell<bool>` is copied by value; the supervised region-sync/heartbeat clones never observe shutdown's flag. The entry-only check in `sync_regions_once` also needs review across awaited manager/open calls.
+- **Scope**: share the shutdown state across PS clones; prevent in-flight region sync from publishing/reopening a partition during shutdown, without losing drain coverage.
+- **Acceptance**: deterministic clone/shutdown and in-flight-sync regression; graceful shutdown finishes without reopening any partition; restart replays only the tail; ablation fails.
+- `passes: false`
+
 ### F-CHAOS-PS-RESTART — chaos 覆盖 PS 真进程重启与 checkpoint / row stream 结构检查
 - **Trigger** (2026-09-29 用户): "chaos test为什么之前没有覆盖1a，1b的问题，需要加chaos测试" → "先不管perf check，chaos还是要增加 1. checkpoint 与 row stream的结构检查 2. PS 真进程和两种重启， 然后开始跑chaos测试"。之前 system_chaos 的 PS 在测试进程内、从不重启，读的都是反复覆盖的最新值，没有任何检查核对 checkpoint 引用的 SST 是否还在 row stream 里。
 - **Scope**: system_chaos 的 PS 改为 `autumn-ps` 子进程（二进制可替换，便于拿旧版本 A/B）；新增 nemesis 动作 `psterm`（SIGTERM → drain 退出 → 重启 → 等 ready）与 `pskill`（SIGKILL → 重启 → 等 ready）；每个 nemesis 动作之后与 verify 之前，对每个分区检查：恢复会读的 checkpoint（每个 meta extent 的最后一条）列出的 SST 所在 extent 都还在 row stream 里；verify 前再做一次崩溃重启，全部分区必须重新打开；传输出错的写按结果不确定处理。

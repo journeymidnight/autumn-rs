@@ -1042,9 +1042,11 @@ Why the two streams react differently:
   operation: it frees the *oldest* extents, and only once **every** SST inside
   them has been compacted away (live data merged into newer SSTs). You cannot
   free a middle extent, and you cannot truncate the current tail. So a partition
-  whose whole row_stream still fits in one 16 GiB extent returns **zero** SST
-  space via truncate until that extent rolls — dead SST bytes accumulate up to
-  ~one extent before any is reclaimed. A full 16 GiB extent holds ~128 × 128 MB
+  whose whole row_stream still fits in one 16 GiB extent needs a roll before
+  truncate can reclaim SST space. **Major compaction now rolls first**, even
+  for one SST; its output goes into a fresh extent. Minor compactions still
+  rely on natural rolls, so dead SST bytes can accumulate up to ~one extent.
+  A full 16 GiB extent holds ~128 × 128 MB
   SSTs; clearing it takes ~26 minor-compaction rounds (`COMPACT_N=5`/round) plus
   the matching write amplification.
 
@@ -1303,6 +1305,19 @@ partition means rewriting its checkpoint without them (an audited, one-off
 operation, not something the PS does). Regression tests:
 `background::compaction_truncate_tests`,
 `crates/manager/tests/system_row_truncate_live_refs.rs`.
+
+A manual `autumn-op --manager <MGR> compact <P> --wait` flushes the memtable,
+rolls the row tail on P-sst, and rewrites even a single SST. Once its checkpoint
+is durable, unreferenced prefix extents can be dropped. A queued flush may pin
+an older extent until it commits; no-op compactions also retry safe truncation.
+A failed roll aborts the major before output is written. Repeated majors rewrite
+the live SSTs each time, so use them for reclamation rather than polling them.
+
+Regression (real manager/EN/PS, with reopen and a paused concurrent flush):
+
+```bash
+cargo test -p autumn-manager --test system_row_truncate_live_refs --test system_row_truncate_queued_flush -- --test-threads=1
+```
 
 ### Reading GC replay-floor protection — a skipped `forcegc` is usually CORRECT
 

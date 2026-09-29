@@ -576,55 +576,38 @@ pub(crate) async fn background_maintenance_loop(
                     major_guards = Some((gate, permit));
                 }
                 let tbls = part.borrow().tables.clone();
-                // A single table can still hold a delete together with the
-                // value it killed (both flushed from one memtable), and only a
-                // major compaction drops that pair — so a major one that is
-                // settling deletes never skips on table count.
-                if tbls.len() < 2 && part.borrow().has_overlap.get() == 0 && settling == 0 {
-                    tracing::info!(
-                        "compact part {}: skipped (major={}) — tables={}, has_overlap=0",
-                        part_id,
-                        major,
-                        tbls.len()
-                    );
-                    metrics.pending_compaction_bytes.store(
-                        compute_pending_compaction_bytes(&part),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    record_maint_outcome(
-                        &metrics,
-                        compact_op_id,
-                        manager_rpc::OP_KIND_COMPACT,
-                        manager_rpc::OP_STATE_SUCCEEDED,
-                        String::new(),
-                        "nothing to compact".to_string(),
-                    );
-                    refresh_metrics(&part);
-                    stamp_last_compact();
-                    clear_compact_inflight();
-                    continue;
-                }
-
                 let compact_tbls = if major {
                     tbls.clone()
                 } else {
                     pickup_tables(&tbls, 2 * crate::flush_mem_bytes())
                 };
-                // Skip when the size-tiered selector couldn't pick a mergeable
-                // pair (minor only) or when there's literally nothing to
-                // compact. Major mode falls through with a single table so
-                // overlap cleanup (drop out-of-range keys → clear
-                // `has_overlap` at line 229) can unblock split. The earlier
-                // guard at line 183 already filters out "1 SST + no overlap",
-                // so reaching here in major mode with `compact_tbls.len() < 2`
-                // implies `has_overlap == 1` and `do_compact` will rewrite
-                // the SST without the out-of-range keys.
+                // A major rewrites even one SST: its old extent may contain
+                // arbitrarily much dead data, including after a restart.
                 let skip_compact = if major {
                     compact_tbls.is_empty()
                 } else {
                     compact_tbls.len() < 2
                 };
                 if skip_compact {
+                    let _gate = if major_guards.is_none() {
+                        Some(maintenance_gate.acquire().await)
+                    } else {
+                        None
+                    };
+                    if let Err(e) = checkpoint_and_truncate_row_prefix(&part, part_id).await {
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            format!("{e:#}"),
+                            String::new(),
+                        );
+                        refresh_metrics(&part);
+                        stamp_last_compact();
+                        clear_compact_inflight();
+                        continue;
+                    }
                     metrics.pending_compaction_bytes.store(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,
@@ -2323,6 +2306,41 @@ async fn truncate_unreferenced_row_prefix(
     Ok(())
 }
 
+/// A no-op may follow a failed checkpoint append after an in-memory table
+/// swap. Publish the current tables before retrying truncation, just as a real
+/// compaction does. Never use the live WAL tail: active/queued data may not yet
+/// be in these SSTs. The durable cursor and SST boundaries are safe floors.
+async fn checkpoint_and_truncate_row_prefix(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+) -> Result<()> {
+    let (sc, log_id, meta_id) = {
+        let p = part.borrow();
+        (p.stream_client.clone(), p.log_stream_id, p.meta_stream_id)
+    };
+    let log_ids = sc.get_stream_info(log_id).await?.extent_ids;
+    let (tables, floors, vp) = {
+        let p = part.borrow();
+        (
+            p.tables.clone(),
+            crate::snapshot_fence_floors(&p),
+            checkpoint_vp_head(&p, p.durable_ckpt_vp.get(), &log_ids),
+        )
+    };
+    // No await between the snapshot and the checkpoint enqueue (publish order).
+    save_table_locs_raw(
+        &sc,
+        meta_id,
+        &tables,
+        vp.0,
+        vp.1,
+        log_ids.len() as u32,
+        floors,
+    )
+    .await?;
+    truncate_unreferenced_row_prefix(part, part_id).await
+}
+
 /// Which tables a minor compaction merges. Selection only: which row-stream
 /// extents may then be dropped is `truncate_unreferenced_row_prefix`'s question,
 /// answered from what the tables reference, never from their order here.
@@ -2593,6 +2611,26 @@ pub(crate) async fn do_compact(
             entries_discarded: 0,
             output_bytes: 0,
         });
+    }
+
+    if major {
+        // The maintenance gate excludes split, and compact_inflight makes
+        // merge freeze wait. Only P-sst may seal its row writer; the barrier
+        // drains appends before rolling and admits queued flushes afterwards.
+        let mut barrier_tx = part.borrow().row_invalidate_tx.clone();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        barrier_tx
+            .send(crate::RowInvalidateBarrierReq {
+                row_stream_id,
+                seal_and_roll: true,
+                resp_tx,
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("major compact: row barrier closed"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("major compact: row barrier ACK dropped"))?
+            .map_err(|e| anyhow::anyhow!("major compact: roll row tail: {e:#}"))?;
     }
 
     // async window iteration directly over the (paged) inputs — one

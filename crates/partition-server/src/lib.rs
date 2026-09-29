@@ -2156,11 +2156,13 @@ pub(crate) struct RowInvalidateBarrierReq {
     /// when true, after draining inflight P-sst to zero the
     /// worker SEALS + ROLLS the row_stream tail (`sst_sc.seal_and_roll_tail`,
     /// which invalidates internally) instead of only invalidating the cache.
-    /// Used by MSG_ROLL_TAILS to drain a row tail off a fenced node. Split
-    /// passes `false` — it only needs the invalidate before the manager
+    /// Used by major compaction to write into a fresh extent and by
+    /// MSG_ROLL_TAILS to drain a fenced node. Split passes `false` — it only
+    /// needs the invalidate before the manager
     /// seals the tail itself in `multi_modify_split`.
     pub(crate) seal_and_roll: bool,
-    pub(crate) resp_tx: oneshot::Sender<()>,
+    /// ACK carries the roll result; callers must not publish success on failure.
+    pub(crate) resp_tx: oneshot::Sender<Result<()>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -11140,32 +11142,19 @@ async fn flush_worker_loop(
             while let Some(done) = inflight.next().await {
                 done.send();
             }
-            if req.seal_and_roll {
-                // seal + roll the row tail off a fenced node. The inflight FU
-                // was drained to zero above, and `seal_and_roll_tail` is
-                // live-writer-safe: with the row worker alive it quiesces via
-                // the SealCommit handshake, seals at the worker's exact
-                // all-replica-acked commit, and ResetTails the worker onto the
-                // fresh extent — so no later flush can append to (and ack
-                // into) the ghost region above the sealed length. Best-
-                // effort: on error (e.g. all replicas unreachable → manager
-                // Precondition) log + still ACK; the manager sweep retries on
-                // its cooldown.
-                if let Err(e) = sst_sc.seal_and_roll_tail(req.row_stream_id).await {
-                    tracing::warn!(
-                        row_stream_id = req.row_stream_id,
-                        error = %e,
-                        "row tail seal_and_roll failed (will retry)"
-                    );
-                }
+            let result = if req.seal_and_roll {
+                // All P-sst appends have drained. The live-writer handshake
+                // seals at the acknowledged commit and resets onto a fresh tail.
+                sst_sc.seal_and_roll_tail(req.row_stream_id).await
             } else {
                 sst_sc.invalidate_stream(req.row_stream_id);
+                Ok(())
+            };
+            if let Err(e) = &result {
+                tracing::warn!(row_stream_id = req.row_stream_id, error = %e,
+                    "row tail seal_and_roll failed");
             }
-            // ACK after invalidate/roll (the ACK semantics are "by the time you
-            // receive this, no in-flight P-sst operation is touching the
-            // pre-invalidate sst_sc state"). Receiver-dropped is treated
-            // as the caller aborted; the invalidate/roll stands regardless.
-            let _ = req.resp_tx.send(());
+            let _ = req.resp_tx.send(result);
             continue;
         }
 
@@ -14674,7 +14663,7 @@ mod invalidate_plumbing_tests {
         let rt = compio::runtime::Runtime::new().expect("rt");
         rt.block_on(async {
             let (tx, mut rx) = mpsc::channel::<RowInvalidateBarrierReq>(1);
-            let (resp_tx, resp_rx) = oneshot::channel::<()>();
+            let (resp_tx, resp_rx) = oneshot::channel::<Result<()>>();
             let req = RowInvalidateBarrierReq {
                 row_stream_id: 42,
                 seal_and_roll: false,
@@ -14690,13 +14679,41 @@ mod invalidate_plumbing_tests {
             assert_eq!(row_stream_id, 42);
             // Round-trip the ACK as well — handle_split_part awaits this
             // oneshot before releasing gates.
-            let _ = recv_resp_tx.send(());
+            let _ = recv_resp_tx.send(Ok(()));
             assert!(
-                resp_rx.await.is_ok(),
+                matches!(resp_rx.await, Ok(Ok(()))),
                 "barrier ACK oneshot must round-trip — \
                  handle_split_part blocks here before releasing \
                  compact_gate / gc_gate / frozen_for_split."
             );
+        });
+    }
+
+    #[test]
+    fn row_roll_barrier_propagates_failure() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            // No manager is listening: the roll must fail, and the real worker
+            // must return that failure rather than acknowledging success.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            drop(listener);
+            let sc = StreamClient::new_with_owner_epoch(
+                &addr.to_string(), "barrier-test".into(), 1,
+                1024 * 1024, Rc::new(ConnPool::new()),
+            ).await.unwrap();
+            let (flush_tx, flush_rx) = mpsc::channel(1);
+            let (append_tx, append_rx) = mpsc::channel(1);
+            let (mut barrier_tx, barrier_rx) = mpsc::channel(1);
+            let (resp_tx, resp_rx) = oneshot::channel();
+            barrier_tx.send(RowInvalidateBarrierReq {
+                row_stream_id: 42, seal_and_roll: true, resp_tx,
+            }).await.unwrap();
+            drop((flush_tx, append_tx, barrier_tx));
+            let (_, result) = futures::join!(
+                flush_worker_loop(sc, flush_rx, append_rx, barrier_rx), resp_rx,
+            );
+            assert!(result.expect("worker must ACK").is_err(),
+                "a failed seal/roll must never be acknowledged as success");
         });
     }
 

@@ -156,7 +156,7 @@ fn truncation_proceeds_while_a_flush_is_queued() {
             ps_put(&ps, PART, format!("q{i:03}").as_bytes(), &queued_value(i)).await;
         }
 
-        // The expiry major compaction rewrites every table into the tail and
+        // The expiry major compaction rewrites every table into a new tail and
         // truncates, with the imm still queued.
         let t0 = Instant::now();
         let after = loop {
@@ -170,7 +170,20 @@ fn truncation_proceeds_while_a_flush_is_queued() {
             );
             compio::time::sleep(Duration::from_millis(500)).await;
         };
-        assert_eq!(after, vec![*before.last().unwrap()], "only the tail stays");
+        assert_eq!(
+            after.len(),
+            2,
+            "queued floor plus the major's new tail: {after:?}"
+        );
+        assert_eq!(
+            after[0],
+            *before.last().unwrap(),
+            "queued flush still pins its floor"
+        );
+        assert!(
+            !before.contains(after.last().unwrap()),
+            "major output uses a new tail"
+        );
 
         // Release the queued flush and wait for it to commit.
         let commits = autumn_partition_server::flush_commit_count();

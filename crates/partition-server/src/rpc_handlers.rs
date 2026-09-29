@@ -493,14 +493,14 @@ pub(crate) async fn handle_roll_tails(
         if stream_id == row_id {
             // row_stream single-writer invariant: seal+roll on P-sst's sst_sc
             // via the row-invalidate barrier (drains inflight to zero first).
-            let (tx, rx) = futures::channel::oneshot::channel::<()>();
+            let (tx, rx) = futures::channel::oneshot::channel::<anyhow::Result<()>>();
             let mut inv_tx = row_inv_tx.clone();
             let br = crate::RowInvalidateBarrierReq {
                 row_stream_id: row_id,
                 seal_and_roll: true,
                 resp_tx: tx,
             };
-            if inv_tx.send(br).await.is_ok() && rx.await.is_ok() {
+            if inv_tx.send(br).await.is_ok() && matches!(rx.await, Ok(Ok(()))) {
                 rolled += 1;
             }
         } else if stream_id == log_id || stream_id == meta_id {
@@ -2075,7 +2075,7 @@ pub(crate) async fn handle_split_part(
     // `Cell<bool> need_invalidate_row_stream` flag piggybacked on each
     // P-sst message — racy under P-sst's cap=2 FuturesUnordered (see
     // fix history in `partition-server/CLAUDE.md` programming note 16).
-    let (inv_resp_tx, inv_resp_rx) = futures::channel::oneshot::channel::<()>();
+    let (inv_resp_tx, inv_resp_rx) = futures::channel::oneshot::channel::<anyhow::Result<()>>();
     let mut inv_tx = part.borrow().row_invalidate_tx.clone();
     let inv_req = crate::RowInvalidateBarrierReq {
         row_stream_id,
@@ -2093,8 +2093,8 @@ pub(crate) async fn handle_split_part(
     // `row_end` — manager seals at the pre-TTL length, post-TTL writes
     // end up above sealed_length, invisible on recovery (coco /findbugs
     // v4/v5, 2026-06-02). The SEND can block independently of the ACK:
-    // `row_invalidate_tx` is capacity 1 (only `handle_split_part`
-    // sends), so a still-queued prior-split barrier whose P-sst
+    // `row_invalidate_tx` is capacity 1 (shared with major compaction
+    // and tail rolls), so a still-queued barrier whose P-sst
     // processing never completed (e.g. permanently-down replica on
     // flush) would back-pressure us here BEFORE the ACK timeout could
     // even arm. Two separate timers (5 s + 10 s) keep the total budget
@@ -2133,7 +2133,14 @@ pub(crate) async fn handle_split_part(
     let ack_timer = compio::time::sleep(ack_timeout);
     futures::pin_mut!(ack_timer);
     match futures::future::select(inv_resp_rx, ack_timer).await {
-        futures::future::Either::Left((Ok(()), _)) => {}
+        futures::future::Either::Left((Ok(Ok(())), _)) => {}
+        futures::future::Either::Left((Ok(Err(e)), _)) => {
+            part.borrow().frozen_for_split.set(None);
+            return Err((
+                StatusCode::Internal,
+                format!("split: row barrier failed: {e:#}"),
+            ));
+        }
         futures::future::Either::Left((Err(_canceled), _)) => {
             part.borrow().frozen_for_split.set(None);
             return Err((
