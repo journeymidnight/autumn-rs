@@ -1,3 +1,10 @@
+Date: 2026-09-29
+TaskStatus: not_completed
+Task scope: F-PS-CORE-CAPACITY (feature_list.md) — place partitions by PS core capacity (--cpuset = slot_cap = cpuset_len/2), allow oversubscription with floating threads confined to the cpuset, manager resolves overflow by move -> merge (post-merge <= 1/4 of split thresholds) -> alert, never seesaw split/merge.
+Current summary: design agreed with user and recorded in feature_list.md; no code yet.
+Main gaps: stage 1 (capacity reporting + capacity-aware placement/rebalance), stage 2 (PS: drop hard refusals, float in cpuset mask, decouple port ord from core slot, promote on free slot), stage 3 (overflow planner + anti-seesaw rules).
+Next steps: stage 1 — decide how capacity survives manager failover (registration vs heartbeat), then implement placement order in compute_region_for_partition / rebalance_regions / compute_rebalance_moves.
+
 Date: 2026-09-28 (6)
 TaskStatus: completed
 Task scope: user report "UCX 启动检查可能误报成功": the EN logged "listening" before ExtentNode::new (O_DIRECT check), cluster.sh's UCX wait grepped that line, so an EN that then died on a data dir refusing O_DIRECT was reported up.

@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-27
+**Last updated:** 2026-09-29
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,6 +13,28 @@
 ---
 
 ## Active
+
+### F-PS-CORE-CAPACITY — 分区放置按 PS 核容量；允许超卖，manager 感知并按策略消解
+- **Trigger** (2026-09-29 用户讨论): `--cpuset` 下每个分区占 2 核（P-log + P-sst），PS 容量 = `cpuset_len/2`，但 manager 放置分区只看各 PS 的 region 数（`compute_region_for_partition`、`rebalance_regions`、`compute_rebalance_moves` 三处），完全不知道核容量。PS 侧预算门是硬拒：`sync_regions_once` 满了拒开（分区一直 `ps=unknown`），`handle_split_part` 满了拒 split，且检查的是父分区所在 PS，而右孩子由 manager 派到最少 region 的 PS，可能不是本机。超出核数的线程 `pick_cpu_for_ord` 返回 `None` 不绑核，继承进程掩码，可能跑出 cpuset 抢 EN/其他租户的核。
+- **设计定案（用户确认）**:
+  1. `--cpuset` 即该 PS 全部核预算；不带 `--cpuset` 的 PS 容量未知、不参与核容量管理。
+  2. 放置顺序：有空 slot 的 cpuset PS（空闲 slot 多者优先）→ 无 cpuset 的 PS → 全满时超卖到 `used/cap` 最低的 PS。容量是软门，不做预留/2PC。rebalance 同样改按 `used/cap`。
+  3. 允许超卖：PS 不再因核预算拒开分区或拒 split。超卖分区的线程亲和到整个 cpuset 掩码（浮动但不出 cpuset）。端口序号与核槽位解耦；绑核分区关闭腾出槽位时，把一个浮动分区晋升绑核（线程自行 re-pin，不重开分区）。
+  4. manager 能看到超卖（每 PS `used/cap`、浮动分区数，经 `client info`/dashboard 可见），按顺序处理：迁移（集群尚有空 slot）→ 超卖 merge（集群整体满）→ 告警加 PS（无足够冷的相邻对）。动作走 op ledger，在 leader-fenced manager 内执行。
+  5. 防跷跷板（用户硬要求：split/merge 绝不能来回切换）：
+     - 超卖 merge 可放宽 merge 阈值，但合并后指标必须不超过 split 阈值的 **1/4**：QPS 和 ≤ 3.75K（`SPLIT_QPS_HIGH/4`）、带宽和 ≤ `SPLIT_BW_HIGH/4`（≈44 MiB/s）、imm_full 仍须为 0、每侧大小仍 < `MERGE_SIZE_LOW`（不放宽）。
+     - 同一 tick 由一个 planner 统一决策；集群有待执行 split 时不做超卖 merge。
+     - split 产生的孩子在 merge 冷却期内不可作超卖 merge 候选；merge 产物在冷却期内不可因超卖被迁移。
+     - 为凑同 PS 而做的迁移与 rebalance 共用同一容量评分，只有评分严格下降才做。
+- **Scope（分阶段，每阶段独立提交）**:
+  - 阶段 1：PS 上报核容量（cpuset 是否显式、`slot_cap`）；manager 在三处放置/rebalance 路径按上述顺序与 `used/cap` 决策；容量可见于 `client info`。manager 换主后容量信息须能恢复（注册或心跳重新带上，不能依赖旧 leader 内存）。
+  - 阶段 2：PS 去掉两处硬拒；超卖线程亲和整个 cpuset 掩码；端口序号与核槽位解耦，槽位空出时晋升浮动分区。
+  - 阶段 3：manager 超卖处理（迁移 → 超卖 merge → 告警）及防跷跷板规则。
+- **Acceptance**:
+  - 阶段 1：2 个 cpuset PS（容量不同）+ 1 个无 cpuset PS 的集群，新建/split 出的分区按放置顺序落位；manager 重启/换主后放置仍正确；消融（改回按 region 数）测试变红。
+  - 阶段 2：分区数超过 `cpuset_len/2` 时全部可服务；浮动线程的亲和掩码等于 cpuset（读 `/proc/<pid>/task/*/status` 的 `Cpus_allowed_list`）；关闭一个绑核分区后，一个浮动分区在有限时间内变为单核绑定；split 在 PS 满时不再被拒。
+  - 阶段 3：超卖时产生迁移或满足 1/4 上限的 merge；构造在阈值边界抖动的负载，断言 N 个 tick 内同一 key range 的 split+merge 次数 ≤ 1；无冷对时只告警不动作；各规则消融能变红。
+- `passes: false`
 
 ### BUG-POLICY-ACTIVATE-ATOMIC — policy 名称与模式切换跨两次 RPC
 - **Trigger** (2026-09-27 dashboard review): `autumn-op auto-policy activate` 先 SET_ACTIVE 后 SET_MODE；manager 的 SET_ACTIVE 保留旧 mode。旧模式为 Armed 时，选择本应 DryRun 的新 policy 会先继承 Armed；第二次请求失败会留下部分更新，其他操作者也可在两次调用之间交错。
