@@ -582,8 +582,8 @@ pub(crate) async fn background_maintenance_loop(
                     continue;
                 }
 
-                let (compact_tbls, truncate_id) = if major {
-                    (tbls.clone(), tbls.last().map(|t| t.extent_id).unwrap_or(0))
+                let compact_tbls = if major {
+                    tbls.clone()
                 } else {
                     pickup_tables(&tbls, 2 * MAX_SKIP_LIST)
                 };
@@ -649,14 +649,8 @@ pub(crate) async fn background_maintenance_loop(
                             part.borrow().set_has_overlap(0);
                             settle_deletes(&metrics, settling);
                         }
-                        if truncate_id != 0 {
-                            let (row_stream_id, part_sc) = {
-                                let p = part.borrow();
-                                (p.row_stream_id, p.stream_client.clone())
-                            };
-                            if let Err(e) = part_sc.truncate(row_stream_id, truncate_id).await {
-                                tracing::warn!("compaction truncate: {e}");
-                            }
+                        if let Err(e) = truncate_unreferenced_row_prefix(&part, part_id).await {
+                            tracing::warn!(part_id, "compaction: row stream truncate: {e:#}");
                         }
                         record_maint_outcome(
                             &metrics,
@@ -736,7 +730,6 @@ pub(crate) async fn background_maintenance_loop(
                 if has_expired {
                     let tbls = part.borrow().tables.clone();
                     if !tbls.is_empty() {
-                        let last_extent = tbls.last().map(|t| t.extent_id).unwrap_or(0);
                         // Per-partition maintenance_gate (see main arm above).
                         let _local_gate = maintenance_gate.acquire().await;
                         let _permit = concurrency_ctrl.acquire_compact().await;
@@ -763,16 +756,13 @@ pub(crate) async fn background_maintenance_loop(
                                 // The auto-trim arm below is MINOR and must not
                                 // clear it — it does not drop out-of-range keys.
                                 part.borrow().set_has_overlap(0);
-                                if last_extent != 0 {
-                                    let (row_stream_id, part_sc) = {
-                                        let p = part.borrow();
-                                        (p.row_stream_id, p.stream_client.clone())
-                                    };
-                                    if let Err(e) =
-                                        part_sc.truncate(row_stream_id, last_extent).await
-                                    {
-                                        tracing::warn!("expiry major compaction truncate: {e}");
-                                    }
+                                if let Err(e) =
+                                    truncate_unreferenced_row_prefix(&part, part_id).await
+                                {
+                                    tracing::warn!(
+                                        part_id,
+                                        "expiry major compaction: row stream truncate: {e:#}"
+                                    );
                                 }
                             }
                             Err(e) => tracing::error!("expiry major compaction: {e}"),
@@ -829,7 +819,7 @@ pub(crate) async fn background_maintenance_loop(
                         == 0
                 {
                     let tbls = part.borrow().tables.clone();
-                    let (compact_tbls, truncate_id) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+                    let compact_tbls = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
                     if compact_tbls.len() >= 2 {
                         // Per-partition maintenance_gate (see main arm above).
                         let _local_gate = maintenance_gate.acquire().await;
@@ -846,16 +836,10 @@ pub(crate) async fn background_maintenance_loop(
                                     s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
                                     crate::human_size(s.output_bytes)
                                 );
-                                if truncate_id != 0 {
-                                    let (row_stream_id, part_sc) = {
-                                        let p = part.borrow();
-                                        (p.row_stream_id, p.stream_client.clone())
-                                    };
-                                    if let Err(e) =
-                                        part_sc.truncate(row_stream_id, truncate_id).await
-                                    {
-                                        tracing::warn!("auto-trim truncate: {e}");
-                                    }
+                                if let Err(e) =
+                                    truncate_unreferenced_row_prefix(&part, part_id).await
+                                {
+                                    tracing::warn!(part_id, "auto-trim: row stream truncate: {e:#}");
                                 }
                             }
                             Err(e) => tracing::error!("auto-trim compaction: {e}"),
@@ -2146,7 +2130,7 @@ pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>
     if overlap == 1 {
         return tbls.iter().map(|t| t.estimated_size).sum();
     }
-    let (compact_tbls, _) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+    let compact_tbls = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
     compact_tbls.iter().map(|t| t.estimated_size).sum()
 }
 
@@ -2205,7 +2189,7 @@ pub(crate) fn refresh_metrics(part: &Rc<RefCell<PartitionData>>) {
     metrics.sst_out_of_range_bytes.store(sst_oor, Relaxed);
 
     let minor_pending: u64 = if overlap == 0 {
-        let (picked, _) = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
+        let picked = pickup_tables(&tbls, 2 * MAX_SKIP_LIST);
         picked.iter().map(|t| t.estimated_size).sum()
     } else {
         0
@@ -2218,9 +2202,110 @@ pub(crate) fn refresh_metrics(part: &Rc<RefCell<PartitionData>>) {
     // advisory layer treats 0 in these dimensions as "no signal".
 }
 
-pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<TableMeta>, u64) {
+/// The row-stream extent to truncate before: the first one, in STREAM order,
+/// that must be kept — one a live table sits in, or the floor of a queued
+/// flush. Everything ahead of it holds no SST anyone will read. `None` =
+/// nothing to drop. With nothing to keep, only the tail stays.
+///
+/// This is the only sound basis. The truncate point used to come from the
+/// table list's ORDER (the head extent, or the last input's extent), which is
+/// not stream order: a minor compaction's output takes the oldest input's slot
+/// but is written to the newest extent, and a merged partition lists each
+/// source's tables in turn. The row stream was then cut past extents live
+/// tables still referenced; the manager deleted them, and the partition could
+/// not reopen from its checkpoint (`repro_truncate_point_skips_a_still_
+/// referenced_extent`).
+pub(crate) fn row_truncate_point(
+    row_extent_ids: &[u64],
+    keep_extents: &HashSet<u64>,
+) -> Option<u64> {
+    let cut = if keep_extents.is_empty() {
+        row_extent_ids.len().checked_sub(1)?
+    } else {
+        // A kept extent missing from the stream is already damage; cutting on
+        // the strength of the rest could only add to it.
+        if !keep_extents.iter().all(|e| row_extent_ids.contains(e)) {
+            return None;
+        }
+        row_extent_ids.iter().position(|e| keep_extents.contains(e))?
+    };
+    (cut > 0).then(|| row_extent_ids[cut])
+}
+
+/// The row extents a truncate must keep: every live table's, plus the floor of
+/// every queued flush (see `truncate_unreferenced_row_prefix`). `None` = a
+/// queued flush has no floor, so nothing may be cut.
+pub(crate) fn row_keep_set(
+    tables: &[TableMeta],
+    queued_floors: impl IntoIterator<Item = Option<u64>>,
+) -> Option<HashSet<u64>> {
+    let mut keep: HashSet<u64> = tables.iter().map(|t| t.extent_id).collect();
+    for floor in queued_floors {
+        keep.insert(floor?);
+    }
+    Some(keep)
+}
+
+/// Drop the row-stream prefix nothing will read (`row_truncate_point`). Runs
+/// after a compaction, whose checkpoint is already durable: the live tables are
+/// that checkpoint's plus any later flush, so nothing a recovery could load is
+/// dropped.
+///
+/// A queued flush may already have appended its SST to an extent the table
+/// list does not name yet (the table joins at commit), and after a roll that
+/// extent can sit ahead of every listed one. Each imm's rotation-time row floor
+/// (`PartitionData::imm_row_floors`) bounds it: the SST lands at or after that
+/// extent, so keeping it keeps the SST. An imm frozen with no table listed has
+/// no floor, and then nothing is cut this time.
+///
+/// What to keep is taken BEFORE the stream is read: a flush that commits or
+/// starts after that appends at the tail, which is never cut, and every kept
+/// extent is then certainly in the list read.
+async fn truncate_unreferenced_row_prefix(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+) -> Result<()> {
+    let (row_stream_id, part_sc, keep) = {
+        let p = part.borrow();
+        let floors = p.imm_row_floors.borrow();
+        let queued = p
+            .imm
+            .iter()
+            .map(|imm| floors.get(&(Arc::as_ptr(imm) as usize)).copied().flatten());
+        let Some(keep) = row_keep_set(&p.tables, queued) else {
+            return Ok(());
+        };
+        (p.row_stream_id, p.stream_client.clone(), keep)
+    };
+    let row_extent_ids = part_sc.get_stream_info(row_stream_id).await?.extent_ids;
+    let Some(cut) = row_truncate_point(&row_extent_ids, &keep) else {
+        if !keep.iter().all(|e| row_extent_ids.contains(e)) {
+            tracing::error!(
+                part_id,
+                row_stream_id,
+                ?row_extent_ids,
+                "live tables reference row extents missing from the row stream; \
+                 not truncating"
+            );
+        }
+        return Ok(());
+    };
+    part_sc.truncate(row_stream_id, cut).await?;
+    tracing::info!(
+        part_id,
+        row_stream_id,
+        before = cut,
+        "row stream: dropped the extents no live table references"
+    );
+    Ok(())
+}
+
+/// Which tables a minor compaction merges. Selection only: which row-stream
+/// extents may then be dropped is `truncate_unreferenced_row_prefix`'s question,
+/// answered from what the tables reference, never from their order here.
+pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> Vec<TableMeta> {
     if tables.len() < 2 {
-        return (vec![], 0);
+        return vec![];
     }
 
     let total_size: u64 = tables.iter().map(|t| t.estimated_size).sum();
@@ -2233,25 +2318,18 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
     let head_threshold = (HEAD_RATIO * total_size as f64).round() as u64;
 
     if head_size < head_threshold {
-        let head_total = tables.iter().filter(|t| t.extent_id == head_extent).count();
         let chosen: Vec<TableMeta> = tables
             .iter()
             .filter(|t| t.extent_id == head_extent)
             .take(COMPACT_N)
             .cloned()
             .collect();
-        let truncate_id = tables
-            .iter()
-            .find(|t| t.extent_id != head_extent)
-            .map(|t| t.extent_id)
-            .unwrap_or(0);
-
         let mut tbls_sorted = tables.to_vec();
         tbls_sorted.sort_by_key(|t| t.last_seq);
         let mut chosen_sorted = chosen.clone();
         chosen_sorted.sort_by_key(|t| t.last_seq);
         if chosen_sorted.is_empty() {
-            return (vec![], 0);
+            return vec![];
         }
 
         let start_seq = chosen_sorted[0].last_seq;
@@ -2270,22 +2348,10 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
                 break;
             }
         }
-        // `truncate_id` asks the manager to delete every extent BEFORE it, so
-        // returning it asserts the head extent is fully drained. That holds only
-        // if the chosen set was the WHOLE head extent — `take(COMPACT_N)` caps
-        // it, so with more head tables than that, compaction consumes the oldest
-        // few and the rest stay live inside the extent this would delete. Their
-        // keys become unservable and the checkpoint references an SST in a
-        // deleted extent, so the partition does not reopen. Compact them anyway;
-        // just don't claim the extent is empty.
-        if ci == chosen_sorted.len() && chosen_sorted.len() == head_total && compact_tbls.len() >= 2
-        {
-            return (compact_tbls, truncate_id);
-        }
         if compact_tbls.len() >= 2 {
-            return (compact_tbls, 0);
+            return compact_tbls;
         }
-        return (vec![], 0);
+        return vec![];
     }
 
     // Size-tiered rule
@@ -2325,9 +2391,9 @@ pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> (Vec<Tab
         i += 1;
     }
     if compact_tbls.len() >= 2 {
-        return (compact_tbls, 0);
+        return compact_tbls;
     }
-    (vec![], 0)
+    vec![]
 }
 
 // streaming `do_compact`. The earlier implementation built a
@@ -5211,60 +5277,124 @@ mod fence_classifier_tests {
 
 #[cfg(test)]
 mod compaction_truncate_tests {
-    use super::pickup_tables;
+    use super::{pickup_tables, row_keep_set, row_truncate_point};
     use crate::TableMeta;
+    use std::collections::HashSet;
+
+    const MB: u64 = 1024 * 1024;
 
     fn t(extent_id: u64, last_seq: u64, size: u64) -> TableMeta {
         TableMeta {
             extent_id,
-            offset: 0,
+            offset: last_seq, // distinct per table, so `loc()` tells them apart
             len: size,
             estimated_size: size,
             last_seq,
         }
     }
 
-    /// `truncate_id` tells the manager to drop every extent BEFORE it — so
-    /// returning the second extent means "the head extent is fully drained".
-    /// That claim is only true if compaction consumed EVERY table in the head
-    /// extent, not just the ones it chose.
-    ///
-    /// The head-extent rule arms once the head is a minority of total bytes,
-    /// which many small SSTs satisfy. With more than COMPACT_N of them, the
-    /// oldest COMPACT_N are compacted and the rest stay live — pointing into an
-    /// extent the truncate is about to delete. The partition then cannot serve
-    /// those keys, and its checkpoint references an SST in a deleted extent, so
-    /// it does not reopen.
-    #[test]
-    fn head_extent_is_only_truncated_once_every_one_of_its_tables_is_consumed() {
-        // Head extent 10 holds 8 small SSTs; extent 11 holds one big one, so
-        // the head is well under HEAD_RATIO of the total and the rule arms.
-        let mut tables: Vec<TableMeta> = (0..8).map(|i| t(10, i + 1, 10 * 1024 * 1024)).collect();
-        tables.push(t(11, 100, 4 * 1024 * 1024 * 1024));
-
-        let (picked, truncate_id) = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
-        assert!(!picked.is_empty(), "the head-extent rule should have armed");
-        assert!(
-            picked.len() < 8,
-            "precondition: not all head tables fit in one compaction"
-        );
-        assert_eq!(
-            truncate_id, 0,
-            "asked to truncate past extent 10 while {} of its tables are still live",
-            8 - picked.len()
-        );
+    /// Extents a truncate before `cut` drops that a live table references.
+    fn dropped_but_live(row_stream: &[u64], cut: Option<u64>, live: &HashSet<u64>) -> Vec<u64> {
+        let Some(cut) = cut else { return Vec::new() };
+        let pos = row_stream.iter().position(|&e| e == cut).expect("cut is in the stream");
+        row_stream[..pos].iter().copied().filter(|e| live.contains(e)).collect()
     }
 
-    /// The case truncation exists for: the head extent fits in one compaction,
-    /// so after it there is genuinely nothing left there.
-    #[test]
-    fn a_fully_consumed_head_extent_is_truncated() {
-        let mut tables: Vec<TableMeta> = (0..3).map(|i| t(10, i + 1, 10 * 1024 * 1024)).collect();
-        tables.push(t(11, 100, 4 * 1024 * 1024 * 1024));
+    /// What the live tables are once `picked` is merged into one output
+    /// written to the stream's tail.
+    fn live_after(tables: &[TableMeta], picked: &[TableMeta], tail: u64) -> HashSet<u64> {
+        let picked: HashSet<(u64, u64)> = picked.iter().map(|t| t.loc()).collect();
+        let mut live: HashSet<u64> = tables
+            .iter()
+            .filter(|t| !picked.contains(&t.loc()))
+            .map(|t| t.extent_id)
+            .collect();
+        live.insert(tail);
+        live
+    }
 
-        let (picked, truncate_id) = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
-        assert_eq!(picked.len(), 3, "all three head tables should compact");
-        assert_eq!(truncate_id, 11, "head extent is drained, so it can go");
+    /// Table order is not row-stream order. A minor compaction skips a big
+    /// full-memtable SST, merges small ones after it, and inserts the output at
+    /// the oldest input's slot although its bytes sit in the NEWEST extent. The
+    /// old head rule then took "the next table's extent" (12) as the truncate
+    /// point and deleted extent 11, which live tables still reference — the
+    /// shape of the partition that could not reopen.
+    #[test]
+    fn repro_truncate_point_skips_a_still_referenced_extent() {
+        let row_stream = [10u64, 11, 12];
+        let tables = vec![
+            t(10, 1, 100 * MB),
+            t(10, 2, 100 * MB),
+            t(12, 5, 20 * MB), // an earlier compaction's output
+            t(11, 6, 300 * MB),
+            t(11, 7, 300 * MB),
+            t(12, 8, 10 * MB),
+        ];
+        let picked = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
+        assert_eq!(picked.len(), 2, "precondition: the head rule takes extent 10's tables");
+        let live = live_after(&tables, &picked, 12);
+        let cut = row_truncate_point(&row_stream, &live);
+        assert_eq!(dropped_but_live(&row_stream, cut, &live), Vec::<u64>::new());
+        assert_eq!(cut, Some(11), "extent 10 is fully consumed and goes");
+    }
+
+    /// More head tables than one compaction takes: the rest stay live in the
+    /// head extent, so nothing may be dropped.
+    #[test]
+    fn a_partly_consumed_head_extent_is_kept() {
+        let mut tables: Vec<TableMeta> = (0..8).map(|i| t(10, i + 1, 10 * MB)).collect();
+        tables.push(t(11, 100, 4 * 1024 * MB));
+        let picked = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
+        assert!(!picked.is_empty() && picked.len() < 8, "precondition");
+        let live = live_after(&tables, &picked, 11);
+        assert_eq!(row_truncate_point(&[10, 11], &live), None);
+    }
+
+    #[test]
+    fn a_fully_consumed_head_extent_is_dropped() {
+        let mut tables: Vec<TableMeta> = (0..3).map(|i| t(10, i + 1, 10 * MB)).collect();
+        tables.push(t(11, 100, 4 * 1024 * MB));
+        let picked = pickup_tables(&tables, 2 * crate::MAX_SKIP_LIST);
+        assert_eq!(picked.len(), 3);
+        let live = live_after(&tables, &picked, 12);
+        assert_eq!(row_truncate_point(&[10, 11, 12], &live), Some(11));
+    }
+
+    /// A merged partition's row stream repeats CoW-shared extents; the manager
+    /// truncates by FIRST occurrence, and so does the point.
+    #[test]
+    fn stream_order_decides_not_extent_ids_or_repeats() {
+        let live: HashSet<u64> = [7u64].into_iter().collect();
+        assert_eq!(row_truncate_point(&[20, 7, 30, 7], &live), Some(7));
+        let live: HashSet<u64> = [30u64, 7].into_iter().collect();
+        assert_eq!(row_truncate_point(&[20, 7, 30], &live), Some(7));
+    }
+
+    /// A queued flush may have appended its SST to extent 11 before the stream
+    /// rolled to 12, where the compaction then wrote; its table is not listed
+    /// until the flush commits. The imm's rotation-time floor (11) keeps it.
+    #[test]
+    fn a_queued_flush_floor_stops_the_cut_before_its_sst() {
+        let tables = vec![t(12, 9, 20 * MB)];
+        let keep = row_keep_set(&tables, [Some(11)]).expect("the imm has a floor");
+        assert_eq!(row_truncate_point(&[10, 11, 12], &keep), Some(11));
+        let keep = row_keep_set(&tables, []).unwrap();
+        assert_eq!(row_truncate_point(&[10, 11, 12], &keep), Some(12), "no flush queued");
+        assert!(row_keep_set(&tables, [Some(11), None]).is_none(), "an imm without a floor");
+    }
+
+    #[test]
+    fn no_table_keeps_only_the_tail() {
+        assert_eq!(row_truncate_point(&[10, 11, 12], &HashSet::new()), Some(12));
+        assert_eq!(row_truncate_point(&[10], &HashSet::new()), None);
+    }
+
+    /// A live table in an extent the stream no longer has is damage already
+    /// done; the truncate must not act on the rest.
+    #[test]
+    fn a_live_extent_missing_from_the_stream_stops_the_truncate() {
+        let live: HashSet<u64> = [9u64, 12].into_iter().collect();
+        assert_eq!(row_truncate_point(&[10, 11, 12], &live), None);
     }
 }
 

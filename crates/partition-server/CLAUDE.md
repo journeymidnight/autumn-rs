@@ -835,24 +835,61 @@ auto-trim above `MAX_SST_BEFORE_AUTO_COMPACT`, and any minor dispatched over
 successful major, in every arm that runs one — it must never clear `has_overlap`.
 
 `pickup_tables` selects tables via one of two strategies:
-- **Head-extent**: if the oldest extent's tables are < 30% of total data
-  (`HEAD_RATIO`), pick up to 5 (`COMPACT_N`) tables from it — clears old extents to
-  enable `truncate` on `row_stream` (freeing disk/logStream extents).
-
-  INVARIANT: `truncate_id` is returned ONLY when the chosen set is the WHOLE head
-  extent. `handle_truncate` removes every extent BEFORE the target
-  (`extent_ids[..pos]`), so returning it asserts the head is fully drained — and
-  `take(COMPACT_N)` caps the set. With more head-extent tables than that,
-  compaction consumes the oldest few while the rest stay live inside the extent
-  this would delete: their keys become unservable and the persisted checkpoint
-  references an SST in a deleted extent, so the partition does not reopen.
-  Compaction still proceeds in that case; it just doesn't claim the extent is
-  empty. `background::compaction_truncate_tests` pins both directions (a
-  partially-consumed head is not truncated; a fully-consumed one still is).
+- **Head-extent**: if the extent of the FIRST listed table holds < 30% of total
+  data (`HEAD_RATIO`), pick up to 5 (`COMPACT_N`) tables from it, to empty old
+  extents so the row stream can be truncated.
 - **Size-tiered**: sort tables by sequence, find consecutive "small" tables
   (< 32MB = `COMPACT_RATIO * MAX_SKIP_LIST`), pick up to `COMPACT_N`.
 
-Runs `do_compact(major=false)`.
+Runs `do_compact(major=false)`. `pickup_tables` only SELECTS; it says nothing
+about truncation (next section).
+
+### Row-stream truncation = the first extent a live table references
+
+INVARIANT: after every successful compaction (dispatched major/minor, expiry
+major, auto-trim) `truncate_unreferenced_row_prefix` drops the row-stream prefix
+before `row_truncate_point` — the first extent, in STREAM order (first
+occurrence; the manager truncates by first occurrence too), in the keep set
+`row_keep_set`: the extent of every table in `p.tables`, plus the ROW FLOOR of
+every queued imm. It runs after the compaction's checkpoint is durable, and
+`p.tables` is that checkpoint's set plus later flushes, so no SST a recovery
+could load is dropped. With nothing to keep, only the tail stays; a kept extent
+the stream does not have stops the truncate with an ERROR.
+
+The row floor (`PartitionData::imm_row_floors`, captured in `rotate_active`
+beside `imm_vp_heads`, removed at the commit pop): the extent of the newest
+table listed when the imm froze. A queued imm's SST may already sit in an
+extent the list does not name yet — the table joins only at commit — and after
+a roll that extent can be ahead of every listed one. The SST is appended at the
+tail after the imm froze, so it lands at or after the floor; keeping the floor
+keeps it. An imm frozen with no table listed has no floor, and then nothing is
+cut. (A first version skipped the truncate whenever ANY imm was queued; under
+sustained writes one nearly always is, so compacted-away SSTs were never
+dropped.) The keep set is taken BEFORE the stream is read: a flush that commits
+or starts after that appends at the tail, which is never cut, and every kept
+extent is then certainly in the list read — reading the stream first made a
+flush committing in between look like a missing extent.
+
+Why: the truncate point used to come from the table list's ORDER — the head
+extent's successor (minor) or the last input's extent (major) — and list order
+is not stream order. A minor compaction skips a big full-memtable SST, merges
+small ones after it, and inserts the output at the oldest input's slot although
+it is written to the newest extent; a merged partition lists each source's
+tables in turn. The cut then went past extents live tables still referenced,
+the manager deleted them (files on every EN), and the partition failed to reopen
+on the first missing SST — observed in production: the checkpoint listed 37
+SSTs, 28 in three deleted extents, the row stream down to one. Those SSTs' data
+is lost. An earlier patch that refused the cut only when the head extent was
+partly consumed covered one ordering of the same flaw. The manager cannot check
+this — it never reads checkpoints — so the PS is the only place.
+`background::compaction_truncate_tests` (the production ordering is
+`repro_truncate_point_skips_a_still_referenced_extent`; the floor is
+`a_queued_flush_floor_stops_the_cut_before_its_sst`),
+`crates/manager/tests/system_row_truncate_live_refs.rs` (multi-extent row stream
+via `MSG_ROLL_TAILS`, auto-trim + major, reopen) and
+`system_row_truncate_queued_flush.rs` (flush paused with an imm queued, expiry
+major truncates anyway, the queued keys survive a reopen). Each truncate logs
+`row stream: dropped the extents no live table references` with the cut.
 
 ### Major Compaction (`compact_tx`, e.g. after overlap detected)
 `do_compact(major=true)`: processes all tables, additionally drops tombstones
@@ -917,7 +954,7 @@ are refused. `sstable::reader::discards_only_tests`,
   4. Atomic swap: write lock → remove old SstReaders + tables → push new_readers
      → save_table_locs_raw to meta_stream (single linearization point; crash before
      this leaves new SSTs as orphan bytes and recovery loads the prior checkpoint)
-  5. If truncate_id returned: truncate row_stream up to that extent
+  5. Caller: truncate row_stream before the first extent a live table references
 ```
 The merge never materializes all kept entries into an accumulator Vec — it streams
 one builder at a time to keep peak compaction RAM ≈ inputs + one output builder.

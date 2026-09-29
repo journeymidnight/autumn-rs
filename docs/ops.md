@@ -1249,6 +1249,34 @@ still won't reclaim" case. Guard:
 `crates/manager/tests/system_recovery_vp_seed.rs`. The vp_head is now a true
 content boundary on every path (flush, compaction, and recovery).
 
+### Row-stream truncation never drops an SST the checkpoint lists
+
+After a compaction the PS drops the row-stream extents ahead of the first extent
+any live SST sits in (stream order), and logs it:
+
+```bash
+grep "row stream: dropped the extents" <ps.log>   # part_id, row_stream_id, before=<extent>
+```
+
+It used to derive the cut from the ORDER of its table list, which after a minor
+compaction or a merge is not stream order, and could drop extents live SSTs were
+in. The symptom is a partition that fails to open on a missing row extent while
+its checkpoint still lists SSTs there. To check a partition by hand, compare the
+checkpoint's SST extents with the row stream:
+
+```bash
+autumn-op --manager <MGR> info --part <P> --json   # extents[] with role "row"
+# checkpoint SSTs: the last TableLocations record in the meta stream
+# (tests: support::decode_last_table_locations). Every locs[].extent_id must
+# be one of those row extents.
+```
+
+Data in SSTs whose extents were already deleted is gone; repairing such a
+partition means rewriting its checkpoint without them (an audited, one-off
+operation, not something the PS does). Regression tests:
+`background::compaction_truncate_tests`,
+`crates/manager/tests/system_row_truncate_live_refs.rs`.
+
 ### Reading GC replay-floor protection — a skipped `forcegc` is usually CORRECT
 
 GC protects any NON-EMPTY `log_stream` extent that sits AT/BEFORE the recovery

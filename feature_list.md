@@ -14,6 +14,13 @@
 
 ## Active
 
+### F-ROW-TRUNCATE-LIVE-REFS — compaction 截断 row stream 不得删除仍被 checkpoint 引用的 extent
+- **Trigger** (2026-09-29 用户，线上): 最新 checkpoint 引用 37 个 SST，其中 28 个位于已被删除的 extent 996、1029、1034，row stream 只剩 1066，分区无法打开，数据丢失。
+- **Scope**: 截断点不再由表序推出，改为按 row stream 物理顺序取第一个被现存表引用的 extent；major、minor、过期 major、auto-trim 共用一个函数；有待 flush 的 imm 时跳过本轮截断；每次截断记日志；`pickup_tables` 只负责选表。
+- **Acceptance**: 线上表序（大 SST 被跳过、合并输出插回旧位置）在旧逻辑下单测复现为删除仍被引用的 extent，新逻辑不删；消融变红；多 extent row stream 上 auto-trim 加 major 之后，checkpoint 列出的 SST 全在 stream 中，死前缀被删，重启后数据完整。
+- `passes: true`
+- **notes** (2026-09-29): "有待 flush 的 imm 时跳过本轮截断" 经评审改为：每个排队 imm 在冻结时记下当时最新表所在的 extent 作为下界，截断不越过它（持续写入时 imm 几乎总在排队，跳过会让死 SST 永不回收）。
+
 ### F-PS-READY — PS 就绪 = 所有分配给它的分区都已打开
 - **Trigger** (2026-09-29 用户): autumn-op 看 PS 状态只看心跳通不通；PS 必须把所有分区都打开后才算 ready。
 - **Scope**: PS 心跳上报已打开分区 `(part_id, region_epoch)`；manager 内存保存并在 overview 给出 `open_count` 与唯一的 `ready` 定义；autumn-op info / dashboard 显示；cluster.sh 与 autumn-deploy 启动等待改为等 ready。

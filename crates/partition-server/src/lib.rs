@@ -1137,6 +1137,13 @@ pub(crate) struct PartitionData {
     /// `commit_flush_outcome` (pop). Never removed on a flush ERROR (the imm stays
     /// queued for retry and keeps its vp).
     imm_vp_heads: RefCell<HashMap<usize, (u64, u64)>>,
+    /// each queued imm's ROW-stream floor, captured at rotation: the extent of
+    /// the newest table then listed (`None` = no table). The imm's SST is
+    /// appended later, at the tail, so it lands at or after this extent — which
+    /// is what lets `truncate_unreferenced_row_prefix` cut while flushes are
+    /// queued without dropping the extent an in-flight SST lands in before its
+    /// table is listed. Same lifecycle as `imm_vp_heads`.
+    pub(crate) imm_row_floors: RefCell<HashMap<usize, Option<u64>>>,
     flush_tx: mpsc::UnboundedSender<()>,
     compact_tx: mpsc::Sender<CompactTask>,
     gc_tx: mpsc::Sender<GcTask>,
@@ -6524,6 +6531,7 @@ async fn partition_thread_main(
         imm: VecDeque::new(),
         flushing_imm_ptrs: RefCell::new(HashSet::new()),
         imm_vp_heads: RefCell::new(HashMap::new()),
+        imm_row_floors: RefCell::new(HashMap::new()),
         flush_tx,
         compact_tx,
         gc_tx,
@@ -10099,6 +10107,16 @@ pub(crate) fn rotate_active(part: &mut PartitionData) {
     part.imm_vp_heads
         .borrow_mut()
         .insert(Arc::as_ptr(&arc) as usize, (part.vp_extent_id, part.vp_offset));
+    // Every listed table is already in the row stream, so its extent is at or
+    // before the tail this imm's SST will be appended to.
+    let row_floor = part
+        .tables
+        .iter()
+        .max_by_key(|t| t.last_seq)
+        .map(|t| t.extent_id);
+    part.imm_row_floors
+        .borrow_mut()
+        .insert(Arc::as_ptr(&arc) as usize, row_floor);
     part.imm.push_back(arc);
     let _ = part.flush_tx.unbounded_send(());
 }
@@ -10304,6 +10322,7 @@ async fn commit_flush_outcome_inner(
             // release the imm's captured vp_head on pop (the only
             // queue removal). Error paths keep it — the imm stays queued for retry.
             p.imm_vp_heads.borrow_mut().remove(&ptr);
+            p.imm_row_floors.borrow_mut().remove(&ptr);
         }
         // wake partition_loop on imm-full back-pressure.
         let _ = p.imm_drained_tx.unbounded_send(());
