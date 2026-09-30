@@ -56,6 +56,13 @@
 - `passes: true`
 - **notes** (2026-09-30): system_merge_minor_compaction_order；另修 compaction 分块的 last_seq 差一（把下一块第一条的 seq 记到上一块）。未修（非本条范围，已报告）：merge 恢复按字节切块会把同一 key 的版本切进两块（ffb4e8a），排序救不了，要按 key 边界切；GC relocation 可能打破"每次 flush 覆盖更晚的 seq 区间"（reviewer 推断，未复现）；MSG_DIAG_TRACE_KEY 的 fullscan 对 paged SST 一律返回 0。
 
+### BUG-MERGE-REPLAY-NOT-NEEDED — split/merge 之后恢复不该回放源分区的 log
+- **Trigger** (2026-09-30 用户): "merge 还是有问题！， merge先stop，然后flush，所有merge就完全不需要从log stream恢复啊" → "不兼容" → "都放行"（撤掉 8c9d267 的 covered-prefix 标记）。
+- **Scope**: split/merge 的冻结 drain 一律在 log 末尾写 checkpoint（含已接受的 fence floor）；merge 后第一次打开从最新的源游标开始回放，解析不到的游标跳过；去重统一用回放前的全局 max seq。撤掉 etcd 标记、split 冻结期内分配新 tail、`MSG_STREAM_REPLAY_INFO`、按源分区偏移与去重、merge 恢复分块 flush；`log_extent_count` 不再计算（写 0，每次 flush 省一次 manager RPC）；`convert_sst` 去掉 NOT_INTACT 帧。不兼容旧 build 做的、survivor 尚未打开过的 merge。
+- **Acceptance**: merge 后第一次打开回放 < 64 KiB（从最早游标开始的消融回放 1,065,000 字节变红）；split 前只写在 WAL 的 fence bump 在两个子分区重启后仍然生效（checkpoint 不带 floor 的消融变红）；merge/split/恢复/崩溃/lease 集成测试全过。
+- `passes: true`
+- **notes** (2026-09-30): 两轮 opus 评审。第一轮高危：merge 时游标解析不到就拒绝打开，会因空 tail 被回收而永久打不开 → 改为跳过。第二轮高危：跳过 + 去重门槛 0 会让被覆盖的旧记录遮住 SST 里的新值 → 去重统一用全局 max seq（这条路径没有确定性测试：需要源 tail 被回收且覆盖写所在 extent 被 GC 回收，靠推理覆盖）。
+
 ### BUG-CHAOS-RECLAIM-RESIDUE — chaos 的物理回收检查在 fence 后重建的节点上留有旧副本
 - **Trigger** (2026-09-29，加 PS 重启 chaos 时发现): 全动作集 system_chaos 7 轮里 4 轮 `verify_gc_reclaim` 报 `physical reclaim incomplete`，残留文件都在被 KillThenFence/fence 过、随后由 recovery 在别处重建了副本的节点上（例：extent 22 在 node 1）。旧版与新版 PS 都出现。
 - **Scope**: 查清是检查过严（删除只发给当前成员，非成员残留靠 EN reconcile：3 轮 × 5 min 才收）还是产品缺陷（被替换下来的副本该在重建完成时就删），据此修检查或修产品。

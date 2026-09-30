@@ -2479,7 +2479,6 @@ async fn checkpoint_and_truncate_row_prefix(
         &tables,
         vp.0,
         vp.1,
-        log_ids.len() as u32,
         floors,
     )
     .await?;
@@ -3019,7 +3018,6 @@ pub(crate) async fn do_compact(
             &tables_snapshot,
             ckpt_vp_eid,
             ckpt_vp_off,
-            log_extent_ids.len() as u32,
             floors_snapshot,
         )
         .await?;
@@ -3075,7 +3073,6 @@ pub(crate) async fn do_compact(
         &tables_snapshot,
         ckpt_vp_eid,
         ckpt_vp_off,
-        log_extent_ids.len() as u32,
         floors_snapshot,
     )
     .await?;

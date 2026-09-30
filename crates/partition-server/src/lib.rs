@@ -1247,9 +1247,8 @@ pub(crate) struct PartitionData {
     /// cursor when there is exactly ONE checkpoint record: it is durable, and
     /// recovery replays from it. With several (a merge's sources) the open
     /// publishes one merged record before serving (`publish_merged_checkpoint`)
-    /// and sets this from it; until then it is the conservative MIN — punching
-    /// log extents while two sources' dedup regions are computed from extent
-    /// positions would shift them. A compaction's ack does not set it: its
+    /// and sets this from it; until then it is the conservative MIN. A
+    /// compaction's ack does not set it: its
     /// append may ack after a newer flush's, which would move the floor back;
     /// the next flush covers it.
     durable_ckpt_vp: Cell<(u64, u64)>,
@@ -7660,9 +7659,16 @@ async fn try_complete_freeze_drain(
     // completion barrier for both compaction and GC. Do not wait on the
     // informational `compact_inflight` flag here: a task can set it before it
     // queues on this gate, and waiting for that blocked task would deadlock.
-    if need_merge_drain && drain_err.is_none() {
-        if let Err(e) = publish_merge_source_checkpoint(part).await {
-            let msg = format!("publish merge-source checkpoint: {e:#}");
+    // Both a merge and a split publish a checkpoint at the committed log end
+    // here, writes stopped and memtable drained, even when the drain flushed
+    // nothing: it is what lets recovery skip every source extent (a merged
+    // survivor starts at the latest source cursor; a split child starts at
+    // this one). Its fence floors are the admitted ones: a WAL-only fence bump
+    // committed since the last flush is before this cursor, so replay no
+    // longer reaches it and the checkpoint must carry it.
+    if drain_err.is_none() {
+        if let Err(e) = publish_freeze_checkpoint(part).await {
+            let msg = format!("publish freeze checkpoint: {e:#}");
             tracing::error!(part_id, "{msg}");
             drain_err = Some(msg);
         }
@@ -9040,144 +9046,6 @@ fn select_clean_replica_chunk(
     (clean, corrupt)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ReplaySourceCheckpoint {
-    cursor_pos: usize,
-    cursor_offset: u64,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct ReplayExtentPlan {
-    extents: Vec<(usize, u64, u64)>,
-    source_cursor_offsets_applied: bool,
-    /// A valid marker proves that the planned suffix belongs to the unified
-    /// post-boundary sequence space, even when a later ordinary checkpoint
-    /// already chose a stronger replay cursor.
-    covered_prefix_applied: bool,
-    /// True only when the marker actually raised the replay lower bound.
-    covered_prefix_rewrote_plan: bool,
-}
-
-/// Build the WAL extents recovery must scan.
-///
-/// After merge, every source checkpoint covers bytes before its own
-/// `(cursor_pos, cursor_offset)`. The old global plan began at the earliest
-/// source cursor, but read every later source's cursor extent from byte zero.
-/// That is correct but can re-read tens of GiB already covered by the later
-/// source's SSTs. Apply each resolved source's byte offset directly, while
-/// retaining the conservative global extent walk.
-///
-/// A manager-owned `covered_before` sidecar is a stronger lower bound. Merge
-/// and split publish it in the same etcd transaction that appends a fresh log
-/// tail, after the source was frozen, drained, and checkpointed. When its
-/// extent still belongs to this stream, all earlier extents are covered and
-/// replay may begin there at offset zero (or at a later ordinary checkpoint).
-/// A missing/dangling marker is the legacy case and keeps the conservative
-/// plan unchanged.
-fn plan_replay_extents(
-    log_extent_ids: &[u64],
-    chosen_pos: usize,
-    chosen_offset: u64,
-    source_checkpoints: &[ReplaySourceCheckpoint],
-    all_source_cursors_resolved: bool,
-    covered_before_extent_id: Option<u64>,
-    has_checkpoint: bool,
-) -> ReplayExtentPlan {
-    let global_plan = || {
-        let mut seen = HashSet::new();
-        log_extent_ids
-            .iter()
-            .enumerate()
-            .filter_map(|(pos, &eid)| {
-                if chosen_pos != usize::MAX && pos < chosen_pos {
-                    seen.insert(eid);
-                    None
-                } else if !seen.insert(eid) {
-                    None
-                } else {
-                    let start = if pos == chosen_pos { chosen_offset } else { 0 };
-                    Some((pos, eid, start))
-                }
-            })
-            .collect()
-    };
-
-    let mut source_cursor_offsets_applied = false;
-    let mut plan = if chosen_pos == usize::MAX
-        || !all_source_cursors_resolved
-        || source_checkpoints.len() < 2
-    {
-        global_plan()
-    } else {
-        let mut checkpoints = source_checkpoints.to_vec();
-        checkpoints.sort_by_key(|c| (c.cursor_pos, c.cursor_offset));
-        if checkpoints[0].cursor_pos != chosen_pos
-            || checkpoints[0].cursor_offset != chosen_offset
-            || checkpoints
-                .iter()
-                .any(|c| c.cursor_pos >= log_extent_ids.len() || c.cursor_pos < chosen_pos)
-        {
-            global_plan()
-        } else {
-            let mut cursor_offsets = HashMap::new();
-            for checkpoint in checkpoints {
-                cursor_offsets
-                    .entry(checkpoint.cursor_pos)
-                    .and_modify(|offset: &mut u64| {
-                        *offset = (*offset).min(checkpoint.cursor_offset)
-                    })
-                    .or_insert(checkpoint.cursor_offset);
-            }
-            let mut seen = HashSet::new();
-            let mut source_plan = Vec::new();
-            for (pos, &eid) in log_extent_ids.iter().enumerate() {
-                if pos < chosen_pos {
-                    seen.insert(eid);
-                    continue;
-                }
-                if seen.insert(eid) {
-                    let start_offset = cursor_offsets.get(&pos).copied().unwrap_or(0);
-                    source_plan.push((pos, eid, start_offset));
-                }
-            }
-            source_cursor_offsets_applied = true;
-            source_plan
-        }
-    };
-
-    let mut covered_prefix_applied = false;
-    let mut covered_prefix_rewrote_plan = false;
-    if has_checkpoint {
-        if let Some(marker_pos) = covered_before_extent_id
-            .and_then(|marker| log_extent_ids.iter().position(|&eid| eid == marker))
-        {
-            let plan_starts_before_marker = plan
-                .first()
-                .is_none_or(|(pos, _, _)| *pos < marker_pos);
-            if plan_starts_before_marker {
-                let mut seen: HashSet<u64> =
-                    log_extent_ids[..marker_pos].iter().copied().collect();
-                plan = log_extent_ids
-                    .iter()
-                    .enumerate()
-                    .skip(marker_pos)
-                    .filter_map(|(pos, &eid)| seen.insert(eid).then_some((pos, eid, 0)))
-                    .collect();
-                source_cursor_offsets_applied = false;
-                covered_prefix_rewrote_plan = true;
-            }
-            covered_prefix_applied = true;
-        }
-    }
-
-    ReplayExtentPlan {
-        extents: plan,
-        source_cursor_offsets_applied,
-        covered_prefix_applied,
-        covered_prefix_rewrote_plan,
-    }
-}
-
 async fn recover_partition(
     _part_id: u64,
     rg: &Range,
@@ -9216,7 +9084,7 @@ async fn recover_partition(
     // the splice puts both survivor's and victim's old meta_stream
     // extents into the merged stream; reading just the last extent
     // would lose half the table set.
-    let (meta_records, meta_records_intact): (Vec<TableLocations>, bool) =
+    let meta_records: Vec<TableLocations> =
         read_all_table_locations(meta_stream_id, part_sc)
             .await
             .context("union TableLocations from metaStream extents")?;
@@ -9233,8 +9101,7 @@ async fn recover_partition(
     // pre-split) have LOWER extent_ids than survivor's new extents, but
     // appear AFTER survivor's in stream order. So `min(extent_id)` does
     // NOT give the earliest stream position — we have to scan the list.
-    let (log_stream_info, covered_before_extent_id) =
-        part_sc.get_stream_replay_info(log_stream_id).await?;
+    let log_stream_info = part_sc.get_stream_info(log_stream_id).await?;
     let log_extent_ids: Vec<u64> = log_stream_info.extent_ids.clone();
     // Pre-build first-occurrence index. CoW-shared extents can appear
     // twice in the spliced extent_ids; the FIRST occurrence is the
@@ -9260,48 +9127,41 @@ async fn recover_partition(
     // SSTs listed by a checkpoint whose own cursor does not resolve. Only
     // their stamped vp_heads may stand in for it (below).
     let mut cursorless_locs: HashSet<(u64, u64, u64)> = HashSet::new();
-    // merge: declared at outer scope so the replay loop can compute
-    // per-meta_record source_max_seq below.
-    let mut loc_to_last_seq: HashMap<(u64, u64, u64), u64> = HashMap::new();
 
     if !meta_records.is_empty() {
-        // Each meta_record carries a (vp_extent_id, vp_offset) saying
-        // "this source's replay must include records from this position
-        // onward to recover everything its SST set doesn't already cover."
-        // Post-merge there are multiple checkpoints (one per pre-merge source
-        // partition). `chosen_pos` remains the conservative global anchor;
-        // `plan_replay_extents` below applies each later source's own byte
-        // offset when every source cursor resolves, without guessing source
-        // extent boundaries from checkpoint-time counts.
-        //
-        // Pre-this fix:
-        //   - an earlier version took max(vp_extent_id) — wrong for non-monotonic
-        //     splice; lost most data.
-        //   - Then min(vp_extent_id) — wrong for the OPPOSITE reason
-        //     (CoW victim extents have lower IDs but later stream
-        //     position); still lost data on 4/10 seeds.
-        // The correct ordering is by stream POSITION (index into
-        // extent_ids), not by extent_id value.
+        // More than one record = a merge's sources (the survivor's open
+        // publishes one merged record before it serves). Each was written by
+        // the merge freeze drain with writes stopped and the memtable flushed:
+        // its cursor is its source's committed log end and its SSTs hold
+        // everything before it. So nothing in either source's extents needs
+        // replay, and replay starts at the LATEST cursor by stream position —
+        // the log is `[survivor][victim][new tail]`, and only writes after
+        // the merge follow it. Starting at the earliest cursor re-read the
+        // victim's whole log on every merged open. A record whose cursor does
+        // not resolve is skipped: a drain on an empty tail points at `(T, 0)`,
+        // and once the merge seals T behind newer extents the sealed-empty
+        // sweep or GC may reclaim it — there was nothing to replay from it.
+        // Replay then starts earlier than needed, and with no cursor resolving
+        // it walks the whole log; the seq threshold below skips every flushed
+        // record, so this costs reading, not correctness.
+        let merged = meta_records.len() > 1;
         for r in &meta_records {
             let resolved = if r.vp_extent_id == 0 {
                 None // empty / not-yet-flushed checkpoint
             } else {
                 // None = the vp_head names an extent no longer in the stream
-                // (post-merge GC, a reclaimed sealed-empty tail, out-of-band
-                // truncate) — nothing to walk from there.
+                // (a reclaimed sealed-empty tail, out-of-band truncate) —
+                // nothing to walk from there.
                 first_pos_by_eid.get(&r.vp_extent_id).copied()
             };
             let Some(pos) = resolved else {
+                if merged {
+                    continue;
+                }
                 cursorless_locs.extend(r.locs.iter().map(|l| (l.extent_id, l.offset, l.len)));
                 continue;
             };
-            // Prefer earlier position; tie-break with smaller offset.
-            let cur_off = if chosen_pos == usize::MAX {
-                u64::MAX
-            } else {
-                recovered_vp_off
-            };
-            if pos < chosen_pos || (pos == chosen_pos && r.vp_offset < cur_off) {
+            if chosen_pos == usize::MAX || (pos, r.vp_offset) > (chosen_pos, recovered_vp_off) {
                 chosen_pos = pos;
                 recovered_vp_eid = r.vp_extent_id;
                 recovered_vp_off = r.vp_offset;
@@ -9440,7 +9300,6 @@ async fn recover_partition(
             if tbl_last_seq > max_seq {
                 max_seq = tbl_last_seq;
             }
-            loc_to_last_seq.insert((loc.extent_id, loc.offset, loc.len), tbl_last_seq);
 
             // An SST with no block holds no key (a compaction's discards-only
             // output), so none out of range — and its empty key bounds would
@@ -9495,111 +9354,17 @@ async fn recover_partition(
     sort_tables_by_seq(&mut tables, &mut sst_readers);
 
     // Replay logStream into the recovered memtable, skipping records already
-    // captured by the loaded SSTs.
-    //
-    // Dedup is PER SOURCE REGION, not a single global max_seq. A single
-    // max_seq is only sound for a single-partition timeline; post-merge the
-    // spliced log_stream carries records from TWO source partitions whose
-    // PS-seq counters were independent, so a union max would wrongly skip
-    // survivor's post-vp_head tail records whose ts ≤ victim's max but >
-    // survivor's. Per source the dedup IS sound because partition_loop uses
-    // FuturesOrdered — Phase 3 memtable inserts run in strict seq order, so a
-    // flushed SST satisfies "every seq ≤ last_seq is in this SST or an
-    // earlier one" for its OWN source.
-    //
-    // Per-source region table: each meta_record carries its source's
-    // log_stream extent count at flush time (`log_extent_count`). Sorted by
-    // vp_pos, the sources' regions in the spliced log_stream are cumulative:
-    //   record[i].region = [Σ_{j<i} count[j], Σ_{j≤i} count[j])
-    // Records whose vp_extent_id is no longer in the stream (GC'd / truncated)
-    // are skipped. A record with log_extent_count == 0 is legacy / unset —
-    // fall back to a single global dedup covering the whole stream. For each
-    // region, dedup = MAX seq across that source's SSTs; records at pos with
-    // ts > src_max need re-insert, ts ≤ src_max are already covered. E_new
-    // (post-merge new tail) sits past Σ counts → no region maps to it →
-    // dedup = 0 → replay everything (post-merge survivor writes).
-    struct SourceRegion {
-        end_excl: usize, // region = [prev_end, end_excl)
-        src_max: u64,
-    }
-    let mut records_meta: Vec<(usize, u64, u32, u64)> = Vec::new();
-    // (vp_pos, vp_offset, log_extent_count, src_max)
-    let mut any_zero_count = false;
-    for r in &meta_records {
-        if r.vp_extent_id == 0 {
-            continue;
-        }
-        let pos = match first_pos_by_eid.get(&r.vp_extent_id) {
-            Some(&p) => p,
-            None => continue,
-        };
-        if r.log_extent_count == 0 {
-            any_zero_count = true;
-        }
-        let src_max = r
-            .locs
-            .iter()
-            .filter_map(|loc| {
-                loc_to_last_seq
-                    .get(&(loc.extent_id, loc.offset, loc.len))
-                    .copied()
-            })
-            .max()
-            .unwrap_or(0);
-        records_meta.push((pos, r.vp_offset, r.log_extent_count, src_max));
-    }
-    let replay_checkpoints: Vec<ReplaySourceCheckpoint> = records_meta
-        .iter()
-        .map(|(pos, offset, _count, _max)| ReplaySourceCheckpoint {
-            cursor_pos: *pos,
-            cursor_offset: *offset,
-        })
-        .collect();
-    let all_source_cursors_resolved = records_meta.len() == meta_records.len();
-    let replay_plan = plan_replay_extents(
-        &log_extent_ids,
-        chosen_pos,
-        recovered_vp_off,
-        &replay_checkpoints,
-        all_source_cursors_resolved,
-        covered_before_extent_id,
-        meta_records_intact && !records_meta.is_empty(),
-    );
-    let mut records_meta_by_cursor = records_meta.clone();
-    records_meta_by_cursor.sort_by_key(|(p, _, _, _)| *p);
-    let mut source_regions: Vec<SourceRegion> = Vec::new();
-    if replay_plan.covered_prefix_applied {
-        // Every planned extent is at or after the transaction's fresh tail.
-        // Its sequence domain begins after the checkpointed prefix, so source
-        // max-seq dedup must not apply.
-    } else if any_zero_count || records_meta_by_cursor.is_empty() {
-        // Legacy / partial state: one virtual region covering the whole
-        // stream with dedup = global max_seq (pre-fix behavior).
-        source_regions.push(SourceRegion {
-            end_excl: log_extent_ids.len(),
-            src_max: max_seq,
-        });
-    } else {
-        let mut cum: usize = 0;
-        for (_pos, _offset, count, src_max) in &records_meta_by_cursor {
-            cum += *count as usize;
-            source_regions.push(SourceRegion {
-                end_excl: cum,
-                src_max: *src_max,
-            });
-        }
-    }
-    // dedup_at: find the source region whose [prev_end, end_excl)
-    // contains `pos`. Past all regions (E_new / post-final-source)
-    // → 0 (replay everything).
-    let dedup_at = |pos: usize| -> u64 {
-        for r in &source_regions {
-            if pos < r.end_excl {
-                return r.src_max;
-            }
-        }
-        0
-    };
+    // captured by the loaded SSTs: on one partition's timeline a record whose
+    // seq is <= the SSTs' max seq is in one of them, because partition_loop
+    // inserts in strict seq order (FuturesOrdered) and flushes commit in order.
+    // After a merge the same one threshold (the union max, taken before replay
+    // raises `max_seq`) is right: every record of either source is at or below
+    // that source's max, since each drained with writes stopped, and the
+    // merged partition's own writes start above the union (its seq counter is
+    // seeded from it). It matters when a source cursor was skipped and replay
+    // walks a flushed source region: without it a superseded record there
+    // would enter the memtable and shadow the newer value in an SST.
+    let replay_dedup = max_seq;
     let active = Memtable::new();
     if chosen_pos == usize::MAX && !tables.is_empty() {
         tracing::warn!(
@@ -9619,37 +9384,30 @@ async fn recover_partition(
     // `report_corrupt_replica` (isolation) BEFORE the partition serves (I1).
     let mut corrupt_per_extent: HashMap<u64, HashSet<u64>> = HashMap::new();
 
-    // Position-based replay-extent selection. Pre-this-fix used
-    // `eid < recovered_vp_eid → skip`, which is wrong post-merge because
-    // the spliced extent_ids list is non-monotonic in extent_id. See
-    // the chosen_pos selection above. Each entry carries its stream
-    // position so the per-extent `dedup_at(pos)` lookup can find the
-    // owning source's max_seq.
-    // merge: dedup by extent_id — CoW-shared log extents (e.g.,
-    // extent 12 shared by survivor + victim post-split) appear MULTIPLE
-    // times in the spliced extent_ids. Replaying them twice doubles
-    // each record's insertion AND attributes the duplicate occurrence
-    // to the WRONG source region. We replay each extent only at its
-    // FIRST occurrence (which has the correct source-region dedup).
-    // No resolvable cursor means replay everything from offset zero. With a
-    // cursor, the conservative fallback starts at the globally earliest one.
-    // When every source cursor resolves, use each source's own byte offset so
-    // a later victim cursor extent is not re-read from byte zero merely because
-    // the survivor's cursor precedes it in the spliced stream. Whole extents
-    // between cursors remain in the plan; their source boundaries are not
-    // provable from checkpoint-time extent counts.
-    let replay_extents = replay_plan.extents;
-    let source_cursor_offsets_applied = replay_plan.source_cursor_offsets_applied;
-    let covered_prefix_applied = replay_plan.covered_prefix_applied;
-    let covered_prefix_rewrote_plan = replay_plan.covered_prefix_rewrote_plan;
+    // Position-based replay-extent selection: from the chosen cursor to the
+    // end, each extent once at its FIRST occurrence (CoW-shared extents appear
+    // more than once in a merged log). extent_id order is not stream order
+    // after a merge, so positions are compared, never ids. No resolvable cursor
+    // means the whole log from offset zero.
+    let mut seen_extents: HashSet<u64> = HashSet::new();
+    let replay_extents: Vec<(usize, u64, u64)> = log_extent_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, &eid)| {
+            if chosen_pos != usize::MAX && pos < chosen_pos {
+                seen_extents.insert(eid);
+                None
+            } else if !seen_extents.insert(eid) {
+                None
+            } else {
+                Some((pos, eid, if pos == chosen_pos { recovered_vp_off } else { 0 }))
+            }
+        })
+        .collect();
     tracing::info!(
         target: "recover_trace",
         part_id = _part_id,
-        source_cursor_offsets_applied,
-        covered_prefix_applied,
-        covered_prefix_rewrote_plan,
-        meta_records_intact,
-        covered_before_extent_id,
+        n_meta_records = meta_records.len(),
         planned_extents = replay_extents.len(),
         total_log_extents = log_extent_ids.len(),
         "recover_partition: replay plan built"
@@ -9678,8 +9436,8 @@ async fn recover_partition(
     let replay_extents = Some(replay_extents);
     let replay_extent_count = replay_extents.as_ref().map_or(0, Vec::len);
     if let Some(extents) = replay_extents {
-        for (extent_pos, eid, start_off) in extents {
-            let extent_dedup = dedup_at(extent_pos);
+        for (_pos, eid, start_off) in extents {
+            let extent_dedup = replay_dedup;
             // retry extent reads during recovery instead of silently
             // skipping. A transient node failure should not cause permanent
             // data loss for un-checkpointed writes.
@@ -10179,26 +9937,20 @@ pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u
 pub(crate) async fn read_all_table_locations(
     stream_id: u64,
     sc: &Rc<StreamClient>,
-) -> Result<(Vec<TableLocations>, bool)> {
+) -> Result<Vec<TableLocations>> {
     let info = sc.get_stream_info(stream_id).await?;
     let mut out: Vec<TableLocations> = Vec::new();
-    let mut all_records_intact = true;
     for &eid in &info.extent_ids {
         let (payload, _end) = sc.read_bytes_from_extent(eid, 0, 0).await?;
         if payload.is_empty() {
             continue;
         }
-        // A buffer with no valid record is skipped but makes the integrity
-        // result false. Mid-stream corruption and a partial tail likewise
-        // preserve the last valid checkpoint while disabling covered-prefix
-        // marker use. Empty extents are common and do not affect integrity.
-        match decode_last_table_checkpoint_with_health(&payload) {
-            Ok((locs, intact)) => {
-                out.push(locs);
-                all_records_intact &= intact;
-            }
+        // Empty extents (carry no records) are common — skipped above. An
+        // extent with no valid record is skipped with a warning; bit rot
+        // mid-stream keeps the newer valid records (see the decoder).
+        match decode_last_table_checkpoint(&payload) {
+            Ok(locs) => out.push(locs),
             Err(e) => {
-                all_records_intact = false;
                 tracing::warn!(
                     extent_id = eid,
                     error = %e,
@@ -10207,20 +9959,11 @@ pub(crate) async fn read_all_table_locations(
             }
         }
     }
-    Ok((out, all_records_intact))
+    Ok(out)
 }
 
-#[cfg(test)]
-fn decode_last_table_checkpoint(data: &[u8]) -> Result<TableLocations> {
-    decode_last_table_checkpoint_with_health(data).map(|(locs, _)| locs)
-}
-
-/// Decode the last valid checkpoint and report whether every complete frame
-/// decoded and the stream ended on a frame boundary. A covered-prefix marker
-/// may only trust an intact meta stream: falling back to an older checkpoint
-/// after a corrupt or truncated newer frame is not proof that WAL bytes up to
-/// the marker were captured.
-fn decode_last_table_checkpoint_with_health(data: &[u8]) -> Result<(TableLocations, bool)> {
+/// Decode the last valid checkpoint record in a meta extent.
+pub(crate) fn decode_last_table_checkpoint(data: &[u8]) -> Result<TableLocations> {
     // Format: sequence of [len: u32 LE][rkyv payload] records. We want the last
     // successfully decoded record.
     //
@@ -10243,13 +9986,11 @@ fn decode_last_table_checkpoint_with_health(data: &[u8]) -> Result<(TableLocatio
     let mut buf = data;
     let mut offset = 0usize;
     let mut skipped: usize = 0;
-    let mut incomplete_tail = false;
     while buf.len() >= 4 {
         let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         let total = 4 + msg_len;
         if total > buf.len() {
             // Legitimate partial-tail-write: stop here.
-            incomplete_tail = true;
             break;
         }
         let payload = &buf[4..4 + msg_len];
@@ -10274,8 +10015,7 @@ fn decode_last_table_checkpoint_with_health(data: &[u8]) -> Result<(TableLocatio
             "skipped {skipped} corrupted TableLocations record(s); newer valid records preserved"
         );
     }
-    last.map(|locs| (locs, skipped == 0 && !incomplete_tail))
-        .ok_or_else(|| anyhow!("decode TableLocations: no valid record"))
+    last.ok_or_else(|| anyhow!("decode TableLocations: no valid record"))
 }
 
 pub(crate) fn in_range(rg: &Range, key: &[u8]) -> bool {
@@ -10324,7 +10064,6 @@ pub(crate) async fn save_table_locs_raw(
     tables: &[TableMeta],
     vp_extent_id: u64,
     vp_offset: u64,
-    log_extent_count: u32,
     // BUG-LEASE-2 Phase 2: fence-floor snapshot, captured by the caller
     // under the SAME borrow as `tables` (publish-ordering invariant: snapshot
     // order = publish order, no await in between).
@@ -10341,7 +10080,9 @@ pub(crate) async fn save_table_locs_raw(
             .collect(),
         vp_extent_id,
         vp_offset,
-        log_extent_count,
+        // Unused: recovery starts a merged open at the latest source cursor
+        // and needs no per-source regions. The field stays in the format.
+        log_extent_count: 0,
         fence_floors,
     };
     let payload = rkyv_encode(&locs);
@@ -10370,11 +10111,11 @@ pub(crate) async fn save_table_locs_raw(
 
 /// Publish the final source checkpoint used by merge recovery. The caller has
 /// halted and drained writes while holding `maintenance_gate`.
-async fn publish_merge_source_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
+async fn publish_freeze_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
     let (sc, log_stream_id, meta_stream_id) = {
         let p = part.borrow();
-        if p.frozen_for_merge.get().is_none() {
-            return Err(anyhow!("merge-source checkpoint requires frozen writes"));
+        if p.frozen_for_merge.get().is_none() && p.frozen_for_split.get().is_none() {
+            return Err(anyhow!("freeze checkpoint requires frozen writes"));
         }
         (p.stream_client.clone(), p.log_stream_id, p.meta_stream_id)
     };
@@ -10383,13 +10124,11 @@ async fn publish_merge_source_checkpoint(part: &Rc<RefCell<PartitionData>>) -> R
     let log_info = sc.get_stream_info(log_stream_id).await?;
     if log_info.extent_ids.last().copied() != Some(tail_extent_id) {
         return Err(anyhow!(
-            "log tail changed while checkpointing merge source: commit tail {} vs membership tail {:?}",
+            "log tail changed while checkpointing a frozen partition: commit tail {} vs membership tail {:?}",
             tail_extent_id,
             log_info.extent_ids.last()
         ));
     }
-    let log_extent_count = u32::try_from(log_info.extent_ids.len())
-        .map_err(|_| anyhow!("too many log extents to checkpoint"))?;
     let (tables, floors) = {
         let p = part.borrow();
         (p.tables.clone(), snapshot_fence_floors(&p))
@@ -10400,7 +10139,6 @@ async fn publish_merge_source_checkpoint(part: &Rc<RefCell<PartitionData>>) -> R
         &tables,
         tail_extent_id,
         committed_end,
-        log_extent_count,
         floors,
     )
     .await?;
@@ -10459,41 +10197,6 @@ pub(crate) fn rotate_active(part: &mut PartitionData) {
         .insert(Arc::as_ptr(&arc) as usize, row_floor);
     part.imm.push_back(arc);
     let _ = part.flush_tx.unbounded_send(());
-}
-
-/// Queue a recovered memtable as bounded immutable chunks before publishing a
-/// merged checkpoint.
-///
-/// A post-merge recovery can replay tens of GiB of WAL into one memtable.
-/// Feeding that memtable to the normal flush path would build one equally large
-/// SST, bypassing the normal P-SST output-size policy (and the RPC's u32 payload
-/// length). Split only this recovery-time memtable at the same MAX_SST used by
-/// compaction, then let the ordinary P-SST append path place each SST. The
-/// complete output may occupy any number of newly allocated extents as the row
-/// stream rolls. Every chunk is stamped with the recovered log tail: the final
-/// checkpoint names all chunks atomically, so together they cover every
-/// replayed record up to that cursor.
-fn split_memtable_by_bytes(recovered: Memtable, max_chunk_bytes: u64) -> Vec<Memtable> {
-    debug_assert!(max_chunk_bytes > 0);
-    let Memtable { data, .. } = recovered;
-    let entries = data.into_inner();
-    let mut chunks = Vec::new();
-    let mut chunk = Memtable::new();
-    for (key, entry) in entries {
-        let entry_bytes = sst_entry_bytes(key.0.len(), entry.value.len()) as u64;
-        if !chunk.is_empty()
-            && chunk.mem_bytes().saturating_add(entry_bytes) > max_chunk_bytes
-        {
-            chunks.push(chunk);
-            chunk = Memtable::new();
-        }
-        chunk.insert(key.0, entry, entry_bytes);
-    }
-
-    if !chunk.is_empty() {
-        chunks.push(chunk);
-    }
-    chunks
 }
 
 /// Drain P-sst's row-stream appends, seal the current tail, and make a fresh
@@ -10650,11 +10353,11 @@ pub(crate) async fn commit_flush_outcome(
     part: &Rc<RefCell<PartitionData>>,
     outcome: FlushOutcome,
 ) -> Result<()> {
-    // Mode B fix (coco P1): release the claim-by-ptr on ANY error. The inner
-    // function can error BEFORE it pops the imm + removes the ptr (the
-    // `get_stream_info` pre-step), which would orphan the imm: still claimed,
-    // still in the queue → the backoff-retry sees it "already claimed" and
-    // skips it forever → permanent wedge. Removing here is idempotent: if the
+    // Mode B fix (coco P1): release the claim-by-ptr on ANY error. An inner
+    // error that left the imm claimed and still queued would make the
+    // backoff-retry see it "already claimed" and skip it forever → permanent
+    // wedge. None can come before the pop today, but the release does not rely
+    // on that. Removing here is idempotent: if the
     // inner already popped + removed (a later meta-append error), this is a
     // no-op. Mirrors `run_flush_async_phase`'s release-on-error wrapper.
     let src_imm_ptr = outcome.src_imm_ptr;
@@ -10672,21 +10375,6 @@ async fn commit_flush_outcome_inner(
     part: &Rc<RefCell<PartitionData>>,
     outcome: FlushOutcome,
 ) -> Result<()> {
-    // merge: fetch log_stream extent count BEFORE the borrow_mut
-    // below. The count is persisted in the meta_record so post-merge
-    // recovery can compute each source's region [cumsum, cumsum +
-    // count) in the spliced log_stream. The get_stream_info await
-    // must happen OUTSIDE the borrow_mut → no publish-ordering violation
-    // (borrow_mut order remains the linearization point).
-    let (part_sc_pre, log_stream_id) = {
-        let p = part.borrow();
-        (p.stream_client.clone(), p.log_stream_id)
-    };
-    let log_extent_count = part_sc_pre
-        .get_stream_info(log_stream_id)
-        .await?
-        .extent_ids
-        .len() as u32;
     let outcome_last_seq = outcome.new_meta.last_seq;
     let outcome_src_imm_ptr = outcome.src_imm_ptr;
     let (tables_snapshot, vp_eid, vp_off, part_sc, meta_stream_id, floors_snapshot) = {
@@ -10741,7 +10429,6 @@ async fn commit_flush_outcome_inner(
         &tables_snapshot,
         vp_eid,
         vp_off,
-        log_extent_count,
         floors_snapshot,
     )
     .await?;
@@ -10840,110 +10527,24 @@ const FLUSH_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 /// truncates the meta stream to the extent holding it. A crash before the
 /// append leaves the old records, and the next open does this again.
 async fn publish_merged_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
+    // Replay started past both sources, so the recovered memtable holds only
+    // writes made after an earlier merged open (which crashed before this
+    // record replaced the sources'); an ordinary flush publishes the one record.
     if !part.borrow().active.is_empty() {
-        // A merged recovery differs from an ordinary P-SST flush only here:
-        // start its MAX_SST-sized outputs on a fresh extent. Later appends may
-        // roll onto further new extents through the normal stream policy.
-        seal_and_roll_row_tail(part)
-            .await
-            .context("merge recovery: roll row tail before flush")?;
-
-        let (
-            recovered,
-            vp_eid,
-            vp_off,
-            row_stream_id,
-            log_stream_id,
-            meta_stream_id,
-            mut flush_req_tx,
-            part_sc,
-        ) = {
-            let mut p = part.borrow_mut();
-            let recovered = std::mem::replace(&mut p.active, Memtable::new());
-            (
-                recovered,
-                p.vp_extent_id,
-                p.vp_offset,
-                p.row_stream_id,
-                p.log_stream_id,
-                p.meta_stream_id,
-                p.flush_req_tx.clone(),
-                p.stream_client.clone(),
-            )
-        };
-
-        if vp_eid != 0 && vp_off > 0 {
-            part_sc.await_log_synced_to(vp_eid, vp_off).await?;
-        }
-
-        // Use the ordinary P-sst FlushReq for every normal-sized SST. Do not
-        // call commit_flush_outcome per chunk: that would publish the final WAL
-        // cursor before every recovered chunk was durable. Like compaction,
-        // append all output SSTs first and commit their locations atomically in
-        // one checkpoint below.
-        let mut outputs = Vec::new();
-        for chunk in split_memtable_by_bytes(recovered, max_sst_bytes().max(1)) {
-            let (resp_tx, resp_rx) = oneshot::channel();
-            flush_req_tx
-                .send(FlushReq {
-                    imm: Arc::new(chunk),
-                    vp_eid,
-                    vp_off,
-                    row_stream_id,
-                    resp_tx,
-                })
-                .await
-                .map_err(|_| anyhow!("bulk thread dropped merge-recovery flush channel"))?;
-            outputs.push(
-                resp_rx
-                    .await
-                    .map_err(|_| anyhow!("bulk thread dropped merge-recovery flush response"))??,
-            );
-        }
-
-        let log_extent_count = part_sc
-            .get_stream_info(log_stream_id)
-            .await?
-            .extent_ids
-            .len() as u32;
-        let (tables, floors) = {
-            let mut p = part.borrow_mut();
-            for (meta, reader) in outputs {
-                p.tables.push(meta);
-                p.sst_readers.push(Arc::new(reader));
-            }
-            let p = &mut *p;
-            sort_tables_by_seq(&mut p.tables, &mut p.sst_readers);
-            (p.tables.clone(), snapshot_fence_floors(p))
-        };
-        save_table_locs_raw(
-            &part_sc,
-            meta_stream_id,
-            &tables,
-            vp_eid,
-            vp_off,
-            log_extent_count,
-            floors,
-        )
-        .await?;
-        part.borrow().durable_ckpt_vp.set((vp_eid, vp_off));
-        crate::background::refresh_metrics(part);
-        FLUSH_COMMITS.fetch_add(1, Ordering::Relaxed);
+        flush_memtable_locked(part).await?;
         return Ok(());
     }
-    let (sc, log_stream_id, meta_stream_id, tables, vp, floors) = {
+    let (sc, meta_stream_id, tables, vp, floors) = {
         let p = part.borrow();
         (
             p.stream_client.clone(),
-            p.log_stream_id,
             p.meta_stream_id,
             p.tables.clone(),
             (p.vp_extent_id, p.vp_offset),
             snapshot_fence_floors(&p),
         )
     };
-    let log_extent_count = sc.get_stream_info(log_stream_id).await?.extent_ids.len() as u32;
-    save_table_locs_raw(&sc, meta_stream_id, &tables, vp.0, vp.1, log_extent_count, floors).await?;
+    save_table_locs_raw(&sc, meta_stream_id, &tables, vp.0, vp.1, floors).await?;
     part.borrow().durable_ckpt_vp.set(vp);
     Ok(())
 }
@@ -12367,342 +11968,11 @@ mod tests {
     }
 
     #[test]
-    fn recovered_memtable_split_preserves_order_and_entries() {
-        let mt = Memtable::new();
-        for seq in 1..=5u64 {
-            let key = key_with_ts(format!("k{seq}").as_bytes(), seq);
-            let value = vec![seq as u8; 16];
-            let entry_bytes = key.len() as u64 + value.len() as u64 + 32;
-            mt.insert(
-                key,
-                MemEntry {
-                    op: 1,
-                    value,
-                    expires_at: seq * 10,
-                },
-                entry_bytes,
-            );
-        }
-        let expected = mt.snapshot_sorted();
-
-        // Each entry is 46 bytes, so this produces 2 + 2 + 1 entries.
-        let chunks = split_memtable_by_bytes(mt, 92);
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks.iter().all(|chunk| chunk.mem_bytes() <= 92));
-
-        let actual: Vec<IterItem> = chunks
-            .iter()
-            .flat_map(Memtable::snapshot_sorted)
-            .collect();
-        assert_eq!(actual.len(), expected.len());
-        for (actual, expected) in actual.iter().zip(expected.iter()) {
-            assert_eq!(actual.key, expected.key);
-            assert_eq!(actual.op, expected.op);
-            assert_eq!(actual.value, expected.value);
-            assert_eq!(actual.expires_at, expected.expires_at);
-        }
-    }
-
-    #[test]
-    fn recovered_memtable_split_preserves_versions_across_boundary() {
-        let mt = Memtable::new();
-        for (user_key, seq) in [
-            (b"a".as_ref(), 1u64),
-            (b"k", 1),
-            (b"k", 2),
-            (b"k", 3),
-            (b"z", 1),
-        ] {
-            let key = key_with_ts(user_key, seq);
-            let value = vec![seq as u8; 8];
-            let entry_bytes = sst_entry_bytes(key.len(), value.len()) as u64;
-            mt.insert(
-                key,
-                MemEntry {
-                    op: 1,
-                    value,
-                    expires_at: 0,
-                },
-                entry_bytes,
-            );
-        }
-
-        let chunks = split_memtable_by_bytes(mt, 74);
-        assert!(chunks.len() >= 3, "the k versions must cross a boundary");
-        let versions: Vec<u64> = chunks
-            .iter()
-            .flat_map(Memtable::snapshot_sorted)
-            .filter(|item| parse_key(&item.key) == b"k")
-            .map(|item| parse_ts(&item.key))
-            .collect();
-        assert_eq!(versions, vec![3, 2, 1]);
-    }
-
-    #[test]
-    fn merge_replay_uses_stream_covered_prefix() {
-        let ids = [10, 11, 12, 20, 21, 22, 99];
-        let sources = [
-            ReplaySourceCheckpoint {
-                cursor_pos: 2,
-                cursor_offset: 1_000,
-            },
-            ReplaySourceCheckpoint {
-                cursor_pos: 5,
-                cursor_offset: 2_000,
-            },
-        ];
-        let plan = plan_replay_extents(&ids, 2, 1_000, &sources, true, Some(99), true);
-        assert!(!plan.source_cursor_offsets_applied);
-        assert!(plan.covered_prefix_applied);
-        assert!(plan.covered_prefix_rewrote_plan);
-        assert_eq!(plan.extents, vec![(6, 99, 0)]);
-
-        let ablated = plan_replay_extents(&ids, 2, 1_000, &sources, true, None, true);
-        assert!(!ablated.covered_prefix_applied);
-        assert!(!ablated.covered_prefix_rewrote_plan);
-        assert_eq!(
-            ablated.extents,
-            vec![
-                (2, 12, 1_000),
-                (3, 20, 0),
-                (4, 21, 0),
-                (5, 22, 2_000),
-                (6, 99, 0),
-            ],
-            "without the marker recovery must conservatively scan the source prefix"
-        );
-    }
-
-    #[test]
     fn merge_freeze_is_rejected_for_both_split_freeze_states() {
         assert!(split_blocks_merge_freeze(true, false));
         assert!(split_blocks_merge_freeze(false, true));
         assert!(split_blocks_merge_freeze(true, true));
         assert!(!split_blocks_merge_freeze(false, false));
-    }
-
-    #[test]
-    fn ordinary_checkpoint_later_than_marker_wins() {
-        let ids = [10, 11, 99, 100];
-        let sources = [
-            ReplaySourceCheckpoint {
-                cursor_pos: 3,
-                cursor_offset: 777,
-            },
-        ];
-        let plan = plan_replay_extents(&ids, 3, 777, &sources, true, Some(99), true);
-        assert!(!plan.source_cursor_offsets_applied);
-        assert!(plan.covered_prefix_applied);
-        assert!(!plan.covered_prefix_rewrote_plan);
-        assert_eq!(plan.extents, vec![(3, 100, 777)]);
-    }
-
-    #[test]
-    fn merge_replay_uses_every_source_checkpoint_offset() {
-        // source 0 = [10, 11, 12], checkpoint at 12:100
-        // source 1 = [20, 21, 22], checkpoint at 22:800
-        // 99 is the fresh post-merge tail. The old global plan read 22 from
-        // zero. We still read 20/21 because old extent counts cannot prove
-        // where source 1 begins at merge time.
-        let ids = [10, 11, 12, 20, 21, 22, 99];
-        let sources = [
-            ReplaySourceCheckpoint {
-                cursor_pos: 2,
-                cursor_offset: 100,
-            },
-            ReplaySourceCheckpoint {
-                cursor_pos: 5,
-                cursor_offset: 800,
-            },
-        ];
-
-        let plan = plan_replay_extents(&ids, 2, 100, &sources, true, None, true);
-
-        assert!(plan.source_cursor_offsets_applied);
-        assert!(!plan.covered_prefix_applied);
-        assert_eq!(
-            plan.extents,
-            vec![
-                (2, 12, 100),
-                (3, 20, 0),
-                (4, 21, 0),
-                (5, 22, 800),
-                (6, 99, 0),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_replay_keeps_each_sources_post_checkpoint_extents() {
-        // Each source has one extent after its checkpoint. Those suffix
-        // extents and the post-merge tail must still be replayed from zero.
-        let ids = [10, 11, 12, 20, 21, 22, 99];
-        let sources = [
-            ReplaySourceCheckpoint {
-                cursor_pos: 1,
-                cursor_offset: 100,
-            },
-            ReplaySourceCheckpoint {
-                cursor_pos: 4,
-                cursor_offset: 800,
-            },
-        ];
-
-        let plan = plan_replay_extents(&ids, 1, 100, &sources, true, None, true);
-
-        assert!(plan.source_cursor_offsets_applied);
-        assert!(!plan.covered_prefix_applied);
-        assert_eq!(
-            plan.extents,
-            vec![
-                (1, 11, 100),
-                (2, 12, 0),
-                (3, 20, 0),
-                (4, 21, 800),
-                (5, 22, 0),
-                (6, 99, 0),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_replay_never_guesses_boundaries_from_stale_counts() {
-        // This is the dangerous shape for a cumulative-count planner: source 0
-        // grew by one extent after its checkpoint while source 1 lost one prefix
-        // extent. The stale counts cancel, so their sum still matches the merged
-        // stream. Extent 13 is nevertheless source 0's uncheckpointed WAL and
-        // must be read. The offset-only planner never needs those counts.
-        let ids = [10, 11, 12, 13, 20, 21, 22, 99];
-        let sources = [
-            ReplaySourceCheckpoint {
-                cursor_pos: 1,
-                cursor_offset: 100,
-            },
-            ReplaySourceCheckpoint {
-                cursor_pos: 5,
-                cursor_offset: 800,
-            },
-        ];
-
-        let plan = plan_replay_extents(&ids, 1, 100, &sources, true, None, true);
-
-        assert!(plan.source_cursor_offsets_applied);
-        assert!(!plan.covered_prefix_applied);
-        assert_eq!(
-            plan.extents,
-            vec![
-                (1, 11, 100),
-                (2, 12, 0),
-                (3, 13, 0),
-                (4, 20, 0),
-                (5, 21, 800),
-                (6, 22, 0),
-                (7, 99, 0),
-            ]
-        );
-    }
-
-    #[test]
-    fn merge_replay_uses_earliest_offset_for_cow_duplicate_cursor_positions() {
-        // Both source checkpoints resolve to the first occurrence of shared
-        // extent 12. Read the physical extent once from the earlier offset.
-        let ids = [10, 11, 12, 12, 20, 99];
-        let sources = [
-            ReplaySourceCheckpoint {
-                cursor_pos: 2,
-                cursor_offset: 100,
-            },
-            ReplaySourceCheckpoint {
-                cursor_pos: 2,
-                cursor_offset: 200,
-            },
-        ];
-
-        let plan = plan_replay_extents(&ids, 2, 100, &sources, true, None, true);
-
-        assert!(plan.source_cursor_offsets_applied);
-        assert!(!plan.covered_prefix_applied);
-        assert_eq!(plan.extents, vec![(2, 12, 100), (4, 20, 0), (5, 99, 0)]);
-    }
-
-    #[test]
-    fn merge_replay_falls_back_when_any_source_cursor_is_unresolved() {
-        let ids = [10, 11, 12, 20, 21, 22, 99];
-        // Only source 0 resolved. `all_sources_resolved=false` represents a
-        // legacy zero cursor or a cursor whose extent was already reclaimed.
-        let sources = [ReplaySourceCheckpoint {
-            cursor_pos: 2,
-            cursor_offset: 100,
-        }];
-
-        let plan = plan_replay_extents(&ids, 2, 100, &sources, false, None, true);
-
-        assert!(!plan.source_cursor_offsets_applied);
-        assert!(!plan.covered_prefix_applied);
-        assert_eq!(
-            plan.extents,
-            vec![(2, 12, 100), (3, 20, 0), (4, 21, 0), (5, 22, 0), (6, 99, 0),]
-        );
-    }
-
-    #[test]
-    fn merge_replay_falls_back_when_global_anchor_precedes_source_cursors() {
-        // A cursorless record's SST vp_head may lower the global anchor below
-        // every resolved source checkpoint. Source-local offsets are then not
-        // a complete description of the replay floor, so use the old plan.
-        let ids = [10, 11, 12, 20, 21, 22, 99];
-        let sources = [
-            ReplaySourceCheckpoint {
-                cursor_pos: 2,
-                cursor_offset: 100,
-            },
-            ReplaySourceCheckpoint {
-                cursor_pos: 5,
-                cursor_offset: 800,
-            },
-        ];
-
-        let plan = plan_replay_extents(&ids, 1, 50, &sources, true, None, true);
-
-        assert!(!plan.source_cursor_offsets_applied);
-        assert!(!plan.covered_prefix_applied);
-        assert_eq!(
-            plan.extents,
-            vec![(1, 11, 50), (2, 12, 0), (3, 20, 0), (4, 21, 0), (5, 22, 0), (6, 99, 0),]
-        );
-    }
-
-    #[test]
-    fn dangling_marker_falls_back_to_legacy_plan() {
-        let ids = [10, 11, 20];
-        let sources = [
-            ReplaySourceCheckpoint {
-                cursor_pos: 1,
-                cursor_offset: 50,
-            },
-            ReplaySourceCheckpoint {
-                cursor_pos: 2,
-                cursor_offset: 70,
-            },
-        ];
-        let plan = plan_replay_extents(&ids, 1, 50, &sources, true, Some(999), true);
-        assert!(!plan.covered_prefix_applied);
-        assert_eq!(plan.extents, vec![(1, 11, 50), (2, 20, 70)]);
-    }
-
-    #[test]
-    fn marker_with_only_cursorless_checkpoint_is_ignored() {
-        let ids = [10, 11, 10, 20];
-
-        // Recovery filters a TableLocations with vp_extent_id == 0 out of
-        // records_meta, so it must pass has_checkpoint=false here even though
-        // the raw meta record list was non-empty.
-        let plan = plan_replay_extents(&ids, usize::MAX, 0, &[], false, Some(20), false);
-
-        assert!(!plan.source_cursor_offsets_applied);
-        assert!(!plan.covered_prefix_applied);
-        assert!(!plan.covered_prefix_rewrote_plan);
-        assert_eq!(plan.extents, vec![(0, 10, 0), (1, 11, 0), (3, 20, 0)]);
     }
 
     // under the RwLock<BTreeMap> design the memtable has ONE writer
@@ -12951,32 +12221,9 @@ mod tests {
         data.extend_from_slice(&(boundary_payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&boundary_payload);
 
-        let (decoded, intact) = decode_last_table_checkpoint_with_health(&data).unwrap();
+        let decoded = decode_last_table_checkpoint(&data).unwrap();
         assert_eq!(decoded.vp_extent_id, 12);
         assert_eq!(decoded.vp_offset, 900);
-        assert!(!intact, "an unknown legacy frame must disable marker use");
-    }
-
-    #[test]
-    fn corrupt_newer_checkpoint_disables_covered_prefix() {
-        let locs = TableLocations {
-            fence_floors: vec![],
-            locs: vec![],
-            vp_extent_id: 12,
-            vp_offset: 100,
-            log_extent_count: 3,
-        };
-        let table_payload = rkyv_encode(&locs);
-        let corrupt_payload = vec![0xff; table_payload.len()];
-        let mut data = Vec::new();
-        data.extend_from_slice(&(table_payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&table_payload);
-        data.extend_from_slice(&(corrupt_payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&corrupt_payload);
-
-        let (decoded, intact) = decode_last_table_checkpoint_with_health(&data).unwrap();
-        assert_eq!(decoded.vp_extent_id, 12, "older checkpoint remains available");
-        assert!(!intact, "fallback after corruption cannot authorize a replay marker");
     }
 
     #[test]

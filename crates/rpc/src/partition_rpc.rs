@@ -1067,14 +1067,9 @@ pub struct TableLocations {
     pub locs: Vec<SstLocation>,
     pub vp_extent_id: u64,
     pub vp_offset: u64,
-    /// merge: source partition's log_stream extent count at flush
-    /// time. Used post-merge by `recover_partition` to derive each
-    /// source's region (positions [cumsum, cumsum + count)) in the
-    /// spliced log_stream, so replay dedup uses each source's OWN
-    /// `sst_max_seq` (not the union max, which silently skips one
-    /// source's post-vp_head tail records ≤ the OTHER source's max).
-    /// 0 in legacy / fresh-state checkpoints — treated as "no boundary
-    /// info; fall back to single-source replay" (= pre-fix behavior).
+    /// Unused; written as 0. (It once let recovery split a merged log into
+    /// per-source regions; a merged open now starts at the latest source
+    /// cursor and needs none.) Kept because the checkpoint format is frozen.
     pub log_extent_count: u32,
     /// BUG-LEASE-2 Phase 2: snapshot of the partition's per-ino fence
     /// floors `(ino, lease_epoch)` at checkpoint time. Recovery seeds

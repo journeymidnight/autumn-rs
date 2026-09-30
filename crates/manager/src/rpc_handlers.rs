@@ -363,7 +363,6 @@ impl AutumnManager {
             MSG_REGISTER_NODE => self.handle_register_node(payload).await,
             MSG_CREATE_STREAM => self.handle_create_stream(payload).await,
             MSG_STREAM_INFO => self.handle_stream_info(payload).await,
-            MSG_STREAM_REPLAY_INFO => self.handle_stream_replay_info(payload).await,
             MSG_EXTENT_INFO => self.handle_extent_info(payload).await,
             MSG_NODES_INFO => self.handle_nodes_info().await,
             MSG_CHECK_COMMIT_LENGTH => self.handle_check_commit_length(payload).await,
@@ -2044,46 +2043,6 @@ impl AutumnManager {
         }))
     }
 
-    /// Internal recovery form of `MSG_STREAM_INFO`. It has its own opcode so
-    /// the established client response stays byte-for-byte compatible while a
-    /// current PS can also fetch the durable covered-prefix sidecar.
-    async fn handle_stream_replay_info(&self, payload: Bytes) -> HandlerResult {
-        let req: StreamInfoReq =
-            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        let s = self.store.inner.borrow();
-
-        let ids = if req.stream_ids.is_empty() {
-            s.streams.keys().copied().collect::<Vec<_>>()
-        } else {
-            req.stream_ids
-        };
-        let mut streams = Vec::new();
-        let mut extents = Vec::new();
-        for id in ids {
-            if let Some(st) = s.streams.get(&id) {
-                streams.push((
-                    id,
-                    StreamReplayInfo {
-                        stream: st.into(),
-                        covered_before_extent_id: self.stream_covered_before(id).unwrap_or(0),
-                    },
-                ));
-                for extent_id in &st.extent_ids {
-                    if let Some(e) = s.extents.get(extent_id) {
-                        extents.push((*extent_id, e.into()));
-                    }
-                }
-            }
-        }
-
-        Ok(rkyv_encode(&StreamReplayInfoResp {
-            code: CODE_OK,
-            message: String::new(),
-            streams,
-            extents,
-        }))
-    }
-
     async fn handle_extent_info(&self, payload: Bytes) -> HandlerResult {
         let req: ExtentInfoReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -3586,14 +3545,6 @@ impl AutumnManager {
             "multi_modify_split entered"
         );
 
-        // Split now creates one fresh log tail for each child before publishing
-        // the new memberships. Capture placement inputs outside the store
-        // borrow, matching the ordinary allocation and merge paths.
-        let online_node_ids = self.node_states.borrow().online_node_ids();
-        let space_low_node_ids = self.space_low_node_ids();
-        let hard_excluded = self.placement_excluded_node_ids();
-        let placement_load = self.placement_load();
-
         // #6: serialize splits per partition. A PS that retries
         // multi_modify_split against a SLOW manager (each call timing out but
         // the manager still committing later) used to commit a SEPARATE split
@@ -3621,22 +3572,15 @@ impl AutumnManager {
 
         // Phase 1: Compute all mutations without modifying store
         // (only alloc_ids touches state.next_id, which is safe to waste on failure)
-        struct SplitPhase1 {
-            new_streams: Vec<StreamRecord>,
-            modified_extents: Vec<ExtentRecord>,
-            left: PartitionRecord,
-            right: PartitionRecord,
-            pre_bump_eversion: HashMap<u64, u64>,
-            source_log_baseline: (String, Vec<u8>),
-            extent_baselines: Vec<(String, Vec<u8>)>,
-            left_tail_id: u64,
-            right_tail_id: u64,
-            selected_nodes: Vec<NodeRecord>,
-        }
-
         let out = {
             let mut s = self.store.inner.borrow_mut();
-            (|| -> Result<SplitPhase1, AppError> {
+            (|| -> Result<(
+                Vec<StreamRecord>,
+                Vec<ExtentRecord>,
+                PartitionRecord,
+                PartitionRecord,
+                HashMap<u64, u64>,
+            ), AppError> {
                 Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s)?;
 
                 let src_meta = s
@@ -3743,19 +3687,14 @@ impl AutumnManager {
                     &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream],
                 );
 
-                // Preserve the established first four meanings and reserve two
-                // additional ids for fresh child log tails.
-                let (start, end) = s.alloc_ids(6);
+                let (start, end) = s.alloc_ids(4);
                 let new_log_stream = start;
                 let new_row_stream = start + 1;
                 let new_meta_stream = start + 2;
-                let new_part_id = start + 3;
-                let left_tail_id = start + 4;
-                let right_tail_id = start + 5;
-                debug_assert_eq!(end, start + 6);
+                let new_part_id = end - 1;
 
                 // Compute stream duplications without modifying state
-                let (mut right_log, log_exts) = Self::compute_duplicate_stream(
+                let (log_dup, log_exts) = Self::compute_duplicate_stream(
                     &s, src_meta.log_stream, new_log_stream, req.log_stream_sealed_length,
                 )?;
                 let (row_dup, row_exts) = Self::compute_duplicate_stream(
@@ -3765,76 +3704,11 @@ impl AutumnManager {
                     &s, src_meta.meta_stream, new_meta_stream, req.meta_stream_sealed_length,
                 )?;
 
-                let source_log = s.streams.get(&src_meta.log_stream).ok_or_else(|| {
-                    AppError::NotFound(format!("stream {}", src_meta.log_stream))
-                })?;
-                let target_replicas = if source_log.replicates > 0 {
-                    source_log.replicates as usize
-                } else {
-                    3
-                };
-                let selected_nodes = Self::select_nodes(
-                    &s.nodes,
-                    &s.disks,
-                    &online_node_ids,
-                    &space_low_node_ids,
-                    &hard_excluded,
-                    &placement_load,
-                    target_replicas,
-                    &[],
-                )?;
-                let make_tail = |extent_id| ExtentRecord {
-                    extent_id,
-                    replicates: selected_nodes.iter().map(|n| n.node_id).collect(),
-                    parity: vec![],
-                    replicate_disks: vec![0u64; selected_nodes.len()],
-                    parity_disks: vec![],
-                    sealed_length: 0,
-                    sealed: false,
-                    avali: 0,
-                    eversion: 1,
-                    refs: 1,
-                    vp_table_refs: 0,
-                    ec_converted: false,
-                };
-                let left_tail = make_tail(left_tail_id);
-                let right_tail = make_tail(right_tail_id);
-
-                let mut left_log = source_log.clone();
-                left_log.extent_ids.push(left_tail_id);
-                right_log.extent_ids.push(right_tail_id);
-                if left_log.extent_ids.last().copied() != Some(left_tail_id) {
-                    return Err(AppError::Internal(format!(
-                        "left split log stream {} does not end at fresh tail {left_tail_id}",
-                        left_log.stream_id
-                    )));
-                }
-                if right_log.extent_ids.last().copied() != Some(right_tail_id) {
-                    return Err(AppError::Internal(format!(
-                        "right split log stream {} does not end at fresh tail {right_tail_id}",
-                        right_log.stream_id
-                    )));
-                }
-
-                let source_log_baseline = (
-                    format!("streams/{}", source_log.stream_id),
-                    crate::persist::encode(source_log),
-                );
-                let new_streams = vec![left_log, right_log, row_dup, meta_dup];
+                let new_streams = vec![log_dup, row_dup, meta_dup];
                 let mut all_extents = Vec::new();
                 all_extents.extend(log_exts);
                 all_extents.extend(row_exts);
                 all_extents.extend(meta_exts);
-                all_extents.push(left_tail);
-                all_extents.push(right_tail);
-                let extent_baselines = all_extents
-                    .iter()
-                    .filter_map(|ex| {
-                        s.extents.get(&ex.extent_id).map(|orig| {
-                            (format!("extents/{}", ex.extent_id), crate::persist::encode(orig))
-                        })
-                    })
-                    .collect();
 
                 let mut left = src_meta.clone();
                 let mut right = src_meta;
@@ -3851,92 +3725,17 @@ impl AutumnManager {
                     end_key: rg.end_key,
                 });
 
-                Ok(SplitPhase1 {
-                    new_streams,
-                    modified_extents: all_extents,
-                    left,
-                    right,
-                    pre_bump_eversion,
-                    source_log_baseline,
-                    extent_baselines,
-                    left_tail_id,
-                    right_tail_id,
-                    selected_nodes,
-                })
+                Ok((new_streams, all_extents, left, right, pre_bump_eversion))
             })()
         };
 
         match out {
-            Ok(mut p1) => {
-                let selected_ids: HashSet<u64> =
-                    p1.selected_nodes.iter().map(|n| n.node_id).collect();
-                let fallback_nodes: Vec<NodeRecord> = {
-                    let s = self.store.inner.borrow();
-                    s.nodes
-                        .values()
-                        .filter(|n| !selected_ids.contains(&n.node_id))
-                        .filter(|n| online_node_ids.contains(&n.node_id))
-                        .filter(|n| !space_low_node_ids.contains(&n.node_id))
-                        .filter(|n| !hard_excluded.contains(&n.node_id))
-                        .cloned()
-                        .collect()
-                };
-                let _left_allocating = self.mark_allocating(p1.left_tail_id);
-                let _right_allocating = self.mark_allocating(p1.right_tail_id);
-                let mut left_fallback = fallback_nodes.clone().into_iter();
-                let Some((left_nodes, left_disks)) = self
-                    .place_extents_with_fallback(
-                        &p1.selected_nodes,
-                        &mut left_fallback,
-                        p1.left_tail_id,
-                    )
-                    .await
-                else {
-                    return Self::code_resp(
-                        CODE_PRECONDITION,
-                        format!(
-                            "no healthy node available to allocate left split tail {}",
-                            p1.left_tail_id
-                        ),
-                    );
-                };
-                let mut right_fallback = fallback_nodes.into_iter();
-                let Some((right_nodes, right_disks)) = self
-                    .place_extents_with_fallback(
-                        &p1.selected_nodes,
-                        &mut right_fallback,
-                        p1.right_tail_id,
-                    )
-                    .await
-                else {
-                    return Self::code_resp(
-                        CODE_PRECONDITION,
-                        format!(
-                            "no healthy node available to allocate right split tail {}",
-                            p1.right_tail_id
-                        ),
-                    );
-                };
-                for (tail_id, node_ids, disk_ids) in [
-                    (p1.left_tail_id, left_nodes, left_disks),
-                    (p1.right_tail_id, right_nodes, right_disks),
-                ] {
-                    let tail = p1
-                        .modified_extents
-                        .iter_mut()
-                        .find(|ex| ex.extent_id == tail_id)
-                        .expect("reserved split tail must be in mutation set");
-                    tail.replicates = node_ids;
-                    tail.replicate_disks = disk_ids;
-                }
-
+            Ok((new_streams, modified_extents, left, right, pre_bump_eversion)) => {
                 // Verify-BEFORE-mirror: if any source-stream extent's
                 // eversion drifted during the Phase-1 awaits, the etcd txn
                 // we'd otherwise send is computed from a stale base — refuse
                 // before committing to etcd.
-                if let Some((eid, expected, live)) =
-                    self.first_eversion_drift(&p1.pre_bump_eversion)
-                {
+                if let Some((eid, expected, live)) = self.first_eversion_drift(&pre_bump_eversion) {
                     return Self::code_resp(
                         CODE_PRECONDITION,
                         format!(
@@ -3950,41 +3749,40 @@ impl AutumnManager {
                 // (partitions + regions are included here, not in a separate
                 // txn, to prevent orphan streams on crash.)
                 if let Some(etcd) = &self.etcd {
-                    let mut kvs = Vec::with_capacity(
-                        p1.new_streams.len() + p1.modified_extents.len() + 8,
-                    );
-                    for st in &p1.new_streams {
+                    let mut kvs =
+                        Vec::with_capacity(new_streams.len() + modified_extents.len() + 4);
+                    for st in &new_streams {
                         kvs.push((
                             format!("streams/{}", st.stream_id),
                             crate::persist::encode(st),
                         ));
                     }
-                    for ex in &p1.modified_extents {
+                    for ex in &modified_extents {
                         kvs.push((
                             format!("extents/{}", ex.extent_id),
                             crate::persist::encode(ex),
                         ));
                     }
                     kvs.push((
-                        format!("partitions/{}", p1.left.part_id),
-                        crate::persist::encode(&p1.left),
+                        format!("partitions/{}", left.part_id),
+                        crate::persist::encode(&left),
                     ));
                     kvs.push((
-                        format!("partitions/{}", p1.right.part_id),
-                        crate::persist::encode(&p1.right),
+                        format!("partitions/{}", right.part_id),
+                        crate::persist::encode(&right),
                     ));
                     // Pre-compute region entries for left and right partitions
                     // so they are included in the same atomic txn.
                     {
                         let s = self.store.inner.borrow();
-                        let left_region = Self::compute_region_for_partition(&s, &p1.left);
-                        let right_region = Self::compute_region_for_partition(&s, &p1.right);
+                        let left_region = Self::compute_region_for_partition(&s, &left);
+                        let right_region = Self::compute_region_for_partition(&s, &right);
                         kvs.push((
-                            format!("regions/{}", p1.left.part_id),
+                            format!("regions/{}", left.part_id),
                             crate::persist::encode(&left_region),
                         ));
                         kvs.push((
-                            format!("regions/{}", p1.right.part_id),
+                            format!("regions/{}", right.part_id),
                             crate::persist::encode(&right_region),
                         ));
                     }
@@ -3992,20 +3790,12 @@ impl AutumnManager {
                     // policy engine's cooldown gate is correct.
                     let now = Self::epoch_seconds();
                     kvs.push((
-                        format!("partitionLastOp/{}", p1.left.part_id),
+                        format!("partitionLastOp/{}", left.part_id),
                         now.to_le_bytes().to_vec(),
                     ));
                     kvs.push((
-                        format!("partitionLastOp/{}", p1.right.part_id),
+                        format!("partitionLastOp/{}", right.part_id),
                         now.to_le_bytes().to_vec(),
-                    ));
-                    kvs.push((
-                        crate::stream_covered_prefix::stream_covered_key(p1.left.log_stream),
-                        p1.left_tail_id.to_le_bytes().to_vec(),
-                    ));
-                    kvs.push((
-                        crate::stream_covered_prefix::stream_covered_key(p1.right.log_stream),
-                        p1.right_tail_id.to_le_bytes().to_vec(),
                     ));
                     // Value-CAS each modified extent against its pre-split value.
                     // Split increments refs on CoW-shared extents (and seals the
@@ -4017,21 +3807,37 @@ impl AutumnManager {
                     // premature delete -> data loss. Same class as
                     // compute_extent_ref_drops.
                     //
-                    // Physical allocation adds an await between compute and
-                    // commit. CAS both the rewritten source log membership and
-                    // every pre-existing modified extent against the Phase-1
-                    // snapshot; the two fresh tails are creates and therefore
-                    // intentionally have no value baseline.
-                    let mut cas = vec![p1.source_log_baseline.clone()];
-                    cas.extend(p1.extent_baselines.clone());
-                    etcd.put_delete_txn_cas(kvs, Vec::new(), cas)
+                    // No source streams/<id> CAS is needed even though split
+                    // READS the source membership to derive the right streams:
+                    // the source partition is frozen_for_split AND holds
+                    // gc_gate+compact_gate through this whole multi_modify_split
+                    // (PS-side gc/compact gates), so its streams cannot mutate
+                    // concurrently. The ONLY reachable race is a DIFFERENT
+                    // CoW-sharing partition (from a prior split) GC'ing a shared
+                    // extent — that partition isn't frozen — and this extent CAS
+                    // catches exactly that. (Split also has no Phase-1.5 await,
+                    // so capturing the baseline here, with no await since
+                    // modified_extents was computed, is consistent — unlike merge
+                    // which must capture in Phase-1 before its alloc await.)
+                    let extent_cas: Vec<(String, Vec<u8>)> = {
+                        let s = self.store.inner.borrow();
+                        modified_extents
+                            .iter()
+                            .filter_map(|ex| {
+                                s.extents.get(&ex.extent_id).map(|orig| {
+                                    (format!("extents/{}", ex.extent_id), crate::persist::encode(orig))
+                                })
+                            })
+                            .collect()
+                    };
+                    etcd.put_delete_txn_cas(kvs, Vec::new(), extent_cas)
                         .await
                         .map_err(|e| Self::err_to_status(&e))?;
                 }
                 tracing::info!(
                     target: "mms_trace",
-                    part_id = p1.left.part_id,
-                    right_part_id = p1.right.part_id,
+                    part_id = left.part_id,
+                    right_part_id = right.part_id,
                     elapsed_ms = mms_started.elapsed().as_millis() as u64,
                     "multi_modify_split etcd txn COMMITTED"
                 );
@@ -4041,24 +3847,21 @@ impl AutumnManager {
                 // apply (no verify).
                 {
                     let mut s = self.store.inner.borrow_mut();
-                    let left_id = p1.left.part_id;
-                    let right_id = p1.right.part_id;
-                    let left_log = p1.left.log_stream;
-                    let right_log = p1.right.log_stream;
+                    let _ = pre_bump_eversion; // captured for the verify-BEFORE block above
+                    let left_id = left.part_id;
+                    let right_id = right.part_id;
                     Self::apply_split_mutations(
                         &mut s,
-                        &p1.new_streams,
-                        &p1.modified_extents,
-                        p1.left,
-                        p1.right,
+                        &new_streams,
+                        &modified_extents,
+                        left,
+                        right,
                     );
                     drop(s);
                     // in-memory last_op_at update (mirror of etcd write above)
                     let now = Self::epoch_seconds();
                     self.last_op_at.borrow_mut().insert(left_id, now);
                     self.last_op_at.borrow_mut().insert(right_id, now);
-                    self.commit_stream_covered_before(left_log, p1.left_tail_id);
-                    self.commit_stream_covered_before(right_log, p1.right_tail_id);
                 }
 
                 Self::code_resp(CODE_OK, String::new())
@@ -4258,12 +4061,6 @@ impl AutumnManager {
                     req.log_sealed_lengths[1],
                     new_tail.clone(),
                 )?;
-                if log_dup.extent_ids.last().copied() != Some(new_tail_id) {
-                    return Err(AppError::Internal(format!(
-                        "merged log stream {} does not end at fresh tail {new_tail_id}",
-                        log_dup.stream_id
-                    )));
-                }
                 let (row_dup, row_exts) = Self::splice_streams_without_new_tail(
                     &s,
                     survivor_meta.row_stream,
@@ -4418,7 +4215,7 @@ impl AutumnManager {
         // Phase 2: single fenced etcd txn.
         if let Some(etcd) = &self.etcd {
             let now = Self::epoch_seconds();
-            let mut kvs = Vec::with_capacity(p1.new_streams.len() + modified_extents.len() + 6);
+            let mut kvs = Vec::with_capacity(p1.new_streams.len() + modified_extents.len() + 5);
             for st in &p1.new_streams {
                 kvs.push((
                     format!("streams/{}", st.stream_id),
@@ -4447,18 +4244,8 @@ impl AutumnManager {
                 format!("partitionLastOp/{}", p1.survivor_meta.part_id),
                 now.to_le_bytes().to_vec(),
             ));
-            // The fresh log tail is also the durable replay boundary: both
-            // frozen sources were drained and checkpointed before this txn,
-            // and compute_merge_streams places this extent strictly after the
-            // complete spliced source prefix.
-            kvs.push((
-                crate::stream_covered_prefix::stream_covered_key(
-                    p1.survivor_meta.log_stream,
-                ),
-                p1.new_tail_id.to_le_bytes().to_vec(),
-            ));
 
-            let mut deletes = vec![
+            let deletes = vec![
                 format!("partitions/{}", p1.victim_part_id),
                 format!("streams/{}", p1.victim_log),
                 format!("streams/{}", p1.victim_row),
@@ -4466,11 +4253,6 @@ impl AutumnManager {
                 format!("regions/{}", p1.victim_part_id),
                 format!("partitionLastOp/{}", p1.victim_part_id),
             ];
-            deletes.extend(
-                [p1.victim_log, p1.victim_row, p1.victim_meta]
-                    .into_iter()
-                    .map(crate::stream_covered_prefix::stream_covered_key),
-            );
             // Item 3 (uniform CAS): value-CAS each survivor stream against its
             // pre-splice baseline so a concurrent alloc/punch/truncate that
             // committed on a survivor stream during this RTT makes the merge
@@ -4520,10 +4302,6 @@ impl AutumnManager {
             .borrow_mut()
             .insert(p1.survivor_meta.part_id, now);
         self.last_op_at.borrow_mut().remove(&p1.victim_part_id);
-        self.commit_stream_covered_before(p1.survivor_meta.log_stream, p1.new_tail_id);
-        self.forget_stream_covered_before(p1.victim_log);
-        self.forget_stream_covered_before(p1.victim_row);
-        self.forget_stream_covered_before(p1.victim_meta);
 
         Ok(rkyv_encode(&MultiModifyMergeResp {
             code: CODE_OK,

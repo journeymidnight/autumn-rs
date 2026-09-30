@@ -1,3 +1,12 @@
+Date: 2026-09-30 (3)
+TaskStatus: completed
+Task scope: user "merge先stop，然后flush，所有merge就完全不需要从log stream恢复啊" → "不兼容" → "都放行" (BUG-MERGE-REPLAY-NOT-NEEDED).
+Current summary: the split/merge freeze drain always ends with publish_freeze_checkpoint (log-end cursor, admitted fence floors), for split too. A merged open (>1 records) starts replay at the latest resolvable source cursor; one union max-seq skip. Removed: the covered-prefix marker (8c9d267's manager/rpc/stream files restored to 5b6a378 by the user's command, stream_covered_prefix.rs deleted, merge fallback-node filter re-applied, opcode 0x62 reserved), per-source offsets/regions, meta "intact" tracking, the chunked merge-recovery flush (and its key-splitting bug), NOT_INTACT in convert_sst, log_extent_count computation (written 0; one manager RPC per flush saved).
+Verification: system_merge_single_checkpoint merged-open replay < 64 KiB (earliest-cursor ablation red: 1,065,000 bytes); new system_split_fence_floor (ablation: freeze checkpoint without floors → red). partition-server lib 278, rpc 87, manager lib 442, convert_sst unit; 36 integration suites incl. ignored green, key suites re-run after the review fixes.
+Review: opus x2. Applied: a merged open no longer fails on an unresolved (reclaimed empty-tail) cursor; dedup is the union max seq (dedup 0 with a skipped cursor would let a superseded record shadow an SST value — no deterministic test, argued in code/doc); stale comments; ops upgrade preconditions; etcd cleanup note.
+Main gaps: committed locally, not pushed.
+Next steps: user decides push; production upgrade per docs/ops.md (all merged survivors opened once on the old build; optional etcdctl del --prefix streamCoveredBefore/).
+
 Date: 2026-09-30 (2)
 TaskStatus: completed
 Task scope: user "part 反复split, merge， minor compact以后， sst 不是依赖sst的顺序找最新的吗？ 但是row stream的顺序会乱吗" → "按 last_seq 排序（HBase 的思路）" → "复现测试" (BUG-MERGE-MINOR-ORDER).

@@ -894,7 +894,7 @@ same rule by ordering store files by sequence id.
 
 `sort_tables_by_seq` (stable) establishes it at open and after every change
 that is not an append: a compaction's swap (outputs are pushed, then sorted)
-and the merge-recovery flush. A flush appends at the end, which is already in
+and the merged open's flush. A flush appends at the end, which is already in
 order. Within one partition, seq order is recency order: each flush covers a
 later seq interval than every table before it, and a compaction replaces a
 contiguous run with outputs that hold disjoint keys. After a merge the two
@@ -908,11 +908,7 @@ V1's newer values in front of V0, and a Get found V0's older copy first —
 `system_merge_minor_compaction_order` (the auto-trim is the minor compaction;
 the key read back "old"). Appending the outputs at the end instead had broken
 reads when a flush completed during the compaction (the chaos fence+flush
-data-loss bug). The merge-recovery chunks (`split_memtable_by_bytes`) are a
-separate case this ordering cannot fix: chunks of one memtable share a seq
-interval, so when a key's versions split across two chunks, whether a Get finds
-the newest depends on which chunk happens to sort later; the cut must fall
-between user keys.
+data-loss bug).
 
 ### Row-stream truncation = the first extent a live table references
 
@@ -1136,8 +1132,7 @@ meta_stream checkpoint — set in `commit_flush_outcome_inner` AFTER
 checkpoint's cursor when there is exactly ONE checkpoint record (it is durable
 and recovery replays from it). With several (a merge's sources) the open
 publishes one merged record before serving and sets it from that; until the
-append acks it is `(0,0)` — the MIN: punching log extents while two sources'
-dedup regions are computed from extent positions would shift them. A compaction's ack does not set it: its
+append acks it is `(0,0)` — the MIN. A compaction's ack does not set it: its
 append may ack after a newer flush's and move the floor back; the next flush
 covers it. Every log record strictly
 below a durable checkpoint vp is in that checkpoint's persisted SST set (or
@@ -1153,34 +1148,44 @@ checkpoint (whose SSTs don't cover `[V_old, V_new)`) → silent loss. The ack-ga
 
 ### Recovery replay start = the checkpoint's cursor
 
-`recover_partition` starts its extent walk at the EARLIEST (by stream position)
-cursor among the loaded checkpoint records (one per source after a merge; one
-otherwise). `MSG_MERGE_FREEZE` writes an ordinary checkpoint after write drain
-while holding `maintenance_gate`; every maintenance path re-checks the freeze
-after acquiring the gate. The manager's merge transaction then appends a fresh
-log tail and atomically writes `streamCoveredBefore/<stream_id> = <tail extent
-id>`. Split similarly allocates a fresh log tail for each child and publishes
-each membership and marker in one transaction. The marker means every earlier
-extent in that stream is checkpoint-covered. It is replay-only and is never a
-GC or large-value liveness proof.
+`recover_partition` walks the log from the cursor of the checkpoint it loaded,
+to the end, each extent once at its first occurrence (a merged log lists
+CoW-shared extents more than once; positions, never extent ids, order it).
+Records with seq <= the loaded SSTs' max seq are skipped as already in an SST.
 
-Recovery fetches the sidecar through the internal `MSG_STREAM_REPLAY_INFO`
-opcode, leaving the public `MSG_STREAM_INFO` wire shape unchanged. If the marker
-is a member of the current ordered extent list and at least one cursor-bearing
-checkpoint was loaded from an intact meta stream, it is a durable lower bound:
-replay starts at the marker at offset zero, or at a later ordinary checkpoint
-cursor. Missing markers (old managers), dangling markers (prefix trim), streams
-without a cursor-bearing checkpoint, and any corrupt or partial meta frame use
-the conservative walk. Legacy `AUMSB001` companion frames are no longer emitted
-or interpreted; the checkpoint decoder skips them as unknown malformed records,
-keeps the preceding valid `TableLocations`, and disables marker use.
+Split and merge stop writes and drain first (`try_complete_freeze_drain`), and
+the drain ALWAYS ends with `publish_freeze_checkpoint`: the SSTs and admitted
+fence floors at the source's committed log end, while writes and maintenance
+are stopped — also when the drain flushed nothing. So nothing before a split or
+merge ever needs replay:
 
-In the conservative fallback, each resolved source cursor extent starts at its
-own byte offset, but no complete prefix is skipped from
-`log_extent_count`: that count may be stale, and source growth plus prefix
-truncation can make stale counts cancel. If any cursor is unresolved, the prior
-global plan remains. CoW duplicate cursor extents are read once from the smallest
-source offset.
+- A split child starts at that checkpoint (it inherits the parent's meta
+  stream) and replays only its own writes. A WAL-only fence bump committed
+  since the last flush lies before that cursor, so the checkpoint's admitted
+  fence floors are the only place it survives: `system_split_fence_floor` (a
+  failed compare-write that raised the floor, split, restart — the revoked
+  epoch must stay fenced on both children; red when this checkpoint carries no
+  floors).
+- A merged survivor loads one record per source (the last record of each
+  meta extent) and starts at the LATEST cursor by stream position. The log is
+  `[survivor][victim][new tail]` and each record covers its own source up to
+  its end, so what follows is only the merged partition's own writes, whose
+  seqs start above both sources' maximum — one max-seq skip is sound. Starting
+  at the earliest cursor (the survivor's) re-read the victim's whole log on
+  every merged open (`system_merge_single_checkpoint`: 1,065,000 bytes instead
+  of < 64 KiB when ablated). A record whose cursor does not resolve is
+  ignored — a drain on an empty tail points at `(T, 0)`, and the sealed-empty
+  sweep or GC may reclaim T once the merge sealed it behind newer extents;
+  replay then starts at an earlier cursor, or with none resolving walks the
+  whole log, and the max-seq skip drops every flushed record on the way (it
+  must: a superseded record in a flushed region would otherwise shadow the
+  newer value in an SST). Merges made by builds whose drain did
+  not always write this checkpoint are not supported. The open then replaces
+  the records with one (`publish_merged_checkpoint`, below), whose cursor is
+  the log tail.
+
+The manager keeps no replay state for this; split and merge only seal and
+splice.
 
 The vp_heads stamped on the SSTs a record lists do NOT lower the global start: the
 record's cursor is at or past all of them (flush FIFO + `checkpoint_vp_head`), so
@@ -1193,12 +1198,8 @@ after a CLEAN drain re-read the whole WAL since (observed: ~190 s, a 15.75 GB ta
 extent read from an 780 MB-old cursor). The earlier rejection of "MIN→MAX" was
 about a MAX over SST stamps, which can land where no durable checkpoint says; this
 is the checkpoint itself, the same invariant GC's durable raise rests on.
-`recover_partition: replay plan built` reports
-`source_cursor_offsets_applied=true` when the conservative fallback applies
-per-source cursor offsets. `covered_prefix_applied=true` proves the durable
-stream prefix was skipped; the offsets flag may also be true when it constructed
-the initial plan before the marker raised its lower bound. `planned_extents` then
-normally equals one: the fresh merge or split tail.
+`recover_partition: replay plan built` reports the records loaded and the
+extents planned.
 `recover_partition: log replay done` logs the real start, bytes, records kept vs
 already covered, and time; `replay_read_bytes(part_id)` exposes the bytes to tests.
 `crates/manager/tests/system_restart_replay_cursor.rs` and
@@ -1666,7 +1667,7 @@ stay gate-first to match split, else `acquire_compact ↔ maintenance_gate` cycl
      max_seq/vp_extent_id/vp_offset)
   7. Spawn P-sst OS thread (flush_worker_loop on own compio runtime)
   8. More than one checkpoint record (a merge's sources): publish one merged record
-     before serving (`publish_merged_checkpoint`; flushes a non-empty memtable)
+     before serving (`publish_merged_checkpoint`)
   9. Spawn P-log background tasks on this thread (maintenance loop, flush loop,
      accept loop, dispatch)
 ```
@@ -2248,19 +2249,16 @@ Three fixes bound the restart replay window (worst case per partition =
     Recovery on success: the merge txn deletes victim's region and widens survivor's;
     `region_sync_loop` sees both on its next ~2 s tick, drops the frozen `PartitionData`
     for victim, reopens survivor with `frozen_for_merge = None` (no explicit unfreeze).
-    The splice leaves one checkpoint record per source in the survivor's meta stream.
-    Recovery keeps the earliest cursor as its conservative extent-walk start, but
-    applies each resolved source cursor's byte offset to that source's cursor extent;
-    a 10+ GiB victim tail is therefore not reread from byte zero. It deliberately does
-    not infer whole-source boundaries from checkpoint-time extent counts. The
-    survivor's open, before it serves,
-    replaces them with one (`publish_merged_checkpoint`): a non-empty memtable is
-    flushed; an empty one (the drained case) gets a record listing the loaded tables
-    with the log tail as its cursor, and `save_table_locs_raw` truncates meta_stream to
-    the extent holding it. This is what the first flush used to do; the drain writes
-    no checkpoint when the memtable is empty, so until then every restart replayed the
-    victim's WAL. A crash before the append leaves the records and the next open
-    repeats it. Regression: `crates/manager/tests/system_merge_single_checkpoint.rs`.
+    The splice leaves one checkpoint record per source in the survivor's meta stream,
+    each written by that source's drain at its committed log end; recovery starts
+    at the latest of them and replays nothing from either source ("Recovery replay
+    start"). The survivor's open, before it serves, replaces them with one
+    (`publish_merged_checkpoint`): an empty memtable (the normal case) gets a record
+    listing the loaded tables with the log tail as its cursor; a non-empty one — only
+    writes from an earlier merged open that crashed before this step — is flushed.
+    `save_table_locs_raw` truncates meta_stream to the extent holding it. A crash
+    before the append leaves the records and the next open repeats it. Regression:
+    `crates/manager/tests/system_merge_single_checkpoint.rs`.
     Recovery on failure: manager sends `MSG_MERGE_FREEZE { freeze: false }` rollback; the
     FREEZE_TTL backstop fires if even that fails. Merge wallclock is ~2–3 s (bounded by
     the region_sync tick) but write loss is 0. This model avoids cross-thread plumbing

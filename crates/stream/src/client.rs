@@ -4115,51 +4115,6 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("stream {} not found", stream_id))
     }
 
-    /// Recovery-only stream query. Kept on a distinct opcode so the public
-    /// `MSG_STREAM_INFO` response remains compatible with every client in the
-    /// negotiated window. The optional extent id is a durable lower bound:
-    /// extents before it are checkpoint-covered and need no WAL replay.
-    pub async fn get_stream_replay_info(
-        &self,
-        stream_id: u64,
-    ) -> Result<(StreamInfo, Option<u64>)> {
-        let req = manager_rpc::rkyv_encode(&StreamInfoReq {
-            stream_ids: vec![stream_id],
-        });
-        let resp_data = match self
-            .manager_call(MSG_STREAM_REPLAY_INFO, req, Duration::from_secs(5))
-            .await
-        {
-            Ok(data) => data,
-            Err(err) => {
-                // Rolling upgrade: an older manager does not know the internal
-                // replay-info opcode. Missing the marker only costs a
-                // conservative scan, so retain availability by falling back to
-                // the established stream-info call.
-                tracing::warn!(
-                    stream_id,
-                    error = %err,
-                    "stream replay metadata unavailable; using conservative stream info"
-                );
-                return self
-                    .get_stream_info(stream_id)
-                    .await
-                    .map(|info| (info, None));
-            }
-        };
-        let resp: StreamReplayInfoResp =
-            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
-        self.check_manager_resp(resp.code, &resp.message, "stream_replay_info")?;
-        let (_, replay) = resp
-            .streams
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow!("stream {} not found", stream_id))?;
-        let covered_before = (replay.covered_before_extent_id != 0)
-            .then_some(replay.covered_before_extent_id);
-        Ok((Self::mgr_to_stream_info(&replay.stream), covered_before))
-    }
-
     /// Return the ExtentInfo for a given extent (includes sealed_length). Cached.
     pub async fn get_extent_info(&self, extent_id: u64) -> Result<ExtentInfo> {
         self.fetch_extent_info(extent_id).await

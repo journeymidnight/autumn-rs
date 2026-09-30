@@ -14,15 +14,6 @@ use bytes::Bytes;
 use crate::sstable::format::DecodedBlock;
 use crate::sstable::{SstBuilder, SstReader};
 
-/// A meta-stream frame no build decodes as `TableLocations` (8 bytes; any
-/// archived checkpoint is longer). The tool appends it right after the
-/// checkpoint it republishes when the meta stream it read was not intact — a
-/// frame that failed to decode, or a partial tail. Recovery trusts the
-/// manager's covered-prefix marker only on an intact meta stream, because a
-/// checkpoint recovered past a bad newer frame may be older than the one the
-/// marker vouches for; republishing it as the only frame would hide that.
-pub const NOT_INTACT_FRAME: &[u8] = b"AUCVNI01";
-
 /// A rebuilt SST and the fields the tool compares against the old MetaBlock.
 pub struct RebuiltSst {
     pub bytes: Vec<u8>,
@@ -73,32 +64,6 @@ pub fn rebuild_sst(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn frame(payload: &[u8]) -> Vec<u8> {
-        let mut f = (payload.len() as u32).to_le_bytes().to_vec();
-        f.extend_from_slice(payload);
-        f
-    }
-
-    /// Recovery reads a republished checkpoint followed by the marker frame
-    /// as that checkpoint, from a meta stream that is NOT intact.
-    #[test]
-    fn the_not_intact_frame_keeps_the_checkpoint_and_disables_the_marker() {
-        let ckpt = autumn_rpc::partition_rpc::TableLocations {
-            locs: vec![],
-            vp_extent_id: 7,
-            vp_offset: 99,
-            log_extent_count: 1,
-            fence_floors: vec![],
-        };
-        let mut data = frame(&crate::rkyv_encode(&ckpt));
-        let (_, intact) = crate::decode_last_table_checkpoint_with_health(&data).unwrap();
-        assert!(intact);
-        data.extend_from_slice(&frame(NOT_INTACT_FRAME));
-        let (got, intact) = crate::decode_last_table_checkpoint_with_health(&data).unwrap();
-        assert_eq!((got.vp_extent_id, got.vp_offset), (7, 99));
-        assert!(!intact);
-    }
 
     /// Rebuilding an SST from its own blocks reproduces its data blocks and
     /// MetaBlock fields; with at most one discard entry (the map's encode

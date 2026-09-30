@@ -2502,17 +2502,17 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 # replays nothing, this snapshots replay_read_bytes immediately before the merge:
 # the merge reopen must read <64 KiB, not the victim's ~2 MiB of sealed,
 # checkpoint-covered prefix extents. The test explicitly rolls each source WAL
-# twice and asserts that both contain at least three extents before merge. On a
-# live merge from newly upgraded sources, expect `recover_partition: replay plan
-# built` with `exact_source_boundaries_applied=true` and
-# `source_cursor_offsets_applied=false`; `planned_extents=1` is the fresh
-# post-merge tail and the following `log replay done ... bytes=N` should be near
-# zero. `MSG_MERGE_FREEZE` writes each source's exact ordered log extent list in
-# a versioned companion record while writes and maintenance are halted. Recovery
-# accepts it only when every source is certified and those lists reproduce the
-# manager's CoW-deduplicated merged prefix. Old, partial, unresolved, or
-# mismatching records fall back to the conservative cursor-offset walk; stale
-# checkpoint-time `log_extent_count` is never trusted to skip whole extents.
+# twice and asserts that both contain at least three extents before merge. The
+# merge freeze drain writes each source's checkpoint at its committed log end,
+# and the merged open starts replay at the latest of those cursors, so on a live
+# merge expect `recover_partition: replay plan built` with `n_meta_records=2`
+# and the following `log replay done ... bytes=N` near zero. A source cursor
+# no longer in the log (its empty tail was reclaimed) is ignored; replay then
+# reads from an earlier cursor (or the whole log) and skips everything already
+# flushed — slower, not wrong.
+# Split does the same: its drain always writes a log-end checkpoint, so a child
+# replays only its own writes; cargo test -p autumn-manager --test
+# system_split_fence_floor checks that a WAL-only lease fence bump survives it.
 # Two more actions shape the row stream: `rollrow` seals and rolls every
 # partition's row tail (the fence-drain path), `flushburst` flushes every
 # partition 8 times so the PS's own size-tiered trim (past 32 SSTs) runs.
@@ -4351,6 +4351,11 @@ extent nodes keep running throughout, and the wire version is unchanged.
 #    Every other partition gains nothing: a major rewrites it once and the
 #    conversion rewrites it again. Not a prerequisite — convert_sst takes any SST.
 autumn-op --manager $MGR --wait compact <PART>
+#    Before stopping: every merged partition must have opened once on the old
+#    build (its meta stream then holds one checkpoint). The new PS starts a
+#    merged open at the latest source cursor and supports only merges whose
+#    freeze drain always wrote a log-end checkpoint; convert_sst refuses a
+#    partition still holding several records, which catches the rest.
 # 1. Stop EVERY autumn-ps (graceful SIGTERM). Leave manager and ENs up.
 #    convert_sst refuses to run while any PS heartbeated in the last 10 s.
 # 2. See what will be converted (reads and rebuilds, writes no data):
@@ -4384,6 +4389,10 @@ entry and tombstone sums, then the usual `compact part N: major ...` line.
 
 Once every cluster is converted, delete `convert_sst`, its Dockerfile line and
 `autumn_partition_server::sst_convert`.
+
+A cluster that ran a build with the covered-prefix replay marker holds
+`streamCoveredBefore/<stream>` keys in etcd; nothing reads them any more.
+Optional cleanup with the manager up: `etcdctl del --prefix streamCoveredBefore/`.
 
 ## Compio runtime upgrade verification
 
