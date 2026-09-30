@@ -1,3 +1,12 @@
+Date: 2026-09-30 (4)
+TaskStatus: completed
+Task scope: user "每次不是有perf check吗？ 写一个sub command perf clean".
+Current summary: `autumn-client perf-clean [--dry-run] [--parallel N]` deletes everything under the bench/perf scope (perf-check and ycsb keys): each bench partition's user range (from bench_user_starts) is paged with the new `ClusterClient::range_until` (4096 keys, exclusive end that is also range_bound's partition-walk cap, so a short page never reads the next partitions' tombstones) and deleted with one delete_many per page, N ranges concurrently; partial totals print even when a range fails. Data-plane only. Space returns via the PS deletion rule once tombstones reach SSTs, or at once with `autumn-op compact`.
+Verification: local real-process cluster (manager, 1 EN, 1 PS): perf-check wrote 89.6k keys, perf-clean deleted 89,588 (3.0 s), dry run 0; after a split into two bench partitions 89,889 deleted in 1.5 s, then with range_until 115,512 in 2.7 s, dry run 0, `ls` empty. The PS's deletion rule fired once the tombstones were in SSTs (entries=179176 deletions=89588 → major discarded 179176); memtable-only tombstones did not trigger it (as designed); `autumn-op compact` on both partitions discarded all entries, 0 tables left. Cluster and data removed.
+Review: opus, no correctness issue. Applied: range_until (a short page used to walk later partitions' tombstones), accurate reclamation wording, clippy attribute back on cmd_perf_check, partial total on error, doc row, ops.md without the run log.
+Main gaps: none. Not pushed.
+Next steps: none.
+
 Date: 2026-09-30 (3)
 TaskStatus: completed
 Task scope: user "merge先stop，然后flush，所有merge就完全不需要从log stream恢复啊" → "不兼容" → "都放行" (BUG-MERGE-REPLAY-NOT-NEEDED).

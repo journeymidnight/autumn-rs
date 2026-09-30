@@ -67,7 +67,7 @@ fixed-key benchmark for comparisons sensitive to cache/SST state.
 | `autumn-manager-server` | 9001 | Control plane (streams, partitions, recovery) |
 | `autumn-extent-node` | 9101+ | Data plane (raw extent files on disk) |
 | `autumn-ps` | 9201 binary default; deployments use 9301 (+ per-partition) | LSM partition server |
-| `autumn-client` | — | Data-plane CLI (put/get/del/head/ls/perf-check) |
+| `autumn-client` | — | Data-plane CLI (put/get/del/head/ls/perf-check/perf-clean) |
 | `autumn-op` | — | Admin CLI (bootstrap/split/merge/compact/gc/info/df/format) |
 | `autumn-stream-cli` | — | Low-level stream debugging |
 | `autumn-fuse` | — | FUSE mount of the `fs/` namespace (entrypoint role `fuse`) |
@@ -2079,6 +2079,15 @@ $AC del KEY                              # delete
 $AC ls --prefix p/ --limit 100           # scan
 $AC put-stream KEY /path/to/big.bin      # chunked stripe-put for large values
 $AC perf-check --threads 16 --size 4096 --duration 10 --partitions 8
+$AC perf-clean --dry-run                 # count what perf-check / ycsb left (bench/perf)
+$AC perf-clean [--parallel 8]            # delete it; each bench partition range in
+                                         # parallel, one delete_many per 4096-key page.
+$AC perf-clean --dry-run                 # expect 0 afterwards
+# The deletes leave tombstones and dead values. A PS major-compacts a partition
+# itself once its SSTs hold >= 10000 tombstones and >= 30% of entries (checked
+# every --deletion-compact-check-secs, 300 s by default) — the memtable is not
+# counted, so small cleans wait for the next flush. To reclaim now:
+$AO compact PART_ID
 
 # SST block cache (paged SSTs; SST data blocks no longer RAM-resident)
 # PS flag: autumn-ps --sst-block-cache-bytes N   (cluster.sh: AUTUMN_SST_BLOCK_CACHE_BYTES, default 512MB)

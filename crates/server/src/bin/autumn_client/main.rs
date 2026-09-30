@@ -475,6 +475,89 @@ async fn cmd_ycsb(
     Ok(())
 }
 
+/// `perf-clean`: delete every key the benchmarks wrote, i.e. everything under
+/// the `bench/perf` scope (perf-check and ycsb keys alike).
+///
+/// Each bench partition's user range is cleaned on its own, `parallel` at a
+/// time: a page of keys from `range_until` (which never walks into the next
+/// partition, so a short page does not read another range's tombstones),
+/// deleted with one `delete_many`, then the next page from just after the last
+/// key. The deletes leave tombstones and dead values; a partition server
+/// major-compacts on its own once its SSTs (not its memtable) hold enough of
+/// them, and `autumn-op compact` reclaims at once.
+async fn cmd_perf_clean(
+    client: &ClusterClient,
+    manager: &str,
+    cred: Option<(String, Vec<u8>)>,
+    dry_run: bool,
+    parallel: usize,
+) -> Result<()> {
+    use futures::stream::{self, StreamExt};
+    const PAGE: u32 = 4096;
+
+    let starts = bench_user_starts(&client.all_partitions_with_range().await?);
+    let ranges: Vec<(Vec<u8>, Option<Vec<u8>>)> = starts
+        .iter()
+        .enumerate()
+        .map(|(i, s)| (s.clone(), starts.get(i + 1).cloned()))
+        .collect();
+    let bench = bench_connect(manager, &cred).await?;
+    let bench = &bench;
+    let started = Instant::now();
+    println!(
+        "==> perf-clean: {} bench partition range(s){}",
+        ranges.len(),
+        if dry_run { " (dry run: counting only)" } else { "" }
+    );
+    let results: Vec<Result<u64>> = stream::iter(ranges)
+        .map(|(start, end)| async move {
+            let mut cursor = start;
+            let mut removed = 0u64;
+            loop {
+                let page = match &end {
+                    Some(end) => bench.range_until(b"", &cursor, end, PAGE).await,
+                    None => bench.range(b"", &cursor, PAGE).await,
+                }
+                .map_err(|e| anyhow!("range from {:?}: {e}", String::from_utf8_lossy(&cursor)))?;
+                let keys: Vec<&[u8]> = page.entries.iter().map(|e| e.key.as_slice()).collect();
+                if !keys.is_empty() && !dry_run {
+                    for (key, r) in keys.iter().zip(bench.delete_many(&keys).await) {
+                        r.map_err(|e| anyhow!("delete {:?}: {e}", String::from_utf8_lossy(key)))?;
+                    }
+                }
+                removed += keys.len() as u64;
+                if !page.has_more || page.entries.is_empty() {
+                    return Ok::<u64, anyhow::Error>(removed);
+                }
+                cursor = page.entries.last().expect("non-empty page").key.clone();
+                cursor.push(0);
+            }
+        })
+        .buffer_unordered(parallel)
+        .collect()
+        .await;
+    let mut total = 0u64;
+    let mut first_err = None;
+    for r in results {
+        match r {
+            Ok(n) => total += n,
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    println!(
+        "perf-clean: {} {total} bench key(s) in {:.1}s{}",
+        if dry_run { "found" } else { "deleted" },
+        started.elapsed().as_secs_f64(),
+        if first_err.is_some() { " (some ranges failed)" } else { "" }
+    );
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 // Main
 // ---------------------------------------------------------------------------
 
@@ -1068,7 +1151,10 @@ async fn main() -> Result<()> {
     };
 
     let client = match &args.command {
-        Command::PerfCheck { .. } | Command::Ycsb { .. } | Command::OpStub { .. } => {
+        Command::PerfCheck { .. }
+        | Command::PerfClean { .. }
+        | Command::Ycsb { .. }
+        | Command::OpStub { .. } => {
             ClusterClient::connect_raw(&args.manager).await?
         }
         _ => {
@@ -1307,6 +1393,10 @@ async fn main() -> Result<()> {
             &client, threads, duration_secs, value_size, baseline_file, threshold, update_baseline, partitions_meta_from_flag, pipeline_depth, group_commit_cap, bulk, ramp_ms, direct_read, &args.manager, cred,
         )
         .await?,
+
+        Command::PerfClean { dry_run, parallel } => {
+            cmd_perf_clean(&client, &args.manager, cred, dry_run, parallel).await?
+        }
 
         Command::Ycsb {
             threads,

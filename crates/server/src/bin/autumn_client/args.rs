@@ -88,6 +88,13 @@ pub(crate) enum Command {
         /// read) instead of get/get_into.
         direct_read: bool,
     },
+    /// Delete every key the benchmarks wrote (everything under the
+    /// `bench/perf` scope: perf-check and ycsb data). `dry_run` only counts.
+    PerfClean {
+        dry_run: bool,
+        /// Bench partitions cleaned concurrently.
+        parallel: usize,
+    },
     /// YCSB-equivalent mixed-workload benchmark. Unlike perf-check (pure
     /// write phase then pure read phase), this runs ONE mixed loop with a
     /// configurable read/write ratio and key-access distribution — so it
@@ -152,6 +159,8 @@ fn usage() -> ! {
     eprintln!("  ls [--prefix P] [--start S] [--limit N]  List keys");
     eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]   (zero-copy auto on --transport ucx)");
     eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
+    eprintln!("  perf-clean [--dry-run] [--parallel 8]");
+    eprintln!("                                    Delete everything perf-check / ycsb wrote (the bench/perf scope)");
     eprintln!("  ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian|uniform] [--records 100000] [--rmw]");
     eprintln!("                                    YCSB-equivalent mixed workload (A=0.5 B=0.95 C=1.0 D=0.95 F=--rmw); LOAD then mixed RUN");
     eprintln!();
@@ -557,6 +566,28 @@ pub(crate) fn parse_args() -> Args {
                 ramp_ms,
                 direct_read,
             }
+        }
+        "perf-clean" => {
+            let mut dry_run = false;
+            let mut parallel = 8usize;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--dry-run" => dry_run = true,
+                    "--parallel" => {
+                        i += 1;
+                        parallel = val(&raw, i).parse().expect("--parallel must be a number");
+                        if parallel == 0 {
+                            usage();
+                        }
+                    }
+                    other => {
+                        eprintln!("unknown perf-clean flag: {other}");
+                        usage();
+                    }
+                }
+                i += 1;
+            }
+            Command::PerfClean { dry_run, parallel }
         }
         "ycsb" => {
             let mut threads = 32usize;

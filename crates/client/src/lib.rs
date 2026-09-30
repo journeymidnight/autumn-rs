@@ -4761,6 +4761,44 @@ impl ClusterClient {
         Ok(result)
     }
 
+    /// `range` that stops before `end` (exclusive): no key at or after it is
+    /// returned, and — the point — the scan does not walk into partitions
+    /// that start at or after it. A plain `range` whose page is not full in
+    /// its own partition keeps reading the next ones, which is costly when
+    /// those hold nothing but tombstones (a bulk delete walking a keyspace
+    /// partition by partition). `has_more` is false once `end` is reached.
+    pub async fn range_until(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: &[u8],
+        limit: u32,
+    ) -> std::result::Result<RangeResult, AutumnError> {
+        let wire_prefix = self.binding.bind_prefix(prefix)?;
+        let wire_start: Vec<u8> = if start.is_empty() {
+            Vec::new()
+        } else {
+            self.binding.bind_key(start)?
+        };
+        let wire_end = self.binding.bind_key(end)?;
+        let cap = match self.binding.upper_cap() {
+            Some(ns_cap) if ns_cap < wire_end => ns_cap,
+            _ => wire_end.clone(),
+        };
+        let mut result = self
+            .range_bound(&wire_prefix, &wire_start, limit, Some(&cap))
+            .await?;
+        let before = result.entries.len();
+        result.entries.retain(|e| e.key < wire_end);
+        if result.entries.len() < before {
+            result.has_more = false;
+        }
+        for e in result.entries.iter_mut() {
+            e.key = self.binding.strip(std::mem::take(&mut e.key));
+        }
+        Ok(result)
+    }
+
     /// D7: this client's namespace binding.
     pub fn binding(&self) -> &NamespaceBinding {
         &self.binding

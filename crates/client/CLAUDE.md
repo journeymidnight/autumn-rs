@@ -138,6 +138,14 @@ the API suffix.
 - `delete(key)` — delete a key.
 - `head(key) → KeyMeta` — metadata (`found`, `value_length`).
 - `range(prefix, start, limit) → RangeResult` — prefix scan (resume cursor below).
+- `range_until(prefix, start, end, limit) → RangeResult` — the same scan stopping
+  before `end` (exclusive). `end` is also the cap `range_bound` stops walking
+  partitions at, so a page that is not full in its own partition does not read
+  the partitions after `end` — which a plain `range` does until it fills the
+  page or reaches the namespace cap, and which costs a full tombstone walk when
+  those partitions were just bulk-deleted (`autumn-client perf-clean` pages per
+  partition this way). Keys at or past `end` are dropped and then `has_more` is
+  false.
 
 **Stream operations (large values):**
 - `put_stream_begin(key, expires_at) → PutStreamHandle` — streaming writer; the handle
