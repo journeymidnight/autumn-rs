@@ -684,6 +684,15 @@ pub(crate) async fn background_maintenance_loop(
                         clear_compact_inflight();
                         continue;
                     }
+                    // A major skips only with no table left after its flush,
+                    // so no tombstone exists anywhere: the deletes counted in
+                    // `settling` are gone — an expiry major that dropped every
+                    // entry leaves no table and does not settle. Without this
+                    // the count stayed up and SETTLE re-advised this no-op
+                    // compaction every cooldown.
+                    if major {
+                        settle_deletes(&metrics, settling);
+                    }
                     metrics.pending_compaction_bytes.store(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,

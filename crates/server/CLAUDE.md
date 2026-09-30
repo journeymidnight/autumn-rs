@@ -425,6 +425,23 @@ row stream (cut before the first extent, in stream order, a listed SST is in).
   PS first, which reads v2 as well and publishes one record.
 - Truncates like the PS's `row_truncate_point`, and cuts nothing when a listed
   SST's extent is missing from the row stream.
+- Keeps a non-intact meta stream non-intact. Recovery trusts the manager's
+  covered-prefix marker only when every meta frame decoded (a checkpoint found
+  past a bad newer frame may be older than the one the marker vouches for), so
+  when a frame failed to decode or the tail was partial the republished
+  checkpoint is followed, in the same append, by `sst_convert::NOT_INTACT_FRAME`,
+  which decodes as no checkpoint. Without it the rewrite would present a
+  possibly older checkpoint as the whole, intact stream.
+- Publishes safely on a damaged meta tail: when the stream is not intact it
+  rolls the meta tail first, because a tail ending inside a frame whose length
+  runs past the end would swallow frames appended after it; it truncates the
+  meta stream to the extent its append landed in (not the stream's last, which
+  an append-time roll can make a fresh empty extent); and it re-reads the meta
+  stream the way recovery does and refuses to truncate the row stream unless it
+  gets back exactly the checkpoint just published. Verified on real processes
+  with a partial frame appended to a partition's meta stream: converted and all
+  keys correct; with the roll removed the read-back check refused and left the
+  row stream untouched.
 - Resumable: the checkpoint is replaced only after every SST is appended, and
   the version field says which SSTs are done, so a rerun converts what is left
   and a finished partition only repeats the truncate.

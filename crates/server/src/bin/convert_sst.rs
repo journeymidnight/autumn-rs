@@ -41,7 +41,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
 
-use autumn_partition_server::sst_convert::rebuild_sst;
+use autumn_partition_server::sst_convert::{rebuild_sst, NOT_INTACT_FRAME};
 use autumn_rpc::manager_rpc::{self, rkyv_decode, rkyv_encode};
 use autumn_rpc::partition_rpc::{SstLocation, TableLocations};
 use autumn_stream::{normalize_endpoint, ConnPool, StreamClient};
@@ -239,45 +239,86 @@ fn convert_sst_bytes(sst: &[u8]) -> Result<(Vec<u8>, u64, u64)> {
 // Checkpoints (the PS's `read_all_table_locations` / `save_table_locs_raw`).
 // ---------------------------------------------------------------------------
 
-/// The last valid `[len u32][rkyv TableLocations]` record in a meta extent.
-fn last_table_locations(mut buf: &[u8]) -> Option<TableLocations> {
+/// The last valid `[len u32][rkyv TableLocations]` record in a meta extent,
+/// and whether every frame decoded with no partial tail — the same verdict as
+/// the PS's `decode_last_table_checkpoint_with_health`.
+fn last_table_locations(mut buf: &[u8]) -> (Option<TableLocations>, bool) {
     let mut last = None;
+    let mut intact = true;
     while buf.len() >= 4 {
         let len = u32::from_le_bytes(buf[..4].try_into().unwrap()) as usize;
         if 4 + len > buf.len() {
+            intact = false;
             break;
         }
-        if let Ok(t) = rkyv_decode::<TableLocations>(&buf[4..4 + len]) {
-            last = Some(t);
+        match rkyv_decode::<TableLocations>(&buf[4..4 + len]) {
+            Ok(t) => last = Some(t),
+            Err(_) => intact = false,
         }
         buf = &buf[4 + len..];
     }
-    last
+    (last, intact)
 }
 
-async fn read_checkpoints(sc: &StreamClient, meta_stream: u64) -> Result<Vec<TableLocations>> {
+/// The last checkpoint of every non-empty meta extent, and whether the whole
+/// stream was intact.
+async fn read_checkpoints(sc: &StreamClient, meta_stream: u64) -> Result<(Vec<TableLocations>, bool)> {
     let info = sc.get_stream_info(meta_stream).await?;
     let mut out = Vec::new();
+    let mut intact = true;
     for &eid in &info.extent_ids {
         let (payload, _) = sc.read_bytes_from_extent(eid, 0, 0).await?;
-        if let Some(t) = last_table_locations(&payload) {
-            out.push(t);
+        if payload.is_empty() {
+            continue;
         }
+        let (last, ok) = last_table_locations(&payload);
+        intact &= ok && last.is_some();
+        out.extend(last);
     }
-    Ok(out)
+    Ok((out, intact))
 }
 
-async fn publish_checkpoint(sc: &StreamClient, meta_stream: u64, t: &TableLocations) -> Result<()> {
+/// Append the checkpoint — followed, in the SAME append, by
+/// `NOT_INTACT_FRAME` when the stream it replaces was not intact, so recovery
+/// keeps distrusting the covered-prefix marker — then keep only the extent the
+/// append landed in.
+///
+/// A non-intact stream may end inside a frame whose length prefix runs past
+/// the end; appended after it, the new frames would be read as that frame's
+/// body. So the tail is rolled first and the new frames start a fresh extent.
+/// Truncating to the append's own extent (not the stream's last) keeps them
+/// even if the append rolled the tail behind itself. Returns the extent.
+async fn publish_checkpoint(
+    sc: &StreamClient,
+    meta_stream: u64,
+    t: &TableLocations,
+    intact: bool,
+) -> Result<u64> {
+    if !intact {
+        sc.seal_and_roll_tail(meta_stream).await.context("roll meta tail")?;
+    }
     let payload = rkyv_encode(t);
-    let mut rec = Vec::with_capacity(4 + payload.len());
+    let mut rec = Vec::with_capacity(4 + payload.len() + 4 + NOT_INTACT_FRAME.len());
     rec.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     rec.extend_from_slice(&payload);
-    sc.append(meta_stream, &rec).await?;
-    let info = sc.get_stream_info(meta_stream).await?;
-    if info.extent_ids.len() > 1 {
-        sc.truncate(meta_stream, *info.extent_ids.last().unwrap()).await?;
+    if !intact {
+        rec.extend_from_slice(&(NOT_INTACT_FRAME.len() as u32).to_le_bytes());
+        rec.extend_from_slice(NOT_INTACT_FRAME);
     }
-    Ok(())
+    let r = sc.append(meta_stream, &rec).await?;
+    let info = sc.get_stream_info(meta_stream).await?;
+    if info.extent_ids.first() != Some(&r.extent_id) {
+        sc.truncate(meta_stream, r.extent_id).await?;
+    }
+    Ok(r.extent_id)
+}
+
+/// Same checkpoint content: SST list and replay cursor.
+fn same_checkpoint(a: &TableLocations, b: &TableLocations) -> bool {
+    let key = |t: &TableLocations| {
+        t.locs.iter().map(|l| (l.extent_id, l.offset, l.len)).collect::<Vec<_>>()
+    };
+    key(a) == key(b) && (a.vp_extent_id, a.vp_offset) == (b.vp_extent_id, b.vp_offset)
 }
 
 // ---------------------------------------------------------------------------
@@ -399,7 +440,7 @@ async fn convert_partition(
         }
     }
 
-    let mut ckpts = read_checkpoints(&sc, meta_stream).await.context("read checkpoint")?;
+    let (mut ckpts, intact) = read_checkpoints(&sc, meta_stream).await.context("read checkpoint")?;
     let mut report = PartReport::default();
     let ckpt = match ckpts.len() {
         0 => return Ok(report),
@@ -462,8 +503,21 @@ async fn convert_partition(
         return Ok(report);
     }
     if report.converted > 0 {
-        let new_ckpt = TableLocations { locs: new_locs.clone(), ..ckpt };
-        publish_checkpoint(&sc, meta_stream, &new_ckpt).await.context("publish checkpoint")?;
+        let new_ckpt = TableLocations { locs: new_locs.clone(), ..ckpt.clone() };
+        publish_checkpoint(&sc, meta_stream, &new_ckpt, intact)
+            .await
+            .context("publish checkpoint")?;
+        // Read it back the way recovery will before cutting anything: the row
+        // truncate below drops the v1 SSTs, which is only safe once recovery
+        // is certain to load the checkpoint naming their replacements.
+        let (back, back_intact) = read_checkpoints(&sc, meta_stream).await.context("re-read checkpoint")?;
+        if back.len() != 1 || !same_checkpoint(&back[0], &new_ckpt) || back_intact != intact {
+            bail!(
+                "the meta stream does not read back as the checkpoint just published \
+                 ({} records, intact {back_intact}); the row stream is left untouched",
+                back.len()
+            );
+        }
     }
 
     // Drop the row-stream prefix no listed SST lives in. Like the PS's
@@ -663,8 +717,21 @@ mod tests {
             rec.extend_from_slice(&(payload.len() as u32).to_le_bytes());
             rec.extend_from_slice(&payload);
         }
-        let back = last_table_locations(&rec).unwrap();
+        let (back, intact) = last_table_locations(&rec);
+        let back = back.unwrap();
         assert_eq!(back.locs[0].len, 5);
         assert_eq!(back.fence_floors, vec![(1, 2)]);
+        assert!(intact);
+
+        // An undecodable frame after it (the tool's own marker, a legacy
+        // companion, bit rot) keeps the checkpoint but is not intact.
+        rec.extend_from_slice(&(NOT_INTACT_FRAME.len() as u32).to_le_bytes());
+        rec.extend_from_slice(NOT_INTACT_FRAME);
+        let (back, intact) = last_table_locations(&rec);
+        assert_eq!(back.unwrap().vp_offset, 10);
+        assert!(!intact);
+        // A partial tail is not intact either.
+        let (_, intact) = last_table_locations(&rec[..rec.len() - 3]);
+        assert!(!intact);
     }
 }

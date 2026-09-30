@@ -852,9 +852,12 @@ flushed, no external trigger, the partition settles itself; red with the rule
 disabled).
 
 The expiry major (and a minor compaction's shadowing) drops tombstones without
-settling `unsettled_deletes`; the next dispatched major — which never skips a
-single SST, see below — rewrites the table and settles them
-(`a_major_after_an_expiry_pass_settles_the_deletes_it_dropped`).
+settling `unsettled_deletes`. The next dispatched major settles them either
+way: it rewrites any table left (it never skips a single SST, see below), and
+when the expiry pass dropped every entry there is no table at all, so the
+major's skip settles too — after its flush no tombstone can exist. Without that
+the count stayed up and SETTLE re-advised the no-op compaction every cooldown
+(`a_major_after_an_expiry_pass_settles_the_deletes_it_dropped`, red without).
 
 Cost to know: every partition evaluates the rule on its first tick after open,
 so after a restart the tombstone-heavy ones all queue a major at once
