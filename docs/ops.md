@@ -2500,12 +2500,19 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 # Deterministic form: cargo test -p autumn-manager --test system_merge_single_checkpoint
 # Besides checking that the open publishes one checkpoint and the next restart
 # replays nothing, this snapshots replay_read_bytes immediately before the merge:
-# the merge reopen must read <64 KiB, not the victim's ~3 MiB checkpoint-covered
-# tail. On a live merge, expect `recover_partition: replay plan built` with
-# `source_cursor_offsets_applied=true`; compare the following `log replay done ... bytes=N`
-# with each source checkpoint offset. The optimization changes the starting byte
-# of every resolved cursor extent. It intentionally still scans ambiguous whole
-# extents between cursors instead of trusting stale checkpoint-time extent counts.
+# the merge reopen must read <64 KiB, not the victim's ~2 MiB of sealed,
+# checkpoint-covered prefix extents. The test explicitly rolls each source WAL
+# twice and asserts that both contain at least three extents before merge. On a
+# live merge from newly upgraded sources, expect `recover_partition: replay plan
+# built` with `exact_source_boundaries_applied=true` and
+# `source_cursor_offsets_applied=false`; `planned_extents=1` is the fresh
+# post-merge tail and the following `log replay done ... bytes=N` should be near
+# zero. `MSG_MERGE_FREEZE` writes each source's exact ordered log extent list in
+# a versioned companion record while writes and maintenance are halted. Recovery
+# accepts it only when every source is certified and those lists reproduce the
+# manager's CoW-deduplicated merged prefix. Old, partial, unresolved, or
+# mismatching records fall back to the conservative cursor-offset walk; stale
+# checkpoint-time `log_extent_count` is never trusted to skip whole extents.
 # Two more actions shape the row stream: `rollrow` seals and rolls every
 # partition's row tail (the fence-drain path), `flushburst` flushes every
 # partition 8 times so the PS's own size-tiered trim (past 32 SSTs) runs.

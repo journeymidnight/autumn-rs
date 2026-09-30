@@ -1086,14 +1086,25 @@ checkpoint (whose SSTs don't cover `[V_old, V_new)`) → silent loss. The ack-ga
 
 `recover_partition` starts its extent walk at the EARLIEST (by stream position)
 cursor among the loaded checkpoint records (one per source after a merge; one
-otherwise). For a multi-source merge whose checkpoint cursors all resolve, the
-walk also starts each later cursor extent at that source's own byte offset. It does
-NOT skip whole later-source prefix extents from `log_extent_count`: the count was
-captured when the checkpoint was published, and growth in one source plus prefix
-truncation in another can make stale counts cancel and produce a plausible but
-wrong boundary. If any source cursor is unresolved, replay retains the previous
-conservative global plan. CoW duplicate cursor extents are read once from the
-smallest source offset.
+otherwise). `MSG_MERGE_FREEZE` now writes a fresh checkpoint plus a versioned
+companion record containing that source's exact ordered log extent list. It does
+so after write drain while holding `maintenance_gate`; every maintenance path
+re-checks the freeze after acquiring the gate. The list therefore stays stable
+until the manager seals and splices the streams. Recovery reconstructs the
+manager's exact splice rule (survivor list, then victim extents not already in
+the survivor, then the new tail). Only when every source has a valid companion
+and the reconstruction exactly matches the merged prefix does it skip all source
+extents and replay only the post-merge tail.
+
+The companion is a separate framed record immediately after the unchanged
+`TableLocations`, in the same meta-stream append. Old binaries ignore it and use
+the preceding checkpoint; new binaries accept old checkpoints and fall back to
+the conservative walk. For that fallback, each resolved source cursor extent
+starts at its own byte offset, but no complete prefix is skipped from
+`log_extent_count`: that count may be stale, and source growth plus prefix
+truncation can make stale counts cancel. If any cursor is unresolved, the prior
+global plan remains. CoW duplicate cursor extents are read once from the smallest
+source offset.
 
 The vp_heads stamped on the SSTs a record lists do NOT lower the global start: the
 record's cursor is at or past all of them (flush FIFO + `checkpoint_vp_head`), so
@@ -1107,8 +1118,10 @@ extent read from an 780 MB-old cursor). The earlier rejection of "MIN→MAX" was
 about a MAX over SST stamps, which can land where no durable checkpoint says; this
 is the checkpoint itself, the same invariant GC's durable raise rests on.
 `recover_partition: replay plan built` reports
-`source_cursor_offsets_applied=true` when source offsets were applied and how
-many extents remain in the conservative walk.
+`source_cursor_offsets_applied=true` when the conservative fallback applies
+per-source cursor offsets. `exact_source_boundaries_applied=true` instead proves
+the certified source prefix was skipped; in that mode the offsets flag is false.
+`planned_extents` then normally equals one: the new post-merge tail.
 `recover_partition: log replay done` logs the real start, bytes, records kept vs
 already covered, and time; `replay_read_bytes(part_id)` exposes the bytes to tests.
 `crates/manager/tests/system_restart_replay_cursor.rs` and

@@ -1,14 +1,15 @@
-//! After a merge the survivor replays only each source's post-checkpoint WAL,
-//! publishes one checkpoint, and a restart replays nothing.
+//! After a merge the survivor skips every freeze-certified source extent,
+//! replays only the post-merge WAL tail, publishes one checkpoint, and a
+//! restart replays nothing.
 //!
 //! The merge splices both partitions' meta streams into the survivor's, so it
 //! briefly holds one checkpoint record per source. Recovery replays from the
-//! earliest cursor among them. Recovery must nevertheless apply every source's
-//! own cursor: otherwise a later victim extent is read from byte zero merely
-//! because the survivor's cursor occurs earlier in the spliced stream. The
-//! survivor's open then publishes one record for both; without that, the records
-//! stayed until the survivor's next flush, and a drain with an empty memtable
-//! does not flush, so every restart replayed the victim's WAL again.
+//! earliest cursor among them. A cursor offset alone cannot skip complete
+//! checkpoint-covered extents before a later source's cursor, so merge freeze
+//! certifies each source's exact extent list. The survivor's open then publishes
+//! one record for both; without that, the records stayed until the survivor's
+//! next flush, and a drain with an empty memtable does not flush, so every
+//! restart replayed the victim's WAL again.
 
 mod support;
 
@@ -29,11 +30,12 @@ use support::*;
 
 const SURVIVOR: u64 = 1201;
 const VICTIM: u64 = 1202;
+const SURVIVOR_KEYS: usize = 1000;
 /// The victim's WAL: 3000 x 1 KiB values, flushed by the merge's drain.
 const VICTIM_KEYS: usize = 3000;
 const VALUE: usize = 1024;
 /// What a replay that starts at the tail may still read. Replaying the
-/// victim's log reads ~3 MiB.
+/// victim's two sealed prefix extents reads ~2 MiB.
 const TAIL_REPLAY_BOUND: u64 = 64 * 1024;
 
 fn spawn_ps(
@@ -110,6 +112,48 @@ async fn checkpoint_records(mgr_addr: SocketAddr, meta_stream: u64) -> usize {
     records
 }
 
+async fn stream_extent_ids(mgr_addr: SocketAddr, stream_id: u64) -> Vec<u64> {
+    let sc = StreamClient::connect(
+        &mgr_addr.to_string(),
+        "merge-checkpoint-test".to_string(),
+        128 * 1024 * 1024,
+        Rc::new(ConnPool::new()),
+    )
+    .await
+    .expect("stream client");
+    sc.get_stream_info(stream_id)
+        .await
+        .expect("stream info")
+        .extent_ids
+}
+
+/// Force a real WAL extent boundary without weakening the production 1-GiB
+/// minimum accepted by `set_max_extent_size_bytes`. Every preceding put is
+/// awaited and this test has one sequential writer; no P-log append is in
+/// flight when the independent stream client rolls the tail. Background GC is
+/// never dispatched in this test.
+async fn roll_log_tail(mgr_addr: SocketAddr, log_stream_id: u64) {
+    let sc = StreamClient::connect(
+        &mgr_addr.to_string(),
+        "merge-checkpoint-roll".to_string(),
+        128 * 1024 * 1024,
+        Rc::new(ConnPool::new()),
+    )
+    .await
+    .expect("stream client");
+    let before = sc
+        .get_stream_info(log_stream_id)
+        .await
+        .expect("stream info before roll")
+        .extent_ids;
+    sc.seal_and_roll_tail(log_stream_id)
+        .await
+        .expect("roll log tail");
+    let after = stream_extent_ids(mgr_addr, log_stream_id).await;
+    assert_eq!(after.len(), before.len() + 1, "roll must add one extent");
+    assert_eq!(&after[..before.len()], before.as_slice());
+}
+
 /// Wait until the survivor serves `key`, which the merge moved into its range.
 async fn wait_serving(router: &PsRouter, key: &[u8]) {
     let started = Instant::now();
@@ -129,41 +173,60 @@ async fn wait_serving(router: &PsRouter, key: &[u8]) {
 
 #[test]
 fn a_merge_survivor_holds_one_checkpoint_and_restarts_without_replay() {
+    // Force both WALs across multiple extents. The old cursor-offset-only
+    // recovery passed the single-extent shape but re-read every complete
+    // victim prefix extent on the first merge reopen.
     let mgr_addr = pick_addr();
     let en_addr = pick_addr();
     start_manager(mgr_addr);
     let dir = tempfile::tempdir().expect("tempdir");
     start_extent_node(en_addr, dir.path().to_path_buf(), 1);
-    let survivor_meta = compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("mgr");
-        let _ = register_node(&mgr, &en_addr.to_string(), "uuid-merge-ckpt").await;
-        let (s_log, s_row, s_meta) = (
-            create_stream(&mgr, 1).await,
-            create_stream(&mgr, 1).await,
-            create_stream(&mgr, 1).await,
-        );
-        let (v_log, v_row, v_meta) = (
-            create_stream(&mgr, 1).await,
-            create_stream(&mgr, 1).await,
-            create_stream(&mgr, 1).await,
-        );
-        upsert_partition(&mgr, SURVIVOR, s_log, s_row, s_meta, b"", b"m").await;
-        upsert_partition(&mgr, VICTIM, v_log, v_row, v_meta, b"m", b"\xff").await;
-        s_meta
-    });
+    let (survivor_log, victim_log, survivor_meta) =
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mgr = RpcClient::connect(mgr_addr).await.expect("mgr");
+            let _ = register_node(&mgr, &en_addr.to_string(), "uuid-merge-ckpt").await;
+            let (s_log, s_row, s_meta) = (
+                create_stream(&mgr, 1).await,
+                create_stream(&mgr, 1).await,
+                create_stream(&mgr, 1).await,
+            );
+            let (v_log, v_row, v_meta) = (
+                create_stream(&mgr, 1).await,
+                create_stream(&mgr, 1).await,
+                create_stream(&mgr, 1).await,
+            );
+            upsert_partition(&mgr, SURVIVOR, s_log, s_row, s_meta, b"", b"m").await;
+            upsert_partition(&mgr, VICTIM, v_log, v_row, v_meta, b"m", b"\xff").await;
+            (s_log, v_log, s_meta)
+        });
 
     let ps_addr = pick_addr();
     let stop = Arc::new(AtomicBool::new(false));
     let join = spawn_ps(mgr_addr, ps_addr, stop.clone());
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let router = PsRouter::new(mgr_addr, ps_addr);
-        for i in 0..10 {
-            psr_put(&router, SURVIVOR, survivor_key(i).as_bytes(), b"s").await;
+        for i in 0..SURVIVOR_KEYS {
+            psr_put(&router, SURVIVOR, survivor_key(i).as_bytes(), &vec![b's'; VALUE]).await;
+            if i == 299 || i == 599 {
+                roll_log_tail(mgr_addr, survivor_log).await;
+            }
         }
         psr_flush(&router, SURVIVOR).await;
         for i in 0..VICTIM_KEYS {
             psr_put(&router, VICTIM, victim_key(i).as_bytes(), &vec![b'v'; VALUE]).await;
+            if i == 999 || i == 1999 {
+                roll_log_tail(mgr_addr, victim_log).await;
+            }
         }
+
+        assert!(
+            stream_extent_ids(mgr_addr, survivor_log).await.len() >= 3,
+            "survivor must have multiple WAL extents before merge"
+        );
+        assert!(
+            stream_extent_ids(mgr_addr, victim_log).await.len() >= 3,
+            "victim must have multiple WAL extents before merge"
+        );
 
         let before_merge_replay = replay_read_bytes(SURVIVOR);
         let mgr = RpcClient::connect(mgr_addr).await.expect("mgr");
@@ -204,9 +267,10 @@ fn a_merge_survivor_holds_one_checkpoint_and_restarts_without_replay() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let router = PsRouter::new(mgr_addr, ps_addr);
         wait_serving(&router, victim_key(0).as_bytes()).await;
-        for i in 0..10 {
+        for i in 0..SURVIVOR_KEYS {
             let r = psr_get(&router, SURVIVOR, survivor_key(i).as_bytes()).await;
             assert_eq!(r.code, CODE_OK, "{} lost", survivor_key(i));
+            assert_eq!(r.value.len(), VALUE);
         }
         for i in 0..VICTIM_KEYS {
             let r = psr_get(&router, SURVIVOR, victim_key(i).as_bytes()).await;

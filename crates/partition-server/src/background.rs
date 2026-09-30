@@ -53,6 +53,11 @@ fn record_maint_outcome(
     });
 }
 
+fn is_frozen_for_maintenance(part: &Rc<RefCell<PartitionData>>) -> bool {
+    let p = part.borrow();
+    p.frozen_for_split.get().is_some() || p.frozen_for_merge.get().is_some()
+}
+
 // the R4 4.4 MIN_PIPELINE_BATCH launch gate (and its
 // `--min-pipeline-batch` knob) is GONE. The gate required `n_inflight == 0
 // || pending >= 256` before launching a batch; whenever per-partition
@@ -553,6 +558,19 @@ pub(crate) async fn background_maintenance_loop(
                 let mut settling = 0u64;
                 if major {
                     let gate = maintenance_gate.acquire().await;
+                    if is_frozen_for_maintenance(&part) {
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            "deferred: partition frozen for split/merge — retry".to_string(),
+                            String::new(),
+                        );
+                        stamp_last_compact();
+                        clear_compact_inflight();
+                        continue;
+                    }
                     let permit = concurrency_ctrl.acquire_compact().await;
                     settling = metrics
                         .unsettled_deletes
@@ -594,6 +612,19 @@ pub(crate) async fn background_maintenance_loop(
                     } else {
                         None
                     };
+                    if is_frozen_for_maintenance(&part) {
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            "deferred: partition frozen for split/merge — retry".to_string(),
+                            String::new(),
+                        );
+                        stamp_last_compact();
+                        clear_compact_inflight();
+                        continue;
+                    }
                     if let Err(e) = checkpoint_and_truncate_row_prefix(&part, part_id).await {
                         record_maint_outcome(
                             &metrics,
@@ -640,6 +671,19 @@ pub(crate) async fn background_maintenance_loop(
                         concurrency_ctrl.acquire_compact().await,
                     ),
                 };
+                if is_frozen_for_maintenance(&part) {
+                    record_maint_outcome(
+                        &metrics,
+                        compact_op_id,
+                        manager_rpc::OP_KIND_COMPACT,
+                        manager_rpc::OP_STATE_FAILED,
+                        "deferred: partition frozen for split/merge — retry".to_string(),
+                        String::new(),
+                    );
+                    stamp_last_compact();
+                    clear_compact_inflight();
+                    continue;
+                }
                 // compact_inflight already latched at top of recv arm.
                 let result = do_compact(&part, compact_tbls, major, compact_op_id).await;
                 match result {
@@ -738,6 +782,9 @@ pub(crate) async fn background_maintenance_loop(
                     if !tbls.is_empty() {
                         // Per-partition maintenance_gate (see main arm above).
                         let _local_gate = maintenance_gate.acquire().await;
+                        if is_frozen_for_maintenance(&part) {
+                            continue;
+                        }
                         let _permit = concurrency_ctrl.acquire_compact().await;
                         metrics
                             .compact_inflight
@@ -829,6 +876,9 @@ pub(crate) async fn background_maintenance_loop(
                     if compact_tbls.len() >= 2 {
                         // Per-partition maintenance_gate (see main arm above).
                         let _local_gate = maintenance_gate.acquire().await;
+                        if is_frozen_for_maintenance(&part) {
+                            continue;
+                        }
                         let _permit = concurrency_ctrl.acquire_compact().await;
                         metrics
                             .compact_inflight
@@ -1425,6 +1475,19 @@ pub(crate) async fn background_maintenance_loop(
                 // (the read-only candidate selection above ran without it) so
                 // handle_split_part sees no log_stream GC append in-flight.
                 let _gc_permit = maintenance_gate.acquire().await;
+                if is_frozen_for_maintenance(&part) {
+                    record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_FAILED,
+                        "deferred: partition frozen for split/merge — retry".to_string(),
+                        String::new(),
+                    );
+                    stamp_last_gc();
+                    clear_inflight(&metrics);
+                    continue;
+                }
                 tracing::info!("GC: starting, extents={:?}", holes);
                 // fix MED-4: gc_inflight already latched at top of loop;
                 // hold through the punch and clear at the bottom.

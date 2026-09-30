@@ -2524,131 +2524,34 @@ impl AutumnManager {
         Ok(())
     }
 
-    /// auto-orchestrate MERGE for a same-PS adjacent cold pair.
-    /// Mirrors the CLI orchestration (FLUSH both → admin owner-lock →
-    /// commit_lengths → multi_modify_merge). PS-side state catches up
-    /// via region_sync_loop within ~2 s.
+    /// Auto-orchestrate MERGE for a same-PS adjacent cold pair.
+    ///
+    /// Keep this mechanism on the exact same path as operator-triggered
+    /// merges. In particular, `handle_merge_partitions` freezes and drains
+    /// both sources, publishes their exact WAL-extent certificates, enforces
+    /// the freeze deadline, and rolls back both freezes on failure. A second
+    /// flush/commit-length implementation here previously bypassed those
+    /// certificates and made policy-triggered merges fall back to scanning
+    /// every old source extent on their first reopen.
     pub(crate) async fn auto_dispatch_merge(
         &self,
         cand: &PolicyCandidate,
-        state: &crate::store::MetadataState,
+        _state: &crate::store::MetadataState,
     ) -> Result<()> {
         let survivor_id = cand.primary_part_id;
         let victim_id = cand.secondary_part_id;
-        // Resolve PS addresses (per-partition first).
-        let resolve = |pid: u64| -> Option<String> {
-            state.part_addrs.get(&pid).cloned().or_else(|| {
-                state
-                    .regions
-                    .get(&pid)
-                    .and_then(|r| state.ps_nodes.get(&r.ps_id).cloned())
-            })
-        };
-        let s_addr = resolve(survivor_id)
-            .ok_or_else(|| anyhow::anyhow!("no address for survivor {survivor_id}"))?;
-        let v_addr = resolve(victim_id)
-            .ok_or_else(|| anyhow::anyhow!("no address for victim {victim_id}"))?;
-
-        // FLUSH both partitions.
-        // (PS slice): merge's flush is a manager→PS MSG_MAINTENANCE;
-        // capture the admin token so the closure can prefix it (the closure moves
-        // `pool`, not `self`).
-        let admin_tok: Option<Vec<u8>> =
-            self.admin_token.borrow().as_ref().map(|t| t.as_bytes().to_vec());
-        let flush = |addr: String, pid: u64| {
-            let pool = self.conn_pool.clone();
-            let admin_tok = admin_tok.clone();
-            async move {
-                let payload = autumn_rpc::partition_rpc::rkyv_encode(
-                    &autumn_rpc::partition_rpc::MaintenanceReq {
-                        part_id: pid,
-                        op: autumn_rpc::partition_rpc::MAINTENANCE_FLUSH,
-                        extent_ids: vec![],
-                        // wire fields — ignored for FLUSH op.
-                        gc_ratio: None,
-                        gc_max_size: None,
-                        gc_stream_debt: None,
-                        gc_dead_bytes_high: None,
-                        gc_empty_only: false,
-                        gc_policy_is_standing: false,
-                        op_id: 0,
-                    },
-                );
-                let payload = match &admin_tok {
-                    Some(t) => autumn_rpc::manager_rpc::prefix_admin_token(t, &payload),
-                    None => payload,
-                };
-                // 60 s — MAINTENANCE_FLUSH rotates active + drains the
-                // imm queue (each imm is up to FLUSH_MEM_BYTES = 256 MiB).
-                pool.call_timeout(
-                    &addr,
-                    autumn_rpc::partition_rpc::MSG_MAINTENANCE,
-                    payload,
-                    Duration::from_secs(60),
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                Ok::<(), anyhow::Error>(())
-            }
-        };
-        flush(s_addr.clone(), survivor_id).await?;
-        flush(v_addr.clone(), victim_id).await?;
-
-        // Acquire an admin owner-lock. The manager is `self` so we call
-        // through `acquire_owner_epoch` directly — same owner_epoch the
-        // CLI obtains via MSG_ACQUIRE_OWNER_LOCK.
-        let owner_key = format!("auto-merge:{survivor_id}:{victim_id}");
-        let owner_epoch = self.acquire_owner_epoch(&owner_key).await?;
-
-        // commit_length per stream type for both partitions.
-        let s_region = state
-            .regions
-            .get(&survivor_id)
-            .ok_or_else(|| anyhow::anyhow!("no region for survivor {survivor_id}"))?;
-        let v_region = state
-            .regions
-            .get(&victim_id)
-            .ok_or_else(|| anyhow::anyhow!("no region for victim {victim_id}"))?;
-        let log_lens = [
-            self.commit_length_for_stream(s_region.log_stream, &owner_key, owner_epoch)
-                .await?
-                .max(1),
-            self.commit_length_for_stream(v_region.log_stream, &owner_key, owner_epoch)
-                .await?
-                .max(1),
-        ];
-        let row_lens = [
-            self.commit_length_for_stream(s_region.row_stream, &owner_key, owner_epoch)
-                .await?
-                .max(1),
-            self.commit_length_for_stream(v_region.row_stream, &owner_key, owner_epoch)
-                .await?
-                .max(1),
-        ];
-        let meta_lens = [
-            self.commit_length_for_stream(s_region.meta_stream, &owner_key, owner_epoch)
-                .await?
-                .max(1),
-            self.commit_length_for_stream(v_region.meta_stream, &owner_key, owner_epoch)
-                .await?
-                .max(1),
-        ];
-
-        // Issue the merge directly through the local handler — manager is `self`.
-        let req = MultiModifyMergeReq {
+        let req = MergePartitionsReq {
             survivor_part_id: survivor_id,
             victim_part_id: victim_id,
-            owner_key,
-            owner_epoch,
-            log_sealed_lengths: log_lens,
-            row_sealed_lengths: row_lens,
-            meta_sealed_lengths: meta_lens,
+            // Policy candidates already exclude sacred boundaries. Preserve
+            // the handler's precondition as a final fail-closed check.
+            force: false,
         };
         let resp_bytes = self
-            .handle_multi_modify_merge(rkyv_encode(&req))
+            .handle_merge_partitions(rkyv_encode(&req))
             .await
             .map_err(|(_, msg)| anyhow::anyhow!("{msg}"))?;
-        let resp: MultiModifyMergeResp =
+        let resp: MergePartitionsResp =
             rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
         if resp.code != CODE_OK {
             anyhow::bail!("merge returned code {}: {}", resp.code, resp.message);
@@ -2659,31 +2562,6 @@ impl AutumnManager {
             resp.new_log_tail_extent_id
         );
         Ok(())
-    }
-
-    /// helper: query commit_length for one stream by hitting the
-    /// stream's tail extent's replicas via ConnPool.
-    async fn commit_length_for_stream(
-        &self,
-        stream_id: u64,
-        owner_key: &str,
-        owner_epoch: i64,
-    ) -> Result<u64> {
-        let req = rkyv_encode(&CheckCommitLengthReq {
-            stream_id,
-            owner_key: owner_key.to_string(),
-            owner_epoch,
-        });
-        let resp_bytes = self
-            .handle_check_commit_length(req)
-            .await
-            .map_err(|(_, msg)| anyhow::anyhow!("{msg}"))?;
-        let resp: CheckCommitLengthResp =
-            rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-        if resp.code != CODE_OK {
-            anyhow::bail!("commit_length code {}: {}", resp.code, resp.message);
-        }
-        Ok(resp.end as u64)
     }
 
     // ── Leader election ────────────────────────────────────────────────

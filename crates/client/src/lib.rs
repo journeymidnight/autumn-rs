@@ -2080,6 +2080,34 @@ impl ClusterClient {
     }
 
     pub async fn get_ps_client(&self, ps_addr: &str) -> Result<Rc<RpcClient>> {
+        self.get_ps_client_with_timeout(ps_addr, self.rpc_timeout.get())
+            .await
+    }
+
+    /// Get or create a PS connection within the caller's current attempt
+    /// budget.  The response timeout used to begin only after this function
+    /// returned, leaving TCP connect outside every RPC deadline.  A stale
+    /// partition route could therefore remain in SYN-SENT until an outer FUSE
+    /// deadline cancelled the whole operation, before the routing loop got a
+    /// chance to refresh.
+    async fn get_ps_client_with_timeout(
+        &self,
+        ps_addr: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Rc<RpcClient>> {
+        let acquire = self.get_ps_client_inner(ps_addr);
+        match timeout {
+            None => acquire.await,
+            Some(t) => match compio::time::timeout(t, acquire).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::Error::new(AutumnError::ConnectionError(format!(
+                    "connect/handshake PS {ps_addr} timed out after {t:?}"
+                )))),
+            },
+        }
+    }
+
+    async fn get_ps_client_inner(&self, ps_addr: &str) -> Result<Rc<RpcClient>> {
         // renew the token BEFORE serving a cached connection so a
         // long-lived client rebinds before the current token expires —
         // `ensure_token` clears `ps_conns` on renewal, dropping stale-token
@@ -2174,7 +2202,9 @@ impl ClusterClient {
         values: Vec<Bytes>,
         timeout: Option<Duration>,
     ) -> Result<Bytes> {
-        let client = self.get_ps_client(ps_addr).await?;
+        let client = self
+            .get_ps_client_with_timeout(ps_addr, timeout)
+            .await?;
         let call = client.call_vectored_bulk_multi(msg_type, vec![ctrl], values);
         let outcome = match timeout {
             None => call.await,
@@ -2205,7 +2235,9 @@ impl ClusterClient {
         payload: Bytes,
         timeout: Option<Duration>,
     ) -> Result<Bytes> {
-        let client = self.get_ps_client(ps_addr).await?;
+        let client = self
+            .get_ps_client_with_timeout(ps_addr, timeout)
+            .await?;
         let outcome = match timeout {
             None => client.call(msg_type, payload).await,
             Some(t) => client.call_timeout(msg_type, payload, t).await,
@@ -2273,11 +2305,9 @@ impl ClusterClient {
         if attempt > 0 {
             return rpc_t;
         }
-        match (rpc_t, self.first_attempt_timeout.get()) {
-            (Some(r), Some(f)) => Some(r.min(f)),
-            (Some(r), None) => Some(r),
-            (None, Some(f)) => Some(f),
-            (None, None) => None,
+        match self.first_attempt_timeout.get() {
+            Some(first_t) => Some(rpc_t.map_or(first_t, |rpc_t| rpc_t.min(first_t))),
+            None => rpc_t,
         }
     }
 
@@ -2601,12 +2631,16 @@ impl ClusterClient {
                 .resolve_part_id(part_id)
                 .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
-            match self.get_ps_client(&ps_addr).await {
+            let timeout = self.first_attempt_effective_timeout(attempt);
+            match self
+                .get_ps_client_with_timeout(&ps_addr, timeout)
+                .await
+            {
                 Ok(client) => {
                     let call = client.call_into_pooled(msg_type, payload.clone());
                     // Cancel-safe like every other pooled call: a timed-out
                     // call's buffer returns to the pool via the read loop.
-                    let outcome = match self.first_attempt_effective_timeout(attempt) {
+                    let outcome = match timeout {
                         None => call.await,
                         Some(t) => match compio::time::timeout(t, call).await {
                             Ok(r) => r,
@@ -2970,7 +3004,11 @@ impl ClusterClient {
                 lease.inode_hint,
                 lease.lease_epoch,
             );
-            match self.get_ps_client(&ps_addr).await {
+            let timeout = self.first_attempt_effective_timeout(attempt);
+            match self
+                .get_ps_client_with_timeout(&ps_addr, timeout)
+                .await
+            {
                 Ok(client) => {
                     // v28 value-separable send: [meta][key] is the CRC'd ctrl,
                     // the value rides after the crc as its own iovec and is
@@ -3024,7 +3062,7 @@ impl ClusterClient {
                     // future being dropped.
                     let call =
                         client.call_vectored_bulk(partition_rpc::MSG_PUT_BULK, vec![meta], value.clone());
-                    let bulk_outcome = match self.rpc_timeout.get() {
+                    let bulk_outcome = match timeout {
                         None => call.await,
                         Some(t) => match compio::time::timeout(t, call).await {
                             Ok(r) => r,
@@ -3872,7 +3910,11 @@ impl ClusterClient {
                 length,
                 region_epoch,
             });
-            match self.get_ps_client(&ps_addr).await {
+            let timeout = self.first_attempt_effective_timeout(attempt);
+            match self
+                .get_ps_client_with_timeout(&ps_addr, timeout)
+                .await
+            {
                 Ok(client) => {
                     // The value lands in a read_loop-owned PooledBuf and is
                     // handed back as-is (ZERO SDK-side copies). Racing
@@ -3880,7 +3922,7 @@ impl ClusterClient {
                     // returns to the pool via the read_loop (cancel-safe,
                     // unlike the removed call_into_dest).
                     let call = client.call_into_pooled(partition_rpc::MSG_GET_BULK, payload);
-                    let outcome = match self.first_attempt_effective_timeout(attempt) {
+                    let outcome = match timeout {
                         None => call.await,
                         Some(t) => match compio::time::timeout(t, call).await {
                             Ok(r) => r,
@@ -5627,7 +5669,7 @@ mod cluster_ready_tests {
 mod first_attempt_timeout_tests {
     //! Bug #2 fix (2026-06-06) — `first_attempt_effective_timeout` is
     //! the policy that fast-fails a stale PS conn within 5 s on the
-    //! first attempt of `call_ps_for_key` / `call_ps_for_part`,
+    //! first attempt of every routed PS call, including connection setup,
     //! falling back to the full 30 s `rpc_timeout` on retries against
     //! the freshly-reconnected listener.
 
@@ -5675,6 +5717,36 @@ mod first_attempt_timeout_tests {
             Some(Duration::from_secs(5)),
             "attempt 0 → fast-fail at 5 s (min)"
         );
+    }
+
+    #[test]
+    fn ps_connection_setup_obeys_attempt_timeout() {
+        let client = client_with(Some(Duration::from_secs(1)), Some(Duration::from_secs(1)));
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server = compio::runtime::spawn(async move {
+                let (_socket, _) = listener.accept().await.unwrap();
+                // Accept TCP but never answer MSG_CLIENT_HELLO. This is the
+                // same pre-RPC acquisition phase that used to sit outside the
+                // caller's attempt deadline.
+                compio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            let err = match client
+                .get_ps_client_with_timeout(&addr, Some(Duration::from_millis(20)))
+                .await
+            {
+                Ok(_) => panic!("connection handshake ignored the attempt timeout"),
+                Err(err) => err,
+            };
+            assert!(
+                err.downcast_ref::<AutumnError>()
+                    .is_some_and(|e| matches!(e, AutumnError::ConnectionError(_))),
+                "timeout must remain a retryable connection error: {err:#}"
+            );
+            server.await.unwrap();
+        });
     }
 
     #[test]

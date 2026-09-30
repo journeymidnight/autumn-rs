@@ -18,11 +18,14 @@
 
 mod support;
 
+use std::rc::Rc;
 use std::time::Duration;
 
+use autumn_partition_server::replay_read_bytes;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc;
+use autumn_stream::{ConnPool, StreamClient};
 use bytes::Bytes;
 
 use support::*;
@@ -582,19 +585,46 @@ fn merge_then_split_again_round_trip() {
     });
 }
 
-/// auto-trigger smoke: register an in-process AutumnManager so the
-/// test can call `force_auto_merge` directly. Verifies that
-/// `auto_dispatch_merge` orchestrates FLUSH+lock+commit_length+merge
-/// end-to-end via the manager's own internal RPC handlers.
+/// Roll a stream tail from an independent client. The caller waits for all
+/// writes before each roll; this is only used to create a real multi-extent
+/// source shape for recovery coverage.
+async fn roll_stream_tail(mgr_addr: std::net::SocketAddr, stream_id: u64) {
+    let sc = StreamClient::connect(
+        &mgr_addr.to_string(),
+        "auto-merge-multi-extent".to_string(),
+        128 * 1024 * 1024,
+        Rc::new(ConnPool::new()),
+    )
+    .await
+    .expect("stream client");
+    let before = sc
+        .get_stream_info(stream_id)
+        .await
+        .expect("stream info before roll")
+        .extent_ids;
+    sc.seal_and_roll_tail(stream_id)
+        .await
+        .expect("roll stream tail");
+    let after = sc
+        .get_stream_info(stream_id)
+        .await
+        .expect("stream info after roll")
+        .extent_ids;
+    assert_eq!(after.len(), before.len() + 1);
+}
+
+/// Register an in-process AutumnManager so the test can call
+/// `force_auto_merge` directly. The sources are split-born and each WAL has
+/// multiple extents. This pins two invariants together:
+///
+/// - the mechanism helper delegates to the normal freeze/certificate handler;
+/// - freeze publication canonicalizes split-inherited meta prefixes before
+///   merge, allowing the first reopen to skip every certified source extent.
 ///
 /// Note: this differs from `merge_split_round_trip_keys_intact` because
-/// it goes through the auto-trigger code path (`force_auto_merge`)
-/// rather than the test's hand-rolled `merge_partitions` helper. They
-/// both ultimately call `MSG_MULTI_MODIFY_MERGE` but the auto path
-/// also exercises the FLUSH-via-conn_pool + admin-owner-lock-acquire +
-/// per-stream commit_length capture inside `auto_dispatch_merge`.
+/// it goes through the auto-trigger code path (`force_auto_merge`) rather than
+/// the test's hand-rolled `merge_partitions` helper.
 #[test]
-#[ignore]
 fn auto_dispatch_merge_orchestrates_full_flow() {
     use autumn_manager::AutumnManager;
 
@@ -631,8 +661,21 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
         let _ps = RpcClient::connect(ps_addr).await.expect("connect ps");
         let router = PsRouter::new(mgr_addr, ps_addr);
 
-        for i in 0u8..6 {
-            psr_put(&router, 6001, format!("k-{:02}", i).as_bytes(), b"v").await;
+        for i in 0..128usize {
+            psr_put(
+                &router,
+                6001,
+                format!("b-{i:05}").as_bytes(),
+                &vec![b'l'; 1024],
+            )
+            .await;
+            psr_put(
+                &router,
+                6001,
+                format!("n-{i:05}").as_bytes(),
+                &vec![b'r'; 1024],
+            )
+            .await;
         }
         psr_flush(&router, 6001).await;
         psr_compact(&router, 6001).await;
@@ -644,7 +687,10 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
             .await
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 6001, at_key: None }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
+                    part_id: 6001,
+                    at_key: Some(b"m".to_vec()),
+                }),
             )
             .await
             .expect("split");
@@ -661,31 +707,80 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
         let regions = get_regions(&mgr).await;
         let mut s = 0u64;
         let mut v = 0u64;
+        let mut s_log = 0u64;
+        let mut v_log = 0u64;
         for (pid, r) in &regions.regions {
             if let Some(rg) = &r.rg {
                 if rg.start_key == b"a".to_vec() {
                     s = *pid;
+                    s_log = r.log_stream;
                 } else {
                     v = *pid;
+                    v_log = r.log_stream;
                 }
             }
         }
+        assert!(s != 0 && v != 0 && s_log != 0 && v_log != 0);
+
+        // Create two complete post-split WAL extents per child. Each put is
+        // acknowledged before the external roll and no maintenance/GC is
+        // dispatched during these loops.
+        for round in 0..2usize {
+            for i in 0..128usize {
+                psr_put(
+                    &router,
+                    s,
+                    format!("c-{round}-{i:05}").as_bytes(),
+                    &vec![b's'; 1024],
+                )
+                .await;
+                psr_put(
+                    &router,
+                    v,
+                    format!("p-{round}-{i:05}").as_bytes(),
+                    &vec![b'v'; 1024],
+                )
+                .await;
+            }
+            roll_stream_tail(mgr_addr, s_log).await;
+            roll_stream_tail(mgr_addr, v_log).await;
+        }
+
+        // Split children carry overlapping CoW tables and merge refuses that
+        // shape. The required major compactions also exercise the realistic
+        // split-born lifecycle before freeze canonicalizes each final source
+        // checkpoint and attaches its exact WAL extent list.
         psr_compact(&router, s).await;
         psr_compact(&router, v).await;
         compio::time::sleep(Duration::from_millis(3000)).await;
 
         // ── KEY DIFFERENCE: drive the merge via force_auto_merge ──
-        // This exercises auto_dispatch_merge's full flow.
+        // This must enter the same freeze/certificate path as the public RPC.
+        let before_replay = replay_read_bytes(s);
         manager
             .force_auto_merge(s, v)
             .await
             .expect("force_auto_merge must succeed");
 
-        compio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            poll_until_async(Duration::from_secs(20), Duration::from_millis(200), || async {
+                match router.try_client_for(s).await {
+                    Ok(c) => ps_get(&c, s, b"p-1-00000").await.code == partition_rpc::CODE_OK,
+                    Err(_) => false,
+                }
+            })
+            .await,
+            "merged split-born survivor never reopened"
+        );
         assert_eq!(
             get_regions(&mgr).await.regions.len(),
             1,
             "merge must complete"
+        );
+        let replayed = replay_read_bytes(s) - before_replay;
+        assert!(
+            replayed < 64 * 1024,
+            "split-born auto-merge replayed {replayed} checkpoint-covered WAL bytes"
         );
     });
 }
@@ -695,7 +790,7 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
 /// partitions, verify the policy_tick_loop fires auto-merge automatically
 /// (no manual force_auto_merge call). Exercises the full closed loop:
 /// `MSG_REPORT_PARTITION_LOAD → metrics window → compute_candidates →
-/// auto_dispatch_merge → multi_modify_merge`.
+/// auto_dispatch_merge → handle_merge_partitions`.
 ///
 /// removed the in-kernel auto-dispatch loop; this test now only
 /// compiles as a historical reference and is permanently `#[ignore]`'d. The
