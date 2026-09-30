@@ -4342,6 +4342,15 @@ extent nodes keep running throughout, and the wire version is unchanged.
 
 ```bash
 # 0. Build or pull the new image; convert_sst ships in it next to autumn-ps.
+#    Optional, while the OLD cluster still serves (no downtime): major-compact
+#    only the partitions that would otherwise be copied needlessly —
+#      - heavily deleted ones: unconverted, their tombstones and the values they
+#        shadow are copied, and the new PS majors them on its first check anyway;
+#      - split children still sharing SSTs (info shows overlap): each child
+#        copies the whole shared SST, out-of-range keys included.
+#    Every other partition gains nothing: a major rewrites it once and the
+#    conversion rewrites it again. Not a prerequisite — convert_sst takes any SST.
+autumn-op --manager $MGR --wait compact <PART>
 # 1. Stop EVERY autumn-ps (graceful SIGTERM). Leave manager and ENs up.
 #    convert_sst refuses to run while any PS heartbeated in the last 10 s.
 # 2. See what will be converted (reads and rebuilds, writes no data):
