@@ -1,3 +1,12 @@
+Date: 2026-09-30 (2)
+TaskStatus: completed
+Task scope: user "part 反复split, merge， minor compact以后， sst 不是依赖sst的顺序找最新的吗？ 但是row stream的顺序会乱吗" → "按 last_seq 排序（HBase 的思路）" → "复现测试" (BUG-MERGE-MINOR-ORDER).
+Current summary: point reads walk the table list from the back; row-stream order is never used for lookups (only truncation, which is order-free). The list was insertion order; a minor compaction put its output at its first input's list slot, which after a merge (survivor tables then victim tables, independent seqs) put V1's newer values in front of V0 and a Get returned the old value. sort_tables_by_seq keeps the list in last_seq order at open, after every compaction swap and after the merge-recovery flush (HBase orders store files by sequence id). Also: compaction chunk last_seq no longer takes the next chunk's first seq.
+Verification: system_merge_minor_compaction_order reproduced ("old") before the fix, asserts the scenario (table seqs V0<S1<S2<V1<S3 before the merge; after the trim V0 and V1's seq present, S1/S2 gone), green after; ablation restoring the old placement red at the final assertion. partition-server lib 292; 20 integration suites incl. ignored green (10 re-run after the chunk fix).
+Review: opus, no high. Applied: scenario assertions (the test could otherwise pass without building the case), chunk last_seq off-by-one, hard length assert, simpler trim wait, no `let _`. Reported, not fixed: GC relocation may break per-flush seq intervals (inferred); merge-recovery byte-cut chunks (ffb4e8a) need key-boundary cuts; MSG_DIAG_TRACE_KEY fullscan returns 0 on paged SSTs.
+Main gaps: committed locally, not pushed.
+Next steps: user to decide push; upstream findings (chunking, split marker vs WAL-only fence bumps, split EN alloc inside freeze budget, save_table_locs_raw truncate after a rolling append) await the user.
+
 Date: 2026-09-30
 TaskStatus: completed
 Task scope: user report "range特别慢": after a job deleted ~13.17 M keys and restarted, its first range page scanned the tombstones for 185.4 s. User: "在 SST 里记 tombstone 数，改SST格式，这个是必要的"; "DeleteRange还是太困难，不做"; "做删除计数，和RocksDB 和 TiKV 一个规则"; "写一个临时的convert_sst的binary，stopworld->convert_sst->start-new-version"; "最后也先别push" (F-SST-DELETION-COUNT).

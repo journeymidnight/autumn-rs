@@ -1103,6 +1103,32 @@ impl TableMeta {
     }
 }
 
+/// Order the table list by `last_seq`, oldest first (stable), keeping
+/// `sst_readers` aligned. Point reads walk the list from the back and stop at
+/// the first hit, and a minor compaction picks a run contiguous in `last_seq`
+/// order, so the list must be in that order — the rule HBase keeps by always
+/// ordering store files by sequence id. Within one partition the two agree:
+/// each flush covers a later seq interval than every table before it and a
+/// compaction replaces a contiguous run. Insertion order alone does not keep
+/// it: after a merge the list is the survivor's tables then the victim's, whose
+/// sequence counters were independent, and a compaction output placed at its
+/// first input's list slot then lands in front of an older table of the other
+/// side and shadows it. Tables of different merge sources hold disjoint keys, so
+/// interleaving them by seq changes nothing a read sees.
+pub(crate) fn sort_tables_by_seq(tables: &mut Vec<TableMeta>, readers: &mut Vec<Arc<SstReader>>) {
+    assert_eq!(tables.len(), readers.len(), "table list and readers out of step");
+    if tables.windows(2).all(|w| w[0].last_seq <= w[1].last_seq) {
+        return;
+    }
+    let mut pairs: Vec<(TableMeta, Arc<SstReader>)> =
+        tables.drain(..).zip(readers.drain(..)).collect();
+    pairs.sort_by_key(|(t, _)| t.last_seq);
+    for (t, r) in pairs {
+        tables.push(t);
+        readers.push(r);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PartitionData — lives on a dedicated partition thread (Rc, no locks)
 // ---------------------------------------------------------------------------
@@ -9466,6 +9492,7 @@ async fn recover_partition(
             sst_readers.push(Arc::new(reader));
         }
     }
+    sort_tables_by_seq(&mut tables, &mut sst_readers);
 
     // Replay logStream into the recovered memtable, skipping records already
     // captured by the loaded SSTs.
@@ -10885,7 +10912,9 @@ async fn publish_merged_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<
                 p.tables.push(meta);
                 p.sst_readers.push(Arc::new(reader));
             }
-            (p.tables.clone(), snapshot_fence_floors(&p))
+            let p = &mut *p;
+            sort_tables_by_seq(&mut p.tables, &mut p.sst_readers);
+            (p.tables.clone(), snapshot_fence_floors(p))
         };
         save_table_locs_raw(
             &part_sc,

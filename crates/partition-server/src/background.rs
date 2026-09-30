@@ -2360,9 +2360,9 @@ pub(crate) fn refresh_metrics(part: &Rc<RefCell<PartitionData>>) {
 ///
 /// This is the only sound basis. The truncate point used to come from the
 /// table list's ORDER (the head extent, or the last input's extent), which is
-/// not stream order: a minor compaction's output takes the oldest input's slot
-/// but is written to the newest extent, and a merged partition lists each
-/// source's tables in turn. The row stream was then cut past extents live
+/// not stream order: a minor compaction's output is listed by its `last_seq`
+/// but is written to the newest extent, and a merged partition interleaves
+/// both sources' tables. The row stream was then cut past extents live
 /// tables still referenced; the manager deleted them, and the partition could
 /// not reopen from its checkpoint (`repro_truncate_point_skips_a_still_
 /// referenced_extent`).
@@ -2921,10 +2921,6 @@ pub(crate) async fn do_compact(
             }
         }
 
-        if raw_ts > chunk_last_seq {
-            chunk_last_seq = raw_ts;
-        }
-
         let entry_size = crate::sst_entry_bytes(raw_key.len(), raw_value.len());
         if current_size + entry_size > max_chunk && !current_builder.is_empty() {
             // Finalize this chunk inline. Intermediate chunks carry NO
@@ -2945,6 +2941,11 @@ pub(crate) async fn do_compact(
             )
             .await?;
             current_size = 0;
+            chunk_last_seq = 0;
+        }
+        // After the emit: this entry belongs to the next chunk, and a chunk's
+        // `last_seq` orders the table list (`sort_tables_by_seq`).
+        if raw_ts > chunk_last_seq {
             chunk_last_seq = raw_ts;
         }
 
@@ -3044,30 +3045,20 @@ pub(crate) async fn do_compact(
 
     let (tables_snapshot, floors_snapshot, (ckpt_vp_eid, ckpt_vp_off)) = {
         let mut p = part.borrow_mut();
-        // locate the position of the OLDEST input table BEFORE
-        // removing the compaction inputs. The compaction output
-        // logically replaces those inputs in age order (its newest
-        // contained seq is bounded by the input set's last_seq), so it
-        // must be inserted at the SAME position — NOT appended at the
-        // newest end. Appending breaks the
-        // `sst_readers.iter().rev() = newest first` lookup contract
-        // when a flush completed during the compaction await window:
-        // that newer SST sits at a lower index than the compaction
-        // output, and a Get for a key updated by that newer flush
-        // walks the compaction output first (stale value) and never
-        // reaches the newer flush. Surfaced as the chaos test's
-        // fence+flush data-loss bug and the in-process reproducer.
-        let insert_at = p
-            .tables
-            .iter()
-            .position(|tm| compact_keys.contains(&tm.loc()))
-            .unwrap_or(p.tables.len());
+        // The outputs take their place by `last_seq`, not by list position:
+        // see `sort_tables_by_seq`. Appending them at the newest end instead
+        // broke reads when a flush completed during the compaction's awaits
+        // (that newer SST sat in front of the output and a Get walked the
+        // output first — the chaos fence+flush data-loss bug); inserting at
+        // the oldest input's LIST slot broke them after a merge, whose list is
+        // not in seq order.
         remove_compacted_tables(&mut p, &compact_keys);
-        for (offset, (tbl_meta, reader)) in new_readers.into_iter().enumerate() {
-            let idx = insert_at + offset;
-            p.sst_readers.insert(idx, reader);
-            p.tables.insert(idx, tbl_meta);
+        for (tbl_meta, reader) in new_readers {
+            p.tables.push(tbl_meta);
+            p.sst_readers.push(reader);
         }
+        let pd = &mut *p;
+        crate::sort_tables_by_seq(&mut pd.tables, &mut pd.sst_readers);
         (
             p.tables.clone(),
             crate::snapshot_fence_floors(&p),
@@ -5515,8 +5506,8 @@ mod compaction_truncate_tests {
     }
 
     /// Table order is not row-stream order. A minor compaction skips a big
-    /// full-memtable SST, merges small ones after it, and inserts the output at
-    /// the oldest input's slot although its bytes sit in the NEWEST extent. The
+    /// full-memtable SST, merges small ones after it, and lists the output
+    /// among older tables although its bytes sit in the NEWEST extent. The
     /// old head rule then took "the next table's extent" (12) as the truncate
     /// point and deleted extent 11, which live tables still reference — the
     /// shape of the partition that could not reopen.

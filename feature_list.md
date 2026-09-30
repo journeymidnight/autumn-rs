@@ -49,6 +49,13 @@
 - `passes: true`
 - **notes** (2026-09-29): 已实现，本地提交、未 push（用户"最后也先别push"）。system_deletion_triggered_compaction 三项消融均变红（规则关掉、打开时不计 SST tombstone、跳过的 major 不结算）；真实进程端到端：旧 PS 经 merge + split 写 v1 数据，新 PS 拒开并提示 convert_sst，转换 38 个 SST，重跑为空操作，11000 个 key 逐字节正确、range 恰好列出 8200 个存活 key。线上集群尚未转换；转换完成后删掉 convert_sst、Dockerfile 那行和 sst_convert 模块。
 
+### BUG-MERGE-MINOR-ORDER — merge 之后的 minor compaction 让旧 SST 遮住新值
+- **Trigger** (2026-09-30 用户): "part 反复split, merge， minor compact以后， sst 不是依赖sst的顺序找最新的吗？" → "按 last_seq 排序（HBase 的思路）" → "复现测试" / "同意"。
+- **Scope**: 点查从表列表尾部往前找、命中即返回；minor compaction 按 last_seq 连续选输入，却把输出插在第一个输入的列表位置。merge 后列表是 survivor 的表再接 victim 的表（两边 seq 独立），于是输出落在 victim 更旧的表前面。改为表列表始终按 last_seq 排序（打开时、compaction 替换后、merge 恢复写 checkpoint 前），与 HBase 按 sequence id 排 store file 相同。
+- **Acceptance**: 确定性测试复现（修前读到旧值）并断言场景形状（各表 seq 顺序、trim 选中的表）；修后变绿；恢复旧放置逻辑的消融变红；相关 compaction/merge/split 集成测试全过。
+- `passes: true`
+- **notes** (2026-09-30): system_merge_minor_compaction_order；另修 compaction 分块的 last_seq 差一（把下一块第一条的 seq 记到上一块）。未修（非本条范围，已报告）：merge 恢复按字节切块会把同一 key 的版本切进两块（ffb4e8a），排序救不了，要按 key 边界切；GC relocation 可能打破"每次 flush 覆盖更晚的 seq 区间"（reviewer 推断，未复现）；MSG_DIAG_TRACE_KEY 的 fullscan 对 paged SST 一律返回 0。
+
 ### BUG-CHAOS-RECLAIM-RESIDUE — chaos 的物理回收检查在 fence 后重建的节点上留有旧副本
 - **Trigger** (2026-09-29，加 PS 重启 chaos 时发现): 全动作集 system_chaos 7 轮里 4 轮 `verify_gc_reclaim` 报 `physical reclaim incomplete`，残留文件都在被 KillThenFence/fence 过、随后由 recovery 在别处重建了副本的节点上（例：extent 22 在 node 1）。旧版与新版 PS 都出现。
 - **Scope**: 查清是检查过严（删除只发给当前成员，非成员残留靠 EN reconcile：3 轮 × 5 min 才收）还是产品缺陷（被替换下来的副本该在重建完成时就删），据此修检查或修产品。

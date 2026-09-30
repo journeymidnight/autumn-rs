@@ -883,6 +883,37 @@ successful major, in every arm that runs one — it must never clear `has_overla
 Runs `do_compact(major=false)`. `pickup_tables` only SELECTS; it says nothing
 about truncation (next section).
 
+### Table list order = `last_seq` order
+
+INVARIANT: `p.tables` / `sst_readers` (and so a checkpoint's `locs`) are in
+`last_seq` order, oldest first. Point reads (`sst_lookup_paged_retry`), GC's
+liveness lookup and split's key sampling walk the list from the back and stop
+at the first hit, and `pickup_tables` picks a run contiguous in `last_seq`
+order — both need list order = recency order for every key. HBase keeps the
+same rule by ordering store files by sequence id.
+
+`sort_tables_by_seq` (stable) establishes it at open and after every change
+that is not an append: a compaction's swap (outputs are pushed, then sorted)
+and the merge-recovery flush. A flush appends at the end, which is already in
+order. Within one partition, seq order is recency order: each flush covers a
+later seq interval than every table before it, and a compaction replaces a
+contiguous run with outputs that hold disjoint keys. After a merge the two
+sources' sequence counters were independent, but their keys are disjoint, so
+interleaving them by seq changes nothing a read sees.
+
+Why: the swap used to insert its outputs at the first input's LIST slot, and a
+merged partition's list is the survivor's tables then the victim's. The
+size-tiered pick `[S1, S2, V1]` (seq order V0 < S1 < S2 < V1 < S3) then put
+V1's newer values in front of V0, and a Get found V0's older copy first —
+`system_merge_minor_compaction_order` (the auto-trim is the minor compaction;
+the key read back "old"). Appending the outputs at the end instead had broken
+reads when a flush completed during the compaction (the chaos fence+flush
+data-loss bug). The merge-recovery chunks (`split_memtable_by_bytes`) are a
+separate case this ordering cannot fix: chunks of one memtable share a seq
+interval, so when a key's versions split across two chunks, whether a Get finds
+the newest depends on which chunk happens to sort later; the cut must fall
+between user keys.
+
 ### Row-stream truncation = the first extent a live table references
 
 INVARIANT: after every successful compaction (dispatched major/minor, expiry
@@ -912,9 +943,9 @@ flush committing in between look like a missing extent.
 Why: the truncate point used to come from the table list's ORDER — the head
 extent's successor (minor) or the last input's extent (major) — and list order
 is not stream order. A minor compaction skips a big full-memtable SST, merges
-small ones after it, and inserts the output at the oldest input's slot although
-it is written to the newest extent; a merged partition lists each source's
-tables in turn. The cut then went past extents live tables still referenced,
+small ones after it, and the output is listed by its `last_seq`, among older
+tables, although it is written to the newest extent; a merged partition
+interleaves both sources' tables. The cut then went past extents live tables still referenced,
 the manager deleted them (files on every EN), and the partition failed to reopen
 on the first missing SST — observed in production: the checkpoint listed 37
 SSTs, 28 in three deleted extents, the row stream down to one. Those SSTs' data
