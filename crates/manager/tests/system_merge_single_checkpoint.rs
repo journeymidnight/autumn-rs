@@ -1,13 +1,14 @@
-//! After a merge the survivor holds one checkpoint, and a restart replays
-//! nothing.
+//! After a merge the survivor replays only each source's post-checkpoint WAL,
+//! publishes one checkpoint, and a restart replays nothing.
 //!
 //! The merge splices both partitions' meta streams into the survivor's, so it
 //! briefly holds one checkpoint record per source. Recovery replays from the
-//! earliest cursor among them, which is the survivor's, and that walks every
-//! victim log extent spliced in after it. The survivor's open publishes one
-//! record for both; without that, the records stayed until the survivor's next
-//! flush, and a drain with an empty memtable does not flush, so every restart
-//! replayed the victim's whole WAL again.
+//! earliest cursor among them. Recovery must nevertheless apply every source's
+//! own cursor: otherwise a later victim extent is read from byte zero merely
+//! because the survivor's cursor occurs earlier in the spliced stream. The
+//! survivor's open then publishes one record for both; without that, the records
+//! stayed until the survivor's next flush, and a drain with an empty memtable
+//! does not flush, so every restart replayed the victim's WAL again.
 
 mod support;
 
@@ -164,6 +165,7 @@ fn a_merge_survivor_holds_one_checkpoint_and_restarts_without_replay() {
             psr_put(&router, VICTIM, victim_key(i).as_bytes(), &vec![b'v'; VALUE]).await;
         }
 
+        let before_merge_replay = replay_read_bytes(SURVIVOR);
         let mgr = RpcClient::connect(mgr_addr).await.expect("mgr");
         let bytes = mgr
             .call(
@@ -180,6 +182,11 @@ fn a_merge_survivor_holds_one_checkpoint_and_restarts_without_replay() {
         assert_eq!(resp.code, CODE_OK, "merge: {}", resp.message);
 
         wait_serving(&router, victim_key(0).as_bytes()).await;
+        let merge_replayed = replay_read_bytes(SURVIVOR) - before_merge_replay;
+        assert!(
+            merge_replayed < TAIL_REPLAY_BOUND,
+            "the merge reopen replayed {merge_replayed} WAL bytes already covered by source checkpoints"
+        );
         assert_eq!(
             checkpoint_records(mgr_addr, survivor_meta).await,
             1,

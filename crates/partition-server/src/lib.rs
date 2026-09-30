@@ -8984,6 +8984,87 @@ fn select_clean_replica_chunk(
     (clean, corrupt)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplaySourceCheckpoint {
+    cursor_pos: usize,
+    cursor_offset: u64,
+}
+
+/// Build the WAL extents recovery must scan.
+///
+/// After merge, every source checkpoint covers bytes before its own
+/// `(cursor_pos, cursor_offset)`. The old global plan began at the earliest
+/// source cursor, but read every later source's cursor extent from byte zero.
+/// That is correct but can re-read tens of GiB already covered by the later
+/// source's SSTs. Apply each resolved source's byte offset directly, while
+/// retaining the conservative global extent walk.
+///
+/// Do not use persisted `log_extent_count` to skip whole source prefixes here.
+/// Counts are captured when a checkpoint is published, not when the later
+/// merge splices the streams. One source may grow while another truncates, so
+/// stale counts can cancel in aggregate and make a wrong boundary look valid.
+fn plan_replay_extents(
+    log_extent_ids: &[u64],
+    chosen_pos: usize,
+    chosen_offset: u64,
+    source_checkpoints: &[ReplaySourceCheckpoint],
+    all_source_cursors_resolved: bool,
+) -> (Vec<(usize, u64, u64)>, bool) {
+    let global_plan = || {
+        let mut seen = HashSet::new();
+        log_extent_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &eid)| {
+                if chosen_pos != usize::MAX && pos < chosen_pos {
+                    seen.insert(eid);
+                    None
+                } else if !seen.insert(eid) {
+                    None
+                } else {
+                    let start = if pos == chosen_pos { chosen_offset } else { 0 };
+                    Some((pos, eid, start))
+                }
+            })
+            .collect()
+    };
+
+    if chosen_pos == usize::MAX || !all_source_cursors_resolved || source_checkpoints.len() < 2 {
+        return (global_plan(), false);
+    }
+
+    let mut checkpoints = source_checkpoints.to_vec();
+    checkpoints.sort_by_key(|c| (c.cursor_pos, c.cursor_offset));
+    if checkpoints[0].cursor_pos != chosen_pos || checkpoints[0].cursor_offset != chosen_offset {
+        return (global_plan(), false);
+    }
+
+    let mut cursor_offsets = HashMap::new();
+    for checkpoint in checkpoints {
+        if checkpoint.cursor_pos >= log_extent_ids.len() || checkpoint.cursor_pos < chosen_pos {
+            return (global_plan(), false);
+        }
+        cursor_offsets
+            .entry(checkpoint.cursor_pos)
+            .and_modify(|offset: &mut u64| *offset = (*offset).min(checkpoint.cursor_offset))
+            .or_insert(checkpoint.cursor_offset);
+    }
+
+    let mut seen = HashSet::new();
+    let mut plan = Vec::new();
+    for (pos, &eid) in log_extent_ids.iter().enumerate() {
+        if pos < chosen_pos {
+            seen.insert(eid);
+            continue;
+        }
+        if seen.insert(eid) {
+            let start_offset = cursor_offsets.get(&pos).copied().unwrap_or(0);
+            plan.push((pos, eid, start_offset));
+        }
+    }
+    (plan, true)
+}
+
 async fn recover_partition(
     _part_id: u64,
     rg: &Range,
@@ -9070,13 +9151,13 @@ async fn recover_partition(
 
     if !meta_records.is_empty() {
         // Each meta_record carries a (vp_extent_id, vp_offset) saying
-        // "log_stream replay must include records from this position
-        // onward to recover everything the SST set doesn't already
-        // cover." Post-merge there are multiple checkpoints (one per
-        // pre-merge source partition), and we must take the EARLIEST
-        // stream position so survivor's older log_stream extents aren't
-        // skipped just because some OTHER checkpoint's vp_head sits at
-        // a later position with a NUMERICALLY SMALLER extent_id.
+        // "this source's replay must include records from this position
+        // onward to recover everything its SST set doesn't already cover."
+        // Post-merge there are multiple checkpoints (one per pre-merge source
+        // partition). `chosen_pos` remains the conservative global anchor;
+        // `plan_replay_extents` below applies each later source's own byte
+        // offset when every source cursor resolves, without guessing source
+        // extent boundaries from checkpoint-time counts.
         //
         // Pre-this fix:
         //   - an earlier version took max(vp_extent_id) — wrong for non-monotonic
@@ -9325,7 +9406,8 @@ async fn recover_partition(
         end_excl: usize, // region = [prev_end, end_excl)
         src_max: u64,
     }
-    let mut records_meta: Vec<(usize, u32, u64)> = Vec::new(); // (vp_pos, log_extent_count, src_max)
+    let mut records_meta: Vec<(usize, u64, u32, u64)> = Vec::new();
+    // (vp_pos, vp_offset, log_extent_count, src_max)
     let mut any_zero_count = false;
     for r in &meta_records {
         if r.vp_extent_id == 0 {
@@ -9348,9 +9430,9 @@ async fn recover_partition(
             })
             .max()
             .unwrap_or(0);
-        records_meta.push((pos, r.log_extent_count, src_max));
+        records_meta.push((pos, r.vp_offset, r.log_extent_count, src_max));
     }
-    records_meta.sort_by_key(|(p, _, _)| *p);
+    records_meta.sort_by_key(|(p, _, _, _)| *p);
     let mut source_regions: Vec<SourceRegion> = Vec::new();
     if any_zero_count || records_meta.is_empty() {
         // Legacy / partial state: one virtual region covering the whole
@@ -9361,7 +9443,7 @@ async fn recover_partition(
         });
     } else {
         let mut cum: usize = 0;
-        for (_pos, count, src_max) in &records_meta {
+        for (_pos, _offset, count, src_max) in &records_meta {
             cum += *count as usize;
             source_regions.push(SourceRegion {
                 end_excl: cum,
@@ -9411,84 +9493,36 @@ async fn recover_partition(
     // each record's insertion AND attributes the duplicate occurrence
     // to the WRONG source region. We replay each extent only at its
     // FIRST occurrence (which has the correct source-region dedup).
-    let replay_extents: Option<Vec<(usize, u64, u64)>> =
-        if chosen_pos == usize::MAX {
-            // No resolvable replay cursor: replay everything from offset 0 of
-            // every extent — dedup by first occurrence.
-            //
-            // This used to require `tables.is_empty()`, and everything else fell
-            // through to `None` — replay NOTHING. That is a silent loss of every
-            // acked-but-un-flushed write, and it is reachable: a cursor may name
-            // an extent that no longer exists, because recovery seeds the write
-            // cursor to the committed log TAIL and a freshly-rolled tail has zero
-            // committed bytes, so the seed is `(E, 0)`. Once E leaves the tail
-            // slot it is sealed-empty, which every reclaimer treats as free —
-            // `gc_extent_punchable` is `sealed_length == 0 || pos < floor`, so
-            // even the replay floor does not protect it. Compaction then makes
-            // "no cursor resolves" the common case rather than a corner, because
-            // it stamps every output SST with the newest input's vp_head.
-            // Regression: `system_empty_vp_cursor`.
-            //
-            // Over-replaying is safe, though not by the mechanism it looks like.
-            // Per-source dedup cannot exist here: a `records_meta` entry needs
-            // its vp to resolve through `first_pos_by_eid`, and that lookup
-            // failing for EVERY record is what produced `chosen_pos == MAX` in
-            // the first place. So `records_meta` is empty and the single
-            // whole-stream region applies, with `src_max = max_seq` — the global
-            // union over every loaded SST. Every replayed record therefore has
-            // `ts > max_seq >= every entry seq already flushed`, so no flushed
-            // version is re-inserted, and memtable keys are MVCC-unique per
-            // (user_key, seq) with newest-first reads, so nothing shadows a newer
-            // one. Reclamation is prefix-only or empty-only, so a later tombstone
-            // can never be lost while its earlier put is kept.
-            //
-            // What the global union costs is the inverse error, and only in one
-            // corner: on a post-merge spliced log it can SKIP a survivor record
-            // whose ts is below the victim's max. Narrow, and strictly better
-            // than what it replaces — which skipped everything.
-            //
-            // The cost is reading the log from the start on a recovery that has
-            // lost its cursor. That is one-shot: the first flush afterwards
-            // re-stamps a live cursor.
-            let mut seen: HashSet<u64> = HashSet::new();
-            Some(
-                log_extent_ids
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(pos, &eid)| {
-                        if seen.insert(eid) {
-                            Some((pos, eid, 0u64))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect(),
-            )
-        } else if chosen_pos != usize::MAX {
-            // Replay from `chosen_pos` onward, but only the FIRST occurrence
-            // of each extent_id (CoW-dup later occurrences are skipped).
-            let mut seen: HashSet<u64> = HashSet::new();
-            Some(
-                log_extent_ids
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(pos, &eid)| {
-                        if pos < chosen_pos {
-                            seen.insert(eid);
-                            None
-                        } else if !seen.insert(eid) {
-                            None
-                        } else if pos == chosen_pos {
-                            Some((pos, eid, recovered_vp_off))
-                        } else {
-                            Some((pos, eid, 0u64))
-                        }
-                    })
-                    .collect(),
-            )
-        } else {
-            None
-        };
+    // No resolvable cursor means replay everything from offset zero. With a
+    // cursor, the conservative fallback starts at the globally earliest one.
+    // When every source cursor resolves, use each source's own byte offset so
+    // a later victim cursor extent is not re-read from byte zero merely because
+    // the survivor's cursor precedes it in the spliced stream. Whole extents
+    // between cursors remain in the plan; their source boundaries are not
+    // provable from checkpoint-time extent counts.
+    let replay_checkpoints: Vec<ReplaySourceCheckpoint> = records_meta
+        .iter()
+        .map(|(pos, offset, _count, _)| ReplaySourceCheckpoint {
+            cursor_pos: *pos,
+            cursor_offset: *offset,
+        })
+        .collect();
+    let all_source_cursors_resolved = records_meta.len() == meta_records.len();
+    let (replay_extents, source_cursor_offsets_applied) = plan_replay_extents(
+        &log_extent_ids,
+        chosen_pos,
+        recovered_vp_off,
+        &replay_checkpoints,
+        all_source_cursors_resolved,
+    );
+    tracing::info!(
+        target: "recover_trace",
+        part_id = _part_id,
+        source_cursor_offsets_applied,
+        planned_extents = replay_extents.len(),
+        total_log_extents = log_extent_ids.len(),
+        "recover_partition: replay plan built"
+    );
 
     // (b): p.vp — the write cursor recorded for the recovered
     // active memtable, which its eventual rotation stamps as the flushed SST's
@@ -9507,7 +9541,11 @@ async fn recover_partition(
     let mut replay_bytes: u64 = 0;
     let mut replay_kept: u64 = 0;
     let mut replay_covered: u64 = 0;
-    let replay_extent_count = replay_extents.as_ref().map_or(0, |e| e.len());
+    // Keep the optional wrapper around the scan body: recovery historically
+    // used `None` for "nothing to replay", and retaining the block keeps this
+    // safety-critical loop's structure stable while the planner changes.
+    let replay_extents = Some(replay_extents);
+    let replay_extent_count = replay_extents.as_ref().map_or(0, Vec::len);
     if let Some(extents) = replay_extents {
         for (extent_pos, eid, start_off) in extents {
             let extent_dedup = dedup_at(extent_pos);
@@ -12206,6 +12244,185 @@ mod tests {
             .map(|item| parse_ts(&item.key))
             .collect();
         assert_eq!(versions, vec![3, 2, 1]);
+    }
+
+    #[test]
+    fn merge_replay_uses_every_source_checkpoint_offset() {
+        // source 0 = [10, 11, 12], checkpoint at 12:100
+        // source 1 = [20, 21, 22], checkpoint at 22:800
+        // 99 is the fresh post-merge tail. The old global plan read 22 from
+        // zero. We still read 20/21 because old extent counts cannot prove
+        // where source 1 begins at merge time.
+        let ids = [10, 11, 12, 20, 21, 22, 99];
+        let sources = [
+            ReplaySourceCheckpoint {
+                cursor_pos: 2,
+                cursor_offset: 100,
+            },
+            ReplaySourceCheckpoint {
+                cursor_pos: 5,
+                cursor_offset: 800,
+            },
+        ];
+
+        let (plan, source_offsets) = plan_replay_extents(&ids, 2, 100, &sources, true);
+
+        assert!(source_offsets);
+        assert_eq!(
+            plan,
+            vec![
+                (2, 12, 100),
+                (3, 20, 0),
+                (4, 21, 0),
+                (5, 22, 800),
+                (6, 99, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_replay_keeps_each_sources_post_checkpoint_extents() {
+        // Each source has one extent after its checkpoint. Those suffix
+        // extents and the post-merge tail must still be replayed from zero.
+        let ids = [10, 11, 12, 20, 21, 22, 99];
+        let sources = [
+            ReplaySourceCheckpoint {
+                cursor_pos: 1,
+                cursor_offset: 100,
+            },
+            ReplaySourceCheckpoint {
+                cursor_pos: 4,
+                cursor_offset: 800,
+            },
+        ];
+
+        let (plan, source_offsets) = plan_replay_extents(&ids, 1, 100, &sources, true);
+
+        assert!(source_offsets);
+        assert_eq!(
+            plan,
+            vec![
+                (1, 11, 100),
+                (2, 12, 0),
+                (3, 20, 0),
+                (4, 21, 800),
+                (5, 22, 0),
+                (6, 99, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_replay_never_guesses_boundaries_from_stale_counts() {
+        // This is the dangerous shape for a cumulative-count planner: source 0
+        // grew by one extent after its checkpoint while source 1 lost one prefix
+        // extent. The stale counts cancel, so their sum still matches the merged
+        // stream. Extent 13 is nevertheless source 0's uncheckpointed WAL and
+        // must be read. The offset-only planner never needs those counts.
+        let ids = [10, 11, 12, 13, 20, 21, 22, 99];
+        let sources = [
+            ReplaySourceCheckpoint {
+                cursor_pos: 1,
+                cursor_offset: 100,
+            },
+            ReplaySourceCheckpoint {
+                cursor_pos: 5,
+                cursor_offset: 800,
+            },
+        ];
+
+        let (plan, source_offsets) = plan_replay_extents(&ids, 1, 100, &sources, true);
+
+        assert!(source_offsets);
+        assert_eq!(
+            plan,
+            vec![
+                (1, 11, 100),
+                (2, 12, 0),
+                (3, 13, 0),
+                (4, 20, 0),
+                (5, 21, 800),
+                (6, 22, 0),
+                (7, 99, 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_replay_uses_earliest_offset_for_cow_duplicate_cursor_positions() {
+        // Both source checkpoints resolve to the first occurrence of shared
+        // extent 12. Read the physical extent once from the earlier offset.
+        let ids = [10, 11, 12, 12, 20, 99];
+        let sources = [
+            ReplaySourceCheckpoint {
+                cursor_pos: 2,
+                cursor_offset: 100,
+            },
+            ReplaySourceCheckpoint {
+                cursor_pos: 2,
+                cursor_offset: 200,
+            },
+        ];
+
+        let (plan, source_offsets) = plan_replay_extents(&ids, 2, 100, &sources, true);
+
+        assert!(source_offsets);
+        assert_eq!(plan, vec![(2, 12, 100), (4, 20, 0), (5, 99, 0)]);
+    }
+
+    #[test]
+    fn merge_replay_falls_back_when_any_source_cursor_is_unresolved() {
+        let ids = [10, 11, 12, 20, 21, 22, 99];
+        // Only source 0 resolved. `all_sources_resolved=false` represents a
+        // legacy zero cursor or a cursor whose extent was already reclaimed.
+        let sources = [ReplaySourceCheckpoint {
+            cursor_pos: 2,
+            cursor_offset: 100,
+        }];
+
+        let (plan, source_offsets) = plan_replay_extents(&ids, 2, 100, &sources, false);
+
+        assert!(!source_offsets);
+        assert_eq!(
+            plan,
+            vec![(2, 12, 100), (3, 20, 0), (4, 21, 0), (5, 22, 0), (6, 99, 0),]
+        );
+    }
+
+    #[test]
+    fn merge_replay_falls_back_when_global_anchor_precedes_source_cursors() {
+        // A cursorless record's SST vp_head may lower the global anchor below
+        // every resolved source checkpoint. Source-local offsets are then not
+        // a complete description of the replay floor, so use the old plan.
+        let ids = [10, 11, 12, 20, 21, 22, 99];
+        let sources = [
+            ReplaySourceCheckpoint {
+                cursor_pos: 2,
+                cursor_offset: 100,
+            },
+            ReplaySourceCheckpoint {
+                cursor_pos: 5,
+                cursor_offset: 800,
+            },
+        ];
+
+        let (plan, source_offsets) = plan_replay_extents(&ids, 1, 50, &sources, true);
+
+        assert!(!source_offsets);
+        assert_eq!(
+            plan,
+            vec![(1, 11, 50), (2, 12, 0), (3, 20, 0), (4, 21, 0), (5, 22, 0), (6, 99, 0),]
+        );
+    }
+
+    #[test]
+    fn merge_replay_without_a_cursor_reads_every_unique_extent_from_zero() {
+        let ids = [10, 11, 10, 20];
+
+        let (plan, source_offsets) = plan_replay_extents(&ids, usize::MAX, 0, &[], false);
+
+        assert!(!source_offsets);
+        assert_eq!(plan, vec![(0, 10, 0), (1, 11, 0), (3, 20, 0)]);
     }
 
     // under the RwLock<BTreeMap> design the memtable has ONE writer

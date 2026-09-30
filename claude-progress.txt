@@ -1,3 +1,12 @@
+Date: 2026-09-29 (9)
+TaskStatus: completed
+Task scope: fix post-merge recovery reading each later source's checkpoint-covered WAL from byte zero; prepare /tmp/review.md for external review before build or rollout.
+Current summary: recover_partition still walks extents from the globally earliest durable cursor, but when every merge-source cursor resolves it applies each source's own byte offset to that cursor extent. It does not skip ambiguous whole extents based on checkpoint-time log_extent_count: source growth and prefix truncation can make stale counts cancel and turn a guessed boundary into data loss. CoW duplicate extents remain first-occurrence deduplicated and use the smallest source offset; any unresolved source takes the prior conservative global plan. The trace reports source_cursor_offsets_applied; system_merge_single_checkpoint bounds the immediate merge reopen, not only the following restart.
+Verification: 7 focused planner tests passed; partition-server lib 280 passed, 1 existing ignored; system_merge_single_checkpoint 4 passed. The integration-test ablation that forces the old global plan failed at the new bound with 3,195,000 replay bytes, then the fix was restored. Clippy with -D warnings passes after allowing the repository's 4 pre-existing await-holding-refcell-ref findings; the new hunks are rustfmt-clean and diff --check passes.
+Review: external review in /tmp/review.md found no high/medium issues. Applied all required/recommended low items: three formatting fixes, clearer boolean trace name, and tests for the stand-in-lowered global anchor and cursorless whole-log fallback. The optional Option wrapper remains to avoid mechanical churn in the safety-critical replay loop. The separately identified pre-existing stale source-region dedup issue is tracked as BUG-MERGE-STALE-SOURCE-DEDUP.
+Main gaps: none for this fix. The optimization intentionally does not skip whole extents between source cursor extents because their boundaries are not durably encoded.
+Next steps: commit, Volc CP build, rollout, then validate live replay volume before resuming the remaining bench merges.
+
 Date: 2026-09-29 (8)
 TaskStatus: completed
 Task scope: major compaction writes into a fresh row extent, including a single SST, then safely truncates dead prefix extents. User requested no assistant attribution in commits; rollout remains on hold.

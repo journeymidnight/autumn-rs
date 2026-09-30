@@ -1084,22 +1084,35 @@ checkpoint (whose SSTs don't cover `[V_old, V_new)`) → silent loss. The ack-ga
 
 ### Recovery replay start = the checkpoint's cursor
 
-`recover_partition` starts replay at the EARLIEST (by stream position) cursor among
-the loaded checkpoint records (one per source after a merge; one otherwise). The
-vp_heads stamped on the SSTs a record lists do NOT lower it: the record's cursor is
-at or past all of them (flush FIFO + `checkpoint_vp_head`), so they could only move
-the start back. They stand in only for a record whose own cursor does not resolve
-(`vp_extent_id == 0`, or its extent left the stream); with no cursor at all the
-whole-log `chosen_pos==MAX` fallback still applies. Why: one old SST that no
+`recover_partition` starts its extent walk at the EARLIEST (by stream position)
+cursor among the loaded checkpoint records (one per source after a merge; one
+otherwise). For a multi-source merge whose checkpoint cursors all resolve, the
+walk also starts each later cursor extent at that source's own byte offset. It does
+NOT skip whole later-source prefix extents from `log_extent_count`: the count was
+captured when the checkpoint was published, and growth in one source plus prefix
+truncation in another can make stale counts cancel and produce a plausible but
+wrong boundary. If any source cursor is unresolved, replay retains the previous
+conservative global plan. CoW duplicate cursor extents are read once from the
+smallest source offset.
+
+The vp_heads stamped on the SSTs a record lists do NOT lower the global start: the
+record's cursor is at or past all of them (flush FIFO + `checkpoint_vp_head`), so
+they could only move the start back. They stand in only for a record whose own
+cursor does not resolve (`vp_extent_id == 0`, or its extent left the stream); with
+no cursor at all the whole-log `chosen_pos==MAX` fallback still applies. Why: one old SST that no
 compaction touched anchored every open at its own flush, and GC never punches a
 log extent holding live large values, so nothing ever moved that anchor — an open
 after a CLEAN drain re-read the whole WAL since (observed: ~190 s, a 15.75 GB tail
 extent read from an 780 MB-old cursor). The earlier rejection of "MIN→MAX" was
 about a MAX over SST stamps, which can land where no durable checkpoint says; this
 is the checkpoint itself, the same invariant GC's durable raise rests on.
+`recover_partition: replay plan built` reports
+`source_cursor_offsets_applied=true` when source offsets were applied and how
+many extents remain in the conservative walk.
 `recover_partition: log replay done` logs the real start, bytes, records kept vs
 already covered, and time; `replay_read_bytes(part_id)` exposes the bytes to tests.
-`crates/manager/tests/system_restart_replay_cursor.rs`.
+`crates/manager/tests/system_restart_replay_cursor.rs` and
+`crates/manager/tests/system_merge_single_checkpoint.rs`.
 
 ## GC (Garbage Collection)
 
@@ -2134,9 +2147,12 @@ Three fixes bound the restart replay window (worst case per partition =
     Recovery on success: the merge txn deletes victim's region and widens survivor's;
     `region_sync_loop` sees both on its next ~2 s tick, drops the frozen `PartitionData`
     for victim, reopens survivor with `frozen_for_merge = None` (no explicit unfreeze).
-    The splice leaves one checkpoint record per source in the survivor's meta stream,
-    and recovery replays from the earliest cursor — the survivor's — through every
-    victim log extent spliced in after it. So the survivor's open, before it serves,
+    The splice leaves one checkpoint record per source in the survivor's meta stream.
+    Recovery keeps the earliest cursor as its conservative extent-walk start, but
+    applies each resolved source cursor's byte offset to that source's cursor extent;
+    a 10+ GiB victim tail is therefore not reread from byte zero. It deliberately does
+    not infer whole-source boundaries from checkpoint-time extent counts. The
+    survivor's open, before it serves,
     replaces them with one (`publish_merged_checkpoint`): a non-empty memtable is
     flushed; an empty one (the drained case) gets a record listing the loaded tables
     with the log tail as its cursor, and `save_table_locs_raw` truncates meta_stream to

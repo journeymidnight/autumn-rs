@@ -14,6 +14,12 @@
 
 ## Active
 
+### BUG-MERGE-STALE-SOURCE-DEDUP — stale checkpoint extent counts can assign replay to the wrong source max_seq
+- **Trigger** (2026-09-29 external review of BUG-MERGE-SOURCE-REPLAY-OFFSET): existing `dedup_at` derives post-merge source regions from cumulative checkpoint-time `log_extent_count`. If one source grows while another truncates, stale counts can misattribute an extent to the other source; independent source sequence spaces then make `ts <= wrong_src_max` capable of dropping an unflushed record.
+- **Scope**: establish a durable source-boundary representation at merge time or remove count-derived source attribution without reverting to unsafe global sequence dedup. Keep the cursor-offset replay optimization independent from this work.
+- **Acceptance**: construct a reachable source-growth plus prefix-truncation merge shape with overlapping independent sequence numbers; crash-reopen preserves every ACKed record; the pre-fix implementation fails the test; no WAL/checkpoint format change unless explicitly approved.
+- `passes: false`
+
 ### BUG-PS-SHUTDOWN-CLONE — background region sync can reopen a drained partition
 - **Trigger** (2026-09-29 major-row-reclaim verification): `system_restart_replay_cursor::graceful_restart_replays_only_past_the_checkpoint` hit its 30 s shutdown deadline; trace showed "graceful drain complete" followed by region sync reopening the same partition.
 - **Cause**: `PartitionServer` derives Clone, but `shutting_down: Cell<bool>` is copied by value; the supervised region-sync/heartbeat clones never observe shutdown's flag. The entry-only check in `sync_regions_once` also needs review across awaited manager/open calls.

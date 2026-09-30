@@ -2498,6 +2498,14 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 # survivor's open alone left. A PS with that step disabled fails there on every
 # seed tried ("part N is open with 2 checkpoint records").
 # Deterministic form: cargo test -p autumn-manager --test system_merge_single_checkpoint
+# Besides checking that the open publishes one checkpoint and the next restart
+# replays nothing, this snapshots replay_read_bytes immediately before the merge:
+# the merge reopen must read <64 KiB, not the victim's ~3 MiB checkpoint-covered
+# tail. On a live merge, expect `recover_partition: replay plan built` with
+# `source_cursor_offsets_applied=true`; compare the following `log replay done ... bytes=N`
+# with each source checkpoint offset. The optimization changes the starting byte
+# of every resolved cursor extent. It intentionally still scans ambiguous whole
+# extents between cursors instead of trusting stale checkpoint-time extent counts.
 # Two more actions shape the row stream: `rollrow` seals and rolls every
 # partition's row tail (the fence-drain path), `flushburst` flushes every
 # partition 8 times so the PS's own size-tiered trim (past 32 SSTs) runs.
