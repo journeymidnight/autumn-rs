@@ -1086,21 +1086,28 @@ checkpoint (whose SSTs don't cover `[V_old, V_new)`) → silent loss. The ack-ga
 
 `recover_partition` starts its extent walk at the EARLIEST (by stream position)
 cursor among the loaded checkpoint records (one per source after a merge; one
-otherwise). `MSG_MERGE_FREEZE` now writes a fresh checkpoint plus a versioned
-companion record containing that source's exact ordered log extent list. It does
-so after write drain while holding `maintenance_gate`; every maintenance path
-re-checks the freeze after acquiring the gate. The list therefore stays stable
-until the manager seals and splices the streams. Recovery reconstructs the
-manager's exact splice rule (survivor list, then victim extents not already in
-the survivor, then the new tail). Only when every source has a valid companion
-and the reconstruction exactly matches the merged prefix does it skip all source
-extents and replay only the post-merge tail.
+otherwise). `MSG_MERGE_FREEZE` writes an ordinary checkpoint after write drain
+while holding `maintenance_gate`; every maintenance path re-checks the freeze
+after acquiring the gate. The manager's merge transaction then appends a fresh
+log tail and atomically writes `streamCoveredBefore/<stream_id> = <tail extent
+id>`. Split similarly allocates a fresh log tail for each child and publishes
+each membership and marker in one transaction. The marker means every earlier
+extent in that stream is checkpoint-covered. It is replay-only and is never a
+GC or large-value liveness proof.
 
-The companion is a separate framed record immediately after the unchanged
-`TableLocations`, in the same meta-stream append. Old binaries ignore it and use
-the preceding checkpoint; new binaries accept old checkpoints and fall back to
-the conservative walk. For that fallback, each resolved source cursor extent
-starts at its own byte offset, but no complete prefix is skipped from
+Recovery fetches the sidecar through the internal `MSG_STREAM_REPLAY_INFO`
+opcode, leaving the public `MSG_STREAM_INFO` wire shape unchanged. If the marker
+is a member of the current ordered extent list and at least one cursor-bearing
+checkpoint was loaded from an intact meta stream, it is a durable lower bound:
+replay starts at the marker at offset zero, or at a later ordinary checkpoint
+cursor. Missing markers (old managers), dangling markers (prefix trim), streams
+without a cursor-bearing checkpoint, and any corrupt or partial meta frame use
+the conservative walk. Legacy `AUMSB001` companion frames are no longer emitted
+or interpreted; the checkpoint decoder skips them as unknown malformed records,
+keeps the preceding valid `TableLocations`, and disables marker use.
+
+In the conservative fallback, each resolved source cursor extent starts at its
+own byte offset, but no complete prefix is skipped from
 `log_extent_count`: that count may be stale, and source growth plus prefix
 truncation can make stale counts cancel. If any cursor is unresolved, the prior
 global plan remains. CoW duplicate cursor extents are read once from the smallest
@@ -1119,9 +1126,10 @@ about a MAX over SST stamps, which can land where no durable checkpoint says; th
 is the checkpoint itself, the same invariant GC's durable raise rests on.
 `recover_partition: replay plan built` reports
 `source_cursor_offsets_applied=true` when the conservative fallback applies
-per-source cursor offsets. `exact_source_boundaries_applied=true` instead proves
-the certified source prefix was skipped; in that mode the offsets flag is false.
-`planned_extents` then normally equals one: the new post-merge tail.
+per-source cursor offsets. `covered_prefix_applied=true` proves the durable
+stream prefix was skipped; the offsets flag may also be true when it constructed
+the initial plan before the marker raised its lower bound. `planned_extents` then
+normally equals one: the fresh merge or split tail.
 `recover_partition: log replay done` logs the real start, bytes, records kept vs
 already covered, and time; `replay_read_bytes(part_id)` exposes the bytes to tests.
 `crates/manager/tests/system_restart_replay_cursor.rs` and

@@ -56,6 +56,10 @@ pub const MSG_GET_REGIONS: u8 = 0x2E;
 pub const MSG_GET_CLIENT_REGIONS: u8 = 0x60;
 /// EN verifies a recovery instruction against the current leader before reuse.
 pub const MSG_VALIDATE_RECOVERY: u8 = 0x61;
+/// Internal PS recovery query. This is a new opcode rather than a widened
+/// `MSG_STREAM_INFO` response so clients anywhere in the supported wire
+/// window keep decoding the old response byte-for-byte.
+pub const MSG_STREAM_REPLAY_INFO: u8 = 0x62;
 pub const MSG_HEARTBEAT_PS: u8 = 0x2F;
 
 // per-partition listener address registration (PS reports the
@@ -595,6 +599,26 @@ pub struct StreamInfoResp {
     /// (stream_id, MgrStreamInfo) pairs
     pub streams: Vec<(u64, MgrStreamInfo)>,
     /// (extent_id, MgrExtentInfo) pairs
+    pub extents: Vec<(u64, MgrExtentInfo)>,
+}
+
+/// Replay-only stream metadata. `covered_before_extent_id == 0` means the
+/// stream predates the covered-prefix sidecar (or has never needed one).
+/// Everything before a non-zero marker in `stream.extent_ids` is known to be
+/// represented by a durable checkpoint; recovery may begin at the marker.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct StreamReplayInfo {
+    pub stream: MgrStreamInfo,
+    pub covered_before_extent_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct StreamReplayInfoResp {
+    pub code: u8,
+    pub message: String,
+    /// `(stream_id, replay metadata)` pairs.
+    pub streams: Vec<(u64, StreamReplayInfo)>,
+    /// `(extent_id, MgrExtentInfo)` pairs.
     pub extents: Vec<(u64, MgrExtentInfo)>,
 }
 

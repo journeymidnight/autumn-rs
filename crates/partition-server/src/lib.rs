@@ -7592,7 +7592,7 @@ async fn try_complete_freeze_drain(
     // final checkpoint publication. Split already holds this same gate in its
     // caller. Maintenance paths re-check the freeze flag after acquiring the
     // gate, so work which queued before this freeze cannot mutate the source
-    // between certification and manager seal.
+    // between checkpoint publication and manager seal.
     let _merge_maintenance_permit = if need_merge_drain {
         let gate = part.borrow().maintenance_gate.clone();
         Some(gate.acquire().await)
@@ -7632,7 +7632,7 @@ async fn try_complete_freeze_drain(
     // queues on this gate, and waiting for that blocked task would deadlock.
     if need_merge_drain && drain_err.is_none() {
         if let Err(e) = publish_merge_source_checkpoint(part).await {
-            let msg = format!("publish exact merge-source checkpoint: {e:#}");
+            let msg = format!("publish merge-source checkpoint: {e:#}");
             tracing::error!(part_id, "{msg}");
             drain_err = Some(msg);
         }
@@ -9014,16 +9014,18 @@ fn select_clean_replica_chunk(
 struct ReplaySourceCheckpoint {
     cursor_pos: usize,
     cursor_offset: u64,
-    /// Present only on a merge-freeze checkpoint written while the source was
-    /// write-halted and while its maintenance gate was held.
-    exact_extent_ids: Option<Vec<u64>>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 struct ReplayExtentPlan {
     extents: Vec<(usize, u64, u64)>,
     source_cursor_offsets_applied: bool,
-    exact_source_boundaries_applied: bool,
+    /// A valid marker proves that the planned suffix belongs to the unified
+    /// post-boundary sequence space, even when a later ordinary checkpoint
+    /// already chose a stronger replay cursor.
+    covered_prefix_applied: bool,
+    /// True only when the marker actually raised the replay lower bound.
+    covered_prefix_rewrote_plan: bool,
 }
 
 /// Build the WAL extents recovery must scan.
@@ -9035,18 +9037,21 @@ struct ReplayExtentPlan {
 /// source's SSTs. Apply each resolved source's byte offset directly, while
 /// retaining the conservative global extent walk.
 ///
-/// A freeze-certified source record carries the exact ordered extent list
-/// while writes and maintenance were both halted. Reconstructing the manager's
-/// splice (`source[0] + source[n].not_already_present + new_tail`) from every
-/// source list proves the whole checkpoint-covered prefix. If any record is
-/// legacy, unresolved, or fails reconstruction, use the conservative
-/// offset-only plan.
+/// A manager-owned `covered_before` sidecar is a stronger lower bound. Merge
+/// and split publish it in the same etcd transaction that appends a fresh log
+/// tail, after the source was frozen, drained, and checkpointed. When its
+/// extent still belongs to this stream, all earlier extents are covered and
+/// replay may begin there at offset zero (or at a later ordinary checkpoint).
+/// A missing/dangling marker is the legacy case and keeps the conservative
+/// plan unchanged.
 fn plan_replay_extents(
     log_extent_ids: &[u64],
     chosen_pos: usize,
     chosen_offset: u64,
     source_checkpoints: &[ReplaySourceCheckpoint],
     all_source_cursors_resolved: bool,
+    covered_before_extent_id: Option<u64>,
+    has_checkpoint: bool,
 ) -> ReplayExtentPlan {
     let global_plan = || {
         let mut seen = HashSet::new();
@@ -9067,98 +9072,79 @@ fn plan_replay_extents(
             .collect()
     };
 
-    if chosen_pos == usize::MAX || !all_source_cursors_resolved || source_checkpoints.len() < 2 {
-        return ReplayExtentPlan {
-            extents: global_plan(),
-            source_cursor_offsets_applied: false,
-            exact_source_boundaries_applied: false,
-        };
-    }
-
-    // Meta-stream order is survivor then victim, exactly matching the manager
-    // splice. Cursor order cannot substitute for it when a CoW-shared cursor
-    // resolves to the survivor's first occurrence.
-    if source_checkpoints.iter().all(|c| c.exact_extent_ids.is_some()) {
-        let mut reconstructed = Vec::new();
-        let mut seen = HashSet::new();
-        let mut valid = true;
-        for (source_idx, checkpoint) in source_checkpoints.iter().enumerate() {
-            let ids = checkpoint.exact_extent_ids.as_ref().unwrap();
-            if ids.is_empty()
-                || ids.last().copied() != log_extent_ids.get(checkpoint.cursor_pos).copied()
-            {
-                valid = false;
-                break;
+    let mut source_cursor_offsets_applied = false;
+    let mut plan = if chosen_pos == usize::MAX
+        || !all_source_cursors_resolved
+        || source_checkpoints.len() < 2
+    {
+        global_plan()
+    } else {
+        let mut checkpoints = source_checkpoints.to_vec();
+        checkpoints.sort_by_key(|c| (c.cursor_pos, c.cursor_offset));
+        if checkpoints[0].cursor_pos != chosen_pos
+            || checkpoints[0].cursor_offset != chosen_offset
+            || checkpoints
+                .iter()
+                .any(|c| c.cursor_pos >= log_extent_ids.len() || c.cursor_pos < chosen_pos)
+        {
+            global_plan()
+        } else {
+            let mut cursor_offsets = HashMap::new();
+            for checkpoint in checkpoints {
+                cursor_offsets
+                    .entry(checkpoint.cursor_pos)
+                    .and_modify(|offset: &mut u64| {
+                        *offset = (*offset).min(checkpoint.cursor_offset)
+                    })
+                    .or_insert(checkpoint.cursor_offset);
             }
-            for &eid in ids {
-                if source_idx == 0 || seen.insert(eid) {
-                    reconstructed.push(eid);
+            let mut seen = HashSet::new();
+            let mut source_plan = Vec::new();
+            for (pos, &eid) in log_extent_ids.iter().enumerate() {
+                if pos < chosen_pos {
+                    seen.insert(eid);
+                    continue;
+                }
+                if seen.insert(eid) {
+                    let start_offset = cursor_offsets.get(&pos).copied().unwrap_or(0);
+                    source_plan.push((pos, eid, start_offset));
                 }
             }
-            if source_idx == 0 {
-                seen.extend(ids.iter().copied());
-            }
+            source_cursor_offsets_applied = true;
+            source_plan
         }
-        if valid
-            && reconstructed.len() < log_extent_ids.len()
-            && log_extent_ids.starts_with(&reconstructed)
+    };
+
+    let mut covered_prefix_applied = false;
+    let mut covered_prefix_rewrote_plan = false;
+    if has_checkpoint {
+        if let Some(marker_pos) = covered_before_extent_id
+            .and_then(|marker| log_extent_ids.iter().position(|&eid| eid == marker))
         {
-            let mut suffix_seen = seen;
-            let extents = log_extent_ids
-                .iter()
-                .enumerate()
-                .skip(reconstructed.len())
-                .filter_map(|(pos, &eid)| suffix_seen.insert(eid).then_some((pos, eid, 0)))
-                .collect();
-            return ReplayExtentPlan {
-                extents,
-                source_cursor_offsets_applied: false,
-                exact_source_boundaries_applied: true,
-            };
+            let plan_starts_before_marker = plan
+                .first()
+                .is_none_or(|(pos, _, _)| *pos < marker_pos);
+            if plan_starts_before_marker {
+                let mut seen: HashSet<u64> =
+                    log_extent_ids[..marker_pos].iter().copied().collect();
+                plan = log_extent_ids
+                    .iter()
+                    .enumerate()
+                    .skip(marker_pos)
+                    .filter_map(|(pos, &eid)| seen.insert(eid).then_some((pos, eid, 0)))
+                    .collect();
+                source_cursor_offsets_applied = false;
+                covered_prefix_rewrote_plan = true;
+            }
+            covered_prefix_applied = true;
         }
     }
 
-    let mut checkpoints = source_checkpoints.to_vec();
-    checkpoints.sort_by_key(|c| (c.cursor_pos, c.cursor_offset));
-    if checkpoints[0].cursor_pos != chosen_pos || checkpoints[0].cursor_offset != chosen_offset {
-        return ReplayExtentPlan {
-            extents: global_plan(),
-            source_cursor_offsets_applied: false,
-            exact_source_boundaries_applied: false,
-        };
-    }
-
-    let mut cursor_offsets = HashMap::new();
-    for checkpoint in checkpoints {
-        if checkpoint.cursor_pos >= log_extent_ids.len() || checkpoint.cursor_pos < chosen_pos {
-            return ReplayExtentPlan {
-                extents: global_plan(),
-                source_cursor_offsets_applied: false,
-                exact_source_boundaries_applied: false,
-            };
-        }
-        cursor_offsets
-            .entry(checkpoint.cursor_pos)
-            .and_modify(|offset: &mut u64| *offset = (*offset).min(checkpoint.cursor_offset))
-            .or_insert(checkpoint.cursor_offset);
-    }
-
-    let mut seen = HashSet::new();
-    let mut plan = Vec::new();
-    for (pos, &eid) in log_extent_ids.iter().enumerate() {
-        if pos < chosen_pos {
-            seen.insert(eid);
-            continue;
-        }
-        if seen.insert(eid) {
-            let start_offset = cursor_offsets.get(&pos).copied().unwrap_or(0);
-            plan.push((pos, eid, start_offset));
-        }
-    }
     ReplayExtentPlan {
         extents: plan,
-        source_cursor_offsets_applied: true,
-        exact_source_boundaries_applied: false,
+        source_cursor_offsets_applied,
+        covered_prefix_applied,
+        covered_prefix_rewrote_plan,
     }
 }
 
@@ -9200,7 +9186,7 @@ async fn recover_partition(
     // the splice puts both survivor's and victim's old meta_stream
     // extents into the merged stream; reading just the last extent
     // would lose half the table set.
-    let meta_records: Vec<RecoveredTableLocations> =
+    let (meta_records, meta_records_intact): (Vec<TableLocations>, bool) =
         read_all_table_locations(meta_stream_id, part_sc)
             .await
             .context("union TableLocations from metaStream extents")?;
@@ -9217,7 +9203,8 @@ async fn recover_partition(
     // pre-split) have LOWER extent_ids than survivor's new extents, but
     // appear AFTER survivor's in stream order. So `min(extent_id)` does
     // NOT give the earliest stream position — we have to scan the list.
-    let log_stream_info = part_sc.get_stream_info(log_stream_id).await?;
+    let (log_stream_info, covered_before_extent_id) =
+        part_sc.get_stream_replay_info(log_stream_id).await?;
     let log_extent_ids: Vec<u64> = log_stream_info.extent_ids.clone();
     // Pre-build first-occurrence index. CoW-shared extents can appear
     // twice in the spliced extent_ids; the FIRST occurrence is the
@@ -9504,11 +9491,10 @@ async fn recover_partition(
         end_excl: usize, // region = [prev_end, end_excl)
         src_max: u64,
     }
-    let mut records_meta: Vec<(usize, u64, u32, u64, Option<Vec<u64>>)> = Vec::new();
-    // (vp_pos, vp_offset, log_extent_count, src_max, exact_extent_ids)
+    let mut records_meta: Vec<(usize, u64, u32, u64)> = Vec::new();
+    // (vp_pos, vp_offset, log_extent_count, src_max)
     let mut any_zero_count = false;
-    let mut exact_source_stream_ids = HashSet::new();
-    for (source_idx, r) in meta_records.iter().enumerate() {
+    for r in &meta_records {
         if r.vp_extent_id == 0 {
             continue;
         }
@@ -9529,36 +9515,13 @@ async fn recover_partition(
             })
             .max()
             .unwrap_or(0);
-        let exact_extent_ids = r.exact_boundary.as_ref().and_then(|boundary| {
-            // The first meta record belongs to the surviving stream. Later
-            // records belong to victim streams whose IDs were deleted by the
-            // merge, so requiring every source ID to equal the survivor would
-            // reject every real multi-source certificate. Keep the identity
-            // check fail-closed: survivor first, distinct victim IDs after it.
-            let source_role_matches = if source_idx == 0 {
-                boundary.log_stream_id == log_stream_id
-            } else {
-                boundary.log_stream_id != log_stream_id
-            };
-            (source_role_matches && exact_source_stream_ids.insert(boundary.log_stream_id))
-                .then(|| boundary.log_extent_ids.clone())
-        });
-        records_meta.push((
-            pos,
-            r.vp_offset,
-            r.log_extent_count,
-            src_max,
-            exact_extent_ids,
-        ));
+        records_meta.push((pos, r.vp_offset, r.log_extent_count, src_max));
     }
-    // Exact reconstruction must preserve meta-stream order (survivor then
-    // victim). The legacy count-based dedup path still uses cursor order.
     let replay_checkpoints: Vec<ReplaySourceCheckpoint> = records_meta
         .iter()
-        .map(|(pos, offset, _count, _max, exact_extent_ids)| ReplaySourceCheckpoint {
+        .map(|(pos, offset, _count, _max)| ReplaySourceCheckpoint {
             cursor_pos: *pos,
             cursor_offset: *offset,
-            exact_extent_ids: exact_extent_ids.clone(),
         })
         .collect();
     let all_source_cursors_resolved = records_meta.len() == meta_records.len();
@@ -9568,13 +9531,16 @@ async fn recover_partition(
         recovered_vp_off,
         &replay_checkpoints,
         all_source_cursors_resolved,
+        covered_before_extent_id,
+        meta_records_intact && !records_meta.is_empty(),
     );
     let mut records_meta_by_cursor = records_meta.clone();
-    records_meta_by_cursor.sort_by_key(|(p, _, _, _, _)| *p);
+    records_meta_by_cursor.sort_by_key(|(p, _, _, _)| *p);
     let mut source_regions: Vec<SourceRegion> = Vec::new();
-    if replay_plan.exact_source_boundaries_applied {
-        // Every planned extent is post-merge. Its sequence domain begins after
-        // both source checkpoints, so source max-seq dedup must not apply.
+    if replay_plan.covered_prefix_applied {
+        // Every planned extent is at or after the transaction's fresh tail.
+        // Its sequence domain begins after the checkpointed prefix, so source
+        // max-seq dedup must not apply.
     } else if any_zero_count || records_meta_by_cursor.is_empty() {
         // Legacy / partial state: one virtual region covering the whole
         // stream with dedup = global max_seq (pre-fix behavior).
@@ -9584,7 +9550,7 @@ async fn recover_partition(
         });
     } else {
         let mut cum: usize = 0;
-        for (_pos, _offset, count, src_max, _exact) in &records_meta_by_cursor {
+        for (_pos, _offset, count, src_max) in &records_meta_by_cursor {
             cum += *count as usize;
             source_regions.push(SourceRegion {
                 end_excl: cum,
@@ -9643,12 +9609,16 @@ async fn recover_partition(
     // provable from checkpoint-time extent counts.
     let replay_extents = replay_plan.extents;
     let source_cursor_offsets_applied = replay_plan.source_cursor_offsets_applied;
-    let exact_source_boundaries_applied = replay_plan.exact_source_boundaries_applied;
+    let covered_prefix_applied = replay_plan.covered_prefix_applied;
+    let covered_prefix_rewrote_plan = replay_plan.covered_prefix_rewrote_plan;
     tracing::info!(
         target: "recover_trace",
         part_id = _part_id,
         source_cursor_offsets_applied,
-        exact_source_boundaries_applied,
+        covered_prefix_applied,
+        covered_prefix_rewrote_plan,
+        meta_records_intact,
+        covered_before_extent_id,
         planned_extents = replay_extents.len(),
         total_log_extents = log_extent_ids.len(),
         "recover_partition: replay plan built"
@@ -10167,34 +10137,6 @@ pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u
     out
 }
 
-/// Companion framing keeps the established `TableLocations` rkyv layout
-/// readable. Old binaries ignore this unknown payload and use the immediately
-/// preceding TableLocations; new binaries attach it only after validating the
-/// cursor and extent count.
-const MERGE_SOURCE_BOUNDARY_MAGIC: &[u8; 8] = b"AUMSB001";
-
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize, Clone, Debug)]
-struct MergeSourceBoundary {
-    log_stream_id: u64,
-    vp_extent_id: u64,
-    vp_offset: u64,
-    log_extent_ids: Vec<u64>,
-}
-
-#[derive(Clone, Debug)]
-struct RecoveredTableLocations {
-    locations: TableLocations,
-    exact_boundary: Option<MergeSourceBoundary>,
-}
-
-impl std::ops::Deref for RecoveredTableLocations {
-    type Target = TableLocations;
-
-    fn deref(&self) -> &Self::Target {
-        &self.locations
-    }
-}
-
 /// Walk all extents in a meta_stream and collect the LAST checkpoint from each
 /// non-empty extent. Used by
 /// recovery to gather both survivor's and victim's checkpoints
@@ -10206,21 +10148,26 @@ impl std::ops::Deref for RecoveredTableLocations {
 pub(crate) async fn read_all_table_locations(
     stream_id: u64,
     sc: &Rc<StreamClient>,
-) -> Result<Vec<RecoveredTableLocations>> {
+) -> Result<(Vec<TableLocations>, bool)> {
     let info = sc.get_stream_info(stream_id).await?;
-    let mut out: Vec<RecoveredTableLocations> = Vec::new();
+    let mut out: Vec<TableLocations> = Vec::new();
+    let mut all_records_intact = true;
     for &eid in &info.extent_ids {
         let (payload, _end) = sc.read_bytes_from_extent(eid, 0, 0).await?;
         if payload.is_empty() {
             continue;
         }
-        // decode_last_table_checkpoint returns Err only when NO valid
-        // record exists in the buffer; bit-rot mid-stream is logged
-        // and skipped. Empty extents (carry no records) are common —
-        // skip them silently.
-        match decode_last_table_checkpoint(&payload) {
-            Ok(locs) => out.push(locs),
+        // A buffer with no valid record is skipped but makes the integrity
+        // result false. Mid-stream corruption and a partial tail likewise
+        // preserve the last valid checkpoint while disabling covered-prefix
+        // marker use. Empty extents are common and do not affect integrity.
+        match decode_last_table_checkpoint_with_health(&payload) {
+            Ok((locs, intact)) => {
+                out.push(locs);
+                all_records_intact &= intact;
+            }
             Err(e) => {
+                all_records_intact = false;
                 tracing::warn!(
                     extent_id = eid,
                     error = %e,
@@ -10229,10 +10176,20 @@ pub(crate) async fn read_all_table_locations(
             }
         }
     }
-    Ok(out)
+    Ok((out, all_records_intact))
 }
 
-fn decode_last_table_checkpoint(data: &[u8]) -> Result<RecoveredTableLocations> {
+#[cfg(test)]
+fn decode_last_table_checkpoint(data: &[u8]) -> Result<TableLocations> {
+    decode_last_table_checkpoint_with_health(data).map(|(locs, _)| locs)
+}
+
+/// Decode the last valid checkpoint and report whether every complete frame
+/// decoded and the stream ended on a frame boundary. A covered-prefix marker
+/// may only trust an intact meta stream: falling back to an older checkpoint
+/// after a corrupt or truncated newer frame is not proof that WAL bytes up to
+/// the marker were captured.
+fn decode_last_table_checkpoint_with_health(data: &[u8]) -> Result<(TableLocations, bool)> {
     // Format: sequence of [len: u32 LE][rkyv payload] records. We want the last
     // successfully decoded record.
     //
@@ -10251,68 +10208,30 @@ fn decode_last_table_checkpoint(data: &[u8]) -> Result<RecoveredTableLocations> 
     // garbage, we still bound the damage: the next record's length-prefix will
     // almost certainly fail decode too, and we'll skip it; eventually we either
     // find a valid record or exit with `last` populated by the last good one.
-    let mut last: Option<RecoveredTableLocations> = None;
-    let mut boundary_can_attach = false;
+    let mut last: Option<TableLocations> = None;
     let mut buf = data;
     let mut offset = 0usize;
     let mut skipped: usize = 0;
+    let mut incomplete_tail = false;
     while buf.len() >= 4 {
         let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
         let total = 4 + msg_len;
         if total > buf.len() {
             // Legitimate partial-tail-write: stop here.
+            incomplete_tail = true;
             break;
         }
         let payload = &buf[4..4 + msg_len];
-        if let Some(encoded) = payload.strip_prefix(MERGE_SOURCE_BOUNDARY_MAGIC) {
-            match rkyv_decode::<MergeSourceBoundary>(encoded) {
-                Ok(boundary) => {
-                    let attaches = boundary_can_attach
-                        && last.as_ref().is_some_and(|checkpoint| {
-                            !boundary.log_extent_ids.is_empty()
-                                && boundary.vp_extent_id == checkpoint.vp_extent_id
-                                && boundary.vp_offset == checkpoint.vp_offset
-                                && boundary.log_extent_ids.last().copied()
-                                    == Some(checkpoint.vp_extent_id)
-                                && boundary.log_extent_ids.len()
-                                    == checkpoint.log_extent_count as usize
-                        });
-                    if attaches {
-                        last.as_mut().unwrap().exact_boundary = Some(boundary);
-                    } else {
-                        tracing::warn!(
-                            offset,
-                            log_stream_id = boundary.log_stream_id,
-                            "merge-source boundary does not match preceding checkpoint; ignoring"
-                        );
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(offset, msg_len, error = %e,
-                        "merge-source boundary decode failed; ignoring");
-                    skipped += 1;
-                }
-            }
-            boundary_can_attach = false;
-        } else {
-            match rkyv_decode::<TableLocations>(payload) {
-                Ok(locs) => {
-                    last = Some(RecoveredTableLocations {
-                        locations: locs,
-                        exact_boundary: None,
-                    });
-                    boundary_can_attach = true;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        offset,
-                        msg_len,
-                        error = %e,
-                        "TableLocations record decode failed (likely bit rot); skipping and continuing"
-                    );
-                    skipped += 1;
-                    boundary_can_attach = false;
-                }
+        match rkyv_decode::<TableLocations>(payload) {
+            Ok(locs) => last = Some(locs),
+            Err(e) => {
+                tracing::warn!(
+                    offset,
+                    msg_len,
+                    error = %e,
+                    "TableLocations record decode failed (likely bit rot); skipping and continuing"
+                );
+                skipped += 1;
             }
         }
         buf = &buf[total..];
@@ -10324,7 +10243,8 @@ fn decode_last_table_checkpoint(data: &[u8]) -> Result<RecoveredTableLocations> 
             "skipped {skipped} corrupted TableLocations record(s); newer valid records preserved"
         );
     }
-    last.ok_or_else(|| anyhow!("decode TableLocations: no valid record"))
+    last.map(|locs| (locs, skipped == 0 && !incomplete_tail))
+        .ok_or_else(|| anyhow!("decode TableLocations: no valid record"))
 }
 
 pub(crate) fn in_range(rg: &Range, key: &[u8]) -> bool {
@@ -10379,29 +10299,6 @@ pub(crate) async fn save_table_locs_raw(
     // order = publish order, no await in between).
     fence_floors: Vec<(u64, u64)>,
 ) -> Result<()> {
-    save_table_locs_raw_inner(
-        stream_client,
-        meta_stream_id,
-        tables,
-        vp_extent_id,
-        vp_offset,
-        log_extent_count,
-        fence_floors,
-        None,
-    )
-    .await
-}
-
-async fn save_table_locs_raw_inner(
-    stream_client: &Rc<StreamClient>,
-    meta_stream_id: u64,
-    tables: &[TableMeta],
-    vp_extent_id: u64,
-    vp_offset: u64,
-    log_extent_count: u32,
-    fence_floors: Vec<(u64, u64)>,
-    exact_boundary: Option<MergeSourceBoundary>,
-) -> Result<()> {
     let locs = TableLocations {
         locs: tables
             .iter()
@@ -10417,21 +10314,9 @@ async fn save_table_locs_raw_inner(
         fence_floors,
     };
     let payload = rkyv_encode(&locs);
-    let boundary_payload = exact_boundary.as_ref().map(|boundary| {
-        let encoded = rkyv_encode(boundary);
-        let mut payload = Vec::with_capacity(MERGE_SOURCE_BOUNDARY_MAGIC.len() + encoded.len());
-        payload.extend_from_slice(MERGE_SOURCE_BOUNDARY_MAGIC);
-        payload.extend_from_slice(&encoded);
-        payload
-    });
-    let boundary_len = boundary_payload.as_ref().map_or(0, |p| 4 + p.len());
-    let mut data = Vec::with_capacity(4 + payload.len() + boundary_len);
+    let mut data = Vec::with_capacity(4 + payload.len());
     data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     data.extend_from_slice(&payload);
-    if let Some(boundary_payload) = boundary_payload {
-        data.extend_from_slice(&(boundary_payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&boundary_payload);
-    }
     let ckpt_result = stream_client.append(meta_stream_id, &data).await?;
     tracing::info!(
         target: "ckpt_trace",
@@ -10442,7 +10327,6 @@ async fn save_table_locs_raw_inner(
         ckpt_extent = ckpt_result.extent_id,
         ckpt_offset = ckpt_result.offset,
         ckpt_end = ckpt_result.end,
-        merge_source_boundary = exact_boundary.is_some(),
         "checkpoint published"
     );
     let info = stream_client.get_stream_info(meta_stream_id).await?;
@@ -10464,15 +10348,11 @@ async fn publish_merge_source_checkpoint(part: &Rc<RefCell<PartitionData>>) -> R
         (p.stream_client.clone(), p.log_stream_id, p.meta_stream_id)
     };
 
-    // A manager timeout can deliver freeze=false while this async publication
-    // is already in flight. Such a stale certificate is harmless: a later
-    // merge accepts exact mode only when source identities are valid and all
-    // certified extent lists reconstruct the merged log's exact prefix.
     let (committed_end, tail_extent_id) = sc.commit_length_with_tail(log_stream_id).await?;
     let log_info = sc.get_stream_info(log_stream_id).await?;
     if log_info.extent_ids.last().copied() != Some(tail_extent_id) {
         return Err(anyhow!(
-            "log tail changed while certifying merge source: commit tail {} vs membership tail {:?}",
+            "log tail changed while checkpointing merge source: commit tail {} vs membership tail {:?}",
             tail_extent_id,
             log_info.extent_ids.last()
         ));
@@ -10483,13 +10363,7 @@ async fn publish_merge_source_checkpoint(part: &Rc<RefCell<PartitionData>>) -> R
         let p = part.borrow();
         (p.tables.clone(), snapshot_fence_floors(&p))
     };
-    let boundary = MergeSourceBoundary {
-        log_stream_id,
-        vp_extent_id: tail_extent_id,
-        vp_offset: committed_end,
-        log_extent_ids: log_info.extent_ids,
-    };
-    save_table_locs_raw_inner(
+    save_table_locs_raw(
         &sc,
         meta_stream_id,
         &tables,
@@ -10497,7 +10371,6 @@ async fn publish_merge_source_checkpoint(part: &Rc<RefCell<PartitionData>>) -> R
         committed_end,
         log_extent_count,
         floors,
-        Some(boundary),
     )
     .await?;
     part.borrow()
@@ -12533,24 +12406,38 @@ mod tests {
     }
 
     #[test]
-    fn merge_replay_skips_two_certified_multi_extent_sources() {
+    fn merge_replay_uses_stream_covered_prefix() {
         let ids = [10, 11, 12, 20, 21, 22, 99];
         let sources = [
             ReplaySourceCheckpoint {
                 cursor_pos: 2,
                 cursor_offset: 1_000,
-                exact_extent_ids: Some(vec![10, 11, 12]),
             },
             ReplaySourceCheckpoint {
                 cursor_pos: 5,
                 cursor_offset: 2_000,
-                exact_extent_ids: Some(vec![20, 21, 22]),
             },
         ];
-        let plan = plan_replay_extents(&ids, 2, 1_000, &sources, true);
+        let plan = plan_replay_extents(&ids, 2, 1_000, &sources, true, Some(99), true);
         assert!(!plan.source_cursor_offsets_applied);
-        assert!(plan.exact_source_boundaries_applied);
+        assert!(plan.covered_prefix_applied);
+        assert!(plan.covered_prefix_rewrote_plan);
         assert_eq!(plan.extents, vec![(6, 99, 0)]);
+
+        let ablated = plan_replay_extents(&ids, 2, 1_000, &sources, true, None, true);
+        assert!(!ablated.covered_prefix_applied);
+        assert!(!ablated.covered_prefix_rewrote_plan);
+        assert_eq!(
+            ablated.extents,
+            vec![
+                (2, 12, 1_000),
+                (3, 20, 0),
+                (4, 21, 0),
+                (5, 22, 2_000),
+                (6, 99, 0),
+            ],
+            "without the marker recovery must conservatively scan the source prefix"
+        );
     }
 
     #[test]
@@ -12562,47 +12449,19 @@ mod tests {
     }
 
     #[test]
-    fn merge_replay_certified_cow_sources_follow_manager_dedup() {
-        let ids = [10, 11, 12, 20, 21, 99];
+    fn ordinary_checkpoint_later_than_marker_wins() {
+        let ids = [10, 11, 99, 100];
         let sources = [
             ReplaySourceCheckpoint {
-                cursor_pos: 2,
-                cursor_offset: 1_000,
-                exact_extent_ids: Some(vec![10, 11, 12]),
-            },
-            ReplaySourceCheckpoint {
-                cursor_pos: 4,
-                cursor_offset: 2_000,
-                exact_extent_ids: Some(vec![10, 11, 20, 21]),
+                cursor_pos: 3,
+                cursor_offset: 777,
             },
         ];
-        let plan = plan_replay_extents(&ids, 2, 1_000, &sources, true);
-        assert!(plan.exact_source_boundaries_applied);
-        assert_eq!(plan.extents, vec![(5, 99, 0)]);
-    }
-
-    #[test]
-    fn merge_replay_rejects_stale_certified_boundary() {
-        let ids = [10, 11, 12, 13, 20, 21, 99];
-        let sources = [
-            ReplaySourceCheckpoint {
-                cursor_pos: 2,
-                cursor_offset: 100,
-                exact_extent_ids: Some(vec![10, 11, 12]),
-            },
-            ReplaySourceCheckpoint {
-                cursor_pos: 5,
-                cursor_offset: 200,
-                exact_extent_ids: Some(vec![20, 21]),
-            },
-        ];
-        let plan = plan_replay_extents(&ids, 2, 100, &sources, true);
-        assert!(plan.source_cursor_offsets_applied);
-        assert!(!plan.exact_source_boundaries_applied);
-        assert_eq!(
-            plan.extents,
-            vec![(2, 12, 100), (3, 13, 0), (4, 20, 0), (5, 21, 200), (6, 99, 0)]
-        );
+        let plan = plan_replay_extents(&ids, 3, 777, &sources, true, Some(99), true);
+        assert!(!plan.source_cursor_offsets_applied);
+        assert!(plan.covered_prefix_applied);
+        assert!(!plan.covered_prefix_rewrote_plan);
+        assert_eq!(plan.extents, vec![(3, 100, 777)]);
     }
 
     #[test]
@@ -12617,19 +12476,17 @@ mod tests {
             ReplaySourceCheckpoint {
                 cursor_pos: 2,
                 cursor_offset: 100,
-                exact_extent_ids: None,
             },
             ReplaySourceCheckpoint {
                 cursor_pos: 5,
                 cursor_offset: 800,
-                exact_extent_ids: None,
             },
         ];
 
-        let plan = plan_replay_extents(&ids, 2, 100, &sources, true);
+        let plan = plan_replay_extents(&ids, 2, 100, &sources, true, None, true);
 
         assert!(plan.source_cursor_offsets_applied);
-        assert!(!plan.exact_source_boundaries_applied);
+        assert!(!plan.covered_prefix_applied);
         assert_eq!(
             plan.extents,
             vec![
@@ -12651,19 +12508,17 @@ mod tests {
             ReplaySourceCheckpoint {
                 cursor_pos: 1,
                 cursor_offset: 100,
-                exact_extent_ids: None,
             },
             ReplaySourceCheckpoint {
                 cursor_pos: 4,
                 cursor_offset: 800,
-                exact_extent_ids: None,
             },
         ];
 
-        let plan = plan_replay_extents(&ids, 1, 100, &sources, true);
+        let plan = plan_replay_extents(&ids, 1, 100, &sources, true, None, true);
 
         assert!(plan.source_cursor_offsets_applied);
-        assert!(!plan.exact_source_boundaries_applied);
+        assert!(!plan.covered_prefix_applied);
         assert_eq!(
             plan.extents,
             vec![
@@ -12689,19 +12544,17 @@ mod tests {
             ReplaySourceCheckpoint {
                 cursor_pos: 1,
                 cursor_offset: 100,
-                exact_extent_ids: None,
             },
             ReplaySourceCheckpoint {
                 cursor_pos: 5,
                 cursor_offset: 800,
-                exact_extent_ids: None,
             },
         ];
 
-        let plan = plan_replay_extents(&ids, 1, 100, &sources, true);
+        let plan = plan_replay_extents(&ids, 1, 100, &sources, true, None, true);
 
         assert!(plan.source_cursor_offsets_applied);
-        assert!(!plan.exact_source_boundaries_applied);
+        assert!(!plan.covered_prefix_applied);
         assert_eq!(
             plan.extents,
             vec![
@@ -12725,19 +12578,17 @@ mod tests {
             ReplaySourceCheckpoint {
                 cursor_pos: 2,
                 cursor_offset: 100,
-                exact_extent_ids: None,
             },
             ReplaySourceCheckpoint {
                 cursor_pos: 2,
                 cursor_offset: 200,
-                exact_extent_ids: None,
             },
         ];
 
-        let plan = plan_replay_extents(&ids, 2, 100, &sources, true);
+        let plan = plan_replay_extents(&ids, 2, 100, &sources, true, None, true);
 
         assert!(plan.source_cursor_offsets_applied);
-        assert!(!plan.exact_source_boundaries_applied);
+        assert!(!plan.covered_prefix_applied);
         assert_eq!(plan.extents, vec![(2, 12, 100), (4, 20, 0), (5, 99, 0)]);
     }
 
@@ -12749,13 +12600,12 @@ mod tests {
         let sources = [ReplaySourceCheckpoint {
             cursor_pos: 2,
             cursor_offset: 100,
-            exact_extent_ids: None,
         }];
 
-        let plan = plan_replay_extents(&ids, 2, 100, &sources, false);
+        let plan = plan_replay_extents(&ids, 2, 100, &sources, false, None, true);
 
         assert!(!plan.source_cursor_offsets_applied);
-        assert!(!plan.exact_source_boundaries_applied);
+        assert!(!plan.covered_prefix_applied);
         assert_eq!(
             plan.extents,
             vec![(2, 12, 100), (3, 20, 0), (4, 21, 0), (5, 22, 0), (6, 99, 0),]
@@ -12772,19 +12622,17 @@ mod tests {
             ReplaySourceCheckpoint {
                 cursor_pos: 2,
                 cursor_offset: 100,
-                exact_extent_ids: None,
             },
             ReplaySourceCheckpoint {
                 cursor_pos: 5,
                 cursor_offset: 800,
-                exact_extent_ids: None,
             },
         ];
 
-        let plan = plan_replay_extents(&ids, 1, 50, &sources, true);
+        let plan = plan_replay_extents(&ids, 1, 50, &sources, true, None, true);
 
         assert!(!plan.source_cursor_offsets_applied);
-        assert!(!plan.exact_source_boundaries_applied);
+        assert!(!plan.covered_prefix_applied);
         assert_eq!(
             plan.extents,
             vec![(1, 11, 50), (2, 12, 0), (3, 20, 0), (4, 21, 0), (5, 22, 0), (6, 99, 0),]
@@ -12792,13 +12640,35 @@ mod tests {
     }
 
     #[test]
-    fn merge_replay_without_a_cursor_reads_every_unique_extent_from_zero() {
+    fn dangling_marker_falls_back_to_legacy_plan() {
+        let ids = [10, 11, 20];
+        let sources = [
+            ReplaySourceCheckpoint {
+                cursor_pos: 1,
+                cursor_offset: 50,
+            },
+            ReplaySourceCheckpoint {
+                cursor_pos: 2,
+                cursor_offset: 70,
+            },
+        ];
+        let plan = plan_replay_extents(&ids, 1, 50, &sources, true, Some(999), true);
+        assert!(!plan.covered_prefix_applied);
+        assert_eq!(plan.extents, vec![(1, 11, 50), (2, 20, 70)]);
+    }
+
+    #[test]
+    fn marker_with_only_cursorless_checkpoint_is_ignored() {
         let ids = [10, 11, 10, 20];
 
-        let plan = plan_replay_extents(&ids, usize::MAX, 0, &[], false);
+        // Recovery filters a TableLocations with vp_extent_id == 0 out of
+        // records_meta, so it must pass has_checkpoint=false here even though
+        // the raw meta record list was non-empty.
+        let plan = plan_replay_extents(&ids, usize::MAX, 0, &[], false, Some(20), false);
 
         assert!(!plan.source_cursor_offsets_applied);
-        assert!(!plan.exact_source_boundaries_applied);
+        assert!(!plan.covered_prefix_applied);
+        assert!(!plan.covered_prefix_rewrote_plan);
         assert_eq!(plan.extents, vec![(0, 10, 0), (1, 11, 0), (3, 20, 0)]);
     }
 
@@ -13012,7 +12882,15 @@ mod tests {
     }
 
     #[test]
-    fn decode_merge_source_boundary_attaches_to_preceding_checkpoint() {
+    fn decode_legacy_unknown_companion_keeps_preceding_checkpoint() {
+        #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        struct LegacyMergeSourceBoundary {
+            log_stream_id: u64,
+            vp_extent_id: u64,
+            vp_offset: u64,
+            log_extent_ids: Vec<u64>,
+        }
+
         let locs = TableLocations {
             fence_floors: vec![],
             locs: vec![],
@@ -13020,19 +12898,19 @@ mod tests {
             vp_offset: 900,
             log_extent_count: 3,
         };
-        let boundary = MergeSourceBoundary {
+        let table_payload = rkyv_encode(&locs);
+        let boundary = LegacyMergeSourceBoundary {
             log_stream_id: 44,
             vp_extent_id: 12,
             vp_offset: 900,
             log_extent_ids: vec![10, 11, 12],
         };
-        let table_payload = rkyv_encode(&locs);
         let boundary_encoded = rkyv_encode(&boundary);
-        let mut boundary_payload = MERGE_SOURCE_BOUNDARY_MAGIC.to_vec();
+        let mut boundary_payload = b"AUMSB001".to_vec();
         boundary_payload.extend_from_slice(&boundary_encoded);
         assert!(
             rkyv_decode::<TableLocations>(&boundary_payload).is_err(),
-            "an old decoder must ignore the companion instead of mistaking it for a checkpoint"
+            "the real legacy companion payload must not decode as TableLocations"
         );
         let mut data = Vec::new();
         data.extend_from_slice(&(table_payload.len() as u32).to_le_bytes());
@@ -13040,40 +12918,32 @@ mod tests {
         data.extend_from_slice(&(boundary_payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&boundary_payload);
 
-        let decoded = decode_last_table_checkpoint(&data).unwrap();
-        let exact = decoded.exact_boundary.expect("boundary must attach");
-        assert_eq!(exact.log_stream_id, 44);
-        assert_eq!(exact.log_extent_ids, vec![10, 11, 12]);
+        let (decoded, intact) = decode_last_table_checkpoint_with_health(&data).unwrap();
+        assert_eq!(decoded.vp_extent_id, 12);
+        assert_eq!(decoded.vp_offset, 900);
+        assert!(!intact, "an unknown legacy frame must disable marker use");
     }
 
     #[test]
-    fn decode_merge_source_boundary_mismatch_uses_legacy_checkpoint() {
+    fn corrupt_newer_checkpoint_disables_covered_prefix() {
         let locs = TableLocations {
             fence_floors: vec![],
             locs: vec![],
             vp_extent_id: 12,
-            vp_offset: 900,
+            vp_offset: 100,
             log_extent_count: 3,
         };
-        let boundary = MergeSourceBoundary {
-            log_stream_id: 44,
-            vp_extent_id: 12,
-            vp_offset: 901,
-            log_extent_ids: vec![10, 11, 12],
-        };
         let table_payload = rkyv_encode(&locs);
-        let boundary_encoded = rkyv_encode(&boundary);
-        let mut boundary_payload = MERGE_SOURCE_BOUNDARY_MAGIC.to_vec();
-        boundary_payload.extend_from_slice(&boundary_encoded);
+        let corrupt_payload = vec![0xff; table_payload.len()];
         let mut data = Vec::new();
         data.extend_from_slice(&(table_payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&table_payload);
-        data.extend_from_slice(&(boundary_payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&boundary_payload);
+        data.extend_from_slice(&(corrupt_payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&corrupt_payload);
 
-        let decoded = decode_last_table_checkpoint(&data).unwrap();
-        assert!(decoded.exact_boundary.is_none());
-        assert_eq!(decoded.vp_offset, 900);
+        let (decoded, intact) = decode_last_table_checkpoint_with_health(&data).unwrap();
+        assert_eq!(decoded.vp_extent_id, 12, "older checkpoint remains available");
+        assert!(!intact, "fallback after corruption cannot authorize a replay marker");
     }
 
     #[test]

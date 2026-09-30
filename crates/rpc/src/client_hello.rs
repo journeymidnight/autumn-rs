@@ -499,6 +499,7 @@ mod tests {
             manager_rpc::MSG_ACQUIRE_OWNER_LOCK,
             manager_rpc::MSG_MULTI_MODIFY_SPLIT,
             manager_rpc::MSG_MULTI_MODIFY_MERGE,
+            manager_rpc::MSG_STREAM_REPLAY_INFO,
         ] {
             assert!(!is_client_surface_mgr_msg(m), "mgr msg {m:#x}");
         }

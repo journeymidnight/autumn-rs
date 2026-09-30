@@ -9,6 +9,7 @@ mod op_log;
 mod placement;
 mod ps_placement;
 mod extent_layout;
+mod stream_covered_prefix;
 mod persist;
 pub(crate) mod store;
 mod fs_alloc;
@@ -722,6 +723,10 @@ pub struct AutumnManager {
     /// a second parse is a second chance to answer `InDat` for a file this
     /// build cannot name.
     pub(crate) extent_payload_location: Rc<RefCell<HashMap<u64, PayloadLocation>>>,
+    /// Replay lower bound for streams that were atomically re-sealed by a
+    /// merge or split. Persisted separately from `StreamRecord`; absent is the
+    /// legacy conservative-replay behavior. See `stream_covered_prefix.rs`.
+    pub(crate) stream_covered_before: Rc<RefCell<HashMap<u64, u64>>>,
     /// Per-process sequence + amortised-rotation counter for the durable
     /// op-log (see `op_log`).
     pub(crate) op_log_seq: Cell<u64>,
@@ -1085,6 +1090,7 @@ impl AutumnManager {
             node_lifecycle_lock: Rc::new(futures::lock::Mutex::new(())),
             inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
             extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
+            stream_covered_before: Rc::new(RefCell::new(HashMap::new())),
             extent_corrupt_slots: Rc::new(RefCell::new(HashMap::new())),
             op_log_seq: Cell::new(0),
             op_log_writes_since_gc: Cell::new(0),
@@ -2528,10 +2534,10 @@ impl AutumnManager {
     ///
     /// Keep this mechanism on the exact same path as operator-triggered
     /// merges. In particular, `handle_merge_partitions` freezes and drains
-    /// both sources, publishes their exact WAL-extent certificates, enforces
-    /// the freeze deadline, and rolls back both freezes on failure. A second
-    /// flush/commit-length implementation here previously bypassed those
-    /// certificates and made policy-triggered merges fall back to scanning
+    /// both sources, publishes their ordinary checkpoints, commits the fresh
+    /// tail replay boundary, enforces the freeze deadline, and rolls back both
+    /// freezes on failure. Keeping a second flush/commit-length implementation
+    /// here would bypass that boundary and make policy-triggered merges scan
     /// every old source extent on their first reopen.
     pub(crate) async fn auto_dispatch_merge(
         &self,
@@ -3158,6 +3164,11 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let extent_layout_raw = c
             .get_prefix(crate::extent_layout::EXTENT_LAYOUT_PREFIX)
             .await?;
+        // Per-stream replay lower bound. Absent on legacy streams; merge and
+        // split publish it atomically with the new stream membership.
+        let stream_covered_raw = c
+            .get_prefix(crate::stream_covered_prefix::STREAM_COVERED_PREFIX)
+            .await?;
         // Per-extent corrupt slots. A rebuild scheduled by a corrupt report
         // must survive the leader change that interrupted it, or the extent is
         // left isolated at RF-1 with the reason gone.
@@ -3441,6 +3452,10 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         }
         self.install_replayed_payload_locations(
             Self::decode_extent_layout_kvs(&extent_layout_raw.kvs)
+                .map_err(Self::replay_decode_err)?,
+        );
+        self.install_replayed_stream_covered_before(
+            Self::decode_stream_covered_kvs(&stream_covered_raw.kvs)
                 .map_err(Self::replay_decode_err)?,
         );
         self.install_replayed_corrupt_slots(Self::decode_extent_corrupt_kvs(

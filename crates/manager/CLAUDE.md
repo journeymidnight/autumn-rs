@@ -315,11 +315,16 @@ Atomically splits one partition into left + right:
    (refuse `split captured tail moved` otherwise — a roll that landed after
    the PS's capture would get the captured length stamped onto its fresh
    empty tail; 0 = no claim, skip).
-2. `alloc_ids(4)` → new log/row/meta stream ids + new part id.
-3. `duplicate_stream` each of the 3 streams at its sealed length (shares extents).
+2. `alloc_ids(6)` → new log/row/meta stream ids + new part id (the established
+   first four meanings), then one fresh log-tail extent id per child.
+3. `duplicate_stream` each of the 3 streams at its sealed length (shares extents),
+   append the two fresh log tails to the left/right log memberships, and allocate
+   their physical replicas before publication.
 4. Left range → `[start, mid)`; right created as `[mid, end)` with new stream ids.
 5. `rebalance_regions` (bumps left's `region_epoch`, seeds right's = 1).
-6. Persist everything in one fenced etcd txn.
+6. Persist everything plus both `streamCoveredBefore/<log_stream>` markers in
+   one fenced etcd txn. Each marker names its child's fresh tail, proving the
+   shared prefix was covered by the split-drain checkpoint.
 
 Both children initially share the same physical extents; each `PartitionServer`
 detects `has_overlap` on open and major-compaction cleans out-of-range keys and
@@ -348,7 +353,9 @@ vp_head replay correctness; `splice_streams_without_new_tail` for row+meta;
 `apply_merge_mutations`). Phases: (1) inflight checks + adjacency + `alloc_ids(1)` +
 `select_nodes` for the new tail `E_new` + eversion/CAS-baseline snapshot; (1.5)
 `alloc_extent_on_node` per replica; (2) single fenced `put_and_delete_txn` (all puts
-+ victim deletes — the linearization point); (3) verify-at-apply + apply.
++ survivor `streamCoveredBefore/<log_stream> = E_new` + victim deletes, including
+their marker keys — the linearization point); (3) verify-at-apply + apply. The
+marker is a replay lower bound only, never an extent-liveness or GC proof.
 
 `handle_merge_partitions` wraps that txn with a TiKV-PrepareMerge-style freeze-drain
 so writes that would race the flush→commit window are halted at the source. It first
