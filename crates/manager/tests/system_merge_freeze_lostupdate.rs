@@ -135,7 +135,7 @@ fn merge_freeze_ttl_lost_update() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 110).await;
 
         // Two ADJACENT partitions created directly (no CoW split → no has_overlap):

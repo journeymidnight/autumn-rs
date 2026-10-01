@@ -14,6 +14,19 @@
 
 ## Active
 
+### BUG-PROTOCOL-HELLO-REVIEW — 统一 Hello 提交（e8e6be2）评审出的回归
+- **Trigger** (2026-10-01 用户): "review 这个新commit" → "fix"。评审发现：Peer 角色的测试调管理类 opcode 被拒，manager/stream 测试大面积红；`integration compaction_merges_small_tables` 在 partition 线程栈溢出（上一提交通过）；`ConnPool::call_timeout` / `call_into_pooled` 把建连放进调用方超时，黑洞地址不再被识别为 `NodeAddrStale`；autumn-op 用 PS 连接探 EN，声明的目标服务不对，开放 extent 长度静默拿不到；PS 等 manager 时认不出建连超时；服务端拒绝版本不符只打 debug；PS 被拒分支的测试断言不可能失败；`connect_raw` 文档称管理入口实为 Client；`client_window_verify.sh` 前提不可能成立且依赖 ruby。
+- **Scope**: 只修上述问题，不改 Hello 协议、版本号与客户端区间设计。
+- **Acceptance**: 受影响测试套件全绿；栈溢出测试在默认 2 MiB 栈通过；真实 ConnPool 对不回应握手的地址，读超时短于建连上限时仍归类为建连失败，回退修复即红；PS 测试覆盖“握手与写请求同一次发送、写不被投递”和“Client 角色发 SPLIT_PART 被拒”，两项各自消融变红；autumn-op `info` 能拿到开放 extent 的实时长度；`docs/ops.md` 更新。
+- `passes: true`
+- **notes** (2026-10-01): 已修并验证。另修评审中途发现的两处同源回归：e8e6be2 让 `autumn-fuse` 编译失败（`prefetch_ahead` 布局超出 rustc 深度上限），以及 `ConnPool` 两个等长 5 s 建连计时器竞争导致错误形状随机、`is_liveness_timeout`（只读 `to_string()`）多数情况认不出建连超时。根因：connect+Hello 的状态机内联进每个调用者 future → `RpcClient::connect_as` 内 Box；建连只留一个计时器，两个分类器都读 `{:#}`。测量：栈溢出用例 1 MiB 栈通过（只恢复超时结构时 1.25 MiB 仍溢出）；新 ConnPool 用例对“建连放进调用超时”和“`is_liveness_timeout` 读 `to_string()`”两项消融都变红；PS 窗口用例两项消融变红。全量：rpc/stream/client/fs/fuse/PS lib 绿；manager 111 个目标仅剩 5 个在 e8e6be2^ 上同样失败的恢复用例（见 BUG-RECOVERY-PINNED-TARGET-TESTS）。`extent_pipeline::cq_flushes_fast_ops_while_slow_op_runs` 本机负载下 ratio 0.52–0.56 间歇失败（计时窗口不含建连，HEAD 上评审也见过），未动。本地真集群：`autumn-op info` / `info --part` 显示开放 extent 实时长度 500195 B；wire-52 Peer Hello 触发 manager WARN。`client_window_verify.sh` 只验证了“无可用旧客户端 → 退出 0”分支，完整分支要等出现低于上限的 Hello 版本客户端。独立评审（fable）发现的 `is_liveness_timeout` 与 doc 粘连已修。
+
+### BUG-RECOVERY-PINNED-TARGET-TESTS — 5 个副本恢复集成测试在 main 上失败
+- **Trigger** (2026-10-01，BUG-PROTOCOL-HELLO-REVIEW 跑全量 manager 测试时发现): `e2e_lifecycle::e2e_fence_triggers_recovery_dispatch`、`system_correlated_2of3_loss::leg1_correlated_2of3_loss_survives_and_recovery_refills_from_survivor`、`system_corrupt_replica_rebuild::a_replica_reported_corrupt_is_eventually_rebuilt`、`system_recovery_loop_drives::fencing_a_member_rebuilds_the_slot_when_a_spare_node_exists`、`system_wiped_rejoin_truncation::fencing_a_wiped_rejoined_node_triggers_recovery_refill` 恢复从不完成；在 e8e6be2^ 上同样失败，与统一 Hello 无关。EN 日志反复 `recovery task failed ... recovery destination disk is outside the pinned target`（检查来自 0efc2aa）。
+- **Scope**: 先查清是测试夹具（手工注册的节点/磁盘身份与 EN 真实 disk_id 不一致）还是 0efc2aa 的生产缺陷，再按根因修。
+- **Acceptance**: 5 个用例全绿；若是生产缺陷，加能在修复前变红的回归测试。
+- `passes: false`
+
 ### BUG-MERGE-STALE-SOURCE-DEDUP — stale checkpoint extent counts can assign replay to the wrong source max_seq
 - **Trigger** (2026-09-29 external review of BUG-MERGE-SOURCE-REPLAY-OFFSET): existing `dedup_at` derives post-merge source regions from cumulative checkpoint-time `log_extent_count`. If one source grows while another truncates, stale counts can misattribute an extent to the other source; independent source sequence spaces then make `ts <= wrong_src_max` capable of dropping an unflushed record.
 - **Scope**: establish a durable source-boundary representation at merge time or remove count-derived source attribution without reverting to unsafe global sequence dedup. Keep the cursor-offset replay optimization independent from this work.
@@ -44,7 +57,7 @@
 
 ### F-SST-DELETION-COUNT — SST 记删除条目数，按 TiKV 规则自动 major compaction
 - **Trigger** (2026-09-29 用户): 线上删除约 1317 万 key 后重启删除进程，第一次从头 range 扫过这些 tombstone，首页 4096 key 用了 185.4 秒。本地复现：扫描耗时正比于未被 compaction 清掉的 tombstone 及其遮住的旧值；一次 major 后同一页 2.9 s → 29 ms。持续删除时 SETTLE（要求窗口内无新删除）不触发，`unsettled_deletes` 只在内存、重启清零。用户定："在 SST 里记 tombstone 数，改SST格式，这个是必要的"；"DeleteRange还是太困难，不做"；"做删除计数，和RocksDB 和 TiKV 一个规则"；"写一个临时的convert_sst的binary，stopworld->convert_sst->start-new-version"。
-- **Scope**: SST MetaBlock 格式 v2，记 `num_entries` / `num_deletions`，服务端只认 v2（v1 报错显示支持版本）；PS 周期 tick 按 TiKV 规则（tombstone ≥ 10000 且 ≥ 全部条目 30%，检查间隔 5 分钟）自动发起 major compaction；分区打开时 `unsettled_deletes` 计入 SST 里的 tombstone；临时二进制 `convert_sst`：全停 PS 后把每个分区 checkpoint 引用的 SST 重写成 v2、发布新 checkpoint、截断 row stream，可中断重跑。
+- **Scope**: SST MetaBlock 格式 v2，记 `num_entries` / `num_deletions`，服务端只认 v2（v1 报错并提示跑 convert_sst）；PS 周期 tick 按 TiKV 规则（tombstone ≥ 10000 且 ≥ 全部条目 30%，检查间隔 5 分钟）自动发起 major compaction；分区打开时 `unsettled_deletes` 计入 SST 里的 tombstone；临时二进制 `convert_sst`：全停 PS 后把每个分区 checkpoint 引用的 SST 重写成 v2、发布新 checkpoint、截断 row stream，可中断重跑。
 - **Acceptance**: v2 编解码单测，v1 被拒；集成测试：删除 ≥ 1 万 key 并 flush 后，无外部触发，PS 自己做 major，tombstone 被清、range 首页变快，消融变红；重启后删除数不丢；convert_sst 在真实进程集群上把 v1 数据转成 v2，新 PS 打开后全部 key 可读（含 split 后 CoW 共享 SST、merge 后分区），重跑幂等；`docs/ops.md` 写明升级步骤。
 - `passes: true`
 - **notes** (2026-09-29): 已实现，本地提交、未 push（用户"最后也先别push"）。system_deletion_triggered_compaction 三项消融均变红（规则关掉、打开时不计 SST tombstone、跳过的 major 不结算）；真实进程端到端：旧 PS 经 merge + split 写 v1 数据，新 PS 拒开并提示 convert_sst，转换 38 个 SST，重跑为空操作，11000 个 key 逐字节正确、range 恰好列出 8200 个存活 key。2026-09-30：按用户要求删除一次性 SST/FS 转换工具、辅助模块及镜像配置，保留格式拒绝检查。

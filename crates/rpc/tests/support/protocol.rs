@@ -63,3 +63,15 @@ pub async fn initiate_tcp(
     .unwrap();
     socket
 }
+/// The raw request packet `initiate` would write for `hello`, so a test can
+/// pipeline business frames behind it in one write.
+pub fn hello_packet(hello: autumn_rpc::protocol_hello::Hello) -> Vec<u8> {
+    let ctrl = hello.encode();
+    let mut out = 1u32.to_le_bytes().to_vec();
+    out.extend_from_slice(&[0xF0, 0]);
+    out.extend_from_slice(&((ctrl.len() + 8) as u32).to_le_bytes());
+    out.extend_from_slice(&(ctrl.len() as u32).to_le_bytes());
+    out.extend_from_slice(&ctrl);
+    out.extend_from_slice(&crc32c::crc32c(&out).to_le_bytes());
+    out
+}

@@ -1118,9 +1118,6 @@ impl AutumnManager {
             // identity. Overwritten by `try_become_leader` /
             // `replay_from_etcd` when etcd is configured.
             cluster_id: Rc::new(RefCell::new(uuid::Uuid::new_v4().to_string())),
-            // R1: memory-only mode runs at this binary's max wire
-            // version. Overwritten by `try_become_leader` /
-            // `replay_from_etcd` when etcd is configured.
             // Empty registry; populated on
             // AcquireLease and on `replay_from_etcd`.
             inode_leases: Rc::new(RefCell::new(crate::inode_lease::LeaseRegistry::with_ttl(

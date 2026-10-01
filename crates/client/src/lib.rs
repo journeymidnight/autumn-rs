@@ -1598,17 +1598,24 @@ impl ClusterClient {
         Self::connect_with_binding(manager, NamespaceBinding::scoped(scope)).await
     }
 
-    /// D7: connect an ADMIN / UNSCOPED client (`Raw` binding) — NO
-    /// client-side namespace clamp. For admin / manager-only tooling
-    /// (`autumn-op`, node registration), cross-namespace inspection/migration,
-    /// tests exercising other features, and fuse-before-SD3 (whose keys are still
+    /// D7: connect an UNSCOPED client (`Raw` binding) — NO client-side
+    /// namespace clamp. For cross-namespace inspection/migration, tests
+    /// exercising other features, and fuse-before-SD3 (whose keys are still
     /// raw bytes). **NOT for data-plane writers** — those must declare their
     /// namespace via `connect`. The PS still enforces Layer-A/B, so this only
     /// bypasses the CLIENT prefixing, never server authorization.
+    ///
+    /// It declares the CLIENT role, so only client-surface RPCs pass; split,
+    /// compact, gc, flush, merge, namespace/principal admin and the op ledger
+    /// are refused (`PermissionDenied`). Operator tooling uses `connect_admin`.
     pub async fn connect_raw(manager: &str) -> Result<Self> {
         Self::connect_with_binding(manager, NamespaceBinding::Raw).await
     }
 
+    /// `connect_raw` declaring the ADMIN role: every opcode of each service,
+    /// at exact `WIRE_VERSION` equality. For operator tooling (`autumn-op`).
+    /// The role is a declaration, not a credential — the admin token and authz
+    /// still apply.
     pub async fn connect_admin(manager: &str) -> Result<Self> {
         Self::connect_with_role(
             manager,
@@ -1618,6 +1625,8 @@ impl ClusterClient {
         .await
     }
 
+    /// `connect_raw` declaring the PEER role (cluster members: the extent
+    /// node's startup calls). Exact `WIRE_VERSION` equality; no admin opcodes.
     pub async fn connect_peer(manager: &str) -> Result<Self> {
         Self::connect_with_role(
             manager,

@@ -173,6 +173,14 @@ budget for it rather than assuming the guard rarely fires. Cheap would require
 a manager-side reverse lookup, i.e. a wire change. A failed lookup degrades to
 `refs` alone rather than failing the panel.
 
+**Open extent lengths (`info`, `info --part`).** The manager only knows a
+sealed extent's length, so both views probe the first replica with
+`MSG_PROBE_EXTENT` (`probe_extent_len`), through an ADMIN-role `ConnPool`. Not
+through the SDK: its PS connections declare `Service::PartitionServer` and an
+extent node refuses that hello, and its own EN connections are client-role,
+which may only read. A failed probe keeps the manager's value, so a probe
+that can never succeed looks exactly like an empty open extent.
+
 `format` is IDENTITY-ONLY: no location flags — it stamps the sentinels and registers an EMPTY location; the EN self-registers its real location. `register-node` is a migration stub that hints and exits 1 before connecting.
 
 **CLI conventions (canonical + accepted aliases).** Both binaries hand-parse args (no clap; `autumn_op/args.rs`, `autumn_client/args.rs`). Canonical subcommands are kebab-case; the old snake_case / no-separator spellings stay as accepted aliases (`policy-candidates`←`policy_candidates`/`policy`, `auto-policy`←`auto_policy`, `put-stream`←`putstream`, `get-stream`←`getstream`). Canonical flag names per concept, with the older spelling kept as an alias: `--namespace` (←`--scope`, client KV scope), `--tenant` (←`--with-tenant`, `namespace-create`), `--principal` (←`--tenant`, `mint-token`). Byte-size flags accept an optional binary suffix (`4k`/`8m`/`1gib`) across both binaries (`gc --max-size`/`--stream-debt`, `perf-check`/`ycsb --size`). Three `autumn-client` subcommands are INTERNAL zero-copy verification paths, deliberately omitted from `usage()`: `put-bulk`, `direct-get`, `bulk-get` (they mirror `put`/`get` through the ZC codepaths). NOT YET unified (follow-ups): the verb-noun vs noun-verb split (`list-nodes`/`fence-node` vs `namespace-create`), the per-command `--admin-token` duplicating the global one, and `split`'s three targeting flags (`--at`/`--at-hex`/`--at-raw-hex`).

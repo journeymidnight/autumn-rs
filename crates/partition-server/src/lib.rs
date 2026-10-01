@@ -6055,6 +6055,7 @@ async fn handle_ps_connection(
         &mut reader,
         &mut writer,
         autumn_rpc::protocol_hello::Service::PartitionServer,
+        &peer_label,
     )
     .await?;
     let mut decoder = FrameDecoder::new();
@@ -15277,27 +15278,57 @@ mod authz_enforcement_tests {
                 let worker = compio::runtime::spawn(async move {
                     while let Some(req) = req_rx.next().await {
                         count.set(count.get() + 1);
-                        let p: PutReq = partition_rpc::rkyv_decode(&req.payload).unwrap();
-                        req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&PutResp {
-                            code: CODE_OK, message: String::new(), key: p.key,
-                        }))).ok();
+                        let reply = if req.msg_type == MSG_PUT {
+                            let p: PutReq = partition_rpc::rkyv_decode(&req.payload).unwrap();
+                            partition_rpc::rkyv_encode(&PutResp {
+                                code: CODE_OK, message: String::new(), key: p.key,
+                            })
+                        } else {
+                            Bytes::new()
+                        };
+                        req.resp_tx.send(Ok(reply)).ok();
                     }
                 });
+                let put = || partition_rpc::rkyv_encode(&PutReq { part_id: 7, key: b"k".to_vec(),
+                    value: b"v".to_vec(), region_epoch: 0, expires_at: 0,
+                    inode_hint: 0, lease_epoch: 0 });
+                let hello = Hello { role: Role::Client, wire_version: version, client_version: version };
                 let (mut rd, mut wr) = autumn_transport::Conn::Tcp(client).into_split();
-                let result = initiate(&mut rd, &mut wr, Hello { role: Role::Client,
-                    wire_version: version, client_version: version }, Some(Service::PartitionServer)).await;
                 if !(autumn_rpc::MIN_CLIENT_WIRE_VERSION..=autumn_rpc::WIRE_VERSION).contains(&version) {
-                    assert!(matches!(result, Err(autumn_rpc::RpcError::VersionMismatch { .. })));
-                    assert_eq!(delivered.get(), 0);
+                    // Hello and a Put in ONE write: the Put is already in the
+                    // server's socket buffer when the Hello is judged.
+                    let mut bytes = test_protocol::hello_packet(hello);
+                    bytes.extend_from_slice(&Frame::request(2, MSG_PUT, put()).encode());
+                    wr.write_all(bytes).await.0.unwrap();
+                    // The server closes with the Put unread, so the kernel may
+                    // answer with a reset; either way the connection is gone.
+                    compio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let BufResult(n, _) = rd.read(vec![0u8; 4096]).await;
+                            if !matches!(n, Ok(n) if n > 0) {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .expect("a refused connection is closed");
                     assert!(conn.await.unwrap().is_err());
                     worker.await.unwrap();
+                    assert_eq!(delivered.get(), 0);
                 } else {
-                    assert!(result.is_ok());
-                    let f = round_trip(&mut wr, &mut rd, &mut FrameDecoder::new(), 2, MSG_PUT,
-                        partition_rpc::rkyv_encode(&PutReq { part_id: 7, key: b"k".to_vec(),
-                            value: b"v".to_vec(), region_epoch: 0, expires_at: 0,
-                            inode_hint: 0, lease_epoch: 0 })).await;
+                    initiate(&mut rd, &mut wr, hello, Some(Service::PartitionServer)).await.unwrap();
+                    let mut decoder = FrameDecoder::new();
+                    let f = round_trip(&mut wr, &mut rd, &mut decoder, 2, MSG_PUT, put()).await;
                     assert!(!f.is_error());
+                    // An admitted client is still held to the client surface:
+                    // a split is refused on the connection, never delivered.
+                    let before = delivered.get();
+                    let f = round_trip(&mut wr, &mut rd, &mut decoder, 3, MSG_SPLIT_PART,
+                        Bytes::new()).await;
+                    assert!(f.is_error());
+                    let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
+                    assert_eq!(code, StatusCode::PermissionDenied);
+                    assert_eq!(delivered.get(), before);
                     drop(conn); drop(worker);
                 }
             }

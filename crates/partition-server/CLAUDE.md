@@ -1756,7 +1756,12 @@ again after receive so expiry/revocation during await cannot bypass them.
 
 - protocol admission uses the client interval or exact peer/admin wire. The
   real socket test a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition
-  runs with authz OFF and proves version refusal does not reach the partition.
+  runs with authz OFF. A refused client sends its Hello and a Put in ONE write,
+  so the Put is already buffered when the Hello is judged, and it must never
+  reach the partition loop; an admitted client's Put is answered, and its
+  MSG_SPLIT_PART is refused PermissionDenied without reaching the loop.
+  Ablations: admitting a mismatched client, or skipping `check_opcode` in
+  `authz_gate`, each turn it red.
 - handles `MSG_AUTH_HELLO`: `verify_auth_hello` (sig + `aud == cluster_id` +
   `nbf`/`exp`) binds the per-connection `principal: Option<BoundPrincipal>`. When
   authz is OFF, AUTH_HELLO is a no-op OK so an authz-aware client still works against

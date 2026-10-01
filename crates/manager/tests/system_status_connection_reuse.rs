@@ -117,7 +117,7 @@ fn split_merge_status_refusals_reuse_healthy_connections() {
             upsert_partition(&mgr, 1801, log, row, meta, b"a", b"z").await;
             let ps_addr = pick_addr();
             start_partition_server(180, mgr_addr, ps_addr);
-            let admin = ClusterClient::connect_raw(&mgr_addr.to_string())
+            let admin = ClusterClient::connect_admin(&mgr_addr.to_string())
                 .await
                 .unwrap();
             admin.put(b"c-key", b"left").await.unwrap();

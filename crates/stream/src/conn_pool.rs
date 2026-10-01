@@ -22,16 +22,6 @@ use anyhow::{anyhow, Result};
 use autumn_rpc::client::RpcClient;
 use bytes::Bytes;
 
-/// (1A): bound the TCP connect so a blackholed peer (SYN dropped) can't
-/// hang `get_client` — and therefore any PS/EN background loop that reaches it
-/// (region_sync `open_partition` → `commit_length`, EN reconcile, recovery
-/// fanout) — indefinitely. `call_timeout` only bounds the call AFTER connect;
-/// the connect itself had no deadline. Mirrors the manager-side connect-timeout
-/// fix (`AUTUMN_MGR_CONNECT_TIMEOUT_MS`); a fixed constant here (not a tuning
-/// knob) keeps it env-free per the config rule. 5 s is generous for
-/// datacenter / loopback (sub-second normal); on expiry the entry is not
-/// cached, so the next call retries a fresh connect.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct ConnPool {
     role: autumn_rpc::protocol_hello::Role,
@@ -103,24 +93,18 @@ impl ConnPool {
         // Evict any closed entry under a fresh borrow so the upcoming
         // `connect.await` doesn't hold the RefCell across a yield.
         self.clients.borrow_mut().remove(&addr);
-        // (1A): bound the connect (see CONNECT_TIMEOUT). On timeout the
-        // entry stays uncached so the next call retries a fresh connect.
-        let client = match compio::time::timeout(
-            CONNECT_TIMEOUT,
-            RpcClient::connect_as(addr, self.role, None),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(anyhow::Error::new(e).context(format!("connect {addr}"))),
-            Err(_) => {
-                return Err(anyhow!(
-                    "connect {} timed out after {:?}",
-                    addr,
-                    CONNECT_TIMEOUT
-                ))
-            }
-        };
+        // (1A): the connect is bounded so a blackholed peer (SYN dropped)
+        // can't hang `get_client` — and therefore any PS/EN background loop
+        // that reaches it (region_sync `open_partition` → `commit_length`, EN
+        // reconcile, recovery fanout) — indefinitely. The bound is the one
+        // `connect_as` already applies to connect + PROTOCOL_HELLO
+        // (`protocol_hello::TIMEOUT`, 5 s). A second timer here with the same
+        // length raced it and made the error's shape a coin toss, which is
+        // what classifiers read. On failure the entry is not cached, so the
+        // next call retries a fresh connect.
+        let client = RpcClient::connect_as(addr, self.role, None)
+            .await
+            .map_err(|e| anyhow::Error::new(e).context(format!("connect {addr}")))?;
         self.clients.borrow_mut().insert(addr, client.clone());
         Ok(client)
     }
@@ -155,28 +139,17 @@ impl ConnPool {
         timeout: Duration,
     ) -> Result<Bytes> {
         let sock = parse_addr(addr)?;
-        // A single budget includes TCP connect, Hello, submission and reply.
-        let result = compio::time::timeout(timeout, async {
-            let client = self.get_client(sock).await?;
-            client
-                .call(msg_type, payload)
-                .await
-                .map_err(anyhow::Error::new)
-        })
-        .await;
-        match result {
-            Ok(Ok(bytes)) => Ok(bytes),
-            Ok(Err(e)) => {
-                if e.downcast_ref::<autumn_rpc::RpcError>()
-                    .is_some_and(|e| e.is_connection_error())
-                {
+        // The connect is bounded by `get_client` on its own, outside
+        // `timeout`: a connect failure must surface as one ("connect ..."), so
+        // a read can tell a stale node address from a slow reply.
+        let client = self.get_client(sock).await?;
+        match client.call_timeout(msg_type, payload, timeout).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) => {
+                if e.is_connection_error() {
                     self.evict(sock);
                 }
-                Err(e)
-            }
-            Err(_) => {
-                self.evict(sock);
-                Err(anyhow::Error::new(autumn_rpc::RpcError::Timeout(timeout)))
+                Err(anyhow::Error::new(e))
             }
         }
     }
@@ -193,22 +166,16 @@ impl ConnPool {
         timeout: Duration,
     ) -> Result<autumn_rpc::client::BulkResp> {
         let sock = parse_addr(addr)?;
-        let fut = async {
-            let client = self.get_client(sock).await?;
-            client
-                .call_into_pooled(msg_type, payload)
-                .await
-                .map_err(anyhow::Error::new)
-        };
+        // Connect outside `timeout`, as in `call_timeout`.
+        let client = self.get_client(sock).await?;
+        let fut = client.call_into_pooled(msg_type, payload);
         match compio::time::timeout(timeout, fut).await {
             Ok(Ok(r)) => Ok(r),
             Ok(Err(e)) => {
-                if e.downcast_ref::<autumn_rpc::RpcError>()
-                    .is_some_and(|e| e.is_connection_error())
-                {
+                if e.is_connection_error() {
                     self.evict(sock);
                 }
-                Err(e)
+                Err(anyhow::Error::new(e))
             }
             Err(_) => {
                 self.evict(sock);

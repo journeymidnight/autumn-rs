@@ -36,10 +36,6 @@ fn usage() -> ! {
     eprintln!("  ops history [--kind K] [--since UNIX] [--limit N]");
     eprintln!("                               durable terminal history from etcd, newest first");
     eprintln!();
-    eprintln!("upgrade versioning:");
-    eprintln!("                               allowed, never backward; run ONLY after every member binary");
-    eprintln!("                               is upgraded; not rollbackable");
-    eprintln!();
     eprintln!("node-lifecycle admin commands:");
     eprintln!("  fence-node <id> --reason \"...\" --by alice [--force]");
     eprintln!("  maintenance <id> --reason \"...\" --by alice [--expire UNIX_TS]");

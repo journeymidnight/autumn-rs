@@ -318,13 +318,19 @@ impl RpcClient {
         expected: Option<crate::protocol_hello::Service>,
     ) -> Result<Rc<Self>, RpcError> {
         let deadline = crate::protocol_hello::TIMEOUT;
-        compio::time::timeout(deadline, async {
+        // Boxed: connect + PROTOCOL_HELLO is a cold path, and its state
+        // machine inline grows every caller's future. Unboxed, autumn-fuse's
+        // `prefetch_ahead` overflowed rustc's layout depth limit, and a flush
+        // on the 2 MiB partition thread overflowed its stack (debug build).
+        Box::pin(compio::time::timeout(deadline, async {
             let conn = autumn_transport::current_or_init().connect(addr).await?;
             if let Some(s) = conn.as_tcp() {
                 s.set_nodelay(true)?;
             }
             Self::from_conn_as(conn, addr, Keepalive::DEFAULT, role, expected).await
-        }).await.map_err(|_| RpcError::Timeout(deadline))?
+        }))
+        .await
+        .map_err(|_| RpcError::Timeout(deadline))?
     }
 
     /// `connect` with a non-default `Keepalive` (tests shorten it).

@@ -14,6 +14,9 @@
 //! `slow request died with the eviction` — the eviction tears the connection
 //! down while the reply is still in flight.
 
+#[path = "../../rpc/tests/support/protocol.rs"]
+mod protocol;
+
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::Duration;
@@ -35,6 +38,7 @@ async fn an_eviction_does_not_kill_another_callers_in_flight_request() {
     let addr = listener.local_addr().expect("local_addr").to_string();
     let server = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().expect("accept");
+        protocol::accept_std(&mut sock, autumn_rpc::WIRE_VERSION, 3);
         let mut answered = 0usize;
         // Two requests arrive; only SLOW is ever answered, 400 ms after it
         // lands — after the STUCK caller's 200 ms deadline has evicted.

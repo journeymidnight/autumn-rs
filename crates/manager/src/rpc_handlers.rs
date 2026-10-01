@@ -165,11 +165,16 @@ impl AutumnManager {
     /// that's correct (client already gave up).
     async fn handle_connection(conn: autumn_transport::Conn, mgr: AutumnManager) -> Result<()> {
         use futures::StreamExt;
+        let peer = conn
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".to_string());
         let (mut reader, mut writer) = conn.into_split();
         let protocol = autumn_rpc::protocol_hello::accept(
             &mut reader,
             &mut writer,
             autumn_rpc::protocol_hello::Service::Manager,
+            &peer,
         )
         .await?;
         let mut decoder = FrameDecoder::new();

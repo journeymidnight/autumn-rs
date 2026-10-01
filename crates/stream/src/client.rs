@@ -265,7 +265,7 @@ pub(crate) fn is_connect_failure(err: &anyhow::Error) -> bool {
         && (m.contains(" timed out after ")
             // The kernel's own ETIMEDOUT, which reads differently from the
             // bounded-connect one above and only surfaces where `tcp_syn_retries`
-            // is tuned below CONNECT_TIMEOUT.
+            // is tuned below the 5 s connect bound.
             || m.contains("Connection timed out")
             || m.contains("Connection refused")
             || m.contains("No route to host")
@@ -1199,7 +1199,10 @@ pub const DEFAULT_READ_FLOOR_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
 /// Matches the message strings `conn_pool` emits (`"timed out after"`) — the same
 /// contract already relied on at the two damping sites; centralised here.
 pub(crate) fn is_liveness_timeout(err: &anyhow::Error) -> bool {
-    let m = err.to_string();
+    // `{:#}`, like `is_connect_failure`: a connect timeout from `ConnPool` is
+    // `RpcError::Timeout` under a `connect <addr>` context, and plain
+    // `to_string()` prints only that context.
+    let m = format!("{err:#}");
     m.contains("timed out after") || m.contains("timed out")
 }
 
@@ -1379,7 +1382,7 @@ mod io_deadline_tests {
             "call_into_pooled timed out after 5s"
         )));
         assert!(is_liveness_timeout(&anyhow::anyhow!(
-            "connect 1.2.3.4:9101 timed out after 5s"
+            "connect 1.2.3.4:9101: RPC timed out after 5s"
         )));
         assert!(!is_liveness_timeout(&anyhow::anyhow!(
             "direct read from 1.2.3.4:9101: code=locked"
@@ -7890,7 +7893,7 @@ mod ec_gather_retry_tests {
     fn an_unreachable_cached_address_is_its_own_retry_class() {
         for m in [
             // ConnPool's bounded-connect timeout — the shape actually observed.
-            "connect 192.168.3.199:9111 timed out after 5s",
+            "connect 192.168.3.199:9111: RPC timed out after 5s",
             // ...and its underlying-io-error sibling, which is what a reused
             // address answers with once something else holds the port.
             "connect 192.168.3.199:9111: Connection refused (os error 111)",
@@ -7927,8 +7930,34 @@ mod ec_gather_retry_tests {
     /// read to a genuinely dead node.
     #[test]
     fn the_address_class_still_retries_only_once() {
-        let err = anyhow::anyhow!("connect 192.168.3.199:9111 timed out after 5s");
+        let err = anyhow::anyhow!("connect 192.168.3.199:9111: RPC timed out after 5s");
         assert_eq!(read_retry_action(1, &err), None);
+    }
+
+    /// The strings above are hand-built; this one comes from the real pool. A
+    /// peer that never completes the connect (here: TCP accepted by the kernel
+    /// backlog, PROTOCOL_HELLO never answered) must fail as a connect even when
+    /// the read's own deadline is shorter than the connect bound — otherwise
+    /// the read deadline fires first and the stale address is never refreshed.
+    #[compio::test]
+    async fn a_connect_that_never_completes_is_classified_through_the_real_pool() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let pool = ConnPool::new();
+        let err = pool
+            .call_into_pooled(&addr, 1, Bytes::new(), Duration::from_secs(1))
+            .await
+            .expect_err("the peer never answers");
+        assert!(is_connect_failure(&err), "got: {err:#}");
+        assert!(is_liveness_timeout(&err), "got: {err:#}");
+        assert_eq!(read_retry_action(0, &err), Some(ReadRetry::NodeAddrStale));
+        let err = pool
+            .call_timeout(&addr, 1, Bytes::new(), Duration::from_secs(1))
+            .await
+            .expect_err("the peer never answers");
+        assert!(is_connect_failure(&err), "got: {err:#}");
+        assert!(is_liveness_timeout(&err), "got: {err:#}");
+        drop(listener);
     }
 
     fn ex_with_replicas(extent_id: u64, replicates: Vec<u64>) -> ExtentInfo {
@@ -8032,7 +8061,7 @@ mod ec_gather_retry_tests {
 
         sc.forget_unreachable_replicas(
             &ex,
-            &anyhow::anyhow!("connect 192.168.3.199:9111 timed out after 5s"),
+            &anyhow::anyhow!("connect 192.168.3.199:9111: RPC timed out after 5s"),
         );
         assert!(sc.nodes_cache.is_empty(), "the replicas' addresses must be dropped");
     }

@@ -254,7 +254,7 @@ fn fence_flush_invariant() {
     let outer_rt = compio::runtime::Runtime::new().unwrap();
     let (en_node_ids, _mgr, log_stream, row_stream, meta_stream, ps_addr) =
         outer_rt.block_on(async {
-            let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+            let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
             // wait for leader
             for _ in 0..30 {
                 if mgr.call(MSG_STATUS, Bytes::new()).await.is_ok() {
@@ -310,8 +310,8 @@ fn fence_flush_invariant() {
 
     let stress_rt = compio::runtime::Runtime::new().unwrap();
     let final_expected = stress_rt.block_on(async move {
-        let ps: Rc<RpcClient> = RpcClient::connect(ps_addr).await.expect("connect ps");
-        let mgr_c: Rc<RpcClient> = RpcClient::connect(mgr_addr).await.expect("connect mgr2");
+        let ps: Rc<RpcClient> = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let mgr_c: Rc<RpcClient> = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr2");
 
         // Spawn WRITER_COUNT writers (mirrors chaos test).
         let mut writers = Vec::new();
@@ -359,7 +359,7 @@ fn fence_flush_invariant() {
     // ── Verify ──
     let verify_rt = compio::runtime::Runtime::new().unwrap();
     let mismatches = verify_rt.block_on(async {
-        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
         let mut mismatches: Vec<(Vec<u8>, u64, Option<u64>)> = Vec::new();
         for (key, (exp_seq, exp_val)) in final_expected.iter() {
             let resp = ps
@@ -392,7 +392,7 @@ fn fence_flush_invariant() {
     // across memtable / imm / SSTs to localise the data-loss root cause.
     let trace_rt = compio::runtime::Runtime::new().unwrap();
     trace_rt.block_on(async {
-        let ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
         for (key, exp, got) in mismatches.iter().take(20) {
             let resp = ps
                 .call(

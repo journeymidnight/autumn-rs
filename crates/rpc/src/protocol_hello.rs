@@ -322,10 +322,14 @@ pub async fn initiate(
     .await
     .map_err(|_| RpcError::Timeout(TIMEOUT))?
 }
+/// `peer` only labels the WARN a version refusal logs, so an operator can find
+/// the stale binary from the refusing side; a malformed or missing Hello (port
+/// scanners, health probes) is not logged here.
 pub async fn accept(
     reader: &mut autumn_transport::ReadHalf,
     writer: &mut autumn_transport::WriteHalf,
     service: Service,
+    peer: &str,
 ) -> Result<Negotiated, RpcError> {
     compio::time::timeout(TIMEOUT, async {
         let parsed = match read_packet(reader, false, REQUEST_LEN).await {
@@ -361,6 +365,16 @@ pub async fn accept(
             ))
             .await;
         result?;
+        if matches!(verdict, Verdict::WireMismatch | Verdict::ClientMismatch) {
+            tracing::warn!(
+                peer,
+                ?service,
+                request = ?parsed,
+                server_wire = crate::WIRE_VERSION,
+                min_client = crate::MIN_CLIENT_WIRE_VERSION,
+                "PROTOCOL_HELLO refused a version mismatch"
+            );
+        }
         if verdict != Verdict::Ok {
             return Err(RpcError::status(
                 StatusCode::FailedPrecondition,
@@ -669,7 +683,7 @@ mod tests {
             let (mut rd, mut wr) = client.into_split();
             let server = compio::runtime::spawn(async move {
                 let (mut rd, mut wr) = server.into_split();
-                accept(&mut rd, &mut wr, Service::ExtentNode).await
+                accept(&mut rd, &mut wr, Service::ExtentNode, "test").await
             });
             let h = Hello {
                 role,
@@ -700,7 +714,7 @@ mod tests {
             let (mut rd, mut wr) = client.into_split();
             let task = compio::runtime::spawn(async move {
                 let (mut rd, mut wr) = server.into_split();
-                accept(&mut rd, &mut wr, Service::Manager).await
+                accept(&mut rd, &mut wr, Service::Manager, "test").await
             });
             let mut b = valid.to_vec();
             match kind {

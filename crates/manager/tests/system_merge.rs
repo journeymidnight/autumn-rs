@@ -138,14 +138,14 @@ fn merge_split_round_trip_keys_intact() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 80).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 1001, log, row, meta, b"a", b"z").await;
 
         let ps_addr = pick_addr();
         start_partition_server(80, mgr_addr, ps_addr);
-        let ps = RpcClient::connect(ps_addr).await.unwrap();
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Write 10 keys spread across [a..z): "key-00".."key-09" + "merge-00".."merge-09"
@@ -280,7 +280,7 @@ fn merge_refuses_non_adjacent_partitions() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 81).await;
         // Two non-adjacent partitions: [a..f) and [m..z) — gap in [f..m).
         let (l1, r1, m1) = create_three_streams(&mgr).await;
@@ -290,7 +290,7 @@ fn merge_refuses_non_adjacent_partitions() {
 
         let ps_addr = pick_addr();
         start_partition_server(81, mgr_addr, ps_addr);
-        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let router = PsRouter::new(mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(800)).await;
 
@@ -319,14 +319,14 @@ fn merge_refuses_self_merge() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 82).await;
         let (l, r, m) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 3001, l, r, m, b"a", b"z").await;
 
         let ps_addr = pick_addr();
         start_partition_server(82, mgr_addr, ps_addr);
-        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let router = PsRouter::new(mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(500)).await;
 
@@ -365,14 +365,14 @@ fn merge_preserves_value_pointer_resolution() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 90).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 4001, log, row, meta, b"a", b"z").await;
 
         let ps_addr = pick_addr();
         start_partition_server(90, mgr_addr, ps_addr);
-        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Write 6 large values (8 KiB each) → above the 4 KiB VP threshold,
@@ -493,14 +493,14 @@ fn merge_then_split_again_round_trip() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 91).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 5001, log, row, meta, b"a", b"z").await;
 
         let ps_addr = pick_addr();
         start_partition_server(91, mgr_addr, ps_addr);
-        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Pre-populate.
@@ -649,7 +649,7 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
         })
         .detach();
         compio::time::sleep(Duration::from_millis(200)).await;
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 95).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 6001, log, row, meta, b"a", b"z").await;
@@ -658,7 +658,7 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
         start_partition_server(95, mgr_addr, ps_addr);
         // Give the PS a moment to register + open partition.
         compio::time::sleep(Duration::from_millis(2000)).await;
-        let _ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         for i in 0..128usize {
@@ -835,7 +835,7 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
         .detach();
         compio::time::sleep(Duration::from_millis(200)).await;
 
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 97).await;
 
         // Set up two adjacent partitions on one PS.
@@ -932,7 +932,7 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
         .detach();
         compio::time::sleep(Duration::from_millis(200)).await;
 
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 98).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 9001, log, row, meta, b"a", b"z").await;
@@ -940,7 +940,7 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
         let ps_addr = pick_addr();
         start_partition_server(98, mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(2000)).await;
-        let _ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Populate enough keys for split to find a clean mid_key.
@@ -1007,7 +1007,7 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
         .detach();
         compio::time::sleep(Duration::from_millis(200)).await;
 
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 96).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 7001, log, row, meta, b"a", b"z").await;
@@ -1015,7 +1015,7 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
         let ps_addr = pick_addr();
         start_partition_server(96, mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(2000)).await;
-        let _ps = RpcClient::connect(ps_addr).await.expect("connect ps");
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Populate enough keys for unique_user_keys to find a clean mid.
@@ -1088,7 +1088,7 @@ fn split_merge_split_with_concurrent_writes() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 100).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 13001, log, row, meta, b"a", b"z").await;
@@ -1096,7 +1096,7 @@ fn split_merge_split_with_concurrent_writes() {
         let ps_addr = pick_addr();
         start_partition_server(100, mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(2000)).await;
-        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Pre-seed enough keys so split's unique_user_keys finds a clean mid_key.
@@ -1331,7 +1331,7 @@ fn orchestrated_merge_zero_loss_concurrent_writes() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 101).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 14001, log, row, meta, b"a", b"z").await;
@@ -1339,7 +1339,7 @@ fn orchestrated_merge_zero_loss_concurrent_writes() {
         let ps_addr = pick_addr();
         start_partition_server(101, mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(2000)).await;
-        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Pre-seed enough keys so split has a clean mid_key.
@@ -1351,7 +1351,7 @@ fn orchestrated_merge_zero_loss_concurrent_writes() {
         compio::time::sleep(Duration::from_millis(2500)).await;
 
         let cluster = std::rc::Rc::new(
-            ClusterClient::connect_raw(&mgr_addr.to_string())
+            ClusterClient::connect_admin(&mgr_addr.to_string())
                 .await
                 .expect("ClusterClient::connect"),
         );
@@ -1540,7 +1540,7 @@ fn split_merge_split_with_interleaved_writes() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 99).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 12001, log, row, meta, b"a", b"z").await;
@@ -1548,7 +1548,7 @@ fn split_merge_split_with_interleaved_writes() {
         let ps_addr = pick_addr();
         start_partition_server(99, mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(2000)).await;
-        let _ps = RpcClient::connect(ps_addr).await.unwrap();
+        let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // ── Phase 0: pre-seed ─────────────────────────────────────────
@@ -1653,7 +1653,7 @@ fn split_merge_split_with_interleaved_writes() {
         for i in 0u8..6 {
             let key = format!("post-split2-{:02}", i).into_bytes();
             // Resolve to current part_id.
-            let mgr_c = RpcClient::connect(mgr_addr).await.unwrap();
+            let mgr_c = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
             let pid = resolve_part_id_for_key(&mgr_c, &key)
                 .await
                 .expect("post-split2 key must route to a partition");
@@ -1662,7 +1662,7 @@ fn split_merge_split_with_interleaved_writes() {
         }
 
         // ── Verify ALL keys readable from current topology ────────────
-        let mgr_v = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr_v = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let mut missing: Vec<Vec<u8>> = Vec::new();
         for key in &all_keys {
             let pid = match resolve_part_id_for_key(&mgr_v, key).await {
@@ -1716,7 +1716,7 @@ fn merge_refuses_unseparated_cow_child(compact_survivor_first: bool) {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 83).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         const PART: u64 = 1201;
@@ -1724,7 +1724,7 @@ fn merge_refuses_unseparated_cow_child(compact_survivor_first: bool) {
 
         let ps_addr = pick_addr();
         start_partition_server(83, mgr_addr, ps_addr);
-        let ps = RpcClient::connect(ps_addr).await.unwrap();
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
         let router = PsRouter::new(mgr_addr, ps_addr);
 
         // Survivor range [a, m): D is rewritten, J deleted after the split.

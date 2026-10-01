@@ -102,7 +102,7 @@ fn spawn_stack_3rep() -> (SocketAddr, [SocketAddr; 3]) {
 
 /// Register 3 nodes + create a 3-replica stream. Returns `stream_id`.
 async fn setup_stream_3rep(mgr_addr: SocketAddr, n_addrs: [SocketAddr; 3]) -> u64 {
-    let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+    let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
     for (i, addr) in n_addrs.iter().enumerate() {
         let resp = mgr
             .call(
@@ -136,7 +136,7 @@ async fn setup_stream_3rep(mgr_addr: SocketAddr, n_addrs: [SocketAddr; 3]) -> u6
 
 /// Register the node + create a 1-replica stream.  Returns `stream_id`.
 async fn setup_stream(mgr_addr: SocketAddr, n_addr: SocketAddr) -> u64 {
-    let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+    let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
     let resp = mgr
         .call(
             MSG_REGISTER_NODE,

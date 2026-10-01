@@ -3211,6 +3211,19 @@ fn ps_state(p: &PsOverview) -> String {
     }
 }
 
+/// Live length of an open extent from its first replica, or `None` when the
+/// probe fails (the caller keeps the manager's value). An extent node is not a
+/// partition server: the SDK's PS connections declare the wrong service and the
+/// SDK's own EN connections are client-role, which may only read.
+async fn probe_extent_len(pool: &autumn_stream::ConnPool, addr: &str, extent_id: u64) -> Option<u64> {
+    let req = ExtProbeExtentReq { extent_id };
+    let resp = pool
+        .call_timeout(addr, EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
+        .await
+        .ok()?;
+    ExtProbeExtentResp::decode(resp).ok().map(|r| r.length)
+}
+
 /// Scoped per-partition view (`info --part P`, no `--detail`): one
 /// `MSG_GET_REGIONS` (cheap) to resolve the partition's 3 streams + ps + range,
 /// then a SCOPED `MSG_STREAM_INFO` (only those streams) so the extent list is
@@ -3228,6 +3241,7 @@ fn ps_state(p: &PsOverview) -> String {
 /// sides have collected. Making it cheap needs a manager-side reverse lookup
 /// (a wire change); until then this is the trade, stated rather than hoped.
 async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) -> Result<()> {
+    let en_pool = autumn_stream::ConnPool::with_role(autumn_rpc::protocol_hello::Role::Admin);
     let regions_bytes = client.mgr_call(MSG_GET_REGIONS, Bytes::new()).await.context("get regions")?;
     let regions_resp: GetRegionsResp = rkyv_decode(&regions_bytes).map_err(decode_err)?;
     if regions_resp.code != CODE_OK {
@@ -3334,20 +3348,8 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
                     let mut sz = e.sealed_length;
                     if !e.sealed {
                         if let Some(addr) = e.replicates.first().and_then(|nid| node_map.get(nid)) {
-                            if let Ok(enc) = client.get_ps_client(addr).await {
-                                let req = ExtProbeExtentReq { extent_id: *eid };
-                                if let Ok(rb) = enc
-                                    .call_timeout(
-                                        EXT_MSG_PROBE_EXTENT,
-                                        req.encode(),
-                                        DEFAULT_RPC_TIMEOUT,
-                                    )
-                                    .await
-                                {
-                                    if let Ok(pr) = ExtProbeExtentResp::decode(rb) {
-                                        sz = pr.length;
-                                    }
-                                }
+                            if let Some(len) = probe_extent_len(&en_pool, addr, *eid).await {
+                                sz = len;
                             }
                         }
                     }
@@ -3650,6 +3652,7 @@ async fn run_info(
         HashSet::new()
     };
 
+    let en_pool = autumn_stream::ConnPool::with_role(autumn_rpc::protocol_hello::Role::Admin);
     let mut open_extents: HashSet<u64> = HashSet::new();
     for (eid, ext) in extent_map.iter_mut() {
         // Authoritative seal STATE is the explicit `sealed` flag, NOT
@@ -3663,18 +3666,10 @@ async fn run_info(
             }
             if let Some(node_id) = ext.replicates.first() {
                 if let Some(addr) = node_map.get(node_id) {
-                    if let Ok(en_client) = client.get_ps_client(addr).await {
-                        // Tier 2: probe RPC has no PS-owner context;
-                        // must NOT use the fence-gated commit_length RPC.
-                        let req = ExtProbeExtentReq { extent_id: *eid };
-                        if let Ok(resp_bytes) = en_client
-                            .call_timeout(EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
-                            .await
-                        {
-                            if let Ok(resp) = ExtProbeExtentResp::decode(resp_bytes) {
-                                ext.sealed_length = resp.length;
-                            }
-                        }
+                    // Tier 2: probe RPC has no PS-owner context;
+                    // must NOT use the fence-gated commit_length RPC.
+                    if let Some(len) = probe_extent_len(&en_pool, addr, *eid).await {
+                        ext.sealed_length = len;
                     }
                 }
             }

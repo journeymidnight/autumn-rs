@@ -86,7 +86,7 @@ fn benchmark_append_stream_throughput() {
     std::thread::sleep(Duration::from_millis(200));
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
 
         let resp = mgr
             .call(

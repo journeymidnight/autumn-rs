@@ -3062,6 +3062,20 @@ removed. A mismatch reports the local/remote versions, connection role and
 reason, rather than appearing as an unexplained business decode failure.
 A decode error after successful Hello remains a separate protocol error;
 matching version numbers cannot compensate for a forgotten wire bump.
+The refusing server logs a WARN `PROTOCOL_HELLO refused a version mismatch`
+with the peer address, its declared role and versions; grep for it to find the
+stale binary.
+
+`autumn-op` connects as an ADMIN peer, so it needs the exact `WIRE_VERSION` of
+the manager it talks to: during a wire-changing rollout use the old release's
+`autumn-op` until the manager is replaced and the new one afterwards (step 5
+below runs with the new one).
+
+Every client built before `PROTOCOL_HELLO` is refused whatever its wire number,
+so the first Hello deployment also rebuilds every embedded client: fuse
+daemons, the S3 gateway, Python wheels in inference pods, benchmark tools. An
+old one reports a closed connection, not a version message, because it never
+sees the Hello reply.
 
 The implementation removes the manager's persisted `cluster_version` latch,
 its startup/replay checks, query/bump RPCs, and `autumn-op cluster-version` /
@@ -3160,11 +3174,12 @@ cargo test -p autumn-rpc --test client_surface_freeze
 cargo test -p autumn-rpc --test negotiation_freeze
 ```
 
-These cover existing client compatibility. Unified Hello additionally needs
-real two-build rolling-upgrade verification: version rejection before decode,
-reconnection, mismatch waiting, leader failover, request failures and recovered
-acknowledged data. The old tests accepting silent connections must be updated
-for mandatory Hello.
+The script needs a hello-capable client build below the current ceiling. Until
+one exists (every hello-capable build is at the ceiling) it prints "nothing to
+prove" and exits 0. Unified Hello additionally needs real two-build
+rolling-upgrade verification: version rejection before decode, reconnection,
+mismatch waiting, leader failover, request failures and recovered acknowledged
+data.
 
 #### Converting the manager's persisted records — DONE, converter deleted
 

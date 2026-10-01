@@ -1,7 +1,7 @@
 #!/bin/bash
-# Prove the client wire window: a client built at the window's FLOOR still
-# works against a cluster at its CEILING, and stops working the moment the
-# floor is raised past it.
+# Prove the client wire window: a client built below the ceiling (as low in the
+# window as a hello-capable build exists) still works against a cluster at its
+# CEILING, and stops working the moment the floor is raised past it.
 #
 # This is the acceptance for F-CLIENT-WIRE-COMPAT, and it is a script rather
 # than a note because a one-shot manual run proves nothing the next time
@@ -11,10 +11,14 @@
 #
 #   scripts/client_window_verify.sh [OLD_COMMIT]
 #
-# OLD_COMMIT defaults to the newest commit whose WIRE_VERSION equals this
-# tree's MIN_CLIENT_WIRE_VERSION and already supports PROTOCOL_HELLO — a real binary from the floor of the
-# window, not a forged version number. That distinction is the point: the
-# ledger row asks for a client "不是伪造区间".
+# OLD_COMMIT defaults to the commit with the LOWEST wire version in
+# [MIN_CLIENT_WIRE_VERSION, WIRE_VERSION) that already speaks PROTOCOL_HELLO —
+# a real binary from as low in the window as one exists, not a forged version
+# number. That distinction is the point: the ledger row asks for a client
+# "不是伪造区间". A client built before PROTOCOL_HELLO is refused whatever its
+# number, so it cannot stand for the window. When no such commit exists yet
+# (every hello-capable build is at the ceiling), there is nothing to prove and
+# the script says so and exits 0.
 #
 # Leaves nothing behind: the worktree, the venv, the cluster and its data are
 # all removed on exit, including on failure.
@@ -74,31 +78,38 @@ if [ "$FLOOR" = "$CEILING" ]; then
     exit 0
 fi
 
-# ── find a real commit at the floor ─────────────────────────────────────────
+# ── find a real hello-capable commit below the ceiling ──────────────────────
+in_window() { [ -n "$1" ] && [ "$1" -ge "$FLOOR" ] && [ "$1" -lt "$CEILING" ]; }
 OLD=${1:-}
 if [ -z "$OLD" ]; then
-    say "looking for the newest commit whose WIRE_VERSION is $FLOOR"
+    say "looking for the lowest hello-capable wire in [$FLOOR, $CEILING)"
+    best=
     for c in $(git -C "$REPO" log --format=%h -n 400 -- crates/rpc/src/lib.rs); do
-        v=$(git -C "$REPO" show "$c:crates/rpc/src/lib.rs" 2>/dev/null \
-            | grep -oP 'pub const WIRE_VERSION(_MAX)?: u32 = \K[0-9]+' | head -1)
-        if [ "$v" = "$FLOOR" ]; then OLD=$c; break; fi
+        git -C "$REPO" cat-file -e "$c:crates/rpc/src/protocol_hello.rs" 2>/dev/null || break
+        v=$(git -C "$REPO" show "$c:crates/rpc/src/lib.rs" \
+            | grep -oP 'pub const WIRE_VERSION: u32 = \K[0-9]+' | head -1)
+        if in_window "$v" && { [ -z "$best" ] || [ "$v" -le "$best" ]; }; then
+            OLD=$c; best=$v
+        fi
     done
+    if [ -z "$OLD" ]; then
+        echo "  every hello-capable build is at wire $CEILING: no client below the"
+        echo "  ceiling exists yet. Not a failure of this script; nothing to prove."
+        exit 0
+    fi
 fi
-[ -n "$OLD" ] || { echo "no commit found at wire $FLOOR — pass one explicitly"; exit 1; }
 echo "  using $OLD ($(git -C "$REPO" log -1 --format=%s "$OLD"))"
 
 mkdir -p "$WORK"
 git -C "$REPO" worktree add -q "$WORK/old" "$OLD" || exit 1
-# Bootstrap migration requires rebuilding all callers. A historical pre-Hello
-# client is intentionally refused even if its numeric version is in the window.
-if ! rg -q 'pub const MSG_PROTOCOL_HELLO' "$WORK/old/crates/rpc/src/protocol_hello.rs" 2>/dev/null; then
-    echo "selected client predates mandatory PROTOCOL_HELLO; choose a post-migration floor build"
-    exit 1
-fi
+# A client built before mandatory PROTOCOL_HELLO is refused whatever its
+# number, so it cannot stand for the window.
+[ -f "$WORK/old/crates/rpc/src/protocol_hello.rs" ] \
+    || { echo "$OLD predates PROTOCOL_HELLO; pass a hello-capable commit"; exit 1; }
 OLDVER=$(constant WIRE_VERSION "$WORK/old")
-[ "$OLDVER" = "$FLOOR" ] || { echo "worktree is at wire $OLDVER, expected $FLOOR"; exit 1; }
+in_window "$OLDVER" || { echo "$OLD is at wire $OLDVER, outside [$FLOOR, $CEILING)"; exit 1; }
 
-say "building the CEILING cluster ($CEILING) and the FLOOR client ($FLOOR)"
+say "building the CEILING cluster ($CEILING) and the old client ($OLDVER)"
 ( cd "$REPO" && cargo build -q --bins ) || exit 1
 ( cd "$WORK/old" && cargo build -q --bin autumn-client ) || exit 1
 OLDC="$WORK/old/target/debug/autumn-client --manager $M --namespace $NS"
@@ -122,8 +133,8 @@ PIDS+=($!); sleep 5
 "$B/autumn-op" --manager "$M" namespace-create --name "$NS" >/dev/null 2>&1
 echo "  compiled server wire=$CEILING, client window=[$FLOOR,$CEILING]; client connections verify it via PROTOCOL_HELLO"
 
-# ── the data plane, from the floor-built client ─────────────────────────────
-say "wire-$FLOOR client against the wire-$CEILING cluster"
+# ── the data plane, from the old client ─────────────────────────────
+say "wire-$OLDVER client against the wire-$CEILING cluster"
 head -c 2048 /dev/urandom >"$WORK/small"
 head -c 9000000 /dev/urandom >"$WORK/big"
 
@@ -162,15 +173,18 @@ $OLDC del wk/small >/dev/null 2>&1 && $OLDC del wk/big >/dev/null 2>&1 \
 # ── the control: close the window, same binary must be refused ──────────────
 say "control: raise the floor to $CEILING and re-run the same binary"
 cp "$GUARD" "$GUARD_BAK"
-ruby - "$GUARD" "$CEILING" <<'RB'
-p, ceiling = ARGV
-s = File.read(p)
-s.sub!(/pub const MIN_CLIENT_WIRE_VERSION: u32 = \d+;/,
-       "pub const MIN_CLIENT_WIRE_VERSION: u32 = #{ceiling};")
-s.gsub!(/^const _: \(\) = assert!\(MIN_CLIENT_WIRE_VERSION.*$/,
-        '// bypassed by client_window_verify.sh')
-File.write(p, s)
-RB
+python3 - "$GUARD" "$CEILING" <<'PY'
+import sys, re
+p, ceiling = sys.argv[1], sys.argv[2]
+s = open(p).read()
+s = re.sub(r'pub const MIN_CLIENT_WIRE_VERSION: u32 = \d+;',
+           f'pub const MIN_CLIENT_WIRE_VERSION: u32 = {ceiling};', s, count=1)
+# The const guards deliberately forbid this; the control is the one place it
+# is legitimate, so they are bypassed for the rebuild and restored after.
+s = re.sub(r'^const _: \(\) = assert!\(MIN_CLIENT_WIRE_VERSION.*$',
+           '// bypassed by client_window_verify.sh', s, flags=re.M)
+open(p, 'w').write(s)
+PY
 ( cd "$REPO" && cargo build -q --bin autumn-manager-server ) || RC=1
 kill "${PIDS[0]}" 2>/dev/null; sleep 2
 "$B/autumn-manager-server" --listen 127.0.0.1 --port "$MGR_PORT" >"$WORK/mgr2.log" 2>&1 &

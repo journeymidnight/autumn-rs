@@ -173,7 +173,7 @@ fn ec_flip_persists_seal_on_every_shard_holder() {
     ];
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
 
         let node_ids = [
             register_node(&mgr, &n1_addr.to_string(), "disk-pm-1").await,
@@ -368,7 +368,7 @@ fn ec_flip_persists_seal_on_every_shard_holder() {
 
         {
             let holder = &victim;
-            let node = RpcClient::connect(restart_addr)
+            let node = RpcClient::connect_as(restart_addr, autumn_rpc::protocol_hello::Role::Admin, None)
                 .await
                 .expect("connect restarted holder");
 

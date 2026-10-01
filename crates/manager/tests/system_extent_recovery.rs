@@ -35,7 +35,7 @@ fn extent_recovery_replaces_dead_node() {
     start_extent_node(n3_addr, n3_dir.path().to_path_buf(), 3);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
 
         // Register all 3 nodes. Node order determines which get selected for the stream.
         register_node(&mgr, &n1_addr.to_string(), "uuid-1").await;
@@ -209,7 +209,7 @@ fn lost_recovery_completion_redispatch_adopts_local_copy() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
         register_node(&mgr, &n1_addr.to_string(), "uuid-1").await;
         register_node(&mgr, &n2_addr.to_string(), "uuid-2").await;
 
@@ -260,7 +260,7 @@ fn lost_recovery_completion_redispatch_adopts_local_copy() {
 
         // Dispatch recovery DIRECTLY to n3 (bypassing the manager's
         // dispatch loop — n3 consults the manager only for extent_info).
-        let en3 = RpcClient::connect(n3_addr).await.expect("connect n3");
+        let en3 = RpcClient::connect_as(n3_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect n3");
         let task = ext::RecoveryTask {
             extent_id,
             replace_id,
@@ -353,7 +353,7 @@ fn recovery_dispatch_skips_healthy_sealed_extents() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
         register_node(&mgr, &n1_addr.to_string(), "uuid-1").await;
         register_node(&mgr, &n2_addr.to_string(), "uuid-2").await;
 
@@ -460,7 +460,7 @@ fn incomplete_local_copy_is_discarded_and_rebuilt_not_refused_forever() {
     // test drains its `recovery_done`.
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
         register_node(&mgr, &n1_addr.to_string(), "uuid-1").await;
         register_node(&mgr, &n2_addr.to_string(), "uuid-2").await;
 
@@ -512,7 +512,7 @@ fn incomplete_local_copy_is_discarded_and_rebuilt_not_refused_forever() {
             "extent must be sealed with data"
         );
 
-        let en3 = RpcClient::connect(n3_addr).await.expect("connect n3");
+        let en3 = RpcClient::connect_as(n3_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect n3");
 
         // Plant the residue: n3 now HOLDS this extent id, but empty + unsealed —
         // exactly what a recovery killed mid-copy leaves behind.
@@ -619,7 +619,7 @@ fn redispatch_while_running_is_an_idempotent_accept() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
         register_node(&mgr, &n1_addr.to_string(), "uuid-1").await;
         register_node(&mgr, &n2_addr.to_string(), "uuid-2").await;
 
@@ -665,7 +665,7 @@ fn redispatch_while_running_is_an_idempotent_accept() {
             mgr_addr,
         );
 
-        let en3 = RpcClient::connect(n3_addr).await.expect("connect n3");
+        let en3 = RpcClient::connect_as(n3_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect n3");
         let task = ext::RecoveryTask {
             extent_id,
             replace_id,

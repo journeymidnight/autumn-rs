@@ -119,12 +119,12 @@ payloads.
   because a peer knowing a location this build does not cannot reach these
   decoders — but NOT for the reason the deleted comment gave. Exact
   `WIRE_VERSION` equality covers manager/PS/EN only. An embedded CLIENT sends
-  this byte too, on the default-on direct read to an extent node, and **the EN
-  has no hello and no admission gate at all**: what holds there is that a client
-  above the cluster's ceiling never obtains the redirect descriptor a direct
-  read needs, because the manager and the PS refuse it first. Whoever adds a
-  third location must re-check THAT chain — a wire-45 client is in-window
-  against a wire-43 cluster. Folding an unreadable byte to `InDat` is not the absence
+  this byte too, on the default-on direct read to an extent node. What holds
+  there is PROTOCOL_HELLO at the EN itself: a client above the cluster's
+  ceiling is refused before its first `ReadBytesReq`, as at the manager and the
+  PS, and an admitted client may send only `READ_BYTES` / `READ_BYTES_BULK`.
+  So a third location must come with a `WIRE_VERSION` bump: every client that
+  can send it is then at or above that version, which an older EN refuses. Folding an unreadable byte to `InDat` is not the absence
   of an answer — `InDat` is a positive claim that `extent-{id}.dat` holds the
   payload, so the fold hands shard bytes to a caller asking for a value on
   exactly the extents whose payload has moved. `ReadBytesReq` therefore carries
@@ -287,8 +287,9 @@ SDK's `ps_conns` / `mgr_conn`.
 - **Servers answer in the decode loop**, never through a dispatch that can queue:
   EN `process_frames_backpressured` (straight into `tx_bufs`), PS
   `push_one_frame_to_inflight` (before the authz gate — the ping names no
-  partition and carries no data, and an un-helloed connection must still prove
-  the peer alive), manager `handle_connection`.
+  partition and carries no data), manager `handle_connection`. Every one of
+  them runs after PROTOCOL_HELLO; no connection reaches its decode loop
+  without it.
 - **No wire-version bump.** Any reply proves the peer alive, including the
   `unknown msg_type` error an older server sends; the client never inspects it.
 - **Cost.** Loaded connections: one `Cell` increment per socket read, no ping.
@@ -672,10 +673,24 @@ header and control. See `docs/cluster_version_design.md` for the byte layout.
 Every `RpcClient` constructor handshakes before starting business tasks; all
 manager/PS/EN listeners accept before creating a business decoder. Peer/admin
 require equal WIRE_VERSION; client requires its declared version inside the
-server interval. Connect plus Hello has a 5-second bound, with shorter caller
-budgets taking precedence. Malformed, missing, legacy or mismatched Hello
-closes the connection without decoding a business DTO. Reconnect handshakes
-again; a failed handshake never enters a pool.
+server interval. Connect plus Hello has a 5-second bound
+(`protocol_hello::TIMEOUT`); the stream `ConnPool` bounds it separately from a
+call's own deadline so a connect failure stays classifiable (stream CLAUDE.md,
+"Bounded connect"). Malformed, missing, legacy or mismatched Hello closes the
+connection without decoding a business DTO. Reconnect handshakes again; a
+failed handshake never enters a pool.
+
+`RpcClient::connect_as` boxes its connect + Hello future. Inline, that state
+machine grew every caller's future: autumn-fuse's `prefetch_ahead` overflowed
+rustc's layout depth limit, and a flush on the PS's 2 MiB partition thread
+overflowed its stack in a debug build (boxed it runs in 1 MiB). One heap
+allocation per new connection.
+
+A version refusal (`WireMismatch` / `ClientMismatch`) is logged at WARN by the
+refusing server with the peer address, the declared role and versions
+(`PROTOCOL_HELLO refused a version mismatch`), so a rollout's stale binary can
+be found from either side. A malformed or missing Hello is not logged there:
+port scanners and TCP health probes look exactly like that.
 
 `Negotiated::check_opcode` checks the explicit service/role surface before
 business decode or batch grouping. Role is a declaration, not a credential:
@@ -706,9 +721,9 @@ would have led you to:
   (`crates/client/src/lib.rs`), so its layout is a client contract all the same.
 - the extent-node direct read. `--direct-read` is on by default, so a client takes the
   descriptor from `GetRedirectResp` and reads value bytes straight from an EN:
-  `ReadBytesReq` (hand-coded 40 bytes) and the bulk response head. The EN has no hello
-  and no version concept — §8 closes that edge from the PS side — which is a statement
-  about ADMISSION and says nothing about whose bytes those are.
+  `ReadBytesReq` (hand-coded 40 bytes) and the bulk response head. The EN admits a
+  client by PROTOCOL_HELLO on the same window as the manager and PS — a statement
+  about ADMISSION that says nothing about whose bytes those are.
 
 - the error envelope. `[status_code: u8][utf8 message]` (`RpcError::encode_status`), on
   every `FLAG_ERROR` frame from any of the three roles, decoded by every embedded client

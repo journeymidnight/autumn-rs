@@ -134,7 +134,7 @@ fn update_stream_ec_sets_ec_fields() {
     start_extent_node(n3_addr, d3.path().to_path_buf(), 3, &mgr_str);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
         register_node(&mgr, &n1_addr.to_string(), "disk-1").await;
         register_node(&mgr, &n2_addr.to_string(), "disk-2").await;
         register_node(&mgr, &n3_addr.to_string(), "disk-3").await;
@@ -170,7 +170,7 @@ fn update_stream_ec_rejects_ec_data_below_two() {
     start_extent_node(n1_addr, d1.path().to_path_buf(), 1, &mgr_addr.to_string());
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect");
         register_node(&mgr, &n1_addr.to_string(), "disk-1").await;
         let (stream_id, _) = create_stream_repl(&mgr, 1).await;
 
@@ -191,7 +191,7 @@ fn update_stream_ec_rejects_unknown_stream() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect");
         let resp = call_update_stream_ec(&mgr, 999999, 2, 1).await;
         assert_ne!(resp.code, CODE_OK, "unknown stream should fail");
     });
@@ -219,7 +219,7 @@ fn update_stream_ec_triggers_conversion() {
         use autumn_stream::{ConnPool, StreamClient};
         use std::rc::Rc;
 
-        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
         register_node(&mgr, &n1_addr.to_string(), "disk-1").await;
         register_node(&mgr, &n2_addr.to_string(), "disk-2").await;
         register_node(&mgr, &n3_addr.to_string(), "disk-3").await;

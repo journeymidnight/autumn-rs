@@ -49,6 +49,8 @@
 //!     cargo test -p autumn-manager --test system_chaos -- --ignored --nocapture
 
 mod support;
+#[path = "../../rpc/tests/support/protocol.rs"]
+mod protocol;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -3675,6 +3677,7 @@ async fn liveness_rejects_readable_partition_when_every_put_fails() {
             let (mut socket, _) = listener.accept().await.unwrap();
             let attempts = attempts.clone();
             compio::runtime::spawn(async move {
+                protocol::accept_tcp(&mut socket, autumn_rpc::WIRE_VERSION, 2, 0, "").await;
                 let mut decoder = FrameDecoder::new();
                 loop {
                     let (result, bytes) = socket.read(vec![0; 16384]).await.into_parts();
@@ -3716,7 +3719,7 @@ async fn liveness_rejects_readable_partition_when_every_put_fails() {
             }).detach();
         }
     });
-    let reader = RpcClient::connect(address).await.unwrap();
+    let reader = RpcClient::connect_as(address, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
     let value = ps_get(&reader, 901, b"mem/b000000").await;
     assert_eq!(value.code, partition_rpc::CODE_OK);
     assert_eq!(value.value, b"readable");
@@ -4130,7 +4133,7 @@ async fn physical_reclaim_rejects_failed_delete_without_extent_metadata() {
     let address = pick_addr();
     let server = compio::runtime::spawn(async move { node.serve(address).await.unwrap(); });
     compio::time::sleep(Duration::from_millis(100)).await;
-    let client = RpcClient::connect(address).await.unwrap();
+    let client = RpcClient::connect_as(address, autumn_rpc::protocol_hello::Role::Admin, None).await.unwrap();
     let allocated: extent::AllocExtentResp = extent::rkyv_decode(&client.call(
         extent::MSG_ALLOC_EXTENT, extent::rkyv_encode(&extent::AllocExtentReq { extent_id: 42 }),
     ).await.unwrap()).unwrap();
@@ -4765,7 +4768,7 @@ fn checkpoint_check_reports_an_sst_outside_the_row_stream() {
     let dir = tempfile::tempdir().expect("tempdir");
     start_extent_node(en, dir.path().to_path_buf(), 1);
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("mgr");
         let _ = register_node(&mgr, &en.to_string(), "uuid-ckpt-check").await;
         let row = create_stream(&mgr, 1).await;
         let meta = create_stream(&mgr, 1).await;
@@ -4874,7 +4877,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         // bootstrap fence rejects writes from a non-leader, and the
         // election loop runs every 2 s. Without this, `autumn-op format`'s
         // `register_node` can race in before `try_become_leader` lands.
-        let mgr_probe = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr_probe = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
         let leader_ok = poll_until_async(
             Duration::from_secs(15),
             Duration::from_millis(300),
@@ -4932,7 +4935,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         // → select_nodes would only see the cold-leader fallback set.
         compio::time::sleep(Duration::from_secs(4)).await;
 
-        let mgr: Rc<RpcClient> = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let mgr: Rc<RpcClient> = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
 
         // -------- Create EC-policy streams + partition --------
         let log = create_stream_kp(&mgr, cfg.ec_k, cfg.ec_m).await;

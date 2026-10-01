@@ -1684,9 +1684,25 @@ swallows panics). Two helpers in `extent_node.rs`:
   `owner_loop` (the durability-critical single writer; a panic mid-burst must not
   silently strand queued appends → fail-stop, EN restarts and recovers from disk).
 
-**Bounded connect**: `ConnPool::get_client` wraps `RpcClient::connect` in a fixed
-`CONNECT_TIMEOUT` (5 s) so a blackholed peer (SYN dropped) can't hang a caller
-(`call_timeout` only bounds the call AFTER connect).
+**Bounded connect**: `ConnPool::get_client` relies on the 5 s bound
+`RpcClient::connect_as` applies to TCP/UCX connect + PROTOCOL_HELLO
+(`protocol_hello::TIMEOUT`), so a blackholed peer (SYN dropped) can't hang a
+caller. There is exactly ONE timer: a second, equal-length one here raced it,
+and the error's shape — which the classifiers read — depended on which won.
+The error is `RpcError::Timeout` (or the transport error) under a `connect
+<addr>` context; `{:#}` reads `connect <addr>: RPC timed out after 5s`, plain
+`to_string()` only `connect <addr>`, so both classifiers (`is_connect_failure`,
+`is_liveness_timeout`) format with `{:#}`.
+
+The connect stays OUTSIDE the caller's own deadline in `call_timeout` /
+`call_into_pooled`, which bound only the call after it: a read's deadline is
+~3 s for small values, shorter than the connect bound, and a connect failure
+has to surface as one or `is_connect_failure` never classifies a stale node
+address and every later small read to it waits out its deadline for the life
+of the process. `a_connect_that_never_completes_is_classified_through_the_real_pool`
+drives the real pool against a peer that never answers the hello and asserts
+both classifiers; putting the connect inside the call deadline, or reading
+`to_string()` in `is_liveness_timeout`, makes it red.
 
 **Invariant:** never reintroduce a bare `spawn(..).detach()` for an EN
 background loop — use `en_spawn_supervised` (re-derive-safe) or

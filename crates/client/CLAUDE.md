@@ -44,10 +44,13 @@ Constructors:
   namespace (Layer-A checks it). Built-in key builders (`fuse/key.rs`,
   `kvc/_keys.py`) emit keys RELATIVE to `{scope}/` (the binding owns the prefix) so
   there is no double-prefix.
-- **`connect_raw(mgr)`** — admin/unscoped (`Raw` binding, no client prefixing) for
-  admin/mgr-only tooling (autumn-op, node registration), cross-namespace
-  inspection/migration, and tests. NOT for data writers. The PS still enforces
-  Layer-A/B — `raw` only bypasses the CLIENT prefixing.
+- **`connect_raw(mgr)`** — unscoped (`Raw` binding, no client prefixing) for
+  cross-namespace inspection/migration, and tests. NOT for data writers. The PS
+  still enforces Layer-A/B — `raw` only bypasses the CLIENT prefixing. It
+  declares the CLIENT role, so split / compact / gc / flush / merge,
+  namespace / principal admin and the op ledger are refused PermissionDenied;
+  operator tooling uses **`connect_admin`** (ADMIN role, exact wire), and the
+  extent node's startup calls use `connect_peer`.
 - **`connect_with_credential(mgr, scope, principal, credential)`** — scoped + authz.
   `principal` = credential owner (from `read_credential_file` → `(principal, secret)`);
   `credential` = raw secret. When authz is on, `validate_credential_scope` verifies at

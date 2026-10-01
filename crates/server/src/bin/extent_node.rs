@@ -324,8 +324,10 @@ fn apply_extent_tunables(
 /// fetches its cluster_id, and verifies it matches the value stamped
 /// in our data dirs. Catches the "EN pointed at the wrong manager"
 /// misconfiguration that the on-disk consistency check alone cannot
-/// see. No retry — if the manager isn't reachable at startup we want
-/// to bubble up the error fast.
+/// see. A manager that is unreachable or refuses our wire version
+/// (`transient_manager_error`) is waited for, with a WARN per attempt —
+/// during a wire rollout the manager may be replaced after this node. A
+/// cluster_id mismatch is terminal.
 async fn verify_manager_cluster_id(manager: &str, stamped: &str) -> Result<()> {
     let mut delay = 1u64;
     loop {
@@ -521,11 +523,12 @@ fn build_register_req(
 /// the shard ports this process actually binds) with the manager at startup.
 /// The manager keys the node by `node_uuid` (M0) and updates the location IN
 /// PLACE — so a changed shard-port layout (a reshard) or a fresh pod IP is
-/// picked up on the next boot without re-running `format`. Retries through a
-/// manager mid-election (30 × 1 s, like PS `register_ps`); fail-stops on a hard
-/// refusal (fenced / decommissioned / cluster mismatch) or on exhaustion — an
-/// EN the manager can't route to must not serve (same rationale as the
-/// multi-shard bind fail-stop).
+/// picked up on the next boot without re-running `format`. An unreachable or
+/// wire-mismatched manager (`transient_manager_error`) is waited for without
+/// limit, 5 s apart; a manager mid-election (NOT_LEADER) is retried 30 × 1 s;
+/// a hard refusal (fenced / decommissioned / cluster mismatch) or exhausted
+/// NOT_LEADER retries fail-stop — an EN the manager can't route to must not
+/// serve (same rationale as the multi-shard bind fail-stop).
 async fn register_with_manager(manager: &str, req: &RegisterNodeReq) -> Result<()> {
     let mut last_err = String::new();
     let mut attempt = 0u32;

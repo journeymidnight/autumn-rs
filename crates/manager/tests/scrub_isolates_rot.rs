@@ -125,7 +125,7 @@ fn a_rotted_replica_is_found_by_its_own_node_and_isolated_by_the_manager() {
     }
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.expect("mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("mgr");
         let mut node_ids = Vec::new();
         for i in 0..3 {
             node_ids.push(register_node(&mgr, &addrs[i].to_string(), &format!("d{i}")).await);
