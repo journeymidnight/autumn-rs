@@ -915,6 +915,15 @@ pub(crate) struct Memtable {
     /// not `mem_bytes()`. Updated once per group-commit batch via `add_log_bytes`
     /// (Σ record_sizes = bytes appended to log_stream).
     log_bytes: AtomicU64,
+    /// Per log extent, the bytes of this memtable's WAL records that are dead
+    /// once it is flushed: every record byte except a ValuePointer's value,
+    /// which only lives in the log. An inline value (<= `VALUE_THROTTLE`) is
+    /// copied into the SST, so its WAL record is needed only until then.
+    /// `build_sst_bytes` stores this as the SST's discard map. Compaction
+    /// cannot count these bytes later: an inline entry does not record where
+    /// its WAL record is. Without it, a log extent of small values never
+    /// showed a dead byte and GC never took it.
+    wal_dead: parking_lot::Mutex<HashMap<u64, i64>>,
 }
 
 impl Memtable {
@@ -923,6 +932,7 @@ impl Memtable {
             data: parking_lot::RwLock::new(BTreeMap::new()),
             bytes: AtomicU64::new(0),
             log_bytes: AtomicU64::new(0),
+            wal_dead: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -984,6 +994,14 @@ impl Memtable {
     }
     fn log_bytes(&self) -> u64 {
         self.log_bytes.load(Ordering::Relaxed)
+    }
+    /// Record `n` bytes of `extent_id` that this memtable's flush makes dead
+    /// (see `wal_dead`). The write and GC paths call it once per appended
+    /// batch; recovery replay once per kept record.
+    fn add_wal_dead(&self, extent_id: u64, n: u64) {
+        if n > 0 {
+            *self.wal_dead.lock().entry(extent_id).or_insert(0) += n as i64;
+        }
     }
 
     fn seek_user_key(&self, user_key: &[u8]) -> Option<MemEntry> {
@@ -9684,7 +9702,15 @@ async fn recover_partition(
                         + crate::wal_record::PAYLOAD_HEADER as u64
                         + key.len() as u64
                         + value.len() as u64;
-                    let mem_entry = if record_carries_value_pointer(op, value.len()) {
+                    // A ValuePointer's value stays live in the log; the rest of
+                    // the record dies with this memtable's flush (`wal_dead`).
+                    let carries_vp = record_carries_value_pointer(op, value.len());
+                    let log_rec_dead = if carries_vp {
+                        log_rec_bytes - value.len() as u64
+                    } else {
+                        log_rec_bytes
+                    };
+                    let mem_entry = if carries_vp {
                         // VP detection: new WAL has VP flag in op; old WAL uses
                         // value size as fallback. The reconstructed VP.offset MUST
                         // equal the value's true on-disk offset for BOTH envelope
@@ -9721,6 +9747,7 @@ async fn recover_partition(
                 // gap is accurate (otherwise it seeds at 0 and the first replay
                 // window after a restart can grow unbounded before rotating).
                 active.add_log_bytes(log_rec_bytes);
+                active.add_wal_dead(eid, log_rec_dead);
             }
             carry = buf[consumed..].to_vec();
             // Advance by the full window `buf` covers (= the committed bytes for
@@ -10201,11 +10228,14 @@ pub(crate) fn build_sst_bytes(imm: &Memtable, vp_extent_id: u64, vp_offset: u64)
         }
         builder.add(ikey, me.op, &me.value, me.expires_at);
     });
-    if builder.is_empty() {
-        (SstBuilder::new(vp_extent_id, vp_offset).finish(), last_seq)
+    let wal_dead = imm.wal_dead.lock().clone();
+    let mut builder = if builder.is_empty() {
+        SstBuilder::new(vp_extent_id, vp_offset)
     } else {
-        (builder.finish(), last_seq)
-    }
+        builder
+    };
+    builder.set_discards(wal_dead);
+    (builder.finish(), last_seq)
 }
 
 // ---------------------------------------------------------------------------

@@ -1390,6 +1390,32 @@ can occasionally be stale-cached-as-open on the PS and skipped until its cache
 refreshes (a read / restart) — a `forcegc` that logs "not authoritatively sealed
 yet" is that case; re-issue after a moment.
 
+### GC reclaims log extents of small values (inline-value WAL)
+
+A value of at most 4 KiB is stored inline in the SST; its WAL record in the
+log_stream is dead once the memtable is flushed. The flush records those bytes
+in the SST's discard map, so a sealed log extent full of small values reaches
+the GC ratio by itself — no delete or compaction needed. Check on a partition:
+
+```bash
+$AO --json info --part P --full | jq '.discards'   # [{extent_id, bytes}, …]
+$AO --json info --part P | jq '.extents[] | select(.role=="log") | {extent_id, size, open}'
+```
+
+A sealed log extent whose `discards` entry is close to its `size` is taken by
+the next auto GC (or `autumn-op gc P`). Extents written by a PS older than this
+change carry no such record (discard 0 however dead): reclaim them with
+`autumn-op forcegc P <e1> <e2> <e3>` (3 per op, only extents before the replay
+floor). Before forcegc, confirm the partition really holds no live large values
+there — `info --part P --detail` `size_bytes` small AND the range holds no
+ValuePointer data. A range covering `fs/\x03…` (file data chunks) is mostly live,
+and forcegc there only rewrites it (seen on the VKE cluster: three 17 GB extents,
+~2000 live 8 MiB chunks relocated each, nothing freed).
+
+Regression: `RUST_MIN_STACK=16777216 cargo test --release -p autumn-manager --test
+system_gc_inline_wal` (needs `cargo build -p autumn-server --bins` for the killed
+child PS; the debug part-* thread overflows its default 2 MiB stack).
+
 ## Read route-around for Suspected nodes
 
 When the manager marks an EN **Suspected** (df heartbeats lapsed past the soft

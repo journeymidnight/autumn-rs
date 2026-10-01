@@ -32,6 +32,15 @@ const PART_ONE_TABLE: u64 = 932;
 const VALUE_LEN: usize = 64 * 1024;
 const KEYS: u32 = 8;
 
+/// Whether `discarded` holds exactly `values` deleted values. A flush also
+/// counts its WAL records as dead (headers, keys, tombstones — never a
+/// ValuePointer's value), a few hundred bytes here, so the total is the values
+/// plus less than one more value's worth.
+fn holds_values(discarded: i64, values: u32) -> bool {
+    let v = VALUE_LEN as i64;
+    discarded >= values as i64 * v && discarded < (values as i64 + 1) * v
+}
+
 async fn discarded_bytes(ps: &RpcClient, part_id: u64) -> i64 {
     let resp = ps
         .call(
@@ -105,23 +114,24 @@ fn a_major_compaction_settles_deletes_still_in_the_memtable() {
         for i in 0..KEYS {
             ps_delete(&ps, PART, format!("big-{i:02}").as_bytes()).await;
         }
-        assert_eq!(discarded_bytes(&ps, PART).await, 0, "nothing compacted yet");
+        let before = discarded_bytes(&ps, PART).await;
+        assert!(holds_values(before, 0), "nothing compacted yet: {before}");
         wait_reported(&mgr, KEYS as u64).await;
 
         // One SST, tombstones only in the memtable: without the flush this
         // compaction has nothing to merge and records no discard at all.
         ps_compact(&ps, PART).await;
-        let want = KEYS as i64 * VALUE_LEN as i64;
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut got = discarded_bytes(&ps, PART).await;
-        while got != want && std::time::Instant::now() < deadline {
+        while !holds_values(got, KEYS) && std::time::Instant::now() < deadline {
             compio::time::sleep(Duration::from_millis(200)).await;
             got = discarded_bytes(&ps, PART).await;
         }
-        assert_eq!(
-            got, want,
-            "the major compaction must discard every deleted value"
+        assert!(
+            holds_values(got, KEYS),
+            "the major compaction must discard every deleted value: {got}"
         );
+        let want = got;
         wait_reported(&mgr, 0).await;
 
         for i in 0..KEYS {
@@ -201,13 +211,15 @@ fn a_single_table_holding_a_value_and_its_delete_is_still_compacted() {
         }
         ps_compact(&ps, PART_ONE_TABLE).await;
 
-        let want = KEYS as i64 * VALUE_LEN as i64;
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut got = discarded_bytes(&ps, PART_ONE_TABLE).await;
-        while got != want && std::time::Instant::now() < deadline {
+        while !holds_values(got, KEYS) && std::time::Instant::now() < deadline {
             compio::time::sleep(Duration::from_millis(200)).await;
             got = discarded_bytes(&ps, PART_ONE_TABLE).await;
         }
-        assert_eq!(got, want, "the single flushed table must still be compacted");
+        assert!(
+            holds_values(got, KEYS),
+            "the single flushed table must still be compacted: {got}"
+        );
     });
 }

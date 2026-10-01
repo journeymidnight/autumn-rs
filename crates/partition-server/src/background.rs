@@ -2147,6 +2147,10 @@ pub(crate) async fn finish_write_batch(
         let durable_bumps_ref = &mut durable_bumps;
         let mut deletes: u64 = 0;
         let deletes_ref = &mut deletes;
+        // Value bytes this batch left behind ValuePointers: the only part of
+        // its log records still live after the flush (`Memtable::wal_dead`).
+        let mut vp_value_bytes: u64 = 0;
+        let vp_value_bytes_ref = &mut vp_value_bytes;
         let iter = valid.into_iter().filter_map(move |entry| {
             let record_offset = base_offset + cumulative;
             cumulative += record_sizes[idx] as u64;
@@ -2190,6 +2194,7 @@ pub(crate) async fn finish_write_batch(
                     offset: record_offset + 22 + entry.internal_key.len() as u64,
                     len: entry.value.len() as u64,
                 };
+                *vp_value_bytes_ref += vp.len;
                 MemEntry {
                     op: entry.op | OP_VALUE_POINTER,
                     value: vp.encode().to_vec(),
@@ -2233,6 +2238,8 @@ pub(crate) async fn finish_write_batch(
         // included) for the force-rotate; `mem_bytes` would only see the
         // ~24-byte VP for large values and never trip the 2 GiB gap.
         p.active.add_log_bytes(batch_log_bytes);
+        p.active
+            .add_wal_dead(result.extent_id, batch_log_bytes.saturating_sub(vp_value_bytes));
 
         p.vp_extent_id = result.extent_id;
         p.vp_offset = result.end;
@@ -3543,6 +3550,7 @@ async fn flush_gc_batch(
 
     let mut cur_offset = result.offset;
     let mut insert_items: Vec<(Vec<u8>, MemEntry, u64)> = Vec::with_capacity(n);
+    let mut vp_value_bytes = 0u64;
     for r in pending {
         // fix: V1 envelope adds 5 bytes (sentinel+length) before the
         // V0 inner header, so value bytes start at +22 not +17. See
@@ -3557,6 +3565,7 @@ async fn flush_gc_batch(
             value: new_vp.encode().to_vec(),
             expires_at: r.expires_at,
         };
+        vp_value_bytes += r.value_len as u64;
         let write_size = (r.user_key.len() + r.value_len as usize + 32) as u64;
         insert_items.push((r.internal_key, mem_entry, write_size));
         cur_offset = cur_offset.saturating_add(r.record_size as u64);
@@ -3572,6 +3581,8 @@ async fn flush_gc_batch(
         // join the un-flushed LOG window that recovery would replay. Track the
         // appended bytes for an accurate force-rotate gap.
         p.active.add_log_bytes(batch_bytes);
+        p.active
+            .add_wal_dead(result.extent_id, batch_bytes.saturating_sub(vp_value_bytes));
     }
     *moved += n;
 

@@ -1,3 +1,13 @@
+Date: 2026-10-01 (2)
+TaskStatus: completed
+Task scope: user "kubectl -n autumn 上面的part#1229, bench prefix的key应该都已经全删除了，但是为什么还不能GC" → "代码修复…写测试复现" (BUG-GC-INLINE-WAL-DISCARD).
+Current summary: discard maps were written only by compaction for dropped ValuePointers; inline values (<= VALUE_THROTTLE 4 KiB) have their WAL copy in the log, dead after flush, but nothing counted it, so a sealed log extent of small values never showed a dead byte and auto GC never took it (VKE: part 1223, bench keys all deleted, SST 5 KB, 204 GB log, empty discard map). Memtable now tallies per extent the WAL bytes that die at flush (record bytes minus VP value) on the write path, GC relocation and recovery replay (kept records only); build_sst_bytes attaches it as the SST discard map. 1229 itself was a misdiagnosis: its range [bench0, fs/\x03\x01) holds live fs data chunks (~8 MiB VPs); forcegc of 3 of its extents relocated ~2000 live entries each and freed nothing.
+Verification: system_gc_inline_wal (write path; WAL replay after SIGKILL) green, each ablation red at "0 < 204800"; system_compact_settles_deletes relaxed from exact VP totals to values + < one value of WAL overhead; partition-server lib 277; GC/row-truncate/split suites green. Tests need --release + RUST_MIN_STACK=16777216 (debug part-* thread overflows its 2 MiB stack, independent of this change).
+Found, not fixed: a PS that opens with extent E as its open tail caches E unsealed; seal_and_roll_tail does not evict it and authoritative_sealed never refetches, so auto GC skips E until the PS restarts.
+Review: fable, no high. Applied: add_wal_dead doc (replay calls it per record), CLAUDE.md note on GC read amplification and why not to skip the scan. Reported, not fixed: inferred hypothesis that a GC-relocated record could get a seq below an earlier imm's last_seq and be dropped by replay's ts<=max_seq skip after a crash (not traced). After rebasing onto 434bb373 (hello-admission test fixes): system_merge_single_checkpoint green too.
+Main gaps: pushed, not deployed.
+Next steps: user decides push + CP build + rollout; forcegc of pre-fix leaked extents (1223 running; 17 pending decision); stale open-tail cache blocking auto GC until restart awaits the user.
+
 Date: 2026-10-01
 TaskStatus: completed
 Task scope: user "review 这个新commit" (e8e6be2, unified PROTOCOL_HELLO + cluster bump retired) → "fix" (BUG-PROTOCOL-HELLO-REVIEW).

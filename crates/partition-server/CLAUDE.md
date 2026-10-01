@@ -554,8 +554,9 @@ after open — and it is the input to the manager's hard split trigger
 
 ### `open_tail_dead_bytes` — WAL debt on the open tail
 
-`PartitionMetrics.open_tail_dead_bytes` is the dead (overwritten/deleted)
-large-value bytes on the OPEN (last) `log_stream` extent. `gc_debt_bytes` is
+`PartitionMetrics.open_tail_dead_bytes` is the dead bytes on the OPEN (last)
+`log_stream` extent: overwritten/deleted large values, plus the WAL records
+already flushed (see "Discard map"). `gc_debt_bytes` is
 SEALED-only (GC can't punch an unsealed extent), so a log-heavy / all-open-tail
 partition reports `gc_debt=0` while holding real garbage; this gauge exposes it.
 `gc_debt_bytes + open_tail_dead_bytes` is the full reclaimable WAL debt (the two
@@ -1417,9 +1418,35 @@ at Phase 3). The pre-fix bug was the missing Case A: at T4, GC did
 ```
 
 **Discard map**: each SSTable's MetaBlock holds `HashMap<extent_id,
-reclaimable_bytes>`. During compaction, dropping a VP entry (dedup/range/tombstone/
-expiry) adds its extent_id + value length to the map. The GC loop aggregates across
-all SstReaders.
+reclaimable_bytes>`, written at two points. The GC loop aggregates across all
+SstReaders.
+- **Flush** stores the memtable's `wal_dead`: per log extent, every WAL record
+  byte except a ValuePointer's value. An inline value (<= `VALUE_THROTTLE`) is
+  copied into the SST, so its record is dead once the flush is durable; a VP
+  record's header and key are too. The write path tallies it once per appended
+  batch (`batch_log_bytes - VP value bytes`), GC relocation the same way, and
+  recovery replay per kept record (records an SST already covers were counted by
+  that SST's flush; fence bumps are not counted on replay). The tally rides the
+  memtable into the imm and `build_sst_bytes` attaches it.
+- **Compaction**: dropping a VP entry (dedup/range/tombstone/expiry) adds its
+  extent_id + value length. The two never count the same bytes: flush leaves
+  the VP value out, compaction counts only the VP value.
+
+Why flush and not compaction: an inline entry does not record where its WAL
+record is, so by compaction time nothing knows which extent to charge. Before
+this, a log extent of small values never showed a dead byte and auto GC never
+took it — measured on the VKE cluster: a partition whose 4 KiB benchmark keys
+were all deleted and compacted (SST 5 KB) held 204 GB of sealed log extents with
+an empty discard map. `crates/manager/tests/system_gc_inline_wal.rs` covers the
+write path and the replay path (each goes red without its tally). Extents
+written before this change carry no such record; reclaiming them takes forcegc.
+
+Cost: for a small-value workload every sealed log extent is ~100% dead once its
+flush checkpoints, so auto GC now reads each one end to end (finding nothing to
+relocate) before punching — one extra read of the WAL volume, paced by the GC
+rate limit. Do not shortcut that scan with "dead >= sealed_length ⇒ punch
+without reading": the tally can over-count (replay charges a V0 record the V1
+envelope), and the scan is what relocates a live ValuePointer.
 
 **Discard snapshot RPC** (`MSG_GET_DISCARDS = 0x48`): `handle_get_discards` reads a
 live snapshot of the partition's discard map without manager state — snapshots
@@ -2079,7 +2106,10 @@ Three fixes bound the restart replay window (worst case per partition =
    when nothing was kept) → persisted to metaStream → aggregated by GC from all
    SstReaders. Break any link and GC won't collect dead VP data. Upstream of all
    of it: a delete still in the memtable is invisible to compaction, which is why
-   a major compaction flushes first.
+   a major compaction flushes first. The WAL bytes themselves enter at flush
+   (`Memtable::wal_dead` → `build_sst_bytes`); a new path that appends to the log
+   or fills a memtable from it must tally them too, or its extents never become
+   collectable.
 
 4. **`has_overlap` blocks split but not reads** — `range()` with `has_overlap` set
    range-filters; `get()` does NOT filter (point lookups are exact). Write it ONLY
