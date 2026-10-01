@@ -1,15 +1,17 @@
 use super::*;
 #[path = "../../rpc/tests/support/status_peer.rs"]
 mod peer;
+use autumn_rpc::protocol_hello::Service;
 use peer::*;
 
 fn client(manager: String) -> ClusterClient {
     ClusterClient {
+        role: autumn_rpc::protocol_hello::Role::Client,
         manager_addrs: vec![manager],
         current_mgr: Cell::new(0),
         mgr_conn: Rc::new(RefCell::new(None)),
         ps_conns: RefCell::new(HashMap::new()),
-        en_pool: autumn_stream::ConnPool::new(),
+        en_pool: autumn_stream::ConnPool::with_role(autumn_rpc::protocol_hello::Role::Client),
         regions: RefCell::new(vec![]),
         ps_details: RefCell::new(HashMap::new()),
         part_addrs: RefCell::new(HashMap::new()),
@@ -28,7 +30,7 @@ fn client(manager: String) -> ClusterClient {
 async fn wrong_shard_bulk_refusal_falls_back_to_proxy() {
     let en_calls = Rc::new(Cell::new(0));
     let count = en_calls.clone();
-    let en = Peer::start(move |frame| {
+    let en = Peer::start_as(Service::ExtentNode, move |frame| {
         assert_eq!(
             frame.msg_type,
             autumn_stream::extent_rpc::MSG_READ_BYTES_BULK
@@ -47,7 +49,7 @@ async fn wrong_shard_bulk_refusal_falls_back_to_proxy() {
     let en_addr = en.addr.clone();
     let proxy_calls = Rc::new(Cell::new(0));
     let count = proxy_calls.clone();
-    let ps = Peer::start(move |frame| {
+    let ps = Peer::start_as(Service::PartitionServer, move |frame| {
         if frame.msg_type == MSG_GET_REDIRECT {
             Reply::Frame(autumn_rpc::Frame::response(
                 frame.req_id,
@@ -102,8 +104,16 @@ async fn wrong_shard_bulk_refusal_falls_back_to_proxy() {
 
 #[compio::test]
 async fn client_status_errors_preserve_connections_and_transport_failures_evict() {
-    let peer = Peer::start(respond).await;
     for shape in 0..4 {
+        let peer = Peer::start_as(
+            if shape == 3 {
+                Service::Manager
+            } else {
+                Service::PartitionServer
+            },
+            respond,
+        )
+        .await;
         let client = client(peer.addr.clone());
         let before = peer.accepts.get();
         for code in STATUSES {
@@ -213,7 +223,7 @@ async fn routing_retries_keep_the_connection_for_plain_bulk_and_pooled_calls() {
         ] {
             let calls = Rc::new(Cell::new(0));
             let observed = calls.clone();
-            let peer = Peer::start(move |f| {
+            let peer = Peer::start_as(Service::PartitionServer, move |f| {
                 observed.set(observed.get() + 1);
                 if observed.get() == 1 {
                     return Reply::Frame(autumn_rpc::Frame::error(
@@ -269,6 +279,7 @@ async fn routing_retries_keep_the_connection_for_plain_bulk_and_pooled_calls() {
             })
             .await;
             let client = client(manager.addr.clone());
+            client.mgr_client().await.unwrap();
             client.regions.borrow_mut().push((1, region(1)));
             client.part_addrs.borrow_mut().insert(1, peer.addr.clone());
             match shape {
@@ -292,7 +303,7 @@ async fn routing_retries_keep_the_connection_for_plain_bulk_and_pooled_calls() {
 
 #[compio::test]
 async fn pooled_batch_status_keeps_connection_and_identity_change_clears_it() {
-    let peer = Peer::start(respond).await;
+    let peer = Peer::start_as(Service::PartitionServer, respond).await;
     let client = client("127.0.0.1:1".into());
     client.regions.borrow_mut().push((1, region(1)));
     client.part_addrs.borrow_mut().insert(1, peer.addr.clone());
@@ -319,7 +330,7 @@ async fn pooled_batch_status_keeps_connection_and_identity_change_clears_it() {
     assert_eq!(
         peer.hellos.get(),
         1,
-        "the SDK sends MSG_CLIENT_HELLO once per connection it OPENS"
+        "the SDK sends PROTOCOL_HELLO once per connection it OPENS"
     );
 
     // A rebuilt connection handshakes again. It has to: the server's admission
@@ -375,7 +386,7 @@ async fn a_wire_version_refusal_is_terminal_and_keeps_the_servers_words() {
     // (2) On the data path. A wire refusal is as terminal as PermissionDenied:
     //     the version is compiled into this binary, so no refresh can change
     //     the answer.
-    let ps = Peer::start_refusing_hello(respond).await;
+    let ps = Peer::start_refusing_as(Service::PartitionServer, usize::MAX, respond).await;
     let client = client("127.0.0.1:1".into());
     client.regions.borrow_mut().push((1, region(1)));
     client.part_addrs.borrow_mut().insert(1, ps.addr.clone());
@@ -400,7 +411,7 @@ async fn a_wire_version_refusal_is_terminal_and_keeps_the_servers_words() {
 /// inference pod is not something anyone restarts to clear a flag.
 #[compio::test]
 async fn a_refusal_clears_when_the_cluster_catches_up() {
-    let ps = Peer::start_refusing_first_hellos(1, respond).await;
+    let ps = Peer::start_refusing_as(Service::PartitionServer, 1, respond).await;
     let client = client("127.0.0.1:1".into());
     client.regions.borrow_mut().push((1, region(1)));
     client.part_addrs.borrow_mut().insert(1, ps.addr.clone());
@@ -422,44 +433,13 @@ async fn a_refusal_clears_when_the_cluster_catches_up() {
     );
 }
 
-/// The client's own version check is SKIPPED when the fetch that feeds it
-/// fails — and the write must still be refused, by the server.
-///
-/// This is the direct regression for the hole the whole feature was opened
-/// over. `connect` reads the cluster's window out of `GetClusterIdResp` behind
-/// an `if let Ok`, and a TRANSPORT failure of that one call is deliberately
-/// skipped: availability wins while a manager is briefly down. Before there was
-/// a server-side gate, that skip was a way for a version-mismatched wheel to
-/// connect during a manager blip and then write silently mis-decoded bytes —
-/// the `part_id = 0` accident's exact shape.
-///
-/// So the fixture has to make `connect` actually RUN and actually SKIP. A
-/// client built by hand (as the sibling refusal tests do) never had a check to
-/// bypass, which proves something weaker.
-///
-/// What this pins is the COMPOSITION: the self-check is skipped, and the write
-/// is refused anyway because the data path handshakes on every connection it
-/// OPENS, independently of what connect learned. The refusing peer here is a
-/// mock, so this says nothing about whether a real server refuses — that half
-/// is `a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition`
-/// in the partition server, which drives a real `handle_ps_connection` and
-/// asserts the write never reaches the partition. The ablation that reds THIS
-/// test is removing `say_hello` from `get_ps_client`.
+/// Each data connection negotiates independently of a successful manager
+/// connection. A refused PS handshake cannot reach the Put handler.
 #[compio::test]
-async fn a_client_whose_self_check_was_skipped_is_still_refused_by_the_server() {
-    // The partition server refuses this client's wire version.
-    let ps = Peer::start_refusing_hello(respond).await;
+async fn a_partition_refusal_is_checked_independently_of_the_manager() {
+    let ps = Peer::start_refusing_as(Service::PartitionServer, usize::MAX, respond).await;
     let ps_addr = ps.addr.clone();
-
-    // The manager is reachable — it answers the hello and serves routing — but
-    // its `MSG_GET_CLUSTER_ID` fails. That is the blip.
-    let cluster_id_calls = Rc::new(Cell::new(0));
-    let seen = cluster_id_calls.clone();
     let mgr = Peer::start(move |f| {
-        if f.msg_type == MSG_GET_CLUSTER_ID {
-            seen.set(seen.get() + 1);
-            return Reply::Close;
-        }
         assert_eq!(f.msg_type, MSG_GET_CLIENT_REGIONS);
         Reply::Frame(autumn_rpc::Frame::response(
             f.req_id,
@@ -474,58 +454,11 @@ async fn a_client_whose_self_check_was_skipped_is_still_refused_by_the_server() 
         ))
     })
     .await;
-
-    let client = ClusterClient::connect_raw(&mgr.addr)
-        .await
-        .expect("a manager blip must not stop a client connecting — that is the skip");
-    assert_eq!(cluster_id_calls.get(), 1, "the fetch must have been attempted");
-
-    // Proof that what just happened was the SKIP and not a check that passed:
-    // the same fixture, with the same call SUCCEEDING and reporting a window
-    // this client is outside of, refuses at connect. One fixture, one
-    // difference — whether the fetch completes — and opposite outcomes.
-    let strict = Peer::start(move |f| {
-        if f.msg_type == MSG_GET_CLUSTER_ID {
-            return Reply::Frame(autumn_rpc::Frame::response(
-                f.req_id,
-                f.msg_type,
-                rkyv_encode(&GetClusterIdResp {
-                    code: 0,
-                    message: String::new(),
-                    cluster_id: "c".to_string(),
-                    wire_version_min: autumn_rpc::WIRE_VERSION + 5,
-                    wire_version_max: autumn_rpc::WIRE_VERSION + 6,
-                    cluster_version: 1,
-                }),
-            ));
-        }
-        unreachable!("connect must stop at the version check");
-    })
-    .await;
-    let Err(refused) = ClusterClient::connect_raw(&strict.addr).await else {
-        panic!("a SUCCESSFUL out-of-window response is a hard refusal, not a skip");
-    };
-    assert!(
-        format!("{refused:#}").contains("wire-version mismatch"),
-        "{refused:#}"
-    );
-
-    // The write. Refused by the PARTITION SERVER, not by the client's own
-    // courtesy check, which is the whole point: the gate no longer depends on
-    // a client being willing and able to police itself.
-    let err = client
-        .put(b"key", b"value")
-        .await
-        .expect_err("a below-window client must not be able to write");
-    assert!(
-        matches!(err, AutumnError::WireVersionRefused(_)),
-        "the refusal must survive typed, not flattened into a connection error: {err}"
-    );
-    assert!(
-        format!("{err}").contains(HELLO_REFUSAL),
-        "and it must carry the server's own words, which say which way round \
-         the mismatch is: {err}"
-    );
+    let client = ClusterClient::connect_raw(&mgr.addr).await.unwrap();
+    let err = client.put(b"key", b"value").await.unwrap_err();
+    assert!(matches!(err, AutumnError::WireVersionRefused(_)), "{err}");
+    assert!(err.to_string().contains(HELLO_REFUSAL));
+    assert_eq!(ps.accepts.get(), 1);
 }
 
 /// The two-form rule, exercised from the client's side: WHICH opcode a refresh
@@ -547,7 +480,7 @@ async fn which_routing_opcode_is_sent_follows_the_negotiated_version() {
     async fn opcode_seen_by_a_cluster_reporting(wire: u32) -> u8 {
         let seen: Rc<RefCell<Vec<u8>>> = Rc::new(RefCell::new(Vec::new()));
         let record = seen.clone();
-        let peer = Peer::start_reporting_wire(wire, move |f| {
+        let peer = Peer::start(move |f| {
             record.borrow_mut().push(f.msg_type);
             // `connect`'s cluster-id self-check is not what this test is about;
             // closing on it is what the sibling mocks do, and the hello — which
@@ -601,7 +534,11 @@ async fn which_routing_opcode_is_sent_follows_the_negotiated_version() {
             }
         })
         .await;
-        let client = ClusterClient::connect(&peer.addr, "fs").await.expect("connect");
+        let client = ClusterClient::connect(&peer.addr, "fs")
+            .await
+            .expect("connect");
+        seen.borrow_mut().clear();
+        client.negotiated_cluster_wire.set(wire);
         client.refresh_regions().await.expect("refresh");
         let routing = seen
             .borrow()
@@ -623,4 +560,15 @@ async fn which_routing_opcode_is_sent_follows_the_negotiated_version() {
         "a cluster one version below it has no handler for the new opcode and \
          would refuse the frame outright"
     );
+}
+
+#[compio::test]
+async fn a_partition_hello_does_not_change_the_managers_routing_version() {
+    // A client can see a newer PS while it still uses an older manager during
+    // a wire rollout. The manager's negotiated version selects routing DTOs.
+    let ps = Peer::start_as(Service::PartitionServer, respond).await;
+    let client = client("127.0.0.1:1".into());
+    client.negotiated_cluster_wire.set(autumn_rpc::WIRE_VERSION_WITH_CLIENT_REGIONS - 1);
+    client.ps_call(&ps.addr, ECHO, Bytes::new()).await.unwrap();
+    assert_eq!(client.negotiated_cluster_wire.get(), autumn_rpc::WIRE_VERSION_WITH_CLIENT_REGIONS - 1);
 }

@@ -8,6 +8,8 @@
 //! [req_id: u32 LE][msg_type: u8][flags: u8][payload_len: u32 LE][payload]
 //! ```
 
+#[cfg(test)]
+extern crate self as autumn_rpc;
 pub mod cap_token;
 pub mod client;
 pub mod client_hello;
@@ -16,7 +18,11 @@ pub mod extent_rpc;
 pub mod frame;
 pub mod manager_rpc;
 pub mod partition_rpc;
+pub mod protocol_hello;
 
+/// Re-exported for SDK-level source-staging decisions (autumn-client
+/// `ValueBuf` docs): staging into a pool slab only pays off on a UCX runtime.
+pub use autumn_transport::runtime_transport_is_ucx;
 /// Re-exported so consumers of the recv-into seam (`autumn_transport::
 /// ReadHalf::recv_into(reg: Option<&RegisteredMem>)`) don't need a direct
 /// autumn-transport dependency. (Uninhabited stub on non-ucx builds — `reg`
@@ -26,9 +32,6 @@ pub use autumn_transport::RegisteredMem;
 /// reference `autumn_rpc::PooledBuf` without a direct autumn-transport dep.
 /// Transport-agnostic: registered on `ucx`, plain (copy-out) on TCP/no-ucx.
 pub use autumn_transport::{regpool_acquire, PooledBuf};
-/// Re-exported for SDK-level source-staging decisions (autumn-client
-/// `ValueBuf` docs): staging into a pool slab only pays off on a UCX runtime.
-pub use autumn_transport::runtime_transport_is_ucx;
 pub use error::{Result, RpcError, StatusCode};
 pub use frame::{Frame, FrameDecoder, ReadWindow, HEADER_LEN};
 
@@ -124,7 +127,7 @@ pub const WIRE_VERSION: u32 = 51;
 /// `WIRE_VERSION` alone leaves every client inside the window untouched, which
 /// is the entire point and is now a fact about the tree rather than a plan.
 ///
-/// It rides in `GetClusterIdResp`'s `wire_version_min` FIELD. That struct is
+/// It is reported in PROTOCOL_HELLO and `GetClusterIdResp.wire_version_min`. That struct is
 /// frozen (it is the negotiation channel, decoded before any compat decision
 /// can be made), so the field name outlives the constant it carries; the
 /// mismatch is deliberate and noted at both ends.
@@ -150,11 +153,8 @@ const _: () = assert!(MIN_CLIENT_WIRE_VERSION <= WIRE_VERSION);
 /// ENTRY TICKET. Lowering it to 42 was implemented and reverted for exactly
 /// this. A stale 42 partition server computes `[42,42] ∩ [43,43] = ∅` and
 /// refuses itself today; against a reported `[42,43]` it computes `{42}` and
-/// JOINS. Nothing server-side catches it afterwards — `RegisterPsReq` and
-/// `RegisterNodeReq` carry no version, they are outside the client-surface
-/// gate, and a silent connection is read as 43 regardless. That is a
-/// mixed-version cluster on the INTERNAL plane, which is the one thing
-/// stop-the-world exists to make impossible.
+/// JOINS. Historically nothing server-side caught it afterwards. Mandatory
+/// PROTOCOL_HELLO now rejects that old binary before business decoding.
 ///
 /// **INVARIANT: the client floor may never go below this.** Raising the
 /// ceiling is the safe way to open the window, and it is safe in every
@@ -199,32 +199,15 @@ const _: () = assert!(WIRE_VERSION_WITH_LEASE_MODES <= WIRE_VERSION);
 
 const _: () = assert!(MIN_CLIENT_WIRE_VERSION >= FIRST_WIRE_VERSION_WITH_PEER_EQUALITY);
 
-/// A client that says nothing is assumed to speak
-/// `client_hello::WIRE_VERSION_WITH_CLIENT_HELLO`, so a floor above that
-/// number refuses every silent connection at once — every client image built
-/// before the handshake existed. That is a legitimate future act (it is what a
-/// client-facing break costs), but it is a fleet-wide one, so it may not be
-/// reached by editing a number: DELETE this line deliberately, with the
-/// announcement that goes with it.
-///
-/// Together with the assertion above, the floor is pinned at exactly 43 until
-/// someone removes one of them on purpose.
-const _: () = assert!(MIN_CLIENT_WIRE_VERSION <= client_hello::WIRE_VERSION_WITH_CLIENT_HELLO);
-
-
 /// CLUSTER-peer compat check: accept iff the peer speaks our exact version.
 ///
 /// Equality, not interval overlap, and the difference is load-bearing. The
 /// manager reports `MIN_CLIENT_WIRE_VERSION` in the `wire_version_min` slot
-/// because that is what a client needs, so an overlap test would admit a stale
-/// PS or EN sitting anywhere inside the CLIENT window — and the handshake is
-/// the only thing enforcing stop-the-world. Equality is also the honest
-/// spelling of the rule: manager, PS and EN binaries swap in one window and
-/// never face a peer of another version.
-///
-/// Callers treat a TRANSPORT failure fetching the peer's values as
-/// best-effort-skip (the peer may be briefly down; availability wins),
-/// but a SUCCESSFUL response that fails this check is a hard startup
+/// because that is what a client needs. An overlap test would admit a stale
+/// PS or EN sitting inside the CLIENT window. Mandatory PROTOCOL_HELLO
+/// enforces equality before business RPC; this helper also checks the
+/// manager's frozen identity response after connection admission.
+/// A successful response that fails this check is a hard startup
 /// refusal. A peer reporting `max == 0` (empty/pre-R1) is refused.
 ///
 /// This used to also compare a build-time fingerprint of the schema source,
@@ -246,10 +229,8 @@ pub fn cluster_peer_compat_check(remote_max: u32) -> std::result::Result<(), Str
     }
     Err(format!(
         "wire-version mismatch: this binary speaks {WIRE_VERSION}, the cluster \
-speaks {remote_max}. Cluster members must all run the SAME commit (rkyv wire \
-structs have no implicit cross-version compatibility; a mixed deploy decodes \
-garbage — and rkyv does not always fail loudly when it does). Stop every manager, partition server \
-and extent node, swap the binaries together, and start."
+speaks {remote_max}. Internal RPC requires exact wire equality. During a rolling \
+upgrade, update the remaining dependencies and wait for a compatible peer."
     ))
 }
 
@@ -267,13 +248,9 @@ and extent node, swap the binaries together, and start."
 /// constant — see `MIN_CLIENT_WIRE_VERSION`). A cluster reporting `max == 0`
 /// (empty/pre-R1) is refused.
 ///
-/// This runs at connect and is a courtesy, not the gate: it is skipped when the
-/// fetch itself fails, and the design puts admission at the server. Until that
-/// lands, nothing validates an incoming client at all.
-pub fn client_compat_check(
-    remote_min: u32,
-    remote_max: u32,
-) -> std::result::Result<(), String> {
+/// Legacy helper retained for callers using the frozen identity response.
+/// Live connection admission is enforced by PROTOCOL_HELLO at both endpoints.
+pub fn client_compat_check(remote_min: u32, remote_max: u32) -> std::result::Result<(), String> {
     if (remote_min..=remote_max).contains(&WIRE_VERSION) {
         return Ok(());
     }
@@ -392,7 +369,6 @@ mod admin_token_prefix_tests {
         assert!(is_admin_mgr_msg(MSG_FENCE_NODE));
         assert!(is_admin_mgr_msg(MSG_MERGE_PARTITIONS));
         assert!(is_admin_mgr_msg(MSG_CREATE_STREAM));
-        assert!(is_admin_mgr_msg(MSG_BUMP_CLUSTER_VERSION));
         // M3: the raw merge txn is gated so it can't bypass the guard.
         assert!(is_admin_mgr_msg(MSG_MULTI_MODIFY_MERGE));
         // … but MULTI_MODIFY_SPLIT stays ungated — it IS PS-driven.

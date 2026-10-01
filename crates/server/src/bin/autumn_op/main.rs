@@ -290,7 +290,9 @@ fn extent_sharers(
     for pid in part_ids {
         let Some(r) = regions.get(pid) else { continue };
         for sid in [r.log_stream, r.row_stream, r.meta_stream] {
-            let Some(s) = stream_map.get(&sid) else { continue };
+            let Some(s) = stream_map.get(&sid) else {
+                continue;
+            };
             for eid in &s.extent_ids {
                 let holders = sharers.entry(*eid).or_default();
                 // One partition, one entry. A partition that reaches the same
@@ -372,7 +374,7 @@ async fn run(args: Args) -> Result<()> {
     // Select the process-global transport before connecting. Without this an
     // autumn-op invoked against a UCX manager would default to TCP and hang.
     let _ = autumn_transport::init_with(args.transport);
-    let client = ClusterClient::connect_raw(&args.manager).await?;
+    let client = ClusterClient::connect_admin(&args.manager).await?;
     // a global `--admin-token[-file]` authorizes cluster-mutating
     // ops (fence/merge/create-stream/…). Read-only commands are unaffected — the
     // manager only strips+checks the prefix for `is_admin_mgr_msg`, so passing a
@@ -392,17 +394,34 @@ async fn run(args: Args) -> Result<()> {
     }
     match args.cmd {
         // ---------------- node-lifecycle read ----------------
-        Command::ClusterVersion => cmd_cluster_version(&client, args.json).await?,
-        Command::UpgradeVersion { to } => cmd_upgrade_version(&client, args.json, to).await?,
         Command::ListNodes => cmd_list_nodes(&client, args.json).await?,
         Command::Df => cmd_df(&client, args.json).await?,
-        Command::ExtentHealth { node_filter, include_healthy } => cmd_extent_health(&client, args.json, node_filter, include_healthy).await?,
+        Command::ExtentHealth {
+            node_filter,
+            include_healthy,
+        } => cmd_extent_health(&client, args.json, node_filter, include_healthy).await?,
         Command::ListEcMarkers => cmd_list_ec_markers(&client, args.json).await?,
         Command::RecoveryStats => cmd_recovery_stats(&client, args.json).await?,
-        Command::AuditLog { op, node_id, since, until, limit } => cmd_audit_log(&client, args.json, op, node_id, since, until, limit).await?,
+        Command::AuditLog {
+            op,
+            node_id,
+            since,
+            until,
+            limit,
+        } => cmd_audit_log(&client, args.json, op, node_id, since, until, limit).await?,
         // ---------------- node-lifecycle admin ----------------
-        Command::Fence { node_id, reason, by, force } => cmd_fence(&client, args.json, node_id, reason, by, force).await?,
-        Command::Maintenance { node_id, reason, by, expire } => cmd_maintenance(&client, args.json, node_id, reason, by, expire).await?,
+        Command::Fence {
+            node_id,
+            reason,
+            by,
+            force,
+        } => cmd_fence(&client, args.json, node_id, reason, by, force).await?,
+        Command::Maintenance {
+            node_id,
+            reason,
+            by,
+            expire,
+        } => cmd_maintenance(&client, args.json, node_id, reason, by, expire).await?,
         Command::Unfence { node_id, by } => cmd_unfence(&client, args.json, node_id, by).await?,
         Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
         // ---------------- cluster / partition read ----------------
@@ -444,12 +463,44 @@ async fn run(args: Args) -> Result<()> {
         } => {
             run_bootstrap(&client, args.json, &replication, &presplit, log_ec, row_ec).await?;
         }
-        Command::SetStreamEc { stream_id, ec_data, ec_parity } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
-        Command::ForceEcConvert { extent_id } => cmd_force_ec_convert(&client, args.json, args.wait, args.wait_timeout, extent_id).await?,
-        Command::Split { part_id, point } => cmd_split(&client, args.json, args.wait, args.wait_timeout, part_id, point).await?,
-        Command::Ops { op_id, active, kind, limit } => cmd_ops(&client, args.json, op_id, active, &kind, limit).await?,
-        Command::OpsHistory { kind, since_unix, limit } => cmd_ops_history(&client, args.json, &kind, since_unix, limit).await?,
-        Command::Presplit { namespace, tenant, rule, admin_token, force } => {
+        Command::SetStreamEc {
+            stream_id,
+            ec_data,
+            ec_parity,
+        } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
+        Command::ForceEcConvert { extent_id } => {
+            cmd_force_ec_convert(&client, args.json, args.wait, args.wait_timeout, extent_id)
+                .await?
+        }
+        Command::Split { part_id, point } => {
+            cmd_split(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                part_id,
+                point,
+            )
+            .await?
+        }
+        Command::Ops {
+            op_id,
+            active,
+            kind,
+            limit,
+        } => cmd_ops(&client, args.json, op_id, active, &kind, limit).await?,
+        Command::OpsHistory {
+            kind,
+            since_unix,
+            limit,
+        } => cmd_ops_history(&client, args.json, &kind, since_unix, limit).await?,
+        Command::Presplit {
+            namespace,
+            tenant,
+            rule,
+            admin_token,
+            force,
+        } => {
             // UX-fix: the recording token falls back to the GLOBAL
             // `--admin-token[-file]` (the position `usage()` documents) so an
             // operator no longer has to pass the same secret twice. The
@@ -465,13 +516,75 @@ async fn run(args: Args) -> Result<()> {
             if let Some(tok) = record_token {
                 client.set_admin_token(tok.as_bytes().to_vec());
             }
-            cmd_presplit(&client, args.json, &namespace, &tenant, &rule, record_token, force).await?
+            cmd_presplit(
+                &client,
+                args.json,
+                &namespace,
+                &tenant,
+                &rule,
+                record_token,
+                force,
+            )
+            .await?
         }
-        Command::Merge { survivor_part_id, victim_part_id, force } => cmd_merge(&client, args.json, args.wait, args.wait_timeout, survivor_part_id, victim_part_id, force).await?,
-        Command::Rebalance { max_moves } => cmd_rebalance(&client, args.json, args.wait, args.wait_timeout, max_moves).await?,
-        Command::Compact { part_id } => cmd_compact(&client, args.json, args.wait, args.wait_timeout, part_id).await?,
-        Command::Gc { part_id, ratio, max_size, stream_debt, dead_bytes, empty_only } => cmd_gc(&client, args.json, args.wait, args.wait_timeout, part_id, ratio, max_size, stream_debt, dead_bytes, empty_only).await?,
-        Command::ForceGc { part_id, extent_ids } => cmd_force_gc(&client, args.json, args.wait, args.wait_timeout, part_id, extent_ids).await?,
+        Command::Merge {
+            survivor_part_id,
+            victim_part_id,
+            force,
+        } => {
+            cmd_merge(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                survivor_part_id,
+                victim_part_id,
+                force,
+            )
+            .await?
+        }
+        Command::Rebalance { max_moves } => {
+            cmd_rebalance(&client, args.json, args.wait, args.wait_timeout, max_moves).await?
+        }
+        Command::Compact { part_id } => {
+            cmd_compact(&client, args.json, args.wait, args.wait_timeout, part_id).await?
+        }
+        Command::Gc {
+            part_id,
+            ratio,
+            max_size,
+            stream_debt,
+            dead_bytes,
+            empty_only,
+        } => {
+            cmd_gc(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                part_id,
+                ratio,
+                max_size,
+                stream_debt,
+                dead_bytes,
+                empty_only,
+            )
+            .await?
+        }
+        Command::ForceGc {
+            part_id,
+            extent_ids,
+        } => {
+            cmd_force_gc(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                part_id,
+                extent_ids,
+            )
+            .await?
+        }
         Command::RegisterNode => {
             // Already handled by the pre-connect stub above.
             unreachable!("Command::RegisterNode handled before connect");
@@ -479,12 +592,41 @@ async fn run(args: Args) -> Result<()> {
         Command::Format { dirs } => cmd_format(&client, args.json, dirs, &args.manager).await?,
         // ---------------- authz tooling ----------------
         Command::GenSigningKey { .. } => unreachable!("gen-signing-key handled before connect"),
-        Command::PrincipalCreate { principal, grants, admin_token } => cmd_principal_create(&client, args.json, principal, grants, admin_token).await?,
-        Command::PrincipalDelete { principal, admin_token } => cmd_principal_delete(&client, args.json, principal, admin_token).await?,
-        Command::MintToken { principal, credential } => cmd_mint_token(&client, args.json, principal, credential).await?,
+        Command::PrincipalCreate {
+            principal,
+            grants,
+            admin_token,
+        } => cmd_principal_create(&client, args.json, principal, grants, admin_token).await?,
+        Command::PrincipalDelete {
+            principal,
+            admin_token,
+        } => cmd_principal_delete(&client, args.json, principal, admin_token).await?,
+        Command::MintToken {
+            principal,
+            credential,
+        } => cmd_mint_token(&client, args.json, principal, credential).await?,
         // ---------------- namespace registry ----------------
-        Command::NamespaceCreate { name, owner_tenant, presplit, admin_token } => cmd_namespace_create(&client, args.json, name, owner_tenant, presplit, admin_token).await?,
-        Command::NamespaceDelete { name, force, admin_token } => cmd_namespace_delete(&client, args.json, name, force, admin_token).await?,
+        Command::NamespaceCreate {
+            name,
+            owner_tenant,
+            presplit,
+            admin_token,
+        } => {
+            cmd_namespace_create(
+                &client,
+                args.json,
+                name,
+                owner_tenant,
+                presplit,
+                admin_token,
+            )
+            .await?
+        }
+        Command::NamespaceDelete {
+            name,
+            force,
+            admin_token,
+        } => cmd_namespace_delete(&client, args.json, name, force, admin_token).await?,
         Command::NamespaceList => cmd_namespace_list(&client, args.json).await?,
         Command::PrincipalList => cmd_principal_list(&client, args.json).await?,
     }
@@ -764,59 +906,6 @@ async fn cmd_principal_list(client: &ClusterClient, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_cluster_version(client: &ClusterClient, json: bool) -> Result<()> {
-                let bytes = client
-                    .mgr_call(
-                        MSG_GET_CLUSTER_VERSION,
-                        rkyv_encode(&GetClusterVersionReq {}),
-                    )
-                    .await?;
-                let resp: GetClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-                if resp.code != CODE_OK {
-                    bail!("cluster-version: {}", resp.message);
-                }
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "cluster_version": resp.cluster_version,
-                            // The frozen field names; `wire_version_min`
-                            // carries the manager's MIN_CLIENT_WIRE_VERSION.
-                            "cluster_wire_version": resp.wire_version_max,
-                            "cluster_min_client_wire_version": resp.wire_version_min,
-                            "op_wire_version": autumn_rpc::WIRE_VERSION,
-                        }))?
-                    );
-                } else {
-                    println!("cluster_version: {}", resp.cluster_version);
-                    println!("cluster wire version:   {}", resp.wire_version_max);
-                    println!(
-                        "oldest client served:   {}{}",
-                        resp.wire_version_min,
-                        if resp.wire_version_min == resp.wire_version_max {
-                            "  (window shut — clients must match the cluster)".to_string()
-                        } else {
-                            // An open window is the state an operator most
-                            // needs spelled out: it is what says a client image
-                            // does NOT have to be rebuilt at this commit.
-                            format!(
-                                "  (window open — any client built at {}..={} is served)",
-                                resp.wire_version_min, resp.wire_version_max
-                            )
-                        }
-                    );
-                    println!("this autumn-op binary:  {}", autumn_rpc::WIRE_VERSION);
-                    if resp.cluster_version < resp.wire_version_max {
-                        println!(
-                            "NOTE: manager binaries support up to v{} — `upgrade-version` can bump \
-    once EVERY member runs the new binary",
-                            resp.wire_version_max
-                        );
-                    }
-                }
-    Ok(())
-}
-
 async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
     let bytes = client
         .mgr_call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
@@ -888,10 +977,7 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
     // 4+1-only cluster is ~1.25x and RF3 is ~3x. `physical_used` remains a
     // diagnostic sum of extent file lengths, not the capacity numerator.
     let logical_size = r.logical_stored.saturating_add(r.logical_open_tail);
-    let amp = autumn_manager::dashboard_compose::raw_capacity_amplification(
-        raw_used,
-        logical_size,
-    );
+    let amp = autumn_manager::dashboard_compose::raw_capacity_amplification(raw_used, logical_size);
     // Writable logical estimate is a RANGE under EC: best EC shape is
     // K = min(4, node_count-1) data shards + 1 parity → factor
     // (K+1)/K; worst is 3-replica. Point estimate uses the empirical
@@ -1026,7 +1112,12 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_extent_health(client: &ClusterClient, json: bool, node_filter: Vec<u64>, include_healthy: bool) -> Result<()> {
+async fn cmd_extent_health(
+    client: &ClusterClient,
+    json: bool,
+    node_filter: Vec<u64>,
+    include_healthy: bool,
+) -> Result<()> {
     let req = ExtentHealthReq {
         node_id_filter: node_filter,
         include_healthy,
@@ -1225,7 +1316,15 @@ async fn cmd_recovery_stats(client: &ClusterClient, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_audit_log(client: &ClusterClient, json: bool, op: u8, node_id: u64, since: i64, until: i64, limit: u32) -> Result<()> {
+async fn cmd_audit_log(
+    client: &ClusterClient,
+    json: bool,
+    op: u8,
+    node_id: u64,
+    since: i64,
+    until: i64,
+    limit: u32,
+) -> Result<()> {
     let req = QueryAuditLogReq {
         op_filter: op,
         node_id_filter: node_id,
@@ -1472,7 +1571,10 @@ async fn cmd_auto_policy(
 async fn cmd_overview(client: &ClusterClient) -> Result<()> {
     let df = client.cluster_df().await?;
     let ov_bytes = client
-        .mgr_call(MSG_GET_CLUSTER_OVERVIEW, rkyv_encode(&GetClusterOverviewReq {}))
+        .mgr_call(
+            MSG_GET_CLUSTER_OVERVIEW,
+            rkyv_encode(&GetClusterOverviewReq {}),
+        )
         .await
         .context("cluster overview")?;
     let ov: GetClusterOverviewResp = rkyv_decode(&ov_bytes).map_err(decode_err)?;
@@ -1580,53 +1682,14 @@ async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()>
     Ok(())
 }
 
-async fn cmd_upgrade_version(client: &ClusterClient, json: bool, to: Option<u32>) -> Result<()> {
-                // Resolve the default target (current+1) from a fresh read so
-                // the printed intent matches what the manager will validate.
-                let bytes = client
-                    .mgr_call(
-                        MSG_GET_CLUSTER_VERSION,
-                        rkyv_encode(&GetClusterVersionReq {}),
-                    )
-                    .await?;
-                let cur: GetClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-                if cur.code != CODE_OK {
-                    bail!("upgrade-version: read current failed: {}", cur.message);
-                }
-                let target = to.unwrap_or(cur.cluster_version + 1);
-                let bytes = client
-                    .mgr_call(
-                        MSG_BUMP_CLUSTER_VERSION,
-                        rkyv_encode(&BumpClusterVersionReq { to: target }),
-                    )
-                    .await?;
-                let resp: BumpClusterVersionResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
-                if resp.code != CODE_OK {
-                    bail!(
-                        "upgrade-version to {} REFUSED (cluster_version stays {}): {}",
-                        target,
-                        resp.cluster_version,
-                        resp.message
-                    );
-                }
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "cluster_version": resp.cluster_version,
-                        }))?
-                    );
-                } else {
-                    println!(
-                        "cluster_version bumped: {} -> {} — rollback to older binaries is no \
-    longer safe (new formats may now be emitted/persisted)",
-                        cur.cluster_version, resp.cluster_version
-                    );
-                }
-    Ok(())
-}
-
-async fn cmd_fence(client: &ClusterClient, json: bool, node_id: u64, reason: String, by: String, force: bool) -> Result<()> {
+async fn cmd_fence(
+    client: &ClusterClient,
+    json: bool,
+    node_id: u64,
+    reason: String,
+    by: String,
+    force: bool,
+) -> Result<()> {
     if reason.is_empty() || by.is_empty() {
         bail!("--reason and --by are required");
     }
@@ -1642,7 +1705,14 @@ async fn cmd_fence(client: &ClusterClient, json: bool, node_id: u64, reason: Str
     Ok(())
 }
 
-async fn cmd_maintenance(client: &ClusterClient, json: bool, node_id: u64, reason: String, by: String, expire: u64) -> Result<()> {
+async fn cmd_maintenance(
+    client: &ClusterClient,
+    json: bool,
+    node_id: u64,
+    reason: String,
+    by: String,
+    expire: u64,
+) -> Result<()> {
     if by.is_empty() {
         bail!("--by is required");
     }
@@ -1713,7 +1783,13 @@ async fn cmd_remove(client: &ClusterClient, json: bool, node_id: u64, by: String
     Ok(())
 }
 
-async fn cmd_set_stream_ec(client: &ClusterClient, json: bool, stream_id: u64, ec_data: u32, ec_parity: u32) -> Result<()> {
+async fn cmd_set_stream_ec(
+    client: &ClusterClient,
+    json: bool,
+    stream_id: u64,
+    ec_data: u32,
+    ec_parity: u32,
+) -> Result<()> {
     let req_bytes = rkyv_encode(&UpdateStreamEcReq {
         stream_id,
         ec_data_shard: ec_data,
@@ -2529,7 +2605,12 @@ async fn cmd_force_gc(
 /// meta.properties, zero network info) and Ceph `ceph-volume prepare` (writes
 /// only the OSD fsid) — mkfs mints identity offline; the daemon reports its
 /// own network location every boot, not the formatting step.
-async fn cmd_format(client: &ClusterClient, json: bool, dirs: Vec<String>, manager: &str) -> Result<()> {
+async fn cmd_format(
+    client: &ClusterClient,
+    json: bool,
+    dirs: Vec<String>,
+    manager: &str,
+) -> Result<()> {
     // fetch the manager's cluster_id BEFORE touching
     // any disk. Failure here means the manager is not yet
     // leader (retries internally) or has never bootstrapped
@@ -2951,7 +3032,10 @@ async fn run_bootstrap(
 /// are fetched lazily via `info --part P` (scoped).
 async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
     let bytes = client
-        .mgr_call(MSG_GET_CLUSTER_OVERVIEW, rkyv_encode(&GetClusterOverviewReq {}))
+        .mgr_call(
+            MSG_GET_CLUSTER_OVERVIEW,
+            rkyv_encode(&GetClusterOverviewReq {}),
+        )
         .await
         .context("cluster overview")?;
     let resp: GetClusterOverviewResp = rkyv_decode(&bytes).map_err(decode_err)?;
@@ -2993,9 +3077,11 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
         let nj: Vec<_> = resp
             .nodes
             .iter()
-            .map(|n| serde_json::json!({
-                "node_id": n.node_id, "address": n.address, "extent_count": n.extent_count,
-            }))
+            .map(|n| {
+                serde_json::json!({
+                    "node_id": n.node_id, "address": n.address, "extent_count": n.extent_count,
+                })
+            })
             .collect();
         println!(
             "{}",
@@ -3232,7 +3318,11 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut extents_json = Vec::new();
     let mut live_size = 0u64;
-    for (role, sid) in [("log", r.log_stream), ("row", r.row_stream), ("meta", r.meta_stream)] {
+    for (role, sid) in [
+        ("log", r.log_stream),
+        ("row", r.row_stream),
+        ("meta", r.meta_stream),
+    ] {
         if let Some(st) = stream_map.get(&sid) {
             for eid in &st.extent_ids {
                 if !seen.insert(*eid) {
@@ -3247,7 +3337,11 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
                             if let Ok(enc) = client.get_ps_client(addr).await {
                                 let req = ExtProbeExtentReq { extent_id: *eid };
                                 if let Ok(rb) = enc
-                                    .call_timeout(EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
+                                    .call_timeout(
+                                        EXT_MSG_PROBE_EXTENT,
+                                        req.encode(),
+                                        DEFAULT_RPC_TIMEOUT,
+                                    )
                                     .await
                                 {
                                     if let Ok(pr) = ExtProbeExtentResp::decode(rb) {

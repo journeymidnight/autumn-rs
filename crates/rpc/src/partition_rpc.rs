@@ -439,12 +439,7 @@ pub struct BatchPutOp {
 pub struct BatchPutReq {
     pub part_id: u64,
     pub region_epoch: u64,
-    /// the `must_sync` field was removed here too. `PutReq` and
-    /// `AppendReq` lost theirs when every write became durable via the
-    /// extent-node fsync coalescer (RocksDB-style group commit); this one
-    /// outlived that pass and was never read by the PS — the only writers
-    /// set it to `true` unconditionally. A durability flag nobody honours is
-    /// a fail-open switch waiting for someone to flip it.
+    /// Operations acknowledged after durable group commit.
     pub ops: Vec<BatchPutOp>,
 }
 
@@ -711,9 +706,7 @@ pub struct PutReq {
     pub part_id: u64,
     pub key: Vec<u8>,
     pub value: Vec<u8>,
-    /// follow-up: the `must_sync` field was removed. Every Put is
-    /// now durable via the extent-node fsync coalescer (RocksDB-style
-    /// group commit). The PS no longer threads any sync flag through.
+    /// Expiration timestamp; zero means no expiration.
     pub expires_at: u64,
     /// TiKV-style region epoch: client stamps the epoch from its
     /// routing cache; PS rejects with FailedPrecondition when its own

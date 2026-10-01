@@ -151,6 +151,7 @@ dependencies = [
  "anyhow",
  "autumn-rpc",
  "autumn-stream",
+ "autumn-transport",
  "bytes",
  "compio",
  "crc32c",

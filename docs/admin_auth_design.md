@@ -9,7 +9,7 @@
 **部署前提 = 可信内网**（sglang/vLLM 推理集群，RoCE 内网）。
 
 - **目标**：挡「**误连别的集群**」与「**流氓或测试客户端跑破坏性管理命令**」——
-  fence-node / remove-node / 改 EC / 改 cluster_version / 乱建 stream / 改路由 /
+  fence-node / remove-node / 改 EC / 乱建 stream / 改路由 /
   提交 op / 触发 split·merge·gc·compact。
 - **不做**：不防 MITM / 真实网络攻击者（不上 TLS/mTLS）；不做多租户 per-user
   角色 / ACL（不上 RBAC）。
@@ -48,7 +48,7 @@ admin token 与数据面 authz **解耦**：一个没开 authz（没配 signing 
 client 与 manager 共用（杜绝两边漂移）：
 
 `MSG_FENCE_NODE` / `MSG_REMOVE_NODE` / `MSG_SET_NODE_MAINTENANCE` /
-`MSG_CLEAR_NODE_OVERRIDE` / `MSG_BUMP_CLUSTER_VERSION` / `MSG_UPDATE_STREAM_EC` /
+`MSG_CLEAR_NODE_OVERRIDE` / `MSG_UPDATE_STREAM_EC` /
 `MSG_FORCE_EC_CONVERT` / `MSG_CREATE_STREAM` / `MSG_UPSERT_PARTITION` /
 `MSG_MERGE_PARTITIONS` / `MSG_MULTI_MODIFY_MERGE` / `MSG_OP_SUBMIT`
 
@@ -100,7 +100,7 @@ client 侧同样在 `call_ps_for_part` 里按 `is_admin_ps_msg` 前缀一次（�
   一帧不动。key 级授权由 `data_plane_authz_design.md` 的 capability token 负责。
 - **只读 / 观测类**（`info`、`df`、node 列表、recovery-stats、extent-health、
   audit-query、partition-detail、get-regions、probe-extent、get-discards、
-  cluster-id / cluster-version、`namespace-list`）：不破坏性，留开。
+  cluster-id、`namespace-list`）：不破坏性，留开。
 - **已被 `owner_epoch` fencing 挡住的**（`punch_holes` / `truncate` /
   `stream_alloc_extent` 等）：流氓客户端拿不到 partition owner 锁，发了也被
   EN / manager 拒。

@@ -7,8 +7,7 @@ pub const BLOCK_SIZE_TARGET: usize = 64 * 1024; // 64 KB
 pub const MAX_ENTRIES_PER_BLOCK: usize = 1000;
 pub const MAGIC: u32 = 0x4155_3742; // "AU7B"
 /// The only MetaBlock version this build reads or writes. v2 added
-/// `num_entries` / `num_deletions`; a v1 SST is refused, and the one-off
-/// `convert_sst` tool rewrites them with the cluster stopped.
+/// `num_entries` / `num_deletions`; older SST formats are refused.
 pub const FORMAT_VERSION: u16 = 2;
 /// 13 bytes per SST entry's value section: op(1) + val_len(4) + expires_at(8).
 pub const ENTRY_VALUE_HEADER: usize = 13;
@@ -158,8 +157,7 @@ impl MetaBlock {
         let version = read_u16(payload, &mut c)?;
         if version != FORMAT_VERSION {
             return Err(anyhow!(
-                "SST MetaBlock format v{version}, this build reads only v{FORMAT_VERSION}: \
-                 stop the cluster and run convert_sst"
+                "SST MetaBlock format v{version}, this build reads only v{FORMAT_VERSION}"
             ));
         }
         let num_blocks = read_u32(payload, &mut c)? as usize;
@@ -476,12 +474,12 @@ mod tests {
     }
 
     #[test]
-    fn a_v1_meta_block_is_refused_with_the_conversion_hint() {
+    fn a_v1_meta_block_is_refused_with_the_supported_version() {
         let err = MetaBlock::decode(&as_v1(&sample_meta().encode()))
             .err()
             .expect("a v1 MetaBlock must not decode")
             .to_string();
-        assert!(err.contains("v1") && err.contains("convert_sst"), "{err}");
+        assert!(err.contains("v1") && err.contains("reads only v2"), "{err}");
     }
 
     #[test]

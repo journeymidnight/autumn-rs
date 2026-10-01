@@ -247,11 +247,8 @@ fn parse_args() -> Args {
             }
             "--ucx-regpool-cap-bytes" => {
                 i += 1;
-                ucx_regpool_cap_bytes = Some(
-                    args[i]
-                        .parse()
-                        .expect("--ucx-regpool-cap-bytes usize"),
-                );
+                ucx_regpool_cap_bytes =
+                    Some(args[i].parse().expect("--ucx-regpool-cap-bytes usize"));
             }
             "--metrics-port" => {
                 i += 1;
@@ -330,7 +327,34 @@ fn apply_extent_tunables(
 /// see. No retry — if the manager isn't reachable at startup we want
 /// to bubble up the error fast.
 async fn verify_manager_cluster_id(manager: &str, stamped: &str) -> Result<()> {
-    let client = ClusterClient::connect_raw(manager)
+    let mut delay = 1u64;
+    loop {
+        match verify_manager_cluster_id_once(manager, stamped).await {
+            Ok(()) => return Ok(()),
+            Err(e) if transient_manager_error(&e) => {
+                tracing::warn!(manager, wire = autumn_rpc::WIRE_VERSION, error = %format!("{e:#}"), delay, "waiting for compatible manager; dependencies not ready");
+                compio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                delay = (delay + 1).min(5);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn transient_manager_error(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<autumn_rpc::RpcError>().is_some_and(|e| {
+        matches!(
+            e,
+            autumn_rpc::RpcError::VersionMismatch { .. }
+                | autumn_rpc::RpcError::Io(_)
+                | autumn_rpc::RpcError::ConnectionClosed
+                | autumn_rpc::RpcError::Timeout(_)
+        )
+    })
+}
+
+async fn verify_manager_cluster_id_once(manager: &str, stamped: &str) -> Result<()> {
+    let client = ClusterClient::connect_peer(manager)
         .await
         .with_context(|| format!("connect to manager {manager} for cluster_id verify"))?;
     let resp_bytes = client
@@ -427,9 +451,7 @@ fn read_node_identity(data_dirs: &[PathBuf]) -> Result<(String, Vec<String>)> {
     let mut disk_uuids: Vec<String> = Vec::with_capacity(data_dirs.len());
     for dir in data_dirs {
         let du = std::fs::read_to_string(dir.join("disk_uuid"))
-            .with_context(|| {
-                format!("read disk_uuid in {} (dir not formatted?)", dir.display())
-            })?
+            .with_context(|| format!("read disk_uuid in {} (dir not formatted?)", dir.display()))?
             .trim()
             .to_string();
         if du.is_empty() {
@@ -441,9 +463,7 @@ fn read_node_identity(data_dirs: &[PathBuf]) -> Result<(String, Vec<String>)> {
         disk_uuids.push(du);
 
         let nu = std::fs::read_to_string(dir.join("node_uuid"))
-            .with_context(|| {
-                format!("read node_uuid in {} (dir not formatted?)", dir.display())
-            })?
+            .with_context(|| format!("read node_uuid in {} (dir not formatted?)", dir.display()))?
             .trim()
             .to_string();
         if nu.is_empty() {
@@ -506,14 +526,13 @@ fn build_register_req(
 /// refusal (fenced / decommissioned / cluster mismatch) or on exhaustion — an
 /// EN the manager can't route to must not serve (same rationale as the
 /// multi-shard bind fail-stop).
-async fn register_with_manager(
-    manager: &str,
-    req: &RegisterNodeReq,
-) -> Result<()> {
+async fn register_with_manager(manager: &str, req: &RegisterNodeReq) -> Result<()> {
     let mut last_err = String::new();
-    for attempt in 1..=30u32 {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
         let step = async {
-            let client = ClusterClient::connect_raw(manager)
+            let client = ClusterClient::connect_peer(manager)
                 .await
                 .with_context(|| format!("connect to manager {manager}"))?;
             let bytes = client
@@ -525,6 +544,14 @@ async fn register_with_manager(
             Ok::<RegisterNodeResp, anyhow::Error>(resp)
         }
         .await;
+        if let Err(e) = &step {
+            if transient_manager_error(e) {
+                tracing::warn!(manager, wire = autumn_rpc::WIRE_VERSION, error = %e, "waiting for compatible manager registration");
+                compio::time::sleep(std::time::Duration::from_secs(5)).await;
+                attempt = 0;
+                continue;
+            }
+        }
         match step {
             Ok(resp) if resp.code == CODE_OK => {
                 tracing::info!(
@@ -549,6 +576,9 @@ async fn register_with_manager(
             Err(e) => last_err = format!("{e:#}"),
         }
         tracing::warn!(attempt, error = %last_err, "EN self-register retry");
+        if attempt >= 30 {
+            break;
+        }
         compio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
     anyhow::bail!("EN self-registration failed after 30 attempts: {last_err}")
@@ -726,7 +756,11 @@ fn main() -> Result<()> {
     // `control_port_base`, derived from --port). Equal in the common case
     // (advertise_port == --port), different behind a proxy.
     let advertise_shard_ports: Vec<u16> = advertise_port
-        .map(|ap| (0..shards).map(|i| ap + (i as u16) * args.shard_stride).collect())
+        .map(|ap| {
+            (0..shards)
+                .map(|i| ap + (i as u16) * args.shard_stride)
+                .collect()
+        })
         .unwrap_or_default();
     let advertise_control_base: u16 = advertise_port.map_or(0, |ap| ap.saturating_add(1000));
 
@@ -833,11 +867,9 @@ fn main() -> Result<()> {
                         .ok();
                         // per-shard control listener — same SQ/CQ
                         // machinery, no API churn.
-                        let ctl_addr = autumn_transport::format_listen_addr(
-                            &bind_host,
-                            control_listen_port,
-                        )
-                        .context("parse control listen address")?;
+                        let ctl_addr =
+                            autumn_transport::format_listen_addr(&bind_host, control_listen_port)
+                                .context("parse control listen address")?;
 
                         // only shard 0 runs the manager cross-check;
                         // it's the same check for every shard, so doing it

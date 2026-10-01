@@ -1,26 +1,26 @@
 pub mod audit;
 pub mod authz;
 pub mod ec_abandon;
+mod extent_corrupt;
 mod extent_delete;
 pub mod extent_inflight;
-mod inflight_commit;
-mod extent_corrupt;
-mod op_log;
-mod placement;
-mod ps_placement;
 mod extent_layout;
-mod persist;
-pub(crate) mod store;
 mod fs_alloc;
+mod inflight_commit;
 pub mod inode_lease;
 pub mod node_state;
+mod op_log;
+mod persist;
+mod placement;
 pub mod policy;
 #[cfg(test)]
 mod policy_tests;
+mod ps_placement;
 mod recovery;
 mod recovery_attempt;
 pub mod recovery_rate_limiter;
 mod rpc_handlers;
+pub(crate) mod store;
 /// Test-only merge-freeze failpoint (always 0 in production); see its doc in
 /// `rpc_handlers`. Re-exported so integration tests can arm it.
 #[doc(hidden)]
@@ -78,18 +78,18 @@ use std::rc::Rc;
 use std::str;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::persist::records::ExtentRecord;
+use crate::persist::records::NodeRecord;
+use crate::persist::records::PartitionRecord;
+use crate::persist::records::RegionRecord;
+use crate::persist::records::StreamRecord;
+use crate::store::MetadataStore;
 use anyhow::Result;
 use autumn_common::AppError;
-use crate::store::MetadataStore;
 use autumn_rpc::extent_rpc::PayloadLocation;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::StatusCode;
 use bytes::Bytes;
-use crate::persist::records::NodeRecord;
-use crate::persist::records::StreamRecord;
-use crate::persist::records::PartitionRecord;
-use crate::persist::records::RegionRecord;
-use crate::persist::records::ExtentRecord;
 
 // ── EtcdMirror ─────────────────────────────────────────────────────────────
 
@@ -113,10 +113,6 @@ pub const DECOMMISSIONED_PREFIX: &str = "decommissioned/";
 /// by `MSG_GET_CLUSTER_ID` so `autumn-op format` can stamp each
 /// formatted disk and `autumn-extent-node` can verify on startup.
 pub const CLUSTER_ID_KEY: &str = "autumn-rs/cluster_id";
-/// R1 rolling upgrade: persisted cluster_version. Value is ASCII decimal
-/// (e.g. b"3") — deliberately NOT rkyv, so it stays readable across every
-/// future serialization era (it gates exactly those transitions).
-pub const CLUSTER_VERSION_KEY: &str = "autumn-rs/cluster_version";
 
 /// Writer-lease etcd prefix. One key per inode that
 /// currently has a writer (reader leases are NOT persisted — they're
@@ -440,11 +436,7 @@ impl EtcdMirror {
     /// if a concurrent change beat us (caller should NOT treat
     /// this as an error — in-memory state is still authoritative).
     /// `Err` for genuine etcd / network / not-leader failures.
-    async fn read_then_cas_put(
-        &self,
-        key: &str,
-        new_value: Vec<u8>,
-    ) -> Result<bool, AppError> {
+    async fn read_then_cas_put(&self, key: &str, new_value: Vec<u8>) -> Result<bool, AppError> {
         // Read the current record. If absent, the record was deleted
         // (release happened) — skip the put.
         let resp = self
@@ -568,9 +560,12 @@ impl ConnPool {
         // firewalled peer would wedge the calling background loop forever
         // despite call_timeout. Default 5 s, env AUTUMN_MGR_CONNECT_TIMEOUT_MS.
         let connect_to = connect_timeout();
-        let client = compio::time::timeout(connect_to, autumn_rpc::client::RpcClient::connect(addr))
-            .await
-            .map_err(|_| anyhow::anyhow!("connect to {addr} timed out after {connect_to:?}"))??;
+        let client =
+            compio::time::timeout(connect_to, autumn_rpc::client::RpcClient::connect(addr))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!("connect to {addr} timed out after {connect_to:?}")
+                })??;
         self.conns.borrow_mut().insert(addr, client.clone());
         Ok(client)
     }
@@ -994,16 +989,6 @@ pub struct AutumnManager {
     /// `Self::new()` so dev/test workflows still work end-to-end. Read
     /// by `handle_get_cluster_id`.
     pub(crate) cluster_id: Rc<RefCell<String>>,
-    /// R1 rolling upgrade: persisted cluster_version (etcd
-    /// `autumn-rs/cluster_version`, ASCII decimal). The operator-bumped
-    /// operator-driven feature gate — new wire
-    /// forms / persisted formats versioned N may only be EMITTED once
-    /// this reaches N. CAS-seeded to the first leader's
-    /// `WIRE_VERSION` by `imprint_cluster_version`; bumped only via
-    /// `MSG_BUMP_CLUSTER_VERSION` (monotonic, exactly +1, capped at this
-    /// binary's own WIRE_VERSION). Memory-only mode starts at this
-    /// binary's WIRE_VERSION.
-    pub(crate) cluster_version: Rc<Cell<u32>>,
     /// Inode-level lease registry shared between the
     /// AcquireLease / ReleaseLease / HeartbeatLease / PollInvalidations
     /// handlers and the `inode_lease_revoke_loop` background task.
@@ -1136,13 +1121,10 @@ impl AutumnManager {
             // R1: memory-only mode runs at this binary's max wire
             // version. Overwritten by `try_become_leader` /
             // `replay_from_etcd` when etcd is configured.
-            cluster_version: Rc::new(Cell::new(autumn_rpc::WIRE_VERSION)),
             // Empty registry; populated on
             // AcquireLease and on `replay_from_etcd`.
             inode_leases: Rc::new(RefCell::new(crate::inode_lease::LeaseRegistry::with_ttl(
-                std::time::Duration::from_secs(
-                    crate::inode_lease::DEFAULT_LEASE_TTL_SECS as u64,
-                ),
+                std::time::Duration::from_secs(crate::inode_lease::DEFAULT_LEASE_TTL_SECS as u64),
             ))),
             // authz OFF unless the binary loads a signing-key file.
             authz_keyring: Rc::new(RefCell::new(None)),
@@ -1782,7 +1764,9 @@ impl AutumnManager {
                         AppError::InvalidArgument("upsert requires an entry".to_string())
                     })?;
                     if e.name.is_empty() {
-                        return Err(AppError::InvalidArgument("policy name required".to_string()));
+                        return Err(AppError::InvalidArgument(
+                            "policy name required".to_string(),
+                        ));
                     }
                     if crate::auto_policy::is_preset_name(&e.name) {
                         return Err(AppError::InvalidArgument(format!(
@@ -2287,13 +2271,8 @@ impl AutumnManager {
                     _ => (MAINTENANCE_FORCE_GC, spec.extent_ids.clone()),
                 };
                 let gc_debt_high = self.policy.borrow().config.gc_debt_high;
-                let req = maintenance_req_for_submitted_op(
-                    spec,
-                    op,
-                    extent_ids,
-                    op_id,
-                    gc_debt_high,
-                );
+                let req =
+                    maintenance_req_for_submitted_op(spec, op, extent_ids, op_id, gc_debt_high);
                 match self.send_maintenance(req, state).await {
                     Ok(resp) if resp.code == autumn_rpc::partition_rpc::CODE_OK => {
                         ActuationResult::Dispatched {
@@ -2694,20 +2673,6 @@ impl AutumnManager {
             tracing::warn!(error = %err, "imprint_cluster_id failed");
         }
 
-        // R1: ensure cluster_version exists in etcd (same CAS-imprint
-        // pattern as cluster_id above). Best-effort is SAFE here (coco
-        // P2 considered): (a) no code gates on cluster_version yet (R1
-        // is plumbing; first consumer arrives with the first V2 form),
-        // (b) a bump against a missing key CAS-fails → refused, so the
-        // gate can never advance unpersisted, (c) every election retry
-        // re-imprints. Revisit fail-closed when the first gate consumer
-        // lands. NOTE: an out-of-bound persisted value does NOT take
-        // this lenient path — replay_from_etcd already hard-failed on
-        // it before we got here (rollback safety).
-        if let Err(err) = self.imprint_cluster_version().await {
-            tracing::warn!(error = %err, "R1: imprint_cluster_version failed");
-        }
-
         // D2: CAS-preregister the built-in namespace families
         // (`fs`/`kvc`/`mem`). Same best-effort posture as imprint_cluster_id:
         // a failure logs WARN and the next election retry re-seeds. Idempotent
@@ -2793,86 +2758,6 @@ impl AutumnManager {
         }
     }
 
-    /// R1: parse an etcd cluster_version value (ASCII decimal) and
-    /// enforce the rollback-safety bound (coco P1): a persisted value
-    /// ABOVE this binary's WIRE_VERSION means the cluster was bumped
-    /// past what this binary speaks — i.e. an old binary was rolled back
-    /// AFTER the bump, exactly the "a bump can never roll back" rule from design
-    /// §3-R1. Fail closed: the error propagates out of replay /
-    /// imprint, so this manager refuses to install the state (and a
-    /// replay failure prevents it from becoming leader) instead of
-    /// silently serving — or persisting — formats it cannot understand.
-    /// This single helper is the only decode point (imprint, CAS-lost
-    /// re-reads, replay, bump heal all route through it).
-    fn parse_cluster_version(raw: &[u8]) -> Result<u32, AppError> {
-        let v = str::from_utf8(raw)
-            .map_err(|e| AppError::Internal(format!("cluster_version utf8: {e}")))?
-            .trim()
-            .parse::<u32>()
-            .map_err(|e| AppError::Internal(format!("cluster_version parse: {e}")))?;
-        if v > autumn_rpc::WIRE_VERSION {
-            return Err(AppError::Precondition(format!(
-                "persisted cluster_version {v} exceeds this binary's WIRE_VERSION={} — \
-this binary is OLDER than the cluster's committed format level (rollback past a \
-cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
-                autumn_rpc::WIRE_VERSION
-            )));
-        }
-        Ok(v)
-    }
-
-    /// R1: CAS-imprint the cluster_version key in etcd. Same shape as
-    /// `imprint_cluster_id`: first leader ever seeds it to its own
-    /// `WIRE_VERSION` (a fresh cluster runs at the version it was
-    /// born with — there is nothing older to be compatible with);
-    /// subsequent leaders read the existing value. Memory-only mode
-    /// keeps the `Self::new()` seed.
-    async fn imprint_cluster_version(&self) -> Result<(), AppError> {
-        let etcd = match &self.etcd {
-            Some(v) => v,
-            None => return Ok(()),
-        };
-
-        let existing = etcd
-            .client
-            .get(CLUSTER_VERSION_KEY.as_bytes())
-            .await
-            .map_err(|e| AppError::Internal(format!("get cluster_version: {e}")))?;
-        if let Some(kv) = existing.kvs.first() {
-            self.cluster_version.set(Self::parse_cluster_version(&kv.value)?);
-            return Ok(());
-        }
-
-        let fresh = autumn_rpc::WIRE_VERSION;
-        let cmp = autumn_etcd::Cmp::create_revision(CLUSTER_VERSION_KEY.as_bytes(), 0);
-        let put = autumn_etcd::Op::put(
-            CLUSTER_VERSION_KEY.as_bytes(),
-            fresh.to_string().into_bytes(),
-        );
-        match etcd.txn_fenced(vec![cmp], vec![put], vec![]).await? {
-            true => {
-                self.cluster_version.set(fresh);
-                tracing::info!(cluster_version = fresh, "R1: imprinted fresh cluster_version");
-                Ok(())
-            }
-            false => {
-                let resp = etcd
-                    .client
-                    .get(CLUSTER_VERSION_KEY.as_bytes())
-                    .await
-                    .map_err(|e| AppError::Internal(format!("re-get cluster_version: {e}")))?;
-                if let Some(kv) = resp.kvs.first() {
-                    self.cluster_version.set(Self::parse_cluster_version(&kv.value)?);
-                    Ok(())
-                } else {
-                    Err(AppError::Internal(
-                        "cluster_version CAS lost but key absent on re-read".into(),
-                    ))
-                }
-            }
-        }
-    }
-
     /// D2: CAS-preregister the built-in namespace families
     /// (`fs`/`kvc`/`mem`). Runs on every leader promotion (after replay), same
     /// idempotent best-effort shape as `imprint_cluster_id`: a family already in
@@ -2918,11 +2803,10 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
                 }
                 false => {
                     // CAS lost — re-read whoever wrote first and install it.
-                    let resp = etcd
-                        .client
-                        .get(key.as_bytes())
-                        .await
-                        .map_err(|e| AppError::Internal(format!("re-get namespace/{name}: {e}")))?;
+                    let resp =
+                        etcd.client.get(key.as_bytes()).await.map_err(|e| {
+                            AppError::Internal(format!("re-get namespace/{name}: {e}"))
+                        })?;
                     if let Some(kv) = resp.kvs.first() {
                         let existing: persist::records::NamespaceRecord =
                             persist::decode(&key, &kv.value).map_err(AppError::Internal)?;
@@ -2934,67 +2818,6 @@ cluster_version bump is unsupported); deploy a binary with wire version >= {v}",
             }
         }
         Ok(())
-    }
-
-    /// R1: validate + persist a cluster_version bump. Refusal reasons are
-    /// returned as `Precondition` with an operator-actionable message.
-    /// The etcd write is a value-CAS against the CURRENT version so two
-    /// racing bumps can't both land (the loser sees the txn fail and
-    /// re-reads).
-    ///
-    /// The latch is ONE-WAY, not one-STEP: any forward target within this
-    /// binary's WIRE_VERSION is accepted, so an operator catching up several
-    /// versions runs one command instead of a loop of cur+1 calls. Downward
-    /// and equal are refused — the latch exists to say "new formats are now
-    /// on disk", and old binaries must never come back past it.
-    pub(crate) async fn bump_cluster_version(&self, to: u32) -> Result<u32, AppError> {
-        self.ensure_leader()?;
-        let cur = self.cluster_version.get();
-        if to <= cur {
-            return Err(AppError::Precondition(format!(
-                "cluster_version is a one-way latch and never moves back or stands still: \
-                 current={cur}, requested={to}"
-            )));
-        }
-        if to > autumn_rpc::WIRE_VERSION {
-            return Err(AppError::Precondition(format!(
-                "cluster_version {to} exceeds this manager's WIRE_VERSION={} — upgrade \
-the manager binaries first (design §6: bump comes AFTER all members run the new binary)",
-                autumn_rpc::WIRE_VERSION
-            )));
-        }
-        if let Some(etcd) = &self.etcd {
-            let cmp = autumn_etcd::Cmp::value(
-                CLUSTER_VERSION_KEY.as_bytes(),
-                cur.to_string().into_bytes(),
-            );
-            let put = autumn_etcd::Op::put(
-                CLUSTER_VERSION_KEY.as_bytes(),
-                to.to_string().into_bytes(),
-            );
-            match etcd.txn_fenced(vec![cmp], vec![put], vec![]).await? {
-                true => {}
-                false => {
-                    // CAS lost: another bump (or an operator etcdctl write)
-                    // moved the value. Re-read so our in-memory view heals,
-                    // then refuse — the caller re-runs against fresh state.
-                    if let Ok(resp) = etcd.client.get(CLUSTER_VERSION_KEY.as_bytes()).await {
-                        if let Some(kv) = resp.kvs.first() {
-                            if let Ok(v) = Self::parse_cluster_version(&kv.value) {
-                                self.cluster_version.set(v);
-                            }
-                        }
-                    }
-                    return Err(AppError::Precondition(format!(
-                        "cluster_version changed concurrently (now {}); re-check and retry",
-                        self.cluster_version.get()
-                    )));
-                }
-            }
-        }
-        self.cluster_version.set(to);
-        tracing::info!(cluster_version = to, "R1: cluster_version bumped");
-        Ok(to)
     }
 
     async fn leader_keepalive_loop(self, lease_id: i64) {
@@ -3069,7 +2892,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
     where
         T: crate::persist::PersistRecord + rkyv::Archive,
         T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
-            + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+            + for<'a> rkyv::bytecheck::CheckBytes<
+                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+            >,
     {
         let mut out = HashMap::new();
         for kv in kvs {
@@ -3165,8 +2990,6 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let decommissioned_raw = c.get_prefix(DECOMMISSIONED_PREFIX).await?;
         // cluster identity (single key, not a prefix).
         let cluster_id_kv = c.get(CLUSTER_ID_KEY.as_bytes()).await?;
-        // R1: persisted cluster_version (single key, ASCII decimal).
-        let cluster_version_kv = c.get(CLUSTER_VERSION_KEY.as_bytes()).await?;
         // Persisted writer leases.
         let inode_leases_raw = c.get_prefix(INODE_LEASES_PREFIX).await?;
         // persisted tenant account DB.
@@ -3220,11 +3043,9 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         let mut decoded_regions = BTreeMap::new();
         for kv in &regions.kvs {
             let id = Self::parse_id_from_key("regions/", &kv.key)?;
-            let region: RegionRecord = crate::persist::decode(
-                &String::from_utf8_lossy(&kv.key),
-                &kv.value,
-            )
-            .map_err(Self::replay_decode_err)?;
+            let region: RegionRecord =
+                crate::persist::decode(&String::from_utf8_lossy(&kv.key), &kv.value)
+                    .map_err(Self::replay_decode_err)?;
             decoded_regions.insert(id, region);
         }
 
@@ -3480,12 +3301,6 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
                 .to_string();
             *self.cluster_id.borrow_mut() = id;
         }
-        // R1: install cluster_version. Absent on a pre-R1 / brand-new
-        // cluster — `try_become_leader` imprints it right after replay.
-        if let Some(kv) = cluster_version_kv.kvs.first() {
-            self.cluster_version
-                .set(Self::parse_cluster_version(&kv.value).map_err(|e| anyhow::anyhow!("{e}"))?);
-        }
         // M2: rehydrate the auto-policy controller config +
         // cooldowns so the active policy + mode + custom policies survive leader
         // failover (the crash-safety win over the killable Python webserver).
@@ -3652,9 +3467,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .node_overrides
             .borrow()
             .iter()
-            .filter(|(_, o)| {
-                o.kind == NODE_OVERRIDE_FENCED || o.kind == NODE_OVERRIDE_MAINTENANCE
-            })
+            .filter(|(_, o)| o.kind == NODE_OVERRIDE_FENCED || o.kind == NODE_OVERRIDE_MAINTENANCE)
             .map(|(id, _)| *id)
             .collect();
         set.extend(self.node_states.borrow().suspected_node_ids());
@@ -3983,9 +3796,19 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         use autumn_common::metrics_http::{push_metric, push_type};
         let mut out = String::with_capacity(1024);
         push_type(&mut out, "autumn_manager_leader", "gauge");
-        push_metric(&mut out, "autumn_manager_leader", &[], self.leader.get() as u32);
+        push_metric(
+            &mut out,
+            "autumn_manager_leader",
+            &[],
+            self.leader.get() as u32,
+        );
         push_type(&mut out, "autumn_manager_serving", "gauge");
-        push_metric(&mut out, "autumn_manager_serving", &[], self.serving.get() as u32);
+        push_metric(
+            &mut out,
+            "autumn_manager_serving",
+            &[],
+            self.serving.get() as u32,
+        );
         {
             let s = self.store.inner.borrow();
             for (name, v) in [
@@ -4213,9 +4036,7 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
             .get(&part.part_id)
             .filter(|r| state.ps_nodes.contains_key(&r.ps_id))
             .map(|r| r.ps_id)
-            .or_else(|| {
-                crate::ps_placement::pick_home(state, &crate::ps_placement::loads(state))
-            })
+            .or_else(|| crate::ps_placement::pick_home(state, &crate::ps_placement::loads(state)))
             .unwrap_or(0);
         let region_epoch = Self::next_region_epoch(state, part.part_id, &part.rg);
         RegionRecord {
@@ -4975,9 +4796,17 @@ the manager binaries first (design §6: bump comes AFTER all members run the new
         if let Some(etcd) = &self.etcd {
             let mut kvs = vec![Self::persist_kv_entry("streams", stream.stream_id, stream)];
             if let Some(sealed_old) = sealed_old {
-                kvs.push(Self::persist_kv_entry("extents", sealed_old.extent_id, sealed_old));
+                kvs.push(Self::persist_kv_entry(
+                    "extents",
+                    sealed_old.extent_id,
+                    sealed_old,
+                ));
             }
-            kvs.push(Self::persist_kv_entry("extents", new_extent.extent_id, new_extent));
+            kvs.push(Self::persist_kv_entry(
+                "extents",
+                new_extent.extent_id,
+                new_extent,
+            ));
             let cas: Vec<(String, Vec<u8>)> = stream_cas
                 .map(|v| (format!("streams/{}", stream.stream_id), v))
                 .into_iter()
@@ -5060,8 +4889,19 @@ mod tests {
     // ── pure namespace-validation helpers ──────────────────────────────
     #[test]
     fn validate_namespace_name_accepts_valid_segments() {
-        for ok in ["bench", "a", "kv-cache", "app.v2", "under_score", "0", "a1._-"] {
-            assert!(validate_namespace_name(ok).is_ok(), "'{ok}' should be valid");
+        for ok in [
+            "bench",
+            "a",
+            "kv-cache",
+            "app.v2",
+            "under_score",
+            "0",
+            "a1._-",
+        ] {
+            assert!(
+                validate_namespace_name(ok).is_ok(),
+                "'{ok}' should be valid"
+            );
         }
     }
 
@@ -5663,7 +5503,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        let req = rkyv_encode(&ReportPartitionLoadReq { ps_id: 1, partitions: vec![load] });
+        let req = rkyv_encode(&ReportPartitionLoadReq {
+            ps_id: 1,
+            partitions: vec![load],
+        });
         run(async { m.handle_report_partition_load(req).await.unwrap() });
         // The ledger entry is now terminal with the surfaced error string.
         let q: OpQueryResp = rkyv_decode(&run(async {
@@ -5870,12 +5713,28 @@ mod tests {
     fn en_dynshard_uuid_match_survives_address_change() {
         run(async {
             let m = AutumnManager::new();
-            let r1 = reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101], "10.0.0.1:9100").await;
+            let r1 = reg_node(
+                &m,
+                "uuid-A",
+                "10.0.0.1:9101",
+                "disk-A",
+                &[9101],
+                "10.0.0.1:9100",
+            )
+            .await;
             assert_eq!(r1.code, CODE_OK);
             let nid = r1.node_id;
 
             // SAME uuid, DIFFERENT address + shard ports (pod rescheduled).
-            let r2 = reg_node(&m, "uuid-A", "10.0.0.2:9111", "disk-A", &[9111], "10.0.0.2:9110").await;
+            let r2 = reg_node(
+                &m,
+                "uuid-A",
+                "10.0.0.2:9111",
+                "disk-A",
+                &[9111],
+                "10.0.0.2:9110",
+            )
+            .await;
             assert_eq!(r2.code, CODE_OK);
             assert_eq!(
                 r2.node_id, nid,
@@ -5921,9 +5780,15 @@ mod tests {
     fn en_dynshard_identity_only_reregister_preserves_location() {
         run(async {
             let m = AutumnManager::new();
-            let r1 =
-                reg_node(&m, "uuid-A", "10.0.0.1:9101", "disk-A", &[9101, 9102], "10.0.0.1:10101")
-                    .await;
+            let r1 = reg_node(
+                &m,
+                "uuid-A",
+                "10.0.0.1:9101",
+                "disk-A",
+                &[9101, 9102],
+                "10.0.0.1:10101",
+            )
+            .await;
             let nid = r1.node_id;
 
             // uuid + empty addr + empty ports + empty ctrl.
@@ -6169,13 +6034,21 @@ mod tests {
 
             // PS 20 now reports 4 slots on its heartbeat: it has 3 free, PS 10
             // none, so the next partition goes to PS 20.
-            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 20, slot_cap: 4, open_parts: Vec::new() });
+            let req = rkyv_encode(&HeartbeatPsReq {
+                ps_id: 20,
+                slot_cap: 4,
+                open_parts: Vec::new(),
+            });
             m.handle_heartbeat_ps(req).await.unwrap();
             m.handle_upsert_partition(upsert(5, b"z", b"")).await.unwrap();
             assert_eq!(count_on(20), 2);
 
             // A heartbeat from an unregistered PS records nothing.
-            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 99, slot_cap: 8, open_parts: Vec::new() });
+            let req = rkyv_encode(&HeartbeatPsReq {
+                ps_id: 99,
+                slot_cap: 8,
+                open_parts: Vec::new(),
+            });
             m.handle_heartbeat_ps(req).await.unwrap();
             assert!(!m.store.inner.borrow().ps_slot_caps.contains_key(&99));
 
@@ -6225,7 +6098,11 @@ mod tests {
             m.handle_register_ps(register(20)).await.unwrap();
             let epoch = |part_id: u64| m.store.inner.borrow().regions[&part_id].region_epoch;
             let beat = |ps_id: u64, open_parts: Vec<(u64, u64)>| {
-                rkyv_encode(&HeartbeatPsReq { ps_id, slot_cap: 0, open_parts })
+                rkyv_encode(&HeartbeatPsReq {
+                    ps_id,
+                    slot_cap: 0,
+                    open_parts,
+                })
             };
             let m = &m;
             let ps = |ps_id: u64| async move {
@@ -6328,7 +6205,11 @@ mod tests {
 
             compio::time::sleep(Duration::from_millis(10)).await;
 
-            let req = rkyv_encode(&HeartbeatPsReq { ps_id: 55, slot_cap: 0, open_parts: Vec::new() });
+            let req = rkyv_encode(&HeartbeatPsReq {
+                ps_id: 55,
+                slot_cap: 0,
+                open_parts: Vec::new(),
+            });
             m.handle_heartbeat_ps(req).await.unwrap();
 
             let hb = m.ps_last_heartbeat.borrow();
@@ -7793,9 +7674,13 @@ mod tests {
                 // The dispatch that opened the entry, exactly as the dispatch
                 // loop opens it.
                 let (now_s, now_ms) = AutumnManager::now_s_ms();
-                m.ops
-                    .borrow_mut()
-                    .note_recovery_dispatch(extent_id, 0, task.node_id, now_s, now_ms);
+                m.ops.borrow_mut().note_recovery_dispatch(
+                    extent_id,
+                    0,
+                    task.node_id,
+                    now_s,
+                    now_ms,
+                );
 
                 let got = m
                     .apply_recovery_done(RecoveryTaskDone {
@@ -8625,9 +8510,17 @@ mod tests {
         const ITERS: usize = 1000;
         let mut counts: HashMap<u64, usize> = HashMap::new();
         for _ in 0..ITERS {
-            let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), &HashSet::new(), &HashMap::new(), 3, &[])
-                    .unwrap();
+            let picked = AutumnManager::select_nodes(
+                &nodes,
+                &disks,
+                &online_node_ids,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+                3,
+                &[],
+            )
+            .unwrap();
             assert_eq!(picked.len(), 3);
             let mut ids: Vec<u64> = picked.iter().map(|n| n.node_id).collect();
             ids.sort();
@@ -8676,9 +8569,17 @@ mod tests {
         let online_node_ids: HashSet<u64> = nodes.keys().copied().collect();
         let mut first_node_seen: HashSet<u64> = HashSet::new();
         for _ in 0..200 {
-            let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online_node_ids, &HashSet::new(), &HashSet::new(), &HashMap::new(), 1, &[])
-                    .unwrap();
+            let picked = AutumnManager::select_nodes(
+                &nodes,
+                &disks,
+                &online_node_ids,
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+                1,
+                &[],
+            )
+            .unwrap();
             first_node_seen.insert(picked[0].node_id);
         }
         assert!(
@@ -8722,8 +8623,17 @@ mod tests {
         // node 7 must NEVER be picked.
         let low: HashSet<u64> = [7u64].into_iter().collect();
         for _ in 0..200 {
-            let picked =
-                AutumnManager::select_nodes(&nodes, &disks, &online, &low, &HashSet::new(), &HashMap::new(), 3, &[]).unwrap();
+            let picked = AutumnManager::select_nodes(
+                &nodes,
+                &disks,
+                &online,
+                &low,
+                &HashSet::new(),
+                &HashMap::new(),
+                3,
+                &[],
+            )
+            .unwrap();
             assert!(
                 picked.iter().all(|n| n.node_id != 7),
                 "space-low node 7 picked despite 3 spacious candidates"
@@ -8734,8 +8644,17 @@ mod tests {
         // fallback widens to all healthy nodes (allocation must proceed
         // on a capacity-crunched cluster, not refuse).
         let low2: HashSet<u64> = [5u64, 7].into_iter().collect();
-        let picked =
-            AutumnManager::select_nodes(&nodes, &disks, &online, &low2, &HashSet::new(), &HashMap::new(), 3, &[]).unwrap();
+        let picked = AutumnManager::select_nodes(
+            &nodes,
+            &disks,
+            &online,
+            &low2,
+            &HashSet::new(),
+            &HashMap::new(),
+            3,
+            &[],
+        )
+        .unwrap();
         assert_eq!(picked.len(), 3);
     }
 
@@ -8759,13 +8678,23 @@ mod tests {
                 "precondition: three failures must put the slot in backoff"
             );
 
-            m.record_dispatch_outcome(eid, slot, now, &Ok(crate::recovery::DispatchOutcome::Deferred));
+            m.record_dispatch_outcome(
+                eid,
+                slot,
+                now,
+                &Ok(crate::recovery::DispatchOutcome::Deferred),
+            );
             assert!(
                 m.recovery_limiter.borrow().in_backoff(eid, slot, now),
                 "a rate-limited deferral says nothing about this slot — backoff must survive"
             );
 
-            m.record_dispatch_outcome(eid, slot, now, &Ok(crate::recovery::DispatchOutcome::Dispatched));
+            m.record_dispatch_outcome(
+                eid,
+                slot,
+                now,
+                &Ok(crate::recovery::DispatchOutcome::Dispatched),
+            );
             assert!(
                 !m.recovery_limiter.borrow().in_backoff(eid, slot, now),
                 "an actual dispatch does clear the backoff"
@@ -9841,69 +9770,6 @@ mod tests {
         assert_eq!(decoded.owner_epoch, original.owner_epoch);
     }
 
-    /// R1: cluster_version bump validation (memory-mode — etcd CAS is
-    /// exercised by the live cluster smoke; this pins the refusal rules).
-    #[test]
-    fn r1_bump_cluster_version_validation() {
-        let m = AutumnManager::new();
-        // Memory mode seeds cluster_version = WIRE_VERSION.
-        assert_eq!(m.cluster_version.get(), autumn_rpc::WIRE_VERSION);
-        run(async {
-            // +1 beyond this binary's max → refused (nothing to upgrade to).
-            let err = m
-                .bump_cluster_version(autumn_rpc::WIRE_VERSION + 1)
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("WIRE_VERSION"), "{err}");
-
-            // Simulate a cluster running several versions behind this binary
-            // (the post-rolling-upgrade state where a bump is legal).
-            m.cluster_version.set(autumn_rpc::WIRE_VERSION - 3);
-            // Same and backwards are refused: the latch is one-WAY, not
-            // one-STEP — a forward jump is the point.
-            for bad in [autumn_rpc::WIRE_VERSION - 3, autumn_rpc::WIRE_VERSION - 5] {
-                let err = m.bump_cluster_version(bad).await.unwrap_err();
-                assert!(err.to_string().contains("one-way latch"), "{err}");
-            }
-            // A forward jump straight to this binary's max succeeds — no
-            // cur+1 loop required.
-            let v = m
-                .bump_cluster_version(autumn_rpc::WIRE_VERSION)
-                .await
-                .unwrap();
-            assert_eq!(v, autumn_rpc::WIRE_VERSION);
-            assert_eq!(m.cluster_version.get(), autumn_rpc::WIRE_VERSION);
-
-            // Non-leader refuses before any validation.
-            m.cluster_version.set(autumn_rpc::WIRE_VERSION - 1);
-            m.leader.set(false);
-            assert!(m
-                .bump_cluster_version(autumn_rpc::WIRE_VERSION)
-                .await
-                .is_err());
-            m.leader.set(true);
-        });
-    }
-
-    /// R1 (coco P1): a persisted cluster_version ABOVE this binary's
-    /// WIRE_VERSION is the rolled-back-past-a-bump case — every
-    /// decode point (replay / imprint / CAS-lost re-reads) must refuse.
-    #[test]
-    fn r1_parse_cluster_version_rejects_rollback_and_garbage() {
-        let max = autumn_rpc::WIRE_VERSION;
-        assert_eq!(
-            AutumnManager::parse_cluster_version(max.to_string().as_bytes()).unwrap(),
-            max
-        );
-        assert_eq!(AutumnManager::parse_cluster_version(b"1").unwrap(), 1);
-        let err =
-            AutumnManager::parse_cluster_version((max + 1).to_string().as_bytes()).unwrap_err();
-        assert!(err.to_string().contains("rollback"), "{err}");
-        assert!(AutumnManager::parse_cluster_version(b"").is_err());
-        assert!(AutumnManager::parse_cluster_version(b"not-a-number").is_err());
-        assert!(AutumnManager::parse_cluster_version(b"-1").is_err());
-    }
-
     /// the unified inflight ledger (the
     /// successor to `pending_ec_dispatch`) starts empty; acquire +
     /// commit_release round-trip ConvertToEc payloads correctly.
@@ -10024,16 +9890,14 @@ mod tests {
             m.store.inner.borrow_mut().extents.insert(extent_id, pre);
             m.acquire_extent_inflight(
                 extent_id,
-                crate::extent_inflight::ExtentOpPayload::ConvertToEc(
-                    MgrEcDispatchInflight {
-                        extent_id,
-                        target_nodes: vec![1, 3, 5, 7],
-                        extra_disk_ids: vec![70],
-                        data_shards: 3,
-                        new_eversion: 4,
-                        owner_epoch: 0,
-                    },
-                ),
+                crate::extent_inflight::ExtentOpPayload::ConvertToEc(MgrEcDispatchInflight {
+                    extent_id,
+                    target_nodes: vec![1, 3, 5, 7],
+                    extra_disk_ids: vec![70],
+                    data_shards: 3,
+                    new_eversion: 4,
+                    owner_epoch: 0,
+                }),
             )
             .await
             .expect("acquire EC marker");

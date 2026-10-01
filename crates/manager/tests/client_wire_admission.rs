@@ -1,206 +1,91 @@
-//! The MANAGER decides admission, over a real socket, through the real decode
-//! loop.
-//!
-//! The predicates have unit tests in `autumn-rpc`. What those cannot show is
-//! that the connection loop reaches them, that the per-connection value
-//! survives from the hello to the next frame, and that the msg_type scoping
-//! really does leave internal peer traffic alone — the three things that are
-//! the difference between this mechanism working and it being dead code with
-//! green tests beside it.
-//!
-//! The window is OPEN (`[43, 44]`), so a client can be admitted while reporting
-//! a version the cluster does not itself speak — which is the whole point — and
-//! a connection whose reported version falls OUTSIDE it must still be refused
-//! BY THE SERVER, not by the client's own courtesy check.
-
+//! Admission through the real manager connection loop, before any business DTO.
 mod support;
-
-use autumn_rpc::client::RpcClient;
-use autumn_rpc::client_hello::{
-    admit_client, encode_hello_req, parse_hello_resp, MSG_CLIENT_HELLO,
-};
-use autumn_rpc::manager_rpc::{
-    rkyv_decode, rkyv_encode, ClusterDfReq, GetClusterIdReq, GetClusterIdResp, MSG_CLUSTER_DF,
-    MSG_GET_CLIENT_REGIONS, MSG_GET_CLUSTER_ID, MSG_GET_REGIONS,
-};
-use autumn_rpc::{RpcError, StatusCode, WIRE_VERSION};
+use autumn_rpc::protocol_hello::{self, Hello, Role, Service};
+use autumn_rpc::manager_rpc::*;
+use autumn_rpc::{Frame, FrameDecoder, RpcError, StatusCode, WIRE_VERSION, MIN_CLIENT_WIRE_VERSION};
+use autumn_transport::{Conn, ReadHalf, WriteHalf};
 use bytes::Bytes;
+use compio::io::{AsyncRead, AsyncWriteExt};
+use std::net::SocketAddr;
 use support::{pick_stable_port_pair, start_manager};
 
-fn hello(version: u32) -> Bytes {
-    Bytes::copy_from_slice(&encode_hello_req(version))
+async fn open(addr: SocketAddr, hello: Hello) -> Result<(ReadHalf, WriteHalf), RpcError> {
+    let socket = compio::net::TcpStream::connect(addr).await?;
+    let (mut rd, mut wr) = Conn::Tcp(socket).into_split();
+    protocol_hello::initiate(&mut rd, &mut wr, hello, Some(Service::Manager)).await?;
+    Ok((rd, wr))
 }
-
-/// The status of a refusal, or `None` when the call succeeded.
-fn status(r: &Result<Bytes, RpcError>) -> Option<(StatusCode, String)> {
-    match r {
-        Ok(_) => None,
-        Err(RpcError::Status { code, message }) => Some((*code, message.clone())),
-        Err(e) => panic!("expected a status frame, got {e}"),
+async fn receive(rd: &mut ReadHalf) -> Frame {
+    let mut decoder = FrameDecoder::new();
+    loop {
+        let compio::BufResult(n, buf) = rd.read(vec![0; 4096]).await;
+        let n = n.unwrap(); assert_ne!(n, 0);
+        decoder.feed(&buf[..n]);
+        if let Some(frame) = decoder.try_decode().unwrap() { return frame; }
     }
 }
-
-#[test]
-fn the_manager_admits_clients_by_their_reported_wire_version() {
-    let port = pick_stable_port_pair();
-    let mgr_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        // (1) A client AT this version is admitted, and learns what the
-        //     cluster speaks.
-        let c = RpcClient::connect(mgr_addr).await.expect("connect");
-        let resp = c
-            .call(MSG_CLIENT_HELLO, hello(WIRE_VERSION))
-            .await
-            .expect("an in-window hello must be admitted");
-        let (server_wire, min_client) =
-            parse_hello_resp(&resp).expect("the reply is a hello response");
-        assert_eq!(server_wire, WIRE_VERSION);
-        assert!(
-            admit_client(min_client).is_ok(),
-            "the floor the cluster reports must itself be inside its window"
-        );
-        // …and a client-surface call on that connection goes through.
-        assert!(
-            c.call(MSG_CLUSTER_DF, rkyv_encode(&ClusterDfReq {}))
-                .await
-                .is_ok(),
-            "an admitted client must be served"
-        );
-
-        // (2) A client one version AHEAD. Images are built from `main`, so a
-        //     wheel running ahead of an un-upgraded cluster is the routine
-        //     case, not an exotic one — and the refusal has to say so, because
-        //     the fix is to deploy rather than to rebuild.
-        let c = RpcClient::connect(mgr_addr).await.expect("connect");
-        let r = c.call(MSG_CLIENT_HELLO, hello(WIRE_VERSION + 1)).await;
-        let (code, msg) = status(&r).expect("a client above the ceiling must be refused");
-        assert_eq!(code, StatusCode::FailedPrecondition, "{msg}");
-        assert!(msg.contains("NEWER"), "{msg}");
-
-        // (3) The verdict STICKS for the rest of that connection. This is the
-        //     acceptance's second half: the gate is the SERVER's, so a client
-        //     that ignores the refusal and issues a real request meets the same
-        //     answer — it is not a one-frame courtesy.
-        let r = c.call(MSG_CLUSTER_DF, rkyv_encode(&ClusterDfReq {})).await;
-        let (code, msg) = status(&r).expect("the later request must be refused too");
-        assert_eq!(code, StatusCode::FailedPrecondition, "{msg}");
-
-        // (4) …but the NEGOTIATION channel stays open on that same refused
-        //     connection. Gating the question on its own answer would admit
-        //     nobody, and an operator staring at a refusal needs to be able to
-        //     ask what the cluster actually speaks.
-        let id = c
-            .call(MSG_GET_CLUSTER_ID, rkyv_encode(&GetClusterIdReq {}))
-            .await
-            .expect("MSG_GET_CLUSTER_ID must stay answerable to a refused client");
-        // And it must report the pair the RIGHT WAY ROUND. This assertion was a
-        // tautology until the window opened — the two numbers were equal, so a
-        // swapped fill produced identical bytes. It is the highest-stakes pair
-        // in the tree: `wire_version_max` is what every partition server and
-        // extent node checks for equality at startup, and the range is what
-        // every client checks itself against. Reversed, the fleet does not
-        // start and no client is served.
-        let id: GetClusterIdResp = rkyv_decode(&id).expect("decodes");
-        assert_eq!(
-            (id.wire_version_min, id.wire_version_max),
-            (
-                autumn_rpc::MIN_CLIENT_WIRE_VERSION,
-                autumn_rpc::WIRE_VERSION
-            ),
-            "wire_version_min carries the CLIENT floor, not a cluster minimum"
-        );
-
-
-        // (5) A connection that says NOTHING is served. Every client built
-        //     before the hello existed is silent — and so is every partition
-        //     server and extent node, which dial through `ConnPool` with no
-        //     handshake of any kind. This is what makes the change inert.
-        let c = RpcClient::connect(mgr_addr).await.expect("connect");
-        assert!(
-            c.call(MSG_CLUSTER_DF, rkyv_encode(&ClusterDfReq {}))
-                .await
-                .is_ok(),
-            "a silent connection must still be served"
-        );
-
-        // (6) A malformed hello is InvalidArgument, never a version. Without
-        //     the magic check any 8-byte payload landing on this msg_type
-        //     would parse, and whatever number it yielded would decide
-        //     admission.
-        let r = c
-            .call(MSG_CLIENT_HELLO, Bytes::from_static(&[0u8; 8]))
-            .await;
-        let (code, msg) = status(&r).expect("a non-hello payload must be refused");
-        assert_eq!(code, StatusCode::InvalidArgument, "{msg}");
-    });
+async fn call(rd: &mut ReadHalf, wr: &mut WriteHalf, op: u8, payload: Bytes) -> Frame {
+    wr.write_all(Frame::request(2, op, payload).encode()).await.0.unwrap();
+    receive(rd).await
 }
 
-/// `MSG_GET_REGIONS` is the one message on BOTH surfaces — an SDK routes with
-/// it and so does every partition server's `sync_regions_once`. A PS sends no
-/// hello, so gating it would refuse region sync for the whole fleet the moment
-/// the client floor rose: the outage the msg_type scoping exists to prevent,
-/// arriving through the set instead of through the connection.
-///
-/// Pinned here, at the level where it would actually bite, rather than only as
-/// a predicate assertion. Delete this together with a way for a cluster peer to
-/// identify itself — never on its own.
 #[test]
-fn a_refused_client_can_still_reach_the_message_partition_servers_share_with_it() {
-    let port = pick_stable_port_pair();
-    let mgr_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let c = RpcClient::connect(mgr_addr).await.expect("connect");
-        let r = c.call(MSG_CLIENT_HELLO, hello(WIRE_VERSION + 1)).await;
-        assert!(r.is_err(), "precondition: this connection is refused");
-
-        // Not asserting the RESULT of get_regions (an empty cluster answers
-        // whatever it answers) — only that it is not the wire-version refusal.
-        let r = c
-            // GetRegions takes an empty payload — it has no request struct.
-            .call(MSG_GET_REGIONS, Bytes::new())
-            .await;
-        if let Some((code, msg)) = status(&r) {
-            assert_ne!(
-                code,
-                StatusCode::FailedPrecondition,
-                "get_regions must not be wire-gated: {msg}"
-            );
+fn manager_checks_client_interval_and_exact_internal_wire() {
+    let addr: SocketAddr = format!("127.0.0.1:{}", pick_stable_port_pair()).parse().unwrap();
+    start_manager(addr);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        for version in [MIN_CLIENT_WIRE_VERSION - 1, MIN_CLIENT_WIRE_VERSION,
+            WIRE_VERSION - 1, WIRE_VERSION, WIRE_VERSION + 1] {
+            let result = open(addr, Hello { role: Role::Client, wire_version: version, client_version: version }).await;
+            if (MIN_CLIENT_WIRE_VERSION..=WIRE_VERSION).contains(&version) {
+                let (mut rd, mut wr) = result.unwrap();
+                let frame = call(&mut rd, &mut wr, MSG_GET_CLUSTER_ID, rkyv_encode(&GetClusterIdReq {})).await;
+                assert!(!frame.is_error());
+                let id: GetClusterIdResp = rkyv_decode(&frame.payload).unwrap();
+                assert_eq!((id.wire_version_min, id.wire_version_max), (MIN_CLIENT_WIRE_VERSION, WIRE_VERSION));
+                assert_eq!(id.cluster_version, 0, "reserved field has no latch semantics");
+                let frame = call(&mut rd, &mut wr, MSG_REGISTER_PS, Bytes::from_static(b"invalid DTO")).await;
+                assert!(frame.is_error());
+                assert_eq!(RpcError::decode_status(&frame.payload).0, StatusCode::PermissionDenied);
+            } else {
+                assert!(matches!(result, Err(RpcError::VersionMismatch { .. })));
+            }
+            for role in [Role::Peer, Role::Admin] {
+                let result = open(addr, Hello { role, wire_version: version, client_version: 0 }).await;
+                if version == WIRE_VERSION { assert!(result.is_ok()); }
+                else { assert!(matches!(result, Err(RpcError::VersionMismatch { .. }))); }
+            }
         }
+        for op in [MSG_REGISTER_PS, autumn_rpc::client_hello::MSG_CLIENT_HELLO] {
+            let socket = compio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut rd, mut wr) = Conn::Tcp(socket).into_split();
+            let frame = call(&mut rd, &mut wr, op, Bytes::from_static(b"not a bootstrap")).await;
+            assert_eq!(frame.msg_type, protocol_hello::MSG_PROTOCOL_HELLO);
+            assert_eq!(frame.payload[6], protocol_hello::Verdict::Malformed as u8);
+        }
+        let (mut rd, mut wr) = open(addr, Hello::current(Role::Peer)).await.unwrap();
+        let frame = call(&mut rd, &mut wr, MSG_CREATE_STREAM, Bytes::new()).await;
+        assert_eq!(RpcError::decode_status(&frame.payload).0, StatusCode::PermissionDenied);
     });
 }
 
-/// The narrow routing opcode IS wire-gated, and this is the pair to the test
-/// above: `MSG_GET_REGIONS` must NOT be gated (a partition server sends it and
-/// carries no handshake), while `MSG_GET_CLIENT_REGIONS` must be (nothing but
-/// an SDK ever sends it).
-///
-/// Without this, deleting `MSG_GET_CLIENT_REGIONS` from
-/// `is_client_surface_mgr_msg` leaves every test green — the freeze records its
-/// bytes independently of the set — while a below-floor client goes on being
-/// handed routing it has no business acting on. The claim that this narrows the
-/// documented `MSG_GET_REGIONS` residue is only worth making if something
-/// fails when it stops being true.
 #[test]
-fn the_narrow_routing_opcode_is_wire_gated_while_the_shared_one_is_not() {
-    let port = pick_stable_port_pair();
-    let mgr_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let c = RpcClient::connect(mgr_addr).await.expect("connect");
-        let r = c.call(MSG_CLIENT_HELLO, hello(WIRE_VERSION + 1)).await;
-        assert!(r.is_err(), "precondition: this connection is refused");
-
-        let r = c.call(MSG_GET_CLIENT_REGIONS, Bytes::new()).await;
-        let (code, msg) = status(&r).expect("a refused connection answers with a status");
-        assert_eq!(
-            code,
-            StatusCode::FailedPrecondition,
-            "the narrow routing opcode must be refused for an out-of-window client: {msg}"
-        );
+fn an_admin_protocol_declaration_does_not_bypass_admin_authentication() {
+    let addr: SocketAddr = format!("127.0.0.1:{}", pick_stable_port_pair()).parse().unwrap();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = autumn_manager::AutumnManager::new();
+            manager.set_admin_token("secret".into());
+            manager.serve(addr).await.unwrap();
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (mut rd, mut wr) = open(addr, Hello::current(Role::Admin)).await.unwrap();
+        let frame = call(&mut rd, &mut wr, MSG_CREATE_STREAM, Bytes::new()).await;
+        assert!(frame.is_error());
+        let (code, message) = RpcError::decode_status(&frame.payload);
+        assert_eq!(code, StatusCode::FailedPrecondition);
+        assert!(message.contains("admin token"), "{message}");
     });
 }

@@ -28,10 +28,7 @@ fn usage() -> ! {
     eprintln!("  audit-log [--op N] [--node N] [--since S] [--until U] [--limit L]");
     eprintln!("                               query operator action history");
     eprintln!("  info [--part PID] [--detail] show cluster snapshot (--detail = partition load)");
-    eprintln!(
-        "  policy-candidates            advisory split/merge/gc/compact/ec candidates"
-    );
-    eprintln!("  cluster-version              persisted cluster_version + the cluster's wire version");
+    eprintln!("  policy-candidates            advisory split/merge/gc/compact/ec candidates");
     eprintln!();
     eprintln!("op observability:");
     eprintln!("  ops status <id>              live state of one op, incl. progress");
@@ -40,7 +37,6 @@ fn usage() -> ! {
     eprintln!("                               durable terminal history from etcd, newest first");
     eprintln!();
     eprintln!("upgrade versioning:");
-    eprintln!("  upgrade-version [--to N]     bump cluster_version to N (default current+1); forward jumps");
     eprintln!("                               allowed, never backward; run ONLY after every member binary");
     eprintln!("                               is upgraded; not rollbackable");
     eprintln!();
@@ -273,11 +269,6 @@ pub(crate) enum Command {
     ListNodes,
     // cluster-df: aggregate capacity summary (Ceph `ceph df` style)
     Df,
-    // R1 rolling upgrade
-    ClusterVersion,
-    UpgradeVersion {
-        to: Option<u32>,
-    },
     ExtentHealth {
         node_filter: Vec<u64>,
         include_healthy: bool,
@@ -431,7 +422,9 @@ pub(crate) enum Command {
     /// startup (mirrors Kafka `kafka-storage.sh format` / Ceph `ceph-volume
     /// prepare`: mkfs mints identity only, the daemon reports its own network
     /// location on every boot). See docs/en_dynamic_shard_design.md §2.2.
-    Format { dirs: Vec<String> },
+    Format {
+        dirs: Vec<String>,
+    },
     // ── data-plane authz tooling ──────────────────────────────────
     /// Generate an Ed25519 signing key (LOCAL — no manager). Prints the keyfile
     /// line (`<kid> <hex-seed>`) to stdout; redirect to `--auth-signing-key-file`.
@@ -625,7 +618,9 @@ pub(crate) fn parse() -> Args {
             }
             "--admin-token-file" => {
                 i += 1;
-                admin_token = Some(read_secret_file(&raw.get(i).cloned().unwrap_or_else(|| usage())));
+                admin_token = Some(read_secret_file(
+                    &raw.get(i).cloned().unwrap_or_else(|| usage()),
+                ));
                 i += 1;
             }
             // data-plane credential, for the admin subcommands that read or write
@@ -661,25 +656,6 @@ pub(crate) fn parse() -> Args {
         // read
         "list-nodes" => Command::ListNodes,
         "df" => Command::Df,
-        // R1 rolling upgrade
-        "cluster-version" => Command::ClusterVersion,
-        "upgrade-version" => {
-            let mut to: Option<u32> = None;
-            while i < raw.len() {
-                match raw[i].as_str() {
-                    "--to" => {
-                        i += 1;
-                        if i >= raw.len() {
-                            usage();
-                        }
-                        to = Some(val(&raw, i).parse().unwrap_or_else(|_| usage()));
-                        i += 1;
-                    }
-                    _ => break,
-                }
-            }
-            Command::UpgradeVersion { to }
-        }
         "extent-health" => {
             let mut node_filter: Vec<u64> = Vec::new();
             let mut include_healthy = false;
@@ -942,7 +918,10 @@ pub(crate) fn parse() -> Args {
             if principal.is_empty() || credential.is_empty() {
                 usage();
             }
-            Command::MintToken { principal, credential }
+            Command::MintToken {
+                principal,
+                credential,
+            }
         }
         // D2: namespace registry admin
         "namespace-create" => {
@@ -1125,9 +1104,7 @@ pub(crate) fn parse() -> Args {
                         desc = raw.get(i + 1).cloned();
                         i += 1;
                     }
-                    other if !other.starts_with('-') && name.is_empty() => {
-                        name = other.to_string()
-                    }
+                    other if !other.starts_with('-') && name.is_empty() => name = other.to_string(),
                     _ => {}
                 }
                 i += 1;
@@ -1432,13 +1409,34 @@ pub(crate) fn parse() -> Args {
                     "--count" => { i += 1; count = Some(num(val(&raw, i), "--count") as usize); i += 1; }
                     "--fs-inos" => {
                         i += 1;
-                        fs_inos = Some(val(&raw, i).split(',').map(|s| num(s, "--fs-inos entry")).collect());
+                        fs_inos = Some(
+                            val(&raw, i)
+                                .split(',')
+                                .map(|s| num(s, "--fs-inos entry"))
+                                .collect(),
+                        );
                         i += 1;
                     }
-                    "--lanes" => { i += 1; lanes = Some(num(val(&raw, i), "--lanes") as usize); i += 1; }
-                    "--parts" => { i += 1; parts = Some(num(val(&raw, i), "--parts") as usize); i += 1; }
-                    "--admin-token" => { i += 1; presplit_admin_token = Some(val(&raw, i).to_owned()); i += 1; }
-                    "--admin-token-file" => { i += 1; presplit_admin_token = Some(read_secret_file(val(&raw, i))); i += 1; }
+                    "--lanes" => {
+                        i += 1;
+                        lanes = Some(num(val(&raw, i), "--lanes") as usize);
+                        i += 1;
+                    }
+                    "--parts" => {
+                        i += 1;
+                        parts = Some(num(val(&raw, i), "--parts") as usize);
+                        i += 1;
+                    }
+                    "--admin-token" => {
+                        i += 1;
+                        presplit_admin_token = Some(val(&raw, i).to_owned());
+                        i += 1;
+                    }
+                    "--admin-token-file" => {
+                        i += 1;
+                        presplit_admin_token = Some(read_secret_file(val(&raw, i)));
+                        i += 1;
+                    }
                     // Already read by `prescan_secret_flags`; accepted (and
                     // skipped) here only so the flag may follow the subcommand
                     // as well as precede it.
@@ -1485,11 +1483,16 @@ pub(crate) fn parse() -> Args {
                             eprintln!("presplit --parts P: P must be in 1..={n} (got {p})");
                             std::process::exit(1);
                         }
-                        PresplitRule::FsLanes { lanes: n as u8, parts: p as u8 }
+                        PresplitRule::FsLanes {
+                            lanes: n as u8,
+                            parts: p as u8,
+                        }
                     } else if let Some(inos) = fs_inos {
                         PresplitRule::Fs { inos }
                     } else if let Some(n) = count {
-                        PresplitRule::Fs { inos: (1..n as u64).collect() } // ino 1..N-1 → N parts
+                        PresplitRule::Fs {
+                            inos: (1..n as u64).collect(),
+                        } // ino 1..N-1 → N parts
                     } else {
                         eprintln!("presplit --namespace fs requires --lanes <N> | --fs-inos <i,j,…> | --count <N>");
                         std::process::exit(1);
@@ -1517,7 +1520,10 @@ pub(crate) fn parse() -> Args {
                         );
                         std::process::exit(1);
                     });
-                    PresplitRule::Kvc { hash_prefix: hp.into_bytes(), count: n }
+                    PresplitRule::Kvc {
+                        hash_prefix: hp.into_bytes(),
+                        count: n,
+                    }
                 }
                 "mem" => {
                     let agents = agents.unwrap_or_else(|| {
@@ -1537,7 +1543,13 @@ pub(crate) fn parse() -> Args {
                     PresplitRule::Hex { count: n }
                 }
             };
-            Command::Presplit { namespace, tenant, rule, admin_token: presplit_admin_token, force: presplit_force }
+            Command::Presplit {
+                namespace,
+                tenant,
+                rule,
+                admin_token: presplit_admin_token,
+                force: presplit_force,
+            }
         }
         "merge" => {
             if raw.get(i).map(|s| s == "--help" || s == "-h").unwrap_or(false) {
@@ -1560,7 +1572,11 @@ pub(crate) fn parse() -> Args {
                     usage();
                 }
             }
-            Command::Merge { survivor_part_id, victim_part_id, force }
+            Command::Merge {
+                survivor_part_id,
+                victim_part_id,
+                force,
+            }
         }
         "rebalance" => {
             // Optional [MAX_MOVES]; absent / 0 = move as many as needed to balance.
@@ -1661,7 +1677,14 @@ pub(crate) fn parse() -> Args {
                 eprintln!("gc requires <PARTID>");
                 std::process::exit(1);
             };
-            Command::Gc { part_id, ratio, max_size, stream_debt, dead_bytes, empty_only }
+            Command::Gc {
+                part_id,
+                ratio,
+                max_size,
+                stream_debt,
+                dead_bytes,
+                empty_only,
+            }
         }
         "forcegc" => {
             if i >= raw.len() {
@@ -1776,8 +1799,9 @@ fn parse_admin_flags(raw: &[String], i: &mut usize) -> (String, String, bool) {
 /// the fail-loud wrapper.
 pub(crate) fn valid_segment(s: &str) -> bool {
     !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+        && s.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 fn reject_bad_segment(cmd: &str, kind: &str, s: &str) {
@@ -2412,8 +2436,10 @@ mod tests {
         use super::PresplitRule;
         // Retires the low-byte stepping: inodes 4–8 are all < 0x20 but each gets
         // its own cut here.
-        let suffixes =
-            super::presplit_suffixes(&PresplitRule::Fs { inos: vec![4, 5, 6, 7, 8] }).unwrap();
+        let suffixes = super::presplit_suffixes(&PresplitRule::Fs {
+            inos: vec![4, 5, 6, 7, 8],
+        })
+        .unwrap();
         assert_eq!(suffixes.len(), 5);
         // suffix = [0x03][ino BE 8]
         assert_eq!(suffixes[0], vec![0x03, 0, 0, 0, 0, 0, 0, 0, 4]);
@@ -2425,7 +2451,13 @@ mod tests {
         }
         // An extent of inode 5 (`[0x03][5][off]`) sorts >= the `[0x03][5]` cut
         // and < the `[0x03][6]` cut → lands in inode 5's own partition.
-        let ext5 = wire("default", "fs", &[0x03, 0, 0, 0, 0, 0, 0, 0, 5, /*off*/ 0, 0, 0, 0, 0, 0, 0, 0]);
+        let ext5 = wire(
+            "default",
+            "fs",
+            &[
+                0x03, 0, 0, 0, 0, 0, 0, 0, 5, /*off*/ 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        );
         assert!(ext5 >= pts[1] && ext5 < pts[2]);
     }
 
@@ -2444,7 +2476,13 @@ mod tests {
         assert_eq!(s, vec![vec![0x03, 1], vec![0x03, 2], vec![0x03, 3]]);
         // A striped extent on lane 2 (wire [0x03][2][ino][off]) sorts into the
         // partition [[0x03][2], [0x03][3]).
-        let ext_lane2 = wire("default", "fs", &[0x03, 2, /*ino*/ 0, 0, 0, 0, 0, 0, 0, 9, /*off*/ 0, 0, 0, 0, 0, 0, 0, 0]);
+        let ext_lane2 = wire(
+            "default",
+            "fs",
+            &[
+                0x03, 2, /*ino*/ 0, 0, 0, 0, 0, 0, 0, 9, /*off*/ 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+        );
         let cut2 = wire("default", "fs", &s[1]); // [0x03][2]
         let cut3 = wire("default", "fs", &s[2]); // [0x03][3]
         assert!(ext_lane2 >= cut2 && ext_lane2 < cut3);
@@ -2602,12 +2640,20 @@ mod lane_parts_tests {
     fn record_grid_is_the_full_lane_grid_not_just_the_cut_grid() {
         use super::{presplit_record_suffixes, presplit_suffixes, PresplitRule};
         // 24 lanes over 6 parts: we CUT 5 points (the parts grid) …
-        let cut = presplit_suffixes(&PresplitRule::FsLanes { lanes: 24, parts: 6 }).unwrap();
+        let cut = presplit_suffixes(&PresplitRule::FsLanes {
+            lanes: 24,
+            parts: 6,
+        })
+        .unwrap();
         assert_eq!(cut.len(), 5);
         // … but RECORD all 23 lane boundaries (M4): a partition owning lanes
         // [0,4) then holds a declared point so auto-split snaps to a lane
         // boundary instead of a median inside a lane.
-        let rec = presplit_record_suffixes(&PresplitRule::FsLanes { lanes: 24, parts: 6 }).unwrap();
+        let rec = presplit_record_suffixes(&PresplitRule::FsLanes {
+            lanes: 24,
+            parts: 6,
+        })
+        .unwrap();
         assert_eq!(rec.len(), 23);
         assert_eq!(rec[0], vec![0x03, 1]);
         assert_eq!(rec[22], vec![0x03, 23]);
@@ -2644,11 +2690,19 @@ mod lane_parts_tests {
     #[test]
     fn parts_must_divide_lanes() {
         // 24 lanes over 4 parts → each partition owns exactly 6 lanes.
-        let s = presplit_suffixes(&PresplitRule::FsLanes { lanes: 24, parts: 4 }).unwrap();
+        let s = presplit_suffixes(&PresplitRule::FsLanes {
+            lanes: 24,
+            parts: 4,
+        })
+        .unwrap();
         assert_eq!(s, vec![vec![0x03, 6], vec![0x03, 12], vec![0x03, 18]]);
         // Every divisor of 24 works and yields parts-1 cuts, evenly spaced.
         for p in [2u8, 3, 4, 6, 8, 12, 24] {
-            let cuts = presplit_suffixes(&PresplitRule::FsLanes { lanes: 24, parts: p }).unwrap();
+            let cuts = presplit_suffixes(&PresplitRule::FsLanes {
+                lanes: 24,
+                parts: p,
+            })
+            .unwrap();
             assert_eq!(cuts.len() as u8, p - 1, "parts={p}");
             let step = 24 / p;
             for (k, c) in cuts.iter().enumerate() {
@@ -2657,9 +2711,12 @@ mod lane_parts_tests {
         }
         // A non-divisor is REJECTED, not rounded: uneven lane runs make every
         // striped file land lopsided.
-        let err = presplit_suffixes(&PresplitRule::FsLanes { lanes: 24, parts: 5 })
-            .unwrap_err()
-            .to_string();
+        let err = presplit_suffixes(&PresplitRule::FsLanes {
+            lanes: 24,
+            parts: 5,
+        })
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("must DIVIDE"), "{err}");
         assert!(err.contains("1, 2, 3, 4, 6, 8, 12, 24"), "should list divisors: {err}");
         // parts > lanes is impossible — only lanes-1 boundaries exist.

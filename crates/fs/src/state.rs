@@ -255,10 +255,7 @@ impl FsState {
     /// (Option 3 dropped the tenant segment — fuse is one global tree; multi-tree
     /// isolation is by distinct namespaces, §8.9). The client `connect(mgr, "fs")`
     /// prepends `fs/` to every key (and strips it off returned range keys).
-    pub async fn new_with_host(
-        manager_addr: &str,
-        host: String,
-    ) -> Result<Self> {
+    pub async fn new_with_host(manager_addr: &str, host: String) -> Result<Self> {
         let client = ClusterClient::connect(manager_addr, "fs")
             .await
             .context("connect to manager")?;
@@ -370,13 +367,8 @@ impl FsState {
 
     /// Put a key-value pair into the KV store.
     ///
-    /// every Put is durable (no `must_sync` flag). Previously there
-    /// was a `kv_put` (must_sync=false) and `kv_put_sync` (must_sync=
-    /// true) split; they now collapse to one method because the
-    /// extent-node fsync coalescer makes every append durable
-    /// regardless. The `kv_put_sync` alias is retained as a no-op
-    /// pass-through for callers that explicitly want to read as
-    /// "durable Put".
+    /// Every Put is durable through the extent-node fsync coalescer.
+    /// `kv_put_sync` is an alias with the same durability guarantee.
     pub async fn kv_put(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
         self.client
             .put(k, v)

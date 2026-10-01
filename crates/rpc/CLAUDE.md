@@ -486,7 +486,7 @@ Tests: `shard_for_extent_tests`.
 
 `is_admin_mgr_msg(msg_type)` is the set of cluster-MUTATING manager ops gated
 behind the manager's admin secret (fence/remove/maintenance/create-stream/
-upsert-partition/merge/bump-cluster-version/…). Read-only observability ops and
+upsert-partition/merge/…). Read-only observability ops and
 ops carrying their own `admin_token` field (tenant/namespace/principal) are NOT
 gated; `MSG_REGISTER_NODE` is deliberately excluded (the EN self-registers with no
 admin token — gating it would wedge bring-up). `is_admin_ps_msg` is the PS analog
@@ -660,101 +660,40 @@ still ask with `MSG_GET_REGIONS` remains ungated.
 Verified with both forms live on one cluster: a client built at wire 44 read
 values a wire-45 client had written, and wrote one the wire-45 client then read.
 
-### `MSG_CLIENT_HELLO` (0x5F) — the client→server half, and server-side admission
+### `PROTOCOL_HELLO` (0xF0): mandatory connection bootstrap
 
-`client_hello.rs`. The SDK sends it once per connection it OPENS (from `mgr_client()`
-and `get_ps_client()`, not from `connect()` — `rotate_manager` and the `mgr_call` error
-arm drop a manager connection and `mgr_client()` silently reopens it). Request
-`[magic "AUH1": u32 LE][client_wire_version: u32 LE]`; an admitted reply is
-`[server_wire_version][min_client_wire_version]`. A refusal is an ordinary error frame
-carrying `FailedPrecondition` and a message that names WHICH WAY ROUND the mismatch is,
-because the fix differs. Cost is one round trip per new connection, never per request.
+`protocol_hello.rs` parses a frozen, bounded framing independently of rkyv and
+business `FrameDecoder`. Request control is 16 bytes (`AUPH`, bootstrap version
+1, role, reserved zero, wire version, client version); response control is
+22+n bytes with verdict, target service, wire, client interval and a reason
+of at most 256 bytes. Integers are little-endian; CRC32C covers the frozen
+header and control. See `docs/cluster_version_design.md` for the byte layout.
 
-**Hand-coded fixed-layout binary, not rkyv, and the reason is specific.** rkyv's
-archived root sits at the END of its buffer, so a decoder reading a longer peer's struct
-reads its SUFFIX — a two-`u64` struct decoding a three-`u64` one returns `Ok` with the
-fields shifted, and a `u32` added into tail padding round-trips `Ok` in both directions
-reading zero. The one message whose job is to detect a version mismatch must not depend
-on its own shape to do it. The module is FROZEN for the same reason `GetClusterIdResp`
-is; `tests/negotiation_freeze.rs` pins all three encodings byte for byte, and its header
-says why refreshing a recorded value is the wrong response to a failure.
+Every `RpcClient` constructor handshakes before starting business tasks; all
+manager/PS/EN listeners accept before creating a business decoder. Peer/admin
+require equal WIRE_VERSION; client requires its declared version inside the
+server interval. Connect plus Hello has a 5-second bound, with shorter caller
+budgets taking precedence. Malformed, missing, legacy or mismatched Hello
+closes the connection without decoding a business DTO. Reconnect handshakes
+again; a failed handshake never enters a pool.
 
-**Admission is scoped to msg_types, never to the connection.** `is_client_surface_ps_msg`
-/ `is_client_surface_mgr_msg` are the two sets; a frame outside them is never wire-gated.
-Without that scoping the first floor move is a cluster outage: the listeners that serve
-clients also serve internal peers, that peer traffic is SILENT (PS→manager and EN→manager
-go through `ConnPool` straight to `RpcClient::connect`; manager→PS drives split /
-maintenance / merge-freeze / roll-tails the same way), and nothing in a frame says which
-role sent it. The one peer that does handshake is the extent node's startup identity
-check, which is a `ClusterClient` — always at `WIRE_VERSION`, so always admitted, and its
-two messages are un-gated regardless. `MSG_GET_CLUSTER_ID` and the hello itself are exempt — they are how a peer
-finds out what it is talking to.
+`Negotiated::check_opcode` checks the explicit service/role surface before
+business decode or batch grouping. Role is a declaration, not a credential:
+AUTH_HELLO, admin token, direct-read capability, cluster identity and ownership
+checks continue. Unknown and retired opcodes are refused. Duplicate Hello
+cannot change the connection's role.
 
-**`MSG_GET_REGIONS` is deliberately NOT in the manager set**, and it is the one message
-the sets cannot cover: an SDK routes with it and so does every PS's `sync_regions_once`.
-Gating it would refuse region sync fleet-wide once the floor rose. Closing it properly
-means teaching cluster peers to identify themselves — a different change, and the two
-tests pinning this say so.
+The old `MSG_CLIENT_HELLO` (0x5F, AUH1) codec remains frozen for historical
+fixtures; it no longer admits a live connection. There is no fallback to an
+unchecked legacy connection. First deployment updates every caller via
+stopworld; later wire changes may roll with cross-wire RPC failures and short
+unavailability, subject to the release's persistence and recovery analysis.
 
-**The operator surface is deliberately uncovered too.** `MSG_STATUS`, stream/extent info,
-`namespace_*`, `tenant_*`, the op-ledger, autopolicy and `MSG_MULTI_MODIFY_*` stay
-reachable from a client of any version: they are `autumn-op`'s, and `autumn-op` ships
-WITH the cluster at the same commit, so a window buys it nothing. The residue is that a
-below-floor caller can still reach routing and the admin surface — both rkyv, so a
-stale `autumn-op` gets the same silent misread the data plane is now protected from.
-The trade is deliberate, not an oversight.
-
-A connection that sends no hello is treated as `WIRE_VERSION_WITH_CLIENT_HELLO` (43,
-frozen at the literal — it is a fact about history, and following `WIRE_VERSION` would
-make every silent connection look current). That is what makes the mechanism INERT on
-arrival: with the floor at 43, a client built the day before and one built from this
-commit are admitted alike.
-
-Where it runs: the PS inside `authz_gate`, **above** its `!gate_active()` early return
-(below that line it would never run on an authz-off cluster, which is most of them —
-ablated); the manager synchronously in `handle_connection`'s decode loop, before the
-per-frame spawn, because a hello and the first request can arrive in one read and a
-detached task would let the request be judged before the hello describing it.
-
-**What that leaves uncovered, stated where someone will read it:** *changed the schema
-and forgot to bump* is UNCAUGHT. rkyv has no version tag, so two binaries claiming the
-same version with different layouts handshake happily and then decode each other's
-bytes as garbage. The `compat_no_longer_verifies_the_peers_schema` test exists to keep
-that hole visible in the code. The wire schema is `manager_rpc.rs`, `partition_rpc.rs`, `frame.rs`,
-`extent_rpc.rs`, `cap_token.rs`; adding, removing, reordering or retyping any field of
-an `Archive` type in those files — or changing what an existing field MEANS — is a wire
-change.
-
-Bump rule: bump `WIRE_VERSION` on every wire change. Deploying it is stop-the-world for
-the manager, PS and EN. Raise `MIN_CLIENT_WIRE_VERSION` **only** when the change breaks
-the client-facing surface — it is the one constant answering "does this force every
-image carrying an embedded client to be rebuilt", and while the two are equal the
-answer is always yes.
-
-**A pure msg_type ADDITION is not a bump.** Until the hello landed the tree treated one
-as a bump anyway, which is what made a new opcode expensive; an old peer that never
-sends a msg_type cannot be affected by its existence. That rule change is a
-precondition, not a convenience: serving two forms of a message means giving the new
-form its own opcode, so a window can only be opened if opcodes are cheap. Adding a
-CLIENT-facing one still means classifying it in `client_hello.rs` — a data-plane
-message with no entry lands outside the window silently, which is the same shape as the
-two `extract_part_id` / `authz_check` omissions this tree has already shipped.
-
-**The exception, and it is not a contradiction: an opcode a CLIENT must
-DETECT does need a bump.** `MSG_GET_CLIENT_REGIONS` added no field to any
-existing struct and still took `WIRE_VERSION` 44 → 45, because the version
-integer is the SDK's only signal that the handler exists on the other end.
-Without a bump there is no number to compare and the client has to either ask
-blind (every refresh fails against an older cluster) or never use the new form
-at all. §7 says the same thing from the other side: each retained form names the
-version that introduced it.
-
-Say the cost out loud, because it is the cost this crate's own measurement is
-about: that bump stops every PS and EN for a change neither can see — one of the
-68% of intervals where the extent node need not have moved. It buys the thing
-that matters more here, which is that no embedded client image has to be
-rebuilt. An addition NO client needs to detect — an internal opcode, or one a
-server only ever receives — still costs nothing and must not be bumped for.
+Bump WIRE_VERSION for incompatible layouts/semantics. Raise
+MIN_CLIENT_WIRE_VERSION only when client compatibility is actually removed.
+A matching version cannot detect a forgotten bump. Adding an opcode still
+requires updating its role surface and documenting when a client may use it;
+retain old forms while they remain inside the supported client interval.
 
 ### The client surface is frozen to exact bytes
 
@@ -826,39 +765,17 @@ response is exactly the half an old client decodes. What the guard still cannot 
 whether a form's declared opcodes are the ones its handler actually serves; nothing ties
 those lists to the dispatchers.
 
-Exchange: both numbers ride on `GetClusterIdResp` (filled by the manager in
-`handle_get_cluster_id`), checked at every long-lived process's startup
-(`ClusterClient::connect`, the PS's `finish_connect`, the EN's startup). **The FIELD names outlive
-the constants they carry**: `wire_version_max` carries `WIRE_VERSION` and
-`wire_version_min` carries `MIN_CLIENT_WIRE_VERSION`, because the struct is frozen and
-already-deployed clients read those field names with code that cannot be changed. `GetClusterIdReq/Resp` are FROZEN —
-they ARE the negotiation channel, decoded before any compat decision; additions go in
-new msg_types. A SUCCESSFUL response failing the check is a hard startup refusal; a
-TRANSPORT failure fetching it is best-effort skipped (availability wins while the
-manager is briefly down — every subsequent RPC fails loudly anyway).
+`PROTOCOL_HELLO` carries version admission on every connection. The frozen
+`GetClusterIdReq/Resp` still serves identity lookup: wire_version_min reports
+MIN_CLIENT_WIRE_VERSION, wire_version_max reports WIRE_VERSION, and
+cluster_version is reserved and always zero. It is not a best-effort substitute
+for connection admission.
 
-`cluster_version` (manager etcd key `autumn-rs/cluster_version`, ASCII decimal) is the
-operator-bumped ROLLBACK LATCH: `MSG_GET_CLUSTER_VERSION` (0x4A, fresh etcd read) /
-`MSG_BUMP_CLUSTER_VERSION` (0x4B, leader-only, +1, capped at `WIRE_VERSION`,
-value-CAS'd). Bump via `autumn-op upgrade-version` only after every member runs the new
-binary, which is why that command prints that rollback is no longer possible.
-
-**It gates PERSISTED formats only — never a wire format.** A wire change is settled by
-the restart itself: after a stop-the-world swap every live peer speaks the same version
-and no byte of the old shape exists anywhere, so there is nothing left for a gate to
-decide. Stored bytes are still there when the cluster comes back, so what needs a gate
-is the moment it becomes safe to START WRITING a shape the previous binary cannot read
-— which is exactly "everyone is upgraded and we are not going back". `cluster_version
->= N` is that question and no other.
-
-The cap at `WIRE_VERSION` REUSES the wire numbering so the interlock is one
-comparison; it does not make this a wire version. The interlock is the latch's other
-side: every manager decode of the persisted value fails closed (blocks leadership) when
-it exceeds the binary's own `WIRE_VERSION`, so a rolled-back binary cannot come up
-against data written past its own horizon.
-
-Nothing in the tree gates on it yet, by design — the mechanism is in place and carries
-no resident evolution code until the first persisted change actually needs it.
+The manager cluster_version latch and query/bump RPCs are removed. Opcode
+0x4A/0x4B stay reserved. Persistence changes are rare and analyzed per release;
+there is no global latch or mandatory common persistence codec. Preserve
+cluster_id and ownership fencing. See docs/ops.md for policy pause, task drain,
+replacement and recovery checks.
 
 ## Notes
 

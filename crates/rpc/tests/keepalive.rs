@@ -1,6 +1,8 @@
 //! Dead-peer detection: a connection whose peer stops sending bytes is closed
 //! by the client itself, and one whose peer keeps answering is never judged —
 //! however long a single request of its own takes.
+#[path = "support/protocol.rs"]
+mod protocol;
 #[path = "support/status_peer.rs"]
 #[allow(dead_code)] // shared fixture; this suite uses part of it
 mod peer;
@@ -35,7 +37,8 @@ async fn a_silent_peer_is_closed_and_its_waiting_call_released() {
     let addr = listener.local_addr().unwrap().to_string();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
+        let (mut sock, _) = listener.accept().unwrap();
+        protocol::accept_std(&mut sock, autumn_rpc::WIRE_VERSION, 1);
         let _ = stop_rx.recv_timeout(Duration::from_secs(30));
         drop(sock);
     });
@@ -111,6 +114,7 @@ async fn an_idle_connection_stays_open_whatever_the_peer_answers_the_ping_with()
 
 /// Read `sock` like a slow but healthy server: at most `bytes_per_sec`, and
 /// answer every complete frame with "ok" — the ping included.
+#[cfg(target_os = "linux")]
 fn serve_slowly(mut sock: std::net::TcpStream, bytes_per_sec: usize) {
     use std::io::{Read, Write};
     let mut decoder = autumn_rpc::FrameDecoder::new();
@@ -143,6 +147,9 @@ fn serve_slowly(mut sock: std::net::TcpStream, bytes_per_sec: usize) {
 /// buffer — which is where they wait on a slow link. (A large receive buffer
 /// would instead model a peer that received everything and is not reading,
 /// which is the dead-peer signature and is meant to be closed.)
+// This specifically tests Linux TCP_INFO ACK progress. macOS lacks that
+// signal and its receive-window behavior does not produce this slow link.
+#[cfg(target_os = "linux")]
 #[compio::test]
 async fn a_large_request_on_a_slow_link_is_not_mistaken_for_death() {
     use std::os::fd::AsRawFd;
@@ -167,7 +174,8 @@ async fn a_large_request_on_a_slow_link_is_not_mistaken_for_death() {
     assert_eq!(rc, 0);
     let addr: SocketAddr = listener.local_addr().unwrap();
     let server = std::thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
+        let (mut sock, _) = listener.accept().unwrap();
+        protocol::accept_std(&mut sock, autumn_rpc::WIRE_VERSION, 1);
         serve_slowly(sock, RATE);
     });
 
@@ -205,6 +213,7 @@ async fn a_bulk_receive_frozen_mid_value_is_released_by_the_close() {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let server = std::thread::spawn(move || {
         let (mut sock, _) = listener.accept().unwrap();
+        protocol::accept_std(&mut sock, autumn_rpc::WIRE_VERSION, 1);
         let mut decoder = autumn_rpc::FrameDecoder::new();
         let mut buf = vec![0u8; 4096];
         let req = loop {
@@ -248,7 +257,8 @@ async fn caller_traffic_to_a_frozen_peer_does_not_keep_it_alive() {
     let addr = listener.local_addr().unwrap().to_string();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
+        let (mut sock, _) = listener.accept().unwrap();
+        protocol::accept_std(&mut sock, autumn_rpc::WIRE_VERSION, 1);
         let _ = stop_rx.recv_timeout(Duration::from_secs(30));
         drop(sock);
     });
@@ -285,7 +295,8 @@ async fn steady_small_requests_to_a_frozen_peer_do_not_keep_it_alive() {
     let addr = listener.local_addr().unwrap().to_string();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let holder = std::thread::spawn(move || {
-        let (sock, _) = listener.accept().unwrap();
+        let (mut sock, _) = listener.accept().unwrap();
+        protocol::accept_std(&mut sock, autumn_rpc::WIRE_VERSION, 1);
         let _ = stop_rx.recv_timeout(Duration::from_secs(30));
         drop(sock);
     });

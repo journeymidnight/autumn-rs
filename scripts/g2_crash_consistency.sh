@@ -107,7 +107,7 @@ sleep 5
 log "cluster up (crash mode: $([[ $QUIESCE == 0 ]] && echo IMMEDIATE || echo "quiesced ${QUIESCE}s"))"
 
 # ==================== PHASE 2: baseline + workload =========================
-log "=== PHASE 2: checkpoint baseline, then $N_SMALL small + $N_BIG×$((BIG_BYTES/1024))KiB writes (all must_sync) ==="
+log "=== PHASE 2: checkpoint baseline, then $N_SMALL small + $N_BIG×$((BIG_BYTES/1024))KiB writes (all durable) ==="
 fifo_cmd "lazyfs::cache-checkpoint"   # persist sentinels + bootstrap extents (models pre-crash writeback of the already-running cluster)
 ACK="$W/acked.txt"; : > "$ACK"; mkdir -p "$W/vals"
 gen(){ head -c "$2" /dev/urandom > "$W/vals/$1"; printf '\n%s' "$1" >> "$W/vals/$1"; }

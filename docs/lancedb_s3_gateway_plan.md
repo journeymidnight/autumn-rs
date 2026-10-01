@@ -177,7 +177,7 @@ DeleteObject、`If-Match`、Abort 与 HeadBucket 没有出现，但仍按原验�
 
 ### 9.2 FS 格式 v4（`SCHEMA_VERSION` 3 → 4，离线转换）
 
-`InodeMeta` 增加两个字段（rkyv 布局改变，按仓库惯例用一次性 `migratev3_v4`
+`InodeMeta` 增加两个字段（rkyv 布局改变，按仓库惯例用一次性
 转换器改写全部 `[0x01]` inode，转换完删除，不留兼容代码）：
 
 - `generation: u64`：内容代数。任何改变内容的操作（flush 写入数据、truncate、

@@ -1,3 +1,5 @@
+Task update (2026-09-30): user requested retiring the old SST/FS conversion tools and removing obsolete durability-flag references. Deleted the converters, SST helper module, Cargo targets and Docker image entries; retained strict SST/FS version checks and unconditional durable writes. Verification: autumn-server binary cargo check passed; SST format tests 3 passed; ignored system_fuse_ns unstamped-populated-tree rejection test 1 passed. Added dependency-aware outage reduction guidance to docs/cluster_version_design.md; rollout controls remain planned. Earlier conversion notes below are historical.
+
 Date: 2026-09-30 (4)
 TaskStatus: completed
 Task scope: user "每次不是有perf check吗？ 写一个sub command perf clean".

@@ -3046,135 +3046,125 @@ autumn-op --manager $MGR info                          # PS1: silent 7s
 autumn-op --manager $MGR info                          # PS1 2/1 slots, opening 1/2, over its cpuset
 ```
 
-### cluster_version + the wire version
+### RPC version checks and general upgrade procedure
 
-Every binary carries `WIRE_VERSION` — the schema it speaks — and
-`MIN_CLIENT_WIRE_VERSION`, the oldest CLIENT it serves (`crates/rpc`). They are
-checked by two different rules, because they answer different questions:
+The connection contract is specified in [cluster_version_design.md](cluster_version_design.md).
+`PROTOCOL_HELLO` (opcode `0xF0`, magic `AUPH`, bootstrap version 1) is mandatory
+on manager, PS and EN connections. Deploy this first bootstrap migration with
+stopworld, updating all callers. The release's rolling-upgrade rehearsal must
+validate the dependency order and ACKed-data recovery before using it in production.
 
-- a **cluster peer** (manager / PS / EN) must match `WIRE_VERSION` EXACTLY. This
-  is what makes an upgrade stop-the-world, and the startup handshake is the only
-  thing enforcing it.
-- a **client** must fall INSIDE `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`,
-  refused at both ends — too old and the cluster no longer keeps the behavior it
-  needs, too new and the cluster cannot speak what it will send.
+Every connection completes a stable Hello before business payload decoding:
+internal peers and admin tools require equal `WIRE_VERSION`; clients must lie
+inside `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`. Retain the existing client
+window and change its lower bound only when actual client compatibility is
+removed. A mismatch reports the local/remote versions, connection role and
+reason, rather than appearing as an unexplained business decode failure.
+A decode error after successful Hello remains a separate protocol error;
+matching version numbers cannot compensate for a forgotten wire bump.
 
-The window is OPEN today: `MIN_CLIENT_WIRE_VERSION` is 43 and `WIRE_VERSION`
-is 44, so a client built at either is served and an internal bump no longer
-forces every embedded client image to be rebuilt. `autumn-op cluster-version`
-prints both and says which state it is in.
+The implementation removes the manager's persisted `cluster_version` latch,
+its startup/replay checks, query/bump RPCs, and `autumn-op cluster-version` /
+`upgrade-version`. There is no final cluster bump after replacing binaries.
+Frozen response fields retain their encoding as reserved placeholders, and
+retired opcode numbers are not reused. Retain `cluster_id` and ownership
+fencing. Removal of the latch does not prove old binaries can read newer data.
 
-Proving it needs TWO builds of the client at DIFFERENT wire versions, which no
-`cargo test` can produce, so it is a script:
+**Preparation, before any instance is stopped:**
 
-```bash
-scripts/client_window_verify.sh          # ~3 min, cleans up after itself
-# Builds a client from the newest commit at the window's FLOOR (a real binary,
-# not a forged version), runs put / get / 9 MB bulk / EN-direct / range / batch
-# / delete against a cluster at the CEILING, then raises the floor and asserts
-# the SAME binary is refused with a message saying which way round to fix it.
-# Prints "the window is SHUT" and exits 0 if there is nothing to prove.
-```
+1. Distribute the builds/images and check configuration. State whether wire,
+   client surface or any persistent format/semantics changed. Analyze an actual
+   persistent change separately; rolling upgrade is allowed only if that
+   release's new/old readers and writers can coexist safely. The first unified
+   Hello deployment uses the agreed stopworld procedure and updates every
+   server, SDK and tool; later wire changes may use rolling replacement.
+2. Record the active policy name and mode, then deactivate it. Use the existing
+   admin credentials when required:
 
-**The floor may never go BELOW 43**, and a `const` assertion makes it a compile
-error. Peer equality is enforced by each peer policing ITSELF at startup, so a
-pre-43 partition server or extent node — which checked itself with an interval
-OVERLAP — reads `wire_version_min` as a peer floor and would JOIN a cluster
-whose window reached down to it. Nothing catches that afterwards: the register
-messages carry no version.
+   ```bash
+   autumn-op --manager "$MGR" auto-policy status
+   autumn-op --manager "$MGR" auto-policy deactivate
+   autumn-op --manager "$MGR" auto-policy status  # confirm mode=off
+   ```
 
-The SERVER decides. Every connection the SDK opens sends `MSG_CLIENT_HELLO`
-first; the manager and the partition server refuse a client outside the window,
-on the client-facing message types, with a message naming which way round the
-mismatch is — rebuild the client, or deploy the cluster. The client's own check
-at connect stays as an earlier, better-worded failure, but it is not the gate:
-it is skipped when the fetch itself fails.
+   Off is persisted and survives manager failover. Stop new manual/dashboard/
+   scheduled management submissions too. This stops policy actuation; it does
+   not cancel already submitted operations or disable all background workers.
+3. Wait for submitted compaction, EC, GC, split/merge and rebalance operations
+   to finish; also check recovery and pending work. Check terminal outcomes,
+   not merely disappearance from the active list:
 
-A connection that sends NO hello is treated as wire version 43, the version the
-hello was introduced in, so every client image built before it keeps working.
-Refusal is scoped to client-facing message types, never to the connection: the
-same listeners carry partition-server and extent-node traffic, which carries no
-handshake, so a connection-scoped rule would refuse registration, heartbeats and
-reconcile as soon as the floor moved.
+   ```bash
+   autumn-op --manager "$MGR" ops list --active
+   autumn-op --manager "$MGR" ops history --limit 50
+   autumn-op --manager "$MGR" info
+   ```
 
-Separately the manager persists an operator-bumped `cluster_version` in etcd
-(ASCII decimal at `autumn-rs/cluster_version`). It is the ROLLBACK LATCH and it
-gates PERSISTED formats only — never a wire format, which the restart settles by
-itself. See `crates/rpc/CLAUDE.md`.
+   PS expiry/deletion-triggered compactions can run independently of the
+   manager's policy and may have no submitted op ID. Inspect their metrics/logs
+   and include local background work in the per-instance drain. An empty live
+   ledger alone is not proof that every worker is idle; leader changes also
+   replace the live ledger. Do not proceed merely because a wait timed out.
 
-```bash
-autumn-op cluster-version            # current gate + the cluster's wire version
-autumn-op upgrade-version [--to N]   # bump (default current+1); a forward jump over
-                                     # several versions is one command, never backward — run
-                                     # ONLY after EVERY member runs the new binary; not rollbackable
-```
+**Replacement and recovery:**
 
-Manual verification (all on a fresh `cluster.sh reset 3`):
+1. Drain each affected instance, close its old connections, replace the binary
+   and preserve its identity/data directories. Follow the dependency order or
+   coordinated batches verified for this release; do not assume one universal
+   manager → PS → EN order. Prevent an old process from being restarted
+   automatically. Coordinate manager leadership changes and check that policy
+   remains Off after failover.
+2. With the same wire, wait for Hello, registration, recovery and business Ready
+   before advancing. With a changed wire, an upgraded node may wait for peers
+   that have not been upgraded. Advance on verified local initialization plus
+   an explicit expected version-mismatch wait; waiting for every instance to
+   become fully Ready before touching its dependencies can deadlock the rollout.
+   Identity, storage and unexpected initialization errors are not this wait.
+3. Different-wire internal RPCs fail before business decoding. Request failure,
+   timeout, lost response, an unknown write outcome and temporary service
+   unavailability are accepted during replacement. **Already acknowledged
+   durable writes must remain readable after recovery.** Preserve the existing
+   ownership fences, commit/checkpoint rules and WAL recovery; do not blindly
+   replay a non-idempotent write whose response was lost. If drain cannot finish
+   because a dependency already changed wire, follow the release's verified
+   recovery procedure rather than treating it as a successful drain.
+4. Verify leader, registration, ownership, partition readiness, replica/EC
+   health, reads/writes, direct reads and previously acknowledged data. Current
+   stream append waits for every replica, so a rolling EN restart can interrupt
+   writes even while a majority remains alive. Measure read and write disruption
+   separately; shared manager/EN dependencies can affect many partitions.
+5. After all required nodes and business paths recover, restore the original
+   policy name and mode. For example, if it was `balanced` and Armed:
 
-```bash
-autumn-op cluster-version
-#   cluster_version: 45
-#   cluster wire version:   45
-#   oldest client served:   43  (window open — any client built at 43..=45 is served)
-#   this autumn-op binary:  45
-# Verified against a real manager. The `--json` form needs the flag BEFORE the
-# subcommand and prints cluster_wire_version / cluster_min_client_wire_version:
-autumn-op --json cluster-version
-autumn-op upgrade-version            # expect REFUSED: 46 exceeds WIRE_VERSION=45
-bash cluster.sh restart-manager && sleep 10
-autumn-op cluster-version            # expect: unchanged (etcd replay)
-# mixed-version refusal: any pre-R1 binary against this manager fails its
-# startup check loudly ("decode GetClusterIdResp failed ... wire-schema mismatch")
-```
+   ```bash
+   autumn-op --manager "$MGR" auto-policy activate balanced --arm
+   autumn-op --manager "$MGR" auto-policy status
+   ```
 
-Server-side admission, on the same cluster. There is no flag that fakes a
-client version, so this is driven from the test that owns the mechanism — it
-opens real sockets against a real manager and a real partition-server
-connection:
+   Restore a previous DryRun with `activate <original-name>` without `--arm`;
+   leave a previous Off state Off. Resume external management submissions only
+   after recovery checks pass. On an upgrade failure keep policy Off while
+   following the release's recovery/rollback procedure.
 
-```bash
-cargo test -p autumn-manager --test client_wire_admission
-cargo test -p autumn-partition-server --lib \
-  a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition
-# Both assert the refusal carries FailedPrecondition and says which way round
-# the mismatch is, that it STICKS for the rest of the connection (so a client
-# ignoring it cannot write anyway), and that a silent connection is served.
-```
+Pausing policy and waiting for maintenance reduce interference and outage time;
+they do not by themselves prove data safety. A persistent-format change may
+require stopping only its affected writers or stopworld, as determined by that
+specific change. Do not automatically clear persisted history or other etcd
+prefixes for a wire bump; handle each changed stored layout explicitly.
 
-An operator seeing a client refused in the field reads the message the server
-sent, which names both versions. `autumn-op cluster-version` prints the same
-pair from the cluster's side.
-
-**The window now carries two live forms of one message, which is what it was
-built for.** At wire 45 an embedded client's routing reply dropped the three
-stream ids it never read, under a NEW opcode (`MSG_GET_CLIENT_REGIONS`); the old
-`MSG_GET_REGIONS` is untouched and still serves the partition servers,
-`autumn-op`, and any client built at 43 or 44. An SDK picks between them from
-the version the handshake negotiated, so nothing has to be rebuilt for this.
-Verified on one cluster with both: a client binary built at wire 44 read values
-a wire-45 client had written, and wrote one the wire-45 client then read.
-
-A wire bump also invalidates anything ALREADY WRITTEN to etcd in a wire type's
-rkyv layout, which the version handshake cannot protect: it guards
-process-to-process traffic, not bytes at rest. Today that is the op log —
-`opLog/` holds up to 2000 `OpRecord`s, and `ops history` decodes them one by
-one. A record written by the previous version fails `rkyv_decode`, and the
-reader logs `skipping an undecodable op-log record` and carries on, so nothing
-breaks — but every pre-upgrade record is skipped, one warn line each. Clear the
-prefix as part of the stop-the-world rather than reading a few thousand of
-those, and accept that `ops history` starts empty after the upgrade (it is
-diagnostic history, not cluster state — no op depends on it):
+The existing client-window exercise uses real builds at different versions:
 
 ```bash
-# The prefix is at the etcd ROOT, not under autumn-rs/ (verified: 190 records
-# on the live cluster). Check before you delete.
-kubectl -n autumn exec autumn-etcd-0 -- etcdctl get "" --prefix --keys-only | grep -c '^opLog/'
-kubectl -n autumn exec autumn-etcd-0 -- etcdctl del --prefix 'opLog/'
+scripts/client_window_verify.sh
+cargo test -p autumn-rpc --test client_surface_freeze
+cargo test -p autumn-rpc --test negotiation_freeze
 ```
 
-Do this while the managers are DOWN, in the same window as the binary swap. Any
-wire type that is also persisted needs the same treatment; `OpRecord` is the
-only one today.
+These cover existing client compatibility. Unified Hello additionally needs
+real two-build rolling-upgrade verification: version rejection before decode,
+reconnection, mismatch waiting, leader failover, request failures and recovered
+acknowledged data. The old tests accepting silent connections must be updated
+for mandatory Hello.
 
 #### Converting the manager's persisted records — DONE, converter deleted
 
@@ -3319,15 +3309,12 @@ cargo test -p autumn-rpc --test negotiation_freeze
 # the whole table re-recorded in that commit. The file's header says so.
 ```
 
-Nothing equivalent exists for the cluster-internal schema, and that is
-deliberate: there an in-place edit is the CORRECT answer (bump, stop the
-world), so a freeze would fire on every legitimate change and train the reflex
-of refreshing the record without looking — which is how the deleted fingerprint
-waved a real change through.
-Bump exactly ONCE per commit: `autumn-op upgrade-version` moves forward only
-(a jump over several missed bumps is one command — the latch is one-way, not
-one-step; backward is refused). Rolling back a binary past a `cluster_version`
-bump is refused at manager startup (fail-closed in replay).
+Internal wire layouts are not frozen by the client-surface tests. Bump
+WIRE_VERSION when an internal layout or incompatible protocol meaning changes;
+wire-changing rolling replacement may have failed RPCs and temporary
+unavailability, following the general upgrade procedure above. No cluster bump
+is part of the target flow. Rollback depends on the actual stored data and
+protocol compatibility of the release, not a cluster_version latch.
 
 ## Direct read on EC extents
 
@@ -3990,57 +3977,14 @@ Three traps this script exists to encode, all of which cost a run to find:
   makes the final check fail as `connect PS … failed`, which reads like a
   data-plane break and is not one.
 
-## fs schema v3 → v4 upgrade (segmented files)
+## FS schema version
 
-v4 adds `generation` and `segments` to every inode. It is a stop-the-world
-change of the `fs/` tree, converted in place by `migratev3_v4`; nothing is
-reset and no file data is touched. It ships with wire 48, so the cluster
-binaries swap in the same window.
-
-```bash
-# 0. Stop EVERY fs client: fuse mounts, autumn-s3 gateways, Python autumn.Fs
-#    users, autumnfs. An old binary does not check the stamp and misreads v4
-#    inodes, silently.
-# 1. Swap and restart manager / PS / EN on the new build (etcd kept).
-# 2. Check the stamp and count what will convert:
-migratev3_v4 --manager $MGR --dry-run
-#    "fs has no schema stamp": the tree was built by autumnfs or the S3 gateway
-#    alone (they did not stamp before v4) and its inodes are v3 — add
-#    --unstamped-is-v3 to this and the next command.
-# 3. Convert. Prints "converted N inodes; fs schema is now v4". Safe to rerun
-#    after an interruption: it resumes from [0x04]migrate_v4_cursor.
-migratev3_v4 --manager $MGR
-migratev3_v4 --manager $MGR            # again: "already v4; nothing to do"
-# 4. Spot-check with the NEW autumnfs, then start the clients on the new build.
-autumnfs --manager $MGR ls /
-autumnfs --manager $MGR cat /some/file | sha256sum
-```
-
-A new fs client against an unconverted tree refuses to start ("on-disk fs schema
-version 3 != supported 4"), and against an unstamped populated tree says
-to run the converter — it never stamps over existing inodes. (A pre-release v4
-build did stamp v4 over an unstamped v3 tree; every new client then fails with
-"decode inode". Repair: put the stamp back to 3, then convert —
-`printf '\0\0\0\0\0\0\0\3' > v3; autumn-client --namespace fs put "$(printf '\x04schema_version')" v3`.) The converter ships in the image
-(Dockerfile COPY; added after the first rollout found it missing from
-/usr/local/bin) and stays until every cluster is on v4.
-
-Field notes from the wire-48 rollout (2026-09-26):
-
-- The converter needs an IP:port for --manager — `ClusterClient::connect` does
-  not resolve names ("invalid socket address syntax"). In k8s use the
-  `autumn-manager` Service's ClusterIP, or the pod IP.
-- The k8s fs clients fail LOUD and visibly: code-index-mcp and other clients
-  crashloop with the 3 != 4 error above — that is the signal the tree is not
-  converted yet, not a new bug. Fix the tree, restart the pod.
-- After the stop-the-world the auto-policy's rebalance cooldown can hold every
-  partition on one PS indefinitely (REBALANCE candidate logged every tick,
-  `primary=0 secondary=0`, nothing moves). The unblock is the manual op, as
-  many times as it takes:
-  `autumn-op --manager $MGR --admin-token-file /etc/autumn/authz/admin.token rebalance --wait`
-  — each call moves up to 4; rerun until the per-PS counts differ by ≤1.
-  Convergence check (no two partitions share an address):
-  `autumn-op --manager $MGR info | awk '$1=="part" && $3=="ps" {print $4}' | sort | uniq -d`
+The current filesystem schema is v4 (segmented files and content generations).
+Clients refuse a mismatched stamp or a populated tree with no stamp. The
+one-off v3 → v4 converter has been removed from the current build and image;
+legacy data needs the migration procedure from the corresponding historical
+release before a current client can mount it. Never overwrite the stamp to
+bypass this check.
 
 ## S3 gateway — reading and writing autumn over S3
 
@@ -4338,70 +4282,23 @@ stopped, not that it succeeded. `ops history` says `succeeded` and names the
 node the slot landed on.
 
 
-## SST MetaBlock v1 → v2 upgrade (deletion-triggered compaction)
+## SST format and deletion-triggered compaction
 
-MetaBlock v2 records each SST's entry and tombstone counts; with them every PS
-major-compacts a partition whose SSTs hold >= 10 000 tombstones that are >= 30%
-of all entries (TiKV's rule, checked every `--deletion-compact-check-secs`,
-default 300). The new `autumn-ps` reads only v2 and will not open a partition
-that still has a v1 SST (its log says `SST MetaBlock format v1 ... run
-convert_sst`), so the upgrade is stop the world → convert → start. Nothing else
-changes: WAL, checkpoint and etcd records are untouched, the manager and the
-extent nodes keep running throughout, and the wire version is unchanged.
+The current PS reads only MetaBlock v2, which records entry and tombstone
+counts. Older formats are rejected with the actual and supported versions.
+The one-off v1 → v2 converter has been removed from the build and image.
+Legacy data needs the conversion procedure from the corresponding historical
+release before a current PS can open it.
+
+Each PS schedules a major compaction when SSTs hold >= 10 000 tombstones
+and tombstones are >= 30% of entries, checked every
+`--deletion-compact-check-secs` (default 300). The log reports
+`tombstones reached the deletion-trigger rule; scheduling a major compaction`
+with the counts. Verify with:
 
 ```bash
-# 0. Build or pull the new image; convert_sst ships in it next to autumn-ps.
-#    Optional, while the OLD cluster still serves (no downtime): major-compact
-#    only the partitions that would otherwise be copied needlessly —
-#      - heavily deleted ones: unconverted, their tombstones and the values they
-#        shadow are copied, and the new PS majors them on its first check anyway;
-#      - split children still sharing SSTs (info shows overlap): each child
-#        copies the whole shared SST, out-of-range keys included.
-#    Every other partition gains nothing: a major rewrites it once and the
-#    conversion rewrites it again. Not a prerequisite — convert_sst takes any SST.
-autumn-op --manager $MGR --wait compact <PART>
-#    Before stopping: every merged partition must have opened once on the old
-#    build (its meta stream then holds one checkpoint). The new PS starts a
-#    merged open at the latest source cursor and supports only merges whose
-#    freeze drain always wrote a log-end checkpoint; convert_sst refuses a
-#    partition still holding several records, which catches the rest.
-# 1. Stop EVERY autumn-ps (graceful SIGTERM). Leave manager and ENs up.
-#    convert_sst refuses to run while any PS heartbeated in the last 10 s.
-# 2. See what will be converted (reads and rebuilds, writes no data):
-convert_sst --manager $MGR --dry-run
-#    per partition: "converted N SSTs (bytes, entries, tombstones)".
-#    "N checkpoint records": a merge whose survivor never opened since —
-#    start the OLD autumn-ps once, wait for `autumn-op info` to say ready,
-#    stop it, rerun.
-# 3. Convert. Every partition is independent; a failure names the partition and
-#    the rest still convert. Safe to rerun after an interruption or a failure.
-convert_sst --manager $MGR [--parallel 4] [--max-extent-size-bytes <as the PS>]
-convert_sst --manager $MGR    # again: "0 SSTs converted, N already v2"
-# 4. Start the new autumn-ps; wait until `autumn-op info` shows every PS ready.
-#    Then `autumn-op rebalance` as after any stop-the-world restart.
+cargo test -p autumn-manager --test system_deletion_triggered_compaction
 ```
-
-Cost: the tool reads every live SST once and writes it back once (the row
-stream roughly doubles until each partition's truncate at the end of its own
-conversion), so budget the time of copying the LSM-resident bytes — large
-values behind value pointers stay in the log stream and are not copied. Split
-siblings that still share SSTs each write their own full copy (out-of-range keys
-included), so a CoW-heavy cluster needs more free space than that; there is no
-space pre-check — a partition that hits ENOSPC fails on its own and a rerun
-finishes it.
-
-Checking the rule afterwards: a partition that crossed it logs `tombstones
-reached the deletion-trigger rule; scheduling a major compaction` with the
-entry and tombstone sums, then the usual `compact part N: major ...` line.
-`system_deletion_triggered_compaction` is the deterministic test:
-`cargo test -p autumn-manager --test system_deletion_triggered_compaction`.
-
-Once every cluster is converted, delete `convert_sst`, its Dockerfile line and
-`autumn_partition_server::sst_convert`.
-
-A cluster that ran a build with the covered-prefix replay marker holds
-`streamCoveredBefore/<stream>` keys in etcd; nothing reads them any more.
-Optional cleanup with the manager up: `etcdctl del --prefix streamCoveredBefore/`.
 
 ## Compio runtime upgrade verification
 

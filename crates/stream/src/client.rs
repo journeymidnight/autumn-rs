@@ -490,7 +490,16 @@ pub async fn read_extent_value_direct(
     // hands out addresses only when the payload is in `.dat`. An EC extent gets
     // a different descriptor and `read_extent_shard_direct` below, because its
     // bytes live in per-shard files and the offset means something else.
-    read_extent_direct(pool, addr, extent_id, eversion, offset, length, PayloadRef::in_dat()).await
+    read_extent_direct(
+        pool,
+        addr,
+        extent_id,
+        eversion,
+        offset,
+        length,
+        PayloadRef::in_dat(),
+    )
+    .await
 }
 
 /// One DATA SHARD's sub-range of an EC extent, straight from the node that
@@ -1506,11 +1515,8 @@ enum StreamSubmitMsg {
     /// Append payload segments; worker leases offsets, fans out to 3
     /// replicas, and acks on completion.
     ///
-    /// no `must_sync` field. Every append is durable via the
-    /// extent-node's per-extent fsync coalescer. This previously carried
-    /// a `must_sync: bool` that the extent-node honoured to skip the
-    /// fsync wait; that wire field was removed when --nosync was
-    /// dropped.
+    /// Every append is durable via the extent-node's per-extent
+    /// fsync coalescer.
     Append {
         payload_parts: Vec<Bytes>,
         owner_epoch: i64,
@@ -4053,10 +4059,6 @@ impl StreamClient {
     pub async fn await_log_synced_to(&self, extent_id: u64, offset: u64) -> Result<()> {
         self.await_extent_synced_to(extent_id, offset).await
     }
-
-    // Phase B retired the public `sync_stream_tail` API. The fsync
-    // barrier is now folded into `start_write_batch`'s rotation-trigger
-    // must_sync=true promotion in autumn-partition-server.
 
     pub async fn punch_holes(&self, stream_id: u64, extent_ids: Vec<u64>) -> Result<StreamInfo> {
         let req = manager_rpc::rkyv_encode(&PunchHolesReq {

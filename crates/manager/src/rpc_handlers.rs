@@ -14,11 +14,11 @@ use compio::BufResult;
 
 use std::rc::Rc;
 
-use crate::{AutumnManager, ConnPool, PendingDelete};
-use crate::persist::records::NodeRecord;
-use crate::persist::records::StreamRecord;
-use crate::persist::records::PartitionRecord;
 use crate::persist::records::ExtentRecord;
+use crate::persist::records::NodeRecord;
+use crate::persist::records::PartitionRecord;
+use crate::persist::records::StreamRecord;
+use crate::{AutumnManager, ConnPool, PendingDelete};
 
 /// #6: RAII removal of a partition from `AutumnManager.split_inflight` on every
 /// exit path of `handle_multi_modify_split` (success + all early-return errors).
@@ -166,17 +166,15 @@ impl AutumnManager {
     async fn handle_connection(conn: autumn_transport::Conn, mgr: AutumnManager) -> Result<()> {
         use futures::StreamExt;
         let (mut reader, mut writer) = conn.into_split();
+        let protocol = autumn_rpc::protocol_hello::accept(
+            &mut reader,
+            &mut writer,
+            autumn_rpc::protocol_hello::Service::Manager,
+        )
+        .await?;
         let mut decoder = FrameDecoder::new();
         let mut buf = vec![0u8; 64 * 1024];
-        // This connection's client wire version, from `MSG_CLIENT_HELLO`.
-        // `None` = it sent no hello, which `admit_connection` reads as the
-        // version the hello was introduced in — so every client built before
-        // it, and all internal peer traffic (PS→manager and EN→manager go
-        // through `autumn_stream::ConnPool` with no handshake), is unaffected.
-        let mut client_wire_version: Option<u32> = None;
-
-        let (resp_tx, mut resp_rx) =
-            futures::channel::mpsc::unbounded::<Bytes>();
+        let (resp_tx, mut resp_rx) = futures::channel::mpsc::unbounded::<Bytes>();
 
         // Writer task: drain encoded responses, write to socket
         // in completion order. Single writer = no concurrent
@@ -208,6 +206,18 @@ impl AutumnManager {
                             let req_id = frame.req_id;
                             let msg_type = frame.msg_type;
                             let payload = frame.payload;
+                            if let Err(e) = protocol.check_opcode(msg_type) {
+                                let reply = Frame::error(
+                                    req_id,
+                                    msg_type,
+                                    autumn_rpc::RpcError::encode_status(
+                                        StatusCode::PermissionDenied,
+                                        &e.to_string(),
+                                    ),
+                                );
+                                let _ = resp_tx.unbounded_send(reply.encode());
+                                continue;
+                            }
                             // Keepalive: answered in the decode loop, never
                             // spawned, so it proves this loop is reading.
                             if msg_type == autumn_rpc::MSG_TYPE_PING {
@@ -217,35 +227,13 @@ impl AutumnManager {
                                 let _ = resp_tx.unbounded_send(pong.encode());
                                 continue;
                             }
-                            // Version handshake + admission, SYNCHRONOUSLY in
-                            // the decode loop rather than inside the spawned
-                            // task: the per-connection value is `!Send`-free
-                            // but it is also ordering-sensitive — a hello and
-                            // the first request can arrive in one read, and a
-                            // detached task would let the request be judged
-                            // before the hello that describes it.
-                            if let Some(reply) = Self::client_wire_gate(
-                                msg_type,
-                                &payload,
-                                req_id,
-                                &mut client_wire_version,
-                            ) {
-                                // best-effort, exactly like the spawned
-                                // task's send below: a closed `resp_rx` means
-                                // the connection is already gone, and there is
-                                // no caller left to report it to.
-                                let _ = resp_tx.unbounded_send(reply);
-                                continue;
-                            }
                             let mgr_c = mgr.clone();
                             let tx = resp_tx.clone();
                             compio::runtime::spawn(async move {
                                 let resp_frame = match mgr_c.dispatch(msg_type, payload).await {
                                     Ok(p) => Frame::response(req_id, msg_type, p),
                                     Err((code, message)) => {
-                                        let p = autumn_rpc::RpcError::encode_status(
-                                            code, &message,
-                                        );
+                                        let p = autumn_rpc::RpcError::encode_status(code, &message);
                                         Frame::error(req_id, msg_type, p)
                                     }
                                 };
@@ -270,61 +258,6 @@ impl AutumnManager {
         drop(resp_tx);
         let _ = writer_task.await;
         reader_result
-    }
-
-    /// Answer `MSG_CLIENT_HELLO`, and refuse a client-surface message from a
-    /// connection whose version falls outside this binary's client window.
-    ///
-    /// `Some(frame_bytes)` = handled here; the caller emits it and does NOT
-    /// dispatch. `None` = admit as usual.
-    ///
-    /// **Scoped to msg_types, never to the connection.** The manager's listener
-    /// serves every partition server and extent node as well as clients, and
-    /// those peers are silent by construction — nothing in a frame says which
-    /// role sent it. A connection-scoped refusal would reject `register_ps`,
-    /// heartbeats, `register_node` and reconcile the moment the client floor
-    /// moved, which is a cluster outage rather than a compatibility check.
-    /// `MSG_GET_CLUSTER_ID` is exempt for the same family of reason: it is how
-    /// a peer finds out what it is talking to.
-    fn client_wire_gate(
-        msg_type: u8,
-        payload: &Bytes,
-        req_id: u32,
-        client_wire_version: &mut Option<u32>,
-    ) -> Option<Bytes> {
-        use autumn_rpc::client_hello;
-        let refuse = |code, msg: &str| -> Option<Bytes> {
-            Some(
-                Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, msg))
-                    .encode(),
-            )
-        };
-        if msg_type == client_hello::MSG_CLIENT_HELLO {
-            let Some(v) = client_hello::parse_hello_req(payload) else {
-                return refuse(StatusCode::InvalidArgument, "malformed MSG_CLIENT_HELLO");
-            };
-            // Recorded even when refused, so a client that ignores the refusal
-            // meets the same verdict on its next frame rather than an unknown
-            // one.
-            *client_wire_version = Some(v);
-            if let Err(why) = client_hello::admit_client(v) {
-                return refuse(StatusCode::FailedPrecondition, &why);
-            }
-            return Some(
-                Frame::response(
-                    req_id,
-                    msg_type,
-                    Bytes::copy_from_slice(&client_hello::server_hello_resp()),
-                )
-                .encode(),
-            );
-        }
-        if client_hello::is_client_surface_mgr_msg(msg_type) {
-            if let Err(why) = client_hello::admit_connection(*client_wire_version) {
-                return refuse(StatusCode::FailedPrecondition, &why);
-            }
-        }
-        None
     }
 
     async fn dispatch(&self, msg_type: u8, payload: Bytes) -> HandlerResult {
@@ -398,9 +331,6 @@ impl AutumnManager {
             MSG_RECOVERY_STATS => self.handle_recovery_stats(payload).await,
             MSG_QUERY_AUDIT_LOG => self.handle_query_audit_log(payload).await,
             MSG_GET_CLUSTER_ID => self.handle_get_cluster_id().await,
-            // ── R1 rolling upgrade: cluster_version gate ─────────────────
-            MSG_GET_CLUSTER_VERSION => self.handle_get_cluster_version().await,
-            MSG_BUMP_CLUSTER_VERSION => self.handle_bump_cluster_version(payload).await,
             // ── WAL self-heal A5: isolate a corrupt log_stream replica ──
             MSG_REPORT_CORRUPT_REPLICA => self.handle_report_corrupt_replica(payload).await,
             // ── cluster-df: aggregate capacity summary ──────────────────
@@ -458,7 +388,7 @@ impl AutumnManager {
                 cluster_id: String::new(),
                 wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
                 wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
-                cluster_version: self.cluster_version.get(),
+                cluster_version: 0,
             }));
         }
         Ok(rkyv_encode(&GetClusterIdResp {
@@ -467,7 +397,7 @@ impl AutumnManager {
             cluster_id: id,
             wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
             wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
-            cluster_version: self.cluster_version.get(),
+            cluster_version: 0,
         }))
     }
 
@@ -740,7 +670,9 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         match self.admin_token.borrow().as_ref() {
             Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
-            Some(_) => return Self::code_resp(CODE_PRECONDITION, "admin token invalid".to_string()),
+            Some(_) => {
+                return Self::code_resp(CODE_PRECONDITION, "admin token invalid".to_string())
+            }
             None => {
                 return Self::code_resp(
                     CODE_ERROR,
@@ -877,7 +809,9 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         match self.admin_token.borrow().as_ref() {
             Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
-            Some(_) => return Self::code_resp(CODE_PRECONDITION, "admin token invalid".to_string()),
+            Some(_) => {
+                return Self::code_resp(CODE_PRECONDITION, "admin token invalid".to_string())
+            }
             None => {
                 return Self::code_resp(
                     CODE_ERROR,
@@ -1105,62 +1039,6 @@ impl AutumnManager {
             message: String::new(),
             principals,
         }))
-    }
-
-    /// R1: read the persisted cluster_version. Servable from any replica,
-    /// but a follower's in-memory copy only updates on replay (leader
-    /// promotion) — after a bump it would stay stale indefinitely (coco
-    /// P2). This is a rare operator RPC, so do a FRESH etcd read (and
-    /// heal the local cache); fall back to the in-memory value only when
-    /// etcd is unreachable/absent (memory mode).
-    async fn handle_get_cluster_version(&self) -> HandlerResult {
-        if let Some(etcd) = &self.etcd {
-            if let Ok(resp) = etcd.client.get(crate::CLUSTER_VERSION_KEY.as_bytes()).await {
-                if let Some(kv) = resp.kvs.first() {
-                    match AutumnManager::parse_cluster_version(&kv.value) {
-                        Ok(v) => self.cluster_version.set(v),
-                        Err(err) => {
-                            // Out-of-bound (this binary older than the
-                            // committed format level) or garbage: report
-                            // it rather than serving a misleading number.
-                            return Ok(rkyv_encode(&GetClusterVersionResp {
-                                code: CODE_ERROR,
-                                message: err.to_string(),
-                                cluster_version: self.cluster_version.get(),
-                                wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
-                                wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(rkyv_encode(&GetClusterVersionResp {
-            code: CODE_OK,
-            message: String::new(),
-            cluster_version: self.cluster_version.get(),
-            wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
-            wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
-        }))
-    }
-
-    /// R1: operator bump (leader-only, monotonic +1, value-CAS'd —
-    /// validation in `bump_cluster_version`).
-    async fn handle_bump_cluster_version(&self, payload: Bytes) -> HandlerResult {
-        let req: BumpClusterVersionReq =
-            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        match self.bump_cluster_version(req.to).await {
-            Ok(v) => Ok(rkyv_encode(&BumpClusterVersionResp {
-                code: CODE_OK,
-                message: String::new(),
-                cluster_version: v,
-            })),
-            Err(err) => Ok(rkyv_encode(&BumpClusterVersionResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-                cluster_version: self.cluster_version.get(),
-            })),
-        }
     }
 
     /// WAL self-heal A5: isolate a bit-rotted log_stream replica reported by a
@@ -2139,7 +2017,12 @@ impl AutumnManager {
                 .get(&node_id)
                 .map(|n| n.disks.clone())
                 .unwrap_or_default();
-            let uuid_of = |id: &u64| disks_reg.get(id).map(|d| d.uuid.clone()).unwrap_or_default();
+            let uuid_of = |id: &u64| {
+                disks_reg
+                    .get(id)
+                    .map(|d| d.uuid.clone())
+                    .unwrap_or_default()
+            };
             let mut out: Vec<DiskCapWire> = reported
                 .iter()
                 .filter(|(disk_id, _)| owned.contains(disk_id))
@@ -2584,14 +2467,15 @@ impl AutumnManager {
             let tail_id = match stream.extent_ids.last().copied() {
                 Some(v) => v,
                 None => {
-                    return Self::alloc_reject(CODE_NOT_FOUND, format!("tail extent in stream {}", req.stream_id))
+                    return Self::alloc_reject(
+                        CODE_NOT_FOUND,
+                        format!("tail extent in stream {}", req.stream_id),
+                    )
                 }
             };
             let tail = match s.extents.get(&tail_id).cloned() {
                 Some(v) => v,
-                None => {
-                    return Self::alloc_reject(CODE_NOT_FOUND, format!("extent {tail_id}"))
-                }
+                None => return Self::alloc_reject(CODE_NOT_FOUND, format!("extent {tail_id}")),
             };
 
             // BUG2-IDEMPOTENT-ROLL: the writer pinned `seal_extent_id` = the tail
@@ -2675,9 +2559,7 @@ impl AutumnManager {
                 &req.exclude_node_ids,
             ) {
                 Ok(v) => v,
-                Err(err) => {
-                    return Self::alloc_reject(Self::err_to_code(&err), err.to_string())
-                }
+                Err(err) => return Self::alloc_reject(Self::err_to_code(&err), err.to_string()),
             };
             let (extent_id, _) = s.alloc_ids(1);
             (tail, selected, extent_id, data, s.nodes.clone())
@@ -3280,7 +3162,14 @@ impl AutumnManager {
         };
 
         match out {
-            Ok((stream, extent_puts, extent_deletes, pending_deletes, stream_baseline, extent_cas)) => {
+            Ok((
+                stream,
+                extent_puts,
+                extent_deletes,
+                pending_deletes,
+                stream_baseline,
+                extent_cas,
+            )) => {
                 // Persist to etcd FIRST. Failure → in-memory zero changes
                 // (the closure above produced clones only).
                 if let Err(err) = self
@@ -3426,7 +3315,14 @@ impl AutumnManager {
         };
 
         match out {
-            Ok((stream, extent_puts, extent_deletes, pending_deletes, stream_baseline, extent_cas)) => {
+            Ok((
+                stream,
+                extent_puts,
+                extent_deletes,
+                pending_deletes,
+                stream_baseline,
+                extent_cas,
+            )) => {
                 if let Err(err) = self
                     .mirror_stream_extent_mutation(
                         &stream,
@@ -3516,7 +3412,10 @@ impl AutumnManager {
     /// txn — keeps a stale-base mutation from landing durably (committing
     /// then returning Precondition would leave etcd holding a write that
     /// replay loads as if successful).
-    fn first_eversion_drift(&self, pre_bump_eversion: &HashMap<u64, u64>) -> Option<(u64, u64, u64)> {
+    fn first_eversion_drift(
+        &self,
+        pre_bump_eversion: &HashMap<u64, u64>,
+    ) -> Option<(u64, u64, u64)> {
         let s = self.store.inner.borrow();
         for (eid, expected) in pre_bump_eversion {
             if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
@@ -3825,7 +3724,10 @@ impl AutumnManager {
                             .iter()
                             .filter_map(|ex| {
                                 s.extents.get(&ex.extent_id).map(|orig| {
-                                    (format!("extents/{}", ex.extent_id), crate::persist::encode(orig))
+                                    (
+                                        format!("extents/{}", ex.extent_id),
+                                        crate::persist::encode(orig),
+                                    )
                                 })
                             })
                             .collect()
@@ -4108,7 +4010,10 @@ impl AutumnManager {
                     .iter()
                     .filter_map(|ex| {
                         s.extents.get(&ex.extent_id).map(|orig| {
-                            (format!("extents/{}", ex.extent_id), crate::persist::encode(orig))
+                            (
+                                format!("extents/{}", ex.extent_id),
+                                crate::persist::encode(orig),
+                            )
                         })
                     })
                     .collect();
@@ -5029,7 +4934,12 @@ impl AutumnManager {
         let load_progress: Vec<(u64, autumn_rpc::manager_rpc::MaintenanceProgress)> = req
             .partitions
             .iter()
-            .flat_map(|l| l.active_maintenance.iter().cloned().map(move |m| (l.part_id, m)))
+            .flat_map(|l| {
+                l.active_maintenance
+                    .iter()
+                    .cloned()
+                    .map(move |m| (l.part_id, m))
+            })
             .collect();
         let mut p = self.policy.borrow_mut();
         // honour the configured `window_buckets / bucket_sec`
@@ -5060,9 +4970,9 @@ impl AutumnManager {
             } else {
                 // Split's ledger entry carries `secondary_id == 0`, and split
                 // is the only kind that reports without an op id from a PS.
-                self.ops.borrow_mut().update_progress_by_part(
-                    p.kind, *part_id, 0, p.done, p.total,
-                );
+                self.ops
+                    .borrow_mut()
+                    .update_progress_by_part(p.kind, *part_id, 0, p.done, p.total);
             }
         }
         // Reconcile PS-executed op outcomes into the ledger (known op_id only,
@@ -5446,7 +5356,9 @@ impl AutumnManager {
     pub(crate) async fn handle_get_partition_detail(&self, payload: Bytes) -> HandlerResult {
         let req: GetPartitionDetailReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        Ok(rkyv_encode(&self.compute_partition_detail_resp(req.part_id)))
+        Ok(rkyv_encode(
+            &self.compute_partition_detail_resp(req.part_id),
+        ))
     }
 
     /// Dashboard compact overview: per-partition rollup (range / ps / live_size
@@ -5480,7 +5392,13 @@ impl AutumnManager {
             pol.metrics
                 .get(&pid)
                 .and_then(|w| w.buckets.back())
-                .map(|(_, l)| (l.req_per_sec as u64, l.write_bytes_per_sec, l.read_bytes_per_sec))
+                .map(|(_, l)| {
+                    (
+                        l.req_per_sec as u64,
+                        l.write_bytes_per_sec,
+                        l.read_bytes_per_sec,
+                    )
+                })
                 .unwrap_or((0, 0, 0))
         };
 
@@ -6160,7 +6078,14 @@ impl AutumnManager {
             let nodes: Vec<(u64, String, String, Vec<u16>)> = s
                 .nodes
                 .iter()
-                .map(|(id, n)| (*id, n.address.clone(), n.node_uuid.clone(), n.shard_ports.clone()))
+                .map(|(id, n)| {
+                    (
+                        *id,
+                        n.address.clone(),
+                        n.node_uuid.clone(),
+                        n.shard_ports.clone(),
+                    )
+                })
                 .collect();
             let overrides = self.node_overrides.borrow().clone();
             let snap = self.node_states.borrow().snapshot();
@@ -6737,9 +6662,10 @@ impl AutumnManager {
                     format!(
                         "extent {}: no recovery target {:?} reports {} free bytes for its \
                          shard (no report from {:?}) (use --force to override)",
-                        ex.extent_id, targets, shard_size, unreported
-                    )
-                }));
+                            ex.extent_id, targets, shard_size, unreported
+                        )
+                    },
+                ));
             }
             to_move = to_move.saturating_add(shard_size);
             receivers.extend(targets);
@@ -7343,13 +7269,11 @@ impl AutumnManager {
                     }),
                 }))
             }
-            crate::inode_lease::HeartbeatOutcome::NotHeld => {
-                Ok(rkyv_encode(&HeartbeatLeaseResp {
-                    code: CODE_NOT_FOUND,
-                    message: "lease not held".to_string(),
-                    lease: None,
-                }))
-            }
+            crate::inode_lease::HeartbeatOutcome::NotHeld => Ok(rkyv_encode(&HeartbeatLeaseResp {
+                code: CODE_NOT_FOUND,
+                message: "lease not held".to_string(),
+                lease: None,
+            })),
         }
     }
 
@@ -8157,7 +8081,10 @@ mod namespace_registry_tests {
     /// Drive a mutating op through `dispatch` (where the gate lives). Returns the
     /// frame-level result: `Ok` = passed the gate (the handler then ran and
     /// answered on its own merits), `Err(code,msg)` = the gate rejected it.
-    fn dispatch_merge(m: &AutumnManager, wire_payload: Bytes) -> Result<Bytes, (StatusCode, String)> {
+    fn dispatch_merge(
+        m: &AutumnManager,
+        wire_payload: Bytes,
+    ) -> Result<Bytes, (StatusCode, String)> {
         run(async { m.dispatch(MSG_MERGE_PARTITIONS, wire_payload).await })
     }
 
@@ -8657,7 +8584,13 @@ mod namespace_registry_tests {
 
         let cfg = authz_config(&m);
         // `namespaces` carries EVERY registered prefix (Layer-A data source).
-        for p in [b"fs/".to_vec(), b"kvc/".to_vec(), b"mem/".to_vec(), b"bench/".to_vec(), b"scratch/".to_vec()] {
+        for p in [
+            b"fs/".to_vec(),
+            b"kvc/".to_vec(),
+            b"mem/".to_vec(),
+            b"bench/".to_vec(),
+            b"scratch/".to_vec(),
+        ] {
             assert!(cfg.namespaces.contains(&p), "namespaces missing {p:?}");
         }
         // `protected_prefixes` carries ONLY the owned namespace (bench), not the
@@ -8706,9 +8639,9 @@ mod cluster_df_disk_tests {
     //! distinct: a node that ANSWERED df but omitted a disk the registry assigns
     //! to it (one `reported: false` row), and a node that did NOT answer (no
     //! rows — an unreachable machine is one fact, not N missing disks).
+    use crate::persist::records::NodeRecord;
     use crate::{AutumnManager, NodeCap};
     use autumn_rpc::extent_rpc::DiskStatus;
-    use crate::persist::records::NodeRecord;
 
     fn node(id: u64, disks: &[u64]) -> NodeRecord {
         NodeRecord {
@@ -8722,7 +8655,12 @@ mod cluster_df_disk_tests {
     }
 
     fn up(total: u64, free: u64) -> DiskStatus {
-        DiskStatus { total, free, online: true, extent_bytes: 0 }
+        DiskStatus {
+            total,
+            free,
+            online: true,
+            extent_bytes: 0,
+        }
     }
 
     fn mgr_with(nodes: &[NodeRecord], disk_ids: &[u64]) -> AutumnManager {
@@ -8736,7 +8674,11 @@ mod cluster_df_disk_tests {
             for d in disk_ids {
                 s.disks.insert(
                     *d,
-                    crate::persist::records::DiskRecord { disk_id: *d, online: true, uuid: format!("uuid-{d}") },
+                    crate::persist::records::DiskRecord {
+                        disk_id: *d,
+                        online: true,
+                        uuid: format!("uuid-{d}"),
+                    },
                 );
             }
         }
@@ -8771,8 +8713,13 @@ mod cluster_df_disk_tests {
     #[test]
     fn unreachable_node_gets_no_rows_not_n_missing_disks() {
         let m = mgr_with(&[node(1, &[10, 11])], &[10, 11]);
-        m.cluster_cap.borrow_mut().per_node =
-            vec![(1, NodeCap { online: false, ..Default::default() })];
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                online: false,
+                ..Default::default()
+            },
+        )];
         let resp = m.compute_cluster_df_resp();
         assert!(
             resp.per_node[0].disks.is_empty(),
@@ -8815,8 +8762,16 @@ mod fence_precheck_tests {
 
     /// Nodes `nodes`, one RF2 extent per `(id, [a, b], sealed_length)`, and a
     /// df row with `free` bytes for each node listed in `free`.
-    fn cluster(nodes: &[u64], extents: &[(u64, [u64; 2], u64)], free: &[(u64, u64)]) -> AutumnManager {
-        cluster_with(nodes, extents, &free.iter().map(|(n, f)| (*n, *f, true)).collect::<Vec<_>>())
+    fn cluster(
+        nodes: &[u64],
+        extents: &[(u64, [u64; 2], u64)],
+        free: &[(u64, u64)],
+    ) -> AutumnManager {
+        cluster_with(
+            nodes,
+            extents,
+            &free.iter().map(|(n, f)| (*n, *f, true)).collect::<Vec<_>>(),
+        )
     }
 
     /// As `cluster`, with each df row's `online` flag given: a probe that
@@ -8863,7 +8818,13 @@ mod fence_precheck_tests {
             .map(|(nid, f, online)| {
                 (
                     *nid,
-                    NodeCap { total: 1 << 40, free: *f, extent_bytes: 0, online: *online, disks: Vec::new() },
+                    NodeCap {
+                        total: 1 << 40,
+                        free: *f,
+                        extent_bytes: 0,
+                        online: *online,
+                        disks: Vec::new(),
+                    },
                 )
             })
             .collect();
@@ -8896,21 +8857,34 @@ mod fence_precheck_tests {
 
     #[test]
     fn a_legal_target_with_room_passes() {
-        let m = cluster(&[1, 2, 3], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB), (3, 10 * GIB)]);
-        m.check_capacity_for_fence(1).expect("node 3 can take extent 7's slot");
+        let m = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB), (3, 10 * GIB)],
+        );
+        m.check_capacity_for_fence(1)
+            .expect("node 3 can take extent 7's slot");
     }
 
     /// The review's case: an RF2 extent already on the only two nodes.
     #[test]
     fn no_spare_is_refused() {
-        let m = cluster(&[1, 2], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB)]);
+        let m = cluster(
+            &[1, 2],
+            &[(7, [1, 2], GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB)],
+        );
         assert!(refused(&m, 1).contains("extent 7 has no recovery target"));
     }
 
     #[test]
     fn a_spare_that_is_fenced_in_maintenance_or_suspected_does_not_count() {
         for how in ["fenced", "maintenance", "suspected"] {
-            let m = cluster(&[1, 2, 3], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB), (3, 10 * GIB)]);
+            let m = cluster(
+                &[1, 2, 3],
+                &[(7, [1, 2], GIB)],
+                &[(1, 10 * GIB), (2, 10 * GIB), (3, 10 * GIB)],
+            );
             match how {
                 "fenced" => set_override(&m, 3, NODE_OVERRIDE_FENCED),
                 "maintenance" => set_override(&m, 3, NODE_OVERRIDE_MAINTENANCE),
@@ -8933,7 +8907,11 @@ mod fence_precheck_tests {
 
     #[test]
     fn a_target_without_room_for_the_shard_is_refused() {
-        let m = cluster(&[1, 2, 3], &[(7, [1, 2], 4 * GIB)], &[(1, 10 * GIB), (2, 10 * GIB), (3, GIB)]);
+        let m = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], 4 * GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB), (3, GIB)],
+        );
         assert!(refused(&m, 1).contains("free bytes for its shard"));
     }
 
@@ -8941,12 +8919,20 @@ mod fence_precheck_tests {
     /// unknown capacity is not room, and the message says it is unknown.
     #[test]
     fn a_target_without_a_capacity_signal_is_refused() {
-        let absent = cluster(&[1, 2, 3], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB)]);
+        let absent = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB)],
+        );
         assert!(refused(&absent, 1).contains("no capacity report yet"));
         let failed = cluster_with(
             &[1, 2, 3],
             &[(7, [1, 2], GIB)],
-            &[(1, 10 * GIB, true), (2, 10 * GIB, true), (3, 10 * GIB, false)],
+            &[
+                (1, 10 * GIB, true),
+                (2, 10 * GIB, true),
+                (3, 10 * GIB, false),
+            ],
         );
         assert!(refused(&failed, 1).contains("no capacity report yet"));
     }
@@ -8999,9 +8985,18 @@ mod fence_precheck_tests {
     /// `--force` is the explicit override: the same no-spare cluster fences.
     #[test]
     fn force_skips_the_check() {
-        let m = cluster(&[1, 2], &[(7, [1, 2], GIB)], &[(1, 10 * GIB), (2, 10 * GIB)]);
+        let m = cluster(
+            &[1, 2],
+            &[(7, [1, 2], GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB)],
+        );
         let call = |force: bool| {
-            let req = FenceNodeReq { node_id: 1, reason: "t".into(), set_by: "t".into(), force };
+            let req = FenceNodeReq {
+                node_id: 1,
+                reason: "t".into(),
+                set_by: "t".into(),
+                force,
+            };
             let bytes = compio::runtime::Runtime::new()
                 .unwrap()
                 .block_on(m.handle_fence_node(rkyv_encode(&req)))

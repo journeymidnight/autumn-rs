@@ -262,6 +262,8 @@ pub async fn register_node_with_uuid(
 
 /// Create a replicated stream.
 pub async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
+    let mgr = RpcClient::connect_as(mgr.peer_addr(), autumn_rpc::protocol_hello::Role::Admin,
+        Some(autumn_rpc::protocol_hello::Service::Manager)).await.unwrap();
     let resp = mgr
         .call(
             MSG_CREATE_STREAM,
@@ -303,6 +305,8 @@ pub async fn upsert_partition(
     start_key: &[u8],
     end_key: &[u8],
 ) {
+    let mgr = RpcClient::connect_as(mgr.peer_addr(), autumn_rpc::protocol_hello::Role::Admin,
+        Some(autumn_rpc::protocol_hello::Service::Manager)).await.unwrap();
     let resp = mgr
         .call(
             MSG_UPSERT_PARTITION,

@@ -5,7 +5,6 @@ pub mod authz;
 pub mod background;
 mod rpc_handlers;
 mod sstable;
-pub mod sst_convert;
 mod wal_record;
 
 use background::*;
@@ -25,6 +24,9 @@ use autumn_common::metrics::{duration_to_ns, ns_to_ms};
 use autumn_rpc::manager_rpc::{self, rkyv_decode, rkyv_encode, MgrRange as Range};
 use autumn_rpc::partition_rpc::{self, SstLocation, TableLocations, *};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
+#[cfg(test)]
+#[path = "../../rpc/tests/support/protocol.rs"]
+mod test_protocol;
 use autumn_stream::{ConnPool, StreamClient};
 use bytes::Bytes;
 use compio::io::AsyncWriteExt;
@@ -2068,8 +2070,14 @@ pub(crate) enum GcTask {
     /// `discard_ratio > 0.4` over all sealed non-tail extents (the
     /// original single-tier behaviour) PLUS empty-sealed slots that
     /// the candidate-set fix unblocked. `op_id == 0` = untracked.
-    Auto { params: GcAutoParams, op_id: u64 },
-    Force { extent_ids: Vec<u64>, op_id: u64 },
+    Auto {
+        params: GcAutoParams,
+        op_id: u64,
+    },
+    Force {
+        extent_ids: Vec<u64>,
+        op_id: u64,
+    },
 }
 
 impl GcTask {
@@ -2218,7 +2226,10 @@ pub(crate) enum WriteOp {
     /// the same (or an earlier) group-commit batch — durable no later than
     /// the admitted write's ACK. Skips the in_range check (its key is the
     /// raw ino, not a user key) and the memtable insert.
-    FenceBump { ino: u64, epoch: u64 },
+    FenceBump {
+        ino: u64,
+        epoch: u64,
+    },
 }
 
 /// Shared accumulator for `MSG_BATCH_PUT`. The dispatcher creates ONE
@@ -3603,7 +3614,33 @@ impl PartitionServer {
     /// that need to set `base_port` before the implicit
     /// `sync_regions_once()` runs use this + `bind_listen_addr` +
     /// `finish_connect`.
-    async fn connect_raw(
+    /// Keep an upgraded process alive while the manager still speaks the old
+    /// wire. Identity, authorization and storage errors remain hard failures.
+    async fn connect_raw(ps_id: u64, manager_endpoint: &str, advertise_addr: Option<String>) -> Result<Self> {
+        let mut delay = 1u64;
+        loop {
+            match Self::connect_raw_once(ps_id, manager_endpoint, advertise_addr.clone()).await {
+                Ok(server) => return Ok(server),
+                Err(e) if Self::manager_wait_error(&e) => {
+                    tracing::warn!(ps_id, manager = manager_endpoint, wire = autumn_rpc::WIRE_VERSION,
+                        error = %format!("{e:#}"), delay, "waiting for compatible manager owner lock; dependencies not ready");
+                    compio::time::sleep(Duration::from_secs(delay)).await;
+                    delay = (delay + 1).min(5);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn manager_wait_error(error: &anyhow::Error) -> bool {
+        let text = error.to_string().to_lowercase();
+        text.contains("not leader") || text.contains("notleader") ||
+            error.downcast_ref::<autumn_rpc::RpcError>().is_some_and(|e| matches!(e,
+                autumn_rpc::RpcError::VersionMismatch { .. } | autumn_rpc::RpcError::Io(_)
+                | autumn_rpc::RpcError::ConnectionClosed | autumn_rpc::RpcError::Timeout(_)))
+    }
+
+    async fn connect_raw_once(
         ps_id: u64,
         manager_endpoint: &str,
         advertise_addr: Option<String>,
@@ -3649,7 +3686,9 @@ impl PartitionServer {
                             // `bind_listen_addr` (called from
                             // `serve()` or `connect_with_advertise_and_port`).
                             base_port: Cell::new(0),
-                            used_port_ords: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+                            used_port_ords: Rc::new(
+                                RefCell::new(std::collections::BTreeSet::new()),
+                            ),
                             advertise_host: Rc::new(std::cell::RefCell::new(String::from(
                                 "127.0.0.1",
                             ))),
@@ -3683,45 +3722,18 @@ impl PartitionServer {
     async fn finish_connect(self) -> Result<Self> {
         let server = self;
 
-        // WIRE-1: startup wire-schema cross-check against the manager. A
-        // successful response whose wire-version interval does not overlap
-        // ours is a hard refusal (mixed same-commit deploy — rkyv decodes
-        // garbage silently); a transport failure is best-effort-skipped
-        // (register_ps below retries through manager unavailability).
-        if let Ok(resp_bytes) = server
-            .pool
-            .call_timeout(
-                server.manager_addr(),
-                manager_rpc::MSG_GET_CLUSTER_ID,
-                manager_rpc::rkyv_encode(&manager_rpc::GetClusterIdReq {}),
-                Duration::from_secs(5),
-            )
-            .await
-        {
-            // Successful-but-undecodable IS the mismatch (coco P1).
-            let resp = manager_rpc::rkyv_decode::<manager_rpc::GetClusterIdResp>(&resp_bytes)
-                .map_err(|e| {
-                    anyhow::anyhow!("decode GetClusterIdResp failed ({e}) — possible wire-schema mismatch; rebuild from the cluster's commit")
-                })?;
-            // A partition server is a CLUSTER peer, so it needs the manager's
-            // exact version. `wire_version_min` is the CLIENT floor and says
-            // nothing about whether this PS belongs in this cluster.
-            if let Err(msg) = autumn_rpc::cluster_peer_compat_check(resp.wire_version_max) {
-                return Err(anyhow::anyhow!(msg));
-            }
-        }
-
-        // Retry register_ps — manager may still be electing leader after restart.
-        let mut retries = 15;
+        // Every manager connection is version-checked by the pool before
+        // registration. During a wire rollout, stay started and wait for the
+        // manager instead of skipping the check or exhausting a retry count.
+        let mut delay = 1u64;
         loop {
             match server.register_ps().await {
                 Ok(()) => break,
-                Err(e) if retries > 0 && e.to_string().contains("not leader") => {
-                    retries -= 1;
-                    tracing::warn!(
-                        "register_ps: manager not leader yet, retrying in 1s ({retries} left)"
-                    );
-                    compio::time::sleep(Duration::from_secs(1)).await;
+                Err(e) if Self::manager_wait_error(&e) =>
+                {
+                    tracing::warn!(ps_id = server.ps_id, wire = autumn_rpc::WIRE_VERSION, error = %format!("{e:#}"), delay, "waiting for manager registration; dependencies not ready");
+                    compio::time::sleep(Duration::from_secs(delay)).await;
+                    delay = (delay + 1).min(5);
                 }
                 Err(e) => return Err(e),
             }
@@ -4000,9 +4012,11 @@ impl PartitionServer {
             ("autumn_ps_partition_open_tail_dead_bytes", "gauge", |m| {
                 m.open_tail_dead_bytes.load(Relaxed) as f64
             }),
-            ("autumn_ps_partition_pending_compaction_bytes", "gauge", |m| {
-                m.pending_compaction_bytes.load(Relaxed) as f64
-            }),
+            (
+                "autumn_ps_partition_pending_compaction_bytes",
+                "gauge",
+                |m| m.pending_compaction_bytes.load(Relaxed) as f64,
+            ),
             ("autumn_ps_partition_gc_inflight", "gauge", |m| {
                 m.gc_inflight.load(Relaxed) as f64
             }),
@@ -4495,7 +4509,10 @@ impl PartitionServer {
             // `self.partitions` borrow is held across the `.next().await`.
             let mut opens = futures::stream::iter(to_open)
                 .map(
-                    |(part_id, (rg, log_stream_id, row_stream_id, meta_stream_id, region_epoch))| async move {
+                    |(
+                        part_id,
+                        (rg, log_stream_id, row_stream_id, meta_stream_id, region_epoch),
+                    )| async move {
                         tracing::info!("PS {} opening partition {part_id}", self.ps_id);
                         let r = self
                             .open_partition(
@@ -5209,7 +5226,9 @@ enum PsReadBurst {
         reader: autumn_transport::ReadHalf,
     },
     Eof,
-    Err { e: std::io::Error },
+    Err {
+        e: std::io::Error,
+    },
 }
 
 /// Build a `'static`-lifetime `LocalBoxFuture<PsReadBurst>` that reads once
@@ -5297,9 +5316,7 @@ async fn drain_bulk_writes(
     reader: &mut autumn_transport::ReadHalf,
     req_tx: &mpsc::Sender<PartitionRequest>,
     owner_part: u64,
-    inflight: &mut FuturesUnordered<
-        futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>,
-    >,
+    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>>,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
     authz: &crate::authz::AuthzState,
@@ -5692,34 +5709,12 @@ pub(crate) struct ConnGateState {
     /// Bound by a successful `MSG_AUTH_HELLO`. `None` = anonymous (denied on
     /// protected prefixes only).
     pub principal: Option<crate::authz::BoundPrincipal>,
-    /// This client's wire version, from `MSG_CLIENT_HELLO`. `None` = the
-    /// connection sent no hello, which `admit_connection` reads as the version
-    /// the hello was introduced in — that is what makes admission inert for
-    /// every client built before it existed, and for the manager→PS control
-    /// RPCs, which carry no handshake.
-    pub client_wire_version: Option<u32>,
+    pub protocol: Option<autumn_rpc::protocol_hello::Negotiated>,
 }
 
-/// The connection-layer gate. Runs at the TOP of every frame dispatch, before
-/// routing, and is the ONE choke point for everything decided per CONNECTION
-/// rather than per request: `MSG_CLIENT_HELLO` (record + admit the client's
-/// wire version), wire-version admission on the client-surface msg_types,
-/// `MSG_AUTH_HELLO` (verify + bind the principal), and — when authz is enabled
-/// — the per-request key-prefix + `exp` check.
-///
-/// The two connection facts live in ONE `ConnGateState` deliberately. Every
-/// dispatch path already threads it here, so a new per-connection fact cannot
-/// be added to some paths and missed on others — the shape that has bitten this
-/// file twice (`extract_part_id` and `authz_check` each shipped a keyed opcode
-/// with no arm).
-///
-/// Returns `Some(reply_bytes)` when the frame was HANDLED here — a hello
-/// response, a wire-version refusal, an AUTH_HELLO response or a
-/// `PermissionDenied` rejection — so the caller emits `reply` and does NOT
-/// dispatch the frame to serve/delegate. `None` = admit as usual.
-///
-/// Synchronous (no I/O): `conn` is mutated only here, before any await in the
-/// calling dispatch fn, so the `&mut` borrow never spans an await.
+/// Checks the negotiated role before business DTO decoding, then preserves
+/// existing AUTH_HELLO and key-prefix/expiry authorization. The bootstrap
+/// itself completes before this gate or the business decoder is reached.
 fn authz_gate(
     msg_type: u8,
     payload: &Bytes,
@@ -5727,54 +5722,16 @@ fn authz_gate(
     authz: &crate::authz::AuthzState,
     conn: &mut ConnGateState,
 ) -> Option<Bytes> {
-    // Wire-version admission runs FIRST, and above the `gate_active()` early
-    // return below — under it this would never run on an authz-off cluster,
-    // which is most of them. It is scoped to the client-surface msg_types, not
-    // to the connection: the manager→PS control RPCs arrive on listeners that
-    // serve clients too, with nothing in a frame to say which role sent them.
-    if msg_type == autumn_rpc::client_hello::MSG_CLIENT_HELLO {
-        let Some(v) = autumn_rpc::client_hello::parse_hello_req(payload) else {
+    if let Some(protocol) = &conn.protocol {
+        if let Err(e) = protocol.check_opcode(msg_type) {
             return Some(
                 Frame::error(
                     req_id,
                     msg_type,
                     autumn_rpc::RpcError::encode_status(
-                        StatusCode::InvalidArgument,
-                        "malformed MSG_CLIENT_HELLO",
+                        StatusCode::PermissionDenied,
+                        &e.to_string(),
                     ),
-                )
-                .encode(),
-            );
-        };
-        // Recorded even when it is refused: a client that ignores the refusal
-        // and sends a Put must meet the same verdict, not an unknown one.
-        conn.client_wire_version = Some(v);
-        if let Err(why) = autumn_rpc::client_hello::admit_client(v) {
-            return Some(
-                Frame::error(
-                    req_id,
-                    msg_type,
-                    autumn_rpc::RpcError::encode_status(StatusCode::FailedPrecondition, &why),
-                )
-                .encode(),
-            );
-        }
-        return Some(
-            Frame::response(
-                req_id,
-                msg_type,
-                Bytes::copy_from_slice(&autumn_rpc::client_hello::server_hello_resp()),
-            )
-            .encode(),
-        );
-    }
-    if autumn_rpc::client_hello::is_client_surface_ps_msg(msg_type) {
-        if let Err(why) = autumn_rpc::client_hello::admit_connection(conn.client_wire_version) {
-            return Some(
-                Frame::error(
-                    req_id,
-                    msg_type,
-                    autumn_rpc::RpcError::encode_status(StatusCode::FailedPrecondition, &why),
                 )
                 .encode(),
             );
@@ -5852,8 +5809,12 @@ fn authz_gate(
     if !snap.namespaces.is_empty() {
         if let Some((code, msg)) = crate::authz::check_layer_a(msg_type, payload, &snap) {
             return Some(
-                Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &msg))
-                    .encode(),
+                Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(code, &msg),
+                )
+                .encode(),
             );
         }
     }
@@ -5864,8 +5825,12 @@ fn authz_gate(
             crate::authz::authz_check(msg_type, payload, principal.as_ref(), &snap, now)
         {
             return Some(
-                Frame::error(req_id, msg_type, autumn_rpc::RpcError::encode_status(code, &msg))
-                    .encode(),
+                Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(code, &msg),
+                )
+                .encode(),
             );
         }
     }
@@ -5895,9 +5860,7 @@ fn push_one_frame_to_inflight(
     // into
     // `tx_bufs` so one vectored flush emits them as a single wire frame
     // (segmented at IOV_MAX, since a batched read contributes one buffer per value).
-    inflight: &mut FuturesUnordered<
-        futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>,
-    >,
+    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>>,
     // connection authz runtime + the per-connection facts the gate owns.
     authz: &crate::authz::AuthzState,
     conn: &mut ConnGateState,
@@ -6007,9 +5970,7 @@ async fn push_frames_to_inflight(
     req_tx: &mpsc::Sender<PartitionRequest>,
     part: &Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
-    inflight: &mut FuturesUnordered<
-        futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>,
-    >,
+    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>>,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
     // threaded into push_one_frame_to_inflight for the per-frame gate.
@@ -6089,13 +6050,19 @@ async fn handle_ps_connection(
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "?".to_string());
-    let (reader, mut writer) = conn.into_split();
+    let (mut reader, mut writer) = conn.into_split();
+    let protocol = autumn_rpc::protocol_hello::accept(
+        &mut reader,
+        &mut writer,
+        autumn_rpc::protocol_hello::Service::PartitionServer,
+    )
+    .await?;
     let mut decoder = FrameDecoder::new();
-    // Per-connection facts the gate owns: the principal bound by a
-    // successful MSG_AUTH_HELLO, and the wire version reported by
-    // MSG_CLIENT_HELLO. Both default to "not said", which is what makes this
-    // inert for every client and internal peer that predates the hello.
-    let mut conn_state = ConnGateState::default();
+    // The negotiated protocol precedes the principal bound by AUTH_HELLO.
+    let mut conn_state = ConnGateState {
+        protocol: Some(protocol),
+        ..Default::default()
+    };
 
     let cap = ps_conn_inflight_cap();
     // R4: completion = `(head, values)`; non-empty only for the bulk reads
@@ -6106,8 +6073,10 @@ async fn handle_ps_connection(
     let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(64);
 
     // Persistent read future: owns reader + read window across iterations.
-    let mut read_fut: Option<LocalBoxFuture<'static, PsReadBurst>> =
-        Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
+    let mut read_fut: Option<LocalBoxFuture<'static, PsReadBurst>> = Some(spawn_ps_read(
+        reader,
+        ps_read_window(&mut decoder, READ_BUF_SIZE),
+    ));
 
     loop {
         // (A) Opportunistic drain of already-ready completions.
@@ -6217,7 +6186,10 @@ async fn handle_ps_connection(
                         &mut conn_state,
                     )
                     .await?;
-                    read_fut = Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
+                    read_fut = Some(spawn_ps_read(
+                        reader,
+                        ps_read_window(&mut decoder, READ_BUF_SIZE),
+                    ));
                 }
             }
             continue;
@@ -6312,7 +6284,10 @@ async fn handle_ps_connection(
                             &mut conn_state,
                         )
                         .await?;
-                        read_fut = Some(spawn_ps_read(reader, ps_read_window(&mut decoder, READ_BUF_SIZE)));
+                        read_fut = Some(spawn_ps_read(
+                            reader,
+                            ps_read_window(&mut decoder, READ_BUF_SIZE),
+                        ));
                     }
                 }
             }
@@ -6660,9 +6635,9 @@ async fn partition_thread_main(
     // A merge leaves one checkpoint per source in the meta stream. Publish the
     // merged one before serving, so every later open replays from one cursor.
     if ckpt_records > 1 {
-        publish_merged_checkpoint(&part)
-            .await
-            .with_context(|| format!("partition {part_id}: merge {ckpt_records} checkpoints into one"))?;
+        publish_merged_checkpoint(&part).await.with_context(|| {
+            format!("partition {part_id}: merge {ckpt_records} checkpoints into one")
+        })?;
     }
 
     // Spawn background loops on this thread's compio runtime.
@@ -7207,7 +7182,16 @@ async fn partition_loop(
                 futures::pin_mut!(req_fut, timer);
                 match select(req_fut, timer).await {
                     Either::Left((Some(req), _)) => {
-                        handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
+                        handle_incoming_req(
+                            req,
+                            &mut pending,
+                            &part,
+                            &routing,
+                            &mut inflight,
+                            &mut metrics,
+                            &locked_by_other,
+                        )
+                        .await;
                         continue;
                     }
                     Either::Left((None, _)) => break,
@@ -7376,7 +7360,16 @@ async fn partition_loop(
                 match select(req_fut, wake_fut).await {
                     Either::Left((maybe_req, _)) => match maybe_req {
                         Some(req) => {
-                            handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
+                            handle_incoming_req(
+                                req,
+                                &mut pending,
+                                &part,
+                                &routing,
+                                &mut inflight,
+                                &mut metrics,
+                                &locked_by_other,
+                            )
+                            .await;
                         }
                         None => break,
                     },
@@ -7392,7 +7385,16 @@ async fn partition_loop(
                 match select(req_fut, select(wake_fut, drain_fut)).await {
                     Either::Left((maybe_req, _)) => match maybe_req {
                         Some(req) => {
-                            handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
+                            handle_incoming_req(
+                                req,
+                                &mut pending,
+                                &part,
+                                &routing,
+                                &mut inflight,
+                                &mut metrics,
+                                &locked_by_other,
+                            )
+                            .await;
                         }
                         None => break,
                     },
@@ -7433,7 +7435,16 @@ async fn partition_loop(
             match select(req_fut, Box::pin(cfut)).await {
                 Either::Left((maybe_req, _cfut_dropped)) => match maybe_req {
                     Some(req) => {
-                        handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
+                        handle_incoming_req(
+                            req,
+                            &mut pending,
+                            &part,
+                            &routing,
+                            &mut inflight,
+                            &mut metrics,
+                            &locked_by_other,
+                        )
+                        .await;
                     }
                     None => {
                         // Channel closed: drain remaining inflight, then exit.
@@ -7497,7 +7508,16 @@ async fn partition_loop(
             while pending.len() < max_write_batch() {
                 match req_rx.next().now_or_never() {
                     Some(Some(req)) => {
-                        handle_incoming_req(req, &mut pending, &part, &routing, &mut inflight, &mut metrics, &locked_by_other).await;
+                        handle_incoming_req(
+                            req,
+                            &mut pending,
+                            &part,
+                            &routing,
+                            &mut inflight,
+                            &mut metrics,
+                            &locked_by_other,
+                        )
+                        .await;
                     }
                     _ => break,
                 }
@@ -7854,8 +7874,17 @@ async fn handle_incoming_req(
                 Ok(Some(mut flight)) => {
                     let result = (&mut flight.phase2_fut).await;
                     let id = part.borrow().part_id;
-                    handle_completion(part, metrics, locked_by_other, id,
-                        InflightCompletion { data: flight.data, phase2_result: result }).await;
+                    handle_completion(
+                        part,
+                        metrics,
+                        locked_by_other,
+                        id,
+                        InflightCompletion {
+                            data: flight.data,
+                            phase2_result: result,
+                        },
+                    )
+                    .await;
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -7865,7 +7894,10 @@ async fn handle_incoming_req(
             }
         }
         if locked_by_other.get() {
-            let _ = req.resp_tx.send(Err((StatusCode::Unavailable, "partition writer fenced".into())));
+            let _ = req.resp_tx.send(Err((
+                StatusCode::Unavailable,
+                "partition writer fenced".into(),
+            )));
             return;
         }
         let response = if req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
@@ -9283,18 +9315,14 @@ async fn recover_partition(
                         loc.extent_id
                     )
                 })?;
-            let reader = SstReader::open_paged_from_meta(
-                &meta_bytes,
-                loc.extent_id,
-                loc.offset,
-                loc.len,
-            )
-            .with_context(|| {
-                format!(
-                    "open SST meta extent={} offset={} len={}",
-                    loc.extent_id, loc.offset, loc.len
-                )
-            })?;
+            let reader =
+                SstReader::open_paged_from_meta(&meta_bytes, loc.extent_id, loc.offset, loc.len)
+                    .with_context(|| {
+                        format!(
+                            "open SST meta extent={} offset={} len={}",
+                            loc.extent_id, loc.offset, loc.len
+                        )
+                    })?;
 
             let tbl_last_seq = reader.seq_num();
             if tbl_last_seq > max_seq {
@@ -9400,7 +9428,15 @@ async fn recover_partition(
             } else if !seen_extents.insert(eid) {
                 None
             } else {
-                Some((pos, eid, if pos == chosen_pos { recovered_vp_off } else { 0 }))
+                Some((
+                    pos,
+                    eid,
+                    if pos == chosen_pos {
+                        recovered_vp_off
+                    } else {
+                        0
+                    },
+                ))
             }
         })
         .collect();
@@ -9484,90 +9520,90 @@ async fn recover_partition(
                                 "recover_partition: read extent {} attempt {}/10 failed: {}, retrying...",
                                 eid, attempt, e
                             );
-                            compio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                compio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            }
                         }
                     }
-                }
-            };
-            let got = data.len();
-            replay_bytes += got as u64;
-            // Bytes still committed from cur_off, and how many THIS chunk should
-            // have yielded. `expected < got` is impossible (the read clamps to
-            // committed_end); `got < expected` = the serving replica TRUNCATED
-            // the committed window (coco P1 #2) — a short read that lands on a
-            // record boundary would otherwise decode clean and be silently
-            // treated as end-of-extent, dropping the committed tail. We route it
-            // to self-heal (a clean replica has the bytes) / fail-loud instead.
-            let rem = committed_end.saturating_sub(cur_off);
-            let expected = REPLAY_CHUNK_BYTES.min(rem) as usize;
-            let is_final = rem <= REPLAY_CHUNK_BYTES;
-            let short = got < expected;
-            if rem == 0 && carry.is_empty() {
-                // Reached the committed end cleanly, nothing buffered. Done.
-                // (b): still advance the tail seed here (coco P2) —
-                // an EMPTY tail extent (`committed_end == start_off`, e.g. a
-                // freshly-rolled open tail with no committed data yet) exits on
-                // THIS branch, never reaching the `is_final` update below. `cur_off
-                // == committed_end` here, so this records the true (empty) tail so
-                // the recovered active's flush stamps the newest position and the
-                // GC floor advances past the previous (data-holding) extent.
-                tail_eid = eid;
-                tail_off = cur_off;
-                break;
-            }
-            let buf_base = cur_off - carry.len() as u64;
-            // The full committed window this chunk covers (carry prefix + the
-            // bytes that SHOULD be readable here) — used as the self-heal re-read
-            // length so a truncated serving replica's short `got` doesn't shrink it.
-            let want_full = carry.len() + expected;
-            let mut buf: Vec<u8> = if carry.is_empty() {
-                data
-            } else {
-                let mut c = std::mem::take(&mut carry);
-                c.extend_from_slice(&data);
-                c
-            };
-            // WAL-FAILSTOP + self-heal A3: try to decode the chunk. Corruption =
-            // a short read (truncated serving replica), OR a CRC/length mismatch
-            // on a complete record (`decode_records_chunk` Err), OR a non-empty
-            // leftover at the committed end (final chunk, `consumed < buf.len()`).
-            // On corruption, attempt cross-replica self-heal: re-read this
-            // committed window from every replica of the SEALED extent,
-            // decode-check each, use the first clean one, and record the corrupt
-            // node_ids for A5 isolation. Only if NO clean replica exists (or the
-            // extent is OPEN / EC, not self-healable) do we fail the open loud.
-            let decoded = decode_records_chunk(&buf);
-            let need_heal = short
-                || match &decoded {
-                    Ok((_recs, consumed)) => is_final && *consumed < buf.len(),
-                    Err(_) => true,
                 };
-            let (records, consumed) = if !need_heal {
-                decoded.expect("need_heal=false implies Ok")
-            } else {
-                let corrupt_set = corrupt_per_extent.entry(eid).or_default();
-                // Re-read the FULL committed window (`want_full`), not the
-                // possibly-short `buf.len()` — a truncated serving replica must
-                // not shrink the window we ask clean replicas for.
-                match self_heal_replay_chunk(
-                    part_sc,
-                    eid,
-                    log_stream_id,
-                    buf_base,
-                    want_full as u32,
-                    is_final,
-                    short,
-                    corrupt_set,
-                )
-                .await?
-                {
-                    Some((recs, c, healed)) => {
-                        tracing::warn!(
-                            part_id = _part_id,
-                            extent_id = eid,
-                            offset = buf_base,
-                            short,
-                            "WAL self-heal: log_stream chunk corrupt/truncated on the \
+                let got = data.len();
+                replay_bytes += got as u64;
+                // Bytes still committed from cur_off, and how many THIS chunk should
+                // have yielded. `expected < got` is impossible (the read clamps to
+                // committed_end); `got < expected` = the serving replica TRUNCATED
+                // the committed window (coco P1 #2) — a short read that lands on a
+                // record boundary would otherwise decode clean and be silently
+                // treated as end-of-extent, dropping the committed tail. We route it
+                // to self-heal (a clean replica has the bytes) / fail-loud instead.
+                let rem = committed_end.saturating_sub(cur_off);
+                let expected = REPLAY_CHUNK_BYTES.min(rem) as usize;
+                let is_final = rem <= REPLAY_CHUNK_BYTES;
+                let short = got < expected;
+                if rem == 0 && carry.is_empty() {
+                    // Reached the committed end cleanly, nothing buffered. Done.
+                    // (b): still advance the tail seed here (coco P2) —
+                    // an EMPTY tail extent (`committed_end == start_off`, e.g. a
+                    // freshly-rolled open tail with no committed data yet) exits on
+                    // THIS branch, never reaching the `is_final` update below. `cur_off
+                    // == committed_end` here, so this records the true (empty) tail so
+                    // the recovered active's flush stamps the newest position and the
+                    // GC floor advances past the previous (data-holding) extent.
+                    tail_eid = eid;
+                    tail_off = cur_off;
+                    break;
+                }
+                let buf_base = cur_off - carry.len() as u64;
+                // The full committed window this chunk covers (carry prefix + the
+                // bytes that SHOULD be readable here) — used as the self-heal re-read
+                // length so a truncated serving replica's short `got` doesn't shrink it.
+                let want_full = carry.len() + expected;
+                let mut buf: Vec<u8> = if carry.is_empty() {
+                    data
+                } else {
+                    let mut c = std::mem::take(&mut carry);
+                    c.extend_from_slice(&data);
+                    c
+                };
+                // WAL-FAILSTOP + self-heal A3: try to decode the chunk. Corruption =
+                // a short read (truncated serving replica), OR a CRC/length mismatch
+                // on a complete record (`decode_records_chunk` Err), OR a non-empty
+                // leftover at the committed end (final chunk, `consumed < buf.len()`).
+                // On corruption, attempt cross-replica self-heal: re-read this
+                // committed window from every replica of the SEALED extent,
+                // decode-check each, use the first clean one, and record the corrupt
+                // node_ids for A5 isolation. Only if NO clean replica exists (or the
+                // extent is OPEN / EC, not self-healable) do we fail the open loud.
+                let decoded = decode_records_chunk(&buf);
+                let need_heal = short
+                    || match &decoded {
+                        Ok((_recs, consumed)) => is_final && *consumed < buf.len(),
+                        Err(_) => true,
+                    };
+                let (records, consumed) = if !need_heal {
+                    decoded.expect("need_heal=false implies Ok")
+                } else {
+                    let corrupt_set = corrupt_per_extent.entry(eid).or_default();
+                    // Re-read the FULL committed window (`want_full`), not the
+                    // possibly-short `buf.len()` — a truncated serving replica must
+                    // not shrink the window we ask clean replicas for.
+                    match self_heal_replay_chunk(
+                        part_sc,
+                        eid,
+                        log_stream_id,
+                        buf_base,
+                        want_full as u32,
+                        is_final,
+                        short,
+                        corrupt_set,
+                    )
+                    .await?
+                    {
+                        Some((recs, c, healed)) => {
+                            tracing::warn!(
+                                part_id = _part_id,
+                                extent_id = eid,
+                                offset = buf_base,
+                                short,
+                                "WAL self-heal: log_stream chunk corrupt/truncated on the \
                              serving replica(s); recovered the window from a clean \
                              replica (corrupt replica(s) will be isolated via the manager)"
                         );
@@ -9583,97 +9619,99 @@ async fn recover_partition(
                             format!(
                                 "serving replica truncated the committed window (got {got} of \
                                  {expected} expected bytes)"
-                            )
-                        } else {
-                            let leftover = match &decoded {
-                                Ok((_r, c)) => buf.len().saturating_sub(*c),
-                                Err(_) => 0,
+                                )
+                            } else {
+                                let leftover = match &decoded {
+                                    Ok((_r, c)) => buf.len().saturating_sub(*c),
+                                    Err(_) => 0,
+                                };
+                                format!("{leftover} leftover byte(s) at the committed end")
                             };
-                            format!("{leftover} leftover byte(s) at the committed end")
-                        };
-                        return Err(decoded
-                            .err()
-                            .unwrap_or_else(|| {
-                                anyhow::anyhow!("WAL-FAILSTOP: {reason} of log_stream extent {eid}")
-                            })
-                            .context(format!(
-                                "log_stream extent {eid} chunk @ offset {buf_base} is \
+                            return Err(decoded
+                                .err()
+                                .unwrap_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "WAL-FAILSTOP: {reason} of log_stream extent {eid}"
+                                    )
+                                })
+                                .context(format!(
+                                    "log_stream extent {eid} chunk @ offset {buf_base} is \
                                  corrupt and not self-healable (EC / all replicas corrupt / \
                                  open-tail truncated or seal failed) — recover from a healthy \
                                  log_stream copy"
-                            )));
-                    }
-                }
-            };
-            for (buf_off, op, key, value, expires_at) in records {
-                let ts = parse_ts(&key);
-                if ts > max_seq {
-                    max_seq = ts;
-                }
-                // BUG-LEASE-2 Phase 2: fence-bump records bypass the
-                // ts-dedup (max-merge is idempotent — re-applying a bump
-                // already covered by the checkpoint snapshot is a no-op)
-                // and never enter the memtable.
-                if op == OP_FENCE_BUMP {
-                    let uk = parse_key(&key);
-                    if uk.len() == 8 && value.len() == 8 {
-                        let ino = u64::from_be_bytes(uk.try_into().unwrap());
-                        let epoch = u64::from_le_bytes(value.as_slice().try_into().unwrap());
-                        let f = fence_floors.entry(ino).or_insert(0);
-                        *f = (*f).max(epoch);
-                    } else {
-                        tracing::warn!(
-                            key_len = uk.len(),
-                            val_len = value.len(),
-                            "replay: malformed OP_FENCE_BUMP record skipped"
-                        );
-                    }
-                    continue;
-                }
-                if ts <= extent_dedup {
-                    replay_covered += 1;
-                    continue;
-                }
-                replay_kept += 1;
-
-                let record_extent_off = buf_base + buf_off as u64;
-                // BUG1: the un-flushed LOG bytes this
-                // replayed record contributes to the recovered active memtable
-                // (value included), so the post-recovery WAL-gap is accurate.
-                // Captured before `value`/`key` are moved into the entry/insert.
-                let log_rec_bytes = crate::wal_record::V1_ENVELOPE_OVERHEAD as u64
-                    + crate::wal_record::PAYLOAD_HEADER as u64
-                    + key.len() as u64
-                    + value.len() as u64;
-                let mem_entry = if record_carries_value_pointer(op, value.len()) {
-                    // VP detection: new WAL has VP flag in op; old WAL uses
-                    // value size as fallback. The reconstructed VP.offset MUST
-                    // equal the value's true on-disk offset for BOTH envelope
-                    // formats — GC's full-VP-identity liveness compares the live
-                    // VP.offset against the scanned record's computed offset, so
-                    // a per-version mismatch drops live records. The record's
-                    // first byte (V1 0xff sentinel vs V0 op) selects the layout
-                    // via the shared `value_offset_in_record` helper (was a
-                    // hardcoded V1 `+22`, which mis-placed every V0 VP by 5 B).
-                    let val_off =
-                        crate::wal_record::value_offset_in_record(buf[buf_off], key.len());
-                    let vp = ValuePointer {
-                        extent_id: eid,
-                        offset: record_extent_off + val_off as u64,
-                        len: value.len() as u64,
-                    };
-                    MemEntry {
-                        op: (op & 0x7f) | OP_VALUE_POINTER,
-                        value: vp.encode().to_vec(),
-                        expires_at,
-                    }
-                } else {
-                    MemEntry {
-                        op,
-                        value,
-                        expires_at,
+                                )));
+                        }
                     }
                 };
+                for (buf_off, op, key, value, expires_at) in records {
+                    let ts = parse_ts(&key);
+                    if ts > max_seq {
+                        max_seq = ts;
+                    }
+                    // BUG-LEASE-2 Phase 2: fence-bump records bypass the
+                    // ts-dedup (max-merge is idempotent — re-applying a bump
+                    // already covered by the checkpoint snapshot is a no-op)
+                    // and never enter the memtable.
+                    if op == OP_FENCE_BUMP {
+                        let uk = parse_key(&key);
+                        if uk.len() == 8 && value.len() == 8 {
+                            let ino = u64::from_be_bytes(uk.try_into().unwrap());
+                            let epoch = u64::from_le_bytes(value.as_slice().try_into().unwrap());
+                            let f = fence_floors.entry(ino).or_insert(0);
+                            *f = (*f).max(epoch);
+                        } else {
+                            tracing::warn!(
+                                key_len = uk.len(),
+                                val_len = value.len(),
+                                "replay: malformed OP_FENCE_BUMP record skipped"
+                            );
+                        }
+                        continue;
+                    }
+                    if ts <= extent_dedup {
+                        replay_covered += 1;
+                        continue;
+                    }
+                    replay_kept += 1;
+
+                    let record_extent_off = buf_base + buf_off as u64;
+                    // BUG1: the un-flushed LOG bytes this
+                    // replayed record contributes to the recovered active memtable
+                    // (value included), so the post-recovery WAL-gap is accurate.
+                    // Captured before `value`/`key` are moved into the entry/insert.
+                    let log_rec_bytes = crate::wal_record::V1_ENVELOPE_OVERHEAD as u64
+                        + crate::wal_record::PAYLOAD_HEADER as u64
+                        + key.len() as u64
+                        + value.len() as u64;
+                    let mem_entry = if record_carries_value_pointer(op, value.len()) {
+                        // VP detection: new WAL has VP flag in op; old WAL uses
+                        // value size as fallback. The reconstructed VP.offset MUST
+                        // equal the value's true on-disk offset for BOTH envelope
+                        // formats — GC's full-VP-identity liveness compares the live
+                        // VP.offset against the scanned record's computed offset, so
+                        // a per-version mismatch drops live records. The record's
+                        // first byte (V1 0xff sentinel vs V0 op) selects the layout
+                        // via the shared `value_offset_in_record` helper (was a
+                        // hardcoded V1 `+22`, which mis-placed every V0 VP by 5 B).
+                        let val_off =
+                            crate::wal_record::value_offset_in_record(buf[buf_off], key.len());
+                        let vp = ValuePointer {
+                            extent_id: eid,
+                            offset: record_extent_off + val_off as u64,
+                            len: value.len() as u64,
+                        };
+                        MemEntry {
+                            op: (op & 0x7f) | OP_VALUE_POINTER,
+                            value: vp.encode().to_vec(),
+                            expires_at,
+                        }
+                    } else {
+                        MemEntry {
+                            op,
+                            value,
+                            expires_at,
+                        }
+                    };
 
                 let size = key.len() as u64 + mem_entry.value.len() as u64 + 32;
                 active.insert(key, mem_entry, size);
@@ -9707,16 +9745,16 @@ async fn recover_partition(
                          commit boundary (corruption / length bit-flip / truncated replica). \
                          Refusing to discard committed data; recover this replica from a \
                          healthy log_stream copy.",
-                        carry.len()
-                    ));
+                            carry.len()
+                        ));
+                    }
+                    // (b): committed end of this extent. Extents replay
+                    // in stream-position order, so the LAST one to land here is the
+                    // tail → this converges to the committed log tail.
+                    tail_eid = eid;
+                    tail_off = cur_off;
+                    break;
                 }
-                // (b): committed end of this extent. Extents replay
-                // in stream-position order, so the LAST one to land here is the
-                // tail → this converges to the committed log tail.
-                tail_eid = eid;
-                tail_off = cur_off;
-                break;
-            }
             } // chunk loop
         }
     }
@@ -10182,9 +10220,10 @@ pub(crate) fn rotate_active(part: &mut PartitionData) {
     // capture this imm's content boundary = the write cursor at
     // THIS instant (position after the last record that went into it). The flush
     // stamps this, NOT the cursor at flush-claim time (which later writes advance).
-    part.imm_vp_heads
-        .borrow_mut()
-        .insert(Arc::as_ptr(&arc) as usize, (part.vp_extent_id, part.vp_offset));
+    part.imm_vp_heads.borrow_mut().insert(
+        Arc::as_ptr(&arc) as usize,
+        (part.vp_extent_id, part.vp_offset),
+    );
     // Every listed table is already in the row stream, so its extent is at or
     // before the tail this imm's SST will be appended to.
     let row_floor = part
@@ -12866,7 +12905,12 @@ mod single_thread_write_tests {
             let frame = Frame::request(42, MSG_PUT, payload);
             let bytes = frame.encode();
 
-            let (mut client_rd, mut client_wr) = client.into_split();
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::protocol_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
             let BufResult(r, _buf) = client_wr.write_all(bytes).await;
             r.expect("write request");
 
@@ -12923,7 +12967,14 @@ mod single_thread_write_tests {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(128);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 1, std::sync::Arc::new(crate::authz::AuthzState::new())).await
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    1,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
+                )
+                .await
             });
 
             // Simulated merged_loop: echo every Put.
@@ -12939,7 +12990,12 @@ mod single_thread_write_tests {
                 }
             });
 
-            let (mut client_rd, mut client_wr) = client.into_split();
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::protocol_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
             let n_ops: u32 = 1000;
             let start = Instant::now();
 
@@ -13098,14 +13154,17 @@ mod partition_listener_tests {
                                         let _ = stream.set_nodelay(true);
                                         let tx = req_tx_accept.clone();
                                         compio::runtime::spawn(async move {
-                                            let _ = handle_ps_connection(
-                                                autumn_transport::Conn::Tcp(stream),
-                                                tx,
-                                                None,
-                                                owner_part,
-                                                std::sync::Arc::new(crate::authz::AuthzState::new()),
-                                            )
-                                            .await;
+                                            let _ =
+                                                handle_ps_connection(
+                                                    autumn_transport::Conn::Tcp(stream),
+                                                    tx,
+                                                    None,
+                                                    owner_part,
+                                                    std::sync::Arc::new(
+                                                        crate::authz::AuthzState::new(),
+                                                    ),
+                                                )
+                                                .await;
                                         })
                                         .detach();
                                     }
@@ -13151,7 +13210,12 @@ mod partition_listener_tests {
                     let stream = compio::net::TcpStream::connect(addr)
                         .await
                         .expect("connect");
-                    let (mut rd, mut wr) = stream.into_split();
+                    let (mut rd, mut wr) = test_protocol::initiate_tcp(
+                        stream,
+                        autumn_rpc::protocol_hello::Service::PartitionServer,
+                    )
+                    .await
+                    .into_split();
 
                     let put = PutReq {
                         part_id: owner_part,
@@ -13237,7 +13301,12 @@ mod partition_listener_tests {
                         let stream = compio::net::TcpStream::connect(addr)
                             .await
                             .expect("connect");
-                        let (mut rd, mut wr) = stream.into_split();
+                        let (mut rd, mut wr) = test_protocol::initiate_tcp(
+                            stream,
+                            autumn_rpc::protocol_hello::Service::PartitionServer,
+                        )
+                        .await
+                        .into_split();
 
                         // (a) correct part_id on owner's port → CODE_OK.
                         let put = PutReq {
@@ -13376,44 +13445,42 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
         mt
     }
 
-    fn timed<T>(reps: u32, mut f: impl FnMut() -> T) -> std::time::Duration {
-        std::hint::black_box(f());
-        let t0 = std::time::Instant::now();
-        for _ in 0..reps {
+        fn timed<T>(reps: u32, mut f: impl FnMut() -> T) -> std::time::Duration {
             std::hint::black_box(f());
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(f());
+            }
+            t0.elapsed() / reps
         }
-        t0.elapsed() / reps
-    }
 
-    // Where a page starts does not matter to the OLD cost and is the whole
-    // story for the new one, so seek to the middle: the window there is full,
-    // which is the windowed path's worst case.
-    println!("\n  entries   value_len   full snapshot   windowed (cap 4096)");
-    for &(n, val_len) in &[
-        (10_000usize, 64usize),
-        (100_000, 64),
-        (500_000, 64),
-        (1_000_000, 64),
-        (500_000, 512),
-    ] {
-        let mt = fill(n, val_len);
-        let seek = crate::key_with_ts(
-            format!("mem/agent/post/{:012}", n / 2).as_bytes(),
-            u64::MAX,
-        );
-        let full = timed(3, || mt.snapshot_sorted().len());
-        let windowed = timed(20, || {
-            mt.snapshot_range_keys(std::ops::Bound::Included(seek.as_slice()), 4096)
-                .0
-                .len()
-        });
-        println!("  {n:>9}   {val_len:>9}   {full:>13.1?}   {windowed:>19.1?}");
-    }
-    println!(
-        "\n  A 512-entry page returns ~512 entries no matter which row it is on;\n  \
+        // Where a page starts does not matter to the OLD cost and is the whole
+        // story for the new one, so seek to the middle: the window there is full,
+        // which is the windowed path's worst case.
+        println!("\n  entries   value_len   full snapshot   windowed (cap 4096)");
+        for &(n, val_len) in &[
+            (10_000usize, 64usize),
+            (100_000, 64),
+            (500_000, 64),
+            (1_000_000, 64),
+            (500_000, 512),
+        ] {
+            let mt = fill(n, val_len);
+            let seek =
+                crate::key_with_ts(format!("mem/agent/post/{:012}", n / 2).as_bytes(), u64::MAX);
+            let full = timed(3, || mt.snapshot_sorted().len());
+            let windowed = timed(20, || {
+                mt.snapshot_range_keys(std::ops::Bound::Included(seek.as_slice()), 4096)
+                    .0
+                    .len()
+            });
+            println!("  {n:>9}   {val_len:>9}   {full:>13.1?}   {windowed:>19.1?}");
+        }
+        println!(
+            "\n  A 512-entry page returns ~512 entries no matter which row it is on;\n  \
          the cost above is what the page pays BEFORE looking at any of them.\n"
-    );
-}
+        );
+    }
     use super::*;
 
     /// test 1 — Single-frame passthrough: one Put per TCP read,
@@ -13458,7 +13525,12 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 }
             });
 
-            let (mut client_rd, mut client_wr) = client.into_split();
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::protocol_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
 
             // One synchronous send-recv round trip.
             let put = PutReq {
@@ -13532,7 +13604,14 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             let cur = Rc::new(Cell::new(0usize));
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 9, std::sync::Arc::new(crate::authz::AuthzState::new())).await
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    9,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
+                )
+                .await
             });
 
             let peak_c = peak.clone();
@@ -13595,7 +13674,12 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 let f = Frame::request(100 + i, MSG_PUT, payload).encode();
                 big.extend_from_slice(&f[..]);
             }
-            let (mut client_rd, mut client_wr) = client.into_split();
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::protocol_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
             let BufResult(r, _) = client_wr.write_all(big).await;
             r.expect("write 8 frames");
 
@@ -13671,11 +13755,10 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 9,
                 authz,
             ));
-            let client = autumn_rpc::client::RpcClient::from_conn(
-                autumn_transport::Conn::Tcp(client),
-                addr,
-            )
-            .expect("client");
+            let client =
+                autumn_rpc::client::RpcClient::from_conn(autumn_transport::Conn::Tcp(client), addr)
+                    .await
+                    .expect("client");
             let pong = client
                 .call(autumn_rpc::MSG_TYPE_PING, Bytes::new())
                 .await
@@ -13746,8 +13829,14 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                     let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(4096);
 
                     let conn_handle = compio::runtime::spawn(async move {
-                        handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 5, std::sync::Arc::new(crate::authz::AuthzState::new()))
-                            .await
+                        handle_ps_connection(
+                            autumn_transport::Conn::Tcp(server),
+                            req_tx,
+                            None,
+                            5,
+                            std::sync::Arc::new(crate::authz::AuthzState::new()),
+                        )
+                        .await
                     });
 
                     let peak_c = peak.clone();
@@ -13810,7 +13899,12 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                         drained
                     });
 
-                    let (mut client_rd, mut client_wr) = client.into_split();
+                    let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                        client,
+                        autumn_rpc::protocol_hello::Service::PartitionServer,
+                    )
+                    .await
+                    .into_split();
                     let mut big = Vec::with_capacity(N_FRAMES as usize * 64);
                     for i in 0..N_FRAMES {
                         let put = PutReq {
@@ -13922,6 +14016,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                     11,
                     namespace_authz(),
                 ));
+                client = test_protocol::initiate_tcp(client, autumn_rpc::protocol_hello::Service::PartitionServer).await;
                 let mut requests = Vec::new();
                 for id in 1..=2 {
                     let frame = if bulk {
@@ -13983,6 +14078,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 11,
                 namespace_authz(),
             ));
+            client = test_protocol::initiate_tcp(client, autumn_rpc::protocol_hello::Service::PartitionServer).await;
             for (id, key) in [(1, &b"unknown/k"[..]), (2, &b"fs/k"[..])] {
                 let frame = Frame::request_zc(
                     id,
@@ -14120,7 +14216,12 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 }
             });
 
-            let (mut client_rd, mut client_wr) = client.into_split();
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::protocol_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
             let mut decoder = FrameDecoder::new();
             let mut buf = vec![0u8; 8192];
 
@@ -14257,7 +14358,12 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             wire.extend_from_slice(&crc);
             wire.extend_from_slice(&tail);
 
-            let (client_rd, mut client_wr) = client.into_split();
+            let (client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::protocol_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
             let BufResult(r, _) = client_wr.write_all(wire).await;
             r.expect("write");
 
@@ -14309,7 +14415,14 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
 
             let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 13, std::sync::Arc::new(crate::authz::AuthzState::new())).await
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    13,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
+                )
+                .await
             });
 
             let loop_handle = compio::runtime::spawn(async move {
@@ -14324,7 +14437,12 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 }
             });
 
-            let (mut client_rd, mut client_wr) = client.into_split();
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::protocol_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
 
             const N: u32 = 8;
             let mut big = Vec::with_capacity(N as usize * 64);
@@ -14743,10 +14861,13 @@ mod invalidate_plumbing_tests {
             }).await.unwrap();
             drop((flush_tx, append_tx, barrier_tx));
             let (_, result) = futures::join!(
-                flush_worker_loop(sc, flush_rx, append_rx, barrier_rx), resp_rx,
+                flush_worker_loop(sc, flush_rx, append_rx, barrier_rx),
+                resp_rx,
             );
-            assert!(result.expect("worker must ACK").is_err(),
-                "a failed seal/roll must never be acknowledged as success");
+            assert!(
+                result.expect("worker must ACK").is_err(),
+                "a failed seal/roll must never be acknowledged as success"
+            );
         });
     }
 
@@ -14769,11 +14890,10 @@ mod invalidate_plumbing_tests {
             // the strategy must pick `inv` (Left).
             inv_tx.send(0xFF).await.unwrap();
             other_tx.send(0x01).await.unwrap();
-            let mut combined = futures::stream::select_with_strategy(
-                inv_rx,
-                other_rx,
-                |_: &mut ()| PollNext::Left,
-            );
+            let mut combined =
+                futures::stream::select_with_strategy(inv_rx, other_rx, |_: &mut ()| {
+                    PollNext::Left
+                });
             let picked = combined.next().await.expect("at least one ready");
             assert_eq!(
                 picked, 0xFF,
@@ -15138,129 +15258,49 @@ mod authz_enforcement_tests {
     /// below that line this mechanism would simply not exist for them.
     #[test]
     fn a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition() {
-        use autumn_rpc::client_hello;
-
-        let rt = compio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            // No signing key, no namespaces: `gate_active()` is false.
+        use autumn_rpc::protocol_hello::{Hello, Role, Service, initiate};
+        compio::runtime::Runtime::new().unwrap().block_on(async {
             let authz = std::sync::Arc::new(crate::authz::AuthzState::new());
-            assert!(!authz.is_enabled(), "this test is about the authz-OFF path");
-
+            assert!(!authz.is_enabled());
             let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap();
-
             let delivered = Rc::new(Cell::new(0usize));
-            let put = |key: &[u8]| {
-                partition_rpc::rkyv_encode(&PutReq {
-                    part_id: 7,
-                    key: key.to_vec(),
-                    value: b"v".to_vec(),
-                    region_epoch: 0,
-                    expires_at: 0,
-                    inode_hint: 0,
-                    lease_epoch: 0,
-                })
-            };
-
-            // One connection per case; each drives the real conn task.
-            let listener = Rc::new(listener);
-            let open = |authz: std::sync::Arc<crate::authz::AuthzState>,
-                        delivered: Rc<Cell<usize>>| {
-                let listener = listener.clone();
-                async move {
-                let client = compio::net::TcpStream::connect(addr).await.unwrap();
+            for version in [autumn_rpc::WIRE_VERSION + 1, autumn_rpc::MIN_CLIENT_WIRE_VERSION - 1,
+                autumn_rpc::MIN_CLIENT_WIRE_VERSION, autumn_rpc::WIRE_VERSION] {
+                let client = compio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
                 let (server, _) = listener.accept().await.unwrap();
                 let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+                let authz = authz.clone();
                 let conn = compio::runtime::spawn(async move {
-                    let _ = handle_ps_connection(
-                        autumn_transport::Conn::Tcp(server),
-                        req_tx,
-                        None,
-                        7,
-                        authz,
-                    )
-                    .await;
+                    handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 7, authz).await
                 });
-                let loop_h = compio::runtime::spawn(async move {
+                let count = delivered.clone();
+                let worker = compio::runtime::spawn(async move {
                     while let Some(req) = req_rx.next().await {
-                        delivered.set(delivered.get() + 1);
+                        count.set(count.get() + 1);
                         let p: PutReq = partition_rpc::rkyv_decode(&req.payload).unwrap();
-                        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&PutResp {
-                            code: CODE_OK,
-                            message: String::new(),
-                            key: p.key,
-                        })));
+                        req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&PutResp {
+                            code: CODE_OK, message: String::new(), key: p.key,
+                        }))).ok();
                     }
                 });
-                let (rd, wr) = client.into_split();
-                (rd, wr, FrameDecoder::new(), conn, loop_h)
+                let (mut rd, mut wr) = autumn_transport::Conn::Tcp(client).into_split();
+                let result = initiate(&mut rd, &mut wr, Hello { role: Role::Client,
+                    wire_version: version, client_version: version }, Some(Service::PartitionServer)).await;
+                if !(autumn_rpc::MIN_CLIENT_WIRE_VERSION..=autumn_rpc::WIRE_VERSION).contains(&version) {
+                    assert!(matches!(result, Err(autumn_rpc::RpcError::VersionMismatch { .. })));
+                    assert_eq!(delivered.get(), 0);
+                    assert!(conn.await.unwrap().is_err());
+                    worker.await.unwrap();
+                } else {
+                    assert!(result.is_ok());
+                    let f = round_trip(&mut wr, &mut rd, &mut FrameDecoder::new(), 2, MSG_PUT,
+                        partition_rpc::rkyv_encode(&PutReq { part_id: 7, key: b"k".to_vec(),
+                            value: b"v".to_vec(), region_epoch: 0, expires_at: 0,
+                            inode_hint: 0, lease_epoch: 0 })).await;
+                    assert!(!f.is_error());
+                    drop(conn); drop(worker);
                 }
-            };
-
-            // (1) A client one version AHEAD of this cluster. Refused at the
-            //     hello, and the refusal says which way round it is — the fix
-            //     for "too new" is to deploy, not to rebuild.
-            let (mut rd, mut wr, mut dec, _c, _l) =
-                open(authz.clone(), delivered.clone()).await;
-            let ahead = Bytes::copy_from_slice(&client_hello::encode_hello_req(
-                autumn_rpc::WIRE_VERSION + 1,
-            ));
-            let f = round_trip(
-                &mut wr,
-                &mut rd,
-                &mut dec,
-                1,
-                client_hello::MSG_CLIENT_HELLO,
-                ahead,
-            )
-            .await;
-            assert!(f.is_error(), "a client above the ceiling must be refused");
-            let (code, msg) = autumn_rpc::RpcError::decode_status(&f.payload);
-            assert_eq!(code, StatusCode::FailedPrecondition, "{msg}");
-            assert!(msg.contains("NEWER"), "{msg}");
-
-            // (2) …and the refusal STICKS for the rest of that connection. A
-            //     client that ignores it and writes anyway gets the same
-            //     verdict, and the partition never sees the request — which is
-            //     the acceptance claim: refused before any Put can land.
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_PUT, put(b"k")).await;
-            assert!(f.is_error(), "the write must be refused too");
-            let (code, msg) = autumn_rpc::RpcError::decode_status(&f.payload);
-            assert_eq!(code, StatusCode::FailedPrecondition, "{msg}");
-            assert_eq!(delivered.get(), 0, "no refused write may reach the partition");
-
-            // (3) A client AT this version is admitted, and is told what the
-            //     cluster speaks. This is the only channel for that on a PS —
-            //     the PS does not answer MSG_GET_CLUSTER_ID.
-            let (mut rd, mut wr, mut dec, _c, _l) =
-                open(authz.clone(), delivered.clone()).await;
-            let ours = Bytes::copy_from_slice(&client_hello::encode_hello_req(
-                autumn_rpc::WIRE_VERSION,
-            ));
-            let f = round_trip(
-                &mut wr,
-                &mut rd,
-                &mut dec,
-                1,
-                client_hello::MSG_CLIENT_HELLO,
-                ours,
-            )
-            .await;
-            assert!(!f.is_error(), "an in-window client must be admitted");
-            assert_eq!(
-                client_hello::parse_hello_resp(&f.payload),
-                Some((autumn_rpc::WIRE_VERSION, autumn_rpc::MIN_CLIENT_WIRE_VERSION))
-            );
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_PUT, put(b"k")).await;
-            assert!(!f.is_error(), "an admitted write must be served");
-            assert_eq!(delivered.get(), 1);
-
-            // (4) A connection that says NOTHING is served. Every client built
-            //     before the hello existed is silent, and so is every internal
-            //     peer — this is what makes the mechanism inert on arrival.
-            let (mut rd, mut wr, mut dec, _c, _l) = open(authz, delivered.clone()).await;
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_PUT, put(b"k")).await;
-            assert!(!f.is_error(), "a silent connection must still be served");
+            }
             assert_eq!(delivered.get(), 2);
         });
     }
@@ -15308,7 +15348,12 @@ mod authz_enforcement_tests {
                 }
             });
 
-            let (mut rd, mut wr) = client.into_split();
+            let (mut rd, mut wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::protocol_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
             let mut dec = FrameDecoder::new();
 
             // (1) AUTH_HELLO with tenant acme's token → OK, binds principal.
@@ -15419,7 +15464,12 @@ mod authz_enforcement_tests {
                     let _ = req.resp_tx.send(Ok(Bytes::new()));
                 }
             });
-            let (mut rd, mut wr) = client.into_split();
+            let (mut rd, mut wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::protocol_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
             let mut dec = FrameDecoder::new();
             // No AUTH_HELLO → anonymous. GET on protected mem/ → denied.
             let g = partition_rpc::rkyv_encode(&GetReq {
@@ -15662,7 +15712,13 @@ mod write_batch_ceiling_tests {
         let (outer, _rx) = oneshot::channel();
         let accum = BatchPutAccumulator::new(outer, 3);
         let ops: Vec<bool> = (0..3)
-            .map(|idx| WriteResponder::BatchPut { accum: accum.clone(), idx }.send_ok())
+            .map(|idx| {
+                WriteResponder::BatchPut {
+                    accum: accum.clone(),
+                    idx,
+                }
+                .send_ok()
+            })
             .collect();
         assert_eq!(ops, [false, false, true], "one reply, on the batch's last op");
     }
@@ -15702,7 +15758,10 @@ mod write_batch_ceiling_tests {
     }
 
     fn fence_bump() -> WriteRequest {
-        WriteRequest { op: WriteOp::FenceBump { ino: 7, epoch: 3 }, resp: WriteResponder::Fence }
+        WriteRequest {
+            op: WriteOp::FenceBump { ino: 7, epoch: 3 },
+            resp: WriteResponder::Fence,
+        }
     }
 
     /// A fence record never ends a batch that leaves its write behind: if
@@ -15713,8 +15772,13 @@ mod write_batch_ceiling_tests {
         let big = MAX_WRITE_BATCH_BYTES / 4;
         // Three writes fill the batch to just under the cap, the fence fits
         // after them, its write does not.
-        let mut pending: Vec<WriteRequest> =
-            vec![put_of(big), put_of(big), put_of(big), fence_bump(), put_of(big)];
+        let mut pending: Vec<WriteRequest> = vec![
+            put_of(big),
+            put_of(big),
+            put_of(big),
+            fence_bump(),
+            put_of(big),
+        ];
         let batch = take_byte_bounded_batch(&mut pending);
         assert!(!matches!(batch.last().unwrap().op, WriteOp::FenceBump { .. }));
         assert_eq!(batch.len(), 3);
@@ -15767,7 +15831,11 @@ mod unsettled_delete_seed_tests {
     #[test]
     fn the_replayed_memtable_counts_its_tombstones() {
         let m = Memtable::new();
-        let entry = |op: u8| MemEntry { op, value: vec![1; 24], expires_at: 0 };
+        let entry = |op: u8| MemEntry {
+            op,
+            value: vec![1; 24],
+            expires_at: 0,
+        };
         m.insert(key_with_ts(b"a", 1), entry(1), 1);
         m.insert(key_with_ts(b"b", 2), entry(1 | OP_VALUE_POINTER), 1);
         m.insert(key_with_ts(b"a", 3), entry(OP_TOMBSTONE), 1);

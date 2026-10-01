@@ -832,8 +832,7 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
     };
 
     // Push every produced file: thumb.jpg → thumb_key, everything else →
-    // .hls/<name>/<fname>. must_sync=false: HLS segments are derivable from
-    // the original which we still have until the final delete.
+    // .hls/<name>/<fname>. Each Put is durable before it completes.
     let t_kv = std::time::Instant::now();
     let mut kv_bytes: u64 = 0;
     let mut hls_bytes: u64 = 0;

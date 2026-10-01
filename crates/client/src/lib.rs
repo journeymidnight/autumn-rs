@@ -66,7 +66,7 @@ pub enum AutumnError {
     /// the caller must write under a registered namespace). Distinct from
     /// `NotFound` (a read-miss) and `InvalidArgument`.
     NamespaceUnknown(String),
-    /// A server refused this client's wire version at `MSG_CLIENT_HELLO`.
+    /// A server refused this client's wire version at `PROTOCOL_HELLO`.
     /// TERMINAL, and more sharply so than the two above: the version is baked
     /// into this binary, so no amount of refreshing, reconnecting or waiting
     /// can change the answer. The message is the SERVER's own, and names which
@@ -208,8 +208,9 @@ impl NamespaceBinding {
 /// every frontend at once.
 pub(crate) fn is_valid_scope_segment(s: &str) -> bool {
     !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+        && s.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
 }
 
 /// D7: a borrow-view of a `ClusterClient` under a DIFFERENT namespace
@@ -288,7 +289,10 @@ pub struct WriteLease {
 }
 
 impl WriteLease {
-    pub const ANON: WriteLease = WriteLease { inode_hint: 0, lease_epoch: 0 };
+    pub const ANON: WriteLease = WriteLease {
+        inode_hint: 0,
+        lease_epoch: 0,
+    };
 }
 
 fn code_to_error(code: u8, message: String) -> AutumnError {
@@ -880,6 +884,7 @@ struct ClientAuth {
 }
 
 pub struct ClusterClient {
+    role: autumn_rpc::protocol_hello::Role,
     /// Manager addresses (comma-separated on construction).
     manager_addrs: Vec<String>,
     /// Current manager index (round-robin).
@@ -960,16 +965,10 @@ pub struct ClusterClient {
     /// read by `refresh_and_backoff` and `routing_exhausted`, is one place to
     /// be right instead of seven.
     wire_refused: RefCell<Option<String>>,
-    /// The cluster's wire version, as the servers reported it — from
-    /// `GetClusterIdResp` at connect and from each `MSG_CLIENT_HELLO` reply.
-    /// `0` = nothing has answered yet.
-    ///
-    /// ONE value, not one per peer: stop-the-world means every manager, PS and
-    /// EN in a cluster speaks the same version, so a second copy could only
-    /// ever disagree by being stale. Kept because the client used to DISCARD
-    /// the negotiated number, which is what made a compatibility window
-    /// impossible however the bytes were encoded — no call site could branch on
-    /// it. Nothing branches on it yet; serving two forms is design §7.
+    /// Wire version reported by the manager connection used for routing.
+    /// During a rolling upgrade PS and manager versions may differ, so a PS
+    /// Hello must not change which routing opcode this client sends to manager.
+    /// Zero means no manager has completed a Hello yet.
     negotiated_cluster_wire: Cell<u32>,
     /// D7: the namespace scope this client operates within. Set at
     /// `connect(mgr, ns, tenant)` (Scoped) or `connect_raw(mgr)` (Raw). Every
@@ -1083,75 +1082,38 @@ impl ClusterClient {
         self.negotiated_cluster_wire.get()
     }
 
-    /// Send `MSG_CLIENT_HELLO` on a freshly opened connection and record what
-    /// comes back.
-    ///
-    /// Sent from the two functions that OPEN connections rather than from
-    /// `connect()`, because `rotate_manager` and the `mgr_call` error arm drop
-    /// a manager connection and `mgr_client()` silently reopens it — a hello
-    /// sent once at connect would cover only the first one.
-    ///
-    /// Three answers, and the middle one is the whole reason this is not just
-    /// a version fetch:
-    /// - an 8-byte OK reply: record the cluster's version, proceed;
-    /// - `FailedPrecondition`: the SERVER refused us. Hard failure, carrying
-    ///   the server's own message, which names which way round the mismatch is;
-    /// - any other error: the server predates the hello (a PS answers an
-    ///   unknown msg_type `NotFound`, because `extract_part_id` returns 0 for
-    ///   anything it does not know and partition ids start at 1; the manager
-    ///   answers `InvalidArgument`). Proceed — `connect`'s own
-    ///   `client_compat_check` against `GetClusterIdResp` is the check that
-    ///   applies to such a cluster.
-    ///
-    /// Cost is one round trip per NEW connection, never per request: manager
-    /// and PS connections are pooled for the client's life.
-    async fn say_hello(&self, client: &RpcClient, peer: &str) -> Result<()> {
-        use autumn_rpc::client_hello;
-        let payload = Bytes::copy_from_slice(&client_hello::encode_hello_req(
-            autumn_rpc::WIRE_VERSION,
-        ));
-        // The FIRST-attempt budget, not `rpc_timeout`. A hello on a fresh
-        // connection is by definition a first attempt, and that budget exists
-        // for exactly this shape: a peer that accepts the TCP connection and
-        // then never answers. Waiting the full `rpc_timeout` here would stall
-        // every new connection behind a hung peer before the data call that
-        // has the short budget even starts.
-        let outcome = match self.first_attempt_effective_timeout(0) {
-            None => client.call(client_hello::MSG_CLIENT_HELLO, payload).await,
-            Some(t) => {
-                client
-                    .call_timeout(client_hello::MSG_CLIENT_HELLO, payload, t)
-                    .await
-            }
+    /// Bootstrap has already validated this connection before its RPC tasks
+    /// start. Record the server version used to choose client-surface opcodes.
+    async fn say_hello(&self, client: &RpcClient, _peer: &str) -> Result<()> {
+        if client.protocol().service == autumn_rpc::protocol_hello::Service::Manager {
+            self.negotiated_cluster_wire.set(client.protocol().remote_wire);
+        }
+        *self.wire_refused.borrow_mut() = None;
+        Ok(())
+    }
+
+    async fn open_rpc(
+        &self,
+        addr: SocketAddr,
+        service: autumn_rpc::protocol_hello::Service,
+    ) -> Result<Rc<RpcClient>> {
+        let connect = RpcClient::connect_as(addr, self.role, Some(service));
+        let result = match self.first_attempt_effective_timeout(0) {
+            None => connect.await,
+            Some(t) => compio::time::timeout(t, connect)
+                .await
+                .unwrap_or_else(|_| Err(RpcError::Timeout(t))),
         };
-        match outcome {
-            Ok(resp) => {
-                if let Some((server_wire, _min_client)) = client_hello::parse_hello_resp(&resp) {
-                    self.negotiated_cluster_wire.set(server_wire);
-                }
-                // Cleared here, which is what keeps the refusal from being a
-                // latch: a client refused for running AHEAD of its cluster
-                // recovers on its own once the cluster is deployed.
-                *self.wire_refused.borrow_mut() = None;
-                // An OK reply of the wrong shape is left alone deliberately:
-                // it cannot be this message (the server that answers it is the
-                // server that encodes it), and failing the connection on it
-                // would turn a future additive reply into an outage.
-                Ok(())
-            }
-            Err(RpcError::Status {
-                code: StatusCode::FailedPrecondition,
-                message,
-            }) => {
-                let why = format!("{peer} refused this client: {message}");
+        match result {
+            Ok(c) => Ok(c),
+            Err(e @ RpcError::VersionMismatch { .. })
+                if self.role == autumn_rpc::protocol_hello::Role::Client =>
+            {
+                let why = format!("{addr}: {e}");
                 *self.wire_refused.borrow_mut() = Some(why.clone());
                 Err(anyhow!(AutumnError::WireVersionRefused(why)))
             }
-            // Predates the hello, or a transport failure. A broken transport
-            // surfaces on the very next call on this connection, and refusing
-            // here instead would make the hello a new way for a healthy
-            // cluster to be unreachable.
-            Err(_) => Ok(()),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -1165,7 +1127,8 @@ impl ClusterClient {
             }
         }
         let addr = parse_addr(self.manager_addr())?;
-        let client = RpcClient::connect(addr)
+        let client = self
+            .open_rpc(addr, autumn_rpc::protocol_hello::Service::Manager)
             .await
             .with_context(|| format!("connect manager {}", self.manager_addr()))?;
         // Before the connection is cached, so a refused client never gets a
@@ -1217,7 +1180,7 @@ impl ClusterClient {
                 if e.is_connection_error() {
                     *self.mgr_conn.borrow_mut() = None;
                 }
-                Err(anyhow!("{e}"))
+                Err(anyhow::Error::new(e))
             }
         }
     }
@@ -1362,10 +1325,17 @@ impl ClusterClient {
         });
         let managers = self.manager_addrs.len().max(1) as u32;
         let resp: MintTokenResp = self
-            .mgr_call_leader(MSG_MINT_TOKEN, req, "mint token", managers, managers + 2, |b| {
-                let r: MintTokenResp = rkyv_decode(b).map_err(decode_err)?;
-                Ok((r.code, r))
-            })
+            .mgr_call_leader(
+                MSG_MINT_TOKEN,
+                req,
+                "mint token",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: MintTokenResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
             .await?;
         if resp.code != autumn_rpc::manager_rpc::CODE_OK {
             return Err(anyhow!("mint token rejected: {}", resp.message));
@@ -1639,16 +1609,43 @@ impl ClusterClient {
         Self::connect_with_binding(manager, NamespaceBinding::Raw).await
     }
 
+    pub async fn connect_admin(manager: &str) -> Result<Self> {
+        Self::connect_with_role(
+            manager,
+            NamespaceBinding::Raw,
+            autumn_rpc::protocol_hello::Role::Admin,
+        )
+        .await
+    }
+
+    pub async fn connect_peer(manager: &str) -> Result<Self> {
+        Self::connect_with_role(
+            manager,
+            NamespaceBinding::Raw,
+            autumn_rpc::protocol_hello::Role::Peer,
+        )
+        .await
+    }
+
     /// Shared constructor for `connect` / `connect_raw` / `connect_with_credential`.
     async fn connect_with_binding(manager: &str, binding: NamespaceBinding) -> Result<Self> {
+        Self::connect_with_role(manager, binding, autumn_rpc::protocol_hello::Role::Client).await
+    }
+
+    async fn connect_with_role(
+        manager: &str,
+        binding: NamespaceBinding,
+        role: autumn_rpc::protocol_hello::Role,
+    ) -> Result<Self> {
         let manager_addrs: Vec<String> = manager.split(',').map(|s| s.trim().to_string()).collect();
 
         let client = Self {
+            role,
             manager_addrs,
             current_mgr: Cell::new(0),
             mgr_conn: Rc::new(RefCell::new(None)),
             ps_conns: RefCell::new(HashMap::new()),
-            en_pool: autumn_stream::ConnPool::new(),
+            en_pool: autumn_stream::ConnPool::with_role(autumn_rpc::protocol_hello::Role::Client),
             regions: RefCell::new(Vec::new()),
             ps_details: RefCell::new(HashMap::new()),
             part_addrs: RefCell::new(HashMap::new()),
@@ -1694,38 +1691,6 @@ impl ClusterClient {
                 Some(e) => Err(e.context(format!("cannot connect to any manager: {manager}"))),
                 None => Err(anyhow!("cannot connect to any manager: {manager}")),
             };
-        }
-
-        // WIRE-1: startup wire-schema cross-check. A SUCCESSFUL response
-        // whose wire-version interval does not overlap ours is a hard
-        // refusal (mixed same-commit deploy — rkyv would decode garbage;
-        // the stale python wheel failed exactly this way, silently). A
-        // transport failure is skipped: availability wins while the manager
-        // is briefly down, and every RPC after this would fail loudly anyway.
-        if let Ok(resp_bytes) = client
-            .mgr_call(MSG_GET_CLUSTER_ID, rkyv_encode(&GetClusterIdReq {}))
-            .await
-        {
-            // A SUCCESSFUL response that fails to DECODE is itself the
-            // mismatch this check exists for (an older manager's resp
-            // lacks the field) — hard fail, never skip (coco P1).
-            let resp = rkyv_decode::<GetClusterIdResp>(&resp_bytes).map_err(|e| {
-                anyhow!("decode GetClusterIdResp failed ({e}) — possible wire-schema mismatch; rebuild from the cluster's commit")
-            })?;
-            // This is the CLIENT rule: our version must fall inside the window
-            // the cluster serves, refused at BOTH ends. Too old and the
-            // cluster no longer keeps the behavior we need; too new and it
-            // cannot speak what we will send.
-            if let Err(msg) = autumn_rpc::client_compat_check(
-                resp.wire_version_min,
-                resp.wire_version_max,
-            ) {
-                return Err(anyhow!(msg));
-            }
-            // Keep what the handshake negotiated. This is also the ONLY
-            // channel on a cluster that predates `MSG_CLIENT_HELLO`, and the
-            // only one at all for the manager before any hello is sent.
-            client.negotiated_cluster_wire.set(resp.wire_version_max);
         }
 
         client.refresh_regions().await?;
@@ -2129,7 +2094,8 @@ impl ClusterClient {
             }
         }
         let addr = parse_addr(ps_addr)?;
-        let client = RpcClient::connect(addr)
+        let client = self
+            .open_rpc(addr, autumn_rpc::protocol_hello::Service::PartitionServer)
             .await
             .with_context(|| format!("connect PS {ps_addr}"))?;
         // BEFORE the AUTH_HELLO: the PS gates AUTH_HELLO itself on the client
@@ -2503,11 +2469,7 @@ impl ClusterClient {
                 }
             }
         }
-        Err(self.routing_exhausted(
-            "ps_call",
-            attempt,
-            last_err,
-        ))
+        Err(self.routing_exhausted("ps_call", attempt, last_err))
     }
 
     /// How every routing-retry loop ends. ONE place, because the seven tails
@@ -2607,11 +2569,7 @@ impl ClusterClient {
                 }
             }
         }
-        Err(self.routing_exhausted(
-            &format!("ps_call_bulk(part {part_id})"),
-            attempt,
-            last_err,
-        ))
+        Err(self.routing_exhausted(&format!("ps_call_bulk(part {part_id})"), attempt, last_err))
     }
 
     /// `call_ps_for_part` for a request whose RESPONSE is value-separable —
@@ -2754,21 +2712,15 @@ impl ClusterClient {
                 }
             }
         }
-        Err(self.routing_exhausted(
-            &format!("ps_call(part {part_id})"),
-            attempt,
-            last_err,
-        ))
+        Err(self.routing_exhausted(&format!("ps_call(part {part_id})"), attempt, last_err))
     }
 
     // ── High-level SDK API ──────────────────────────────────────────────────
 
     /// Put a key-value pair. Retries once on routing miss.
     ///
-    /// every Put is durable. Earlier the API took a `must_sync: bool`
-    /// flag; that field was later removed from the wire and every
-    /// append goes through the extent-node fsync coalescer (RocksDB-style
-    /// group commit). Callers no longer have a "fast but unsafe" mode.
+    /// Every Put is durable through the extent-node fsync coalescer
+    /// (group commit).
     pub async fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
         let bound = self.binding.bind_key(key)?;
         self.put_bound(&bound, value).await
@@ -2787,12 +2739,21 @@ impl ClusterClient {
             )));
         }
         let key = self.binding.bind_key(key)?;
-        let response = self.call_ps_for_key(&key, partition_rpc::MSG_COMPARE_PUT, |part_id, region_epoch| {
-            rkyv_encode(&partition_rpc::ComparePutReq {
-                part_id, region_epoch, key: key.clone(),
-                expected: expected.map(<[u8]>::to_vec), value: value.to_vec(),
-            })
-        }).await?;
+        let response = self
+            .call_ps_for_key(
+                &key,
+                partition_rpc::MSG_COMPARE_PUT,
+                |part_id, region_epoch| {
+                    rkyv_encode(&partition_rpc::ComparePutReq {
+                        part_id,
+                        region_epoch,
+                        key: key.clone(),
+                        expected: expected.map(<[u8]>::to_vec),
+                        value: value.to_vec(),
+                    })
+                },
+            )
+            .await?;
         let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;
         if response.code == partition_rpc::CODE_PRECONDITION { return Ok(false); }
         check_ps_code(response.code, &response.message)?;
@@ -2832,13 +2793,23 @@ impl ClusterClient {
             )));
         }
         let key = self.binding.bind_key(key)?;
-        let response = self.call_ps_for_key(&key, partition_rpc::MSG_COMPARE_WRITE, |part_id, region_epoch| {
-            rkyv_encode(&partition_rpc::CompareWriteReq {
-                part_id, region_epoch, key: key.clone(),
-                expected: expected.map(<[u8]>::to_vec), value: value.map(<[u8]>::to_vec),
-                inode_hint: lease.inode_hint, lease_epoch: lease.lease_epoch,
-            })
-        }).await?;
+        let response = self
+            .call_ps_for_key(
+                &key,
+                partition_rpc::MSG_COMPARE_WRITE,
+                |part_id, region_epoch| {
+                    rkyv_encode(&partition_rpc::CompareWriteReq {
+                        part_id,
+                        region_epoch,
+                        key: key.clone(),
+                        expected: expected.map(<[u8]>::to_vec),
+                        value: value.map(<[u8]>::to_vec),
+                        inode_hint: lease.inode_hint,
+                        lease_epoch: lease.lease_epoch,
+                    })
+                },
+            )
+            .await?;
         let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;
         if response.code == partition_rpc::CODE_PRECONDITION { return Ok(false); }
         check_ps_code(response.code, &response.message)?;
@@ -3060,8 +3031,11 @@ impl ClusterClient {
                     // caller only hands a message to the writer task's channel;
                     // the `writev` happens over there and is unaffected by this
                     // future being dropped.
-                    let call =
-                        client.call_vectored_bulk(partition_rpc::MSG_PUT_BULK, vec![meta], value.clone());
+                    let call = client.call_vectored_bulk(
+                        partition_rpc::MSG_PUT_BULK,
+                        vec![meta],
+                        value.clone(),
+                    );
                     let bulk_outcome = match timeout {
                         None => call.await,
                         Some(t) => match compio::time::timeout(t, call).await {
@@ -3102,11 +3076,7 @@ impl ClusterClient {
                 break;
             }
         }
-        Err(self.routing_exhausted(
-            "put_bulk",
-            attempt,
-            last_err,
-        ))
+        Err(self.routing_exhausted("put_bulk", attempt, last_err))
     }
 
     /// Get a value by key. Returns None if not found.
@@ -3422,10 +3392,7 @@ impl ClusterClient {
     /// (`read_extent_value_direct` treats `got < value_len` under CODE_OK as an
     /// error → next replica → proxy). Caller must have already handled the
     /// inline (`extent_id == 0`) case.
-    async fn read_redirect_replicas(
-        &self,
-        resp: &GetRedirectResp,
-    ) -> DirectReadOutcome {
+    async fn read_redirect_replicas(&self, resp: &GetRedirectResp) -> DirectReadOutcome {
         let n = resp.replica_addrs.len();
         if n == 0 {
             return DirectReadOutcome::Failed;
@@ -3743,7 +3710,10 @@ impl ClusterClient {
             let dest: &mut [u8] = &mut *it.dest;
             async move {
                 match desc {
-                    Some(resp) => self.apply_redirect_desc(&resp, key, offset, length, dest).await,
+                    Some(resp) => {
+                        self.apply_redirect_desc(&resp, key, offset, length, dest)
+                            .await
+                    }
                     None => self.get_range_direct_into(key, offset, length, dest).await,
                 }
             }
@@ -3973,11 +3943,7 @@ impl ClusterClient {
                 break;
             }
         }
-        Err(self.routing_exhausted(
-            "get_range_pooled",
-            attempt,
-            last_err,
-        ))
+        Err(self.routing_exhausted("get_range_pooled", attempt, last_err))
     }
 
     /// batched point reads — the ONE client-side fan-out primitive. (Its first
@@ -4006,9 +3972,9 @@ impl ClusterClient {
         // threshold. Mixed / range / large-bulk inputs fall through to
         // the per-op fan_out which keeps the bulk pooled-receive path.
         let homogeneous_small = !items.is_empty()
-            && items.iter().all(|it| {
-                it.offset == 0 && it.length == 0 && !bulk_worthwhile(it.dest.len())
-            });
+            && items
+                .iter()
+                .all(|it| it.offset == 0 && it.length == 0 && !bulk_worthwhile(it.dest.len()));
         if homogeneous_small {
             let keys: Vec<&[u8]> = items.iter().map(|it| it.key).collect();
             let resp = self.get_many(&keys).await;
@@ -4335,13 +4301,8 @@ impl ClusterClient {
                 // `writev` as the caller's own buffers, never copied.
                 let values: Vec<bytes::Bytes> =
                     group.iter().map(|(_, _, v, _)| v.clone()).collect();
-                self.call_ps_for_part_bulk(
-                    part_id,
-                    partition_rpc::MSG_BATCH_PUT_BULK,
-                    ctrl,
-                    values,
-                )
-                .await
+                self.call_ps_for_part_bulk(part_id, partition_rpc::MSG_BATCH_PUT_BULK, ctrl, values)
+                    .await
             } else {
                 let ops: Vec<partition_rpc::BatchPutOp> = group
                     .iter()
@@ -5329,10 +5290,7 @@ impl ClusterClient {
 
     /// Query the op-ledger: `op_id != 0` → one record (UNKNOWN if the leader
     /// doesn't know it); `op_id == 0` → a filtered list.
-    pub async fn op_query(
-        &self,
-        req: OpQueryReq,
-    ) -> std::result::Result<OpQueryResp, AutumnError> {
+    pub async fn op_query(&self, req: OpQueryReq) -> std::result::Result<OpQueryResp, AutumnError> {
         let resp_bytes = self
             .mgr_call(MSG_OP_QUERY, rkyv_encode(&req))
             .await
@@ -5347,10 +5305,7 @@ impl ClusterClient {
         req: autumn_rpc::manager_rpc::OpHistoryReq,
     ) -> std::result::Result<autumn_rpc::manager_rpc::OpHistoryResp, AutumnError> {
         let resp_bytes = self
-            .mgr_call(
-                autumn_rpc::manager_rpc::MSG_OP_HISTORY,
-                rkyv_encode(&req),
-            )
+            .mgr_call(autumn_rpc::manager_rpc::MSG_OP_HISTORY, rkyv_encode(&req))
             .await
             .map_err(|e| AutumnError::ServerError(e.to_string()))?;
         rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)
@@ -5723,11 +5678,14 @@ mod first_attempt_timeout_tests {
             // there isn't one, so we use a real address that won't
             // be dialled (the policy fn doesn't dial).
             ClusterClient {
+                role: autumn_rpc::protocol_hello::Role::Client,
                 manager_addrs: vec!["127.0.0.1:1".to_string()],
                 current_mgr: Cell::new(0),
                 mgr_conn: Rc::new(RefCell::new(None)),
                 ps_conns: RefCell::new(HashMap::new()),
-            en_pool: autumn_stream::ConnPool::new(),
+                en_pool: autumn_stream::ConnPool::with_role(
+                    autumn_rpc::protocol_hello::Role::Client,
+                ),
                 regions: RefCell::new(Vec::new()),
                 ps_details: RefCell::new(HashMap::new()),
                 part_addrs: RefCell::new(HashMap::new()),
@@ -5746,10 +5704,7 @@ mod first_attempt_timeout_tests {
 
     #[test]
     fn attempt_0_uses_min_of_rpc_and_first_attempt() {
-        let c = client_with(
-            Some(Duration::from_secs(30)),
-            Some(Duration::from_secs(5)),
-        );
+        let c = client_with(Some(Duration::from_secs(30)), Some(Duration::from_secs(5)));
         assert_eq!(
             c.first_attempt_effective_timeout(0),
             Some(Duration::from_secs(5)),
@@ -5825,33 +5780,15 @@ mod first_attempt_timeout_tests {
                 let arrived_tx = arrived_tx.clone();
                 servers.push(compio::runtime::spawn(async move {
                     let (mut socket, _) = listener.accept().await.unwrap();
+                    test_protocol::accept_tcp(&mut socket, autumn_rpc::WIRE_VERSION, 2, 0, "")
+                        .await;
                     let mut decoder = autumn_rpc::FrameDecoder::new();
                     let mut buf = vec![0; 4096];
-                    // The SDK opens each PS connection with MSG_CLIENT_HELLO.
-                    // It must be ANSWERED, not skipped: `get_ps_client` awaits
-                    // the reply before the connection is usable, so leaving it
-                    // unanswered would serialize the very fan-out this test
-                    // measures behind the first partition's timeout.
                     let frame = 'outer: loop {
                         let compio::BufResult(n, back) = socket.read(buf).await;
                         buf = back;
                         decoder.feed(&buf[..n.unwrap()]);
                         while let Some(frame) = decoder.try_decode().unwrap() {
-                            if frame.msg_type == autumn_rpc::client_hello::MSG_CLIENT_HELLO {
-                                let resp = autumn_rpc::Frame::response(
-                                    frame.req_id,
-                                    frame.msg_type,
-                                    Bytes::copy_from_slice(
-                                        &autumn_rpc::client_hello::encode_hello_resp(
-                                            autumn_rpc::WIRE_VERSION,
-                                            autumn_rpc::MIN_CLIENT_WIRE_VERSION,
-                                        ),
-                                    ),
-                                )
-                                .encode();
-                                socket.write_all(resp).await.0.unwrap();
-                                continue;
-                            }
                             break 'outer frame;
                         }
                     };
@@ -5962,11 +5899,11 @@ mod first_attempt_timeout_tests {
         // Edge case: an operator sets `set_first_attempt_timeout`
         // to a value LARGER than `rpc_timeout`. The min ensures we
         // never go above `rpc_timeout` (it's a hard ceiling).
-        let c = client_with(
-            Some(Duration::from_secs(2)),
-            Some(Duration::from_secs(10)),
+        let c = client_with(Some(Duration::from_secs(2)), Some(Duration::from_secs(10)));
+        assert_eq!(
+            c.first_attempt_effective_timeout(0),
+            Some(Duration::from_secs(2))
         );
-        assert_eq!(c.first_attempt_effective_timeout(0), Some(Duration::from_secs(2)));
     }
 }
 
@@ -6505,7 +6442,14 @@ mod namespace_binding_tests {
     fn scope_segment_validation_rejects_forged_scopes() {
         // connect() validates EACH `/`-delimited segment against `[a-z0-9._-]+`,
         // so an empty or illegal segment can't forge/nest a scope.
-        for ok in ["bench", "kvc", "acme", "default", "model-cfg_1.0", "a-b_c.d"] {
+        for ok in [
+            "bench",
+            "kvc",
+            "acme",
+            "default",
+            "model-cfg_1.0",
+            "a-b_c.d",
+        ] {
             assert!(super::is_valid_scope_segment(ok), "{ok} should be valid");
         }
         for bad in ["", "acme/sub", "Acme", "a b", "a:b", "a/", "/x"] {
@@ -6661,3 +6605,6 @@ mod ec_shard_plan_tests {
 
 #[cfg(test)]
 mod connection_tests;
+#[cfg(test)]
+#[path = "../../rpc/tests/support/protocol.rs"]
+mod test_protocol;

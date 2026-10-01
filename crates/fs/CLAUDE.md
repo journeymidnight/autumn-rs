@@ -11,7 +11,7 @@
 |------|------|
 | 内核挂载 | `autumn-fuse`（唯一依赖 fuser / libfuse 的 crate，见它的 CLAUDE.md）|
 | S3 网关 | `crates/server/src/bin/autumn_s3/` |
-| `autumnfs` CLI、`migratev3_v4` | `crates/server/src/bin/` |
+| `autumnfs` CLI | `crates/server/src/bin/` |
 | PyO3 `autumn.Fs` + fsspec facade | `python/src/fs.rs` |
 
 以前这些代码是 `autumn-fuse` 的 `core` feature；拆成独立 crate 是因为 S3 网关、Python
@@ -665,12 +665,12 @@ legacy extent 前缀扫描（`scan_extents`、`clean_beyond_eof`、`delete_all_e
 - v3 = lane striping：`InodeMeta` 加 `stripe` 字段（rkyv 布局变，v2 inode 字节解不出），
   大文件走 lane-striped key。v2→v3 stop-world reset，无 in-place 迁移；小/legacy 文件
   仍 `stripe=None` + `[0x03][ino][off]`。BUMP whenever 布局/编码不兼容变更。
-- v4 = 分段文件 + 内容代数：`InodeMeta` 加 `generation`、`segments`。用一次性离线工具
-  `migratev3_v4` 原地转换（每个 inode 保留编号/链接/字节，得到 `generation=1`、
-  `segments=None`，最后才改戳），不 reset。
+- v4 = 分段文件 + 内容代数：`InodeMeta` 加 `generation`、`segments`。历史迁移使用一次性
+  离线工具原地转换，每个 inode 保留编号/链接/字节，得到 `generation=1`、
+  `segments=None`，最后才改戳，不 reset；工具现已移除。
 - **缺戳 ≠ 新树**：只有一个 inode 都没有才算新树并盖当前版本；有 inode 却无戳，是 v4 以前
   不盖戳的工具（`autumnfs`、S3 网关）建的，inode 是 v3——拒绝挂载并指向
-  `migratev3_v4 --unstamped-is-v3`。以前会直接盖 v4，在本地实测转换时把一棵 v3 树变得
+  对应历史发布的独立转换流程。以前会直接盖 v4，在本地实测转换时把一棵 v3 树变得
   整棵不可读（`an_unstamped_populated_tree_is_refused_not_stamped`）。
 
 ## 关键依赖文件

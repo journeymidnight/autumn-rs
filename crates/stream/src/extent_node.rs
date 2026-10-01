@@ -53,7 +53,8 @@ use anyhow::{Context, Result};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
 use bytes::Bytes;
 use compio::fs::{File as CompioFile, OpenOptions};
-use compio::io::{AsyncRead, AsyncWriteExt};
+#[cfg(test)]
+use compio::io::AsyncWriteExt;
 use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
 use compio::BufResult;
 use dashmap::DashMap;
@@ -1794,8 +1795,6 @@ pub struct ExtentNode {
     /// node-wide rather than per-extent because the snapshot has to cover
     /// extents that carried no mark at all when it was taken.
     ec_stage_tick: Rc<Cell<u64>>,
-    /// WAL for small must_sync writes. None if WAL is disabled.
-    /// Wrapped in Rc<RefCell<>> for interior mutability on single-threaded compio.
     /// shard_idx / shard_count for per-shard extent ownership.
     /// Default is (0, 1) = legacy single-thread mode.
     shard_idx: u32,
@@ -1888,35 +1887,10 @@ impl Clone for ExtentNode {
 
 /// Helper: one-shot RPC call (connect → send → recv → close).
 async fn rpc_oneshot(addr: std::net::SocketAddr, msg_type: u8, payload: Bytes) -> Result<Bytes> {
-    let conn = autumn_transport::current_or_init().connect(addr).await?;
-    if let Some(s) = conn.as_tcp() {
-        s.set_nodelay(true)?;
-    }
-    let (mut reader, mut writer) = conn.into_split();
-
-    let req_id = 1u32;
-    let frame = Frame::request(req_id, msg_type, payload);
-    let BufResult(result, _) = writer.write_all(frame.encode()).await;
-    result?;
-
-    let mut decoder = FrameDecoder::new();
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let BufResult(result, buf_back) = reader.read(buf).await;
-        buf = buf_back;
-        let n = result?;
-        if n == 0 {
-            return Err(anyhow::anyhow!("connection closed before response"));
-        }
-        decoder.feed(&buf[..n]);
-        if let Some(resp) = decoder.try_decode().map_err(|e| anyhow::anyhow!("{e}"))? {
-            if resp.is_error() {
-                let (code, msg) = autumn_rpc::RpcError::decode_status(&resp.payload);
-                return Err(anyhow::anyhow!("rpc error ({:?}): {}", code, msg));
-            }
-            return Ok(resp.payload);
-        }
-    }
+    let client = autumn_rpc::client::RpcClient::connect(addr).await?;
+    Ok(client
+        .call_timeout(msg_type, payload, std::time::Duration::from_secs(30))
+        .await?)
 }
 
 /// Send an EC participant control RPC (`WriteShard`) to a
@@ -2258,13 +2232,25 @@ async fn process_frames_backpressured(
     >,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
+    protocol: &autumn_rpc::protocol_hello::Negotiated,
 ) -> Result<()> {
     use futures::stream::StreamExt as _;
     // Pull all complete frames out of the decoder.
     let mut frames: Vec<Frame> = Vec::new();
     loop {
         match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
-            Some(frame) if frame.req_id != 0 => frames.push(frame),
+            Some(frame) if frame.req_id != 0 => {
+                if let Err(e) = protocol.check_opcode(frame.msg_type) {
+                    tx_bufs.push(err_bytes(
+                        frame.req_id,
+                        frame.msg_type,
+                        StatusCode::PermissionDenied,
+                        &e.to_string(),
+                    ));
+                } else {
+                    frames.push(frame);
+                }
+            }
             Some(_) => continue, // req_id=0: fire-and-forget, no response needed
             None => break,
         }
@@ -5915,7 +5901,13 @@ impl ExtentNode {
 
         const READ_BUF_SIZE: usize = 512 * 1024;
 
-        let (reader, mut writer) = conn.into_split();
+        let (mut reader, mut writer) = conn.into_split();
+        let protocol = autumn_rpc::protocol_hello::accept(
+            &mut reader,
+            &mut writer,
+            autumn_rpc::protocol_hello::Service::ExtentNode,
+        )
+        .await?;
         let mut decoder = FrameDecoder::new();
 
         // per-conn inflight cap from `ExtentNodeConfig.inflight_cap`,
@@ -5979,6 +5971,7 @@ impl ExtentNode {
                             &mut inflight,
                             &mut tx_bufs,
                             cap,
+                            &protocol,
                         )
                         .await?;
                         read_fut = Some(spawn_read(reader, next_window(&mut decoder)));
@@ -6035,6 +6028,7 @@ impl ExtentNode {
                                 &mut inflight,
                                 &mut tx_bufs,
                                 cap,
+                                &protocol,
                             )
                             .await?;
                             read_fut = Some(spawn_read(reader, next_window(&mut decoder)));
@@ -6301,9 +6295,8 @@ impl ExtentNode {
     /// hit disk before the manager (or anyone else) can rely on the
     /// sealed prefix being durable.
     ///
-    /// Without (2), an extent that was open + receiving `must_sync=
-    /// false` writes can have `extent.len` advanced in memory past
-    /// what's actually on disk; the seal then captures the in-memory
+    /// Without (2), pending writes can have `extent.len` advanced
+    /// in memory past what's durable on disk; the seal captures the in-memory
     /// length but the disk holds less. A subsequent extent-node
     /// restart, OOM-driven page eviction, or host reboot drops the
     /// unsynced bytes — the file shrinks below `sealed_length` and
@@ -6351,7 +6344,7 @@ impl ExtentNode {
             // reversed: .meta written first then .dat fsync'd. If the
             // process crashed in that window, the OS page cache could have
             // already flushed .meta (44 bytes, well under one sector) while
-            // .dat's must_sync=false bytes were still in page cache and
+            // .dat's unsynced bytes were still in page cache and
             // lost. On restart `parse_meta` returned the NEW sealed_length
             // while the `.dat` file size was SHORTER; subsequent reads
             // past the durable `extent.len` returned EOF or zero-padded
@@ -6779,7 +6772,7 @@ impl ExtentNode {
         f.set_len(commit).await.map_err(|e| e.to_string())?;
         // fsync the truncate. Without this, the kernel may report the
         // smaller size in stat() before the inode metadata is durable; if the
-        // node crashes after `set_len` but before any subsequent must_sync
+        // node crashes after `set_len` but before any subsequent durable
         // append flushes the file's metadata, post-restart the file size
         // could be observed at the pre-truncate length. The min-replica
         // commit protocol depends on per-replica `extent.len` matching what
@@ -11215,6 +11208,17 @@ mod enospc_disk_health_tests {
             autumn_transport::Conn::Tcp(server),
             node,
         ));
+        {
+        let (mut rd, mut wr) = autumn_transport::Conn::Tcp(client.clone()).into_split();
+        autumn_rpc::protocol_hello::initiate(
+            &mut rd,
+            &mut wr,
+            autumn_rpc::protocol_hello::Hello::current(autumn_rpc::protocol_hello::Role::Peer),
+            Some(autumn_rpc::protocol_hello::Service::ExtentNode),
+        )
+        .await
+        .unwrap();
+        }
         for id in 1..=2u32 {
             let req = AppendReq {
                 extent_id: 6100,

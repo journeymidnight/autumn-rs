@@ -1161,7 +1161,7 @@ remotely-triggerable crash. Refusing names the fix ("chunk the read") and keeps
 the node serving; the encoder's assert is then the last resort for frames this
 node builds itself, not the thing a remote request trips. It reuses
 `CODE_PRECONDITION` rather than claiming a new code, because a new code is a
-stop-the-world deploy.
+coordinated wire rollout with transient RPC refusal.
 
 **A BULK read's refusal carries the same status its plain twin does.** The bulk
 arm used to answer every `get_extent` error with `bulk_read_head(CODE_ERROR,
@@ -1232,7 +1232,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
 3. **Parallel 3-replica fanout** — `launch_append` fires the 3 per-replica `pool.send_prepared` futures concurrently via `join_all`; one slow replica doesn't serialise the others. Per-replica TCP byte order is preserved because each `RpcClient` runs a single-writer `writer_task`; fanout order across replicas is irrelevant. `apply_completion` enforces that all replicas agree on the file-level `offset/end`.
 
-4. **Durability is not a knob** — the per-extent owner does ONE `sync_data` per drained burst (`pending_fsync` before, `last_synced` after), so every append is durable before it ACKs. `sync_data` is whole-file, so one burst's fsync covers every append in that burst. There is no `--nosync` and no `must_sync` flag: the byte was removed from `AppendReq`, and `BatchPutReq` lost the last surviving copy at wire v30.
+4. **Durability is not a knob** — the per-extent owner does ONE `sync_data` per drained burst (`pending_fsync` before, `last_synced` after), so every append is durable before it ACKs. `sync_data` is whole-file, so one burst's fsync covers every append in that burst. Every append follows the same durability path.
 
 5. **StreamClient is always `Rc<StreamClient>`** — constructors return `Rc<Self>` (via `Rc::new_cyclic`) so per-stream workers hold `Weak<StreamClient>` for the removal guard. Public API takes `&self`.
 
@@ -1638,7 +1638,7 @@ ConvertToEc(9), WriteShard(10), DeleteExtent(11), ReconcileExtents(0x31).
 `CODE_CONTENT_CORRUPT = 8` (added at `WIRE_VERSION` 42) says an EC source failed
 its stored checksum — the attempt has ended and its marker should be released
 for repair, which no other code says. Adding one is a wire event
-(`MIN == MAX`, stop-the-world), and `code_description` must learn it in the same
+(with client compatibility checked separately), and `code_description` must learn it in the same
 change: an unnamed code renders as one generic word, which is how a stale-fence
 rejection and a corrupt-content refusal become the same useless log line.
 

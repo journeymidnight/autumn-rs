@@ -192,17 +192,30 @@ pub fn decode_segc(bytes: &[u8]) -> Result<SegcRecord, String> {
 pub enum PendingOp {
     /// Publishing new inode `new_ino` as `parent`/`name`. Finished iff the
     /// dirent names `new_ino`; otherwise `new_ino` and its data are undone.
-    Publish { parent: u64, name: Vec<u8>, new_ino: u64 },
+    Publish {
+        parent: u64,
+        name: Vec<u8>,
+        new_ino: u64,
+    },
     /// Taking `parent`/`name` away from inode `ino`, handing it to
     /// `successor` (a replace) or to nobody (a delete). Once the dirent holds
     /// exactly that, the name is dropped from `ino`. Anything else (the old
     /// name still, or another session's file) says this swap did not land,
     /// and whoever moved the name retired `ino` themselves.
-    Retire { parent: u64, name: Vec<u8>, ino: u64, successor: Option<u64> },
+    Retire {
+        parent: u64,
+        name: Vec<u8>,
+        ino: u64,
+        successor: Option<u64>,
+    },
     /// Writing data object `data_ino` as part `part` of `upload`. Kept iff
     /// the upload owns it: open with the part record naming it, or frozen
     /// into the file a Complete is publishing or has published.
-    Part { upload: u64, part: u32, data_ino: u64 },
+    Part {
+        upload: u64,
+        part: u32,
+        data_ino: u64,
+    },
     /// Completing `upload` into the inode this record is keyed by. Finished
     /// iff the dirent names that inode; otherwise undone and the upload
     /// reopened.
@@ -224,10 +237,17 @@ pub enum UploadState {
     Open,
     /// Being published as inode `new_ino` by `session`, from exactly the data
     /// objects in `frozen` (list order).
-    Completing { new_ino: u64, session: u64, frozen: Vec<u64> },
+    Completing {
+        new_ino: u64,
+        session: u64,
+        frozen: Vec<u64>,
+    },
     /// Published as `new_ino`, which owns the objects in `frozen`. The record
     /// is deleted once the upload's leftovers are.
-    Completed { new_ino: u64, frozen: Vec<u64> },
+    Completed {
+        new_ino: u64,
+        frozen: Vec<u64>,
+    },
     Aborted,
 }
 
@@ -497,7 +517,7 @@ pub const ROOT_INO: u64 = 1;
 ///
 /// - **v4** = segmented files and content generations: `InodeMeta` gains
 ///   `generation` and `segments` (rkyv layout change). Converted in place by
-///   the one-shot `migratev3_v4` tool against a stopped filesystem — every
+///   a one-shot converter against a stopped filesystem (tool since removed) — every
 ///   inode keeps its number, links and bytes, and gains `generation = 1` and
 ///   `segments = None` — rather than by a reset.
 ///

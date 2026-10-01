@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # rolling_restart.sh — SAME-BINARY rolling restart.
 #
-# autumn does NOT support rolling UPGRADES: a version change is stop-the-world
-# (full stop, swap binaries, full start). This script restarts a cluster that
-# is already running one binary — for config changes, host maintenance, or
-# clearing a wedged process.
+# This script restarts one unchanged binary for config changes, host
+# maintenance or clearing a wedged process. A wire-changing rolling upgrade
+# uses the separate runbook in docs/ops.md; failed RPCs and temporary service
+# unavailability are permitted while dependencies converge.
 #
 # Programmatic rolling restart of a running autumn-rs cluster, one process
 # at a time, with a convergence gate + write-liveness probe between every
@@ -18,9 +18,9 @@
 #   3. manager                    (gate: leader back + all nodes Online)
 #
 # This is a SAME-BINARY rolling restart (config change / machine move /
-# kernel upgrade). Version-skew rolling upgrades additionally need the
-# R1+ cluster_version machinery; this script is their orchestration
-# skeleton.
+# kernel upgrade). Its Ready-between-instances gates must not be reused
+# unchanged for a wire-changing rollout: dependent upgraded nodes may wait
+# for the next instances to be upgraded.
 #
 # Usage:
 #   bash scripts/rolling_restart.sh            # full sequence

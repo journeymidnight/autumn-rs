@@ -1,5 +1,9 @@
 # Client Wire Compatibility
 
+Historical design record. The current mandatory `PROTOCOL_HELLO`, retired
+`cluster_version` latch and rolling-upgrade rules are in
+[cluster_version_design.md](cluster_version_design.md) and [ops.md](ops.md).
+
 An upgrade stops and restarts the manager, partition servers and extent nodes
 together. It does not stop the processes that hold an embedded client — an
 inference pod, a mounted fuse daemon, an s3 gateway, a python wheel inside

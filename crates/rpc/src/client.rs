@@ -34,6 +34,9 @@ use futures::channel::{mpsc, oneshot};
 use futures::StreamExt;
 
 use crate::error::RpcError;
+#[cfg(test)]
+#[path = "../tests/support/protocol.rs"]
+mod test_protocol;
 use crate::frame::{Frame, FrameDecoder};
 
 // ── zero-copy GET (recv-into-pooled) ─────────────────────────────────────────
@@ -126,14 +129,26 @@ const SUBMIT_CHANNEL_CAP: usize = 1024;
 /// vectored bufs). The writer_task simply writes to the socket.
 enum SubmitMsg {
     /// A single-buffer frame (used by `call()`, `send_oneshot()`, etc.).
-    Single { bytes: Bytes, req_id: u32 },
+    Single {
+        bytes: Bytes,
+        req_id: u32,
+    },
     /// A vectored frame `[header][part0][part1]...` (used by `call_vectored`,
     /// `send_vectored`). Zero-copy for the payload parts.
-    Vectored { bufs: Vec<Bytes>, req_id: u32 },
-    Prepared { bufs: Vec<Bytes>, req_id: u32 },
+    Vectored {
+        bufs: Vec<Bytes>,
+        req_id: u32,
+    },
+    Prepared {
+        bufs: Vec<Bytes>,
+        req_id: u32,
+    },
     /// A keepalive ping. Written like `Single`; the writer counts it once it
     /// is on the wire, which is when the keepalive starts timing the reply.
-    Ping { bytes: Bytes, req_id: u32 },
+    Ping {
+        bytes: Bytes,
+        req_id: u32,
+    },
 }
 
 impl SubmitMsg {
@@ -217,6 +232,7 @@ impl Keepalive {
 /// All fields are !Send (single-threaded, compio thread-per-core model).
 /// `pending` uses `RefCell` with scoped borrows — never held across await.
 pub struct RpcClient {
+    protocol: crate::protocol_hello::Negotiated,
     /// SQ: submit channel to writer_task. Borrowed mutably, never cloned per
     /// send: `futures::mpsc` grants each SENDER a slot beyond the shared
     /// buffer, so a clone per call hands every caller its own slot and the
@@ -293,22 +309,37 @@ impl RpcClient {
     /// writer. Honours `AUTUMN_TRANSPORT={tcp,ucx,auto}` once Phase 4 wires
     /// the env switch.
     pub async fn connect(addr: SocketAddr) -> Result<Rc<Self>, RpcError> {
-        let conn = autumn_transport::current_or_init().connect(addr).await?;
-        // TCP_NODELAY only applies to the TCP variant; UCX manages framing
-        // itself and exposes no equivalent knob.
-        if let Some(s) = conn.as_tcp() {
-            s.set_nodelay(true)?;
-        }
-        Self::from_conn(conn, addr)
+        Self::connect_as(addr, crate::protocol_hello::Role::Peer, None).await
+    }
+
+    pub async fn connect_as(
+        addr: SocketAddr,
+        role: crate::protocol_hello::Role,
+        expected: Option<crate::protocol_hello::Service>,
+    ) -> Result<Rc<Self>, RpcError> {
+        let deadline = crate::protocol_hello::TIMEOUT;
+        compio::time::timeout(deadline, async {
+            let conn = autumn_transport::current_or_init().connect(addr).await?;
+            if let Some(s) = conn.as_tcp() {
+                s.set_nodelay(true)?;
+            }
+            Self::from_conn_as(conn, addr, Keepalive::DEFAULT, role, expected).await
+        }).await.map_err(|_| RpcError::Timeout(deadline))?
     }
 
     /// `connect` with a non-default `Keepalive` (tests shorten it).
-    pub async fn connect_with(addr: SocketAddr, keepalive: Keepalive) -> Result<Rc<Self>, RpcError> {
-        let conn = autumn_transport::current_or_init().connect(addr).await?;
-        if let Some(s) = conn.as_tcp() {
-            s.set_nodelay(true)?;
-        }
-        Self::from_conn_with(conn, addr, keepalive)
+    pub async fn connect_with(
+        addr: SocketAddr,
+        keepalive: Keepalive,
+    ) -> Result<Rc<Self>, RpcError> {
+        let deadline = crate::protocol_hello::TIMEOUT;
+        compio::time::timeout(deadline, async {
+            let conn = autumn_transport::current_or_init().connect(addr).await?;
+            if let Some(s) = conn.as_tcp() {
+                s.set_nodelay(true)?;
+            }
+            Self::from_conn_with(conn, addr, keepalive).await
+        }).await.map_err(|_| RpcError::Timeout(deadline))?
     }
 
     /// Build an RpcClient from an already-connected `autumn_transport::Conn`.
@@ -320,18 +351,35 @@ impl RpcClient {
     /// Both tasks terminate on socket close / write error. When either exits,
     /// `pending` is cleared so callers' receivers see `RecvError` and surface
     /// `RpcError::ConnectionClosed`.
-    pub fn from_conn(
+    pub async fn from_conn(
         conn: autumn_transport::Conn,
         peer_addr: SocketAddr,
     ) -> Result<Rc<Self>, RpcError> {
-        Self::from_conn_with(conn, peer_addr, Keepalive::DEFAULT)
+        Self::from_conn_with(conn, peer_addr, Keepalive::DEFAULT).await
     }
 
     /// `from_conn` with an explicit `Keepalive`.
-    pub fn from_conn_with(
+    pub async fn from_conn_with(
         conn: autumn_transport::Conn,
         peer_addr: SocketAddr,
         keepalive: Keepalive,
+    ) -> Result<Rc<Self>, RpcError> {
+        Self::from_conn_as(
+            conn,
+            peer_addr,
+            keepalive,
+            crate::protocol_hello::Role::Peer,
+            None,
+        )
+        .await
+    }
+
+    pub async fn from_conn_as(
+        conn: autumn_transport::Conn,
+        peer_addr: SocketAddr,
+        keepalive: Keepalive,
+        role: crate::protocol_hello::Role,
+        expected: Option<crate::protocol_hello::Service>,
     ) -> Result<Rc<Self>, RpcError> {
         // Taken before the split; valid while either half lives, which the
         // keepalive checks through `closed` (see `keepalive_task`).
@@ -342,7 +390,14 @@ impl RpcClient {
         });
         #[cfg(not(target_os = "linux"))]
         let ack_probe: Option<AckProbe> = None;
-        let (reader, writer) = conn.into_split();
+        let (mut reader, mut writer) = conn.into_split();
+        let protocol = crate::protocol_hello::initiate(
+            &mut reader,
+            &mut writer,
+            crate::protocol_hello::Hello::current(role),
+            expected,
+        )
+        .await?;
         let pending: Rc<RefCell<HashMap<u32, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
 
         let (submit_tx, submit_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
@@ -404,6 +459,7 @@ impl RpcClient {
         // The handles are FIELDS, not `detach()` — see `_writer_task`. They are
         // this connection's only teardown.
         Ok(Rc::new_cyclic(|weak| Self {
+            protocol,
             submit_tx: RefCell::new(submit_tx),
             pending,
             next_id: Cell::new(1),
@@ -425,6 +481,10 @@ impl RpcClient {
     /// True when either `read_loop` or `writer_task` has exited.
     /// Pools should evict the entry; new `send_*` calls return
     /// `ConnectionClosed` without inserting into `pending`.
+    pub fn protocol(&self) -> &crate::protocol_hello::Negotiated {
+        &self.protocol
+    }
+
     pub fn is_closed(&self) -> bool {
         self.closed.get()
     }
@@ -853,7 +913,11 @@ pub fn set_prepared_zerocopy_min_bytes(bytes: usize) {
     PREPARED_ZEROCOPY_MIN_BYTES.store(bytes, Ordering::Relaxed);
 }
 
-async fn write_prepared(writer: &mut WriteHalf, bufs: Vec<Bytes>, size: usize) -> std::io::Result<()> {
+async fn write_prepared(
+    writer: &mut WriteHalf,
+    bufs: Vec<Bytes>,
+    size: usize,
+) -> std::io::Result<()> {
     let min = PREPARED_ZEROCOPY_MIN_BYTES.load(Ordering::Relaxed);
     if min == 0 || size < min {
         return write_vectored_chunked(writer, bufs).await;
@@ -1061,7 +1125,9 @@ async fn writer_task(
         // rare error branch).
         let is_ping = matches!(msg, SubmitMsg::Ping { .. });
         let (iov_count, total_bytes) = match &msg {
-            SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => (1usize, bytes.len()),
+            SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => {
+                (1usize, bytes.len())
+            }
             SubmitMsg::Vectored { bufs, .. } | SubmitMsg::Prepared { bufs, .. } => {
                 let total: usize = bufs.iter().map(|b| b.len()).sum();
                 (bufs.len(), total)
@@ -1073,7 +1139,9 @@ async fn writer_task(
                 r
             }
             SubmitMsg::Vectored { bufs, .. } => write_vectored_chunked(&mut writer, bufs).await,
-            SubmitMsg::Prepared { bufs, .. } => write_prepared(&mut writer, bufs, total_bytes).await,
+            SubmitMsg::Prepared { bufs, .. } => {
+                write_prepared(&mut writer, bufs, total_bytes).await
+            }
         };
 
         if let Err(e) = result {
@@ -1403,8 +1471,8 @@ fn finish_into_pooled_from_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use crate::error::StatusCode;
+    use bytes::Bytes;
     use std::time::Duration;
 
     /// A peer that ACCEPTS and never ANSWERS holds this path forever — so
@@ -1440,7 +1508,8 @@ mod tests {
         let server_addr = listener.local_addr().expect("local_addr");
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let accept_thread = std::thread::spawn(move || {
-            let (sock, _) = listener.accept().expect("accept");
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
             let _ = stop_rx.recv_timeout(Duration::from_secs(30));
             drop(sock);
         });
@@ -1500,7 +1569,8 @@ mod tests {
         let server_addr = listener.local_addr().expect("local_addr");
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
         let accept_thread = std::thread::spawn(move || {
-            let (sock, _) = listener.accept().expect("accept");
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
             let _ = stop_rx.recv_timeout(Duration::from_secs(30));
             drop(sock);
         });
@@ -1619,7 +1689,8 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let server_addr = listener.local_addr().expect("local_addr");
         let accept_thread = std::thread::spawn(move || {
-            let (sock, _) = listener.accept().expect("accept");
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
             // Hold for ~50 ms so the client finishes connecting, then
             // drop — the FIN reaches the client and read_loop exits.
             std::thread::sleep(Duration::from_millis(50));
@@ -1673,6 +1744,7 @@ mod tests {
 
         let srv = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
             let mut hdr = [0u8; 10];
             sock.read_exact(&mut hdr).expect("read req hdr");
             let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
@@ -1725,6 +1797,7 @@ mod tests {
 
         let srv = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
             let mut hdr = [0u8; 10];
             sock.read_exact(&mut hdr).expect("read req hdr");
             let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
@@ -1773,6 +1846,7 @@ mod tests {
 
         let srv = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
             let mut hdr = [0u8; 10];
             sock.read_exact(&mut hdr).expect("read req hdr");
             let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
@@ -1813,6 +1887,7 @@ mod tests {
 
         let srv = std::thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
             let mut hdr = [0u8; 10];
             sock.read_exact(&mut hdr).expect("read req hdr");
             let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());

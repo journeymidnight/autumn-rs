@@ -173,19 +173,17 @@ All in `crates/rpc/src/manager_rpc.rs` and `crates/rpc/src/extent_rpc.rs`:
 **Operational rule:** any edit to those schema files is a MANUAL
 `WIRE_VERSION` bump in `crates/rpc/src/lib.rs` (and a raise of
 `MIN_CLIENT_WIRE_VERSION` if the change breaks the client surface).
-Nothing verifies the bump for you — a forgotten one ships two binaries that
-agree on the version number, disagree on the layout, handshake happily, and then
-decode each other's bytes as garbage. Bump exactly once per commit
-(`autumn-op upgrade-version` steps `cur + 1`).
+Nothing verifies the bump for you. A forgotten one lets different layouts
+claim the same version; `PROTOCOL_HELLO` cannot detect that mistake.
 
-Because `MgrNodeInfo` / `MgrNodeOverride` are persisted, changing their layout is
-a stop-world upgrade: stop every role, swap binaries, start, with no rollback
-(`autumn-op upgrade-version --to N` may jump straight to N; it never moves back).
-across the change. rkyv's decode is fail-loud, so an un-migrated old value
-refuses leadership rather than being mis-read — but note that M0 itself shipped
-NO migration for pre-`node_uuid` rows. Production etcd is never wiped, so a
-cluster predating M0 needs a one-shot migration written before upgrading; a dev
-cluster rebuilds from empty.
+Because `MgrNodeInfo` / `MgrNodeOverride` are persisted, a layout change needs
+its own persisted-reader/writer compatibility and migration analysis. The
+retired `cluster_version` latch and `autumn-op upgrade-version` are not used.
+Only when that specific format change permits coexistence may its release
+use a rolling upgrade; otherwise coordinate the required stopworld or writer
+pause. Preserve existing data and verify recovery after the change. M0 shipped
+no migration for pre-`node_uuid` rows; upgrading such a cluster needs a
+one-off migration. Production etcd is never wiped.
 
 ### 2.6 df-echo drift detection and imposter refusal
 

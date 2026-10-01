@@ -51,6 +51,16 @@ impl StatusCode {
 /// An RPC error returned to callers.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
+    #[error("PROTOCOL_HELLO version mismatch: role={role:?}, local wire={local_wire}, remote wire={remote_wire}, client={client_version}, server clients=[{min_client},{max_client}]: {message}")]
+    VersionMismatch {
+        role: crate::protocol_hello::Role,
+        local_wire: u32,
+        remote_wire: u32,
+        client_version: u32,
+        min_client: u32,
+        max_client: u32,
+        message: String,
+    },
     #[error("rpc status {code:?}: {message}")]
     Status { code: StatusCode, message: String },
 
@@ -79,7 +89,8 @@ impl RpcError {
     pub fn is_connection_error(&self) -> bool {
         match self {
             Self::Status { .. } => false,
-            Self::ConnectionClosed
+            Self::VersionMismatch { .. }
+            | Self::ConnectionClosed
             | Self::Cancelled
             | Self::Timeout(_)
             | Self::Frame(_)

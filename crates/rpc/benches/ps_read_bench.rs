@@ -72,7 +72,9 @@ fn bulk_head(req_id: u32, value: &[u8]) -> Bytes {
 
 async fn serve_conn(conn: autumn_transport::Conn, value: Bytes) {
     use compio::io::{AsyncReadExt, AsyncWriteExt};
-    let (mut r, mut w) = conn.into_split();
+let (mut r, mut w) = conn.into_split();
+    if autumn_rpc::protocol_hello::accept(&mut r, &mut w,
+        autumn_rpc::protocol_hello::Service::ExtentNode).await.is_err() { return; }
     loop {
         // Read the 10-byte request header; req_id at [0..4], wire payload_len at
         // [6..10] (V1 includes the +4 CRC trailer — we just drain it).

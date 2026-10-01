@@ -1436,12 +1436,8 @@ pub(crate) async fn background_maintenance_loop(
                         let collectable = {
                             let p = part.borrow();
                             let mut slot = p.gc_debt_basis.borrow_mut();
-                            let next = next_gc_debt_basis(
-                                slot.as_ref(),
-                                resolved,
-                                policy,
-                                defines_policy,
-                            );
+                            let next =
+                                next_gc_debt_basis(slot.as_ref(), resolved, policy, defines_policy);
                             *slot = next;
                             gc_debt_from_basis(&discards, slot.as_ref())
                         };
@@ -1461,8 +1457,12 @@ pub(crate) async fn background_maintenance_loop(
                 {
                     let mut protected_eids: Vec<u64> = Vec::new();
                     holes.retain(|(eid, sealed_length)| {
-                        let keep =
-                            gc_extent_punchable(*eid, *sealed_length, &pos_by_eid, replay_floor_pos);
+                        let keep = gc_extent_punchable(
+                            *eid,
+                            *sealed_length,
+                            &pos_by_eid,
+                            replay_floor_pos,
+                        );
                         if !keep {
                             protected_eids.push(*eid);
                         }
@@ -1849,7 +1849,12 @@ pub(crate) async fn start_write_batch(
                     value,
                     expires_at,
                 } => (user_key, 1u8, value, expires_at),
-                WriteOp::Delete { user_key } => (Bytes::from(user_key), crate::OP_TOMBSTONE, Bytes::new(), 0u64),
+                WriteOp::Delete { user_key } => (
+                    Bytes::from(user_key),
+                    crate::OP_TOMBSTONE,
+                    Bytes::new(),
+                    0u64,
+                ),
                 // BUG-LEASE-2 Phase 2: fence-floor bump record. key = raw
                 // ino bytes (NOT a user key — skips in_range below), value
                 // = epoch. Never inserted into the memtable (Phase 3 skips
@@ -1895,7 +1900,13 @@ pub(crate) async fn start_write_batch(
         let log_stream_id = p.log_stream_id;
         let part_sc = p.stream_client.clone();
         let admission = p.rate_ctrl.clone();
-        (valid, inflight_key_hashes, log_stream_id, part_sc, admission)
+        (
+            valid,
+            inflight_key_hashes,
+            log_stream_id,
+            part_sc,
+            admission,
+        )
     };
     // borrow_mut released here — safe to await below.
 
@@ -1999,17 +2010,15 @@ pub(crate) async fn start_write_batch(
         (segments, record_sizes)
     };
 
-    // every append is durable. The old Phase B rotation-trigger
-    // barrier is gone (Phase 2), and the AppendReq.must_sync wire field
-    // is gone (Phase 3 follow-up). Durability is enforced at TWO points:
+    // Every append is durable. Durability is enforced at two points:
     //   1. extent-node coalescer (Phase 1, event-driven group commit) —
     //      every pwrite's bytes become durable in one fsync coalesced
     //      with concurrent friends; the handler always awaits the
     //      coalescer's wake.
-    //   2. flush-time `await_log_synced_to` in `flush_one_imm` — quorum
-    //      of replicas must have synced past `vp_offset` BEFORE the SST
+    //   2. flush-time `await_log_synced_to` in `flush_one_imm` — all
+    //      replicas must have synced past `vp_offset` BEFORE the SST
     //      upload, so every byte the imm's ValuePointers reference is
-    //      durable on a quorum before the SST that names them is
+    //      durable on every replica before the SST that names them is
     //      checkpointed.
     //
     // Net: every Put pays exactly one fsync syscall (~1 ms tmpfs / 5-15
@@ -2473,15 +2482,7 @@ async fn checkpoint_and_truncate_row_prefix(
         )
     };
     // No await between the snapshot and the checkpoint enqueue (publish order).
-    save_table_locs_raw(
-        &sc,
-        meta_id,
-        &tables,
-        vp.0,
-        vp.1,
-        floors,
-    )
-    .await?;
+    save_table_locs_raw(&sc, meta_id, &tables, vp.0, vp.1, floors).await?;
     truncate_unreferenced_row_prefix(part, part_id).await
 }
 
@@ -3146,10 +3147,7 @@ pub(crate) fn get_discards(readers: &[Arc<SstReader>]) -> HashMap<u64, i64> {
 /// It exists as its own function because the idle refresh tick re-arms every
 /// 5-7 s and overwrites whatever selection stored, so this is what the advisory
 /// actually reads almost all the time.
-pub(crate) fn gc_debt_from_basis(
-    discards: &HashMap<u64, i64>,
-    basis: Option<&GcDebtBasis>,
-) -> u64 {
+pub(crate) fn gc_debt_from_basis(discards: &HashMap<u64, i64>, basis: Option<&GcDebtBasis>) -> u64 {
     match basis {
         Some((resolved, policy)) => {
             // Re-derive the stream-debt relaxation HERE rather than storing a
@@ -5597,7 +5595,11 @@ mod gc_selection_tests {
     /// What the manager actuates from its own config: the cluster's standing
     /// GC policy.
     fn standing() -> GcDebtPolicy {
-        GcDebtPolicy { ratio_base: 0.4, stream_debt: Some(GIB), floor: Some(GIB) }
+        GcDebtPolicy {
+            ratio_base: 0.4,
+            stream_debt: Some(GIB),
+            floor: Some(GIB),
+        }
     }
 
     const GIB: u64 = 1024 * 1024 * 1024;
@@ -5669,7 +5671,11 @@ mod gc_selection_tests {
         // GC button. Such a pass may refresh what it resolved; it may not
         // leave the gauge answering a different question than the advisory
         // asks.
-        let bare = GcDebtPolicy { ratio_base: 0.4, stream_debt: None, floor: None };
+        let bare = GcDebtPolicy {
+            ratio_base: 0.4,
+            stream_debt: None,
+            floor: None,
+        };
         let manual = next_gc_debt_basis(auto.as_ref(), resolved, bare, false);
         assert_eq!(
             gc_debt_from_basis(&discards, manual.as_ref()),
@@ -5694,8 +5700,11 @@ mod gc_selection_tests {
         // which is exactly why `defines_policy`, and not the floor's presence,
         // is what bars it. The unreachable INFINITY gate is PS-local to
         // selection and never reaches a policy.
-        let sweep_policy =
-            GcDebtPolicy { ratio_base: 0.4, stream_debt: None, floor: Some(100 * GIB) };
+        let sweep_policy = GcDebtPolicy {
+            ratio_base: 0.4,
+            stream_debt: None,
+            floor: Some(100 * GIB),
+        };
         let sweep = next_gc_debt_basis(auto.as_ref(), resolved, sweep_policy, false);
         assert_eq!(gc_debt_from_basis(&discards, sweep.as_ref()), DEAD_190);
     }
@@ -5714,8 +5723,11 @@ mod gc_selection_tests {
         let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
         let auto = next_gc_debt_basis(None, resolved.clone(), standing(), true);
 
-        let overridden =
-            GcDebtPolicy { ratio_base: 0.9, stream_debt: None, floor: Some(100 * GIB) };
+        let overridden = GcDebtPolicy {
+            ratio_base: 0.9,
+            stream_debt: None,
+            floor: Some(100 * GIB),
+        };
         let after = next_gc_debt_basis(auto.as_ref(), resolved, overridden, false);
         assert_eq!(
             gc_debt_from_basis(&discards, after.as_ref()),
@@ -5764,7 +5776,11 @@ mod gc_selection_tests {
         let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
         // No pass has ever carried the standing policy, so there is nothing to
         // judge by: over-report rather than guess a gate.
-        let bare = GcDebtPolicy { ratio_base: 0.4, stream_debt: None, floor: None };
+        let bare = GcDebtPolicy {
+            ratio_base: 0.4,
+            stream_debt: None,
+            floor: None,
+        };
         let b = next_gc_debt_basis(None, resolved, bare, false);
         assert!(b.is_none());
         assert_eq!(gc_debt_from_basis(&discards, b.as_ref()), DEAD_190);
@@ -5785,7 +5801,11 @@ mod gc_selection_tests {
         // so 0.195 stays under it.
         let basis = (
             HashMap::from([(190u64, (LEN_190, 1u64))]),
-            GcDebtPolicy { ratio_base: 0.4, stream_debt: None, floor: None },
+            GcDebtPolicy {
+                ratio_base: 0.4,
+                stream_debt: None,
+                floor: None,
+            },
         );
         assert_eq!(
             gc_debt_from_basis(&discards, Some(&basis)),

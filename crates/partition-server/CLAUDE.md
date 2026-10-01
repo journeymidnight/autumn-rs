@@ -1747,35 +1747,16 @@ check per request — it NEVER calls the manager to enforce.
 signing key configured cluster-wide) ⇒ the whole gate is skipped, so fuse / kvcache /
 dev pay nothing. `enabled` flips true only after the config poll installs a keyring.
 
-INVARIANT — **ONE choke point: `authz_gate`, at the TOP of every frame dispatch,
-BEFORE admission.** The single exception is the keepalive ping, answered just
-above it: it names no partition, carries and returns no data, and an un-helloed
-connection must be able to prove the PS alive (test
-`keepalive_ping_is_answered_by_the_connection_loop` runs with authz ON). Called from `push_one_frame_to_inflight` and from
-`drain_bulk_writes`. Bulk receive checks the verified control before allocating a
-value slab, then checks again after receive so expiry/revocation during the await
-cannot bypass normal admission semantics.
+INVARIANT: handle_ps_connection accepts mandatory PROTOCOL_HELLO before its
+business decoder or keepalive dispatch. No silent/legacy admission exists.
+ConnGateState carries the negotiated protocol and authenticated principal.
+authz_gate checks the service/role/opcode before business DTO decoding, then
+performs existing authorization. Bulk checks occur before value allocation and
+again after receive so expiry/revocation during await cannot bypass them.
 
-Its name is historical: it is the gate for everything decided per CONNECTION rather
-than per request, and wire-version admission joined it rather than getting a second
-function precisely so the three call sites cannot drift apart. The two connection facts
-travel together in one `ConnGateState` (`principal`, `client_wire_version`) for the same
-reason — a keyed opcode with no arm has shipped from this file twice
-(`extract_part_id`, `authz_check`), and threading a second `&mut` through six sites is
-that shape again. Both fields are mutated synchronously, before any await in the calling
-dispatch, so neither borrow spans an await. It:
-
-- handles `MSG_CLIENT_HELLO` and gates the client-surface msg_types on the window
-  (`autumn_rpc::client_hello`). **This runs ABOVE the `!authz.gate_active()` early
-  return** — below it the check would not exist on an authz-off cluster, which is most
-  of them; ablated by `a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition`,
-  which drives a real `handle_ps_connection` over a real socket with authz OFF and
-  asserts the refused write never reaches the mock partition loop. A connection that
-  sent no hello is treated as the version the hello was introduced in, so every client
-  and every manager→PS control RPC predating it is unaffected. Scoping is by msg_type,
-  never by connection: `MSG_SPLIT_PART` / `MSG_MAINTENANCE` / `MSG_MERGE_FREEZE` /
-  `MSG_ROLL_TAILS` arrive on the same listeners with nothing in the frame naming the
-  sender's role.
+- protocol admission uses the client interval or exact peer/admin wire. The
+  real socket test a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition
+  runs with authz OFF and proves version refusal does not reach the partition.
 - handles `MSG_AUTH_HELLO`: `verify_auth_hello` (sig + `aud == cluster_id` +
   `nbf`/`exp`) binds the per-connection `principal: Option<BoundPrincipal>`. When
   authz is OFF, AUTH_HELLO is a no-op OK so an authz-aware client still works against
@@ -1977,12 +1958,10 @@ decision of its own, taken by the user for one specific need.
 
 It has been taken once: MetaBlock **v2** (2026-09-29, user: "在 SST 里记
 tombstone 数，改SST格式，这个是必要的") added `num_entries` / `num_deletions`
-for the deletion-triggered compaction. Delivery followed the rule — stop every
-PS, run `convert_sst` (`crates/server/CLAUDE.md`), start the new PS — and the
-server reads **only v2**: a v1 MetaBlock fails to decode with an error naming
-`convert_sst`, so an unconverted partition does not open. The data blocks did
-not change; the converter rebuilds each SST from them with the current builder
-(`sst_convert::rebuild_sst`, deleted with the tool). The `VERSION` field is the
+for the deletion-triggered compaction. The one-off conversion tool has been
+removed. The server reads **only v2**: a v1 MetaBlock fails to decode with the
+actual and supported versions, so an unconverted partition does not open.
+The data blocks did not change. The `VERSION` field is the
 tripwire that makes a mismatch loud; the decoder also refuses missing or
 trailing MetaBlock bytes.
 
@@ -2125,9 +2104,7 @@ Three fixes bound the restart replay window (worst case per partition =
      min-commit truncation on an un-synced replica orphans the VP (the
      `stale_vp_offset_past_sealed_length` class). On a healthy cluster this waits ≈ 0.
    The fsync work is entirely background (latency-invisible); every Put pays only the
-   1–5 ms coalesce floor. No wire field can opt out: `AppendReq` lost its `must_sync`
-   byte when the coalescer landed, and `BatchPutReq` — the last struct still carrying
-   one, write-only and never read here — lost it at wire v30.
+   1–5 ms coalesce floor. Every write follows the same durability path.
 
 7. **Per-partition StreamClient** — each `PartitionData` holds its own
    `stream_client: Arc<StreamClient>` (no Mutex) via `new_with_owner_epoch`.

@@ -142,9 +142,9 @@ Global `--admin-token` / `--admin-token-file`: attached as a signed payload pref
 
 | Category | Commands |
 |----------|----------|
-| Read / observability | `list-nodes`, `df`, `cluster-version` (prints the cluster's wire version AND the CLIENT WINDOW — `oldest client served`, annotated open or shut; an open window is what says an embedded client image does not have to be rebuilt at this commit), `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `policy-candidates` |
+| Read / observability | `list-nodes`, `df`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `policy-candidates` |
 | Node lifecycle | `fence-node <id> --reason ... --by ... [--force]`, `maintenance <id> --reason ... --by ... [--expire TS]`, `unfence <id> --by ...`, `remove <id> --by ...` |
-| Cluster / partition admin | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal\|N:hex]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID>`, `presplit <ns> <tenant> <rule>`, `merge <SURVIVOR> <VICTIM> [--force]`, `rebalance`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format <DIR>...`, `upgrade-version --to <V>` |
+| Cluster / partition admin | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal\|N:hex]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID>`, `presplit <ns> <tenant> <rule>`, `merge <SURVIVOR> <VICTIM> [--force]`, `rebalance`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format <DIR>...` |
 | Auth / tenancy | `gen-signing-key [--kid K]`, `principal-create --principal P --grant P... [--admin-token]`, `principal-delete --principal P`, `principal-list`, `mint-token --principal P --credential ...`, `namespace-create --name N [--tenant T] [--presplit hex,…] [--admin-token]`, `namespace-delete --name N`, `namespace-list` |
 | Auto-policy controller | `auto-policy status`, `auto-policy activate <NAME> [--arm]` (`--arm` = Armed, else DryRun), `auto-policy deactivate`, `auto-policy upsert <NAME> --switches split,gc,… [--interval N --cooldown N --max N --desc "…"]` (create/replace a custom policy), `auto-policy delete <NAME>`. Leader-routed |
 | Async op-ledger | `ops status <OP_ID>` (one op, `unknown` if this leader doesn't know it), `ops list [--active] [--kind split\|merge\|rebalance\|compact\|gc\|forcegc\|ec\|recovery] [--limit N]`. The seven op triggers above submit here + print an `op_id`; global `--wait` blocks to terminal. **`recovery` is auto-dispatched** (never submitted — submit refuses it): it appears on its own and, while still `running`, carries the last failure as `ERROR[code]: reason` — including the executing node's own reason, which arrives on the `df` heartbeat rather than waiting for the next re-dispatch. Leader-routed |
@@ -388,70 +388,11 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 - **Inodes** come from the MANAGER's global counter (`alloc_inodes`) — the same crash-safe source the fuse mount and PyO3 `autumn.Fs` use, so no colliding inodes.
 - **ls / cat**: PS `handle_range` returns key-only entries, so both do a per-key `cluster.get` after the range scan (fine for one-shot CLI use). **Sizes**: files ≤4 KiB inline in the `InodeMeta`; larger go through the extent path (8 MiB chunks, `extent_key([0x03][ino BE][off BE])`).
 
-### `migratev3_v4` — the fs schema v3 → v4 converter (run once, then delete)
+### Retired one-off format converters
 
-Rewrites every `[0x01][ino]` of the `fs/` tree from the v3 `InodeMeta` (vendored
-in the tool) to v4 (`generation = 1`, `segments = None`); dirents, extents and
-inode numbers are untouched, and the `[0x04]schema_version` stamp moves to 4
-LAST. Resumable: the last converted key is kept in `[0x04]migrate_v4_cursor`,
-so an interrupted run continues instead of decoding converted values as v3.
-`--dry-run` decodes everything and writes nothing; `--unstamped-is-v3` accepts
-a populated tree with no stamp (built by autumnfs or the S3 gateway, which did
-not stamp before v4). Stop every fs client first — an old binary does not check
-the stamp and misreads v4 inodes. Verified on a local cluster: 6715 inodes,
-listings and file bytes identical before and after, rerun a no-op. Runbook in
-`docs/ops.md`.
-
-### `convert_sst` — SST MetaBlock v1 → v2 converter (run once, then delete)
-
-MetaBlock v2 adds `num_entries` / `num_deletions` (the PS's deletion-triggered
-compaction reads them; `crates/partition-server/CLAUDE.md`, "SSTable Format").
-The new `autumn-ps` reads only v2, so the upgrade is stop every PS (manager and
-ENs stay up) → `convert_sst --manager HOST:PORT` → start the new PS.
-
-Per partition it takes the partition's owner lock `partition/<id>` (bumping it,
-as a PS open does), checks commit length and fences the row and meta tails,
-reads the checkpoint, and for each listed SST whose MetaBlock is v1 reads it,
-parses the v1 MetaBlock (vendored in the tool), rebuilds it from its data blocks
-with the current builder (`autumn_partition_server::sst_convert::rebuild_sst`),
-refuses unless the rebuild has the same key range, seq, `vp_deps` and
-`min_expires_at`, and appends it to the row stream. Then one checkpoint naming
-the rebuilt SSTs, every other field unchanged, and the PS's truncate rule on the
-row stream (cut before the first extent, in stream order, a listed SST is in).
-
-- Refuses to start while any PS heartbeated in the last 10 s (waits up to 30 s).
-- Refuses a partition holding more than one checkpoint record (a merge whose
-  survivor has not opened since, or its own run stopped between publishing and
-  truncating when the meta tail had to roll): open it once with the previous
-  PS first, which reads v2 as well and publishes one record.
-- Truncates like the PS's `row_truncate_point`, and cuts nothing when a listed
-  SST's extent is missing from the row stream.
-- Publishes safely on a damaged meta tail: when a frame failed to decode or the
-  tail is partial it rolls the meta tail first, because a tail ending inside a frame whose length
-  runs past the end would swallow frames appended after it; it truncates the
-  meta stream to the extent its append landed in (not the stream's last, which
-  an append-time roll can make a fresh empty extent); and it re-reads the meta
-  stream the way recovery does and refuses to truncate the row stream unless it
-  gets back exactly the checkpoint just published. Verified on real processes
-  with a partial frame appended to a partition's meta stream: converted and all
-  keys correct; with the roll removed the read-back check refused and left the
-  row stream untouched.
-- Resumable: the checkpoint is replaced only after every SST is appended, and
-  the version field says which SSTs are done, so a rerun converts what is left
-  and a finished partition only repeats the truncate.
-- A split child whose SSTs are shared with its sibling gets its own copy; the
-  shared extents go when both have truncated.
-- `--dry-run` reads and rebuilds everything and writes no data (it still
-  takes each partition's owner lock, which fences nothing on a stopped cluster). `--part ID`
-  (repeatable) limits it; `--parallel N` (default 4) converts N partitions at
-  once; `--max-extent-size-bytes` should match the PS's.
-
-Verified with real processes (in-process manager + EN, previous and new
-`autumn-ps` as children): v1 data written through a merge and a split, the new
-PS refusing it, dry run, conversion of 38 SSTs (both split children), rerun a
-no-op, then all 11 000 keys byte-correct, deletes still deleted, range listing
-every live key once. Delete the tool and `sst_convert` once the cluster is
-converted.
+The fs schema v3 → v4 and SST MetaBlock v1 → v2 converters have been removed
+from this tree and the container image. Historical releases retain their
+conversion implementations; current servers retain strict format checks.
 
 ### `migratev0_v1` — RAN AND DELETED (2026-09-20)
 

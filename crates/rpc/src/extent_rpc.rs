@@ -40,11 +40,7 @@ pub const MSG_DELETE_EXTENT: u8 = 11;
 //      `extent-{id}.shard{i}` file and the manager's layout flip is the sole
 //      commit point, so no node ever publishes a shard over its own `.dat`.
 //      The number stays reserved — msg_type values are append-only.
-// 13 = MSG_SYNC_EXTENT — retired when the fsync barrier was
-//      folded into `start_write_batch`'s rotation-trigger `must_sync=true`
-//      batch promotion. A later phase retires the rotation barrier in turn,
-//      replacing both with the per-extent fsync coalescer + `MSG_SYNCED_LENGTH`
-//      durability query so flush waits at flush-time, not at write-time.
+// 13 is the durability query for the per-extent fsync coalescer.
 /// Phase 2: query the extent-node's coalesced fsync high-water mark.
 /// Returned `length` = `Coalescer::last_synced` for `extent_id`. Used by
 /// `flush_one_imm` to await durability of all log_stream bytes referenced
@@ -105,18 +101,15 @@ pub const MSG_FENCE_EXTENT: u8 = 17;
 
 // ── Append (hot path) ────────────────────────────────────────────────────────
 
-/// Fixed binary header for AppendRequest: 28 bytes + raw payload.
+/// Fixed binary header for AppendRequest: 32 bytes + raw payload.
 /// ```text
 /// [extent_id: u64 LE][eversion: u64 LE][commit: u64 LE][owner_epoch: i64 LE]
 /// [payload bytes...]
 /// ```
 ///
-/// Phase 3 follow-up: `must_sync` byte removed. Every append is
-/// always durable via the per-extent fsync coalescer (see
-/// `extent_node.rs::Coalescer`); the handler unconditionally registers a
-/// sync waiter and awaits coalesced `sync_data`. This byte previously
-/// distinguished sync vs. nosync writes; now there is no nosync
-/// path. Wire format shrinks by 1 byte.
+/// Every append is durable via the per-extent fsync coalescer (see
+/// `extent_node.rs::Coalescer`); the handler registers a sync waiter
+/// and awaits coalesced `sync_data` before acknowledging it.
 // u64-offset widening: commit is a byte position in the extent (up to
 // max_extent_size, now > 4 GiB), so it is u64. Header = 8+8+8(commit)+8 = 32.
 pub const APPEND_HEADER_LEN: usize = 32;
@@ -235,7 +228,13 @@ pub struct ReadBytesReq {
 
 impl ReadBytesReq {
     /// Build a request naming `payload` on the target node.
-    pub fn new(extent_id: u64, eversion: u64, offset: u64, length: u64, payload: PayloadRef) -> Self {
+    pub fn new(
+        extent_id: u64,
+        eversion: u64,
+        offset: u64,
+        length: u64,
+        payload: PayloadRef,
+    ) -> Self {
         Self {
             extent_id,
             eversion,
@@ -443,12 +442,6 @@ impl ProbeExtentReq {
 /// `CODE_NOT_FOUND` (extent missing locally); `length` carries
 /// `coalescer.last_synced` for open extents or `sealed_length` for sealed.
 pub type ProbeExtentResp = CommitLengthResp;
-
-// (SyncExtentReq/Resp + MSG_SYNC_EXTENT were removed — the
-// fsync barrier is now folded into `start_write_batch`'s rotation-trigger
-// `must_sync=true` promotion in autumn-partition-server. A later phase
-// then drops the rotation barrier altogether and adds MSG_SYNCED_LENGTH
-// (below) for flush-time durability waits via the per-extent coalescer.)
 
 // ── SyncedLength ─────────────────────────────────────────────────────────────
 

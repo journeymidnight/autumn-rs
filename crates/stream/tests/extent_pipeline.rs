@@ -50,7 +50,7 @@ async fn concurrent_appends_preserve_offset_order_per_extent() {
 
 #[compio::test]
 async fn appends_to_different_extents_run_concurrently() {
-    // Two extents, each receiving a must_sync append via its own TCP conn.
+    // Two extents, each receiving a durable append via its own TCP conn.
     // Because each conn pushes its own I/O future and completions are driven
     // by independent FuturesUnordered instances on separate tasks (one per
     // connection), the two append futures run in parallel: total elapsed
@@ -65,7 +65,7 @@ async fn appends_to_different_extents_run_concurrently() {
     assert_eq!(alloc_a.code, CODE_OK);
     assert_eq!(alloc_b.code, CODE_OK);
 
-    // Warm-up: do a must_sync once on each extent to exclude first-sync cost.
+    // Warm-up: do a durable once on each extent to exclude first-sync cost.
     let _ = conn.append(2010, 1, 0, 10, vec![0u8; 4096]).await;
     let _ = conn.append(2011, 1, 0, 10, vec![0u8; 4096]).await;
 
@@ -74,7 +74,7 @@ async fn appends_to_different_extents_run_concurrently() {
     let _ = conn.append(2010, 1, 4096, 10, vec![0u8; 4096]).await;
     let single = t.elapsed();
 
-    // Two concurrent must_sync appends on different extents, each on its
+    // Two concurrent durable appends on different extents, each on its
     // own TCP conn.
     let conn_a = TestConn::new(addr);
     let conn_b = TestConn::new(addr);
@@ -182,7 +182,7 @@ async fn pwritev_batch_still_coalesced() {
 /// running, the completion side wins the select, and the response flushes
 /// immediately → first_read_response ≪ append_done.
 ///
-/// Test strategy: mix 1 slow APPEND (32 MB, must_sync) with 100 READs to
+/// Test strategy: mix 1 slow APPEND (32 MB, durable) with 100 READs to
 /// DIFFERENT extents so each read becomes its own future in FU (not batched
 /// with the others). The first read's pread is microseconds; in SQ/CQ mode
 /// it must surface to the client well before the append's sync_all finishes.
@@ -211,7 +211,7 @@ async fn cq_flushes_fast_ops_while_slow_op_runs() {
         assert_eq!(seed.code, CODE_OK);
     }
 
-    // Warm-up: must_sync on extent A once so the first-sync cost doesn't
+    // Warm-up: durable on extent A once so the first-sync cost doesn't
     // contaminate the measurement.
     let warm = setup
         .append(APPEND_EXTENT, 1, 0, 10, vec![0u8; 64 * 1024])

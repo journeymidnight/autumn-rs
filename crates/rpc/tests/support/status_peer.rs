@@ -1,5 +1,8 @@
 //! A real TCP peer for testing connection lifetime across replies and failures.
+use autumn_rpc::protocol_hello::Service;
 use autumn_rpc::{Frame, FrameDecoder, RpcError, StatusCode};
+#[path = "protocol.rs"]
+mod protocol;
 use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use std::{cell::Cell, rc::Rc};
@@ -29,7 +32,7 @@ pub const STATUSES: [StatusCode; 9] = [
 pub struct Peer {
     pub addr: String,
     pub accepts: Rc<Cell<usize>>,
-    /// How many `MSG_CLIENT_HELLO` frames this peer answered. The SDK sends
+    /// How many `PROTOCOL_HELLO` frames this peer answered. The SDK sends
     /// one on every connection it opens, so a test can assert the handshake
     /// really happened rather than assuming it.
     ///
@@ -68,7 +71,7 @@ pub fn respond(frame: Frame) -> Reply {
 
 impl Peer {
     pub async fn start(handler: impl Fn(Frame) -> Reply + 'static) -> Self {
-        Self::start_inner(handler, 0, autumn_rpc::WIRE_VERSION).await
+        Self::start_inner(handler, 0, autumn_rpc::WIRE_VERSION, Service::Manager).await
     }
 
     /// A peer that admits the hello but reports a CHOSEN cluster wire version
@@ -81,16 +84,22 @@ impl Peer {
         wire: u32,
         handler: impl Fn(Frame) -> Reply + 'static,
     ) -> Self {
-        Self::start_inner(handler, 0, wire).await
+        Self::start_inner(handler, 0, wire, Service::Manager).await
     }
 
-    /// A peer that REFUSES every `MSG_CLIENT_HELLO` with the status a real
+    /// A peer that REFUSES every `PROTOCOL_HELLO` with the status a real
     /// server uses for an out-of-window client. There is no way to build a
     /// client that reports a wrong version — the constant is compiled in — so
     /// the refusal has to come from the peer.
     #[allow(dead_code)] // only autumn-client's copy of this module uses it
     pub async fn start_refusing_hello(handler: impl Fn(Frame) -> Reply + 'static) -> Self {
-        Self::start_inner(handler, usize::MAX, autumn_rpc::WIRE_VERSION).await
+        Self::start_inner(
+            handler,
+            usize::MAX,
+            autumn_rpc::WIRE_VERSION,
+            Service::Manager,
+        )
+        .await
     }
 
     /// Refuses the first `n` hellos, then admits — a cluster being upgraded
@@ -100,13 +109,26 @@ impl Peer {
         n: usize,
         handler: impl Fn(Frame) -> Reply + 'static,
     ) -> Self {
-        Self::start_inner(handler, n, autumn_rpc::WIRE_VERSION).await
+        Self::start_inner(handler, n, autumn_rpc::WIRE_VERSION, Service::Manager).await
     }
 
+    #[allow(dead_code)]
+    pub async fn start_as(service: Service, handler: impl Fn(Frame) -> Reply + 'static) -> Self {
+        Self::start_inner(handler, 0, autumn_rpc::WIRE_VERSION, service).await
+    }
+    #[allow(dead_code)]
+    pub async fn start_refusing_as(
+        service: Service,
+        n: usize,
+        handler: impl Fn(Frame) -> Reply + 'static,
+    ) -> Self {
+        Self::start_inner(handler, n, autumn_rpc::WIRE_VERSION, service).await
+    }
     async fn start_inner(
         handler: impl Fn(Frame) -> Reply + 'static,
         refuse_hellos: usize,
         report_wire: u32,
+        service: Service,
     ) -> Self {
         let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -124,7 +146,21 @@ impl Peer {
                 let hello_count = hello_count.clone();
                 let refuse_hellos = refuse_hellos;
                 connections.push(compio::runtime::spawn(async move {
+                    hello_count.set(hello_count.get() + 1);
+                    let refused = hello_count.get() <= refuse_hellos;
+                    protocol::accept_tcp(
+                        &mut socket,
+                        report_wire,
+                        service as u8,
+                        if refused { 2 } else { 0 },
+                        if refused { HELLO_REFUSAL } else { "" },
+                    )
+                    .await;
+                    if refused {
+                        return;
+                    }
                     let mut decoder = FrameDecoder::new();
+
                     loop {
                         let compio::BufResult(n, buf) = socket.read(vec![0; 8192]).await;
                         let Ok(n) = n else { return };
@@ -133,41 +169,6 @@ impl Peer {
                         }
                         decoder.feed(&buf[..n]);
                         while let Some(frame) = decoder.try_decode().unwrap() {
-                            // Answered HERE, ahead of the handler, so every
-                            // mock keeps its strict assertions about the first
-                            // frame it cares about. A real server gates this
-                            // in its own connection layer for the same reason:
-                            // the handshake is not part of any service.
-                            if frame.msg_type == autumn_rpc::client_hello::MSG_CLIENT_HELLO {
-                                hello_count.set(hello_count.get() + 1);
-                                let resp = if hello_count.get() <= refuse_hellos {
-                                    Frame::error(
-                                        frame.req_id,
-                                        frame.msg_type,
-                                        RpcError::encode_status(
-                                            StatusCode::FailedPrecondition,
-                                            HELLO_REFUSAL,
-                                        ),
-                                    )
-                                    .encode()
-                                } else {
-                                    Frame::response(
-                                    frame.req_id,
-                                    frame.msg_type,
-                                    Bytes::copy_from_slice(
-                                        &autumn_rpc::client_hello::encode_hello_resp(
-                                            report_wire,
-                                            autumn_rpc::MIN_CLIENT_WIRE_VERSION,
-                                        ),
-                                    ),
-                                )
-                                .encode()
-                                };
-                                if socket.write_all(resp).await.0.is_err() {
-                                    return;
-                                }
-                                continue;
-                            }
                             let bytes = match handler(frame) {
                                 Reply::Close => return,
                                 Reply::Hang => continue,

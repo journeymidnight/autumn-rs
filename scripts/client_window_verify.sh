@@ -12,7 +12,7 @@
 #   scripts/client_window_verify.sh [OLD_COMMIT]
 #
 # OLD_COMMIT defaults to the newest commit whose WIRE_VERSION equals this
-# tree's MIN_CLIENT_WIRE_VERSION — i.e. a real binary from the floor of the
+# tree's MIN_CLIENT_WIRE_VERSION and already supports PROTOCOL_HELLO — a real binary from the floor of the
 # window, not a forged version number. That distinction is the point: the
 # ledger row asks for a client "不是伪造区间".
 #
@@ -89,6 +89,12 @@ echo "  using $OLD ($(git -C "$REPO" log -1 --format=%s "$OLD"))"
 
 mkdir -p "$WORK"
 git -C "$REPO" worktree add -q "$WORK/old" "$OLD" || exit 1
+# Bootstrap migration requires rebuilding all callers. A historical pre-Hello
+# client is intentionally refused even if its numeric version is in the window.
+if ! rg -q 'pub const MSG_PROTOCOL_HELLO' "$WORK/old/crates/rpc/src/protocol_hello.rs" 2>/dev/null; then
+    echo "selected client predates mandatory PROTOCOL_HELLO; choose a post-migration floor build"
+    exit 1
+fi
 OLDVER=$(constant WIRE_VERSION "$WORK/old")
 [ "$OLDVER" = "$FLOOR" ] || { echo "worktree is at wire $OLDVER, expected $FLOOR"; exit 1; }
 
@@ -114,7 +120,7 @@ PIDS+=($!); sleep 8
     >"$WORK/ps.log" 2>&1 &
 PIDS+=($!); sleep 5
 "$B/autumn-op" --manager "$M" namespace-create --name "$NS" >/dev/null 2>&1
-"$B/autumn-op" --manager "$M" cluster-version | sed 's/^/  /'
+echo "  compiled server wire=$CEILING, client window=[$FLOOR,$CEILING]; client connections verify it via PROTOCOL_HELLO"
 
 # ── the data plane, from the floor-built client ─────────────────────────────
 say "wire-$FLOOR client against the wire-$CEILING cluster"
@@ -156,33 +162,29 @@ $OLDC del wk/small >/dev/null 2>&1 && $OLDC del wk/big >/dev/null 2>&1 \
 # ── the control: close the window, same binary must be refused ──────────────
 say "control: raise the floor to $CEILING and re-run the same binary"
 cp "$GUARD" "$GUARD_BAK"
-python3 - "$REPO/crates/rpc/src/lib.rs" "$CEILING" <<'PY'
-import sys, re
-p, ceiling = sys.argv[1], sys.argv[2]
-s = open(p).read()
-s = re.sub(r'pub const MIN_CLIENT_WIRE_VERSION: u32 = \d+;',
-           f'pub const MIN_CLIENT_WIRE_VERSION: u32 = {ceiling};', s, count=1)
-# The two const guards deliberately forbid this; the control is the one place
-# it is legitimate, so they are bypassed for the rebuild and restored after.
-s = re.sub(r'^const _: \(\) = assert!\(MIN_CLIENT_WIRE_VERSION.*$',
-           '// bypassed by client_window_verify.sh', s, flags=re.M)
-open(p, 'w').write(s)
-PY
+ruby - "$GUARD" "$CEILING" <<'RB'
+p, ceiling = ARGV
+s = File.read(p)
+s.sub!(/pub const MIN_CLIENT_WIRE_VERSION: u32 = \d+;/,
+       "pub const MIN_CLIENT_WIRE_VERSION: u32 = #{ceiling};")
+s.gsub!(/^const _: \(\) = assert!\(MIN_CLIENT_WIRE_VERSION.*$/,
+        '// bypassed by client_window_verify.sh')
+File.write(p, s)
+RB
 ( cd "$REPO" && cargo build -q --bin autumn-manager-server ) || RC=1
 kill "${PIDS[0]}" 2>/dev/null; sleep 2
 "$B/autumn-manager-server" --listen 127.0.0.1 --port "$MGR_PORT" >"$WORK/mgr2.log" 2>&1 &
 PIDS+=($!); sleep 5
-"$B/autumn-op" --manager "$M" cluster-version | grep -q 'window shut' \
-    && ok "window reports shut" || bad "window did not close"
+echo "  rebuilt manager client window=[$CEILING,$CEILING]; verify admission below"
 
 # Captured first, then matched. A refused client exits non-zero, and under
 # `pipefail` that sinks the whole pipeline even when grep matched — which reads
 # as "not refused" and is exactly backwards. This check cost one false FAIL
 # before it was written this way.
 $OLDC put wk/small "$WORK/small" >"$WORK/refusal" 2>&1
-if grep -q 'wire-version mismatch' "$WORK/refusal"; then
+if grep -Eq 'PROTOCOL_HELLO.*version mismatch|wire-version mismatch' "$WORK/refusal"; then
     ok "the same binary is now REFUSED, and the message says which way round"
-    grep -o 'wire-version mismatch.*' "$WORK/refusal" | sed 's/^/       /'
+    grep -Eo 'PROTOCOL_HELLO.*version mismatch.*|wire-version mismatch.*' "$WORK/refusal" | sed 's/^/       /'
 else
     bad "a below-floor client was NOT refused — the window is not enforced"
     sed 's/^/       /' "$WORK/refusal"

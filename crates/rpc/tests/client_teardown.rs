@@ -12,6 +12,8 @@
 //! Ablation: restore `.detach()` on either handle in `RpcClient::from_conn` and
 //! both tests below fail — no EOF ever reaches the peer.
 
+#[path = "support/protocol.rs"]
+mod protocol;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -77,7 +79,9 @@ fn never_reading_peer(
     let h = std::thread::spawn(move || {
         let mut socks: Vec<TcpStream> = Vec::new();
         for _ in 0..n {
-            socks.push(listener.accept().expect("accept").0);
+            let mut socket = listener.accept().expect("accept").0;
+            protocol::accept_std(&mut socket, autumn_rpc::WIRE_VERSION, 1);
+            socks.push(socket);
         }
         stop_rx.recv().expect("stop signal");
         socks.into_iter().map(drain_to_eof).collect()

@@ -40,7 +40,7 @@ the guard every open tail reads as a fault — 21 of 21 reported extents on a
 `sealed_length`, not the `sealed` flag, so the state is only visible
 server-side; `autumn-op info --json --part P` prints an `open` flag per extent
 when an operator needs it.
-- **Identity/capacity**: get_cluster_id (`0x45`), get/bump_cluster_version,
+- **Identity/capacity**: get_cluster_id (`0x45`),
   cluster_df, get_cluster_overview.
 - **Inode leases** (`0x46`–`0x49`): acquire/release/heartbeat_lease,
   poll_invalidations. **fs inode alloc**: alloc_inodes (`0x53`).
@@ -56,22 +56,21 @@ when an operator needs it.
 Manager RPC structs are rkyv, which has no version tag and no cross-version decode.
 `WIRE_VERSION` in `crates/rpc/src/lib.rs` is maintained BY HAND — there is
 no fingerprint and nothing checks the bump for you. Cluster peers require it to
-match EXACTLY, so any layout change is a **same-commit, stop-the-world deploy**
-(stop every role, swap binaries, start; etcd is never wiped — see the upgrade-safety
-note below). `GetClusterIdResp`
-(`{wire_version_min, wire_version_max, cluster_version}`, the startup handshake) is
-**FROZEN** from R1 on — never reshape it.
+match exactly on an internal connection. The first mandatory PROTOCOL_HELLO
+migration is stopworld; later wire changes can roll while unlike versions
+refuse RPC, subject to the release's persistence and recovery analysis.
+`GetClusterIdResp` preserves its frozen layout for identity lookup;
+wire_version_min is the client floor, wire_version_max the server wire, and
+cluster_version is reserved zero.
 
-`handle_connection` answers `MSG_CLIENT_HELLO` (0x5F) and refuses a client-surface
-message from a connection outside this binary's client window — `client_wire_gate`,
-run SYNCHRONOUSLY in the decode loop, before the per-frame spawn: a hello and the first
-request can arrive in one read, and a detached task would let the request be judged
-before the hello describing it. Scoped to `is_client_surface_mgr_msg`, never to the
-connection, because this listener also serves every PS and EN and that traffic carries no
-handshake — a connection-scoped refusal would reject `register_ps`, heartbeats,
-`register_node` and reconcile the moment the client floor moved. `MSG_GET_CLUSTER_ID` is
-exempt (it is how a peer finds out what it is talking to), and `MSG_GET_REGIONS` is
-deliberately un-gated because a PS routes with it too. `crates/manager/tests/client_wire_admission.rs`. New message-type numbers and enum variants
+`handle_connection` completes `PROTOCOL_HELLO` before the business decoder.
+Clients use the supported interval; internal/admin connections require exact
+wire equality. It checks service/role/opcode before spawning business handlers.
+`MSG_GET_REGIONS` is explicitly shared by admitted clients and peers; silent
+or refused connections cannot reach it. Admin role still requires the existing
+admin token when configured. `tests/client_wire_admission.rs` drives the real
+listener, including client boundaries, mismatch, role and authentication checks.
+New message-type numbers and enum variants
 (`POLICY_KIND_*`, `NODE_AUTO_STATE_*`) are **append-only**; existing numeric values
 are frozen so external controllers can introspect the binary's mapping
 (`MSG_GET_POLICY_KIND_NAMES = 0x3B`).
@@ -223,7 +222,6 @@ All writes go through the leader-fenced `txn_fenced` (below). On promotion
 | `tenantAccount/<name>` | `persist::TenantAccountRecord` | authz principal DB |
 | `autoPolicy/config`, `autoPolicy/cooldowns` | policy state | leader-owned |
 | `autumn-rs/cluster_id` | UUID | CAS-imprinted once |
-| `autumn-rs/cluster_version` | ASCII decimal | format-version stamp |
 | `autumn-rs/fs/next_inode` (or `…/fs/{tenant}/{volume}/next_inode`) | BE u64 | fs inode counter |
 
 `part_addrs` (client routing hints) is deliberately **in-memory only** — see the
@@ -1586,61 +1584,20 @@ writes sentinel files; idempotent; mismatched cluster_id → refuse). The EN ver
 cluster_id twice at startup (each `--data` dir agrees; one round-trip to the manager)
 before the listener binds.
 
-**`cluster_version`** (`autumn-rs/cluster_version`, ASCII decimal — deliberately not
-rkyv so it outlives serialization eras). CAS-imprinted to this binary's
-`WIRE_VERSION`; `bump_cluster_version` is leader-only, forward-only (a jump over
-several versions is one command — the latch is one-way, not one-step), capped at
-`WIRE_VERSION`, value-CAS'd. `parse_cluster_version` (the only decode point) is
-**fail-closed on rollback**: it refuses a persisted value above this binary's
-`WIRE_VERSION`, so through replay an old binary can't become leader after a bump.
+The persisted cluster_version latch, startup/replay checks, query/bump RPCs and
+operator commands are removed. Legacy etcd keys are ignored; 0x4A/0x4B remain
+reserved, and the frozen identity response's historical field is always zero.
 
-**Upgrade safety = stop-world + rkyv fail-loud.** 生产升级 = 全停 → 换二进制 → 全起,
-etcd 永不清(绝不 `cluster.sh reset`)。安全来自 rkyv 校验式 `from_bytes`:新二进制
-读旧 etcd,布局不符则响亮失败(`replay_from_etcd` 报错 → 当不上 leader),绝不静默解成
-错值。**Invariant: any persistent-struct change (etcd value / SST / .meta / WAL) is
-either same-rkyv-layout or ships a versioned one-time migration — never rely on reset.**
+Upgrade procedure is in docs/ops.md: pause policy, wait for dispatched and local
+background work, drain, replace, verify recovery, then restore policy. The first
+PROTOCOL_HELLO deployment uses stopworld. Later wire-changing releases may roll
+with temporary cross-wire failures. Existing ACK durability, fencing and recovery
+rules remain necessary; Hello alone is not a data-safety proof.
 
-**HOW that migration is delivered, for etcd values: a CONVERTER TOOL, never
-in-code compatibility** (user, 2026-09-20). A format change to a persisted
-manager record bumps that record's own `FORMAT_VERSION` and adds a step to the
-converter, which runs ONCE against a stopped cluster. The server binaries carry
-**no** dual-read, **no** retained previous schema, and **no** sniffing of a
-value's bytes to guess its format. A value that does not carry the expected
-envelope is an ERROR — the manager refuses leadership — not a "maybe it is the
-old form".
-
-The reason is that the alternative does not stay small. In-code compatibility
-means every persisted type keeps every shape it has ever had, each one reachable,
-each one needing a test, forever — and the discriminator has to be guessed from
-the bytes, which **provably cannot work here**: rkyv puts its root at the END of
-the buffer, so a persisted value BEGINS with variable-length business content. A
-namespace named `AUMG…` produces a value whose first four bytes are literally
-`41 55 4d 47`. Measured, not argued. Any "does it start with our magic" test
-misreads that record.
-
-What makes the tool cheap: a rename-only split (same field list, new type name)
-is byte-identical under rkyv — measured, `MgrExtentInfo` and an identically
-shaped `ExtentRecord` both encode to the same 152 bytes. So the first conversion
-is a pure prefix insertion: read the value, prepend the envelope, write it back.
-The tool decodes nothing and links no schema, and is idempotent by skipping any
-value that already carries the envelope.
-
-The converter is an ordinary bin in the repo — `migratev<from>_v<to>`, e.g.
-`migratev44_v45` — run once by hand and then DELETED. It is reviewable and
-testable while it matters and leaves no residue afterwards; no server binary
-links it, which is what "the code carries no upgrade logic" means. The tool is
-in the tree; the compatibility is not.
-
-**Scope, and the other half of the rule: the bulk formats do not evolve.**
-SST / WAL / checkpoint inside extents do not change in the normal course of
-work (user, 2026-09-20), and they are never dual-read. That is what keeps the
-converter rule affordable: the persisted data a migration normally rewrites is
-the etcd records, small and centralized enough to convert in one stopped pass.
-A change that genuinely needs a new bulk format is an exceptional event the user
-decides. The one taken so far — SST MetaBlock v2, adding entry and tombstone
-counts (2026-09-29) — was delivered the same way as any other: a one-off
-`convert_sst` run against the stopped cluster, and a server that reads only the
-new version (`crates/server/CLAUDE.md`).
+Persisted formats change rarely. Analyze each actual change separately and
+supply its required conversion/recovery procedure. Do not rely on rkyv validation
+or a global wire number to prove persisted compatibility. One-time migration
+code is removed after its migration; old SST/FS converters have been deleted.
 
 **`cluster_df`** (`MSG_CLUSTER_DF`, leader-gated). Ceph-style aggregate, in-memory only,
 built inside the single `node_health_loop`: RAW + `physical_used` are summed from each

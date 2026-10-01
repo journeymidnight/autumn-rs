@@ -157,8 +157,8 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
                 return Err(anyhow!(
                     "fs/ holds inodes but no schema stamp — it was built by a tool that \
                      did not stamp (autumnfs or the S3 gateway before v4), so its \
-                     inodes are v3. Refusing to stamp v{} over them: convert it with \
-                     `migratev3_v4 --unstamped-is-v3`.",
+                     inodes are v3. Refusing to stamp v{} over them; use the \
+                     migration procedure for the release that wrote this data.",
                     schema::SCHEMA_VERSION
                 ));
             }
@@ -206,9 +206,11 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
 /// read puts it back and returns the error.
 pub async fn get_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
     if let Some(is) = state.inodes.get(&ino) {
-        let own_writer = state.held_leases.borrow().get(&ino).is_some_and(|l| {
-            l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE && !l.revoked
-        });
+        let own_writer = state
+            .held_leases
+            .borrow()
+            .get(&ino)
+            .is_some_and(|l| l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE && !l.revoked);
         if is.dirty || own_writer || !state.meta_invalidated.borrow().contains(&ino) {
             return Ok(is.meta.clone());
         }

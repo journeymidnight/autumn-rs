@@ -33,7 +33,7 @@ use crate::{AutumnManager, EtcdMirror};
 
 /// Etcd key holding the next unallocated fuse-fs inode number for the LEGACY
 /// single global counter (empty `volume`), big-endian u64. Same `autumn-rs/`
-/// namespace as `cluster_id` / `cluster_version`. SD-3 makes the
+/// namespace as `cluster_id`. SD-3 makes the
 /// counter PER-VOLUME (see `fs_next_inode_key`); this stays the empty-volume
 /// key so the pre-SD-3 wire (`volume = ""`) and existing tests are unchanged.
 pub(crate) const FS_NEXT_INODE_KEY: &str = "autumn-rs/fs/next_inode";
@@ -169,14 +169,14 @@ impl EtcdMirror {
                 None => {
                     // First-ever grant: create the key iff it still doesn't
                     // exist (same create_revision==0 pattern as owner locks).
-                    (
-                        floor,
-                        autumn_etcd::Cmp::create_revision(key, 0),
-                    )
+                    (floor, autumn_etcd::Cmp::create_revision(key, 0))
                 }
                 Some(kv) => {
                     let cur = decode_counter(key, &kv.value)?;
-                    (cur.max(floor), autumn_etcd::Cmp::value(key, kv.value.clone()))
+                    (
+                        cur.max(floor),
+                        autumn_etcd::Cmp::value(key, kv.value.clone()),
+                    )
                 }
             };
 

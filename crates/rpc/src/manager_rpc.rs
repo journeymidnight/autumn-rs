@@ -168,16 +168,7 @@ pub const MSG_RELEASE_LEASE: u8 = 0x47;
 pub const MSG_HEARTBEAT_LEASE: u8 = 0x48;
 pub const MSG_POLL_INVALIDATIONS: u8 = 0x49;
 
-// ── R1 rolling upgrade: persisted cluster_version (design §3-R1) ──────────
-//
-// etcd key `autumn-rs/cluster_version`, ASCII decimal. GET servable from
-// any replica (replayed state). BUMP is leader-only, monotonic FORWARD
-// (a jump over several versions is fine — the latch is one-way, not
-// one-step), capped at the manager's own WIRE_VERSION. Operators bump
-// via `autumn-op upgrade-version` AFTER every member binary is upgraded;
-// new wire forms / persisted formats gate on the bumped value.
-pub const MSG_GET_CLUSTER_VERSION: u8 = 0x4A;
-pub const MSG_BUMP_CLUSTER_VERSION: u8 = 0x4B;
+// 0x4A / 0x4B reserved: retired cluster-version query and bump.
 
 // ── WAL self-heal A5: report a corrupt replica (docs/wal_selfheal_design.md) ──
 //
@@ -1882,46 +1873,7 @@ pub struct GetClusterIdResp {
     /// sitting anywhere inside the client window.
     pub wire_version_min: u32,
     pub wire_version_max: u32,
-    /// R1: the persisted cluster_version (the operator-bumped feature
-    /// gate, NOT this binary's wire version). New wire forms / persisted
-    /// formats versioned N may only be EMITTED once cluster_version >= N.
-    /// 0 when the manager hasn't bootstrapped it yet.
-    pub cluster_version: u32,
-}
-
-// --- ClusterVersion (R1 rolling upgrade) --------------------------------
-// Persisted in etcd as ASCII decimal (format-stable across serialization
-// eras). Read servable from any replica; bump is leader-only, monotonic,
-// and exactly +1 per call (design §3-R1).
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct GetClusterVersionReq {}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct GetClusterVersionResp {
-    pub code: u8,
-    pub message: String,
-    pub cluster_version: u32,
-    /// The responding manager binary's own wire interval — surfaced so
-    /// `autumn-op cluster-version` can show operators how much headroom
-    /// a bump has (`cluster_version < wire_version_max` ⇒ bump possible).
-    pub wire_version_min: u32,
-    pub wire_version_max: u32,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct BumpClusterVersionReq {
-    /// Target version. Must equal current cluster_version + 1, and must
-    /// not exceed the manager's own WIRE_VERSION.
-    pub to: u32,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
-pub struct BumpClusterVersionResp {
-    pub code: u8,
-    pub message: String,
-    /// The cluster_version after this call (the new value on success,
-    /// the unchanged current value on refusal).
+    /// Reserved historical field in the frozen identity response; always zero.
     pub cluster_version: u32,
 }
 
@@ -2543,7 +2495,6 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_REMOVE_NODE
             | MSG_SET_NODE_MAINTENANCE
             | MSG_CLEAR_NODE_OVERRIDE
-            | MSG_BUMP_CLUSTER_VERSION
             | MSG_UPDATE_STREAM_EC
             | MSG_FORCE_EC_CONVERT
             | MSG_CREATE_STREAM
