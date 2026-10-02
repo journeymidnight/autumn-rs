@@ -80,8 +80,8 @@ async fn register_node(mgr: &RpcClient, addr: &str, disk_uuid: &str) -> Register
 
 /// Create a stream via RPC and return its stream_id.
 async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
-    let mgr = RpcClient::connect_as(mgr.peer_addr(), autumn_rpc::protocol_hello::Role::Admin,
-        Some(autumn_rpc::protocol_hello::Service::Manager)).await.unwrap();
+    let mgr = RpcClient::connect_as(mgr.peer_addr(), autumn_rpc::version_hello::Role::Admin,
+        Some(autumn_rpc::version_hello::Service::Manager)).await.unwrap();
     let resp = mgr
         .call(
             MSG_CREATE_STREAM,
@@ -250,8 +250,8 @@ async fn upsert_partition(
     start_key: &[u8],
     end_key: &[u8],
 ) {
-    let mgr = RpcClient::connect_as(mgr.peer_addr(), autumn_rpc::protocol_hello::Role::Admin,
-        Some(autumn_rpc::protocol_hello::Service::Manager)).await.unwrap();
+    let mgr = RpcClient::connect_as(mgr.peer_addr(), autumn_rpc::version_hello::Role::Admin,
+        Some(autumn_rpc::version_hello::Service::Manager)).await.unwrap();
     let resp = mgr
         .call(
             MSG_UPSERT_PARTITION,
@@ -320,7 +320,7 @@ fn stream_manager_alloc_and_truncate_flow() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         register_node(&mgr, &n1_addr.to_string(), "disk-a").await;
         register_node(&mgr, &n2_addr.to_string(), "disk-b").await;
@@ -388,7 +388,7 @@ fn partition_server_put_get_and_split_flow() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         register_node(&mgr, &n1_addr.to_string(), "disk-c").await;
         register_node(&mgr, &n2_addr.to_string(), "disk-d").await;
@@ -403,7 +403,7 @@ fn partition_server_put_get_and_split_flow() {
         let ps_addr = pick_addr();
         start_partition_server(12, mgr_addr, ps_addr);
 
-        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
         for k in ["a1", "a2", "a3", "a4"] {
             ps_put(&ps, 501, k.as_bytes(), format!("val-{k}").as_bytes()).await;
@@ -472,7 +472,7 @@ fn partition_server_recovery_replays_table_and_wal() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         register_node(&mgr, &n1_addr.to_string(), "disk-rp1").await;
         register_node(&mgr, &n2_addr.to_string(), "disk-rp2").await;
@@ -487,7 +487,7 @@ fn partition_server_recovery_replays_table_and_wal() {
         let ps1_addr = pick_addr();
         start_partition_server(22, mgr_addr, ps1_addr);
 
-        let ps1 = RpcClient::connect_as(ps1_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps1");
+        let ps1 = RpcClient::connect_as(ps1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps1");
 
         ps_put(&ps1, 511, b"a-flush", b"flushed-value").await;
         ps_flush(&ps1, 511).await;
@@ -502,7 +502,7 @@ fn partition_server_recovery_replays_table_and_wal() {
         let ps2_addr = pick_addr();
         start_partition_server(22, mgr_addr, ps2_addr);
 
-        let ps2 = RpcClient::connect_as(ps2_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps2");
+        let ps2 = RpcClient::connect_as(ps2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps2");
 
         let got_flush = ps_get(&ps2, 511, b"a-flush").await;
         assert_eq!(got_flush.value, b"flushed-value");
@@ -528,7 +528,7 @@ fn stream_append_commit_punchhole_truncate_flow() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         register_node(&mgr, &n1_addr.to_string(), "disk-e").await;
         register_node(&mgr, &n2_addr.to_string(), "disk-f").await;
@@ -598,7 +598,7 @@ fn stream_append_and_read_blocks_flow() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         register_node(&mgr, &n1_addr.to_string(), "disk-r1").await;
         register_node(&mgr, &n2_addr.to_string(), "disk-r2").await;
@@ -722,7 +722,7 @@ fn flush_writes_sst_to_row_stream() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(101);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_infra_nodes(&mgr, n1_addr, n2_addr, 101).await;
 
         let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
@@ -732,7 +732,7 @@ fn flush_writes_sst_to_row_stream() {
         let ps_addr = pick_addr();
         start_partition_server(41, mgr_addr, ps_addr);
 
-        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
         ps_put(&ps, 601, b"a-big", &vec![b'X'; 4 * 1024]).await;
         ps_flush(&ps, 601).await;
@@ -787,7 +787,7 @@ fn recovery_from_meta_and_row_streams() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(103);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_infra_nodes(&mgr, n1_addr, n2_addr, 103).await;
 
         let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
@@ -798,7 +798,7 @@ fn recovery_from_meta_and_row_streams() {
         let ps1_addr = pick_addr();
         start_partition_server(42, mgr_addr, ps1_addr);
 
-        let ps1 = RpcClient::connect_as(ps1_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps1");
+        let ps1 = RpcClient::connect_as(ps1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps1");
         ps_put(&ps1, 611, b"a-streamed", &vec![b'S'; 4 * 1024]).await;
         ps_flush(&ps1, 611).await;
         ps_put(&ps1, 611, b"a-wal-only", b"small").await;
@@ -810,7 +810,7 @@ fn recovery_from_meta_and_row_streams() {
         let ps2_addr = pick_addr();
         start_partition_server(42, mgr_addr, ps2_addr);
 
-        let ps2 = RpcClient::connect_as(ps2_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps2");
+        let ps2 = RpcClient::connect_as(ps2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps2");
 
         let v1 = ps_get(&ps2, 611, b"a-streamed").await;
         assert_eq!(
@@ -829,7 +829,7 @@ fn compaction_merges_small_tables() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(105);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_infra_nodes(&mgr, n1_addr, n2_addr, 105).await;
 
         let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
@@ -839,7 +839,7 @@ fn compaction_merges_small_tables() {
         let ps_addr = pick_addr();
         start_partition_server(43, mgr_addr, ps_addr);
 
-        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
         // Write 3 values, each followed by an explicit flush.
         for i in 0u8..3 {
@@ -922,7 +922,7 @@ fn large_value_stored_in_log_stream() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(107);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_infra_nodes(&mgr, n1_addr, n2_addr, 107).await;
 
         let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
@@ -932,7 +932,7 @@ fn large_value_stored_in_log_stream() {
         let ps_addr = pick_addr();
         start_partition_server(51, mgr_addr, ps_addr);
 
-        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
         // Large value: 8 KB > VALUE_THROTTLE (4 KB) — stored in logStream.
         let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
@@ -961,7 +961,7 @@ fn recovery_replays_log_stream() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(109);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_infra_nodes(&mgr, n1_addr, n2_addr, 109).await;
 
         let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
@@ -972,7 +972,7 @@ fn recovery_replays_log_stream() {
         let ps1_addr = pick_addr();
         start_partition_server(52, mgr_addr, ps1_addr);
 
-        let ps1 = RpcClient::connect_as(ps1_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps1");
+        let ps1 = RpcClient::connect_as(ps1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps1");
 
         let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
         ps_put(&ps1, 711, b"b-large", &large_val).await;
@@ -986,7 +986,7 @@ fn recovery_replays_log_stream() {
         let ps2_addr = pick_addr();
         start_partition_server(52, mgr_addr, ps2_addr);
 
-        let ps2 = RpcClient::connect_as(ps2_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps2");
+        let ps2 = RpcClient::connect_as(ps2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps2");
 
         let got_large = ps_get(&ps2, 711, b"b-large").await;
         assert_eq!(
@@ -1007,7 +1007,7 @@ fn compaction_preserves_value_pointers() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(111);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_infra_nodes(&mgr, n1_addr, n2_addr, 111).await;
 
         let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
@@ -1017,7 +1017,7 @@ fn compaction_preserves_value_pointers() {
         let ps_addr = pick_addr();
         start_partition_server(53, mgr_addr, ps_addr);
 
-        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
         let large_val: Vec<u8> = (0u8..=255).cycle().take(8 * 1024).collect();
 
@@ -1048,7 +1048,7 @@ fn gc_reclaims_log_stream_extents() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(117);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_infra_nodes(&mgr, n1_addr, n2_addr, 117).await;
 
         let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
@@ -1058,7 +1058,7 @@ fn gc_reclaims_log_stream_extents() {
         let ps_addr = pick_addr();
         start_partition_server(59, mgr_addr, ps_addr);
 
-        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
         // Round 1: write large values
         let val_v1: Vec<u8> = vec![b'A'; 8 * 1024];
@@ -1103,7 +1103,7 @@ fn overlap_detected_after_split_and_cleared_by_compaction() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(119);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_infra_nodes(&mgr, n1_addr, n2_addr, 119).await;
 
         let (log_stream, row_stream, meta_stream) = create_three_streams(&mgr).await;
@@ -1113,7 +1113,7 @@ fn overlap_detected_after_split_and_cleared_by_compaction() {
         let ps_addr = pick_addr();
         start_partition_server(71, mgr_addr, ps_addr);
 
-        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
         // Write keys in the "a*" range and flush
         for i in 0u8..5 {

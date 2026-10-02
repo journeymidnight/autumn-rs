@@ -14,6 +14,19 @@
 
 ## Active
 
+### F-CLUSTER-SECRET — 集群密钥替代 admin token；EN 直读校验客户端 cred
+- **Trigger** (2026-10-02 用户): "现在EN有auth检查吗？" → 没有：任何能连 EN 的进程声明 Peer 即可 APPEND / DELETE_EXTENT / FENCE_EXTENT，声明 Client 可按猜的坐标读任意 extent；声明 Peer 还能从 manager `GET_AUTHZ_CONFIG` 读到 admin token。用户："一把密钥替代现在的 admin token，这样EN，PS，MANAGER启动的时候都要这个token，但是对于client来说，需要一个cred"；"是不是强制cred是cluster的配置决定的"；"EN只看身份，并且只有direct-read这一个API"；升级 stop world。
+- **Scope**: (1) manager / PS / EN 启动必须给集群密钥文件，缺则拒绝启动；非 Client 连接在 VERSION_HELLO 之后做独立的双向 HMAC 挑战应答，失败即断开；VERSION_HELLO 字节不变。(2) admin token 全部删除（manager / autumn-op / dashboard 的 flag、payload 前缀、principal/namespace 请求字段、`GET_AUTHZ_CONFIG` 下发）；管理操作改由“经集群密钥认证的 Admin 连接”把关；autumn-op / dashboard 用同一密钥文件。(3) 集群开启 authz（manager 配 signing key）时，EN 对 Client 连接要求先 `AUTH_HELLO` 绑定有效 principal（只验身份与有效期 / kid，不验 extent 归属）才服务 `READ_BYTES` / `READ_BYTES_BULK`；未开启时不查。SDK 直读连接在 authz 开启时自动 AUTH_HELLO，token 续期时重连。
+- **Acceptance**: 真进程集群（manager / PS / EN 二进制）上：无密钥或错误密钥的 Peer / Admin 连接被拒且 EN 日志记录拒绝；正确密钥的集群读写、split、autumn-op 管理操作正常；无 `--cluster-secret-file` 的服务端拒绝启动。authz 开启时：未 AUTH_HELLO 的 Client 连接 READ_BYTES 被拒，带有效 token 的 SDK 大值直读成功；authz 关闭时直读不需 token。各拒绝路径的回归测试在去掉对应检查后变红。`docs/ops.md`、部署脚本（cluster.sh / docker / baremetal / k8s）更新。数据路径每请求无新增密码学开销。
+- `passes: false`
+
+### REN-VERSION-HELLO — 版本握手改名 PROTOCOL_HELLO → VERSION_HELLO
+- **Trigger** (2026-10-02 用户): "PROTOCOL_HELLO是检查version的，和这些没关系" → "改成VERSION_HELLO我同意"。
+- **Scope**: 只改代码 / 文档 / 脚本中的名字（模块 `version_hello`、`MSG_VERSION_HELLO`）；wire 字节（0xF0、AUPH）不变；历史账本不改。顺带改正两处“EN 校验 direct-read capability”的错误文档。
+- **Acceptance**: workspace 全目标编译；rpc / client / stream lib 与版本准入测试绿；`client_window_verify.sh` 同时认新旧名字。
+- `passes: true`
+- **notes** (2026-10-02): `cargo build --workspace --all-targets` 通过；autumn-rpc、autumn-client lib 65、autumn-stream lib 218、manager client_wire_admission、PS lib refused 过滤全绿。独立评审（opus）无阻塞；已采纳：ops.md 的 grep 同时匹配旧名、文档注明“开启 authz 时”、重排长行，另改正 cluster_version_design.md 两处同类表述。
+
 ### BUG-PROTOCOL-HELLO-REVIEW — 统一 Hello 提交（e8e6be2）评审出的回归
 - **Trigger** (2026-10-01 用户): "review 这个新commit" → "fix"。评审发现：Peer 角色的测试调管理类 opcode 被拒，manager/stream 测试大面积红；`integration compaction_merges_small_tables` 在 partition 线程栈溢出（上一提交通过）；`ConnPool::call_timeout` / `call_into_pooled` 把建连放进调用方超时，黑洞地址不再被识别为 `NodeAddrStale`；autumn-op 用 PS 连接探 EN，声明的目标服务不对，开放 extent 长度静默拿不到；PS 等 manager 时认不出建连超时；服务端拒绝版本不符只打 debug；PS 被拒分支的测试断言不可能失败；`connect_raw` 文档称管理入口实为 Client；`client_window_verify.sh` 前提不可能成立且依赖 ruby。
 - **Scope**: 只修上述问题，不改 Hello 协议、版本号与客户端区间设计。

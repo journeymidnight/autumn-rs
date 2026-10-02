@@ -174,7 +174,7 @@ All in `crates/rpc/src/manager_rpc.rs` and `crates/rpc/src/extent_rpc.rs`:
 `WIRE_VERSION` bump in `crates/rpc/src/lib.rs` (and a raise of
 `MIN_CLIENT_WIRE_VERSION` if the change breaks the client surface).
 Nothing verifies the bump for you. A forgotten one lets different layouts
-claim the same version; `PROTOCOL_HELLO` cannot detect that mistake.
+claim the same version; `VERSION_HELLO` cannot detect that mistake.
 
 Because `MgrNodeInfo` / `MgrNodeOverride` are persisted, a layout change needs
 its own persisted-reader/writer compatibility and migration analysis. The

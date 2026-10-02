@@ -120,7 +120,7 @@ payloads.
   decoders — but NOT for the reason the deleted comment gave. Exact
   `WIRE_VERSION` equality covers manager/PS/EN only. An embedded CLIENT sends
   this byte too, on the default-on direct read to an extent node. What holds
-  there is PROTOCOL_HELLO at the EN itself: a client above the cluster's
+  there is VERSION_HELLO at the EN itself: a client above the cluster's
   ceiling is refused before its first `ReadBytesReq`, as at the manager and the
   PS, and an admitted client may send only `READ_BYTES` / `READ_BYTES_BULK`.
   So a third location must come with a `WIRE_VERSION` bump: every client that
@@ -288,7 +288,7 @@ SDK's `ps_conns` / `mgr_conn`.
   EN `process_frames_backpressured` (straight into `tx_bufs`), PS
   `push_one_frame_to_inflight` (before the authz gate — the ping names no
   partition and carries no data), manager `handle_connection`. Every one of
-  them runs after PROTOCOL_HELLO; no connection reaches its decode loop
+  them runs after VERSION_HELLO; no connection reaches its decode loop
   without it.
 - **No wire-version bump.** Any reply proves the peer alive, including the
   `unknown msg_type` error an older server sends; the client never inspects it.
@@ -661,9 +661,9 @@ still ask with `MSG_GET_REGIONS` remains ungated.
 Verified with both forms live on one cluster: a client built at wire 44 read
 values a wire-45 client had written, and wrote one the wire-45 client then read.
 
-### `PROTOCOL_HELLO` (0xF0): mandatory connection bootstrap
+### `VERSION_HELLO` (0xF0): mandatory connection bootstrap
 
-`protocol_hello.rs` parses a frozen, bounded framing independently of rkyv and
+`version_hello.rs` parses a frozen, bounded framing independently of rkyv and
 business `FrameDecoder`. Request control is 16 bytes (`AUPH`, bootstrap version
 1, role, reserved zero, wire version, client version); response control is
 22+n bytes with verdict, target service, wire, client interval and a reason
@@ -674,7 +674,7 @@ Every `RpcClient` constructor handshakes before starting business tasks; all
 manager/PS/EN listeners accept before creating a business decoder. Peer/admin
 require equal WIRE_VERSION; client requires its declared version inside the
 server interval. Connect plus Hello has a 5-second bound
-(`protocol_hello::TIMEOUT`); the stream `ConnPool` bounds it separately from a
+(`version_hello::TIMEOUT`); the stream `ConnPool` bounds it separately from a
 call's own deadline so a connect failure stays classifiable (stream CLAUDE.md,
 "Bounded connect"). Malformed, missing, legacy or mismatched Hello closes the
 connection without decoding a business DTO. Reconnect handshakes again; a
@@ -688,15 +688,17 @@ allocation per new connection.
 
 A version refusal (`WireMismatch` / `ClientMismatch`) is logged at WARN by the
 refusing server with the peer address, the declared role and versions
-(`PROTOCOL_HELLO refused a version mismatch`), so a rollout's stale binary can
+(`VERSION_HELLO refused a version mismatch`), so a rollout's stale binary can
 be found from either side. A malformed or missing Hello is not logged there:
 port scanners and TCP health probes look exactly like that.
 
 `Negotiated::check_opcode` checks the explicit service/role surface before
 business decode or batch grouping. Role is a declaration, not a credential:
-AUTH_HELLO, admin token, direct-read capability, cluster identity and ownership
-checks continue. Unknown and retired opcodes are refused. Duplicate Hello
-cannot change the connection's role.
+AUTH_HELLO, admin token, cluster identity and ownership checks continue. The EN
+has no authorization of its own: with authz enabled the PS hands out
+direct-read descriptors only after its authz check, and the EN serves any
+connection past VERSION_HELLO. Unknown and retired opcodes are refused.
+Duplicate Hello cannot change the connection's role.
 
 The old `MSG_CLIENT_HELLO` (0x5F, AUH1) codec remains frozen for historical
 fixtures; it no longer admits a live connection. There is no fallback to an
@@ -722,7 +724,7 @@ would have led you to:
 - the extent-node direct read. `--direct-read` is on by default, so a client takes the
   descriptor from `GetRedirectResp` and reads value bytes straight from an EN:
   `ReadBytesReq` (hand-coded 40 bytes) and the bulk response head. The EN admits a
-  client by PROTOCOL_HELLO on the same window as the manager and PS — a statement
+  client by VERSION_HELLO on the same window as the manager and PS — a statement
   about ADMISSION that says nothing about whose bytes those are.
 
 - the error envelope. `[status_code: u8][utf8 message]` (`RpcError::encode_status`), on
@@ -780,7 +782,7 @@ response is exactly the half an old client decodes. What the guard still cannot 
 whether a form's declared opcodes are the ones its handler actually serves; nothing ties
 those lists to the dispatchers.
 
-`PROTOCOL_HELLO` carries version admission on every connection. The frozen
+`VERSION_HELLO` carries version admission on every connection. The frozen
 `GetClusterIdReq/Resp` still serves identity lookup: wire_version_min reports
 MIN_CLIENT_WIRE_VERSION, wire_version_max reports WIRE_VERSION, and
 cluster_version is reserved and always zero. It is not a best-effort substitute

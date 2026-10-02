@@ -54,7 +54,7 @@ async fn check_takeover_fence() {
             let refuse = proxy_refuse.clone();
             let rejected = proxy_rejected.clone();
             compio::runtime::spawn(async move {
-                // The proxy terminates the client's PROTOCOL_HELLO itself; its
+                // The proxy terminates the client's VERSION_HELLO itself; its
                 // own connection to the node handshakes separately.
                 protocol::accept_tcp(&mut socket, autumn_rpc::WIRE_VERSION, 3, 0, "").await;
                 let backend = RpcClient::connect(node_addr).await.unwrap();

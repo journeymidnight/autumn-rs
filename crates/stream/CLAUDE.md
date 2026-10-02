@@ -1685,8 +1685,8 @@ swallows panics). Two helpers in `extent_node.rs`:
   silently strand queued appends → fail-stop, EN restarts and recovers from disk).
 
 **Bounded connect**: `ConnPool::get_client` relies on the 5 s bound
-`RpcClient::connect_as` applies to TCP/UCX connect + PROTOCOL_HELLO
-(`protocol_hello::TIMEOUT`), so a blackholed peer (SYN dropped) can't hang a
+`RpcClient::connect_as` applies to TCP/UCX connect + VERSION_HELLO
+(`version_hello::TIMEOUT`), so a blackholed peer (SYN dropped) can't hang a
 caller. There is exactly ONE timer: a second, equal-length one here raced it,
 and the error's shape — which the classifiers read — depended on which won.
 The error is `RpcError::Timeout` (or the transport error) under a `connect

@@ -365,7 +365,7 @@ fn wiped_rejoin_under_same_identity_does_not_truncate_acked_data() {
         start_en_with_mgr_stoppable(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         let _r1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1").await;
         let _r2 = register_node(&mgr, &n2_addr.to_string(), "uuid-2").await;
         let r3 = register_node_uuid(&mgr, &n3_addr.to_string(), "uuid-3", "g8-n3").await;
@@ -554,7 +554,7 @@ fn fencing_a_wiped_rejoined_node_triggers_recovery_refill() {
     start_en_with_mgr(n4_addr, n4_dir.path().to_path_buf(), 4, mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         let _r1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1").await;
         let _r2 = register_node(&mgr, &n2_addr.to_string(), "uuid-2").await;
         let r3 = register_node_uuid(&mgr, &n3_addr.to_string(), "uuid-3", "g8-n3").await;

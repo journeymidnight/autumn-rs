@@ -170,10 +170,10 @@ impl AutumnManager {
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "?".to_string());
         let (mut reader, mut writer) = conn.into_split();
-        let protocol = autumn_rpc::protocol_hello::accept(
+        let protocol = autumn_rpc::version_hello::accept(
             &mut reader,
             &mut writer,
-            autumn_rpc::protocol_hello::Service::Manager,
+            autumn_rpc::version_hello::Service::Manager,
             &peer,
         )
         .await?;

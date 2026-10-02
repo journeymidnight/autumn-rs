@@ -246,7 +246,7 @@ fn leg_a_read_serves_silently_corrupted_sealed_bytes() {
     start_extent_node(a3, d3.path().to_path_buf(), 3, &mgr_str);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("mgr");
         register_node(&mgr, &a1.to_string(), "u1").await;
         register_node(&mgr, &a2.to_string(), "u2").await;
         register_node(&mgr, &a3.to_string(), "u3").await;
@@ -299,9 +299,9 @@ fn leg_a_read_serves_silently_corrupted_sealed_bytes() {
         );
 
         // ── sub-check A1: the EN serves the corrupt bytes raw, with CODE_OK ──
-        let en1 = RpcClient::connect_as(a1, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("en1");
-        let en2 = RpcClient::connect_as(a2, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("en2");
-        let en3 = RpcClient::connect_as(a3, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("en3");
+        let en1 = RpcClient::connect_as(a1, autumn_rpc::version_hello::Role::Admin, None).await.expect("en1");
+        let en2 = RpcClient::connect_as(a2, autumn_rpc::version_hello::Role::Admin, None).await.expect("en2");
+        let en3 = RpcClient::connect_as(a3, autumn_rpc::version_hello::Role::Admin, None).await.expect("en3");
         let (c1, v1) = direct_read(&en1, extent_id, ev, 0, N as u64).await;
         let (c2, v2) = direct_read(&en2, extent_id, ev, 0, N as u64).await;
         let (c3, v3) = direct_read(&en3, extent_id, ev, 0, N as u64).await;
@@ -374,7 +374,7 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
     start_extent_node(a3, d3.path().to_path_buf(), 3, &mgr_str);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("mgr");
         // Register the 3 members FIRST (lowest node ids) so the RF-3 stream
         // selects them; the spare (a4) is registered afterwards.
         let n1 = register_node(&mgr, &a1.to_string(), "u1").await;
@@ -448,7 +448,7 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
         // r1, and among {r0(corrupt,intact), r2(deleted)} only r0 can serve —
         // so it streams the corrupt copy. (fenced_only recovery gate means the
         // manager does not auto-dispatch; this direct dispatch is the only one.)
-        let en4 = RpcClient::connect_as(a4, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("en4");
+        let en4 = RpcClient::connect_as(a4, autumn_rpc::version_hello::Role::Admin, None).await.expect("en4");
         let task = extent_rpc::RecoveryTask {
             extent_id,
             replace_id: reps[1],
@@ -532,7 +532,7 @@ fn leg_c_ec_convert_encodes_corrupt_bytes_undetected() {
     start_extent_node(a3, d3.path().to_path_buf(), 3, &mgr_str);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("mgr");
         let n1 = register_node(&mgr, &a1.to_string(), "u1").await;
         let n2 = register_node(&mgr, &a2.to_string(), "u2").await;
         let n3 = register_node(&mgr, &a3.to_string(), "u3").await;

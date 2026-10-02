@@ -205,7 +205,7 @@ fn re_avali_that_cannot_refill_must_not_destroy_the_local_copy() {
     let kill_b = start_killable_extent_node(b_addr, b_dir.path().to_path_buf(), 2, &mgr_str);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_node(&mgr, &a_addr.to_string(), "disk-a").await;
         register_node(&mgr, &b_addr.to_string(), "disk-b").await;
 
@@ -241,7 +241,7 @@ fn re_avali_that_cannot_refill_must_not_destroy_the_local_copy() {
         kill_b.store(true, std::sync::atomic::Ordering::SeqCst);
         compio::time::sleep(Duration::from_millis(400)).await;
 
-        let a = RpcClient::connect_as(a_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect a");
+        let a = RpcClient::connect_as(a_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect a");
         let resp = a
             .call(
                 extent_rpc::MSG_RE_AVALI,
@@ -286,7 +286,7 @@ fn re_avali_still_repairs_when_a_peer_has_the_data() {
     start_extent_node(b_addr, b_dir.path().to_path_buf(), 2, &mgr_str);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_node(&mgr, &a_addr.to_string(), "disk-a2").await;
         register_node(&mgr, &b_addr.to_string(), "disk-b2").await;
 
@@ -303,7 +303,7 @@ fn re_avali_still_repairs_when_a_peer_has_the_data() {
         // Write to B ONLY. A is left holding an empty copy — a member that
         // lags, which is exactly what re_avali exists to repair.
         let payload = vec![0x3Du8; 4096];
-        let b = RpcClient::connect_as(b_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect b");
+        let b = RpcClient::connect_as(b_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect b");
         let ap = b
             .call(
                 extent_rpc::MSG_APPEND,
@@ -333,7 +333,7 @@ fn re_avali_still_repairs_when_a_peer_has_the_data() {
             "precondition: A must be the lagging copy"
         );
 
-        let a = RpcClient::connect_as(a_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect a");
+        let a = RpcClient::connect_as(a_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect a");
         let resp = a
             .call(
                 extent_rpc::MSG_RE_AVALI,

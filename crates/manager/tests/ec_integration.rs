@@ -73,7 +73,7 @@ async fn setup_ec_stream(
     ec_data_shard: u32,
     ec_parity_shard: u32,
 ) -> (u64, Rc<StreamClient>) {
-    let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+    let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
     for (addr, disk) in [
         (n1_addr, "disk-ec-1"),

@@ -127,7 +127,7 @@ fn e2e_phantom_node_stays_suspend() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         // Register a phantom node (no real EN listening at that addr).
         let phantom_addr = pick_addr();
@@ -162,7 +162,7 @@ fn e2e_fence_persists_and_blocks_reregister() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         // Register one phantom node (so the fence path works without
         // needing a real EN heartbeat).
@@ -256,7 +256,7 @@ fn e2e_fence_triggers_recovery_dispatch() {
     start_extent_node_with_manager(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         let id1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1").await.node_id;
         let id2 = register_node(&mgr, &n2_addr.to_string(), "uuid-2").await.node_id;
@@ -389,7 +389,7 @@ fn e2e_remove_blocked_by_active_extents() {
     start_extent_node_with_manager(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         let id1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1")
             .await
@@ -460,7 +460,7 @@ fn e2e_audit_log_captures_admin_ops() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         let n1_addr = pick_addr();
         let n1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1")
@@ -505,7 +505,7 @@ fn e2e_recovery_stats_baseline() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         let bytes = mgr
             .call(MSG_RECOVERY_STATS, rkyv_encode(&RecoveryStatsReq {}))
             .await
@@ -535,7 +535,7 @@ fn e2e_extent_health_report_reflects_overrides() {
     start_extent_node_with_manager(n2_addr, n2_dir.path().to_path_buf(), 2, mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         let id1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1")
             .await
             .node_id;
@@ -609,7 +609,7 @@ fn e2e_list_ec_inflight_markers_empty_baseline() {
     start_manager(mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         let bytes = mgr
             .call(
                 MSG_LIST_EC_INFLIGHT_MARKERS,

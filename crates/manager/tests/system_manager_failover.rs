@@ -98,7 +98,7 @@ fn manager_failover_preserves_streams_and_partitions() {
         // Start M1, extent nodes
         let mgr1_addr = pick_addr();
         let m1 = start_etcd_manager_stoppable(mgr1_addr, etcd_endpoint.clone());
-        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr1");
+        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr1");
 
         let n1_dir = tempfile::tempdir().expect("n1");
         let n2_dir = tempfile::tempdir().expect("n2");
@@ -116,7 +116,7 @@ fn manager_failover_preserves_streams_and_partitions() {
         // Write data via PS connected to M1
         let ps_addr = pick_addr();
         let ps_stop = start_partition_server_stoppable(91, mgr1_addr, ps_addr);
-        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
         // An etcd-backed leader seeds the built-in namespaces, which turns on
         // the PS's Layer-A check: a key under no registered namespace fails
@@ -136,7 +136,7 @@ fn manager_failover_preserves_streams_and_partitions() {
         start_etcd_manager(mgr2_addr, etcd_endpoint.clone());
         compio::time::sleep(Duration::from_millis(500)).await;
 
-        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr2");
+        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr2");
 
         // M2 should have replayed the streams
         let resp = mgr2
@@ -217,7 +217,7 @@ fn manager_crash_during_split_state_consistent() {
         // M1 + extent nodes
         let mgr1_addr = pick_addr();
         let m1 = start_etcd_manager_stoppable(mgr1_addr, etcd_endpoint.clone());
-        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr1");
+        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr1");
 
         let n1_dir = tempfile::tempdir().expect("n1");
         let n2_dir = tempfile::tempdir().expect("n2");
@@ -234,7 +234,7 @@ fn manager_crash_during_split_state_consistent() {
         // PS writes and splits via M1
         let ps_addr = pick_addr();
         let ps_stop = start_partition_server_stoppable(92, mgr1_addr, ps_addr);
-        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect ps");
+        let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
         for i in 0..10 {
             ps_put(
@@ -286,7 +286,7 @@ fn manager_crash_during_split_state_consistent() {
         start_etcd_manager(mgr2_addr, etcd_endpoint.clone());
         compio::time::sleep(Duration::from_millis(500)).await;
 
-        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr2");
+        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr2");
 
         // M1 dies after the split; M2 takes over.
         let regions2 = fail_over(m1, &mgr2).await;

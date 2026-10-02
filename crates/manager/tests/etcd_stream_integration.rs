@@ -106,7 +106,7 @@ fn stream_manager_with_real_etcd() {
         let mgr_addr = pick_addr();
         start_etcd_manager(mgr_addr, etcd_endpoint.clone());
 
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         let n1_addr = pick_addr();
         let n2_addr = pick_addr();
@@ -186,7 +186,7 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
         let mgr1_addr = pick_addr();
         start_etcd_manager(mgr1_addr, etcd_endpoint.clone());
 
-        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr1");
+        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr1");
 
         let n1_addr = pick_addr();
         let n1_dir = tempfile::tempdir().expect("n1 tempdir");
@@ -233,7 +233,7 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
         let mgr2_addr = pick_addr();
         start_etcd_manager(mgr2_addr, etcd_endpoint.clone());
 
-        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr2");
+        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr2");
 
         // key point: do not reacquire owner lock on manager2
         let resp = mgr2
@@ -267,7 +267,7 @@ fn etcd_replicated_append_and_recovery_flow() {
         let mgr_addr = pick_addr();
         start_etcd_manager(mgr_addr, etcd_endpoint.clone());
 
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         let n1_addr = pick_addr();
         let n2_addr = pick_addr();
@@ -377,7 +377,7 @@ fn etcd_election_and_replay_on_second_manager() {
         let mgr1_addr = pick_addr();
         start_etcd_manager(mgr1_addr, etcd_endpoint.clone());
 
-        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr1");
+        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr1");
 
         let n1_addr = pick_addr();
         let n1_dir = tempfile::tempdir().expect("n1 tempdir");
@@ -392,7 +392,7 @@ fn etcd_election_and_replay_on_second_manager() {
         let mgr2_addr = pick_addr();
         start_etcd_manager(mgr2_addr, etcd_endpoint.clone());
 
-        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr2");
+        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr2");
 
         // Manager2 should be able to read replayed state
         let resp = mgr2

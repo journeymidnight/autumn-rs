@@ -109,7 +109,7 @@ fn ec_2_1_failover_and_recovery() {
     start_extent_node(n4_addr, d4.path().to_path_buf(), 4, &mgr_str);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         // Register all 4 nodes.
         register_node(&mgr, &n1_addr.to_string(), "disk-1").await;

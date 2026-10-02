@@ -66,7 +66,7 @@ pub enum AutumnError {
     /// the caller must write under a registered namespace). Distinct from
     /// `NotFound` (a read-miss) and `InvalidArgument`.
     NamespaceUnknown(String),
-    /// A server refused this client's wire version at `PROTOCOL_HELLO`.
+    /// A server refused this client's wire version at `VERSION_HELLO`.
     /// TERMINAL, and more sharply so than the two above: the version is baked
     /// into this binary, so no amount of refreshing, reconnecting or waiting
     /// can change the answer. The message is the SERVER's own, and names which
@@ -884,7 +884,7 @@ struct ClientAuth {
 }
 
 pub struct ClusterClient {
-    role: autumn_rpc::protocol_hello::Role,
+    role: autumn_rpc::version_hello::Role,
     /// Manager addresses (comma-separated on construction).
     manager_addrs: Vec<String>,
     /// Current manager index (round-robin).
@@ -1085,7 +1085,7 @@ impl ClusterClient {
     /// Bootstrap has already validated this connection before its RPC tasks
     /// start. Record the server version used to choose client-surface opcodes.
     async fn say_hello(&self, client: &RpcClient, _peer: &str) -> Result<()> {
-        if client.protocol().service == autumn_rpc::protocol_hello::Service::Manager {
+        if client.protocol().service == autumn_rpc::version_hello::Service::Manager {
             self.negotiated_cluster_wire.set(client.protocol().remote_wire);
         }
         *self.wire_refused.borrow_mut() = None;
@@ -1095,7 +1095,7 @@ impl ClusterClient {
     async fn open_rpc(
         &self,
         addr: SocketAddr,
-        service: autumn_rpc::protocol_hello::Service,
+        service: autumn_rpc::version_hello::Service,
     ) -> Result<Rc<RpcClient>> {
         let connect = RpcClient::connect_as(addr, self.role, Some(service));
         let result = match self.first_attempt_effective_timeout(0) {
@@ -1107,7 +1107,7 @@ impl ClusterClient {
         match result {
             Ok(c) => Ok(c),
             Err(e @ RpcError::VersionMismatch { .. })
-                if self.role == autumn_rpc::protocol_hello::Role::Client =>
+                if self.role == autumn_rpc::version_hello::Role::Client =>
             {
                 let why = format!("{addr}: {e}");
                 *self.wire_refused.borrow_mut() = Some(why.clone());
@@ -1128,7 +1128,7 @@ impl ClusterClient {
         }
         let addr = parse_addr(self.manager_addr())?;
         let client = self
-            .open_rpc(addr, autumn_rpc::protocol_hello::Service::Manager)
+            .open_rpc(addr, autumn_rpc::version_hello::Service::Manager)
             .await
             .with_context(|| format!("connect manager {}", self.manager_addr()))?;
         // Before the connection is cached, so a refused client never gets a
@@ -1620,7 +1620,7 @@ impl ClusterClient {
         Self::connect_with_role(
             manager,
             NamespaceBinding::Raw,
-            autumn_rpc::protocol_hello::Role::Admin,
+            autumn_rpc::version_hello::Role::Admin,
         )
         .await
     }
@@ -1631,20 +1631,20 @@ impl ClusterClient {
         Self::connect_with_role(
             manager,
             NamespaceBinding::Raw,
-            autumn_rpc::protocol_hello::Role::Peer,
+            autumn_rpc::version_hello::Role::Peer,
         )
         .await
     }
 
     /// Shared constructor for `connect` / `connect_raw` / `connect_with_credential`.
     async fn connect_with_binding(manager: &str, binding: NamespaceBinding) -> Result<Self> {
-        Self::connect_with_role(manager, binding, autumn_rpc::protocol_hello::Role::Client).await
+        Self::connect_with_role(manager, binding, autumn_rpc::version_hello::Role::Client).await
     }
 
     async fn connect_with_role(
         manager: &str,
         binding: NamespaceBinding,
-        role: autumn_rpc::protocol_hello::Role,
+        role: autumn_rpc::version_hello::Role,
     ) -> Result<Self> {
         let manager_addrs: Vec<String> = manager.split(',').map(|s| s.trim().to_string()).collect();
 
@@ -1654,7 +1654,7 @@ impl ClusterClient {
             current_mgr: Cell::new(0),
             mgr_conn: Rc::new(RefCell::new(None)),
             ps_conns: RefCell::new(HashMap::new()),
-            en_pool: autumn_stream::ConnPool::with_role(autumn_rpc::protocol_hello::Role::Client),
+            en_pool: autumn_stream::ConnPool::with_role(autumn_rpc::version_hello::Role::Client),
             regions: RefCell::new(Vec::new()),
             ps_details: RefCell::new(HashMap::new()),
             part_addrs: RefCell::new(HashMap::new()),
@@ -2104,7 +2104,7 @@ impl ClusterClient {
         }
         let addr = parse_addr(ps_addr)?;
         let client = self
-            .open_rpc(addr, autumn_rpc::protocol_hello::Service::PartitionServer)
+            .open_rpc(addr, autumn_rpc::version_hello::Service::PartitionServer)
             .await
             .with_context(|| format!("connect PS {ps_addr}"))?;
         // BEFORE the AUTH_HELLO: the PS gates AUTH_HELLO itself on the client
@@ -5687,13 +5687,13 @@ mod first_attempt_timeout_tests {
             // there isn't one, so we use a real address that won't
             // be dialled (the policy fn doesn't dial).
             ClusterClient {
-                role: autumn_rpc::protocol_hello::Role::Client,
+                role: autumn_rpc::version_hello::Role::Client,
                 manager_addrs: vec!["127.0.0.1:1".to_string()],
                 current_mgr: Cell::new(0),
                 mgr_conn: Rc::new(RefCell::new(None)),
                 ps_conns: RefCell::new(HashMap::new()),
                 en_pool: autumn_stream::ConnPool::with_role(
-                    autumn_rpc::protocol_hello::Role::Client,
+                    autumn_rpc::version_hello::Role::Client,
                 ),
                 regions: RefCell::new(Vec::new()),
                 ps_details: RefCell::new(HashMap::new()),

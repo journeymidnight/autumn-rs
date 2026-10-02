@@ -56,14 +56,14 @@ when an operator needs it.
 Manager RPC structs are rkyv, which has no version tag and no cross-version decode.
 `WIRE_VERSION` in `crates/rpc/src/lib.rs` is maintained BY HAND — there is
 no fingerprint and nothing checks the bump for you. Cluster peers require it to
-match exactly on an internal connection. The first mandatory PROTOCOL_HELLO
+match exactly on an internal connection. The first mandatory VERSION_HELLO
 migration is stopworld; later wire changes can roll while unlike versions
 refuse RPC, subject to the release's persistence and recovery analysis.
 `GetClusterIdResp` preserves its frozen layout for identity lookup;
 wire_version_min is the client floor, wire_version_max the server wire, and
 cluster_version is reserved zero.
 
-`handle_connection` completes `PROTOCOL_HELLO` before the business decoder.
+`handle_connection` completes `VERSION_HELLO` before the business decoder.
 Clients use the supported interval; internal/admin connections require exact
 wire equality. It checks service/role/opcode before spawning business handlers.
 `MSG_GET_REGIONS` is explicitly shared by admitted clients and peers; silent
@@ -1590,7 +1590,7 @@ reserved, and the frozen identity response's historical field is always zero.
 
 Upgrade procedure is in docs/ops.md: pause policy, wait for dispatched and local
 background work, drain, replace, verify recovery, then restore policy. The first
-PROTOCOL_HELLO deployment uses stopworld. Later wire-changing releases may roll
+VERSION_HELLO deployment uses stopworld. Later wire-changing releases may roll
 with temporary cross-wire failures. Existing ACK durability, fencing and recovery
 rules remain necessary; Hello alone is not a data-safety proof.
 

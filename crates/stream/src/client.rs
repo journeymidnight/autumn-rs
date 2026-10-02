@@ -7936,7 +7936,7 @@ mod ec_gather_retry_tests {
 
     /// The strings above are hand-built; this one comes from the real pool. A
     /// peer that never completes the connect (here: TCP accepted by the kernel
-    /// backlog, PROTOCOL_HELLO never answered) must fail as a connect even when
+    /// backlog, VERSION_HELLO never answered) must fail as a connect even when
     /// the read's own deadline is shorter than the connect bound — otherwise
     /// the read deadline fires first and the stale address is never refreshed.
     #[compio::test]

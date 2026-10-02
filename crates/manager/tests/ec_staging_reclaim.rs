@@ -171,7 +171,7 @@ fn an_abandoned_conversions_staging_is_reclaimed_by_the_next_reconcile() {
         .collect();
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         for i in 0..3 {
             register_node(
                 &mgr,
@@ -223,7 +223,7 @@ fn an_abandoned_conversions_staging_is_reclaimed_by_the_next_reconcile() {
         // on the manager means the marker is released with the layout still
         // pointing at `.dat`. Nothing about the file records that it was
         // abandoned; it just stops being anybody's.
-        let node = RpcClient::connect_as(addrs[victim], autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect en");
+        let node = RpcClient::connect_as(addrs[victim], autumn_rpc::version_hello::Role::Admin, None).await.expect("connect en");
         let staged: Vec<u8> = vec![0xC7; 16384];
         let resp = node
             .call(

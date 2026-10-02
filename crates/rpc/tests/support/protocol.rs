@@ -1,5 +1,5 @@
 //! Bootstrap helpers for mock business-protocol peers. These peers are not
-//! production admission tests; protocol_hello tests exercise the real parser.
+//! production admission tests; version_hello tests exercise the real parser.
 #![allow(dead_code)]
 use std::io::{Read, Write};
 
@@ -50,13 +50,13 @@ pub async fn accept_tcp(
 }
 pub async fn initiate_tcp(
     socket: compio::net::TcpStream,
-    service: autumn_rpc::protocol_hello::Service,
+    service: autumn_rpc::version_hello::Service,
 ) -> compio::net::TcpStream {
     let (mut rd, mut wr) = autumn_transport::Conn::Tcp(socket.clone()).into_split();
-    autumn_rpc::protocol_hello::initiate(
+    autumn_rpc::version_hello::initiate(
         &mut rd,
         &mut wr,
-        autumn_rpc::protocol_hello::Hello::current(autumn_rpc::protocol_hello::Role::Peer),
+        autumn_rpc::version_hello::Hello::current(autumn_rpc::version_hello::Role::Peer),
         Some(service),
     )
     .await
@@ -65,7 +65,7 @@ pub async fn initiate_tcp(
 }
 /// The raw request packet `initiate` would write for `hello`, so a test can
 /// pipeline business frames behind it in one write.
-pub fn hello_packet(hello: autumn_rpc::protocol_hello::Hello) -> Vec<u8> {
+pub fn hello_packet(hello: autumn_rpc::version_hello::Hello) -> Vec<u8> {
     let ctrl = hello.encode();
     let mut out = 1u32.to_le_bytes().to_vec();
     out.extend_from_slice(&[0xF0, 0]);

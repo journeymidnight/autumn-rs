@@ -18,7 +18,7 @@ pub mod extent_rpc;
 pub mod frame;
 pub mod manager_rpc;
 pub mod partition_rpc;
-pub mod protocol_hello;
+pub mod version_hello;
 
 /// Re-exported for SDK-level source-staging decisions (autumn-client
 /// `ValueBuf` docs): staging into a pool slab only pays off on a UCX runtime.
@@ -127,7 +127,7 @@ pub const WIRE_VERSION: u32 = 51;
 /// `WIRE_VERSION` alone leaves every client inside the window untouched, which
 /// is the entire point and is now a fact about the tree rather than a plan.
 ///
-/// It is reported in PROTOCOL_HELLO and `GetClusterIdResp.wire_version_min`. That struct is
+/// It is reported in VERSION_HELLO and `GetClusterIdResp.wire_version_min`. That struct is
 /// frozen (it is the negotiation channel, decoded before any compat decision
 /// can be made), so the field name outlives the constant it carries; the
 /// mismatch is deliberate and noted at both ends.
@@ -154,7 +154,7 @@ const _: () = assert!(MIN_CLIENT_WIRE_VERSION <= WIRE_VERSION);
 /// this. A stale 42 partition server computes `[42,42] ∩ [43,43] = ∅` and
 /// refuses itself today; against a reported `[42,43]` it computes `{42}` and
 /// JOINS. Historically nothing server-side caught it afterwards. Mandatory
-/// PROTOCOL_HELLO now rejects that old binary before business decoding.
+/// VERSION_HELLO now rejects that old binary before business decoding.
 ///
 /// **INVARIANT: the client floor may never go below this.** Raising the
 /// ceiling is the safe way to open the window, and it is safe in every
@@ -204,7 +204,7 @@ const _: () = assert!(MIN_CLIENT_WIRE_VERSION >= FIRST_WIRE_VERSION_WITH_PEER_EQ
 /// Equality, not interval overlap, and the difference is load-bearing. The
 /// manager reports `MIN_CLIENT_WIRE_VERSION` in the `wire_version_min` slot
 /// because that is what a client needs. An overlap test would admit a stale
-/// PS or EN sitting inside the CLIENT window. Mandatory PROTOCOL_HELLO
+/// PS or EN sitting inside the CLIENT window. Mandatory VERSION_HELLO
 /// enforces equality before business RPC; this helper also checks the
 /// manager's frozen identity response after connection admission.
 /// A successful response that fails this check is a hard startup
@@ -249,7 +249,7 @@ upgrade, update the remaining dependencies and wait for a compatible peer."
 /// (empty/pre-R1) is refused.
 ///
 /// Legacy helper retained for callers using the frozen identity response.
-/// Live connection admission is enforced by PROTOCOL_HELLO at both endpoints.
+/// Live connection admission is enforced by VERSION_HELLO at both endpoints.
 pub fn client_compat_check(remote_min: u32, remote_max: u32) -> std::result::Result<(), String> {
     if (remote_min..=remote_max).contains(&WIRE_VERSION) {
         return Ok(());

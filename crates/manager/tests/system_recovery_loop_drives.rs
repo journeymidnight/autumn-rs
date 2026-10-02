@@ -115,7 +115,7 @@ fn fencing_a_member_rebuilds_the_slot_when_a_spare_node_exists() {
     let _dc = spawn_en(c, 3, mgr_addr); // the spare — recovery needs a NON-member target
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         for (i, addr) in [a, b, c].iter().enumerate() {
             register_node(&mgr, &addr.to_string(), &format!("uuid-drv-{i}")).await;
         }
@@ -160,7 +160,7 @@ fn the_loop_is_inert_without_a_spare_node() {
     let _db = spawn_en(b, 2, mgr_addr); // no spare: every node is already a member
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         register_two_nodes(&mgr, a, b, 88).await;
 
         let pool = Rc::new(ConnPool::new());

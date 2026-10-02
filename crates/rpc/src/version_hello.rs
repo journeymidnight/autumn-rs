@@ -7,7 +7,8 @@ use compio::io::{AsyncReadExt, AsyncWriteExt};
 use compio::BufResult;
 use std::time::Duration;
 
-pub const MSG_PROTOCOL_HELLO: u8 = 0xF0;
+pub const MSG_VERSION_HELLO: u8 = 0xF0;
+// Frozen bytes; the letters predate the handshake's current name.
 pub const MAGIC: [u8; 4] = *b"AUPH";
 pub const BOOTSTRAP_VERSION: u16 = 1;
 pub const TIMEOUT: Duration = Duration::from_secs(5);
@@ -154,7 +155,7 @@ impl Negotiated {
             return Ok(());
         }
         // A connection cannot change its role or repeat either version Hello.
-        if opcode == MSG_PROTOCOL_HELLO || opcode == c::MSG_CLIENT_HELLO {
+        if opcode == MSG_VERSION_HELLO || opcode == c::MSG_CLIENT_HELLO {
             return Err(RpcError::status(
                 StatusCode::FailedPrecondition,
                 "version Hello already completed",
@@ -192,13 +193,13 @@ impl Negotiated {
 fn malformed(message: &str) -> RpcError {
     RpcError::status(
         StatusCode::InvalidArgument,
-        format!("PROTOCOL_HELLO: {message}"),
+        format!("VERSION_HELLO: {message}"),
     )
 }
 fn encode_packet(ctrl: &[u8], response: bool) -> Bytes {
     let mut b = Vec::with_capacity(HEADER_LEN + OVERHEAD + ctrl.len());
     b.extend_from_slice(&REQUEST_ID.to_le_bytes());
-    b.push(MSG_PROTOCOL_HELLO);
+    b.push(MSG_VERSION_HELLO);
     b.push(u8::from(response));
     b.extend_from_slice(&((ctrl.len() + OVERHEAD) as u32).to_le_bytes());
     b.extend_from_slice(&(ctrl.len() as u32).to_le_bytes());
@@ -215,7 +216,7 @@ async fn read_packet(
     result?;
     let length = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
     if u32::from_le_bytes(header[..4].try_into().unwrap()) != REQUEST_ID
-        || header[4] != MSG_PROTOCOL_HELLO
+        || header[4] != MSG_VERSION_HELLO
         || header[5] != u8::from(response)
         || length < OVERHEAD
         || length > max_ctrl + OVERHEAD
@@ -372,13 +373,13 @@ pub async fn accept(
                 request = ?parsed,
                 server_wire = crate::WIRE_VERSION,
                 min_client = crate::MIN_CLIENT_WIRE_VERSION,
-                "PROTOCOL_HELLO refused a version mismatch"
+                "VERSION_HELLO refused a version mismatch"
             );
         }
         if verdict != Verdict::Ok {
             return Err(RpcError::status(
                 StatusCode::FailedPrecondition,
-                format!("PROTOCOL_HELLO {message}; request={parsed:?}"),
+                format!("VERSION_HELLO {message}; request={parsed:?}"),
             ));
         }
         let hello = parsed.map_err(|_| malformed("invalid request"))?;
@@ -647,7 +648,7 @@ mod tests {
             .is_ok());
         for role in [Role::Client, Role::Peer, Role::Admin] {
             n.role = role;
-            assert!(n.check_opcode(MSG_PROTOCOL_HELLO).is_err());
+            assert!(n.check_opcode(MSG_VERSION_HELLO).is_err());
             assert!(n
                 .check_opcode(crate::client_hello::MSG_CLIENT_HELLO)
                 .is_err());

@@ -12,10 +12,10 @@
 #   scripts/client_window_verify.sh [OLD_COMMIT]
 #
 # OLD_COMMIT defaults to the commit with the LOWEST wire version in
-# [MIN_CLIENT_WIRE_VERSION, WIRE_VERSION) that already speaks PROTOCOL_HELLO —
+# [MIN_CLIENT_WIRE_VERSION, WIRE_VERSION) that already speaks VERSION_HELLO —
 # a real binary from as low in the window as one exists, not a forged version
 # number. That distinction is the point: the ledger row asks for a client
-# "不是伪造区间". A client built before PROTOCOL_HELLO is refused whatever its
+# "不是伪造区间". A client built before VERSION_HELLO is refused whatever its
 # number, so it cannot stand for the window. When no such commit exists yet
 # (every hello-capable build is at the ceiling), there is nothing to prove and
 # the script says so and exits 0.
@@ -80,12 +80,17 @@ fi
 
 # ── find a real hello-capable commit below the ceiling ──────────────────────
 in_window() { [ -n "$1" ] && [ "$1" -ge "$FLOOR" ] && [ "$1" -lt "$CEILING" ]; }
+# The handshake's module was protocol_hello.rs before it was named version_hello.rs.
+speaks_hello() {
+    git -C "$REPO" cat-file -e "$1:crates/rpc/src/version_hello.rs" 2>/dev/null \
+        || git -C "$REPO" cat-file -e "$1:crates/rpc/src/protocol_hello.rs" 2>/dev/null
+}
 OLD=${1:-}
 if [ -z "$OLD" ]; then
     say "looking for the lowest hello-capable wire in [$FLOOR, $CEILING)"
     best=
     for c in $(git -C "$REPO" log --format=%h -n 400 -- crates/rpc/src/lib.rs); do
-        git -C "$REPO" cat-file -e "$c:crates/rpc/src/protocol_hello.rs" 2>/dev/null || break
+        speaks_hello "$c" || break
         v=$(git -C "$REPO" show "$c:crates/rpc/src/lib.rs" \
             | grep -oP 'pub const WIRE_VERSION: u32 = \K[0-9]+' | head -1)
         if in_window "$v" && { [ -z "$best" ] || [ "$v" -le "$best" ]; }; then
@@ -102,10 +107,10 @@ echo "  using $OLD ($(git -C "$REPO" log -1 --format=%s "$OLD"))"
 
 mkdir -p "$WORK"
 git -C "$REPO" worktree add -q "$WORK/old" "$OLD" || exit 1
-# A client built before mandatory PROTOCOL_HELLO is refused whatever its
+# A client built before mandatory VERSION_HELLO is refused whatever its
 # number, so it cannot stand for the window.
-[ -f "$WORK/old/crates/rpc/src/protocol_hello.rs" ] \
-    || { echo "$OLD predates PROTOCOL_HELLO; pass a hello-capable commit"; exit 1; }
+speaks_hello "$OLD" \
+    || { echo "$OLD predates VERSION_HELLO; pass a hello-capable commit"; exit 1; }
 OLDVER=$(constant WIRE_VERSION "$WORK/old")
 in_window "$OLDVER" || { echo "$OLD is at wire $OLDVER, outside [$FLOOR, $CEILING)"; exit 1; }
 
@@ -131,7 +136,7 @@ PIDS+=($!); sleep 8
     >"$WORK/ps.log" 2>&1 &
 PIDS+=($!); sleep 5
 "$B/autumn-op" --manager "$M" namespace-create --name "$NS" >/dev/null 2>&1
-echo "  compiled server wire=$CEILING, client window=[$FLOOR,$CEILING]; client connections verify it via PROTOCOL_HELLO"
+echo "  compiled server wire=$CEILING, client window=[$FLOOR,$CEILING]; client connections verify it via VERSION_HELLO"
 
 # ── the data plane, from the old client ─────────────────────────────
 say "wire-$OLDVER client against the wire-$CEILING cluster"
@@ -196,9 +201,10 @@ echo "  rebuilt manager client window=[$CEILING,$CEILING]; verify admission belo
 # as "not refused" and is exactly backwards. This check cost one false FAIL
 # before it was written this way.
 $OLDC put wk/small "$WORK/small" >"$WORK/refusal" 2>&1
-if grep -Eq 'PROTOCOL_HELLO.*version mismatch|wire-version mismatch' "$WORK/refusal"; then
+# The old client prints its own build's name for the handshake.
+if grep -Eq '(VERSION|PROTOCOL)_HELLO.*version mismatch|wire-version mismatch' "$WORK/refusal"; then
     ok "the same binary is now REFUSED, and the message says which way round"
-    grep -Eo 'PROTOCOL_HELLO.*version mismatch.*|wire-version mismatch.*' "$WORK/refusal" | sed 's/^/       /'
+    grep -Eo '(VERSION|PROTOCOL)_HELLO.*version mismatch.*|wire-version mismatch.*' "$WORK/refusal" | sed 's/^/       /'
 else
     bad "a below-floor client was NOT refused — the window is not enforced"
     sed 's/^/       /' "$WORK/refusal"

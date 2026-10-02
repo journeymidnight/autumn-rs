@@ -1,5 +1,5 @@
 //! A real TCP peer for testing connection lifetime across replies and failures.
-use autumn_rpc::protocol_hello::Service;
+use autumn_rpc::version_hello::Service;
 use autumn_rpc::{Frame, FrameDecoder, RpcError, StatusCode};
 #[path = "protocol.rs"]
 mod protocol;
@@ -32,7 +32,7 @@ pub const STATUSES: [StatusCode; 9] = [
 pub struct Peer {
     pub addr: String,
     pub accepts: Rc<Cell<usize>>,
-    /// How many `PROTOCOL_HELLO` frames this peer answered. The SDK sends
+    /// How many `VERSION_HELLO` frames this peer answered. The SDK sends
     /// one on every connection it opens, so a test can assert the handshake
     /// really happened rather than assuming it.
     ///
@@ -87,7 +87,7 @@ impl Peer {
         Self::start_inner(handler, 0, wire, Service::Manager).await
     }
 
-    /// A peer that REFUSES every `PROTOCOL_HELLO` with the status a real
+    /// A peer that REFUSES every `VERSION_HELLO` with the status a real
     /// server uses for an out-of-window client. There is no way to build a
     /// client that reports a wrong version — the constant is compiled in — so
     /// the refusal has to come from the peer.

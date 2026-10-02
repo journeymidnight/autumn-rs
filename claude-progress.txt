@@ -1,3 +1,10 @@
+Date: 2026-10-02
+TaskStatus: not_completed
+Task scope: user "现在EN有auth检查吗？" → rename PROTOCOL_HELLO → VERSION_HELLO (REN-VERSION-HELLO, done) → F-CLUSTER-SECRET (cluster secret replaces admin token; EN checks client cred when authz is on).
+Current summary: REN-VERSION-HELLO committed (pure rename, wire bytes unchanged; two false "EN direct-read capability" doc claims corrected). F-CLUSTER-SECRET defined in feature_list.md, not started.
+Main gaps: F-CLUSTER-SECRET implementation.
+Next steps: implement F-CLUSTER-SECRET per its Scope/Acceptance.
+
 Date: 2026-10-01 (2)
 TaskStatus: completed
 Task scope: user "kubectl -n autumn 上面的part#1229, bench prefix的key应该都已经全删除了，但是为什么还不能GC" → "代码修复…写测试复现" (BUG-GC-INLINE-WAL-DISCARD).

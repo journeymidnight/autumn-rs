@@ -1,6 +1,6 @@
 //! Admission through the real manager connection loop, before any business DTO.
 mod support;
-use autumn_rpc::protocol_hello::{self, Hello, Role, Service};
+use autumn_rpc::version_hello::{self, Hello, Role, Service};
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::{Frame, FrameDecoder, RpcError, StatusCode, WIRE_VERSION, MIN_CLIENT_WIRE_VERSION};
 use autumn_transport::{Conn, ReadHalf, WriteHalf};
@@ -12,7 +12,7 @@ use support::{pick_stable_port_pair, start_manager};
 async fn open(addr: SocketAddr, hello: Hello) -> Result<(ReadHalf, WriteHalf), RpcError> {
     let socket = compio::net::TcpStream::connect(addr).await?;
     let (mut rd, mut wr) = Conn::Tcp(socket).into_split();
-    protocol_hello::initiate(&mut rd, &mut wr, hello, Some(Service::Manager)).await?;
+    version_hello::initiate(&mut rd, &mut wr, hello, Some(Service::Manager)).await?;
     Ok((rd, wr))
 }
 async fn receive(rd: &mut ReadHalf) -> Frame {
@@ -60,8 +60,8 @@ fn manager_checks_client_interval_and_exact_internal_wire() {
             let socket = compio::net::TcpStream::connect(addr).await.unwrap();
             let (mut rd, mut wr) = Conn::Tcp(socket).into_split();
             let frame = call(&mut rd, &mut wr, op, Bytes::from_static(b"not a bootstrap")).await;
-            assert_eq!(frame.msg_type, protocol_hello::MSG_PROTOCOL_HELLO);
-            assert_eq!(frame.payload[6], protocol_hello::Verdict::Malformed as u8);
+            assert_eq!(frame.msg_type, version_hello::MSG_VERSION_HELLO);
+            assert_eq!(frame.payload[6], version_hello::Verdict::Malformed as u8);
         }
         let (mut rd, mut wr) = open(addr, Hello::current(Role::Peer)).await.unwrap();
         let frame = call(&mut rd, &mut wr, MSG_CREATE_STREAM, Bytes::new()).await;

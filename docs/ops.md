@@ -3075,7 +3075,7 @@ autumn-op --manager $MGR info                          # PS1 2/1 slots, opening 
 ### RPC version checks and general upgrade procedure
 
 The connection contract is specified in [cluster_version_design.md](cluster_version_design.md).
-`PROTOCOL_HELLO` (opcode `0xF0`, magic `AUPH`, bootstrap version 1) is mandatory
+`VERSION_HELLO` (opcode `0xF0`, magic `AUPH`, bootstrap version 1) is mandatory
 on manager, PS and EN connections. Deploy this first bootstrap migration with
 stopworld, updating all callers. The release's rolling-upgrade rehearsal must
 validate the dependency order and ACKed-data recovery before using it in production.
@@ -3088,16 +3088,17 @@ removed. A mismatch reports the local/remote versions, connection role and
 reason, rather than appearing as an unexplained business decode failure.
 A decode error after successful Hello remains a separate protocol error;
 matching version numbers cannot compensate for a forgotten wire bump.
-The refusing server logs a WARN `PROTOCOL_HELLO refused a version mismatch`
-with the peer address, its declared role and versions; grep for it to find the
-stale binary.
+The refusing server logs a WARN `VERSION_HELLO refused a version mismatch`
+with the peer address, its declared role and versions; grep for
+`refused a version mismatch` to find the stale binary (servers built before the
+handshake's rename log it as `PROTOCOL_HELLO refused a version mismatch`).
 
 `autumn-op` connects as an ADMIN peer, so it needs the exact `WIRE_VERSION` of
 the manager it talks to: during a wire-changing rollout use the old release's
 `autumn-op` until the manager is replaced and the new one afterwards (step 5
 below runs with the new one).
 
-Every client built before `PROTOCOL_HELLO` is refused whatever its wire number,
+Every client built before `VERSION_HELLO` is refused whatever its wire number,
 so the first Hello deployment also rebuilds every embedded client: fuse
 daemons, the S3 gateway, Python wheels in inference pods, benchmark tools. An
 old one reports a closed connection, not a version message, because it never

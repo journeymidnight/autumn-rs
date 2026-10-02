@@ -2232,7 +2232,7 @@ async fn process_frames_backpressured(
     >,
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
-    protocol: &autumn_rpc::protocol_hello::Negotiated,
+    protocol: &autumn_rpc::version_hello::Negotiated,
 ) -> Result<()> {
     use futures::stream::StreamExt as _;
     // Pull all complete frames out of the decoder.
@@ -5906,10 +5906,10 @@ impl ExtentNode {
             .map(|a| a.to_string())
             .unwrap_or_else(|_| "?".to_string());
         let (mut reader, mut writer) = conn.into_split();
-        let protocol = autumn_rpc::protocol_hello::accept(
+        let protocol = autumn_rpc::version_hello::accept(
             &mut reader,
             &mut writer,
-            autumn_rpc::protocol_hello::Service::ExtentNode,
+            autumn_rpc::version_hello::Service::ExtentNode,
             &peer,
         )
         .await?;
@@ -11215,11 +11215,11 @@ mod enospc_disk_health_tests {
         ));
         {
         let (mut rd, mut wr) = autumn_transport::Conn::Tcp(client.clone()).into_split();
-        autumn_rpc::protocol_hello::initiate(
+        autumn_rpc::version_hello::initiate(
             &mut rd,
             &mut wr,
-            autumn_rpc::protocol_hello::Hello::current(autumn_rpc::protocol_hello::Role::Peer),
-            Some(autumn_rpc::protocol_hello::Service::ExtentNode),
+            autumn_rpc::version_hello::Hello::current(autumn_rpc::version_hello::Role::Peer),
+            Some(autumn_rpc::version_hello::Service::ExtentNode),
         )
         .await
         .unwrap();

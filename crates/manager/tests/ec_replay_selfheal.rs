@@ -183,7 +183,7 @@ fn a_replay_read_heals_a_layout_that_went_stale_under_ec() {
         tracing::subscriber::set_default(tracing_subscriber::registry().with(retries));
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         let node_ids = [
             register_node(&mgr, &n1_addr.to_string(), "disk-rs-1").await,
             register_node(&mgr, &n2_addr.to_string(), "disk-rs-2").await,

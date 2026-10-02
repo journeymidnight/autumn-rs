@@ -5727,7 +5727,7 @@ pub(crate) struct ConnGateState {
     /// Bound by a successful `MSG_AUTH_HELLO`. `None` = anonymous (denied on
     /// protected prefixes only).
     pub principal: Option<crate::authz::BoundPrincipal>,
-    pub protocol: Option<autumn_rpc::protocol_hello::Negotiated>,
+    pub protocol: Option<autumn_rpc::version_hello::Negotiated>,
 }
 
 /// Checks the negotiated role before business DTO decoding, then preserves
@@ -6069,10 +6069,10 @@ async fn handle_ps_connection(
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "?".to_string());
     let (mut reader, mut writer) = conn.into_split();
-    let protocol = autumn_rpc::protocol_hello::accept(
+    let protocol = autumn_rpc::version_hello::accept(
         &mut reader,
         &mut writer,
-        autumn_rpc::protocol_hello::Service::PartitionServer,
+        autumn_rpc::version_hello::Service::PartitionServer,
         &peer_label,
     )
     .await?;
@@ -12938,7 +12938,7 @@ mod single_thread_write_tests {
 
             let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
                 client,
-                autumn_rpc::protocol_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Service::PartitionServer,
             )
             .await
             .into_split();
@@ -13023,7 +13023,7 @@ mod single_thread_write_tests {
 
             let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
                 client,
-                autumn_rpc::protocol_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Service::PartitionServer,
             )
             .await
             .into_split();
@@ -13243,7 +13243,7 @@ mod partition_listener_tests {
                         .expect("connect");
                     let (mut rd, mut wr) = test_protocol::initiate_tcp(
                         stream,
-                        autumn_rpc::protocol_hello::Service::PartitionServer,
+                        autumn_rpc::version_hello::Service::PartitionServer,
                     )
                     .await
                     .into_split();
@@ -13334,7 +13334,7 @@ mod partition_listener_tests {
                             .expect("connect");
                         let (mut rd, mut wr) = test_protocol::initiate_tcp(
                             stream,
-                            autumn_rpc::protocol_hello::Service::PartitionServer,
+                            autumn_rpc::version_hello::Service::PartitionServer,
                         )
                         .await
                         .into_split();
@@ -13558,7 +13558,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
 
             let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
                 client,
-                autumn_rpc::protocol_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Service::PartitionServer,
             )
             .await
             .into_split();
@@ -13707,7 +13707,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             }
             let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
                 client,
-                autumn_rpc::protocol_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Service::PartitionServer,
             )
             .await
             .into_split();
@@ -13932,7 +13932,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
 
                     let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
                         client,
-                        autumn_rpc::protocol_hello::Service::PartitionServer,
+                        autumn_rpc::version_hello::Service::PartitionServer,
                     )
                     .await
                     .into_split();
@@ -14047,7 +14047,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                     11,
                     namespace_authz(),
                 ));
-                client = test_protocol::initiate_tcp(client, autumn_rpc::protocol_hello::Service::PartitionServer).await;
+                client = test_protocol::initiate_tcp(client, autumn_rpc::version_hello::Service::PartitionServer).await;
                 let mut requests = Vec::new();
                 for id in 1..=2 {
                     let frame = if bulk {
@@ -14109,7 +14109,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 11,
                 namespace_authz(),
             ));
-            client = test_protocol::initiate_tcp(client, autumn_rpc::protocol_hello::Service::PartitionServer).await;
+            client = test_protocol::initiate_tcp(client, autumn_rpc::version_hello::Service::PartitionServer).await;
             for (id, key) in [(1, &b"unknown/k"[..]), (2, &b"fs/k"[..])] {
                 let frame = Frame::request_zc(
                     id,
@@ -14249,7 +14249,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
 
             let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
                 client,
-                autumn_rpc::protocol_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Service::PartitionServer,
             )
             .await
             .into_split();
@@ -14391,7 +14391,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
 
             let (client_rd, mut client_wr) = test_protocol::initiate_tcp(
                 client,
-                autumn_rpc::protocol_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Service::PartitionServer,
             )
             .await
             .into_split();
@@ -14470,7 +14470,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
 
             let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
                 client,
-                autumn_rpc::protocol_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Service::PartitionServer,
             )
             .await
             .into_split();
@@ -15289,7 +15289,7 @@ mod authz_enforcement_tests {
     /// below that line this mechanism would simply not exist for them.
     #[test]
     fn a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition() {
-        use autumn_rpc::protocol_hello::{Hello, Role, Service, initiate};
+        use autumn_rpc::version_hello::{Hello, Role, Service, initiate};
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let authz = std::sync::Arc::new(crate::authz::AuthzState::new());
             assert!(!authz.is_enabled());
@@ -15411,7 +15411,7 @@ mod authz_enforcement_tests {
 
             let (mut rd, mut wr) = test_protocol::initiate_tcp(
                 client,
-                autumn_rpc::protocol_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Service::PartitionServer,
             )
             .await
             .into_split();
@@ -15527,7 +15527,7 @@ mod authz_enforcement_tests {
             });
             let (mut rd, mut wr) = test_protocol::initiate_tcp(
                 client,
-                autumn_rpc::protocol_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Service::PartitionServer,
             )
             .await
             .into_split();

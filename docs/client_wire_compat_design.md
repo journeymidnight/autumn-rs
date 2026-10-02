@@ -1,6 +1,6 @@
 # Client Wire Compatibility
 
-Historical design record. The current mandatory `PROTOCOL_HELLO`, retired
+Historical design record. The current mandatory `VERSION_HELLO`, retired
 `cluster_version` latch and rolling-upgrade rules are in
 [cluster_version_design.md](cluster_version_design.md) and [ops.md](ops.md).
 

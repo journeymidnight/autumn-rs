@@ -24,7 +24,7 @@ use bytes::Bytes;
 
 
 pub struct ConnPool {
-    role: autumn_rpc::protocol_hello::Role,
+    role: autumn_rpc::version_hello::Role,
     clients: RefCell<HashMap<SocketAddr, Rc<RpcClient>>>,
 }
 
@@ -64,10 +64,10 @@ impl std::future::Future for PinnedRecv {
 
 impl ConnPool {
     pub fn new() -> Self {
-        Self::with_role(autumn_rpc::protocol_hello::Role::Peer)
+        Self::with_role(autumn_rpc::version_hello::Role::Peer)
     }
 
-    pub fn with_role(role: autumn_rpc::protocol_hello::Role) -> Self {
+    pub fn with_role(role: autumn_rpc::version_hello::Role) -> Self {
         Self {
             role,
             clients: RefCell::new(HashMap::new()),
@@ -97,8 +97,8 @@ impl ConnPool {
         // can't hang `get_client` — and therefore any PS/EN background loop
         // that reaches it (region_sync `open_partition` → `commit_length`, EN
         // reconcile, recovery fanout) — indefinitely. The bound is the one
-        // `connect_as` already applies to connect + PROTOCOL_HELLO
-        // (`protocol_hello::TIMEOUT`, 5 s). A second timer here with the same
+        // `connect_as` already applies to connect + VERSION_HELLO
+        // (`version_hello::TIMEOUT`, 5 s). A second timer here with the same
         // length raced it and made the error's shape a coin toss, which is
         // what classifiers read. On failure the entry is not cached, so the
         // next call retries a fresh connect.

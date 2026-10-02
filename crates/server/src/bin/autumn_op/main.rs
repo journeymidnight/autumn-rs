@@ -3241,7 +3241,7 @@ async fn probe_extent_len(pool: &autumn_stream::ConnPool, addr: &str, extent_id:
 /// sides have collected. Making it cheap needs a manager-side reverse lookup
 /// (a wire change); until then this is the trade, stated rather than hoped.
 async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) -> Result<()> {
-    let en_pool = autumn_stream::ConnPool::with_role(autumn_rpc::protocol_hello::Role::Admin);
+    let en_pool = autumn_stream::ConnPool::with_role(autumn_rpc::version_hello::Role::Admin);
     let regions_bytes = client.mgr_call(MSG_GET_REGIONS, Bytes::new()).await.context("get regions")?;
     let regions_resp: GetRegionsResp = rkyv_decode(&regions_bytes).map_err(decode_err)?;
     if regions_resp.code != CODE_OK {
@@ -3652,7 +3652,7 @@ async fn run_info(
         HashSet::new()
     };
 
-    let en_pool = autumn_stream::ConnPool::with_role(autumn_rpc::protocol_hello::Role::Admin);
+    let en_pool = autumn_stream::ConnPool::with_role(autumn_rpc::version_hello::Role::Admin);
     let mut open_extents: HashSet<u64> = HashSet::new();
     for (eid, ext) in extent_map.iter_mut() {
         // Authoritative seal STATE is the explicit `sealed` flag, NOT

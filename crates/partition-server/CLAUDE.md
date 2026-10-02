@@ -1774,7 +1774,7 @@ check per request — it NEVER calls the manager to enforce.
 signing key configured cluster-wide) ⇒ the whole gate is skipped, so fuse / kvcache /
 dev pay nothing. `enabled` flips true only after the config poll installs a keyring.
 
-INVARIANT: handle_ps_connection accepts mandatory PROTOCOL_HELLO before its
+INVARIANT: handle_ps_connection accepts mandatory VERSION_HELLO before its
 business decoder or keepalive dispatch. No silent/legacy admission exists.
 ConnGateState carries the negotiated protocol and authenticated principal.
 authz_gate checks the service/role/opcode before business DTO decoding, then

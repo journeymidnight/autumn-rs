@@ -183,7 +183,7 @@ fn a_merge_survivor_holds_one_checkpoint_and_restarts_without_replay() {
     start_extent_node(en_addr, dir.path().to_path_buf(), 1);
     let (survivor_log, victim_log, survivor_meta) =
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("mgr");
+            let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("mgr");
             let _ = register_node(&mgr, &en_addr.to_string(), "uuid-merge-ckpt").await;
             let (s_log, s_row, s_meta) = (
                 create_stream(&mgr, 1).await,
@@ -229,7 +229,7 @@ fn a_merge_survivor_holds_one_checkpoint_and_restarts_without_replay() {
         );
 
         let before_merge_replay = replay_read_bytes(SURVIVOR);
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("mgr");
         let bytes = mgr
             .call(
                 MSG_MERGE_PARTITIONS,

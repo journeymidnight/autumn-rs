@@ -232,7 +232,7 @@ impl Keepalive {
 /// All fields are !Send (single-threaded, compio thread-per-core model).
 /// `pending` uses `RefCell` with scoped borrows — never held across await.
 pub struct RpcClient {
-    protocol: crate::protocol_hello::Negotiated,
+    protocol: crate::version_hello::Negotiated,
     /// SQ: submit channel to writer_task. Borrowed mutably, never cloned per
     /// send: `futures::mpsc` grants each SENDER a slot beyond the shared
     /// buffer, so a clone per call hands every caller its own slot and the
@@ -309,16 +309,16 @@ impl RpcClient {
     /// writer. Honours `AUTUMN_TRANSPORT={tcp,ucx,auto}` once Phase 4 wires
     /// the env switch.
     pub async fn connect(addr: SocketAddr) -> Result<Rc<Self>, RpcError> {
-        Self::connect_as(addr, crate::protocol_hello::Role::Peer, None).await
+        Self::connect_as(addr, crate::version_hello::Role::Peer, None).await
     }
 
     pub async fn connect_as(
         addr: SocketAddr,
-        role: crate::protocol_hello::Role,
-        expected: Option<crate::protocol_hello::Service>,
+        role: crate::version_hello::Role,
+        expected: Option<crate::version_hello::Service>,
     ) -> Result<Rc<Self>, RpcError> {
-        let deadline = crate::protocol_hello::TIMEOUT;
-        // Boxed: connect + PROTOCOL_HELLO is a cold path, and its state
+        let deadline = crate::version_hello::TIMEOUT;
+        // Boxed: connect + VERSION_HELLO is a cold path, and its state
         // machine inline grows every caller's future. Unboxed, autumn-fuse's
         // `prefetch_ahead` overflowed rustc's layout depth limit, and a flush
         // on the 2 MiB partition thread overflowed its stack (debug build).
@@ -338,7 +338,7 @@ impl RpcClient {
         addr: SocketAddr,
         keepalive: Keepalive,
     ) -> Result<Rc<Self>, RpcError> {
-        let deadline = crate::protocol_hello::TIMEOUT;
+        let deadline = crate::version_hello::TIMEOUT;
         compio::time::timeout(deadline, async {
             let conn = autumn_transport::current_or_init().connect(addr).await?;
             if let Some(s) = conn.as_tcp() {
@@ -374,7 +374,7 @@ impl RpcClient {
             conn,
             peer_addr,
             keepalive,
-            crate::protocol_hello::Role::Peer,
+            crate::version_hello::Role::Peer,
             None,
         )
         .await
@@ -384,8 +384,8 @@ impl RpcClient {
         conn: autumn_transport::Conn,
         peer_addr: SocketAddr,
         keepalive: Keepalive,
-        role: crate::protocol_hello::Role,
-        expected: Option<crate::protocol_hello::Service>,
+        role: crate::version_hello::Role,
+        expected: Option<crate::version_hello::Service>,
     ) -> Result<Rc<Self>, RpcError> {
         // Taken before the split; valid while either half lives, which the
         // keepalive checks through `closed` (see `keepalive_task`).
@@ -397,10 +397,10 @@ impl RpcClient {
         #[cfg(not(target_os = "linux"))]
         let ack_probe: Option<AckProbe> = None;
         let (mut reader, mut writer) = conn.into_split();
-        let protocol = crate::protocol_hello::initiate(
+        let protocol = crate::version_hello::initiate(
             &mut reader,
             &mut writer,
-            crate::protocol_hello::Hello::current(role),
+            crate::version_hello::Hello::current(role),
             expected,
         )
         .await?;
@@ -487,7 +487,7 @@ impl RpcClient {
     /// True when either `read_loop` or `writer_task` has exited.
     /// Pools should evict the entry; new `send_*` calls return
     /// `ConnectionClosed` without inserting into `pending`.
-    pub fn protocol(&self) -> &crate::protocol_hello::Negotiated {
+    pub fn protocol(&self) -> &crate::version_hello::Negotiated {
         &self.protocol
     }
 

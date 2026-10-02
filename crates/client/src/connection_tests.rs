@@ -1,17 +1,17 @@
 use super::*;
 #[path = "../../rpc/tests/support/status_peer.rs"]
 mod peer;
-use autumn_rpc::protocol_hello::Service;
+use autumn_rpc::version_hello::Service;
 use peer::*;
 
 fn client(manager: String) -> ClusterClient {
     ClusterClient {
-        role: autumn_rpc::protocol_hello::Role::Client,
+        role: autumn_rpc::version_hello::Role::Client,
         manager_addrs: vec![manager],
         current_mgr: Cell::new(0),
         mgr_conn: Rc::new(RefCell::new(None)),
         ps_conns: RefCell::new(HashMap::new()),
-        en_pool: autumn_stream::ConnPool::with_role(autumn_rpc::protocol_hello::Role::Client),
+        en_pool: autumn_stream::ConnPool::with_role(autumn_rpc::version_hello::Role::Client),
         regions: RefCell::new(vec![]),
         ps_details: RefCell::new(HashMap::new()),
         part_addrs: RefCell::new(HashMap::new()),
@@ -330,7 +330,7 @@ async fn pooled_batch_status_keeps_connection_and_identity_change_clears_it() {
     assert_eq!(
         peer.hellos.get(),
         1,
-        "the SDK sends PROTOCOL_HELLO once per connection it OPENS"
+        "the SDK sends VERSION_HELLO once per connection it OPENS"
     );
 
     // A rebuilt connection handshakes again. It has to: the server's admission

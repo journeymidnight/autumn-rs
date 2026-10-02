@@ -335,7 +335,7 @@ failover via `rotate_manager` on connection error.
 ## Wire-version handshake
 
 Every newly opened manager, PS and direct-read EN connection completes
-PROTOCOL_HELLO through RpcClient before business traffic; reconnect repeats it.
+VERSION_HELLO through RpcClient before business traffic; reconnect repeats it.
 Manager and PS target service types are checked. Normal connect/connect_raw
 use client role; connect_admin and connect_peer use exact internal wire
 matching. Raw namespace binding does not grant admin protocol or auth rights.
@@ -374,7 +374,7 @@ the token is always prefixed (greppable: `is_admin_mgr_msg` / `is_admin_ps_msg`)
 - `AutumnError::ConnectionError(msg)` — RPC connection failure.
 - `AutumnError::NamespaceUnknown` — Layer-A reject (terminal on write path).
 - `AutumnError::WireVersionRefused` — a server refused this client's wire version at
-  `PROTOCOL_HELLO`. TERMINAL, and more sharply than the two authz cases: the version
+  `VERSION_HELLO`. TERMINAL, and more sharply than the two authz cases: the version
   is compiled in, so no refresh can change the answer. Carries the SERVER's own message,
   which names which way round the mismatch is.
 

@@ -1,5 +1,5 @@
 //! Historical `MSG_CLIENT_HELLO` (AUH1) codec and client opcode tables.
-//! Live connections use mandatory `PROTOCOL_HELLO` (AUPH) before any business
+//! Live connections use mandatory `VERSION_HELLO` (AUPH) before any business
 //! decoder; the old opcode cannot admit a connection or change its role.
 //!
 //! `GetClusterIdResp` already carries server→client. Nothing carried

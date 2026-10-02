@@ -271,7 +271,7 @@ fn leg1_correlated_2of3_loss_survives_and_recovery_refills_from_survivor() {
     }
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
 
         // register the first 3 → the stream lands on them.
         for i in 0..3 {
@@ -500,7 +500,7 @@ fn leg3_ec_over_loss_is_loud_not_silent() {
     }
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("connect mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
         for i in 0..6 {
             ens[i].node_id = register_node(&mgr, &ens[i].addr.to_string(), &format!("uuid-{i}")).await;
         }

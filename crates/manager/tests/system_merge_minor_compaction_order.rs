@@ -81,7 +81,7 @@ fn a_minor_compaction_after_a_merge_keeps_the_newest_version_visible() {
     let dir = tempfile::tempdir().expect("tempdir");
     start_extent_node(en_addr, dir.path().to_path_buf(), 1);
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::protocol_hello::Role::Admin, None).await.expect("mgr");
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("mgr");
         register_node(&mgr, &en_addr.to_string(), "uuid-merge-minor").await;
         let (l, r, m) = (create_stream(&mgr, 1).await, create_stream(&mgr, 1).await, create_stream(&mgr, 1).await);
         upsert_partition(&mgr, SURVIVOR, l, r, m, b"", b"m").await;

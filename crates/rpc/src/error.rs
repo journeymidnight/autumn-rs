@@ -51,9 +51,9 @@ impl StatusCode {
 /// An RPC error returned to callers.
 #[derive(Debug, thiserror::Error)]
 pub enum RpcError {
-    #[error("PROTOCOL_HELLO version mismatch: role={role:?}, local wire={local_wire}, remote wire={remote_wire}, client={client_version}, server clients=[{min_client},{max_client}]: {message}")]
+    #[error("VERSION_HELLO version mismatch: role={role:?}, local wire={local_wire}, remote wire={remote_wire}, client={client_version}, server clients=[{min_client},{max_client}]: {message}")]
     VersionMismatch {
-        role: crate::protocol_hello::Role,
+        role: crate::version_hello::Role,
         local_wire: u32,
         remote_wire: u32,
         client_version: u32,
