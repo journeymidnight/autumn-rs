@@ -702,3 +702,125 @@ fn a_node_that_returns_keeps_its_copies_despite_repair_requests() {
     });
     drop(nodes);
 }
+
+async fn submit(admin: &RpcClient, kind: u8, extent_ids: Vec<u64>) -> OpRecord {
+    let resp = admin
+        .call(
+            MSG_OP_SUBMIT,
+            rkyv_encode(&OpSubmitReq {
+                kind,
+                secondary_id: extent_ids[0],
+                extent_ids,
+                requested_by: "test".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("submit");
+    let r: OpSubmitResp = rkyv_decode(&resp).expect("decode submit");
+    assert_eq!(r.code, CODE_OK, "submit refused: {}", r.message);
+    let start = Instant::now();
+    loop {
+        let resp = admin
+            .call(
+                MSG_OP_QUERY,
+                rkyv_encode(&OpQueryReq {
+                    op_id: r.op_id,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("query op");
+        let q: OpQueryResp = rkyv_decode(&resp).expect("decode op query");
+        if let Some(op) = q
+            .ops
+            .into_iter()
+            .find(|o| o.state != OP_STATE_RUNNING && o.state != OP_STATE_PENDING)
+        {
+            return op;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "op never finished");
+        compio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A standing request is visible — `autumn-op health` marks the slot and
+/// counts it — and an operator can withdraw it: the mark goes, and a spare
+/// that joins afterwards receives nothing. Three nodes hold the RF 3 extent and
+/// there is no spare, so the request stands until it is cancelled.
+#[test]
+fn a_standing_repair_request_is_shown_and_can_be_cancelled() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().expect("tmpdir")).collect();
+    let addrs: Vec<_> = (0..4).map(|_| pick_addr()).collect();
+    let uuid = |i: usize| format!("uuid-repair-cancel-{i}");
+    let disks: Vec<u64> = (0..3).map(|i| format_node(mgr_addr, addrs[i], &uuid(i))).collect();
+    let mut nodes: Vec<_> = (0..3)
+        .map(|i| {
+            Some(start_node(
+                addrs[i],
+                dirs[i].path().to_path_buf(),
+                disks[i],
+                mgr_addr.to_string(),
+            ))
+        })
+        .collect();
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let admin = RpcClient::connect_as(mgr_addr, Role::Admin, None)
+            .await
+            .expect("connect mgr");
+        let mut node_ids = Vec::new();
+        for (i, addr) in addrs.iter().take(3).enumerate() {
+            node_ids.push(register_node(&admin, &addr.to_string(), &uuid(i)).await.node_id);
+        }
+        let (extent, members) = sealed_rf3_extent(mgr_addr, &admin, "repair-cancel/owner").await;
+        let victim = node_ids.iter().position(|n| *n == members[1]).unwrap();
+        let (flag, handle) = nodes[victim].take().unwrap();
+        flag.shutdown();
+        handle.join().expect("join extent node");
+        wait_degraded(&admin, extent).await;
+
+        let op = submit(&admin, OP_KIND_REPAIR, vec![extent]).await;
+        assert_eq!(op.state, OP_STATE_SUCCEEDED, "{op:?}");
+        let marked = |r: &ExtentHealthSummaryResp| {
+            r.problems
+                .iter()
+                .find(|p| p.extent_id == extent)
+                .is_some_and(|p| {
+                    p.slots
+                        .iter()
+                        .any(|s| s.node_id == members[1] && s.repair_requested)
+                })
+        };
+        let r = summary(&admin).await;
+        assert_eq!(r.repair_requested_slots, 1, "{r:?}");
+        assert!(marked(&r), "the requested slot is marked: {r:?}");
+
+        let op = submit(&admin, OP_KIND_REPAIR_CANCEL, vec![extent]).await;
+        assert_eq!(op.state, OP_STATE_SUCCEEDED, "{op:?}");
+        assert!(op.message.contains("withdrew 1 repair request"), "{}", op.message);
+        let r = summary(&admin).await;
+        assert_eq!(r.repair_requested_slots, 0, "{r:?}");
+        assert!(!marked(&r), "the mark is gone: {r:?}");
+        // Nothing left to cancel says so.
+        let op = submit(&admin, OP_KIND_REPAIR_CANCEL, vec![extent]).await;
+        assert_eq!(op.state, OP_STATE_FAILED, "{op:?}");
+
+        // A spare joins: with the request withdrawn, nothing moves to it.
+        let r = register_node(&admin, &addrs[3].to_string(), &uuid(3)).await;
+        nodes.push(Some(start_node(
+            addrs[3],
+            dirs[3].path().to_path_buf(),
+            r.disk_uuids[0].1,
+            mgr_addr.to_string(),
+        )));
+        compio::time::sleep(Duration::from_secs(12)).await;
+        assert!(
+            extent_info(&admin, extent).await.replicates.contains(&members[1]),
+            "a cancelled request must not rebuild anything"
+        );
+    });
+    drop(nodes);
+}

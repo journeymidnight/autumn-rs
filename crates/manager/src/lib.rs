@@ -68,6 +68,7 @@ fn op_kind_audit_code(kind: u8) -> u8 {
         OP_KIND_FORCE_GC => AUDIT_OP_FORCE_GC,
         OP_KIND_EC_CONVERT => AUDIT_OP_FORCE_EC_CONVERT,
         OP_KIND_REPAIR => AUDIT_OP_REPAIR,
+        OP_KIND_REPAIR_CANCEL => AUDIT_OP_REPAIR_CANCEL,
         _ => 0,
     }
 }
@@ -2274,6 +2275,24 @@ impl AutumnManager {
                     message: outcome.describe(),
                 },
                 Ok(outcome) => terminal_err(outcome.describe()),
+                Err(e) => terminal_err(e.to_string()),
+            },
+            OP_KIND_REPAIR_CANCEL => match self
+                .cancel_repair(
+                    &spec.extent_ids,
+                    (spec.extent_ids.is_empty() && spec.part_id != 0).then_some(spec.part_id),
+                )
+                .await
+            {
+                Ok((slots, extents)) if slots > 0 => ActuationResult::Terminal {
+                    state: OP_STATE_SUCCEEDED,
+                    error: String::new(),
+                    message: format!(
+                        "withdrew {slots} repair request(s) on {extents} extent(s); their \
+                         degraded clocks restart"
+                    ),
+                },
+                Ok(_) => terminal_err("no standing repair request to withdraw".to_string()),
                 Err(e) => terminal_err(e.to_string()),
             },
             OP_KIND_EC_CONVERT => {

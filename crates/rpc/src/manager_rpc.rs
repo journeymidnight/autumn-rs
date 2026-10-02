@@ -1737,6 +1737,9 @@ pub struct ProblemSlot {
     /// How long this leader has seen the slot not serving, in seconds. The
     /// clock is the leader's own and restarts at a leader change.
     pub degraded_secs: u64,
+    /// A repair request stands for this slot (`autumn-op repair`, or the
+    /// repair policy): it is to be rebuilt on another node. Wire 54.
+    pub repair_requested: bool,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -1780,6 +1783,8 @@ pub struct ExtentHealthSummaryResp {
     pub recovering: u64,
     /// Σ `sealed_length` over degraded and unavailable extents.
     pub degraded_bytes: u64,
+    /// Slots with a standing repair request, cluster-wide. Wire 54.
+    pub repair_requested_slots: u64,
     /// Non-serving slots of sealed extents, indexed by `SLOT_STATE_*`
     /// (index 0, SERVING, is always 0). A reader must accept a longer vector.
     pub slot_counts: Vec<u64>,
@@ -1918,6 +1923,7 @@ pub const AUDIT_OP_COMPACT: u8 = 10;
 pub const AUDIT_OP_GC: u8 = 11;
 pub const AUDIT_OP_FORCE_GC: u8 = 12;
 pub const AUDIT_OP_REPAIR: u8 = 13;
+pub const AUDIT_OP_REPAIR_CANCEL: u8 = 14;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrAuditEntry {
@@ -2397,6 +2403,12 @@ pub const OP_KIND_RECOVERY: u8 = 8;
 /// every degraded slot on node `part_id`. Terminal as soon as the requests are
 /// recorded; the rebuilds themselves then appear as `OP_KIND_RECOVERY` entries.
 pub const OP_KIND_REPAIR: u8 = 9;
+/// Withdraw standing repair requests (`autumn-op repair --cancel`): those of
+/// the extents in `extent_ids`, or — with `extent_ids` empty — every one on
+/// node `part_id`. Their degraded clocks restart, so the repair policy waits a
+/// full grace period before proposing them again. A rebuild already dispatched
+/// runs to completion.
+pub const OP_KIND_REPAIR_CANCEL: u8 = 10;
 
 /// Display name for an `OP_KIND_*`, next to the constants so the mapping has
 /// ONE definition — the manager logs it and the CLI renders it, and a label
@@ -2412,6 +2424,7 @@ pub fn op_kind_name(kind: u8) -> &'static str {
         OP_KIND_EC_CONVERT => "ec-convert",
         OP_KIND_RECOVERY => "recovery",
         OP_KIND_REPAIR => "repair",
+        OP_KIND_REPAIR_CANCEL => "repair-cancel",
         _ => "?",
     }
 }

@@ -237,6 +237,82 @@ impl AutumnManager {
         Ok(outcome)
     }
 
+    /// Withdraw standing requests (`autumn-op repair --cancel`): every one on
+    /// the named extents, or — none named — every one on a slot of
+    /// `only_node`. Returns `(slots, extents)` withdrawn.
+    ///
+    /// Their degraded clocks restart too: the policy proposes a slot only once
+    /// it has been degraded a full grace period, and with the old clock an
+    /// Armed policy would re-request the cancelled slots on its next pass. A
+    /// rebuild already dispatched for one runs to completion — its marker is
+    /// a standing instruction of its own.
+    pub(crate) async fn cancel_repair(
+        &self,
+        extent_ids: &[u64],
+        only_node: Option<u64>,
+    ) -> Result<(u32, usize), AppError> {
+        let targets: Vec<(u64, u32)> = if extent_ids.is_empty() {
+            let Some(node) = only_node else {
+                return Ok((0, 0));
+            };
+            let s = self.store.inner.borrow();
+            self.extent_repair_slots
+                .borrow()
+                .iter()
+                .filter_map(|(id, bits)| {
+                    let ex = s.extents.get(id)?;
+                    let mask = Self::extent_nodes(ex)
+                        .iter()
+                        .enumerate()
+                        .filter(|(slot, n)| *slot < 32 && **n == node && bits & (1u32 << slot) != 0)
+                        .fold(0u32, |m, (slot, _)| m | (1u32 << slot));
+                    (mask != 0).then_some((*id, mask))
+                })
+                .collect()
+        } else {
+            let mut seen = std::collections::HashSet::new();
+            extent_ids
+                .iter()
+                .filter(|id| seen.insert(**id))
+                .filter_map(|id| {
+                    let bits = self.repair_slots_of(*id);
+                    (bits != 0).then_some((*id, bits))
+                })
+                .collect()
+        };
+        if targets.is_empty() {
+            return Ok((0, 0));
+        }
+        // Clocks first: between two withdrawal batches the runtime yields, and
+        // a slot already withdrawn but still carrying its old clock (past the
+        // grace) would be re-requested by an Armed policy in that window. A
+        // clock reset whose withdrawal then fails only delays the policy.
+        {
+            let mut since = self.slot_degraded_since.borrow_mut();
+            for (id, bits) in &targets {
+                for slot in 0..32u32 {
+                    if bits & (1u32 << slot) != 0 {
+                        since.remove(&(*id, slot));
+                    }
+                }
+            }
+        }
+        self.withdraw_repairs(&targets).await.map_err(|(done, e)| {
+            AppError::Internal(format!(
+                "withdrew the requests of {done} of {} extent(s), then: {e}",
+                targets.len()
+            ))
+        })?;
+        let slots = targets.iter().map(|(_, b)| b.count_ones()).sum();
+        tracing::info!(
+            slots,
+            extents = targets.len(),
+            node = ?only_node,
+            "repair requests cancelled"
+        );
+        Ok((slots, targets.len()))
+    }
+
     /// The repair policy's advisories: one per node whose slots have stayed
     /// degraded (behind or unreachable) for at least `--repair-grace-secs`,
     /// on extents a rebuild can actually serve, that nothing is already
@@ -461,6 +537,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, s)| (i as u64, *s, 0))
                 .collect(),
+            requested: 0,
         }
     }
 
@@ -501,6 +578,74 @@ mod tests {
             plan_repair(&ec, 0, RepairRequester::Operator).is_err(),
             "an EC extent short of its data shards has no source either"
         );
+    }
+
+    /// A cancel restarts the cancelled slots' degraded clocks: with the old
+    /// clock (already past the grace) an Armed policy would re-request them
+    /// on its very next pass.
+    #[test]
+    fn a_cancel_restarts_the_grace_period() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let m = AutumnManager::new();
+            m.set_repair_grace_secs(600);
+            for (node_id, disk) in [(1u64, 10u64), (2, 20)] {
+                m.store.inner.borrow_mut().nodes.insert(
+                    node_id,
+                    crate::persist::records::NodeRecord {
+                        node_id,
+                        address: format!("127.0.0.1:{}", 9100 + node_id),
+                        disks: vec![disk],
+                        shard_ports: vec![],
+                        control_address: String::new(),
+                        node_uuid: String::new(),
+                    },
+                );
+                m.store.inner.borrow_mut().disks.insert(
+                    disk,
+                    crate::persist::records::DiskRecord {
+                        disk_id: disk,
+                        online: true,
+                        uuid: String::new(),
+                    },
+                );
+            }
+            m.node_states.borrow_mut().on_register_first(1); // never heard from
+            m.node_states.borrow_mut().on_heartbeat_ok(2);
+            m.store.inner.borrow_mut().extents.insert(
+                50,
+                crate::persist::records::ExtentRecord {
+                    extent_id: 50,
+                    sealed: true,
+                    sealed_length: 4096,
+                    replicates: vec![1, 2],
+                    replicate_disks: vec![10, 20],
+                    avali: 0b11,
+                    ..Default::default()
+                },
+            );
+            let now = AutumnManager::epoch_seconds();
+            m.slot_degraded_since.borrow_mut().insert((50, 0), now - 1000);
+            let policy_ask = |m: &AutumnManager| {
+                m.repair_candidates(now)
+                    .iter()
+                    .any(|c| c.secondary_part_id == 1)
+            };
+            assert!(policy_ask(&m), "slot 0 has been degraded past the grace");
+            let first = m
+                .request_repair(&[], Some(1), 600, RepairRequester::Policy)
+                .await
+                .unwrap();
+            assert_eq!(first.requested_slots, 1);
+
+            assert_eq!(m.cancel_repair(&[50], None).await.unwrap(), (1, 1));
+            assert_eq!(m.repair_slots_of(50), 0);
+            assert!(!policy_ask(&m), "after a cancel the grace starts over");
+            let again = m
+                .request_repair(&[], Some(1), 600, RepairRequester::Policy)
+                .await
+                .unwrap();
+            assert_eq!(again.requested_slots, 0, "not re-requested on the next pass");
+        });
     }
 
     #[test]

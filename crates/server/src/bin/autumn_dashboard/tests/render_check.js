@@ -32,7 +32,7 @@ const ctx = { $: sel => ({ set innerHTML(v) { OUT[sel] = v; } }) };
 const src = [escLine, constLine("jsAttr"), constLine("BYTE_KINDS"),
              constLine("COUNT_UNIT"), lift("fmtBytes"), lift("fmtProgress"), lift("agoStr"), lift("psHealth"),
              lift("diskRow"), lift("hotColdAdvisory"), lift("advRow"), lift("opsTarget"), lift("opsAgo"),
-             lift("nodeAddr"), lift("extChip"), lift("extentHealthRows"), lift("extentHealthBad"), lift("repairBtn"),
+             lift("nodeAddr"), lift("extChip"), lift("extentHealthRows"), lift("extentHealthBad"), lift("repairBtn"), lift("cancelBtn"),
              lift("renderLiveOps"), lift("renderOpsHistory")].join("\n");
 const now = Math.floor(Date.now() / 1000);
 let PURE = {};
@@ -62,6 +62,10 @@ OUT2.ehErr = extentHealthRows({status:"HEALTH_ERR", sealed_extents:4, degraded:0
   unavailable:1, recovering:0, degraded_bytes:1,
   problems:[{extent_id:9, serving:3, total:6, needed:4, recovering:false,
              slots:[{slot:3, node_id:2, state:"unreachable", degraded_secs:60}]}]});
+OUT2.ehRequested = extentHealthRows({status:"HEALTH_WARN", sealed_extents:3, degraded:1, no_redundancy:0,
+  unavailable:0, recovering:0, degraded_bytes:1, repair_requested_slots:1,
+  problems:[{extent_id:41, serving:2, total:3, needed:1, recovering:false,
+             slots:[{slot:2, node_id:7, state:"unreachable", degraded_secs:900, repair_requested:true}]}]});
 OUT2.ehClean = extentHealthRows({status:"HEALTH_OK", sealed_extents:4, degraded:0, no_redundancy:0,
   unavailable:0, recovering:0, degraded_bytes:0, problems:[]});
 OUT2.ehUnknown = extentHealthRows(null);
@@ -163,6 +167,12 @@ want(text(PURE.ehErr), "extent 9 3/6 serving", "…named with its shard count");
 wantEq(PURE.ehClean, "", "a clean summary raises nothing");
 want(text(PURE.ehUnknown), "Extent health unknown", "an unread summary is unknown, never healthy");
 wantEq(PURE.ehBad.join(","), "false,true,false,true", "the all-clear line needs a summary that says clean");
+
+const ehr = text(PURE.ehRequested);
+want(ehr, "slot2 node 7 unreachable", "the requested slot is named");
+want(ehr, "(repair requested)", "…and marked as queued to move");
+want(ehr, "1 slot queued to be rebuilt on another node", "the standing requests are counted");
+want(PURE.ehRequested, 'action:"repair_cancel",extent_id:41', "a standing request can be cancelled from the page");
 
 // An advisory's reason can be a whole sentence; the row must lead with the
 // action and keep the reasoning, not truncate one into the other.

@@ -4657,7 +4657,7 @@ impl AutumnManager {
                 "recovery is auto-dispatched, not submittable — watch it with \
                  `ops list --kind recovery`",
             ),
-            OP_KIND_REPAIR => {
+            OP_KIND_REPAIR | OP_KIND_REPAIR_CANCEL => {
                 if req.extent_ids.is_empty() == (req.part_id == 0) {
                     Some("repair takes extent ids OR a node id in part_id, not both or neither")
                 } else {

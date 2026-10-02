@@ -33,7 +33,7 @@
 
 rkyv 不提供 Protobuf 式字段增补兼容：新增 Option 字段也可能改变 archived layout，需要判断并 bump wire。普通优化、修复和未改变协议的发布不 bump。客户端 surface 改变时须保留真实旧入口/类型，或明确收紧兼容范围；不能仅用整数窗口声称兼容。
 
-当前 WIRE_VERSION = 53、MIN_CLIENT_WIRE_VERSION = 43。新增 Hello 不自动 bump wire 或提高客户端下界；业务协议确有变化时，再按相应变更规则处理。
+当前 WIRE_VERSION = 54、MIN_CLIENT_WIRE_VERSION = 43。新增 Hello 不自动 bump wire 或提高客户端下界；业务协议确有变化时，再按相应变更规则处理。
 
 客户端连接时使用现有区间检查：服务端提供 [MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]，客户端声明的 client_wire_version 必须位于该区间。当前 SDK 使用自身 WIRE_VERSION 作为声明值。这是客户端所用协议与服务端支持集合有交集；不把内部 peer 的准入改成区间 overlap。内部成员只使用 WIRE_VERSION exact-match。
 

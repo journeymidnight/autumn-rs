@@ -893,6 +893,16 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## Pending repair requests in the health summary (wire 54)
+
+`ProblemSlot` gains `repair_requested: bool` and `ExtentHealthSummaryResp`
+gains `repair_requested_slots: u64`, so `autumn-op health` and the dashboard
+show which degraded copies are already queued to move. `MSG_EXTENT_HEALTH_SUMMARY`
+is read by autumn-op only (Admin), not on the client surface: the window's
+ceiling rises to [43, 54], the floor stays, and autumn-op / the dashboard are
+upgraded with the cluster. `OP_KIND_REPAIR_CANCEL` (10) and
+`AUDIT_OP_REPAIR_CANCEL` (14) are appended values, no struct change.
+
 ## Corrupt slots beside extent info (wire 53)
 
 `ExtentInfoResp` gains `corrupt_slots: u32` — the manager's corrupt-slot

@@ -173,6 +173,7 @@ fn op_name(b: u8) -> &'static str {
         AUDIT_OP_FORCE_EC_CONVERT => "force_ec_convert",
         AUDIT_OP_FORCE_ABANDON_EC_MARKER => "force_abandon_ec_marker",
         AUDIT_OP_REPAIR => "repair",
+        AUDIT_OP_REPAIR_CANCEL => "repair_cancel",
         _ => "unknown",
     }
 }
@@ -476,14 +477,22 @@ async fn run(args: Args) -> Result<()> {
             ec_data,
             ec_parity,
         } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
-        Command::Repair { extents, node } => {
+        Command::Repair {
+            extents,
+            node,
+            cancel,
+        } => {
             submit_op_cli(
                 &client,
                 args.json,
                 args.wait,
                 args.wait_timeout,
                 OpSubmitReq {
-                    kind: OP_KIND_REPAIR,
+                    kind: if cancel {
+                        OP_KIND_REPAIR_CANCEL
+                    } else {
+                        OP_KIND_REPAIR
+                    },
                     part_id: node.unwrap_or(0),
                     secondary_id: extents.first().copied().unwrap_or(0),
                     extent_ids: extents,
@@ -1186,6 +1195,12 @@ fn render_health(r: &ExtentHealthSummaryResp) -> String {
             r.recovering
         ),
     ];
+    if r.repair_requested_slots > 0 {
+        lines.push(format!(
+            "  {} slot(s) with a standing repair request (`autumn-op repair --cancel` withdraws)",
+            r.repair_requested_slots
+        ));
+    }
     let slots: Vec<String> = r
         .slot_counts
         .iter()
@@ -1211,10 +1226,11 @@ fn render_health(r: &ExtentHealthSummaryResp) -> String {
                     String::new()
                 };
                 format!(
-                    "slot{} node {} {}{since}",
+                    "slot{} node {} {}{since}{}",
                     s.slot_index,
                     s.node_id,
                     slot_state_str(s.state),
+                    if s.repair_requested { " [repair requested]" } else { "" },
                 )
             })
             .collect();
@@ -2052,6 +2068,7 @@ fn op_kind_from_str(s: &str) -> u8 {
         "ec" | "ec-convert" => OP_KIND_EC_CONVERT,
         "recovery" => OP_KIND_RECOVERY,
         "repair" => OP_KIND_REPAIR,
+        "repair-cancel" => OP_KIND_REPAIR_CANCEL,
         _ => 0,
     }
 }
@@ -4182,6 +4199,7 @@ mod tests {
             degraded: 1,
             no_redundancy: 1,
             degraded_bytes: 64 << 20,
+            repair_requested_slots: 1,
             slot_counts,
             problems: vec![ProblemExtent {
                 extent_id: 77,
@@ -4196,6 +4214,7 @@ mod tests {
                     node_id: 5,
                     state: SLOT_STATE_UNREACHABLE,
                     degraded_secs: 812,
+                    repair_requested: true,
                 }],
             }],
             ..Default::default()
@@ -4205,13 +4224,19 @@ mod tests {
         assert!(text.contains("9 clean, 1 degraded (64.0 MiB), 1 with no redundancy left"), "{text}");
         assert!(text.contains("slots not serving: 2 unreachable"), "{text}");
         assert!(
-            text.contains("extent 77  1/3 serving (needs 1)  recovering  64.0 MiB  slot1 node 5 unreachable 812s"),
+            text.contains(
+                "extent 77  1/3 serving (needs 1)  recovering  64.0 MiB  slot1 node 5 unreachable \
+                 812s [repair requested]"
+            ),
             "{text}"
         );
+        assert!(text.contains("1 slot(s) with a standing repair request"), "{text}");
         let j = health_json(&r);
         assert_eq!(j["status"], "HEALTH_WARN");
         assert_eq!(j["slots_not_serving"]["unreachable"], 2);
         assert_eq!(j["problems"][0]["slots"][0]["state"], "unreachable");
+        assert_eq!(j["problems"][0]["slots"][0]["repair_requested"], true);
+        assert_eq!(j["repair_requested_slots"], 1);
     }
 
     fn region(part_id: u64, log: u64, row: u64, meta: u64) -> MgrRegionInfo {

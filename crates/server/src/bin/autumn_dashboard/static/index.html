@@ -601,7 +601,7 @@ function extentHealthRows(eh){
   const rows=[];
   const worst=(eh.problems||[]).slice(0,5).map(p=>
     `extent ${p.extent_id} ${p.serving}/${p.total} serving${p.recovering?" (rebuilding)":""}: `+
-    (p.slots||[]).map(s=>`slot${s.slot} node ${s.node_id} ${s.state}${s.degraded_secs?" "+agoStr(s.degraded_secs):""}`).join(", ")
+    (p.slots||[]).map(s=>`slot${s.slot} node ${s.node_id} ${s.state}${s.degraded_secs?" "+agoStr(s.degraded_secs):""}${s.repair_requested?" (repair requested)":""}`).join(", ")
   ).join("; ");
   if(eh.unavailable>0) rows.push(`<div class="adv"><span class="sev" style="background:var(--bad)"></span>
       <span class="d">${eh.unavailable} extent${eh.unavailable>1?"s":""} unavailable — fewer serving copies than a read needs
@@ -609,6 +609,9 @@ function extentHealthRows(eh){
   if(eh.degraded>0) rows.push(`<div class="adv"><span class="sev" style="background:var(${eh.no_redundancy>0?"--bad":"--warn"})"></span>
       <span class="d">${eh.degraded} extent${eh.degraded>1?"s":""} degraded (${fmtBytes(eh.degraded_bytes)})${eh.no_redundancy>0?`, ${eh.no_redundancy} with no redundancy left`:""}
       ${eh.unavailable>0?"":`<span class="why">${esc(worst)}</span>`}</span>${repairBtn(eh)}</div>`);
+  if(eh.repair_requested_slots>0) rows.push(`<div class="adv"><span class="sev" style="background:var(--warn)"></span>
+      <span class="d">${eh.repair_requested_slots} slot${eh.repair_requested_slots>1?"s":""} queued to be rebuilt on another node
+      <span class="why">withdrawn on their own when the node answers again; cancel with autumn-op repair --cancel</span></span>${cancelBtn(eh)}</div>`);
   if(eh.recovering>0) rows.push(`<div class="adv"><span class="sev" style="background:var(--ok)"></span>
       <span class="d">${eh.recovering} extent${eh.recovering>1?"s":""} rebuilding</span>
       <button class="btn xs" onclick="setTab('logs')">Logs</button></div>`);
@@ -620,6 +623,12 @@ function extentHealthRows(eh){
 function repairBtn(eh){
   const p=(eh.problems||[]).find(p=>p.serving>=p.needed && !p.recovering);
   return p?`<button class="btn xs warn" onclick='act({action:"repair",extent_id:${Number(p.extent_id)}},"repair extent ${Number(p.extent_id)}")'>Repair #${Number(p.extent_id)}</button>`:"";
+}
+// Withdraw the standing repair requests of the worst problem extent that has
+// one (`autumn-op repair --cancel <extent>`).
+function cancelBtn(eh){
+  const p=(eh.problems||[]).find(p=>(p.slots||[]).some(s=>s.repair_requested));
+  return p?`<button class="btn xs" onclick='act({action:"repair_cancel",extent_id:${Number(p.extent_id)}},"cancel the repair of extent ${Number(p.extent_id)}")'>Cancel repair #${Number(p.extent_id)}</button>`:"";
 }
 function extentHealthBad(eh){
   return eh===null || (eh!==undefined && (eh.unavailable>0 || eh.degraded>0));

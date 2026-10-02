@@ -415,6 +415,15 @@ async fn action(cfg: &Config, body: Bytes) -> Response<Body> {
         // degraded slot on one node.
         "repair" if extent > 0 => vec!["repair".into(), extent.to_string()],
         "repair" if node > 0 => vec!["repair".into(), "--node".into(), node.to_string()],
+        "repair_cancel" if extent > 0 => {
+            vec!["repair".into(), "--cancel".into(), extent.to_string()]
+        }
+        "repair_cancel" if node > 0 => vec![
+            "repair".into(),
+            "--cancel".into(),
+            "--node".into(),
+            node.to_string(),
+        ],
         _ => {
             return json_resp(
                 StatusCode::BAD_REQUEST,

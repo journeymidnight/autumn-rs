@@ -92,6 +92,7 @@ pub fn health_json(r: &ExtentHealthSummaryResp) -> serde_json::Value {
         "unavailable": r.unavailable,
         "recovering": r.recovering,
         "degraded_bytes": r.degraded_bytes,
+        "repair_requested_slots": r.repair_requested_slots,
         "slots_not_serving": r
             .slot_counts
             .iter()
@@ -112,6 +113,7 @@ pub fn health_json(r: &ExtentHealthSummaryResp) -> serde_json::Value {
                 "node_id": s.node_id,
                 "state": slot_state_str(s.state),
                 "degraded_secs": s.degraded_secs,
+                "repair_requested": s.repair_requested,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
     })

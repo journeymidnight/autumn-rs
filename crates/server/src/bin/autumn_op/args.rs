@@ -50,8 +50,9 @@ fn usage() -> ! {
     eprintln!("                               (--presplit RETIRED — use `presplit --namespace <NS>` after bootstrap)");
     eprintln!("  set-stream-ec --stream <ID> --ec K+M");
     eprintln!("  force-ec-convert --extent <EXTID>");
-    eprintln!("  repair <EXTID>... | --node <NODE_ID>");
+    eprintln!("  repair [--cancel] <EXTID>... | [--cancel] --node <NODE_ID>");
     eprintln!("                               rebuild degraded copies on other nodes now, no fence");
+    eprintln!("                               (--cancel: withdraw standing repair requests)");
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
     eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (presplit EMPTY keyspace before loading)");
     eprintln!("           fs: --lanes <N> [--parts <P>] [--force to narrow declared lanes]");
@@ -366,6 +367,8 @@ pub(crate) enum Command {
     Repair {
         extents: Vec<u64>,
         node: Option<u64>,
+        /// Withdraw standing requests instead of making them.
+        cancel: bool,
     },
     ForceEcConvert {
         extent_id: u64,
@@ -1255,8 +1258,13 @@ pub(crate) fn parse() -> Args {
         "repair" => {
             let mut extents: Vec<u64> = Vec::new();
             let mut node: Option<u64> = None;
+            let mut cancel = false;
             while i < raw.len() {
                 match raw[i].as_str() {
+                    "--cancel" => {
+                        cancel = true;
+                        i += 1;
+                    }
                     "--node" => {
                         i += 1;
                         node = Some(val(&raw, i).parse().unwrap_or_else(|_| {
@@ -1278,7 +1286,11 @@ pub(crate) fn parse() -> Args {
                 eprintln!("repair takes extent ids OR --node <NODE_ID>");
                 usage();
             }
-            Command::Repair { extents, node }
+            Command::Repair {
+                extents,
+                node,
+                cancel,
+            }
         }
         "force-ec-convert" => {
             let mut extent_id: Option<u64> = None;

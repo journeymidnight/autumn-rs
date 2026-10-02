@@ -1,9 +1,17 @@
+Date: 2026-10-02 (12)
+TaskStatus: completed
+Task scope: user "补齐缺的，改wire结构" (F-EXTENT-REPAIR-VISIBILITY).
+Current summary: wire 54 — the health summary marks slots with a standing repair request and counts them (`autumn-op health`, dashboard); `autumn-op repair --cancel <EXT>... | --cancel --node N` withdraws requests and restarts their degraded clocks. All servers and autumn-op/dashboard upgrade together; SDK clients 43..53 still admitted.
+Verification: see feature_list F-EXTENT-REPAIR-VISIBILITY notes.
+Main gaps: none for this task.
+Next steps: none.
+
 Date: 2026-10-02 (11)
 TaskStatus: completed
 Task scope: user "policy要能发现和修复…extent的状态不对了,然后就可以发起立即重建到别的节点的操作(不等待fenced)" (F-EXTENT-REPAIR).
 Current summary: persisted per-slot repair requests make the recovery loop rebuild a degraded copy on another node without fencing its node; operator `autumn-op repair <EXT>... | --node N`; the auto-policy `repair` switch proposes one advisory per node degraded past `--repair-grace-secs` and actuates when Armed; dashboard switch/Apply/Repair button. When a request's node answers again on first-hand evidence, a serving copy's request is withdrawn and a behind replica is caught up in place first (rebuilt elsewhere only when its node answers that the extent is gone); replayed state after a failover is not evidence.
 Verification: see feature_list F-EXTENT-REPAIR notes.
-Main gaps: (user to decide) pending requests are not shown per slot in `autumn-op health`; no explicit `repair --cancel`.
+Main gaps: none (visibility and cancel done in (12)).
 Next steps: none for this task.
 
 Date: 2026-10-02 (10)

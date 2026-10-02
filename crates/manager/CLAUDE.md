@@ -1621,9 +1621,24 @@ not reinstalling it (the failover test red), no repair candidates (the policy
 test red), never withdrawing (the returning-node test red); unit
 `a_repair_request_is_withdrawn_when_its_node_answers_again`.
 
-Not visible yet: which slots carry a pending request — the health summary
-shows them by state only (unreachable / behind); the op message and the
-policy's action log say what was requested.
+Visible and cancellable (wire 54): the health summary marks each problem slot
+that carries a request (`ProblemSlot.repair_requested`) and counts them
+cluster-wide (`repair_requested_slots`); `autumn-op health` prints
+"[repair requested]" and the dashboard "(repair requested)" with a Cancel
+button. `OP_KIND_REPAIR_CANCEL` (`autumn-op repair --cancel <EXT>... |
+--cancel --node N`, `cancel_repair`) withdraws them and restarts their
+degraded clocks — without that an Armed policy re-requests a cancelled slot
+on its next pass, since its clock already exceeds the grace. The clocks go
+FIRST, before the batched withdrawal yields: a slot withdrawn in an early
+batch but still carrying its old clock would otherwise be re-requested by a
+policy actuation in that window (a reset whose withdrawal then fails only
+delays the policy). With `--repair-grace-secs 0` a cancel holds only until the
+next policy pass. A rebuild already dispatched runs to completion (its marker
+is its own standing instruction). Tests:
+`a_standing_repair_request_is_shown_and_can_be_cancelled` (ablations: cancel
+that does not withdraw; a summary that does not mark) and
+`extent_repair::tests::a_cancel_restarts_the_grace_period` (ablation: no
+clock reset).
 
 ## Web dashboard (standalone app)
 

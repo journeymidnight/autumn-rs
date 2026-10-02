@@ -14,6 +14,13 @@
 
 ## Active
 
+### F-EXTENT-REPAIR-VISIBILITY — 挂着的修复请求可见、可撤销
+- **Trigger** (2026-10-02 用户): "补齐缺的，改wire结构"（F-EXTENT-REPAIR 留下的两项：`autumn-op health` 不显示哪些 slot 挂着请求；没有 `repair --cancel`）。
+- **Scope**: `ProblemSlot.repair_requested`、`ExtentHealthSummaryResp.repair_requested_slots`（wire 54）；`autumn-op health`、dashboard 标出；`OP_KIND_REPAIR_CANCEL` + `autumn-op repair --cancel <EXT>... | --cancel --node N`，撤回请求并重置这些 slot 的 degraded 计时（Armed policy 不会马上再提）。
+- **Acceptance**: 真实 EN：请求记录后 health 标出该 slot 且计数为 1，撤销后消失且不再重建；消融（撤销不生效 / 不标记）各自变红；渲染测试覆盖。
+- `passes: true`
+- **notes** (2026-10-02): wire 54：`ProblemSlot.repair_requested`、`ExtentHealthSummaryResp.repair_requested_slots`；`OP_KIND_REPAIR_CANCEL`=10、`AUDIT_OP_REPAIR_CANCEL`=14（追加值）。`cancel_repair` 先重置 degraded 计时再批量撤回（评审：跨批次 yield 时 Armed policy 会重新请求）。autumn-op `[repair requested]` 与计数、`repair --cancel`；dashboard 标记 + Cancel 按钮 + `repair_cancel` 动作。测试：`a_standing_repair_request_is_shown_and_can_be_cancelled`（真实 EN；撤销不撤回 / 汇总不标记两处消融均红）、`a_cancel_restarts_the_grace_period`（消融红）、summary 单测、autumn-op 渲染、render_check.js（消融红）；rpc/manager lib/autumn-server 全量/dashboard JS/api_contract.sh 绿。评审 opus×1。
+
 ### F-RECOVERY-ONE-MODE — 恢复只留一种模式；错过 seal 的副本原地补齐
 - **Trigger** (2026-10-02 用户): "我认为留一种模式就行, 1. fenced_only也要RE_AVALI"。此前 `AUTUMN_MGR_RECOVERY_GATE` 选 `fenced_only`（默认）或 `auto_disk`；默认模式在发 `RE_AVALI` 的分支之前就返回，seal 时不在的副本回来后 avali 永不置位，extent 一直少一份，直到有人 fence。
 - **Scope**: 删除两种模式与环境变量；搬走副本只在 fenced / corrupt / 本节点自报磁盘故障时发生；avali 未置位、节点 Online、磁盘在线的复制 extent 发 `RE_AVALI` 按 sealed_length 原地补齐，失败只退避不搬走；删除只属于 `auto_disk` 的探测分支。

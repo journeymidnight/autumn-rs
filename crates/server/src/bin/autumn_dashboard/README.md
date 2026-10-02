@@ -42,7 +42,7 @@ without the secret — read-only views included.
 |-------|------|
 | `GET /api/overview` | `autumn-op overview` (df + nodes with per-disk rows + partitions + ps_servers + amplification + advisories + extent health) |
 | `GET /api/partition/{id}` | `autumn-op info --part {id} --detail` |
-| `POST /api/action` | maps `{action, part_id, …}` → `split` / `gc` / `compact` / `merge` / `force-ec-convert` / `rebalance` / `repair <extent>` / `repair --node <id>` |
+| `POST /api/action` | maps `{action, part_id, …}` → `split` / `gc` / `compact` / `merge` / `force-ec-convert` / `rebalance` / `repair <extent>` / `repair --node <id>` / `repair --cancel <extent>` |
 | `GET /api/policies` | `autumn-op auto-policy status` (reshaped to the page's schema) |
 | `GET /api/ops` | `autumn-op ops list --active` + `ops history` → `{live, history, history_error}` |
 | `POST /api/policies/activate` | `autumn-op auto-policy activate <name> [--arm]` / `deactivate` |

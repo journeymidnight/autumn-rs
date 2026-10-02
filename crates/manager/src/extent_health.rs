@@ -97,6 +97,8 @@ pub(crate) struct ExtentView {
     pub recovering: bool,
     /// `(node_id, SLOT_STATE_*, degraded_secs)` per slot, in slot order.
     pub slots: Vec<(u64, u8, u64)>,
+    /// Slots with a standing repair request (`extent_repair`), as a bitmap.
+    pub requested: u32,
 }
 
 impl ExtentView {
@@ -117,6 +119,8 @@ pub(crate) struct HealthScan {
     pub clean: u64,
     /// Clean extents with a rebuild in flight (a problem view carries its own).
     pub clean_recovering: u64,
+    /// Slots with a standing repair request, over every extent.
+    pub repair_requested_slots: u64,
     pub problems: Vec<ExtentView>,
 }
 
@@ -128,6 +132,7 @@ pub(crate) fn summarize(scan: HealthScan, max_problems: usize) -> ExtentHealthSu
         clean: scan.clean,
         sealed_extents: scan.clean,
         recovering: scan.clean_recovering,
+        repair_requested_slots: scan.repair_requested_slots,
         slot_counts: vec![0; SLOT_STATES],
         ..Default::default()
     };
@@ -189,6 +194,7 @@ pub(crate) fn summarize(scan: HealthScan, max_problems: usize) -> ExtentHealthSu
                     node_id: *node_id,
                     state: *st,
                     degraded_secs: *secs,
+                    repair_requested: i < 32 && v.requested & (1u32 << i) != 0,
                 })
                 .collect(),
         })
@@ -245,13 +251,21 @@ impl AutumnManager {
         let s = self.store.inner.borrow();
         let since = self.slot_degraded_since.borrow();
         let inflight = self.inflight.borrow();
+        let requests = self.extent_repair_slots.borrow();
         let src = FactSources {
             node_states: self.node_states.borrow(),
             overrides: self.node_overrides.borrow(),
             faulted: self.faulted_disks.borrow(),
             corrupt: self.extent_corrupt_slots.borrow(),
         };
-        let mut scan = HealthScan::default();
+        let mut scan = HealthScan {
+            repair_requested_slots: requests
+                .iter()
+                .filter(|(id, _)| s.extents.contains_key(*id))
+                .map(|(_, bits)| u64::from(bits.count_ones()))
+                .sum(),
+            ..Default::default()
+        };
         // Reused per extent; a view copies it only when the extent is a problem.
         let mut states: Vec<(u64, u8)> = Vec::new();
         for ex in s.extents.values() {
@@ -297,6 +311,7 @@ impl AutumnManager {
                 needed: needed_copies(ex),
                 recovering,
                 slots,
+                requested: requests.get(&ex.extent_id).copied().unwrap_or(0),
             });
         }
         scan
@@ -479,6 +494,7 @@ mod tests {
                 .enumerate()
                 .map(|(i, (st, secs))| (i as u64 + 10, *st, *secs))
                 .collect(),
+            requested: 0,
         }
     }
 
@@ -524,6 +540,22 @@ mod tests {
         );
         assert_eq!(r.status, HEALTH_ERR);
         assert_eq!((r.degraded, r.unavailable), (0, 1));
+    }
+
+    /// A slot with a standing repair request is marked as such, and the count
+    /// comes through.
+    #[test]
+    fn a_standing_repair_request_is_shown() {
+        let s = SLOT_STATE_SERVING;
+        let u = SLOT_STATE_UNREACHABLE;
+        let mut v = view(5, 1, &[(s, 0), (u, 700)]);
+        v.requested = 0b10;
+        let mut sc = scan(vec![v], 0);
+        sc.repair_requested_slots = 1;
+        let r = summarize(sc, 10);
+        assert_eq!(r.repair_requested_slots, 1);
+        assert!(r.problems[0].slots[0].repair_requested);
+        assert_eq!(r.problems[0].slots[0].slot_index, 1);
     }
 
     #[test]

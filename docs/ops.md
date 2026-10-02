@@ -4872,6 +4872,18 @@ When it is not coming back soon, move its copies without fencing it:
     autumn-op ... repair --node 5        # every degraded slot on node 5
     autumn-op ... --wait repair 77       # block until the request is recorded
 
+See and withdraw standing requests:
+
+    autumn-op ... health                 # "[repair requested]" per slot, and the count
+    autumn-op ... repair --cancel 77     # withdraw extent 77's requests
+    autumn-op ... repair --cancel --node 5
+
+A cancel restarts those slots' degraded clocks, so the repair policy waits a
+full `--repair-grace-secs` before proposing them again (switch the policy's
+`repair` off to stop it for good; with a grace of 0 the next pass re-requests
+them). A rebuild already dispatched runs to
+completion.
+
 The op succeeds once the requests are recorded (`ops status` shows "requested
 a rebuild of N slot(s) on M extent(s)", plus what was skipped and why — a
 healthy or open extent, one with no copy left to read from); the rebuilds then
@@ -4897,6 +4909,7 @@ Verify:
 
     cargo test -p autumn-manager --test extent_repair
     cargo test -p autumn-manager --lib extent_repair
+    cargo test -p autumn-manager --lib extent_health
     cargo test -p autumn-manager --lib auto_policy
 
 `extent_repair` runs three real-EN scenarios: an operator repair moves the copy
@@ -4908,7 +4921,9 @@ could be served keeps its copies when the spare comes back. Ablations, each
 reddening exactly its scenario: make `slot_verdict` ignore `repair_requested`
 (the first three), make `install_replayed_repair_slots` drop what it replays
 (the failover one), make `repair_candidates` return nothing (the policy one),
-never withdraw a request (the returning-node one).
+never withdraw a request (the returning-node one), make `cancel_repair` skip
+`withdraw_repairs` or `summarize` never set `repair_requested` (the
+`a_standing_repair_request_is_shown_and_can_be_cancelled` one).
 
 ## A corrupt EC source yields to recovery instead of burning 24 retries
 
