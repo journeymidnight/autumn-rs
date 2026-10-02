@@ -18,7 +18,8 @@
 - **Trigger** (2026-10-02，删除 flush 屏障时独立评审提出): 回放 open 尾部的读取上限是 `commit_length_for_extent`（可达副本的 min），而写游标由 `current_commit`（全部副本的 min）决定。若副本 C 宕机期间一条未确认的记录 R 只落在 A、B 上，PS 此时重启，回放会把 R 读进 memtable；C 在首次追加前回来，首次追加按 C 的较短长度截断 A、B，R 的值指针随后指向被覆盖的字节。
 - **Scope**: 先复现；若成立，让回放上限与全副本规则一致，或回放前先 seal-and-roll。
 - **Acceptance**: 有一个按上述时序构造的测试，修复前红、修复后绿；不可复现则关闭并记录原因。
-- `passes: false`
+- `passes: true`
+- **notes** (2026-10-02): 用户关闭："这个不会出现,因为PS打开stream log的时候要100%确保A,B,C一样长" → "BUG-OPEN-TAIL-REPLAY-BOUND可关"。未复现、未改代码。关闭时的观察（供以后复查）：打开分区时回放前对日志尾做的是 `fence_tail`（partition-server lib.rs ~6393），只抬 owner_epoch、不比较或截断长度，且跳过连不上的副本；回放读取上限是 `commit_length_for_extent`（可达副本 min）；截断发生在回放之后的首次追加（`ensure_tail_initialised` → `truncate_to_commit`）。未找到回放前使三副本等长的步骤，但打开流程没有完整读完。
 
 ### BUG-FLUSH-BARRIER-WEDGE — 删除 flush 前的全副本 synced 屏障
 - **Trigger** (2026-10-02 用户): 解释运行中 EN 死后 flush 卡在屏障之后，"不需要这个屏障, 因为WAL写入的时候已经确认过了(你可以读代码), await_log_synced_to完全没有作用"。
