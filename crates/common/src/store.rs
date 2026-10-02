@@ -36,7 +36,7 @@ pub const OWNER_KEY_MISSING_TOKEN: &str = "does not exist";
 ///
 /// Why a message matcher at all: over the wire an owner-epoch fence is just
 /// `CODE_PRECONDITION`, indistinguishable from ordinary preconditions
-/// ("stream cannot be empty after punch holes", admin-token checks, …)
+/// ("stream cannot be empty after punch holes", …)
 /// without a new wire code — and a new code in `manager_rpc.rs` changes
 /// a stop-world WIRE version bump (see `WIRE_VERSION`). The
 /// stream-layer `StreamClient` uses this to turn a manager-side fence into

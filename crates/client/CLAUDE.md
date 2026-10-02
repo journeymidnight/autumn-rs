@@ -354,15 +354,22 @@ existing retained MSG_GET_REGIONS/MSG_GET_CLIENT_REGIONS forms, choosing from
 the manager version before sending. ConnPool's role is fixed per instance;
 the SDK's EN pool uses client and cannot share internal/admin connections.
 
-## Admin-token prefixing
+## Operator and member connections
 
-`set_admin_token(token)` sets a per-client admin token. On send, the SDK prefixes it onto
-the payload of admin RPCs — manager msgs classified by
-`autumn_rpc::manager_rpc::is_admin_mgr_msg`, PS msgs by
-`autumn_rpc::partition_rpc::is_admin_ps_msg`, both via `manager_rpc::prefix_admin_token`
-(`[u32 len][token][payload]`). Non-admin msgs are sent unmodified. **INVARIANT: do not add
-a raw manager/PS call path for admin RPCs** — route them through the classified send so
-the token is always prefixed (greppable: `is_admin_mgr_msg` / `is_admin_ps_msg`).
+`connect_admin` / `connect_peer` declare the Admin / Peer role; every
+connection they open runs PEER_AUTH and proves the cluster secret installed in
+the process (`autumn_rpc::peer_auth::install`, done by autumn-op from
+`--cluster-secret-file` and by the EN binary). Requests carry no token of their
+own: operator-only RPCs are gated by the role the connection proved.
+
+## Direct reads under authz
+
+`ensure_token` hands every token it returns to the EN pool
+(`ConnPool::set_auth_token`): each new EN connection sends `AUTH_HELLO` after
+VERSION_HELLO, and a changed token drops the pooled EN connections so they
+rebind (as `ps_conns` already did). `set_principal_credential` clears it. An EN
+of a cluster that runs authz refuses a direct read on a connection without a
+valid bound principal; the read then falls back to the PS proxy.
 
 ## Error types
 

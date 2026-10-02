@@ -63,13 +63,15 @@ refuse RPC, subject to the release's persistence and recovery analysis.
 wire_version_min is the client floor, wire_version_max the server wire, and
 cluster_version is reserved zero.
 
-`handle_connection` completes `VERSION_HELLO` before the business decoder.
+`handle_connection` completes `VERSION_HELLO`, then `PEER_AUTH` for Peer/Admin
+connections (cluster secret, `autumn_rpc::peer_auth`), before the business
+decoder.
 Clients use the supported interval; internal/admin connections require exact
 wire equality. It checks service/role/opcode before spawning business handlers.
 `MSG_GET_REGIONS` is explicitly shared by admitted clients and peers; silent
-or refused connections cannot reach it. Admin role still requires the existing
-admin token when configured. `tests/client_wire_admission.rs` drives the real
-listener, including client boundaries, mismatch, role and authentication checks.
+or refused connections cannot reach it. `tests/client_wire_admission.rs` drives
+the real listener (client boundaries, mismatch, role checks); the secret is
+covered against the real binary by `autumn-server`'s `tests/cluster_secret.rs`.
 New message-type numbers and enum variants
 (`POLICY_KIND_*`, `NODE_AUTO_STATE_*`) are **append-only**; existing numeric values
 are frozen so external controllers can introspect the binary's mapping
@@ -85,7 +87,7 @@ pub struct AutumnManager {
     etcd: Option<EtcdMirror>,    // optional etcd persistence + leader fence
     conn_pool: Rc<ConnPool>,     // extent-node RPCs
     // + inflight ledger, recovery limiter, node_states, policy engine,
-    //   lease registry, namespaces, tenant_accounts, admin_token, authz keyring …
+    //   lease registry, namespaces, tenant_accounts, authz keyring …
 }
 ```
 
@@ -229,19 +231,12 @@ leaderless-routing note below.
 
 ## Admin auth & KDC
 
-**Admin-token gating (opt-in).** `dispatch` calls
-`autumn_rpc::manager_rpc::is_admin_mgr_msg(msg_type)` to identify cluster-mutating
-ops. Enforcement is **opt-in**: a token-less manager (dev/test/bench/chaos, memory
-mode) runs them bare. When `--admin-token-file` is set, the payload MUST carry a
-matching length-prefixed token (`strip_admin_token` + constant-time
-`authz::ct_eq_secret`); the stripped remainder is what the real handler decodes.
-Zero wire-struct change. `is_admin_ps_msg` is the symmetric PS-side set (split /
-maintenance); when actuating those, the manager prefixes its own admin token via
-`admin_prefix_ps`.
-
-`handle_namespace_set_presplit` follows the same opt-in shape rather than
-fail-closed: it only *records* an operator-declared layout, and a token-less
-cluster must still be able to arm the merge guard.
+**Operator-only ops.** `autumn_rpc::manager_rpc::is_admin_mgr_msg` lists the ops
+served only on an Admin connection (cluster mutations, principal and namespace
+admin); `check_opcode` refuses them on a Peer connection, and an Admin
+connection must have proved the cluster secret (PEER_AUTH). There is no admin
+token: handlers take the bare request. The manager's own split / flush / gc
+calls to a PS go out over its Peer connection, authenticated the same way.
 
 **KDC keyring (`authz.rs`).** `AuthzKeyring` is the manager's Ed25519 signing
 keyring loaded from `--auth-signing-key-file`; **its mere presence = authz enabled**.
@@ -250,11 +245,11 @@ File format `<kid> <hex-32-byte-seed> [disabled]`, fail-loud on any malformed li
 tokens); `published()` publishes ALL kids incl. disabled so the PS learns to reject a
 disabled kid. The token codec/claims live in `autumn_rpc::cap_token` (shared
 signer/verifier). `credential_hash` = SHA-256; compares are constant-time
-(`ct_eq_32` / `ct_eq_secret`) to avoid timing/length oracles.
+(`ct_eq_32`) to avoid timing/length oracles.
 
 **Principal accounts.** `tenantAccount/<name>` → `persist::TenantAccountRecord
 {tenant, credential_hash, allowed_prefixes}` (a PERSISTED record with its own
-format version — see "Persisted records"; it has no wire twin at all); create/delete are admin-token-gated, etcd-first,
+format version — see "Persisted records"; it has no wire twin at all); create/delete are Admin-connection-only, etcd-first,
 leader-fenced, serialized on `tenant_admin_lock`. `MSG_PRINCIPAL_LIST` (`0x5A`,
 `handle_principal_list`) is leader-gated + read-only and returns
 `PrincipalRow{name, grants}` — dropping `credential_hash` is structural: an
@@ -1476,7 +1471,7 @@ The manager **no longer serves a web UI** — the old in-manager `dashboard.rs`
 (axum over `cyper_axum::serve` + `include_str!` HTML) is gone. The dashboard is
 now a standalone app, `crates/server/src/bin/autumn_dashboard` (the `autumn-dashboard` binary), which
 holds no cluster state and drives the cluster ONLY through `autumn-op` — so the
-wire schema stays in exactly one place. It requires `--admin-token[-file]` for upstream manager mutations; the dashboard HTTP port itself has no authentication.
+wire schema stays in exactly one place. It requires `--cluster-secret-file` (forwarded to autumn-op, which connects as an operator); the dashboard HTTP port itself has no authentication.
 
 What survives in this crate is `dashboard_compose.rs`: the pure `/api/overview`
 composer (df + nodes + partitions + ps_servers + amplification + advisories),
@@ -1704,7 +1699,7 @@ return EIO (never serve pre-close bytes). See `docs/autumn_fs_lease_plan.md`.
 
 Etcd string-keyed registry `namespace/<name>` → `persist::NamespaceRecord {name, prefix,
 owner_tenant, presplit, created_at}` (modelled 1:1 on the `tenantAccount/` DB):
-in-mem shadow, fail-loud replay, admin-token-gated create/delete (`MSG_NAMESPACE_CREATE`
+in-mem shadow, fail-loud replay, Admin-connection-only create/delete (`MSG_NAMESPACE_CREATE`
 `0x57` / `DELETE` `0x58`), etcd-first + leader-fenced, serialized on `namespace_admin_lock`.
 Built-in families `fs`/`kvc`/`mem` are CAS-preregistered by the first leader
 (`seed_builtin_namespaces`, `owner_tenant=None` = existence-only). Create rejects

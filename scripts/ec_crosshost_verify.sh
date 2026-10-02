@@ -25,7 +25,9 @@ EN0=30811            # local
 EN1=30812; EN2=30813 # remote
 
 rm -rf "$WD"; mkdir -p "$WD"/{en0,ps1}
-TOK="$WD/admin.token"; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$TOK"
+# One cluster secret for every server and autumn-op on both hosts.
+SECRET="$WD/cluster.secret"; RSECRET="$RWD/cluster.secret"
+( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$SECRET" )
 PIDS=()
 
 remote() { timeout 180 "$RUN" "$1" 2>&1; }
@@ -37,30 +39,33 @@ cleanup() {
   remote "pkill -f 'autumn-extent-node --data $RWD' 2>/dev/null; true" >/dev/null
 }
 trap cleanup EXIT
-OP(){ "$BIN/autumn-op" --manager "[$L6]:$MGR" --admin-token-file "$TOK" "$@"; }
+OP(){ "$BIN/autumn-op" --manager "[$L6]:$MGR" --cluster-secret-file "$SECRET" "$@"; }
 
 echo "=== ship v29 binaries to ::15 (its release tree is months stale) ==="
 remote "rm -rf $RWD/en1 $RWD/en2 && mkdir -p $RWD/bin $RWD/en1 $RWD/en2" >/dev/null
 scp -q -P 2222 "$BIN/autumn-extent-node" "$BIN/autumn-op" "root@[$R6]:$RWD/bin/" \
   || { echo "SCP FAIL"; exit 1; }
+scp -q -P 2222 "$SECRET" "root@[$R6]:$RSECRET" || { echo "SCP SECRET FAIL"; exit 1; }
 remote "cd $RWD/bin && ls -la autumn-extent-node | awk '{print \$5, \$9}' && ldd autumn-extent-node >/dev/null && echo ldd-ok"
 
 echo "=== manager on ::14 ==="
-"$BIN/autumn-manager-server" --port $MGR --listen "$L6" --admin-token-file "$TOK" \
+"$BIN/autumn-manager-server" --port $MGR --listen "$L6" --cluster-secret-file "$SECRET" \
   > "$WD/manager.log" 2>&1 & PIDS+=($!)
 sleep 3
 
 echo "=== format + start EN0 (::14), EN1/EN2 (::15) ==="
-"$BIN/autumn-op" --manager "[$L6]:$MGR" format "$WD/en0" > "$WD/format0.log" 2>&1 \
+OP format "$WD/en0" > "$WD/format0.log" 2>&1 \
   || { echo "FORMAT0 FAIL"; cat "$WD/format0.log"; exit 1; }
 "$BIN/autumn-extent-node" --data "$WD/en0" --port $EN0 --manager "[$L6]:$MGR" \
-  --listen "$L6" --advertise "[$L6]:$EN0" --cpuset 100 > "$WD/en0.log" 2>&1 & PIDS+=($!)
+  --listen "$L6" --advertise "[$L6]:$EN0" --cpuset 100 --cluster-secret-file "$SECRET" \
+  > "$WD/en0.log" 2>&1 & PIDS+=($!)
 
 for i in 1 2; do
   p=$([ $i = 1 ] && echo $EN1 || echo $EN2)
-  remote "cd $RWD && ./bin/autumn-op --manager '[$L6]:$MGR' format $RWD/en$i > $RWD/format$i.log 2>&1 && echo FORMAT$i-OK" | tail -1
+  remote "cd $RWD && ./bin/autumn-op --manager '[$L6]:$MGR' --cluster-secret-file $RSECRET format $RWD/en$i > $RWD/format$i.log 2>&1 && echo FORMAT$i-OK" | tail -1
   remote "cd $RWD && setsid nohup ./bin/autumn-extent-node --data $RWD/en$i --port $p \
       --manager '[$L6]:$MGR' --listen '$R6' --advertise '[$R6]:$p' --cpuset $((100+i)) \
+      --cluster-secret-file $RSECRET \
       > $RWD/en$i.log 2>&1 < /dev/null & sleep 1; echo EN$i-STARTED" | tail -1
 done
 sleep 4
@@ -71,7 +76,7 @@ echo "=== bootstrap RF1 + log-ec 2+1 ==="
 OP bootstrap --replication 1+0 --log-ec 2+1 > "$WD/bootstrap.log" 2>&1 \
   || { echo BOOTSTRAP-FAIL; cat "$WD/bootstrap.log"; exit 1; }
 "$BIN/autumn-ps" --psid 1 --port $PS --manager "[$L6]:$MGR" --data "$WD/ps1" \
-  --listen "$L6" --advertise "[$L6]:$PS" > "$WD/ps.log" 2>&1 & PIDS+=($!)
+  --listen "$L6" --advertise "[$L6]:$PS" --cluster-secret-file "$SECRET" > "$WD/ps.log" 2>&1 & PIDS+=($!)
 sleep 4
 
 PID=$(OP --json info 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin)["partitions"][0]["part_id"])' 2>/dev/null)
@@ -129,11 +134,13 @@ for q in $(pgrep -f "autumn-extent-node --data $WD/en0"); do kill "$q" 2>/dev/nu
 remote "pkill -f 'autumn-extent-node --data $RWD' 2>/dev/null; true" >/dev/null
 sleep 2
 "$BIN/autumn-extent-node" --data "$WD/en0" --port $EN0 --manager "[$L6]:$MGR" \
-  --listen "$L6" --advertise "[$L6]:$EN0" --cpuset 100 > "$WD/en0.restart.log" 2>&1 & PIDS+=($!)
+  --listen "$L6" --advertise "[$L6]:$EN0" --cpuset 100 --cluster-secret-file "$SECRET" \
+  > "$WD/en0.restart.log" 2>&1 & PIDS+=($!)
 for i in 1 2; do
   p=$([ $i = 1 ] && echo $EN1 || echo $EN2)
   remote "cd $RWD && setsid nohup ./bin/autumn-extent-node --data $RWD/en$i --port $p \
       --manager '[$L6]:$MGR' --listen '$R6' --advertise '[$R6]:$p' --cpuset $((100+i)) \
+      --cluster-secret-file $RSECRET \
       > $RWD/en$i.restart.log 2>&1 < /dev/null & sleep 1; echo EN$i-RESTARTED" | tail -1
 done
 echo "--- waiting for all 3 ENs to come back Online ---"

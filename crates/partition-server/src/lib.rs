@@ -5668,54 +5668,6 @@ fn authz_now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// (PS slice): gate a cluster-mutating PS op (split /
-/// maintenance) on the admin token AND strip the token prefix so the handler
-/// decodes the bare request. Returns `Some(reject frame)` to refuse, `None` to
-/// allow — and on allow, `payload` has had any admin prefix removed.
-///
-/// OPT-IN, exactly like the manager slice: when the manager configured no admin
-/// token, `snap.admin_token` is empty and this is a no-op, so a token-less
-/// cluster (dev/test/chaos) runs split/gc/compact/flush BARE. When a token IS
-/// present the payload MUST carry a matching prefix — from `autumn-op` (operator)
-/// OR from the MANAGER itself (its controller drives split + gc/compact and merge
-/// drives flush; those manager→PS calls prefix `self.admin_token`).
-fn admin_ps_gate_and_strip(
-    msg_type: u8,
-    payload: &mut Bytes,
-    req_id: u32,
-    authz: &crate::authz::AuthzState,
-) -> Option<Bytes> {
-    if !partition_rpc::is_admin_ps_msg(msg_type) {
-        return None;
-    }
-    let snap = authz.snapshot();
-    if snap.admin_token.is_empty() {
-        return None; // unconfigured → run bare (opt-in)
-    }
-    let reject = |m: &str| -> Option<Bytes> {
-        Some(
-            Frame::error(
-                req_id,
-                msg_type,
-                autumn_rpc::RpcError::encode_status(StatusCode::FailedPrecondition, m),
-            )
-            .encode(),
-        )
-    };
-    let Some((got, rest)) = autumn_rpc::manager_rpc::strip_admin_token(payload) else {
-        return reject(
-            "admin op requires an admin token (malformed or missing prefix) — pass \
-             --admin-token-file to autumn-op",
-        );
-    };
-    if !crate::authz::ct_eq_bytes(got, &snap.admin_token) {
-        return reject("admin token invalid");
-    }
-    // Verified — hand the handler the bare request.
-    *payload = payload.slice_ref(rest);
-    None
-}
-
 /// The two things this connection learned about itself, carried together so a
 /// third costs nothing and so no call site can thread one and forget the other.
 ///
@@ -5769,13 +5721,8 @@ fn authz_gate(
                 Frame::response(req_id, MSG_AUTH_HELLO, partition_rpc::rkyv_encode(&resp)).encode(),
             );
         }
-        // Bound the UNAUTHENTICATED AUTH_HELLO payload BEFORE the outer rkyv
-        // decode (coco P2): a legit token is <= MAX_CAP_TOKEN_LEN (8 KiB) plus a
-        // tiny rkyv envelope, so 16 KiB is generous. Without this cap the outer
-        // `rkyv_decode::<AuthHelloReq>` would copy/allocate an attacker-sized
-        // token before verify_token's own 8 KiB cap could reject it.
-        const AUTH_HELLO_MAX_PAYLOAD: usize = 16 * 1024;
-        if payload.len() > AUTH_HELLO_MAX_PAYLOAD {
+        // Bound the UNAUTHENTICATED payload before the rkyv decode.
+        if payload.len() > partition_rpc::AUTH_HELLO_MAX_PAYLOAD {
             let resp = AuthHelloResp {
                 code: StatusCode::InvalidArgument as u8,
                 message: "AUTH_HELLO too large".to_string(),
@@ -5887,7 +5834,7 @@ fn push_one_frame_to_inflight(
     use futures::FutureExt;
     let req_id = frame.req_id;
     let msg_type = frame.msg_type;
-    let mut payload = frame.payload;
+    let payload = frame.payload;
     // v28: a value-separable request (MSG_PUT_BULK) arrives with its raw value
     // split off by the decoder; thread it into the delegate as bulk_value so
     // enqueue_put_bulk uses it directly (payload = [meta][key] only).
@@ -5903,12 +5850,6 @@ fn push_one_frame_to_inflight(
     // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
     // ready completion; it never reaches serve/delegate.
     if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, conn) {
-        inflight.push(async move { (reply, Vec::new()) }.boxed_local());
-        return;
-    }
-    // (PS slice): gate + strip the admin prefix off split /
-    // maintenance BEFORE part-id extraction (the prefix would misroute otherwise).
-    if let Some(reply) = admin_ps_gate_and_strip(msg_type, &mut payload, req_id, authz) {
         inflight.push(async move { (reply, Vec::new()) }.boxed_local());
         return;
     }
@@ -6073,6 +6014,14 @@ async fn handle_ps_connection(
         &mut reader,
         &mut writer,
         autumn_rpc::version_hello::Service::PartitionServer,
+        &peer_label,
+    )
+    .await?;
+    autumn_rpc::peer_auth::accept(
+        &mut reader,
+        &mut writer,
+        &protocol,
+        autumn_rpc::peer_auth::installed(),
         &peer_label,
     )
     .await?;
@@ -14021,7 +13970,6 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             public_keys: Vec::new(),
             protected_prefixes: Vec::new(),
             namespaces: vec![b"fs/".to_vec()],
-            admin_token: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
             cluster_id: "perf-test".to_string(),
@@ -14176,7 +14124,6 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                     public_keys: Vec::new(),
                     protected_prefixes: Vec::new(),
                     namespaces: vec![b"other/".to_vec()],
-                    admin_token: Vec::new(),
                     token_ttl_secs: 3600,
                     clock_skew_secs: 60,
                     cluster_id: "perf-test".to_string(),
@@ -15184,7 +15131,6 @@ mod authz_enforcement_tests {
             }],
             protected_prefixes: vec![b"mem/".to_vec()],
             namespaces: Vec::new(),
-            admin_token: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
             cluster_id: "cluster-test".to_string(),
@@ -15214,7 +15160,6 @@ mod authz_enforcement_tests {
             }],
             protected_prefixes: vec![b"mem/".to_vec()],
             namespaces: vec![b"fs/".to_vec(), b"mem/".to_vec()],
-            admin_token: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
             cluster_id: "cluster-test".to_string(),

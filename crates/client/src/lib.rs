@@ -930,12 +930,6 @@ pub struct ClusterClient {
     /// surfaces as `ConnectionError`; the existing `mgr_call_retry`
     /// path's `rotate_manager` then walks to the next manager address.
     rpc_timeout: Cell<Option<Duration>>,
-    /// shared admin secret for cluster-mutating manager ops
-    /// (fence/remove/merge/create-stream/…). When set, `mgr_call*` prefix it
-    /// onto the payload of an `is_admin_mgr_msg` (`[u32 len][token][payload]`)
-    /// and the manager strips + verifies. `None` = don't prefix (the manager
-    /// opt-in means a token-less manager runs these bare anyway).
-    admin_token: RefCell<Option<Vec<u8>>>,
     /// Bug #2 fix (2026-06-06) — first-attempt timeout for
     /// `call_ps_for_key` / `call_ps_for_part`. See
     /// `DEFAULT_FIRST_ATTEMPT_TIMEOUT` for the rationale. `None`
@@ -1145,30 +1139,7 @@ impl ClusterClient {
     /// surfaces as a transport error; `mgr_call_retry`'s
     /// `rotate_manager` walks to the next manager address on the next
     /// attempt.
-    /// set the admin secret used to authorize cluster-mutating
-    /// manager ops. `autumn-op` calls this once at connect when `--admin-token-file`
-    /// is given; read-only commands are unaffected (the server only gates
-    /// `is_admin_mgr_msg`).
-    pub fn set_admin_token(&self, token: Vec<u8>) {
-        *self.admin_token.borrow_mut() = Some(token);
-    }
-
-    /// Prefix the admin token onto an `is_admin_mgr_msg` payload when a token is
-    /// set; otherwise return the payload untouched. One choke point for all
-    /// three `mgr_call*` variants (leader/retry both funnel through `mgr_call`) so a
-    /// key is prefixed EXACTLY once per request.
-    fn maybe_prefix_admin(&self, msg_type: u8, payload: Bytes) -> Bytes {
-        if !autumn_rpc::manager_rpc::is_admin_mgr_msg(msg_type) {
-            return payload;
-        }
-        match self.admin_token.borrow().as_ref() {
-            Some(tok) => autumn_rpc::manager_rpc::prefix_admin_token(tok, &payload),
-            None => payload,
-        }
-    }
-
     pub async fn mgr_call(&self, msg_type: u8, payload: Bytes) -> Result<Bytes> {
-        let payload = self.maybe_prefix_admin(msg_type, payload);
         let client = self.mgr_client().await?;
         let outcome = match self.rpc_timeout.get() {
             None => client.call(msg_type, payload).await,
@@ -1350,10 +1321,8 @@ impl ClusterClient {
         &self,
         principal: &str,
         allowed_prefixes: Vec<Vec<u8>>,
-        admin_token: &str,
     ) -> Result<Vec<u8>> {
         let req = rkyv_encode(&TenantCreateReq {
-            admin_token: admin_token.to_string(),
             tenant: principal.to_string(),
             allowed_prefixes,
         });
@@ -1378,9 +1347,8 @@ impl ClusterClient {
     }
 
     /// delete a principal account (admin). Leader-only.
-    pub async fn principal_delete(&self, principal: &str, admin_token: &str) -> Result<()> {
+    pub async fn principal_delete(&self, principal: &str) -> Result<()> {
         let req = rkyv_encode(&TenantDeleteReq {
-            admin_token: admin_token.to_string(),
             tenant: principal.to_string(),
         });
         let managers = self.manager_addrs.len().max(1) as u32;
@@ -1411,10 +1379,8 @@ impl ClusterClient {
         name: &str,
         owner_tenant: Option<String>,
         presplit: Vec<Vec<u8>>,
-        admin_token: &str,
     ) -> Result<()> {
         let req = rkyv_encode(&NamespaceCreateReq {
-            admin_token: admin_token.to_string(),
             name: name.to_string(),
             owner_tenant,
             presplit,
@@ -1442,9 +1408,8 @@ impl ClusterClient {
     /// D2: delete a namespace registry row (admin). Leader-only. The
     /// non-empty guard (`--force`) is enforced by the CALLER (autumn-op scans
     /// the prefix); this only drops the registry row.
-    pub async fn namespace_delete(&self, name: &str, admin_token: &str) -> Result<()> {
+    pub async fn namespace_delete(&self, name: &str) -> Result<()> {
         let req = rkyv_encode(&NamespaceDeleteReq {
-            admin_token: admin_token.to_string(),
             name: name.to_string(),
         });
         let managers = self.manager_addrs.len().max(1) as u32;
@@ -1492,16 +1457,15 @@ impl ClusterClient {
 
     /// step 4: record the split points a presplit actually
     /// applied onto an EXISTING namespace row, so `merge` refuses to undo them.
-    /// UNIONs with whatever is already recorded (never replaces). Admin-gated.
+    /// UNIONs with whatever is already recorded (never replaces). Admin connection
+    /// only.
     pub async fn namespace_set_presplit(
         &self,
         name: &str,
         points: Vec<Vec<u8>>,
-        admin_token: &str,
     ) -> Result<()> {
         let managers = self.manager_addrs.len().max(1) as u32;
         let req = rkyv_encode(&NamespaceSetPresplitReq {
-            admin_token: admin_token.to_string(),
             name: name.to_string(),
             points,
         });
@@ -1614,8 +1578,9 @@ impl ClusterClient {
 
     /// `connect_raw` declaring the ADMIN role: every opcode of each service,
     /// at exact `WIRE_VERSION` equality. For operator tooling (`autumn-op`).
-    /// The role is a declaration, not a credential — the admin token and authz
-    /// still apply.
+    /// Every connection it opens must prove the cluster secret installed in
+    /// this process (`autumn_rpc::peer_auth::install`); servers refuse it
+    /// otherwise.
     pub async fn connect_admin(manager: &str) -> Result<Self> {
         Self::connect_with_role(
             manager,
@@ -1627,6 +1592,7 @@ impl ClusterClient {
 
     /// `connect_raw` declaring the PEER role (cluster members: the extent
     /// node's startup calls). Exact `WIRE_VERSION` equality; no admin opcodes.
+    /// Proves the installed cluster secret, as `connect_admin` does.
     pub async fn connect_peer(manager: &str) -> Result<Self> {
         Self::connect_with_role(
             manager,
@@ -1659,7 +1625,6 @@ impl ClusterClient {
             ps_details: RefCell::new(HashMap::new()),
             part_addrs: RefCell::new(HashMap::new()),
             rpc_timeout: Cell::new(Some(DEFAULT_RPC_TIMEOUT)),
-            admin_token: RefCell::new(None),
             first_attempt_timeout: Cell::new(Some(DEFAULT_FIRST_ATTEMPT_TIMEOUT)),
             auth: RefCell::new(None),
             auth_gen: Cell::new(0),
@@ -1926,6 +1891,7 @@ impl ClusterClient {
         // Bump the identity generation + drop cached PS conns so they rebind.
         self.auth_gen.set(self.auth_gen.get().wrapping_add(1));
         self.ps_conns.borrow_mut().clear();
+        self.en_pool.set_auth_token(None);
     }
 
     /// connect a SCOPED client + set its authz credential
@@ -2050,6 +2016,9 @@ impl ClusterClient {
         if renewed {
             self.ps_conns.borrow_mut().clear();
         }
+        // Direct reads present the same token to the EN; a new one rebinds the
+        // pooled EN connections too.
+        self.en_pool.set_auth_token(Some(Bytes::from(token.clone())));
         Ok(token)
     }
 
@@ -2527,17 +2496,9 @@ impl ClusterClient {
     /// Resolve part_id to ps_addr, call PS, retry with TiKV-style
     /// backoff on failure.
     ///
-    /// fix-2: same retry shape as `call_ps_for_key`. Admin ops
-    /// (split/compact/gc/flush) don't carry `region_epoch` on the
-    /// wire, but they CAN race the same post-split topology change
-    /// window — e.g. `compact <new_part_id>` issued immediately
-    /// after split can land while the new partition's part_addr
-    /// isn't registered yet.
     /// `call_ps_for_part` for a multi-value bulk request. Same routing,
     /// refresh and deterministic-error rules; the only difference is that the
-    /// values travel as their own iovecs instead of inside `payload`. Not
-    /// admin-gated — `MSG_BATCH_PUT_BULK` is a data-plane write, so there is no
-    /// admin-token prefix to apply.
+    /// values travel as their own iovecs instead of inside `payload`.
     async fn call_ps_for_part_bulk(
         &self,
         part_id: u64,
@@ -2545,7 +2506,6 @@ impl ClusterClient {
         ctrl: Bytes,
         values: Vec<Bytes>,
     ) -> std::result::Result<Bytes, AutumnError> {
-        debug_assert!(!autumn_rpc::partition_rpc::is_admin_ps_msg(msg_type));
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
         while attempt <= MAX_PS_REFRESHES {
@@ -2663,23 +2623,18 @@ impl ClusterClient {
         ))
     }
 
+    /// fix-2: same retry shape as `call_ps_for_key`. Admin ops
+    /// (split/compact/gc/flush) don't carry `region_epoch` on the
+    /// wire, but they CAN race the same post-split topology change
+    /// window — e.g. `compact <new_part_id>` issued immediately
+    /// after split can land while the new partition's part_addr
+    /// isn't registered yet.
     async fn call_ps_for_part(
         &self,
         part_id: u64,
         msg_type: u8,
         payload: Bytes,
     ) -> std::result::Result<Bytes, AutumnError> {
-        // (PS slice): split / maintenance (gc/compact/forcegc/
-        // flush) are admin-gated at the PS when a token is configured — prefix
-        // it once here (before the retry loop; the loop re-clones this payload).
-        let payload = if autumn_rpc::partition_rpc::is_admin_ps_msg(msg_type) {
-            match self.admin_token.borrow().as_ref() {
-                Some(tok) => autumn_rpc::manager_rpc::prefix_admin_token(tok, &payload),
-                None => payload,
-            }
-        } else {
-            payload
-        };
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
         while attempt <= MAX_PS_REFRESHES {
@@ -3492,8 +3447,9 @@ impl ClusterClient {
                 tracing::warn!(
                     extent_id = resp.extent_id,
                     replicas = n,
-                    "direct-read fell back to PS proxy (ENs not client-reachable?) — \
-                     large reads use the proxy path; pass direct_read=false to disable"
+                    "direct-read fell back to PS proxy (ENs not client-reachable, or an \
+                     authz-on EN refused this connection's credential?) — large reads use \
+                     the proxy path; pass direct_read=false to disable"
                 );
             } else {
                 tracing::debug!(
@@ -5699,7 +5655,6 @@ mod first_attempt_timeout_tests {
                 ps_details: RefCell::new(HashMap::new()),
                 part_addrs: RefCell::new(HashMap::new()),
                 rpc_timeout: Cell::new(rpc),
-                admin_token: RefCell::new(None),
                 first_attempt_timeout: Cell::new(first),
                 auth: RefCell::new(None),
                 auth_gen: Cell::new(0),

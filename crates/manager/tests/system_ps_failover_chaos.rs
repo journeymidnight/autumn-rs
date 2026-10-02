@@ -68,6 +68,8 @@ impl PsProc {
     fn spawn(psid: u64, mgr: std::net::SocketAddr) -> Self {
         let addr = pick_addr();
         let child = Command::new(ps_binary())
+        .arg("--cluster-secret-file")
+        .arg(support::cluster_secret_file())
             .arg("--psid")
             .arg(psid.to_string())
             .arg("--port")
@@ -99,6 +101,8 @@ impl PsProc {
     fn respawn(&mut self, mgr: std::net::SocketAddr) {
         assert!(self.child.is_none(), "respawn over a live child");
         let child = Command::new(ps_binary())
+        .arg("--cluster-secret-file")
+        .arg(support::cluster_secret_file())
             .arg("--psid")
             .arg(self.psid.to_string())
             .arg("--port")

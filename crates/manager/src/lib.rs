@@ -1001,9 +1001,6 @@ pub struct AutumnManager {
     /// material), loaded once from `--auth-signing-key-file`. `None` = authz
     /// disabled (opt-in; fuse/kvcache/dev unaffected). Set at startup only.
     pub(crate) authz_keyring: Rc<RefCell<Option<crate::authz::AuthzKeyring>>>,
-    /// admin token gating the tenant-create/delete RPCs
-    /// (admin_auth_design.md Option A). `None` = those admin RPCs are refused.
-    pub(crate) admin_token: Rc<RefCell<Option<String>>>,
     /// key prefixes under which the PS applies default-DENY (e.g.
     /// `mem/`). Published in `GET_AUTHZ_CONFIG`. Each ends with `/`.
     pub(crate) protected_prefixes: Rc<RefCell<Vec<Vec<u8>>>>,
@@ -1125,7 +1122,6 @@ impl AutumnManager {
             ))),
             // authz OFF unless the binary loads a signing-key file.
             authz_keyring: Rc::new(RefCell::new(None)),
-            admin_token: Rc::new(RefCell::new(None)),
             protected_prefixes: Rc::new(RefCell::new(Vec::new())),
             token_ttl_secs: Rc::new(Cell::new(3600)),
             clock_skew_secs: Rc::new(Cell::new(60)),
@@ -1162,27 +1158,6 @@ impl AutumnManager {
     /// `--auth-signing-key-file`). Its presence ENABLES data-plane authz.
     pub fn set_authz_keyring(&self, keyring: crate::authz::AuthzKeyring) {
         *self.authz_keyring.borrow_mut() = Some(keyring);
-    }
-
-    /// set the admin token gating tenant-create/delete
-    /// (`--admin-token`). Without it those admin RPCs are refused.
-    pub fn set_admin_token(&self, token: String) {
-        *self.admin_token.borrow_mut() = Some(token);
-    }
-
-    /// (PS slice): prefix the manager's admin token onto a
-    /// payload bound for a PS `is_admin_ps_msg` (split / maintenance). The
-    /// manager DRIVES those ops itself — the auto-policy controller's split +
-    /// gc/compact and merge's flush are manager→PS calls — so with the PS gate
-    /// on (the manager configured a token, which the PS learns via
-    /// GetAuthzConfigResp), the manager must authenticate exactly like an
-    /// operator's autumn-op. No token configured → unchanged payload (the PS
-    /// gate is off too, so it runs bare).
-    fn admin_prefix_ps(&self, payload: bytes::Bytes) -> bytes::Bytes {
-        match self.admin_token.borrow().as_ref() {
-            Some(tok) => autumn_rpc::manager_rpc::prefix_admin_token(tok.as_bytes(), &payload),
-            None => payload,
-        }
     }
 
     /// set the protected (default-DENY) key prefixes
@@ -1863,9 +1838,6 @@ impl AutumnManager {
             })
             .ok_or_else(|| anyhow::anyhow!("no address for part {part_id}"))?;
         let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
-        // (PS slice): authenticate the manager's own maintenance
-        // call so the PS gate (when a token is configured) admits it.
-        let payload = self.admin_prefix_ps(payload);
         let resp_bytes = self
             .conn_pool
             .call_timeout(
@@ -2467,9 +2439,6 @@ impl AutumnManager {
                 // point an intra-lane cut is exactly what's wanted.
                 at_key,
             });
-        // (PS slice): the controller's auto-split is a manager→PS
-        // MSG_SPLIT_PART, gated by the PS — prefix the manager's admin token.
-        let payload = self.admin_prefix_ps(payload);
         // 60 s — split has to flush memtable + commit_length × 3 + a
         // manager round-trip. PS-side flush can take a few seconds
         // under contention, but anything > 60 s is a real wedge worth

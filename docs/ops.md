@@ -7,6 +7,7 @@ see [`README.md`](../README.md); for architecture see [`CLAUDE.md`](../CLAUDE.md
 and the per-crate `crates/*/CLAUDE.md`.
 
 - [Binaries & ports](#binaries--ports)
+- [Cluster secret](#cluster-secret)
 - [Fuse daemon runbook](#fuse-daemon-runbook)
 - [Cluster capacity — `autumn-op df`](#cluster-capacity--autumn-op-df)
 - [Prometheus /metrics](#prometheus-metrics)
@@ -83,6 +84,86 @@ plain commands.
 Python `python/dashboard/` was retired 2026-07-04 — folded into the manager; see
 "Web dashboard + auto-policy controller" below.)
 
+## Cluster secret
+
+Every manager, PS and extent node must be started with the same
+`--cluster-secret-file <PATH>`; without it the binary exits at once (exit 2,
+`--cluster-secret-file is required`). A connection that declares itself a
+cluster member (Peer) or an operator tool (Admin) proves it holds the secret
+right after VERSION_HELLO (PEER_AUTH, HMAC challenge-response, both ways); a
+connection that cannot is closed before any request is read. Clients (SDK, fuse,
+kvcache, S3 gateway, `autumn-client`) never hold it — they authenticate with a
+data-plane credential when authz is on. Design: `docs/cluster_secret_design.md`.
+
+**autumn-op connects as an operator, so every command that talks to a cluster
+needs `--cluster-secret-file`** (before or after the subcommand), read-only ones
+included. The examples in this manual leave it out, and often `--manager` too:
+
+```bash
+DR=${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}       # cluster.sh keeps the secret in $DR/cluster.secret
+AO=(autumn-op --cluster-secret-file "$DR/cluster.secret" --manager 127.0.0.1:9001)
+"${AO[@]}" info
+```
+
+The admin token is gone: operator-only manager RPCs (fence / remove / merge /
+bootstrap / principal / namespace / presplit / op-submit …) are served only on
+an Admin connection, and an Admin connection exists only with the secret.
+`--admin-token` / `--admin-token-file` are refused by name on the manager and
+autumn-op (autumn-dashboard rejects them as unknown flags).
+
+**Generate and distribute:**
+
+```bash
+autumn-op gen-cluster-secret > cluster.secret      # 64 hex chars; needs no cluster
+chmod 600 cluster.secret                            # same file on every node and operator host
+autumn-manager-server --cluster-secret-file cluster.secret …
+autumn-extent-node    --cluster-secret-file cluster.secret …
+autumn-ps             --cluster-secret-file cluster.secret …
+```
+
+`cluster.sh` generates `$DATA_ROOT/cluster.secret` on first start (or uses
+`AUTUMN_CLUSTER_SECRET_FILE`) and passes it everywhere; `reset` wipes it with the
+data root.
+
+**Verify** (dev cluster; each step must hold):
+
+```bash
+bash cluster.sh reset 3
+DR=${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}
+autumn-op --manager 127.0.0.1:9001 info              # refused: "... requires the cluster secret;
+                                                     #  start this process with --cluster-secret-file"
+autumn-op --cluster-secret-file "$DR/cluster.secret" --manager 127.0.0.1:9001 info   # works
+autumn-op gen-cluster-secret > /tmp/wrong.secret
+autumn-op --cluster-secret-file /tmp/wrong.secret --manager 127.0.0.1:9001 info      # refused:
+                                                     #  "... the two hold different secrets"
+grep "PEER_AUTH refused" /tmp/autumn-rs-logs/manager.log   # the refusal, with the caller's address
+```
+
+A server logs every refusal at WARN with the caller's address, declared role and
+service: `PEER_AUTH refused a connection holding a different cluster secret` (a
+process configured with another secret) and `PEER_AUTH: connection gave no
+cluster-secret proof` (a process with none, which gives up after the challenge).
+Grep both to find a misconfigured process after a rollout.
+
+`cargo test -p autumn-server --test cluster_secret` runs the same checks against
+the real binaries (manager and EN, Peer and Admin, no / wrong / right secret).
+
+**Upgrading a cluster that used the admin token** is a stop-the-world change
+(wire 52, and every Peer/Admin connection now runs PEER_AUTH):
+
+1. Generate one secret and put it on every manager, PS, EN and operator host
+   (in k8s: the `autumn-cluster-secret` Secret, see `docs/k8s_deploy.md`).
+2. Stop everything. Replace the binaries, `autumn-op` and `autumn-dashboard`.
+3. Start with `--cluster-secret-file` on every server; drop `--admin-token[-file]`
+   from the manager, autumn-op and dashboard command lines (they are refused).
+4. Embedded clients inside the client window keep working. On a cluster with
+   authz on, a client built before this change does not send AUTH_HELLO to the
+   EN, so its direct reads fall back to the PS proxy (slower, still correct)
+   until it is rebuilt.
+
+**Rotation** needs a full stop as well: a process knows one secret. Replace the
+file everywhere, then restart everything.
+
 ## Async ops (op-ledger)
 
 The seven long-running ops — `split` / `merge` / `rebalance` / `compact` / `gc` /
@@ -148,7 +229,7 @@ turns suspected and the merge's new log tail cannot be placed:
 
 ```bash
 DR=${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}
-AO=(autumn-op --admin-token-file "$DR/authz/admin.token")   # before the subcommand
+AO=(autumn-op --cluster-secret-file "$DR/cluster.secret")
 EN=$(cat "$DR/pids/node2.pid")
 kill -STOP $EN; "${AO[@]}" split <PID>         # or: merge <S> <V>; prints "submitted … op <ID>"
 "${AO[@]}" ops status <ID>                     # sits at 1/6 or 2/6 (merge: 1/4) while stopped
@@ -254,9 +335,9 @@ Presets (safest → most aggressive): `gc-only`, `maintenance`, `space-reclaim`,
 The dashboard is a separate process built by the `autumn-server` package,
 `crates/server/src/bin/autumn_dashboard` (the `autumn-dashboard` binary), which holds no cluster
 state and drives the cluster ONLY through `autumn-op` (so the wire schema stays
-in one place). The admin token is required for manager mutations and forwarded
-to every `autumn-op` call; read-only views ignore it, mutations (per-target Apply
-buttons + auto-policy activate/deactivate) use it.
+in one place). It requires `--cluster-secret-file` and forwards the path to every
+`autumn-op` call (autumn-op connects as an operator, which the manager refuses
+without the secret, read-only calls included).
 
 ```bash
 # Build both formal server binaries.
@@ -264,7 +345,7 @@ cargo build -p autumn-server --bin autumn-dashboard --bin autumn-op
 # autumn-op must be on PATH (or pass --autumn-op /path/to/autumn-op).
 autumn-dashboard \
   --manager 127.0.0.1:9001 \
-  --admin-token-file /etc/autumn/admin.token \
+  --cluster-secret-file /etc/autumn/cluster.secret \
   --port 8799                        # → http://<host>:8799/
 
 # k8s (vke overlay ships it as its own Deployment + internal ClusterIP):
@@ -353,8 +434,8 @@ autumn-op auto-policy status                         # → STILL mode=armed acti
 ```
 
 **HTTP access:** the dashboard has no per-request authentication or TLS.
-Anyone who can reach it can submit controls using the server's admin token;
-that token protects the manager RPC, not the dashboard caller. The VKE overlay
+Anyone who can reach it can submit controls with the cluster secret the
+dashboard holds; the secret protects the manager RPC, not the dashboard caller. The VKE overlay
 also publishes all paths through APIG Ingress, so its ClusterIP Service does
 not imply private access. Preserve network controls or bind `--listen 127.0.0.1`
 and tunnel. HTTP authentication is an existing non-goal retained in this move.
@@ -933,7 +1014,7 @@ original incident (3.12 GiB dead in 16.00 GiB = 0.195):
 ```bash
 # Default everything, including the 16 GiB extent seal size.
 AUTUMN_DATA_ROOT=/data05/autumn-gcverify bash cluster.sh reset 3
-AO=(autumn-op --manager 127.0.0.1:9001 --admin-token-file <DATA_ROOT>/authz/admin.token)
+AO=(autumn-op --manager 127.0.0.1:9001 --cluster-secret-file <DATA_ROOT>/cluster.secret)
 AC=(autumn-client --manager 127.0.0.1:9001 --namespace bench)
 
 # 14 x 1.2 GiB seals the first log extent at 16.0 GB.
@@ -980,7 +1061,7 @@ compaction then keeps no entry, and its discards must still reach GC:
 
 ```bash
 AUTUMN_DATA_ROOT=/data05/<scratch> AUTUMN_EXTENT_BASE_PORT=21000 bash cluster.sh reset 3
-AO=(autumn-op --manager 127.0.0.1:9001 --admin-token-file <DATA_ROOT>/authz/admin.token)
+AO=(autumn-op --manager 127.0.0.1:9001 --cluster-secret-file <DATA_ROOT>/cluster.secret)
 AC=(autumn-client --manager 127.0.0.1:9001 --namespace bench)
 
 head -c $((64<<20)) /dev/urandom > /tmp/v64
@@ -1826,7 +1907,7 @@ Two pieces of state, different jobs:
 
 ```bash
 # Declare 24 lanes and cut 6 partitions (6 divides 24 → 4 lanes each).
-$AO presplit --namespace fs --lanes 24 --parts 6      --admin-token-file $DATA_ROOT/authz/admin.token
+$AO presplit --namespace fs --lanes 24 --parts 6
 # → declared fs stripe geometry: 24 lanes × 8 MiB units
 # → presplit /fs: 5/5 cut points applied
 
@@ -1842,8 +1923,7 @@ land only partially (`has_overlap`) if you load first.
 
 ### Declared boundaries: split there first, never merge there
 
-`--admin-token[-file]` records the intended cut points on the namespace registry
-row. That record drives BOTH halves of a symmetric rule:
+`presplit` records the intended cut points on the namespace registry row. That record drives BOTH halves of a symmetric rule:
 
 * **merge refuses** to erase a declared boundary (`--force` to override). This
   matters because an EMPTY lane partition is a perfect auto-merge candidate
@@ -1921,8 +2001,8 @@ $AO principal-list
 $AO principal-list --json     # [{"name":"fs","grants":["fs/"]}, ...]
 ```
 
-Read-only and leader-routed (rotates on NOT_LEADER), so it needs **no**
-`--admin-token`. It never prints credential material: the response row type
+Read-only and leader-routed (rotates on NOT_LEADER). It never prints credential
+material: the response row type
 carries only `(name, grants)` — `credential_hash` is not a field on it, so there
 is no flag or future edit that can make it leak. A lost credential is re-minted
 (`principal-create` again, which rotates), never recovered.
@@ -2043,12 +2123,12 @@ authz-off, anonymous, zero hot-path cost).
 ### Turnkey dev cluster with authz (`AUTUMN_AUTH=1`)
 
 `cluster.sh` auto-provisions the whole authz bring-up so the examples work
-end-to-end. `AUTUMN_AUTH=1` generates a signing key + admin token under
+end-to-end. `AUTUMN_AUTH=1` generates a signing key under
 `$DATA_ROOT/authz/`, registers the `gallery` namespace, and mints credentials
 for `fs/`, `kvc/` and `gallery/`:
 
 ```bash
-AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,admin.token,fs.cred,kvc.cred,gallery.cred}
+AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,fs.cred,kvc.cred,gallery.cred}
 
 # gallery (gallery/gallery/, protected) — Scoped client, credential via env:
 AUTUMN_CREDENTIAL_FILE=/tmp/autumn-rs/authz/gallery.cred \
@@ -2060,33 +2140,32 @@ The example binds its namespace scope and authenticates through
 scope with `AUTUMN_NAMESPACE` / `AUTUMN_TENANT`.
 
 ```bash
-# 1) Generate a signing key (LOCAL, no cluster needed) + an admin token file:
+# 1) Generate a signing key (LOCAL, no cluster needed):
 ./target/release/autumn-op gen-signing-key --kid 1 > /path/signing.key
-printf '%s' "$(openssl rand -hex 24)" > /path/admin.token
 
 # 2) Start the cluster with authz enabled (cluster.sh env→flag translation;
 #    protected prefixes default to mem/ when unset):
 AUTUMN_AUTH_SIGNING_KEY_FILE=/path/signing.key \
-AUTUMN_ADMIN_TOKEN_FILE=/path/admin.token \
   bash cluster.sh start 4
 
 # 3) Create a PRINCIPAL (admin; credential printed ONCE as principal:/credential:
 #    two lines — redirect straight to a credential file).
 #    Keys are ns-first `{ns}/…` (no tenant); a grant is a whole namespace (`fs/`)
 #    or an in-namespace sub-prefix (`mem/acme/`):
-AO="./target/release/autumn-op --manager 127.0.0.1:9001"
-$AO principal-create --principal acme --grant mem/acme/ --admin-token-file /path/admin.token > /path/acme.cred
-# `--admin-token[-file]` and `--credential-file` work BEFORE or AFTER the
-# subcommand — position does not matter (it used to, differently per command).
+AO="./target/release/autumn-op --cluster-secret-file /tmp/autumn-rs/cluster.secret --manager 127.0.0.1:9001"
+$AO principal-create --principal acme --grant mem/acme/ > /path/acme.cred
+# `--cluster-secret-file` and `--credential-file` work BEFORE or AFTER the
+# subcommand — position does not matter.
 
 # 4) Use it from the SDK (auto-mints + renews tokens, AUTH_HELLOs each PS
-#    connection; principal read from the credential file):
+#    connection and each extent-node direct-read connection; principal read from
+#    the credential file):
 #      ClusterClient::connect_with_credential(mgr, "mem/acme", principal, secret)
 #    Cross-scope / anonymous access to a protected prefix fails PermissionDenied.
 
 # Ops: mint a token by hand / revoke a principal:
 $AO mint-token --principal acme --credential-file /path/acme.cred
-$AO principal-delete --principal acme --admin-token-file /path/admin.token   # stops renewal; token dies at exp
+$AO principal-delete --principal acme   # stops renewal; token dies at exp
 # Key rotation: add a higher kid line to signing.key, restart the manager,
 # wait a TTL, then mark the old line "disabled" (PS rejects it per request).
 ```
@@ -2289,8 +2368,8 @@ $AO presplit --namespace mem --tenant default --agents alice,bob,carol
 # layout (24 by default, a permanent constant), PARTS is how many partitions to
 # create (must divide lanes; omit = one per lane). See the "fs stripe geometry:
 # lanes vs partitions" section above for the full model + the sacred-boundary
-# merge guard. Pass --admin-token[-file] so the boundaries are RECORDED (protected).
-$AO presplit --namespace fs --lanes 24 --parts 6 --admin-token-file "$ADMIN_TOKEN"
+# merge guard. The boundaries are RECORDED (protected) as part of the presplit.
+$AO presplit --namespace fs --lanes 24 --parts 6
 ```
 
 ### Stripe one large file across lanes (break the single-partition ceiling)
@@ -2310,9 +2389,9 @@ to turn it off).
 
 ```bash
 # 1. Declare + cut on the EMPTY fs (before ingest). --parts spreads the lanes over
-#    P partitions (must divide lanes). --admin-token records the boundaries so the
-#    merge guard protects them.
-$AO presplit --namespace fs --lanes 24 --parts 6 --admin-token-file "$ADMIN_TOKEN"
+#    P partitions (must divide lanes). The boundaries are recorded so the merge
+#    guard protects them.
+$AO presplit --namespace fs --lanes 24 --parts 6
 $AO info | grep part          # → 6 fs lane partitions, spread across PSs
 
 # 2. Just upload. Every file's extents round-robin across the declared lanes:
@@ -3269,7 +3348,7 @@ reach 8/8/8.
 
 ```bash
 # repeat until it reports "moved 0"
-autumn-op --manager $MGR:9001 --admin-token-file F --wait rebalance 0
+autumn-op --manager $MGR:9001 --cluster-secret-file F --wait rebalance 0
 ```
 
 **Read the spread from `--json`, not from `info`.** A rebalance DELETES the
@@ -3416,8 +3495,8 @@ autumnfs --manager 127.0.0.1:9001 put big.bin /ec/big.bin      # >= 1.5 MiB
 # Seal its log extent: restart the PS at the 1 GiB floor and fill past it,
 # since there is no operator command that seals a partition's tail.
 autumn-ps --psid 1 ... --max-extent-size-bytes 1073741824
-autumn-op --admin-token-file <tok> force-ec-convert --extent <ID>
-autumn-op --admin-token-file <tok> info --part <PID>   # wait for "ec":true
+autumn-op --cluster-secret-file <F> force-ec-convert --extent <ID>
+autumn-op --cluster-secret-file <F> info --part <PID>   # wait for "ec":true
 autumn-s3 --manager 127.0.0.1:9001 --port 9100 --direct-read true &
 curl -s http://127.0.0.1:9100/ec/big.bin -o out.bin && cmp big.bin out.bin
 ```
@@ -3772,14 +3851,14 @@ no protected-prefix list; a credential grants a key prefix — a whole namespace
 (`fs/`) or an in-namespace sub-prefix (`mem/app/`). The key layout is
 `{ns}/…` (NO tenant segment; see §8).
 
-- **`deploy/baremetal/autumn-deploy start`** generates a signing key + admin
-  token once (reused across re-deploys — rotating invalidates every credential),
+- **`deploy/baremetal/autumn-deploy start`** generates a signing key once (reused
+  across re-deploys — rotating invalidates every credential),
   distributes the key to every manager host, and after bootstrap mints per-family
   principal credentials to `~/.autumn-deploy/authz/*.cred`. Clients pass
   `--credential-file ~/.autumn-deploy/authz/fs.cred` (the principal name is read
   from the file — no `--principal`/`--tenant`).
 - **k8s** (`deploy/overlays/vke/deploy.sh`) generates the `autumn-authz` Secret
-  (signing key + admin token) once and the manager StatefulSet mounts it (the
+  (signing key) once and the manager StatefulSet mounts it (the
   signing key alone arms protect-everything — no prefix list). Mint a client
   credential + Secret with the manual steps below.
 - **Escape hatch:** `AUTUMN_AUTH_DISABLE=1` (both paths) runs authz-OFF — for
@@ -3807,14 +3886,14 @@ autumn-op gen-signing-key > /secrets/autumn-auth-signing.key
 #    whole namespace (`fs/`). principal-create prints the two-line
 #    principal:/credential: form (shown ONCE) — redirect it STRAIGHT to the
 #    credential file (the reader parses the name + hex from it):
-autumn-op --manager $M principal-create --principal app \
-    --grant "mem/app/" --admin-token-file /secrets/admin.token \
+autumn-op --manager $M --cluster-secret-file /secrets/cluster.secret \
+    principal-create --principal app --grant "mem/app/" \
   > /secrets/app.cred
 
 # 3. Verify mint works BEFORE enforcing (minting is a manager RPC, unaffected by
 #    whether the PS is enforcing yet — safe to run while authz is off):
-autumn-op --manager $M mint-token --principal app \
-    --credential-file /secrets/app.cred   # must print a token
+autumn-op --manager $M --cluster-secret-file /secrets/cluster.secret \
+    mint-token --principal app --credential-file /secrets/app.cred   # must print a token
 
 # 4. ARM: manager gets --auth-signing-key-file (or env
 #    AUTUMN_AUTH_SIGNING_KEY_FILE via entrypoint). PROTECT-EVERYTHING: the signing
@@ -4194,7 +4273,7 @@ first; a single stream is bounded by receiving its body plus writing its last
 autumn-op --manager 127.0.0.1:9001 info        # how many partitions own fs/[0x03][lane]?
 # On a fresh cluster, BEFORE loading data (a data-bearing partition refuses):
 autumn-op --manager 127.0.0.1:9001 --wait presplit --namespace fs --lanes 24 --parts 4 \
-    --admin-token-file $DATA_ROOT/authz/admin.token
+    --cluster-secret-file $DATA_ROOT/cluster.secret
 autumnfs --manager 127.0.0.1:9001 mkdir /bench
 RUST_LOG=info,autumn_s3::write=debug autumn-s3 --manager 127.0.0.1:9001 --port 9100 > s3.log 2>&1 &
 for c in 1 8 32; do

@@ -137,12 +137,21 @@ spec:
             periodSeconds: 5
           volumeMounts:
             - { name: data, mountPath: /data }
+            # The cluster secret (required): the EN refuses to start without
+            # it, and its startup \`autumn-op format\` proves it too.
+            - name: cluster-secret
+              mountPath: /etc/autumn/cluster
+              readOnly: true
           resources:
             requests: { cpu: "${CPU}", memory: "1Gi" }
       volumes:
         - name: data
           persistentVolumeClaim:
             claimName: data-autumn-en-${n}
+        - name: cluster-secret
+          secret:
+            secretName: autumn-cluster-secret
+            defaultMode: 0400
 YAML
 }
 

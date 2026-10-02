@@ -31,17 +31,15 @@ spec:
           args: ["bootstrap"]
           envFrom:
             - configMapRef: { name: autumn-config }
-          # Bootstrap sends CREATE_STREAM / UPSERT_PARTITION, and the manager
-          # gates those on the admin token. The ConfigMap already points
-          # AUTUMN_ADMIN_TOKEN_FILE here, but without this mount the path named
-          # nothing and bring-up failed with "admin token invalid".
-          # optional: true keeps an authz-off cluster (no Secret) bootstrapping.
+          # Every autumn-op call (info, list-nodes, bootstrap) proves the
+          # cluster secret; the ConfigMap's AUTUMN_CLUSTER_SECRET_FILE names
+          # this mount. Required: without it the Job fails loudly.
           volumeMounts:
-            - name: authz
-              mountPath: /etc/autumn/authz
+            - name: cluster-secret
+              mountPath: /etc/autumn/cluster
               readOnly: true
       volumes:
-        - name: authz
+        - name: cluster-secret
           secret:
-            secretName: autumn-authz
-            optional: true
+            secretName: autumn-cluster-secret
+            defaultMode: 0400

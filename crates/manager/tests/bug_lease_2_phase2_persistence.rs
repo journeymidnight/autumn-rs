@@ -61,6 +61,8 @@ fn ps_binary() -> PathBuf {
 
 fn spawn_ps(psid: u64, mgr: std::net::SocketAddr, ps: std::net::SocketAddr) -> Child {
     Command::new(ps_binary())
+        .arg("--cluster-secret-file")
+        .arg(support::cluster_secret_file())
         .arg("--psid")
         .arg(psid.to_string())
         .arg("--port")

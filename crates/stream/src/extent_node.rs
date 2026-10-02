@@ -1732,6 +1732,78 @@ impl Drop for RecoveryPermit {
 
 // ─── ExtentNode ───────────────────────────────────────────────────────────────
 
+/// What this node knows about the cluster's data-plane authz, for direct reads
+/// on Client connections. Polled from the manager (`GET_AUTHZ_CONFIG`).
+///
+/// The EN checks identity only: a bound principal with a live token. It cannot
+/// check which keys a principal may read, because it does not know which key
+/// an extent holds; the PS checks that before it hands out a descriptor.
+enum ClientAuthz {
+    /// The manager has not answered yet. Direct reads are refused (the client
+    /// falls back to the PS proxy) rather than served unchecked.
+    Unknown,
+    /// Authz is off cluster-wide, or this node has no manager (tests).
+    Off,
+    On {
+        keys: autumn_rpc::cap_token::Keyring,
+        cluster_id: String,
+        clock_skew_secs: u64,
+    },
+}
+
+impl ClientAuthz {
+    fn install(&mut self, resp: &manager_rpc::GetAuthzConfigResp) {
+        *self = if resp.enabled {
+            Self::On {
+                keys: autumn_rpc::cap_token::keyring(&resp.public_keys),
+                cluster_id: resp.cluster_id.clone(),
+                clock_skew_secs: resp.clock_skew_secs,
+            }
+        } else {
+            Self::Off
+        };
+    }
+
+    /// `AUTH_HELLO` on a Client connection: the principal to bind, or why not.
+    fn bind(&self, token: &[u8], now: u64) -> Result<Option<autumn_rpc::cap_token::BoundPrincipal>, String> {
+        match self {
+            Self::Unknown => Err("authz config not loaded yet; retry".to_string()),
+            // Nothing to bind against; reads need no principal.
+            Self::Off => Ok(None),
+            Self::On {
+                keys,
+                cluster_id,
+                clock_skew_secs,
+            } => autumn_rpc::cap_token::bind_principal(token, keys, cluster_id, now, *clock_skew_secs)
+                .map(Some),
+        }
+    }
+
+    /// May this Client connection read?
+    fn admit_read(
+        &self,
+        principal: Option<&autumn_rpc::cap_token::BoundPrincipal>,
+        now: u64,
+    ) -> Result<(), (StatusCode, &'static str)> {
+        match self {
+            Self::Unknown => Err((StatusCode::Unavailable, "authz config not loaded yet")),
+            Self::Off => Ok(()),
+            Self::On {
+                keys,
+                clock_skew_secs,
+                ..
+            } => {
+                let p = principal.ok_or((
+                    StatusCode::PermissionDenied,
+                    "direct read requires a capability token (no AUTH_HELLO on this connection)",
+                ))?;
+                autumn_rpc::cap_token::still_valid(p, keys, now, *clock_skew_secs)
+                    .map_err(|m| (StatusCode::PermissionDenied, m))
+            }
+        }
+    }
+}
+
 pub struct ExtentNode {
     extents: Rc<DashMap<u64, Rc<ExtentEntry>>>,
     /// bounded cache of open fds for SEALED extents (open/active
@@ -1746,6 +1818,8 @@ pub struct ExtentNode {
     manager_endpoint: Option<String>,
     /// ConnPool for manager RPC calls (nodes_info, extent_info, etc.)
     manager_pool: Rc<crate::ConnPool>,
+    /// See `ClientAuthz`; refreshed by `spawn_client_authz_poll_loop`.
+    client_authz: Rc<RefCell<ClientAuthz>>,
     /// Shared across every shard of this process — see `DoneQueues`.
     done: DoneQueues,
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
@@ -1864,6 +1938,7 @@ impl Clone for ExtentNode {
             metrics_gauges: self.metrics_gauges.clone(),
             manager_endpoint: self.manager_endpoint.clone(),
             manager_pool: self.manager_pool.clone(),
+            client_authz: self.client_authz.clone(),
             done: self.done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             recovery_attempts: self.recovery_attempts.clone(),
@@ -2233,8 +2308,12 @@ async fn process_frames_backpressured(
     tx_bufs: &mut Vec<Bytes>,
     cap: usize,
     protocol: &autumn_rpc::version_hello::Negotiated,
+    principal: &mut Option<autumn_rpc::cap_token::BoundPrincipal>,
 ) -> Result<()> {
     use futures::stream::StreamExt as _;
+    let client = protocol.role == autumn_rpc::version_hello::Role::Client;
+    // Taken once per burst, and only if a Client frame needs it.
+    let mut now: Option<u64> = None;
     // Pull all complete frames out of the decoder.
     let mut frames: Vec<Frame> = Vec::new();
     loop {
@@ -2247,6 +2326,11 @@ async fn process_frames_backpressured(
                         StatusCode::PermissionDenied,
                         &e.to_string(),
                     ));
+                } else if let Some(reply) = client
+                    .then(|| node.client_gate(&frame, principal, &mut now))
+                    .flatten()
+                {
+                    tx_bufs.push(reply);
                 } else {
                     frames.push(frame);
                 }
@@ -3810,6 +3894,11 @@ impl ExtentNode {
             fd_lru,
             disks: Rc::new(disk_map),
             metrics_gauges,
+            client_authz: Rc::new(RefCell::new(if config.manager_endpoint.is_some() {
+                ClientAuthz::Unknown
+            } else {
+                ClientAuthz::Off
+            })),
             manager_endpoint: config.manager_endpoint,
             manager_pool: Rc::new(crate::ConnPool::new()),
             done,
@@ -3854,6 +3943,7 @@ impl ExtentNode {
         // extent's manager refs hit 0 while the node was momentarily
         // unreachable.
         node.spawn_reconcile_orphans_loop();
+        node.spawn_client_authz_poll_loop();
         node.spawn_content_scrub_loop();
 
         // Per-shard 2 s sweep on THIS shard's runtime, two jobs:
@@ -4402,6 +4492,116 @@ impl ExtentNode {
     /// at-most-once channel that already carries recovery and EC completions.
     fn note_scrub_rot(&self, extent_id: u64, eversion: u64) {
         self.done.push_scrub_rot(extent_id, eversion);
+    }
+
+    /// Keeps `client_authz` current. 5 s, like the PS's poll: the config
+    /// changes on key rotation or when authz is switched on. A failed poll
+    /// keeps the last answer, so a manager outage does not stop direct reads.
+    fn spawn_client_authz_poll_loop(&self) {
+        let Some(mgr) = self.manager_endpoint.clone() else {
+            return;
+        };
+        let mgr = crate::conn_pool::normalize_endpoint(&mgr);
+        let node = self.clone();
+        en_spawn_supervised("en_client_authz_poll", move || {
+            let node = node.clone();
+            let mgr = mgr.clone();
+            async move {
+                loop {
+                    if let Err(e) = node.poll_client_authz(&mgr).await {
+                        // Loud while the EN still refuses every direct read for
+                        // want of an answer; quiet once it has one to keep using.
+                        if matches!(*node.client_authz.borrow(), ClientAuthz::Unknown) {
+                            tracing::warn!(error = %e, manager = %mgr,
+                                "EN authz config poll failed; direct reads are refused until it succeeds");
+                        } else {
+                            tracing::debug!(error = %e, "EN authz config poll failed");
+                        }
+                    }
+                    compio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
+        });
+    }
+
+    async fn poll_client_authz(&self, mgr: &str) -> Result<()> {
+        let resp = self
+            .manager_pool
+            .call_timeout(
+                mgr,
+                manager_rpc::MSG_GET_AUTHZ_CONFIG,
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
+            .await?;
+        let resp: manager_rpc::GetAuthzConfigResp =
+            manager_rpc::rkyv_decode(&resp).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            anyhow::bail!("get_authz_config: {}", resp.message);
+        }
+        let mut authz = self.client_authz.borrow_mut();
+        let was_on = matches!(*authz, ClientAuthz::On { .. });
+        let was_unknown = matches!(*authz, ClientAuthz::Unknown);
+        authz.install(&resp);
+        if was_unknown || was_on != resp.enabled {
+            tracing::info!(
+                shard = self.shard_idx,
+                enabled = resp.enabled,
+                "EN direct-read authz config loaded"
+            );
+        }
+        Ok(())
+    }
+
+    /// Client connections only, after `check_opcode` admitted the frame:
+    /// answers `AUTH_HELLO` itself, and refuses a direct read the connection's
+    /// principal does not admit (`ClientAuthz::admit_read`). `None` = serve it.
+    fn client_gate(
+        &self,
+        frame: &Frame,
+        principal: &mut Option<autumn_rpc::cap_token::BoundPrincipal>,
+        now: &mut Option<u64>,
+    ) -> Option<Bytes> {
+        use autumn_rpc::partition_rpc::{AuthHelloReq, AuthHelloResp, MSG_AUTH_HELLO};
+        // The keepalive proves the connection, not a read.
+        if frame.msg_type == autumn_rpc::MSG_TYPE_PING {
+            return None;
+        }
+        let now = *now.get_or_insert_with(autumn_rpc::cap_token::now_secs);
+        let authz = self.client_authz.borrow();
+        if frame.msg_type != MSG_AUTH_HELLO {
+            return authz
+                .admit_read(principal.as_ref(), now)
+                .err()
+                .map(|(code, m)| err_bytes(frame.req_id, frame.msg_type, code, m));
+        }
+        let (code, message) = if frame.payload.len() > autumn_rpc::partition_rpc::AUTH_HELLO_MAX_PAYLOAD
+        {
+            (StatusCode::InvalidArgument, "AUTH_HELLO too large".to_string())
+        } else {
+            match autumn_rpc::partition_rpc::rkyv_decode::<AuthHelloReq>(&frame.payload) {
+                Ok(req) => match authz.bind(&req.token, now) {
+                    Ok(bound) => {
+                        *principal = bound;
+                        (StatusCode::Ok, String::new())
+                    }
+                    Err(reason) => (StatusCode::PermissionDenied, reason),
+                },
+                Err(e) => (StatusCode::InvalidArgument, format!("bad AUTH_HELLO: {e}")),
+            }
+        };
+        let resp = AuthHelloResp {
+            code: code as u8,
+            message,
+        };
+        Some(
+            Frame::response(
+                frame.req_id,
+                MSG_AUTH_HELLO,
+                autumn_rpc::partition_rpc::rkyv_encode(&resp),
+            )
+            .encode(),
+        )
     }
 
     fn spawn_reconcile_orphans_loop(&self) {
@@ -5913,6 +6113,16 @@ impl ExtentNode {
             &peer,
         )
         .await?;
+        autumn_rpc::peer_auth::accept(
+            &mut reader,
+            &mut writer,
+            &protocol,
+            autumn_rpc::peer_auth::installed(),
+            &peer,
+        )
+        .await?;
+        // Bound by AUTH_HELLO on a Client connection (see `client_gate`).
+        let mut principal: Option<autumn_rpc::cap_token::BoundPrincipal> = None;
         let mut decoder = FrameDecoder::new();
 
         // per-conn inflight cap from `ExtentNodeConfig.inflight_cap`,
@@ -5977,6 +6187,7 @@ impl ExtentNode {
                             &mut tx_bufs,
                             cap,
                             &protocol,
+                            &mut principal,
                         )
                         .await?;
                         read_fut = Some(spawn_read(reader, next_window(&mut decoder)));
@@ -6034,6 +6245,7 @@ impl ExtentNode {
                                 &mut tx_bufs,
                                 cap,
                                 &protocol,
+                                &mut principal,
                             )
                             .await?;
                             read_fut = Some(spawn_read(reader, next_window(&mut decoder)));
@@ -11215,7 +11427,7 @@ mod enospc_disk_health_tests {
         ));
         {
         let (mut rd, mut wr) = autumn_transport::Conn::Tcp(client.clone()).into_split();
-        autumn_rpc::version_hello::initiate(
+        let negotiated = autumn_rpc::version_hello::initiate(
             &mut rd,
             &mut wr,
             autumn_rpc::version_hello::Hello::current(autumn_rpc::version_hello::Role::Peer),
@@ -11223,6 +11435,9 @@ mod enospc_disk_health_tests {
         )
         .await
         .unwrap();
+        autumn_rpc::peer_auth::initiate(&mut rd, &mut wr, &negotiated, None)
+            .await
+            .unwrap();
         }
         for id in 1..=2u32 {
             let req = AppendReq {
@@ -15796,5 +16011,163 @@ mod read_frame_ceiling_tests {
         let req = ReadBytesReq::new(9004, 1, 0, 256 * 1024 * 1024, PayloadRef::in_dat());
         let (_, _, read_size) = read_plan(&entry, &req).expect("the normal chunk stays legal");
         assert_eq!(read_size, 256 * 1024 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod client_direct_read_auth_tests {
+    //! An EN of a cluster that runs authz serves direct reads only on a Client
+    //! connection that bound a principal with `AUTH_HELLO`; the SDK's
+    //! direct-read pool sends it when it holds a token.
+    use super::*;
+    use autumn_rpc::cap_token::{CapClaims, CAP_TYP, CAP_VER};
+    use autumn_rpc::version_hello::Role;
+
+    const KID: u32 = 7;
+    const SEED: [u8; 32] = [9; 32];
+    const CLUSTER: &str = "test-cluster";
+    const PAYLOAD: &[u8] = b"direct-read authz payload";
+
+    fn token(seed: [u8; 32], exp: u64) -> Bytes {
+        let now = autumn_rpc::cap_token::now_secs();
+        let claims = CapClaims {
+            ver: CAP_VER,
+            typ: CAP_TYP.to_string(),
+            kid: KID,
+            iss: "autumn-mgr".to_string(),
+            aud: CLUSTER.to_string(),
+            iat: now,
+            nbf: now,
+            exp,
+            allowed_prefixes: vec![b"acme/".to_vec()],
+        };
+        let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
+        Bytes::from(autumn_rpc::cap_token::sign_claims(&sk, &claims).unwrap())
+    }
+
+    fn authz_on() -> ClientAuthz {
+        ClientAuthz::On {
+            keys: autumn_rpc::cap_token::keyring(&[manager_rpc::AuthzPublicKey {
+                kid: KID,
+                ed25519_pub: autumn_rpc::cap_token::public_key_from_seed(&SEED).to_vec(),
+                disabled: false,
+            }]),
+            cluster_id: CLUSTER.to_string(),
+            clock_skew_secs: 0,
+        }
+    }
+
+    /// A served node holding one extent with `PAYLOAD`; returns its address.
+    async fn served_node(dir: &std::path::Path) -> (ExtentNode, String) {
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.to_path_buf(), 1))
+            .await
+            .unwrap();
+        node.ensure_extent(1).await.unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let served = node.clone();
+        compio::runtime::spawn(async move { served.serve(addr).await }).detach();
+        let addr = addr.to_string();
+        let peer = crate::ConnPool::new();
+        let mut appended = None;
+        for _ in 0..50 {
+            let req = AppendReq {
+                extent_id: 1,
+                eversion: 1,
+                commit: 0,
+                owner_epoch: 1,
+                payload: Bytes::from_static(PAYLOAD),
+            };
+            match peer.call(&addr, MSG_APPEND, req.encode()).await {
+                Ok(r) => {
+                    appended = Some(r);
+                    break;
+                }
+                Err(_) => compio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+        AppendResp::decode(appended.expect("node never served")).unwrap();
+        (node, addr)
+    }
+
+    async fn read(pool: &crate::ConnPool, addr: &str) -> anyhow::Result<Bytes> {
+        crate::read_extent_value_direct(pool, addr, 1, 1, 0, PAYLOAD.len() as u64).await
+    }
+
+    fn status(e: &anyhow::Error) -> Option<StatusCode> {
+        e.chain().find_map(|c| match c.downcast_ref::<autumn_rpc::RpcError>() {
+            Some(autumn_rpc::RpcError::Status { code, .. }) => Some(*code),
+            _ => None,
+        })
+    }
+
+    #[compio::test]
+    async fn authz_off_needs_no_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_node, addr) = served_node(dir.path()).await;
+        let pool = crate::ConnPool::with_role(Role::Client);
+        assert_eq!(&read(&pool, &addr).await.unwrap()[..], PAYLOAD);
+    }
+
+    #[compio::test]
+    async fn authz_on_refuses_a_connection_without_a_valid_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, addr) = served_node(dir.path()).await;
+        *node.client_authz.borrow_mut() = authz_on();
+        let far = autumn_rpc::cap_token::now_secs() + 3600;
+
+        // No AUTH_HELLO at all: refused a read, but its keepalive is answered.
+        let anonymous = crate::ConnPool::with_role(Role::Client);
+        let e = read(&anonymous, &addr).await.expect_err("anonymous read served");
+        assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "{e:#}");
+        anonymous
+            .call(&addr, autumn_rpc::MSG_TYPE_PING, Bytes::new())
+            .await
+            .expect("a keepalive is not a read");
+
+        // A token signed by a key this cluster does not publish.
+        let forged = crate::ConnPool::with_role(Role::Client);
+        forged.set_auth_token(Some(token([1; 32], far)));
+        let e = read(&forged, &addr).await.expect_err("forged token admitted");
+        assert!(format!("{e:#}").contains("AUTH_HELLO"), "{e:#}");
+
+        // An expired one.
+        let expired = crate::ConnPool::with_role(Role::Client);
+        expired.set_auth_token(Some(token(SEED, autumn_rpc::cap_token::now_secs() - 10)));
+        assert!(read(&expired, &addr).await.is_err(), "expired token admitted");
+
+        // A valid one.
+        let member = crate::ConnPool::with_role(Role::Client);
+        member.set_auth_token(Some(token(SEED, far)));
+        assert_eq!(&read(&member, &addr).await.unwrap()[..], PAYLOAD);
+
+        // Disabling the kid revokes the bound connection on its next read.
+        *node.client_authz.borrow_mut() = ClientAuthz::On {
+            keys: autumn_rpc::cap_token::Keyring::new(),
+            cluster_id: CLUSTER.to_string(),
+            clock_skew_secs: 0,
+        };
+        let e = read(&member, &addr).await.expect_err("revoked kid still served");
+        assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "{e:#}");
+    }
+
+    #[compio::test]
+    async fn an_en_that_has_not_heard_from_the_manager_refuses_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, addr) = served_node(dir.path()).await;
+        *node.client_authz.borrow_mut() = ClientAuthz::Unknown;
+        let pool = crate::ConnPool::with_role(Role::Client);
+        let e = read(&pool, &addr).await.expect_err("served before authz was known");
+        assert_eq!(status(&e), Some(StatusCode::Unavailable), "{e:#}");
+    }
+
+    #[compio::test]
+    async fn a_member_connection_needs_no_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, addr) = served_node(dir.path()).await;
+        *node.client_authz.borrow_mut() = authz_on();
+        let peer = crate::ConnPool::new();
+        assert_eq!(&read(&peer, &addr).await.unwrap()[..], PAYLOAD);
     }
 }

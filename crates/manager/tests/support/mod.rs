@@ -39,10 +39,36 @@ impl ShutdownFlag {
     }
 }
 
+// ── Cluster secret ────────────────────────────────────────────────────
+
+/// The cluster secret this test process proves on every Peer/Admin
+/// connection, and the file a spawned server binary reads the same secret
+/// from (`--cluster-secret-file`, which every server binary requires).
+///
+/// Installed process-wide on first use. The address pickers call it, because
+/// every test picks its addresses before it starts anything: an in-process
+/// server that accepted before the install would answer PEER_AUTH "open", and
+/// a client holding the secret refuses an open server.
+pub fn cluster_secret_file() -> &'static std::path::Path {
+    static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        const SECRET: &str = "autumn-manager-tests-cluster-secret-0123456789";
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("cluster-secret-{}", std::process::id()));
+        std::fs::write(&path, SECRET).expect("write test cluster secret");
+        autumn_rpc::peer_auth::install(
+            autumn_rpc::peer_auth::ClusterSecret::new(SECRET).expect("test secret"),
+        )
+        .expect("install test cluster secret");
+        path
+    })
+}
+
 // ── Address allocation ────────────────────────────────────────────────
 
 /// Pick a random available port on loopback.
 pub fn pick_addr() -> SocketAddr {
+    cluster_secret_file();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     drop(listener);
@@ -62,6 +88,7 @@ pub fn pick_addr() -> SocketAddr {
 /// we check both.
 pub fn pick_stable_port_pair() -> u16 {
     use std::net::TcpListener;
+    cluster_secret_file();
     let floor: u16 = std::fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
         .ok()
         .and_then(|s| s.split_whitespace().next().and_then(|v| v.parse().ok()))
@@ -1343,6 +1370,8 @@ pub fn start_partition_server_killable(
 ) -> KillablePs {
     let bin = support_binary_path("autumn-ps");
     let child = std::process::Command::new(bin)
+        .arg("--cluster-secret-file")
+        .arg(cluster_secret_file())
         .arg("--psid")
         .arg(ps_id.to_string())
         .arg("--manager")

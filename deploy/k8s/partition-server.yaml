@@ -72,3 +72,13 @@ spec:
           # is both wrong and unnecessary.
           resources:
             requests: { cpu: "2", memory: "2Gi" }
+          volumeMounts:
+            # The cluster secret (required): the PS refuses to start without it.
+            - name: cluster-secret
+              mountPath: /etc/autumn/cluster
+              readOnly: true
+      volumes:
+        - name: cluster-secret
+          secret:
+            secretName: autumn-cluster-secret
+            defaultMode: 0400

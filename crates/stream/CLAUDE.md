@@ -349,6 +349,35 @@ owner's mailbox before the first response, allowing the next durable burst to
 coalesce them. A regression holds the mailbox busy and requires a later append to
 arrive; restoring the single-inflight pause fails it.
 
+### Who may talk to an EN
+
+`handle_connection` runs VERSION_HELLO, then PEER_AUTH for Peer/Admin
+connections (cluster secret, `autumn_rpc::peer_auth`): a process that cannot
+prove the secret never reaches `APPEND` / `DELETE_EXTENT` / `FENCE_EXTENT` or any
+other member opcode. A Client connection may send only `READ_BYTES`,
+`READ_BYTES_BULK` and `AUTH_HELLO` (`check_opcode`).
+
+**Direct reads under authz (`ClientAuthz`).** Each shard polls
+`MSG_GET_AUTHZ_CONFIG` every 5 s (`spawn_client_authz_poll_loop`; a failed poll
+keeps the last answer). `Unknown` until the first answer — reads refused
+`Unavailable`, never served unchecked; `Off` (authz off, or no manager) — no
+token needed; `On` — `client_gate` answers `AUTH_HELLO` itself (verify with
+`cap_token::bind_principal`, bind the connection's `principal`) and refuses a
+read unless the bound principal is `still_valid` (kid enabled, not expired),
+`PermissionDenied` as a frame-level error, which a bulk read surfaces as its
+`RpcError::Status`. Identity only: the EN cannot check key ranges, since it does
+not know which key an extent holds. The per-burst cost is one `SystemTime::now`
+and a keyring lookup per read frame, only on Client connections with authz on.
+Tests: `client_direct_read_auth_tests` (anonymous / forged / expired / valid /
+revoked kid / Unknown / Off / member connection).
+
+**`ConnPool::set_auth_token`**: a pool that holds a token sends `AUTH_HELLO` on
+every connection it opens, right after the handshake and before pooling it
+(`AUTH_HELLO to <addr>` context, deliberately not `connect <addr>`: the address
+is fine, so `is_connect_failure` must not read it as a stale node). A changed
+token drops the pooled connections; a connection whose AUTH_HELLO raced a
+change serves its one call and is not pooled.
+
 ### Per-extent owner (write path) — appends serialized by one task
 
 All appends to an extent are MESSAGES (`ExtentMsg::Append`) to a single

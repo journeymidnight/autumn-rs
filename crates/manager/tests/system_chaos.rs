@@ -372,6 +372,8 @@ impl EnProcess {
         // != --port here is the legitimate proxy case (the EN warns, not fails).
         let advertise = format!("127.0.0.1:{}", self.proxy_port);
         let child = Command::new(en_binary)
+            .arg("--cluster-secret-file")
+            .arg(support::cluster_secret_file())
             .args([
                 "--port",
                 &self.port.to_string(),
@@ -451,6 +453,8 @@ impl PsProcess {
             .open(&self.log_path)
             .expect("open PS log");
         let mut cmd = Command::new(&self.binary);
+        cmd.arg("--cluster-secret-file")
+            .arg(support::cluster_secret_file());
         if let Some(n) = self.flush_bytes {
             cmd.args(["--flush-mem-bytes", &n.to_string()]);
         }
@@ -1086,6 +1090,8 @@ fn bootstrap_en(
     ];
     format_args.extend(data_dirs.iter().map(|d| d.to_string_lossy().into_owned()));
     let status = Command::new(op_binary)
+        .arg("--cluster-secret-file")
+        .arg(support::cluster_secret_file())
         .args(&format_args)
         .stdout(Stdio::from(log_file.try_clone().unwrap()))
         .stderr(Stdio::from(log_file))

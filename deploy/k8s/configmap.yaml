@@ -16,8 +16,15 @@ data:
   # Bootstrap waits for this many extent nodes Online before creating streams.
   # MUST equal the extent-node StatefulSet replica count.
   AUTUMN_EXPECT_NODES: "3"
+  # The cluster secret: the manager, PS and EN refuse to start without it, and
+  # it authorizes autumn-op (bootstrap, readiness probe, admin ops). It comes
+  # from the REQUIRED `autumn-cluster-secret` Secret (key `cluster.secret`;
+  # generate it once with `autumn-op gen-cluster-secret` —
+  # deploy/overlays/vke/deploy.sh does this), mounted read-only at
+  # /etc/autumn/cluster into every server pod and the bootstrap Job.
+  AUTUMN_CLUSTER_SECRET_FILE: "/etc/autumn/cluster/cluster.secret"
   # F-AUTHZ-BUILTIN: data-plane authz is ON by DEFAULT for k8s deploys. The
-  # signing key + admin token come from the `autumn-authz` Secret (generate it
+  # signing key comes from the `autumn-authz` Secret (generate it
   # once with `autumn-op gen-signing-key` — deploy/overlays/vke/deploy.sh does
   # this), mounted into the manager at /etc/autumn/authz. Authz engages ONLY when
   # that Secret is actually mounted (entrypoint `-s` gate), so a cluster deployed
@@ -26,7 +33,6 @@ data:
   # TENANT-FIRST + PROTECT-EVERYTHING: the signing key alone arms enforcement of
   # EVERY tenant-scoped write; there is no protected-prefix list to set.
   AUTUMN_AUTH_SIGNING_KEY_FILE: "/etc/autumn/authz/signing.key"
-  AUTUMN_ADMIN_TOKEN_FILE: "/etc/autumn/authz/admin.token"
   # Escape hatch (dev/test): AUTUMN_AUTH_DISABLE: "1"
   # EC + replication defaults follow cluster.sh (auto by node count). To force:
   # AUTUMN_REPLICATION: "3+0"

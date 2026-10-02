@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use autumn_rpc::cap_token::{verify_token, AuthReject};
+pub use autumn_rpc::cap_token::BoundPrincipal;
 use autumn_rpc::manager_rpc::GetAuthzConfigResp;
 use autumn_rpc::partition_rpc::{
     self, parse_put_bulk_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
@@ -53,11 +53,6 @@ pub struct AuthzInner {
     /// `GetAuthzConfigResp.namespaces`). Layer-A's data source: `check_layer_a`
     /// admits a put-class write only if its key `starts_with` one of these.
     pub namespaces: Vec<Vec<u8>>,
-    /// (PS slice): the manager's admin secret, for gating
-    /// `is_admin_ps_msg` (split / maintenance). EMPTY = unconfigured → those ops
-    /// run bare (opt-in). Carried in the snapshot so the gate reads one
-    /// consistent object.
-    pub admin_token: Vec<u8>,
 }
 
 impl AuthzInner {
@@ -69,7 +64,6 @@ impl AuthzInner {
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
-            admin_token: Vec::new(),
         }
     }
 }
@@ -136,21 +130,7 @@ impl AuthzState {
     /// public key (wrong length / not on-curve) is skipped with the rest kept —
     /// its kid then rejects as `UnknownKid`, which is the safe direction.
     pub fn install(&self, resp: &GetAuthzConfigResp) {
-        let mut keys = HashMap::new();
-        for k in &resp.public_keys {
-            if k.disabled {
-                continue;
-            }
-            match <[u8; 32]>::try_from(k.ed25519_pub.as_slice()) {
-                Ok(arr) => match VerifyingKey::from_bytes(&arr) {
-                    Ok(vk) => {
-                        keys.insert(k.kid, vk);
-                    }
-                    Err(e) => tracing::warn!(kid = k.kid, error = %e, "authz: bad public key, skipping kid"),
-                },
-                Err(_) => tracing::warn!(kid = k.kid, "authz: public key wrong length, skipping kid"),
-            }
-        }
+        let keys = autumn_rpc::cap_token::keyring(&resp.public_keys);
         let inner = Arc::new(AuthzInner {
             enabled: resp.enabled,
             keys,
@@ -159,7 +139,6 @@ impl AuthzState {
             cluster_id: resp.cluster_id.clone(),
             // D7: the registered-namespace list — Layer-A's data source.
             namespaces: resp.namespaces.clone(),
-            admin_token: resp.admin_token.clone(),
         });
         // D7: Layer-A is on iff the registry is non-empty (independent
         // of the signing key). Compute BEFORE the swap so the flag matches the
@@ -174,45 +153,21 @@ impl AuthzState {
     }
 }
 
-/// The per-connection principal bound by a successful `MSG_AUTH_HELLO`.
-#[derive(Clone, Debug)]
-pub struct BoundPrincipal {
-    pub allowed_prefixes: Vec<Vec<u8>>,
-    /// Token expiry (unix seconds).
-    pub exp: u64,
-    /// The kid this token was verified against. Re-checked against the live
-    /// keyring on EVERY request so a disabled/rotated-out kid revokes even
-    /// already-bound long connections (coco P1: `install` drops disabled kids,
-    /// but the per-request check is what enforces it on live connections).
-    pub kid: u32,
-}
-
 /// Verify an `AUTH_HELLO` token against the cached public keys → the bound
 /// principal, or a reject reason (string, for the AuthHelloResp message /
-/// metrics). `now`/skew gate `nbf`/`exp`; the `aud` must equal this cluster's id
-/// (when known) so a token minted for another cluster can't be replayed here.
+/// metrics).
 pub fn verify_auth_hello(
     token: &[u8],
     inner: &AuthzInner,
     now: u64,
 ) -> Result<BoundPrincipal, String> {
-    let claims = verify_token(
+    autumn_rpc::cap_token::bind_principal(
         token,
-        |kid| inner.keys.get(&kid).copied(),
+        &inner.keys,
+        &inner.cluster_id,
         now,
         inner.clock_skew_secs,
     )
-    .map_err(|r: AuthReject| r.label().to_string())?;
-    // aud must match this cluster (defends cross-cluster replay when signing
-    // keys are shared). Skipped only when this PS doesn't know its cluster_id.
-    if !inner.cluster_id.is_empty() && claims.aud != inner.cluster_id {
-        return Err("wrong_audience".to_string());
-    }
-    Ok(BoundPrincipal {
-        allowed_prefixes: claims.allowed_prefixes,
-        exp: claims.exp,
-        kid: claims.kid,
-    })
 }
 
 fn denied(msg: &str) -> Option<(StatusCode, String)> {
@@ -237,13 +192,9 @@ fn check_key(
         Some(p) => p,
         None => return denied("protected key requires a capability token (no AUTH_HELLO on this connection)"),
     };
-    if !inner.keys.contains_key(&p.kid) {
-        // kid disabled / rotated out since this connection bound — revoke it
-        // (coco P1: closes the "emergency bulk revocation misses live conns" gap).
-        return denied("signing key disabled/rotated; re-authenticate");
-    }
-    if now > p.exp.saturating_add(inner.clock_skew_secs) {
-        return denied("capability token expired; re-authenticate");
+    // A kid disabled / rotated out since this connection bound revokes it.
+    if let Err(m) = autumn_rpc::cap_token::still_valid(p, &inner.keys, now, inner.clock_skew_secs) {
+        return denied(m);
     }
     if p.allowed_prefixes.iter().any(|ap| key.starts_with(ap)) {
         None
@@ -273,11 +224,8 @@ fn check_range(
         Some(p) => p,
         None => return denied("protected range requires a capability token (no AUTH_HELLO on this connection)"),
     };
-    if !inner.keys.contains_key(&p.kid) {
-        return denied("signing key disabled/rotated; re-authenticate");
-    }
-    if now > p.exp.saturating_add(inner.clock_skew_secs) {
-        return denied("capability token expired; re-authenticate");
+    if let Err(m) = autumn_rpc::cap_token::still_valid(p, &inner.keys, now, inner.clock_skew_secs) {
+        return denied(m);
     }
     if !prefix.is_empty() && p.allowed_prefixes.iter().any(|ap| prefix.starts_with(ap)) {
         None
@@ -304,22 +252,6 @@ fn check_range(
 /// auth is a separate concern) and `AUTH_HELLO` (handled by the connection
 /// loop). Adding a new keyed read/write RPC without an arm here silently lets
 /// it read/write any tenant's `mem/` prefix. If you add one, add it here too.
-/// (PS slice): constant-time byte equality for the admin token.
-/// The token is a fixed-width hex secret, so a length mismatch is not sensitive;
-/// equal lengths are compared with an XOR-accumulate that never short-circuits,
-/// so a matching prefix can't be timed out. (The PS has no sha2/subtle dep, so
-/// this is a small local impl rather than the manager's hash-then-compare.)
-pub fn ct_eq_bytes(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 pub fn authz_check(
     msg_type: u8,
     payload: &[u8],
@@ -538,7 +470,6 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
-            admin_token: Vec::new(),
         }
     }
 
@@ -600,7 +531,6 @@ mod tests {
         assert!(check_range(b"acme/mem/", None, &inner, now).is_some());
     }
 
-    #[test]
     /// A batched delete must be gated key by key, like every other keyed RPC.
     ///
     /// This is the arm whose ABSENCE is the danger: `authz_check` ends in
@@ -657,6 +587,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn authz_check_dispatch_get_and_put() {
         let inner = inner_with(vec![]);
         let p = acme();
@@ -711,7 +642,6 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
             namespaces: Vec::new(),
-            admin_token: Vec::new(),
         };
         let now = 1_000_000;
         let mk = |aud: &str| CapClaims {
@@ -738,7 +668,6 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
             namespaces: Vec::new(),
-            admin_token: Vec::new(),
         };
         assert!(verify_auth_hello(&token, &inner2, now).is_err());
         // wrong audience (token minted for a DIFFERENT cluster) → reject (coco P1)
@@ -757,36 +686,10 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
-            admin_token: Vec::new(),
         };
         let p = acme(); // kid 1
         assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner_disabled, 999_000).is_some());
         assert!(check_range(b"mem/acme/", Some(&p), &inner_disabled, 999_000).is_some());
-    }
-
-    #[test]
-    fn ct_eq_bytes_matches_only_exact() {
-        assert!(ct_eq_bytes(b"deadbeef", b"deadbeef"));
-        assert!(!ct_eq_bytes(b"deadbeef", b"deadbee0"));
-        assert!(!ct_eq_bytes(b"deadbeef", b"deadbee")); // length differs
-        assert!(ct_eq_bytes(b"", b""));
-    }
-
-    #[test]
-    fn install_caches_admin_token_from_config() {
-        // (PS slice): the PS learns the admin secret from the
-        // manager's GetAuthzConfigResp and stores it in the snapshot.
-        let st = AuthzState::new();
-        // Absent by default (opt-in: the gate runs bare).
-        assert!(st.snapshot().admin_token.is_empty());
-        st.install(&GetAuthzConfigResp {
-            admin_token: b"the-secret".to_vec(),
-            ..Default::default()
-        });
-        assert_eq!(st.snapshot().admin_token, b"the-secret");
-        // An empty token in a later poll clears it (manager dropped its token).
-        st.install(&GetAuthzConfigResp::default());
-        assert!(st.snapshot().admin_token.is_empty());
     }
 
     #[test]
@@ -812,7 +715,6 @@ mod tests {
             ],
             protected_prefixes: vec![b"mem/".to_vec()],
             namespaces: Vec::new(),
-            admin_token: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 45,
             cluster_id: "cluster-abc".to_string(),
@@ -1018,7 +920,6 @@ mod tests {
             public_keys: vec![],
             protected_prefixes: vec![],
             namespaces: vec![b"kvc/".to_vec()],
-            admin_token: Vec::new(),
             token_ttl_secs: 0,
             clock_skew_secs: 0,
             cluster_id: String::new(),
@@ -1034,7 +935,6 @@ mod tests {
             public_keys: vec![],
             protected_prefixes: vec![],
             namespaces: vec![],
-            admin_token: Vec::new(),
             token_ttl_secs: 0,
             clock_skew_secs: 0,
             cluster_id: String::new(),

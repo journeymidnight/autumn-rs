@@ -77,6 +77,12 @@ PS_PORT_STRIDE="${PS_PORT_STRIDE:-200}"
 ETCD_CLIENT_BASE_PORT="${ETCD_CLIENT_BASE_PORT:-2379}"
 ETCD_PEER_BASE_PORT="${ETCD_PEER_BASE_PORT:-2380}"
 BIN_DIR="$DEPLOY_DIR/bin"
+# The cluster secret: the manager, EN and PS refuse to start without
+# --cluster-secret-file, and every autumn-op call proves it. One driver-local
+# copy (generated once, reused across re-deploys) is copied to every server
+# host at CLUSTER_SECRET_REMOTE by _ensure_cluster_secret.
+CLUSTER_SECRET_LOCAL="${AUTUMN_CLUSTER_SECRET_FILE:-$HOME/.autumn-deploy/cluster.secret}"
+CLUSTER_SECRET_REMOTE="$DATA_ROOT/cluster.secret"
 
 case "$TRANSPORT" in tcp|ucx) ;; *) die "TRANSPORT must be tcp or ucx" ;; esac
 [[ "${#ETCD_HOSTS[@]}" -ge 1 ]]    || die "ETCD_HOSTS is empty"
@@ -358,7 +364,10 @@ etcd_initial_cluster() {
 # ---------------------------------------------------------------------------
 # wait helpers  (run from the deploy host, over the network)
 # ---------------------------------------------------------------------------
-op() { "$BIN_SRC/autumn-op" --manager "$MANAGER_LIST" --transport "$TRANSPORT" "$@"; }
+op() {
+    "$BIN_SRC/autumn-op" --cluster-secret-file "$CLUSTER_SECRET_LOCAL" \
+        --manager "$MANAGER_LIST" --transport "$TRANSPORT" "$@"
+}
 
 wait_manager_leader() {
     log "waiting for manager leadership at $MANAGER_LIST"
@@ -506,20 +515,20 @@ _start_managers() {
     # fresh cluster and auto-runs gc + compaction + EC + rebalance (no separate
     # arming flag). AUTUMN_AUTO_POLICY_DEFAULT=<preset|off> changes/disables it.
     # The web dashboard is a separate app (crates/server/src/bin/autumn_dashboard → the autumn-
-    # dashboard binary); run it yourself against this manager + admin token —
-    # `autumn-dashboard --manager <host>:9001 --admin-token-file <tok> --port 8799`.
+    # dashboard binary); run it yourself against this manager + cluster secret —
+    # `autumn-dashboard --manager <host>:9001 --cluster-secret-file <file> --port 8799`.
     _auto_policy="${AUTUMN_AUTO_POLICY_DEFAULT:-balanced}"
     [[ "$_auto_policy" != "off" && "$_auto_policy" != "0" ]] \
         && extra+=(--auto-policy-default "$_auto_policy")
     if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
         extra+=(--auth-signing-key-file "$AUTUMN_AUTH_SIGNING_KEY_FILE")
-        [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]] && extra+=(--admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE")
         local p; for p in ${AUTUMN_AUTH_PROTECTED_PREFIXES:-}; do extra+=(--auth-protected-prefix "$p"); done
         [[ -n "${AUTUMN_AUTH_TOKEN_TTL_SECS:-}" ]] && extra+=(--auth-token-ttl-secs "$AUTUMN_AUTH_TOKEN_TTL_SECS")
     fi
     for (( m = 0; m < ${#MANAGER_HOSTS[@]}; m++ )); do
         host="${MANAGER_HOSTS[$m]}"
         svc_start "$host" "manager$m" "$DATA_ROOT" "$BIN_DIR/autumn-manager-server" \
+            --cluster-secret-file "$CLUSTER_SECRET_REMOTE" \
             --port "$MANAGER_PORT" --etcd "$ETCD_ENDPOINTS" \
             --listen "$(plain_host "$host")" --transport "$TRANSPORT" \
             ${extra[@]:+"${extra[@]}"}
@@ -538,7 +547,7 @@ _format_and_start_ens() {
         local dirs_sp="${dirs//,/ }"
         on_host "$host" "mkdir -p $dirs_sp"
         log "format en$i ($host:$port, dirs=$dirs)"
-        on_host "$host" "'$BIN_DIR/autumn-op' --manager '$MANAGER_FIRST' --transport '$TRANSPORT' format $dirs_sp"
+        on_host "$host" "'$BIN_DIR/autumn-op' --cluster-secret-file '$CLUSTER_SECRET_REMOTE' --manager '$MANAGER_FIRST' --transport '$TRANSPORT' format $dirs_sp"
         # One shard, pinned to AUTUMN_EXTENT_CPUSET or else the host's first
         # allowed core. Not a hardcoded 0: the EN refuses a --cpuset core
         # outside its cgroup (a container without core 0 would never start).
@@ -563,6 +572,7 @@ _format_and_start_ens() {
         # F-EN-DYNSHARD M1a: --advertise is now REQUIRED with --manager — the
         # EN self-registers its live address + shard ports at every startup.
         svc_start "$host" "en$i" "$DATA_ROOT" "$BIN_DIR/autumn-extent-node" \
+            --cluster-secret-file "$CLUSTER_SECRET_REMOTE" \
             --port "$port" --data "$dirs" --manager "$MANAGER_FIRST" \
             --listen "$ph" --advertise "$(bracket_ip_static "$host"):$port" \
             --transport "$TRANSPORT" ${cpu_args[@]:+"${cpu_args[@]}"} \
@@ -655,6 +665,7 @@ _start_ps() {
         # 9701 (their data ports are already strided by PS_PORT_STRIDE).
         [[ "${AUTUMN_METRICS:-0}" == "1" ]] && inst_args+=(--metrics-port "$(( 9701 + i ))")
         svc_start "$host" "ps$i" "$DATA_ROOT" "$BIN_DIR/autumn-ps" \
+            --cluster-secret-file "$CLUSTER_SECRET_REMOTE" \
             --psid "$psid" --port "$port" --manager "$MANAGER_LIST" \
             --listen "$ph" --advertise "$(bracket_ip_static "$host"):$port" \
             --transport "$TRANSPORT" ${inst_args[@]:+"${inst_args[@]}"}
@@ -681,15 +692,35 @@ wait_ps_ready() {
     sed -n '/^partition servers:/,/^nodes:/p' <<<"$out" | sed '$d' >&2
 }
 
+# Generate the driver-local cluster secret ONCE (every server must hold the same
+# value, so it is never regenerated while the file exists) and copy it to every
+# manager / EN / PS host. Idempotent; runs before any server starts.
+_ensure_cluster_secret() {
+    if [[ ! -s "$CLUSTER_SECRET_LOCAL" ]]; then
+        mkdir -p "$(dirname "$CLUSTER_SECRET_LOCAL")"
+        ( umask 077; "$BIN_SRC/autumn-op" gen-cluster-secret > "$CLUSTER_SECRET_LOCAL" ) \
+            || die "gen-cluster-secret failed"
+        log "generated cluster secret → $CLUSTER_SECRET_LOCAL"
+    fi
+    local -A seen=()
+    local host i
+    for host in "${MANAGER_HOSTS[@]}" "${PS_HOSTS[@]}"; do seen["$(plain_host "$host")"]="$host"; done
+    for (( i = 0; i < ${#EN_NODES[@]}; i++ )); do seen["$(plain_host "$(en_host "$i")")"]="$(en_host "$i")"; done
+    for host in "${seen[@]}"; do
+        on_host "$host" "mkdir -p '$DATA_ROOT'"
+        copy_to_host "$CLUSTER_SECRET_LOCAL" "$host" "$CLUSTER_SECRET_REMOTE"
+        on_host "$host" "chmod 600 '$CLUSTER_SECRET_REMOTE'"
+    done
+}
+
 # F-AUTHZ-BUILTIN: authz is ON by default at the DEPLOY layer (the dev/test
 # harness `cluster.sh` never sets AUTUMN_AUTH_* so it stays OFF). Auto-generate a
-# signing key + admin token ONCE (reused across re-deploys — re-genning would
+# signing key ONCE (reused across re-deploys — re-genning would
 # invalidate every minted credential), protect the built-in namespaces, and
 # distribute the key to every manager host. Escape hatch: AUTUMN_AUTH_DISABLE=1.
 # If the operator already set AUTUMN_AUTH_SIGNING_KEY_FILE, respect it and only
 # default the protected-prefix list. Sets AUTUMN_AUTH_* env that the existing
 # `_start_managers` env→flag block consumes.
-AUTHZ_LOCAL_ADMIN_TOKEN=""
 AUTHZ_LOCAL_DIR=""
 _ensure_authz() {
     if [[ "${AUTUMN_AUTH_DISABLE:-0}" == "1" ]]; then
@@ -697,7 +728,7 @@ _ensure_authz() {
         # in the caller's env would otherwise make `_start_managers` append
         # --auth-signing-key-file anyway, so the manager would still enforce despite
         # the "disabled" log (coco P2). Clear all authz env so disable really disables.
-        unset AUTUMN_AUTH_SIGNING_KEY_FILE AUTUMN_ADMIN_TOKEN_FILE AUTUMN_AUTH_PROTECTED_PREFIXES
+        unset AUTUMN_AUTH_SIGNING_KEY_FILE AUTUMN_AUTH_PROTECTED_PREFIXES
         log "authz: DISABLED (AUTUMN_AUTH_DISABLE=1)"
         return
     fi
@@ -710,10 +741,10 @@ _ensure_authz() {
         return
     fi
 
-    # Driver-local, persisted so re-deploys keep the SAME key + token.
+    # Driver-local, persisted so re-deploys keep the SAME key.
     local ldir="${AUTUMN_AUTHZ_DIR:-$HOME/.autumn-deploy/authz}"
     mkdir -p "$ldir"; chmod 700 "$ldir" 2>/dev/null || true
-    local lkey="$ldir/signing.key" ltok="$ldir/admin.token"
+    local lkey="$ldir/signing.key"
     if [[ ! -s "$lkey" ]]; then
         "$BIN_SRC/autumn-op" gen-signing-key > "$lkey" 2>/dev/null || die "authz: gen-signing-key failed"
         chmod 600 "$lkey" 2>/dev/null || true
@@ -721,21 +752,14 @@ _ensure_authz() {
     else
         log "authz: reusing signing key → $lkey"
     fi
-    if [[ ! -s "$ltok" ]]; then
-        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$ltok"
-        chmod 600 "$ltok" 2>/dev/null || true
-    fi
 
     # Distribute to every manager host; point the managers at the per-host path.
-    local mkey="$DATA_ROOT/authz/signing.key" mtok="$DATA_ROOT/authz/admin.token" h
+    local mkey="$DATA_ROOT/authz/signing.key" h
     for h in "${MANAGER_HOSTS[@]}"; do
         on_host "$h" "mkdir -p '$DATA_ROOT/authz'"
         copy_to_host "$lkey" "$h" "$mkey"
-        copy_to_host "$ltok" "$h" "$mtok"
     done
     export AUTUMN_AUTH_SIGNING_KEY_FILE="$mkey"
-    export AUTUMN_ADMIN_TOKEN_FILE="$mtok"
-    AUTHZ_LOCAL_ADMIN_TOKEN="$ltok"
     AUTHZ_LOCAL_DIR="$ldir"
     log "authz: ENABLED (protect-everything) — key on ${#MANAGER_HOSTS[@]} manager(s)"
 }
@@ -746,7 +770,7 @@ _ensure_authz() {
 # exists (re-minting ROTATES it, invalidating already-distributed copies).
 _provision_credential() {
     [[ "${AUTUMN_AUTH_DISABLE:-0}" == "1" ]] && return
-    [[ -z "$AUTHZ_LOCAL_ADMIN_TOKEN" ]] && return  # operator-provided key ⇒ they own credentials
+    [[ -z "$AUTHZ_LOCAL_DIR" ]] && return  # operator-provided key ⇒ they own credentials
     local cred="$AUTHZ_LOCAL_DIR/default.cred"
     # Skip ONLY if the local credential is present AND still valid on THIS
     # cluster — a `mint-token` verify catches a wiped/rebuilt etcd (or a fresh
@@ -754,8 +778,8 @@ _provision_credential() {
     # not; skipping there would leave every client with a dead credential (coco
     # P1). `default.cred` holds the BARE hex (mint-token's --credential-file
     # reads a plain hex string; the native clients accept bare hex too).
-    if [[ -s "$cred" ]] && "$BIN_SRC/autumn-op" --manager "$MANAGER_LIST" \
-            mint-token --tenant default --credential-file "$cred" >/dev/null 2>&1; then
+    if [[ -s "$cred" ]] && "$BIN_SRC/autumn-op" --cluster-secret-file "$CLUSTER_SECRET_LOCAL" \
+            --manager "$MANAGER_LIST" mint-token --tenant default --credential-file "$cred" >/dev/null 2>&1; then
         log "authz: default credential valid on this cluster → $cred"
         return
     fi
@@ -763,9 +787,9 @@ _provision_credential() {
     # TENANT-FIRST: grant the WHOLE tenant `default/` (covers default/fs/,
     # default/kvc/, default/mem/ — the key layout is {tenant}/{namespace}/).
     local tmp="$cred.tmp"
-    if "$BIN_SRC/autumn-op" --manager "$MANAGER_LIST" tenant-create \
-            --tenant default --prefix default/ \
-            --admin-token-file "$AUTHZ_LOCAL_ADMIN_TOKEN" 2>/dev/null \
+    if "$BIN_SRC/autumn-op" --cluster-secret-file "$CLUSTER_SECRET_LOCAL" \
+            --manager "$MANAGER_LIST" tenant-create \
+            --tenant default --prefix default/ 2>/dev/null \
             | awk '/^credential:/{print $2}' > "$tmp" && [[ -s "$tmp" ]]; then
         chmod 600 "$tmp" 2>/dev/null || true
         mv -f "$tmp" "$cred"   # atomic replace
@@ -773,7 +797,7 @@ _provision_credential() {
         log "  clients: fuse/autumnfs/autumn-client --credential-file $cred --tenant default"
     else
         rm -f "$tmp"
-        log "authz: WARN tenant-create failed — mint manually: autumn-op --manager $MANAGER_LIST tenant-create --tenant default --prefix default/ --admin-token-file <token>"
+        log "authz: WARN tenant-create failed — mint manually: autumn-op --cluster-secret-file $CLUSTER_SECRET_LOCAL --manager $MANAGER_LIST tenant-create --tenant default --prefix default/"
     fi
 }
 
@@ -784,6 +808,7 @@ do_start() {
         do_deploy
     fi
     _start_etcd
+    _ensure_cluster_secret # every server + autumn-op needs it
     _ensure_authz          # F-AUTHZ-BUILTIN: set AUTUMN_AUTH_* before managers start
     _start_managers
     _format_and_start_ens
@@ -793,7 +818,7 @@ do_start() {
     log "cluster started."
     log "  manager(s): $MANAGER_LIST"
     log "  data plane: $BIN_SRC/autumn-client --manager $MANAGER_LIST put mykey /path"
-    log "  op plane:   $BIN_SRC/autumn-op --manager $MANAGER_LIST info"
+    log "  op plane:   $BIN_SRC/autumn-op --cluster-secret-file $CLUSTER_SECRET_LOCAL --manager $MANAGER_LIST info"
 }
 
 # Stop in reverse dependency order.
@@ -819,9 +844,9 @@ do_restart() {
     local role="${EXTRA[0]:-}"
     case "$role" in
         etcd)    do_stop etcd; _start_etcd ;;
-        manager) do_stop manager; _start_managers ;;
-        en)      do_stop en; _format_and_start_ens ;;
-        ps)      do_stop ps; _start_ps ;;
+        manager) do_stop manager; _ensure_cluster_secret; _start_managers ;;
+        en)      do_stop en; _ensure_cluster_secret; _format_and_start_ens ;;
+        ps)      do_stop ps; _ensure_cluster_secret; _start_ps ;;
         "")      do_stop; do_start ;;
         *)       die "restart: unknown role '$role' (etcd|manager|en|ps)" ;;
     esac

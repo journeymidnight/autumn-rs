@@ -41,6 +41,8 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
 struct Args {
+    /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
+    cluster_secret_file: Option<PathBuf>,
     /// Primary (shard 0) listen port. Sibling shards use
     /// `port + shard_idx * shard_stride` (default stride 10).
     port: u16,
@@ -112,6 +114,7 @@ struct Args {
 }
 
 fn parse_args() -> Args {
+    let mut cluster_secret_file: Option<PathBuf> = None;
     let mut port: u16 = 9101;
     let mut data_dirs: Vec<PathBuf> = Vec::new();
     let mut manager: Option<String> = None;
@@ -141,6 +144,10 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--cluster-secret-file" => {
+                i += 1;
+                cluster_secret_file = Some(PathBuf::from(&args[i]));
+            }
             "--port" => {
                 i += 1;
                 port = args[i].parse().expect("--port must be a number");
@@ -280,6 +287,7 @@ fn parse_args() -> Args {
     }
 
     Args {
+        cluster_secret_file,
         port,
         data_dirs,
         manager,
@@ -596,6 +604,10 @@ fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+    if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref()) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     // Apply the EC-convert stripe size (process-global, first-call-wins) before
     // any shard runs an EC convert. Flag > env > 64 MiB default.
     if let Some(n) = args.ec_stripe_bytes {

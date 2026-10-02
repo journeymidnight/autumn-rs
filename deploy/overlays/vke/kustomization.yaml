@@ -117,8 +117,8 @@ patches:
       # was caught: bootstrap CrashLoopBackOff'd on the v29 image.
       #
       # Presplit per namespace AFTER bootstrap instead (see docs/ops.md):
-      #   autumn-op presplit --namespace fs  --lanes 24 --parts 6 --admin-token-file F
-      #   autumn-op presplit --namespace kvc --count 8 --hash-prefix '<model>/…'
+      #   autumn-op --cluster-secret-file F presplit --namespace fs  --lanes 24 --parts 6
+      #   autumn-op --cluster-secret-file F presplit --namespace kvc --count 8 --hash-prefix '<model>/…'
       # The write-fanout benchmark the old value cited (p1 7.7k → p32 65k ops/s,
       # 4K RF=3 on NVMe) still argues for splitting — it just has to happen on a
       # namespace, where the cut points land among real keys.

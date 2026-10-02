@@ -19,10 +19,12 @@
 set -u
 cd /data/dongmao_dev/autumn-rs
 BIN=target/debug
-W=/tmp/ec-prog; PB=22000; TOK=ectok
+W=/tmp/ec-prog; PB=22000; SECRET="$W/cluster.secret"
 MGR="127.0.0.1:$((PB+1))"; PS=$((PB+201)); DASH=$((PB+301)); ETCD=$((PB+401))
-AO="$BIN/autumn-op --admin-token $TOK --manager $MGR"
+AO="$BIN/autumn-op --cluster-secret-file $SECRET --manager $MGR"
 rm -rf "$W"; mkdir -p "$W"
+# Every server and autumn-op proves the same cluster secret.
+( umask 077; "$BIN/autumn-op" gen-cluster-secret >"$SECRET" ) || { echo FAIL-secret; exit 1; }
 PIDS=(); cleanup(){ for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; }
 trap cleanup EXIT
 for p in $ETCD $((ETCD+1)) $((PB+1)) $PS $DASH 22101 22102 22103 22104; do
@@ -36,7 +38,7 @@ etcd --name ecp --data-dir "$W/etcd" \
   --listen-peer-urls "http://127.0.0.1:$((ETCD+1))" --initial-advertise-peer-urls "http://127.0.0.1:$((ETCD+1))" \
   --initial-cluster "ecp=http://127.0.0.1:$((ETCD+1))" >"$W/etcd.log" 2>&1 & PIDS+=($!)
 wp $ETCD || { echo FAIL-etcd; exit 1; }
-"$BIN/autumn-manager-server" --port $((PB+1)) --listen 127.0.0.1 --admin-token $TOK \
+"$BIN/autumn-manager-server" --port $((PB+1)) --listen 127.0.0.1 --cluster-secret-file "$SECRET" \
   --etcd "127.0.0.1:$ETCD" >"$W/mgr.log" 2>&1 & PIDS+=($!)
 wp $((PB+1)) || { echo FAIL-mgr; tail -5 "$W/mgr.log"; exit 1; }
 
@@ -44,13 +46,15 @@ wp $((PB+1)) || { echo FAIL-mgr; tail -5 "$W/mgr.log"; exit 1; }
 for i in 1 2 3 4; do
   mkdir -p "$W/en$i"
   $AO format "$W/en$i" >"$W/fmt$i.log" 2>&1 || { echo "FAIL-format$i"; cat "$W/fmt$i.log"; exit 1; }
-  "$BIN/autumn-extent-node" --data "$W/en$i" --port $((22100+i)) --manager "$MGR" --cpuset $((i-1)) \
+  "$BIN/autumn-extent-node" --cluster-secret-file "$SECRET" \
+    --data "$W/en$i" --port $((22100+i)) --manager "$MGR" --cpuset $((i-1)) \
     --advertise "127.0.0.1:$((22100+i))" --listen 127.0.0.1 >"$W/en$i.log" 2>&1 & PIDS+=($!)
   wp $((22100+i)) || { echo "FAIL-en$i"; tail -5 "$W/en$i.log"; exit 1; }
 done
 sleep 4
 $AO bootstrap --replication 3+0 >"$W/boot.log" 2>&1 || { echo FAIL-boot; cat "$W/boot.log"; exit 1; }
-"$BIN/autumn-ps" --psid 1 --port $PS --manager "$MGR" --data "$W/ps1" \
+"$BIN/autumn-ps" --cluster-secret-file "$SECRET" \
+  --psid 1 --port $PS --manager "$MGR" --data "$W/ps1" \
   --listen 127.0.0.1 --advertise "127.0.0.1:$PS" \
   --max-extent-size-bytes $((1024*1024*1024)) >"$W/ps.log" 2>&1 & PIDS+=($!)
 wp $PS || { echo FAIL-ps; tail -5 "$W/ps.log"; exit 1; }
@@ -59,7 +63,7 @@ sleep 5
 # Layer-A namespace registry is active whenever it is non-empty, and bootstrap
 # always seeds fs/kvc/mem — so an unregistered first key segment is rejected
 # even with authz off. perf-check writes under `bench/perf`.
-$AO namespace-create --name bench --admin-token $TOK >"$W/ns.log" 2>&1 || true
+$AO namespace-create --name bench >"$W/ns.log" 2>&1 || true
 
 # Only a ROLL seals an extent — a PS restart replays and keeps appending to the
 # same open tail (verified). So cap extents at 1 GiB and write just past it:
@@ -75,7 +79,7 @@ timeout -s KILL 35 "$BIN/autumn-client" --manager "$MGR" perf-check --threads 8 
 grep -E "Total data|Ops/sec" "$W/fill.log" | head -2
 sleep 5
 
-OPJ="$BIN/autumn-op --admin-token $TOK --json --manager $MGR"
+OPJ="$BIN/autumn-op --cluster-secret-file $SECRET --json --manager $MGR"
 
 echo "--- find the biggest SEALED extent ---"
 $OPJ overview >"$W/ov.json" 2>&1

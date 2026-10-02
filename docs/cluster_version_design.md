@@ -33,7 +33,7 @@
 
 rkyv 不提供 Protobuf 式字段增补兼容：新增 Option 字段也可能改变 archived layout，需要判断并 bump wire。普通优化、修复和未改变协议的发布不 bump。客户端 surface 改变时须保留真实旧入口/类型，或明确收紧兼容范围；不能仅用整数窗口声称兼容。
 
-保留当前 WIRE_VERSION = 51、MIN_CLIENT_WIRE_VERSION = 43 及对应机制。本计划不因新增 Hello 自动 bump wire 或提高客户端下界；后续业务协议确有变化时，再按相应变更规则处理。
+当前 WIRE_VERSION = 52、MIN_CLIENT_WIRE_VERSION = 43。新增 Hello 不自动 bump wire 或提高客户端下界；业务协议确有变化时，再按相应变更规则处理。
 
 客户端连接时使用现有区间检查：服务端提供 [MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]，客户端声明的 client_wire_version 必须位于该区间。当前 SDK 使用自身 WIRE_VERSION 作为声明值。这是客户端所用协议与服务端支持集合有交集；不把内部 peer 的准入改成区间 overlap。内部成员只使用 WIRE_VERSION exact-match。
 
@@ -47,10 +47,10 @@ rkyv 不提供 Protobuf 式字段增补兼容：新增 Option 字段也可能改
 
 ## 3. 已接入的连接路径
 
-- manager、PS、EN 的 listener 均先完成 `version_hello::accept`，再创建业务 `FrameDecoder`。
-- `RpcClient::connect` / `from_conn` 在启动业务 reader/writer 前完成握手。默认 peer；SDK 使用 client，autumn-op 使用 admin，EN 身份检查和注册显式使用 peer。
+- manager、PS、EN 的 listener 均先完成 `version_hello::accept`，再对 Peer / Admin 连接完成 `peer_auth::accept`（集群密钥，见 `cluster_secret_design.md`），然后才创建业务 `FrameDecoder`。
+- `RpcClient::connect` / `from_conn` 在启动业务 reader/writer 前完成两步握手（VERSION_HELLO，Peer / Admin 再加 PEER_AUTH）。默认 peer；SDK 使用 client，autumn-op 使用 admin，EN 身份检查和注册显式使用 peer。
 - `ConnPool` 的角色在构造时固定；失败握手不会进入连接池。SDK 到 EN 的 direct-read 池独立使用 client。
-- manager、PS、EN 在分派或批量 append 合并前执行 role × opcode 检查。原有 AUTH、admin token、capability、cluster_id、ownership 检查继续执行（capability 只在 PS 检查，EN 没有鉴权）。
+- manager、PS、EN 在分派或批量 append 合并前执行 role × opcode 检查。role 只是声明，Peer / Admin 由 PEER_AUTH 证明；capability（AUTH_HELLO）、cluster_id、ownership 检查继续执行。
 - PS 获取 owner lock 和注册、EN 校验 manager 身份和注册，在明确的 wire mismatch 或暂时传输故障时等待重试，不跳过版本检查。身份、授权、存储异常仍返回错误。
 
 ## 4. 连接与请求的统一准入
@@ -59,7 +59,7 @@ rkyv 不提供 Protobuf 式字段增补兼容：新增 Option 字段也可能改
 
 统一版本握手命名为 VERSION_HELLO，常量 MSG_VERSION_HELLO = 0xF0（manager、PS、EN 共用）。使用新 magic AUPH，bootstrap_version 初始为 1；既有 MSG_CLIENT_HELLO = 0x5F 的冻结编码不修改。VERSION_HELLO 使用独立冻结的固定格式解析，不依赖 rkyv 或业务 FrameDecoder。
 
-AUTH_HELLO = 0x55 是既有 SDK → PS 认证消息，仍使用现有 rkyv 编码：请求 AuthHelloReq { token: Vec<u8> }，响应 AuthHelloResp { code: u8, message: String }。连接先完成 VERSION_HELLO，再按现有认证配置执行 AUTH_HELLO；admin token 校验继续在各自入口执行。EN 不做任何鉴权：开启 authz 时，直读描述符只由 PS 在 authz 检查之后发放，EN 对通过 VERSION_HELLO 的连接直接服务。版本 Hello 的 role 仅作协议声明，不授予身份或权限。
+AUTH_HELLO = 0x55 是既有 SDK → PS 认证消息，仍使用现有 rkyv 编码：请求 AuthHelloReq { token: Vec<u8> }，响应 AuthHelloResp { code: u8, message: String }。客户端连接先完成 VERSION_HELLO，再按现有认证配置执行 AUTH_HELLO（PS；开启 authz 时也包括 EN 的直读连接）。Peer / Admin 连接在 VERSION_HELLO 之后执行 PEER_AUTH（MSG_PEER_AUTH = 0xF1，与 VERSION_HELLO 同一冻结帧格式），证明持有集群密钥。版本 Hello 的 role 仅作协议声明，不授予身份或权限。
 
 bootstrap 使用固定二进制格式，包含协议标识/版本、连接角色、声明的 wire/client 版本。请求、成功响应和拒绝响应都不能依赖可变的 rkyv DTO。响应明确携带目标服务类型、服务端 wire、客户端兼容范围和失败原因，连接发起方也必须校验，不能仅依赖 listener 单向判断。
 
@@ -103,7 +103,7 @@ EN 注册与 startup identity check 显式使用 peer 模式；autumn-op 显式�
 
 direct-read 是独立客户端连接：首次建连必须 Hello；EN 按 client_wire_version 与对应客户端读请求的兼容规则准入。不能因为请求绕过 PS、读取的是 bytes 或已经向 manager/PS 做过 Hello 而跳过检查。
 
-重连、连接池替换、换 replica/EN 地址均重新握手。连接池的复用条件至少包含地址、角色与版本/身份上下文，不能把同一地址的 client、peer、admin 连接混用。extent eversion 检查继续执行；EN 不检查身份或 capability token。
+重连、连接池替换、换 replica/EN 地址均重新握手。连接池的复用条件至少包含地址、角色与版本/身份上下文，不能把同一地址的 client、peer、admin 连接混用。开启 authz 时，EN 只在 AUTH_HELLO 绑定了有效 principal 的连接上服务直读（只验身份，不验 key 范围，见 `data_plane_authz_design.md` §10）；extent eversion 检查继续执行。
 
 首次发布不以旧 SDK 的 proxy fallback 代替 SDK 更新，也不因此自动提高 MIN_CLIENT_WIRE_VERSION。后续支持窗口内的客户端还须支持统一 Hello；新服务端需保留它实际使用的 direct-read 请求及相关 token/响应编码，或对具体不兼容变更明确收紧范围。
 

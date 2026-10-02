@@ -61,19 +61,6 @@ pub const MSG_SPLIT_PART: u8 = 0x45;
 pub const MSG_MAINTENANCE: u8 = 0x47;
 pub const MSG_GET_DISCARDS: u8 = 0x48;
 
-/// (PS slice): the cluster-MUTATING PS ops gated on the admin
-/// token — split and every maintenance op (compact / auto-gc / force-gc /
-/// flush, all under `MSG_MAINTENANCE`). Token carried as the SAME payload prefix
-/// the manager slice uses (`manager_rpc::{prefix,strip}_admin_token`). The data
-/// plane (PUT/GET/DELETE/HEAD/RANGE/*_ZC) is never gated here — that is Layer-A/B.
-/// Senders that must prefix: `autumn-op` (operator) AND the MANAGER itself (its
-/// auto-policy controller drives split + gc/compact, and merge drives flush, all
-/// as manager→PS calls).
-#[inline]
-pub fn is_admin_ps_msg(msg_type: u8) -> bool {
-    matches!(msg_type, MSG_SPLIT_PART | MSG_MAINTENANCE)
-}
-
 // server-side multipart upload was REMOVED.
 // Wire constants 0x49-0x4C remain RESERVED to prevent accidental re-use
 // while old binaries with handlers may still be in flight in production
@@ -312,7 +299,14 @@ pub const MSG_AUTH_HELLO: u8 = 0x55;
 /// rolled) is a no-op.
 pub const MSG_ROLL_TAILS: u8 = 0x57;
 
-/// `MSG_AUTH_HELLO` request — the opaque capability token bytes.
+/// Largest `MSG_AUTH_HELLO` payload a server decodes. A legit token is
+/// <= `cap_token::MAX_CAP_TOKEN_LEN` (8 KiB) plus a tiny rkyv envelope; the
+/// bound is checked BEFORE the decode, which would otherwise copy an
+/// attacker-sized token before the token's own cap could reject it.
+pub const AUTH_HELLO_MAX_PAYLOAD: usize = 16 * 1024;
+
+/// `MSG_AUTH_HELLO` request — the opaque capability token bytes. Sent to a PS,
+/// and to an EN before direct reads when the cluster runs authz.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct AuthHelloReq {
     pub token: Vec<u8>,

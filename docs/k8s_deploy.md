@@ -145,31 +145,45 @@ kubectl -n autumn get pods,svc
 kubectl -n autumn wait --for=condition=complete job/autumn-bootstrap --timeout=300s
 ```
 
+## Cluster secret (required)
+
+Every manager, PS and extent-node pod — and the bootstrap Job and the
+dashboard — mounts the Secret `autumn-cluster-secret` (key `cluster.secret`,
+read-only at `/etc/autumn/cluster/`); the ConfigMap's
+`AUTUMN_CLUSTER_SECRET_FILE` points the entrypoint at it, and the servers refuse
+to start without it (`docs/cluster_secret_design.md`). `deploy/overlays/vke/deploy.sh`
+creates it once and never rotates it. For the base `deploy/k8s` kustomization,
+create it before applying:
+
+```bash
+autumn-op gen-cluster-secret > cluster.secret
+kubectl -n autumn create secret generic autumn-cluster-secret --from-file=cluster.secret
+```
+
+The fuse and S3 roles hold no secret; they wait for the manager with a TCP
+probe instead of `autumn-op info`.
+
 ## Authz (ON by default)
 
 `deploy/overlays/vke/deploy.sh` provisions data-plane authz automatically:
-it generates the `autumn-authz` Secret (signing key + admin
-token) **once — never rotated here** (rotating invalidates every minted
-credential) — and the manager StatefulSet mounts it (`optional`, at
-`/etc/autumn/authz`). The ConfigMap sets `AUTUMN_AUTH_PROTECTED_PREFIXES=fs/ kvc/
-mem/`; the entrypoint engages authz only when the Secret is actually present
-(`-s` gate), so a cluster deployed without it — or with
-`AUTUMN_AUTH_DISABLE=1` in the ConfigMap — runs authz-OFF instead of
-crash-looping.
+it generates the `autumn-authz` Secret (signing key) **once — never rotated
+here** (rotating invalidates every minted credential) — and the manager
+StatefulSet mounts it (`optional`, at `/etc/autumn/authz`). The ConfigMap sets
+`AUTUMN_AUTH_PROTECTED_PREFIXES=fs/ kvc/ mem/`; the entrypoint engages authz only
+when the Secret is actually present (`-s` gate), so a cluster deployed without
+it — or with `AUTUMN_AUTH_DISABLE=1` in the ConfigMap — runs authz-OFF instead
+of crash-looping.
 
-Mint a client credential + Secret (once the cluster is up):
+Mint a client credential + Secret (once the cluster is up), from a host that
+holds the cluster secret:
 
 ```bash
-# admin token lives in the autumn-authz Secret
-ADMIN=$(kubectl -n autumn get secret autumn-authz -o jsonpath='{.data.admin\.token}' | base64 -d)
-# mint a 'default'-tenant credential (run against the manager Service).
-# TENANT-FIRST: grant the whole tenant `default/` (covers default/fs/, default/kvc/,
-# default/mem/). --admin-token-file reads the token from a file (process
-# substitution keeps it out of argv).
-autumn-op --manager <mgr> tenant-create --tenant default \
-    --prefix default/ \
-    --admin-token-file <(printf %s "$ADMIN") | awk '/^credential:/{print $2}' > default.cred
-kubectl -n autumn create secret generic autumn-credential --from-file=credential=default.cred
+kubectl -n autumn get secret autumn-cluster-secret \
+    -o jsonpath='{.data.cluster\.secret}' | base64 -d > cluster.secret
+# A principal granting the whole `fs/` namespace (or a sub-prefix such as mem/app/).
+autumn-op --manager <mgr> --cluster-secret-file cluster.secret \
+    principal-create --principal app --grant fs/ > app.cred
+kubectl -n autumn create secret generic autumn-credential --from-file=credential=app.cred
 ```
 
 Client pods mount `autumn-credential` and pass `--credential-file` (native

@@ -32,7 +32,8 @@ set -euo pipefail
 
 NS="${AUTUMN_NS:-autumn}"
 MGR_POD="${AUTUMN_MANAGER_POD:-autumn-manager-0}"
-ADMIN_TOKEN="${AUTUMN_ADMIN_TOKEN_FILE:-/etc/autumn/authz/admin.token}"
+# The cluster secret as mounted in the manager pod; every autumn-op call proves it.
+CLUSTER_SECRET="${AUTUMN_CLUSTER_SECRET_FILE:-/etc/autumn/cluster/cluster.secret}"
 # Minimum healthy nodes that must REMAIN. Placement hard-excludes fenced nodes,
 # so a cluster left with fewer eligible nodes than the replica count refuses
 # new extent allocation -- loudly, but only once you try to write.
@@ -56,10 +57,9 @@ case "$ORDINAL" in ''|*[!0-9]*) echo "not an ordinal: $ORDINAL" >&2; exit 2;; es
 WORKLOAD="autumn-en-${ORDINAL}"
 PVC="data-autumn-en-${ORDINAL}"
 say() { printf '\n=== %s\n' "$*"; }
-ao() { kubectl -n "$NS" exec "$MGR_POD" -- autumn-op --manager 127.0.0.1:9001 "$@"; }
-ao_admin() {
+ao() {
   kubectl -n "$NS" exec "$MGR_POD" -- \
-    autumn-op --manager 127.0.0.1:9001 --admin-token-file "$ADMIN_TOKEN" "$@"
+    autumn-op --cluster-secret-file "$CLUSTER_SECRET" --manager 127.0.0.1:9001 "$@"
 }
 
 # --- find the pod ---------------------------------------------------------
@@ -127,7 +127,7 @@ fi
 
 # --- 1. fence -------------------------------------------------------------
 say "1/4 fence node $NODE_ID"
-ao_admin fence-node "$NODE_ID" --reason "decommission $POD" --by "${USER:-en-decommission.sh}"
+ao fence-node "$NODE_ID" --reason "decommission $POD" --by "${USER:-en-decommission.sh}"
 
 # --- 2. drain -------------------------------------------------------------
 # Shard count -> 0 is the drain. `ops list` carries live byte progress for the
@@ -155,7 +155,7 @@ done
 # has verified nothing references the node. Zero shards in `info` and a clean
 # `remove` are not the same check, so let the server have the last word.
 say "3/4 remove node $NODE_ID from the cluster"
-ao_admin remove "$NODE_ID" --by "${USER:-en-decommission.sh}"
+ao remove "$NODE_ID" --by "${USER:-en-decommission.sh}"
 
 # --- 4. delete the workload ----------------------------------------------
 say "4/4 delete the workload"

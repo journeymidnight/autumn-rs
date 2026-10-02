@@ -210,10 +210,11 @@ pub const MSG_GET_CLUSTER_OVERVIEW: u8 = 0x4E;
 // Client → manager: authenticate with a permanent tenant credential, get a
 // short-TTL signed token (renewed in the background before exp).
 pub const MSG_MINT_TOKEN: u8 = 0x4F;
-// PS → manager (poll, cached): fetch the public keys + protected prefixes so
-// the PS can verify tokens + know which key ranges to enforce.
+// PS / EN → manager (poll, cached): fetch the public keys + protected prefixes
+// so the PS and the EN can verify tokens (and the PS knows which key ranges to
+// enforce).
 pub const MSG_GET_AUTHZ_CONFIG: u8 = 0x50;
-// admin → manager (low-frequency, admin-token gated): create/delete a tenant
+// admin → manager (low-frequency, Admin connection only): create/delete a tenant
 // account (credential_hash + allowed_prefixes) in the KDC's account DB.
 pub const MSG_TENANT_CREATE: u8 = 0x51;
 pub const MSG_TENANT_DELETE: u8 = 0x52;
@@ -2217,7 +2218,7 @@ pub const MSG_REBALANCE_REGIONS: u8 = 0x56;
 
 // ── namespace registry (admin → manager, low-frequency) ──────────────────────
 // admin creates/deletes a `namespace/<name>` etcd registry row (leader-fenced,
-// admin-token gated — same posture as MSG_TENANT_CREATE/DELETE). The registry is
+// Admin connection only — same posture as MSG_TENANT_CREATE/DELETE). The registry is
 // the authoritative source for D7 Layer-A (writes must fall in a registered
 // namespace) + the D6 protected-prefix bridge. See docs/key_namespace_split_design.md.
 pub const MSG_NAMESPACE_CREATE: u8 = 0x57;
@@ -2461,32 +2462,15 @@ pub struct OpQueryResp {
     pub ops: Vec<OpRecord>,
 }
 
-// ── admin-token gating for cluster-mutating manager ops ──────────────────────
+// ── operator-only manager ops ────────────────────────────────────────────────
 //
-// A shared admin secret gates the control-plane ops that CHANGE the cluster but
-// are neither owner-fenced nor already admin-gated (tenant/namespace/principal
-// create/delete carry their own `admin_token` struct field). Trust model: a
-// trusted internal network defending against a ROGUE/TEST client running a
-// destructive command — NOT MITM (no TLS).
-//
-// Wire cost is ZERO: instead of adding an `admin_token` field to all eleven
-// request structs, the token is a length-prefixed PREFIX on the payload
-// (`[u32 LE len][token bytes][original payload]`), stripped and verified in one
-// place in the manager dispatch. `is_admin_mgr_msg` is the ONE list every layer
-// agrees on (client prefixes iff it holds a token; manager strips iff it holds
-// one).
-//
-// OPT-IN, unlike the struct-field ops: a manager with no admin token runs these
-// BARE (so dev / test / bench / chaos, which never set a token, are unaffected).
-// The struct-field ops stay fail-CLOSED (no token ⇒ refused) because they only
-// make sense under authz; these are everyday cluster ops.
+// The ops that change the cluster on an operator's say-so are served only on an
+// Admin connection (`version_hello::Negotiated::check_opcode` refuses them on a
+// Peer one). An Admin connection is one that proved the cluster secret
+// (`peer_auth`), so this list is the whole gate: there is no separate admin
+// token. Not the read/observability ops (info/df/list-nodes/…).
 
-/// The length-prefix width for the admin-token payload prefix.
-pub const ADMIN_TOKEN_LEN_PREFIX: usize = 4;
-
-/// True for the cluster-MUTATING manager ops that the admin token gates. NOT
-/// the read/observability ops (info/df/list-nodes/…), and NOT the ops that
-/// already carry their own `admin_token` field (tenant/namespace/principal).
+/// True for the manager ops only an Admin connection may send.
 #[inline]
 pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
     matches!(
@@ -2502,43 +2486,23 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_MERGE_PARTITIONS
             | MSG_MULTI_MODIFY_MERGE
             | MSG_OP_SUBMIT
+            | MSG_TENANT_CREATE
+            | MSG_TENANT_DELETE
+            | MSG_NAMESPACE_CREATE
+            | MSG_NAMESPACE_DELETE
+            | MSG_NAMESPACE_SET_PRESPLIT
     )
-    // UX-fix (M3): MSG_MULTI_MODIFY_MERGE (the raw merge txn) is
-    // gated too. The manager invokes it IN-PROCESS (from handle_merge_partitions
-    // + auto_dispatch_merge, not over the wire), so gating it only blocks an
-    // EXTERNAL rogue client from dispatching the low-level primitive to bypass
-    // both the admin gate AND the freeze / sacred-boundary guard that
+    // MSG_MULTI_MODIFY_MERGE (the raw merge txn) is on the list although the
+    // manager only invokes it IN-PROCESS (from handle_merge_partitions +
+    // auto_dispatch_merge): listing it keeps a Peer from dispatching the
+    // low-level primitive past the freeze / sacred-boundary guard that
     // MSG_MERGE_PARTITIONS enforces. No in-tree wire caller sends it. (Unlike
-    // MSG_MULTI_MODIFY_SPLIT, which IS PS-driven, so it stays ungated.)
+    // MSG_MULTI_MODIFY_SPLIT, which the PS drives, so it is not listed.)
     //
-    // MSG_REGISTER_NODE is DELIBERATELY NOT gated, deviating from the design
-    // doc's list. It is not operator-only: the EXTENT NODE self-registers with
-    // it at startup and re-registers after a manager restart
-    // (extent_node.rs `register_with_manager`), and the EN has no admin-token
-    // concept. Gating it would wedge cluster bring-up. CREATE_STREAM /
-    // UPSERT_PARTITION stay gated — only `autumn-op bootstrap` sends them, so
-    // cluster.sh's bootstrap call carries the token.
-}
-
-/// Prepend `[u32 LE token_len][token][payload]`. Called on the client for an
-/// `is_admin_mgr_msg` when a token is set.
-pub fn prefix_admin_token(token: &[u8], payload: &[u8]) -> bytes::Bytes {
-    let mut b = bytes::BytesMut::with_capacity(ADMIN_TOKEN_LEN_PREFIX + token.len() + payload.len());
-    b.extend_from_slice(&(token.len() as u32).to_le_bytes());
-    b.extend_from_slice(token);
-    b.extend_from_slice(payload);
-    b.freeze()
-}
-
-/// Split a payload carrying an admin-token prefix into `(token, rest)`. `None`
-/// if the prefix is malformed (too short / length runs past the buffer) — the
-/// manager treats that as a failed check, never as "run it bare".
-pub fn strip_admin_token(payload: &[u8]) -> Option<(&[u8], &[u8])> {
-    let len_bytes = payload.get(..ADMIN_TOKEN_LEN_PREFIX)?;
-    let token_len = u32::from_le_bytes(len_bytes.try_into().ok()?) as usize;
-    let token = payload.get(ADMIN_TOKEN_LEN_PREFIX..ADMIN_TOKEN_LEN_PREFIX + token_len)?;
-    let rest = &payload[ADMIN_TOKEN_LEN_PREFIX + token_len..];
-    Some((token, rest))
+    // MSG_REGISTER_NODE is NOT listed: the EXTENT NODE self-registers with it
+    // over its Peer connection at startup and after a manager restart
+    // (extent_node.rs `register_with_manager`). CREATE_STREAM /
+    // UPSERT_PARTITION are listed — only `autumn-op bootstrap` sends them.
 }
 
 /// `AutoPolicySetReq.op` values.
@@ -2653,13 +2617,11 @@ pub struct MgrInodeLeaseRecord {
 // WIRE schema file, with no reader to say which one is authoritative. Removing
 // it moves no archived layout and therefore no `WIRE_VERSION`.
 
-/// `MSG_TENANT_CREATE` — admin creates/rotates a tenant account. `admin_token`
-/// is checked (constant-time) against the manager's configured admin token
-/// (admin_auth_design.md Option A). Returns the freshly-generated permanent
+/// `MSG_TENANT_CREATE` — admin creates/rotates a tenant account (Admin
+/// connection only, `is_admin_mgr_msg`). Returns the freshly-generated permanent
 /// credential (shown once; the manager stores only its hash).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TenantCreateReq {
-    pub admin_token: String,
     pub tenant: String,
     pub allowed_prefixes: Vec<Vec<u8>>,
 }
@@ -2676,7 +2638,6 @@ pub struct TenantCreateResp {
 /// tenant's current token still works until it expires). Resp = `CodeResp`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TenantDeleteReq {
-    pub admin_token: String,
     pub tenant: String,
 }
 
@@ -2713,12 +2674,11 @@ pub struct MgrNamespace {
 }
 
 /// `MSG_NAMESPACE_CREATE` — admin registers a new namespace. Leader-only,
-/// admin-token gated (same posture as `TenantCreateReq`). Rejects reserved names
+/// Admin connection only (same posture as `TenantCreateReq`). Rejects reserved names
 /// (`fs`/`kvc`/`mem`/`default`) + any name whose `name/` prefix is a
 /// `starts_with` relation with an existing namespace prefix (disjointness).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct NamespaceCreateReq {
-    pub admin_token: String,
     pub name: String,
     /// Optional owner tenant — `Some(_)` makes the namespace protected (bridged
     /// into authz `protected_prefixes`).
@@ -2735,20 +2695,19 @@ pub struct NamespaceCreateResp {
 }
 
 /// `MSG_NAMESPACE_DELETE` — admin removes a namespace registry row. Leader-only,
-/// admin-token gated. Refuses the three built-in families. The NON-EMPTY guard
+/// Admin connection only. Refuses the three built-in families. The NON-EMPTY guard
 /// (refuse deleting a namespace whose prefix still holds data unless `--force`)
 /// is enforced CLIENT-SIDE in `autumn-op` (the manager has no KV data-plane
 /// client); this handler only removes the etcd registry row. Resp = `CodeResp`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct NamespaceDeleteReq {
-    pub admin_token: String,
     pub name: String,
 }
 
 /// `MSG_NAMESPACE_LIST` — admin lists the full registry (rich rows: name,
 /// prefix, owner_tenant, presplit, created_at). Leader-only (the registry is
 /// leader-maintained; a follower's shadow is empty/stale). Request payload is
-/// empty. Not admin-token gated — listing is read-only inspection.
+/// empty. Not Admin-only — listing is read-only inspection.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct NamespaceListResp {
     pub code: u8,
@@ -2757,15 +2716,14 @@ pub struct NamespaceListResp {
 }
 
 /// `MSG_NAMESPACE_SET_PRESPLIT` — record split points that a presplit actually
-/// applied, onto an EXISTING namespace registry row. Leader-only, admin-token
-/// gated (it changes what merge will refuse). Points are UNIONed with whatever
+/// applied, onto an EXISTING namespace registry row. Leader-only, Admin
+/// connection only (it changes what merge will refuse). Points are UNIONed with whatever
 /// the row already carries, never replaced: widening a namespace's presplit
 /// (e.g. fs 6 lanes → 24) is a superset, and dropping a sacred boundary must be
 /// a deliberate separate act, not a side effect of re-running presplit.
 /// Resp = `CodeResp`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct NamespaceSetPresplitReq {
-    pub admin_token: String,
     pub name: String,
     /// Raw split keys (absolute, as passed to `split --at`).
     pub points: Vec<Vec<u8>>,
@@ -2788,7 +2746,7 @@ pub struct PrincipalRow {
 /// `MSG_PRINCIPAL_LIST` — admin lists every registered principal + its grants.
 /// Leader-only (the account map is leader-maintained; a follower's shadow is
 /// empty/stale until it replays on promotion). Request payload is empty.
-/// NOT admin-token gated — read-only inspection, same posture as
+/// Not Admin-only — read-only inspection, same posture as
 /// `MSG_NAMESPACE_LIST`; the secret-bearing field is omitted from the row type
 /// instead (see `PrincipalRow`).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -2830,13 +2788,15 @@ pub struct AuthzPublicKey {
     pub disabled: bool,
 }
 
-/// `MSG_GET_AUTHZ_CONFIG` — PS polls this (cached). Request payload is empty.
+/// `MSG_GET_AUTHZ_CONFIG` — the PS and the EN poll this (cached). Request payload
+/// is empty.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct GetAuthzConfigResp {
     pub code: u8,
     pub message: String,
     /// Authz turned on at the manager (a signing key was configured)? When
-    /// false the PS does not enforce (opt-in; fuse/kvcache/dev unaffected).
+    /// false neither the PS nor the EN enforces (opt-in; fuse/kvcache/dev
+    /// unaffected).
     pub enabled: bool,
     pub public_keys: Vec<AuthzPublicKey>,
     /// Key prefixes under which default-DENY applies (e.g. `mem/`). A request
@@ -2853,16 +2813,8 @@ pub struct GetAuthzConfigResp {
     pub token_ttl_secs: u64,
     /// Clock-skew leeway (seconds) the PS should apply to `nbf`/`exp`.
     pub clock_skew_secs: u64,
-    /// (PS slice): the manager's shared admin secret, so the PS
-    /// can gate cluster-mutating PS ops (`is_admin_ps_msg`: split + maintenance =
-    /// gc/compact/forcegc/flush). EMPTY when the manager configured no admin token
-    /// → the PS runs those ops BARE (opt-in, same posture as the manager slice;
-    /// dev/test/chaos unaffected). Travels manager→PS in the clear, which the
-    /// trust model allows (internal network, no MITM — same as the cap-token
-    /// signing material). Additive rkyv field.
-    pub admin_token: Vec<u8>,
     /// This cluster's `cluster_id` = the token `aud` the manager mints with. The
-    /// PS enforces `token.aud == cluster_id` at AUTH_HELLO so a token minted for
+    /// PS and the EN enforce `token.aud == cluster_id` at AUTH_HELLO so a token minted for
     /// another cluster (that happens to share signing keys) can't be replayed
     /// here. Empty = unknown (manager not yet bootstrapped) → PS skips the check.
     pub cluster_id: String,

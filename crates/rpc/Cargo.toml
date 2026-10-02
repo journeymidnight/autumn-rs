@@ -28,6 +28,10 @@ rkyv = { version = "0.8.15", features = ["alloc"] }
 # cargo's feature unification turns it on for the whole graph.
 rancor = { version = "0.1", features = ["alloc"] }
 thiserror.workspace = true
+# Cluster-secret proof (`peer_auth`): HMAC-SHA256 challenge-response.
+hmac = "0.12"
+sha2 = "0.10"
+rand = "0.8"
 futures = "0.3"
 tracing = "0.1"
 # `TCP_INFO` for the keepalive's ACK-progress signal (`client::AckProbe`).

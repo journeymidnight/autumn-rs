@@ -16,7 +16,6 @@ fn client(manager: String) -> ClusterClient {
         ps_details: RefCell::new(HashMap::new()),
         part_addrs: RefCell::new(HashMap::new()),
         rpc_timeout: Cell::new(Some(Duration::from_secs(2))),
-        admin_token: RefCell::new(None),
         first_attempt_timeout: Cell::new(None),
         auth: RefCell::new(None),
         auth_gen: Cell::new(0),

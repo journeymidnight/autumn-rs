@@ -68,6 +68,13 @@ REM "for pid in \$(ps -eo pid,stat,comm | awk '\$3 ~ /^autumn-/ && \$2 !~ /Z/ {p
 sleep 2
 rm -rf "$LDATA" /tmp/autumn-rs; mkdir -p "$LDATA/d1" "$LDATA/d2"
 
+# One cluster secret for every server and autumn-op on BOTH hosts. A fresh
+# throwaway value per run; the remote copy is written over the ssh session.
+SECRET="$LDATA/cluster.secret"
+RSECRET="$RDATA/cluster.secret"
+( umask 077; "$AO" gen-cluster-secret > "$SECRET" ) || { echo "gen-cluster-secret failed"; exit 1; }
+REM "umask 077; printf %s '$(cat "$SECRET")' > $RSECRET; echo secret-ok" | grep -q secret-ok || { echo "remote secret copy failed"; exit 1; }
+
 # ── etcd + manager (local) ──────────────────────────────────────────────────
 say "starting etcd + manager on $LIP"
 setsid nohup etcd --data-dir "$LDATA/etcd" \
@@ -77,10 +84,11 @@ setsid nohup etcd --data-dir "$LDATA/etcd" \
 for i in $(seq 1 30); do curl -s http://127.0.0.1:2379/health >/dev/null 2>&1 && break; sleep 1; done
 setsid nohup "$ROOT/target/release/autumn-manager-server" \
     --port 9001 --etcd 127.0.0.1:2379 --listen "$LIP" --transport "$T" \
+    --cluster-secret-file "$SECRET" \
     > "$WORK/manager.log" 2>&1 < /dev/null &
 sleep 3
 
-AOC=(timeout 20 "$AO" --manager "$MGR" --transport "$T")
+AOC=(timeout 20 "$AO" --cluster-secret-file "$SECRET" --manager "$MGR" --transport "$T")
 CLI=(timeout 20 "$AC" --manager "$MGR" --transport "$T" --namespace mem)
 CLIS=(timeout 90 "$AC" --manager "$MGR" --transport "$T" --namespace mem)
 
@@ -113,7 +121,7 @@ wait_mgr "boot"
 say "formatting + starting ENs (2 local + 1 remote)"
 "${AOC[@]}" format "$LDATA/d1" >/dev/null 2>&1 || fail "format local d1"
 "${AOC[@]}" format "$LDATA/d2" >/dev/null 2>&1 || fail "format local d2"
-REM "cd $RROOT && timeout 20 ./target/release/autumn-op --manager '$MGR' --transport $T format $RDATA/d1 >/dev/null 2>&1 && echo fmt-ok || echo fmt-FAIL" | grep -q fmt-ok || fail "format remote d1"
+REM "cd $RROOT && timeout 20 ./target/release/autumn-op --cluster-secret-file $RSECRET --manager '$MGR' --transport $T format $RDATA/d1 >/dev/null 2>&1 && echo fmt-ok || echo fmt-FAIL" | grep -q fmt-ok || fail "format remote d1"
 
 start_local_en() { # port datadir logname
     # M1c: format is identity-only now — the EN self-registers
@@ -121,12 +129,13 @@ start_local_en() { # port datadir logname
     setsid nohup "$ROOT/target/release/autumn-extent-node" \
         --port "$1" --data "$2" --manager "$MGR" --listen "$LIP" \
         --advertise "[$LIP]:$1" \
-        --transport "$T" --cpuset 0-0 > "$WORK/$3" 2>&1 < /dev/null &
+        --transport "$T" --cpuset 0-0 --cluster-secret-file "$SECRET" \
+        > "$WORK/$3" 2>&1 < /dev/null &
 }
 start_remote_en() {
     # ssh can linger after spawning a remote daemon (sshd holds the
     # channel) — background the WHOLE ssh locally and just wait a beat.
-    REM "cd $RROOT && env $UCX_REMOTE_ENV setsid nohup ./target/release/autumn-extent-node --port 21003 --data $RDATA/d1 --manager '$MGR' --listen $RIP --advertise '[$RIP]:21003' --transport $T --cpuset 0-0 > /tmp/xh_en_remote.log 2>&1 < /dev/null &" >> "$WORK/remote_cmds.log" 2>&1 &
+    REM "cd $RROOT && env $UCX_REMOTE_ENV setsid nohup ./target/release/autumn-extent-node --port 21003 --data $RDATA/d1 --manager '$MGR' --listen $RIP --advertise '[$RIP]:21003' --transport $T --cpuset 0-0 --cluster-secret-file $RSECRET > /tmp/xh_en_remote.log 2>&1 < /dev/null &" >> "$WORK/remote_cmds.log" 2>&1 &
     sleep 3
 }
 start_local_en 21001 "$LDATA/d1" en1.log
@@ -140,8 +149,9 @@ say "bootstrap + starting PS1 (local) / PS2 (remote)"
 "${AOC[@]}" bootstrap --replication 3+0 >/dev/null 2>&1 || fail "bootstrap"
 setsid nohup "$ROOT/target/release/autumn-ps" --psid 1 --port 9301 --manager "$MGR" \
     --listen "$LIP" --advertise "[$LIP]:9301" --transport "$T" \
+    --cluster-secret-file "$SECRET" \
     > "$WORK/ps1.log" 2>&1 < /dev/null &
-REM "cd $RROOT && env $UCX_REMOTE_ENV setsid nohup ./target/release/autumn-ps --psid 2 --port 9351 --manager '$MGR' --listen $RIP --advertise '[$RIP]:9351' --transport $T > /tmp/xh_ps2.log 2>&1 < /dev/null &" >> "$WORK/remote_cmds.log" 2>&1 &
+REM "cd $RROOT && env $UCX_REMOTE_ENV setsid nohup ./target/release/autumn-ps --psid 2 --port 9351 --manager '$MGR' --listen $RIP --advertise '[$RIP]:9351' --transport $T --cluster-secret-file $RSECRET > /tmp/xh_ps2.log 2>&1 < /dev/null &" >> "$WORK/remote_cmds.log" 2>&1 &
 sleep 8
 
 parts_on() { # parts_on <hostport-grep>
@@ -250,6 +260,7 @@ write_liveness "x2"
 say "X3: respawn local PS1, then kill REMOTE PS2 → failback"
 setsid nohup "$ROOT/target/release/autumn-ps" --psid 1 --port 9301 --manager "$MGR" \
     --listen "$LIP" --advertise "[$LIP]:9301" --transport "$T" \
+    --cluster-secret-file "$SECRET" \
     > "$WORK/ps1_respawn.log" 2>&1 < /dev/null &
 sleep 6
 REM "pkill -9 -f 'autumn-ps --psid 2'; echo killed"

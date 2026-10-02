@@ -1781,6 +1781,9 @@ authz_gate checks the service/role/opcode before business DTO decoding, then
 performs existing authorization. Bulk checks occur before value allocation and
 again after receive so expiry/revocation during await cannot bypass them.
 
+- Peer/Admin connections prove the cluster secret (PEER_AUTH) right after
+  VERSION_HELLO in `handle_ps_connection`. split / maintenance are outside the
+  client surface, so that is their gate: there is no admin-token prefix.
 - protocol admission uses the client interval or exact peer/admin wire. The
   real socket test a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition
   runs with authz OFF. A refused client sends its Hello and a Put in ONE write,

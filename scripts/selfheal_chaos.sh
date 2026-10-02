@@ -33,7 +33,8 @@ DATA_ROOT="${AUTUMN_DATA_ROOT:-/data05/autumn-rs-selfheal}"
 PSLOG="/tmp/autumn-rs-logs/ps.log"
 NKEYS="${NKEYS:-12}"
 AC=("$ROOT/target/release/autumn-client" --manager "$MGR")
-AOP=("$ROOT/target/release/autumn-op" --manager "$MGR")
+AOP=("$ROOT/target/release/autumn-op" --manager "$MGR"
+     --cluster-secret-file "${AUTUMN_CLUSTER_SECRET_FILE:-$DATA_ROOT/cluster.secret}")
 FAIL=0
 
 say()  { echo "[selfheal $(date +%H:%M:%S)] $*"; }
@@ -46,7 +47,7 @@ cleanup_all() {
     sleep 1
 }
 
-kill_ps() { pkill -9 -f "autumn-ps --psid 1" 2>/dev/null; sleep 2; }
+kill_ps() { pkill -9 -f "autumn-ps .*--psid 1" 2>/dev/null; sleep 2; }
 start_ps() {
     env AUTUMN_DATA_ROOT="$DATA_ROOT" AUTUMN_TRANSPORT=tcp AUTUMN_METRICS=1 \
         AUTUMN_EXTENT_BASE_PORT=20000 \

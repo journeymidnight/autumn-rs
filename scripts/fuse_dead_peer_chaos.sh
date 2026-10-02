@@ -67,7 +67,7 @@ env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" AUTUMN
   bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" || { echo "cluster start failed"; tail -20 "$WORK/cluster.log"; exit 1; }
 sleep 3
-OP=("$BIN/autumn-op" --manager "$MGR" --admin-token-file "$AUTUMN_DATA_ROOT/authz/admin.token")
+OP=("$BIN/autumn-op" --manager "$MGR" --cluster-secret-file "${AUTUMN_CLUSTER_SECRET_FILE:-$AUTUMN_DATA_ROOT/cluster.secret}")
 
 MOUNT_MGR="$MGR"
 if [ "$TRANSPORT" = tcp ]; then
@@ -176,7 +176,7 @@ for scenario in $SCENARIOS; do
     ;;
   en-stop)
     EP=20001
-    STOPPED_PID=$(pgrep -f "$BIN/autumn-extent-node --port $EP" | head -1)
+    STOPPED_PID=$(pgrep -f "$BIN/autumn-extent-node .*--port $EP" | head -1)
     [ -n "$STOPPED_PID" ] || { fail "no EN on :$EP"; continue; }
     say "[en-stop] SIGSTOP EN :$EP pid=$STOPPED_PID for ${FAULT_SECS}s (grace ${GRACE_SECS}s)"
     kill -STOP "$STOPPED_PID"

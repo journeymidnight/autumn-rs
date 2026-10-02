@@ -55,9 +55,8 @@ struct Args {
     /// `<kid> <hex-32-byte-seed> [disabled]`. Generate via
     /// `autumn-op gen-signing-key`.
     auth_signing_key_file: Option<String>,
-    /// admin token gating `tenant-create` / `tenant-delete`
-    /// (admin_auth_design.md Option A). `None` = those admin RPCs are refused.
-    admin_token: Option<String>,
+    /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
+    cluster_secret_file: Option<std::path::PathBuf>,
     /// protected (default-DENY) key prefixes, repeatable. `mem/` is
     /// the default when authz is enabled and none is given.
     auth_protected_prefixes: Vec<String>,
@@ -86,7 +85,7 @@ fn parse_args() -> Args {
     let mut min_alloc_free_bytes: Option<u64> = None;
     let mut audit_retention_days: Option<u64> = None;
     let mut auth_signing_key_file: Option<String> = None;
-    let mut admin_token: Option<String> = None;
+    let mut cluster_secret_file: Option<std::path::PathBuf> = None;
     let mut auth_protected_prefixes: Vec<String> = Vec::new();
     let mut auth_token_ttl_secs: Option<u64> = None;
     let mut auth_clock_skew_secs: Option<u64> = None;
@@ -169,24 +168,17 @@ fn parse_args() -> Args {
                 i += 1;
                 auth_signing_key_file = Some(raw[i].clone());
             }
-            "--admin-token" => {
+            "--cluster-secret-file" => {
                 i += 1;
-                admin_token = Some(raw[i].clone());
+                cluster_secret_file = Some(raw[i].clone().into());
             }
-            // Read the admin token from a FILE — preferred over --admin-token,
-            // which leaks the secret via ps / /proc/<pid>/cmdline on a
-            // long-lived daemon. Trailing newline trimmed. cluster.sh passes
-            // this form (AUTUMN_ADMIN_TOKEN_FILE).
-            "--admin-token-file" => {
-                i += 1;
-                let path = raw[i].clone();
-                let text = std::fs::read_to_string(&path)
-                    .unwrap_or_else(|e| panic!("read --admin-token-file {path}: {e}"));
-                let tok = text.trim_end_matches(['\n', '\r']).to_string();
-                if tok.is_empty() {
-                    panic!("--admin-token-file {path} is empty");
-                }
-                admin_token = Some(tok);
+            "--admin-token" | "--admin-token-file" => {
+                eprintln!(
+                    "error: {} was removed: admin operations are authorized by the \
+                     cluster secret (--cluster-secret-file)",
+                    raw[i]
+                );
+                std::process::exit(2);
             }
             "--auth-protected-prefix" => {
                 i += 1;
@@ -224,7 +216,7 @@ fn parse_args() -> Args {
         min_alloc_free_bytes,
         audit_retention_days,
         auth_signing_key_file,
-        admin_token,
+        cluster_secret_file,
         auth_protected_prefixes,
         auth_token_ttl_secs,
         auth_clock_skew_secs,
@@ -242,6 +234,10 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+    if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref()) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     let _ = autumn_transport::init_with(args.transport);
     let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
         .context("parse listen address")?;
@@ -285,19 +281,6 @@ async fn main() -> Result<()> {
         tracing::info!(audit_retention_days = v, "audit retention configured");
     }
 
-    // The ADMIN TOKEN gates CONTROL-plane admin RPCs (namespace-create,
-    // principal-create, the merge/set-presplit ops, …) and is
-    // INDEPENDENT of data-plane authz. Apply it UNCONDITIONALLY: it used to live
-    // only inside the signing-key branch below, so a manager launched with
-    // `--admin-token-file` but no `--auth-signing-key-file` silently discarded
-    // the token and answered every admin RPC with "admin RPCs disabled". That is
-    // exactly the shape a default (authz-off) cluster needs in order to register
-    // the bench namespace (BUG-BENCH-NS-UNREGISTERED). Configuring the token can
-    // only ENABLE RPCs that were refused outright before.
-    if let Some(tok) = &args.admin_token {
-        manager.set_admin_token(tok.clone());
-    }
-
     // data-plane authz (opt-in). Loading a signing-key file ENABLES
     // it; without the flag the manager is not a KDC and PSes don't enforce.
     if let Some(path) = &args.auth_signing_key_file {
@@ -322,20 +305,16 @@ async fn main() -> Result<()> {
         if let Some(v) = args.auth_clock_skew_secs {
             manager.set_clock_skew_secs(v);
         }
-        // (admin token is applied unconditionally above — it is not part of
-        // data-plane authz.)
         tracing::info!(
             protected_prefixes = ?prefixes
                 .iter()
                 .map(|p| String::from_utf8_lossy(p).into_owned())
                 .collect::<Vec<_>>(),
-            admin_token_set = args.admin_token.is_some(),
             "data-plane authz ENABLED (manager is a KDC)"
         );
     } else if !args.auth_protected_prefixes.is_empty() {
-        // --admin-token WITHOUT a signing key is now valid (control-plane admin,
-        // applied above). Only protected-prefixes is meaningless without one —
-        // it configures data-plane enforcement that isn't running.
+        // Protected prefixes configure data-plane enforcement, which a manager
+        // without a signing key does not run.
         tracing::warn!(
             "--auth-protected-prefix given without --auth-signing-key-file; \
              data-plane authz stays DISABLED (no signing key)"

@@ -32,9 +32,8 @@ use autumn_rpc::manager_rpc::{
 
 use support::{pick_addr, start_etcd};
 
-const ADMIN: &str = "admin-secret";
 
-/// Start an etcd-backed manager WITH an admin token, STOPPABLE: dropping the
+/// Start an etcd-backed manager, STOPPABLE: dropping the
 /// returned flag's runtime (via `.store(true)`) tears down the manager's compio
 /// runtime → its leader-keepalive stops → the etcd lease expires → a successor
 /// wins the election. Mirrors `support::start_extent_node_stoppable`.
@@ -46,7 +45,6 @@ fn start_stoppable_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) -> 
             let manager = autumn_manager::AutumnManager::new_with_etcd(vec![etcd_endpoint])
                 .await
                 .expect("new manager with etcd");
-            manager.set_admin_token(ADMIN.to_string());
             compio::runtime::spawn(async move {
                 let _ = manager.serve(mgr_addr).await;
             })
@@ -64,7 +62,6 @@ fn start_stoppable_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) -> 
 
 async fn ns_create(mgr: &RpcClient, name: &str, owner: Option<&str>) -> NamespaceCreateResp {
     let payload = rkyv_encode(&NamespaceCreateReq {
-        admin_token: ADMIN.to_string(),
         name: name.to_string(),
         owner_tenant: owner.map(|s| s.to_string()),
         presplit: Vec::new(),
@@ -102,7 +99,7 @@ fn bootstrap_persists_leader_gates_and_successor_replay_rehydrates() {
         let mgr1_addr = pick_addr();
         let mgr1_flag = start_stoppable_etcd_manager(mgr1_addr, etcd_endpoint.clone());
         compio::time::sleep(Duration::from_secs(2)).await;
-        let mgr1 = RpcClient::connect(mgr1_addr).await.expect("connect mgr1");
+        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr1");
 
         let created = ns_create(&mgr1, "bench", Some("acme")).await;
         assert_eq!(created.code, CODE_OK, "create failed: {}", created.message);
@@ -125,7 +122,7 @@ fn bootstrap_persists_leader_gates_and_successor_replay_rehydrates() {
         let mgr2_addr = pick_addr();
         let _mgr2_flag = start_stoppable_etcd_manager(mgr2_addr, etcd_endpoint.clone());
         compio::time::sleep(Duration::from_secs(2)).await;
-        let mgr2 = RpcClient::connect(mgr2_addr).await.expect("connect mgr2");
+        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr2");
 
         let follower_cfg = authz_config(&mgr2).await;
         assert_eq!(

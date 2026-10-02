@@ -483,21 +483,16 @@ hashed on-disk data dirs — only logical ownership re-partitions on restart), n
 no wire-struct change (`lib.rs` is not part of the wire schema) and no etcd reset.
 Tests: `shard_for_extent_tests`.
 
-## Admin-token payload-prefix codec
+## Operator-only manager ops
 
-`is_admin_mgr_msg(msg_type)` is the set of cluster-MUTATING manager ops gated
-behind the manager's admin secret (fence/remove/maintenance/create-stream/
-upsert-partition/merge/…). Read-only observability ops and
-ops carrying their own `admin_token` field (tenant/namespace/principal) are NOT
-gated; `MSG_REGISTER_NODE` is deliberately excluded (the EN self-registers with no
-admin token — gating it would wedge bring-up). `is_admin_ps_msg` is the PS analog
-(`MSG_SPLIT_PART`, `MSG_MAINTENANCE`).
-
-The token rides as an out-of-band prefix stripped before rkyv decode:
-`prefix_admin_token(token, payload)` prepends `[u32 LE token_len][token][payload]`
-(`ADMIN_TOKEN_LEN_PREFIX = 4`); `strip_admin_token` returns `(token, rest)` or
-`None` on a malformed prefix. The manager treats `None` as a FAILED check, never
-"run it bare" — a bare unprefixed payload can't be mistaken for a valid strip.
+`is_admin_mgr_msg(msg_type)` is the set of manager ops served only on an Admin
+connection (fence/remove/maintenance/EC/create-stream/upsert-partition/merge/
+op-submit, and the principal/namespace mutations). `check_opcode` refuses them
+on a Peer connection; an Admin connection exists only after PEER_AUTH, so this
+list is the whole gate — no token rides in any request. `MSG_REGISTER_NODE` is
+deliberately not on it (the EN self-registers over its Peer connection), nor is
+`MSG_MULTI_MODIFY_SPLIT` (PS-driven). The PS's split/maintenance are outside the
+client surface, so only Peer/Admin connections reach them.
 
 ## Frame length ceiling
 
@@ -671,7 +666,9 @@ of at most 256 bytes. Integers are little-endian; CRC32C covers the frozen
 header and control. See `docs/cluster_version_design.md` for the byte layout.
 
 Every `RpcClient` constructor handshakes before starting business tasks; all
-manager/PS/EN listeners accept before creating a business decoder. Peer/admin
+manager/PS/EN listeners accept before creating a business decoder. Peer and
+Admin connections then run PEER_AUTH (below) before either side starts its
+business reader. Peer/admin
 require equal WIRE_VERSION; client requires its declared version inside the
 server interval. Connect plus Hello has a 5-second bound
 (`version_hello::TIMEOUT`); the stream `ConnPool` bounds it separately from a
@@ -694,11 +691,50 @@ port scanners and TCP health probes look exactly like that.
 
 `Negotiated::check_opcode` checks the explicit service/role surface before
 business decode or batch grouping. Role is a declaration, not a credential:
-AUTH_HELLO, admin token, cluster identity and ownership checks continue. The EN
-has no authorization of its own: with authz enabled the PS hands out
-direct-read descriptors only after its authz check, and the EN serves any
-connection past VERSION_HELLO. Unknown and retired opcodes are refused.
-Duplicate Hello cannot change the connection's role.
+PEER_AUTH proves a Peer/Admin declaration, AUTH_HELLO a client's principal;
+cluster identity and ownership checks continue. A Client on an EN may send
+`READ_BYTES`, `READ_BYTES_BULK` and `AUTH_HELLO` (0x55, the same message the PS
+takes), which binds the principal the EN requires for direct reads when the
+cluster runs authz. Unknown and retired opcodes are refused. Duplicate Hello
+cannot change the connection's role.
+
+### `PEER_AUTH` (0xF1): cluster-member proof
+
+`peer_auth.rs`, right after a successful VERSION_HELLO, on Peer and Admin
+connections only (both sides know the role, so a Client connection exchanges
+nothing). Same frozen bootstrap framing as VERSION_HELLO
+(`version_hello::{encode_bootstrap, read_bootstrap}`), magic `AUPA`:
+challenge (mode, server nonce) → proof (client nonce, HMAC) → result (verdict,
+server HMAC), `HMAC-SHA256(secret, domain | side | service | role | nonces)`.
+Mutual: the dialer verifies the server's MAC, so a listener impersonating a
+member fails too. The secret never crosses the wire, and a recorded proof does
+not pass a fresh nonce. The challenge is written back-to-back with the
+VERSION_HELLO response, so the step costs one extra round trip per new
+connection and nothing per request.
+
+The secret is process-global (`install`, from `--cluster-secret-file`; same
+shape as the process-global transport): one process belongs to one cluster.
+Every server binary refuses to start without it (`install_for_server`). A server
+without a secret (in-process tests only) answers `open`; a dialer holding a
+secret refuses an open server, because that is what an impostor would answer.
+Refusals log WARN with the caller's address, role and service
+(`PEER_AUTH refused a connection holding a different cluster secret`,
+`PEER_AUTH: connection gave no cluster-secret proof`). Design:
+`docs/cluster_secret_design.md`.
+
+Tests that start in-process servers and also spawn server binaries install one
+test secret per process before ANY server starts (manager `tests/support`
+installs it from the address pickers): a server that accepted in open mode
+would be refused by a dialer that installed the secret a moment later.
+
+### Capability-token helpers shared by the PS and the EN
+
+`cap_token::{keyring, bind_principal, still_valid, BoundPrincipal, now_secs}`:
+build the verify keyring from a polled `GetAuthzConfigResp`, verify an
+AUTH_HELLO token (signature, time window, `aud == cluster_id`), and re-check a
+bound principal per request (kid still enabled, token not expired). The PS adds
+its key-prefix checks on top; the EN uses them as they are (identity only).
+`partition_rpc::AUTH_HELLO_MAX_PAYLOAD` bounds the payload either server decodes.
 
 The old `MSG_CLIENT_HELLO` (0x5F, AUH1) codec remains frozen for historical
 fixtures; it no longer admits a live connection. There is no fallback to an

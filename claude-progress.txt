@@ -1,9 +1,9 @@
 Date: 2026-10-02
-TaskStatus: not_completed
-Task scope: user "现在EN有auth检查吗？" → rename PROTOCOL_HELLO → VERSION_HELLO (REN-VERSION-HELLO, done) → F-CLUSTER-SECRET (cluster secret replaces admin token; EN checks client cred when authz is on).
-Current summary: REN-VERSION-HELLO committed (pure rename, wire bytes unchanged; two false "EN direct-read capability" doc claims corrected). F-CLUSTER-SECRET defined in feature_list.md, not started.
-Main gaps: F-CLUSTER-SECRET implementation.
-Next steps: implement F-CLUSTER-SECRET per its Scope/Acceptance.
+TaskStatus: completed
+Task scope: user "现在EN有auth检查吗？" → REN-VERSION-HELLO (5795b03) → F-CLUSTER-SECRET: "一把密钥替代现在的 admin token，这样EN，PS，MANAGER启动的时候都要这个token，但是对于client来说，需要一个cred"; "是不是强制cred是cluster的配置决定的"; "EN只看身份，并且只有direct-read这一个API"; stop-world upgrade.
+Current summary: cluster secret (peer_auth, 0xF1) mandatory on manager/PS/EN, proved by every Peer/Admin connection; admin token removed everywhere (closed the GET_AUTHZ_CONFIG admin-token leak); EN refuses direct reads without a bound principal when authz is on (identity only). WIRE 52. cluster.sh/deploy/scripts/docs updated. See feature_list F-CLUSTER-SECRET notes for verification + ablations.
+Main gaps: EN polls one manager address (pre-existing single-manager limitation); a running PS redials an EN restarted with a different secret every ~2 ms (pre-existing pacing, EN WARN per attempt); perf/compio_upgrade_20260914/cluster.py and perf/controlled_validation/run.py still pass --admin-token (replay old binaries; user to decide); pre-existing autumn-deploy bugs reported (tenant-create subcommand missing, mint-token bare-hex credential file, restart manager drops signing key); BUG-RECOVERY-PINNED-TARGET-TESTS.
+Next steps: production upgrade per docs/ops.md "Cluster secret" (stop-world, distribute secret, rebuild autumn-op/dashboard).
 
 Date: 2026-10-01 (2)
 TaskStatus: completed

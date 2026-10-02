@@ -111,10 +111,26 @@ streams-guarded `autumn-op bootstrap` → PS → wait a partition is served.** T
 bootstrap guard makes `start` idempotent: on an already-bootstrapped cluster it
 skips bootstrap and preserves data, so `stop` + `start` is a safe restart.
 
+## Cluster secret (required)
+
+`start` generates the cluster secret once on the driver host
+(`~/.autumn-deploy/cluster.secret`, or `AUTUMN_CLUSTER_SECRET_FILE`) with
+`autumn-op gen-cluster-secret`, copies it to `$DATA_ROOT/cluster.secret` (mode
+600) on every manager, EN and PS host, and passes `--cluster-secret-file` to
+every server and every `autumn-op` call it makes (`restart manager|en|ps`
+re-copies it). Servers refuse to start without it
+(`docs/cluster_secret_design.md`). Two clusters deployed from one driver share
+the secret unless `AUTUMN_CLUSTER_SECRET_FILE` differs. Run operator commands
+with it:
+
+```bash
+autumn-op --cluster-secret-file ~/.autumn-deploy/cluster.secret --manager $M info
+```
+
 ## Authz (ON by default)
 
 `start` arms data-plane authz automatically: it generates a
-signing key + admin token under `~/.autumn-deploy/authz/` (override with
+signing key under `~/.autumn-deploy/authz/` (override with
 `AUTUMN_AUTHZ_DIR`) — **once, reused across re-deploys** so already-minted
 credentials keep working — distributes the key to every manager host, and after
 bootstrap mints a `default`-tenant credential (granting the whole tenant
@@ -168,7 +184,8 @@ cargo build --release -p autumn-server
 cd deploy/baremetal
 # point EN_NODES at scratch dirs if you don't have /data* disks
 ./autumn-deploy -t topology-singlehost.conf start
-../../target/release/autumn-op --manager 127.0.0.1:9001 info      # 3 nodes, 1 partition
+../../target/release/autumn-op --cluster-secret-file ~/.autumn-deploy/cluster.secret \
+    --manager 127.0.0.1:9001 info                                # 3 nodes, 1 partition
 AC="../../target/release/autumn-client --manager 127.0.0.1:9001"
 echo hello | $AC put mykey /dev/stdin && $AC get mykey            # → hello
 ./autumn-deploy -t topology-singlehost.conf stop

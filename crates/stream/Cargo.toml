@@ -23,6 +23,8 @@ rkyv = { version = "0.8.15", features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Signs capability tokens for the direct-read authz tests.
+ed25519-dalek = "2"
 autumn-manager = { path = "../manager" }
 autumn-rpc = { path = "../rpc" }
 bytes.workspace = true

@@ -12,7 +12,9 @@ use support::{pick_stable_port_pair, start_manager};
 async fn open(addr: SocketAddr, hello: Hello) -> Result<(ReadHalf, WriteHalf), RpcError> {
     let socket = compio::net::TcpStream::connect(addr).await?;
     let (mut rd, mut wr) = Conn::Tcp(socket).into_split();
-    version_hello::initiate(&mut rd, &mut wr, hello, Some(Service::Manager)).await?;
+    let negotiated = version_hello::initiate(&mut rd, &mut wr, hello, Some(Service::Manager)).await?;
+    autumn_rpc::peer_auth::initiate(&mut rd, &mut wr, &negotiated, autumn_rpc::peer_auth::installed())
+        .await?;
     Ok((rd, wr))
 }
 async fn receive(rd: &mut ReadHalf) -> Frame {
@@ -66,26 +68,5 @@ fn manager_checks_client_interval_and_exact_internal_wire() {
         let (mut rd, mut wr) = open(addr, Hello::current(Role::Peer)).await.unwrap();
         let frame = call(&mut rd, &mut wr, MSG_CREATE_STREAM, Bytes::new()).await;
         assert_eq!(RpcError::decode_status(&frame.payload).0, StatusCode::PermissionDenied);
-    });
-}
-
-#[test]
-fn an_admin_protocol_declaration_does_not_bypass_admin_authentication() {
-    let addr: SocketAddr = format!("127.0.0.1:{}", pick_stable_port_pair()).parse().unwrap();
-    std::thread::spawn(move || {
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            let manager = autumn_manager::AutumnManager::new();
-            manager.set_admin_token("secret".into());
-            manager.serve(addr).await.unwrap();
-        });
-    });
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (mut rd, mut wr) = open(addr, Hello::current(Role::Admin)).await.unwrap();
-        let frame = call(&mut rd, &mut wr, MSG_CREATE_STREAM, Bytes::new()).await;
-        assert!(frame.is_error());
-        let (code, message) = RpcError::decode_status(&frame.payload);
-        assert_eq!(code, StatusCode::FailedPrecondition);
-        assert!(message.contains("admin token"), "{message}");
     });
 }

@@ -117,7 +117,7 @@ What stays here is the part `autumn-stream` needs:
 
 **`is_owner_epoch_fence_message(msg) -> bool`** — the classifier. Over the wire a
 fence is just `CODE_PRECONDITION`, indistinguishable from ordinary preconditions
-("stream cannot be empty after punch holes", admin-token checks) without a new
+("stream cannot be empty after punch holes", …) without a new
 wire code — which would force a stop-world `WIRE_VERSION` bump that nothing
 would catch if forgotten. `StreamClient` uses this to route a fence into the
 PS's "LockedByOther" poison-and-reopen self-heal.

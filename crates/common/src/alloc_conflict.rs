@@ -3,7 +3,7 @@
 //!
 //! Over the wire these rejections are plain `CODE_PRECONDITION`, which is
 //! also what deterministic business-rule refusals use ("stream cannot be
-//! empty after punch holes", admin-token checks). The client must tell them
+//! empty after punch holes", "extent N is already sealed"). The client must tell them
 //! apart: a transient conflict self-heals by re-pulling a fresh snapshot or
 //! waiting out an in-flight op and retrying, while a deterministic
 //! precondition must fail fast. Distinguishing them by a new wire code would
@@ -92,7 +92,6 @@ mod tests {
         for m in [
             "stream cannot be empty after punch holes",
             "owner_key=ps-1 owner_epoch mismatch, expected 4, got 3",
-            "admin token invalid",
             "extent 7 is already sealed",
         ] {
             assert!(

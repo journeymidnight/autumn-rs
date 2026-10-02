@@ -27,14 +27,13 @@ use autumn_rpc::manager_rpc::{
 
 use support::*;
 
-const ADMIN: &str = "layer-a-admin";
 
-/// A memory-mode manager WITH an admin token (namespace-create is admin-gated).
-fn start_manager_with_admin(mgr_addr: SocketAddr) {
+/// A memory-mode manager (namespace-create is Admin-only: see `ns_create`'s
+/// connection).
+fn start_memory_manager(mgr_addr: SocketAddr) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let manager = autumn_manager::AutumnManager::new();
-            manager.set_admin_token(ADMIN.to_string());
             let _ = manager.serve(mgr_addr).await;
         });
     });
@@ -43,7 +42,6 @@ fn start_manager_with_admin(mgr_addr: SocketAddr) {
 
 async fn ns_create(mgr: &RpcClient, name: &str) {
     let payload = rkyv_encode(&NamespaceCreateReq {
-        admin_token: ADMIN.to_string(),
         name: name.to_string(),
         owner_tenant: None,
         presplit: Vec::new(),
@@ -60,7 +58,7 @@ async fn ns_create(mgr: &RpcClient, name: &str) {
 #[ignore] // needs EN binaries + a real PS
 fn layer_a_rejects_unregistered_namespace_put() {
     let mgr_addr = pick_addr();
-    start_manager_with_admin(mgr_addr);
+    start_memory_manager(mgr_addr);
     let n1_dir = tempfile::tempdir().expect("n1");
     let n2_dir = tempfile::tempdir().expect("n2");
     let n1_addr = pick_addr();
@@ -69,7 +67,7 @@ fn layer_a_rejects_unregistered_namespace_put() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 131);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 130).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 13001, log, row, meta, b"", b"\xff\xff\xff\xff").await;
@@ -133,7 +131,7 @@ fn putstream_chunks_land_in_tenant_range() {
     start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 141);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
         register_two_nodes(&mgr, n1_addr, n2_addr, 140).await;
         let (log, row, meta) = create_three_streams(&mgr).await;
         upsert_partition(&mgr, 14001, log, row, meta, b"", b"\xff\xff\xff\xff").await;

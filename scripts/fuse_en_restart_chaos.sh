@@ -62,13 +62,13 @@ verify baseline; rmw_clean; verify after-clean-rmw
 
 en_ports=(20001 20002 20003)
 for r in 1 2 3 4; do
-  ep=${en_ports[$(( r % 3 ))]}; EPID=$(pgrep -f "autumn-extent-node --port $ep"|head -1)
+  ep=${en_ports[$(( r % 3 ))]}; EPID=$(pgrep -f "autumn-extent-node .*--port $ep"|head -1)
   if [ -n "$EPID" ]; then
     ECMD=$(tr '\0' ' ' < "/proc/$EPID/cmdline")
     say "round $r: kill -9 EN :$ep pid=$EPID, respawn in 2s (short down)"
     kill -9 "$EPID"; sleep 2
     setsid nohup $ECMD > "$WORK/en_${ep}_r$r.log" 2>&1 </dev/null &
-    for i in $(seq 1 30); do pgrep -f "autumn-extent-node --port $ep" >/dev/null && break; sleep 1; done
+    for i in $(seq 1 30); do pgrep -f "autumn-extent-node .*--port $ep" >/dev/null && break; sleep 1; done
     sleep 12   # let the EN rejoin + replicas resync
     verify "r$r-read"; rmw_clean; verify "r$r-rmw"
   fi

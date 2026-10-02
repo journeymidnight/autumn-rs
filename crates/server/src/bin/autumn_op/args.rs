@@ -8,16 +8,17 @@ use anyhow::{bail, Context, Result};
 use autumn_transport::TransportKind;
 
 fn usage() -> ! {
-    eprintln!("usage: autumn-op [--manager addr] [--json] [--admin-token-file F] <command>");
-    eprintln!("  --admin-token-file F: authorize cluster-mutating ops (fence/remove/merge/create-stream/…)");
-    eprintln!("    when the manager was started with --admin-token-file. Read-only ops ignore it.");
+    eprintln!("usage: autumn-op [--manager addr] [--json] [--cluster-secret-file F] <command>");
+    eprintln!("  --cluster-secret-file F: the cluster secret the manager, PS and EN were started");
+    eprintln!("    with. autumn-op connects as an operator (Admin), which every server refuses");
+    eprintln!("    without it — read-only commands included.");
     eprintln!("  --credential-file F: data-plane capability (`<principal>\\n<hex>`), for the admin");
     eprintln!("    subcommands that read/write partition keys rather than only calling the manager");
     eprintln!("    (e.g. `presplit --namespace fs`, which reads the declared stripe geometry).");
-    eprintln!("    Both --admin-token[-file] and --credential-file may appear BEFORE or AFTER");
+    eprintln!("    Both --cluster-secret-file and --credential-file may appear BEFORE or AFTER");
     eprintln!("    the subcommand — position does not matter.");
-    eprintln!("    The admin token does NOT satisfy the partition server; when authz is on it");
-    eprintln!("    protects every key, so those commands need this too.");
+    eprintln!("    The cluster secret does NOT satisfy the partition server's key checks; when");
+    eprintln!("    authz is on it protects every key, so those commands need this too.");
     eprintln!();
     eprintln!("read / observability commands:");
     eprintln!("  list-nodes                   show every EN's auto-state + override");
@@ -49,7 +50,7 @@ fn usage() -> ! {
     eprintln!("  force-ec-convert --extent <EXTID>");
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
     eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (presplit EMPTY keyspace before loading)");
-    eprintln!("           fs: --lanes <N> [--parts <P>] [--admin-token-file F to record] [--force to narrow declared lanes]");
+    eprintln!("           fs: --lanes <N> [--parts <P>] [--force to narrow declared lanes]");
     eprintln!("      fs:  --lanes <N> [--parts <P>] | --fs-inos <i,j,…> | --count <N>");
     eprintln!("           (--lanes = stripe width, declared; --parts = partitions to cut, MUST divide lanes; default P=N)");
     eprintln!("      kvc: --count <N> --hash-prefix <rel-prefix>       (split by content-hash first hex char)");
@@ -70,11 +71,12 @@ fn usage() -> ! {
     eprintln!(
         "                               format dir(s), register node identity, stamp cluster_id"
     );
+    eprintln!("  gen-cluster-secret           print a new cluster secret (local, no manager)");
     eprintln!();
-    eprintln!("namespace registry (admin — needs --admin-token[-file]):");
-    eprintln!("  namespace-create --name <NS> [--with-tenant <T>] [--presplit <hex,hex,...>] --admin-token <TOK>");
+    eprintln!("namespace registry (admin):");
+    eprintln!("  namespace-create --name <NS> [--with-tenant <T>] [--presplit <hex,hex,...>]");
     eprintln!("                               register a namespace (--with-tenant marks it protected)");
-    eprintln!("  namespace-delete --name <NS> [--force] --admin-token <TOK>");
+    eprintln!("  namespace-delete --name <NS> [--force]");
     eprintln!("                               remove the registry row (refuses non-empty unless --force)");
     eprintln!("  namespace-list [--json]      list registered namespaces (name/prefix/owner/presplit/created)");
     eprintln!("  principal-list [--json]      list principals + their grants (read-only, no credentials)");
@@ -108,7 +110,7 @@ fn num_arg<T: std::str::FromStr>(raw: &[String], i: usize, name: &str) -> T {
     })
 }
 
-/// read a secret (admin token / tenant credential) from a file,
+/// read a secret (a tenant credential) from a file,
 /// trimming a trailing newline. Preferred over passing secrets on argv, which
 /// leak via `ps` / `/proc/<pid>/cmdline` (coco P2). Fatal on read error.
 fn read_secret_file(path: &str) -> String {
@@ -158,14 +160,13 @@ pub(crate) struct Args {
     pub(crate) manager: String,
     pub(crate) json: bool,
     pub(crate) transport: TransportKind,
-    /// shared admin secret for cluster-mutating ops
-    /// (`--admin-token[-file]`). Applied to the client at connect via
-    /// `set_admin_token`; read-only commands are unaffected. `None` = don't send
-    /// a token (a token-less manager runs these bare; a token-ON manager refuses).
-    pub(crate) admin_token: Option<String>,
+    /// `--cluster-secret-file`: installed before connecting, since every
+    /// connection autumn-op opens declares the Admin role and must prove it.
+    /// `None` = no secret, so only commands that never connect work.
+    pub(crate) cluster_secret_file: Option<std::path::PathBuf>,
     /// data-plane credential (`--credential-file`), as
-    /// `(principal, secret)`. The admin token authorizes CONTROL-plane RPCs; it
-    /// does nothing for a partition-server read. Some admin subcommands do touch
+    /// `(principal, secret)`. The cluster secret authorizes CONTROL-plane RPCs;
+    /// it does nothing for a partition-server key check. Some admin subcommands do touch
     /// the data plane — `presplit --namespace fs` reads the declared stripe
     /// geometry before overwriting it — and under PROTECT-EVERYTHING every key
     /// needs a capability token, so those need a credential too. `None` = connect
@@ -367,11 +368,6 @@ pub(crate) enum Command {
         namespace: String,
         tenant: String,
         rule: PresplitRule,
-        /// step 4: admin token used to RECORD the applied cut
-        /// points as protected boundaries (`--admin-token` / `--admin-token-file`).
-        /// Optional — without it the cuts still land, but merge won't refuse to
-        /// undo them (a warning says so).
-        admin_token: Option<String>,
         /// UX-fix (M5): required to NARROW an fs's declared stripe
         /// geometry (`--lanes` smaller than the current declaration). Without it,
         /// a redeclare that lowers the lane count is refused — a stray
@@ -427,19 +423,19 @@ pub(crate) enum Command {
     GenSigningKey {
         kid: u32,
     },
-    /// create/rotate a PRINCIPAL account (admin — needs
-    /// `--admin-token`). Returns the principal's permanent credential (shown once,
+    /// Generate a cluster secret (LOCAL — no manager): 64 hex characters on
+    /// stdout; redirect to the file every `--cluster-secret-file` names.
+    GenClusterSecret,
+    /// create/rotate a PRINCIPAL account (admin). Returns the principal's permanent credential (shown once,
     /// as `<name>\n<hex>` for direct save to a credential file).
     PrincipalCreate {
         principal: String,
         /// Granted key prefixes (`--grant fs/`, repeatable). Normalized to end `/`.
         grants: Vec<String>,
-        admin_token: String,
     },
     /// Remove a principal account (admin). Its current token still works until exp.
     PrincipalDelete {
         principal: String,
-        admin_token: String,
     },
     /// Mint a short-TTL capability token from a principal credential. Prints the
     /// token (hex) to stdout.
@@ -447,7 +443,7 @@ pub(crate) enum Command {
         principal: String,
         credential: String,
     },
-    /// D2: register a namespace (admin — needs `--admin-token`).
+    /// D2: register a namespace (admin).
     /// `--with-tenant <T>` marks it protected (owner tenant = T). `--presplit`
     /// takes comma-separated hex split points (frozen for D8; stored, not yet
     /// acted upon).
@@ -455,7 +451,6 @@ pub(crate) enum Command {
         name: String,
         owner_tenant: Option<String>,
         presplit: Vec<Vec<u8>>,
-        admin_token: String,
     },
     /// D2: delete a namespace registry row (admin). Refuses a non-empty
     /// namespace unless `--force` (the emptiness check is done client-side here,
@@ -463,7 +458,6 @@ pub(crate) enum Command {
     NamespaceDelete {
         name: String,
         force: bool,
-        admin_token: String,
     },
     /// D2: list the full namespace registry (rich rows). Read-only.
     NamespaceList,
@@ -472,25 +466,31 @@ pub(crate) enum Command {
     PrincipalList,
 }
 
-/// Find `--admin-token[-file]` and `--credential-file` anywhere in argv.
+/// Find `--cluster-secret-file` and `--credential-file` anywhere in argv.
 ///
 /// Position-independence is the point — see the comment at the call site.
 /// Values are consumed positionally, and the value of any OTHER flag is skipped,
-/// so `--principal --admin-token` cannot be misread as the token flag. The last
-/// occurrence wins, matching what the per-subcommand loops already do.
-fn prescan_secret_flags(raw: &[String]) -> (Option<String>, Option<(String, Vec<u8>)>) {
-    let mut token: Option<String> = None;
+/// so `--principal --cluster-secret-file` cannot be misread as the secret flag.
+/// The last occurrence wins.
+fn prescan_secret_flags(
+    raw: &[String],
+) -> (Option<std::path::PathBuf>, Option<(String, Vec<u8>)>) {
+    let mut secret: Option<std::path::PathBuf> = None;
     let mut cred: Option<(String, Vec<u8>)> = None;
     let mut k = 1usize;
     while k < raw.len() {
         match raw[k].as_str() {
-            "--admin-token" if k + 1 < raw.len() => {
-                token = Some(raw[k + 1].clone());
+            "--cluster-secret-file" if k + 1 < raw.len() => {
+                secret = Some(raw[k + 1].clone().into());
                 k += 2;
             }
-            "--admin-token-file" if k + 1 < raw.len() => {
-                token = Some(read_secret_file(&raw[k + 1]));
-                k += 2;
+            "--admin-token" | "--admin-token-file" => {
+                eprintln!(
+                    "autumn-op: {} was removed: pass the cluster secret with \
+                     --cluster-secret-file",
+                    raw[k]
+                );
+                std::process::exit(2);
             }
             "--credential-file" if k + 1 < raw.len() => {
                 let path = &raw[k + 1];
@@ -511,8 +511,8 @@ fn prescan_secret_flags(raw: &[String]) -> (Option<String>, Option<(String, Vec<
                 }
                 k += 2;
             }
-            // Skip another flag's VALUE so `--principal --admin-token` can't be
-            // misread as the token flag. But boolean flags (`--json`, `--force`)
+            // Skip another flag's VALUE so `--principal --cluster-secret-file`
+            // can't be misread as the secret flag. But boolean flags (`--json`, `--force`)
             // have no value, and blindly skipping one token past them would
             // swallow the very flag we are looking for — so only skip a token
             // that isn't itself a flag.
@@ -526,7 +526,7 @@ fn prescan_secret_flags(raw: &[String]) -> (Option<String>, Option<(String, Vec<
             _ => k += 1,
         }
     }
-    (token, cred)
+    (secret, cred)
 }
 
 pub(crate) fn parse() -> Args {
@@ -566,20 +566,16 @@ pub(crate) fn parse() -> Args {
     //
     // This was inconsistent in a way that cost real time to diagnose: `presplit`
     // read `--credential-file` ONLY from the global position (before the
-    // subcommand), while `principal-create` read `--admin-token-file` ONLY from
-    // its own (after it) — the subcommand parsers declare a LOCAL `admin_token`
-    // that shadows the global one, then reject it as empty. Each refused the
-    // other's placement with a bare usage dump naming neither the flag nor the
-    // position, so a correct-looking command read as "this build lacks that
-    // flag". Both placements now work for every subcommand.
-    let (scanned_admin_token, scanned_credential) = prescan_secret_flags(&raw);
+    // subcommand), while `principal-create` read its secret ONLY from its own
+    // (after it). Each refused the other's placement with a bare usage dump
+    // naming neither the flag nor the position, so a correct-looking command
+    // read as "this build lacks that flag". Both placements now work for every
+    // subcommand.
+    let (cluster_secret_file, scanned_credential) = prescan_secret_flags(&raw);
     let mut manager = "127.0.0.1:9001".to_string();
     let mut json = false;
     let mut transport = TransportKind::Tcp;
-    let mut admin_token: Option<String> = scanned_admin_token.clone();
     let mut credential: Option<(String, Vec<u8>)> = scanned_credential;
-    // Seeds the per-subcommand parsers below; their own flag, if given, wins.
-    let global_admin_token = scanned_admin_token.unwrap_or_default();
     let mut i = 1usize;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -603,21 +599,9 @@ pub(crate) fn parse() -> Args {
                 });
                 i += 1;
             }
-            // global admin token, gating cluster-mutating ops.
-            // (The per-command `--admin-token` on tenant/namespace/principal ops
-            // is a separate, older struct-field path; this global flag drives the
-            // payload-prefix path for fence/merge/create-stream/….)
-            "--admin-token" => {
-                i += 1;
-                admin_token = Some(raw.get(i).cloned().unwrap_or_else(|| usage()));
-                i += 1;
-            }
-            "--admin-token-file" => {
-                i += 1;
-                admin_token = Some(read_secret_file(
-                    &raw.get(i).cloned().unwrap_or_else(|| usage()),
-                ));
-                i += 1;
+            // Read by `prescan_secret_flags`.
+            "--cluster-secret-file" => {
+                i += 2;
             }
             // data-plane credential, for the admin subcommands that read or write
             // partition keys rather than only talking to the manager.
@@ -804,10 +788,10 @@ pub(crate) fn parse() -> Args {
             }
             Command::GenSigningKey { kid }
         }
+        "gen-cluster-secret" => Command::GenClusterSecret,
         "principal-create" => {
             let mut principal = String::new();
             let mut grants: Vec<String> = Vec::new();
-            let mut admin_token = global_admin_token.clone();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--principal" => {
@@ -820,40 +804,24 @@ pub(crate) fn parse() -> Args {
                         grants.push(val(&raw, i).to_owned());
                         i += 1;
                     }
-                    "--admin-token" => {
-                        i += 1;
-                        admin_token = val(&raw, i).to_owned();
-                        i += 1;
-                    }
-                    // Read the admin token from a FILE (avoids leaking it via
-                    // argv / ps / /proc/<pid>/cmdline). Preferred over --admin-token.
-                    "--admin-token-file" => {
-                        i += 1;
-                        admin_token = read_secret_file(val(&raw, i));
-                        i += 1;
-                    }
                     // Read by `prescan_secret_flags`; skipped here so position
                     // never matters.
-                    "--credential-file" => {
+                    "--credential-file" | "--cluster-secret-file" => {
                         i += 2;
                     }
                     _ => break,
                 }
             }
-            // Validate at parse time (fail-fast, coco P3): the RPC needs a
-            // non-empty admin token; catch a missing --admin-token[-file] here.
-            if principal.is_empty() || grants.is_empty() || admin_token.is_empty() {
+            if principal.is_empty() || grants.is_empty() {
                 usage();
             }
             Command::PrincipalCreate {
                 principal,
                 grants,
-                admin_token,
             }
         }
         "principal-delete" => {
             let mut principal = String::new();
-            let mut admin_token = global_admin_token.clone();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--principal" => {
@@ -861,31 +829,18 @@ pub(crate) fn parse() -> Args {
                         principal = val(&raw, i).to_owned();
                         i += 1;
                     }
-                    "--admin-token" => {
-                        i += 1;
-                        admin_token = val(&raw, i).to_owned();
-                        i += 1;
-                    }
-                    "--admin-token-file" => {
-                        i += 1;
-                        admin_token = read_secret_file(val(&raw, i));
-                        i += 1;
-                    }
                     // Read by `prescan_secret_flags`; skipped here so position
                     // never matters.
-                    "--credential-file" => {
+                    "--credential-file" | "--cluster-secret-file" => {
                         i += 2;
                     }
                     _ => break,
                 }
             }
-            if principal.is_empty() || admin_token.is_empty() {
+            if principal.is_empty() {
                 usage();
             }
-            Command::PrincipalDelete {
-                principal,
-                admin_token,
-            }
+            Command::PrincipalDelete { principal }
         }
         "mint-token" => {
             let mut principal = String::new();
@@ -924,7 +879,6 @@ pub(crate) fn parse() -> Args {
             let mut name = String::new();
             let mut owner_tenant: Option<String> = None;
             let mut presplit: Vec<Vec<u8>> = Vec::new();
-            let mut admin_token = global_admin_token.clone();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--name" => {
@@ -948,38 +902,26 @@ pub(crate) fn parse() -> Args {
                         presplit = parse_hex_split_points(val(&raw, i));
                         i += 1;
                     }
-                    "--admin-token" => {
-                        i += 1;
-                        admin_token = val(&raw, i).to_owned();
-                        i += 1;
-                    }
-                    "--admin-token-file" => {
-                        i += 1;
-                        admin_token = read_secret_file(val(&raw, i));
-                        i += 1;
-                    }
                     // Read by `prescan_secret_flags`; skipped here so position
                     // never matters.
-                    "--credential-file" => {
+                    "--credential-file" | "--cluster-secret-file" => {
                         i += 2;
                     }
                     _ => break,
                 }
             }
-            if name.is_empty() || admin_token.is_empty() {
+            if name.is_empty() {
                 usage();
             }
             Command::NamespaceCreate {
                 name,
                 owner_tenant,
                 presplit,
-                admin_token,
             }
         }
         "namespace-delete" => {
             let mut name = String::new();
             let mut force = false;
-            let mut admin_token = global_admin_token.clone();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--name" => {
@@ -991,31 +933,20 @@ pub(crate) fn parse() -> Args {
                         force = true;
                         i += 1;
                     }
-                    "--admin-token" => {
-                        i += 1;
-                        admin_token = val(&raw, i).to_owned();
-                        i += 1;
-                    }
-                    "--admin-token-file" => {
-                        i += 1;
-                        admin_token = read_secret_file(val(&raw, i));
-                        i += 1;
-                    }
                     // Read by `prescan_secret_flags`; skipped here so position
                     // never matters.
-                    "--credential-file" => {
+                    "--credential-file" | "--cluster-secret-file" => {
                         i += 2;
                     }
                     _ => break,
                 }
             }
-            if name.is_empty() || admin_token.is_empty() {
+            if name.is_empty() {
                 usage();
             }
             Command::NamespaceDelete {
                 name,
                 force,
-                admin_token,
             }
         }
         "namespace-list" => Command::NamespaceList,
@@ -1214,8 +1145,8 @@ pub(crate) fn parse() -> Args {
                              `{{ns}}/` key layout those points miss every real key, so the\n\
                              presplit silently did nothing.\n\
                              Presplit per namespace AFTER bootstrap instead:\n\
-                             \x20 autumn-op presplit --namespace fs    --lanes 24 --parts 6 --admin-token-file F\n\
-                             \x20 autumn-op presplit --namespace bench --count 8            --admin-token-file F\n\
+                             \x20 autumn-op presplit --namespace fs    --lanes 24 --parts 6\n\
+                             \x20 autumn-op presplit --namespace bench --count 8\n\
                              \x20 autumn-op presplit --namespace kvc   --count 8 --hash-prefix '<model>/vllm/v1/'"
                         );
                         std::process::exit(2);
@@ -1389,8 +1320,6 @@ pub(crate) fn parse() -> Args {
             let mut parts: Option<usize> = None;
             let mut hash_prefix: Option<String> = None;
             let mut agents: Option<Vec<String>> = None;
-            let mut presplit_admin_token: Option<String> =
-                    (!global_admin_token.is_empty()).then(|| global_admin_token.clone());
             let mut presplit_force = false;
             let num = |v: &str, what: &str| -> u64 {
                 v.trim().parse().unwrap_or_else(|_| {
@@ -1423,20 +1352,10 @@ pub(crate) fn parse() -> Args {
                         parts = Some(num(val(&raw, i), "--parts") as usize);
                         i += 1;
                     }
-                    "--admin-token" => {
-                        i += 1;
-                        presplit_admin_token = Some(val(&raw, i).to_owned());
-                        i += 1;
-                    }
-                    "--admin-token-file" => {
-                        i += 1;
-                        presplit_admin_token = Some(read_secret_file(val(&raw, i)));
-                        i += 1;
-                    }
                     // Already read by `prescan_secret_flags`; accepted (and
                     // skipped) here only so the flag may follow the subcommand
                     // as well as precede it.
-                    "--credential-file" => { i += 2; }
+                    "--credential-file" | "--cluster-secret-file" => { i += 2; }
                     "--hash-prefix" => { i += 1; hash_prefix = Some(val(&raw, i).to_owned()); i += 1; }
                     "--force" => { i += 1; presplit_force = true; }
                     "--agents" => {
@@ -1543,7 +1462,6 @@ pub(crate) fn parse() -> Args {
                 namespace,
                 tenant,
                 rule,
-                admin_token: presplit_admin_token,
                 force: presplit_force,
             }
         }
@@ -1754,7 +1672,7 @@ pub(crate) fn parse() -> Args {
         manager,
         json,
         transport,
-        admin_token,
+        cluster_secret_file,
         credential,
         wait,
         wait_timeout,
@@ -2722,11 +2640,11 @@ mod lane_parts_tests {
         assert!(presplit_suffixes(&PresplitRule::FsLanes { lanes: 1, parts: 1 }).unwrap().is_empty());
     }
 
-    /// `--admin-token[-file]` and `--credential-file` must work in BOTH
+    /// `--cluster-secret-file` and `--credential-file` must work in BOTH
     /// positions, for every subcommand.
     ///
     /// They used to be split: `presplit` took the credential only before the
-    /// subcommand, `principal-create` took the token only after it, and each
+    /// subcommand, `principal-create` took its secret only after it, and each
     /// rejected the other placement with a usage dump that named neither the
     /// flag nor the position — so a correct-looking command read as an
     /// unsupported flag. This pins the prescan that fixed it, including the
@@ -2738,16 +2656,17 @@ mod lane_parts_tests {
                 .chain(v.iter().map(|s| s.to_string()))
                 .collect()
         };
-        let tok = |a: &[&str]| super::prescan_secret_flags(&argv(a)).0;
+        let secret = |a: &[&str]| super::prescan_secret_flags(&argv(a)).0;
+        let f = Some(std::path::PathBuf::from("F"));
 
         // After the subcommand, before it, and either side of a boolean flag.
-        assert_eq!(tok(&["principal-create", "--admin-token", "T"]).as_deref(), Some("T"));
-        assert_eq!(tok(&["--admin-token", "T", "principal-create"]).as_deref(), Some("T"));
-        assert_eq!(tok(&["--json", "--admin-token", "T", "presplit"]).as_deref(), Some("T"));
-        assert_eq!(tok(&["presplit", "--force", "--admin-token", "T"]).as_deref(), Some("T"));
+        assert_eq!(secret(&["principal-create", "--cluster-secret-file", "F"]), f);
+        assert_eq!(secret(&["--cluster-secret-file", "F", "principal-create"]), f);
+        assert_eq!(secret(&["--json", "--cluster-secret-file", "F", "presplit"]), f);
+        assert_eq!(secret(&["presplit", "--force", "--cluster-secret-file", "F"]), f);
 
         // A flag's VALUE is never mistaken for the flag itself.
-        assert_eq!(tok(&["principal-create", "--principal", "--admin-token"]), None);
-        assert_eq!(tok(&["presplit", "--namespace", "fs"]), None);
+        assert_eq!(secret(&["principal-create", "--principal", "--cluster-secret-file"]), None);
+        assert_eq!(secret(&["presplit", "--namespace", "fs"]), None);
     }
 }

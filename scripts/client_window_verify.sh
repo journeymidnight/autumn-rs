@@ -123,19 +123,22 @@ B="$REPO/target/debug"
 # ── cluster ─────────────────────────────────────────────────────────────────
 say "starting a cluster at wire $CEILING"
 mkdir -p "$WORK/en0" "$WORK/ps1"
-"$B/autumn-manager-server" --listen 127.0.0.1 --port "$MGR_PORT" >"$WORK/mgr.log" 2>&1 &
+# Every server requires the cluster secret; autumn-op proves it on every call.
+"$B/autumn-op" gen-cluster-secret >"$WORK/cluster.secret" || exit 1
+S=(--cluster-secret-file "$WORK/cluster.secret")
+"$B/autumn-manager-server" --listen 127.0.0.1 --port "$MGR_PORT" "${S[@]}" >"$WORK/mgr.log" 2>&1 &
 PIDS+=($!); sleep 4
-"$B/autumn-op" --manager "$M" format "$WORK/en0" >/dev/null || exit 1
+"$B/autumn-op" "${S[@]}" --manager "$M" format "$WORK/en0" >/dev/null || exit 1
 # One shard: the EN otherwise binds one data port per core and fail-stops on
 # the first collision, which on a shared box is immediate.
 "$B/autumn-extent-node" --data "$WORK/en0" --port "$EN_PORT" --manager "$M" \
-    --advertise "127.0.0.1:$EN_PORT" --cpuset 0 >"$WORK/en.log" 2>&1 &
+    --advertise "127.0.0.1:$EN_PORT" --cpuset 0 "${S[@]}" >"$WORK/en.log" 2>&1 &
 PIDS+=($!); sleep 8
-"$B/autumn-op" --manager "$M" bootstrap --replication 1+0 >/dev/null || exit 1
-"$B/autumn-ps" --psid 1 --port "$PS_PORT" --manager "$M" --data "$WORK/ps1" \
+"$B/autumn-op" "${S[@]}" --manager "$M" bootstrap --replication 1+0 >/dev/null || exit 1
+"$B/autumn-ps" --psid 1 --port "$PS_PORT" --manager "$M" --data "$WORK/ps1" "${S[@]}" \
     >"$WORK/ps.log" 2>&1 &
 PIDS+=($!); sleep 5
-"$B/autumn-op" --manager "$M" namespace-create --name "$NS" >/dev/null 2>&1
+"$B/autumn-op" "${S[@]}" --manager "$M" namespace-create --name "$NS" >/dev/null 2>&1
 echo "  compiled server wire=$CEILING, client window=[$FLOOR,$CEILING]; client connections verify it via VERSION_HELLO"
 
 # ── the data plane, from the old client ─────────────────────────────
@@ -192,7 +195,7 @@ open(p, 'w').write(s)
 PY
 ( cd "$REPO" && cargo build -q --bin autumn-manager-server ) || RC=1
 kill "${PIDS[0]}" 2>/dev/null; sleep 2
-"$B/autumn-manager-server" --listen 127.0.0.1 --port "$MGR_PORT" >"$WORK/mgr2.log" 2>&1 &
+"$B/autumn-manager-server" --listen 127.0.0.1 --port "$MGR_PORT" "${S[@]}" >"$WORK/mgr2.log" 2>&1 &
 PIDS+=($!); sleep 5
 echo "  rebuilt manager client window=[$CEILING,$CEILING]; verify admission below"
 

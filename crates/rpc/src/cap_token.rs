@@ -211,6 +211,95 @@ pub fn verify_token(
     Ok(claims)
 }
 
+/// kid → verifying key, as built by `keyring`.
+pub type Keyring = std::collections::HashMap<u32, VerifyingKey>;
+
+/// The verify keyring from a polled authz config: kid → key, ENABLED kids
+/// only, so a disabled kid's tokens reject as `UnknownKid` (emergency bulk
+/// revocation). A malformed key (wrong length / not on-curve) is skipped with
+/// the rest kept — its kid then rejects too, which is the safe direction.
+pub fn keyring(keys: &[crate::manager_rpc::AuthzPublicKey]) -> Keyring {
+    let mut out = Keyring::new();
+    for k in keys {
+        if k.disabled {
+            continue;
+        }
+        match <[u8; 32]>::try_from(k.ed25519_pub.as_slice()) {
+            Ok(arr) => match VerifyingKey::from_bytes(&arr) {
+                Ok(vk) => {
+                    out.insert(k.kid, vk);
+                }
+                Err(e) => tracing::warn!(kid = k.kid, error = %e, "authz: bad public key, skipping kid"),
+            },
+            Err(_) => tracing::warn!(kid = k.kid, "authz: public key wrong length, skipping kid"),
+        }
+    }
+    out
+}
+
+/// The per-connection principal bound by a successful `MSG_AUTH_HELLO` (on a
+/// PS or an EN connection).
+#[derive(Clone, Debug)]
+pub struct BoundPrincipal {
+    pub allowed_prefixes: Vec<Vec<u8>>,
+    /// Token expiry (unix seconds).
+    pub exp: u64,
+    /// The kid this token was verified against. Re-checked against the live
+    /// keyring on EVERY request so a disabled/rotated-out kid revokes even
+    /// already-bound long connections.
+    pub kid: u32,
+}
+
+/// Verify an `AUTH_HELLO` token → the bound principal, or a reject reason
+/// (for the AuthHelloResp message / metrics). `now`/`skew` gate `nbf`/`exp`;
+/// the `aud` must equal `cluster_id` (when known) so a token minted for another
+/// cluster can't be replayed here.
+pub fn bind_principal(
+    token: &[u8],
+    keys: &Keyring,
+    cluster_id: &str,
+    now: u64,
+    skew: u64,
+) -> Result<BoundPrincipal, String> {
+    let claims = verify_token(token, |kid| keys.get(&kid).copied(), now, skew)
+        .map_err(|r| r.label().to_string())?;
+    // Skipped only when this server doesn't know its cluster_id.
+    if !cluster_id.is_empty() && claims.aud != cluster_id {
+        return Err("wrong_audience".to_string());
+    }
+    Ok(BoundPrincipal {
+        allowed_prefixes: claims.allowed_prefixes,
+        exp: claims.exp,
+        kid: claims.kid,
+    })
+}
+
+/// Whether a principal bound earlier still stands: its kid is still enabled
+/// and its token has not expired (with `skew` leeway). The per-request check
+/// behind every key-range check (PS) and every direct read (EN).
+pub fn still_valid(
+    p: &BoundPrincipal,
+    keys: &Keyring,
+    now: u64,
+    skew: u64,
+) -> Result<(), &'static str> {
+    if !keys.contains_key(&p.kid) {
+        return Err("signing key disabled/rotated; re-authenticate");
+    }
+    if now > p.exp.saturating_add(skew) {
+        return Err("capability token expired; re-authenticate");
+    }
+    Ok(())
+}
+
+/// Unix seconds, for token `exp` / `nbf` checks.
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 /// Derive the 32-byte Ed25519 public key from a 32-byte private seed. Used by
 /// key-file loading (manager) and `autumn-op gen-signing-key` so the published
 /// public key is always derived from the seed, never stored separately (no drift).

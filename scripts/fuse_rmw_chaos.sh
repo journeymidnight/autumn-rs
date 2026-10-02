@@ -91,7 +91,7 @@ dd if="$WORK/B" of="$WORK/EXPECT" bs=262144 seek=1 count=1 conv=notrunc 2>/dev/n
 if cmp -s "$MNT/F.bin" "$WORK/A"; then say "baseline: F.bin == A (1 MiB)"; else fail "baseline mismatch"; fi
 
 # ── capture the live PS cmdline so we can respawn it exactly ───────────────
-PSPID=$(pgrep -f "autumn-ps --psid 1" | head -1)
+PSPID=$(pgrep -f "autumn-ps .*--psid 1" | head -1)
 [ -z "$PSPID" ] && { fail "no PS found"; exit 1; }
 PSCMD=$(tr '\0' ' ' < "/proc/$PSPID/cmdline")
 say "PS pid=$PSPID"
@@ -108,7 +108,7 @@ dd if="$WORK/B" of="$MNT/F.bin" bs=262144 seek=1 count=1 conv=notrunc 2>"$WORK/d
 ddrc=$?
 say "dd partial-overwrite rc=$ddrc after $((SECONDS-t0))s ($(tr '\n' ' ' < "$WORK/dd.err"))"
 
-for i in $(seq 1 30); do pgrep -f "autumn-ps --psid 1" >/dev/null && break; sleep 1; done
+for i in $(seq 1 30); do pgrep -f "autumn-ps .*--psid 1" >/dev/null && break; sleep 1; done
 sleep 5
 
 # ── verdict: remount (drop daemon caches), read back ───────────────────────

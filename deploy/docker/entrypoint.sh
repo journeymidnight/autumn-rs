@@ -37,6 +37,16 @@ die() { log "ERROR: $*"; exit 1; }
 
 TRANSPORT="${AUTUMN_TRANSPORT:-tcp}"
 
+# The cluster secret (AUTUMN_CLUSTER_SECRET_FILE → --cluster-secret-file). The
+# manager, PS and EN refuse to start without it, and autumn-op needs it for
+# every call (it connects as an operator), so every server role and the
+# bootstrap Job require it. Client roles (fuse, s3) never hold it.
+CLUSTER_SECRET_FILE="${AUTUMN_CLUSTER_SECRET_FILE:-}"
+require_cluster_secret() {
+    [[ -s "$CLUSTER_SECRET_FILE" ]] \
+        || die "AUTUMN_CLUSTER_SECRET_FILE='$CLUSTER_SECRET_FILE' is not a non-empty file (generate one with: autumn-op gen-cluster-secret)"
+}
+
 # ---------------------------------------------------------------------------
 # address helpers
 # ---------------------------------------------------------------------------
@@ -105,17 +115,36 @@ resolve_hostport_list() {
 
 # Leader-gated readiness: `autumn-op info` only succeeds against the elected
 # leader, so this doubles as "control plane actually up", not just TCP-open.
+# Needs the cluster secret (autumn-op connects as an operator).
 wait_for_manager() {
     local mgr="$1" tries="${2:-150}"
     local i
     for (( i = 0; i < tries; i++ )); do
-        if autumn-op --manager "$mgr" --transport "$TRANSPORT" info >/dev/null 2>&1; then
+        if autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+            --manager "$mgr" --transport "$TRANSPORT" info >/dev/null 2>&1; then
             return 0
         fi
         (( i == 0 )) && log "waiting for manager leader at $mgr"
         sleep 2
     done
     die "manager at $mgr not answering leader-gated info after $tries attempts"
+}
+
+# Client roles (fuse, s3) do not hold the cluster secret, so they cannot run
+# `autumn-op info`; they wait for the first manager address to accept TCP.
+wait_for_manager_port() {
+    local mgr="${1%%,*}" tries="${2:-150}"
+    local host="${mgr%:*}" port="${mgr##*:}"
+    host="${host#[}"; host="${host%]}"
+    local i
+    for (( i = 0; i < tries; i++ )); do
+        if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+            return 0
+        fi
+        (( i == 0 )) && log "waiting for manager at $mgr"
+        sleep 2
+    done
+    die "manager at $mgr not accepting connections after $tries attempts"
 }
 
 # ---------------------------------------------------------------------------
@@ -126,7 +155,9 @@ run_manager() {
     local port="${AUTUMN_MANAGER_PORT:-9001}"
     local etcd
     etcd="$(resolve_hostport_list "${AUTUMN_ETCD_ENDPOINTS:-etcd:2379}")"
+    require_cluster_secret
     local -a args=(
+        --cluster-secret-file "$CLUSTER_SECRET_FILE"
         --port "$port" --etcd "$etcd" --listen 0.0.0.0 --transport "$TRANSPORT"
     )
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && args+=(--policy-fast-mode)
@@ -154,8 +185,6 @@ run_manager() {
     # missing key. (cluster.sh stays OFF because it never sets the env at all.)
     if [[ "${AUTUMN_AUTH_DISABLE:-0}" != "1" && -s "${AUTUMN_AUTH_SIGNING_KEY_FILE:-/nonexistent}" ]]; then
         args+=(--auth-signing-key-file "$AUTUMN_AUTH_SIGNING_KEY_FILE")
-        [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]] \
-            && args+=(--admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE")
         local pfx
         for pfx in ${AUTUMN_AUTH_PROTECTED_PREFIXES:-}; do
             args+=(--auth-protected-prefix "$pfx")
@@ -173,6 +202,7 @@ run_extent_node() {
     local mgr
     mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
     [[ "$mgr" == *,* ]] && die "extent-node takes a single manager address, got '$mgr'"
+    require_cluster_secret
 
     # M2: advertise this pod's OWN IP (Downward-API status.podIP,
     # passed as AUTUMN_ADVERTISE_IP). The EN self-registers its location under a
@@ -217,7 +247,8 @@ run_extent_node() {
     done
     local i
     for (( i = 0; i < 30; i++ )); do
-        if autumn-op --manager "$mgr" --transport "$TRANSPORT" format "${dirs[@]}"; then
+        if autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+            --manager "$mgr" --transport "$TRANSPORT" format "${dirs[@]}"; then
             break
         fi
         (( i == 29 )) && die "autumn-op format failed after 30 attempts"
@@ -226,6 +257,7 @@ run_extent_node() {
     done
 
     local -a args=(
+        --cluster-secret-file "$CLUSTER_SECRET_FILE"
         --port "$port" --data "$data" --manager "$mgr"
         --listen 0.0.0.0 --transport "$TRANSPORT"
         # M1a: self-register the live location + shard ports at
@@ -300,9 +332,11 @@ run_ps() {
     local adv
     adv="$(bracket_host "$POD_IP")"
 
+    require_cluster_secret
     wait_for_manager "$mgr"
 
     local -a args=(
+        --cluster-secret-file "$CLUSTER_SECRET_FILE"
         --psid "$psid" --port "$port" --manager "$mgr"
         --listen 0.0.0.0 --advertise "${adv}:${port}" --transport "$TRANSPORT"
     )
@@ -323,6 +357,7 @@ run_bootstrap() {
         || die "AUTUMN_EXPECT_NODES must be a positive integer"
     local mgr
     mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    require_cluster_secret
     wait_for_manager "$mgr"
 
     # Guard: `bootstrap` is NOT idempotent (a second run creates duplicate
@@ -330,7 +365,8 @@ run_bootstrap() {
     # leader-gated info snapshot: any stream ⇒ already bootstrapped. Only
     # `info --full` emits the streams array ("stream_id") + partitions ("part_id").
     local info
-    info="$(autumn-op --manager "$mgr" --transport "$TRANSPORT" --json info --full 2>/dev/null || true)"
+    info="$(autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+        --manager "$mgr" --transport "$TRANSPORT" --json info --full 2>/dev/null || true)"
     if grep -q '"stream_id"' <<<"$info"; then
         if grep -q '"part_id"' <<<"$info"; then
             log "cluster already bootstrapped (streams + partition) — nothing to do"
@@ -346,7 +382,8 @@ run_bootstrap() {
     log "waiting for $expect extent node(s) Online"
     local i n
     for (( i = 0; i < 60; i++ )); do
-        n="$(autumn-op --manager "$mgr" --transport "$TRANSPORT" list-nodes 2>/dev/null \
+        n="$(autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+            --manager "$mgr" --transport "$TRANSPORT" list-nodes 2>/dev/null \
             | grep -c Online || true)"
         (( n >= expect )) && break
         sleep 5
@@ -375,26 +412,14 @@ run_bootstrap() {
     if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
         die "AUTUMN_BOOTSTRAP_PRESPLIT is retired (raw-keyspace presplit is namespace-blind).
 Presplit per namespace AFTER bootstrap instead:
-  autumn-op presplit --namespace fs  --lanes 24 --parts N --admin-token-file F
-  autumn-op presplit --namespace kvc --count N --hash-prefix '<model>/...'"
+  autumn-op --cluster-secret-file F presplit --namespace fs  --lanes 24 --parts N
+  autumn-op --cluster-secret-file F presplit --namespace kvc --count N --hash-prefix '<model>/...'"
     fi
-    # Bootstrap sends CREATE_STREAM / UPSERT_PARTITION, which the manager gates
-    # on the admin token whenever one is configured — and the deploy configures
-    # one unconditionally. Same `-s` (non-empty file) idiom as run_manager, so an
-    # authz-off cluster with no Secret mounted still bootstraps.
-    #
-    # `--admin-token-file` is a GLOBAL flag and must precede the subcommand: the
-    # global parse loop stops at the first non-flag, so anything after
-    # `bootstrap` is left to the subcommand's own parser, which drops it — the
-    # token then never reaches the client and the manager answers "admin token
-    # invalid". Matches cluster.sh, which places it the same way.
-    local -a admin=()
-    if [[ -s "${AUTUMN_ADMIN_TOKEN_FILE:-/nonexistent}" ]]; then
-        admin=(--admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE")
-    fi
-    log "autumn-op ${admin[*]:-} bootstrap ${args[*]}"
-    autumn-op --manager "$mgr" --transport "$TRANSPORT" \
-        ${admin[@]+"${admin[@]}"} bootstrap "${args[@]}"
+    # Bootstrap sends CREATE_STREAM / UPSERT_PARTITION, admin RPCs the manager
+    # authorizes by the cluster secret autumn-op proves on connect.
+    log "autumn-op bootstrap ${args[*]}"
+    autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+        --manager "$mgr" --transport "$TRANSPORT" bootstrap "${args[@]}"
     log "bootstrap complete"
 }
 
@@ -423,7 +448,7 @@ run_fuse() {
     fi
     mkdir -p "$mp"
 
-    wait_for_manager "$mgr"
+    wait_for_manager_port "$mgr"
 
     local -a args=(
         --manager "$mgr" --mountpoint "$mp" --transport "$TRANSPORT"
@@ -449,7 +474,7 @@ run_fuse() {
 run_s3() {
     local mgr
     mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
-    wait_for_manager "$mgr"
+    wait_for_manager_port "$mgr"
 
     local -a args=(
         --manager "$mgr"

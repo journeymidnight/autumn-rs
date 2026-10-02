@@ -177,6 +177,14 @@ impl AutumnManager {
             &peer,
         )
         .await?;
+        autumn_rpc::peer_auth::accept(
+            &mut reader,
+            &mut writer,
+            &protocol,
+            autumn_rpc::peer_auth::installed(),
+            &peer,
+        )
+        .await?;
         let mut decoder = FrameDecoder::new();
         let mut buf = vec![0u8; 64 * 1024];
         let (resp_tx, mut resp_rx) = futures::channel::mpsc::unbounded::<Bytes>();
@@ -266,35 +274,6 @@ impl AutumnManager {
     }
 
     async fn dispatch(&self, msg_type: u8, payload: Bytes) -> HandlerResult {
-        // gate cluster-MUTATING ops on a shared admin token,
-        // carried as a length-prefix on the payload (zero wire-struct change).
-        // OPT-IN: only enforced when this manager was configured with a token —
-        // a token-less manager (dev/test/bench/chaos) runs these bare. When a
-        // token IS set, the payload MUST carry a matching prefix; the stripped
-        // remainder is what the real handler decodes.
-        let payload = if autumn_rpc::manager_rpc::is_admin_mgr_msg(msg_type) {
-            if let Some(tok) = self.admin_token.borrow().as_ref() {
-                let Some((got, rest)) = autumn_rpc::manager_rpc::strip_admin_token(&payload) else {
-                    return Err((
-                        StatusCode::FailedPrecondition,
-                        "admin op requires an admin token (malformed or missing prefix) — pass \
-                         --admin-token-file to autumn-op"
-                            .to_string(),
-                    ));
-                };
-                if !crate::authz::ct_eq_secret(tok, &String::from_utf8_lossy(got)) {
-                    return Err((
-                        StatusCode::FailedPrecondition,
-                        "admin token invalid".to_string(),
-                    ));
-                }
-                payload.slice_ref(rest)
-            } else {
-                payload
-            }
-        } else {
-            payload
-        };
         match msg_type {
             MSG_STATUS => self.handle_status().await,
             MSG_ACQUIRE_OWNER_LOCK => self.handle_acquire_owner_lock(payload).await,
@@ -551,19 +530,11 @@ impl AutumnManager {
             token_ttl_secs: self.token_ttl_secs.get(),
             clock_skew_secs: self.clock_skew_secs.get(),
             cluster_id: self.cluster_id.borrow().clone(),
-            // (PS slice): hand the PS the admin secret so it can
-            // gate split/maintenance. Empty when unconfigured → PS runs them bare.
-            admin_token: self
-                .admin_token
-                .borrow()
-                .as_ref()
-                .map(|t| t.as_bytes().to_vec())
-                .unwrap_or_default(),
         }))
     }
 
     /// `MSG_TENANT_CREATE` — admin creates/rotates a tenant account. Leader-only,
-    /// admin-token gated. Returns the freshly-generated permanent credential
+    /// Admin connection only. Returns the freshly-generated permanent credential
     /// (shown once; only its SHA-256 hash is stored).
     async fn handle_tenant_create(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
@@ -576,25 +547,6 @@ impl AutumnManager {
         let req: TenantCreateReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // Admin-token gate (admin_auth_design.md Option A). Fail-closed: refuse
-        // if no admin token is configured; constant-time compare otherwise.
-        match self.admin_token.borrow().as_ref() {
-            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
-            Some(_) => {
-                return Ok(rkyv_encode(&TenantCreateResp {
-                    code: CODE_PRECONDITION,
-                    message: "admin token invalid".to_string(),
-                    credential: Vec::new(),
-                }));
-            }
-            None => {
-                return Ok(rkyv_encode(&TenantCreateResp {
-                    code: CODE_ERROR,
-                    message: "admin RPCs disabled (no --admin-token configured)".to_string(),
-                    credential: Vec::new(),
-                }));
-            }
-        }
 
         if req.tenant.is_empty() {
             return Ok(rkyv_encode(&TenantCreateResp {
@@ -666,25 +618,13 @@ impl AutumnManager {
 
     /// `MSG_TENANT_DELETE` — admin removes a tenant account (stops renewal; the
     /// tenant's current token still works until it expires). Leader-only,
-    /// admin-token gated.
+    /// Admin connection only.
     async fn handle_tenant_delete(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
         let req: TenantDeleteReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        match self.admin_token.borrow().as_ref() {
-            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
-            Some(_) => {
-                return Self::code_resp(CODE_PRECONDITION, "admin token invalid".to_string())
-            }
-            None => {
-                return Self::code_resp(
-                    CODE_ERROR,
-                    "admin RPCs disabled (no --admin-token configured)".to_string(),
-                )
-            }
-        }
         // Same serialization as tenant-create (coco P1): create/delete of the
         // same tenant must not reorder between etcd and memory.
         let _admin = self.tenant_admin_lock.lock().await;
@@ -699,7 +639,7 @@ impl AutumnManager {
     }
 
     /// `MSG_NAMESPACE_CREATE` (D2) — admin registers a namespace.
-    /// Leader-only, admin-token gated. Rejects reserved names + prefix-overlap;
+    /// Leader-only, Admin connection only. Rejects reserved names + prefix-overlap;
     /// etcd-first (Programming Note 1), leader-fenced, serialized on
     /// `namespace_admin_lock`. Mirrors `handle_tenant_create`.
     async fn handle_namespace_create(&self, payload: Bytes) -> HandlerResult {
@@ -712,22 +652,6 @@ impl AutumnManager {
         let req: NamespaceCreateReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // Admin-token gate (fail-closed; constant-time compare). Same as tenant.
-        match self.admin_token.borrow().as_ref() {
-            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
-            Some(_) => {
-                return Ok(rkyv_encode(&NamespaceCreateResp {
-                    code: CODE_PRECONDITION,
-                    message: "admin token invalid".to_string(),
-                }));
-            }
-            None => {
-                return Ok(rkyv_encode(&NamespaceCreateResp {
-                    code: CODE_ERROR,
-                    message: "admin RPCs disabled (no --admin-token configured)".to_string(),
-                }));
-            }
-        }
 
         // Name charset validation (single path segment).
         if let Err(msg) = crate::validate_namespace_name(&req.name) {
@@ -801,7 +725,7 @@ impl AutumnManager {
     }
 
     /// `MSG_NAMESPACE_DELETE` (D2) — admin removes a namespace registry
-    /// row. Leader-only, admin-token gated. Refuses the three built-in families
+    /// row. Leader-only, Admin connection only. Refuses the three built-in families
     /// (`fs`/`kvc`/`mem`). The NON-EMPTY guard (`--force`) is enforced
     /// CLIENT-SIDE in `autumn-op` (the manager has no KV data-plane client), so
     /// this handler only drops the etcd registry row. Mirrors
@@ -812,18 +736,6 @@ impl AutumnManager {
         }
         let req: NamespaceDeleteReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        match self.admin_token.borrow().as_ref() {
-            Some(cfg) if crate::authz::ct_eq_secret(cfg, &req.admin_token) => {}
-            Some(_) => {
-                return Self::code_resp(CODE_PRECONDITION, "admin token invalid".to_string())
-            }
-            None => {
-                return Self::code_resp(
-                    CODE_ERROR,
-                    "admin RPCs disabled (no --admin-token configured)".to_string(),
-                )
-            }
-        }
         // Built-in families are non-deletable (bootstrap-seeded).
         if crate::BUILTIN_NAMESPACES.contains(&req.name.as_str()) {
             return Self::code_resp(
@@ -851,7 +763,7 @@ impl AutumnManager {
     /// `MSG_NAMESPACE_LIST` (D2) — list the full registry (rich rows).
     /// Leader-gated (the registry is leader-maintained; a follower's shadow is
     /// empty/stale — same reason `GET_AUTHZ_CONFIG` is leader-gated). Read-only,
-    /// not admin-token gated.
+    /// not Admin-only.
     async fn handle_namespace_list(&self) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&NamespaceListResp {
@@ -893,26 +805,6 @@ impl AutumnManager {
         }
         let req: NamespaceSetPresplitReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        // UX-fix (M2): recording sacred boundaries is OPT-IN on the
-        // admin token, mirroring `is_admin_mgr_msg` — NOT fail-closed like the
-        // tenant/namespace-create family. Rationale: this op only *records* a
-        // layout an operator already declared (it grants no capability and
-        // exposes no secret), and the WHOLE POINT is the merge guard + auto-split
-        // snap. Fail-closing it meant a token-less cluster (dev / bench / chaos /
-        // memory-mode) could NEVER arm the protection, while its auto-policy
-        // controller could still merge boundaries away. So:
-        //   • manager has NO token  → accept bare (record the boundaries);
-        //   • manager HAS a token   → the request MUST carry a matching one.
-        // This makes "merge is safe" unconditional instead of contingent on a
-        // two-position secret ritual.
-        if let Some(cfg) = self.admin_token.borrow().as_ref() {
-            if !crate::authz::ct_eq_secret(cfg, &req.admin_token) {
-                return Ok(rkyv_encode(&CodeResp {
-                    code: CODE_PRECONDITION,
-                    message: "admin token invalid".to_string(),
-                }));
-            }
-        }
         // Build the updated row WITHOUT touching the live map: etcd is written
         // first and memory only commits on success, same discipline as
         // `handle_namespace_create`. Mutating in place and then failing to
@@ -1017,7 +909,7 @@ impl AutumnManager {
     }
 
     /// list every principal + its grants. Mirrors
-    /// `handle_namespace_list` — leader-gated, read-only, no admin-token gate.
+    /// `handle_namespace_list` — leader-gated, read-only, not Admin-only.
     /// `credential_hash` is dropped on the way out (see `PrincipalRow`).
     async fn handle_principal_list(&self) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
@@ -7882,14 +7774,12 @@ mod authz_kdc_tests {
             mgr.set_authz_keyring(
                 crate::authz::AuthzKeyring::from_file_contents(&keyfile()).unwrap(),
             );
-            mgr.set_admin_token("admin-secret".to_string());
             mgr.set_protected_prefixes(vec![b"mem/".to_vec()]);
             mgr.set_token_ttl_secs(3600);
             let cluster_id = mgr.cluster_id.borrow().clone();
 
             // ── (1) tenant-create (admin) ──────────────────────────────
             let ok_create = rkyv_encode(&TenantCreateReq {
-                admin_token: "admin-secret".to_string(),
                 tenant: "acme".to_string(),
                 allowed_prefixes: vec![b"mem/acme/".to_vec()],
             });
@@ -7898,16 +7788,6 @@ mod authz_kdc_tests {
             assert_eq!(resp.code, CODE_OK, "{}", resp.message);
             let cred = resp.credential;
             assert_eq!(cred.len(), 32);
-
-            // wrong admin token → refused
-            let bad_admin = rkyv_encode(&TenantCreateReq {
-                admin_token: "wrong".to_string(),
-                tenant: "acme2".to_string(),
-                allowed_prefixes: vec![b"mem/acme2/".to_vec()],
-            });
-            let r: TenantCreateResp =
-                rkyv_decode(&mgr.handle_tenant_create(bad_admin).await.unwrap()).unwrap();
-            assert_ne!(r.code, CODE_OK);
 
             // ── (2) mint a token with the credential ───────────────────
             let mint = rkyv_encode(&MintTokenReq {
@@ -7974,7 +7854,6 @@ mod authz_kdc_tests {
 
             // ── (6) tenant-delete stops future renewal ─────────────────
             let del = rkyv_encode(&TenantDeleteReq {
-                admin_token: "admin-secret".to_string(),
                 tenant: "acme".to_string(),
             });
             let dresp: CodeResp =
@@ -7999,7 +7878,7 @@ mod authz_kdc_tests {
                 rkyv_decode(&mgr.handle_get_authz_config().await.unwrap()).unwrap();
             assert!(!cfg.enabled);
             assert!(cfg.public_keys.is_empty());
-            // mint refused (no signing key), tenant-create refused (no admin token).
+            // mint refused (no signing key).
             let mint = rkyv_encode(&MintTokenReq {
                 principal: "acme".to_string(),
                 credential: vec![1u8; 32],
@@ -8007,14 +7886,6 @@ mod authz_kdc_tests {
             let mr: MintTokenResp =
                 rkyv_decode(&mgr.handle_mint_token(mint).await.unwrap()).unwrap();
             assert_ne!(mr.code, CODE_OK);
-            let tc = rkyv_encode(&TenantCreateReq {
-                admin_token: "x".to_string(),
-                tenant: "acme".to_string(),
-                allowed_prefixes: vec![b"mem/acme/".to_vec()],
-            });
-            let r: TenantCreateResp =
-                rkyv_decode(&mgr.handle_tenant_create(tc).await.unwrap()).unwrap();
-            assert_ne!(r.code, CODE_OK);
         });
     }
 }
@@ -8028,30 +7899,23 @@ mod namespace_registry_tests {
     #![allow(clippy::await_holding_refcell_ref)]
     use crate::AutumnManager;
     use autumn_rpc::manager_rpc::*;
-    use autumn_rpc::StatusCode;
     use bytes::Bytes;
-
-    const ADMIN: &str = "admin-secret";
 
     fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
         compio::runtime::Runtime::new().unwrap().block_on(f)
     }
 
     fn mgr() -> AutumnManager {
-        let m = AutumnManager::new();
-        m.set_admin_token(ADMIN.to_string());
-        m
+        AutumnManager::new()
     }
 
     fn create(
         m: &AutumnManager,
-        admin: &str,
         name: &str,
         owner: Option<&str>,
         presplit: Vec<Vec<u8>>,
     ) -> NamespaceCreateResp {
         let req = NamespaceCreateReq {
-            admin_token: admin.to_string(),
             name: name.to_string(),
             owner_tenant: owner.map(|s| s.to_string()),
             presplit,
@@ -8061,9 +7925,8 @@ mod namespace_registry_tests {
         rkyv_decode::<NamespaceCreateResp>(&resp).expect("decode NamespaceCreateResp")
     }
 
-    fn delete(m: &AutumnManager, admin: &str, name: &str) -> CodeResp {
+    fn delete(m: &AutumnManager, name: &str) -> CodeResp {
         let req = NamespaceDeleteReq {
-            admin_token: admin.to_string(),
             name: name.to_string(),
         };
         let payload: Bytes = rkyv_encode(&req);
@@ -8081,81 +7944,12 @@ mod namespace_registry_tests {
         rkyv_decode::<NamespaceListResp>(&resp).expect("decode NamespaceListResp")
     }
 
-    // ── payload-prefix admin gate on cluster-mutating ops ──
-
-    /// Drive a mutating op through `dispatch` (where the gate lives). Returns the
-    /// frame-level result: `Ok` = passed the gate (the handler then ran and
-    /// answered on its own merits), `Err(code,msg)` = the gate rejected it.
-    fn dispatch_merge(
-        m: &AutumnManager,
-        wire_payload: Bytes,
-    ) -> Result<Bytes, (StatusCode, String)> {
-        run(async { m.dispatch(MSG_MERGE_PARTITIONS, wire_payload).await })
-    }
-
-    fn merge_body() -> Bytes {
-        rkyv_encode(&MergePartitionsReq {
-            survivor_part_id: 1,
-            victim_part_id: 2,
-            force: false,
-        })
-    }
-
-    #[test]
-    fn admin_gate_skipped_when_manager_has_no_token() {
-        // Opt-in: a token-less manager runs mutating ops BARE (dev/test/bench/
-        // chaos never set a token). The bare body passes the gate and reaches the
-        // handler, which then fails for its OWN reason (no such partition) — the
-        // point is it was NOT rejected by the gate.
-        let m = AutumnManager::new(); // no set_admin_token
-        let r = dispatch_merge(&m, merge_body());
-        assert!(r.is_ok(), "gate must not reject when no admin token is configured");
-    }
-
-    #[test]
-    fn admin_gate_rejects_missing_and_wrong_token_accepts_correct() {
-        let m = AutumnManager::new();
-        m.set_admin_token(ADMIN.to_string());
-
-        // No prefix at all (a stale/rogue client that doesn't know about the gate).
-        let bare = dispatch_merge(&m, merge_body());
-        let (code, msg) = bare.expect_err("token-ON manager must reject an unprefixed admin op");
-        assert_eq!(code, StatusCode::FailedPrecondition);
-        assert!(msg.contains("admin token"), "{msg}");
-
-        // Wrong token.
-        let wrong = dispatch_merge(
-            &m,
-            autumn_rpc::manager_rpc::prefix_admin_token(b"not-the-secret", &merge_body()),
-        );
-        let (code, msg) = wrong.expect_err("wrong token must be rejected");
-        assert_eq!(code, StatusCode::FailedPrecondition);
-        assert_eq!(msg, "admin token invalid");
-
-        // Correct token → passes the gate (handler then runs and fails on its own
-        // merits — a missing partition — which is NOT a gate rejection).
-        let ok = dispatch_merge(
-            &m,
-            autumn_rpc::manager_rpc::prefix_admin_token(ADMIN.as_bytes(), &merge_body()),
-        );
-        assert!(ok.is_ok(), "correct token must pass the gate");
-    }
-
-    #[test]
-    fn admin_gate_leaves_read_only_ops_untouched() {
-        // A read op is never prefixed and never stripped, even with a token set.
-        let m = AutumnManager::new();
-        m.set_admin_token(ADMIN.to_string());
-        let r = run(async { m.dispatch(MSG_NODES_INFO, Bytes::new()).await });
-        assert!(r.is_ok(), "read-only op must not be gated");
-    }
-
     #[test]
     fn namespace_list_returns_rich_registry_sorted() {
         let m = mgr();
         run(async { m.seed_builtin_namespaces().await.unwrap() });
         assert_eq!(
-            create(&m, ADMIN, "bench", Some("acme"), vec![vec![0x01u8, 0x02]]).code,
+            create(&m, "bench", Some("acme"), vec![vec![0x01u8, 0x02]]).code,
             CODE_OK
         );
         let r = list(&m);
@@ -8191,7 +7985,6 @@ mod namespace_registry_tests {
 
     fn principal_create(m: &AutumnManager, name: &str, grants: &[&[u8]]) -> TenantCreateResp {
         let req = TenantCreateReq {
-            admin_token: ADMIN.to_string(),
             tenant: name.to_string(),
             allowed_prefixes: grants.iter().map(|g| g.to_vec()).collect(),
         };
@@ -8260,7 +8053,6 @@ mod namespace_registry_tests {
 
     fn set_presplit(m: &AutumnManager, name: &str, points: &[&[u8]]) -> CodeResp {
         let req = NamespaceSetPresplitReq {
-            admin_token: ADMIN.to_string(),
             name: name.to_string(),
             points: points.iter().map(|p| p.to_vec()).collect(),
         };
@@ -8299,50 +8091,16 @@ mod namespace_registry_tests {
     }
 
     #[test]
-    fn set_presplit_is_admin_and_leader_gated_and_needs_a_real_namespace() {
+    fn set_presplit_is_leader_gated_and_needs_a_real_namespace() {
         let m = mgr();
         run(async { m.seed_builtin_namespaces().await.unwrap() });
-        // wrong token
-        let bad = NamespaceSetPresplitReq {
-            admin_token: "wrong".to_string(),
-            name: "fs".to_string(),
-            points: vec![b"fs/\x03\x01".to_vec()],
-        };
-        let r = run(async {
-            m.handle_namespace_set_presplit(rkyv_encode(&bad)).await.unwrap()
-        });
-        assert_eq!(rkyv_decode::<CodeResp>(&r).unwrap().code, CODE_PRECONDITION);
-        assert!(m.sacred_boundaries().is_empty(), "a rejected call must record nothing");
-
         // unknown namespace
         assert_eq!(set_presplit(&m, "nope", &[b"nope/\x01"]).code, CODE_NOT_FOUND);
+        assert!(m.sacred_boundaries().is_empty(), "a rejected call must record nothing");
 
         // follower
         m.set_leader(false);
         assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x01"]).code, CODE_NOT_LEADER);
-    }
-
-    #[test]
-    fn set_presplit_is_opt_in_bare_on_a_tokenless_manager() {
-        // UX-fix (M2): recording is OPT-IN like is_admin_mgr_msg — a
-        // manager with NO admin token accepts a bare (empty-token) call and
-        // records, so a token-less cluster (dev/bench/chaos) can ARM the merge
-        // guard + auto-split snap. Fail-closing it (the old behaviour) made the
-        // whole protection impossible to enable there.
-        let m = AutumnManager::new(); // deliberately NO set_admin_token
-        run(async { m.seed_builtin_namespaces().await.unwrap() });
-        let bare = NamespaceSetPresplitReq {
-            admin_token: String::new(),
-            name: "fs".to_string(),
-            points: vec![b"fs/\x03\x06".to_vec(), b"fs/\x03\x0c".to_vec()],
-        };
-        let r = run(async {
-            m.handle_namespace_set_presplit(rkyv_encode(&bare)).await.unwrap()
-        });
-        assert_eq!(rkyv_decode::<CodeResp>(&r).unwrap().code, CODE_OK);
-        assert_eq!(m.sacred_boundaries().len(), 2, "bare call must record on a tokenless manager");
-        // And the guard is now live on this tokenless cluster.
-        assert!(m.sacred_boundary_owner(b"fs/\x03\x06").is_some());
     }
 
     /// Put a partition with an explicit range into the store so the split-snap
@@ -8486,20 +8244,20 @@ mod namespace_registry_tests {
     #[test]
     fn create_delete_round_trip() {
         let m = mgr();
-        let r = create(&m, ADMIN, "bench", None, Vec::new());
+        let r = create(&m, "bench", None, Vec::new());
         assert_eq!(r.code, CODE_OK, "{}", r.message);
         assert!(m.namespaces.borrow().contains_key("bench"));
 
         // Re-create is a precondition failure (already exists).
-        let dup = create(&m, ADMIN, "bench", None, Vec::new());
+        let dup = create(&m, "bench", None, Vec::new());
         assert_eq!(dup.code, CODE_PRECONDITION);
 
-        let d = delete(&m, ADMIN, "bench");
+        let d = delete(&m, "bench");
         assert_eq!(d.code, CODE_OK, "{}", d.message);
         assert!(!m.namespaces.borrow().contains_key("bench"));
 
         // Delete of a now-absent namespace = NOT_FOUND.
-        let gone = delete(&m, ADMIN, "bench");
+        let gone = delete(&m, "bench");
         assert_eq!(gone.code, CODE_NOT_FOUND);
     }
 
@@ -8507,7 +8265,7 @@ mod namespace_registry_tests {
     fn presplit_points_are_stored_verbatim() {
         let m = mgr();
         let pts = vec![vec![0x01u8, 0x02], vec![0xffu8]];
-        let r = create(&m, ADMIN, "bench", Some("acme"), pts.clone());
+        let r = create(&m, "bench", Some("acme"), pts.clone());
         assert_eq!(r.code, CODE_OK, "{}", r.message);
         let ns = m.namespaces.borrow();
         let row = ns.get("bench").unwrap();
@@ -8519,7 +8277,7 @@ mod namespace_registry_tests {
     fn reserved_names_are_rejected() {
         let m = mgr();
         for name in ["fs", "kvc", "mem", "default"] {
-            let r = create(&m, ADMIN, name, None, Vec::new());
+            let r = create(&m, name, None, Vec::new());
             assert_eq!(r.code, CODE_INVALID_ARGUMENT, "{name} must be reserved");
         }
     }
@@ -8528,7 +8286,7 @@ mod namespace_registry_tests {
     fn invalid_charset_is_rejected() {
         let m = mgr();
         for bad in ["Bench", "a/b", "has space", "", "up_UP"] {
-            let r = create(&m, ADMIN, bad, None, Vec::new());
+            let r = create(&m, bad, None, Vec::new());
             assert_eq!(r.code, CODE_INVALID_ARGUMENT, "'{bad}' must be rejected");
         }
     }
@@ -8548,10 +8306,10 @@ mod namespace_registry_tests {
                 created_at: 0,
             },
         );
-        let r = create(&m, ADMIN, "a", None, Vec::new());
+        let r = create(&m, "a", None, Vec::new());
         assert_eq!(r.code, CODE_INVALID_ARGUMENT, "overlapping prefix must reject");
         // A disjoint name is still accepted.
-        let ok = create(&m, ADMIN, "bench", None, Vec::new());
+        let ok = create(&m, "bench", None, Vec::new());
         assert_eq!(ok.code, CODE_OK, "{}", ok.message);
     }
 
@@ -8560,23 +8318,10 @@ mod namespace_registry_tests {
         let m = mgr();
         run(async { m.seed_builtin_namespaces().await.unwrap() });
         for name in ["fs", "kvc", "mem"] {
-            let d = delete(&m, ADMIN, name);
+            let d = delete(&m, name);
             assert_eq!(d.code, CODE_INVALID_ARGUMENT, "{name} must be non-deletable");
             assert!(m.namespaces.borrow().contains_key(name));
         }
-    }
-
-    #[test]
-    fn admin_token_is_enforced() {
-        let m = mgr();
-        // Wrong token.
-        let bad = create(&m, "wrong", "bench", None, Vec::new());
-        assert_eq!(bad.code, CODE_PRECONDITION);
-        assert!(!m.namespaces.borrow().contains_key("bench"));
-        // No admin token configured at all → RPCs disabled.
-        let m2 = AutumnManager::new();
-        let disabled = create(&m2, ADMIN, "bench", None, Vec::new());
-        assert_eq!(disabled.code, CODE_ERROR);
     }
 
     #[test]
@@ -8584,8 +8329,8 @@ mod namespace_registry_tests {
         let m = mgr();
         run(async { m.seed_builtin_namespaces().await.unwrap() });
         // An OWNED namespace is auto-protected; an unowned one is registered only.
-        assert_eq!(create(&m, ADMIN, "bench", Some("acme"), Vec::new()).code, CODE_OK);
-        assert_eq!(create(&m, ADMIN, "scratch", None, Vec::new()).code, CODE_OK);
+        assert_eq!(create(&m, "bench", Some("acme"), Vec::new()).code, CODE_OK);
+        assert_eq!(create(&m, "scratch", None, Vec::new()).code, CODE_OK);
 
         let cfg = authz_config(&m);
         // `namespaces` carries EVERY registered prefix (Layer-A data source).
@@ -8630,7 +8375,7 @@ mod namespace_registry_tests {
         let m = mgr();
         // The D6 manual `--auth-protected-prefix` list must survive the bridge.
         m.set_protected_prefixes(vec![b"legacy/".to_vec()]);
-        assert_eq!(create(&m, ADMIN, "bench", Some("acme"), Vec::new()).code, CODE_OK);
+        assert_eq!(create(&m, "bench", Some("acme"), Vec::new()).code, CODE_OK);
         let cfg = authz_config(&m);
         assert!(cfg.protected_prefixes.contains(&b"legacy/".to_vec()), "manual list dropped");
         assert!(cfg.protected_prefixes.contains(&b"bench/".to_vec()), "owned ns not bridged");

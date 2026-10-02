@@ -17,6 +17,21 @@ const MANAGER_BIN: &str = env!("CARGO_BIN_EXE_autumn-manager-server");
 const EXTENT_NODE_BIN: &str = env!("CARGO_BIN_EXE_autumn-extent-node");
 const AUTUMN_OP_BIN: &str = env!("CARGO_BIN_EXE_autumn-op");
 
+/// The cluster secret file every server binary this test spawns requires, and
+/// autumn-op proves (it connects as an operator).
+fn cluster_secret_file() -> &'static std::path::Path {
+    static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "cluster-secret-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "autumn-server-tests-cluster-secret-0123456789")
+            .expect("write test cluster secret");
+        path
+    })
+}
+
 fn pick_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
     l.local_addr().expect("local_addr").port()
@@ -79,6 +94,8 @@ fn en_startup_log(tmp: &std::path::Path, mgr_addr: &str, name: &str, extra: &[&s
     let dir = tmp.join(name);
     std::fs::create_dir_all(&dir).unwrap();
     let out = Command::new(AUTUMN_OP_BIN)
+        .arg("--cluster-secret-file")
+        .arg(cluster_secret_file())
         .args(["--manager", mgr_addr, "format", dir.to_str().unwrap()])
         .output()
         .expect("spawn autumn-op format");
@@ -89,6 +106,8 @@ fn en_startup_log(tmp: &std::path::Path, mgr_addr: &str, name: &str, extra: &[&s
     let port = pick_port();
     let _en = ChildGuard(
         Command::new(EXTENT_NODE_BIN)
+            .arg("--cluster-secret-file")
+            .arg(cluster_secret_file())
             .args(["--port", &port.to_string(), "--listen", "127.0.0.1"])
             .args(["--control-port", &pick_port().to_string()])
             .args(["--cpuset", &one_allowed_core()])
@@ -115,6 +134,8 @@ fn extent_node_binary_defaults_to_direct_io() {
     let mgr_addr = format!("127.0.0.1:{mgr_port}");
     let _manager = ChildGuard(
         Command::new(MANAGER_BIN)
+            .arg("--cluster-secret-file")
+            .arg(cluster_secret_file())
             .args(["--port", &mgr_port.to_string(), "--listen", "127.0.0.1"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())

@@ -371,19 +371,24 @@ async fn run(args: Args) -> Result<()> {
     if let Command::GenSigningKey { kid } = &args.cmd {
         return cmd_gen_signing_key(*kid);
     }
+    if matches!(args.cmd, Command::GenClusterSecret) {
+        println!("{}", autumn_rpc::peer_auth::ClusterSecret::generate());
+        return Ok(());
+    }
+    // Every connection below declares the Admin role, which every server
+    // refuses unless it proves the cluster secret. Without the flag nothing is
+    // installed, and the first connect says which flag is missing.
+    if let Some(path) = &args.cluster_secret_file {
+        autumn_rpc::peer_auth::ClusterSecret::from_file(path)
+            .and_then(autumn_rpc::peer_auth::install)
+            .map_err(|e| anyhow::anyhow!("--cluster-secret-file: {e}"))?;
+    }
     // Select the process-global transport before connecting. Without this an
     // autumn-op invoked against a UCX manager would default to TCP and hang.
     let _ = autumn_transport::init_with(args.transport);
     let client = ClusterClient::connect_admin(&args.manager).await?;
-    // a global `--admin-token[-file]` authorizes cluster-mutating
-    // ops (fence/merge/create-stream/…). Read-only commands are unaffected — the
-    // manager only strips+checks the prefix for `is_admin_mgr_msg`, so passing a
-    // token to `info`/`list-nodes` is a harmless no-op.
-    if let Some(tok) = &args.admin_token {
-        client.set_admin_token(tok.as_bytes().to_vec());
-    }
-    // The admin token gates CONTROL-plane RPCs; it means nothing to a partition
-    // server. Subcommands that touch partition keys need a data-plane capability
+    // The cluster secret authorizes CONTROL-plane RPCs; it does not satisfy a
+    // partition server's key checks. Subcommands that touch partition keys need a data-plane capability
     // too — `presplit --namespace fs` reads the declared stripe geometry before
     // overwriting it, and under PROTECT-EVERYTHING that read is denied on a
     // connection that never sent AUTH_HELLO. The binding stays Raw (autumn-op
@@ -498,35 +503,8 @@ async fn run(args: Args) -> Result<()> {
             namespace,
             tenant,
             rule,
-            admin_token,
             force,
-        } => {
-            // UX-fix: the recording token falls back to the GLOBAL
-            // `--admin-token[-file]` (the position `usage()` documents) so an
-            // operator no longer has to pass the same secret twice. The
-            // per-command spelling stays as an override.
-            let record_token = admin_token.as_deref().or(args.admin_token.as_deref());
-            // The cuts inside cmd_presplit go out as `split_at` → MSG_MULTI_MODIFY_SPLIT,
-            // a PS admin op that authorizes via the client's global admin-token prefix.
-            // The connect-time `set_admin_token` above only fires for the GLOBAL flag
-            // position; when the token is given as the per-command `--admin-token` (the
-            // position `usage()` documents), install it here too — otherwise every cut is
-            // rejected "missing prefix" and presplit silently no-ops to one partition on
-            // any admin-token cluster.
-            if let Some(tok) = record_token {
-                client.set_admin_token(tok.as_bytes().to_vec());
-            }
-            cmd_presplit(
-                &client,
-                args.json,
-                &namespace,
-                &tenant,
-                &rule,
-                record_token,
-                force,
-            )
-            .await?
-        }
+        } => cmd_presplit(&client, args.json, &namespace, &tenant, &rule, force).await?,
         Command::Merge {
             survivor_part_id,
             victim_part_id,
@@ -592,15 +570,13 @@ async fn run(args: Args) -> Result<()> {
         Command::Format { dirs } => cmd_format(&client, args.json, dirs, &args.manager).await?,
         // ---------------- authz tooling ----------------
         Command::GenSigningKey { .. } => unreachable!("gen-signing-key handled before connect"),
-        Command::PrincipalCreate {
-            principal,
-            grants,
-            admin_token,
-        } => cmd_principal_create(&client, args.json, principal, grants, admin_token).await?,
-        Command::PrincipalDelete {
-            principal,
-            admin_token,
-        } => cmd_principal_delete(&client, args.json, principal, admin_token).await?,
+        Command::GenClusterSecret => unreachable!("gen-cluster-secret handled before connect"),
+        Command::PrincipalCreate { principal, grants } => {
+            cmd_principal_create(&client, args.json, principal, grants).await?
+        }
+        Command::PrincipalDelete { principal } => {
+            cmd_principal_delete(&client, args.json, principal).await?
+        }
         Command::MintToken {
             principal,
             credential,
@@ -610,23 +586,10 @@ async fn run(args: Args) -> Result<()> {
             name,
             owner_tenant,
             presplit,
-            admin_token,
-        } => {
-            cmd_namespace_create(
-                &client,
-                args.json,
-                name,
-                owner_tenant,
-                presplit,
-                admin_token,
-            )
-            .await?
+        } => cmd_namespace_create(&client, args.json, name, owner_tenant, presplit).await?,
+        Command::NamespaceDelete { name, force } => {
+            cmd_namespace_delete(&client, args.json, name, force).await?
         }
-        Command::NamespaceDelete {
-            name,
-            force,
-            admin_token,
-        } => cmd_namespace_delete(&client, args.json, name, force, admin_token).await?,
         Command::NamespaceList => cmd_namespace_list(&client, args.json).await?,
         Command::PrincipalList => cmd_principal_list(&client, args.json).await?,
     }
@@ -680,12 +643,11 @@ async fn cmd_principal_create(
     json: bool,
     principal: String,
     grants: Vec<String>,
-    admin_token: String,
 ) -> Result<()> {
     let allowed_prefixes: Vec<Vec<u8>> = grants.iter().map(|p| p.as_bytes().to_vec()).collect();
     // Leader-only RPC with manager rotation on CODE_NOT_LEADER lives in the SDK.
     let credential = client
-        .principal_create(&principal, allowed_prefixes, &admin_token)
+        .principal_create(&principal, allowed_prefixes)
         .await?;
     let cred = hex_encode(&credential);
     if json {
@@ -711,9 +673,8 @@ async fn cmd_principal_delete(
     client: &ClusterClient,
     json: bool,
     principal: String,
-    admin_token: String,
 ) -> Result<()> {
-    client.principal_delete(&principal, &admin_token).await?;
+    client.principal_delete(&principal).await?;
     if json {
         println!(
             "{}",
@@ -760,10 +721,9 @@ async fn cmd_namespace_create(
     name: String,
     owner_tenant: Option<String>,
     presplit: Vec<Vec<u8>>,
-    admin_token: String,
 ) -> Result<()> {
     client
-        .namespace_create(&name, owner_tenant.clone(), presplit.clone(), &admin_token)
+        .namespace_create(&name, owner_tenant.clone(), presplit.clone())
         .await?;
     if json {
         println!(
@@ -797,7 +757,6 @@ async fn cmd_namespace_delete(
     json: bool,
     name: String,
     force: bool,
-    admin_token: String,
 ) -> Result<()> {
     let prefix = format!("{name}/").into_bytes();
     if !force {
@@ -814,7 +773,7 @@ async fn cmd_namespace_delete(
             );
         }
     }
-    client.namespace_delete(&name, &admin_token).await?;
+    client.namespace_delete(&name).await?;
     if json {
         println!(
             "{}",
@@ -2240,7 +2199,6 @@ async fn cmd_presplit(
     namespace: &str,
     tenant: &str,
     rule: &PresplitRule,
-    admin_token: Option<&str>,
     force: bool,
 ) -> Result<()> {
     let suffixes = presplit_suffixes(rule)?;
@@ -2388,15 +2346,6 @@ async fn cmd_presplit(
     //
     // Best-effort by design — this runs AFTER the cuts, so failing the whole
     // presplit here would report failure for work that already succeeded.
-    //
-    // UX-fix (M2): recording is now OPT-IN server-side (bare when the
-    // manager has no admin token), so we ALWAYS attempt it — a token-less
-    // cluster records the boundaries with an empty token, arming the merge guard
-    // + auto-split snap unconditionally. `record_token = ""` when the operator
-    // passed no token; if the manager DID configure one, its SPLIT_PART gate
-    // would already have rejected every cut above (applied == 0 → we bailed),
-    // so an empty token only ever reaches a token-less manager.
-    let record_token = admin_token.unwrap_or("");
     // UX-fix (M4): record the FULL declared grid (for FsLanes, every
     // lane boundary), not just the `points` we cut — so auto-split snaps to a
     // lane boundary instead of a median-inside-a-lane when `parts < lanes`.
@@ -2410,7 +2359,7 @@ async fn cmd_presplit(
         .collect();
     if !record_points.is_empty() {
         if let Err(e) = client
-            .namespace_set_presplit(namespace, record_points.clone(), record_token)
+            .namespace_set_presplit(namespace, record_points.clone())
             .await
         {
             eprintln!(

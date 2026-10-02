@@ -28,6 +28,8 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
 struct Args {
+    /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
+    cluster_secret_file: Option<std::path::PathBuf>,
     port: u16,
     psid: u64,
     manager: String,
@@ -107,6 +109,7 @@ struct Args {
 }
 
 fn parse_args() -> Args {
+    let mut cluster_secret_file: Option<std::path::PathBuf> = None;
     let mut port: u16 = 9201;
     let mut psid: u64 = 0;
     let mut manager = String::from("127.0.0.1:9001");
@@ -165,6 +168,10 @@ fn parse_args() -> Args {
             "--port" => {
                 i += 1;
                 port = args[i].parse().expect("--port must be a number");
+            }
+            "--cluster-secret-file" => {
+                i += 1;
+                cluster_secret_file = Some(args[i].clone().into());
             }
             "--psid" => {
                 i += 1;
@@ -477,6 +484,7 @@ fn parse_args() -> Args {
     }
 
     Args {
+        cluster_secret_file,
         port,
         psid,
         manager,
@@ -713,6 +721,10 @@ async fn main() -> Result<()> {
     // apply PS-library tunables before any library reader fires.
     apply_ps_tunables(&args);
 
+    if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref()) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     let _ = autumn_transport::init_with(args.transport);
     autumn_rpc::client::set_prepared_zerocopy_min_bytes(args.tcp_zerocopy_min_bytes);
     // --cpuset (if given) is installed BEFORE any cpu_pin reader

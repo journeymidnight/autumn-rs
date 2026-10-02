@@ -21,21 +21,22 @@ Binary-only crate: the executable entry points that wire the library crates toge
 **Default port**: 9001
 
 ```
-autumn-manager-server [--port 9001] [--listen 0.0.0.0] [--transport tcp|ucx] [--etcd 127.0.0.1:2379,...]
+autumn-manager-server --cluster-secret-file FILE [--port 9001] [--listen 0.0.0.0] [--transport tcp|ucx] [--etcd 127.0.0.1:2379,...]
 ```
 
 - Without `--etcd`: in-memory only (metadata lost on restart, no leader election). With `--etcd`: persistent — connects, replays state, runs the leader-election loop.
 - Serves `StreamManagerService` + `PartitionManagerService` on the same port, plus gRPC reflection.
 - `--metrics-port <P>` / `--metrics-listen <H>`: opt-in Prometheus `/metrics` (unauthenticated; pin to 127.0.0.1 when the RPC plane is on 0.0.0.0).
 - The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy activate --arm`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op`. Runbook: `docs/ops.md`.
-- Authz (opt-in): `--auth-signing-key-file <FILE>` enables data-plane authz (keys from `autumn-op gen-signing-key`). `--admin-token` / `--admin-token-file` gate the tenancy/authz admin RPCs (refused without one). `--auth-protected-prefix <P>` (repeatable) marks default-DENY prefixes. `--auth-token-ttl-secs` / `--auth-clock-skew-secs` tune minted tokens.
+- `--cluster-secret-file <FILE>` (REQUIRED on the manager, PS and EN; exit 2 without it): the cluster secret every Peer/Admin connection proves (`autumn_rpc::peer_auth`, `docs/cluster_secret_design.md`). `--admin-token[-file]` were removed and are refused by name.
+- Authz (opt-in): `--auth-signing-key-file <FILE>` enables data-plane authz (keys from `autumn-op gen-signing-key`). `--auth-protected-prefix <P>` (repeatable) marks default-DENY prefixes. `--auth-token-ttl-secs` / `--auth-clock-skew-secs` tune minted tokens.
 
 ### `autumn-extent-node` (`src/bin/extent_node.rs`)
 
 **Default port**: 9101
 
 ```
-autumn-extent-node --data DIR[,DIR2,...] [--port 9101] [--manager 127.0.0.1:9001] --advertise HOST:PORT
+autumn-extent-node --cluster-secret-file FILE --data DIR[,DIR2,...] [--port 9101] [--manager 127.0.0.1:9001] --advertise HOST:PORT
 ```
 
 - `--data`: directory holding extent files (`extent-{id}.dat` + `extent-{id}.meta`); comma-separated or repeated for a multi-disk EN.
@@ -59,7 +60,7 @@ autumn-extent-node --data DIR[,DIR2,...] [--port 9101] [--manager 127.0.0.1:9001
 **Default port**: 9201
 
 ```
-autumn-ps --psid <ID> --manager 127.0.0.1:9001 [--port 9201] [--data /tmp] [--advertise <ADDR>]
+autumn-ps --cluster-secret-file FILE --psid <ID> --manager 127.0.0.1:9001 [--port 9201] [--data /tmp] [--advertise <ADDR>]
 ```
 
 - `--psid`: **required**, unique partition-server ID across the cluster. `--data`: directory for local WAL files (`part-{id}.wal`). `--advertise`: address announced to the manager (when listening on 0.0.0.0 but the manager needs a routable address).
@@ -98,8 +99,9 @@ It remains a separate process: all cluster reads and writes invoke the sibling
 No new dependency, wire format, or data-path work is added by this integration.
 
 - `--manager`, `--transport`, `--port` (8799), `--listen` (0.0.0.0),
-  `--autumn-op`, and required `--admin-token[-file]` retain their CLI meanings.
-  The token authorizes the **upstream manager**, not HTTP callers. HTTP remains
+  `--autumn-op`, and required `--cluster-secret-file` (its path is forwarded to
+  every autumn-op call). The secret authorizes the **upstream manager**, not HTTP
+  callers. HTTP remains
   unauthenticated, including the VKE APIG route; see `docs/dashboard_review.md`.
 - Policy write bodies are typed; invalid booleans, integers, switch names and
   option-like policy names fail before spawning the CLI. HTML event arguments
@@ -133,10 +135,10 @@ No new dependency, wire format, or data-path work is added by this integration.
 Admin / observability CLI — the canonical interface to the manager control plane. Directory bin (Cargo target `src/bin/autumn_op/main.rs`). The Python ops tooling shells out to this binary for all RPC traffic, so the wire schema stays in exactly one place (`crates/rpc/src/manager_rpc.rs`).
 
 ```
-autumn-op [--manager 127.0.0.1:9001] [--json] [--transport tcp|ucx] [--admin-token TOK | --admin-token-file FILE] <COMMAND>
+autumn-op [--manager 127.0.0.1:9001] [--json] [--transport tcp|ucx] [--cluster-secret-file FILE] <COMMAND>
 ```
 
-Global `--admin-token` / `--admin-token-file`: attached as a signed payload prefix to mutating RPCs; read-only commands ignore it. `--json` on every command (the `info` schema is top-level `nodes / extents / streams / partitions` arrays). Global `--wait [--timeout SECS]` (default 600) applies to the async op triggers below.
+Global `--cluster-secret-file` (position-independent): autumn-op connects as an operator (Admin role), which every server refuses unless it proves the cluster secret, so every command that talks to a cluster needs it, read-only ones included. `gen-signing-key` / `gen-cluster-secret` never connect. `--admin-token[-file]` were removed and exit 2 by name. `--json` on every command (the `info` schema is top-level `nodes / extents / streams / partitions` arrays). Global `--wait [--timeout SECS]` (default 600) applies to the async op triggers below.
 
 **Async ops.** The seven long-running ops — `split` / `merge` / `rebalance` / `compact` / `gc` / `forcegc` / `force-ec-convert` — are **submitted through the leader's op-ledger** and return an `op_id` immediately (non-blocking). Query with `ops status <OP_ID>` or `ops list [--active] [--kind K] [--limit N]`; each op's state (pending/running/succeeded/failed/unknown) + the **failure reason** is retained (compact/gc/forcegc outcomes ride back on the PS load heartbeat). Pass global `--wait` to block until terminal and exit on the real outcome (non-zero on failure) — scripts/`presplit` that need the blocking error use it. A leader change answers an old id `unknown` (terminal history is in `audit-log`).
 
@@ -145,7 +147,7 @@ Global `--admin-token` / `--admin-token-file`: attached as a signed payload pref
 | Read / observability | `list-nodes`, `df`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `policy-candidates` |
 | Node lifecycle | `fence-node <id> --reason ... --by ... [--force]`, `maintenance <id> --reason ... --by ... [--expire TS]`, `unfence <id> --by ...`, `remove <id> --by ...` |
 | Cluster / partition admin | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M] [--presplit 1:normal\|N:hex]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID>`, `presplit <ns> <tenant> <rule>`, `merge <SURVIVOR> <VICTIM> [--force]`, `rebalance`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format <DIR>...` |
-| Auth / tenancy | `gen-signing-key [--kid K]`, `principal-create --principal P --grant P... [--admin-token]`, `principal-delete --principal P`, `principal-list`, `mint-token --principal P --credential ...`, `namespace-create --name N [--tenant T] [--presplit hex,…] [--admin-token]`, `namespace-delete --name N`, `namespace-list` |
+| Auth / tenancy | `gen-cluster-secret`, `gen-signing-key [--kid K]`, `principal-create --principal P --grant P...`, `principal-delete --principal P`, `principal-list`, `mint-token --principal P --credential ...`, `namespace-create --name N [--tenant T] [--presplit hex,…]`, `namespace-delete --name N`, `namespace-list` |
 | Auto-policy controller | `auto-policy status`, `auto-policy activate <NAME> [--arm]` (`--arm` = Armed, else DryRun), `auto-policy deactivate`, `auto-policy upsert <NAME> --switches split,gc,… [--interval N --cooldown N --max N --desc "…"]` (create/replace a custom policy), `auto-policy delete <NAME>`. Leader-routed |
 | Async op-ledger | `ops status <OP_ID>` (one op, `unknown` if this leader doesn't know it), `ops list [--active] [--kind split\|merge\|rebalance\|compact\|gc\|forcegc\|ec\|recovery] [--limit N]`. The seven op triggers above submit here + print an `op_id`; global `--wait` blocks to terminal. **`recovery` is auto-dispatched** (never submitted — submit refuses it): it appears on its own and, while still `running`, carries the last failure as `ERROR[code]: reason` — including the executing node's own reason, which arrives on the `df` heartbeat rather than waiting for the next re-dispatch. Leader-routed |
 
@@ -183,7 +185,7 @@ that can never succeed looks exactly like an empty open extent.
 
 `format` is IDENTITY-ONLY: no location flags — it stamps the sentinels and registers an EMPTY location; the EN self-registers its real location. `register-node` is a migration stub that hints and exits 1 before connecting.
 
-**CLI conventions (canonical + accepted aliases).** Both binaries hand-parse args (no clap; `autumn_op/args.rs`, `autumn_client/args.rs`). Canonical subcommands are kebab-case; the old snake_case / no-separator spellings stay as accepted aliases (`policy-candidates`←`policy_candidates`/`policy`, `auto-policy`←`auto_policy`, `put-stream`←`putstream`, `get-stream`←`getstream`). Canonical flag names per concept, with the older spelling kept as an alias: `--namespace` (←`--scope`, client KV scope), `--tenant` (←`--with-tenant`, `namespace-create`), `--principal` (←`--tenant`, `mint-token`). Byte-size flags accept an optional binary suffix (`4k`/`8m`/`1gib`) across both binaries (`gc --max-size`/`--stream-debt`, `perf-check`/`ycsb --size`). Three `autumn-client` subcommands are INTERNAL zero-copy verification paths, deliberately omitted from `usage()`: `put-bulk`, `direct-get`, `bulk-get` (they mirror `put`/`get` through the ZC codepaths). NOT YET unified (follow-ups): the verb-noun vs noun-verb split (`list-nodes`/`fence-node` vs `namespace-create`), the per-command `--admin-token` duplicating the global one, and `split`'s three targeting flags (`--at`/`--at-hex`/`--at-raw-hex`).
+**CLI conventions (canonical + accepted aliases).** Both binaries hand-parse args (no clap; `autumn_op/args.rs`, `autumn_client/args.rs`). Canonical subcommands are kebab-case; the old snake_case / no-separator spellings stay as accepted aliases (`policy-candidates`←`policy_candidates`/`policy`, `auto-policy`←`auto_policy`, `put-stream`←`putstream`, `get-stream`←`getstream`). Canonical flag names per concept, with the older spelling kept as an alias: `--namespace` (←`--scope`, client KV scope), `--tenant` (←`--with-tenant`, `namespace-create`), `--principal` (←`--tenant`, `mint-token`). Byte-size flags accept an optional binary suffix (`4k`/`8m`/`1gib`) across both binaries (`gc --max-size`/`--stream-debt`, `perf-check`/`ycsb --size`). Three `autumn-client` subcommands are INTERNAL zero-copy verification paths, deliberately omitted from `usage()`: `put-bulk`, `direct-get`, `bulk-get` (they mirror `put`/`get` through the ZC codepaths). NOT YET unified (follow-ups): the verb-noun vs noun-verb split (`list-nodes`/`fence-node` vs `namespace-create`), and `split`'s three targeting flags (`--at`/`--at-hex`/`--at-raw-hex`).
 
 ### `autumn-s3` (`src/bin/autumn_s3/`)
 
@@ -472,13 +474,15 @@ Newly-registered nodes start `Suspend`; the manager's 2 s `node_health_loop` fli
 
 ```bash
 # Start a minimal 1-node cluster (no replication, testing only)
-autumn-manager-server --port 9001 &
+autumn-op gen-cluster-secret > /tmp/cluster.secret
+S=(--cluster-secret-file /tmp/cluster.secret)
+autumn-manager-server "${S[@]}" --port 9001 &
 # format is identity-only; the EN self-registers its location
-autumn-op --manager 127.0.0.1:9001 format /tmp/extent0
-autumn-extent-node --data /tmp/extent0 --port 9101 --manager 127.0.0.1:9001 \
+autumn-op "${S[@]}" --manager 127.0.0.1:9001 format /tmp/extent0
+autumn-extent-node "${S[@]}" --data /tmp/extent0 --port 9101 --manager 127.0.0.1:9001 \
     --advertise 127.0.0.1:9101 &
-autumn-op --manager 127.0.0.1:9001 bootstrap --replication 1+0
-autumn-ps --psid 1 --port 9201 --manager 127.0.0.1:9001 --data /tmp/ps1 &
+autumn-op "${S[@]}" --manager 127.0.0.1:9001 bootstrap --replication 1+0
+autumn-ps "${S[@]}" --psid 1 --port 9201 --manager 127.0.0.1:9001 --data /tmp/ps1 &
 
 # Write and read (data plane = autumn-client)
 echo "hello world" > /tmp/val.txt
@@ -486,7 +490,7 @@ autumn-client --manager 127.0.0.1:9001 put mykey /tmp/val.txt
 autumn-client --manager 127.0.0.1:9001 get mykey
 
 # Inspect cluster (op plane = autumn-op)
-autumn-op --manager 127.0.0.1:9001 info
+autumn-op "${S[@]}" --manager 127.0.0.1:9001 info
 ```
 
 ## Runtime upgrade and experiments

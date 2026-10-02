@@ -4,6 +4,14 @@
 # + the one-shot bootstrap Job. Ordering is handled by the entrypoints' wait
 # loops (each role waits for the manager leader; bootstrap also waits for
 # AUTUMN_EXPECT_NODES extent nodes Online), so apply order does not matter.
+#
+# Prerequisite: the `autumn-cluster-secret` Secret (key `cluster.secret`), which
+# every server pod, the bootstrap Job and the dashboard mount. Create it once —
+# every pod must see the same value, so never regenerate it on a live cluster:
+#   autumn-op gen-cluster-secret > cluster.secret
+#   kubectl -n autumn create secret generic autumn-cluster-secret \
+#       --from-file=cluster.secret=cluster.secret
+# deploy/overlays/vke/deploy.sh does this for you.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 

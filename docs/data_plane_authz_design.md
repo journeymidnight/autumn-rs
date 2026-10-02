@@ -90,8 +90,8 @@ grant 串语义：**非空、左锚字节前缀、强制补尾 `/`**。
 凭据文件格式是**两行**：`<principal-name>\n<hex-secret>`。名字随文件携带，
 所以数据面不需要 `--principal` / `--tenant` flag。
 
-这条 admin RPC 由 `admin_auth_design.md` §4.2 的 struct 字段 admin token 保护
-（fail-closed）。
+这条 RPC 只在 Admin 连接上受理，Admin 连接必须持有集群密钥
+（`cluster_secret_design.md` §4）。
 
 ### 5.2 签发 / 续期 token（client，高频）
 
@@ -114,7 +114,7 @@ client 连 PS → 首帧 `MSG_AUTH_HELLO{token}`（`0x55`）→ PS 按 `kid` 取
 
 PS 轮询 manager `MSG_GET_AUTHZ_CONFIG` → `GetAuthzConfigResp{enabled,
 public_keys:[{kid, ed25519_pub, disabled}], namespaces, token_ttl_secs,
-clock_skew_secs, admin_token, cluster_id, …}` → 本地缓存
+clock_skew_secs, cluster_id, …}` → 本地缓存
 （`AuthzState::install`，`RwLock<Arc<AuthzInner>>` 整体换页）。
 首次同步取在 `finish_connect`（强制在第一条连接前就已武装），此后 5 s 一次
 （`authz_config_poll_loop`）。manager 宕机 → 用缓存继续强制（只有轮换 / 新公钥
@@ -195,22 +195,31 @@ clock_skew_secs, admin_token, cluster_id, …}` → 本地缓存
 ## 9. 非目标
 
 TLS / mTLS；per-user RBAC / 角色 / ACL 表；抗被攻破的 manager；抗 MITM / 抓包
-重放；per-token 撤销黑名单。
+重放；per-token 撤销黑名单；EN 按 key 范围授权直读（见 §10）。
 
-**EN 直连绕过 PS 的大值直读旁路 —— 明确接受、不做（WON'T-DO）。**
-rogue client 可以绕过 PS 直连 EN 发 `MSG_READ_BYTES`，靠枚举 / 猜
-`(extent_id, offset, length)` 读原始字节（EN 只认坐标、不认 principal / key，
-读路径只校验 `eversion` 不做授权；`owner_epoch` fence 只挡写不挡读）。
-理由：威胁模型是可信内网，且该旁路**只读**（EN 只吐字节、改不了别人的数据），
-攻击者还得先猜中有效坐标。给 EN 加验签会引出「谁签」的对称困境，成本不匹配收益。
-运维上 EN 数据端口本就只在数据面子网、只对 PS 开放。
+## 10. EN 直读：只验身份
 
-正常读路径没有这条旁路：`MSG_GET_BULK` / `MSG_BATCH_GET_BULK`（`get`/`get_many`）**恒走 PS**，只有显式
-opt-in 的 `get_direct` / `MSG_GET_REDIRECT` / `MSG_GET_REDIRECT_MANY` 才发
-descriptor，且只对 ≥ 64 KiB 的值给（失败自动 fallback 到 proxy get）——
-而这些 msg_type 在 `authz_check` 里同样做 `check_key`。
+`get_direct` / `MSG_GET_REDIRECT(_MANY)` 让客户端拿着 PS 发的 descriptor
+（extent、偏移、副本地址）直接向 EN 发 `MSG_READ_BYTES(_BULK)`。PS 在发
+descriptor 前做 `check_key`，但 EN 收到的只是坐标，不知道它属于哪个 key。
 
-## 10. 参照
+- **开启 authz 时**，EN 只在绑定了 principal 的 Client 连接上服务直读：客户端
+  先发同一个 `MSG_AUTH_HELLO{token}`，EN 用同一份公钥验签、校验 `aud`、绑定
+  `BoundPrincipal`，此后每个读请求检查 kid 仍启用、token 未过期（与 PS 的
+  `still_valid` 是同一个函数，`cap_token.rs`）。没有绑定、token 过期、kid 被禁，
+  一律 `PermissionDenied`；客户端的直读失败后回落到 PS proxy。
+- **EN 不验范围**：一个合法 principal 仍可凭猜中的坐标读到别的 tenant 的 extent。
+  要堵这一点需要 PS 为每个 descriptor 签名、EN 验签，未做。
+- **EN 取配置**：每个 shard 每 5 s 轮询 `MSG_GET_AUTHZ_CONFIG`（`ClientAuthz`）。
+  配置到手之前（`Unknown`）拒绝直读（`Unavailable`），不在不知道是否开启 authz
+  的状态下放行；manager 不可达时沿用上一次的结果。
+- **SDK**：`ensure_token` 每次拿到 token 都交给直读连接池
+  （`ConnPool::set_auth_token`），新连接在 VERSION_HELLO 后自动 `AUTH_HELLO`；
+  token 换了，池里的旧连接全部丢弃重连。
+- **集群成员（Peer）**：EN 之间、PS 到 EN 的连接不发 AUTH_HELLO，它们由集群密钥
+  认证（`cluster_secret_design.md`），可以调用 EN 的全部接口。
+
+## 11. 参照
 
 FoundationDB tenant authorization（非对称 JWT，storage 层验，不可撤销靠短 TTL）；
 Ceph cephx（MON 当 KDC + 自动续 ticket，对称 —— 我们改非对称）；etcd RBAC

@@ -106,12 +106,22 @@ AC="$BIN/autumn-client"
 # format / split / merge / compact / gc / info / ...) live on autumn-op.
 # autumn-client is data-plane only.
 AO="$BIN/autumn-op"
+# The cluster secret: every server requires it (--cluster-secret-file), and
+# autumn-op proves it on every call (it connects as an operator). Generated on
+# first start; `reset` wipes $DATA_ROOT and with it the secret.
+CLUSTER_SECRET_FILE="${AUTUMN_CLUSTER_SECRET_FILE:-$DATA_ROOT/cluster.secret}"
 
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+ensure_cluster_secret() {
+    [[ -s "$CLUSTER_SECRET_FILE" ]] && return 0
+    mkdir -p "$(dirname "$CLUSTER_SECRET_FILE")"
+    ( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$CLUSTER_SECRET_FILE" )
+}
 
 need_bin() {
     local b="$1"
@@ -253,7 +263,7 @@ wait_ps_ready() {
             echo " EXITED"
             die "ps (pid $pid) exited during startup — see $LOG_DIR/ps.log"
         fi
-        out="$("$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" info 2>/dev/null || true)"
+        out="$("$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" info 2>/dev/null || true)"
         if grep -Eq '^  ps .* slots  ready' <<<"$out"; then echo " ok"; return 0; fi
         sleep 0.5
     done
@@ -452,7 +462,8 @@ launch_extent_node() {
         ${stride_args[@]:+"${stride_args[@]}"} \
         ${metrics_args[@]:+"${metrics_args[@]}"} \
         ${dio_args[@]:+"${dio_args[@]}"} \
-        ${cpu_args[@]:+"${cpu_args[@]}"}
+        ${cpu_args[@]:+"${cpu_args[@]}"} \
+        --cluster-secret-file "$CLUSTER_SECRET_FILE"
     # "ready" comes after every shard scanned its extents and bound; a UCX bind
     # retries a busy device (a restart inside TIME_WAIT) for up to 90 s. A dead
     # EN fails the wait at once, so the long budget only covers a slow start.
@@ -485,7 +496,7 @@ format_extent_node() {
     # --advertise self-registers the live address + shard ports at every
     # EN startup (M1a/M1b), so format never needs to know them.
     # shellcheck disable=SC2086  # intentional word splitting for positional args
-    "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" format \
+    "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" format \
         $(echo "$disk_arg" | tr ',' ' ')
 }
 
@@ -634,7 +645,8 @@ launch_ps() {
         --advertise "${BIND_HOST}:${PS_BASE_PORT}" \
         --transport "$TRANSPORT" \
         ${cpu_args[@]:+"${cpu_args[@]}"} \
-        ${tunable_args[@]:+"${tunable_args[@]}"}
+        ${tunable_args[@]:+"${tunable_args[@]}"} \
+        --cluster-secret-file "$CLUSTER_SECRET_FILE"
     echo "[cluster] PS launched (per-partition listeners bind on partition open; $affinity_msg)"
 }
 
@@ -675,7 +687,7 @@ launch_manager() {
     fi
     # The web dashboard is a separate app now (crates/server/src/bin/autumn_dashboard → the
     # autumn-dashboard binary); cluster.sh does not start it. Run it by hand
-    # against this cluster's manager + admin token when you want the UI.
+    # against this cluster's manager + cluster secret when you want the UI.
     # unlike the deploy layer (entrypoint / autumn-deploy
     # default `balanced`), cluster.sh leaves the controller OFF by default so
     # chaos / perf / dev are unaffected. Set AUTUMN_AUTO_POLICY_DEFAULT=<preset> to
@@ -696,26 +708,14 @@ launch_manager() {
     if [[ "${AUTUMN_AUTH:-}" != "0" && -s "$DATA_ROOT/authz/signing.key" ]]; then
         AUTUMN_AUTH=1
     fi
-    # Turnkey authz: AUTUMN_AUTH=1 auto-provisions a signing key + admin token,
-    # feeding the AUTUMN_AUTH_* block below (the gallery credential is minted
+    # Turnkey authz: AUTUMN_AUTH=1 auto-provisions a signing key, feeding the
+    # AUTUMN_AUTH_* block below (the gallery credential is minted
     # post-bootstrap). Files live under
     # $DATA_ROOT/authz/ and survive restart; `reset` wipes + regenerates them.
-    # The ADMIN TOKEN is independent of data-plane authz and is now provisioned
-    # UNCONDITIONALLY. They gate different planes — the admin token gates
-    # control-plane admin RPCs (namespace-create, principal-create, …), the
-    # signing key gates data-plane authz — but the token used to live inside the
-    # signing-key branch, so a cluster without authz had NO admin token, and
-    # `namespace-create` answered "admin RPCs disabled". That made it impossible
-    # to register a namespace on a default cluster, which is exactly what the
-    # benches need (BUG-BENCH-NS-UNREGISTERED). Configuring the token is safe:
-    # it only ever ENABLES admin RPCs that were refused outright before.
+    # The cluster secret is not part of data-plane authz: every cluster has one.
+    ensure_cluster_secret
     local _az="$DATA_ROOT/authz"
     mkdir -p "$_az"
-    if [[ -z "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]]; then
-        [[ -s "$_az/admin.token" ]] \
-            || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$_az/admin.token"
-        AUTUMN_ADMIN_TOKEN_FILE="$_az/admin.token"
-    fi
     if [[ "${AUTUMN_AUTH:-0}" == "1" ]]; then
         if [[ -z "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
             [[ -s "$_az/signing.key" ]] \
@@ -726,25 +726,16 @@ launch_manager() {
         # authz protects EVERYTHING when a signing key is configured
         # no per-prefix list needed.
     fi
-    # Pass the admin token whether or not a signing key exists (the signing-key
-    # block below adds the authz flags on top when authz is on).
-    if [[ -n "${AUTUMN_ADMIN_TOKEN_FILE:-}" && -r "${AUTUMN_ADMIN_TOKEN_FILE}" ]]; then
-        mgr_extra="$mgr_extra --admin-token-file $AUTUMN_ADMIN_TOKEN_FILE"
-    fi
     # data-plane authz (docs/data_plane_authz_design.md). OPT-IN —
     # with no env set, no flags are passed and authz stays OFF (zero impact on
     # every existing flow: perf_check, chaos, fuse, kvcache). To enable:
     #   AUTUMN_AUTH_SIGNING_KEY_FILE=/path/key   (generate: autumn-op gen-signing-key)
-    #   AUTUMN_ADMIN_TOKEN_FILE=/path/token      (gates tenant-create/delete; file,
-    #                                             not argv — /proc leak)
     #   AUTUMN_AUTH_PROTECTED_PREFIXES=mem/      (comma-separated; default mem/)
     #   AUTUMN_AUTH_TOKEN_TTL_SECS=3600          (optional)
     if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
         [[ -r "$AUTUMN_AUTH_SIGNING_KEY_FILE" ]] \
             || die "AUTUMN_AUTH_SIGNING_KEY_FILE '$AUTUMN_AUTH_SIGNING_KEY_FILE' is not readable"
         mgr_extra="$mgr_extra --auth-signing-key-file $AUTUMN_AUTH_SIGNING_KEY_FILE"
-        # (--admin-token-file is added unconditionally above — it gates the
-        # control plane and is not part of data-plane authz.)
         if [[ -n "${AUTUMN_AUTH_PROTECTED_PREFIXES:-}" ]]; then
             local _pfx
             for _pfx in ${AUTUMN_AUTH_PROTECTED_PREFIXES//,/ }; do
@@ -757,15 +748,13 @@ launch_manager() {
             mgr_extra="$mgr_extra --auth-token-ttl-secs $AUTUMN_AUTH_TOKEN_TTL_SECS"
         fi
     elif [[ -n "${AUTUMN_AUTH_PROTECTED_PREFIXES:-}" ]]; then
-        # NOTE: AUTUMN_ADMIN_TOKEN_FILE deliberately NOT in this guard any more.
-        # The admin token gates CONTROL-plane admin RPCs and is now provisioned on
-        # every cluster; only the protected-prefix list is meaningless without a
-        # signing key (it configures DATA-plane authz).
+        # The protected-prefix list configures DATA-plane authz, which needs a
+        # signing key.
         die "AUTUMN_AUTH_PROTECTED_PREFIXES set without AUTUMN_AUTH_SIGNING_KEY_FILE — data-plane authz needs a signing key (autumn-op gen-signing-key)"
     fi
     start_proc manager \
         "$MANAGER" --port 9001 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
-        --transport "$TRANSPORT" $mgr_extra
+        --transport "$TRANSPORT" $mgr_extra --cluster-secret-file "$CLUSTER_SECRET_FILE"
     wait_port 9001 manager
     # Wait for LEADERSHIP, not just the listener: a restart leaves the
     # previous leader's 10 s etcd lease behind, so the fresh manager can
@@ -776,7 +765,7 @@ launch_manager() {
     echo -n "[cluster] waiting for manager leadership..."
     local _t
     for _t in $(seq 1 60); do
-        if "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" info >/dev/null 2>&1; then
+        if "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" info >/dev/null 2>&1; then
             echo " ok"
             return 0
         fi
@@ -1078,7 +1067,7 @@ do_start() {
         for _i in $(seq 1 24); do
             sleep 5
             local _n
-            _n=$("$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" list-nodes 2>/dev/null | grep -c Online || true)
+            _n=$("$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" list-nodes 2>/dev/null | grep -c Online || true)
             if [[ "${_n:-0}" -ge "${replicas}" ]]; then
                 echo "[cluster] ${_n} node(s) Online after ${_i}×5s"
                 break
@@ -1089,12 +1078,7 @@ do_start() {
         # keyspace, which misses every `{ns}/`-prefixed key). AUTUMN_BOOTSTRAP_PRESPLIT
         # is now interpreted as "presplit the BENCH namespace into N partitions",
         # applied after bootstrap + namespace registration below.
-        # the manager now always has an admin token (provisioned
-        # above), and bootstrap sends CREATE_STREAM / UPSERT_PARTITION, which the
-        # manager gates. Pass the token so bring-up is authorized.
-        local _boot_admin=()
-        [[ -r "${AUTUMN_ADMIN_TOKEN_FILE:-}" ]] && _boot_admin=( --admin-token-file "$AUTUMN_ADMIN_TOKEN_FILE" )
-        "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" "${_boot_admin[@]}" bootstrap "${bootstrap_args[@]}"
+        "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
         wait_ps_ready 120
     fi
@@ -1109,29 +1093,26 @@ do_start() {
     # rejects any write whose first key segment is unregistered. perf-check and
     # ycsb bind the scope `bench/perf`, so without this every bench write dies
     # with NamespaceUnknown. Idempotent (already-exists is a no-op).
-    if [[ -r "$DATA_ROOT/authz/admin.token" ]]; then
-        local _btok; _btok="$(cat "$DATA_ROOT/authz/admin.token")"
-        "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
-            namespace-create --name bench --admin-token "$_btok" >/dev/null 2>&1 || true
+    {
+        "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
+            namespace-create --name bench >/dev/null 2>&1 || true
         # Presplit the bench namespace RELATIVE to `bench/perf/` so the cut points
         # are where the bench keys actually are. The retired bootstrap presplit cut
         # raw hex points that `bench_user_starts` filtered out entirely, so every
         # `--partitions N` run silently measured one partition.
         local _bp="${AUTUMN_BOOTSTRAP_PRESPLIT:-}"; local _bparts="${_bp%%:*}"
         if [[ "$_bparts" =~ ^[0-9]+$ ]] && (( _bparts > 1 )); then
-            "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
+            "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
                 presplit --namespace bench --tenant perf --count "$_bparts" \
-                --admin-token "$_btok" \
                 || echo "[cluster] warning: bench presplit into $_bparts failed (bench will use 1 partition)"
             wait_ps_ready 120
         fi
-    fi
+    }
 
     if [[ "${AUTUMN_AUTH:-0}" == "1" ]]; then
         local _az="$DATA_ROOT/authz"
-        local _atok; _atok="$(cat "$_az/admin.token")"
-        local _ao=( "$AO" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" )
-        "${_ao[@]}" namespace-create --name gallery --admin-token "$_atok" >/dev/null 2>&1 || true
+        local _ao=( "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" )
+        "${_ao[@]}" namespace-create --name gallery >/dev/null 2>&1 || true
         local _spec _p _grant _out
         # (§8.8): per-family principals (NS-FIRST keys, no
         # tenant segment). Each app uses its own credential = least privilege by
@@ -1144,12 +1125,12 @@ do_start() {
                      "gallery gallery/ $_az/gallery.cred"; do
             read -r _p _grant _out <<< "$_spec"
             [[ -s "$_out" ]] && continue
-            "${_ao[@]}" --json principal-create --principal "$_p" --grant "$_grant" --admin-token "$_atok" \
+            "${_ao[@]}" --json principal-create --principal "$_p" --grant "$_grant" \
                 | python3 -c 'import sys,json;d=json.load(sys.stdin);print("principal: "+d["principal"]);print("credential: "+d["credential"])' > "$_out" \
                 || die "principal-create $_p failed"
             [[ -s "$_out" ]] || die "principal-create $_p produced no credential"
         done
-        echo "[cluster] authz ON: signing key + admin token + per-family creds in $_az/"
+        echo "[cluster] authz ON: signing key + per-family creds in $_az/"
         echo "[cluster]   fuse/autumnfs: --credential-file $_az/fs.cred"
         echo "[cluster]   gallery: AUTUMN_CREDENTIAL_FILE=$_az/gallery.cred"
     fi
@@ -1165,7 +1146,7 @@ do_start() {
     echo "[cluster]   logs     : $LOG_DIR"
     echo ""
     echo "  AC=(\"$AC\" --manager \"$MANAGER_ADDR\")     # data plane (put/get/ls/bench)"
-    echo "  AO=(\"$AO\" --manager \"$MANAGER_ADDR\")     # op plane (info/split/merge/...)"
+    echo "  AO=(\"$AO\" --cluster-secret-file \"$CLUSTER_SECRET_FILE\" --manager \"$MANAGER_ADDR\")  # op plane"
     echo "  \"\${AO[@]}\" info"
     echo "  echo hello | \"\${AC[@]}\" put mykey /dev/stdin"
     echo "  \"\${AC[@]}\" get mykey"

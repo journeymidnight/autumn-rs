@@ -9,11 +9,11 @@
 //! Usage:
 //!   autumn-dashboard --manager H:P [--transport tcp|ucx] [--port 8799]
 //!                    [--listen 0.0.0.0] [--autumn-op autumn-op]
-//!                    (--admin-token TOK | --admin-token-file FILE)
+//!                    --cluster-secret-file FILE
 //!
-//! The admin token is REQUIRED for upstream manager mutations and forwarded to
-//! every `autumn-op` call; read-only ops ignore it, mutations (the Apply buttons
-//! and auto-policy) use it.
+//! The cluster secret file is REQUIRED and its path is forwarded to every
+//! `autumn-op` call: autumn-op connects as an operator, which the manager
+//! refuses without the secret, read-only calls included.
 
 use std::io::Read;
 use std::rc::Rc;
@@ -31,7 +31,7 @@ use serde::Deserialize;
 const INDEX_HTML: &str = include_str!("static/index.html");
 const USAGE: &str = "usage: autumn-dashboard --manager H:P [--transport tcp|ucx] \
 [--port 8799] [--listen 0.0.0.0] [--autumn-op autumn-op] \
-(--admin-token TOK | --admin-token-file FILE)";
+--cluster-secret-file FILE";
 
 /// Hard deadline on each `autumn-op` subprocess. Without it a manager that
 /// ACCEPTS the connection but never answers hangs the HTTP handler forever
@@ -46,18 +46,18 @@ struct Config {
     manager: String,
     transport: String,
     autumn_op: String,
-    admin_token: String,
+    cluster_secret_file: String,
 }
 
 impl Config {
-    /// Run `autumn-op --manager .. --transport .. --admin-token .. --json <args>`
+    /// Run `autumn-op --manager .. --transport .. --cluster-secret-file .. --json <args>`
     /// off the async runtime; returns (combined output, success).
     async fn run_op(&self, args: Vec<String>) -> (String, bool) {
-        let (manager, transport, bin, token) = (
+        let (manager, transport, bin, secret_file) = (
             self.manager.clone(),
             self.transport.clone(),
             self.autumn_op.clone(),
-            self.admin_token.clone(),
+            self.cluster_secret_file.clone(),
         );
         compio::runtime::spawn_blocking(move || {
             let mut cmd = std::process::Command::new(&bin);
@@ -65,8 +65,8 @@ impl Config {
                 .arg(&manager)
                 .arg("--transport")
                 .arg(&transport)
-                .arg("--admin-token")
-                .arg(&token)
+                .arg("--cluster-secret-file")
+                .arg(&secret_file)
                 .arg("--json")
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
@@ -594,7 +594,7 @@ fn parse_args() -> Result<(Config, String, u16)> {
     let mut listen = "0.0.0.0".to_string();
     let mut port: u16 = 8799;
     let mut autumn_op = "autumn-op".to_string();
-    let mut admin_token: Option<String> = None;
+    let mut cluster_secret_file: Option<String> = None;
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < raw.len() {
@@ -619,13 +619,9 @@ fn parse_args() -> Result<(Config, String, u16)> {
                 i += 1;
                 autumn_op = req(&raw, i)?;
             }
-            "--admin-token" => {
+            "--cluster-secret-file" => {
                 i += 1;
-                admin_token = Some(req(&raw, i)?);
-            }
-            "--admin-token-file" => {
-                i += 1;
-                admin_token = Some(std::fs::read_to_string(req(&raw, i)?)?.trim().to_string());
+                cluster_secret_file = Some(req(&raw, i)?);
             }
             "-h" | "--help" => {
                 println!("{USAGE}");
@@ -635,18 +631,18 @@ fn parse_args() -> Result<(Config, String, u16)> {
         }
         i += 1;
     }
-    let admin_token = match admin_token {
-        Some(t) if !t.is_empty() => t,
-        _ => {
-            bail!("--admin-token or --admin-token-file is REQUIRED for manager mutations\n{USAGE}")
-        }
+    let Some(cluster_secret_file) = cluster_secret_file else {
+        bail!("--cluster-secret-file is REQUIRED\n{USAGE}")
     };
+    // Fail at startup, not on the first click: autumn-op reads it per call.
+    std::fs::metadata(&cluster_secret_file)
+        .map_err(|e| anyhow!("--cluster-secret-file {cluster_secret_file}: {e}"))?;
     Ok((
         Config {
             manager,
             transport,
             autumn_op,
-            admin_token,
+            cluster_secret_file,
         },
         listen,
         port,

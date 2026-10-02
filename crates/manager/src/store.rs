@@ -181,8 +181,5 @@ mod tests {
         assert!(!is_owner_epoch_fence_message(
             "precondition failed: stream cannot be empty after punch holes"
         ));
-        assert!(!is_owner_epoch_fence_message(
-            "precondition failed: admin token invalid"
-        ));
     }
 }

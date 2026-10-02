@@ -28,6 +28,21 @@ const EXTENT_NODE_BIN: &str = env!("CARGO_BIN_EXE_autumn-extent-node");
 const PARTITION_SERVER_BIN: &str = env!("CARGO_BIN_EXE_autumn-ps");
 const AUTUMN_OP_BIN: &str = env!("CARGO_BIN_EXE_autumn-op");
 
+/// The cluster secret file every server binary this test spawns requires, and
+/// autumn-op proves (it connects as an operator).
+fn cluster_secret_file() -> &'static std::path::Path {
+    static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "cluster-secret-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "autumn-server-tests-cluster-secret-0123456789")
+            .expect("write test cluster secret");
+        path
+    })
+}
+
 fn pick_port() -> u16 {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
     l.local_addr().expect("local_addr").port()
@@ -135,6 +150,7 @@ fn affinity_of(pid: u32, name: &str) -> Vec<usize> {
 fn format_dir(mgr_addr: &str, dir: &std::path::Path) {
     std::fs::create_dir_all(dir).unwrap();
     let mut cmd = Command::new(AUTUMN_OP_BIN);
+    cmd.arg("--cluster-secret-file").arg(cluster_secret_file());
     cmd.args(["--manager", mgr_addr, "format", dir.to_str().unwrap()]);
     run_or_panic("autumn-op format", cmd);
 }
@@ -147,6 +163,8 @@ fn spawn_under_taskset(launcher: usize, bin: &str, args: &[&str]) -> ChildGuard 
             .arg("-c")
             .arg(launcher.to_string())
             .arg(bin)
+            .arg("--cluster-secret-file")
+            .arg(cluster_secret_file())
             .args(args)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -183,6 +201,8 @@ fn cpuset_moves_threads_off_a_narrower_launcher_mask() {
     let mgr_addr = format!("127.0.0.1:{mgr_port}");
     let _manager = ChildGuard(
         Command::new(MANAGER_BIN)
+            .arg("--cluster-secret-file")
+            .arg(cluster_secret_file())
             .args(["--port", &mgr_port.to_string(), "--listen", "127.0.0.1"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -271,6 +291,7 @@ fn cpuset_moves_threads_off_a_narrower_launcher_mask() {
     );
     std::thread::sleep(Duration::from_secs(2));
     let mut cmd = Command::new(AUTUMN_OP_BIN);
+    cmd.arg("--cluster-secret-file").arg(cluster_secret_file());
     cmd.args(["--manager", &mgr_addr, "bootstrap", "--replication", "1+0"]);
     let out = run_or_panic("autumn-op bootstrap", cmd);
     let part_id: u64 = out

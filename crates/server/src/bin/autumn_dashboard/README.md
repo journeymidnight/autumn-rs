@@ -19,18 +19,18 @@ cargo build -p autumn-server --bin autumn-dashboard --bin autumn-op
 # autumn-op must be on PATH (or pass --autumn-op /path/to/autumn-op)
 autumn-dashboard \
   --manager 127.0.0.1:9001 \
-  --admin-token-file /etc/autumn/admin.token \
+  --cluster-secret-file /etc/autumn/cluster.secret \
   --port 8799            # then open http://<host>:8799
 ```
 
-The **admin token is required for manager mutations** and is forwarded
-to every `autumn-op` call — read-only views ignore it, mutations (the per-target
-Apply buttons and auto-policy activate/deactivate) use it.
+The **cluster secret file is required**; its path is forwarded to every
+`autumn-op` call. autumn-op connects as an operator, which the manager refuses
+without the secret — read-only views included.
 
 | Flag | Default | |
 |------|---------|--|
 | `--manager H:P` | `127.0.0.1:9001` | manager address |
-| `--admin-token TOK` / `--admin-token-file FILE` | — (**required**) | admin secret |
+| `--cluster-secret-file FILE` | — (**required**) | the cluster secret (`docs/cluster_secret_design.md`) |
 | `--port N` | `8799` | listen port |
 | `--listen H` | `0.0.0.0` | bind host |
 | `--transport tcp\|ucx` | `tcp` | must match the manager |
@@ -128,8 +128,8 @@ would be refused once per window forever.
 ## Security posture
 
 The dashboard HTTP port has **no per-request authentication or TLS**. Anyone
-who can reach it can read cluster state and submit mutations using the server
-admin token. The VKE overlay includes an APIG Ingress for all paths; ClusterIP
+who can reach it can read cluster state and submit mutations with the cluster
+secret the dashboard holds. The VKE overlay includes an APIG Ingress for all paths; ClusterIP
 does not make that route private. Use network access controls or a loopback
 bind and tunnel. HTTP authentication remains outside this migration, following
 the existing access contract. See [the review](../../../../../docs/dashboard_review.md)

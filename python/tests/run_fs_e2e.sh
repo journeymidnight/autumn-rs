@@ -23,6 +23,9 @@ for b in autumn-manager-server autumn-op autumn-extent-node autumn-ps; do
   [ -x "$BIN/$b" ] || { echo "FAIL: missing $BIN/$b — run: cargo build --workspace"; exit 2; }
 done
 rm -rf "$WORK"; mkdir -p "$WORK/en0" "$WORK/ps1"
+# Every server and autumn-op proves the same cluster secret.
+SECRET="$WORK/cluster.secret"
+( umask 077; "$BIN/autumn-op" gen-cluster-secret >"$SECRET" ) || { echo "FAIL gen-cluster-secret"; exit 1; }
 PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done; }
 trap cleanup EXIT
@@ -36,14 +39,14 @@ source "$VENV/bin/activate"
 ( cd python && maturin develop 2>&1 | tail -2 ) || { echo "FAIL maturin"; exit 1; }
 
 echo "[fs-e2e] cluster bring-up"
-"$BIN/autumn-manager-server" --port 19401 --listen 127.0.0.1 >"$WORK/mgr.log" 2>&1 & PIDS+=($!)
+"$BIN/autumn-manager-server" --cluster-secret-file "$SECRET" --port 19401 --listen 127.0.0.1 >"$WORK/mgr.log" 2>&1 & PIDS+=($!)
 wait_port 19401 20 || { echo FAIL mgr; tail -6 "$WORK/mgr.log"; exit 1; }
-"$BIN/autumn-op" --manager "$MGR" format "$WORK/en0" >"$WORK/fmt.log" 2>&1 || { echo FAIL fmt; cat "$WORK/fmt.log"; exit 1; }
-"$BIN/autumn-extent-node" --data "$WORK/en0" --port 19411 --manager "$MGR" --cpuset 0 --advertise 127.0.0.1:19411 --listen 127.0.0.1 >"$WORK/en0.log" 2>&1 & PIDS+=($!)
+"$BIN/autumn-op" --cluster-secret-file "$SECRET" --manager "$MGR" format "$WORK/en0" >"$WORK/fmt.log" 2>&1 || { echo FAIL fmt; cat "$WORK/fmt.log"; exit 1; }
+"$BIN/autumn-extent-node" --cluster-secret-file "$SECRET" --data "$WORK/en0" --port 19411 --manager "$MGR" --cpuset 0 --advertise 127.0.0.1:19411 --listen 127.0.0.1 >"$WORK/en0.log" 2>&1 & PIDS+=($!)
 wait_port 19411 20 || { echo FAIL en; tail -6 "$WORK/en0.log"; exit 1; }
 sleep 3
-"$BIN/autumn-op" --manager "$MGR" bootstrap --replication 1+0 >"$WORK/bs.log" 2>&1 || { echo FAIL bootstrap; cat "$WORK/bs.log"; exit 1; }
-"$BIN/autumn-ps" --psid 1 --port 19421 --manager "$MGR" --data "$WORK/ps1" --listen 127.0.0.1 --advertise 127.0.0.1:19421 >"$WORK/ps1.log" 2>&1 & PIDS+=($!)
+"$BIN/autumn-op" --cluster-secret-file "$SECRET" --manager "$MGR" bootstrap --replication 1+0 >"$WORK/bs.log" 2>&1 || { echo FAIL bootstrap; cat "$WORK/bs.log"; exit 1; }
+"$BIN/autumn-ps" --cluster-secret-file "$SECRET" --psid 1 --port 19421 --manager "$MGR" --data "$WORK/ps1" --listen 127.0.0.1 --advertise 127.0.0.1:19421 >"$WORK/ps1.log" 2>&1 & PIDS+=($!)
 wait_port 19421 20 || { echo FAIL ps; tail -6 "$WORK/ps1.log"; exit 1; }
 sleep 4
 

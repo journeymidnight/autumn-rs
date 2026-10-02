@@ -90,6 +90,8 @@ spec:
             exec:
               command:
                 - autumn-op
+                - --cluster-secret-file
+                - /etc/autumn/cluster/cluster.secret
                 - --manager
                 - 127.0.0.1:9001
                 - --transport
@@ -105,13 +107,22 @@ spec:
           resources:
             requests: { cpu: "500m", memory: "512Mi" }
           volumeMounts:
-            # F-AUTHZ-BUILTIN: signing key + admin token. The Secret is
+            # The cluster secret (required): the manager refuses to start
+            # without it, and the readiness probe's autumn-op proves it.
+            - name: cluster-secret
+              mountPath: /etc/autumn/cluster
+              readOnly: true
+            # F-AUTHZ-BUILTIN: signing key. The Secret is
             # `optional` so a deploy WITHOUT it (authz disabled) still schedules
             # — the entrypoint's `-s` gate then runs the manager authz-OFF.
             - name: authz
               mountPath: /etc/autumn/authz
               readOnly: true
       volumes:
+        - name: cluster-secret
+          secret:
+            secretName: autumn-cluster-secret
+            defaultMode: 0400
         - name: authz
           secret:
             secretName: autumn-authz

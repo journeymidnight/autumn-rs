@@ -1,6 +1,7 @@
 //! Frozen connection bootstrap, independent of rkyv and business FrameDecoder.
 //! Changing these bytes requires a separate bootstrap migration. All integers
-//! are little-endian. Authentication follows this handshake and is unchanged.
+//! are little-endian. PEER_AUTH (`peer_auth.rs`) follows it on Peer/Admin
+//! connections; a client's AUTH_HELLO follows it as a business message.
 use crate::{RpcError, StatusCode};
 use bytes::Bytes;
 use compio::io::{AsyncReadExt, AsyncWriteExt};
@@ -166,9 +167,12 @@ impl Negotiated {
                 c::is_client_surface_mgr_msg(opcode) || matches!(opcode, m::MSG_GET_CLUSTER_ID | m::MSG_GET_REGIONS)
             }
             (Service::PartitionServer, Role::Client) => c::is_client_surface_ps_msg(opcode),
-            (Service::ExtentNode, Role::Client) => {
-                matches!(opcode, e::MSG_READ_BYTES | e::MSG_READ_BYTES_BULK)
-            }
+            // Direct reads, plus the AUTH_HELLO that binds a principal to them
+            // when the cluster runs authz.
+            (Service::ExtentNode, Role::Client) => matches!(
+                opcode,
+                e::MSG_READ_BYTES | e::MSG_READ_BYTES_BULK | crate::partition_rpc::MSG_AUTH_HELLO
+            ),
             (Service::Manager, Role::Peer) => {
                 known_manager_opcode(opcode) && !m::is_admin_mgr_msg(opcode)
             }
@@ -197,9 +201,14 @@ fn malformed(message: &str) -> RpcError {
     )
 }
 fn encode_packet(ctrl: &[u8], response: bool) -> Bytes {
+    encode_bootstrap(MSG_VERSION_HELLO, ctrl, response)
+}
+/// The frozen bootstrap framing, shared with `peer_auth`, which runs on the raw
+/// stream right after this handshake.
+pub(crate) fn encode_bootstrap(opcode: u8, ctrl: &[u8], response: bool) -> Bytes {
     let mut b = Vec::with_capacity(HEADER_LEN + OVERHEAD + ctrl.len());
     b.extend_from_slice(&REQUEST_ID.to_le_bytes());
-    b.push(MSG_VERSION_HELLO);
+    b.push(opcode);
     b.push(u8::from(response));
     b.extend_from_slice(&((ctrl.len() + OVERHEAD) as u32).to_le_bytes());
     b.extend_from_slice(&(ctrl.len() as u32).to_le_bytes());
@@ -212,18 +221,29 @@ async fn read_packet(
     response: bool,
     max_ctrl: usize,
 ) -> Result<Vec<u8>, RpcError> {
+    read_bootstrap(reader, "VERSION_HELLO", MSG_VERSION_HELLO, response, max_ctrl).await
+}
+/// `name` only labels the error.
+pub(crate) async fn read_bootstrap(
+    reader: &mut autumn_transport::ReadHalf,
+    name: &str,
+    opcode: u8,
+    response: bool,
+    max_ctrl: usize,
+) -> Result<Vec<u8>, RpcError> {
+    let malformed = |message: &str| {
+        RpcError::status(StatusCode::InvalidArgument, format!("{name}: {message}"))
+    };
     let BufResult(result, header) = reader.read_exact(vec![0; HEADER_LEN]).await;
     result?;
     let length = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
     if u32::from_le_bytes(header[..4].try_into().unwrap()) != REQUEST_ID
-        || header[4] != MSG_VERSION_HELLO
+        || header[4] != opcode
         || header[5] != u8::from(response)
         || length < OVERHEAD
         || length > max_ctrl + OVERHEAD
     {
-        return Err(malformed(
-            "expected bounded bootstrap frame as the first message",
-        ));
+        return Err(malformed("expected a bounded bootstrap frame"));
     }
     let BufResult(result, rest) = reader.read_exact(vec![0; length]).await;
     result?;
@@ -642,10 +662,40 @@ mod tests {
         assert!(n
             .check_opcode(crate::manager_rpc::MSG_CREATE_STREAM)
             .is_err());
+        // Account and namespace mutations are operator-only.
+        for op in [
+            crate::manager_rpc::MSG_TENANT_CREATE,
+            crate::manager_rpc::MSG_NAMESPACE_CREATE,
+            crate::manager_rpc::MSG_NAMESPACE_SET_PRESPLIT,
+        ] {
+            assert!(n.check_opcode(op).is_err(), "Peer sent {op:#x}");
+        }
         n.role = Role::Admin;
         assert!(n
             .check_opcode(crate::manager_rpc::MSG_CREATE_STREAM)
             .is_ok());
+        assert!(n
+            .check_opcode(crate::manager_rpc::MSG_TENANT_CREATE)
+            .is_ok());
+
+        // A Client on an EN: direct reads and the AUTH_HELLO that binds them.
+        let mut en = Negotiated {
+            role: Role::Client,
+            service: Service::ExtentNode,
+            ..n.clone()
+        };
+        for op in [
+            crate::extent_rpc::MSG_READ_BYTES,
+            crate::extent_rpc::MSG_READ_BYTES_BULK,
+            crate::partition_rpc::MSG_AUTH_HELLO,
+        ] {
+            assert!(en.check_opcode(op).is_ok(), "Client refused {op:#x}");
+        }
+        assert!(en.check_opcode(crate::extent_rpc::MSG_APPEND).is_err());
+        assert!(en.check_opcode(crate::extent_rpc::MSG_DELETE_EXTENT).is_err());
+        // AUTH_HELLO is a client message; the EN has no handler for it from a member.
+        en.role = Role::Peer;
+        assert!(en.check_opcode(crate::partition_rpc::MSG_AUTH_HELLO).is_err());
         for role in [Role::Client, Role::Peer, Role::Admin] {
             n.role = role;
             assert!(n.check_opcode(MSG_VERSION_HELLO).is_err());

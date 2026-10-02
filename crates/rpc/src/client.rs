@@ -404,6 +404,13 @@ impl RpcClient {
             expected,
         )
         .await?;
+        crate::peer_auth::initiate(
+            &mut reader,
+            &mut writer,
+            &protocol,
+            crate::peer_auth::installed(),
+        )
+        .await?;
         let pending: Rc<RefCell<HashMap<u32, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
 
         let (submit_tx, submit_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);

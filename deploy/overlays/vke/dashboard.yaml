@@ -3,11 +3,11 @@
 # The manager NO LONGER serves the dashboard. This small Deployment runs the
 # `autumn-dashboard` binary (same image), which holds no cluster state and drives
 # the cluster ONLY through `autumn-op` — the wire schema stays in one place. It
-# talks to the leader-gated manager Service (`autumn-manager`). Upstream
-# mutations use the admin token from the `autumn-authz` Secret.
+# talks to the leader-gated manager Service (`autumn-manager`). Every autumn-op
+# call proves the cluster secret from the `autumn-cluster-secret` Secret.
 #
 # The Service is ClusterIP, but the APIG Ingress below also exposes all paths.
-# The admin token authorizes upstream mutations; there is no HTTP caller auth.
+# The cluster secret authorizes upstream mutations; there is no HTTP caller auth.
 # Pair exposure with network access controls.
 apiVersion: apps/v1
 kind: Deployment
@@ -48,22 +48,23 @@ spec:
           args:
             - exec autumn-dashboard
               --manager "$(getent hosts autumn-manager | awk '{print $1}'):9001"
-              --admin-token-file /etc/autumn/authz/admin.token
+              --cluster-secret-file /etc/autumn/cluster/cluster.secret
               --listen 0.0.0.0 --port 8799
           ports:
             - { name: dashboard, containerPort: 8799 }
           resources:
             requests: { cpu: "50m", memory: "64Mi" }
           volumeMounts:
-            - name: authz
-              mountPath: /etc/autumn/authz
+            - name: cluster-secret
+              mountPath: /etc/autumn/cluster
               readOnly: true
       volumes:
-        # REQUIRED: no upstream admin token means no dashboard.
-        # deploy.sh provisions autumn-authz once before apply.
-        - name: authz
+        # REQUIRED: autumn-dashboard refuses to start without the cluster secret.
+        # deploy.sh provisions autumn-cluster-secret once before apply.
+        - name: cluster-secret
           secret:
-            secretName: autumn-authz
+            secretName: autumn-cluster-secret
+            defaultMode: 0400
 ---
 apiVersion: v1
 kind: Service
@@ -92,7 +93,7 @@ spec:
 #
 # What that means, stated plainly so nobody has to rediscover it: this is a
 # browsable public HTTPS URL with NO authentication, and `autumn-dashboard`
-# runs with `--admin-token-file` and shells out to `autumn-op`. Anyone with the
+# runs with `--cluster-secret-file` and shells out to `autumn-op`. Anyone with the
 # URL can split and merge partitions and flip the auto-policy switches, and can
 # read the cluster's topology. The dashboard has no auth of its own — unlike
 # `hermes-webui`, which does its own basic auth from a Secret. Adding the same

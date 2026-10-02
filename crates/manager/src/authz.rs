@@ -147,13 +147,6 @@ pub fn ct_eq_32(a: &[u8; 32], b: &[u8; 32]) -> bool {
     diff == 0
 }
 
-/// Constant-time equality of two secrets given as strings (e.g. admin tokens).
-/// Both are SHA-256'd first, so the compare is fixed-width and independent of
-/// the (public-ish) length — avoids leaking length via an early return.
-pub fn ct_eq_secret(a: &str, b: &str) -> bool {
-    ct_eq_32(&credential_hash(a.as_bytes()), &credential_hash(b.as_bytes()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,8 +209,5 @@ mod tests {
         let h3 = credential_hash(b"other");
         assert!(ct_eq_32(&h1, &h2));
         assert!(!ct_eq_32(&h1, &h3));
-        assert!(ct_eq_secret("admintok", "admintok"));
-        assert!(!ct_eq_secret("admintok", "admintol"));
-        assert!(!ct_eq_secret("admintok", "admintok2"));
     }
 }

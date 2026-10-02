@@ -18,13 +18,21 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use autumn_rpc::client::RpcClient;
 use bytes::Bytes;
 
 
 pub struct ConnPool {
     role: autumn_rpc::version_hello::Role,
+    /// Capability token presented (`AUTH_HELLO`) on every connection this pool
+    /// opens. The SDK's direct-read pool carries one when it holds a
+    /// credential: an EN of a cluster that runs authz refuses direct reads on a
+    /// connection without it. `None` = present nothing.
+    auth_token: RefCell<Option<Bytes>>,
+    /// Bumped with every `auth_token` change, so a connection whose AUTH_HELLO
+    /// raced one is used once and not pooled.
+    auth_gen: std::cell::Cell<u64>,
     clients: RefCell<HashMap<SocketAddr, Rc<RpcClient>>>,
 }
 
@@ -70,8 +78,39 @@ impl ConnPool {
     pub fn with_role(role: autumn_rpc::version_hello::Role) -> Self {
         Self {
             role,
+            auth_token: RefCell::new(None),
+            auth_gen: std::cell::Cell::new(0),
             clients: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Sets the token new connections present. A change drops every pooled
+    /// connection, since each was bound to the old token; in-flight calls
+    /// keep theirs until they finish.
+    pub fn set_auth_token(&self, token: Option<Bytes>) {
+        if *self.auth_token.borrow() == token {
+            return;
+        }
+        *self.auth_token.borrow_mut() = token;
+        self.auth_gen.set(self.auth_gen.get().wrapping_add(1));
+        self.clients.borrow_mut().clear();
+    }
+
+    async fn auth_hello(client: &RpcClient, token: Bytes) -> Result<()> {
+        use autumn_rpc::partition_rpc::{
+            rkyv_decode, rkyv_encode, AuthHelloReq, AuthHelloResp, MSG_AUTH_HELLO,
+        };
+        let req = rkyv_encode(&AuthHelloReq {
+            token: token.to_vec(),
+        });
+        let resp = client
+            .call_timeout(MSG_AUTH_HELLO, req, autumn_rpc::version_hello::TIMEOUT)
+            .await?;
+        let resp: AuthHelloResp = rkyv_decode(&resp).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != autumn_rpc::StatusCode::Ok as u8 {
+            return Err(anyhow!("refused: {}", resp.message));
+        }
+        Ok(())
     }
 
     /// Get or open an RpcClient for `addr`. Uses the existing pool entry
@@ -97,14 +136,28 @@ impl ConnPool {
         // can't hang `get_client` — and therefore any PS/EN background loop
         // that reaches it (region_sync `open_partition` → `commit_length`, EN
         // reconcile, recovery fanout) — indefinitely. The bound is the one
-        // `connect_as` already applies to connect + VERSION_HELLO
+        // `connect_as` already applies to connect + VERSION_HELLO + PEER_AUTH
         // (`version_hello::TIMEOUT`, 5 s). A second timer here with the same
         // length raced it and made the error's shape a coin toss, which is
         // what classifiers read. On failure the entry is not cached, so the
         // next call retries a fresh connect.
+        let gen = self.auth_gen.get();
+        let token = self.auth_token.borrow().clone();
         let client = RpcClient::connect_as(addr, self.role, None)
             .await
             .map_err(|e| anyhow::Error::new(e).context(format!("connect {addr}")))?;
+        if let Some(token) = token {
+            // Not a "connect" failure: the address is fine, the credential is not.
+            Self::auth_hello(&client, token)
+                .await
+                .with_context(|| format!("AUTH_HELLO to {addr}"))?;
+        }
+        // The token changed while this connection was being set up (including
+        // from none to one): serve this call, but do not pool a connection
+        // bound to the old one.
+        if self.auth_gen.get() != gen {
+            return Ok(client);
+        }
         self.clients.borrow_mut().insert(addr, client.clone());
         Ok(client)
     }

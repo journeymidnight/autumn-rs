@@ -117,14 +117,14 @@ manager 侧内存影子 `namespaces: HashMap<String, MgrNamespace>`，leader 上
 
 ### 2.2 生命周期
 
-全部 leader-only + admin-token gated（`admin_auth_design.md` §4.2），etcd-first，
+全部 leader-only，只在 Admin 连接上受理（`cluster_secret_design.md` §4），etcd-first，
 并由 `namespace_admin_lock` 串行化整个临界区（存在性 + 不相交校验 → etcd 写 →
 内存 apply），防两个并发 create 都通过校验后以冲突顺序提交。
 
 ```
-autumn-op namespace-create --name <NS> [--tenant <T>] [--presplit <hex,…>] --admin-token…
-autumn-op namespace-delete --name <NS> [--force] --admin-token…
-autumn-op namespace-list [--json]        # 只读，不需要 admin token
+autumn-op namespace-create --name <NS> [--tenant <T>] [--presplit <hex,…>]
+autumn-op namespace-delete --name <NS> [--force]
+autumn-op namespace-list [--json]        # 只读
 ```
 
 - **保留名**：`fs` / `kvc` / `mem` / `default` 一律拒绝创建
@@ -343,7 +343,7 @@ stripe），**parts = 真的建几个 partition**。切点是 `[0x03][k · lanes
 
 ### 6.3 sacred boundary：运维声明过的切点不可被合并掉
 
-`autumn-op presplit` 带 admin token 时会把实际切点通过
+`autumn-op presplit` 切完后把实际切点通过
 `MSG_NAMESPACE_SET_PRESPLIT` 记回 `MgrNamespace.presplit`。manager 据此提供三个
 **故意 generic** 的谓词（manager 永远不知道什么叫「lane」）：
 

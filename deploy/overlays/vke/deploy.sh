@@ -21,8 +21,28 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 : "${AUTUMN_IMAGE_TAG:=$(git -C "$here" rev-parse HEAD)}"
 image="${AUTUMN_IMAGE_REPO}:${AUTUMN_IMAGE_TAG}"
 
+# The cluster secret is REQUIRED: the manager, PS and EN refuse to start
+# without it, and it authorizes every autumn-op call (bootstrap, the manager's
+# readiness probe, admin ops, the dashboard). Provision the
+# `autumn-cluster-secret` Secret ONCE and never overwrite it here: every server
+# must hold the same value, so rotating it is a stop-the-world restart. Same
+# 64-hex format as `autumn-op gen-cluster-secret`, generated with shell so the
+# deploy host needs no autumn binary; written to a restricted temp file and
+# passed with --from-file so it never lands in kubectl's argv.
+kubectl create namespace autumn >/dev/null 2>&1 || true
+if kubectl -n autumn get secret autumn-cluster-secret >/dev/null 2>&1; then
+    echo ">>> Secret autumn-cluster-secret exists (reused — never rotated here)"
+else
+    echo ">>> generating cluster secret → Secret autumn-cluster-secret"
+    cs_tmp="$(umask 077 && mktemp -d)"
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$cs_tmp/cluster.secret"
+    kubectl -n autumn create secret generic autumn-cluster-secret \
+        --from-file=cluster.secret="$cs_tmp/cluster.secret"
+    rm -rf "$cs_tmp"
+fi
+
 # data-plane authz is ON by default. Provision the signing-key
-# + admin-token Secret ONCE (rotating it invalidates every minted credential, so
+# Secret ONCE (rotating it invalidates every minted credential, so
 # we never overwrite an existing one). The signing-key file format is
 # `<kid> <hex-32-byte-seed>` — same as `autumn-op gen-signing-key`, generated
 # here with shell so the deploy host needs no autumn binary.
@@ -37,16 +57,14 @@ if [[ "${AUTUMN_AUTH_DISABLE:-0}" != "1" ]]; then
     if kubectl -n autumn get secret autumn-authz >/dev/null 2>&1; then
         echo ">>> authz Secret autumn-authz exists (reused — never rotated here)"
     else
-        echo ">>> generating authz signing key + admin token → Secret autumn-authz"
-        # Restricted temp files + --from-file (NOT --from-literal) so the seed +
-        # admin token never land in kubectl's argv / /proc/<pid>/cmdline on a
-        # shared deploy host (coco P2 security).
+        echo ">>> generating authz signing key → Secret autumn-authz"
+        # Restricted temp files + --from-file (NOT --from-literal) so the seed
+        # never lands in kubectl's argv / /proc/<pid>/cmdline on a shared
+        # deploy host (coco P2 security).
         authz_tmp="$(umask 077 && mktemp -d)"
         printf '1 %s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$authz_tmp/signing.key"
-        head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$authz_tmp/admin.token"
         kubectl -n autumn create secret generic autumn-authz \
-            --from-file=signing.key="$authz_tmp/signing.key" \
-            --from-file=admin.token="$authz_tmp/admin.token"
+            --from-file=signing.key="$authz_tmp/signing.key"
         rm -rf "$authz_tmp"
     fi
 fi

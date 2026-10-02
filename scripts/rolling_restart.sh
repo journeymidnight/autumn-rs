@@ -63,7 +63,10 @@ EXTENT_BASE_PORT="${AUTUMN_EXTENT_BASE_PORT:-9100}"
 PS_BASE_PORT="${AUTUMN_PS_BASE_PORT:-9301}"
 
 AC=("$BIN/autumn-client" --manager "$MANAGER_ADDR" --transport "$TRANSPORT")
-AO=("$BIN/autumn-op"     --manager "$MANAGER_ADDR" --transport "$TRANSPORT")
+# cluster.sh's cluster secret: every autumn-op call proves it.
+CLUSTER_SECRET_FILE="${AUTUMN_CLUSTER_SECRET_FILE:-$DATA_ROOT/cluster.secret}"
+AO=("$BIN/autumn-op"     --manager "$MANAGER_ADDR" --transport "$TRANSPORT"
+    --cluster-secret-file "$CLUSTER_SECRET_FILE")
 
 [[ -x "${AC[0]}" && -x "${AO[0]}" ]] || die "binaries missing under $BIN — cargo build --release --workspace"
 

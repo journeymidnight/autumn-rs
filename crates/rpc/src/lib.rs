@@ -18,6 +18,7 @@ pub mod extent_rpc;
 pub mod frame;
 pub mod manager_rpc;
 pub mod partition_rpc;
+pub mod peer_auth;
 pub mod version_hello;
 
 /// Re-exported for SDK-level source-staging decisions (autumn-client
@@ -109,7 +110,7 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// Bump it on every wire change. There is no separate "oldest cluster peer"
 /// constant: peers compare for EQUALITY, so a floor pinned to this value would
 /// say nothing.
-pub const WIRE_VERSION: u32 = 51;
+pub const WIRE_VERSION: u32 = 52;
 
 /// The oldest CLIENT this binary serves — the floor of the client window
 /// `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`.
@@ -326,74 +327,39 @@ mod shard_for_extent_tests {
 }
 
 #[cfg(test)]
-mod admin_token_prefix_tests {
+mod admin_op_tests {
     use crate::manager_rpc::*;
 
     #[test]
-    fn prefix_then_strip_round_trips() {
-        let tok = b"deadbeef";
-        let payload = b"the original rkyv payload bytes";
-        let wire = prefix_admin_token(tok, payload);
-        let (got_tok, rest) = strip_admin_token(&wire).expect("well-formed");
-        assert_eq!(got_tok, tok);
-        assert_eq!(rest, payload);
-    }
-
-    #[test]
-    fn empty_token_and_empty_payload_are_valid() {
-        let wire = prefix_admin_token(b"", b"");
-        let (t, r) = strip_admin_token(&wire).unwrap();
-        assert!(t.is_empty() && r.is_empty());
-        // An empty payload with a real token.
-        let wire = prefix_admin_token(b"tok", b"");
-        let (t, r) = strip_admin_token(&wire).unwrap();
-        assert_eq!(t, b"tok");
-        assert!(r.is_empty());
-    }
-
-    #[test]
-    fn malformed_prefix_is_none_never_run_bare() {
-        // A bare (unprefixed) admin payload must NOT be mistaken for a valid
-        // strip — the manager treats None as a failed check, not "run it bare".
-        assert!(strip_admin_token(b"").is_none()); // no length header at all
-        assert!(strip_admin_token(b"\x02\x00").is_none()); // header truncated (<4 B)
-        // length says 100 but only 3 bytes follow → runs past the buffer.
-        let mut bad = 100u32.to_le_bytes().to_vec();
-        bad.extend_from_slice(b"abc");
-        assert!(strip_admin_token(&bad).is_none());
-    }
-
-    #[test]
-    fn the_admin_set_is_mutating_ops_only() {
-        // A representative mutating op is gated …
+    fn the_admin_set_is_operator_mutations_only() {
         assert!(is_admin_mgr_msg(MSG_FENCE_NODE));
         assert!(is_admin_mgr_msg(MSG_MERGE_PARTITIONS));
         assert!(is_admin_mgr_msg(MSG_CREATE_STREAM));
-        // M3: the raw merge txn is gated so it can't bypass the guard.
+        // The raw merge txn is listed so a Peer cannot bypass the guard.
         assert!(is_admin_mgr_msg(MSG_MULTI_MODIFY_MERGE));
-        // … but MULTI_MODIFY_SPLIT stays ungated — it IS PS-driven.
+        // Account and namespace mutations are operator-only too.
+        assert!(is_admin_mgr_msg(MSG_TENANT_CREATE));
+        assert!(is_admin_mgr_msg(MSG_TENANT_DELETE));
+        assert!(is_admin_mgr_msg(MSG_NAMESPACE_CREATE));
+        assert!(is_admin_mgr_msg(MSG_NAMESPACE_DELETE));
+        assert!(is_admin_mgr_msg(MSG_NAMESPACE_SET_PRESPLIT));
+        // MULTI_MODIFY_SPLIT is PS-driven.
         assert!(!is_admin_mgr_msg(MSG_MULTI_MODIFY_SPLIT));
-        // … while read-only observability and the struct-field authz ops are NOT
-        // (those carry their own admin_token field and stay fail-closed).
+        // Read-only inspection is not.
         assert!(!is_admin_mgr_msg(MSG_STATUS));
         assert!(!is_admin_mgr_msg(MSG_NODES_INFO));
-        assert!(!is_admin_mgr_msg(MSG_TENANT_CREATE));
-        assert!(!is_admin_mgr_msg(MSG_NAMESPACE_CREATE));
         assert!(!is_admin_mgr_msg(MSG_PRINCIPAL_LIST));
-        // REGISTER_NODE is explicitly NOT gated (deviates from the design list):
-        // the EXTENT NODE self-registers with it and has no admin token, so
-        // gating it would wedge bring-up.
+        assert!(!is_admin_mgr_msg(MSG_NAMESPACE_LIST));
+        // The EXTENT NODE self-registers over its Peer connection.
         assert!(!is_admin_mgr_msg(MSG_REGISTER_NODE));
+        // The PS and the EN poll this over theirs.
+        assert!(!is_admin_mgr_msg(MSG_GET_AUTHZ_CONFIG));
     }
 }
 
 #[cfg(test)]
 mod wire_version_tests {
     use super::*;
-
-
-
-
 
     #[test]
     fn a_cluster_peer_must_match_exactly() {
@@ -488,7 +454,7 @@ mod wire_version_tests {
         assert!(client_compat_check(3, 2).is_err());
     }
 
-    /// The window is OPEN: `[43, 51]`, opened by raising the CEILING and
+    /// The window is OPEN: `[43, 52]`, opened by raising the CEILING and
     /// widened by `MSG_GET_CLIENT_REGIONS`, `MSG_COMPARE_WRITE` and the new
     /// lease modes.
     ///
@@ -501,7 +467,7 @@ mod wire_version_tests {
     #[test]
     fn the_client_window_is_open_and_the_floor_is_where_it_belongs() {
         assert_eq!(MIN_CLIENT_WIRE_VERSION, 43, "read this test's comment");
-        assert_eq!(WIRE_VERSION, 51, "read this test's comment");
+        assert_eq!(WIRE_VERSION, 52, "read this test's comment");
     }
 
     /// The check that actually decides whether a stale SERVER joins is the one

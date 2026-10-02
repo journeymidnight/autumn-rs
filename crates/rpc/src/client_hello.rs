@@ -285,18 +285,12 @@ pub fn is_client_surface_ps_msg(msg_type: u8) -> bool {
 /// `MSG_GET_CLUSTER_ID` is EXEMPT: it is how a peer finds out what it is
 /// talking to, and gating the question on its own answer admits nobody.
 ///
-/// **The OPERATOR surface is deliberately uncovered.** `MSG_STATUS`, the
-/// stream/extent info calls, `namespace_*`, `tenant_*`, the op-ledger
-/// (`MSG_OP_SUBMIT` / `QUERY` / `HISTORY`), autopolicy and the
-/// `MSG_MULTI_MODIFY_*` family stay reachable from a client of any version.
-/// They are `autumn-op`'s messages, and `autumn-op` ships WITH the cluster —
-/// it is built and deployed at the same commit as the servers, so it is never
-/// out of window in practice and a window would buy it nothing. The cost of
-/// being wrong about that is real, since those are rkyv structs and a
-/// cross-version decode is only SOMETIMES loud: an operator running a stale
-/// `autumn-op` gets the same silent misread this mechanism protects the data
-/// plane from. Covering it means paying a second maintained window for a
-/// binary nobody embeds; the trade is recorded rather than hidden.
+/// **The OPERATOR surface is not here.** `MSG_STATUS`, the stream/extent info
+/// calls, `namespace_*`, `tenant_*`, the op-ledger (`MSG_OP_SUBMIT` / `QUERY` /
+/// `HISTORY`), autopolicy and the `MSG_MULTI_MODIFY_*` family are `autumn-op`'s
+/// messages. It sends them over an Admin connection, which needs exact
+/// `WIRE_VERSION` equality and the cluster secret (`peer_auth`), so no client
+/// window applies to them and a Client connection is refused them.
 ///
 /// **`MSG_GET_REGIONS` is deliberately NOT here, and it is the one message this
 /// set cannot cover.** It is on both surfaces — an SDK routes with it, and so
@@ -342,14 +336,13 @@ mod tests {
         // The same frame goes to the manager AND the PS, so a collision in
         // either space would route it into somebody else's handler.
         //
-        // This asserts only that the opcode is outside the four sets THIS
+        // This asserts only that the opcode is outside the three sets THIS
         // module reasons about. It cannot catch a future `MSG_FOO = 0x5F`:
         // both gates intercept 0x5F ahead of dispatch, so a collision would be
         // silently SHADOWED rather than fail here. The real guard is that the
         // opcode is frozen and recorded in `negotiation_freeze.rs`, so the
         // collision has to be introduced by the newcomer, not by this file.
         assert!(!manager_rpc::is_admin_mgr_msg(MSG_CLIENT_HELLO));
-        assert!(!partition_rpc::is_admin_ps_msg(MSG_CLIENT_HELLO));
         assert!(!is_client_surface_ps_msg(MSG_CLIENT_HELLO));
         assert!(!is_client_surface_mgr_msg(MSG_CLIENT_HELLO));
         assert_ne!(MSG_CLIENT_HELLO, crate::MSG_TYPE_PING);

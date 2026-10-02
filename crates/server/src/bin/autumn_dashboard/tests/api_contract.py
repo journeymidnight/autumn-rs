@@ -61,6 +61,8 @@ def run():
     children, logs = [], []
     with tempfile.TemporaryDirectory(prefix='autumn-dashboard-') as tmp:
         work = Path(tmp)
+        secret = work / 'cluster.secret'
+        secret.write_text('dashboard-test-cluster-secret-0123456789abcdef\n')
         def spawn(name, args):
             log = open(work / (name + '.log'), 'wb')
             logs.append(log)
@@ -69,7 +71,7 @@ def run():
             return child
         def op(*args):
             result = subprocess.run([str(BIN / 'autumn-op'), '--manager', address,
-                '--admin-token', 'dashboard-test-token', '--json', *map(str, args)],
+                '--cluster-secret-file', str(secret), '--json', *map(str, args)],
                 capture_output=True, text=True, timeout=15)
             if result.returncode:
                 raise RuntimeError(result.stdout + result.stderr)
@@ -96,7 +98,7 @@ def run():
                 '--initial-cluster', f'dashboard-test=http://127.0.0.1:{etcd+1}'])
             eventually(lambda: ready(etcd))
             manager = spawn('manager', [str(BIN/'autumn-manager-server'), '--port', str(mgr), '--listen', '127.0.0.1',
-                '--admin-token', 'dashboard-test-token', '--etcd', f'127.0.0.1:{etcd}'])
+                '--cluster-secret-file', str(secret), '--etcd', f'127.0.0.1:{etcd}'])
             eventually(lambda: ready(mgr))
             # Read-only status proves that leader election/replay finished.
             def leader():
@@ -110,7 +112,8 @@ def run():
             op('format', work/'en/d0', work/'en/d1')
             cpu = str(min(os.sched_getaffinity(0))) if hasattr(os, 'sched_getaffinity') else '0'
             spawn('en', [str(BIN/'autumn-extent-node'), '--data', f'{work}/en/d0,{work}/en/d1', '--port', str(en),
-                '--manager', address, '--cpuset', cpu, '--advertise', f'127.0.0.1:{en}', '--listen', '127.0.0.1'])
+                '--manager', address, '--cpuset', cpu, '--advertise', f'127.0.0.1:{en}', '--listen', '127.0.0.1',
+                '--cluster-secret-file', str(secret)])
             eventually(lambda: ready(en))
             def disks_ready():
                 v = op('overview')
@@ -118,10 +121,10 @@ def run():
             eventually(disks_ready)
             op('bootstrap', '--replication', '1+0')
             spawn('ps', [str(BIN/'autumn-ps'), '--psid', '1', '--port', str(ps), '--manager', address,
-                '--listen', '127.0.0.1', '--advertise', f'127.0.0.1:{ps}'])
+                '--listen', '127.0.0.1', '--advertise', f'127.0.0.1:{ps}', '--cluster-secret-file', str(secret)])
             eventually(lambda: ready(ps))
             spawn('dashboard', [str(BIN/'autumn-dashboard'), '--manager', address, '--autumn-op', str(BIN/'autumn-op'),
-                '--port', str(dash), '--listen', '127.0.0.1', '--admin-token', 'dashboard-test-token'])
+                '--port', str(dash), '--listen', '127.0.0.1', '--cluster-secret-file', str(secret)])
             eventually(lambda: ready(dash))
             assert http('/') == PAGE.read_bytes(), 'served page must be from this build'
             def overview_ready():

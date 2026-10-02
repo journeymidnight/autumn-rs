@@ -65,6 +65,7 @@ run_one_capture() {
     AUTUMN_PPROF_THREADS="$thread_filter" \
     "$PS_PROF_BIN" \
         --psid 1 --port 9201 --manager 127.0.0.1:9001 --advertise 127.0.0.1:9201 \
+        --cluster-secret-file "${AUTUMN_CLUSTER_SECRET_FILE:-$AUTUMN_DATA_ROOT/cluster.secret}" \
         > "$logpath" 2>&1 &
     local ps_pid=$!
     echo "[R2]   new PS pid=$ps_pid"

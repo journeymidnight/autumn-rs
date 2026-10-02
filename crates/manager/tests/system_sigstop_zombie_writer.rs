@@ -94,6 +94,8 @@ impl PsProc {
     fn spawn(psid: u64, mgr: SocketAddr) -> Self {
         let addr = pick_addr();
         let child = Command::new(ps_binary())
+        .arg("--cluster-secret-file")
+        .arg(support::cluster_secret_file())
             .arg("--psid")
             .arg(psid.to_string())
             .arg("--port")

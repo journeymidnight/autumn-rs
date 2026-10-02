@@ -34,6 +34,21 @@ const PARTITION_SERVER_BIN: &str = env!("CARGO_BIN_EXE_autumn-ps");
 const AUTUMN_OP_BIN: &str = env!("CARGO_BIN_EXE_autumn-op");
 const AUTUMN_CLIENT_BIN: &str = env!("CARGO_BIN_EXE_autumn-client");
 
+/// The cluster secret file every server binary this test spawns requires, and
+/// autumn-op proves (it connects as an operator).
+fn cluster_secret_file() -> &'static std::path::Path {
+    static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "cluster-secret-{}",
+            std::process::id()
+        ));
+        std::fs::write(&path, "autumn-server-tests-cluster-secret-0123456789")
+            .expect("write test cluster secret");
+        path
+    })
+}
+
 /// Bind a TCP listener on an OS-allocated port, capture the port,
 /// drop the listener. Race window between drop and the child re-binding
 /// is small enough in practice for a single-threaded test.
@@ -125,6 +140,8 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     let _manager = ChildGuard::new(
         "manager",
         Command::new(MANAGER_BIN)
+            .arg("--cluster-secret-file")
+            .arg(cluster_secret_file())
             .args(["--port", &mgr_port.to_string(), "--listen", "127.0.0.1"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -145,6 +162,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     // the extent-node spawn.
     {
         let mut cmd = Command::new(AUTUMN_OP_BIN);
+        cmd.arg("--cluster-secret-file").arg(cluster_secret_file());
         // M1c: format is identity-only — no location flags.
         cmd.args(["--manager", &mgr_addr, "format", data_dir.to_str().unwrap()]);
         let stdout = run_or_panic("autumn-op format", cmd);
@@ -166,6 +184,8 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     let _extent_node = ChildGuard::new(
         "extent-node",
         Command::new(EXTENT_NODE_BIN)
+            .arg("--cluster-secret-file")
+            .arg(cluster_secret_file())
             .args([
                 "--port",
                 &en_port.to_string(),
@@ -202,6 +222,8 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     let _ps = ChildGuard::new(
         "partition-server",
         Command::new(PARTITION_SERVER_BIN)
+            .arg("--cluster-secret-file")
+            .arg(cluster_secret_file())
             .args([
                 "--psid",
                 "1",
@@ -226,6 +248,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
     // ── bootstrap ───────────────────────────────────────────────────
     {
         let mut cmd = Command::new(AUTUMN_OP_BIN);
+        cmd.arg("--cluster-secret-file").arg(cluster_secret_file());
         cmd.args(["--manager", &mgr_addr, "bootstrap", "--replication", "1+0"]);
         let stdout = run_or_panic("autumn-op bootstrap", cmd);
         let text = String::from_utf8_lossy(&stdout);

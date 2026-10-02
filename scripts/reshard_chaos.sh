@@ -49,7 +49,8 @@ kill_all(){ for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1
 trap 'kill_all' EXIT
 
 # --- shard count of node 1 as the manager sees it (M1c list-nodes echo) ---
-shard_count(){ "$OP" --manager "$MGR" --json list-nodes 2>/dev/null \
+shard_count(){ "$OP" --cluster-secret-file "${AUTUMN_CLUSTER_SECRET_FILE:-$AUTUMN_DATA_ROOT/cluster.secret}" \
+  --manager "$MGR" --json list-nodes 2>/dev/null \
   | python3 -c 'import json,sys
 try:
   d=json.load(sys.stdin); print(d[0]["shard_count"] if d else -1)
@@ -58,17 +59,17 @@ except Exception: print(-1)'; }
 # --- relaunch the EN with a new cpuset (=> new shard count), same everything else ---
 relaunch_en(){  # $1 = cpuset spec, e.g. "180-183"
   local newcpu="$1" epid cmd i
-  epid=$(pgrep -f "autumn-extent-node --port $EN_PORT" | head -1)
+  epid=$(pgrep -f "autumn-extent-node .*--port $EN_PORT" | head -1)
   [ -z "$epid" ] && { fail "EN not running before reshard to $newcpu"; return 1; }
   cmd=$(tr '\0' ' ' < "/proc/$epid/cmdline")
   # drop the existing --cpuset <spec> (2 tokens); we re-add a fresh one.
   cmd=$(echo "$cmd" | sed -E 's/--cpuset [0-9,-]+ ?//')
   say "reshard: kill EN pid=$epid, relaunch --cpuset $newcpu"
   kill -9 "$epid"
-  for i in $(seq 1 30); do pgrep -f "autumn-extent-node --port $EN_PORT" >/dev/null || break; sleep 0.5; done
+  for i in $(seq 1 30); do pgrep -f "autumn-extent-node .*--port $EN_PORT" >/dev/null || break; sleep 0.5; done
   sleep 1  # let the old shard listeners' TIME_WAIT settle before rebind
   setsid nohup $cmd --cpuset "$newcpu" > "$WORK/en_cpuset_${newcpu//,/_}.log" 2>&1 </dev/null & disown
-  for i in $(seq 1 40); do pgrep -f "autumn-extent-node --port $EN_PORT" >/dev/null && break; sleep 1; done
+  for i in $(seq 1 40); do pgrep -f "autumn-extent-node .*--port $EN_PORT" >/dev/null && break; sleep 1; done
   sleep 6  # let it self-register + the manager df tick pick up the new shard_ports
 }
 
@@ -80,7 +81,7 @@ relaunch_en(){  # $1 = cpuset spec, e.g. "180-183"
 # than forwarding, so fresh routing is required) -> R8 read back every key.
 reshard_to(){  # $1 = cpuset, $2 = expected shard count, $3 = tag
   local newcpu="$1" want="$2" tag="$3" ppid pcmd sc
-  ppid=$(pgrep -f "autumn-ps --psid" | head -1)
+  ppid=$(pgrep -f "autumn-ps .*--psid" | head -1)
   [ -z "$ppid" ] && { fail "[$tag] PS not running"; return 1; }
   pcmd=$(tr '\0' ' ' < "/proc/$ppid/cmdline")
   say "[$tag] R1: stop PS pid=$ppid (quiesce)"
