@@ -1037,10 +1037,14 @@ Two seal sites — `handle_stream_alloc_extent` failover seal and
 `handle_check_commit_length` — both exclude catching-up members
 (`recovering_nodes_for_extent`, a re-replication target holds a partial replica and
 must never lower the `min`), probe committed members, and feed the shared pure
-`compute_commit_seal(members, recovering, responses, floor)`. `floor` =
-`AUTUMN_MGR_SEAL_DURABILITY_FLOOR` (default 1) is a durability floor (min members that
-must exist + respond), NOT a quorum vote on position (position is always `min` over
-responders). An unreachable committed member gets its `avali` bit left unset →
+`compute_commit_seal(members, recovering, responses)`. We wish every committed member
+would answer, but ONE is enough: whichever answers holds all the acked data (perhaps
+more), and after the seal a committed member shorter than the min still holds all of
+it, so a
+single surviving replica of the WAL is enough to recover. It refuses only when no
+committed member answered. There is no setting to demand more (the
+`AUTUMN_MGR_SEAL_DURABILITY_FLOOR` env knob was removed). Position is always `min` over
+responders. An unreachable committed member gets its `avali` bit left unset →
 reconciled by recovery later; it does not block the seal.
 
 **Phantom-commit is ACCEPTABLE.** Seal-over-reachable can promote an

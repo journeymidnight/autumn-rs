@@ -2,9 +2,9 @@
 //! (+ EC beyond parity).  REPRODUCE-FIRST — this file only asserts the current
 //! behaviour; it does not fix anything.
 //!
-//! autumn-rs is RF3, all-replica-ACK, `min`-over-reachable-committed seal with a
-//! lenient durability floor of **1** (`AUTUMN_MGR_SEAL_DURABILITY_FLOOR`,
-//! `compute_commit_seal`, `rpc_handlers.rs`).  A correlated 2-of-3 loss stresses
+//! autumn-rs is RF3, all-replica-ACK, `min`-over-reachable-committed seal that
+//! needs only one answering committed member (`compute_commit_seal`,
+//! `rpc_handlers.rs`).  A correlated 2-of-3 loss stresses
 //! three invariants at their boundary:
 //!
 //!   Leg 1 — kill 2 of an extent's 3 replicas at the same time.  The single

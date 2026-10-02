@@ -14,6 +14,13 @@
 
 ## Active
 
+### REN-SEAL-ONE-REPLICA — seal 只需一个已提交副本回答；删除 AUTUMN_MGR_SEAL_DURABILITY_FLOOR
+- **Trigger** (2026-10-02 用户): "回放WAL的时候,有可能有的副本坏了,但是只要哪怕一个副本回答, 说明这个副本至少有全部数据(可能比真正有的都多), 哪怕seal了以后,有一个比它短的,但是也有全部数据,是安全的, 所以注释应该是 'wish all replicas answer, but even one can response, we could do seal, we are sure data is safe' 之类的"；"AUTUMN_MGR_SEAL_DURABILITY_FLOOR删除, 应当是哪怕就留一个WAL,系统也可以恢复"。
+- **Scope**: `compute_commit_seal` 去掉 floor 参数，只在没有已提交副本回答时拒绝；删 `seal_durability_floor()` 与环境变量；改写 `handle_check_commit_length` 等处与代码不符的注释；更新 manager CLAUDE.md。默认行为不变（原默认 1）。
+- **Acceptance**: manager lib 绿（含新的一副本 / 零副本单测）；seal / failover 相关集成测试绿（旧失败除外）。
+- `passes: true`
+- **notes** (2026-10-02): `compute_commit_seal(members, recovering, responses)` 仅在零个已提交副本回答时 Err（`reachable <= committed`，与原 floor 1 的 `committed < 1 || reachable < 1` 完全等价，只有报错文字变化）；两处 seal 调用点与注释（含 `handle_stream_alloc_extent` 探测分支）改为“希望全部回答，一个即可”。单测 `one_reachable_member_is_enough`、`refuses_when_no_committed_member_answers`；manager lib 434 绿；system_extent_failover、flush_with_dead_log_replica、bug_flush_timeout_leak、system_ps_recovery 绿；system_wiped_rejoin_truncation、system_correlated_2of3_loss 各一个失败用例均属 BUG-RECOVERY-PINNED-TARGET-TESTS 旧失败。评审（opus）确认行为等价，已补漏改的注释与折行。
+
 ### BUG-OPEN-TAIL-REPLAY-BOUND — 回放 open 尾部用可达副本 min，写游标用全副本 min（假设，未复现）
 - **Trigger** (2026-10-02，删除 flush 屏障时独立评审提出): 回放 open 尾部的读取上限是 `commit_length_for_extent`（可达副本的 min），而写游标由 `current_commit`（全部副本的 min）决定。若副本 C 宕机期间一条未确认的记录 R 只落在 A、B 上，PS 此时重启，回放会把 R 读进 memtable；C 在首次追加前回来，首次追加按 C 的较短长度截断 A、B，R 的值指针随后指向被覆盖的字节。
 - **Scope**: 先复现；若成立，让回放上限与全副本规则一致，或回放前先 seal-and-roll。

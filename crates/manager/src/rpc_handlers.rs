@@ -2003,21 +2003,6 @@ impl AutumnManager {
         set
     }
 
-    /// minimum number of committed (non-catching-up) members that
-    /// must be reachable to seal / read a commit length. Default 1 — under
-    /// all-replica-ACK any single committed member holds the full acked
-    /// prefix, so 1 already prevents acked-data loss; raise for a stricter
-    /// durability posture. This is a durability gate, NOT a quorum vote on
-    /// the commit *position* (the position is always `min` over the
-    /// committed members that respond).
-    fn seal_durability_floor() -> usize {
-        std::env::var("AUTUMN_MGR_SEAL_DURABILITY_FLOOR")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1)
-    }
-
     /// pure WAS-faithful commit/seal-length decision (unit-tested,
     /// shared by `handle_stream_alloc_extent` seal + `handle_check_commit_length`).
     ///
@@ -2037,7 +2022,7 @@ impl AutumnManager {
     /// write path wedged → reads starved (bug #3). WAS does NOT block on a
     /// slow/dead replica: the Stream Manager seals at the committed length
     /// over the REACHABLE members and re-replicates the laggard out of band.
-    /// We now require only `floor` committed members to be reachable.
+    /// We wish every committed member would answer, but one is enough.
     ///
     /// **Why this never drops acked data:** the append path is
     /// all-replica-ACK, so the acked length is present on EVERY committed
@@ -2045,21 +2030,23 @@ impl AutumnManager {
     /// holds ≥ the acked length, so `min` over the reachable ones is ALSO ≥
     /// the acked length. The ONLY member that can sit BELOW acked is a
     /// catching-up replica — and those are excluded via `recovering`. So
-    /// `min`-over-reachable-committed ≥ acked, always. (`floor` ≥ 1
-    /// guarantees at least one such member exists + responds, i.e. at least
-    /// one full acked prefix survives the seal.) An unreachable committed
+    /// `min`-over-reachable-committed ≥ acked, always: any single committed
+    /// member that answers holds all the acked data (perhaps more, un-acked
+    /// bytes past it), and after the seal a committed member shorter than it
+    /// still holds all the acked data too. So the system recovers from a
+    /// single surviving replica of the WAL, and there is no knob to demand
+    /// more. An unreachable committed
     /// member gets its `avali` bit left UNSET → the recovery/re_avali path
     /// reconciles it to `sealed_length` later (the laggard may hold MORE —
     /// un-acked speculation — which is then truncated; or LESS — which is
     /// re-replicated up). Either way acked data is safe.
     ///
-    /// `Err` only when fewer than `floor` committed members exist OR fewer
-    /// than `floor` of them responded (can't establish a durable seal point).
+    /// `Err` only when no committed member answered (there is none, or none
+    /// was reachable): then nothing tells where the acked data ends.
     pub(crate) fn compute_commit_seal(
         members: &[(usize, u64)],
         recovering: &std::collections::HashSet<u64>,
         responses: &std::collections::HashMap<u64, u64>,
-        floor: usize,
     ) -> std::result::Result<(u64, u32), String> {
         let mut min_len: Option<u64> = None;
         let mut avali: u32 = 0;
@@ -2076,14 +2063,11 @@ impl AutumnManager {
                 min_len = Some(min_len.map_or(v, |c| c.min(v)));
             }
         }
-        // WAS seal-over-reachable: require `floor` committed members to exist
-        // AND `floor` of them to respond — NOT all (which blocked on a
-        // kill+restarted laggard, bug #3). Safe because min-over-reachable ≥
-        // acked under all-replica-ACK (see doc).
-        if committed < floor || reachable < floor {
-            return Err(format!(
-                "{reachable}/{committed} committed members reachable (need >= floor {floor})"
-            ));
+        // One answering committed member is enough (see doc): it holds all
+        // the acked data. Waiting for all of them blocked on a kill+restarted
+        // laggard (bug #3).
+        if reachable == 0 {
+            return Err(format!("0/{committed} committed members reachable"));
         }
         Ok((min_len.unwrap_or(0), avali))
     }
@@ -2165,15 +2149,13 @@ impl AutumnManager {
         // WAS-faithful commit-length read. The append path is
         // all-replica-ACK (`apply_completion` requires every replica to
         // ack), so every COMMITTED member holds >= the acked commit
-        // length. Therefore `min` over the committed members never drops
-        // acked data — PROVIDED we (a) exclude catching-up members
-        // (in-flight Recovery, partial replica) from the min, and
-        // (b) require all committed members to agree (no majority quorum
-        // subset, which could seal below the acked length by including a
-        // short catching-up replica, or above it by excluding a member).
-        // probe committed members, then decide via the shared pure
-        // `compute_commit_seal` (no quorum; excludes catching-up members;
-        // requires all committed members to respond).
+        // length. We wish every committed member would answer, but even
+        // one is enough: whichever answers holds all the acked data (perhaps
+        // more), so `min` over the answering committed members never drops
+        // acked data, and a member shorter than that min still holds all of
+        // it. Catching-up members (in-flight Recovery, partial replica) are
+        // excluded: they can sit below the acked length. The decision is the
+        // shared pure `compute_commit_seal`.
         let recovering = self.recovering_nodes_for_extent(ex.extent_id);
         let members: Vec<(usize, u64)> = ex
             .replicates
@@ -2242,7 +2224,6 @@ impl AutumnManager {
             &members,
             &recovering,
             &responses,
-            Self::seal_durability_floor(),
         ) {
             Ok((len, _avali)) => len,
             Err(reason) => {
@@ -2524,9 +2505,10 @@ impl AutumnManager {
             // writer did not supply a known commit, so this owner must derive it).
             // commit length = `min` over COMMITTED members only. The append
             // path is all-replica-ACK, so every committed member holds >=
-            // the acked length; min over them is therefore >= acked and
-            // never drops acked data — as long as catching-up members are
-            // excluded and all committed members agree (no quorum subset).
+            // the acked length; min over the ones that answer is therefore
+            // >= acked and never drops acked data, as long as catching-up
+            // members are excluded. We wish every committed member would
+            // answer, but one is enough.
             //
             // This previously took `min` over a majority-quorum subset of
             // responders: a catching-up replica (partial data from an
@@ -2581,15 +2563,14 @@ impl AutumnManager {
                 "BUG2 probe commit_length responses"
             );
             // Shared pure decision: no quorum, exclude catching-up members,
-            // seal at min over the REACHABLE committed members (>= floor;
-            // WAS seal-over-reachable — a kill+restarted laggard no longer
-            // blocks). apply_recovery_done / re_avali set an unset slot's
+            // seal at min over the REACHABLE committed members (one is
+            // enough; WAS seal-over-reachable — a kill+restarted laggard no
+            // longer blocks). apply_recovery_done / re_avali set an unset slot's
             // avali bit when its reconcile to sealed_length completes.
             match Self::compute_commit_seal(
                 &members,
                 &recovering,
                 &responses,
-                Self::seal_durability_floor(),
             ) {
                 Ok((len, av)) => {
                     min_len = Some(len);
@@ -6094,9 +6075,9 @@ impl AutumnManager {
                 //
                 // The bitmask is set at SEAL — all bits on the known-commit,
                 // split/merge CoW and EC-conversion paths; one per responding
-                // member on the probe path, and `compute_commit_seal`'s floor
-                // (>= 1) means never fewer than one. Bits are added back per
-                // slot afterwards as recovery / `re_avali` reconcile a laggard,
+                // member on the probe path, and `compute_commit_seal` needs
+                // at least one answering member, so never fewer than one.
+                // Bits are added back per slot afterwards as recovery / `re_avali` reconcile a laggard,
                 // and only ever CLEARED by corrupt-replica isolation, which
                 // refuses to clear the last one. So a sealed extent always
                 // carries at least one bit, and a missing bit is a real fault.
@@ -7306,7 +7287,7 @@ mod commit_seal_tests {
         resp.insert(1u64, 20_000_000u64);
         resp.insert(3u64, 20_000_000u64);
         resp.insert(5u64, 18_000_000u64);
-        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).unwrap();
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp).unwrap();
         assert_eq!(len, 18_000_000, "seal = min over all committed members");
         assert_eq!(avali, 0b111);
     }
@@ -7324,7 +7305,7 @@ mod commit_seal_tests {
         resp.insert(1u64, 20_000_000u64);
         resp.insert(3u64, 20_000_000u64);
         // node 5 deliberately absent (would have reported a short length).
-        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).unwrap();
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp).unwrap();
         assert_eq!(len, 20_000_000);
         assert_eq!(avali, 0b011, "slot 2 (node 5) avali bit stays unset");
     }
@@ -7333,7 +7314,7 @@ mod commit_seal_tests {
     fn seals_over_reachable_when_a_committed_member_is_silent() {
         // WAS seal-over-reachable (bug #3 fix): a committed member that is
         // unreachable (e.g. a kill+restarted laggard not yet in `recovering`)
-        // no longer blocks the seal. With floor 1 and {1,3} reachable, seal at
+        // no longer blocks the seal. With {1,3} reachable, seal at
         // min(1,3) = 20 MB (which is >= acked under all-replica-ACK), and
         // node 5's avali bit stays UNSET so it is reconciled out of band.
         let m = members3();
@@ -7342,7 +7323,7 @@ mod commit_seal_tests {
         resp.insert(1u64, 20_000_000u64);
         resp.insert(3u64, 20_000_000u64);
         // node 5 committed but silent (unreachable).
-        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).unwrap();
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp).unwrap();
         assert_eq!(
             len, 20_000_000,
             "seal = min over the REACHABLE committed members"
@@ -7354,38 +7335,31 @@ mod commit_seal_tests {
     }
 
     #[test]
-    fn refuses_when_fewer_than_floor_members_reachable() {
-        // The floor still gates: with floor 2 but only node 1 reachable
-        // (node 3 also silent), we cannot establish a durable-enough seal.
+    fn one_reachable_member_is_enough() {
+        // Nodes 3 and 5 silent: node 1 alone holds all the acked data, so the
+        // seal goes ahead at its length.
         let m = members3();
         let rec = HashSet::new();
         let mut resp = HashMap::new();
         resp.insert(1u64, 20_000_000u64);
-        // nodes 3 and 5 silent → only 1 reachable < floor 2.
-        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 2).is_err());
-        // floor 1 is satisfied by the single reachable member.
-        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).is_ok());
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp).unwrap();
+        assert_eq!(len, 20_000_000);
+        assert_eq!(avali, 0b001);
     }
 
     #[test]
-    fn refuses_below_durability_floor() {
-        // All members catching-up -> 0 committed -> below floor 1.
+    fn refuses_when_no_committed_member_answers() {
+        // All members catching-up -> no committed member at all.
         let m = members3();
         let rec: HashSet<u64> = [1u64, 3, 5].into_iter().collect();
-        let resp = HashMap::new();
-        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 1).is_err());
-    }
-
-    #[test]
-    fn floor_gates_committed_member_count() {
-        // 2 committed members (5 catching-up) both respond.
-        let m = members3();
-        let rec: HashSet<u64> = [5u64].into_iter().collect();
+        assert!(AutumnManager::compute_commit_seal(&m, &rec, &HashMap::new()).is_err());
+        // Committed members exist but none answered.
+        assert!(AutumnManager::compute_commit_seal(&m, &HashSet::new(), &HashMap::new()).is_err());
+        // A catching-up member answering does not count.
+        let rec5: HashSet<u64> = [5u64].into_iter().collect();
         let mut resp = HashMap::new();
-        resp.insert(1u64, 20u64);
-        resp.insert(3u64, 20u64);
-        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 3).is_err());
-        assert!(AutumnManager::compute_commit_seal(&m, &rec, &resp, 2).is_ok());
+        resp.insert(5u64, 20u64);
+        assert!(AutumnManager::compute_commit_seal(&m, &rec5, &resp).is_err());
     }
 }
 

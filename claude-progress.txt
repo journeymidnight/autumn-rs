@@ -1,3 +1,11 @@
+Date: 2026-10-02 (8)
+TaskStatus: completed
+Task scope: user "只要哪怕一个副本回答…是安全的…注释应该是 wish all replicas answer, but even one…"; "AUTUMN_MGR_SEAL_DURABILITY_FLOOR删除, 应当是哪怕就留一个WAL,系统也可以恢复" (REN-SEAL-ONE-REPLICA).
+Current summary: the seal / commit-length decision needs one answering committed member; the env knob and floor parameter are gone; comments at both seal sites and in manager CLAUDE.md say so. Default behaviour unchanged (old default was 1).
+Verification: see feature_list REN-SEAL-ONE-REPLICA notes. Review: opus, equivalence confirmed.
+Main gaps: BUG-RECOVERY-PINNED-TARGET-TESTS (pre-existing).
+Next steps: none.
+
 Date: 2026-10-02 (7)
 TaskStatus: completed
 Task scope: user "不需要这个屏障, 因为WAL写入的时候已经确认过了(你可以读代码), await_log_synced_to完全没有作用" → "没部署呢,直接删除" (BUG-FLUSH-BARRIER-WEDGE).
