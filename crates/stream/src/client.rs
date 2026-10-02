@@ -2309,6 +2309,10 @@ pub struct StreamClient {
     /// peer can't OOM us; the per-stream alloc route-around remains
     /// the primary defense, so dropped reports don't hurt correctness.
     failure_report_tx: mpsc::Sender<FailureReport>,
+    /// When each node was last reported unreachable from a read or the flush
+    /// barrier (`report_unreachable`): at most one report per node per
+    /// `NODE_ADDR_FORGET_COOLDOWN`.
+    node_failure_reported: RefCell<HashMap<u64, Instant>>,
     /// identifier the manager dedups by inside its quorum
     /// debounce window. Each `PartitionData` sets this to its own
     /// `part_id` after `StreamClient::new_with_owner_epoch`. Default 0
@@ -2755,6 +2759,7 @@ impl StreamClient {
             stream_init_locks: RefCell::new(HashMap::new()),
             stream_bad_nodes: RefCell::new(HashMap::new()),
             failure_report_tx,
+            node_failure_reported: RefCell::new(HashMap::new()),
             reporter_part_id: Cell::new(0),
             config,
             append_metrics: StreamAppendMetrics::default(),
@@ -4057,6 +4062,11 @@ impl StreamClient {
                     Err(e) => {
                         failed[i] += 1;
                         if failed[i] >= SYNCED_QUERY_ATTEMPTS {
+                            if is_connect_failure(&e) {
+                                if let Some(&node_id) = replica_node_ids(&ex).get(i) {
+                                    self.note_unreachable(node_id, extent_id);
+                                }
+                            }
                             return Err(e.context(format!(
                                 "await_extent_synced_to: replica {addr} of extent {extent_id} \
                                  could not be queried {SYNCED_QUERY_ATTEMPTS} times in a row"
@@ -4233,6 +4243,43 @@ impl StreamClient {
         }
         if self.nodes_cache.remove(&node_id).is_some() {
             tracing::warn!(node_id, "could not reach this node's cached address — forgetting it");
+        }
+    }
+
+    /// Node `node_id` (a replica of `extent_id`) could not be reached: forget
+    /// its cached address and tell the manager. For the sites that know WHICH
+    /// node failed — a read failing over or reconstructing past it, the flush
+    /// barrier giving up on it. Appends report through their worker
+    /// (`StreamAppendState::try_report_failure`).
+    pub(crate) fn note_unreachable(&self, node_id: u64, extent_id: u64) {
+        self.forget_node_addr(node_id);
+        self.report_unreachable(node_id, extent_id);
+    }
+
+    /// `MSG_REPORT_DISK_FAILURE` for `node_id`, at most once per node per
+    /// `NODE_ADDR_FORGET_COOLDOWN`: a read path can hit a dead node thousands
+    /// of times a second, and one report per reporter per window is all the
+    /// manager's quorum counts. The cooldown is what bounds the volume (a
+    /// cloned sender always has a slot); `try_send` fails only once the
+    /// drainer is gone.
+    fn report_unreachable(&self, node_id: u64, extent_id: u64) {
+        let now = Instant::now();
+        {
+            let mut last = self.node_failure_reported.borrow_mut();
+            if last
+                .get(&node_id)
+                .is_some_and(|t| now.duration_since(*t) < Self::NODE_ADDR_FORGET_COOLDOWN)
+            {
+                return;
+            }
+            last.insert(node_id, now);
+        }
+        if let Err(e) = self
+            .failure_report_tx
+            .clone()
+            .try_send(FailureReport { node_id, extent_id })
+        {
+            tracing::debug!(node_id, extent_id, error = %e, "unreachable-node report not sent");
         }
     }
 
@@ -4830,7 +4877,7 @@ impl StreamClient {
                     // connect timeout for the life of the process.
                     if is_connect_failure(&e) {
                         if let Some(&node_id) = replica_node_ids(&ex).get(slot) {
-                            self.forget_node_addr(node_id);
+                            self.note_unreachable(node_id, extent_id);
                         }
                     }
                     if is_liveness_timeout(&e) {
@@ -5156,7 +5203,7 @@ impl StreamClient {
                     // here, where the slot names exactly which node it was.
                     if is_connect_failure(&e) {
                         if let Some(&node_id) = replica_node_ids(ex).get(slot) {
-                            self.forget_node_addr(node_id);
+                            self.note_unreachable(node_id, ex.extent_id);
                         }
                     }
                     last_err = e;
@@ -5647,7 +5694,7 @@ impl StreamClient {
                     // time and the others cover for it.
                     if is_connect_failure(&e) {
                         if let Some(&node_id) = node_ids.get(shard_plan[i].0) {
-                            self.forget_node_addr(node_id);
+                            self.note_unreachable(node_id, extent_id);
                         }
                     }
                     needs_reconstruct.push(i);
@@ -7830,6 +7877,113 @@ mod synced_barrier_tests {
         assert!(format!("{e:#}").contains(&addr), "{e:#}");
         assert_eq!(dials.get(), SYNCED_QUERY_ATTEMPTS);
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    }
+
+    /// A manager that records every `MSG_REPORT_DISK_FAILURE` it receives as
+    /// `(node_id, extent_id, reporter_part_id)`.
+    async fn recording_manager() -> (String, Rc<RefCell<Vec<(u64, u64, u64)>>>) {
+        use compio::io::{AsyncRead, AsyncWriteExt};
+        let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let reports = Rc::new(RefCell::new(Vec::new()));
+        let seen = reports.clone();
+        compio::runtime::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let seen = seen.clone();
+                compio::runtime::spawn(async move {
+                    let (mut rd, mut wr) = autumn_transport::Conn::Tcp(socket).into_split();
+                    let Ok(n) = autumn_rpc::version_hello::accept(
+                        &mut rd,
+                        &mut wr,
+                        autumn_rpc::version_hello::Service::Manager,
+                        "test",
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    if autumn_rpc::peer_auth::accept(&mut rd, &mut wr, &n, None, "test")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let mut decoder = autumn_rpc::FrameDecoder::new();
+                    loop {
+                        let compio::BufResult(r, buf) = rd.read(vec![0; 4096]).await;
+                        let Ok(len) = r else { return };
+                        if len == 0 {
+                            return;
+                        }
+                        decoder.feed(&buf[..len]);
+                        while let Ok(Some(frame)) = decoder.try_decode() {
+                            if frame.msg_type == manager_rpc::MSG_REPORT_DISK_FAILURE {
+                                let req: manager_rpc::ReportDiskFailureReq =
+                                    manager_rpc::rkyv_decode(&frame.payload).unwrap();
+                                seen.borrow_mut().push((
+                                    req.node_id,
+                                    req.extent_id,
+                                    req.reporter_part_id,
+                                ));
+                            }
+                            let reply =
+                                autumn_rpc::Frame::response(frame.req_id, frame.msg_type, Bytes::new());
+                            if wr.write_all(reply.encode()).await.0.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+        })
+        .detach();
+        (addr, reports)
+    }
+
+    /// The barrier giving up on a replica it cannot reach tells the manager,
+    /// once per node per cooldown however often the flush retries.
+    #[compio::test]
+    async fn an_unreachable_replica_is_reported_once() {
+        let (mgr, reports) = recording_manager().await;
+        // Nothing listens here: every connect is refused.
+        let dead = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().to_string()
+        };
+        let sc = StreamClient::construct(
+            vec![mgr],
+            0,
+            "partition/9".to_string(),
+            1,
+            1 << 30,
+            Rc::new(ConnPool::new()),
+            StreamClientConfig::default(),
+        );
+        sc.set_reporter_part_id(9);
+        sc.extent_info_cache.insert(
+            7,
+            ExtentInfo {
+                extent_id: 7,
+                replicates: vec![1],
+                eversion: 1,
+                ..Default::default()
+            },
+        );
+        for _ in 0..2 {
+            // The barrier forgets an address it cannot reach; pin it each round.
+            sc.nodes_cache.insert(1, (dead.clone(), Vec::new()));
+            sc.await_extent_synced_to(7, 4096)
+                .await
+                .expect_err("a refused replica satisfied the barrier");
+        }
+        // The report travels on the client's background drainer.
+        let start = Instant::now();
+        while reports.borrow().is_empty() && start.elapsed() < Duration::from_secs(5) {
+            compio::time::sleep(Duration::from_millis(20)).await;
+        }
+        compio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(*reports.borrow(), vec![(1, 7, 9)]);
     }
 }
 

@@ -1,3 +1,11 @@
+Date: 2026-10-02 (6)
+TaskStatus: completed
+Task scope: user "ps的上报也应该有dead en的情况" → "3. 同意更多的地方可以报考失败" (F-REPORT-UNREACHABLE-EN).
+Current summary: the PS's StreamClient reports an extent node it cannot connect to from reads (replicated failover, single-key read, EC shard read) and from the flush barrier, once per node per 30 s; manager handling unchanged.
+Verification: see feature_list F-REPORT-UNREACHABLE-EN notes. Review: fable, no blocker; doc corrections applied (a moved node is reported once; one PS can reach the quorum; ≤2 s allocation shadow; auto_disk gate).
+Main gaps (user to decide): runtime flush wedge on a dead EN — the barrier re-checks what the all-replica, fsync-before-ack append already guarantees; removing or relaxing it needs WAL replay and GC relocation verified first. Whether reads should report only a node confirmed down (not moved).
+Next steps: wait for the user.
+
 Date: 2026-10-02 (5)
 TaskStatus: completed
 Task scope: user "4. 修" (BUG-EN-CONTROL-PORT-REGISTER).

@@ -14,6 +14,13 @@
 
 ## Active
 
+### F-REPORT-UNREACHABLE-EN — 读路径与 flush 屏障也上报连不上的 EN
+- **Trigger** (2026-10-02 用户): "并且系统的heartbeat也有问题：ps的上报也应该有dead en的情况" → 解释现状（只有追加失败上报）后 "3. 同意更多的地方可以报考失败"。
+- **Scope**: PS 的 StreamClient 在读路径（副本 failover、单 key 读、EC 分片读）和 flush 屏障放弃某副本时，若是连接失败且能确定节点，就向 manager 发 `MSG_REPORT_DISK_FAILURE`；每节点每 30 s 至多一次。不知道哪个副本失败的路径不上报。manager 端处理不变。
+- **Acceptance**: 单测：屏障对连接被拒的副本失败两次，模拟 manager 只收到一条 (node, extent, reporter) 报告；去掉上报或去掉限流即红。stream lib 与读路径相关集成测试绿。
+- `passes: true`
+- **notes** (2026-10-02): `note_unreachable` = `forget_node_addr` + `report_unreachable`（每节点 30 s 冷却），用于三处读路径与屏障放弃副本时（仅 `is_connect_failure` 且已知槽位）。单测恰一条 (1, 7, 9)；消融（不上报 / 不冷却）各红。stream lib 224；system_extent_failover、system_extent_recovery、system_crash_mid_flush 绿。评审（fable）无阻塞；已采纳文档更正：换了地址的节点会在首次连旧地址被拒时被报一次，单个多分区 PS 即可凑够 manager 法定数，效果是磁盘被标离线、至多到下一次 df（2 s）；默认 `fenced_only` 不触发重建，旧 `auto_disk` 会（追加路径的上报本来就如此）；握手超时也算连接失败；限量靠冷却而非通道容量。
+
 ### BUG-EN-CONTROL-PORT-REGISTER — EN 注册控制地址忽略 --control-port
 - **Trigger** (2026-10-02 用户): "忽略 --control-port是什么意思？" → 解释后 "4. 修"。
 - **Scope**: EN 向 manager 注册的控制地址用 `--control-port`（给了时），否则 advertise 端口 + 1000；多 shard 与单 shard 两条注册路径一致。

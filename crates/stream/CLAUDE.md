@@ -1540,6 +1540,30 @@ and from other crates' CLAUDE.md); do not renumber.
     predates the rework and was lost in the first rewrite of this note; it is
     load-bearing, not a nicety.
 
+    **The same sites tell the manager.** All three call `note_unreachable`
+    (forget + `report_unreachable`), and so does the flush barrier when it gives
+    up on a replica it cannot connect to. `report_unreachable` sends
+    `MSG_REPORT_DISK_FAILURE` through the client's drainer, at most once per
+    node per `NODE_ADDR_FORGET_COOLDOWN` (a read path can meet a dead node
+    thousands of times a second; the manager counts one report per reporter
+    per window). Before, only a failed APPEND reported (`try_report_failure` in
+    the worker), so a node that only readers or the barrier could not reach
+    went unreported. Only a connect failure (`is_connect_failure`, which also
+    covers a handshake that timed out) on a KNOWN slot reports:
+    `forget_unreachable_replicas`, which does not know which replica failed,
+    forgets but never reports, so a node not tied to the failure is never named.
+    A node that MOVED is named once per client per cooldown, on the first
+    refusal at its stale address, and reads touch every node, so one PS with
+    several partitions can reach the manager's quorum (distinct reporting
+    partitions in its window) by itself. Accepted: what the manager does with
+    a quorum is unchanged, it marks the node's disks offline
+    (`handle_report_disk_failure`), so allocation avoids the node until the
+    next successful df (2 s) puts them back online. Under the default
+    `fenced_only` recovery gate that starts no rebuild; the legacy `auto_disk`
+    gate rebuilds slots on an offline disk, and the same report already came
+    from failed appends. Tests:
+    `synced_barrier_tests::an_unreachable_replica_is_reported_once`.
+
     **Why a side effect and not a variant**: `ec_gather_collect` keeps only the
     LAST error, so a gather that hit both a dead address and a typed refusal is
     classified by whichever landed last — and a connect timeout arrives seconds
