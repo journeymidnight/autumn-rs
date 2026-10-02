@@ -25,7 +25,8 @@
 - **Trigger** (2026-10-02 用户): "autumn op层面要能包括extent的状态…dashboard也有对应的报警,比如ceph就包括说多少个pg怎么样了"。
 - **Scope**: manager 按 slot 归类（serving / behind / unreachable / fenced / corrupt / faulted disk / maintenance），按 extent 汇总可用份数与所需份数（clean / degraded / 无冗余 / 不可读 / recovering），给出 OK / WARN / ERR 与最差的若干 extent；新 manager 消息（只加 opcode）；`autumn-op health [--detail N] [--json]`；overview JSON 带汇总；dashboard 总览按严重度报警。
 - **Acceptance**: 归类与汇总有单测（每种状态、EC 所需份数、优先级）；真实进程下停一个副本节点后 `autumn-op health` 报 WARN 并列出该 extent，节点恢复后回到 OK；dashboard 渲染测试覆盖报警行。
-- `passes: false`
+- `passes: true`
+- **notes** (2026-10-02): `MSG_EXTENT_HEALTH_SUMMARY`(0x63，纯新增 opcode，不 bump)；`extent_health.rs` 的 `classify_slot` 是唯一归类（corrupt→fenced→disk-faulted→serving→maintenance→unreachable→behind），汇总 OK/WARN/ERR、各状态 slot 数、最差 extent；"degraded since" 在 60 s policy tick 刷新、换主清空。`autumn-op [--json] health [--detail N]`（误放的参数报错）；overview JSON 带 `extent_health`（null=未知）；dashboard Fleet 面板报警行。性能：借用一次、干净 extent 不物化，release 下 10 万 extent ~15 ms。测试：`extent_health_summary`（真实 EN，停副本节点 → ~4 s 内 WARN 点名该 extent，恢复 → OK；消融 reachable=true 变红）、单测 7 个（含状态数覆盖）、autumn-op 渲染、render_check.js（消融变红）、api_contract.sh（真实 etcd+manager+EN+PS+dashboard，断言 HEALTH_OK）。评审：fable×1（无高危；M1 性能已改，L1/L5/L6 已修，L2–L4 写进 ops.md）、opus×1 复核重写。
 
 ### F-EXTENT-REPAIR — 不等 fence，立即把 degraded 副本重建到别的节点（手动 + policy）
 - **Trigger** (2026-10-02 用户): "policy要能发现和修复…我们就应当是extent的状态不对了,然后就可以发起立即重建到别的节点的操作(不等待fenced)"。

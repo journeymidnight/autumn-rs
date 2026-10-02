@@ -29,7 +29,8 @@ via the shared `ConnPool`. RPC families:
   get_partition_detail, autopolicy_get/set (`0x54`/`0x55`).
 - **Node lifecycle**: list_node_states, fence_node, set_node_maintenance,
   clear_node_override, remove_node, recovery_stats, query_audit_log,
-  report_disk_failure, extent_health_report, list_ec_inflight_markers.
+  report_disk_failure, extent_health_report, extent_health_summary (`0x63`),
+  list_ec_inflight_markers.
 
 `extent_health_report` calls a slot unhealthy when its node is Suspected /
 Fenced / Maintenance, or when `avali` is clear **on a SEALED extent**. The
@@ -1503,6 +1504,44 @@ failure reason the fire-and-forget maintenance ops used to drop.
   path, no divergent sync/async behavior. `MSG_OP_SUBMIT` is leader- + admin-gated
   (`is_admin_mgr_msg`); `MSG_OP_QUERY` is leader-gated (a follower's ledger is
   empty).
+
+## Extent health (`extent_health.rs`)
+
+`MSG_EXTENT_HEALTH_SUMMARY` is the extent counterpart of Ceph's PG summary:
+`HEALTH_OK | WARN | ERR`, how many sealed extents are clean / degraded /
+without redundancy / unavailable / rebuilding, how many slots are in each
+`SLOT_STATE_*`, and the worst extents by name. One classification,
+`classify_slot(SlotFacts)`, serves the summary, the degraded clock and the
+repair policy, so they cannot disagree on what "degraded" means. Precedence
+(first match): corrupt → fenced → disk faulted (the copy is going away) →
+serving (node Online, disk not offline, `avali` set) → maintenance (expected
+back) → unreachable (node not Online or disk offline) → behind (node answers,
+bit clear). A maintenance node whose copy still serves is SERVING.
+
+An extent's verdict compares serving copies with what a read needs
+(`needed_copies`: 1 for a replicated extent — parity slots of an unconverted
+extent are full replicas — and the data-shard count for an EC one): fewer →
+unavailable (ERR), fewer than all → degraded (WARN), exactly `needed` → also
+"no redundancy left". Open tails are counted, not classified (no `avali`, and a
+writer rolls off a replica it cannot reach). Worst first: least margin above
+`needed`, then the longest degraded slot.
+
+Nothing here asks a node: it is the leader's own view (node states, the
+`disks/` online bit, `faulted_disks`, corrupt marks, recovery markers), built
+fresh per call — one pass over the store, cheaper than `extent_health_report`,
+which clones every extent: the per-node and per-slot facts are borrowed once
+per pass, and a clean extent is counted without being materialized (100 000
+sealed extents scan and summarize in ~15 ms in a release build). The "degraded since" clock (`slot_degraded_since`)
+is refreshed on the 60 s policy tick (which already walks the whole store) and
+is leader-local, emptied at promotion; a slot that recovers and degrades again
+between two ticks keeps its first time.
+
+Surfaced as `autumn-op [--json] health [--detail N]` and as the overview's
+`extent_health` field (`null` when the leader did not answer — the page says
+"unknown", never "healthy"), which the dashboard renders as alert rows. Test:
+`tests/extent_health_summary.rs` (a replica on a stopped node → WARN naming the
+extent and slot; back → OK; ablation: classify an unreachable node's copy as
+serving).
 
 ## Web dashboard (standalone app)
 

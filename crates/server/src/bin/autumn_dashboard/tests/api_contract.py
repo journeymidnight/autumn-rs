@@ -137,6 +137,10 @@ def run():
             assert capacity['logical_size'] == logical
             expected_amp = capacity['raw_used'] / logical if logical else 0
             assert abs(capacity['amplification'] - expected_amp) < 1e-12
+            health = v['extent_health']
+            assert health is not None, 'the leader answers the extent health summary'
+            assert health['status'] == 'HEALTH_OK' and health['unavailable'] == 0 and health['degraded'] == 0, health
+            assert {'sealed_extents','open_extents','clean','no_redundancy','recovering','degraded_bytes','slots_not_serving','problems'} <= health.keys()
             server = v['ps_servers'][0]
             assert {'ps_id','addr','last_heartbeat_secs_ago','partition_count','n','size','req_per_sec','write_bytes_per_sec','read_bytes_per_sec','total_extents','open_count','ready'} <= server.keys()
             assert server['last_heartbeat_secs_ago'] is not None and server['last_heartbeat_secs_ago'] < 60

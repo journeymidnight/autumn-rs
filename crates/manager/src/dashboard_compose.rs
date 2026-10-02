@@ -7,11 +7,14 @@
 use std::collections::HashMap;
 
 use autumn_rpc::manager_rpc::{
-    ClusterDfResp, GetClusterOverviewResp, ListNodeStatesResp, NodeCapWire, NodeStateEntry,
-    PolicyCandidate, CODE_OK, NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED,
-    NODE_AUTO_STATE_SUSPEND, NODE_OVERRIDE_FENCED, NODE_OVERRIDE_MAINTENANCE, POLICY_KIND_EC,
-    POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT,
-    POLICY_KIND_REBALANCE, POLICY_KIND_SPLIT,
+    ClusterDfResp, ExtentHealthSummaryResp, GetClusterOverviewResp, ListNodeStatesResp,
+    NodeCapWire, NodeStateEntry, PolicyCandidate, CODE_OK, HEALTH_ERR, HEALTH_OK, HEALTH_WARN,
+    NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED, NODE_AUTO_STATE_SUSPEND,
+    NODE_OVERRIDE_FENCED, NODE_OVERRIDE_MAINTENANCE, POLICY_KIND_EC, POLICY_KIND_GC,
+    POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT,
+    POLICY_KIND_REBALANCE, POLICY_KIND_SPLIT, SLOT_STATE_BEHIND, SLOT_STATE_CORRUPT,
+    SLOT_STATE_DISK_FAULTED, SLOT_STATE_FENCED, SLOT_STATE_MAINTENANCE, SLOT_STATE_SERVING,
+    SLOT_STATE_UNREACHABLE,
 };
 use serde_json::json;
 
@@ -52,6 +55,67 @@ fn node_override_kind_str(b: u8) -> &'static str {
     }
 }
 
+pub fn health_status_str(b: u8) -> &'static str {
+    match b {
+        HEALTH_OK => "HEALTH_OK",
+        HEALTH_WARN => "HEALTH_WARN",
+        HEALTH_ERR => "HEALTH_ERR",
+        _ => "HEALTH_UNKNOWN",
+    }
+}
+
+/// `SLOT_STATE_*` as the word `autumn-op health` and the page print.
+pub fn slot_state_str(b: u8) -> &'static str {
+    match b {
+        SLOT_STATE_SERVING => "serving",
+        SLOT_STATE_BEHIND => "behind",
+        SLOT_STATE_UNREACHABLE => "unreachable",
+        SLOT_STATE_MAINTENANCE => "maintenance",
+        SLOT_STATE_FENCED => "fenced",
+        SLOT_STATE_CORRUPT => "corrupt",
+        SLOT_STATE_DISK_FAULTED => "disk-faulted",
+        _ => "unknown",
+    }
+}
+
+/// The extent health summary as JSON: `autumn-op health --json` and the
+/// overview's `extent_health` field are this one shape.
+pub fn health_json(r: &ExtentHealthSummaryResp) -> serde_json::Value {
+    json!({
+        "status": health_status_str(r.status),
+        "sealed_extents": r.sealed_extents,
+        "open_extents": r.open_extents,
+        "clean": r.clean,
+        "degraded": r.degraded,
+        "no_redundancy": r.no_redundancy,
+        "unavailable": r.unavailable,
+        "recovering": r.recovering,
+        "degraded_bytes": r.degraded_bytes,
+        "slots_not_serving": r
+            .slot_counts
+            .iter()
+            .enumerate()
+            .filter(|(state, _)| *state != SLOT_STATE_SERVING as usize)
+            .map(|(state, n)| (slot_state_str(state as u8).to_string(), json!(n)))
+            .collect::<serde_json::Map<_, _>>(),
+        "problems": r.problems.iter().map(|p| json!({
+            "extent_id": p.extent_id,
+            "sealed_length": p.sealed_length,
+            "ec_converted": p.ec_converted,
+            "serving": p.serving,
+            "total": p.total,
+            "needed": p.needed,
+            "recovering": p.recovering,
+            "slots": p.slots.iter().map(|s| json!({
+                "slot": s.slot_index,
+                "node_id": s.node_id,
+                "state": slot_state_str(s.state),
+                "degraded_secs": s.degraded_secs,
+            })).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
 /// Advisory candidate → the structured `/api/action` payload the page's `Apply`
 /// button sends (or `None` for advisory-only / no target).
 fn candidate_to_action(c: &PolicyCandidate) -> Option<serde_json::Value> {
@@ -90,6 +154,7 @@ pub fn build_overview_json(
     mut ov: GetClusterOverviewResp,
     node_states: &ListNodeStatesResp,
     candidates: &[PolicyCandidate],
+    extent_health: Option<&ExtentHealthSummaryResp>,
     ts: i64,
 ) -> String {
     // Range-sort partitions: empty range_start (−∞) first, then bytewise.
@@ -312,6 +377,9 @@ pub fn build_overview_json(
         "total_write_bytes_per_sec": ov.total_write_bytes_per_sec,
         "total_read_bytes_per_sec": ov.total_read_bytes_per_sec,
         "advisories": advisories,
+        // `null` when the summary could not be read (off-leader, or a manager
+        // that predates it): the page then says "unknown", never "healthy".
+        "extent_health": extent_health.map(health_json),
         "errors": errors,
     })
     .to_string()
@@ -372,7 +440,7 @@ mod capacity_tests {
             nodes: Vec::new(),
         };
         let value: serde_json::Value =
-            serde_json::from_str(&build_overview_json(&df, overview, &states, &[], 0)).unwrap();
+            serde_json::from_str(&build_overview_json(&df, overview, &states, &[], None, 0)).unwrap();
         assert_eq!(value["df"]["raw_used"], 1_250);
         assert_eq!(value["df"]["logical_size"], 1_000);
         assert_eq!(value["df"]["amplification"], 1.25);

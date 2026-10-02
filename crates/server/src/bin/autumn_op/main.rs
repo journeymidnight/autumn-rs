@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{decode_err, ClusterClient, DEFAULT_RPC_TIMEOUT};
+use autumn_manager::dashboard_compose::{health_json, health_status_str, slot_state_str};
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc::{
     DiagPartitionVpReq, DiagPartitionVpResp, GetDiscardsReq, GetDiscardsResp,
@@ -405,6 +406,7 @@ async fn run(args: Args) -> Result<()> {
             node_filter,
             include_healthy,
         } => cmd_extent_health(&client, args.json, node_filter, include_healthy).await?,
+        Command::Health { max_problems } => cmd_health(&client, args.json, max_problems).await?,
         Command::ListEcMarkers => cmd_list_ec_markers(&client, args.json).await?,
         Command::RecoveryStats => cmd_recovery_stats(&client, args.json).await?,
         Command::AuditLog {
@@ -1143,6 +1145,95 @@ async fn cmd_extent_health(
     Ok(())
 }
 
+fn health_bytes(n: u64) -> String {
+    human_bytes_or_count(OP_KIND_RECOVERY, n)
+}
+
+/// The text form of `autumn-op health`, kept pure so a test can read it.
+fn render_health(r: &ExtentHealthSummaryResp) -> String {
+    let mut lines = vec![
+        health_status_str(r.status).to_string(),
+        format!(
+            "  extents: {} sealed, {} open (open tails are not classified)",
+            r.sealed_extents, r.open_extents
+        ),
+        format!(
+            "  {} clean, {} degraded ({}), {} with no redundancy left, {} unavailable, \
+             {} recovering",
+            r.clean,
+            r.degraded,
+            health_bytes(r.degraded_bytes),
+            r.no_redundancy,
+            r.unavailable,
+            r.recovering
+        ),
+    ];
+    let slots: Vec<String> = r
+        .slot_counts
+        .iter()
+        .enumerate()
+        .filter(|(state, n)| *state != SLOT_STATE_SERVING as usize && **n > 0)
+        .map(|(state, n)| format!("{n} {}", slot_state_str(state as u8)))
+        .collect();
+    if !slots.is_empty() {
+        lines.push(format!("  slots not serving: {}", slots.join(", ")));
+    }
+    if !r.problems.is_empty() {
+        lines.push("worst extents:".to_string());
+    }
+    for p in &r.problems {
+        let slots: Vec<String> = p
+            .slots
+            .iter()
+            .map(|s| {
+                // 0 = not yet measured: the clock moves on the 60 s policy tick.
+                let since = if s.degraded_secs > 0 {
+                    format!(" {}s", s.degraded_secs)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "slot{} node {} {}{since}",
+                    s.slot_index,
+                    s.node_id,
+                    slot_state_str(s.state),
+                )
+            })
+            .collect();
+        lines.push(format!(
+            "  extent {}  {}/{} serving (needs {}){}{}  {}  {}",
+            p.extent_id,
+            p.serving,
+            p.total,
+            p.needed,
+            if p.ec_converted { "  ec" } else { "" },
+            if p.recovering { "  recovering" } else { "" },
+            health_bytes(p.sealed_length),
+            slots.join("; ")
+        ));
+    }
+    lines.join("\n") + "\n"
+}
+
+async fn cmd_health(client: &ClusterClient, json: bool, max_problems: u32) -> Result<()> {
+    let bytes = client
+        .mgr_call(
+            MSG_EXTENT_HEALTH_SUMMARY,
+            rkyv_encode(&ExtentHealthSummaryReq { max_problems }),
+        )
+        .await?;
+    let r: ExtentHealthSummaryResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if r.code != CODE_OK {
+        bail!("health: {}", r.message);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&health_json(&r))?);
+    } else {
+        print!("{}", render_health(&r));
+    }
+    Ok(())
+}
+
 async fn cmd_list_ec_markers(client: &ClusterClient, json: bool) -> Result<()> {
     let bytes = client
         .mgr_call(
@@ -1543,6 +1634,27 @@ async fn cmd_overview(client: &ClusterClient) -> Result<()> {
     let node_states: ListNodeStatesResp = rkyv_decode(&ns_bytes).map_err(|e| anyhow!(e))?;
     // Advisories are leader-only + best-effort — an empty list is fine off-leader.
     let candidates = client.policy_candidates().await.unwrap_or_default();
+    // Extent health is leader-only too; `null` in the JSON when it is not
+    // available, which the page shows as unknown rather than as healthy.
+    let extent_health = match client
+        .mgr_call(
+            MSG_EXTENT_HEALTH_SUMMARY,
+            rkyv_encode(&ExtentHealthSummaryReq { max_problems: 10 }),
+        )
+        .await
+        .map_err(|e| anyhow!(e))
+        .and_then(|b| rkyv_decode::<ExtentHealthSummaryResp>(&b).map_err(|e| anyhow!(e)))
+    {
+        Ok(r) if r.code == CODE_OK => Some(r),
+        Ok(r) => {
+            eprintln!("extent health unavailable: {}", r.message);
+            None
+        }
+        Err(e) => {
+            eprintln!("extent health unavailable: {e:#}");
+            None
+        }
+    };
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1552,6 +1664,7 @@ async fn cmd_overview(client: &ClusterClient) -> Result<()> {
         ov,
         &node_states,
         &candidates,
+        extent_health.as_ref(),
         ts,
     );
     println!("{out}");
@@ -4033,6 +4146,51 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_renders_status_counts_and_the_worst_extent() {
+        let mut slot_counts = vec![0u64; 7];
+        slot_counts[SLOT_STATE_UNREACHABLE as usize] = 2;
+        let r = ExtentHealthSummaryResp {
+            code: CODE_OK,
+            status: HEALTH_WARN,
+            sealed_extents: 10,
+            open_extents: 3,
+            clean: 9,
+            degraded: 1,
+            no_redundancy: 1,
+            degraded_bytes: 64 << 20,
+            slot_counts,
+            problems: vec![ProblemExtent {
+                extent_id: 77,
+                sealed_length: 64 << 20,
+                ec_converted: false,
+                serving: 1,
+                total: 3,
+                needed: 1,
+                recovering: true,
+                slots: vec![ProblemSlot {
+                    slot_index: 1,
+                    node_id: 5,
+                    state: SLOT_STATE_UNREACHABLE,
+                    degraded_secs: 812,
+                }],
+            }],
+            ..Default::default()
+        };
+        let text = render_health(&r);
+        assert!(text.starts_with("HEALTH_WARN\n"), "{text}");
+        assert!(text.contains("9 clean, 1 degraded (64.0 MiB), 1 with no redundancy left"), "{text}");
+        assert!(text.contains("slots not serving: 2 unreachable"), "{text}");
+        assert!(
+            text.contains("extent 77  1/3 serving (needs 1)  recovering  64.0 MiB  slot1 node 5 unreachable 812s"),
+            "{text}"
+        );
+        let j = health_json(&r);
+        assert_eq!(j["status"], "HEALTH_WARN");
+        assert_eq!(j["slots_not_serving"]["unreachable"], 2);
+        assert_eq!(j["problems"][0]["slots"][0]["state"], "unreachable");
+    }
 
     fn region(part_id: u64, log: u64, row: u64, meta: u64) -> MgrRegionInfo {
         MgrRegionInfo {

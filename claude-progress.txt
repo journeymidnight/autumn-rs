@@ -1,3 +1,11 @@
+Date: 2026-10-02 (10)
+TaskStatus: completed
+Task scope: user "autumn op层面要能包括extent的状态 … dashboard也有对应的报警, 比如ceph就包括说多少个pg怎么样了" (F-EXTENT-HEALTH).
+Current summary: `autumn-op health` / overview `extent_health` / dashboard alert rows from one manager-side classification (`extent_health.rs`, MSG 0x63): OK/WARN/ERR, counts by state, worst extents named.
+Verification: see feature_list F-EXTENT-HEALTH notes.
+Main gaps: none for this task. F-EXTENT-REPAIR (repair op + policy) in progress: `extent_repair.rs` written, not wired, not committed.
+Next steps: F-EXTENT-REPAIR.
+
 Date: 2026-10-02 (9)
 TaskStatus: completed
 Task scope: user "我认为留一种模式就行, 1. fenced_only也要RE_AVALI" (F-RECOVERY-ONE-MODE); BUG-RECOVERY-PINNED-TARGET-TESTS (needed for rebuild-elsewhere verification).

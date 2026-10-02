@@ -72,9 +72,11 @@ erasure-coded, self-healing extents.
 - **Operable** — a **web dashboard** ([`autumn-dashboard`](crates/server/src/bin/autumn_dashboard/README.md),
   built with `autumn-server`) with tabs for keyspace, partitions, servers,
   nodes-and-disks, policy and logs, plus direct Start / Observe / Stop policy
-  controls; declarative bare-metal deployer (systemd), Kubernetes manifests, Prometheus
-  `/metrics`, `ceph df`-style capacity accounting, rolling restart with
-  convergence gates.
+  controls; `ceph -s`-style extent health (`autumn-op health`: how many extents
+  are clean, degraded, without redundancy or unreadable, and the worst ones by
+  name) with matching dashboard alerts; declarative bare-metal deployer
+  (systemd), Kubernetes manifests, Prometheus `/metrics`, `ceph df`-style
+  capacity accounting, rolling restart with convergence gates.
 
 ## Quick start
 

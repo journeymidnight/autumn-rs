@@ -307,6 +307,7 @@ impl AutumnManager {
             // ── operator-driven node lifecycle ──────────────────────
             MSG_LIST_NODE_STATES => self.handle_list_node_states(payload).await,
             MSG_EXTENT_HEALTH_REPORT => self.handle_extent_health_report(payload).await,
+            MSG_EXTENT_HEALTH_SUMMARY => self.handle_extent_health_summary(payload).await,
             MSG_LIST_EC_INFLIGHT_MARKERS => self.handle_list_ec_inflight_markers(payload).await,
             MSG_FENCE_NODE => self.handle_fence_node(payload).await,
             MSG_SET_NODE_MAINTENANCE => self.handle_set_node_maintenance(payload).await,
@@ -6059,6 +6060,26 @@ impl AutumnManager {
 
     pub async fn handle_list_node_states(&self, _payload: Bytes) -> HandlerResult {
         Ok(rkyv_encode(&self.compute_list_node_states_resp()))
+    }
+
+    /// `MSG_EXTENT_HEALTH_SUMMARY` — counts by state and the worst extents
+    /// (`extent_health`). Leader-gated: the degraded clocks and the node
+    /// states it reads are the leader's.
+    pub async fn handle_extent_health_summary(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ExtentHealthSummaryResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ..Default::default()
+            }));
+        }
+        let req: ExtentHealthSummaryReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let scan = self.extent_health_scan(Self::epoch_seconds());
+        Ok(rkyv_encode(&crate::extent_health::summarize(
+            scan,
+            req.max_problems as usize,
+        )))
     }
 
     pub async fn handle_extent_health_report(&self, payload: Bytes) -> HandlerResult {

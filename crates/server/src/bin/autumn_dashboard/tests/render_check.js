@@ -32,7 +32,7 @@ const ctx = { $: sel => ({ set innerHTML(v) { OUT[sel] = v; } }) };
 const src = [escLine, constLine("jsAttr"), constLine("BYTE_KINDS"),
              constLine("COUNT_UNIT"), lift("fmtBytes"), lift("fmtProgress"), lift("agoStr"), lift("psHealth"),
              lift("diskRow"), lift("hotColdAdvisory"), lift("advRow"), lift("opsTarget"), lift("opsAgo"),
-             lift("nodeAddr"), lift("extChip"),
+             lift("nodeAddr"), lift("extChip"), lift("extentHealthRows"), lift("extentHealthBad"),
              lift("renderLiveOps"), lift("renderOpsHistory")].join("\n");
 const now = Math.floor(Date.now() / 1000);
 let PURE = {};
@@ -53,6 +53,20 @@ OUT2.hotcoldBoth = advRow({kind:"hotcold", primary_part_id:8, secondary_part_id:
                            reason:"ps_id=2 qps_ratio=12 hot=[8, 9] cold=[4] size_ratio=20 hot=[8] cold=[4, 5]",
                            desc:"", action:null});
 OUT2.jsattr = jsAttr("it's");
+OUT2.ehDegraded = extentHealthRows({status:"HEALTH_WARN", sealed_extents:10, degraded:2, no_redundancy:1,
+  unavailable:0, recovering:1, degraded_bytes:134217728,
+  problems:[{extent_id:77, serving:1, total:3, needed:1, recovering:true,
+             slots:[{slot:1, node_id:5, state:"unreachable", degraded_secs:812},
+                    {slot:2, node_id:6, state:"behind", degraded_secs:0}]}]});
+OUT2.ehErr = extentHealthRows({status:"HEALTH_ERR", sealed_extents:4, degraded:0, no_redundancy:0,
+  unavailable:1, recovering:0, degraded_bytes:1,
+  problems:[{extent_id:9, serving:3, total:6, needed:4, recovering:false,
+             slots:[{slot:3, node_id:2, state:"unreachable", degraded_secs:60}]}]});
+OUT2.ehClean = extentHealthRows({status:"HEALTH_OK", sealed_extents:4, degraded:0, no_redundancy:0,
+  unavailable:0, recovering:0, degraded_bytes:0, problems:[]});
+OUT2.ehUnknown = extentHealthRows(null);
+OUT2.ehBad = [extentHealthBad(undefined), extentHealthBad(null),
+              extentHealthBad({degraded:0, unavailable:0}), extentHealthBad({degraded:1, unavailable:0})];
 // A CoW split's shared extent, and a private one. The chip must NAME the other
 // holders: refs=2 alone cannot tell an operator that collecting here frees
 // nothing until part 19 collects too.
@@ -129,6 +143,19 @@ want(PURE.disks, 'class="pill bad"', "faulted is styled as a fault");
 want(d, "#5", "a registry disk the node never described is listed");
 want(d, "not reported", "…and is named as not reported, not as offline");
 if (/#5[^#]*0 B/.test(d)) { console.error("FAIL: an unreported disk renders a fake 0-byte capacity"); bad++; }
+
+// Extent health: the counts an operator acts on, and the extent to look at.
+const ehd = text(PURE.ehDegraded);
+want(ehd, "2 extents degraded (128.0 MiB), 1 with no redundancy left", "degraded row counts and sizes");
+want(ehd, "extent 77 1/3 serving (rebuilding): slot1 node 5 unreachable", "…and names the worst extent and slot");
+want(ehd, "slot2 node 6 behind", "every non-serving slot is named");
+want(PURE.ehDegraded, "var(--bad)", "no redundancy left is styled as bad");
+want(ehd, "1 extent rebuilding", "a running rebuild is shown");
+want(text(PURE.ehErr), "1 extent unavailable — fewer serving copies than a read needs", "an unreadable extent is an error");
+want(text(PURE.ehErr), "extent 9 3/6 serving", "…named with its shard count");
+wantEq(PURE.ehClean, "", "a clean summary raises nothing");
+want(text(PURE.ehUnknown), "Extent health unknown", "an unread summary is unknown, never healthy");
+wantEq(PURE.ehBad.join(","), "false,true,false,true", "the all-clear line needs a summary that says clean");
 
 // An advisory's reason can be a whole sentence; the row must lead with the
 // action and keep the reasoning, not truncate one into the other.

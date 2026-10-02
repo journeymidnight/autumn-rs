@@ -4807,6 +4807,61 @@ On a live cluster, `autumn-op extent-health` lists a behind slot as
 `could not catch a behind copy up in place` with the reason (retried with
 backoff, cap 300 s).
 
+## Extent health at a glance (`autumn-op health`)
+
+`autumn-op health` answers what `ceph -s` answers for placement groups: is
+every sealed extent fully replicated, and if not, which ones are worst.
+
+    autumn-op --cluster-secret-file $SECRET --manager $MGR health        # --json goes before `health`
+    HEALTH_WARN
+      extents: 812 sealed, 21 open (open tails are not classified)
+      810 clean, 2 degraded (128.0 MiB), 1 with no redundancy left, 0 unavailable, 1 recovering
+      slots not serving: 2 unreachable, 1 behind
+    worst extents:
+      extent 77  1/3 serving (needs 1)  recovering  64.0 MiB  slot1 node 5 unreachable 812s; slot2 node 6 behind
+
+- `HEALTH_ERR` — some extent has fewer serving copies than a read needs (1 for
+  a replicated extent, the data-shard count for an EC one).
+- `HEALTH_WARN` — some extent is short a copy but every extent can be read.
+- slot states: `behind` (node answers, copy missed the seal — caught up in
+  place automatically), `unreachable` (node not Online or disk offline),
+  `maintenance`, `fenced`, `corrupt`, `disk-faulted` (the last three are being
+  rebuilt automatically).
+- `--detail N` names the N worst extents (default 10); `--json` is the shape
+  the dashboard reads (`/api/overview` → `extent_health`). The seconds after
+  each slot are how long this leader has seen it not serving, measured on the
+  60 s policy tick and restarted at a leader change.
+
+It is the leader's own view, not a poll of the nodes, which has three
+consequences worth knowing:
+- One `df` that times out (5 s) marks that node's disks offline at once, so
+  its slots read `unreachable` and the summary turns `HEALTH_WARN` until the
+  next successful `df` — a loaded node can flicker WARN for a few seconds
+  while `list-nodes` still says Online.
+- Right after a leader change, until each node's first `df` reaches the new
+  leader (about 15 s), a dead node's copies still read as serving.
+- `fenced`, `corrupt` and `disk-faulted` count as not serving even when the
+  copy still answers reads (they are being moved off), so `HEALTH_ERR` can mean
+  "every copy of this extent is going away", not only "unreadable now".
+
+The dashboard's Overview → Fleet panel turns the same summary into alert rows
+(red: unavailable or no redundancy left; amber: degraded; green: rebuilding).
+
+Verify:
+
+    cargo test -p autumn-manager --lib extent_health
+    cargo test -p autumn-manager --test extent_health_summary
+    cargo test -p autumn-server --bin autumn-op health
+    node crates/server/src/bin/autumn_dashboard/tests/render_check.js
+    crates/server/src/bin/autumn_dashboard/tests/api_contract.sh
+
+`extent_health_summary` stops the node holding one replica of a sealed RF 3
+extent: within seconds the summary is `HEALTH_WARN` and names that extent,
+`2/3 serving`, with the node's slot `unreachable`; restarting the node brings
+it back to `HEALTH_OK`. Ablation: make `classify_slot` treat every node as
+reachable — the test times out waiting for `HEALTH_WARN`. `render_check.js`
+fails if the degraded row is not rendered (ablation: skip that row).
+
 ## A corrupt EC source yields to recovery instead of burning 24 retries
 
 Rot on an extent that is also mid-EC-conversion used to deadlock the two

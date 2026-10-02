@@ -333,6 +333,9 @@ impl AutumnManager {
     pub(crate) fn forget_node_health_facts_of_the_previous_term(&self) {
         self.node_max_free.borrow_mut().clear();
         self.faulted_disks.borrow_mut().clear();
+        // The degraded clocks too: a slot this term has not looked at has not
+        // been seen degraded by it.
+        self.slot_degraded_since.borrow_mut().clear();
     }
 
     /// Has THIS leader term applied a `df` from this node, or is it only

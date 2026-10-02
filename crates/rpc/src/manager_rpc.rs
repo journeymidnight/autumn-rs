@@ -1679,6 +1679,105 @@ pub struct ExtentHealthResp {
     pub extents: Vec<ExtentHealth>,
 }
 
+// --- ExtentHealthSummary ---
+
+/// How many sealed extents are in each health state, and the worst ones by
+/// name — the extent counterpart of Ceph's placement-group summary.
+///
+/// A message of its own rather than fields on `ExtentHealthReport`: that one
+/// lists every unhealthy extent with all its slots, which is what an operator
+/// wants about ONE node, and not what a status line polled every few seconds
+/// can afford on a large cluster.
+pub const MSG_EXTENT_HEALTH_SUMMARY: u8 = 0x63;
+
+/// Overall verdict. OK: every sealed extent has every copy serving. WARN: some
+/// extent is short a copy but every extent can still be read. ERR: some extent
+/// has fewer serving copies than a read needs.
+pub const HEALTH_OK: u8 = 0;
+pub const HEALTH_WARN: u8 = 1;
+pub const HEALTH_ERR: u8 = 2;
+
+/// What one slot of a SEALED extent is doing. Append-only; the numeric values
+/// are frozen. Evaluated in this order, first match wins: a corrupt mark, a
+/// fenced node and a faulted disk say the copy is going away whatever else is
+/// true of it; then a copy that serves is SERVING; a maintenance node's copy
+/// that does not serve is MAINTENANCE (expected back); a node that does not
+/// answer, or a disk marked offline, is UNREACHABLE; what remains has a node
+/// that answers but an `avali` bit that is clear, which is BEHIND.
+pub const SLOT_STATE_SERVING: u8 = 0;
+pub const SLOT_STATE_BEHIND: u8 = 1;
+pub const SLOT_STATE_UNREACHABLE: u8 = 2;
+pub const SLOT_STATE_MAINTENANCE: u8 = 3;
+pub const SLOT_STATE_FENCED: u8 = 4;
+pub const SLOT_STATE_CORRUPT: u8 = 5;
+pub const SLOT_STATE_DISK_FAULTED: u8 = 6;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentHealthSummaryReq {
+    /// At most this many problem extents, worst first. 0 = counts only.
+    pub max_problems: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ProblemSlot {
+    pub slot_index: u32,
+    pub node_id: u64,
+    /// `SLOT_STATE_*`, never SERVING.
+    pub state: u8,
+    /// How long this leader has seen the slot not serving, in seconds. The
+    /// clock is the leader's own and restarts at a leader change.
+    pub degraded_secs: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ProblemExtent {
+    pub extent_id: u64,
+    pub sealed_length: u64,
+    pub ec_converted: bool,
+    /// Slots in `SLOT_STATE_SERVING`.
+    pub serving: u32,
+    /// Every slot: replicas, or data + parity shards.
+    pub total: u32,
+    /// Serving copies a read needs: 1 for a replicated extent, the data-shard
+    /// count for an EC one.
+    pub needed: u32,
+    /// A rebuild of one of its slots is in flight.
+    pub recovering: bool,
+    /// Only the slots that are not serving.
+    pub slots: Vec<ProblemSlot>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentHealthSummaryResp {
+    pub code: u8,
+    pub message: String,
+    /// `HEALTH_*`.
+    pub status: u8,
+    pub sealed_extents: u64,
+    /// Open tails are not classified: an open extent carries no `avali` bits,
+    /// and a writer rolls off a replica it cannot reach.
+    pub open_extents: u64,
+    /// Every copy serving.
+    pub clean: u64,
+    /// Some copy not serving, still readable (includes `no_redundancy`).
+    pub degraded: u64,
+    /// Degraded with exactly `needed` copies serving: one more loss and it
+    /// cannot be read.
+    pub no_redundancy: u64,
+    /// Fewer serving copies than a read needs.
+    pub unavailable: u64,
+    /// Extents with a rebuild in flight, whatever their state.
+    pub recovering: u64,
+    /// Σ `sealed_length` over degraded and unavailable extents.
+    pub degraded_bytes: u64,
+    /// Non-serving slots of sealed extents, indexed by `SLOT_STATE_*`
+    /// (index 0, SERVING, is always 0). A reader must accept a longer vector.
+    pub slot_counts: Vec<u64>,
+    /// Worst first: unavailable, then fewest copies above `needed`, then
+    /// longest degraded.
+    pub problems: Vec<ProblemExtent>,
+}
+
 // --- ListEcInflightMarkers ---
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]

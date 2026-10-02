@@ -2,6 +2,7 @@ pub mod audit;
 pub mod authz;
 pub mod ec_abandon;
 mod extent_corrupt;
+mod extent_health;
 mod extent_delete;
 pub mod extent_inflight;
 mod extent_layout;
@@ -724,6 +725,10 @@ pub struct AutumnManager {
     /// Slots proven to hold corrupt bytes, per extent (see `extent_corrupt`).
     /// Distinct from a clear `avali` bit, which cannot say WHY a slot is out.
     pub(crate) extent_corrupt_slots: Rc<RefCell<HashMap<u64, u32>>>,
+    /// When this leader first saw each `(extent, slot)` of a sealed extent
+    /// not serving (`extent_health`), epoch seconds. Refreshed on the policy
+    /// tick; leader-local, emptied at promotion.
+    pub(crate) slot_degraded_since: Rc<RefCell<HashMap<(u64, u32), i64>>>,
     /// #6: per-partition split-in-flight guard (in-memory; single-threaded
     /// manager). `handle_multi_modify_split` inserts `part_id` before its
     /// (possibly slow) etcd txn and removes it on completion via a RAII guard.
@@ -1078,6 +1083,7 @@ impl AutumnManager {
             inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
             extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
             extent_corrupt_slots: Rc::new(RefCell::new(HashMap::new())),
+            slot_degraded_since: Rc::new(RefCell::new(HashMap::new())),
             op_log_seq: Cell::new(0),
             op_log_writes_since_gc: Cell::new(0),
             split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
@@ -1521,6 +1527,7 @@ impl AutumnManager {
             let state_snapshot: crate::store::MetadataState = (*self.store.inner.borrow()).clone();
             // Recompute the full advisory cache for this tick (prune + all five
             // advisory passes + cache write) under a single policy borrow.
+            self.refresh_slot_degraded_since(now);
             let cands = self.recompute_advisory_cache(&state_snapshot, &last_op, &owners, now);
             if !cands.is_empty() {
                 tracing::info!("policy: {} candidate(s)", cands.len());

@@ -22,6 +22,8 @@ fn usage() -> ! {
     eprintln!();
     eprintln!("read / observability commands:");
     eprintln!("  list-nodes                   show every EN's auto-state + override");
+    eprintln!("  health [--detail N]          extent health summary: OK / WARN / ERR, counts by");
+    eprintln!("                               state, and the N worst extents (default 10)");
     eprintln!("  extent-health [--node ID] [--all]");
     eprintln!("                               per-slot health (default: only unhealthy)");
     eprintln!("  list-ec-markers              ConvertToEc inflight markers + coord state");
@@ -269,6 +271,10 @@ pub(crate) enum Command {
     ExtentHealth {
         node_filter: Vec<u64>,
         include_healthy: bool,
+    },
+    /// Extent health summary; `max_problems` worst extents are named.
+    Health {
+        max_problems: u32,
     },
     ListEcMarkers,
     RecoveryStats,
@@ -657,6 +663,29 @@ pub(crate) fn parse() -> Args {
                 node_filter,
                 include_healthy,
             }
+        }
+        "health" => {
+            let mut max_problems = 10u32;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--detail" => {
+                        i += 1;
+                        max_problems = val(&raw, i).parse().unwrap_or_else(|_| usage());
+                        i += 1;
+                    }
+                    // `--json` is a global flag and goes BEFORE the subcommand;
+                    // an unknown token here must not silently become a plain
+                    // `health` with exit 0.
+                    other => {
+                        eprintln!(
+                            "health: unexpected argument {other:?} (global flags such as \
+                             --json go before the subcommand)"
+                        );
+                        usage()
+                    }
+                }
+            }
+            Command::Health { max_problems }
         }
         "list-ec-markers" => Command::ListEcMarkers,
         "recovery-stats" => Command::RecoveryStats,

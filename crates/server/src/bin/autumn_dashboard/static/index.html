@@ -446,6 +446,7 @@ let SEL_PS=null;     // scope: null = all servers, else ps_id
 let SEL_PS_CARD=null;// Servers tab: which PS the drawer describes
 let SEL_NODE=null;   // Nodes tab: which node the drawer describes
 let ADVISORIES=[];
+let EXTENT_HEALTH;   // undefined = not loaded yet; null = the leader did not answer
 let LIVE_OPS=[];
 const ROWH=36;
 const PSCOLORS={};
@@ -589,6 +590,33 @@ function isNodeUnhealthy(n){
   if(n.online===false) return true;
   return (n.disks||[]).some(d=>d.reported===false||d.faulted||!d.online);
 }
+// Extent health as alert rows, worst first. The summary counts SEALED extents
+// by how many copies still serve: ERR when some extent has fewer than a read
+// needs, WARN when some extent is short a copy. `null` is not "healthy" — the
+// summary could not be read — and says so.
+function extentHealthRows(eh){
+  if(eh===undefined) return "";
+  if(eh===null) return `<div class="adv"><span class="sev" style="background:var(--warn)"></span>
+      <span class="d">Extent health unknown<span class="why">the leader did not answer the summary</span></span></div>`;
+  const rows=[];
+  const worst=(eh.problems||[]).slice(0,5).map(p=>
+    `extent ${p.extent_id} ${p.serving}/${p.total} serving${p.recovering?" (rebuilding)":""}: `+
+    (p.slots||[]).map(s=>`slot${s.slot} node ${s.node_id} ${s.state}${s.degraded_secs?" "+agoStr(s.degraded_secs):""}`).join(", ")
+  ).join("; ");
+  if(eh.unavailable>0) rows.push(`<div class="adv"><span class="sev" style="background:var(--bad)"></span>
+      <span class="d">${eh.unavailable} extent${eh.unavailable>1?"s":""} unavailable — fewer serving copies than a read needs
+      <span class="why">${esc(worst)}</span></span></div>`);
+  if(eh.degraded>0) rows.push(`<div class="adv"><span class="sev" style="background:var(${eh.no_redundancy>0?"--bad":"--warn"})"></span>
+      <span class="d">${eh.degraded} extent${eh.degraded>1?"s":""} degraded (${fmtBytes(eh.degraded_bytes)})${eh.no_redundancy>0?`, ${eh.no_redundancy} with no redundancy left`:""}
+      ${eh.unavailable>0?"":`<span class="why">${esc(worst)}</span>`}</span></div>`);
+  if(eh.recovering>0) rows.push(`<div class="adv"><span class="sev" style="background:var(--ok)"></span>
+      <span class="d">${eh.recovering} extent${eh.recovering>1?"s":""} rebuilding</span>
+      <button class="btn xs" onclick="setTab('logs')">Logs</button></div>`);
+  return rows.join("");
+}
+function extentHealthBad(eh){
+  return eh===null || (eh!==undefined && (eh.unavailable>0 || eh.degraded>0));
+}
 function psHealth(p){
   const s=p.last_heartbeat_secs_ago;
   if(s==null) return {cls:"unknown", text:"no heartbeat seen"};
@@ -615,7 +643,9 @@ function renderOverviewTab(){
       <span class="m">disks <b>${NODES.reduce((a,n)=>a+(n.disks||[]).length,0)}</b></span>
       <span class="m">partition servers <b>${PS_SERVERS.length}</b></span>
       <span class="m">partitions <b>${PARTS.length}</b></span>
+      ${EXTENT_HEALTH?`<span class="m">sealed extents <b>${EXTENT_HEALTH.sealed_extents}</b></span>`:""}
     </div>
+    ${extentHealthRows(EXTENT_HEALTH)}
     ${bad.length?`<div class="adv"><span class="sev" style="background:var(--bad)"></span>
       <span class="d">${bad.length} node${bad.length>1?"s":""} not fully healthy
       <span class="why">${esc(bad.map(n=>"node "+n.node_id+" ("+(n.auto_state||"?")+")").join(", "))}</span></span>
@@ -631,7 +661,7 @@ function renderOverviewTab(){
       <span class="d">${openingPs.length} partition server${openingPs.length>1?"s":""} not serving every partition assigned
       <span class="why">${esc(openingPs.map(p=>"PS "+p.ps_id+" — "+psOpenText(p)).join(", "))}</span></span>
       <button class="btn xs" onclick="setTab('servers')">Servers</button></div>`:""}
-    ${(!bad.length&&!badDisks.length&&!latePs.length&&!openingPs.length)?'<div class="empty">Every node, disk and server is reporting.</div>':""}`;
+    ${(!bad.length&&!badDisks.length&&!latePs.length&&!openingPs.length&&!extentHealthBad(EXTENT_HEALTH))?'<div class="empty">Every node, disk and server is reporting, and every sealed extent has every copy.</div>':""}`;
 
   const df=(window.__df)||{};
   const pct = df.raw_total ? (100*df.raw_used/df.raw_total) : 0;
@@ -1092,6 +1122,7 @@ async function overview(){
   PS_SERVERS = s.ps_servers||[];
   PS_SERVERS.forEach(r=>psColor(r.ps_id));
   ADVISORIES = s.advisories||[];
+  EXTENT_HEALTH = s.extent_health===undefined ? null : s.extent_health;
   // default scope: first server (drill-in by default); keep the user's choice on refresh
   if(SEL_PS!==null && !PS_ROLL.some(r=>r.ps_id===SEL_PS)) SEL_PS=null;
   if(SEL_PS===null && PS_ROLL.length>1 && !window.__pickedAll && PARTS.length>0) SEL_PS = PS_ROLL[0].ps_id;
