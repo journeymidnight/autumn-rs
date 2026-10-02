@@ -1,3 +1,11 @@
+Date: 2026-10-02 (4)
+TaskStatus: completed
+Task scope: user "1. 修复 2. EN的话，retry几次后还不行…上报flush失败…" + "如果PS在drain的阶段，等待flush 失败，那就直接退出就行" (BUG-SYNC-BARRIER-REDIAL; Python docstring fix).
+Current summary: the flush durability barrier gives up on a replica after 3 failed queries in a row instead of redialing it every 2 ms for 30 s; a drain then exits at once with the data left in the WAL; the background flush loop retries every 2 s. Python connect docstrings, fs read comment corrected; manager_retry_tests gets #[cfg(test)].
+Verification: see feature_list BUG-SYNC-BARRIER-REDIAL notes (unit + ablation, real-process drain, 11 flush/EN-failure integration targets). Review: fable, no high; doc fixes applied.
+Main gaps (user to decide): runtime flush wedges while an EN is dead (barrier needs every replica of the old WAL extent; manager never auto-fences) — options: barrier needs only live replicas once the extent is sealed, or re-append the values; PS reports dead ENs only on append failures (not barrier/read), and reports never trigger recovery; EN registers control_address = port + 1000 ignoring --control-port.
+Next steps: wait for the user's choice.
+
 Date: 2026-10-02 (3)
 TaskStatus: completed
 Task scope: user "auth_hello应该改明成client_auth" → "是AUTH_CLIENT吗？没改吗？" (REN-CLIENT-AUTH).

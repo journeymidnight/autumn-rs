@@ -364,9 +364,10 @@ async fn fill_region(
         })
         .collect();
     // `direct_read` sends the ≥ 64 KiB whole-extent gets STRAIGHT
-    // to an EN (`get_many_direct`), bypassing the PS on the data path; each item
-    // falls back to the PS proxy on any direct-read failure, so it's safe even if
-    // some ENs are unreachable. Default OFF ⇒ the PS-proxied bulk path
+    // to an EN (`get_many_direct`), bypassing the PS on the data path; a failed
+    // item falls back to the PS proxy, so it's safe even if some ENs are
+    // unreachable. An EN refusing the credential is the exception: that item
+    // fails with PermissionDenied. Default OFF ⇒ the PS-proxied bulk path
     // (`get_many_into`).
     let results = if direct_read {
         client.get_many_direct(&mut items).await

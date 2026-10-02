@@ -578,6 +578,17 @@ the commit path.**
   replicas synced past `vp_offset` (was quorum-min). On a healthy cluster this
   is already satisfied because the append acked all-replicas; worst case it
   waits one coalesce window. Flush is background → invisible to clients.
+  It polls every `synced_poll` (2 ms) for up to `synced_timeout` (30 s) only
+  while replicas ANSWER but have not synced far enough. A replica that cannot
+  be queried (dead, unreachable, refusing) fails the barrier after
+  `SYNCED_QUERY_ATTEMPTS` (3) failed queries in a row: polling it at the
+  coalescer cadence only redialed it ~500 times a second for the full 30 s, and
+  a dead node does not return within the wait. The flush then fails; a drain
+  exits with the unflushed writes left in the WAL, and the background flush
+  loop retries on `FLUSH_RETRY_BACKOFF` (2 s). The retry asks the same replicas
+  (cached `ExtentInfo`), so the dead one stays required until it returns, or
+  until recovery replaces it and the cache entry is evicted.
+  Test: `synced_barrier_tests`.
 - **Manager-side seal/commit** (`handle_stream_alloc_extent` /
   `handle_check_commit_length`) take `min` over the REACHABLE COMMITTED members
   only (catching-up = in-flight Recovery, excluded), requiring only `floor` of

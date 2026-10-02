@@ -14,6 +14,13 @@
 
 ## Active
 
+### BUG-SYNC-BARRIER-REDIAL — flush 屏障对连不上的副本每 2 ms 重连 30 s
+- **Trigger** (2026-10-02 用户): "EN的话，retry几次后还不行，因为不会出现PEER_AUTH的情况，所以就上报flush失败，上面sst会重新allocate 健康的extent重新flush"；"如果PS在drain的阶段，等待flush 失败，那就直接退出就行"。附带："Python 注释过时 → 修复"。
+- **Scope**: `StreamClient::await_extent_synced_to` 对查询失败（连不上 / 超时 / 拒绝）的副本连续失败若干次即返回错误（flush 失败），不再按 2 ms 轮询到 30 s；“已应答但未同步到位”的等待不变。drain 时 flush 失败即退出（数据留在 WAL）。修正 Python `Client.connect` / `Fs.connect` 注释。
+- **Acceptance**: 单测：副本只接受即关闭时屏障在 3 次拨号内报错、远小于 30 s；去掉修复即红。真进程：PS 收到 SIGTERM、EN 已停时 drain 立刻报 flush 失败并退出。flush / EN 故障相关集成测试绿。
+- `passes: true`
+- **notes** (2026-10-02): `await_extent_synced_to` 每个副本连续 3 次查询失败（`SYNCED_QUERY_ATTEMPTS`）即带上下文返回错误；`Ok(None)` / `Ok(Some)` 清零计数；“应答但未同步到位”仍按 2 ms / 30 s。屏障是 flush 的第一步，提前失败只会让 flush 多失败、不会发布 VP 未落盘的 SST；所有失败路径都释放 claim（评审核过）。重试仍查缓存的副本集（`ExtentInfo` 缓存不在此路径失效），死副本在恢复或 recovery 替换并失效缓存前一直被要求。顺带：`manager_retry_tests` 补 `#[cfg(test)]`（正式构建的 dead_code 警告）；Python `Client.connect` / `Fs.connect` 与 `crates/fs/src/read.rs` 注释更正；`python/Cargo.lock` 补上集群密钥提交漏掉的依赖。验证：单测恰 3 次拨号、< 5 s，消融（不放弃）红；真进程 SIGTERM + EN 已停：drain 约 4 ms 报 flush 失败并正常退出（原先在屏障里 30 s）；stream lib 223；manager 集成 bug_flush_timeout_leak、fence_flush_invariant、system_crash_mid_flush、system_extent_failover、system_extent_recovery、system_flush_race_vp_head、system_compact_unflushed_vp_head、system_row_truncate_queued_flush、system_recovery_vp_seed、system_restart_replay_cursor、system_ps_recovery 全绿。评审（fable）无高危；已采纳：文档不再声称重试会重新拉取副本集、Python 异常措辞、fs 注释。未做（待用户定）：运行中 EN 死后屏障失败导致的 flush 卡住（需 EN 恢复或运维 fence）；屏障 / 读失败不上报 `REPORT_DISK_FAILURE`；EN 注册控制地址忽略 `--control-port`。
+
 ### REN-CLIENT-AUTH — 客户端凭证 opcode 改名 AUTH_HELLO → CLIENT_AUTH
 - **Trigger** (2026-10-02 用户): "所以现在内部rpc是先protocol_hello + peer_auth, 外部rpc是protocol_hello +auth_hello? 那么这么看auth_hello应该改明成client_auth，区分外部还是内部请求" → "是AUTH_CLIENT吗？没改吗？"
 - **Scope**: 只改代码 / 测试 / 文档 / CLAUDE.md 中的名字（`MSG_CLIENT_AUTH`、`ClientAuthReq` / `ClientAuthResp`、`CLIENT_AUTH_MAX_PAYLOAD`）；opcode 数值与消息结构不变，不升 WIRE_VERSION；历史账本不改。

@@ -1089,6 +1089,12 @@ const STREAM_SUBMIT_CAP: usize = 256;
 const OPEN_TAIL_COMMIT_RETRIES: u32 = 3;
 const OPEN_TAIL_COMMIT_BACKOFF_MS: u64 = 300;
 
+/// Failed queries in a row after which the flush durability barrier gives up
+/// on a replica (`await_extent_synced_to`): enough to ride over a connection
+/// that has to be re-established, few enough that a dead node fails the flush
+/// at once and the flush loop's own backoff paces the next try.
+const SYNCED_QUERY_ATTEMPTS: u32 = 3;
+
 // env-reading helpers `stream_inflight_cap()`,
 // `append_fanout_timeout()`, `read_chunk_bytes()` removed. Values live
 // on `StreamClientConfig` (defined below) — set once at construction,
@@ -3965,9 +3971,8 @@ impl StreamClient {
     /// code), and `Err` only on transport / decode failure.
     async fn synced_length_on_replica(&self, addr: &str, extent_id: u64) -> Result<Option<u64>> {
         let req = SyncedLengthReq { extent_id };
-        // 5 s — atomic load of `entry.coalescer.last_synced` on EN.
-        // Quorum-aware caller (`await_log_synced_to`) tolerates per-
-        // replica failure, so the bound is generous.
+        // 5 s — atomic load of `entry.coalescer.last_synced` on EN; a replica
+        // that does not answer within it counts as one failed query.
         let resp_bytes = self
             .pool
             .call_timeout(
@@ -4001,11 +4006,17 @@ impl StreamClient {
     /// `max(last_synced, sealed_length)`, so this trivially succeeds
     /// against sealed sources.
     ///
-    /// Polls every `AUTUMN_STREAM_SYNCED_POLL_MS` (default 2 ms — matches
-    /// the coalescer cadence), bounded by
-    /// `AUTUMN_STREAM_SYNCED_TIMEOUT_MS` (default 30 s). Returns
-    /// `Err` if the wait times out (expected only on a stuck disk / dead
-    /// majority).
+    /// Polls every `synced_poll` (default 2 ms — matches the coalescer
+    /// cadence), bounded by `synced_timeout` (default 30 s): that wait is for
+    /// a replica that answers but has not synced far enough yet. A replica
+    /// that cannot be queried at all (dead, unreachable, refusing) is a
+    /// different case: polling it at the coalescer's cadence only redials it
+    /// hundreds of times a second, and a dead node does not come back within
+    /// the wait. After `SYNCED_QUERY_ATTEMPTS` failed queries in a row the
+    /// barrier returns that error, the flush fails, and the partition's flush
+    /// loop retries it on its own backoff. The retry asks the same replicas
+    /// (the cached `ExtentInfo`), so the dead one stays required until it
+    /// returns, or until recovery replaces it and the cache entry is evicted.
     ///
     /// `min_offset == 0` is a no-op fast path; the caller can pass
     /// `imm.max_vp_offset` and we trivially return Ok if the imm carried
@@ -4031,12 +4042,27 @@ impl StreamClient {
         let required = total;
 
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let mut failed = vec![0u32; total];
         loop {
             let mut covered: usize = 0;
-            for addr in &addrs {
+            for (i, addr) in addrs.iter().enumerate() {
                 match self.synced_length_on_replica(addr, extent_id).await {
-                    Ok(Some(synced)) if synced >= min_offset => covered += 1,
-                    _ => {}
+                    Ok(Some(synced)) => {
+                        failed[i] = 0;
+                        if synced >= min_offset {
+                            covered += 1;
+                        }
+                    }
+                    Ok(None) => failed[i] = 0,
+                    Err(e) => {
+                        failed[i] += 1;
+                        if failed[i] >= SYNCED_QUERY_ATTEMPTS {
+                            return Err(e.context(format!(
+                                "await_extent_synced_to: replica {addr} of extent {extent_id} \
+                                 could not be queried {SYNCED_QUERY_ATTEMPTS} times in a row"
+                            )));
+                        }
+                    }
                 }
             }
             if covered >= required {
@@ -7398,6 +7424,7 @@ mod worker_lifecycle_tests {
     }
 }
 
+#[cfg(test)]
 mod manager_retry_tests {
     use super::*;
 
@@ -7751,6 +7778,58 @@ mod manager_retry_tests {
             2,
             "exactly one rotation per failure (NOT_LEADER must not double-rotate)"
         );
+    }
+}
+
+#[cfg(test)]
+mod synced_barrier_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// A client that already knows extent 7 lives on node 1 at `addr`, so the
+    /// barrier needs no manager.
+    fn client_for(addr: &str) -> Rc<StreamClient> {
+        let sc = manager_retry_tests::test_client(1);
+        sc.nodes_cache.insert(1, (addr.to_string(), Vec::new()));
+        sc.extent_info_cache.insert(
+            7,
+            ExtentInfo {
+                extent_id: 7,
+                replicates: vec![1],
+                eversion: 1,
+                ..Default::default()
+            },
+        );
+        sc
+    }
+
+    /// A replica that cannot be queried fails the barrier after
+    /// `SYNCED_QUERY_ATTEMPTS` dials, instead of being redialed every poll
+    /// until the 30 s wait runs out.
+    #[compio::test]
+    async fn an_unreachable_replica_fails_the_barrier_after_a_few_queries() {
+        // Accepts and closes: every query fails at the handshake.
+        let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let dials = Rc::new(Cell::new(0u32));
+        let counted = dials.clone();
+        compio::runtime::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                counted.set(counted.get() + 1);
+                drop(socket);
+            }
+        })
+        .detach();
+
+        let sc = client_for(&addr);
+        let started = Instant::now();
+        let e = sc
+            .await_extent_synced_to(7, 4096)
+            .await
+            .expect_err("a replica that never answered satisfied the barrier");
+        assert!(format!("{e:#}").contains(&addr), "{e:#}");
+        assert_eq!(dials.get(), SYNCED_QUERY_ATTEMPTS);
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 }
 

@@ -126,8 +126,10 @@ impl Fs {
     /// `direct_read=True` makes whole-value reads (≥ 64 KiB)
     /// bypass the PS and read straight from an extent node (`get_many_direct`) —
     /// a cross-host throughput win for fsspec model/dataset serving. TOPOLOGY-
-    /// DEPENDENT (this host must reach EN data ports), default False; each read
-    /// falls back to the PS proxy on any direct-read failure.
+    /// DEPENDENT (this host must reach EN data ports), default False; a failed
+    /// direct read falls back to the PS proxy, except an extent node refusing
+    /// the credential, which fails the read with a `RuntimeError` naming the
+    /// permission denial.
     ///
     /// `principal=` + `credential=` (both or neither) attach an
     /// authz identity, exactly like `Client`/`BatchClient` and the native

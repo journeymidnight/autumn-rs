@@ -436,19 +436,20 @@ struct Client {
 
 #[pymethods]
 impl Client {
-    /// Async classmethod: `await Client.connect("127.0.0.1:9001")`.
+    /// Async classmethod: `await Client.connect("127.0.0.1:9001", "kvc")`.
     /// Spawns the compio worker thread, performs the cluster handshake,
     /// then resolves the returned future with a connected `Client` instance.
     ///
-    /// (D6-mem wiring): pass `tenant=` + `credential=`
-    /// (bytes, from `autumn-op tenant-create`) to bind the connection to a
-    /// tenant credential — the client then sends CLIENT_AUTH on each PS
-    /// connection with a short-TTL token (auto-minted + renewed by the SDK) scoped to
-    /// the tenant's granted prefixes. Required once `mem/` (or any prefix
-    /// this client writes) is enforcement-enabled; harmless against a
-    /// cluster with authz off. Both-or-neither: a lone tenant or lone
-    /// credential is a config error and fails loudly here rather than as a
-    /// confusing first-write PermissionDenied.
+    /// `principal=` + `credential=` (both or neither) attach an authz
+    /// identity: `credential` is RAW bytes (hex-decode the
+    /// `autumn-op principal-create` output first — see
+    /// `autumn_kvcache._identity.read_credential_file`), `principal` its
+    /// owner. The client then sends CLIENT_AUTH, with a short-TTL token the
+    /// SDK mints and renews, on each PS connection and each extent-node
+    /// direct-read connection. Required once a prefix this client touches is
+    /// protected; harmless against a cluster with authz off. A lone principal
+    /// or lone credential is a config error and fails loudly here rather than
+    /// as a confusing first-write PermissionDenied.
     // `scope` is the REQUIRED key prefix — the client
     // PREPENDS `{scope}/` to every key (Prepend-only, scope locked by
     // construction). A scope is a whole namespace (`kvc`) or an in-namespace
