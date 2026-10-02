@@ -50,6 +50,8 @@ fn usage() -> ! {
     eprintln!("                               (--presplit RETIRED — use `presplit --namespace <NS>` after bootstrap)");
     eprintln!("  set-stream-ec --stream <ID> --ec K+M");
     eprintln!("  force-ec-convert --extent <EXTID>");
+    eprintln!("  repair <EXTID>... | --node <NODE_ID>");
+    eprintln!("                               rebuild degraded copies on other nodes now, no fence");
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
     eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (presplit EMPTY keyspace before loading)");
     eprintln!("           fs: --lanes <N> [--parts <P>] [--force to narrow declared lanes]");
@@ -358,6 +360,12 @@ pub(crate) enum Command {
         stream_id: u64,
         ec_data: u32,
         ec_parity: u32,
+    },
+    /// Rebuild degraded slots elsewhere now: of these extents, or (empty) of
+    /// every extent with a degraded slot on `node`.
+    Repair {
+        extents: Vec<u64>,
+        node: Option<u64>,
     },
     ForceEcConvert {
         extent_id: u64,
@@ -1243,6 +1251,34 @@ pub(crate) fn parse() -> Args {
                 ec_data,
                 ec_parity,
             }
+        }
+        "repair" => {
+            let mut extents: Vec<u64> = Vec::new();
+            let mut node: Option<u64> = None;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--node" => {
+                        i += 1;
+                        node = Some(val(&raw, i).parse().unwrap_or_else(|_| {
+                            eprintln!("--node requires a node id");
+                            usage()
+                        }));
+                        i += 1;
+                    }
+                    tok => {
+                        extents.push(tok.parse().unwrap_or_else(|_| {
+                            eprintln!("repair: {tok:?} is not an extent id");
+                            usage()
+                        }));
+                        i += 1;
+                    }
+                }
+            }
+            if extents.is_empty() == node.is_none() {
+                eprintln!("repair takes extent ids OR --node <NODE_ID>");
+                usage();
+            }
+            Command::Repair { extents, node }
         }
         "force-ec-convert" => {
             let mut extent_id: Option<u64> = None;

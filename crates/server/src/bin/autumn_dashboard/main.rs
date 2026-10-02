@@ -159,7 +159,7 @@ fn passthrough(out: String, ok: bool) -> Response<Body> {
     }
 }
 
-const SWITCH_ORDER: [&str; 6] = ["split", "ec", "compact", "gc", "merge", "rebalance"];
+const SWITCH_ORDER: [&str; 7] = ["split", "ec", "compact", "gc", "merge", "rebalance", "repair"];
 
 /// `autumn-op auto-policy status --json` speaks its own shape; the page's
 /// contract (the one the manager used to serve) differs. Translate: `mode`
@@ -201,7 +201,7 @@ fn reshape_policies(out: String, ok: bool) -> Response<Body> {
                         "max_actions": p.get("max_actions").cloned().unwrap_or(serde_json::json!(0)),
                         "switches": {
                             "split": g(0), "ec": g(1), "compact": g(2),
-                            "gc": g(3), "merge": g(4), "rebalance": g(5),
+                            "gc": g(3), "merge": g(4), "rebalance": g(5), "repair": g(6),
                         },
                     })
                 })
@@ -394,6 +394,7 @@ async fn action(cfg: &Config, body: Bytes) -> Response<Body> {
     let u64f = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
     let action = v.get("action").and_then(|x| x.as_str()).unwrap_or("");
     let (part, victim, extent) = (u64f("part_id"), u64f("victim_part_id"), u64f("extent_id"));
+    let node = u64f("node_id");
     // Trust boundary: only known verbs, ids validated non-zero, mapped to argv.
     let args: Vec<String> = match action {
         "split" if part > 0 => vec!["split".into(), part.to_string()],
@@ -410,6 +411,10 @@ async fn action(cfg: &Config, body: Bytes) -> Response<Body> {
             ]
         }
         "rebalance" => vec!["rebalance".into()],
+        // Rebuild on other nodes now: one extent's degraded slots, or every
+        // degraded slot on one node.
+        "repair" if extent > 0 => vec!["repair".into(), extent.to_string()],
+        "repair" if node > 0 => vec!["repair".into(), "--node".into(), node.to_string()],
         _ => {
             return json_resp(
                 StatusCode::BAD_REQUEST,

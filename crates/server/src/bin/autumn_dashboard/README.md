@@ -42,7 +42,7 @@ without the secret — read-only views included.
 |-------|------|
 | `GET /api/overview` | `autumn-op overview` (df + nodes with per-disk rows + partitions + ps_servers + amplification + advisories + extent health) |
 | `GET /api/partition/{id}` | `autumn-op info --part {id} --detail` |
-| `POST /api/action` | maps `{action, part_id, …}` → `split` / `gc` / `compact` / `merge` / `force-ec-convert` / `rebalance` |
+| `POST /api/action` | maps `{action, part_id, …}` → `split` / `gc` / `compact` / `merge` / `force-ec-convert` / `rebalance` / `repair <extent>` / `repair --node <id>` |
 | `GET /api/policies` | `autumn-op auto-policy status` (reshaped to the page's schema) |
 | `GET /api/ops` | `autumn-op ops list --active` + `ops history` → `{live, history, history_error}` |
 | `POST /api/policies/activate` | `autumn-op auto-policy activate <name> [--arm]` / `deactivate` |
@@ -73,7 +73,7 @@ every one. The tab is in the URL hash (`#nodes`), so a view is linkable.
 
 | Tab | Answers |
 |-----|---------|
-| **Overview** | the keyspace ribbon (−∞ → +∞, one segment per partition, colored by owning PS), a fleet health roll-up with extent alerts (unavailable / degraded / no redundancy left / rebuilding, naming the worst extents), space + amplification, the top advisories, and what is running |
+| **Overview** | the keyspace ribbon (−∞ → +∞, one segment per partition, colored by owning PS), a fleet health roll-up with extent alerts (unavailable / degraded / no redundancy left / rebuilding, naming the worst extents, with a Repair button for the worst readable one), space + amplification, the top advisories, and what is running |
 | **Partitions** | which partition — PS-scoped list + the lazy detail drawer |
 | **Servers** | which partition server — every REGISTERED PS with its heartbeat, load and partitions |
 | **Nodes** | which disk — every extent node with a per-disk table (capacity, online, faulted) |

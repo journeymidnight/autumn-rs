@@ -3,6 +3,7 @@ pub mod authz;
 pub mod ec_abandon;
 mod extent_corrupt;
 mod extent_health;
+mod extent_repair;
 mod extent_delete;
 pub mod extent_inflight;
 mod extent_layout;
@@ -66,6 +67,7 @@ fn op_kind_audit_code(kind: u8) -> u8 {
         OP_KIND_GC => AUDIT_OP_GC,
         OP_KIND_FORCE_GC => AUDIT_OP_FORCE_GC,
         OP_KIND_EC_CONVERT => AUDIT_OP_FORCE_EC_CONVERT,
+        OP_KIND_REPAIR => AUDIT_OP_REPAIR,
         _ => 0,
     }
 }
@@ -729,6 +731,17 @@ pub struct AutumnManager {
     /// not serving (`extent_health`), epoch seconds. Refreshed on the policy
     /// tick; leader-local, emptied at promotion.
     pub(crate) slot_degraded_since: Rc<RefCell<HashMap<(u64, u32), i64>>>,
+    /// Slots someone decided to rebuild elsewhere now, per extent
+    /// (`extent_repair`, sibling key `extentRepair/<id>`).
+    pub(crate) extent_repair_slots: Rc<RefCell<HashMap<u64, u32>>>,
+    /// Serializes every writer of `extent_repair_slots` across its
+    /// read-modify-write AND its etcd write: they run on different tasks
+    /// (policy, op, dispatch tick, recovery apply), and two interleaved
+    /// snapshots lose a request or resurrect a withdrawn one.
+    pub(crate) extent_repair_lock: Rc<futures::lock::Mutex<()>>,
+    /// How long a slot must have been degraded before the repair policy
+    /// proposes moving it (`--repair-grace-secs`, default 600).
+    pub(crate) repair_grace_secs: Rc<Cell<u64>>,
     /// #6: per-partition split-in-flight guard (in-memory; single-threaded
     /// manager). `handle_multi_modify_split` inserts `part_id` before its
     /// (possibly slow) etcd txn and removes it on completion via a RAII guard.
@@ -836,6 +849,11 @@ pub struct AutumnManager {
     /// fenced, faulted disk), and a catch-up that succeeds must not clear a
     /// rebuild's backoff. Only its backoff half is used.
     pub(crate) catch_up_backoff: Rc<RefCell<crate::recovery_rate_limiter::RecoveryRateLimiter>>,
+    /// `(extent, slot)` whose node answered a catch-up that it does not have
+    /// the extent at all (`CODE_NOT_FOUND`): no catch-up can help, so a repair
+    /// request on it rebuilds elsewhere. Cleared by a catch-up that succeeds.
+    /// Leader-local.
+    pub(crate) catch_up_copy_gone: Rc<RefCell<HashSet<(u64, u32)>>>,
     /// ENOSPC-1: allocation soft-avoids nodes whose max per-disk free is
     /// below this (`--min-alloc-free-bytes`, default 256 MiB; 0 =
     /// disabled). Soft: select_nodes falls back to the full healthy set
@@ -1084,6 +1102,9 @@ impl AutumnManager {
             extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
             extent_corrupt_slots: Rc::new(RefCell::new(HashMap::new())),
             slot_degraded_since: Rc::new(RefCell::new(HashMap::new())),
+            extent_repair_slots: Rc::new(RefCell::new(HashMap::new())),
+            extent_repair_lock: Rc::new(futures::lock::Mutex::new(())),
+            repair_grace_secs: Rc::new(Cell::new(600)),
             op_log_seq: Cell::new(0),
             op_log_writes_since_gc: Cell::new(0),
             split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
@@ -1102,6 +1123,7 @@ impl AutumnManager {
             catch_up_backoff: Rc::new(RefCell::new(
                 crate::recovery_rate_limiter::RecoveryRateLimiter::default(),
             )),
+            catch_up_copy_gone: Rc::new(RefCell::new(HashSet::new())),
             min_alloc_free_bytes: Rc::new(Cell::new(DEFAULT_MIN_ALLOC_FREE_BYTES)),
             audit_retention_days: Rc::new(Cell::new(90)),
             displaced: Rc::new(Cell::new(true)),
@@ -1541,6 +1563,7 @@ impl AutumnManager {
                         autumn_rpc::manager_rpc::POLICY_KIND_MINOR_COMPACT => "MINOR_COMPACT",
                         autumn_rpc::manager_rpc::POLICY_KIND_EC => "EC",
                         autumn_rpc::manager_rpc::POLICY_KIND_REBALANCE => "REBALANCE",
+                        autumn_rpc::manager_rpc::POLICY_KIND_REPAIR => "REPAIR",
                         _ => "UNKNOWN",
                     };
                     tracing::info!(
@@ -1591,6 +1614,10 @@ impl AutumnManager {
         // fine today but is exactly the kind of nested-borrow that later grows
         // into a RefCell panic). Cheap: a handful of namespaces × a few points.
         let sacred = self.sacred_boundaries();
+        // Repair first: it reads the leader's own extent and node state, not
+        // the engine, so it is computed before the engine is borrowed — and a
+        // copy short is the most urgent thing on the list.
+        let mut repair = self.repair_candidates(now);
         let mut p = self.policy.borrow_mut();
         p.sacred_boundaries = sacred;
         // prune metrics for partitions that no longer exist
@@ -1604,6 +1631,8 @@ impl AutumnManager {
             region_owners: owners,
             now,
         });
+        repair.append(&mut cands);
+        let mut cands = repair;
         // maintenance (GC + major/minor compact) — windowed metrics only
         // (`last_gc_at` / `last_compact_at` come from the PS-reported buckets).
         cands.append(&mut p.compute_maintenance_advisory(now));
@@ -1629,8 +1658,9 @@ impl AutumnManager {
         // reason: the passes that know WHY the op is needed run first.
         let mut seen: HashSet<String> = HashSet::with_capacity(cands.len());
         cands.retain(|c| seen.insert(crate::auto_policy::cooldown_key(c)));
-        // Persist the union so MSG_GET_POLICY_CANDIDATES returns all 8 kinds
-        // (split, merge, gc, major_compact, hot_cold, minor_compact, ec, rebalance).
+        // Persist the union so MSG_GET_POLICY_CANDIDATES returns every kind
+        // (repair, split, merge, gc, major_compact, hot_cold, minor_compact,
+        // ec, rebalance).
         p.advisory_cache = cands.clone();
         p.advisory_cache_at = now;
         cands
@@ -1982,6 +2012,21 @@ impl AutumnManager {
                 }
                 Ok(())
             }
+            POLICY_KIND_REPAIR => {
+                let outcome = self
+                    .request_repair(
+                        &[],
+                        Some(cand.secondary_part_id),
+                        self.repair_grace_secs.get(),
+                        crate::extent_repair::RepairRequester::Policy,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                if outcome.requested_slots == 0 {
+                    anyhow::bail!("nothing to repair on node {} now", cand.secondary_part_id);
+                }
+                Ok(())
+            }
             POLICY_KIND_REBALANCE => {
                 // Phase B: move a BOUNDED batch per tick so a
                 // concentrated cluster converges gradually (the target PSes take
@@ -2210,6 +2255,27 @@ impl AutumnManager {
                     Err((_, m)) => terminal_err(m),
                 }
             }
+            // Named extents, or (none named) every degraded slot on node
+            // `part_id`.
+            OP_KIND_REPAIR => match self
+                .request_repair(
+                    &spec.extent_ids,
+                    (spec.extent_ids.is_empty() && spec.part_id != 0).then_some(spec.part_id),
+                    0,
+                    crate::extent_repair::RepairRequester::Operator,
+                )
+                .await
+            {
+                // The op is the REQUEST: done once it is recorded. The
+                // rebuilds then run as recovery entries of their own.
+                Ok(outcome) if outcome.requested_slots > 0 => ActuationResult::Terminal {
+                    state: OP_STATE_SUCCEEDED,
+                    error: String::new(),
+                    message: outcome.describe(),
+                },
+                Ok(outcome) => terminal_err(outcome.describe()),
+                Err(e) => terminal_err(e.to_string()),
+            },
             OP_KIND_EC_CONVERT => {
                 let req = ForceEcConvertReq {
                     extent_id: spec.secondary_id,
@@ -2972,6 +3038,11 @@ impl AutumnManager {
         let extent_corrupt_raw = c
             .get_prefix(crate::extent_corrupt::EXTENT_CORRUPT_PREFIX)
             .await?;
+        // Repair requests: an operator's or the policy's decision to move a
+        // slot must survive the leader change, like the rebuild it schedules.
+        let extent_repair_raw = c
+            .get_prefix(crate::extent_repair::EXTENT_REPAIR_PREFIX)
+            .await?;
         // persistent operator overrides + decommissioned tombstones.
         let node_override_raw = c.get_prefix(NODE_OVERRIDE_PREFIX).await?;
         let decommissioned_raw = c.get_prefix(DECOMMISSIONED_PREFIX).await?;
@@ -3247,13 +3318,23 @@ impl AutumnManager {
             Self::decode_extent_layout_kvs(&extent_layout_raw.kvs)
                 .map_err(Self::replay_decode_err)?,
         );
-        self.install_replayed_corrupt_slots(Self::decode_extent_corrupt_kvs(
+        self.install_replayed_corrupt_slots(Self::decode_slot_bitmap_kvs(
             extent_corrupt_raw.kvs.iter().filter_map(|kv| {
                 let id =
                     Self::parse_id_from_key(crate::extent_corrupt::EXTENT_CORRUPT_PREFIX, &kv.key)
                         .ok()?;
                 Some((id, kv.value.as_slice()))
             }),
+            crate::extent_corrupt::EXTENT_CORRUPT_PREFIX,
+        ));
+        self.install_replayed_repair_slots(Self::decode_slot_bitmap_kvs(
+            extent_repair_raw.kvs.iter().filter_map(|kv| {
+                let id =
+                    Self::parse_id_from_key(crate::extent_repair::EXTENT_REPAIR_PREFIX, &kv.key)
+                        .ok()?;
+                Some((id, kv.value.as_slice()))
+            }),
+            crate::extent_repair::EXTENT_REPAIR_PREFIX,
         ));
         // rehydrate in-memory `delete_progress` from Delete-kind
         // ledger entries so the new leader's extent_delete_loop picks up
@@ -3693,6 +3774,13 @@ impl AutumnManager {
     /// `--min-alloc-free-bytes`; 0 disables the filter).
     pub fn set_min_alloc_free_bytes(&self, v: u64) {
         self.min_alloc_free_bytes.set(v);
+    }
+
+    /// Repair-policy grace (CLI `--repair-grace-secs`, default 600 — Ceph's
+    /// down→out interval): how long a slot must stay degraded before the
+    /// policy proposes rebuilding it on another node.
+    pub fn set_repair_grace_secs(&self, v: u64) {
+        self.repair_grace_secs.set(v);
     }
 
     /// Audit-log retention window (CLI `--audit-retention-days`; 0 = off).

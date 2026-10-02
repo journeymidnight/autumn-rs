@@ -32,7 +32,7 @@ const ctx = { $: sel => ({ set innerHTML(v) { OUT[sel] = v; } }) };
 const src = [escLine, constLine("jsAttr"), constLine("BYTE_KINDS"),
              constLine("COUNT_UNIT"), lift("fmtBytes"), lift("fmtProgress"), lift("agoStr"), lift("psHealth"),
              lift("diskRow"), lift("hotColdAdvisory"), lift("advRow"), lift("opsTarget"), lift("opsAgo"),
-             lift("nodeAddr"), lift("extChip"), lift("extentHealthRows"), lift("extentHealthBad"),
+             lift("nodeAddr"), lift("extChip"), lift("extentHealthRows"), lift("extentHealthBad"), lift("repairBtn"),
              lift("renderLiveOps"), lift("renderOpsHistory")].join("\n");
 const now = Math.floor(Date.now() / 1000);
 let PURE = {};
@@ -151,6 +151,13 @@ want(ehd, "extent 77 1/3 serving (rebuilding): slot1 node 5 unreachable", "…an
 want(ehd, "slot2 node 6 behind", "every non-serving slot is named");
 want(PURE.ehDegraded, "var(--bad)", "no redundancy left is styled as bad");
 want(ehd, "1 extent rebuilding", "a running rebuild is shown");
+// The worst problem is already rebuilding, so it gets no Repair button; a
+// readable, idle one does.
+if (PURE.ehDegraded.includes("Repair #")) { console.error("FAIL: a rebuilding extent offered a Repair button"); bad++; }
+const rb = new Function(src + `return repairBtn({problems:[{extent_id:9,serving:1,needed:1,recovering:false}]});`)();
+want(rb, 'action:"repair",extent_id:9', "a readable idle problem extent offers a Repair action");
+const rbNone = new Function(src + `return repairBtn({problems:[{extent_id:9,serving:0,needed:1,recovering:false}]});`)();
+wantEq(rbNone, "", "an unreadable extent has nothing to rebuild from — no button");
 want(text(PURE.ehErr), "1 extent unavailable — fewer serving copies than a read needs", "an unreadable extent is an error");
 want(text(PURE.ehErr), "extent 9 3/6 serving", "…named with its shard count");
 wantEq(PURE.ehClean, "", "a clean summary raises nothing");

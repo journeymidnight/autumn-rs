@@ -4862,6 +4862,54 @@ it back to `HEALTH_OK`. Ablation: make `classify_slot` treat every node as
 reachable — the test times out waiting for `HEALTH_WARN`. `render_check.js`
 fails if the degraded row is not rendered (ablation: skip that row).
 
+## Rebuilding degraded copies without a fence (`autumn-op repair`)
+
+The recovery loop moves a copy on its own only off a fenced node, a corrupt
+slot or a faulted disk — a node that stopped answering may be back in seconds.
+When it is not coming back soon, move its copies without fencing it:
+
+    autumn-op ... repair 77 81           # these extents' degraded slots
+    autumn-op ... repair --node 5        # every degraded slot on node 5
+    autumn-op ... --wait repair 77       # block until the request is recorded
+
+The op succeeds once the requests are recorded (`ops status` shows "requested
+a rebuild of N slot(s) on M extent(s)", plus what was skipped and why — a
+healthy or open extent, one with no copy left to read from); the rebuilds then
+run as `recovery` entries in `ops list`. Requests are persisted and survive a
+leader change; one is cleared when its rebuild lands, and WITHDRAWN when the
+slot's node answers again before that (the leader has heard its `df` since it
+took over) and its copy serves — so a node that comes back keeps the copies
+not yet moved, and a leader change alone withdraws nothing. A copy that is
+behind on a node that answers is caught up in place first; the request moves
+it only if the node answers that it has no such extent (a wiped node
+rejoined) — a slow or failing catch-up just retries.
+The node stays in the cluster (unlike fence); copies already moved stay moved.
+
+Automatically: the `repair` auto-policy switch (on in `maintenance`,
+`balanced` and `aggressive`) proposes one advisory per node whose slots have
+been degraded at least `--repair-grace-secs` (manager flag, default 600) —
+visible in `autumn-op policy-candidates` and the dashboard's Policy tab as
+`repair node N` — and, when the policy is Armed, records the requests itself
+(DryRun only logs "would: autumn-op repair --node N"). The dashboard's Fleet
+panel also offers a Repair button for the worst readable degraded extent.
+
+Verify:
+
+    cargo test -p autumn-manager --test extent_repair
+    cargo test -p autumn-manager --lib extent_repair
+    cargo test -p autumn-manager --lib auto_policy
+
+`extent_repair` runs three real-EN scenarios: an operator repair moves the copy
+of a stopped node onto the spare and the node is not fenced; a repair-only
+policy (grace 2 s) advises in DryRun without moving anything, then rebuilds
+when Armed; a request recorded on one leader is served by the next after a
+spare joins (real etcd, two managers); a node that returns before its requests
+could be served keeps its copies when the spare comes back. Ablations, each
+reddening exactly its scenario: make `slot_verdict` ignore `repair_requested`
+(the first three), make `install_replayed_repair_slots` drop what it replays
+(the failover one), make `repair_candidates` return nothing (the policy one),
+never withdraw a request (the returning-node one).
+
 ## A corrupt EC source yields to recovery instead of burning 24 retries
 
 Rot on an extent that is also mid-EC-conversion used to deadlock the two

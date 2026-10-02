@@ -1312,6 +1312,15 @@ pub const POLICY_KIND_EC: u8 = 6;
 /// from PartitionLoad. The armed auto-policy controller actuates it via
 /// `MSG_REBALANCE_REGIONS` with a bounded per-tick `max_moves`.
 pub const POLICY_KIND_REBALANCE: u8 = 7;
+/// Extent repair advisory: a NODE whose slots have stayed degraded (behind or
+/// unreachable — not fenced, corrupt or on a faulted disk, which rebuild on
+/// their own, and not in maintenance) for at least the manager's
+/// `--repair-grace-secs`. `primary_part_id = 0`; `secondary_part_id` = the node
+/// id; `size_bytes` = Σ `sealed_length` of the extents involved; `reason`
+/// names the count, the longest wait and how many have no redundancy left.
+/// Actuation records a repair request for each of those slots, which the
+/// recovery loop then rebuilds on another node — without fencing the node.
+pub const POLICY_KIND_REPAIR: u8 = 8;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PolicyCandidate {
@@ -1373,6 +1382,7 @@ pub fn policy_kind_names() -> Vec<(String, u8)> {
         ),
         ("POLICY_KIND_EC".to_string(), POLICY_KIND_EC),
         ("POLICY_KIND_REBALANCE".to_string(), POLICY_KIND_REBALANCE),
+        ("POLICY_KIND_REPAIR".to_string(), POLICY_KIND_REPAIR),
     ]
 }
 
@@ -1907,6 +1917,7 @@ pub const AUDIT_OP_REBALANCE: u8 = 9;
 pub const AUDIT_OP_COMPACT: u8 = 10;
 pub const AUDIT_OP_GC: u8 = 11;
 pub const AUDIT_OP_FORCE_GC: u8 = 12;
+pub const AUDIT_OP_REPAIR: u8 = 13;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrAuditEntry {
@@ -2380,6 +2391,12 @@ pub const OP_KIND_EC_CONVERT: u8 = 7;
 /// failure reason (`error` + `error_code`) was previously visible only in
 /// aggregate via `recovery-stats`.
 pub const OP_KIND_RECOVERY: u8 = 8;
+/// A request to rebuild degraded slots on other nodes NOW, without fencing
+/// their nodes (`autumn-op repair`): every degraded slot of the extents in
+/// `extent_ids` (`secondary_id` = the first), or — with `extent_ids` empty —
+/// every degraded slot on node `part_id`. Terminal as soon as the requests are
+/// recorded; the rebuilds themselves then appear as `OP_KIND_RECOVERY` entries.
+pub const OP_KIND_REPAIR: u8 = 9;
 
 /// Display name for an `OP_KIND_*`, next to the constants so the mapping has
 /// ONE definition — the manager logs it and the CLI renders it, and a label
@@ -2394,6 +2411,7 @@ pub fn op_kind_name(kind: u8) -> &'static str {
         OP_KIND_FORCE_GC => "forcegc",
         OP_KIND_EC_CONVERT => "ec-convert",
         OP_KIND_RECOVERY => "recovery",
+        OP_KIND_REPAIR => "repair",
         _ => "?",
     }
 }

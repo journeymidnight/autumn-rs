@@ -160,7 +160,7 @@ def run():
             assert {'op_id','kind','state','progress_done','progress_total','started_at','finished_at'} <= ops['history'][0].keys()
             # All switches off: safely exercise Armed without actuating maintenance.
             name = 'contract-\'"&policy'
-            switches = {k:False for k in ('split','ec','compact','gc','merge','rebalance')}
+            switches = {k:False for k in ('split','ec','compact','gc','merge','rebalance','repair')}
             for route, body in [('/api/policies/activate', {}), ('/api/policies/activate', {'enabled':'false'}),
                 ('/api/policies/activate', {'active':'--arm'}), ('/api/policies/delete', {'name':'--arm'}),
                 ('/api/policies/upsert', {'name':'bad','switches':switches,'max_actions':2**32}),

@@ -307,11 +307,14 @@ impl AutumnManager {
         *self.extent_corrupt_slots.borrow_mut() = decoded;
     }
 
-    /// Decode replayed `extentCorrupt/` values. A malformed value is DROPPED
-    /// rather than failing replay: losing a mark costs a missed rebuild, while
-    /// refusing leadership over one costs the whole cluster.
-    pub(crate) fn decode_extent_corrupt_kvs<'a>(
+    /// Decode replayed per-extent slot bitmaps (`extentCorrupt/`,
+    /// `extentRepair/`; `what` names the prefix in the warning). A malformed
+    /// value is DROPPED rather than failing replay: losing a mark costs a
+    /// missed rebuild, while refusing leadership over one costs the whole
+    /// cluster.
+    pub(crate) fn decode_slot_bitmap_kvs<'a>(
         kvs: impl Iterator<Item = (u64, &'a [u8])>,
+        what: &str,
     ) -> HashMap<u64, u32> {
         let mut out = HashMap::new();
         for (id, raw) in kvs {
@@ -324,7 +327,8 @@ impl AutumnManager {
                 tracing::warn!(
                     extent_id = id,
                     len = raw.len(),
-                    "malformed extentCorrupt value; dropping the mark"
+                    what,
+                    "malformed slot-bitmap value; dropping the mark"
                 );
             }
         }
@@ -342,7 +346,7 @@ mod tests {
         let five = [0u8; 5];
         let ok = 0b101u32.to_le_bytes();
         let zero = 0u32.to_le_bytes();
-        let decoded = AutumnManager::decode_extent_corrupt_kvs(
+        let decoded = AutumnManager::decode_slot_bitmap_kvs(
             [
                 (1u64, ok.as_slice()),
                 (2u64, three.as_slice()),
@@ -350,6 +354,7 @@ mod tests {
                 (4u64, zero.as_slice()),
             ]
             .into_iter(),
+            EXTENT_CORRUPT_PREFIX,
         );
         assert_eq!(decoded.get(&1).copied(), Some(0b101));
         assert!(!decoded.contains_key(&2), "3-byte value is malformed");

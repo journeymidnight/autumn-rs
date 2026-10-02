@@ -608,11 +608,18 @@ function extentHealthRows(eh){
       <span class="why">${esc(worst)}</span></span></div>`);
   if(eh.degraded>0) rows.push(`<div class="adv"><span class="sev" style="background:var(${eh.no_redundancy>0?"--bad":"--warn"})"></span>
       <span class="d">${eh.degraded} extent${eh.degraded>1?"s":""} degraded (${fmtBytes(eh.degraded_bytes)})${eh.no_redundancy>0?`, ${eh.no_redundancy} with no redundancy left`:""}
-      ${eh.unavailable>0?"":`<span class="why">${esc(worst)}</span>`}</span></div>`);
+      ${eh.unavailable>0?"":`<span class="why">${esc(worst)}</span>`}</span>${repairBtn(eh)}</div>`);
   if(eh.recovering>0) rows.push(`<div class="adv"><span class="sev" style="background:var(--ok)"></span>
       <span class="d">${eh.recovering} extent${eh.recovering>1?"s":""} rebuilding</span>
       <button class="btn xs" onclick="setTab('logs')">Logs</button></div>`);
   return rows.join("");
+}
+// Rebuild the worst readable problem extent's degraded copies on other nodes
+// now, without fencing its nodes (`autumn-op repair <extent>`). One button for
+// the worst; the repair policy, or `autumn-op repair --node N`, covers bulk.
+function repairBtn(eh){
+  const p=(eh.problems||[]).find(p=>p.serving>=p.needed && !p.recovering);
+  return p?`<button class="btn xs warn" onclick='act({action:"repair",extent_id:${Number(p.extent_id)}},"repair extent ${Number(p.extent_id)}")'>Repair #${Number(p.extent_id)}</button>`:"";
 }
 function extentHealthBad(eh){
   return eh===null || (eh!==undefined && (eh.unavailable>0 || eh.degraded>0));
@@ -1132,7 +1139,7 @@ async function overview(){
 }
 
 // ── policies / controller ────────────────────────────────────────────────────
-function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance"].map(k=>`<span class="sw-i ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
+function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance","repair"].map(k=>`<span class="sw-i ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
 // Hot/cold is a diagnosis, not an executable policy candidate. Turn its compact
 // wire-oriented reason into the decision an operator can actually make.
 function hotColdAdvisory(a){

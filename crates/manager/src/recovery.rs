@@ -386,6 +386,7 @@ impl AutumnManager {
                         self.node_overrides.borrow().contains_key(&task.replace_id),
                         self.slot_is_corrupt(extent_id, slot),
                         disk_faulted,
+                        self.slot_repair_requested(extent_id, slot),
                     );
                     s.nodes.contains_key(&task.replace_id)
                         && self.has_first_hand_df(task.replace_id)
@@ -1254,6 +1255,19 @@ impl AutumnManager {
         // corrupt mark that scheduled this rebuild has been satisfied. Clearing
         // it also stops the slot from being force-dispatched every tick.
         if let Some(slot) = Self::extent_slot(&updated_extent, task.node_id) {
+            // A repair request for the slot is satisfied the same way.
+            if let Err(e) = self
+                .clear_repair_slot(updated_extent.extent_id, slot)
+                .await
+            {
+                tracing::warn!(
+                    extent_id = updated_extent.extent_id,
+                    slot,
+                    error = %e,
+                    "rebuilt a slot with a repair request but could not clear the \
+                     request; it will be rebuilt again until the request clears"
+                );
+            }
             if let Err(e) = self
                 .clear_corrupt_slot(updated_extent.extent_id, slot)
                 .await
@@ -1362,6 +1376,13 @@ impl AutumnManager {
             Ok(resp) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
                 Err(e) => Err(format!("re_avali to {addr}: undecodable reply: {e}")),
                 Ok(r) if r.code != CODE_OK => {
+                    if r.code == autumn_rpc::extent_rpc::CODE_NOT_FOUND {
+                        // The node says it has no such extent: the copy is
+                        // gone, and no catch-up will bring it back.
+                        self.catch_up_copy_gone
+                            .borrow_mut()
+                            .insert((ex.extent_id, slot as u32));
+                    }
                     Err(format!("re_avali to {addr}: code {}: {}", r.code, r.message))
                 }
                 Ok(_) => Ok(()),
@@ -1376,6 +1397,9 @@ impl AutumnManager {
                 self.catch_up_backoff
                     .borrow_mut()
                     .record_success(ex.extent_id, slot32);
+                self.catch_up_copy_gone
+                    .borrow_mut()
+                    .remove(&(ex.extent_id, slot32));
                 if let Err(e) = self
                     .mark_extent_available(ex.extent_id, slot, node.node_id)
                     .await
@@ -1523,6 +1547,8 @@ impl AutumnManager {
             (extents, s.nodes.clone(), s.disks.clone())
         };
 
+        // Repair requests whose premise is gone, withdrawn after the pass.
+        let mut withdraw: HashMap<u64, u32> = HashMap::new();
         for ex in extents {
             let copies = Self::extent_nodes(&ex);
             for (slot, node_id) in copies.iter().copied().enumerate() {
@@ -1547,10 +1573,61 @@ impl AutumnManager {
                 let disk_faulted =
                     disk_id.is_some_and(|did| self.faulted_disks.borrow().contains(&did));
 
+                // A repair request is a decision about a copy that is NOT
+                // there, and its node coming back changes that (Ceph's mark-in
+                // to its down→out). Without this a node back after the grace
+                // period had its copies moved anyway: off to a spare it was
+                // never lost to, or, with no spare, pinned to a rebuild that
+                // can never find a target while the catch-up never ran.
+                //   - The copy SERVES again: the request is withdrawn.
+                //   - The copy is BEHIND on a replicated extent: the catch-up
+                //     below goes first and the request waits; once caught up
+                //     the copy serves and the request is withdrawn. Only when
+                //     the node answers a catch-up that it does not have the
+                //     extent at all (a wiped node rejoined) does the request
+                //     rebuild it elsewhere: a timeout or any other failure is
+                //     no evidence the copy is gone — a node just back, busy
+                //     catching up hundreds of extents, queues past the 30 s
+                //     timeout — and moving a copy that a retry would refill is
+                //     the very move this rule exists to prevent.
+                //
+                // Only on FIRST-HAND evidence: the node is registered, THIS
+                // leader term has applied a `df` from it, and its disk is
+                // reported online. Right after a promotion every replayed node
+                // reads Online and every disk `online: true` until its first
+                // `df` — a dead node included — and acting on that would drop
+                // every persisted request at each failover, the very thing
+                // persisting them is for. The same predicate guards
+                // `release_recovery_markers_for_healthy_slots`.
+                //
+                // Withdrawals are collected and written after the pass, in
+                // batches: a returning node can carry a request on every slot.
+                let node_online = self.node_states.borrow().state_of(node_id).is_online();
+                let mut repair_requested = self.slot_repair_requested(ex.extent_id, slot);
+                let answers_first_hand = node.is_some()
+                    && self.has_first_hand_df(node_id)
+                    && node_online
+                    && disk_online == Some(true);
+                if repair_requested && answers_first_hand {
+                    if (ex.avali & bit) != 0 {
+                        *withdraw.entry(ex.extent_id).or_insert(0) |= bit;
+                        repair_requested = false;
+                    } else if !ex.ec_converted
+                        && !self
+                            .catch_up_copy_gone
+                            .borrow()
+                            .contains(&(ex.extent_id, slot as u32))
+                    {
+                        repair_requested = false; // this tick: catch up first
+                    }
+                }
+
                 // ONE place decides whether the copy moves. It used to be
                 // three checks in a row whose ORDER was the bug: the gate
                 // returned before anything looked at the disk.
-                if slot_verdict(is_fenced, is_corrupt, disk_faulted) == SlotVerdict::Rebuild {
+                if slot_verdict(is_fenced, is_corrupt, disk_faulted, repair_requested)
+                    == SlotVerdict::Rebuild
+                {
                     // A slot whose rebuild keeps failing waits out its backoff.
                     if !self
                         .recovery_limiter
@@ -1584,7 +1661,6 @@ impl AutumnManager {
                 // slot available bumps the eversion that op pinned (a sibling
                 // slot's rebuild would be retired and started over). It runs
                 // once the op is done.
-                let node_online = self.node_states.borrow().state_of(node_id).is_online();
                 if (ex.avali & bit) == 0
                     && !ex.ec_converted
                     && node_online
@@ -1599,6 +1675,25 @@ impl AutumnManager {
                         self.start_catch_up(&ex, slot, n);
                     }
                 }
+            }
+        }
+
+        if !withdraw.is_empty() {
+            let withdraw: Vec<(u64, u32)> = withdraw.into_iter().collect();
+            match self.withdraw_repairs(&withdraw).await {
+                Ok(()) => tracing::info!(
+                    extents = withdraw.len(),
+                    slots = withdraw.iter().map(|(_, b)| b.count_ones()).sum::<u32>(),
+                    "repair requests withdrawn: their nodes answer again, and each copy \
+                     serves or is caught up in place"
+                ),
+                Err((done, e)) => tracing::warn!(
+                    done,
+                    of = withdraw.len(),
+                    error = %e,
+                    "could not withdraw every repair request whose node is back \
+                     (retried next tick)"
+                ),
             }
         }
 
@@ -1839,7 +1934,12 @@ pub(crate) enum SlotVerdict {
 /// was inline, which is how it came to be wrong in a way nothing could assert
 /// on: the gate returned BEFORE the per-disk health check, so a slot on a dead
 /// disk was never even considered.
-pub(crate) fn slot_verdict(fenced: bool, corrupt: bool, disk_faulted: bool) -> SlotVerdict {
+pub(crate) fn slot_verdict(
+    fenced: bool,
+    corrupt: bool,
+    disk_faulted: bool,
+    repair_requested: bool,
+) -> SlotVerdict {
     // A fenced node must have every slot moved off it — that is what fencing
     // is for. A slot a partition owner PROVED corrupt is rebuilt: the owner
     // replayed those bytes and found them wrong, and `re_avali` cannot repair
@@ -1863,6 +1963,12 @@ pub(crate) fn slot_verdict(fenced: bool, corrupt: bool, disk_faulted: bool) -> S
     // reported `online: true` and never lands here, which is what keeps a
     // cluster running low on space from rebuilding itself.
     if disk_faulted {
+        return SlotVerdict::Rebuild;
+    }
+    // Someone DECIDED to move this copy — an operator (`autumn-op repair`) or
+    // the repair policy after the slot stayed degraded past its grace period
+    // (`extent_repair`). The loop does not second-guess it.
+    if repair_requested {
         return SlotVerdict::Rebuild;
     }
     SlotVerdict::Keep
@@ -4211,7 +4317,7 @@ mod slot_verdict_tests {
     /// the data movement on a four-disk machine.
     #[test]
     fn a_dead_disk_is_rebuilt() {
-        assert_eq!(slot_verdict(false, false, true), SlotVerdict::Rebuild);
+        assert_eq!(slot_verdict(false, false, true, false), SlotVerdict::Rebuild);
     }
 
     /// A node that is merely unreachable — `MgrDiskInfo.online` false because a
@@ -4221,13 +4327,20 @@ mod slot_verdict_tests {
     /// merely-absent node does NOT trigger recovery") relies on it.
     #[test]
     fn an_unreachable_node_keeps_its_copies() {
-        assert_eq!(slot_verdict(false, false, false), SlotVerdict::Keep);
+        assert_eq!(slot_verdict(false, false, false, false), SlotVerdict::Keep);
+    }
+
+    /// An operator's or the policy's repair request moves the copy even
+    /// though nothing conclusive says it is lost.
+    #[test]
+    fn a_repair_request_is_rebuilt() {
+        assert_eq!(slot_verdict(false, false, false, true), SlotVerdict::Rebuild);
     }
 
     #[test]
     fn a_fenced_node_or_a_corrupt_slot_is_rebuilt() {
-        assert_eq!(slot_verdict(true, false, false), SlotVerdict::Rebuild);
-        assert_eq!(slot_verdict(false, true, false), SlotVerdict::Rebuild);
+        assert_eq!(slot_verdict(true, false, false, false), SlotVerdict::Rebuild);
+        assert_eq!(slot_verdict(false, true, false, false), SlotVerdict::Rebuild);
     }
 }
 
@@ -4308,7 +4421,7 @@ mod df_disk_health_tests {
             "…but says nothing about any individual disk"
         );
         assert_eq!(
-            slot_verdict(false, false, m.faulted_disks.borrow().contains(&10)),
+            slot_verdict(false, false, m.faulted_disks.borrow().contains(&10), false),
             SlotVerdict::Keep,
             "a node that missed a heartbeat must not have its data rebuilt"
         );
@@ -4316,11 +4429,11 @@ mod df_disk_health_tests {
         // (b) the node answers, and names one of its disks faulted.
         m.apply_df_disk_health(&node, &[(10, status(true)), (11, status(false))]);
         assert_eq!(
-            slot_verdict(false, false, m.faulted_disks.borrow().contains(&11)),
+            slot_verdict(false, false, m.faulted_disks.borrow().contains(&11), false),
             SlotVerdict::Rebuild
         );
         assert_eq!(
-            slot_verdict(false, false, m.faulted_disks.borrow().contains(&10)),
+            slot_verdict(false, false, m.faulted_disks.borrow().contains(&10), false),
             SlotVerdict::Keep,
             "its healthy sibling is untouched"
         );

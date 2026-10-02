@@ -18,7 +18,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use autumn_rpc::manager_rpc::{
     AutoPolicyLogEntry, MgrAutoPolicyConfig, MgrAutoPolicyCooldowns, MgrAutoPolicyEntry,
     PolicyCandidate, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_HOT_COLD, POLICY_KIND_MAJOR_COMPACT,
-    POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_SPLIT,
+    POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_REPAIR,
+    POLICY_KIND_SPLIT,
 };
 
 /// Rolling action-log cap (leader-local, in-memory — not persisted).
@@ -100,8 +101,8 @@ pub(crate) const COMPACT_MIN_ACTUATION_COOLDOWN_SEC: i64 = 60;
 /// Clamp a (possibly hostile / corrupted) custom policy entry to safe bounds —
 /// applied on every UPSERT and on every replay of a persisted config.
 pub(crate) fn sanitize_entry(e: &mut MgrAutoPolicyEntry) {
-    e.switches.truncate(6);
-    while e.switches.len() < 6 {
+    e.switches.truncate(SWITCHES);
+    while e.switches.len() < SWITCHES {
         e.switches.push(false);
     }
     e.interval_sec = e.interval_sec.clamp(2, MAX_INTERVAL_SEC);
@@ -188,18 +189,22 @@ impl AutoPolicyMode {
     }
 }
 
-// The 6 friendly UI switches, in order, are [split, ec, compact, gc, merge,
-// rebalance] (SWITCH_ORDER) — encoded positionally in MgrAutoPolicyEntry.switches
-// and consumed by kinds_from_switches + the dashboard switches_to_dict. The 6th
-// (rebalance, Phase B) was appended after the original 5; a
-// shorter persisted Vec (pre-Phase-B config) reads absent switches as off.
+// The friendly UI switches, in order, are [split, ec, compact, gc, merge,
+// rebalance, repair] (SWITCH_ORDER) — encoded positionally in
+// MgrAutoPolicyEntry.switches and consumed by kinds_from_switches + the
+// dashboard switches_to_dict. Switches are only ever APPENDED; a shorter
+// persisted Vec (a config written before a switch existed) reads the absent
+// switches as off.
+
+/// Number of switches (`SWITCH_ORDER`).
+pub(crate) const SWITCHES: usize = 7;
 
 /// Build a built-in preset (`builtin=true`, never persisted). Switches are
-/// [split, ec, compact, gc, merge, rebalance] per `SWITCH_ORDER`.
+/// [split, ec, compact, gc, merge, rebalance, repair] per `SWITCH_ORDER`.
 fn preset(
     name: &str,
     desc: &str,
-    switches: [bool; 6],
+    switches: [bool; SWITCHES],
     interval_sec: u64,
     cooldown_sec: u64,
     max_actions: u32,
@@ -217,13 +222,13 @@ fn preset(
 
 /// The built-in presets, safest → most aggressive (Python `PRESET_POLICIES`).
 pub(crate) fn preset_policies() -> Vec<MgrAutoPolicyEntry> {
-    // switches = [split, ec, compact, gc, merge, rebalance]
+    // switches = [split, ec, compact, gc, merge, rebalance, repair]
     vec![
-        preset("gc-only", "Reclaim space only (GC)", [false, false, false, true, false, false], 30, 120, 2),
-        preset("maintenance", "GC + compaction, no topology change", [false, false, true, true, false, false], 30, 180, 2),
-        preset("space-reclaim", "GC + auto-EC, space-first", [false, true, false, true, false, false], 20, 120, 3),
-        preset("balanced", "GC + compaction + EC + region rebalance (recommended steady-state)", [false, true, true, true, false, true], 30, 240, 2),
-        preset("aggressive", "Full auto: incl. split / merge / rebalance topology changes", [true, true, true, true, true, true], 20, 180, 3),
+        preset("gc-only", "Reclaim space only (GC)", [false, false, false, true, false, false, false], 30, 120, 2),
+        preset("maintenance", "GC + compaction + extent repair, no topology change", [false, false, true, true, false, false, true], 30, 180, 2),
+        preset("space-reclaim", "GC + auto-EC, space-first", [false, true, false, true, false, false, false], 20, 120, 3),
+        preset("balanced", "GC + compaction + EC + region rebalance + extent repair (recommended steady-state)", [false, true, true, true, false, true, true], 30, 240, 2),
+        preset("aggressive", "Full auto: incl. split / merge / rebalance topology changes and extent repair", [true, true, true, true, true, true, true], 20, 180, 3),
     ]
 }
 
@@ -233,8 +238,8 @@ pub(crate) fn is_preset_name(name: &str) -> bool {
 }
 
 /// Expand a switch set to the actionable candidate kinds it enables. compact ⇒
-/// major + minor. Reads the first 6 switches by `SWITCH_ORDER` ([split, ec,
-/// compact, gc, merge, rebalance]); a shorter Vec treats absent switches as off.
+/// major + minor. Reads the switches by `SWITCH_ORDER` ([split, ec, compact,
+/// gc, merge, rebalance, repair]); a shorter Vec treats absent switches as off.
 pub(crate) fn kinds_from_switches(switches: &[bool]) -> HashSet<u8> {
     let on = |i: usize| switches.get(i).copied().unwrap_or(false);
     let mut out = HashSet::new();
@@ -257,6 +262,9 @@ pub(crate) fn kinds_from_switches(switches: &[bool]) -> HashSet<u8> {
     if on(5) {
         out.insert(POLICY_KIND_REBALANCE);
     }
+    if on(6) {
+        out.insert(POLICY_KIND_REPAIR);
+    }
     out
 }
 
@@ -265,15 +273,18 @@ pub(crate) fn kinds_from_switches(switches: &[bool]) -> HashSet<u8> {
 /// onto one core — [[feedback_auto_split_before_merge]]). Lower = higher priority.
 fn kind_priority(kind: u8) -> u8 {
     match kind {
-        POLICY_KIND_SPLIT => 0,
+        // A copy short comes before everything: the others tune performance
+        // and space, this one restores durability.
+        POLICY_KIND_REPAIR => 0,
+        POLICY_KIND_SPLIT => 1,
         // rebalance is a load-SPREADING action (like split — relieves a hot PS),
         // so it ranks high, ahead of upkeep; merge (concentrates) stays last.
-        POLICY_KIND_REBALANCE => 1,
-        POLICY_KIND_GC => 2,
-        POLICY_KIND_MINOR_COMPACT => 3,
-        POLICY_KIND_MAJOR_COMPACT => 4,
-        POLICY_KIND_EC => 5,
-        POLICY_KIND_MERGE => 6,
+        POLICY_KIND_REBALANCE => 2,
+        POLICY_KIND_GC => 3,
+        POLICY_KIND_MINOR_COMPACT => 4,
+        POLICY_KIND_MAJOR_COMPACT => 5,
+        POLICY_KIND_EC => 6,
+        POLICY_KIND_MERGE => 7,
         _ => 9,
     }
 }
@@ -347,6 +358,7 @@ pub(crate) fn policy_kind_str(kind: u8) -> &'static str {
         POLICY_KIND_MINOR_COMPACT => "minor",
         POLICY_KIND_EC => "ec",
         POLICY_KIND_REBALANCE => "rebalance",
+        POLICY_KIND_REPAIR => "repair",
         _ => "?",
     }
 }
@@ -359,6 +371,7 @@ pub(crate) fn describe_candidate(c: &PolicyCandidate) -> String {
         POLICY_KIND_EC => format!("extent {}", c.secondary_part_id),
         POLICY_KIND_MERGE => format!("part {}<-{}", c.primary_part_id, c.secondary_part_id),
         POLICY_KIND_REBALANCE => "cluster".to_string(),
+        POLICY_KIND_REPAIR => format!("node {}", c.secondary_part_id),
         _ => format!("part {}", c.primary_part_id),
     };
     format!("{:<6} {:<18} {}", policy_kind_str(c.kind), target, c.reason)
@@ -399,6 +412,16 @@ pub(crate) fn candidate_to_cmd(c: &PolicyCandidate) -> Option<Vec<String>> {
         // Cluster-scoped; no target id. Used for the DryRun "would: …" log +
         // the client-side cooldown key ("rebalance:0" via the default arm).
         POLICY_KIND_REBALANCE => Some(vec!["rebalance".to_string()]),
+        POLICY_KIND_REPAIR => {
+            if c.secondary_part_id == 0 {
+                return None;
+            }
+            Some(vec![
+                "repair".to_string(),
+                "--node".to_string(),
+                c.secondary_part_id.to_string(),
+            ])
+        }
         _ => None, // hotcold / unknown → advisory only
     }
 }
@@ -411,6 +434,8 @@ pub(crate) fn cooldown_key(c: &PolicyCandidate) -> String {
         POLICY_KIND_MERGE => {
             format!("merge:{}:{}", c.primary_part_id, c.secondary_part_id)
         }
+        // Per node — the target lives in `secondary_part_id`.
+        POLICY_KIND_REPAIR => format!("repair:{}", c.secondary_part_id),
         _ => format!("{}:{}", policy_kind_str(c.kind), c.primary_part_id),
     }
 }
@@ -486,24 +511,53 @@ mod tests {
         assert!(describe_candidate(&cand(POLICY_KIND_SPLIT, 7, 0)).contains("part 7"));
     }
 
+    /// A repair advisory targets a NODE (`secondary_part_id`): its command,
+    /// its cooldown key and its description all name that node — a key built
+    /// from `primary_part_id` (always 0 here) would make every node share one
+    /// cooldown.
+    #[test]
+    fn a_repair_candidate_names_its_node() {
+        let c = cand(POLICY_KIND_REPAIR, 0, 5);
+        assert_eq!(
+            candidate_to_cmd(&c),
+            Some(vec!["repair".to_string(), "--node".to_string(), "5".to_string()])
+        );
+        assert_eq!(cooldown_key(&c), "repair:5");
+        assert_ne!(cooldown_key(&c), cooldown_key(&cand(POLICY_KIND_REPAIR, 0, 6)));
+        assert!(describe_candidate(&c).contains("node 5"));
+        assert_eq!(candidate_to_cmd(&cand(POLICY_KIND_REPAIR, 0, 0)), None);
+    }
+
+    #[test]
+    fn repair_is_actuated_before_anything_else() {
+        let cands = vec![cand(POLICY_KIND_SPLIT, 1, 0), cand(POLICY_KIND_REPAIR, 0, 5)];
+        let enabled: HashSet<u8> = [POLICY_KIND_SPLIT, POLICY_KIND_REPAIR].into_iter().collect();
+        let picked = decide_actions(&cands, &HashMap::new(), &enabled, 1000, 0, 1);
+        assert_eq!(picked.len(), 1);
+        assert_eq!(picked[0].0.kind, POLICY_KIND_REPAIR);
+    }
+
     #[test]
     fn kinds_from_switches_expands_compact_to_major_and_minor() {
-        // [split, ec, compact, gc, merge]
-        let ks = kinds_from_switches(&[false, false, true, false, false, false]);
+        // [split, ec, compact, gc, merge, rebalance, repair]
+        let ks = kinds_from_switches(&[false, false, true, false, false, false, false]);
         assert!(ks.contains(&POLICY_KIND_MAJOR_COMPACT));
         assert!(ks.contains(&POLICY_KIND_MINOR_COMPACT));
         assert_eq!(ks.len(), 2);
-        let all = kinds_from_switches(&[true, true, true, true, true, true]);
-        assert_eq!(all.len(), 7); // split, ec, major, minor, gc, merge, rebalance
+        let all = kinds_from_switches(&[true; SWITCHES]);
+        assert_eq!(all.len(), 8); // split, ec, major, minor, gc, merge, rebalance, repair
         assert!(all.contains(&POLICY_KIND_REBALANCE));
+        assert!(all.contains(&POLICY_KIND_REPAIR));
+        // A config persisted before the repair switch existed reads it as off.
+        assert!(!kinds_from_switches(&[true; 6]).contains(&POLICY_KIND_REPAIR));
         // rebalance switch (index 5) alone → just rebalance.
-        let rb = kinds_from_switches(&[false, false, false, false, false, true]);
+        let rb = kinds_from_switches(&[false, false, false, false, false, true, false]);
         assert_eq!(rb, {
             let mut s = HashSet::new();
             s.insert(POLICY_KIND_REBALANCE);
             s
         });
-        assert!(kinds_from_switches(&[false; 6]).is_empty());
+        assert!(kinds_from_switches(&[false; SWITCHES]).is_empty());
     }
 
     #[test]
@@ -513,15 +567,15 @@ mod tests {
         assert_eq!(ps[0].name, "gc-only");
         assert_eq!(ps[4].name, "aggressive");
         assert!(ps.iter().all(|p| p.builtin));
-        // gc-only: only the gc switch (index 3). switches = [split,ec,compact,gc,merge,rebalance]
-        assert_eq!(ps[0].switches, vec![false, false, false, true, false, false]);
+        // gc-only: only the gc switch (index 3). switches = [split,ec,compact,gc,merge,rebalance,repair]
+        assert_eq!(ps[0].switches, vec![false, false, false, true, false, false, false]);
         assert_eq!(kinds_from_switches(&ps[0].switches), {
             let mut s = HashSet::new();
             s.insert(POLICY_KIND_GC);
             s
         });
         // aggressive turns everything on (incl. rebalance).
-        assert_eq!(ps[4].switches, vec![true; 6]);
+        assert_eq!(ps[4].switches, vec![true; SWITCHES]);
         assert!(kinds_from_switches(&ps[4].switches).contains(&POLICY_KIND_REBALANCE));
     }
 

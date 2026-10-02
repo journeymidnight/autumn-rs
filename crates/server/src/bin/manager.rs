@@ -48,6 +48,9 @@ struct Args {
     /// disk has less free are soft-avoided by extent allocation.
     /// `None` = library default (256 MiB); 0 = disabled.
     min_alloc_free_bytes: Option<u64>,
+    /// `--repair-grace-secs`: how long a slot stays degraded before the repair
+    /// policy proposes rebuilding it elsewhere. `None` = default 600.
+    repair_grace_secs: Option<u64>,
     /// audit-log retention (days). `None` = default 90; 0 = off.
     audit_retention_days: Option<u64>,
     /// path to the Ed25519 signing-key file (KDC private material).
@@ -83,6 +86,7 @@ fn parse_args() -> Args {
     let mut metrics_port: Option<u16> = None;
     let mut metrics_listen: Option<String> = None;
     let mut min_alloc_free_bytes: Option<u64> = None;
+    let mut repair_grace_secs: Option<u64> = None;
     let mut audit_retention_days: Option<u64> = None;
     let mut auth_signing_key_file: Option<String> = None;
     let mut cluster_secret_file: Option<std::path::PathBuf> = None;
@@ -158,6 +162,11 @@ fn parse_args() -> Args {
                 min_alloc_free_bytes =
                     Some(raw[i].parse().expect("--min-alloc-free-bytes must be a number"));
             }
+            "--repair-grace-secs" => {
+                i += 1;
+                repair_grace_secs =
+                    Some(raw[i].parse().expect("--repair-grace-secs must be a number"));
+            }
             "--audit-retention-days" => {
                 i += 1;
                 audit_retention_days =
@@ -214,6 +223,7 @@ fn parse_args() -> Args {
         metrics_port,
         metrics_listen,
         min_alloc_free_bytes,
+        repair_grace_secs,
         audit_retention_days,
         auth_signing_key_file,
         cluster_secret_file,
@@ -275,6 +285,10 @@ async fn main() -> Result<()> {
     if let Some(v) = args.min_alloc_free_bytes {
         manager.set_min_alloc_free_bytes(v);
         tracing::info!(min_alloc_free_bytes = v, "ENOSPC-1 allocation floor configured");
+    }
+    if let Some(v) = args.repair_grace_secs {
+        manager.set_repair_grace_secs(v);
+        tracing::info!(repair_grace_secs = v, "repair policy grace configured");
     }
     if let Some(v) = args.audit_retention_days {
         manager.set_audit_retention_days(v);

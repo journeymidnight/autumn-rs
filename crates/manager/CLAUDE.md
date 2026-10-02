@@ -646,13 +646,15 @@ because it was three inline checks whose ORDER was the bug — the gate returned
 before anything looked at the disk, so a slot on a DEAD disk was never
 considered, and nothing could assert on it.
 
-Three things move a copy, each because it is CONCLUSIVE rather than
-suggestive: an operator `Fenced` node (that is what fencing is for), a slot a
-partition owner PROVED corrupt (it replayed those bytes; `re_avali` compares
-length, which a full-length rotted replica passes), and a disk **its own node
-named faulted on its last df**. Nothing else does: a node that stopped
-answering may be back in seconds, and moving its data is expensive and
-irreversible.
+Three things move a copy on their own, each because it is CONCLUSIVE rather
+than suggestive: an operator `Fenced` node (that is what fencing is for), a
+slot a partition owner PROVED corrupt (it replayed those bytes; `re_avali`
+compares length, which a full-length rotted replica passes), and a disk **its
+own node named faulted on its last df**. A fourth is a DECISION rather than
+evidence: a repair request (see "Extent repair"), made by an operator or by
+the repair policy after the slot stayed degraded past its grace. Nothing else
+moves a copy: a node that stopped answering may be back in seconds, and moving
+its data is expensive and irreversible.
 
 A copy that stays may still be BEHIND: a member that was down when the extent
 was sealed never had its `avali` bit set (seal needs only one answering
@@ -1191,9 +1193,10 @@ can't catch a panic.
 
 `policy_tick_loop` (leader-only, every `POLICY_BUCKET_SEC = 60 s`) reads per-partition
 metrics from `MSG_REPORT_PARTITION_LOAD` aggregations and rebuilds `advisory_cache`
-(the ONLY job — the manager is pure mechanism; it never self-dispatches). Emits 7 kinds
+(the ONLY job — the manager is pure mechanism; it never self-dispatches). Emits 8 kinds
 (`POLICY_KIND_*`, wire-stable append-only): split / merge / gc / major_compact / minor
-_compact / ec / rebalance. `handle_get_policy_candidates` and `handle_get_partition
+_compact / ec / rebalance / repair (the last from extent state, not partition
+metrics — see "Extent repair"). `handle_get_policy_candidates` and `handle_get_partition
 _detail` are leader-gated (a follower's metrics are empty).
 
 **Metrics window.** `PartitionMetricsWindow::push_with_cap_and_bucket` snaps `ts` to
@@ -1339,16 +1342,20 @@ Config is **etcd, leader-owned, crash-safe** (`autoPolicy/config` = mode + activ
 custom policies, `autoPolicy/cooldowns`), written etcd-first + leader-fenced by
 `autopolicy_set`, reloaded by `replay_from_etcd` (fail-loud decode + `sanitize_entry`
 clamp — a shorter persisted `switches` Vec pads the absent trailing switches to off).
-Switch order is `[split, ec, compact, gc, merge, rebalance]`. Presets are compiled-in,
+Switch order is `[split, ec, compact, gc, merge, rebalance, repair]` (append-only;
+a config persisted with fewer switches reads the missing ones as off). Presets are compiled-in,
 never persisted, safest → most aggressive:
 
 | Preset | Switches enabled |
 |---|---|
 | `gc-only` | gc |
-| `maintenance` | compact, gc |
+| `maintenance` | compact, gc, repair |
 | `space-reclaim` | ec, gc |
-| `balanced` (recommended steady-state) | ec, compact, gc, rebalance |
-| `aggressive` | split, ec, compact, gc, merge, rebalance |
+| `balanced` (recommended steady-state) | ec, compact, gc, rebalance, repair |
+| `aggressive` | split, ec, compact, gc, merge, rebalance, repair |
+
+`repair` actuates first (`kind_priority` 0): the others tune performance and
+space, a copy short is durability.
 
 Headless control: `MSG_AUTOPOLICY_GET/SET` + `autumn-op auto-policy
 status|activate <name> [--arm]|deactivate`. Manual per-target actions go through
@@ -1542,6 +1549,81 @@ Surfaced as `autumn-op [--json] health [--detail N]` and as the overview's
 `tests/extent_health_summary.rs` (a replica on a stopped node → WARN naming the
 extent and slot; back → OK; ablation: classify an unreachable node's copy as
 serving).
+
+## Extent repair (`extent_repair.rs`)
+
+A repair request is a persisted per-slot bitmap (`extentRepair/<id>`, the
+shape and the reasons of `extentCorrupt/`): "rebuild this slot on another node
+now", without fencing its node. `slot_verdict` returns Rebuild for a requested
+slot, the ordinary dispatch moves it, and `apply_recovery_done` clears the
+request with the slot; extent deletion forgets it; leader replay reinstalls it
+— a decision living only in leader memory would be lost at the first failover,
+or whenever the rebuild's executor died.
+
+A request is a decision about a copy that is NOT there, and its node coming
+back changes that (Ceph's mark-in cancelling the remaps of its down→out). When
+the slot's node answers again: a copy that SERVES has its request WITHDRAWN; a
+BEHIND replica is caught up in place first while the request waits — once
+caught up it serves and the request is withdrawn — and the request rebuilds it
+elsewhere only once the node answers a catch-up that it has no such extent
+(`catch_up_copy_gone`: a wiped node rejoined). A timeout or any other failure
+is no evidence the copy is gone — a node just back, catching up hundreds of
+extents, queues past the 30 s timeout — and moving a copy that a retry would
+refill is the move this rule exists to prevent. Without this a node back after
+the grace period had every requested copy moved anyway: onto a spare it was
+never lost to, or, with no spare (RF = node count), pinned to a rebuild with no
+target forever while the catch-up that would have fixed it never ran. All
+writers of the request bitmap serialize on `extent_repair_lock` across their
+read-modify-write and etcd write (policy, ops, the tick and recovery apply are
+different tasks).
+
+"Answers again" is FIRST-HAND only — registered, a `df` applied this leader
+term (`has_first_hand_df`), Online, disk reported online — the predicate
+`release_recovery_markers_for_healthy_slots` uses. After a promotion every
+replayed node reads Online and every disk `online: true` until its first `df`,
+dead nodes included; trusting that withdrew every persisted request at each
+failover. Withdrawals are batched after the pass (a returning node may carry
+one on every slot). A rebuild already dispatched for a copy that serves again
+is released with the request (the marker-release predicate then holds); one
+for a behind copy runs to completion; copies already moved stay moved.
+
+`plan_repair` decides which slots a request covers: only slots that do not
+serve (unreachable, behind; maintenance only on an operator's word) and that
+nothing else is moving (fenced, corrupt and faulted-disk slots rebuild on
+their own). It refuses an extent a read cannot be served from — no source to
+rebuild from — and a slot already requested.
+
+Two ways in, one function (`request_repair`):
+- **Operator** — `OP_KIND_REPAIR` (`autumn-op repair <EXTENT>...` or
+  `--node <N>`, which the manager expands to every degraded slot on that node;
+  `part_id` carries the node). The op is the REQUEST: it is terminal once
+  recorded, and the rebuilds then show as recovery entries. Naming a healthy
+  or open extent is reported back, not an error for the others.
+- **Policy** — `POLICY_KIND_REPAIR`, one advisory per NODE whose slots have
+  been degraded at least `--repair-grace-secs` (default 600, Ceph's down→out
+  interval), counting only extents with no op in flight and a source to
+  rebuild from (`repair_candidates`, computed on the policy tick before the
+  engine is borrowed). Per node, not per extent: a node that is gone degrades
+  every extent it held, and one row is what an operator reads and what one
+  actuation should cover. Actuation records requests only for slots on that
+  node degraded past the grace. The degraded clock is leader-local and
+  restarts at a leader change, so a failover delays the policy, never hastens
+  it. The `repair` auto-policy switch arms it; `maintenance`, `balanced` and
+  `aggressive` enable it.
+
+Tests: `tests/extent_repair.rs` — an operator repair moves the copy of a
+stopped node to the spare without a fence; the policy advises in DryRun and
+moves nothing, then rebuilds when Armed; a request recorded on one leader is
+served by the next after a spare joins; a node that returns before its
+requests could be served keeps its copies when the spare comes back.
+Ablations: `slot_verdict` ignoring the request (the first three red), replay
+not reinstalling it (the failover test red), no repair candidates (the policy
+test red), never withdrawing (the returning-node test red); unit
+`a_repair_request_is_withdrawn_when_its_node_answers_again`.
+
+Not visible yet: which slots carry a pending request — the health summary
+shows them by state only (unreachable / behind); the op message and the
+policy's action log say what was requested.
 
 ## Web dashboard (standalone app)
 

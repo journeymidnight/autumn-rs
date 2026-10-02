@@ -74,7 +74,9 @@ erasure-coded, self-healing extents.
   nodes-and-disks, policy and logs, plus direct Start / Observe / Stop policy
   controls; `ceph -s`-style extent health (`autumn-op health`: how many extents
   are clean, degraded, without redundancy or unreadable, and the worst ones by
-  name) with matching dashboard alerts; declarative bare-metal deployer
+  name) with matching dashboard alerts, and `autumn-op repair` (or the
+  auto-policy's `repair` switch, after a grace period) to rebuild degraded
+  copies on other nodes without fencing theirs; declarative bare-metal deployer
   (systemd), Kubernetes manifests, Prometheus `/metrics`, `ceph df`-style
   capacity accounting, rolling restart with convergence gates.
 

@@ -3132,6 +3132,13 @@ impl AutumnManager {
                     if let Err(e) = self.forget_corrupt_slots(eid).await {
                         tracing::warn!(extent_id = eid, error = %e, "could not drop the corrupt-slot mark");
                     }
+                    if let Err(e) = self.forget_repair_slots(eid).await {
+                        tracing::warn!(
+                            extent_id = eid,
+                            error = %e,
+                            "could not drop the repair request of a deleted extent"
+                        );
+                    }
                 }
                 // Each enqueue is an etcd CAS via the inflight ledger; errors
                 // are downgraded inside enqueue (WARN-logged) so a single
@@ -3281,6 +3288,13 @@ impl AutumnManager {
                     // mark describing its slots must not outlive it.
                     if let Err(e) = self.forget_corrupt_slots(eid).await {
                         tracing::warn!(extent_id = eid, error = %e, "could not drop the corrupt-slot mark");
+                    }
+                    if let Err(e) = self.forget_repair_slots(eid).await {
+                        tracing::warn!(
+                            extent_id = eid,
+                            error = %e,
+                            "could not drop the repair request of a deleted extent"
+                        );
                     }
                 }
                 let _ = self.enqueue_pending_deletes(pending_deletes).await;
@@ -4643,6 +4657,13 @@ impl AutumnManager {
                 "recovery is auto-dispatched, not submittable — watch it with \
                  `ops list --kind recovery`",
             ),
+            OP_KIND_REPAIR => {
+                if req.extent_ids.is_empty() == (req.part_id == 0) {
+                    Some("repair takes extent ids OR a node id in part_id, not both or neither")
+                } else {
+                    None
+                }
+            }
             OP_KIND_SPLIT | OP_KIND_MERGE | OP_KIND_REBALANCE | OP_KIND_COMPACT | OP_KIND_GC
             | OP_KIND_FORCE_GC | OP_KIND_EC_CONVERT => {
                 if need_part && req.part_id == 0 {

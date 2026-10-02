@@ -172,6 +172,7 @@ fn op_name(b: u8) -> &'static str {
         AUDIT_OP_REMOVE_NODE => "remove_node",
         AUDIT_OP_FORCE_EC_CONVERT => "force_ec_convert",
         AUDIT_OP_FORCE_ABANDON_EC_MARKER => "force_abandon_ec_marker",
+        AUDIT_OP_REPAIR => "repair",
         _ => "unknown",
     }
 }
@@ -475,6 +476,23 @@ async fn run(args: Args) -> Result<()> {
             ec_data,
             ec_parity,
         } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
+        Command::Repair { extents, node } => {
+            submit_op_cli(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                OpSubmitReq {
+                    kind: OP_KIND_REPAIR,
+                    part_id: node.unwrap_or(0),
+                    secondary_id: extents.first().copied().unwrap_or(0),
+                    extent_ids: extents,
+                    requested_by: "cli".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?
+        }
         Command::ForceEcConvert { extent_id } => {
             cmd_force_ec_convert(&client, args.json, args.wait, args.wait_timeout, extent_id)
                 .await?
@@ -1428,12 +1446,12 @@ async fn cmd_audit_log(
     Ok(())
 }
 
-/// Map a comma-separated switch list (`split,gc,ec`) to the fixed 6-slot bool
-/// vector the controller stores, order `[split, ec, compact, gc, merge,
-/// rebalance]`. Unknown names are a hard error (a typo must not silently drop a
+/// Map a comma-separated switch list (`split,gc,ec`) to the fixed bool vector
+/// the controller stores, order `[split, ec, compact, gc, merge, rebalance,
+/// repair]`. Unknown names are a hard error (a typo must not silently drop a
 /// switch). An empty list = all off.
 fn parse_switch_csv(csv: &str) -> Result<Vec<bool>> {
-    let mut sw = vec![false; 6];
+    let mut sw = vec![false; 7];
     for tok in csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let idx = match tok {
             "split" => 0,
@@ -1442,7 +1460,8 @@ fn parse_switch_csv(csv: &str) -> Result<Vec<bool>> {
             "gc" => 3,
             "merge" => 4,
             "rebalance" => 5,
-            other => bail!("unknown switch '{other}' (split|ec|compact|gc|merge|rebalance)"),
+            "repair" => 6,
+            other => bail!("unknown switch '{other}' (split|ec|compact|gc|merge|rebalance|repair)"),
         };
         sw[idx] = true;
     }
@@ -1689,6 +1708,7 @@ async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()>
                     POLICY_KIND_MINOR_COMPACT => "minor",
                     POLICY_KIND_EC => "ec",
                     POLICY_KIND_REBALANCE => "rebalance",
+                    POLICY_KIND_REPAIR => "repair",
                     _ => "?",
                 };
                 serde_json::json!({
@@ -1721,6 +1741,7 @@ async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()>
                 POLICY_KIND_MINOR_COMPACT => "minor",
                 POLICY_KIND_EC => "ec",
                 POLICY_KIND_REBALANCE => "rebalance",
+                POLICY_KIND_REPAIR => "repair",
                 _ => "?",
             };
             let feas = match c.kind {
@@ -2030,6 +2051,7 @@ fn op_kind_from_str(s: &str) -> u8 {
         "forcegc" => OP_KIND_FORCE_GC,
         "ec" | "ec-convert" => OP_KIND_EC_CONVERT,
         "recovery" => OP_KIND_RECOVERY,
+        "repair" => OP_KIND_REPAIR,
         _ => 0,
     }
 }

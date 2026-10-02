@@ -318,6 +318,13 @@ impl AutumnManager {
             if let Err(e) = self.forget_corrupt_slots(eid).await {
                 tracing::warn!(extent_id = eid, error = %e, "could not drop the corrupt-slot mark");
             }
+            if let Err(e) = self.forget_repair_slots(eid).await {
+                tracing::warn!(
+                    extent_id = eid,
+                    error = %e,
+                    "could not drop the repair request of a deleted extent"
+                );
+            }
             if let Err(e) = self.enqueue_pending_deletes(vec![d]).await {
                 tracing::warn!(
                     extent_id = eid,
@@ -493,6 +500,13 @@ impl AutumnManager {
                 }
                 if let Err(e) = self.forget_corrupt_slots(eid).await {
                     tracing::warn!(extent_id = eid, error = %e, "sealed-empty sweep: corrupt-slot mark survives the extent");
+                }
+                if let Err(e) = self.forget_repair_slots(eid).await {
+                    tracing::warn!(
+                        extent_id = eid,
+                        error = %e,
+                        "could not drop the repair request of a deleted extent"
+                    );
                 }
             }
             // Each enqueue is an etcd CAS via the inflight ledger, and its

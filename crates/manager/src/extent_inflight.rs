@@ -1379,6 +1379,131 @@ mod tests {
         });
     }
 
+    /// A repair request yields once its node answers again — on first-hand
+    /// evidence, a `df` THIS leader term applied. A copy that serves has its
+    /// request withdrawn; a behind copy is caught up in place first while the
+    /// request waits, and only repeated failed catch-ups let the request move
+    /// it. A request on a node that does not answer stands, and so does one on
+    /// a node that merely READS Online because a promotion replayed it so
+    /// (every replayed node does, dead or not, until its first `df`).
+    #[test]
+    fn a_repair_request_is_withdrawn_when_its_node_answers_again() {
+        run(async {
+            let m = AutumnManager::new();
+            for (node_id, addr, disk) in [
+                (1u64, "127.0.0.1:1", 10u64),
+                (2, "127.0.0.1:9102", 20),
+                (3, "127.0.0.1:9103", 30),
+                (4, "127.0.0.1:9104", 40),
+            ] {
+                m.store.inner.borrow_mut().nodes.insert(
+                    node_id,
+                    NodeRecord {
+                        node_id,
+                        address: addr.into(),
+                        disks: vec![disk],
+                        shard_ports: vec![],
+                        control_address: String::new(),
+                        node_uuid: String::new(),
+                    },
+                );
+                m.store.inner.borrow_mut().disks.insert(
+                    disk,
+                    crate::persist::records::DiskRecord {
+                        disk_id: disk,
+                        online: true,
+                        uuid: String::new(),
+                    },
+                );
+            }
+            // Nodes 1 and 2 answer (this term applied their `df`); node 3
+            // registered and never has; node 4 reads Online only because a
+            // promotion replayed it so — no `df` this term.
+            for n in [1u64, 2, 4] {
+                m.node_states.borrow_mut().on_heartbeat_ok(n);
+            }
+            m.node_max_free.borrow_mut().insert(1, 1 << 30);
+            m.node_max_free.borrow_mut().insert(2, 1 << 30);
+            m.node_states.borrow_mut().on_register_first(3);
+            // Slot 0 of each: 30 on node 1 (behind), 31 on node 3 (silent),
+            // 32 on node 4 (replayed Online, unheard), 33 on node 1 (serving).
+            for (id, first, avali) in [
+                (30u64, 1u64, 0b10u32),
+                (31, 3, 0b10),
+                (32, 4, 0b10),
+                (33, 1, 0b11),
+            ] {
+                m.store.inner.borrow_mut().extents.insert(
+                    id,
+                    ExtentRecord {
+                        extent_id: id,
+                        sealed: true,
+                        sealed_length: 4096,
+                        replicates: vec![first, 2],
+                        replicate_disks: vec![first * 10, 20],
+                        avali,
+                        ..Default::default()
+                    },
+                );
+                m.extent_repair_slots.borrow_mut().insert(id, 0b01);
+            }
+
+            m.recovery_dispatch_tick().await;
+
+            assert_eq!(m.repair_slots_of(33), 0, "node 1 answers and the copy serves: withdrawn");
+            assert_eq!(m.repair_slots_of(30), 0b01, "a behind copy: the request waits…");
+            assert_eq!(m.extent_inflight_op(30), None, "…and nothing is moved yet");
+            let start = std::time::Instant::now();
+            while !m
+                .catch_up_backoff
+                .borrow()
+                .backoff_snapshot()
+                .iter()
+                .any(|(e, slot, ..)| *e == 30 && *slot == 0)
+            {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(5),
+                    "the behind copy is caught up in place instead"
+                );
+                compio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+
+            assert_eq!(m.repair_slots_of(31), 0b01, "node 3 is still silent: the request stands");
+            assert_eq!(
+                m.repair_slots_of(32),
+                0b01,
+                "node 4 reads Online from replay alone: not evidence, the request stands"
+            );
+
+            // A failing catch-up alone (nothing listens on node 1 here) is no
+            // evidence the copy is gone: the request keeps waiting.
+            m.recovery_dispatch_tick().await;
+            let rebuild_tried = |m: &AutumnManager| {
+                m.extent_inflight_op(30).is_some()
+                    || m
+                        .recovery_limiter
+                        .borrow()
+                        .backoff_snapshot()
+                        .iter()
+                        .any(|(e, slot, ..)| *e == 30 && *slot == 0)
+            };
+            assert!(!rebuild_tried(&m), "a failed catch-up alone does not move the copy");
+            // The node answers that it has no such extent (a wiped node
+            // rejoined): the request moves the copy after all.
+            m.catch_up_copy_gone.borrow_mut().insert((30, 0));
+            m.recovery_dispatch_tick().await;
+            assert!(rebuild_tried(&m), "a copy its node says is gone is rebuilt elsewhere");
+            assert!(
+                m.recovery_limiter
+                    .borrow()
+                    .backoff_snapshot()
+                    .iter()
+                    .any(|(e, slot, ..)| *e == 31 && *slot == 0),
+                "and its rebuild was attempted (no spare node here, so it backs off)"
+            );
+        });
+    }
+
     /// No new EC conversion of an extent with a corrupt-marked slot: the
     /// coordinator would encode from a full-length copy without asking where it
     /// came from, and a marked copy is full length.
