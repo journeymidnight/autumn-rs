@@ -237,7 +237,7 @@ pub fn keyring(keys: &[crate::manager_rpc::AuthzPublicKey]) -> Keyring {
     out
 }
 
-/// The per-connection principal bound by a successful `MSG_AUTH_HELLO` (on a
+/// The per-connection principal bound by a successful `MSG_CLIENT_AUTH` (on a
 /// PS or an EN connection).
 #[derive(Clone, Debug)]
 pub struct BoundPrincipal {
@@ -250,8 +250,8 @@ pub struct BoundPrincipal {
     pub kid: u32,
 }
 
-/// Verify an `AUTH_HELLO` token → the bound principal, or a reject reason
-/// (for the AuthHelloResp message / metrics). `now`/`skew` gate `nbf`/`exp`;
+/// Verify a `CLIENT_AUTH` token → the bound principal, or a reject reason
+/// (for the ClientAuthResp message / metrics). `now`/`skew` gate `nbf`/`exp`;
 /// the `aud` must equal `cluster_id` (when known) so a token minted for another
 /// cluster can't be replayed here.
 pub fn bind_principal(

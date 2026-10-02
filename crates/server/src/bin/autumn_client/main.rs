@@ -52,7 +52,7 @@ const BENCH_SCOPE: &str = "bench/perf";
 /// The resulting failure was hard to read, which is why it is written down.
 /// `connect` only contacts the MANAGER, so every worker connected fine. The
 /// puts then went to a partition server over a connection that had sent no
-/// AUTH_HELLO, and the PS authz gate rejected each one as an error frame
+/// CLIENT_AUTH, and the PS authz gate rejected each one as an error frame
 /// before dispatch -- a path that logs nothing, so the PS logs stayed empty
 /// and looked like no traffic had arrived. The client retried, surfaced it as
 /// "ps_call after 10 refreshes", and the hot loop's `.is_ok()` dropped that

@@ -108,9 +108,9 @@ use autumn_rpc::manager_rpc::{
     PollInvalidationsResp, ReleaseLeaseReq, ReleaseLeaseResp,
 };
 use autumn_rpc::partition_rpc::{
-    self as ps, encode_put_bulk_meta, parse_put_bulk_meta, AuthHelloReq, AuthHelloResp,
-    BatchDeleteOp, BatchDeleteReq, BatchDeleteResp, BatchGetBulkCtrl, BatchGetReq, BatchPutBulkOp,
-    BatchPutBulkReq, BatchPutOp, BatchPutReq, BatchPutResp, ComparePutReq, CompareWriteReq,
+    self as ps, encode_put_bulk_meta, parse_put_bulk_meta, BatchDeleteOp, BatchDeleteReq,
+    BatchDeleteResp, BatchGetBulkCtrl, BatchGetReq, BatchPutBulkOp, BatchPutBulkReq, BatchPutOp,
+    BatchPutReq, BatchPutResp, ClientAuthReq, ClientAuthResp, ComparePutReq, CompareWriteReq,
     DeleteReq, DeleteResp, GetRedirectItem,
     GetRedirectManyReq, GetRedirectManyResp, GetRedirectResp, GetReq, HeadReq, HeadResp, PutReq,
     PutResp, RangeEntry, RangeReq, RangeResp,
@@ -142,8 +142,8 @@ const GOLDEN: &[(&str, &str)] = &[
     ("GetRedirectResp", "696e6c696e6531302e302e302e313a3731303031302e302e302e323a373130308d000000e6ffffff8d000000ebffffff030000007265646972656374c4ffffff06000000000000001817161514131211282726252423222138373635343332314847464544434241b8ffffff0200000004000000000000005857565554535251"),
     ("GetRedirectManyReq", "7468652d6b657900f8ffffff07000000343332314443424118171615141312112827262524232221e0ffffff01000000"),
     ("GetRedirectManyResp", "696e6c696e6531302e302e302e313a3731303031302e302e302e323a373130308d000000e6ffffff8d000000ebffffff030000007265646972656374c4ffffff06000000000000001817161514131211282726252423222138373635343332314847464544434241b8ffffff0200000004000000000000005857565554535251b0ffffff01000000"),
-    ("AuthHelloReq", "6f70617175652d6361706162696c6974792d746f6b656e00e8ffffff17000000"),
-    ("AuthHelloResp", "617574682d6d657373616765070000008c000000f0ffffff"),
+    ("ClientAuthReq", "6f70617175652d6361706162696c6974792d746f6b656e00e8ffffff17000000"),
+    ("ClientAuthResp", "617574682d6d657373616765070000008c000000f0ffffff"),
     ("put_bulk meta", "18171615141312112827262524232221383736353433323107000000484746454443424158575655545352517468652d6b6579"),
     ("bulk response head", "141312115001372100000d0000000762756c6b2d6d65737361676561b09c26"),
     // manager surface
@@ -553,18 +553,18 @@ fn forms() -> Vec<Frozen> {
             }
         ),
         frozen!(
-            &[(Ps, ps::MSG_AUTH_HELLO)],
+            &[(Ps, ps::MSG_CLIENT_AUTH)],
             Req,
-            AuthHelloReq,
-            AuthHelloReq {
+            ClientAuthReq,
+            ClientAuthReq {
                 token: b"opaque-capability-token".to_vec(),
             }
         ),
         frozen!(
-            &[(Ps, ps::MSG_AUTH_HELLO)],
+            &[(Ps, ps::MSG_CLIENT_AUTH)],
             Resp,
-            AuthHelloResp,
-            AuthHelloResp {
+            ClientAuthResp,
+            ClientAuthResp {
                 code: 7,
                 message: "auth-message".to_string(),
             }
@@ -705,7 +705,7 @@ fn forms() -> Vec<Frozen> {
         // claims out of its own minted token to check the namespace scope
         // (`crates/client/src/lib.rs`), so its layout is a client contract.
         frozen!(
-            &[(Mgr, mgr::MSG_MINT_TOKEN), (Ps, ps::MSG_AUTH_HELLO)],
+            &[(Mgr, mgr::MSG_MINT_TOKEN), (Ps, ps::MSG_CLIENT_AUTH)],
             Embedded,
             CapClaims,
             CapClaims {

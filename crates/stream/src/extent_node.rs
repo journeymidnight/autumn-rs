@@ -1764,7 +1764,7 @@ impl ClientAuthz {
         };
     }
 
-    /// `AUTH_HELLO` on a Client connection: the principal to bind, or why not.
+    /// `CLIENT_AUTH` on a Client connection: the principal to bind, or why not.
     /// `Unavailable` while the config is unknown (it says nothing about the
     /// token); `PermissionDenied` when the token is refused.
     fn bind(
@@ -1805,7 +1805,7 @@ impl ClientAuthz {
             } => {
                 let p = principal.ok_or((
                     StatusCode::PermissionDenied,
-                    "direct read requires a capability token (no AUTH_HELLO on this connection)",
+                    "direct read requires a capability token (no CLIENT_AUTH on this connection)",
                 ))?;
                 autumn_rpc::cap_token::still_valid(p, keys, now, *clock_skew_secs)
                     .map_err(|m| (StatusCode::PermissionDenied, m))
@@ -4564,7 +4564,7 @@ impl ExtentNode {
     }
 
     /// Client connections only, after `check_opcode` admitted the frame:
-    /// answers `AUTH_HELLO` itself, and refuses a direct read the connection's
+    /// answers `CLIENT_AUTH` itself, and refuses a direct read the connection's
     /// principal does not admit (`ClientAuthz::admit_read`). `None` = serve it.
     fn client_gate(
         &self,
@@ -4572,24 +4572,24 @@ impl ExtentNode {
         principal: &mut Option<autumn_rpc::cap_token::BoundPrincipal>,
         now: &mut Option<u64>,
     ) -> Option<Bytes> {
-        use autumn_rpc::partition_rpc::{AuthHelloReq, AuthHelloResp, MSG_AUTH_HELLO};
+        use autumn_rpc::partition_rpc::{ClientAuthReq, ClientAuthResp, MSG_CLIENT_AUTH};
         // The keepalive proves the connection, not a read.
         if frame.msg_type == autumn_rpc::MSG_TYPE_PING {
             return None;
         }
         let now = *now.get_or_insert_with(autumn_rpc::cap_token::now_secs);
         let authz = self.client_authz.borrow();
-        if frame.msg_type != MSG_AUTH_HELLO {
+        if frame.msg_type != MSG_CLIENT_AUTH {
             return authz
                 .admit_read(principal.as_ref(), now)
                 .err()
                 .map(|(code, m)| err_bytes(frame.req_id, frame.msg_type, code, m));
         }
-        let (code, message) = if frame.payload.len() > autumn_rpc::partition_rpc::AUTH_HELLO_MAX_PAYLOAD
+        let (code, message) = if frame.payload.len() > autumn_rpc::partition_rpc::CLIENT_AUTH_MAX_PAYLOAD
         {
-            (StatusCode::InvalidArgument, "AUTH_HELLO too large".to_string())
+            (StatusCode::InvalidArgument, "CLIENT_AUTH too large".to_string())
         } else {
-            match autumn_rpc::partition_rpc::rkyv_decode::<AuthHelloReq>(&frame.payload) {
+            match autumn_rpc::partition_rpc::rkyv_decode::<ClientAuthReq>(&frame.payload) {
                 Ok(req) => match authz.bind(&req.token, now) {
                     Ok(bound) => {
                         *principal = bound;
@@ -4597,17 +4597,17 @@ impl ExtentNode {
                     }
                     Err(refusal) => refusal,
                 },
-                Err(e) => (StatusCode::InvalidArgument, format!("bad AUTH_HELLO: {e}")),
+                Err(e) => (StatusCode::InvalidArgument, format!("bad CLIENT_AUTH: {e}")),
             }
         };
-        let resp = AuthHelloResp {
+        let resp = ClientAuthResp {
             code: code as u8,
             message,
         };
         Some(
             Frame::response(
                 frame.req_id,
-                MSG_AUTH_HELLO,
+                MSG_CLIENT_AUTH,
                 autumn_rpc::partition_rpc::rkyv_encode(&resp),
             )
             .encode(),
@@ -6131,7 +6131,7 @@ impl ExtentNode {
             &peer,
         )
         .await?;
-        // Bound by AUTH_HELLO on a Client connection (see `client_gate`).
+        // Bound by CLIENT_AUTH on a Client connection (see `client_gate`).
         let mut principal: Option<autumn_rpc::cap_token::BoundPrincipal> = None;
         let mut decoder = FrameDecoder::new();
 
@@ -16027,7 +16027,7 @@ mod read_frame_ceiling_tests {
 #[cfg(test)]
 mod client_direct_read_auth_tests {
     //! An EN of a cluster that runs authz serves direct reads only on a Client
-    //! connection that bound a principal with `AUTH_HELLO`; the SDK's
+    //! connection that bound a principal with `CLIENT_AUTH`; the SDK's
     //! direct-read pool sends it when it holds a token.
     use super::*;
     use autumn_rpc::cap_token::{CapClaims, CAP_TYP, CAP_VER};
@@ -16127,7 +16127,7 @@ mod client_direct_read_auth_tests {
         *node.client_authz.borrow_mut() = authz_on();
         let far = autumn_rpc::cap_token::now_secs() + 3600;
 
-        // No AUTH_HELLO at all: refused a read, but its keepalive is answered.
+        // No CLIENT_AUTH at all: refused a read, but its keepalive is answered.
         let anonymous = crate::ConnPool::with_role(Role::Client);
         let e = read(&anonymous, &addr).await.expect_err("anonymous read served");
         assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "{e:#}");
@@ -16140,7 +16140,7 @@ mod client_direct_read_auth_tests {
         let forged = crate::ConnPool::with_role(Role::Client);
         forged.set_auth_token(Some(token([1; 32], far)));
         let e = read(&forged, &addr).await.expect_err("forged token admitted");
-        assert!(format!("{e:#}").contains("AUTH_HELLO"), "{e:#}");
+        assert!(format!("{e:#}").contains("CLIENT_AUTH"), "{e:#}");
         assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "{e:#}");
 
         // An expired one.

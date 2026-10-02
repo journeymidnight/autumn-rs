@@ -4,7 +4,7 @@
 //! nothing else. This step settles whether a connection that declared itself
 //! a cluster member (`Peer`) or an operator tool (`Admin`) holds the cluster
 //! secret. A `Client` connection skips it: clients prove who they are with a
-//! capability token (`AUTH_HELLO`), never with the cluster secret.
+//! capability token (`CLIENT_AUTH`), never with the cluster secret.
 //!
 //! It runs on the raw stream right after VERSION_HELLO succeeds, before either
 //! side starts its business reader. Both sides prove the secret with an

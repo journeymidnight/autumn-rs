@@ -20,7 +20,7 @@
 |---|---|---|
 | VERSION_HELLO（`version_hello.rs`） | 双方版本能否互通；连接说的是哪套接口（Client / Peer / Admin） | 每条连接的第一帧 |
 | PEER_AUTH（`peer_auth.rs`） | 声明 Peer / Admin 的连接是否持有集群密钥 | 紧跟 VERSION_HELLO，仅 Peer / Admin |
-| AUTH_HELLO（capability token） | 客户端是哪个 principal、能读写哪些 key | 客户端连接上的业务帧（PS；开启 authz 时也在 EN） |
+| CLIENT_AUTH（capability token） | 客户端是哪个 principal、能读写哪些 key | 客户端连接上的业务帧（PS；开启 authz 时也在 EN） |
 
 VERSION_HELLO 声明的身份只决定版本规则和接口范围，本身不是凭证；PEER_AUTH 让
 Peer / Admin 这两种声明需要拿出证明。

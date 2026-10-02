@@ -25,12 +25,12 @@ use bytes::Bytes;
 
 pub struct ConnPool {
     role: autumn_rpc::version_hello::Role,
-    /// Capability token presented (`AUTH_HELLO`) on every connection this pool
+    /// Capability token presented (`CLIENT_AUTH`) on every connection this pool
     /// opens. The SDK's direct-read pool carries one when it holds a
     /// credential: an EN of a cluster that runs authz refuses direct reads on a
     /// connection without it. `None` = present nothing.
     auth_token: RefCell<Option<Bytes>>,
-    /// Bumped with every `auth_token` change, so a connection whose AUTH_HELLO
+    /// Bumped with every `auth_token` change, so a connection whose CLIENT_AUTH
     /// raced one is used once and not pooled.
     auth_gen: std::cell::Cell<u64>,
     clients: RefCell<HashMap<SocketAddr, Rc<RpcClient>>>,
@@ -96,17 +96,17 @@ impl ConnPool {
         self.clients.borrow_mut().clear();
     }
 
-    async fn auth_hello(client: &RpcClient, token: Bytes) -> Result<()> {
+    async fn client_auth(client: &RpcClient, token: Bytes) -> Result<()> {
         use autumn_rpc::partition_rpc::{
-            rkyv_decode, rkyv_encode, AuthHelloReq, AuthHelloResp, MSG_AUTH_HELLO,
+            rkyv_decode, rkyv_encode, ClientAuthReq, ClientAuthResp, MSG_CLIENT_AUTH,
         };
-        let req = rkyv_encode(&AuthHelloReq {
+        let req = rkyv_encode(&ClientAuthReq {
             token: token.to_vec(),
         });
         let resp = client
-            .call_timeout(MSG_AUTH_HELLO, req, autumn_rpc::version_hello::TIMEOUT)
+            .call_timeout(MSG_CLIENT_AUTH, req, autumn_rpc::version_hello::TIMEOUT)
             .await?;
-        let resp: AuthHelloResp = rkyv_decode(&resp).map_err(|e| anyhow!("{e}"))?;
+        let resp: ClientAuthResp = rkyv_decode(&resp).map_err(|e| anyhow!("{e}"))?;
         if resp.code != autumn_rpc::StatusCode::Ok as u8 {
             // Typed, so a caller can tell a refused credential
             // (`PermissionDenied`) from a node not ready to judge it yet.
@@ -154,9 +154,9 @@ impl ConnPool {
             .map_err(|e| anyhow::Error::new(e).context(format!("connect {addr}")))?;
         if let Some(token) = token {
             // Not a "connect" failure: the address is fine, the credential is not.
-            Self::auth_hello(&client, token)
+            Self::client_auth(&client, token)
                 .await
-                .with_context(|| format!("AUTH_HELLO to {addr}"))?;
+                .with_context(|| format!("CLIENT_AUTH to {addr}"))?;
         }
         // The token changed while this connection was being set up (including
         // from none to one): serve this call, but do not pool a connection

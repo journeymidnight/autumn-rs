@@ -1792,9 +1792,9 @@ again after receive so expiry/revocation during await cannot bypass them.
   MSG_SPLIT_PART is refused PermissionDenied without reaching the loop.
   Ablations: admitting a mismatched client, or skipping `check_opcode` in
   `authz_gate`, each turn it red.
-- handles `MSG_AUTH_HELLO`: `verify_auth_hello` (sig + `aud == cluster_id` +
+- handles `MSG_CLIENT_AUTH`: `verify_client_auth` (sig + `aud == cluster_id` +
   `nbf`/`exp`) binds the per-connection `principal: Option<BoundPrincipal>`. When
-  authz is OFF, AUTH_HELLO is a no-op OK so an authz-aware client still works against
+  authz is OFF, CLIENT_AUTH is a no-op OK so an authz-aware client still works against
   a non-authz PS.
 - else runs `authz_check(msg_type, payload, principal, …)`: per the request's user
   key(s), `check_key` (protected prefix ⇒ require an unexpired token whose
@@ -1824,8 +1824,8 @@ buffer uses `write_all`; multiple buffers retain the chunked vectored writer.
    permission hole but a compatibility one: the message lands outside the client
    window silently, so a future floor move would not cover it.
 
-Wire: `MSG_AUTH_HELLO` (0x55) + `AuthHelloReq/Resp`; `StatusCode::PermissionDenied`
-(7). SDK auto-mints/renews the token and AUTH_HELLOs each PS connection
+Wire: `MSG_CLIENT_AUTH` (0x55) + `ClientAuthReq/Resp`; `StatusCode::PermissionDenied`
+(7). SDK auto-mints/renews the token and sends CLIENT_AUTH on each PS connection
 (`ClusterClient::set_tenant_credential`); `AutumnError::PermissionDenied` is terminal
 (not retried).
 

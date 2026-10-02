@@ -691,9 +691,9 @@ port scanners and TCP health probes look exactly like that.
 
 `Negotiated::check_opcode` checks the explicit service/role surface before
 business decode or batch grouping. Role is a declaration, not a credential:
-PEER_AUTH proves a Peer/Admin declaration, AUTH_HELLO a client's principal;
+PEER_AUTH proves a Peer/Admin declaration, CLIENT_AUTH a client's principal;
 cluster identity and ownership checks continue. A Client on an EN may send
-`READ_BYTES`, `READ_BYTES_BULK` and `AUTH_HELLO` (0x55, the same message the PS
+`READ_BYTES`, `READ_BYTES_BULK` and `CLIENT_AUTH` (0x55, the same message the PS
 takes), which binds the principal the EN requires for direct reads when the
 cluster runs authz. Unknown and retired opcodes are refused. Duplicate Hello
 cannot change the connection's role.
@@ -750,10 +750,10 @@ would be refused by a dialer that installed the secret a moment later.
 
 `cap_token::{keyring, bind_principal, still_valid, BoundPrincipal, now_secs}`:
 build the verify keyring from a polled `GetAuthzConfigResp`, verify an
-AUTH_HELLO token (signature, time window, `aud == cluster_id`), and re-check a
+CLIENT_AUTH token (signature, time window, `aud == cluster_id`), and re-check a
 bound principal per request (kid still enabled, token not expired). The PS adds
 its key-prefix checks on top; the EN uses them as they are (identity only).
-`partition_rpc::AUTH_HELLO_MAX_PAYLOAD` bounds the payload either server decodes.
+`partition_rpc::CLIENT_AUTH_MAX_PAYLOAD` bounds the payload either server decodes.
 
 The old `MSG_CLIENT_HELLO` (0x5F, AUH1) codec remains frozen for historical
 fixtures; it no longer admits a live connection. There is no fallback to an

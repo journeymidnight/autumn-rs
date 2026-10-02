@@ -391,7 +391,7 @@ async fn run(args: Args) -> Result<()> {
     // partition server's key checks. Subcommands that touch partition keys need a data-plane capability
     // too — `presplit --namespace fs` reads the declared stripe geometry before
     // overwriting it, and under PROTECT-EVERYTHING that read is denied on a
-    // connection that never sent AUTH_HELLO. The binding stays Raw (autumn-op
+    // connection that never sent CLIENT_AUTH. The binding stays Raw (autumn-op
     // spans namespaces and passes whole keys); `validate_credential_scope` is a
     // no-op for Raw, so this only arms the token, it does not clamp anything.
     if let Some((principal, secret)) = &args.credential {

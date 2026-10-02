@@ -14,6 +14,13 @@
 
 ## Active
 
+### REN-CLIENT-AUTH — 客户端凭证 opcode 改名 AUTH_HELLO → CLIENT_AUTH
+- **Trigger** (2026-10-02 用户): "所以现在内部rpc是先protocol_hello + peer_auth, 外部rpc是protocol_hello +auth_hello? 那么这么看auth_hello应该改明成client_auth，区分外部还是内部请求" → "是AUTH_CLIENT吗？没改吗？"
+- **Scope**: 只改代码 / 测试 / 文档 / CLAUDE.md 中的名字（`MSG_CLIENT_AUTH`、`ClientAuthReq` / `ClientAuthResp`、`CLIENT_AUTH_MAX_PAYLOAD`）；opcode 数值与消息结构不变，不升 WIRE_VERSION；历史账本不改。
+- **Acceptance**: workspace 全目标编译；rpc / stream / client / PS / manager lib 与 `client_surface_freeze`（字节冻结不变）绿。
+- `passes: true`
+- **notes** (2026-10-02): sed 改名 24 个文件 + 手改动词形式；`MSG_CLIENT_AUTH = 0x55`、`ClientAuthReq { token }`、`ClientAuthResp { code, message }` 与改名前逐字节一致，冻结测试的金标十六进制不变（只换键名）。人可读的拒绝消息文本随之变为 CLIENT_AUTH，无代码解析它（匹配的是 "capability token"）。验证：workspace 全目标编译；rpc 97 / stream 222 / client 66 / PS 275 / manager 435 lib、client_surface_freeze 8/8、cluster_secret 4/4 全绿。评审（opus）无阻塞；已采纳：两处 "an" → "a"、两行超 100 列重折、两个 use 列表恢复字母序、三处手改行重折、设计文档框线对齐、`hello` 局部变量改名 `auth_req`。
+
 ### F-AUTH-FAILURE-POLICY — 内部 PEER_AUTH 被拒与客户端凭证被拒的处理
 - **Trigger** (2026-10-02 用户): "所有的内部RPC都有可能出现PEER_AUTH失败的情况，说明远端不允许访问，直接fatal都可以"；"如果是HELLO_AUTH失败，说明client连接了不允许的服务，也正常返回失败就行，由autumn用户自己判断" → 细化（用户确认）："被 manager 拒绝：退出……被 EN 或 PS 拒绝：把对方当作不可达，打 ERROR 日志，按正常的退避重试，不退出。如果其实是自己配错了，下一次心跳就会被 manager 拒绝，然后退出。"
 - **Scope**: (1) 服务端进程（manager / PS / EN）拨号时 PEER_AUTH 失败：对端是 manager → ERROR 并退出；对端是 EN / PS → ERROR，错误照常返回给调用方（按不可达处理），进程不退出。进程内测试与 autumn-op 不退出。(2) SDK 直读时 EN 拒绝客户端凭证（AUTH_HELLO 被拒或读被拒，`PermissionDenied`）→ 不换副本、不回落 PS proxy，返回 `AutumnError::PermissionDenied`。EN 在 authz 配置未知时对 AUTH_HELLO 回 `Unavailable`（暂时状态，不是对凭证的判定）。

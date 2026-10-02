@@ -279,10 +279,10 @@ pub const MSG_GET_REDIRECT: u8 = 0x56;
 /// Ed25519 capability token (see `crate::cap_token`); the PS verifies it once
 /// against its cached public keys and binds the connection's `{allowed_prefixes,
 /// exp}` principal. Subsequent per-request enforcement is a byte `starts_with`
-/// + `exp` check with no re-verify. AUTH_HELLO is OPTIONAL (a connection that
+/// + `exp` check with no re-verify. CLIENT_AUTH is OPTIONAL (a connection that
 /// never sends it is anonymous → denied on protected prefixes only). It carries
 /// no `part_id` — it's connection-level, handled before the routing check.
-pub const MSG_AUTH_HELLO: u8 = 0x55;
+pub const MSG_CLIENT_AUTH: u8 = 0x55;
 
 /// manager → PS "seal + roll these stream tails". The recovery
 /// sweep sends this when it finds an OPEN tail extent (`!sealed`) with a replica
@@ -299,23 +299,23 @@ pub const MSG_AUTH_HELLO: u8 = 0x55;
 /// rolled) is a no-op.
 pub const MSG_ROLL_TAILS: u8 = 0x57;
 
-/// Largest `MSG_AUTH_HELLO` payload a server decodes. A legit token is
+/// Largest `MSG_CLIENT_AUTH` payload a server decodes. A legit token is
 /// <= `cap_token::MAX_CAP_TOKEN_LEN` (8 KiB) plus a tiny rkyv envelope; the
 /// bound is checked BEFORE the decode, which would otherwise copy an
 /// attacker-sized token before the token's own cap could reject it.
-pub const AUTH_HELLO_MAX_PAYLOAD: usize = 16 * 1024;
+pub const CLIENT_AUTH_MAX_PAYLOAD: usize = 16 * 1024;
 
-/// `MSG_AUTH_HELLO` request — the opaque capability token bytes. Sent to a PS,
+/// `MSG_CLIENT_AUTH` request — the opaque capability token bytes. Sent to a PS,
 /// and to an EN before direct reads when the cluster runs authz.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct AuthHelloReq {
+pub struct ClientAuthReq {
     pub token: Vec<u8>,
 }
 
-/// `MSG_AUTH_HELLO` response. `code == CODE_OK` binds the principal; otherwise
+/// `MSG_CLIENT_AUTH` response. `code == CODE_OK` binds the principal; otherwise
 /// `message` carries the reject reason (`cap_token::AuthReject` label).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct AuthHelloResp {
+pub struct ClientAuthResp {
     pub code: u8,
     pub message: String,
 }
@@ -1168,7 +1168,7 @@ mod msg_type_tests {
             MSG_BATCH_GET_BULK,
             MSG_GET_REDIRECT,
             MSG_GET_REDIRECT_MANY,
-            MSG_AUTH_HELLO,
+            MSG_CLIENT_AUTH,
             MSG_ROLL_TAILS,
             MSG_DIAG_TRACE_KEY,
             MSG_DIAG_PARTITION_VP,

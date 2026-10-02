@@ -442,8 +442,8 @@ impl Client {
     ///
     /// (D6-mem wiring): pass `tenant=` + `credential=`
     /// (bytes, from `autumn-op tenant-create`) to bind the connection to a
-    /// tenant credential — the client then AUTH_HELLOs each PS connection
-    /// with a short-TTL token (auto-minted + renewed by the SDK) scoped to
+    /// tenant credential — the client then sends CLIENT_AUTH on each PS
+    /// connection with a short-TTL token (auto-minted + renewed by the SDK) scoped to
     /// the tenant's granted prefixes. Required once `mem/` (or any prefix
     /// this client writes) is enforcement-enabled; harmless against a
     /// cluster with authz off. Both-or-neither: a lone tenant or lone

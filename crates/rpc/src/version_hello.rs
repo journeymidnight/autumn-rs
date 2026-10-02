@@ -1,7 +1,7 @@
 //! Frozen connection bootstrap, independent of rkyv and business FrameDecoder.
 //! Changing these bytes requires a separate bootstrap migration. All integers
 //! are little-endian. PEER_AUTH (`peer_auth.rs`) follows it on Peer/Admin
-//! connections; a client's AUTH_HELLO follows it as a business message.
+//! connections; a client's CLIENT_AUTH follows it as a business message.
 use crate::{RpcError, StatusCode};
 use bytes::Bytes;
 use compio::io::{AsyncReadExt, AsyncWriteExt};
@@ -167,11 +167,11 @@ impl Negotiated {
                 c::is_client_surface_mgr_msg(opcode) || matches!(opcode, m::MSG_GET_CLUSTER_ID | m::MSG_GET_REGIONS)
             }
             (Service::PartitionServer, Role::Client) => c::is_client_surface_ps_msg(opcode),
-            // Direct reads, plus the AUTH_HELLO that binds a principal to them
+            // Direct reads, plus the CLIENT_AUTH that binds a principal to them
             // when the cluster runs authz.
             (Service::ExtentNode, Role::Client) => matches!(
                 opcode,
-                e::MSG_READ_BYTES | e::MSG_READ_BYTES_BULK | crate::partition_rpc::MSG_AUTH_HELLO
+                e::MSG_READ_BYTES | e::MSG_READ_BYTES_BULK | crate::partition_rpc::MSG_CLIENT_AUTH
             ),
             (Service::Manager, Role::Peer) => {
                 known_manager_opcode(opcode) && !m::is_admin_mgr_msg(opcode)
@@ -511,7 +511,7 @@ fn known_ps_opcode(opcode: u8) -> bool {
             | MSG_COMPARE_PUT
             | MSG_COMPARE_WRITE
             | MSG_GET_REDIRECT
-            | MSG_AUTH_HELLO
+            | MSG_CLIENT_AUTH
             | MSG_ROLL_TAILS
             | MSG_GET_REDIRECT_MANY
             | MSG_DIAG_TRACE_KEY
@@ -678,7 +678,7 @@ mod tests {
             .check_opcode(crate::manager_rpc::MSG_TENANT_CREATE)
             .is_ok());
 
-        // A Client on an EN: direct reads and the AUTH_HELLO that binds them.
+        // A Client on an EN: direct reads and the CLIENT_AUTH that binds them.
         let mut en = Negotiated {
             role: Role::Client,
             service: Service::ExtentNode,
@@ -687,15 +687,15 @@ mod tests {
         for op in [
             crate::extent_rpc::MSG_READ_BYTES,
             crate::extent_rpc::MSG_READ_BYTES_BULK,
-            crate::partition_rpc::MSG_AUTH_HELLO,
+            crate::partition_rpc::MSG_CLIENT_AUTH,
         ] {
             assert!(en.check_opcode(op).is_ok(), "Client refused {op:#x}");
         }
         assert!(en.check_opcode(crate::extent_rpc::MSG_APPEND).is_err());
         assert!(en.check_opcode(crate::extent_rpc::MSG_DELETE_EXTENT).is_err());
-        // AUTH_HELLO is a client message; the EN has no handler for it from a member.
+        // CLIENT_AUTH is a client message; the EN has no handler for it from a member.
         en.role = Role::Peer;
-        assert!(en.check_opcode(crate::partition_rpc::MSG_AUTH_HELLO).is_err());
+        assert!(en.check_opcode(crate::partition_rpc::MSG_CLIENT_AUTH).is_err());
         for role in [Role::Client, Role::Peer, Role::Admin] {
             n.role = role;
             assert!(n.check_opcode(MSG_VERSION_HELLO).is_err());

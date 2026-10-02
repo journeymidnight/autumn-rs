@@ -87,7 +87,7 @@ that client compute `lo = 45 > hi = 44` and **refuse itself** at connect.
 The window covers what an embedded client encodes or decodes:
 
 - `partition_rpc`'s data plane — Put / Get / Delete / Head / Range, the three
-  batch families and their bulk forms, `MSG_GET_REDIRECT(_MANY)`, `AUTH_HELLO`.
+  batch families and their bulk forms, `MSG_GET_REDIRECT(_MANY)`, `CLIENT_AUTH`.
   (Server-side multipart upload is retired: `MSG_PUT_BEGIN`/`CHUNK`/`COMMIT`/
   `ABORT` are reserved opcodes with no handlers, and stream writes are ordinary
   Puts under a striped key.);
@@ -143,7 +143,7 @@ The two directions need different carriers:
   `ClusterClient::connect`. The client keeps the number
   (`ClusterClient::negotiated_cluster_wire`). §7 is live: `refresh_regions`
   chooses between `MSG_GET_REGIONS` and `MSG_GET_CLIENT_REGIONS` from it.
-- **client → server** has none. `MSG_AUTH_HELLO` cannot serve: it carries no
+- **client → server** has none. `MSG_CLIENT_AUTH` cannot serve: it carries no
   version, and a client with no credential never sends it at all
   (`crates/client/src/lib.rs` sends it only when a credential is configured), so
   an authz-disabled cluster — fuse, kvcache, every dev cluster — sees it never.
@@ -238,7 +238,7 @@ two messages it sends are un-gated anyway.
 `MSG_GET_CLUSTER_ID` and the hello are exempt: they are how a peer finds out
 what it is talking to.
 
-**Placement.** On the PS the check sits where the `MSG_AUTH_HELLO` arm sits —
+**Placement.** On the PS the check sits where the `MSG_CLIENT_AUTH` arm sits —
 inside `authz_gate`, **above** its `if !authz.gate_active() { return None }`
 early return. Below that line it would never run on an authz-off cluster, which
 is most of them. The manager has no equivalent slot: `handle_connection` decodes

@@ -1,3 +1,12 @@
+Date: 2026-10-02 (3)
+TaskStatus: completed
+Task scope: user "auth_hello应该改明成client_auth" → "是AUTH_CLIENT吗？没改吗？" (REN-CLIENT-AUTH).
+Current summary: AUTH_HELLO renamed CLIENT_AUTH by name only (MSG_CLIENT_AUTH, ClientAuthReq/Resp, CLIENT_AUTH_MAX_PAYLOAD, client_auth fns, docs, CLAUDE.md); opcode and rkyv layout unchanged, no wire bump; ledgers' history left as written.
+Verification: workspace all-targets build; lib rpc 97 / stream 222 / client 66 / PS 275 / manager 435; client_surface_freeze 8/8; cluster_secret 4/4.
+Review: opus, no blocker (wire byte-identical). Applied: "an"→"a" ×2, two >100-col lines rewrapped, two use lists re-sorted, three hand-fixed lines rewrapped, design-doc box aligned, `hello` locals → `auth_req`. Not changed: python `Client.connect` docstring is stale beyond this rename (says tenant=/tenant-create).
+Main gaps: none for this task. Open, awaiting user: flush barrier when an EN dies; --control-port registration bug.
+Next steps: none.
+
 Date: 2026-10-02 (2)
 TaskStatus: completed
 Task scope: user "检查" (the ~2 ms redial) → "所有的内部RPC都有可能出现PEER_AUTH失败的情况，说明远端不允许访问，直接fatal都可以；如果是HELLO_AUTH失败…正常返回失败就行，由autumn用户自己判断" → refined and confirmed: refused by the manager → exit; refused by an EN/PS → ERROR, treat as unreachable (F-AUTH-FAILURE-POLICY).

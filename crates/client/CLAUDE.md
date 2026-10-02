@@ -341,7 +341,7 @@ VERSION_HELLO through RpcClient before business traffic; reconnect repeats it.
 Manager and PS target service types are checked. Normal connect/connect_raw
 use client role; connect_admin and connect_peer use exact internal wire
 matching. Raw namespace binding does not grant admin protocol or auth rights.
-On PS, the existing AUTH_HELLO follows protocol admission.
+On PS, the existing CLIENT_AUTH follows protocol admission.
 
 A client VersionMismatch becomes AutumnError::WireVersionRefused with server
 versions and reason. It stops retries within the current operation; a future
@@ -367,12 +367,12 @@ own: operator-only RPCs are gated by the role the connection proved.
 ## Direct reads under authz
 
 `ensure_token` hands every token it returns to the EN pool
-(`ConnPool::set_auth_token`): each new EN connection sends `AUTH_HELLO` after
+(`ConnPool::set_auth_token`): each new EN connection sends `CLIENT_AUTH` after
 VERSION_HELLO, and a changed token drops the pooled EN connections so they
 rebind (as `ps_conns` already did). `set_principal_credential` clears it. An EN
 of a cluster that runs authz refuses a direct read on a connection without a
 valid bound principal. That refusal (`PermissionDenied`, from a refused
-AUTH_HELLO or a refused read; `en_refusal`) is the answer:
+CLIENT_AUTH or a refused read; `en_refusal`) is the answer:
 `DirectReadOutcome::Denied` returns `AutumnError::PermissionDenied` with no
 other replica and no proxy fallback, because every EN judges the same
 credential the same way and a fallback would only hide the refusal. An EN that
@@ -517,7 +517,7 @@ mapping it to AutumnError. Status errors retain the cached connection; transport
 failures and local timeouts evict it. Routing refresh and retry remain separate:
 a stale epoch still refreshes the region map and rebuilds the request with the
 new epoch. The SDK's manager connection uses the same classification.
-Identity changes and token renewal still clear PS connections so AUTH_HELLO
+Identity changes and token renewal still clear PS connections so CLIENT_AUTH
 binds the new identity/token. Keeping a status-refused connection is not a
 substitute for this authentication lifecycle.
 Tests in src/connection_tests.rs count TCP accepts and verify retry epochs;

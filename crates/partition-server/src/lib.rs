@@ -5676,14 +5676,14 @@ fn authz_now_secs() -> u64 {
 /// `principal` already had, now also load-bearing for the version.
 #[derive(Default)]
 pub(crate) struct ConnGateState {
-    /// Bound by a successful `MSG_AUTH_HELLO`. `None` = anonymous (denied on
+    /// Bound by a successful `MSG_CLIENT_AUTH`. `None` = anonymous (denied on
     /// protected prefixes only).
     pub principal: Option<crate::authz::BoundPrincipal>,
     pub protocol: Option<autumn_rpc::version_hello::Negotiated>,
 }
 
 /// Checks the negotiated role before business DTO decoding, then preserves
-/// existing AUTH_HELLO and key-prefix/expiry authorization. The bootstrap
+/// existing CLIENT_AUTH and key-prefix/expiry authorization. The bootstrap
 /// itself completes before this gate or the business decoder is reached.
 fn authz_gate(
     msg_type: u8,
@@ -5708,52 +5708,54 @@ fn authz_gate(
         }
     }
     let principal = &mut conn.principal;
-    if msg_type == MSG_AUTH_HELLO {
-        // When authz is OFF, accept AUTH_HELLO as a no-op (nothing is enforced;
+    if msg_type == MSG_CLIENT_AUTH {
+        // When authz is OFF, accept CLIENT_AUTH as a no-op (nothing is enforced;
         // the token is simply unused) so an authz-aware client works against a
         // non-authz PS. We can't verify without keys, and don't need to.
         if !authz.is_enabled() {
-            let resp = AuthHelloResp {
+            let resp = ClientAuthResp {
                 code: StatusCode::Ok as u8,
                 message: String::new(),
             };
             return Some(
-                Frame::response(req_id, MSG_AUTH_HELLO, partition_rpc::rkyv_encode(&resp)).encode(),
+                Frame::response(req_id, MSG_CLIENT_AUTH, partition_rpc::rkyv_encode(&resp))
+                    .encode(),
             );
         }
         // Bound the UNAUTHENTICATED payload before the rkyv decode.
-        if payload.len() > partition_rpc::AUTH_HELLO_MAX_PAYLOAD {
-            let resp = AuthHelloResp {
+        if payload.len() > partition_rpc::CLIENT_AUTH_MAX_PAYLOAD {
+            let resp = ClientAuthResp {
                 code: StatusCode::InvalidArgument as u8,
-                message: "AUTH_HELLO too large".to_string(),
+                message: "CLIENT_AUTH too large".to_string(),
             };
             return Some(
-                Frame::response(req_id, MSG_AUTH_HELLO, partition_rpc::rkyv_encode(&resp)).encode(),
+                Frame::response(req_id, MSG_CLIENT_AUTH, partition_rpc::rkyv_encode(&resp))
+                    .encode(),
             );
         }
         let now = authz_now_secs();
         let snap = authz.snapshot();
-        let resp = match partition_rpc::rkyv_decode::<AuthHelloReq>(payload) {
-            Ok(req) => match crate::authz::verify_auth_hello(&req.token, &snap, now) {
+        let resp = match partition_rpc::rkyv_decode::<ClientAuthReq>(payload) {
+            Ok(req) => match crate::authz::verify_client_auth(&req.token, &snap, now) {
                 Ok(p) => {
                     *principal = Some(p);
-                    AuthHelloResp {
+                    ClientAuthResp {
                         code: StatusCode::Ok as u8,
                         message: String::new(),
                     }
                 }
-                Err(reason) => AuthHelloResp {
+                Err(reason) => ClientAuthResp {
                     code: StatusCode::PermissionDenied as u8,
                     message: reason,
                 },
             },
-            Err(e) => AuthHelloResp {
+            Err(e) => ClientAuthResp {
                 code: StatusCode::InvalidArgument as u8,
-                message: format!("bad AUTH_HELLO: {e}"),
+                message: format!("bad CLIENT_AUTH: {e}"),
             },
         };
         return Some(
-            Frame::response(req_id, MSG_AUTH_HELLO, partition_rpc::rkyv_encode(&resp)).encode(),
+            Frame::response(req_id, MSG_CLIENT_AUTH, partition_rpc::rkyv_encode(&resp)).encode(),
         );
     }
     // Fast path: NEITHER layer configured (single relaxed atomic load each).
@@ -5846,7 +5848,7 @@ fn push_one_frame_to_inflight(
         tx_bufs.push(Frame::response(req_id, msg_type, Bytes::new()).encode());
         return;
     }
-    // AUTH_HELLO bind / per-request key-prefix + exp gate, BEFORE
+    // CLIENT_AUTH bind / per-request key-prefix + exp gate, BEFORE
     // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
     // ready completion; it never reaches serve/delegate.
     if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, conn) {
@@ -6026,7 +6028,7 @@ async fn handle_ps_connection(
     )
     .await?;
     let mut decoder = FrameDecoder::new();
-    // The negotiated protocol precedes the principal bound by AUTH_HELLO.
+    // The negotiated protocol precedes the principal bound by CLIENT_AUTH.
     let mut conn_state = ConnGateState {
         protocol: Some(protocol),
         ..Default::default()
@@ -15104,7 +15106,7 @@ mod maintenance_phase_tests {
 mod authz_enforcement_tests {
     //! Stage 2: end-to-end connection-layer enforcement over a real
     //! TCP `handle_ps_connection`, using the mock req_rx loop (part=None). Drives
-    //! a signed AUTH_HELLO + cross-tenant requests and asserts admit/deny.
+    //! a signed CLIENT_AUTH + cross-tenant requests and asserts admit/deny.
     use super::*;
     use autumn_rpc::cap_token::{sign_claims, CapClaims, CAP_TYP, CAP_VER};
     use autumn_rpc::manager_rpc::{AuthzPublicKey, GetAuthzConfigResp};
@@ -15312,7 +15314,7 @@ mod authz_enforcement_tests {
     }
 
     #[test]
-    fn auth_hello_then_cross_tenant_deny_and_anonymous_deny() {
+    fn client_auth_then_cross_tenant_deny_and_anonymous_deny() {
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let sk = SigningKey::from_bytes(&[11u8; 32]);
@@ -15362,13 +15364,13 @@ mod authz_enforcement_tests {
             .into_split();
             let mut dec = FrameDecoder::new();
 
-            // (1) AUTH_HELLO with tenant acme's token → OK, binds principal.
+            // (1) CLIENT_AUTH with tenant acme's token → OK, binds principal.
             // TENANT-FIRST: the grant is the WHOLE tenant `acme/`.
             let token = mint(&sk, vec![b"acme/".to_vec()]);
-            let hello = partition_rpc::rkyv_encode(&AuthHelloReq { token });
-            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_AUTH_HELLO, hello).await;
-            assert!(!f.is_error(), "AUTH_HELLO should succeed");
-            let resp: AuthHelloResp = partition_rpc::rkyv_decode(&f.payload).unwrap();
+            let auth_req = partition_rpc::rkyv_encode(&ClientAuthReq { token });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_CLIENT_AUTH, auth_req).await;
+            assert!(!f.is_error(), "CLIENT_AUTH should succeed");
+            let resp: ClientAuthResp = partition_rpc::rkyv_decode(&f.payload).unwrap();
             assert_eq!(resp.code, StatusCode::Ok as u8, "{}", resp.message);
 
             // (2) GET acme/mem/doc → authorized → delegates → OK.
@@ -15477,7 +15479,7 @@ mod authz_enforcement_tests {
             .await
             .into_split();
             let mut dec = FrameDecoder::new();
-            // No AUTH_HELLO → anonymous. GET on protected mem/ → denied.
+            // No CLIENT_AUTH → anonymous. GET on protected mem/ → denied.
             let g = partition_rpc::rkyv_encode(&GetReq {
                 part_id: 7,
                 key: b"mem/acme/doc".to_vec(),

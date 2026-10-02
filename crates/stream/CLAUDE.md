@@ -355,14 +355,14 @@ arrive; restoring the single-inflight pause fails it.
 connections (cluster secret, `autumn_rpc::peer_auth`): a process that cannot
 prove the secret never reaches `APPEND` / `DELETE_EXTENT` / `FENCE_EXTENT` or any
 other member opcode. A Client connection may send only `READ_BYTES`,
-`READ_BYTES_BULK` and `AUTH_HELLO` (`check_opcode`).
+`READ_BYTES_BULK` and `CLIENT_AUTH` (`check_opcode`).
 
 **Direct reads under authz (`ClientAuthz`).** Each shard polls
 `MSG_GET_AUTHZ_CONFIG` every 5 s (`spawn_client_authz_poll_loop`; a failed poll
 keeps the last answer). `Unknown` until the first answer — reads and
-`AUTH_HELLO` refused `Unavailable` (not a verdict on the token, so the SDK does
+`CLIENT_AUTH` refused `Unavailable` (not a verdict on the token, so the SDK does
 not mistake it for one), never served unchecked; `Off` (authz off, or no manager) — no
-token needed; `On` — `client_gate` answers `AUTH_HELLO` itself (verify with
+token needed; `On` — `client_gate` answers `CLIENT_AUTH` itself (verify with
 `cap_token::bind_principal`, bind the connection's `principal`) and refuses a
 read unless the bound principal is `still_valid` (kid enabled, not expired),
 `PermissionDenied` as a frame-level error, which a bulk read surfaces as its
@@ -372,13 +372,13 @@ and a keyring lookup per read frame, only on Client connections with authz on.
 Tests: `client_direct_read_auth_tests` (anonymous / forged / expired / valid /
 revoked kid / Unknown / Off / member connection).
 
-**`ConnPool::set_auth_token`**: a pool that holds a token sends `AUTH_HELLO` on
+**`ConnPool::set_auth_token`**: a pool that holds a token sends `CLIENT_AUTH` on
 every connection it opens, right after the handshake and before pooling it
-(`AUTH_HELLO to <addr>` context, deliberately not `connect <addr>`: the address
+(`CLIENT_AUTH to <addr>` context, deliberately not `connect <addr>`: the address
 is fine, so `is_connect_failure` must not read it as a stale node). A refusal
 comes back as `RpcError::Status` with the EN's code, so the SDK can tell a
 refused credential (`PermissionDenied`) from an EN not ready (`Unavailable`). A changed
-token drops the pooled connections; a connection whose AUTH_HELLO raced a
+token drops the pooled connections; a connection whose CLIENT_AUTH raced a
 change serves its one call and is not pooled.
 
 ### Per-extent owner (write path) — appends serialized by one task

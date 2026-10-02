@@ -663,7 +663,7 @@ enum DirectReadOutcome {
 }
 
 /// The extent node's refusal of this client, if that is what `e` is: a
-/// refused AUTH_HELLO, or a read refused for want of a valid credential. A
+/// refused CLIENT_AUTH, or a read refused for want of a valid credential. A
 /// node that cannot judge yet answers `Unavailable`, which is not this.
 fn en_refusal(e: &anyhow::Error) -> Option<String> {
     e.chain().find_map(|c| match c.downcast_ref::<RpcError>() {
@@ -954,12 +954,12 @@ pub struct ClusterClient {
     /// disables fast-fail (every attempt uses the full `rpc_timeout`).
     first_attempt_timeout: Cell<Option<Duration>>,
     /// optional tenant credential + cached token. `None` = anonymous
-    /// (no AUTH_HELLO sent — the pre-authz behavior; works against non-authz
-    /// clusters). When `Some`, every fresh PS connection sends AUTH_HELLO with a
+    /// (no CLIENT_AUTH sent — the pre-authz behavior; works against non-authz
+    /// clusters). When `Some`, every fresh PS connection sends CLIENT_AUTH with a
     /// (lazily minted, auto-renewed) token before use.
     auth: RefCell<Option<ClientAuth>>,
     /// bumped by `set_tenant_credential`. `get_ps_client` captures it
-    /// before the AUTH_HELLO await and refuses to CACHE a connection if the
+    /// before the CLIENT_AUTH await and refuses to CACHE a connection if the
     /// identity changed mid-connect — so a principal switch can't leave a
     /// wrong-identity-bound connection in the pool (coco P2).
     auth_gen: Cell<u64>,
@@ -1896,8 +1896,8 @@ impl ClusterClient {
 
     /// Get or create a PS RPC connection. Auto-reconnects on failure.
     /// set this client's tenant credential. Enables authz — every
-    /// fresh PS connection AUTH_HELLOs with a (lazily minted, auto-renewed)
-    /// token scoped to the tenant's granted prefixes. Anonymous (no credential,
+    /// fresh PS connection sends CLIENT_AUTH with a (lazily minted,
+    /// auto-renewed) token scoped to the tenant's granted prefixes. Anonymous (no credential,
     /// the default) works unchanged against non-authz clusters. Clears cached PS
     /// connections so they rebind under the new identity.
     pub fn set_principal_credential(&self, principal: impl Into<String>, credential: Vec<u8>) {
@@ -2094,29 +2094,29 @@ impl ClusterClient {
             .open_rpc(addr, autumn_rpc::version_hello::Service::PartitionServer)
             .await
             .with_context(|| format!("connect PS {ps_addr}"))?;
-        // BEFORE the AUTH_HELLO: the PS gates AUTH_HELLO itself on the client
+        // BEFORE the CLIENT_AUTH: the PS gates CLIENT_AUTH itself on the client
         // window, so a refused client that sent its credential first would be
         // told "wire version" about a frame it thought was about identity.
         self.say_hello(&client, ps_addr).await?;
-        // Bind this connection's principal via AUTH_HELLO before it's cached.
+        // Bind this connection's principal via CLIENT_AUTH before it's cached.
         if let Some(token) = token {
-            let hello = rkyv_encode(&AuthHelloReq { token });
-            // Bounded by rpc_timeout so a hung AUTH_HELLO can't wedge connect
+            let auth_req = rkyv_encode(&ClientAuthReq { token });
+            // Bounded by rpc_timeout so a hung CLIENT_AUTH can't wedge connect
             // (coco P2) — mirrors ps_call_with_timeout.
             let resp_bytes = match self.rpc_timeout.get() {
-                None => client.call(MSG_AUTH_HELLO, hello).await,
-                Some(t) => client.call_timeout(MSG_AUTH_HELLO, hello, t).await,
+                None => client.call(MSG_CLIENT_AUTH, auth_req).await,
+                Some(t) => client.call_timeout(MSG_CLIENT_AUTH, auth_req, t).await,
             }
-            .with_context(|| format!("AUTH_HELLO to PS {ps_addr}"))?;
-            let resp: AuthHelloResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            .with_context(|| format!("CLIENT_AUTH to PS {ps_addr}"))?;
+            let resp: ClientAuthResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
             if resp.code != StatusCode::Ok as u8 {
                 return Err(anyhow!(
-                    "AUTH_HELLO rejected by PS {ps_addr}: {}",
+                    "CLIENT_AUTH rejected by PS {ps_addr}: {}",
                     resp.message
                 ));
             }
             // Identity-switch guard (coco P2): if `set_tenant_credential` ran
-            // during the connect + AUTH_HELLO await, this conn is bound to the
+            // during the connect + CLIENT_AUTH await, this conn is bound to the
             // OLD principal — serve this in-flight call but DON'T cache it, so a
             // later call rebinds under the new identity.
             if self.auth_gen.get() != gen {

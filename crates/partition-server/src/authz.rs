@@ -3,7 +3,7 @@
 //! The PS is the KV-layer enforcement point (per the design decision that auth
 //! is enforced at the KV layer). It holds ONLY the manager's PUBLIC verifying keys (fetched via
 //! `MSG_GET_AUTHZ_CONFIG`), verifies a capability token ONCE per connection
-//! (`MSG_AUTH_HELLO`), and does a per-request byte `starts_with` + `exp` check.
+//! (`MSG_CLIENT_AUTH`), and does a per-request byte `starts_with` + `exp` check.
 //! It NEVER calls the manager to enforce — the data plane is independent of the
 //! control plane. See `docs/data_plane_authz_design.md`.
 //!
@@ -19,8 +19,8 @@ pub use autumn_rpc::cap_token::BoundPrincipal;
 use autumn_rpc::manager_rpc::GetAuthzConfigResp;
 use autumn_rpc::partition_rpc::{
     self, parse_put_bulk_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
-    BatchPutBulkReq, HeadReq, PutReq, RangeReq, MSG_AUTH_HELLO, MSG_BATCH_GET_BULK,
-    MSG_BATCH_PUT, MSG_BATCH_PUT_BULK, MSG_DELETE,
+    BatchPutBulkReq, HeadReq, PutReq, RangeReq, MSG_BATCH_GET_BULK, MSG_BATCH_PUT,
+    MSG_BATCH_PUT_BULK, MSG_CLIENT_AUTH, MSG_DELETE,
     MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_BULK, MSG_HEAD, MSG_PUT, MSG_PUT_BULK, MSG_RANGE,
     PUT_BULK_HEADER_LEN,
 };
@@ -47,7 +47,7 @@ pub struct AuthzInner {
     pub clock_skew_secs: u64,
     /// This cluster's id = the required token `aud`. A token whose `aud` differs
     /// (minted for another cluster that shares signing keys) is rejected at
-    /// AUTH_HELLO. Empty = unknown → the aud check is skipped (degraded).
+    /// CLIENT_AUTH. Empty = unknown → the aud check is skipped (degraded).
     pub cluster_id: String,
     /// D7: ALL registered namespace prefixes (the D2 registry, from
     /// `GetAuthzConfigResp.namespaces`). Layer-A's data source: `check_layer_a`
@@ -153,10 +153,10 @@ impl AuthzState {
     }
 }
 
-/// Verify an `AUTH_HELLO` token against the cached public keys → the bound
-/// principal, or a reject reason (string, for the AuthHelloResp message /
+/// Verify a `CLIENT_AUTH` token against the cached public keys → the bound
+/// principal, or a reject reason (string, for the ClientAuthResp message /
 /// metrics).
-pub fn verify_auth_hello(
+pub fn verify_client_auth(
     token: &[u8],
     inner: &AuthzInner,
     now: u64,
@@ -190,7 +190,7 @@ fn check_key(
 ) -> Option<(StatusCode, String)> {
     let p = match principal {
         Some(p) => p,
-        None => return denied("protected key requires a capability token (no AUTH_HELLO on this connection)"),
+        None => return denied("protected key requires a capability token (no CLIENT_AUTH on this connection)"),
     };
     // A kid disabled / rotated out since this connection bound revokes it.
     if let Err(m) = autumn_rpc::cap_token::still_valid(p, &inner.keys, now, inner.clock_skew_secs) {
@@ -222,7 +222,7 @@ fn check_range(
     // grant → allowed.
     let p = match principal {
         Some(p) => p,
-        None => return denied("protected range requires a capability token (no AUTH_HELLO on this connection)"),
+        None => return denied("protected range requires a capability token (no CLIENT_AUTH on this connection)"),
     };
     if let Err(m) = autumn_rpc::cap_token::still_valid(p, &inner.keys, now, inner.clock_skew_secs) {
         return denied(m);
@@ -249,7 +249,7 @@ fn check_range(
 /// here that extracts the key and calls `check_key` / `check_range`.** The
 /// catch-all `_ => None` admits ungated, which is correct ONLY for
 /// non-key-scoped ops (maintenance / split / merge / discards / diag — admin
-/// auth is a separate concern) and `AUTH_HELLO` (handled by the connection
+/// auth is a separate concern) and `CLIENT_AUTH` (handled by the connection
 /// loop). Adding a new keyed read/write RPC without an arm here silently lets
 /// it read/write any tenant's `mem/` prefix. If you add one, add it here too.
 pub fn authz_check(
@@ -352,11 +352,11 @@ pub fn authz_check(
             None
         }
         // Catch-all = ADMIT ungated. Correct ONLY for non-key-scoped ops
-        // (maintenance / split / merge / discards / diag) and AUTH_HELLO (bound
+        // (maintenance / split / merge / discards / diag) and CLIENT_AUTH (bound
         // by the connection loop). A new KEYED data RPC landing here is an authz
         // bypass — see the INVARIANT on this fn's doc comment.
         _ => {
-            debug_assert_ne!(msg_type, MSG_AUTH_HELLO);
+            debug_assert_ne!(msg_type, MSG_CLIENT_AUTH);
             None
         }
     }
@@ -630,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_auth_hello_binds_principal() {
+    fn verify_client_auth_binds_principal() {
         let sk = SigningKey::from_bytes(&[3u8; 32]);
         let vk = sk.verifying_key();
         let mut keys = HashMap::new();
@@ -656,7 +656,7 @@ mod tests {
             allowed_prefixes: vec![b"mem/acme/".to_vec()],
         };
         let token = sign_claims(&sk, &mk("cluster-x")).unwrap();
-        let p = verify_auth_hello(&token, &inner, now).unwrap();
+        let p = verify_client_auth(&token, &inner, now).unwrap();
         assert_eq!(p.allowed_prefixes, vec![b"mem/acme/".to_vec()]);
         assert_eq!(p.exp, now + 3600);
         assert_eq!(p.kid, 1);
@@ -669,10 +669,10 @@ mod tests {
             cluster_id: "cluster-x".to_string(),
             namespaces: Vec::new(),
         };
-        assert!(verify_auth_hello(&token, &inner2, now).is_err());
+        assert!(verify_client_auth(&token, &inner2, now).is_err());
         // wrong audience (token minted for a DIFFERENT cluster) → reject (coco P1)
         let cross = sign_claims(&sk, &mk("cluster-OTHER")).unwrap();
-        assert!(verify_auth_hello(&cross, &inner, now).is_err());
+        assert!(verify_client_auth(&cross, &inner, now).is_err());
     }
 
     #[test]

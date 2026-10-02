@@ -171,7 +171,7 @@ whether the stranger claims to be an extent node or a manager.
 3. Start with `--cluster-secret-file` on every server; drop `--admin-token[-file]`
    from the manager, autumn-op and dashboard command lines (they are refused).
 4. Embedded clients inside the client window keep working. On a cluster with
-   authz on, a client built before this change does not send AUTH_HELLO to the
+   authz on, a client built before this change does not send CLIENT_AUTH to the
    EN, so its direct reads fall back to the PS proxy (slower, still correct)
    until it is rebuilt.
 
@@ -2130,7 +2130,7 @@ distinct prefixes, not requests.
 Server-side key-range authorization for registered namespaces
 (`data_plane_authz_design.md`): the manager acts as a KDC that mints
 short-TTL Ed25519 capability tokens; the PS verifies them per connection
-(`AUTH_HELLO`) and enforces per request. **OPT-IN** — with no signing key
+(`CLIENT_AUTH`) and enforces per request. **OPT-IN** — with no signing key
 configured nothing changes (fuse / kvcache / perf-check / chaos all run
 authz-off, anonymous, zero hot-path cost).
 
@@ -2171,8 +2171,8 @@ $AO principal-create --principal acme --grant mem/acme/ > /path/acme.cred
 # `--cluster-secret-file` and `--credential-file` work BEFORE or AFTER the
 # subcommand — position does not matter.
 
-# 4) Use it from the SDK (auto-mints + renews tokens, AUTH_HELLOs each PS
-#    connection and each extent-node direct-read connection; principal read from
+# 4) Use it from the SDK (auto-mints + renews tokens, sends CLIENT_AUTH on each
+#    PS connection and each extent-node direct-read connection; principal read from
 #    the credential file):
 #      ClusterClient::connect_with_credential(mgr, "mem/acme", principal, secret)
 #    Cross-scope / anonymous access to a protected prefix fails PermissionDenied.

@@ -9,12 +9,12 @@
  签发/续期(KDC)          验证 + 强制(数据面)
 ┌──────────────┐        ┌──────────────────────────┐
 │ manager      │  公钥   │ partition-server (KV层)   │
-│ leader:      │ ─────▶ │  AUTH_HELLO 验签(公钥)     │
+│ leader:      │ ─────▶ │  CLIENT_AUTH 验签(公钥)    │
 │  · 私钥签token│        │  每请求: key前缀 + exp     │
 │  · principal │        │  ★ 从不回调 manager 做强制 │
 │    账户库    │        └──────────────────────────┘
 └──────┬───────┘
-       │ MINT_TOKEN(短TTL)         ▲ AUTH_HELLO(token)
+       │ MINT_TOKEN(短TTL)         ▲ CLIENT_AUTH(token)
        ▼                           │
    ┌────────────────────────────────┐
    │ client (SDK / fuse / kvcache)   │
@@ -105,7 +105,7 @@ client 库懒 mint，并在 `exp` 前 `TOKEN_RENEW_MARGIN_SECS = 300` 秒自动�
 
 ### 5.3 连接 + 强制（PS）
 
-client 连 PS → 首帧 `MSG_AUTH_HELLO{token}`（`0x55`）→ PS 按 `kid` 取公钥
+client 连 PS → 首帧 `MSG_CLIENT_AUTH{token}`（`0x55`）→ PS 按 `kid` 取公钥
 **本地验签**、校验 `aud == cluster_id` → 绑该连接
 `BoundPrincipal{allowed_prefixes, exp, kid}` → **每个 KV 请求**做前缀 + 有效期
 检查，不符回 `StatusCode::PermissionDenied`(=7)。**PS 全程不调 manager。**
@@ -126,13 +126,13 @@ clock_skew_secs, cluster_id, …}` → 本地缓存
   接在 `push_one_frame_to_inflight` 与 `d1_fast_path_round_trip` 两条路径上。
   `AuthzState::is_enabled()` 是单个 `AtomicBool`，关时一次 relaxed load，零成本。
 - **protect-everything**：authz 一旦开启，**每个 key、每个 range 都要 token**。
-  没有「非受保护区间」的概念 —— 匿名连接（没发过 AUTH_HELLO）对任何 key 都被拒。
+  没有「非受保护区间」的概念 —— 匿名连接（没发过 CLIENT_AUTH）对任何 key 都被拒。
   `GetAuthzConfigResp.protected_prefixes` 字段仍在 wire 上（manager 从 namespace
   注册表里 owner 非空的行桥接过来），但**不参与 PS 的强制判定**。
 - **`authz_check` 的 INVARIANT（load-bearing）**：每个携带 user key 的数据面
   msg_type **必须**在 `authz_check` 里有一条 arm 去取 key 并调
   `check_key` / `check_range`。catch-all `_ => None`（放行）只对非 key 作用域的
-  op（maintenance / split / merge / discards / diag）与 `AUTH_HELLO` 正确。
+  op（maintenance / split / merge / discards / diag）与 `CLIENT_AUTH` 正确。
   新增一个带 key 的读写 RPC 而忘了加 arm = 一个 authz 旁路。
   当前有 arm 的：`MSG_GET_BULK` / `MSG_GET_REDIRECT` /
   `MSG_GET_REDIRECT_MANY` / `MSG_HEAD` / `MSG_DELETE` / `MSG_PUT` /
@@ -185,7 +185,7 @@ clock_skew_secs, cluster_id, …}` → 本地缓存
 
 ## 8. 连接层规则（防串 principal）
 
-- **一条连接 = 一个 principal**：PS 首帧 AUTH_HELLO 后绑定，**不允许有 inflight
+- **一条连接 = 一个 principal**：PS 首帧 CLIENT_AUTH 后绑定，**不允许有 inflight
   时静默 rebind**（要 re-auth 就 drain inflight + auth epoch，或直接关连接重连）。
 - **client 连接池按 principal 分区**：换 token 强制 drop 该 principal 的 PS 连接
   （`ensure_token` 续期路径做这件事）。**不建议一个 `ClusterClient` 服务多个
@@ -204,11 +204,11 @@ TLS / mTLS；per-user RBAC / 角色 / ACL 表；抗被攻破的 manager；抗 MI
 descriptor 前做 `check_key`，但 EN 收到的只是坐标，不知道它属于哪个 key。
 
 - **开启 authz 时**，EN 只在绑定了 principal 的 Client 连接上服务直读：客户端
-  先发同一个 `MSG_AUTH_HELLO{token}`，EN 用同一份公钥验签、校验 `aud`、绑定
+  先发同一个 `MSG_CLIENT_AUTH{token}`，EN 用同一份公钥验签、校验 `aud`、绑定
   `BoundPrincipal`，此后每个读请求检查 kid 仍启用、token 未过期（与 PS 的
   `still_valid` 是同一个函数，`cap_token.rs`）。没有绑定、token 过期、kid 被禁，
   一律 `PermissionDenied`。
-- **被拒就是结果**：EN 拒绝这个客户端（AUTH_HELLO 被拒，或读请求因凭证被拒）时，
+- **被拒就是结果**：EN 拒绝这个客户端（CLIENT_AUTH 被拒，或读请求因凭证被拒）时，
   SDK 不换副本、不回落 PS proxy，直接返回 `AutumnError::PermissionDenied`，由调用方
   决定怎么办：同一份凭证在每个 EN 上的判定都相同，换地方重试只会把拒绝藏起来。
   其他直读失败（节点不可达、超时、布局过期）照旧换副本再回落 proxy。
@@ -217,13 +217,13 @@ descriptor 前做 `check_key`，但 EN 收到的只是坐标，不知道它属�
 - **EN 不验范围**：一个合法 principal 仍可凭猜中的坐标读到别的 tenant 的 extent。
   要堵这一点需要 PS 为每个 descriptor 签名、EN 验签，未做。
 - **EN 取配置**：每个 shard 每 5 s 轮询 `MSG_GET_AUTHZ_CONFIG`（`ClientAuthz`）。
-  配置到手之前（`Unknown`）拒绝直读和 AUTH_HELLO，都回 `Unavailable`（暂时的，
+  配置到手之前（`Unknown`）拒绝直读和 CLIENT_AUTH，都回 `Unavailable`（暂时的，
   不是对凭证的判定，SDK 照常回落 proxy），不在不知道是否开启 authz 的状态下放行；
   manager 不可达时沿用上一次的结果。
 - **SDK**：`ensure_token` 每次拿到 token 都交给直读连接池
-  （`ConnPool::set_auth_token`），新连接在 VERSION_HELLO 后自动 `AUTH_HELLO`；
+  （`ConnPool::set_auth_token`），新连接在 VERSION_HELLO 后自动 `CLIENT_AUTH`；
   token 换了，池里的旧连接全部丢弃重连。
-- **集群成员（Peer）**：EN 之间、PS 到 EN 的连接不发 AUTH_HELLO，它们由集群密钥
+- **集群成员（Peer）**：EN 之间、PS 到 EN 的连接不发 CLIENT_AUTH，它们由集群密钥
   认证（`cluster_secret_design.md`），可以调用 EN 的全部接口。
 
 ## 11. 参照
