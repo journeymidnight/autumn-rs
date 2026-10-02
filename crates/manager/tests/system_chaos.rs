@@ -4567,7 +4567,7 @@ mod accounting_checker_tests {
 ///
 /// After the nemesis loop has stopped and the cluster is restored to full
 /// health, fully decommission ONE extent-node the HDFS way: fence it, wait for
-/// the fence-drain open-tail sweep + `fenced_only` recovery to relocate every
+/// the fence-drain open-tail sweep + fenced-slot recovery to relocate every
 /// extent off it, then `MSG_REMOVE_NODE` — which refuses with
 /// `CODE_PRECONDITION` (listing the still-referencing extents) until the node is
 /// fully drained, and tombstones the address on success. This exercises the
@@ -4613,7 +4613,7 @@ async fn run_terminal_decommission(
         alive.len()
     );
 
-    // 1. Fence (force) — arms the fence-drain open-tail drain + fenced_only
+    // 1. Fence (force) — arms the fence-drain open-tail drain + fenced-slot
     //    recovery of the victim's sealed slots, and hard-excludes it from new
     //    placement.
     let resp = mgr

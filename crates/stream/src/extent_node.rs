@@ -7100,6 +7100,99 @@ impl ExtentNode {
     // gone — the EC rebuild was its last caller and now reads per stripe.
     // `[offset, size)` range copy used by `handle_copy_extent`.)
 
+    /// The members a full-extent copy may read from, in the order to try them.
+    ///
+    /// Never a slot the manager marked CORRUPT (`corrupt`, from
+    /// `ExtentInfoResp.corrupt_slots`): its copy is full length with wrong
+    /// bytes, and a source is accepted on length alone — taking it puts the rot
+    /// into the copy being built, which then gets its bit set and spreads to
+    /// the next rebuild that reads it.
+    ///
+    /// A dark member that is NOT marked stays a source. It was down when the
+    /// extent was sealed: every acked byte is on it (an append is acked only
+    /// once every replica has it), and it is exactly what the recovery
+    /// reconcile-down weighs when the lit members are gone. Excluding it too
+    /// left an extent whose only lit member was fenced or lost unrecoverable
+    /// with its acked bytes sitting on the dark ones.
+    ///
+    /// Lit members (`avali` set) first: they are the ones the manager vouches
+    /// for at `sealed_length`.
+    fn copy_sources(info: &ExtentInfo, corrupt: u32) -> Vec<u64> {
+        let lit = |slot: usize| slot < 32 && info.avali & (1u32 << slot) != 0;
+        let marked = |slot: usize| slot < 32 && corrupt & (1u32 << slot) != 0;
+        let members: Vec<(usize, u64)> = info
+            .replicates
+            .iter()
+            .chain(info.parity.iter())
+            .copied()
+            .enumerate()
+            .filter(|(slot, _)| !marked(*slot))
+            .collect();
+        members
+            .iter()
+            .filter(|(slot, _)| lit(*slot))
+            .chain(members.iter().filter(|(slot, _)| !lit(*slot)))
+            .map(|(_, node_id)| *node_id)
+            .collect()
+    }
+
+    /// Does a corrupt-marked member hold the reconcile-down back? Its bytes
+    /// are never COPIED, but it is weighed like any other member: absent
+    /// (`Err`) it counts as unverified exactly as an unreachable unmarked
+    /// member does, and present it holds back only if it has bytes past the
+    /// longest readable copy (`Ok(true)`) — proof that the seal's bytes exist,
+    /// only on a copy known to be wrong. A marked copy no longer than the best
+    /// one proves nothing.
+    ///
+    /// Never the slot being replaced (`best_effort`): only finishing this very
+    /// rebuild clears its mark, so holding back on it could never end. It is
+    /// excluded from the accounting as it always was.
+    ///
+    /// Holding back on another member is TERMINAL: the extent is sealed, so
+    /// every length here is fixed and every retry reaches the same verdict.
+    /// The only copy that holds the seal's tail is known to be wrong; that is
+    /// an operator's decision (restore the bytes, or accept the loss by
+    /// removing that member), not one to make by copying rot or dropping
+    /// committed bytes.
+    fn marked_member_holds_back(
+        bytes_past_best: Result<bool, String>,
+        best_effort: bool,
+    ) -> bool {
+        if best_effort {
+            return false;
+        }
+        match bytes_past_best {
+            Ok(longer) => longer,
+            Err(_) => true,
+        }
+    }
+
+    /// Whether `node_id`'s copy has a byte at `offset` — a one-byte read,
+    /// bounded by the node's physical file, whose content is not used.
+    async fn peer_has_bytes_past(
+        nodes: &HashMap<u64, (String, Vec<u16>)>,
+        node_id: u64,
+        extent: &ExtentInfo,
+        offset: u64,
+    ) -> Result<bool, String> {
+        let (base, shard_ports) = nodes
+            .get(&node_id)
+            .ok_or_else(|| format!("node {node_id} absent from nodes_map"))?;
+        let addr = shard_addr_for_extent(base, shard_ports, extent.extent_id);
+        let sock = parse_addr(&addr).map_err(|e| format!("addr {addr}: {e}"))?;
+        let got = Self::read_bytes_chunk(
+            sock,
+            &addr,
+            extent.extent_id,
+            extent.eversion,
+            offset,
+            1,
+            PayloadRef::in_dat(),
+        )
+        .await?;
+        Ok(!got.is_empty())
+    }
+
     /// Stage C: stream the full sealed extent from a healthy peer straight
     /// into `dest`, chunk-by-chunk (read one `FILE_IO_CHUNK_BYTES` chunk →
     /// `pwrite` it → drop it), so peak RAM is ONE chunk regardless of extent
@@ -7114,7 +7207,13 @@ impl ExtentNode {
     async fn stream_extent_from_sources(
         &self,
         extent: &ExtentInfo,
+        corrupt: u32,
         exclude_node_ids: &[u64],
+        // Sources tried like any other but whose ABSENCE does not count: a
+        // failure or an unresolvable address there neither raises `err_count`
+        // nor `unverified`. The slot being rebuilt goes here — see
+        // `run_recovery_task`.
+        best_effort: &[u64],
         dest: &Rc<ExtentEntry>,
     ) -> Result<u64, String> {
         let nodes = self
@@ -7154,12 +7253,31 @@ impl ExtentNode {
         let mut err_count = 0usize;
         let mut unverified = 0usize;
         let mut best: Option<(std::net::SocketAddr, String, u64)> = None;
-        for node_id in extent.replicates.iter().chain(extent.parity.iter()) {
+        // Corrupt-marked members are not sources at all — neither attempted
+        // nor "unverified" — so the reconcile-down below never weighs a copy
+        // known to be wrong. Within `copy_sources`' lit-then-dark order, a
+        // best-effort source goes after the others of its kind: it is often
+        // the node that is gone, and its connect timeout should not come
+        // first — but a lit one still comes before any dark member, which
+        // would be read in full only to be found short.
+        let lit = |node: u64| {
+            extent
+                .replicates
+                .iter()
+                .chain(extent.parity.iter())
+                .position(|n| *n == node)
+                .is_some_and(|slot| slot < 32 && extent.avali & (1u32 << slot) != 0)
+        };
+        let mut sources = Self::copy_sources(extent, corrupt);
+        sources.sort_by_key(|n| (!lit(*n), best_effort.contains(n)));
+
+        for node_id in &sources {
             if exclude_node_ids.contains(node_id) {
                 continue;
             }
+            let counts = !best_effort.contains(node_id);
             let Some((base, shard_ports)) = nodes.get(node_id) else {
-                unverified += 1;
+                unverified += usize::from(counts);
                 tracing::warn!(
                     extent_id = extent.extent_id,
                     node_id,
@@ -7173,7 +7291,7 @@ impl ExtentNode {
             let routed = shard_addr_for_extent(base, shard_ports, extent.extent_id);
             let addr = &routed;
             let Ok(sock) = parse_addr(addr) else {
-                unverified += 1;
+                unverified += usize::from(counts);
                 tracing::warn!(
                     extent_id = extent.extent_id,
                     node_id,
@@ -7185,7 +7303,7 @@ impl ExtentNode {
             // Reset before each attempt — a previous source's partial stream
             // must not bleed into this one.
             if dest_f.set_len(0).await.is_err() {
-                unverified += 1;
+                unverified += usize::from(counts);
                 tracing::warn!(
                     extent_id = extent.extent_id,
                     node_id,
@@ -7236,7 +7354,7 @@ impl ExtentNode {
                 }
                 Err(e) => {
                     // source failed mid-stream — next restarts from 0
-                    err_count += 1;
+                    err_count += usize::from(counts);
                     tracing::warn!(
                         extent_id = extent.extent_id,
                         node_id,
@@ -7275,6 +7393,40 @@ impl ExtentNode {
         // (coco P1). run_recovery_task still applies `sealed_length` via
         // `fetch_max`, so the recovered replica reports its commit length as
         // `sealed_length`.
+        // Weigh the marked members before reconciling down over them.
+        if err_count == 0 && unverified == 0 {
+            if let Some((_, _, best_len)) = &best {
+                let marked = extent
+                    .replicates
+                    .iter()
+                    .chain(extent.parity.iter())
+                    .enumerate()
+                    .filter(|(slot, n)| {
+                        *slot < 32
+                            && corrupt & (1u32 << slot) != 0
+                            && !exclude_node_ids.contains(n)
+                    })
+                    .map(|(_, n)| *n);
+                for node_id in marked {
+                    let past = Self::peer_has_bytes_past(&nodes, node_id, extent, *best_len).await;
+                    let replaced = best_effort.contains(&node_id);
+                    if Self::marked_member_holds_back(past.clone(), replaced) {
+                        unverified += 1;
+                        tracing::warn!(
+                            extent_id = extent.extent_id,
+                            node_id,
+                            best_len = *best_len,
+                            sealed_length = total,
+                            evidence = ?past,
+                            "recovery: NOT reconciling down — a CORRUPT-marked member may be the \
+                             only copy of bytes past every readable copy; if it is reachable this \
+                             stays so on every retry and needs an operator (restore the bytes, or \
+                             accept their loss by removing that member)"
+                        );
+                    }
+                }
+            }
+        }
         if err_count == 0 && unverified == 0 {
             if let Some((sock, addr, best_len)) = best {
                 // Re-stream the longest copy cleanly — a trailing shorter
@@ -7388,6 +7540,19 @@ impl ExtentNode {
         &self,
         extent_id: u64,
     ) -> Result<Option<ExtentInfo>, String> {
+        Ok(self
+            .extent_info_and_corrupt_from_manager(extent_id)
+            .await?
+            .map(|(info, _)| info))
+    }
+
+    /// `extent_info_from_manager` plus the manager's corrupt-slot bitmap,
+    /// for the paths that copy a whole extent and must not read from a
+    /// corrupt member (`copy_sources`).
+    pub(crate) async fn extent_info_and_corrupt_from_manager(
+        &self,
+        extent_id: u64,
+    ) -> Result<Option<(ExtentInfo, u32)>, String> {
         let mgr = match &self.manager_endpoint {
             Some(ep) => crate::conn_pool::normalize_endpoint(ep),
             None => return Ok(None),
@@ -7412,7 +7577,8 @@ impl ExtentNode {
             return Ok(None);
         }
         let loc = resp.payload_location;
-        Ok(resp.extent.map(|e| mgr_to_local_extent(&e, loc)))
+        let corrupt = resp.corrupt_slots;
+        Ok(resp.extent.map(|e| (mgr_to_local_extent(&e, loc), corrupt)))
     }
 
     /// `node_id -> (base address, per-shard listener ports)`.
@@ -7504,11 +7670,54 @@ impl ExtentNode {
                 == Some(&task.replace_id)
     }
 
+    /// The corrupt bitmap a peer copy (re_avali) chose its sources by was read
+    /// BEFORE the copy, which can run up to its timeout; a partition's replay
+    /// or a scrub may mark the very member it read from in the meantime — the
+    /// catch-up is not an extent op, so nothing holds the marks still. Re-read
+    /// it, and refuse the copy if that member is now marked, OR is no longer a
+    /// member at all: it may have been marked, rebuilt and its mark cleared
+    /// with the slot, all while this copy ran. Publishing would light rotted
+    /// bytes. The caller retries with fresh sources.
+    ///
+    /// A REBUILD re-checks differently (`run_recovery_task`): it is an extent
+    /// op, so membership cannot change under it, but a repeated report of an
+    /// already-dark slot can still add a mark — it voids on any new mark.
+    async fn refuse_if_source_marked_corrupt(
+        &self,
+        extent_id: u64,
+        source: u64,
+    ) -> Result<(), String> {
+        let Some((info, corrupt)) = self.extent_info_and_corrupt_from_manager(extent_id).await?
+        else {
+            return Err(format!("extent {extent_id} not found on manager after the copy"));
+        };
+        Self::source_still_trusted(&info, corrupt, source)
+            .map_err(|why| format!("extent {extent_id}: source node {source} {why}"))
+    }
+
+    /// Is `source` still an unmarked member? See `refuse_if_source_marked_corrupt`.
+    fn source_still_trusted(
+        info: &ExtentInfo,
+        corrupt: u32,
+        source: u64,
+    ) -> Result<(), &'static str> {
+        let slot = info
+            .replicates
+            .iter()
+            .chain(info.parity.iter())
+            .position(|n| *n == source);
+        match slot {
+            Some(slot) if slot < 32 && corrupt & (1u32 << slot) == 0 => Ok(()),
+            Some(_) => Err("was marked corrupt during the copy"),
+            None => Err("left the extent during the copy"),
+        }
+    }
+
     async fn resolve_recovery_extent(
         &self,
         task: &crate::extent_rpc::RecoveryTask,
-    ) -> Result<ExtentInfo, String> {
-        self.extent_info_from_manager(task.extent_id)
+    ) -> Result<(ExtentInfo, u32), String> {
+        self.extent_info_and_corrupt_from_manager(task.extent_id)
             .await?
             .ok_or_else(|| format!("extent {} not found on manager", task.extent_id))
     }
@@ -7519,7 +7728,7 @@ impl ExtentNode {
         attempt: crate::extent_rpc::RecoveryAttempt,
     ) -> Result<RecoveryTaskDone, String> {
         self.validate_recovery_instruction(&task, &attempt).await?;
-        let extent_info = self.resolve_recovery_extent(&task).await?;
+        let (extent_info, corrupt) = self.resolve_recovery_extent(&task).await?;
         if !Self::recovery_source_matches(&extent_info, &task, &attempt) {
             return Err("recovery source layout changed".into());
         }
@@ -7592,8 +7801,40 @@ impl ExtentNode {
             // FILE_IO_CHUNK_BYTES chunk), instead of materializing the whole
             // extent in a Vec then writing it back. stream_* truncates to 0 and
             // writes each chunk; succeeds only on a full sealed_length transfer.
-            self.stream_extent_from_sources(&extent_info, &[task.node_id, task.replace_id], &extent)
-                .await?
+            //
+            // The slot being REPLACED is a source too, best-effort. A fenced
+            // node is alive and its copy is good — fencing means "move the
+            // data off", and reading it is moving it — and it can be the ONLY
+            // full copy: a member that alone answered the seal, its peers dark
+            // and short. Left out, the reconcile-down below fired on those
+            // short copies and dropped bytes the seal had made committed and a
+            // partition had already replayed. Best-effort because the usual
+            // reason for a rebuild is that the node is gone, and its absence
+            // must not hold back the reconcile-down a dead node needs. A
+            // corrupt-marked slot is excluded by `copy_sources` as always.
+            let written = self
+                .stream_extent_from_sources(
+                    &extent_info,
+                    corrupt,
+                    &[task.node_id],
+                    &[task.replace_id],
+                    &extent,
+                )
+                .await?;
+            // Isolation refuses while this Recovery is in flight, but a
+            // repeated report of an ALREADY dark slot records its missing mark
+            // without moving the eversion, so the bitmap the sources were
+            // chosen by can still grow during the copy. Any new mark voids it;
+            // the retry chooses again.
+            let (_, corrupt_now) = self.resolve_recovery_extent(&task).await?;
+            if corrupt_now & !corrupt != 0 {
+                return Err(format!(
+                    "extent {}: a slot was marked corrupt during the copy ({corrupt:#b} -> \
+                     {corrupt_now:#b}); copying again with fresh sources",
+                    task.extent_id
+                ));
+            }
+            written
         } else {
             // EC recovery: reconstruct the missing shard stripe by stripe,
             // writing each stripe as it is produced. The destination file is
@@ -9944,7 +10185,10 @@ impl ExtentNode {
             }
         };
 
-        let extent_info = match self.extent_info_from_manager(req.extent_id).await {
+        let (extent_info, corrupt) = match self
+            .extent_info_and_corrupt_from_manager(req.extent_id)
+            .await
+        {
             Ok(Some(ex)) => ex,
             Ok(None) => {
                 return code_resp(
@@ -10030,9 +10274,9 @@ impl ExtentNode {
         // but it does not mean "lagging": a member that was merely UNREACHABLE
         // when the extent was sealed has its bit left unset (manager
         // CLAUDE.md, seal-over-reachable) while possibly holding the LONGEST
-        // copy in the cluster — and every recovery elsewhere picks its sources
-        // from the member list without consulting `avali`, so this file is
-        // exactly what another node would rebuild from.
+        // copy in the cluster — and a dark member that is not marked corrupt is
+        // a copy source for every rebuild elsewhere (`copy_sources`), so this
+        // file is exactly what another node may rebuild from.
         //
         // `peer_copy_full_extent_to_dat` streams into a temp and atomic-renames
         // only once a FULL `sealed_length` copy has landed, so a repair that
@@ -10046,6 +10290,7 @@ impl ExtentNode {
                 req.extent_id,
                 &extent,
                 &extent_info,
+                corrupt,
                 extent_info.sealed_length,
             )
             .await
@@ -10260,6 +10505,7 @@ impl ExtentNode {
         extent_id: u64,
         entry: &Rc<ExtentEntry>,
         mgr_info: &ExtentInfo,
+        corrupt: u32,
         sealed_length: u64,
     ) -> Result<(), (StatusCode, String)> {
         let disk = self
@@ -10277,6 +10523,7 @@ impl ExtentNode {
             .map_err(|e| (StatusCode::Unavailable, format!("nodes_map: {e}")))?;
 
         let mut got_full = false;
+        let mut source = 0u64;
         {
             if let Some(parent) = tmp_path.parent() {
                 compio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -10299,7 +10546,7 @@ impl ExtentNode {
                     )
                 })?;
             let tmp_rc = Rc::new(tmp_file);
-            for node_id in mgr_info.replicates.iter().chain(mgr_info.parity.iter()) {
+            for node_id in &Self::copy_sources(mgr_info, corrupt) {
                 let Some((base, shard_ports)) = nodes.get(node_id) else {
                     continue;
                 };
@@ -10335,6 +10582,7 @@ impl ExtentNode {
                             )
                         })?;
                         got_full = true;
+                        source = *node_id;
                         break;
                     }
                     Ok(short) => {
@@ -10362,6 +10610,12 @@ impl ExtentNode {
                      {sealed_length} — over-sealed / unrecoverable; live replica left intact"
                 ),
             ));
+        }
+        if let Err(msg) = self.refuse_if_source_marked_corrupt(extent_id, source).await {
+            if let Err(e) = compio::fs::remove_file(&tmp_path).await {
+                tracing::warn!(extent_id, error = %e, "could not remove a refused peer copy");
+            }
+            return Err((StatusCode::FailedPrecondition, msg));
         }
 
         // Atomic-replace: rename temp → .dat, fsync dir, reopen the handle.
@@ -10697,11 +10951,13 @@ impl ExtentNode {
             // ── Full prepare path: read, encode, distribute ──
 
             // sync sealed_length / eversion from manager.
-            let mgr_info_opt = self
-                .extent_info_from_manager(extent_id)
+            let mgr_view = self
+                .extent_info_and_corrupt_from_manager(extent_id)
                 .await
                 .ok()
                 .flatten();
+            let corrupt = mgr_view.as_ref().map_or(0, |(_, c)| *c);
+            let mgr_info_opt = mgr_view.map(|(info, _)| info);
             if let Some(mgr_info) = mgr_info_opt.as_ref() {
                 // P0-C: include the explicit `sealed` flag so a sealed-EMPTY
                 // extent also has its seal persisted here (consistency with the
@@ -10781,8 +11037,14 @@ impl ExtentNode {
                 // live local replica is never destroyed on a short/failed copy
                 // (coco P1). Replaces the old whole-`Vec`
                 // `fetch_full_extent_from_sources` materialization.
-                self.peer_copy_full_extent_to_dat(extent_id, &entry, &mgr_info, sealed_length)
-                    .await?;
+                self.peer_copy_full_extent_to_dat(
+                    extent_id,
+                    &entry,
+                    &mgr_info,
+                    corrupt,
+                    sealed_length,
+                )
+                .await?;
                 tracing::info!(
                     extent_id,
                     local_len,
@@ -16135,5 +16397,65 @@ mod client_direct_read_auth_tests {
         *node.client_authz.borrow_mut() = authz_on();
         let peer = crate::ConnPool::new();
         assert_eq!(&read(&peer, &addr).await.unwrap()[..], PAYLOAD);
+    }
+}
+
+#[cfg(test)]
+mod copy_source_tests {
+    use super::*;
+
+    fn info(avali: u32) -> ExtentInfo {
+        ExtentInfo {
+            replicates: vec![10, 20, 30],
+            avali,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lit_members_come_first_and_dark_unmarked_ones_still_count() {
+        assert_eq!(ExtentNode::copy_sources(&info(0b100), 0), vec![30, 10, 20]);
+        assert_eq!(
+            ExtentNode::copy_sources(&info(0b000), 0),
+            vec![10, 20, 30],
+            "a member that was down at the seal holds every acked byte"
+        );
+    }
+
+    /// A catch-up's source may be marked, rebuilt and its mark cleared with
+    /// the slot while the copy runs: by then it is not a member at all, and
+    /// "not marked" must not read as trusted.
+    #[test]
+    fn a_source_that_left_or_was_marked_voids_the_copy() {
+        assert!(ExtentNode::source_still_trusted(&info(0b111), 0, 20).is_ok());
+        assert!(ExtentNode::source_still_trusted(&info(0b111), 0b010, 20).is_err());
+        assert!(
+            ExtentNode::source_still_trusted(&info(0b111), 0, 99).is_err(),
+            "a source no longer in the layout is not vouched for"
+        );
+    }
+
+    /// A marked member is weighed like any member, its bytes never copied:
+    /// it holds the reconcile-down back when it has bytes past the best copy,
+    /// or when it cannot be reached (as an unreachable member always does) —
+    /// never when it is the slot being replaced. A marked copy no longer than
+    /// the best proves nothing and holds nothing back, so a stale short mark
+    /// cannot wedge a rebuild.
+    #[test]
+    fn a_marked_member_holds_back_only_on_evidence() {
+        let hold = ExtentNode::marked_member_holds_back;
+        assert!(hold(Ok(true), false));
+        assert!(!hold(Ok(false), false));
+        assert!(hold(Err("unreachable".into()), false));
+        // The slot being replaced never holds back its own rebuild: nothing
+        // but that rebuild clears its mark.
+        assert!(!hold(Ok(true), true));
+        assert!(!hold(Err("unreachable".into()), true));
+    }
+
+    #[test]
+    fn a_corrupt_slot_is_never_a_source_lit_or_dark() {
+        assert_eq!(ExtentNode::copy_sources(&info(0b100), 0b001), vec![30, 20]);
+        assert_eq!(ExtentNode::copy_sources(&info(0b111), 0b010), vec![10, 30]);
     }
 }

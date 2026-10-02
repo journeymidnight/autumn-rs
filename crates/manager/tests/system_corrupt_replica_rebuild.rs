@@ -1,17 +1,12 @@
 //! A replica reported CORRUPT must eventually be rebuilt.
 //!
 //! `handle_report_corrupt_replica` isolates the rotted copy by clearing its
-//! `avali` bit, and that is the whole of it. Nothing marks the slot as needing
-//! a rebuild, and nothing fences the node — so under the default
-//! `fenced_only` recovery gate the dispatch loop skips that slot forever:
-//!
-//! ```text
-//! if gate_mode == FencedOnly && !is_fenced { continue; }   // before avali is even read
-//! ```
-//!
-//! The extent is then permanently short one usable replica. Durability quietly
-//! drops to RF-1 with no alarm, no repair, and no path back except an operator
-//! noticing and fencing the node by hand. Isolation without repair is a leak.
+//! `avali` bit. If that were the whole of it, nothing would say WHY the slot is
+//! dark, and nothing fences the node. The dispatch loop moves a copy only off a
+//! fenced node, a corrupt-marked slot or a faulted disk, so the extent would sit
+//! one usable replica short with no alarm and no repair — or, read as merely
+//! BEHIND, be "caught up" in place by a length check the rotted copy passes.
+//! The corrupt mark, written with the isolation, makes the loop rebuild it.
 //!
 //! Corruption is a STRONGER signal than the conditions that do trigger a
 //! rebuild (an offline disk, a fenced node): the owner replayed those bytes and
@@ -60,9 +55,9 @@ fn a_replica_reported_corrupt_is_eventually_rebuilt() {
     let a = pick_addr();
     let b = pick_addr();
     let c = pick_addr();
-    let _da = spawn_en(a, 1, mgr_addr);
-    let _db = spawn_en(b, 2, mgr_addr);
-    let _dc = spawn_en(c, 3, mgr_addr); // spare target for the rebuild
+    let _da = spawn_en(a, format_node(mgr_addr, a, "uuid-cr-0"), mgr_addr);
+    let _db = spawn_en(b, format_node(mgr_addr, b, "uuid-cr-1"), mgr_addr);
+    let _dc = spawn_en(c, format_node(mgr_addr, c, "uuid-cr-2"), mgr_addr); // spare target
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
@@ -152,9 +147,8 @@ fn a_replica_reported_corrupt_is_eventually_rebuilt() {
             rebuilt,
             "node {victim} was reported holding CORRUPT bytes for extent {extent_id} and \
              was isolated, but 30 s later it is still a member and nothing rebuilt it. \
-             The report clears the avali bit and records nothing else, so the dispatch \
-             loop's `fenced_only` gate skips the slot before it ever looks at avali — \
-             the extent is left permanently at RF-1 with no repair path"
+             A dark slot with no corrupt mark is never moved off its node, so the \
+             extent is left at RF-1 with no repair path"
         );
     });
 }

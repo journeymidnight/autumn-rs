@@ -111,6 +111,21 @@ fn start_en(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64, mgr_addr: S
 }
 
 async fn register_node(mgr: &RpcClient, addr: &str, uuid: &str) -> u64 {
+    register_node_resp(mgr, addr, uuid).await.node_id
+}
+
+/// What `autumn-op format` does before a real node first starts: register it
+/// and return the disk id the manager assigned. A node started on any other id
+/// refuses every rebuild pinned to it ("recovery destination disk is outside
+/// the pinned target").
+fn format_node(mgr_addr: SocketAddr, addr: SocketAddr, uuid: &str) -> u64 {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_node_resp(&mgr, &addr.to_string(), uuid).await.disk_uuids[0].1
+    })
+}
+
+async fn register_node_resp(mgr: &RpcClient, addr: &str, uuid: &str) -> RegisterNodeResp {
     let resp = mgr
         .call(
             MSG_REGISTER_NODE,
@@ -126,7 +141,7 @@ async fn register_node(mgr: &RpcClient, addr: &str, uuid: &str) -> u64 {
         .expect("register node");
     let r: RegisterNodeResp = rkyv_decode(&resp).expect("decode RegisterNodeResp");
     assert_eq!(r.code, CODE_OK, "register node: {}", r.message);
-    r.node_id
+    r
 }
 
 async fn create_stream(mgr: &RpcClient, replicates: u32, ec_data: u32, ec_parity: u32) -> u64 {
@@ -258,14 +273,16 @@ fn leg1_correlated_2of3_loss_survives_and_recovery_refills_from_survivor() {
     start_manager(mgr_addr);
 
     // 6 killable ENs.  We register the FIRST 3 up front so the stream's extents
-    // co-locate on exactly {n0,n1,n2}; the other 3 are registered later as spare
-    // recovery targets (≥6 ENs at the correlated-failure moment).
+    // co-locate on exactly {n0,n1,n2}; the other 3 are registered (and started,
+    // on the disk id that assigns) later as spare recovery targets (≥6 ENs at
+    // the correlated-failure moment).
     let mut dirs: Vec<tempfile::TempDir> = Vec::new();
     let mut ens: Vec<KillableEn> = Vec::new();
-    for i in 0..6u64 {
+    for i in 0..3u64 {
         let dir = tempfile::tempdir().expect("tempdir");
         let addr = pick_addr();
-        let en = start_en(addr, dir.path().to_path_buf(), i + 1, mgr_addr);
+        let disk_id = format_node(mgr_addr, addr, &format!("uuid-{i}"));
+        let en = start_en(addr, dir.path().to_path_buf(), disk_id, mgr_addr);
         dirs.push(dir);
         ens.push(en);
     }
@@ -322,9 +339,16 @@ fn leg1_correlated_2of3_loss_survives_and_recovery_refills_from_survivor() {
         // all-replica-acked seal.
         assert_eq!(e0.avali, all_bits(3), "sealed extent should have every avali bit set");
 
-        // register the 3 spares now (recovery targets); give them a df tick.
+        // register + start the 3 spares now (recovery targets); give them a
+        // df tick.
         for i in 3..6 {
-            ens[i].node_id = register_node(&mgr, &ens[i].addr.to_string(), &format!("uuid-{i}")).await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let addr = pick_addr();
+            let r = register_node_resp(&mgr, &addr.to_string(), &format!("uuid-{i}")).await;
+            let mut en = start_en(addr, dir.path().to_path_buf(), r.disk_uuids[0].1, mgr_addr);
+            en.node_id = r.node_id;
+            dirs.push(dir);
+            ens.push(en);
         }
         compio::time::sleep(Duration::from_secs(3)).await;
 
@@ -353,8 +377,8 @@ fn leg1_correlated_2of3_loss_survives_and_recovery_refills_from_survivor() {
             assert_eq!(&data, payload, "surviving replica must return the acked bytes verbatim");
         }
 
-        // ── fence the two dead nodes → recovery dispatches under the default
-        // `fenced_only` gate → refill both slots from the lone survivor ──
+        // ── fence the two dead nodes → recovery dispatches → refill both slots
+        // from the lone survivor ──
         for &nid in &dead {
             fence_node(&mgr, nid).await;
         }

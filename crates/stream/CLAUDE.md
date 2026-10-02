@@ -675,12 +675,73 @@ a node comes back):
   Those bytes are worth protecting even though `avali == 0` is what aimed
   repair at this replica. **`avali == 0` does not mean "lagging"** — a member
   merely UNREACHABLE at seal time has its bit left unset (manager CLAUDE.md,
-  seal-over-reachable) while possibly holding the LONGEST copy in the cluster,
-  and `stream_extent_from_sources` picks its sources from the member list
-  WITHOUT consulting `avali`, so this file is exactly what another node's
-  recovery would rebuild from. The absence of reconcile-down in
-  `peer_copy_full_extent_to_dat` is deliberate on this path: adopting a SHORTER
-  peer copy over a longer local one is the trade re_avali must not make.
+  seal-over-reachable) while possibly holding the LONGEST copy in the cluster.
+  The absence of reconcile-down in `peer_copy_full_extent_to_dat` is
+  deliberate on this path: adopting a SHORTER peer copy over a longer local
+  one is the trade re_avali must not make.
+
+### Copy sources: never a corrupt-marked member; lit members first
+
+Every whole-extent copy — recovery (`stream_extent_from_sources`), re_avali
+and the EC-convert coordinator (`peer_copy_full_extent_to_dat`) — reads from
+`copy_sources(info, corrupt)`, where `corrupt` is the manager's corrupt-slot
+bitmap (`ExtentInfoResp.corrupt_slots`, wire 53, fetched with
+`extent_info_and_corrupt_from_manager`).
+
+- **Never a corrupt-marked slot.** Its copy is full length with wrong bytes,
+  and a source is accepted on length alone: taking it puts the rot into the
+  copy being built, which then gets its bit set and spreads to the next rebuild
+  that reads it. Its bytes are never COPIED, but for the reconcile-down it is
+  weighed like any member (`marked_member_holds_back`): unreachable, it counts
+  as unverified exactly as an unreachable unmarked member does; reachable, it
+  holds back only if a one-byte read at the best copy's length finds data —
+  proof that the seal's bytes exist, only on a copy known to be wrong. A marked
+  copy no longer than the best proves nothing and holds nothing back, so a
+  stale short mark cannot wedge a rebuild, and the slot being REPLACED never
+  holds back its own rebuild (only that rebuild clears its mark). A hold-back
+  on another reachable marked member is TERMINAL by construction — the extent
+  is sealed, so every retry reaches the same verdict — and its WARN says it
+  needs an operator (restore the bytes, or accept their loss by removing that
+  member) rather than copying rot or dropping committed bytes. (Counting every marked member unconditionally — tried and
+  rejected in review — deadlocked: the mark clears only when its own slot is
+  rebuilt, which cannot start while this rebuild holds the extent.)
+- **A dark member that is NOT marked stays a source.** It was down when the
+  extent was sealed, and every acked byte is on it (an append is acked only once
+  every replica has it). It is what the reconcile-down weighs when the lit
+  members are gone. Excluding every dark member — the first form of this rule —
+  left an extent whose only lit member was fenced or lost with no source at
+  all, its acked bytes sitting on the dark ones.
+- **Lit members (`avali` set) are tried first**: the manager vouches for them
+  at `sealed_length`.
+- **A rebuild reads the slot it REPLACES too, best-effort** — after the other
+  lit members, before any dark one if it is lit itself, last otherwise. A fenced
+  node is alive and its copy good (fencing means "move the data off"), and it
+  can hold the only full copy: the member that alone answered the seal. Left
+  out, the reconcile-down fired on the short dark copies and dropped bytes the
+  seal had made committed — a partition may already have replayed them.
+  Best-effort means its failure or absence counts toward neither `err_count`
+  nor `unverified`, so a node that is really gone does not block the
+  reconcile-down it needs. A corrupt-marked replaced slot is excluded as any
+  other.
+- **A peer copy reads the bitmap again before it publishes**
+  (`refuse_if_source_marked_corrupt`, before the rename): a re_avali is not an
+  extent op, so nothing holds the marks still while it copies, and the member
+  it read from may be marked — or marked, rebuilt and its mark cleared with the
+  slot — meanwhile. A source that is marked OR no longer a member voids the
+  copy; the manager retries with fresh sources (`source_still_trusted`). A
+  rebuild cannot lose a member mid-copy (it is an extent op, and every
+  isolation refuses while one is in flight), but a repeated report of an
+  already-dark slot records its missing mark without moving the eversion, so
+  `run_recovery_task` re-reads the bitmap too and voids the copy on any NEW
+  mark. Residual: the milliseconds between that re-read and
+  the manager lighting the slot — closing it would mean returning the source
+  in the re_avali reply.
+
+Regressions in `crates/manager/tests/single_wal_replica_survivor.rs`:
+`a_catch_up_never_copies_from_a_dark_replica` (a returning replica with the
+only lit copy away must stay behind rather than copy the corrupt one) and
+`a_fenced_sole_seal_member_is_rebuilt_from_its_own_copy` (every slot ends at
+the full seal with the record only the fenced member had).
 
 ### Heartbeat & Df
 
@@ -1545,10 +1606,9 @@ and from other crates' CLAUDE.md); do not renumber.
     partitions in its window) by itself. Accepted: what the manager does with
     a quorum is unchanged, it marks the node's disks offline
     (`handle_report_disk_failure`), so allocation avoids the node until the
-    next successful df (2 s) puts them back online. Under the default
-    `fenced_only` recovery gate that starts no rebuild; the legacy `auto_disk`
-    gate rebuilds slots on an offline disk, and the same report already came
-    from failed appends. Tests:
+    next successful df (2 s) puts them back online. That starts no rebuild:
+    recovery moves a copy only off a fenced node, a corrupt slot, or a disk its
+    own node reports faulted. Tests:
     `unreachable_report_tests::an_unreachable_node_is_reported_once`.
 
     **Why a side effect and not a variant**: `ec_gather_collect` keeps only the

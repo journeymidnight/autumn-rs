@@ -893,6 +893,16 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## Corrupt slots beside extent info (wire 53)
+
+`ExtentInfoResp` gains `corrupt_slots: u32` — the manager's corrupt-slot
+bitmap over `replicates ++ parity`, riding beside `extent` like
+`payload_location` (the persisted `MgrExtentInfo` stays as it is). Extent nodes
+read it before any whole-extent copy and never copy from a marked slot
+(`crates/stream/CLAUDE.md`, "Copy sources"). `MSG_EXTENT_INFO` is internal
+(manager, PS, EN), not on the client surface, so the window's ceiling rises to
+[43, 53] and the floor stays; every server is upgraded together.
+
 ## PS readiness (wire 51)
 
 `HeartbeatPsReq` gains `open_parts: Vec<(u64, u64)>` — `(part_id,

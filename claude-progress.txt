@@ -1,3 +1,11 @@
+Date: 2026-10-02 (9)
+TaskStatus: completed
+Task scope: user "我认为留一种模式就行, 1. fenced_only也要RE_AVALI" (F-RECOVERY-ONE-MODE); BUG-RECOVERY-PINNED-TARGET-TESTS (needed for rebuild-elsewhere verification).
+Current summary: recovery has one mode. A copy moves only off a fenced node, a corrupt slot, or a disk its node reports faulted; a behind copy (avali clear, node Online) is caught up in place in the background. Copy sources on the EN exclude corrupt-marked slots (wire 53 carries the bitmap), lit first; a rebuild also reads the replaced slot best-effort; a peer copy re-checks its source before publishing. Isolation + mark are one etcd txn; mark_extent_available is etcd-first CAS. The 5 "pinned target" test failures were a fixture disk-id mismatch (format_node).
+Verification: see feature_list F-RECOVERY-ONE-MODE / BUG-RECOVERY-PINNED-TARGET-TESTS notes. Reviews: fable x3, opus x4.
+Main gaps: (user to decide) (1) when the only copy holding a seal's tail is corrupt-marked, the rebuild waits forever (WARN says an operator is needed) instead of copying rot or dropping committed bytes; (2) isolation writes are plain puts next to the new CAS in mark_extent_available — a reasoned, unreproduced race; ms window between a peer copy's source re-check and the manager lighting the slot.
+Next steps: F-EXTENT-HEALTH (summary RPC / autumn-op health / dashboard alerts) and F-EXTENT-REPAIR (repair op + policy), in progress, not committed.
+
 Date: 2026-10-02 (8)
 TaskStatus: completed
 Task scope: user "只要哪怕一个副本回答…是安全的…注释应该是 wish all replicas answer, but even one…"; "AUTUMN_MGR_SEAL_DURABILITY_FLOOR删除, 应当是哪怕就留一个WAL,系统也可以恢复" (REN-SEAL-ONE-REPLICA).

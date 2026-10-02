@@ -1598,9 +1598,9 @@ each other's advertised address, and write the same files.
 kubectl -n autumn delete sts autumn-en --cascade=orphan
 
 # 2. One EN at a time. A merely-absent node does NOT trigger recovery -- the
-#    recovery loop's default `fenced_only` gate rebuilds fenced slots, not
-#    slots of a node that is briefly down -- so no fence or maintenance window
-#    is needed for a restart this short.
+#    recovery loop rebuilds fenced slots, corrupt slots and slots on a disk its
+#    node reports faulted, not slots of a node that is briefly down -- so no
+#    fence or maintenance window is needed for a restart this short.
 for n in 0 5 6 7 8 9 10; do
   kubectl -n autumn delete pod "autumn-en-$n" --wait=true      # must be GONE,
   kubectl -n autumn wait --for=delete "pod/autumn-en-$n" --timeout=120s || true
@@ -1706,8 +1706,8 @@ What fencing triggers (all automatic):
   allocation loudly rather than placing data on a draining node.
   (Availability note: a 3-EN RF-3 cluster with one *Suspected* node blocks new
   extent allocation until it heals — seconds — or is fenced.)
-- **Sealed extents**: the recovery loop (`fenced_only` gate, default) rebuilds
-  every sealed extent's fenced slots onto healthy nodes. Includes sealed-EMPTY
+- **Sealed extents**: the recovery loop rebuilds every sealed extent's fenced
+  slots onto healthy nodes. Includes sealed-EMPTY
   extents (0-byte membership swap).
 
 **A single FAILED DISK needs no fence.** An extent node that hits a
@@ -2686,7 +2686,7 @@ VPHEAD_SEEDS="1 42 777" AUTUMN_CHAOS_DURATION_SECS=60 ./scripts/vphead_chaos.sh
 # fence (MSG_FENCE_NODE/clear), killfence (kill-then-fence), ec (convert-under-
 # load), partition + latency (toxiproxy net faults). THEN a terminal one-shot:
 # after the nemesis loop stops and the cluster heals, one EN is permanently
-# removed the HDFS way (fence -> drain + fenced_only recovery relocate
+# removed the HDFS way (fence -> drain + fenced-slot recovery relocate
 # every extent off it -> MSG_REMOVE_NODE refuses until fully drained, tombstones
 # the address), and the per-key/range/accounting verify proves NO loss with the
 # node gone. Removal is a TERMINAL one-shot, NOT a per-cycle nemesis action
@@ -4740,14 +4740,9 @@ A marker that spins without progressing is now visible: the re-dispatch logs
 refusals, undecodable replies and unreachable targets at WARN (they were all
 `debug!`, so a manager at INFO showed a 2 s loop as complete silence).
 
-Two cases deliberately keep their markers, and `recovery-stats` showing a
-non-zero count in either is correct, not a leak:
+One case deliberately keeps its markers, and `recovery-stats` showing a
+non-zero count there is correct, not a leak:
 
-- **`AUTUMN_MGR_RECOVERY_GATE=auto_disk`** (the legacy, non-default mode). There
-  a rebuild can be dispatched because an extent PROBE failed — the copy is gone
-  or unreadable on a node that is otherwise healthy — and that state is
-  indistinguishable from a slot that never needed rebuilding. Releasing it would
-  restart a full-extent copy every tick, so under that gate the marker is held.
 - **Right after a leader change**, until the source node's first `df` reaches
   the new leader. `faulted_disks` is emptied at promotion (election is
   in-process, so last term's entries would otherwise survive) while the
@@ -4763,6 +4758,54 @@ non-zero count in either is correct, not a leak:
 For ablation, make `release_recovery_markers_for_healthy_slots` return an empty
 vec: `recovery_marker_unfence_releases_only_a_healthy_slot` fails with the
 marker still held after the unfence.
+
+## A replica that missed the seal is caught up in place
+
+A log extent may be sealed while only one of its replicas answers: that
+replica holds every acked byte, so its length becomes `sealed_length`. The
+other replicas come back SHORTER and with their `avali` bit clear. The recovery
+loop does not move them; once a node is Online again it sends `re_avali`, the
+node copies the missing bytes from the replica that answered, and the slot is
+marked available. There is no mode to choose: the loop moves a copy to another
+node only for a fenced node, a corrupt slot, or a disk its own node reports
+faulted.
+
+    cargo test -p autumn-manager --test single_wal_replica_survivor
+
+The test writes record 1 to three replicas, stops two of their nodes, lets
+record 2 reach only the third, crashes the writer, opens the stream with only
+the survivor up (one answer seals the extent at 8192), then restarts the two
+nodes holding 4096 bytes. Within 60 s both copies must be 8192 bytes, every
+slot available, and every replica must read back records 1 and 2.
+
+Ablation: make the in-place branch in `recovery_dispatch_tick` never run (for
+example prefix its condition with `false &&`). The test fails with
+`avali 0b100 (want 0b111), their copies [Some(4096), Some(4096)]`.
+
+The same file's `a_catch_up_never_copies_from_a_dark_replica` pins where the
+bytes come from: the first member in slot order rots at full length and is
+reported corrupt. While the one good copy is away the returning replica must
+stay behind; once it is back the replica is filled from it. Ablation: let
+`copy_sources` in `crates/stream/src/extent_node.rs` keep corrupt-marked slots;
+the test fails with `with C away, B was filled from A's corrupt copy`.
+`a_fenced_sole_seal_member_is_rebuilt_from_its_own_copy` pins the other
+side: the one member that answered the seal is fenced while the others are
+away, and every slot must end at the full seal with the record only it held.
+Ablations: keep only lit members (no source, never replaced), or exclude the
+replaced slot from the rebuild's sources (`stream_extent_from_sources`'s
+best-effort list) — the rebuild reconciles down to 4096 and the test fails with
+`avali 0b10 (want 0b111)`.
+
+Catch-ups run in the background, at most 8 at once, and never on an extent
+with another op in flight (a sibling slot's rebuild pinned the eversion the
+catch-up would bump): `cargo test -p autumn-manager --lib
+a_behind_slot_waits_for_the_op_in_flight_on_its_extent`.
+
+On a live cluster, `autumn-op extent-health` lists a behind slot as
+`avali=false` while its node is `auto=online`; the leader logs
+`caught a behind copy up to the sealed length in place` when it finishes, or
+`could not catch a behind copy up in place` with the reason (retried with
+backoff, cap 300 s).
 
 ## A corrupt EC source yields to recovery instead of burning 24 retries
 

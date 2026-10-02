@@ -821,6 +821,16 @@ pub struct AutumnManager {
     /// new leader starts with it empty, so an unrebuilt slot is WITHHELD until
     /// the owning node says again that its disk is bad — the safe direction.
     pub(crate) faulted_disks: Rc<RefCell<HashSet<u64>>>,
+    /// `(extent, slot)` pairs whose in-place catch-up (`re_avali`) is running
+    /// as a background task, so the dispatch tick neither starts a second one
+    /// nor waits for the copy. Leader-local and transient.
+    pub(crate) catch_up_inflight: Rc<RefCell<HashSet<(u64, u32)>>>,
+    /// Per-`(extent, slot)` backoff of in-place catch-ups, kept apart from
+    /// `recovery_limiter`'s rebuild backoff: a copy that kept failing to catch
+    /// up must not delay the rebuild it later turns out to need (corrupt,
+    /// fenced, faulted disk), and a catch-up that succeeds must not clear a
+    /// rebuild's backoff. Only its backoff half is used.
+    pub(crate) catch_up_backoff: Rc<RefCell<crate::recovery_rate_limiter::RecoveryRateLimiter>>,
     /// ENOSPC-1: allocation soft-avoids nodes whose max per-disk free is
     /// below this (`--min-alloc-free-bytes`, default 256 MiB; 0 =
     /// disabled). Soft: select_nodes falls back to the full healthy set
@@ -1082,6 +1092,10 @@ impl AutumnManager {
             cluster_cap: Rc::new(RefCell::new(ClusterCapSnapshot::default())),
             node_slot_counts: Rc::new(RefCell::new(HashMap::new())),
             faulted_disks: Rc::new(RefCell::new(HashSet::new())),
+            catch_up_inflight: Rc::new(RefCell::new(HashSet::new())),
+            catch_up_backoff: Rc::new(RefCell::new(
+                crate::recovery_rate_limiter::RecoveryRateLimiter::default(),
+            )),
             min_alloc_free_bytes: Rc::new(Cell::new(DEFAULT_MIN_ALLOC_FREE_BYTES)),
             audit_retention_days: Rc::new(Cell::new(90)),
             displaced: Rc::new(Cell::new(true)),
@@ -4461,10 +4475,9 @@ impl AutumnManager {
     /// (2026-05-17) plumbs the PS-validated owner_epoch through (was: hardcoded
     /// `0` + EN-side escape hatch) so the EN's fence-handover side-effect
     /// (`if req.owner_epoch > last { bump + persist .meta }`) actually fires
-    /// when a new owner first contacts an EN. Callers without an owner
-    /// context (recovery liveness, autumn-client info display) MUST use
-    /// `probe_extent_on_node` instead — that helper hits `MSG_PROBE_EXTENT`,
-    /// which skips the fence entirely.
+    /// when a new owner first contacts an EN. A caller without an owner
+    /// context must not use it: `MSG_PROBE_EXTENT` is the fence-free length
+    /// query.
     pub(crate) async fn commit_length_on_node(
         &self,
         addr: &str,
@@ -4473,7 +4486,7 @@ impl AutumnManager {
     ) -> Result<u64, AppError> {
         debug_assert!(
             owner_epoch > 0,
-            "commit_length_on_node requires owner_epoch > 0; use probe_extent_on_node for fence-free probes"
+            "commit_length_on_node requires owner_epoch > 0; MSG_PROBE_EXTENT is the fence-free probe"
         );
         let base = Self::normalize_endpoint(addr);
         let shard_ports = self.shard_ports_for_addr(&base);
@@ -4505,44 +4518,6 @@ impl AutumnManager {
         Ok(r.length)
     }
 
-    /// Tier 2 fence-free probe. Used by:
-    ///   - `recovery_dispatch_loop` liveness check (ignores `length`,
-    ///     uses `code == CODE_OK` to decide whether to fire
-    ///     `dispatch_recovery_task`).
-    ///   - Future: any manager-internal "is this extent on this EN +
-    ///     what's its current length" query without an owner context.
-    /// Does NOT touch the EN's `owner_epoch`. NotFound (extent missing
-    /// locally) and RPC error are both surfaced as `Err(Internal(...))`
-    /// so callers can treat both as "dispatch recovery" without branching.
-    pub(crate) async fn probe_extent_on_node(
-        &self,
-        addr: &str,
-        extent_id: u64,
-    ) -> Result<u64, AppError> {
-        let base = Self::normalize_endpoint(addr);
-        let shard_ports = self.shard_ports_for_addr(&base);
-        let routed = Self::shard_addr_for_extent(&base, &shard_ports, extent_id);
-        let req = ExtProbeExtentReq { extent_id };
-        let resp = self
-            .conn_pool
-            .call_timeout(
-                &routed,
-                EXT_MSG_PROBE_EXTENT,
-                req.encode(),
-                Duration::from_secs(5),
-            )
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-        let r = ExtProbeExtentResp::decode(resp).map_err(|e| AppError::Internal(e.to_string()))?;
-        if r.code != CODE_OK {
-            return Err(AppError::Internal(format!(
-                "probe_extent on {routed}: code {}",
-                r.code
-            )));
-        }
-        Ok(r.length)
-    }
-
     // ── Etcd mirroring ─────────────────────────────────────────────────
 
     async fn persist_extent(&self, extent: &ExtentRecord) -> Result<(), AppError> {
@@ -4558,42 +4533,79 @@ impl AutumnManager {
     /// from THIS leader's perspective. Called BEFORE the
     /// `EXT_MSG_CONVERT_TO_EC` RPC is dispatched. If this leader dies
     /// mid-flight, the new leader's `replay_from_etcd` repopulates
-    async fn mark_extent_available(&self, extent_id: u64, slot: usize) -> Result<(), AppError> {
-        // defer while EC conversion is in flight on this
-        // extent. re_avali was sent to the extent-node (eversion bump
-        // there), but the manager-side eversion bump must not race
-        // apply_ec_conversion_done's overwrite. The recovery_dispatch_loop
-        // retries on the next tick. Reads the unified ledger via
-        // `extent_inflight_op`.
-        if matches!(
-            self.extent_inflight_op(extent_id),
-            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-        ) {
+    /// Set `slot`'s `avali` bit: the copy on `node_id` has been brought up to
+    /// the sealed length in place (`re_avali`).
+    async fn mark_extent_available(
+        &self,
+        extent_id: u64,
+        slot: usize,
+        node_id: u64,
+    ) -> Result<(), AppError> {
+        // Defer while ANY stream-layer op is in flight on this extent. The bit
+        // flip bumps the eversion, and every such op pinned the one it saw: an
+        // EC conversion's apply would race this write, and a Recovery of a
+        // sibling slot would be judged stale at its next re-send — retired,
+        // its finished copy refused, the rebuild started over. The dispatch
+        // loop does not catch up an extent with an op in flight; this covers
+        // an op that started while the catch-up was copying.
+        if let Some(kind) = self.extent_inflight_op(extent_id) {
             return Err(AppError::Precondition(format!(
-                "ec conversion in flight on extent {extent_id}; deferring mark_extent_available"
+                "{kind:?} in flight on extent {extent_id}; deferring mark_extent_available"
             )));
         }
-        let updated = {
-            let mut s = self.store.inner.borrow_mut();
+        // The catch-up compared LENGTH only. If the slot was marked corrupt
+        // while it ran (a repeated report records a missing mark without
+        // touching the eversion), the full-length copy it vouched for is the
+        // rotted one.
+        if self.slot_is_corrupt(extent_id, slot) {
+            return Err(AppError::Precondition(format!(
+                "slot {slot} of extent {extent_id} is marked corrupt; not marking it available"
+            )));
+        }
+        let (baseline, updated) = {
+            let s = self.store.inner.borrow();
             let ex = s
                 .extents
-                .get_mut(&extent_id)
+                .get(&extent_id)
                 .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
-            if slot >= ex.replicates.len() + ex.parity.len() {
-                return Err(AppError::InvalidArgument(format!(
-                    "invalid slot {slot} for extent {extent_id}"
+            if Self::extent_nodes(ex).get(slot) != Some(&node_id) {
+                return Err(AppError::Precondition(format!(
+                    "slot {slot} of extent {extent_id} no longer holds node {node_id}"
                 )));
             }
             let bit = 1u32 << slot;
             if (ex.avali & bit) != 0 {
                 return Ok(());
             }
-            ex.avali |= bit;
-            ex.eversion += 1;
-            ex.clone()
+            let mut updated = ex.clone();
+            updated.avali |= bit;
+            updated.eversion += 1;
+            (crate::persist::encode(ex), updated)
         };
-        self.persist_extent(&updated).await?;
-        Ok(())
+        // Etcd-first, compare-and-set against the record this decision read:
+        // memory takes the bit only once it is durable, and a concurrent
+        // writer of the same extent (split's refs, punch's ref drop, a sibling
+        // slot's mark) makes this write fail instead of being overwritten by
+        // it. Either failure leaves the slot dark, and the next tick asks again.
+        let key = format!("extents/{extent_id}");
+        if let Some(etcd) = &self.etcd {
+            etcd.put_delete_txn_cas(
+                vec![(key.clone(), crate::persist::encode(&updated))],
+                vec![],
+                vec![(key, baseline)],
+            )
+            .await?;
+        }
+        let mut s = self.store.inner.borrow_mut();
+        match s.extents.get(&extent_id) {
+            Some(live) if live.eversion + 1 == updated.eversion => {
+                s.extents.insert(extent_id, updated);
+                Ok(())
+            }
+            _ => Err(AppError::Precondition(format!(
+                "extent {extent_id} changed while marking slot {slot} available"
+            ))),
+        }
     }
 
     #[doc(hidden)]
@@ -7795,7 +7807,7 @@ mod tests {
 
             m._test_mark_ec_inflight(extent_id);
 
-            let result = m.mark_extent_available(extent_id, 0).await;
+            let result = m.mark_extent_available(extent_id, 0, 1).await;
             assert!(
                 result.is_err(),
                 "mark_extent_available must return Err while ec_conversion_inflight"
@@ -7808,7 +7820,7 @@ mod tests {
 
             // After EC clears, retry succeeds.
             m._test_clear_inflight(extent_id);
-            let result = m.mark_extent_available(extent_id, 0).await;
+            let result = m.mark_extent_available(extent_id, 0, 1).await;
             assert!(
                 result.is_ok(),
                 "mark_extent_available must succeed after EC clears"
@@ -7817,6 +7829,34 @@ mod tests {
             let ex = s.extents.get(&extent_id).unwrap();
             assert_eq!(ex.eversion, 8, "eversion bumped after retry");
             assert_eq!(ex.avali, 0x7, "avali bit set after retry");
+        })
+    }
+
+    /// A catch-up vouches for LENGTH only. A slot marked corrupt while it ran
+    /// (a repeated report records a missing mark without moving the eversion),
+    /// or one that moved to another node, must not be lit by it.
+    #[test]
+    fn mark_extent_available_refuses_a_corrupt_or_moved_slot() {
+        run(async {
+            let m = AutumnManager::new();
+            let mut ex = make_ec_extent(202, 7);
+            ex.avali = 0x6; // slot 0 (node 1) dark
+            m.store.inner.borrow_mut().extents.insert(202, ex);
+
+            assert!(
+                m.mark_extent_available(202, 0, 9).await.is_err(),
+                "slot 0 holds node 1, not node 9"
+            );
+            m.extent_corrupt_slots.borrow_mut().insert(202, 0b1);
+            assert!(
+                m.mark_extent_available(202, 0, 1).await.is_err(),
+                "a corrupt-marked slot stays dark"
+            );
+            assert_eq!(m.store.inner.borrow().extents[&202].avali, 0x6);
+
+            m.extent_corrupt_slots.borrow_mut().clear();
+            m.mark_extent_available(202, 0, 1).await.unwrap();
+            assert_eq!(m.store.inner.borrow().extents[&202].avali, 0x7);
         })
     }
 

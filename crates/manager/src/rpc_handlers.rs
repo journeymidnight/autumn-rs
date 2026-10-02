@@ -959,7 +959,13 @@ impl AutumnManager {
         let op_in_flight = self.extent_inflight_op(req.extent_id).is_some();
         // Compute the etcd-first update under a read-only borrow (no mutation
         // until the persist succeeds — coco I5).
-        let updated: Result<(ExtentRecord, u32), (u8, String)> = {
+        // Either darken these bits, or (already dark) record the reason for
+        // these bits if it is missing.
+        enum Reported {
+            Isolate(ExtentRecord, u32),
+            AlreadyIsolated { unmarked: u32 },
+        }
+        let updated: Result<Reported, (u8, String)> = {
             let s = self.store.inner.borrow();
             // I4 fencing: the reporter must be the current partition owner.
             let owner_key = format!("partition/{}", req.partition_id);
@@ -1032,16 +1038,24 @@ impl AutumnManager {
                     crate::extent_corrupt::IsolationOutcome::Isolate {
                         updated,
                         cleared_mask,
-                    } => Ok((updated, cleared_mask)),
+                    } => Ok(Reported::Isolate(updated, cleared_mask)),
                     // Reported replicas are already dark: a retried report after
-                    // the first isolation landed. Idempotent success, and it must
-                    // stay distinguishable from a refusal — the PS treats any
-                    // non-OK as "do not trust" and would fail its open.
+                    // the first isolation landed. They may be dark WITHOUT the
+                    // reason recorded (isolated before isolation and mark shared
+                    // a transaction); an unmarked dark slot reads as behind and
+                    // the loop would catch it up in place — a length check the
+                    // rotted copy passes. So the reason is recorded here.
                     crate::extent_corrupt::IsolationOutcome::AlreadyIsolated => {
-                        return Ok(rkyv_encode(&ReportCorruptReplicaResp {
-                            code: CODE_OK,
-                            message: "no-op (reported replica(s) already isolated)".into(),
-                        }));
+                        let unmarked = Self::extent_nodes(ex)
+                            .iter()
+                            .enumerate()
+                            .filter(|(slot, node)| {
+                                *slot < 32
+                                    && req.corrupt_node_ids.contains(node)
+                                    && !self.slot_is_corrupt(ex.extent_id, *slot)
+                            })
+                            .fold(0u32, |bits, (slot, _)| bits | (1u32 << slot));
+                        Ok(Reported::AlreadyIsolated { unmarked })
                     }
                     crate::extent_corrupt::IsolationOutcome::Refused { code, message } => {
                         Err((code, message))
@@ -1050,7 +1064,26 @@ impl AutumnManager {
             }
         };
         let (updated, cleared_bits) = match updated {
-            Ok(u) => u,
+            Ok(Reported::Isolate(u, bits)) => (u, bits),
+            // Idempotent success, distinguishable from a refusal — the PS
+            // treats any non-OK as "do not trust" and would fail its open. A
+            // mark that cannot be written is the one non-OK here: the PS
+            // retries, and until then the slot must not look merely behind.
+            Ok(Reported::AlreadyIsolated { unmarked }) => {
+                if let Err(err) = self.mark_slots_corrupt(req.extent_id, unmarked).await {
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: Self::err_to_code(&err),
+                        message: format!(
+                            "extent {} already isolated, but recording why failed: {err}",
+                            req.extent_id
+                        ),
+                    }));
+                }
+                return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                    code: CODE_OK,
+                    message: "no-op (reported replica(s) already isolated)".into(),
+                }));
+            }
             Err((code, message)) => {
                 return Ok(rkyv_encode(&ReportCorruptReplicaResp { code, message }))
             }
@@ -1068,29 +1101,23 @@ impl AutumnManager {
         // on actual bit-rot during a partition open). The generalized
         // put_delete_txn_cas is kept ready to apply here IF an extent-state
         // clobber is ever actually reproduced — do NOT add it speculatively.
-        if let Err(err) = self.persist_extent(&updated).await {
-            return Ok(rkyv_encode(&ReportCorruptReplicaResp {
-                code: Self::err_to_code(&err),
-                message: err.to_string(),
-            }));
-        }
-        // Record WHY these slots went dark. A clear `avali` bit alone reads as
-        // "behind", which the dispatch loop tries to heal with re_avali — a
-        // length comparison a full-length rotted replica passes. Worse, under
-        // the default `fenced_only` gate the loop skips the slot entirely, so
-        // without this mark the extent stays at RF-1 with no repair path.
-        if let Err(err) = self
-            .mark_slots_corrupt(updated.extent_id, cleared_bits)
+        //
+        // The isolation and WHY these slots went dark land together. A clear
+        // `avali` bit alone reads as "behind", which the dispatch loop heals
+        // in place with re_avali — a length comparison a full-length rotted
+        // replica passes.
+        let marked = match self
+            .persist_isolation_with_mark(&updated, cleared_bits)
             .await
         {
-            return Ok(rkyv_encode(&ReportCorruptReplicaResp {
-                code: Self::err_to_code(&err),
-                message: format!(
-                    "isolated extent {} but could not record the corrupt slots ({err});                      retry so the rebuild is scheduled",
-                    updated.extent_id
-                ),
-            }));
-        }
+            Ok(marked) => marked,
+            Err(err) => {
+                return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                }));
+            }
+        };
         // Verify-at-apply (coco P1 #1, the same pattern): a concurrent mutator
         // (recovery_done / ec_convert_done / seal / split) could have bumped
         // this extent's eversion during the persist await. We snapshotted the
@@ -1114,6 +1141,13 @@ impl AutumnManager {
                 _ => {}
             }
             s.extents.insert(updated.extent_id, updated.clone());
+            // OR, not overwrite: a concurrent report of another slot may
+            // have recorded its bit while this write was in flight.
+            *self
+                .extent_corrupt_slots
+                .borrow_mut()
+                .entry(updated.extent_id)
+                .or_insert(0) |= marked;
         }
         tracing::warn!(
             extent_id = updated.extent_id,
@@ -1822,6 +1856,7 @@ impl AutumnManager {
         let req: ExtentInfoReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let payload_location = self.payload_location_of(req.extent_id).as_byte();
+        let corrupt_slots = self.corrupt_slots_of(req.extent_id);
         let s = self.store.inner.borrow();
         match s.extents.get(&req.extent_id) {
             Some(e) => Ok(rkyv_encode(&ExtentInfoResp {
@@ -1829,12 +1864,14 @@ impl AutumnManager {
                 message: String::new(),
                 extent: Some(e.into()),
                 payload_location,
+                corrupt_slots,
             })),
             None => Ok(rkyv_encode(&ExtentInfoResp {
                 code: CODE_NOT_FOUND,
                 message: format!("extent {} not found", req.extent_id),
                 extent: None,
                 payload_location,
+                corrupt_slots: 0,
             })),
         }
     }
@@ -2038,8 +2075,9 @@ impl AutumnManager {
     /// more. An unreachable committed
     /// member gets its `avali` bit left UNSET → the recovery/re_avali path
     /// reconciles it to `sealed_length` later (the laggard may hold MORE —
-    /// un-acked speculation — which is then truncated; or LESS — which is
-    /// re-replicated up). Either way acked data is safe.
+    /// un-acked speculation past the seal, which nothing reads, since every
+    /// read is bounded by `sealed_length`; or LESS — which is copied up).
+    /// Either way acked data is safe.
     ///
     /// `Err` only when no committed member answered (there is none, or none
     /// was reachable): then nothing tells where the acked data ends.
@@ -7519,6 +7557,8 @@ mod selfheal_a5_tests {
         let ex = s.extents.get(&9).unwrap();
         assert_eq!(ex.avali, 0b101, "slot 1 (node 3) bit cleared");
         assert_eq!(ex.eversion, 8, "eversion bumped to invalidate caches");
+        drop(s);
+        assert!(m.slot_is_corrupt(9, 1), "the isolation lands with its reason");
     }
 
     #[test]
@@ -7655,6 +7695,15 @@ mod selfheal_a5_tests {
         let ex = s.extents.get(&9).unwrap();
         assert_eq!(ex.avali, 0b101, "no-op, no further clear");
         assert_eq!(ex.eversion, 7, "no eversion bump on a no-op report");
+        drop(s);
+        // The dark slot had no reason recorded. Left that way it reads as
+        // BEHIND, and the dispatch loop would catch it up in place with a
+        // length check the rotted copy passes; the report records it.
+        assert!(
+            m.slot_is_corrupt(9, 1),
+            "a repeated report must record why an unmarked dark slot is dark"
+        );
+        assert!(!m.slot_is_corrupt(9, 0) && !m.slot_is_corrupt(9, 2));
     }
 }
 

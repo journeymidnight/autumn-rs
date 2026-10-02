@@ -9,12 +9,11 @@
 //!   copy passes. Only a rebuild replaces the bytes.
 //!
 //! Without somewhere to record the difference, a corrupt report clears the bit
-//! and nothing else. Under the default `fenced_only` recovery gate the dispatch
-//! loop skips the slot before it ever reads `avali`, so the extent sits at RF-1
-//! forever: isolated, unrepaired, and silent. Corruption is a STRONGER signal
-//! than the conditions that do trigger a rebuild — the owner replayed those
-//! bytes and proved them wrong — so it must not need a weaker one to be acted
-//! on.
+//! and nothing else, and the dispatch loop reads a dark slot as behind: it
+//! catches it up in place with `re_avali`, whose length check the rotted copy
+//! passes, and puts it back in service. The mark makes the loop rebuild the
+//! slot instead, and it is written in the same transaction as the isolation so
+//! there is no moment when the slot is dark without it.
 //!
 //! Kept in a sibling key rather than widening `ExtentRecord`, following
 //! `extent_layout`: that struct is the persisted `extents/<id>` value, and
@@ -210,10 +209,47 @@ impl AutumnManager {
             etcd.put_and_delete_txn(vec![(key, merged.to_le_bytes().to_vec())], vec![])
                 .await?;
         }
-        self.extent_corrupt_slots
+        // OR, not overwrite: another report may have landed during the write.
+        *self
+            .extent_corrupt_slots
             .borrow_mut()
-            .insert(extent_id, merged);
+            .entry(extent_id)
+            .or_insert(0) |= merged;
         Ok(())
+    }
+
+    /// Persist an isolation and the reason for it in ONE transaction, and
+    /// return the merged bitmap for the caller to install alongside the
+    /// extent once its verify-at-apply passes.
+    ///
+    /// Two writes left a window — the isolation landed, the mark did not —
+    /// where a slot was dark with nothing saying why. The dispatch loop reads
+    /// an unmarked dark slot as BEHIND and catches it up in place with
+    /// `re_avali`, whose whole test is length: a full-length rotted copy
+    /// passes it and goes back into service.
+    pub(crate) async fn persist_isolation_with_mark(
+        &self,
+        updated: &ExtentRecord,
+        cleared_mask: u32,
+    ) -> Result<u32, AppError> {
+        let merged = self.corrupt_slots_of(updated.extent_id) | cleared_mask;
+        if let Some(etcd) = &self.etcd {
+            etcd.put_and_delete_txn(
+                vec![
+                    (
+                        format!("extents/{}", updated.extent_id),
+                        crate::persist::encode(updated),
+                    ),
+                    (
+                        extent_corrupt_key(updated.extent_id),
+                        merged.to_le_bytes().to_vec(),
+                    ),
+                ],
+                vec![],
+            )
+            .await?;
+        }
+        Ok(merged)
     }
 
     /// Clear one slot's corrupt mark — the rebuild that replaces those bytes has

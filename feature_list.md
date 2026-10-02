@@ -14,6 +14,25 @@
 
 ## Active
 
+### F-RECOVERY-ONE-MODE — 恢复只留一种模式；错过 seal 的副本原地补齐
+- **Trigger** (2026-10-02 用户): "我认为留一种模式就行, 1. fenced_only也要RE_AVALI"。此前 `AUTUMN_MGR_RECOVERY_GATE` 选 `fenced_only`（默认）或 `auto_disk`；默认模式在发 `RE_AVALI` 的分支之前就返回，seal 时不在的副本回来后 avali 永不置位，extent 一直少一份，直到有人 fence。
+- **Scope**: 删除两种模式与环境变量；搬走副本只在 fenced / corrupt / 本节点自报磁盘故障时发生；avali 未置位、节点 Online、磁盘在线的复制 extent 发 `RE_AVALI` 按 sealed_length 原地补齐，失败只退避不搬走；删除只属于 `auto_disk` 的探测分支。
+- **Acceptance**: `single_wal_replica_survivor`（3 副本只写进 1 个、PS 崩溃、只剩该副本时 seal、另 2 个回来）60 s 内两份补齐到 sealed 长度且读出一致；消融（不发 `RE_AVALI`）变红；manager lib 与恢复相关集成测试绿。
+- `passes: true`
+- **notes** (2026-10-02): `slot_verdict(fenced, corrupt, disk_faulted) -> Rebuild | Keep`；Keep 且 avali 未置位、复制 extent、节点 Online、磁盘未离线、extent 无进行中 op 时后台 `re_avali`（`start_catch_up`，最多 8 个并发，独立 `catch_up_backoff`）。删 `RecoveryGateMode`/环境变量/探测分支/`probe_extent_on_node`。七轮独立评审（fable×3、opus×4）引出的修复：(1) EN 整 extent 拷贝（recovery / re_avali / EC 协调者）源 = `copy_sources`：排除 manager 标 corrupt 的 slot（`ExtentInfoResp.corrupt_slots`，**wire 53**），lit 优先，落后未标记副本仍是源；(2) 重建把被替换 slot 当 best-effort 源（被 fence 的唯一全量副本不再被 reconcile-down 丢掉已提交记录）；(3) peer copy 发布前复核源未被标记且仍是成员；(4) 隔离与 corrupt 标记一次 etcd 事务；已隔离路径（RPC/scrub）补写缺失标记；标记安装 OR 入现值；(5) `mark_extent_available` etcd-first + CAS，拒绝进行中 op / 已标 corrupt / slot 换节点；(6) 有 corrupt 标记的 extent 不新建 EC 转换。测试：`single_wal_replica_survivor` 3 个（含 corrupt 不作源、fenced 唯一成员从自身重建且三份含 record 2），`a_behind_slot_waits_for_the_op_in_flight_on_its_extent`、`mark_extent_available_refuses_a_corrupt_or_moved_slot`、`no_ec_conversion_starts_on_an_extent_with_a_corrupt_slot`、`copy_source_tests`×3、corrupt 上报单测扩充；均做消融变红。manager 全量集成 113 目标绿（修复前一轮）、stream 全量绿（`extent_pipeline::cq_flushes_fast_ops_while_slow_op_runs` 时序偶发，HEAD 上同样偶发）。reconcile-down：被标记成员不读内容但照常计数（不可达=unverified；一字节探测发现比最好副本长=挡住；被替换 slot 永不挡自己的重建）——唯一持有 seal 尾部的副本被标记时为终止等待，WARN 写明需运维（待用户确认这一取舍）。未修（推理未复现，按规则不加防御）：`mark_extent_available` 用 CAS 而隔离写是普通 put，二者交错时内存可能短暂把坏副本当 lit 且无标记，直到再次上报；peer copy 复核后到 manager 点亮之间的毫秒窗口；重建排除被替换 slot 之外的老问题（节点真死时 reconcile-down 丢未确认尾）不变。
+
+### F-EXTENT-HEALTH — extent 健康汇总（autumn-op / dashboard 报警）
+- **Trigger** (2026-10-02 用户): "autumn op层面要能包括extent的状态…dashboard也有对应的报警,比如ceph就包括说多少个pg怎么样了"。
+- **Scope**: manager 按 slot 归类（serving / behind / unreachable / fenced / corrupt / faulted disk / maintenance），按 extent 汇总可用份数与所需份数（clean / degraded / 无冗余 / 不可读 / recovering），给出 OK / WARN / ERR 与最差的若干 extent；新 manager 消息（只加 opcode）；`autumn-op health [--detail N] [--json]`；overview JSON 带汇总；dashboard 总览按严重度报警。
+- **Acceptance**: 归类与汇总有单测（每种状态、EC 所需份数、优先级）；真实进程下停一个副本节点后 `autumn-op health` 报 WARN 并列出该 extent，节点恢复后回到 OK；dashboard 渲染测试覆盖报警行。
+- `passes: false`
+
+### F-EXTENT-REPAIR — 不等 fence，立即把 degraded 副本重建到别的节点（手动 + policy）
+- **Trigger** (2026-10-02 用户): "policy要能发现和修复…我们就应当是extent的状态不对了,然后就可以发起立即重建到别的节点的操作(不等待fenced)"。
+- **Scope**: 持久化的 per-slot 修复请求（etcd 兄弟键），被请求的 slot 判 Rebuild，重建完成后清除；`autumn-op repair --extent X` 经 op ledger（kind recovery）只修 degraded slot、健康 slot 拒绝；新增 `POLICY_KIND_REPAIR`：slot 持续 degraded 超过 manager `--repair-grace-secs`（默认 600）出 advisory；auto-policy 第 7 个开关 `repair`（优先级最高，`maintenance` / `balanced` / `aggressive` 预设开启）；dashboard 开关与按钮。
+- **Acceptance**: 真实进程：节点停掉后 `repair` 在 fence 之前把副本重建到备用节点；leader 切换后修复请求仍在；policy Armed + 短 grace 时自动修复，DryRun 只记录；消融（不读修复请求 / policy 不出 repair）各自变红。
+- `passes: false`
+
 ### REN-SEAL-ONE-REPLICA — seal 只需一个已提交副本回答；删除 AUTUMN_MGR_SEAL_DURABILITY_FLOOR
 - **Trigger** (2026-10-02 用户): "回放WAL的时候,有可能有的副本坏了,但是只要哪怕一个副本回答, 说明这个副本至少有全部数据(可能比真正有的都多), 哪怕seal了以后,有一个比它短的,但是也有全部数据,是安全的, 所以注释应该是 'wish all replicas answer, but even one can response, we could do seal, we are sure data is safe' 之类的"；"AUTUMN_MGR_SEAL_DURABILITY_FLOOR删除, 应当是哪怕就留一个WAL,系统也可以恢复"。
 - **Scope**: `compute_commit_seal` 去掉 floor 参数，只在没有已提交副本回答时拒绝；删 `seal_durability_floor()` 与环境变量；改写 `handle_check_commit_length` 等处与代码不符的注释；更新 manager CLAUDE.md。默认行为不变（原默认 1）。
@@ -95,7 +114,8 @@
 - **Trigger** (2026-10-01，BUG-PROTOCOL-HELLO-REVIEW 跑全量 manager 测试时发现): `e2e_lifecycle::e2e_fence_triggers_recovery_dispatch`、`system_correlated_2of3_loss::leg1_correlated_2of3_loss_survives_and_recovery_refills_from_survivor`、`system_corrupt_replica_rebuild::a_replica_reported_corrupt_is_eventually_rebuilt`、`system_recovery_loop_drives::fencing_a_member_rebuilds_the_slot_when_a_spare_node_exists`、`system_wiped_rejoin_truncation::fencing_a_wiped_rejoined_node_triggers_recovery_refill` 恢复从不完成；在 e8e6be2^ 上同样失败，与统一 Hello 无关。EN 日志反复 `recovery task failed ... recovery destination disk is outside the pinned target`（检查来自 0efc2aa）。
 - **Scope**: 先查清是测试夹具（手工注册的节点/磁盘身份与 EN 真实 disk_id 不一致）还是 0efc2aa 的生产缺陷，再按根因修。
 - **Acceptance**: 5 个用例全绿；若是生产缺陷，加能在修复前变红的回归测试。
-- `passes: false`
+- `passes: true`
+- **notes** (2026-10-02): 根因是测试夹具，不是 0efc2aa 的生产缺陷：测试 EN 用随手写的 disk_id（1/2/3）启动，manager 注册时另外分配 disk_id，重建指令钉住目标节点的 manager disk，EN 本地 disk 不在其中 → 拒绝。生产中 `autumn-op format` 把分配的 id 写进数据目录，二者一致。修法：`support::format_node`（先注册取分配的 disk_id 再按它启动 EN），晚注册的备用节点在注册后启动；5 个用例全绿。
 
 ### BUG-MERGE-STALE-SOURCE-DEDUP — stale checkpoint extent counts can assign replay to the wrong source max_seq
 - **Trigger** (2026-09-29 external review of BUG-MERGE-SOURCE-REPLAY-OFFSET): existing `dedup_at` derives post-merge source regions from cumulative checkpoint-time `log_extent_count`. If one source grows while another truncates, stale counts can misattribute an extent to the other source; independent source sequence spaces then make `ts <= wrong_src_max` capable of dropping an unflushed record.

@@ -237,10 +237,6 @@ fn e2e_fence_persists_and_blocks_reregister() {
 
 #[test]
 fn e2e_fence_triggers_recovery_dispatch() {
-    // Make the recovery gate explicit so the test is independent of
-    // a future default flip.
-    std::env::set_var("AUTUMN_MGR_RECOVERY_GATE", "fenced_only");
-
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -251,9 +247,14 @@ fn e2e_fence_triggers_recovery_dispatch() {
     let n1_addr = pick_addr();
     let n2_addr = pick_addr();
     let n3_addr = pick_addr();
-    start_extent_node_with_manager(n1_addr, n1_dir.path().to_path_buf(), 1, mgr_addr);
-    start_extent_node_with_manager(n2_addr, n2_dir.path().to_path_buf(), 2, mgr_addr);
-    start_extent_node_with_manager(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
+    for (addr, dir, uuid) in [
+        (n1_addr, &n1_dir, "uuid-1"),
+        (n2_addr, &n2_dir, "uuid-2"),
+        (n3_addr, &n3_dir, "uuid-3"),
+    ] {
+        let disk_id = format_node(mgr_addr, addr, uuid);
+        start_extent_node_with_manager(addr, dir.path().to_path_buf(), disk_id, mgr_addr);
+    }
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");

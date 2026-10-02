@@ -611,6 +611,13 @@ pub struct ExtentInfoResp {
     /// The manager keeps this in a sibling etcd key, absent ⇒ `InDat`, so every
     /// pre-existing extent reads correctly with no backfill.
     pub payload_location: u8,
+    /// Slots the manager has marked CORRUPT (a partition owner or the node's
+    /// own scrub proved the bytes wrong), as a bitmap over `replicates ++
+    /// parity`. A whole-extent copy never reads from one: its copy is full
+    /// length, and a source is accepted on length alone. Rides beside `extent`
+    /// for the same reason as `payload_location` (sibling etcd key
+    /// `extentCorrupt/<id>`). Wire 53.
+    pub corrupt_slots: u32,
 }
 
 // --- NodesInfo ---
@@ -1021,10 +1028,8 @@ impl ExtCommitLengthResp {
 
 /// `MSG_PROBE_EXTENT` request: 8 bytes. `[extent_id: u64 LE]`
 ///
-/// See `extent_rpc::ProbeExtentReq` for full semantics. Manager
-/// construction sites: `commit_length_on_node`'s probe sibling
-/// `probe_extent_on_node` (recovery liveness check + autumn-client
-/// info open-extent display).
+/// See `extent_rpc::ProbeExtentReq` for full semantics. Built by the
+/// `autumn-op info` open-extent display; nothing in the manager sends it.
 pub struct ExtProbeExtentReq {
     pub extent_id: u64,
 }

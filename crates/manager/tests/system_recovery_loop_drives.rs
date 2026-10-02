@@ -110,9 +110,10 @@ fn fencing_a_member_rebuilds_the_slot_when_a_spare_node_exists() {
     let a = pick_addr();
     let b = pick_addr();
     let c = pick_addr();
-    let _da = spawn_en(a, 1, mgr_addr);
-    let _db = spawn_en(b, 2, mgr_addr);
-    let _dc = spawn_en(c, 3, mgr_addr); // the spare — recovery needs a NON-member target
+    let _da = spawn_en(a, format_node(mgr_addr, a, "uuid-drv-0"), mgr_addr);
+    let _db = spawn_en(b, format_node(mgr_addr, b, "uuid-drv-1"), mgr_addr);
+    // the spare — recovery needs a NON-member target
+    let _dc = spawn_en(c, format_node(mgr_addr, c, "uuid-drv-2"), mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");

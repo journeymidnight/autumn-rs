@@ -231,6 +231,15 @@ impl AutumnManager {
                     "EC target fenced or removed before dispatch".into(),
                 ));
             }
+            // The coordinator encodes from its OWN copy when that copy is full
+            // length, and a corrupt-marked copy is full length. Rebuild the
+            // marked slot first; the conversion is proposed again after.
+            if self.corrupt_slots_of(extent_id) != 0 {
+                return Err(AppError::Precondition(format!(
+                    "extent {extent_id} has a corrupt-marked slot; it is rebuilt before any \
+                     EC conversion"
+                )));
+            }
         }
         let recovery = match &payload {
             ExtentOpPayload::Recovery(task) => Some(self.capture_recovery_attempt(task)?),
@@ -1215,13 +1224,11 @@ mod tests {
         });
     }
 
-    /// Under `auto_disk` a slot on a healthy disk is dispatched when its
-    /// PROBE fails — the copy is gone or unreadable on a node that is otherwise
-    /// perfectly well — and every "is this slot healthy" clause reads true for
-    /// it. Releasing there re-derives the same rebuild next tick, restarting a
-    /// full-extent copy forever, so that gate must keep its markers.
+    /// A marker on a slot that nothing says should move — node registered,
+    /// Online, heard from this term, disk online, `avali` set, no override, no
+    /// corrupt mark — is a rebuild nobody wants any more, and it is released.
     #[test]
-    fn a_probe_driven_rebuild_is_not_released_as_healthy() {
+    fn a_marker_on_a_healthy_slot_is_released() {
         run(async {
             let m = AutumnManager::new();
             m.store.inner.borrow_mut().nodes.insert(
@@ -1262,23 +1269,11 @@ mod tests {
             m._test_acquire_marker(20, recovery_payload(20))
                 .await
                 .unwrap();
-            assert!(
-                m.release_recovery_markers_for_healthy_slots_under(
-                    crate::recovery::RecoveryGateMode::AutoDisk
-                )
-                .await
-                .is_empty(),
-                "auto_disk dispatches on a failed probe, and this state is \
-                 indistinguishable from that one — the marker must be kept"
-            );
             assert_eq!(
-                m.release_recovery_markers_for_healthy_slots_under(
-                    crate::recovery::RecoveryGateMode::FencedOnly
-                )
-                .await,
+                m.release_recovery_markers_for_healthy_slots().await,
                 vec![20],
-                "under the default gate nothing but an override could have \
-                 asked for this rebuild, and it is gone"
+                "nothing but an override could have asked for this rebuild, \
+                 and it is gone"
             );
         });
     }
@@ -1363,8 +1358,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            m.recovery_dispatch_tick_under(crate::recovery::RecoveryGateMode::FencedOnly)
-                .await;
+            m.recovery_dispatch_tick().await;
             assert_eq!(
                 m.extent_inflight_op(20),
                 Some(ExtentOpKind::Recovery),
@@ -1372,8 +1366,7 @@ mod tests {
             );
 
             m.node_overrides.borrow_mut().remove(&1);
-            m.recovery_dispatch_tick_under(crate::recovery::RecoveryGateMode::FencedOnly)
-                .await;
+            m.recovery_dispatch_tick().await;
             assert_eq!(
                 m.extent_inflight_op(20),
                 None,
@@ -1383,6 +1376,113 @@ mod tests {
             let lim = m.recovery_limiter.borrow();
             assert_eq!(lim.global_inflight, 0);
             assert_eq!(lim.snapshot(), (vec![], vec![]));
+        });
+    }
+
+    /// No new EC conversion of an extent with a corrupt-marked slot: the
+    /// coordinator would encode from a full-length copy without asking where it
+    /// came from, and a marked copy is full length.
+    #[test]
+    fn no_ec_conversion_starts_on_an_extent_with_a_corrupt_slot() {
+        run(async {
+            let m = AutumnManager::new();
+            m.extent_corrupt_slots.borrow_mut().insert(10, 0b1);
+            assert!(matches!(
+                m.acquire_extent_inflight(10, ec_payload(10)).await,
+                Err(AppError::Precondition(_))
+            ));
+            m.extent_corrupt_slots.borrow_mut().clear();
+            m.acquire_extent_inflight(10, ec_payload(10)).await.unwrap();
+        });
+    }
+
+    /// A behind slot is caught up in place only once its extent has no op in
+    /// flight. Marking the slot available bumps the eversion every such op
+    /// pinned — a sibling slot's rebuild would be judged stale at its next
+    /// re-send, retired, its finished copy refused, and started over.
+    #[test]
+    fn a_behind_slot_waits_for_the_op_in_flight_on_its_extent() {
+        run(async {
+            let m = AutumnManager::new();
+            for (node_id, addr, disk) in [
+                (1u64, "127.0.0.1:9101", 10u64),
+                (2, "127.0.0.1:1", 11),
+                (9, "127.0.0.1:9109", 90),
+            ] {
+                m.store.inner.borrow_mut().nodes.insert(
+                    node_id,
+                    NodeRecord {
+                        node_id,
+                        address: addr.into(),
+                        disks: vec![disk],
+                        shard_ports: vec![],
+                        control_address: String::new(),
+                        node_uuid: String::new(),
+                    },
+                );
+                m.node_states.borrow_mut().on_heartbeat_ok(node_id);
+                m.store.inner.borrow_mut().disks.insert(
+                    disk,
+                    crate::persist::records::DiskRecord {
+                        disk_id: disk,
+                        online: true,
+                        uuid: String::new(),
+                    },
+                );
+            }
+            // Slot 0 (node 2) missed the seal; slot 1 (node 1) is being
+            // rebuilt onto node 9.
+            m.store.inner.borrow_mut().extents.insert(
+                20,
+                ExtentRecord {
+                    extent_id: 20,
+                    sealed: true,
+                    sealed_length: 4096,
+                    replicates: vec![2, 1],
+                    replicate_disks: vec![11, 10],
+                    avali: 0b10,
+                    ..Default::default()
+                },
+            );
+            m._test_acquire_marker(20, recovery_payload(20))
+                .await
+                .unwrap();
+            let attempted = |m: &AutumnManager| {
+                m.catch_up_backoff
+                    .borrow()
+                    .backoff_snapshot()
+                    .iter()
+                    .any(|(e, slot, ..)| *e == 20 && *slot == 0)
+            };
+
+            m.recovery_dispatch_tick().await;
+            compio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
+            assert!(
+                !attempted(&m) && m.catch_up_inflight.borrow().is_empty(),
+                "no catch-up while the extent's rebuild is in flight"
+            );
+
+            m._test_release_recovery(20).await.unwrap();
+            m.recovery_dispatch_tick().await;
+            // Nothing listens on node 2's address, so the attempt fails and
+            // lands in the slot's backoff — proof that it ran.
+            let start = std::time::Instant::now();
+            while !attempted(&m) {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(5),
+                    "with the op done, the behind slot is caught up"
+                );
+                compio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            assert!(
+                !m.recovery_limiter
+                    .borrow()
+                    .backoff_snapshot()
+                    .iter()
+                    .any(|(e, slot, ..)| *e == 20 && *slot == 0),
+                "a failed catch-up must not hold back a rebuild of the slot"
+            );
         });
     }
 

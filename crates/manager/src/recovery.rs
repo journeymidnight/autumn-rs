@@ -316,20 +316,7 @@ impl AutumnManager {
     /// if it were seen for the first time right now? Answering anything weaker
     /// — "is the node un-fenced", say — releases rebuilds that other, equally
     /// override-blind sources asked for. `slot_verdict` is therefore consulted
-    /// rather than re-derived, and only a `Withhold` releases: under
-    /// `auto_disk` a healthy disk still verdicts `Probe`, and a `Probe` slot is
-    /// dispatched on a FAILED probe (a copy that is gone or unreadable on an
-    /// otherwise healthy node), which every clause below reads as healthy. That
-    /// marker must be kept — releasing it mid-copy only to re-derive it next
-    /// tick restarts a full-extent rebuild forever. The cost of the
-    /// conservative answer is that `auto_disk` keeps the zombie marker this
-    /// exists to collect; it is the legacy mode, and holding a marker costs
-    /// capacity that `recovery-stats` shows, where releasing a live one costs
-    /// availability that nothing shows.
-    pub(crate) async fn release_recovery_markers_for_healthy_slots(&self) -> Vec<u64> {
-        self.release_recovery_markers_for_healthy_slots_under(Self::recovery_gate_mode())
-            .await
-    }
+    /// rather than re-derived, and only a `Keep` releases.
 
     /// Drop what only the PREVIOUS leader term learned from `df`, so a fresh
     /// term starts with no second-hand facts about any node's disks.
@@ -369,12 +356,7 @@ impl AutumnManager {
         self.node_max_free.borrow().contains_key(&node_id)
     }
 
-    /// The gate is a parameter so a test can pin one without reaching for the
-    /// process-wide environment, which no test can own while others run.
-    pub(crate) async fn release_recovery_markers_for_healthy_slots_under(
-        &self,
-        gate: RecoveryGateMode,
-    ) -> Vec<u64> {
+    pub(crate) async fn release_recovery_markers_for_healthy_slots(&self) -> Vec<u64> {
         let ids: Vec<u64> = self.inflight.borrow().keys().copied().collect();
         let mut released = Vec::new();
         for extent_id in ids {
@@ -395,16 +377,12 @@ impl AutumnManager {
                     };
                     let disk_faulted =
                         disk_id.is_some_and(|id| self.faulted_disks.borrow().contains(id));
-                    // Derived exactly as the dispatch loop derives it, so the
-                    // verdict below is answering the same question from the
-                    // same facts: `None` is "no disk record", not "offline".
+                    // `None` is "no disk record", not "offline".
                     let disk_online = disk_id.and_then(|id| s.disks.get(id)).map(|d| d.online);
                     let verdict = slot_verdict(
-                        gate,
                         self.node_overrides.borrow().contains_key(&task.replace_id),
                         self.slot_is_corrupt(extent_id, slot),
                         disk_faulted,
-                        disk_online,
                     );
                     s.nodes.contains_key(&task.replace_id)
                         && self.has_first_hand_df(task.replace_id)
@@ -415,7 +393,7 @@ impl AutumnManager {
                             .is_online()
                         && (ex.avali & (1u32 << slot)) != 0
                         && disk_online == Some(true)
-                        && verdict == SlotVerdict::Withhold
+                        && verdict == SlotVerdict::Keep
                 })
             };
             if healthy {
@@ -1316,6 +1294,129 @@ impl AutumnManager {
         self.record_dispatch_outcome(extent_id, slot, now_s, &res);
     }
 
+    /// Start an in-place catch-up of `slot` as a background task, unless one
+    /// is already running for it or `CATCH_UP_MAX_INFLIGHT` are.
+    ///
+    /// Background because the node copies the whole missing range before it
+    /// answers (up to the 30 s timeout), and the dispatch tick is serial: a
+    /// node back from an hour away with hundreds of behind extents would
+    /// otherwise hold the tick — marker release, re-sends, every other
+    /// extent's rebuild, the fenced-tail drain — for the sum of their copies.
+    /// The cap bounds what a returning node is asked to copy at once; each
+    /// node also gates copies on its own recovery permits.
+    fn start_catch_up(
+        &self,
+        ex: &ExtentRecord,
+        slot: usize,
+        node: crate::persist::records::NodeRecord,
+    ) {
+        let key = (ex.extent_id, slot as u32);
+        {
+            let mut running = self.catch_up_inflight.borrow_mut();
+            if running.contains(&key) || running.len() >= CATCH_UP_MAX_INFLIGHT {
+                return;
+            }
+            running.insert(key);
+        }
+        let mgr = self.clone();
+        let ex = ex.clone();
+        compio::runtime::spawn(async move {
+            mgr.catch_up_in_place(&ex, slot, &node).await;
+            mgr.catch_up_inflight.borrow_mut().remove(&key);
+        })
+        .detach();
+    }
+
+    /// Bring a behind copy up to the sealed length on its own node
+    /// (`re_avali`), and mark the slot available once it is.
+    ///
+    /// The outcome goes to the slot's catch-up backoff (`catch_up_backoff`,
+    /// separate from the rebuild's), so a copy that keeps failing to catch up
+    /// is retried at a falling rate (cap 300 s) and warns at that rate, not
+    /// every 2 s tick. It is not a recovery op: nothing
+    /// moves, so it never enters the op ledger.
+    async fn catch_up_in_place(
+        &self,
+        ex: &ExtentRecord,
+        slot: usize,
+        node: &crate::persist::records::NodeRecord,
+    ) {
+        let base = Self::normalize_endpoint(&node.address);
+        let addr = Self::shard_addr_for_extent(&base, &node.shard_ports, ex.extent_id);
+        let payload = rkyv_encode(&ReAvaliReq {
+            extent_id: ex.extent_id,
+            eversion: ex.eversion,
+        });
+        // 30 s — RE_AVALI may copy the full extent from peers if local data
+        // lags sealed_length, so allow real work; cap to prevent a paged-out
+        // node from wedging the tick.
+        let outcome = match self
+            .conn_pool
+            .call_timeout(&addr, EXT_MSG_RE_AVALI, payload, Duration::from_secs(30))
+            .await
+        {
+            Err(e) => Err(format!("re_avali to {addr}: {e}")),
+            Ok(resp) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
+                Err(e) => Err(format!("re_avali to {addr}: undecodable reply: {e}")),
+                Ok(r) if r.code != CODE_OK => {
+                    Err(format!("re_avali to {addr}: code {}: {}", r.code, r.message))
+                }
+                Ok(_) => Ok(()),
+            },
+        };
+        let slot32 = slot as u32;
+        // The backoff window starts when this attempt ENDED: the copy may
+        // have taken most of the 30 s timeout.
+        let now_s = Self::epoch_seconds();
+        match outcome {
+            Ok(()) => {
+                self.catch_up_backoff
+                    .borrow_mut()
+                    .record_success(ex.extent_id, slot32);
+                if let Err(e) = self
+                    .mark_extent_available(ex.extent_id, slot, node.node_id)
+                    .await
+                {
+                    // The slot stays dark (the write is etcd-first) and the
+                    // next tick asks again; the node answers at once, its copy
+                    // being full now.
+                    tracing::warn!(
+                        extent_id = ex.extent_id,
+                        slot,
+                        error = %e,
+                        "re_avali reported OK but marking the slot available failed; \
+                         will retry next tick"
+                    );
+                } else {
+                    tracing::info!(
+                        extent_id = ex.extent_id,
+                        slot,
+                        node_id = node.node_id,
+                        sealed_length = ex.sealed_length,
+                        "caught a behind copy up to the sealed length in place"
+                    );
+                }
+            }
+            Err(error) => {
+                let consecutive = self.catch_up_backoff.borrow_mut().record_failure(
+                    ex.extent_id,
+                    slot32,
+                    now_s,
+                    &error,
+                );
+                tracing::warn!(
+                    extent_id = ex.extent_id,
+                    slot,
+                    node_id = node.node_id,
+                    consecutive_failures = consecutive,
+                    %error,
+                    "could not catch a behind copy up in place; it stays degraded \
+                     and is retried with backoff"
+                );
+            }
+        }
+    }
+
     pub(crate) fn reseed_recovery_limiter(&self) {
         let mut lim = self.recovery_limiter.borrow_mut();
         lim.reset_counts();
@@ -1342,23 +1443,6 @@ impl AutumnManager {
     /// limiter reseed, slot dispatch, fenced-tail drain — is reachable without
     /// a running cluster.
     pub(crate) async fn recovery_dispatch_tick(&self) {
-        // gate on `AUTUMN_MGR_RECOVERY_GATE`:
-        //   - `fenced_only` (default): trigger recovery ONLY when the
-        //     replica's node is operator-Fenced. Pre-fence transient
-        //     failures stop causing cross-node rebuilds.
-        //   - `auto_disk`: legacy behaviour (trigger on disk.online
-        //     == false). For ops who haven't yet stood up the
-        //     OP policy script.
-        self.recovery_dispatch_tick_under(Self::recovery_gate_mode())
-            .await
-    }
-
-    /// The gate is read ONCE per tick and threaded from here, so every decision
-    /// in one pass — release, dispatch — answers to the same mode, and a test
-    /// can pin it without the process-wide environment no test can own while
-    /// others run.
-    pub(crate) async fn recovery_dispatch_tick_under(&self, gate_mode: RecoveryGateMode) {
-
         // maintenance-TTL tick — clear expired Maintenance
         // overrides before the dispatch decision. Cheap.
         self.tick_maintenance_ttl().await;
@@ -1372,8 +1456,7 @@ impl AutumnManager {
         let now_s = Self::epoch_seconds();
 
         self.release_recovery_markers_for_dead_executors().await;
-        self.release_recovery_markers_for_healthy_slots_under(gate_mode)
-            .await;
+        self.release_recovery_markers_for_healthy_slots().await;
         self.resend_pinned_recovery_markers().await;
 
         // reseed the recovery rate limiter from the inflight
@@ -1443,16 +1526,6 @@ impl AutumnManager {
                 let bit = 1u32 << slot;
                 let node = nodes.get(&node_id).cloned();
 
-                // backoff gate. If the (extent, slot) pair
-                // has consecutive failures, skip this tick.
-                if self
-                    .recovery_limiter
-                    .borrow()
-                    .in_backoff(ex.extent_id, slot as u32, now_s)
-                {
-                    continue;
-                }
-
                 let is_fenced = matches!(
                     overrides.get(&node_id).map(|o| o.kind),
                     Some(NODE_OVERRIDE_FENCED)
@@ -1471,92 +1544,57 @@ impl AutumnManager {
                 let disk_faulted =
                     disk_id.is_some_and(|did| self.faulted_disks.borrow().contains(&did));
 
-                // ONE place decides. It used to be three checks in a row
-                // whose ORDER was the bug: the gate returned before
-                // anything looked at the disk.
-                match slot_verdict(gate_mode, is_fenced, is_corrupt, disk_faulted, disk_online)
-                {
-                    SlotVerdict::Withhold => continue,
-                    SlotVerdict::Rebuild => {
+                // ONE place decides whether the copy moves. It used to be
+                // three checks in a row whose ORDER was the bug: the gate
+                // returned before anything looked at the disk.
+                if slot_verdict(is_fenced, is_corrupt, disk_faulted) == SlotVerdict::Rebuild {
+                    // A slot whose rebuild keeps failing waits out its backoff.
+                    if !self
+                        .recovery_limiter
+                        .borrow()
+                        .in_backoff(ex.extent_id, slot as u32, now_s)
+                    {
                         self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
                             .await;
-                        continue;
                     }
-                    SlotVerdict::Probe => {}
-                }
-
-                if (ex.avali & bit) == 0 {
-                    if let Some(n) = node.clone() {
-                        let base = Self::normalize_endpoint(&n.address);
-                        // re_avali on specific extent → owner shard.
-                        let addr =
-                            Self::shard_addr_for_extent(&base, &n.shard_ports, ex.extent_id);
-                        let payload = rkyv_encode(&ReAvaliReq {
-                            extent_id: ex.extent_id,
-                            eversion: ex.eversion,
-                        });
-                        // 30 s — RE_AVALI may copy the full extent
-                        // from peers if local data lags
-                        // sealed_length, so allow real work; cap to
-                        // prevent paged-out-EN wedge.
-                        if let Ok(resp) = self
-                            .conn_pool
-                            .call_timeout(
-                                &addr,
-                                EXT_MSG_RE_AVALI,
-                                payload,
-                                Duration::from_secs(30),
-                            )
-                            .await
-                        {
-                            if let Ok(r) =
-                                rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp)
-                            {
-                                if r.code == CODE_OK {
-                                    if let Err(e) =
-                                        self.mark_extent_available(ex.extent_id, slot).await
-                                    {
-                                        // Swallowing this left the slot's
-                                        // bit clear while the loop believed
-                                        // it had healed, so the next tick
-                                        // re-sent RE_AVALI forever.
-                                        tracing::warn!(
-                                            extent_id = ex.extent_id,
-                                            slot,
-                                            error = %e,
-                                            "re_avali reported OK but marking the slot \
-                                             available failed; will retry next tick"
-                                        );
-                                    }
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
-                        .await;
                     continue;
                 }
 
-                // Tier 2: switched from `commit_length_on_node`
-                // (fence-gated, requires PS-owner owner_epoch) to the
-                // dedicated fence-free `probe_extent_on_node`. The
-                // recovery loop has no owner context and only uses
-                // `.is_ok()` for liveness — gating it on the
-                // owner-lock fence was always wrong (pre-Tier 2 we
-                // worked around it by hardcoding `owner_epoch: 0` + a
-                // server-side escape hatch; that escape silently
-                // broke and forced this same fix).
-                let healthy = match node {
-                    Some(n) => self
-                        .probe_extent_on_node(&n.address, ex.extent_id)
-                        .await
-                        .is_ok(),
-                    None => false,
-                };
-                if !healthy {
-                    self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
-                        .await;
+                // The copy stays where it is. If it is BEHIND — a member that
+                // was down when the extent was sealed, so its `avali` bit was
+                // never set — and its node answers again, bring it up to the
+                // sealed length in place. The sealed length came from a member
+                // that held every acked byte, so the peers that answered the
+                // seal hold all of it; `re_avali` copies it from them.
+                //
+                // Only to a node that answers: an unreachable one would hold
+                // this tick for the 30 s timeout per slot. A failure leaves
+                // the copy where it is and backs the slot off; moving the data
+                // elsewhere is a decision for the operator or the repair
+                // policy, never for a transient.
+                //
+                // Replicated extents only: `re_avali` is a replica primitive,
+                // and an EC node answers it OK without checking that its shard
+                // exists. A missing shard is rebuilt through recovery.
+                //
+                // Not while another op is in flight on the extent: marking the
+                // slot available bumps the eversion that op pinned (a sibling
+                // slot's rebuild would be retired and started over). It runs
+                // once the op is done.
+                let node_online = self.node_states.borrow().state_of(node_id).is_online();
+                if (ex.avali & bit) == 0
+                    && !ex.ec_converted
+                    && node_online
+                    && disk_online != Some(false)
+                    && self.extent_inflight_op(ex.extent_id).is_none()
+                    && !self
+                        .catch_up_backoff
+                        .borrow()
+                        .in_backoff(ex.extent_id, slot as u32, now_s)
+                {
+                    if let Some(n) = node {
+                        self.start_catch_up(&ex, slot, n);
+                    }
                 }
             }
         }
@@ -1680,21 +1718,6 @@ impl AutumnManager {
         }
     }
 
-    /// load the dispatch gate mode from env. Default
-    /// `fenced_only` (operator-driven). `auto_disk` opts back into the
-    /// legacy always-auto-rebuild behaviour for ops who haven't yet
-    /// stood up the OP policy script.
-    pub(crate) fn recovery_gate_mode() -> RecoveryGateMode {
-        match std::env::var("AUTUMN_MGR_RECOVERY_GATE")
-            .ok()
-            .as_deref()
-            .unwrap_or("fenced_only")
-        {
-            "auto_disk" => RecoveryGateMode::AutoDisk,
-            _ => RecoveryGateMode::FencedOnly,
-        }
-    }
-
     /// record a (success / failure) outcome for the
     /// (extent, slot) pair so the rate-limiter's backoff window
     /// updates correctly.
@@ -1787,90 +1810,59 @@ impl AutumnManager {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RecoveryGateMode {
-    AutoDisk,
-    FencedOnly,
-}
+/// In-place catch-ups (`start_catch_up`) running at once, across the cluster.
+/// The same bound as the EC conversion dispatch.
+const CATCH_UP_MAX_INFLIGHT: usize = 8;
 
 /// What the dispatch loop should do about one replica slot.
 ///
-/// A state, not a bool, because "rebuild it" and "go ask whether it is alive"
-/// are different actions with different costs and the third answer — the gate
-/// says no — is not the absence of either.
+/// A state, not a bool: "move this copy to another node" and "leave it where it
+/// is" are different actions, and the second still lets the loop catch a
+/// behind copy up in place.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum SlotVerdict {
-    /// Rebuild now, without probing. The evidence is already conclusive.
+    /// Rebuild on another node now. The evidence is conclusive.
     Rebuild,
-    /// Inconclusive: fall through to the availability probe.
-    Probe,
-    /// The gate withholds it; the operator has not said to move this data.
-    Withhold,
+    /// Leave the copy on its node. Nothing conclusive says it is lost: a node
+    /// that stopped answering may be back in seconds, and moving its data is
+    /// expensive and irreversible. Moving it anyway is the operator's call
+    /// (fence, or an explicit repair), not this loop's.
+    Keep,
 }
 
-/// Should this slot be rebuilt?
+/// Should this slot be rebuilt on another node?
 ///
 /// Extracted from the dispatch loop so the decision can be tested at all. It
 /// was inline, which is how it came to be wrong in a way nothing could assert
-/// on: the gate returned BEFORE the per-disk health check, so under the default
-/// `fenced_only` a slot on a dead disk was never even considered.
-///
-/// `disk_online` is `None` when the extent's layout does not name a disk for
-/// this slot (legacy records, or a slot index past `replicate_disks`), which
-/// must read as "no evidence" rather than as "dead".
-pub(crate) fn slot_verdict(
-    gate: RecoveryGateMode,
-    fenced: bool,
-    corrupt: bool,
-    disk_faulted: bool,
-    disk_online: Option<bool>,
-) -> SlotVerdict {
+/// on: the gate returned BEFORE the per-disk health check, so a slot on a dead
+/// disk was never even considered.
+pub(crate) fn slot_verdict(fenced: bool, corrupt: bool, disk_faulted: bool) -> SlotVerdict {
     // A fenced node must have every slot moved off it — that is what fencing
-    // is for. A slot a partition owner PROVED corrupt is rebuilt regardless of
-    // the gate: the owner replayed those bytes and found them wrong, which is
-    // stronger evidence than anything the gate waits for, and `re_avali`
-    // cannot repair it (it compares length, which a full-length rotted replica
-    // passes).
+    // is for. A slot a partition owner PROVED corrupt is rebuilt: the owner
+    // replayed those bytes and found them wrong, and `re_avali` cannot repair
+    // it (it compares length, which a full-length rotted replica passes).
     if fenced || corrupt {
         return SlotVerdict::Rebuild;
     }
-    // A disk its OWN node reports faulted is conclusive under either gate, and
-    // this sits above the gate deliberately.
+    // A disk its OWN node reports faulted is conclusive too.
     //
-    // `disk_faulted`, NOT `disk_online`. The two are not the same fact and
-    // conflating them turns this arm into a rebuild storm: `MgrDiskInfo.online`
-    // is also set false node-wide when a `df` merely times out (5 s) or when
-    // partition servers report the node, so reading it here would rebuild
-    // every sealed slot of any node that missed one heartbeat. That is exactly
-    // what the gate exists to prevent, and what the documented rolling-restart
-    // procedure relies on not happening. `disk_faulted` is written only from
-    // the node's own per-disk answer.
+    // `disk_faulted`, NOT `MgrDiskInfo.online`. The two are not the same fact
+    // and conflating them turns this arm into a rebuild storm: `online` is also
+    // set false node-wide when a `df` merely times out (5 s) or when partition
+    // servers report the node, so reading it here would rebuild every sealed
+    // slot of any node that missed one heartbeat — exactly what the
+    // documented rolling-restart procedure relies on not happening.
+    // `disk_faulted` is written only from the node's own per-disk answer.
     //
-    // The gate is for TRANSIENT signals — a node that stopped answering may be
-    // back in seconds, and moving its data is expensive and irreversible. A
-    // faulted disk is not one: the extent node sets `Faulted` from a local I/O
-    // error it has already suffered, and it never clears without a process
-    // restart. `Full` — the transient, self-healing state — is reported
-    // `online: true` and never lands here, which is what keeps a cluster
-    // running low on space from rebuilding itself.
-    //
-    // Below the gate, this was unreachable in the DEFAULT configuration: a
-    // dead disk left its replicas at RF-1 with the manager's own view still
-    // calling it healthy, and the only repair was fencing the whole node —
-    // four times the data movement on a four-disk machine.
+    // A faulted disk is not transient: the extent node sets `Faulted` from a
+    // local I/O error it has already suffered, and it never clears without a
+    // process restart. `Full` — the transient, self-healing state — is
+    // reported `online: true` and never lands here, which is what keeps a
+    // cluster running low on space from rebuilding itself.
     if disk_faulted {
         return SlotVerdict::Rebuild;
     }
-    if gate == RecoveryGateMode::FencedOnly {
-        return SlotVerdict::Withhold;
-    }
-    // `auto_disk` is the legacy mode, and its arm is deliberately the WIDE
-    // `online` bit — including the node-wide meanings. That is what it always
-    // did; opting into it is opting into rebuilding on absence.
-    if disk_online == Some(false) {
-        return SlotVerdict::Rebuild;
-    }
-    SlotVerdict::Probe
+    SlotVerdict::Keep
 }
 
 impl crate::AutumnManager {
@@ -2431,15 +2423,21 @@ impl crate::AutumnManager {
                     "a node read its OWN copy and found it rotted — isolating that slot \
                      so recovery rebuilds it"
                 );
-                if let Err(e) = self.persist_extent(&updated).await {
-                    tracing::warn!(
-                        extent_id = extent_id,
-                        error = %e,
-                        "could not persist the isolation of a rotted replica \
-                         (the scrub re-reports it on its next pass)"
-                    );
-                    return;
-                }
+                let marked = match self
+                    .persist_isolation_with_mark(&updated, cleared_mask)
+                    .await
+                {
+                    Ok(marked) => marked,
+                    Err(e) => {
+                        tracing::warn!(
+                            extent_id = extent_id,
+                            error = %e,
+                            "could not persist the isolation of a rotted replica \
+                             (the scrub re-reports it on its next pass)"
+                        );
+                        return;
+                    }
+                };
                 // Verify at apply, as the RPC path does. The persist
                 // above is an await, and seal / split / EC dispatch /
                 // delete handlers interleave during it; writing this
@@ -2451,6 +2449,13 @@ impl crate::AutumnManager {
                     match s.extents.get(&updated.extent_id) {
                         Some(live) if live.eversion == eversion => {
                             s.extents.insert(updated.extent_id, updated.clone());
+                            // OR, not overwrite: a concurrent report of another slot may
+                            // have recorded its bit while this write was in flight.
+                            *self
+                                .extent_corrupt_slots
+                                .borrow_mut()
+                                .entry(updated.extent_id)
+                                .or_insert(0) |= marked;
                         }
                         _ => {
                             tracing::warn!(
@@ -2462,27 +2467,15 @@ impl crate::AutumnManager {
                         }
                     }
                 }
-                if let Err(e) = self
-                    .mark_slots_corrupt(updated.extent_id, cleared_mask)
-                    .await
-                {
-                    tracing::warn!(
-                        extent_id = extent_id,
-                        error = %e,
-                        "isolated a rotted replica but could not record WHY; the \
-                         scrub's next report re-drives the mark on the \
-                         already-isolated path"
-                    );
-                }
             }
             crate::extent_corrupt::IsolationOutcome::AlreadyIsolated => {
                 // The bit is dark but the REASON may not be
-                // recorded — a `mark_slots_corrupt` that failed
-                // after the isolation landed leaves exactly this
-                // shape, and under the default fenced-only gate an
-                // unmarked dark slot is never rebuilt. This report
-                // is the retry that closes it; without re-driving
-                // here, nothing ever does.
+                // recorded: a slot isolated before the isolation and
+                // its mark were written in one transaction can be in
+                // exactly this shape. An unmarked dark slot reads as
+                // behind, and the dispatch loop would catch it up in
+                // place — a length check a rotted copy passes. This
+                // report records the reason.
                 let slot = ex
                     .replicates
                     .iter()
@@ -3066,9 +3059,8 @@ impl crate::AutumnManager {
                 message.into(),
                 now_s,
             );
-            // Yielding the marker is necessary and not sufficient: under the
-            // default gate recovery rebuilds a slot only once something has
-            // MARKED it, and the coordinator read its OWN sealed bytes and
+            // Yielding the marker is necessary and not sufficient: recovery
+            // rebuilds a slot only once something has MARKED it, and the coordinator read its OWN sealed bytes and
             // found them wrong — the scrub's evidence, found by a different
             // reader. Act on it HERE, in the window the abandon just opened:
             // isolation refuses while the extent has a stream-layer op in
@@ -3847,10 +3839,12 @@ mod corrupt_ec_handoff_tests {
             ..Default::default()
         };
         m.store.inner.borrow_mut().extents.insert(42, ex.clone());
-        m.extent_corrupt_slots.borrow_mut().insert(42, 1);
         m.acquire_extent_inflight(42, ExtentOpPayload::ConvertToEc(params.clone()))
             .await
             .unwrap();
+        // Marked after the conversion started — a new conversion of a marked
+        // extent is refused at acquire.
+        m.extent_corrupt_slots.borrow_mut().insert(42, 1);
         let old_nonce = m.extent_inflight_nonce(42);
         let recovery = || {
             ExtentOpPayload::Recovery(RecoveryTask {
@@ -3893,6 +3887,9 @@ mod corrupt_ec_handoff_tests {
             .await;
         assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::Recovery));
         m.commit_extent_inflight_release(42);
+        // The rebuild landed (which clears the mark) and a new conversion
+        // started.
+        m.extent_corrupt_slots.borrow_mut().remove(&42);
         m.acquire_extent_inflight(42, ExtentOpPayload::ConvertToEc(params))
             .await
             .unwrap();
@@ -3901,8 +3898,8 @@ mod corrupt_ec_handoff_tests {
         assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::ConvertToEc));
     }
 
-    /// Releasing the marker is half the repair: under the default gate recovery
-    /// rebuilds a slot only once something has MARKED it. The coordinator read
+    /// Releasing the marker is half the repair: recovery rebuilds a slot only
+    /// once something has MARKED it. The coordinator read
     /// its OWN sealed bytes and found them wrong, so the isolation happens in
     /// the window the abandon just opened — waiting for the node's `df` copy of
     /// the finding means waiting for a report the manager DROPS while an op is
@@ -3975,7 +3972,7 @@ mod corrupt_ec_handoff_tests {
         assert_eq!(
             m.extent_corrupt_slots.borrow().get(&42).copied(),
             Some(1),
-            "and the REASON must be recorded, or the default gate never rebuilds it"
+            "and the REASON must be recorded, or recovery never rebuilds it"
         );
     }
 }
@@ -4201,136 +4198,33 @@ mod recovery_placement_tests {
 
 #[cfg(test)]
 mod slot_verdict_tests {
-    use super::{slot_verdict, RecoveryGateMode, SlotVerdict};
+    use super::{slot_verdict, SlotVerdict};
 
-    /// THE REGRESSION.
-    ///
-    /// A disk the extent node has locally proven dead (`Faulted`, reported as
-    /// `online: false` on its `df`) must have its replicas rebuilt without
-    /// waiting for an operator. Before this, the default gate withheld the slot
-    /// BEFORE anything looked at the disk, so the extent sat at RF-1 silently
-    /// while the manager's own view still called the disk healthy, and the only
-    /// repair was fencing the whole node — four times the data movement on a
-    /// four-disk machine.
-    ///
-    /// Moving the disk arm back below the gate takes this to `Withhold`.
+    /// A disk the extent node has locally proven dead (`Faulted`) must have
+    /// its replicas rebuilt without waiting for an operator. Before this, the
+    /// gate withheld the slot BEFORE anything looked at the disk, so the extent
+    /// sat at RF-1 silently while the manager's own view still called the disk
+    /// healthy, and the only repair was fencing the whole node — four times
+    /// the data movement on a four-disk machine.
     #[test]
-    fn a_dead_disk_is_rebuilt_under_the_default_gate() {
-        assert_eq!(
-            slot_verdict(
-                RecoveryGateMode::FencedOnly,
-                false,
-                false,
-                true,
-                Some(false)
-            ),
-            SlotVerdict::Rebuild
-        );
+    fn a_dead_disk_is_rebuilt() {
+        assert_eq!(slot_verdict(false, false, true), SlotVerdict::Rebuild);
     }
 
-    /// THE NEAR MISS, kept as a guard.
-    ///
-    /// `MgrDiskInfo.online` is ALSO set false node-wide when a `df` merely
-    /// times out or when partition servers report a node — signals that say
-    /// nothing about any individual disk. Reading it above the gate would
-    /// rebuild every sealed slot of any node that missed one 5 s heartbeat,
-    /// which is the storm the gate exists to prevent and which the documented
-    /// rolling-restart procedure (`docs/ops.md`, "a merely-absent node does
-    /// NOT trigger recovery") relies on not happening.
-    ///
-    /// So: a disk whose node is merely unreachable must be WITHHELD. Swapping
-    /// the arm back to `disk_online` reddens this.
+    /// A node that is merely unreachable — `MgrDiskInfo.online` false because a
+    /// `df` timed out, or partition servers reported it — is no evidence about
+    /// any disk, and the verdict does not even take that bit. Its copies stay
+    /// put; the documented rolling-restart procedure (`docs/ops.md`, "a
+    /// merely-absent node does NOT trigger recovery") relies on it.
     #[test]
-    fn a_node_that_missed_one_heartbeat_is_not_rebuilt() {
-        assert_eq!(
-            slot_verdict(
-                RecoveryGateMode::FencedOnly,
-                false,
-                false,
-                false,
-                Some(false)
-            ),
-            SlotVerdict::Withhold,
-            "offline-because-unreachable is not evidence about a disk"
-        );
-    }
-
-    /// The reverse, and the one that keeps this from being a rebuild storm: a
-    /// disk that is merely FULL must change nothing. `Full` self-heals once
-    /// space returns, and the extent node reports it as `online: true`, so it
-    /// is invisible to the verdict — a cluster running low on space must not
-    /// start rebuilding itself.
-    #[test]
-    fn a_full_disk_triggers_nothing() {
-        assert_eq!(
-            slot_verdict(
-                RecoveryGateMode::FencedOnly,
-                false,
-                false,
-                false,
-                Some(true)
-            ),
-            SlotVerdict::Withhold
-        );
-        assert_eq!(
-            slot_verdict(RecoveryGateMode::AutoDisk, false, false, false, Some(true)),
-            SlotVerdict::Probe
-        );
+    fn an_unreachable_node_keeps_its_copies() {
+        assert_eq!(slot_verdict(false, false, false), SlotVerdict::Keep);
     }
 
     #[test]
-    fn a_fenced_node_or_a_corrupt_slot_is_rebuilt_under_either_gate() {
-        for gate in [RecoveryGateMode::FencedOnly, RecoveryGateMode::AutoDisk] {
-            assert_eq!(
-                slot_verdict(gate, true, false, false, Some(true)),
-                SlotVerdict::Rebuild
-            );
-            assert_eq!(
-                slot_verdict(gate, false, true, false, Some(true)),
-                SlotVerdict::Rebuild
-            );
-        }
-    }
-
-    /// The legacy mode's disk arm, which the extraction must not drop.
-    #[test]
-    fn under_auto_disk_a_dead_disk_is_rebuilt_without_probing() {
-        assert_eq!(
-            slot_verdict(RecoveryGateMode::AutoDisk, false, false, false, Some(false)),
-            SlotVerdict::Rebuild
-        );
-    }
-
-    /// A slot whose layout names no disk must read as "no evidence", never as
-    /// dead — legacy records and any slot index past `replicate_disks`.
-    #[test]
-    fn an_unnamed_disk_is_not_evidence() {
-        assert_eq!(
-            slot_verdict(RecoveryGateMode::AutoDisk, false, false, false, None),
-            SlotVerdict::Probe
-        );
-        assert_eq!(
-            slot_verdict(RecoveryGateMode::FencedOnly, false, false, false, None),
-            SlotVerdict::Withhold
-        );
-    }
-
-    #[test]
-    fn a_healthy_slot_probes_under_auto_disk_and_is_withheld_under_fenced_only() {
-        assert_eq!(
-            slot_verdict(RecoveryGateMode::AutoDisk, false, false, false, Some(true)),
-            SlotVerdict::Probe
-        );
-        assert_eq!(
-            slot_verdict(
-                RecoveryGateMode::FencedOnly,
-                false,
-                false,
-                false,
-                Some(true)
-            ),
-            SlotVerdict::Withhold
-        );
+    fn a_fenced_node_or_a_corrupt_slot_is_rebuilt() {
+        assert_eq!(slot_verdict(true, false, false), SlotVerdict::Rebuild);
+        assert_eq!(slot_verdict(false, true, false), SlotVerdict::Rebuild);
     }
 }
 
@@ -4396,7 +4290,7 @@ mod df_disk_health_tests {
     /// rather than by hand — feeding it `Some(false)` and calling that "a dead
     /// disk" is exactly how the storm below got written in the first place.
     #[test]
-    fn an_unreachable_node_withholds_while_a_faulted_disk_rebuilds() {
+    fn an_unreachable_node_keeps_while_a_faulted_disk_rebuilds() {
         let m = AutumnManager::new();
         let node = node_with_two_disks(&m.store);
 
@@ -4411,38 +4305,20 @@ mod df_disk_health_tests {
             "…but says nothing about any individual disk"
         );
         assert_eq!(
-            slot_verdict(
-                RecoveryGateMode::FencedOnly,
-                false,
-                false,
-                m.faulted_disks.borrow().contains(&10),
-                Some(m.store.inner.borrow().disks[&10].online),
-            ),
-            SlotVerdict::Withhold,
+            slot_verdict(false, false, m.faulted_disks.borrow().contains(&10)),
+            SlotVerdict::Keep,
             "a node that missed a heartbeat must not have its data rebuilt"
         );
 
         // (b) the node answers, and names one of its disks faulted.
         m.apply_df_disk_health(&node, &[(10, status(true)), (11, status(false))]);
         assert_eq!(
-            slot_verdict(
-                RecoveryGateMode::FencedOnly,
-                false,
-                false,
-                m.faulted_disks.borrow().contains(&11),
-                Some(m.store.inner.borrow().disks[&11].online),
-            ),
+            slot_verdict(false, false, m.faulted_disks.borrow().contains(&11)),
             SlotVerdict::Rebuild
         );
         assert_eq!(
-            slot_verdict(
-                RecoveryGateMode::FencedOnly,
-                false,
-                false,
-                m.faulted_disks.borrow().contains(&10),
-                Some(m.store.inner.borrow().disks[&10].online),
-            ),
-            SlotVerdict::Withhold,
+            slot_verdict(false, false, m.faulted_disks.borrow().contains(&10)),
+            SlotVerdict::Keep,
             "its healthy sibling is untouched"
         );
     }

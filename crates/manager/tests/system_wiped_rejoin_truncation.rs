@@ -502,20 +502,20 @@ fn wiped_rejoin_under_same_identity_does_not_truncate_acked_data() {
         assert_records_readable(&sc2, &sealed_recs, "final sealed").await;
         assert_records_readable(&sc2, &open_recs, "final open-tail (now sealed)").await;
 
-        // ── Phase E: recovery observation under the DEFAULT gate ──
-        // Under `fenced_only` (default), a wiped-but-rejoined-NOT-fenced node
-        // is NOT auto-refilled: recovery only fires for Fenced/disk-offline/
-        // avali-unset slots, and the manager still believes n3's avali bit is
-        // set. So E1's membership still lists n3 even though n3 holds nothing.
-        // Redundancy is silently degraded (effectively RF2) until an operator
-        // fences n3 or the auto_disk gate is enabled — but NO acked data is at
-        // risk (the emptiness is excluded from every min).
+        // ── Phase E: recovery observation ──
+        // A wiped-but-rejoined, NOT-fenced node is NOT auto-refilled: recovery
+        // moves a copy only off a fenced node, a corrupt slot or a faulted
+        // disk, and catches up only a slot whose avali bit is clear — the
+        // manager still believes n3's bit is set. So E1's membership still
+        // lists n3 even though n3 holds nothing. Redundancy is silently
+        // degraded (effectively RF2) until an operator fences n3 — but NO
+        // acked data is at risk (the emptiness is excluded from every min).
         compio::time::sleep(Duration::from_secs(5)).await; // > 2 recovery ticks
         sc2.invalidate_extent_cache(e1);
         let e1_after = sc2.get_extent_info(e1).await.expect("e1 info after");
         assert!(
             e1_after.replicates.contains(&n3_id),
-            "under the default fenced_only gate, the not-fenced wiped node is NOT auto-reconfigured out (observation, not a bug): before={e1_replicas_before:?} after={:?}",
+            "the not-fenced wiped node is NOT auto-reconfigured out (observation, not a bug): before={e1_replicas_before:?} after={:?}",
             e1_after.replicates
         );
 
@@ -551,7 +551,6 @@ fn fencing_a_wiped_rejoined_node_triggers_recovery_refill() {
     start_en_with_mgr(n2_addr, n2_dir.path().to_path_buf(), 2, mgr_addr);
     let (n3_flag, n3_handle) =
         start_en_with_mgr_stoppable(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
-    start_en_with_mgr(n4_addr, n4_dir.path().to_path_buf(), 4, mgr_addr);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
@@ -587,10 +586,12 @@ fn fencing_a_wiped_rejoined_node_triggers_recovery_refill() {
             e1_info.replicates
         );
 
-        // Register the spare n4 NOW (after the stream is placed) and wait for
-        // it Online so recovery has a genuine target.
+        // Register the spare n4 NOW (after the stream is placed), start it on
+        // the disk id that assigns, and wait for it Online so recovery has a
+        // genuine target.
         let r4 = register_node(&mgr, &n4_addr.to_string(), "uuid-4").await;
         let n4_id = r4.node_id;
+        start_en_with_mgr(n4_addr, n4_dir.path().to_path_buf(), r4.disk_uuids[0].1, mgr_addr);
         assert!(
             !e1_info.replicates.contains(&n4_id),
             "n4 must be a genuine spare (not in E1)"

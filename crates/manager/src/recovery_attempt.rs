@@ -289,8 +289,7 @@ mod tests {
         m.recovery_attempts.borrow_mut().remove(&42);
         // The marker bytes still decode; it cannot authorize a completion.
         assert!(m.apply_recovery_done(old).await.is_err());
-        m.recovery_dispatch_tick_under(crate::recovery::RecoveryGateMode::FencedOnly)
-            .await;
+        m.recovery_dispatch_tick().await;
         assert!(m.extent_inflight_payload_recovery(42).is_none());
         let new = acquire(&m, &task).await;
         m.apply_recovery_done(new).await.unwrap();

@@ -541,11 +541,12 @@ retried by the standing-instruction tick. Remove checks Recovery as well as EC
 markers. A delayed dispatch failure is scoped to the request's nonce.
 
 
-**Dispatch loop** (2 s, `recovery.rs`): scans all SEALED extents; per replica slot
-does a per-disk health check first (offline `disk_id` → dispatch immediately), then
-probes `commit_length` (or `re_avali` for known-lagging replicas). On no-response /
-error, dispatch `require_recovery` to a healthy candidate. In-flight recoveries live
-in the unified inflight ledger so a double-dispatch is impossible across failover.
+**Dispatch loop** (2 s, `recovery.rs`): scans all SEALED extents; per slot,
+`slot_verdict` decides whether the copy moves (Rebuild → `require_recovery` to a
+healthy candidate). A copy that stays and is BEHIND (`avali` clear, replicated
+extent, node Online, disk not offline) is caught up in place with `re_avali` to
+the sealed length. In-flight recoveries live in the unified inflight ledger so a
+double-dispatch is impossible across failover.
 
 **The marker is a STANDING INSTRUCTION, not a do-not-disturb flag.** A marker pins
 one `(extent, executor)` assignment; the leader keeps RE-SENDING that exact RPC
@@ -583,28 +584,20 @@ Its predicate is "does this slot still need rebuilding", NOT "is the node
 un-fenced" — a disk fault, a dark `avali` bit and a corrupt-slot mark are all
 legitimate marker sources that do not care about overrides. So it asks the
 DISPATCHER's own question, through `slot_verdict` rather than a re-derivation,
-and releases only on `Withhold`: the node is registered and Online, its `avali`
-bit is set, its disk is online, and the gate would not rebuild this slot now.
+and releases only on `Keep`: the node is registered and Online, its `avali`
+bit is set, its disk is online, and the verdict would not rebuild this slot now.
 It is deliberately STRICTER than the dispatcher in one place — it counts ANY
-override as a reason to keep the marker, where the dispatcher's gate tests only
+override as a reason to keep the marker, where the dispatcher's verdict tests only
 `NODE_OVERRIDE_FENCED` — so a node moved from Fenced into Maintenance keeps its
 markers until that override clears.
 
-Two states that look healthy but must KEEP the marker, both found in review:
-- Under `auto_disk` a slot on a healthy disk verdicts `Probe`, and a `Probe`
-  slot is dispatched when the PROBE FAILS — a copy that is gone or unreadable
-  on an otherwise healthy node, which every "is it healthy" clause reads as
-  true. Releasing there re-derives the same rebuild next tick, restarting a
-  full-extent copy forever. `Withhold` is the only verdict that cannot mean
-  that, so under `auto_disk` the zombie marker is kept: holding one costs
-  capacity that `recovery-stats` shows, releasing a live one costs availability
-  that nothing shows.
-- Between a promotion and the source node's first `df`, `faulted_disks` is
-  empty and `disks/<id>` replays `online: true`, so a genuinely faulted disk
-  reads as healthy. For DISPATCH that gap is the safe direction (withhold the
-  rebuild); for RELEASE the sign flips and it would discard a real, possibly
-  mid-copy rebuild after an ordinary failover. `has_first_hand_df` gates on
-  `node_max_free`, which only a successful `df` writes and replay never seeds.
+One state looks healthy but must KEEP the marker (found in review): between a
+promotion and the source node's first `df`, `faulted_disks` is empty and
+`disks/<id>` replays `online: true`, so a genuinely faulted disk reads as
+healthy. For DISPATCH that gap is the safe direction (keep the copy); for
+RELEASE the sign flips and it would discard a real, possibly mid-copy rebuild
+after an ordinary failover. `has_first_hand_df` gates on `node_max_free`,
+which only a successful `df` writes and replay never seeds.
 
 A marker that spins without progressing is also visible now: the re-send logs
 refusals, undecodable replies and unreachable targets at WARN. They were all
@@ -646,32 +639,65 @@ persisted retry outlives the address's ownership, and extent ids restart from
 small integers in the next cluster on that host — see the stream guide's
 "Delete extent" section.
 
-**Recovery gate** `AUTUMN_MGR_RECOVERY_GATE` (default `fenced_only`): one
-predicate, `slot_verdict(gate, fenced, corrupt, disk_online) -> Rebuild | Probe
-| Withhold`, decides every slot. It is a function because it was three inline
-checks whose ORDER was the bug — the gate returned before anything looked at
-the disk, so under the default a slot on a DEAD disk was never considered, and
-nothing could assert on it.
+**One recovery mode.** `slot_verdict(fenced, corrupt, disk_faulted) -> Rebuild
+| Keep` decides whether a slot's copy moves to another node. It is a function
+because it was three inline checks whose ORDER was the bug — the gate returned
+before anything looked at the disk, so a slot on a DEAD disk was never
+considered, and nothing could assert on it.
 
-Three things bypass the gate, each because it is CONCLUSIVE rather than
+Three things move a copy, each because it is CONCLUSIVE rather than
 suggestive: an operator `Fenced` node (that is what fencing is for), a slot a
 partition owner PROVED corrupt (it replayed those bytes; `re_avali` compares
 length, which a full-length rotted replica passes), and a disk **its own node
-named faulted on its last df**. `auto_disk` keeps its legacy arm BELOW the
-gate, where the wide `online` bit still means "rebuild on absence" — opting
-into that mode is opting into that.
+named faulted on its last df**. Nothing else does: a node that stopped
+answering may be back in seconds, and moving its data is expensive and
+irreversible.
+
+A copy that stays may still be BEHIND: a member that was down when the extent
+was sealed never had its `avali` bit set (seal needs only one answering
+member). When its node answers again the loop sends `re_avali`, the node copies
+the bytes up to `sealed_length` from its peers — lit ones first, never one
+marked corrupt (a corrupt-isolated copy is full length; the manager sends the
+bitmap beside the extent info, stream CLAUDE.md "Copy sources") — and
+`mark_extent_available` sets the bit. The conditions and why:
+- replicated extents only — an EC node answers `re_avali` OK without checking
+  that its shard exists;
+- node Online and disk not offline — an unreachable node would only time out;
+- no op in flight on the extent — the bit flip bumps the eversion, and a
+  sibling slot's pinned Recovery would be judged stale at its next re-send,
+  retired, its finished copy refused and the rebuild started over.
+  `mark_extent_available` refuses for the same reason if an op started during
+  the copy. It also refuses a slot marked corrupt meanwhile (the catch-up
+  vouched for length only) or one that no longer holds the node it caught up,
+  and it writes etcd-first with a compare-and-set against the record it read,
+  so a concurrent writer of the extent (split's refs, punch's ref drop) fails
+  it instead of being overwritten;
+- in the BACKGROUND (`start_catch_up`), at most `CATCH_UP_MAX_INFLIGHT` (8) at
+  once and one per slot — the node copies before it answers (30 s timeout),
+  and the dispatch tick is serial: a node back from a long absence with
+  hundreds of behind extents would otherwise hold release, re-sends, every
+  other rebuild and the fenced-tail drain for the sum of the copies.
+A failure goes to the slot's CATCH-UP backoff (`catch_up_backoff`, cap 300 s,
+timed from when the attempt ended — separate from the rebuild backoff, so
+failed catch-ups never delay a rebuild the slot later needs) and leaves the
+copy where it is; it is never a reason to rebuild elsewhere. Regressions: `tests/single_wal_replica_survivor.rs` (two replicas
+return 4096 bytes short of a single-replica seal and are brought up to it; a
+returning replica is never copied from a dark, rotted one) and
+`a_behind_slot_waits_for_the_op_in_flight_on_its_extent`; the fenced sole seal
+member is rebuilt from the dark replicas
+(`a_fenced_sole_seal_member_is_rebuilt_from_its_own_copy`).
 
 **The faulted fact is `faulted_disks`, NOT `MgrDiskInfo.online`, and that
 distinction is the whole safety of this.** The bool carries three meanings —
 the node said this disk is faulted, the node did not answer `df` at all
 (`mark_node_disks_offline`, node-wide, on a 5 s timeout), and a quorum of
 partition servers reported the node. Only the first is evidence about a DISK.
-Reading `online` above the gate rebuilds every sealed slot of any node that
-missed one heartbeat: the storm the gate exists to prevent, and the thing the
-documented rolling-restart runbook relies on not happening. `faulted_disks` is
+Reading `online` in the verdict would rebuild every sealed slot of any node
+that missed one heartbeat: a rebuild storm, and the thing the documented
+rolling-restart runbook relies on not happening. `faulted_disks` is
 in-memory, leader-local, written only by `apply_df_disk_health` from the node's
 own per-disk answer, and empty after a failover — so an unrebuilt slot is
-withheld until the owning node says again that its disk is bad.
+kept until the owning node says again that its disk is bad.
 
 `Full` never reaches here: it is transient and self-heals at 5% free, so the EN
 reports it `online: true`. That mapping (`DiskFS::online()` is
@@ -695,12 +721,15 @@ and the two reasons need opposite handling. *Behind* → `re_avali` refetches th
 missing tail. *Corrupt* → `re_avali` CANNOT help: its whole test is
 `local_len >= sealed_length`, which a full-length rotted replica passes. So
 `handle_report_corrupt_replica` records the darkened slots here in addition to
-clearing their bits, and `recovery_dispatch_loop` force-dispatches a marked slot
-regardless of `gate_mode`. `apply_recovery_done` clears the mark (the rebuilt
+clearing their bits, and `recovery_dispatch_loop` rebuilds a marked slot. `apply_recovery_done` clears the mark (the rebuilt
 slot holds fresh bytes copied from a healthy peer), and extent deletion drops
-the key alongside `extentLayout/`. **Without the mark the extent stays at RF-1
-forever**: the gate skips the slot before it ever reads `avali`, so the copy is
-isolated, unrepaired and silent. Sibling key rather than a `persist::ExtentRecord` field
+the key alongside `extentLayout/`. **Without the mark the dark slot reads as
+BEHIND**, and the dispatch loop's in-place catch-up (`re_avali`, a length
+check the rotted copy passes) would put it back in service. So the isolation
+and its mark are written in ONE etcd transaction
+(`persist_isolation_with_mark`), on both the RPC and the scrub path, and a
+repeated report of an already-dark slot records a missing mark on both paths
+too (a slot isolated before the two shared a transaction). Sibling key rather than a `persist::ExtentRecord` field
 for the same reason as `extentLayout` — widening the persisted `extents/<id>`
 value breaks rkyv replay validation, which refuses leadership.
 Regression: `crates/manager/tests/system_corrupt_replica_rebuild.rs`; the
@@ -713,7 +742,7 @@ replicas). Extending the report to the EC READ path (client infers corruption
 from a failed shard read) was considered and REJECTED: no shard-content
 checksum exists, so real rot reads back clean while the failures a reader does
 see are congestion/absence — see `crates/stream/CLAUDE.md` note 33 for the
-full argument and what should exist instead. The bitmap + gate bypass here are
+full argument and what should exist instead. The bitmap + rebuild verdict here are
 slot-generic over `replicates ++ parity`, and the EN-side scrub is the second
 evidence source: it reports its own rot on `DfResp.scrub_rot` and
 `node_health_loop` runs the SAME decision — `isolate_rotted_slot`, one helper
@@ -734,9 +763,15 @@ eversion out from under the op, and an EC conversion's flip then recomputes
 from the post-isolation baseline and lands with the eversion unchanged across a
 replicated→EC layout change, leaving cached layouts with no signal to refetch.
 Deferring is free: rot does not heal, so the reporter comes back. The
+converse holds too: `acquire_extent_inflight` refuses a NEW EC conversion
+marker on an extent with any corrupt-marked slot — the coordinator encodes from
+its own copy whenever that copy is full length, and a marked copy is; the slot
+is rebuilt first and the conversion proposed again after. The cost: an extent
+whose marked slot has no rebuild target (RF = node count) cannot be converted
+until a node is added. The
 already-isolated path re-drives `mark_slots_corrupt` when the slot is dark but
-unmarked — a mark that failed after its isolation landed is otherwise never
-rebuilt under the default gate.
+unmarked — a slot isolated before isolation and mark shared a transaction can
+be in that shape.
 
 **Node health loop** (`node_health_loop`, 2 s) is the **single** `EXT_MSG_DF` caller
 per node. **INVARIANT: never add a second `df` caller.** The EN's `handle_df`

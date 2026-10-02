@@ -261,6 +261,26 @@ pub async fn register_node(mgr: &RpcClient, addr: &str, disk_uuid: &str) -> Regi
     register_node_with_uuid(mgr, addr, disk_uuid, "").await
 }
 
+/// What `autumn-op format` does before a real extent node first starts:
+/// register it and return the disk id the manager assigned. The node must run
+/// on that id. Started on any other, it refuses every rebuild the manager pins
+/// to it — the instruction names the target's disks, and the node checks that
+/// the copy it is about to write lands on one of them ("recovery destination
+/// disk is outside the pinned target"). Registering again later with the same
+/// address and disk uuid returns the same ids.
+pub fn format_node(mgr_addr: SocketAddr, addr: SocketAddr, disk_uuid: &str) -> u64 {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let resp = register_node(&mgr, &addr.to_string(), disk_uuid).await;
+        assert_eq!(resp.code, CODE_OK, "register {addr}: {}", resp.message);
+        resp.disk_uuids
+            .iter()
+            .find(|(uuid, _)| uuid == disk_uuid)
+            .map(|(_, disk_id)| *disk_id)
+            .expect("the manager assigns a disk id to every registered disk uuid")
+    })
+}
+
 /// `register_node` that also gives the node its own stable identity — what a
 /// real EN does at startup with `--advertise`. Needed by anything that asks the
 /// manager a question ABOUT a specific node (the reconcile answers "what should

@@ -446,8 +446,8 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
         // Dispatch recovery DIRECTLY to the spare (a4), replacing r1. The spare
         // resolves extent_info from the manager (replicas [r0,r1,r2]), excludes
         // r1, and among {r0(corrupt,intact), r2(deleted)} only r0 can serve —
-        // so it streams the corrupt copy. (fenced_only recovery gate means the
-        // manager does not auto-dispatch; this direct dispatch is the only one.)
+        // so it streams the corrupt copy. (Nothing is fenced or marked corrupt,
+        // so the manager dispatches no rebuild; this direct one is the only one.)
         let en4 = RpcClient::connect_as(a4, autumn_rpc::version_hello::Role::Admin, None).await.expect("en4");
         let task = extent_rpc::RecoveryTask {
             extent_id,

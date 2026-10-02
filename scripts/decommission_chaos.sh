@@ -14,7 +14,7 @@
 #
 #  2. Node DECOMMISSION (`AUTUMN_CHAOS_DECOMMISSION=1`). After the nemesis loop
 #     stops and the cluster heals, ONE extent-node is permanently removed the
-#     HDFS way: fence -> wait for the drain + fenced_only recovery to
+#     HDFS way: fence -> wait for the drain + fenced-slot recovery to
 #     relocate every extent off it -> MSG_REMOVE_NODE (refuses until fully
 #     drained, tombstones the address). The existing per-key / range / accounting
 #     verify then proves NO DATA LOSS with the node gone. This is the first chaos
