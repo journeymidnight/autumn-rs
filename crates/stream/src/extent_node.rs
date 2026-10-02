@@ -1064,7 +1064,7 @@ impl ExtentNodeConfig {
 /// coalescer task + waiter machinery were removed once the per-extent owner task
 /// serialised appends and does the fsync inline). `pending_fsync` = high-water of
 /// pwritten bytes; `last_synced` = high-water of durable (fsynced) bytes — read
-/// by MSG_SYNCED_LENGTH / committed_length and gated by `fd_evictable`
+/// by committed_length and gated by `fd_evictable`
 /// (`sealed && pending_fsync <= last_synced && strong_count == 1`).
 pub(crate) struct Coalescer {
     pub(crate) last_synced: AtomicU64,
@@ -3413,7 +3413,7 @@ async fn append_burst_frames(
         // burst's bytes — the old cross-burst coalescer (register_sync_waiter +
         // coalescer_loop) is unnecessary under the owner and has been removed.
         // pending_fsync advances BEFORE the fsync and last_synced (the
-        // durability high-water read by MSG_SYNCED_LENGTH / committed_length and
+        // durability high-water read by committed_length and
         // gated by fd_evictable) AFTER, so an evict-check during the fsync window
         // sees pending > last_synced and won't evict. On error: mark the disk +
         // reject the whole burst, never advance last_synced.
@@ -6287,7 +6287,6 @@ impl ExtentNode {
             MSG_CONVERT_TO_EC => self.handle_convert_to_ec(payload).await,
             MSG_WRITE_SHARD => self.handle_write_shard(payload).await,
             MSG_DELETE_EXTENT => self.handle_delete_extent(payload).await,
-            MSG_SYNCED_LENGTH => self.handle_synced_length(payload).await,
             MSG_PROBE_EXTENT => self.handle_probe_extent(payload).await,
             MSG_FENCE_EXTENT => self.handle_fence_extent(payload).await,
             _ => Err((
@@ -6298,7 +6297,7 @@ impl ExtentNode {
     }
 
     /// wrong-shard rejection: hot-path RPCs (append/read/
-    /// commit_length/probe/synced_length) must hit the owning shard. A
+    /// commit_length/probe) must hit the owning shard. A
     /// wrong-shard request signals a client routing bug — surface it as
     /// FailedPrecondition so the client logs it instead of silently
     /// succeeding on the wrong shard.
@@ -7274,8 +7273,8 @@ impl ExtentNode {
         // a source might still hold the full data, so we Err and let the
         // manager re-dispatch until every source is reachable + confirmed short
         // (coco P1). run_recovery_task still applies `sealed_length` via
-        // `fetch_max`, so the recovered replica reports
-        // `synced_length = max(0, sealed_length)` and the flush barrier clears.
+        // `fetch_max`, so the recovered replica reports its commit length as
+        // `sealed_length`.
         if err_count == 0 && unverified == 0 {
             if let Some((sock, addr, best_len)) = best {
                 // Re-stream the longest copy cleanly — a trailing shorter
@@ -9133,55 +9132,6 @@ impl ExtentNode {
         Ok(FenceExtentResp {
             code: CODE_OK,
             message: String::new(),
-        }
-        .encode())
-    }
-
-    /// Phase 2: report the per-extent fsync coalescer's
-    /// `last_synced_offset`. Used by `flush_one_imm` (via
-    /// `StreamClient::await_log_synced_to`) to ensure all log_stream bytes
-    /// referenced by a to-be-flushed memtable's ValuePointers are durable
-    /// on this replica before the SST upload.
-    ///
-    /// Notes:
-    /// - This is a node-local view; the client takes the quorum-min across
-    ///   3 replicas (mirror of the commit_length quorum).
-    /// - For sealed extents, all bytes up to `sealed_length` were forced
-    ///   durable by `apply_extent_meta_durable` at seal time, so we
-    ///   bound-up to `max(last_synced, sealed_length)` here. Otherwise a
-    ///   reader of a sealed extent could observe `last_synced=0` purely
-    ///   because no append-driven sync has run since this node loaded the
-    ///   extent — even though the bytes are demonstrably on disk.
-    async fn handle_synced_length(&self, payload: Bytes) -> HandlerResult {
-        let req = SyncedLengthReq::decode(payload)
-            .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
-
-        // hot-path RPC; reject wrong-shard.
-        if !self.owns_extent(req.extent_id) {
-            return Err(self.wrong_shard_err(req.extent_id));
-        }
-
-        let entry = self.extents.get(&req.extent_id).ok_or_else(|| {
-            (
-                StatusCode::NotFound,
-                format!("extent {} not found", req.extent_id),
-            )
-        })?;
-
-        let synced = entry.coalescer.last_synced.load(Ordering::SeqCst);
-        let sealed = entry.sealed_length.load(Ordering::SeqCst);
-        // P0-C (coco review #3 issue 3): a SEALED extent's durable length is its
-        // authoritative `sealed_length` (incl. 0 for sealed-empty) — never the
-        // residual file-derived `last_synced`. For an open extent keep the
-        // max(synced, sealed) behaviour.
-        let length = if entry.sealed.load(Ordering::SeqCst) {
-            sealed
-        } else {
-            synced.max(sealed)
-        };
-        Ok(SyncedLengthResp {
-            code: CODE_OK,
-            length,
         }
         .encode())
     }

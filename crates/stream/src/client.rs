@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, FenceExtentReq,
     FenceExtentResp, PayloadLocation, PayloadRef, ProbeExtentReq, ProbeExtentResp, ReadBytesReq,
-    ReadBytesResp, StreamInfo, SyncedLengthReq, SyncedLengthResp, CODE_EVERSION_MISMATCH,
+    ReadBytesResp, StreamInfo, CODE_EVERSION_MISMATCH,
     CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND, MSG_COMMIT_LENGTH,
-    MSG_FENCE_EXTENT, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_BULK, MSG_SYNCED_LENGTH,
+    MSG_FENCE_EXTENT, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_BULK,
     PAYLOAD_LOCATION_IN_DAT,
 };
 use crate::ConnPool;
@@ -1089,11 +1089,6 @@ const STREAM_SUBMIT_CAP: usize = 256;
 const OPEN_TAIL_COMMIT_RETRIES: u32 = 3;
 const OPEN_TAIL_COMMIT_BACKOFF_MS: u64 = 300;
 
-/// Failed queries in a row after which the flush durability barrier gives up
-/// on a replica (`await_extent_synced_to`): enough to ride over a connection
-/// that has to be re-established, few enough that a dead node fails the flush
-/// at once and the flush loop's own backoff paces the next try.
-const SYNCED_QUERY_ATTEMPTS: u32 = 3;
 
 // env-reading helpers `stream_inflight_cap()`,
 // `append_fanout_timeout()`, `read_chunk_bytes()` removed. Values live
@@ -1111,8 +1106,6 @@ const SYNCED_QUERY_ATTEMPTS: u32 = 3;
 ///   - `append_floor_bytes_per_sec`: 8 MiB/s assumed worst-case sustained
 ///     all-replica append throughput floor (BUG-FLUSH-TIMEOUT-LEAK)
 ///   - `read_chunk_bytes`: 256 MiB per replicated read chunk
-///   - `synced_poll`: 2 ms flush-barrier poll interval
-///   - `synced_timeout`: 30 s flush-barrier overall timeout
 #[derive(Clone, Debug)]
 pub struct StreamClientConfig {
     pub bad_nodes_ttl: Duration,
@@ -1150,8 +1143,6 @@ pub struct StreamClientConfig {
     /// Replaces the hardcoded fixed 3 s that stormed on 8 MiB reads.
     pub read_base_timeout: Duration,
     pub read_floor_bytes_per_sec: u64,
-    pub synced_poll: Duration,
-    pub synced_timeout: Duration,
 }
 
 impl Default for StreamClientConfig {
@@ -1164,8 +1155,6 @@ impl Default for StreamClientConfig {
             read_chunk_bytes: 256 * 1024 * 1024,
             read_base_timeout: DEFAULT_READ_BASE_TIMEOUT,
             read_floor_bytes_per_sec: DEFAULT_READ_FLOOR_BYTES_PER_SEC,
-            synced_poll: Duration::from_millis(2),
-            synced_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -1310,18 +1299,6 @@ impl StreamClientConfig {
     /// read chunk size. 0 → default 256 MiB.
     pub fn with_read_chunk_bytes(mut self, bytes: u64) -> Self {
         self.read_chunk_bytes = if bytes == 0 { 256 * 1024 * 1024 } else { bytes };
-        self
-    }
-    /// flush-barrier poll interval `[1, 50] ms`.
-    pub fn with_synced_poll(mut self, p: Duration) -> Self {
-        let ms = p.as_millis().clamp(1, 50) as u64;
-        self.synced_poll = Duration::from_millis(ms);
-        self
-    }
-    /// flush-barrier overall timeout `≥ 100 ms`.
-    pub fn with_synced_timeout(mut self, t: Duration) -> Self {
-        let ms = (t.as_millis() as u64).max(100);
-        self.synced_timeout = Duration::from_millis(ms);
         self
     }
 }
@@ -3968,135 +3945,6 @@ impl StreamClient {
     pub async fn open_tail_committed_len(&self, stream_id: u64) -> Result<u64> {
         let (_stream, extent, end) = self.check_commit(stream_id).await?;
         Ok(if extent.sealed { 0 } else { end })
-    }
-
-    /// Phase 2: query a single replica for `MSG_SYNCED_LENGTH(extent_id)`.
-    /// Returns `Ok(Some(synced))` on a success response, `Ok(None)` if the
-    /// extent is unknown to that node (CODE_NOT_FOUND or any other non-OK
-    /// code), and `Err` only on transport / decode failure.
-    async fn synced_length_on_replica(&self, addr: &str, extent_id: u64) -> Result<Option<u64>> {
-        let req = SyncedLengthReq { extent_id };
-        // 5 s — atomic load of `entry.coalescer.last_synced` on EN; a replica
-        // that does not answer within it counts as one failed query.
-        let resp_bytes = self
-            .pool
-            .call_timeout(
-                addr,
-                MSG_SYNCED_LENGTH,
-                req.encode(),
-                Duration::from_secs(5),
-            )
-            .await?;
-        let resp = SyncedLengthResp::decode(resp_bytes)
-            .map_err(|e| anyhow!("synced_length decode: {e}"))?;
-        if resp.code == CODE_OK {
-            Ok(Some(resp.length))
-        } else {
-            Ok(None)
-        }
-    }
-
-    /// Phase 2: wait until the per-extent fsync coalescer on **all**
-    /// of `extent_id`'s replicas has flushed bytes covering `min_offset`.
-    ///
-    /// NO quorum. The append path is all-replica-ACK, so a VP at
-    /// `min_offset` is durable on every replica the moment its append
-    /// acked; the flush barrier must therefore require ALL replicas to
-    /// have synced past `min_offset` before the SST that names the VP is
-    /// checkpointed — a fsync-quorum (the former `⌊N/2⌋+1`) could
-    /// publish an SST whose VP bytes are durable on only a subset, so a
-    /// later min-commit truncation on the un-synced replica could orphan
-    /// the VP. On a healthy cluster this is satisfied immediately (all-ACK
-    /// already made it durable everywhere). Sealed extents report
-    /// `max(last_synced, sealed_length)`, so this trivially succeeds
-    /// against sealed sources.
-    ///
-    /// Polls every `synced_poll` (default 2 ms — matches the coalescer
-    /// cadence), bounded by `synced_timeout` (default 30 s): that wait is for
-    /// a replica that answers but has not synced far enough yet. A replica
-    /// that cannot be queried at all (dead, unreachable, refusing) is a
-    /// different case: polling it at the coalescer's cadence only redials it
-    /// hundreds of times a second, and a dead node does not come back within
-    /// the wait. After `SYNCED_QUERY_ATTEMPTS` failed queries in a row the
-    /// barrier returns that error, the flush fails, and the partition's flush
-    /// loop retries it on its own backoff. The retry asks the same replicas
-    /// (the cached `ExtentInfo`), so the dead one stays required until it
-    /// returns, or until recovery replaces it and the cache entry is evicted.
-    ///
-    /// `min_offset == 0` is a no-op fast path; the caller can pass
-    /// `imm.max_vp_offset` and we trivially return Ok if the imm carried
-    /// no large values.
-    pub async fn await_extent_synced_to(&self, extent_id: u64, min_offset: u64) -> Result<()> {
-        if min_offset == 0 {
-            return Ok(());
-        }
-        // flush-barrier knobs come from StreamClientConfig.
-        // No env reads.
-        let poll_ms: u64 = self.config.synced_poll.as_millis() as u64;
-        let timeout_ms: u64 = self.config.synced_timeout.as_millis() as u64;
-
-        let ex = self.fetch_extent_info(extent_id).await?;
-        let addrs = self.replica_addrs_for_extent(&ex).await?;
-        let total = addrs.len();
-        if total == 0 {
-            return Err(anyhow!(
-                "await_extent_synced_to: no replica addrs for extent {extent_id}"
-            ));
-        }
-        // require ALL replicas synced — no quorum (see fn doc).
-        let required = total;
-
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
-        let mut failed = vec![0u32; total];
-        loop {
-            let mut covered: usize = 0;
-            for (i, addr) in addrs.iter().enumerate() {
-                match self.synced_length_on_replica(addr, extent_id).await {
-                    Ok(Some(synced)) => {
-                        failed[i] = 0;
-                        if synced >= min_offset {
-                            covered += 1;
-                        }
-                    }
-                    Ok(None) => failed[i] = 0,
-                    Err(e) => {
-                        failed[i] += 1;
-                        if failed[i] >= SYNCED_QUERY_ATTEMPTS {
-                            if is_connect_failure(&e) {
-                                if let Some(&node_id) = replica_node_ids(&ex).get(i) {
-                                    self.note_unreachable(node_id, extent_id);
-                                }
-                            }
-                            return Err(e.context(format!(
-                                "await_extent_synced_to: replica {addr} of extent {extent_id} \
-                                 could not be queried {SYNCED_QUERY_ATTEMPTS} times in a row"
-                            )));
-                        }
-                    }
-                }
-            }
-            if covered >= required {
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                return Err(anyhow!(
-                    "await_extent_synced_to: timeout waiting for extent {extent_id} to sync \
-                     past offset {min_offset} (all-replica {covered}/{required})"
-                ));
-            }
-            compio::time::sleep(Duration::from_millis(poll_ms)).await;
-        }
-    }
-
-    /// Phase 2: helper for flush durability — convenience wrapper
-    /// that delegates to `await_extent_synced_to` for a single extent.
-    /// Renamed from the original plan's `await_log_synced_to(stream_id, _)`
-    /// because `(extent_id, offset)` is the unit the partition layer
-    /// already tracks: each `flush_one_imm` snapshot carries
-    /// `(vp_extent_id, vp_offset)` for the latest log_stream extent the
-    /// imm wrote to. The stream id is implicit in the extent id.
-    pub async fn await_log_synced_to(&self, extent_id: u64, offset: u64) -> Result<()> {
-        self.await_extent_synced_to(extent_id, offset).await
     }
 
     pub async fn punch_holes(&self, stream_id: u64, extent_ids: Vec<u64>) -> Result<StreamInfo> {
@@ -7829,55 +7677,8 @@ mod manager_retry_tests {
 }
 
 #[cfg(test)]
-mod synced_barrier_tests {
+mod unreachable_report_tests {
     use super::*;
-    use std::cell::Cell;
-
-    /// A client that already knows extent 7 lives on node 1 at `addr`, so the
-    /// barrier needs no manager.
-    fn client_for(addr: &str) -> Rc<StreamClient> {
-        let sc = manager_retry_tests::test_client(1);
-        sc.nodes_cache.insert(1, (addr.to_string(), Vec::new()));
-        sc.extent_info_cache.insert(
-            7,
-            ExtentInfo {
-                extent_id: 7,
-                replicates: vec![1],
-                eversion: 1,
-                ..Default::default()
-            },
-        );
-        sc
-    }
-
-    /// A replica that cannot be queried fails the barrier after
-    /// `SYNCED_QUERY_ATTEMPTS` dials, instead of being redialed every poll
-    /// until the 30 s wait runs out.
-    #[compio::test]
-    async fn an_unreachable_replica_fails_the_barrier_after_a_few_queries() {
-        // Accepts and closes: every query fails at the handshake.
-        let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let dials = Rc::new(Cell::new(0u32));
-        let counted = dials.clone();
-        compio::runtime::spawn(async move {
-            while let Ok((socket, _)) = listener.accept().await {
-                counted.set(counted.get() + 1);
-                drop(socket);
-            }
-        })
-        .detach();
-
-        let sc = client_for(&addr);
-        let started = Instant::now();
-        let e = sc
-            .await_extent_synced_to(7, 4096)
-            .await
-            .expect_err("a replica that never answered satisfied the barrier");
-        assert!(format!("{e:#}").contains(&addr), "{e:#}");
-        assert_eq!(dials.get(), SYNCED_QUERY_ATTEMPTS);
-        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
-    }
 
     /// A manager that records every `MSG_REPORT_DISK_FAILURE` it receives as
     /// `(node_id, extent_id, reporter_part_id)`.
@@ -7941,16 +7742,11 @@ mod synced_barrier_tests {
         (addr, reports)
     }
 
-    /// The barrier giving up on a replica it cannot reach tells the manager,
-    /// once per node per cooldown however often the flush retries.
+    /// A node a read could not reach is reported to the manager, once per node
+    /// per cooldown however many reads meet it.
     #[compio::test]
-    async fn an_unreachable_replica_is_reported_once() {
+    async fn an_unreachable_node_is_reported_once() {
         let (mgr, reports) = recording_manager().await;
-        // Nothing listens here: every connect is refused.
-        let dead = {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            l.local_addr().unwrap().to_string()
-        };
         let sc = StreamClient::construct(
             vec![mgr],
             0,
@@ -7961,21 +7757,8 @@ mod synced_barrier_tests {
             StreamClientConfig::default(),
         );
         sc.set_reporter_part_id(9);
-        sc.extent_info_cache.insert(
-            7,
-            ExtentInfo {
-                extent_id: 7,
-                replicates: vec![1],
-                eversion: 1,
-                ..Default::default()
-            },
-        );
-        for _ in 0..2 {
-            // The barrier forgets an address it cannot reach; pin it each round.
-            sc.nodes_cache.insert(1, (dead.clone(), Vec::new()));
-            sc.await_extent_synced_to(7, 4096)
-                .await
-                .expect_err("a refused replica satisfied the barrier");
+        for _ in 0..3 {
+            sc.note_unreachable(1, 7);
         }
         // The report travels on the client's background drainer.
         let start = Instant::now();

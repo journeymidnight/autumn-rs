@@ -1,3 +1,11 @@
+Date: 2026-10-02 (7)
+TaskStatus: completed
+Task scope: user "不需要这个屏障, 因为WAL写入的时候已经确认过了(你可以读代码), await_log_synced_to完全没有作用" → "没部署呢,直接删除" (BUG-FLUSH-BARRIER-WEDGE).
+Current summary: the partition flush no longer polls every log replica's fsynced length before publishing an SST; the stream client's barrier functions and config, and the EN's MSG_SYNCED_LENGTH (msg_type 13, reserved) are gone. A flush now succeeds with one replica of the log extent down. Recovery's commit-length read and truncate-to-commit path is untouched (verified by reading the code and the diff).
+Verification: see feature_list BUG-FLUSH-BARRIER-WEDGE notes. Review: fable, no durability hole.
+Main gaps: BUG-OPEN-TAIL-REPLAY-BOUND (pre-existing hypothesis, not reproduced); BUG-RECOVERY-PINNED-TARGET-TESTS (pre-existing).
+Next steps: user to decide whether to reproduce BUG-OPEN-TAIL-REPLAY-BOUND.
+
 Date: 2026-10-02 (6)
 TaskStatus: completed
 Task scope: user "ps的上报也应该有dead en的情况" → "3. 同意更多的地方可以报考失败" (F-REPORT-UNREACHABLE-EN).

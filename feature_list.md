@@ -14,6 +14,19 @@
 
 ## Active
 
+### BUG-OPEN-TAIL-REPLAY-BOUND — 回放 open 尾部用可达副本 min，写游标用全副本 min（假设，未复现）
+- **Trigger** (2026-10-02，删除 flush 屏障时独立评审提出): 回放 open 尾部的读取上限是 `commit_length_for_extent`（可达副本的 min），而写游标由 `current_commit`（全部副本的 min）决定。若副本 C 宕机期间一条未确认的记录 R 只落在 A、B 上，PS 此时重启，回放会把 R 读进 memtable；C 在首次追加前回来，首次追加按 C 的较短长度截断 A、B，R 的值指针随后指向被覆盖的字节。
+- **Scope**: 先复现；若成立，让回放上限与全副本规则一致，或回放前先 seal-and-roll。
+- **Acceptance**: 有一个按上述时序构造的测试，修复前红、修复后绿；不可复现则关闭并记录原因。
+- `passes: false`
+
+### BUG-FLUSH-BARRIER-WEDGE — 删除 flush 前的全副本 synced 屏障
+- **Trigger** (2026-10-02 用户): 解释运行中 EN 死后 flush 卡在屏障之后，"不需要这个屏障, 因为WAL写入的时候已经确认过了(你可以读代码), await_log_synced_to完全没有作用"。
+- **Scope**: 删除 PS flush 中的 `await_log_synced_to` 调用及 stream client 的 `await_extent_synced_to` / `synced_length_on_replica` / `synced_poll` / `synced_timeout`；EN 的 `MSG_SYNCED_LENGTH` 处理暂留（删 opcode 会改变 peer 面，待用户定）。
+- **Acceptance**: 真实（进程内）集群：日志 extent 的一个副本停掉后，手动 flush 成功、大 value 读回一致；恢复屏障即红。flush / replay / recovery 相关集成测试绿。
+- `passes: true`
+- **notes** (2026-10-02): 用户确认 wire 52 未部署 → "直接删除"：EN 的 `MSG_SYNCED_LENGTH`（extent msg_type 13，编号保留不复用）、`SyncedLengthReq/Resp`、`handle_synced_length`、`known_en_opcode` 中该项一并删除，不升 WIRE_VERSION（52 未上线；本地改动前编出的 52 版 PS 连新 EN 会被拒）。核实：memtable 只有四处插入（写入 Phase 3、GC 搬迁、WAL 回放、一个 ignore 的 bench），前两者均在全副本 fsync 后的 ack 之后；回放上限是 commit 长度 = `last_synced` / `sealed_length`，与屏障查询同一水位。recovery 前的 commit length 读取与截断未动：`ensure_tail_initialised` → `current_commit`（全副本 min）→ `SeedCursor` → 追加头 `commit` → EN `truncate_to_commit`（set_len + sync_data）；manager `handle_check_commit_length` / `handle_stream_alloc_extent` → `commit_length_on_node` → `compute_commit_seal`。验证：新测试 `flush_with_dead_log_replica`（3 EN、RF2、停掉日志尾所在节点后 flush 成功、64 KiB 值读回一致），恢复屏障即红；lib rpc 97 / stream 223 / PS 275 / manager 435 / client 66；rpc 集成（含 opcode 冻结）绿；集成 flush / replay / recovery / failover / wire admission 绿，唯一失败 `system_recovery_loop_drives::fencing_a_member_rebuilds_the_slot_when_a_spare_node_exists` 属 BUG-RECOVERY-PINNED-TARGET-TESTS 旧失败；真进程 cluster_secret、en_control_port 绿。评审（fable）未发现持久性漏洞；提出疑似旧问题另立 BUG-OPEN-TAIL-REPLAY-BOUND。
+
 ### F-REPORT-UNREACHABLE-EN — 读路径与 flush 屏障也上报连不上的 EN
 - **Trigger** (2026-10-02 用户): "并且系统的heartbeat也有问题：ps的上报也应该有dead en的情况" → 解释现状（只有追加失败上报）后 "3. 同意更多的地方可以报考失败"。
 - **Scope**: PS 的 StreamClient 在读路径（副本 failover、单 key 读、EC 分片读）和 flush 屏障放弃某副本时，若是连接失败且能确定节点，就向 manager 发 `MSG_REPORT_DISK_FAILURE`；每节点每 30 s 至多一次。不知道哪个副本失败的路径不上报。manager 端处理不变。

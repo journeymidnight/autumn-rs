@@ -40,12 +40,9 @@ pub const MSG_DELETE_EXTENT: u8 = 11;
 //      `extent-{id}.shard{i}` file and the manager's layout flip is the sole
 //      commit point, so no node ever publishes a shard over its own `.dat`.
 //      The number stays reserved — msg_type values are append-only.
-// 13 is the durability query for the per-extent fsync coalescer.
-/// Phase 2: query the extent-node's coalesced fsync high-water mark.
-/// Returned `length` = `Coalescer::last_synced` for `extent_id`. Used by
-/// `flush_one_imm` to await durability of all log_stream bytes referenced
-/// by the to-be-flushed memtable's ValuePointers BEFORE uploading the SST.
-pub const MSG_SYNCED_LENGTH: u8 = 13;
+// 13 was a per-replica fsynced-length query for a flush barrier that only
+// re-asked what an all-replica append ack already guarantees; retired.
+// The number stays reserved — msg_type values are append-only.
 /// Manager-only probe RPC. Returns CommitLengthResp-shaped
 /// `(code, length)` without touching the owner-lock fence — no
 /// owner_epoch check, no mutation of `owner_epoch`, no `.meta`
@@ -442,62 +439,6 @@ impl ProbeExtentReq {
 /// `CODE_NOT_FOUND` (extent missing locally); `length` carries
 /// `coalescer.last_synced` for open extents or `sealed_length` for sealed.
 pub type ProbeExtentResp = CommitLengthResp;
-
-// ── SyncedLength ─────────────────────────────────────────────────────────────
-
-/// SyncedLengthRequest: 8 bytes.
-/// `[extent_id: u64 LE]`
-pub struct SyncedLengthReq {
-    pub extent_id: u64,
-}
-
-impl SyncedLengthReq {
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(8);
-        buf.put_u64_le(self.extent_id);
-        buf.freeze()
-    }
-
-    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.len() < 8 {
-            return Err("synced_length request too short");
-        }
-        Ok(Self {
-            extent_id: data.get_u64_le(),
-        })
-    }
-}
-
-/// SyncedLengthResponse: 9 bytes.
-/// `[code: u8][length: u64 LE]`
-///
-/// `length` is `Coalescer::last_synced` — the highest byte offset known to
-/// be durable on this replica. Quorum is enforced by the client side
-/// (see `StreamClient::await_log_synced_to`); the server reports its own
-/// view only.
-pub struct SyncedLengthResp {
-    pub code: u8,
-    pub length: u64,
-}
-
-impl SyncedLengthResp {
-    pub fn encode(&self) -> Bytes {
-        let mut buf = BytesMut::with_capacity(9);
-        buf.put_u8(self.code);
-        buf.put_u64_le(self.length);
-        buf.freeze()
-    }
-
-    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
-        if data.len() < 9 {
-            return Err("synced_length response too short");
-        }
-        Ok(Self {
-            code: data.get_u8(),
-            length: data.get_u64_le(),
-        })
-    }
-}
 
 // ── FenceExtent (raise the owner_epoch fence floor, no append) ───────────────
 

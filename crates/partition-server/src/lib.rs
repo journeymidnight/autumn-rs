@@ -10305,7 +10305,7 @@ async fn run_flush_async_phase_inner(
     imm_mem: Arc<Memtable>,
 ) -> Result<FlushOutcome> {
     let src_imm_ptr = Arc::as_ptr(&imm_mem) as usize;
-    let (row_stream_id, snap_vp_eid, snap_vp_off, mut req_tx, part_sc) = {
+    let (row_stream_id, snap_vp_eid, snap_vp_off, mut req_tx) = {
         let p = part.borrow();
         // stamp this imm's ROTATION-time content boundary, NOT the
         // live cursor at claim (foreground writes may have pushed it ahead of this
@@ -10322,16 +10322,8 @@ async fn run_flush_async_phase_inner(
             snap_vp_eid,
             snap_vp_off,
             p.flush_req_tx.clone(),
-            p.stream_client.clone(),
         )
     };
-
-    // Phase 2 durability barrier — see flush_one_imm history comment.
-    if snap_vp_off > 0 && snap_vp_eid != 0 {
-        part_sc
-            .await_log_synced_to(snap_vp_eid, snap_vp_off)
-            .await?;
-    }
 
     let (resp_tx, resp_rx) = oneshot::channel();
     let req = FlushReq {

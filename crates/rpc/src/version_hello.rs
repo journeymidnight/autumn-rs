@@ -534,7 +534,6 @@ fn known_en_opcode(opcode: u8) -> bool {
             | MSG_CONVERT_TO_EC
             | MSG_WRITE_SHARD
             | MSG_DELETE_EXTENT
-            | MSG_SYNCED_LENGTH
             | MSG_PROBE_EXTENT
             | MSG_READ_BYTES_BULK
             | MSG_FENCE_EXTENT

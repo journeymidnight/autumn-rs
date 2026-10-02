@@ -2010,20 +2010,10 @@ pub(crate) async fn start_write_batch(
         (segments, record_sizes)
     };
 
-    // Every append is durable. Durability is enforced at two points:
-    //   1. extent-node coalescer (Phase 1, event-driven group commit) —
-    //      every pwrite's bytes become durable in one fsync coalesced
-    //      with concurrent friends; the handler always awaits the
-    //      coalescer's wake.
-    //   2. flush-time `await_log_synced_to` in `flush_one_imm` — all
-    //      replicas must have synced past `vp_offset` BEFORE the SST
-    //      upload, so every byte the imm's ValuePointers reference is
-    //      durable on every replica before the SST that names them is
-    //      checkpointed.
-    //
-    // Net: every Put pays exactly one fsync syscall (~1 ms tmpfs / 5-15
-    // ms NVMe). Flush adds ≈ 0 ms on the happy path (coalescer fires
-    // when first waiter arrives; flush builds SST in parallel).
+    // Every append is durable when it returns: each replica's per-extent
+    // owner fsyncs a burst before it acks, and the append needs every
+    // replica's ack. Phase 3 inserts into the memtable only after that, so
+    // a flush has no durability left to check before publishing an SST.
     let phase1_ns = duration_to_ns(phase1_started_at.elapsed());
 
     // foreground admission. Per-batch single Mutex acquire +

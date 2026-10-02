@@ -574,21 +574,6 @@ the commit path.**
   `ensure_tail_initialised` propagates that `Err` — seeding cursor 0 would make
   the next append's `header.commit=0` truncate EVERY replica to 0. `Ok(0)`
   (genuinely empty extent) still seeds nothing.
-- `await_extent_synced_to` (the flush durability barrier) requires **ALL**
-  replicas synced past `vp_offset` (was quorum-min). On a healthy cluster this
-  is already satisfied because the append acked all-replicas; worst case it
-  waits one coalesce window. Flush is background → invisible to clients.
-  It polls every `synced_poll` (2 ms) for up to `synced_timeout` (30 s) only
-  while replicas ANSWER but have not synced far enough. A replica that cannot
-  be queried (dead, unreachable, refusing) fails the barrier after
-  `SYNCED_QUERY_ATTEMPTS` (3) failed queries in a row: polling it at the
-  coalescer cadence only redialed it ~500 times a second for the full 30 s, and
-  a dead node does not return within the wait. The flush then fails; a drain
-  exits with the unflushed writes left in the WAL, and the background flush
-  loop retries on `FLUSH_RETRY_BACKOFF` (2 s). The retry asks the same replicas
-  (cached `ExtentInfo`), so the dead one stays required until it returns, or
-  until recovery replaces it and the cache entry is evicted.
-  Test: `synced_barrier_tests`.
 - **Manager-side seal/commit** (`handle_stream_alloc_extent` /
   `handle_check_commit_length`) take `min` over the REACHABLE COMMITTED members
   only (catching-up = in-flight Recovery, excluded), requiring only `floor` of
@@ -604,10 +589,13 @@ resolving a `length=0` "to-end" read on an *open* extent) is intentionally
 quorum-min: it neither seals nor truncates, so its worst case is a short read
 (surfaced as an error), and reads should tolerate a replica being down.
 
-**Flush-time durability barrier**: every Put pays exactly one coalesce window
-(1–5 ms). The durability wait lives in `flush_one_imm`, which calls
-`await_log_synced_to(vp_extent_id, vp_offset)` (ALL replicas report
-`last_synced >= vp_offset`) via `MSG_SYNCED_LENGTH` BEFORE uploading the SST.
+**No flush-time durability barrier.** An append acks only after every replica
+fsynced it, and a replica's commit length (what replay reads up to) is its
+fsynced high-water, so a partition flush has nothing left to wait for. The
+barrier that polled every replica's fsynced length before an SST upload was
+removed, together with its RPC (extent msg_type 13, reserved): it re-asked for
+that same watermark and only ever failed, every 2 s, while one replica of the
+log extent was down.
 
 ### Recovery (`require_recovery` RPC)
 
@@ -1541,14 +1529,13 @@ and from other crates' CLAUDE.md); do not renumber.
     load-bearing, not a nicety.
 
     **The same sites tell the manager.** All three call `note_unreachable`
-    (forget + `report_unreachable`), and so does the flush barrier when it gives
-    up on a replica it cannot connect to. `report_unreachable` sends
+    (forget + `report_unreachable`). `report_unreachable` sends
     `MSG_REPORT_DISK_FAILURE` through the client's drainer, at most once per
     node per `NODE_ADDR_FORGET_COOLDOWN` (a read path can meet a dead node
     thousands of times a second; the manager counts one report per reporter
     per window). Before, only a failed APPEND reported (`try_report_failure` in
-    the worker), so a node that only readers or the barrier could not reach
-    went unreported. Only a connect failure (`is_connect_failure`, which also
+    the worker), so a node that only readers could not reach went unreported.
+    Only a connect failure (`is_connect_failure`, which also
     covers a handshake that timed out) on a KNOWN slot reports:
     `forget_unreachable_replicas`, which does not know which replica failed,
     forgets but never reports, so a node not tied to the failure is never named.
@@ -1562,7 +1549,7 @@ and from other crates' CLAUDE.md); do not renumber.
     `fenced_only` recovery gate that starts no rebuild; the legacy `auto_disk`
     gate rebuilds slots on an offline disk, and the same report already came
     from failed appends. Tests:
-    `synced_barrier_tests::an_unreachable_replica_is_reported_once`.
+    `unreachable_report_tests::an_unreachable_node_is_reported_once`.
 
     **Why a side effect and not a variant**: `ec_gather_collect` keeps only the
     LAST error, so a gather that hit both a dead address and a typed refusal is

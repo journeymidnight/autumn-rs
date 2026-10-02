@@ -1077,8 +1077,8 @@ INVARIANT: `rotate_active` captures `p.vp_*` at the FREEZE instant (the imm's tr
 content boundary) into `PartitionData.imm_vp_heads` (`RefCell<HashMap<usize,
 (u64,u64)>>` keyed by `Arc::as_ptr`; INSERT at push, REMOVE at the single
 `commit_flush_outcome` pop, kept on flush ERROR since the imm stays queued for
-retry). The flush reads the imm's captured vp — NOT the live cursor — for both the
-stamped SST/meta vp_head AND the `await_log_synced_to` durability barrier. Why:
+retry). The flush reads the imm's captured vp — NOT the live cursor — for the
+stamped SST/meta vp_head. Why:
 background flush lags the writer; foreground writes landing between an imm's
 `rotate_active` and its claim push the cursor forward, so a claim-time cursor is
 AHEAD of that imm's own content → on crash before those writes flush, recovery
@@ -2129,20 +2129,19 @@ Three fixes bound the restart replay window (worst case per partition =
    covered — logStream contains all records newer than the last SSTable flush.
 
 6. **Group commit batching + durability.** `partition_loop` drains up to
-   MAX_WRITE_BATCH (256) requests per RPC cycle. Durability lives in two
-   complementary places:
-   - **Per-write coverage**: the extent-node's per-extent fsync coalescer fires
-     `sync_data` every 1–5 ms; every append's bytes become durable within one coalesce
-     window, unconditionally.
-   - **Flush barrier**: `flush_one_imm` calls
-     `part_sc.await_log_synced_to(vp_extent_id, vp_offset)` BEFORE uploading the SST.
-     INVARIANT: **ALL log_stream replicas** (not quorum-min) must report `last_synced >=
-     vp_offset` first — every byte the imm's ValuePointers reference must be durable on
-     every replica BEFORE the SST that names them is checkpointed, else a later
-     min-commit truncation on an un-synced replica orphans the VP (the
-     `stale_vp_offset_past_sealed_length` class). On a healthy cluster this waits ≈ 0.
-   The fsync work is entirely background (latency-invisible); every Put pays only the
-   1–5 ms coalesce floor. Every write follows the same durability path.
+   MAX_WRITE_BATCH (256) requests per RPC cycle. Durability is settled by the
+   append itself: each extent node's per-extent owner `sync_data`s a burst before
+   it acks, and the log append needs every replica's ack, so a record is on disk
+   on every replica before Phase 3 puts it in the memtable (an append that fails
+   inserts nothing). Replay after a restart reads only up to the replicas'
+   commit length, which is their fsynced high-water (`last_synced`), and GC
+   relocation inserts only after its own append returns. So a flush never
+   re-checks durability before publishing an SST: the flush-time barrier that
+   asked every replica for its fsynced length re-asked for that same
+   watermark, and its only effect was to fail every flush while one replica of
+   the imm's log extent was down, wedging the partition until the node came
+   back or was fenced. It was removed. Every write follows the same durability
+   path.
 
 7. **Per-partition StreamClient** — each `PartitionData` holds its own
    `stream_client: Arc<StreamClient>` (no Mutex) via `new_with_owner_epoch`.
