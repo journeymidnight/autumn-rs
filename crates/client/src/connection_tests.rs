@@ -571,3 +571,71 @@ async fn a_partition_hello_does_not_change_the_managers_routing_version() {
     client.ps_call(&ps.addr, ECHO, Bytes::new()).await.unwrap();
     assert_eq!(client.negotiated_cluster_wire.get(), autumn_rpc::WIRE_VERSION_WITH_CLIENT_REGIONS - 1);
 }
+
+/// An extent node refusing this client's credential is the answer, not a
+/// failure to route around: the read returns `PermissionDenied`, with no other
+/// replica tried and no proxy fallback, for the replicated and the EC
+/// descriptor alike.
+#[compio::test]
+async fn en_credential_refusal_is_returned_without_fallback() {
+    for ec_data_shards in [0u32, 2] {
+        let en_calls = Rc::new(Cell::new(0));
+        let mut ens = Vec::new();
+        for _ in 0..2 {
+            let count = en_calls.clone();
+            ens.push(
+                Peer::start_as(Service::ExtentNode, move |frame| {
+                    count.set(count.get() + 1);
+                    Reply::Frame(autumn_rpc::Frame::error(
+                        frame.req_id,
+                        frame.msg_type,
+                        autumn_rpc::RpcError::encode_status(
+                            StatusCode::PermissionDenied,
+                            "direct read requires a capability token",
+                        ),
+                    ))
+                })
+                .await,
+            );
+        }
+        let addrs: Vec<String> = ens.iter().map(|e| e.addr.clone()).collect();
+        let proxy_calls = Rc::new(Cell::new(0));
+        let count = proxy_calls.clone();
+        let ps = Peer::start_as(Service::PartitionServer, move |frame| {
+            if frame.msg_type != MSG_GET_REDIRECT {
+                count.set(count.get() + 1);
+            }
+            Reply::Frame(autumn_rpc::Frame::response(
+                frame.req_id,
+                frame.msg_type,
+                rkyv_encode(&GetRedirectResp {
+                    code: 0,
+                    message: String::new(),
+                    value: vec![],
+                    extent_id: 42,
+                    value_offset: 0,
+                    value_len: 65536,
+                    eversion: 1,
+                    replica_addrs: addrs.clone(),
+                    ec_data_shards,
+                    ec_sealed_length: 2 * 65536,
+                }),
+            ))
+        })
+        .await;
+        let client = client("127.0.0.1:1".into());
+        client.regions.borrow_mut().push((1, region(1)));
+        client.part_addrs.borrow_mut().insert(1, ps.addr.clone());
+        let mut dest = vec![0; 65536];
+        let e = client
+            .get_range_direct_into(b"key", 0, 65536, &mut dest)
+            .await
+            .expect_err("a refused credential was served");
+        assert!(
+            matches!(&e, AutumnError::PermissionDenied(m) if m.contains("capability token")),
+            "ec_data_shards={ec_data_shards}: {e}"
+        );
+        assert_eq!(en_calls.get(), 1, "ec_data_shards={ec_data_shards}: another node was tried");
+        assert_eq!(proxy_calls.get(), 0, "ec_data_shards={ec_data_shards}: fell back to the proxy");
+    }
+}

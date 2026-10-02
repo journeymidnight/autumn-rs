@@ -269,6 +269,227 @@ fn members_and_operators_must_prove_the_secret() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("was removed"));
 }
 
+/// A running member whose dial is refused by PEER_AUTH exits: the extent node
+/// keeps polling its manager, and when the manager comes back on the same
+/// address holding a different secret, the extent node's next dial is refused
+/// and the process ends with status 1, naming the peer.
+#[test]
+fn a_member_refused_by_peer_auth_exits() {
+    let tmp = TempDir::new("cluster-secret-fatal");
+    let (right_file, other_file) = (tmp.0.join("secret"), tmp.0.join("other"));
+    std::fs::write(&right_file, SECRET).unwrap();
+    std::fs::write(&other_file, WRONG).unwrap();
+    let (right_arg, other_arg) = (right_file.to_str().unwrap(), other_file.to_str().unwrap());
+
+    let mgr_port = pick_port();
+    let mgr_addr = format!("127.0.0.1:{mgr_port}");
+    let manager = |secret: &str, log: &str| {
+        ChildGuard(
+            Command::new(MANAGER_BIN)
+                .args(["--cluster-secret-file", secret])
+                .args(["--port", &mgr_port.to_string(), "--listen", "127.0.0.1"])
+                .stdout(std::fs::File::create(tmp.0.join(log)).unwrap())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn manager"),
+        )
+    };
+    let first = manager(right_arg, "manager.log");
+    wait_port_open(mgr_port);
+
+    let en_dir = tmp.0.join("en");
+    std::fs::create_dir_all(&en_dir).unwrap();
+    let out = run_op(&[
+        "--cluster-secret-file",
+        right_arg,
+        "--manager",
+        &mgr_addr,
+        "format",
+        en_dir.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let en_port = pick_port();
+    let en_log = tmp.0.join("en.log");
+    let mut en = ChildGuard(
+        Command::new(EXTENT_NODE_BIN)
+            .args(["--cluster-secret-file", right_arg])
+            .args(["--port", &en_port.to_string(), "--listen", "127.0.0.1"])
+            .args(["--control-port", &pick_port().to_string()])
+            .args(["--data", en_dir.to_str().unwrap()])
+            .args(["--manager", &mgr_addr])
+            .args(["--advertise", &format!("127.0.0.1:{en_port}")])
+            .args(["--cpuset", &first_allowed_core()])
+            .stdout(std::fs::File::create(&en_log).unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn extent node"),
+    );
+    wait_port_open(en_port);
+
+    drop(first);
+    let _second = manager(other_arg, "manager2.log");
+    wait_port_open(mgr_port);
+
+    // The extent node polls its manager every few seconds.
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = en.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the extent node kept running after its manager refused it: {}",
+            std::fs::read_to_string(&en_log).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status.code(), Some(1));
+    let text = std::fs::read_to_string(&en_log).unwrap();
+    assert!(
+        logged(&text, "PEER_AUTH failed against this process's manager", &mgr_addr),
+        "{text}"
+    );
+}
+
+/// The reverse: a member refused by anything but its manager is not the one at
+/// fault, so it keeps running and treats that end as unreachable. The manager
+/// polls its extent nodes; here one of them is replaced, on its registered
+/// address, by a stranger holding a different secret, which first answers
+/// VERSION_HELLO as an extent node and then as a manager. What the stranger
+/// claims to be must not matter: only the address the dialer chose does.
+#[test]
+fn a_member_refused_by_an_extent_node_keeps_running() {
+    let tmp = TempDir::new("cluster-secret-en-refuses");
+    let secret_file = tmp.0.join("secret");
+    std::fs::write(&secret_file, SECRET).unwrap();
+    let secret_arg = secret_file.to_str().unwrap();
+
+    let mgr_port = pick_port();
+    let mgr_addr = format!("127.0.0.1:{mgr_port}");
+    let mgr_log = tmp.0.join("manager.log");
+    let mut manager = ChildGuard(
+        Command::new(MANAGER_BIN)
+            .args(["--cluster-secret-file", secret_arg])
+            .args(["--port", &mgr_port.to_string(), "--listen", "127.0.0.1"])
+            .stdout(std::fs::File::create(&mgr_log).unwrap())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn manager"),
+    );
+    wait_port_open(mgr_port);
+
+    let en_dir = tmp.0.join("en");
+    std::fs::create_dir_all(&en_dir).unwrap();
+    let out = run_op(&[
+        "--cluster-secret-file",
+        secret_arg,
+        "--manager",
+        &mgr_addr,
+        "format",
+        en_dir.to_str().unwrap(),
+    ]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // The node registers its control address as its port + 1000 (whatever
+    // `--control-port` says), and that is where the manager polls.
+    let en_port = std::iter::repeat_with(pick_port)
+        .find(|p| *p < u16::MAX - 1000)
+        .unwrap();
+    let control_port = en_port + 1000;
+    let en = ChildGuard(
+        Command::new(EXTENT_NODE_BIN)
+            .args(["--cluster-secret-file", secret_arg])
+            .args(["--port", &en_port.to_string(), "--listen", "127.0.0.1"])
+            .args(["--data", en_dir.to_str().unwrap()])
+            .args(["--manager", &mgr_addr])
+            .args(["--advertise", &format!("127.0.0.1:{en_port}")])
+            .args(["--cpuset", &first_allowed_core()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn extent node"),
+    );
+    // Registered: the manager polls it from now on.
+    let start = Instant::now();
+    loop {
+        let out = run_op(&["--cluster-secret-file", secret_arg, "--manager", &mgr_addr, "list-nodes"]);
+        if String::from_utf8_lossy(&out.stdout).contains(&format!("127.0.0.1:{en_port}")) {
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(20), "the extent node never registered");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    drop(en);
+
+    for declared in [Service::ExtentNode, Service::Manager] {
+        let refused = stranger(control_port, declared);
+        assert!(refused > 0, "the manager never dialed the extent node's address");
+        assert!(
+            manager.0.try_wait().unwrap().is_none(),
+            "the manager exited after a stranger declaring {declared:?} refused it"
+        );
+    }
+    let text = std::fs::read_to_string(&mgr_log).unwrap();
+    assert!(
+        logged(
+            &text,
+            "PEER_AUTH failed: the peer holds a different cluster secret",
+            &format!("127.0.0.1:{control_port}"),
+        ),
+        "{text}"
+    );
+}
+
+/// A log line carrying `message` and naming `peer`.
+fn logged(text: &str, message: &str, peer: &str) -> bool {
+    text.lines().any(|l| l.contains(message) && l.contains(peer))
+}
+
+/// Listens on `port` for 8 s as a process holding another cluster secret that
+/// answers VERSION_HELLO as `declared`; returns how many dials it refused.
+fn stranger(port: u16, declared: Service) -> u32 {
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async move {
+            // The port can stay busy for a moment after the node is killed.
+            let start = Instant::now();
+            let listener = loop {
+                match compio::net::TcpListener::bind(format!("127.0.0.1:{port}")).await {
+                    Ok(l) => break l,
+                    Err(_) if start.elapsed() < Duration::from_secs(10) => {
+                        compio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                    Err(e) => panic!("bind 127.0.0.1:{port}: {e}"),
+                }
+            };
+            let wrong = secret(WRONG);
+            let mut refused = 0u32;
+            // One deadline around the whole loop: cancelling a pending accept
+            // can drop the connection it was about to return.
+            let _ = compio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else { continue };
+                    let (mut rd, mut wr) = Conn::Tcp(socket).into_split();
+                    let Ok(n) =
+                        autumn_rpc::version_hello::accept(&mut rd, &mut wr, declared, "stranger")
+                            .await
+                    else {
+                        continue;
+                    };
+                    if autumn_rpc::peer_auth::accept(&mut rd, &mut wr, &n, Some(&wrong), "stranger")
+                        .await
+                        .is_err()
+                    {
+                        refused += 1;
+                    }
+                }
+            })
+            .await;
+            refused
+        })
+    })
+    .join()
+    .unwrap()
+}
+
 /// One core, so the EN runs one shard.
 fn first_allowed_core() -> String {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();

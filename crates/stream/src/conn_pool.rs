@@ -108,7 +108,13 @@ impl ConnPool {
             .await?;
         let resp: AuthHelloResp = rkyv_decode(&resp).map_err(|e| anyhow!("{e}"))?;
         if resp.code != autumn_rpc::StatusCode::Ok as u8 {
-            return Err(anyhow!("refused: {}", resp.message));
+            // Typed, so a caller can tell a refused credential
+            // (`PermissionDenied`) from a node not ready to judge it yet.
+            return Err(autumn_rpc::RpcError::status(
+                autumn_rpc::StatusCode::from_u8(resp.code),
+                resp.message,
+            )
+            .into());
         }
         Ok(())
     }

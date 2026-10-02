@@ -359,8 +359,9 @@ other member opcode. A Client connection may send only `READ_BYTES`,
 
 **Direct reads under authz (`ClientAuthz`).** Each shard polls
 `MSG_GET_AUTHZ_CONFIG` every 5 s (`spawn_client_authz_poll_loop`; a failed poll
-keeps the last answer). `Unknown` until the first answer — reads refused
-`Unavailable`, never served unchecked; `Off` (authz off, or no manager) — no
+keeps the last answer). `Unknown` until the first answer — reads and
+`AUTH_HELLO` refused `Unavailable` (not a verdict on the token, so the SDK does
+not mistake it for one), never served unchecked; `Off` (authz off, or no manager) — no
 token needed; `On` — `client_gate` answers `AUTH_HELLO` itself (verify with
 `cap_token::bind_principal`, bind the connection's `principal`) and refuses a
 read unless the bound principal is `still_valid` (kid enabled, not expired),
@@ -374,7 +375,9 @@ revoked kid / Unknown / Off / member connection).
 **`ConnPool::set_auth_token`**: a pool that holds a token sends `AUTH_HELLO` on
 every connection it opens, right after the handshake and before pooling it
 (`AUTH_HELLO to <addr>` context, deliberately not `connect <addr>`: the address
-is fine, so `is_connect_failure` must not read it as a stale node). A changed
+is fine, so `is_connect_failure` must not read it as a stale node). A refusal
+comes back as `RpcError::Status` with the EN's code, so the SDK can tell a
+refused credential (`PermissionDenied`) from an EN not ready (`Unavailable`). A changed
 token drops the pooled connections; a connection whose AUTH_HELLO raced a
 change serves its one call and is not pooled.
 

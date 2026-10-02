@@ -722,6 +722,25 @@ Refusals log WARN with the caller's address, role and service
 `PEER_AUTH: connection gave no cluster-secret proof`). Design:
 `docs/cluster_secret_design.md`.
 
+A refused dial (`initiate` reports a refusal, and only a refusal, as
+`PermissionDenied`) goes through `on_dial_failure` in `from_conn_as`, which
+every Peer/Admin dial passes. The verdict is deterministic, since a secret is
+read once and rotation is a full stop, so what happens depends on who refused,
+and "who" is the dialed address, never the service the other end declared in
+VERSION_HELLO (server-side dials pass `expected = None`, so a stranger on an
+EN's address could otherwise declare `Manager` and end every process that
+dials it). Refused by one of this process's managers (`designate_managers`,
+from `--manager`, called by the PS and EN binaries), a server process (secret
+installed by `install_for_server`) logs ERROR and exits 1: it is not a member.
+Refused by any other address, the other end is the outsider: ERROR, and the
+error is returned, so the caller handles it as an unreachable node. A dialer
+that was wrong after all is refused by its manager on its next call and exits
+then. The manager designates no managers and never exits on a refusal; with the
+secret installed by plain `install` (in-process tests, autumn-op), nothing
+exits. Tests: `autumn-server --test cluster_secret`
+(`a_member_refused_by_peer_auth_exits`,
+`a_member_refused_by_an_extent_node_keeps_running`).
+
 Tests that start in-process servers and also spawn server binaries install one
 test secret per process before ANY server starts (manager `tests/support`
 installs it from the address pickers): a server that accepted in open mode

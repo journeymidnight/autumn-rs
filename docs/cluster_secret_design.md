@@ -50,7 +50,25 @@ mac = HMAC-SHA256(secret, "autumn-rs peer-auth v1" | side | service | role | ser
   `PEER_AUTH refused a connection holding a different cluster secret`，以及
   `PEER_AUTH: connection gave no cluster-secret proof`（对端没有密钥，直接断开）。
 
-## 4. 运维操作的门
+## 4. 发起方被拒绝之后
+
+拒绝是确定的结论：两边的密钥不同。密钥只在启动时读一次，轮换要求整集群停机，
+重试不会改变结果。该怎么办取决于谁拒绝了谁（`peer_auth::on_dial_failure`，在
+`RpcClient::from_conn_as` 里对每条 Peer / Admin 连接生效）。“谁”是本进程拨的
+地址，不是对端在 VERSION_HELLO 里自称的服务：否则占了某个 EN 地址的外人只要自称
+manager，就能让每个连它的进程退出。
+
+- **被本进程的 manager 拒绝**（拨的是 `--manager` 里的地址，PS / EN 启动时用
+  `designate_managers` 登记）：manager 是成员身份的权威，被它拒绝说明本进程不是这个
+  集群的成员。服务端进程（`install_for_server` 装的密钥）打 ERROR 后以状态 1 退出。
+- **被其他地址拒绝**（EN、PS，或占了成员地址的外人）：错的是对方。打 ERROR，把错误
+  原样返回，调用方把它当成不可达的节点处理，进程继续运行。如果实际上是本进程配错了，
+  它下一次访问 manager 时被拒，按上一条退出。manager 自己不登记 manager 地址，所以
+  不会因被拒而退出。
+- 进程内测试和 autumn-op 不退出，只拿到错误。
+- 只有拒绝（`PermissionDenied`）走这条路；超时、连接断开不是拒绝，照常返回。
+
+## 5. 运维操作的门
 
 manager 上只有 Admin 连接能发的 opcode 是 `manager_rpc::is_admin_mgr_msg` 这张表
 （fence / remove / maintenance / EC / create-stream / upsert-partition / merge /
@@ -62,7 +80,7 @@ Peer / Admin 连接能发，同样由 PEER_AUTH 把关。
 manager 自己驱动的 split / flush / gc（auto-policy、merge 前的 flush）是它以
 Peer 身份连 PS 发出的，与运维工具走同一条认证路径。
 
-## 5. 密钥分发
+## 6. 密钥分发
 
 - **manager / PS / EN**：`--cluster-secret-file <PATH>`，必填，缺失即退出（exit 2）。
   文件内容去掉首尾空白后至少 32 字节。`autumn-op gen-cluster-secret` 打印 64 个
@@ -77,12 +95,12 @@ Peer 身份连 PS 发出的，与运维工具走同一条认证路径。
 进程内的密钥是全局的（`peer_auth::install`，与 transport 选择同一形态）：一个进程
 只属于一个集群，所有 Peer / Admin 连接证明同一把密钥。
 
-## 6. 轮换
+## 7. 轮换
 
 一个进程只认一把密钥，轮换需要整集群停机：生成新文件，分发到所有节点和运维机器，
 全部重启。没有双密钥过渡期。
 
-## 7. 性能
+## 8. 性能
 
 每条 Peer / Admin 连接建立时多 1 个 RTT（challenge 与 VERSION_HELLO 的响应背靠背
 发送，proof / result 再一个往返）和两次 HMAC-SHA256。数据路径为零。

@@ -206,7 +206,9 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   read STRAIGHT from an extent node (`MSG_GET_REDIRECT` descriptor →
   `read_extent_value_direct`), taking the PS off the large-value DATA path (cross-host
   throughput win). Sub-64 KiB items stay on the proxy `get_range` path, so MIXED batches
-  route per item. **Per item, ANY direct-read failure falls back to the proxy** — degrades
+  route per item. **Per item, any direct-read failure except an EN refusing the
+  client's credential (returned as `PermissionDenied`, see "Direct reads under
+  authz") falls back to the proxy** — degrades
   gracefully where ENs aren't client-reachable. That includes a PS DECLINE: the
   batched descriptor call answers `CODE_PRECONDITION` for the individual items
   it cannot serve directly (`redirect_item_action` → `Proxy`), and only those
@@ -369,7 +371,14 @@ own: operator-only RPCs are gated by the role the connection proved.
 VERSION_HELLO, and a changed token drops the pooled EN connections so they
 rebind (as `ps_conns` already did). `set_principal_credential` clears it. An EN
 of a cluster that runs authz refuses a direct read on a connection without a
-valid bound principal; the read then falls back to the PS proxy.
+valid bound principal. That refusal (`PermissionDenied`, from a refused
+AUTH_HELLO or a refused read; `en_refusal`) is the answer:
+`DirectReadOutcome::Denied` returns `AutumnError::PermissionDenied` with no
+other replica and no proxy fallback, because every EN judges the same
+credential the same way and a fallback would only hide the refusal. An EN that
+has not loaded its authz config yet answers `Unavailable`, which falls back as
+before. Test: `connection_tests::en_credential_refusal_is_returned_without_fallback`
+(replicated and EC descriptors).
 
 ## Error types
 

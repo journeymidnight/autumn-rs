@@ -604,7 +604,12 @@ fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
-    if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref()) {
+    if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref())
+        .and_then(|()| match args.manager.as_deref() {
+            Some(m) => autumn_rpc::peer_auth::designate_managers(m),
+            None => Ok(()),
+        })
+    {
         eprintln!("error: {e}");
         std::process::exit(2);
     }

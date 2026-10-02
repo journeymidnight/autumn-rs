@@ -207,12 +207,19 @@ descriptor 前做 `check_key`，但 EN 收到的只是坐标，不知道它属�
   先发同一个 `MSG_AUTH_HELLO{token}`，EN 用同一份公钥验签、校验 `aud`、绑定
   `BoundPrincipal`，此后每个读请求检查 kid 仍启用、token 未过期（与 PS 的
   `still_valid` 是同一个函数，`cap_token.rs`）。没有绑定、token 过期、kid 被禁，
-  一律 `PermissionDenied`；客户端的直读失败后回落到 PS proxy。
+  一律 `PermissionDenied`。
+- **被拒就是结果**：EN 拒绝这个客户端（AUTH_HELLO 被拒，或读请求因凭证被拒）时，
+  SDK 不换副本、不回落 PS proxy，直接返回 `AutumnError::PermissionDenied`，由调用方
+  决定怎么办：同一份凭证在每个 EN 上的判定都相同，换地方重试只会把拒绝藏起来。
+  其他直读失败（节点不可达、超时、布局过期）照旧换副本再回落 proxy。
+  “每个 EN 判定相同”有一个窗口：EN 与 PS 每 5 s 才取一次配置，签名密钥增删后的
+  几秒内，用新 kid 签的 token 可能在某个 EN 上被拒，这个拒绝同样直接返回调用方。
 - **EN 不验范围**：一个合法 principal 仍可凭猜中的坐标读到别的 tenant 的 extent。
   要堵这一点需要 PS 为每个 descriptor 签名、EN 验签，未做。
 - **EN 取配置**：每个 shard 每 5 s 轮询 `MSG_GET_AUTHZ_CONFIG`（`ClientAuthz`）。
-  配置到手之前（`Unknown`）拒绝直读（`Unavailable`），不在不知道是否开启 authz
-  的状态下放行；manager 不可达时沿用上一次的结果。
+  配置到手之前（`Unknown`）拒绝直读和 AUTH_HELLO，都回 `Unavailable`（暂时的，
+  不是对凭证的判定，SDK 照常回落 proxy），不在不知道是否开启 authz 的状态下放行；
+  manager 不可达时沿用上一次的结果。
 - **SDK**：`ensure_token` 每次拿到 token 都交给直读连接池
   （`ConnPool::set_auth_token`），新连接在 VERSION_HELLO 后自动 `AUTH_HELLO`；
   token 换了，池里的旧连接全部丢弃重连。

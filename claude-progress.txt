@@ -1,3 +1,13 @@
+Date: 2026-10-02 (2)
+TaskStatus: completed
+Task scope: user "检查" (the ~2 ms redial) → "所有的内部RPC都有可能出现PEER_AUTH失败的情况，说明远端不允许访问，直接fatal都可以；如果是HELLO_AUTH失败…正常返回失败就行，由autumn用户自己判断" → refined and confirmed: refused by the manager → exit; refused by an EN/PS → ERROR, treat as unreachable (F-AUTH-FAILURE-POLICY).
+Current summary: peer_auth::on_dial_failure in RpcClient::from_conn_as: a PS/EN refused by one of its --manager addresses (designate_managers) logs ERROR and exits 1; refused by any other address it logs ERROR and returns the error (caller sees an unreachable node). Decided by the dialed address, not the service the peer declares (review HIGH: a stranger on an EN address declaring Manager could otherwise kill the manager). SDK direct read: an EN PermissionDenied (refused AUTH_HELLO or read) returns AutumnError::PermissionDenied with no replica rotation and no proxy fallback (replicated + EC + stale-heal). ConnPool AUTH_HELLO refusal is typed RpcError::Status; EN bind while authz Unknown answers Unavailable.
+Found while checking: the ~2 ms redial is StreamClient::await_extent_synced_to (flush barrier) polling replicas every 2 ms for 30 s and swallowing every error; independent of the secret (control run with a plain listener: 2872 vs 2659 connections in 6 s); in the code since e6c07ff. User: secret rotation does not happen, so no special handling. Latent: the EN registers control_address = advertise port + 1000 and ignores --control-port (no deployment passes it).
+Verification: unit rpc 97 / stream 222 / client 66 / PS 275 / manager 435 / common 13; autumn-server tests incl. cluster_secret 4/4 (real binaries; stranger declares ExtentNode then Manager); rpc integration; manager client_wire_admission. Ablations red: no exit; exit on any address; decide by declared service; SDK checks removed; Unknown bind = PermissionDenied.
+Review: fable. HIGH fixed (address-based decision + regression). LOW kept: ERROR per refused dial, no damping (user asked for ERROR); signing-key change window (~5 s) now user-visible, documented.
+Main gaps: rename AUTH_HELLO → CLIENT_AUTH (user request, separate commit). Open, awaiting user: flush barrier behaviour when an EN dies (2 ms redial, replica addrs fetched once); --control-port registration bug.
+Next steps: the rename.
+
 Date: 2026-10-02
 TaskStatus: completed
 Task scope: user "现在EN有auth检查吗？" → REN-VERSION-HELLO (5795b03) → F-CLUSTER-SECRET: "一把密钥替代现在的 admin token，这样EN，PS，MANAGER启动的时候都要这个token，但是对于client来说，需要一个cred"; "是不是强制cred是cluster的配置决定的"; "EN只看身份，并且只有direct-read这一个API"; stop-world upgrade.

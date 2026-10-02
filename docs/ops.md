@@ -145,8 +145,22 @@ process configured with another secret) and `PEER_AUTH: connection gave no
 cluster-secret proof` (a process with none, which gives up after the challenge).
 Grep both to find a misconfigured process after a rollout.
 
+The dialing side decides by the address it dialed, never by what the other end
+claims to be. A PS or EN refused by one of its `--manager` addresses is not a
+member of this cluster: it logs `PEER_AUTH failed against this process's
+manager ... exiting` at ERROR (with `peer=<addr>`) and exits with status 1.
+Refused by any other address (an extent node, a partition server, a stranger on
+a member's address), it logs `PEER_AUTH failed: the peer holds a different
+cluster secret; treating it as unreachable` at ERROR and keeps running; that
+node is handled like any unreachable one. If the dialer was the misconfigured
+one after all, its next call to the manager is refused and it exits then. The
+manager never exits on a refusal; autumn-op only prints the error.
+
 `cargo test -p autumn-server --test cluster_secret` runs the same checks against
-the real binaries (manager and EN, Peer and Admin, no / wrong / right secret).
+the real binaries (manager and EN, Peer and Admin, no / wrong / right secret),
+plus both dialer outcomes: an EN whose manager comes back with another secret
+exits, and a manager refused by a stranger on an EN's address keeps running,
+whether the stranger claims to be an extent node or a manager.
 
 **Upgrading a cluster that used the admin token** is a stop-the-world change
 (wire 52, and every Peer/Admin connection now runs PEER_AUTH):

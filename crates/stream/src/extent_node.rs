@@ -1765,9 +1765,18 @@ impl ClientAuthz {
     }
 
     /// `AUTH_HELLO` on a Client connection: the principal to bind, or why not.
-    fn bind(&self, token: &[u8], now: u64) -> Result<Option<autumn_rpc::cap_token::BoundPrincipal>, String> {
+    /// `Unavailable` while the config is unknown (it says nothing about the
+    /// token); `PermissionDenied` when the token is refused.
+    fn bind(
+        &self,
+        token: &[u8],
+        now: u64,
+    ) -> Result<Option<autumn_rpc::cap_token::BoundPrincipal>, (StatusCode, String)> {
         match self {
-            Self::Unknown => Err("authz config not loaded yet; retry".to_string()),
+            Self::Unknown => Err((
+                StatusCode::Unavailable,
+                "authz config not loaded yet; retry".to_string(),
+            )),
             // Nothing to bind against; reads need no principal.
             Self::Off => Ok(None),
             Self::On {
@@ -1775,7 +1784,8 @@ impl ClientAuthz {
                 cluster_id,
                 clock_skew_secs,
             } => autumn_rpc::cap_token::bind_principal(token, keys, cluster_id, now, *clock_skew_secs)
-                .map(Some),
+                .map(Some)
+                .map_err(|reason| (StatusCode::PermissionDenied, reason)),
         }
     }
 
@@ -4585,7 +4595,7 @@ impl ExtentNode {
                         *principal = bound;
                         (StatusCode::Ok, String::new())
                     }
-                    Err(reason) => (StatusCode::PermissionDenied, reason),
+                    Err(refusal) => refusal,
                 },
                 Err(e) => (StatusCode::InvalidArgument, format!("bad AUTH_HELLO: {e}")),
             }
@@ -16131,6 +16141,7 @@ mod client_direct_read_auth_tests {
         forged.set_auth_token(Some(token([1; 32], far)));
         let e = read(&forged, &addr).await.expect_err("forged token admitted");
         assert!(format!("{e:#}").contains("AUTH_HELLO"), "{e:#}");
+        assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "{e:#}");
 
         // An expired one.
         let expired = crate::ConnPool::with_role(Role::Client);
@@ -16159,6 +16170,11 @@ mod client_direct_read_auth_tests {
         *node.client_authz.borrow_mut() = ClientAuthz::Unknown;
         let pool = crate::ConnPool::with_role(Role::Client);
         let e = read(&pool, &addr).await.expect_err("served before authz was known");
+        assert_eq!(status(&e), Some(StatusCode::Unavailable), "{e:#}");
+        // A token cannot be judged yet either: that is not a refusal of it.
+        let member = crate::ConnPool::with_role(Role::Client);
+        member.set_auth_token(Some(token(SEED, autumn_rpc::cap_token::now_secs() + 3600)));
+        let e = read(&member, &addr).await.expect_err("bound before authz was known");
         assert_eq!(status(&e), Some(StatusCode::Unavailable), "{e:#}");
     }
 

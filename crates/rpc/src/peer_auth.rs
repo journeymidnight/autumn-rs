@@ -25,13 +25,14 @@
 //! exists for in-process tests only: every server binary refuses to start
 //! without `--cluster-secret-file`. A client holding a secret refuses an open
 //! server, because answering `open` is exactly what an impostor would do.
-use crate::version_hello::{encode_bootstrap, read_bootstrap, Negotiated, Role, TIMEOUT};
+use crate::version_hello::{encode_bootstrap, read_bootstrap, Negotiated, Role, Service, TIMEOUT};
 use crate::{RpcError, StatusCode};
 use compio::io::AsyncWriteExt;
 use compio::BufResult;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 pub const MSG_PEER_AUTH: u8 = 0xF1;
@@ -119,14 +120,93 @@ pub fn install(secret: ClusterSecret) -> Result<(), String> {
     }
 }
 
+/// Set by `install_for_server`: in a server process, the manager refusing a
+/// dial ends the process (`on_dial_failure`).
+static REFUSAL_IS_FATAL: AtomicBool = AtomicBool::new(false);
+
+/// This process's managers, as its `--manager` flag names them
+/// (`designate_managers`).
+static MANAGERS: OnceLock<Vec<std::net::SocketAddr>> = OnceLock::new();
+
 /// What every server binary runs before it serves: install the secret named by
-/// `--cluster-secret-file`, or refuse to start.
+/// `--cluster-secret-file`, or refuse to start. From then on, failing PEER_AUTH
+/// against one of its managers is fatal.
 pub fn install_for_server(path: Option<&std::path::Path>) -> Result<(), String> {
     let path = path.ok_or_else(|| {
         "--cluster-secret-file is required (generate one with `autumn-op gen-cluster-secret`)"
             .to_string()
     })?;
-    install(ClusterSecret::from_file(path)?)
+    install(ClusterSecret::from_file(path)?)?;
+    REFUSAL_IS_FATAL.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Records which addresses are this process's managers: `list` is its
+/// `--manager` flag, comma-separated `IP:PORT`s (an `http://` prefix is
+/// ignored, as everywhere else). Called once at startup by the partition server
+/// and the extent node; the manager dials no manager.
+pub fn designate_managers(list: &str) -> Result<(), String> {
+    let addrs = list
+        .split(',')
+        .map(|a| {
+            let a = a.trim();
+            let bare = a
+                .trim_start_matches("http://")
+                .trim_start_matches("https://");
+            bare.parse()
+                .map_err(|e| format!("--manager {a:?} is not IP:PORT: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    MANAGERS
+        .set(addrs)
+        .map_err(|_| "the managers are already designated in this process".to_string())
+}
+
+/// What a dialer does when `initiate` failed against `peer`.
+///
+/// Only a refusal counts (`initiate` reports one, and only one, as
+/// `PermissionDenied`); a timeout or a broken connection is not a refusal and
+/// passes through. A refusal means the two ends hold different cluster
+/// secrets, and since a secret is read once at startup and rotating it is a
+/// full stop, retrying never changes it. Who refused decides what happens, and
+/// "who" is the address this process dialed, never what the other end says it
+/// is: a stranger answering VERSION_HELLO as the manager must not be able to
+/// end a process.
+///
+/// - One of this process's managers (`designate_managers`), the authority on
+///   membership: this process is not a member of the cluster it serves. A
+///   server process logs and exits.
+/// - Any other address: that end is the outsider (a misconfigured process, or
+///   a stranger on a member's address). It is logged at ERROR and the error is
+///   returned, so the caller sees an unreachable node and goes on as it would
+///   for one. Should this process be the outsider instead, its next call to a
+///   manager is refused and it exits then.
+pub fn on_dial_failure(e: &RpcError, peer: std::net::SocketAddr, declared: Service) {
+    if !matches!(
+        e,
+        RpcError::Status {
+            code: StatusCode::PermissionDenied,
+            ..
+        }
+    ) {
+        return;
+    }
+    let is_manager = MANAGERS.get().is_some_and(|m| m.contains(&peer));
+    if is_manager && REFUSAL_IS_FATAL.load(Ordering::Relaxed) {
+        tracing::error!(
+            %peer,
+            error = %e,
+            "PEER_AUTH failed against this process's manager: this process holds a different \
+             cluster secret and is not a member of this cluster; exiting",
+        );
+        std::process::exit(1);
+    }
+    tracing::error!(
+        %peer,
+        ?declared,
+        error = %e,
+        "PEER_AUTH failed: the peer holds a different cluster secret; treating it as unreachable",
+    );
 }
 
 pub fn installed() -> Option<&'static ClusterSecret> {

@@ -654,7 +654,25 @@ enum DirectReadOutcome {
     /// liveness anomaly: the descriptor was built from a pre-EC-conversion
     /// cached ExtentInfo. Healable — see `read_descriptor_with_stale_heal`.
     StaleLayout,
+    /// An extent node refused this client (its credential, or the lack of
+    /// one). TERMINAL: every node of the cluster judges the same credential
+    /// the same way, so no other replica and no proxy fallback is tried; the
+    /// caller gets `AutumnError::PermissionDenied` and decides.
+    Denied(String),
     Failed,
+}
+
+/// The extent node's refusal of this client, if that is what `e` is: a
+/// refused AUTH_HELLO, or a read refused for want of a valid credential. A
+/// node that cannot judge yet answers `Unavailable`, which is not this.
+fn en_refusal(e: &anyhow::Error) -> Option<String> {
+    e.chain().find_map(|c| match c.downcast_ref::<RpcError>() {
+        Some(RpcError::Status {
+            code: StatusCode::PermissionDenied,
+            message,
+        }) => Some(message.clone()),
+        _ => None,
+    })
 }
 
 /// EN refusal text for `CODE_EVERSION_MISMATCH` (eversion bumped at the EC
@@ -3145,7 +3163,7 @@ impl ClusterClient {
         }
         if let Some(v) = self
             .read_descriptor_with_stale_heal(&key_v, 0, 0, &resp)
-            .await
+            .await?
         {
             return Ok(Some(v));
         }
@@ -3162,18 +3180,21 @@ impl ClusterClient {
     /// itself (`read_bytes_from_extent` refetches on `EversionStale`); this
     /// gives the descriptor path the same cure, client-side:
     /// 1-byte proxy probe (PS read path refetches as a side effect) → re-send
-    /// `MSG_GET_REDIRECT` once → direct read again. Any failure returns `None`
-    /// and the caller's proxy fallback runs as before. One heal per read.
+    /// `MSG_GET_REDIRECT` once → direct read again. Any failure returns
+    /// `Ok(None)` and the caller's proxy fallback runs as before; an extent
+    /// node refusing this client is `Err(PermissionDenied)`, with no fallback.
+    /// One heal per read.
     async fn read_descriptor_with_stale_heal(
         &self,
         key: &[u8],
         offset: u32,
         length: u32,
         first: &GetRedirectResp,
-    ) -> Option<bytes::Bytes> {
-        match self.read_from_descriptor(first).await {
+    ) -> std::result::Result<Option<bytes::Bytes>, AutumnError> {
+        Ok(match self.read_from_descriptor(first).await {
             DirectReadOutcome::Value(v) => Some(v),
             DirectReadOutcome::Failed => None,
+            DirectReadOutcome::Denied(m) => return Err(AutumnError::PermissionDenied(m)),
             DirectReadOutcome::StaleLayout => {
                 static HEAL_ANNOUNCED: std::sync::atomic::AtomicBool =
                     std::sync::atomic::AtomicBool::new(false);
@@ -3192,8 +3213,10 @@ impl ClusterClient {
                 // Best-effort: the probe heals the PS cache as a side effect.
                 let mut probe = [0u8; 1];
                 let _ = self.get_range_into(key, offset, 1, &mut probe).await;
-                let key_v = self.binding.bind_key(key).ok()?;
-                let resp_bytes = self
+                let Ok(key_v) = self.binding.bind_key(key) else {
+                    return Ok(None);
+                };
+                let Ok(resp_bytes) = self
                     .call_ps_for_key(&key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
                         rkyv_encode(&GetReq {
                             part_id,
@@ -3204,17 +3227,22 @@ impl ClusterClient {
                         })
                     })
                     .await
-                    .ok()?;
-                let resp: GetRedirectResp = rkyv_decode(&resp_bytes).ok()?;
+                else {
+                    return Ok(None);
+                };
+                let Ok(resp) = rkyv_decode::<GetRedirectResp>(&resp_bytes) else {
+                    return Ok(None);
+                };
                 if resp.code != partition_rpc::CODE_OK || resp.extent_id == 0 {
-                    return None;
+                    return Ok(None);
                 }
                 match self.read_from_descriptor(&resp).await {
                     DirectReadOutcome::Value(v) => Some(v),
+                    DirectReadOutcome::Denied(m) => return Err(AutumnError::PermissionDenied(m)),
                     _ => None,
                 }
             }
-        }
+        })
     }
 
     /// Serve a read from whatever the descriptor turned out to describe.
@@ -3294,6 +3322,9 @@ impl ClusterClient {
                 // concatenated here would be silently wrong data, not an error.
                 Ok(b) => out.extend_from_slice(&b),
                 Err(e) => {
+                    if let Some(m) = en_refusal(&e) {
+                        return DirectReadOutcome::Denied(m);
+                    }
                     let msg = format!("{e:#}");
                     // Loud once, then debug — the same shape as the replicated
                     // path's fallback warning, and for the same reason: falling
@@ -3389,6 +3420,9 @@ impl ClusterClient {
             {
                 Ok(v) => return DirectReadOutcome::Value(v),
                 Err(e) => {
+                    if let Some(m) = en_refusal(&e) {
+                        return DirectReadOutcome::Denied(m);
+                    }
                     // A TIMEOUT is a liveness anomaly (dead endpoint /
                     // stuck peer) that silently costs the op the full RPC
                     // deadline — surface it at warn (the 2026-07-03 UCX
@@ -3447,9 +3481,8 @@ impl ClusterClient {
                 tracing::warn!(
                     extent_id = resp.extent_id,
                     replicas = n,
-                    "direct-read fell back to PS proxy (ENs not client-reachable, or an \
-                     authz-on EN refused this connection's credential?) — large reads use \
-                     the proxy path; pass direct_read=false to disable"
+                    "direct-read fell back to PS proxy (ENs not client-reachable?) — large \
+                     reads use the proxy path; pass direct_read=false to disable"
                 );
             } else {
                 tracing::debug!(
@@ -3543,7 +3576,7 @@ impl ClusterClient {
         }
         if let Some(v) = self
             .read_descriptor_with_stale_heal(&key_v, offset, length, &resp)
-            .await
+            .await?
         {
             let n = v.len().min(dest.len());
             dest[..n].copy_from_slice(&v[..n]);
@@ -3723,7 +3756,7 @@ impl ClusterClient {
             RedirectItemAction::Descriptor => {
                 if let Some(v) = self
                     .read_descriptor_with_stale_heal(key, offset, length, resp)
-                    .await
+                    .await?
                 {
                     let nn = v.len().min(dest.len());
                     dest[..nn].copy_from_slice(&v[..nn]);

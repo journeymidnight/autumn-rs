@@ -14,6 +14,13 @@
 
 ## Active
 
+### F-AUTH-FAILURE-POLICY — 内部 PEER_AUTH 被拒与客户端凭证被拒的处理
+- **Trigger** (2026-10-02 用户): "所有的内部RPC都有可能出现PEER_AUTH失败的情况，说明远端不允许访问，直接fatal都可以"；"如果是HELLO_AUTH失败，说明client连接了不允许的服务，也正常返回失败就行，由autumn用户自己判断" → 细化（用户确认）："被 manager 拒绝：退出……被 EN 或 PS 拒绝：把对方当作不可达，打 ERROR 日志，按正常的退避重试，不退出。如果其实是自己配错了，下一次心跳就会被 manager 拒绝，然后退出。"
+- **Scope**: (1) 服务端进程（manager / PS / EN）拨号时 PEER_AUTH 失败：对端是 manager → ERROR 并退出；对端是 EN / PS → ERROR，错误照常返回给调用方（按不可达处理），进程不退出。进程内测试与 autumn-op 不退出。(2) SDK 直读时 EN 拒绝客户端凭证（AUTH_HELLO 被拒或读被拒，`PermissionDenied`）→ 不换副本、不回落 PS proxy，返回 `AutumnError::PermissionDenied`。EN 在 authz 配置未知时对 AUTH_HELLO 回 `Unavailable`（暂时状态，不是对凭证的判定）。
+- **Acceptance**: 真进程：EN 的 manager 在同地址换密钥重启后 EN 以状态 1 退出并打出 ERROR；manager 被占了 EN 控制地址、持另一把密钥的监听者拒绝后继续运行并打出 ERROR。SDK：EN 以 `PermissionDenied` 拒绝时，副本与 EC 两种 descriptor 都返回 `PermissionDenied`，只访问一个 EN、零次 proxy。EN：配置未知时带 token 的连接得到 `Unavailable`。每项去掉修复后对应测试变红。
+- `passes: true`
+- **notes** (2026-10-02): `peer_auth::on_dial_failure`（在 `RpcClient::from_conn_as`）：拒绝（`PermissionDenied`）且拨的是本进程 `--manager` 地址（PS / EN 启动时 `designate_managers` 登记）→ ERROR + exit 1；其他地址 → ERROR，错误原样返回（按不可达处理）。按拨号地址判断而不是对端在 VERSION_HELLO 里自称的服务（评审高危：服务端拨号 `expected = None`，占 EN 地址的外人自称 manager 就能让 manager 退出）。SDK `DirectReadOutcome::Denied` → `AutumnError::PermissionDenied`，副本 / EC / stale-heal 三处；`ConnPool` AUTH_HELLO 拒绝带类型；EN `bind` 在 Unknown 时回 `Unavailable`。验证：cluster_secret 4/4（真二进制，含外人分别自称 ExtentNode / Manager 两轮）；client 66、stream 222、rpc 97、PS 275、manager 435 lib 全绿；rpc 集成与 client_wire_admission 绿。消融变红：不退出、对任何地址都退出、按自称服务判断、SDK 去掉拒绝检查、Unknown 回 PermissionDenied。评审（fable）：高危 1 已修并补回归；低：每次被拒都打 ERROR 无限流（按用户要求，未限流）；签名密钥增删后约 5 s 内新 kid 的 token 可能被某个 EN 拒并直接报给调用方（已写入文档）。顺带发现（未修）：EN 注册控制地址恒为 advertise 端口 + 1000，忽略 `--control-port`。
+
 ### F-CLUSTER-SECRET — 集群密钥替代 admin token；EN 直读校验客户端 cred
 - **Trigger** (2026-10-02 用户): "现在EN有auth检查吗？" → 没有：任何能连 EN 的进程声明 Peer 即可 APPEND / DELETE_EXTENT / FENCE_EXTENT，声明 Client 可按猜的坐标读任意 extent；声明 Peer 还能从 manager `GET_AUTHZ_CONFIG` 读到 admin token。用户："一把密钥替代现在的 admin token，这样EN，PS，MANAGER启动的时候都要这个token，但是对于client来说，需要一个cred"；"是不是强制cred是cluster的配置决定的"；"EN只看身份，并且只有direct-read这一个API"；升级 stop world。
 - **Scope**: (1) manager / PS / EN 启动必须给集群密钥文件，缺则拒绝启动；非 Client 连接在 VERSION_HELLO 之后做独立的双向 HMAC 挑战应答，失败即断开；VERSION_HELLO 字节不变。(2) admin token 全部删除（manager / autumn-op / dashboard 的 flag、payload 前缀、principal/namespace 请求字段、`GET_AUTHZ_CONFIG` 下发）；管理操作改由“经集群密钥认证的 Admin 连接”把关；autumn-op / dashboard 用同一密钥文件。(3) 集群开启 authz（manager 配 signing key）时，EN 对 Client 连接要求先 `AUTH_HELLO` 绑定有效 principal（只验身份与有效期 / kid，不验 extent 归属）才服务 `READ_BYTES` / `READ_BYTES_BULK`；未开启时不查。SDK 直读连接在 authz 开启时自动 AUTH_HELLO，token 续期时重连。

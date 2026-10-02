@@ -721,7 +721,9 @@ async fn main() -> Result<()> {
     // apply PS-library tunables before any library reader fires.
     apply_ps_tunables(&args);
 
-    if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref()) {
+    if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref())
+        .and_then(|()| autumn_rpc::peer_auth::designate_managers(&args.manager))
+    {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
