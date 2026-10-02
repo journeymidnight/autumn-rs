@@ -19,7 +19,7 @@
 - **Scope**: 先复现；若成立，让回放上限与全副本规则一致，或回放前先 seal-and-roll。
 - **Acceptance**: 有一个按上述时序构造的测试，修复前红、修复后绿；不可复现则关闭并记录原因。
 - `passes: true`
-- **notes** (2026-10-02): 用户关闭："这个不会出现,因为PS打开stream log的时候要100%确保A,B,C一样长" → "BUG-OPEN-TAIL-REPLAY-BOUND可关"。未复现、未改代码。关闭时的观察（供以后复查）：打开分区时回放前对日志尾做的是 `fence_tail`（partition-server lib.rs ~6393），只抬 owner_epoch、不比较或截断长度，且跳过连不上的副本；回放读取上限是 `commit_length_for_extent`（可达副本 min）；截断发生在回放之后的首次追加（`ensure_tail_initialised` → `truncate_to_commit`）。未找到回放前使三副本等长的步骤，但打开流程没有完整读完。
+- **notes** (2026-10-02): 用户关闭："这个不会出现,因为PS打开stream log的时候要100%确保A,B,C一样长" → "BUG-OPEN-TAIL-REPLAY-BOUND可关"。未复现、未改代码。关闭时的观察（供以后复查）：打开分区时回放前对日志尾做的是 `fence_tail`（partition-server lib.rs ~6393），只抬 owner_epoch、不比较或截断长度，且跳过连不上的副本；回放读取上限是 `commit_length_for_extent`（可达副本 min）；截断发生在回放之后的首次追加（`ensure_tail_initialised` → `truncate_to_commit`）。（更正，完整读过打开流程后：回放前确有对齐检查——`partition_thread_main` 对 log/row/meta 调 `commit_length` → manager `handle_check_commit_length`，open 尾部并发探测每个成员的 `EXT_MSG_COMMIT_LENGTH` 并经 `compute_commit_seal` 取 min，失败每 5 s 重试；三副本都在线时回放上限即一致的 min，所述情形不会发生。注意：该处注释写"require all committed members to agree"，但 `compute_commit_seal` 只要求 `seal_durability_floor()` 个成员回答，默认 1（读环境变量 `AUTUMN_MGR_SEAL_DURABILITY_FLOOR`，违反 rs 不读 env 的规则，旧问题）；且此检查不 seal 不截断，长度真正对齐在回放后的首次追加 `truncate_to_commit`。）
 
 ### BUG-FLUSH-BARRIER-WEDGE — 删除 flush 前的全副本 synced 屏障
 - **Trigger** (2026-10-02 用户): 解释运行中 EN 死后 flush 卡在屏障之后，"不需要这个屏障, 因为WAL写入的时候已经确认过了(你可以读代码), await_log_synced_to完全没有作用"。
