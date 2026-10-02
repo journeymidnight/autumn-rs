@@ -1777,7 +1777,10 @@ is tombstoned (same address cannot re-register); stop the EN process.
 **Drain-never-completes checklist (root cause):** the
 drain's last mile is the manager LEARNING that a rebuild finished — the EN
 reports completed recoveries only in its `df` response, and the manager's df
-goes to the node's **control address = advertise_host:(advertise_port+1000)**.
+goes to the node's **control address = advertise_host:--control-port, or
+advertise_host:(advertise_port+1000) without the flag**. An explicit
+`--control-port` is both the port the node binds and the port it registers, so
+behind a proxy it must be the same number on both sides.
 If anything sits between the manager and an EN (proxy, NAT, port forward), it
 MUST forward the control port alongside the data port, or every df fails
 silently: recoveries complete on the target ENs but are never applied, the

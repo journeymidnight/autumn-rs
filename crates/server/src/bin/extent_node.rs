@@ -497,6 +497,34 @@ fn read_node_identity(data_dirs: &[PathBuf]) -> Result<(String, Vec<String>)> {
     Ok((node_uuid.unwrap(), disk_uuids))
 }
 
+/// The control listener's port: `--control-port`, else `--port` + 1000. The
+/// default is computed only when the flag is absent, so an explicit control
+/// port works with any data port; without one, a data port above 64535 has no
+/// default and is refused.
+fn local_control_port(control_port: Option<u16>, port: u16) -> Result<u16> {
+    match control_port {
+        Some(p) => Ok(p),
+        None => port.checked_add(1000).ok_or_else(|| {
+            anyhow::anyhow!("--port {port} + 1000 exceeds 65535; pass --control-port")
+        }),
+    }
+}
+
+/// The control port the manager is told to dial: `--control-port` when given
+/// (the port the control listener binds, so behind a proxy it must also be the
+/// proxy's), else the advertised data port + 1000, matching the listener's own
+/// default of `--port` + 1000.
+fn advertise_control_port(control_port: Option<u16>, advertise_port: u16) -> Result<u16> {
+    match control_port {
+        Some(p) => Ok(p),
+        None => advertise_port.checked_add(1000).ok_or_else(|| {
+            anyhow::anyhow!(
+                "advertised port {advertise_port} + 1000 exceeds 65535; pass --control-port"
+            )
+        }),
+    }
+}
+
 /// M1: build the self-registration request (pure — no I/O, so the
 /// control_address derivation is unit-testable). UCX serves control RPCs on the
 /// data listener (a second `ucp_listener` on the same RoCE device can't bind),
@@ -725,7 +753,7 @@ fn main() -> Result<()> {
     // per-shard control port. Operator can override the shard-0
     // base via --control-port; per-shard stride matches data plane so
     // shard-N has its own control listener too.
-    let control_port_base = args.control_port.unwrap_or(args.port + 1000);
+    let control_port_base = local_control_port(args.control_port, args.port)?;
     let control_ports: Vec<u16> = (0..shards)
         .map(|i| control_port_base + (i as u16) * args.shard_stride)
         .collect();
@@ -782,7 +810,10 @@ fn main() -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    let advertise_control_base: u16 = advertise_port.map_or(0, |ap| ap.saturating_add(1000));
+    let advertise_control_base: u16 = match advertise_port {
+        Some(ap) => advertise_control_port(args.control_port, ap)?,
+        None => 0,
+    };
 
     // Sibling addresses — used by each shard to forward control-plane RPCs
     // to the owning sibling when a mismatched extent_id arrives. Must use
@@ -1036,7 +1067,7 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
     autumn_common::cpu_pin::confine_io_workers(&rt);
     tracing::info!(?cpu, "extent-node (single-shard) runtime ready");
     // control port defaults to port + 1000.
-    let ctl_port = args.control_port.unwrap_or(args.port + 1000);
+    let ctl_port = local_control_port(args.control_port, args.port)?;
     rt.block_on(async move {
         let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
             .context("parse listen address")?;
@@ -1051,7 +1082,8 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
             // M1: self-register live location before serving. A
             // single-shard node registers `[advertise_port]` — the PEER-reachable
             // port (== --port normally, but the proxy/NAT port when they differ),
-            // and control = advertise_port + 1000. main() already required
+            // and control = --control-port, else advertise_port + 1000
+            // (`advertise_control_port`). main() already required
             // --advertise here, so the parse cannot fail.
             if let Some(adv) = args.advertise.as_ref() {
                 let advertise_port = adv
@@ -1062,7 +1094,7 @@ fn run_single_shard(args: Args, stamped_cluster_id: String) -> Result<()> {
                 let req = build_register_req(
                     adv,
                     args.transport,
-                    advertise_port.saturating_add(1000),
+                    advertise_control_port(args.control_port, advertise_port)?,
                     &node_uuid,
                     &disk_uuids,
                     &[advertise_port],
@@ -1119,6 +1151,24 @@ mod tests {
         assert_eq!(req.shard_ports, vec![9101u16, 9111]);
         assert_eq!(req.node_uuid, "uuid-A");
         assert_eq!(req.disk_uuids, vec!["disk-A".to_string(), "disk-B".to_string()]);
+    }
+
+    /// The registered control port is the one the listener binds: an explicit
+    /// `--control-port` is used as is, not replaced by the data port + 1000.
+    #[test]
+    fn registered_control_port_follows_the_flag() {
+        assert_eq!(advertise_control_port(Some(29421), 29420).unwrap(), 29421);
+        assert_eq!(advertise_control_port(None, 29420).unwrap(), 30420);
+        assert!(advertise_control_port(None, 65000).is_err());
+    }
+
+    /// An explicit control port never touches the data port + 1000 default,
+    /// which does not exist for a data port above 64535.
+    #[test]
+    fn an_explicit_control_port_works_with_any_data_port() {
+        assert_eq!(local_control_port(Some(21878), 65000).unwrap(), 21878);
+        assert_eq!(local_control_port(None, 9101).unwrap(), 10101);
+        assert!(local_control_port(None, 65000).is_err());
     }
 
     #[test]

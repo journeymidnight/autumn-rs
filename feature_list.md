@@ -14,6 +14,13 @@
 
 ## Active
 
+### BUG-EN-CONTROL-PORT-REGISTER — EN 注册控制地址忽略 --control-port
+- **Trigger** (2026-10-02 用户): "忽略 --control-port是什么意思？" → 解释后 "4. 修"。
+- **Scope**: EN 向 manager 注册的控制地址用 `--control-port`（给了时），否则 advertise 端口 + 1000；多 shard 与单 shard 两条注册路径一致。
+- **Acceptance**: 真进程：EN 以 ≠ 数据端口 + 1000 的 `--control-port` 启动，数秒后 manager 记录的最近心跳 ≤ 3 s；去掉修复即红。
+- `passes: true`
+- **notes** (2026-10-02): `advertise_control_port` / `local_control_port` 供两条路径共用，默认值只在没给 flag 时计算（原 `unwrap_or(port + 1000)` 在 `--port` > 64535 时即使给了 flag 也会溢出 panic，测试约 1.8% 随机失败），没 flag 且溢出时启动报错。单测 `registered_control_port_follows_the_flag`、`an_explicit_control_port_works_with_any_data_port`；真进程 `tests/en_control_port.rs` 单 shard 与两 shard 两条注册路径（7 s 后 last_heartbeat_secs_ago ≤ 3；修复前该值随时间增长、磁盘被标离线）；消融（单 shard 忽略 flag、只多 shard 路径忽略 flag）各自变红。cluster_secret、direct_io_default 真进程测试仍绿。评审（opus）已采纳：溢出、多 shard 覆盖、ops.md 代理说明（显式 flag 同时是监听端口与注册端口）、过时注释（EN 代码、cluster_secret 测试、server CLAUDE.md 的 --advertise 端口说明）。部署脚本都用默认值，生产未触发。
+
 ### BUG-SYNC-BARRIER-REDIAL — flush 屏障对连不上的副本每 2 ms 重连 30 s
 - **Trigger** (2026-10-02 用户): "EN的话，retry几次后还不行，因为不会出现PEER_AUTH的情况，所以就上报flush失败，上面sst会重新allocate 健康的extent重新flush"；"如果PS在drain的阶段，等待flush 失败，那就直接退出就行"。附带："Python 注释过时 → 修复"。
 - **Scope**: `StreamClient::await_extent_synced_to` 对查询失败（连不上 / 超时 / 拒绝）的副本连续失败若干次即返回错误（flush 失败），不再按 2 ms 轮询到 30 s；“已应答但未同步到位”的等待不变。drain 时 flush 失败即退出（数据留在 WAL）。修正 Python `Client.connect` / `Fs.connect` 注释。

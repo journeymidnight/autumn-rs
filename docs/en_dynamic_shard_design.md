@@ -91,9 +91,10 @@ binary stays DNS-free, the shell resolves names.
   REGISTERED `shard_ports` derive from the advertise port
   (`advertise_port + i*shard_stride`, stride default 10) while the BIND ports
   derive from `--port` — the two differ only behind a proxy.
-- The registered `control_address` is a SINGLE address,
-  `advertise_host:(advertise_port + 1000)` = shard 0's control port, because the
-  manager's df dials shard 0 only. Locally each shard binds
+- The registered `control_address` is a SINGLE address, shard 0's control
+  port: `advertise_host:--control-port` when the flag is given, else
+  `advertise_host:(advertise_port + 1000)`, because the manager's df dials
+  shard 0 only. Locally each shard binds
   `control_port_base + i*shard_stride`, where `control_port_base` is
   `--control-port` or `--port + 1000`. Under UCX the registered
   `control_address` is EMPTY (a second `ucp_listener` on the same RoCE device

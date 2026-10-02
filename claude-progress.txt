@@ -1,3 +1,11 @@
+Date: 2026-10-02 (5)
+TaskStatus: completed
+Task scope: user "4. 修" (BUG-EN-CONTROL-PORT-REGISTER).
+Current summary: the EN registers --control-port (else advertise port + 1000) on both registration paths; the default is computed only without the flag, so an explicit control port no longer overflows on --port > 64535.
+Verification: see feature_list BUG-EN-CONTROL-PORT-REGISTER notes. Review: opus, applied.
+Main gaps: none for this task. In progress next: report unreachable ENs from reads and the flush barrier (user "3. 同意更多的地方可以报告失败").
+Next steps: review + commit that change; runtime flush wedge on a dead EN awaits the user's choice.
+
 Date: 2026-10-02 (4)
 TaskStatus: completed
 Task scope: user "1. 修复 2. EN的话，retry几次后还不行…上报flush失败…" + "如果PS在drain的阶段，等待flush 失败，那就直接退出就行" (BUG-SYNC-BARRIER-REDIAL; Python docstring fix).

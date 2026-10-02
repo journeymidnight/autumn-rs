@@ -389,8 +389,8 @@ fn a_member_refused_by_an_extent_node_keeps_running() {
         en_dir.to_str().unwrap(),
     ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    // The node registers its control address as its port + 1000 (whatever
-    // `--control-port` says), and that is where the manager polls.
+    // No `--control-port`: the node listens on, and registers, its port +
+    // 1000, which is where the manager polls.
     let en_port = std::iter::repeat_with(pick_port)
         .find(|p| *p < u16::MAX - 1000)
         .unwrap();
