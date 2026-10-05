@@ -76,6 +76,14 @@ impl SstBuilder {
         self.discards = discards;
     }
 
+    /// Raise the table's seq to at least `seq`. A table's seq is the newest seq
+    /// it accounts for, which a compaction output sets to its inputs' newest:
+    /// the entries it dropped were written at those seqs and may still be in
+    /// the log.
+    pub fn cover_seq(&mut self, seq: u64) {
+        self.seq_num = self.seq_num.max(seq);
+    }
+
     /// Add one entry to the SSTable.
     ///
     /// `internal_key` is a MVCC key (user_key ++ 8-byte inverted-seq suffix);

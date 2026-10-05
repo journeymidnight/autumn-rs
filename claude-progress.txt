@@ -1,3 +1,11 @@
+Date: 2026-10-05 (3)
+TaskStatus: completed
+Task scope: user "BUG-COMPACT-SEQ-BELOW-DROPPED" (reproduce, then fix).
+Current summary: reproduced deterministically (major compaction dropping a key's puts + newest tombstone left the output SST's seq below log records; the next open seeded the seq counter low; a whole-log replay let the old tombstone shadow an acked put). Fix: the compaction's final output SST carries max(kept, inputs' newest seq) via SstBuilder::cover_seq. No format change. Test crates/manager/tests/system_compact_seq_below_dropped.rs (keep / kept-nothing / control); ablation red. Reverted an "always emit an output" addition that ablation showed unnecessary. Review: fable, no high; L1 (async compaction could make the test pass vacuously) fixed with a published-output precondition.
+Verification: partition-server lib 275; 16 compaction/replay/merge integration suites green; ablation of cover_seq turns both compaction cases red with the precondition holding.
+Main gaps: data written before this fix may already hold lowered SST seqs (forward-only fix; documented in docs/ops.md). A compaction that keeps nothing and carries no discards emits no table (needs all input log extents punched; not reproduced).
+Next steps: none for this task.
+
 Date: 2026-10-05 (2)
 TaskStatus: completed
 Task scope: user "BUG-MERGE-STALE-SOURCE-DEDUP" → closed as superseded (user choice); new hypothesis recorded.

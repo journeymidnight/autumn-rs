@@ -2968,22 +2968,30 @@ pub(crate) async fn do_compact(
     // when no entry was kept at all (every in-loop emit is followed by adding
     // the entry that triggered it) — a major compaction over a partition whose
     // data was all deleted, the one whose whole log is garbage. The discards
-    // then get an SST of their own with no entries (its seq is 0,
-    // like the MetaBlock recovery reads back: an SST's seq is the newest entry
-    // it holds). The readers skip it — its bloom has no key and it has no
-    // block — and the overlap checks ignore it, having no key out of range.
+    // then get an SST of their own with no entries. The readers skip it — its
+    // bloom has no key and it has no block — and the overlap checks ignore it,
+    // having no key out of range.
+    //
+    // Its seq covers the inputs' newest, not just the newest entry it kept.
+    // The dropped entries were written at those seqs and may still be in the
+    // log; recovery skips log records at or below the tables' max seq and
+    // seeds the seq counter from it. Below them, a later write reuses their
+    // seqs and a whole-log replay brings an old tombstone back over it
+    // (`system_compact_seq_below_dropped`).
     if !current_builder.is_empty() || !discards.is_empty() {
+        let input_seq = tbls.iter().map(|t| t.last_seq).max().unwrap_or(0);
         let mut builder = std::mem::replace(
             &mut current_builder,
             SstBuilder::new(compact_vp_eid, compact_vp_off),
         );
         builder.set_discards(discards.clone());
+        builder.cover_seq(input_seq);
         output_bytes += emit_compact_chunk(
             builder,
             &row_append_tx,
             row_stream_id,
             &rate_ctrl,
-            chunk_last_seq,
+            chunk_last_seq.max(input_seq),
             &mut new_readers,
         )
         .await?;

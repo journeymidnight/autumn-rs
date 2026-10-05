@@ -1346,6 +1346,33 @@ still won't reclaim" case. Guard:
 `crates/manager/tests/system_recovery_vp_seed.rs`. The vp_head is now a true
 content boundary on every path (flush, compaction, and recovery).
 
+### A compaction never lowers the partition's seq
+
+Recovery skips WAL records at or below the loaded SSTs' max seq and starts the
+partition's seq counter there. A major compaction that drops a key's puts and
+its newest tombstone used to write an SST whose seq was only the newest entry it
+kept, below the dropped records that are still in `log_stream`. The next open
+then gave a new put of that key a seq below the old tombstone, and an open that
+had to replay the whole log (its checkpoint cursor gone) let the tombstone hide
+the acknowledged put. A compaction's last output SST now carries the newest seq
+of its inputs. No operator action. Verify:
+
+```bash
+cargo test -p autumn-manager --test system_compact_seq_below_dropped
+```
+
+Three cases: a major compaction that keeps one key, one that keeps nothing, and
+a control without compaction; all must pass.
+
+Data written before this fix: a partition that ran a major compaction under an
+older build may still hold SSTs whose seq is below records in its log, and a
+later compaction cannot raise them (it takes the inputs' already-lowered seq).
+The loss needs an open whose replay walks flushed log, which happens only when
+the checkpoint cursor names an extent no longer in the log stream (replay then
+starts at an SST's older stamp, or with none resolving walks the whole log and
+logs `replaying the WHOLE log stream`). The exposure ends once GC has punched
+the log extents that hold the old tombstones.
+
 ### How much WAL a partition open replays — and why a clean restart replays ~none
 
 Recovery replays the log from the **checkpoint's cursor** (the `vp` in the

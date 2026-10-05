@@ -1015,12 +1015,35 @@ does not ride out on an output SST is gone for good. When every entry is dropped
 (a major compaction over a partition whose data was all deleted — exactly the
 one whose whole log is garbage) there used to be no output and the map was
 thrown away, taking the inputs' earlier discards with it. Now it gets an SST
-with no entries: seq 0, bloom with no key (point reads skip it before any
-block), zero blocks (iterators bounds-check `block_count()`). Its key bounds are
+with no entries: the inputs' seq (next section), bloom with no key (point reads
+skip it before any block), zero blocks (iterators bounds-check `block_count()`). Its key bounds are
 empty, so both overlap checks — at open and in split's re-evaluation — skip
 block-less SSTs; otherwise the empty key reads as out of every range and splits
 are refused. `sstable::reader::discards_only_tests`,
 `crates/manager/tests/system_compact_settles_deletes.rs` (reopen included).
+
+### A table's seq covers what it dropped
+
+INVARIANT: a compaction's final output SST carries `seq_num` (and `last_seq`)
+= max(newest entry it kept, newest INPUT table's seq), via
+`SstBuilder::cover_seq`. Recovery relies on "every record in the log is at or
+below the loaded tables' max seq" twice: replay skips records at or below it,
+and the open seeds `seq_number` from it. A major compaction drops a key's puts
+together with its newest tombstone, and the records are still in the log; with
+the output's seq taken from kept entries only (or 0 for a discards-only output)
+the max fell below them. The next open then handed a new put of that key a seq
+below the old tombstone, and a whole-log replay (no checkpoint cursor or SST
+stamp resolves) let the tombstone through the lowered threshold to shadow the
+acknowledged put. `crates/manager/tests/system_compact_seq_below_dropped.rs`
+(both compaction cases red without `cover_seq`; the no-compaction control
+green either way).
+
+Only the final chunk is raised: chunks of one compaction hold disjoint keys, and
+the inputs are all tables (major) or a run contiguous in `last_seq` (minor), so a
+raised output stays inside the span its inputs already occupied in the table
+order. Not covered: a compaction that keeps no entry AND carries no discard
+emits no table at all. Every flushed SST carries its WAL dead bytes, so that
+needs inputs whose log extents are all already punched; not reproduced.
 
 ### `do_compact` Logic (streaming)
 ```
