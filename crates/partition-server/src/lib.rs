@@ -2771,17 +2771,21 @@ pub struct PartitionServer {
     /// until `retry_after` (exponential backoff, capped); cleared on a
     /// successful open and pruned for partitions no longer assigned.
     open_backoff: Rc<RefCell<HashMap<u64, OpenBackoff>>>,
-    /// BUG-MGR-RETRY-CLASS liveness: set at the top of `shutdown()`.
-    /// Gates `sync_regions_once` so the dead-thread reopen path (below)
-    /// cannot race the graceful drain and resurrect a partition that was
-    /// just drained for process exit. `Cell` suffices — `shutdown()` and
-    /// the region-sync tick both run on the single-threaded main compio
-    /// runtime.
     /// SST block cache for every partition this PS opens. Per-PS, not
     /// process-global: its keys `(extent_id, offset)` are unique only within
     /// one cluster, and one PS serves exactly one cluster.
     block_cache: std::sync::Arc<crate::sstable::BlockCache>,
-    shutting_down: Cell<bool>,
+    /// Set at the top of `shutdown()`; once set, `sync_regions_once` does
+    /// nothing and the heartbeat reports nothing open. MUST be `Rc<Cell>` for
+    /// the same reason as `current_mgr`: region sync and the heartbeat run on
+    /// clones, and a by-value `Cell` left them blind to the shutdown — region
+    /// sync then reloaded a partition the drain had just closed.
+    shutting_down: Rc<Cell<bool>>,
+    /// Held by a `sync_regions_once` pass for its whole run. `shutdown()`
+    /// takes it after setting `shutting_down`, so a pass that was already past
+    /// the flag check finishes (and anything it opened is published) before the
+    /// drain snapshots the partitions; a later pass sees the flag.
+    sync_pass: Rc<futures::lock::Mutex<()>>,
 }
 
 /// Per-partition reopen-backoff state (BUG #3 hardening). See
@@ -3717,8 +3721,9 @@ impl PartitionServer {
                             )),
                             authz: std::sync::Arc::new(crate::authz::AuthzState::new()),
                             open_backoff: Rc::new(RefCell::new(HashMap::new())),
-                            shutting_down: Cell::new(false),
                             block_cache: new_block_cache(),
+                            shutting_down: Rc::new(Cell::new(false)),
+                            sync_pass: Rc::new(futures::lock::Mutex::new(())),
                         };
                         return Ok(server);
                     } else if resp.code == manager_rpc::CODE_NOT_LEADER {
@@ -4298,10 +4303,12 @@ impl PartitionServer {
     }
 
     pub async fn sync_regions_once(&self) -> Result<()> {
-        // BUG-MGR-RETRY-CLASS liveness: during graceful shutdown the
-        // region-sync tick must not run — the dead-thread reopen below
-        // would see a freshly-DRAINED partition thread as "dead" and
-        // resurrect it mid-exit.
+        // During graceful shutdown region sync must not run: the dead-thread
+        // reopen below would see a freshly drained partition thread as dead,
+        // and a changed region tuple would reload a partition the drain closed.
+        // The flag is read under `sync_pass`, which `shutdown()` takes after
+        // setting it, so no pass runs across the drain.
+        let _pass = self.sync_pass.lock().await;
         if self.shutting_down.get() {
             return Ok(());
         }
@@ -4914,10 +4921,9 @@ impl PartitionServer {
     pub async fn shutdown(&self) -> Result<()> {
         use futures::future::join_all;
 
-        // BUG-MGR-RETRY-CLASS liveness: stop the region-sync tick FIRST so
-        // its dead-thread reopen can't resurrect a partition we are about
-        // to drain (both run on this single-threaded runtime, but drains
-        // await across ticks).
+        // Stop region sync FIRST so it cannot reopen a partition we are about
+        // to drain (both run on this single-threaded runtime, but drains await
+        // across ticks). A pass already in flight is waited for below.
         self.shutting_down.set(true);
         // Tell the manager now that nothing here is serving, so a restart's
         // readiness wait cannot read this process's last report as the new
@@ -4953,6 +4959,26 @@ impl PartitionServer {
         }
 
         let timeout = Duration::from_millis(shutdown_timeout_ms());
+
+        // A sync pass that passed its flag check before we set it may still be
+        // waiting on the manager or on an open. Let it finish, so it cannot act
+        // on the regions it fetched after the drain and every partition it
+        // opens is in the snapshot below. An open retries its stream checks
+        // without limit, so the wait has the drain's deadline; past it the drain
+        // goes ahead and the WAL covers whatever that pass opens.
+        {
+            use futures::future::{select, Either};
+            let pass = self.sync_pass.lock();
+            let sleep_fut = compio::time::sleep(timeout);
+            futures::pin_mut!(sleep_fut);
+            if let Either::Right(_) = select(pass, sleep_fut).await {
+                tracing::warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "graceful shutdown: an in-flight region sync did not finish; draining without it",
+                );
+            }
+        }
+
         let part_ids: Vec<u64> = self.partitions.borrow().keys().copied().collect();
 
         tracing::info!(

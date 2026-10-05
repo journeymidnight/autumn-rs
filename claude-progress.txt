@@ -1,3 +1,11 @@
+Date: 2026-10-05 (4)
+TaskStatus: completed
+Task scope: user "BUG-PS-SHUTDOWN-CLONE".
+Current summary: reproduced deterministically, then fixed. PartitionServer.shutting_down was a by-value Cell, so the region-sync and heartbeat clones never saw shutdown; region sync reloaded a partition the drain had closed (dead thread or changed region tuple) and shutdown waited out its join deadline on the new handle. Also a pass already past the flag check acted on regions fetched during the drain. Fix: shutting_down is Rc<Cell>; a sync_pass async mutex is held for each pass and shutdown() takes it after setting the flag, before snapshotting the partitions to drain (bounded by the shutdown timeout, because an open retries its stream checks forever). Test crates/manager/tests/system_ps_shutdown_region_sync.rs (clone sync after shutdown; pass held in get_regions by a pausable proxy while the range changes, plus restart replay < 64 KiB). Both red on HEAD; by-value flag reds only the clone case, no wait reds only the in-flight case.
+Verification: partition-server lib 275; graceful_shutdown, system_restart_replay_cursor, system_merge, system_merge_single_checkpoint, system_range_split, system_ps_failover, system_ps_crash_takeover, system_ps_recovery, system_locked_by_other, system_split_fence_floor, system_multi_split_chain, system_manager_failover green; the original trigger test 10/10. Review: fable, no high; applied doc items (3x deadline bound, heartbeat waits on a pass, ops.md exception wording, paren).
+Main gaps: base_port is also a by-value Cell taken into clones before bind_listen_addr on the port-less connect path; not reachable today (every caller uses connect_with_advertise_and_port), left as is. Worst-case graceful stop is now 3x the shutdown timeout.
+Next steps: none for this task.
+
 Date: 2026-10-05 (3)
 TaskStatus: completed
 Task scope: user "BUG-COMPACT-SEQ-BELOW-DROPPED" (reproduce, then fix).

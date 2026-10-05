@@ -1766,9 +1766,27 @@ making the manager's region map the arbiter that same tick:
 - moved away (rebalance) → not in `wanted` → stays closed. Also self-heals a crashed
   partition thread.
 
-`PartitionServer.shutting_down` (set first thing in `shutdown()`) makes
-`sync_regions_once` a no-op so the dead-thread reopen can't resurrect partitions
-drained for process exit.
+**No region sync across a graceful shutdown.** `PartitionServer.shutting_down`
+(set first thing in `shutdown()`) makes `sync_regions_once` a no-op and empties
+the heartbeat's `open_parts`. Two things make that hold:
+- It is `Rc<Cell<bool>>`, like `current_mgr`: region sync and the heartbeat run
+  on CLONES of the server, and a by-value `Cell` never told them about the
+  shutdown. Region sync then reopened a partition the drain had just closed —
+  through the dead-thread path above, or because its region tuple changed — and
+  `shutdown()` waited out its thread-join deadline on the new handle.
+- A pass already past its flag check would act on the regions it fetched after
+  the drain. Each pass holds `sync_pass` (an async mutex) for its whole run, and
+  `shutdown()` takes it after setting the flag and before snapshotting the
+  partitions to drain, so the in-flight pass finishes first and anything it
+  opened is drained with the rest. An open retries its stream checks without
+  limit, so that wait has the drain's deadline (`SHUTDOWN_TIMEOUT_MS`); past it
+  the drain proceeds and the WAL covers what the pass opens. So a stop spends
+  the drain's deadline up to three times before `graceful shutdown: complete`
+  (pass wait, drain, thread join): 180 s at the default. The lock also
+  serializes the heartbeat's re-register sync with the 2 s tick.
+`crates/manager/tests/system_ps_shutdown_region_sync.rs`: a clone's sync after
+shutdown (red with a by-value flag), and a pass held in its `get_regions` call by
+a pausable proxy while the region changes under it (red without the wait).
 
 ## Heartbeat must outlive `sync_regions_once`
 
@@ -1784,6 +1802,8 @@ BEFORE the (potentially 10+ s with hundreds of MiB unflushed WAL) `sync_regions_
 the PS, leaving every region's `ps_addr` permanently `unknown`. `heartbeat_loop` also
 decodes the manager `CodeResp`: on `CODE_NOT_FOUND` (unknown `ps_id`) it WARN-logs and
 re-runs `register_ps` + `sync_regions_once`, so a transient eviction self-heals.
+That re-sync takes `sync_pass` like any pass, so while a tick's pass (opens
+included) runs, the heartbeat task waits for it and sends no beat.
 
 ## Data-plane authz enforcement (`authz.rs`)
 
@@ -2493,7 +2513,7 @@ Three fixes bound the restart replay window (worst case per partition =
     (a) `PartitionServer.current_mgr` is `Rc<Cell<usize>>` (the struct is cloned once per
     supervised loop; a plain Cell gives each loop a PRIVATE rotation index, so only
     heartbeat's rotates while region_sync + part_addr self-heal hammer the dead manager
-    forever).
+    forever; `shutting_down` is `Rc<Cell>` for the same reason).
     (b) Every StreamClient manager RPC routes through `manager_call` (rotate on transport
     failure) or `retry_manager_call`; decode sites call `note_manager_code` (rotate on
     CODE_NOT_LEADER). Never add a raw `pool.call_timeout(self.manager_addr(), ..)` site.

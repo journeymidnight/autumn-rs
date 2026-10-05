@@ -1392,13 +1392,21 @@ grep "log replay done" <ps.log>
 `records_covered` after a clean stop would mean the start was pulled back again.
 The drain's own outcome is in the stopping PS's log, one line per partition:
 `graceful shutdown: drained`, `graceful shutdown: flush failed ... replay on
-restart: <error>`, or `graceful shutdown: drain timed out`.
+restart: <error>`, or `graceful shutdown: drain timed out`. After
+`graceful shutdown: complete` the stopping PS logs no `opening partition` /
+`reloading partition` line: region sync stops for the drain, after waiting for
+a pass already running. The one exception is a pass that outlived the drain's
+deadline, announced by `an in-flight region sync did not finish; draining
+without it`; it may still open a partition afterwards, and the WAL covers it.
+Any other reopen there means the drain closed a partition and region sync
+started it again.
 
 Manual check (any cluster): put a few keys and stop/start the PS once (the drain
 makes an early SST), put ~60 x 1 MiB, SIGTERM the PS, start it, then:
 `grep "log replay done" <ps.log> | tail` must show `bytes` near 0 for the
 partition holding the data. Regression tests:
-`crates/manager/tests/system_restart_replay_cursor.rs`.
+`crates/manager/tests/system_restart_replay_cursor.rs`,
+`crates/manager/tests/system_ps_shutdown_region_sync.rs`.
 
 ### Row-stream truncation never drops an SST the checkpoint lists
 
