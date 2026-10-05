@@ -1058,6 +1058,17 @@ Then run the two judgements, which differ ONLY in whether a floor is carried:
   log, the extent leaves `info --full`, and `df` drops to `0 B`. Reclaiming a
   16 GiB extent relocates ~14.6 GiB of live values; budget ~7 min.
 
+GC refuses to punch an extent it could not read completely: the PS log shows
+`run_gc extent N: short read at <off>: wanted W, got G; refusing to punch` (or
+`scanned X of L bytes` / `trailing bytes ... refusing to punch`) and the extent
+stays in `info --full`. It means a replica's `.dat` is shorter than the sealed
+length (lost tail, wiped file, torn write). Nothing is lost by the refusal:
+restore or rebuild the short replica from a healthy copy, and a later GC cycle
+collects the extent. Manual check, on a test cluster: seal a log
+extent, stop its nodes, truncate each replica's `extent-<id>.dat`, start the
+nodes again on the same dirs, `autumn-op gc <PART>`; the extent must still be
+listed. Automated: `cargo test -p autumn-manager --test system_gc_truncated_replica`.
+
 Unattended, the same thing happens through `auto-policy activate gc-only
 --arm`: the advisory needs the debt sustained over 5 buckets (~5 min at the
 default 60 s bucket), logs `GC primary=<PART> ... reason='gc_debt_bytes>...
@@ -1182,6 +1193,16 @@ curl -s http://127.0.0.1:9591/metrics   # manager: leader/serving + streams/exte
 curl -s http://127.0.0.1:9701/metrics   # PS: per-partition requests_total (monotonic), size/gc-debt/pending-compaction bytes, gc/compact inflight, sealed log extents
 curl -s http://127.0.0.1:9601/metrics   # EN: append batches/bytes/ns totals, extents per shard + total, per-disk online
 ```
+
+EN refusals: `autumn_en_auth_rejects_total{class="opcode_denied|peer_auth|client_read|client_token"}`
+counts connections/frames the EN refused (a Client sending a member op, a Peer
+that fails PEER_AUTH, a direct read without a valid principal, a refused
+`CLIENT_AUTH` token). A rising `peer_auth` means a process with the wrong
+`--cluster-secret-file` (it also counts a peer that vanished or timed out
+mid-handshake, so a lone tick is not a verdict); a rising `opcode_denied` means something is sending
+non-read ops on a Client connection. Manual check:
+`cargo test -p autumn-server --test cluster_secret` (scrapes both counters from a
+real EN started with `--metrics-port`).
 
 PS latency histograms (LAT-1): `autumn_ps_write_duration_seconds` (group-commit end-to-end across ALL write ops — Put/Delete —
 observed per batched op from the already-measured WriteLoopMetrics

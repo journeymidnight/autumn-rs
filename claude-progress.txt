@@ -1,3 +1,11 @@
+Date: 2026-10-05 (8)
+TaskStatus: completed
+Task scope: user "F-EN-WIRE-AUTH + F-REVIEW-R1-GC-COMPLETE-SCAN验收".
+Current summary: both accepted, passes:true (entries kept in feature_list with notes; user may delete). F-EN-WIRE-AUTH: new EN counters autumn_en_auth_rejects_total{class=opcode_denied|peer_auth|client_read|client_token} (process-global atomics, bumped only on refusal paths); threat-model section in docs/data_plane_authz_design.md; ops.md + stream CLAUDE.md updated. Deviation noted in the ledger: the admission gate itself predated this task (cluster-secret work); this adds the metrics and proof. F-REVIEW-R1: no production change; new e2e system_gc_truncated_replica.rs (both replicas truncated to empty / record boundary / mid-record, .ck kept or dropped, ENs restarted on the same port so they answer short with CODE_OK, FORCE_GC must refuse, then bytes restored -> relocate + punch -> SIGKILL PS -> byte-for-byte reopen). A live EN errors on a truncated .dat (in-memory length is longer), so only a restarted EN reproduces the short-OK shape.
+Verification: stream lib 229 (client_direct_read_auth 6), cluster_secret 4 (real EN scraped), system_gc_truncated_replica 5 cases green; ablation (accept short chunk + drop ensure_gc_scan_complete) turns all 5 red; counter ablation turned 4 stream tests red. Regressions green: partition-server lib 274, system_gc_chunked_read, system_gc_multiversion_same_extent, system_gc_inflight_wal_put, client_wire_admission. Review: fable, no high; applied: assert code OK after refused Client FENCE, peer_auth wording (also counts mid-handshake disconnect/timeout), live-node wording, PEER_AUTH-needs-installed-secret note.
+Main gaps: GC e2e refusal check is a fixed 3 s sleep then asserts E0 still in the stream (red-proof by ablation, but a slow GC could false-green); op_id 0 so no outcome message is asserted. EN reject counters are not per-peer.
+Next steps: none for this task; F-STREAM-ATREST-CKSUM EC .shard content check remains open.
+
 Date: 2026-10-05 (7)
 TaskStatus: completed
 Task scope: user — ledger cleanup (delete passes:true entries; F-STREAM-ATREST-CKSUM status stale).

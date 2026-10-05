@@ -154,6 +154,40 @@ pub(crate) static EN_APPEND_TOTALS: EnAppendTotals = EnAppendTotals {
     ns: std::sync::atomic::AtomicU64::new(0),
 };
 
+/// Why the EN refused a connection or a request on authentication grounds.
+/// Counted on the refusal path only, so the admitted path pays nothing.
+#[derive(Clone, Copy)]
+enum EnReject {
+    /// A connection called an opcode its (service, role) may not call.
+    OpcodeDenied,
+    /// A Peer/Admin connection did not prove the cluster secret.
+    PeerAuth,
+    /// A Client read refused: authz is on and the connection bound no principal.
+    ClientRead,
+    /// `CLIENT_AUTH` refused the presented capability token.
+    ClientToken,
+}
+
+impl EnReject {
+    const ALL: [(EnReject, &'static str); 4] = [
+        (EnReject::OpcodeDenied, "opcode_denied"),
+        (EnReject::PeerAuth, "peer_auth"),
+        (EnReject::ClientRead, "client_read"),
+        (EnReject::ClientToken, "client_token"),
+    ];
+}
+
+static EN_REJECTS: [std::sync::atomic::AtomicU64; 4] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn note_reject(class: EnReject) {
+    EN_REJECTS[class as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub struct EnShardGauges {
     shard_idx: u32,
     extents: std::sync::atomic::AtomicU64,
@@ -202,6 +236,15 @@ pub fn render_en_metrics() -> String {
         &[],
         EN_APPEND_TOTALS.ns.load(Relaxed) as f64,
     );
+    push_type(&mut out, "autumn_en_auth_rejects_total", "counter");
+    for (class, name) in EnReject::ALL {
+        push_metric(
+            &mut out,
+            "autumn_en_auth_rejects_total",
+            &[("class", name.to_string())],
+            EN_REJECTS[class as usize].load(Relaxed) as f64,
+        );
+    }
     let slots: Vec<std::sync::Arc<EnShardGauges>> = {
         let mut guard = EN_SHARD_GAUGES.lock().unwrap();
         // Prune slots whose ExtentNode has dropped (coco P2).
@@ -2330,6 +2373,7 @@ async fn process_frames_backpressured(
         match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
             Some(frame) if frame.req_id != 0 => {
                 if let Err(e) = protocol.check_opcode(frame.msg_type) {
+                    note_reject(EnReject::OpcodeDenied);
                     tx_bufs.push(err_bytes(
                         frame.req_id,
                         frame.msg_type,
@@ -4583,7 +4627,12 @@ impl ExtentNode {
             return authz
                 .admit_read(principal.as_ref(), now)
                 .err()
-                .map(|(code, m)| err_bytes(frame.req_id, frame.msg_type, code, m));
+                .map(|(code, m)| {
+                    if code == StatusCode::PermissionDenied {
+                        note_reject(EnReject::ClientRead);
+                    }
+                    err_bytes(frame.req_id, frame.msg_type, code, m)
+                });
         }
         let (code, message) = if frame.payload.len() > autumn_rpc::partition_rpc::CLIENT_AUTH_MAX_PAYLOAD
         {
@@ -4595,7 +4644,12 @@ impl ExtentNode {
                         *principal = bound;
                         (StatusCode::Ok, String::new())
                     }
-                    Err(refusal) => refusal,
+                    Err(refusal) => {
+                        if refusal.0 == StatusCode::PermissionDenied {
+                            note_reject(EnReject::ClientToken);
+                        }
+                        refusal
+                    }
                 },
                 Err(e) => (StatusCode::InvalidArgument, format!("bad CLIENT_AUTH: {e}")),
             }
@@ -6123,14 +6177,18 @@ impl ExtentNode {
             &peer,
         )
         .await?;
-        autumn_rpc::peer_auth::accept(
+        if let Err(e) = autumn_rpc::peer_auth::accept(
             &mut reader,
             &mut writer,
             &protocol,
             autumn_rpc::peer_auth::installed(),
             &peer,
         )
-        .await?;
+        .await
+        {
+            note_reject(EnReject::PeerAuth);
+            return Err(e.into());
+        }
         // Bound by CLIENT_AUTH on a Client connection (see `client_gate`).
         let mut principal: Option<autumn_rpc::cap_token::BoundPrincipal> = None;
         let mut decoder = FrameDecoder::new();
@@ -16397,6 +16455,85 @@ mod client_direct_read_auth_tests {
         *node.client_authz.borrow_mut() = authz_on();
         let peer = crate::ConnPool::new();
         assert_eq!(&read(&peer, &addr).await.unwrap()[..], PAYLOAD);
+    }
+
+    /// The counter of one refusal class, from the EN's own `/metrics` text.
+    fn rejects(class: &str) -> u64 {
+        let line = format!("autumn_en_auth_rejects_total{{class=\"{class}\"}} ");
+        render_en_metrics()
+            .lines()
+            .find_map(|l| l.strip_prefix(&line))
+            .unwrap_or_else(|| panic!("no {class} counter"))
+            .trim()
+            .parse::<f64>()
+            .unwrap() as u64
+    }
+
+    /// The counters are process-global and sibling tests refuse reads too, so
+    /// a class is judged by how far it rose, never by its value.
+    #[compio::test]
+    async fn a_client_connection_cannot_reach_a_mutating_op_and_the_refusal_is_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, addr) = served_node(dir.path()).await;
+        let client = crate::ConnPool::with_role(Role::Client);
+        let before = rejects("opcode_denied");
+
+        let delete = autumn_rpc::manager_rpc::rkyv_encode(&DeleteExtentReq {
+            extent_id: 1,
+            node_uuid: String::new(),
+        });
+        let fence = FenceExtentReq { extent_id: 1, owner_epoch: 99 }.encode();
+        let append = AppendReq {
+            extent_id: 1,
+            eversion: 1,
+            commit: 0,
+            owner_epoch: 1,
+            payload: Bytes::from_static(b"injected"),
+        }
+        .encode();
+        for (op, payload) in [(MSG_DELETE_EXTENT, delete), (MSG_FENCE_EXTENT, fence), (MSG_APPEND, append)] {
+            let e = client.call(&addr, op, payload).await.expect_err("a Client reached a member op");
+            assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "op {op}: {e:#}");
+        }
+        assert!(
+            rejects("opcode_denied") >= before + 3,
+            "three refused member ops must all be counted"
+        );
+
+        // None of them ran: the extent is still there, unfenced (the owner
+        // epoch 1 writer still appends), and holds exactly what it did.
+        let peer = crate::ConnPool::new();
+        assert_eq!(&read(&peer, &addr).await.unwrap()[..], PAYLOAD);
+        let append = AppendReq {
+            extent_id: 1,
+            eversion: 1,
+            commit: PAYLOAD.len() as u64,
+            owner_epoch: 1,
+            payload: Bytes::from_static(b"!"),
+        };
+        let resp = AppendResp::decode(
+            peer.call(&addr, MSG_APPEND, append.encode()).await.expect("append after a refused Client FENCE"),
+        )
+        .unwrap();
+        assert_eq!(resp.code, CODE_OK, "a refused FENCE must leave the owner epoch alone");
+        drop(node);
+    }
+
+    #[compio::test]
+    async fn refused_reads_and_tokens_are_counted_by_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, addr) = served_node(dir.path()).await;
+        *node.client_authz.borrow_mut() = authz_on();
+        let (read_before, token_before) = (rejects("client_read"), rejects("client_token"));
+
+        let anonymous = crate::ConnPool::with_role(Role::Client);
+        read(&anonymous, &addr).await.expect_err("anonymous read served");
+        assert!(rejects("client_read") > read_before, "an unbound read is a client_read refusal");
+
+        let forged = crate::ConnPool::with_role(Role::Client);
+        forged.set_auth_token(Some(token([1; 32], autumn_rpc::cap_token::now_secs() + 3600)));
+        read(&forged, &addr).await.expect_err("forged token admitted");
+        assert!(rejects("client_token") > token_before, "a bad token is a client_token refusal");
     }
 }
 

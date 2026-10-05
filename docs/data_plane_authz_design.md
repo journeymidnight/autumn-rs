@@ -226,6 +226,30 @@ descriptor 前做 `check_key`，但 EN 收到的只是坐标，不知道它属�
 - **集群成员（Peer）**：EN 之间、PS 到 EN 的连接不发 CLIENT_AUTH，它们由集群密钥
   认证（`cluster_secret_design.md`），可以调用 EN 的全部接口。
 
+### EN 破坏性 op 的威胁模型
+
+直读给了 client 一个能到 EN 的 TCP 地址，这条连接不能顺带变成写/删面。EN 把对端
+分三类：
+
+- **Client 角色**（VERSION_HELLO 声明）：只许 `READ_BYTES` / `READ_BYTES_BULK` /
+  `CLIENT_AUTH`（`check_opcode`，每帧检查）。`APPEND` / `COMMIT_LENGTH` /
+  `DELETE_EXTENT` / `FENCE_EXTENT` / `ALLOC_EXTENT` / `COPY_EXTENT` /
+  `CONVERT_TO_EC` / `WRITE_SHARD` 等其余操作一律 `PermissionDenied`，请求不会被
+  解码，更不会执行。
+- **Peer / Admin 角色**：VERSION_HELLO 之后必须过 PEER_AUTH（集群密钥 HMAC 挑战），
+  通过才开放全部 EN opcode。伪造角色没有用：声明 Peer 却拿不出密钥的连接在第一个
+  业务帧之前就被拒。（只在装了集群密钥时才有这道关；生产二进制没有密钥拒绝启动。）
+- 没有 per-node token：破坏性 op 的准入凭据就是集群密钥，持有者（manager / PS / EN
+  / 运维）本来就是可信计算基。client 持有的 cap token 只能换来直读，与它们无关。
+
+不防的：持有集群密钥的进程被攻破（见 §9，密钥即信任根）；Client 通过 EN 直读读到
+别的 tenant 的 extent（§10）。
+
+拒绝按类计数，EN `/metrics` 的 `autumn_en_auth_rejects_total{class}`：`opcode_denied`
+（Client 发了不许发的 op）、`peer_auth`（PEER_AUTH 握手失败：密钥不符，或对端在握手中途断开/超时）、`client_read`（authz 开启，
+读请求没有有效 principal）、`client_token`（`CLIENT_AUTH` 的 token 被拒）。`Unavailable`
+（EN 还没拿到 authz 配置）不是拒绝，不计数。只在拒绝路径上累加，放行路径零开销。
+
 ## 11. 参照
 
 FoundationDB tenant authorization（非对称 JWT，storage 层验，不可撤销靠短 TTL）；

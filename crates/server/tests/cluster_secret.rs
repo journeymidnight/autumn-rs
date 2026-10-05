@@ -10,6 +10,7 @@ use std::net::{SocketAddr, TcpListener};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use autumn_rpc::extent_rpc::MSG_DELETE_EXTENT;
 use autumn_rpc::manager_rpc::{MSG_GET_CLUSTER_ID, MSG_NAMESPACE_CREATE, MSG_NAMESPACE_LIST};
 use autumn_rpc::peer_auth::ClusterSecret;
 use autumn_rpc::version_hello::{Hello, Role, Service};
@@ -117,6 +118,23 @@ fn refused(r: &Result<(ReadHalf, WriteHalf), RpcError>, needle: &str) {
     }
 }
 
+/// One class of `autumn_en_auth_rejects_total` from an extent node's /metrics.
+fn en_rejects(metrics_port: u16, class: &str) -> u64 {
+    use std::io::{Read, Write};
+    wait_port_open(metrics_port);
+    let mut conn = std::net::TcpStream::connect(("127.0.0.1", metrics_port)).unwrap();
+    conn.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").unwrap();
+    let mut body = String::new();
+    conn.read_to_string(&mut body).unwrap();
+    let line = format!("autumn_en_auth_rejects_total{{class=\"{class}\"}} ");
+    body.lines()
+        .find_map(|l| l.strip_prefix(&line))
+        .unwrap_or_else(|| panic!("no {class} counter in:\n{body}"))
+        .trim()
+        .parse::<f64>()
+        .unwrap() as u64
+}
+
 fn run_op(args: &[&str]) -> std::process::Output {
     Command::new(AUTUMN_OP_BIN)
         .args(args)
@@ -178,11 +196,13 @@ fn members_and_operators_must_prove_the_secret() {
     ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let en_port = pick_port();
+    let metrics_port = pick_port();
     let en_log = tmp.0.join("en.log");
     let _en = ChildGuard(
         Command::new(EXTENT_NODE_BIN)
             .args(["--cluster-secret-file", secret_arg])
             .args(["--port", &en_port.to_string(), "--listen", "127.0.0.1"])
+            .args(["--metrics-port", &metrics_port.to_string()])
             .args(["--control-port", &pick_port().to_string()])
             .args(["--data", en_dir.to_str().unwrap()])
             .args(["--manager", &mgr_addr])
@@ -240,6 +260,26 @@ fn members_and_operators_must_prove_the_secret() {
             .unwrap();
         let reply = call(&mut rd, &mut wr, MSG_GET_CLUSTER_ID, Bytes::new()).await;
         assert!(!reply.is_error(), "Client get-cluster-id refused");
+
+        // A Client reaches an extent node without any proof, but only its
+        // read ops: a destructive one is refused and counted.
+        let before = (en_rejects(metrics_port, "opcode_denied"), en_rejects(metrics_port, "peer_auth"));
+        let (mut rd, mut wr) = open(en, Service::ExtentNode, Role::Client, None)
+            .await
+            .unwrap();
+        let reply = call(&mut rd, &mut wr, MSG_DELETE_EXTENT, Bytes::new()).await;
+        assert_eq!(
+            RpcError::decode_status(&reply.payload).0,
+            StatusCode::PermissionDenied,
+            "a Client ran DELETE_EXTENT"
+        );
+        assert_eq!(en_rejects(metrics_port, "opcode_denied"), before.0 + 1);
+        // A Peer holding the wrong secret never reaches a frame: counted too.
+        refused(
+            &open(en, Service::ExtentNode, Role::Peer, Some(&secret(WRONG))).await,
+            "different secrets",
+        );
+        assert_eq!(en_rejects(metrics_port, "peer_auth"), before.1 + 1);
     });
 
     // The refusing side names the refused peer, so a misconfigured process can

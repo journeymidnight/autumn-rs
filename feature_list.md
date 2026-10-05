@@ -54,8 +54,9 @@
 - **Trigger**: review.md R1；提前 EOF 或 record 边界短读可绕过 carry 检查并误 punch。
 - **Scope**: 每次读取必须满足 want，punch 前检查 sealed_length 和 carry。
 - **Acceptance**: 截短到 0/record 边界、有无 checksum 均拒绝 punch 或完整搬迁；重启逐字节验证 live VP。
-- `passes: false`
+- `passes: true` (2026-10-05)
 - **notes** (2026-09-20): 已实现逐次 want 精确长度校验和 punch 前 sealed_length/carry 双重校验；5 条 GC streaming 单测通过，新增完整 record 边界及 offset=0 提前 EOF 回归。尚未完成真实双副本截短、checksum 两种状态及 PS 硬重启组合验收，不能按完整 R1 验收关闭。
+- **notes** (2026-10-05): 组合验收完成：`crates/manager/tests/system_gc_truncated_replica.rs`（真实 manager + 双 EN + 子进程 PS；两副本截短为空/record 边界/record 中间 × 有无 `.ck`；重启 EN 使其按截短文件应答短 OK；强制 GC 拒绝 punch；还原后 GC 完整搬迁并 punch；逐字节验证后 SIGKILL PS 重开再验）5 例通过。消融（短读 break + 去掉 `ensure_gc_scan_complete` 的两项检查）5 例全红于 “GC punched E0 from a truncated replica”。存活 EN 对截短 `.dat` 返回内部错误（按内存长度读），不是短 OK——只截文件不重启复现不了，测试因此重启 EN。无生产代码改动。
 
 ### F-REVIEW-T3-REAL-CRASH — P2 crash 测试真正停止旧 runtime
 - **Trigger**: review.md T3；drop RpcClient 不等于杀 PS/EN。
@@ -200,7 +201,15 @@
   `MSG_FENCE_EXTENT` 等被拒且按类上报 metric；持 token 的 PS/manager 数据路径行为
   逐字节不变（建连多一次验签，吞吐回归不劣化）；authz 未配置时行为与现状完全一致；
   消融测试在无 gate 时变红。
-- **Status**: `passes: false` (2026-09-27) — 仅记录，未开始。
+- **Status**: `passes: true` (2026-10-05) — 由另一机制满足，与上文"节点 token"形状不同：实际落地的是集群密钥
+  PEER_AUTH（Peer/Admin 连接须过 HMAC 挑战）加按角色的 `check_opcode`（EN 上 Client 角色只放行
+  `MSG_READ_BYTES` / `MSG_READ_BYTES_BULK` / `MSG_CLIENT_AUTH`），没有签发节点 token、没有 Ed25519 路径。
+  本次补齐验收所缺：`autumn_en_auth_rejects_total{class=opcode_denied|peer_auth|client_read|client_token}`
+  （仅拒绝路径计数，接受路径零新增）；进程内测试（Client 发 DELETE/FENCE/APPEND 被拒、extent 完好、计数递增）
+  与真实二进制测试（`crates/server/tests/cluster_secret.rs`，Client 发 DELETE_EXTENT、错密钥 Peer 被拒且计数）；
+  消融（EN 的 Client 角色放行全部已知 opcode）4 例变红；威胁模型已写入 `data_plane_authz_design.md`。
+  与原 Acceptance 的差异：“authz 未配置时行为与现状完全一致”不再字面成立——集群密钥是必选项，未带密钥的
+  Peer/Admin 连接被拒；“持节点 token 的 PS/manager”对应为持集群密钥的 PS/manager。
 
 ### BUG-KVC-POOLNAME-STR — `str(PoolName.KV)` 在 py≥3.11 得到 `'PoolName.KV'` 而非 `'kv'`
 - **Trigger** (2026-09-04, fable 评审 L3 接口解析改动时顺带发现，**在本次改动之外**):

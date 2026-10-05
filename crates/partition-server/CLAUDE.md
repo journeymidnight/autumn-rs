@@ -1385,6 +1385,22 @@ state and reclaims it. We EVICT, not synthesize `sealed_length = seal_commit` lo
 (the manager's `already_sealed` branch keeps the existing `L ≥ seal_commit`, so a
 synthesized smaller value would make GC punch committed `[seal_commit, L)`).
 
+INVARIANT (GC punches only after PROVING it scanned the whole extent): `run_gc`
+reads exactly `want = min(sealed_length - cur, chunk)` bytes per chunk and a
+short answer is an error, because an extent node whose `.dat` was truncated
+answers a read past its end with code OK and a short (or empty) payload, which
+`StreamClient` hands back without failing over, and the `.ck` sidecar can vouch
+only for whole blocks. Stopping on a record boundary (or at offset 0) leaves an
+empty carry, so the trailing-partial-record check alone passes; hence
+`ensure_gc_scan_complete` also requires `scanned == sealed_length` before
+`punch_holes`. Relocation without a complete scan would drop every live VP the
+scan never saw. A LIVE node refuses such a read with an internal error (its in-memory
+length still exceeds the file, so the pread fails), so the short-OK shape only
+appears after the node restarted and loaded its length from the shortened file.
+`crates/manager/tests/system_gc_truncated_replica.rs` (both replicas truncated
+three ways, with and without `.ck`, nodes restarted; refuse, then restore,
+relocate, punch, SIGKILL the PS, verify byte for byte).
+
 INVARIANT (GC liveness is FULL VP identity, not extent_id): a scanned record is the
 live version of its key ONLY if the current live VP matches `extent_id` AND `offset`
 AND `len` — it points at THIS record's exact bytes. Comparing `vp.extent_id` alone

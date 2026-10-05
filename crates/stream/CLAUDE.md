@@ -372,6 +372,18 @@ and a keyring lookup per read frame, only on Client connections with authz on.
 Tests: `client_direct_read_auth_tests` (anonymous / forged / expired / valid /
 revoked kid / Unknown / Off / member connection).
 
+**Refusal counters.** `EN_REJECTS` (process-global atomics, bumped only on the
+refusal paths via `note_reject`) feed `autumn_en_auth_rejects_total{class}` in
+`render_en_metrics`: `opcode_denied` (`check_opcode` refused a frame),
+`peer_auth` (any failed PEER_AUTH handshake in `handle_connection`: wrong secret, or a peer that vanished / timed out mid-handshake), `client_read` (authz-On
+read without a valid principal), `client_token` (`CLIENT_AUTH` token refused).
+`Unavailable` answers are not counted. Tests: `a_client_connection_cannot_reach_a_mutating_op_and_the_refusal_is_counted`
+(Client `DELETE_EXTENT` / `FENCE_EXTENT` / `APPEND` refused, counter +3, extent
+untouched and unfenced), `refused_reads_and_tokens_are_counted_by_class`, and the
+real-binary `cluster_secret.rs::members_and_operators_must_prove_the_secret`
+(`opcode_denied` and `peer_auth` scraped from a running EN). The counters are
+process-global, so in-process tests compare deltas with `>=` (never `==`).
+
 **`ConnPool::set_auth_token`**: a pool that holds a token sends `CLIENT_AUTH` on
 every connection it opens, right after the handshake and before pooling it
 (`CLIENT_AUTH to <addr>` context, deliberately not `connect <addr>`: the address

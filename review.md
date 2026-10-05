@@ -30,6 +30,8 @@ run_gc 已有 CRC 错误即终止、尾部不完整 record 即拒绝 punch 的�
 
 **应补测试：** extent 含 live VP，截短一个副本到 0 及完整 record 边界；固定读路由命中短副本；ForceGC 后断言完整搬迁或拒绝 punch，再杀 PS、重开并逐字节验证。故障要在已有 checksum 和没有 checksum 两种状态各测一次。
 
+**状态（2026-10-05）：已修并有端到端验收。** run_gc 每个 chunk 要求读满 want、punch 前要求 scanned==sealed_length 且无尾部残片（`ensure_gc_scan_complete`）。`crates/manager/tests/system_gc_truncated_replica.rs`：两副本都截短（空 / record 边界 / record 中间）× 有无 `.ck`，重启 EN 使其按截短文件应答短 OK，强制 GC 必须拒绝、E0 留在 log stream；还原文件后 GC 完整搬迁并 punch，逐字节验证，再 SIGKILL PS 重开后复验。消融（短读 break + 去掉完整性检查）5 例全红于“GC punched E0 from a truncated replica”。注意：存活的 EN 对截短的 `.dat` 返回内部错误而非短 OK（内存长度更长），所以只截文件不重启复现不了本条。
+
 ### R2 — [P1] Recovery 的“attempt identity”实际只比较节点组合，存在 ABA
 
 **位置：** [recovery.rs:200](crates/manager/src/recovery.rs#L200)、[recovery.rs:892](crates/manager/src/recovery.rs#L892)、[extent_rpc.rs:839](crates/rpc/src/extent_rpc.rs#L839)、[extent_node.rs:9130](crates/stream/src/extent_node.rs#L9130)。
