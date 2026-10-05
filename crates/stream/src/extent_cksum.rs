@@ -70,6 +70,40 @@ pub(crate) struct ExtentChecksums {
 }
 
 impl ExtentChecksums {
+    /// The description of no content yet, to be grown with `append`.
+    pub(crate) fn empty(block_bytes: u64) -> Self {
+        Self {
+            sealed_length: 0,
+            block_bytes,
+            blocks: Vec::new(),
+        }
+    }
+
+    /// Extend this description by `data`, written at `sealed_length`.
+    ///
+    /// For content that is written once, in order, by a path that already holds
+    /// the bytes: an EC shard arrives a stripe at a time, and hashing each stripe
+    /// as it lands describes the shard without reading it back. Stripe and
+    /// block boundaries need not agree — a short last block is carried as the
+    /// CRC of its prefix and finished by the next call, since
+    /// `crc32c_append(crc32c(a), b) == crc32c(a ++ b)`. The result after any
+    /// sequence of appends is exactly what hashing the concatenation in one go
+    /// produces.
+    pub(crate) fn append(&mut self, mut data: &[u8]) {
+        let fill = self.sealed_length % self.block_bytes;
+        if fill != 0 && !data.is_empty() {
+            let take = ((self.block_bytes - fill) as usize).min(data.len());
+            let last = self.blocks.last_mut().expect("a partial block has a CRC");
+            *last = crc32c::crc32c_append(*last, &data[..take]);
+            self.sealed_length += take as u64;
+            data = &data[take..];
+        }
+        for block in data.chunks(self.block_bytes as usize) {
+            self.blocks.push(crc32c(block));
+            self.sealed_length += block.len() as u64;
+        }
+    }
+
     pub(crate) fn encode(&self, extent_id: u64) -> Vec<u8> {
         let mut buf =
             Vec::with_capacity(CK_HEADER_BYTES + self.blocks.len() * 4 + CK_TRAILER_BYTES);
@@ -273,6 +307,32 @@ mod tests {
         rot[100] ^= 0x01;
         assert_eq!(ck.verify_read(0, &rot[0..512]), Ok(0));
         assert!(ck.verify_read(0, &rot).is_err(), "the full read still catches it");
+    }
+
+    /// Growing a description piece by piece must land on exactly what hashing
+    /// the whole content does, wherever the pieces happen to split — inside a
+    /// block, on a boundary, or several blocks at once.
+    #[test]
+    fn appending_in_any_pieces_matches_hashing_the_whole() {
+        let content: Vec<u8> = (0..10_000u32).map(|i| (i * 31 % 257) as u8).collect();
+        let whole = checksums_over(&content, 1024);
+        for cuts in [
+            vec![10_000],
+            vec![1024, 2048, 10_000],
+            vec![1, 1023, 1024, 1025, 5000, 9999, 10_000],
+            vec![700, 1400, 2100, 9000, 10_000],
+        ] {
+            let mut ck = ExtentChecksums::empty(1024);
+            let mut at = 0usize;
+            for end in cuts.iter().copied() {
+                ck.append(&content[at..end]);
+                at = end;
+            }
+            assert_eq!(ck, whole, "cuts {cuts:?}");
+        }
+        let mut ck = ExtentChecksums::empty(1024);
+        ck.append(&[]);
+        assert_eq!(ck, checksums_over(&[], 1024), "nothing appended is the empty description");
     }
 
     /// A read starting past the first block must not mis-index its blocks.

@@ -1,9 +1,10 @@
 # At-rest integrity for stream-layer content
 
-## What is protected today, and what is not
+## What is protected, and by what
 
-Every layer that owns a byte format checksums it. The stream layer does not own
-one — it stores opaque bytes — and that is where the hole is.
+Every layer that owns a byte format checksums it. The stream layer owns none —
+it stores opaque bytes — so its content is described by sidecars written beside
+the files that hold it.
 
 | bytes | checksum | verified at | reference |
 |---|---|---|---|
@@ -12,11 +13,11 @@ one — it stores opaque bytes — and that is where the hole is.
 | partition WAL record | CRC32C **including the value** | replay | `crates/partition-server/src/wal_record.rs:220` |
 | partition SST block | CRC32C, compared on read | every block read | `crates/partition-server/src/sstable/format.rs:134`, `:254` |
 | stream `.meta` | CRC32C over the 48 metadata bytes | `parse_meta` | `crates/stream/src/extent_node.rs:4212` |
-| stream `.dat` content | **none** | — | — |
-| stream `.shard{i}` content | **none** | — | — |
+| stream `.dat` content | CRC32C per 1 MiB block, `extent-{id}.ck` | whole-block reads, recovery source reads, before EC encode, scrub | `crates/stream/src/extent_cksum.rs` |
+| stream `.shard{i}` content | CRC32C per 1 MiB block, `extent-{id}.shard{i}.ck` | whole-block reads, EC rebuild source reads, scrub | `describe_shard_stripe` in `extent_node.rs` |
 | background scrub | per-shard byte-paced sweep | continuously | `crates/stream/src/extent_scrub.rs` |
 
-Two consequences follow, and the second is the serious one.
+Without the sidecars two things hold, and the second is the serious one.
 
 **A stream-layer consumer is protected only if it brings its own checksum.**
 The partition layer does, for what it writes. A consumer that hands raw bytes to
@@ -223,12 +224,56 @@ Two guards carry over unchanged and are not optional: a report must not isolate
 the LAST available replica, and it must not act on an extent whose eversion
 moved since the scrub read it.
 
-`handle_report_corrupt_replica` refuses EC-converted extents
-(`crates/manager/src/rpc_handlers.rs:1148`), on the
-grounds that no shard-content checksum exists and a reader's failed shard read is
-more likely congestion than rot. This design supplies exactly the missing
-evidence, so that refusal is what must change for EC coverage — the bitmap and
-the gate bypass are already slot-generic over `replicates ++ parity`.
+On an EC extent a slot is one shard, and "last" means K: isolation refuses when
+fewer than K shards would remain available, because below K nothing can be
+reconstructed and the damaged shard's range would go from wrong to gone.
+`handle_report_corrupt_replica` — the partition server's report — still refuses
+EC extents: its evidence is the same bytes read clean from another copy, and an
+EC extent has no other copy of any byte. Only the shard's own node can tell.
+
+## EC shards
+
+A shard file gets its own sidecar, `extent-{id}.shard{i}.ck`, in the `.ck`
+format with the length field holding the shard's length.
+
+**Described as it is written, not read back.** A conversion streams shards far
+faster than the scrub's few MiB per second could describe them afterwards, so
+a backfill would make "no description yet" the normal state of every recently
+converted shard. Each staged stripe is hashed from the bytes in hand
+(`ExtentChecksums::append`, off the event loop) and the sidecar is persisted
+after the stripe is durable, so it always describes exactly the bytes staged so
+far; stripe and block boundaries need not agree. Stripe 0 starts a new
+description (it truncates the file); a stripe that does not continue the
+recorded description leaves no sidecar at all, and the scrub describes the
+finished shard instead. A rebuilt shard is described the same way, from the
+bytes the reconstruct produced, once they are durable.
+
+**Verified where a shard is read whole.** A whole-block shard read is refused
+on mismatch, like `.dat`. That covers a client's direct shard read (it then
+reconstructs the shard from the others) and every source read of an EC rebuild,
+whose stripes cover whole blocks — a rotted peer is refused and the rebuild
+reads the next one.
+
+**Scrubbed, and reported only once it is live.** The scrub takes an extent's
+shard file when the node holds exactly one (more is reconcile residue, and
+nothing on the node can say which index is live), verifies a block per pass,
+and backfills a shard with no sidecar once the manager confirms the layout
+publishes it at exactly a shard's length. A mismatch is REPORTED only after the
+manager confirms the layout is committed to shard files: before that the shard
+is staging — an abandoned attempt simply deletes it — and this node's slot is a
+replica whose `.dat` may be fine. Reporting would isolate that. The converse
+holds for `.dat`: once the extent is converted, rot in the `.dat` a holder keeps
+until the next reconcile is about residue, and reporting it would isolate the
+node's shard; it is dropped.
+
+**An isolated shard never serves.** The client treats a sealed EC slot with its
+`avali` bit dark as gone: reads of its range are reconstructed, it is never an
+input to another shard's reconstruct (one wrong input makes every byte the RS
+decode spans wrong), and the direct-read descriptor declines while a data shard
+is isolated. Sub-block reads are not checksummed, so without this a rotted shard
+would keep answering them until its rebuild finished.
+
+Shards of a pre-CoW conversion live in `.dat` and are not covered.
 
 ## Non-goals
 
@@ -240,29 +285,35 @@ the gate bypass are already slot-generic over `replicates ++ parity`.
 - **This does not detect a lying peer.** It detects media rot and silent
   mis-writes. A node that computes a checksum over bytes it has already
   corrupted is a Byzantine problem this does not address.
-- **RS reconstruction is not made self-checking.** Verifying a reconstruct needs
-  shard checksums, which arrive with EC coverage; reconstruct itself stays as is.
+- **RS reconstruction is not made self-checking.** Its inputs are checked where
+  they are read whole (rebuild stripes); a client's sub-block reconstruct is not,
+  and relies on isolation to keep a known-bad shard out of it.
 
 ## Acceptance
 
-The reproduction harness `crates/manager/tests/silent_corruption_rot.rs` has
-three legs that pass today **because** corruption goes undetected. Each flips to
-a correctness assertion:
+`crates/manager/tests/silent_corruption_rot.rs` began as a reproduction whose
+legs passed because corruption went undetected; each is now the opposite
+assertion. Every leg first waits for the replicas to describe the sealed
+content, then rots one — rot before any description is the trust-on-first-use
+window, not detection.
 
-- **(a) read** — a client reading a flipped single replica gets correct bytes
-  from another replica, or an error; never the corrupt bytes with `CODE_OK`.
-- **(b) recovery** — rebuilding from sources including the corrupt one produces
-  byte-exact content, or refuses; it does not launder.
-- **(c) EC** — conversion over a corrupt replica reports an error instead of
-  encoding corrupt parity.
-- **(d) scrub** — with no external read at all, the corrupt replica's `avali`
-  bit is cleared and the slot is rebuilt.
+- **(a) read** — a whole-block read of the rotted replica is refused by its
+  node, client reads return the original, and once the scrub has isolated the
+  slot even 4 KiB reads do.
+- **(b) recovery** — a rebuild whose only full-length source is the rotted
+  replica finishes byte-exact or not at all.
+- **(c) EC** — the rotted coordinator is isolated, and an EC read-back, if the
+  extent ever converts, is the original.
+- **(d) scrub** — `scrub_isolates_rot.rs`: with no read at all, the rotted
+  replica's `avali` bit is cleared.
+- **(e) EC shard** — `ec_shard_rot.rs`: a shard described as staged is rotted;
+  its node refuses the block, the client reconstructs it, the scrub isolates
+  the slot, a sub-block read while it is dark is the original, and recovery
+  rebuilds the shard byte-exact on the spare.
 
-Each leg must be shown to fail without the corresponding change.
-
-The three legs still pass, and the reason is worth stating rather than reading
-as a gap in the checks: the harness corrupts a replica IMMEDIATELY after sealing,
-before any sweep has described it, so there is nothing to verify against. That is
-the trust-on-first-use window, not a hole in detection. Flipping them means
-letting the scrub describe the clean content first — "described, then rotted,
-then caught" — which is the sequence the feature actually claims.
+Ablations, each red at the step it guards: no read check (a, b); no pre-encode
+check (c); no shard read check, no staging description, no shard scrub, the
+manager refusing EC isolation, or a client that reads a dark shard (e). The
+rebuild's own description is not discriminated by (e) — the scrub's backfill
+describes the new shard within a tick — and is pinned by
+`a_durable_shard_is_recorded_at_its_length`.

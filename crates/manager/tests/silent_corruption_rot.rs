@@ -1,46 +1,32 @@
-//! G12 reproduction (reproduce-FIRST, NO FIX) — "silent corruption of sealed
-//! data + rot propagation through repair/EC".
+//! At-rest rot of a sealed replica, end to end: once a replica's content has
+//! been described, a bit flipped in it at rest must never reach a reader, be
+//! copied by recovery, or be encoded into EC parity.
 //!
-//! HYPOTHESIS (verified against code before this harness was written):
-//!   Large values at rest have NO checksum. The RPC frame CRC covers only
-//!   `header ++ ctrl_len ++ ctrl` and deliberately EXCLUDES the bulk value tail
-//!   ("bulk value integrity is the transport's job" — `crates/rpc/src/frame.rs`,
-//!   whose own `vectored_zc_request_round_trip` test flips a value byte and
-//!   asserts the frame still decodes). The extent-node serves raw `pread` bytes
-//!   (`extent_node.rs::file_pread` / `build_read_future`). The `.meta` sidecar
-//!   carries a CRC32C, but it covers ONLY the 40 metadata bytes — never the
-//!   `.dat` value region. There is NO scrubber anywhere under
-//!   `crates/stream/src/`. The read-path start-replica rotation is a
-//!   deterministic SplitMix64 over `(extent_id, offset)`
-//!   (`client.rs::rotated_replica_start`), so a corrupt replica is CONSISTENTLY
-//!   chosen for the affected reads. Recovery's verify-after-fetch checks
-//!   fetched-length == `sealed_length` and that eversion did not advance — NOT
-//!   content (`run_recovery_task` / `stream_extent_from_sources`), so recovery
-//!   FAITHFULLY REPLICATES corruption. EC conversion's coordinator
-//!   (`target_nodes[0] == ex.replicates[0]`) reads its local bytes and encodes
-//!   parity with no verification (`handle_convert_to_ec`), making the corruption
-//!   canonical.
+//! This began as a reproduction that passed BECAUSE nothing noticed: the RPC
+//! frame CRC excludes the bulk value, `.meta`'s CRC covers its own 48 bytes,
+//! recovery's verify-after-fetch compares length and eversion (a flip moves
+//! neither), EC conversion encoded whatever the coordinator read, and replica
+//! choice is a deterministic hash of `(extent_id, offset)`, so the damaged copy
+//! was picked consistently. Each leg is now the opposite assertion.
 //!
-//! Net effect this harness demonstrates, as three independent runnable legs:
-//!   (a) READ     — a single-replica bit-flip in a SEALED extent's value region
-//!                  is served to clients with CODE_OK and NO detection; the
-//!                  deterministic rotation routes a fraction of reads onto the
-//!                  corrupt replica (byzantine-adjacent wrong bytes).
-//!   (b) RECOVERY — rebuilding a lost replica from sources that include the
-//!                  corrupt one copies the corruption verbatim; verify-after-
-//!                  fetch (length/eversion) passes because neither changed.
-//!   (c) EC       — converting the extent to erasure coding encodes the shards
-//!                  (and parity) from the coordinator's corrupt bytes; the
-//!                  cluster reports success and the reconstructed value is the
-//!                  corrupt one — nothing detects it.
+//! Every leg waits for the replicas to DESCRIBE the sealed content before it
+//! rots one. A replica that rots before any description exists gets the rot
+//! recorded as truth by the first backfill — the trust-on-first-use window the
+//! design accepts — so rotting first would test that window, not detection.
 //!
-//! This is a REPRODUCTION, not a fix. Today's EXPECTED outcome is that all
-//! three legs succeed silently (no checksum, no scrub). Every assertion below
-//! is written to FAIL if some layer we missed actually DOES detect the
-//! corruption — in which case the harness would surface that instead.
+//! The legs and what each catches:
+//!   (a) READ     — a whole-block read of the rotted replica is refused by its
+//!                  node, client reads get the right bytes from another
+//!                  replica, and once the node's scrub has isolated the slot
+//!                  even sub-block reads (which no checksum covers) are right.
+//!   (b) RECOVERY — a rebuild whose only full-length source is the rotted
+//!                  replica refuses it: the result is byte-exact or absent.
+//!   (c) EC       — converting over a rotted coordinator never yields parity
+//!                  encoded from the rot: the rot is found and isolated, and an
+//!                  EC read-back, if the extent ever converts, is the original.
 //!
-//! This file is intentionally self-contained (mirrors `update_stream_ec.rs`'s
-//! standalone helpers) so it touches no shared harness module.
+//! Rot found with nobody reading is `scrub_isolates_rot.rs`; the same chain for
+//! an EC shard file is `ec_shard_rot.rs`.
 
 mod support;
 
@@ -160,6 +146,11 @@ async fn seal_extent(mgr: &RpcClient, sc: &StreamClient, stream_id: u64, commit:
 /// Recursively locate `extent-{id}.dat` under a node's data dir (hashed layout
 /// `{dir}/{hash:02x}/extent-{id}.dat`).
 fn find_dat(dir: &Path, extent_id: u64) -> PathBuf {
+    find_dat_opt(dir, extent_id)
+        .unwrap_or_else(|| panic!("extent-{extent_id}.dat not found under {dir:?}"))
+}
+
+fn find_dat_opt(dir: &Path, extent_id: u64) -> Option<PathBuf> {
     let name = format!("extent-{extent_id}.dat");
     fn rec(d: &Path, name: &str) -> Option<PathBuf> {
         for e in std::fs::read_dir(d).ok()?.flatten() {
@@ -174,7 +165,7 @@ fn find_dat(dir: &Path, extent_id: u64) -> PathBuf {
         }
         None
     }
-    rec(dir, &name).unwrap_or_else(|| panic!("{name} not found under {dir:?}"))
+    rec(dir, &name)
 }
 
 fn read_file(path: &Path) -> Vec<u8> {
@@ -211,8 +202,16 @@ fn corrupt_of(payload: &[u8], start: usize, len: usize) -> Vec<u8> {
     c
 }
 
-/// Direct single-replica EN read of `[offset,len)` (raw `pread`, no PS proxy).
-async fn direct_read(en: &RpcClient, extent_id: u64, eversion: u64, offset: u64, len: u64) -> (u8, Vec<u8>) {
+/// Direct single-replica EN read of `[offset,len)` (no PS proxy). `Ok` only
+/// when the node SERVED the bytes; a refusal — a typed error frame or a non-OK
+/// code — is `Err` with its reason.
+async fn direct_read(
+    en: &RpcClient,
+    extent_id: u64,
+    eversion: u64,
+    offset: u64,
+    len: u64,
+) -> Result<Vec<u8>, String> {
     let req = extent_rpc::ReadBytesReq::new(
         extent_id,
         eversion,
@@ -223,16 +222,46 @@ async fn direct_read(en: &RpcClient, extent_id: u64, eversion: u64, offset: u64,
     let resp = en
         .call(extent_rpc::MSG_READ_BYTES, req.encode())
         .await
-        .expect("MSG_READ_BYTES");
+        .map_err(|e| e.to_string())?;
     let r = extent_rpc::ReadBytesResp::decode(resp).expect("decode ReadBytesResp");
-    (r.code, r.payload.to_vec())
+    if r.code != extent_rpc::CODE_OK {
+        return Err(format!("code {}", r.code));
+    }
+    Ok(r.payload.to_vec())
+}
+
+fn ck_exists(dir: &Path, extent_id: u64) -> bool {
+    let dat = find_dat(dir, extent_id);
+    dat.with_extension("ck").exists()
+}
+
+/// Wait until every listed node has described the sealed extent. Rot is only
+/// catchable against a description taken BEFORE it: an extent that rots before
+/// any sidecar exists gets the rot recorded as truth (trust-on-first-use).
+async fn wait_described(dirs: &[&Path], extent_id: u64) {
+    for _ in 0..60 {
+        if dirs.iter().all(|d| ck_exists(d, extent_id)) {
+            return;
+        }
+        compio::time::sleep(Duration::from_millis(500)).await;
+    }
+    panic!("not every replica described extent {extent_id} within 30 s");
+}
+
+fn slot_bit(ex: &MgrExtentInfo, node_id: u64) -> u32 {
+    1u32 << ex
+        .replicates
+        .iter()
+        .chain(ex.parity.iter())
+        .position(|n| *n == node_id)
+        .expect("node holds a slot")
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// LEG (a) — READ: silent corruption served to clients, no detection.
+// LEG (a) — READ
 // ═══════════════════════════════════════════════════════════════════════════
 #[test]
-fn leg_a_read_serves_silently_corrupted_sealed_bytes() {
+fn leg_a_rotted_replica_is_never_served() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
     let mgr_str = mgr_addr.to_string();
@@ -247,7 +276,7 @@ fn leg_a_read_serves_silently_corrupted_sealed_bytes() {
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("mgr");
-        register_node(&mgr, &a1.to_string(), "u1").await;
+        let n1 = register_node(&mgr, &a1.to_string(), "u1").await;
         register_node(&mgr, &a2.to_string(), "u2").await;
         register_node(&mgr, &a3.to_string(), "u3").await;
         let stream_id = create_stream(&mgr, 3).await;
@@ -257,109 +286,86 @@ fn leg_a_read_serves_silently_corrupted_sealed_bytes() {
             .await
             .expect("stream client");
 
-        // Write a distinctive 64 KiB value, then SEAL the extent.
-        const N: usize = 64 * 1024;
+        // Three whole 1 MiB blocks and a short tail.
+        const MIB: usize = 1024 * 1024;
+        const N: usize = 3 * MIB + 777;
         let payload: Vec<u8> = (0..N).map(|i| (i % 251) as u8).collect();
         let r = sc.append(stream_id, &payload).await.expect("append");
         let extent_id = r.extent_id;
         seal_extent(&mgr, &sc, stream_id, r.end).await;
+        wait_described(&[d1.path(), d2.path(), d3.path()], extent_id).await;
 
         sc.invalidate_extent_cache(extent_id);
         let ext = get_extent_info(&mgr, extent_id).await;
-        assert!(ext.sealed_length as usize == N, "sealed_length={}", ext.sealed_length);
-        let ev = ext.eversion;
+        assert_eq!(ext.sealed_length as usize, N);
+        let victim_bit = slot_bit(&ext, n1);
 
-        // Baseline: all three replicas hold identical, clean value bytes.
-        let (p1, p2, p3) = (
-            find_dat(d1.path(), extent_id),
-            find_dat(d2.path(), extent_id),
-            find_dat(d3.path(), extent_id),
-        );
-        assert_eq!(read_file(&p1), payload, "replica1 baseline");
-        assert_eq!(read_file(&p2), payload, "replica2 baseline");
-        assert_eq!(read_file(&p3), payload, "replica3 baseline");
+        // Rot 64 bytes inside block 1 of replica 1 only.
+        let p1 = find_dat(d1.path(), extent_id);
+        let (cstart, clen) = (MIB + MIB / 2, 64usize);
+        flip_range(&p1, cstart, clen);
+        assert_eq!(read_file(&p1), corrupt_of(&payload, cstart, clen), "replica 1 rotted on disk");
 
-        // Snapshot replica-1's `.meta` — we will show it is UNCHANGED after we
-        // corrupt the `.dat`, i.e. the only at-rest checksum (the 40-byte meta
-        // CRC) still validates while the value region silently rots.
-        let meta1 = p1.with_extension("meta");
-        let meta_before = read_file(&meta1);
-
-        // ── corrupt the ENTIRE value region on replica 1 only ──
-        flip_range(&p1, 0, N);
-        let corrupt = corrupt_of(&payload, 0, N);
-        assert_eq!(read_file(&p1), corrupt, "replica1 now corrupt on disk");
-        assert_eq!(read_file(&p2), payload, "replica2 still clean");
-        assert_eq!(read_file(&p3), payload, "replica3 still clean");
-        assert_eq!(
-            read_file(&meta1),
-            meta_before,
-            "the .dat corruption did NOT touch .meta — its CRC still validates \
-             the (unchanged) 40 metadata bytes; nothing at rest guards the value"
-        );
-
-        // ── sub-check A1: the EN serves the corrupt bytes raw, with CODE_OK ──
+        // Its node refuses a read that covers the rotted block; a clean replica
+        // serves the same range.
         let en1 = RpcClient::connect_as(a1, autumn_rpc::version_hello::Role::Admin, None).await.expect("en1");
         let en2 = RpcClient::connect_as(a2, autumn_rpc::version_hello::Role::Admin, None).await.expect("en2");
-        let en3 = RpcClient::connect_as(a3, autumn_rpc::version_hello::Role::Admin, None).await.expect("en3");
-        let (c1, v1) = direct_read(&en1, extent_id, ev, 0, N as u64).await;
-        let (c2, v2) = direct_read(&en2, extent_id, ev, 0, N as u64).await;
-        let (c3, v3) = direct_read(&en3, extent_id, ev, 0, N as u64).await;
-        assert_eq!(c1, extent_rpc::CODE_OK, "corrupt replica STILL returns CODE_OK (no checksum)");
-        assert_eq!(c2, extent_rpc::CODE_OK);
-        assert_eq!(c3, extent_rpc::CODE_OK);
-        assert_eq!(v1, corrupt, "EN #1 served the corrupt value verbatim");
-        assert_eq!(v2, payload, "EN #2 served clean");
-        assert_eq!(v3, payload, "EN #3 served clean");
-        eprintln!(
-            "[G12/leg-a] EN direct reads: replica1=CORRUPT(code={c1}) replica2=clean replica3=clean \
-             — the extent-node pread serves raw bytes with NO at-rest checksum."
+        let refused = direct_read(&en1, extent_id, ext.eversion, MIB as u64, MIB as u64).await;
+        assert!(refused.is_err(), "the rotted replica served a block that fails its checksum");
+        assert_eq!(
+            direct_read(&en2, extent_id, ext.eversion, MIB as u64, MIB as u64).await,
+            Ok(payload[MIB..2 * MIB].to_vec()),
+            "a clean replica must serve the same block"
         );
 
-        // ── sub-check A2: the deterministic (extent_id,offset) rotation routes
-        //    a fraction of client reads onto the corrupt replica → wrong bytes.
-        let mut corrupt_reads = 0usize;
-        let mut total = 0usize;
-        let win = 1024usize;
-        let mut off = 0usize;
-        while off + win <= N {
+        // Whole-block client reads: whichever replica the rotation starts on,
+        // the answer is the original.
+        for (off, len) in [(0, N), (0, MIB), (MIB, MIB), (2 * MIB, MIB), (MIB, 2 * MIB)] {
+            let (got, _) = sc
+                .read_bytes_from_extent(extent_id, off as u64, len as u64)
+                .await
+                .expect("client read");
+            assert!(got == payload[off..off + len], "client read [{off}, +{len}) returned rot");
+        }
+
+        // Nobody has to read the rotted bytes for the slot to be isolated: the
+        // node's own scrub finds them.
+        let mut isolated = false;
+        for _ in 0..60 {
+            compio::time::sleep(Duration::from_millis(500)).await;
+            if get_extent_info(&mgr, extent_id).await.avali & victim_bit == 0 {
+                isolated = true;
+                break;
+            }
+        }
+        assert!(isolated, "the rotted replica was never isolated");
+
+        // Isolated, it serves nothing — including the 4 KiB reads that no
+        // checksum covers, which before isolation could still land on it.
+        sc.invalidate_extent_cache(extent_id);
+        let win = 4096usize;
+        let mut off = MIB;
+        while off < 2 * MIB {
             let (got, _) = sc
                 .read_bytes_from_extent(extent_id, off as u64, win as u64)
                 .await
-                .expect("client read");
-            let expect_clean = &payload[off..off + win];
-            if got != expect_clean {
-                assert_eq!(
-                    got,
-                    &corrupt[off..off + win],
-                    "a client read returned bytes that are neither clean NOR the \
-                     known corruption — unexpected"
-                );
-                corrupt_reads += 1;
-            }
-            total += 1;
+                .expect("sub-block read");
+            assert!(got == payload[off..off + win], "sub-block read at {off} returned rot");
             off += win;
         }
-        eprintln!(
-            "[G12/leg-a] client rotation sweep: {corrupt_reads}/{total} sub-range reads returned \
-             the CORRUPT bytes (deterministic rotation over (extent_id,offset) — no failover, \
-             no error, no detection)."
-        );
-        assert!(
-            corrupt_reads >= 1,
-            "expected the deterministic rotation to route at least one client read onto the \
-             corrupt replica; got 0/{total} — if this fails the read path may have gained a \
-             content check we did not model"
-        );
     });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// LEG (b) — RECOVERY: rebuilds a replica FROM the corrupt one, laundering it.
+// LEG (b) — RECOVERY
 // ═══════════════════════════════════════════════════════════════════════════
 #[test]
-fn leg_b_recovery_launders_corruption_no_content_check() {
+fn leg_b_recovery_never_copies_a_rotted_source() {
     let mgr_addr = pick_addr();
+    // Background loops off: the rebuild below is dispatched by hand, and the
+    // scrub's own findings must not isolate the rotted source first — that
+    // would keep recovery from reading it at all, and this leg is about what
+    // recovery does when it does.
     let manager_control = support::start_recovery_manager(mgr_addr);
     let mgr_str = mgr_addr.to_string();
 
@@ -393,7 +399,6 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
             .disks[0];
         start_extent_node(a4, d4.path().to_path_buf(), disk, &mgr_str);
 
-        // node_id -> (addr, dir)
         let node_dir = |nid: u64| -> &Path {
             if nid == n1 {
                 d1.path()
@@ -411,7 +416,7 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
             .await
             .expect("stream client");
 
-        const N: usize = 32 * 1024;
+        const N: usize = 2 * 1024 * 1024 + 333;
         let payload: Vec<u8> = (0..N).map(|i| (i % 241) as u8 ^ 0x5A).collect();
         let r = sc.append(stream_id, &payload).await.expect("append");
         let extent_id = r.extent_id;
@@ -419,35 +424,25 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
 
         sc.invalidate_extent_cache(extent_id);
         let ext = get_extent_info(&mgr, extent_id).await;
-        assert!(ext.sealed_length as usize == N);
-        let reps = ext.replicates.clone(); // slot order [r0, r1, r2]
+        assert_eq!(ext.sealed_length as usize, N);
+        let reps = ext.replicates.clone();
         assert_eq!(reps.len(), 3, "replicated stream must have 3 members");
-        let ev_before = ext.eversion;
+        wait_described(&[node_dir(reps[0])], extent_id).await;
 
-        // The corrupt SURVIVOR is r0. To force recovery to source from it, we
-        // make it the ONLY replica that still holds the data: physically delete
-        // r1's and r2's files (models "those replicas were lost" — the reason
-        // recovery runs). r1 will be the replaced slot; r2 is simply gone.
-        let corrupt_dir = node_dir(reps[0]);
-        let corrupt_dat = find_dat(corrupt_dir, extent_id);
-        // flip a distinctive 64-byte marker inside the value region.
-        let (cstart, clen) = (777usize, 64usize);
+        // r0 rots and becomes the only replica still on disk: r1 is the slot
+        // being replaced and r2 is gone too. This is the case where copying
+        // the rot used to be recovery's only option.
+        let corrupt_dat = find_dat(node_dir(reps[0]), extent_id);
+        let (cstart, clen) = (1024 * 1024 + 777usize, 64usize);
         flip_range(&corrupt_dat, cstart, clen);
         let corrupt = corrupt_of(&payload, cstart, clen);
         assert_eq!(read_file(&corrupt_dat), corrupt, "r0 corrupted on disk");
-
         for &nid in &[reps[1], reps[2]] {
             let dat = find_dat(node_dir(nid), extent_id);
-            let meta = dat.with_extension("meta");
+            std::fs::remove_file(dat.with_extension("meta")).ok();
             std::fs::remove_file(&dat).ok();
-            std::fs::remove_file(&meta).ok();
         }
 
-        // Dispatch recovery DIRECTLY to the spare (a4), replacing r1. The spare
-        // resolves extent_info from the manager (replicas [r0,r1,r2]), excludes
-        // r1, and among {r0(corrupt,intact), r2(deleted)} only r0 can serve —
-        // so it streams the corrupt copy. (Nothing is fenced or marked corrupt,
-        // so the manager dispatches no rebuild; this direct one is the only one.)
         let en4 = RpcClient::connect_as(a4, autumn_rpc::version_hello::Role::Admin, None).await.expect("en4");
         let task = extent_rpc::RecoveryTask {
             extent_id,
@@ -466,7 +461,6 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
         let code: extent_rpc::CodeResp = extent_rpc::rkyv_decode(&resp).expect("decode");
         assert_eq!(code.code, extent_rpc::CODE_OK, "recovery dispatch refused: {}", code.message);
 
-        // Wait for background recovery to complete (drain the spare's df queue).
         let mut done = false;
         for _ in 0..75 {
             compio::time::sleep(Duration::from_millis(200)).await;
@@ -486,39 +480,33 @@ fn leg_b_recovery_launders_corruption_no_content_check() {
                 break;
             }
         }
-        assert!(done, "recovery did not report completion within 15s");
 
-        // The rebuilt replica on the spare must byte-equal the CORRUPT source —
-        // recovery copied the rot with no content verification. verify-after-
-        // fetch passed only because length (== sealed_length) and eversion did
-        // not change.
-        let recovered = read_file(&find_dat(d4.path(), extent_id));
-        assert_eq!(
-            recovered, corrupt,
-            "the recovered replica does NOT match the corrupt source — if this fails, recovery \
-             gained a content check we did not model"
-        );
-        assert_ne!(recovered, payload, "recovered copy equals the ORIGINAL — corruption was healed?!");
-
-        sc.invalidate_extent_cache(extent_id);
-        let ext_after = get_extent_info(&mgr, extent_id).await;
+        // Byte-exact or not at all. A copy that finished must be the original;
+        // one that did not must not have left the rot behind as a replica.
+        let rebuilt = find_dat_opt(d4.path(), extent_id).map(|p| read_file(&p));
         eprintln!(
-            "[G12/leg-b] recovery rebuilt slot from the corrupt survivor: recovered {} bytes == \
-             corrupt source (marker @[{cstart},{}) flipped), eversion {}→{} (verify-after-fetch \
-             is length+eversion only, NEVER content).",
-            recovered.len(),
-            cstart + clen,
-            ev_before,
-            ext_after.eversion,
+            "[leg-b] recovery {}",
+            if done { "completed" } else { "did not complete" }
         );
+        if done {
+            assert!(
+                rebuilt.as_deref() == Some(payload.as_slice()),
+                "recovery reported done with content that is not the original"
+            );
+        } else {
+            assert!(
+                rebuilt.as_deref() != Some(corrupt.as_slice()),
+                "recovery copied the rotted source"
+            );
+        }
     });
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// LEG (c) — EC: parity/shards encoded over corrupt bytes, made canonical.
+// LEG (c) — EC
 // ═══════════════════════════════════════════════════════════════════════════
 #[test]
-fn leg_c_ec_convert_encodes_corrupt_bytes_undetected() {
+fn leg_c_ec_never_encodes_a_rotted_coordinator() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
     let mgr_str = mgr_addr.to_string();
@@ -543,38 +531,33 @@ fn leg_c_ec_convert_encodes_corrupt_bytes_undetected() {
             .await
             .expect("stream client");
 
-        const N: usize = 16 * 1024;
+        const N: usize = 2 * 1024 * 1024 + 100;
         let payload: Vec<u8> = (0..N).map(|i| ((i * 7) % 253) as u8).collect();
         let r = sc.append(stream_id, &payload).await.expect("append");
         let extent_id = r.extent_id;
         seal_extent(&mgr, &sc, stream_id, r.end).await;
+        wait_described(&[d1.path(), d2.path(), d3.path()], extent_id).await;
 
         sc.invalidate_extent_cache(extent_id);
         let ext = get_extent_info(&mgr, extent_id).await;
-        assert!(ext.sealed_length as usize == N);
-        let reps = ext.replicates.clone();
-        assert_eq!(reps.len(), 3);
+        assert_eq!(ext.sealed_length as usize, N);
 
-        // The EC coordinator is `target_nodes[0] == ex.replicates[0]`
-        // (handle_force_ec_convert). It reads its LOCAL bytes, slices them into
-        // K=2 data shards, and encodes M=1 parity — all derived from ITS copy.
-        // Corrupt exactly that node so the whole EC image is corrupt-derived.
-        let coord_dir = if reps[0] == n1 {
+        // The coordinator (`replicates[0]`) encodes every shard from ITS copy,
+        // so rotting it is what would make the rot canonical across the stripe.
+        let coord = ext.replicates[0];
+        let coord_dir = if coord == n1 {
             d1.path()
-        } else if reps[0] == n2 {
+        } else if coord == n2 {
             d2.path()
-        } else if reps[0] == n3 {
+        } else if coord == n3 {
             d3.path()
         } else {
-            panic!("coordinator node {} not found", reps[0])
+            panic!("coordinator node {coord} not found")
         };
-        let coord_dat = find_dat(coord_dir, extent_id);
-        let (cstart, clen) = (321usize, 48usize);
-        flip_range(&coord_dat, cstart, clen);
-        let corrupt = corrupt_of(&payload, cstart, clen);
+        let coord_bit = slot_bit(&ext, coord);
+        let (cstart, clen) = (1024 * 1024 + 321usize, 48usize);
+        flip_range(&find_dat(coord_dir, extent_id), cstart, clen);
 
-        // Turn the stream into an EC-2+1 policy stream, then force conversion of
-        // this sealed extent. Nothing verifies the coordinator's bytes.
         let resp = mgr
             .call(
                 MSG_UPDATE_STREAM_EC,
@@ -588,54 +571,37 @@ fn leg_c_ec_convert_encodes_corrupt_bytes_undetected() {
             .expect("update_stream_ec");
         let u: UpdateStreamEcResp = rkyv_decode(&resp).expect("decode UpdateStreamEcResp");
         assert_eq!(u.code, CODE_OK, "update_stream_ec: {}", u.message);
-
-        let resp = mgr
+        // Accepted or refused, both are fine here: the scrub may already have
+        // isolated the coordinator, and a marked extent is not converted until
+        // its slot is rebuilt.
+        let _ = mgr
             .call(MSG_FORCE_EC_CONVERT, rkyv_encode(&ForceEcConvertReq { extent_id }))
             .await
             .expect("force_ec");
-        let f: ForceEcConvertResp = rkyv_decode(&resp).expect("decode ForceEcConvertResp");
-        assert_eq!(
-            f.code, CODE_OK,
-            "force_ec_convert refused an extent with a corrupt replica: {} \
-             (if this is a NEW content check, the harness has surfaced a guard)",
-            f.message
-        );
 
-        // Wait for the dispatch loop (5s cadence) to convert.
-        let mut converted = false;
-        for _ in 0..20 {
-            compio::time::sleep(Duration::from_secs(2)).await;
+        // The rot is found (by the pre-encode check or by the scrub) and the
+        // coordinator's slot isolated; with no spare node it stays dark, and a
+        // marked extent is never converted. If it ever does convert, it must
+        // read back as the original.
+        let mut isolated = false;
+        for _ in 0..40 {
+            compio::time::sleep(Duration::from_secs(1)).await;
             let e = get_extent_info(&mgr, extent_id).await;
             if e.ec_converted {
-                converted = true;
-                break;
+                sc.invalidate_extent_cache(extent_id);
+                let (got, _) = sc
+                    .read_bytes_from_extent(extent_id, 0, N as u64)
+                    .await
+                    .expect("EC read-back");
+                assert!(got == payload, "EC parity was encoded from the rotted coordinator");
+            } else if e.avali & coord_bit == 0 {
+                isolated = true;
             }
         }
+        assert!(isolated, "the rotted coordinator was never isolated");
         assert!(
-            converted,
-            "EC conversion of the corrupt-containing extent did not complete — NO layer errored \
-             on the corruption, but conversion also did not finish within 40s"
-        );
-        eprintln!("[G12/leg-c] EC conversion COMPLETED (ec_converted=true) with NO detection of the corrupt replica.");
-
-        // Read the value back through the EC decode path. Because the
-        // coordinator's corrupt copy seeded every shard, the reconstructed
-        // value IS the corrupt one — corruption is now canonical/erasure-coded.
-        sc.invalidate_extent_cache(extent_id);
-        let (got, _) = sc
-            .read_bytes_from_extent(extent_id, 0, N as u64)
-            .await
-            .expect("EC read-back");
-        assert_eq!(
-            got, corrupt,
-            "EC read-back is not the coordinator's corrupt bytes — if this fails, EC gained a \
-             content/parity check we did not model"
-        );
-        assert_ne!(got, payload, "EC read-back equals ORIGINAL — corruption was somehow healed?!");
-        eprintln!(
-            "[G12/leg-c] EC read-back returned the CORRUPT value (marker @[{cstart},{}) flipped): \
-             parity + data shards were encoded over corrupt bytes and nothing detected it.",
-            cstart + clen
+            !get_extent_info(&mgr, extent_id).await.ec_converted,
+            "converted with a rotted coordinator and nowhere to rebuild it"
         );
     });
 }

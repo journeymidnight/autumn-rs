@@ -1030,6 +1030,19 @@ impl AutumnManager {
                     CODE_NOT_FOUND,
                     format!("extent {} not found", req.extent_id),
                 )),
+                // This report rests on the reporter having read the same bytes
+                // from another copy and found them clean. An EC extent has no
+                // other copy of any byte, so that cannot have happened, and a
+                // failed read cannot say which shard is at fault. A shard's own
+                // checksum can; that finding arrives from its node's scrub.
+                Some(ex) if ex.ec_converted => Err((
+                    CODE_PRECONDITION,
+                    format!(
+                        "extent {} is EC-converted; there is no second copy to have \
+                         confirmed clean (a shard's own node reports its rot)",
+                        req.extent_id
+                    ),
+                )),
                 Some(ex) => match crate::extent_corrupt::compute_corrupt_isolation(
                     ex,
                     &req.corrupt_node_ids,

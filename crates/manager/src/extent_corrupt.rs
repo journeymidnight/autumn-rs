@@ -61,10 +61,14 @@ pub(crate) enum IsolationOutcome {
 ///
 /// `reported_eversion` is what the reporter saw. Every refusal below is
 /// load-bearing: an eversion that moved means the finding describes content
-/// that has already been replaced; an EC extent's `avali` bits mean shard
-/// availability, not replica health; an OPEN tail cannot be isolated without a
+/// that has already been replaced; an OPEN tail cannot be isolated without a
 /// seal-and-roll; and clearing the LAST available bit would make the extent
 /// unreadable, which is worse than serving a copy known to be damaged.
+///
+/// On an EC extent a slot is one shard, and its `avali` bit is that shard's
+/// availability — which is what a finding about the shard's own bytes is
+/// about. "Last" there means K: below K serving shards nothing can be
+/// reconstructed, so the damaged shard's range would go from wrong to gone.
 pub(crate) fn compute_corrupt_isolation(
     ex: &ExtentRecord,
     corrupt_node_ids: &[u64],
@@ -101,16 +105,6 @@ pub(crate) fn compute_corrupt_isolation(
                 "extent {} eversion moved ({} != reported {}) — the report describes \
                  content that has since been replaced",
                 ex.extent_id, ex.eversion, reported_eversion
-            ),
-        };
-    }
-    if ex.ec_converted {
-        return IsolationOutcome::Refused {
-            code: CODE_PRECONDITION,
-            message: format!(
-                "extent {} is EC-converted; replicated corrupt-replica isolation does not \
-                 apply (EC shard repair routes through recovery)",
-                ex.extent_id
             ),
         };
     }
@@ -160,7 +154,20 @@ pub(crate) fn compute_corrupt_isolation(
     if cleared_mask == 0 {
         return IsolationOutcome::AlreadyIsolated;
     }
-    if updated.avali == 0 {
+    if ex.ec_converted {
+        let data_shards = ex.replicates.len() as u32;
+        if updated.avali.count_ones() < data_shards {
+            return IsolationOutcome::Refused {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "refusing to isolate shard(s) of EC extent {}: {} would remain available, \
+                     below the {data_shards} needed to reconstruct — unrecoverable",
+                    ex.extent_id,
+                    updated.avali.count_ones()
+                ),
+            };
+        }
+    } else if updated.avali == 0 {
         return IsolationOutcome::Refused {
             code: CODE_PRECONDITION,
             message: format!(
@@ -451,14 +458,39 @@ mod isolation_tests {
         ));
     }
 
-    /// EC `avali` bits mean shard availability; clearing one on the strength of
-    /// a replicated-content finding would corrupt the read/repair semantics.
-    #[test]
-    fn an_ec_converted_extent_is_refused() {
-        let mut ex = extent(0b111, vec![1, 3, 5]);
+    /// 2+1 over nodes 1, 3 (data) and 5 (parity).
+    fn ec_extent(avali: u32) -> ExtentRecord {
+        let mut ex = extent(avali, vec![1, 3]);
+        ex.parity = vec![5];
+        ex.replicate_disks = vec![10, 11];
+        ex.parity_disks = vec![12];
         ex.ec_converted = true;
+        ex
+    }
+
+    /// A rotted shard is darkened like a rotted replica: its slot, by its
+    /// position in `replicates ++ parity`, and the eversion moves.
+    #[test]
+    fn a_rotted_shard_is_darkened_while_k_shards_still_serve() {
+        for (node, bit) in [(3u64, 0b010u32), (5, 0b100)] {
+            match compute_corrupt_isolation(&ec_extent(0b111), &[node], 7, false) {
+                IsolationOutcome::Isolate { updated, cleared_mask } => {
+                    assert_eq!(cleared_mask, bit, "node {node}");
+                    assert_eq!(updated.avali, 0b111 & !bit);
+                    assert_eq!(updated.eversion, 8);
+                }
+                other => panic!("node {node}: expected isolation, got {other:?}"),
+            }
+        }
+    }
+
+    /// Below K serving shards nothing reconstructs, so the damaged shard's range
+    /// would go from wrong to unreadable — the EC form of "never the last copy".
+    #[test]
+    fn a_shard_is_never_darkened_below_k() {
+        // Parity already dark: darkening a data shard would leave 1 of K=2.
         assert!(matches!(
-            compute_corrupt_isolation(&ex, &[3], 7, false),
+            compute_corrupt_isolation(&ec_extent(0b011), &[3], 7, false),
             IsolationOutcome::Refused { .. }
         ));
     }

@@ -162,11 +162,14 @@
 - **Trigger** (2026-08-04, chaos 缺口 loop 的 G12，已 reproduce-first 复现 harness `crates/manager/tests/silent_corruption_rot.rs`): sealed extent 的 **value 数据字节**在单副本上被静默翻位后，**全链无检测**：(a) 客户端读回坏字节仍返回 `CODE_OK`（frame CRC 明确排除 bulk value 段；`.meta` CRC 只覆盖 40B 元数据；WAL/SST CRC 是 partition 层、不覆盖 stream extent 的原始 value）；(b) recovery 从坏副本重填时 `verify` 只校 `length==sealed_length` + eversion、**不校内容** → 把腐化洗成权威；(c) EC 转换对坏字节直接编 parity → 固化成 canonical。stream 层**既无 per-extent/block content checksum、也无 scrubber**；确定性副本轮转让坏副本被一致选中（harness 里 25/64 子区间读命中）。这是**设计缺口**（数据完整性面），不是坏代码——today 的裸机盘不会自发翻位、且需要单副本静默腐化才触发，故不是"今天可复现的线上危害"，属于中期加固。
 - **Scope（真要做时）**: (1) 写侧对 sealed extent 落 **per-extent/block content checksum**（`.meta` 里加一段覆盖 `.dat` 内容的 CRC/xxhash；注意不能进 append 热路径的每帧 CRC，只在 seal 时对最终内容算一次）；(2) EN 读时（至少 sealed 全值读 + recovery 重填读）验内容 checksum，错则走**现有副本轮转/failover 绕开**坏副本（隔离路径已存在，缺的是检测触发器）；(3) recovery/EC 转换前加内容校验，**拒绝**把校验失败的副本洗成权威/编进 parity；(4) 后台 **scrub loop**：低速重哈希 sealed extent，mismatch 则清该副本 `avali` 位交给 recovery 重建。
 - **Acceptance**: 用 `silent_corruption_rot.rs` 的注入点——翻转单副本 sealed `.dat` 字节后：客户端读返回错误（非 `CODE_OK` 坏字节）或自动从好副本服务正确字节；recovery 不再从坏副本洗白（重填结果字节精确）；EC 转换对坏副本报错而非编坏 parity；scrub 能在无外部读的情况下自行发现并清 `avali`。harness 从"记录暴露"翻成 fail-until-fixed 正确性断言。
-- **Status**: `passes: false` — 增量 1、2 均已在 main：`.ck` sidecar（seal 时写、读时验，
-  `crates/stream/src/extent_cksum.rs`）；scrub（`extent_scrub.rs`，含 sidecar 回填，经
-  `DfResp.scrub_rot` 上报，manager 隔离该副本并重建）与 EC 转换前置内容校验（`e0b8861`，
-  后续 `1ffaa93` / `5720408` 修过）。剩余：EC `.shard{i}` 的 at-rest 内容校验
-  （`docs/autumn_integrity_plan.md` 表中仍为 none），以及本条 Acceptance 的逐条复核。
+- **Status**: `passes: true` — `.dat`：`.ck` sidecar + 读时验 + scrub + EC 转换前置校验（`e0b8861`
+  等）。EC shard：`extent-{id}.shard{i}.ck`，staging 时逐 stripe 从内存字节描述、重建时从重构字节描述；
+  整块 shard 读拒绝、scrub 校验/回填、仅在 manager 确认 layout 已提交到 shard 文件后上报；manager 允许隔离
+  EC slot（剩余 < K 时拒绝），客户端不读也不拿被隔离的 shard 做重构输入。Acceptance 复核：
+  `silent_corruption_rot.rs` 三条 leg 已翻成断言（先描述后腐化），(d) = `scrub_isolates_rot.rs`，
+  EC shard = `ec_shard_rot.rs`；各 leg 消融均红（重建自身的描述只由单测区分）。偏差：不覆盖整块
+  （<1 MiB 对齐块）的读不校验，在 scrub 发现并隔离前仍可能读到坏字节（设计 non-goal，见
+  `docs/autumn_integrity_plan.md`）；隔离后客户端不再读到。
 
 ### F-EN-SHARD-AUTO — default EN shard count to CPU cores (format-side), not a hand-set env
 - **Trigger** (2026-07-13, user: "EN 分片确实是核数导向,但目前是手动 env,不是自动...对于集群配置有好处,记下来,以后做"): EN sharding IS core-oriented — `AUTUMN_EXTENT_SHARDS` should track io_uring cores (one shard = `extent_id % shard_count`), but it's a MANUAL env (default 1). Operators must hand-count cores AND keep three things in lockstep. It is NOT a simple "read `available_parallelism()` in the EN" because shard_count is coupled through a chain: **(a)** EN ports are static/registered-once — `autumn-op format --shard-ports <csv>` stamps the N ports into etcd and the manager routes by that list forever (stream CLAUDE.md "EN ports are FUNDAMENTALLY static"); a runtime-auto shard count would desync from etcd → manager black-holes shards 1..N. **(b)** the k8s overlay Service must enumerate exactly `shard_count` data+control ports (`9101+i*10` / `10101+i*10`); auto-shard needs the Service port list generated too. **(c)** `AUTUMN_EXPECT_NODES` / presplit sizing are tuned against the shard fan-out.

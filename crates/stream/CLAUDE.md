@@ -204,6 +204,39 @@ be checked by a full read and could not say WHICH region rotted.
 
 `remove_extent_files` unlinks it with the rest.
 
+**EC shards** get `extent-{id}.shard{i}.ck` in the same format, its length
+field the shard's length (`DiskFS::shard_ck_path`). Written AS THE SHARD IS
+WRITTEN, from the bytes in hand — a conversion outruns any scrub, so a
+read-back backfill would leave every recent shard undescribed:
+`describe_shard_stripe` extends the description per staged stripe
+(`ExtentChecksums::append`, `spawn_blocking`; stripe and block boundaries need
+not agree) and the sidecar is persisted after the stripe is durable, so it
+always describes exactly the bytes staged so far. The CRC runs beside the
+stripe's pwrite (`futures::join!`); the persist is one small tmp write + two
+fsyncs per stripe (64 MiB by default). Stripe 0 starts over: before its
+truncating open `forget_shard_description` drops the cached description AND
+unlinks the old sidecar (either left alone describes bytes about to be gone —
+a scrub over the half-rewritten file would log rot that is not there, and a
+later cache load would pick the old file up at the same length), and it
+records the file's length as that stripe's end, not the max with a previous
+attempt's, or the next stripe could not continue. A stripe that does not
+continue the description leaves NO sidecar. A rebuild describes
+from the reconstructed stripes (`rebuild_ec_shard_by_stripes` returns the
+description; `land_rebuilt_shard` persists it after the sync), and forgets the
+old one before it truncates, like stripe 0. A failed
+persist removes the old sidecar: a stale description that matches the new
+length condemns a healthy shard. `discard_shard_file` unlinks the sidecar
+FIRST; `remove_extent_files` finds sidecars by their own names
+(`parse_shard_ck_file`), so one whose shard is already gone still goes. The
+read cache is `ExtentEntry.shard_ck`, per index, checked against the recorded
+shard length and dropped by `invalidate_shard_ck` whenever the content is
+replaced. A load straddling a writer is discarded, not cached or used:
+`shard_ck_gen` is bumped by every install and every invalidate, and a load
+whose generation moved during its disk read answers with whatever is current
+— otherwise it can put back the very sidecar `forget_shard_description` just
+removed. `handle_read_bytes` resolves checksums the same way as the
+batched path (`cached_payload_checksums`). Pre-CoW conversions keep their shard in `.dat` and are not covered.
+
 **Who may describe content.** Two refusals, both because this node's own
 sidecar is what later condemns this node's own bytes:
 - only bytes `coalescer.last_synced` proves durable (an append advances
@@ -219,7 +252,11 @@ sidecar is what later condemns this node's own bytes:
 **Where it is checked.** Whole-block reads in BOTH arms of `build_read_future`
 (the production path; `handle_read_bytes` alone is unreachable over the wire)
 fail rather than serve — the client's existing rotation carries the read to
-another replica. Sub-block reads are deliberately NOT verified (a 4 KiB read
+another replica. Checksums are resolved for the file the batch NAMES
+(`cached_payload_checksums`): `.dat` or one shard. A refused shard block is
+reconstructed by the client from the others, and an EC rebuild's source reads
+(whole stripes, so whole blocks) refuse a rotted peer, which moves the rebuild
+on to the next. Sub-block reads are deliberately NOT verified (a 4 KiB read
 would have to hash its whole 1 MiB block: 256× on the hot path); the scrub
 covers those bytes on its own schedule. EC conversion verifies the WHOLE extent
 before encoding, after both the seal sync and the peer-copy, because the layout
@@ -229,7 +266,25 @@ flip makes whatever it read canonical for the stripe. `ContentCheck` keeps
 wrong thing.
 
 **The scrub** (`spawn_content_scrub_loop`, 1 s tick) both DESCRIBES and
-VERIFIES, so rot is found with nobody reading. Paced by BYTES per shard
+VERIFIES, so rot is found with nobody reading. It looks at an extent's shard
+file before its `.dat` when the node holds exactly ONE shard file (more is
+reconcile residue, and the node cannot tell which index is live); a shard with
+no sidecar is backfilled only once the manager confirms the layout publishes
+shard files at exactly that length. Whether a finding is REPORTED is
+`rot_report_eversion`, one pure decision: the manager isolates whatever slot
+the REPORTER holds, so a finding counts only while the file it is about IS that
+slot. A shard finding needs the manager to confirm the layout is committed to
+shard files (before the flip the shard is staging, and the slot is a replica
+whose `.dat` may be fine); a `.dat` finding on an EC-converted extent is
+dropped (that `.dat` is residue the next reconcile reclaims, and the slot is the
+node's shard, which may be fine). While a node holds a described shard file,
+that extent's `.dat` is not verified at all — through a long conversion, and
+for an abandoned attempt's residue until the next reconcile. Both `.dat` and shards go
+through one verifier (`scrub_verify_block`) whose finding counts only while the
+description it checked against is still the cached one and no op is in flight
+(the read is an await; a rebuild or re-staged stripe may have replaced the
+bytes), and one accumulator (`scrub_accumulate`) keyed by `(file, length)` so a
+holder of both files never splices one's blocks onto the other's. Paced by BYTES per shard
 (`SCRUB_DEFAULT_BYTES_PER_SEC`, 8 MiB/s, no banked burst), one block per extent
 per pass, cursor keyed by extent id. Bounded by the candidate count, not by the
 budget alone: the skip paths spend nothing and never await, and the cursor
@@ -1522,14 +1577,12 @@ and from other crates' CLAUDE.md); do not renumber.
     slot corrupt and force-dispatches a rebuild past the recovery gate. Rejected
     because the signal does not exist at this layer, not because the plumbing is
     expensive:
-    - **A failed shard read cannot mean corruption.** No shard-content checksum
-      exists anywhere: `WriteShardReq` carries none, the `.meta` CRC covers only
-      the 48-byte sidecar, and the bulk read's `value_crc32c` is computed at read
-      time from whatever is on disk (transport integrity only). A bit-rotted
-      shard therefore reads back CLEAN — the one failure class that IS corruption
-      never fails a shard read; rot surfaces later at the partition layer (SST
-      block CRC / WAL record CRC) or never (VP value reads have no CRC). What
-      DOES fail a shard read: timeout/connect (congestion or a dead node —
+    - **A failed shard read is not the reader's evidence to act on.** Rot has
+      a first-party reporter: the shard's own node, whose whole-block reads
+      refuse a block that fails its `.shard{i}.ck` and whose scrub reports it
+      (sub-block reads, which no checksum covers, are caught only by the
+      scrub). Everything else that fails a shard read is not corruption:
+      timeout/connect (congestion or a dead node —
       Suspected avoidance, note 27, and operator fencing already handle both),
       `CODE_PAYLOAD_NOT_HERE` (stale layout → the typed refresh; or a genuinely
       missing shard file), or the META-FAILCLOSED quarantine — which
@@ -1544,25 +1597,20 @@ and from other crates' CLAUDE.md); do not renumber.
       that triggered it, across every extent that hiccuped in the same window. A
       cross-request per-(extent,shard) failure counter does not repair this:
       N timeouts is stronger congestion evidence, not corruption evidence.
-    - **The manager refuses it today anyway**: `handle_report_corrupt_replica`
-      rejects EC-converted extents by design (EC `avali` bits mean shard
-      availability; the replicated isolation semantics don't apply). The
-      deferral's plumbing blocker turned out cheap — `owner_epoch` and
-      `reporter_part_id` already live on `StreamClient` and
-      `ReportCorruptReplicaReq` already carries every field, so no wire change
-      would be needed — which is why THIS note records the evidential argument
-      as the reason.
+    - **The manager refuses it anyway**: `handle_report_corrupt_replica`
+      rejects EC-converted extents — its evidence is the same bytes read clean
+      from another copy, and an EC extent has no other copy of any byte. The
+      plumbing would have been cheap (`owner_epoch` and `reporter_part_id`
+      already live on `StreamClient`, `ReportCorruptReplicaReq` carries every
+      field), which is why THIS note records the evidential argument as the
+      reason.
     - **What closes the real gaps instead.** (a) Rot needs EN-side first-party
-      evidence — see "At-rest content integrity" below, which supplies it for
-      REPLICATED extents and reports through `DfResp`. An EC extent's shard is
-      still undescribed: the sidecar covers `.dat`, and staging writes no
-      checksum. (b) A missing shard file / quarantined holder is
+      evidence — "At-rest content integrity" supplies it for `.dat` AND for
+      shard files (each shard is described as it is staged), reported through
+      `DfResp.scrub_rot`; the manager isolates an EC slot on that report while
+      K shards still serve. (b) A missing shard file / quarantined holder is
       first-party EN knowledge too; today's repair is an operator fence of the
-      node (force-dispatches every slot → `run_ec_recovery_payload`). The
-      manager side is already EC-ready for a trustworthy source: the corrupt-slot
-      bitmap is slot-indexed over `replicates ++ parity` and the recovery-gate
-      bypass + EC shard rebuild work for shard slots — only the report entry
-      point's EC refusal would need an EC-aware variant.
+      node (force-dispatches every slot → `run_ec_recovery_payload`).
 
 34. **A node that MOVED is not a node that is gone — forgetting its ADDRESS is an orthogonal side effect, not a retry class.**
     A node keeps its id across a restart (identity is the `node_uuid` on its

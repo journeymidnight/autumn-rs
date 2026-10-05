@@ -738,14 +738,13 @@ value breaks rkyv replay validation, which refuses leadership.
 Regression: `crates/manager/tests/system_corrupt_replica_rebuild.rs`; the
 prerequisite that the loop can act at all is pinned by
 `system_recovery_loop_drives.rs`.
-`handle_report_corrupt_replica` REFUSES EC-converted extents by design (EC
-`avali` bits mean shard availability, and the reporter's evidence — a
-CRC-failed WAL decode plus a clean replica found — only exists for full
-replicas). Extending the report to the EC READ path (client infers corruption
-from a failed shard read) was considered and REJECTED: no shard-content
-checksum exists, so real rot reads back clean while the failures a reader does
-see are congestion/absence — see `crates/stream/CLAUDE.md` note 33 for the
-full argument and what should exist instead. The bitmap + rebuild verdict here are
+`handle_report_corrupt_replica` REFUSES EC-converted extents, before the
+shared decision: the reporter's evidence — a CRC-failed WAL decode plus the same
+bytes found clean on another copy — only exists for full replicas, and an EC
+extent has no other copy of any byte. Extending the report to the EC READ path
+(client infers corruption from a failed shard read) was considered and REJECTED
+— see `crates/stream/CLAUDE.md` note 33. A rotted SHARD is reported by its own
+node instead, whose `.shard{i}.ck` caught it. The bitmap + rebuild verdict here are
 slot-generic over `replicates ++ parity`, and the EN-side scrub is the second
 evidence source: it reports its own rot on `DfResp.scrub_rot` and
 `node_health_loop` runs the SAME decision — `isolate_rotted_slot`, one helper
@@ -759,8 +758,10 @@ node saying "my copy is bad" can only hurt itself), which is why it does not
 use the PS-shaped RPC.
 
 Both entry points share `compute_corrupt_isolation`, which refuses when the
-eversion moved, on an EC extent, on an OPEN tail, when no reported node is a
-member, when it would darken the LAST available slot, and **while the extent
+eversion moved, on an OPEN tail, when no reported node is a member, when it
+would darken the LAST available slot — on an EC extent, when fewer than K
+shards would stay available (below K nothing reconstructs, so the shard's range
+would go from wrong to gone) — and **while the extent
 has a stream-layer op in flight** — isolating into that window moves the
 eversion out from under the op, and an EC conversion's flip then recomputes
 from the post-isolation baseline and lands with the eversion unchanged across a

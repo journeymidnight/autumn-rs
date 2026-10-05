@@ -5067,6 +5067,43 @@ late_reply` fails with the marker still ConvertToEc. Dropping the EN-side
 refusal instead makes `ec_corruption_stops_before_redispatch_and_is_attempt_
 scoped` see `CODE_OK` where it requires code 8.
 
+## At-rest rot in an EC shard is refused, isolated and rebuilt
+
+Each EC shard file has a sidecar, `extent-{id}.shard{i}.ck` (CRC32C per 1 MiB
+block), written while the shard is staged and when it is rebuilt. Rot in a
+shard is handled like rot in a replica:
+
+- a read covering a whole rotted block is refused by the shard's node
+  (`CONTENT CHECKSUM MISMATCH ... file=.shard{i}` in that EN's log); the client
+  reconstructs that range from the other shards;
+- the node's scrub finds it with nobody reading (`SCRUB FOUND CONTENT ROT`,
+  `target=Shard(i)`), and reports it once the manager confirms the layout
+  publishes shard files;
+- the manager isolates the slot (refused if fewer than K shards would remain)
+  and recovery rebuilds the shard on another node. While the slot is dark no
+  client reads it, not even the sub-block reads no checksum covers.
+
+Automated:
+
+    cargo test -p autumn-stream --lib shard_checksum_tests
+    cargo test -p autumn-manager --test ec_shard_rot
+    cargo test -p autumn-manager --test silent_corruption_rot
+
+Manually, on a dev cluster with an EC-converted extent `E` (needs one node
+outside the extent's layout as the rebuild target):
+
+    "${AO[@]}" info --json --part P            # E's layout; shard 0 = replicates[0]
+    ls <that EN's data dir>/*/extent-E.shard0*  # .shard0 and .shard0.ck
+    python3 -c "import sys; f=open(sys.argv[1],'r+b'); f.seek(1<<20|512); b=f.read(1); f.seek(1<<20|512); f.write(bytes([b[0]^1]))" <path>/extent-E.shard0
+    grep 'SCRUB FOUND CONTENT ROT' <that EN's log>   # within a few seconds
+    "${AO[@]}" health                          # the slot shows corrupt, then a rebuild
+    "${AO[@]}" info --json --part P            # replicates[0] is the spare once rebuilt
+
+Reads of the extent return the original bytes throughout. A shard whose node
+holds more than one shard file of the extent (reconcile has not yet removed the
+residue) is not scrubbed until it holds one. Shards of a conversion made before
+the CoW layout live in `.dat` and are not covered.
+
 ## A bulk read's refusal keeps its status code
 
 `MSG_READ_BYTES` refuses a mis-routed read with `FailedPrecondition` and a
