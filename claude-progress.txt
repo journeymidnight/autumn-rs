@@ -1,3 +1,10 @@
+Date: 2026-10-05 (2)
+TaskStatus: completed
+Task scope: user "BUG-MERGE-STALE-SOURCE-DEDUP" → closed as superseded (user choice); new hypothesis recorded.
+Current summary: no code change. The count-derived source attribution was deleted by 4fac151a; the union-max dedup that replaced it is safe because no unflushed source record reaches the merged log (drain flushes + checkpoints at committed end, seal at lengths captured under freeze, 15 s commit deadline < 30 s freeze TTL, post-merge seq seeded from the union). Verified by reading, no test (user chose not to build the acceptance test). Entry deleted; reasoning in the commit message. New entry BUG-COMPACT-SEQ-BELOW-DROPPED (hypothesis: major compaction lowers SST seq below dropped records).
+Main gaps: BUG-COMPACT-SEQ-BELOW-DROPPED not reproduced. Stale comment at partition-server lib.rs "merge: populate the per-loc last_seq cache…" still describes per-source dedup, contradicting the union-max code below it.
+Next steps: user to decide on the stale comment and on reproducing the new hypothesis.
+
 Date: 2026-10-05 (1)
 TaskStatus: completed
 Task scope: user "BUG-E2E-FENCE-RECOVERY-STALLS".

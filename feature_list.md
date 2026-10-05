@@ -126,10 +126,11 @@
 - `passes: true`
 - **notes** (2026-10-02): 根因是测试夹具，不是 0efc2aa 的生产缺陷：测试 EN 用随手写的 disk_id（1/2/3）启动，manager 注册时另外分配 disk_id，重建指令钉住目标节点的 manager disk，EN 本地 disk 不在其中 → 拒绝。生产中 `autumn-op format` 把分配的 id 写进数据目录，二者一致。修法：`support::format_node`（先注册取分配的 disk_id 再按它启动 EN），晚注册的备用节点在注册后启动；5 个用例全绿。
 
-### BUG-MERGE-STALE-SOURCE-DEDUP — stale checkpoint extent counts can assign replay to the wrong source max_seq
-- **Trigger** (2026-09-29 external review of BUG-MERGE-SOURCE-REPLAY-OFFSET): existing `dedup_at` derives post-merge source regions from cumulative checkpoint-time `log_extent_count`. If one source grows while another truncates, stale counts can misattribute an extent to the other source; independent source sequence spaces then make `ts <= wrong_src_max` capable of dropping an unflushed record.
-- **Scope**: establish a durable source-boundary representation at merge time or remove count-derived source attribution without reverting to unsafe global sequence dedup. Keep the cursor-offset replay optimization independent from this work.
-- **Acceptance**: construct a reachable source-growth plus prefix-truncation merge shape with overlapping independent sequence numbers; crash-reopen preserves every ACKed record; the pre-fix implementation fails the test; no WAL/checkpoint format change unless explicitly approved.
+### BUG-COMPACT-SEQ-BELOW-DROPPED — major compaction 让 SST 的 seq 低于它丢掉的记录，游标失效时整段回放的去重门槛偏低（假设，未复现）
+- **Trigger** (2026-10-05，关闭 BUG-MERGE-STALE-SOURCE-DEDUP 时读代码发现): 恢复的回放去重门槛是已加载 SST 的 `seq_num` 最大值（merge 后取各源并集），前提是"日志里每条已 flush 的记录 ≤ 它所在 SST 集合的 max seq"。但 compaction 输出的 `seq_num` 只取**保留下来**的条目的最大 ts（`do_compact` → `SstBuilder::add`），major compaction 丢掉 tombstone / 过期条目后 seq 可以低于它们；只剩丢弃项的输出 seq 为 0。打开时 seq 计数器也从这个值起步，新写入可能拿到低于旧日志记录的 seq。
+- **假设的危害时序**: 写 put K@500、del K@1000 → flush → major compaction 丢掉二者（SST max 降到 < 500）→ 重启，新 put K 拿到 seq 501 并 flush → 某次打开 checkpoint 游标解析不到（merge 空 tail 被回收等），回放从头走已 flush 的日志区，门槛 < 1000 → 旧 del K@1000 进 memtable，遮住已 ACK 的 put K@501。只在游标解析不到时可达；merge 时另一源更高的 seq 可能恰好掩盖。
+- **Scope**: 先复现（确定性测试按上述时序构造，需让游标解析不到）；成立再定修法（例如 compaction 输出带输入的 max seq，或 seq 计数器不低于历史最大值），不成立则关闭并记录原因。
+- **Acceptance**: 有按上述时序构造的测试，修复前红、修复后绿；不可复现则关闭并写明原因。
 - `passes: false`
 
 ### BUG-PS-SHUTDOWN-CLONE — background region sync can reopen a drained partition
