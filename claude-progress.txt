@@ -1,3 +1,10 @@
+Date: 2026-10-05 (7)
+TaskStatus: completed
+Task scope: user — ledger cleanup (delete passes:true entries; F-STREAM-ATREST-CKSUM status stale).
+Current summary: deleted 21 passes:true entries from feature_list (git history is the record). F-STREAM-ATREST-CKSUM Status rewritten to current state (increments 1+2 on main: sidecar, scrub + DfResp.scrub_rot isolation, EC pre-encode content check e0b8861/1ffaa93/5720408); remaining EC .shard content check + acceptance re-check; stays passes:false. No code change.
+Main gaps: F-EN-WIRE-AUTH is in substance covered by the cluster-secret work (Client role on EN admits only READ_BYTES/READ_BYTES_BULK/CLIENT_AUTH; Peer/Admin need the HMAC challenge) but its acceptance asks for per-class reject metrics, which do not exist (WARN log only) — user to decide close vs keep. F-REVIEW-R1-GC-COMPLETE-SCAN: code guards in (exact-length reads, scanned==sealed_length and empty carry before punch, unit tests) but the real two-replica truncation / checksum on-off / PS hard-restart acceptance is not done. F-FUSE-READ-LATENCY-NOT-BANDWIDTH has no passes field.
+Next steps: user decisions above.
+
 Date: 2026-10-05 (6)
 TaskStatus: completed
 Task scope: user "BUG-FLUSH-CKPT-FAIL-UNLISTED-SST先复现吧" + "合理的路径确实应该是先追加 checkpoint 到 meta stream， 然后再修改内存".
