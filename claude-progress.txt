@@ -1,3 +1,11 @@
+Date: 2026-10-05 (6)
+TaskStatus: completed
+Task scope: user "BUG-FLUSH-CKPT-FAIL-UNLISTED-SST先复现吧" + "合理的路径确实应该是先追加 checkpoint 到 meta stream， 然后再修改内存".
+Current summary: reproduced, then fixed. Repro: flush checkpoint fails (SST in memory, unlisted, imm popped) then a major compaction's checkpoint fails (output stamped with that flush's vp_head) -> GC floor above the durable cursor -> GC punches the log holding inline writes/deletes -> SIGKILL + reopen lost 20 ACKed puts and resurrected 5 deletes (3/3); each failure alone harmless. Fix: every checkpoint is appended BEFORE the in-memory table list changes. Flush commit appends tables+new SST, then pushes the SST and pops the imm (on failure the imm stays queued and is re-flushed); do_compact builds the post-compaction list locally, appends, then assigns it. New PartitionData::publish_lock held by all five publishers (flush commit, compaction, no-op compaction checkpoint, freeze checkpoint, merged open) from snapshot through ack to the memory change. Removed publisher_invariant_tests (simulated the old snapshot-order rule). Failpoints fail_nth_flush_checkpoint / fail_next_compaction_checkpoint; child-PS harness moved to tests/support (ChildPs, ChildFailpoints, child_ps_main). Entry deleted from feature_list.
+Verification: system_compact_checkpoint_fail 4 cases green x4 (repro + 2 single-failure controls + failed-compaction-must-not-swap); ablation (memory change before the append in flush and compaction) turns the repro and the must-not-swap case red, controls green. partition-server lib 274. 42 manager integration suites green (flush/compaction/GC/row-truncate/split/merge/recovery/failover/shutdown/replay families). No perf run: write hot path untouched; flush commit still awaits one meta append; imm popped one meta append later (still serves reads). Review: fable, no high; applied comment fixes (pre-flush republishes the queued imm; failpoint doc; lock cost stated as healthy-path bound).
+Main gaps: publishers now wait on each other's meta append (up to the append timeout when a meta replica hangs); not benchmarked.
+Next steps: none for this task.
+
 Date: 2026-10-05 (5)
 TaskStatus: completed
 Task scope: user "F-REVIEW-V3-COMPACT-CHECKPOINT" (review.md 4.3: GC recovery chain after a failed compaction checkpoint).

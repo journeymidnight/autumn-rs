@@ -1423,6 +1423,107 @@ pub fn start_partition_server_killable(
     panic!("autumn-ps {ps_id} never accepted on {ps_addr}");
 }
 
+/// Failpoints a re-executed child PS arms before it connects. See `ChildPs`.
+#[derive(Clone, Copy, Default)]
+pub struct ChildFailpoints {
+    /// The n-th flush commit fails its checkpoint (0 = none).
+    pub flush_checkpoint_nth: u64,
+    /// The first compaction fails its checkpoint (outputs already written).
+    pub compaction_checkpoint: bool,
+}
+
+/// Environment of a re-executed child PS:
+/// `<ps_id> <manager> <ps addr> <flush nth> <compaction 0|1>`.
+const CHILD_PS_ENV: &str = "AUTUMN_TEST_CHILD_PS";
+
+/// A partition server running as a re-executed copy of THIS test binary, so a
+/// test can arm in-process failpoints in it and still SIGKILL it
+/// (`KillablePs` runs the real `autumn-ps`, which no test can arm). The test
+/// binary must define `#[test] fn child_ps() { support::child_ps_main() }`;
+/// that test is a no-op in an ordinary run. A child outlives a parent killed
+/// from outside the test (an outer timeout); kill it by hand.
+pub struct ChildPs(std::process::Child);
+
+impl ChildPs {
+    pub fn spawn(
+        ps_id: u64,
+        mgr_addr: SocketAddr,
+        ps_addr: SocketAddr,
+        fp: ChildFailpoints,
+    ) -> Self {
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "child_ps", "--nocapture", "--test-threads=1"])
+            .env(
+                CHILD_PS_ENV,
+                format!(
+                    "{ps_id} {mgr_addr} {ps_addr} {} {}",
+                    fp.flush_checkpoint_nth,
+                    u8::from(fp.compaction_checkpoint)
+                ),
+            )
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child PS");
+        let mut ps = ChildPs(child);
+        for _ in 0..600 {
+            if std::net::TcpStream::connect_timeout(&ps_addr, Duration::from_millis(200)).is_ok() {
+                return ps;
+            }
+            if let Some(status) = ps.0.try_wait().expect("poll child PS") {
+                panic!("child PS exited before accepting: {status} (its stderr is above)");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("child PS never accepted on {ps_addr}");
+    }
+
+    /// SIGKILL and reap: what is durable is what was durable before it.
+    pub fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for ChildPs {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Body of a test binary's `child_ps` test: when re-executed by
+/// `ChildPs::spawn`, arm the failpoints and serve until SIGKILLed; otherwise
+/// return at once.
+pub fn child_ps_main() {
+    let Ok(spec) = std::env::var(CHILD_PS_ENV) else {
+        return;
+    };
+    let f: Vec<&str> = spec.split(' ').collect();
+    let ps_id: u64 = f[0].parse().unwrap();
+    let mgr = f[1].to_string();
+    let ps_addr: SocketAddr = f[2].parse().unwrap();
+    // The cluster secret every server here proves.
+    cluster_secret_file();
+    let nth: u64 = f[3].parse().unwrap();
+    if nth > 0 {
+        autumn_partition_server::fail_nth_flush_checkpoint(nth);
+    }
+    if f[4] == "1" {
+        autumn_partition_server::background::fail_next_compaction_checkpoint();
+    }
+    compio::runtime::Runtime::new().unwrap().block_on(async move {
+        let ps = PartitionServer::connect_with_advertise_and_port(
+            ps_id,
+            &mgr,
+            Some(ps_addr.to_string()),
+            ps_addr,
+        )
+        .await
+        .expect("connect partition server");
+        ps.sync_regions_once().await.expect("sync regions");
+        let _ = ps.serve(ps_addr).await;
+    });
+}
+
 /// `target/debug/<name>`, honouring `CARGO_TARGET_DIR`.
 fn support_binary_path(name: &str) -> std::path::PathBuf {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

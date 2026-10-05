@@ -1,46 +1,33 @@
-//! A compaction whose checkpoint append fails leaves the in-memory table list
-//! on its outputs while the durable checkpoint still names its inputs. The
-//! partition keeps serving; GC, foreground writes and later truncates then act
-//! on the in-memory list. A crash anywhere in that window must recover every
-//! acknowledged value and delete from the durable checkpoint plus the log.
+//! A checkpoint is published BEFORE the in-memory table list changes, so a
+//! failed checkpoint append leaves memory exactly as durable as it was, and a
+//! crash at any point afterwards recovers every acknowledged value and delete.
 //!
-//! What keeps that true:
-//! - The failed compaction does not truncate the row stream, and every later
-//!   truncate follows a checkpoint that succeeded with the current list. The
-//!   inputs' row extent therefore stays while the durable checkpoint names it.
-//! - GC's replay floor cannot pass the durable cursor: an output's vp_head is
-//!   the newest of its inputs', which the durable checkpoint already covers
-//!   when it lists every input, and the raise to `durable_ckpt_vp` is gated on
-//!   a checkpoint ack. (A flush whose own checkpoint failed leaves an SST no
-//!   durable checkpoint lists; compacting it under a second failed checkpoint
-//!   is outside this test.)
-//! - GC relocates what is live in memory, which a compaction never changes, at
-//!   fresh seqs past the durable cursor, so replay brings those values back
-//!   over the durable SSTs' stale pointers into the punched extent.
+//! `crash_after_failed_compaction_checkpoint_loses_nothing`: two flushed SSTs
+//! hold big values (ValuePointers into log extent E0), deletes of some of
+//! them, and small inline values; E0 is sealed and a third SST puts the
+//! durable cursor past it. A major compaction writes its output and its
+//! checkpoint fails (test failpoint): the partition must keep serving the
+//! three inputs, the output left as orphan bytes in the row stream. The test
+//! then overwrites and deletes keys, force-GCs E0 (relocating the live values
+//! and punching it), writes again, and SIGKILLs the PS; the reopened
+//! partition must serve the exact acknowledged state. A later major
+//! compaction then publishes and truncates past both the inputs and the
+//! orphaned output, and a second reopen must serve the same state.
 //!
-//! The scenario: two flushed SSTs hold big values (ValuePointers into log
-//! extent E0), deletes of some of them, and small inline values; E0 is sealed
-//! and a third SST puts the durable cursor past it. A major compaction swaps
-//! in one output and its checkpoint fails (test failpoint). Inside the window
-//! the test overwrites and deletes keys, force-GCs E0 (relocating the live
-//! values and punching it), writes again, and SIGKILLs the PS while the
-//! durable checkpoint still names the three inputs. The reopened partition
-//! must serve the exact acknowledged state. A later major compaction then
-//! publishes and truncates past both the inputs and the orphaned output, and a
-//! second reopen must serve the same state.
+//! `unlisted_flush_case`: a flush whose checkpoint fails, then a compaction
+//! whose checkpoint fails (and each alone as a control). When either changed
+//! memory before its append, the flush's SST sat in the table list with no
+//! durable checkpoint naming it, the failed compaction's output carried that
+//! flush's vp_head, GC's floor rose past the durable cursor, and a crash lost
+//! the inline writes and deletes in between.
 //!
-//! The PS runs as a child process (this test binary re-executed into
-//! `child_ps`) so the failpoint can be armed in it and it can be SIGKILLed: a
-//! graceful stop would flush and publish a checkpoint on the way out, closing
-//! the window before the "crash".
+//! The PS runs as a child process (`support::ChildPs`, this test binary
+//! re-executed) so the failpoints can be armed in it and it can be SIGKILLed:
+//! a graceful stop would flush and publish a checkpoint on the way out.
 //!
-//! Ablation: letting the failed compaction go on to truncate the row stream
-//! makes the reopen load SSTs from a dropped extent, and this test fails. GC
-//! here punches only E0, well below the floor, so the test does not
-//! discriminate the floor itself (the `system_gc_*` tests do).
-//!
-//! `child_ps` passes as a no-op in an ordinary run. A child outlives a parent
-//! killed from outside the test (an outer timeout); kill it by hand.
+//! Ablation: changing the table list before the append (flush and
+//! compaction) turns both the compaction case (it serves the outputs) and the
+//! flush-then-compaction case (20 puts lost, 5 deletes back) red.
 
 mod support;
 
@@ -61,76 +48,14 @@ const PS_ID: u64 = 79;
 /// Above `VALUE_THROTTLE` (4 KiB): stored behind a ValuePointer in the log.
 const BIG_LEN: usize = 8 * 1024;
 const SMALL_KEYS: u32 = 40;
-/// Environment of a re-executed `child_ps`: `<ps_id> <manager> <ps addr>`.
-const CHILD_ENV: &str = "AUTUMN_TEST_COMPACT_CKPT_FAIL_CHILD";
-
 fn big(tag: u8) -> Vec<u8> {
     vec![tag; BIG_LEN]
 }
 
-/// The PS of the test, when this binary is re-executed with `CHILD_ENV` set:
-/// it arms the failpoint, serves until SIGKILLed, and never returns. Without
-/// `CHILD_ENV` it does nothing.
+/// The re-executed child PS (`support::ChildPs`).
 #[test]
 fn child_ps() {
-    let Ok(spec) = std::env::var(CHILD_ENV) else {
-        return;
-    };
-    let mut it = spec.split(' ');
-    let ps_id: u64 = it.next().unwrap().parse().unwrap();
-    let mgr = it.next().unwrap().to_string();
-    let ps_addr: SocketAddr = it.next().unwrap().parse().unwrap();
-    // The cluster secret every server here proves (installed by the helper).
-    cluster_secret_file();
-    autumn_partition_server::background::fail_next_compaction_checkpoint();
-    compio::runtime::Runtime::new().unwrap().block_on(async move {
-        let ps = autumn_partition_server::PartitionServer::connect_with_advertise_and_port(
-            ps_id,
-            &mgr,
-            Some(ps_addr.to_string()),
-            ps_addr,
-        )
-        .await
-        .expect("connect partition server");
-        ps.sync_regions_once().await.expect("sync regions");
-        let _ = ps.serve(ps_addr).await;
-    });
-}
-
-struct ChildPs(std::process::Child);
-
-impl ChildPs {
-    fn spawn(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr) -> Self {
-        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
-            .args(["--exact", "child_ps", "--nocapture", "--test-threads=1"])
-            .env(CHILD_ENV, format!("{ps_id} {mgr_addr} {ps_addr}"))
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn child PS");
-        let mut ps = ChildPs(child);
-        for _ in 0..600 {
-            if std::net::TcpStream::connect_timeout(&ps_addr, Duration::from_millis(200)).is_ok() {
-                return ps;
-            }
-            if let Some(status) = ps.0.try_wait().expect("poll child PS") {
-                panic!("child PS exited before accepting: {status} (its stderr is above)");
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        panic!("child PS never accepted on {ps_addr}");
-    }
-
-    /// SIGKILL and reap: what is durable is what was durable before it.
-    fn kill(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-impl Drop for ChildPs {
-    fn drop(&mut self) {
-        self.kill();
-    }
+    child_ps_main();
 }
 
 async fn stream_extents(mgr: &RpcClient, stream_id: u64) -> Vec<u64> {
@@ -207,6 +132,18 @@ async fn live_sst_count(ps: &RpcClient) -> usize {
         partition_rpc::rkyv_decode(&resp).expect("decode DiagPartitionVpResp");
     assert_eq!(r.code, partition_rpc::CODE_OK, "diag partition vp: {}", r.message);
     r.sst_vp_heads.len()
+}
+
+/// Wait for a major compaction to start writing: it rolls the row tail first
+/// (`before` is the tail it rolls off; a successful one may then truncate it
+/// away). GC dispatched after this runs after the compaction (one maintenance
+/// task).
+async fn wait_row_roll(mgr: &RpcClient, row: u64, before: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while stream_extents(mgr, row).await.last() == Some(&before) {
+        assert!(std::time::Instant::now() < deadline, "the compaction never rolled the row tail");
+        compio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// The row extents of the SSTs the DURABLE checkpoint lists.
@@ -317,7 +254,15 @@ fn crash_after_failed_compaction_checkpoint_loses_nothing() {
         .expect("stream client");
 
         let ps1_addr = pick_addr();
-        let mut child = ChildPs::spawn(PS_ID, mgr_addr, ps1_addr);
+        let mut child = ChildPs::spawn(
+            PS_ID,
+            mgr_addr,
+            ps1_addr,
+            ChildFailpoints {
+                compaction_checkpoint: true,
+                ..Default::default()
+            },
+        );
         let ps = RpcClient::connect(ps1_addr).await.expect("connect ps1");
         let mut want = Expected::new();
 
@@ -348,18 +293,10 @@ fn crash_after_failed_compaction_checkpoint_loses_nothing() {
         assert_eq!(inputs_row.len(), 3, "three durable SSTs before the compaction");
         assert_eq!(live_sst_count(&ps).await, 3);
 
-        // The major compaction swaps one output in; its checkpoint fails.
+        // The major compaction writes its output; its checkpoint fails.
+        let row_before_compaction = *stream_extents(&mgr, row).await.last().expect("row tail");
         ps_compact(&ps, PART).await;
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while live_sst_count(&ps).await != 1 {
-            assert!(std::time::Instant::now() < deadline, "the compaction never swapped");
-            compio::time::sleep(Duration::from_millis(100)).await;
-        }
-        assert_eq!(
-            checkpoint_sst_extents(&sc, meta).await,
-            inputs_row,
-            "the failpoint must leave the durable checkpoint on the inputs"
-        );
+        wait_row_roll(&mgr, row, row_before_compaction).await;
 
         // Inside the window: writes, GC of E0, writes.
         for i in 0..4u8 {
@@ -380,9 +317,10 @@ fn crash_after_failed_compaction_checkpoint_loses_nothing() {
         put(&ps, &mut want, "d0", big(0x22)).await;
         assert_state(&ps, &want, "before the crash").await;
 
-        // The window is still open at the crash.
-        assert_eq!(live_sst_count(&ps).await, 1);
+        // The compaction finished before GC ran (one task): it failed, and the
+        // partition still serves what the durable checkpoint lists.
         assert_eq!(checkpoint_sst_extents(&sc, meta).await, inputs_row);
+        assert_eq!(live_sst_count(&ps).await, 3, "a failed checkpoint must not swap");
         drop(ps);
         child.kill();
 
@@ -421,4 +359,143 @@ fn crash_after_failed_compaction_checkpoint_loses_nothing() {
         let ps = reopened(ps3_addr, &mgr, &sc, row, meta).await;
         assert_state(&ps, &want, "after the second reopen").await;
     });
+}
+
+/// Raw flush whose outcome the caller judges (`ps_flush` asserts success).
+async fn flush_raw(ps: &RpcClient) -> bool {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_MAINTENANCE,
+            partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
+                part_id: PART,
+                op: partition_rpc::MAINTENANCE_FLUSH,
+                extent_ids: vec![],
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_dead_bytes_high: None,
+                gc_empty_only: false,
+                gc_policy_is_standing: false,
+                op_id: 0,
+            }),
+        )
+        .await;
+    match resp {
+        Ok(b) => {
+            partition_rpc::rkyv_decode::<partition_rpc::MaintenanceResp>(&b)
+                .map(|r| r.code == partition_rpc::CODE_OK)
+                .unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+/// A flush whose checkpoint fails, then a major compaction whose checkpoint
+/// fails, then GC of the log extent holding the inline puts and deletes
+/// written between the durable cursor C and that flush's vp_head H, then a
+/// crash. Had either changed memory first, GC's floor would sit at H while
+/// recovery replays from C, and those writes (no ValuePointer, so nothing to
+/// relocate) would be gone.
+///
+/// `flush_fails` / `compaction_fails` pick which checkpoint fails; each
+/// control (one failure only) must keep everything too.
+fn unlisted_flush_case(flush_fails: bool, compaction_fails: bool) {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        register_two_nodes(&mgr, n1_addr, n2_addr, 951).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, PART, log, row, meta, b"a", b"z").await;
+        let sc = StreamClient::connect(
+            &mgr_addr.to_string(),
+            "unlisted-flush-probe".to_string(),
+            1 << 20,
+            Rc::new(ConnPool::new()),
+        )
+        .await
+        .expect("stream client");
+
+        let ps1_addr = pick_addr();
+        let mut child = ChildPs::spawn(
+            PS_ID,
+            mgr_addr,
+            ps1_addr,
+            ChildFailpoints {
+                // The first flush publishes C; the second is the unlisted one.
+                flush_checkpoint_nth: if flush_fails { 2 } else { 0 },
+                compaction_checkpoint: compaction_fails,
+            },
+        );
+        let ps = RpcClient::connect(ps1_addr).await.expect("connect ps1");
+        let mut want = Expected::new();
+
+        // SST 1: its checkpoint is durable, cursor C in E0.
+        for i in 0..20u32 {
+            put(&ps, &mut want, &format!("b{i:02}"), format!("base-{i}").into_bytes()).await;
+        }
+        assert!(flush_raw(&ps).await, "the first flush must publish");
+
+        // [C, H): inline puts and deletes, still in E0. Seal E0 and write into
+        // E1, so the second flush's vp_head H is in E1.
+        for i in 0..20u32 {
+            put(&ps, &mut want, &format!("k{i:02}"), format!("unlisted-{i}").into_bytes()).await;
+        }
+        for i in 0..5u32 {
+            delete(&ps, &mut want, &format!("b{i:02}")).await;
+        }
+        let e0 = *stream_extents(&mgr, log).await.last().expect("log tail");
+        assert_eq!(roll_tails(&ps, vec![(log, e0)]).await, 1, "roll the log tail");
+        put(&ps, &mut want, "x0", b"after-roll".to_vec()).await;
+
+        // SST 2; the failed checkpoint is reported to the caller.
+        assert_eq!(flush_raw(&ps).await, !flush_fails, "second flush outcome");
+
+        // The major compaction. Its pre-flush re-flushes an imm whose checkpoint
+        // failed (it stayed queued), so SST 2 is durable before the compaction's
+        // own checkpoint fails: the unlisted-SST state never forms.
+        let row_before_compaction = *stream_extents(&mgr, row).await.last().expect("row tail");
+        ps_compact(&ps, PART).await;
+        wait_row_roll(&mgr, row, row_before_compaction).await;
+
+        // GC E0, then one more write, then crash.
+        force_gc(&ps, vec![e0]).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while stream_extents(&mgr, log).await.contains(&e0) {
+            assert!(std::time::Instant::now() < deadline, "GC never punched E0");
+            compio::time::sleep(Duration::from_millis(200)).await;
+        }
+        put(&ps, &mut want, "x1", b"after-gc".to_vec()).await;
+        assert_state(&ps, &want, "before the crash").await;
+        drop(ps);
+        child.kill();
+
+        let ps2_addr = pick_addr();
+        start_partition_server(PS_ID, mgr_addr, ps2_addr);
+        let ps = reopened(ps2_addr, &mgr, &sc, row, meta).await;
+        assert_state(&ps, &want, "after the crash").await;
+    });
+}
+
+#[test]
+fn failed_flush_then_failed_compaction_checkpoint_loses_nothing() {
+    unlisted_flush_case(true, true);
+}
+
+#[test]
+fn failed_flush_checkpoint_alone_loses_nothing() {
+    unlisted_flush_case(true, false);
+}
+
+#[test]
+fn failed_compaction_checkpoint_after_a_published_flush_loses_nothing() {
+    unlisted_flush_case(false, true);
 }

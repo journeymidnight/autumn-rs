@@ -1449,22 +1449,25 @@ Regression (real manager/EN/PS, with reopen and a paused concurrent flush):
 cargo test -p autumn-manager --test system_row_truncate_live_refs --test system_row_truncate_queued_flush -- --test-threads=1
 ```
 
-### A failed compaction checkpoint loses nothing on a crash
+### A failed checkpoint changes nothing (flush or compaction)
 
-A compaction swaps its outputs into the partition before it appends the
-checkpoint that names them. If that append fails, the PS logs `compaction:`
-with the error (the op reports FAILED) and keeps serving from the outputs while
-the durable checkpoint still names the inputs. Nothing to do: the inputs' row
-extent stays until a later checkpoint lists the current tables, GC never
-punches log the durable checkpoint still replays, and values GC moves in the
-meantime are replayed back after a crash. The next flush or compaction
-checkpoint closes the window, and the orphaned output's row extent is dropped
-by a later compaction's truncate.
+A flush or compaction appends the checkpoint that names its new tables BEFORE
+the partition starts serving them. If the append fails, the PS logs the error
+(`compaction:` for a compaction, `background flush commit error:` for a
+flush) and keeps serving exactly what the durable checkpoint lists: a flush's
+memtable stays queued and is flushed again, and the SST it had uploaded, or a
+compaction's output, is left as unreferenced bytes in the row stream, which a
+later compaction's row truncate drops. Nothing to do; a crash at any point recovers every acknowledged
+write.
 
-Verify (fails the append with a test failpoint, then GC + writes, then SIGKILL
-and two reopens):
+This order matters. When memory changed first, a failed flush checkpoint
+followed by a failed compaction checkpoint let GC delete log that recovery
+still needed, and a crash lost acknowledged small writes and brought deletes
+back. Verify (failpoints in a SIGKILLed PS, GC between the failure and the
+crash):
 
 ```bash
+cargo build -p autumn-server --bins
 cargo test -p autumn-manager --test system_compact_checkpoint_fail
 ```
 

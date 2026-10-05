@@ -193,6 +193,19 @@ pub fn set_flush_test_pause(paused: bool) {
 fn flush_test_paused() -> bool {
     FLUSH_TEST_PAUSE.load(Ordering::Relaxed)
 }
+/// Test failpoint: `n > 0` makes the n-th flush commit from now fail its
+/// checkpoint as an append that never landed (0 = off). Only tests set it.
+static FLUSH_CHECKPOINT_FAIL_AT: AtomicU64 = AtomicU64::new(0);
+/// Arm `FLUSH_CHECKPOINT_FAIL_AT`: the `n`-th flush commit from now fails its
+/// checkpoint (1 = the next one). Only tests call this.
+pub fn fail_nth_flush_checkpoint(n: u64) {
+    FLUSH_CHECKPOINT_FAIL_AT.store(n, Ordering::Relaxed);
+}
+fn flush_checkpoint_failpoint() -> bool {
+    FLUSH_CHECKPOINT_FAIL_AT
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        == Ok(1)
+}
 /// Number of flushes fully committed (checkpoint published) since process start.
 /// Tests poll this for deterministic flush completion. See `FLUSH_COMMITS`.
 pub fn flush_commit_count() -> u64 {
@@ -500,8 +513,8 @@ pub(crate) fn ps_sst_inflight_cap() -> usize {
 /// parallel imm-flush drain cap on the P-log side.
 /// `background_flush_loop` uses `FuturesOrdered` with this cap; up to
 /// N imms can be building+uploading concurrently, then commit
-/// (`tables.push` / `imm.pop_front` / `save_table_locs_raw`) runs
-/// strictly serial in launch order — preserves the publish-ordering invariant.
+/// (`save_table_locs_raw`, then `tables.push` / `imm.pop_front`) runs
+/// strictly serial in launch order (see `commit_flush_outcome`).
 /// Range clamped to [1, 64].
 ///
 /// **Default = 1** (functionally equivalent to the original serial flow).
@@ -1233,6 +1246,12 @@ pub(crate) struct PartitionData {
     meta_stream_id: u64,
     tables: Vec<TableMeta>,
     sst_readers: Vec<Arc<SstReader>>,
+    /// Held by every checkpoint publisher from its table snapshot through the
+    /// append to the change of `tables` / `sst_readers` it publishes, which
+    /// happens only after the append acks. Only publishers change the list, so
+    /// the list in memory is never ahead of the durable checkpoint, and a later
+    /// snapshot never misses a change whose append is still in flight.
+    pub(crate) publish_lock: Rc<futures::lock::Mutex<()>>,
     has_overlap: Cell<u32>,
     /// What the last GC SELECTION pass resolved — `eid -> (sealed_length, refs)`
     /// plus the standing POLICY to judge them by — so the IDLE refresh tick can compute
@@ -1256,11 +1275,10 @@ pub(crate) struct PartitionData {
     /// `commit_flush_outcome_inner` — NEVER from in-memory state (`vp_*` or a
     /// MAX over live readers), and NEVER from a compaction publish (whose
     /// `compaction_output_vp_head` = MAX(input vp_heads) can regress backward).
-    /// Rationale: `commit_flush_outcome_inner` pushes the new SST into
-    /// `tables`/`sst_readers` BEFORE the checkpoint append acks, so any floor
-    /// derived from in-memory state can run ahead of what a crash-time recovery
-    /// will actually load — GC could punch a log region whose naming checkpoint
-    /// never landed → silent loss. This ack-gated value lets GC raise its
+    /// Rationale: the in-memory cursor (`vp_*`) runs past acked writes no SST
+    /// holds yet, so a floor derived from in-memory state can run ahead of what
+    /// a crash-time recovery will actually load — GC could punch a log region
+    /// whose naming checkpoint never landed → silent loss. This ack-gated value lets GC raise its
     /// replay floor to reclaim the fully-covered `[MIN-over-SST-vps, this)`
     /// region safely (proof: [[gc_replay_floor]] + the flush vp_head content-
     /// boundary invariant). Seeded at open from the recovered checkpoint's
@@ -6589,6 +6607,7 @@ async fn partition_thread_main(
         meta_stream_id,
         tables,
         sst_readers,
+        publish_lock: Rc::new(futures::lock::Mutex::new(())),
         has_overlap: Cell::new(if detected_overlap { 1 } else { 0 }),
         gc_debt_basis: RefCell::new(None),
         vp_extent_id: vp_eid,
@@ -10108,8 +10127,7 @@ pub(crate) async fn save_table_locs_raw(
     vp_extent_id: u64,
     vp_offset: u64,
     // BUG-LEASE-2 Phase 2: fence-floor snapshot, captured by the caller
-    // under the SAME borrow as `tables` (publish-ordering invariant: snapshot
-    // order = publish order, no await in between).
+    // under the SAME borrow as `tables`, both under `publish_lock`.
     fence_floors: Vec<(u64, u64)>,
 ) -> Result<()> {
     let locs = TableLocations {
@@ -10172,6 +10190,8 @@ async fn publish_freeze_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<
             log_info.extent_ids.last()
         ));
     }
+    let publish_lock = part.borrow().publish_lock.clone();
+    let _publish = publish_lock.lock().await;
     let (tables, floors) = {
         let p = part.borrow();
         (p.tables.clone(), snapshot_fence_floors(&p))
@@ -10377,17 +10397,11 @@ async fn run_flush_async_phase_inner(
 }
 
 /// commit phase. Must be called in strict launch order (i.e. the
-/// outcome for imm at front of the queue) — handles the atomic swap
-/// (table-publish + imm.pop_front + meta_stream checkpoint). NEVER
-/// reordered with respect to other commits.
-///
-/// invariant: NO `.await` between the `borrow_mut` block and
-/// the `stream_client.append` mpsc-send inside `save_table_locs_raw`.
-/// `FuturesOrdered` in `background_flush_loop` guarantees the per-
-/// partition concurrent flushes commit in launch order, so commits
-/// from this function and from `do_compact` interleave at single-
-/// threaded P-log granularity — meta_stream record order = borrow_mut
-/// order, as before.
+/// outcome for imm at front of the queue): meta_stream checkpoint, then
+/// table-publish + imm.pop_front. NEVER reordered with respect to other
+/// commits — `FuturesOrdered` in `background_flush_loop` commits the
+/// concurrent flushes in launch order, and `PartitionData::publish_lock`
+/// orders them against every other checkpoint publisher.
 pub(crate) async fn commit_flush_outcome(
     part: &Rc<RefCell<PartitionData>>,
     outcome: FlushOutcome,
@@ -10395,10 +10409,8 @@ pub(crate) async fn commit_flush_outcome(
     // Mode B fix (coco P1): release the claim-by-ptr on ANY error. An inner
     // error that left the imm claimed and still queued would make the
     // backoff-retry see it "already claimed" and skip it forever → permanent
-    // wedge. None can come before the pop today, but the release does not rely
-    // on that. Removing here is idempotent: if the
-    // inner already popped + removed (a later meta-append error), this is a
-    // no-op. Mirrors `run_flush_async_phase`'s release-on-error wrapper.
+    // wedge. A failed checkpoint append is such an error: the imm stays
+    // queued. Mirrors `run_flush_async_phase`'s release-on-error wrapper.
     let src_imm_ptr = outcome.src_imm_ptr;
     let result = commit_flush_outcome_inner(part, outcome).await;
     if result.is_err() {
@@ -10416,7 +10428,39 @@ async fn commit_flush_outcome_inner(
 ) -> Result<()> {
     let outcome_last_seq = outcome.new_meta.last_seq;
     let outcome_src_imm_ptr = outcome.src_imm_ptr;
-    let (tables_snapshot, vp_eid, vp_off, part_sc, meta_stream_id, floors_snapshot) = {
+    let publish_lock = part.borrow().publish_lock.clone();
+    let _publish = publish_lock.lock().await;
+    // Publish first: the checkpoint names the new SST before the table list
+    // does, and the imm leaves the queue only once that is durable. A failed
+    // append changes nothing in memory; the imm stays queued and is flushed
+    // again. Listing the SST and popping the imm first left an SST no durable
+    // checkpoint named; a compaction over it then lifted GC's floor past the
+    // durable cursor, and a crash lost the log in between
+    // (`system_compact_checkpoint_fail`).
+    let (tables_snapshot, part_sc, meta_stream_id, floors_snapshot) = {
+        let p = part.borrow();
+        let mut tables = p.tables.clone();
+        tables.push(outcome.new_meta.clone());
+        (
+            tables,
+            p.stream_client.clone(),
+            p.meta_stream_id,
+            snapshot_fence_floors(&p),
+        )
+    };
+    if flush_checkpoint_failpoint() {
+        return Err(anyhow!("flush checkpoint: test failpoint"));
+    }
+    save_table_locs_raw(
+        &part_sc,
+        meta_stream_id,
+        &tables_snapshot,
+        outcome.vp_eid,
+        outcome.vp_off,
+        floors_snapshot,
+    )
+    .await?;
+    {
         let mut p = part.borrow_mut();
         p.tables.push(outcome.new_meta);
         p.sst_readers.push(Arc::new(outcome.reader));
@@ -10451,32 +10495,13 @@ async fn commit_flush_outcome_inner(
         }
         // wake partition_loop on imm-full back-pressure.
         let _ = p.imm_drained_tx.unbounded_send(());
-        (
-            p.tables.clone(),
-            outcome.vp_eid,
-            outcome.vp_off,
-            p.stream_client.clone(),
-            p.meta_stream_id,
-            snapshot_fence_floors(&p),
-        )
-    };
-    // no `.await` between the borrow_mut drop above and the
-    // stream_client.append mpsc-send inside save_table_locs_raw.
-    save_table_locs_raw(
-        &part_sc,
-        meta_stream_id,
-        &tables_snapshot,
-        vp_eid,
-        vp_off,
-        floors_snapshot,
-    )
-    .await?;
+    }
     // BUG2: the checkpoint naming (vp_eid, vp_off) is now
     // DURABLE. By the flush vp_head invariant every log record strictly below it is in the
     // just-persisted SST set (or compaction-dead), so GC may safely raise its
     // replay floor to this position. Set ONLY here — after the ack — never from
     // in-memory state (see the `durable_ckpt_vp` field doc for the loss trap).
-    part.borrow().durable_ckpt_vp.set((vp_eid, vp_off));
+    part.borrow().durable_ckpt_vp.set((outcome.vp_eid, outcome.vp_off));
     // tables changed (new SST committed) → refresh the
     // advisory-input metrics so the next report_load_loop tick carries
     // accurate dead-data / minor-compact-pending volumes.
@@ -10573,6 +10598,8 @@ async fn publish_merged_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<
         flush_memtable_locked(part).await?;
         return Ok(());
     }
+    let publish_lock = part.borrow().publish_lock.clone();
+    let _publish = publish_lock.lock().await;
     let (sc, meta_stream_id, tables, vp, floors) = {
         let p = part.borrow();
         (
@@ -10617,9 +10644,8 @@ pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> 
 /// `FuturesOrdered` drives up to `ps_flush_inflight_cap()` concurrent
 /// `run_flush_async_phase` futures. Each future captures one imm
 /// (`Arc<Memtable>` clone) at launch time; completions are pulled in
-/// strict launch order, then `commit_flush_outcome` runs serially
-/// (preserves the publish-ordering invariant: borrow_mut order = mpsc-send order
-/// = meta_stream record order).
+/// strict launch order, then `commit_flush_outcome` runs serially, so
+/// checkpoints land in launch order.
 ///
 /// Why FuturesOrdered: matches the "concurrent build/upload, serial
 /// commit" semantics exactly without any reorder buffer or seq
@@ -14572,200 +14598,6 @@ mod maintenance_gate_tests {
     // D-r6: gc_concurrency_gate folded into AdmissionController.
     // Cross-partition concurrent-GC behaviour now exercised by
     // `admission_tests::admission_acquire_compact_and_gc_concurrency_caps`.
-}
-
-#[cfg(test)]
-mod publisher_invariant_tests {
-    //! locks in the metadata-publish ordering invariant that
-    //! `flush_one_imm` (lib.rs) and `do_compact` (background.rs) both rely
-    //! on for race-free concurrent publishing.
-    //!
-    //! ## The invariant
-    //!
-    //! Both publishers follow this pattern:
-    //!
-    //!   1. `borrow_mut` block: mutate `part.tables` / `part.sst_readers`,
-    //!      capture `tables_snapshot = part.tables.clone()` inside the
-    //!      borrow, drop the borrow.   (synchronous)
-    //!   2. `save_table_locs_raw(&snap, ...)`: rkyv_encode + build payload,
-    //!      then `stream_client.append.await`.   (synchronous until mpsc send)
-    //!
-    //! Three load-bearing properties make this race-free against a
-    //! concurrent publisher (flush vs compact, both running as separate
-    //! tasks on the single-threaded P-log compio runtime):
-    //!
-    //!   (P1) compio P-log runtime is single-threaded.
-    //!   (P2) the `borrow_mut` block contains no `.await`.
-    //!   (P3) the path from borrow_mut drop → rkyv_encode →
-    //!        stream_client.append → mpsc send is purely synchronous,
-    //!        with the first `.await` on `ack_rx` (after the message is
-    //!        in the per-stream worker FIFO mpsc).
-    //!
-    //! Together, (P1)–(P3) guarantee: `borrow_mut` order = mpsc-send
-    //! order = meta_stream record order.   The LATEST persisted record's
-    //! `tables_snapshot` therefore necessarily reflects all prior
-    //! borrow_mut mutations.
-    //!
-    //! ## What this test exercises
-    //!
-    //! Two simulated publishers ("flush" and "compact") run concurrently
-    //! within a single compio task via `futures::join!` (the canonical
-    //! way to multiplex two await-yielding futures on a single-threaded
-    //! runtime — exactly mirrors the production "two background tasks
-    //! interleave at await points" model).   Each publisher:
-    //!
-    //!   - takes `RefCell::borrow_mut`, mutates a shared "tables" Vec,
-    //!     captures snapshot, drops borrow (mirrors property P2);
-    //!   - synchronously sends the snapshot to a fake stream worker via
-    //!     `mpsc::unbounded_send` (mirrors property P3 — the first await
-    //!     is on `ack_rx`, after the message lands in the worker queue);
-    //!   - awaits ack.
-    //!
-    //! Asserts:
-    //!
-    //!   (A1) the worker receives both publishes;
-    //!   (A2) the LATER publish's snapshot includes the EARLIER publish's
-    //!        mutation (no stale persistence);
-    //!   (A3) the LATEST received snapshot equals the post-state of the
-    //!        shared tables (recovery would read this and reconstruct
-    //!        the correct latest state).
-    //!
-    //! ## What this test does NOT cover
-    //!
-    //! A future refactor that inserts an `.await` between the publisher's
-    //! borrow_mut drop and the mpsc send (violating P3) would silently
-    //! re-open the stale-snapshot race in production but would NOT fail
-    //! this test — because the test simulates the production pattern,
-    //! it does not validate it.   Inline comments at the production call
-    //! sites in `flush_one_imm` (lib.rs) and `do_compact`
-    //! (background.rs) state the invariant explicitly to flag any such
-    //! refactor at review time.
-
-    use futures::channel::{mpsc, oneshot};
-    use futures::StreamExt;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-
-    type WorkerMsg = (u32, Vec<u32>, oneshot::Sender<()>);
-
-    /// Mirrors `save_table_locs_raw`'s critical path: synchronous compute
-    /// → mpsc send → ack await.   Property (P3) is enforced by construction
-    /// (no `.await` between the borrow_mut drop in the caller and the
-    /// `unbounded_send` here; first await is `ack_rx`).
-    async fn fake_save_and_sync(
-        publisher_id: u32,
-        snapshot: Vec<u32>,
-        worker_tx: &mpsc::UnboundedSender<WorkerMsg>,
-    ) {
-        let (ack_tx, ack_rx) = oneshot::channel();
-        // Synchronous send (mirrors stream_client.append's mpsc-send into
-        // the per-stream worker queue).
-        worker_tx
-            .unbounded_send((publisher_id, snapshot, ack_tx))
-            .expect("worker tx should be open");
-        // First await on the publishing path.
-        ack_rx.await.expect("worker should ack");
-    }
-
-    /// Mirrors flush_one_imm / do_compact's borrow_mut-then-publish
-    /// pattern.
-    async fn publisher(
-        publisher_id: u32,
-        tables: Rc<RefCell<Vec<u32>>>,
-        worker_tx: mpsc::UnboundedSender<WorkerMsg>,
-    ) -> Vec<u32> {
-        // Property (P2): borrow_mut block contains no `.await`.
-        let snapshot = {
-            let mut t = tables.borrow_mut();
-            t.push(publisher_id);
-            t.clone()
-        };
-        // Property (P3): no `.await` between borrow_mut drop and mpsc
-        // send inside fake_save_and_sync.
-        fake_save_and_sync(publisher_id, snapshot.clone(), &worker_tx).await;
-        snapshot
-    }
-
-    #[test]
-    fn concurrent_publisher_ordering_invariant() {
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            let tables: Rc<RefCell<Vec<u32>>> = Rc::new(RefCell::new(Vec::new()));
-            let (worker_tx, mut worker_rx) = mpsc::unbounded::<WorkerMsg>();
-
-            // Fake stream worker: drains messages in FIFO order, acks each,
-            // records (publisher_id, snapshot) for assertion.
-            let received: Rc<RefCell<Vec<(u32, Vec<u32>)>>> = Rc::new(RefCell::new(Vec::new()));
-            let received_clone = received.clone();
-            let worker_task = compio::runtime::spawn(async move {
-                while let Some((id, snap, ack)) = worker_rx.next().await {
-                    received_clone.borrow_mut().push((id, snap));
-                    let _ = ack.send(());
-                }
-            });
-
-            // Run two publishers "concurrently" via futures::join! — the
-            // canonical way to multiplex two await-yielding futures on a
-            // single-threaded runtime (this is what compio P-log does for
-            // concurrent flush_one_imm + do_compact tasks).
-            let pub_flush = publisher(1, tables.clone(), worker_tx.clone());
-            let pub_compact = publisher(2, tables.clone(), worker_tx.clone());
-            let (snap_flush, snap_compact) = futures::join!(pub_flush, pub_compact);
-
-            // Drop sender to let worker exit.
-            drop(worker_tx);
-            let _ = worker_task.await;
-
-            let recv = received.borrow();
-            // (A1) both publishers reached the worker.
-            assert_eq!(recv.len(), 2, "worker should receive both publishes");
-
-            // The first received snapshot is from whichever publisher's
-            // borrow_mut completed first.   Because the synchronous path
-            // from borrow_mut drop to mpsc send is uninterrupted, send
-            // order == borrow_mut order.   Test that the LATER publisher's
-            // snapshot strictly extends the EARLIER's.
-            let (first_id, first_snap) = &recv[0];
-            let (_second_id, second_snap) = &recv[1];
-
-            // (A2) the LATER publisher's snapshot includes the EARLIER
-            // publisher's mutation.   This is the load-bearing assertion:
-            // it would FAIL if mpsc-send order diverged from borrow_mut
-            // order (i.e., if a future refactor introduced an `.await`
-            // between borrow_mut drop and the mpsc send).
-            assert_eq!(
-                first_snap.len(),
-                1,
-                "first publish's snapshot has 1 entry: {:?}",
-                first_snap
-            );
-            assert_eq!(
-                second_snap.len(),
-                2,
-                "second publish's snapshot has 2 entries: {:?}",
-                second_snap
-            );
-            assert!(
-                second_snap.contains(first_id),
-                "second publisher's snapshot must contain first publisher's id ({}); \
-                 got {:?} — invariant violated: borrow_mut order != mpsc-send order",
-                first_id,
-                second_snap
-            );
-
-            // (A3) the LATEST persisted record's snapshot equals the final
-            // shared state.   Recovery would read this record and reconstruct
-            // the union of all publishers' mutations — no stale persistence.
-            let final_tables = tables.borrow().clone();
-            assert_eq!(
-                *second_snap, final_tables,
-                "latest snapshot must equal final shared tables — \
-                 a stale latest record would mis-reconstruct after restart"
-            );
-
-            // Sanity on returned values.
-            assert_eq!(snap_flush.len() + snap_compact.len(), 3);
-        });
-    }
 }
 
 #[cfg(test)]

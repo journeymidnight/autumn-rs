@@ -173,10 +173,9 @@ pub fn gc_verdict_parked_count() -> u64 {
     GC_VERDICT_PARKED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Test failpoint: when armed, the next compaction that swaps its outputs into
-/// the table list fails its checkpoint as an append that never landed — the
-/// in-memory tables are the outputs, the durable checkpoint still names the
-/// inputs. One-shot; only ever set by tests.
+/// Test failpoint: when armed, the next compaction fails its checkpoint as an
+/// append that never landed, after its outputs are in the row stream.
+/// One-shot; only ever set by tests.
 static COMPACT_CHECKPOINT_FAIL: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 /// Arm `COMPACT_CHECKPOINT_FAIL` for the next compaction. Only tests call this.
@@ -345,9 +344,8 @@ pub(crate) fn compaction_output_vp_head(
 }
 
 /// The replay cursor a compaction's checkpoint publishes: the newest content
-/// boundary among the compaction's own output stamp and every table left in the
-/// partition (`p` is the post-swap state, borrowed together with the table
-/// snapshot the checkpoint lists).
+/// boundary among the compaction's own output stamp and every table the
+/// checkpoint lists (`readers`, the post-compaction set).
 ///
 /// The output stamp alone is the newest INPUT's boundary. A minor compaction
 /// takes older tables while a newer flush's SST stays live, so publishing only
@@ -359,13 +357,13 @@ pub(crate) fn compaction_output_vp_head(
 /// whole set instead of the inputs. A boundary in an extent `log_extent_ids`
 /// (fetched before the merge) does not name yet is skipped, which only errs early.
 fn checkpoint_vp_head(
-    p: &crate::PartitionData,
+    readers: &[Arc<SstReader>],
     output_vp_head: (u64, u64),
     log_extent_ids: &[u64],
 ) -> (u64, u64) {
     compaction_output_vp_head(
         std::iter::once(output_vp_head)
-            .chain(p.sst_readers.iter().map(|r| (r.vp_extent_id, r.vp_offset))),
+            .chain(readers.iter().map(|r| (r.vp_extent_id, r.vp_offset))),
         log_extent_ids,
     )
 }
@@ -380,9 +378,9 @@ pub(crate) async fn background_maintenance_loop(
 ) {
     // Compaction + GC folded onto ONE task (was background_compact_loop +
     // background_gc_loop). Single task => they are STRUCTURALLY serialized, so
-    // GC never reads `sst_readers` while a compaction is mid-publish: the
-    // recovery replay floor it computes always matches the durable checkpoint
-    // recovery would load, with NO GC-vs-compaction gate. Both sections still
+    // GC never runs while a compaction is mid-publish, with NO GC-vs-compaction
+    // gate (and `sst_readers` is never ahead of the durable checkpoint: every
+    // publisher changes it only after its append acks). Both sections still
     // acquire the single per-partition `maintenance_gate` vs SPLIT (which runs
     // on partition_loop, a different task, and must see no compact_row_append
     // nor log_stream GC append in flight while it seals). See lock notes.
@@ -2468,29 +2466,35 @@ async fn truncate_unreferenced_row_prefix(
     Ok(())
 }
 
-/// A no-op may follow a failed checkpoint append after an in-memory table
-/// swap. Publish the current tables before retrying truncation, just as a real
-/// compaction does. Never use the live WAL tail: active/queued data may not yet
-/// be in these SSTs. The durable cursor and SST boundaries are safe floors.
+/// A no-op compaction publishes the current tables before retrying
+/// truncation, just as a real compaction does. Never use the live WAL tail:
+/// active/queued data may not yet be in these SSTs. The durable cursor and SST
+/// boundaries are safe floors.
 async fn checkpoint_and_truncate_row_prefix(
     part: &Rc<RefCell<PartitionData>>,
     part_id: u64,
 ) -> Result<()> {
-    let (sc, log_id, meta_id) = {
+    let (sc, log_id, meta_id, publish_lock) = {
         let p = part.borrow();
-        (p.stream_client.clone(), p.log_stream_id, p.meta_stream_id)
+        (
+            p.stream_client.clone(),
+            p.log_stream_id,
+            p.meta_stream_id,
+            p.publish_lock.clone(),
+        )
     };
     let log_ids = sc.get_stream_info(log_id).await?.extent_ids;
+    let publish = publish_lock.lock().await;
     let (tables, floors, vp) = {
         let p = part.borrow();
         (
             p.tables.clone(),
             crate::snapshot_fence_floors(&p),
-            checkpoint_vp_head(&p, p.durable_ckpt_vp.get(), &log_ids),
+            checkpoint_vp_head(&p.sst_readers, p.durable_ckpt_vp.get(), &log_ids),
         )
     };
-    // No await between the snapshot and the checkpoint enqueue (publish order).
     save_table_locs_raw(&sc, meta_id, &tables, vp.0, vp.1, floors).await?;
+    drop(publish);
     truncate_unreferenced_row_prefix(part, part_id).await
 }
 
@@ -2712,10 +2716,9 @@ async fn emit_compact_chunk(
     Ok(chunk_bytes)
 }
 
-// clippy false-positive: every `part.borrow_mut()` here is `drop(p)`-ed before
-// the following `.await` (the publish-ordering invariant requires exactly this —
-// no await between the borrow_mut drop and the meta-stream mpsc send). The lint
-// flags the borrow because awaits exist later in the fn; it doesn't track the drop.
+// clippy false-positive: every `part.borrow()` / `borrow_mut()` here ends before
+// the following `.await`. The lint flags the borrow because awaits exist later
+// in the fn; it doesn't track the drop.
 #[allow(clippy::await_holding_refcell_ref)]
 pub(crate) async fn do_compact(
     part: &Rc<RefCell<PartitionData>>,
@@ -3010,56 +3013,26 @@ pub(crate) async fn do_compact(
 
     let output_tables = new_readers.len();
 
-    if new_readers.is_empty() {
-        // No new SSTs emitted (input had no kept entries). Just remove
-        // old tables and persist meta.
-        let mut p = part.borrow_mut();
-        remove_compacted_tables(&mut p, &compact_keys);
-        let tables_snapshot = p.tables.clone();
-        let floors_snapshot = crate::snapshot_fence_floors(&p);
-        let (ckpt_vp_eid, ckpt_vp_off) =
-            checkpoint_vp_head(&p, (compact_vp_eid, compact_vp_off), &log_extent_ids);
-        drop(p);
-        // invariant — DO NOT introduce an `.await` between the
-        // borrow_mut drop above and the mpsc send inside
-        // `save_table_locs_raw` below. See the matching comment in
-        // `flush_one_imm` (lib.rs). The invariant guarantees that
-        // concurrent flush + compact publishers (running as separate
-        // tasks on the single-threaded P-log compio runtime) cannot
-        // produce a stale-snapshot meta_stream checkpoint: borrow_mut
-        // order = mpsc-send order = meta_stream record order, so the
-        // latest record always reflects the latest in-memory state.
-        save_table_locs_raw(
-            &part_sc,
-            meta_stream_id,
-            &tables_snapshot,
-            ckpt_vp_eid,
-            ckpt_vp_off,
-            floors_snapshot,
-        )
-        .await?;
-        return Ok(CompactStats {
-            input_tables,
-            output_tables: 0,
-            entries_kept: 0,
-            entries_discarded,
-            output_bytes: 0,
-        });
-    }
-
-    // Drop local input-reader Arc clones BEFORE the swap. The partition's
-    // own `sst_readers` Vec still holds them via separate Arcs, so this
-    // doesn't free memory yet — but after the swap removes them from the
-    // partition's Vec, the Arc count drops to zero and the input SST
-    // bytes are released. Without this drop, `readers` would keep the
-    // Arc count at >=1 and the memory would be retained until function
-    // return.
+    // Drop local input-reader Arc clones: once the partition's list drops the
+    // inputs, their SST bytes are released instead of being retained until
+    // function return.
     drop(merge);
     drop(readers);
     drop(readers_with_meta);
 
-    let (tables_snapshot, floors_snapshot, (ckpt_vp_eid, ckpt_vp_off)) = {
-        let mut p = part.borrow_mut();
+    // Publish first, then change the table list: the checkpoint names the
+    // outputs before the partition serves them, so the list in memory is never
+    // ahead of the durable checkpoint. A failed append leaves the inputs in
+    // place and the outputs as orphan bytes in the row stream (dropped by a
+    // later compaction's truncate). The lock holds every other publisher off
+    // until the list has changed; without it a flush could snapshot the list
+    // while this append is in flight and publish it without the outputs.
+    let publish_lock = part.borrow().publish_lock.clone();
+    let _publish = publish_lock.lock().await;
+    let (tables, sst_readers, floors_snapshot, (ckpt_vp_eid, ckpt_vp_off)) = {
+        let p = part.borrow();
+        let mut tables = p.tables.clone();
+        let mut sst_readers = p.sst_readers.clone();
         // The outputs take their place by `last_seq`, not by list position:
         // see `sort_tables_by_seq`. Appending them at the newest end instead
         // broke reads when a flush completed during the compaction's awaits
@@ -3067,35 +3040,36 @@ pub(crate) async fn do_compact(
         // output first — the chaos fence+flush data-loss bug); inserting at
         // the oldest input's LIST slot broke them after a merge, whose list is
         // not in seq order.
-        remove_compacted_tables(&mut p, &compact_keys);
+        remove_compacted_tables(&mut tables, &mut sst_readers, &compact_keys);
         for (tbl_meta, reader) in new_readers {
-            p.tables.push(tbl_meta);
-            p.sst_readers.push(reader);
+            tables.push(tbl_meta);
+            sst_readers.push(reader);
         }
-        let pd = &mut *p;
-        crate::sort_tables_by_seq(&mut pd.tables, &mut pd.sst_readers);
-        (
-            p.tables.clone(),
-            crate::snapshot_fence_floors(&p),
-            checkpoint_vp_head(&p, (compact_vp_eid, compact_vp_off), &log_extent_ids),
-        )
+        crate::sort_tables_by_seq(&mut tables, &mut sst_readers);
+        let ckpt_vp = checkpoint_vp_head(
+            &sst_readers,
+            (compact_vp_eid, compact_vp_off),
+            &log_extent_ids,
+        );
+        (tables, sst_readers, crate::snapshot_fence_floors(&p), ckpt_vp)
     };
-
-    // invariant — see flush_one_imm in lib.rs for the full
-    // statement. No `.await` may be introduced between the borrow_mut
-    // drop and the mpsc send inside `save_table_locs_raw`.
     if COMPACT_CHECKPOINT_FAIL.swap(false, std::sync::atomic::Ordering::Relaxed) {
         return Err(anyhow::anyhow!("compaction checkpoint: test failpoint"));
     }
     save_table_locs_raw(
         &part_sc,
         meta_stream_id,
-        &tables_snapshot,
+        &tables,
         ckpt_vp_eid,
         ckpt_vp_off,
         floors_snapshot,
     )
     .await?;
+    {
+        let mut p = part.borrow_mut();
+        p.tables = tables;
+        p.sst_readers = sst_readers;
+    }
     Ok(CompactStats {
         input_tables,
         output_tables,
@@ -3106,14 +3080,15 @@ pub(crate) async fn do_compact(
 }
 
 pub(crate) fn remove_compacted_tables(
-    part: &mut PartitionData,
+    tables: &mut Vec<TableMeta>,
+    sst_readers: &mut Vec<Arc<SstReader>>,
     compact_keys: &HashSet<(u64, u64)>,
 ) {
     let mut i = 0;
-    while i < part.tables.len() {
-        if compact_keys.contains(&part.tables[i].loc()) {
-            part.tables.remove(i);
-            part.sst_readers.remove(i);
+    while i < tables.len() {
+        if compact_keys.contains(&tables[i].loc()) {
+            tables.remove(i);
+            sst_readers.remove(i);
         } else {
             i += 1;
         }

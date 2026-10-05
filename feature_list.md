@@ -14,12 +14,6 @@
 
 ## Active
 
-### BUG-FLUSH-CKPT-FAIL-UNLISTED-SST — flush 的 checkpoint 失败留下无持久 checkpoint 列出的 SST，再叠加一次失败的 compaction checkpoint 可能让 GC 删掉回放需要的日志（假设，未复现）
-- **Trigger** (2026-10-05，验证 checkpoint 失败后的 GC 恢复链时独立评审提出): `commit_flush_outcome_inner` 先把新 SST 放进 `p.tables` 并 pop 掉 imm，再追加 checkpoint；追加失败时 imm 已没了，这个 SST（vp_head = H，大于持久 cursor C）不在任何持久 checkpoint 里。单独发生时安全（GC 地板仍是最老 SST 的 vp_head 与 `durable_ckpt_vp` 的较大者，≤ C；崩溃后从 C 回放）。若在下一次成功的 checkpoint 之前，一次 major compaction 把它换成输出（vp_head = H）且这次 checkpoint 也失败，GC 地板变成 pos(H)，[C, H) 内已 seal 的日志 extent 可被 punch：大 value 会被搬迁，但这段里的 inline 值与 tombstone 只在日志和那个未列出的 SST 里；崩溃后按旧 checkpoint 从 C 回放即丢失已确认的写、删除复活。
-- **Scope**: 先复现：flush checkpoint 失败点 + compaction checkpoint 失败点，中间写 inline put 与 delete 并 seal 所在日志 extent，FORCE_GC 它，SIGKILL，重开。成立再定修法（例如 flush 失败不 pop、或 GC 地板只取持久 checkpoint 列出的 SST）。
-- **Acceptance**: 按上述时序的测试修复前红、修复后绿；不可复现则关闭并记录原因。
-- `passes: false`
-
 ### F-EXTENT-REPAIR-VISIBILITY — 挂着的修复请求可见、可撤销
 - **Trigger** (2026-10-02 用户): "补齐缺的，改wire结构"（F-EXTENT-REPAIR 留下的两项：`autumn-op health` 不显示哪些 slot 挂着请求；没有 `repair --cancel`）。
 - **Scope**: `ProblemSlot.repair_requested`、`ExtentHealthSummaryResp.repair_requested_slots`（wire 54）；`autumn-op health`、dashboard 标出；`OP_KIND_REPAIR_CANCEL` + `autumn-op repair --cancel <EXT>... | --cancel --node N`，撤回请求并重置这些 slot 的 degraded 计时（Armed policy 不会马上再提）。

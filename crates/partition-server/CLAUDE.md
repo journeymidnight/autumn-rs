@@ -786,11 +786,11 @@ P-sst: flush_worker_loop
   4. SstReader::from_bytes(...)
   5. resp_tx.send(Ok((new_meta, reader)))
 
-P-log: continuation
-  6. part.tables.push(new_meta)
-  7. part.sst_readers.push(Rc::new(reader))
-  8. part.imm.pop_front()
-  9. save_table_locs_raw(part_sc, meta_stream_id, part.tables.clone(), vp)
+P-log: continuation (under publish_lock)
+  6. save_table_locs_raw(part_sc, meta_stream_id, part.tables + new_meta, vp)
+  7. part.tables.push(new_meta)
+  8. part.sst_readers.push(Arc::new(reader))
+  9. part.imm.pop_front()
 ```
 
 P-sst spawn failure is fatal-for-this-partition: `open_partition` returns Err and
@@ -960,25 +960,46 @@ major truncates anyway, the queued keys survive a reopen). Each truncate logs
 
 No-op dispatched compactions retry the same safe prefix cut under the
 maintenance gate. They first publish the current table snapshot with a replay
-cursor from durable checkpoint / SST boundaries (never the active WAL tail): a
-previous failed compaction may already have swapped the in-memory table list
-without publishing it. If that checkpoint fails, truncation is not attempted.
+cursor from durable checkpoint / SST boundaries (never the active WAL tail).
+If that checkpoint fails, truncation is not attempted.
 
-**A compaction whose checkpoint fails leaves the durable set complete.** The
-swap happens before the append, so the partition then serves outputs the
-durable checkpoint does not list. Three things keep a crash in that window
-lossless: no arm truncates after a failed compaction, and every truncate
-follows a checkpoint of the current list; the GC floor cannot pass the durable
-cursor (an output's vp_head is its newest input's, and `durable_ckpt_vp` is
-ack-gated); GC relocates live values at fresh seqs past that cursor, so replay
-puts them back over the durable SSTs' stale pointers into a punched extent.
-`crates/manager/tests/system_compact_checkpoint_fail.rs` (a failpoint,
-`fail_next_compaction_checkpoint`, fails the append in a PS child process that
-is SIGKILLed after GC and writes in the window; red if the failed arm
-truncates). Boundary: the floor argument assumes every input is in the durable
-checkpoint. A flush whose own checkpoint fails leaves its SST unlisted, and a
-failed compaction over it could raise the floor past the durable cursor —
-reasoned, not reproduced (feature_list `BUG-FLUSH-CKPT-FAIL-UNLISTED-SST`).
+### Checkpoint first, then the table list
+
+INVARIANT: every change of `tables` / `sst_readers` is published to the meta
+stream BEFORE it is made in memory. A flush appends a checkpoint listing the
+current tables plus its new SST, and only after the ack pushes the SST and pops
+the imm; a compaction appends the post-compaction list and only after the ack
+assigns it. A failed append changes nothing: a flush's imm stays queued and is
+flushed again (its uploaded SST becomes orphan bytes in the row stream), a
+compaction's outputs become orphan bytes that a later compaction's truncate
+drops. So the table list in memory is never ahead of the durable checkpoint, and
+everything that reads it — GC's replay floor, the row truncate's keep set,
+split's and merge's freeze checkpoints — sees only what a crash-time recovery
+would load.
+
+Why: both used to change memory first. A flush whose append failed left its SST
+in the list, listed by no durable checkpoint, with its imm already gone; a major
+compaction over it whose append also failed left one output stamped with that
+flush's vp_head, and GC's floor rose there while recovery still replayed from
+the older durable cursor. GC punched the log between them — inline values and
+deletes, which have no ValuePointer to relocate — and a crash lost 20
+acknowledged puts and brought 5 deletes back.
+`crates/manager/tests/system_compact_checkpoint_fail.rs` (failpoints
+`fail_nth_flush_checkpoint` / `fail_next_compaction_checkpoint`, armed in a PS
+child process that is SIGKILLed): both failures red under memory-first, each
+alone green either way, and a failed compaction must leave the inputs served
+(red under memory-first).
+
+`PartitionData::publish_lock` (an async mutex) is held by every checkpoint
+publisher — flush commit, compaction, the no-op compaction's checkpoint, the
+split/merge freeze checkpoint, the merged open — from its snapshot through the
+ack to the memory change. Only publishers change the list, so a later snapshot
+can never miss a change whose append is still in flight (without the lock a
+flush could snapshot while a compaction's append is out and publish a list
+without the outputs). The cost is that publishers wait on each other's meta
+append: one small append on a healthy stream, up to the append timeout when a
+meta replica is unresponsive (each publisher already awaited its own append
+before). Reads are unaffected: the imm keeps serving until it is popped.
 
 ### Major Compaction (`compact_tx`, e.g. after overlap detected)
 `do_compact(major=true)`: processes all tables, additionally drops tombstones
@@ -1075,9 +1096,10 @@ needs inputs whose log extents are all already punched; not reproduced.
        - Otherwise SstBuilder.add(key, op, value, expires_at)
        - After loop: attach aggregated discards to final SstBuilder, finalize,
          append, push to new_readers
-  4. Atomic swap: write lock → remove old SstReaders + tables → push new_readers
-     → save_table_locs_raw to meta_stream (single linearization point; crash before
-     this leaves new SSTs as orphan bytes and recovery loads the prior checkpoint)
+  4. Under publish_lock: build the post-compaction list (remove inputs, add
+     new_readers, sort by seq) → save_table_locs_raw (single linearization point;
+     a failure or crash before the ack leaves new SSTs as orphan bytes and the
+     prior checkpoint) → assign the list to the partition
   5. Caller: truncate row_stream before the first extent a live table references
 ```
 The merge never materializes all kept entries into an accumulator Vec — it streams
@@ -1178,13 +1200,14 @@ covers it. Every log record strictly
 below a durable checkpoint vp is in that checkpoint's persisted SST set (or
 compaction-dead), so `[MIN, durable-vp)` is safe to punch.
 
-INVARIANT (why ack-gated, never in-memory): `commit_flush_outcome_inner` pushes the
-new SST into `tables`/`sst_readers` BEFORE the checkpoint append acks. A floor
-derived from in-memory state (`p.vp_*`, or a MAX over live `sst_readers` vp_heads)
-could run AHEAD of what a crash-time recovery loads — GC punches `[V_old, V_new)`,
-the process crashes before the `V_new` checkpoint acks, recovery loads the `V_old`
-checkpoint (whose SSTs don't cover `[V_old, V_new)`) → silent loss. The ack-gated
-`durable_ckpt_vp` is immune. `background::gc_replay_floor_tests`.
+INVARIANT (why ack-gated, never in-memory): a floor derived from in-memory state
+(`p.vp_*`, the live write cursor past un-flushed writes) could run AHEAD of what a
+crash-time recovery loads — GC punches `[V_old, V_new)`, the process crashes
+before a `V_new` checkpoint acks, recovery loads the `V_old` checkpoint (whose
+SSTs don't cover `[V_old, V_new)`) → silent loss. The ack-gated
+`durable_ckpt_vp` is immune, and so is the MIN over `sst_readers`, because the
+table list changes only after its checkpoint acks ("Checkpoint first, then the
+table list"). `background::gc_replay_floor_tests`.
 
 ### Recovery replay start = the checkpoint's cursor
 
@@ -2235,26 +2258,17 @@ Three fixes bound the restart replay window (worst case per partition =
       `for_each(closure)` (read lock held for the iteration). The `bytes: AtomicU64`
       counter is outside the lock, so `mem_bytes()` / `maybe_rotate` stay lock-free.
 
-11. **Metadata-publish ordering invariant.** `flush_one_imm` (lib.rs) and `do_compact`
-    (background.rs) both publish to `meta_stream` via `save_table_locs_raw`. They run as
-    separate background tasks on the single-threaded P-log runtime and interleave at
-    every `.await`. INVARIANT (race-free concurrent publishing — the LATEST persisted
-    meta_stream record always reflects ALL prior in-memory mutations from both
-    publishers) rests on three load-bearing properties — DO NOT violate:
-    - **(P1)** P-log compio runtime is single-threaded.
-    - **(P2)** the `borrow_mut` block that captures `tables_snapshot` contains no `.await`.
-    - **(P3)** the path `borrow_mut` drop → `rkyv_encode` → `stream_client.append` →
-      mpsc-send-into-per-stream-worker is purely synchronous; the first `.await` is on
-      the per-stream worker's `ack_rx`, AFTER the message lands in the FIFO mpsc.
-
-    Together: `borrow_mut` order = mpsc-send order = meta_stream record order. Adding an
-    `.await` between the `borrow_mut` drop and `stream_client.append` (moving
-    `rkyv_encode` behind an async helper, an async metric flush, a `futures::lock::Mutex`
-    around publish) re-opens a stale-snapshot race: a flush whose snapshot was captured
-    earlier could be ack'd later than a compact's, persisting tables that compact already
-    removed → on restart recovery resurrects compacted-away SSTs whose VPs may point at
-    GC-punched log_stream extents. Inline invariant comments mark both call
-    sites; test `publisher_invariant_tests` exercises two concurrent publishers.
+11. **Metadata-publish ordering.** Every `meta_stream` checkpoint publisher (flush
+    commit, `do_compact`, the no-op compaction's checkpoint, the freeze and
+    merged-open checkpoints) holds `PartitionData::publish_lock` from its table
+    snapshot through the append's ack to the change of `tables` / `sst_readers` it
+    publishes; see "Checkpoint first, then the table list". So meta_stream record
+    order = lock order, and the LATEST record always lists every change made in
+    memory: a change is made only after its own record acks, and the next snapshot
+    is taken only after that. Never publish a checkpoint, or change the table list,
+    outside the lock — a snapshot taken while another publisher's append is in
+    flight misses its change, and the later record would drop it (a compaction's
+    outputs, or a flush's SST, then exist in memory but not in the durable state).
 
 12. **Metrics export.** Each `PartitionData` carries an `Arc<PartitionMetrics>` whose
     AtomicU64 counters are bumped by `partition_loop` (req_count on each
