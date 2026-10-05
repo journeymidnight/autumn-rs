@@ -1,3 +1,11 @@
+Date: 2026-10-05 (5)
+TaskStatus: completed
+Task scope: user "F-REVIEW-V3-COMPACT-CHECKPOINT" (review.md 4.3: GC recovery chain after a failed compaction checkpoint).
+Current summary: verified, no production fix. After a compaction swaps its outputs in and its checkpoint append fails: no arm truncates the row stream after a failed compaction (every truncate follows a checkpoint of the current list); the GC floor stays at or below the durable cursor (output vp_head = newest input's, durable_ckpt_vp ack-gated); GC relocation writes fresh seqs past the cursor, so replay restores moved values over the durable SSTs' stale pointers. Test-only failpoint fail_next_compaction_checkpoint (background.rs). New test crates/manager/tests/system_compact_checkpoint_fail.rs: PS as a self-re-executed child process (failpoint armed there), major compaction fails its checkpoint, in-window puts/deletes + FORCE_GC of E0 (relocates live VPs, punches), SIGKILL, reopen = exact acknowledged state (gets, NOT_FOUND, range key set), then a later major publishes and truncates past inputs + orphaned output, second reopen same state. Entry deleted from feature_list (passes).
+Verification: test 5/5 + 3/3 after review edits; ablation (truncate in the failed arm) red: "durable checkpoint lists SSTs in row extents [8, 8, 8], row stream holds [12]". partition-server lib 275; system_crash_mid_compact, compact_seq_below_dropped, compact_unflushed_vp_head, compact_settles_deletes, row_truncate_live_refs, row_truncate_queued_flush, gc_inline_wal, gc_multiversion_same_extent, gc_inflight_wal_put, restart_replay_cursor, empty_vp_cursor, deletion_triggered_compaction green. Review: fable, argument verified, no single-failure hole; applied harness nits (child try_wait + stderr, uuid base, comment placement, doc boundary).
+Main gaps: the floor argument assumes every input is in the durable checkpoint; a flush whose own checkpoint fails pops its imm and leaves its SST unlisted, and a failed compaction over it could raise the GC floor past the durable cursor (two failures, reasoned, not reproduced) — new entry BUG-FLUSH-CKPT-FAIL-UNLISTED-SST. The test does not discriminate the GC floor itself (system_gc_* do).
+Next steps: user to decide whether to reproduce BUG-FLUSH-CKPT-FAIL-UNLISTED-SST.
+
 Date: 2026-10-05 (4)
 TaskStatus: completed
 Task scope: user "BUG-PS-SHUTDOWN-CLONE".

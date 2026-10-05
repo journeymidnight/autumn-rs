@@ -964,6 +964,22 @@ cursor from durable checkpoint / SST boundaries (never the active WAL tail): a
 previous failed compaction may already have swapped the in-memory table list
 without publishing it. If that checkpoint fails, truncation is not attempted.
 
+**A compaction whose checkpoint fails leaves the durable set complete.** The
+swap happens before the append, so the partition then serves outputs the
+durable checkpoint does not list. Three things keep a crash in that window
+lossless: no arm truncates after a failed compaction, and every truncate
+follows a checkpoint of the current list; the GC floor cannot pass the durable
+cursor (an output's vp_head is its newest input's, and `durable_ckpt_vp` is
+ack-gated); GC relocates live values at fresh seqs past that cursor, so replay
+puts them back over the durable SSTs' stale pointers into a punched extent.
+`crates/manager/tests/system_compact_checkpoint_fail.rs` (a failpoint,
+`fail_next_compaction_checkpoint`, fails the append in a PS child process that
+is SIGKILLed after GC and writes in the window; red if the failed arm
+truncates). Boundary: the floor argument assumes every input is in the durable
+checkpoint. A flush whose own checkpoint fails leaves its SST unlisted, and a
+failed compaction over it could raise the floor past the durable cursor —
+reasoned, not reproduced (feature_list `BUG-FLUSH-CKPT-FAIL-UNLISTED-SST`).
+
 ### Major Compaction (`compact_tx`, e.g. after overlap detected)
 `do_compact(major=true)`: processes all tables, additionally drops tombstones
 (op=2), expired entries, out-of-range keys (overlap cleanup), and clears

@@ -1449,6 +1449,29 @@ Regression (real manager/EN/PS, with reopen and a paused concurrent flush):
 cargo test -p autumn-manager --test system_row_truncate_live_refs --test system_row_truncate_queued_flush -- --test-threads=1
 ```
 
+### A failed compaction checkpoint loses nothing on a crash
+
+A compaction swaps its outputs into the partition before it appends the
+checkpoint that names them. If that append fails, the PS logs `compaction:`
+with the error (the op reports FAILED) and keeps serving from the outputs while
+the durable checkpoint still names the inputs. Nothing to do: the inputs' row
+extent stays until a later checkpoint lists the current tables, GC never
+punches log the durable checkpoint still replays, and values GC moves in the
+meantime are replayed back after a crash. The next flush or compaction
+checkpoint closes the window, and the orphaned output's row extent is dropped
+by a later compaction's truncate.
+
+Verify (fails the append with a test failpoint, then GC + writes, then SIGKILL
+and two reopens):
+
+```bash
+cargo test -p autumn-manager --test system_compact_checkpoint_fail
+```
+
+To check a live partition after such a failure, compare the checkpoint's SST
+extents with the row stream as in the previous section: every `locs[].extent_id`
+must still be a row extent.
+
 ### Reading GC replay-floor protection — a skipped `forcegc` is usually CORRECT
 
 GC protects any NON-EMPTY `log_stream` extent that sits AT/BEFORE the recovery

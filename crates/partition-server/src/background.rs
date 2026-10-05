@@ -173,6 +173,17 @@ pub fn gc_verdict_parked_count() -> u64 {
     GC_VERDICT_PARKED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Test failpoint: when armed, the next compaction that swaps its outputs into
+/// the table list fails its checkpoint as an append that never landed — the
+/// in-memory tables are the outputs, the durable checkpoint still names the
+/// inputs. One-shot; only ever set by tests.
+static COMPACT_CHECKPOINT_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Arm `COMPACT_CHECKPOINT_FAIL` for the next compaction. Only tests call this.
+pub fn fail_next_compaction_checkpoint() {
+    COMPACT_CHECKPOINT_FAIL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) struct CompactStats {
     pub input_tables: usize,
     pub output_tables: usize,
@@ -3073,6 +3084,9 @@ pub(crate) async fn do_compact(
     // invariant — see flush_one_imm in lib.rs for the full
     // statement. No `.await` may be introduced between the borrow_mut
     // drop and the mpsc send inside `save_table_locs_raw`.
+    if COMPACT_CHECKPOINT_FAIL.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return Err(anyhow::anyhow!("compaction checkpoint: test failpoint"));
+    }
     save_table_locs_raw(
         &part_sc,
         meta_stream_id,
