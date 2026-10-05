@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-09-29
+**Last updated:** 2026-10-05
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -236,25 +236,6 @@
   （否则 freeze 直接拒、manager kill 落空），**这一步未实跑**。另：该脚本开机时 `kill -9` 本机
   所有 `autumn-*`/`etcd` 进程，多租户机器上会杀掉别的工作树的进程。
 
-### BUG-E2E-FENCE-RECOVERY-STALLS — `e2e_fence_triggers_recovery_dispatch` 在 HEAD 上失败：fence 之后恢复 60 s 内没换掉副本
-- **Trigger** (2026-09-27，做 fence 预检时跑到): `cargo test -p autumn-manager --test e2e_lifecycle
-  e2e_fence_triggers_recovery_dispatch`（未标 ignore）在 `cd8a956` 上连续失败：3 个真 EN、RF2
-  extent 追加并 seal 后 fence 一个成员（此时 fence 返回 OK），轮询 60 s，
-  `recovery did not replace fenced victim N with healthy_target M`。与 fence 预检的改动无关
-  （改动前的 HEAD 同样失败；改动后测试多了一步等 df 上报）。
-- **未查**: 是恢复派发没发生、EN 执行失败，还是完成没被收回来。测试设了
-  `AUTUMN_MGR_RECOVERY_GATE=fenced_only`，代码仍读这个 env。
-- **Scope**: 先定位卡在哪一段（manager 日志的 dispatch / EN 的 recovery_done / apply），
-  再按根因修。
-- **Acceptance**: 该测试稳定通过；若根因在生产路径，修复要有消融。
-- `passes: true`
-- **notes** (2026-10-05): 与 BUG-RECOVERY-PINNED-TARGET-TESTS 同一根因（该条首个用例即本测试），
-  已由 e4b5853b 的 `support::format_node` 夹具修复，不是生产缺陷，本条无代码改动。HEAD 上 10/10
-  通过（4–6 s）。消融判别：在 EN 拒绝点（`extent_node.rs` "outside the pinned target"）临时加
-  eprintln 标记，两组只差夹具——HEAD 夹具：通过，标记 0 次；还原为手写 disk_id 1/2/3：同一断言
-  60 s 超时，标记 6 次 `extent=8 local_disk=2 pinned=[4]`（manager 把重建钉在注册时分配的 disk 4，
-  EN 本地是 disk 2 → 每次拒绝）。临时改动已还原。测试日志看不到该 warn 是因为测试未装 tracing subscriber。
-
 ### F-REVIEW-V1-MERGE-REPLAY — 待验证：merge replay cursor 可达性
 - **Trigger**: review.md 4.1；数值模型不足以证明正常 merge 丢失数据。
 - **Scope**: 复现 raw merge、checkpoint 失败、旧状态和 sealed-empty cursor 回收；按可达性决定修复。
@@ -342,46 +323,6 @@
 - **Acceptance**: 人为造一个盘间倾斜的节点 ⇒ 收敛;搬迁过程中该 extent 始终可读;
   中途杀 EN ⇒ 重启后不留半拉文件、账目一致。
 - `passes: false`
-
-### F-WIRE-VERSION-BY-HAND — 指纹已删除，wire 版本号改为纯手工维护
-- **决定** (2026-09-05，用户): 删掉 schema 指纹与 registry 测试，`WIRE_VERSION_MIN/MAX`
-  由人维护。已实施：`crates/rpc/build.rs` 删除、`syn` 构建依赖移除、
-  `WIRE_FINGERPRINT` / `WIRE_VERSION_FINGERPRINTS` 清空、
-  `GetClusterIdResp.wire_fingerprint` 字段摘除（并进未部署的 v36）、
-  `wire_compat_check` 改为纯版本区间。五个 schema 文件顶部各加了警示横幅。
-- **放弃了什么，说清楚**: 指纹独占的能力只有一个——抓「改了 schema 却没抬版本号」。
-  其余全部由区间覆盖（例如那次陈旧 python wheel，它的 MAX 更低，区间检查本就会拒）。
-  这个能力现在**没有任何东西替代**，`compat_no_longer_verifies_the_peers_schema`
-  这条测试就是为了把这个洞留在代码里可见，而不是只存在于某个 commit 说明里。
-- **为什么仍然合理**: 字节哈希造成过真实停机（翻译一条中文注释劈开了滚动中的集群），
-  而误报会训练出「刷新记录值继续」的反射——那正是真实改动被放行的路径。
-  且 `MIN=MAX` 的停机纪律意味着**不会存在混版本集群**，而混版本正是静默损坏的发生条件。
-- **调研结论（2026-09-05，回答"要不要换掉 rkyv"）**:
-  - **rkyv 官方不做 schema 演进**。docs.rs 自陈 "lacks a full schema system…
-    isn't well equipped for data migration and schema upgrades"；
-    issue #164 "Schema evolution" 2021-07 开，至今 open，标签是 "new crate"。
-  - **作者自己的 protoss（rkyv 的 schema 演进 crate）已于 2024-11-11 归档**，
-    共 6 个 commit、无 release。生态里没有可用方案。
-  - 没有搜到任何用 rkyv 做**网络协议**并公开版本管理方案的项目。协议层主流是
-    Cap'n Proto / FlatBuffers / protobuf，**三者都把演进做进格式本身**（字段编号 /
-    可选字段），所以不需要外挂版本号。rkyv 没有 tag，解码就是按当前 Rust 布局读，
-    **忘记抬版本 = 静默读错**，而 protobuf 里最多是丢个字段。
-  - ⇒ 这套 `WIRE_VERSION` 不是过度设计，是在补 rkyv 缺的那一层，且无先例可抄。
-- **若将来要迁移（实测规模，非估计）**: 206 个 `Archive` 类型
-  （manager 144 / partition 45 / extent 16 / cap_token 1）、
-  `rkyv_encode` 852 处 + `rkyv_decode` 533 处。
-  **FlatBuffers 是错的方向**：它的全部价值在零拷贝访问器，而本树几乎不用——
-  `Archived*` 直接读只有 1 处，`rkyv_decode` 是 memcpy 到 `AlignedVec` 再完整反序列化成
-  owned，大数据则走帧的裸 tail 完全绕开 rkyv。为一个用不上的能力付 1,385 个调用点的改造。
-  **prost 才贴合现状**（解码产物就是 owned struct，多数调用点只换函数名），但迁移的触发
-  条件应该是「需要滚动升级、不能再停机」，而不是现在——停机纪律已经挡住了实际风险。
-- **`rkyv_decode` 改零拷贝的阻断点（2026-09-05 查清，未做）**: `HEADER_LEN=10` +
-  `CTRL_PREFIX_LEN=4` ⇒ rkyv 载荷从帧内偏移 **14** 开始，既非 16 也非 8 对齐。
-  那次 memcpy 到 `AlignedVec<16>` **正是让 `rkyv::access` 合法的前提，不是浪费**。
-  要零拷贝必须先把帧头补齐到 16 对齐（wire 改动）。且 533 个解码点的类型全变
-  （`String`→`ArchivedString` 等），而许多点拿到数据后立刻 clone 进 owned 结构、
-  零拷贝买不到东西。**并且没有任何测量指向解码是瓶颈**——今天测到的是 append 0.185 ms /
-  端到端 1.15 ms，PS 处理那 ~0.97 ms 的构成完全空白。要做应先量。
 
 ### F-STREAM-ATREST-CKSUM — stream 层大 value 的 at-rest 内容校验 + scrub（静默腐化 G12）
 - **Trigger** (2026-08-04, chaos 缺口 loop 的 G12，已 reproduce-first 复现 harness `crates/manager/tests/silent_corruption_rot.rs`): sealed extent 的 **value 数据字节**在单副本上被静默翻位后，**全链无检测**：(a) 客户端读回坏字节仍返回 `CODE_OK`（frame CRC 明确排除 bulk value 段；`.meta` CRC 只覆盖 40B 元数据；WAL/SST CRC 是 partition 层、不覆盖 stream extent 的原始 value）；(b) recovery 从坏副本重填时 `verify` 只校 `length==sealed_length` + eversion、**不校内容** → 把腐化洗成权威；(c) EC 转换对坏字节直接编 parity → 固化成 canonical。stream 层**既无 per-extent/block content checksum、也无 scrubber**；确定性副本轮转让坏副本被一致选中（harness 里 25/64 子区间读命中）。这是**设计缺口**（数据完整性面），不是坏代码——today 的裸机盘不会自发翻位、且需要单副本静默腐化才触发，故不是"今天可复现的线上危害"，属于中期加固。

@@ -7,10 +7,10 @@
 //!
 //! ## Why a freeze here and a hand-maintained version number everywhere else
 //!
-//! The deleted schema fingerprint (`F-WIRE-VERSION-BY-HAND`) hashed the SOURCE
-//! of every wire module, and translating one Chinese comment split a running
-//! cluster. It covered the cluster-internal schema, where editing a struct in
-//! place is the CORRECT answer — you bump the version and stop the world — so
+//! The deleted schema fingerprint hashed the SOURCE of every wire module, and
+//! translating one Chinese comment split a running cluster. It covered the
+//! cluster-internal schema, where editing a struct in place is the CORRECT
+//! answer — you bump the version and stop the world — so
 //! it fired constantly on changes whose right response was "yes, I know", and
 //! that taught the reflex of refreshing the recorded value without looking.
 //! A real change then went through on that reflex.
