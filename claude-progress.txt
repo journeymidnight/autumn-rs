@@ -1,3 +1,11 @@
+Date: 2026-10-05 (1)
+TaskStatus: completed
+Task scope: user "BUG-E2E-FENCE-RECOVERY-STALLS".
+Current summary: no code change. Same root cause as BUG-RECOVERY-PINNED-TARGET-TESTS (test ENs on made-up disk ids vs the manager-assigned id the rebuild is pinned to), already fixed by support::format_node in e4b5853b. HEAD 10/10 green; ablation with a marker at the EN's pinned-target reject: HEAD fixture 0 rejects/pass, old fixture 6 rejects/same 60 s assert.
+Verification: see feature_list BUG-E2E-FENCE-RECOVERY-STALLS notes.
+Main gaps: none for this task.
+Next steps: none.
+
 Date: 2026-10-02 (12)
 TaskStatus: completed
 Task scope: user "补齐缺的，改wire结构" (F-EXTENT-REPAIR-VISIBILITY).

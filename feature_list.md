@@ -247,7 +247,13 @@
 - **Scope**: 先定位卡在哪一段（manager 日志的 dispatch / EN 的 recovery_done / apply），
   再按根因修。
 - **Acceptance**: 该测试稳定通过；若根因在生产路径，修复要有消融。
-- `passes: false`
+- `passes: true`
+- **notes** (2026-10-05): 与 BUG-RECOVERY-PINNED-TARGET-TESTS 同一根因（该条首个用例即本测试），
+  已由 e4b5853b 的 `support::format_node` 夹具修复，不是生产缺陷，本条无代码改动。HEAD 上 10/10
+  通过（4–6 s）。消融判别：在 EN 拒绝点（`extent_node.rs` "outside the pinned target"）临时加
+  eprintln 标记，两组只差夹具——HEAD 夹具：通过，标记 0 次；还原为手写 disk_id 1/2/3：同一断言
+  60 s 超时，标记 6 次 `extent=8 local_disk=2 pinned=[4]`（manager 把重建钉在注册时分配的 disk 4，
+  EN 本地是 disk 2 → 每次拒绝）。临时改动已还原。测试日志看不到该 warn 是因为测试未装 tracing subscriber。
 
 ### F-REVIEW-V1-MERGE-REPLAY — 待验证：merge replay cursor 可达性
 - **Trigger**: review.md 4.1；数值模型不足以证明正常 merge 丢失数据。
