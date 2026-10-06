@@ -79,6 +79,17 @@ rebuild), and pre-CoW EC layouts whose shards live in `.dat`. On the node: a
 copy shorter than the length named (a replica that missed the seal), a file it
 does not hold, a quarantined `.meta`.
 
+## Reads are not left waiting for the scrub
+
+The partition server checks every SST data block's own CRC32C as it decodes
+it, as it always has. A block that fails is fetched again from every other
+copy — each lit replica, or for an EC extent one reconstruction per covering
+data shard with that shard left out and its node not asked — and the first
+copy that decodes is served. A replica of a sealed extent whose copy failed
+while another passed is reported (`MSG_REPORT_CORRUPT_REPLICA`, row stream)
+and isolated like a WAL replay's finding; an EC culprit is only logged, and
+its node's scrub reports it. A healthy read pays nothing new.
+
 ## Findings and repair
 
 A block that differs from its checksum, or that can no longer be read in full

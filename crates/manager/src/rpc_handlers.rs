@@ -939,8 +939,9 @@ impl AutumnManager {
         }))
     }
 
-    /// WAL self-heal A5: isolate a bit-rotted log_stream replica reported by a
-    /// PS replay. Fenced (owner_epoch + eversion CAS) + etcd-first. Clears the
+    /// Isolate a bit-rotted replica reported by a PS: a WAL replay (log
+    /// stream, self-heal A5) or an SST block read (row stream) that found one
+    /// copy failing its CRC and another passing it. Fenced (owner_epoch + eversion CAS) + etcd-first. Clears the
     /// corrupt slots' `avali` bits on a SEALED extent (so the A1 read filter
     /// stops serving from them) and bumps eversion (invalidates client caches).
     /// OPEN-extent corruption needs seal-and-roll (A4) — refused here with
@@ -986,35 +987,36 @@ impl AutumnManager {
                     }));
                 }
             }
-            // I4 scoping (coco P1 #4 + #2): the named log_stream must actually
-            // belong to the partition whose owner_epoch authorized this report,
-            // AND the extent must be a member of that stream. Without the
-            // partition→log_stream binding, a PS owning partition A could name
-            // partition B's log_stream + a B extent and isolate B's replicas.
-            // Mirrors punch_holes/truncate operating only on their named
-            // stream's extents, plus the owner→stream ownership tie.
+            // I4 scoping (coco P1 #4 + #2): the named stream must actually be
+            // the log or row stream of the partition whose owner_epoch
+            // authorized this report, AND the extent must be a member of that
+            // stream. Without the partition→stream binding, a PS owning
+            // partition A could name partition B's stream + a B extent and
+            // isolate B's replicas. Mirrors punch_holes/truncate operating only
+            // on their named stream's extents, plus the owner→stream ownership
+            // tie. Log: a WAL replay found the rot; row: an SST block read did.
             match s.partitions.get(&req.partition_id) {
-                Some(pm) if pm.log_stream == req.log_stream_id => {}
+                Some(pm) if pm.log_stream == req.stream_id || pm.row_stream == req.stream_id => {}
                 _ => {
                     return Ok(rkyv_encode(&ReportCorruptReplicaResp {
                         code: CODE_PRECONDITION,
                         message: format!(
-                            "log_stream {} is not partition {}'s log_stream — refusing \
+                            "stream {} is not partition {}'s log or row stream — refusing \
                              cross-partition corrupt-replica report",
-                            req.log_stream_id, req.partition_id
+                            req.stream_id, req.partition_id
                         ),
                     }));
                 }
             }
-            match s.streams.get(&req.log_stream_id) {
+            match s.streams.get(&req.stream_id) {
                 Some(si) if si.extent_ids.contains(&req.extent_id) => {}
                 _ => {
                     return Ok(rkyv_encode(&ReportCorruptReplicaResp {
                         code: CODE_PRECONDITION,
                         message: format!(
-                            "extent {} is not a member of log_stream {} — refusing out-of-scope \
+                            "extent {} is not a member of stream {} — refusing out-of-scope \
                              corrupt-replica report",
-                            req.extent_id, req.log_stream_id
+                            req.extent_id, req.stream_id
                         ),
                     }));
                 }
@@ -1170,7 +1172,7 @@ impl AutumnManager {
             extent_id = updated.extent_id,
             avali = updated.avali,
             corrupt = ?req.corrupt_node_ids,
-            "A5: isolated corrupt log_stream replica(s) (avali cleared, eversion bumped)"
+            "isolated corrupt replica(s) a PS reported (avali cleared, eversion bumped)"
         );
         Ok(rkyv_encode(&ReportCorruptReplicaResp {
             code: CODE_OK,
@@ -7596,7 +7598,7 @@ mod selfheal_a5_tests {
         let req = ReportCorruptReplicaReq {
             partition_id: part_id,
             owner_epoch,
-            log_stream_id: LOG_STREAM_ID,
+            stream_id: LOG_STREAM_ID,
             extent_id,
             eversion,
             corrupt_node_ids: corrupt,
@@ -7697,7 +7699,7 @@ mod selfheal_a5_tests {
         let req = ReportCorruptReplicaReq {
             partition_id: 100,
             owner_epoch: 42,
-            log_stream_id: LOG_STREAM_ID,
+            stream_id: LOG_STREAM_ID,
             extent_id: 8,
             eversion: 7,
             corrupt_node_ids: vec![3],
@@ -7729,7 +7731,7 @@ mod selfheal_a5_tests {
         let req = ReportCorruptReplicaReq {
             partition_id: 100,
             owner_epoch: 42,
-            log_stream_id: LOG_STREAM_ID + 1,
+            stream_id: LOG_STREAM_ID + 1,
             extent_id: 9,
             eversion: 7,
             corrupt_node_ids: vec![3],
@@ -7738,6 +7740,46 @@ mod selfheal_a5_tests {
         let resp = run(async { m.handle_report_corrupt_replica(payload).await.unwrap() });
         let r = rkyv_decode::<ReportCorruptReplicaResp>(&resp).unwrap();
         assert_eq!(r.code, CODE_PRECONDITION, "cross-partition stream → refused");
+    }
+
+    /// An SST block read names the partition's ROW stream, and is acted on
+    /// like a WAL replay's report; the meta stream holds no SST block and is
+    /// out of scope.
+    #[test]
+    fn a_row_stream_report_is_accepted_and_a_meta_stream_one_refused() {
+        for (stream_id, accepted) in [(LOG_STREAM_ID + 10, true), (LOG_STREAM_ID + 20, false)] {
+            let m = AutumnManager::new();
+            seed(&m, 100, 42, 9);
+            {
+                let mut s = m.store.inner.borrow_mut();
+                let pm = s.partitions.get_mut(&100).unwrap();
+                pm.row_stream = LOG_STREAM_ID + 10;
+                pm.meta_stream = LOG_STREAM_ID + 20;
+                let mut st = s.streams.remove(&LOG_STREAM_ID).unwrap();
+                st.stream_id = stream_id;
+                s.streams.insert(stream_id, st);
+            }
+            let req = ReportCorruptReplicaReq {
+                partition_id: 100,
+                owner_epoch: 42,
+                stream_id,
+                extent_id: 9,
+                eversion: 7,
+                corrupt_node_ids: vec![3],
+            };
+            let resp = run(async {
+                m.handle_report_corrupt_replica(rkyv_encode(&req)).await.unwrap()
+            });
+            let r = rkyv_decode::<ReportCorruptReplicaResp>(&resp).unwrap();
+            let avali = m.store.inner.borrow().extents.get(&9).unwrap().avali;
+            if accepted {
+                assert_eq!(r.code, CODE_OK, "row stream: {}", r.message);
+                assert_eq!(avali, 0b101);
+            } else {
+                assert_eq!(r.code, CODE_PRECONDITION, "meta stream: {}", r.message);
+                assert_eq!(avali, 0b111);
+            }
+        }
     }
 
     #[test]

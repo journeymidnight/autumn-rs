@@ -1310,6 +1310,28 @@ When comparing buffered and direct yourself, alternate the two in the same
 period (A/B/A/B): this host's NVMe throughput drifts by tens of percent over
 hours (IOMMU IOVA allocator state), which swamps the difference.
 
+## SST block rot (row stream)
+
+A row-stream copy that rotted stays in service until a scrub finds it, so the
+PS reads around it: an SST block that fails its CRC is fetched again from the
+other copies and the first that decodes is served. Watch the PS log for
+`SST block failed to decode; served from another copy` (`served_from` names
+the copy, `rotted_replicas` the replicas that failed). For a sealed replicated
+extent those replicas are reported and isolated (an open tail is read around
+but not reported: isolating it needs a seal first, and the scrub covers it
+once it seals) (manager log: `isolated
+corrupt replica(s) a PS reported`); then `autumn-op info --extent <ID>` shows
+the slot dark and recovery rebuilds it. For an EC extent `served_from` is
+`EcWithoutShard { shard: i }`: shard `i` is the culprit; run
+`autumn-op scrub <ID>` to have its node confirm and isolate it.
+
+Manual check (3 ENs, row stream RF 2): write and flush a few thousand small
+keys, roll the row tail so its extent seals, flip one byte in every 4 KiB of
+the first half of one replica's `extent-<ID>.dat` (or of `extent-<ID>.shard0`
+after `force-ec-convert`), restart the PS so its block cache is cold, and read
+every key back: all must return their values. The automated version is
+`cargo test -p autumn-manager --test system_sst_block_rot`.
+
 ## WAL replay self-heal (log_stream bit-rot / truncated replica)
 
 Partition open replays `log_stream`. If a sealed extent's serving replica

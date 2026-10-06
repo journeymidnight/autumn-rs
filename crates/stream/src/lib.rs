@@ -14,7 +14,7 @@ pub use autumn_rpc::extent_rpc;
 
 pub use client::{
     read_extent_shard_direct, read_extent_value_direct, set_read_hedge_ms, AppendResult,
-    StaleVpOffset, StreamClient,
+    CopySource, RangeCopies, RangeCopy, StaleVpOffset, StreamClient,
 };
 pub use conn_pool::{normalize_endpoint, shard_addr_for_extent, ConnPool};
 pub use extent_node::{

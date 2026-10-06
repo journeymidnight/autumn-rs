@@ -382,8 +382,12 @@ impl AsyncTableIterator {
                     self.win = Some((bytes, idx, end_idx, start_rel));
                 }
                 let (bytes, _, _, start_rel) = self.win.as_ref().unwrap();
-                self.reader
-                    .decode_block_from_window(bytes, *start_rel, idx)?
+                // A window is one read of one copy; a block in it that does
+                // not decode is fetched again on its own, from the others.
+                match self.reader.decode_block_from_window(bytes, *start_rel, idx) {
+                    Ok(b) => b,
+                    Err(why) => self.reader.reread_block(idx, &self.sc, why).await?,
+                }
             }
         };
         Ok(Some(BlockIterator::new(block)))

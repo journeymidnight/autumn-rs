@@ -626,6 +626,30 @@ Invariants:
   the compaction (never silently truncates merge output). Sync
   TableIterator/MergeIterator remain Resident-only (tests, builder round-trips).
 - Diag seq_opt/fullscan report miss on paged readers (diagnostic-only).
+- **A block that fails to decode (its CRC32C, or its structure) is read again
+  from the other copies** (`SstReader::reread_block`), on both paths: a cache
+  miss in `read_block_via`, and a block in a compaction/split window (the
+  window is one read of one copy). `StreamClient::read_range_copies` returns
+  every independent copy of the block's range — each lit replica, or for an EC
+  extent one reconstruction per covering data shard with that shard left out
+  and its node not asked — and the first that decodes is served (and cached,
+  on the cached path). Replicas of a SEALED extent whose copy failed while
+  another passed are reported in the background (`report_rotted_row_copies`,
+  the partition's row stream, same fencing and evidence as the WAL replay's
+  A5); an EC culprit is only logged — its node's scrub reports shard rot. No
+  copy decodes → the first error, with what the others said. Why: nothing on
+  the hot path checks a checksum sidecar, so a rotted row copy is in service
+  until a scrub finds it (a week, on the policy), and a read that returned
+  the CRC error instead turned rot on one copy into failed reads for every key
+  in the block. Healthy reads pay nothing new (the CRC was always computed).
+  Regression: `crates/manager/tests/system_sst_block_rot.rs` (replicated get +
+  isolation, EC get, compaction window). Accepted limits (failure path only):
+  the copies are read together and the reread waits for the slowest (a hung
+  replica costs its read deadline per miss); concurrent misses on one rotted
+  extent each refetch its layout and each report (the manager dedups; it stops
+  once the isolation lands, as the fresh layout no longer lists the slot); the
+  report is not retried — the good block is cached either way, so a refused
+  report waits for the scrub; an open tail is read around, never reported.
 
 ### Large-VP client direct-read (`MSG_GET_REDIRECT`)
 

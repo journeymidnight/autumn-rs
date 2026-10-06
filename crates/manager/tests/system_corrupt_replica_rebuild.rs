@@ -112,7 +112,7 @@ fn a_replica_reported_corrupt_is_eventually_rebuilt() {
                 rkyv_encode(&ReportCorruptReplicaReq {
                     partition_id: PART,
                     owner_epoch: sc.owner_epoch(),
-                    log_stream_id: log,
+                    stream_id: log,
                     extent_id,
                     eversion: before.eversion,
                     corrupt_node_ids: vec![victim],

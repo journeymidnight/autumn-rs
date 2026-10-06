@@ -6384,6 +6384,9 @@ async fn partition_thread_main(
     // this partition (the manager's quorum debounce dedups by
     // `reporter_part_id`).
     part_sc.set_reporter_part_id(part_id);
+    // and with its row stream, so an SST block read that finds a rotted
+    // replica (`SstReader::reread_block`) can report it for isolation.
+    part_sc.set_reporter_row_stream(row_stream_id);
 
     // Check commit length on all streams before recovery (Go: checkCommitLength).
     // This ensures the last extent of each stream has consistent commit length
@@ -11034,6 +11037,10 @@ fn spawn_sst_thread(
                 // bulk-thread row_stream / compact append failures bucket
                 // into the same partition for the manager's quorum count.
                 sst_sc.set_reporter_part_id(part_id);
+                // No `set_reporter_row_stream` here: this client only appends
+                // (flush, compaction output). Every SST block read — gets,
+                // ranges, compaction and split scans — goes through the P-log
+                // client, which has it.
                 tracing::info!(part_id, "bulk thread ready");
                 if ready_tx.send(Ok(())).is_err() {
                     // P-log dropped the receiver (open_partition aborted

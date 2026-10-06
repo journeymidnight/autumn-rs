@@ -281,7 +281,7 @@ fn a_catch_up_never_copies_from_a_dark_replica() {
                 rkyv_encode(&ReportCorruptReplicaReq {
                     partition_id: PART,
                     owner_epoch: second.owner_epoch(),
-                    log_stream_id: log,
+                    stream_id: log,
                     extent_id: extent,
                     eversion: ex.eversion,
                     corrupt_node_ids: vec![node_ids[a]],

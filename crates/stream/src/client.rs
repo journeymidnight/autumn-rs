@@ -2230,6 +2230,29 @@ async fn launch_append(
 /// without forming an Rc cycle.  Callers that previously wrote
 /// `let sc = StreamClient::connect(...)` get `Rc<StreamClient>`; method
 /// calls `sc.append(...)` still work via `Deref`.
+/// What `StreamClient::read_range_copies` found.
+pub struct RangeCopies {
+    pub copies: Vec<RangeCopy>,
+    /// The layout the copies were read under — what a corrupt report names.
+    pub eversion: u64,
+    pub sealed: bool,
+}
+
+/// One independent copy of a byte range.
+pub struct RangeCopy {
+    pub bytes: Vec<u8>,
+    pub source: CopySource,
+}
+
+/// Where a `RangeCopy` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopySource {
+    /// Read from this replica.
+    Replica { node_id: u64 },
+    /// Reconstructed with this data shard left out, its node not asked.
+    EcWithoutShard { shard: usize },
+}
+
 pub struct StreamClient {
     /// Weak self-reference — used by per-stream workers to clean up on
     /// exit. Set exactly once by `Rc::new_cyclic`.
@@ -2296,6 +2319,11 @@ pub struct StreamClient {
     /// means "no reporter id configured" — drainer skips sending to
     /// avoid polluting the manager's quorum count with a sentinel.
     reporter_part_id: Cell<u64>,
+    /// The reporter partition's row stream: where the SSTs it reads live, and
+    /// what a rotted SST block copy is reported against
+    /// (`report_rotted_row_copies`). 0 = not set: such a finding is logged,
+    /// not reported.
+    reporter_row_stream: Cell<u64>,
     /// stream tunables. Defaults match the legacy env defaults.
     /// Cloned into per-stream workers at spawn time (`Rc` keeps the
     /// clone cheap).
@@ -2738,6 +2766,7 @@ impl StreamClient {
             failure_report_tx,
             node_failure_reported: RefCell::new(HashMap::new()),
             reporter_part_id: Cell::new(0),
+            reporter_row_stream: Cell::new(0),
             config,
             append_metrics: StreamAppendMetrics::default(),
             suspected: Rc::new(RefCell::new(SuspectedCache::default())),
@@ -2757,6 +2786,11 @@ impl StreamClient {
     /// a partition.
     pub fn set_reporter_part_id(&self, part_id: u64) {
         self.reporter_part_id.set(part_id);
+    }
+
+    /// Set the reporter partition's row stream (`reporter_row_stream`).
+    pub fn set_reporter_row_stream(&self, row_stream_id: u64) {
+        self.reporter_row_stream.set(row_stream_id);
     }
 
     pub fn owner_epoch(&self) -> i64 {
@@ -4573,8 +4607,116 @@ impl StreamClient {
         Ok(ex.replicates.len() + ex.parity.len())
     }
 
-    /// WAL self-heal A5: report bit-rotted replica(s) of a SEALED log_stream
-    /// extent to the manager so it ISOLATES them (clears each corrupt slot's
+    /// Every independent copy of `[offset, offset + length)` this extent can
+    /// produce, for a caller whose own content check (an SST block CRC) failed
+    /// on what `read_bytes_from_extent` returned — that read names no source,
+    /// so the caller cannot tell which copy was wrong, or whether another is
+    /// right.
+    ///
+    /// A replicated extent gives one copy per replica (avali-dark slots of a
+    /// sealed extent are left out, as on every read). An EC extent has one copy
+    /// of each byte, so the alternatives are reconstructions: one per data
+    /// shard the range covers, that shard rebuilt from the other shards with
+    /// its own node not asked. Whichever copy passes the caller's check names
+    /// the culprit by its `source`. A copy that could not be read is left out —
+    /// it says nothing about content.
+    ///
+    /// Reads run in parallel; this costs one read per replica (or K shard
+    /// sub-range reads per covering shard) and is for the failure path only.
+    pub async fn read_range_copies(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<RangeCopies> {
+        // The layout is fetched fresh: the one cached for the failed read may
+        // predate a seal or an isolation, and what the copies are read under
+        // is what a corrupt report names.
+        self.invalidate_extent_cache(extent_id);
+        let ex = self.fetch_extent_info(extent_id).await?;
+        let mut copies = Vec::new();
+        if ex.ec_converted {
+            let data_shards = ex.replicates.len();
+            let shard_size =
+                crate::erasure::shard_size(ex.sealed_length as usize, data_shards.max(1)) as u64;
+            if data_shards > 0 && shard_size > 0 && length > 0 {
+                let first = (offset / shard_size) as usize;
+                let last = ((offset + length - 1) / shard_size) as usize;
+                if last < data_shards {
+                    let reads = (first..=last).map(|shard| {
+                        let ex = &ex;
+                        async move {
+                            (
+                                shard,
+                                self.ec_subrange_read(extent_id, offset, length, ex, Some(shard))
+                                    .await,
+                            )
+                        }
+                    });
+                    for (shard, r) in futures::future::join_all(reads).await {
+                        match r {
+                            Ok((bytes, _)) if bytes.len() as u64 == length => {
+                                copies.push(RangeCopy {
+                                    bytes,
+                                    source: CopySource::EcWithoutShard { shard },
+                                })
+                            }
+                            Ok((bytes, _)) => tracing::warn!(
+                                extent_id,
+                                shard,
+                                got = bytes.len(),
+                                length,
+                                "range copy: reconstruction came back short"
+                            ),
+                            Err(e) => tracing::warn!(
+                                extent_id,
+                                shard,
+                                error = %format_args!("{e:#}"),
+                                "range copy: could not reconstruct without this shard"
+                            ),
+                        }
+                    }
+                }
+            }
+        } else {
+            let node_ids = replica_node_ids(&ex);
+            let reads = eligible_replica_slots(&ex).into_iter().map(|idx| async move {
+                (idx, self.read_committed_from_replica(extent_id, idx, offset, length).await)
+            });
+            for (idx, r) in futures::future::join_all(reads).await {
+                match r {
+                    Ok((bytes, _, node_id)) if bytes.len() as u64 == length => {
+                        copies.push(RangeCopy {
+                            bytes,
+                            source: CopySource::Replica { node_id },
+                        })
+                    }
+                    Ok((bytes, _, node_id)) => tracing::warn!(
+                        extent_id,
+                        node_id,
+                        got = bytes.len(),
+                        length,
+                        "range copy: replica answered short"
+                    ),
+                    Err(e) => tracing::warn!(
+                        extent_id,
+                        node_id = node_ids.get(idx).copied().unwrap_or(0),
+                        error = %format_args!("{e:#}"),
+                        "range copy: replica could not be read"
+                    ),
+                }
+            }
+        }
+        Ok(RangeCopies {
+            copies,
+            eversion: ex.eversion,
+            sealed: ex.sealed,
+        })
+    }
+
+    /// Report bit-rotted replica(s) of a SEALED extent in the partition's log
+    /// stream (WAL self-heal A5) or row stream (an SST block read) to the
+    /// manager so it ISOLATES them (clears each corrupt slot's
     /// `avali` bit + bumps eversion, etcd-first) — the A1 read-path filter then
     /// stops serving from those slots, and the eversion bump forces every PS to
     /// refetch the cleared ExtentInfo on its next read. Fenced: carries the
@@ -4587,7 +4729,7 @@ impl StreamClient {
     pub async fn report_corrupt_replica(
         &self,
         partition_id: u64,
-        log_stream_id: u64,
+        stream_id: u64,
         extent_id: u64,
         eversion: u64,
         corrupt_node_ids: Vec<u64>,
@@ -4595,7 +4737,7 @@ impl StreamClient {
         let req = manager_rpc::rkyv_encode(&ReportCorruptReplicaReq {
             partition_id,
             owner_epoch: self.owner_epoch,
-            log_stream_id,
+            stream_id,
             extent_id,
             eversion,
             corrupt_node_ids,
@@ -4610,6 +4752,31 @@ impl StreamClient {
             return Err(anyhow!("report_corrupt_replica refused: {}", resp.message));
         }
         Ok(())
+    }
+
+    /// Report the replicas whose copy of an SST block failed its CRC while
+    /// another replica's copy passed (`read_range_copies`), so the manager
+    /// isolates them — the row-stream twin of the WAL replay's report, under
+    /// the same fencing and the same evidence. Then drops the cached layout,
+    /// so this client's next read of the extent sees the darkened slot.
+    /// `Err` when this client has no reporter partition and row stream set.
+    pub async fn report_rotted_row_copies(
+        &self,
+        extent_id: u64,
+        eversion: u64,
+        corrupt_node_ids: Vec<u64>,
+    ) -> Result<()> {
+        let (part_id, row_stream) = (self.reporter_part_id.get(), self.reporter_row_stream.get());
+        if part_id == 0 || row_stream == 0 {
+            return Err(anyhow!(
+                "no reporter partition / row stream set on this client; not reporting"
+            ));
+        }
+        let r = self
+            .report_corrupt_replica(part_id, row_stream, extent_id, eversion, corrupt_node_ids)
+            .await;
+        self.invalidate_extent_cache(extent_id);
+        r
     }
 
     /// UCX / TCP recv-side copy-elimination fast path: recv the
@@ -4808,7 +4975,7 @@ impl StreamClient {
             }));
         }
         if ex.ec_converted {
-            return self.ec_subrange_read(extent_id, offset, length, ex).await;
+            return self.ec_subrange_read(extent_id, offset, length, ex, None).await;
         }
 
         // Resolve effective length so we know when to stop chunking.
@@ -5365,12 +5532,19 @@ impl StreamClient {
     /// by shard 2's prefix, and the GC log-record decoder panicked
     /// with `trailing bytes did not form a complete record`. The
     /// generalised scatter below handles spans of any width safely.
+    ///
+    /// `distrust`: a data shard whose bytes are not to be believed — it is
+    /// reconstructed from the others, and its node is asked for nothing during
+    /// this read, not for its own shard nor as a peer of another shard being
+    /// reconstructed (`read_range_copies`, after a content check failed).
+    /// `None` = every shard read directly unless it fails.
     async fn ec_subrange_read(
         &self,
         extent_id: u64,
         offset: u64,
         length: u64,
         ex: &ExtentInfo,
+        distrust: Option<usize>,
     ) -> Result<(Vec<u8>, u64)> {
         let data_shards = ex.replicates.len();
         if data_shards == 0 {
@@ -5446,7 +5620,9 @@ impl StreamClient {
         let mut to_read: Vec<usize> = Vec::with_capacity(shard_plan.len());
         for (i, &(shard_idx, _, _)) in shard_plan.iter().enumerate() {
             let nid = node_ids.get(shard_idx).copied().unwrap_or(0);
-            if self.is_node_suspected(nid) {
+            if distrust == Some(shard_idx) {
+                needs_reconstruct.push(i);
+            } else if self.is_node_suspected(nid) {
                 // The THIRD way into a reconstruct, and the one that lasts: a
                 // short read and a read error each get a warning, but a node the
                 // manager has marked Suspected is diverted here before anything
@@ -5567,6 +5743,7 @@ impl StreamClient {
                         failing_shard_idx,
                         sh_off,
                         sh_len,
+                        distrust,
                     )
                     .await?;
                 plan_results[plan_idx] = Some(recon);
@@ -5627,6 +5804,7 @@ impl StreamClient {
         missing_shard_idx: usize,
         sh_off: u64,
         sh_len: u64,
+        distrust: Option<usize>,
     ) -> Result<Vec<u8>> {
         let data_shards = ex.replicates.len();
         let parity_shards = ex.parity.len();
@@ -5663,7 +5841,15 @@ impl StreamClient {
         // its bytes ARE the answer — `missing_shard_idx < data_shards` is
         // enforced above, so this is a data shard, never parity — which lets
         // the receive loop return them directly and skip RS entirely.
+        //
+        // Except a distrusted shard (`ec_subrange_read`'s `distrust`): a
+        // content check failed and that shard is the one being ruled out, so
+        // its bytes must neither come back verbatim nor feed the RS of any
+        // other shard this read reconstructs.
         for (i, addr) in addrs.iter().enumerate() {
+            if distrust == Some(i) {
+                continue;
+            }
             let mut tx_clone = tx.clone();
             let addr_clone = addr.clone();
             let pool = self.pool.clone();

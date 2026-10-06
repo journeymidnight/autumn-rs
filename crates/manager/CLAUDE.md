@@ -738,6 +738,10 @@ value breaks rkyv replay validation, which refuses leadership.
 Regression: `crates/manager/tests/system_corrupt_replica_rebuild.rs`; the
 prerequisite that the loop can act at all is pinned by
 `system_recovery_loop_drives.rs`.
+The report names one of the partition's streams, and the manager accepts the
+log stream (a WAL replay's finding) or the row stream (an SST block that
+failed its CRC on one replica and decoded from another,
+`SstReader::reread_block`); the meta stream holds no SST block and is refused.
 `handle_report_corrupt_replica` REFUSES EC-converted extents, before the
 shared decision: the reporter's evidence — a CRC-failed WAL decode plus the same
 bytes found clean on another copy — only exists for full replicas, and an EC

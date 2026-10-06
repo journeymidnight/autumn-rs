@@ -7,7 +7,7 @@ use parking_lot::Mutex;
 
 use std::rc::Rc;
 
-use autumn_stream::StreamClient;
+use autumn_stream::{CopySource, StreamClient};
 
 use super::block_cache::BlockCache;
 use super::bloom::BloomFilter;
@@ -273,18 +273,11 @@ impl SstReader {
         self
     }
 
-    /// block read that works for BOTH modes. Resident → the sync path;
-    /// paged → bounded global cache, miss fetched from row_stream via `sc`
-    /// (rides the replica rotation). The await happens with NO RefCell
-    /// borrow held — callers snapshot `Arc<SstReader>`s first (note 15).
-    pub async fn read_block_via(
-        &self,
-        idx: usize,
-        sc: &Rc<StreamClient>,
-        cache: &BlockCache,
-    ) -> Result<Arc<DecodedBlock>> {
+    /// Where paged block `idx` lives: `(extent_id, absolute offset, its
+    /// offset entry)`. `None` for a resident reader.
+    fn paged_block_location(&self, idx: usize) -> Result<Option<(u64, u64, &BlockOffset)>> {
         let (extent_id, base, len_in_extent) = match &self.source {
-            SstSource::Resident(_) => return self.read_block(idx),
+            SstSource::Resident(_) => return Ok(None),
             SstSource::Paged {
                 extent_id,
                 base_in_extent,
@@ -323,6 +316,22 @@ impl SstReader {
             .checked_add(self.sst_base)
             .and_then(|v| v.checked_add(bo.relative_offset as u64))
             .ok_or_else(|| anyhow!("paged block {idx}: absolute offset overflows u64"))?;
+        Ok(Some((extent_id, abs, bo)))
+    }
+
+    /// block read that works for BOTH modes. Resident → the sync path;
+    /// paged → bounded global cache, miss fetched from row_stream via `sc`
+    /// (rides the replica rotation). The await happens with NO RefCell
+    /// borrow held — callers snapshot `Arc<SstReader>`s first (note 15).
+    pub async fn read_block_via(
+        &self,
+        idx: usize,
+        sc: &Rc<StreamClient>,
+        cache: &BlockCache,
+    ) -> Result<Arc<DecodedBlock>> {
+        let Some((extent_id, abs, bo)) = self.paged_block_location(idx)? else {
+            return self.read_block(idx);
+        };
         let key = (extent_id, abs);
         if let Some(b) = cache.get(key) {
             return Ok(b);
@@ -337,8 +346,93 @@ impl SstReader {
                 raw.len()
             ));
         }
-        let block = Arc::new(DecodedBlock::decode(Bytes::from(raw), &bo.key)?);
+        let block = match DecodedBlock::decode(Bytes::from(raw), &bo.key) {
+            Ok(b) => Arc::new(b),
+            Err(why) => self.reread_block(idx, sc, why).await?,
+        };
         cache.insert(key, block.clone(), bo.block_len as usize);
+        Ok(block)
+    }
+
+    /// Block `idx` again, after the copy a read returned failed to decode
+    /// (`why`: its CRC, or its structure). That read names no source, so every
+    /// other copy is fetched (`read_range_copies`: each replica, or for an EC
+    /// extent one reconstruction per covering data shard with that shard left
+    /// out) and the first that decodes is served. Replicas whose copy failed
+    /// while another passed are reported for isolation, in the background — the
+    /// same evidence the WAL replay reports on; an EC culprit is only logged,
+    /// its own node's scrub reports it. No copy decodes → `why`, with what the
+    /// other copies said.
+    ///
+    /// The failure path only: a healthy read never comes here, and once a
+    /// block is served from a good copy it is cached like any other.
+    pub async fn reread_block(
+        &self,
+        idx: usize,
+        sc: &Rc<StreamClient>,
+        why: anyhow::Error,
+    ) -> Result<Arc<DecodedBlock>> {
+        let Some((extent_id, abs, bo)) = self.paged_block_location(idx)? else {
+            return Err(why);
+        };
+        let found = match sc
+            .read_range_copies(extent_id, abs, bo.block_len as u64)
+            .await
+        {
+            Ok(found) => found,
+            Err(e) => {
+                return Err(why.context(format!(
+                    "SST block extent={extent_id} off={abs}: no other copy could be read: {e:#}"
+                )))
+            }
+        };
+        let mut good = None;
+        let mut rotted = Vec::new();
+        let mut tried = Vec::new();
+        for copy in found.copies {
+            tried.push(copy.source);
+            match DecodedBlock::decode(Bytes::from(copy.bytes), &bo.key) {
+                Ok(b) => {
+                    if good.is_none() {
+                        good = Some((Arc::new(b), copy.source));
+                    }
+                }
+                Err(_) => {
+                    if let CopySource::Replica { node_id } = copy.source {
+                        rotted.push(node_id);
+                    }
+                }
+            }
+        }
+        let Some((block, source)) = good else {
+            return Err(why.context(format!(
+                "SST block extent={extent_id} off={abs}: no copy decodes (tried {tried:?})"
+            )));
+        };
+        tracing::error!(
+            extent_id,
+            offset = abs,
+            served_from = ?source,
+            rotted_replicas = ?rotted,
+            first_read = %format_args!("{why:#}"),
+            "SST block failed to decode; served from another copy"
+        );
+        if found.sealed && !rotted.is_empty() {
+            let sc = sc.clone();
+            compio::runtime::spawn(async move {
+                if let Err(e) = sc
+                    .report_rotted_row_copies(extent_id, found.eversion, rotted)
+                    .await
+                {
+                    tracing::warn!(
+                        extent_id,
+                        error = %format_args!("{e:#}"),
+                        "could not report rotted SST block replica(s) for isolation"
+                    );
+                }
+            })
+            .detach();
+        }
         Ok(block)
     }
 

@@ -1488,8 +1488,12 @@ and from other crates' CLAUDE.md); do not renumber.
     expensive:
     - **A failed shard read is not the reader's evidence to act on.** Rot has
       a first-party reporter: the shard's own node, when a scrub compares the
-      shard with its `.shard{i}.ck`. No read checks content, so rot never fails
-      a read at all. Everything that does fail a shard read is not corruption:
+      shard with its `.shard{i}.ck`. No stream-layer read checks content, so
+      rot never fails a shard read at all. (A PS's SST block CRC does check
+      content, above this layer: on a failure it reads around the shard with
+      `read_range_copies` — reconstructing with each covering data shard left
+      out, `ec_subrange_read(.., distrust)`, the distrusted node not asked — and
+      logs the culprit; it still does not report it.) Everything that does fail a shard read is not corruption:
       timeout/connect (congestion or a dead node —
       Suspected avoidance, note 27, and operator fencing already handle both),
       `CODE_PAYLOAD_NOT_HERE` (stale layout → the typed refresh; or a genuinely

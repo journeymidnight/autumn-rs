@@ -2015,17 +2015,20 @@ pub struct ReportCorruptReplicaReq {
     /// The reporting PS's partition owner_epoch (fencing — a stale PS whose
     /// epoch no longer matches is rejected).
     pub owner_epoch: i64,
-    /// The partition's log_stream id. The manager verifies `extent_id` is a
-    /// member of this stream (scoping: an owner can only isolate replicas of an
-    /// extent in the stream it is replaying — mirrors punch_holes/truncate
-    /// operating only on their named stream's extents).
-    pub log_stream_id: u64,
+    /// The partition's stream holding the extent: its log stream (a WAL
+    /// replay) or its row stream (an SST block read). The manager verifies it
+    /// is one of those two of `partition_id`'s streams and that `extent_id` is
+    /// a member of it (scoping: an owner can only isolate replicas of an
+    /// extent in a stream it reads — mirrors punch_holes/truncate operating
+    /// only on their named stream's extents).
+    pub stream_id: u64,
     pub extent_id: u64,
     /// The extent eversion the PS saw; the manager rejects the report if it
     /// has since changed (a concurrent recovery / EC bump).
     pub eversion: u64,
-    /// Node ids whose copy of `extent_id` failed the per-record CRC during
-    /// replay (the PS confirmed at least one OTHER replica decodes clean).
+    /// Node ids whose copy of `extent_id` failed the reader's CRC (per WAL
+    /// record, or per SST block) while at least one OTHER replica's copy of
+    /// the same bytes passed it.
     pub corrupt_node_ids: Vec<u64>,
 }
 
