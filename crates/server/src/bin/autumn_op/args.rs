@@ -53,6 +53,9 @@ fn usage() -> ! {
     eprintln!("  repair [--cancel] <EXTID>... | [--cancel] --node <NODE_ID>");
     eprintln!("                               rebuild degraded copies on other nodes now, no fence");
     eprintln!("                               (--cancel: withdraw standing repair requests)");
+    eprintln!("  scrub <EXTID>... | --part <PART_ID> | --all");
+    eprintln!("                               check sealed copies against their checksums on the");
+    eprintln!("                               nodes that hold them; rot is isolated and rebuilt");
     eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
     eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (presplit EMPTY keyspace before loading)");
     eprintln!("           fs: --lanes <N> [--parts <P>] [--force to narrow declared lanes]");
@@ -369,6 +372,13 @@ pub(crate) enum Command {
         node: Option<u64>,
         /// Withdraw standing requests instead of making them.
         cancel: bool,
+    },
+    /// Check sealed copies against their recorded checksums on the nodes that
+    /// hold them: these extents, or every extent of `part`, or (both empty —
+    /// the parser requires `--all` for that) every sealed extent in the cluster.
+    Scrub {
+        extents: Vec<u64>,
+        part: Option<u64>,
     },
     ForceEcConvert {
         extent_id: u64,
@@ -1291,6 +1301,42 @@ pub(crate) fn parse() -> Args {
                 node,
                 cancel,
             }
+        }
+        "scrub" => {
+            let mut extents: Vec<u64> = Vec::new();
+            let mut part: Option<u64> = None;
+            let mut all = false;
+            while i < raw.len() {
+                match raw[i].as_str() {
+                    "--all" => {
+                        all = true;
+                        i += 1;
+                    }
+                    "--part" => {
+                        i += 1;
+                        part = Some(val(&raw, i).parse().unwrap_or_else(|_| {
+                            eprintln!("--part requires a partition id");
+                            usage()
+                        }));
+                        i += 1;
+                    }
+                    tok => {
+                        extents.push(tok.parse().unwrap_or_else(|_| {
+                            eprintln!("scrub: {tok:?} is not an extent id");
+                            usage()
+                        }));
+                        i += 1;
+                    }
+                }
+            }
+            // Exactly one scope, and the whole cluster only when asked for by
+            // name — an empty argument list must not mean "everything".
+            let scopes = usize::from(!extents.is_empty()) + usize::from(part.is_some()) + usize::from(all);
+            if scopes != 1 {
+                eprintln!("scrub takes extent ids, OR --part <PART_ID>, OR --all");
+                usage();
+            }
+            Command::Scrub { extents, part }
         }
         "force-ec-convert" => {
             let mut extent_id: Option<u64> = None;

@@ -174,6 +174,7 @@ fn op_name(b: u8) -> &'static str {
         AUDIT_OP_FORCE_ABANDON_EC_MARKER => "force_abandon_ec_marker",
         AUDIT_OP_REPAIR => "repair",
         AUDIT_OP_REPAIR_CANCEL => "repair_cancel",
+        AUDIT_OP_SCRUB => "scrub",
         _ => "unknown",
     }
 }
@@ -494,6 +495,25 @@ async fn run(args: Args) -> Result<()> {
                         OP_KIND_REPAIR
                     },
                     part_id: node.unwrap_or(0),
+                    secondary_id: extents.first().copied().unwrap_or(0),
+                    extent_ids: extents,
+                    requested_by: "cli".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?
+        }
+        // Naming neither extents nor a partition is `--all`, the scope the
+        // manager reads from that; the parser already insisted on exactly one.
+        Command::Scrub { extents, part } => {
+            submit_op_cli(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                OpSubmitReq {
+                    kind: OP_KIND_SCRUB,
+                    part_id: part.unwrap_or(0),
                     secondary_id: extents.first().copied().unwrap_or(0),
                     extent_ids: extents,
                     requested_by: "cli".to_string(),
@@ -1464,10 +1484,10 @@ async fn cmd_audit_log(
 
 /// Map a comma-separated switch list (`split,gc,ec`) to the fixed bool vector
 /// the controller stores, order `[split, ec, compact, gc, merge, rebalance,
-/// repair]`. Unknown names are a hard error (a typo must not silently drop a
+/// repair, scrub]`. Unknown names are a hard error (a typo must not silently drop a
 /// switch). An empty list = all off.
 fn parse_switch_csv(csv: &str) -> Result<Vec<bool>> {
-    let mut sw = vec![false; 7];
+    let mut sw = vec![false; 8];
     for tok in csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let idx = match tok {
             "split" => 0,
@@ -1477,7 +1497,10 @@ fn parse_switch_csv(csv: &str) -> Result<Vec<bool>> {
             "merge" => 4,
             "rebalance" => 5,
             "repair" => 6,
-            other => bail!("unknown switch '{other}' (split|ec|compact|gc|merge|rebalance|repair)"),
+            "scrub" => 7,
+            other => bail!(
+                "unknown switch '{other}' (split|ec|compact|gc|merge|rebalance|repair|scrub)"
+            ),
         };
         sw[idx] = true;
     }
@@ -1725,6 +1748,7 @@ async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()>
                     POLICY_KIND_EC => "ec",
                     POLICY_KIND_REBALANCE => "rebalance",
                     POLICY_KIND_REPAIR => "repair",
+                    POLICY_KIND_SCRUB => "scrub",
                     _ => "?",
                 };
                 serde_json::json!({
@@ -1758,6 +1782,7 @@ async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()>
                 POLICY_KIND_EC => "ec",
                 POLICY_KIND_REBALANCE => "rebalance",
                 POLICY_KIND_REPAIR => "repair",
+                POLICY_KIND_SCRUB => "scrub",
                 _ => "?",
             };
             let feas = match c.kind {
@@ -2069,6 +2094,7 @@ fn op_kind_from_str(s: &str) -> u8 {
         "recovery" => OP_KIND_RECOVERY,
         "repair" => OP_KIND_REPAIR,
         "repair-cancel" => OP_KIND_REPAIR_CANCEL,
+        "scrub" => OP_KIND_SCRUB,
         _ => 0,
     }
 }

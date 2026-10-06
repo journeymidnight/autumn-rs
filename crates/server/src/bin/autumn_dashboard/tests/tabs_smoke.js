@@ -117,7 +117,7 @@ const POLICIES = {
   policies: [{ name: "gc-only", desc: "Reclaim space only (GC)", builtin: true,
                interval: 30, cooldown: 120, max_actions: 2,
                switches: { split: false, ec: false, compact: false, gc: true, merge: false, rebalance: false } }],
-  switch_order: ["split", "ec", "compact", "gc", "merge", "rebalance", "repair"],
+  switch_order: ["split", "ec", "compact", "gc", "merge", "rebalance", "repair", "scrub"],
   log: [{ ts: Math.floor(Date.now() / 1000), level: "refused", msg: "autumn-op split 168: overlapping keys" }],
 };
 const payload = { "/api/overview": OVERVIEW, "/api/ops": OPS, "/api/policies": POLICIES };

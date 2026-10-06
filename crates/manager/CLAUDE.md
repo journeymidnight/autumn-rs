@@ -744,29 +744,36 @@ bytes found clean on another copy — only exists for full replicas, and an EC
 extent has no other copy of any byte. Extending the report to the EC READ path
 (client infers corruption from a failed shard read) was considered and REJECTED
 — see `crates/stream/CLAUDE.md` note 33. A rotted SHARD is reported by its own
-node instead, whose `.shard{i}.ck` caught it. The bitmap + rebuild verdict here are
-slot-generic over `replicates ++ parity`, and the EN-side scrub is the second
-evidence source: it reports its own rot on `DfResp.scrub_rot` and
-`node_health_loop` runs the SAME decision — `isolate_rotted_slot`, one helper
-shared by every first-hand report. The THIRD source is the EC pre-encode
-content check: `release_corrupt_ec_attempt` calls the same helper in the window
-its own abandon just opened, because isolation refuses while the extent has a
-stream-layer op in flight and that reply is what removes the op. Going through
-`df` alone would at best delay the repair by a tick, and lose the finding
-outright whenever another op takes the extent before that tick lands. Self-reporting needs no fencing (a
-node saying "my copy is bad" can only hurt itself), which is why it does not
-use the PS-shaped RPC.
+node instead, when a scrub finds it. The bitmap + rebuild verdict here are
+slot-generic over `replicates ++ parity`, and the EN-side scrub (see "Scrub"
+below) is the second evidence source: it reports its own rot as a ROT
+outcome on `DfResp.scrub_done` and `node_health_loop` runs the SAME decision —
+`isolate_rotted_slot`, the helper every first-hand report goes through.
+Self-reporting needs no fencing (a node saying "my copy is bad" can only hurt
+itself), which is why it does not use the PS-shaped RPC.
 
-Both entry points share `compute_corrupt_isolation`, which refuses when the
-eversion moved, on an OPEN tail, when no reported node is a member, when it
+Both entry points share `compute_corrupt_isolation`, which answers `Stale`
+(not judged) when the eversion moved, refuses on an OPEN tail, when no reported node is a member, when it
 would darken the LAST available slot — on an EC extent, when fewer than K
 shards would stay available (below K nothing reconstructs, so the shard's range
-would go from wrong to gone) — and **while the extent
+would go from wrong to gone) — and answers `Stale` **while the extent
 has a stream-layer op in flight** — isolating into that window moves the
 eversion out from under the op, and an EC conversion's flip then recomputes
 from the post-isolation baseline and lands with the eversion unchanged across a
 replicated→EC layout change, leaving cached layouts with no signal to refetch.
-Deferring is free: rot does not heal, so the reporter comes back. The
+Deferring costs a re-check, not the finding: the PS
+retries its report, and a scrub finding is held in its op (`ScrubOp::recheck`)
+and that copy scrubbed again under the current eversion once the extent has
+nothing in flight and its node is Online (`recheck_scrub_findings`, after each
+`df` round; synchronous, with the sends spawned, so a dead shard listener
+cannot hold the `df` round, and with no await between the in-flight check and
+the re-plan). Without that, two rotted copies of one extent lose the second
+finding every time: the first one's isolation moves the eversion the second was
+planned under. Accepted limits: with a spare node the first slot's rebuild can
+start before the second finding is re-checked, and copy from that still-lit
+rotted copy (the rebuilt copy has no checksums, so the next scrub records the
+damage as its content); and a second rot refused as the last available copy is
+settled without a mark. The
 converse holds too: `acquire_extent_inflight` refuses a NEW EC conversion
 marker on an extent with any corrupt-marked slot — the coordinator encodes from
 its own copy whenever that copy is full length, and a marked copy is; the slot
@@ -919,26 +926,10 @@ cluster or `Suspected`, NOT merely "not Online": a freshly registered node sits
 in `Suspend` until its first `df`, and abandoning on that makes a conversion
 that outlives one tick impossible.
 
-**A CORRUPT source abandons on the FIRST failure, not on the 24th.** The
-pre-encode content check correctly refuses a bit-rotted replica, and the
-extent's own marker is what stops recovery from repairing it
-(`recovery_dispatch_tick` skips any extent carrying a ConvertToEc marker). The
-two repairs then block each other and the only exit is
-`EC_ABANDON_AFTER_CONSECUTIVE_FAILURES`, so "repair rot promptly" became "wait
-out 24 dispatch round trips" — measured at 78-79 s of a pinned marker per chaos
-round, three reproductions, and the main source of one seed's instability. The
-coordinator now answers `CODE_CONTENT_CORRUPT` (wire code 8) and
-`release_corrupt_ec_attempt` abandons the marker at once, handing the extent to
-replica recovery. Retrying is what the generic budget is FOR — a transient peer
-or a busy disk — and corrupted bytes are the one failure a retry cannot improve,
-so they must not share it. The conversion resumes by itself: a later attempt
-carries a new nonce and re-reads the content that recovery rewrote.
-
 `abandon_ec_marker` is CAS'd on the persisted record and re-reads the attempt
-nonce after its etcd await, so a reply that was already stale when it arrived
-cannot release a SUCCESSOR's marker — the release path is now as attempt-scoped
-as the apply path (`classify_ec_done`), which it had to be the moment a single
-late reply could trigger it.
+nonce after its etcd await, so a release decided against a stale view cannot
+release a SUCCESSOR's marker — the release path is as attempt-scoped as the
+apply path (`classify_ec_done`).
 
 **Payload location (`extent_layout.rs`).** Which FILE holds an extent's payload
 — `.dat` or `.shard{i}` — is per-extent metadata the manager owns and the EN
@@ -1194,10 +1185,10 @@ can't catch a panic.
 
 `policy_tick_loop` (leader-only, every `POLICY_BUCKET_SEC = 60 s`) reads per-partition
 metrics from `MSG_REPORT_PARTITION_LOAD` aggregations and rebuilds `advisory_cache`
-(the ONLY job — the manager is pure mechanism; it never self-dispatches). Emits 8 kinds
+(the ONLY job — the manager is pure mechanism; it never self-dispatches). Emits 9 kinds
 (`POLICY_KIND_*`, wire-stable append-only): split / merge / gc / major_compact / minor
-_compact / ec / rebalance / repair (the last from extent state, not partition
-metrics — see "Extent repair"). `handle_get_policy_candidates` and `handle_get_partition
+_compact / ec / rebalance / repair / scrub (the last two from extent state and
+the clock, not partition metrics — see "Extent repair" and "Scrub"). `handle_get_policy_candidates` and `handle_get_partition
 _detail` are leader-gated (a follower's metrics are empty).
 
 **Metrics window.** `PartitionMetricsWindow::push_with_cap_and_bucket` snaps `ts` to
@@ -1343,17 +1334,17 @@ Config is **etcd, leader-owned, crash-safe** (`autoPolicy/config` = mode + activ
 custom policies, `autoPolicy/cooldowns`), written etcd-first + leader-fenced by
 `autopolicy_set`, reloaded by `replay_from_etcd` (fail-loud decode + `sanitize_entry`
 clamp — a shorter persisted `switches` Vec pads the absent trailing switches to off).
-Switch order is `[split, ec, compact, gc, merge, rebalance, repair]` (append-only;
+Switch order is `[split, ec, compact, gc, merge, rebalance, repair, scrub]` (append-only;
 a config persisted with fewer switches reads the missing ones as off). Presets are compiled-in,
 never persisted, safest → most aggressive:
 
 | Preset | Switches enabled |
 |---|---|
 | `gc-only` | gc |
-| `maintenance` | compact, gc, repair |
+| `maintenance` | compact, gc, repair, scrub |
 | `space-reclaim` | ec, gc |
-| `balanced` (recommended steady-state) | ec, compact, gc, rebalance, repair |
-| `aggressive` | split, ec, compact, gc, merge, rebalance, repair |
+| `balanced` (recommended steady-state) | ec, compact, gc, rebalance, repair, scrub |
+| `aggressive` | split, ec, compact, gc, merge, rebalance, repair, scrub |
 
 `repair` actuates first (`kind_priority` 0): the others tune performance and
 space, a copy short is durability.
@@ -1640,6 +1631,50 @@ is its own standing instruction). Tests:
 that does not withdraw; a summary that does not mark) and
 `extent_repair::tests::a_cancel_restarts_the_grace_period` (ablation: no
 clock reset).
+
+## Scrub (`extent_scrub.rs`)
+
+`OP_KIND_SCRUB` (`autumn-op scrub EXT... | --part P | --all`, or the weekly
+policy) checks sealed copies against their recorded checksums ON THE NODES THAT
+HOLD THEM; no content crosses the network, and nothing on the hot path reads or
+writes a checksum (design: `docs/autumn_integrity_plan.md`; the node side is
+the stream crate's `extent_node/scrub.rs`).
+
+`plan_scrub` (pure) turns the scope into one `ScrubTask` per LIT copy of every
+SEALED, non-empty extent with no op in flight, NAMING the file and its length:
+`.dat` at `sealed_length` for a replica, `.shard{i}` for slot `i` at
+`ceil(sealed_length / K)` (`shard_len`, which must equal the stream crate's
+`erasure::shard_size` — this crate does not link it) for a converted extent.
+Left out and counted in the op's message: open/empty extents, an op in flight,
+pre-CoW EC layouts (shards in `.dat`), dark slots, and copies on nodes that are
+not Online. `dispatch_scrub` groups tasks by the EN shard that owns each extent
+(`shard_addr_for_extent`) and sends `MSG_SCRUB_EXTENTS` in chunks of 4096; a
+failed send records those files as FAILED at once.
+
+The op is per-file accounting in `scrub_ops` (leader-local, like the ledger):
+`record_scrub_outcome` takes each `DfResp.scrub_done` once — keyed by (extent,
+node, file) — updates progress, and finishes the op when nothing is pending:
+SUCCEEDED whatever was found (a ROT outcome is first handed to
+`isolate_rotted_slot`; one it answers `Stale` is held for a re-check rather
+than counted) and FAILED only if a file could not be checked.
+Outcomes are at-most-once and a node's queue is in memory, so each `df` also
+carries `scrub_queued` (`record_scrub_queued`): an op listed there is alive
+however long its files wait; an op with files pending on a node that answers
+WITHOUT listing it, past `SCRUB_QUEUE_GRACE_SECS` (30 s) after dispatch, has
+lost them (restart, lost report) and they are FAILED at once.
+`sweep_silent_scrub_ops` (policy tick) ends an op nothing has been heard about
+for `SCRUB_OP_SILENCE_SECS` (2 h — every node holding its files stopped
+answering) as UNKNOWN; a RUNNING op would attach-dedup every later submit of
+its scope into a no-op. A failover ends running scrubs the same way; nodes keep
+scrubbing and their outcomes are dropped from the accounting, but a ROT one is
+still acted on (it cannot be held for a re-check without its op).
+
+The `scrub` auto-policy switch (switch 8; on in `maintenance`, `balanced`,
+`aggressive`) submits `scrub --all` through the ledger at most once per
+`SCRUB_POLICY_INTERVAL_SEC` (7 days): `decide_actions` floors that kind's
+cooldown at the interval whatever the policy says, and cooldowns are persisted.
+`scrub_candidates` emits its one advisory row only when the week is up and no
+scrub is running.
 
 ## Web dashboard (standalone app)
 

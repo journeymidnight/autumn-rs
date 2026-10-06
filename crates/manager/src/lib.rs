@@ -4,6 +4,7 @@ pub mod ec_abandon;
 mod extent_corrupt;
 mod extent_health;
 mod extent_repair;
+mod extent_scrub;
 mod extent_delete;
 pub mod extent_inflight;
 mod extent_layout;
@@ -69,6 +70,7 @@ fn op_kind_audit_code(kind: u8) -> u8 {
         OP_KIND_EC_CONVERT => AUDIT_OP_FORCE_EC_CONVERT,
         OP_KIND_REPAIR => AUDIT_OP_REPAIR,
         OP_KIND_REPAIR_CANCEL => AUDIT_OP_REPAIR_CANCEL,
+        OP_KIND_SCRUB => AUDIT_OP_SCRUB,
         _ => 0,
     }
 }
@@ -743,6 +745,9 @@ pub struct AutumnManager {
     /// How long a slot must have been degraded before the repair policy
     /// proposes moving it (`--repair-grace-secs`, default 600).
     pub(crate) repair_grace_secs: Rc<Cell<u64>>,
+    /// Running scrub ops' per-file accounting (`extent_scrub.rs`). Leader-local
+    /// like the op ledger it feeds: a failover ends them as `UNKNOWN`.
+    pub(crate) scrub_ops: Rc<RefCell<HashMap<u64, crate::extent_scrub::ScrubOp>>>,
     /// #6: per-partition split-in-flight guard (in-memory; single-threaded
     /// manager). `handle_multi_modify_split` inserts `part_id` before its
     /// (possibly slow) etcd txn and removes it on completion via a RAII guard.
@@ -1106,6 +1111,7 @@ impl AutumnManager {
             extent_repair_slots: Rc::new(RefCell::new(HashMap::new())),
             extent_repair_lock: Rc::new(futures::lock::Mutex::new(())),
             repair_grace_secs: Rc::new(Cell::new(600)),
+            scrub_ops: Rc::new(RefCell::new(HashMap::new())),
             op_log_seq: Cell::new(0),
             op_log_writes_since_gc: Cell::new(0),
             split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
@@ -1537,6 +1543,7 @@ impl AutumnManager {
             // whose terminal outcome never came back to UNKNOWN, keeping
             // `ops status` honest instead of RUNNING forever.
             self.ops.borrow_mut().sweep_running_ttl(Self::epoch_seconds());
+            self.sweep_silent_scrub_ops(Self::epoch_seconds());
             // Backstop drain: kinds no PS reports (recovery, ec-convert) close
             // outside the load heartbeat, so without this their history would
             // wait for unrelated PS traffic.
@@ -1565,6 +1572,7 @@ impl AutumnManager {
                         autumn_rpc::manager_rpc::POLICY_KIND_EC => "EC",
                         autumn_rpc::manager_rpc::POLICY_KIND_REBALANCE => "REBALANCE",
                         autumn_rpc::manager_rpc::POLICY_KIND_REPAIR => "REPAIR",
+                        autumn_rpc::manager_rpc::POLICY_KIND_SCRUB => "SCRUB",
                         _ => "UNKNOWN",
                     };
                     tracing::info!(
@@ -1619,6 +1627,7 @@ impl AutumnManager {
         // the engine, so it is computed before the engine is borrowed — and a
         // copy short is the most urgent thing on the list.
         let mut repair = self.repair_candidates(now);
+        repair.append(&mut self.scrub_candidates(now));
         let mut p = self.policy.borrow_mut();
         p.sacred_boundaries = sacred;
         // prune metrics for partitions that no longer exist
@@ -2028,6 +2037,11 @@ impl AutumnManager {
                 }
                 Ok(())
             }
+            POLICY_KIND_SCRUB => {
+                let op_id = self.submit_scrub_all("auto-policy");
+                tracing::info!(op_id, "auto-policy: weekly scrub submitted");
+                Ok(())
+            }
             POLICY_KIND_REBALANCE => {
                 // Phase B: move a BOUNDED batch per tick so a
                 // concentrated cluster converges gradually (the target PSes take
@@ -2295,6 +2309,20 @@ impl AutumnManager {
                 Ok(_) => terminal_err("no standing repair request to withdraw".to_string()),
                 Err(e) => terminal_err(e.to_string()),
             },
+            OP_KIND_SCRUB => {
+                let scope = if !spec.extent_ids.is_empty() {
+                    crate::extent_scrub::ScrubScope::Extents(spec.extent_ids.clone())
+                } else if spec.part_id != 0 {
+                    crate::extent_scrub::ScrubScope::Partition(spec.part_id)
+                } else {
+                    crate::extent_scrub::ScrubScope::All
+                };
+                match self.dispatch_scrub(op_id, scope).await {
+                    // RUNNING until every node has reported each file.
+                    Ok(message) => ActuationResult::Dispatched { message },
+                    Err(e) => terminal_err(e),
+                }
+            }
             OP_KIND_EC_CONVERT => {
                 let req = ForceEcConvertReq {
                     extent_id: spec.secondary_id,

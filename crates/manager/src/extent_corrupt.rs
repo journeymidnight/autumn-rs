@@ -51,17 +51,33 @@ pub(crate) enum IsolationOutcome {
     /// The reported slots are already dark — a retried report after the first
     /// isolation landed. Success, not a no-op to be confused with a refusal.
     AlreadyIsolated,
+    /// Not now: the extent is mid-change (an op in flight) or has changed
+    /// since the finding was made (its eversion moved). Nothing about the
+    /// finding is judged; the same copy checked again, once the extent
+    /// settles, decides. Answered as `CODE_PRECONDITION` on the RPC path.
+    Stale { message: String },
     /// `code` is what the RPC entry point answers with; the heartbeat entry
     /// point only logs `message`. Both are kept so neither caller has to
     /// re-derive the other's half.
     Refused { code: u8, message: String },
 }
 
+/// What became of a node's finding that its own copy is rotted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RotFinding {
+    /// Decided: isolated, already isolated, or refused for good (the last
+    /// copy, too few EC shards, not a member).
+    Settled,
+    /// Not judged yet (`IsolationOutcome::Stale`, or the isolation could not
+    /// be written or applied): the copy must be checked again.
+    Stale,
+}
+
 /// Decide whether the named replicas of `ex` may be isolated.
 ///
 /// `reported_eversion` is what the reporter saw. Every refusal below is
 /// load-bearing: an eversion that moved means the finding describes content
-/// that has already been replaced; an OPEN tail cannot be isolated without a
+/// that may have been replaced (so is `Stale`: checked again, not believed); an OPEN tail cannot be isolated without a
 /// seal-and-roll; and clearing the LAST available bit would make the extent
 /// unreadable, which is worse than serving a copy known to be damaged.
 ///
@@ -83,14 +99,14 @@ pub(crate) fn compute_corrupt_isolation(
     // post-isolation baseline, where its PINNED `new_eversion` is no longer one
     // above what the extent now holds. The flip lands with the eversion
     // unchanged across a replicated→EC layout change, and every client caching
-    // that layout has nothing to tell it to refetch. Deferring costs one sweep:
-    // the reporter re-reports, because rot does not heal.
+    // that layout has nothing to tell it to refetch. Deferring costs a
+    // re-check: a scrub finding is checked again once the extent settles
+    // (`ScrubOp::recheck`), and rot does not heal.
     //
     // This mirrors `handle_reconcile_extents`, which withholds a verdict for
     // exactly the same reason.
     if op_in_flight {
-        return IsolationOutcome::Refused {
-            code: CODE_PRECONDITION,
+        return IsolationOutcome::Stale {
             message: format!(
                 "extent {} has a stream-layer op in flight; isolating now would move the \
                  eversion under it",
@@ -99,8 +115,7 @@ pub(crate) fn compute_corrupt_isolation(
         };
     }
     if ex.eversion != reported_eversion {
-        return IsolationOutcome::Refused {
-            code: CODE_PRECONDITION,
+        return IsolationOutcome::Stale {
             message: format!(
                 "extent {} eversion moved ({} != reported {}) — the report describes \
                  content that has since been replaced",
@@ -397,14 +412,14 @@ mod isolation_tests {
         }
     }
 
-    /// Timing, not evidence: the same report that is refused mid-op is acted on
-    /// once the op clears. Rot does not heal, so the reporter comes back.
+    /// Timing, not evidence: the same report that is deferred mid-op is acted
+    /// on once the op clears and the copy is checked again.
     #[test]
     fn a_report_is_deferred_while_the_extent_has_an_op_in_flight() {
         let ex = extent(0b111, vec![1, 3, 5]);
         assert!(matches!(
             compute_corrupt_isolation(&ex, &[3], 7, true),
-            IsolationOutcome::Refused { .. }
+            IsolationOutcome::Stale { .. }
         ));
         assert!(matches!(
             compute_corrupt_isolation(&ex, &[3], 7, false),
@@ -444,7 +459,7 @@ mod isolation_tests {
         let ex = extent(0b111, vec![1, 3, 5]);
         assert!(matches!(
             compute_corrupt_isolation(&ex, &[3], 6, false),
-            IsolationOutcome::Refused { .. }
+            IsolationOutcome::Stale { .. }
         ));
     }
 

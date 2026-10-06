@@ -1,15 +1,15 @@
 //! GC must not punch a sealed log extent unless it read every byte up to the
 //! sealed length. An extent node whose `.dat` was truncated (a lost tail, a
 //! wiped file, a torn write) answers a read with code OK and a short or empty
-//! payload, and the `.ck` sidecar can vouch only for whole blocks, so the
-//! reader's own length check is the last line of defence: a scan that ends
-//! early, even exactly on a record boundary, would otherwise relocate nothing
-//! and punch an extent still full of live values.
+//! payload, and nothing on the read path checks content, so the reader's own
+//! length check is the only defence: a scan that ends early, even exactly on a
+//! record boundary, would otherwise relocate nothing and punch an extent still
+//! full of live values.
 //!
 //! Each case seals a log extent E0 holding live big values, overwritten and
 //! deleted ones and inline records, then truncates E0's `.dat` on BOTH replicas
-//! (so the replica the reader asks first is short whichever it is), with or
-//! without its `.ck`, restarts both nodes on those files (a live node's in-memory
+//! (so the replica the reader asks first is short whichever it is), restarts
+//! both nodes on those files (a live node's in-memory
 //! length still exceeds the file, so its read fails with an internal error; a
 //! restarted one loads the shorter length and answers short with code OK), and force-GCs E0. GC must refuse: E0 stays in the log
 //! stream. The original bytes are then put back, GC is run again and must
@@ -310,7 +310,7 @@ async fn bounce(ens: &mut [En], mgr: &RpcClient, mgr_addr: SocketAddr, change: i
     }
 }
 
-fn run_case(part: u64, cut: Cut, drop_ck: bool) {
+fn run_case(part: u64, cut: Cut) {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
     let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
@@ -354,16 +354,6 @@ fn run_case(part: u64, cut: Cut, drop_ck: bool) {
         ps_flush(&ps, part).await;
         assert_state(&ps, part, &want, "before the damage").await;
 
-        // A node describes a sealed extent's content once the manager has told
-        // it about the seal.
-        for dir in [n1_dir.path(), n2_dir.path()] {
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            while extent_file(dir, e0, "ck").is_none() {
-                assert!(std::time::Instant::now() < deadline, "no .ck sidecar for the sealed E0");
-                compio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-
         // Damage E0 on both replicas, keeping the originals, and restart the
         // nodes so they serve the damaged files.
         let mut saved: Vec<(PathBuf, Vec<u8>)> = Vec::new();
@@ -375,12 +365,6 @@ fn run_case(part: u64, cut: Cut, drop_ck: bool) {
                 let f = std::fs::OpenOptions::new().write(true).open(&dat).unwrap();
                 f.set_len(keep as u64).unwrap();
                 saved.push((dat, bytes));
-                let ck = extent_file(dir, e0, "ck");
-                if drop_ck {
-                    std::fs::remove_file(ck.expect("a sealed extent has its .ck sidecar")).unwrap();
-                } else {
-                    assert!(ck.is_some(), "a sealed extent has its .ck sidecar");
-                }
             }
         })
         .await;
@@ -389,7 +373,7 @@ fn run_case(part: u64, cut: Cut, drop_ck: bool) {
         compio::time::sleep(Duration::from_secs(3)).await;
         assert!(
             stream_extents(&mgr, log).await.contains(&e0),
-            "GC punched E0 from a truncated replica ({cut:?}, drop_ck={drop_ck})"
+            "GC punched E0 from a truncated replica ({cut:?})"
         );
 
         // Put the bytes back and restart the nodes on them.
@@ -421,26 +405,16 @@ fn run_case(part: u64, cut: Cut, drop_ck: bool) {
 }
 
 #[test]
-fn gc_refuses_an_empty_replica_with_its_checksum_sidecar() {
-    run_case(961, Cut::Empty, false);
+fn gc_refuses_an_empty_replica() {
+    run_case(961, Cut::Empty);
 }
 
 #[test]
-fn gc_refuses_an_empty_replica_without_its_checksum_sidecar() {
-    run_case(962, Cut::Empty, true);
-}
-
-#[test]
-fn gc_refuses_a_replica_cut_at_a_record_boundary_with_its_sidecar() {
-    run_case(963, Cut::HalfAtRecordBoundary, false);
-}
-
-#[test]
-fn gc_refuses_a_replica_cut_at_a_record_boundary_without_its_sidecar() {
-    run_case(964, Cut::HalfAtRecordBoundary, true);
+fn gc_refuses_a_replica_cut_at_a_record_boundary() {
+    run_case(963, Cut::HalfAtRecordBoundary);
 }
 
 #[test]
 fn gc_refuses_a_replica_cut_inside_a_record() {
-    run_case(965, Cut::HalfPlusPartialRecord, false);
+    run_case(965, Cut::HalfPlusPartialRecord);
 }

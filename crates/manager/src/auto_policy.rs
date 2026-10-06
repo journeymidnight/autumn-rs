@@ -19,7 +19,7 @@ use autumn_rpc::manager_rpc::{
     AutoPolicyLogEntry, MgrAutoPolicyConfig, MgrAutoPolicyCooldowns, MgrAutoPolicyEntry,
     PolicyCandidate, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_HOT_COLD, POLICY_KIND_MAJOR_COMPACT,
     POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_REPAIR,
-    POLICY_KIND_SPLIT,
+    POLICY_KIND_SCRUB, POLICY_KIND_SPLIT, SCRUB_POLICY_INTERVAL_SEC,
 };
 
 /// Rolling action-log cap (leader-local, in-memory — not persisted).
@@ -190,17 +190,17 @@ impl AutoPolicyMode {
 }
 
 // The friendly UI switches, in order, are [split, ec, compact, gc, merge,
-// rebalance, repair] (SWITCH_ORDER) — encoded positionally in
+// rebalance, repair, scrub] (SWITCH_ORDER) — encoded positionally in
 // MgrAutoPolicyEntry.switches and consumed by kinds_from_switches + the
 // dashboard switches_to_dict. Switches are only ever APPENDED; a shorter
 // persisted Vec (a config written before a switch existed) reads the absent
 // switches as off.
 
 /// Number of switches (`SWITCH_ORDER`).
-pub(crate) const SWITCHES: usize = 7;
+pub(crate) const SWITCHES: usize = 8;
 
 /// Build a built-in preset (`builtin=true`, never persisted). Switches are
-/// [split, ec, compact, gc, merge, rebalance, repair] per `SWITCH_ORDER`.
+/// [split, ec, compact, gc, merge, rebalance, repair, scrub] per `SWITCH_ORDER`.
 fn preset(
     name: &str,
     desc: &str,
@@ -222,13 +222,13 @@ fn preset(
 
 /// The built-in presets, safest → most aggressive (Python `PRESET_POLICIES`).
 pub(crate) fn preset_policies() -> Vec<MgrAutoPolicyEntry> {
-    // switches = [split, ec, compact, gc, merge, rebalance, repair]
+    // switches = [split, ec, compact, gc, merge, rebalance, repair, scrub]
     vec![
-        preset("gc-only", "Reclaim space only (GC)", [false, false, false, true, false, false, false], 30, 120, 2),
-        preset("maintenance", "GC + compaction + extent repair, no topology change", [false, false, true, true, false, false, true], 30, 180, 2),
-        preset("space-reclaim", "GC + auto-EC, space-first", [false, true, false, true, false, false, false], 20, 120, 3),
-        preset("balanced", "GC + compaction + EC + region rebalance + extent repair (recommended steady-state)", [false, true, true, true, false, true, true], 30, 240, 2),
-        preset("aggressive", "Full auto: incl. split / merge / rebalance topology changes and extent repair", [true, true, true, true, true, true, true], 20, 180, 3),
+        preset("gc-only", "Reclaim space only (GC)", [false, false, false, true, false, false, false, false], 30, 120, 2),
+        preset("maintenance", "GC + compaction + extent repair + weekly scrub, no topology change", [false, false, true, true, false, false, true, true], 30, 180, 2),
+        preset("space-reclaim", "GC + auto-EC, space-first", [false, true, false, true, false, false, false, false], 20, 120, 3),
+        preset("balanced", "GC + compaction + EC + region rebalance + extent repair + weekly scrub (recommended steady-state)", [false, true, true, true, false, true, true, true], 30, 240, 2),
+        preset("aggressive", "Full auto: incl. split / merge / rebalance topology changes, extent repair and weekly scrub", [true, true, true, true, true, true, true, true], 20, 180, 3),
     ]
 }
 
@@ -239,7 +239,8 @@ pub(crate) fn is_preset_name(name: &str) -> bool {
 
 /// Expand a switch set to the actionable candidate kinds it enables. compact ⇒
 /// major + minor. Reads the switches by `SWITCH_ORDER` ([split, ec, compact,
-/// gc, merge, rebalance, repair]); a shorter Vec treats absent switches as off.
+/// gc, merge, rebalance, repair, scrub]); a shorter Vec treats absent switches
+/// as off.
 pub(crate) fn kinds_from_switches(switches: &[bool]) -> HashSet<u8> {
     let on = |i: usize| switches.get(i).copied().unwrap_or(false);
     let mut out = HashSet::new();
@@ -265,6 +266,9 @@ pub(crate) fn kinds_from_switches(switches: &[bool]) -> HashSet<u8> {
     if on(6) {
         out.insert(POLICY_KIND_REPAIR);
     }
+    if on(7) {
+        out.insert(POLICY_KIND_SCRUB);
+    }
     out
 }
 
@@ -285,6 +289,8 @@ fn kind_priority(kind: u8) -> u8 {
         POLICY_KIND_MAJOR_COMPACT => 5,
         POLICY_KIND_EC => 6,
         POLICY_KIND_MERGE => 7,
+        // Background reading, never urgent: it finds rot that repair then fixes.
+        POLICY_KIND_SCRUB => 8,
         _ => 9,
     }
 }
@@ -335,6 +341,10 @@ pub(crate) fn decide_actions(
             POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
                 cooldown_secs.max(COMPACT_MIN_ACTUATION_COOLDOWN_SEC)
             }
+            // The cadence IS the cooldown: once a week, whatever the policy's
+            // own cooldown says. Persisted with the others, so a failover does
+            // not restart the week.
+            POLICY_KIND_SCRUB => cooldown_secs.max(SCRUB_POLICY_INTERVAL_SEC as i64),
             _ => cooldown_secs,
         };
         if now - last < effective_cooldown {
@@ -359,6 +369,7 @@ pub(crate) fn policy_kind_str(kind: u8) -> &'static str {
         POLICY_KIND_EC => "ec",
         POLICY_KIND_REBALANCE => "rebalance",
         POLICY_KIND_REPAIR => "repair",
+        POLICY_KIND_SCRUB => "scrub",
         _ => "?",
     }
 }
@@ -370,7 +381,7 @@ pub(crate) fn describe_candidate(c: &PolicyCandidate) -> String {
     let target = match c.kind {
         POLICY_KIND_EC => format!("extent {}", c.secondary_part_id),
         POLICY_KIND_MERGE => format!("part {}<-{}", c.primary_part_id, c.secondary_part_id),
-        POLICY_KIND_REBALANCE => "cluster".to_string(),
+        POLICY_KIND_REBALANCE | POLICY_KIND_SCRUB => "cluster".to_string(),
         POLICY_KIND_REPAIR => format!("node {}", c.secondary_part_id),
         _ => format!("part {}", c.primary_part_id),
     };
@@ -412,6 +423,7 @@ pub(crate) fn candidate_to_cmd(c: &PolicyCandidate) -> Option<Vec<String>> {
         // Cluster-scoped; no target id. Used for the DryRun "would: …" log +
         // the client-side cooldown key ("rebalance:0" via the default arm).
         POLICY_KIND_REBALANCE => Some(vec!["rebalance".to_string()]),
+        POLICY_KIND_SCRUB => Some(vec!["scrub".to_string(), "--all".to_string()]),
         POLICY_KIND_REPAIR => {
             if c.secondary_part_id == 0 {
                 return None;
@@ -545,11 +557,13 @@ mod tests {
         assert!(ks.contains(&POLICY_KIND_MINOR_COMPACT));
         assert_eq!(ks.len(), 2);
         let all = kinds_from_switches(&[true; SWITCHES]);
-        assert_eq!(all.len(), 8); // split, ec, major, minor, gc, merge, rebalance, repair
+        assert_eq!(all.len(), 9); // split, ec, major, minor, gc, merge, rebalance, repair, scrub
         assert!(all.contains(&POLICY_KIND_REBALANCE));
         assert!(all.contains(&POLICY_KIND_REPAIR));
-        // A config persisted before the repair switch existed reads it as off.
+        assert!(all.contains(&POLICY_KIND_SCRUB));
+        // A config persisted before a switch existed reads it as off.
         assert!(!kinds_from_switches(&[true; 6]).contains(&POLICY_KIND_REPAIR));
+        assert!(!kinds_from_switches(&[true; 7]).contains(&POLICY_KIND_SCRUB));
         // rebalance switch (index 5) alone → just rebalance.
         let rb = kinds_from_switches(&[false, false, false, false, false, true, false]);
         assert_eq!(rb, {
@@ -567,8 +581,9 @@ mod tests {
         assert_eq!(ps[0].name, "gc-only");
         assert_eq!(ps[4].name, "aggressive");
         assert!(ps.iter().all(|p| p.builtin));
-        // gc-only: only the gc switch (index 3). switches = [split,ec,compact,gc,merge,rebalance,repair]
-        assert_eq!(ps[0].switches, vec![false, false, false, true, false, false, false]);
+        // gc-only: only the gc switch (index 3).
+        // switches = [split,ec,compact,gc,merge,rebalance,repair,scrub]
+        assert_eq!(ps[0].switches, vec![false, false, false, true, false, false, false, false]);
         assert_eq!(kinds_from_switches(&ps[0].switches), {
             let mut s = HashSet::new();
             s.insert(POLICY_KIND_GC);
@@ -577,6 +592,29 @@ mod tests {
         // aggressive turns everything on (incl. rebalance).
         assert_eq!(ps[4].switches, vec![true; SWITCHES]);
         assert!(kinds_from_switches(&ps[4].switches).contains(&POLICY_KIND_REBALANCE));
+    }
+
+    /// The weekly cadence is the actuation cooldown, whatever the policy's own
+    /// `cooldown_sec` says: an armed policy that scrubbed a minute ago does not
+    /// scrub again until a week has passed.
+    #[test]
+    fn a_scrub_is_actuated_at_most_once_a_week() {
+        let enabled: HashSet<u8> = [POLICY_KIND_SCRUB].into_iter().collect();
+        let c = cand(POLICY_KIND_SCRUB, 0, 0);
+        assert_eq!(candidate_to_cmd(&c), Some(vec!["scrub".to_string(), "--all".to_string()]));
+        let key = cooldown_key(&c);
+        let week = SCRUB_POLICY_INTERVAL_SEC as i64;
+        let now = 10 * week;
+        let fresh = HashMap::new();
+        assert_eq!(decide_actions(&[c.clone()], &fresh, &enabled, now, 60, 5).len(), 1);
+        let mut cds = HashMap::new();
+        cds.insert(key.clone(), now - week + 60);
+        assert!(
+            decide_actions(&[c.clone()], &cds, &enabled, now, 60, 5).is_empty(),
+            "a policy cooldown of 60 s must not shorten the week"
+        );
+        cds.insert(key, now - week);
+        assert_eq!(decide_actions(&[c], &cds, &enabled, now, 60, 5).len(), 1);
     }
 
     #[test]

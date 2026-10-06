@@ -76,7 +76,10 @@ erasure-coded, self-healing extents.
   are clean, degraded, without redundancy or unreadable, and the worst ones by
   name) with matching dashboard alerts, and `autumn-op repair` (or the
   auto-policy's `repair` switch, after a grace period) to rebuild degraded
-  copies on other nodes without fencing theirs; declarative bare-metal deployer
+  copies on other nodes without fencing theirs; `autumn-op scrub` (or the
+  policy's weekly `scrub`) to check sealed copies against their checksums on
+  the nodes that hold them, with rotted ones isolated and rebuilt; declarative
+  bare-metal deployer
   (systemd), Kubernetes manifests, Prometheus `/metrics`, `ceph df`-style
   capacity accounting, rolling restart with convergence gates.
 

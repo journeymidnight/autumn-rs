@@ -215,6 +215,16 @@ impl TestConn {
         rkyv_decode::<DfResp>(&resp).expect("decode DfResp")
     }
 
+    pub async fn scrub_extents(&self, tasks: Vec<ScrubTask>) -> CodeResp {
+        let payload = rkyv_encode(&ScrubExtentsReq { tasks });
+        let resp = self
+            .pool
+            .call(&self.addr, MSG_SCRUB_EXTENTS, payload)
+            .await
+            .expect("scrub_extents RPC");
+        rkyv_decode::<CodeResp>(&resp).expect("decode CodeResp")
+    }
+
     pub async fn delete_extent(&self, extent_id: u64) -> CodeResp {
         let payload = rkyv_encode(&DeleteExtentReq {
             extent_id,

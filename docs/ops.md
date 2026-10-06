@@ -2293,6 +2293,9 @@ $AC perf-clean --dry-run                 # expect 0 afterwards
 # counted, so small cleans wait for the next flush. To reclaim now:
 $AO compact PART_ID
 
+# At-rest content check (see "Scrub" below): extents / a partition / everything
+$AO scrub EXT_ID... | --part PART_ID | --all [--wait]
+
 # SST block cache (paged SSTs; SST data blocks no longer RAM-resident)
 # PS flag: autumn-ps --sst-block-cache-bytes N   (cluster.sh: AUTUMN_SST_BLOCK_CACHE_BYTES, default 512MB)
 # Manual check: write >> RAM dataset, kill -TERM the PS, restart, then
@@ -2844,14 +2847,6 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   replicas while its node stays a member are still reached only by unit tests
 #   (tracked as F-CHAOS-DISK-FAULT). Set _DISKS_PER_EN=1 to A/B a failure
 #   against the single-disk shape.
-#   KNOWN RED: `corrupt` and `ec` can land on the SAME extent — the conversion's
-#   pre-encode content check then (correctly) refuses forever while the recovery
-#   that would repair the rot is skipped for carrying an EC marker. Symptom:
-#   `EC marker on extent N still pinned after quiesce (age ~78s)` with an
-#   op-ledger `last_error` naming a content-checksum mismatch. Reproduced 3× on
-#   seed 603; tracked as BUG-ROT-BLOCKS-ITS-OWN-REPAIR. Bisect with
-#   AUTUMN_CHAOS_ACTIONS=... minus `ec`, and do NOT read it as data loss —
-#   `mismatches=0` in every observed instance.
 #   verdict-gate: a real bug = `mismatches>0` OR a not_found that REPRODUCES on
 #   DRAINED ports. A burst of not_found with `mismatches=0` after back-to-back
 #   runs is almost always loopback PORT EXHAUSTION (cumulative TIME-WAIT) — a
@@ -3064,15 +3059,17 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 # Every other action stops a process or cuts a link — faults the system is told
 # about. This one flips bytes in ONE replica's `.dat` on disk and tells nobody:
 # the file keeps its length and the extent keeps its eversion, so no error is
-# raised anywhere and reads still succeed from the other copies. It asserts the
-# damaged node's OWN scrub found it (`SCRUB FOUND CONTENT ROT` in that EN's
-# log) — not that a rebuild happened, because a fence in the same round rebuilds
-# the same extents for unrelated reasons.
+# raised anywhere and reads still succeed. At the end of the round it scrubs
+# every rotted extent (`autumn-op scrub` path) and asserts the damaged node
+# reported it (`SCRUB FOUND CONTENT ROT` in that EN's log) — not that a rebuild
+# happened, because a fence in the same round rebuilds the same extents for
+# unrelated reasons.
 #
 # It seals a tail itself (`MSG_ROLL_TAILS`) when no sealed extent exists yet,
-# and only rots content a node has already DESCRIBED (`extent-{id}.ck` present)
-# — rot before the first digest is trust-on-first-use and undetectable by
-# design. Isolated round, nothing else can drive a rebuild:
+# scrubs candidates first so their checksums are recorded, and only rots a copy
+# that has them (`extent-{id}.ck` present) — rot before the first record is
+# trust-on-first-use and undetectable by design. Isolated round, nothing else
+# can drive a rebuild:
 AUTUMN_CHAOS_ACTIONS=corrupt AUTUMN_CHAOS_DURATION_SECS=60 \
   cargo test -p autumn-manager --test system_chaos -- --nocapture --ignored
 
@@ -5007,102 +5004,64 @@ never withdraw a request (the returning-node one), make `cancel_repair` skip
 `withdraw_repairs` or `summarize` never set `repair_requested` (the
 `a_standing_repair_request_is_shown_and_can_be_cancelled` one).
 
-## A corrupt EC source yields to recovery instead of burning 24 retries
+## Scrub: checking sealed copies at rest (`autumn-op scrub`)
 
-Rot on an extent that is also mid-EC-conversion used to deadlock the two
-repairs against each other: the recovery dispatch skips any extent carrying a
-ConvertToEc marker, and the conversion's pre-encode content check fails every
-time on exactly those bytes. The only exit was the generic give-up after 24
-consecutive failures.
+Nothing on the read, write, seal, conversion or repair path checks content. A
+scrub does, when asked: the manager names each lit copy of each sealed extent
+in scope, the node holding it reads and hashes it locally, and only outcomes
+come back. A copy's first scrub records its checksums (`extent-{id}.ck` for a
+replica's `.dat`, `extent-{id}.shard{i}.ck` for an EC shard); later scrubs
+compare against them. Design: `docs/autumn_integrity_plan.md`.
 
-A content-checksum failure is now answered with `CODE_CONTENT_CORRUPT` (wire
-code 8, hence `WIRE_VERSION` 42) and the marker is abandoned on the FIRST
-failure, which hands the extent to replica recovery immediately. Retrying was
-never going to make the bytes better; every other EC failure keeps the old
-budget.
+    "${AO[@]}" scrub 1234 1235          # these extents
+    "${AO[@]}" scrub --part 7           # every extent of partition 7
+    "${AO[@]}" scrub --all --wait       # the whole cluster, and wait for it
+    "${AO[@]}" ops status <OP_ID>       # progress = files reported / dispatched
 
-    cargo test -p autumn-stream --lib ec_corruption_stops
-    cargo test -p autumn-manager --lib corrupt_ec_reply
-    cargo test -p autumn-manager --test ec_integration
+The op's message counts files: clean, recorded for the first time, rotted,
+skipped, failed, plus what planning left out (open or empty extents, an op in
+flight, dark slots, nodes not online). It SUCCEEDS whatever it found and FAILS
+only if a file could not be checked. A rotted copy is also reported to the
+manager, which isolates the slot (never the last replica; never below K EC
+shards) and rebuilds it elsewhere:
 
-What an operator sees:
+    grep 'SCRUB FOUND CONTENT ROT' <that EN's log>   # the finding, per file
+    "${AO[@]}" health                                # the slot shows corrupt, then rebuilds
 
-    "${AO[@]}" ops history --kind ec-convert   # state=failed
-                                              # content checksum failed; yielded to recovery
+Pacing is on each extent node: `autumn-extent-node --scrub-bytes-per-sec N`
+(default 8 MiB/s per shard, so N shards read up to N times that; `0` =
+unpaced). A node that restarts mid-scrub loses its queue; the files it held are
+reported FAILED on its next `df` ("no longer has it queued"), so the op ends
+FAILED — submit it again. An op whose nodes all stop answering ends as UNKNOWN
+after two hours.
 
-and in the manager log, at WARN:
+Weekly: the auto-policy `scrub` switch (on in `maintenance`, `balanced`,
+`aggressive`) submits `scrub --all` at most once every 7 days; the cooldown is
+persisted, so a manager failover does not restart the week:
 
-    EC checksum failure: released marker for replica recovery
+    "${AO[@]}" auto-policy activate balanced --arm
+    "${AO[@]}" policy-candidates        # a `scrub cluster` row only when it is due
+    "${AO[@]}" ops list --kind scrub
 
-The extent node refuses to start a second encoder after such a failure
-(`ec convert already running` is not the answer — the attempt has exited), and
-a NEW attempt nonce rechecks the content, so the conversion resumes by itself
-once recovery has rewritten the source.
-
-**Releasing the marker is only half of it.** Under the default gate recovery
-rebuilds a slot only when something has MARKED it, so the node reports the rot
-it found on the same `df` channel the scrub uses. The manager isolates the slot
-(clears its `avali` bit and records the corrupt mark); the rebuild follows on a
-later dispatch tick, where a corrupt slot verdicts `Rebuild` regardless of the
-gate:
-
-    autumn-op --manager ... extent-health      # unhealthy slots only; the rotted one appears
-    autumn-op --manager ... recovery-stats     # a rebuild in flight for it
-
-The manager acts on the refusal itself, isolating the slot in the window its own
-abandon opens, so the repair does not wait for a `df` round trip. The node's
-report is the backstop for every way that call can bail out — a leader change, a
-failed persist, a lost verify-at-apply race, a refusal because another op took
-the extent — and it is re-queued on each refusal because the manager drops a finding for an extent that
-still has an op in flight — the refusal is what releases that op. Without either
-half the repair waits for the scrub to rediscover the same rot on its own paced
-pass, while EC keeps being re-proposed and re-reading the whole extent to refuse
-again.
-
-For ablation, drop the `isolate_rotted_slot` call from
-`release_corrupt_ec_attempt`: `a_corrupt_coordinator_slot_is_isolated_when_its_
-marker_is_released` fails with the coordinator's slot still being served. Or
-drop the `CODE_CONTENT_CORRUPT` arm in the manager's dispatch reply handling: `corrupt_ec_reply_releases_marker_on_first_failure_and_rejects_
-late_reply` fails with the marker still ConvertToEc. Dropping the EN-side
-refusal instead makes `ec_corruption_stops_before_redispatch_and_is_attempt_
-scoped` see `CODE_OK` where it requires code 8.
-
-## At-rest rot in an EC shard is refused, isolated and rebuilt
-
-Each EC shard file has a sidecar, `extent-{id}.shard{i}.ck` (CRC32C per 1 MiB
-block), written while the shard is staged and when it is rebuilt. Rot in a
-shard is handled like rot in a replica:
-
-- a read covering a whole rotted block is refused by the shard's node
-  (`CONTENT CHECKSUM MISMATCH ... file=.shard{i}` in that EN's log); the client
-  reconstructs that range from the other shards;
-- the node's scrub finds it with nobody reading (`SCRUB FOUND CONTENT ROT`,
-  `target=Shard(i)`), and reports it once the manager confirms the layout
-  publishes shard files;
-- the manager isolates the slot (refused if fewer than K shards would remain)
-  and recovery rebuilds the shard on another node. While the slot is dark no
-  client reads it, not even the sub-block reads no checksum covers.
+Trust-on-first-use: bytes already damaged before a copy's first scrub are
+recorded as they are, so scrub new data early. Until a scrub finds rot, reads,
+recovery and EC conversion use the damaged copy like any other.
 
 Automated:
 
-    cargo test -p autumn-stream --lib shard_checksum_tests
-    cargo test -p autumn-manager --test ec_shard_rot
-    cargo test -p autumn-manager --test silent_corruption_rot
+    cargo test -p autumn-stream --lib scrub
+    cargo test -p autumn-stream --test payload_location a_scrub_request
+    cargo test -p autumn-manager --lib extent_scrub
+    cargo test -p autumn-manager --test scrub_on_demand
 
-Manually, on a dev cluster with an EC-converted extent `E` (needs one node
-outside the extent's layout as the rebuild target):
+Manual, on a dev cluster with a sealed extent `E` held by node `N`:
 
-    "${AO[@]}" info --json --part P            # E's layout; shard 0 = replicates[0]
-    ls <that EN's data dir>/*/extent-E.shard0*  # .shard0 and .shard0.ck
-    python3 -c "import sys; f=open(sys.argv[1],'r+b'); f.seek(1<<20|512); b=f.read(1); f.seek(1<<20|512); f.write(bytes([b[0]^1]))" <path>/extent-E.shard0
-    grep 'SCRUB FOUND CONTENT ROT' <that EN's log>   # within a few seconds
-    "${AO[@]}" health                          # the slot shows corrupt, then a rebuild
-    "${AO[@]}" info --json --part P            # replicates[0] is the spare once rebuilt
-
-Reads of the extent return the original bytes throughout. A shard whose node
-holds more than one shard file of the extent (reconcile has not yet removed the
-residue) is not scrubbed until it holds one. Shards of a conversion made before
-the CoW layout live in `.dat` and are not covered.
+    "${AO[@]}" scrub E --wait                      # "... recorded for the first time"
+    ls <N's data dir>/*/extent-E.ck
+    python3 -c "import sys; f=open(sys.argv[1],'r+b'); f.seek(1<<20|512); b=f.read(1); f.seek(1<<20|512); f.write(bytes([b[0]^1]))" <path>/extent-E.dat
+    "${AO[@]}" scrub E --wait                      # "... 1 rotted ... isolated for rebuild"
+    "${AO[@]}" health                              # N's slot of E: corrupt, then rebuilt elsewhere
+    "${AO[@]}" scrub E --wait                      # the rebuilt copy: recorded for the first time
 
 ## A bulk read's refusal keeps its status code
 

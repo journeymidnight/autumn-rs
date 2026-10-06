@@ -2303,15 +2303,28 @@ impl crate::AutumnManager {
                 // from the report — the report only says "it finished" and carries
                 // `new_eversion` for a cross-check, so a stale/forged report can't
                 // steer the layout.
-                // Scrub findings: this node read its own sealed content and it
-                // did not match what was hashed at seal. Isolate the slot so
-                // recovery rebuilds it — a clear `avali` bit alone reads as
-                // "behind", which `re_avali` tries to heal with a length
-                // comparison a full-length rotted replica passes.
-                for rot in df.scrub_rot {
-                    self.isolate_rotted_slot(rot.extent_id, node.node_id, rot.eversion, "scrub")
-                        .await;
+                // Scrub outcomes. A ROT one is this node reading its own sealed
+                // content and finding it differs from the checksums recorded
+                // for it: isolate the slot so recovery rebuilds it — a clear
+                // `avali` bit alone reads as "behind", which `re_avali` tries
+                // to heal with a length comparison a full-length rotted replica
+                // passes. A finding that cannot be judged yet (the extent moved
+                // since the task was planned — another slot's isolation is
+                // enough) stays open in its op and the copy is checked again.
+                for done in &df.scrub_done {
+                    if done.outcome == autumn_rpc::extent_rpc::SCRUB_OUTCOME_ROT {
+                        let finding = self
+                            .isolate_rotted_slot(done.extent_id, node.node_id, done.eversion, "scrub")
+                            .await;
+                        if finding == crate::extent_corrupt::RotFinding::Stale
+                            && self.defer_scrub_recheck(node.node_id, done)
+                        {
+                            continue;
+                        }
+                    }
+                    self.record_scrub_outcome(node.node_id, done);
                 }
+                self.record_scrub_queued(node.node_id, &df.scrub_queued);
                 for done in df.ec_done {
                     let Some(params) = self.extent_inflight_payload_ec(done.extent_id) else {
                         // No marker: an already-applied conversion re-reported
@@ -2350,6 +2363,11 @@ impl crate::AutumnManager {
                     .await;
                 }
             }
+
+            // Rot findings held this round or earlier (`defer_scrub_recheck`)
+            // are checked again as soon as their extent has nothing in flight —
+            // before the recovery loop next picks a copy source, when it can.
+            self.recheck_scrub_findings();
 
             // cluster-df: publish this tick's RAW + physical snapshot (cheap —
             // one entry per disk), then drive the chunked logical-scan rotation.
@@ -2494,25 +2512,27 @@ impl crate::AutumnManager {
     /// Act on a first-hand report that a node's own copy of `extent_id` is
     /// rotted: isolate that slot so recovery rebuilds it.
     ///
-    /// `reporter` is the node whose bytes were read and found wrong. Two
-    /// sources feed this and they are the same evidence class — the scrub
-    /// reading a described block on its own schedule, and the EC pre-encode
-    /// content check reading the whole extent before it would make the damage
-    /// canonical across a stripe. Neither node can isolate itself: clearing an
-    /// `avali` bit is the manager's write.
+    /// `reporter` is the node whose bytes were read and found wrong — by its
+    /// scrub, against the checksums recorded for that file. It cannot isolate
+    /// itself: clearing an `avali` bit is the manager's write.
+    ///
+    /// `Stale` = not judged: the extent is mid-change or changed since the
+    /// finding's task was planned, so the bytes read may not be the ones there
+    /// now. The caller has the copy checked again.
     pub(crate) async fn isolate_rotted_slot(
         &self,
         extent_id: u64,
         reporter: u64,
         eversion: u64,
         source: &'static str,
-    ) {
+    ) -> crate::extent_corrupt::RotFinding {
+        use crate::extent_corrupt::RotFinding;
         let ex = {
             let s = self.store.inner.borrow();
             s.extents.get(&extent_id).cloned()
         };
         let Some(ex) = ex else {
-            return;
+            return RotFinding::Settled;
         };
         let op_in_flight = self.extent_inflight_op(extent_id).is_some();
         match crate::extent_corrupt::compute_corrupt_isolation(
@@ -2542,17 +2562,17 @@ impl crate::AutumnManager {
                             extent_id = extent_id,
                             error = %e,
                             "could not persist the isolation of a rotted replica \
-                             (the scrub re-reports it on its next pass)"
+                             (the copy is checked again)"
                         );
-                        return;
+                        return RotFinding::Stale;
                     }
                 };
                 // Verify at apply, as the RPC path does. The persist
                 // above is an await, and seal / split / EC dispatch /
                 // delete handlers interleave during it; writing this
                 // stale clone into memory would roll their work back.
-                // The scrub re-reports on its next pass, so dropping
-                // a raced apply costs a sweep, not the finding.
+                // The copy is checked again, so dropping a raced apply
+                // delays the finding, not loses it.
                 {
                     let mut s = self.store.inner.borrow_mut();
                     match s.extents.get(&updated.extent_id) {
@@ -2570,9 +2590,9 @@ impl crate::AutumnManager {
                             tracing::warn!(
                                 extent_id = extent_id,
                                 "extent changed while isolating a rotted replica; \
-                                 dropping this apply (the scrub re-reports it)"
+                                 dropping this apply (the copy is checked again)"
                             );
-                            return;
+                            return RotFinding::Stale;
                         }
                     }
                 }
@@ -2604,6 +2624,15 @@ impl crate::AutumnManager {
                     }
                 }
             }
+            crate::extent_corrupt::IsolationOutcome::Stale { message } => {
+                tracing::info!(
+                    extent_id = extent_id,
+                    node_id = reporter,
+                    source,
+                    "a rot finding cannot be judged yet: {message}"
+                );
+                return RotFinding::Stale;
+            }
             crate::extent_corrupt::IsolationOutcome::Refused { message, .. } => {
                 tracing::warn!(
                     extent_id = extent_id,
@@ -2613,6 +2642,7 @@ impl crate::AutumnManager {
                 );
             }
         }
+        RotFinding::Settled
     }
 
     /// helper: counterpart to `mark_node_disks_offline`. Flip
@@ -2886,11 +2916,6 @@ impl crate::AutumnManager {
     ) {
         let EcDispatchCandidate { ex, stream, params } = cand;
         let extent_id = ex.extent_id;
-        // The eversion this dispatch is ABOUT. A content-corrupt reply is
-        // evidence about the bytes as of this layout, so the isolation is
-        // reported against it rather than against whatever is live when the
-        // reply lands — that is what the predicate's eversion guard is for.
-        let ex_eversion = ex.eversion;
         let data_shards = stream.ec_data_shard as usize;
         let parity_shards = stream.ec_parity_shard as usize;
         let total_shards = data_shards + parity_shards;
@@ -2983,17 +3008,6 @@ impl crate::AutumnManager {
         let mut started_new = false;
         let rpc_ok = match result {
             Ok(resp_data) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp_data) {
-                Ok(r) if r.code == autumn_rpc::extent_rpc::CODE_CONTENT_CORRUPT => {
-                    self.release_corrupt_ec_attempt(
-                        extent_id,
-                        attempt_nonce,
-                        params.target_nodes[0],
-                        ex_eversion,
-                        &r.message,
-                    )
-                    .await;
-                    return;
-                }
                 Ok(r) if r.code == CODE_OK => {
                     // CODE_OK is "accepted", so count the ACCEPT, and read the
                     // message: the coordinator puts its previous attempt's
@@ -3133,53 +3147,6 @@ impl crate::AutumnManager {
                 extent_id,
                 "EC convert accepted by coordinator; awaiting df report"
             );
-        }
-    }
-
-    async fn release_corrupt_ec_attempt(
-        &self,
-        extent_id: u64,
-        nonce: u64,
-        coord: u64,
-        eversion: u64,
-        message: &str,
-    ) {
-        if self.extent_inflight_nonce(extent_id) != nonce
-            || self.extent_inflight_op(extent_id)
-                != Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-        {
-            return;
-        }
-        if self
-            .abandon_ec_marker(extent_id, coord, "content_corrupt")
-            .await
-        {
-            tracing::warn!(
-                extent_id,
-                coord,
-                message,
-                "EC checksum failure: released marker for replica recovery"
-            );
-            let (now_s, _) = Self::now_s_ms();
-            self.ops.borrow_mut().complete_ec(
-                extent_id,
-                OP_STATE_FAILED,
-                "content checksum failed; yielded to recovery".into(),
-                message.into(),
-                now_s,
-            );
-            // Yielding the marker is necessary and not sufficient: recovery
-            // rebuilds a slot only once something has MARKED it, and the coordinator read its OWN sealed bytes and
-            // found them wrong — the scrub's evidence, found by a different
-            // reader. Act on it HERE, in the window the abandon just opened:
-            // isolation refuses while the extent has a stream-layer op in
-            // flight, and this is the instant that op is gone. The node also
-            // queues the finding for its next `df`, and that copy is the
-            // backstop for EVERY way this call can bail: a leader change, a
-            // failed persist, an apply that lost the verify-at-apply race, or
-            // a refusal because another op took the extent first.
-            self.isolate_rotted_slot(extent_id, coord, eversion, "ec_content_check")
-                .await;
         }
     }
 
@@ -3902,186 +3869,6 @@ mod ec_abandon_counting_tests {
             ),
             "a re-send into a live conversion must not count, however loudly it \
              quotes an old failure"
-        );
-    }
-}
-
-#[cfg(test)]
-#[allow(dead_code)]
-#[path = "../../rpc/tests/support/status_peer.rs"]
-mod handoff_peer;
-
-#[cfg(test)]
-mod corrupt_ec_handoff_tests {
-    use super::handoff_peer as peer;
-    use super::*;
-    use crate::extent_inflight::{ExtentOpKind, ExtentOpPayload};
-
-    #[compio::test]
-    async fn corrupt_ec_reply_releases_marker_on_first_failure_and_rejects_late_reply() {
-        let peer = peer::Peer::start(|frame| {
-            peer::Reply::Frame(autumn_rpc::Frame::response(
-                frame.req_id,
-                frame.msg_type,
-                rkyv_encode(&autumn_rpc::extent_rpc::CodeResp {
-                    code: autumn_rpc::extent_rpc::CODE_CONTENT_CORRUPT,
-                    message: "content checksum failure".into(),
-                }),
-            ))
-        })
-        .await;
-        let m = AutumnManager::new();
-        let params = MgrEcDispatchInflight {
-            extent_id: 42,
-            target_nodes: vec![1, 2, 3],
-            data_shards: 2,
-            new_eversion: 2,
-            ..Default::default()
-        };
-        let ex = ExtentRecord {
-            extent_id: 42,
-            sealed: true,
-            sealed_length: 4096,
-            replicates: vec![1, 2, 3],
-            avali: 6,
-            eversion: 1,
-            ..Default::default()
-        };
-        m.store.inner.borrow_mut().extents.insert(42, ex.clone());
-        m.acquire_extent_inflight(42, ExtentOpPayload::ConvertToEc(params.clone()))
-            .await
-            .unwrap();
-        // Marked after the conversion started — a new conversion of a marked
-        // extent is refused at acquire.
-        m.extent_corrupt_slots.borrow_mut().insert(42, 1);
-        let old_nonce = m.extent_inflight_nonce(42);
-        let recovery = || {
-            ExtentOpPayload::Recovery(RecoveryTask {
-                extent_id: 42,
-                replace_id: 1,
-                node_id: 4,
-                start_time: 0,
-            })
-        };
-        assert!(
-            m.acquire_extent_inflight(42, recovery()).await.is_err(),
-            "EC excludes recovery while live"
-        );
-        m.dispatch_one_ec_conversion(
-            EcDispatchCandidate {
-                ex,
-                stream: StreamRecord {
-                    ec_data_shard: 2,
-                    ec_parity_shard: 1,
-                    ..Default::default()
-                },
-                params: params.clone(),
-            },
-            &[
-                (1, peer.addr.clone()),
-                (2, peer.addr.clone()),
-                (3, peer.addr.clone()),
-            ]
-            .into_iter()
-            .collect(),
-        )
-        .await;
-        assert_eq!(
-            m.extent_inflight_op(42),
-            None,
-            "first content failure must release, not wait for 24 retries"
-        );
-        m._test_acquire_marker(42, recovery()).await.unwrap();
-        m.release_corrupt_ec_attempt(42, old_nonce, 1, 1, "late reply")
-            .await;
-        assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::Recovery));
-        m.commit_extent_inflight_release(42);
-        // The rebuild landed (which clears the mark) and a new conversion
-        // started.
-        m.extent_corrupt_slots.borrow_mut().remove(&42);
-        m.acquire_extent_inflight(42, ExtentOpPayload::ConvertToEc(params))
-            .await
-            .unwrap();
-        m.release_corrupt_ec_attempt(42, old_nonce, 1, 1, "late reply")
-            .await;
-        assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::ConvertToEc));
-    }
-
-    /// Releasing the marker is half the repair: recovery rebuilds a slot only
-    /// once something has MARKED it. The coordinator read
-    /// its OWN sealed bytes and found them wrong, so the isolation happens in
-    /// the window the abandon just opened — waiting for the node's `df` copy of
-    /// the finding means waiting for a report the manager DROPS while an op is
-    /// in flight, and the op is only gone once this reply has been acted on.
-    #[compio::test]
-    async fn a_corrupt_coordinator_slot_is_isolated_when_its_marker_is_released() {
-        let peer = peer::Peer::start(|frame| {
-            peer::Reply::Frame(autumn_rpc::Frame::response(
-                frame.req_id,
-                frame.msg_type,
-                rkyv_encode(&autumn_rpc::extent_rpc::CodeResp {
-                    code: autumn_rpc::extent_rpc::CODE_CONTENT_CORRUPT,
-                    message: "extent 42 block 0 fails its content checksum".into(),
-                }),
-            ))
-        })
-        .await;
-        let m = AutumnManager::new();
-        let params = MgrEcDispatchInflight {
-            extent_id: 42,
-            target_nodes: vec![1, 2, 3],
-            data_shards: 2,
-            new_eversion: 2,
-            ..Default::default()
-        };
-        // Nothing has noticed the rot yet: every slot is available and no slot
-        // carries a corrupt mark. This is the state the EC pre-check finds when
-        // it is the FIRST reader to reach those bytes.
-        let ex = ExtentRecord {
-            extent_id: 42,
-            sealed: true,
-            sealed_length: 4096,
-            replicates: vec![1, 2, 3],
-            avali: 7,
-            eversion: 1,
-            ..Default::default()
-        };
-        m.store.inner.borrow_mut().extents.insert(42, ex.clone());
-        m.acquire_extent_inflight(42, ExtentOpPayload::ConvertToEc(params.clone()))
-            .await
-            .unwrap();
-
-        m.dispatch_one_ec_conversion(
-            EcDispatchCandidate {
-                ex,
-                stream: StreamRecord {
-                    ec_data_shard: 2,
-                    ec_parity_shard: 1,
-                    ..Default::default()
-                },
-                params,
-            },
-            &[
-                (1, peer.addr.clone()),
-                (2, peer.addr.clone()),
-                (3, peer.addr.clone()),
-            ]
-            .into_iter()
-            .collect(),
-        )
-        .await;
-
-        assert_eq!(m.extent_inflight_op(42), None, "the marker must be gone");
-        let live = m.store.inner.borrow().extents.get(&42).cloned().unwrap();
-        assert_eq!(
-            live.avali & 1,
-            0,
-            "the coordinator's slot must stop being served"
-        );
-        assert_eq!(
-            m.extent_corrupt_slots.borrow().get(&42).copied(),
-            Some(1),
-            "and the REASON must be recorded, or recovery never rebuilds it"
         );
     }
 }

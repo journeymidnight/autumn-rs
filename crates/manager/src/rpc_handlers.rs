@@ -1071,6 +1071,9 @@ impl AutumnManager {
                             .fold(0u32, |bits, (slot, _)| bits | (1u32 << slot));
                         Ok(Reported::AlreadyIsolated { unmarked })
                     }
+                    crate::extent_corrupt::IsolationOutcome::Stale { message } => {
+                        Err((CODE_PRECONDITION, message))
+                    }
                     crate::extent_corrupt::IsolationOutcome::Refused { code, message } => {
                         Err((code, message))
                     }
@@ -4670,6 +4673,8 @@ impl AutumnManager {
                 "recovery is auto-dispatched, not submittable — watch it with \
                  `ops list --kind recovery`",
             ),
+            // Any scope: extents, a partition, or (neither) the whole cluster.
+            OP_KIND_SCRUB => None,
             OP_KIND_REPAIR | OP_KIND_REPAIR_CANCEL => {
                 if req.extent_ids.is_empty() == (req.part_id == 0) {
                     Some("repair takes extent ids OR a node id in part_id, not both or neither")

@@ -192,124 +192,65 @@ NAME, so a shard staged for one index can never be *served* as another.
   the fd cache, a shard opened per use (read-only after staging, and keeping it
   out of `FdLru` preserves that cache's one-fd-per-extent accounting).
 
-### At-rest content integrity (`extent_cksum.rs`, `extent_scrub.rs`)
+### At-rest integrity: scrub (`extent_node/scrub.rs`, `extent_cksum.rs`, `extent_scrub.rs`)
 
-A sealed extent's `.dat` gets `extent-{id}.ck`: magic + extent_id +
-sealed_length + block_bytes + block_count + one CRC32C per 1 MiB block + a
-trailer CRC. **Missing, undecodable, or describing a different `sealed_length`
-all mean "no evidence" — never "corrupt"**, which is what makes it
-zero-migration and what stops a damaged 4 KiB sidecar from condemning a healthy
-multi-GiB replica. Per block, not per extent: a whole-extent digest could only
-be checked by a full read and could not say WHICH region rotted.
+**The scrub shares nothing with the hot path.** Appends, reads, seals, EC
+conversion and repairs never compute, write or consult a checksum; the scrub
+is the only writer and only reader of the sidecars, and it runs only when the
+manager asks (`MSG_SCRUB_EXTENTS`, from `autumn-op scrub` or the weekly
+policy). Design: `docs/autumn_integrity_plan.md`.
 
-`remove_extent_files` unlinks it with the rest.
+**Sidecars** (`extent_cksum.rs`): `extent-{id}.ck` for a sealed `.dat`,
+`extent-{id}.shard{i}.ck` for a shard file — magic + extent_id + length +
+block_bytes + block_count + one CRC32C per 1 MiB block + a trailer CRC.
+Undecodable, another extent's, or describing another length all mean "no
+record" (the next scrub records one), never "corrupt" — a damaged 4 KiB
+sidecar must not condemn a healthy multi-GiB copy. `remove_extent_files`
+unlinks `.ck` and every `.shard{i}.ck` by its own name (`parse_shard_ck_file`,
+so one whose shard is already gone still goes); `discard_shard_file` unlinks
+the shard's sidecar first.
 
-**EC shards** get `extent-{id}.shard{i}.ck` in the same format, its length
-field the shard's length (`DiskFS::shard_ck_path`). Written AS THE SHARD IS
-WRITTEN, from the bytes in hand — a conversion outruns any scrub, so a
-read-back backfill would leave every recent shard undescribed:
-`describe_shard_stripe` extends the description per staged stripe
-(`ExtentChecksums::append`, `spawn_blocking`; stripe and block boundaries need
-not agree) and the sidecar is persisted after the stripe is durable, so it
-always describes exactly the bytes staged so far. The CRC runs beside the
-stripe's pwrite (`futures::join!`); the persist is one small tmp write + two
-fsyncs per stripe (64 MiB by default). Stripe 0 starts over: before its
-truncating open `forget_shard_description` drops the cached description AND
-unlinks the old sidecar (either left alone describes bytes about to be gone —
-a scrub over the half-rewritten file would log rot that is not there, and a
-later cache load would pick the old file up at the same length), and it
-records the file's length as that stripe's end, not the max with a previous
-attempt's, or the next stripe could not continue. A stripe that does not
-continue the description leaves NO sidecar. A rebuild describes
-from the reconstructed stripes (`rebuild_ec_shard_by_stripes` returns the
-description; `land_rebuilt_shard` persists it after the sync), and forgets the
-old one before it truncates, like stripe 0. A failed
-persist removes the old sidecar: a stale description that matches the new
-length condemns a healthy shard. `discard_shard_file` unlinks the sidecar
-FIRST; `remove_extent_files` finds sidecars by their own names
-(`parse_shard_ck_file`), so one whose shard is already gone still goes. The
-read cache is `ExtentEntry.shard_ck`, per index, checked against the recorded
-shard length and dropped by `invalidate_shard_ck` whenever the content is
-replaced. A load straddling a writer is discarded, not cached or used:
-`shard_ck_gen` is bumped by every install and every invalidate, and a load
-whose generation moved during its disk read answers with whatever is current
-— otherwise it can put back the very sidecar `forget_shard_description` just
-removed. `handle_read_bytes` resolves checksums the same way as the
-batched path (`cached_payload_checksums`). Pre-CoW conversions keep their shard in `.dat` and are not covered.
+**A request names the file and its length** (`ScrubTask`: extent, `.dat` or
+shard index, length, the manager's eversion, op id) — the manager knows the
+extent is sealed and which file is the payload here, so the node never asks.
+`handle_scrub_extents` forwards tasks to the shard that owns each extent,
+queues the rest and answers at once (a file already queued is not queued twice;
+an op asking for it again joins the waiting entry (`ScrubQueue.waiting`: file →
+its own op and the ops that joined it), and
+gets the same outcome — dropping it would leave that op waiting forever); ONE worker per shard drains the queue and exits when it is empty — not a
+standing loop. It is paced by `ScrubPacer` (`--scrub-bytes-per-sec`, default
+8 MiB/s per shard, `0` = unpaced; an idle stretch banks no burst).
 
-**Who may describe content.** Two refusals, both because this node's own
-sidecar is what later condemns this node's own bytes:
-- only bytes `coalescer.last_synced` proves durable (an append advances
-  `entry.len` before its pwritev is submitted, and a short replica is a normal
-  mid-repair state);
-- `note_durable_install` — the single definition of "durable bytes installed out
-  of band", used by the peer copy and the recovery rebuild — clears any
-  half-built description, the cached sidecar and the verify cursor, so nothing
-  survives from content that was replaced. Without it a description spliced
-  across a repair makes the copy that was just made healthy fail its own
-  checksum forever.
+**Per file** (`scrub_task`): skipped while a recovery or EC conversion is in
+flight on the extent, if this node does not hold the file, if `.meta` is
+quarantined, or if it holds fewer bytes than named (`.dat`: min of `len` and
+the durable `last_synced` — a replica that missed the seal is caught up, not
+recorded; a shard: exactly the named length). Then checksums recorded for
+exactly this length are compared block by block — a differing block, or a
+described block that can no longer be read in full (a lost tail mismatches
+nothing), is ROT — else the content is hashed and recorded (trust-on-first-use).
+Every outcome — ROT among them, which the manager isolates on — goes on
+`DfResp.scrub_done` echoing the task's op id and eversion, drained by `df`
+through the node-wide `DoneQueues` (the manager dials only shard 0). `DfResp.scrub_queued` lists the
+ops with tasks still queued or running on ANY shard (sampled BEFORE the
+outcomes are drained: a worker pushes its outcome and only then drops its
+count, so a task is always in one or the other): it is how the
+manager tells a file waiting behind others from one a restart lost.
 
-**Where it is checked.** Whole-block reads in BOTH arms of `build_read_future`
-(the production path; `handle_read_bytes` alone is unreachable over the wire)
-fail rather than serve — the client's existing rotation carries the read to
-another replica. Checksums are resolved for the file the batch NAMES
-(`cached_payload_checksums`): `.dat` or one shard. A refused shard block is
-reconstructed by the client from the others, and an EC rebuild's source reads
-(whole stripes, so whole blocks) refuse a rotted peer, which moves the rebuild
-on to the next. Sub-block reads are deliberately NOT verified (a 4 KiB read
-would have to hash its whole 1 MiB block: 256× on the hot path); the scrub
-covers those bytes on its own schedule. EC conversion verifies the WHOLE extent
-before encoding, after both the seal sync and the peer-copy, because the layout
-flip makes whatever it read canonical for the stripe. `ContentCheck` keeps
-"could not read it" (`Unavailable`) apart from "it does not match"
-(`FailedPrecondition`) — naming the wrong fault sends the operator after the
-wrong thing.
+**An EC rebuild never reads a dark slot** (`ec_rebuild_source_slots`): a dark
+EC slot was isolated as rotted or is awaiting its own rebuild, nothing on the
+read path checks content, and RS turns one wrong input into a wrong output for
+every byte it spans.
 
-**The scrub** (`spawn_content_scrub_loop`, 1 s tick) both DESCRIBES and
-VERIFIES, so rot is found with nobody reading. It looks at an extent's shard
-file before its `.dat` when the node holds exactly ONE shard file (more is
-reconcile residue, and the node cannot tell which index is live); a shard with
-no sidecar is backfilled only once the manager confirms the layout publishes
-shard files at exactly that length. Whether a finding is REPORTED is
-`rot_report_eversion`, one pure decision: the manager isolates whatever slot
-the REPORTER holds, so a finding counts only while the file it is about IS that
-slot. A shard finding needs the manager to confirm the layout is committed to
-shard files (before the flip the shard is staging, and the slot is a replica
-whose `.dat` may be fine); a `.dat` finding on an EC-converted extent is
-dropped (that `.dat` is residue the next reconcile reclaims, and the slot is the
-node's shard, which may be fine). While a node holds a described shard file,
-that extent's `.dat` is not verified at all — through a long conversion, and
-for an abandoned attempt's residue until the next reconcile. Both `.dat` and shards go
-through one verifier (`scrub_verify_block`) whose finding counts only while the
-description it checked against is still the cached one and no op is in flight
-(the read is an await; a rebuild or re-staged stripe may have replaced the
-bytes), and one accumulator (`scrub_accumulate`) keyed by `(file, length)` so a
-holder of both files never splices one's blocks onto the other's. Paced by BYTES per shard
-(`SCRUB_DEFAULT_BYTES_PER_SEC`, 8 MiB/s, no banked burst), one block per extent
-per pass, cursor keyed by extent id. Bounded by the candidate count, not by the
-budget alone: the skip paths spend nothing and never await, and the cursor
-wraps, so an all-skipped tick would spin the shard's event loop — starving the
-very recovery whose marker caused the skip, and on shard 0 starving `df`.
-Deliberately NOT gated on the local `sealed` flag (there is no seal event on an
-EN, so that would skip exactly the rolled tails it exists for); it asks the
-manager instead, on a per-extent EXPONENTIAL backoff (8 scrub ticks doubling to
-300). A constant cannot serve both halves of that question: a cold partition's
-open tail answers "not sealed" for hours and must get cheap, but the same
-extent seals eventually, and until this node learns that it cannot describe the
-content — so a flat five minutes leaves every seal followed by a blind window
-of that length, inside which rot becomes the recorded truth. Measured: a chaos
-round sealed an extent ten seconds in and no node had learned it a minute
-later, with no sidecar anywhere in the cluster. The ramp bounds the window for
-a tail that rolls while young; one that stays open past ~8 minutes is already
-at the ceiling when it seals and gets the old window, which a different curve
-cannot fix. A read failure of a
-DESCRIBED block is a finding, not noise — nothing mismatches when the bytes are
-simply gone, and `re_avali` only inspects slots already dark, so a member that
-silently shrank is otherwise invisible. Findings ride `DfResp.scrub_rot`
-(reported against the MANAGER's current eversion, because a stale local one
-makes every later finding refusable as "eversion moved") and land in the
-per-node `DoneQueues` — the manager dials only shard 0, so a per-instance queue
-would strand every other shard's findings.
+**Content replaced under a scrub drops its result.** `ExtentEntry.content_gen`
+is bumped by every out-of-band replacement of a payload file — `note_durable_install`
+(recovery writeback, peer copy), a shard discard — and `forget_description`
+unlinks the file's sidecar and bumps it BEFORE a repair replaces content
+(recovery `.dat` writeback, peer copy's rename, shard rebuild's truncate): a
+sidecar left behind would condemn the repaired copy whenever the old content
+was the bad one. The scrub snapshots the generation and re-checks it (and the
+in-flight maps, and that the extent still exists) after every block read and
+after persisting, and on a change reports SKIPPED and removes what it wrote.
 
 ### Bounded fd cache for SEALED extents (`FdLru`)
 
@@ -1463,38 +1404,6 @@ and from other crates' CLAUDE.md); do not renumber.
     idempotent-skip path ALSO reports done (the ADOPT case), so a completion lost
     to `df`'s at-most-once delivery converges on the next re-dispatch.
 
-    **A prior CONTENT-CORRUPT attempt is answered `CODE_CONTENT_CORRUPT` (8),
-    not by starting another encoder.** The pre-encode content check exists to
-    refuse a rotted source, but the refusal alone is not enough: the extent's own
-    ConvertToEc marker is what keeps replica recovery away from it, so a
-    coordinator that simply kept re-encoding held the extent in a deadlock —
-    both repairs blocked, exiting only via the manager's 24-failure give-up.
-    `ec_last_error` records `EcConvertError::ContentCorrupt` for the attempt
-    nonce; the next dispatch of that SAME nonce answers code 8 instead of `OK`
-    and starts nothing, which the manager reads as "release the marker so
-    recovery can repair the source". This is the one failure class that gets a
-    typed refusal rather than a retry: peers, disks and timeouts can improve on
-    the next attempt and corrupted bytes cannot. A NEW nonce re-reads the
-    content, so the conversion resumes on its own once the source is rebuilt —
-    the refusal parks the attempt, it does not disable EC on the extent.
-
-    **The refusal also REPORTS the rot** (`note_scrub_rot`, the same `df`
-    channel the scrub uses, on both the failed check and every refusal built
-    from it). Releasing the marker is necessary but not sufficient: under the
-    default gate the manager rebuilds a slot only once something has MARKED it
-    corrupt, so without a report the extent sits dark-but-unmarked and waits for
-    the scrub to rediscover the same bytes on its own paced pass, while the
-    policy re-proposes EC and each attempt re-reads the whole extent to refuse
-    again. This node just read its own sealed bytes and they did not match what
-    was hashed at seal — that is the scrub's evidence found by a different
-    reader. The manager acts on the refusal itself — it isolates the slot in the
-    window its own abandon opens — so this report is the BACKSTOP, covering
-    every way that call can bail out (a leader change, a failed persist, a lost
-    verify-at-apply race, or a refusal because another op took the extent). It is re-queued on each
-    refusal for the same reason the backstop is needed: the manager DROPS a
-    finding for an extent with a stream-layer op in flight, and the refusal is
-    what releases that op.
-
     **Attempt identity (`attempt_nonce`) rides the whole conversion.** The
     manager stamps each attempt with the etcd revision that created its marker;
     it flows `ConvertToEcReq` → `WriteShardReq` → `EcConvertDone`. Two EN-side
@@ -1578,10 +1487,9 @@ and from other crates' CLAUDE.md); do not renumber.
     because the signal does not exist at this layer, not because the plumbing is
     expensive:
     - **A failed shard read is not the reader's evidence to act on.** Rot has
-      a first-party reporter: the shard's own node, whose whole-block reads
-      refuse a block that fails its `.shard{i}.ck` and whose scrub reports it
-      (sub-block reads, which no checksum covers, are caught only by the
-      scrub). Everything else that fails a shard read is not corruption:
+      a first-party reporter: the shard's own node, when a scrub compares the
+      shard with its `.shard{i}.ck`. No read checks content, so rot never fails
+      a read at all. Everything that does fail a shard read is not corruption:
       timeout/connect (congestion or a dead node —
       Suspected avoidance, note 27, and operator fencing already handle both),
       `CODE_PAYLOAD_NOT_HERE` (stale layout → the typed refresh; or a genuinely
@@ -1605,10 +1513,9 @@ and from other crates' CLAUDE.md); do not renumber.
       field), which is why THIS note records the evidential argument as the
       reason.
     - **What closes the real gaps instead.** (a) Rot needs EN-side first-party
-      evidence — "At-rest content integrity" supplies it for `.dat` AND for
-      shard files (each shard is described as it is staged), reported through
-      `DfResp.scrub_rot`; the manager isolates an EC slot on that report while
-      K shards still serve. (b) A missing shard file / quarantined holder is
+      evidence — the scrub ("At-rest integrity") supplies it for `.dat` AND for
+      shard files, reported as a ROT outcome on `DfResp.scrub_done`; the manager isolates an
+      EC slot on that report while K shards still serve. (b) A missing shard file / quarantined holder is
       first-party EN knowledge too; today's repair is an operator fence of the
       node (force-dispatches every slot → `run_ec_recovery_payload`).
 
@@ -1806,12 +1713,12 @@ RPCs use hand-coded binary encoding; control-plane RPCs use rkyv zero-copy.
 ### Control-plane (rkyv)
 
 AllocExtent(4), Df(5), RequireRecovery(6), ReAvali(7), CopyExtent(8),
-ConvertToEc(9), WriteShard(10), DeleteExtent(11), ReconcileExtents(0x31).
+ConvertToEc(9), WriteShard(10), DeleteExtent(11), ScrubExtents(18),
+ReconcileExtents(0x31).
 
 **Response codes are append-only and every one of them must be NAMED.**
-`CODE_CONTENT_CORRUPT = 8` (added at `WIRE_VERSION` 42) says an EC source failed
-its stored checksum — the attempt has ended and its marker should be released
-for repair, which no other code says. Adding one is a wire event
+`CODE_CONTENT_CORRUPT = 8` is reserved; nothing produces it. Adding a code is a
+wire event
 (with client compatibility checked separately), and `code_description` must learn it in the same
 change: an unnamed code renders as one generic word, which is how a stale-fence
 rejection and a corrupt-content refusal become the same useless log line.

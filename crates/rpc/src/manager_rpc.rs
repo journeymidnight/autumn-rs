@@ -1321,6 +1321,11 @@ pub const POLICY_KIND_REBALANCE: u8 = 7;
 /// Actuation records a repair request for each of those slots, which the
 /// recovery loop then rebuilds on another node — without fencing the node.
 pub const POLICY_KIND_REPAIR: u8 = 8;
+/// Scrub every sealed payload file in the cluster (`autumn-op scrub --all`),
+/// at most once per `SCRUB_POLICY_INTERVAL_SEC`. Cluster-scoped: no target id.
+pub const POLICY_KIND_SCRUB: u8 = 9;
+/// How often the `scrub` policy switch scrubs the whole cluster: weekly.
+pub const SCRUB_POLICY_INTERVAL_SEC: u64 = 7 * 24 * 3600;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PolicyCandidate {
@@ -1383,6 +1388,7 @@ pub fn policy_kind_names() -> Vec<(String, u8)> {
         ("POLICY_KIND_EC".to_string(), POLICY_KIND_EC),
         ("POLICY_KIND_REBALANCE".to_string(), POLICY_KIND_REBALANCE),
         ("POLICY_KIND_REPAIR".to_string(), POLICY_KIND_REPAIR),
+        ("POLICY_KIND_SCRUB".to_string(), POLICY_KIND_SCRUB),
     ]
 }
 
@@ -1924,6 +1930,7 @@ pub const AUDIT_OP_GC: u8 = 11;
 pub const AUDIT_OP_FORCE_GC: u8 = 12;
 pub const AUDIT_OP_REPAIR: u8 = 13;
 pub const AUDIT_OP_REPAIR_CANCEL: u8 = 14;
+pub const AUDIT_OP_SCRUB: u8 = 15;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrAuditEntry {
@@ -2409,6 +2416,13 @@ pub const OP_KIND_REPAIR: u8 = 9;
 /// full grace period before proposing them again. A rebuild already dispatched
 /// runs to completion.
 pub const OP_KIND_REPAIR_CANCEL: u8 = 10;
+/// Scrub sealed payload files on the nodes that hold them (`autumn-op scrub`):
+/// the extents in `extent_ids`, else every extent of partition `part_id`,
+/// else (both empty) every sealed extent in the cluster. Each node reads and
+/// hashes its own files and reports per file on `df`; the op finishes when
+/// every file dispatched has reported. A file whose content differs from its
+/// recorded checksums is isolated and rebuilt like any other rotted copy.
+pub const OP_KIND_SCRUB: u8 = 11;
 
 /// Display name for an `OP_KIND_*`, next to the constants so the mapping has
 /// ONE definition — the manager logs it and the CLI renders it, and a label
@@ -2425,6 +2439,7 @@ pub fn op_kind_name(kind: u8) -> &'static str {
         OP_KIND_RECOVERY => "recovery",
         OP_KIND_REPAIR => "repair",
         OP_KIND_REPAIR_CANCEL => "repair-cancel",
+        OP_KIND_SCRUB => "scrub",
         _ => "?",
     }
 }

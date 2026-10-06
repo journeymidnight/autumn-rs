@@ -12,7 +12,8 @@ use autumn_rpc::manager_rpc::{
     NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED, NODE_AUTO_STATE_SUSPEND,
     NODE_OVERRIDE_FENCED, NODE_OVERRIDE_MAINTENANCE, POLICY_KIND_EC, POLICY_KIND_GC,
     POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT,
-    POLICY_KIND_REBALANCE, POLICY_KIND_REPAIR, POLICY_KIND_SPLIT, SLOT_STATE_BEHIND,
+    POLICY_KIND_REBALANCE, POLICY_KIND_REPAIR, POLICY_KIND_SCRUB, POLICY_KIND_SPLIT,
+    SLOT_STATE_BEHIND,
     SLOT_STATE_CORRUPT,
     SLOT_STATE_DISK_FAULTED, SLOT_STATE_FENCED, SLOT_STATE_MAINTENANCE, SLOT_STATE_SERVING,
     SLOT_STATE_UNREACHABLE,
@@ -145,6 +146,7 @@ fn candidate_to_action(c: &PolicyCandidate) -> Option<serde_json::Value> {
             Some(json!({ "action": "compact", "part_id": c.primary_part_id }))
         }
         POLICY_KIND_REBALANCE => Some(json!({ "action": "rebalance" })),
+        POLICY_KIND_SCRUB => Some(json!({ "action": "scrub" })),
         POLICY_KIND_REPAIR => {
             if c.secondary_part_id == 0 {
                 return None;

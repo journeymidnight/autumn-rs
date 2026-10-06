@@ -644,21 +644,6 @@ pub(crate) fn eligible_replica_slots(ex: &ExtentInfo) -> Vec<usize> {
     }
 }
 
-/// Is EC slot `i` (into `replicates ++ parity`) isolated — dark in `avali`?
-///
-/// The EC counterpart of `eligible_replica_slots`, and for the same reason:
-/// a shard whose node found its bytes rotted is darkened by the manager, and a
-/// dark slot must not serve until recovery rebuilds it. A shard is not skipped
-/// like a replica — it has no second home — but reconstructed from the others,
-/// and it must not be one of the inputs to someone else's reconstruct either:
-/// RS turns one wrong input into a wrong output for every byte it spans.
-///
-/// The same fallback as replicas: no bit set at all is a layout that never
-/// recorded availability rather than every shard isolated, and is read as is.
-pub(crate) fn ec_slot_isolated(ex: &ExtentInfo, i: usize) -> bool {
-    ex.ec_converted && ex.sealed && ex.avali != 0 && i < 32 && (ex.avali & (1u32 << i)) == 0
-}
-
 /// The extent's PUBLISHED payload location, or a refusal naming the byte.
 ///
 /// Every read that names a payload file resolves the location here, ONCE, and
@@ -2372,10 +2357,6 @@ pub enum NotDirect {
     /// nothing to rotate to, and the proxy path can rebuild it from parity
     /// while this one cannot.
     EcShardNodeSuspected,
-    /// EC, and one of the data shards is isolated (its node found it rotted).
-    /// Until recovery rebuilds it the shard's bytes exist only as a parity
-    /// reconstruct, which the proxy path performs and this one cannot.
-    EcShardIsolated,
     /// Holds RS shards, not the payload: a single-EN raw read would hand the
     /// caller shard bytes as if they were the value.
     EcConverted,
@@ -2391,7 +2372,6 @@ impl NotDirect {
                 "extent is EC-converted but its shards are not in shard files"
             }
             NotDirect::EcShardNodeSuspected => "a data shard's node is Suspected",
-            NotDirect::EcShardIsolated => "a data shard is isolated pending rebuild",
             NotDirect::EcConverted => "extent is EC-converted (holds RS shards)",
             NotDirect::PayloadOutsideDat => "extent keeps its payload outside .dat",
         }
@@ -2410,8 +2390,7 @@ impl NotDirect {
         match self {
             NotDirect::EcConverted
             | NotDirect::EcNotShardAddressable
-            | NotDirect::EcShardNodeSuspected
-            | NotDirect::EcShardIsolated => {
+            | NotDirect::EcShardNodeSuspected => {
                 tracing::debug!(extent_id, reason = self.as_str(), "{what}")
             }
             NotDirect::PayloadOutsideDat => tracing::warn!(
@@ -4917,9 +4896,6 @@ impl StreamClient {
             if ex.payload() != Some(PayloadLocation::InShardFile) {
                 return Ok(ReadDescriptor::NotDirect(NotDirect::EcNotShardAddressable));
             }
-            if (0..data_shards).any(|i| ec_slot_isolated(&ex, i)) {
-                return Ok(ReadDescriptor::NotDirect(NotDirect::EcShardIsolated));
-            }
             let node_ids = replica_node_ids(&ex);
             let any_suspected = (0..data_shards)
                 .any(|i| self.is_node_suspected(node_ids.get(i).copied().unwrap_or(0)));
@@ -5470,17 +5446,7 @@ impl StreamClient {
         let mut to_read: Vec<usize> = Vec::with_capacity(shard_plan.len());
         for (i, &(shard_idx, _, _)) in shard_plan.iter().enumerate() {
             let nid = node_ids.get(shard_idx).copied().unwrap_or(0);
-            if ec_slot_isolated(ex, shard_idx) {
-                // Its node found its bytes rotted. A sub-block read is not
-                // checked against the shard's checksums, so reading it would
-                // serve exactly the bytes that were condemned.
-                tracing::debug!(
-                    extent_id,
-                    shard = shard_idx,
-                    "EC read: shard is isolated — reconstructing from the others"
-                );
-                needs_reconstruct.push(i);
-            } else if self.is_node_suspected(nid) {
+            if self.is_node_suspected(nid) {
                 // The THIRD way into a reconstruct, and the one that lasts: a
                 // short read and a read error each get a warning, but a node the
                 // manager has marked Suspected is diverted here before anything
@@ -5698,9 +5664,6 @@ impl StreamClient {
         // enforced above, so this is a data shard, never parity — which lets
         // the receive loop return them directly and skip RS entirely.
         for (i, addr) in addrs.iter().enumerate() {
-            if ec_slot_isolated(ex, i) {
-                continue;
-            }
             let mut tx_clone = tx.clone();
             let addr_clone = addr.clone();
             let pool = self.pool.clone();
@@ -5860,9 +5823,6 @@ impl StreamClient {
         let cached_location = published_payload(ex)?;
         let shard_len = crate::erasure::shard_size(ex.sealed_length as usize, data_shards) as u64;
         for (i, addr) in addrs.into_iter().enumerate() {
-            if ec_slot_isolated(ex, i) {
-                continue;
-            }
             let mut tx = tx.clone();
             let pool = self.pool.clone();
             let delay = if i >= data_shards {
@@ -6460,29 +6420,8 @@ mod selfheal_avali_filter_tests {
     //! SEALED replicated extent (the read-path isolation that makes "clear the
     //! avali bit" actually remove a bit-rotted replica from the serving set),
     //! while leaving OPEN extents and the all-clear defensive case unfiltered.
-    use super::{ec_slot_isolated, eligible_replica_slots};
+    use super::eligible_replica_slots;
     use crate::extent_rpc::ExtentInfo;
-
-    /// An EC slot is isolated exactly when its bit is dark on a sealed,
-    /// converted extent — never on a replicated one (that is
-    /// `eligible_replica_slots`' question), and never when no bit is set at
-    /// all, which is a layout that never recorded availability.
-    #[test]
-    fn an_ec_slot_is_isolated_only_when_its_bit_is_dark() {
-        let mut e = ext(true, 2, 0b101);
-        e.parity = vec![9];
-        e.ec_converted = true;
-        assert!(!ec_slot_isolated(&e, 0));
-        assert!(ec_slot_isolated(&e, 1), "data shard 1's bit is dark");
-        assert!(!ec_slot_isolated(&e, 2));
-
-        e.avali = 0;
-        assert!(!ec_slot_isolated(&e, 1), "no bit at all is not every shard isolated");
-
-        let mut replicated = ext(true, 3, 0b101);
-        replicated.ec_converted = false;
-        assert!(!ec_slot_isolated(&replicated, 1));
-    }
 
     fn ext(sealed: bool, n_repl: usize, avali: u32) -> ExtentInfo {
         ExtentInfo {

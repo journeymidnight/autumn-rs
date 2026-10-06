@@ -1,19 +1,13 @@
-//! At-rest content checksums for sealed extents.
+//! The checksum sidecar format: per-block CRC32C of one sealed payload file
+//! (`extent-{id}.ck` for `.dat`, `extent-{id}.shard{i}.ck` for a shard).
 //!
-//! Every layer that owns a byte format checksums it — the partition layer's WAL
-//! records and SST blocks, the RPC frame's header. The stream layer stores
-//! opaque bytes and owns no format, so nothing here ever described its content:
-//! `.meta`'s CRC32C covers its own 48 metadata bytes and never the `.dat`.
-//!
-//! That matters most in the repair paths, which run BELOW the layer holding the
-//! checksums. Recovery's verify-after-fetch compares length and eversion, and a
-//! bit flip moves neither, so a rebuilt replica is byte-identical to a corrupt
-//! source. EC conversion encodes parity from whatever the coordinator reads.
-//! Both make corruption authoritative before any consumer can notice.
-//!
-//! The sidecar is written once, when the extent seals, and is content-only: it
-//! says nothing about which extent generation or layout is live, so it needs no
-//! coordination with `.meta` beyond agreeing on the length it describes.
+//! The stream layer stores opaque bytes and owns no format, so nothing else
+//! describes its content: `.meta`'s CRC32C covers its own 48 metadata bytes.
+//! The sidecar is written and read ONLY by the scrub (`extent_node/scrub.rs`);
+//! no read, write, seal, conversion or repair path consults it. It is
+//! content-only — it says nothing about which generation or layout is live —
+//! and describes exactly `sealed_length` bytes, which is how a sidecar left
+//! from other content is told apart.
 
 use crc32c::crc32c;
 
@@ -40,7 +34,7 @@ pub(crate) fn block_count_for(sealed_length: u64, block_bytes: u64) -> usize {
 /// The byte range block `i` covers. The last block is short whenever
 /// `sealed_length` is not a multiple of `block_bytes`.
 ///
-/// Shared by the writer, the verifier and the tests on purpose: treating the
+/// Shared by the scrub and the tests on purpose: treating the
 /// short tail block as a full one is the mistake that would make every extent
 /// whose length is not a multiple of the block size look corrupt, and it should
 /// only be possible to make it in one place.
@@ -48,15 +42,6 @@ pub(crate) fn block_range(i: usize, block_bytes: u64, sealed_length: u64) -> (u6
     let start = (i as u64) * block_bytes;
     let end = start.saturating_add(block_bytes).min(sealed_length);
     (start, end)
-}
-
-/// What a read was checked against.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct BlockMismatch {
-    pub(crate) block: usize,
-    pub(crate) offset: u64,
-    pub(crate) expected: u32,
-    pub(crate) found: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,40 +55,6 @@ pub(crate) struct ExtentChecksums {
 }
 
 impl ExtentChecksums {
-    /// The description of no content yet, to be grown with `append`.
-    pub(crate) fn empty(block_bytes: u64) -> Self {
-        Self {
-            sealed_length: 0,
-            block_bytes,
-            blocks: Vec::new(),
-        }
-    }
-
-    /// Extend this description by `data`, written at `sealed_length`.
-    ///
-    /// For content that is written once, in order, by a path that already holds
-    /// the bytes: an EC shard arrives a stripe at a time, and hashing each stripe
-    /// as it lands describes the shard without reading it back. Stripe and
-    /// block boundaries need not agree — a short last block is carried as the
-    /// CRC of its prefix and finished by the next call, since
-    /// `crc32c_append(crc32c(a), b) == crc32c(a ++ b)`. The result after any
-    /// sequence of appends is exactly what hashing the concatenation in one go
-    /// produces.
-    pub(crate) fn append(&mut self, mut data: &[u8]) {
-        let fill = self.sealed_length % self.block_bytes;
-        if fill != 0 && !data.is_empty() {
-            let take = ((self.block_bytes - fill) as usize).min(data.len());
-            let last = self.blocks.last_mut().expect("a partial block has a CRC");
-            *last = crc32c::crc32c_append(*last, &data[..take]);
-            self.sealed_length += take as u64;
-            data = &data[take..];
-        }
-        for block in data.chunks(self.block_bytes as usize) {
-            self.blocks.push(crc32c(block));
-            self.sealed_length += block.len() as u64;
-        }
-    }
-
     pub(crate) fn encode(&self, extent_id: u64) -> Vec<u8> {
         let mut buf =
             Vec::with_capacity(CK_HEADER_BYTES + self.blocks.len() * 4 + CK_TRAILER_BYTES);
@@ -168,48 +119,15 @@ impl ExtentChecksums {
             blocks,
         })
     }
-
-    /// Check the blocks this read FULLY covers.
-    ///
-    /// A partially covered block is skipped rather than reported: its remaining
-    /// bytes are not in hand, so the only honest answer about it is silence.
-    /// That is why a sub-block read verifies nothing and the scrub exists.
-    pub(crate) fn verify_read(&self, offset: u64, data: &[u8]) -> Result<usize, BlockMismatch> {
-        let read_end = offset.saturating_add(data.len() as u64);
-        let mut checked = 0usize;
-        let first = (offset / self.block_bytes) as usize;
-        for i in first..self.blocks.len() {
-            let (b_start, b_end) = block_range(i, self.block_bytes, self.sealed_length);
-            if b_start >= read_end {
-                break;
-            }
-            if b_start < offset || b_end > read_end {
-                continue;
-            }
-            let from = (b_start - offset) as usize;
-            let to = (b_end - offset) as usize;
-            let found = crc32c(&data[from..to]);
-            if found != self.blocks[i] {
-                return Err(BlockMismatch {
-                    block: i,
-                    offset: b_start,
-                    expected: self.blocks[i],
-                    found,
-                });
-            }
-            checked += 1;
-        }
-        Ok(checked)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Walks blocks exactly the way `write_extent_checksums` does — same
-    /// `block_range`, same per-block `crc32c` — so these tests exercise the
-    /// arithmetic production uses rather than a parallel implementation.
+    /// Walks blocks exactly the way the scrub does — same `block_range`, same
+    /// per-block `crc32c` — so these tests exercise the arithmetic production
+    /// uses rather than a parallel implementation.
     fn checksums_over(content: &[u8], block_bytes: u64) -> ExtentChecksums {
         let sealed_length = content.len() as u64;
         let blocks = (0..block_count_for(sealed_length, block_bytes))
@@ -269,83 +187,5 @@ mod tests {
         assert!(ck.blocks.is_empty());
         let buf = ck.encode(9);
         assert_eq!(ExtentChecksums::decode(&buf, 9), Some(ck));
-    }
-
-    #[test]
-    fn a_full_read_checks_every_block_including_the_short_last_one() {
-        let content: Vec<u8> = (0..2500u32).map(|i| (i * 7) as u8).collect();
-        let ck = checksums_over(&content, 1024);
-        assert_eq!(ck.verify_read(0, &content), Ok(3));
-
-        // The tail block is 452 bytes, not 1024 — hashing it as a full block
-        // would make every extent whose length is not a multiple of the block
-        // size look corrupt.
-        let mut rot = content.clone();
-        rot[2400] ^= 0x01;
-        let err = ck.verify_read(0, &rot).expect_err("tail rot must be caught");
-        assert_eq!(err.block, 2);
-        assert_eq!(err.offset, 2048);
-    }
-
-    /// The point of per-block: a read that covers whole blocks is checked, and
-    /// one that covers none is silently unchecked rather than wrongly failed.
-    #[test]
-    fn only_fully_covered_blocks_are_checked() {
-        let content: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
-        let ck = checksums_over(&content, 1024);
-
-        // Exactly the middle two blocks.
-        assert_eq!(ck.verify_read(1024, &content[1024..3072]), Ok(2));
-        // A sub-block read covers nothing whole: unchecked, NOT an error.
-        assert_eq!(ck.verify_read(1024, &content[1024..1088]), Ok(0));
-        // Straddling a boundary still covers no block completely.
-        assert_eq!(ck.verify_read(512, &content[512..1536]), Ok(0));
-
-        // And a rotted byte inside a block the read does not fully cover is
-        // invisible here — that is what the scrub is for.
-        let mut rot = content.clone();
-        rot[100] ^= 0x01;
-        assert_eq!(ck.verify_read(0, &rot[0..512]), Ok(0));
-        assert!(ck.verify_read(0, &rot).is_err(), "the full read still catches it");
-    }
-
-    /// Growing a description piece by piece must land on exactly what hashing
-    /// the whole content does, wherever the pieces happen to split — inside a
-    /// block, on a boundary, or several blocks at once.
-    #[test]
-    fn appending_in_any_pieces_matches_hashing_the_whole() {
-        let content: Vec<u8> = (0..10_000u32).map(|i| (i * 31 % 257) as u8).collect();
-        let whole = checksums_over(&content, 1024);
-        for cuts in [
-            vec![10_000],
-            vec![1024, 2048, 10_000],
-            vec![1, 1023, 1024, 1025, 5000, 9999, 10_000],
-            vec![700, 1400, 2100, 9000, 10_000],
-        ] {
-            let mut ck = ExtentChecksums::empty(1024);
-            let mut at = 0usize;
-            for end in cuts.iter().copied() {
-                ck.append(&content[at..end]);
-                at = end;
-            }
-            assert_eq!(ck, whole, "cuts {cuts:?}");
-        }
-        let mut ck = ExtentChecksums::empty(1024);
-        ck.append(&[]);
-        assert_eq!(ck, checksums_over(&[], 1024), "nothing appended is the empty description");
-    }
-
-    /// A read starting past the first block must not mis-index its blocks.
-    #[test]
-    fn a_read_at_an_offset_maps_to_the_right_blocks() {
-        let content: Vec<u8> = (0..8192u32).map(|i| (i % 253) as u8).collect();
-        let ck = checksums_over(&content, 1024);
-        let mut rot = content.clone();
-        rot[5000] ^= 0x01;
-        let err = ck
-            .verify_read(4096, &rot[4096..8192])
-            .expect_err("rot in block 4");
-        assert_eq!(err.block, 4);
-        assert_eq!(err.offset, 4096);
     }
 }

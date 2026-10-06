@@ -159,7 +159,8 @@ fn passthrough(out: String, ok: bool) -> Response<Body> {
     }
 }
 
-const SWITCH_ORDER: [&str; 7] = ["split", "ec", "compact", "gc", "merge", "rebalance", "repair"];
+const SWITCH_ORDER: [&str; 8] =
+    ["split", "ec", "compact", "gc", "merge", "rebalance", "repair", "scrub"];
 
 /// `autumn-op auto-policy status --json` speaks its own shape; the page's
 /// contract (the one the manager used to serve) differs. Translate: `mode`
@@ -202,6 +203,7 @@ fn reshape_policies(out: String, ok: bool) -> Response<Body> {
                         "switches": {
                             "split": g(0), "ec": g(1), "compact": g(2),
                             "gc": g(3), "merge": g(4), "rebalance": g(5), "repair": g(6),
+                            "scrub": g(7),
                         },
                     })
                 })
@@ -411,6 +413,8 @@ async fn action(cfg: &Config, body: Bytes) -> Response<Body> {
             ]
         }
         "rebalance" => vec!["rebalance".into()],
+        // The weekly scrub advisory's action: every sealed copy in the cluster.
+        "scrub" => vec!["scrub".into(), "--all".into()],
         // Rebuild on other nodes now: one extent's degraded slots, or every
         // degraded slot on one node.
         "repair" if extent > 0 => vec!["repair".into(), extent.to_string()],

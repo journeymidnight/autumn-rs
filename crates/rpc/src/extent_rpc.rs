@@ -93,6 +93,12 @@ pub const MSG_READ_BYTES_BULK: u8 = 15;
 /// already rejects the zombie via the sealed check; fencing it is still safe),
 /// so the handler deliberately does NOT special-case-reject sealed.
 pub const MSG_FENCE_EXTENT: u8 = 17;
+/// Manager → EN: scrub these sealed payload files on this node (`ScrubExtentsReq`
+/// → `CodeResp`). ACCEPTED, not done: the node reads and hashes each file
+/// locally, paced by its own byte budget, and reports each outcome on a later
+/// `df` (`DfResp.scrub_done`). Nothing but the request and the outcomes
+/// crosses the network.
+pub const MSG_SCRUB_EXTENTS: u8 = 18;
 
 // MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
 
@@ -937,19 +943,25 @@ pub struct DfResp {
     /// (EC conversion, recovery). A sample, not a ledger: whatever is in
     /// flight at df time, empty when nothing is.
     pub op_progress: Vec<ExtentOpProgress>,
-    /// Extents whose content this node's scrub found ROTTED — its own copy
-    /// differs from what was hashed when the extent sealed.
+    /// Scrub tasks this node finished since the last `df`, whatever they
+    /// found. Drained at-most-once like `done_tasks`; a lost report leaves the
+    /// op it belongs to unfinished, never wrong.
     ///
-    /// Drained at-most-once like `done_tasks` and `ec_done`. A node cannot
-    /// isolate itself: clearing an `avali` bit is the manager's write, and
-    /// `MSG_REPORT_CORRUPT_REPLICA` is unusable here — it CAS-validates a
-    /// PARTITION owner epoch and its contract is that the reporter confirmed
-    /// some OTHER replica is clean, and an extent node has neither. Reporting
-    /// oneself needs no such fencing: a node saying "my own copy is bad" can
-    /// only ever cost itself.
-    pub scrub_rot: Vec<ScrubRotReport>,
+    /// A `SCRUB_OUTCOME_ROT` entry is also the finding the manager isolates
+    /// on. A node cannot isolate itself: clearing an `avali` bit is the
+    /// manager's write, and `MSG_REPORT_CORRUPT_REPLICA` is unusable here — it
+    /// CAS-validates a PARTITION owner epoch and its contract is that the
+    /// reporter confirmed some OTHER replica is clean, and an extent node has
+    /// neither. Reporting oneself needs no such fencing: a node saying "my own
+    /// copy is bad" can only ever cost itself.
+    pub scrub_done: Vec<ScrubDone>,
+    /// Ops that still have scrub tasks queued or running on this node. An op
+    /// listed here is alive however long its files wait behind others; an op
+    /// the manager dispatched here that is NOT listed (after a short grace)
+    /// has lost its files — the node restarted, or a report went missing.
+    pub scrub_queued: Vec<u64>,
     /// Failures this node hit while EXECUTING a recovery, drained at-most-once
-    /// like `done_tasks` / `ec_done` / `scrub_rot`. (`kind` is carried so the
+    /// like `done_tasks` / `ec_done` / `scrub_done`. (`kind` is carried so the
     /// channel generalises, but only the recovery retry loop reports today; EC
     /// conversion still surfaces its reason in the next dispatch's response.)
     ///
@@ -980,15 +992,58 @@ pub struct ExtentOpFailure {
     pub reason: String,
 }
 
-/// One extent this node found rotted at rest.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct ScrubRotReport {
+/// What one scrub task found (`ScrubDone.outcome`).
+/// The file matched the checksums recorded for it.
+pub const SCRUB_OUTCOME_CLEAN: u8 = 0;
+/// No checksums were recorded for it; this scrub recorded them.
+pub const SCRUB_OUTCOME_DESCRIBED: u8 = 1;
+/// It differs from its recorded checksums, or lost bytes they cover. The
+/// manager isolates the copy on this outcome.
+pub const SCRUB_OUTCOME_ROT: u8 = 2;
+/// Not looked at: not held here, not the requested length, or an op in
+/// flight is changing it. Says nothing about the content.
+pub const SCRUB_OUTCOME_SKIPPED: u8 = 3;
+/// Could not be read or its checksums could not be written.
+pub const SCRUB_OUTCOME_FAILED: u8 = 4;
+
+/// One sealed payload file to scrub. The MANAGER names the file and its length:
+/// it is what knows the extent is sealed, which file is its payload on this
+/// node, and how long that file must be, so the node never has to ask.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScrubTask {
     pub extent_id: u64,
-    /// The eversion this node held when it read the bad bytes. The manager
-    /// drops a report whose eversion has since moved: a concurrent recovery or
-    /// EC conversion has replaced the content the finding was about, so the
-    /// finding no longer describes anything.
+    /// `PAYLOAD_LOCATION_*`: `.dat` or one shard file.
+    pub payload_location: u8,
+    pub shard_index: u32,
+    /// Bytes the file holds: the sealed length for `.dat`, a shard's length
+    /// for a shard file. Checksums are recorded for, and compared over,
+    /// exactly this many bytes.
+    pub length: u64,
+    /// The manager's eversion when it planned the task, echoed back on the
+    /// outcome so a finding about content that may since have been replaced
+    /// is checked again instead of believed.
     pub eversion: u64,
+    /// The `autumn-op` op this task belongs to (`0` = none), echoed back.
+    pub op_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ScrubExtentsReq {
+    pub tasks: Vec<ScrubTask>,
+}
+
+/// One finished scrub task, drained at-most-once on `df`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScrubDone {
+    pub extent_id: u64,
+    pub payload_location: u8,
+    pub shard_index: u32,
+    pub op_id: u64,
+    /// `ScrubTask.eversion`, echoed.
+    pub eversion: u64,
+    /// `SCRUB_OUTCOME_*`.
+    pub outcome: u8,
+    pub message: String,
 }
 
 /// RequireRecovery request: start a background recovery task.

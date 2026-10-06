@@ -92,6 +92,9 @@ struct Args {
     /// path); `--no-direct-io` turns it off. While on, startup fails if any
     /// data dir's filesystem refuses O_DIRECT.
     direct_io: bool,
+    /// How much a scrub may read per second, per shard (`--scrub-bytes-per-sec`;
+    /// `None` = library default, 8 MiB/s; `0` = unpaced).
+    scrub_bytes_per_sec: Option<u64>,
     /// Per-thread regpool cap (pinned/registered bytes). `None` = library
     /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB].
     ucx_regpool_cap_bytes: Option<usize>,
@@ -137,6 +140,7 @@ fn parse_args() -> Args {
     let mut ec_stripe_bytes: Option<usize> = None;
     let mut fd_cache_cap: Option<usize> = None;
     let mut direct_io = cfg!(target_os = "linux");
+    let mut scrub_bytes_per_sec: Option<u64> = None;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut advertise: Option<String> = None;
 
@@ -247,6 +251,11 @@ fn parse_args() -> Args {
                     Some(args[i].parse().expect("--ec-stripe-bytes must be a number"));
             }
             "--no-direct-io" => direct_io = false,
+            "--scrub-bytes-per-sec" => {
+                i += 1;
+                scrub_bytes_per_sec =
+                    Some(args[i].parse().expect("--scrub-bytes-per-sec must be a number"));
+            }
             "--fd-cache-cap" => {
                 i += 1;
                 fd_cache_cap =
@@ -303,6 +312,7 @@ fn parse_args() -> Args {
         ec_stripe_bytes,
         fd_cache_cap,
         direct_io,
+        scrub_bytes_per_sec,
         ucx_regpool_cap_bytes,
         metrics_port,
         metrics_listen,
@@ -324,6 +334,9 @@ fn apply_extent_tunables(
     }
     if let Some(n) = args.inflight_cap {
         cfg = cfg.with_inflight_cap(n);
+    }
+    if let Some(n) = args.scrub_bytes_per_sec {
+        cfg = cfg.with_scrub_bytes_per_sec(n);
     }
     cfg.with_direct_io(args.direct_io)
 }
@@ -889,6 +902,7 @@ fn main() -> Result<()> {
         let rec_par = args.recovery_parallelism;
         let inflight = args.inflight_cap;
         let direct_io = args.direct_io;
+        let scrub_rate = args.scrub_bytes_per_sec;
         let bound_tx = bound_tx.clone();
         // Fail-stop: any shard exit (Err / panic / unexpected clean return)
         // calls `std::process::exit(1)` directly. The join loop below is
@@ -989,6 +1003,9 @@ fn main() -> Result<()> {
                             cfg = cfg.with_inflight_cap(n);
                         }
                         cfg = cfg.with_direct_io(direct_io);
+                        if let Some(n) = scrub_rate {
+                            cfg = cfg.with_scrub_bytes_per_sec(n);
+                        }
 
                         let node = ExtentNode::new(cfg)
                             .await

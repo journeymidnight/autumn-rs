@@ -1148,7 +1148,7 @@ async function overview(){
 }
 
 // ── policies / controller ────────────────────────────────────────────────────
-function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance","repair"].map(k=>`<span class="sw-i ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
+function swLine(sw){ return ["split","ec","compact","gc","merge","rebalance","repair","scrub"].map(k=>`<span class="sw-i ${sw[k]?"on":""}">${sw[k]?"●":"○"} ${k}</span>`).join(""); }
 // Hot/cold is a diagnosis, not an executable policy candidate. Turn its compact
 // wire-oriented reason into the decision an operator can actually make.
 function hotColdAdvisory(a){

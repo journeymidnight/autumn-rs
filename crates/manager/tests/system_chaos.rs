@@ -2214,14 +2214,16 @@ async fn do_corrupt_replica(ctx: &NemesisCtx) -> Result<String, String> {
         // nemesis fire only in rounds that happened to seal an extent for
         // some other reason, which is coverage by luck: the exact shape this
         // action exists to remove.
-        let rolled = roll_open_tails(ctx).await;
-        if rolled > 0 {
-            // Wait for a node to actually DESCRIBE the newly sealed content —
-            // the seal reaches the extent nodes lazily and the digest is paced,
-            // so returning as soon as the roll acked would inject into the
-            // trust-on-first-use window every time.
-            // Inside the 30 s per-action budget the dispatcher enforces, or
-            // the wait itself is reported as a wedged orchestration RPC.
+        if targets.undescribed.is_empty() && roll_open_tails(ctx).await > 0 {
+            targets = rottable_replicas(ctx).await;
+        }
+        // Only a scrub records a copy's checksums, so ask for one and wait for
+        // a holder to have them — rot injected before that is
+        // trust-on-first-use and would be recorded as truth. Inside the 30 s
+        // per-action budget the dispatcher enforces, or the wait itself is
+        // reported as a wedged orchestration RPC.
+        if !targets.undescribed.is_empty() {
+            submit_scrub(ctx, targets.undescribed.clone()).await?;
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
                 compio::time::sleep(Duration::from_secs(2)).await;
@@ -2303,6 +2305,29 @@ async fn do_corrupt_replica(ctx: &NemesisCtx) -> Result<String, String> {
     ))
 }
 
+/// Submit a scrub of `extents` through the operator path (`autumn-op scrub`).
+async fn submit_scrub(ctx: &NemesisCtx, extents: Vec<u64>) -> Result<u64, String> {
+    let submit = ctx
+        .mgr
+        .call(
+            MSG_OP_SUBMIT,
+            rkyv_encode(&OpSubmitReq {
+                kind: OP_KIND_SCRUB,
+                secondary_id: extents.first().copied().unwrap_or(0),
+                extent_ids: extents,
+                requested_by: "chaos-nemesis".to_string(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|e| format!("scrub submit rpc: {e}"))?;
+    let r: OpSubmitResp = rkyv_decode(&submit).map_err(|e| format!("decode scrub submit: {e}"))?;
+    if r.code != CODE_OK {
+        return Err(format!("scrub submit refused: {}", r.message));
+    }
+    Ok(r.op_id)
+}
+
 /// Seal + roll every partition's log-stream tail, returning how many rolled.
 ///
 /// `MSG_ROLL_TAILS` is the manager's own fence-drain instrument, so this seals
@@ -2379,12 +2404,16 @@ struct RotTargets {
     /// the same false accusation this file just had to remove from the rot
     /// verifier.
     reachable: usize,
+    /// Extents of the right shape with a usable holder whose copy has no
+    /// checksums yet — what a scrub must record before rot can be caught.
+    undescribed: Vec<u64>,
 }
 
 async fn rottable_replicas(ctx: &NemesisCtx) -> RotTargets {
     let mut targets = RotTargets {
         ready: Vec::new(),
         reachable: 0,
+        undescribed: Vec::new(),
     };
     let Ok(client) = autumn_etcd::EtcdClient::connect(&ctx.etcd_endpoint).await else {
         return targets;
@@ -2435,14 +2464,16 @@ async fn rottable_replicas(ctx: &NemesisCtx) -> RotTargets {
                 continue;
             }
             usable_holder = true;
-            // Only content this node has already DESCRIBED. Rot that lands
-            // before the first digest is trust-on-first-use: the sweep records
+            // Only content a scrub has already RECORDED. Rot that lands
+            // before the first record is trust-on-first-use: the scrub records
             // the damaged bytes as truth and nothing can ever contradict them.
             // That is a documented property, not a defect, so asserting
             // detection on it would be asserting something impossible.
             if let Some(path) = find_extent_dat(&en.data_dirs, ex.extent_id) {
                 if path.with_extension("ck").is_file() {
                     targets.ready.push((ex.extent_id, *nid, path));
+                } else if !targets.undescribed.contains(&ex.extent_id) {
+                    targets.undescribed.push(ex.extent_id);
                 }
             }
         }
@@ -3117,14 +3148,18 @@ async fn verify_injected_rot_was_found(
     if corrupted.is_empty() {
         return Vec::new();
     }
-    // Detection is a full cursor wrap, not a fixed cost: the sweep verifies one
-    // block per described extent per tick out of an 8 MiB/s budget, so the time
-    // to reach block 0 of the rotted extent grows with BOTH the extent's block
-    // count and how many extents that node has described. 60 s covered the
-    // rounds measured (4 MiB extents, tens of candidates) with no margin; a
-    // longer round or bigger extents would have failed on latency and read as
-    // "nothing noticed". Cheap to be generous — the wait only runs to the end
-    // when the round is about to fail anyway.
+    // Nothing looks at content unless asked: scrub every rotted extent, the
+    // way an operator (or the weekly policy) would. A refused submit is not a
+    // detection failure of the product, so it is only said, not asserted.
+    let mut extents: Vec<u64> = corrupted.iter().map(|r| r.extent_id).collect();
+    extents.sort_unstable();
+    extents.dedup();
+    if let Err(e) = submit_scrub(ctx, extents).await {
+        eprintln!("chaos: could not submit the detection scrub: {e}");
+    }
+    // Each node reads its copies at its own byte budget, so the time to a
+    // finding grows with how much it was asked to read. Cheap to be generous —
+    // the wait only runs to the end when the round is about to fail anyway.
     const WAIT: Duration = Duration::from_secs(180);
     let deadline = Instant::now() + WAIT;
     let mut pending: Vec<RottedReplica> = corrupted.to_vec();
@@ -3151,8 +3186,8 @@ async fn verify_injected_rot_was_found(
         .map(|r| {
             format!(
                 "extent {}'s replica on node {} was rotted on disk, the damaged bytes are STILL \
-                 THERE, and its own node never said so within {}s. Reads of it are served from \
-                 the damaged copy whenever the replica hash picks it",
+                 THERE, and a scrub of it never reported them within {}s. Reads of it are \
+                 served from the damaged copy whenever the replica hash picks it",
                 r.extent_id,
                 r.node_id,
                 WAIT.as_secs()

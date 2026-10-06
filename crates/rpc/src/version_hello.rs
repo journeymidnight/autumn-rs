@@ -538,6 +538,7 @@ fn known_en_opcode(opcode: u8) -> bool {
             | MSG_PROBE_EXTENT
             | MSG_READ_BYTES_BULK
             | MSG_FENCE_EXTENT
+            | MSG_SCRUB_EXTENTS
     )
 }
 
