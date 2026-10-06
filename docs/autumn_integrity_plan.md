@@ -90,6 +90,19 @@ while another passed is reported (`MSG_REPORT_CORRUPT_REPLICA`, row stream)
 and isolated like a WAL replay's finding; an EC culprit is only logged, and
 its node's scrub reports it. A healthy read pays nothing new.
 
+**Large values (value pointers into the log stream) are not checked on read;
+the scrub is their only check.** Their WAL record's CRC covers the value, but
+a value read fetches only the value's bytes — through the PS (`resolve_value`)
+or, mostly, straight from an extent node (`MSG_GET_REDIRECT` + direct read,
+received zero-copy into the caller's buffer) — and the RPC frame CRC does not
+cover a value tail. Checking it would mean returning the record's start in the
+redirect descriptor (a wire change), reading the record header and CRC around
+a zero-copy value, and a CRC pass over every value on the client (or the
+check moved into the extent node's read path). Decided against: a rotted
+value copy is served, undetected by the reader, until a scrub of its sealed
+log extent isolates it — up to the scrub interval; rot before the first scrub
+is recorded as the content.
+
 ## Findings and repair
 
 A block that differs from its checksum, or that can no longer be read in full
