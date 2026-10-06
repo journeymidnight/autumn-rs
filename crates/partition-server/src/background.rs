@@ -4065,16 +4065,8 @@ async fn process_gc_chunk(
             key_with_ts(&user_key, seq)
         };
 
-        // GC re-write also emits V1 envelope (sentinel + length +
-        // payload + crc). Match the original GC behaviour of writing op=1
-        // (no VP flag); recovery's `value.len() > VALUE_THROTTLE` fallback
-        // at lib.rs:2891 still detects this as a VP entry on replay, since
-        // GC only ever rewrites entries that were tagged VP in the source.
-        // caller-side memcpy unavoidable here — `value` is borrowed
-        // from the chunk read buffer; can't move it. GC is bounded by
-        // `gc_batch_bytes() = 4 MiB` per batch and runs cooperatively
-        // (yield between chunks), so the copy is acceptable on this cold
-        // path.
+        // `value` borrows the chunk read buffer, so it is copied; GC
+        // batches are bounded (`gc_batch_bytes()`), a cold path.
         let value_bytes = Bytes::copy_from_slice(value);
         // Mark the record as carrying a ValuePointer, matching the memtable
         // entry this same relocation inserts. Leaving it bare made GC's own

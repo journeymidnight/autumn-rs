@@ -51,7 +51,8 @@
 12. When `claude-progress.txt` and `feature_list.md` grow too long, prune them.
     Keep them tidy.
 13. Never write feature numbers of the `Fxxx` form in comments, in commit
-    descriptions, or — above all — in the code itself.
+    descriptions, or — above all — in the code itself. Keep comments short:
+    say what is not obvious from the code, no essays.
 14. A commit message must NEVER contain a
     `Claude-Session: https://claude.ai/code/session_...` line. Session links are
     internal, they expire, and they mean nothing to whoever reads `git log`
