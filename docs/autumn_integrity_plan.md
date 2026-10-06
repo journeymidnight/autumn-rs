@@ -90,18 +90,41 @@ while another passed is reported (`MSG_REPORT_CORRUPT_REPLICA`, row stream)
 and isolated like a WAL replay's finding; an EC culprit is only logged, and
 its node's scrub reports it. A healthy read pays nothing new.
 
-**Large values (value pointers into the log stream) are not checked on read;
-the scrub is their only check.** Their WAL record's CRC covers the value, but
-a value read fetches only the value's bytes — through the PS (`resolve_value`)
-or, mostly, straight from an extent node (`MSG_GET_REDIRECT` + direct read,
-received zero-copy into the caller's buffer) — and the RPC frame CRC does not
-cover a value tail. Checking it would mean returning the record's start in the
-redirect descriptor (a wire change), reading the record header and CRC around
-a zero-copy value, and a CRC pass over every value on the client (or the
-check moved into the extent node's read path). Decided against: a rotted
-value copy is served, undetected by the reader, until a scrub of its sealed
-log extent isolates it — up to the scrub interval; rot before the first scrub
-is recorded as the content.
+## Where the CRCs are, and who computes them
+
+The rules, decided by the maintainer:
+
+1. **On disk: the formats carry their own CRCs, computed by the server.** Every
+   SST data block and MetaBlock has a CRC32C written by the PS's SST builder;
+   every V1 WAL record has a CRC32C over its length and payload, value
+   included, written by the PS when it encodes the record. The extent node's
+   `.meta` has its own, and the scrub's `.ck` sidecar describes a payload file
+   per 1 MiB block. Nothing here changes per request.
+2. **On the wire: every frame's header and ctrl are CRC'd; a value tail is
+   not.** `rpc/src/frame.rs` computes the CRC over `header ++ ctrl_len ++ ctrl`
+   on every encode path and verifies it on every decode path before ctrl is
+   used. The bulk RPCs (`PUT_BULK`, `BATCH_PUT_BULK`, `GET_BULK`,
+   `BATCH_GET_BULK`, `READ_BYTES_BULK`) carry their value as a raw tail.
+3. **`MSG_APPEND` carries its data inside ctrl**, so what an extent node
+   persists is CRC'd in transit: the node cannot check a WAL record or an SST
+   block itself, so the frame CRC is the only check it has.
+4. **Client writes carry no CRC.** The PS computes the WAL record CRC on the
+   bytes it received.
+5. **Reads: SST blocks are verified as they are decoded (and read around when
+   they fail). Large values are not verified on read; the scrub is their only
+   check.** A value pointer's bytes sit inside a V1 WAL record whose CRC
+   covers them, but a read fetches only the value — mostly straight from an
+   extent node into the caller's buffer (`MSG_GET_REDIRECT` + direct read),
+   otherwise through the PS (`resolve_value`) — and nothing checks that record
+   CRC. Decided against checking it, for two reasons: most reads are direct
+   reads, where a check costs a CRC pass over every value on the client (about
+   1.2 ms for 8 MiB here, comparable to the transfer on RDMA, and one CRC per
+   record cannot be checked while the value streams in); and the scrub covers
+   sealed log extents. The cost of the decision: a rotted copy of a value, or
+   one damaged in transit, reaches the reader undetected — rot until a scrub
+   of its sealed log extent isolates it (up to the scrub interval; rot before
+   the first scrub is recorded as the content, and an open tail is not
+   scrubbed).
 
 ## Findings and repair
 
