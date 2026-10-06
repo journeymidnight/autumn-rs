@@ -14,10 +14,10 @@
 
 ## Active
 
-### BUG-CHAOS-RECLAIM-RESIDUE — chaos 的物理回收检查在 fence 后重建的节点上留有旧副本
-- **Trigger** (2026-09-29，加 PS 重启 chaos 时发现): 全动作集 system_chaos 7 轮里 4 轮 `verify_gc_reclaim` 报 `physical reclaim incomplete`，残留文件都在被 KillThenFence/fence 过、随后由 recovery 在别处重建了副本的节点上（例：extent 22 在 node 1）。旧版与新版 PS 都出现。
-- **Scope**: 查清是检查过严（删除只发给当前成员，非成员残留靠 EN reconcile：3 轮 × 5 min 才收）还是产品缺陷（被替换下来的副本该在重建完成时就删），据此修检查或修产品。
-- **Acceptance**: 结论有证据；修后全动作集多种子不再因此失败，且真实泄漏仍会被检查抓到。
+### BUG-CHAOS-ROT-THEN-EC — 被注入腐烂的副本随后被 EC 转换，chaos 的 corrupt 检查判"副本不再持有注入字节"
+- **Trigger** (2026-10-06，修 BUG-CHAOS-RECLAIM-RESIDUE 时全动作集 180 s 三个种子 23/7/101 全中): CorruptReplica 在某副本 `.dat` 偏移 0 写 64 字节，随后 EcConvert 恰好转换同一 extent（例：seed 23 extent 20 node 7；seed 101 extent 28 node 4），reconcile 回收转换前的 `.dat`，`inflight_errors` 报该节点槽位 AVAILABLE 却不再持有注入字节。per-key mismatches=0。2026-10-06 重设计已删 EC pre-encode 内容检查，所以腐烂字节可能被编码进 shard 后再由首次 scrub 记成 ck。
+- **Scope**: 查清 shard 是否带着腐烂字节、scrub 能否发现；据此判定是检查没跟上 EC 转换（修检查）还是腐烂经转换进 shard 未被发现（交用户定是否属已接受的"重建可从腐烂副本拷贝"同类限制）。
+- **Acceptance**: 结论有证据；全动作集多种子不再因此失败，且检查对真实"指针下文件被改写"仍报错。
 - `passes: false`
 
 ### F-PS-CORE-CAPACITY — 分区放置按 PS 核容量；允许超卖，manager 感知并按策略消解

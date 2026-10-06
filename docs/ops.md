@@ -2783,7 +2783,17 @@ AUTUMN_CHAOS_SEED=1 AUTUMN_CHAOS_DURATION_SECS=180 AUTUMN_CHAOS_NEMESIS_INTERVAL
 # extent = loss. Every acked put verified byte-exact per seed; PLUS a
 # positive-reclaim check (verify_gc_reclaim): a final quiesce -> compact ->
 # force-GC MUST physically DELETE extents (else the floor is stuck), and the
-# punch pass is re-verified loss-free + leak-free:
+# punch pass is re-verified loss-free + leak-free.
+# The physical half has two windows: a copy on a node that was a MEMBER before
+# the delete must be unlinked within 30 s (the delete reaches it); a copy on a
+# FORMER member (a node recovery replaced, typically after killfence) is reached
+# only by that node's orphan reconcile, so it gets 30 s + one reconcile interval
+# (5 min). A failure names each file as `on members` or `on former members`.
+# Members are taken from the snapshot before force-GC; a recovery that applies
+# after it is mis-booked as a member and fails at 30 s (look for `recovery
+# applied ... extent_id=N` after the snapshot; not seen in seeds 23/7/101). A
+# former-member failure at ~330 s can also be one failed reconcile round: grep
+# that EN's log for `reconcile failed (will retry next sweep)`.
 ./scripts/vphead_chaos.sh                              # 6 default seeds
 VPHEAD_SEEDS="1 42 777" AUTUMN_CHAOS_DURATION_SECS=60 ./scripts/vphead_chaos.sh
 #   (system_chaos's own action name for force GC is `forcegc`; AUTUMN_CHAOS_ACTIONS

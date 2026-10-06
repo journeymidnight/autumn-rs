@@ -831,7 +831,8 @@ belt-and-braces for leader-failover where `pending_extent_deletes` is lost but
 ### Startup + periodic orphan reconcile
 
 `ExtentNode::new` spawns `spawn_reconcile_orphans_loop()` after
-`load_extents()`: runs immediately, then every 5 minutes. Each iteration ships
+`load_extents()`: runs immediately, then every `RECONCILE_SWEEP_INTERVAL`
+(5 min, exported so tests derive their wait from it). Each iteration ships
 every locally-loaded (shard-owned) `extent_id` to the manager via
 `MSG_RECONCILE_EXTENTS = 0x31`. The answer is **file-granular**: `garbage`
 (extents this node is not a member of — delete everything) plus `placements`
@@ -842,6 +843,13 @@ CoW-conversion cleanup — dropping the redundant pre-conversion `.dat` after th
 flip, and dropping an abandoned attempt's shards when the layout still says
 `InDat` — with no second mechanism and no intent marker (a crash mid-cleanup is
 resolved by startup discovery re-deriving what is on disk).
+
+**It is the only thing that removes a copy recovery replaced.**
+`apply_recovery_done` moves the slot and sends the old holder nothing, and a
+later whole-extent delete goes only to the members of that moment. The old copy
+therefore stays until the holder's next round after the delete (or three rounds
+while the extent lives), up to one interval after the delete — bounded, not a
+leak.
 
 **An extent in NEITHER list has no verdict and is left strictly alone.** The
 manager omits any extent with an in-flight ledger op, because its file set is

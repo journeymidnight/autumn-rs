@@ -4039,8 +4039,11 @@ async fn sealed_extents_naming(etcd_endpoint: &str, node_id: u64) -> usize {
         .count()
 }
 
-async fn read_extent_id_set(etcd_endpoint: &str) -> Result<std::collections::HashSet<u64>, String> {
-    let mut set = std::collections::HashSet::new();
+/// Every extent in etcd, with the nodes it names (`replicates ++ parity`).
+async fn read_extent_members(
+    etcd_endpoint: &str,
+) -> Result<std::collections::HashMap<u64, Vec<u64>>, String> {
+    let mut members = std::collections::HashMap::new();
     let client = autumn_etcd::EtcdClient::connect(etcd_endpoint)
         .await
         .map_err(|error| format!("extent snapshot connect: {error}"))?;
@@ -4050,9 +4053,18 @@ async fn read_extent_id_set(etcd_endpoint: &str) -> Result<std::collections::Has
     for kv in &resp.kvs {
         let extent_id = parse_id_after_prefix(&kv.key, "extents/")
             .ok_or_else(|| format!("invalid extent metadata key: {:?}", kv.key))?;
-        set.insert(extent_id);
+        let extent = support::try_decode_persisted_extent(&kv.value)
+            .map_err(|error| format!("extent {extent_id} snapshot decode: {error}"))?;
+        members.insert(extent_id, extent.replicates.iter().chain(&extent.parity).copied().collect());
     }
-    Ok(set)
+    Ok(members)
+}
+
+fn extent_id_of_file(path: &Path) -> Option<u64> {
+    path.file_name()?.to_str()?
+        .strip_prefix("extent-")?
+        .split_once('.')?
+        .0.parse().ok()
 }
 
 fn remaining_extent_files(
@@ -4068,14 +4080,8 @@ fn remaining_extent_files(
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 scan(&entry.path(), candidates, remaining)?;
-            } else if let Some(extent_id) = entry.file_name().to_str()
-                .and_then(|name| name.strip_prefix("extent-"))
-                .and_then(|name| name.split_once('.'))
-                .and_then(|(id, _)| id.parse::<u64>().ok())
-            {
-                if candidates.contains(&extent_id) {
-                    remaining.push(entry.path());
-                }
+            } else if extent_id_of_file(&entry.path()).is_some_and(|id| candidates.contains(&id)) {
+                remaining.push(entry.path());
             }
         }
         Ok(())
@@ -4089,24 +4095,43 @@ fn remaining_extent_files(
     Ok(remaining)
 }
 
+/// Wait until no node holds a file of a deleted extent and no delete is pending.
+///
+/// `candidates` maps each deleted extent to the members it had before the
+/// delete. A member's copy is removed by the delete itself, so it must be gone
+/// within `push_timeout`. Any other node holding a copy is a former member
+/// (typically the node a recovery replaced): nothing sends it a delete, and its
+/// copy goes at that node's next orphan reconcile, so it gets `sweep_timeout`.
 async fn wait_for_physical_reclaim(
     etcd_endpoint: &str,
-    data_dirs: &[PathBuf],
-    candidates: &std::collections::HashSet<u64>,
-    timeout: Duration,
+    nodes: &[(u64, Vec<PathBuf>)],
+    candidates: &std::collections::HashMap<u64, Vec<u64>>,
+    push_timeout: Duration,
+    sweep_timeout: Duration,
 ) -> Result<(), String> {
     if candidates.is_empty() {
         return Ok(());
     }
-    if data_dirs.is_empty() {
+    if nodes.iter().all(|(_, dirs)| dirs.is_empty()) {
         return Err("physical reclaim has no replica directories to inspect".to_string());
     }
+    let ids: std::collections::HashSet<u64> = candidates.keys().copied().collect();
     let client = autumn_etcd::EtcdClient::connect(etcd_endpoint)
         .await
         .map_err(|error| format!("delete state connect: {error}"))?;
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
     loop {
-        let remaining = remaining_extent_files(data_dirs, candidates)?;
+        let mut on_members = Vec::new();
+        let mut on_former_members = Vec::new();
+        for (node_id, dirs) in nodes {
+            for path in remaining_extent_files(dirs, &ids)? {
+                let member = extent_id_of_file(&path)
+                    .and_then(|id| candidates.get(&id))
+                    .is_some_and(|members| members.contains(node_id));
+                let held = format!("node {node_id}: {}", path.display());
+                if member { on_members.push(held) } else { on_former_members.push(held) }
+            }
+        }
         let mut pending = Vec::new();
         for prefix in ["extent_inflight/", "extentDeleteRetry/"] {
             let snapshot = client.get_prefix(prefix).await
@@ -4114,16 +4139,22 @@ async fn wait_for_physical_reclaim(
             for entry in snapshot.kvs {
                 let extent_id = parse_id_after_prefix(&entry.key, prefix)
                     .ok_or_else(|| format!("invalid delete state key: {:?}", entry.key))?;
-                if candidates.contains(&extent_id) {
+                if ids.contains(&extent_id) {
                     pending.push(String::from_utf8_lossy(&entry.key).into_owned());
                 }
             }
         }
-        if remaining.is_empty() && pending.is_empty() {
+        if on_members.is_empty() && on_former_members.is_empty() && pending.is_empty() {
             return Ok(());
         }
-        if Instant::now() >= deadline {
-            return Err(format!("physical reclaim incomplete: files={remaining:?}, pending={pending:?}"));
+        let elapsed = started.elapsed();
+        if (elapsed >= push_timeout && !(on_members.is_empty() && pending.is_empty()))
+            || elapsed >= sweep_timeout
+        {
+            return Err(format!(
+                "physical reclaim incomplete after {elapsed:?}: on members={on_members:?}, \
+                 on former members={on_former_members:?}, pending={pending:?}"
+            ));
         }
         compio::time::sleep(Duration::from_millis(500)).await;
     }
@@ -4158,7 +4189,7 @@ fn physical_reclaim_checker_finds_each_replica_and_sidecar() {
 
 #[compio::test]
 async fn reclaim_snapshot_failure_is_not_an_empty_extent_set() {
-    assert!(read_extent_id_set("http://127.0.0.1:1").await.is_err());
+    assert!(read_extent_members("http://127.0.0.1:1").await.is_err());
 }
 
 #[compio::test]
@@ -4189,10 +4220,10 @@ async fn physical_reclaim_rejects_failed_delete_without_extent_metadata() {
         extent::MSG_DELETE_EXTENT, delete_request.clone(),
     ).await.unwrap()).unwrap();
     assert_eq!(refused.code, extent::CODE_PRECONDITION);
-    assert!(read_extent_id_set(&endpoint).await.unwrap().is_empty());
-    let dirs = [directory.path().to_path_buf()];
-    let candidates = [42u64].into_iter().collect();
-    let error = wait_for_physical_reclaim(&endpoint, &dirs, &candidates, Duration::ZERO)
+    assert!(read_extent_members(&endpoint).await.unwrap().is_empty());
+    let nodes = [(1u64, vec![directory.path().to_path_buf()])];
+    let candidates = [(42u64, vec![1u64])].into_iter().collect();
+    let error = wait_for_physical_reclaim(&endpoint, &nodes, &candidates, Duration::ZERO, Duration::ZERO)
         .await.unwrap_err();
     assert!(error.contains("extent-42.dat"), "{error}");
 
@@ -4204,13 +4235,56 @@ async fn physical_reclaim_rejects_failed_delete_without_extent_metadata() {
     let metadata = autumn_etcd::EtcdClient::connect(&endpoint).await.unwrap();
     for key in ["extent_inflight/42", "extentDeleteRetry/42"] {
         metadata.put(key, b"pending").await.unwrap();
-        let error = wait_for_physical_reclaim(&endpoint, &dirs, &candidates, Duration::ZERO)
+        let error = wait_for_physical_reclaim(&endpoint, &nodes, &candidates, Duration::ZERO, Duration::ZERO)
             .await.unwrap_err();
         assert!(error.contains(key), "{error}");
         metadata.delete(key).await.unwrap();
     }
-    wait_for_physical_reclaim(&endpoint, &dirs, &candidates, Duration::ZERO).await.unwrap();
+    wait_for_physical_reclaim(&endpoint, &nodes, &candidates, Duration::ZERO, Duration::ZERO).await.unwrap();
     drop(server);
+}
+
+#[compio::test]
+async fn physical_reclaim_gives_a_former_member_until_its_reconcile() {
+    let (_etcd, endpoint) = start_etcd().await;
+    let member = tempfile::tempdir().unwrap();
+    let former = tempfile::tempdir().unwrap();
+    let nodes = [
+        (1u64, vec![member.path().to_path_buf()]),
+        (2u64, vec![former.path().to_path_buf()]),
+    ];
+    let candidates = [(42u64, vec![1u64])].into_iter().collect();
+    let residue = former.path().join("extent-42.dat");
+    std::fs::write(&residue, b"replaced copy").unwrap();
+
+    // Past the push window, inside the sweep window: still waiting.
+    let collector = {
+        let residue = residue.clone();
+        compio::runtime::spawn(async move {
+            compio::time::sleep(Duration::from_millis(1200)).await;
+            std::fs::remove_file(residue).unwrap();
+        })
+    };
+    wait_for_physical_reclaim(&endpoint, &nodes, &candidates, Duration::ZERO, Duration::from_secs(10))
+        .await.unwrap();
+    collector.await.unwrap();
+
+    // Never collected: the sweep window is a bound, not a pass.
+    std::fs::write(&residue, b"replaced copy").unwrap();
+    let error = wait_for_physical_reclaim(
+        &endpoint, &nodes, &candidates, Duration::ZERO, Duration::from_secs(1),
+    ).await.unwrap_err();
+    assert!(error.contains("on former members=[\"node 2:"), "{error}");
+    std::fs::remove_file(&residue).unwrap();
+
+    // A member's copy gets only the push window, however long the sweep one is.
+    std::fs::write(member.path().join("extent-42.dat"), b"undeleted member copy").unwrap();
+    let started = Instant::now();
+    let error = wait_for_physical_reclaim(
+        &endpoint, &nodes, &candidates, Duration::ZERO, Duration::from_secs(5),
+    ).await.unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(2), "member copy waited for the sweep window");
+    assert!(error.contains("on members=[\"node 1:"), "{error}");
 }
 
 /// POSITIVE reclamation check (user ask: after GC, an extent must definitely
@@ -4232,7 +4306,7 @@ async fn verify_gc_reclaim(
     router: &PsRouter,
     topo: &Topology,
     etcd_endpoint: &str,
-    data_dirs: &[PathBuf],
+    nodes: &[(u64, Vec<PathBuf>)],
 ) -> (Vec<String>, usize, usize) {
     let mut errors = Vec::new();
     // Set when any partition's force-GC reports PROTECTED extents (a pinned
@@ -4242,7 +4316,7 @@ async fn verify_gc_reclaim(
     // reclaim, e.g. a merge-consolidated survivor with ≤1 SST / ≤1 sealed log
     // extent — common under the full nemesis set, false-positive pre-fix).
     let mut any_protected = false;
-    let before = match read_extent_id_set(etcd_endpoint).await {
+    let before = match read_extent_members(etcd_endpoint).await {
         Ok(snapshot) => snapshot,
         Err(error) => return (vec![error], 0, 0),
     };
@@ -4282,7 +4356,7 @@ async fn verify_gc_reclaim(
         }
         compio::time::sleep(Duration::from_secs(3)).await;
     }
-    let mid = match read_extent_id_set(etcd_endpoint).await {
+    let mid = match read_extent_members(etcd_endpoint).await {
         Ok(snapshot) => snapshot,
         Err(error) => return (vec![error], 0, 0),
     };
@@ -4347,17 +4421,25 @@ async fn verify_gc_reclaim(
     // refs→0 delete need a few ticks to land.
     compio::time::sleep(Duration::from_secs(12)).await;
 
-    let after = match read_extent_id_set(etcd_endpoint).await {
+    let after = match read_extent_members(etcd_endpoint).await {
         Ok(snapshot) => snapshot,
         Err(error) => return (vec![error], 0, 0),
     };
-    let candidates = before.union(&mid).filter(|id| !after.contains(id)).copied().collect();
-    if let Err(error) = wait_for_physical_reclaim(etcd_endpoint, data_dirs, &candidates, Duration::from_secs(30)).await {
+    // Members as of the latest snapshot that still had the extent.
+    let candidates: std::collections::HashMap<u64, Vec<u64>> = before.iter().chain(&mid)
+        .filter(|(id, _)| !after.contains_key(id))
+        .map(|(id, members)| (*id, members.clone()))
+        .collect();
+    let push_timeout = Duration::from_secs(30);
+    let sweep_timeout = push_timeout + autumn_stream::RECONCILE_SWEEP_INTERVAL;
+    if let Err(error) = wait_for_physical_reclaim(
+        etcd_endpoint, nodes, &candidates, push_timeout, sweep_timeout,
+    ).await {
         errors.push(error);
         return (errors, 0, 0);
     }
-    let total_reclaimed = before.difference(&after).count();
-    let gc_reclaimed = mid.difference(&after).count();
+    let total_reclaimed = before.keys().filter(|id| !after.contains_key(id)).count();
+    let gc_reclaimed = mid.keys().filter(|id| !after.contains_key(id)).count();
 
     if gc_reclaimed == 0 && any_protected {
         errors.push(format!(
@@ -5360,8 +5442,8 @@ runs ACROSS rounds is uncovered, not unlucky.",
         // protecting everything forever. MUTATING, so it runs AFTER the read-only
         // verifiers above.
         eprintln!("chaos: verifying GC reclaim (quiesce → compact → force-GC → delete)");
-        let reclaim_dirs: Vec<PathBuf> = nemesis_ctx.ens.borrow().iter()
-            .flat_map(|node| node.data_dirs.iter().cloned()).collect();
+        let reclaim_dirs: Vec<(u64, Vec<PathBuf>)> = nemesis_ctx.ens.borrow().iter()
+            .map(|node| (node.node_id, node.data_dirs.clone())).collect();
         let (reclaim_errors, total_reclaimed, gc_reclaimed) =
             verify_gc_reclaim(&mgr, &router, &topo, &etcd_endpoint, &reclaim_dirs).await;
         eprintln!(

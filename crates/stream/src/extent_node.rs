@@ -19,6 +19,10 @@ use std::time::{Duration, Instant};
 /// refused by `claim_ec_staging`.
 const EC_STAGING_SEALED: u64 = u64::MAX;
 
+/// Period of the orphan reconcile after the startup round. Public so a test
+/// that waits for the sweep to collect residue derives its bound from here.
+pub const RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
 /// What this node knows about EC staging for one extent.
 ///
 /// The nonce orders two attempts against each other. The tick answers a
@@ -4102,7 +4106,7 @@ impl ExtentNode {
 
     /// long-lived periodic orphan reconcile.
     ///
-    /// Runs immediately on spawn, then every `SWEEP_INTERVAL`. Errors
+    /// Runs immediately on spawn, then every `RECONCILE_SWEEP_INTERVAL`. Errors
     /// (manager not leader during cold boot, transient network blip,
     /// etcd hiccup) are logged at WARN and the loop continues — the
     /// next sweep retries. No separate "startup retry" phase: a cold-
@@ -4117,6 +4121,10 @@ impl ExtentNode {
     ///     unreachable.
     ///   • Manager restart losing its in-memory
     ///     `pending_extent_deletes` queue between leader hand-offs.
+    ///   • A copy that recovery replaced: `apply_recovery_done` moves the
+    ///     slot to the rebuilt node and sends nothing to the old holder, and
+    ///     a later whole-extent delete goes only to the members of that
+    ///     time. This sweep is the only thing that removes it.
     ///   • Future EC conversion: a replica-shaped extent that gets
     ///     converted to EC leaves the original `.dat` files behind on
     ///     the data nodes; `convert_to_ec` updates manager metadata
@@ -4145,7 +4153,6 @@ impl ExtentNode {
         en_spawn_supervised("en_reconcile_orphans", move || {
             let node = node.clone();
             async move {
-                const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
                 loop {
                     if let Err(e) = node.reconcile_orphans_with_manager().await {
                         tracing::warn!(
@@ -4153,7 +4160,7 @@ impl ExtentNode {
                             "reconcile failed (will retry next sweep)",
                         );
                     }
-                    compio::time::sleep(SWEEP_INTERVAL).await;
+                    compio::time::sleep(RECONCILE_SWEEP_INTERVAL).await;
                 }
             }
         });
