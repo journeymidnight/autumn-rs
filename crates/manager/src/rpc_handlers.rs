@@ -287,7 +287,6 @@ impl AutumnManager {
             MSG_STREAM_PUNCH_HOLES => self.handle_stream_punch_holes(payload).await,
             MSG_TRUNCATE => self.handle_truncate(payload).await,
             MSG_MULTI_MODIFY_SPLIT => self.handle_multi_modify_split(payload).await,
-            MSG_MULTI_MODIFY_MERGE => self.handle_multi_modify_merge(payload).await,
             MSG_MERGE_PARTITIONS => self.handle_merge_partitions(payload).await,
             MSG_GET_POLICY_CANDIDATES => self.handle_get_policy_candidates(payload).await,
             MSG_REPORT_PARTITION_LOAD => self.handle_report_partition_load(payload).await,

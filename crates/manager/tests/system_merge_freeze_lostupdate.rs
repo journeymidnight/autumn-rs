@@ -27,18 +27,10 @@
 //!      → torn merge / lost update.
 //!
 //! ── Injection method ─────────────────────────────────────────────────────────
-//! This harness does NOT SIGSTOP a subprocess (the in-process test cluster runs
-//! the manager/EN/PS as threads, each on its own compio runtime — a thread can't
-//! be selectively SIGSTOP'd) and does NOT add a test-only pause hook to the
-//! manager source. Instead it REPLAYS the exact orchestration steps that
-//! `handle_merge_partitions` performs internally — `MSG_ACQUIRE_OWNER_LOCK` →
-//! `MSG_MERGE_FREEZE{true}` (victim, then survivor) → `MSG_CHECK_COMMIT_LENGTH`
-//! ×6 → `MSG_MULTI_MODIFY_MERGE` — with the coordinator PAUSE injected in the test
-//! BETWEEN the capture and the txn. Because the real coordinator issues those same
-//! RPCs, in that same order, with zero elapsed-time guard between the last capture
-//! and `handle_multi_modify_merge`, this replay is behaviourally identical to a
-//! manager paused/SIGSTOP'd at that site for > FREEZE_TTL. It is deterministic (we
-//! control the exact timeline) and touches no shared harness file.
+//! The in-process cluster runs the manager as a thread, which cannot be
+//! SIGSTOP'd, so the test arms `MERGE_TEST_PAUSE_MS`: `handle_merge_partitions`
+//! sleeps between the commit_length capture and the merge txn, which is what a
+//! paused manager looks like at that site.
 //!
 //! Topology: manager + 2 ENs + 1 PS; two ADJACENT partitions created directly via
 //! `upsert_partition` (no CoW split → no `has_overlap`): survivor [a,m), victim

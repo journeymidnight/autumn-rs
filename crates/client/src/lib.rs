@@ -5197,16 +5197,7 @@ impl ClusterClient {
     /// merge two adjacent partitions. Survivor keeps its part_id;
     /// victim is deleted from the manager.
     ///
-    /// Stage 1 implementation orchestrates the merge from the client:
-    ///   1. FLUSH on both partitions (drains imm into SSTs durable in row_stream).
-    ///   2. Read commit_length on each of the six streams via stream_info.
-    ///   3. Call manager's MSG_MULTI_MODIFY_MERGE with the sealed lengths.
-    ///   4. On success, the survivor's PS picks up the wider rg + spliced
-    ///      extent_ids on the next region_sync_loop tick (~2 s). Brief
-    ///      unavailability during the reopen is the trade-off for not
-    ///      requiring a PS-side splice handler in Stage 1.
-    ///
-    /// thin wrapper around the manager-orchestrated `MSG_MERGE_PARTITIONS`.
+    /// Thin wrapper around the manager-orchestrated `MSG_MERGE_PARTITIONS`.
     ///
     /// The manager (which is leader-fenced and crash-recoverable via etcd)
     /// owns the full sequence:

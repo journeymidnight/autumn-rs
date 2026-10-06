@@ -2747,7 +2747,15 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 # and the following `log replay done ... bytes=N` near zero. A source cursor
 # no longer in the log (its empty tail was reclaimed) is ignored; replay then
 # reads from an earlier cursor (or the whole log) and skips everything already
-# flushed — slower, not wrong.
+# flushed — slower, not wrong. That skip is by the union of both sources' max
+# seq, sound only because the drain left nothing unflushed; cargo test -p
+# autumn-manager --test system_merge_replay_reachability drives both edges: a
+# drain flush whose checkpoint fails (the merge must be refused, the survivor
+# must take writes at once, an immediate retry must flush before merging, and
+# nothing acked is lost) and a merged open with both
+# source cursors reclaimed (whole-log replay, every acked write reads back).
+# Every merge goes through MSG_MERGE_PARTITIONS (`autumn-op merge`, the
+# policy); the raw merge opcode 0x34 is retired and refused.
 # Split does the same: its drain always writes a log-end checkpoint, so a child
 # replays only its own writes; cargo test -p autumn-manager --test
 # system_split_fence_floor checks that a WAL-only lease fence bump survives it.

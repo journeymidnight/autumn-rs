@@ -445,7 +445,6 @@ fn known_manager_opcode(opcode: u8) -> bool {
             | MSG_REGISTER_PARTITION_ADDR
             | MSG_RECONCILE_EXTENTS
             | MSG_UPDATE_STREAM_EC
-            | MSG_MULTI_MODIFY_MERGE
             | MSG_GET_POLICY_CANDIDATES
             | MSG_REPORT_PARTITION_LOAD
             | MSG_MERGE_PARTITIONS
@@ -678,6 +677,8 @@ mod tests {
         assert!(n
             .check_opcode(crate::manager_rpc::MSG_TENANT_CREATE)
             .is_ok());
+        // The retired raw merge txn (no freeze drain) is refused even to Admin.
+        assert!(n.check_opcode(0x34).is_err());
 
         // A Client on an EN: direct reads and the CLIENT_AUTH that binds them.
         let mut en = Negotiated {

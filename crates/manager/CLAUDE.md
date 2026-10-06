@@ -19,7 +19,9 @@ via the shared `ConnPool`. RPC families:
 - **StreamManager**: status, acquire_owner_lock, register_node, create_stream,
   update_stream_ec, stream_info, extent_info, nodes_info, check_commit_length,
   stream_alloc_extent, stream_punch_holes, truncate, multi_modify_split,
-  multi_modify_merge, merge_partitions, reconcile_extents, force_ec_convert.
+  merge_partitions, reconcile_extents, force_ec_convert. The raw merge txn
+  (`handle_multi_modify_merge`) runs only inside `merge_partitions`; its opcode
+  0x34 is retired (no freeze drain, so it lost a source's unflushed writes).
 - **PartitionManager**: register_ps, upsert_partition, get_regions,
   get_client_regions (`0x60` — the SAME routing answer narrowed to the four
   fields an SDK reads; `get_regions` keeps all seven for the PS and autumn-op,

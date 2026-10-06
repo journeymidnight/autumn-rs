@@ -62,12 +62,6 @@
   （否则 freeze 直接拒、manager kill 落空），**这一步未实跑**。另：该脚本开机时 `kill -9` 本机
   所有 `autumn-*`/`etcd` 进程，多租户机器上会杀掉别的工作树的进程。
 
-### F-REVIEW-V1-MERGE-REPLAY — 待验证：merge replay cursor 可达性
-- **Trigger**: review.md 4.1；数值模型不足以证明正常 merge 丢失数据。
-- **Scope**: 复现 raw merge、checkpoint 失败、旧状态和 sealed-empty cursor 回收；按可达性决定修复。
-- **Acceptance**: 真实调用链固定时序及 ACK 数据验证，记录可达或不可达的证据。
-- `passes: false`
-
 ### F-COMPIO-UPGRADE — 升级运行时并分阶段验证 TCP 内核 CPU 降耗
 - **Trigger** (2026-09-14，用户要求记录升级计划): 当前 compio 0.18.0 /
   compio-driver 0.11.4 / compio-runtime 0.11.0；H200-1 单 partition 写入采样的

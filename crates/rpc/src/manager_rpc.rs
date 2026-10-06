@@ -78,8 +78,9 @@ pub const MSG_UPDATE_STREAM_EC: u8 = 0x32;
 // 0x33 retired with the vp_table_refs removal (was
 // MSG_SYNC_PARTITION_VP_REFS, partition→manager VP-dependency sync).
 
-// partition merge primitive (inverse of MSG_MULTI_MODIFY_SPLIT).
-pub const MSG_MULTI_MODIFY_MERGE: u8 = 0x34;
+// 0x34 retired: was MSG_MULTI_MODIFY_MERGE, the raw merge txn. It has no
+// freeze drain, so a source's unflushed writes were lost; merges go through
+// MSG_MERGE_PARTITIONS only.
 // advisory engine — query split/merge candidates.
 pub const MSG_GET_POLICY_CANDIDATES: u8 = 0x35;
 // per-partition load metrics report (PS → manager, 5 s cadence).
@@ -87,8 +88,8 @@ pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
 // orchestrated partition merge — inputs are just (survivor, victim).
 // The manager (which is leader-fenced + persistent) acquires its own
 // admin owner lock, freezes both PSes via MSG_MERGE_FREEZE, captures the
-// 6 commit_lengths under the freeze, then runs the existing
-// MSG_MULTI_MODIFY_MERGE handler logic atomically. CLI is a thin wrapper
+// 6 commit_lengths under the freeze, then runs the merge txn
+// (`handle_multi_modify_merge`, in-process) atomically. CLI is a thin wrapper
 // so a CLI crash mid-merge is benign — the manager either commits the
 // txn (region_sync_loop on the survivor's PS picks up the wider rg and
 // drops the frozen PartitionData on next tick) or it doesn't (PSes
@@ -1048,7 +1049,7 @@ pub type ExtProbeExtentResp = ExtCommitLengthResp;
 
 // ── partition merge + policy advisory ──────────────────────────────────────
 
-// --- MultiModifyMerge ---
+// --- MultiModifyMerge --- (in-process only: the manager's merge txn input)
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct MultiModifyMergeReq {
     pub survivor_part_id: u64,
@@ -2637,7 +2638,6 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_CREATE_STREAM
             | MSG_UPSERT_PARTITION
             | MSG_MERGE_PARTITIONS
-            | MSG_MULTI_MODIFY_MERGE
             | MSG_OP_SUBMIT
             | MSG_TENANT_CREATE
             | MSG_TENANT_DELETE
@@ -2645,13 +2645,6 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_NAMESPACE_DELETE
             | MSG_NAMESPACE_SET_PRESPLIT
     )
-    // MSG_MULTI_MODIFY_MERGE (the raw merge txn) is on the list although the
-    // manager only invokes it IN-PROCESS (from handle_merge_partitions +
-    // auto_dispatch_merge): listing it keeps a Peer from dispatching the
-    // low-level primitive past the freeze / sacred-boundary guard that
-    // MSG_MERGE_PARTITIONS enforces. No in-tree wire caller sends it. (Unlike
-    // MSG_MULTI_MODIFY_SPLIT, which the PS drives, so it is not listed.)
-    //
     // MSG_REGISTER_NODE is NOT listed: the EXTENT NODE self-registers with it
     // over its Peer connection at startup and after a manager restart
     // (extent_node.rs `register_with_manager`). CREATE_STREAM /

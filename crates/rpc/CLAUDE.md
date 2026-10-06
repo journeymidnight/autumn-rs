@@ -849,6 +849,14 @@ there is no global latch or mandatory common persistence codec. Preserve
 cluster_id and ownership fencing. See docs/ops.md for policy pause, task drain,
 replacement and recovery checks.
 
+Manager opcode 0x34 (`MSG_MULTI_MODIFY_MERGE`, the raw merge txn) is retired and
+stays reserved. It had no freeze drain, so a merge through it lost a source's
+unflushed writes. Only a May 2026 client sent it, long before
+MIN_CLIENT_WIRE_VERSION; no peer and no client inside the supported window
+does, so retiring it changes nothing between deployed binaries and
+WIRE_VERSION was not bumped. An Admin connection that sends it is refused as
+an unknown opcode.
+
 ## Notes
 
 - The 10-byte header eliminates HTTP/2 frame (9B) + gRPC envelope (5B) + HEADERS

@@ -1430,10 +1430,12 @@ pub struct ChildFailpoints {
     pub flush_checkpoint_nth: u64,
     /// The first compaction fails its checkpoint (outputs already written).
     pub compaction_checkpoint: bool,
+    /// Every merged open fails before publishing its merged checkpoint.
+    pub merged_checkpoint: bool,
 }
 
 /// Environment of a re-executed child PS:
-/// `<ps_id> <manager> <ps addr> <flush nth> <compaction 0|1>`.
+/// `<ps_id> <manager> <ps addr> <flush nth> <compaction 0|1> <merged 0|1>`.
 const CHILD_PS_ENV: &str = "AUTUMN_TEST_CHILD_PS";
 
 /// A partition server running as a re-executed copy of THIS test binary, so a
@@ -1456,9 +1458,10 @@ impl ChildPs {
             .env(
                 CHILD_PS_ENV,
                 format!(
-                    "{ps_id} {mgr_addr} {ps_addr} {} {}",
+                    "{ps_id} {mgr_addr} {ps_addr} {} {} {}",
                     fp.flush_checkpoint_nth,
-                    u8::from(fp.compaction_checkpoint)
+                    u8::from(fp.compaction_checkpoint),
+                    u8::from(fp.merged_checkpoint)
                 ),
             )
             .stdout(std::process::Stdio::null())
@@ -1509,6 +1512,9 @@ pub fn child_ps_main() {
     }
     if f[4] == "1" {
         autumn_partition_server::background::fail_next_compaction_checkpoint();
+    }
+    if f[5] == "1" {
+        autumn_partition_server::fail_merged_checkpoint();
     }
     compio::runtime::Runtime::new().unwrap().block_on(async move {
         let ps = PartitionServer::connect_with_advertise_and_port(

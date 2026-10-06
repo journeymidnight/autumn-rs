@@ -206,6 +206,15 @@ fn flush_checkpoint_failpoint() -> bool {
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
         == Ok(1)
 }
+/// Test failpoint: while set, a merged open fails before it publishes the
+/// merged checkpoint, leaving the meta stream as a PS crash right after the
+/// merge would. Only tests set it.
+static MERGED_CHECKPOINT_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Arm `MERGED_CHECKPOINT_FAIL` for the life of the process. Only tests call this.
+pub fn fail_merged_checkpoint() {
+    MERGED_CHECKPOINT_FAIL.store(true, Ordering::Relaxed);
+}
 /// Number of flushes fully committed (checkpoint published) since process start.
 /// Tests poll this for deterministic flush completion. See `FLUSH_COMMITS`.
 pub fn flush_commit_count() -> u64 {
@@ -7726,9 +7735,9 @@ async fn try_complete_freeze_drain(
         };
         let succeeded = resp.code == partition_rpc::CODE_OK;
         let delivered = ack.send(Ok(partition_rpc::rkyv_encode(&resp))).is_ok();
-        if succeeded && !delivered {
-            // A manager that did not observe the freeze response cannot safely
-            // proceed.
+        if !succeeded || !delivered {
+            // A manager that did not observe a successful freeze cannot
+            // proceed, and its rollback skips the side whose freeze failed.
             part.borrow().frozen_for_merge.set(None);
         }
         if succeeded {
@@ -7736,7 +7745,7 @@ async fn try_complete_freeze_drain(
         } else {
             tracing::warn!(
                 part_id,
-                "freeze drain reported flush failure to manager; \
+                "freeze drain reported flush failure to manager and unfroze; \
                  merge will be rolled back"
             );
         }
@@ -9246,14 +9255,9 @@ async fn recover_partition(
                 }
             }
         }
-        // merge: populate the per-loc last_seq cache used post-loop
-        // to compute each meta_record's source_max_seq independently.
-        // Post-merge the spliced meta_stream carries TWO source records
-        // (survivor's + victim's), whose PS-seq counters were INDEPENDENT
-        // pre-merge. A single union max_seq for replay-dedup would
-        // silently skip survivor's post-vp_head tail records whose ts is
-        // ≤ victim's max but > survivor's max — the failure mode that
-        // the chaos test surfaced as q-key data loss on split+merge.
+        // After a merge the sources' seq counters were independent, so the
+        // union max below is only a sound replay skip because each source's
+        // freeze drain left no record outside its SSTs (see `replay_dedup`).
         for loc in all_locs {
             // bounded retry on eversion-mismatch during open. A
             // post-restart manager whose `apply_ec_conversion_done` did
@@ -10594,6 +10598,9 @@ const FLUSH_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 /// truncates the meta stream to the extent holding it. A crash before the
 /// append leaves the old records, and the next open does this again.
 async fn publish_merged_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
+    if MERGED_CHECKPOINT_FAIL.load(Ordering::Relaxed) {
+        return Err(anyhow!("merged checkpoint: test failpoint"));
+    }
     // Replay started past both sources, so the recovered memtable holds only
     // writes made after an earlier merged open (which crashed before this
     // record replaced the sources'); an ordinary flush publishes the one record.

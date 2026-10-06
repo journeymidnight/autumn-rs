@@ -2367,9 +2367,15 @@ Three fixes bound the restart replay window (worst case per partition =
     `handle_incoming_req` short-circuits Put / Delete with `CODE_UNAVAILABLE` while
     frozen; reads + maintenance flow normally. `partition_loop` top-of-loop:
     - if `freeze_drain_ack.is_some() && pending.is_empty() && inflight.is_empty()`:
-      rotate active + flush every imm via `flush_one_imm`, then send OK on the parked
-      oneshot (the strict precondition for the orchestrator's commit_length capture to
-      be race-free).
+      rotate active + flush every imm via `flush_one_imm`, publish a checkpoint at the
+      committed log end, then send OK on the parked oneshot (the strict precondition
+      for the orchestrator's commit_length capture to be race-free). A flush or
+      checkpoint failure answers `CODE_UNAVAILABLE` and unfreezes at once. The
+      manager's rollback skips the side whose freeze failed; left frozen, that side
+      refused writes until `FREEZE_TTL`, and a retried merge inside the TTL was
+      answered "already drained-frozen" with no new drain while the failed imm was
+      still queued — the merge committed and lost its writes (100 acked writes in
+      `a_merge_retried_after_a_failed_drain_flush_loses_nothing`).
     - if `frozen_for_merge` elapsed > `FREEZE_TTL` (30 s): auto-unfreeze + drop stale ack
       with PRECONDITION (orchestrator-crash backstop; happy path completes < 1 s).
 
@@ -2386,6 +2392,19 @@ Three fixes bound the restart replay window (worst case per partition =
     `save_table_locs_raw` truncates meta_stream to the extent holding it. A crash
     before the append leaves the records and the next open repeats it. Regression:
     `crates/manager/tests/system_merge_single_checkpoint.rs`.
+    The union max-seq skip is unsafe the moment a source holds a record outside
+    its SSTs at commit (independent counters: a survivor record at seq 101 is
+    skipped against a victim at 2000), so the drain above is what makes it
+    sound. `system_merge_replay_reachability.rs`: a failed drain flush refuses
+    the merge, the side takes writes at once, and an immediate retry loses
+    nothing (red when the drain answers OK anyway, and both red when the failed
+    side stays frozen); a merged open whose two cursors were both reclaimed
+    replays the whole log and loses nothing (red when the drain does not
+    flush: the survivor's 100 unflushed writes are skipped, the victim's above
+    the union survive). The raw merge
+    txn had no drain and lost a source's unflushed writes, so its opcode
+    (0x34) is retired: `handle_multi_modify_merge` runs only inside
+    `handle_merge_partitions`.
     Recovery on failure: manager sends `MSG_MERGE_FREEZE { freeze: false }` rollback; the
     FREEZE_TTL backstop fires if even that fails. Merge wallclock is ~2–3 s (bounded by
     the region_sync tick) but write loss is 0. This model avoids cross-thread plumbing
@@ -2407,9 +2426,9 @@ Three fixes bound the restart replay window (worst case per partition =
     leaves it in the survivor's. With both sides separated the two sources' key sets are
     disjoint and neither table order nor per-source seq counters matter. Regression:
     `merge_refuses_{victim,survivor}_still_carrying_parent_tables` (`crates/manager/tests/system_merge.rs`).
-    The low-level `MSG_MULTI_MODIFY_MERGE` txn has no PS in the loop and does not check;
-    every production path (client, `autumn-op merge`, the policy) goes through
-    `MSG_MERGE_PARTITIONS`, which freezes both sides.
+    Every merge (client, `autumn-op merge`, the policy) goes through
+    `MSG_MERGE_PARTITIONS`, which freezes both sides; the merge txn itself has no
+    PS in the loop and does not check.
 
 14. **Background-loop supervision — no loop dies silently; durability loops fail-stop.**
     Every PS background loop runs under a supervisor wrapper, never a bare

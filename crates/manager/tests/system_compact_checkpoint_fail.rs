@@ -433,6 +433,7 @@ fn unlisted_flush_case(flush_fails: bool, compaction_fails: bool) {
                 // The first flush publishes C; the second is the unlisted one.
                 flush_checkpoint_nth: if flush_fails { 2 } else { 0 },
                 compaction_checkpoint: compaction_fails,
+                ..Default::default()
             },
         );
         let ps = RpcClient::connect(ps1_addr).await.expect("connect ps1");

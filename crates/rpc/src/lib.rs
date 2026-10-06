@@ -335,8 +335,6 @@ mod admin_op_tests {
         assert!(is_admin_mgr_msg(MSG_FENCE_NODE));
         assert!(is_admin_mgr_msg(MSG_MERGE_PARTITIONS));
         assert!(is_admin_mgr_msg(MSG_CREATE_STREAM));
-        // The raw merge txn is listed so a Peer cannot bypass the guard.
-        assert!(is_admin_mgr_msg(MSG_MULTI_MODIFY_MERGE));
         // Account and namespace mutations are operator-only too.
         assert!(is_admin_mgr_msg(MSG_TENANT_CREATE));
         assert!(is_admin_mgr_msg(MSG_TENANT_DELETE));
