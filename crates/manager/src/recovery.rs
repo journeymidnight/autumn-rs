@@ -2321,6 +2321,14 @@ impl crate::AutumnManager {
                         {
                             continue;
                         }
+                        if finding == crate::extent_corrupt::RotFinding::Stale && done.op_id == 0 {
+                            tracing::warn!(
+                                extent_id = done.extent_id,
+                                node_id = node.node_id,
+                                "a rot finding outside any scrub op could not be judged yet \
+                                 and has no op to hold it; dropped"
+                            );
+                        }
                     }
                     self.record_scrub_outcome(node.node_id, done);
                 }
@@ -3008,6 +3016,17 @@ impl crate::AutumnManager {
         let mut started_new = false;
         let rpc_ok = match result {
             Ok(resp_data) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp_data) {
+                Ok(r) if r.code == autumn_rpc::extent_rpc::CODE_CONTENT_CORRUPT => {
+                    self.release_rotted_ec_attempt(
+                        extent_id,
+                        attempt_nonce,
+                        params.target_nodes.first().copied().unwrap_or(0),
+                        params.new_eversion.saturating_sub(1),
+                        &r.message,
+                    )
+                    .await;
+                    return;
+                }
                 Ok(r) if r.code == CODE_OK => {
                     // CODE_OK is "accepted", so count the ACCEPT, and read the
                     // message: the coordinator puts its previous attempt's
@@ -3148,6 +3167,44 @@ impl crate::AutumnManager {
                 "EC convert accepted by coordinator; awaiting df report"
             );
         }
+    }
+
+    /// The coordinator found its own `.dat` rotted while encoding it: give up
+    /// this attempt and isolate that copy, so recovery rebuilds it and the
+    /// conversion is refused until then (`acquire_extent_inflight`).
+    ///
+    /// Isolation refuses while the extent has an op in flight, so it has to
+    /// happen here, right after the release. The node's queued finding is the
+    /// backstop when this call bails (leader change, failed persist).
+    async fn release_rotted_ec_attempt(
+        &self,
+        extent_id: u64,
+        nonce: u64,
+        coord: u64,
+        eversion: u64,
+        message: &str,
+    ) {
+        if self.extent_inflight_nonce(extent_id) != nonce
+            || self.extent_inflight_op(extent_id)
+                != Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        {
+            return;
+        }
+        if !self.abandon_ec_marker(extent_id, coord, "source_rotted").await {
+            return;
+        }
+        tracing::warn!(extent_id, coord, message, "EC source rotted: released the marker");
+        let (now_s, _) = Self::now_s_ms();
+        self.ops.borrow_mut().complete_ec(
+            extent_id,
+            OP_STATE_FAILED,
+            "the coordinator's copy failed its checksums; it is isolated and rebuilt before a \
+             conversion, unless it is the last available copy (then it stays, unconvertible)"
+                .into(),
+            message.into(),
+            now_s,
+        );
+        self.isolate_rotted_slot(extent_id, coord, eversion, "ec_convert").await;
     }
 
     /// Post-RPC finalize after a successful `EXT_MSG_CONVERT_TO_EC`: apply the

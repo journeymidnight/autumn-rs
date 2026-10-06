@@ -3104,6 +3104,18 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 # can drive a rebuild:
 AUTUMN_CHAOS_ACTIONS=corrupt AUTUMN_CHAOS_DURATION_SECS=60 \
   cargo test -p autumn-manager --test system_chaos -- --nocapture --ignored
+# The detection scrub names only rotted extents that still exist (a deleted one
+# makes the manager refuse the whole op) and the check polls the op. If the
+# rotted extent was EC-converted meanwhile, the check follows the bytes to the
+# head of extent-{id}.shard0 on slot 0. The EC coordinator itself checks the
+# .dat it encodes against its .ck: a rotted source logs
+# `EC CONVERT FOUND CONTENT ROT` on that EN, the manager logs
+# `EC source rotted: released the marker` and isolates the slot
+# (source="ec_convert"); the conversion is refused until it is rebuilt. With
+# `corrupt` and `ec` in one round (the full set) both paths are exercised:
+AUTUMN_CHAOS_SEED=23 AUTUMN_CHAOS_DURATION_SECS=180 AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1000 \
+  cargo test -p autumn-manager --test system_chaos chaos_real -- --nocapture --ignored
+# Deterministic: cargo test -p autumn-manager --test scrub_on_demand
 
 # AFTER ANY EN-SIDE CHANGE, rebuild the WHOLE workspace before running chaos:
 # the harness spawns `target/debug/autumn-extent-node`, and `cargo build -p

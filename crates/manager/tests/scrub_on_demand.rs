@@ -171,6 +171,14 @@ async fn seal(mgr: &RpcClient, sc: &StreamClient, stream_id: u64, commit: u64) {
     assert_eq!(r.code, CODE_OK, "seal: {}", r.message);
 }
 
+async fn force_ec(mgr: &RpcClient, extent_id: u64) -> ForceEcConvertResp {
+    let resp = mgr
+        .call(MSG_FORCE_EC_CONVERT, rkyv_encode(&ForceEcConvertReq { extent_id }))
+        .await
+        .expect("force_ec");
+    rkyv_decode(&resp).expect("decode force_ec")
+}
+
 /// Wait until `pred` holds for the extent's layout.
 async fn wait_layout(mgr: &RpcClient, extent_id: u64, what: &str, pred: impl Fn(&MgrExtentInfo) -> bool) -> MgrExtentInfo {
     for _ in 0..120 {
@@ -384,5 +392,143 @@ fn two_rotted_replicas_found_by_one_scrub_are_both_isolated() {
         let op = scrub(&mgr, vec![extent_id], 0).await;
         assert!(op.message.contains("2 rotted"), "{}", op.message);
         wait_layout(&mgr, extent_id, "both rotted replicas must be isolated", |e| e.avali & bits == 0).await;
+    });
+}
+
+/// A copy a scrub found rotted is never the source of an EC conversion.
+///
+/// The coordinator encodes from its own full-length copy, and a rotted copy is
+/// full length; once the conversion's cleanup drops the replicas, the damage
+/// would be the only version, with parity agreeing. Three nodes for RF 3, so
+/// the isolated slot has no rebuild target and stays marked.
+#[test]
+fn an_extent_with_a_rotted_copy_is_not_ec_converted() {
+    const TAG: &str = "scrub-noec";
+    let mut c = Cluster::new(3, 3, TAG);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect_as(c.mgr_addr, Role::Admin, None).await.expect("mgr");
+        for i in 0..3 {
+            c.register(&mgr, i, TAG).await;
+        }
+        let resp = mgr
+            .call(
+                MSG_CREATE_STREAM,
+                rkyv_encode(&CreateStreamReq {
+                    replicates: 3,
+                    ec_data_shard: 2,
+                    ec_parity_shard: 1,
+                }),
+            )
+            .await
+            .unwrap();
+        let created: CreateStreamResp = rkyv_decode(&resp).unwrap();
+        assert_eq!(created.code, CODE_OK, "create_stream: {}", created.message);
+        let stream_id = created.stream.expect("stream").stream_id;
+        let pool = Rc::new(ConnPool::new());
+        let sc = StreamClient::connect(&c.mgr_addr.to_string(), "owner/scrub-noec/0".into(), 256 << 20, pool)
+            .await
+            .expect("stream client");
+        let payload: Vec<u8> = (0..(2 * 1024 * 1024 + 3)).map(|i| (i % 241) as u8).collect();
+        let r = sc.append(stream_id, &payload).await.expect("append");
+        let extent_id = r.extent_id;
+        seal(&mgr, &sc, stream_id, r.end).await;
+        let layout = extent_info(&mgr, extent_id).await;
+        let op = scrub(&mgr, vec![extent_id], 0).await;
+        assert!(op.message.contains("3 recorded for the first time"), "{}", op.message);
+
+        // The coordinator's own copy: slot 0.
+        let victim = layout.replicates[0];
+        let bit = slot_bit(&layout, victim);
+        let dat = find_file(c.dir(victim), &format!("extent-{extent_id}.dat")).expect("victim .dat");
+        flip_byte(&dat, 10);
+        let op = scrub(&mgr, vec![extent_id], 0).await;
+        assert!(op.message.contains("1 rotted"), "{}", op.message);
+        wait_layout(&mgr, extent_id, "the rotted replica was never isolated", |e| e.avali & bit == 0).await;
+
+        let resp = mgr
+            .call(MSG_FORCE_EC_CONVERT, rkyv_encode(&ForceEcConvertReq { extent_id }))
+            .await
+            .expect("force_ec");
+        let f: ForceEcConvertResp = rkyv_decode(&resp).expect("decode force_ec");
+        assert_eq!(f.code, CODE_PRECONDITION, "converted with a rotted copy: {}", f.message);
+        assert!(f.message.contains("corrupt-marked"), "{}", f.message);
+        assert!(!extent_info(&mgr, extent_id).await.ec_converted);
+    });
+}
+
+/// Rot nobody has reported yet is caught by the conversion itself: the
+/// coordinator checks the `.dat` it encodes against what a scrub recorded,
+/// refuses, and the manager isolates that copy. Once it is rebuilt and
+/// recorded again, the conversion goes through, checked clean.
+#[test]
+fn an_ec_conversion_refuses_a_coordinator_copy_that_fails_its_checksums() {
+    const TAG: &str = "scrub-ecsrc";
+    let mut c = Cluster::new(3, 3, TAG);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect_as(c.mgr_addr, Role::Admin, None).await.expect("mgr");
+        for i in 0..3 {
+            c.register(&mgr, i, TAG).await;
+        }
+        let resp = mgr
+            .call(
+                MSG_CREATE_STREAM,
+                rkyv_encode(&CreateStreamReq {
+                    replicates: 2,
+                    ec_data_shard: 2,
+                    ec_parity_shard: 1,
+                }),
+            )
+            .await
+            .unwrap();
+        let created: CreateStreamResp = rkyv_decode(&resp).unwrap();
+        assert_eq!(created.code, CODE_OK, "create_stream: {}", created.message);
+        let stream_id = created.stream.expect("stream").stream_id;
+        let pool = Rc::new(ConnPool::new());
+        let sc = StreamClient::connect(&c.mgr_addr.to_string(), "owner/scrub-ecsrc/0".into(), 256 << 20, pool)
+            .await
+            .expect("stream client");
+        // Over one 1 MiB checksum block per shard, and odd, so a block
+        // straddles the boundary between the two data shards.
+        const N: usize = 3 * 1024 * 1024 + 777;
+        let payload: Vec<u8> = (0..N).map(|i| ((i * 31) % 251) as u8).collect();
+        let r = sc.append(stream_id, &payload).await.expect("append");
+        let extent_id = r.extent_id;
+        seal(&mgr, &sc, stream_id, r.end).await;
+        let layout = extent_info(&mgr, extent_id).await;
+        let op = scrub(&mgr, vec![extent_id], 0).await;
+        assert!(op.message.contains("2 recorded for the first time"), "{}", op.message);
+
+        // Rot the coordinator's copy (slot 0) and tell nobody.
+        let coord = layout.replicates[0];
+        let bit = slot_bit(&layout, coord);
+        let dat = find_file(c.dir(coord), &format!("extent-{extent_id}.dat")).expect("coordinator .dat");
+        flip_byte(&dat, 1024 * 1024 + 5);
+        let f = force_ec(&mgr, extent_id).await;
+        assert_eq!(f.code, CODE_OK, "force_ec_convert: {}", f.message);
+        let isolated = wait_layout(&mgr, extent_id, "the rotted coordinator copy was never isolated", |e| {
+            e.avali & bit == 0
+        })
+        .await;
+        assert!(!isolated.ec_converted, "converted from a copy that fails its checksums");
+        let f = force_ec(&mgr, extent_id).await;
+        assert_eq!(f.code, CODE_PRECONDITION, "the marked copy must be rebuilt first: {}", f.message);
+
+        // Recovery rebuilds the copy on the third node from the clean replica,
+        // a scrub records the rebuilt copy, and the conversion now goes through.
+        wait_layout(&mgr, extent_id, "the isolated copy was never rebuilt", |e| {
+            !e.replicates.contains(&coord) && e.avali.count_ones() as usize == e.replicates.len()
+        })
+        .await;
+        let op = scrub(&mgr, vec![extent_id], 0).await;
+        assert!(op.message.contains("1 recorded for the first time"), "{}", op.message);
+        let f = force_ec(&mgr, extent_id).await;
+        assert_eq!(f.code, CODE_OK, "force_ec_convert after rebuild: {}", f.message);
+        let converted = wait_layout(&mgr, extent_id, "the extent never converted", |e| e.ec_converted).await;
+        let shard0 = find_file(c.dir(converted.replicates[0]), &format!("extent-{extent_id}.shard0"))
+            .expect("shard 0");
+        assert_eq!(&std::fs::read(&shard0).unwrap()[..4096], &payload[..4096]);
+        sc.invalidate_extent_cache(extent_id);
+        let (got, _) = sc.read_bytes_from_extent(extent_id, 0, N as u64).await.expect("read");
+        assert!(got == payload, "the converted extent does not read back clean");
     });
 }

@@ -353,6 +353,9 @@ enum DiskProbeError {
 enum EcConvertError {
     #[error("{code:?}: {message}")]
     Status { code: StatusCode, message: String },
+    /// The coordinator's `.dat` differs from its recorded checksums.
+    #[error("source content rotted: {0}")]
+    SourceRotted(String),
 }
 
 impl From<(StatusCode, String)> for EcConvertError {
@@ -10052,6 +10055,22 @@ impl ExtentNode {
                 },
             );
         }
+        if let Some(EcConvertError::SourceRotted(why)) = &prior_failure {
+            // Encoding again would only find the same rot. The typed answer is
+            // what lets the manager release the marker and isolate this copy.
+            // The finding queued with it is a backstop only if it reaches a
+            // `df` after the release; one that arrives earlier is dropped.
+            self.done.push_scrub_done(ScrubDone {
+                extent_id: req.extent_id,
+                payload_location: PayloadLocation::InDat.as_byte(),
+                shard_index: 0,
+                op_id: 0,
+                eversion: req.eversion.saturating_sub(1),
+                outcome: SCRUB_OUTCOME_ROT,
+                message: why.clone(),
+            });
+            return code_resp(CODE_CONTENT_CORRUPT, why.clone());
+        }
         self.ec_convert_inflight.insert(req.extent_id, ());
 
         let node = self.clone();
@@ -10394,6 +10413,19 @@ impl ExtentNode {
                     )
                         .into());
                 }
+                // Encoding makes these bytes canonical for the stripe and the
+                // conversion then drops every replica, so check them against
+                // what a scrub recorded, as they are read.
+                let ck_path = self
+                    .disk_for(entry.disk_id)
+                    .map_err(|e| (StatusCode::Internal, e))?
+                    .ck_path(extent_id);
+                let mut content_check = match compio::fs::read(&ck_path).await {
+                    Ok(raw) => extent_cksum::ExtentChecksums::decode(&raw, extent_id)
+                        .filter(|ck| ck.sealed_length == sealed_length)
+                        .map(extent_cksum::PieceCheck::new),
+                    Err(_) => None,
+                };
                 let mut s = 0usize;
                 while s < per_shard {
                     let stripe_len = (per_shard - s).min(stripe_bytes);
@@ -10404,12 +10436,14 @@ impl ExtentNode {
                     // is only `sealed_length` bytes), so a short read is filled
                     // with zeros — identical to `ec_encode`'s zero-fill.
                     let mut data_bufs: Vec<Vec<u8>> = Vec::with_capacity(data_shards);
+                    let mut read_ranges: Vec<(u64, usize)> = Vec::with_capacity(data_shards);
                     for i in 0..data_shards {
                         let start = i * per_shard + s;
                         let avail = (sealed_length as usize)
                             .saturating_sub(start)
                             .min(stripe_len);
                         let mut buf = vec![0u8; stripe_len];
+                        let mut got = 0usize;
                         if avail > 0 {
                             let read = file_pread_chunked(ecf.clone(), start as u64, avail)
                                 .await
@@ -10421,7 +10455,12 @@ impl ExtentNode {
                             })?;
                             let n = read.len().min(stripe_len);
                             buf[..n].copy_from_slice(&read[..n]);
+                            got = n.min(avail);
                         }
+                        // One entry per buffer. Only bytes actually read are
+                        // checked; a short read leaves its block incomplete,
+                        // not "rotted".
+                        read_ranges.push((start as u64, got));
                         data_bufs.push(buf);
                     }
 
@@ -10429,14 +10468,25 @@ impl ExtentNode {
                     // and hand it back alongside the parity so the fanout below
                     // doesn't re-clone the data stripes.
                     let pshards = parity_shards;
-                    let (data_bufs, parity): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+                    let block_bytes = content_check.as_ref().map(|c| c.block_bytes());
+                    let (data_bufs, parity, pieces): (Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<extent_cksum::Piece>) =
                         compio::runtime::spawn_blocking(
                             move || -> std::result::Result<_, String> {
                                 let refs: Vec<&[u8]> =
                                     data_bufs.iter().map(|v| v.as_slice()).collect();
                                 let parity = crate::erasure::ec_encode_stripe(&refs, pshards)
                                     .map_err(|e| e.to_string())?;
-                                Ok((data_bufs, parity))
+                                let pieces = match block_bytes {
+                                    Some(bb) => read_ranges
+                                        .iter()
+                                        .zip(&data_bufs)
+                                        .flat_map(|(&(at, n), buf)| {
+                                            extent_cksum::piece_crcs(bb, at, &buf[..n])
+                                        })
+                                        .collect(),
+                                    None => Vec::new(),
+                                };
+                                Ok((data_bufs, parity, pieces))
                             },
                         )
                         .await
@@ -10452,6 +10502,17 @@ impl ExtentNode {
                                 format!("ec_encode_stripe failed: {e}"),
                             )
                         })?;
+                    if let Some(check) = content_check.as_mut() {
+                        if let Err(block) = check.add(pieces) {
+                            let why = format!("block {block} of .dat differs from its checksum");
+                            tracing::error!(
+                                extent_id,
+                                block,
+                                "EC CONVERT FOUND CONTENT ROT — {why}; refusing to encode it"
+                            );
+                            return Err(EcConvertError::SourceRotted(why));
+                        }
+                    }
 
                     // Fan the stripe out: REMOTE shards (data 1..K, parity
                     // K..K+M) first, coordinator's own shard 0 LAST so that
@@ -10523,6 +10584,13 @@ impl ExtentNode {
                     );
                 }
 
+                if content_check.as_ref().is_some_and(|c| !c.complete()) {
+                    return Err((
+                        StatusCode::Internal,
+                        format!("extent {extent_id}: the encode did not cover every checksummed block"),
+                    )
+                        .into());
+                }
                 // Prepare finished for ALL nodes (the coordinator stages itself
                 // last). Stamp WHICH attempt produced this staging so a later
                 // re-dispatch can tell "my completed prepare" from "some other

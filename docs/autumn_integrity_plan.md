@@ -13,14 +13,14 @@ on the node that holds it.
 | partition WAL record | CRC32C including the value | replay | `crates/partition-server/src/wal_record.rs` |
 | partition SST block | CRC32C | every block read | `crates/partition-server/src/sstable/format.rs` |
 | stream `.meta` | CRC32C over its 48 metadata bytes | `parse_meta` | `crates/stream/src/extent_node.rs` |
-| sealed `.dat` (replica) | CRC32C per 1 MiB block, `extent-{id}.ck` | scrub only | `crates/stream/src/extent_node/scrub.rs` |
+| sealed `.dat` (replica) | CRC32C per 1 MiB block, `extent-{id}.ck` | scrub; the EC coordinator, on the copy it encodes | `crates/stream/src/extent_node/scrub.rs` |
 | sealed `.shard{i}` (EC) | CRC32C per 1 MiB block, `extent-{id}.shard{i}.ck` | scrub only | same |
 
-## The rule: the scrub shares nothing with the hot path
+## The rule: the hot path never touches a checksum
 
-Appends, reads, seals, EC conversion and repairs never compute, write or
-consult a checksum. The scrub is the only writer and the only reader of the
-sidecars. Every other choice follows from that:
+Appends, reads, seals and repairs never compute, write or consult a checksum.
+The scrub is the only writer of the sidecars; it and the EC coordinator are
+their only readers. Every other choice follows from that:
 
 - **No write path pays for integrity.** Content is hashed when it is scrubbed,
   not when it is written.
@@ -30,9 +30,19 @@ sidecars. Every other choice follows from that:
   already damaged before then are recorded as they are; a later scrub finds
   only what changed after the first. Scrubbing early is what keeps that window
   small — which is what the weekly policy is for.
-- **Recovery and conversion read unverified.** A rebuild copies, and a
-  conversion encodes, whatever its sources hold. A rotted source no scrub has
-  found yet is propagated. Once a scrub finds it the slot is dark, and no
+- **Recovery reads unverified; conversion does not.** A rebuild copies
+  whatever its source holds, so a rotted source no scrub has found yet is
+  propagated — but the other copies survive it. A conversion is different:
+  once its layout flips, reconcile drops every replica, and the encoded bytes,
+  parity included, are the only version left. So the coordinator checks the
+  `.dat` it encodes against its `.ck` as it reads it (`PieceCheck`: pieces read
+  shard by shard, combined per block with `crc32c_combine` — no second pass).
+  A mismatch fails the attempt; the re-dispatch is answered
+  `CODE_CONTENT_CORRUPT`, and the manager releases the marker and isolates that
+  copy (`release_rotted_ec_attempt`), so it is rebuilt before any conversion
+  (`acquire_extent_inflight` refuses an extent with a corrupt-marked slot). A
+  copy with no `.ck` is encoded unchecked: rot before the first scrub cannot be
+  told from content. Once a scrub finds rot the slot is dark, and no
   repair reads a dark slot: a replica copy chooses sources by the corrupt
   bitmap, and an EC rebuild skips dark slots (`ec_rebuild_source_slots`) —
   Reed-Solomon would turn one wrong input into a wrong output for every byte

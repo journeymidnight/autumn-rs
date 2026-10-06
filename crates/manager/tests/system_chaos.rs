@@ -3090,55 +3090,107 @@ struct RottedReplica {
     rotted: Vec<u8>,
 }
 
-impl RottedReplica {
-    /// Are the bytes this harness wrote still on disk?
-    ///
-    /// False once the node deletes the extent (GC reclaimed it) or rebuilds it
-    /// (recovery overwrote it) — in both cases nothing damaged is left to find,
-    /// and demanding the scrub report it anyway is demanding a finding about
-    /// bytes that no longer exist.
-    fn still_damaged(&self) -> bool {
-        let Ok(mut f) = std::fs::File::open(&self.dat_path) else {
-            return false;
-        };
-        let mut buf = vec![0u8; self.rotted.len()];
-        use std::io::Read;
-        f.read_exact(&mut buf).is_ok() && buf == self.rotted
-    }
+/// Do the first bytes of `path` still equal what the harness wrote?
+fn holds_rot(path: &Path, rotted: &[u8]) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut buf = vec![0u8; rotted.len()];
+    use std::io::Read;
+    f.read_exact(&mut buf).is_ok() && buf == rotted
 }
 
-/// Does the layout still say this node serves those bytes?
-///
-/// The question that separates "the extent legitimately went away" from "a
-/// member's replica changed underneath a layout that still points at it".
-/// `still_damaged() == false` alone cannot tell them apart — a missing file, a
-/// short file and rewritten bytes all look identical — and calling every one of
-/// them benign is how a real silent-loss shape would slip past as a note.
-async fn layout_still_serves(ctx: &NemesisCtx, r: &RottedReplica) -> bool {
-    let Ok(client) = autumn_etcd::EtcdClient::connect(&ctx.etcd_endpoint).await else {
-        // Cannot tell. Say "no": an unreachable etcd is the harness's problem,
-        // and manufacturing a data-loss accusation out of it is the false
-        // positive this whole rewrite exists to remove.
-        return false;
-    };
-    let Ok(resp) = client.get_prefix(&format!("extents/{}", r.extent_id)).await else {
-        return false;
-    };
-    for kv in &resp.kvs {
-        let ex = support::decode_persisted_extent(&String::from_utf8_lossy(&kv.key), &kv.value);
-        if ex.extent_id != r.extent_id {
-            continue;
-        }
-        let Some(slot) = ex.replicates.iter().position(|n| *n == r.node_id) else {
-            // No longer a holder: whatever is on that disk is an orphan nobody
-            // reads.
-            return false;
-        };
-        // A darkened slot IS the system having noticed — the layout has already
-        // stopped serving it and a rebuild is owed.
-        return ex.avali & (1u32 << slot) != 0;
+/// The injected bytes as they would sit at the head of `ex`'s payload file
+/// here: all of them in a `.dat`, at most one shard's worth in shard 0.
+fn rotted_prefix<'a>(r: &'a RottedReplica, ex: &MgrExtentInfo) -> &'a [u8] {
+    if !ex.ec_converted || ex.replicates.is_empty() {
+        return &r.rotted;
     }
-    false
+    let shard_len = ex.sealed_length.div_ceil(ex.replicates.len() as u64) as usize;
+    &r.rotted[..r.rotted.len().min(shard_len)]
+}
+
+async fn read_rotted_extents(
+    ctx: &NemesisCtx,
+    corrupted: &[RottedReplica],
+) -> Result<std::collections::HashMap<u64, MgrExtentInfo>, String> {
+    let client = autumn_etcd::EtcdClient::connect(&ctx.etcd_endpoint)
+        .await
+        .map_err(|e| format!("rot check: etcd connect: {e}"))?;
+    let resp = client.get_prefix("extents/").await.map_err(|e| format!("rot check: extents read: {e}"))?;
+    Ok(resp.kvs.iter()
+        .map(|kv| support::decode_persisted_extent(&String::from_utf8_lossy(&kv.key), &kv.value))
+        .filter(|ex| corrupted.iter().any(|r| r.extent_id == ex.extent_id))
+        .map(|ex| (ex.extent_id, ex))
+        .collect())
+}
+
+fn find_file_under(dirs: &[PathBuf], name: &str) -> Option<PathBuf> {
+    fn walk(dir: &Path, name: &str) -> Option<PathBuf> {
+        for entry in std::fs::read_dir(dir).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(found) = walk(&path, name) {
+                    return Some(found);
+                }
+            } else if path.file_name().is_some_and(|n| n == name) {
+                return Some(path);
+            }
+        }
+        None
+    }
+    dirs.iter().find_map(|dir| walk(dir, name))
+}
+
+/// Where the injected bytes would be served from now.
+///
+/// Replicated: the rotted `.dat` on its own node. EC: shard 0 is the first
+/// `per_shard` payload bytes verbatim, so offset 0 of the payload is the head
+/// of shard 0, held by the node in slot 0 — the damage is there if the
+/// conversion encoded from the rotted copy.
+struct RotSite {
+    node_id: u64,
+    log_path: PathBuf,
+    path: Option<PathBuf>,
+}
+
+fn rot_site(ctx: &NemesisCtx, r: &RottedReplica, ex: &MgrExtentInfo) -> Option<RotSite> {
+    if !ex.ec_converted {
+        return Some(RotSite {
+            node_id: r.node_id,
+            log_path: r.log_path.clone(),
+            path: Some(r.dat_path.clone()),
+        });
+    }
+    let holder = *ex.replicates.first()?;
+    let ens = ctx.ens.borrow();
+    let en = ens.iter().find(|e| e.node_id == holder)?;
+    Some(RotSite {
+        node_id: holder,
+        log_path: en.log_path.clone(),
+        path: find_file_under(&en.data_dirs, &format!("extent-{}.shard0", r.extent_id)),
+    })
+}
+
+/// Does the layout still route reads of this replicated extent to `node_id`?
+///
+/// A darkened slot IS the system having noticed — the layout has stopped
+/// serving it and a rebuild is owed.
+fn layout_serves(ex: &MgrExtentInfo, node_id: u64) -> bool {
+    ex.replicates
+        .iter()
+        .position(|n| *n == node_id)
+        .is_some_and(|slot| ex.avali & (1u32 << slot) != 0)
+}
+
+async fn op_record(ctx: &NemesisCtx, op_id: u64) -> Result<OpRecord, String> {
+    let resp = ctx
+        .mgr
+        .call(MSG_OP_QUERY, rkyv_encode(&OpQueryReq { op_id, ..Default::default() }))
+        .await
+        .map_err(|e| format!("op query rpc: {e}"))?;
+    let q: OpQueryResp = rkyv_decode(&resp).map_err(|e| format!("decode op query: {e}"))?;
+    q.ops.into_iter().next().ok_or_else(|| format!("op {op_id} not in the ledger"))
 }
 
 async fn verify_injected_rot_was_found(
@@ -3148,74 +3200,153 @@ async fn verify_injected_rot_was_found(
     if corrupted.is_empty() {
         return Vec::new();
     }
-    // Nothing looks at content unless asked: scrub every rotted extent, the
-    // way an operator (or the weekly policy) would. A refused submit is not a
-    // detection failure of the product, so it is only said, not asserted.
-    let mut extents: Vec<u64> = corrupted.iter().map(|r| r.extent_id).collect();
+    let mut accused = Vec::new();
+    let records = match read_rotted_extents(ctx, corrupted).await {
+        Ok(records) => records,
+        Err(e) => return vec![e],
+    };
+    // Nothing looks at content unless asked: scrub every rotted extent that
+    // still exists, the way an operator (or the weekly policy) would. A scrub
+    // naming a deleted extent is refused as a whole, so those are left out.
+    let mut extents: Vec<u64> = records.keys().copied().collect();
     extents.sort_unstable();
-    extents.dedup();
-    if let Err(e) = submit_scrub(ctx, extents).await {
-        eprintln!("chaos: could not submit the detection scrub: {e}");
+    let op_id = if extents.is_empty() {
+        None
+    } else {
+        match submit_scrub(ctx, extents).await {
+            Ok(id) => Some(id),
+            Err(e) => {
+                accused.push(format!("the detection scrub was not accepted: {e}"));
+                None
+            }
+        }
+    };
+    let mut pending: Vec<(&RottedReplica, Option<RotSite>)> = Vec::new();
+    for r in corrupted {
+        match records.get(&r.extent_id) {
+            Some(ex) => pending.push((r, rot_site(ctx, r, ex))),
+            None => eprintln!(
+                "chaos: extent {}'s rotted replica on node {} belongs to a deleted extent — \
+                 nothing left for the scrub to find, so this injection tested nothing",
+                r.extent_id, r.node_id
+            ),
+        }
     }
-    // Each node reads its copies at its own byte budget, so the time to a
-    // finding grows with how much it was asked to read. Cheap to be generous —
-    // the wait only runs to the end when the round is about to fail anyway.
+    // A finding comes from the node that rotted (before a conversion) or from
+    // the node now serving the bytes. Each node reads at its own byte budget,
+    // so the wait grows with what it was asked to read; it only runs to the end
+    // when the round is about to fail anyway.
+    let reported = |r: &RottedReplica, site: &Option<RotSite>| {
+        en_log_reports_rot(&r.log_path, r.extent_id)
+            || site.as_ref().is_some_and(|s| en_log_reports_rot(&s.log_path, r.extent_id))
+    };
     const WAIT: Duration = Duration::from_secs(180);
     let deadline = Instant::now() + WAIT;
-    let mut pending: Vec<RottedReplica> = corrupted.to_vec();
+    let mut finished = None;
     loop {
-        pending.retain(|r| !en_log_reports_rot(&r.log_path, r.extent_id));
-        if pending.is_empty() || Instant::now() >= deadline {
+        pending.retain(|(r, site)| !reported(r, site));
+        if let Some(id) = op_id {
+            match op_record(ctx, id).await {
+                Ok(op) if op.state != OP_STATE_PENDING && op.state != OP_STATE_RUNNING => {
+                    finished = Some(op);
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("chaos: detection scrub status: {e}"),
+            }
+        }
+        if pending.is_empty() || finished.is_some() || Instant::now() >= deadline {
             break;
         }
         compio::time::sleep(Duration::from_secs(2)).await;
     }
-    // Order matters: the log is consulted FIRST, above, so a node that reported
-    // the rot and then deleted the extent is already gone from `pending` and
-    // counts as found. What is left here is damage nobody reported — and some
-    // of it is damage that no longer exists.
-    let (unreported, vanished): (Vec<_>, Vec<_>) =
-        pending.into_iter().partition(|r| r.still_damaged());
-    // "The damage is gone" is only benign when the layout agrees the bytes are
-    // gone too. If the extent still exists, this node is still one of its
-    // replicas, and its slot is still marked available, then the manager is
-    // routing reads at a file that is missing, short, or no longer what was
-    // written — and no layer said a word.
-    let mut accused: Vec<String> = unreported
-        .iter()
-        .map(|r| {
-            format!(
+    // The node logs a finding before it reports the outcome, so after a
+    // terminal op one more look at the logs is final.
+    pending.retain(|(r, site)| !reported(r, site));
+    // The op's fate matters only for a copy nobody reported: did the scrub
+    // look at it at all?
+    if !pending.is_empty() {
+        match (&finished, op_id) {
+            (Some(op), _) if op.state == OP_STATE_FAILED => accused.push(format!(
+                "the detection scrub failed ({}), so the unreported copies were not checked",
+                op.error
+            )),
+            (Some(op), _) if op.state == OP_STATE_UNKNOWN => accused.push(
+                "the detection scrub's outcome is unknown (leader change?), so whether the \
+                 unreported copies were checked is unknown".to_string()
+            ),
+            (None, Some(id)) => accused.push(format!(
+                "the detection scrub (op {id}) did not finish within {}s", WAIT.as_secs()
+            )),
+            _ => {}
+        }
+    }
+    // Judge on the layout as it is now, not as it was before the wait.
+    let now = match read_rotted_extents(ctx, corrupted).await {
+        Ok(records) => records,
+        Err(e) => {
+            accused.push(e);
+            return accused;
+        }
+    };
+    // What the scrub said it skipped (an op in flight, a dark slot), so an
+    // accusation below reads against it.
+    let scrub_said = finished.as_ref().map_or(String::new(), |op| format!(" [scrub: {}]", op.message));
+    for (r, _) in pending {
+        let Some(ex) = now.get(&r.extent_id) else {
+            eprintln!(
+                "chaos: extent {}'s rotted replica on node {} belongs to an extent deleted during \
+                 the check — nothing left to find",
+                r.extent_id, r.node_id
+            );
+            continue;
+        };
+        let site = rot_site(ctx, r, ex);
+        let site_holds_rot = site.as_ref()
+            .and_then(|s| s.path.as_deref())
+            .is_some_and(|path| holds_rot(path, rotted_prefix(r, ex)));
+        if site_holds_rot && ex.ec_converted {
+            let holder = site.as_ref().map_or(0, |s| s.node_id);
+            accused.push(format!(
+                "extent {} was rotted on node {}, then EC-converted: the injected bytes are now \
+                 the head of shard 0 on node {holder}, parity agrees with them, and no scrub \
+                 reported them. The damage is canonical for the stripe{scrub_said}",
+                r.extent_id, r.node_id
+            ));
+        } else if site_holds_rot && layout_serves(ex, r.node_id) {
+            accused.push(format!(
                 "extent {}'s replica on node {} was rotted on disk, the damaged bytes are STILL \
                  THERE, and a scrub of it never reported them within {}s. Reads of it are \
-                 served from the damaged copy whenever the replica hash picks it",
-                r.extent_id,
-                r.node_id,
-                WAIT.as_secs()
-            )
-        })
-        .collect();
-    for r in vanished {
-        if layout_still_serves(ctx, &r).await {
+                 served from the damaged copy whenever the replica hash picks it{scrub_said}",
+                r.extent_id, r.node_id, WAIT.as_secs()
+            ));
+        } else if site_holds_rot {
+            eprintln!(
+                "chaos: extent {}'s rotted copy on node {} is no longer served (rebuilt elsewhere \
+                 or dark), so the scrub was never asked about it; reconcile collects it",
+                r.extent_id, r.node_id
+            );
+        } else if !ex.ec_converted && layout_serves(ex, r.node_id) {
+            // "The damage is gone" is only benign when the layout agrees the
+            // bytes are gone too.
             accused.push(format!(
                 "extent {}'s replica on node {} no longer holds the injected bytes, yet the \
                  layout still lists that node with its slot AVAILABLE and no layer said a word. \
                  The file is missing, short, or rewritten underneath a pointer that still names \
-                 it — which is a worse finding than the rot this injection was testing for",
+                 it — which is a worse finding than the rot this injection was testing for{scrub_said}",
                 r.extent_id, r.node_id
             ));
         } else {
             eprintln!(
-                "chaos: extent {}'s rotted replica on node {} was deleted or rebuilt before the \
-                 sweep reached it, and the layout agrees it is gone — nothing left for the scrub \
-                 to find, so this injection tested nothing",
+                "chaos: extent {}'s rotted replica on node {} was rebuilt, or EC-converted from \
+                 a clean copy, before the sweep reached it — nothing left for the scrub to find, \
+                 so this injection tested nothing",
                 r.extent_id, r.node_id
             );
         }
     }
     if accused.is_empty() {
         eprintln!(
-            "chaos: every rotted replica the layout still serves was found by its own node's \
-             scrub ({} injected)",
+            "chaos: every rotted copy still served was found by a scrub ({} injected)",
             corrupted.len()
         );
     }
@@ -3230,7 +3361,8 @@ async fn verify_injected_rot_was_found(
 /// extents for reasons having nothing to do with the damage. Measured doing
 /// exactly that — an injection that had been accidentally UNDONE still
 /// satisfied a ledger-based check, because a fence-driven rebuild of that
-/// extent was sitting in the ledger. Only the scrub writes this line.
+/// extent was sitting in the ledger. Only the scrub, and an EC coordinator
+/// checking the copy it encodes, write these lines.
 fn en_log_reports_rot(log_path: &Path, extent_id: u64) -> bool {
     let Ok(body) = std::fs::read_to_string(log_path) else {
         return false;
@@ -3243,7 +3375,8 @@ fn en_log_reports_rot(log_path: &Path, extent_id: u64) -> bool {
         // like the product not having noticed.
         let plain = strip_ansi(l);
         (plain.contains("SCRUB FOUND CONTENT ROT")
-            || plain.contains("SCRUB FOUND A TRUNCATED REPLICA"))
+            || plain.contains("SCRUB FOUND A TRUNCATED REPLICA")
+            || plain.contains("EC CONVERT FOUND CONTENT ROT"))
             && mentions_extent(&plain, extent_id)
     })
 }

@@ -3,13 +3,14 @@
 //!
 //! The stream layer stores opaque bytes and owns no format, so nothing else
 //! describes its content: `.meta`'s CRC32C covers its own 48 metadata bytes.
-//! The sidecar is written and read ONLY by the scrub (`extent_node/scrub.rs`);
-//! no read, write, seal, conversion or repair path consults it. It is
-//! content-only — it says nothing about which generation or layout is live —
-//! and describes exactly `sealed_length` bytes, which is how a sidecar left
-//! from other content is told apart.
+//! The scrub (`extent_node/scrub.rs`) writes and reads it; the EC coordinator
+//! also checks the `.dat` it encodes against it (`PieceCheck`), because the
+//! conversion is the last moment clean replicas exist. It is content-only — it
+//! says nothing about which generation or layout is live — and describes
+//! exactly `sealed_length` bytes, which is how a sidecar left from other
+//! content is told apart.
 
-use crc32c::crc32c;
+use crc32c::{crc32c, crc32c_combine};
 
 /// One checksummed unit.
 ///
@@ -121,6 +122,72 @@ impl ExtentChecksums {
     }
 }
 
+/// One read piece of a described file: its offset, length and CRC32C. A piece
+/// never crosses a block boundary.
+pub(crate) type Piece = (u64, u64, u32);
+
+/// Cut `buf`, read at `offset`, at block boundaries and checksum each piece.
+/// CPU only, so the caller can run it off the runtime thread.
+pub(crate) fn piece_crcs(block_bytes: u64, offset: u64, buf: &[u8]) -> Vec<Piece> {
+    let mut pieces = Vec::new();
+    let mut at = 0usize;
+    while at < buf.len() {
+        let start = offset + at as u64;
+        let room = (block_bytes - start % block_bytes) as usize;
+        let len = room.min(buf.len() - at);
+        pieces.push((start, len as u64, crc32c(&buf[at..at + len])));
+        at += len;
+    }
+    pieces
+}
+
+/// Checks a file against its recorded checksums from pieces read in any order,
+/// so a reader that walks the file out of order — the EC encoder reads it
+/// shard by shard — verifies it without a second pass. Each byte must arrive
+/// exactly once.
+pub(crate) struct PieceCheck {
+    ck: ExtentChecksums,
+    pending: std::collections::HashMap<usize, Vec<Piece>>,
+    verified: usize,
+}
+
+impl PieceCheck {
+    pub(crate) fn new(ck: ExtentChecksums) -> Self {
+        Self { ck, pending: std::collections::HashMap::new(), verified: 0 }
+    }
+
+    pub(crate) fn block_bytes(&self) -> u64 {
+        self.ck.block_bytes
+    }
+
+    /// Take pieces; `Err(block)` names the first completed block whose
+    /// content differs from its checksum.
+    pub(crate) fn add(&mut self, pieces: Vec<Piece>) -> Result<(), usize> {
+        for piece in pieces {
+            let block = (piece.0 / self.ck.block_bytes) as usize;
+            let (start, end) = block_range(block, self.ck.block_bytes, self.ck.sealed_length);
+            let parts = self.pending.entry(block).or_default();
+            parts.push(piece);
+            if parts.iter().map(|p| p.1).sum::<u64>() < end - start {
+                continue;
+            }
+            let mut parts = self.pending.remove(&block).unwrap_or_default();
+            parts.sort_unstable_by_key(|p| p.0);
+            let crc = parts[1..].iter().fold(parts[0].2, |crc, p| crc32c_combine(crc, p.2, p.1 as usize));
+            if self.ck.blocks.get(block) != Some(&crc) {
+                return Err(block);
+            }
+            self.verified += 1;
+        }
+        Ok(())
+    }
+
+    /// Was every block seen and found clean?
+    pub(crate) fn complete(&self) -> bool {
+        self.verified == self.ck.blocks.len() && self.pending.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +208,43 @@ mod tests {
             block_bytes,
             blocks,
         }
+    }
+
+    #[test]
+    fn pieces_read_out_of_order_verify_each_block_once_complete() {
+        let content: Vec<u8> = (0..10_000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let ck = checksums_over(&content, 1024);
+        let mut check = PieceCheck::new(ck);
+        // Two "shards" of 5000 bytes, read in stripes of 1500, shard-major per
+        // stripe — the EC encoder's order. Block 4 straddles the shard boundary.
+        for s in (0..5000).step_by(1500) {
+            for shard in 0..2 {
+                let start = shard * 5000 + s;
+                let end = (start + 1500).min(shard * 5000 + 5000);
+                let pieces = piece_crcs(check.block_bytes(), start as u64, &content[start..end]);
+                assert_eq!(check.add(pieces), Ok(()));
+            }
+        }
+        assert!(check.complete());
+    }
+
+    #[test]
+    fn a_rotted_piece_names_its_block() {
+        let content: Vec<u8> = (0..4096u32).map(|i| (i % 253) as u8).collect();
+        let mut check = PieceCheck::new(checksums_over(&content, 1024));
+        let mut rotted = content.clone();
+        rotted[2050] ^= 1;
+        assert_eq!(check.add(piece_crcs(1024, 0, &rotted[..2000])), Ok(()));
+        assert_eq!(check.add(piece_crcs(1024, 2000, &rotted[2000..])), Err(2));
+        assert!(!check.complete());
+    }
+
+    #[test]
+    fn a_missing_piece_is_not_complete() {
+        let content = vec![9u8; 3000];
+        let mut check = PieceCheck::new(checksums_over(&content, 1024));
+        assert_eq!(check.add(piece_crcs(1024, 0, &content[..2500])), Ok(()));
+        assert!(!check.complete());
     }
 
     #[test]

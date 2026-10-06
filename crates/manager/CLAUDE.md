@@ -783,7 +783,11 @@ marker on an extent with any corrupt-marked slot — the coordinator encodes fro
 its own copy whenever that copy is full length, and a marked copy is; the slot
 is rebuilt first and the conversion proposed again after. The cost: an extent
 whose marked slot has no rebuild target (RF = node count) cannot be converted
-until a node is added. The
+until a node is added. Rot nobody has reported is caught by the coordinator
+itself (stream CLAUDE.md, "The EC coordinator checks the `.dat` it encodes"):
+the dispatch answer `CODE_CONTENT_CORRUPT` makes `release_rotted_ec_attempt`
+abandon the marker, fail the op and isolate the coordinator's slot at once —
+isolation refuses while the marker stands, so this is the only moment it can. The
 already-isolated path re-drives `mark_slots_corrupt` when the slot is dark but
 unmarked — a slot isolated before isolation and mark shared a transaction can
 be in that shape.

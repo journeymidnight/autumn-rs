@@ -1,9 +1,10 @@
 //! Scrub: check sealed payload files against the checksums recorded for them,
 //! on the node that holds them, when asked.
 //!
-//! The scrub shares nothing with the hot path. Appends, reads, seals, EC
-//! conversion and repairs never compute, write or consult a checksum; the
-//! scrub is the only reader and the only writer of the `.ck` sidecars. What it
+//! The scrub shares nothing with the hot path. Appends, reads, seals and
+//! repairs never compute, write or consult a checksum; the scrub is the only
+//! writer of the `.ck` sidecars, and the EC coordinator their only other
+//! reader (it checks the `.dat` it encodes). What it
 //! costs is what it reads, paced on this node (`ScrubPacer`), and nothing but
 //! the request and the outcomes crosses the network.
 //!

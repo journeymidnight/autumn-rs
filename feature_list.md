@@ -14,12 +14,6 @@
 
 ## Active
 
-### BUG-CHAOS-ROT-THEN-EC — 被注入腐烂的副本随后被 EC 转换，chaos 的 corrupt 检查判"副本不再持有注入字节"
-- **Trigger** (2026-10-06，修 BUG-CHAOS-RECLAIM-RESIDUE 时全动作集 180 s 三个种子 23/7/101 全中): CorruptReplica 在某副本 `.dat` 偏移 0 写 64 字节，随后 EcConvert 恰好转换同一 extent（例：seed 23 extent 20 node 7；seed 101 extent 28 node 4），reconcile 回收转换前的 `.dat`，`inflight_errors` 报该节点槽位 AVAILABLE 却不再持有注入字节。per-key mismatches=0。2026-10-06 重设计已删 EC pre-encode 内容检查，所以腐烂字节可能被编码进 shard 后再由首次 scrub 记成 ck。
-- **Scope**: 查清 shard 是否带着腐烂字节、scrub 能否发现；据此判定是检查没跟上 EC 转换（修检查）还是腐烂经转换进 shard 未被发现（交用户定是否属已接受的"重建可从腐烂副本拷贝"同类限制）。
-- **Acceptance**: 结论有证据；全动作集多种子不再因此失败，且检查对真实"指针下文件被改写"仍报错。
-- `passes: false`
-
 ### F-PS-CORE-CAPACITY — 分区放置按 PS 核容量；允许超卖，manager 感知并按策略消解
 - **Trigger** (2026-09-29 用户讨论): `--cpuset` 下每个分区占 2 核（P-log + P-sst），PS 容量 = `cpuset_len/2`，但 manager 放置分区只看各 PS 的 region 数（`compute_region_for_partition`、`rebalance_regions`、`compute_rebalance_moves` 三处），完全不知道核容量。PS 侧预算门是硬拒：`sync_regions_once` 满了拒开（分区一直 `ps=unknown`），`handle_split_part` 满了拒 split，且检查的是父分区所在 PS，而右孩子由 manager 派到最少 region 的 PS，可能不是本机。超出核数的线程 `pick_cpu_for_ord` 返回 `None` 不绑核，继承进程掩码，可能跑出 cpuset 抢 EN/其他租户的核。
 - **设计定案（用户确认）**:

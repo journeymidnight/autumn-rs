@@ -194,11 +194,24 @@ NAME, so a shard staged for one index can never be *served* as another.
 
 ### At-rest integrity: scrub (`extent_node/scrub.rs`, `extent_cksum.rs`, `extent_scrub.rs`)
 
-**The scrub shares nothing with the hot path.** Appends, reads, seals, EC
-conversion and repairs never compute, write or consult a checksum; the scrub
-is the only writer and only reader of the sidecars, and it runs only when the
-manager asks (`MSG_SCRUB_EXTENTS`, from `autumn-op scrub` or the weekly
-policy). Design: `docs/autumn_integrity_plan.md`.
+**The hot path never touches a checksum.** Appends, reads, seals and repairs
+never compute, write or consult one; the scrub is the only writer of the
+sidecars, and it runs only when the manager asks (`MSG_SCRUB_EXTENTS`, from
+`autumn-op scrub` or the weekly policy). Design: `docs/autumn_integrity_plan.md`.
+
+**The EC coordinator checks the `.dat` it encodes.** After the layout flip
+every replica is dropped, so the encoded bytes become the only version. If the
+`.dat` has a `.ck` for exactly `sealed_length`, each stripe's read pieces are
+checksummed in the same `spawn_blocking` as the RS encode and fed to
+`extent_cksum::PieceCheck`, which combines them per block (`crc32c_combine`) in
+whatever order they arrive — the encoder reads shard by shard, so a block can
+span two shards. A mismatch logs `EC CONVERT FOUND CONTENT ROT` and fails the
+attempt (`EcConvertError::SourceRotted`) before any completion report; the
+re-dispatch of that attempt is answered `CODE_CONTENT_CORRUPT` without
+re-encoding, with a ROT `ScrubDone` (op 0) queued beside it — a backstop only
+when it reaches a `df` after the manager released the marker (before that,
+isolation answers Stale and an op-less finding is dropped, logged). An encode
+that did not cover every block (a short read) fails without a finding.
 
 **Sidecars** (`extent_cksum.rs`): `extent-{id}.ck` for a sealed `.dat`,
 `extent-{id}.shard{i}.ck` for a shard file — magic + extent_id + length +
