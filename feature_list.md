@@ -50,14 +50,6 @@
 - `passes: false`
 - **notes**: 两次 RPC 与 manager 保留旧 mode 已按代码核实；窗口内真实误派发尚未复现。本次 dashboard 迁移不改这个跨层契约。
 
-### F-REVIEW-R1-GC-COMPLETE-SCAN — P1 GC 完整扫描证明
-- **Trigger**: review.md R1；提前 EOF 或 record 边界短读可绕过 carry 检查并误 punch。
-- **Scope**: 每次读取必须满足 want，punch 前检查 sealed_length 和 carry。
-- **Acceptance**: 截短到 0/record 边界、有无 checksum 均拒绝 punch 或完整搬迁；重启逐字节验证 live VP。
-- `passes: true` (2026-10-05)
-- **notes** (2026-09-20): 已实现逐次 want 精确长度校验和 punch 前 sealed_length/carry 双重校验；5 条 GC streaming 单测通过，新增完整 record 边界及 offset=0 提前 EOF 回归。尚未完成真实双副本截短、checksum 两种状态及 PS 硬重启组合验收，不能按完整 R1 验收关闭。
-- **notes** (2026-10-05): 组合验收完成：`crates/manager/tests/system_gc_truncated_replica.rs`（真实 manager + 双 EN + 子进程 PS；两副本截短为空/record 边界/record 中间 × 有无 `.ck`；重启 EN 使其按截短文件应答短 OK；强制 GC 拒绝 punch；还原后 GC 完整搬迁并 punch；逐字节验证后 SIGKILL PS 重开再验）5 例通过。消融（短读 break + 去掉 `ensure_gc_scan_complete` 的两项检查）5 例全红于 “GC punched E0 from a truncated replica”。存活 EN 对截短 `.dat` 返回内部错误（按内存长度读），不是短 OK——只截文件不重启复现不了，测试因此重启 EN。无生产代码改动。
-
 ### F-REVIEW-T3-REAL-CRASH — P2 crash 测试真正停止旧 runtime
 - **Trigger**: review.md T3；drop RpcClient 不等于杀 PS/EN。
 - **Scope**: 改用可终止 runtime 或 SIGKILL 子进程并等待退出；compact/flush 用 durable/checkpoint barrier。
@@ -163,43 +155,6 @@
 - **Scope (when triggered)**: make the CORRECT layer (deploy/format, NOT the Rust EN process) default the shard count to cores when unset — entrypoint.sh: `AUTUMN_EXTENT_SHARDS` unset → `nproc` (clamped to a sane max); `autumn-op format` auto-derives `--shard-ports` from it; the k8s overlay generates the per-pod Service port list from the same value (kustomize can't loop → a small generator or documented N-port template). Keep the manual env as an explicit override. Rust EN stays config-driven (no `available_parallelism()` read in-process — the ports must match etcd, which only `format` knows). Cross-ref stream CLAUDE.md "serve_with_control is fail-stop … EN ports are FUNDAMENTALLY static".
 - **Acceptance**: a fresh deploy with no `AUTUMN_EXTENT_SHARDS` set brings up one shard per core, `format` registers the matching ports, the Service exposes them, and the manager routes to all shards; the manual env still overrides.
 - **Status**: `passes: false` (2026-07-13) — recorded for later per user. Deploy/format-layer change (entrypoint + format + overlay), NOT an EN-process change; the coupling chain above is the reason it's "manual by design" today, not a bug.
-
-### F-EN-WIRE-AUTH — EN wire 面无鉴权：破坏性 op（APPEND/DELETE/FENCE/…）对任何内网对端开放
-- **Trigger** (2026-09-27, 设计讨论: "安全的话，EN 最好也有 auth"): `data_plane_authz_design.md`
-  §9 只把 **client 直读旁路**（大值 `MSG_READ_BYTES` 直连 EN）记为明确接受（WON'T-DO），
-  但读旁路与破坏面来自同一事实：EN 不区分对端。client 通过一次 `GetRedirectResp`
-  descriptor 就合法拿到 `(en_addr, extent_id, eversion)`，之后在同一个裸连接上不仅能读，
-  还能发 `MSG_APPEND`（往别人的 extent 追加垃圾）、`MSG_COMMIT_LENGTH`（谎报长度）、
-  `MSG_DELETE_EXTENT` / `MSG_FENCE_EXTENT` / `MSG_ALLOC_EXTENT` / `MSG_COPY_EXTENT` /
-  `MSG_CONVERT_TO_EC` / `MSG_WRITE_SHARD`——一个流氓 client 能毁掉**所有租户**的数据完整性。
-  这是未在威胁模型里讨论过的面，比已接受的读旁路更值得先修。
-- **形状（已讨论）**: 不照搬 PS 的 tenant-prefix 模型——EN 的操作单位是 extent_id，
-  不租户可判定，且 extent 随 split/merge/GC 高频生灭，per-extent capability 会让 mint
-  频率与 token 尺寸崩掉。改为**按操作等级分两层，复用现有 Ed25519 keyring**：
-  (1) 破坏性/管理 op 要求"节点 token"——manager 在 PS/EN 注册时签发
-  `typ: "autumn.node.v1"` 的同族 token（复用 `cap_token.rs` 全套 codec，domain 分开），
-  EN 轮询现成 `MSG_GET_AUTHZ_CONFIG` 拿公钥，连接级验一次绑 principal，之后每请求零开销
-  （与 PS 的 AUTH_HELLO 同构；opt-in 同 PS：manager 不配 key 文件则全关）；
-  (2) 数据读保持开放（维持 WON'T-DO），最多做到"持任意有效 cap token 即可读"挡匿名
-  actor；**不做** per-extent 租户隔离（需 PS 持签名权或逐读 mint，改变信任模型，
-  可信内网前提下不值）。性能账：验签只在建连时一次（~几十 µs），数据面零新增。
-- **Scope**: (a) 先把"破坏性 op 无鉴权可达"补进 `data_plane_authz_design.md` 的威胁模型
-  节（读旁路已有记录，写/删面没有）；(b) 节点 token 的签发（manager）、分发（PS/EN
-  注册路径）、EN 侧连接级验证与 op 分级 gate；(c) EN 侧拒绝指标（复用 `AuthReject`
-  分类）；(d) 消融：去掉 gate 后一个未认证 client 能 APPEND/DELETE 成功。
-- **Acceptance**: 开启后未持节点 token 的连接发 `MSG_DELETE_EXTENT` / `MSG_APPEND` /
-  `MSG_FENCE_EXTENT` 等被拒且按类上报 metric；持 token 的 PS/manager 数据路径行为
-  逐字节不变（建连多一次验签，吞吐回归不劣化）；authz 未配置时行为与现状完全一致；
-  消融测试在无 gate 时变红。
-- **Status**: `passes: true` (2026-10-05) — 由另一机制满足，与上文"节点 token"形状不同：实际落地的是集群密钥
-  PEER_AUTH（Peer/Admin 连接须过 HMAC 挑战）加按角色的 `check_opcode`（EN 上 Client 角色只放行
-  `MSG_READ_BYTES` / `MSG_READ_BYTES_BULK` / `MSG_CLIENT_AUTH`），没有签发节点 token、没有 Ed25519 路径。
-  本次补齐验收所缺：`autumn_en_auth_rejects_total{class=opcode_denied|peer_auth|client_read|client_token}`
-  （仅拒绝路径计数，接受路径零新增）；进程内测试（Client 发 DELETE/FENCE/APPEND 被拒、extent 完好、计数递增）
-  与真实二进制测试（`crates/server/tests/cluster_secret.rs`，Client 发 DELETE_EXTENT、错密钥 Peer 被拒且计数）；
-  消融（EN 的 Client 角色放行全部已知 opcode）4 例变红；威胁模型已写入 `data_plane_authz_design.md`。
-  与原 Acceptance 的差异：“authz 未配置时行为与现状完全一致”不再字面成立——集群密钥是必选项，未带密钥的
-  Peer/Admin 连接被拒；“持节点 token 的 PS/manager”对应为持集群密钥的 PS/manager。
 
 ### BUG-KVC-POOLNAME-STR — `str(PoolName.KV)` 在 py≥3.11 得到 `'PoolName.KV'` 而非 `'kv'`
 - **Trigger** (2026-09-04, fable 评审 L3 接口解析改动时顺带发现，**在本次改动之外**):
