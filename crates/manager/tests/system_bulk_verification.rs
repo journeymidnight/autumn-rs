@@ -136,7 +136,7 @@ fn bulk_mixed_ops_split_restart_verify() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None, op_id: 0 }),
             )
             .await
             .expect("split");

@@ -254,6 +254,7 @@ fn manager_crash_during_split_state_consistent() {
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
                     part_id: 901,
                     at_key: None,
+                    op_id: 0,
                 }),
             )
             .await

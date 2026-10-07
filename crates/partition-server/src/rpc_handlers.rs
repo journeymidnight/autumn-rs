@@ -1699,12 +1699,49 @@ pub(crate) async fn handle_split_part(
     part_sc: &Rc<StreamClient>,
     pool: &Rc<ConnPool>,
     manager_addr: &str,
-    _owner_key: &str,
-    _revision: i64,
 ) -> HandlerResult {
     let req: SplitPartReq =
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    // Refused here, not on the maintenance gate: a queued second split would
+    // run after the first committed and cut the partition again.
+    let result = if part.borrow().split_pending.replace(true) {
+        Err((
+            StatusCode::FailedPrecondition,
+            "split already in progress on this partition".to_string(),
+        ))
+    } else {
+        let r = split_part(&req, part, part_sc, pool, manager_addr).await;
+        part.borrow().split_pending.set(false);
+        r
+    };
+    // A submitted split's failure also travels on the load report: the
+    // manager may have stopped waiting for this reply. Success needs no
+    // report — the manager closes the op when it commits the split.
+    if let (Err((_, error)), true) = (&result, req.op_id != 0) {
+        part.borrow()
+            .metrics
+            .push_maintenance_outcome(manager_rpc::MaintenanceOutcome {
+                op_id: req.op_id,
+                kind: manager_rpc::OP_KIND_SPLIT,
+                state: manager_rpc::OP_STATE_FAILED,
+                error: error.clone(),
+                message: String::new(),
+                finished_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            });
+    }
+    result
+}
 
+async fn split_part(
+    req: &SplitPartReq,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+    pool: &Rc<ConnPool>,
+    manager_addr: &str,
+) -> HandlerResult {
     if part.borrow().has_overlap.get() != 0 {
         return Err((
             StatusCode::FailedPrecondition,
@@ -1757,7 +1794,7 @@ pub(crate) async fn handle_split_part(
             // Owns an Arc and clears the slot on drop, so every exit below —
             // the three `?` through `unfreeze_on_err`, both barrier timeouts,
             // the TTL aborts — is covered without a list that goes stale.
-            crate::MaintenancePhaseGuard::new(p.metrics.clone()),
+            crate::MaintenancePhaseGuard::new(p.metrics.clone(), req.op_id),
         )
     };
     // Reported BEFORE the gate wait, because the gate is the first thing that
@@ -1912,18 +1949,11 @@ pub(crate) async fn handle_split_part(
     // handle_split_part runs on a spawned task (see MSG_SPLIT_PART in
     // handle_incoming_req) so its awaits don't block partition_loop.
     //
-    // Idempotency: if a previous split is already in flight on this
-    // partition, refuse. Same shape as the merge freeze's "already in
-    // progress" check.
+    // A second split on this partition was refused at entry
+    // (`split_pending`), so only a merge freeze can be in the way here.
     let (drain_tx, drain_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
     {
         let p = part.borrow();
-        if p.split_drain_ack.borrow().is_some() || p.frozen_for_split.get().is_some() {
-            return Err((
-                StatusCode::FailedPrecondition,
-                "split already in progress on this partition".to_string(),
-            ));
-        }
         if p.frozen_for_merge.get().is_some() {
             return Err((
                 StatusCode::FailedPrecondition,
@@ -1932,8 +1962,7 @@ pub(crate) async fn handle_split_part(
         }
         // Writes stop on this line and do not resume until the end of the
         // function — the window an operator most needs narrated.
-        p.metrics
-            .set_maintenance_phase(manager_rpc::OP_KIND_SPLIT, 2, SPLIT_PHASES);
+        phase.set(manager_rpc::OP_KIND_SPLIT, 2, SPLIT_PHASES);
         p.frozen_for_split.set(Some(std::time::Instant::now()));
         *p.split_drain_ack.borrow_mut() = Some(drain_tx);
         // fix — wake partition_loop so its idle-path
@@ -2209,6 +2238,7 @@ pub(crate) async fn handle_split_part(
             .multi_modify_split(
                 mid.clone(),
                 req.part_id,
+                req.op_id,
                 [log_end, row_end, meta_end],
                 [log_tail_eid, row_tail_eid, meta_tail_eid],
                 SPLIT_CALL_TIMEOUT,
@@ -2232,7 +2262,10 @@ pub(crate) async fn handle_split_part(
                 // values — every retry re-sends the same stale capture and
                 // gets the same refusal. Abort now; the client retries the
                 // whole split, whose fresh capture sees the rolled tails.
-                if split_err.contains("split captured tail moved") {
+                // So is a refusal of an op the manager has already ended.
+                if split_err.contains("split captured tail moved")
+                    || split_err.contains("refusing to commit it")
+                {
                     break;
                 }
                 compio::time::sleep(backoff).await;

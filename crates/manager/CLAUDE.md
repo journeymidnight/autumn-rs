@@ -306,7 +306,8 @@ unlink.
 ### `multi_modify_split`
 
 Atomically splits one partition into left + right:
-1. Validate owner epoch; validate `mid_key` inside the range; verify the
+1. Refuse an `op_id` the ledger has already ended (see "Async op-ledger");
+   validate owner epoch; validate `mid_key` inside the range; verify the
    request's captured tail extent ids still match each stream's CURRENT tail
    (refuse `split captured tail moved` otherwise — a roll that landed after
    the PS's capture would get the captured length stamped onto its fresh
@@ -1200,7 +1201,8 @@ dies silently. And **never add an unbounded await reachable from a loop**: etcd
 `unary_call` has no request deadline (`AUTUMN_ETCD_REQUEST_TIMEOUT_MS`, 10 s) and
 `ConnPool::get_or_connect`'s connect sits outside `call_timeout`
 (`AUTUMN_MGR_CONNECT_TIMEOUT_MS`, 5 s) — both are bounded; any new pool RPC must use
-`call_timeout`. Both are required: `catch_unwind` can't rescue a hung await; a bound
+`call_timeout` (or `connect_then_call`, the same bound with the connect failure
+kept apart). Both are required: `catch_unwind` can't rescue a hung await; a bound
 can't catch a panic.
 
 ## Policy engine (advisory)
@@ -1447,8 +1449,9 @@ failure reason the fire-and-forget maintenance ops used to drop.
   Surfaced as `autumn-op ops history [--kind K] [--since UNIX] [--limit N]`,
   rendered through the SAME formatter as `ops list` so an operator reads one
   format whether a record is live or historical.
-- **Terminal reporting split**: manager-orchestrated kinds (split/merge/rebalance)
-  close their entry in-process on return; **PS-executed kinds (compact/gc/forcegc)
+- **Terminal reporting split**: merge/rebalance close their entry in-process
+  on return; a split closes when its PS answers OR when its commit names it
+  (below); **PS-executed kinds (compact/gc/forcegc)
   stay Running and are closed by the load heartbeat** — the PS records a
   `MaintenanceOutcome{op_id,state,error}` in a small ring, piggybacks it on
   `PartitionLoad`, and `handle_report_partition_load` reconciles by op_id
@@ -1499,13 +1502,13 @@ failure reason the fire-and-forget maintenance ops used to drop.
   nor resurrect one the cap evicted. `record_maint_outcome` clears the sample at
   every terminal exit, so a finished op never shows as forever mid-flight.
 - **Two ways in, because not every executor knows the op id.** `update_progress`
-  is keyed by op id and is what gc/compact/forcegc use. `split` cannot: its
-  request carries only `part_id`, and adding an id would be an rkyv struct
-  change — a wire bump, `MIN == MAX`, stop-the-world — for a progress sample. So
-  split publishes `op_id: 0` (`PartitionMetrics::set_maintenance_phase`, which
-  is a separate setter precisely because the op-id one treats 0 as "PS-local,
-  nothing to update") and the manager routes those to
-  `update_progress_by_part(kind, part_id, secondary_id, ..)`. Same shape as
+  is keyed by op id: gc/compact/forcegc, and a submitted split
+  (`SplitPartReq.op_id`, wire 56). An untracked split (policy, presplit)
+  publishes `op_id: 0` (`PartitionMetrics::set_maintenance_phase`, a separate
+  setter and slot: the op-id one treats 0 as "PS-local, nothing to update",
+  and a compaction's sample must not overwrite a split queued behind it) and
+  the manager routes it to `update_progress_by_part(kind, part_id,
+  secondary_id, ..)`. Same shape as
   `update_progress_by_extent`, which exists for the same reason on the EN side.
   `merge` is orchestrated on the leader, so it calls that directly.
   Split/merge report **phases, not bytes**: their steps cost wildly different
@@ -1529,6 +1532,31 @@ failure reason the fire-and-forget maintenance ops used to drop.
   reconstructs RUNNING entries for BOTH EC-convert and recovery on promotion
   (their etcd markers survived and this leader keeps working them);
   compact/gc/forcegc are PS-local, so an old id honestly answers `Unknown`.
+- **A split whose reply is lost is not a failed split** (`split_op.rs`). The PS
+  runs the split on its own task; the manager's reply timeout (60 s) cancels
+  nothing, and recording FAILED there let a retry cut the partition again
+  while the first split still committed. So a timeout or a dropped connection
+  (`SplitReplyLost`, an error after the request was sent; a status answer or
+  a connect that failed is still a failure — `connect_then_call` keeps them
+  apart) leaves the op RUNNING in `unknown_splits` with "outcome unknown",
+  and a resubmit attaches to it. A fact ends it: the commit
+  (`handle_multi_modify_split` gets the op id and calls
+  `end_split_op_committed` with no await after the etcd commit) → SUCCEEDED;
+  the PS's failure on the load report → FAILED; the partition's owner epoch
+  moved since dispatch (the split can no longer pass `ensure_owner_epoch`) →
+  FAILED; no load report named the op for `SPLIT_SILENCE_SECS` (30 s; a
+  running split names it in every phase sample) → FAILED. The last two are
+  verdicts, and **the commit fence makes them true**: `handle_multi_modify_split`
+  refuses an op id the ledger has ended. None of them fires while
+  `split_inflight` holds the partition — a PS that gave up waiting on a slow
+  commit reports FAILED (and its reply says so) while that commit may still
+  land, so the actuation treats such a reply as unknown and the heartbeat
+  defers the report until the commit attempt is over. Whoever ends the op
+  audits it (`finish` returns whether this call ended it). Leader-local like
+  the ledger: after a failover the id is unknown and a late commit is accepted.
+  Tests: `tests/split_op_outcome.rs` (commit after the timeout → SUCCEEDED and
+  a retry attaches; failure after the timeout → the PS's reason; second split
+  refused at entry) and `split_op::tests`.
 - **`--wait`** is a pure client-side poll over `MSG_OP_QUERY` — one execution
   path, no divergent sync/async behavior. `MSG_OP_SUBMIT` is leader- + admin-gated
   (`is_admin_mgr_msg`); `MSG_OP_QUERY` is leader-gated (a follower's ledger is

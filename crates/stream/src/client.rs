@@ -6126,6 +6126,7 @@ impl StreamClient {
         &self,
         mid_key: Vec<u8>,
         part_id: u64,
+        op_id: u64,
         sealed_lengths: [u64; 3],
         tail_extent_ids: [u64; 3],
         timeout: Duration,
@@ -6141,6 +6142,7 @@ impl StreamClient {
             log_tail_extent_id: tail_extent_ids[0],
             row_tail_extent_id: tail_extent_ids[1],
             meta_tail_extent_id: tail_extent_ids[2],
+            op_id,
         });
         // Per-call timeout is caller-chosen (#6): the PS split path bounds it
         // SHORT so the whole freeze critical section stays under FREEZE_TTL —

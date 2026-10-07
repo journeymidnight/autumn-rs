@@ -1706,9 +1706,28 @@ each `MSG_READ_BYTES` under the frame's `payload_len: u32` ceiling.
 
 ## Partition Split
 
-`handle_split_part` runs inline on `partition_loop` (the P-log task) via
-`dispatch_partition_rpc`, so all partition-state mutations are single-writer on the
-partition thread.
+`handle_split_part` runs on a task spawned on the P-log runtime (its awaits
+would otherwise block `partition_loop`, which must run the drain), so all
+partition-state mutations stay on the partition thread.
+
+**One split per partition, refused at entry.** `split_pending` is set on the
+handler's first line and cleared at its return; a second split is answered
+`split already in progress` at once. Checked any later, it queued on the
+`maintenance_gate` behind the first and then cut the partition again, so a
+retry of a split whose reply was lost became a second split
+(`split_op_outcome.rs`, `a_second_split_on_a_partition_with_one_pending_is_refused`).
+
+**A submitted split reports its failure on the load heartbeat.**
+`SplitPartReq.op_id` (0 = untracked) rides into `multi_modify_split`, where the
+manager closes the op on commit. Every `Err` of a tracked split is also pushed
+to the outcome ring (`push_maintenance_outcome`, kind split), because the
+manager may have stopped waiting for the reply; success is not pushed, the
+commit already ended the op. The phase sample carries the op id too, which is
+how the manager knows a split it stopped waiting for is still running. It has
+its own slot (`PartitionMetrics::split_phase`): a split waits at phase 1 on the
+maintenance gate while a compaction or GC publishes and then clears the shared
+slot, and a submitted split left unreported for 30 s is judged not running
+(`a_split_queued_behind_a_maintenance_op_keeps_its_phase`).
 
 **It reports a phase on every load heartbeat** (`MaintenancePhaseGuard`, six
 phases; see the manager guide for why they are phases and not bytes). Two things
@@ -1747,7 +1766,9 @@ handle_split_part(req):
   6. mid_key = user_keys[len/2] (MEDIAN) or req.at_key (EXPLICIT)
   7. commit_length on each of {log, row, meta} stream
   8. multi_modify_split(mid_key, part_id, sealed_lengths) on manager
-       (up to 8 retries, backoff 100ms → 2s)
+       (retried with backoff 100ms → 2s until the freeze budget runs out;
+        stops at once on "split captured tail moved" or on the manager's
+        refusal of an op it has already ended)
   8b. Row-stream invalidate BARRIER to P-sst (see below), INSIDE the critical
        section BEFORE the manager seal; await the ACK. Then invalidate the log +
        meta stream workers (part_sc.invalidate_stream) — the manager sealed the old

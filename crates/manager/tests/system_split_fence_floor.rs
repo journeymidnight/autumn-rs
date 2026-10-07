@@ -97,7 +97,7 @@ fn a_wal_only_fence_bump_survives_a_split_and_a_restart() {
         let bytes = c
             .call(
                 MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&SplitPartReq { part_id: PART, at_key: Some(b"m".to_vec()) }),
+                partition_rpc::rkyv_encode(&SplitPartReq { part_id: PART, at_key: Some(b"m".to_vec()), op_id: 0 }),
             )
             .await
             .expect("split");

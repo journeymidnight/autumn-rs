@@ -403,6 +403,7 @@ fn lost_reply_split_yields_exactly_one_child() {
             log_tail_extent_id: 0,
             row_tail_extent_id: 0,
             meta_tail_extent_id: 0,
+            op_id: 0,
         });
         let (resp_bytes, attempts) =
             call_with_lost_reply_retry(front, MSG_MULTI_MODIFY_SPLIT, payload, 12).await;
@@ -467,6 +468,7 @@ fn concurrent_duplicate_split_yields_exactly_one_child() {
             log_tail_extent_id: 0,
             row_tail_extent_id: 0,
             meta_tail_extent_id: 0,
+            op_id: 0,
         });
 
         // Two independent connections, both firing the identical split.

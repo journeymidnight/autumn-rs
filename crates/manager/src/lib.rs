@@ -23,6 +23,7 @@ mod recovery;
 mod recovery_attempt;
 pub mod recovery_rate_limiter;
 mod rpc_handlers;
+mod split_op;
 pub(crate) mod store;
 /// Test-only merge-freeze failpoint (always 0 in production); see its doc in
 /// `rpc_handlers`. Re-exported so integration tests can arm it.
@@ -549,10 +550,27 @@ impl ConnPool {
         payload: Bytes,
         timeout: std::time::Duration,
     ) -> Result<Bytes> {
+        self.connect_then_call(addr, msg_type, payload, timeout)
+            .await?
+            .map_err(anyhow::Error::new)
+    }
+
+    /// `call_timeout` that keeps the two failures apart: `Err` = no connection,
+    /// nothing was sent; `Ok(Err)` = the call itself failed.
+    async fn connect_then_call(
+        &self,
+        addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: std::time::Duration,
+    ) -> Result<autumn_rpc::Result<Bytes>> {
         let sock = parse_addr(addr)?;
         let client = self.get_or_connect(sock).await?;
         let result = client.call_timeout(msg_type, payload, timeout).await;
-        self.settle(sock, result)
+        if matches!(&result, Err(e) if e.is_connection_error()) {
+            self.conns.borrow_mut().remove(&sock);
+        }
+        Ok(result)
     }
 
     async fn get_or_connect(&self, addr: SocketAddr) -> Result<Rc<autumn_rpc::client::RpcClient>> {
@@ -663,6 +681,12 @@ pub struct AutumnManager {
     /// caller reaches the setter. A by-value cell would leave the setter with no
     /// effect at all.
     sealed_empty_sweep_interval: Rc<Cell<Duration>>,
+    /// How long a submitted split waits for the PS's reply. Past it the
+    /// outcome is unknown, not failed. Tests shorten it.
+    split_reply_timeout: Rc<Cell<Duration>>,
+    /// Submitted splits whose reply was lost, by op id (`split_op.rs`).
+    /// Leader-local like the ledger.
+    pub(crate) unknown_splits: Rc<RefCell<HashMap<u64, crate::split_op::UnknownSplit>>>,
     /// Consecutive failed EC conversion attempts, per extent.
     ///
     /// A conversion whose PARTICIPANT is unreachable fails identically forever:
@@ -1098,6 +1122,8 @@ impl AutumnManager {
             sealed_empty_sweep_interval: Rc::new(Cell::new(
                 crate::extent_delete::SEALED_EMPTY_SWEEP_INTERVAL_DEFAULT,
             )),
+            split_reply_timeout: Rc::new(Cell::new(Duration::from_secs(60))),
+            unknown_splits: Rc::new(RefCell::new(HashMap::new())),
             ec_consecutive_failures: Rc::new(RefCell::new(HashMap::new())),
             etcd: None,
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
@@ -1263,6 +1289,11 @@ impl AutumnManager {
             .set(every.max(Duration::from_secs(1)));
     }
 
+    /// See the field.
+    pub fn set_split_reply_timeout(&self, t: Duration) {
+        self.split_reply_timeout.set(t);
+    }
+
     pub async fn force_auto_split(&self, part_id: u64) -> Result<()> {
         let state = (*self.store.inner.borrow()).clone();
         let cand = autumn_rpc::manager_rpc::PolicyCandidate {
@@ -1276,7 +1307,7 @@ impl AutumnManager {
             same_ps: true,
             last_op_at: 0,
         };
-        self.auto_dispatch_split(&cand, None, &state).await
+        self.auto_dispatch_split(&cand, None, 0, &state).await
     }
 
     /// test helper: orchestrate a MERGE for (survivor, victim) as
@@ -1544,6 +1575,7 @@ impl AutumnManager {
             // `ops status` honest instead of RUNNING forever.
             self.ops.borrow_mut().sweep_running_ttl(Self::epoch_seconds());
             self.sweep_silent_scrub_ops(Self::epoch_seconds());
+            self.reconcile_unknown_splits(Self::epoch_seconds()).await;
             // Backstop drain: kinds no PS reports (recovery, ec-convert) close
             // outside the load heartbeat, so without this their history would
             // wait for unrelated PS traffic.
@@ -1966,7 +1998,7 @@ impl AutumnManager {
         state: &crate::store::MetadataState,
     ) -> Result<()> {
         match cand.kind {
-            POLICY_KIND_SPLIT => self.auto_dispatch_split(cand, None, state).await,
+            POLICY_KIND_SPLIT => self.auto_dispatch_split(cand, None, 0, state).await,
             POLICY_KIND_MERGE => {
                 let req = MergePartitionsReq {
                     survivor_part_id: cand.primary_part_id,
@@ -2118,9 +2150,14 @@ impl AutumnManager {
                 error,
                 message,
             } => {
-                self.ops
+                let ended = self
+                    .ops
                     .borrow_mut()
                     .finish(op_id, state, error.clone(), message.clone(), now_s);
+                // A split's commit ends its op itself, and reports it.
+                if !ended {
+                    return;
+                }
                 // Say what happened in the LEADER'S LOG too. The outcome already
                 // reaches the ledger (queryable), the audit trail and the durable
                 // op history — but none of those is what an operator tailing
@@ -2202,8 +2239,9 @@ impl AutumnManager {
                     same_ps: false,
                     last_op_at: 0,
                 };
+                let owner_epoch = crate::split_op::owner_epoch_of(state, spec.part_id);
                 match self
-                    .auto_dispatch_split(&cand, spec.at_key.clone(), state)
+                    .auto_dispatch_split(&cand, spec.at_key.clone(), op_id, state)
                     .await
                 {
                     Ok(()) => ActuationResult::Terminal {
@@ -2225,6 +2263,25 @@ impl AutumnManager {
                         // this op.)
                         message: format!("split part {} in two", spec.part_id),
                     },
+                    // No reply is not a failure: the PS's split runs on.
+                    // Neither is a refusal while a commit for this partition
+                    // is in flight — the PS gave up waiting on that commit,
+                    // which may still land.
+                    Err(e)
+                        if e.is::<crate::split_op::SplitReplyLost>()
+                            || self.split_inflight.borrow().contains(&spec.part_id) =>
+                    {
+                        let message = self.split_outcome_unknown(
+                            op_id,
+                            spec.part_id,
+                            owner_epoch,
+                            &format!("{e:#}"),
+                            Self::now_s_ms().0,
+                        );
+                        ActuationResult::Dispatched {
+                            message: message.unwrap_or_default(),
+                        }
+                    }
                     Err(e) => terminal_err(format!("{e:#}")),
                 }
             }
@@ -2524,6 +2581,8 @@ impl AutumnManager {
         // overrides the declared-boundary snap and is used verbatim; `None` keeps
         // the controller's snap-to-declared-boundary-else-PS-median behavior.
         explicit_at_key: Option<Vec<u8>>,
+        // The ledger op this serves; 0 = untracked (policy, tests).
+        op_id: u64,
         state: &crate::store::MetadataState,
     ) -> Result<()> {
         // Look up the owning PS via regions + ps_nodes.
@@ -2572,21 +2631,28 @@ impl AutumnManager {
                 // down to one), so fall back to PS median selection — at that
                 // point an intra-lane cut is exactly what's wanted.
                 at_key,
+                op_id,
             });
         // 60 s — split has to flush memtable + commit_length × 3 + a
-        // manager round-trip. PS-side flush can take a few seconds
-        // under contention, but anything > 60 s is a real wedge worth
-        // surfacing (auto-split policy will retry on the next tick).
+        // manager round-trip. Past it the outcome is unknown, not failed: the
+        // PS keeps running the split (`split_op.rs`). Only a status answer is
+        // the PS's own verdict.
         let resp_bytes = self
             .conn_pool
-            .call_timeout(
+            .connect_then_call(
                 &ps_addr,
                 autumn_rpc::partition_rpc::MSG_SPLIT_PART,
                 payload,
-                Duration::from_secs(60),
+                self.split_reply_timeout.get(),
             )
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .await?
+            .map_err(|e| match e {
+                // The PS's own answer.
+                autumn_rpc::RpcError::Status { .. }
+                | autumn_rpc::RpcError::VersionMismatch { .. } => anyhow::anyhow!("{e}"),
+                // Sent, and no answer: timeout, dropped connection, bad frame.
+                _ => anyhow::Error::new(crate::split_op::SplitReplyLost(e.to_string())),
+            })?;
         let resp: autumn_rpc::partition_rpc::SplitPartResp =
             autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -8182,6 +8248,7 @@ mod tests {
             log_tail_extent_id: 0,
             row_tail_extent_id: 0,
             meta_tail_extent_id: 0,
+            op_id: 0,
             });
             let resp = m.handle_multi_modify_split(req).await.unwrap();
             let r: CodeResp = rkyv_decode(&resp).unwrap();
@@ -9866,6 +9933,7 @@ mod tests {
             log_tail_extent_id: 0,
             row_tail_extent_id: 0,
             meta_tail_extent_id: 0,
+            op_id: 0,
             });
             let resp = m.handle_multi_modify_split(req).await.unwrap();
             let r: CodeResp = rkyv_decode(&resp).unwrap();

@@ -5122,7 +5122,7 @@ impl ClusterClient {
         self.call_ps_for_part(
             part_id,
             MSG_SPLIT_PART,
-            rkyv_encode(&SplitPartReq { part_id, at_key }),
+            rkyv_encode(&SplitPartReq { part_id, at_key, op_id: 0 }),
         )
         .await?;
         Ok(())

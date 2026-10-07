@@ -36,7 +36,7 @@ async fn split_verdict(ps: &RpcClient, part_id: u64) -> String {
     match ps
         .call(
             partition_rpc::MSG_SPLIT_PART,
-            partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id, at_key: None }),
+            partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id, at_key: None, op_id: 0 }),
         )
         .await
     {

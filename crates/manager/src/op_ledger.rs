@@ -159,6 +159,8 @@ impl OpLedger {
 
     /// Move a known, still-active op to a terminal state. No-op if the op is gone
     /// (evicted) or already terminal (idempotent — heartbeat outcomes retransmit).
+    /// Returns whether this call ended the op (it was active), so the caller
+    /// reports the end exactly once.
     pub(crate) fn finish(
         &mut self,
         op_id: u64,
@@ -166,7 +168,7 @@ impl OpLedger {
         error: String,
         message: String,
         now_s: i64,
-    ) {
+    ) -> bool {
         let mut went_terminal = false;
         if let Some(e) = self.find_mut(op_id) {
             if Self::is_active(e.state) {
@@ -197,6 +199,27 @@ impl OpLedger {
         if went_terminal {
             self.queue_terminal(op_id);
         }
+        went_terminal
+    }
+
+    pub(crate) fn is_active_op(&self, op_id: u64) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.op_id == op_id && Self::is_active(e.state))
+    }
+
+    /// The state of an op this ledger knows and has ended; `None` while it is
+    /// active or when it is not here (evicted, or submitted to another leader).
+    pub(crate) fn ended_state(&self, op_id: u64) -> Option<u8> {
+        self.entries
+            .iter()
+            .find(|e| e.op_id == op_id)
+            .map(|e| e.state)
+            .filter(|s| !Self::is_active(*s))
+    }
+
+    pub(crate) fn record(&self, op_id: u64) -> Option<OpRecord> {
+        self.entries.iter().find(|e| e.op_id == op_id).cloned()
     }
 
     /// Reconcile a PS-reported terminal maintenance outcome. Returns `true` iff
@@ -597,13 +620,9 @@ impl OpLedger {
     /// Apply a progress sample for a PARTITION-scoped op the PS is executing
     /// (split / merge).
     ///
-    /// Keyed by partition for the same reason `update_progress_by_extent` is
-    /// keyed by extent: the executor never learns the manager's op id.
-    /// `SplitPartReq` carries only `part_id` and an optional split key, and
-    /// adding an id to it would be an rkyv struct change — a wire bump, and
-    /// with `MIN == MAX` that is a stop-the-world rollout for a progress
-    /// sample. The sample arrives inside a `PartitionLoad`, so the partition is
-    /// already known; that is enough to find the entry.
+    /// Keyed by partition for an executor that does not know the op id: a
+    /// split sent with `op_id: 0`, and the merge the leader orchestrates. The
+    /// partition is known from the `PartitionLoad` or the orchestrator.
     ///
     /// Only a RUNNING entry is touched, so a sample that overtakes the op's
     /// completion cannot re-animate a terminal record.

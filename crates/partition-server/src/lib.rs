@@ -1443,6 +1443,10 @@ pub(crate) struct PartitionData {
     /// past the captured `commit_length` — those bytes existed on EN disk
     /// past sealed_length and were invisible on recovery.
     pub(crate) frozen_for_split: Cell<Option<std::time::Instant>>,
+    /// A split handler is running on this partition, from its first line to
+    /// its return. A second split is refused at once instead of queueing on
+    /// the maintenance gate and cutting the partition again after the first.
+    pub(crate) split_pending: Cell<bool>,
     /// internal oneshot signal from `partition_loop` to
     /// the spawned `handle_split_part` task — fired after drain completes.
     /// Payload is `Result<(), String>`: `Ok(())` = drain succeeded,
@@ -1717,6 +1721,11 @@ pub struct PartitionMetrics {
     /// worthless once superseded, and the merged GC/compaction loop runs one op
     /// at a time by construction.
     pub maintenance_progress: parking_lot::Mutex<Option<manager_rpc::MaintenanceProgress>>,
+    /// The running split's phase. Its own slot: a split waits at phase 1 on
+    /// the maintenance gate while a compaction or GC reports and clears the
+    /// slot above, and a submitted split that goes unreported is judged not
+    /// running by the manager.
+    pub split_phase: parking_lot::Mutex<Option<manager_rpc::MaintenanceProgress>>,
 }
 
 /// Max terminal maintenance outcomes buffered for the heartbeat. Small — each
@@ -1748,23 +1757,21 @@ impl PartitionMetrics {
         });
     }
 
-    /// Publish which PHASE a manager-orchestrated partition op (split / merge)
-    /// has reached.
+    /// Publish which PHASE the split has reached.
     ///
-    /// Deliberately reports `op_id: 0`, which `set_maintenance_progress` above
-    /// refuses: these ops do not know the manager's id for themselves, because
-    /// `SplitPartReq` has no field carrying one and adding it would be an rkyv
-    /// wire bump — a stop-the-world rollout, for a progress sample. The manager
-    /// matches on (kind, part_id) instead; the sample rides inside a
-    /// `PartitionLoad`, so it already knows the partition.
+    /// Unlike `set_maintenance_progress`, `op_id: 0` is published too: an
+    /// untracked split (policy, presplit) carries none, and the manager
+    /// matches it on (kind, part_id). A submitted split's id also tells the
+    /// manager the split is still running after it stopped waiting for the
+    /// reply.
     ///
     /// Phases, not bytes. Split's steps cost wildly different amounts — the
     /// flush dominates — so a byte counter sits still through the expensive one
     /// and reads as a hang, which is the exact confusion this is here to end.
     /// A phase index says "still flushing", and that is the true answer.
-    pub fn set_maintenance_phase(&self, kind: u8, phase: u64, phases: u64) {
-        *self.maintenance_progress.lock() = Some(manager_rpc::MaintenanceProgress {
-            op_id: 0,
+    pub fn set_maintenance_phase(&self, op_id: u64, kind: u8, phase: u64, phases: u64) {
+        *self.split_phase.lock() = Some(manager_rpc::MaintenanceProgress {
+            op_id,
             kind,
             done: phase,
             total: phases,
@@ -1778,9 +1785,15 @@ impl PartitionMetrics {
         *self.maintenance_progress.lock() = None;
     }
 
-    /// Snapshot the live progress sample for the heartbeat.
+    pub fn clear_split_phase(&self) {
+        *self.split_phase.lock() = None;
+    }
+
+    /// Snapshot the live progress samples for the heartbeat.
     pub fn snapshot_maintenance_progress(&self) -> Vec<manager_rpc::MaintenanceProgress> {
-        self.maintenance_progress.lock().iter().cloned().collect()
+        let mut v: Vec<_> = self.maintenance_progress.lock().iter().cloned().collect();
+        v.extend(self.split_phase.lock().iter().cloned());
+        v
     }
 
     /// Snapshot (copy, not drain) the ring for the heartbeat — idempotent
@@ -1809,20 +1822,22 @@ pub struct MaintenancePhaseGuard {
     // single-threaded executor the first time anything else touched the
     // partition.
     metrics: std::sync::Arc<PartitionMetrics>,
+    op_id: u64,
 }
 
 impl MaintenancePhaseGuard {
-    pub fn new(metrics: std::sync::Arc<PartitionMetrics>) -> Self {
-        Self { metrics }
+    pub fn new(metrics: std::sync::Arc<PartitionMetrics>, op_id: u64) -> Self {
+        Self { metrics, op_id }
     }
     pub fn set(&self, kind: u8, phase: u64, phases: u64) {
-        self.metrics.set_maintenance_phase(kind, phase, phases);
+        self.metrics
+            .set_maintenance_phase(self.op_id, kind, phase, phases);
     }
 }
 
 impl Drop for MaintenancePhaseGuard {
     fn drop(&mut self) {
-        self.metrics.clear_maintenance_progress();
+        self.metrics.clear_split_phase();
     }
 }
 
@@ -6643,6 +6658,7 @@ async fn partition_thread_main(
         frozen_for_merge: Cell::new(None),
         freeze_drain_ack: std::cell::RefCell::new(None),
         frozen_for_split: Cell::new(None),
+        split_pending: Cell::new(false),
         split_drain_ack: std::cell::RefCell::new(None),
         metrics: metrics_arc.clone(),
         opened_with_shared: opened_with_shared.clone(),
@@ -8216,8 +8232,6 @@ async fn handle_incoming_req(
             let part_sc_c = routing.part_sc.clone();
             let pool_c = routing.pool.clone();
             let manager_addr_c = routing.manager_addr.clone();
-            let owner_key_c = routing.owner_key.clone();
-            let revision_c = routing.owner_epoch;
             let payload = req.payload;
             let resp_tx = req.resp_tx;
             compio::runtime::spawn(async move {
@@ -8227,8 +8241,6 @@ async fn handle_incoming_req(
                     &part_sc_c,
                     &pool_c,
                     &manager_addr_c,
-                    &owner_key_c,
-                    revision_c,
                 )
                 .await;
                 let _ = resp_tx.send(result);
@@ -14935,7 +14947,7 @@ mod maintenance_phase_tests {
     fn the_phase_slot_is_cleared_however_the_split_exits() {
         let m = std::sync::Arc::new(PartitionMetrics::default());
         {
-            let g = MaintenancePhaseGuard::new(m.clone());
+            let g = MaintenancePhaseGuard::new(m.clone(), 0);
             g.set(autumn_rpc::manager_rpc::OP_KIND_SPLIT, 2, 6);
             assert_eq!(
                 m.snapshot_maintenance_progress().len(),
@@ -14953,14 +14965,30 @@ mod maintenance_phase_tests {
     }
 
     #[test]
-    fn a_phase_carries_no_op_id_because_the_split_never_learns_one() {
-        // `SplitPartReq` has no field for it, and adding one would be an rkyv
-        // wire bump. The manager matches on (kind, part_id) instead.
+    fn a_split_queued_behind_a_maintenance_op_keeps_its_phase() {
+        // The split waits at phase 1 on the maintenance gate while a submitted
+        // compaction reports and ends. The manager must still hear the split,
+        // or it judges it not running.
         let m = std::sync::Arc::new(PartitionMetrics::default());
-        let g = MaintenancePhaseGuard::new(m.clone());
+        let g = MaintenancePhaseGuard::new(m.clone(), 77);
+        g.set(autumn_rpc::manager_rpc::OP_KIND_SPLIT, 1, 6);
+        m.set_maintenance_progress(9, autumn_rpc::manager_rpc::OP_KIND_COMPACT, 1, 4);
+        assert_eq!(m.snapshot_maintenance_progress().len(), 2);
+        m.clear_maintenance_progress();
+        let s = m.snapshot_maintenance_progress();
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].op_id, s[0].done), (77, 1));
+    }
+
+    #[test]
+    fn a_phase_carries_the_split_s_op_id() {
+        // The manager reads it as "this split is still running" once it has
+        // stopped waiting for the reply.
+        let m = std::sync::Arc::new(PartitionMetrics::default());
+        let g = MaintenancePhaseGuard::new(m.clone(), 77);
         g.set(autumn_rpc::manager_rpc::OP_KIND_SPLIT, 1, 6);
         let s = m.snapshot_maintenance_progress();
-        assert_eq!(s[0].op_id, 0);
+        assert_eq!(s[0].op_id, 77);
         assert_eq!(s[0].kind, autumn_rpc::manager_rpc::OP_KIND_SPLIT);
         assert_eq!((s[0].done, s[0].total), (1, 6));
     }

@@ -129,6 +129,7 @@ fn gc_relocation_must_not_shadow_inflight_wal_put() {
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
                     part_id: 901,
                     at_key: Some(b"n".to_vec()),
+                    op_id: 0,
                 }),
             )
             .await

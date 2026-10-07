@@ -98,6 +98,7 @@ fn split_compact_preserves_gallery_originals_on_rightmost_child() {
                     partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
                         part_id: current_part,
                         at_key: None,
+                        op_id: 0,
                     }),
                 )
                 .await
@@ -187,7 +188,7 @@ fn single_split_compact_preserves_gallery_originals_on_right_child() {
         let resp = ps
             .call(
                 partition_rpc::MSG_SPLIT_PART,
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None }),
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None, op_id: 0 }),
             )
             .await
             .expect("split partition");
@@ -265,7 +266,7 @@ fn two_split_compact_preserves_gallery_originals_on_rightmost_descendant() {
                 router.client_for(current).await
             };
             let split_req =
-                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: current, at_key: None });
+                partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: current, at_key: None, op_id: 0 });
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
             let resp = loop {
                 match client

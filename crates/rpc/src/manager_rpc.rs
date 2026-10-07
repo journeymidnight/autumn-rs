@@ -758,6 +758,10 @@ pub struct MultiModifySplitReq {
     pub log_tail_extent_id: u64,
     pub row_tail_extent_id: u64,
     pub meta_tail_extent_id: u64,
+    /// The ledger op the split serves (`SplitPartReq.op_id`); 0 = untracked.
+    /// The manager closes it on commit and refuses to commit one it has
+    /// already ended.
+    pub op_id: u64,
 }
 
 // Response: CodeResp
@@ -1239,9 +1243,8 @@ pub struct PartitionLoad {
     /// ones it doesn't know. Empty in the common (untracked / no recent op) case.
     pub maintenance_outcomes: Vec<MaintenanceOutcome>,
     /// Latest progress sample for whatever maintenance op this partition is
-    /// running now. Empty when idle. At most one entry today — the merged
-    /// GC/compaction loop runs one at a time by construction — but carried as a
-    /// list so a second concurrent kind would not need a wire change.
+    /// running now. Empty when idle. At most two: the merged GC/compaction
+    /// loop runs one at a time, and a split waiting for it reports its own.
     pub active_maintenance: Vec<MaintenanceProgress>,
 }
 

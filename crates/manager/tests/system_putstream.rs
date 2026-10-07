@@ -553,6 +553,7 @@ fn get_many_recovers_from_a_stale_epoch_after_a_split() {
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
                     part_id: 12501,
                     at_key: None,
+                    op_id: 0,
                 }),
             )
             .await

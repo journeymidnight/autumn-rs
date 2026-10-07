@@ -197,8 +197,9 @@ autumn-op gc 7 --wait --timeout 300         # block until terminal; non-zero exi
 - **`--wait [--timeout SECS]`** (global, default 600) blocks until the op reaches
   a terminal state and exits on its real outcome — for scripts (and `presplit`
   internally) that need the blocking error. Without it, poll `ops status`.
-- **Where outcomes come from**: split/merge/rebalance close in-process on the
-  leader; compact/gc/forcegc run on the PS and report their terminal outcome +
+- **Where outcomes come from**: merge/rebalance close in-process on the
+  leader; a split closes on its PS's reply or on its commit (see "A split whose
+  reply did not arrive" below); compact/gc/forcegc run on the PS and report their terminal outcome +
   error back on the 5 s load heartbeat (so terminal state appears within
   ~5–10 s); ec-convert closes when the conversion applies.
 
@@ -229,9 +230,31 @@ through them reads as a hang.
 behind an in-flight compaction on the partition, or scanning SSTs for a split
 key. A split sitting at 1 is normal and costs nothing but time.
 **Phase 2 and 3 are the frozen ones**, and they are bounded: `FREEZE_TTL` is
-30 s and the manager's split call times out at 60 s, so a split cannot sit
-frozen for minutes — it fails within one. If you see a partition frozen longer
-than that, the freeze is orphaned, not slow.
+30 s, so a split cannot sit frozen for minutes. If you see a partition frozen
+longer than that, the freeze is orphaned, not slow.
+
+**A split whose reply did not arrive.** The manager waits 60 s for the PS's
+answer. Past that, `ops status` stays `running` with "outcome unknown (RPC
+timed out after 60s)" — the PS keeps running the split, so it may still
+commit. Do not resubmit to "retry" it: a resubmit attaches to the same op.
+It ends on a fact: `succeeded` when the split commits ("split part P in two
+(new part R)"), `failed` with the PS's own reason when it gives up, `failed`
+"partition P was reopened" when its owner epoch moves, or `failed` "no load
+report … has named this split for 30 s" when nothing on the PS is running it.
+Once the manager says `failed`, that split can no longer commit (the manager
+refuses an ended op at commit). A second split on a partition whose split is
+still pending is refused by the PS at once (`split already in progress`).
+
+To see it on a dev cluster, make the split outlive 60 s at phase 1 (queued
+behind a long compaction on the same partition), then:
+```bash
+"${AO[@]}" ops status <ID>    # running … outcome unknown (RPC timed out after 60s) …
+"${AO[@]}" split <PID>        # prints the SAME op id: attached, not a second split
+"${AO[@]}" ops status <ID>    # → succeeded "split part <PID> in two (new part <R>)"
+"${AO[@]}" info                 # one more partition, not two
+```
+The automated form (2 s timeout, split held at its commit point) is
+`cargo test -p autumn-manager --test split_op_outcome`.
 
 Samples arrive on the 5 s heartbeat, so a split that finishes in under ~5 s may
 show no intermediate phase at all — that is not a fault.

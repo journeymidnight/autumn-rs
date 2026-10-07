@@ -27,7 +27,7 @@ async fn split_at(
 ) -> Result<bytes::Bytes, autumn_rpc::error::RpcError> {
     ps.call(
         partition_rpc::MSG_SPLIT_PART,
-        partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id, at_key }),
+        partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id, at_key, op_id: 0 }),
     )
     .await
 }

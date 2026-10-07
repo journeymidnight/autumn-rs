@@ -874,6 +874,9 @@ pub struct SplitPartReq {
     /// `None` = legacy behaviour (median-by-key-count over live user keys,
     /// which still enforces `>= 2 keys`).
     pub at_key: Option<Vec<u8>>,
+    /// The manager's ledger op this split serves; 0 = untracked (policy,
+    /// presplit, tests). Carried into the commit and the PS's outcome report.
+    pub op_id: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

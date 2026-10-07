@@ -3416,6 +3416,22 @@ impl AutumnManager {
                 part_id: req.part_id,
             }
         };
+        // The ledger has already told its operator how this op ended; a
+        // commit now would contradict it.
+        if let Some(state) = self.ops.borrow().ended_state(req.op_id) {
+            return Self::code_resp(
+                CODE_PRECONDITION,
+                format!(
+                    "split op {} already ended ({}); refusing to commit it",
+                    req.op_id,
+                    match state {
+                        OP_STATE_SUCCEEDED => "succeeded",
+                        OP_STATE_FAILED => "failed",
+                        _ => "unknown",
+                    }
+                ),
+            );
+        }
 
         // Phase 1: Compute all mutations without modifying store
         // (only alloc_ids touches state.next_id, which is safe to waste on failure)
@@ -3712,6 +3728,9 @@ impl AutumnManager {
                     let now = Self::epoch_seconds();
                     self.last_op_at.borrow_mut().insert(left_id, now);
                     self.last_op_at.borrow_mut().insert(right_id, now);
+                    if req.op_id != 0 {
+                        self.end_split_op_committed(req.op_id, left_id, right_id, now);
+                    }
                 }
 
                 Self::code_resp(CODE_OK, String::new())
@@ -4878,16 +4897,18 @@ impl AutumnManager {
         // Collect PS-reported maintenance outcomes before the loop consumes
         // `req.partitions`; reconciled into the op-ledger after the metrics
         // borrow is released (append_audit is async).
-        let outcomes: Vec<autumn_rpc::manager_rpc::MaintenanceOutcome> = req
+        let outcomes: Vec<(u64, autumn_rpc::manager_rpc::MaintenanceOutcome)> = req
             .partitions
             .iter()
-            .flat_map(|l| l.maintenance_outcomes.iter().cloned())
+            .flat_map(|l| {
+                l.maintenance_outcomes
+                    .iter()
+                    .cloned()
+                    .map(move |o| (l.part_id, o))
+            })
             .collect();
-        // Carry the partition with the sample. A split/merge cannot name the
-        // manager's op id — `SplitPartReq` has no field for one, and adding it
-        // would be a wire bump for a progress sample — so those report `op_id:
-        // 0` and are matched by (kind, part_id) instead. Flattening the
-        // partition away here is what used to make that impossible.
+        // Carry the partition with the sample: an untracked split reports
+        // `op_id: 0` and is matched by (kind, part_id).
         let load_progress: Vec<(u64, autumn_rpc::manager_rpc::MaintenanceProgress)> = req
             .partitions
             .iter()
@@ -4921,12 +4942,13 @@ impl AutumnManager {
         // RUNNING entries, and the outcome flips it terminal afterwards.
         for (part_id, p) in &load_progress {
             if p.op_id != 0 {
+                self.note_split_heard(p.op_id, now);
                 self.ops
                     .borrow_mut()
                     .update_progress(p.op_id, p.done, p.total);
             } else {
-                // Split's ledger entry carries `secondary_id == 0`, and split
-                // is the only kind that reports without an op id from a PS.
+                // Split's ledger entry carries `secondary_id == 0`, and an
+                // untracked split is the only report without an op id.
                 self.ops
                     .borrow_mut()
                     .update_progress_by_part(p.kind, *part_id, 0, p.done, p.total);
@@ -4934,7 +4956,13 @@ impl AutumnManager {
         }
         // Reconcile PS-executed op outcomes into the ledger (known op_id only,
         // idempotent) and audit each terminal transition exactly once.
-        for o in outcomes {
+        for (part_id, o) in outcomes {
+            self.note_split_heard(o.op_id, now);
+            // A split the PS gave up on while its commit is still in flight
+            // here may yet commit; the PS re-sends the outcome next report.
+            if o.kind == OP_KIND_SPLIT && self.split_inflight.borrow().contains(&part_id) {
+                continue;
+            }
             let transitioned = self.ops.borrow_mut().reconcile_outcome(
                 o.op_id,
                 o.state,
@@ -4982,6 +5010,7 @@ impl AutumnManager {
                 .await;
             }
         }
+        self.reconcile_unknown_splits(now).await;
         // Write this heartbeat's own terminal records to durable history —
         // after the loop above queued them, so a completion does not wait for
         // the next heartbeat to become durable.
@@ -7839,6 +7868,7 @@ mod split_inflight_guard_tests {
             log_tail_extent_id: 0,
             row_tail_extent_id: 0,
             meta_tail_extent_id: 0,
+            op_id: 0,
         };
         let payload: Bytes = rkyv_encode(&req);
         let resp = run(async { m.handle_multi_modify_split(payload).await.unwrap() });

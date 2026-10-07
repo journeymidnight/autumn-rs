@@ -178,6 +178,7 @@ fn run_scenario(part_id: u64, ps_id: u64, roll_meta_too: bool) {
                 partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
                     part_id,
                     at_key: Some(b"m".to_vec()),
+                    op_id: 0,
                 }),
             )
             .await
@@ -347,6 +348,7 @@ fn in_flight_roll_racing_split_commit_child_still_opens() {
                     partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
                         part_id,
                         at_key: Some(b"m".to_vec()),
+                        op_id: 0,
                     }),
                 )
                 .await
@@ -391,6 +393,7 @@ fn in_flight_roll_racing_split_commit_child_still_opens() {
                     partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
                         part_id,
                         at_key: Some(b"m".to_vec()),
+                        op_id: 0,
                     }),
                 )
                 .await
