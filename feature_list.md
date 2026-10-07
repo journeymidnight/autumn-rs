@@ -299,6 +299,30 @@
   消融能变红。
 - `passes: false`
 
+### BUG-MERGE-FREEZE-PS-RESTART — freeze 应答后、merge 提交前 PS 重启，重启后接受的写会被 merge 丢掉（推断，未复现）
+- **Trigger** (2026-10-06，F-REVIEW-V1-MERGE-REPLAY 的 fable 评审): freeze 只存在 PS 内存。某一侧回了 freeze OK 之后崩溃并重开（`frozen_for_merge = None`），manager 还在抓 6 个 commit_length 或提交事务；重开的分区接受客户端写。merge 提交后，合并打开从最新的源 cursor（victim 的）开始重放，survivor 这段写不会被重放，即使被读到也会被并集 max_seq 跳过。`admin-merge:S:V` owner key 只是 epoch bump，不 fence 这个 PS。
+- **Scope**: 先复现（PS 子进程：freeze OK 后 SIGKILL，重开，写，再让 manager 提交）。坐实后从根因修：让 merge 提交能发现某一侧已不在它冻结时的状态（例如 fence 源分区的 owner epoch，或在事务里校验源分区自 freeze 以来没有重开），不是加超时。
+- **Acceptance**: 确定性复现，或说明前提不可达的代码证据；修则 ACK 数据全部可读，消融变红。
+- `passes: false`
+
+### BUG-MERGE-STALE-ROLLBACK-UNFREEZE — 一次 merge 的回滚可能解冻另一次并发 merge 以为冻住的那一侧（推断，未复现）
+- **Trigger** (2026-10-06，同上评审): `MSG_MERGE_FREEZE{freeze:false}` 无条件清 `frozen_for_merge`；`acquire_owner_epoch` 只 bump epoch，不串行化同一对分区的并发 merge（`handle_merge_partitions` 里"two concurrent merge attempts ... serialize on the manager"的注释不准确）。A、B 两次同对 merge：B 的 freeze 命中"already drained-frozen"拿到 OK，A 失败回滚把这一侧解冻，B 继续抓 commit_length 并提交，期间该侧已在接受写。
+- **Scope**: 先复现（两个并发 `MSG_MERGE_PARTITIONS`，让 A 在 freeze 后失败）。坐实后让解冻只作用于发出它的那次 freeze（freeze 带 attempt 身份），或在 manager 侧真正串行化同对 merge；同时改正注释。
+- **Acceptance**: 确定性复现或不可达证据；修则 B 提交时 ACK 数据全部可读，消融变红。
+- `passes: false`
+
+### BUG-MERGE-COMMIT-DEADLINE-BEFORE-TXN — 提交截止时间在 etcd 事务前检查，事务本身无上限（推断，未复现）
+- **Trigger** (2026-10-06，同上评审): `MERGE_FREEZE_COMMIT_DEADLINE`（15 s）在 `handle_multi_modify_merge` 之前检查；etcd 事务本身没有截止时间。事务若超过 `FREEZE_TTL`（30 s）才落地，PS 已自动解冻并在旧尾部继续 ACK 写，merge 按抓到的长度 seal，这些写在 sealed length 之后，丢失（与重放去重无关）。
+- **Scope**: 先复现（在事务前后注入 etcd 延迟，或 manager 侧暂停点放到事务内）。坐实后从根因修：让提交在 PS 解冻后不可能成立（例如 PS 解冻时 fence 掉 merge 的 owner epoch），而不是再加一个超时。
+- **Acceptance**: 确定性复现或不可达证据；修则 ACK 数据全部可读，消融变红。
+- `passes: false`
+
+### BUG-MERGE-FREEZE-REPLY-LOST — freeze OK 在网络上丢失时，那一侧冻到 FREEZE_TTL（推断，不丢数据）
+- **Trigger** (2026-10-06，同上评审): PS 已把 OK 交给连接（`succeeded && delivered`），但回复没到 manager（30 s `call_timeout` 恰等于 `FREEZE_TTL`，或回复写出时连接断）。manager 视为失败，回滚列表不含这一侧；PS 保持冻结直到 TTL，期间拒写。不丢数据：已排空、全程拒写，重试命中"already drained"是合法的。
+- **Scope**: 量一下实际影响（一次 30 s 拒写）再决定是否修；修法候选：manager 回滚时也给失败的一侧发 `freeze=false`（它可能已冻住）。
+- **Acceptance**: 复现一次回复丢失后该侧在有界时间内恢复可写；消融变红。
+- `passes: false`
+
 ### F-SPLIT-CARRIED-BYTES-UNBOUNDED — 大 value 分区可以无限长大，而现在没有任何判据会说话
 - **Trigger** (2026-09-11，本次 split 判据重设计的直接后果): 硬 size 触发器改读
   **LSM 常驻字节**(`size_bytes`)之后，一个大 value 分区的携带字节(log_stream 里的
