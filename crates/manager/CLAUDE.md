@@ -32,7 +32,8 @@ via the shared `ConnPool`. RPC families:
 - **Node lifecycle**: list_node_states, fence_node, set_node_maintenance,
   clear_node_override, remove_node, recovery_stats, query_audit_log,
   report_disk_failure, extent_health_report, extent_health_summary (`0x63`),
-  list_ec_inflight_markers, remove_member (`0x64`, see "PS membership").
+  list_ec_inflight_markers, remove_member (`0x64`, see "PS membership"),
+  get_cluster_status (`0x65`, see "Cluster status").
 
 `extent_health_report` calls a slot unhealthy when its node is Suspected /
 Fenced / Maintenance, or when `avali` is clear **on a SEALED extent**. The
@@ -525,6 +526,28 @@ be absent, so a running manager is refused without a check-then-act window;
 a removed id that starts again rejoins. Test: `tests/manager_members_etcd.rs`
 (ablations red: claim ignoring the holder, no reclaim, remove without the
 presence compare). The exit path is checked by hand (docs/ops.md).
+
+## Cluster status (`cluster_status.rs`)
+
+`MSG_GET_CLUSTER_STATUS` (leader-gated) answers "is the fleet whole" with
+every EXPECTED member in a list whose length is the denominator: managers =
+`managerMembers/` ∪ present ids ∪ the leader itself (memory mode: just the
+leader, id 0); partition servers = `ps_servers_overview` (members ∪ live
+registry); extent nodes = registered nodes. Each carries a `FLEET_*` state —
+leader / standby / absent; ready / opening / silent / evicted; online /
+suspected / suspend / fenced / maintenance (an override wins) / unknown —
+and an age. An extent node counts as online only after a `df` answer to THIS
+leader (`has_first_hand_df`): replay seeds every node Online, so right after
+a failover a dead fleet would otherwise read `EN Online 6/6`.
+Plus the extent counts of the health summary and the Recovery markers in the
+ledger. `managerAlive/` is read from etcd during the call (the only await;
+leadership is re-checked after it), and everything else is read at one
+instant stamped `sampled_at_ms`. A follower answers NOT_LEADER, never a stale
+view. Rendered by `autumn-op status [--json]` (`dashboard_compose::status_json`
+is the JSON shape). Tests: `cluster_status::tests` (classification) and
+`tests/cluster_status_etcd.rs` (standby, evicted PS, a registered node that
+never answered, a stopped standby turning absent; ablations: counting only
+present managers, not telling an evicted PS apart — both red).
 
 ## Extent in-flight ledger (unified)
 

@@ -901,6 +901,13 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## Cluster status (no bump)
+
+`MSG_GET_CLUSTER_STATUS` (0x65) with the new `ClusterStatusResp`,
+`FleetMember` and `FLEET_*` states. A new opcode with new types only: no peer
+that predates it can send or receive them, so it is not a bump; an older
+manager refuses the opcode.
+
 ## PS membership (wire 57)
 
 `PsOverview` gains `joined_at_ms` and `evicted_at_ms` (0 = in the live

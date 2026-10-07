@@ -7,7 +7,10 @@
 use std::collections::HashMap;
 
 use autumn_rpc::manager_rpc::{
-    ClusterDfResp, ExtentHealthSummaryResp, GetClusterOverviewResp, ListNodeStatesResp,
+    ClusterDfResp, ClusterStatusResp, ExtentHealthSummaryResp, FleetMember, FLEET_EN_FENCED,
+    FLEET_EN_MAINTENANCE, FLEET_EN_ONLINE, FLEET_EN_SUSPECTED, FLEET_EN_SUSPEND, FLEET_EN_UNKNOWN,
+    FLEET_MANAGER_ABSENT, FLEET_MANAGER_LEADER, FLEET_MANAGER_STANDBY, FLEET_PS_EVICTED,
+    FLEET_PS_OPENING, FLEET_PS_READY, FLEET_PS_SILENT, GetClusterOverviewResp, ListNodeStatesResp,
     NodeCapWire, NodeStateEntry, PolicyCandidate, CODE_OK, HEALTH_ERR, HEALTH_OK, HEALTH_WARN,
     NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED, NODE_AUTO_STATE_SUSPEND,
     NODE_OVERRIDE_FENCED, NODE_OVERRIDE_MAINTENANCE, POLICY_KIND_EC, POLICY_KIND_GC,
@@ -117,6 +120,69 @@ pub fn health_json(r: &ExtentHealthSummaryResp) -> serde_json::Value {
                 "repair_requested": s.repair_requested,
             })).collect::<Vec<_>>(),
         })).collect::<Vec<_>>(),
+    })
+}
+
+pub fn fleet_state_str(b: u8) -> &'static str {
+    match b {
+        FLEET_MANAGER_LEADER => "leader",
+        FLEET_MANAGER_STANDBY => "standby",
+        FLEET_MANAGER_ABSENT => "absent",
+        FLEET_PS_READY => "ready",
+        FLEET_PS_OPENING => "opening",
+        FLEET_PS_SILENT => "silent",
+        FLEET_PS_EVICTED => "evicted",
+        FLEET_EN_ONLINE => "online",
+        FLEET_EN_SUSPECTED => "suspected",
+        FLEET_EN_SUSPEND => "suspend",
+        FLEET_EN_FENCED => "fenced",
+        FLEET_EN_MAINTENANCE => "maintenance",
+        FLEET_EN_UNKNOWN => "unknown (no df yet)",
+        _ => "unknown",
+    }
+}
+
+/// `autumn-op status --json` and the dashboard's status bar. Each role's
+/// `expected` is its list length; the counts beside it are the numerators.
+pub fn status_json(r: &ClusterStatusResp) -> serde_json::Value {
+    let members = |v: &[FleetMember]| -> Vec<serde_json::Value> {
+        v.iter()
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "address": m.address,
+                    "state": fleet_state_str(m.state),
+                    "age_secs": (m.age_secs != u64::MAX).then_some(m.age_secs),
+                })
+            })
+            .collect()
+    };
+    let count = |v: &[FleetMember], state: u8| v.iter().filter(|m| m.state == state).count();
+    json!({
+        "sampled_at_ms": r.sampled_at_ms,
+        "managers": {
+            "leader": count(&r.managers, FLEET_MANAGER_LEADER),
+            "standby": count(&r.managers, FLEET_MANAGER_STANDBY),
+            "expected": r.managers.len(),
+            "members": members(&r.managers),
+        },
+        "partition_servers": {
+            "ready": count(&r.partition_servers, FLEET_PS_READY),
+            "expected": r.partition_servers.len(),
+            "members": members(&r.partition_servers),
+        },
+        "extent_nodes": {
+            "online": count(&r.extent_nodes, FLEET_EN_ONLINE),
+            "expected": r.extent_nodes.len(),
+            "members": members(&r.extent_nodes),
+        },
+        "extents": {
+            "sealed": r.sealed_extents,
+            "clean": r.clean,
+            "degraded": r.degraded,
+            "unavailable": r.unavailable,
+        },
+        "recovery_inflight": r.recovery_inflight,
     })
 }
 

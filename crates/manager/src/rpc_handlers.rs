@@ -309,6 +309,7 @@ impl AutumnManager {
             MSG_EXTENT_HEALTH_REPORT => self.handle_extent_health_report(payload).await,
             MSG_EXTENT_HEALTH_SUMMARY => self.handle_extent_health_summary(payload).await,
             MSG_REMOVE_MEMBER => self.handle_remove_member(payload).await,
+            MSG_GET_CLUSTER_STATUS => self.handle_get_cluster_status().await,
             MSG_LIST_EC_INFLIGHT_MARKERS => self.handle_list_ec_inflight_markers(payload).await,
             MSG_FENCE_NODE => self.handle_fence_node(payload).await,
             MSG_SET_NODE_MAINTENANCE => self.handle_set_node_maintenance(payload).await,
@@ -5349,6 +5350,62 @@ impl AutumnManager {
         ))
     }
 
+    /// Every PS member plus the live registry, with its heartbeat and how many
+    /// of its assigned partitions it reports open — not derived from the
+    /// regions, which can only show a PS that owns something.
+    pub(crate) fn ps_servers_overview(&self, s: &crate::store::MetadataState) -> Vec<PsOverview> {
+        // Regions assigned to each PS.
+        let mut per_ps_parts: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
+        // Of those, how many the PS last reported open at the current epoch.
+        let mut per_ps_open: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
+        for r in s.regions.values() {
+            *per_ps_parts.entry(r.ps_id).or_insert(0) += 1;
+            if s
+                .ps_open_parts
+                .get(&r.ps_id)
+                .is_some_and(|open| open.contains(&(r.part_id, r.region_epoch)))
+            {
+                *per_ps_open.entry(r.ps_id).or_insert(0) += 1;
+            }
+        }
+        let hb = self.ps_last_heartbeat.borrow();
+        let now = Instant::now();
+        // Every member plus the live registry: an evicted member is listed
+        // (no heartbeat, `evicted_at_ms` set) until an operator removes it.
+        let ids: std::collections::BTreeSet<u64> =
+            s.ps_nodes.keys().chain(s.ps_members.keys()).copied().collect();
+        ids
+            .iter()
+            .map(|ps_id| (ps_id, s.ps_nodes.get(ps_id), s.ps_members.get(ps_id)))
+            .map(|(ps_id, live, member)| PsOverview {
+                ps_id: *ps_id,
+                address: live
+                    .or(member.map(|m| &m.address))
+                    .cloned()
+                    .unwrap_or_default(),
+                // u64::MAX = no heartbeat entry: an evicted member.
+                last_heartbeat_secs_ago: hb
+                    .get(ps_id)
+                    .map(|t| now.saturating_duration_since(*t).as_secs())
+                    .unwrap_or(u64::MAX),
+                partition_count: per_ps_parts.get(ps_id).copied().unwrap_or(0),
+                slot_cap: s.ps_slot_caps.get(ps_id).copied().unwrap_or(0),
+                open_count: s
+                    .ps_open_parts
+                    .contains_key(ps_id)
+                    .then(|| per_ps_open.get(ps_id).copied().unwrap_or(0)),
+                joined_at_ms: member.map_or(0, |m| m.joined_at_ms),
+                evicted_at_ms: if live.is_some() {
+                    0
+                } else {
+                    member.map_or(0, |m| m.left_at_ms)
+                },
+            })
+            .collect()
+    }
+
     /// Dashboard compact overview: per-partition rollup (range / ps / live_size
     /// / extent count) + per-node extent-shard count, computed entirely from
     /// in-memory state with NO extent-node probe and NO per-extent array on the
@@ -5489,59 +5546,7 @@ impl AutumnManager {
             .collect::<std::collections::HashSet<_>>()
             .len() as u32;
 
-        // Every REGISTERED partition server, from `ps_nodes` — not from the
-        // regions, which can only show a PS that owns something. A PS serving
-        // nothing and a PS that stopped heartbeating are both invisible in a
-        // partition-derived list, and they are the two states worth looking at.
-        let mut per_ps_parts: std::collections::HashMap<u64, u32> =
-            std::collections::HashMap::new();
-        // Of those, how many the PS last reported open at the current epoch.
-        let mut per_ps_open: std::collections::HashMap<u64, u32> =
-            std::collections::HashMap::new();
-        for r in s.regions.values() {
-            *per_ps_parts.entry(r.ps_id).or_insert(0) += 1;
-            if s
-                .ps_open_parts
-                .get(&r.ps_id)
-                .is_some_and(|open| open.contains(&(r.part_id, r.region_epoch)))
-            {
-                *per_ps_open.entry(r.ps_id).or_insert(0) += 1;
-            }
-        }
-        let hb = self.ps_last_heartbeat.borrow();
-        let now = Instant::now();
-        // Every member plus the live registry: an evicted member is listed
-        // (no heartbeat, `evicted_at_ms` set) until an operator removes it.
-        let ids: std::collections::BTreeSet<u64> =
-            s.ps_nodes.keys().chain(s.ps_members.keys()).copied().collect();
-        let ps_servers: Vec<PsOverview> = ids
-            .iter()
-            .map(|ps_id| (ps_id, s.ps_nodes.get(ps_id), s.ps_members.get(ps_id)))
-            .map(|(ps_id, live, member)| PsOverview {
-                ps_id: *ps_id,
-                address: live
-                    .or(member.map(|m| &m.address))
-                    .cloned()
-                    .unwrap_or_default(),
-                // u64::MAX = no heartbeat entry: an evicted member.
-                last_heartbeat_secs_ago: hb
-                    .get(ps_id)
-                    .map(|t| now.saturating_duration_since(*t).as_secs())
-                    .unwrap_or(u64::MAX),
-                partition_count: per_ps_parts.get(ps_id).copied().unwrap_or(0),
-                slot_cap: s.ps_slot_caps.get(ps_id).copied().unwrap_or(0),
-                open_count: s
-                    .ps_open_parts
-                    .contains_key(ps_id)
-                    .then(|| per_ps_open.get(ps_id).copied().unwrap_or(0)),
-                joined_at_ms: member.map_or(0, |m| m.joined_at_ms),
-                evicted_at_ms: if live.is_some() {
-                    0
-                } else {
-                    member.map_or(0, |m| m.left_at_ms)
-                },
-            })
-            .collect();
+        let ps_servers = self.ps_servers_overview(&s);
 
         GetClusterOverviewResp {
             code: CODE_OK,

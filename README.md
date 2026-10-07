@@ -72,7 +72,11 @@ erasure-coded, self-healing extents.
 - **Operable** — a **web dashboard** ([`autumn-dashboard`](crates/server/src/bin/autumn_dashboard/README.md),
   built with `autumn-server`) with tabs for keyspace, partitions, servers,
   nodes-and-disks, policy and logs, plus direct Start / Observe / Stop policy
-  controls; `ceph -s`-style extent health (`autumn-op health`: how many extents
+  controls; a fleet status checked against the EXPECTED members
+  (`autumn-op status`: manager leader/standby, `PS Ready 3/3`, `EN Online 6/6`,
+  extents clean/degraded/unavailable, rebuilds in flight, when it was sampled —
+  a stopped server stays in the count until an operator removes it);
+  `ceph -s`-style extent health (`autumn-op health`: how many extents
   are clean, degraded, without redundancy or unreadable, and the worst ones by
   name) with matching dashboard alerts, and `autumn-op repair` (or the
   auto-policy's `repair` switch, after a grace period) to rebuild degraded

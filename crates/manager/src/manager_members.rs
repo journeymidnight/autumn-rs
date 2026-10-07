@@ -13,7 +13,7 @@
 //! if another process holds the id by then.
 
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::Result;
 use autumn_common::AppError;
@@ -171,23 +171,31 @@ impl AutumnManager {
         }
     }
 
-    pub(crate) async fn sync_manager_members(&self) -> Result<(), AppError> {
+    /// `managerAlive/` as etcd has it now: id → address.
+    pub(crate) async fn read_manager_presence(&self) -> Result<BTreeMap<u64, String>, AppError> {
         let Some(etcd) = &self.etcd else {
-            return Ok(());
+            return Ok(BTreeMap::new());
         };
         let got = etcd
             .client
             .get_prefix(MANAGER_ALIVE_PREFIX)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        let mut alive = BTreeMap::new();
-        for kv in &got.kvs {
-            let id = Self::parse_id_from_key(MANAGER_ALIVE_PREFIX, &kv.key)
-                .map_err(|e| AppError::Internal(e.to_string()))?;
-            alive.insert(id, parse_alive_value(&kv.value).1);
-        }
-        *self.manager_alive.borrow_mut() = alive.clone();
-        self.manager_alive_at.set(Some(Instant::now()));
+        got.kvs
+            .iter()
+            .map(|kv| {
+                let id = Self::parse_id_from_key(MANAGER_ALIVE_PREFIX, &kv.key)
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                Ok((id, parse_alive_value(&kv.value).1))
+            })
+            .collect()
+    }
+
+    pub(crate) async fn sync_manager_members(&self) -> Result<(), AppError> {
+        let Some(etcd) = &self.etcd else {
+            return Ok(());
+        };
+        let alive = self.read_manager_presence().await?;
 
         let _members = self.manager_member_lock.lock().await;
         let now_ms = Self::now_s_ms().1;

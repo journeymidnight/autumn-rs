@@ -1726,6 +1726,62 @@ pub const MSG_REMOVE_MEMBER: u8 = 0x64;
 pub const MEMBER_ROLE_PS: u8 = 1;
 pub const MEMBER_ROLE_MANAGER: u8 = 2;
 
+/// The fleet at a glance: every EXPECTED manager, partition server and extent
+/// node with its state, plus the extent and recovery counts. Each list's
+/// length is the denominator; the leader computes it all at one instant
+/// (`sampled_at_ms`). Request: empty. Leader-gated.
+pub const MSG_GET_CLUSTER_STATUS: u8 = 0x65;
+
+/// `FleetMember.state`. Managers: `age_secs` is unused (0) except for ABSENT,
+/// where it is the time since the leader saw it go (`u64::MAX` = unknown).
+pub const FLEET_MANAGER_LEADER: u8 = 1;
+pub const FLEET_MANAGER_STANDBY: u8 = 2;
+pub const FLEET_MANAGER_ABSENT: u8 = 3;
+/// Partition servers: `age_secs` is the heartbeat age, or for EVICTED the
+/// time since eviction. OPENING = heartbeating but not every assigned
+/// partition open; SILENT = still registered, heartbeat too old to vouch.
+pub const FLEET_PS_READY: u8 = 4;
+pub const FLEET_PS_OPENING: u8 = 5;
+pub const FLEET_PS_SILENT: u8 = 6;
+pub const FLEET_PS_EVICTED: u8 = 7;
+/// Extent nodes: `age_secs` is the time since the node last answered `df`
+/// (`u64::MAX` = not this leader term). An operator override wins over the
+/// automatic state. UNKNOWN = this leader has had no `df` answer from it yet
+/// (right after a leader change), so nothing vouches for it.
+pub const FLEET_EN_ONLINE: u8 = 8;
+pub const FLEET_EN_SUSPECTED: u8 = 9;
+pub const FLEET_EN_SUSPEND: u8 = 10;
+pub const FLEET_EN_FENCED: u8 = 11;
+pub const FLEET_EN_MAINTENANCE: u8 = 12;
+pub const FLEET_EN_UNKNOWN: u8 = 13;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct FleetMember {
+    pub id: u64,
+    pub address: String,
+    /// `FLEET_*`.
+    pub state: u8,
+    pub age_secs: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ClusterStatusResp {
+    pub code: u8,
+    pub message: String,
+    /// Leader wall clock, unix ms.
+    pub sampled_at_ms: i64,
+    pub managers: Vec<FleetMember>,
+    pub partition_servers: Vec<FleetMember>,
+    pub extent_nodes: Vec<FleetMember>,
+    /// Sealed extents by health (`MSG_EXTENT_HEALTH_SUMMARY`'s counts).
+    pub sealed_extents: u64,
+    pub clean: u64,
+    pub degraded: u64,
+    pub unavailable: u64,
+    /// Rebuilds in flight: Recovery markers in the extent op ledger.
+    pub recovery_inflight: u64,
+}
+
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RemoveMemberReq {
     /// `MEMBER_ROLE_*`.

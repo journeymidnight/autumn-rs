@@ -456,6 +456,7 @@ fn known_manager_opcode(opcode: u8) -> bool {
             | MSG_EXTENT_HEALTH_REPORT
             | MSG_EXTENT_HEALTH_SUMMARY
             | MSG_REMOVE_MEMBER
+            | MSG_GET_CLUSTER_STATUS
             | MSG_LIST_EC_INFLIGHT_MARKERS
             | MSG_FENCE_NODE
             | MSG_SET_NODE_MAINTENANCE

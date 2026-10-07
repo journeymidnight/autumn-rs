@@ -2019,6 +2019,35 @@ Requirements / caveats:
   df-echo check (M1b) WARNs if the stored location drifts and refuses to serve
   an imposter that reused the node's IP under a different uuid.
 
+## Fleet status (`autumn-op status`)
+
+```text
+$ autumn-op status
+Manager   leader 1 / standby 0   (1 expected)
+PS        Ready 0/1
+EN        Online 2/3
+Extent    clean 0 / degraded 0 / unavailable 0   (0 sealed)
+Recovery  inflight 0
+sampled   2026-10-07 06:45:34 UTC by manager 1 (127.0.0.1:9001); oldest EN df 0s
+  PS 1 127.0.0.1:9301  evicted 0s
+  EN 3 127.0.0.1:20002  suspected 12s
+```
+
+Every denominator is the EXPECTED set: manager members (`manager-remove`),
+PS members (`ps-remove`), registered extent nodes (`remove`). A server that
+stopped stays counted, as absent / evicted / suspected, until it is back or
+removed. Each member that is not up gets a line with its state and age (time
+since it left, or since its last heartbeat / `df`). `--json` gives the same
+data with every member. Only the leader answers; anything else fails with
+`not leader` rather than print an old view, and so does a leader that cannot
+read `managerAlive/` from etcd. Right after a leader change an extent node
+reads `unknown (no df yet)` until it answers this leader's `df` (≤ 2 s per
+node when it is up): the new leader has no first-hand word on it yet.
+
+Manual check: `cluster.sh reset 3` → `status` shows `Ready 1/1`, `Online 3/3`;
+`kill -9` one extent node and the PS (by PID) → within ~12 s `PS Ready 0/1`
+with the PS `evicted`, `EN Online 2/3` with that node `suspected`.
+
 ## Retiring a partition server (`ps-remove`)
 
 The manager remembers every psid that has ever registered (`psMembers/` in

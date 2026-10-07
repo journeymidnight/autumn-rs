@@ -21,6 +21,8 @@ fn usage() -> ! {
     eprintln!("    authz is on it protects every key, so those commands need this too.");
     eprintln!();
     eprintln!("read / observability commands:");
+    eprintln!("  status                       the fleet against its expected members: managers,");
+    eprintln!("                               PS ready, EN online, extents, rebuilds, sample time");
     eprintln!("  list-nodes                   show every EN's auto-state + override");
     eprintln!("  health [--detail N]          extent health summary: OK / WARN / ERR, counts by");
     eprintln!("                               state, and the N worst extents (default 10)");
@@ -320,6 +322,7 @@ pub(crate) enum Command {
         ps_id: u64,
         by: String,
     },
+    Status,
     ManagerRemove {
         manager_id: u64,
         by: String,
@@ -674,6 +677,7 @@ pub(crate) fn parse() -> Args {
     let cmd = match sub {
         // read
         "list-nodes" => Command::ListNodes,
+        "status" => Command::Status,
         "df" => Command::Df,
         "extent-health" => {
             let mut node_filter: Vec<u64> = Vec::new();

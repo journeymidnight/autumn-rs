@@ -32,7 +32,7 @@
   - `autumn-op status` 与 dashboard 顶栏显示同一份数据，含采样时间；leader 无应答时显示未知而非旧值。
   - 代码与文档中不再出现 `HEALTH_OK/WARN/ERR`。
 - `passes: false`
-- **notes** (2026-10-07): 第 1 步完成（wire 57，record type 11 `MemberRecord`）。第 2 步完成：`--manager-id` + `managerAlive/` lease 占位（丢 lease 重占，被他人占走才退出）+ `managerMembers/` + `manager-remove`。已知：manager 记录的是 `--listen` 地址（k8s 下为 0.0.0.0）。
+- **notes** (2026-10-07): 第 1 步完成（wire 57，record type 11 `MemberRecord`）。第 2 步完成：`--manager-id` + `managerAlive/` lease 占位（丢 lease 重占，被他人占走才退出）+ `managerMembers/` + `manager-remove`。已知：manager 记录的是 `--listen` 地址（k8s 下为 0.0.0.0）。第 3 步完成：`MSG_GET_CLUSTER_STATUS` + `autumn-op status [--json]`。
 
 ### F-ETCD-AUTH — manager 连接带认证/TLS 的 etcd
 - **Trigger** (2026-10-07 用户): 生产 etcd 要开 auth。现 manager 只有 `--etcd <endpoints>`，`crates/etcd` 是 h2c 明文 gRPC，无 `Auth/Authenticate`、无 token 头、无 TLS；开 auth 的 etcd 连不上。

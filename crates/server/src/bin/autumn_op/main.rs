@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{decode_err, ClusterClient, DEFAULT_RPC_TIMEOUT};
-use autumn_manager::dashboard_compose::{health_json, health_status_str, slot_state_str};
+use autumn_manager::dashboard_compose::{
+    fleet_state_str, health_json, health_status_str, slot_state_str, status_json,
+};
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc::{
     DiagPartitionVpReq, DiagPartitionVpResp, GetDiscardsReq, GetDiscardsResp,
@@ -412,6 +414,7 @@ async fn run(args: Args) -> Result<()> {
             include_healthy,
         } => cmd_extent_health(&client, args.json, node_filter, include_healthy).await?,
         Command::Health { max_problems } => cmd_health(&client, args.json, max_problems).await?,
+        Command::Status => cmd_status(&client, args.json).await?,
         Command::ListEcMarkers => cmd_list_ec_markers(&client, args.json).await?,
         Command::RecoveryStats => cmd_recovery_stats(&client, args.json).await?,
         Command::AuditLog {
@@ -1273,6 +1276,118 @@ fn render_health(r: &ExtentHealthSummaryResp) -> String {
             health_bytes(p.sealed_length),
             slots.join("; ")
         ));
+    }
+    lines.join("\n") + "\n"
+}
+
+async fn cmd_status(client: &ClusterClient, json: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(MSG_GET_CLUSTER_STATUS, bytes::Bytes::new())
+        .await?;
+    let r: ClusterStatusResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if r.code != CODE_OK {
+        bail!("status: {}", r.message);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status_json(&r))?);
+    } else {
+        print!("{}", render_status(&r));
+    }
+    Ok(())
+}
+
+fn age_str(secs: u64) -> String {
+    match secs {
+        u64::MAX => "unknown".to_string(),
+        s if s < 120 => format!("{s}s"),
+        s if s < 7200 => format!("{}m", s / 60),
+        s => format!("{}h", s / 3600),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS UTC` from unix ms.
+fn utc_string(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Days since 1970-01-01 to a civil date (Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+fn render_status(r: &ClusterStatusResp) -> String {
+    let count = |v: &[FleetMember], state: u8| v.iter().filter(|m| m.state == state).count();
+    let oldest = |v: &[FleetMember], state: u8| {
+        v.iter()
+            .filter(|m| m.state == state)
+            .map(|m| m.age_secs)
+            .max()
+    };
+    let mut lines = vec![
+        format!(
+            "Manager   leader {} / standby {}   ({} expected)",
+            count(&r.managers, FLEET_MANAGER_LEADER),
+            count(&r.managers, FLEET_MANAGER_STANDBY),
+            r.managers.len()
+        ),
+        format!(
+            "PS        Ready {}/{}",
+            count(&r.partition_servers, FLEET_PS_READY),
+            r.partition_servers.len()
+        ),
+        format!(
+            "EN        Online {}/{}",
+            count(&r.extent_nodes, FLEET_EN_ONLINE),
+            r.extent_nodes.len()
+        ),
+        format!(
+            "Extent    clean {} / degraded {} / unavailable {}   ({} sealed)",
+            r.clean, r.degraded, r.unavailable, r.sealed_extents
+        ),
+        format!("Recovery  inflight {}", r.recovery_inflight),
+    ];
+    let mut sampled = format!("sampled   {}", utc_string(r.sampled_at_ms));
+    if let Some(l) = r
+        .managers
+        .iter()
+        .find(|m| m.state == FLEET_MANAGER_LEADER && m.id != 0)
+    {
+        sampled += &format!(" by manager {} ({})", l.id, l.address);
+    }
+    if let Some(a) = oldest(&r.extent_nodes, FLEET_EN_ONLINE) {
+        sampled += &format!("; oldest EN df {}", age_str(a));
+    }
+    if let Some(a) = oldest(&r.partition_servers, FLEET_PS_READY) {
+        sampled += &format!("; oldest PS heartbeat {}", age_str(a));
+    }
+    lines.push(sampled);
+    let ok = [FLEET_MANAGER_LEADER, FLEET_MANAGER_STANDBY, FLEET_PS_READY, FLEET_EN_ONLINE];
+    for (role, list) in [
+        ("manager", &r.managers),
+        ("PS", &r.partition_servers),
+        ("EN", &r.extent_nodes),
+    ] {
+        for m in list.iter().filter(|m| !ok.contains(&m.state)) {
+            lines.push(format!(
+                "  {role} {} {}  {} {}",
+                m.id,
+                m.address,
+                fleet_state_str(m.state),
+                age_str(m.age_secs)
+            ));
+        }
     }
     lines.join("\n") + "\n"
 }
@@ -4258,6 +4373,48 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn utc_string_is_the_civil_date() {
+        assert_eq!(utc_string(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc_string(1_791_352_181_498), "2026-10-07 05:49:41 UTC");
+        assert_eq!(utc_string(951_782_400_000), "2000-02-29 00:00:00 UTC");
+    }
+
+    #[test]
+    fn status_lists_counts_then_every_member_that_is_not_up() {
+        let m = |id, state, age_secs| FleetMember {
+            id,
+            address: format!("h{id}:1"),
+            state,
+            age_secs,
+        };
+        let r = ClusterStatusResp {
+            code: CODE_OK,
+            sampled_at_ms: 0,
+            managers: vec![m(1, FLEET_MANAGER_LEADER, 0), m(2, FLEET_MANAGER_ABSENT, 180)],
+            partition_servers: vec![m(1, FLEET_PS_READY, 1), m(7, FLEET_PS_EVICTED, 720)],
+            extent_nodes: vec![m(1, FLEET_EN_ONLINE, 2), m(2, FLEET_EN_SUSPEND, u64::MAX)],
+            sealed_extents: 10,
+            clean: 9,
+            degraded: 1,
+            unavailable: 0,
+            recovery_inflight: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            render_status(&r),
+            "Manager   leader 1 / standby 0   (2 expected)\n\
+             PS        Ready 1/2\n\
+             EN        Online 1/2\n\
+             Extent    clean 9 / degraded 1 / unavailable 0   (10 sealed)\n\
+             Recovery  inflight 1\n\
+             sampled   1970-01-01 00:00:00 UTC by manager 1 (h1:1); oldest EN df 2s; oldest PS heartbeat 1s\n\
+             \x20 manager 2 h2:1  absent 3m\n\
+             \x20 PS 7 h7:1  evicted 12m\n\
+             \x20 EN 2 h2:1  suspend unknown\n"
+        );
+    }
 
     #[test]
     fn health_renders_status_counts_and_the_worst_extent() {

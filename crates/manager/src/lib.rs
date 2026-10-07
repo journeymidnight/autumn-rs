@@ -13,6 +13,7 @@ mod inflight_commit;
 pub mod inode_lease;
 pub mod node_state;
 mod op_log;
+mod cluster_status;
 mod manager_members;
 mod persist;
 mod placement;
@@ -733,9 +734,6 @@ pub struct AutumnManager {
     pub(crate) identity: Option<Rc<manager_members::ManagerIdentity>>,
     /// The lease holding `managerAlive/<id>`.
     pub(crate) presence_lease: Rc<Cell<i64>>,
-    /// `managerAlive/` as the leader last read it (id → address), and when.
-    pub(crate) manager_alive: Rc<RefCell<BTreeMap<u64, String>>>,
-    pub(crate) manager_alive_at: Rc<Cell<Option<Instant>>>,
     /// Serializes `managerMembers/` writes (member sync, remove).
     pub(crate) manager_member_lock: Rc<futures::lock::Mutex<()>>,
     /// Attempt identity for each live marker in `inflight`, keyed the same way:
@@ -1151,8 +1149,6 @@ impl AutumnManager {
             ps_member_lock: Rc::new(futures::lock::Mutex::new(())),
             identity: None,
             presence_lease: Rc::new(Cell::new(0)),
-            manager_alive: Rc::new(RefCell::new(BTreeMap::new())),
-            manager_alive_at: Rc::new(Cell::new(None)),
             manager_member_lock: Rc::new(futures::lock::Mutex::new(())),
             inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
             extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
