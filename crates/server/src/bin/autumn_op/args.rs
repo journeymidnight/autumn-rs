@@ -24,8 +24,8 @@ fn usage() -> ! {
     eprintln!("  status                       the fleet against its expected members: managers,");
     eprintln!("                               PS ready, EN online, extents, rebuilds, sample time");
     eprintln!("  list-nodes                   show every EN's auto-state + override");
-    eprintln!("  health [--detail N]          extent health summary: OK / WARN / ERR, counts by");
-    eprintln!("                               state, and the N worst extents (default 10)");
+    eprintln!("  health [--detail N]          sealed extents clean / degraded / unavailable, slots");
+    eprintln!("                               by state, and the N worst extents (default 10)");
     eprintln!("  extent-health [--node ID] [--all]");
     eprintln!("                               per-slot health (default: only unhealthy)");
     eprintln!("  list-ec-markers              ConvertToEc inflight markers + coord state");

@@ -226,6 +226,13 @@
   .adv .d { flex:1; font-size:12px; }
   .adv .d .why { color:var(--dim); font-size:11.5px; display:block; }
   .empty { color:var(--dim); padding:8px 0; }
+  .status { margin:0 0 16px; }
+  .st-row { display:grid; grid-template-columns:8px 72px 1fr; align-items:baseline; gap:10px;
+    padding:5px 0; font-size:13px; }
+  .st-row .dot { width:8px; height:8px; border-radius:50%; align-self:center; }
+  .st-row .k { color:var(--dim); font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
+  .st-row .why { color:var(--dim); font-size:11.5px; display:block; overflow-wrap:anywhere; }
+  .st-sampled { color:var(--dim); font-size:11.5px; margin-top:6px; }
   .ctlrow { display:flex; align-items:center; gap:8px; margin-bottom:12px; font-size:12.5px; }
   .ctlrow .dot { width:8px; height:8px; border-radius:50%; }
   .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)} .dot.warn{background:var(--warn)}
@@ -331,6 +338,7 @@
 
   <!-- ── OVERVIEW ─────────────────────────────────────────────────────── -->
   <section class="pane" id="pane-overview">
+    <section class="panel status"><h2>Status</h2><div id="ov_status"></div></section>
     <section class="keyspace">
       <div class="cap"><span class="eyebrow">Keyspace</span>
         <span class="hint">−∞ → +∞, segment = partition, colored by owning PS — click a segment to open that server's partitions</span></div>
@@ -447,6 +455,7 @@ let SEL_PS_CARD=null;// Servers tab: which PS the drawer describes
 let SEL_NODE=null;   // Nodes tab: which node the drawer describes
 let ADVISORIES=[];
 let EXTENT_HEALTH;   // undefined = not loaded yet; null = the leader did not answer
+let STATUS;          // same convention: `autumn-op status`'s JSON
 let LIVE_OPS=[];
 const ROWH=36;
 const PSCOLORS={};
@@ -648,7 +657,37 @@ function psOpenText(p){
   if(p.open_count==null) return "awaiting report";
   return `opening ${p.open_count}/${p.partition_count||0}`;
 }
+// The fleet against its EXPECTED members: each denominator is the member list,
+// so a stopped server stays counted (absent / evicted / unknown) until removed.
+// null = the leader did not answer, which is "unknown", never "healthy".
+function statusRows(st){
+  const row=(cls,k,v,why)=>`<div class="st-row"><span class="dot ${cls}"></span><span class="k">${k}</span>
+    <span>${v}${why?`<span class="why">${esc(why)}</span>`:""}</span></div>`;
+  if(st===undefined) return "";
+  if(st===null) return row("warn","Status","unknown","the leader did not answer");
+  const down=(g,up)=>(g.members||[]).filter(m=>!up.includes(m.state))
+    .map(m=>`${m.id} ${m.address||""} ${m.state}${m.age_secs==null?"":" "+agoStr(m.age_secs)}`).join(" · ");
+  // Nothing expected is not a healthy fleet.
+  const share=(n,of)=>of===0?"warn":(n===of?"ok":(n===0?"bad":"warn"));
+  const mg=st.managers, ps=st.partition_servers, en=st.extent_nodes, ex=st.extents;
+  const mCls=mg.leader!==1?"bad":(mg.leader+mg.standby===mg.expected?"ok":"warn");
+  const exCls=ex.unavailable>0?"bad":(ex.degraded>0?"warn":"ok");
+  const leader=(mg.members||[]).find(m=>m.state==="leader");
+  const oldest=(g,state)=>{ const a=(g.members||[]).filter(m=>m.state===state).map(m=>m.age_secs);
+    return a.length?Math.max(...a):undefined; };
+  const enAge=oldest(en,"online"), psAge=oldest(ps,"ready");
+  return row(mCls,"Manager",`leader ${mg.leader} / standby ${mg.standby} <span class="why" style="display:inline">(${mg.expected} expected)</span>`,down(mg,["leader","standby"]))
+    + row(share(ps.ready,ps.expected),"PS",`Ready ${ps.ready}/${ps.expected}`,down(ps,["ready"]))
+    + row(share(en.online,en.expected),"EN",`Online ${en.online}/${en.expected}`,down(en,["online"]))
+    + row(exCls,"Extent",`clean ${ex.clean} / degraded ${ex.degraded} / unavailable ${ex.unavailable}`,`${ex.sealed} sealed`)
+    + row("ok","Recovery",`inflight ${st.recovery_inflight}`,"")
+    + `<div class="st-sampled">sampled ${new Date(st.sampled_at_ms).toLocaleString()}`
+    + (leader&&leader.id?` by manager ${leader.id} (${esc(leader.address)})`:"")
+    + (enAge!==undefined?` · oldest EN df ${agoStr(enAge)}`:"")
+    + (psAge!==undefined?` · oldest PS heartbeat ${agoStr(psAge)}`:"")+`</div>`;
+}
 function renderOverviewTab(){
+  $("#ov_status").innerHTML = statusRows(STATUS);
   renderRibbon();
   const bad=NODES.filter(isNodeUnhealthy);
   const badDisks=NODES.flatMap(n=>(n.disks||[]).filter(d=>d.reported===false||d.faulted||!d.online));
@@ -1140,6 +1179,7 @@ async function overview(){
   PS_SERVERS.forEach(r=>psColor(r.ps_id));
   ADVISORIES = s.advisories||[];
   EXTENT_HEALTH = s.extent_health===undefined ? null : s.extent_health;
+  STATUS = s.status===undefined ? null : s.status;
   // default scope: first server (drill-in by default); keep the user's choice on refresh
   if(SEL_PS!==null && !PS_ROLL.some(r=>r.ps_id===SEL_PS)) SEL_PS=null;
   if(SEL_PS===null && PS_ROLL.length>1 && !window.__pickedAll && PARTS.length>0) SEL_PS = PS_ROLL[0].ps_id;

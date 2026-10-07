@@ -1790,13 +1790,6 @@ pub struct RemoveMemberReq {
     pub set_by: String,
 }
 
-/// Overall verdict. OK: every sealed extent has every copy serving. WARN: some
-/// extent is short a copy but every extent can still be read. ERR: some extent
-/// has fewer serving copies than a read needs.
-pub const HEALTH_OK: u8 = 0;
-pub const HEALTH_WARN: u8 = 1;
-pub const HEALTH_ERR: u8 = 2;
-
 /// What one slot of a SEALED extent is doing. Append-only; the numeric values
 /// are frozen. Evaluated in this order, first match wins: a corrupt mark, a
 /// fenced node and a faulted disk say the copy is going away whatever else is
@@ -1854,8 +1847,6 @@ pub struct ProblemExtent {
 pub struct ExtentHealthSummaryResp {
     pub code: u8,
     pub message: String,
-    /// `HEALTH_*`.
-    pub status: u8,
     pub sealed_extents: u64,
     /// Open tails are not classified: an open extent carries no `avali` bits,
     /// and a writer rolls off a replica it cannot reach.

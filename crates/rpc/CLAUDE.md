@@ -901,6 +901,13 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## No health verdict (wire 58)
+
+`ExtentHealthSummaryResp.status` and its three verdict constants are gone: the
+verdict looked only at extents, so it read OK with every PS down. The counts
+it was derived from stay. Read by autumn-op only (Admin), not on the client
+surface: the ceiling rises to [43, 58], the floor stays.
+
 ## Cluster status (no bump)
 
 `MSG_GET_CLUSTER_STATUS` (0x65) with the new `ClusterStatusResp`,

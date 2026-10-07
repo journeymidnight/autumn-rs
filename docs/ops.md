@@ -395,9 +395,9 @@ a view is linkable.
 
 | Tab | What it answers |
 |-----|-----------------|
-| Overview | keyspace ribbon, fleet health roll-up, space + amplification, top advisories, what is running |
+| Overview | status bar (the `autumn-op status` counts against expected members, each member not up named), keyspace ribbon, fleet health roll-up, space + amplification, top advisories, what is running |
 | Partitions | PS-scoped partition list + the lazy per-partition drawer (load metrics + extents) |
-| Servers | every REGISTERED partition server, with heartbeat, load and its partitions |
+| Servers | every partition server member (an evicted one stays listed until `ps-remove`), with heartbeat, load and its partitions |
 | Nodes | every extent node, with a **per-disk** table — capacity, online, faulted |
 | Policy | advisories with their full reasoning, the controller, the policy editor |
 | Logs | running ops, durable outcomes, the auto-policy action log |
@@ -2038,7 +2038,8 @@ PS members (`ps-remove`), registered extent nodes (`remove`). A server that
 stopped stays counted, as absent / evicted / suspected, until it is back or
 removed. Each member that is not up gets a line with its state and age (time
 since it left, or since its last heartbeat / `df`). `--json` gives the same
-data with every member. Only the leader answers; anything else fails with
+data with every member; the dashboard's Overview tab shows the same counts as
+its status bar. Only the leader answers; anything else fails with
 `not leader` rather than print an old view, and so does a leader that cannot
 read `managerAlive/` from etcd. Right after a leader change an extent node
 reads `unknown (no df yet)` until it answers this leader's `df` (≤ 2 s per
@@ -5005,7 +5006,7 @@ recovery` a running entry, then unfence:
 
     "${AO[@]}" recovery-stats        # no backoff rows
     "${AO[@]}" ops list --kind recovery   # the entry is succeeded, "no rebuild needed any more"
-    "${AO[@]}" health                # HEALTH_OK, 0 recovering — all three agree
+    "${AO[@]}" health                # 0 degraded, 0 recovering — all three agree
 
 A late completion of the released attempt is still refused with "recovery
 attempt changed"; that is the guard working, not a stuck repair.
@@ -5088,16 +5089,17 @@ backoff, cap 300 s).
 every sealed extent fully replicated, and if not, which ones are worst.
 
     autumn-op --cluster-secret-file $SECRET --manager $MGR health        # --json goes before `health`
-    HEALTH_WARN
-      extents: 812 sealed, 21 open (open tails are not classified)
-      810 clean, 2 degraded (128.0 MiB), 1 with no redundancy left, 0 unavailable, 1 recovering
-      slots not serving: 2 unreachable, 1 behind
+    extents: 812 sealed, 21 open (open tails are not classified)
+    810 clean, 2 degraded (128.0 MiB), 1 with no redundancy left, 0 unavailable, 1 recovering
+    slots not serving: 2 unreachable, 1 behind
     worst extents:
       extent 77  1/3 serving (needs 1)  recovering  64.0 MiB  slot1 node 5 unreachable 812s; slot2 node 6 behind
 
-- `HEALTH_ERR` — some extent has fewer serving copies than a read needs (1 for
-  a replicated extent, the data-shard count for an EC one).
-- `HEALTH_WARN` — some extent is short a copy but every extent can be read.
+There is no one-word verdict: the counts are the answer (`autumn-op status`
+puts them beside the fleet counts).
+- `unavailable` — fewer serving copies than a read needs (1 for a replicated
+  extent, the data-shard count for an EC one).
+- `degraded` — short a copy but still readable.
 - slot states: `behind` (node answers, copy missed the seal — caught up in
   place automatically), `unreachable` (node not Online or disk offline),
   `maintenance`, `fenced`, `corrupt`, `disk-faulted` (the last three are being
@@ -5110,16 +5112,17 @@ every sealed extent fully replicated, and if not, which ones are worst.
 It is the leader's own view, not a poll of the nodes, which has three
 consequences worth knowing:
 - One `df` that times out (5 s) marks that node's disks offline at once, so
-  its slots read `unreachable` and the summary turns `HEALTH_WARN` until the
-  next successful `df` — a loaded node can flicker WARN for a few seconds
+  its slots read `unreachable` and its extents count as degraded until the
+  next successful `df` — a loaded node can flicker degraded for a few seconds
   while `list-nodes` still says Online.
 - Right after a leader change, until each node's first `df` reaches the new
   leader (about 15 s), a dead node's copies still read as serving.
 - `fenced`, `corrupt` and `disk-faulted` count as not serving even when the
-  copy still answers reads (they are being moved off), so `HEALTH_ERR` can mean
+  copy still answers reads (they are being moved off), so `unavailable` can mean
   "every copy of this extent is going away", not only "unreadable now".
 
-The dashboard's Overview → Fleet panel turns the same summary into alert rows
+The dashboard's Overview → Status bar shows the counts beside the fleet; the
+Fleet panel turns the same summary into alert rows
 (red: unavailable or no redundancy left; amber: degraded; green: rebuilding).
 
 Verify:
@@ -5131,10 +5134,10 @@ Verify:
     crates/server/src/bin/autumn_dashboard/tests/api_contract.sh
 
 `extent_health_summary` stops the node holding one replica of a sealed RF 3
-extent: within seconds the summary is `HEALTH_WARN` and names that extent,
+extent: within seconds the summary counts it degraded and names it,
 `2/3 serving`, with the node's slot `unreachable`; restarting the node brings
-it back to `HEALTH_OK`. Ablation: make `classify_slot` treat every node as
-reachable — the test times out waiting for `HEALTH_WARN`. `render_check.js`
+it back to 0 degraded. Ablation: make `classify_slot` treat every node as
+reachable — the test times out waiting for the degraded count. `render_check.js`
 fails if the degraded row is not rendered (ablation: skip that row).
 
 ## Rebuilding degraded copies without a fence (`autumn-op repair`)

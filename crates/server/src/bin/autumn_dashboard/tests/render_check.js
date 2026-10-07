@@ -32,7 +32,7 @@ const ctx = { $: sel => ({ set innerHTML(v) { OUT[sel] = v; } }) };
 const src = [escLine, constLine("jsAttr"), constLine("BYTE_KINDS"),
              constLine("COUNT_UNIT"), lift("fmtBytes"), lift("fmtProgress"), lift("agoStr"), lift("psHealth"),
              lift("diskRow"), lift("hotColdAdvisory"), lift("advRow"), lift("opsTarget"), lift("opsAgo"),
-             lift("nodeAddr"), lift("extChip"), lift("extentHealthRows"), lift("extentHealthBad"), lift("repairBtn"), lift("cancelBtn"),
+             lift("nodeAddr"), lift("extChip"), lift("extentHealthRows"), lift("extentHealthBad"), lift("statusRows"), lift("repairBtn"), lift("cancelBtn"),
              lift("renderLiveOps"), lift("renderOpsHistory")].join("\n");
 const now = Math.floor(Date.now() / 1000);
 let PURE = {};
@@ -53,22 +53,37 @@ OUT2.hotcoldBoth = advRow({kind:"hotcold", primary_part_id:8, secondary_part_id:
                            reason:"ps_id=2 qps_ratio=12 hot=[8, 9] cold=[4] size_ratio=20 hot=[8] cold=[4, 5]",
                            desc:"", action:null});
 OUT2.jsattr = jsAttr("it's");
-OUT2.ehDegraded = extentHealthRows({status:"HEALTH_WARN", sealed_extents:10, degraded:2, no_redundancy:1,
+OUT2.ehDegraded = extentHealthRows({sealed_extents:10, degraded:2, no_redundancy:1,
   unavailable:0, recovering:1, degraded_bytes:134217728,
   problems:[{extent_id:77, serving:1, total:3, needed:1, recovering:true,
              slots:[{slot:1, node_id:5, state:"unreachable", degraded_secs:812},
                     {slot:2, node_id:6, state:"behind", degraded_secs:0}]}]});
-OUT2.ehErr = extentHealthRows({status:"HEALTH_ERR", sealed_extents:4, degraded:0, no_redundancy:0,
+OUT2.ehErr = extentHealthRows({sealed_extents:4, degraded:0, no_redundancy:0,
   unavailable:1, recovering:0, degraded_bytes:1,
   problems:[{extent_id:9, serving:3, total:6, needed:4, recovering:false,
              slots:[{slot:3, node_id:2, state:"unreachable", degraded_secs:60}]}]});
-OUT2.ehRequested = extentHealthRows({status:"HEALTH_WARN", sealed_extents:3, degraded:1, no_redundancy:0,
+OUT2.ehRequested = extentHealthRows({sealed_extents:3, degraded:1, no_redundancy:0,
   unavailable:0, recovering:0, degraded_bytes:1, repair_requested_slots:1,
   problems:[{extent_id:41, serving:2, total:3, needed:1, recovering:false,
              slots:[{slot:2, node_id:7, state:"unreachable", degraded_secs:900, repair_requested:true}]}]});
-OUT2.ehClean = extentHealthRows({status:"HEALTH_OK", sealed_extents:4, degraded:0, no_redundancy:0,
+OUT2.ehClean = extentHealthRows({sealed_extents:4, degraded:0, no_redundancy:0,
   unavailable:0, recovering:0, degraded_bytes:0, problems:[]});
 OUT2.ehUnknown = extentHealthRows(null);
+const fleet = (members) => members.map(([id, state, age]) => ({id, address:"h"+id+":1", state, age_secs:age}));
+const status = (o) => Object.assign({sampled_at_ms:0, recovery_inflight:0,
+  managers:{leader:1, standby:1, expected:2, members:fleet([[1,"leader",0],[2,"standby",0]])},
+  partition_servers:{ready:3, expected:3, members:fleet([[1,"ready",1],[2,"ready",1],[3,"ready",2]])},
+  extent_nodes:{online:2, expected:2, members:fleet([[1,"online",1],[2,"online",2]])},
+  extents:{sealed:12, clean:12, degraded:0, unavailable:0}}, o);
+OUT2.stOk = statusRows(status({}));
+OUT2.stDown = statusRows(status({
+  managers:{leader:1, standby:0, expected:2, members:fleet([[1,"leader",0],[2,"absent",180]])},
+  partition_servers:{ready:2, expected:3, members:fleet([[1,"ready",1],[2,"ready",1],[7,"evicted",720]])},
+  extent_nodes:{online:1, expected:2, members:fleet([[1,"online",1],[4,"unknown (no df yet)",null]])},
+  extents:{sealed:12, clean:10, degraded:1, unavailable:1}, recovery_inflight:3}));
+OUT2.stEmpty = statusRows(status({partition_servers:{ready:0, expected:0, members:[]}}));
+OUT2.stUnknown = statusRows(null);
+OUT2.stNotLoaded = statusRows(undefined);
 OUT2.ehBad = [extentHealthBad(undefined), extentHealthBad(null),
               extentHealthBad({degraded:0, unavailable:0}), extentHealthBad({degraded:1, unavailable:0})];
 // A CoW split's shared extent, and a private one. The chip must NAME the other
@@ -123,8 +138,8 @@ want(live, "compact 9 50% · 3 / 6 blocks", "compact counts SST data blocks");
 // A finished op's reason is the whole point of the history list.
 want(hist, "recovery extent 31 disk offline", "failed history row shows the reason");
 
-// A PS with no heartbeat entry is UNKNOWN, not dead: the state is defensive
-// (replay and registration both seed one), and it must not paint the fleet red.
+// A PS with no heartbeat entry (and no eviction recorded) is UNKNOWN, not
+// dead, and must not paint the fleet red.
 const wantEq = (got, exp, why) => {
   if (got !== exp) { console.error(`FAIL: ${why} — got ${JSON.stringify(got)} want ${JSON.stringify(exp)}`); bad++; }
 };
@@ -198,6 +213,27 @@ want(hotcoldBoth, "small: part 4, part 5", "size cold list is decoded");
 // today (they are "part N" / "extent N" / "cluster"), which is exactly why the
 // helper is tested directly rather than through a contrived advisory.
 wantEq(PURE.jsattr, '"it\\u0027s"', "jsAttr escapes the apostrophe");
+
+// Status bar: every denominator is the expected member count, and each member
+// that is not up is named with its state. Unknown is never rendered as healthy.
+const stOk = text(PURE.stOk), stDown = text(PURE.stDown);
+want(stOk, "leader 1 / standby 1 (2 expected)", "managers: leader, standby, expected");
+want(stOk, "Ready 3/3", "PS ready over expected");
+want(stOk, "Online 2/2", "EN online over expected");
+want(stOk, "clean 12 / degraded 0 / unavailable 0", "extent counts");
+want(stOk, "inflight 0", "recovery in flight");
+want(stOk, "by manager 1 (h1:1)", "names the leader that sampled it");
+if (/dot (warn|bad)/.test(PURE.stOk)) { console.error("FAIL: a whole fleet is not flagged"); bad++; }
+want(stDown, "leader 1 / standby 0 (2 expected)", "a stopped standby stays expected");
+want(stDown, "2 h2:1 absent 3m ago", "…and is named");
+want(stDown, "Ready 2/3", "an evicted PS stays in the denominator");
+want(stDown, "7 h7:1 evicted 12m ago", "…and is named with its age");
+want(stDown, "Online 1/2", "an unanswered node is not online");
+want(stDown, "4 h4:1 unknown (no df yet)", "…and says why");
+want(PURE.stDown, 'dot bad"></span><span class="k">Extent', "an unavailable extent is red");
+want(text(PURE.stUnknown), "unknown the leader did not answer", "null is unknown, not healthy");
+want(PURE.stEmpty, 'dot warn"></span><span class="k">PS', "no expected PS is not a healthy fleet");
+wantEq(PURE.stNotLoaded, "", "nothing before the first load");
 
 // Shared-extent chip. This is asserted on the RENDERED string, not on the
 // helper that builds it: the first version of this feature computed the line

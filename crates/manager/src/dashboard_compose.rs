@@ -11,7 +11,7 @@ use autumn_rpc::manager_rpc::{
     FLEET_EN_MAINTENANCE, FLEET_EN_ONLINE, FLEET_EN_SUSPECTED, FLEET_EN_SUSPEND, FLEET_EN_UNKNOWN,
     FLEET_MANAGER_ABSENT, FLEET_MANAGER_LEADER, FLEET_MANAGER_STANDBY, FLEET_PS_EVICTED,
     FLEET_PS_OPENING, FLEET_PS_READY, FLEET_PS_SILENT, GetClusterOverviewResp, ListNodeStatesResp,
-    NodeCapWire, NodeStateEntry, PolicyCandidate, CODE_OK, HEALTH_ERR, HEALTH_OK, HEALTH_WARN,
+    NodeCapWire, NodeStateEntry, PolicyCandidate, CODE_OK,
     NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED, NODE_AUTO_STATE_SUSPEND,
     NODE_OVERRIDE_FENCED, NODE_OVERRIDE_MAINTENANCE, POLICY_KIND_EC, POLICY_KIND_GC,
     POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT,
@@ -60,15 +60,6 @@ fn node_override_kind_str(b: u8) -> &'static str {
     }
 }
 
-pub fn health_status_str(b: u8) -> &'static str {
-    match b {
-        HEALTH_OK => "HEALTH_OK",
-        HEALTH_WARN => "HEALTH_WARN",
-        HEALTH_ERR => "HEALTH_ERR",
-        _ => "HEALTH_UNKNOWN",
-    }
-}
-
 /// `SLOT_STATE_*` as the word `autumn-op health` and the page print.
 pub fn slot_state_str(b: u8) -> &'static str {
     match b {
@@ -87,7 +78,6 @@ pub fn slot_state_str(b: u8) -> &'static str {
 /// overview's `extent_health` field are this one shape.
 pub fn health_json(r: &ExtentHealthSummaryResp) -> serde_json::Value {
     json!({
-        "status": health_status_str(r.status),
         "sealed_extents": r.sealed_extents,
         "open_extents": r.open_extents,
         "clean": r.clean,
@@ -232,6 +222,7 @@ pub fn build_overview_json(
     node_states: &ListNodeStatesResp,
     candidates: &[PolicyCandidate],
     extent_health: Option<&ExtentHealthSummaryResp>,
+    status: Option<&ClusterStatusResp>,
     ts: i64,
 ) -> String {
     // Range-sort partitions: empty range_start (−∞) first, then bytewise.
@@ -461,6 +452,8 @@ pub fn build_overview_json(
         // `null` when the summary could not be read (off-leader, or a manager
         // that predates it): the page then says "unknown", never "healthy".
         "extent_health": extent_health.map(health_json),
+        // `null` likewise: the status bar then says unknown.
+        "status": status.map(status_json),
         "errors": errors,
     })
     .to_string()
@@ -521,7 +514,7 @@ mod capacity_tests {
             nodes: Vec::new(),
         };
         let value: serde_json::Value =
-            serde_json::from_str(&build_overview_json(&df, overview, &states, &[], None, 0)).unwrap();
+            serde_json::from_str(&build_overview_json(&df, overview, &states, &[], None, None, 0)).unwrap();
         assert_eq!(value["df"]["raw_used"], 1_250);
         assert_eq!(value["df"]["logical_size"], 1_000);
         assert_eq!(value["df"]["amplification"], 1.25);

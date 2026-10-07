@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::{
     rkyv_decode, rkyv_encode, ExtentHealthSummaryReq, ExtentHealthSummaryResp,
-    StreamAllocExtentReq, StreamAllocExtentResp, CODE_OK, HEALTH_OK, HEALTH_WARN,
+    StreamAllocExtentReq, StreamAllocExtentResp, CODE_OK,
     MSG_EXTENT_HEALTH_SUMMARY, MSG_STREAM_ALLOC_EXTENT, SLOT_STATE_UNREACHABLE,
 };
 use autumn_stream::{ConnPool, StreamClient};
@@ -84,7 +84,7 @@ fn a_replica_on_a_silent_node_is_degraded_until_the_node_returns() {
         assert_eq!(seal.code, CODE_OK, "seal failed: {}", seal.message);
 
         let before = summary(&mgr).await;
-        assert_eq!(before.status, HEALTH_OK, "{before:?}");
+        assert_eq!((before.degraded, before.unavailable), (0, 0), "{before:?}");
         assert!(before.sealed_extents >= 1 && before.clean == before.sealed_extents);
 
         let ex = sc.get_extent_info(extent).await.expect("extent info");
@@ -97,7 +97,7 @@ fn a_replica_on_a_silent_node_is_degraded_until_the_node_returns() {
         let start = Instant::now();
         let degraded = loop {
             let r = summary(&mgr).await;
-            if r.status == HEALTH_WARN {
+            if r.degraded > 0 {
                 break r;
             }
             assert!(
@@ -127,7 +127,7 @@ fn a_replica_on_a_silent_node_is_degraded_until_the_node_returns() {
         let start = Instant::now();
         loop {
             let r = summary(&mgr).await;
-            if r.status == HEALTH_OK {
+            if r.degraded == 0 && r.unavailable == 0 {
                 break;
             }
             assert!(

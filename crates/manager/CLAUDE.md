@@ -544,7 +544,9 @@ ledger. `managerAlive/` is read from etcd during the call (the only await;
 leadership is re-checked after it), and everything else is read at one
 instant stamped `sampled_at_ms`. A follower answers NOT_LEADER, never a stale
 view. Rendered by `autumn-op status [--json]` (`dashboard_compose::status_json`
-is the JSON shape). Tests: `cluster_status::tests` (classification) and
+is the JSON shape) and carried as the overview's `status` field
+(`build_overview_json`; `null` when the leader did not answer or predates the
+opcode), which the dashboard draws as its Overview status bar. Tests: `cluster_status::tests` (classification) and
 `tests/cluster_status_etcd.rs` (standby, evicted PS, a registered node that
 never answered, a stopped standby turning absent; ablations: counting only
 present managers, not telling an evicted PS apart — both red).
@@ -1649,8 +1651,10 @@ failure reason the fire-and-forget maintenance ops used to drop.
 
 ## Extent health (`extent_health.rs`)
 
-`MSG_EXTENT_HEALTH_SUMMARY` is the extent counterpart of Ceph's PG summary:
-`HEALTH_OK | WARN | ERR`, how many sealed extents are clean / degraded /
+`MSG_EXTENT_HEALTH_SUMMARY` is the extent counterpart of Ceph's PG summary,
+counts with no one-word verdict (the fleet is `MSG_GET_CLUSTER_STATUS`'s
+job): how many
+sealed extents are clean / degraded /
 without redundancy / unavailable / rebuilding, how many slots are in each
 `SLOT_STATE_*`, and the worst extents by name. One classification,
 `classify_slot(SlotFacts)`, serves the summary, the degraded clock and the
@@ -1663,7 +1667,7 @@ bit clear). A maintenance node whose copy still serves is SERVING.
 An extent's verdict compares serving copies with what a read needs
 (`needed_copies`: 1 for a replicated extent — parity slots of an unconverted
 extent are full replicas — and the data-shard count for an EC one): fewer →
-unavailable (ERR), fewer than all → degraded (WARN), exactly `needed` → also
+unavailable, fewer than all → degraded, exactly `needed` → also
 "no redundancy left". Open tails are counted, not classified (no `avali`, and a
 writer rolls off a replica it cannot reach). Worst first: least margin above
 `needed`, then the longest degraded slot.
@@ -1681,9 +1685,9 @@ between two ticks keeps its first time.
 Surfaced as `autumn-op [--json] health [--detail N]` and as the overview's
 `extent_health` field (`null` when the leader did not answer — the page says
 "unknown", never "healthy"), which the dashboard renders as alert rows. Test:
-`tests/extent_health_summary.rs` (a replica on a stopped node → WARN naming the
-extent and slot; back → OK; ablation: classify an unreachable node's copy as
-serving).
+`tests/extent_health_summary.rs` (a replica on a stopped node → degraded,
+naming the extent and slot; back → 0 degraded; ablation: classify an
+unreachable node's copy as serving).
 
 ## Extent repair (`extent_repair.rs`)
 

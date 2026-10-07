@@ -11,8 +11,8 @@
 use std::collections::HashMap;
 
 use autumn_rpc::manager_rpc::{
-    ExtentHealthSummaryResp, ProblemExtent, ProblemSlot, CODE_OK, HEALTH_ERR, HEALTH_OK,
-    HEALTH_WARN, NODE_OVERRIDE_FENCED, NODE_OVERRIDE_MAINTENANCE, NODE_OVERRIDE_NONE,
+    ExtentHealthSummaryResp, ProblemExtent, ProblemSlot, CODE_OK, NODE_OVERRIDE_FENCED,
+    NODE_OVERRIDE_MAINTENANCE, NODE_OVERRIDE_NONE,
     SLOT_STATE_BEHIND, SLOT_STATE_CORRUPT, SLOT_STATE_DISK_FAULTED, SLOT_STATE_FENCED,
     SLOT_STATE_MAINTENANCE, SLOT_STATE_SERVING, SLOT_STATE_UNREACHABLE,
 };
@@ -161,13 +161,6 @@ pub(crate) fn summarize(scan: HealthScan, max_problems: usize) -> ExtentHealthSu
         let longest = v.slots.iter().map(|(_, _, secs)| *secs).max().unwrap_or(0);
         problems.push((margin, longest, v));
     }
-    r.status = if r.unavailable > 0 {
-        HEALTH_ERR
-    } else if r.degraded > 0 {
-        HEALTH_WARN
-    } else {
-        HEALTH_OK
-    };
     // Worst first: unreadable, then the least margin above what a read needs,
     // then the slot that has been down longest.
     problems.sort_by_key(|(margin, longest, v)| {
@@ -514,7 +507,6 @@ mod tests {
             ),
             10,
         );
-        assert_eq!(r.status, HEALTH_WARN);
         assert_eq!((r.sealed_extents, r.open_extents), (3, 4));
         assert_eq!((r.clean, r.degraded, r.no_redundancy, r.unavailable), (1, 2, 1, 0));
         assert_eq!(r.degraded_bytes, 200);
@@ -538,7 +530,6 @@ mod tests {
             scan(vec![view(7, 4, &[(s, 0), (s, 0), (s, 0), (u, 5), (u, 5), (u, 5)])], 0),
             10,
         );
-        assert_eq!(r.status, HEALTH_ERR);
         assert_eq!((r.degraded, r.unavailable), (0, 1));
     }
 
@@ -559,10 +550,10 @@ mod tests {
     }
 
     #[test]
-    fn everything_clean_is_ok_and_lists_nothing() {
+    fn everything_clean_lists_nothing() {
         let s = SLOT_STATE_SERVING;
         let r = summarize(scan(vec![view(1, 1, &[(s, 0), (s, 0)])], 0), 10);
-        assert_eq!(r.status, HEALTH_OK);
+        assert_eq!((r.clean, r.degraded, r.unavailable), (1, 0, 0));
         assert!(r.problems.is_empty());
     }
 

@@ -24,7 +24,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use autumn_client::{decode_err, ClusterClient, DEFAULT_RPC_TIMEOUT};
 use autumn_manager::dashboard_compose::{
-    fleet_state_str, health_json, health_status_str, slot_state_str, status_json,
+    fleet_state_str, health_json, slot_state_str, status_json,
 };
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc::{
@@ -1210,13 +1210,12 @@ fn health_bytes(n: u64) -> String {
 /// The text form of `autumn-op health`, kept pure so a test can read it.
 fn render_health(r: &ExtentHealthSummaryResp) -> String {
     let mut lines = vec![
-        health_status_str(r.status).to_string(),
         format!(
-            "  extents: {} sealed, {} open (open tails are not classified)",
+            "extents: {} sealed, {} open (open tails are not classified)",
             r.sealed_extents, r.open_extents
         ),
         format!(
-            "  {} clean, {} degraded ({}), {} with no redundancy left, {} unavailable, \
+            "{} clean, {} degraded ({}), {} with no redundancy left, {} unavailable, \
              {} recovering",
             r.clean,
             r.degraded,
@@ -1228,7 +1227,7 @@ fn render_health(r: &ExtentHealthSummaryResp) -> String {
     ];
     if r.repair_requested_slots > 0 {
         lines.push(format!(
-            "  {} slot(s) with a standing repair request (`autumn-op repair --cancel` withdraws)",
+            "{} slot(s) with a standing repair request (`autumn-op repair --cancel` withdraws)",
             r.repair_requested_slots
         ));
     }
@@ -1240,7 +1239,7 @@ fn render_health(r: &ExtentHealthSummaryResp) -> String {
         .map(|(state, n)| format!("{n} {}", slot_state_str(state as u8)))
         .collect();
     if !slots.is_empty() {
-        lines.push(format!("  slots not serving: {}", slots.join(", ")));
+        lines.push(format!("slots not serving: {}", slots.join(", ")));
     }
     if !r.problems.is_empty() {
         lines.push("worst extents:".to_string());
@@ -1836,6 +1835,22 @@ async fn cmd_overview(client: &ClusterClient) -> Result<()> {
             None
         }
     };
+    let status = match client
+        .mgr_call(MSG_GET_CLUSTER_STATUS, bytes::Bytes::new())
+        .await
+        .map_err(|e| anyhow!(e))
+        .and_then(|b| rkyv_decode::<ClusterStatusResp>(&b).map_err(|e| anyhow!(e)))
+    {
+        Ok(r) if r.code == CODE_OK => Some(r),
+        Ok(r) => {
+            eprintln!("cluster status unavailable: {}", r.message);
+            None
+        }
+        Err(e) => {
+            eprintln!("cluster status unavailable: {e:#}");
+            None
+        }
+    };
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -1846,6 +1861,7 @@ async fn cmd_overview(client: &ClusterClient) -> Result<()> {
         &node_states,
         &candidates,
         extent_health.as_ref(),
+        status.as_ref(),
         ts,
     );
     println!("{out}");
@@ -4417,12 +4433,11 @@ mod tests {
     }
 
     #[test]
-    fn health_renders_status_counts_and_the_worst_extent() {
+    fn health_renders_counts_and_the_worst_extent() {
         let mut slot_counts = vec![0u64; 7];
         slot_counts[SLOT_STATE_UNREACHABLE as usize] = 2;
         let r = ExtentHealthSummaryResp {
             code: CODE_OK,
-            status: HEALTH_WARN,
             sealed_extents: 10,
             open_extents: 3,
             clean: 9,
@@ -4450,7 +4465,7 @@ mod tests {
             ..Default::default()
         };
         let text = render_health(&r);
-        assert!(text.starts_with("HEALTH_WARN\n"), "{text}");
+        assert!(text.starts_with("extents: 10 sealed, 3 open"), "{text}");
         assert!(text.contains("9 clean, 1 degraded (64.0 MiB), 1 with no redundancy left"), "{text}");
         assert!(text.contains("slots not serving: 2 unreachable"), "{text}");
         assert!(
@@ -4462,7 +4477,7 @@ mod tests {
         );
         assert!(text.contains("1 slot(s) with a standing repair request"), "{text}");
         let j = health_json(&r);
-        assert_eq!(j["status"], "HEALTH_WARN");
+        assert!(j.get("status").is_none(), "no single-word verdict: {j}");
         assert_eq!(j["slots_not_serving"]["unreachable"], 2);
         assert_eq!(j["problems"][0]["slots"][0]["state"], "unreachable");
         assert_eq!(j["problems"][0]["slots"][0]["repair_requested"], true);
