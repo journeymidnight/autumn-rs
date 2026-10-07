@@ -2890,6 +2890,15 @@ cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
 # must take writes at once, an immediate retry must flush before merging, and
 # nothing acked is lost) and a merged open with both
 # source cursors reclaimed (whole-log replay, every acked write reads back).
+# A compaction after the merge must not move the cursor back: the merged
+# record's cursor is the log tail, past every SST header, and GC's floor sits
+# there. Manual check: after `autumn-op merge` and `autumn-op compact <PART>`,
+# the PS log's `ckpt_trace` "checkpoint published" lines for that meta stream
+# show a vp_extent_id/vp_offset that never goes back, and the next restart's
+# `log replay done ... bytes=N` stays near zero. Deterministic form: cargo test
+# -p autumn-manager --test system_merge_single_checkpoint
+# a_compaction_after_a_merge_keeps_the_checkpoint_cursor (and --test
+# system_compact_ckpt_cursor for a flush that rolls the log mid-compaction).
 # Every merge goes through MSG_MERGE_PARTITIONS (`autumn-op merge`, the
 # policy); the raw merge opcode 0x34 is retired and refused.
 # Split does the same: its drain always writes a log-end checkpoint, so a child

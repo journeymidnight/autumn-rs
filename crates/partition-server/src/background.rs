@@ -176,6 +176,11 @@ pub fn gc_verdict_parked_count() -> u64 {
 /// Test sync point: while set, a compaction parks after publishing a progress
 /// sample, so a test can kill its PS with the op mid-flight. Only tests set it.
 static COMPACTION_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static COMPACTION_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How many compactions have parked on `COMPACTION_HOLD`.
+pub fn compaction_held_count() -> u64 {
+    COMPACTION_HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
 /// Set or release `COMPACTION_HOLD`. Only tests call this.
 pub fn set_compaction_hold(held: bool) {
     COMPACTION_HOLD.store(held, std::sync::atomic::Ordering::Relaxed);
@@ -362,8 +367,10 @@ pub(crate) fn compaction_output_vp_head(
 /// table the checkpoint lists is already durable in the row stream, and flushes
 /// commit in order, so all WAL below the newest boundary among them is in the
 /// listed set — the same argument as `compaction_output_vp_head`, taken over the
-/// whole set instead of the inputs. A boundary in an extent `log_extent_ids`
-/// (fetched before the merge) does not name yet is skipped, which only errs early.
+/// whole set instead of the inputs.
+///
+/// Only used when no checkpoint cursor is durable yet; see
+/// `compaction_checkpoint_cursor`.
 fn checkpoint_vp_head(
     readers: &[Arc<SstReader>],
     output_vp_head: (u64, u64),
@@ -374,6 +381,23 @@ fn checkpoint_vp_head(
             .chain(readers.iter().map(|r| (r.vp_extent_id, r.vp_offset))),
         log_extent_ids,
     )
+}
+
+/// The cursor a compaction's checkpoint publishes. Call under `publish_lock`.
+/// `durable` is the newest record's cursor and no live table is past it, so
+/// it is republished as is; a cursor rebuilt from the tables can fall behind
+/// it, below GC's floor. `(0, 0)` (none resolved at open) uses the tables.
+pub(crate) fn compaction_checkpoint_cursor(
+    durable: (u64, u64),
+    readers: &[Arc<SstReader>],
+    output_vp_head: (u64, u64),
+    log_extent_ids: &[u64],
+) -> (u64, u64) {
+    if durable.0 != 0 {
+        durable
+    } else {
+        checkpoint_vp_head(readers, output_vp_head, log_extent_ids)
+    }
 }
 
 pub(crate) async fn background_maintenance_loop(
@@ -2498,7 +2522,12 @@ async fn checkpoint_and_truncate_row_prefix(
         (
             p.tables.clone(),
             crate::snapshot_fence_floors(&p),
-            checkpoint_vp_head(&p.sst_readers, p.durable_ckpt_vp.get(), &log_ids),
+            compaction_checkpoint_cursor(
+                p.durable_ckpt_vp.get(),
+                &p.sst_readers,
+                (0, 0),
+                &log_ids,
+            ),
         )
     };
     save_table_locs_raw(&sc, meta_id, &tables, vp.0, vp.1, floors).await?;
@@ -2891,6 +2920,9 @@ pub(crate) async fn do_compact(
                 done,
                 total,
             );
+            if COMPACTION_HOLD.load(std::sync::atomic::Ordering::Relaxed) {
+                COMPACTION_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             while COMPACTION_HOLD.load(std::sync::atomic::Ordering::Relaxed) {
                 compio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -3057,7 +3089,8 @@ pub(crate) async fn do_compact(
             sst_readers.push(reader);
         }
         crate::sort_tables_by_seq(&mut tables, &mut sst_readers);
-        let ckpt_vp = checkpoint_vp_head(
+        let ckpt_vp = compaction_checkpoint_cursor(
+            p.durable_ckpt_vp.get(),
             &sst_readers,
             (compact_vp_eid, compact_vp_off),
             &log_extent_ids,

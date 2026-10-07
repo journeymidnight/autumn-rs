@@ -1218,9 +1218,15 @@ meta_stream checkpoint — set in `commit_flush_outcome_inner` AFTER
 checkpoint's cursor when there is exactly ONE checkpoint record (it is durable
 and recovery replays from it). With several (a merge's sources) the open
 publishes one merged record before serving and sets it from that; until the
-append acks it is `(0,0)` — the MIN. A compaction's ack does not set it: its
-append may ack after a newer flush's and move the floor back; the next flush
-covers it. Every log record strictly
+append acks it is `(0,0)` — the MIN. Freeze checkpoints (merge/split) set it to
+the frozen log tail. Every publisher holds `publish_lock`, so it is always the
+newest record's cursor, and a compaction (real or no-op) REPUBLISHES it
+(`compaction_checkpoint_cursor`) instead of rebuilding a cursor from the
+tables' vp_heads: a rebuilt one fell behind a merged/freeze cursor (the log
+tail, past every SST header) and behind a flush that rolled the log after the
+compaction fetched its extent list, while the floor stayed here — GC then
+deleted the extent the newest record names and the next open needed the
+whole-log fallback. Only `(0,0)` falls back to the tables. Every log record strictly
 below a durable checkpoint vp is in that checkpoint's persisted SST set (or
 compaction-dead), so `[MIN, durable-vp)` is safe to punch.
 

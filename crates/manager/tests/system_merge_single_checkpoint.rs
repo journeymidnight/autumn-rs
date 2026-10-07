@@ -285,3 +285,182 @@ fn a_merge_survivor_holds_one_checkpoint_and_restarts_without_replay() {
         "a restart after the merge replayed {replayed} WAL bytes"
     );
 }
+
+/// The last checkpoint record of `meta_stream`: its cursor and table count.
+async fn last_checkpoint(mgr_addr: SocketAddr, meta_stream: u64) -> ((u64, u64), usize) {
+    let sc = StreamClient::connect(
+        &mgr_addr.to_string(),
+        "merge-checkpoint-test".to_string(),
+        128 * 1024 * 1024,
+        Rc::new(ConnPool::new()),
+    )
+    .await
+    .expect("stream client");
+    let info = sc.get_stream_info(meta_stream).await.expect("meta stream info");
+    let eid = *info.extent_ids.last().expect("meta extent");
+    let (payload, _) = sc
+        .read_bytes_from_extent(eid, 0, 0)
+        .await
+        .expect("read meta extent");
+    let locs = decode_last_table_locations(&payload);
+    ((locs.vp_extent_id, locs.vp_offset), locs.locs.len())
+}
+
+async fn force_gc(router: &PsRouter, extent_ids: Vec<u64>) {
+    let c = router.client_for(SURVIVOR).await;
+    let resp = c
+        .call(
+            autumn_rpc::partition_rpc::MSG_MAINTENANCE,
+            autumn_rpc::partition_rpc::rkyv_encode(&autumn_rpc::partition_rpc::MaintenanceReq {
+                part_id: SURVIVOR,
+                op: autumn_rpc::partition_rpc::MAINTENANCE_FORCE_GC,
+                extent_ids,
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_dead_bytes_high: None,
+                gc_empty_only: false,
+                gc_policy_is_standing: false,
+                op_id: 0,
+            }),
+        )
+        .await
+        .expect("forcegc");
+    let r: autumn_rpc::partition_rpc::MaintenanceResp =
+        autumn_rpc::partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+    assert_eq!(r.code, CODE_OK, "forcegc: {}", r.message);
+}
+
+/// The merged open publishes the log tail as its cursor, past every SST's own
+/// content boundary. A compaction that rebuilt the cursor from those
+/// boundaries moved the checkpoint back while GC kept the tail as its floor,
+/// so GC deleted the extent the newest checkpoint names.
+#[test]
+fn a_compaction_after_a_merge_keeps_the_checkpoint_cursor() {
+    let mgr_addr = pick_addr();
+    let en_addr = pick_addr();
+    start_manager(mgr_addr);
+    let dir = tempfile::tempdir().expect("tempdir");
+    start_extent_node(en_addr, dir.path().to_path_buf(), 1);
+    let (survivor_log, victim_log, survivor_meta) =
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None)
+                .await
+                .expect("mgr");
+            let _ = register_node(&mgr, &en_addr.to_string(), "uuid-merge-compact").await;
+            let (s_log, s_row, s_meta) = (
+                create_stream(&mgr, 1).await,
+                create_stream(&mgr, 1).await,
+                create_stream(&mgr, 1).await,
+            );
+            let (v_log, v_row, v_meta) = (
+                create_stream(&mgr, 1).await,
+                create_stream(&mgr, 1).await,
+                create_stream(&mgr, 1).await,
+            );
+            upsert_partition(&mgr, SURVIVOR, s_log, s_row, s_meta, b"", b"m").await;
+            upsert_partition(&mgr, VICTIM, v_log, v_row, v_meta, b"m", b"\xff").await;
+            (s_log, v_log, s_meta)
+        });
+
+    let ps_addr = pick_addr();
+    let stop = Arc::new(AtomicBool::new(false));
+    let join = spawn_ps(mgr_addr, ps_addr, stop.clone());
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let router = PsRouter::new(mgr_addr, ps_addr);
+        for i in 0..SURVIVOR_KEYS {
+            psr_put(&router, SURVIVOR, survivor_key(i).as_bytes(), &vec![b's'; VALUE]).await;
+            if i == 499 {
+                roll_log_tail(mgr_addr, survivor_log).await;
+            }
+        }
+        psr_flush(&router, SURVIVOR).await;
+        for i in 0..VICTIM_KEYS {
+            psr_put(&router, VICTIM, victim_key(i).as_bytes(), &vec![b'v'; VALUE]).await;
+            if i == 1499 {
+                roll_log_tail(mgr_addr, victim_log).await;
+            }
+        }
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None)
+            .await
+            .expect("mgr");
+        let bytes = mgr
+            .call(
+                MSG_MERGE_PARTITIONS,
+                rkyv_encode(&MergePartitionsReq {
+                    survivor_part_id: SURVIVOR,
+                    victim_part_id: VICTIM,
+                    force: false,
+                }),
+            )
+            .await
+            .expect("merge call");
+        let resp: MergePartitionsResp = rkyv_decode(&bytes).expect("merge resp");
+        assert_eq!(resp.code, CODE_OK, "merge: {}", resp.message);
+        wait_serving(&router, victim_key(0).as_bytes()).await;
+
+        let (merged_cursor, merged_tables) = last_checkpoint(mgr_addr, survivor_meta).await;
+        assert!(merged_tables >= 2, "both sources' SSTs: {merged_tables}");
+
+        psr_compact(&router, SURVIVOR).await;
+        let started = Instant::now();
+        let compacted_cursor = loop {
+            let (cursor, tables) = last_checkpoint(mgr_addr, survivor_meta).await;
+            if tables < merged_tables {
+                break cursor;
+            }
+            assert!(started.elapsed() < Duration::from_secs(60), "compaction never published");
+            compio::time::sleep(Duration::from_millis(100)).await;
+        };
+        assert_eq!(
+            compacted_cursor, merged_cursor,
+            "the compaction moved the checkpoint cursor back"
+        );
+
+        // GC everything behind the tail; the extent the checkpoint names must stay.
+        let log = stream_extent_ids(mgr_addr, survivor_log).await;
+        let behind: Vec<u64> = log[..log.len() - 1].to_vec();
+        force_gc(&router, behind.clone()).await;
+        let started = Instant::now();
+        loop {
+            let now = stream_extent_ids(mgr_addr, survivor_log).await;
+            let (cursor, _) = last_checkpoint(mgr_addr, survivor_meta).await;
+            assert!(
+                now.contains(&cursor.0),
+                "GC deleted extent {} that the newest checkpoint names (log now {now:?})",
+                cursor.0
+            );
+            if behind.iter().filter(|e| now.contains(e)).count() <= 1 {
+                break;
+            }
+            if started.elapsed() > Duration::from_secs(30) {
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(200)).await;
+        }
+    });
+    stop_ps(&stop, join);
+
+    let before = replay_read_bytes(SURVIVOR);
+    let ps_addr = pick_addr();
+    let stop = Arc::new(AtomicBool::new(false));
+    let join = spawn_ps(mgr_addr, ps_addr, stop.clone());
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let router = PsRouter::new(mgr_addr, ps_addr);
+        wait_serving(&router, victim_key(0).as_bytes()).await;
+        for i in 0..SURVIVOR_KEYS {
+            let r = psr_get(&router, SURVIVOR, survivor_key(i).as_bytes()).await;
+            assert_eq!(r.code, CODE_OK, "{} lost", survivor_key(i));
+        }
+        for i in 0..VICTIM_KEYS {
+            let r = psr_get(&router, SURVIVOR, victim_key(i).as_bytes()).await;
+            assert_eq!(r.code, CODE_OK, "{} lost", victim_key(i));
+        }
+    });
+    let replayed = replay_read_bytes(SURVIVOR) - before;
+    stop_ps(&stop, join);
+    assert!(
+        replayed < TAIL_REPLAY_BOUND,
+        "a restart after merge + compaction + GC replayed {replayed} WAL bytes"
+    );
+}

@@ -1276,28 +1276,16 @@ pub(crate) struct PartitionData {
     pub(crate) gc_debt_basis: RefCell<Option<crate::background::GcDebtBasis>>,
     vp_extent_id: u64,
     vp_offset: u64,
-    /// BUG2 (GC replay-floor tightening): the vp_head of
-    /// the newest FLUSH-published, *durably ACKed* meta_stream checkpoint of
-    /// THIS partition incarnation. `(0,0)` until the first flush commit acks.
-    ///
-    /// Set ONLY after `save_table_locs_raw` returns `Ok` in
-    /// `commit_flush_outcome_inner` — NEVER from in-memory state (`vp_*` or a
-    /// MAX over live readers), and NEVER from a compaction publish (whose
-    /// `compaction_output_vp_head` = MAX(input vp_heads) can regress backward).
-    /// Rationale: the in-memory cursor (`vp_*`) runs past acked writes no SST
-    /// holds yet, so a floor derived from in-memory state can run ahead of what
-    /// a crash-time recovery will actually load — GC could punch a log region
-    /// whose naming checkpoint never landed → silent loss. This ack-gated value lets GC raise its
-    /// replay floor to reclaim the fully-covered `[MIN-over-SST-vps, this)`
-    /// region safely (proof: [[gc_replay_floor]] + the flush vp_head content-
-    /// boundary invariant). Seeded at open from the recovered checkpoint's
-    /// cursor when there is exactly ONE checkpoint record: it is durable, and
-    /// recovery replays from it. With several (a merge's sources) the open
-    /// publishes one merged record before serving (`publish_merged_checkpoint`)
-    /// and sets this from it; until then it is the conservative MIN. A
-    /// compaction's ack does not set it: its
-    /// append may ack after a newer flush's, which would move the floor back;
-    /// the next flush covers it.
+    /// The cursor of the newest durably ACKed checkpoint record; GC raises its
+    /// replay floor to it (`gc_floor_raise_to_durable_ckpt`). Every publisher
+    /// holds `publish_lock`. Flush, freeze and merged publishes set it after
+    /// their append acks; a compaction republishes it unchanged
+    /// (`compaction_checkpoint_cursor`), so no record falls behind the floor.
+    /// Never set from in-memory state (`vp_*` runs past acked writes no SST
+    /// holds yet, and a floor there could outrun what recovery loads). Seeded
+    /// at open from the single recovered record's cursor when it resolves;
+    /// several records (a merge's sources) are replaced by a merged record
+    /// before serving. `(0,0)` = none resolved: GC keeps the MIN-over-SST floor.
     durable_ckpt_vp: Cell<(u64, u64)>,
     stream_client: Rc<StreamClient>,
     /// This partition's SST block cache, owned by the `PartitionServer` and
@@ -1469,22 +1457,11 @@ pub(crate) struct PartitionData {
     /// tears down the source partition even though its in-memory
     /// state is already correct — a 5-60+ s outage per split.
     pub(crate) opened_with_shared: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
-    /// BUG-LEASE-2 (coco P0 #2, 2026-06-05) — Phase 1 storage-layer
-    /// fencing token. Per-inode floor of the highest `lease_epoch`
-    /// this PS has ever accepted a write under. A write whose
-    /// stamped `inode_hint != 0` AND `lease_epoch < floor` is
-    /// rejected with `CODE_FENCED`; on acceptance the floor is
-    /// bumped to `max(floor, lease_epoch)`.
-    ///
-    /// **Phase 1 scope:** IN-MEMORY ONLY. A PS restart wipes the
-    /// floors and the next write per ino warms them from zero.
-    /// During the window between restart and the first write of a
-    /// post-restart writer, an old stale-epoch RPC from a
-    /// previously-revoked writer would slip through. Phase 2
-    /// extends this with WAL persistence (each accepted write
-    /// records the floor alongside the value, replay rebuilds
-    /// the map) — tracked separately, see feature_list.md
-    /// BUG-LEASE-2.
+    /// Per-inode floor of the highest `lease_epoch` this PS has accepted a
+    /// write under. A write with `inode_hint != 0` and `lease_epoch < floor`
+    /// is rejected with `CODE_FENCED`; a higher epoch raises the floor and
+    /// appends an `OP_FENCE_BUMP` WAL record before the ACK. Recovered from
+    /// the checkpoint's `fence_floors` snapshot plus replayed bump records.
     pub(crate) fence_floors: FenceFloors,
 }
 
