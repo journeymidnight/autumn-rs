@@ -331,7 +331,14 @@ autumn-op --manager $MGR --json info --part <PID> --detail \
 - **Failover honesty**: the live ledger is leader-local (in-memory, cap 256).
   After a leader change, `ops status <old-id>` answers `unknown` (never a false
   `running`); durable terminal history is in `autumn-op audit-log`. A PS-executed
-  op whose outcome never arrives flips to `unknown` after 30 min.
+  op (compact/gc/forcegc) flips to `unknown` within one load report (~5 s) once
+  its partition is reopened (PS restart / move / merge) — "partition N was
+  reopened (owner epoch A -> B)…" — and a resubmit then starts a new op. One
+  whose outcome never arrives without a reopen flips to `unknown` after 30 min.
+  Manual check: `autumn-op compact <PART>` on a partition large enough to take
+  a while, restart its PS while `ops status <ID>` shows a percentage, then
+  `ops status <ID>` → `unknown … reopened …` within ~10 s of the PS serving
+  again, and `autumn-op compact <PART>` returns a new op id.
 - **Dedup**: re-submitting the same target while one is in flight returns the
   existing `op_id` ("attached") rather than double-dispatching.
 

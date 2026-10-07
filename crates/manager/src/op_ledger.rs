@@ -12,7 +12,7 @@
 //! Pure data structure — the manager passes wall-clock in (`now_s` / `now_ms`),
 //! so this is unit-testable without a clock or a cluster.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use autumn_rpc::manager_rpc::{
     OpQueryReq, OpRecord, OP_KIND_COMPACT, OP_KIND_EC_CONVERT, OP_KIND_FORCE_GC, OP_KIND_GC,
@@ -35,6 +35,9 @@ pub(crate) struct OpLedger {
     seq: u16,
     /// Terminal records not yet written to durable history (see `op_log`).
     pending_log: Vec<OpRecord>,
+    /// RUNNING compact/gc/forcegc op -> the owner epoch of its partition when
+    /// it was dispatched. The task lives in that open's memory only.
+    ps_dispatch_epochs: HashMap<u64, Option<i64>>,
 }
 
 impl OpLedger {
@@ -665,6 +668,58 @@ impl OpLedger {
         }
     }
 
+    /// A compact/gc/forcegc op was handed to its PS while the partition's
+    /// owner epoch was `owner_epoch`.
+    pub(crate) fn note_ps_dispatch(&mut self, op_id: u64, owner_epoch: Option<i64>) {
+        if self.is_active_op(op_id) {
+            self.ps_dispatch_epochs.insert(op_id, owner_epoch);
+        }
+    }
+
+    /// End every dispatched compact/gc/forcegc whose partition has been
+    /// opened again since (PS restart, move, merge): the reopen started with an
+    /// empty queue, so the task will not run or report. UNKNOWN, not FAILED —
+    /// it may have finished just before, with the report lost. A late real
+    /// outcome still overwrites it (`accepts_terminal_report`). Returns the
+    /// ops ended, with the reason.
+    pub(crate) fn sweep_reopened(
+        &mut self,
+        epoch_of: impl Fn(u64) -> Option<i64>,
+        now_s: i64,
+    ) -> Vec<(u64, String)> {
+        let mut ended = Vec::new();
+        let entries = &mut self.entries;
+        self.ps_dispatch_epochs.retain(|&op_id, &mut dispatched| {
+            let Some(e) = entries
+                .iter_mut()
+                .find(|e| e.op_id == op_id && e.state == OP_STATE_RUNNING)
+            else {
+                return false;
+            };
+            let now_epoch = epoch_of(e.part_id);
+            if now_epoch == dispatched {
+                return true;
+            }
+            let show = |x: Option<i64>| x.map_or_else(|| "none".to_string(), |v| v.to_string());
+            let why = format!(
+                "partition {} was reopened (owner epoch {} -> {}); the op did not survive \
+                 it and its outcome was not reported",
+                e.part_id,
+                show(dispatched),
+                show(now_epoch)
+            );
+            e.state = OP_STATE_UNKNOWN;
+            e.message = why.clone();
+            e.finished_at = now_s;
+            ended.push((op_id, why));
+            false
+        });
+        for (op_id, _) in &ended {
+            self.queue_terminal(*op_id);
+        }
+        ended
+    }
+
     /// Answer a query. `op_id != 0` → one record, synthesizing `UNKNOWN` when it
     /// isn't in this leader's ledger (never a false RUNNING). `op_id == 0` → a
     /// filtered list (active-only / kind / limit), newest-first.
@@ -1011,6 +1066,43 @@ mod tests {
             "a genuine terminal state is NOT superseded by a later retransmit"
         );
         assert_eq!(q_one(&led, id).state, OP_STATE_FAILED);
+    }
+
+    /// A compaction queued on a PS dies with the partition's open. Left
+    /// RUNNING, every resubmit attached to the dead op until the 30 min TTL.
+    #[test]
+    fn a_reopened_partition_ends_its_dispatched_op() {
+        let mut led = OpLedger::new();
+        let (id, _) = led.submit(OP_KIND_COMPACT, 7, 0, vec![], "cli".into(), 100, 100_000);
+        led.set_running(id, 100);
+        led.note_ps_dispatch(id, Some(40));
+        let (other, _) = led.submit(OP_KIND_GC, 8, 0, vec![], "cli".into(), 100, 100_001);
+        led.set_running(other, 100);
+        led.note_ps_dispatch(other, Some(41));
+        led.update_progress(id, 21, 100);
+
+        // Same epoch: still running.
+        assert!(led.sweep_reopened(|p| Some(if p == 7 { 40 } else { 41 }), 101).is_empty());
+        assert_eq!(q_one(&led, id).state, OP_STATE_RUNNING);
+
+        // Partition 7 reopened; 8 did not.
+        let ended = led.sweep_reopened(|p| Some(if p == 7 { 50 } else { 41 }), 102);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].0, id);
+        assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN);
+        assert_eq!(q_one(&led, other).state, OP_STATE_RUNNING);
+        assert_eq!(led.drain_pending_log().len(), 1, "the end goes to history");
+
+        let (fresh, attached) =
+            led.submit(OP_KIND_COMPACT, 7, 0, vec![], "cli".into(), 103, 103_000);
+        assert!(!attached, "a resubmit must start a new op");
+        assert_ne!(fresh, id);
+
+        // A real outcome that does arrive still wins.
+        assert!(led.reconcile_outcome(id, OP_STATE_SUCCEEDED, String::new(), String::new(), 104));
+        // Ended ops leave the epoch map.
+        assert!(led.sweep_reopened(|_| Some(99), 105).len() == 1, "only `other` is left");
+        assert!(led.ps_dispatch_epochs.is_empty());
     }
 
     #[test]

@@ -173,6 +173,14 @@ pub fn gc_verdict_parked_count() -> u64 {
     GC_VERDICT_PARKED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Test sync point: while set, a compaction parks after publishing a progress
+/// sample, so a test can kill its PS with the op mid-flight. Only tests set it.
+static COMPACTION_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set or release `COMPACTION_HOLD`. Only tests call this.
+pub fn set_compaction_hold(held: bool) {
+    COMPACTION_HOLD.store(held, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Test failpoint: when armed, the next compaction fails its checkpoint as an
 /// append that never landed, after its outputs are in the row stream.
 /// One-shot; only ever set by tests.
@@ -2883,6 +2891,9 @@ pub(crate) async fn do_compact(
                 done,
                 total,
             );
+            while COMPACTION_HOLD.load(std::sync::atomic::Ordering::Relaxed) {
+                compio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
         }
         // Snapshot the current item's needed fields. We can't hold the
         // `&IterItem` borrow across `merge.next()` (mutable borrow), and

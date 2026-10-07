@@ -5014,6 +5014,7 @@ impl AutumnManager {
             }
         }
         self.reconcile_unknown_splits(now).await;
+        self.settle_reopened_maintenance(now);
         // Write this heartbeat's own terminal records to durable history —
         // after the loop above queued them, so a completion does not wait for
         // the next heartbeat to become durable.

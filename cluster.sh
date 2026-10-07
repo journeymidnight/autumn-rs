@@ -613,6 +613,9 @@ launch_ps() {
     if [[ -n "${AUTUMN_READ_HEDGE_MS:-}" ]]; then
         tunable_args+=(--read-hedge-ms "$AUTUMN_READ_HEDGE_MS")
     fi
+    if [[ -n "${AUTUMN_PS_FLUSH_MEM_BYTES:-}" ]]; then
+        tunable_args+=(--flush-mem-bytes "$AUTUMN_PS_FLUSH_MEM_BYTES")
+    fi
     if [[ -n "${AUTUMN_SST_BLOCK_CACHE_BYTES:-}" ]]; then
         tunable_args+=(--sst-block-cache-bytes "$AUTUMN_SST_BLOCK_CACHE_BYTES")
     fi

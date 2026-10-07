@@ -1544,9 +1544,23 @@ failure reason the fire-and-forget maintenance ops used to drop.
   `PartitionLoad`, and `handle_report_partition_load` reconciles by op_id
   (`reconcile_outcome`, once) + audits. ec-convert closes via
   `apply_ec_conversion_done → complete_ec(extent_id)`.
+- **Reopen settles PS-executed ops**: the queued/running task lives only in
+  the partition's open (cap-1 channel + in-memory progress/outcome ring), and
+  every open acquires a fresh `partition/<id>` owner epoch. Dispatch records the
+  epoch (`note_ps_dispatch`, read from the pre-send snapshot); the load heartbeat
+  and the policy tick call `settle_reopened_maintenance` → `sweep_reopened`,
+  which flips an op to `Unknown` once the epoch moved (PS restart, move, merge
+  reopen). `Unknown`, not `Failed`: the compaction may have committed just
+  before the reopen with only its report lost; after the reopen the EN tail
+  fence rejects the old open's appends, so it cannot commit later. A real
+  outcome that still arrives overwrites `Unknown` (`accepts_terminal_report`)
+  and is written to `opLog/` as a second row (only the same-PS race where the
+  reopen lands between the dispatch snapshot and the send can produce one).
+  Without this a restarted PS left the op Running for 30 min and every
+  resubmit attached to the dead op.
 - **TTL backstop**: a Running compact/gc/forcegc older than 30 min flips to
-  `Unknown` (`sweep_running_ttl`, on the leader policy tick) — a lost PS outcome
-  never sits Running forever. **Attach-dedup**: a resubmit of the same
+  `Unknown` (`sweep_running_ttl`, on the leader policy tick) — covers a PS that
+  stops reporting without the partition being reopened. **Attach-dedup**: a resubmit of the same
   `(kind, part_id, secondary_id)` while active returns the existing op_id.
 - **Auto-dispatched kinds** (`OP_KIND_RECOVERY`): extent recovery is entered by
   the recovery loop, not by a submit — `MSG_OP_SUBMIT` REFUSES it. Hooks:

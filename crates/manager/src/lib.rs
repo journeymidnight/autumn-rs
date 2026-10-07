@@ -1618,6 +1618,7 @@ impl AutumnManager {
             // whose terminal outcome never came back to UNKNOWN, keeping
             // `ops status` honest instead of RUNNING forever.
             self.ops.borrow_mut().sweep_running_ttl(Self::epoch_seconds());
+            self.settle_reopened_maintenance(Self::epoch_seconds());
             self.sweep_silent_scrub_ops(Self::epoch_seconds());
             self.reconcile_unknown_splits(Self::epoch_seconds()).await;
             // Backstop drain: kinds no PS reports (recovery, ec-convert) close
@@ -2257,6 +2258,21 @@ impl AutumnManager {
         }
     }
 
+    /// End the compact/gc/forcegc ops whose partition was opened again after
+    /// dispatch — see `OpLedger::sweep_reopened`.
+    pub(crate) fn settle_reopened_maintenance(&self, now_s: i64) {
+        let ended = {
+            let state = self.store.inner.borrow();
+            self.ops.borrow_mut().sweep_reopened(
+                |part_id| crate::split_op::owner_epoch_of(&state, part_id),
+                now_s,
+            )
+        };
+        for (op_id, why) in ended {
+            tracing::warn!(target: "autumn::op_event", op_id, reason = %why, "maintenance op UNKNOWN");
+        }
+    }
+
     /// Dispatch ONE submitted op through the controller's actuation building
     /// blocks and report how the ledger should transition.
     async fn actuate_submitted_op(
@@ -2477,8 +2493,12 @@ impl AutumnManager {
                 let gc_debt_high = self.policy.borrow().config.gc_debt_high;
                 let req =
                     maintenance_req_for_submitted_op(spec, op, extent_ids, op_id, gc_debt_high);
+                // Taken before the send: a reopen racing the send then reads as
+                // a move, and the op's own report overrules that.
+                let owner_epoch = crate::split_op::owner_epoch_of(state, spec.part_id);
                 match self.send_maintenance(req, state).await {
                     Ok(resp) if resp.code == autumn_rpc::partition_rpc::CODE_OK => {
+                        self.ops.borrow_mut().note_ps_dispatch(op_id, owner_epoch);
                         ActuationResult::Dispatched {
                             message: resp.message,
                         }
