@@ -303,6 +303,29 @@ impl OpLedger {
         );
     }
 
+    /// Close a recovery entry whose need went away without a rebuild (the copy
+    /// serves again, the extent is gone). Nothing failed, and nothing is left to
+    /// retry, so it ends SUCCEEDED with the reason in its message.
+    pub(crate) fn withdraw_recovery(&mut self, extent_id: u64, reason: &str, now_s: i64) {
+        self.complete_by_extent(
+            OP_KIND_RECOVERY,
+            extent_id,
+            OP_STATE_SUCCEEDED,
+            format!("no rebuild needed any more: {reason}"),
+            String::new(),
+            now_s,
+        );
+    }
+
+    /// Extents with an active recovery entry.
+    pub(crate) fn active_recovery_extents(&self) -> Vec<u64> {
+        self.entries
+            .iter()
+            .filter(|e| e.kind == OP_KIND_RECOVERY && Self::is_active(e.state))
+            .map(|e| e.secondary_id)
+            .collect()
+    }
+
     pub(crate) fn complete_recovery(&mut self, extent_id: u64, message: String, now_s: i64) {
         self.complete_by_extent(
             OP_KIND_RECOVERY,

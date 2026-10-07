@@ -814,6 +814,18 @@ calls** in `apply_recovery_done`/drain (a stray release double-counts down). Bac
 is independent of the marker and **never gives up** (candidates re-derived from
 `s.extents` each tick; manager restart resets backoff → immediate retry), so
 `backoff_entries = 0` means "nothing in a backoff window now", not "not retrying".
+Backoff belongs to the NEED, not to an attempt: each tick keeps only the backoff
+of slots its pass judged `Rebuild`, of slots whose Keep is not yet a verdict (a
+repair request waiting on an in-place catch-up; a node this term has no
+first-hand `df` from, whose faulted disk would read healthy) and of extents
+under EC conversion (`end_rebuilds_no_longer_owed`); deleted and unsealed
+extents lose theirs. The no-`df` hold lasts as long as the node stays silent,
+up to the whole term for an unfenced dead node; `health` then reports that
+slot unreachable, so the views still agree that something is owed. A failed
+dispatch drains its marker but leaves the backoff behind, and a slot that stops
+needing a rebuild (unfence: the copy serves again) is never dispatched again,
+so without that the backoff outlived the need in `recovery-stats`
+(`an_unfence_ends_the_failed_rebuild_s_backoff_and_op`).
 `record_dispatch_outcome` takes the `Result` so the failure reason is preserved
 (`recovery-stats`). `max_per_target` (default 2,
 `AUTUMN_MGR_RECOVERY_MAX_PER_TARGET`) should track the EN's `recovery_max` (default
@@ -1453,7 +1465,15 @@ failure reason the fire-and-forget maintenance ops used to drop.
   arm → `record_recovery_failure`, which **keeps the entry RUNNING** (the loop
   retries with exponential backoff and never gives up) while carrying the last
   reason + `error_code` (`err_to_code`) + consecutive-failure count;
-  `apply_recovery_done` → `complete_recovery`. This is why recovery belongs in
+  `apply_recovery_done` → `complete_recovery`. When the need goes away
+  without a rebuild, the entry ends SUCCEEDED as "no rebuild needed any more:
+  …" (`withdraw_recovery`): from the healthy-slot marker release, and each
+  tick for an extent with an active entry, no slot judged `Rebuild` and no
+  Recovery marker (a failed dispatch leaves exactly that: a RUNNING entry
+  and no marker); the slots whose Keep is not yet a verdict count as owed.
+  The entry's last failure is not kept (SUCCEEDED clears `error`); the
+  leader log has it. A late completion of a released attempt is still refused
+  ("recovery attempt changed"); that guard is unchanged. This is why recovery belongs in
   the ledger: a repair looping on the same failure is otherwise invisible
   per-extent (only aggregate in `recovery-stats`).
 - **`error` on a RUNNING op is deliberate** for auto-retrying kinds — it is the

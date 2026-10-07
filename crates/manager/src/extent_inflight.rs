@@ -1357,6 +1357,7 @@ mod tests {
             m._test_acquire_marker(20, recovery_payload(20))
                 .await
                 .unwrap();
+            m.ops.borrow_mut().note_recovery_dispatch(20, 0, 9, 1, 1_000);
 
             m.recovery_dispatch_tick().await;
             assert_eq!(
@@ -1376,6 +1377,199 @@ mod tests {
             let lim = m.recovery_limiter.borrow();
             assert_eq!(lim.global_inflight, 0);
             assert_eq!(lim.snapshot(), (vec![], vec![]));
+            let ops = m.ops.borrow().query(&autumn_rpc::manager_rpc::OpQueryReq {
+                op_id: 0,
+                active_only: false,
+                kind_filter: autumn_rpc::manager_rpc::OP_KIND_RECOVERY,
+                limit: 0,
+            });
+            assert_eq!(ops.len(), 1);
+            assert_eq!(ops[0].state, autumn_rpc::manager_rpc::OP_STATE_SUCCEEDED);
+            assert_eq!(
+                ops[0].message,
+                "no rebuild needed any more: source slot is healthy again"
+            );
+        });
+    }
+
+    /// A rebuild whose dispatch failed leaves a backoff entry and a RUNNING
+    /// recovery op behind it, with no marker. When the need goes away (unfence:
+    /// the copy serves again) the tick must end both — otherwise
+    /// `recovery-stats` and `ops list` keep reporting a repair that `health`
+    /// rightly says is not happening.
+    #[test]
+    fn an_unfence_ends_the_failed_rebuild_s_backoff_and_op() {
+        use autumn_rpc::manager_rpc::{OpQueryReq, OP_KIND_RECOVERY};
+        run(async {
+            let m = AutumnManager::new();
+            // Node 1 holds the copy; node 9 is the only rebuild candidate and
+            // nothing listens at its address, so every dispatch fails.
+            for (id, addr, disk) in [(1u64, "127.0.0.1:1", 10u64), (9, "127.0.0.1:9", 90)] {
+                m.store.inner.borrow_mut().nodes.insert(
+                    id,
+                    NodeRecord {
+                        node_id: id,
+                        address: addr.into(),
+                        disks: vec![disk],
+                        shard_ports: vec![],
+                        control_address: String::new(),
+                        node_uuid: String::new(),
+                    },
+                );
+                m.node_states.borrow_mut().on_heartbeat_ok(id);
+                m.node_max_free.borrow_mut().insert(id, 1 << 30);
+                m.store.inner.borrow_mut().disks.insert(
+                    disk,
+                    crate::persist::records::DiskRecord {
+                        disk_id: disk,
+                        online: true,
+                        uuid: String::new(),
+                    },
+                );
+            }
+            m.store.inner.borrow_mut().extents.insert(
+                20,
+                ExtentRecord {
+                    extent_id: 20,
+                    sealed: true,
+                    sealed_length: 4096,
+                    replicates: vec![1],
+                    replicate_disks: vec![10],
+                    avali: 1,
+                    ..Default::default()
+                },
+            );
+            m.node_overrides.borrow_mut().insert(
+                1,
+                MgrNodeOverride {
+                    node_id: 1,
+                    kind: NODE_OVERRIDE_FENCED,
+                    ..Default::default()
+                },
+            );
+            let active_recovery = |m: &AutumnManager| {
+                m.ops.borrow().query(&OpQueryReq {
+                    op_id: 0,
+                    active_only: true,
+                    kind_filter: OP_KIND_RECOVERY,
+                    limit: 0,
+                })
+            };
+
+            m.recovery_dispatch_tick().await;
+            assert_eq!(m.extent_inflight_op(20), None, "the failed dispatch drained its marker");
+            assert_eq!(
+                m.recovery_limiter.borrow().backoff_snapshot().len(),
+                1,
+                "the failure backs the slot off"
+            );
+            assert_eq!(active_recovery(&m).len(), 1, "and leaves the repair RUNNING");
+
+            // Still fenced: the rebuild is still owed, so both stay.
+            m.recovery_dispatch_tick().await;
+            assert_eq!(m.recovery_limiter.borrow().backoff_snapshot().len(), 1);
+            assert_eq!(active_recovery(&m).len(), 1);
+
+            m.node_overrides.borrow_mut().remove(&1);
+            m.recovery_dispatch_tick().await;
+            assert!(
+                m.recovery_limiter.borrow().backoff_snapshot().is_empty(),
+                "the copy serves again: nothing is retrying, so nothing may back off"
+            );
+            assert!(
+                active_recovery(&m).is_empty(),
+                "and the repair it was for is over: {:?}",
+                active_recovery(&m)
+            );
+            let all = m.ops.borrow().query(&OpQueryReq {
+                op_id: 0,
+                active_only: false,
+                kind_filter: OP_KIND_RECOVERY,
+                limit: 0,
+            });
+            let last = all.first().expect("the recovery entry");
+            assert_eq!(last.state, autumn_rpc::manager_rpc::OP_STATE_SUCCEEDED);
+            assert!(
+                last.message.starts_with("no rebuild needed any more"),
+                "{last:?}"
+            );
+        });
+    }
+
+    /// Keep is not always a verdict. A node this term has no `df` from may sit
+    /// on a faulted disk that reads healthy, and a repair request waiting on an
+    /// in-place catch-up becomes a rebuild again if the catch-up finds the copy
+    /// gone. A failed rebuild's backoff and RUNNING entry must outlive both.
+    #[test]
+    fn an_undecided_keep_holds_the_failed_rebuild_s_backoff_and_op() {
+        use autumn_rpc::manager_rpc::{OpQueryReq, OP_KIND_RECOVERY};
+        run(async {
+            let m = AutumnManager::new();
+            m.store.inner.borrow_mut().nodes.insert(
+                1,
+                NodeRecord {
+                    node_id: 1,
+                    address: "127.0.0.1:1".into(),
+                    disks: vec![10],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: String::new(),
+                },
+            );
+            m.node_states.borrow_mut().on_heartbeat_ok(1);
+            m.store.inner.borrow_mut().disks.insert(
+                10,
+                crate::persist::records::DiskRecord {
+                    disk_id: 10,
+                    online: true,
+                    uuid: String::new(),
+                },
+            );
+            m.store.inner.borrow_mut().extents.insert(
+                20,
+                ExtentRecord {
+                    extent_id: 20,
+                    sealed: true,
+                    sealed_length: 4096,
+                    replicates: vec![1],
+                    replicate_disks: vec![10],
+                    avali: 1,
+                    ..Default::default()
+                },
+            );
+            // What a failed dispatch leaves: a backoff and a RUNNING entry.
+            m.recovery_limiter
+                .borrow_mut()
+                .record_failure(20, 0, 1, "no candidate node for recovery");
+            m.ops
+                .borrow_mut()
+                .record_recovery_failure(20, "no candidate node for recovery".into(), 3, 1, 1_000);
+            let held = |m: &AutumnManager| {
+                let active = m.ops.borrow().query(&OpQueryReq {
+                    op_id: 0,
+                    active_only: true,
+                    kind_filter: OP_KIND_RECOVERY,
+                    limit: 0,
+                });
+                (m.recovery_limiter.borrow().backoff_snapshot().len(), active.len())
+            };
+
+            // No first-hand df from node 1 this term.
+            m.recovery_dispatch_tick().await;
+            assert_eq!(held(&m), (1, 1), "no df yet: Keep is not a verdict");
+
+            // Heard from, but a repair request waits on an in-place catch-up.
+            m.node_max_free.borrow_mut().insert(1, 1 << 30);
+            m.store.inner.borrow_mut().extents.get_mut(&20).unwrap().avali = 0;
+            m.extent_repair_slots.borrow_mut().insert(20, 1);
+            m.recovery_dispatch_tick().await;
+            assert_eq!(held(&m), (1, 1), "a suspended rebuild is not a withdrawn one");
+
+            // The request gone and the copy serving: now the need is over.
+            m.extent_repair_slots.borrow_mut().clear();
+            m.store.inner.borrow_mut().extents.get_mut(&20).unwrap().avali = 1;
+            m.recovery_dispatch_tick().await;
+            assert_eq!(held(&m), (0, 0));
         });
     }
 

@@ -4867,6 +4867,22 @@ set, the slot is not marked corrupt, and its disk is neither faulted nor
 offline). Disk faults, dark slots and corruption keep their markers, which is
 why unfencing a node whose disk is bad releases nothing.
 
+The same unfence also ends what a FAILED rebuild left behind. A dispatch that
+fails (no reachable target) drains its marker but leaves a backoff entry and a
+RUNNING recovery op; once the slot no longer needs a rebuild, the next tick
+drops that backoff and closes the op as SUCCEEDED, "no rebuild needed any
+more: …". To see it, fence a node while every other node is unreachable or
+full, wait for `recovery-stats` to show a backoff row and `ops list --kind
+recovery` a running entry, then unfence:
+
+    "${AO[@]}" recovery-stats        # no backoff rows
+    "${AO[@]}" ops list --kind recovery   # the entry is succeeded, "no rebuild needed any more"
+    "${AO[@]}" health                # HEALTH_OK, 0 recovering — all three agree
+
+A late completion of the released attempt is still refused with "recovery
+attempt changed"; that is the guard working, not a stuck repair.
+`cargo test -p autumn-manager --lib an_unfence_ends` is the deterministic form.
+
 A marker that spins without progressing is now visible: the re-dispatch logs
 refusals, undecodable replies and unreachable targets at WARN (they were all
 `debug!`, so a manager at INFO showed a 2 s loop as complete silence).

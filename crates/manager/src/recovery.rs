@@ -402,7 +402,7 @@ impl AutumnManager {
             };
             if healthy {
                 match self
-                    .drain_extent_inflight_marker(extent_id, "source slot is healthy again")
+                    .release_obsolete_recovery_marker(extent_id, "source slot is healthy again")
                     .await
                 {
                     Ok(()) => {
@@ -1251,6 +1251,17 @@ impl AutumnManager {
         self.commit_inflight_extent(&snapshot, baseline, updated_extent.clone(), vec![])
             .await?;
         drop(_lifecycle);
+        // Op-ledger: the extent layout is repaired — close the recovery entry
+        // before the awaits below, or a tick in between finds no marker and
+        // closes it as a rebuild nobody needed.
+        {
+            let (now_s, _) = Self::now_s_ms();
+            self.ops.borrow_mut().complete_recovery(
+                updated_extent.extent_id,
+                format!("recovered slot onto node {}", task.node_id),
+                now_s,
+            );
+        }
         // The rebuilt slot holds fresh bytes copied from a healthy peer, so the
         // corrupt mark that scheduled this rebuild has been satisfied. Clearing
         // it also stops the slot from being force-dispatched every tick.
@@ -1280,15 +1291,6 @@ impl AutumnManager {
                      re-dispatched until the mark clears"
                 );
             }
-        }
-        // Op-ledger: the extent layout is repaired — close the recovery entry.
-        {
-            let (now_s, _) = Self::now_s_ms();
-            self.ops.borrow_mut().complete_recovery(
-                updated_extent.extent_id,
-                format!("recovered slot onto node {}", task.node_id),
-                now_s,
-            );
         }
         tracing::info!(
             extent_id = updated_extent.extent_id,
@@ -1511,6 +1513,9 @@ impl AutumnManager {
         // `handle_multi_modify_split` still re-check the set at apply
         // time, so a stale snapshot here is safe (drops at most one
         // tick's worth of dispatch latency on the racing extent).
+        // Extents whose conversion is in flight are not looked at this pass;
+        // their rebuild state is left as it is.
+        let mut converting: HashSet<u64> = HashSet::new();
         let (extents, nodes, disks) = {
             let s = self.store.inner.borrow();
             // read the unified inflight ledger instead of the
@@ -1537,10 +1542,14 @@ impl AutumnManager {
                     if !ex.sealed {
                         return false;
                     }
-                    !matches!(
+                    if matches!(
                         inflight.get(&ex.extent_id).and_then(|r| r.kind()),
                         Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-                    )
+                    ) {
+                        converting.insert(ex.extent_id);
+                        return false;
+                    }
+                    true
                 })
                 .cloned()
                 .collect();
@@ -1549,6 +1558,9 @@ impl AutumnManager {
 
         // Repair requests whose premise is gone, withdrawn after the pass.
         let mut withdraw: HashMap<u64, u32> = HashMap::new();
+        // Slots whose rebuild is still owed, or whose Keep this pass is not
+        // yet a verdict: their backoff and recovery entry stay.
+        let mut open_need: HashSet<(u64, u32)> = HashSet::new();
         for ex in extents {
             let copies = Self::extent_nodes(&ex);
             for (slot, node_id) in copies.iter().copied().enumerate() {
@@ -1619,7 +1631,16 @@ impl AutumnManager {
                             .contains(&(ex.extent_id, slot as u32))
                     {
                         repair_requested = false; // this tick: catch up first
+                        // Suspended, not withdrawn: a catch-up that finds the
+                        // copy gone turns it back into a rebuild.
+                        open_need.insert((ex.extent_id, slot as u32));
                     }
+                }
+                // Until this term hears the node's own `df`, a faulted disk
+                // reads healthy (`faulted_disks` starts empty), so Keep here
+                // proves nothing — the same rule the marker release follows.
+                if !self.has_first_hand_df(node_id) {
+                    open_need.insert((ex.extent_id, slot as u32));
                 }
 
                 // ONE place decides whether the copy moves. It used to be
@@ -1628,6 +1649,7 @@ impl AutumnManager {
                 if slot_verdict(is_fenced, is_corrupt, disk_faulted, repair_requested)
                     == SlotVerdict::Rebuild
                 {
+                    open_need.insert((ex.extent_id, slot as u32));
                     // A slot whose rebuild keeps failing waits out its backoff.
                     if !self
                         .recovery_limiter
@@ -1678,6 +1700,8 @@ impl AutumnManager {
             }
         }
 
+        self.end_rebuilds_no_longer_owed(&open_need, &converting);
+
         if !withdraw.is_empty() {
             let withdraw: Vec<(u64, u32)> = withdraw.into_iter().collect();
             match self.withdraw_repairs(&withdraw).await {
@@ -1701,6 +1725,51 @@ impl AutumnManager {
         // recovery (above) can rebuild them and `remove` can proceed. Runs
         // each tick after the sealed-extent recovery dispatch.
         self.drain_fenced_open_tails().await;
+    }
+
+    /// Backoff and the recovery entry belong to the NEED for a rebuild, not to
+    /// an attempt: a failed dispatch drains its marker but leaves both behind,
+    /// and a slot that stops needing a rebuild (unfence: the copy serves again)
+    /// is never dispatched again, so nothing else would ever end them. Without
+    /// this `recovery-stats` and `ops list` kept a backoff and a RUNNING repair
+    /// for an extent `health` correctly reported whole.
+    ///
+    /// `open_need` holds the slots this pass judged Rebuild (in backoff or
+    /// not) and those whose Keep is not yet a verdict; `converting` was not
+    /// looked at. Everything else loses its backoff (deleted and unsealed
+    /// extents included). A live Recovery marker keeps its entry: its own
+    /// completion or release closes it.
+    fn end_rebuilds_no_longer_owed(
+        &self,
+        open_need: &HashSet<(u64, u32)>,
+        converting: &HashSet<u64>,
+    ) {
+        self.recovery_limiter
+            .borrow_mut()
+            .retain_backoff(|extent_id, slot| {
+                open_need.contains(&(extent_id, slot)) || converting.contains(&extent_id)
+            });
+        let needed: HashSet<u64> = open_need.iter().map(|(e, _)| *e).collect();
+        let ended: Vec<u64> = self
+            .ops
+            .borrow()
+            .active_recovery_extents()
+            .into_iter()
+            .filter(|extent_id| {
+                !converting.contains(extent_id)
+                    && !needed.contains(extent_id)
+                    && self.extent_inflight_op(*extent_id)
+                        != Some(crate::extent_inflight::ExtentOpKind::Recovery)
+            })
+            .collect();
+        let (now_s, _) = Self::now_s_ms();
+        for extent_id in ended {
+            self.ops.borrow_mut().withdraw_recovery(
+                extent_id,
+                "no copy of the extent needs moving",
+                now_s,
+            );
+        }
     }
 
     /// find OPEN tail extents (`!sealed`) whose replica set
@@ -3280,20 +3349,9 @@ impl crate::AutumnManager {
         extent_id: u64,
         reason: &str,
     ) -> Result<(), AppError> {
-        let Some(record) = self.inflight.borrow().get(&extent_id).cloned() else {
+        let Some(kind) = self.remove_extent_inflight_marker(extent_id).await? else {
             return Ok(());
         };
-        let kind = record
-            .kind()
-            .ok_or_else(|| AppError::Precondition("invalid inflight kind".into()))?;
-        let snapshot = self.snapshot_inflight(extent_id, kind)?;
-        self.commit_inflight_txn(
-            &snapshot,
-            vec![],
-            vec![autumn_etcd::Op::delete(Self::extent_inflight_key(extent_id))],
-        )
-        .await?;
-        self.commit_extent_inflight_release(extent_id);
         // Only after the marker is really gone — a failed drain above returns
         // early and leaves the entry RUNNING, which is then accurate.
         let (now_s, _) = Self::now_s_ms();
@@ -3317,6 +3375,50 @@ impl crate::AutumnManager {
             crate::extent_inflight::ExtentOpKind::Delete => {}
         }
         Ok(())
+    }
+
+    /// Release a Recovery marker whose rebuild nobody needs any more, closing
+    /// its entry as withdrawn rather than abandoned.
+    async fn release_obsolete_recovery_marker(
+        &self,
+        extent_id: u64,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        if self.extent_inflight_op(extent_id)
+            != Some(crate::extent_inflight::ExtentOpKind::Recovery)
+        {
+            return Ok(());
+        }
+        if self.remove_extent_inflight_marker(extent_id).await?.is_some() {
+            let (now_s, _) = Self::now_s_ms();
+            self.ops
+                .borrow_mut()
+                .withdraw_recovery(extent_id, reason, now_s);
+        }
+        Ok(())
+    }
+
+    /// Delete `extent_id`'s marker (etcd first, then memory); its kind, or
+    /// `None` when there was none.
+    async fn remove_extent_inflight_marker(
+        &self,
+        extent_id: u64,
+    ) -> Result<Option<crate::extent_inflight::ExtentOpKind>, AppError> {
+        let Some(record) = self.inflight.borrow().get(&extent_id).cloned() else {
+            return Ok(None);
+        };
+        let kind = record
+            .kind()
+            .ok_or_else(|| AppError::Precondition("invalid inflight kind".into()))?;
+        let snapshot = self.snapshot_inflight(extent_id, kind)?;
+        self.commit_inflight_txn(
+            &snapshot,
+            vec![],
+            vec![autumn_etcd::Op::delete(Self::extent_inflight_key(extent_id))],
+        )
+        .await?;
+        self.commit_extent_inflight_release(extent_id);
+        Ok(Some(kind))
     }
 
     pub async fn apply_ec_conversion_done(

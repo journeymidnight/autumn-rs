@@ -167,6 +167,12 @@ impl RecoveryRateLimiter {
         self.backoff.remove(&(extent_id, slot));
     }
 
+    /// Drop the backoff of every slot `keep` rejects: a slot nothing retries
+    /// any more has no backoff to wait out.
+    pub fn retain_backoff(&mut self, mut keep: impl FnMut(u64, u32) -> bool) {
+        self.backoff.retain(|(extent_id, slot), _| keep(*extent_id, *slot));
+    }
+
     /// Returns `true` if this (extent, slot) is currently inside the
     /// backoff window — the dispatch loop should skip it this tick.
     pub fn in_backoff(&self, extent_id: u64, slot: u32, now_s: i64) -> bool {
