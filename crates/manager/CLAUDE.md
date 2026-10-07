@@ -32,7 +32,7 @@ via the shared `ConnPool`. RPC families:
 - **Node lifecycle**: list_node_states, fence_node, set_node_maintenance,
   clear_node_override, remove_node, recovery_stats, query_audit_log,
   report_disk_failure, extent_health_report, extent_health_summary (`0x63`),
-  list_ec_inflight_markers.
+  list_ec_inflight_markers, remove_member (`0x64`, see "PS membership").
 
 `extent_health_report` calls a slot unhealthy when its node is Suspected /
 Fenced / Maintenance, or when `avali` is clear **on a SEALED extent**. The
@@ -162,8 +162,9 @@ an error that refuses leadership, not "maybe it is the older form" — see the
 Upgrade-safety section for why guessing from the leading bytes provably cannot
 work here.
 
-**ALL NINE ARE SPLIT.** extent=4, stream=5, node=6, disk=7, partition=8,
-region=9, audit=1, tenantAccount=2, namespace=3; the next record takes 10.
+**ALL ARE SPLIT.** extent=4, stream=5, node=6, disk=7, partition=8,
+region=9, audit=1, tenantAccount=2, namespace=3, recoveryAttempt=10,
+member=11; the next record takes 12.
 `MetadataState` (now `src/store.rs`, moved here from `autumn-common`) holds the
 RECORDS, not the wire structs — which is what gives a purely persistent field
 somewhere to live. `RangeRecord` is a FIELD of the partition and region records
@@ -212,7 +213,8 @@ All writes go through the leader-fenced `txn_fenced` (below). On promotion
 | `extents/<id>` | `persist::ExtentRecord` | `refs` RMW is value-CAS'd |
 | `partitions/<id>` | `persist::PartitionRecord` | key range |
 | `regions/<id>` | `persist::RegionRecord` | carries `region_epoch` |
-| `ps_nodes/<id>` | PS address | ephemeral fleet membership |
+| `psNodes/<id>` | PS address | LIVE registry; deleted on eviction |
+| `psMembers/<id>` | `persist::MemberRecord` | EXPECTED fleet; only `remove_member` deletes it |
 | `next_id` | u64 | the ONLY id source (`alloc_ids`) |
 | `ownerLocks/<key>` | owner epoch | `owner_epoch` = the acquire's `mod_revision` |
 | `extent_inflight/<id>` | `MgrExtentInflightRecord` | unified in-flight ledger |
@@ -443,6 +445,36 @@ carry `slot_cap`, recorded only for a registered PS — see "Rebalance");
 `sync_regions_once` (silent `CODE_OK` would leave it invisible as `ps=unknown`).
 `replay_from_etcd` seeds `ps_last_heartbeat = now` for every replayed PS so the
 liveness loop's `Some(t)` arm engages instead of treating it as an immortal zombie.
+
+### PS membership
+
+Eviction answers "is it alive", and its answer must not also become "how many
+PS should there be": with only `psNodes/`, a dead PS vanished from every list
+after 10 s and a 3-PS cluster read `2/2`. So the expected fleet is a second
+key family, `psMembers/<id>` → `MemberRecord {address, joined_at_ms,
+left_at_ms}`:
+- `register_ps` makes the id a member (or clears `left_at_ms` and refreshes the
+  address); it writes only when the record changes, and then writes
+  `psNodes/<id>` in the same txn — a member replayed without it would never be
+  in the live registry, so never evicted, and would read as neither live nor
+  evicted.
+- `evict_silent_ps` keeps the member and stamps `left_at_ms` in the same txn
+  that deletes `psNodes/<id>`.
+- `MSG_REMOVE_MEMBER` (Admin; `autumn-op ps-remove <id> --by X`) deletes it,
+  refused (`Precondition`) while the id is in the live registry. A removed id
+  that starts again simply rejoins; there is no tombstone (a PS holds no data).
+- All three serialize on `ps_member_lock`, which the eviction pass takes BEFORE
+  judging who is dead, so a registration cannot land between the verdict and
+  the stamp.
+
+The overview's `ps_servers` is members ∪ live registry; an evicted member has
+no heartbeat and `evicted_at_ms` set. psid uniqueness is the OPERATOR's job:
+two processes with one psid are counted as one PS, with no error (decided
+2026-10-07; the manager does not judge registrations). There is no seeding
+from `psNodes/`: an upgrade is a full restart, and every PS registers.
+Test: `tests/ps_members_etcd.rs` (evicted PS listed, survives a leader change,
+live remove refused; ablations: eviction forgetting the member, replay not
+loading it, remove skipping the live check — each red).
 
 The PS spawns its `heartbeat_loop` in `finish_connect` (NOT `serve()`, which only
 runs after every assigned partition finishes WAL replay — that can exceed the
@@ -1759,12 +1791,13 @@ Two of its fields exist because a ROLL-UP CANNOT ANSWER THE QUESTION THEY ANSWER
   `reported: false` — the node ANSWERED df but omitted a disk the registry assigns to
   it (usually a dropped `--data` dir). A node that did NOT answer df gets no rows at
   all: "unreachable" and "disk missing" call for different actions.
-- **`ps_servers`** — every REGISTERED PS, from `ps_nodes` plus `ps_last_heartbeat`.
+- **`ps_servers`** — every PS MEMBER plus the live registry (see "PS
+  membership"), with `ps_last_heartbeat`; an evicted member carries
+  `evicted_at_ms`.
   A list derived from the partitions can only show a PS that owns something, so
   the two states most worth seeing (serving nothing; stopped heartbeating) are
   exactly the two it cannot express. `last_heartbeat_secs_ago = u64::MAX` (JSON
-  `null`) means no heartbeat entry — defensive only, since `replay_from_etcd` and
-  `register_ps` both seed one. The flip side of the replay seed: right after a leader
+  `null`) means no heartbeat entry: an evicted member. The flip side of the replay seed: right after a leader
   change every replayed PS reads as freshly heard from until the 10 s eviction window
   judges it. Each row also carries `slot_cap` (JSON `null` = no `--cpuset`, or
   not heard from since this manager became leader); `autumn-op info` prints

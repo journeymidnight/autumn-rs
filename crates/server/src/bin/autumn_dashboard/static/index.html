@@ -634,6 +634,7 @@ function extentHealthBad(eh){
   return eh===null || (eh!==undefined && (eh.unavailable>0 || eh.degraded>0));
 }
 function psHealth(p){
+  if(p.evicted_at_ms) return {cls:"bad", text:"evicted "+agoStr(Math.max(0,Math.floor((Date.now()-p.evicted_at_ms)/1000)))};
   const s=p.last_heartbeat_secs_ago;
   if(s==null) return {cls:"unknown", text:"no heartbeat seen"};
   if(s<6)  return {cls:"ok",   text:agoStr(s)};

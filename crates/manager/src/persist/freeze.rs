@@ -49,8 +49,8 @@
 //! re-record.
 
 use super::records::{
-    AuditRecord, DiskRecord, ExtentRecord, NamespaceRecord, NodeRecord, PartitionRecord,
-    RangeRecord, RegionRecord, StreamRecord, TenantAccountRecord,
+    AuditRecord, DiskRecord, ExtentRecord, MemberRecord, NamespaceRecord, NodeRecord,
+    PartitionRecord, RangeRecord, RegionRecord, StreamRecord, TenantAccountRecord,
 };
 use super::{decode, encode, PersistRecord};
 
@@ -100,6 +100,14 @@ fn namespace_fixture() -> NamespaceRecord {
         owner_tenant: Some("owner-tenant-field".to_string()),
         presplit: vec![b"cut-one".to_vec(), b"cut-two".to_vec()],
         created_at: 0x6162636465666768,
+    }
+}
+
+fn member_fixture() -> MemberRecord {
+    MemberRecord {
+        address: "member-address-field".to_string(),
+        joined_at_ms: 0x6162636465666768,
+        left_at_ms: 0x7172737475767778,
     }
 }
 
@@ -197,6 +205,7 @@ const PARTITION_FROZEN: &str = "41554d47080173746172742d6b6579656e642d6b6579c8c7
 const REGION_FROZEN: &str = "41554d470901726567696f6e2d7374617274726567696f6e2d656e64000001000000e4ffffff0c000000e8ffffff0a00000000000000d100000000000000d200000000000000d300000000000000d400000000000000d500000000000000d600000000000000";
 const EXTENT_FROZEN: &str = "41554d47040103000000000000000100000000000000040000000000000009000000000000000b000000000000000c000000000000000d000000000000000e00000000000000e8e7e6e5e4e3e2e1b8ffffff03000000c8ffffff010000000700000000000000020000000000000005000000000000000000000004000000010000000b000000a0ffffff03000000b0ffffff010000000000000000000000";
 const NODE_FROZEN: &str = "41554d470601616464726573732d6669656c6400000011000000000000002200000000000000330000000000000055447766636f6e74726f6c2d616464726573732d6669656c646e6f64652d757569642d6669656c6488878685848382818d000000a8ffffffb0ffffff03000000c0ffffff0200000095000000bcffffff8f000000c9ffffff";
+const MEMBER_FROZEN: &str = "41554d470b016d656d6265722d616464726573732d6669656c640000000094000000e8ffffff68676665646362617877767574737271";
 const DISK_FROZEN: &str = "41554d470701757569642d6669656c640000000000007877767574737271000000008a000000e4ffffff00000000";
 const NAMESPACE_FROZEN: &str = "41554d4703016e616d652d6669656c647072656669782d6669656c642f6f776e65722d74656e616e742d6669656c646375742d6f6e656375742d74776f00f1ffffff07000000f0ffffff070000008a000000b8ffffffbaffffff0d0000000100000092000000bbffffffd4ffffff02000000000000006867666564636261";
 
@@ -212,6 +221,7 @@ fn the_persisted_encodings_are_frozen() {
         ("partition", hex(&encode(&partition_fixture())), PARTITION_FROZEN),
         ("region", hex(&encode(&region_fixture())), REGION_FROZEN),
         ("extent", hex(&encode(&extent_fixture())), EXTENT_FROZEN),
+        ("member", hex(&encode(&member_fixture())), MEMBER_FROZEN),
     ] {
         assert_eq!(
             actual, frozen,
@@ -241,6 +251,10 @@ fn every_recorded_encoding_is_a_value_this_binary_can_read_back() {
     let back: NamespaceRecord = decode("namespace/n", &raw).expect("namespace decodes");
     assert_eq!(back.owner_tenant.as_deref(), Some("owner-tenant-field"));
     assert_eq!(back.presplit.len(), 2);
+
+    let raw = encode(&member_fixture());
+    let back: MemberRecord = decode("psMembers/1", &raw).expect("member decodes");
+    assert_eq!(back, member_fixture());
 }
 
 /// The envelope is the first six bytes of every record, and the version in it
@@ -303,6 +317,12 @@ fn each_frozen_encoding_carries_the_version_it_was_recorded_at() {
             EXTENT_FROZEN,
             ExtentRecord::RECORD_TYPE,
             ExtentRecord::FORMAT_VERSION,
+        ),
+        (
+            "member",
+            MEMBER_FROZEN,
+            MemberRecord::RECORD_TYPE,
+            MemberRecord::FORMAT_VERSION,
         ),
     ] {
         assert_eq!(&frozen[0..8], "41554d47", "{name}: magic");

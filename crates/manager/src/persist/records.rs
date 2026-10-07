@@ -29,8 +29,8 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use super::{
     PersistRecord, RECORD_TYPE_AUDIT, RECORD_TYPE_DISK, RECORD_TYPE_NAMESPACE,
-    RECORD_TYPE_EXTENT, RECORD_TYPE_NODE, RECORD_TYPE_PARTITION, RECORD_TYPE_REGION,
-    RECORD_TYPE_STREAM, RECORD_TYPE_TENANT_ACCOUNT,
+    RECORD_TYPE_EXTENT, RECORD_TYPE_MEMBER, RECORD_TYPE_NODE, RECORD_TYPE_PARTITION,
+    RECORD_TYPE_REGION, RECORD_TYPE_STREAM, RECORD_TYPE_TENANT_ACCOUNT,
 };
 
 // ── audit log ───────────────────────────────────────────────────────────────
@@ -490,6 +490,28 @@ impl From<&NodeRecord> for MgrNodeInfo {
             node_uuid: node_uuid.clone(),
         }
     }
+}
+
+// ── members ─────────────────────────────────────────────────────────────────
+
+/// `psMembers/<ps_id>` — one id the cluster expects to be running. Written on
+/// first registration and kept through restarts and evictions; only an
+/// operator's remove deletes it. The fleet counts are measured against this
+/// set, never against whoever happens to be alive.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub(crate) struct MemberRecord {
+    /// Where it last registered from.
+    pub address: String,
+    /// Unix ms of the first registration under this id.
+    pub joined_at_ms: i64,
+    /// Unix ms the manager last saw it go (eviction); `0` while present.
+    pub left_at_ms: i64,
+}
+
+impl PersistRecord for MemberRecord {
+    const RECORD_TYPE: u8 = RECORD_TYPE_MEMBER;
+    const FORMAT_VERSION: u8 = 1;
+    const NAME: &'static str = "member";
 }
 
 // ── streams ─────────────────────────────────────────────────────────────────

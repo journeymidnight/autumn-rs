@@ -1526,6 +1526,14 @@ pub struct PsOverview {
     /// heartbeat with that report since the PS registered or this manager
     /// became leader.
     pub open_count: Option<u32>,
+    /// Unix ms this PS id first registered; `0` = it is in the live registry
+    /// but has no member record (registered before members existed).
+    pub joined_at_ms: i64,
+    /// Unix ms the manager evicted it for a silent heartbeat; `0` = it is in
+    /// the live registry. A member stays listed after eviction until an
+    /// operator removes it, so the fleet's size does not shrink to whatever
+    /// happens to be alive.
+    pub evicted_at_ms: i64,
 }
 
 impl PsOverview {
@@ -1709,6 +1717,21 @@ pub struct ExtentHealthResp {
 /// wants about ONE node, and not what a status line polled every few seconds
 /// can afford on a large cluster.
 pub const MSG_EXTENT_HEALTH_SUMMARY: u8 = 0x63;
+
+/// Drop a member from the cluster's membership: the set the fleet counts are
+/// measured against. Refused while the member is live; only an operator's
+/// say-so shrinks it. Response: `CodeResp`.
+pub const MSG_REMOVE_MEMBER: u8 = 0x64;
+
+pub const MEMBER_ROLE_PS: u8 = 1;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RemoveMemberReq {
+    /// `MEMBER_ROLE_*`.
+    pub role: u8,
+    pub id: u64,
+    pub set_by: String,
+}
 
 /// Overall verdict. OK: every sealed extent has every copy serving. WARN: some
 /// extent is short a copy but every extent can still be read. ERR: some extent
@@ -1935,6 +1958,8 @@ pub const AUDIT_OP_FORCE_GC: u8 = 12;
 pub const AUDIT_OP_REPAIR: u8 = 13;
 pub const AUDIT_OP_REPAIR_CANCEL: u8 = 14;
 pub const AUDIT_OP_SCRUB: u8 = 15;
+/// `node_id` of the entry carries the removed member's id.
+pub const AUDIT_OP_REMOVE_PS: u8 = 16;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrAuditEntry {
@@ -2634,6 +2659,7 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
         msg_type,
         MSG_FENCE_NODE
             | MSG_REMOVE_NODE
+            | MSG_REMOVE_MEMBER
             | MSG_SET_NODE_MAINTENANCE
             | MSG_CLEAR_NODE_OVERRIDE
             | MSG_UPDATE_STREAM_EC

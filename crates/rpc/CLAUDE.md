@@ -901,6 +901,16 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## PS membership (wire 57)
+
+`PsOverview` gains `joined_at_ms` and `evicted_at_ms` (0 = in the live
+registry): the overview now lists every PS member, including evicted ones,
+until an operator removes it. `MSG_REMOVE_MEMBER` (0x64, Admin-only,
+`RemoveMemberReq {role, id, set_by}`, role `MEMBER_ROLE_PS`; answer
+`CodeResp`) and `AUDIT_OP_REMOVE_PS` (16) are appended values. Neither is on
+the client surface: the ceiling rises to [43, 57], the floor stays, and
+autumn-op / the dashboard are rebuilt with the cluster.
+
 ## Pending repair requests in the health summary (wire 54)
 
 `ProblemSlot` gains `repair_requested: bool` and `ExtentHealthSummaryResp`

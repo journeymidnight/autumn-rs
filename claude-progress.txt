@@ -1,3 +1,11 @@
+Date: 2026-10-07 (3)
+TaskStatus: not_completed
+Task scope: user — replace the home-page `HEALTH_OK` with a checkable summary (Manager leader/standby, PS Ready x/N, EN Online x/N, Extent clean/degraded/unavailable, Recovery inflight, sample time); denominators are EXPECTED counts from a persistent etcd member table (feature_list F-CLUSTER-STATUS-SUMMARY, four steps). Decisions: psid and manager-id hand-assigned; psid uniqueness is the operator's job; manager-id claimed by an etcd lease; no read/write-availability line; HEALTH_* removed entirely; etcd auth later (F-ETCD-AUTH).
+Current summary: Step 1 done — `psMembers/<id>` (MemberRecord, persisted type 11) written on registration together with `psNodes/<id>`; eviction (now `evict_silent_ps`) keeps the member and stamps left_at_ms; MSG_REMOVE_MEMBER 0x64 / `autumn-op ps-remove` refused while registered; overview lists members (wire 57: PsOverview.joined_at_ms/evicted_at_ms); dashboard shows an evicted PS as evicted.
+Verification: manager lib 466; rpc green; new tests/ps_members_etcd.rs (ablations red: eviction forgets member, replay skips members, remove skips live check) + unit an_evicted_ps_rejoins_as_the_same_member; system_ps_failover(+chaos), client_wire_admission, system_lost_reply_idempotency, system_sigstop_zombie_writer green; dashboard JS checks green; manual real-binary run (evict, refuse, restart, remove, audit). fable review: no high findings; fixed member+psNodes atomicity, lock scope, stale comments, page rendering.
+Main gaps: steps 2-4. Eviction stays memory-first (as before): a failed eviction txn leaves etcd unstamped until the next failover re-evicts.
+Next steps: step 2 — `--manager-id`, lease claim `manager_alive/<id>`, `managerMembers/`, `autumn-op manager-remove`, cluster.sh/scripts.
+
 Date: 2026-10-07 (2)
 TaskStatus: completed
 Task scope: user bug report, two items. (1) a submitted split timed out at the manager (60 s) and was recorded FAILED while the PS kept running it; it committed later, and an operator retry meanwhile produced an extra split. User chose 5a: a lost reply is "outcome unknown", reconciled by the partition owner epoch; the unknown state is RUNNING plus a message (my recommendation; the user answered only 5a). (2) recovery ops/backoff left RUNNING after unfence: the report cited HEAD~1 line numbers; already fixed by 4317935f, no change.

@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-06
+**Last updated:** 2026-10-07
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,6 +13,33 @@
 ---
 
 ## Active
+
+### F-CLUSTER-STATUS-SUMMARY — 首页状态改为可核对的明细摘要，分母是期望数
+- **Trigger** (2026-10-07 用户): `HEALTH_OK` 只看 extent，PS 全挂、无 standby 时照样 OK；作为首页状态不合适。要一份可核对的明细：`Manager leader 1 / standby 1`、`PS Ready 3/3`、`EN Online 6/6`、`Extent clean/degraded/unavailable`、`Recovery inflight`、采样时间。**分母必须是期望数**，不能用当前发现的节点数凑成 5/5。
+- **设计定案（用户确认）**:
+  1. 期望数 = etcd 持久成员表。新 id 首次注册自动加入；重启/掉线/驱逐不改成员表，只影响分子；只有显式 remove 删除，且在线成员拒绝删除。
+  2. `--psid` 与新加的 `--manager-id` 都手填。psid 唯一性由运维保证（manager 不判重）；manager 启动时对 `manager_alive/<id>` 做 etcd lease 占位（`create_revision==0`），占不到每秒重试并打出持有者，lease 丢失则退出——这把 key 同时是 standby 计数的来源。
+  3. 不显示读/写可用推导。
+  4. `HEALTH_OK/WARN/ERR` 彻底移除（常量、wire 字段、页面、测试、文档）。
+- **Scope（分步，每步独立提交）**:
+  1. PS 成员表 `psMembers/`；驱逐保留成员并记离开时间；`autumn-op ps-remove`（在线拒绝）；overview 列出全部成员。
+  2. `--manager-id` + lease 占位 + `managerMembers/` + `autumn-op manager-remove`（在线拒绝）；cluster.sh 与脚本启动命令同步。
+  3. `GET_CLUSTER_STATUS` RPC（leader 上计算，带采样时间与各来源数据年龄）+ `autumn-op status`。
+  4. dashboard 首页顶栏改为该摘要；移除 `HEALTH_*`；docs/README/CLAUDE.md。
+- **Acceptance**:
+  - 3 PS 杀 1 台，等过驱逐窗口，分母仍为 3；跨 leader 切换不变；在线成员 remove 被拒；消融（驱逐删成员 / replay 不读成员 / remove 不查在线）各自变红。
+  - 2 manager 杀 standby 显示 `standby 0/1`；同 id 第二个 manager 进程占不到 id、日志报出持有者；消融变红。
+  - `autumn-op status` 与 dashboard 顶栏显示同一份数据，含采样时间；leader 无应答时显示未知而非旧值。
+  - 代码与文档中不再出现 `HEALTH_OK/WARN/ERR`。
+- `passes: false`
+- **notes** (2026-10-07): 第 1 步完成（wire 57，record type 11 `MemberRecord`）。
+
+### F-ETCD-AUTH — manager 连接带认证/TLS 的 etcd
+- **Trigger** (2026-10-07 用户): 生产 etcd 要开 auth。现 manager 只有 `--etcd <endpoints>`，`crates/etcd` 是 h2c 明文 gRPC，无 `Auth/Authenticate`、无 token 头、无 TLS；开 auth 的 etcd 连不上。
+- **Scope**: 用户名+密码（`Auth/Authenticate` 换 token，每请求带 `token` 头，过期重认证一次再发）；TLS（rustls，CA 校验，可选双向证书）。CLI flag：`--etcd-user`、`--etcd-password-file`、`--etcd-cacert`、`--etcd-cert`、`--etcd-key`（rs 不读 env）。cluster.sh / docs/ops.md 同步。
+- **Acceptance**: 对开了 auth+TLS 的真实 etcd，manager 选主、replay、写入、token 过期后自动重认证均正常；错误口令/证书启动即响亮失败；不带新 flag 时对明文 etcd 行为不变。
+- `passes: false`
+- **notes** (2026-10-07): 用户定：后做，排在 F-CLUSTER-STATUS-SUMMARY 之后。
 
 ### F-PS-CORE-CAPACITY — 分区放置按 PS 核容量；允许超卖，manager 感知并按策略消解
 - **Trigger** (2026-09-29 用户讨论): `--cpuset` 下每个分区占 2 核（P-log + P-sst），PS 容量 = `cpuset_len/2`，但 manager 放置分区只看各 PS 的 region 数（`compute_region_for_partition`、`rebalance_regions`、`compute_rebalance_moves` 三处），完全不知道核容量。PS 侧预算门是硬拒：`sync_regions_once` 满了拒开（分区一直 `ps=unknown`），`handle_split_part` 满了拒 split，且检查的是父分区所在 PS，而右孩子由 manager 派到最少 region 的 PS，可能不是本机。超出核数的线程 `pick_cpu_for_ord` 返回 `None` 不绑核，继承进程掩码，可能跑出 cpuset 抢 EN/其他租户的核。

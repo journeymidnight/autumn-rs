@@ -2019,6 +2019,35 @@ Requirements / caveats:
   df-echo check (M1b) WARNs if the stored location drifts and refuses to serve
   an imposter that reused the node's IP under a different uuid.
 
+## Retiring a partition server (`ps-remove`)
+
+The manager remembers every psid that has ever registered (`psMembers/` in
+etcd) and counts the fleet against that set. A PS that stops heartbeating is
+evicted after 10 s — its partitions move to the others — but it stays a
+member, listed as `evicted Ns ago`, so the fleet reads `2/3`, not `2/2`.
+
+```bash
+AO=(./target/release/autumn-op --cluster-secret-file "$DR/cluster.secret" --manager 127.0.0.1:9001)
+"${AO[@]}" info                         # partition servers: ... evicted 37s ago
+"${AO[@]}" ps-remove 7 --by you         # only once PS 7 is stopped AND evicted
+```
+
+`ps-remove` refuses (`code=3 precondition failed: ps 7 is registered at ...`,
+exit 2) while the PS is in the live registry: stop it and wait the 10 s
+eviction first. Unknown ids answer `code=1 not found`. A removed psid that
+starts again simply rejoins. Each attempt lands in `audit-log` as `remove_ps`.
+
+**psid uniqueness is yours to guarantee.** The manager does not judge
+registrations: two processes started with the same `--psid` are counted as one
+PS, the later registration's address wins, and nothing reports an error.
+
+Manual check (real binaries, debug build is fine): start etcd + manager + two
+PS (`--psid 1`, `--psid 2`), `kill -9` PS 2, wait 14 s → `info` shows PS 2
+`evicted`; `ps-remove 1` → refused; restart the manager → PS 2 still listed as
+evicted; `ps-remove 2` → `remove: ok`; again → `not found`; `info` lists PS 1
+only. Do not `pkill -f` by a pattern your own shell command contains — it kills
+the shell; take PIDs from `pgrep autumn-manager` / `pgrep -x autumn-ps`.
+
 ## fs stripe geometry: lanes vs partitions
 
 Large-file striping spreads one file's extents across N **lanes** so a single

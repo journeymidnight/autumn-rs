@@ -336,8 +336,8 @@ pub fn build_overview_json(
             json!({
                 "ps_id": p.ps_id,
                 "addr": p.address,
-                // null = no heartbeat entry (defensive — replay and
-                // registration both seed one). Never render it as "0 s ago".
+                // null = no heartbeat entry (an evicted member). Never
+                // render it as "0 s ago".
                 "last_heartbeat_secs_ago": (p.last_heartbeat_secs_ago != u64::MAX)
                     .then_some(p.last_heartbeat_secs_ago),
                 "partition_count": p.partition_count,
@@ -348,6 +348,10 @@ pub fn build_overview_json(
                 // this manager just became leader).
                 "open_count": p.open_count,
                 "ready": p.ready(),
+                // null = in the live registry. Set = evicted at that unix ms
+                // and still a member: expected back, or awaiting `ps-remove`.
+                "evicted_at_ms": (p.evicted_at_ms > 0).then_some(p.evicted_at_ms),
+                "joined_at_ms": p.joined_at_ms,
                 // Recomputed from the partitions the page is showing, so the
                 // count here and the list it drills into cannot disagree.
                 "n": n,

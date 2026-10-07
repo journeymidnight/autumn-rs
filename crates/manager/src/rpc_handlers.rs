@@ -15,10 +15,11 @@ use compio::BufResult;
 use std::rc::Rc;
 
 use crate::persist::records::ExtentRecord;
+use crate::persist::records::MemberRecord;
 use crate::persist::records::NodeRecord;
 use crate::persist::records::PartitionRecord;
 use crate::persist::records::StreamRecord;
-use crate::{AutumnManager, ConnPool, PendingDelete};
+use crate::{AutumnManager, ConnPool, PendingDelete, PS_MEMBERS_PREFIX};
 
 /// #6: RAII removal of a partition from `AutumnManager.split_inflight` on every
 /// exit path of `handle_multi_modify_split` (success + all early-return errors).
@@ -307,6 +308,7 @@ impl AutumnManager {
             MSG_LIST_NODE_STATES => self.handle_list_node_states(payload).await,
             MSG_EXTENT_HEALTH_REPORT => self.handle_extent_health_report(payload).await,
             MSG_EXTENT_HEALTH_SUMMARY => self.handle_extent_health_summary(payload).await,
+            MSG_REMOVE_MEMBER => self.handle_remove_member(payload).await,
             MSG_LIST_EC_INFLIGHT_MARKERS => self.handle_list_ec_inflight_markers(payload).await,
             MSG_FENCE_NODE => self.handle_fence_node(payload).await,
             MSG_SET_NODE_MAINTENANCE => self.handle_set_node_maintenance(payload).await,
@@ -5508,15 +5510,20 @@ impl AutumnManager {
         }
         let hb = self.ps_last_heartbeat.borrow();
         let now = Instant::now();
-        let mut ps_servers: Vec<PsOverview> = s
-            .ps_nodes
+        // Every member plus the live registry: an evicted member is listed
+        // (no heartbeat, `evicted_at_ms` set) until an operator removes it.
+        let ids: std::collections::BTreeSet<u64> =
+            s.ps_nodes.keys().chain(s.ps_members.keys()).copied().collect();
+        let ps_servers: Vec<PsOverview> = ids
             .iter()
-            .map(|(ps_id, addr)| PsOverview {
+            .map(|ps_id| (ps_id, s.ps_nodes.get(ps_id), s.ps_members.get(ps_id)))
+            .map(|(ps_id, live, member)| PsOverview {
                 ps_id: *ps_id,
-                address: addr.clone(),
-                // u64::MAX = no heartbeat entry for this PS. Not expected —
-                // `replay_from_etcd` and `register_ps` both seed one — but a
-                // missing entry must render as "unknown", never as "0 s ago".
+                address: live
+                    .or(member.map(|m| &m.address))
+                    .cloned()
+                    .unwrap_or_default(),
+                // u64::MAX = no heartbeat entry: an evicted member.
                 last_heartbeat_secs_ago: hb
                     .get(ps_id)
                     .map(|t| now.saturating_duration_since(*t).as_secs())
@@ -5527,9 +5534,14 @@ impl AutumnManager {
                     .ps_open_parts
                     .contains_key(ps_id)
                     .then(|| per_ps_open.get(ps_id).copied().unwrap_or(0)),
+                joined_at_ms: member.map_or(0, |m| m.joined_at_ms),
+                evicted_at_ms: if live.is_some() {
+                    0
+                } else {
+                    member.map_or(0, |m| m.left_at_ms)
+                },
             })
             .collect();
-        ps_servers.sort_by_key(|p| p.ps_id);
 
         GetClusterOverviewResp {
             code: CODE_OK,
@@ -5649,6 +5661,94 @@ impl AutumnManager {
         }
     }
 
+    /// Make `ps_id` a member, or mark an existing member present again at
+    /// `address`. Writes only when the record changes, so a PS re-registering
+    /// at the same address costs no etcd write. `psNodes/<id>` goes in the same
+    /// txn: a member written without it would replay as never registered and
+    /// so never be evicted. Caller holds `ps_member_lock`.
+    async fn record_ps_member(&self, ps_id: u64, address: &str) -> Result<(), AppError> {
+        let next = {
+            let s = self.store.inner.borrow();
+            match s.ps_members.get(&ps_id) {
+                Some(m) if m.address == address && m.left_at_ms == 0 => return Ok(()),
+                Some(m) => MemberRecord {
+                    address: address.to_string(),
+                    joined_at_ms: m.joined_at_ms,
+                    left_at_ms: 0,
+                },
+                None => MemberRecord {
+                    address: address.to_string(),
+                    joined_at_ms: Self::now_s_ms().1,
+                    left_at_ms: 0,
+                },
+            }
+        };
+        if let Some(etcd) = &self.etcd {
+            etcd.put_msgs_txn(vec![
+                (
+                    format!("{PS_MEMBERS_PREFIX}{ps_id}"),
+                    crate::persist::encode(&next),
+                ),
+                (format!("psNodes/{ps_id}"), address.as_bytes().to_vec()),
+            ])
+            .await?;
+        }
+        self.store.inner.borrow_mut().ps_members.insert(ps_id, next);
+        Ok(())
+    }
+
+    /// `MSG_REMOVE_MEMBER`: shrink the expected fleet. Refused while the
+    /// member is in the live registry — removing a running server would only
+    /// make the counts lie until it re-registered.
+    pub(crate) async fn handle_remove_member(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: RemoveMemberReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let (code, message) = match req.role {
+            MEMBER_ROLE_PS => match self.remove_ps_member(req.id).await {
+                Ok(()) => (CODE_OK, String::new()),
+                Err(err) => (Self::err_to_code(&err), err.to_string()),
+            },
+            other => (CODE_INVALID_ARGUMENT, format!("unknown member role {other}")),
+        };
+        self.append_audit(MgrAuditEntry {
+            op: AUDIT_OP_REMOVE_PS,
+            node_id: req.id,
+            extent_id: 0,
+            by: req.set_by,
+            reason: String::new(),
+            result_code: code,
+            result_message: message.clone(),
+            ts_ns: 0,
+        })
+        .await;
+        Self::code_resp(code, message)
+    }
+
+    async fn remove_ps_member(&self, ps_id: u64) -> Result<(), AppError> {
+        let _members = self.ps_member_lock.lock().await;
+        {
+            let s = self.store.inner.borrow();
+            if let Some(addr) = s.ps_nodes.get(&ps_id) {
+                return Err(AppError::Precondition(format!(
+                    "ps {ps_id} is registered at {addr}; stop it and wait for its \
+                     eviction before removing it"
+                )));
+            }
+            if !s.ps_members.contains_key(&ps_id) {
+                return Err(AppError::NotFound(format!("ps {ps_id} is not a member")));
+            }
+        }
+        if let Some(etcd) = &self.etcd {
+            etcd.put_and_delete_txn(Vec::new(), vec![format!("{PS_MEMBERS_PREFIX}{ps_id}")])
+                .await?;
+        }
+        self.store.inner.borrow_mut().ps_members.remove(&ps_id);
+        Ok(())
+    }
+
     pub(crate) async fn handle_register_ps(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Self::code_resp(Self::err_to_code(&err), err.to_string());
@@ -5658,6 +5758,12 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let ps_id = req.ps_id;
         {
+            // Held until the PS is in the live registry, so a remove cannot
+            // land between the member write and the insert.
+            let _members = self.ps_member_lock.lock().await;
+            if let Err(err) = self.record_ps_member(ps_id, &req.address).await {
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
+            }
             let mut s = self.store.inner.borrow_mut();
             s.ps_nodes.insert(ps_id, req.address);
             Self::record_slot_cap(&mut s, ps_id, req.slot_cap);
@@ -5665,10 +5771,11 @@ impl AutumnManager {
             // its first heartbeat says what it has.
             s.ps_open_parts.remove(&ps_id);
             Self::rebalance_regions(&mut s);
+            drop(s);
+            self.ps_last_heartbeat
+                .borrow_mut()
+                .insert(ps_id, Instant::now());
         }
-        self.ps_last_heartbeat
-            .borrow_mut()
-            .insert(ps_id, Instant::now());
         if let Err(err) = self.mirror_partition_snapshot().await {
             return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }

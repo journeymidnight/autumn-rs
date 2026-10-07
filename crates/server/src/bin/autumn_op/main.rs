@@ -170,6 +170,7 @@ fn op_name(b: u8) -> &'static str {
         AUDIT_OP_SET_NODE_MAINTENANCE => "maintenance",
         AUDIT_OP_CLEAR_NODE_OVERRIDE => "clear_override",
         AUDIT_OP_REMOVE_NODE => "remove_node",
+        AUDIT_OP_REMOVE_PS => "remove_ps",
         AUDIT_OP_FORCE_EC_CONVERT => "force_ec_convert",
         AUDIT_OP_FORCE_ABANDON_EC_MARKER => "force_abandon_ec_marker",
         AUDIT_OP_REPAIR => "repair",
@@ -434,6 +435,9 @@ async fn run(args: Args) -> Result<()> {
         } => cmd_maintenance(&client, args.json, node_id, reason, by, expire).await?,
         Command::Unfence { node_id, by } => cmd_unfence(&client, args.json, node_id, by).await?,
         Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
+        Command::PsRemove { ps_id, by } => {
+            cmd_remove_member(&client, args.json, MEMBER_ROLE_PS, ps_id, by).await?
+        }
         // ---------------- cluster / partition read ----------------
         Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,
         Command::Overview => cmd_overview(&client).await?,
@@ -1917,6 +1921,38 @@ async fn cmd_remove(client: &ClusterClient, json: bool, node_id: u64, by: String
     Ok(())
 }
 
+async fn cmd_remove_member(
+    client: &ClusterClient,
+    json: bool,
+    role: u8,
+    id: u64,
+    by: String,
+) -> Result<()> {
+    if by.is_empty() {
+        bail!("--by is required");
+    }
+    let req = RemoveMemberReq { role, id, set_by: by };
+    let bytes = client.mgr_call(MSG_REMOVE_MEMBER, rkyv_encode(&req)).await?;
+    let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "code": resp.code,
+                "message": resp.message,
+            }))?
+        );
+    } else if resp.code == CODE_OK {
+        println!("remove: ok");
+    } else {
+        println!("remove: code={} {}", resp.code, resp.message);
+    }
+    if resp.code != CODE_OK {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
 async fn cmd_set_stream_ec(
     client: &ClusterClient,
     json: bool,
@@ -3224,6 +3260,8 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
                         .then_some(p.last_heartbeat_secs_ago),
                     "open_count": p.open_count,
                     "ready": p.ready(),
+                    "joined_at_ms": p.joined_at_ms,
+                    "evicted_at_ms": (p.evicted_at_ms > 0).then_some(p.evicted_at_ms),
                 })).collect::<Vec<_>>(),
                 "total_req_per_sec": resp.total_req_per_sec,
                 "total_write_bytes_per_sec": resp.total_write_bytes_per_sec,
@@ -3324,7 +3362,12 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
 /// One word on whether a PS serves what it was assigned; `ready` is the
 /// only state a start-up or readiness check should accept.
 fn ps_state(p: &PsOverview) -> String {
-    if p.last_heartbeat_secs_ago == u64::MAX {
+    if p.evicted_at_ms > 0 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        format!("evicted {}s ago", (now_ms - p.evicted_at_ms).max(0) / 1000)
+    } else if p.last_heartbeat_secs_ago == u64::MAX {
         "no heartbeat".to_string()
     } else if p.last_heartbeat_secs_ago >= PsOverview::READY_MAX_HEARTBEAT_AGE_SECS {
         format!("silent {}s", p.last_heartbeat_secs_ago)

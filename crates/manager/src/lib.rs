@@ -103,6 +103,10 @@ use bytes::Bytes;
 /// Etcd path for the manager leader-key. Also used as the fence target
 /// for every manager etcd write txn.
 pub(crate) const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
+/// A PS silent this long is evicted from the live registry.
+const PS_DEAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// `psMembers/<ps_id>` → `MemberRecord`.
+pub(crate) const PS_MEMBERS_PREFIX: &str = "psMembers/";
 
 /// etcd prefix for persistent operator overrides
 /// (`node_override/<node_id>` → rkyv'd `MgrNodeOverride`).
@@ -720,6 +724,9 @@ pub struct AutumnManager {
         Rc<RefCell<HashMap<u64, crate::recovery_attempt::RecoveryRecord>>>,
     /// Serializes recovery publication with node identity and retirement.
     pub(crate) node_lifecycle_lock: Rc<futures::lock::Mutex<()>>,
+    /// Serializes every write of a `psMembers/` record (registration, eviction,
+    /// remove), so a remove cannot interleave a registration of the same id.
+    pub(crate) ps_member_lock: Rc<futures::lock::Mutex<()>>,
     /// Attempt identity for each live marker in `inflight`, keyed the same way:
     /// the etcd revision of the txn that CREATED that marker. Unique per
     /// attempt (a released-then-reissued marker is a different creation) and
@@ -1130,6 +1137,7 @@ impl AutumnManager {
             inflight: Rc::new(RefCell::new(HashMap::new())),
             recovery_attempts: Rc::new(RefCell::new(HashMap::new())),
             node_lifecycle_lock: Rc::new(futures::lock::Mutex::new(())),
+            ps_member_lock: Rc::new(futures::lock::Mutex::new(())),
             inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
             extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
             extent_corrupt_slots: Rc::new(RefCell::new(HashMap::new())),
@@ -3126,6 +3134,7 @@ impl AutumnManager {
         let owner_locks = c.get_prefix("ownerLocks/").await?;
         let partitions = c.get_prefix("partitions/").await?;
         let ps_nodes = c.get_prefix("psNodes/").await?;
+        let ps_members = c.get_prefix(PS_MEMBERS_PREFIX).await?;
         let regions = c.get_prefix("regions/").await?;
         // per-partition last_op_at sidecar
         let last_op = c.get_prefix("partitionLastOp/").await?;
@@ -3211,6 +3220,15 @@ impl AutumnManager {
             decoded_ps_nodes.insert(id, addr);
         }
 
+        let mut decoded_ps_members = BTreeMap::new();
+        for kv in &ps_members.kvs {
+            let id = Self::parse_id_from_key(PS_MEMBERS_PREFIX, &kv.key)?;
+            let member: crate::persist::records::MemberRecord =
+                crate::persist::decode(&String::from_utf8_lossy(&kv.key), &kv.value)
+                    .map_err(Self::replay_decode_err)?;
+            decoded_ps_members.insert(id, member);
+        }
+
         let mut decoded_regions = BTreeMap::new();
         for kv in &regions.kvs {
             let id = Self::parse_id_from_key("regions/", &kv.key)?;
@@ -3240,6 +3258,7 @@ impl AutumnManager {
             s.next_revision = s.next_revision.max(max_revision);
             s.partitions = decoded_partitions;
             s.ps_nodes = decoded_ps_nodes;
+            s.ps_members = decoded_ps_members;
             // Caps are in-memory only; whatever an earlier term held may be
             // stale. The next heartbeat of each PS brings them back.
             s.ps_slot_caps.clear();
@@ -4040,7 +4059,6 @@ impl AutumnManager {
     // restart, so the loop future must own it.
     async fn ps_liveness_check_loop(self) {
         const CHECK_INTERVAL: Duration = Duration::from_secs(2);
-        const PS_DEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
         loop {
             compio::time::sleep(CHECK_INTERVAL).await;
@@ -4053,65 +4071,77 @@ impl AutumnManager {
             if !self.leader.get() || !self.serving.get() {
                 continue;
             }
+            self.evict_silent_ps(PS_DEAD_TIMEOUT).await;
+        }
+    }
 
-            let dead_ps: Vec<u64> = {
-                let hb = self.ps_last_heartbeat.borrow();
-                let s = self.store.inner.borrow();
-                s.ps_nodes
-                    .keys()
-                    .filter(|ps_id| match hb.get(ps_id) {
-                        Some(t) => t.elapsed() > PS_DEAD_TIMEOUT,
-                        None => false,
-                    })
-                    .copied()
-                    .collect()
-            };
+    /// Drop every PS silent for longer than `dead_after` from the live
+    /// registry and reassign its regions. Its member record stays, stamped
+    /// with when it left.
+    pub(crate) async fn evict_silent_ps(&self, dead_after: Duration) {
+        // Under the member lock so a registration cannot land between
+        // judging a PS dead and stamping its member record.
+        let _members = self.ps_member_lock.lock().await;
 
-            if dead_ps.is_empty() {
-                continue;
-            }
+        let dead_ps: Vec<u64> = {
+            let hb = self.ps_last_heartbeat.borrow();
+            let s = self.store.inner.borrow();
+            s.ps_nodes
+                .keys()
+                .filter(|ps_id| match hb.get(ps_id) {
+                    Some(t) => t.elapsed() > dead_after,
+                    None => false,
+                })
+                .copied()
+                .collect()
+        };
 
+        if dead_ps.is_empty() {
+            return;
+        }
+
+        for ps_id in &dead_ps {
+            tracing::warn!("PS {ps_id} heartbeat timed out, removing and reassigning regions");
+        }
+
+        // The member stays; it only records when the PS went.
+        let left_at_ms = Self::now_s_ms().1;
+        let mut member_puts = Vec::new();
+        {
+            let mut s = self.store.inner.borrow_mut();
             for ps_id in &dead_ps {
-                tracing::warn!("PS {ps_id} heartbeat timed out, removing and reassigning regions");
-            }
-
-            {
-                let mut s = self.store.inner.borrow_mut();
-                for ps_id in &dead_ps {
-                    s.ps_nodes.remove(ps_id);
-                    s.ps_slot_caps.remove(ps_id);
-                    s.ps_open_parts.remove(ps_id);
-                }
-                Self::rebalance_regions(&mut s);
-            }
-            {
-                let mut hb = self.ps_last_heartbeat.borrow_mut();
-                for ps_id in &dead_ps {
-                    hb.remove(ps_id);
+                s.ps_nodes.remove(ps_id);
+                s.ps_slot_caps.remove(ps_id);
+                s.ps_open_parts.remove(ps_id);
+                if let Some(m) = s.ps_members.get_mut(ps_id) {
+                    m.left_at_ms = left_at_ms;
+                    member_puts.push((
+                        format!("{PS_MEMBERS_PREFIX}{ps_id}"),
+                        crate::persist::encode(&*m),
+                    ));
                 }
             }
-
-            // explicit delete of every evicted PS's etcd key.
-            // `mirror_partition_snapshot` only PUTs survivors and never
-            // DELETEs — previously the evicted `psNodes/<id>` key
-            // persisted in etcd indefinitely. On manager failover the
-            // new leader's `replay_from_etcd` rehydrated it back into
-            // `s.ps_nodes`, but `ps_last_heartbeat` (in-memory only) was
-            // empty, so the liveness check's `None` arm short-circuited
-            // to `false` (treated as live) and the resurrected ghost
-            // PS was unevictable forever. Deleting the etcd key here
-            // closes the resurrection path entirely.
-            if let Some(etcd) = &self.etcd {
-                let deletes: Vec<String> =
-                    dead_ps.iter().map(|id| format!("psNodes/{id}")).collect();
-                if let Err(e) = etcd.put_and_delete_txn(Vec::new(), deletes).await {
-                    tracing::error!("delete evicted psNodes/ keys failed: {e}");
-                }
+            Self::rebalance_regions(&mut s);
+        }
+        {
+            let mut hb = self.ps_last_heartbeat.borrow_mut();
+            for ps_id in &dead_ps {
+                hb.remove(ps_id);
             }
+        }
 
-            if let Err(e) = self.mirror_partition_snapshot().await {
-                tracing::error!("mirror after PS eviction failed: {e}");
+        // `mirror_partition_snapshot` never deletes, so the evicted
+        // `psNodes/` keys go here, or a successor would replay them as live.
+        if let Some(etcd) = &self.etcd {
+            let deletes: Vec<String> =
+                dead_ps.iter().map(|id| format!("psNodes/{id}")).collect();
+            if let Err(e) = etcd.put_and_delete_txn(member_puts, deletes).await {
+                tracing::error!("delete evicted psNodes/ keys failed: {e}");
             }
+        }
+
+        if let Err(e) = self.mirror_partition_snapshot().await {
+            tracing::error!("mirror after PS eviction failed: {e}");
         }
     }
 
@@ -6375,6 +6405,51 @@ mod tests {
             for r in s.regions.values() {
                 assert_eq!(r.ps_id, 2);
             }
+        })
+    }
+
+    /// A silent PS leaves the live registry but not the membership; coming
+    /// back clears the eviction stamp and keeps the original join time.
+    #[test]
+    fn an_evicted_ps_rejoins_as_the_same_member() {
+        run(async {
+            let m = AutumnManager::new();
+            for ps_id in [1u64, 2] {
+                let req = rkyv_encode(&RegisterPsReq {
+                    ps_id,
+                    address: format!("ps{ps_id}:9001"),
+                    slot_cap: 0,
+                });
+                m.handle_register_ps(req).await.unwrap();
+            }
+            let joined = m.store.inner.borrow().ps_members[&2].joined_at_ms;
+            assert!(joined > 0);
+
+            let past = Instant::now() - Duration::from_secs(60);
+            m.ps_last_heartbeat.borrow_mut().insert(2, past);
+            m.evict_silent_ps(PS_DEAD_TIMEOUT).await;
+            {
+                let s = m.store.inner.borrow();
+                assert!(!s.ps_nodes.contains_key(&2));
+                assert!(s.ps_members[&2].left_at_ms > 0);
+                assert_eq!(s.ps_members[&1].left_at_ms, 0);
+            }
+            let ov = m.compute_cluster_overview_resp();
+            let ids: Vec<u64> = ov.ps_servers.iter().map(|p| p.ps_id).collect();
+            assert_eq!(ids, vec![1, 2]);
+            assert!(ov.ps_servers[1].evicted_at_ms > 0 && !ov.ps_servers[1].ready());
+
+            let req = rkyv_encode(&RegisterPsReq {
+                ps_id: 2,
+                address: "ps2-moved:9001".to_string(),
+                slot_cap: 0,
+            });
+            m.handle_register_ps(req).await.unwrap();
+            let s = m.store.inner.borrow();
+            let member = &s.ps_members[&2];
+            assert_eq!(member.left_at_ms, 0);
+            assert_eq!(member.joined_at_ms, joined);
+            assert_eq!(member.address, "ps2-moved:9001");
         })
     }
 

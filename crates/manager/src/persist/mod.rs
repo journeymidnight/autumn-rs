@@ -99,9 +99,9 @@ pub(crate) trait PersistRecord {
 
 // ── record_type registry (frozen, append-only) ──────────────────────────────
 //
-// All nine persisted records. These numbers are written into every stored
+// Every persisted record. These numbers are written into every stored
 // value, so they are FROZEN — renumbering one silently re-labels every record
-// already on disk. The next record takes 10.
+// already on disk.
 pub(crate) const RECORD_TYPE_AUDIT: u8 = 1;
 pub(crate) const RECORD_TYPE_TENANT_ACCOUNT: u8 = 2;
 pub(crate) const RECORD_TYPE_NAMESPACE: u8 = 3;
@@ -112,7 +112,8 @@ pub(crate) const RECORD_TYPE_REGION: u8 = 9;
 pub(crate) const RECORD_TYPE_NODE: u8 = 6;
 pub(crate) const RECORD_TYPE_DISK: u8 = 7;
 pub(crate) const RECORD_TYPE_RECOVERY_ATTEMPT: u8 = 10;
-// The next record takes 11.
+pub(crate) const RECORD_TYPE_MEMBER: u8 = 11;
+// The next record takes 12.
 
 /// Wrap a record in its envelope. The body is the same rkyv codec the rest of
 /// the manager uses — the envelope is what this module adds, not a new

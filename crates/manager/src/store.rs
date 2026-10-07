@@ -38,7 +38,11 @@ pub(crate) struct MetadataState {
     pub owner_epochs: HashMap<String, i64>,
     pub next_revision: i64,
     pub partitions: HashMap<u64, crate::persist::records::PartitionRecord>,
+    /// The LIVE registry: a PS is here from registration until eviction.
     pub ps_nodes: HashMap<u64, String>,
+    /// Every PS id the cluster expects (`psMembers/`). A superset of
+    /// `ps_nodes` from registration on; eviction leaves the member here.
+    pub ps_members: BTreeMap<u64, crate::persist::records::MemberRecord>,
     pub regions: BTreeMap<u64, crate::persist::records::RegionRecord>,
     /// per-partition listener addresses reported by PS via
     /// `RegisterPartitionAddr`. In-memory only; rebuilt when the PS
