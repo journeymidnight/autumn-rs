@@ -98,7 +98,7 @@ def run():
                 '--initial-cluster', f'dashboard-test=http://127.0.0.1:{etcd+1}'])
             eventually(lambda: ready(etcd))
             manager = spawn('manager', [str(BIN/'autumn-manager-server'), '--port', str(mgr), '--listen', '127.0.0.1',
-                '--cluster-secret-file', str(secret), '--etcd', f'127.0.0.1:{etcd}'])
+                '--cluster-secret-file', str(secret), '--manager-id', '1', '--etcd', f'127.0.0.1:{etcd}'])
             eventually(lambda: ready(mgr))
             # Read-only status proves that leader election/replay finished.
             def leader():
@@ -160,7 +160,7 @@ def run():
             assert {'op_id','kind','state','progress_done','progress_total','started_at','finished_at'} <= ops['history'][0].keys()
             # All switches off: safely exercise Armed without actuating maintenance.
             name = 'contract-\'"&policy'
-            switches = {k:False for k in ('split','ec','compact','gc','merge','rebalance','repair')}
+            switches = {k:False for k in ('split','ec','compact','gc','merge','rebalance','repair','scrub')}
             for route, body in [('/api/policies/activate', {}), ('/api/policies/activate', {'enabled':'false'}),
                 ('/api/policies/activate', {'active':'--arm'}), ('/api/policies/delete', {'name':'--arm'}),
                 ('/api/policies/upsert', {'name':'bad','switches':switches,'max_actions':2**32}),

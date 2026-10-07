@@ -23,6 +23,10 @@ pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 struct Args {
     port: u16,
     etcd: Vec<String>,
+    /// `--manager-id`: this manager's identity in the membership. Required
+    /// with `--etcd`; the operator keeps it unique, and a second process
+    /// with the same id waits until the first is gone.
+    manager_id: u64,
     bind_host: String,
     transport: TransportKind,
     /// enable fast-mode policy thresholds for load testing —
@@ -78,6 +82,7 @@ struct Args {
 fn parse_args() -> Args {
     let mut port: u16 = 9001;
     let mut etcd: Vec<String> = Vec::new();
+    let mut manager_id: u64 = 0;
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
     let mut policy_fast_mode = false;
@@ -108,6 +113,10 @@ fn parse_args() -> Args {
                 for ep in raw[i].split(',') {
                     etcd.push(ep.trim().to_string());
                 }
+            }
+            "--manager-id" => {
+                i += 1;
+                manager_id = raw[i].parse().expect("--manager-id must be a number");
             }
             "--listen" => {
                 i += 1;
@@ -212,9 +221,15 @@ fn parse_args() -> Args {
         i += 1;
     }
 
+    if !etcd.is_empty() && manager_id == 0 {
+        eprintln!("error: --manager-id <N> (non-zero) is required with --etcd");
+        std::process::exit(2);
+    }
+
     Args {
         port,
         etcd,
+        manager_id,
         bind_host,
         transport,
         policy_fast_mode,
@@ -260,7 +275,11 @@ async fn main() -> Result<()> {
         AutumnManager::new()
     } else {
         tracing::info!("connecting to etcd: {:?}", args.etcd);
-        AutumnManager::new_with_etcd(args.etcd)
+        let identity = autumn_manager::ManagerIdentity {
+            id: args.manager_id,
+            address: addr.to_string(),
+        };
+        AutumnManager::new_with_etcd(args.etcd, identity)
             .await
             .context("connect to etcd")?
     };

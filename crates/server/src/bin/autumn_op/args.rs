@@ -46,6 +46,8 @@ fn usage() -> ! {
     eprintln!("  remove <id> --by alice");
     eprintln!("  ps-remove <ps_id> --by alice");
     eprintln!("                               drop a stopped, evicted PS from the expected fleet");
+    eprintln!("  manager-remove <manager_id> --by alice");
+    eprintln!("                               drop a stopped manager from the expected fleet");
     eprintln!();
     eprintln!("cluster / partition admin commands (moved from autumn-client):");
     eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]");
@@ -316,6 +318,10 @@ pub(crate) enum Command {
     },
     PsRemove {
         ps_id: u64,
+        by: String,
+    },
+    ManagerRemove {
+        manager_id: u64,
         by: String,
     },
     // read / observability (migrated from autumn-client)
@@ -837,6 +843,15 @@ pub(crate) fn parse() -> Args {
             i += 1;
             let (_reason, by, _force) = parse_admin_flags(&raw, &mut i);
             Command::PsRemove { ps_id, by }
+        }
+        "manager-remove" => {
+            let manager_id: u64 = raw
+                .get(i)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| usage());
+            i += 1;
+            let (_reason, by, _force) = parse_admin_flags(&raw, &mut i);
+            Command::ManagerRemove { manager_id, by }
         }
         // ── authz tooling ────────────────────────────────────────────
         "gen-signing-key" => {

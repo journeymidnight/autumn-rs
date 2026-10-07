@@ -42,7 +42,7 @@ fn start_stoppable_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) -> 
     let flag_thread = flag.clone();
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let manager = autumn_manager::AutumnManager::new_with_etcd(vec![etcd_endpoint])
+            let manager = autumn_manager::AutumnManager::new_with_etcd(vec![etcd_endpoint], support::manager_identity())
                 .await
                 .expect("new manager with etcd");
             compio::runtime::spawn(async move {

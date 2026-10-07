@@ -156,9 +156,17 @@ run_manager() {
     local etcd
     etcd="$(resolve_hostport_list "${AUTUMN_ETCD_ENDPOINTS:-etcd:2379}")"
     require_cluster_secret
+    # manager id must be unique and non-zero: StatefulSet ordinal + 1.
+    local mid="${AUTUMN_MANAGER_ID:-}"
+    if [[ -z "$mid" ]]; then
+        local ord="${HOSTNAME##*-}"
+        [[ "$ord" =~ ^[0-9]+$ ]] \
+            || die "cannot derive the manager id from HOSTNAME='$HOSTNAME'; set AUTUMN_MANAGER_ID"
+        mid=$(( ord + 1 ))
+    fi
     local -a args=(
         --cluster-secret-file "$CLUSTER_SECRET_FILE"
-        --port "$port" --etcd "$etcd" --listen 0.0.0.0 --transport "$TRANSPORT"
+        --port "$port" --manager-id "$mid" --etcd "$etcd" --listen 0.0.0.0 --transport "$TRANSPORT"
     )
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && args+=(--policy-fast-mode)
     [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9591)

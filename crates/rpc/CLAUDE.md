@@ -910,6 +910,9 @@ until an operator removes it. `MSG_REMOVE_MEMBER` (0x64, Admin-only,
 `CodeResp`) and `AUDIT_OP_REMOVE_PS` (16) are appended values. Neither is on
 the client surface: the ceiling rises to [43, 57], the floor stays, and
 autumn-op / the dashboard are rebuilt with the cluster.
+`MEMBER_ROLE_MANAGER` (2) and `AUDIT_OP_REMOVE_MANAGER` (17) were appended
+afterwards as values only, with no struct change and no bump: an older
+manager answers role 2 with `CODE_INVALID_ARGUMENT`.
 
 ## Pending repair requests in the health summary (wire 54)
 

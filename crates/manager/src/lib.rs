@@ -13,6 +13,7 @@ mod inflight_commit;
 pub mod inode_lease;
 pub mod node_state;
 mod op_log;
+mod manager_members;
 mod persist;
 mod placement;
 pub mod policy;
@@ -28,6 +29,7 @@ pub(crate) mod store;
 /// Test-only merge-freeze failpoint (always 0 in production); see its doc in
 /// `rpc_handlers`. Re-exported so integration tests can arm it.
 #[doc(hidden)]
+pub use manager_members::ManagerIdentity;
 pub use rpc_handlers::MERGE_TEST_PAUSE_MS;
 
 // Pure `/api/overview` composer, shared with `autumn-op overview` so the
@@ -727,6 +729,15 @@ pub struct AutumnManager {
     /// Serializes every write of a `psMembers/` record (registration, eviction,
     /// remove), so a remove cannot interleave a registration of the same id.
     pub(crate) ps_member_lock: Rc<futures::lock::Mutex<()>>,
+    /// `--manager-id` and address; `None` in memory mode.
+    pub(crate) identity: Option<Rc<manager_members::ManagerIdentity>>,
+    /// The lease holding `managerAlive/<id>`.
+    pub(crate) presence_lease: Rc<Cell<i64>>,
+    /// `managerAlive/` as the leader last read it (id → address), and when.
+    pub(crate) manager_alive: Rc<RefCell<BTreeMap<u64, String>>>,
+    pub(crate) manager_alive_at: Rc<Cell<Option<Instant>>>,
+    /// Serializes `managerMembers/` writes (member sync, remove).
+    pub(crate) manager_member_lock: Rc<futures::lock::Mutex<()>>,
     /// Attempt identity for each live marker in `inflight`, keyed the same way:
     /// the etcd revision of the txn that CREATED that marker. Unique per
     /// attempt (a released-then-reissued marker is a different creation) and
@@ -1138,6 +1149,11 @@ impl AutumnManager {
             recovery_attempts: Rc::new(RefCell::new(HashMap::new())),
             node_lifecycle_lock: Rc::new(futures::lock::Mutex::new(())),
             ps_member_lock: Rc::new(futures::lock::Mutex::new(())),
+            identity: None,
+            presence_lease: Rc::new(Cell::new(0)),
+            manager_alive: Rc::new(RefCell::new(BTreeMap::new())),
+            manager_alive_at: Rc::new(Cell::new(None)),
+            manager_member_lock: Rc::new(futures::lock::Mutex::new(())),
             inflight_attempt_nonce: Rc::new(RefCell::new(HashMap::new())),
             extent_payload_location: Rc::new(RefCell::new(HashMap::new())),
             extent_corrupt_slots: Rc::new(RefCell::new(HashMap::new())),
@@ -1336,9 +1352,16 @@ impl AutumnManager {
         self.auto_dispatch_merge(&cand, &state).await
     }
 
-    pub async fn new_with_etcd(endpoints: Vec<String>) -> Result<Self> {
+    /// Waits, before anything else, until it holds `identity.id` (see
+    /// `manager_members`).
+    pub async fn new_with_etcd(
+        endpoints: Vec<String>,
+        identity: manager_members::ManagerIdentity,
+    ) -> Result<Self> {
+        anyhow::ensure!(identity.id != 0, "the manager id must be non-zero");
         let mut s = Self::new();
         s.leader.set(false);
+        s.identity = Some(Rc::new(identity));
         s.etcd = Some(
             EtcdMirror::connect(
                 endpoints,
@@ -1348,7 +1371,18 @@ impl AutumnManager {
             )
             .await?,
         );
-        s.replay_from_etcd().await?;
+        let lease = s.claim_presence_until_held().await;
+        s.presence_lease.set(lease);
+        if let Err(e) = s.replay_from_etcd().await {
+            // Free the id for the next attempt instead of making it wait out
+            // the lease.
+            if let Some(etcd) = &s.etcd {
+                if let Err(re) = etcd.client.lease_revoke(lease).await {
+                    tracing::warn!(error = %re, "revoking the manager id lease failed");
+                }
+            }
+            return Err(e);
+        }
         let _ = s.try_become_leader().await;
         s.start_runtime_tasks();
         Ok(s)
@@ -1463,6 +1497,12 @@ impl AutumnManager {
             let mgr = self.clone();
             Self::spawn_supervised("leader_election", move || {
                 mgr.clone().leader_election_loop()
+            });
+            let mgr = self.clone();
+            Self::spawn_supervised("manager_presence", move || mgr.clone().presence_loop());
+            let mgr = self.clone();
+            Self::spawn_supervised("manager_members", move || {
+                mgr.clone().manager_member_loop()
             });
         }
 
@@ -3135,6 +3175,9 @@ impl AutumnManager {
         let partitions = c.get_prefix("partitions/").await?;
         let ps_nodes = c.get_prefix("psNodes/").await?;
         let ps_members = c.get_prefix(PS_MEMBERS_PREFIX).await?;
+        let manager_members = c
+            .get_prefix(manager_members::MANAGER_MEMBERS_PREFIX)
+            .await?;
         let regions = c.get_prefix("regions/").await?;
         // per-partition last_op_at sidecar
         let last_op = c.get_prefix("partitionLastOp/").await?;
@@ -3228,6 +3271,14 @@ impl AutumnManager {
                     .map_err(Self::replay_decode_err)?;
             decoded_ps_members.insert(id, member);
         }
+        let mut decoded_manager_members = BTreeMap::new();
+        for kv in &manager_members.kvs {
+            let id = Self::parse_id_from_key(manager_members::MANAGER_MEMBERS_PREFIX, &kv.key)?;
+            let member: crate::persist::records::MemberRecord =
+                crate::persist::decode(&String::from_utf8_lossy(&kv.key), &kv.value)
+                    .map_err(Self::replay_decode_err)?;
+            decoded_manager_members.insert(id, member);
+        }
 
         let mut decoded_regions = BTreeMap::new();
         for kv in &regions.kvs {
@@ -3259,6 +3310,7 @@ impl AutumnManager {
             s.partitions = decoded_partitions;
             s.ps_nodes = decoded_ps_nodes;
             s.ps_members = decoded_ps_members;
+            s.manager_members = decoded_manager_members;
             // Caps are in-memory only; whatever an earlier term held may be
             // stale. The next heartbeat of each PS brings them back.
             s.ps_slot_caps.clear();

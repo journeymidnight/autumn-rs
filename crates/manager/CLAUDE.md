@@ -120,6 +120,8 @@ Invariants that came with it:
 
 ## Leader election
 
+Preceded by holding `--manager-id` (see "Manager identity and membership").
+
 Lease-based (10 s TTL):
 1. Create lease; CAS-write `autumn-rs/stream-manager/leader = instance_id` if absent.
 2. On win: `replay_from_etcd` rebuilds all in-memory state, set `leader = true`,
@@ -215,6 +217,8 @@ All writes go through the leader-fenced `txn_fenced` (below). On promotion
 | `regions/<id>` | `persist::RegionRecord` | carries `region_epoch` |
 | `psNodes/<id>` | PS address | LIVE registry; deleted on eviction |
 | `psMembers/<id>` | `persist::MemberRecord` | EXPECTED fleet; only `remove_member` deletes it |
+| `managerAlive/<id>` | `<instance_id>\n<address>` | on the manager's own lease; claim + presence |
+| `managerMembers/<id>` | `persist::MemberRecord` | expected managers; leader-written |
 | `next_id` | u64 | the ONLY id source (`alloc_ids`) |
 | `ownerLocks/<key>` | owner epoch | `owner_epoch` = the acquire's `mod_revision` |
 | `extent_inflight/<id>` | `MgrExtentInflightRecord` | unified in-flight ledger |
@@ -446,6 +450,26 @@ carry `slot_cap`, recorded only for a registered PS — see "Rebalance");
 `replay_from_etcd` seeds `ps_last_heartbeat = now` for every replayed PS so the
 liveness loop's `Some(t)` arm engages instead of treating it as an immortal zombie.
 
+The PS spawns its `heartbeat_loop` in `finish_connect` (NOT `serve()`, which only
+runs after every assigned partition finishes WAL replay — that can exceed the
+eviction window).
+
+**Alive is not ready.** Because the heartbeat starts before any partition has
+recovered, a fresh heartbeat says only that the process is up. Every heartbeat
+also carries `open_parts` — `(part_id, region_epoch)` of each partition the PS
+has open with a live thread, empty once it starts a graceful drain (which sends
+one extra beat at once). The manager keeps the latest set per PS in
+`MetadataState::ps_open_parts`, in memory only like the slot caps: replay
+clears it, eviction drops it, and `register_ps` drops it, so a restarted process
+never inherits its predecessor's report. The overview's `open_count` counts the
+PS's assigned regions whose `(part_id, region_epoch)` is in that set (`None` =
+no report yet); an epoch mismatch — a split the PS has not reloaded — does not
+count. `PsOverview::ready()` = heartbeat younger than 6 s AND `open_count ==
+partition_count`; autumn-op, the dashboard, `cluster.sh` and `autumn-deploy`
+all use it. After a `kill -9` the old report still reads ready until the new
+process registers or the heartbeat turns 6 s old — there is no signal the
+manager could see sooner.
+
 ### PS membership
 
 Eviction answers "is it alive", and its answer must not also become "how many
@@ -469,32 +493,38 @@ left_at_ms}`:
 
 The overview's `ps_servers` is members ∪ live registry; an evicted member has
 no heartbeat and `evicted_at_ms` set. psid uniqueness is the OPERATOR's job:
-two processes with one psid are counted as one PS, with no error (decided
-2026-10-07; the manager does not judge registrations). There is no seeding
+two processes with one psid are counted as one PS, with no error (the
+manager does not judge registrations). There is no seeding
 from `psNodes/`: an upgrade is a full restart, and every PS registers.
 Test: `tests/ps_members_etcd.rs` (evicted PS listed, survives a leader change,
 live remove refused; ablations: eviction forgetting the member, replay not
 loading it, remove skipping the live check — each red).
 
-The PS spawns its `heartbeat_loop` in `finish_connect` (NOT `serve()`, which only
-runs after every assigned partition finishes WAL replay — that can exceed the
-eviction window).
+## Manager identity and membership (`manager_members.rs`)
 
-**Alive is not ready.** Because the heartbeat starts before any partition has
-recovered, a fresh heartbeat says only that the process is up. Every heartbeat
-also carries `open_parts` — `(part_id, region_epoch)` of each partition the PS
-has open with a live thread, empty once it starts a graceful drain (which sends
-one extra beat at once). The manager keeps the latest set per PS in
-`MetadataState::ps_open_parts`, in memory only like the slot caps: replay
-clears it, eviction drops it, and `register_ps` drops it, so a restarted process
-never inherits its predecessor's report. The overview's `open_count` counts the
-PS's assigned regions whose `(part_id, region_epoch)` is in that set (`None` =
-no report yet); an epoch mismatch — a split the PS has not reloaded — does not
-count. `PsOverview::ready()` = heartbeat younger than 6 s AND `open_count ==
-partition_count`; autumn-op, the dashboard, `cluster.sh` and `autumn-deploy`
-all use it. After a `kill -9` the old report still reads ready until the new
-process registers or the heartbeat turns 6 s old — there is no signal the
-manager could see sooner.
+`--manager-id` is hand-assigned and required with `--etcd`. Startup claims
+`managerAlive/<id>` with a `create_revision == 0` txn on a 10 s lease of the
+manager's own (separate from the leader lease) and retries every second for
+as long as it takes, logging the holder: a predecessor's lease lapses within
+10 s, a misconfigured duplicate keeps holding and the log names it. A replay
+failure revokes the lease so a retry is not made to wait.
+
+Losing the lease (keepalive fails, etcd blip) does NOT stop the manager — the
+leader fence already makes a manager without leadership harmless, and exiting
+on a blip would take every manager down at once and void the leaderless
+routing window. `presence_loop` claims the id again; a key still carrying
+this process's instance id is adopted with its lease. Only when the reclaim
+finds ANOTHER process holding the id does the manager exit.
+
+The leader folds presence into `managerMembers/<id>` every 2 s
+(`sync_manager_members`, fenced): a present id becomes a member (or has its
+address refreshed and `left_at_ms` cleared); a member no longer present gets
+the time the leader noticed. Standbys write nothing. `remove_manager_member`
+deletes a member in ONE fenced txn that also requires `managerAlive/<id>` to
+be absent, so a running manager is refused without a check-then-act window;
+a removed id that starts again rejoins. Test: `tests/manager_members_etcd.rs`
+(ablations red: claim ignoring the holder, no reclaim, remove without the
+presence compare). The exit path is checked by hand (docs/ops.md).
 
 ## Extent in-flight ledger (unified)
 

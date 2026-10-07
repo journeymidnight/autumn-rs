@@ -5706,15 +5706,23 @@ impl AutumnManager {
         }
         let req: RemoveMemberReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        let (code, message) = match req.role {
-            MEMBER_ROLE_PS => match self.remove_ps_member(req.id).await {
-                Ok(()) => (CODE_OK, String::new()),
-                Err(err) => (Self::err_to_code(&err), err.to_string()),
-            },
-            other => (CODE_INVALID_ARGUMENT, format!("unknown member role {other}")),
+        let (result, op) = match req.role {
+            MEMBER_ROLE_PS => (self.remove_ps_member(req.id).await, AUDIT_OP_REMOVE_PS),
+            MEMBER_ROLE_MANAGER => (
+                self.remove_manager_member(req.id).await,
+                AUDIT_OP_REMOVE_MANAGER,
+            ),
+            other => {
+                let msg = format!("unknown member role {other}");
+                return Self::code_resp(CODE_INVALID_ARGUMENT, msg);
+            }
+        };
+        let (code, message) = match result {
+            Ok(()) => (CODE_OK, String::new()),
+            Err(err) => (Self::err_to_code(&err), err.to_string()),
         };
         self.append_audit(MgrAuditEntry {
-            op: AUDIT_OP_REMOVE_PS,
+            op,
             node_id: req.id,
             extent_id: 0,
             by: req.set_by,

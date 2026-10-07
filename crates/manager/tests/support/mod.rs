@@ -67,6 +67,17 @@ pub fn cluster_secret_file() -> &'static std::path::Path {
 // ── Address allocation ────────────────────────────────────────────────
 
 /// Pick a random available port on loopback.
+/// A manager id unique within this test process. Each test owns its etcd,
+/// so ids only have to differ between managers of one test.
+pub fn manager_identity() -> autumn_manager::ManagerIdentity {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    autumn_manager::ManagerIdentity {
+        id,
+        address: format!("test-manager-{id}"),
+    }
+}
+
 pub fn pick_addr() -> SocketAddr {
     cluster_secret_file();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");

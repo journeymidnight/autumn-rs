@@ -18,7 +18,7 @@ fn remove_lost_reply_retries_after_manager_runtime_restart() {
     let (node_id, tombstone) = {
         let runtime = compio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let manager = AutumnManager::new_with_etcd(vec![endpoint.clone()])
+            let manager = AutumnManager::new_with_etcd(vec![endpoint.clone()], support::manager_identity())
                 .await
                 .unwrap();
             let registered: RegisterNodeResp = rkyv_decode(
@@ -69,7 +69,7 @@ fn remove_lost_reply_retries_after_manager_runtime_restart() {
             .delete("autumn-rs/stream-manager/leader")
             .await
             .unwrap();
-        let manager = AutumnManager::new_with_etcd(vec![endpoint.clone()])
+        let manager = AutumnManager::new_with_etcd(vec![endpoint.clone()], support::manager_identity())
             .await
             .unwrap();
         for _ in 0..2 {

@@ -43,6 +43,8 @@ pub(crate) struct MetadataState {
     /// Every PS id the cluster expects (`psMembers/`). A superset of
     /// `ps_nodes` from registration on; eviction leaves the member here.
     pub ps_members: BTreeMap<u64, crate::persist::records::MemberRecord>,
+    /// Every manager id the cluster expects (`managerMembers/`).
+    pub manager_members: BTreeMap<u64, crate::persist::records::MemberRecord>,
     pub regions: BTreeMap<u64, crate::persist::records::RegionRecord>,
     /// per-partition listener addresses reported by PS via
     /// `RegisterPartitionAddr`. In-memory only; rebuilt when the PS

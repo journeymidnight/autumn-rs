@@ -180,7 +180,7 @@ async fn target_restart_refuses_old_attempt_and_same_assignment_successor_comple
 #[ignore = "requires etcd"]
 async fn durable_snapshot_replay_and_same_assignment_reissue() {
     let (_guard, endpoint) = support::start_etcd().await;
-    let m = AutumnManager::new_with_etcd(vec![endpoint.clone()])
+    let m = AutumnManager::new_with_etcd(vec![endpoint.clone()], support::manager_identity())
         .await
         .unwrap();
     let (task, disk) = setup(&m).await;

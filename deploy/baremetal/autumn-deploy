@@ -529,7 +529,7 @@ _start_managers() {
         host="${MANAGER_HOSTS[$m]}"
         svc_start "$host" "manager$m" "$DATA_ROOT" "$BIN_DIR/autumn-manager-server" \
             --cluster-secret-file "$CLUSTER_SECRET_REMOTE" \
-            --port "$MANAGER_PORT" --etcd "$ETCD_ENDPOINTS" \
+            --port "$MANAGER_PORT" --manager-id "$(( m + 1 ))" --etcd "$ETCD_ENDPOINTS" \
             --listen "$(plain_host "$host")" --transport "$TRANSPORT" \
             ${extra[@]:+"${extra[@]}"}
     done

@@ -171,6 +171,7 @@ fn op_name(b: u8) -> &'static str {
         AUDIT_OP_CLEAR_NODE_OVERRIDE => "clear_override",
         AUDIT_OP_REMOVE_NODE => "remove_node",
         AUDIT_OP_REMOVE_PS => "remove_ps",
+        AUDIT_OP_REMOVE_MANAGER => "remove_manager",
         AUDIT_OP_FORCE_EC_CONVERT => "force_ec_convert",
         AUDIT_OP_FORCE_ABANDON_EC_MARKER => "force_abandon_ec_marker",
         AUDIT_OP_REPAIR => "repair",
@@ -437,6 +438,9 @@ async fn run(args: Args) -> Result<()> {
         Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
         Command::PsRemove { ps_id, by } => {
             cmd_remove_member(&client, args.json, MEMBER_ROLE_PS, ps_id, by).await?
+        }
+        Command::ManagerRemove { manager_id, by } => {
+            cmd_remove_member(&client, args.json, MEMBER_ROLE_MANAGER, manager_id, by).await?
         }
         // ---------------- cluster / partition read ----------------
         Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,

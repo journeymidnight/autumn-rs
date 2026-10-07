@@ -21,7 +21,7 @@ use support::{pick_addr, start_etcd};
 fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint])
+            let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint], support::manager_identity())
                 .await
                 .expect("new manager with etcd");
             let _ = manager.serve(mgr_addr).await;

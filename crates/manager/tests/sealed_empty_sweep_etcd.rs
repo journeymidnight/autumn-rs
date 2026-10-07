@@ -43,7 +43,7 @@ fn the_sweep_reclaims_a_tail_the_dead_writer_never_punched() {
 
         // Hold the manager in THIS runtime so the sweep can be driven a tick at
         // a time; serving runs beside it.
-        let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()])
+        let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()], support::manager_identity())
             .await
             .expect("manager with etcd");
         let mgr_addr = pick_addr();

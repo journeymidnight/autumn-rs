@@ -1724,6 +1724,7 @@ pub const MSG_EXTENT_HEALTH_SUMMARY: u8 = 0x63;
 pub const MSG_REMOVE_MEMBER: u8 = 0x64;
 
 pub const MEMBER_ROLE_PS: u8 = 1;
+pub const MEMBER_ROLE_MANAGER: u8 = 2;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct RemoveMemberReq {
@@ -1960,6 +1961,7 @@ pub const AUDIT_OP_REPAIR_CANCEL: u8 = 14;
 pub const AUDIT_OP_SCRUB: u8 = 15;
 /// `node_id` of the entry carries the removed member's id.
 pub const AUDIT_OP_REMOVE_PS: u8 = 16;
+pub const AUDIT_OP_REMOVE_MANAGER: u8 = 17;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrAuditEntry {

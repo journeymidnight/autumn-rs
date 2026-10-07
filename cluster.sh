@@ -753,9 +753,11 @@ launch_manager() {
         die "AUTUMN_AUTH_PROTECTED_PREFIXES set without AUTUMN_AUTH_SIGNING_KEY_FILE — data-plane authz needs a signing key (autumn-op gen-signing-key)"
     fi
     start_proc manager \
-        "$MANAGER" --port 9001 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
+        "$MANAGER" --port 9001 --manager-id 1 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
         --transport "$TRANSPORT" $mgr_extra --cluster-secret-file "$CLUSTER_SECRET_FILE"
-    wait_port 9001 manager
+    # A restart binds only after it holds manager id 1, which can wait out
+    # the predecessor's 10 s presence lease.
+    wait_port 9001 manager 60
     # Wait for LEADERSHIP, not just the listener: a restart leaves the
     # previous leader's 10 s etcd lease behind, so the fresh manager can
     # spend ~10 s answering NOT_LEADER — `autumn-op format` / bootstrap

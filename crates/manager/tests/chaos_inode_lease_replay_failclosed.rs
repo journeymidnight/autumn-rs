@@ -46,7 +46,7 @@ fn malformed_inode_lease_replay_fails_closed() {
         // Invariant A: with an undecodable persisted writer lease present, the
         // manager must NOT come up as a (writable) leader — `new_with_etcd`
         // replays first and propagates the decode error.
-        let res = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()]).await;
+        let res = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()], support::manager_identity()).await;
         assert!(
             res.is_err(),
             "FAIL-LOUD: a malformed inode_leases/<ino> writer lease must refuse \
@@ -68,7 +68,7 @@ fn malformed_inode_lease_replay_fails_closed() {
         aux.delete(format!("inode_leases/{ino}").as_bytes())
             .await
             .expect("delete malformed record");
-        let ok = AutumnManager::new_with_etcd(vec![etcd_endpoint]).await;
+        let ok = AutumnManager::new_with_etcd(vec![etcd_endpoint], support::manager_identity()).await;
         assert!(
             ok.is_ok(),
             "after removing the malformed record the manager must construct/lead \
@@ -108,7 +108,7 @@ fn inode_lease_key_payload_ino_mismatch_fails_closed() {
             .await
             .expect("seed ino-mismatch record");
 
-        let res = AutumnManager::new_with_etcd(vec![etcd_endpoint]).await;
+        let res = AutumnManager::new_with_etcd(vec![etcd_endpoint], support::manager_identity()).await;
         assert!(
             res.is_err(),
             "FAIL-LOUD: an inode_leases/<key> whose payload ino != key id must \

@@ -62,7 +62,7 @@ fn apply_ec_conversion_done_atomic_success() {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
 
         // Manager M1 — becomes leader on construction.
-        let m = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()])
+        let m = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()], support::manager_identity())
             .await
             .expect("manager with etcd");
 
@@ -136,7 +136,7 @@ fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
 
-        let m = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()])
+        let m = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()], support::manager_identity())
             .await
             .expect("manager with etcd");
 
@@ -211,7 +211,7 @@ fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
 fn identical_reissued_marker_has_new_identity_and_rejects_old_apply() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
-        let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()])
+        let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()], support::manager_identity())
             .await
             .expect("manager with etcd");
         let extent_id = 4211;

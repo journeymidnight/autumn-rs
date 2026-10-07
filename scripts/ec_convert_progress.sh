@@ -39,7 +39,7 @@ etcd --name ecp --data-dir "$W/etcd" \
   --initial-cluster "ecp=http://127.0.0.1:$((ETCD+1))" >"$W/etcd.log" 2>&1 & PIDS+=($!)
 wp $ETCD || { echo FAIL-etcd; exit 1; }
 "$BIN/autumn-manager-server" --port $((PB+1)) --listen 127.0.0.1 --cluster-secret-file "$SECRET" \
-  --etcd "127.0.0.1:$ETCD" >"$W/mgr.log" 2>&1 & PIDS+=($!)
+  --manager-id 1 --etcd "127.0.0.1:$ETCD" >"$W/mgr.log" 2>&1 & PIDS+=($!)
 wp $((PB+1)) || { echo FAIL-mgr; tail -5 "$W/mgr.log"; exit 1; }
 
 # EC 3+1 needs FOUR shard targets, so four extent nodes.

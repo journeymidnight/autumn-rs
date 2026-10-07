@@ -62,7 +62,7 @@ sleep 3
 
 # Standby manager2 @9002 (same etcd) — must stay follower while mgr1 leads.
 say "starting standby manager2 @9002"
-setsid nohup "$MGRBIN" --port 9002 --etcd 127.0.0.1:2379 \
+setsid nohup "$MGRBIN" --port 9002 --manager-id 2 --etcd 127.0.0.1:2379 \
     --listen 127.0.0.1 --transport "$T" --cluster-secret-file "$SECRET" \
     > "$WORK/mgr2.log" 2>&1 < /dev/null &
 sleep 3

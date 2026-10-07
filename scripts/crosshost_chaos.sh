@@ -83,7 +83,7 @@ setsid nohup etcd --data-dir "$LDATA/etcd" \
     > "$WORK/etcd.log" 2>&1 < /dev/null &
 for i in $(seq 1 30); do curl -s http://127.0.0.1:2379/health >/dev/null 2>&1 && break; sleep 1; done
 setsid nohup "$ROOT/target/release/autumn-manager-server" \
-    --port 9001 --etcd 127.0.0.1:2379 --listen "$LIP" --transport "$T" \
+    --port 9001 --manager-id 1 --etcd 127.0.0.1:2379 --listen "$LIP" --transport "$T" \
     --cluster-secret-file "$SECRET" \
     > "$WORK/manager.log" 2>&1 < /dev/null &
 sleep 3

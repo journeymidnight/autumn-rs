@@ -21,10 +21,10 @@ Binary-only crate: the executable entry points that wire the library crates toge
 **Default port**: 9001
 
 ```
-autumn-manager-server --cluster-secret-file FILE [--port 9001] [--listen 0.0.0.0] [--transport tcp|ucx] [--etcd 127.0.0.1:2379,...]
+autumn-manager-server --cluster-secret-file FILE [--port 9001] [--listen 0.0.0.0] [--transport tcp|ucx] [--etcd 127.0.0.1:2379,... --manager-id N]
 ```
 
-- Without `--etcd`: in-memory only (metadata lost on restart, no leader election). With `--etcd`: persistent — connects, replays state, runs the leader-election loop.
+- Without `--etcd`: in-memory only (metadata lost on restart, no leader election). With `--etcd`: persistent — holds `--manager-id` (required, non-zero, unique per manager; a second process with a held id waits), replays state, runs the leader-election loop. `autumn-op manager-remove <id> --by X` drops a stopped manager from the expected fleet.
 - Serves `StreamManagerService` + `PartitionManagerService` on the same port, plus gRPC reflection.
 - `--metrics-port <P>` / `--metrics-listen <H>`: opt-in Prometheus `/metrics` (unauthenticated; pin to 127.0.0.1 when the RPC plane is on 0.0.0.0).
 - The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy activate --arm`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op`. Runbook: `docs/ops.md`.

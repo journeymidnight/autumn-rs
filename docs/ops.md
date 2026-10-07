@@ -2048,6 +2048,53 @@ evicted; `ps-remove 2` → `remove: ok`; again → `not found`; `info` lists PS 
 only. Do not `pkill -f` by a pattern your own shell command contains — it kills
 the shell; take PIDs from `pgrep autumn-manager` / `pgrep -x autumn-ps`.
 
+## Manager ids and `manager-remove`
+
+With `--etcd` every manager needs `--manager-id <N>` (non-zero, unique per
+manager; it exits 2 without one). `cluster.sh` uses 1, `autumn-deploy` the
+manager's index + 1, the container entrypoint `AUTUMN_MANAGER_ID` or the
+StatefulSet ordinal + 1. While it runs a manager holds `managerAlive/<id>` on
+its own 10 s etcd lease; the leader keeps every id it has seen in
+`managerMembers/` — the expected manager count.
+
+- **A second process with a held id waits** — it does not listen, replay or
+  campaign — and logs `manager id is held by another process; waiting
+  manager_id=N holder=<addr>` every second. A restarted manager waits at most
+  10 s for its predecessor's lease, so a restarted manager opens its port up
+  to ~12 s late (`cluster.sh` waits 30 s for it).
+- **The recorded address is the `--listen` address.** A manager listening on
+  `0.0.0.0` is listed and named in conflict logs as `0.0.0.0:<port>`; the
+  manager has no `--advertise`.
+- **An etcd blip does not stop a manager.** A manager that lost its lease
+  claims the id again; it exits only if another process took the id in the
+  meantime (`manager id taken by another process while this one lost its
+  lease; exiting`).
+- **Retiring a manager:** stop it, then
+  `"${AO[@]}" manager-remove <id> --by you`. Refused (`code=3`) while
+  `managerAlive/<id>` exists, i.e. until its lease lapses (≤ 10 s); unknown ids
+  answer `code=1 not found`. Audited as `remove_manager`.
+
+Manual check of the duplicate and exit paths (etcd's JSON gateway, no
+etcdctl needed): start etcd on `$E` and manager A with `--manager-id 1`; start
+B with the same id on another port → B's log repeats the "held by another
+process" line and its port is closed. Then take A's id from under it:
+
+```bash
+K=$(printf managerAlive/1 | base64)
+LEASE=$(curl -s $E/v3/kv/range -d "{\"key\":\"$K\"}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["kvs"][0]["lease"])')
+V=$(printf 'someone-else\n10.0.0.9:9001' | base64 -w0)
+curl -s $E/v3/lease/revoke -d "{\"ID\":\"$LEASE\"}"; curl -s $E/v3/kv/put -d "{\"key\":\"$K\",\"value\":\"$V\"}"
+```
+
+Within ~5 s A logs `manager id keepalive failed; reclaiming` then the
+`taken by another process ... exiting` line, and its process is gone. The put
+has no lease, so it holds id 1 forever: delete it before starting anything as
+id 1 again (`curl -s $E/v3/kv/deleterange -d "{\"key\":\"$K\"}"`). Revoking
+the lease WITHOUT the put instead shows A reclaim the id (`manager id
+reclaimed`) and keep running. Kill test processes by the PIDs you started
+(`$!`), not `pkill -f`: a pattern your own command line contains kills your
+shell.
+
 ## fs stripe geometry: lanes vs partitions
 
 Large-file striping spreads one file's extents across N **lanes** so a single
