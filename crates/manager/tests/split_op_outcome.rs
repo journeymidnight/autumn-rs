@@ -46,15 +46,15 @@ struct Cluster {
     ps: Rc<RpcClient>,
     ps_addr: SocketAddr,
     log_stream: u64,
+    _dirs: [tempfile::TempDir; 2],
 }
 
 async fn cluster(part_id: u64, ps_id: u64) -> Cluster {
     let mgr_addr = pick_addr();
     start_manager_with_split_timeout(mgr_addr);
     let (n1, n2) = (pick_addr(), pick_addr());
-    // Leaked on purpose: the nodes must outlive the scenario's async block.
-    let d1 = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-    let d2 = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let d1 = tempfile::tempdir().unwrap();
+    let d2 = tempfile::tempdir().unwrap();
     start_extent_node(n1, d1.path().to_path_buf(), 1);
     start_extent_node(n2, d2.path().to_path_buf(), 2);
     let mgr = RpcClient::connect(mgr_addr).await.unwrap();
@@ -78,6 +78,7 @@ async fn cluster(part_id: u64, ps_id: u64) -> Cluster {
         ps,
         ps_addr,
         log_stream: log,
+        _dirs: [d1, d2],
     }
 }
 
