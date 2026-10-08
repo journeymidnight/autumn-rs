@@ -314,7 +314,9 @@ unlink.
 
 Atomically splits one partition into left + right:
 1. Refuse an `op_id` the ledger has already ended (see "Async op-ledger");
-   validate owner epoch; validate `mid_key` inside the range; verify the
+   validate owner epoch; validate `mid_key` inside the range; refuse an
+   EC conversion or recovery in flight on any source extent
+   (`topology_blocker`, see "Topology gate"); verify the
    request's captured tail extent ids still match each stream's CURRENT tail
    (refuse `split captured tail moved` otherwise — a roll that landed after
    the PS's capture would get the captured length stamped onto its fresh
@@ -334,9 +336,10 @@ Both children initially share the same physical extents; each `PartitionServer`
 detects `has_overlap` on open and major-compaction cleans out-of-range keys and
 frees the shared extents via GC.
 
-**`duplicate_stream`**: for each non-tail extent, `refs += 1` + add to the new
-stream; for the tail, set its sealed length at the split point, bump `eversion`,
-`refs += 1`, add. `compute_duplicate_stream` is the read-only pure form (the applier
+**`duplicate_stream`**: every extent of the stream gets `refs += 1` and
+`eversion += 1` and is added to the new stream; the open tail is also sealed at
+the captured length. Each modified extent is value-CAS'd in the commit txn.
+`compute_duplicate_stream` is the read-only pure form (the applier
 is `apply_split_mutations`).
 
 **`region_epoch` (TiKV-style)** on `persist::RegionRecord`, bumped through
@@ -369,6 +372,42 @@ checkpoint) → capture `commit_length` ×6 → `handle_multi_modify_merge` → 
 NOT explicitly unfreeze (each PS's `region_sync_loop` sees the new (rg, stream_ids)
 and reopens the survivor = natural unfreeze); on error best-effort unfreeze. PS-side
 `FREEZE_TTL` (30 s) is the final backstop, so no procedure-WAL is needed.
+
+### Topology gate (`topology_gate.rs`)
+
+Both commits refuse while any extent of their partitions' streams carries a
+ConvertToEc or Recovery marker, and both rewrite every such extent record.
+Those ops run for seconds to minutes. Met after the freeze, a split's PS
+retried the refused commit with writes frozen for its whole ~20 s budget
+(19.857 s observed, behind an EC conversion), and a merge froze both sides
+only to roll back. So before anything freezes, `topology_ready` waits until no
+marker covers the partitions, with writes flowing; a submitted op shows
+`waiting, writes not frozen: <reason>` and fails after `BLOCKER_WAIT_MAX`
+(10 min). The policy controller actuates inline and a direct
+`MSG_MERGE_PARTITIONS` has no op, so op id 0 refuses instead of waiting
+(`<reason>; split deferred`).
+
+From before that wait until the op ends, the partitions are in
+`topology_held` and nothing new starts on their extents: `force-ec-convert`
+(checked after its alloc awaits, right before the marker), recovery dispatch
+and in-place catch-up (the need and its backoff are kept, the dispatch waits),
+scrub (counted as not scrubbed), GC `punch_holes` / `truncate` from another
+partition sharing the extents (Precondition, the PS's 30 s soft cooldown; a
+held partition's own streams are exempt from its own hold — its PS takes the
+maintenance gate before freezing, so its own GC and compaction cannot overlap
+the commit, and any other own-stream punch meets the commit's per-extent
+CAS), the
+sealed-empty sweep, and maintenance dispatched to the partitions. A second
+split or merge of a held partition is refused at once. Holding recovery is
+what lets the wait end; the cap bounds how long repairs wait.
+
+A marker acquired across its etcd await can still slip in: a split's commit
+then refuses `... in flight on extent N`, which the PS treats as final and
+unfreezes at once; a merge's single commit attempt rolls back. Tests:
+`topology_gate::tests`, `force_ec_target_tests::a_split_being_dispatched_holds_the_conversion_back`,
+`tests/topology_waits_for_extent_ops.rs` (split and merge wait with writes
+flowing; a marker at commit ends the split within 5 s; ablations: no wait, no
+PS fail-fast, no recovery hold, no EC hold — each red).
 
 ### Rebalance
 
@@ -1497,7 +1536,8 @@ Every long-running op (split/merge/rebalance/compact/gc/forcegc/ec-convert) is
 **submitted through the leader** (`MSG_OP_SUBMIT`), assigned an `op_id`, actuated
 in a background one-shot task that reuses `actuate_candidate`'s building blocks
 (`auto_dispatch_split` — now takes an explicit `at_key` override — /
-`handle_merge_partitions` / `handle_rebalance_regions` / `handle_force_ec_convert`
+`merge_partitions` (with the op id, so it can wait; see "Topology gate") /
+`handle_rebalance_regions` / `handle_force_ec_convert`
 / `send_maintenance`), and made queryable (`MSG_OP_QUERY`). This recovers the
 failure reason the fire-and-forget maintenance ops used to drop.
 

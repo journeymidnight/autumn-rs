@@ -25,6 +25,7 @@ mod recovery;
 mod recovery_attempt;
 pub mod recovery_rate_limiter;
 mod rpc_handlers;
+mod topology_gate;
 mod split_op;
 pub(crate) mod store;
 /// Test-only merge-freeze failpoint (always 0 in production); see its doc in
@@ -798,6 +799,9 @@ pub struct AutumnManager {
     /// failover duplicate is a far narrower residual (the new leader hasn't
     /// processed the in-flight request).
     pub(crate) split_inflight: Rc<RefCell<std::collections::HashSet<u64>>>,
+    /// Partitions under a split or merge (`topology_gate.rs`): nothing new
+    /// starts on their extents until it ends.
+    pub(crate) topology_held: Rc<RefCell<HashSet<u64>>>,
     /// in-memory live retry state for Delete ops. The ledger
     /// entry's `PersistedPendingDelete` payload is a snapshot of the
     /// original addrs (captured at enqueue time); the live "which
@@ -1161,6 +1165,7 @@ impl AutumnManager {
             op_log_seq: Cell::new(0),
             op_log_writes_since_gc: Cell::new(0),
             split_inflight: Rc::new(RefCell::new(std::collections::HashSet::new())),
+            topology_held: Rc::new(RefCell::new(HashSet::new())),
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
             fs_next_inode: Rc::new(RefCell::new(HashMap::new())),
@@ -1327,7 +1332,8 @@ impl AutumnManager {
             same_ps: true,
             last_op_at: 0,
         };
-        self.auto_dispatch_split(&cand, None, 0, &state).await
+        let (hold, _) = self.topology_ready(&[part_id], 0, "split").await?;
+        self.auto_dispatch_split(&hold, &cand, None, 0, &state).await
     }
 
     /// test helper: orchestrate a MERGE for (survivor, victim) as
@@ -1964,6 +1970,9 @@ impl AutumnManager {
         state: &crate::store::MetadataState,
     ) -> Result<autumn_rpc::partition_rpc::MaintenanceResp> {
         let part_id = req.part_id;
+        if self.topology_held.borrow().contains(&part_id) {
+            anyhow::bail!("partition {part_id} is being split or merged; retry after it");
+        }
         let ps_addr = state
             .part_addrs
             .get(&part_id)
@@ -2043,7 +2052,10 @@ impl AutumnManager {
         state: &crate::store::MetadataState,
     ) -> Result<()> {
         match cand.kind {
-            POLICY_KIND_SPLIT => self.auto_dispatch_split(cand, None, 0, state).await,
+            POLICY_KIND_SPLIT => {
+                let (hold, _) = self.topology_ready(&[cand.primary_part_id], 0, "split").await?;
+                self.auto_dispatch_split(&hold, cand, None, 0, state).await
+            }
             POLICY_KIND_MERGE => {
                 let req = MergePartitionsReq {
                     survivor_part_id: cand.primary_part_id,
@@ -2299,9 +2311,20 @@ impl AutumnManager {
                     same_ps: false,
                     last_op_at: 0,
                 };
+                let (hold, waited) = match self.topology_ready(&[spec.part_id], op_id, "split").await {
+                    Ok(r) => r,
+                    Err(e) => return terminal_err(format!("{e:#}")),
+                };
+                let fresh;
+                let state = if waited {
+                    fresh = self.store.inner.borrow().clone();
+                    &fresh
+                } else {
+                    state
+                };
                 let owner_epoch = crate::split_op::owner_epoch_of(state, spec.part_id);
                 match self
-                    .auto_dispatch_split(&cand, spec.at_key.clone(), op_id, state)
+                    .auto_dispatch_split(&hold, &cand, spec.at_key.clone(), op_id, state)
                     .await
                 {
                     Ok(()) => ActuationResult::Terminal {
@@ -2351,7 +2374,7 @@ impl AutumnManager {
                     victim_part_id: spec.secondary_id,
                     force: spec.force,
                 };
-                match self.handle_merge_partitions(rkyv_encode(&req)).await {
+                match self.merge_partitions(req, op_id).await {
                     Ok(bytes) => match rkyv_decode::<MergePartitionsResp>(&bytes) {
                         Ok(resp) if resp.code == CODE_OK => ActuationResult::Terminal {
                             state: OP_STATE_SUCCEEDED,
@@ -2640,6 +2663,8 @@ impl AutumnManager {
     /// dual-gate + auth-rg flow; we just send the RPC.
     pub(crate) async fn auto_dispatch_split(
         &self,
+        // Taken by `topology_ready`; held until the PS answers.
+        _hold: &crate::topology_gate::TopologyHold,
         cand: &PolicyCandidate,
         // Explicit split point (raw key bytes) from a manual `ops` submit. `Some`
         // overrides the declared-boundary snap and is used verbatim; `None` keeps

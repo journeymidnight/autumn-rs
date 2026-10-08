@@ -2263,8 +2263,12 @@ async fn split_part(
                 // gets the same refusal. Abort now; the client retries the
                 // whole split, whose fresh capture sees the rolled tails.
                 // So is a refusal of an op the manager has already ended.
+                // An EC conversion or recovery on a source extent runs for
+                // seconds to minutes: waiting for it here holds writes frozen
+                // (the manager waits for those before dispatching).
                 if split_err.contains("split captured tail moved")
                     || split_err.contains("refusing to commit it")
+                    || split_err.contains("in flight on extent")
                 {
                     break;
                 }

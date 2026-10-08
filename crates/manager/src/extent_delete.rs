@@ -449,7 +449,12 @@ impl AutumnManager {
             let drops = {
                 let s = self.store.inner.borrow();
                 let (ec_now, rec_now) = self.inflight_snapshot_ec_recovery();
-                if removed.iter().any(|id| ec_now.contains(id) || rec_now.contains(id)) {
+                // A pending split CAS's every extent of its streams.
+                if removed.iter().any(|id| {
+                    ec_now.contains(id)
+                        || rec_now.contains(id)
+                        || self.topology_holding_extent(*id).is_some()
+                }) {
                     None
                 } else {
                     Some(Self::compute_extent_ref_drops(&s, &removed, &ec_now))

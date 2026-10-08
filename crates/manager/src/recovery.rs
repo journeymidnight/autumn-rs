@@ -1650,11 +1650,13 @@ impl AutumnManager {
                     == SlotVerdict::Rebuild
                 {
                     open_need.insert((ex.extent_id, slot as u32));
-                    // A slot whose rebuild keeps failing waits out its backoff.
+                    // A slot whose rebuild keeps failing waits out its backoff;
+                    // one under a pending split or merge waits for it (`topology_gate.rs`).
                     if !self
                         .recovery_limiter
                         .borrow()
                         .in_backoff(ex.extent_id, slot as u32, now_s)
+                        && self.topology_holding_extent(ex.extent_id).is_none()
                     {
                         self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
                             .await;
@@ -1688,6 +1690,7 @@ impl AutumnManager {
                     && node_online
                     && disk_online != Some(false)
                     && self.extent_inflight_op(ex.extent_id).is_none()
+                    && self.topology_holding_extent(ex.extent_id).is_none()
                     && !self
                         .catch_up_backoff
                         .borrow()

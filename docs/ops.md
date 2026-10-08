@@ -256,6 +256,34 @@ behind a long compaction on the same partition), then:
 The automated form (2 s timeout, split held at its commit point) is
 `cargo test -p autumn-manager --test split_op_outcome`.
 
+**A split or merge waits for EC conversions and rebuilds before it freezes.**
+Its commit refuses while any extent of the partitions' streams is being
+EC-converted or rebuilt, and those run for minutes. So the manager waits
+first, with writes flowing, and `ops status` reads `running … waiting, writes
+not frozen: ec conversion in flight on extent N` (or `recovery in flight`).
+After 10 min it gives up: `failed … for over 600 s; split abandoned before
+freezing writes`. While a split or merge is pending (waiting or running),
+nothing new starts on its extents: `force-ec-convert` answers "… is being
+split or merged; retry after it completes", gc / compact / forcegc for the
+partitions are refused, scrub skips them, rebuilds and catch-ups wait, and a
+sibling partition's GC punch on shared extents backs off. A second split or
+merge of the same partition is refused at once. The auto-policy does not wait:
+its split is refused with `…; split deferred` and retried after its cooldown.
+
+To see it on a dev cluster with an EC-policy stream, start a conversion and
+split while it runs:
+```bash
+"${AO[@]}" force-ec-convert --extent <EID>   # a sealed extent of partition <PID>
+"${AO[@]}" split <PID>                       # → op id
+"${AO[@]}" ops status <ID>                   # running … waiting, writes not frozen: ec conversion …
+"${AC[@]}" put <key-in-PID> /etc/hostname    # succeeds: not frozen
+"${AO[@]}" ops status <ID>                   # succeeded once the conversion lands
+```
+If an EC conversion or rebuild still starts after the wait, the split's PS
+aborts its commit at once and unfreezes (`failed … ec conversion in flight on
+extent N; retry split`) instead of holding writes frozen for ~20 s. The
+automated form is `cargo test -p autumn-manager --test topology_waits_for_extent_ops`.
+
 Samples arrive on the 5 s heartbeat, so a split that finishes in under ~5 s may
 show no intermediate phase at all — that is not a fault.
 

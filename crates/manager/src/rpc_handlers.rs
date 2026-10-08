@@ -3077,6 +3077,7 @@ impl AutumnManager {
                     &ec_inflight_set,
                     "punch_holes",
                 )?;
+                self.refuse_if_topology_holds(&removed, req.stream_id, "punch_holes")?;
 
                 let mut updated = stream;
                 updated.extent_ids.retain(|id| !removed.contains(id));
@@ -3242,6 +3243,7 @@ impl AutumnManager {
                     &ec_inflight_set,
                     "truncate",
                 )?;
+                self.refuse_if_topology_holds(&removed, req.stream_id, "truncate")?;
 
                 let mut updated = stream;
                 updated.extent_ids.retain(|id| !removed.contains(id));
@@ -3468,49 +3470,14 @@ impl AutumnManager {
                     ));
                 }
 
-                // reject split if any source-stream extent
-                // is undergoing EC conversion. compute_duplicate_stream
-                // bumps eversion on the source extents; if
-                // apply_ec_conversion_done runs concurrently it would
-                // overwrite those bumps. Fail fast — client retries with
-                // backoff. Reads the unified ledger via
-                // `extent_inflight_op`.
-                {
-                    for &sid in &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream] {
-                        if let Some(stream) = s.streams.get(&sid) {
-                            for &eid in &stream.extent_ids {
-                                if matches!(
-                                    self.extent_inflight_op(eid),
-                                    Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-                                ) {
-                                    return Err(AppError::Precondition(format!(
-                                        "ec conversion in flight on extent {eid}; retry split"
-                                    )));
-                                }
-                            }
-                        }
-                    }
-                }
-                // symmetric guard against in-flight recovery on any
-                // source-stream extent. apply_recovery_done bumps eversion and
-                // rewrites replicates; Phase-3's apply_split_mutations would
-                // overwrite both with the Phase-1 captured snapshot.
-                // read Recovery from the unified ledger.
-                {
-                    for &sid in &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream] {
-                        if let Some(stream) = s.streams.get(&sid) {
-                            for &eid in &stream.extent_ids {
-                                if matches!(
-                                    self.extent_inflight_op(eid),
-                                    Some(crate::extent_inflight::ExtentOpKind::Recovery)
-                                ) {
-                                    return Err(AppError::Precondition(format!(
-                                        "recovery in flight on extent {eid}; retry split"
-                                    )));
-                                }
-                            }
-                        }
-                    }
+                // An EC conversion's or a recovery's apply bumps eversion and
+                // rewrites the extent; Phase-3's apply_split_mutations would
+                // overwrite it with the Phase-1 snapshot. `topology_ready`
+                // waited for these before the PS froze, so one here started
+                // after that wait; the PS aborts on it rather than retrying,
+                // and "retry split" is advice to resubmit.
+                if let Some(why) = self.topology_blocker(&s, &src_meta) {
+                    return Err(AppError::Precondition(format!("{why}; retry split")));
                 }
 
                 // The three sealed lengths were captured by the PS for
@@ -4222,6 +4189,14 @@ impl AutumnManager {
     //     either the merge committed (PS reopens with merged state) or
     //     it didn't (PS reopens with original state).
     pub(crate) async fn handle_merge_partitions(&self, payload: Bytes) -> HandlerResult {
+        let req: MergePartitionsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        self.merge_partitions(req, 0).await
+    }
+
+    /// `op_id` 0 (direct RPC, policy) refuses while an extent op blocks the
+    /// merge; a submitted op waits for it (`topology_gate.rs`).
+    pub(crate) async fn merge_partitions(&self, req: MergePartitionsReq, op_id: u64) -> HandlerResult {
         // 1 = owner lock held, 2 = both partitions frozen, 3 = all six
         // commit_lengths captured, 4 = metadata merge committed. Phases and not
         // bytes, for the same reason split reports phases: the steps cost
@@ -4234,8 +4209,6 @@ impl AutumnManager {
                 new_log_tail_extent_id: 0,
             }));
         }
-        let req: MergePartitionsReq =
-            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         // step 4: merging destroys the boundary between the
         // two partitions — which is the start_key of whichever one sits on the
@@ -4274,6 +4247,21 @@ impl AutumnManager {
                 }));
             }
         }
+
+        // Before the endpoints are resolved: a wait can outlast them.
+        let _hold = match self
+            .topology_ready(&[req.survivor_part_id, req.victim_part_id], op_id, "merge")
+            .await
+        {
+            Ok((hold, _)) => hold,
+            Err(e) => {
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: CODE_PRECONDITION,
+                    message: format!("{e:#}"),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
 
         // Resolve PS endpoints and stream ids in one borrow.
         struct PartInfo {
@@ -5251,6 +5239,18 @@ impl AutumnManager {
         }
 
         let new_eversion = live_eversion + 1;
+
+        // After the alloc awaits, so a split or merge that started waiting during them
+        // still holds this conversion back (`topology_gate.rs`).
+        if let Some(part_id) = self.topology_holding_extent(extent_id) {
+            return Self::force_ec_resp(
+                CODE_PRECONDITION,
+                format!(
+                    "extent {extent_id} belongs to partition {part_id}, which is being split \
+                     or merged; retry after it completes"
+                ),
+            );
+        }
 
         // Tier 2: capture the current owner_lock owner_epoch for the
         // partition that owns this extent. Threaded through dispatch ->
@@ -9149,6 +9149,33 @@ mod force_ec_target_tests {
                 "{how}: no marker may be written"
             );
         }
+    }
+
+    /// A split being dispatched holds a conversion of its partition's extents
+    /// back; the conversion is accepted once the split is answered.
+    #[test]
+    fn a_split_being_dispatched_holds_the_conversion_back() {
+        let m = cluster();
+        m.store.inner.borrow_mut().partitions.insert(
+            5,
+            crate::persist::records::PartitionRecord {
+                part_id: 5,
+                log_stream: 100,
+                row_stream: 101,
+                meta_stream: 102,
+                rg: None,
+            },
+        );
+        let (hold, waited) = run(m.topology_ready(&[5], 0, "split")).expect("nothing blocks the split");
+        assert!(!waited);
+        let resp = force(&m);
+        assert_eq!(resp.code, CODE_PRECONDITION, "{}", resp.message);
+        assert!(resp.message.contains("partition 5"), "{}", resp.message);
+        assert!(m.extent_inflight_payload_ec(7).is_none(), "no marker may be written");
+
+        drop(hold);
+        let resp = force(&m);
+        assert_eq!(resp.code, CODE_OK, "{}", resp.message);
     }
 
     #[test]

@@ -1773,8 +1773,11 @@ handle_split_part(req):
   7. commit_length on each of {log, row, meta} stream
   8. multi_modify_split(mid_key, part_id, sealed_lengths) on manager
        (retried with backoff 100ms → 2s until the freeze budget runs out;
-        stops at once on "split captured tail moved" or on the manager's
-        refusal of an op it has already ended)
+        stops at once on "split captured tail moved", on the manager's
+        refusal of an op it has already ended, and on an EC conversion or
+        recovery in flight on a source extent ("in flight on extent") — those
+        run for minutes, and waiting here held writes frozen for the whole
+        budget; the manager waits for them before dispatching)
   8b. Row-stream invalidate BARRIER to P-sst (see below), INSIDE the critical
        section BEFORE the manager seal; await the ACK. Then invalidate the log +
        meta stream workers (part_sc.invalidate_stream) — the manager sealed the old

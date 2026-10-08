@@ -63,7 +63,8 @@ pub(crate) struct ScrubPlan {
     /// Named extents the manager does not know.
     pub missing: Vec<u64>,
     /// Extents left alone, with the reason: open, sealed empty, an op in
-    /// flight, or a pre-CoW EC layout whose shards live in `.dat`.
+    /// flight or a pending split of its partition, or a pre-CoW EC layout
+    /// whose shards live in `.dat`.
     pub not_scrubbed: u64,
     /// Copies left alone because their slot is dark (behind, or isolated and
     /// awaiting a rebuild) — there is nothing settled there to check.
@@ -218,7 +219,9 @@ impl AutumnManager {
         let plan = {
             let state = self.store.inner.borrow();
             let layout = self.extent_payload_location.borrow();
-            let in_flight = |id: u64| self.extent_inflight_op(id).is_some();
+            let held = self.topology_held_extents();
+            let in_flight =
+                |id: u64| self.extent_inflight_op(id).is_some() || held.contains(&id);
             plan_scrub(&state, &layout, &in_flight, &scope, op_id)
         };
         if !plan.missing.is_empty() && matches!(scope, ScrubScope::Extents(_)) {
@@ -389,7 +392,9 @@ impl AutumnManager {
         };
         for (op_id, key) in held {
             let (extent_id, node_id, payload_location, shard_index) = key;
-            if self.extent_inflight_op(extent_id).is_some() {
+            if self.extent_inflight_op(extent_id).is_some()
+                || self.topology_holding_extent(extent_id).is_some()
+            {
                 continue;
             }
             let Some(addr) = self.scrub_addr(node_id, extent_id) else {

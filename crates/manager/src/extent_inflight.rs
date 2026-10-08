@@ -436,9 +436,18 @@ impl AutumnManager {
     /// CAS and the leader fence for direct in-memory state injection.
     #[cfg(test)]
     pub(crate) fn _test_mark_ec_inflight(&self, extent_id: u64) {
+        self._test_mark_ec_inflight_by(extent_id, vec![]);
+    }
+
+    /// `_test_mark_ec_inflight` with a coordinator (`target_nodes[0]`). With
+    /// none, the dead-executor release drops the marker on the next recovery
+    /// tick; a registered node that never answered (`Suspend`) keeps it and is
+    /// never dispatched to.
+    #[doc(hidden)]
+    pub fn _test_mark_ec_inflight_by(&self, extent_id: u64, target_nodes: Vec<u64>) {
         let payload = ExtentOpPayload::ConvertToEc(MgrEcDispatchInflight {
             extent_id,
-            target_nodes: vec![],
+            target_nodes,
             extra_disk_ids: vec![],
             data_shards: 0,
             new_eversion: 0,
@@ -451,8 +460,8 @@ impl AutumnManager {
     /// Test-only convenience: clear an in-flight marker (any op kind) on
     /// `extent_id`. Replaces today's
     /// `m.ec_conversion_inflight.borrow_mut().remove(&extent_id)` pattern.
-    #[cfg(test)]
-    pub(crate) fn _test_clear_inflight(&self, extent_id: u64) {
+    #[doc(hidden)]
+    pub fn _test_clear_inflight(&self, extent_id: u64) {
         self.inflight.borrow_mut().remove(&extent_id);
     }
 
