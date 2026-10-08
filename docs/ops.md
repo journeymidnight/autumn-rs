@@ -2497,6 +2497,12 @@ $AO scrub EXT_ID... | --part PART_ID | --all [--wait]
 #   AUTUMN_EXTENT_EC_STRIPE_BYTES on the EN to force many stripes on a smaller
 #   extent. Repro script: the isolated memory-mode loopback recipe (manager
 #   w/o --etcd, 4 single-shard ENs, 1 PS) used in dev.
+# EC never targets an excluded node: stop one EN that holds a replica of a
+#   sealed extent E, wait for `$AO health` / node states to show it Suspected,
+#   then `$AO force-ec-convert --extent E --wait` must FAIL with "has a replica
+#   on node N, which is suspected, fenced or in maintenance" and no EC marker
+#   is left (`$AO info` shows no in-flight op on E). Restart the EN (or repair
+#   the replica off it) and the same command succeeds.
 
 # Admin / observability
 $AO info                                 # nodes / extents / streams / partitions

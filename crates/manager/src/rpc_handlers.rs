@@ -5116,6 +5116,21 @@ impl AutumnManager {
         let parity_shards = stream.ec_parity_shard as usize;
         let total_shards = data_shards + parity_shards;
 
+        // Every replica is a target (the coordinator encodes its own copy, the
+        // others keep their disk slot), so a replica on an excluded node would
+        // make the conversion fail on every attempt — and its marker blocks the
+        // repair that moves that replica.
+        let hard_excluded = self.placement_excluded_node_ids();
+        if let Some(nid) = ex.replicates.iter().find(|n| hard_excluded.contains(n)) {
+            return Self::force_ec_resp(
+                CODE_PRECONDITION,
+                format!(
+                    "extent {extent_id} has a replica on node {nid}, which is suspected, \
+                     fenced or in maintenance; retry once the node is back or the replica \
+                     is repaired off it"
+                ),
+            );
+        }
         let mut target_nodes = ex.replicates.clone();
         let mut extra_disk_ids: Vec<u64> = Vec::new();
         let mut target_addrs: Vec<String> = Vec::new();
@@ -5133,7 +5148,7 @@ impl AutumnManager {
 
         if total_shards > target_nodes.len() {
             let extra_needed = total_shards - target_nodes.len();
-            let hard_excluded = self.placement_excluded_node_ids();            let extra_candidates: Vec<_> = {
+            let extra_candidates: Vec<_> = {
                 use rand::seq::SliceRandom;
                 let s = self.store.inner.borrow();
                 let existing: HashSet<u64> = target_nodes.iter().copied().collect();
@@ -9032,5 +9047,116 @@ mod fence_precheck_tests {
         assert_eq!(call(true), CODE_OK);
         // A retry of a fence that landed does not re-run the precheck.
         assert_eq!(call(false), CODE_OK, "re-fencing a fenced node must stay idempotent");
+    }
+}
+
+#[cfg(test)]
+mod force_ec_target_tests {
+    //! A force-ec-convert whose targets would include an excluded node is
+    //! refused before any marker exists.
+    use super::*;
+    use crate::persist::records::{ExtentRecord, NodeRecord, StreamRecord};
+
+    fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    /// Nodes 1..=3, extent 7 replicated on all three, in a 2+1 EC stream (so
+    /// the targets are exactly the replicas and no extra node is allocated).
+    fn cluster() -> AutumnManager {
+        let m = AutumnManager::new();
+        m.leader.set(true);
+        let mut s = m.store.inner.borrow_mut();
+        for nid in [1u64, 2, 3] {
+            s.nodes.insert(
+                nid,
+                NodeRecord {
+                    node_id: nid,
+                    address: format!("127.0.0.1:{}", 9000 + nid),
+                    disks: vec![nid * 10],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: format!("uuid-{nid}"),
+                },
+            );
+        }
+        s.extents.insert(
+            7,
+            ExtentRecord {
+                extent_id: 7,
+                replicates: vec![1, 2, 3],
+                replicate_disks: vec![10, 20, 30],
+                eversion: 1,
+                refs: 1,
+                sealed_length: 4096,
+                sealed: true,
+                avali: 0b111,
+                ..Default::default()
+            },
+        );
+        s.streams.insert(
+            100,
+            StreamRecord {
+                stream_id: 100,
+                extent_ids: vec![7],
+                ec_data_shard: 2,
+                ec_parity_shard: 1,
+                replicates: 3,
+            },
+        );
+        drop(s);
+        m
+    }
+
+    fn force(m: &AutumnManager) -> ForceEcConvertResp {
+        let bytes = run(m.handle_force_ec_convert(rkyv_encode(&ForceEcConvertReq { extent_id: 7 })))
+            .expect("handler answers");
+        rkyv_decode(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_replica_on_an_excluded_node_refuses_the_conversion() {
+        for how in ["suspected", "maintenance"] {
+            let m = cluster();
+            match how {
+                "maintenance" => {
+                    m.node_overrides.borrow_mut().insert(
+                        2,
+                        MgrNodeOverride {
+                            node_id: 2,
+                            kind: NODE_OVERRIDE_MAINTENANCE,
+                            set_at: 0,
+                            set_by: "test".into(),
+                            reason: String::new(),
+                            expire_at: 0,
+                            node_uuid: String::new(),
+                        },
+                    );
+                }
+                _ => {
+                    let mut st = m.node_states.borrow_mut();
+                    *st = crate::node_state::NodeStateTracker::new(Duration::ZERO);
+                    st.on_heartbeat_ok(2);
+                    st.on_heartbeat_fail(2);
+                    assert!(st.suspected_node_ids().contains(&2));
+                }
+            }
+            let resp = force(&m);
+            assert_eq!(resp.code, CODE_PRECONDITION, "{how}: {}", resp.message);
+            assert!(resp.message.contains("node 2"), "{how}: {}", resp.message);
+            assert!(
+                m.extent_inflight_payload_ec(7).is_none(),
+                "{how}: no marker may be written"
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_replicas_get_a_marker_naming_them() {
+        let m = cluster();
+        let resp = force(&m);
+        assert_eq!(resp.code, CODE_OK, "{}", resp.message);
+        let p = m.extent_inflight_payload_ec(7).expect("marker written");
+        assert_eq!(p.target_nodes, vec![1, 2, 3]);
     }
 }

@@ -1113,6 +1113,13 @@ coordinator `handle_convert_to_ec` is idempotent (already-converted at this ever
 after leader-failover serialises and no-ops. EC dispatch skips a coord whose state is
 Suspected/Fenced/Maintenance/Suspend (no log spam during a flap).
 
+**Target selection (`handle_force_ec_convert`).** Targets are the extent's
+replicas (positionally paired with `replicate_disks`, the coordinator encodes its
+own `.dat`) plus extra nodes drawn outside `placement_excluded_node_ids`. A
+replica on an excluded node (Suspected / Fenced / Maintenance) refuses the
+submit with `CODE_PRECONDITION`: no shard write to it can land, and the marker
+would block the repair that moves the replica.
+
 ## Node lifecycle & identity
 
 **State machine (`node_state.rs`).** `NodeAutoState {Online, Suspected, Suspend}`,
