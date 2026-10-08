@@ -14,6 +14,12 @@
 
 ## Active
 
+### BUG-ALLOC-MEMBERSHIP-CHECK-NOOP — 新 extent 分配的 stream 成员校验永远不触发（推断，未复现）
+- **Trigger** (2026-10-08 代码评审): `handle_stream_alloc_extent` 的成员校验比较的 baseline 是在 commit_length 探测 / `place_extents_with_fallback` 这些 await 之后才构造的，构造与校验之间没有 await，所以永远相等；etcd CAS 的 baseline 同样取在 await 之后。awaits 期间的并发成员变更因此被吸收。tail 已 sealed 时，同一 stream 的两次并发 alloc 都能成功，留下 `[.., T, N1, N2]`：一个 open 的 N1 卡在 stream 中间。
+- **Scope**: 先用 failpoint 卡住一次 alloc 的 await、并发再发一次 alloc 来复现；复现后把 baseline 取在第一个 await 之前（与 tail_id 同一时刻），让校验与 CAS 真正比较 await 前后。
+- **Acceptance**: 复现用例在修复前失败（stream 中间出现 open extent 或两次都成功），修复后第二次 alloc 被拒（Precondition）并能重试成功；既有 alloc/split/merge/GC 回归全绿。
+- `passes: false`
+
 ### F-ETCD-AUTH — manager 连接带认证/TLS 的 etcd
 - **Trigger** (2026-10-07 用户): 生产 etcd 要开 auth。现 manager 只有 `--etcd <endpoints>`，`crates/etcd` 是 h2c 明文 gRPC，无 `Auth/Authenticate`、无 token 头、无 TLS；开 auth 的 etcd 连不上。
 - **Scope**: 用户名+密码（`Auth/Authenticate` 换 token，每请求带 `token` 头，过期重认证一次再发）；TLS（rustls，CA 校验，可选双向证书）。CLI flag：`--etcd-user`、`--etcd-password-file`、`--etcd-cacert`、`--etcd-cert`、`--etcd-key`（rs 不读 env）。cluster.sh / docs/ops.md 同步。

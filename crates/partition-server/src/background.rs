@@ -3840,8 +3840,9 @@ fn bump_discards_for_dropped_entry(discards: &mut HashMap<u64, i64>, op: u8, raw
 /// `sealed_length==0` but is NOT empty (its committed length is `last_synced`,
 /// invisible here; it is the live tail or holds uncommitted data), so skipping is
 /// exactly right. A stale `sealed=false` snapshot of a genuinely-sealed extent is
-/// likewise skipped — data-safe (never punched → no loss); it is reclaimed a tick
-/// later once its cache refreshes (a read / EC-invalidate / restart).
+/// likewise skipped — data-safe (never punched → no loss). Every roll evicts the
+/// tail it sealed (`StreamClient::alloc_new_extent`), so the next read here
+/// fetches the sealed view.
 ///
 /// We deliberately do NOT `invalidate_extent_cache` + refetch here to "freshen" a
 /// `sealed=false` read: an extra GC→manager RPC per stale candidate shifts P-log

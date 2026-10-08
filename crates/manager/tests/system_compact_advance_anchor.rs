@@ -257,3 +257,90 @@ fn a_cursor_at_a_sealed_end_moves_on_and_the_extent_is_reclaimed() {
         );
     });
 }
+
+/// After a restart with no write, the open tail is sealed by a probe roll (no
+/// stream worker exists yet to quiesce). The reopened PS cached that extent
+/// as open while it replayed it; left so, the compaction cannot tell it is
+/// sealed and the cursor stays on it.
+///
+/// Ablation: not evicting the old tail on a probe roll (`alloc_new_extent`)
+/// leaves the cursor at the extent's end.
+#[test]
+fn a_probe_roll_after_a_restart_lets_the_cursor_move_on() {
+    let mgr_addr = pick_addr();
+    let en_addr = pick_addr();
+    start_manager(mgr_addr);
+    let dir = tempfile::tempdir().expect("tempdir");
+    start_extent_node(en_addr, dir.path().to_path_buf(), 1);
+    let (log, meta) = compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None)
+            .await
+            .expect("mgr");
+        let _ = register_node(&mgr, &en_addr.to_string(), "uuid-advance-anchor-restart").await;
+        let (log, row, meta) = (
+            create_stream(&mgr, 1).await,
+            create_stream(&mgr, 1).await,
+            create_stream(&mgr, 1).await,
+        );
+        upsert_partition(&mgr, PART, log, row, meta, b"", b"\xff").await;
+        (log, meta)
+    });
+
+    let ps_addr = pick_addr();
+    let mut child = ChildPs::spawn(PS_ID, mgr_addr, ps_addr, ChildFailpoints::default());
+    let (tail, flushed) = compio::runtime::Runtime::new().unwrap().block_on(async {
+        let ps = RpcClient::connect(ps_addr).await.expect("ps");
+        let sc = stream_client(mgr_addr).await;
+        for i in 0..8u8 {
+            ps_put(&ps, PART, format!("big-{i:02}").as_bytes(), &big(i)).await;
+        }
+        ps_flush(&ps, PART).await;
+        let tail = *extents(&sc, log).await.last().unwrap();
+        let flushed = last_cursor(&sc, meta).await;
+        assert_eq!(flushed.0, tail);
+        (tail, flushed)
+    });
+    child.kill();
+
+    let ps_addr = pick_addr();
+    let _child = ChildPs::spawn(PS_ID, mgr_addr, ps_addr, ChildFailpoints::default());
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let sc = stream_client(mgr_addr).await;
+        let started = Instant::now();
+        let ps = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "partition did not reopen"
+            );
+            if let Ok(ps) = RpcClient::connect(ps_addr).await {
+                if ps_get(&ps, PART, b"big-00").await.code == partition_rpc::CODE_OK {
+                    break ps;
+                }
+            }
+            compio::time::sleep(Duration::from_millis(200)).await;
+        };
+        roll_log(&ps, log, tail).await;
+        let next = *extents(&sc, log).await.last().unwrap();
+        assert_ne!(next, tail);
+
+        ps_compact(&ps, PART).await;
+        let started = Instant::now();
+        loop {
+            let c = last_cursor(&sc, meta).await;
+            if c != flushed {
+                assert_eq!(c, (next, 0));
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the compaction left the cursor at {flushed:?}, the end of probe-sealed {tail}"
+            );
+            compio::time::sleep(Duration::from_millis(100)).await;
+        }
+        for i in 0..8u8 {
+            let r = ps_get(&ps, PART, format!("big-{i:02}").as_bytes()).await;
+            assert_eq!(r.code, partition_rpc::CODE_OK, "big-{i:02}: {}", r.message);
+            assert!(r.value == big(i));
+        }
+    });
+}

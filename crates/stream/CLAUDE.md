@@ -1199,10 +1199,19 @@ first append would overwrite committed bytes).
 | `stream_workers` | stream_id | `(generation, mpsc::Sender<StreamSubmitMsg>)` | Worker exit (own generation only), `invalidate_stream`, drop |
 | `stream_init_locks` | stream_id | `Rc<futures::lock::Mutex<bool>>` | Worker exit (same generation gate), `invalidate_stream` — NEVER outlives the worker it initialised (note 35) |
 | `nodes_cache` | node_id | address | A node id missing from it, **or a cached address that could not be reached** — `forget_node_addr`, called from the retry loops AND from the sites that swallow a per-replica failure; rate-limited per node (note 34) |
-| `extent_info_cache` | extent_id | `ExtentInfo` | Replica lookup failure |
+| `extent_info_cache` | extent_id | `ExtentInfo` | Replica lookup failure; the old tail on every roll (`alloc_new_extent`: the pinned `seal_extent_id`, or for a probe roll the new extent's predecessor) |
 
 `nodes_cache` + `extent_info_cache` use `DashMap`; `stream_workers` +
 `stream_init_locks` use `RefCell<HashMap>` (single compio thread per caller).
+
+A roll evicts the tail it sealed, never synthesizing its length (the manager
+may keep an earlier, longer seal): a pinned roll its `seal_extent_id`, an
+unpinned one (`seal_extent_id = 0`) the new extent's predecessor. A cached OPEN
+view of a sealed extent reads to the PS's `authoritative_sealed` as "not
+sealed": GC skips the extent and a compaction cannot move a checkpoint cursor
+off its end. A partition reopened with no write since caches its tail open
+during replay, and `MSG_ROLL_TAILS` then rolls unpinned (no worker yet)
+(`system_compact_advance_anchor`'s restart test, red without the eviction).
 
 ### Other public methods
 

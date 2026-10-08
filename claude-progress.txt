@@ -1,3 +1,11 @@
+Date: 2026-10-08 (7)
+TaskStatus: completed
+Task scope: user-reproduced gap in the compaction cursor advance: after a PS restart with no write, a probe roll (MSG_ROLL_TAILS with no stream worker yet) sealed log extent E, but the reopened PS had cached E as open during replay; authoritative_sealed trusts a cached sealed=false, so the compaction never moved the cursor ((4, 8227) instead of (9, 0)). User: fix it if simple.
+Current summary: root cause in StreamClient::alloc_new_extent — the old tail was evicted from extent_info_cache only for a pinned roll (Some(commit), seal_extent_id); an unpinned roll (seal_extent_id = 0) now evicts the new extent's predecessor, the extent the manager just sealed. Same stale view also made GC skip E. Docs: stream CLAUDE.md cache table + paragraph, PS CLAUDE.md test list, authoritative_sealed doc. feature_list: BUG-ALLOC-MEMBERSHIP-CHECK-NOOP (review finding, inferred: the manager's alloc membership check compares against a baseline built after its awaits, so it never fires).
+Verification: new system_compact_advance_anchor::a_probe_roll_after_a_restart_lets_the_cursor_move_on (child PS SIGKILLed + respawned; red without the eviction: cursor stuck at (4, 524608)). Stream lib 227; 42 release system binaries green (previous set + extent/PS failover, ec_replay_selfheal, single_wal_replica_survivor, ps_crash_takeover). opus review: no high; dead guard dropped, docs made present-tense.
+Main gaps: a fetch_extent_info already in flight across the roll can re-cache the pre-seal view (narrow, inferred, also for the pinned branch). The WAL self-heal's explicit invalidate after seal_and_roll_tail is now redundant (left).
+Next steps: gc_debt vs replay floor (user chose option A) — next entry.
+
 Date: 2026-10-08 (6)
 TaskStatus: completed
 Task scope: user — GC could not reclaim an idle partition's old log extent: with no write after the last flush the checkpoint cursor sat at (E, off); once the log rolled, E was sealed with sealed_length == off and sat at GC's replay floor forever. User chose: advance the cursor at compaction time, and re-count the discard (shared CoW extents included).

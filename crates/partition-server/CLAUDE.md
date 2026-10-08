@@ -1264,7 +1264,9 @@ with a stale list (that RPC is not leader-checked) — which only lowers GC's
 floor until the next flush (inferred, not reproduced).
 `background::sealed_anchor_tests`,
 `crates/manager/tests/system_compact_advance_anchor.rs` (major, GC, SIGKILL,
-reopen), `system_compact_advance_anchor_minor.rs` (auto-trim, log rolled
+reopen; a probe roll after a restart with no write — the reopened PS had
+cached the extent open, see the stream guide's cache table),
+`system_compact_advance_anchor_minor.rs` (auto-trim, log rolled
 mid-compaction) and `system_compact_swept_anchor.rs` (red when the swept
 cursor is republished).
 

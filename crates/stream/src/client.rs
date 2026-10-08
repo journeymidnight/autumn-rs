@@ -3212,6 +3212,12 @@ impl StreamClient {
         // longer wedges anything; and it is one-shot (re-cached on the fetch).
         if seal_commit.is_some() && seal_extent_id != 0 {
             self.extent_info_cache.remove(&seal_extent_id);
+        } else if seal_extent_id == 0 {
+            // An unpinned roll names no target: the manager sealed whatever
+            // was the tail, now the new extent's predecessor.
+            if let [.., old_tail, _] = stream.extent_ids[..] {
+                self.extent_info_cache.remove(&old_tail);
+            }
         }
         Ok((stream, extent))
     }
