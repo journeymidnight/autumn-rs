@@ -1617,9 +1617,36 @@ writes. How to tell CORRECT-protection from a real problem:
 To actually reclaim a protected extent, **advance the floor**: run a MAJOR
 compaction (`autumn-op compact P`) so every live SST's `vp_head` moves past that
 extent (a lagging CoW-shared SST from a split is the usual cause), then re-issue
-`forcegc`. If the floor still won't pass it, the partition genuinely still needs
-that extent for replay (its data was all flushed while that extent was the log
-tail) — nothing to reclaim until newer data supersedes it.
+`forcegc`. If the floor is that extent because the last flush ended exactly at
+its end (it was the log tail then, and nothing was written since), the same
+compaction moves the checkpoint cursor to the next extent once the log has
+rolled — see the next section. If the extent is still the log tail, nothing
+can be reclaimed from it: GC never takes the tail.
+
+### A compaction moves the checkpoint off a sealed extent's end
+
+With no write after the last flush, the checkpoint cursor sits at the end of
+the extent that was the log tail then. After the log rolls (failover seal,
+split, 16 GiB roll, `MSG_ROLL_TAILS`; a plain restart keeps the open tail)
+that extent is sealed, holds nothing to replay,
+and used to stay protected forever. Any compaction now republishes the cursor
+as `(next extent, 0)`; GC then takes the old extent like any other. Manual
+check on a partition with no writes:
+
+```bash
+$AO --json info --part P | jq '.extents[] | select(.role=="log") | {extent_id, size, open}'
+$AO compact P                     # wait for it to finish (ops status / --wait)
+$AO forcegc P <old extent>         # no "replay floor" advisory any more
+$AO --json info --part P | jq '.extents[] | select(.role=="log") | .extent_id'   # gone
+```
+
+The PS log no longer names it in `GC: protected extent(s)`. Not moved: a
+cursor in the open tail (nothing to free), or one short of a sealed extent's
+end (records after it are replayed on reopen).
+
+Regressions: `RUST_MIN_STACK=8388608 cargo test --release -p autumn-manager
+--test system_compact_advance_anchor --test system_compact_advance_anchor_minor
+--test system_compact_swept_anchor --test system_compact_recount_discard`.
 
 ### Recovery is BOUNDED and reopens in parallel
 
@@ -1680,9 +1707,12 @@ $AO --json info --part P | jq '.extents[] | select(.role=="log") | {extent_id, s
 
 A sealed log extent whose `discards` entry is close to its `size` is taken by
 the next auto GC (or `autumn-op gc P`). Extents written by a PS older than this
-change carry no such record (discard 0 however dead): reclaim them with
-`autumn-op forcegc P <e1> <e2> <e3>` (3 per op, only extents before the replay
-floor). Before forcegc, confirm the partition really holds no live large values
+change carry no such record (discard 0 however dead) until a major compaction
+(`autumn-op compact P`) re-counts them: it sets each sealed log extent's discard
+before the replay floor to its size minus the live values it keeps there, after
+which the next auto GC takes it. `autumn-op forcegc P <e1> <e2> <e3>` (3 per
+op, only extents before the replay floor) still works without it. Before
+forcegc, confirm the partition really holds no live large values
 there — `info --part P --detail` `size_bytes` small AND the range holds no
 ValuePointer data. A range covering `fs/\x03…` (file data chunks) is mostly live,
 and forcegc there only rewrites it (seen on the VKE cluster: three 17 GB extents,

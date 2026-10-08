@@ -395,21 +395,131 @@ pub(crate) fn compaction_chunk_keys(input_entries: u64, input_bytes: u64, max_ch
     keys.min(input_entries) as usize
 }
 
-/// The cursor a compaction's checkpoint publishes. Call under `publish_lock`.
-/// `durable` is the newest record's cursor and no live table is past it, so
-/// it is republished as is; a cursor rebuilt from the tables can fall behind
-/// it, below GC's floor. `(0, 0)` (none resolved at open) uses the tables.
+/// The cursor a compaction's checkpoint publishes, before
+/// `advance_sealed_anchor`. Call under `publish_lock`. `durable` is the newest
+/// record's cursor and no live table is past it, so it is republished; a
+/// cursor rebuilt from the tables can fall behind it, below GC's floor.
+/// `(0, 0)` (none resolved at open) uses the tables, and so does a `durable`
+/// whose extent was swept: `swept` = it was read before `log_extent_ids` was
+/// fetched and is not in it (a sealed-empty extent, reclaimed). Republished,
+/// it would keep GC at the MIN floor until the next flush.
 pub(crate) fn compaction_checkpoint_cursor(
     durable: (u64, u64),
+    swept: bool,
     readers: &[Arc<SstReader>],
     output_vp_head: (u64, u64),
     log_extent_ids: &[u64],
 ) -> (u64, u64) {
-    if durable.0 != 0 {
+    if durable.0 != 0 && !swept {
         durable
     } else {
         checkpoint_vp_head(readers, output_vp_head, log_extent_ids)
     }
+}
+
+/// Whether the durable cursor names an extent the log no longer has: unchanged
+/// since `seen`, read before `log_extent_ids` was fetched. A cursor published
+/// after the fetch may name an extent the list has not seen yet.
+pub(crate) fn durable_cursor_swept(
+    durable: (u64, u64),
+    seen: (u64, u64),
+    log_extent_ids: &[u64],
+) -> bool {
+    durable.0 != 0 && durable == seen && !log_extent_ids.contains(&durable.0)
+}
+
+/// A cursor at the very end of a sealed, non-tail extent replays nothing from
+/// it, so `(next, 0)` is the same replay start — and only then can GC, which
+/// keeps the floor extent, reclaim that extent. Without writes no flush ever
+/// moves the cursor off it.
+///
+/// `seals` holds authoritative sealed lengths (`anchor_seals`). Sealed-empty
+/// successors are skipped: the manager sweeps them, and a cursor naming a
+/// swept extent no longer resolves. Unchanged when the extent is the tail,
+/// holds records past `off`, or a needed seal is unknown.
+pub(crate) fn advance_sealed_anchor(
+    cursor: (u64, u64),
+    log_extent_ids: &[u64],
+    seals: &HashMap<u64, u64>,
+) -> (u64, u64) {
+    let first_pos = |eid: u64| log_extent_ids.iter().position(|&e| e == eid);
+    let Some(pos) = first_pos(cursor.0) else {
+        return cursor;
+    };
+    let tail = log_extent_ids.len() - 1;
+    if pos == tail || seals.get(&cursor.0) != Some(&cursor.1) {
+        return cursor;
+    }
+    let mut p = pos + 1;
+    while p < tail && seals.get(&log_extent_ids[p]) == Some(&0) {
+        p += 1;
+    }
+    let next = log_extent_ids[p];
+    // Unknown seal: it may be empty. A repeated member resolves earlier.
+    if (p < tail && !seals.contains_key(&next)) || first_pos(next) != Some(p) {
+        return cursor;
+    }
+    (next, 0)
+}
+
+/// The authoritative sealed lengths `advance_sealed_anchor` reads: `cursor`'s
+/// extent and the successors up to the first non-empty one. Nothing when the
+/// extent is the tail or not at its end.
+pub(crate) async fn anchor_seals(
+    sc: &StreamClient,
+    cursor: (u64, u64),
+    log_extent_ids: &[u64],
+) -> HashMap<u64, u64> {
+    let mut seals = HashMap::new();
+    let Some(pos) = log_extent_ids.iter().position(|&e| e == cursor.0) else {
+        return seals;
+    };
+    let tail = log_extent_ids.len() - 1;
+    if pos == tail {
+        return seals;
+    }
+    match authoritative_sealed(sc, cursor.0).await {
+        Some((len, _)) if len == cursor.1 => {
+            seals.insert(cursor.0, len);
+        }
+        _ => return seals,
+    }
+    for &eid in &log_extent_ids[pos + 1..tail] {
+        let Some((len, _)) = authoritative_sealed(sc, eid).await else {
+            break;
+        };
+        seals.insert(eid, len);
+        if len > 0 {
+            break;
+        }
+    }
+    seals
+}
+
+/// The sealed extents a major compaction re-counts: every one before the
+/// inputs' advanced content boundary. All of their records are then in the
+/// inputs (or dead), so the partition's live bytes there are exactly the
+/// value pointers the compaction keeps.
+async fn recount_extents(
+    sc: &StreamClient,
+    inputs_head: (u64, u64),
+    log_extent_ids: &[u64],
+) -> HashMap<u64, u64> {
+    let seals = anchor_seals(sc, inputs_head, log_extent_ids).await;
+    let start = advance_sealed_anchor(inputs_head, log_extent_ids, &seals);
+    let Some(end) = log_extent_ids.iter().position(|&e| e == start.0) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for &eid in &log_extent_ids[..end] {
+        if out.contains_key(&eid) {
+            continue;
+        }
+        if let Some((len, _)) = authoritative_sealed(sc, eid).await {
+            out.insert(eid, len);
+        }
+    }
+    out
 }
 
 pub(crate) async fn background_maintenance_loop(
@@ -2513,7 +2623,7 @@ async fn truncate_unreferenced_row_prefix(
 /// A no-op compaction publishes the current tables before retrying
 /// truncation, just as a real compaction does. Never use the live WAL tail:
 /// active/queued data may not yet be in these SSTs. The durable cursor and SST
-/// boundaries are safe floors.
+/// boundaries are safe floors, advanced past a sealed extent's end.
 async fn checkpoint_and_truncate_row_prefix(
     part: &Rc<RefCell<PartitionData>>,
     part_id: u64,
@@ -2527,22 +2637,29 @@ async fn checkpoint_and_truncate_row_prefix(
             p.publish_lock.clone(),
         )
     };
+    let durable = part.borrow().durable_ckpt_vp.get();
     let log_ids = sc.get_stream_info(log_id).await?.extent_ids;
     let publish = publish_lock.lock().await;
-    let (tables, floors, vp) = {
+    let (tables, floors, base) = {
         let p = part.borrow();
+        let now = p.durable_ckpt_vp.get();
         (
             p.tables.clone(),
             crate::snapshot_fence_floors(&p),
             compaction_checkpoint_cursor(
-                p.durable_ckpt_vp.get(),
+                now,
+                durable_cursor_swept(now, durable, &log_ids),
                 &p.sst_readers,
                 (0, 0),
                 &log_ids,
             ),
         )
     };
+    // Under the lock: no publisher can change the tables or the cursor.
+    let seals = anchor_seals(&sc, base, &log_ids).await;
+    let vp = advance_sealed_anchor(base, &log_ids, &seals);
     save_table_locs_raw(&sc, meta_id, &tables, vp.0, vp.1, floors).await?;
+    part.borrow().durable_ckpt_vp.set(vp);
     drop(publish);
     truncate_unreferenced_row_prefix(part, part_id).await
 }
@@ -2880,6 +2997,16 @@ pub(crate) async fn do_compact(
         &log_extent_ids,
     );
 
+    // A major's inputs are every table, so behind their boundary the bytes it
+    // does not keep alive are dead — including ones no write ever counted
+    // (`wal_dead` arrived after inline WAL did). Replaces the running sums.
+    let recount = if major {
+        recount_extents(&part_sc, (compact_vp_eid, compact_vp_off), &log_extent_ids).await
+    } else {
+        HashMap::new()
+    };
+    let mut recount_live: HashMap<u64, u64> = HashMap::new();
+
     let now = now_secs();
     let max_chunk = crate::max_sst_bytes() as usize;
 
@@ -3020,6 +3147,12 @@ pub(crate) async fn do_compact(
             chunk_last_seq = raw_ts;
         }
 
+        if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+            let vp = ValuePointer::decode(&raw_value);
+            if recount.contains_key(&vp.extent_id) {
+                *recount_live.entry(vp.extent_id).or_insert(0) += vp.len;
+            }
+        }
         current_builder.add(&raw_key, raw_op, &raw_value, raw_expires);
         current_size += entry_size;
         entries_kept += 1;
@@ -3034,6 +3167,13 @@ pub(crate) async fn do_compact(
     }
 
     valid_discard(&mut discards, &log_extent_ids);
+    for (&eid, &sealed_length) in &recount {
+        let live = recount_live.get(&eid).copied().unwrap_or(0);
+        match sealed_length.saturating_sub(live) {
+            0 => discards.remove(&eid),
+            dead => discards.insert(eid, dead as i64),
+        };
+    }
 
     // Final chunk: attach the aggregated discards. `discards` began as the
     // INPUT tables' own maps, and the swap below removes those tables — so
@@ -3087,9 +3227,13 @@ pub(crate) async fn do_compact(
     // later compaction's truncate). The lock holds every other publisher off
     // until the list has changed; without it a flush could snapshot the list
     // while this append is in flight and publish it without the outputs.
+    // The log may have rolled while the compaction ran; the cursor is
+    // advanced against what follows its extent now.
+    let durable = part.borrow().durable_ckpt_vp.get();
+    let publish_log_ids = part_sc.get_stream_info(log_stream_id).await?.extent_ids;
     let publish_lock = part.borrow().publish_lock.clone();
     let _publish = publish_lock.lock().await;
-    let (tables, sst_readers, floors_snapshot, (ckpt_vp_eid, ckpt_vp_off)) = {
+    let (tables, sst_readers, floors_snapshot, base) = {
         let p = part.borrow();
         let mut tables = p.tables.clone();
         let mut sst_readers = p.sst_readers.clone();
@@ -3106,14 +3250,19 @@ pub(crate) async fn do_compact(
             sst_readers.push(reader);
         }
         crate::sort_tables_by_seq(&mut tables, &mut sst_readers);
-        let ckpt_vp = compaction_checkpoint_cursor(
-            p.durable_ckpt_vp.get(),
+        let now = p.durable_ckpt_vp.get();
+        let base = compaction_checkpoint_cursor(
+            now,
+            durable_cursor_swept(now, durable, &publish_log_ids),
             &sst_readers,
             (compact_vp_eid, compact_vp_off),
-            &log_extent_ids,
+            &publish_log_ids,
         );
-        (tables, sst_readers, crate::snapshot_fence_floors(&p), ckpt_vp)
+        (tables, sst_readers, crate::snapshot_fence_floors(&p), base)
     };
+    // Under the lock: no publisher can change the tables or the cursor.
+    let seals = anchor_seals(&part_sc, base, &publish_log_ids).await;
+    let (ckpt_vp_eid, ckpt_vp_off) = advance_sealed_anchor(base, &publish_log_ids, &seals);
     if COMPACT_CHECKPOINT_FAIL.swap(false, std::sync::atomic::Ordering::Relaxed) {
         return Err(anyhow::anyhow!("compaction checkpoint: test failpoint"));
     }
@@ -3130,6 +3279,7 @@ pub(crate) async fn do_compact(
         let mut p = part.borrow_mut();
         p.tables = tables;
         p.sst_readers = sst_readers;
+        p.durable_ckpt_vp.set((ckpt_vp_eid, ckpt_vp_off));
     }
     Ok(CompactStats {
         input_tables,
@@ -5478,6 +5628,81 @@ mod compaction_vp_head_tests {
         assert_eq!(
             compaction_output_vp_head([(11u64, 400u64), (12, 100)], &log),
             (12, 100)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sealed_anchor_tests {
+    use super::advance_sealed_anchor;
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_cursor_at_a_sealed_end_moves_to_the_successor() {
+        let seals = HashMap::from([(10u64, 500u64)]);
+        assert_eq!(advance_sealed_anchor((10, 500), &[10, 11], &seals), (11, 0));
+    }
+
+    #[test]
+    fn records_past_the_cursor_keep_it() {
+        let seals = HashMap::from([(10u64, 900u64)]);
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11], &seals),
+            (10, 500)
+        );
+    }
+
+    #[test]
+    fn the_tail_and_unknown_seals_keep_it() {
+        let seals = HashMap::from([(11u64, 500u64)]);
+        assert_eq!(
+            advance_sealed_anchor((11, 500), &[10, 11], &seals),
+            (11, 500)
+        );
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11], &HashMap::new()),
+            (10, 500)
+        );
+        assert_eq!(advance_sealed_anchor((0, 0), &[10, 11], &seals), (0, 0));
+    }
+
+    #[test]
+    fn sealed_empty_successors_are_skipped() {
+        // 11 and 12 are sealed empty: the sweep may reclaim them.
+        let seals = HashMap::from([(10u64, 500u64), (11, 0), (12, 0), (13, 7)]);
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11, 12, 13, 14], &seals),
+            (13, 0)
+        );
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11, 12, 14], &seals),
+            (14, 0)
+        );
+        // 12's seal is unknown: it may be empty, so it is not a safe anchor.
+        let partial = HashMap::from([(10u64, 500u64), (11, 0)]);
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11, 12, 13], &partial),
+            (10, 500)
+        );
+    }
+
+    #[test]
+    fn only_an_unchanged_cursor_missing_from_a_later_list_is_swept() {
+        use super::durable_cursor_swept;
+        assert!(durable_cursor_swept((11, 0), (11, 0), &[10, 12]));
+        // Published after the list was fetched: may name a newer extent.
+        assert!(!durable_cursor_swept((13, 0), (11, 0), &[10, 12]));
+        assert!(!durable_cursor_swept((11, 0), (11, 0), &[10, 11, 12]));
+        assert!(!durable_cursor_swept((0, 0), (0, 0), &[10]));
+    }
+
+    #[test]
+    fn a_successor_listed_earlier_is_not_taken() {
+        // After a merge an extent can appear twice; its first position counts.
+        let seals = HashMap::from([(10u64, 500u64), (11, 7)]);
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[11, 10, 11, 12], &seals),
+            (10, 500)
         );
     }
 }

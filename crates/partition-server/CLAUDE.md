@@ -984,7 +984,8 @@ major truncates anyway, the queued keys survive a reopen). Each truncate logs
 
 No-op dispatched compactions retry the same safe prefix cut under the
 maintenance gate. They first publish the current table snapshot with a replay
-cursor from durable checkpoint / SST boundaries (never the active WAL tail).
+cursor from durable checkpoint / SST boundaries (never the active WAL tail),
+moved off a sealed extent's end like any compaction's (see the GC floor).
 If that checkpoint fails, truncation is not attempted.
 
 ### Checkpoint first, then the table list
@@ -1221,7 +1222,8 @@ publishes one merged record before serving and sets it from that; until the
 append acks it is `(0,0)` — the MIN. Freeze checkpoints (merge/split) set it to
 the frozen log tail. Every publisher holds `publish_lock`, so it is always the
 newest record's cursor, and a compaction (real or no-op) REPUBLISHES it
-(`compaction_checkpoint_cursor`) instead of rebuilding a cursor from the
+(`compaction_checkpoint_cursor`; moved only off a sealed extent's end, below)
+instead of rebuilding a cursor from the
 tables' vp_heads: a rebuilt one fell behind a merged/freeze cursor (the log
 tail, past every SST header) and behind a flush that rolled the log after the
 compaction fetched its extent list, while the floor stayed here — GC then
@@ -1229,6 +1231,42 @@ deleted the extent the newest record names and the next open needed the
 whole-log fallback. Only `(0,0)` falls back to the tables. Every log record strictly
 below a durable checkpoint vp is in that checkpoint's persisted SST set (or
 compaction-dead), so `[MIN, durable-vp)` is safe to punch.
+
+**A compaction moves a cursor off a sealed extent's end**
+(`advance_sealed_anchor`, `anchor_seals`). With no write after the last flush
+the cursor stays `(E, off)`; once the log rolls, E is sealed with
+`sealed_length == off`, holds nothing to replay, and sits AT the floor — GC
+keeps it forever, with all its garbage. Every compaction (major, minor, no-op)
+republishes such a cursor as `(next, 0)`, the same replay start, and sets
+`durable_ckpt_vp` after the append acks; the next GC's floor is past E. It
+checks the extent list fetched right before publishing (the log may have rolled
+during the compaction) and the authoritative seals (`authoritative_sealed`),
+looked up while holding `publish_lock` (cached; nothing else can change the
+tables or the cursor meanwhile). Unchanged when E is the tail (nothing to
+free; no extent is sealed or allocated for this), when E holds records past
+`off` (a replay brings them back), or when a seal it needs is unknown.
+Sealed-empty successors are skipped: the manager's sealed-empty sweep reclaims
+them, and a cursor naming a reclaimed extent no longer resolves.
+
+A `(T, 0)` cursor — this move onto an empty tail, or a freeze drained on one —
+still becomes unresolvable when T later rolls empty (split, merge, roll_tails,
+a failover seal; an ordinary restart keeps an open tail) and is reclaimed.
+Republished, it held GC at the MIN-over-SST floor for the rest of the
+incarnation. So a compaction treats a durable cursor whose extent is missing
+from a list fetched AFTER it read the cursor (`durable_cursor_swept`; a cursor
+published after the fetch may name a newer extent) like `(0, 0)` and rebuilds
+it from the tables it lists, then moves that off a sealed end. A reopen before
+that takes the whole-log path, which after GC is only the extents left. The
+rebuild is never ahead of what the tables cover (flushes commit in order), but
+it can land behind the lost cursor — on an older stamp when GC already punched
+the newest one's extent, or when a deposed manager answers `MSG_STREAM_INFO`
+with a stale list (that RPC is not leader-checked) — which only lowers GC's
+floor until the next flush (inferred, not reproduced).
+`background::sealed_anchor_tests`,
+`crates/manager/tests/system_compact_advance_anchor.rs` (major, GC, SIGKILL,
+reopen), `system_compact_advance_anchor_minor.rs` (auto-trim, log rolled
+mid-compaction) and `system_compact_swept_anchor.rs` (red when the swept
+cursor is republished).
 
 INVARIANT (why ack-gated, never in-memory): a floor derived from in-memory state
 (`p.vp_*`, the live write cursor past un-flushed writes) could run AHEAD of what a
@@ -1539,6 +1577,22 @@ SstReaders.
 - **Compaction**: dropping a VP entry (dedup/range/tombstone/expiry) adds its
   extent_id + value length. The two never count the same bytes: flush leaves
   the VP value out, compaction counts only the VP value.
+- **Major compaction re-counts** (`recount_extents`): for every sealed extent
+  before its inputs' cursor (moved off a sealed end, as above), the output's
+  discard is SET to `sealed_length - Σ len of the ValuePointers it keeps there`.
+  A major's inputs are every table, and every record below that cursor is in
+  them or dead, so this is exact; it replaces the running sum, which misses
+  bytes no write counted (WAL written before flushes recorded `wal_dead`,
+  records whose append failed after landing). Later drops add to it as usual —
+  those values were counted live. A CoW-shared extent counts only this
+  partition's values as live, so after a split each child's major makes the
+  extent collectable for it: each child relocates its own values and drops its
+  reference, and the file goes when the last one does (one extra rewrite of
+  the live data per split). Cost: one `get_extent_info` per sealed log extent
+  per major, serial — cached, but after a restart each is a manager RPC once —
+  and one map lookup per kept ValuePointer.
+  `crates/manager/tests/system_compact_recount_discard.rs` (the tally switched
+  off by `set_wal_dead_off`; red without the re-count).
 
 Why flush and not compaction: an inline entry does not record where its WAL
 record is, so by compaction time nothing knows which extent to charge. Before
@@ -1547,7 +1601,8 @@ took it — measured on the VKE cluster: a partition whose 4 KiB benchmark keys
 were all deleted and compacted (SST 5 KB) held 204 GB of sealed log extents with
 an empty discard map. `crates/manager/tests/system_gc_inline_wal.rs` covers the
 write path and the replay path (each goes red without its tally). Extents
-written before this change carry no such record; reclaiming them takes forcegc.
+written before this change carry no such record until a major compaction
+re-counts them (above).
 
 Cost: for a small-value workload every sealed log extent is ~100% dead once its
 flush checkpoints, so auto GC now reads each one end to end (finding nothing to

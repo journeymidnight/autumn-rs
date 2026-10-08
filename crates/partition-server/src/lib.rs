@@ -215,6 +215,13 @@ static MERGED_CHECKPOINT_FAIL: std::sync::atomic::AtomicBool =
 pub fn fail_merged_checkpoint() {
     MERGED_CHECKPOINT_FAIL.store(true, Ordering::Relaxed);
 }
+/// Test failpoint: while set, writes record no `wal_dead`, leaving their WAL
+/// bytes uncounted as builds before that tally did. Only tests set it.
+static WAL_DEAD_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set `WAL_DEAD_OFF`. Only tests call this.
+pub fn set_wal_dead_off(off: bool) {
+    WAL_DEAD_OFF.store(off, Ordering::Relaxed);
+}
 /// Number of flushes fully committed (checkpoint published) since process start.
 /// Tests poll this for deterministic flush completion. See `FLUSH_COMMITS`.
 pub fn flush_commit_count() -> u64 {
@@ -1025,7 +1032,7 @@ impl Memtable {
     /// (see `wal_dead`). The write and GC paths call it once per appended
     /// batch; recovery replay once per kept record.
     fn add_wal_dead(&self, extent_id: u64, n: u64) {
-        if n > 0 {
+        if n > 0 && !WAL_DEAD_OFF.load(Ordering::Relaxed) {
             *self.wal_dead.lock().entry(extent_id).or_insert(0) += n as i64;
         }
     }
@@ -1282,8 +1289,8 @@ pub(crate) struct PartitionData {
     vp_offset: u64,
     /// The cursor of the newest durably ACKed checkpoint record; GC raises its
     /// replay floor to it (`gc_floor_raise_to_durable_ckpt`). Every publisher
-    /// holds `publish_lock`. Flush, freeze and merged publishes set it after
-    /// their append acks; a compaction republishes it unchanged
+    /// holds `publish_lock`. Every publisher sets it after its append acks; a
+    /// compaction republishes it, only moved off a sealed extent's end
     /// (`compaction_checkpoint_cursor`), so no record falls behind the floor.
     /// Never set from in-memory state (`vp_*` runs past acked writes no SST
     /// holds yet, and a floor there could outrun what recovery loads). Seeded
