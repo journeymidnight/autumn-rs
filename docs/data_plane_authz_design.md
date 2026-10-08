@@ -80,15 +80,15 @@ token(wire) = canonical_bytes(claims) ‖ sig[64]     // SIG_LEN = 64
 
 ### 5.1 建 principal（admin，低频）
 
-`autumn-op principal-create <name> --grant <prefix> [--grant …]` →
+`autumn-op principal-create --principal <name> --grant <prefix> [--grant …]` →
 manager 存 `{name, credential_hash = SHA-256(cred), allowed_prefixes}` 到 etcd
-`tenantAccount/<name>`（leader-fenced，replay fail-loud），返回该 principal 的
+`principal/<name>`（leader-fenced，replay fail-loud），返回该 principal 的
 **长期凭据**（≈ refresh token，交给那个组件）。
 
 grant 串语义：**非空、左锚字节前缀、强制补尾 `/`**。
 
 凭据文件格式是**两行**：`<principal-name>\n<hex-secret>`。名字随文件携带，
-所以数据面不需要 `--principal` / `--tenant` flag。
+所以数据面不需要 `--principal` flag。
 
 这条 RPC 只在 Admin 连接上受理，Admin 连接必须持有集群密钥
 （`cluster_secret_design.md` §4）。
@@ -127,8 +127,7 @@ clock_skew_secs, cluster_id, …}` → 本地缓存
   `AuthzState::is_enabled()` 是单个 `AtomicBool`，关时一次 relaxed load，零成本。
 - **protect-everything**：authz 一旦开启，**每个 key、每个 range 都要 token**。
   没有「非受保护区间」的概念 —— 匿名连接（没发过 CLIENT_AUTH）对任何 key 都被拒。
-  `GetAuthzConfigResp.protected_prefixes` 字段仍在 wire 上（manager 从 namespace
-  注册表里 owner 非空的行桥接过来），但**不参与 PS 的强制判定**。
+  `GetAuthzConfigResp` 只带公钥与已注册 namespace（Layer-A 数据源），没有前缀名单。
 - **`authz_check` 的 INVARIANT（load-bearing）**：每个携带 user key 的数据面
   msg_type **必须**在 `authz_check` 里有一条 arm 去取 key 并调
   `check_key` / `check_range`。catch-all `_ => None`（放行）只对非 key 作用域的
@@ -214,7 +213,7 @@ descriptor 前做 `check_key`，但 EN 收到的只是坐标，不知道它属�
   其他直读失败（节点不可达、超时、布局过期）照旧换副本再回落 proxy。
   “每个 EN 判定相同”有一个窗口：EN 与 PS 每 5 s 才取一次配置，签名密钥增删后的
   几秒内，用新 kid 签的 token 可能在某个 EN 上被拒，这个拒绝同样直接返回调用方。
-- **EN 不验范围**：一个合法 principal 仍可凭猜中的坐标读到别的 tenant 的 extent。
+- **EN 不验范围**：一个合法 principal 仍可凭猜中的坐标读到它 grant 之外的 extent。
   要堵这一点需要 PS 为每个 descriptor 签名、EN 验签，未做。
 - **EN 取配置**：每个 shard 每 5 s 轮询 `MSG_GET_AUTHZ_CONFIG`（`ClientAuthz`）。
   配置到手之前（`Unknown`）拒绝直读和 CLIENT_AUTH，都回 `Unavailable`（暂时的，
@@ -243,7 +242,7 @@ descriptor 前做 `check_key`，但 EN 收到的只是坐标，不知道它属�
   / 运维）本来就是可信计算基。client 持有的 cap token 只能换来直读，与它们无关。
 
 不防的：持有集群密钥的进程被攻破（见 §9，密钥即信任根）；Client 通过 EN 直读读到
-别的 tenant 的 extent（§10）。
+grant 之外的 extent（§10）。
 
 拒绝按类计数，EN `/metrics` 的 `autumn_en_auth_rejects_total{class}`：`opcode_denied`
 （Client 发了不许发的 op）、`peer_auth`（PEER_AUTH 握手失败：密钥不符，或对端在握手中途断开/超时）、`client_read`（authz 开启，

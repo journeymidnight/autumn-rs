@@ -600,15 +600,14 @@ endpoint is not connected"); clear it before re-mounting with
 `fusermount3 -u "$MP"` (or `umount -l "$MP"`).
 
 **The mount is scoped to the WHOLE `fs/` namespace.**
-`autumn-fuse` (and `autumnfs`, and the PyO3 `autumn.Fs.connect(...)`) has NO
-`--tenant` — every inode/dirent/extent key lands under `fs/…` (one global tree).
+`autumn-fuse` (and `autumnfs`, and the PyO3 `autumn.Fs.connect(...)`) takes no
+scope flag — every inode/dirent/extent key lands under `fs/…` (one global tree).
 A fuse mount, `autumnfs`, and the PyO3 client **all see the SAME filesystem**. To
 run isolated filesystems in one cluster use DISTINCT NAMESPACES (`fsA`/`fsB`, each
-`namespace-create`d), not a tenant. Inode numbers are cluster-unique (a single
-global counter); a `schema_version` stamp makes a future incompatible layout fail
-loud rather than mount empty. (Option 3, docs/key_namespace_split_design.md §8:
-the tenant segment — and the short-lived SD-3 `{volume}` layer before it — were
-removed; this is a stop-world data-reset change with a WIRE bump to v26.)
+`namespace-create`d). Inode numbers are cluster-unique (a single global counter,
+etcd `autumn-rs/fs/next_inode`); a `schema_version` stamp makes a future
+incompatible layout fail loud rather than mount empty
+(docs/key_namespace_split_design.md §8).
 
 **UCX (RDMA):** with `--transport ucx`, export the UCX env before launching (the
 UCX C library reads it directly): a positive `UCX_TLS` list — never `^` negation —
@@ -2293,7 +2292,7 @@ Regression: `cargo test -p autumn-manager --test system_merge still_carrying`.
 answering "which principals exist and what are they granted" meant either
 `ls $DATA_ROOT/authz/*.cred` (only what cluster.sh's turnkey path happened to
 write — nothing an operator minted by hand) or an etcd key scan
-(`etcdctl get --prefix --keys-only tenantAccount/`), which shows names
+(`etcdctl get --prefix --keys-only principal/`), which shows names
 but NOT grants because the value is rkyv.
 
 ```bash
@@ -2313,11 +2312,12 @@ is no flag or future edit that can make it leak. A lost credential is re-minted
 (`principal-create` again, which rotates), never recovered.
 
 The namespace-side counterpart is `namespace-list` (registry rows: name / prefix
-/ owner / presplit / created_at).
+/ presplit / created_at).
 
-## autumn-kvcache tenant / model identity (BUG-KVC-TENANT)
+## autumn-kvcache model identity
 
-vLLM-connector KV keys are `kvc/{model}_{fingerprint}_{tp...}/vllm/...`. The
+vLLM-connector KV keys are `kvc/{model_scope}/vllm/...`, where the model scope
+is `{model}_{fingerprint}_{tp...}` (`build_model_scope`). The
 `{model}` segment is the autumn **weights-path basename** (e.g. `qwen7b` from
 `model_loader_extra_config.path=models/qwen7b`), NOT the constant `/model-cfg`
 config dir that several models can share — so the readable
@@ -2326,12 +2326,12 @@ segment ALONE distinguishes models even if the fingerprint ever degrades
 `model-cfg_<fp>_0_1`). The 12-hex fingerprint carries the model's real identity
 (arch shape + weights source + optional `model_id`; see
 `python/autumn_kvcache/autumn_kvcache/_identity.py`). Before both, every model
-served via the fixed local config dir shared ONE tenant and cross-read KV
+served via the fixed local config dir shared ONE model scope and cross-read KV
 (live 2026-07: Qwen2.5-7B/32B both under `kvc/model-cfg_0_1/`).
 
 **Load is fail-closed (BUG-KVC-LOAD-ATOMIC, 2026-08-11).** When the scheduler
 admits a request on the `__present__` marker but the worker cannot load EVERY
-layer (TTL grace breach / tenant mismatch / backend fault), the connector now
+layer (TTL grace breach / model identity mismatch / backend fault), the connector now
 injects NO KV for that request and reports its blocks via
 `get_block_ids_with_load_errors()` so vLLM re-runs normal prefill. Previously it
 injected the layers that loaded and skipped the rest → the request decoded on a
@@ -2340,33 +2340,33 @@ symptom: `external KV load miss after positive presence` on layer 0..N). If you
 see that warning now it is followed by a recompute, not a wrong answer. The fingerprint also folds in the two **layout
 versions** — the running vLLM version (full `x.y.z`) and the connector's own
 `VLLM_KV_STORAGE_FORMAT` (`_keys.py`) — so the same model on a
-layout-incompatible stack never shares a tenant. Operational consequence:
-**every vLLM upgrade (patch releases included) moves the tenant and
+layout-incompatible stack never shares a model scope. Operational consequence:
+**every vLLM upgrade (patch releases included) moves the model scope and
 cold-invalidates the whole vLLM pool** — expected, one-time re-warm; the old
-tenant's keys need the same manual reclaim as below.
+scope's keys need the same manual reclaim as below.
 
 **`--kv-cache-dtype` is part of the identity too** (added 2026-07-22): the
 connector stores raw KV bytes and reinterprets them with the *current* runtime
 dtype, and `CacheConfig.cache_dtype` is independent of the model dtype. The
 silent case is a same-itemsize flip — `fp8_e4m3` ↔ `fp8_e5m2` are both one byte,
 so nothing errors and the KV is just wrong. `cache_dtype` (plus
-`kv_cache_dtype_skip_layers`) therefore splits the tenant. **Changing
-`--kv-cache-dtype` moves the tenant and cold-invalidates the pool**, same as a
+`kv_cache_dtype_skip_layers`) therefore splits the model scope. **Changing
+`--kv-cache-dtype` moves the model scope and cold-invalidates the pool**, same as a
 vLLM upgrade. Note this also means the FIRST deploy carrying this change starts
 from a cold vLLM pool even with no config change, because the fingerprint gained
-a source — orphaned old-tenant keys reclaim exactly as below.
+a source — orphaned old-scope keys reclaim exactly as below.
 
 ```bash
 # Offline unit tests (no cluster / engine / native module):
-cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_tenant_identity.py -q
+cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_model_identity.py -q
 
-# Manual verify on a live deployment: the connector logs its tenant + identity
-# sources at startup — two DIFFERENT models must log two different tenants:
-#   AutumnKVConnector role=... tenant=qwen7b_<fp>_0_1 ... identity={'layers': 28, ...}
-# and the stored keys must not share a tenant prefix:
+# Manual verify on a live deployment: the connector logs its model scope +
+# identity sources at startup — two DIFFERENT models must log two different scopes:
+#   AutumnKVConnector role=... model_scope=qwen7b_<fp>_0_1 ... identity={'layers': 28, ...}
+# and the stored keys must not share a model-scope prefix:
 #   (autumn-client / python) list keys under kvc/ — one prefix per model.
 
-# Upgrade note: the fingerprint changed every vLLM-pool key → old-tenant keys
+# Upgrade note: the fingerprint changed every vLLM-pool key → old-scope keys
 # (e.g. kvc/model-cfg_0_1/vllm/...) are orphaned; with ttl_secs=0 they never
 # expire. Reclaim manually when convenient (venv with the autumn wheel):
 #   python - <<'EOF'
@@ -2377,7 +2377,7 @@ cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_ten
 #   asyncio.run(main())
 #   EOF
 # The load-miss-after-marker warning now states the plausible causes given the
-# TTL config (ttl=0 ⇒ never blames TTL; points at tenant/model mismatch).
+# TTL config (ttl=0 ⇒ never blames TTL; points at a model identity mismatch).
 ```
 
 ### External hit rate & the kill switch (BUG-KVC-NO-HIT)
@@ -2435,27 +2435,27 @@ for `fs/`, `kvc/` and `gallery/`:
 ```bash
 AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,fs.cred,kvc.cred,gallery.cred}
 
-# gallery (gallery/gallery/, protected) — Scoped client, credential via env:
+# gallery (scope gallery/) — Scoped client, credential via env:
 AUTUMN_CREDENTIAL_FILE=/tmp/autumn-rs/authz/gallery.cred \
   ./target/release/gallery 127.0.0.1:9001
 ```
 
 The example binds its namespace scope and authenticates through
 `AUTUMN_CREDENTIAL_FILE`; the SDK auto-mints short-TTL tokens. Override the
-scope with `AUTUMN_NAMESPACE` / `AUTUMN_TENANT`.
+scope with `AUTUMN_SCOPE` (legacy `AUTUMN_NAMESPACE` still read).
 
 ```bash
 # 1) Generate a signing key (LOCAL, no cluster needed):
 ./target/release/autumn-op gen-signing-key --kid 1 > /path/signing.key
 
 # 2) Start the cluster with authz enabled (cluster.sh env→flag translation;
-#    protected prefixes default to mem/ when unset):
+#    every keyed op then needs a token — there is no protected-prefix list):
 AUTUMN_AUTH_SIGNING_KEY_FILE=/path/signing.key \
   bash cluster.sh start 4
 
 # 3) Create a PRINCIPAL (admin; credential printed ONCE as principal:/credential:
 #    two lines — redirect straight to a credential file).
-#    Keys are ns-first `{ns}/…` (no tenant); a grant is a whole namespace (`fs/`)
+#    Keys are `{ns}/…`; a grant is a whole namespace (`fs/`)
 #    or an in-namespace sub-prefix (`mem/acme/`):
 AO="./target/release/autumn-op --cluster-secret-file /tmp/autumn-rs/cluster.secret --manager 127.0.0.1:9001"
 $AO principal-create --principal acme --grant mem/acme/ > /path/acme.cred
@@ -2466,7 +2466,7 @@ $AO principal-create --principal acme --grant mem/acme/ > /path/acme.cred
 #    PS connection and each extent-node direct-read connection; principal read from
 #    the credential file):
 #      ClusterClient::connect_with_credential(mgr, "mem/acme", principal, secret)
-#    Cross-scope / anonymous access to a protected prefix fails PermissionDenied.
+#    Cross-scope or anonymous access to any key fails PermissionDenied.
 
 # Ops: mint a token by hand / revoke a principal:
 $AO mint-token --principal acme --credential-file /path/acme.cred
@@ -2555,7 +2555,7 @@ $AO scrub EXT_ID... | --part PART_ID | --all [--wait]
 # Admin / observability
 $AO info                                 # nodes / extents / streams / partitions
 $AO bootstrap --replication 3+0          # --presplit RETIRED; use `presplit --namespace <NS>` after
-$AO split PART_ID                         # or: split PART --namespace <ns> --tenant <t> --at <suffix>
+$AO split PART_ID                         # or: split PART --namespace <ns[/sub]> --at <suffix>
 $AO merge SURVIVOR_PART_ID VICTIM_PART_ID # add --force to cross a declared presplit boundary
 $AO rebalance [MAX_MOVES]                 # re-spread partitions across PS
 $AO compact PART_ID
@@ -2603,31 +2603,31 @@ extent's `refs` against live stream membership.
 
 ## Explicit split point — `autumn-op split --at`
 
-`split PART_ID` with no extra flags lets the PS pick the median of the live keys
-(legacy). To cut at an **operator-chosen** point — e.g. to pre-split an empty /
-near-empty partition, or split two tenants into different partitions — name the
-point on the CLI. The user-facing form speaks **namespace + tenant**, never raw
-prefix bytes (the partition layer stays namespace-agnostic; the CLI assembles
-the key and the wire carries only raw bytes):
+`split PART_ID` with no extra flags lets the PS pick the median of the live keys.
+To cut at an **operator-chosen** point — e.g. to pre-split an empty / near-empty
+partition, or put two sub-scopes in different partitions — name the point on the
+CLI. The user-facing form speaks a **scope + suffix**, never raw prefix bytes (the
+partition layer stays namespace-agnostic; the CLI assembles the key and the wire
+carries only raw bytes).
 
-The key order is **NAMESPACE-FIRST**: `{namespace}/{tenant}/{suffix}` (Option 3;
-the older tenant-first `{tenant}/{namespace}/` was retired 2026-07-19).
+`--namespace` takes a SCOPE: a namespace (`kvc`) or an in-namespace sub-scope
+(`kvc/acme`, `bench/perf`), each `/`-separated segment matching `[a-z0-9._-]+` —
+the same convention as `autumn-client --namespace`. Cut key = `{scope}/` ++ suffix.
 
 ```bash
-# Cut exactly at the pair boundary "kvc/acme/" — splits `acme`'s kvc keyspace
-# (and everything sorting >= it) off into a new partition. Empty/omitted
-# suffix = the boundary itself.
-$AO split PART_ID --namespace kvc --tenant acme --at ""
+# Cut exactly at "kvc/acme/" — splits that sub-scope (and everything sorting
+# >= it) off into a new partition. Empty/omitted suffix = the boundary itself.
+$AO split PART_ID --namespace kvc/acme --at ""
 
-# Cut inside a pair at a text suffix -> key = "kvc/acme/" ++ "vllm/v1/80".
-$AO split PART_ID --namespace kvc --tenant acme --at vllm/v1/80
+# Cut at a text suffix -> key = "kvc/acme/" ++ "vllm/v1/80". Equivalent:
+#   --namespace kvc --at acme/vllm/v1/80
+$AO split PART_ID --namespace kvc/acme --at vllm/v1/80
 
 # Binary suffix (e.g. an fs extent/inode prefix) via hex -> key = "fs/" ++ 0x0103ff.
 $AO split PART_ID --namespace fs --at-hex 0103ff
 
-# ADMIN escape hatch only (documented admin-only, like D7 raw()): a whole raw
-# key, no namespace/tenant assembly. Operators should NOT hand-build prefixes.
-# (hex below = "kvc/acme/" — namespace-first.)
+# ADMIN escape hatch only: a whole raw key, no scope assembly. Operators should
+# NOT hand-build prefixes. (hex below = "kvc/acme/".)
 $AO split PART_ID --at-raw-hex 6b76632f61636d652f
 ```
 
@@ -2635,38 +2635,41 @@ Rules & behavior:
 - The assembled key must land **strictly inside** the target partition's
   `[start, end)` (equal to `start`, equal to/`>=` `end`, or out of range are all
   rejected). The CLI does a friendly pre-check (readable error naming your
-  ns/tenant/suffix); the **PS is the authoritative validator**.
+  scope/suffix); the **PS is the authoritative validator**.
 - With an explicit `--at`, an **empty or near-empty** partition can be split
   (the `>= 2 keys` gate is skipped) — this is the presplit primitive: cut an
-  empty pair into two empty children. Without `--at`, an empty partition is
+  empty range into two empty children. Without `--at`, an empty partition is
   still refused (`< 2 keys`).
-- `--namespace` is required for `--at`/`--at-hex`/`--tenant`; `--tenant` is an
-  OPTIONAL in-namespace sub-segment (mem/kvc — fs has none). `--at-raw-hex` is
-  mutually exclusive with all of the above.
+- `--at`/`--at-hex` require `--namespace`; `--at-raw-hex` is mutually exclusive
+  with all of them. A malformed scope (uppercase, empty segment, …) is refused
+  before any RPC.
 
 Manual verification (memory-mode loopback recipe, no etcd):
 ```bash
 # 1. Bring up a 1-manager / 2-EN / 1-PS loopback cluster (see the dev recipe).
-# 2. Create an EMPTY partition covering the keyspace, then presplit it at a
-#    tenant boundary and confirm the region count goes 1 -> 2 with the new
+# 2. Create an EMPTY partition covering the keyspace, then split it at a
+#    sub-scope boundary and confirm the region count goes 1 -> 2 with the new
 #    boundary == the assembled key:
-$AO info --json | jq '.partitions | length'          # -> 1
-$AO split <PART> --namespace kvc --tenant acme --at "" --json
-$AO info --json | jq '.partitions | length'          # -> 2
-$AO info --json | jq -r '.partitions[].start_key'    # one range starts at acme/kvc/
+$AO --json info | jq '.partitions | length'          # -> 1
+$AO split <PART> --namespace kvc/acme --at ""
+$AO --json info | jq '.partitions | length'          # -> 2
+$AO --json info | jq -r '.partitions[].range_start'  # one range starts at kvc/acme/
 # 3. Negative: a point outside the range is rejected up front:
-$AO split <PART> --namespace zzz --tenant zzz --at "" ; echo "exit=$?"  # non-zero
+$AO split <PART> --namespace zzz/zzz --at "" ; echo "exit=$?"  # non-zero
 ```
 
 ## Namespace-aware presplit — `autumn-op presplit`
 
 A raw-byte uniform split is **namespace-blind**: after key-namespacing every real key
-sits in the `fs/…` / `kvc/…` / `mem/…` byte sliver (namespace-first, Option 3),
+sits in the `fs/…` / `kvc/…` / `mem/…` byte sliver,
 so uniform splitting over the whole 0x00..0xff space collapses everything into
 one or two partitions (live: 19 GB fs on a single partition, 30 empty). That is
-why `bootstrap --presplit` was retired. `presplit` instead splits a
-`{namespace}/{tenant}/` keyspace along the namespace's **natural high-entropy
-dimension** (built on the `split --at` primitive):
+why `bootstrap --presplit` was retired. `presplit` instead splits a `{scope}/`
+keyspace along the namespace's **natural high-entropy dimension** (built on the
+`split --at` primitive). `--namespace` takes a scope as in `split`: the FIRST
+segment picks the rule (`fs` | `kvc` | `mem` | anything else = uniform hex
+`--count N`), the whole scope is the cut prefix, and the declared points are
+recorded on the first segment's namespace row. `fs` refuses a sub-scope (one tree).
 
 ```bash
 # fs — split by INODE (the fs data key is [0x03][ino BE][off BE]). Give the exact
@@ -2676,16 +2679,20 @@ $AO presplit --namespace fs --count 8            # → inodes 1..7
 
 # kvc — split by CONTENT HASH (sha256 hexdigest). --hash-prefix is REQUIRED: it is
 # the RELATIVE prefix from the namespace root down to just before the hash hex, and
-# it is per-MODEL, so there is no default. The vLLM connector stores (Option 3, no
-# tenant segment):
-#   kvc/{model}/vllm/v1/{hash}/{layer}
-# → the hash is under `{model}/vllm/v1/`, NOT directly under `vllm/`. Find the exact
-# {model} fingerprint from a live key: `autumn-client --namespace kvc ls`.
-$AO presplit --namespace kvc --tenant default --count 8 --hash-prefix "qwen3-8b_a1b2/vllm/v1/"
-# sglang keys are {model}/{pool}/{hash} → pass "<model>/<pool>/".
+# it is per-MODEL, so there is no default. The vLLM connector stores
+#   kvc/{model_scope}/vllm/v1/{hash}/{layer}
+# → the hash is under `{model_scope}/vllm/v1/`, NOT directly under `vllm/`. Find the
+# exact model scope from a live key: `autumn-client --namespace kvc ls`.
+$AO presplit --namespace kvc --count 8 --hash-prefix "qwen3-8b_a1b2_0_1/vllm/v1/"
+# same cuts:  --namespace kvc/qwen3-8b_a1b2_0_1 --count 8 --hash-prefix "vllm/v1/"
+# sglang keys are {model_scope}/{pool}/{hash} → pass "<model_scope>/<pool>/".
 
 # mem — split by AGENT.
-$AO presplit --namespace mem --tenant default --agents alice,bob,carol
+$AO presplit --namespace mem --agents alice,bob,carol
+
+# any other namespace (or sub-scope) — uniform hex split under the scope; this is
+# what cluster.sh / perf_check.sh run for the bench keyspace.
+$AO presplit --namespace bench/perf --count 8
 
 # fs --lanes N [--parts P] — split fs for large-file striping. LANES is the key
 # layout (24 by default, a permanent constant), PARTS is how many partitions to
@@ -2738,7 +2745,7 @@ autumnfs --manager <mgr> get /ckpt ./out   # reader reads the file's own stamp
   disks/hosts so the per-stream ceiling is high.
 - **fuse mount**: READS and DELETES (unlink/rename-over) striped files correctly
   (an autumnfs-striped file is fully readable + removable via a mount on the same
-  tenant). fuse WRITE/TRUNCATE of a striped file is refused fail-loud for now
+  cluster). fuse WRITE/TRUNCATE of a striped file is refused fail-loud for now
   (streaming writes don't know the final size up front, so fuse can't decide the
   stripe geometry at create) — use `autumnfs put` to (re)write large striped files.
   Schema is **v3** (`InodeMeta.stripe`) — a stop-world reset from v2 (no in-place
@@ -3652,7 +3659,8 @@ inside an envelope, `[AUMG][record_type][format_version]`, and the servers speak
 exactly one shape: **a value without the envelope is refused and the manager will
 not take leadership.** There is no dual-read, by design.
 
-Nine prefixes were covered: `mgr_audit_log/`, `tenantAccount/`, `namespace/`,
+Nine prefixes were covered: `mgr_audit_log/`, `tenantAccount/` (the principal
+DB, since moved to `principal/` by `migratev1_v2`), `namespace/`,
 `extents/`, `streams/`, `nodes/`, `disks/`, `partitions/`, `regions/`. Every
 other persisted key (`opLog/`, `extent_inflight/`, `extentLayout/`,
 `extentCorrupt/`, `node_override/`, `inode_leases/`, `autoPolicy/*`, …) is NOT
@@ -3719,6 +3727,59 @@ One more, for whoever compares namespaces afterwards: a bare `autumn-client ls`
 scans from the namespace head and does not continue into later partitions, so it
 returns nothing when the head is empty even though keys exist further on. Use
 `ls --prefix` before concluding a namespace was emptied.
+
+#### `migratev1_v2` — the tenant removal (wire 58 -> 59, stop the world)
+
+Two etcd changes ship with wire 59:
+
+- the principal account DB moves from `tenantAccount/<name>` to `principal/<name>`.
+  The value is copied unchanged (same record type 2, format 1).
+- `namespace/<name>` goes from format 1 to 2: `owner_tenant` is dropped. It fed
+  only the protected-prefix list, which no PS read.
+
+A wire-59 manager refuses to lead while any namespace record is still v1, with
+`namespace/fs: namespace record is at format version 1, this binary speaks 2.
+The converter has not run`. The built-in `fs`/`kvc`/`mem` rows exist on every
+bootstrapped cluster, so an unconverted cluster always stops there instead of
+starting with principals missing. Wire 58 and 59 cannot run together, so stop
+everything.
+
+```bash
+# 1. pause policy, wait for dispatched ops (general procedure above), then stop
+#    every manager, PS and EN.
+# 2. count what will be converted, then dry-run; on a first run the counts match
+#    moved= and converted= (after an interrupted run some show as already=).
+etcdctl get tenantAccount/ --prefix --keys-only | grep -c .
+etcdctl get namespace/ --prefix --keys-only | grep -c .
+cargo run --release --bin migratev1_v2 -- --etcd http://ETCD:2379 --dry-run
+#    tenantAccount/ -> principal/  moved=N already=0
+#    namespace/<name>: dropping owner_tenant "..."   (one line per owned namespace)
+#    namespace/ v1 -> v2  converted=M already=0
+# 3. convert, then re-run: the re-run must report moved=0 and converted=0, with
+#    already=M for namespaces.
+cargo run --release --bin migratev1_v2 -- --etcd http://ETCD:2379
+cargo run --release --bin migratev1_v2 -- --etcd http://ETCD:2379
+# 4. start the wire-59 binaries and check:
+autumn-op --cluster-secret-file F --manager MGR:9001 principal-list   # same names + grants
+autumn-op --cluster-secret-file F --manager MGR:9001 namespace-list   # no OWNER column
+autumn-op --cluster-secret-file F --manager MGR:9001 mint-token --principal P --credential HEX
+```
+
+The tool refuses while any manager is up (the leader key or any
+`managerAlive/<id>` is present); a manager that just exited leaves its keys for
+up to 10 s until its lease expires — wait and re-run. It moves
+accounts first (one txn per account: create `principal/<n>` if absent, delete
+`tenantAccount/<n>`) and namespaces last, each write a compare-and-put, so a run
+interrupted anywhere is simply re-run. Credentials keep working: the account
+bytes, and so the credential hash, are unchanged. After the production cluster
+has converted, delete `crates/server/src/bin/migratev1_v2.rs`, its `[[bin]]`
+entry and the `autumn-etcd` dependency in `crates/server/Cargo.toml`.
+
+Operator-visible changes in the same release: `namespace-create`, `split` and
+`presplit` no longer take `--tenant` (`split`/`presplit --namespace` take a scope
+such as `bench/perf`), `mint-token` takes only `--principal`, the manager no
+longer takes `--auth-protected-prefix`, and the kvcache `auth_tenant` config key
+is gone (use `auth_credential_file` and optionally `auth_principal`).
 
 #### Rolling BACK onto data a newer binary wrote
 
@@ -4200,19 +4261,19 @@ dest: `fs.read_into(ino, off, memoryview(buf))` byte-equals `fs.read(ino, off, n
 
 ## Enabling authz
 
-**Deploy layer = ON by default (Task 2, 2026-07-18).** Both deploy paths arm
-data-plane authz automatically. **Protect-everything (tenant-first, 2026-07-19):**
-with a signing key present, EVERY tenant-scoped write requires a token — there is
-no protected-prefix list; a credential grants a key prefix — a whole namespace
-(`fs/`) or an in-namespace sub-prefix (`mem/app/`). The key layout is
-`{ns}/…` (NO tenant segment; see §8).
+**Deploy layer = ON by default.** Both deploy paths arm
+data-plane authz automatically. **Protect-everything:** with a signing key
+present, EVERY keyed op requires a token — there is no protected-prefix list and
+anonymous connections are denied; a principal's credential grants key prefixes —
+a whole namespace (`fs/`) or an in-namespace sub-prefix (`mem/app/`). Keys are
+`{ns}/…`.
 
 - **`deploy/baremetal/autumn-deploy start`** generates a signing key once (reused
   across re-deploys — rotating invalidates every credential),
   distributes the key to every manager host, and after bootstrap mints per-family
   principal credentials to `~/.autumn-deploy/authz/*.cred`. Clients pass
   `--credential-file ~/.autumn-deploy/authz/fs.cred` (the principal name is read
-  from the file — no `--principal`/`--tenant`).
+  from the file — no `--principal` flag).
 - **k8s** (`deploy/overlays/vke/deploy.sh`) generates the `autumn-authz` Secret
   (signing key) once and the manager StatefulSet mounts it (the
   signing key alone arms protect-everything — no prefix list). Mint a client
@@ -4220,8 +4281,8 @@ no protected-prefix list; a credential grants a key prefix — a whole namespace
 - **Escape hatch:** `AUTUMN_AUTH_DISABLE=1` (both paths) runs authz-OFF — for
   local debugging. The dev/test harness (`cluster.sh`, `scripts/*_chaos.sh`)
   never sets `AUTUMN_AUTH_*`, so it is authz-OFF unconditionally.
-- **Native clients** all take `--credential-file <path>` (NO `--principal`/
-  `--tenant` — the principal identity travels IN the file): `autumn-fuse`,
+- **Native clients** all take `--credential-file <path>` (NO `--principal` —
+  the principal identity travels IN the file): `autumn-fuse`,
   `autumnfs`, `autumn-client`. The file is the two-line `principal:`/`credential:`
   form `autumn-op principal-create` prints (or `<name>\n<hex>`); the hex decodes
   to the raw bytes the manager hashed.
@@ -4253,7 +4314,7 @@ autumn-op --manager $M --cluster-secret-file /secrets/cluster.secret \
 
 # 4. ARM: manager gets --auth-signing-key-file (or env
 #    AUTUMN_AUTH_SIGNING_KEY_FILE via entrypoint). PROTECT-EVERYTHING: the signing
-#    key alone arms enforcement of EVERY namespaced write — there is no
+#    key alone arms enforcement of EVERY keyed op — there is no
 #    protected-prefix list. Restart manager; PS picks it up via 5s authz poll.
 
 # 5. Verify enforcement: a credential-less write must fail, while the scoped

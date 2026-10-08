@@ -220,7 +220,7 @@ def get_hash_str(token_ids: List[int], prior_hash: Optional[str] = None) -> str:
 
 - **Backend 不 hash**，sglang controller 已经算好传过来
 - Merkle 链式 → 所以 `batch_exists` 返回"最长连续存在前缀长度"语义自然成立
-- **Backend 必须再加 tenant suffix** 区分模型/TP/PP/MLA（照搬 `HiCacheFile._get_suffixed_key`）:
+- **Backend 必须再加 model scope** 区分模型/TP/PP/MLA（照搬 `HiCacheFile._get_suffixed_key`）:
   ```python
   config_suffix = f"_{model_name}"
   if not is_mla_model: config_suffix += f"_{tp_rank}_{tp_size}"
@@ -320,7 +320,7 @@ class LMCRadixCache(RadixCache):  # 注意不是 HiCacheStorage
 3. Override `register_mem_pool_host` 缓存 pinned-host 基址 + stride
 4. 实现 `batch_get_v1` / `batch_set_v1` / `batch_exists` (返回 contiguous-prefix int)
 5. v0 abstract 方法实现成 thin wrapper（开 `interface_v1: 1` 后不走热路径）
-6. Tenant key suffix 用 `(model_name, tp_rank, tp_size, pp_rank, pp_size, is_mla_model)` 拼，照搬 `HiCacheFile._get_suffixed_key`
+6. Model scope 用 `(model_name, tp_rank, tp_size, pp_rank, pp_size, is_mla_model)` 拼，照搬 `HiCacheFile._get_suffixed_key`
 7. **内部容量管理是 backend 自己的事**（sglang 永不调 delete）—— LRU + `get_stats()` 暴露指标
 8. **必须快** —— prefetch budget = `2s + 0.1s/Ki-tok`，慢 backend 直接被放弃
 
@@ -346,5 +346,5 @@ sglang ... \
 - **节点间 peer 共享 (one-sided RDMA)** = LRU miss 时先问 peer，再 fall through partition
 - **Partition 持久化** = LRU miss + peer miss 时 `ClusterClient.get`；writeback evict 时 `ClusterClient.put`
 - **Block 大小** = sglang `bytes_per_page` 决定，不固定（不同模型不同 page_size），但**一次启动期间是常量** —— autumn-kvcache 启动时锁定 slab slot 大小
-- **Key 命名** = `f"autumn-kvcache/{tenant_suffix}/{sha256_hash}"`，partition key 直接用这个字符串
+- **Key 命名** = `f"autumn-kvcache/{model_scope}/{sha256_hash}"`，partition key 直接用这个字符串
 - **持久化失败语义** = `batch_set_v1` 返回 `[False]` 就行，sglang 会按 write policy 决定是否重试。**绝对不能阻塞** prefetch budget

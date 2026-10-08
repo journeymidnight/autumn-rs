@@ -18,7 +18,7 @@ Design (route A, mirrors vLLM's reference `SharedStorageConnector`):
   - scheduler role: prefix-hash lookup → autumn existence → matched-token count,
     then build per-request load/save metadata.
   - worker role: per-layer extract/inject of the paged KV tensor through autumn
-    keyed by `kvc/{tenant}/vllm/{prefix_hash}/{layer_name}`.
+    keyed by `kvc/{model_scope}/vllm/{prefix_hash}/{layer_name}`.
 
 Phase 3a target = CPU-offload KV (no GPU staging buffers), synchronous load in
 `start_load_kv` (overlap is Phase 3b). The autumn-facing byte I/O is factored
@@ -37,8 +37,8 @@ from typing import TYPE_CHECKING, Any, List, Optional
 import autumn
 
 from ._bridge import new_loop, run, run_on
-from ._identity import read_credential_pair as _read_credential_pair, tenant_cfg_from_vllm as _tenant_cfg_from_vllm
-from ._keys import VLLM_KV_STORAGE_FORMAT, build_tenant_suffix, full_key
+from ._identity import read_credential_pair as _read_credential_pair, model_scope_cfg_from_vllm as _model_scope_cfg_from_vllm
+from ._keys import VLLM_KV_STORAGE_FORMAT, build_model_scope, full_key
 
 log = logging.getLogger(__name__)
 
@@ -56,8 +56,8 @@ VLLM_POOL_NAME = "vllm"
 _MAX_INFLIGHT_SAVES = 2
 
 # The connector's own KV-layout / storage-format version. Moved to `_keys.py`
-# (pure, offline-testable + pinned by test_tenant_identity.py) — it is baked
-# into every key path AND the tenant fingerprint. BUMP it whenever
+# (pure, offline-testable + pinned by test_model_identity.py) — it is baked
+# into every key path AND the model fingerprint. BUMP it whenever
 # `_extract_layer` / `_inject_layer` / `_byte_view` / the key scheme changes;
 # see the invariant comment at its definition.
 _KV_STORAGE_FORMAT = VLLM_KV_STORAGE_FORMAT
@@ -218,14 +218,14 @@ class _AutumnKVStore:
     vLLM/torch dependency so `tests/test_vllm_dataplane.py` can exercise it
     against a real 1-node cluster.
 
-    Keys: `kvc/{tenant}/vllm/{content_hash}/{layer_name}` (the `content_hash`
+    Keys: `kvc/{model_scope}/vllm/{content_hash}/{layer_name}` (the `content_hash`
     arg to `full_key` carries the `"{hash}/{layer}"` suffix).
     """
 
     def __init__(
         self,
         endpoint: str,
-        tenant_suffix: str,
+        model_scope: str,
         transport: str = "tcp",
         n_workers: int = 1,
         max_inflight: Optional[int] = None,
@@ -237,7 +237,7 @@ class _AutumnKVStore:
         if not endpoint:
             raise ValueError("_AutumnKVStore requires a non-empty endpoint")
         # (D6-kvc): authz identity, NOT the key scope —
-        # `tenant_suffix` (model fingerprint etc.) picks WHERE keys live;
+        # `model_scope` (model fingerprint etc.) picks WHERE keys live;
         # `auth_principal`+`auth_credential` prove WHO may write there.
         # Both-or-neither (the PyO3 layer enforces it too, but failing here
         # keeps the error at construction, before any worker threads spawn).
@@ -245,16 +245,14 @@ class _AutumnKVStore:
             raise ValueError(
                 "auth_principal and auth_credential must be passed together"
             )
-        # (Option 3): keys are NS-FIRST with no tenant
-        # segment — the client binds the `kvc` SCOPE and PREPENDS `kvc/`, and
-        # `_keys.py` emits the relative `{model}/…` (wire key `kvc/{model}/…`).
-        # `tenant_suffix` is the per-MODEL instance (`self._tenant` below, kept
-        # for the `tenant` property + logging), unrelated to the authz identity.
+        # The client binds the `kvc` SCOPE and PREPENDS `kvc/`; `_keys.py`
+        # emits the relative `{model_scope}/…`. `model_scope` is the per-model
+        # instance, unrelated to the authz identity.
         self._auth = {"scope": "kvc"}
         if auth_principal is not None:
             self._auth["principal"] = auth_principal
             self._auth["credential"] = auth_credential
-        self._tenant = tenant_suffix
+        self._model_scope = model_scope
         # Marker TTL = configured ttl_secs; layer TTL = ttl_secs + grace so the
         # marker always expires first (see _TTL_LAYER_GRACE_SECS). 0 = no expiry.
         # Both saturate at u64 so a huge "never expire" TTL is honoured and the
@@ -303,8 +301,8 @@ class _AutumnKVStore:
     PRESENT_MARKER = "__present__"
 
     @property
-    def tenant(self) -> str:
-        return self._tenant
+    def model_scope(self) -> str:
+        return self._model_scope
 
     @property
     def marker_ttl(self) -> int:
@@ -316,7 +314,7 @@ class _AutumnKVStore:
     def _key(self, content_hash: str, layer_name: str) -> bytes:
         # kvc/{model}/{pool}/{fmt}/{hash}/{layer}.
         return full_key(
-            self._tenant,
+            self._model_scope,
             f"{_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}",
             VLLM_POOL_NAME,
         )
@@ -503,12 +501,12 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
 
         extra = {}
         block_size = 16
-        tenant_cfg = None
+        scope_cfg = None
         try:
             kt = getattr(vllm_config, "kv_transfer_config", None)
             extra = dict(getattr(kt, "kv_connector_extra_config", None) or {})
             block_size = int(getattr(getattr(vllm_config, "cache_config", None), "block_size", 16) or 16)
-            tenant_cfg = _tenant_cfg_from_vllm(vllm_config)
+            scope_cfg = _model_scope_cfg_from_vllm(vllm_config)
         except Exception as e:  # noqa: BLE001
             log.warning("AutumnKVConnector: partial vllm_config (%r); using defaults", e)
 
@@ -518,35 +516,35 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 "AutumnKVConnector requires 'endpoint' in kv_connector_extra_config"
             )
         self._block_size = block_size
-        # BUG-KVC-TENANT: the tenant MUST carry the model's real identity.
+        # The model scope MUST carry the model's real identity.
         # `model_name` alone is the served path, which is a CONSTANT local dir
         # when one config dir is shared — the fingerprint (arch shape + weights
         # source, see _identity.py) is what actually separates models.
-        fingerprint = getattr(tenant_cfg, "model_fingerprint", None)
-        self._tenant_suffix = build_tenant_suffix(tenant_cfg, fingerprint)
+        fingerprint = getattr(scope_cfg, "model_fingerprint", None)
+        self._model_scope = build_model_scope(scope_cfg, fingerprint)
         if fingerprint is None:
             log.warning(
                 "no model-identity fingerprint derivable from vllm_config — "
-                "tenant %r falls back to the model path only and WILL collide "
+                "model scope %r falls back to the model path only and WILL collide "
                 "if two different models are served with the same path (e.g. "
                 "a fixed config dir shared by several models). Set "
                 "kv_connector_extra_config['model_id'] to disambiguate.",
-                self._tenant_suffix,
+                self._model_scope,
             )
-        identity = getattr(tenant_cfg, "identity_sources", None) or {}
+        identity = getattr(scope_cfg, "identity_sources", None) or {}
         if _VLLM_AVAILABLE and identity and "vllm" not in identity:
             # Should be near-impossible (vLLM imported fine but neither
-            # vllm.__version__ nor package metadata resolved) — but a tenant
+            # vllm.__version__ nor package metadata resolved) — but a scope
             # that silently drops the version source loses cross-version
             # layout isolation, so degrade LOUDLY like the fingerprint path.
             log.warning(
-                "vLLM is importable but its version is undetectable — tenant "
+                "vLLM is importable but its version is undetectable — model scope "
                 "%r carries no vLLM version, so a vLLM upgrade that changes "
                 "the internal KV page layout will NOT invalidate this cache "
                 "(risk: cross-version reads of layout-incompatible KV).",
-                self._tenant_suffix,
+                self._model_scope,
             )
-        self._is_mla = bool(getattr(tenant_cfg, "is_mla_model", False))
+        self._is_mla = bool(getattr(scope_cfg, "is_mla_model", False))
         transport = (extra.get("transport") or "tcp").lower()
         # `ttl_secs` (default 0 = no expiry) bounds how long an offloaded prefix
         # lives in autumn before lazy expiry reclaims it. Content-addressed keys
@@ -566,20 +564,12 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         # extra_config. `auth_credential_file` (path; k8s mounts a Secret) is the
         # ONLY required key — Option 3's credential file carries its principal's
         # NAME, so the identity is self-describing. `auth_principal` overrides
-        # that name for the rare cross-name setup; `auth_tenant` is the retired
-        # spelling, still accepted so an un-migrated config fails loudly-but-
-        # working rather than silently unauthenticated. Required once kvc/ is
+        # that name for the rare cross-name setup. Required once kvc/ is
         # enforcement-enabled; absent = unauthenticated (fine while authz is
         # off). The file read fails at startup rather than as a first-write
         # PermissionDenied mid-inference.
         auth_cred_file = extra.get("auth_credential_file")
         auth_principal = extra.get("auth_principal")
-        if auth_principal is None and extra.get("auth_tenant") is not None:
-            auth_principal = extra["auth_tenant"]
-            log.warning(
-                "kv_connector_extra_config: `auth_tenant` is the retired "
-                "(pre-Option-3) spelling — rename it to `auth_principal`"
-            )
         auth_credential: Optional[bytes] = None
         if auth_cred_file:
             file_principal, auth_credential = _read_credential_pair(auth_cred_file)
@@ -597,7 +587,7 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
             )
         self._store = _AutumnKVStore(
             endpoint,
-            self._tenant_suffix,
+            self._model_scope,
             transport=transport,
             n_workers=max(1, int(extra.get("client_workers", 1))),
             max_inflight=extra.get("max_inflight"),
@@ -633,12 +623,12 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         self._inflight_lock = threading.Lock()
         self._inflight_saves = 0
         log.info(
-            "AutumnKVConnector role=%s tenant=%s block_size=%d vllm=%s identity=%s",
-            role, self._tenant_suffix, self._block_size, _VLLM_AVAILABLE,
-            # The raw identity sources behind the tenant fingerprint — logged
-            # so a tenant collision/mismatch is diagnosable from startup logs
+            "AutumnKVConnector role=%s model_scope=%s block_size=%d vllm=%s identity=%s",
+            role, self._model_scope, self._block_size, _VLLM_AVAILABLE,
+            # The raw identity sources behind the model fingerprint — logged
+            # so a model-scope collision/mismatch is diagnosable from startup logs
             # alone (the fingerprint itself is an opaque hash).
-            getattr(tenant_cfg, "identity_sources", None),
+            getattr(scope_cfg, "identity_sources", None),
         )
 
     # ── scheduler side ──────────────────────────────────────────────────────
@@ -802,23 +792,23 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
                 # re-runs normal prefill (recompute) for them.
                 #
                 # Diagnose by what the config makes POSSIBLE: at ttl=0 expiry is
-                # impossible, so a miss points at a tenant/model identity
-                # collision (a DIFFERENT model wrote this tenant) or a backend
+                # impossible, so a miss points at a model identity collision
+                # (a DIFFERENT model wrote this model scope) or a backend
                 # fault; with a TTL a grace breach is also possible.
                 causes = (
-                    "possible TTL grace breach, tenant/model identity mismatch, "
+                    "possible TTL grace breach, model identity mismatch, "
                     "or backend fault"
                     if self._store.marker_ttl > 0
-                    else "ttl=0 rules out expiry — likely a tenant/model identity "
-                    "mismatch (a DIFFERENT model/engine wrote this tenant) or a "
+                    else "ttl=0 rules out expiry — likely a model identity "
+                    "mismatch (a DIFFERENT model/engine wrote this model scope) or a "
                     "backend fault"
                 )
                 n_missing = sum(1 for ok in oks if not ok) + (len(layer_names) - len(oks))
                 log.warning(
-                    "external KV load miss after positive presence: req=%s tenant=%s "
+                    "external KV load miss after positive presence: req=%s model_scope=%s "
                     "missing=%d/%d layers (prefix partially uncached — %s) — failing "
                     "closed: injecting no KV, re-running prefill for its blocks",
-                    rm.req_id, self._store.tenant, n_missing, len(layer_names), causes,
+                    rm.req_id, self._store.model_scope, n_missing, len(layer_names), causes,
                 )
                 self._load_failed_block_ids.update(rm.block_ids)
                 continue
@@ -948,10 +938,10 @@ class AutumnKVConnector(KVConnectorBase_V1):  # type: ignore[misc]
         return None, None
 
 
-# ── vllm_config → tenant cfg shim ────────────────────────────────────────────
-# Moved to `_identity.tenant_cfg_from_vllm` (imported above as
-# `_tenant_cfg_from_vllm`) so the pure identity/tenant logic is unit-testable
-# without the `autumn` native module or vllm installed (BUG-KVC-TENANT).
+# ── vllm_config → model-scope cfg shim ───────────────────────────────────────
+# Lives in `_identity.model_scope_cfg_from_vllm` (imported above as
+# `_model_scope_cfg_from_vllm`) so the pure identity logic is unit-testable
+# without the `autumn` native module or vllm installed.
 
 
 def _flatten_block_ids(block_ids: Any) -> List[int]:

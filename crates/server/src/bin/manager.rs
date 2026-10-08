@@ -64,9 +64,6 @@ struct Args {
     auth_signing_key_file: Option<String>,
     /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
     cluster_secret_file: Option<std::path::PathBuf>,
-    /// protected (default-DENY) key prefixes, repeatable. `mem/` is
-    /// the default when authz is enabled and none is given.
-    auth_protected_prefixes: Vec<String>,
     /// minted-token TTL in seconds. `None` = library default 3600.
     auth_token_ttl_secs: Option<u64>,
     /// clock-skew leeway in seconds. `None` = library default 60.
@@ -95,7 +92,6 @@ fn parse_args() -> Args {
     let mut audit_retention_days: Option<u64> = None;
     let mut auth_signing_key_file: Option<String> = None;
     let mut cluster_secret_file: Option<std::path::PathBuf> = None;
-    let mut auth_protected_prefixes: Vec<String> = Vec::new();
     let mut auth_token_ttl_secs: Option<u64> = None;
     let mut auth_clock_skew_secs: Option<u64> = None;
     let mut auto_policy_default: Option<String> = None;
@@ -198,10 +194,6 @@ fn parse_args() -> Args {
                 );
                 std::process::exit(2);
             }
-            "--auth-protected-prefix" => {
-                i += 1;
-                auth_protected_prefixes.push(raw[i].clone());
-            }
             "--auth-token-ttl-secs" => {
                 i += 1;
                 auth_token_ttl_secs =
@@ -242,7 +234,6 @@ fn parse_args() -> Args {
         audit_retention_days,
         auth_signing_key_file,
         cluster_secret_file,
-        auth_protected_prefixes,
         auth_token_ttl_secs,
         auth_clock_skew_secs,
         auto_policy_default,
@@ -322,36 +313,13 @@ async fn main() -> Result<()> {
         let keyring = autumn_manager::authz::AuthzKeyring::from_file_contents(&text)
             .map_err(|e| anyhow::anyhow!("parse --auth-signing-key-file {path}: {e}"))?;
         manager.set_authz_keyring(keyring);
-        // Protected prefixes: use the given ones, else default to `mem/`.
-        let prefixes: Vec<Vec<u8>> = if args.auth_protected_prefixes.is_empty() {
-            vec![b"mem/".to_vec()]
-        } else {
-            args.auth_protected_prefixes
-                .iter()
-                .map(|p| p.as_bytes().to_vec())
-                .collect()
-        };
-        manager.set_protected_prefixes(prefixes.clone());
         if let Some(v) = args.auth_token_ttl_secs {
             manager.set_token_ttl_secs(v);
         }
         if let Some(v) = args.auth_clock_skew_secs {
             manager.set_clock_skew_secs(v);
         }
-        tracing::info!(
-            protected_prefixes = ?prefixes
-                .iter()
-                .map(|p| String::from_utf8_lossy(p).into_owned())
-                .collect::<Vec<_>>(),
-            "data-plane authz ENABLED (manager is a KDC)"
-        );
-    } else if !args.auth_protected_prefixes.is_empty() {
-        // Protected prefixes configure data-plane enforcement, which a manager
-        // without a signing key does not run.
-        tracing::warn!(
-            "--auth-protected-prefix given without --auth-signing-key-file; \
-             data-plane authz stays DISABLED (no signing key)"
-        );
+        tracing::info!("data-plane authz ENABLED (manager is a KDC)");
     }
 
     if args.policy_fast_mode {

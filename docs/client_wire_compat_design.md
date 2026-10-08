@@ -271,7 +271,7 @@ properly means giving a cluster peer a way to identify itself, which is a
 different change from this one.
 
 The OPERATOR surface is uncovered by the same kind of decision but for a
-different reason. `MSG_STATUS`, stream/extent info, `namespace_*`, `tenant_*`,
+different reason. `MSG_STATUS`, stream/extent info, `namespace_*`, `principal_*`,
 the op-ledger, autopolicy and `MSG_MULTI_MODIFY_*` are `autumn-op`'s messages,
 and `autumn-op` ships WITH the cluster at the same commit — it is never out of
 window in practice, so maintaining a second window for it buys nothing. What

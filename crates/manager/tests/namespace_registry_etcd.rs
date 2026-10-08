@@ -15,7 +15,7 @@
 //!    follower's config.
 //! 3. After the leader is stopped, a SUCCESSOR leader's `replay_from_etcd`
 //!    rehydrates the full registry: the promoted manager serves fs/kvc/mem/bench
-//!    in `namespaces` and bridges the owned `bench` into `protected_prefixes`.
+//!    in `namespaces` and lists bench's presplit points.
 
 mod support;
 
@@ -60,11 +60,10 @@ fn start_stoppable_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) -> 
     flag
 }
 
-async fn ns_create(mgr: &RpcClient, name: &str, owner: Option<&str>) -> NamespaceCreateResp {
+async fn ns_create(mgr: &RpcClient, name: &str, presplit: Vec<Vec<u8>>) -> NamespaceCreateResp {
     let payload = rkyv_encode(&NamespaceCreateReq {
         name: name.to_string(),
-        owner_tenant: owner.map(|s| s.to_string()),
-        presplit: Vec::new(),
+        presplit,
     });
     let resp = mgr
         .call(MSG_NAMESPACE_CREATE, payload)
@@ -95,13 +94,13 @@ fn bootstrap_persists_leader_gates_and_successor_replay_rehydrates() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
 
-        // ── First leader: bootstrap seeds fs/kvc/mem, admin creates OWNED bench.
+        // ── First leader: bootstrap seeds fs/kvc/mem, admin creates bench.
         let mgr1_addr = pick_addr();
         let mgr1_flag = start_stoppable_etcd_manager(mgr1_addr, etcd_endpoint.clone());
         compio::time::sleep(Duration::from_secs(2)).await;
         let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr1");
 
-        let created = ns_create(&mgr1, "bench", Some("acme")).await;
+        let created = ns_create(&mgr1, "bench", vec![b"bench/m".to_vec()]).await;
         assert_eq!(created.code, CODE_OK, "create failed: {}", created.message);
 
         // The etcd registry rows exist with the expected prefixes.
@@ -113,10 +112,10 @@ fn bootstrap_persists_leader_gates_and_successor_replay_rehydrates() {
             assert!(!got.kvs.is_empty(), "namespace/{name} not persisted to etcd");
         }
 
-        // Leader serves the registry + bridges the owned namespace.
+        // Leader serves the registry.
         let leader_cfg = authz_config(&mgr1).await;
         assert_eq!(leader_cfg.code, CODE_OK, "leader must answer OK");
-        assert!(leader_cfg.protected_prefixes.contains(&b"bench/".to_vec()));
+        assert!(leader_cfg.namespaces.contains(&b"bench/".to_vec()));
 
         // ── Follower: replays at startup but REFUSES to serve the registry.
         let mgr2_addr = pick_addr();
@@ -158,22 +157,12 @@ fn bootstrap_persists_leader_gates_and_successor_replay_rehydrates() {
         ] {
             assert!(cfg.namespaces.contains(&p), "post-replay namespaces missing {p:?}");
         }
-        // Owned bench is bridged; existence-only fs is not.
-        assert!(
-            cfg.protected_prefixes.contains(&b"bench/".to_vec()),
-            "owned namespace not bridged after replay"
-        );
-        assert!(
-            !cfg.protected_prefixes.contains(&b"fs/".to_vec()),
-            "existence-only family should not be protected"
-        );
-
         // Re-creating bench on the successor is rejected (replay saw it).
-        let dup = ns_create(&mgr2, "bench", Some("acme")).await;
+        let dup = ns_create(&mgr2, "bench", Vec::new()).await;
         assert_ne!(dup.code, CODE_OK, "duplicate create should fail after replay");
 
         // MSG_NAMESPACE_LIST over the wire: the promoted leader returns the rich
-        // registry (rehydrated from etcd), with bench's owner carried through.
+        // registry (rehydrated from etcd), with bench's presplit carried through.
         let listed = namespace_list(&mgr2).await;
         assert_eq!(listed.code, CODE_OK);
         let names: Vec<&str> = listed.namespaces.iter().map(|n| n.name.as_str()).collect();
@@ -181,6 +170,6 @@ fn bootstrap_persists_leader_gates_and_successor_replay_rehydrates() {
             assert!(names.contains(&want), "namespace-list missing {want}");
         }
         let bench = listed.namespaces.iter().find(|n| n.name == "bench").unwrap();
-        assert_eq!(bench.owner_tenant.as_deref(), Some("acme"));
+        assert_eq!(bench.presplit, vec![b"bench/m".to_vec()]);
     });
 }

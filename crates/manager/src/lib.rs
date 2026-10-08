@@ -144,11 +144,10 @@ pub const CLUSTER_ID_KEY: &str = "autumn-rs/cluster_id";
 /// per plan §6.4).
 pub const INODE_LEASES_PREFIX: &str = "inode_leases/";
 
-/// etcd prefix for the KDC tenant account DB
-/// (`tenantAccount/<tenant>` → `persist::TenantAccountRecord`). Replayed on leader
-/// failover; the credential HASH is stored, never the raw credential. The
-/// tenant name is a string suffix (percent-encoded segment), not a u64 id.
-pub const TENANT_ACCOUNT_PREFIX: &str = "tenantAccount/";
+/// etcd prefix for the KDC principal account DB
+/// (`principal/<name>` → `persist::PrincipalAccountRecord`). Replayed on leader
+/// failover; the credential HASH is stored, never the raw credential.
+pub const PRINCIPAL_PREFIX: &str = "principal/";
 
 /// D2: etcd prefix for the namespace registry
 /// (`namespace/<name>` → `persist::NamespaceRecord`). Replayed on leader failover;
@@ -158,18 +157,15 @@ pub const TENANT_ACCOUNT_PREFIX: &str = "tenantAccount/";
 pub const NAMESPACE_PREFIX: &str = "namespace/";
 
 /// D2: the built-in namespace families, CAS-preregistered by the first
-/// leader. `owner_tenant = None` (existence-only until an owner is later
-/// assigned), so they are registered but NOT protected out of the box.
+/// leader.
 pub const BUILTIN_NAMESPACES: [&str; 3] = ["fs", "kvc", "mem"];
 
-/// D2: names that `namespace-create` refuses. `fs`/`kvc`/`mem` are the
-/// bootstrap-seeded families (created + non-deletable); `default` is reserved
-/// purely to prevent confusion (it is a conventional TENANT name, never a
-/// namespace — see §3.7③).
-pub const RESERVED_NAMESPACE_NAMES: [&str; 4] = ["fs", "kvc", "mem", "default"];
+/// D2: names that `namespace-create` refuses: the bootstrap-seeded families
+/// (created + non-deletable).
+pub const RESERVED_NAMESPACE_NAMES: [&str; 3] = BUILTIN_NAMESPACES;
 
 /// D2: validate a namespace name — a single path segment matching
-/// `[a-z0-9._-]+` (same charset as the D1 tenant/volume components). Returns the
+/// `[a-z0-9._-]+`. Returns the
 /// reason string on rejection. Pure (unit-tested).
 pub(crate) fn validate_namespace_name(name: &str) -> Result<(), String> {
     if name.is_empty() {
@@ -831,16 +827,14 @@ pub struct AutumnManager {
     /// the entry moves to this queue).
     pub(crate) failed_deletes:
         Rc<RefCell<HashMap<u64, crate::extent_delete::MgrExtentDeleteRetry>>>,
-    /// Etcd-less (memory-only) shadow of the
-    /// fuse-fs inode-allocator counter, keyed PER-VOLUME (the canonicalized
-    /// `fs/{tenant}/{volume}/` prefix; empty key = the legacy global counter).
-    /// In etcd-backed mode the AUTHORITATIVE per-volume counters live at
-    /// `fs_alloc::fs_next_inode_key(volume)` and every grant is a leader-fenced
-    /// CAS txn (this map is unused there); memory-only mode (tests/dev)
-    /// allocates straight from this map. NOT part of `alloc_ids` (note 5):
+    /// Etcd-less (memory-only) shadow of the fuse-fs inode-allocator counter.
+    /// In etcd-backed mode the AUTHORITATIVE counter lives at
+    /// `fs_alloc::FS_NEXT_INODE_KEY` and every grant is a leader-fenced CAS txn
+    /// (this is unused there); memory-only mode (tests/dev) allocates straight
+    /// from here. NOT part of `alloc_ids` (note 5):
     /// that counter numbers stream/extent/partition ENTITIES replayed from
     /// etcd prefixes; inode numbers are fs-layer data with their own key.
-    pub(crate) fs_next_inode: Rc<RefCell<HashMap<Vec<u8>, u64>>>,
+    pub(crate) fs_next_inode: Rc<Cell<u64>>,
     /// Serializes this manager's inode grants (`fs_alloc::alloc_fs_inodes`),
     /// so its own concurrent requests never race each other's CAS.
     pub(crate) fs_alloc_turn: Rc<futures::lock::Mutex<()>>,
@@ -1093,31 +1087,28 @@ pub struct AutumnManager {
     /// material), loaded once from `--auth-signing-key-file`. `None` = authz
     /// disabled (opt-in; fuse/kvcache/dev unaffected). Set at startup only.
     pub(crate) authz_keyring: Rc<RefCell<Option<crate::authz::AuthzKeyring>>>,
-    /// key prefixes under which the PS applies default-DENY (e.g.
-    /// `mem/`). Published in `GET_AUTHZ_CONFIG`. Each ends with `/`.
-    pub(crate) protected_prefixes: Rc<RefCell<Vec<Vec<u8>>>>,
     /// TTL (seconds) minted tokens get. Default 3600 (1 h).
     pub(crate) token_ttl_secs: Rc<Cell<u64>>,
     /// clock-skew leeway (seconds) advertised to the PS. Default 60.
     pub(crate) clock_skew_secs: Rc<Cell<u64>>,
-    /// tenant account DB (etcd `tenantAccount/<tenant>` →
-    /// `persist::TenantAccountRecord`). Replayed on leader failover; mutated only via the
+    /// principal account DB (etcd `principal/<name>` →
+    /// `persist::PrincipalAccountRecord`). Replayed on leader failover; mutated only via the
     /// admin RPCs. Stores the credential HASH, never the raw credential.
-    pub(crate) tenant_accounts: Rc<RefCell<HashMap<String, persist::records::TenantAccountRecord>>>,
-    /// serializes the tenant create/delete critical section
+    pub(crate) principal_accounts: Rc<RefCell<HashMap<String, persist::records::PrincipalAccountRecord>>>,
+    /// serializes the principal create/delete critical section
     /// (build → etcd write → in-memory apply). Handlers are spawned per-frame
-    /// and interleave at the etcd await, and a tenant account's value is a
+    /// and interleave at the etcd await, and an account's value is a
     /// NON-idempotent freshly-generated secret — without this, two concurrent
-    /// same-tenant ops could commit to etcd in one order but apply to memory in
+    /// same-principal ops could commit to etcd in one order but apply to memory in
     /// the other, leaving the live leader's in-memory hash out of sync with
     /// etcd (coco P1). Low-frequency admin path → a global async mutex is free.
-    pub(crate) tenant_admin_lock: Rc<futures::lock::Mutex<()>>,
+    pub(crate) principal_admin_lock: Rc<futures::lock::Mutex<()>>,
     /// D2: namespace registry shadow (etcd `namespace/<name>` →
     /// `persist::NamespaceRecord`). Replayed on leader failover; mutated only via the admin
     /// namespace-create/delete RPCs + `seed_builtin_namespaces`. Keyed by name.
     pub(crate) namespaces: Rc<RefCell<HashMap<String, persist::records::NamespaceRecord>>>,
     /// D2: serializes the namespace create/delete critical section
-    /// (build → etcd write → in-memory apply), mirroring `tenant_admin_lock`.
+    /// (build → etcd write → in-memory apply), mirroring `principal_admin_lock`.
     /// Low-frequency admin path → a global async mutex is free.
     pub(crate) namespace_admin_lock: Rc<futures::lock::Mutex<()>>,
 }
@@ -1177,7 +1168,7 @@ impl AutumnManager {
             topology_held: Rc::new(RefCell::new(HashSet::new())),
             delete_progress: Rc::new(RefCell::new(HashMap::new())),
             failed_deletes: Rc::new(RefCell::new(HashMap::new())),
-            fs_next_inode: Rc::new(RefCell::new(HashMap::new())),
+            fs_next_inode: Rc::new(Cell::new(0)),
             fs_alloc_turn: Rc::new(futures::lock::Mutex::new(())),
             runtime_started: Rc::new(Cell::new(false)),
             serving: Rc::new(Cell::new(false)),
@@ -1231,11 +1222,10 @@ impl AutumnManager {
             ))),
             // authz OFF unless the binary loads a signing-key file.
             authz_keyring: Rc::new(RefCell::new(None)),
-            protected_prefixes: Rc::new(RefCell::new(Vec::new())),
             token_ttl_secs: Rc::new(Cell::new(3600)),
             clock_skew_secs: Rc::new(Cell::new(60)),
-            tenant_accounts: Rc::new(RefCell::new(HashMap::new())),
-            tenant_admin_lock: Rc::new(futures::lock::Mutex::new(())),
+            principal_accounts: Rc::new(RefCell::new(HashMap::new())),
+            principal_admin_lock: Rc::new(futures::lock::Mutex::new(())),
             // D2: empty; populated by replay / admin RPCs /
             // seed_builtin_namespaces on leader promotion.
             namespaces: Rc::new(RefCell::new(HashMap::new())),
@@ -1267,17 +1257,6 @@ impl AutumnManager {
     /// `--auth-signing-key-file`). Its presence ENABLES data-plane authz.
     pub fn set_authz_keyring(&self, keyring: crate::authz::AuthzKeyring) {
         *self.authz_keyring.borrow_mut() = Some(keyring);
-    }
-
-    /// set the protected (default-DENY) key prefixes
-    /// (`--auth-protected-prefix`, repeatable). Each is normalized to end `/`.
-    pub fn set_protected_prefixes(&self, mut prefixes: Vec<Vec<u8>>) {
-        for p in &mut prefixes {
-            if p.last() != Some(&b'/') {
-                p.push(b'/');
-            }
-        }
-        *self.protected_prefixes.borrow_mut() = prefixes;
     }
 
     /// set the minted-token TTL in seconds. Clamped to
@@ -2877,7 +2856,7 @@ impl AutumnManager {
     /// (`fs`/`kvc`/`mem`). Runs on every leader promotion (after replay), same
     /// idempotent best-effort shape as `imprint_cluster_id`: a family already in
     /// the registry (loaded by replay or seeded by a prior leader) is left
-    /// untouched so an owner assigned later survives. Memory-only mode inserts
+    /// untouched so its recorded presplit survives. Memory-only mode inserts
     /// directly into the in-mem shadow.
     async fn seed_builtin_namespaces(&self) -> Result<(), AppError> {
         for name in BUILTIN_NAMESPACES {
@@ -2888,8 +2867,6 @@ impl AutumnManager {
             let row = persist::records::NamespaceRecord {
                 name: name.to_string(),
                 prefix: format!("{name}/").into_bytes(),
-                // Existence-only until an owner is explicitly assigned.
-                owner_tenant: None,
                 presplit: Vec::new(),
                 created_at: 0,
             };
@@ -3116,8 +3093,8 @@ impl AutumnManager {
         let cluster_id_kv = c.get(CLUSTER_ID_KEY.as_bytes()).await?;
         // Persisted writer leases.
         let inode_leases_raw = c.get_prefix(INODE_LEASES_PREFIX).await?;
-        // persisted tenant account DB.
-        let tenant_account_raw = c.get_prefix(TENANT_ACCOUNT_PREFIX).await?;
+        // persisted principal account DB.
+        let principal_raw = c.get_prefix(PRINCIPAL_PREFIX).await?;
         // D2: persisted namespace registry.
         let namespace_raw = c.get_prefix(NAMESPACE_PREFIX).await?;
         // M2: auto-policy controller config + cooldowns (single keys)
@@ -3247,31 +3224,31 @@ impl AutumnManager {
             "decommissioned",
             &mut self.decommissioned.borrow_mut(),
         )?;
-        // replay the KDC tenant account DB. String-keyed (tenant
+        // replay the KDC principal account DB. String-keyed (principal
         // name), so we can't use replay_node_override_map (u64 id); mirror the
         // ownerLocks/ inline pattern. A malformed account is fail-loud (a bad
         // authz record must not silently start the KDC half-armed — it would
-        // let a tenant that should have prefixes mint with none / stale ones).
+        // let a principal that should have prefixes mint with none / stale ones).
         {
-            let mut accts = self.tenant_accounts.borrow_mut();
+            let mut accts = self.principal_accounts.borrow_mut();
             accts.clear();
-            for kv in &tenant_account_raw.kvs {
+            for kv in &principal_raw.kvs {
                 let raw = str::from_utf8(&kv.key)
-                    .map_err(|e| anyhow::anyhow!("non-utf8 tenantAccount key: {e}"))?;
-                let tenant = raw
-                    .strip_prefix(TENANT_ACCOUNT_PREFIX)
-                    .ok_or_else(|| anyhow::anyhow!("invalid tenantAccount key: {raw}"))?
+                    .map_err(|e| anyhow::anyhow!("non-utf8 principal key: {e}"))?;
+                let name = raw
+                    .strip_prefix(PRINCIPAL_PREFIX)
+                    .ok_or_else(|| anyhow::anyhow!("invalid principal key: {raw}"))?
                     .to_string();
-                let acct: persist::records::TenantAccountRecord =
+                let acct: persist::records::PrincipalAccountRecord =
                     persist::decode(raw, &kv.value).map_err(Self::replay_decode_err)?;
-                accts.insert(tenant, acct);
+                accts.insert(name, acct);
             }
         }
         // D2: replay the namespace registry. String-keyed (namespace
-        // name), so mirror the tenantAccount/ inline pattern above. A malformed
+        // name), so mirror the principal/ inline pattern above. A malformed
         // row is fail-loud (note 39): a bad registry record must not silently
-        // start the manager with a half-populated namespace set — Layer-A / the
-        // authz bridge would then act on it. Fail-loud covers BOTH (a) rkyv
+        // start the manager with a half-populated namespace set — Layer-A would
+        // then act on it. Fail-loud covers BOTH (a) rkyv
         // decode failure AND (b) SEMANTIC corruption — the etcd key suffix, the
         // stored `row.name`, and the stored `row.prefix` must all agree and obey
         // the namespace naming rules; otherwise `handle_get_authz_config` could

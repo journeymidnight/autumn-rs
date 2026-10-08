@@ -1,19 +1,18 @@
-"""Shared key-namespace + tenant-suffix helpers for autumn-kvcache adapters.
+"""Shared key-namespace + model-scope helpers for autumn-kvcache adapters.
 
 Both the sglang HiCache L3 backend (`sglang_backend.py`) and the vLLM
 `KVConnectorV1` adapter (`vllm_connector.py`) map an inference engine's KV
 pages into the SAME autumn keyspace:
 
-    kvc/{tenant_suffix}/{pool}/{content_hash}
+    kvc/{model_scope}/{pool}/{content_hash}
 
 - `kvc/`           — reserved namespace, distinguishes kvcache keys from
                      autumn-fuse / autumn-client keys on the shared cluster.
-- `tenant_suffix`  — `(model, model_fingerprint, tp_rank, tp_size, pp_rank,
+- `model_scope`    — `(model, model_fingerprint, tp_rank, tp_size, pp_rank,
                      pp_size)` scoping so two models / parallel ranks never
-                     collide. The fingerprint (BUG-KVC-TENANT, `_identity.py`)
-                     exists because the model *path* alone is NOT an identity:
-                     A deployment that serves every model from
-                     the same fixed local config dir.
+                     collide. The fingerprint (`_identity.py`) exists because
+                     the model *path* alone is NOT an identity: a deployment
+                     may serve every model from the same fixed local config dir.
 - `pool`           — `kv` for sglang, `vllm` for the vLLM connector (separate
                      keyspaces; also the v2 multi-pool reservation slot).
 - `content_hash`   — the engine's own content-addressed hash (sglang chain hash
@@ -28,8 +27,8 @@ from __future__ import annotations
 KEY_NAMESPACE = "kvc"
 
 # The vLLM connector's OWN storage-format / KV-layout version. It is baked
-# into every vLLM-pool key (`kvc/{tenant}/vllm/{THIS}/{hash}/{layer}`, see
-# `_AutumnKVStore._key`) AND folded into the tenant fingerprint
+# into every vLLM-pool key (`kvc/{model_scope}/vllm/{THIS}/{hash}/{layer}`, see
+# `_AutumnKVStore._key`) AND folded into the model fingerprint
 # (`_identity.vllm_identity_sources`), so bumping it makes every old entry
 # unreachable twice over — old bytes can NEVER be loaded by an incompatible
 # newer connector under the same content hash; they just stop matching and
@@ -40,9 +39,9 @@ KEY_NAMESPACE = "kvc"
 # scheme changes. Concretely: any change to `vllm_connector._extract_layer` /
 # `_inject_layer` (the serialize/deserialize pair — e.g. the 2026-06-22
 # K/V-dim-order fix), to `_byte_view`, or to how keys are composed. Changing
-# that layout WITHOUT bumping = same failure class as BUG-KVC-TENANT: shapes
-# may still line up, nothing errors, output is silently garbage.
-# `test_tenant_identity.py` pins the current value so a bump is always a
+# that layout WITHOUT bumping = same failure class as two models sharing one
+# scope: shapes may still line up, nothing errors, output is silently garbage.
+# `test_model_identity.py` pins the current value so a bump is always a
 # deliberate, reviewed act (it cold-invalidates the whole vLLM pool).
 #
 # Lives here (not in `vllm_connector.py`, which imports the `autumn` native
@@ -53,7 +52,7 @@ VLLM_KV_STORAGE_FORMAT = "v1"
 def _rank_int(cfg, attr: str, default: int) -> int:
     """Read a rank/size attribute as an int, failing loudly on garbage.
 
-    The values are f-string'd straight into the tenant suffix, i.e. into every
+    The values are f-string'd straight into the model scope, i.e. into every
     KV key. A duck-typed config sourced from JSON/env can hand us `"2"`, which
     used to blow up at the `pp_size > 1` comparison with a bare `TypeError`
     (`'>' not supported between 'str' and 'int'`) — from inside key
@@ -70,13 +69,13 @@ def _rank_int(cfg, attr: str, default: int) -> int:
         return int(v)
     except (TypeError, ValueError):
         raise ValueError(
-            f"build_tenant_suffix: {attr}={v!r} is not an integer — it would be "
+            f"build_model_scope: {attr}={v!r} is not an integer — it would be "
             f"stamped into every KV key for this model"
         ) from None
 
 
-def build_tenant_suffix(cfg, model_fingerprint=None) -> str:
-    """Build the per-tenant key suffix from a model/parallel config.
+def build_model_scope(cfg, model_fingerprint=None) -> str:
+    """Build the per-model key scope from a model/parallel config.
 
     Mirrors sglang's `HiCacheFile._get_suffixed_key`
     (docs/hicache_l3_interface.md:207-209). Accepts any object exposing the
@@ -87,14 +86,14 @@ def build_tenant_suffix(cfg, model_fingerprint=None) -> str:
     `_{tp_rank}_{tp_size}` (skipped for MLA models, whose KV is
     rank-independent) then `_pp{pp_rank}_{pp_size}` (only if pp_size > 1).
 
-    `model_fingerprint` (BUG-KVC-TENANT, see `_identity.py`) carries the
+    `model_fingerprint` (see `_identity.py`) carries the
     model's REAL identity (architecture shape + weights source). It is
     REQUIRED on the vLLM connector path, where `model_name` is just the local
     config-dir path, which is constant across models when one config dir is shared
-    — without it two different models silently share one tenant and cross-read
+    — without it two different models silently share one scope and cross-read
     KV (live incident: Qwen2.5-7B/32B both under `model-cfg_0_1`). When None
     (sglang default, or an unfingerprintable config) the format is exactly the
-    pre-fingerprint one, so existing sglang tenants are unchanged.
+    pre-fingerprint one, so existing sglang model scopes are unchanged.
     """
     if cfg is None:
         return "default"
@@ -127,9 +126,8 @@ def full_key(model: str, content_hash: str, pool: str) -> bytes:
     construction and the builder must emit only the RELATIVE part →
     ``{model}/{pool}/{content_hash}`` (the full wire key becomes
     ``kvc/{model}/{pool}/{content_hash}``). ``model`` is the per-model instance
-    suffix (arch + weights fingerprint + tp/pp — what ``build_tenant_suffix``
-    returns). The old ``{tenant}`` segment is GONE: Option 3 dropped tenants, so
-    the leading positional arg was removed rather than left ignored.
+    scope (arch + weights fingerprint + tp/pp — what ``build_model_scope``
+    returns).
     """
     return f"{model}/{pool}/{content_hash}".encode("utf-8")
 

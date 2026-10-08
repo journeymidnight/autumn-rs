@@ -34,7 +34,7 @@ other.
 ### 2.1 On-disk layout (`crates/fuse/src/{key,schema,geom}.rs` — un-feature-gated)
 
 Keys below are RELATIVE; the client prepends the `fs/` namespace (one global
-tree, no tenant/volume segment — `FsState` connects with `scoped("fs")`).
+tree — `FsState` connects with `scoped("fs")`).
 
 | prefix | key | value |
 |---|---|---|
@@ -199,7 +199,7 @@ no Python-side reimplementation to drift.
 ## 6. Inode allocation
 
 Inode numbers come from the manager, not from a client-side counter:
-`ClusterClient::alloc_inodes(count, floor, volume)` → `MSG_ALLOC_INODES`
+`ClusterClient::alloc_inodes(count, floor)` → `MSG_ALLOC_INODES`
 (`0x53`) → `crates/manager/src/fs_alloc.rs`.
 
 - The authoritative counter is the etcd key `autumn-rs/fs/next_inode` (strict
@@ -217,11 +217,10 @@ Inode numbers come from the manager, not from a client-side counter:
   replayed from etcd prefixes); inode numbers are fs-layer data with their own
   key.
 
-`AllocInodesReq.volume` is frozen into the wire but **dormant**: the fuse layer
-passes an empty volume, so there is a single global counter. The lease/fence
-plane keys on the bare ino, so per-volume inode numbers would collide across
-volumes and produce cross-volume write-lease conflicts. Isolation between trees
-comes from the namespace prefix, not the inode number.
+There is a single global counter because the lease/fence plane keys on the bare
+ino: inode numbers must be cluster-unique. `AllocInodesReq.volume` stays on the
+frozen client wire but must be empty (the manager refuses anything else).
+Isolation between trees comes from the namespace prefix, not the inode number.
 
 ---
 

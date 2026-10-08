@@ -868,8 +868,7 @@ pub struct SplitPartReq {
     /// the partition's authoritative `(start_key, end_key)` interval and uses
     /// it verbatim as `mid_key`, SKIPPING both median selection AND the
     /// `>= 2 keys` gate — so an empty / near-empty partition can be split
-    /// (the D8 per-(namespace,tenant) presplit primitive: cut an empty pair
-    /// into empty children). The key is an ARBITRARY byte string; the PS is
+    /// (the presplit primitive: cut an empty range into empty children). The key is an ARBITRARY byte string; the PS is
     /// app-agnostic (D5) — it never inspects namespace/prefix structure.
     /// `None` = legacy behaviour (median-by-key-count over live user keys,
     /// which still enforces `>= 2 keys`).

@@ -30,8 +30,8 @@ data:
   # that Secret is actually mounted (entrypoint `-s` gate), so a cluster deployed
   # WITHOUT the Secret — or with AUTUMN_AUTH_DISABLE="1" — runs authz-OFF.
   # Clients pass the minted credential via --credential-file (see k8s_deploy.md).
-  # TENANT-FIRST + PROTECT-EVERYTHING: the signing key alone arms enforcement of
-  # EVERY tenant-scoped write; there is no protected-prefix list to set.
+  # PROTECT-EVERYTHING: the signing key alone arms enforcement of EVERY keyed
+  # op; there is no protected-prefix list to set.
   AUTUMN_AUTH_SIGNING_KEY_FILE: "/etc/autumn/authz/signing.key"
   # Escape hatch (dev/test): AUTUMN_AUTH_DISABLE: "1"
   # EC + replication defaults follow cluster.sh (auto by node count). To force:

@@ -133,14 +133,16 @@ autumn-op --cluster-secret-file ~/.autumn-deploy/cluster.secret --manager $M inf
 signing key under `~/.autumn-deploy/authz/` (override with
 `AUTUMN_AUTHZ_DIR`) — **once, reused across re-deploys** so already-minted
 credentials keep working — distributes the key to every manager host, and after
-bootstrap mints a `default`-tenant credential (granting the whole tenant
-`default/`) to `~/.autumn-deploy/authz/default.cred`. With authz on, EVERY
-tenant-scoped write needs a token (protect-everything; the key layout is
-`{tenant}/{namespace}/`). Point clients at the credential:
+bootstrap mints one principal per namespace family — `fs` (grant `fs/`) →
+`~/.autumn-deploy/authz/fs.cred`, `kvc` (grant `kvc/`) → `kvc.cred` — as two-line
+`principal:`/`credential:` files. A file that still mints on this cluster is kept;
+a stale one is re-provisioned. With authz on, EVERY keyed op needs a token
+(protect-everything; keys are `{namespace}/…`). Point clients at the credential:
 
 ```bash
-autumnfs   --manager $M --credential-file ~/.autumn-deploy/authz/default.cred put F /F
-autumn-fuse --manager $M --credential-file ~/.autumn-deploy/authz/default.cred --mountpoint /mnt/x
+autumnfs   --manager $M --credential-file ~/.autumn-deploy/authz/fs.cred put F /F
+autumn-fuse --manager $M --credential-file ~/.autumn-deploy/authz/fs.cred --mountpoint /mnt/x
+# kvcache: extra_config auth_credential_file=~/.autumn-deploy/authz/kvc.cred
 ```
 
 Override `AUTUMN_AUTH_SIGNING_KEY_FILE` to bring your own key (then you own

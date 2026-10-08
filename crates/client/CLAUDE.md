@@ -31,8 +31,8 @@ KV operations, batching, namespace binding, region routing, zero-copy, and maint
 ## Namespace binding
 
 Every `ClusterClient` carries a `NamespaceBinding` that maps user keys onto wire keys
-BEFORE routing, so a client can only touch its own `{scope}/` keyspace. **There is NO
-tenant segment** — a `scope` is a whole namespace (`fs`, `gallery`) or an in-namespace
+BEFORE routing, so a client can only touch its own `{scope}/` keyspace. A `scope` is a
+whole namespace (`fs`, `gallery`) or an in-namespace
 sub-prefix an app owns (`mem/agent7`). See `docs/key_namespace_split_design.md` §8.
 
 Constructors:

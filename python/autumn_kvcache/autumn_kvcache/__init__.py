@@ -5,7 +5,7 @@ See docs/autumn_kvcache_plan.md for architecture and rationale (§4 sglang, §13
 The adapter classes are re-exported LAZILY (PEP 562): both submodules import
 the `autumn` native module at import time, but the pure helpers
 (`_keys`, `_identity`) must stay importable — and unit-testable — in
-environments without the PyO3 build (BUG-KVC-TENANT offline tests). Engines
+environments without the PyO3 build (the offline identity tests). Engines
 plug in via the submodule paths (`autumn_kvcache.sglang_backend` /
 `autumn_kvcache.vllm_connector`) anyway, so nothing relies on eager imports
 here.

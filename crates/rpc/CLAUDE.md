@@ -555,7 +555,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **48**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **59**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -900,6 +900,16 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## Principal admin ops, ownerless namespaces (wire 59)
+
+`MSG_PRINCIPAL_CREATE` / `MSG_PRINCIPAL_DELETE` keep opcodes 0x51 / 0x52 with
+`PrincipalCreateReq/Resp` / `PrincipalDeleteReq` (field `principal`).
+`MgrNamespace` and `NamespaceCreateReq` have no owner; `GetAuthzConfigResp`
+has no protected-prefix list (its key set is public keys + registered namespaces).
+All Admin/Peer: the ceiling rises to [43, 59], the floor stays.
+`AllocInodesReq.volume` stays on the frozen client surface; the manager refuses
+a non-empty one.
 
 ## No health verdict (wire 58)
 

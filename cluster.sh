@@ -733,27 +733,16 @@ launch_manager() {
     # with no env set, no flags are passed and authz stays OFF (zero impact on
     # every existing flow: perf_check, chaos, fuse, kvcache). To enable:
     #   AUTUMN_AUTH_SIGNING_KEY_FILE=/path/key   (generate: autumn-op gen-signing-key)
-    #   AUTUMN_AUTH_PROTECTED_PREFIXES=mem/      (comma-separated; default mem/)
     #   AUTUMN_AUTH_TOKEN_TTL_SECS=3600          (optional)
     if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
         [[ -r "$AUTUMN_AUTH_SIGNING_KEY_FILE" ]] \
             || die "AUTUMN_AUTH_SIGNING_KEY_FILE '$AUTUMN_AUTH_SIGNING_KEY_FILE' is not readable"
         mgr_extra="$mgr_extra --auth-signing-key-file $AUTUMN_AUTH_SIGNING_KEY_FILE"
-        if [[ -n "${AUTUMN_AUTH_PROTECTED_PREFIXES:-}" ]]; then
-            local _pfx
-            for _pfx in ${AUTUMN_AUTH_PROTECTED_PREFIXES//,/ }; do
-                mgr_extra="$mgr_extra --auth-protected-prefix $_pfx"
-            done
-        fi
         if [[ -n "${AUTUMN_AUTH_TOKEN_TTL_SECS:-}" ]]; then
             [[ "$AUTUMN_AUTH_TOKEN_TTL_SECS" =~ ^[0-9]+$ ]] \
                 || die "AUTUMN_AUTH_TOKEN_TTL_SECS must be a non-negative integer (got '$AUTUMN_AUTH_TOKEN_TTL_SECS')"
             mgr_extra="$mgr_extra --auth-token-ttl-secs $AUTUMN_AUTH_TOKEN_TTL_SECS"
         fi
-    elif [[ -n "${AUTUMN_AUTH_PROTECTED_PREFIXES:-}" ]]; then
-        # The protected-prefix list configures DATA-plane authz, which needs a
-        # signing key.
-        die "AUTUMN_AUTH_PROTECTED_PREFIXES set without AUTUMN_AUTH_SIGNING_KEY_FILE — data-plane authz needs a signing key (autumn-op gen-signing-key)"
     fi
     start_proc manager \
         "$MANAGER" --port 9001 --manager-id 1 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
@@ -1101,14 +1090,14 @@ do_start() {
     {
         "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
             namespace-create --name bench >/dev/null 2>&1 || true
-        # Presplit the bench namespace RELATIVE to `bench/perf/` so the cut points
+        # Presplit the bench scope `bench/perf/` so the cut points
         # are where the bench keys actually are. The retired bootstrap presplit cut
         # raw hex points that `bench_user_starts` filtered out entirely, so every
         # `--partitions N` run silently measured one partition.
         local _bp="${AUTUMN_BOOTSTRAP_PRESPLIT:-}"; local _bparts="${_bp%%:*}"
         if [[ "$_bparts" =~ ^[0-9]+$ ]] && (( _bparts > 1 )); then
             "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
-                presplit --namespace bench --tenant perf --count "$_bparts" \
+                presplit --namespace bench/perf --count "$_bparts" \
                 || echo "[cluster] warning: bench presplit into $_bparts failed (bench will use 1 partition)"
             wait_ps_ready 120
         fi
@@ -1119,8 +1108,7 @@ do_start() {
         local _ao=( "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" )
         "${_ao[@]}" namespace-create --name gallery >/dev/null 2>&1 || true
         local _spec _p _grant _out
-        # (§8.8): per-family principals (NS-FIRST keys, no
-        # tenant segment). Each app uses its own credential = least privilege by
+        # (§8.8): per-family principals. Each app uses its own credential = least privilege by
         # default (no all-ns master key). Cred file = two-line `principal:`/
         # `credential:` form (read_credential_file carries the name).
         #   fs/  → fuse mount / autumnfs        kvc/ → kvcache loader

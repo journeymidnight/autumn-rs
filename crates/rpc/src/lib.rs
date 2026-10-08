@@ -110,7 +110,7 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// Bump it on every wire change. There is no separate "oldest cluster peer"
 /// constant: peers compare for EQUALITY, so a floor pinned to this value would
 /// say nothing.
-pub const WIRE_VERSION: u32 = 58;
+pub const WIRE_VERSION: u32 = 59;
 
 /// The oldest CLIENT this binary serves — the floor of the client window
 /// `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`.
@@ -336,8 +336,8 @@ mod admin_op_tests {
         assert!(is_admin_mgr_msg(MSG_MERGE_PARTITIONS));
         assert!(is_admin_mgr_msg(MSG_CREATE_STREAM));
         // Account and namespace mutations are operator-only too.
-        assert!(is_admin_mgr_msg(MSG_TENANT_CREATE));
-        assert!(is_admin_mgr_msg(MSG_TENANT_DELETE));
+        assert!(is_admin_mgr_msg(MSG_PRINCIPAL_CREATE));
+        assert!(is_admin_mgr_msg(MSG_PRINCIPAL_DELETE));
         assert!(is_admin_mgr_msg(MSG_NAMESPACE_CREATE));
         assert!(is_admin_mgr_msg(MSG_NAMESPACE_DELETE));
         assert!(is_admin_mgr_msg(MSG_NAMESPACE_SET_PRESPLIT));
@@ -452,7 +452,7 @@ mod wire_version_tests {
         assert!(client_compat_check(3, 2).is_err());
     }
 
-    /// The window is OPEN: `[43, 58]`, opened by raising the CEILING and
+    /// The window is OPEN: `[43, 59]`, opened by raising the CEILING and
     /// widened by `MSG_GET_CLIENT_REGIONS`, `MSG_COMPARE_WRITE` and the new
     /// lease modes (later bumps changed only cluster-internal forms).
     ///
@@ -465,7 +465,7 @@ mod wire_version_tests {
     #[test]
     fn the_client_window_is_open_and_the_floor_is_where_it_belongs() {
         assert_eq!(MIN_CLIENT_WIRE_VERSION, 43, "read this test's comment");
-        assert_eq!(WIRE_VERSION, 58, "read this test's comment");
+        assert_eq!(WIRE_VERSION, 59, "read this test's comment");
     }
 
     /// The check that actually decides whether a stale SERVER joins is the one

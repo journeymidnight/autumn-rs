@@ -22,8 +22,7 @@
 //!
 //! Paths are `/`-separated; leading `/` is optional. ROOT_INO = 1.
 //!
-//! `autumnfs` connects SCOPED to the WHOLE `fs/` namespace
-//! (no `--tenant` — Option 3 dropped it) so its keys land in the SAME keyspace a
+//! `autumnfs` connects SCOPED to the WHOLE `fs/` namespace so its keys land in the SAME keyspace a
 //! fuse mount uses — a write here is visible to a mount, and vice versa. Inode
 //! numbers come from the MANAGER's
 //! crash-safe GLOBAL counter (`alloc_inodes`), the same source the fuse mount +
@@ -65,8 +64,8 @@ struct Args {
     /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED when the
     /// cluster protects the `fs/` namespace; omit on an authz-off cluster. Connects
     /// via `connect_with_credential` (principal read from the file) and FAILS FAST
-    /// if it doesn't cover `fs/`. (No tenant segment — this
-    /// CLI sees the WHOLE `fs/` namespace, same as a mount.)
+    /// if it doesn't cover `fs/`. This CLI sees the WHOLE `fs/` namespace, same
+    /// as a mount.
     #[arg(long)]
     credential_file: Option<PathBuf>,
 
@@ -260,7 +259,7 @@ async fn resolve_parent_leaf(
 /// pre-SD-3 racy non-CAS get/put on the `next_inode` KV counter.
 async fn alloc_inode(cluster: &ClusterClient) -> Result<u64> {
     cluster
-        .alloc_inodes(1, 0, b"")
+        .alloc_inodes(1, 0)
         .await
         .map_err(|e| anyhow!("alloc_inodes from manager: {e}"))
 }
@@ -968,8 +967,7 @@ async fn publish_file(
 ///   * any lookup error degraded to `lanes = 1`, so one transient manager blip
 ///     produced a permanently single-partition 41 GB file whose only symptom was
 ///     bad throughput. `read_stripe_geom` propagates instead;
-///   * it hardcoded the wire prefix `b"fs/"` in a CLI, a byte string that has
-///     already changed twice (tenant-first, then Option 3).
+///   * it hardcoded the wire prefix `b"fs/"` in a CLI.
 async fn declared_stripe_geom(cluster: &ClusterClient) -> Result<StripeLayout> {
     autumn_fs::geom::read_stripe_geom(cluster).await
 }

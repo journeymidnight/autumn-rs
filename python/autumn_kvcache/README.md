@@ -11,7 +11,7 @@ layer. Two adapters, one data plane (`autumn.BatchClient` + the sync/async
 
 There is **no daemon and no local DRAM cache** — the autumn partition layer is
 the only persistence path. KV pages are content-addressed
-(`kvc/{tenant}/{pool}/{hash}/{layer}`), so there is no invalidation.
+(`kvc/{model_scope}/{pool}/{hash}/{layer}`), so there is no invalidation.
 
 ## Install
 
@@ -115,9 +115,9 @@ background**: a prefix already durable in autumn is neither re-copied nor
 re-written, so a repeated prompt (served by the local GPU cache) costs no storage
 and no extra latency.
 
-### Tenant isolation: the model's real identity is part of the key
+### Model-scope isolation: the model's real identity is part of the key
 
-The tenant segment of every key is
+The model-scope segment of every key is
 `{model}_{fingerprint}_{tp_rank}_{tp_size}[...]`, where `fingerprint` is a
 short hash of the model's **identity**: architecture shape
 (layers / hidden / kv-heads / head-size / vocab / dtype / quantization / MLA)
@@ -131,8 +131,8 @@ layout changes).
 
 This exists because the model *path* is not an identity: with
 a shared config dir, every model is served from the same fixed local config
-dir, so two different models used to share one tenant and cross-read each
-other's KV (observed live: Qwen2.5-7B and 32B under one tenant; a same-shape
+dir, so two different models used to share one model scope and cross-read each
+other's KV (observed live: Qwen2.5-7B and 32B under one model scope; a same-shape
 pair would have been silently wrong). Set
 `kv_connector_extra_config["model_id"]` when even the fingerprint can't
 distinguish your deployments — e.g. two finetunes with identical architecture
@@ -140,15 +140,15 @@ loaded from the **same** path, or weights overwritten in place at one autumn
 path (don't do that — store new weights at a new path).
 
 > **Upgrade note:** any change to the fingerprint inputs — **including every
-> vLLM version change, patch releases too** — moves the tenant, so the whole
+> vLLM version change, patch releases too** — moves the model scope, so the whole
 > vLLM pool goes cold and rebuilds on first use (pure cache, content-addressed
 > — no migration needed). This is deliberate: an upgrade already restarts the
 > pods (GPU cache is lost anyway), so the re-warm is a one-time, predictable
 > cost, whereas carrying KV across a layout-incompatible vLLM would be silent
-> garbage. Keys written by older connectors stay behind under the old tenant;
+> garbage. Keys written by older connectors stay behind under the old model scope;
 > with `ttl_secs=0` they never expire, so reclaim them manually if you care
-> about the space: `client.batch_delete(b"kvc/<old-tenant>/vllm/")` (the old
-> tenant is in the previous deployment's startup log).
+> about the space: `client.batch_delete(b"kvc/<old-model-scope>/vllm/")` (the
+> old model scope is in the previous deployment's startup log).
 
 **`ttl_secs`** (default `0` = no expiry) is the relative TTL after which an
 offloaded prefix stops being *served*. Content-addressed keys never invalidate,
@@ -215,9 +215,9 @@ AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 AUTUMN_KVCACHE_TRANSPORT=tcp \
   shorter than its layers' (see above) to preserve load correctness.
 - **Return fast** — never block past the engine's step budget; the load path is
   synchronous in Phase 3a (per-layer overlap is Phase 3b).
-- **Tenant isolation** — keys carry a tenant suffix derived from model +
+- **Model-scope isolation** — keys carry a model scope derived from model +
   model-identity fingerprint (`_identity.py`) + TP/PP, so different models /
-  parallel layouts never alias. The sglang tenant format is unchanged
+  parallel layouts never alias. The sglang model-scope format is unchanged
   (`model_name` is a real identity there); its escape hatch is
   `extra_config["model_id"]`.
 - See `docs/autumn_kvcache_plan.md` §13 for the full design.
@@ -225,5 +225,5 @@ AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 AUTUMN_KVCACHE_TRANSPORT=tcp \
 ## Offline unit tests (no cluster, no engine, no native module)
 
 ```bash
-cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_tenant_identity.py -q
+cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_model_identity.py -q
 ```

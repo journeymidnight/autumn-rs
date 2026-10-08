@@ -30,7 +30,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 use super::{
     PersistRecord, RECORD_TYPE_AUDIT, RECORD_TYPE_DISK, RECORD_TYPE_NAMESPACE,
     RECORD_TYPE_EXTENT, RECORD_TYPE_MEMBER, RECORD_TYPE_NODE, RECORD_TYPE_PARTITION,
-    RECORD_TYPE_REGION, RECORD_TYPE_STREAM, RECORD_TYPE_TENANT_ACCOUNT,
+    RECORD_TYPE_REGION, RECORD_TYPE_STREAM, RECORD_TYPE_PRINCIPAL_ACCOUNT,
 };
 
 // ── audit log ───────────────────────────────────────────────────────────────
@@ -107,9 +107,9 @@ impl From<&AuditRecord> for MgrAuditEntry {
     }
 }
 
-// ── tenant accounts ─────────────────────────────────────────────────────────
+// ── principal accounts ──────────────────────────────────────────────────────
 
-/// `tenantAccount/<tenant>` — the authz principal DB.
+/// `principal/<name>` — the authz principal DB.
 ///
 /// This record has **no wire twin at all**, and that is deliberate rather than
 /// an omission: `PrincipalListResp` carries a `PrincipalRow` precisely so that
@@ -117,19 +117,19 @@ impl From<&AuditRecord> for MgrAuditEntry {
 /// credential. So there is no conversion below — nothing outside the manager
 /// has any business holding one of these.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub(crate) struct TenantAccountRecord {
-    pub tenant: String,
-    /// SHA-256 of the tenant's permanent credential. Verified constant-time at
+pub(crate) struct PrincipalAccountRecord {
+    pub principal: String,
+    /// SHA-256 of the principal's permanent credential. Verified constant-time at
     /// mint time; the raw credential is never stored.
     pub credential_hash: [u8; 32],
-    /// Key prefixes this tenant may access. Each MUST end with `b'/'`.
+    /// Key prefixes this principal may access. Each MUST end with `b'/'`.
     pub allowed_prefixes: Vec<Vec<u8>>,
 }
 
-impl PersistRecord for TenantAccountRecord {
-    const RECORD_TYPE: u8 = RECORD_TYPE_TENANT_ACCOUNT;
+impl PersistRecord for PrincipalAccountRecord {
+    const RECORD_TYPE: u8 = RECORD_TYPE_PRINCIPAL_ACCOUNT;
     const FORMAT_VERSION: u8 = 1;
-    const NAME: &'static str = "tenantAccount";
+    const NAME: &'static str = "principal";
 }
 
 // ── namespace registry ──────────────────────────────────────────────────────
@@ -139,8 +139,6 @@ impl PersistRecord for TenantAccountRecord {
 pub(crate) struct NamespaceRecord {
     pub name: String,
     pub prefix: Vec<u8>,
-    /// `None` = existence-only (the built-in families `fs` / `kvc` / `mem`).
-    pub owner_tenant: Option<String>,
     /// Declared split points — the sacred boundaries a merge may not cross.
     pub presplit: Vec<Vec<u8>>,
     pub created_at: i64,
@@ -148,7 +146,8 @@ pub(crate) struct NamespaceRecord {
 
 impl PersistRecord for NamespaceRecord {
     const RECORD_TYPE: u8 = RECORD_TYPE_NAMESPACE;
-    const FORMAT_VERSION: u8 = 1;
+    /// v2 dropped an `Option<String>` owner after `prefix`; `migratev1_v2` converts.
+    const FORMAT_VERSION: u8 = 2;
     const NAME: &'static str = "namespace";
 }
 
@@ -157,14 +156,12 @@ impl From<&MgrNamespace> for NamespaceRecord {
         let MgrNamespace {
             name,
             prefix,
-            owner_tenant,
             presplit,
             created_at,
         } = n;
         Self {
             name: name.clone(),
             prefix: prefix.clone(),
-            owner_tenant: owner_tenant.clone(),
             presplit: presplit.clone(),
             created_at: *created_at,
         }
@@ -176,14 +173,12 @@ impl From<&NamespaceRecord> for MgrNamespace {
         let NamespaceRecord {
             name,
             prefix,
-            owner_tenant,
             presplit,
             created_at,
         } = r;
         Self {
             name: name.clone(),
             prefix: prefix.clone(),
-            owner_tenant: owner_tenant.clone(),
             presplit: presplit.clone(),
             created_at: *created_at,
         }
@@ -358,14 +353,12 @@ mod tests {
         let wire = MgrNamespace {
             name: "kvc".to_string(),
             prefix: b"kvc/".to_vec(),
-            owner_tenant: Some("t1".to_string()),
             presplit: vec![b"kvc/a".to_vec(), b"kvc/b".to_vec()],
             created_at: 1_700_000_000,
         };
         let back: MgrNamespace = (&NamespaceRecord::from(&wire)).into();
         assert_eq!(back.name, "kvc");
         assert_eq!(back.prefix, b"kvc/");
-        assert_eq!(back.owner_tenant.as_deref(), Some("t1"));
         assert_eq!(back.presplit, vec![b"kvc/a".to_vec(), b"kvc/b".to_vec()]);
         assert_eq!(back.created_at, 1_700_000_000);
     }

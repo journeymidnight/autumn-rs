@@ -6,7 +6,7 @@ validates:
 
   1. put_from / get_into zero-copy buffer round-trip
   2. batch_exists contiguous-prefix semantics
-  3. tenant suffix wiring (different tp_rank → different partition key)
+  3. model-scope wiring (different tp_rank → different partition key)
 
 Setup before running:
     cd python && maturin develop --release         # builds the `autumn` module
@@ -83,12 +83,12 @@ def main() -> int:
     pool = FakeHostPool(n_pages=n_pages, bytes_per_page=bytes_per_page)
     backend.register_mem_pool_host(pool)
 
-    # ── tenant-isolation sanity: keys are namespaced ─────────────────────
+    # ── model-scope sanity: keys are namespaced ──────────────────────────
     sample_key = backend._full_key(_make_key(0))
     assert sample_key.startswith(b"kvc/smoke-model_0_1/kv/"), (
         f"unexpected key format: {sample_key!r}"
     )
-    log.info("tenant key format OK: %r", sample_key)
+    log.info("model-scope key format OK: %r", sample_key)
 
     # ── 1. write 4 pages with distinct fill bytes, then read back ────────
     keys = [_make_key(i) for i in range(4)]

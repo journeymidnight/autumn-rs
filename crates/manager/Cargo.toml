@@ -17,7 +17,7 @@ autumn-transport = { path = "../transport" }
 bytes.workspace = true
 compio = { workspace = true, features = ["net", "time", "macros"] }
 # F-AUTHZ-1: manager-as-KDC — Ed25519 signing (holds the private key) + SHA-256
-# credential hashing for the tenant account DB.
+# credential hashing for the principal account DB.
 ed25519-dalek = "2"
 futures = "0.3"
 rand = "0.8"

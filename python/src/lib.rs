@@ -1000,15 +1000,12 @@ impl BatchClient {
     /// ClusterClient, and wait until all are ready. `per_worker_cap` bounds the
     /// in-flight pipeline depth per worker (keep ≤ ~16-32 on UCX to dodge the
     /// rendezvous cliff).
-    /// (D6-kvc wiring): `tenant=` + `credential=` (bytes)
-    /// bind EVERY worker's ClusterClient to the tenant credential — required
-    /// once `kvc/` is enforcement-enabled (the kvcache connector threads these
-    /// from `kv_connector_extra_config`); harmless with authz off. Both or
-    /// neither, validated up front.
+    /// `scope` (keyword-only) is the REQUIRED key scope. `principal=` +
+    /// `credential=` (bytes) bind EVERY worker's ClusterClient to that
+    /// credential — required once `kvc/` is enforcement-enabled (the kvcache
+    /// connector threads these from `kv_connector_extra_config`); harmless with
+    /// authz off. Both or neither, validated up front.
     #[new]
-    // D7 (SD-2): `namespace` + `tenant` are the REQUIRED key scope
-    // (keyword-only, after the perf knobs); `principal` + `credential` are the
-    // OPTIONAL authz identity (renamed from `tenant=` in refinement 3).
     #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false, *, scope, principal=None, credential=None))]
     fn new(
         py: Python<'_>,

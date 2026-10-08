@@ -113,7 +113,7 @@ impl std::error::Error for AutumnError {}
 // ── D7: namespace binding ───────────────────────────────────────────
 
 /// (Option 3): the key-prefix scope a `ClusterClient`
-/// operates within. There is NO tenant segment — a scope is `{ns}/` (a whole
+/// operates within. A scope is `{ns}/` (a whole
 /// namespace, e.g. `fs/`, `gallery/`) or an in-namespace sub-prefix
 /// (`mem/agent7/` — an app's own segment; the app owns its sub-structure). A
 /// scoped op ALWAYS PREPENDS the scope prefix to the user key before routing, so
@@ -123,8 +123,6 @@ impl std::error::Error for AutumnError {}
 /// owns the prefix). `Raw` (`connect_raw` / `raw()`) applies NO client-side
 /// prefixing — for admin / cross-namespace tooling — but the PS still enforces
 /// Layer-A/B, so `raw()` only bypasses the CLIENT clamp, never authorization.
-/// (Historical: tenant-first `{tenant}/{ns}/` and pre-that `{ns}/{tenant}/` were
-/// retired 2026-07-19 — see docs/key_namespace_split_design.md.)
 #[derive(Clone, Debug)]
 pub enum NamespaceBinding {
     Scoped {
@@ -154,7 +152,7 @@ impl NamespaceBinding {
         }
     }
 
-    /// Map a user key to the wire key. Scoped → `{tenant}/{ns}/ ++ key` (ALWAYS
+    /// Map a user key to the wire key. Scoped → `{scope}/ ++ key` (ALWAYS
     /// prepend — scope is locked by construction); Raw → pass through unchanged.
     /// Infallible (a scoped key can't escape its scope); returns `Result` only so
     /// call sites keep the `?` shape.
@@ -166,7 +164,7 @@ impl NamespaceBinding {
     }
 
     /// Map a user range prefix to the wire prefix. Same mapping as `bind_key`; an
-    /// EMPTY user prefix scans the whole `{tenant}/{ns}/`.
+    /// EMPTY user prefix scans the whole `{scope}/`.
     pub fn bind_prefix(&self, user_prefix: &[u8]) -> std::result::Result<Vec<u8>, AutumnError> {
         self.bind_key(user_prefix)
     }
@@ -182,9 +180,9 @@ impl NamespaceBinding {
         }
     }
 
-    /// Upper cap for a scoped range scan: `{tenant}/{ns}0` (`0`=0x30 is the
+    /// Upper cap for a scoped range scan: `{scope}0` (`0`=0x30 is the
     /// successor of `/`=0x2f), so a limit-driven scan can never walk past this
-    /// namespace into the next one within the tenant. `None` for `Raw`.
+    /// scope into the next one. `None` for `Raw`.
     pub fn upper_cap(&self) -> Option<Vec<u8>> {
         match self {
             NamespaceBinding::Scoped { prefix, .. } => {
@@ -199,11 +197,9 @@ impl NamespaceBinding {
     }
 }
 
-/// D7: validate a namespace/tenant scope segment used at connect.
-/// Prepend-only embeds these verbatim into `{tenant}/{ns}/` (the old `q()`
-/// percent-encoding of the tenant is gone), so an EMPTY segment or one containing
-/// `/` would forge a nested/aliased scope (`acme/sub` + `mem` → `acme/sub/mem/`,
-/// or `//mem`). Enforce the same `[a-z0-9._-]+` charset the manager uses for
+/// D7: validate a scope segment used at connect. Prepend-only embeds it
+/// verbatim into the scope prefix, so an EMPTY segment or one containing `/`
+/// would forge a nested/aliased scope (`//mem`). Enforce the same `[a-z0-9._-]+` charset the manager uses for
 /// namespace names, at connect (fail fast) — restores the dropped invariant for
 /// every frontend at once.
 pub(crate) fn is_valid_scope_segment(s: &str) -> bool {
@@ -216,7 +212,7 @@ pub(crate) fn is_valid_scope_segment(s: &str) -> bool {
 /// D7: a borrow-view of a `ClusterClient` under a DIFFERENT namespace
 /// binding, SHARING all of its connection pools (no reconnect, no Rc refactor).
 /// Returned by `ClusterClient::raw()` (Raw binding — admin/migration, no client
-/// clamp) and `ClusterClient::rescope(ns, tenant)` (a different scope). Exposes
+/// clamp) and `ClusterClient::rescope(scope)` (a different scope). Exposes
 /// the core KV ops; exotic bulk/batch/stream ops use a dedicated scoped
 /// `ClusterClient`. **The PS still enforces Layer-A/B** on every op — a view only
 /// changes the CLIENT-side key transform, never server authorization.
@@ -251,7 +247,7 @@ impl NamespaceScope<'_> {
         self.client.head_bound(&bound).await
     }
 
-    /// Range scan clamped to this scope's `{ns}/{tenant}/` (Raw = unbounded).
+    /// Range scan clamped to this scope's prefix (Raw = unbounded).
     /// Same bind/clamp/strip as `ClusterClient::range`, under the view's binding.
     pub async fn range(
         &self,
@@ -953,12 +949,12 @@ pub struct ClusterClient {
     /// `DEFAULT_FIRST_ATTEMPT_TIMEOUT` for the rationale. `None`
     /// disables fast-fail (every attempt uses the full `rpc_timeout`).
     first_attempt_timeout: Cell<Option<Duration>>,
-    /// optional tenant credential + cached token. `None` = anonymous
+    /// optional principal credential + cached token. `None` = anonymous
     /// (no CLIENT_AUTH sent — the pre-authz behavior; works against non-authz
     /// clusters). When `Some`, every fresh PS connection sends CLIENT_AUTH with a
     /// (lazily minted, auto-renewed) token before use.
     auth: RefCell<Option<ClientAuth>>,
-    /// bumped by `set_tenant_credential`. `get_ps_client` captures it
+    /// bumped by `set_principal_credential`. `get_ps_client` captures it
     /// before the CLIENT_AUTH await and refuses to CACHE a connection if the
     /// identity changed mid-connect — so a principal switch can't leave a
     /// wrong-identity-bound connection in the pool (coco P2).
@@ -983,7 +979,7 @@ pub struct ClusterClient {
     /// Zero means no manager has completed a Hello yet.
     negotiated_cluster_wire: Cell<u32>,
     /// D7: the namespace scope this client operates within. Set at
-    /// `connect(mgr, ns, tenant)` (Scoped) or `connect_raw(mgr)` (Raw). Every
+    /// `connect(mgr, scope)` (Scoped) or `connect_raw(mgr)` (Raw). Every
     /// scoped op binds its key through this before routing. `raw()` / `rescope`
     /// return borrow-views with a different binding sharing these pools.
     binding: NamespaceBinding,
@@ -1282,16 +1278,11 @@ impl ClusterClient {
     /// disjoint ranges). `floor` is the legacy `[0x04]next_inode` fs KV
     /// counter value (0 = none): the grant never returns a base below it,
     /// so a pre-M0 filesystem migrates without duplicate inodes. Leader-only.
-    pub async fn alloc_inodes(&self, count: u32, floor: u64, volume: &[u8]) -> Result<u64> {
-        // `volume` keys the manager's inode counter per-volume, but the fuse layer
-        // passes EMPTY so inodes are a single cluster-unique GLOBAL counter (the
-        // lease/fence plane keys by bare ino). The per-volume seam stays wired
-        // (frozen field + manager machinery) but DORMANT — reserved for a future
-        // volume-aware-lease feature. Empty = the global counter.
+    pub async fn alloc_inodes(&self, count: u32, floor: u64) -> Result<u64> {
         let req = rkyv_encode(&AllocInodesReq {
             count,
             floor,
-            volume: volume.to_vec(),
+            volume: Vec::new(),
         });
         let resp: AllocInodesResp = self
             .mgr_call_leader(MSG_ALLOC_INODES, req, "alloc_inodes", 3, 3, |b| {
@@ -1333,48 +1324,47 @@ impl ClusterClient {
     }
 
     /// create/rotate a principal account (admin). Returns
-    /// the permanent credential. Leader-only. (`TenantCreateReq.tenant` carries the
-    /// principal NAME — the wire struct name is retained; the concept is principal.)
+    /// the permanent credential. Leader-only.
     pub async fn principal_create(
         &self,
         principal: &str,
         allowed_prefixes: Vec<Vec<u8>>,
     ) -> Result<Vec<u8>> {
-        let req = rkyv_encode(&TenantCreateReq {
-            tenant: principal.to_string(),
+        let req = rkyv_encode(&PrincipalCreateReq {
+            principal: principal.to_string(),
             allowed_prefixes,
         });
         let managers = self.manager_addrs.len().max(1) as u32;
-        let resp: TenantCreateResp = self
+        let resp: PrincipalCreateResp = self
             .mgr_call_leader(
-                MSG_TENANT_CREATE,
+                MSG_PRINCIPAL_CREATE,
                 req,
-                "tenant-create",
+                "principal-create",
                 managers,
                 managers + 2,
                 |b| {
-                    let r: TenantCreateResp = rkyv_decode(b).map_err(decode_err)?;
+                    let r: PrincipalCreateResp = rkyv_decode(b).map_err(decode_err)?;
                     Ok((r.code, r))
                 },
             )
             .await?;
         if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-            return Err(anyhow!("tenant-create rejected: {}", resp.message));
+            return Err(anyhow!("principal-create rejected: {}", resp.message));
         }
         Ok(resp.credential)
     }
 
     /// delete a principal account (admin). Leader-only.
     pub async fn principal_delete(&self, principal: &str) -> Result<()> {
-        let req = rkyv_encode(&TenantDeleteReq {
-            tenant: principal.to_string(),
+        let req = rkyv_encode(&PrincipalDeleteReq {
+            principal: principal.to_string(),
         });
         let managers = self.manager_addrs.len().max(1) as u32;
         let resp: CodeResp = self
             .mgr_call_leader(
-                MSG_TENANT_DELETE,
+                MSG_PRINCIPAL_DELETE,
                 req,
-                "tenant-delete",
+                "principal-delete",
                 managers,
                 managers + 2,
                 |b| {
@@ -1384,23 +1374,16 @@ impl ClusterClient {
             )
             .await?;
         if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-            return Err(anyhow!("tenant-delete rejected: {}", resp.message));
+            return Err(anyhow!("principal-delete rejected: {}", resp.message));
         }
         Ok(())
     }
 
-    /// D2: register a namespace (admin). Leader-only. `owner_tenant`
-    /// `Some(_)` marks it protected; `presplit` freezes D8 split points (stored,
-    /// not yet acted upon).
-    pub async fn namespace_create(
-        &self,
-        name: &str,
-        owner_tenant: Option<String>,
-        presplit: Vec<Vec<u8>>,
-    ) -> Result<()> {
+    /// D2: register a namespace (admin). Leader-only. `presplit` records the
+    /// namespace's declared split points.
+    pub async fn namespace_create(&self, name: &str, presplit: Vec<Vec<u8>>) -> Result<()> {
         let req = rkyv_encode(&NamespaceCreateReq {
             name: name.to_string(),
-            owner_tenant,
             presplit,
         });
         let managers = self.manager_addrs.len().max(1) as u32;
@@ -1895,9 +1878,9 @@ impl ClusterClient {
     }
 
     /// Get or create a PS RPC connection. Auto-reconnects on failure.
-    /// set this client's tenant credential. Enables authz — every
+    /// set this client's principal credential. Enables authz — every
     /// fresh PS connection sends CLIENT_AUTH with a (lazily minted,
-    /// auto-renewed) token scoped to the tenant's granted prefixes. Anonymous (no credential,
+    /// auto-renewed) token scoped to the principal's granted prefixes. Anonymous (no credential,
     /// the default) works unchanged against non-authz clusters. Clears cached PS
     /// connections so they rebind under the new identity.
     pub fn set_principal_credential(&self, principal: impl Into<String>, credential: Vec<u8>) {
@@ -1932,7 +1915,7 @@ impl ClusterClient {
         Ok(c)
     }
 
-    /// D7: when authz is on, verify the client's `{ns}/{tenant}/` scope
+    /// D7: when authz is on, verify the client's scope
     /// is within one of the credential's granted prefixes, and FAIL FAST at
     /// connect if not (coco P2 — no more silent defer-to-first-write). Skipped
     /// only when authz is DISABLED on the manager (no signing key) — there is
@@ -2003,7 +1986,7 @@ impl ClusterClient {
             let auth = self.auth.borrow();
             let a = auth
                 .as_ref()
-                .ok_or_else(|| anyhow!("no tenant credential set"))?;
+                .ok_or_else(|| anyhow!("no principal credential set"))?;
             if let Some(t) = &a.token {
                 if t.exp > client_now_secs().saturating_add(TOKEN_RENEW_MARGIN_SECS) {
                     return Ok(t.bytes.clone());
@@ -2023,7 +2006,7 @@ impl ClusterClient {
             let mut auth = self.auth.borrow_mut();
             let a = auth
                 .as_mut()
-                .ok_or_else(|| anyhow!("no tenant credential set"))?;
+                .ok_or_else(|| anyhow!("no principal credential set"))?;
             let renewed = a.token.is_some();
             a.token = Some(CachedToken {
                 bytes: token.clone(),
@@ -2115,7 +2098,7 @@ impl ClusterClient {
                     resp.message
                 ));
             }
-            // Identity-switch guard (coco P2): if `set_tenant_credential` ran
+            // Identity-switch guard (coco P2): if `set_principal_credential` ran
             // during the connect + CLIENT_AUTH await, this conn is bound to the
             // OLD principal — serve this in-flight call but DON'T cache it, so a
             // later call rebinds under the new identity.
@@ -4614,7 +4597,7 @@ impl ClusterClient {
 
     /// Internal: `delete` over an ALREADY-bound wire key (no namespace binding).
     /// D7. NOTE: Layer-A does NOT gate deletes at the PS, but the CLIENT
-    /// still prepends so a scoped delete targets THIS tenant's key, not a raw one.
+    /// still prepends so a scoped delete targets THIS scope's key, not a raw one.
     async fn delete_bound(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         self.delete_opts(key, WriteLease::ANON).await
     }
@@ -4699,9 +4682,9 @@ impl ClusterClient {
         start: &[u8],
         limit: u32,
     ) -> std::result::Result<RangeResult, AutumnError> {
-        // D7: clamp the scan to `{ns}/{tenant}/` — bind the prefix,
+        // D7: clamp the scan to the scope prefix — bind the prefix,
         // bind the start (empty start → scan from the namespace lower bound),
-        // cap the upper end at `{ns}/{tenant}0`, then strip the binding prefix
+        // cap the upper end at `{scope}0`, then strip the binding prefix
         // off returned keys so a Prepend caller sees its original keys. Raw
         // binding is a no-op on all three (unbounded admin scan).
         let wire_prefix = self.binding.bind_prefix(prefix)?;
@@ -4790,7 +4773,7 @@ impl ClusterClient {
     }
 
     /// Internal: range scan over ALREADY-bound `prefix`/`start` wire keys, with
-    /// an optional `upper_cap` (`{ns}/{tenant}0`) that stops the limit-driven
+    /// an optional `upper_cap` (`{scope}0`) that stops the limit-driven
     /// walk at the namespace boundary. No prefix binding / stripping — the public
     /// `range` (and the `raw()`/`rescope` views) do that. D7.
     async fn range_bound(
@@ -4831,8 +4814,8 @@ impl ClusterClient {
                 has_more = true;
                 break;
             }
-            // D7: stop at the namespace upper bound `{ns}/{tenant}0` so a
-            // limit-driven scan can't walk past the tenant into the next
+            // D7: stop at the namespace upper bound `{scope}0` so a
+            // limit-driven scan can't walk past the scope into the next
             // namespace. `None` (Raw binding) = unbounded.
             if let Some(cap) = upper_cap {
                 if cursor.as_slice() >= cap {
@@ -6153,8 +6136,8 @@ impl<'a> PutStreamHandle<'a> {
             )));
         }
         // The chunk key `\xff\xfe…++user_key` is a normal user key to the binding:
-        // a scoped (Prepend) client prepends `{ns}/{tenant}/` so chunks land in
-        // the tenant range; Raw writes the legacy global chunk space.
+        // a scoped (Prepend) client prepends the scope prefix so chunks land in
+        // the scope range; Raw writes the legacy global chunk space.
         let chunk_key = make_chunk_key(&self.user_key, self.next_chunk_index);
         self.cluster.put(&chunk_key, chunk).await?;
         self.next_chunk_index = self.next_chunk_index.saturating_add(1);

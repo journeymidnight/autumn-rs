@@ -31,7 +31,7 @@ use parking_lot::RwLock;
 
 /// Immutable snapshot of the authz config the PS enforces against.
 pub struct AuthzInner {
-    /// D7 (coco P2): Layer-B (protected-prefix / token) enforcement on
+    /// D7 (coco P2): Layer-B (capability token) enforcement on
     /// (a signing key was configured). Carried IN the snapshot so the gate's
     /// per-request decision comes from ONE consistent object — never "flag from
     /// one atomic + config from a different-time snapshot". The `enabled`
@@ -40,9 +40,6 @@ pub struct AuthzInner {
     /// kid → verifying key. Only ENABLED kids are present — a disabled kid's
     /// tokens then reject as `UnknownKid` (emergency bulk revocation).
     pub keys: HashMap<u32, VerifyingKey>,
-    /// Key prefixes under which default-DENY applies (e.g. `mem/`). A request
-    /// key outside every protected prefix is NOT gated.
-    pub protected_prefixes: Vec<Vec<u8>>,
     /// Clock-skew leeway (seconds) applied to token `exp`.
     pub clock_skew_secs: u64,
     /// This cluster's id = the required token `aud`. A token whose `aud` differs
@@ -60,7 +57,6 @@ impl AuthzInner {
         Self {
             enabled: false,
             keys: HashMap::new(),
-            protected_prefixes: Vec::new(),
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
@@ -134,7 +130,6 @@ impl AuthzState {
         let inner = Arc::new(AuthzInner {
             enabled: resp.enabled,
             keys,
-            protected_prefixes: resp.protected_prefixes.clone(),
             clock_skew_secs: resp.clock_skew_secs,
             cluster_id: resp.cluster_id.clone(),
             // D7: the registered-namespace list — Layer-A's data source.
@@ -176,12 +171,9 @@ fn denied(msg: &str) -> Option<(StatusCode, String)> {
 
 /// Authorize ONE key. `Some((code,msg))` = deny, `None` = allow.
 ///
-/// PROTECT-EVERYTHING (tenant-first, 2026-07-19): when authz is enabled EVERY
-/// key requires a token (this fn only runs under `snap.enabled`), so there is no
-/// `is_protected` prefix filter — a credential grants `{tenant}/` (whole tenant)
-/// or `{tenant}/{ns}/` and the key must fall under one of those grants. The old
-/// `protected_prefixes` list is retired (there is no un-protected range once
-/// every write is mandatorily tenant-scoped).
+/// PROTECT-EVERYTHING: when authz is enabled EVERY key requires a token (this
+/// fn only runs under `snap.enabled`) — a credential grants prefixes such as
+/// `{ns}/` and the key must fall under one of them.
 fn check_key(
     key: &[u8],
     principal: Option<&BoundPrincipal>,
@@ -190,7 +182,7 @@ fn check_key(
 ) -> Option<(StatusCode, String)> {
     let p = match principal {
         Some(p) => p,
-        None => return denied("protected key requires a capability token (no CLIENT_AUTH on this connection)"),
+        None => return denied("key requires a capability token (no CLIENT_AUTH on this connection)"),
     };
     // A kid disabled / rotated out since this connection bound revokes it.
     if let Err(m) = autumn_rpc::cap_token::still_valid(p, &inner.keys, now, inner.clock_skew_secs) {
@@ -218,11 +210,10 @@ fn check_range(
 ) -> Option<(StatusCode, String)> {
     // PROTECT-EVERYTHING: every range needs a token when authz is on (this fn
     // only runs under `snap.enabled`). An empty (unbounded) prefix can never be
-    // ⊆ a non-empty grant → denied; a `{tenant}/`-scoped scan is ⊆ the tenant
-    // grant → allowed.
+    // ⊆ a non-empty grant → denied; a scan inside a grant → allowed.
     let p = match principal {
         Some(p) => p,
-        None => return denied("protected range requires a capability token (no CLIENT_AUTH on this connection)"),
+        None => return denied("range requires a capability token (no CLIENT_AUTH on this connection)"),
     };
     if let Err(m) = autumn_rpc::cap_token::still_valid(p, &inner.keys, now, inner.clock_skew_secs) {
         return denied(m);
@@ -244,14 +235,14 @@ fn check_range(
 /// requests, `parse_put_bulk_meta` for `MSG_PUT_BULK`): a payload that fails to
 /// parse here fails identically in the handler, so no bytes are ever served.
 ///
-/// **INVARIANT (load-bearing — an authz bypass = cross-tenant data exposure):
+/// **INVARIANT (load-bearing — an authz bypass = cross-principal data exposure):
 /// every client data-plane msg_type that carries a USER KEY must have an arm
 /// here that extracts the key and calls `check_key` / `check_range`.** The
 /// catch-all `_ => None` admits ungated, which is correct ONLY for
 /// non-key-scoped ops (maintenance / split / merge / discards / diag — admin
 /// auth is a separate concern) and `CLIENT_AUTH` (handled by the connection
 /// loop). Adding a new keyed read/write RPC without an arm here silently lets
-/// it read/write any tenant's `mem/` prefix. If you add one, add it here too.
+/// it read/write any principal's prefix. If you add one, add it here too.
 pub fn authz_check(
     msg_type: u8,
     payload: &[u8],
@@ -328,7 +319,7 @@ pub fn authz_check(
         }
         // Every key, exactly as MSG_BATCH_PUT. Without this arm the match falls
         // to `_ => None`, which ADMITS -- so a batched delete would reach any
-        // tenant's protected prefix with no capability at all, which is the
+        // principal's prefix with no capability at all, which is the
         // failure this function's doc names.
         partition_rpc::MSG_BATCH_DELETE => {
             let r = partition_rpc::rkyv_decode::<partition_rpc::BatchDeleteReq>(payload).ok()?;
@@ -380,8 +371,7 @@ pub fn check_layer_a(
     payload: &[u8],
     inner: &AuthzInner,
 ) -> Option<(StatusCode, String)> {
-    // (Option 3): the wire key is `{ns}/…` (NO tenant
-    // segment), so a registered namespace (`{name}/`, e.g. `fs/`) is the FIRST
+    // The wire key is `{ns}/…`, so a registered namespace (`{name}/`, e.g. `fs/`) is the FIRST
     // `/`-delimited segment. Extract `{ns}/` (the bytes up to and including the
     // first `/`) and require an EXACT match against a registered namespace. `{ns}`
     // is ASCII-no-slash (`is_valid_scope_segment`), so the first slash bounds it
@@ -459,25 +449,23 @@ mod tests {
     use autumn_rpc::partition_rpc::rkyv_encode;
     use ed25519_dalek::SigningKey;
 
-    fn inner_with(prefixes: Vec<Vec<u8>>) -> AuthzInner {
+    fn inner_with() -> AuthzInner {
         // Include kid 1 so a principal bound to kid 1 passes the revocation check.
         let mut keys = HashMap::new();
         keys.insert(1u32, SigningKey::from_bytes(&[1u8; 32]).verifying_key());
         AuthzInner {
             enabled: true,
             keys,
-            protected_prefixes: prefixes,
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
         }
     }
 
-    // TENANT-FIRST: a tenant credential grants the WHOLE tenant `acme/` (covers
-    // every namespace `acme/fs/`, `acme/kvc/`, `acme/mem/`).
+    // A principal granted the in-namespace scope `mem/acme/`.
     fn acme() -> BoundPrincipal {
         BoundPrincipal {
-            allowed_prefixes: vec![b"acme/".to_vec()],
+            allowed_prefixes: vec![b"mem/acme/".to_vec()],
             exp: 1_000_000,
             kid: 1,
         }
@@ -485,50 +473,48 @@ mod tests {
 
     #[test]
     fn check_key_matrix() {
-        // protected_prefixes is retired (protect-everything) — pass empty.
-        let inner = inner_with(vec![]);
+        let inner = inner_with();
         let p = acme();
         let now = 999_000;
-        // key inside the granted tenant → allow (ANY namespace within it)
-        assert!(check_key(b"acme/mem/fact/1", Some(&p), &inner, now).is_none());
-        assert!(check_key(b"acme/fs/\x01x", Some(&p), &inner, now).is_none());
-        // another tenant → deny (outside the acme/ grant)
-        assert!(check_key(b"other/mem/fact/1", Some(&p), &inner, now).is_some());
+        // key inside the grant → allow
+        assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner, now).is_none());
+        // outside the grant (another scope, another namespace) → deny
+        assert!(check_key(b"mem/other/fact/1", Some(&p), &inner, now).is_some());
+        assert!(check_key(b"fs/\x01x", Some(&p), &inner, now).is_some());
         // anonymous → deny (protect-everything: every key needs a token)
-        assert!(check_key(b"acme/mem/fact/1", None, &inner, now).is_some());
-        assert!(check_key(b"acme/fs/\x01x", None, &inner, now).is_some());
+        assert!(check_key(b"mem/acme/fact/1", None, &inner, now).is_some());
         // expired token → deny
-        assert!(check_key(b"acme/mem/fact/1", Some(&p), &inner, p.exp + 61).is_some());
+        assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner, p.exp + 61).is_some());
         // within skew leeway → allow
-        assert!(check_key(b"acme/mem/fact/1", Some(&p), &inner, p.exp + 30).is_none());
+        assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner, p.exp + 30).is_none());
     }
 
     #[test]
     fn prefix_boundary_not_forgeable() {
-        // `acmeevil/` must NOT be authorized by the `acme/` grant (the trailing
-        // `/` on the grant makes `acmeevil/…` fall outside it).
-        let inner = inner_with(vec![]);
+        // `mem/acmeevil/` must NOT be authorized by the `mem/acme/` grant (the
+        // trailing `/` on the grant makes `mem/acmeevil/…` fall outside it).
+        let inner = inner_with();
         let p = acme();
         let now = 999_000;
-        assert!(check_key(b"acmeevil/mem/x", Some(&p), &inner, now).is_some());
-        assert!(check_key(b"acme/mem/x", Some(&p), &inner, now).is_none());
+        assert!(check_key(b"mem/acmeevil/x", Some(&p), &inner, now).is_some());
+        assert!(check_key(b"mem/acme/x", Some(&p), &inner, now).is_none());
     }
 
     #[test]
     fn range_whole_interval_subseteq_prefix() {
-        let inner = inner_with(vec![]);
+        let inner = inner_with();
         let p = acme();
         let now = 999_000;
-        // prefix ⊆ the tenant grant → allow (incl. scanning the whole tenant)
-        assert!(check_range(b"acme/mem/", Some(&p), &inner, now).is_none());
-        assert!(check_range(b"acme/mem/fact/", Some(&p), &inner, now).is_none());
-        assert!(check_range(b"acme/", Some(&p), &inner, now).is_none());
-        // another tenant (prefix ⊄ acme/) → deny
-        assert!(check_range(b"other/mem/", Some(&p), &inner, now).is_some());
+        // prefix ⊆ the grant → allow (incl. scanning the whole grant)
+        assert!(check_range(b"mem/acme/", Some(&p), &inner, now).is_none());
+        assert!(check_range(b"mem/acme/fact/", Some(&p), &inner, now).is_none());
+        // wider than the grant, or another scope → deny
+        assert!(check_range(b"mem/", Some(&p), &inner, now).is_some());
+        assert!(check_range(b"mem/other/", Some(&p), &inner, now).is_some());
         // empty prefix (unbounded scan) → deny
         assert!(check_range(b"", Some(&p), &inner, now).is_some());
         // anonymous → deny (protect-everything)
-        assert!(check_range(b"acme/mem/", None, &inner, now).is_some());
+        assert!(check_range(b"mem/acme/", None, &inner, now).is_some());
     }
 
     /// A batched delete must be gated key by key, like every other keyed RPC.
@@ -536,14 +522,14 @@ mod tests {
     /// This is the arm whose ABSENCE is the danger: `authz_check` ends in
     /// `_ => None`, and `None` ADMITS. A new keyed opcode with no arm here is
     /// not merely ungated, it is silently ungated -- there is no error, no log,
-    /// and the write succeeds against any tenant's protected prefix. The batch
+    /// and the write succeeds against any principal's prefix. The batch
     /// delete shipped that way until this test existed.
     ///
     /// ABLATION: delete the `MSG_BATCH_DELETE` arm from `authz_check` and the
-    /// cross-tenant half of this test goes green, which is the whole problem.
+    /// cross-scope half of this test goes green, which is the whole problem.
     #[test]
     fn authz_check_gates_every_key_of_a_batch_delete() {
-        let inner = inner_with(vec![]);
+        let inner = inner_with();
         let p = acme();
         let now = 999_000;
 
@@ -551,14 +537,14 @@ mod tests {
             part_id: 1,
             region_epoch: 0,
             ops: vec![partition_rpc::BatchDeleteOp {
-                key: b"acme/mem/doc/1".to_vec(),
+                key: b"mem/acme/doc/1".to_vec(),
                 inode_hint: 0,
                 lease_epoch: 0,
             }],
         });
         assert!(
             authz_check(partition_rpc::MSG_BATCH_DELETE, &mine, Some(&p), &inner, now).is_none(),
-            "own-tenant key must be admitted"
+            "a key inside the grant must be admitted"
         );
 
         // One foreign key among otherwise-permitted ones must refuse the
@@ -569,12 +555,12 @@ mod tests {
             region_epoch: 0,
             ops: vec![
                 partition_rpc::BatchDeleteOp {
-                    key: b"acme/mem/doc/1".to_vec(),
+                    key: b"mem/acme/doc/1".to_vec(),
                     inode_hint: 0,
                     lease_epoch: 0,
                 },
                 partition_rpc::BatchDeleteOp {
-                    key: b"other/mem/doc/1".to_vec(),
+                    key: b"mem/other/doc/1".to_vec(),
                     inode_hint: 0,
                     lease_epoch: 0,
                 },
@@ -583,37 +569,37 @@ mod tests {
         assert!(
             authz_check(partition_rpc::MSG_BATCH_DELETE, &smuggled, Some(&p), &inner, now)
                 .is_some(),
-            "a cross-tenant key anywhere in the batch must refuse the frame"
+            "a key outside the grant anywhere in the batch must refuse the frame"
         );
     }
 
     #[test]
     fn authz_check_dispatch_get_and_put() {
-        let inner = inner_with(vec![]);
+        let inner = inner_with();
         let p = acme();
         let now = 999_000;
-        // GET authorized (within the acme/ tenant grant)
+        // GET authorized (within the mem/acme/ grant)
         let g = rkyv_encode(&GetReq {
             part_id: 1,
-            key: b"acme/mem/doc/1".to_vec(),
+            key: b"mem/acme/doc/1".to_vec(),
             offset: 0,
             length: 0,
             region_epoch: 0,
         });
         assert!(authz_check(MSG_GET_BULK, &g, Some(&p), &inner, now).is_none());
-        // GET cross-tenant denied
+        // GET outside the grant denied
         let g2 = rkyv_encode(&GetReq {
             part_id: 1,
-            key: b"other/mem/doc/1".to_vec(),
+            key: b"mem/other/doc/1".to_vec(),
             offset: 0,
             length: 0,
             region_epoch: 0,
         });
         assert!(authz_check(MSG_GET_BULK, &g2, Some(&p), &inner, now).is_some());
-        // PUT cross-tenant denied (value not copied into the assertion path)
+        // PUT outside the grant denied (value not copied into the assertion path)
         let put = rkyv_encode(&PutReq {
             part_id: 1,
-            key: b"other/mem/doc/1".to_vec(),
+            key: b"mem/other/doc/1".to_vec(),
             value: vec![7u8; 100],
             expires_at: 0,
             region_epoch: 0,
@@ -638,7 +624,6 @@ mod tests {
         let inner = AuthzInner {
             enabled: true,
             keys,
-            protected_prefixes: vec![b"mem/".to_vec()],
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
             namespaces: Vec::new(),
@@ -664,7 +649,6 @@ mod tests {
         let inner2 = AuthzInner {
             enabled: true,
             keys: HashMap::new(),
-            protected_prefixes: vec![],
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
             namespaces: Vec::new(),
@@ -682,7 +666,6 @@ mod tests {
         let inner_disabled = AuthzInner {
             enabled: true,
             keys: HashMap::new(), // kid 1 no longer present
-            protected_prefixes: vec![b"mem/".to_vec()],
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
@@ -713,7 +696,6 @@ mod tests {
                     disabled: true,             // disabled → not in keyring
                 },
             ],
-            protected_prefixes: vec![b"mem/".to_vec()],
             namespaces: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 45,
@@ -723,14 +705,13 @@ mod tests {
         let snap = st.snapshot();
         assert!(snap.keys.contains_key(&1));
         assert!(!snap.keys.contains_key(&2)); // disabled kid excluded
-        assert_eq!(snap.protected_prefixes, vec![b"mem/".to_vec()]);
         assert_eq!(snap.clock_skew_secs, 45);
         assert_eq!(snap.cluster_id, "cluster-abc");
     }
 
     // ── Layer-A ──────────────────────────────────────────────────────────
     fn inner_with_namespaces(namespaces: Vec<Vec<u8>>) -> AuthzInner {
-        let mut inner = inner_with(Vec::new());
+        let mut inner = inner_with();
         inner.namespaces = namespaces;
         inner
     }
@@ -758,14 +739,14 @@ mod tests {
 
     #[test]
     fn compare_put_enforces_namespace_and_principal() {
-        let mut inner = inner_with_namespaces(vec![b"acme/".to_vec()]);
+        let mut inner = inner_with_namespaces(vec![b"mem/".to_vec()]);
         let principal = acme();
         let request = |key: &[u8]| rkyv_encode(&ComparePutReq {
             part_id: 77, region_epoch: 3, key: key.to_vec(),
             expected: None, value: b"manifest".to_vec(),
         });
-        let mine = request(b"acme/mem/object");
-        let other = request(b"other/mem/object");
+        let mine = request(b"mem/acme/object");
+        let other = request(b"scratch/acme/object");
         assert!(check_layer_a(MSG_COMPARE_PUT, &mine, &inner).is_none());
         assert!(matches!(check_layer_a(MSG_COMPARE_PUT, &other, &inner), Some((StatusCode::NamespaceUnknown, _))));
         inner.enabled = true;
@@ -776,14 +757,14 @@ mod tests {
 
     #[test]
     fn compare_write_enforces_namespace_and_principal() {
-        let mut inner = inner_with_namespaces(vec![b"acme/".to_vec()]);
+        let mut inner = inner_with_namespaces(vec![b"mem/".to_vec()]);
         let principal = acme();
         let request = |key: &[u8]| rkyv_encode(&CompareWriteReq {
             part_id: 77, region_epoch: 3, key: key.to_vec(),
             expected: Some(b"old".to_vec()), value: None, inode_hint: 9, lease_epoch: 4,
         });
-        let mine = request(b"acme/mem/object");
-        let other = request(b"other/mem/object");
+        let mine = request(b"mem/acme/object");
+        let other = request(b"scratch/acme/object");
         assert!(check_layer_a(MSG_COMPARE_WRITE, &mine, &inner).is_none());
         assert!(matches!(check_layer_a(MSG_COMPARE_WRITE, &other, &inner), Some((StatusCode::NamespaceUnknown, _))));
         inner.enabled = true;
@@ -808,23 +789,23 @@ mod tests {
         // `authz_check`'s match also ends in a catch-all that ADMITS, so a
         // batched READ with no arm would hand back values for keys the caller
         // has no grant on.
-        let inner = inner_with(vec![]);
+        let inner = inner_with();
         let p = acme();
         let mk = |k2: &[u8]| {
             partition_rpc::rkyv_encode(&BatchGetReq {
                 part_id: 1,
                 region_epoch: 0,
-                keys: vec![b"acme/mem/1".to_vec(), k2.to_vec()],
+                keys: vec![b"mem/acme/1".to_vec(), k2.to_vec()],
             })
             .to_vec()
         };
         let msg = MSG_BATCH_GET_BULK;
         assert!(
-            authz_check(msg, &mk(b"acme/mem/2"), Some(&p), &inner, 0).is_none(),
+            authz_check(msg, &mk(b"mem/acme/2"), Some(&p), &inner, 0).is_none(),
             "in-grant keys must pass"
         );
         assert!(
-            authz_check(msg, &mk(b"other/mem/2"), Some(&p), &inner, 0).is_some(),
+            authz_check(msg, &mk(b"mem/other/2"), Some(&p), &inner, 0).is_some(),
             "an out-of-grant key must be refused"
         );
     }
@@ -918,7 +899,6 @@ mod tests {
             message: String::new(),
             enabled: false,
             public_keys: vec![],
-            protected_prefixes: vec![],
             namespaces: vec![b"kvc/".to_vec()],
             token_ttl_secs: 0,
             clock_skew_secs: 0,
@@ -933,7 +913,6 @@ mod tests {
             message: String::new(),
             enabled: false,
             public_keys: vec![],
-            protected_prefixes: vec![],
             namespaces: vec![],
             token_ttl_secs: 0,
             clock_skew_secs: 0,

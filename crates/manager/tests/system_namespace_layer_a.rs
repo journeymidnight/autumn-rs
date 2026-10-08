@@ -6,9 +6,9 @@
 //!    UNregistered prefix is rejected with `NamespaceUnknown` (anonymous
 //!    connection checked too), and a `delete` under an unregistered prefix is
 //!    NOT Layer-A gated.
-//! 2. **put-stream chunk-in-tenant-range** (`putstream_chunks_land_in_tenant_range`):
+//! 2. **put-stream chunk-in-scope-range** (`putstream_chunks_land_in_scope_range`):
 //!    a Prepend-bound client's striped chunk keys land INSIDE
-//!    `[{tenant}/{ns}/, {tenant}/{ns}0)`, not in a global `\xff\xfe…` space.
+//!    `[{scope}/, {scope}0)`, not in a global `\xff\xfe…` space.
 //!
 //! Both need EN binaries + a real PS, so they are `#[ignore]` (run explicitly),
 //! mirroring `system_putstream.rs`.
@@ -43,7 +43,6 @@ fn start_memory_manager(mgr_addr: SocketAddr) {
 async fn ns_create(mgr: &RpcClient, name: &str) {
     let payload = rkyv_encode(&NamespaceCreateReq {
         name: name.to_string(),
-        owner_tenant: None,
         presplit: Vec::new(),
     });
     let resp = mgr
@@ -120,7 +119,7 @@ fn layer_a_rejects_unregistered_namespace_put() {
 
 #[test]
 #[ignore] // needs EN binaries + a real PS
-fn putstream_chunks_land_in_tenant_range() {
+fn putstream_chunks_land_in_scope_range() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr); // no namespace registered → Layer-A OFF (not under test)
     let n1_dir = tempfile::tempdir().expect("n1");
@@ -152,9 +151,9 @@ fn putstream_chunks_land_in_tenant_range() {
         h.send(&value).await.expect("send");
         h.commit().await.expect("commit");
 
-        // A tenant-scoped range scan (empty prefix → the whole `bench/perf/`)
+        // A scoped range scan (empty prefix → the whole `bench/perf/`)
         // sees BOTH the meta key and the striped chunk keys — proving the chunks
-        // landed inside the tenant range. The binding strips `bench/perf/`, so
+        // landed inside the scope range. The binding strips `bench/perf/`, so
         // the chunk keys come back starting with the `\xff\xfe` chunk prefix.
         let scan = scoped.range(b"", b"", 10_000).await.expect("scoped range");
         let has_meta = scan.entries.iter().any(|e| e.key == b"bigfile");
@@ -162,10 +161,10 @@ fn putstream_chunks_land_in_tenant_range() {
             .entries
             .iter()
             .any(|e| e.key.starts_with(b"\xff\xfe"));
-        assert!(has_meta, "meta key `bigfile` must be in the tenant range");
+        assert!(has_meta, "meta key `bigfile` must be in the scope range");
         assert!(
             has_chunk,
-            "striped chunk keys (\\xff\\xfe…) must be in the tenant range"
+            "striped chunk keys (\\xff\\xfe…) must be in the scope range"
         );
 
         // On the WIRE the chunk keys are `bench/perf/\xff\xfe…` — verify via a raw
@@ -182,12 +181,12 @@ fn putstream_chunks_land_in_tenant_range() {
             "no chunk key may live in the GLOBAL \\xff\\xfe space (found {})",
             global.entries.len()
         );
-        let in_tenant = raw
+        let in_scope = raw
             .range(b"bench/perf/", b"bench/perf/", 10_000)
             .await
-            .expect("raw tenant range");
+            .expect("raw scope range");
         assert!(
-            in_tenant
+            in_scope
                 .entries
                 .iter()
                 .any(|e| e.key.starts_with(b"bench/perf/\xff\xfe")),

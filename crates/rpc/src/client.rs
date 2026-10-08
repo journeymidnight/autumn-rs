@@ -1771,7 +1771,7 @@ mod tests {
             // Normal CRC'd error frame, exactly what authz_gate emits.
             let status = RpcError::encode_status(
                 crate::error::StatusCode::PermissionDenied,
-                "protected key requires a capability token",
+                "key requires a capability token",
             );
             let bytes = Frame::error(req_id, 9, status).encode();
             sock.write_all(&bytes).expect("write resp");

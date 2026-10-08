@@ -103,7 +103,7 @@ pub(crate) trait PersistRecord {
 // value, so they are FROZEN — renumbering one silently re-labels every record
 // already on disk.
 pub(crate) const RECORD_TYPE_AUDIT: u8 = 1;
-pub(crate) const RECORD_TYPE_TENANT_ACCOUNT: u8 = 2;
+pub(crate) const RECORD_TYPE_PRINCIPAL_ACCOUNT: u8 = 2;
 pub(crate) const RECORD_TYPE_NAMESPACE: u8 = 3;
 pub(crate) const RECORD_TYPE_EXTENT: u8 = 4;
 pub(crate) const RECORD_TYPE_STREAM: u8 = 5;
@@ -199,7 +199,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::records::{AuditRecord, NamespaceRecord, TenantAccountRecord};
+    use super::records::{AuditRecord, NamespaceRecord, PrincipalAccountRecord};
     use super::*;
 
     /// A free-text value whose own bytes spell a valid envelope: the magic,
@@ -264,7 +264,6 @@ mod tests {
         let ns = NamespaceRecord {
             name: "AUMGnamespace".to_string(),
             prefix: b"AUMGnamespace/".to_vec(),
-            owner_tenant: None,
             presplit: vec![],
             created_at: 1,
         };
@@ -282,8 +281,8 @@ mod tests {
     /// only thing left. It must refuse.
     ///
     /// Reachable because two of the three records have an unvalidated free-text
-    /// field at offset 0: a tenant name (nothing validates one — there is no
-    /// `validate_tenant_name` in the tree) and an audit `reason`. A namespace
+    /// field at offset 0: a principal name (nothing validates one beyond
+    /// non-empty) and an audit `reason`. A namespace
     /// cannot do it: `validate_namespace_name` allows only `[a-z0-9._-]`, so
     /// byte 0 is never `A`.
     ///
@@ -298,14 +297,14 @@ mod tests {
     /// argument.
     #[test]
     fn a_bare_value_impersonating_the_whole_envelope_is_still_refused() {
-        let acct = TenantAccountRecord {
+        let acct = PrincipalAccountRecord {
             // Built from the constants, not spelled out: a fixture that
             // hardcodes the version byte has to be hand-edited on every
             // FORMAT_VERSION bump, and one that is forgotten stops
             // impersonating anything while still passing.
-            tenant: impersonating_name(
-                TenantAccountRecord::RECORD_TYPE,
-                TenantAccountRecord::FORMAT_VERSION,
+            principal: impersonating_name(
+                PrincipalAccountRecord::RECORD_TYPE,
+                PrincipalAccountRecord::FORMAT_VERSION,
                 "longname",
             ),
             credential_hash: [7u8; 32],
@@ -313,13 +312,13 @@ mod tests {
         };
         let bare = autumn_rpc::manager_rpc::rkyv_encode(&acct).to_vec();
         assert_eq!(&bare[0..4], &PERSIST_MAGIC);
-        assert_eq!(bare[4], TenantAccountRecord::RECORD_TYPE);
+        assert_eq!(bare[4], PrincipalAccountRecord::RECORD_TYPE);
         assert_eq!(
             bare[5],
-            TenantAccountRecord::FORMAT_VERSION,
+            PrincipalAccountRecord::FORMAT_VERSION,
             "this fixture exists because the full six-byte check CAN be passed              by a bare value's own content"
         );
-        let err = decode::<TenantAccountRecord>("tenantAccount/x", &bare)
+        let err = decode::<PrincipalAccountRecord>("principal/x", &bare)
             .expect_err("a skipped-as-converted bare value must not decode");
         assert!(
             err.contains("does not decode"),
@@ -344,8 +343,8 @@ mod tests {
     #[test]
     fn a_record_under_the_wrong_key_is_refused_by_type() {
         let raw = encode(&audit());
-        let err = decode::<TenantAccountRecord>("tenantAccount/t1", &raw)
-            .expect_err("an audit record is not a tenant account");
+        let err = decode::<PrincipalAccountRecord>("principal/p1", &raw)
+            .expect_err("an audit record is not a principal account");
         assert!(err.contains("record type"), "{err}");
     }
 
@@ -389,7 +388,6 @@ mod tests {
         let record = NamespaceRecord {
             name: "kvc".to_string(),
             prefix: b"kvc/".to_vec(),
-            owner_tenant: Some("t1".to_string()),
             presplit: vec![b"kvc/a".to_vec()],
             created_at: 99,
         };
@@ -417,7 +415,7 @@ mod tests {
             DiskRecord, ExtentRecord, NodeRecord, PartitionRecord, RegionRecord, StreamRecord,
         };
         assert_eq!(AuditRecord::RECORD_TYPE, 1);
-        assert_eq!(TenantAccountRecord::RECORD_TYPE, 2);
+        assert_eq!(PrincipalAccountRecord::RECORD_TYPE, 2);
         assert_eq!(NamespaceRecord::RECORD_TYPE, 3);
         assert_eq!(ExtentRecord::RECORD_TYPE, 4);
         assert_eq!(StreamRecord::RECORD_TYPE, 5);

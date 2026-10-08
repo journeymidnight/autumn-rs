@@ -27,7 +27,7 @@ import autumn
 
 from ._bridge import run, run_on, new_loop
 from ._identity import fingerprint_from_sources, read_credential_pair as _read_credential_pair
-from ._keys import build_tenant_suffix, full_key, pool_prefix
+from ._keys import build_model_scope, full_key, pool_prefix
 
 # The interface this adapter implements is sglang's, but sglang is not the only
 # engine that carries it: an engine may vendor the same module rather than
@@ -135,7 +135,7 @@ log = logging.getLogger(__name__)
 
 # Reserved pool name. MVP only supports the "kv" pool; the slot is in the
 # key format so future v2 multi-pool (mamba / swa) doesn't require a key
-# migration. (The shared `kvc/` namespace + tenant suffix live in `_keys`.)
+# migration. (The shared `kvc/` namespace + model scope live in `_keys`.)
 DEFAULT_POOL_NAME = "kv"
 
 
@@ -196,10 +196,10 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             )
 
         self.storage_config = storage_config
-        # BUG-KVC-TENANT: on the sglang path `model_name` is the served
+        # On the sglang path `model_name` is the served
         # `--model-path` — normally a real identity (sglang has no equivalent
-        # of a fixed config dir shared by several models), so the default tenant
-        # format is UNCHANGED (no key invalidation for existing sglang
+        # of a fixed config dir shared by several models), so the default
+        # model-scope format is UNCHANGED (no key invalidation for existing sglang
         # deployments). `HiCacheStorageConfig` carries no architecture info to
         # fingerprint from, so the escape hatch for deployments where the path
         # is NOT unique (two finetunes at one path, containers mounting
@@ -209,7 +209,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         fingerprint = (
             fingerprint_from_sources({"model_id": str(model_id)}) if model_id else None
         )
-        self._tenant_suffix = build_tenant_suffix(storage_config, fingerprint)
+        self._model_scope = build_model_scope(storage_config, fingerprint)
         # Optional transport selection ("tcp" default, or "ucx" for RDMA).
         # Must be set before the first connect; idempotent process-global.
         transport = (extra_config.get("transport") or "tcp").lower()
@@ -253,21 +253,14 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         # (D6-kvc): same authz wiring as
         # the vLLM connector — `auth_credential_file` in extra_config is the only
         # required key (Option 3's credential file names its own principal),
-        # `auth_principal` overrides that name, `auth_tenant` is the retired
-        # spelling. The file read fails loudly at startup. Threads to BOTH
+        # `auth_principal` overrides that name. The file read fails loudly at
+        # startup. Threads to BOTH
         # clients (authz gates reads on protected prefixes too — a
         # credential-less probe client would silently turn every hit into a miss).
         auth_cred_file = extra_config.get("auth_credential_file")
         auth_principal = extra_config.get("auth_principal")
-        if auth_principal is None and extra_config.get("auth_tenant") is not None:
-            auth_principal = extra_config["auth_tenant"]
-            log.warning(
-                "extra_config: `auth_tenant` is the retired (pre-Option-3) "
-                "spelling — rename it to `auth_principal`"
-            )
-        # NS-FIRST keys with no tenant segment — the
-        # client binds the `kvc` SCOPE and PREPENDS `kvc/` (`_keys.py` emits the
-        # relative `{model}/…`).
+        # The client binds the `kvc` SCOPE and PREPENDS `kvc/` (`_keys.py`
+        # emits the relative `{model_scope}/…`).
         auth: dict = {"scope": "kvc"}
         if auth_cred_file:
             file_principal, secret = _read_credential_pair(auth_cred_file)
@@ -300,9 +293,9 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
             "set_error": 0,
         }
         log.info(
-            "AutumnKVCacheStorage connected: endpoint=%s tenant=%s sglang=%s",
+            "AutumnKVCacheStorage connected: endpoint=%s model_scope=%s sglang=%s",
             endpoint,
-            self._tenant_suffix,
+            self._model_scope,
             _SGLANG_AVAILABLE,
         )
 
@@ -317,7 +310,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
         self._mem_pool_host = mem_pool_host
 
     def _full_key(self, hash_str: str, pool_name: str = DEFAULT_POOL_NAME) -> bytes:
-        return full_key(self._tenant_suffix, hash_str, pool_name)
+        return full_key(self._model_scope, hash_str, pool_name)
 
     def _page_view(self, idx: int):
         """Resolve a host_index to a buffer-protocol view of the pinned page.
@@ -432,7 +425,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     # a backend that only implements v1 makes those models unusable — the
     # controller calls batch_exists_v2 and gets NotImplementedError.
     #
-    # The key schema already anticipated this: `full_key(tenant, hash, pool)`
+    # The key schema already anticipated this: `full_key(model_scope, hash, pool)`
     # puts the pool in its own path segment, and the KV pool's segment is "kv",
     # which is what `PoolName.KV` stringifies to. So v2 keys for the KV pool are
     # byte-identical to v1's — this is additive, not a migration.
@@ -627,8 +620,8 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     # ── optional ───────────────────────────────────────────────────────────
 
     def clear(self) -> None:
-        # Pool-scoped: must NOT cross into a co-tenant's vLLM (`vllm`) pool.
-        prefix = pool_prefix(self._tenant_suffix, DEFAULT_POOL_NAME)
+        # Pool-scoped: must NOT cross into the same model's vLLM (`vllm`) pool.
+        prefix = pool_prefix(self._model_scope, DEFAULT_POOL_NAME)
         try:
             n = run(lambda: self._client.batch_delete(prefix))
             log.info("AutumnKVCacheStorage.clear deleted %d keys under %r", n, prefix)

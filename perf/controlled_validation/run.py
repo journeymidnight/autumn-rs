@@ -208,7 +208,7 @@ class Cluster:
         else:
             raise RuntimeError('partition RPC not ready')
         if self.partitions > 1:
-            self.op('presplit', '--namespace', 'bench', '--tenant', 'controlled',
+            self.op('presplit', '--namespace', 'bench/controlled',
                     '--count', self.partitions)
         info = self.op('info')
         if f'{self.partitions} partitions' not in info:

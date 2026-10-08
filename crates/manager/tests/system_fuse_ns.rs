@@ -3,7 +3,7 @@
 //! The extent DATA path bypasses `FsState`'s `kv_*` helpers for performance
 //! (read → `get_many_into`, write append → `put_many_fenced`), calling the
 //! scoped client directly. Both paths and the `kv_*` metadata paths must land
-//! at the SAME `fs/{tenant}/[type]…` keys, or a cold remount's range-scan/read
+//! at the SAME `fs/[type]…` keys, or a cold remount's range-scan/read
 //! wouldn't find the extents the append path wrote. Every OTHER fuse test
 //! write+read within ONE warm `FsState`, so a key mismatch there is invisible;
 //! this test is the exact blind spot:
@@ -12,12 +12,6 @@
 //! the `FsState` (unmount), open a NEW one (cold `scan_extents`), read it back
 //! byte-exact. Fails if the append path's extents aren't at the same keys the
 //! cold scan/read use.
-//!
-//! (2026-07-19: the former `two_tenants_isolate_same_inode`
-//! + `stale_volume_data_refuses_mount` cases were REMOVED — fuse no longer has a
-//! tenant segment (`fs/…` is one global tree; multi-tree isolation is by distinct
-//! namespaces, §8.9), so per-tenant isolation / per-tenant stale-volume refusal are
-//! no longer meaningful.)
 //!
 //! Driven directly through `FsState` (the kernel FUSE mount layer is unchanged).
 //! `#[ignore]` — needs a live cluster (manager + 2 EN + PS), same as

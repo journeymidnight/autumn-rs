@@ -332,8 +332,8 @@ impl AutumnManager {
             // ── manager-as-KDC (data-plane authz) ────────────
             MSG_MINT_TOKEN => self.handle_mint_token(payload).await,
             MSG_GET_AUTHZ_CONFIG => self.handle_get_authz_config().await,
-            MSG_TENANT_CREATE => self.handle_tenant_create(payload).await,
-            MSG_TENANT_DELETE => self.handle_tenant_delete(payload).await,
+            MSG_PRINCIPAL_CREATE => self.handle_principal_create(payload).await,
+            MSG_PRINCIPAL_DELETE => self.handle_principal_delete(payload).await,
             // ── namespace registry ─────────────────────────
             MSG_NAMESPACE_CREATE => self.handle_namespace_create(payload).await,
             MSG_NAMESPACE_DELETE => self.handle_namespace_delete(payload).await,
@@ -390,9 +390,9 @@ impl AutumnManager {
 
     // ── manager-as-KDC (data-plane authz) ─────────────────────────
 
-    /// `MSG_MINT_TOKEN` — a client authenticates with its permanent tenant
+    /// `MSG_MINT_TOKEN` — a client authenticates with its permanent principal
     /// credential and receives a short-TTL signed capability token. Leader-only:
-    /// the tenant account DB is authoritative only on the leader (replayed on
+    /// the principal account DB is authoritative only on the leader (replayed on
     /// promotion); a follower's copy may be stale/empty.
     async fn handle_mint_token(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
@@ -421,10 +421,10 @@ impl AutumnManager {
             }
         };
 
-        // Verify the credential (constant-time). A missing tenant and a wrong
+        // Verify the credential (constant-time). A missing principal and a wrong
         // credential return the SAME opaque error (don't reveal which).
         let allowed_prefixes = {
-            let accts = self.tenant_accounts.borrow();
+            let accts = self.principal_accounts.borrow();
             match accts.get(&req.principal) {
                 Some(acct)
                     if crate::authz::ct_eq_32(
@@ -437,7 +437,7 @@ impl AutumnManager {
                 _ => {
                     return Ok(rkyv_encode(&MintTokenResp {
                         code: CODE_PRECONDITION,
-                        message: "tenant or credential invalid".to_string(),
+                        message: "principal or credential invalid".to_string(),
                         token: Vec::new(),
                         exp: 0,
                     }));
@@ -477,17 +477,15 @@ impl AutumnManager {
     }
 
     /// `MSG_GET_AUTHZ_CONFIG` — PS polls this (cached) to learn the public keys
-    /// + protected prefixes + the registered namespace list.
+    /// + the registered namespace list.
     ///
     /// **LEADER-GATED (D2, coco P1).** Pre-D2 this was intentionally
     /// follower-answerable because the response was STATIC local config (the same
     /// signing-key file on every manager via cluster.sh). D2 folded in DYNAMIC,
-    /// leader-maintained state — the `namespaces` list + the owner-derived
-    /// auto-protected prefixes come from the etcd registry, which only the leader
-    /// replays. A follower's shadow is empty/stale, so answering from it would
-    /// publish an EMPTY namespace list (Layer-A would then reject every write in
-    /// SD-2) and drop the auto-protected prefixes (an owned namespace would go
-    /// unprotected). So we refuse from a follower with `CODE_NOT_LEADER`; the PS
+    /// leader-maintained state — the `namespaces` list comes from the etcd
+    /// registry, which only the leader replays. A follower's shadow is
+    /// empty/stale, so answering from it would publish an EMPTY namespace list
+    /// (Layer-A would then reject every write). So we refuse from a follower with `CODE_NOT_LEADER`; the PS
     /// `fetch_authz_config_once` rotates to the leader on that code AND keeps its
     /// last-known cached config through the election window (it only `install`s
     /// on `CODE_OK`), so enforcement never fail-opens on a transient follower hit.
@@ -504,31 +502,18 @@ impl AutumnManager {
             Some(k) => (true, k.published()),
             None => (false, Vec::new()),
         };
-        // D2/D7: derive both prefix lists from the namespace registry.
-        //  - `namespaces` = ALL registered prefixes (Layer-A data source, SD-2).
-        //  - `protected_prefixes` = the manually-configured D6 list (kept as a
-        //    fallback / union member so `--auth-protected-prefix` never breaks)
-        //    UNIONED with every registry namespace whose owner_tenant.is_some()
-        //    (auto-protected — replaces the hand-maintained list over time).
-        // Both are de-duplicated so a manually-listed prefix that is also an
-        // owned namespace appears once.
-        let mut protected: Vec<Vec<u8>> = self.protected_prefixes.borrow().clone();
-        let mut namespaces: Vec<Vec<u8>> = Vec::new();
-        {
-            let ns = self.namespaces.borrow();
-            for row in ns.values() {
-                namespaces.push(row.prefix.clone());
-                if row.owner_tenant.is_some() && !protected.contains(&row.prefix) {
-                    protected.push(row.prefix.clone());
-                }
-            }
-        }
+        // Layer-A's data source: every registered namespace prefix.
+        let namespaces: Vec<Vec<u8>> = self
+            .namespaces
+            .borrow()
+            .values()
+            .map(|row| row.prefix.clone())
+            .collect();
         Ok(rkyv_encode(&GetAuthzConfigResp {
             code: CODE_OK,
             message: String::new(),
             enabled,
             public_keys,
-            protected_prefixes: protected,
             namespaces,
             token_ttl_secs: self.token_ttl_secs.get(),
             clock_skew_secs: self.clock_skew_secs.get(),
@@ -536,30 +521,30 @@ impl AutumnManager {
         }))
     }
 
-    /// `MSG_TENANT_CREATE` — admin creates/rotates a tenant account. Leader-only,
+    /// `MSG_PRINCIPAL_CREATE` — admin creates/rotates a principal account. Leader-only,
     /// Admin connection only. Returns the freshly-generated permanent credential
     /// (shown once; only its SHA-256 hash is stored).
-    async fn handle_tenant_create(&self, payload: Bytes) -> HandlerResult {
+    async fn handle_principal_create(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
-            return Ok(rkyv_encode(&TenantCreateResp {
+            return Ok(rkyv_encode(&PrincipalCreateResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
                 credential: Vec::new(),
             }));
         }
-        let req: TenantCreateReq =
+        let req: PrincipalCreateReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
 
-        if req.tenant.is_empty() {
-            return Ok(rkyv_encode(&TenantCreateResp {
+        if req.principal.is_empty() {
+            return Ok(rkyv_encode(&PrincipalCreateResp {
                 code: CODE_INVALID_ARGUMENT,
-                message: "tenant must be non-empty".to_string(),
+                message: "principal must be non-empty".to_string(),
                 credential: Vec::new(),
             }));
         }
         if req.allowed_prefixes.is_empty() {
-            return Ok(rkyv_encode(&TenantCreateResp {
+            return Ok(rkyv_encode(&PrincipalCreateResp {
                 code: CODE_INVALID_ARGUMENT,
                 message: "at least one allowed_prefix required".to_string(),
                 credential: Vec::new(),
@@ -569,7 +554,7 @@ impl AutumnManager {
         let mut allowed_prefixes = req.allowed_prefixes.clone();
         for p in &mut allowed_prefixes {
             if p.is_empty() {
-                return Ok(rkyv_encode(&TenantCreateResp {
+                return Ok(rkyv_encode(&PrincipalCreateResp {
                     code: CODE_INVALID_ARGUMENT,
                     message: "empty allowed_prefix".to_string(),
                     credential: Vec::new(),
@@ -586,65 +571,65 @@ impl AutumnManager {
             use rand::RngCore;
             rand::rngs::OsRng.fill_bytes(&mut cred);
         }
-        let acct = crate::persist::records::TenantAccountRecord {
-            tenant: req.tenant.clone(),
+        let acct = crate::persist::records::PrincipalAccountRecord {
+            principal: req.principal.clone(),
             credential_hash: crate::authz::credential_hash(&cred),
             allowed_prefixes,
         };
         // Serialize the whole write critical section (etcd → memory apply) so a
-        // concurrent same-tenant op can't commit to etcd in one order but apply
+        // concurrent same-principal op can't commit to etcd in one order but apply
         // to memory in the other (coco P1). etcd-first (Programming Note 1),
         // fenced txn.
-        let _admin = self.tenant_admin_lock.lock().await;
-        let key = format!("{}{}", crate::TENANT_ACCOUNT_PREFIX, req.tenant);
+        let _admin = self.principal_admin_lock.lock().await;
+        let key = format!("{}{}", crate::PRINCIPAL_PREFIX, req.principal);
         if let Some(etcd) = &self.etcd {
             if let Err(err) = etcd
                 .put_msgs_txn(vec![(key, crate::persist::encode(&acct))])
                 .await
             {
-                return Ok(rkyv_encode(&TenantCreateResp {
+                return Ok(rkyv_encode(&PrincipalCreateResp {
                     code: Self::err_to_code(&err),
                     message: err.to_string(),
                     credential: Vec::new(),
                 }));
             }
         }
-        self.tenant_accounts
+        self.principal_accounts
             .borrow_mut()
-            .insert(req.tenant.clone(), acct);
-        Ok(rkyv_encode(&TenantCreateResp {
+            .insert(req.principal.clone(), acct);
+        Ok(rkyv_encode(&PrincipalCreateResp {
             code: CODE_OK,
             message: String::new(),
             credential: cred.to_vec(),
         }))
     }
 
-    /// `MSG_TENANT_DELETE` — admin removes a tenant account (stops renewal; the
-    /// tenant's current token still works until it expires). Leader-only,
+    /// `MSG_PRINCIPAL_DELETE` — admin removes a principal account (stops renewal;
+    /// the principal's current token still works until it expires). Leader-only,
     /// Admin connection only.
-    async fn handle_tenant_delete(&self, payload: Bytes) -> HandlerResult {
+    async fn handle_principal_delete(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Self::code_resp(Self::err_to_code(&err), err.to_string());
         }
-        let req: TenantDeleteReq =
+        let req: PrincipalDeleteReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        // Same serialization as tenant-create (coco P1): create/delete of the
-        // same tenant must not reorder between etcd and memory.
-        let _admin = self.tenant_admin_lock.lock().await;
-        let key = format!("{}{}", crate::TENANT_ACCOUNT_PREFIX, req.tenant);
+        // Same serialization as principal-create (coco P1): create/delete of the
+        // same principal must not reorder between etcd and memory.
+        let _admin = self.principal_admin_lock.lock().await;
+        let key = format!("{}{}", crate::PRINCIPAL_PREFIX, req.principal);
         if let Some(etcd) = &self.etcd {
             if let Err(err) = etcd.put_and_delete_txn(Vec::new(), vec![key]).await {
                 return Self::code_resp(Self::err_to_code(&err), err.to_string());
             }
         }
-        self.tenant_accounts.borrow_mut().remove(&req.tenant);
+        self.principal_accounts.borrow_mut().remove(&req.principal);
         Self::code_resp(CODE_OK, String::new())
     }
 
     /// `MSG_NAMESPACE_CREATE` (D2) — admin registers a namespace.
     /// Leader-only, Admin connection only. Rejects reserved names + prefix-overlap;
     /// etcd-first (Programming Note 1), leader-fenced, serialized on
-    /// `namespace_admin_lock`. Mirrors `handle_tenant_create`.
+    /// `namespace_admin_lock`. Mirrors `handle_principal_create`.
     async fn handle_namespace_create(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&NamespaceCreateResp {
@@ -663,7 +648,7 @@ impl AutumnManager {
                 message: msg,
             }));
         }
-        // Reserved-name reject (fs/kvc/mem/default).
+        // Reserved-name reject (fs/kvc/mem).
         if crate::RESERVED_NAMESPACE_NAMES.contains(&req.name.as_str()) {
             return Ok(rkyv_encode(&NamespaceCreateResp {
                 code: CODE_INVALID_ARGUMENT,
@@ -675,8 +660,8 @@ impl AutumnManager {
 
         // Serialize the whole critical section (existence + disjointness check →
         // etcd write → in-mem apply) so two concurrent creates can't both pass
-        // the checks and then commit in a conflicting order (mirrors the tenant
-        // admin lock — coco P1 class).
+        // the checks and then commit in a conflicting order (mirrors the
+        // principal admin lock — coco P1 class).
         let _admin = self.namespace_admin_lock.lock().await;
 
         // Already-exists + prefix-disjointness check (under the lock).
@@ -704,7 +689,6 @@ impl AutumnManager {
         let row = crate::persist::records::NamespaceRecord {
             name: req.name.clone(),
             prefix: new_prefix,
-            owner_tenant: req.owner_tenant.clone(),
             presplit: req.presplit.clone(),
             created_at: Self::epoch_seconds(),
         };
@@ -732,7 +716,7 @@ impl AutumnManager {
     /// (`fs`/`kvc`/`mem`). The NON-EMPTY guard (`--force`) is enforced
     /// CLIENT-SIDE in `autumn-op` (the manager has no KV data-plane client), so
     /// this handler only drops the etcd registry row. Mirrors
-    /// `handle_tenant_delete`.
+    /// `handle_principal_delete`.
     async fn handle_namespace_delete(&self, payload: Bytes) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Self::code_resp(Self::err_to_code(&err), err.to_string());
@@ -923,11 +907,11 @@ impl AutumnManager {
             }));
         }
         let mut principals: Vec<PrincipalRow> = self
-            .tenant_accounts
+            .principal_accounts
             .borrow()
             .values()
             .map(|a| PrincipalRow {
-                name: a.tenant.clone(),
+                name: a.principal.clone(),
                 grants: a.allowed_prefixes.clone(),
             })
             .collect();
@@ -7494,15 +7478,12 @@ impl AutumnManager {
                 base: 0,
             }));
         }
-        // SD-3 (review P2-4): the volume is concatenated into an etcd
-        // counter key, so reject anything but empty or a canonical
-        // `ns/tenant/volume/` prefix (prevents forging the global key / churning
-        // another tenant's counter / non-canonical duplicate counters).
-        if !crate::fs_alloc::valid_alloc_volume(&req.volume) {
+        // There is one inode counter; `volume` survives only on the frozen
+        // client surface.
+        if !req.volume.is_empty() {
             return Ok(rkyv_encode(&AllocInodesResp {
                 code: CODE_INVALID_ARGUMENT,
-                message: "volume must be empty or a canonical ns/tenant/volume/ prefix"
-                    .to_string(),
+                message: "volume must be empty".to_string(),
                 base: 0,
             }));
         }
@@ -7516,7 +7497,7 @@ impl AutumnManager {
                 base: 0,
             }));
         }
-        match self.alloc_fs_inodes(req.count as u64, req.floor, &req.volume).await {
+        match self.alloc_fs_inodes(req.count as u64, req.floor).await {
             Ok(base) => Ok(rkyv_encode(&AllocInodesResp {
                 code: CODE_OK,
                 message: String::new(),
@@ -8029,7 +8010,7 @@ mod split_inflight_guard_tests {
 #[cfg(test)]
 mod authz_kdc_tests {
     //! Stage 1 acceptance: drive the KDC handlers end-to-end in
-    //! memory mode (leader=true, no etcd) — tenant-create → mint → publish
+    //! memory mode (leader=true, no etcd) — principal-create → mint → publish
     //! config → verify → expiry-fail → byte-flip-fail → delete-stops-renewal.
     use super::*;
     use crate::AutumnManager;
@@ -8067,17 +8048,16 @@ mod authz_kdc_tests {
             mgr.set_authz_keyring(
                 crate::authz::AuthzKeyring::from_file_contents(&keyfile()).unwrap(),
             );
-            mgr.set_protected_prefixes(vec![b"mem/".to_vec()]);
             mgr.set_token_ttl_secs(3600);
             let cluster_id = mgr.cluster_id.borrow().clone();
 
-            // ── (1) tenant-create (admin) ──────────────────────────────
-            let ok_create = rkyv_encode(&TenantCreateReq {
-                tenant: "acme".to_string(),
+            // ── (1) principal-create (admin) ───────────────────────────
+            let ok_create = rkyv_encode(&PrincipalCreateReq {
+                principal: "acme".to_string(),
                 allowed_prefixes: vec![b"mem/acme/".to_vec()],
             });
-            let resp: TenantCreateResp =
-                rkyv_decode(&mgr.handle_tenant_create(ok_create).await.unwrap()).unwrap();
+            let resp: PrincipalCreateResp =
+                rkyv_decode(&mgr.handle_principal_create(ok_create).await.unwrap()).unwrap();
             assert_eq!(resp.code, CODE_OK, "{}", resp.message);
             let cred = resp.credential;
             assert_eq!(cred.len(), 32);
@@ -8093,7 +8073,7 @@ mod authz_kdc_tests {
             assert!(!mresp.token.is_empty());
             let exp = mresp.exp;
 
-            // wrong credential → refused (same opaque error as unknown tenant)
+            // wrong credential → refused (same opaque error as unknown principal)
             let mint_bad = rkyv_encode(&MintTokenReq {
                 principal: "acme".to_string(),
                 credential: vec![9u8; 32],
@@ -8114,7 +8094,6 @@ mod authz_kdc_tests {
                 rkyv_decode(&mgr.handle_get_authz_config().await.unwrap()).unwrap();
             assert!(cfg.enabled);
             assert_eq!(cfg.public_keys.len(), 1);
-            assert_eq!(cfg.protected_prefixes, vec![b"mem/".to_vec()]);
             assert_eq!(
                 cfg.public_keys[0].ed25519_pub,
                 public_key_from_seed(&seed_1()).to_vec()
@@ -8145,12 +8124,12 @@ mod authz_kdc_tests {
             let err = verify_token(&tampered, &rk, exp - 1, cfg.clock_skew_secs).unwrap_err();
             assert_eq!(err, AuthReject::BadSignature);
 
-            // ── (6) tenant-delete stops future renewal ─────────────────
-            let del = rkyv_encode(&TenantDeleteReq {
-                tenant: "acme".to_string(),
+            // ── (6) principal-delete stops future renewal ──────────────
+            let del = rkyv_encode(&PrincipalDeleteReq {
+                principal: "acme".to_string(),
             });
             let dresp: CodeResp =
-                rkyv_decode(&mgr.handle_tenant_delete(del).await.unwrap()).unwrap();
+                rkyv_decode(&mgr.handle_principal_delete(del).await.unwrap()).unwrap();
             assert_eq!(dresp.code, CODE_OK);
             let mint_after_del = rkyv_encode(&MintTokenReq {
                 principal: "acme".to_string(),
@@ -8158,7 +8137,7 @@ mod authz_kdc_tests {
             });
             let mr2: MintTokenResp =
                 rkyv_decode(&mgr.handle_mint_token(mint_after_del).await.unwrap()).unwrap();
-            assert_ne!(mr2.code, CODE_OK, "deleted tenant must not renew");
+            assert_ne!(mr2.code, CODE_OK, "deleted principal must not renew");
         });
     }
 
@@ -8202,15 +8181,9 @@ mod namespace_registry_tests {
         AutumnManager::new()
     }
 
-    fn create(
-        m: &AutumnManager,
-        name: &str,
-        owner: Option<&str>,
-        presplit: Vec<Vec<u8>>,
-    ) -> NamespaceCreateResp {
+    fn create(m: &AutumnManager, name: &str, presplit: Vec<Vec<u8>>) -> NamespaceCreateResp {
         let req = NamespaceCreateReq {
             name: name.to_string(),
-            owner_tenant: owner.map(|s| s.to_string()),
             presplit,
         };
         let payload: Bytes = rkyv_encode(&req);
@@ -8242,7 +8215,7 @@ mod namespace_registry_tests {
         let m = mgr();
         run(async { m.seed_builtin_namespaces().await.unwrap() });
         assert_eq!(
-            create(&m, "bench", Some("acme"), vec![vec![0x01u8, 0x02]]).code,
+            create(&m, "bench", vec![vec![0x01u8, 0x02]]).code,
             CODE_OK
         );
         let r = list(&m);
@@ -8258,10 +8231,7 @@ mod namespace_registry_tests {
         // Rich fields carried through.
         let bench = r.namespaces.iter().find(|n| n.name == "bench").unwrap();
         assert_eq!(bench.prefix, b"bench/".to_vec());
-        assert_eq!(bench.owner_tenant.as_deref(), Some("acme"));
         assert_eq!(bench.presplit, vec![vec![0x01u8, 0x02]]);
-        let fs = r.namespaces.iter().find(|n| n.name == "fs").unwrap();
-        assert!(fs.owner_tenant.is_none(), "builtin fs is existence-only");
     }
 
     #[test]
@@ -8276,14 +8246,14 @@ mod namespace_registry_tests {
 
     // ── principal-list ──────────────────────────────────────────────
 
-    fn principal_create(m: &AutumnManager, name: &str, grants: &[&[u8]]) -> TenantCreateResp {
-        let req = TenantCreateReq {
-            tenant: name.to_string(),
+    fn principal_create(m: &AutumnManager, name: &str, grants: &[&[u8]]) -> PrincipalCreateResp {
+        let req = PrincipalCreateReq {
+            principal: name.to_string(),
             allowed_prefixes: grants.iter().map(|g| g.to_vec()).collect(),
         };
         let payload: Bytes = rkyv_encode(&req);
-        let resp = run(async { m.handle_tenant_create(payload).await.unwrap() });
-        rkyv_decode::<TenantCreateResp>(&resp).expect("decode TenantCreateResp")
+        let resp = run(async { m.handle_principal_create(payload).await.unwrap() });
+        rkyv_decode::<PrincipalCreateResp>(&resp).expect("decode PrincipalCreateResp")
     }
 
     fn principal_list(m: &AutumnManager) -> PrincipalListResp {
@@ -8321,7 +8291,7 @@ mod namespace_registry_tests {
         assert_eq!(created.code, CODE_OK);
         assert!(!created.credential.is_empty(), "create returns the credential once");
         assert_ne!(
-            m.tenant_accounts.borrow().get("fs").unwrap().credential_hash,
+            m.principal_accounts.borrow().get("fs").unwrap().credential_hash,
             [0u8; 32],
             "the account stores a real credential hash"
         );
@@ -8527,7 +8497,6 @@ mod namespace_registry_tests {
         for name in ["fs", "kvc", "mem"] {
             let row = ns.get(name).unwrap_or_else(|| panic!("{name} not seeded"));
             assert_eq!(row.prefix, format!("{name}/").into_bytes());
-            assert!(row.owner_tenant.is_none(), "{name} should be existence-only");
         }
         // Idempotent: a second seed leaves them untouched (memory mode).
         run(async { m.seed_builtin_namespaces().await.unwrap() });
@@ -8537,12 +8506,12 @@ mod namespace_registry_tests {
     #[test]
     fn create_delete_round_trip() {
         let m = mgr();
-        let r = create(&m, "bench", None, Vec::new());
+        let r = create(&m, "bench", Vec::new());
         assert_eq!(r.code, CODE_OK, "{}", r.message);
         assert!(m.namespaces.borrow().contains_key("bench"));
 
         // Re-create is a precondition failure (already exists).
-        let dup = create(&m, "bench", None, Vec::new());
+        let dup = create(&m, "bench", Vec::new());
         assert_eq!(dup.code, CODE_PRECONDITION);
 
         let d = delete(&m, "bench");
@@ -8558,19 +8527,18 @@ mod namespace_registry_tests {
     fn presplit_points_are_stored_verbatim() {
         let m = mgr();
         let pts = vec![vec![0x01u8, 0x02], vec![0xffu8]];
-        let r = create(&m, "bench", Some("acme"), pts.clone());
+        let r = create(&m, "bench", pts.clone());
         assert_eq!(r.code, CODE_OK, "{}", r.message);
         let ns = m.namespaces.borrow();
         let row = ns.get("bench").unwrap();
         assert_eq!(row.presplit, pts);
-        assert_eq!(row.owner_tenant.as_deref(), Some("acme"));
     }
 
     #[test]
     fn reserved_names_are_rejected() {
         let m = mgr();
-        for name in ["fs", "kvc", "mem", "default"] {
-            let r = create(&m, name, None, Vec::new());
+        for name in ["fs", "kvc", "mem"] {
+            let r = create(&m, name, Vec::new());
             assert_eq!(r.code, CODE_INVALID_ARGUMENT, "{name} must be reserved");
         }
     }
@@ -8579,7 +8547,7 @@ mod namespace_registry_tests {
     fn invalid_charset_is_rejected() {
         let m = mgr();
         for bad in ["Bench", "a/b", "has space", "", "up_UP"] {
-            let r = create(&m, bad, None, Vec::new());
+            let r = create(&m, bad, Vec::new());
             assert_eq!(r.code, CODE_INVALID_ARGUMENT, "'{bad}' must be rejected");
         }
     }
@@ -8594,15 +8562,14 @@ mod namespace_registry_tests {
             crate::persist::records::NamespaceRecord {
                 name: "deep".to_string(),
                 prefix: b"a/b/".to_vec(),
-                owner_tenant: None,
                 presplit: Vec::new(),
                 created_at: 0,
             },
         );
-        let r = create(&m, "a", None, Vec::new());
+        let r = create(&m, "a", Vec::new());
         assert_eq!(r.code, CODE_INVALID_ARGUMENT, "overlapping prefix must reject");
         // A disjoint name is still accepted.
-        let ok = create(&m, "bench", None, Vec::new());
+        let ok = create(&m, "bench", Vec::new());
         assert_eq!(ok.code, CODE_OK, "{}", ok.message);
     }
 
@@ -8621,9 +8588,8 @@ mod namespace_registry_tests {
     fn get_authz_config_bridges_registry() {
         let m = mgr();
         run(async { m.seed_builtin_namespaces().await.unwrap() });
-        // An OWNED namespace is auto-protected; an unowned one is registered only.
-        assert_eq!(create(&m, "bench", Some("acme"), Vec::new()).code, CODE_OK);
-        assert_eq!(create(&m, "scratch", None, Vec::new()).code, CODE_OK);
+        assert_eq!(create(&m, "bench", Vec::new()).code, CODE_OK);
+        assert_eq!(create(&m, "scratch", Vec::new()).code, CODE_OK);
 
         let cfg = authz_config(&m);
         // `namespaces` carries EVERY registered prefix (Layer-A data source).
@@ -8636,11 +8602,7 @@ mod namespace_registry_tests {
         ] {
             assert!(cfg.namespaces.contains(&p), "namespaces missing {p:?}");
         }
-        // `protected_prefixes` carries ONLY the owned namespace (bench), not the
-        // existence-only families or the unowned `scratch`.
-        assert!(cfg.protected_prefixes.contains(&b"bench/".to_vec()));
-        assert!(!cfg.protected_prefixes.contains(&b"fs/".to_vec()));
-        assert!(!cfg.protected_prefixes.contains(&b"scratch/".to_vec()));
+        assert_eq!(cfg.namespaces.len(), 5);
     }
 
     #[test]
@@ -8657,21 +8619,9 @@ mod namespace_registry_tests {
         let follower = authz_config(&m);
         assert_eq!(follower.code, CODE_NOT_LEADER, "follower must refuse");
         // A refused response carries NO registry data — a PS never installs an
-        // empty namespace list or drops protected prefixes from a follower.
+        // empty namespace list from a follower.
         assert!(follower.namespaces.is_empty());
-        assert!(follower.protected_prefixes.is_empty());
         assert!(follower.public_keys.is_empty());
-    }
-
-    #[test]
-    fn manual_protected_prefix_list_is_preserved_as_union_member() {
-        let m = mgr();
-        // The D6 manual `--auth-protected-prefix` list must survive the bridge.
-        m.set_protected_prefixes(vec![b"legacy/".to_vec()]);
-        assert_eq!(create(&m, "bench", Some("acme"), Vec::new()).code, CODE_OK);
-        let cfg = authz_config(&m);
-        assert!(cfg.protected_prefixes.contains(&b"legacy/".to_vec()), "manual list dropped");
-        assert!(cfg.protected_prefixes.contains(&b"bench/".to_vec()), "owned ns not bridged");
     }
 }
 // end of rpc_handlers.rs

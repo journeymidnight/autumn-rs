@@ -474,8 +474,8 @@ fn known_manager_opcode(opcode: u8) -> bool {
             | MSG_GET_CLUSTER_OVERVIEW
             | MSG_MINT_TOKEN
             | MSG_GET_AUTHZ_CONFIG
-            | MSG_TENANT_CREATE
-            | MSG_TENANT_DELETE
+            | MSG_PRINCIPAL_CREATE
+            | MSG_PRINCIPAL_DELETE
             | MSG_ALLOC_INODES
             | MSG_AUTOPOLICY_GET
             | MSG_AUTOPOLICY_SET
@@ -666,7 +666,7 @@ mod tests {
             .is_err());
         // Account and namespace mutations are operator-only.
         for op in [
-            crate::manager_rpc::MSG_TENANT_CREATE,
+            crate::manager_rpc::MSG_PRINCIPAL_CREATE,
             crate::manager_rpc::MSG_NAMESPACE_CREATE,
             crate::manager_rpc::MSG_NAMESPACE_SET_PRESPLIT,
         ] {
@@ -677,7 +677,7 @@ mod tests {
             .check_opcode(crate::manager_rpc::MSG_CREATE_STREAM)
             .is_ok());
         assert!(n
-            .check_opcode(crate::manager_rpc::MSG_TENANT_CREATE)
+            .check_opcode(crate::manager_rpc::MSG_PRINCIPAL_CREATE)
             .is_ok());
         // The retired raw merge txn (no freeze drain) is refused even to Admin.
         assert!(n.check_opcode(0x34).is_err());

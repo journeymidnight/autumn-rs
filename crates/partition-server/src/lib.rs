@@ -2779,8 +2779,8 @@ pub struct PartitionServer {
     /// when `--cpuset` was explicitly supplied; otherwise `max =
     /// usize::MAX` and `would_exceed` always returns false.
     pub(crate) partition_budget: std::sync::Arc<PartitionBudget>,
-    /// shared data-plane authz runtime (public keys + protected
-    /// prefixes), refreshed by the main-thread `authz_config_poll_loop` and read
+    /// shared data-plane authz runtime (public keys + registered
+    /// namespaces), refreshed by the main-thread `authz_config_poll_loop` and read
     /// by every connection task. `Arc` because connection tasks run on the
     /// partition OS threads. Opt-in: disabled until the manager reports a
     /// signing key via `MSG_GET_AUTHZ_CONFIG`.
@@ -4303,7 +4303,6 @@ impl PartitionServer {
                 ps_id = self.ps_id,
                 enabled = resp.enabled,
                 keys = resp.public_keys.len(),
-                protected = resp.protected_prefixes.len(),
                 "authz config updated"
             );
         }
@@ -4311,7 +4310,7 @@ impl PartitionServer {
     }
 
     /// periodic authz-config refresh (mirrors `region_sync_loop`).
-    /// The config rarely changes (key rotation / protected-prefix edits), so a
+    /// The config rarely changes (key rotation / namespace edits), so a
     /// 5 s cadence is ample; the initial load happens synchronously in
     /// `finish_connect` so enforcement is armed before the first connection.
     async fn authz_config_poll_loop(&self) {
@@ -5196,7 +5195,7 @@ impl PartitionServer {
         });
 
         // refresh the data-plane authz config from the manager (key
-        // rotation / protected-prefix edits) on a 5 s cadence.
+        // rotation / namespace edits) on a 5 s cadence.
         let s_authz = self.clone();
         spawn_supervised("ps_authz_config", move || {
             let s = s_authz.clone();
@@ -5725,8 +5724,8 @@ fn authz_now_secs() -> u64 {
 /// `principal` already had, now also load-bearing for the version.
 #[derive(Default)]
 pub(crate) struct ConnGateState {
-    /// Bound by a successful `MSG_CLIENT_AUTH`. `None` = anonymous (denied on
-    /// protected prefixes only).
+    /// Bound by a successful `MSG_CLIENT_AUTH`. `None` = anonymous (denied
+    /// every keyed op while authz is on).
     pub principal: Option<crate::authz::BoundPrincipal>,
     pub protocol: Option<autumn_rpc::version_hello::Negotiated>,
 }
@@ -5834,7 +5833,7 @@ fn authz_gate(
             );
         }
     }
-    // Layer-B: protected-prefix / capability-token enforcement (snapshot-derived).
+    // Layer-B: capability-token enforcement (snapshot-derived).
     if snap.enabled {
         let now = authz_now_secs();
         if let Some((code, msg)) =
@@ -6046,7 +6045,7 @@ async fn handle_ps_connection(
     // would fall back to the req_tx delegate.
     part: Option<Rc<RefCell<PartitionData>>>,
     owner_part: u64,
-    // shared authz runtime (public keys + protected prefixes),
+    // shared authz runtime (public keys + registered namespaces),
     // refreshed by the main-thread poll loop. Disabled → zero hot-path cost.
     authz: std::sync::Arc<crate::authz::AuthzState>,
 ) -> Result<()> {
@@ -14044,7 +14043,6 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             message: String::new(),
             enabled: false,
             public_keys: Vec::new(),
-            protected_prefixes: Vec::new(),
             namespaces: vec![b"fs/".to_vec()],
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
@@ -14198,7 +14196,6 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                     message: String::new(),
                     enabled: false,
                     public_keys: Vec::new(),
-                    protected_prefixes: Vec::new(),
                     namespaces: vec![b"other/".to_vec()],
                     token_ttl_secs: 3600,
                     clock_skew_secs: 60,
@@ -15002,7 +14999,7 @@ mod maintenance_phase_tests {
 mod authz_enforcement_tests {
     //! Stage 2: end-to-end connection-layer enforcement over a real
     //! TCP `handle_ps_connection`, using the mock req_rx loop (part=None). Drives
-    //! a signed CLIENT_AUTH + cross-tenant requests and asserts admit/deny.
+    //! a signed CLIENT_AUTH + out-of-grant requests and asserts admit/deny.
     use super::*;
     use autumn_rpc::cap_token::{sign_claims, CapClaims, CAP_TYP, CAP_VER};
     use autumn_rpc::manager_rpc::{AuthzPublicKey, GetAuthzConfigResp};
@@ -15015,7 +15012,7 @@ mod authz_enforcement_tests {
             .as_secs()
     }
 
-    /// An enabled AuthzState with one signing key (kid 1) + protected `mem/`.
+    /// An enabled AuthzState with one signing key (kid 1).
     fn enabled_authz(sk: &SigningKey) -> std::sync::Arc<crate::authz::AuthzState> {
         let st = crate::authz::AuthzState::new();
         st.install(&GetAuthzConfigResp {
@@ -15027,7 +15024,6 @@ mod authz_enforcement_tests {
                 ed25519_pub: sk.verifying_key().to_bytes().to_vec(),
                 disabled: false,
             }],
-            protected_prefixes: vec![b"mem/".to_vec()],
             namespaces: Vec::new(),
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
@@ -15042,7 +15038,7 @@ mod authz_enforcement_tests {
     /// config — keeps enforcing through the election window and NEVER
     /// fail-opens. This pins the `AuthzState` half of that contract: `install`
     /// is the sole mutator, so absent a fresh successful install the enabled
-    /// flag + protected prefixes + namespace list are all unchanged.
+    /// flag + namespace list are both unchanged.
     #[test]
     fn cached_authz_config_survives_absent_a_fresh_install() {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
@@ -15056,7 +15052,6 @@ mod authz_enforcement_tests {
                 ed25519_pub: sk.verifying_key().to_bytes().to_vec(),
                 disabled: false,
             }],
-            protected_prefixes: vec![b"mem/".to_vec()],
             namespaces: vec![b"fs/".to_vec(), b"mem/".to_vec()],
             token_ttl_secs: 3600,
             clock_skew_secs: 60,
@@ -15064,7 +15059,6 @@ mod authz_enforcement_tests {
         });
         assert!(st.is_enabled());
         let before = st.snapshot();
-        assert_eq!(before.protected_prefixes, vec![b"mem/".to_vec()]);
         assert_eq!(before.namespaces, vec![b"fs/".to_vec(), b"mem/".to_vec()]);
         // The NOT_LEADER / error path performs NO install → the cache is intact.
         let after = st.snapshot();
@@ -15072,7 +15066,6 @@ mod authz_enforcement_tests {
             st.is_enabled(),
             "enforcement must not fail-open when no fresh leader config lands"
         );
-        assert_eq!(after.protected_prefixes, before.protected_prefixes);
         assert_eq!(after.namespaces, before.namespaces);
         assert_eq!(after.cluster_id, before.cluster_id);
     }
@@ -15210,7 +15203,7 @@ mod authz_enforcement_tests {
     }
 
     #[test]
-    fn client_auth_then_cross_tenant_deny_and_anonymous_deny() {
+    fn client_auth_then_out_of_grant_deny() {
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let sk = SigningKey::from_bytes(&[11u8; 32]);
@@ -15260,19 +15253,18 @@ mod authz_enforcement_tests {
             .into_split();
             let mut dec = FrameDecoder::new();
 
-            // (1) CLIENT_AUTH with tenant acme's token → OK, binds principal.
-            // TENANT-FIRST: the grant is the WHOLE tenant `acme/`.
-            let token = mint(&sk, vec![b"acme/".to_vec()]);
+            // (1) CLIENT_AUTH with a token granting `mem/acme/` → OK, binds principal.
+            let token = mint(&sk, vec![b"mem/acme/".to_vec()]);
             let auth_req = partition_rpc::rkyv_encode(&ClientAuthReq { token });
             let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_CLIENT_AUTH, auth_req).await;
             assert!(!f.is_error(), "CLIENT_AUTH should succeed");
             let resp: ClientAuthResp = partition_rpc::rkyv_decode(&f.payload).unwrap();
             assert_eq!(resp.code, StatusCode::Ok as u8, "{}", resp.message);
 
-            // (2) GET acme/mem/doc → authorized → delegates → OK.
+            // (2) GET mem/acme/doc → authorized → delegates → OK.
             let g = partition_rpc::rkyv_encode(&GetReq {
                 part_id: 7,
-                key: b"acme/mem/doc".to_vec(),
+                key: b"mem/acme/doc".to_vec(),
                 offset: 0,
                 length: 0,
                 region_epoch: 0,
@@ -15280,23 +15272,23 @@ mod authz_enforcement_tests {
             let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_GET_BULK, g).await;
             assert!(!f.is_error(), "authorized GET should pass");
 
-            // (3) GET other/mem/doc → cross-tenant → DENIED at the gate.
+            // (3) GET mem/other/doc → outside the grant → DENIED at the gate.
             let g2 = partition_rpc::rkyv_encode(&GetReq {
                 part_id: 7,
-                key: b"other/mem/doc".to_vec(),
+                key: b"mem/other/doc".to_vec(),
                 offset: 0,
                 length: 0,
                 region_epoch: 0,
             });
             let f = round_trip(&mut wr, &mut rd, &mut dec, 3, MSG_GET_BULK, g2).await;
-            assert!(f.is_error(), "cross-tenant GET must be denied");
+            assert!(f.is_error(), "out-of-grant GET must be denied");
             let (code, _msg) = autumn_rpc::RpcError::decode_status(&f.payload);
             assert_eq!(code, StatusCode::PermissionDenied);
 
-            // (4) PUT acme/mem/x → authorized write passes the gate.
+            // (4) PUT mem/acme/x → authorized write passes the gate.
             let put = partition_rpc::rkyv_encode(&PutReq {
                 part_id: 7,
-                key: b"acme/mem/x".to_vec(),
+                key: b"mem/acme/x".to_vec(),
                 value: b"v".to_vec(),
                 expires_at: 0,
                 region_epoch: 0,
@@ -15306,10 +15298,10 @@ mod authz_enforcement_tests {
             let f = round_trip(&mut wr, &mut rd, &mut dec, 4, MSG_PUT, put).await;
             assert!(!f.is_error(), "authorized PUT should pass");
 
-            // (5) PUT other/mem/x → cross-tenant write DENIED.
+            // (5) PUT mem/other/x → out-of-grant write DENIED.
             let put2 = partition_rpc::rkyv_encode(&PutReq {
                 part_id: 7,
-                key: b"other/mem/x".to_vec(),
+                key: b"mem/other/x".to_vec(),
                 value: b"v".to_vec(),
                 expires_at: 0,
                 region_epoch: 0,
@@ -15317,22 +15309,20 @@ mod authz_enforcement_tests {
                 lease_epoch: 0,
             });
             let f = round_trip(&mut wr, &mut rd, &mut dec, 5, MSG_PUT, put2).await;
-            assert!(f.is_error(), "cross-tenant PUT must be denied");
+            assert!(f.is_error(), "out-of-grant PUT must be denied");
             let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
             assert_eq!(code, StatusCode::PermissionDenied);
 
-            // (6) A DIFFERENT namespace within the SAME tenant → allowed: the
-            // tenant-wide `acme/` grant covers every namespace (acme/fs/, …),
-            // and PROTECT-EVERYTHING means it still needs the (bound) token.
+            // (6) Another namespace → DENIED: the grant is `mem/acme/` only.
             let g3 = partition_rpc::rkyv_encode(&GetReq {
                 part_id: 7,
-                key: b"acme/fs/inode1".to_vec(),
+                key: b"fs/inode1".to_vec(),
                 offset: 0,
                 length: 0,
                 region_epoch: 0,
             });
             let f = round_trip(&mut wr, &mut rd, &mut dec, 6, MSG_GET_BULK, g3).await;
-            assert!(!f.is_error(), "same-tenant different-namespace should pass under the acme/ grant");
+            assert!(f.is_error(), "a key in another namespace must be denied");
 
             drop(wr);
             drop(rd);

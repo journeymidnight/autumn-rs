@@ -522,7 +522,6 @@ _start_managers() {
         && extra+=(--auto-policy-default "$_auto_policy")
     if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
         extra+=(--auth-signing-key-file "$AUTUMN_AUTH_SIGNING_KEY_FILE")
-        local p; for p in ${AUTUMN_AUTH_PROTECTED_PREFIXES:-}; do extra+=(--auth-protected-prefix "$p"); done
         [[ -n "${AUTUMN_AUTH_TOKEN_TTL_SECS:-}" ]] && extra+=(--auth-token-ttl-secs "$AUTUMN_AUTH_TOKEN_TTL_SECS")
     fi
     for (( m = 0; m < ${#MANAGER_HOSTS[@]}; m++ )); do
@@ -713,14 +712,13 @@ _ensure_cluster_secret() {
     done
 }
 
-# F-AUTHZ-BUILTIN: authz is ON by default at the DEPLOY layer (the dev/test
+# Authz is ON by default at the DEPLOY layer (the dev/test
 # harness `cluster.sh` never sets AUTUMN_AUTH_* so it stays OFF). Auto-generate a
 # signing key ONCE (reused across re-deploys — re-genning would
-# invalidate every minted credential), protect the built-in namespaces, and
-# distribute the key to every manager host. Escape hatch: AUTUMN_AUTH_DISABLE=1.
-# If the operator already set AUTUMN_AUTH_SIGNING_KEY_FILE, respect it and only
-# default the protected-prefix list. Sets AUTUMN_AUTH_* env that the existing
-# `_start_managers` env→flag block consumes.
+# invalidate every minted credential) and distribute it to every manager host.
+# Escape hatch: AUTUMN_AUTH_DISABLE=1. If the operator already set
+# AUTUMN_AUTH_SIGNING_KEY_FILE, respect it. Sets AUTUMN_AUTH_* env that the
+# existing `_start_managers` env→flag block consumes.
 AUTHZ_LOCAL_DIR=""
 _ensure_authz() {
     if [[ "${AUTUMN_AUTH_DISABLE:-0}" == "1" ]]; then
@@ -728,13 +726,12 @@ _ensure_authz() {
         # in the caller's env would otherwise make `_start_managers` append
         # --auth-signing-key-file anyway, so the manager would still enforce despite
         # the "disabled" log (coco P2). Clear all authz env so disable really disables.
-        unset AUTUMN_AUTH_SIGNING_KEY_FILE AUTUMN_AUTH_PROTECTED_PREFIXES
+        unset AUTUMN_AUTH_SIGNING_KEY_FILE
         log "authz: DISABLED (AUTUMN_AUTH_DISABLE=1)"
         return
     fi
-    # TENANT-FIRST + PROTECT-EVERYTHING: when authz is on, EVERY tenant-scoped
-    # write needs a token, so there is no protected-prefix list to configure (the
-    # signing key alone arms enforcement). `--auth-protected-prefix` is retired.
+    # PROTECT-EVERYTHING: when authz is on, EVERY keyed op needs a token; the
+    # signing key alone arms enforcement.
 
     if [[ -n "${AUTUMN_AUTH_SIGNING_KEY_FILE:-}" ]]; then
         log "authz: using operator-provided key $AUTUMN_AUTH_SIGNING_KEY_FILE"
@@ -764,41 +761,40 @@ _ensure_authz() {
     log "authz: ENABLED (protect-everything) — key on ${#MANAGER_HOSTS[@]} manager(s)"
 }
 
-# F-AUTHZ-BUILTIN: mint a 'default'-tenant credential (covering every protected
-# namespace for tenant `default`) and write it driver-local for clients to pass
-# via --credential-file. Idempotent: skips if the local credential already
-# exists (re-minting ROTATES it, invalidating already-distributed copies).
+# Mint one principal per namespace family (`fs` → fs/, `kvc` → kvc/; least
+# privilege, no all-namespace key) and write each two-line credential file
+# driver-local for clients to pass via --credential-file. Idempotent: a local
+# credential that still mints on THIS cluster is kept (re-creating ROTATES it,
+# invalidating copies already handed out); one a rebuilt etcd no longer knows
+# is re-provisioned.
 _provision_credential() {
     [[ "${AUTUMN_AUTH_DISABLE:-0}" == "1" ]] && return
     [[ -z "$AUTHZ_LOCAL_DIR" ]] && return  # operator-provided key ⇒ they own credentials
-    local cred="$AUTHZ_LOCAL_DIR/default.cred"
-    # Skip ONLY if the local credential is present AND still valid on THIS
-    # cluster — a `mint-token` verify catches a wiped/rebuilt etcd (or a fresh
-    # cluster) where the local file survived but the `default` tenant account did
-    # not; skipping there would leave every client with a dead credential (coco
-    # P1). `default.cred` holds the BARE hex (mint-token's --credential-file
-    # reads a plain hex string; the native clients accept bare hex too).
-    if [[ -s "$cred" ]] && "$BIN_SRC/autumn-op" --cluster-secret-file "$CLUSTER_SECRET_LOCAL" \
-            --manager "$MANAGER_LIST" mint-token --tenant default --credential-file "$cred" >/dev/null 2>&1; then
-        log "authz: default credential valid on this cluster → $cred"
-        return
-    fi
-    [[ -s "$cred" ]] && log "authz: local default credential is stale (tenant absent here) — re-provisioning"
-    # TENANT-FIRST: grant the WHOLE tenant `default/` (covers default/fs/,
-    # default/kvc/, default/mem/ — the key layout is {tenant}/{namespace}/).
-    local tmp="$cred.tmp"
-    if "$BIN_SRC/autumn-op" --cluster-secret-file "$CLUSTER_SECRET_LOCAL" \
-            --manager "$MANAGER_LIST" tenant-create \
-            --tenant default --prefix default/ 2>/dev/null \
-            | awk '/^credential:/{print $2}' > "$tmp" && [[ -s "$tmp" ]]; then
-        chmod 600 "$tmp" 2>/dev/null || true
-        mv -f "$tmp" "$cred"   # atomic replace
-        log "authz: minted 'default' tenant credential → $cred"
-        log "  clients: fuse/autumnfs/autumn-client --credential-file $cred --tenant default"
-    else
-        rm -f "$tmp"
-        log "authz: WARN tenant-create failed — mint manually: autumn-op --cluster-secret-file $CLUSTER_SECRET_LOCAL --manager $MANAGER_LIST tenant-create --tenant default --prefix default/"
-    fi
+    local ao=( "$BIN_SRC/autumn-op" --cluster-secret-file "$CLUSTER_SECRET_LOCAL" --manager "$MANAGER_LIST" )
+    local spec p grant cred hex tmp
+    for spec in "fs fs/" "kvc kvc/"; do
+        read -r p grant <<< "$spec"
+        cred="$AUTHZ_LOCAL_DIR/$p.cred"
+        hex="$(awk '/^credential:/{print $2}' "$cred" 2>/dev/null)"
+        if [[ -n "$hex" ]] && "${ao[@]}" mint-token --principal "$p" \
+                --credential "$hex" >/dev/null 2>&1; then
+            log "authz: $p credential valid on this cluster → $cred"
+            continue
+        fi
+        [[ -s "$cred" ]] && log "authz: local $p credential is stale (principal absent here) — re-provisioning"
+        tmp="$cred.tmp"
+        if "${ao[@]}" principal-create --principal "$p" --grant "$grant" 2>/dev/null \
+                | grep -E '^(principal|credential): ' > "$tmp" \
+                && [[ "$(wc -l < "$tmp")" -eq 2 ]]; then
+            chmod 600 "$tmp" 2>/dev/null || true
+            mv -f "$tmp" "$cred"   # atomic replace
+            log "authz: minted '$p' credential → $cred"
+        else
+            rm -f "$tmp"
+            log "authz: WARN principal-create $p failed — mint manually: ${ao[*]} principal-create --principal $p --grant $grant"
+        fi
+    done
+    log "  clients: fuse/autumnfs --credential-file $AUTHZ_LOCAL_DIR/fs.cred; kvcache auth_credential_file=$AUTHZ_LOCAL_DIR/kvc.cred"
 }
 
 do_start() {
@@ -809,11 +805,11 @@ do_start() {
     fi
     _start_etcd
     _ensure_cluster_secret # every server + autumn-op needs it
-    _ensure_authz          # F-AUTHZ-BUILTIN: set AUTUMN_AUTH_* before managers start
+    _ensure_authz          # set AUTUMN_AUTH_* before managers start
     _start_managers
     _format_and_start_ens
     _bootstrap
-    _provision_credential  # F-AUTHZ-BUILTIN: mint the default credential (manager is leader)
+    _provision_credential  # mint the per-family credentials (manager is leader)
     _start_ps
     log "cluster started."
     log "  manager(s): $MANAGER_LIST"

@@ -106,11 +106,11 @@ const LISTEN_PORT: u16 = 5001;
 // Chunk size for downloading source video to a temp file before transcoding.
 const RANGE_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
 
-// gallery's keys are RELATIVE to the client's namespace binding
-// `{ns}/{tenant}/` (default gallery/gallery/) — the scoped `ClusterClient` owns
+// gallery's keys are RELATIVE to the client's scope (default `gallery/`) —
+// the scoped `ClusterClient` owns
 // the prefix and prepends it on every op (and strips it off returned range
 // keys), so `ROOT` is now empty. The two whole-store scans (`range(ROOT, …)`)
-// therefore scan the entire `{ns}/{tenant}/` scope (an empty user prefix), and
+// therefore scan the entire scope (an empty user prefix), and
 // `strip_prefix(ROOT)` is a no-op because the binding already stripped the
 // scope. Was `"gallery/"` under the old raw-client model (the namespace binding
 // now carries the prefix, so keeping it here would double-prefix).
@@ -119,7 +119,7 @@ const ROOT: &str = "";
 // First two bytes of `autumn_client`'s striped-value chunk namespace (the SDK
 // keys each stripe under `\xff\xfe…` so chunks sort AFTER every normal user
 // key — see the client crate). Under the namespace binding the chunk
-// key is `\xff\xfe…` RELATIVE to `{ns}/{tenant}/`, so it now sorts at the tail of
+// key is `\xff\xfe…` RELATIVE to the scope, so it now sorts at the tail of
 // the scope and the whole-store scans DO see it — the `is_chunk_key` guard skips
 // it (it operates on the binding-stripped relative key, which still starts with
 // these two bytes).
@@ -1857,13 +1857,12 @@ async fn main() -> Result<()> {
         .nth(1)
         .unwrap_or_else(|| "127.0.0.1:9001".to_string());
 
-    // gallery lives in its own namespace scope `{ns}/{tenant}/`
-    // (default gallery/gallery/). The scoped client PREPENDS that prefix to every
-    // key (incl. stripe chunks), so gallery's key builders emit keys RELATIVE
-    // to the scope (see `ROOT = ""`). Under authz (protected namespace), point
-    // AUTUMN_CREDENTIAL_FILE at the tenant credential from `autumn-op
-    // tenant-create` — the SDK auto-mints + renews short-TTL tokens. Without it, a
-    // plain scoped connect (works only if the namespace is unprotected).
+    // gallery lives in its own namespace scope (default `gallery/`). The
+    // scoped client PREPENDS that prefix to every key (incl. stripe chunks), so
+    // gallery's key builders emit keys RELATIVE to the scope (see `ROOT = ""`).
+    // Under authz, point AUTUMN_CREDENTIAL_FILE at a principal credential from
+    // `autumn-op principal-create` — the SDK auto-mints + renews short-TTL
+    // tokens. Without it, a plain scoped connect (works only with authz off).
     // scope is a single key-prefix (the `gallery`
     // namespace). AUTUMN_SCOPE (or legacy AUTUMN_NAMESPACE) overrides.
     let scope = std::env::var("AUTUMN_SCOPE")

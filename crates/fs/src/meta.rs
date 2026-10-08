@@ -110,9 +110,8 @@ pub async fn ensure_root(state: &mut FsState) -> Result<bool> {
     Ok(true)
 }
 
-/// verify (or stamp) this filesystem's on-disk layout version.
-/// Each tenant carries its own `[0x04]schema_version` (relative → it lives at
-/// `fs/{tenant}/[0x04]schema_version`).
+/// verify (or stamp) this filesystem's on-disk layout version, kept at
+/// `fs/[0x04]schema_version`.
 ///
 /// - **absent** → a fresh volume: stamp the current `SCHEMA_VERSION`.
 /// - **present, matches** → OK.
@@ -126,29 +125,8 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
     let k = key::schema_version_key();
     match state.kv_get_opt(&k).await? {
         None => {
-            // "No stamp" must mean a genuinely fresh filesystem — NOT an
-            // un-migrated pre-`{volume}`-removal tree. The old SD-3 layout put
-            // everything under `fs/{tenant}/{volume}/…`, i.e. relative keys that
-            // begin with a volume-name byte (`[a-z0-9._-]`, all ≥ 0x2d). Our own
-            // keys begin with a type byte (0x01–0x04). So if ANY relative key
-            // ≥ 0x06 exists, this tenant holds old volume-scoped data that our
-            // `fs/{tenant}/…` keys would SHADOW — mounting would silently show an
-            // empty FS and write a second dataset. Refuse loudly instead
-            // (the deploy is a stop-world reset; wipe or migrate first).
-            // (0x05 is the v4 segment-page prefix, so the first byte no layout
-            // of ours uses is 0x06.)
-            let stragglers = state.kv_range_keys(b"", b"\x06", 1).await?;
-            if !stragglers.is_empty() {
-                return Err(anyhow!(
-                    "fs/{{tenant}}/ has no schema stamp but holds keys from the \
-                     pre-`{{volume}}`-removal layout (e.g. {:?}) — refusing to mount \
-                     (it would shadow that data as an empty FS). Wipe/reset this \
-                     tenant's fs keyspace or run against a matching build.",
-                    String::from_utf8_lossy(&stragglers[0])
-                ));
-            }
-            // Nor may it be a tree some other writer populated without ever
-            // stamping it: the `autumnfs` CLI and the S3 gateway did not stamp
+            // "No stamp" must mean a genuinely fresh filesystem, not a tree
+            // some other writer populated without ever stamping it: the `autumnfs` CLI and the S3 gateway did not stamp
             // before v4, so a tree they alone built holds v3 inodes and no
             // stamp. Stamping the current version over those would declare
             // them readable as a layout they are not.
@@ -338,15 +316,13 @@ pub async fn alloc_inode(state: &mut FsState) -> Result<u64> {
     // Pass an EMPTY volume so the manager grants from its single GLOBAL inode
     // counter — inodes stay cluster-unique. The lease/fence plane (manager
     // `inode_leases/<ino>`, PS `fence_floors`, `WriteLease.inode_hint`) keys by
-    // BARE ino, so a global counter is the right granularity. The manager's
-    // per-volume counter machinery + the frozen `AllocInodesReq.volume` field
-    // stay DORMANT (reserved for a future volume-aware-lease feature). The
-    // `floor` above is this tenant's own `[0x04]next_inode` cursor — harmless
+    // BARE ino, so a global counter is the right granularity. The
+    // `floor` above is this tree's own `[0x04]next_inode` cursor — harmless
     // with a global grant since `max(cur,floor)` only ever RAISES the shared
     // counter, never rewinds it.
     let base = state
         .client
-        .alloc_inodes(INODE_ALLOC_BATCH as u32, floor, b"")
+        .alloc_inodes(INODE_ALLOC_BATCH as u32, floor)
         .await
         .context("alloc_inodes from manager")?;
     // Best-effort: keep the legacy KV cursor roughly current so a disaster

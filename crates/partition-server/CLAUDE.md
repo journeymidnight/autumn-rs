@@ -459,8 +459,8 @@ from a test that calls the enqueue function directly:
   matches.
 - `authz::authz_check` — without an arm the match falls to `_ => None`, and
   `None` ADMITS. A keyed opcode with no arm is not merely ungated, it is
-  SILENTLY ungated: any connection could delete another tenant's protected
-  keys, with no error and no log.
+  SILENTLY ungated: any connection could delete keys outside its grants, with
+  no error and no log.
 
 Both now have arms and a regression test that goes red without them.
 
@@ -1916,7 +1916,7 @@ included) runs, the heartbeat task waits for it and sends no beat.
 
 ## Data-plane authz enforcement (`authz.rs`)
 
-The PS is the KV-layer enforcement point for multi-tenant `mem/` isolation. It holds
+The PS is the KV-layer enforcement point for principal grants. It holds
 ONLY the manager's PUBLIC keys (fetched via `MSG_GET_AUTHZ_CONFIG`, cached in
 `PartitionServer.authz: Arc<AuthzState>`, refreshed by `authz_config_poll_loop`, 5 s).
 It verifies a capability token ONCE per connection and enforces a byte prefix + `exp`
@@ -1949,8 +1949,9 @@ again after receive so expiry/revocation during await cannot bypass them.
   authz is OFF, CLIENT_AUTH is a no-op OK so an authz-aware client still works against
   a non-authz PS.
 - else runs `authz_check(msg_type, payload, principal, …)`: per the request's user
-  key(s), `check_key` (protected prefix ⇒ require an unexpired token whose
-  `allowed_prefixes` covers the key; kid still in the live keyring) / `check_range`
+  key(s), `check_key` (EVERY key ⇒ require an unexpired token whose
+  `allowed_prefixes` covers it; kid still in the live keyring; anonymous ⇒ denied —
+  there is no protected-prefix list) / `check_range`
   (whole scan interval ⊆ one allowed prefix). Reject ⇒ a `PermissionDenied` frame is
   emitted and the frame NEVER reaches serve/delegate.
 
@@ -1964,7 +1965,7 @@ to the output batch. Suspended handlers remain pinned in the in-flight queue, so
 the first poll never cancels an operation or blocks receive. A single output
 buffer uses `write_all`; multiple buffers retain the chunked vectored writer.
 
-**Two load-bearing INVARIANTS (breaking either = silent cross-tenant exposure):**
+**Load-bearing INVARIANTS (breaking 1 or 2 = silent access outside a principal's grants):**
 1. Any new frame-dispatch path (a new local-serve fast path, a new inline handler off
    the ps-conn task) MUST route through `authz_gate` before serving — the gate is the
    only enforcement point.
@@ -1978,7 +1979,7 @@ buffer uses `write_all`; multiple buffers retain the chunked vectored writer.
 
 Wire: `MSG_CLIENT_AUTH` (0x55) + `ClientAuthReq/Resp`; `StatusCode::PermissionDenied`
 (7). SDK auto-mints/renews the token and sends CLIENT_AUTH on each PS connection
-(`ClusterClient::set_tenant_credential`); `AutumnError::PermissionDenied` is terminal
+(`ClusterClient::set_principal_credential`); `AutumnError::PermissionDenied` is terminal
 (not retried).
 
 ### Layer-A — put must target a REGISTERED namespace

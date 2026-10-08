@@ -485,7 +485,7 @@ async fn flush_appends(
     let drained_values = std::mem::take(values);
     let drained_upserts = std::mem::take(upserts);
     // This append path calls `put_many_fenced` directly on the client, which
-    // prepends `fs/{tenant}/` — same as the RMW-overwrite branch (kv_put_fenced)
+    // prepends `fs/` — same as the RMW-overwrite branch (kv_put_fenced)
     // and the read path (read::prepare). The bare `key::*` keys are relative.
     let items: Vec<(&[u8], Bytes, u64)> = drained_keys
         .iter()

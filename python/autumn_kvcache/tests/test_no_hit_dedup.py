@@ -58,7 +58,7 @@ class _FakeStore:
         return True
 
     @property
-    def tenant(self) -> str:
+    def model_scope(self) -> str:
         return "fake"
 
 

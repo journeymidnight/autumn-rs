@@ -559,12 +559,9 @@ async fn run(args: Args) -> Result<()> {
             since_unix,
             limit,
         } => cmd_ops_history(&client, args.json, &kind, since_unix, limit).await?,
-        Command::Presplit {
-            namespace,
-            tenant,
-            rule,
-            force,
-        } => cmd_presplit(&client, args.json, &namespace, &tenant, &rule, force).await?,
+        Command::Presplit { scope, rule, force } => {
+            cmd_presplit(&client, args.json, &scope, &rule, force).await?
+        }
         Command::Merge {
             survivor_part_id,
             victim_part_id,
@@ -642,11 +639,9 @@ async fn run(args: Args) -> Result<()> {
             credential,
         } => cmd_mint_token(&client, args.json, principal, credential).await?,
         // ---------------- namespace registry ----------------
-        Command::NamespaceCreate {
-            name,
-            owner_tenant,
-            presplit,
-        } => cmd_namespace_create(&client, args.json, name, owner_tenant, presplit).await?,
+        Command::NamespaceCreate { name, presplit } => {
+            cmd_namespace_create(&client, args.json, name, presplit).await?
+        }
         Command::NamespaceDelete { name, force } => {
             cmd_namespace_delete(&client, args.json, name, force).await?
         }
@@ -773,33 +768,24 @@ async fn cmd_mint_token(
     Ok(())
 }
 
-/// D2: register a namespace. `--with-tenant` sets the owner (protected);
-/// `--presplit` freezes D8 split points (stored, not acted upon in SD-1).
+/// D2: register a namespace. `--presplit` records declared split points.
 async fn cmd_namespace_create(
     client: &ClusterClient,
     json: bool,
     name: String,
-    owner_tenant: Option<String>,
     presplit: Vec<Vec<u8>>,
 ) -> Result<()> {
-    client
-        .namespace_create(&name, owner_tenant.clone(), presplit.clone())
-        .await?;
+    client.namespace_create(&name, presplit.clone()).await?;
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "namespace": name,
-                "owner_tenant": owner_tenant,
                 "presplit_points": presplit.len(),
             }))?
         );
     } else {
         println!("namespace '{name}' created");
-        match &owner_tenant {
-            Some(t) => println!("  owner tenant: {t} (protected)"),
-            None => println!("  owner tenant: none (registered, not protected)"),
-        }
         if !presplit.is_empty() {
             println!("  presplit points: {} (stored; applied by D8)", presplit.len());
         }
@@ -862,8 +848,6 @@ async fn cmd_namespace_list(client: &ClusterClient, json: bool) -> Result<()> {
                 serde_json::json!({
                     "name": n.name,
                     "prefix": String::from_utf8_lossy(&n.prefix),
-                    "owner_tenant": n.owner_tenant,
-                    "protected": n.owner_tenant.is_some(),
                     "presplit_points": n.presplit.len(),
                     "created_at": n.created_at,
                 })
@@ -872,19 +856,14 @@ async fn cmd_namespace_list(client: &ClusterClient, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else {
         println!(
-            "{:<14} {:<16} {:<14} {:>8} {:>12}",
-            "NAME", "PREFIX", "OWNER", "PRESPLIT", "CREATED_AT"
+            "{:<14} {:<16} {:>8} {:>12}",
+            "NAME", "PREFIX", "PRESPLIT", "CREATED_AT"
         );
         for n in &namespaces {
-            let owner = match &n.owner_tenant {
-                Some(t) => format!("{t} (protected)"),
-                None => "-".to_string(),
-            };
             println!(
-                "{:<14} {:<16} {:<14} {:>8} {:>12}",
+                "{:<14} {:<16} {:>8} {:>12}",
                 n.name,
                 String::from_utf8_lossy(&n.prefix),
-                owner,
                 n.presplit.len(),
                 n.created_at,
             );
@@ -2490,13 +2469,13 @@ async fn cmd_split(
     part_id: u64,
     point: SplitPoint,
 ) -> Result<()> {
-    // Lower the CLI intent (ns/tenant/suffix or raw) to the raw wire key.
+    // Lower the CLI intent (ns/suffix or raw) to the raw wire key.
     let at_key = point.resolve_at_key();
 
     // Friendly CLI precheck (UX only — the PS is the authoritative validator).
     // When an explicit point is given, verify it lands strictly inside the
     // target partition's [start, end). This turns the PS's hex-only rejection
-    // into a message that names the namespace/tenant/suffix the operator typed.
+    // into a message that names the namespace/suffix the operator typed.
     if let Some(key) = &at_key {
         if let Ok(parts) = client.all_partitions_with_range().await {
             if let Some((_, _, start, end)) = parts.iter().find(|(pid, _, _, _)| *pid == part_id) {
@@ -2505,7 +2484,7 @@ async fn cmd_split(
                 if below_start || at_or_above_end {
                     bail!(
                         "split point {} resolves to key 0x{} which is not strictly inside \
-                         partition {}'s range [0x{}, 0x{}); pick a namespace/tenant/suffix \
+                         partition {}'s range [0x{}, 0x{}); pick a namespace/suffix \
                          that falls inside this partition",
                         point.describe(),
                         hex_encode(key),
@@ -2537,7 +2516,7 @@ async fn cmd_split(
     .await
 }
 
-/// presplit a `{tenant}/{namespace}/` keyspace by its
+/// presplit a `{scope}/` keyspace (a namespace or an in-namespace sub-scope) by its
 /// natural dimension (fs=ino, kvc=content-hash, mem=agent). Computes the cut
 /// points, then splits the owning partition at each in ASCENDING order —
 /// re-resolving the owner each time, since a prior split creates the child that
@@ -2545,19 +2524,14 @@ async fn cmd_split(
 async fn cmd_presplit(
     client: &ClusterClient,
     json: bool,
-    namespace: &str,
-    tenant: &str,
+    scope: &str,
     rule: &PresplitRule,
     force: bool,
 ) -> Result<()> {
     let suffixes = presplit_suffixes(rule)?;
-    // cut prefix = `{namespace}/` (+ `{tenant}/` as an
-    // in-namespace sub-segment for mem/kvc; empty for fs), matching the binding.
-    let prefix = if tenant.is_empty() {
-        format!("{namespace}/").into_bytes()
-    } else {
-        format!("{namespace}/{tenant}/").into_bytes()
-    };
+    let prefix = format!("{scope}/").into_bytes();
+    // The registry row the declared points are recorded on.
+    let namespace = scope.split('/').next().unwrap_or(scope);
     let points: Vec<Vec<u8>> = suffixes
         .into_iter()
         .map(|s| {
@@ -2726,8 +2700,7 @@ async fn cmd_presplit(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": ok,
-                "namespace": namespace,
-                "tenant": tenant,
+                "namespace": scope,
                 "points": points.len(),
                 "applied": applied,
                 "already_in_place": already,
@@ -2736,7 +2709,7 @@ async fn cmd_presplit(
         );
     } else {
         println!(
-            "presplit {tenant}/{namespace}: {applied}/{} cut points applied{}",
+            "presplit {scope}: {applied}/{} cut points applied{}",
             points.len(),
             if already > 0 { format!(" ({already} boundaries already in place)") } else { String::new() }
         );
@@ -2753,7 +2726,7 @@ async fn cmd_presplit(
     }
     if !ok {
         bail!(
-            "presplit {tenant}/{namespace}: 0/{} cut points applied and none already in place — \
+            "presplit {scope}: 0/{} cut points applied and none already in place — \
              nothing was split. Check --hash-prefix (a wrong prefix owns no partition), authz, \
              and the partition map.",
             points.len()

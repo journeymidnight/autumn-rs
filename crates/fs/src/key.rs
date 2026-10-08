@@ -178,10 +178,9 @@ pub fn next_inode_key() -> Vec<u8> {
     super_key(b"next_inode")
 }
 
-/// Well-known superblock key holding this tenant's on-disk layout version
+/// Well-known superblock key holding the tree's on-disk layout version
 /// (`schema::SCHEMA_VERSION`, BE u64). Relative like every other key, so it lives
-/// at `fs/{tenant}/[0x04]schema_version` — each tenant stamps + verifies its own
-/// layout independently.
+/// at `fs/[0x04]schema_version`.
 pub fn schema_version_key() -> Vec<u8> {
     super_key(b"schema_version")
 }

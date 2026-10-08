@@ -204,21 +204,20 @@ pub const MSG_GET_CLUSTER_OVERVIEW: u8 = 0x4E;
 // ── manager-as-KDC (data-plane authz) ─────────────────────────────────────────
 //
 // The manager (leader) is a KDC: it holds an Ed25519 signing private key + a
-// tenant account DB, mints short-TTL capability tokens, and publishes its
+// principal account DB, mints short-TTL capability tokens, and publishes its
 // PUBLIC keys so the PS (KV layer) can verify locally without ever calling
 // back. See docs/data_plane_authz_design.md.
 //
-// Client → manager: authenticate with a permanent tenant credential, get a
+// Client → manager: authenticate with a permanent principal credential, get a
 // short-TTL signed token (renewed in the background before exp).
 pub const MSG_MINT_TOKEN: u8 = 0x4F;
-// PS / EN → manager (poll, cached): fetch the public keys + protected prefixes
-// so the PS and the EN can verify tokens (and the PS knows which key ranges to
-// enforce).
+// PS / EN → manager (poll, cached): fetch the public keys + registered
+// namespaces so the PS and the EN can verify tokens.
 pub const MSG_GET_AUTHZ_CONFIG: u8 = 0x50;
-// admin → manager (low-frequency, Admin connection only): create/delete a tenant
-// account (credential_hash + allowed_prefixes) in the KDC's account DB.
-pub const MSG_TENANT_CREATE: u8 = 0x51;
-pub const MSG_TENANT_DELETE: u8 = 0x52;
+// admin → manager (low-frequency, Admin connection only): create/delete a
+// principal account (credential_hash + allowed_prefixes) in the KDC's account DB.
+pub const MSG_PRINCIPAL_CREATE: u8 = 0x51;
+pub const MSG_PRINCIPAL_DELETE: u8 = 0x52;
 // M0: fuse-fs inode-number allocation moved into the manager
 // (leader-fenced etcd CAS). The old scheme — every allocator doing a
 // non-CAS read-modify-write on the `[0x04]next_inode` fs KV key — hands
@@ -2392,12 +2391,9 @@ pub struct AllocInodesReq {
     /// fuse mount passes that legacy value here on its first batch so an
     /// existing filesystem migrates without duplicate inodes. 0 = none.
     pub floor: u64,
-    /// D1: the per-volume identity (the canonicalized `fs/{tenant}/
-    /// {volume}/` prefix, or empty for the pre-D1 single global counter). SD-1
-    /// FREEZES this field into the wire; `handle_alloc_inodes` IGNORES it for
-    /// now. SD-3 wires the per-volume etcd counter
-    /// (`autumn-rs/fs/{tenant}/{volume}/next_inode`). Empty = legacy global
-    /// counter (existing callers keep encoding unchanged). Additive rkyv field.
+    /// Always empty: there is one inode counter. The field stays because this
+    /// struct is on the frozen client surface; the manager refuses a non-empty
+    /// value.
     pub volume: Vec<u8>,
 }
 
@@ -2427,14 +2423,14 @@ pub const MSG_REBALANCE_REGIONS: u8 = 0x56;
 
 // ── namespace registry (admin → manager, low-frequency) ──────────────────────
 // admin creates/deletes a `namespace/<name>` etcd registry row (leader-fenced,
-// Admin connection only — same posture as MSG_TENANT_CREATE/DELETE). The registry is
+// Admin connection only — same posture as MSG_PRINCIPAL_CREATE/DELETE). The registry is
 // the authoritative source for D7 Layer-A (writes must fall in a registered
-// namespace) + the D6 protected-prefix bridge. See docs/key_namespace_split_design.md.
+// namespace). See docs/key_namespace_split_design.md.
 pub const MSG_NAMESPACE_CREATE: u8 = 0x57;
 pub const MSG_NAMESPACE_DELETE: u8 = 0x58;
 // admin → manager (leader-gated): list the full registry (rich rows). The 5 s
 // `MSG_GET_AUTHZ_CONFIG` poll stays LEAN (prefixes only, for Layer-A); the rich
-// data (owner/presplit/created_at) rides this dedicated low-frequency RPC.
+// data (presplit/created_at) rides this dedicated low-frequency RPC.
 pub const MSG_NAMESPACE_LIST: u8 = 0x59;
 // admin → manager (leader-gated): list every registered principal with its
 // grants. The symmetric counterpart of NAMESPACE_LIST:
@@ -2717,8 +2713,8 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_UPSERT_PARTITION
             | MSG_MERGE_PARTITIONS
             | MSG_OP_SUBMIT
-            | MSG_TENANT_CREATE
-            | MSG_TENANT_DELETE
+            | MSG_PRINCIPAL_CREATE
+            | MSG_PRINCIPAL_DELETE
             | MSG_NAMESPACE_CREATE
             | MSG_NAMESPACE_DELETE
             | MSG_NAMESPACE_SET_PRESPLIT
@@ -2832,38 +2828,33 @@ pub struct MgrInodeLeaseRecord {
 
 // ── authz wire + persisted types (manager-as-KDC) ────────────────────────────
 
-// `MgrTenantAccount` used to live here, described as "persisted tenant account
-// in etcd". It is DELETED rather than kept: `tenantAccount/<tenant>` now stores
-// `persist::records::TenantAccountRecord` (manager-private, with its own format
-// version), and no message ever carried this type — `PrincipalListResp`
-// deliberately uses `PrincipalRow` so an inspection RPC cannot hand out a
-// `credential_hash`. Leaving it would have recreated the very shape this split
-// exists to remove: a second definition of a persisted record sitting in the
-// WIRE schema file, with no reader to say which one is authoritative. Removing
-// it moves no archived layout and therefore no `WIRE_VERSION`.
+// The persisted principal account (`principal/<name>`) is
+// `persist::records::PrincipalAccountRecord`, manager-private. No message
+// carries it: `PrincipalListResp` uses `PrincipalRow` so an inspection RPC
+// cannot hand out a `credential_hash`.
 
-/// `MSG_TENANT_CREATE` — admin creates/rotates a tenant account (Admin
+/// `MSG_PRINCIPAL_CREATE` — admin creates/rotates a principal account (Admin
 /// connection only, `is_admin_mgr_msg`). Returns the freshly-generated permanent
 /// credential (shown once; the manager stores only its hash).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct TenantCreateReq {
-    pub tenant: String,
+pub struct PrincipalCreateReq {
+    pub principal: String,
     pub allowed_prefixes: Vec<Vec<u8>>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct TenantCreateResp {
+pub struct PrincipalCreateResp {
     pub code: u8,
     pub message: String,
     /// The generated permanent credential (raw bytes). Empty on error.
     pub credential: Vec<u8>,
 }
 
-/// `MSG_TENANT_DELETE` — admin removes a tenant account (stops renewal; the
-/// tenant's current token still works until it expires). Resp = `CodeResp`.
+/// `MSG_PRINCIPAL_DELETE` — admin removes a principal account (stops renewal;
+/// the principal's current token still works until it expires). Resp = `CodeResp`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct TenantDeleteReq {
-    pub tenant: String,
+pub struct PrincipalDeleteReq {
+    pub principal: String,
 }
 
 // ── namespace registry types (SD-1) ──────────────────────────────────────────
@@ -2885,11 +2876,6 @@ pub struct MgrNamespace {
     /// The registered key prefix = `name + "/"`. This is the byte prefix
     /// Layer-A / authz / presplit match against (all namespaces are disjoint).
     pub prefix: Vec<u8>,
-    /// Owning tenant, if any. `Some(_)` marks the namespace PROTECTED — its
-    /// prefix is bridged into authz `protected_prefixes` (D6). The three
-    /// bootstrap-seeded families (`fs`/`kvc`/`mem`) start `None` (existence-only
-    /// until an owner is later assigned). `None` ⇒ registered but not protected.
-    pub owner_tenant: Option<String>,
     /// D8 presplit points (raw split keys inside `[prefix, prefix-successor)`).
     /// SD-1 FREEZES this field + stores it verbatim; CONSUMPTION (looping
     /// `split --at` at namespace-create) is D8. Empty = no presplit.
@@ -2899,15 +2885,12 @@ pub struct MgrNamespace {
 }
 
 /// `MSG_NAMESPACE_CREATE` — admin registers a new namespace. Leader-only,
-/// Admin connection only (same posture as `TenantCreateReq`). Rejects reserved names
+/// Admin connection only (same posture as `PrincipalCreateReq`). Rejects reserved names
 /// (`fs`/`kvc`/`mem`/`default`) + any name whose `name/` prefix is a
 /// `starts_with` relation with an existing namespace prefix (disjointness).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct NamespaceCreateReq {
     pub name: String,
-    /// Optional owner tenant — `Some(_)` makes the namespace protected (bridged
-    /// into authz `protected_prefixes`).
-    pub owner_tenant: Option<String>,
     /// D8 presplit split points (raw keys). Freeze-only in SD-1 (stored, not
     /// acted upon). Empty = none.
     pub presplit: Vec<Vec<u8>>,
@@ -2930,7 +2913,7 @@ pub struct NamespaceDeleteReq {
 }
 
 /// `MSG_NAMESPACE_LIST` — admin lists the full registry (rich rows: name,
-/// prefix, owner_tenant, presplit, created_at). Leader-only (the registry is
+/// prefix, presplit, created_at). Leader-only (the registry is
 /// leader-maintained; a follower's shadow is empty/stale). Request payload is
 /// empty. Not Admin-only — listing is read-only inspection.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -2954,14 +2937,14 @@ pub struct NamespaceSetPresplitReq {
     pub points: Vec<Vec<u8>>,
 }
 
-/// One row of `MSG_PRINCIPAL_LIST`. Deliberately NOT a `MgrTenantAccount`:
-/// that type carries `credential_hash`, and an inspection RPC must not hand
+/// One row of `MSG_PRINCIPAL_LIST`. Deliberately NOT the persisted account:
+/// that carries `credential_hash`, and an inspection RPC must not hand
 /// out the verifier for a credential — offline-guessing a weak credential
 /// against a leaked hash is exactly the attack the KDC design avoids by never
 /// storing the credential itself. Name + grants are all an operator needs.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PrincipalRow {
-    /// The principal (credential owner) name — the key under `tenantAccount/`.
+    /// The principal (credential owner) name — the key under `principal/`.
     pub name: String,
     /// The key prefixes this principal may access (`allowed_prefixes`), each
     /// ending in `b'/'`. Rendered as `{ns}/…` under Option 3.
@@ -2986,7 +2969,7 @@ pub struct PrincipalListResp {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MintTokenReq {
     /// the principal NAME (credential owner) to mint for.
-    /// The manager looks up the account under this name (`tenantAccount/<name>`).
+    /// The manager looks up the account under this name (`principal/<name>`).
     pub principal: String,
     pub credential: Vec<u8>,
 }
@@ -3024,14 +3007,8 @@ pub struct GetAuthzConfigResp {
     /// unaffected).
     pub enabled: bool,
     pub public_keys: Vec<AuthzPublicKey>,
-    /// Key prefixes under which default-DENY applies (e.g. `mem/`). A request
-    /// key outside every protected prefix is not gated.
-    pub protected_prefixes: Vec<Vec<u8>>,
-    /// D7: ALL registered namespace prefixes (the D2 registry). This is
-    /// Layer-A's data source (a put-class write must fall in one of these).
-    /// POPULATED by the manager in SD-1; CONSUMED by the PS Layer-A gate in SD-2
-    /// (the PS stores it now, unused). Distinct from `protected_prefixes`, which
-    /// is the OWNED subset (Layer-B). Additive rkyv field (same-commit deploy).
+    /// ALL registered namespace prefixes — Layer-A's data source (a put-class
+    /// write must fall in one of these).
     pub namespaces: Vec<Vec<u8>>,
     /// The TTL the manager mints tokens with (seconds) — advisory, lets the PS
     /// size its clock-skew leeway / the client its renew cadence.

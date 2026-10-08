@@ -495,16 +495,14 @@ pub const APPEND_INFLIGHT_DEPTH: usize = 2;
 /// Root inode number (FUSE_ROOT_ID).
 pub const ROOT_INO: u64 = 1;
 
-/// the on-disk layout version stamped per tenant in the superblock
-/// (`[0x04]schema_version`, so it lands at `fs/{tenant}/[0x04]schema_version`).
+/// the on-disk layout version stamped in the superblock
+/// (`[0x04]schema_version`, so it lands at `fs/[0x04]schema_version`).
 ///
 /// - **v1** = the pre-namespace layout (raw `0x01`–`0x04` keys under a Raw client
 ///   binding). Never actually stamped — v1 filesystems carry NO schema_version
 ///   key.
-/// - **v2** = the namespaced layout: keys are RELATIVE to `fs/{tenant}/` (the
-///   client prepends it), with a cluster-unique GLOBAL inode counter. (Removing
-///   the short-lived SD-3 `{volume}` layer does NOT change this relative on-disk
-///   format — only where the tree lives on the wire — so it stays v2.)
+/// - **v2** = the namespaced layout: keys are RELATIVE to `fs/` (the client
+///   prepends it), with a cluster-unique GLOBAL inode counter.
 ///
 /// `meta::ensure_schema_version` stamps a fresh filesystem with this value and
 /// FAILS LOUD if an existing stamp differs — a future incompatible layout (v3+)

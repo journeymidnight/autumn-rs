@@ -193,10 +193,6 @@ run_manager() {
     # missing key. (cluster.sh stays OFF because it never sets the env at all.)
     if [[ "${AUTUMN_AUTH_DISABLE:-0}" != "1" && -s "${AUTUMN_AUTH_SIGNING_KEY_FILE:-/nonexistent}" ]]; then
         args+=(--auth-signing-key-file "$AUTUMN_AUTH_SIGNING_KEY_FILE")
-        local pfx
-        for pfx in ${AUTUMN_AUTH_PROTECTED_PREFIXES:-}; do
-            args+=(--auth-protected-prefix "$pfx")
-        done
         [[ -n "${AUTUMN_AUTH_TOKEN_TTL_SECS:-}" ]] \
             && args+=(--auth-token-ttl-secs "$AUTUMN_AUTH_TOKEN_TTL_SECS")
     fi

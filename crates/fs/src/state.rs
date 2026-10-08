@@ -251,9 +251,8 @@ impl FsState {
     /// `host` seeds `DaemonClientId::new_fuse` — the per-mount/per-client
     /// lease identity the manager keys its lease registry on.
     ///
-    /// this mount is scoped to the WHOLE `fs/` namespace
-    /// (Option 3 dropped the tenant segment — fuse is one global tree; multi-tree
-    /// isolation is by distinct namespaces, §8.9). The client `connect(mgr, "fs")`
+    /// this mount is scoped to the WHOLE `fs/` namespace (one global tree;
+    /// multi-tree isolation is by distinct namespaces, §8.9). The client `connect(mgr, "fs")`
     /// prepends `fs/` to every key (and strips it off returned range keys).
     pub async fn new_with_host(manager_addr: &str, host: String) -> Result<Self> {
         let client = ClusterClient::connect(manager_addr, "fs")
@@ -328,10 +327,10 @@ impl FsState {
 
     // ── KV helpers ──────────────────────────────────────────────────────────
     //
-    // Keys are the bare `key::*` builders (relative to `fs/{tenant}/`). The
-    // scoped client (`scoped(fs, tenant)`) prepends `fs/{tenant}/` on the wire
-    // and strips it back off range results, so these helpers hand it the key
-    // straight through — the net wire key is `fs/{tenant}/[type][fields]`.
+    // Keys are the bare `key::*` builders (relative to `fs/`). The scoped
+    // client prepends `fs/` on the wire and strips it back off range results,
+    // so these helpers hand it the key straight through — the net wire key is
+    // `fs/[type][fields]`.
 
     /// Get a value from the KV store by key.
     pub async fn kv_get(&mut self, k: &[u8]) -> Result<Vec<u8>> {
@@ -452,9 +451,8 @@ impl FsState {
         start: &[u8],
         limit: u32,
     ) -> Result<Vec<Vec<u8>>> {
-        // The scoped client prepends `fs/{tenant}/` to prefix+start, clamps the
-        // scan at the tenant boundary, and strips `fs/{tenant}/` back off returned
-        // keys — so callers get the bare `[type][fields]` key they parse.
+        // The scoped client prepends `fs/` to prefix+start, clamps the scan at
+        // the namespace boundary, and strips `fs/` back off returned keys — so callers get the bare `[type][fields]` key they parse.
         let r = self
             .client
             .range(prefix, start, limit)

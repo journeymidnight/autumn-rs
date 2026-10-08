@@ -168,8 +168,8 @@ probe instead of `autumn-op info`.
 `deploy/overlays/vke/deploy.sh` provisions data-plane authz automatically:
 it generates the `autumn-authz` Secret (signing key) **once — never rotated
 here** (rotating invalidates every minted credential) — and the manager
-StatefulSet mounts it (`optional`, at `/etc/autumn/authz`). The ConfigMap sets
-`AUTUMN_AUTH_PROTECTED_PREFIXES=fs/ kvc/ mem/`; the entrypoint engages authz only
+StatefulSet mounts it (`optional`, at `/etc/autumn/authz`). With a signing key
+every keyed op needs a token (no per-prefix list); the entrypoint engages authz only
 when the Secret is actually present (`-s` gate), so a cluster deployed without
 it — or with `AUTUMN_AUTH_DISABLE=1` in the ConfigMap — runs authz-OFF instead
 of crash-looping.

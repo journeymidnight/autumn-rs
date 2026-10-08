@@ -76,9 +76,8 @@ on-disk format changes. The `read_plan` benchmark measures cached planning acros
 | `0x03` | 条带 extent (striped) | `[0x03][lane: u8][ino BE][logical_off BE]` | raw bytes ≤ `MAX_EXTENT` |
 | `0x04` | FS 超级块 | `[0x04][field]` | varies（`next_inode` / `schema_version` / `stripe_geom` / `rmtomb/[ino]`）|
 
-**Namespace-first 绑定（Option 3）**：wire key = `fs/[type][fields]`（一棵全局树，
-无 tenant 段、无 volume 段）。`autumn-fuse` / `autumnfs` / PyO3 `autumn.Fs` 都无
-`--tenant`；`FsState` 用 `connect(mgr, "fs")` / `scoped("fs")`。多棵互隔离的树用不同
+**Namespace 绑定**：wire key = `fs/[type][fields]`（一棵全局树）。`autumn-fuse` /
+`autumnfs` / PyO3 `autumn.Fs` 都没有 scope 参数；`FsState` 用 `connect(mgr, "fs")` / `scoped("fs")`。多棵互隔离的树用不同
 namespace（`fsA`/`fsB`）。上表是 RELATIVE key —— **client 负责整个 `fs/` 前缀**
 （prepend + 把返回 range key 剥回、按 namespace 边界 clamp）。`state.rs` 的 8 个
 `kv_*` choke point、`key::*` builder、全部 `parse_*` 都交裸 RELATIVE key 给 client，

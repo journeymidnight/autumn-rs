@@ -91,7 +91,7 @@ pub struct AutumnManager {
     etcd: Option<EtcdMirror>,    // optional etcd persistence + leader fence
     conn_pool: Rc<ConnPool>,     // extent-node RPCs
     // + inflight ledger, recovery limiter, node_states, policy engine,
-    //   lease registry, namespaces, tenant_accounts, authz keyring …
+    //   lease registry, namespaces, principal_accounts, authz keyring …
 }
 ```
 
@@ -166,7 +166,7 @@ Upgrade-safety section for why guessing from the leading bytes provably cannot
 work here.
 
 **ALL ARE SPLIT.** extent=4, stream=5, node=6, disk=7, partition=8,
-region=9, audit=1, tenantAccount=2, namespace=3, recoveryAttempt=10,
+region=9, audit=1, principalAccount=2, namespace=3, recoveryAttempt=10,
 member=11; the next record takes 12.
 `MetadataState` (now `src/store.rs`, moved here from `autumn-common`) holds the
 RECORDS, not the wire structs — which is what gives a purely persistent field
@@ -231,10 +231,10 @@ All writes go through the leader-fenced `txn_fenced` (below). On promotion
 | `mgr_audit_log/<ts>_<seq>` | `persist::AuditRecord` | admin-op audit trail (90-day GC) |
 | `inode_leases/<ino>` | writer lease | reader leases are memory-only |
 | `namespace/<name>` | `persist::NamespaceRecord` | registry |
-| `tenantAccount/<name>` | `persist::TenantAccountRecord` | authz principal DB |
+| `principal/<name>` | `persist::PrincipalAccountRecord` | authz principal DB |
 | `autoPolicy/config`, `autoPolicy/cooldowns` | policy state | leader-owned |
 | `autumn-rs/cluster_id` | UUID | CAS-imprinted once |
-| `autumn-rs/fs/next_inode` (or `…/fs/{tenant}/{volume}/next_inode`) | BE u64 | fs inode counter |
+| `autumn-rs/fs/next_inode` | BE u64 | fs inode counter (one, global) |
 
 `part_addrs` (client routing hints) is deliberately **in-memory only** — see the
 leaderless-routing note below.
@@ -257,10 +257,10 @@ disabled kid. The token codec/claims live in `autumn_rpc::cap_token` (shared
 signer/verifier). `credential_hash` = SHA-256; compares are constant-time
 (`ct_eq_32`) to avoid timing/length oracles.
 
-**Principal accounts.** `tenantAccount/<name>` → `persist::TenantAccountRecord
-{tenant, credential_hash, allowed_prefixes}` (a PERSISTED record with its own
+**Principal accounts.** `principal/<name>` → `persist::PrincipalAccountRecord
+{principal, credential_hash, allowed_prefixes}` (a PERSISTED record with its own
 format version — see "Persisted records"; it has no wire twin at all); create/delete are Admin-connection-only, etcd-first,
-leader-fenced, serialized on `tenant_admin_lock`. `MSG_PRINCIPAL_LIST` (`0x5A`,
+leader-fenced, serialized on `principal_admin_lock`. `MSG_PRINCIPAL_LIST` (`0x5A`,
 `handle_principal_list`) is leader-gated + read-only and returns
 `PrincipalRow{name, grants}` — dropping `credential_hash` is structural: an
 inspection RPC must never hand out the verifier for a credential.
@@ -2136,12 +2136,12 @@ return EIO (never serve pre-close bytes). See `docs/autumn_fs_lease_plan.md`.
 ## Namespace registry
 
 Etcd string-keyed registry `namespace/<name>` → `persist::NamespaceRecord {name, prefix,
-owner_tenant, presplit, created_at}` (modelled 1:1 on the `tenantAccount/` DB):
+presplit, created_at}` (format version 2; modelled 1:1 on the `principal/` DB):
 in-mem shadow, fail-loud replay, Admin-connection-only create/delete (`MSG_NAMESPACE_CREATE`
 `0x57` / `DELETE` `0x58`), etcd-first + leader-fenced, serialized on `namespace_admin_lock`.
 Built-in families `fs`/`kvc`/`mem` are CAS-preregistered by the first leader
-(`seed_builtin_namespaces`, `owner_tenant=None` = existence-only). Create rejects
-reserved names + names failing `validate_namespace_name` (`[a-z0-9._-]+`) +
+(`seed_builtin_namespaces`). Create rejects
+the reserved names (exactly the built-ins, `RESERVED_NAMESPACE_NAMES`) + names failing `validate_namespace_name` (`[a-z0-9._-]+`) +
 `namespace_prefix_conflicts` (a new `name/` may not be `starts_with`-related to any
 existing prefix, either direction — pairwise-disjoint intervals). Delete refuses the
 built-ins; the non-empty guard is CLIENT-SIDE in `autumn-op` (range-scan, `--force`
@@ -2150,17 +2150,18 @@ overrides) because the manager has no KV data-plane client.
 `MSG_NAMESPACE_LIST` (`0x59`, leader-gated read-only) returns the rich rows
 (`Vec<MgrNamespace>`, sorted). The 5 s authz-config poll stays lean (prefixes only).
 
-**Authz bridge (`handle_get_authz_config`):** `namespaces` = every registered prefix
-(the Layer-A data source the PS consumes); `protected_prefixes` = the manual
-`--auth-protected-prefix` list ∪ every registry namespace whose `owner_tenant.is_some()`
-(auto-protected). `CODE_NAMESPACE_UNKNOWN = 10` is the Layer-A reject the PS returns.
+**Authz config (`handle_get_authz_config`):** publishes the public keys plus
+`namespaces` = every registered prefix (the Layer-A data source the PS consumes).
+There is no protected-prefix list: with a signing key the PS gates every keyed op.
+`CODE_NAMESPACE_UNKNOWN = 10` is the Layer-A reject the PS returns.
 
 ## fs inode allocation
 
 `fs_alloc.rs`, `MSG_ALLOC_INODES = 0x53` — the manager grants contiguous inode ranges
 `[base, base+count)` for the fuse fs (replacing a client-side non-CAS RMW that
 duplicated batches under concurrent allocators). Etcd mode: authoritative counter at
-`fs_next_inode_key(volume)` (strict BE u64; malformed → refuse loudly). Every grant is a
+`FS_NEXT_INODE_KEY` = `autumn-rs/fs/next_inode` (strict BE u64; malformed → refuse
+loudly). Every grant is a
 read → `txn_fenced` value-CAS loop (leader fence prepended, so a deposed leader's grant
 loses the txn — no double-grant across a transition); first-create uses the
 create_revision==0 pattern; no in-memory cache (failover needs no replay hook). Grants
@@ -2178,12 +2179,10 @@ below it (`max(cur, floor)`) and the counter never rewinds. This is deliberately
 `alloc_ids` (that numbers manager entities replayed from etcd prefixes; inode numbers
 are fs-layer data with their own key).
 
-Per-volume machinery is present but **DORMANT**: the fuse layer passes an EMPTY volume,
-so production uses the single global `autumn-rs/fs/next_inode`. The lease/fence plane
-keys by BARE ino, so per-volume inodes would collide across volumes → cross-volume
-write-lease conflict. Data isolation comes from the `{volume}/` KEY prefix, not the
-inode number; the frozen `AllocInodesReq.volume` field + machinery stay for a future
-volume-aware-lease feature. `handle_alloc_inodes` is leader-gated.
+There is ONE counter because the lease/fence plane keys by BARE ino: inode numbers
+must be cluster-unique, so per-volume counters would collide into cross-volume
+write-lease conflicts. `AllocInodesReq.volume` stays on the frozen client surface;
+`handle_alloc_inodes` refuses a non-empty one and is leader-gated.
 
 ## Routing while leaderless
 

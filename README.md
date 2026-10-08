@@ -67,8 +67,9 @@ erasure-coded, self-healing extents.
   split/merge/GC/compaction/EC decisions, plus a built-in **auto-policy
   controller** that acts on them — leader-fenced and crash-safe (config in etcd,
   survives failover), default-off until you arm it.
-- **Multi-tenant** — opt-in key-range authorization with short-TTL **Ed25519
-  capability tokens** (manager as KDC, enforcement at the KV layer).
+- **Access control** — opt-in key-prefix authorization: principals hold prefix
+  grants and present short-TTL **Ed25519 capability tokens** (manager as KDC,
+  enforcement at the KV layer).
 - **Operable** — a **web dashboard** ([`autumn-dashboard`](crates/server/src/bin/autumn_dashboard/README.md),
   built with `autumn-server`) with tabs for keyspace, partitions, servers,
   nodes-and-disks, policy and logs, plus direct Start / Observe / Stop policy

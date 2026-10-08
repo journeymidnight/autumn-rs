@@ -50,7 +50,7 @@
 
 use super::records::{
     AuditRecord, DiskRecord, ExtentRecord, MemberRecord, NamespaceRecord, NodeRecord,
-    PartitionRecord, RangeRecord, RegionRecord, StreamRecord, TenantAccountRecord,
+    PartitionRecord, RangeRecord, RegionRecord, StreamRecord, PrincipalAccountRecord,
 };
 use super::{decode, encode, PersistRecord};
 
@@ -77,9 +77,11 @@ fn audit_fixture() -> AuditRecord {
     }
 }
 
-fn tenant_fixture() -> TenantAccountRecord {
-    TenantAccountRecord {
-        tenant: "tenant-field".to_string(),
+fn principal_fixture() -> PrincipalAccountRecord {
+    PrincipalAccountRecord {
+        // Recorded before the field was renamed from `tenant`; unchanged bytes
+        // are the evidence the rename moved no layout.
+        principal: "tenant-field".to_string(),
         credential_hash: {
             // Not all-equal bytes: a truncation or an off-by-one inside the
             // array has to be able to show up.
@@ -97,7 +99,6 @@ fn namespace_fixture() -> NamespaceRecord {
     NamespaceRecord {
         name: "name-field".to_string(),
         prefix: b"prefix-field/".to_vec(),
-        owner_tenant: Some("owner-tenant-field".to_string()),
         presplit: vec![b"cut-one".to_vec(), b"cut-two".to_vec()],
         created_at: 0x6162636465666768,
     }
@@ -199,7 +200,7 @@ fn extent_fixture() -> ExtentRecord {
 
 /// The recorded encodings. Read the file header before changing one.
 const AUDIT_FROZEN: &str = "41554d470101726561736f6e2d6669656c64726573756c742d6d6573736167652d6669656c6411000000000000002827262524232221383736353433323162792d6669656c648c000000c0ffffff4100000094000000c0ffffff000000005857565554535251";
-const TENANT_FROZEN: &str = "41554d47020174656e616e742d6669656c64616c7068612f626574612f00f4ffffff06000000f2ffffff050000008c000000d8ffffff030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dcc8ffffff02000000";
+const PRINCIPAL_FROZEN: &str = "41554d47020174656e616e742d6669656c64616c7068612f626574612f00f4ffffff06000000f2ffffff050000008c000000d8ffffff030a11181f262d343b424950575e656c737a81888f969da4abb2b9c0c7ced5dcc8ffffff02000000";
 const STREAM_FROZEN: &str = "41554d470501a100000000000000b200000000000000c3000000000000009897969594939291e0ffffff0300000004000000020000000300000000000000";
 const PARTITION_FROZEN: &str = "41554d47080173746172742d6b6579656e642d6b6579c8c7c6c5c4c3c2c111000000000000002200000000000000330000000000000001000000ccffffff09000000cdffffff0700000000000000";
 const REGION_FROZEN: &str = "41554d470901726567696f6e2d7374617274726567696f6e2d656e64000001000000e4ffffff0c000000e8ffffff0a00000000000000d100000000000000d200000000000000d300000000000000d400000000000000d500000000000000d600000000000000";
@@ -207,13 +208,13 @@ const EXTENT_FROZEN: &str = "41554d470401030000000000000001000000000000000400000
 const NODE_FROZEN: &str = "41554d470601616464726573732d6669656c6400000011000000000000002200000000000000330000000000000055447766636f6e74726f6c2d616464726573732d6669656c646e6f64652d757569642d6669656c6488878685848382818d000000a8ffffffb0ffffff03000000c0ffffff0200000095000000bcffffff8f000000c9ffffff";
 const MEMBER_FROZEN: &str = "41554d470b016d656d6265722d616464726573732d6669656c640000000094000000e8ffffff68676665646362617877767574737271";
 const DISK_FROZEN: &str = "41554d470701757569642d6669656c640000000000007877767574737271000000008a000000e4ffffff00000000";
-const NAMESPACE_FROZEN: &str = "41554d4703016e616d652d6669656c647072656669782d6669656c642f6f776e65722d74656e616e742d6669656c646375742d6f6e656375742d74776f00f1ffffff07000000f0ffffff070000008a000000b8ffffffbaffffff0d0000000100000092000000bbffffffd4ffffff02000000000000006867666564636261";
+const NAMESPACE_FROZEN: &str = "41554d4703026e616d652d6669656c647072656669782d6669656c642f6375742d6f6e656375742d74776f000000efffffff07000000eeffffff070000008a000000c8ffffffcaffffff0d000000e0ffffff020000006867666564636261";
 
 #[test]
 fn the_persisted_encodings_are_frozen() {
     for (name, actual, frozen) in [
         ("audit", hex(&encode(&audit_fixture())), AUDIT_FROZEN),
-        ("tenantAccount", hex(&encode(&tenant_fixture())), TENANT_FROZEN),
+        ("principal", hex(&encode(&principal_fixture())), PRINCIPAL_FROZEN),
         ("namespace", hex(&encode(&namespace_fixture())), NAMESPACE_FROZEN),
         ("disk", hex(&encode(&disk_fixture())), DISK_FROZEN),
         ("node", hex(&encode(&node_fixture())), NODE_FROZEN),
@@ -242,14 +243,14 @@ fn every_recorded_encoding_is_a_value_this_binary_can_read_back() {
     assert_eq!(back.by, "by-field");
     assert_eq!(back.result_message, "result-message-field");
 
-    let raw = encode(&tenant_fixture());
-    let back: TenantAccountRecord = decode("tenantAccount/t", &raw).expect("tenant decodes");
-    assert_eq!(back.tenant, "tenant-field");
+    let raw = encode(&principal_fixture());
+    let back: PrincipalAccountRecord = decode("principal/p", &raw).expect("principal decodes");
+    assert_eq!(back.principal, "tenant-field");
     assert_eq!(back.allowed_prefixes.len(), 2);
 
     let raw = encode(&namespace_fixture());
     let back: NamespaceRecord = decode("namespace/n", &raw).expect("namespace decodes");
-    assert_eq!(back.owner_tenant.as_deref(), Some("owner-tenant-field"));
+    assert_eq!(back.prefix, b"prefix-field/");
     assert_eq!(back.presplit.len(), 2);
 
     let raw = encode(&member_fixture());
@@ -271,10 +272,10 @@ fn each_frozen_encoding_carries_the_version_it_was_recorded_at() {
             AuditRecord::FORMAT_VERSION,
         ),
         (
-            "tenantAccount",
-            TENANT_FROZEN,
-            TenantAccountRecord::RECORD_TYPE,
-            TenantAccountRecord::FORMAT_VERSION,
+            "principal",
+            PRINCIPAL_FROZEN,
+            PrincipalAccountRecord::RECORD_TYPE,
+            PrincipalAccountRecord::FORMAT_VERSION,
         ),
         (
             "namespace",

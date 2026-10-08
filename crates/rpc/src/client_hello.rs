@@ -286,7 +286,7 @@ pub fn is_client_surface_ps_msg(msg_type: u8) -> bool {
 /// talking to, and gating the question on its own answer admits nobody.
 ///
 /// **The OPERATOR surface is not here.** `MSG_STATUS`, the stream/extent info
-/// calls, `namespace_*`, `tenant_*`, the op-ledger (`MSG_OP_SUBMIT` / `QUERY` /
+/// calls, `namespace_*`, `principal_*`, the op-ledger (`MSG_OP_SUBMIT` / `QUERY` /
 /// `HISTORY`), autopolicy and the `MSG_MULTI_MODIFY_*` family are `autumn-op`'s
 /// messages. It sends them over an Admin connection, which needs exact
 /// `WIRE_VERSION` equality and the cluster secret (`peer_auth`), so no client

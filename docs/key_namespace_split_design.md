@@ -16,7 +16,7 @@
 
 部署前提是**可信内网**（sglang/vLLM 推理集群，RoCE 内网）。这里没有互不信任
 的租户，就是**一份统一资源**，只是不同组件有不同访问权限。所以键空间里
-**没有 tenant 段**：
+没有归属段，第 1 段就是 namespace：
 
 ```
 wire key = {ns}/[relative]
@@ -102,13 +102,13 @@ Layer-A 放行、Layer-B 覆盖、presplit 区间涵盖。代价是本 ns 内的
 
 ### 2.1 数据模型
 
-etcd `namespace/<name>` → rkyv 的 `MgrNamespace`（`crates/rpc/src/manager_rpc.rs`）：
+etcd `namespace/<name>` → `persist::NamespaceRecord`（format version 2；wire 孪生是
+`crates/rpc/src/manager_rpc.rs` 的 `MgrNamespace`，字段相同）：
 
 | 字段 | 含义 |
 |---|---|
 | `name` | 单路径段，`[a-z0-9._-]+` |
 | `prefix` | `name + "/"` —— Layer-A / authz / presplit 匹配的字节前缀 |
-| `owner_tenant: Option<String>` | `Some(_)` 标记该 ns **protected**，其前缀被桥接进 `GetAuthzConfigResp.protected_prefixes`。内置三族种子值是 `None`（只登记、不标 owner） |
 | `presplit: Vec<Vec<u8>>` | 运维声明过的切点（§6.3 的 sacred boundary） |
 | `created_at` | 诊断用 |
 
@@ -122,18 +122,16 @@ manager 侧内存影子 `namespaces: HashMap<String, MgrNamespace>`，leader 上
 内存 apply），防两个并发 create 都通过校验后以冲突顺序提交。
 
 ```
-autumn-op namespace-create --name <NS> [--tenant <T>] [--presplit <hex,…>]
+autumn-op namespace-create --name <NS> [--presplit <hex,…>]
 autumn-op namespace-delete --name <NS> [--force]
 autumn-op namespace-list [--json]        # 只读
 ```
 
-- **保留名**：`fs` / `kvc` / `mem` / `default` 一律拒绝创建
-  （`RESERVED_NAMESPACE_NAMES`）。`default` 被保留纯为防混淆 —— 它是约定俗成的
-  **tenant 名**，不是 namespace。
+- **保留名**：`fs` / `kvc` / `mem`（即内置三族，`RESERVED_NAMESPACE_NAMES`）
+  拒绝创建。
 - **前缀不相交规则**：新名 `X` 使 `X/` 与任何既有 namespace 前缀互为
   `starts_with` 时拒绝创建，保证所有 namespace 区间两两不交 —— Layer-A / 授权 /
-  presplit 的前缀匹配才无歧义。这也天然免疫「捕获脚枪」：`default/abc/…`
-  永远不会被后来创建的 `abc/` 静默易主。
+  presplit 的前缀匹配才无歧义。
 - **删除**：内置三族拒绝删除。非空检查由 `autumn-op` **客户端侧**做
   （manager 没有 KV 数据面 client），`--force` 跳过；handler 只摘 etcd 注册表行。
 
@@ -190,12 +188,12 @@ token；prod 集群两层全开。
   一个有 bug 的 kvcache 进程就能删 fs 数据。turnkey 部署建**每族一把**：
 
 ```bash
-autumn-op principal-create fs   --grant fs/    # → fs.cred   （fuse / autumnfs）
-autumn-op principal-create kvc  --grant kvc/   # → kvc.cred  （kvcache loader）
-autumn-op principal-create app  --grant mem/app/   # → app.cred
+autumn-op principal-create --principal fs  --grant fs/       > fs.cred   # fuse / autumnfs
+autumn-op principal-create --principal kvc --grant kvc/      > kvc.cred  # kvcache loader
+autumn-op principal-create --principal app --grant mem/app/  > app.cred
 ```
 
-- **数据面只出示凭据**，没有 `--tenant` / `--principal` flag：principal 名字随
+- **数据面只出示凭据**，没有 `--principal` flag：principal 名字随
   凭据文件携带（两行格式 `<name>\n<hex>`），作用域来自 `--namespace <ns>`
   （`autumn-client` 的 `--namespace` / `--scope`）或 app 自带的 ns。
 - **Layer-A 与 grant 正交**：一个 grant 再宽，写也必须落在**已注册 ns** 下。
@@ -290,16 +288,18 @@ effective = max(size_bytes, est_live)
 （extent ≤ 8 MiB）；修它要在 SST 侧按 key 累计 VP 字节直方图，而在
 `effective_size_bytes` + 显式切点之后没有剩余的真实场景。
 
-CLI（用户面只讲 namespace，不手拼前缀字节）：
+CLI（用户面只讲 scope，不手拼前缀字节）：
 
 ```
-autumn-op split <PARTID>                                        # median
-autumn-op split <PARTID> --namespace <NS> [--tenant <T>] [--at <SUFFIX> | --at-hex <HEX>]
-autumn-op split <PARTID> --at-raw-hex <HEX>                     # admin 逃生舱
+autumn-op split <PARTID>                                             # median
+autumn-op split <PARTID> --namespace <NS[/SUB]> [--at <SUFFIX> | --at-hex <HEX>]
+autumn-op split <PARTID> --at-raw-hex <HEX>                          # admin 逃生舱
 ```
 
-`SplitPoint::resolve_at_key` 把 CLI 意图降到裸 wire key
-= `{ns}/` (+ `{tenant}/` 作为 ns 内子段，`fs` 场景为空) `++ suffix`；
+`--namespace` 收一个 **scope**：namespace 本身（`kvc`）或 ns 内子 scope
+（`kvc/acme`、`bench/perf`），每段 `[a-z0-9._-]+`，与 `autumn-client --namespace`
+同一约定。`SplitPoint::resolve_at_key` 把 CLI 意图降到裸 wire key
+= `{scope}/ ++ suffix`；
 **空 suffix = 恰好切在前缀边界上**。wire 层（`MSG_SPLIT_PART`）**只认裸字节
 key**，partition 层继续不认识 namespace。
 
@@ -313,20 +313,24 @@ keyspace 还空的时候执行：
 ```
 autumn-op presplit --namespace fs     --lanes <N> [--parts <P>]      # 条带 lane 边界
 autumn-op presplit --namespace fs     --fs-inos <i,j,…> | --count <N> # 按 inode 切（一文件一分区）
-autumn-op presplit --namespace kvc    --count <N> --hash-prefix '<model>/vllm/v1/'
+autumn-op presplit --namespace kvc    --count <N> --hash-prefix '<model-scope>/vllm/v1/'
 autumn-op presplit --namespace mem    --agents <a,b,…>
 autumn-op presplit --namespace <其它> --count <N>                     # 均分 hex 空间
 ```
 
-`--tenant <T>` 是**可选**的 ns 内子段（`mem` / `kvc` 用得上，`fs` 没有 →
-默认空串 → 切在 `{ns}/` 上）；给了就必须是单个小写路径段，与 `split` 同一守卫。
+`--namespace` 同样收 scope（与 `split` 同一守卫）：**第 1 段选规则**
+（`fs` / `kvc` / `mem` / 其它 = `--count` 均分 hex），整个 scope 是切点前缀，
+声明的切点记在第 1 段那个 namespace 的注册行上。`fs` 是一棵树，拒绝子 scope。
+例：`presplit --namespace bench/perf --count 8`（cluster.sh / perf_check.sh 用的就是它）；
+`--namespace kvc/<model-scope> --hash-prefix vllm/v1/` 与
+`--namespace kvc --hash-prefix '<model-scope>/vllm/v1/'` 切点相同。
 
 `presplit_suffixes(rule)` 产出**相对**切点后缀，`cmd_presplit` 拼上
-`{ns}/`(+`{tenant}/`) 得到绝对切点，逐点调 §6.1 的显式 split。
+`{scope}/` 得到绝对切点，逐点调 §6.1 的显式 split。
 规则见 `PresplitRule`：`FsLanes` / `Fs` / `Kvc` / `Mem` / `Hex`。
 
 `kvc` 的 `--hash-prefix` **没有默认值**：content-hash 不在一个固定段之下
-（vLLM 存 `kvc/{model}/vllm/v1/{hash}/{layer}`，hash 坐在 per-model 前缀之下），
+（vLLM 存 `kvc/{model_scope}/vllm/v1/{hash}/{layer}`，hash 坐在 per-model 前缀之下），
 硬编码一个 `vllm/` 会切在离真实 key 十万八千里的地方并**静默**让 presplit 失效。
 必须先看一条真实 key 再传精确的相对前缀。
 

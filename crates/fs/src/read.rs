@@ -291,7 +291,7 @@ async fn prepare_inner(
         chunks.push(ChunkSpec {
             // The spawned `execute` reads these via `get_many_into` /
             // `get_many_direct` directly on the client, which prepends
-            // `fs/{tenant}/` — same as the write side (kv_put_fenced /
+            // `fs/` — same as the write side (kv_put_fenced /
             // flush_appends). The bare `key::*` builder is relative.
             // striped inode → lane key `[0x03][lane][ino][off]`.
             key: match &meta.stripe {

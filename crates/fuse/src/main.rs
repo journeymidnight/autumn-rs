@@ -37,8 +37,8 @@ struct Args {
     /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED when the
     /// cluster protects the `fs/` namespace; omit on an authz-off cluster. The
     /// mount connects via `connect_with_credential` (principal read from the file)
-    /// and FAILS FAST if the credential doesn't cover `fs/`. (The tenant segment
-    /// is gone — a mount covers the WHOLE `fs/` namespace.)
+    /// and FAILS FAST if the credential doesn't cover `fs/`. A mount covers the
+    /// WHOLE `fs/` namespace.
     #[arg(long)]
     credential_file: Option<PathBuf>,
 
@@ -234,7 +234,7 @@ fn main() -> Result<()> {
         .spawn(move || {
             let _compio_done = compio_done_tx;
             compio::runtime::Runtime::new().unwrap().block_on(async {
-                // Connect to cluster (scoped to `fs/{tenant}/`); with an authz
+                // Connect to cluster (scoped to `fs/`); with an authz
                 // credential when `--credential-file` was given.
                 let connect = async {
                     match credential {

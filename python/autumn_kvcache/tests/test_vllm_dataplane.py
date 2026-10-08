@@ -52,8 +52,8 @@ def main() -> int:
     transport = os.environ.get("AUTUMN_KVCACHE_TRANSPORT", "tcp")
     log.info("connecting to autumn manager at %s (transport=%s)", endpoint, transport)
 
-    tenant = "vllm-dp-model_0_1"
-    store = _AutumnKVStore(endpoint, tenant, transport=transport)
+    model_scope = "vllm-dp-model_0_1"
+    store = _AutumnKVStore(endpoint, model_scope, transport=transport)
 
     # ── 1. pure-function sanity (no cluster) ─────────────────────────────────
     assert align_to_block_size(31, 16) == 16
@@ -68,7 +68,7 @@ def main() -> int:
     # ── 2. key format ────────────────────────────────────────────────────────
     k = store._key("deadbeef", "layer.7")
     expected = (
-        f"{KEY_NAMESPACE}/{tenant}/{VLLM_POOL_NAME}/{_KV_STORAGE_FORMAT}/deadbeef/layer.7".encode()
+        f"{KEY_NAMESPACE}/{model_scope}/{VLLM_POOL_NAME}/{_KV_STORAGE_FORMAT}/deadbeef/layer.7".encode()
     )
     assert k == expected, f"key mismatch: {k!r} != {expected!r}"
     log.info("key format OK: %r", k)
@@ -122,7 +122,7 @@ def main() -> int:
     # with ttl=1 and the layers with ttl=1+grace, so after the marker expires
     # the layers must STILL be present (the "marker present ⇒ layers present"
     # invariant the scheduler relies on).
-    ttl_store = _AutumnKVStore(endpoint, tenant, transport=transport, ttl_secs=1)
+    ttl_store = _AutumnKVStore(endpoint, model_scope, transport=transport, ttl_secs=1)
     ttl_hash = prefix_hash([99, 98, 97, 96], 4)
     ttl_layers = ["layer.0", "layer.1"]
     ttl_src = [_page(0xE0 + i, page_bytes) for i in range(len(ttl_layers))]

@@ -33,7 +33,7 @@ class _FakeStore:
     def __init__(self, oks):
         self._oks = oks
         self.marker_ttl = 0
-        self.tenant = "qwen7b_deadbeef_0_1"
+        self.model_scope = "qwen7b_deadbeef_0_1"
 
     def load_layers(self, content_hash, layer_names, dests):
         # Mirror the real contract: one bool per layer (or a short list on a

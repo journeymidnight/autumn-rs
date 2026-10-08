@@ -62,8 +62,8 @@ fn usage() -> ! {
     eprintln!("  scrub <EXTID>... | --part <PART_ID> | --all");
     eprintln!("                               check sealed copies against their checksums on the");
     eprintln!("                               nodes that hold them; rot is isolated and rebuilt");
-    eprintln!("  split <PARTID> [--namespace <NS> --tenant <T> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
-    eprintln!("  presplit --namespace <fs|kvc|mem> --tenant <T> ...   (presplit EMPTY keyspace before loading)");
+    eprintln!("  split <PARTID> [--namespace <NS[/SUB]> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
+    eprintln!("  presplit --namespace <NS[/SUB]> ...   (presplit EMPTY keyspace before loading; rule by NS: fs|kvc|mem|other)");
     eprintln!("           fs: --lanes <N> [--parts <P>] [--force to narrow declared lanes]");
     eprintln!("      fs:  --lanes <N> [--parts <P>] | --fs-inos <i,j,…> | --count <N>");
     eprintln!("           (--lanes = stripe width, declared; --parts = partitions to cut, MUST divide lanes; default P=N)");
@@ -88,11 +88,11 @@ fn usage() -> ! {
     eprintln!("  gen-cluster-secret           print a new cluster secret (local, no manager)");
     eprintln!();
     eprintln!("namespace registry (admin):");
-    eprintln!("  namespace-create --name <NS> [--with-tenant <T>] [--presplit <hex,hex,...>]");
-    eprintln!("                               register a namespace (--with-tenant marks it protected)");
+    eprintln!("  namespace-create --name <NS> [--presplit <hex,hex,...>]");
+    eprintln!("                               register a namespace");
     eprintln!("  namespace-delete --name <NS> [--force]");
     eprintln!("                               remove the registry row (refuses non-empty unless --force)");
-    eprintln!("  namespace-list [--json]      list registered namespaces (name/prefix/owner/presplit/created)");
+    eprintln!("  namespace-list [--json]      list registered namespaces (name/prefix/presplit/created)");
     eprintln!("  principal-list [--json]      list principals + their grants (read-only, no credentials)");
     std::process::exit(1);
 }
@@ -124,7 +124,7 @@ fn num_arg<T: std::str::FromStr>(raw: &[String], i: usize, name: &str) -> T {
     })
 }
 
-/// read a secret (a tenant credential) from a file,
+/// read a secret (a principal credential) from a file,
 /// trimming a trailing newline. Preferred over passing secrets on argv, which
 /// leak via `ps` / `/proc/<pid>/cmdline` (coco P2). Fatal on read error.
 fn read_secret_file(path: &str) -> String {
@@ -202,20 +202,19 @@ pub(crate) struct Args {
 /// namespace-agnostic, D5). This enum is the CLI-side INTENT; `resolve_at_key`
 /// lowers it to the raw wire key. Per the §3.4 CLI refinement (refinement 3's
 /// term rule: prefixes are an implementation detail, the user-facing surface
-/// speaks only namespace/tenant):
+/// speaks namespace + suffix):
 /// - `Median` — no explicit point; PS picks the median (legacy).
-/// - `Namespaced { namespace, tenant, suffix }` — the normal operator form.
-///   The cut key = `"{tenant}/{namespace}/" ++ suffix` (TENANT-FIRST). An EMPTY
-///   `suffix` cuts exactly at the pair boundary `"{tenant}/{namespace}/"`
-///   (splits one tenant's namespace off — a common op).
+/// - `Namespaced { scope, suffix }` — the normal operator form. `scope` is a
+///   namespace or an in-namespace sub-scope (`bench/perf`), as `autumn-client
+///   --namespace` takes it. The cut key = `"{scope}/" ++ suffix`; an EMPTY
+///   `suffix` cuts exactly at `"{scope}/"`.
 /// - `Raw(bytes)` — admin-only escape hatch (`--at-raw-hex`); the caller hand-
 ///   builds the whole prefix. Same posture as D7 ⑤ `raw()`: documented
 ///   admin-only, not the day-to-day path.
 pub(crate) enum SplitPoint {
     Median,
     Namespaced {
-        namespace: String,
-        tenant: String,
+        scope: String,
         suffix: Vec<u8>,
     },
     Raw(Vec<u8>),
@@ -226,17 +225,8 @@ impl SplitPoint {
     pub(crate) fn resolve_at_key(&self) -> Option<Vec<u8>> {
         match self {
             SplitPoint::Median => None,
-            SplitPoint::Namespaced {
-                namespace,
-                tenant,
-                suffix,
-            } => {
-                // cut key = `{namespace}/` (+ `{tenant}/`
-                // as an in-namespace sub-segment, e.g. mem/kvc; empty for fs).
-                let mut key = format!("{namespace}/").into_bytes();
-                if !tenant.is_empty() {
-                    key.extend_from_slice(format!("{tenant}/").as_bytes());
-                }
+            SplitPoint::Namespaced { scope, suffix } => {
+                let mut key = format!("{scope}/").into_bytes();
                 key.extend_from_slice(suffix);
                 Some(key)
             }
@@ -248,18 +238,10 @@ impl SplitPoint {
     pub(crate) fn describe(&self) -> String {
         match self {
             SplitPoint::Median => "median (PS-selected)".to_string(),
-            SplitPoint::Namespaced {
-                namespace,
-                tenant,
-                suffix,
-            } => {
-                let base = if tenant.is_empty() {
-                    format!("{namespace}/")
-                } else {
-                    format!("{namespace}/{tenant}/")
-                };
+            SplitPoint::Namespaced { scope, suffix } => {
+                let base = format!("{scope}/");
                 if suffix.is_empty() {
-                    format!("pair boundary {base}")
+                    format!("scope boundary {base}")
                 } else {
                     format!(
                         "{base} + suffix 0x{}",
@@ -403,12 +385,11 @@ pub(crate) enum Command {
         /// (D4): where to cut. See `SplitPoint`.
         point: SplitPoint,
     },
-    /// presplit a `{tenant}/{namespace}/` keyspace by the
-    /// namespace's natural dimension. Explicit op (NOT bootstrap — the tenant
-    /// must exist first).
+    /// presplit a `{scope}/` keyspace by its namespace's natural dimension.
+    /// `scope` is a namespace or an in-namespace sub-scope (`bench/perf`).
+    /// Explicit op (NOT bootstrap — the namespace must exist first).
     Presplit {
-        namespace: String,
-        tenant: String,
+        scope: String,
         rule: PresplitRule,
         /// UX-fix (M5): required to NARROW an fs's declared stripe
         /// geometry (`--lanes` smaller than the current declaration). Without it,
@@ -485,13 +466,10 @@ pub(crate) enum Command {
         principal: String,
         credential: String,
     },
-    /// D2: register a namespace (admin).
-    /// `--with-tenant <T>` marks it protected (owner tenant = T). `--presplit`
-    /// takes comma-separated hex split points (frozen for D8; stored, not yet
-    /// acted upon).
+    /// D2: register a namespace (admin). `--presplit` takes comma-separated
+    /// hex split points, recorded on the namespace.
     NamespaceCreate {
         name: String,
-        owner_tenant: Option<String>,
         presplit: Vec<Vec<u8>>,
     },
     /// D2: delete a namespace registry row (admin). Refuses a non-empty
@@ -931,7 +909,7 @@ pub(crate) fn parse() -> Args {
             let mut credential = String::new();
             while i < raw.len() {
                 match raw[i].as_str() {
-                    "--principal" | "--tenant" => {
+                    "--principal" => {
                         i += 1;
                         principal = val(&raw, i).to_owned();
                         i += 1;
@@ -961,23 +939,12 @@ pub(crate) fn parse() -> Args {
         // D2: namespace registry admin
         "namespace-create" => {
             let mut name = String::new();
-            let mut owner_tenant: Option<String> = None;
             let mut presplit: Vec<Vec<u8>> = Vec::new();
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--name" => {
                         i += 1;
                         name = val(&raw, i).to_owned();
-                        i += 1;
-                    }
-                    // Convenience: mark the namespace PROTECTED with owner = T.
-                    // (Full principal-create wrapping is deferred to a later
-                    // sub-delivery — this only sets the owner marker.)
-                    // `--tenant` is the canonical spelling (matches split /
-                    // presplit / mint-token); `--with-tenant` kept as an alias.
-                    "--tenant" | "--with-tenant" => {
-                        i += 1;
-                        owner_tenant = Some(val(&raw, i).to_owned());
                         i += 1;
                     }
                     // Comma-separated HEX split points (frozen for D8).
@@ -991,17 +958,16 @@ pub(crate) fn parse() -> Args {
                     "--credential-file" | "--cluster-secret-file" => {
                         i += 2;
                     }
-                    _ => break,
+                    other => {
+                        eprintln!("namespace-create: unexpected argument {other:?}");
+                        std::process::exit(1);
+                    }
                 }
             }
             if name.is_empty() {
                 usage();
             }
-            Command::NamespaceCreate {
-                name,
-                owner_tenant,
-                presplit,
-            }
+            Command::NamespaceCreate { name, presplit }
         }
         "namespace-delete" => {
             let mut name = String::new();
@@ -1404,16 +1370,15 @@ pub(crate) fn parse() -> Args {
             }
             let part_id: u64 = num_arg(&raw, i, "PARTID");
             i += 1;
-            // (D4). The CLI's user-facing surface speaks namespace/tenant,
+            // (D4). The CLI's user-facing surface speaks namespace + suffix,
             // never raw prefix bytes (§3.4 CLI refinement / refinement 3). Forms:
             //   split <PART>                                    → median (legacy)
-            //   split <PART> --namespace NS --tenant T [--at S | --at-hex HEX]
-            //        → cut at "NS/T/" ++ suffix; empty/omitted suffix = the
-            //          pair boundary "NS/T/" itself
+            //   split <PART> --namespace NS [--at S | --at-hex HEX]
+            //        → cut at "NS/" ++ suffix; empty/omitted suffix = the
+            //          namespace boundary "NS/" itself
             //   split <PART> --at-raw-hex HEX                   → admin escape
-            //        hatch: raw whole key, no ns/tenant assembly
+            //        hatch: raw whole key, no namespace assembly
             let mut namespace: Option<String> = None;
-            let mut tenant: Option<String> = None;
             let mut suffix: Option<Vec<u8>> = None; // from --at / --at-hex
             let mut raw_key: Option<Vec<u8>> = None; // from --at-raw-hex
             while i < raw.len() {
@@ -1421,11 +1386,6 @@ pub(crate) fn parse() -> Args {
                     "--namespace" => {
                         i += 1;
                         namespace = Some(val(&raw, i).to_owned());
-                        i += 1;
-                    }
-                    "--tenant" => {
-                        i += 1;
-                        tenant = Some(val(&raw, i).to_owned());
                         i += 1;
                     }
                     "--at" => {
@@ -1461,16 +1421,15 @@ pub(crate) fn parse() -> Args {
                     }
                 }
             }
-            let point = build_split_point(namespace, tenant, suffix, raw_key);
+            let point = build_split_point(namespace, suffix, raw_key);
             Command::Split { part_id, point }
         }
         "presplit" => {
-            // presplit <NS>/<TENANT> by the ns's dimension.
-            //   presplit --namespace fs  --tenant T (--fs-inos i,j,… | --count N)
-            //   presplit --namespace kvc --tenant T --count N --hash-prefix '<model>/vllm/v1/'
-            //   presplit --namespace mem --tenant T --agents a,b,…
+            // presplit <NS> by the ns's dimension.
+            //   presplit --namespace fs  (--lanes N | --fs-inos i,j,… | --count N)
+            //   presplit --namespace kvc --count N --hash-prefix '<model-scope>/vllm/v1/'
+            //   presplit --namespace mem --agents a,b,…
             let mut namespace: Option<String> = None;
-            let mut tenant: Option<String> = None;
             let mut count: Option<usize> = None;
             let mut fs_inos: Option<Vec<u64>> = None;
             let mut lanes: Option<usize> = None;
@@ -1487,7 +1446,6 @@ pub(crate) fn parse() -> Args {
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--namespace" => { i += 1; namespace = Some(val(&raw, i).to_owned()); i += 1; }
-                    "--tenant" => { i += 1; tenant = Some(val(&raw, i).to_owned()); i += 1; }
                     "--count" => { i += 1; count = Some(num(val(&raw, i), "--count") as usize); i += 1; }
                     "--fs-inos" => {
                         i += 1;
@@ -1525,20 +1483,18 @@ pub(crate) fn parse() -> Args {
                     other => { eprintln!("presplit: unknown flag {other}"); std::process::exit(1); }
                 }
             }
-            let namespace = namespace.unwrap_or_else(|| {
-                eprintln!("presplit requires --namespace <fs|kvc|mem>"); std::process::exit(1);
+            let scope = namespace.unwrap_or_else(|| {
+                eprintln!("presplit requires --namespace <NS[/SUB]>"); std::process::exit(1);
             });
-            // `--tenant` is an OPTIONAL in-namespace
-            // sub-segment (mem/kvc). fs has no tenant → default empty → cut at
-            // `{namespace}/`. When given it is concatenated raw into the
-            // `{namespace}/{tenant}/` cut key, so it MUST be a single lowercase
-            // path segment — same guard `split` uses.
-            let tenant = tenant.unwrap_or_default();
-            if !tenant.is_empty() {
-                reject_bad_segment("presplit", "tenant", &tenant);
-            }
-            let rule = match namespace.as_str() {
+            reject_bad_scope("presplit", &scope);
+            // The rule follows the namespace (first segment); the cut prefix is
+            // the whole scope.
+            let rule = match scope.split('/').next().unwrap_or_default() {
                 "fs" => {
+                    if scope != "fs" {
+                        eprintln!("presplit: fs is one tree — pass --namespace fs, not {scope:?}");
+                        std::process::exit(1);
+                    }
                     // `--lanes N` presplits fs into N LANE partitions
                     // (cut at `[0x03][1..N]`) so a striped large file's extents
                     // spread across them. Distinct from `--fs-inos`/`--count`
@@ -1576,9 +1532,8 @@ pub(crate) fn parse() -> Args {
                     });
                     // No default: the content-hash is NOT directly under a fixed
                     // segment. The vLLM connector stores
-                    //   kvc/{tenant}/{model}/vllm/v1/{hash}/{layer}
-                    // (full_key -> {model}/{pool}/{fmt}/{hash}/{layer}, POOL=vllm,
-                    // FMT=v1), so the hash sits under a per-MODEL prefix. A hardcoded
+                    //   kvc/{model_scope}/vllm/v1/{hash}/{layer}
+                    // so the hash sits under a per-model prefix. A hardcoded
                     // "vllm/" would cut nowhere near real keys and silently defeat the
                     // presplit. Require the operator to pass the exact relative prefix
                     // down to (but excluding) the hash hex — inspect a live key first.
@@ -1586,9 +1541,9 @@ pub(crate) fn parse() -> Args {
                         eprintln!(
                             "presplit --namespace kvc requires --hash-prefix <rel-prefix-to-hash>\n  \
                              the RELATIVE prefix from the namespace root down to just before the\n  \
-                             content-hash hex. vLLM stores kvc/<tenant>/<model>/vllm/v1/<hash>/<layer>,\n  \
-                             so pass e.g. --hash-prefix '<model-fingerprint>/vllm/v1/'. Find the exact\n  \
-                             <model-fingerprint> with: autumn-client ls --prefix '<tenant>/kvc/'"
+                             content-hash hex. vLLM stores kvc/<model-scope>/vllm/v1/<hash>/<layer>,\n  \
+                             so pass e.g. --hash-prefix '<model-scope>/vllm/v1/'. Find the exact\n  \
+                             <model-scope> with: autumn-client --namespace kvc ls"
                         );
                         std::process::exit(1);
                     });
@@ -1616,8 +1571,7 @@ pub(crate) fn parse() -> Args {
                 }
             };
             Command::Presplit {
-                namespace,
-                tenant,
+                scope,
                 rule,
                 force: presplit_force,
             }
@@ -1863,10 +1817,9 @@ fn parse_admin_flags(raw: &[String], i: &mut usize) -> (String, String, bool) {
     (reason, by, force)
 }
 
-/// (D4) / coco P2: a namespace/tenant CLI segment must be a
-/// SINGLE path segment so `{ns}/{tenant}/ ++ suffix` is 1:1 with what the
-/// operator typed. The namespace convention pins the charset to `[a-z0-9._-]+`
-/// (non-empty, no `/`). Pure so it is unit-testable; `reject_bad_segment` is
+/// (D4) / coco P2: a scope segment must be a SINGLE path segment so
+/// `{scope}/ ++ suffix` is 1:1 with what the operator typed. The namespace
+/// convention pins the charset to `[a-z0-9._-]+` (non-empty, no `/`). Pure so it is unit-testable; `reject_bad_scope` is
 /// the fail-loud wrapper.
 pub(crate) fn valid_segment(s: &str) -> bool {
     !s.is_empty()
@@ -1875,11 +1828,16 @@ pub(crate) fn valid_segment(s: &str) -> bool {
         })
 }
 
-fn reject_bad_segment(cmd: &str, kind: &str, s: &str) {
-    if !valid_segment(s) {
+/// A `--namespace` scope: one or more `/`-separated segments, each valid.
+pub(crate) fn valid_scope(s: &str) -> bool {
+    s.split('/').all(valid_segment)
+}
+
+fn reject_bad_scope(cmd: &str, s: &str) {
+    if !valid_scope(s) {
         eprintln!(
-            "{cmd}: --{kind} {s:?} is not a valid segment — must be non-empty and \
-             match [a-z0-9._-]+ (no '/')."
+            "{cmd}: --namespace {s:?} is not a valid scope — `/`-separated \
+             segments, each non-empty and matching [a-z0-9._-]+."
         );
         std::process::exit(1);
     }
@@ -1891,53 +1849,41 @@ fn reject_bad_segment(cmd: &str, kind: &str, s: &str) {
 ///
 /// Rules:
 /// - `--at-raw-hex` is the admin escape hatch and is mutually exclusive with
-///   every ns/tenant/suffix flag.
-/// - `--namespace` and `--tenant` are both-or-neither.
-/// - `--at` / `--at-hex` (the suffix) require `--namespace` + `--tenant`
-///   (a suffix is relative to a pair; a bare suffix is meaningless — use
-///   `--at-raw-hex` for a whole raw key).
+///   `--namespace` / `--at` / `--at-hex`.
+/// - `--at` / `--at-hex` (the suffix) require `--namespace` (a suffix is
+///   relative to a namespace; a whole raw key uses `--at-raw-hex`).
 /// - Nothing → `Median`.
 pub(crate) fn build_split_point(
     namespace: Option<String>,
-    tenant: Option<String>,
     suffix: Option<Vec<u8>>,
     raw_key: Option<Vec<u8>>,
 ) -> SplitPoint {
     if let Some(bytes) = raw_key {
-        if namespace.is_some() || tenant.is_some() || suffix.is_some() {
+        if namespace.is_some() || suffix.is_some() {
             eprintln!(
                 "split: --at-raw-hex is an escape hatch and cannot be combined \
-                 with --namespace/--tenant/--at/--at-hex"
+                 with --namespace/--at/--at-hex"
             );
             std::process::exit(1);
         }
         return SplitPoint::Raw(bytes);
     }
-    // `--namespace` alone is enough (fs has no tenant);
-    // `--tenant` is an OPTIONAL in-namespace sub-segment (mem/kvc).
     match namespace {
-        Some(namespace) => {
-            // Each segment MUST be a single path segment (`[a-z0-9._-]+`, no `/`),
-            // else the (ns, tenant, suffix) triple is not 1:1 with the assembled
-            // raw key. A key that needs other bytes uses `--at-raw-hex`.
-            reject_bad_segment("split", "namespace", &namespace);
-            let tenant = tenant.unwrap_or_default();
-            if !tenant.is_empty() {
-                reject_bad_segment("split", "tenant", &tenant);
-            }
+        Some(scope) => {
+            // Each scope segment must be `[a-z0-9._-]+`, else (scope, suffix)
+            // is not 1:1 with the assembled raw key.
+            reject_bad_scope("split", &scope);
             SplitPoint::Namespaced {
-                namespace,
-                tenant,
-                // Omitted suffix = empty = cut exactly at the namespace/pair boundary.
+                scope,
+                // Omitted suffix = empty = cut exactly at the namespace boundary.
                 suffix: suffix.unwrap_or_default(),
             }
         }
         None => {
-            if suffix.is_some() || tenant.is_some() {
+            if suffix.is_some() {
                 eprintln!(
-                    "split: --at/--at-hex/--tenant require --namespace <ns> \
-                     (a suffix/tenant is relative to a namespace). For a whole raw \
-                     key use --at-raw-hex."
+                    "split: --at/--at-hex require --namespace <ns> (a suffix is \
+                     relative to a namespace). For a whole raw key use --at-raw-hex."
                 );
                 std::process::exit(1);
             }
@@ -2037,12 +1983,10 @@ pub(crate) fn hex_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
 ///
 /// **SUPERSEDED for real workloads by `autumn-op presplit --namespace fs`.**
 /// This produces RAW `[0x03][ino low byte]` split
-/// points with NO `{tenant}/{namespace}/` prefix, so under SD-2/SD-3 tenant-first
-/// keys (`{t}/fs/[0x03][ino]`) it does NOT match any real wire key — every file
-/// lands in one partition. It also steps the ino LOW byte (0x20/0x40/…), but
-/// real inodes 4–8 are all < 0x20, so byte-stepping never splits them. Kept only
-/// as the namespace-blind bootstrap fallback (`AUTUMN_BOOTSTRAP_PRESPLIT`); use
-/// `presplit` after the tenant exists.
+/// points with NO `fs/` prefix, so it does NOT match any real wire key
+/// (`fs/[0x03][ino]`) — every file lands in one partition. It also steps the
+/// ino LOW byte (0x20/0x40/…), but real inodes 4–8 are all < 0x20, so
+/// byte-stepping never splits them. Use `presplit --namespace fs`.
 pub(crate) fn fuse_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     if n <= 1 {
         return vec![(vec![], vec![])];
@@ -2064,13 +2008,13 @@ pub(crate) fn fuse_split_ranges(n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 // ── Per-namespace presplit rules ─────────────────────────────────────────────
-// Presplit a `{tenant}/{namespace}/` keyspace by the namespace's NATURAL
+// Presplit a `{namespace}/` keyspace by the namespace's NATURAL
 // high-entropy dimension (a raw-byte uniform split is namespace-blind — after
 // SD-2/SD-3 all real keys sit in the `fs/`/`kvc/`/`mem/` byte sliver, so uniform
 // splitting collapses everything into a couple of partitions). Each rule returns
-// SUFFIXES relative to `{tenant}/{namespace}/`, ASCENDING; `cmd_presplit`
-// prepends the tenant-first `{tenant}/{namespace}/` prefix to get raw wire cut
-// points and splits the owning partition at each.
+// SUFFIXES relative to `{namespace}/`, ASCENDING; `cmd_presplit` prepends the
+// `{namespace}/` prefix to get raw wire cut points and splits the owning
+// partition at each.
 
 /// Per-namespace presplit rule (key structure ⇒ split dimension).
 #[derive(Debug, Clone)]
@@ -2332,49 +2276,46 @@ mod tests {
 
     #[test]
     fn split_point_namespaced_with_suffix_assembles_prefix() {
-        // NS-FIRST; tenant is an in-namespace sub-segment.
         let p = SplitPoint::Namespaced {
-            namespace: "kvc".into(),
-            tenant: "acme".into(),
-            suffix: b"vllm/v1/80".to_vec(),
+            scope: "kvc".into(),
+            suffix: b"model-a/vllm/v1/80".to_vec(),
         };
         assert_eq!(
             p.resolve_at_key().unwrap(),
-            b"kvc/acme/vllm/v1/80".to_vec()
+            b"kvc/model-a/vllm/v1/80".to_vec()
         );
     }
 
     #[test]
-    fn split_point_empty_tenant_cuts_at_namespace_boundary() {
-        // fs has no tenant → cut at the namespace boundary `fs/`.
+    fn split_point_sub_scope_assembles_every_segment() {
         let p = SplitPoint::Namespaced {
-            namespace: "fs".into(),
-            tenant: String::new(),
+            scope: "bench/perf".into(),
+            suffix: b"80".to_vec(),
+        };
+        assert_eq!(p.resolve_at_key().unwrap(), b"bench/perf/80".to_vec());
+        assert!(super::valid_scope("bench/perf"));
+        assert!(!super::valid_scope("bench/"));
+        assert!(!super::valid_scope("/perf"));
+        assert!(!super::valid_scope("bench//perf"));
+    }
+
+    #[test]
+    fn split_point_empty_suffix_cuts_at_namespace_boundary() {
+        let p = SplitPoint::Namespaced {
+            scope: "fs".into(),
             suffix: vec![],
         };
         assert_eq!(p.resolve_at_key().unwrap(), b"fs/".to_vec());
     }
 
     #[test]
-    fn split_point_empty_suffix_is_pair_boundary() {
-        // With a tenant sub-segment, empty suffix cuts at "ns/tenant/".
-        let p = SplitPoint::Namespaced {
-            namespace: "kvc".into(),
-            tenant: "acme".into(),
-            suffix: vec![],
-        };
-        assert_eq!(p.resolve_at_key().unwrap(), b"kvc/acme/".to_vec());
-    }
-
-    #[test]
     fn split_point_hex_suffix_carries_binary_bytes() {
         // --at-hex path: a binary suffix (e.g. an fs inode prefix) rides on
-        // the `{ns}/` assembly (fs has no tenant sub-segment).
+        // the `{ns}/` assembly.
         let suffix = super::parse_hex_key("0103ff00");
         assert_eq!(suffix, vec![0x01, 0x03, 0xff, 0x00]);
         let p = SplitPoint::Namespaced {
-            namespace: "fs".into(),
-            tenant: String::new(),
+            scope: "fs".into(),
             suffix,
         };
         let mut expected = b"fs/".to_vec();
@@ -2384,11 +2325,10 @@ mod tests {
 
     #[test]
     fn valid_segment_enforces_single_path_segment() {
-        // coco P2: the segment charset must be [a-z0-9._-]+ so the
-        // (ns, tenant, suffix) triple is 1:1 with the assembled raw key.
+        // coco P2: the segment charset must be [a-z0-9._-]+ so
+        // (ns, suffix) is 1:1 with the assembled raw key.
         assert!(super::valid_segment("kvc"));
         assert!(super::valid_segment("acme"));
-        assert!(super::valid_segment("default"));
         assert!(super::valid_segment("model-cfg_456cf7.0"));
         // Rejected: empty, embedded '/', uppercase, whitespace, other bytes.
         assert!(!super::valid_segment(""));
@@ -2408,27 +2348,22 @@ mod tests {
     fn build_split_point_classification() {
         // Nothing → median.
         assert!(matches!(
-            super::build_split_point(None, None, None, None),
+            super::build_split_point(None, None, None),
             SplitPoint::Median
         ));
-        // ns + tenant, no suffix → pair-boundary namespaced (empty suffix).
-        match super::build_split_point(Some("a".into()), Some("b".into()), None, None) {
+        // ns, no suffix → namespace boundary (empty suffix).
+        match super::build_split_point(Some("a".into()), None, None) {
             SplitPoint::Namespaced { suffix, .. } => assert!(suffix.is_empty()),
             _ => panic!("expected namespaced"),
         }
-        // ns + tenant + suffix → namespaced with suffix.
-        match super::build_split_point(
-            Some("a".into()),
-            Some("b".into()),
-            Some(b"s".to_vec()),
-            None,
-        ) {
+        // ns + suffix → namespaced with suffix.
+        match super::build_split_point(Some("a".into()), Some(b"s".to_vec()), None) {
             SplitPoint::Namespaced { suffix, .. } => assert_eq!(suffix, b"s".to_vec()),
             _ => panic!("expected namespaced"),
         }
         // raw escape hatch alone → raw.
         assert!(matches!(
-            super::build_split_point(None, None, None, Some(vec![1, 2, 3])),
+            super::build_split_point(None, None, Some(vec![1, 2, 3])),
             SplitPoint::Raw(_)
         ));
     }
@@ -2495,9 +2430,9 @@ mod tests {
 
     // ── Per-namespace presplit rules ──────────────────────────────────────────────
 
-    /// The full tenant-first wire cut point = `{tenant}/{ns}/ ++ suffix`.
-    fn wire(tenant: &str, ns: &str, suffix: &[u8]) -> Vec<u8> {
-        let mut k = format!("{tenant}/{ns}/").into_bytes();
+    /// The full wire cut point = `{ns}/ ++ suffix`.
+    fn wire(ns: &str, suffix: &[u8]) -> Vec<u8> {
+        let mut k = format!("{ns}/").into_bytes();
         k.extend_from_slice(suffix);
         k
     }
@@ -2516,15 +2451,13 @@ mod tests {
         assert_eq!(suffixes[0], vec![0x03, 0, 0, 0, 0, 0, 0, 0, 4]);
         assert_eq!(suffixes[4], vec![0x03, 0, 0, 0, 0, 0, 0, 0, 8]);
         // ascending on the wire, so limit-scans + PS range checks stay sane.
-        let pts: Vec<Vec<u8>> = suffixes.iter().map(|s| wire("default", "fs", s)).collect();
+        let pts: Vec<Vec<u8>> = suffixes.iter().map(|s| wire("fs", s)).collect();
         for w in pts.windows(2) {
             assert!(w[0] < w[1], "cut points must be ascending");
         }
         // An extent of inode 5 (`[0x03][5][off]`) sorts >= the `[0x03][5]` cut
         // and < the `[0x03][6]` cut → lands in inode 5's own partition.
-        let ext5 = wire(
-            "default",
-            "fs",
+        let ext5 = wire("fs",
             &[
                 0x03, 0, 0, 0, 0, 0, 0, 0, 5, /*off*/ 0, 0, 0, 0, 0, 0, 0, 0,
             ],
@@ -2547,15 +2480,13 @@ mod tests {
         assert_eq!(s, vec![vec![0x03, 1], vec![0x03, 2], vec![0x03, 3]]);
         // A striped extent on lane 2 (wire [0x03][2][ino][off]) sorts into the
         // partition [[0x03][2], [0x03][3]).
-        let ext_lane2 = wire(
-            "default",
-            "fs",
+        let ext_lane2 = wire("fs",
             &[
                 0x03, 2, /*ino*/ 0, 0, 0, 0, 0, 0, 0, 9, /*off*/ 0, 0, 0, 0, 0, 0, 0, 0,
             ],
         );
-        let cut2 = wire("default", "fs", &s[1]); // [0x03][2]
-        let cut3 = wire("default", "fs", &s[2]); // [0x03][3]
+        let cut2 = wire("fs", &s[1]); // [0x03][2]
+        let cut3 = wire("fs", &s[2]); // [0x03][3]
         assert!(ext_lane2 >= cut2 && ext_lane2 < cut3);
         // < 2 lanes → no cut.
         assert!(super::presplit_suffixes(&PresplitRule::FsLanes { lanes: 1, parts: 1 }).unwrap().is_empty());
@@ -2576,9 +2507,9 @@ mod tests {
         let sfx = |c: u8| { let mut v = hp.to_vec(); v.push(c); v };
         assert_eq!(s, vec![sfx(b'4'), sfx(b'8'), sfx(b'c')]);
         // A sha256-hexdigest key starting '9' lands in the 3rd bucket [8, c).
-        let k9 = wire("t", "kvc", &{ let mut v = hp.to_vec(); v.extend_from_slice(b"9abc..."); v });
-        let p8 = wire("t", "kvc", &sfx(b'8'));
-        let pc = wire("t", "kvc", &sfx(b'c'));
+        let k9 = wire("kvc", &{ let mut v = hp.to_vec(); v.extend_from_slice(b"9abc..."); v });
+        let p8 = wire("kvc", &sfx(b'8'));
+        let pc = wire("kvc", &sfx(b'c'));
         assert!(k9 >= p8 && k9 < pc);
         // count < 2 → no cut.
         assert!(super::presplit_suffixes(&PresplitRule::Kvc { hash_prefix: hp.to_vec(), count: 1 })
@@ -2595,9 +2526,9 @@ mod tests {
         .unwrap();
         assert_eq!(s, vec![b"b/".to_vec(), b"m/".to_vec(), b"z/".to_vec()]); // sorted
         // agent "chatbot" (starts 'c') sorts >= "b/" and < "m/" → bucket [b, m).
-        let kc = wire("t", "mem", b"chatbot/ep/1");
-        let pb = wire("t", "mem", b"b/");
-        let pm = wire("t", "mem", b"m/");
+        let kc = wire("mem", b"chatbot/ep/1");
+        let pb = wire("mem", b"b/");
+        let pm = wire("mem", b"m/");
         assert!(kc >= pb && kc < pm);
         // empty agent name rejected.
         assert!(super::presplit_suffixes(&PresplitRule::Mem { agents: vec!["".into()] }).is_err());
@@ -2742,7 +2673,7 @@ mod lane_parts_tests {
     fn hex_rule_cuts_relative_to_the_namespace() {
         use super::{presplit_suffixes, PresplitRule};
         let s = presplit_suffixes(&PresplitRule::Hex { count: 4 }).unwrap();
-        // RELATIVE suffixes — the caller prepends `{ns}/{tenant}/`, which is the
+        // RELATIVE suffixes — the caller prepends `{ns}/`, which is the
         // whole point: the retired bootstrap presplit emitted these as ABSOLUTE
         // raw keys, where no namespaced key ever reaches them.
         assert_eq!(s.len(), 3);

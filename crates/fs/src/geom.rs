@@ -9,8 +9,7 @@
 //!
 //! `autumnfs` shares this exact reader with the mount. One implementation, no
 //! drift — the duplication this replaces is what let the CLI
-//! hardcode the wire prefix `b"fs/"`, a byte string that has already changed
-//! twice (tenant-first, then Option 3).
+//! hardcode the wire prefix `b"fs/"`.
 //!
 //! What stays per-file is the STAMP (`InodeMeta.stripe`): every file remains
 //! self-describing, so reads never consult cluster shape and any

@@ -105,21 +105,21 @@ class AutumnKVCacheStorage(HiCacheStorage):
 ## 5. Key 格式
 
 ```
-wire key = kvc/{tenant_suffix}/{pool_name}/{content_hash}
+wire key = kvc/{model_scope}/{pool_name}/{content_hash}
 ```
 
 **客户端绑定 `scope="kvc"` 并自己 prepend `kvc/`**，所以 `_keys.full_key()` 只
-emit 相对部分 `{tenant_suffix}/{pool_name}/{content_hash}`——scope 由构造锁死，
+emit 相对部分 `{model_scope}/{pool_name}/{content_hash}`——scope 由构造锁死，
 adapter 不拼 wire 前缀。
 
 | 字段 | 来源 | 备注 |
 |---|---|---|
 | `kvc/` | client scope | 跟其它 autumn 接口（`fs/` / `mem/`）分命名空间 |
-| `tenant_suffix` | `build_tenant_suffix(cfg, fingerprint)` | `{model}` + 可选 `_{fingerprint}` + `_{tp_rank}_{tp_size}`（MLA 模型跳过，其 KV 与 rank 无关）+ `_pp{pp_rank}_{pp_size}`（仅 `pp_size > 1`）。`model` 里的 `/` 折成 `_` |
+| `model_scope` | `build_model_scope(cfg, fingerprint)` | `{model}` + 可选 `_{fingerprint}` + `_{tp_rank}_{tp_size}`（MLA 模型跳过，其 KV 与 rank 无关）+ `_pp{pp_rank}_{pp_size}`（仅 `pp_size > 1`）。`model` 里的 `/` 折成 `_` |
 | `pool_name` | sglang = `"kv"`，vLLM = `"vllm"` | 两个框架的 keyspace 天然分流 |
 | `content_hash` | 内容寻址摘要 | sglang 直接用 controller 算好的 chain hash（backend 不重算）；vLLM 见 §13.3 |
 
-`tenant_suffix` 的 `model` 段在 sglang 路径上就是 `--model-path`（本身是真实
+`model_scope` 的 `model` 段在 sglang 路径上就是 `--model-path`（本身是真实
 身份），所以默认不带指纹；路径**不唯一**的部署（同一路径下两个微调、容器把不同
 权重挂到同一挂载点）用 `extra_config["model_id"]` 显式区分，它会被折成指纹。
 vLLM 路径**必须**带指纹（§13.3）。
@@ -240,7 +240,7 @@ fail-fast）、`model_id`（§5）、`auth_credential_file`/`auth_principal`（�
 - **L3 lookup latency P50/P99**：必须 << prefetch budget（2s + 0.1s/Kitok）。
 - **L3 write latency**：write_through 模式下的 worst-case bound。
 - **partition QPS**：单 partition 不能超 [[project_partition_qps_ceiling]] 的
-  30K QPS；超了说明该 split 或该按 tenant_suffix 分库。
+  30K QPS；超了说明该 split 或该按 model_scope 分库。
 
 按 [[feedback_perf_check_matrix]]：transport × partitions{8+} × depth{8} ×
 size{4K, 8M}。**page size 由模型决定**，不在 perf matrix 里，但 benchmark 要覆盖
@@ -310,7 +310,7 @@ sglang HiCache L3 是个**同步 storage backend**（§4）。vLLM 的 `KVConnec
 ### 13.3 Key 格式（沿用 §5 命名空间）
 
 ```
-wire key = kvc/{tenant_suffix}/vllm/{VLLM_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}
+wire key = kvc/{model_scope}/vllm/{VLLM_KV_STORAGE_FORMAT}/{content_hash}/{layer_name}
 ```
 
 - `vllm` 段就是 §5 的 `pool_name`（sglang 用 `kv`），两个框架的 keyspace 天然分流。
@@ -323,24 +323,24 @@ wire key = kvc/{tenant_suffix}/vllm/{VLLM_KV_STORAGE_FORMAT}/{content_hash}/{lay
   都已存完"。scheduler 探的是**它**而不是某个真实层名——scheduler 不知道 worker
   侧的模型层命名（`register_kv_caches` 只在 worker 侧）。marker 在后台 save ACK
   之后才发布，所以它天然是 all-layers-durable 的提交点。
-- **`model_fingerprint`（写进 `tenant_suffix`）**：`_identity.vllm_identity_sources`
+- **`model_fingerprint`（写进 `model_scope`）**：`_identity.vllm_identity_sources`
   从 `VllmConfig` 提取模型真实身份做 12-hex sha256——架构形状（layers / hidden /
   kv_heads / head / vocab / model_type / dtype / quant / MLA）+ 权重来源
   （`load_format`，autumn loader 时再加 `model_loader_extra_config["path"]`）+
   可选 `kv_connector_extra_config["model_id"]`。vLLM 路径上这个指纹是**必需**的：
   共享一个本地 config 目录的部署把 config/tokenizer 钉死在固定路径，`model_config.model`
-  对所有这样 serve 的模型都是同一个字符串，没有指纹就会两个模型共用一个 tenant
+  对所有这样 serve 的模型都是同一个字符串，没有指纹就会两个模型共用一个 model scope
   互相串读 KV（层数不同时是可见告警，同形状模型则是**无声**错误）。指纹跨进程
-  确定（同部署 → 同 tenant，否则缓存永 miss）。
+  确定（同部署 → 同 model scope，否则缓存永 miss）。
   **残留撞车场景**：同架构 + 同权重身份源（同本地路径的两个微调、或在同一 autumn
   path 原地覆写权重）→ 用 `model_id` 显式区分 / 新权重放新 path。
 - **`VLLM_KV_STORAGE_FORMAT`（`_keys.py`）**：connector 自己的 KV 布局版本，既烧进
-  key 路径又折进 tenant 指纹（双重失配）。指纹里另折入**运行中的 vLLM 完整版本号**
+  key 路径又折进 model scope 指纹（双重失配）。指纹里另折入**运行中的 vLLM 完整版本号**
   ——KV page 布局是 vLLM 内部实现细节、无稳定性契约，patch 版也可能改（取不到时
   loud warning + 降级）。
   **INVARIANT：改 `_extract_layer` / `_inject_layer` / `_byte_view` / key 组成方式
   必须 bump `VLLM_KV_STORAGE_FORMAT`**；不 bump = 形状可能仍对得上、什么都不报错、
-  输出静默是垃圾。`test_tenant_identity.py` 钉住当前值，让 bump 永远是一次自觉的、
+  输出静默是垃圾。`test_model_identity.py` 钉住当前值，让 bump 永远是一次自觉的、
   被 review 的动作（它会冷失效整个 vLLM pool）。
   运维后果：**任何 vLLM 版本变动都冷失效整个 vLLM pool**（见 ops.md）。粒度取完整
   版本是有意的——升级本就重启 pod（GPU cache 必丢），重暖是一次性可预期代价；漏挡

@@ -139,7 +139,7 @@ impl Fs {
     /// read. `credential` is RAW bytes (hex-decode the `autumn-op principal-create`
     /// output first — see `autumn_kvcache._identity.read_credential_file`).
     /// `principal` is the credential owner (from the credential file's name line).
-    /// no tenant — `autumn.Fs` scopes to the WHOLE `fs/`
+    /// `autumn.Fs` scopes to the WHOLE `fs/`
     /// namespace (one global tree; see docs/key_namespace_split_design.md).
     #[staticmethod]
     #[pyo3(signature = (manager, host=None, principal=None, credential=None, direct_read=false))]

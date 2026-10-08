@@ -1,12 +1,12 @@
-"""Model-identity fingerprint for tenant isolation (BUG-KVC-TENANT).
+"""Model-identity fingerprint for model-scope isolation.
 
 Why this exists — the live incident: deployments that pin the
 served path to a constant local dir (config/tokenizer in e.g. `/model-cfg`,
 weights streamed from autumn), so vLLM's `model_config.model` is the SAME
-string for every model served that way. `build_tenant_suffix` inherited
+string for every model served that way. `build_model_scope` inherited
 sglang's assumption that `model_name` identifies a model → Qwen2.5-7B-AWQ and
 Qwen2.5-32B-AWQ (same tokenizer ⇒ same token ids ⇒ same content hash) landed
-in ONE tenant `model-cfg_0_1` and cross-read each other's KV. 28-vs-64-layer
+in ONE model scope `model-cfg_0_1` and cross-read each other's KV. 28-vs-64-layer
 mismatch made it visible; two same-shape models would have been a fully
 SILENT correctness bug.
 
@@ -19,11 +19,11 @@ independent of the model dtype and decides the element type of the very
 bytes we store), plus the LAYOUT versions (the running vLLM version and the
 connector's own `VLLM_KV_STORAGE_FORMAT`): the page byte layout is an
 internal detail of the vLLM build + this connector, so the same model on a
-different vLLM must not read the old bytes — and fold it into the tenant
-suffix. Everything here is pure at import time (no vllm/torch/autumn module
+different vLLM must not read the old bytes — and fold it into the model
+scope. Everything here is pure at import time (no vllm/torch/autumn module
 imports; the vLLM version is a lazy, guarded lookup) so it is unit-testable
 offline and, more importantly, deterministic across processes: the same
-deployment MUST map to the same tenant or the cache never hits.
+deployment MUST map to the same model scope or the cache never hits.
 
 Residual collisions this does NOT close (documented, not hidden):
 - same architecture + same weights identity source — e.g. two finetunes
@@ -40,7 +40,7 @@ from typing import Any, Dict, Optional
 
 from ._keys import VLLM_KV_STORAGE_FORMAT
 
-# Length of the hex fingerprint folded into the tenant suffix. 12 hex chars
+# Length of the hex fingerprint folded into the model scope. 12 hex chars
 # = 48 bits — collision-free for any realistic number of co-hosted models,
 # short enough that keys stay readable in dumps.
 FINGERPRINT_HEX_LEN = 12
@@ -162,7 +162,7 @@ def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
             src["revision"] = str(rev)
         try:
             # MLA changes the saved KV layout for the SAME shape (and can be
-            # toggled by VLLM_MLA_DISABLE), so it must split the tenant.
+            # toggled by VLLM_MLA_DISABLE), so it must split the model scope.
             if bool(getattr(mc, "use_mla", False)):
                 src["mla"] = 1
         except Exception:  # noqa: BLE001 — property may touch vllm envs
@@ -171,7 +171,7 @@ def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
     # The bytes this connector stores ARE the KV tensors, and `_inject_layer`
     # reinterprets them with the CURRENT runtime dtype
     # (`from_numpy(staging).view(template.dtype)`), so a deployment that flips
-    # --kv-cache-dtype without splitting the tenant reads old bytes under a new
+    # --kv-cache-dtype without splitting the model scope reads old bytes under a new
     # type. The dangerous pair is SAME-itemsize (fp8_e4m3 ↔ fp8_e5m2, both one
     # byte): the reshape succeeds, nothing errors, the KV is silently wrong —
     # exactly the failure class this module exists to close, on the dtype axis.
@@ -218,7 +218,7 @@ def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
             # THE strongest identity on the deployment path that broke
             # model_name — two models must live at two paths. (The `manager`
             # endpoint is deliberately excluded: the same weights reached via
-            # a different manager address must not split the tenant.)
+            # a different manager address must not split the model scope.)
             wpath = mle.get("path")
             if wpath:
                 src["weights_path"] = str(wpath).strip("/")
@@ -234,9 +234,9 @@ def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
     # The KV page byte layout is NOT part of the model: it is an internal
     # implementation detail of (a) the running vLLM build and (b) this
     # connector's extract/inject code. Either changing without splitting the
-    # tenant is the same failure class as the tenant bug itself: shapes may
-    # happen to line up, nothing errors, output is silently garbage. So both
-    # versions are identity sources.
+    # model scope is the same failure class as two models sharing one scope:
+    # shapes may happen to line up, nothing errors, output is silently
+    # garbage. So both versions are identity sources.
     #
     # FULL vLLM version (not major.minor): vLLM gives no stability contract
     # for its internal KV-cache tensor layout, and patch releases do touch
@@ -261,9 +261,9 @@ def vllm_identity_sources(vllm_config: Any) -> Dict[str, Any]:
     return src
 
 
-def tenant_cfg_from_vllm(vllm_config: Any):
-    """Adapt a VllmConfig into the duck-typed object `build_tenant_suffix` wants,
-    now carrying `model_fingerprint` + `identity_sources` (BUG-KVC-TENANT) and a
+def model_scope_cfg_from_vllm(vllm_config: Any):
+    """Adapt a VllmConfig into the duck-typed object `build_model_scope` wants,
+    now carrying `model_fingerprint` + `identity_sources` and a
     REAL `is_mla_model` (was hardcoded False — vLLM-side MLA was never detected).
     Pure + defensive so it is unit-testable without vllm installed.
     """
@@ -275,8 +275,8 @@ def tenant_cfg_from_vllm(vllm_config: Any):
         model = getattr(getattr(vllm_config, "model_config", None), "model", None)
         # When weights come from a streaming loader, `model_config.model` can be a CONSTANT local
         # config-dir (e.g. /model-cfg) shared by every model served that way — it
-        # identifies nothing and made the tenant key `model-cfg_<fp>_...` (the
-        # BUG-KVC-TENANT collision surface + noise). Prefer the autumn weights
+        # identifies nothing and made the model scope `model-cfg_<fp>_...` (the
+        # cross-model collision surface + noise). Prefer the autumn weights
         # path BASENAME (e.g. `qwen7b`): per-model unique, so the key is concise
         # AND model-distinguishing (`qwen7b_<fp>_...`) even if the fingerprint
         # hash ever degrades. The FULL path still feeds the fingerprint (see
@@ -300,7 +300,7 @@ def tenant_cfg_from_vllm(vllm_config: Any):
         # stage as `pp0`, because pp_rank was initialised to None and never
         # assigned. Prefer explicit fields when a vLLM build exposes them.
         # With pp_size == 1 — every deployment today — the derivation is the
-        # identity (`g % t == g`), so existing tenants are byte-identical.
+        # identity (`g % t == g`), so existing model scopes are byte-identical.
         tp_rank = getattr(par, "tensor_parallel_rank", None)
         pp_rank = getattr(par, "pipeline_parallel_rank", None)
         if tp_rank is None or pp_rank is None:
