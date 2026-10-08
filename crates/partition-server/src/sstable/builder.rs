@@ -46,8 +46,9 @@ pub struct SstBuilder {
 }
 
 impl SstBuilder {
-    pub fn new(vp_extent_id: u64, vp_offset: u64) -> Self {
-        // 1% FPR with a generous initial capacity; bloom will grow dynamically
+    /// `expected_keys` sizes the bloom filter (1% FPR at that many keys); a
+    /// table holding more keys degrades its filter, never its correctness.
+    pub fn new(vp_extent_id: u64, vp_offset: u64, expected_keys: usize) -> Self {
         SstBuilder {
             blocks: Vec::new(),
             block_offsets: Vec::new(),
@@ -55,7 +56,7 @@ impl SstBuilder {
             current: Vec::new(),
             entry_offsets: Vec::new(),
             base_key: Vec::new(),
-            bloom: BloomFilterBuilder::new(512, 0.01),
+            bloom: BloomFilterBuilder::new(expected_keys, 0.01),
             seq_num: 0,
             vp_extent_id,
             vp_offset,
@@ -257,7 +258,7 @@ mod tests {
 
     #[test]
     fn build_and_read_round_trip() {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         // Add entries in sorted order (higher seq = sorts first for same user key)
         let keys = vec![
             (b"apple".as_ref(), 10u64),
@@ -282,7 +283,7 @@ mod tests {
 
     #[test]
     fn multiple_blocks() {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         // Force multiple blocks with many entries
         for i in 0u64..2000 {
             let uk = format!("key{i:06}");
@@ -295,7 +296,7 @@ mod tests {
 
     #[test]
     fn crc_corruption_detected() {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         b.add(&ikey(b"key", 1), 1, b"val", 0);
         let mut data = b.finish();
         // Corrupt a byte in the first block
@@ -311,7 +312,7 @@ mod tests {
 
     #[test]
     fn discards_round_trip() {
-        let mut b = SstBuilder::new(42, 100);
+        let mut b = SstBuilder::new(42, 100, 1024);
         b.add(&ikey(b"key", 1), 1, b"val", 0);
         let mut discards = HashMap::new();
         discards.insert(10u64, 500i64);
@@ -327,7 +328,7 @@ mod tests {
 
     #[test]
     fn min_expires_at_no_expiry() {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         b.add(&ikey(b"a", 1), 1, b"v1", 0);
         b.add(&ikey(b"b", 2), 1, b"v2", 0);
         let data = b.finish();
@@ -337,7 +338,7 @@ mod tests {
 
     #[test]
     fn min_expires_at_with_expiry() {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         b.add(&ikey(b"a", 1), 1, b"v1", 1000);
         b.add(&ikey(b"b", 2), 1, b"v2", 500);
         b.add(&ikey(b"c", 3), 1, b"v3", 0); // no expiry
@@ -349,7 +350,7 @@ mod tests {
 
     #[test]
     fn min_expires_at_single_expiry() {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         b.add(&ikey(b"a", 1), 1, b"v1", 0);
         b.add(&ikey(b"b", 2), 1, b"v2", 42);
         let data = b.finish();
@@ -359,7 +360,7 @@ mod tests {
 
     #[test]
     fn mixed_gallery_like_keys_round_trip() {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         let keys = [
             b".thumb/320/Patreon--leeesovely-October-2024-MissKON.com-241.jpg".as_ref(),
             b".thumb/320/Patreon--leeesovely-October-2024-MissKON.com-299.jpg".as_ref(),
@@ -388,7 +389,7 @@ mod tests {
 
     #[test]
     fn gallery_like_rightmost_slice_round_trip() {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         let mut keys: Vec<Vec<u8>> = (241..=301)
             .map(|i| {
                 format!(".thumb/320/Patreon--leeesovely-October-2024-MissKON.com-{i:03}.jpg")
@@ -421,7 +422,7 @@ mod tests {
 
     #[test]
     fn the_meta_block_counts_entries_and_deletions() {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         let mut vp = vec![0u8; crate::VALUE_POINTER_SIZE];
         vp[0] = 7;
         b.add(&ikey(b"a", 9), 1, b"v", 0);
@@ -433,7 +434,7 @@ mod tests {
         assert_eq!(reader.num_entries, 5);
         assert_eq!(reader.num_deletions, 2);
 
-        let empty = SstReader::from_bytes(bytes::Bytes::from(SstBuilder::new(0, 0).finish()))
+        let empty = SstReader::from_bytes(bytes::Bytes::from(SstBuilder::new(0, 0, 1024).finish()))
             .expect("empty reader");
         assert_eq!((empty.num_entries, empty.num_deletions), (0, 0));
     }

@@ -6,10 +6,13 @@
 //! readers keep their per-reader slot vec (their memory is the resident
 //! bytes themselves, the slot vec just skips re-decode).
 //!
-//! Eviction: sampled-LRU (CLOCK-ish) — on overflow, scan up to
-//! `EVICT_SAMPLE` entries from the map's (randomized) iteration order and
-//! evict the least-recently-used of the sample, repeating until under cap.
-//! O(1)-ish, no ordered structure to maintain on the hot hit path.
+//! Eviction: CLOCK. Entries sit in a slot array; a hit sets the slot's
+//! reference bit, and on overflow the hand clears set bits and evicts the
+//! first clear one. Every entry is reachable by the hand. The previous
+//! sampled LRU took the first 16 entries of the map's iteration order, which
+//! is fixed for a given table layout: entries outside that window were never
+//! evicted, so once the cache filled only ~16 slots still turned over and a
+//! working set larger than that missed on every get.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -18,20 +21,31 @@ use parking_lot::Mutex;
 
 use super::format::DecodedBlock;
 
-const EVICT_SAMPLE: usize = 16;
-
-struct Entry {
+struct Slot {
+    key: (u64, u64),
     block: Arc<DecodedBlock>,
     size: usize,
-    last_used: u64,
+    referenced: bool,
 }
 
 struct Inner {
-    map: HashMap<(u64, u64), Entry>,
+    map: HashMap<(u64, u64), usize>,
+    slots: Vec<Option<Slot>>,
+    free: Vec<usize>,
+    hand: usize,
     bytes: usize,
-    tick: u64,
     hits: u64,
     misses: u64,
+}
+
+impl Inner {
+    fn remove_slot(&mut self, idx: usize) {
+        if let Some(s) = self.slots[idx].take() {
+            self.map.remove(&s.key);
+            self.bytes -= s.size;
+            self.free.push(idx);
+        }
+    }
 }
 
 pub struct BlockCache {
@@ -44,8 +58,10 @@ impl BlockCache {
         Self {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
+                slots: Vec::new(),
+                free: Vec::new(),
+                hand: 0,
                 bytes: 0,
-                tick: 0,
                 hits: 0,
                 misses: 0,
             }),
@@ -55,14 +71,12 @@ impl BlockCache {
 
     pub fn get(&self, key: (u64, u64)) -> Option<Arc<DecodedBlock>> {
         let mut g = self.inner.lock();
-        g.tick += 1;
-        let tick = g.tick;
-        match g.map.get_mut(&key) {
-            Some(e) => {
-                e.last_used = tick;
-                let b = e.block.clone();
+        match g.map.get(&key).copied() {
+            Some(idx) => {
                 g.hits += 1;
-                Some(b)
+                let slot = g.slots[idx].as_mut().expect("mapped slot is live");
+                slot.referenced = true;
+                Some(slot.block.clone())
             }
             None => {
                 g.misses += 1;
@@ -73,68 +87,72 @@ impl BlockCache {
 
     pub fn insert(&self, key: (u64, u64), block: Arc<DecodedBlock>, size: usize) {
         let mut g = self.inner.lock();
-        g.tick += 1;
-        let tick = g.tick;
-        if let Some(old) = g.map.insert(
-            key,
-            Entry {
-                block,
-                size,
-                last_used: tick,
-            },
-        ) {
-            g.bytes -= old.size;
-        }
-        g.bytes += size;
-        while g.bytes > self.cap_bytes && g.map.len() > 1 {
-            // Sampled LRU: pick the oldest of up to EVICT_SAMPLE entries,
-            // never evicting the key we just inserted.
-            let victim = g
-                .map
-                .iter()
-                .filter(|(k, _)| **k != key)
-                .take(EVICT_SAMPLE)
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(k, _)| *k);
-            match victim {
-                Some(v) => {
-                    if let Some(e) = g.map.remove(&v) {
-                        g.bytes -= e.size;
+        let g = &mut *g;
+        let idx = match g.map.get(&key).copied() {
+            Some(idx) => {
+                let slot = g.slots[idx].as_mut().expect("mapped slot is live");
+                g.bytes = g.bytes - slot.size + size;
+                slot.block = block;
+                slot.size = size;
+                slot.referenced = true;
+                idx
+            }
+            None => {
+                // Unreferenced until hit: a block read once goes first.
+                let slot = Some(Slot {
+                    key,
+                    block,
+                    size,
+                    referenced: false,
+                });
+                let idx = match g.free.pop() {
+                    Some(i) => {
+                        g.slots[i] = slot;
+                        i
                     }
-                }
-                None => break,
+                    None => {
+                        g.slots.push(slot);
+                        g.slots.len() - 1
+                    }
+                };
+                g.map.insert(key, idx);
+                g.bytes += size;
+                idx
+            }
+        };
+        // Never evicts the entry just inserted. Each pass clears every bit
+        // it passes, so a victim turns up within two turns of the hand.
+        while g.bytes > self.cap_bytes && g.map.len() > 1 {
+            let h = g.hand;
+            g.hand = (h + 1) % g.slots.len();
+            if h == idx {
+                continue;
+            }
+            match g.slots[h].as_mut() {
+                None => {}
+                Some(s) if s.referenced => s.referenced = false,
+                Some(_) => g.remove_slot(h),
             }
         }
     }
 
     /// Drop every cached block belonging to `extent_id`. TEST-ONLY: production
-    /// never invalidates per-extent — extent ids are globally unique within a
-    /// process, so a punched/truncated extent's `(extent_id, offset)` keys are
-    /// never reused (cross-cluster test reuse is handled by `clear`). (An
-    /// earlier doc claimed a compaction-time caller; that wiring never
-    /// existed.)
+    /// never invalidates per-extent — extent ids are never reused within a
+    /// cache's owner, so a punched extent's keys are never asked for again.
     #[cfg(test)]
     pub fn invalidate_extent(&self, extent_id: u64) {
         let mut g = self.inner.lock();
-        let keys: Vec<(u64, u64)> = g
+        let idxs: Vec<usize> = g
             .map
-            .keys()
-            .filter(|(e, _)| *e == extent_id)
-            .copied()
+            .iter()
+            .filter(|((e, _), _)| *e == extent_id)
+            .map(|(_, &i)| i)
             .collect();
-        for k in keys {
-            if let Some(e) = g.map.remove(&k) {
-                g.bytes -= e.size;
-            }
+        for i in idxs {
+            g.remove_slot(i);
         }
     }
 
-    /// Drop ALL cached blocks. The cache is keyed by `(extent_id, offset)` and
-    /// relies on extent ids being globally unique within a process (true for a
-    /// production cluster). A test harness that runs multiple independent
-    /// clusters in one process reuses low extent ids, so a fresh cluster must
-    /// start from an empty cache or it can be served a prior cluster's block
-    /// for the same `(extent_id, offset)`. Diagnostic / test use only.
     /// TEST-ONLY diagnostic snapshot: `(bytes, entries, hits, misses)`.
     #[cfg(test)]
     pub fn stats(&self) -> (usize, usize, u64, u64) {
@@ -166,6 +184,37 @@ mod tests {
         c.invalidate_extent(1);
         let (bytes, n, _, _) = c.stats();
         assert_eq!((bytes, n), (0, 0));
+    }
+
+    /// A scan: the cache fills with blocks used once, then every round brings
+    /// one new block while the same 56 blocks (8 readers x 7 tables) are hit.
+    /// The old sampled LRU only ever evicted from the first 16 entries of the
+    /// map, so the hot set kept missing; here it must stay resident.
+    #[test]
+    fn a_hot_set_survives_a_stream_of_cold_blocks() {
+        const CAP: usize = 512;
+        let c = BlockCache::new(CAP);
+        let mut cold = 0u64;
+        for _ in 0..CAP {
+            c.insert((1, cold), blk(), 1);
+            cold += 1;
+        }
+        let mut misses = 0;
+        for round in 0..4000 {
+            c.insert((1, cold), blk(), 1);
+            cold += 1;
+            for h in 0..56u64 {
+                if c.get((2, h)).is_none() {
+                    c.insert((2, h), blk(), 1);
+                    if round >= 1000 {
+                        misses += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(misses, 0, "hot blocks missed after warm-up");
+        let (bytes, n, _, _) = c.stats();
+        assert!(bytes <= CAP && n <= CAP);
     }
 
     #[test]

@@ -995,6 +995,10 @@ impl Memtable {
     fn is_empty(&self) -> bool {
         self.data.read().is_empty()
     }
+
+    fn len(&self) -> usize {
+        self.data.read().len()
+    }
     /// Tombstones held here. A full walk — only for seeding
     /// `PartitionMetrics::unsettled_deletes` from the replayed memtable at open.
     fn tombstone_count(&self) -> u64 {
@@ -10212,7 +10216,7 @@ async fn publish_freeze_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<
 // ---------------------------------------------------------------------------
 
 pub(crate) fn build_sst_bytes(imm: &Memtable, vp_extent_id: u64, vp_offset: u64) -> (Vec<u8>, u64) {
-    let mut builder = SstBuilder::new(vp_extent_id, vp_offset);
+    let mut builder = SstBuilder::new(vp_extent_id, vp_offset, imm.len());
     let mut last_seq = 0u64;
     imm.for_each(|ikey, me| {
         let ts = parse_ts(ikey);
@@ -10223,7 +10227,7 @@ pub(crate) fn build_sst_bytes(imm: &Memtable, vp_extent_id: u64, vp_offset: u64)
     });
     let wal_dead = imm.wal_dead.lock().clone();
     let mut builder = if builder.is_empty() {
-        SstBuilder::new(vp_extent_id, vp_offset)
+        SstBuilder::new(vp_extent_id, vp_offset, 0)
     } else {
         builder
     };
@@ -12008,6 +12012,29 @@ mod tests {
                 .unwrap_or_else(|| panic!("{uk:?} must be found in SST"));
             assert_eq!(&val[..], want);
         }
+    }
+
+    /// A flushed SST's filter is sized from the memtable it was built from.
+    #[test]
+    fn a_flushed_sst_filter_rejects_absent_keys() {
+        let mt = Memtable::new();
+        for i in 0..20_000u64 {
+            mt.insert(
+                key_with_ts(format!("key{i:06}").as_bytes(), i + 1),
+                MemEntry {
+                    op: 1,
+                    value: b"v".to_vec(),
+                    expires_at: 0,
+                },
+                10,
+            );
+        }
+        let (bytes, _) = build_sst_bytes(&mt, 0, 0);
+        let reader = SstReader::from_bytes(bytes::Bytes::from(bytes)).expect("reader");
+        let fp = (0..20_000u32)
+            .filter(|i| reader.bloom_may_contain(format!("absent{i:06}").as_bytes()))
+            .count();
+        assert!(fp < 400, "{fp} of 20000 absent keys passed the filter");
     }
 
     #[test]

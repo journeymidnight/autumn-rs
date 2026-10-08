@@ -596,7 +596,7 @@ Get(key, part_id):
 `SstReader` does NOT keep SST bytes resident: production readers (flush / compact
 / recovery) are PAGED — only MetaBlock state stays in memory; data blocks are
 fetched on demand from row_stream through a bounded `BlockCache`
-(`--sst-block-cache-bytes`, default 512 MB, sampled-LRU; keys =
+(`--sst-block-cache-bytes`, default 512 MB, CLOCK eviction; keys =
 `(extent_id, abs_off)`; NO compaction invalidation needed — extent ids are never
 reused, stale entries age out). The cache is owned by the `PartitionServer` and
 shared by every partition it opens — NOT a process-global: `(extent_id, abs_off)`
@@ -2183,7 +2183,35 @@ payload and trailing bytes.
 Double hashing with xxh3: `h1 = xxh3_64(user_key)`, `h2 =
 xxh3_64_with_seed(user_key, SEED)`, `hash_i = (h1 + i * h2) mod num_bits`. Operates
 on **user keys only** (8-byte MVCC suffix stripped before hashing). 1% target FPR,
-initial capacity 512 keys. Encoding: `[num_bits:4B LE][num_hashes:4B LE][bits...]`.
+sized for `SstBuilder::new`'s required `expected_keys`: a flush passes the
+memtable's entry count, a compaction `compaction_chunk_keys` (the inputs'
+entries at their average size per output chunk, capped by their total). No key
+or hash buffer — at a 512 MiB chunk of small entries that would be ~16M keys x
+16 B per running compaction. More keys than expected only raises the FPR.
+The chunk estimate assumes the inputs' entry sizes are roughly uniform: a
+chunk made only of small entries in a mixed-size partition holds more keys
+than estimated (not measured).
+~1.2 B/key stays resident per paged reader (MetaBlock state). Encoding:
+`[num_bits:4B LE][num_hashes:4B LE][bits...]`, so older SSTs (whose filter was
+sized for 512 keys and passes every key) still decode.
+
+A get probes every table newer than the one holding the key, and the filter is
+what skips a table; with no working filter each probe reads a data block, so the
+block cache's working set is readers x tables.
+
+### Block cache eviction
+CLOCK over a slot array: a hit sets the slot's reference bit, a new block
+starts unreferenced, and on overflow the hand clears set bits and evicts the
+first clear slot. Every entry is reachable by the hand. The earlier sampled
+LRU took the first 16 entries of `HashMap` iteration order, which is fixed
+for a given table layout (Rust randomises the hash seed, not the iteration
+start), so entries outside that window were never evicted: once full, only
+~16 slots turned over, and a sequential read whose working set exceeded that
+fell from ~3.4K to ~210 gets/s per reader (32 MiB cache, 4 partitions x 7
+SSTs; 1 GiB cache or exact LRU: flat). Worst case for CLOCK is one full turn
+after every slot was hit (~45 us at 8192 slots, under the cache lock), at
+most once per turn; the slot count is cap / block size, so it scales with
+both.
 
 ### Iterators
 - `BlockIterator`: scan entries within one decoded block; `seek` via binary search

@@ -2460,6 +2460,15 @@ $AO scrub EXT_ID... | --part PART_ID | --all [--wait]
 #   `$AC get KEY` must byte-match and idle PS RSS stays at the replay-window
 #   bound (GBs), not O(dataset). Recovery must log `open_partition: ready`
 #   for every partition with no `stale_vp_offset_past_sealed_length` retries.
+# Eviction is CLOCK; a sequential read must not fall off once the cache fills.
+# Manual check: cluster.sh with AUTUMN_SST_BLOCK_CACHE_BYTES=33554432,
+#   AUTUMN_PS_FLUSH_MEM_BYTES=8388608, AUTUMN_BOOTSTRAP_PRESPLIT=4 (cores
+#   pinned away from other tenants); write 1M 200 B keys under bench/perf in
+#   RANDOM order, then read them in key order with 8 readers and print ops/s
+#   per 5% of each reader's slice. Expect a flat rate (~3.5K/reader from one
+#   Python client); before the fix it fell from ~3.4K to ~210 after ~15%.
+#   Same after `$AO merge 13 <V> --force` down to one partition (32 SSTs).
+#   SSTs written by this build size their bloom filter from their key count.
 # async SST iteration (no whole-SST materialization for range/compact/split)
 # Manual check: on a multi-GB dataset, `$AO compact PART_ID` must log
 #   "compact part N: ... output=..." and `$AC ls --prefix p/` must return

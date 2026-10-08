@@ -591,7 +591,7 @@ mod tests {
     }
 
     fn build_sst(entries: &[(&[u8], u64, &[u8])]) -> Arc<SstReader> {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         for (uk, seq, val) in entries {
             b.add(&ikey(uk, *seq), 1, val, 0);
         }

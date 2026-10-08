@@ -383,6 +383,18 @@ fn checkpoint_vp_head(
     )
 }
 
+/// Keys one compaction output chunk holds, for sizing its bloom filter: the
+/// inputs' entries at their average size, capped by their total. Dropped
+/// entries only make it high.
+pub(crate) fn compaction_chunk_keys(input_entries: u64, input_bytes: u64, max_chunk: u64) -> usize {
+    let keys = if input_bytes <= max_chunk {
+        input_entries
+    } else {
+        (input_entries as u128 * max_chunk as u128 / input_bytes as u128) as u64 + 1
+    };
+    keys.min(input_entries) as usize
+}
+
 /// The cursor a compaction's checkpoint publishes. Call under `publish_lock`.
 /// `durable` is the newest record's cursor and no live table is past it, so
 /// it is republished as is; a cursor rebuilt from the tables can fall behind
@@ -2888,7 +2900,12 @@ pub(crate) async fn do_compact(
     // chunk; when its byte budget is exceeded we finalize, append to
     // row_stream, push (TableMeta, Arc<SstReader>) into new_readers, and
     // start a fresh builder.
-    let mut current_builder = SstBuilder::new(compact_vp_eid, compact_vp_off);
+    let chunk_keys = compaction_chunk_keys(
+        readers.iter().map(|r| r.num_entries).sum(),
+        readers.iter().map(|r| r.estimated_size()).sum(),
+        max_chunk as u64,
+    );
+    let mut current_builder = SstBuilder::new(compact_vp_eid, compact_vp_off, chunk_keys);
     let mut current_size: usize = 0;
     let mut chunk_last_seq: u64 = 0;
     let mut prev_user_key: Option<Vec<u8>> = None;
@@ -2983,7 +3000,7 @@ pub(crate) async fn do_compact(
             // `last_chunk_idx` was the only chunk to call set_discards).
             let builder = std::mem::replace(
                 &mut current_builder,
-                SstBuilder::new(compact_vp_eid, compact_vp_off),
+                SstBuilder::new(compact_vp_eid, compact_vp_off, chunk_keys),
             );
             output_bytes += emit_compact_chunk(
                 builder,
@@ -3039,7 +3056,7 @@ pub(crate) async fn do_compact(
         let input_seq = tbls.iter().map(|t| t.last_seq).max().unwrap_or(0);
         let mut builder = std::mem::replace(
             &mut current_builder,
-            SstBuilder::new(compact_vp_eid, compact_vp_off),
+            SstBuilder::new(compact_vp_eid, compact_vp_off, chunk_keys),
         );
         builder.set_discards(discards.clone());
         builder.cover_seq(input_seq);
@@ -5177,7 +5194,7 @@ mod lookup_block_boundary_tests {
         // several keys necessarily become block base_keys.
         let val = vec![b'x'; 2048];
         let n: u32 = 300;
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 1024);
         for i in 0..n {
             let uk = format!("k{i:06}").into_bytes();
             // distinct seq per key so the stored ts is checkable
@@ -5397,6 +5414,16 @@ mod compaction_vp_head_tests {
     //! acked-but-un-flushed tail (which the pre-fix live-cursor stamp overran →
     //! `system_compact_unflushed_vp_head`).
     use super::compaction_output_vp_head;
+
+    #[test]
+    fn a_compaction_chunk_filter_is_sized_for_one_chunk() {
+        use super::compaction_chunk_keys;
+        // Fits in one chunk: every input entry.
+        assert_eq!(compaction_chunk_keys(1000, 10_000, 1 << 20), 1000);
+        // 16M entries over 4 chunks: a quarter each, not all 16M.
+        assert_eq!(compaction_chunk_keys(16_000_000, 4 << 29, 1 << 29), 4_000_001);
+        assert_eq!(compaction_chunk_keys(0, 0, 1 << 29), 0);
+    }
 
     #[test]
     fn takes_max_first_occurrence_position() {

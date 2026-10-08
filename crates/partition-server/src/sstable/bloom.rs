@@ -130,6 +130,20 @@ mod tests {
         }
     }
 
+    /// Sized for the keys it holds, a filter of 100k keys rejects ~1% of
+    /// absent ones. One sized for 512 keys accepted every key.
+    #[test]
+    fn a_filter_sized_for_its_keys_rejects_absent_ones() {
+        let n = 100_000u64;
+        let mut b = BloomFilterBuilder::new(n as usize, 0.01);
+        for i in 0..n {
+            b.add_user_key(&i.to_le_bytes());
+        }
+        let f = b.finish();
+        let fp = (n..2 * n).filter(|i| f.may_contain(&i.to_le_bytes())).count();
+        assert!(fp < (n / 50) as usize, "false positives {fp} of {n}");
+    }
+
     #[test]
     fn round_trip_encode_decode() {
         let mut b = BloomFilterBuilder::new(100, 0.01);

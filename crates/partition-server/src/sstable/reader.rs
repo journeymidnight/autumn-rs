@@ -618,12 +618,33 @@ mod window_tests {
     /// Multi-block SST: >1000 entries forces several blocks (per-block
     /// entry cap), exercising real block boundaries.
     fn multi_block_reader() -> SstReader {
-        let mut b = SstBuilder::new(0, 0);
+        let mut b = SstBuilder::new(0, 0, 3500);
         for i in 0..3500u32 {
             let user = format!("key{i:06}");
             b.add(&ikey(user.as_bytes(), i as u64 + 1), 1, b"v", 0);
         }
         SstReader::from_bytes(Bytes::from(b.finish())).expect("reader")
+    }
+
+    /// The filter is sized for the table's distinct keys. Sized for a fixed
+    /// 512 it was saturated and passed every key, so a get read a block of
+    /// every newer table. Two versions per key must not inflate the count.
+    #[test]
+    fn an_sst_filter_rejects_keys_it_does_not_hold() {
+        let mut b = SstBuilder::new(0, 0, 40_000);
+        for i in 0..20_000u32 {
+            let user = format!("key{i:06}");
+            b.add(&ikey(user.as_bytes(), 2 * i as u64 + 2), 1, b"v", 0);
+            b.add(&ikey(user.as_bytes(), 2 * i as u64 + 1), 1, b"v", 0);
+        }
+        let r = SstReader::from_bytes(Bytes::from(b.finish())).expect("reader");
+        for i in 0..20_000u32 {
+            assert!(r.bloom_may_contain(format!("key{i:06}").as_bytes()));
+        }
+        let fp = (0..20_000u32)
+            .filter(|i| r.bloom_may_contain(format!("absent{i:06}").as_bytes()))
+            .count();
+        assert!(fp < 400, "{fp} of 20000 absent keys passed the filter");
     }
 
     #[test]
@@ -706,7 +727,7 @@ mod discards_only_tests {
 
     #[test]
     fn an_sst_without_entries_carries_its_discards_and_holds_no_key() {
-        let mut b = SstBuilder::new(7, 4096);
+        let mut b = SstBuilder::new(7, 4096, 1024);
         b.set_discards(HashMap::from([(7u64, 16 << 30)]));
         let r = Arc::new(SstReader::from_bytes(Bytes::from(b.finish())).expect("reader"));
 
