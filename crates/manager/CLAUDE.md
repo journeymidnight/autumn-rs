@@ -383,7 +383,7 @@ retried the refused commit with writes frozen for its whole ~20 s budget
 only to roll back. So before anything freezes, `topology_ready` waits until no
 marker covers the partitions, with writes flowing; a submitted op shows
 `waiting, writes not frozen: <reason>` and fails after `BLOCKER_WAIT_MAX`
-(10 min). The policy controller actuates inline and a direct
+(10 min); a policy split or merge is such an op too. A direct
 `MSG_MERGE_PARTITIONS` has no op, so op id 0 refuses instead of waiting
 (`<reason>; split deferred`).
 
@@ -1482,10 +1482,17 @@ actuation on a follower). **DEFAULT-OFF** (a fresh cluster is pure-mechanism); `
 actuates, `DryRun` logs "would: …" but never mutates. The **mode is the whole gate**
 — arming is per-policy, with no separate process-wide flag.
 
-Actuation is in-process to the same ops the mechanism layer exposes: split →
-`auto_dispatch_split` (snapping to a sacred boundary); merge → the freeze-drain
-`handle_merge_partitions` (NOT the raw flush path — avoids the loss window); gc /
-compact / forcegc → PS `MSG_MAINTENANCE`; ec → `handle_force_ec_convert`.
+**An armed policy's action is an op-ledger op**, the one the operator's
+`autumn-op` command would submit (`candidate_to_submit`, `requested_by =
+"auto-policy"`), entered by `submit_internal_op` and run by the same
+`run_submitted_op`. So it is listed by `ops list` while it runs and kept in
+`ops history` when it ends, refusals included; one in flight on the same target
+is attached to. The cooldown starts at submission, whatever the outcome. The
+only difference is `OpOrigin::Policy`: its repair waits out `repair_grace_secs`
+and never takes a slot under maintenance (`RepairRequester::Policy`), exactly
+what its advisory counted. A policy split or merge waits at the topology gate
+like a submitted one. The controller's own log holds only DryRun's "would: …"
+lines — nothing in it was run.
 
 Config is **etcd, leader-owned, crash-safe** (`autoPolicy/config` = mode + active +
 custom policies, `autoPolicy/cooldowns`), written etcd-first + leader-fenced by
@@ -1534,15 +1541,24 @@ collect the bytes the advisory had just fired on.
 
 Every long-running op (split/merge/rebalance/compact/gc/forcegc/ec-convert) is
 **submitted through the leader** (`MSG_OP_SUBMIT`), assigned an `op_id`, actuated
-in a background one-shot task that reuses `actuate_candidate`'s building blocks
+in a background one-shot task (`run_submitted_op`, which an armed auto-policy
+shares, see "Auto-policy controller") over the building blocks
 (`auto_dispatch_split` — now takes an explicit `at_key` override — /
 `merge_partitions` (with the op id, so it can wait; see "Topology gate") /
 `handle_rebalance_regions` / `handle_force_ec_convert`
 / `send_maintenance`), and made queryable (`MSG_OP_QUERY`). This recovers the
 failure reason the fire-and-forget maintenance ops used to drop.
 
-- **`OpLedger`** = leader-local, in-memory `VecDeque<OpRecord>` cap 256 (the
-  `ACTION_LOG_CAP` pattern). **State machine, not bools**: `Pending → Running →
+- **`OpLedger`** = leader-local, in-memory `VecDeque<OpRecord>` cap 256. Over
+  the cap it drops the entry that ENDED longest ago (`trim`, by `finished_at`,
+  not ring position — a long op is the oldest by position the moment it ends,
+  while `ops status --wait` and the split commit fence still read it). Every
+  end queues its history record first (the TTL sweep's UNKNOWN included), and
+  an active entry dropped would end with no record; only a ring of active
+  entries loses its oldest. Limit: with ~256 entries active (recovery entries
+  stuck with no rebuild target), a just-ended op is dropped at the next push,
+  before `--wait` or the split fence reads it. The ring also no longer ages
+  out an active entry nothing closes. The armed policy's ops share the ring. **State machine, not bools**: `Pending → Running →
   Succeeded|Failed`, plus a synthesized `Unknown` — the honest answer for an
   unknown/old id after a leader change (never a false `Running`). `op_id =
   (epoch_ms<<16)|seq16` (non-zero — `0` is the query "list" sentinel).
@@ -1601,13 +1617,15 @@ failure reason the fire-and-forget maintenance ops used to drop.
   before the reopen with only its report lost; after the reopen the EN tail
   fence rejects the old open's appends, so it cannot commit later. A real
   outcome that still arrives overwrites `Unknown` (`accepts_terminal_report`)
-  and is written to `opLog/` as a second row (only the same-PS race where the
-  reopen lands between the dispatch snapshot and the send can produce one).
+  and is written to `opLog/` as a second row (the same-PS race where the
+  reopen lands between the dispatch snapshot and the send, or a TTL-ended op
+  that does finish).
   Without this a restarted PS left the op Running for 30 min and every
   resubmit attached to the dead op.
 - **TTL backstop**: a Running compact/gc/forcegc older than 30 min flips to
-  `Unknown` (`sweep_running_ttl`, on the leader policy tick) — covers a PS that
-  stops reporting without the partition being reopened. **Attach-dedup**: a resubmit of the same
+  `Unknown` (`sweep_running_ttl`, on the leader policy tick; the end goes to
+  `opLog/`) — covers a PS that stops reporting without the partition being
+  reopened. **Attach-dedup**: a resubmit of the same
   `(kind, part_id, secondary_id)` while active returns the existing op_id.
 - **Auto-dispatched kinds** (`OP_KIND_RECOVERY`): extent recovery is entered by
   the recovery loop, not by a submit — `MSG_OP_SUBMIT` REFUSES it. Hooks:
@@ -1651,7 +1669,7 @@ failure reason the fire-and-forget maintenance ops used to drop.
   every terminal exit, so a finished op never shows as forever mid-flight.
 - **Two ways in, because not every executor knows the op id.** `update_progress`
   is keyed by op id: gc/compact/forcegc, and a submitted split
-  (`SplitPartReq.op_id`, wire 56). An untracked split (policy, presplit)
+  (`SplitPartReq.op_id`, wire 56). An untracked split (presplit, test helpers)
   publishes `op_id: 0` (`PartitionMetrics::set_maintenance_phase`, a separate
   setter and slot: the op-id one treats 0 as "PS-local, nothing to update",
   and a compaction's sample must not overwrite a split queued behind it) and

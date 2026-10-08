@@ -76,6 +76,32 @@ impl OpLedger {
         self.entries.iter_mut().find(|e| e.op_id == op_id)
     }
 
+    /// Hold the ring at `OP_LEDGER_CAP`, dropping the entry that ENDED longest
+    /// ago first: its history record is already queued, while an active one
+    /// dropped would end with no record at all. By end time, not ring position:
+    /// a long op is the oldest by position the moment it ends, and `ops status
+    /// --wait` and the split commit fence still read it. Only a ring of active
+    /// entries loses its oldest.
+    fn trim(&mut self) {
+        while self.entries.len() > OP_LEDGER_CAP {
+            let ended_first = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !Self::is_active(e.state))
+                .min_by_key(|(i, e)| (e.finished_at, std::cmp::Reverse(*i)))
+                .map(|(i, _)| i);
+            match ended_first {
+                Some(i) => {
+                    self.entries.remove(i);
+                }
+                None => {
+                    self.entries.pop_back();
+                }
+            }
+        }
+    }
+
     fn is_active(state: u8) -> bool {
         state == OP_STATE_PENDING || state == OP_STATE_RUNNING
     }
@@ -134,9 +160,7 @@ impl OpLedger {
             started_at: 0,
             finished_at: 0,
         });
-        while self.entries.len() > OP_LEDGER_CAP {
-            self.entries.pop_back();
-        }
+        self.trim();
         (op_id, false)
     }
 
@@ -398,9 +422,7 @@ impl OpLedger {
             started_at: now_s,
             ..Default::default()
         });
-        while self.entries.len() > OP_LEDGER_CAP {
-            self.entries.pop_back();
-        }
+        self.trim();
     }
 
     /// An EC conversion dispatch reached the coordinator: refresh the extent's
@@ -446,9 +468,7 @@ impl OpLedger {
             started_at: now_s,
             ..Default::default()
         });
-        while self.entries.len() > OP_LEDGER_CAP {
-            self.entries.pop_back();
-        }
+        self.trim();
     }
 
     /// The coordinator reported that its LAST conversion attempt failed.
@@ -504,9 +524,7 @@ impl OpLedger {
             started_at: now_s,
             ..Default::default()
         });
-        while self.entries.len() > OP_LEDGER_CAP {
-            self.entries.pop_back();
-        }
+        self.trim();
     }
 
     /// On leader promotion, seed a synthetic RUNNING entry per in-flight
@@ -556,9 +574,7 @@ impl OpLedger {
                 ..Default::default()
             });
         }
-        while self.entries.len() > OP_LEDGER_CAP {
-            self.entries.pop_back();
-        }
+        self.trim();
     }
 
     /// A failure the EXECUTING NODE reported on its `df` heartbeat.
@@ -656,6 +672,7 @@ impl OpLedger {
     /// TTL backstop: a RUNNING PS-executed op (compact/gc/forcegc) whose terminal
     /// outcome never came back becomes UNKNOWN, keeping `ops status` honest.
     pub(crate) fn sweep_running_ttl(&mut self, now_s: i64) {
+        let mut ended = Vec::new();
         for e in self.entries.iter_mut() {
             if e.state == OP_STATE_RUNNING
                 && matches!(e.kind, OP_KIND_COMPACT | OP_KIND_GC | OP_KIND_FORCE_GC)
@@ -664,7 +681,11 @@ impl OpLedger {
                 e.state = OP_STATE_UNKNOWN;
                 e.message = "outcome lost — PS restarted or load report missed".to_string();
                 e.finished_at = now_s;
+                ended.push(e.op_id);
             }
+        }
+        for op_id in ended {
+            self.queue_terminal(op_id);
         }
     }
 
@@ -755,7 +776,7 @@ impl OpLedger {
 mod tests {
     use super::*;
     use autumn_rpc::manager_rpc::{
-        OP_KIND_EC_CONVERT, OP_KIND_GC, OP_KIND_SPLIT, OP_STATE_FAILED, OP_STATE_SUCCEEDED,
+        OP_KIND_EC_CONVERT, OP_KIND_GC, OP_KIND_SCRUB, OP_KIND_SPLIT, OP_STATE_FAILED, OP_STATE_SUCCEEDED,
     };
 
     fn q_one(led: &OpLedger, op_id: u64) -> OpRecord {
@@ -855,6 +876,32 @@ mod tests {
         assert_eq!(led.query(&OpQueryReq::default()).len(), OP_LEDGER_CAP);
     }
 
+    /// A long op (a scrub, a split waiting at the gate) outlives a ring's worth
+    /// of short ones: they go, it stays, and its end still reaches history.
+    #[test]
+    fn cap_keeps_an_active_op_over_ended_ones() {
+        let mut led = OpLedger::new();
+        let (long, _) = led.submit(OP_KIND_SCRUB, 0, 0, vec![], "auto-policy".into(), 0, 0);
+        led.set_running(long, 0);
+        for i in 1..=(OP_LEDGER_CAP as u64 + 10) {
+            let (id, _) = led.submit(OP_KIND_GC, i, 0, vec![], "auto-policy".into(), i as i64, i as i64 * 10);
+            led.finish(id, OP_STATE_SUCCEEDED, String::new(), String::new(), i as i64);
+        }
+        assert_eq!(led.query(&OpQueryReq::default()).len(), OP_LEDGER_CAP);
+        assert_eq!(q_one(&led, long).state, OP_STATE_RUNNING);
+        led.drain_pending_log();
+        let end = OP_LEDGER_CAP as i64 + 10;
+        assert!(led.finish(long, OP_STATE_SUCCEEDED, String::new(), String::new(), end));
+        assert_eq!(led.drain_pending_log().len(), 1, "its end goes to history");
+        // Ended last, it is dropped last: half a ring of later ops later, it
+        // is still there for `ops status`.
+        for i in 1..=(OP_LEDGER_CAP as u64 / 2) {
+            let (id, _) = led.submit(OP_KIND_GC, 1000 + i, 0, vec![], "cli".into(), end, end * 10 + i as i64);
+            led.finish(id, OP_STATE_SUCCEEDED, String::new(), String::new(), end + i as i64);
+        }
+        assert_eq!(q_one(&led, long).state, OP_STATE_SUCCEEDED);
+    }
+
     #[test]
     fn ttl_flips_stale_running_maintenance_to_unknown() {
         let mut led = OpLedger::new();
@@ -864,6 +911,9 @@ mod tests {
         assert_eq!(q_one(&led, id).state, OP_STATE_RUNNING);
         led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 1); // past TTL
         assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN);
+        let queued = led.drain_pending_log();
+        assert_eq!(queued.len(), 1, "the UNKNOWN end goes to history");
+        assert_eq!(queued[0].op_id, id);
     }
 
     #[test]
@@ -1054,6 +1104,8 @@ mod tests {
         let r = q_one(&led, id);
         assert_eq!(r.state, OP_STATE_FAILED);
         assert_eq!(r.error, "disk full", "the failure reason must survive");
+        let rows: Vec<u8> = led.drain_pending_log().iter().map(|r| r.state).collect();
+        assert_eq!(rows, [OP_STATE_UNKNOWN, OP_STATE_FAILED], "history keeps both ends");
 
         assert!(
             !led.reconcile_outcome(

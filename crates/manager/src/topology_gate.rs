@@ -150,9 +150,9 @@ impl AutumnManager {
     }
 
     /// Take the hold on `parts`, then wait until no extent op blocks `what`
-    /// ("split" / "merge"). `op_id` 0 (the policy controller, which actuates
-    /// inline, or a direct RPC) refuses instead of waiting. Returns whether it
-    /// waited, i.e. whether the caller's metadata snapshot is stale.
+    /// ("split" / "merge"). `op_id` 0 (a direct RPC, a test helper) refuses
+    /// instead of waiting. Returns whether it waited, i.e. whether the caller's
+    /// metadata snapshot is stale.
     pub(crate) async fn topology_ready(
         &self,
         parts: &[u64],

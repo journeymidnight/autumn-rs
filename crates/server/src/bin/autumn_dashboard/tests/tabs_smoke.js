@@ -106,7 +106,7 @@ const PART = {
 const OPS = {
   live: [{ op_id: 1, kind: "gc", state: "running", part_id: 1, secondary_id: 0,
            progress_done: 5, progress_total: 8, started_at: Math.floor(Date.now() / 1000) - 3,
-           submitted_at: 0, finished_at: 0, message: "" }],
+           submitted_at: 0, finished_at: 0, message: "", requested_by: "auto-policy" }],
   history: [{ op_id: 2, kind: "compact", state: "failed", part_id: 1, secondary_id: 0,
               progress_done: 0, progress_total: 0, started_at: 0, submitted_at: 0,
               finished_at: Math.floor(Date.now() / 1000) - 9, message: "", error: "no address for part 1" }],
@@ -118,7 +118,7 @@ const POLICIES = {
                interval: 30, cooldown: 120, max_actions: 2,
                switches: { split: false, ec: false, compact: false, gc: true, merge: false, rebalance: false } }],
   switch_order: ["split", "ec", "compact", "gc", "merge", "rebalance", "repair", "scrub"],
-  log: [{ ts: Math.floor(Date.now() / 1000), level: "refused", msg: "autumn-op split 168: overlapping keys" }],
+  log: [{ ts: Math.floor(Date.now() / 1000), level: "would", msg: "would: autumn-op gc 168 (gc part 168 debt)" }],
 };
 const payload = { "/api/overview": OVERVIEW, "/api/ops": OPS, "/api/policies": POLICIES };
 const fetchStub = async p => ({ ok: true, json: async () => payload[p] ?? PART });
@@ -181,8 +181,9 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   want("#advisories", "major compaction before split", "the advisory keeps its whole reason");
   want("#advisories", "PS 3 partition size imbalance", "hot/cold is rendered in operator language");
   want("#advisories", "Information only", "hot/cold says it cannot execute an operation");
-  want("#autolog", "overlapping keys", "the auto-policy log is on the Logs tab");
+  want("#polpreview", "would: autumn-op gc 168", "an observing policy's proposals are on the Policy tab");
   want("#ops_live", "gc", "running ops are on the Logs tab");
+  want("#ops_live", "auto-policy", "…naming who asked, so the policy's own ops are told apart");
   want("#ops_hist", "no address for part 1", "…and a failed op keeps its reason");
   console.log(bad ? `tabs smoke FAILED (${bad})` : "tabs smoke OK — six tabs + both drawers render");
   process.exit(bad ? 1 : 0);

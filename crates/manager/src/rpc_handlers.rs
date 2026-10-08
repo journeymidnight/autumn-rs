@@ -4743,7 +4743,10 @@ impl AutumnManager {
         }
         // Actuate in the background; the caller polls `ops status`.
         let mgr = self.clone();
-        compio::runtime::spawn(async move { mgr.run_submitted_op(op_id, req).await }).detach();
+        compio::runtime::spawn(async move {
+            mgr.run_submitted_op(op_id, req, crate::OpOrigin::Operator).await
+        })
+        .detach();
         Ok(rkyv_encode(&OpSubmitResp {
             code: CODE_OK,
             message: String::new(),
@@ -4833,7 +4836,7 @@ impl AutumnManager {
     // ── auto-policy controller RPCs (headless control) ────
 
     pub(crate) async fn handle_autopolicy_get(&self, _payload: Bytes) -> HandlerResult {
-        // Leader-only: the live state + action log are leader-local, and the
+        // Leader-only: the live state + preview log are leader-local, and the
         // controller loop only runs on the leader (a follower's replayed config
         // is stale). Sister to the MSG_GET_POLICY_CANDIDATES gate.
         if !self.leader.get() {

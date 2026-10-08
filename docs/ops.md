@@ -393,7 +393,9 @@ it. **cluster.sh / chaos / perf leave it OFF** (they never set the env), so
 dev/test behaviour is unchanged. Headless control:
 
 ```bash
-autumn-op auto-policy status                 # mode + active + presets + action log
+autumn-op auto-policy status                 # mode + active + presets + what an observing policy would run
+autumn-op ops list --active                  # an armed policy's actions: requested_by=auto-policy
+autumn-op ops history                        # ... and how they ended, refusals included
 autumn-op auto-policy activate gc-only       # select + DryRun (observe, no actuation)
 autumn-op auto-policy activate aggressive --arm   # select + Armed (actuate)
 autumn-op auto-policy deactivate             # mode → Off
@@ -401,6 +403,24 @@ autumn-op auto-policy deactivate             # mode → Off
 
 Presets (safest → most aggressive): `gc-only`, `maintenance`, `space-reclaim`,
 `balanced`, `aggressive`.
+
+**Verify that an armed policy's actions are ops.** On a cluster with GC debt
+over `gc_debt_high` on some partition:
+
+```bash
+autumn-op auto-policy activate gc-only            # Observe: nothing runs
+autumn-op auto-policy status                      # "would: autumn-op gc <PID> (...)"
+autumn-op --json ops list --active | grep auto-policy   # → nothing
+autumn-op auto-policy activate gc-only --arm
+autumn-op --json ops list | grep -A3 '"requested_by": "auto-policy"'   # a gc on <PID>
+autumn-op ops history --kind gc                   # its outcome once it ends
+```
+
+The dashboard's Logs tab shows the same rows marked `auto-policy`; there is no
+separate action log. Automated: `cargo test -p autumn-manager --lib
+candidate_to_submit a_policy_repair_op`, `cargo test -p autumn-manager --test
+extent_repair` (the armed repair policy leaves a SUCCEEDED `auto-policy` repair
+op in the ledger).
 
 ## Web dashboard (server component)
 
@@ -434,8 +454,8 @@ a view is linkable.
 | Partitions | PS-scoped partition list + the lazy per-partition drawer (load metrics + extents) |
 | Servers | every partition server member (an evicted one stays listed until `ps-remove`), with heartbeat, load and its partitions |
 | Nodes | every extent node, with a **per-disk** table — capacity, online, faulted |
-| Policy | advisories with their full reasoning, the controller, the policy editor |
-| Logs | running ops, durable outcomes, the auto-policy action log |
+| Policy | advisories with their full reasoning, the controller, the policy editor, what an observing policy would run |
+| Logs | every op — the operator's and the auto-policy's alike — running, then durable outcomes, each marked with who asked |
 
 Manual actions map to the allow-listed `autumn-op` subcommands (`split` / `gc` /
 `compact` / `merge` / `force-ec-convert` / `rebalance`).
@@ -471,8 +491,8 @@ After a split, both children share the parent's SSTs — which carry keys outsid
 each child's range — and `handle_split_part` refuses (`cannot split: partition
 has overlapping keys`) until a MAJOR compaction rewrites them. The partition
 drawer shows that precondition before the Split button is clicked, and the
-auto-policy emits the compaction *in place of* the split, so the action log
-stops filling with one refusal per window:
+auto-policy emits the compaction *in place of* the split, so the op history
+stops filling with one refused split per window:
 
 ```bash
 autumn-op --manager $MGR --json info --part <PID> --detail | grep has_overlap
@@ -5238,9 +5258,13 @@ Automatically: the `repair` auto-policy switch (on in `maintenance`,
 `balanced` and `aggressive`) proposes one advisory per node whose slots have
 been degraded at least `--repair-grace-secs` (manager flag, default 600) —
 visible in `autumn-op policy-candidates` and the dashboard's Policy tab as
-`repair node N` — and, when the policy is Armed, records the requests itself
-(DryRun only logs "would: autumn-op repair --node N"). The dashboard's Fleet
-panel also offers a Repair button for the worst readable degraded extent.
+`repair node N` — and, when the policy is Armed, submits `repair --node N` as
+an op (`requested_by=auto-policy`, in `ops list` / `ops history`) that
+requests only the slots past the grace (DryRun only lists "would: autumn-op
+repair --node N"). The dashboard's Fleet panel also offers a Repair button for
+the worst readable degraded extent that still has a slot nobody asked to
+rebuild; once every listed slot is marked `(repair requested)` there is no
+button, only `Cancel repair`.
 
 Verify:
 

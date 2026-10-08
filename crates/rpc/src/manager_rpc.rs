@@ -2767,11 +2767,12 @@ pub struct MgrAutoPolicyCooldowns {
     pub entries: Vec<(String, i64)>,
 }
 
-/// One rolling action-log entry (leader-local; served by AutoPolicyGet).
+/// One entry of what an observing (DryRun) policy would run (leader-local;
+/// served by AutoPolicyGet). An armed policy's actions are op-ledger ops.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct AutoPolicyLogEntry {
     pub ts: i64,
-    /// "issued" | "would" | "refused" | "error".
+    /// "would" (older leaders also wrote "issued" / "refused" / "error").
     pub level: String,
     pub msg: String,
 }

@@ -63,6 +63,15 @@ enum ActuationResult {
     Dispatched { message: String },
 }
 
+/// Who submitted an op. The controller asks for less than an operator: its
+/// repair waits out `repair_grace_secs` and never moves a copy off a node in
+/// maintenance.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpOrigin {
+    Operator,
+    Policy,
+}
+
 /// `OP_KIND_*` → the `AUDIT_OP_*` code for its durable terminal record.
 fn op_kind_audit_code(kind: u8) -> u8 {
     match kind {
@@ -972,7 +981,7 @@ pub struct AutumnManager {
     /// act on what they see.
     pub(crate) policy: Rc<RefCell<crate::policy::PolicyEngine>>,
     /// M2: in-manager auto-policy controller state — mode +
-    /// active policy + custom policies + cooldowns + rolling action log.
+    /// active policy + custom policies + cooldowns + rolling DryRun preview log.
     /// Config (mode/active/custom) is etcd-persisted (`autoPolicy/config`,
     /// leader-fenced) + cooldowns (`autoPolicy/cooldowns`), replayed on leader
     /// promotion so the active policy survives failover. The controller loop
@@ -1962,8 +1971,7 @@ impl AutumnManager {
     /// Send a fully-populated MAINTENANCE request to its partition's owning PS
     /// (in-process, same ConnPool as auto_dispatch_*) and return the decoded
     /// response WITHOUT interpreting its code. The op-ledger path needs the raw
-    /// `MaintenanceResp` (op_id correlation + the forcegc advisory in `message`);
-    /// `actuate_maintenance` wraps this for the controller's fire-and-forget use.
+    /// `MaintenanceResp` (op_id correlation + the forcegc advisory in `message`).
     async fn send_maintenance(
         &self,
         req: autumn_rpc::partition_rpc::MaintenanceReq,
@@ -1998,161 +2006,6 @@ impl AutumnManager {
         autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))
     }
 
-    /// Send a MAINTENANCE op (gc / compact / forcegc) to a partition's owning PS.
-    /// `extent_ids` is used only by `MAINTENANCE_FORCE_GC`; gc/compact pass empty.
-    /// Untracked (`op_id = 0`) — the controller's fire-and-forget path.
-    async fn actuate_maintenance(
-        &self,
-        part_id: u64,
-        op: u8,
-        extent_ids: Vec<u64>,
-        state: &crate::store::MetadataState,
-    ) -> Result<()> {
-        // Bind BEFORE the call: as an argument the `Ref` would live until the
-        // end of the enclosing statement, which includes the `.await` below,
-        // and a `borrow_mut` landing in that window panics the manager.
-        let gc_debt_high = self.policy.borrow().config.gc_debt_high;
-        let resp = self
-            .send_maintenance(
-                // The controller actuating its OWN config is the standing
-                // policy by definition, and a default spec names no knobs — so
-                // the helper fills both numbers from `gc_debt_high` and marks
-                // it standing. Routed through the same helper as the submitted
-                // path deliberately: two hand-maintained copies of this
-                // decision would drift, and the PS cannot tell which one it is
-                // looking at.
-                maintenance_req_for_submitted_op(
-                    &autumn_rpc::manager_rpc::OpSubmitReq {
-                        part_id,
-                        ..Default::default()
-                    },
-                    op,
-                    extent_ids,
-                    0,
-                    gc_debt_high,
-                ),
-                state,
-            )
-            .await?;
-        if resp.code != autumn_rpc::partition_rpc::CODE_OK {
-            anyhow::bail!("maintenance code {}: {}", resp.code, resp.message);
-        }
-        Ok(())
-    }
-
-    /// Actuate ONE advisory candidate IN-PROCESS (no autumn-op subprocess).
-    /// split → auto_dispatch_split; merge → the freeze-drain handler (NOT
-    /// the raw flush path — avoids the ~5% loss window); gc/compact → PS
-    /// MSG_MAINTENANCE; ec → handle_force_ec_convert. Every underlying op is
-    /// already crash-safe + idempotent-on-retry (leader fence / inflight ledger /
-    /// freeze-drain), so a refusal is logged + retried next tick.
-    async fn actuate_candidate(
-        &self,
-        cand: &PolicyCandidate,
-        state: &crate::store::MetadataState,
-    ) -> Result<()> {
-        match cand.kind {
-            POLICY_KIND_SPLIT => {
-                let (hold, _) = self.topology_ready(&[cand.primary_part_id], 0, "split").await?;
-                self.auto_dispatch_split(&hold, cand, None, 0, state).await
-            }
-            POLICY_KIND_MERGE => {
-                let req = MergePartitionsReq {
-                    survivor_part_id: cand.primary_part_id,
-                    victim_part_id: cand.secondary_part_id,
-                    // NEVER force from the automatic path: the controller is
-                    // precisely the actor that must not silently erase an
-                    // operator-declared presplit boundary (the declared-geometry
-                    // merge guard). `merge_candidates` already skips these, so this
-                    // is the belt to that suspenders.
-                    force: false,
-                };
-                let resp_bytes = self
-                    .handle_merge_partitions(rkyv_encode(&req))
-                    .await
-                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
-                let resp: MergePartitionsResp =
-                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-                if resp.code != CODE_OK {
-                    anyhow::bail!("merge code {}: {}", resp.code, resp.message);
-                }
-                Ok(())
-            }
-            POLICY_KIND_GC => {
-                self.actuate_maintenance(
-                    cand.primary_part_id,
-                    autumn_rpc::partition_rpc::MAINTENANCE_AUTO_GC,
-                    vec![],
-                    state,
-                )
-                .await
-            }
-            POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
-                self.actuate_maintenance(
-                    cand.primary_part_id,
-                    autumn_rpc::partition_rpc::MAINTENANCE_COMPACT,
-                    vec![],
-                    state,
-                )
-                .await
-            }
-            POLICY_KIND_EC => {
-                let req = ForceEcConvertReq {
-                    extent_id: cand.secondary_part_id,
-                };
-                let resp_bytes = self
-                    .handle_force_ec_convert(rkyv_encode(&req))
-                    .await
-                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
-                let resp: ForceEcConvertResp =
-                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-                if resp.code != CODE_OK {
-                    anyhow::bail!("ec code {}: {}", resp.code, resp.message);
-                }
-                Ok(())
-            }
-            POLICY_KIND_REPAIR => {
-                let outcome = self
-                    .request_repair(
-                        &[],
-                        Some(cand.secondary_part_id),
-                        self.repair_grace_secs.get(),
-                        crate::extent_repair::RepairRequester::Policy,
-                    )
-                    .await
-                    .map_err(|e| anyhow::anyhow!("{e}"))?;
-                if outcome.requested_slots == 0 {
-                    anyhow::bail!("nothing to repair on node {} now", cand.secondary_part_id);
-                }
-                Ok(())
-            }
-            POLICY_KIND_SCRUB => {
-                let op_id = self.submit_scrub_all("auto-policy");
-                tracing::info!(op_id, "auto-policy: weekly scrub submitted");
-                Ok(())
-            }
-            POLICY_KIND_REBALANCE => {
-                // Phase B: move a BOUNDED batch per tick so a
-                // concentrated cluster converges gradually (the target PSes take
-                // a reopen storm otherwise). The advisory's own cooldown paces
-                // re-emission; this cap paces each actuation.
-                let max_moves = self.policy.borrow().config.rebalance_max_moves_per_tick;
-                let req = RebalanceRegionsReq { max_moves };
-                let resp_bytes = self
-                    .handle_rebalance_regions(rkyv_encode(&req))
-                    .await
-                    .map_err(|(_, m)| anyhow::anyhow!("{m}"))?;
-                let resp: RebalanceRegionsResp =
-                    rkyv_decode(&resp_bytes).map_err(|e| anyhow::anyhow!("{e}"))?;
-                if resp.code != CODE_OK {
-                    anyhow::bail!("rebalance code {}: {}", resp.code, resp.message);
-                }
-                Ok(())
-            }
-            _ => anyhow::bail!("candidate kind {} not actionable", cand.kind),
-        }
-    }
-
     /// Wall-clock as `(epoch_seconds, epoch_millis)`.
     fn now_s_ms() -> (i64, i64) {
         let d = std::time::SystemTime::now()
@@ -2184,12 +2037,12 @@ impl AutumnManager {
     /// controller's dispatch), then record the terminal outcome + a durable audit
     /// entry. A panic in the actuation records FAILED (compio catches the panic
     /// itself, but without this the entry would sit RUNNING until the TTL sweep).
-    async fn run_submitted_op(&self, op_id: u64, spec: OpSubmitReq) {
+    async fn run_submitted_op(&self, op_id: u64, spec: OpSubmitReq, origin: OpOrigin) {
         let (now_s, _) = Self::now_s_ms();
         self.ops.borrow_mut().set_running(op_id, now_s);
         let state = (*self.store.inner.borrow()).clone();
         let outcome = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
-            self.actuate_submitted_op(op_id, &spec, &state),
+            self.actuate_submitted_op(op_id, &spec, &state, origin),
         ))
         .await
         {
@@ -2270,6 +2123,29 @@ impl AutumnManager {
         }
     }
 
+    /// Enter an op the manager starts itself into the ledger and run it in the
+    /// background, as `handle_op_submit` does for an operator's. An op already
+    /// in flight on the same target is attached to. `spec` is trusted: built
+    /// in-process, so it skips the submit handler's validation.
+    pub(crate) fn submit_internal_op(&self, spec: OpSubmitReq, origin: OpOrigin) -> u64 {
+        let (now_s, now_ms) = Self::now_s_ms();
+        let (op_id, attached) = self.ops.borrow_mut().submit(
+            spec.kind,
+            spec.part_id,
+            spec.secondary_id,
+            spec.extent_ids.clone(),
+            spec.requested_by.clone(),
+            now_s,
+            now_ms,
+        );
+        if !attached {
+            let mgr = self.clone();
+            compio::runtime::spawn(async move { mgr.run_submitted_op(op_id, spec, origin).await })
+                .detach();
+        }
+        op_id
+    }
+
     /// End the compact/gc/forcegc ops whose partition was opened again after
     /// dispatch — see `OpLedger::sweep_reopened`.
     pub(crate) fn settle_reopened_maintenance(&self, now_s: i64) {
@@ -2292,6 +2168,7 @@ impl AutumnManager {
         op_id: u64,
         spec: &OpSubmitReq,
         state: &crate::store::MetadataState,
+        origin: OpOrigin,
     ) -> ActuationResult {
         let terminal_err = |e: String| ActuationResult::Terminal {
             state: OP_STATE_FAILED,
@@ -2416,8 +2293,14 @@ impl AutumnManager {
                 .request_repair(
                     &spec.extent_ids,
                     (spec.extent_ids.is_empty() && spec.part_id != 0).then_some(spec.part_id),
-                    0,
-                    crate::extent_repair::RepairRequester::Operator,
+                    match origin {
+                        OpOrigin::Operator => 0,
+                        OpOrigin::Policy => self.repair_grace_secs.get(),
+                    },
+                    match origin {
+                        OpOrigin::Operator => crate::extent_repair::RepairRequester::Operator,
+                        OpOrigin::Policy => crate::extent_repair::RepairRequester::Policy,
+                    },
                 )
                 .await
             {
@@ -2600,13 +2483,8 @@ impl AutumnManager {
             if actions.is_empty() {
                 continue;
             }
-            let state_snapshot = self.store.inner.borrow().clone();
-            // Cooldowns move on refusal too, so persist when either happened.
             let mut cooldowns_changed = false;
             for (cand, cmd, key) in actions {
-                if !self.leader.get() {
-                    break; // lost leadership mid-batch — stragglers are leader-fenced anyway
-                }
                 let desc = crate::auto_policy::describe_candidate(&cand);
                 let cmd_str = cmd.join(" ");
                 if !armed {
@@ -2617,37 +2495,19 @@ impl AutumnManager {
                     );
                     continue;
                 }
-                match self.actuate_candidate(&cand, &state_snapshot).await {
-                    Ok(()) => {
-                        {
-                            let mut st = self.auto_policy.borrow_mut();
-                            st.cooldowns.insert(key, now);
-                            st.record(now, "issued", format!("autumn-op {cmd_str} ({desc})"));
-                        }
-                        cooldowns_changed = true;
-                        tracing::info!("auto-policy issued: autumn-op {cmd_str}");
-                    }
-                    Err(e) => {
-                        // A refusal starts the cooldown as well. Only success used
-                        // to, so anything the PS turns down came back on the very
-                        // next tick — a split refused for `overlapping keys` (a
-                        // CoW split whose physical separation has not finished, and
-                        // which only compaction clears) was re-issued and re-refused
-                        // every cycle, filling the operator's action log with a
-                        // decision nothing was going to change.
-                        //
-                        // This is a rate limit, not a ban: when the condition does
-                        // clear, the next window picks the candidate up. Applied to
-                        // every failure kind, because retrying a transient error at
-                        // tick rate is not better than waiting one window either.
-                        {
-                            let mut st = self.auto_policy.borrow_mut();
-                            st.cooldowns.insert(key, now);
-                            st.record(now, "refused", format!("autumn-op {cmd_str}: {e}"));
-                        }
-                        cooldowns_changed = true;
-                    }
-                }
+                // A ledger op like an operator's: it shows in `ops list` while it
+                // runs and in `ops history` when it ends, refusals included.
+                let Some(spec) = crate::auto_policy::candidate_to_submit(&cand) else {
+                    continue;
+                };
+                let op_id = self.submit_internal_op(spec, OpOrigin::Policy);
+                // The cooldown starts on submission, whatever the outcome: a
+                // refused op (a split refused for `overlapping keys` until
+                // compaction clears it) is not retried at tick rate. A rate
+                // limit, not a ban: the next window picks the candidate up.
+                self.auto_policy.borrow_mut().cooldowns.insert(key, now);
+                cooldowns_changed = true;
+                tracing::info!(op_id, "auto-policy submitted: autumn-op {cmd_str} ({desc})");
             }
             // Best-effort persist cooldowns once per tick (not per action).
             if cooldowns_changed {
@@ -2670,7 +2530,7 @@ impl AutumnManager {
         // overrides the declared-boundary snap and is used verbatim; `None` keeps
         // the controller's snap-to-declared-boundary-else-PS-median behavior.
         explicit_at_key: Option<Vec<u8>>,
-        // The ledger op this serves; 0 = untracked (policy, tests).
+        // The ledger op this serves; 0 = untracked (tests).
         op_id: u64,
         state: &crate::store::MetadataState,
     ) -> Result<()> {
@@ -9133,7 +8993,7 @@ mod tests {
                 0,
                 1,
             );
-            m.run_submitted_op(op_id, spec).await;
+            m.run_submitted_op(op_id, spec, OpOrigin::Operator).await;
 
             let rec = m
                 .ops

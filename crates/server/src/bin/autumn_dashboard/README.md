@@ -50,9 +50,11 @@ without the secret — read-only views included.
 | `POST /api/policies/delete` | `autumn-op auto-policy delete <name>` |
 
 Each policy has a **Start** button: confirm the named policy to select it and
-run its enabled actions immediately. **Observe** is an optional preview that
-logs proposed actions without executing them; it is not a prerequisite for
-Start. **Stop** stops the current controller. Only one policy runs at a time;
+run its enabled actions immediately. A running policy's actions are ops like
+an operator's: they are on the Logs tab, running and in the durable history,
+marked `auto-policy`. **Observe** is an optional preview that lists, on the
+Policy tab, what the policy would run, without running it; it is not a
+prerequisite for Start. **Stop** stops the current controller. Only one policy runs at a time;
 starting or observing another replaces the current selection. The page shows
 **Running / Observing / Stopped** and disables the current mode's button.
 
@@ -73,12 +75,12 @@ every one. The tab is in the URL hash (`#nodes`), so a view is linkable.
 
 | Tab | Answers |
 |-----|---------|
-| **Overview** | a status bar counting the fleet against its EXPECTED members (manager leader / standby, PS ready, EN online, extents clean / degraded / unavailable, rebuilds in flight, sample time, and each member that is not up — `null` from the leader reads "unknown"), the keyspace ribbon (−∞ → +∞, one segment per partition, colored by owning PS), a fleet health roll-up with extent alerts (unavailable / degraded / no redundancy left / rebuilding, naming the worst extents, with a Repair button for the worst readable one), space + amplification, the top advisories, and what is running |
+| **Overview** | a status bar counting the fleet against its EXPECTED members (manager leader / standby, PS ready, EN online, extents clean / degraded / unavailable, rebuilds in flight, sample time, and each member that is not up — `null` from the leader reads "unknown"), the keyspace ribbon (−∞ → +∞, one segment per partition, colored by owning PS), a fleet health roll-up with extent alerts (unavailable / degraded / no redundancy left / rebuilding, naming the worst extents, with a Repair button for the worst readable one that still has a slot nobody asked to rebuild), space + amplification, the top advisories, and what is running |
 | **Partitions** | which partition — PS-scoped list + the lazy detail drawer |
 | **Servers** | which partition server — every REGISTERED PS with its heartbeat, load and partitions |
 | **Nodes** | which disk — every extent node with a per-disk table (capacity, online, faulted) |
-| **Policy** | what the controller would do — advisories with their full reasoning, and the policy editor |
-| **Logs** | what just happened — running ops, durable outcomes, and the auto-policy action log |
+| **Policy** | what the controller would do — advisories with their full reasoning, the policy editor, and what an observing policy would run |
+| **Logs** | what just happened — every op, the operator's and the auto-policy's alike: running now, then durable outcomes, each marked with who asked |
 
 Built for many partitions: the Partitions tab is **partition-server-first** (pick
 a PS card and the list shows *only that server's* partitions; **All servers**

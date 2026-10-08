@@ -1786,7 +1786,7 @@ async fn cmd_auto_policy(
             );
         }
         if !st.log.is_empty() {
-            println!("  recent actions:");
+            println!("  would run (observing; an armed policy's actions are in `ops list`):");
             for l in st.log.iter().take(10) {
                 println!("    [{}] {}", l.level, l.msg);
             }

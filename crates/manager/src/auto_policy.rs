@@ -17,19 +17,23 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use autumn_rpc::manager_rpc::{
     AutoPolicyLogEntry, MgrAutoPolicyConfig, MgrAutoPolicyCooldowns, MgrAutoPolicyEntry,
-    PolicyCandidate, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_HOT_COLD, POLICY_KIND_MAJOR_COMPACT,
-    POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_REPAIR,
-    POLICY_KIND_SCRUB, POLICY_KIND_SPLIT, SCRUB_POLICY_INTERVAL_SEC,
+    OpSubmitReq, PolicyCandidate, OP_KIND_COMPACT, OP_KIND_EC_CONVERT, OP_KIND_GC, OP_KIND_MERGE,
+    OP_KIND_REBALANCE, OP_KIND_REPAIR, OP_KIND_SCRUB, OP_KIND_SPLIT, POLICY_KIND_EC,
+    POLICY_KIND_GC, POLICY_KIND_HOT_COLD, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE,
+    POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_REPAIR, POLICY_KIND_SCRUB,
+    POLICY_KIND_SPLIT, SCRUB_POLICY_INTERVAL_SEC,
 };
 
-/// Rolling action-log cap (leader-local, in-memory — not persisted).
-const ACTION_LOG_CAP: usize = 100;
+/// Rolling preview-log cap (leader-local, in-memory — not persisted).
+const PREVIEW_LOG_CAP: usize = 100;
 
 /// In-manager controller state: the mode + active policy + custom policies +
-/// per-target cooldowns + a rolling action log. Config (mode/active/custom) is
-/// etcd-persisted (`autoPolicy/config`, leader-fenced) and cooldowns to
-/// `autoPolicy/cooldowns`, replayed on leader promotion so the active policy
-/// survives failover. The action log is leader-local (not persisted).
+/// per-target cooldowns + a rolling log of what an observing (DryRun) policy
+/// would run. Config (mode/active/custom) is etcd-persisted
+/// (`autoPolicy/config`, leader-fenced) and cooldowns to `autoPolicy/cooldowns`,
+/// replayed on leader promotion so the active policy survives failover. The
+/// log is leader-local (not persisted); an armed policy's actions are op-ledger
+/// ops, listed and kept in history like an operator's.
 pub(crate) struct AutoPolicyState {
     pub mode: AutoPolicyMode,
     pub active: String,
@@ -126,14 +130,14 @@ impl AutoPolicyState {
             .or_else(|| self.custom.iter().find(|p| p.name == name).cloned())
     }
 
-    /// Push a newest-first action-log entry (capped).
+    /// Push a newest-first preview-log entry (capped).
     pub fn record(&mut self, ts: i64, level: &str, msg: String) {
         self.log.push_front(AutoPolicyLogEntry {
             ts,
             level: level.to_string(),
             msg,
         });
-        while self.log.len() > ACTION_LOG_CAP {
+        while self.log.len() > PREVIEW_LOG_CAP {
             self.log.pop_back();
         }
     }
@@ -438,6 +442,50 @@ pub(crate) fn candidate_to_cmd(c: &PolicyCandidate) -> Option<Vec<String>> {
     }
 }
 
+/// The op the controller submits for a candidate: the same ledger entry, and
+/// so the same `ops list` / `ops history` rows, as the operator's command from
+/// `candidate_to_cmd`. `None` exactly where that is `None`.
+pub(crate) fn candidate_to_submit(c: &PolicyCandidate) -> Option<OpSubmitReq> {
+    candidate_to_cmd(c)?;
+    let (kind, part_id, secondary_id, extent_ids) = match c.kind {
+        POLICY_KIND_SPLIT => (OP_KIND_SPLIT, c.primary_part_id, 0, vec![]),
+        POLICY_KIND_MERGE => (
+            OP_KIND_MERGE,
+            c.primary_part_id,
+            c.secondary_part_id,
+            vec![],
+        ),
+        POLICY_KIND_GC => (OP_KIND_GC, c.primary_part_id, 0, vec![]),
+        POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
+            (OP_KIND_COMPACT, c.primary_part_id, 0, vec![])
+        }
+        POLICY_KIND_EC => (
+            OP_KIND_EC_CONVERT,
+            0,
+            c.secondary_part_id,
+            vec![c.secondary_part_id],
+        ),
+        POLICY_KIND_REBALANCE => (OP_KIND_REBALANCE, 0, 0, vec![]),
+        POLICY_KIND_SCRUB => (OP_KIND_SCRUB, 0, 0, vec![]),
+        // A node's degraded slots: the node id rides in `part_id`.
+        POLICY_KIND_REPAIR => (OP_KIND_REPAIR, c.secondary_part_id, 0, vec![]),
+        _ => return None,
+    };
+    Some(OpSubmitReq {
+        kind,
+        part_id,
+        secondary_id,
+        extent_ids,
+        requested_by: POLICY_REQUESTER.to_string(),
+        // `force` stays false: the controller must never erase an
+        // operator-declared presplit boundary by merging across it.
+        ..Default::default()
+    })
+}
+
+/// `requested_by` of the controller's ops.
+pub(crate) const POLICY_REQUESTER: &str = "auto-policy";
+
 /// Stable per-(kind, target) key for client-side cooldown tracking (Python
 /// `cooldown_key`).
 pub(crate) fn cooldown_key(c: &PolicyCandidate) -> String {
@@ -506,6 +554,38 @@ mod tests {
         assert_eq!(candidate_to_cmd(&cand(POLICY_KIND_EC, 0, 0)), None); // no extent
         assert_eq!(candidate_to_cmd(&cand(POLICY_KIND_MERGE, 3, 0)), None); // no victim
         assert_eq!(candidate_to_cmd(&cand(99, 1, 2)), None); // unknown kind
+    }
+
+    /// Every candidate the controller acts on becomes the ledger op of the
+    /// operator command it previews, naming the same target.
+    #[test]
+    fn candidate_to_submit_matches_the_previewed_command() {
+        let cases = [
+            (cand(POLICY_KIND_SPLIT, 7, 0), OP_KIND_SPLIT, 7, 0),
+            (cand(POLICY_KIND_MERGE, 3, 4), OP_KIND_MERGE, 3, 4),
+            (cand(POLICY_KIND_GC, 5, 0), OP_KIND_GC, 5, 0),
+            (cand(POLICY_KIND_MAJOR_COMPACT, 6, 0), OP_KIND_COMPACT, 6, 0),
+            (cand(POLICY_KIND_MINOR_COMPACT, 6, 0), OP_KIND_COMPACT, 6, 0),
+            (cand(POLICY_KIND_EC, 0, 88), OP_KIND_EC_CONVERT, 0, 88),
+            (cand(POLICY_KIND_REBALANCE, 0, 0), OP_KIND_REBALANCE, 0, 0),
+            (cand(POLICY_KIND_SCRUB, 0, 0), OP_KIND_SCRUB, 0, 0),
+            (cand(POLICY_KIND_REPAIR, 0, 9), OP_KIND_REPAIR, 9, 0),
+        ];
+        for (c, kind, part_id, secondary_id) in cases {
+            let s = candidate_to_submit(&c).expect("actionable");
+            assert_eq!(
+                (s.kind, s.part_id, s.secondary_id),
+                (kind, part_id, secondary_id),
+                "{}",
+                describe_candidate(&c)
+            );
+            assert_eq!(s.requested_by, POLICY_REQUESTER);
+            assert!(!s.force, "the controller never forces a merge");
+        }
+        assert!(candidate_to_submit(&cand(POLICY_KIND_HOT_COLD, 1, 2)).is_none());
+        assert!(candidate_to_submit(&cand(POLICY_KIND_EC, 0, 0)).is_none());
+        assert!(candidate_to_submit(&cand(POLICY_KIND_MERGE, 3, 0)).is_none());
+        assert!(candidate_to_submit(&cand(POLICY_KIND_REPAIR, 0, 0)).is_none());
     }
 
     #[test]

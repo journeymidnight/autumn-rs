@@ -24,8 +24,8 @@ use autumn_rpc::extent_rpc::{
     SCRUB_OUTCOME_SKIPPED,
 };
 use autumn_rpc::manager_rpc::{
-    rkyv_decode, rkyv_encode, OpSubmitReq, PolicyCandidate, OP_KIND_SCRUB, OP_STATE_FAILED,
-    OP_STATE_SUCCEEDED, OP_STATE_UNKNOWN, POLICY_KIND_SCRUB, SCRUB_POLICY_INTERVAL_SEC,
+    rkyv_decode, rkyv_encode, PolicyCandidate, OP_STATE_FAILED, OP_STATE_SUCCEEDED,
+    OP_STATE_UNKNOWN, POLICY_KIND_SCRUB, SCRUB_POLICY_INTERVAL_SEC,
 };
 
 use crate::store::MetadataState;
@@ -562,31 +562,6 @@ impl AutumnManager {
         }]
     }
 
-    /// Submit a whole-cluster scrub through the op ledger, so it is listed and
-    /// followed like an operator's. A scrub already running is attached to.
-    pub(crate) fn submit_scrub_all(&self, requested_by: &str) -> u64 {
-        let (now_s, now_ms) = Self::now_s_ms();
-        let (op_id, attached) = self.ops.borrow_mut().submit(
-            OP_KIND_SCRUB,
-            0,
-            0,
-            Vec::new(),
-            requested_by.to_string(),
-            now_s,
-            now_ms,
-        );
-        if !attached {
-            let mgr = self.clone();
-            let spec = OpSubmitReq {
-                kind: OP_KIND_SCRUB,
-                requested_by: requested_by.to_string(),
-                ..Default::default()
-            };
-            compio::runtime::spawn(async move { mgr.run_submitted_op(op_id, spec).await }).detach();
-        }
-        op_id
-    }
-
     /// Apply a node's `scrub_queued` (from the same `df`, AFTER its outcomes).
     ///
     /// An op listed there is alive, however long its files wait behind other
@@ -676,6 +651,7 @@ impl AutumnManager {
 mod tests {
     use super::*;
     use crate::persist::records::{ExtentRecord, PartitionRecord, StreamRecord};
+    use autumn_rpc::manager_rpc::OP_KIND_SCRUB;
 
     fn extent(id: u64, nodes: Vec<u64>, parity: Vec<u64>, sealed: u64, avali: u32) -> ExtentRecord {
         ExtentRecord {

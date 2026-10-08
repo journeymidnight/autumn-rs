@@ -118,7 +118,7 @@ pub(crate) struct RepairOutcome {
 }
 
 impl RepairOutcome {
-    /// One line for an op's message or the policy's action log.
+    /// One line for an op's message.
     pub(crate) fn describe(&self) -> String {
         let mut out = format!(
             "requested a rebuild of {} slot(s) on {} extent(s)",
@@ -583,38 +583,40 @@ mod tests {
     /// A cancel restarts the cancelled slots' degraded clocks: with the old
     /// clock (already past the grace) an Armed policy would re-request them
     /// on its very next pass.
-    #[test]
-    fn a_cancel_restarts_the_grace_period() {
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            let m = AutumnManager::new();
-            m.set_repair_grace_secs(600);
-            for (node_id, disk) in [(1u64, 10u64), (2, 20)] {
-                m.store.inner.borrow_mut().nodes.insert(
+    /// Nodes 1 (never heard from) and 2 (healthy), grace 600 s, and one RF 2
+    /// extent on both per `(extent_id, secs slot 0 on node 1 has been degraded)`.
+    fn node_1_down(extents: &[(u64, i64)]) -> (AutumnManager, i64) {
+        let m = AutumnManager::new();
+        m.set_repair_grace_secs(600);
+        for (node_id, disk) in [(1u64, 10u64), (2, 20)] {
+            m.store.inner.borrow_mut().nodes.insert(
+                node_id,
+                crate::persist::records::NodeRecord {
                     node_id,
-                    crate::persist::records::NodeRecord {
-                        node_id,
-                        address: format!("127.0.0.1:{}", 9100 + node_id),
-                        disks: vec![disk],
-                        shard_ports: vec![],
-                        control_address: String::new(),
-                        node_uuid: String::new(),
-                    },
-                );
-                m.store.inner.borrow_mut().disks.insert(
-                    disk,
-                    crate::persist::records::DiskRecord {
-                        disk_id: disk,
-                        online: true,
-                        uuid: String::new(),
-                    },
-                );
-            }
-            m.node_states.borrow_mut().on_register_first(1); // never heard from
-            m.node_states.borrow_mut().on_heartbeat_ok(2);
+                    address: format!("127.0.0.1:{}", 9100 + node_id),
+                    disks: vec![disk],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: String::new(),
+                },
+            );
+            m.store.inner.borrow_mut().disks.insert(
+                disk,
+                crate::persist::records::DiskRecord {
+                    disk_id: disk,
+                    online: true,
+                    uuid: String::new(),
+                },
+            );
+        }
+        m.node_states.borrow_mut().on_register_first(1);
+        m.node_states.borrow_mut().on_heartbeat_ok(2);
+        let now = AutumnManager::epoch_seconds();
+        for &(extent_id, secs) in extents {
             m.store.inner.borrow_mut().extents.insert(
-                50,
+                extent_id,
                 crate::persist::records::ExtentRecord {
-                    extent_id: 50,
+                    extent_id,
                     sealed: true,
                     sealed_length: 4096,
                     replicates: vec![1, 2],
@@ -623,8 +625,35 @@ mod tests {
                     ..Default::default()
                 },
             );
-            let now = AutumnManager::epoch_seconds();
-            m.slot_degraded_since.borrow_mut().insert((50, 0), now - 1000);
+            m.slot_degraded_since.borrow_mut().insert((extent_id, 0), now - secs);
+        }
+        (m, now)
+    }
+
+    /// The policy's repair op asks for what its advisory counted — slots past
+    /// the grace — while an operator's `repair --node` asks for every one.
+    #[test]
+    fn a_policy_repair_op_leaves_slots_inside_the_grace() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            for (origin, young) in [(crate::OpOrigin::Policy, 0), (crate::OpOrigin::Operator, 1)] {
+                let (m, now) = node_1_down(&[(50, 1000), (51, 10)]);
+                let cand = m
+                    .repair_candidates(now)
+                    .into_iter()
+                    .find(|c| c.secondary_part_id == 1)
+                    .expect("node 1 advised");
+                let spec = crate::auto_policy::candidate_to_submit(&cand).unwrap();
+                m.run_submitted_op(0, spec, origin).await;
+                assert_eq!(m.repair_slots_of(50), 1, "{origin:?}");
+                assert_eq!(m.repair_slots_of(51), young, "{origin:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_cancel_restarts_the_grace_period() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let (m, now) = node_1_down(&[(50, 1000)]);
             let policy_ask = |m: &AutumnManager| {
                 m.repair_candidates(now)
                     .iter()

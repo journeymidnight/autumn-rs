@@ -31,7 +31,7 @@ let OUT = {};
 const ctx = { $: sel => ({ set innerHTML(v) { OUT[sel] = v; } }) };
 const src = [escLine, constLine("jsAttr"), constLine("BYTE_KINDS"),
              constLine("COUNT_UNIT"), lift("fmtBytes"), lift("fmtProgress"), lift("agoStr"), lift("psHealth"),
-             lift("diskRow"), lift("hotColdAdvisory"), lift("advRow"), lift("opsTarget"), lift("opsAgo"),
+             lift("diskRow"), lift("hotColdAdvisory"), lift("advRow"), lift("opsTarget"), lift("opsAgo"), lift("opsWhen"),
              lift("nodeAddr"), lift("extChip"), lift("extentHealthRows"), lift("extentHealthBad"), lift("statusRows"), lift("repairBtn"), lift("cancelBtn"),
              lift("renderLiveOps"), lift("renderOpsHistory")].join("\n");
 const now = Math.floor(Date.now() / 1000);
@@ -173,8 +173,16 @@ want(ehd, "1 extent rebuilding", "a running rebuild is shown");
 // The worst problem is already rebuilding, so it gets no Repair button; a
 // readable, idle one does.
 if (PURE.ehDegraded.includes("Repair #")) { console.error("FAIL: a rebuilding extent offered a Repair button"); bad++; }
-const rb = new Function(src + `return repairBtn({problems:[{extent_id:9,serving:1,needed:1,recovering:false}]});`)();
+const rb = new Function(src + `return repairBtn({problems:[{extent_id:9,serving:1,needed:1,recovering:false,slots:[{repair_requested:false}]}]});`)();
 want(rb, 'action:"repair",extent_id:9', "a readable idle problem extent offers a Repair action");
+// A slot with a standing request is already queued: the button skips to the
+// worst extent still unasked, and is gone once every slot is asked for.
+const rbNext = new Function(src + `return repairBtn({problems:[
+  {extent_id:80,serving:4,needed:3,recovering:false,slots:[{repair_requested:true}]},
+  {extent_id:81,serving:4,needed:3,recovering:false,slots:[{repair_requested:false}]}]});`)();
+want(rbNext, 'action:"repair",extent_id:81', "the Repair button skips an extent already queued");
+wantEq(new Function(src + `return repairBtn({problems:[{extent_id:80,serving:4,needed:3,recovering:false,slots:[{repair_requested:true}]}]});`)(),
+  "", "every degraded slot already requested — no Repair button");
 const rbNone = new Function(src + `return repairBtn({problems:[{extent_id:9,serving:0,needed:1,recovering:false}]});`)();
 wantEq(rbNone, "", "an unreadable extent has nothing to rebuild from — no button");
 want(text(PURE.ehErr), "1 extent unavailable — fewer serving copies than a read needs", "an unreadable extent is an error");
@@ -188,6 +196,7 @@ want(ehr, "slot2 node 7 unreachable", "the requested slot is named");
 want(ehr, "(repair requested)", "…and marked as queued to move");
 want(ehr, "1 slot queued to be rebuilt on another node", "the standing requests are counted");
 want(PURE.ehRequested, 'action:"repair_cancel",extent_id:41', "a standing request can be cancelled from the page");
+if (PURE.ehRequested.includes("Repair #")) { console.error("FAIL: an extent whose slots are all requested offered a Repair button"); bad++; }
 
 // An advisory's reason can be a whole sentence; the row must lead with the
 // action and keep the reasoning, not truncate one into the other.

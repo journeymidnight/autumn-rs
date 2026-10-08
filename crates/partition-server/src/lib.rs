@@ -1741,7 +1741,7 @@ impl PartitionMetrics {
     /// Publish which PHASE the split has reached.
     ///
     /// Unlike `set_maintenance_progress`, `op_id: 0` is published too: an
-    /// untracked split (policy, presplit) carries none, and the manager
+    /// untracked split (presplit, test helpers) carries none, and the manager
     /// matches it on (kind, part_id). A submitted split's id also tells the
     /// manager the split is still running after it stopped waiting for the
     /// reply.

@@ -214,6 +214,25 @@ async fn submit_repair(admin: &RpcClient, extent_ids: Vec<u64>) -> OpRecord {
     }
 }
 
+/// The repair ops the controller submitted for `node`, as the ledger lists them.
+async fn policy_repair_ops(admin: &RpcClient, node: u64) -> Vec<OpRecord> {
+    let resp = admin
+        .call(
+            MSG_OP_QUERY,
+            rkyv_encode(&OpQueryReq {
+                kind_filter: OP_KIND_REPAIR,
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("query ops");
+    let q: OpQueryResp = rkyv_decode(&resp).expect("decode op query");
+    q.ops
+        .into_iter()
+        .filter(|o| o.requested_by == "auto-policy" && o.part_id == node)
+        .collect()
+}
+
 fn no_override(mgr_states: &ListNodeStatesResp, node: u64) -> bool {
     mgr_states
         .nodes
@@ -425,6 +444,10 @@ fn the_repair_policy_advises_in_dry_run_and_rebuilds_when_armed() {
                 .contains(&members[1]),
             "DryRun must not move anything"
         );
+        assert!(
+            policy_repair_ops(&admin, members[1]).await.is_empty(),
+            "DryRun submits no op"
+        );
 
         set(AUTOPOLICY_OP_SET_MODE, 2, "", None).await; // Armed
         wait_replaced(
@@ -438,6 +461,13 @@ fn the_repair_policy_advises_in_dry_run_and_rebuilds_when_armed() {
         assert!(
             no_override(&node_states(&admin).await, members[1]),
             "the policy repairs extents, it does not fence the node"
+        );
+        // The armed policy's action is an op in the ledger, like an operator's.
+        let ops = policy_repair_ops(&admin, members[1]).await;
+        assert!(
+            ops.iter().any(|o| o.state == OP_STATE_SUCCEEDED),
+            "no succeeded auto-policy repair op for node {}: {ops:?}",
+            members[1]
         );
     });
     drop(nodes);
@@ -658,20 +688,14 @@ fn a_node_that_returns_keeps_its_copies_despite_repair_requests() {
         // only spare is down too).
         let start = Instant::now();
         loop {
-            let resp = admin
-                .call(MSG_AUTOPOLICY_GET, rkyv_encode(&AutoPolicyGetReq {}))
-                .await
-                .expect("autopolicy get");
-            let g: AutoPolicyGetResp = rkyv_decode(&resp).expect("decode autopolicy get");
-            let issued = format!("autumn-op repair --node {}", members[1]);
-            if g.log.iter().any(|e| e.level == "issued" && e.msg.contains(&issued)) {
+            let ops = policy_repair_ops(&admin, members[1]).await;
+            if ops.iter().any(|o| o.state == OP_STATE_SUCCEEDED) {
                 break;
             }
             assert!(
                 start.elapsed() < Duration::from_secs(30),
-                "the armed policy never issued a repair for node {}: {:?}",
-                members[1],
-                g.log
+                "the armed policy never requested a repair for node {}: {ops:?}",
+                members[1]
             );
             compio::time::sleep(Duration::from_millis(500)).await;
         }
