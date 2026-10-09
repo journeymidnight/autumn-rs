@@ -48,6 +48,12 @@ const FENCE_HEADROOM_DEN: u64 = 10;
 pub static MERGE_TEST_PAUSE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Test-only failpoint: the next `stream_alloc_extent` sleeps this many ms
+/// after its entry checks, inside the window its awaits open (one-shot).
+#[doc(hidden)]
+pub static ALLOC_TEST_PAUSE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Test-only failpoint like `MERGE_TEST_PAUSE_MS`, between the freezes and the
 /// takeover.
 #[doc(hidden)]
@@ -2405,7 +2411,7 @@ impl AutumnManager {
         let space_low_node_ids = self.space_low_node_ids();
         let hard_excluded = self.placement_excluded_node_ids();
         let placement_load = self.placement_load();
-        let (mut tail, selected, extent_id, data, nodes_map) = {
+        let (mut tail, selected, extent_id, data, nodes_map, entry_stream) = {
             let mut s = self.store.inner.borrow_mut();
             if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
                 return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
@@ -2515,7 +2521,7 @@ impl AutumnManager {
                 Err(err) => return Self::alloc_reject(Self::err_to_code(&err), err.to_string()),
             };
             let (extent_id, _) = s.alloc_ids(1);
-            (tail, selected, extent_id, data, s.nodes.clone())
+            (tail, selected, extent_id, data, s.nodes.clone(), stream)
         };
 
         // capture the tail's eversion BEFORE any mutation so the
@@ -2550,6 +2556,12 @@ impl AutumnManager {
         // honor the "allocate a new tail" intent while preserving the
         // existing seal point.
         let already_sealed = tail.sealed;
+        {
+            let pause = ALLOC_TEST_PAUSE_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if pause > 0 {
+                compio::time::sleep(Duration::from_millis(pause)).await;
+            }
+        }
 
         // Assigned exactly once on every branch below (deferred init — no dead
         // default, no `mut` needed).
@@ -2772,24 +2784,16 @@ impl AutumnManager {
 
         // compute stream_after without modifying store, mirror to
         // etcd FIRST, then apply to in-memory state on success.
-        let (stream_after, alloc_stream_baseline) = {
-            let s = self.store.inner.borrow();
-            let st = match s.streams.get(&req.stream_id) {
-                Some(v) => v,
-                None => {
-                    return Self::alloc_reject(CODE_NOT_FOUND, format!("stream {}", req.stream_id))
-                }
-            };
-            // Item 3: CAS baseline = the stream's current value (etcd holds
-            // exactly this until a concurrent op commits). The mirror txn below
-            // value-CAS's `streams/<id>` against it, so a punch_holes/truncate
-            // committing during our RTT makes our write fail → retry, instead of
-            // resurrecting the removed extent.
-            let baseline = crate::persist::encode(st);
-            let mut stream_after = st.clone();
-            stream_after.extent_ids.push(extent_id);
-            (stream_after, baseline)
-        };
+        //
+        // The commit stands on the stream as read at ENTRY, before the awaits
+        // above: the verify below and the etcd CAS compare it with the live
+        // record. A baseline read here, after the awaits, would always match —
+        // a punch / truncate / split / another alloc in the window would go
+        // through, and two allocations on a sealed tail would both append,
+        // leaving an open extent inside the stream (`tests/alloc_extent_races.rs`).
+        let alloc_stream_baseline = crate::persist::encode(&entry_stream);
+        let mut stream_after = entry_stream.clone();
+        stream_after.extent_ids.push(extent_id);
 
         // verify-BEFORE-mirror (replaces the earlier
         // verify-AFTER-mirror form). If a concurrent mutator
@@ -2811,25 +2815,27 @@ impl AutumnManager {
         // alloc_extent op, which is filed as a follow-up (PS-layer
         // ops currently don't enroll in the ledger by design).
         //
-        // coco P1 — stream-membership baseline verify (runs for BOTH paths).
-        // The etcd mirror + in-memory apply below write `stream_after`
-        // (= the live stream's `extent_ids` captured at build time, plus our
-        // new extent). If a concurrent `punch_holes` / `truncate` / `split`
-        // changed this stream's `extent_ids` during our alloc / mirror await
-        // window, overwriting with `stream_after` would resurrect a removed
-        // extent or roll back the membership change. Refuse (Precondition) when
-        // the live stream no longer matches the baseline we built from — the
-        // client retries with a fresh snapshot. Membership is independent of
-        // the tail seal, so this guard applies whether or not `already_sealed`.
-        // (A narrow residual remains for a mutation landing during the etcd
-        // mirror RTT itself — the same follow-up window the eversion
-        // verify below documents.)
+        // Stream-record verify (runs for BOTH paths). The etcd mirror +
+        // in-memory apply below write `stream_after` (= the entry snapshot plus
+        // our new extent). If anything changed the stream record during the
+        // awaits, overwriting it would resurrect a removed extent, drop an added
+        // one, or revert a record change: refuse (Precondition) and the client
+        // retries with a fresh snapshot. A change landing during the etcd mirror
+        // RTT itself is refused by the txn's value-CAS. The owner, checked at
+        // entry only, is checked again here: a deposed owner must not get a
+        // fresh tail, which no EN fence floor protects.
         {
             let s = self.store.inner.borrow();
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
+                return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
+            }
             match s.streams.get(&req.stream_id) {
+                // The exact bytes the etcd CAS compares, so both modes judge
+                // alike: the apply writes the whole entry snapshot back, and
+                // e.g. an `update_stream_ec` in the window must refuse this
+                // allocation rather than be reverted.
                 Some(live) => {
-                    let baseline = &stream_after.extent_ids[..stream_after.extent_ids.len() - 1];
-                    if live.extent_ids.as_slice() != baseline {
+                    if crate::persist::encode(live) != alloc_stream_baseline {
                         let msg = autumn_common::alloc_conflict::membership_changed_message(
                             req.stream_id,
                         );
@@ -2881,6 +2887,7 @@ impl AutumnManager {
                 sealed_old,
                 &new_extent,
                 Some(alloc_stream_baseline),
+                (!req.owner_key.is_empty()).then(|| (req.owner_key.as_str(), req.owner_epoch)),
             )
             .await
         {

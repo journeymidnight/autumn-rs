@@ -316,6 +316,14 @@ deadlocking the PS main thread (over 64 connections on one partition). Check:
 (300 idle connections, a range change, the PS must stay registered and the
 partition reopen; ~15 s).
 
+**Extent allocation refuses a stream that changed under it.** An allocation
+whose stream record changed while it was creating the new extent's files
+(extents added or removed, or its EC shape changed) is refused — the message
+reads `membership changed during alloc_extent` either way — and the writer
+retries with a fresh view. One whose partition changed owner meanwhile is refused with
+`owner_epoch mismatch`: the old PS does not retry, it gives the partition up
+and reopens it under a fresh epoch. Check: `cargo test -p autumn-manager --test alloc_extent_races` (~6 s).
+
 **A merge freeze no longer stops a partition behind a compaction.** The
 freeze waits for the partition's maintenance gate with writes still flowing,
 and halts writes only once it holds it. If a long major compaction holds the

@@ -33,7 +33,8 @@ pub(crate) mod store;
 #[doc(hidden)]
 pub use manager_members::ManagerIdentity;
 pub use rpc_handlers::{
-    MERGE_TEST_DROP_FREEZE_REPLY, MERGE_TEST_PAUSE_MS, MERGE_TEST_TAKEOVER_PAUSE_MS,
+    ALLOC_TEST_PAUSE_MS, MERGE_TEST_DROP_FREEZE_REPLY, MERGE_TEST_PAUSE_MS,
+    MERGE_TEST_TAKEOVER_PAUSE_MS,
 };
 
 // Pure `/api/overview` composer, shared with `autumn-op overview` so the
@@ -5017,6 +5018,10 @@ impl AutumnManager {
         // CAS fails → `Precondition` → client retries (instead of overwriting
         // the concurrent change and resurrecting a removed extent).
         stream_cas: Option<Vec<u8>>,
+        // `Some((owner_key, epoch))` = the owner lock must still be at the
+        // epoch the caller holds: an acquire landing during this RTT is a
+        // takeover the in-memory check cannot see yet.
+        owner: Option<(&str, i64)>,
     ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
             let mut kvs = vec![Self::persist_kv_entry("streams", stream.stream_id, stream)];
@@ -5032,11 +5037,16 @@ impl AutumnManager {
                 new_extent.extent_id,
                 new_extent,
             ));
-            let cas: Vec<(String, Vec<u8>)> = stream_cas
-                .map(|v| (format!("streams/{}", stream.stream_id), v))
+            let mut cmp: Vec<_> = stream_cas
+                .map(|v| {
+                    autumn_etcd::Cmp::value(format!("streams/{}", stream.stream_id), v)
+                })
                 .into_iter()
                 .collect();
-            etcd.put_delete_txn_cas(kvs, vec![], cas).await?;
+            cmp.extend(owner.map(|(key, epoch)| {
+                autumn_etcd::Cmp::mod_revision(format!("ownerLocks/{key}"), epoch)
+            }));
+            etcd.put_delete_txn_compare(kvs, vec![], cmp).await?;
         }
         Ok(())
     }

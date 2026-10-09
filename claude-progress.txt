@@ -1,3 +1,11 @@
+Date: 2026-10-09 (7)
+TaskStatus: completed
+Task scope: user — fix BUG-ALLOC-MEMBERSHIP-CHECK-NOOP (reproduce first).
+Current summary: handle_stream_alloc_extent checked the owner at entry only and built its membership verify and etcd CAS baseline after its awaits (commit-length probes, file creation on the ENs), so both always matched. Reproduced (ALLOC_TEST_PAUSE_MS, one-shot pause after the entry checks): two allocs on a split-sealed tail both succeeded, stream [8] -> [8, 18, 17] with 18 open inside; an owner re-acquired during the pause still got a fresh tail ([8] -> [8, 13]). Fix: the entry snapshot is the baseline (stream_after = snapshot + new extent; the verify compares the live record's encoded bytes with it, as the etcd value-CAS does); ensure_owner_epoch again before the commit; the etcd txn also compares ownerLocks/<key> mod_revision (mirror_stream_alloc_extent(.., owner), via put_delete_txn_compare). Docs: manager CLAUDE.md, ops.md.
+Verification: tests/alloc_extent_races.rs 4 scenarios (sealed-tail double alloc, owner change, update_stream_ec during an alloc, an etcd-backed alloc), each asserting the refusal reason; ablations each red only their own: after-await baseline, no owner recheck, extent_ids-only verify (update_stream_ec reverted in memory mode), wrong ownerLocks/ key. manager lib 484; integration, system_split_writes, system_merge, merge_freeze_races, split_op_outcome, system_roll_tails_live_writer, system_lost_reply_idempotency, topology_waits_for_extent_ops, extent_repair, partition_reload_many_connections, merge_freeze_waits_for_gate green. Reviews: fable (no high; byte verify, etcd test, test reasons), opus (no high; serial mutex, docs).
+Main gaps: the refusal for an EC-only record change still reads "membership changed". Filed BUG-UPDATE-STREAM-EC-NO-CAS (update_stream_ec mirrors the whole stream without CAS — the reverse race). Not run on a real cluster.
+Next steps: none for this task.
+
 Date: 2026-10-09 (6)
 TaskStatus: completed
 Task scope: user-reported P2 on a92a2f4f — merge_freeze_task, when its OK could not be delivered, called end() unconditionally and could end a newer freeze (A drained and woken; the loop handles freeze=false and a new freeze B before A runs; A's cleanup cancels B).

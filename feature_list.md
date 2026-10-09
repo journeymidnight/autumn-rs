@@ -14,10 +14,10 @@
 
 ## Active
 
-### BUG-ALLOC-MEMBERSHIP-CHECK-NOOP — 新 extent 分配的 stream 成员校验永远不触发（推断，未复现）
-- **Trigger** (2026-10-08 代码评审): `handle_stream_alloc_extent` 的成员校验比较的 baseline 是在 commit_length 探测 / `place_extents_with_fallback` 这些 await 之后才构造的，构造与校验之间没有 await，所以永远相等；etcd CAS 的 baseline 同样取在 await 之后。awaits 期间的并发成员变更因此被吸收。tail 已 sealed 时，同一 stream 的两次并发 alloc 都能成功，留下 `[.., T, N1, N2]`：一个 open 的 N1 卡在 stream 中间。
-- **Scope**: 先用 failpoint 卡住一次 alloc 的 await、并发再发一次 alloc 来复现；复现后把 baseline 取在第一个 await 之前（与 tail_id 同一时刻），让校验与 CAS 真正比较 await 前后。
-- **Acceptance**: 复现用例在修复前失败（stream 中间出现 open extent 或两次都成功），修复后第二次 alloc 被拒（Precondition）并能重试成功；既有 alloc/split/merge/GC 回归全绿。
+### BUG-UPDATE-STREAM-EC-NO-CAS — `update_stream_ec` 写 etcd 不做 CAS，可能覆盖并发提交的 stream 成员变更（推断，未复现）
+- **Trigger** (2026-10-09 alloc 修复的 fable 评审): `handle_update_stream_ec` 用 `put_msgs_txn` 把整条 `streams/<id>` 写回 etcd，没有值 CAS。它的 etcd RTT 期间若有 alloc / punch / split 提交了该 stream 的成员变更，etcd 被写回旧的 `extent_ids`；内存里只改了两个 ec 字段，所以内存保留了新成员。换主 replay 后，已提交的尾巴会从 stream 里消失。运维触发（autumn-op），罕见。
+- **Scope**: 先复现（在 update_stream_ec 的 etcd 写前挂暂停点，期间做一次 alloc，换主后看 stream）。坐实后给它加 `streams/<id>` 的值 CAS（与 alloc/punch 同一机制）。
+- **Acceptance**: 复现用例修复前换主后丢成员、修复后 update_stream_ec 被拒并可重试；消融变红。
 - `passes: false`
 
 ### BUG-OWNER-EPOCH-MEMORY-BACKWARDS — 同一 key 的两次 acquire 交错时，内存 epoch 可能落后于 etcd（推断，未复现）

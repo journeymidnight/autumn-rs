@@ -1316,8 +1316,21 @@ sealed extent back as "fresh".
 fired on already-sealed tails), and on the already-sealed path the tail etcd write +
 `s.extents.insert` are skipped (the sealer already persisted it) — otherwise a
 concurrent Recovery completing during the mirror RTT would be clobbered by the stale
-clone. A stream-membership baseline verify runs for BOTH paths (refuse if
-`extent_ids` changed) so a concurrent punch/truncate/split can't be clobbered.
+clone.
+
+**The commit stands on the stream as read at ENTRY, and the owner is checked
+again after the awaits.** The handler awaits for seconds (commit-length probes,
+creating the files on the nodes). Before the commit, the live stream record
+must still equal the entry snapshot byte for byte — the same bytes the etcd
+txn value-CASes — since the apply writes that whole snapshot back; and
+`ensure_owner_epoch` runs again, with the etcd txn also comparing
+`ownerLocks/<key>`'s `mod_revision` with the caller's epoch. A baseline read
+after the awaits always matches: two allocations on a sealed tail both
+append (`[.., T, N1, N2]`, an open extent inside the stream), an
+`update_stream_ec` in the window is reverted, and an owner deposed during the
+awaits gets a fresh tail no EN fence protects. `tests/alloc_extent_races.rs`
+covers each, red without its part of the fix, plus a wrong `ownerLocks/` key
+(the etcd-backed allocation refused).
 
 ## Crash-safety & fencing invariants
 
