@@ -1,3 +1,11 @@
+Date: 2026-10-09 (9)
+TaskStatus: completed
+Task scope: user — dashboard capacity mismatch: partition 2694's list row said 22.6 GiB, its drawer listed a 16.0 GiB sealed log extent and three open tails at 0 B.
+Current summary: The list (manager overview: Σ sealed_length + the PS's shard-routed open_tail_bytes) is right; the drawer was wrong. autumn-op's probe_extent_len (info --part, info --full) sent MSG_PROBE_EXTENT to the node's base address (shard 0); an EN shard refuses another shard's extent, the failed probe kept sealed_length 0 → 0 B for every open extent off shard 0 (2694's single open row tail held its 4.3 GiB of SSTs). Fix: route with shard_addr_for_extent(address, shard_ports, id); also a NOT_FOUND answer is no longer read as length 0 (review). Docs: server CLAUDE.md, ops.md.
+Verification: new op_info_open_extent_shard (real binaries, 8-shard EN, open log tail on shard 2): green 5/5; routing reverted → red "open log extent 4 on shard 2 reports 0 B". autumn-op 38, op_bootstrap_e2e green. opus review: routing verified consistent with the EN and manager, no other copy of the bug; test port pick flaked ~2% (EN port + 1000 overflow) → fixed; doc wording fixed.
+Main gaps: not checked on the user's cluster (unreachable from here). The probe still asks only the first replica. The list's LIVE (extent footprint) and the drawer's "live size" (LSM resident) are different quantities under similar labels.
+Next steps: none for this task.
+
 Date: 2026-10-09 (8)
 TaskStatus: not_completed
 Task scope: VKE CP build/rollout and EN/manager/split/merge stress; user reported incomplete or apparently repeated key ranges in the dashboard.

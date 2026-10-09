@@ -1269,6 +1269,11 @@ autumn-op --manager 127.0.0.1:9001 info --part 17  # EXACT size (probes the EN l
 
 For an idle partition the two match to the byte; for one actively
 GC/compacting they differ transiently — `info --part` is authoritative.
+If an idle partition's overview size stays above the `info --part` sum and the
+gap matches open tails listed as `0 B`, `info --part` could not probe those
+tails: it asks the extent's first replica on the shard that owns it, and keeps
+`0 B` when that replica is down or does not hold the extent. Check the node with
+`autumn-op --json list-nodes` (state, `shard_ports`).
 
 ## Tuning `--max-extent-size-bytes` — reclamation granularity vs metadata
 

@@ -178,13 +178,15 @@ budget for it rather than assuming the guard rarely fires. Cheap would require
 a manager-side reverse lookup, i.e. a wire change. A failed lookup degrades to
 `refs` alone rather than failing the panel.
 
-**Open extent lengths (`info`, `info --part`).** The manager only knows a
+**Open extent lengths (`info --full`, `info --part`).** The manager only knows a
 sealed extent's length, so both views probe the first replica with
 `MSG_PROBE_EXTENT` (`probe_extent_len`), through an ADMIN-role `ConnPool`. Not
 through the SDK: its PS connections declare `Service::PartitionServer` and an
 extent node refuses that hello, and its own EN connections are client-role,
-which may only read. A failed probe keeps the manager's value, so a probe
-that can never succeed looks exactly like an empty open extent.
+which may only read. A shard refuses another shard's extent, so the probe is
+routed to the owner (`shard_addr_for_extent` with the node's `shard_ports`).
+A failed or `NOT_FOUND` probe keeps the manager's value, so a probe that can
+never succeed looks exactly like an empty open extent.
 
 `format` is IDENTITY-ONLY: no location flags — it stamps the sentinels and registers an EMPTY location; the EN self-registers its real location. `register-node` is a migration stub that hints and exits 1 before connecting.
 

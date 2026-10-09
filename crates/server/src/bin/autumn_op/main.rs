@@ -3479,14 +3479,19 @@ fn ps_state(p: &PsOverview) -> String {
 /// Live length of an open extent from its first replica, or `None` when the
 /// probe fails (the caller keeps the manager's value). An extent node is not a
 /// partition server: the SDK's PS connections declare the wrong service and the
-/// SDK's own EN connections are client-role, which may only read.
-async fn probe_extent_len(pool: &autumn_stream::ConnPool, addr: &str, extent_id: u64) -> Option<u64> {
+/// SDK's own EN connections are client-role, which may only read. The probe
+/// goes to the shard that owns the extent; any other shard refuses it.
+async fn probe_extent_len(pool: &autumn_stream::ConnPool, node: &MgrNodeInfo, extent_id: u64) -> Option<u64> {
     let req = ExtProbeExtentReq { extent_id };
+    let addr = autumn_stream::shard_addr_for_extent(&node.address, &node.shard_ports, extent_id);
     let resp = pool
-        .call_timeout(addr, EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
+        .call_timeout(&addr, EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
         .await
         .ok()?;
-    ExtProbeExtentResp::decode(resp).ok().map(|r| r.length)
+    ExtProbeExtentResp::decode(resp)
+        .ok()
+        .filter(|r| r.code == CODE_OK)
+        .map(|r| r.length)
 }
 
 /// Scoped per-partition view (`info --part P`, no `--detail`): one
@@ -3542,10 +3547,10 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
     // for their live length. An OPEN (unsealed) extent's manager `sealed_length`
     // is 0, so without a probe the tail log/row/meta extents render as 0B — which
     // is wrong (the log tail holds the live WAL). Sealed/EC extents need no probe.
-    let node_map: std::collections::HashMap<u64, String> =
+    let node_map: std::collections::HashMap<u64, MgrNodeInfo> =
         match client.mgr_call(MSG_NODES_INFO, Bytes::new()).await {
             Ok(nb) => match rkyv_decode::<NodesInfoResp>(&nb) {
-                Ok(nr) => nr.nodes.into_iter().map(|(id, n)| (id, n.address)).collect(),
+                Ok(nr) => nr.nodes.into_iter().collect(),
                 Err(_) => Default::default(),
             },
             Err(_) => Default::default(),
@@ -3612,8 +3617,8 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
                     // for the live length (else it shows 0B, see node_map note).
                     let mut sz = e.sealed_length;
                     if !e.sealed {
-                        if let Some(addr) = e.replicates.first().and_then(|nid| node_map.get(nid)) {
-                            if let Some(len) = probe_extent_len(&en_pool, addr, *eid).await {
+                        if let Some(node) = e.replicates.first().and_then(|nid| node_map.get(nid)) {
+                            if let Some(len) = probe_extent_len(&en_pool, node, *eid).await {
                                 sz = len;
                             }
                         }
@@ -3884,10 +3889,7 @@ async fn run_info(
 
     let mut nodes_sorted: Vec<(u64, MgrNodeInfo)> = nodes_resp.nodes.into_iter().collect();
     nodes_sorted.sort_by_key(|(id, _)| *id);
-    let node_map: HashMap<u64, String> = nodes_sorted
-        .iter()
-        .map(|(id, n)| (*id, n.address.clone()))
-        .collect();
+    let node_map: HashMap<u64, &MgrNodeInfo> = nodes_sorted.iter().map(|(id, n)| (*id, n)).collect();
 
     let mut streams_sorted: Vec<(u64, MgrStreamInfo)> = stream_resp.streams.into_iter().collect();
     streams_sorted.sort_by_key(|(id, _)| *id);
@@ -3930,10 +3932,10 @@ async fn run_info(
                 continue;
             }
             if let Some(node_id) = ext.replicates.first() {
-                if let Some(addr) = node_map.get(node_id) {
+                if let Some(node) = node_map.get(node_id) {
                     // Tier 2: probe RPC has no PS-owner context;
                     // must NOT use the fence-gated commit_length RPC.
-                    if let Some(len) = probe_extent_len(&en_pool, addr, *eid).await {
+                    if let Some(len) = probe_extent_len(&en_pool, node, *eid).await {
                         ext.sealed_length = len;
                     }
                 }
