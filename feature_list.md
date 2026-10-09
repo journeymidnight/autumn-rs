@@ -14,12 +14,6 @@
 
 ## Active
 
-### F-ADVISE-COMPACT-FOR-PROTECTED-GARBAGE — replay 窗口内的大量垃圾没有动作去释放
-- **Trigger** (2026-10-08 评审, F-GC-DEBT-REPLAY-FLOOR 之后): floor extent 上的垃圾现在记在 `open_tail_dead_bytes`，`gc_debt` 为 0，GC 不再空跑；但也没有任何东西去推进 checkpoint 让它变成 debt。锚点在 floor extent 中间时只能靠 flush + compaction 推进，而 flush 要等 256 MiB memtable / 1 GiB WAL gap / 一次 major。SETTLE 只看 delete（`unsettled_deletes`），大 value 覆写不计，所以闲置分区可以无限期压着 GiB 级覆写垃圾。
-- **Scope**: 策略在 `open_tail_dead_bytes` 大（与 `gc_debt_high` 同口径）、`gc_debt` 为 0、且多个窗口不变时，建议一次 major compact（会先 flush，再推进锚点）；以锚点/边界变化与冷却控制，不能把 GC 空跑换成 compact 空跑。
-- **Acceptance**: 构造覆写垃圾压在 floor extent、无新写入的分区：Armed 策略在冷却内发出一次 compact，之后 `gc_debt` 出现并被 GC 回收；锚点无法推进（tail 仍 open）时不反复建议；消融变红。
-- `passes: false`
-
 ### BUG-ALLOC-MEMBERSHIP-CHECK-NOOP — 新 extent 分配的 stream 成员校验永远不触发（推断，未复现）
 - **Trigger** (2026-10-08 代码评审): `handle_stream_alloc_extent` 的成员校验比较的 baseline 是在 commit_length 探测 / `place_extents_with_fallback` 这些 await 之后才构造的，构造与校验之间没有 await，所以永远相等；etcd CAS 的 baseline 同样取在 await 之后。awaits 期间的并发成员变更因此被吸收。tail 已 sealed 时，同一 stream 的两次并发 alloc 都能成功，留下 `[.., T, N1, N2]`：一个 open 的 N1 卡在 stream 中间。
 - **Scope**: 先用 failpoint 卡住一次 alloc 的 await、并发再发一次 alloc 来复现；复现后把 baseline 取在第一个 await 之前（与 tail_id 同一时刻），让校验与 CAS 真正比较 await 前后。
