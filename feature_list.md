@@ -325,12 +325,6 @@
 - **Acceptance**: 复现一次回复丢失后该侧在有界时间内恢复可写；消融变红。
 - `passes: false`
 
-### F-SPLIT-PHASE1-WAIT-REASON — split 阶段 1 把三种长等待都显示成同一个 "1/6"
-- **Trigger** (2026-10-09 用户 dashboard 截图: split 2684 停在 `17% · 1 / 6 phases` 两分钟，以为 dashboard 超时): 阶段 1 里有三处可能等很久——本分区的 maintenance gate（在跑的 compaction/GC）、PS 级 compaction 名额（`--major-compact-parallelism` 默认 4，别的分区占满也排队）、没给 `--at` 时对全部 SST 用户 key 做的中位扫描。ops 表和 dashboard 只显示 1/6，分不出在等哪个。dashboard 提交本身不等 split（`autumn-op split` 不带 `--wait`，立即返回 op id）。
-- **Scope**: 先量：大分区上中位扫描的耗时，真实集群上阶段 1 的时长分布。再定：(a) 阶段 1 上报等待原因（op message 或子阶段）；(b) 中位 key 是否改从 SST 索引块估算；(c) split 是否应占 PS 级 compaction 名额。
-- **Acceptance**: `ops status` 与 dashboard 能区分三种等待；若改中位估算，给出大分区上扫描耗时的前后对比，切点误差界写明。
-- `passes: false`
-
 ### F-SPLIT-CARRIED-BYTES-UNBOUNDED — 大 value 分区可以无限长大，而现在没有任何判据会说话
 - **Trigger** (2026-09-11，本次 split 判据重设计的直接后果): 硬 size 触发器改读
   **LSM 常驻字节**(`size_bytes`)之后，一个大 value 分区的携带字节(log_stream 里的
