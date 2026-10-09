@@ -511,11 +511,12 @@ a view is linkable.
 Manual actions map to the allow-listed `autumn-op` subcommands (`split` / `gc` /
 `compact` / `merge` / `force-ec-convert` / `rebalance`).
 
-Partition ranges list `start` (inclusive) and `end` (exclusive) separately and
-wrap long keys without truncation. To check the layout, use neighboring ranges
-with a long common prefix, resize the window, and scroll to the last partition:
-both endpoints should remain complete and rows must not overlap. The detail
-drawer also wraps the full range, including escaped binary key bytes.
+Partition rows list `start` (inclusive) and `end` (exclusive) on two lines, each
+cut in the middle (`…`) to fit the column. To check the layout, use neighboring
+ranges with a long common prefix, resize the window, and scroll to the last
+partition: each endpoint shows its head and its distinguishing tail, every row
+is the same height and none overlap. Hovering a row or opening its drawer shows
+the full range, including escaped binary key bytes.
 
 The [2026-10-09 VKE fault-test report](vke-stress-20261009.md) records the
 CP revisions, live range checks, two EN outages, two manager failovers,

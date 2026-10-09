@@ -40,6 +40,10 @@ const disk = (id, extra) => Object.assign({
   disk_id: id, uuid: `uuid-${id}`, total: 3779300532224, free: 345875152896,
   extent_bytes: 12345678, reported: true, online: true, faulted: false,
 }, extra || {});
+// Two neighbouring kvc keys from a real cluster: a long shared prefix, differing
+// near both ends.
+const LONG_KEY = "kvc/dsv4-flash-ftw/kv/dsv4-P128-h512-i128-r0,0" + ",4,128".repeat(22) +
+  ",4-f880640-w17842176/4d80f016503631212681175d60a63e9f811d73ad282fc7f4aec4526ca9ea123f";
 const OVERVIEW = {
   ts: Math.floor(Date.now() / 1000),
   part_count: 2, ps_count: 2,
@@ -68,10 +72,10 @@ const OVERVIEW = {
       override_kind: "-", override_reason: "", override_set_by: "", disks: [] },
   ],
   partitions: [
-    { part_id: 1, ps_id: 1, ps_addr: "127.0.0.1:21201", range_start: "", range_end: "m",
+    { part_id: 1, ps_id: 1, ps_addr: "127.0.0.1:21201", range_start: "", range_end: LONG_KEY,
       live_size: 1048576, total_extents: 3, req_per_sec: 12,
       write_bytes_per_sec: 1048576, read_bytes_per_sec: 2097152 },
-    { part_id: 2, ps_id: 1, ps_addr: "127.0.0.1:21202", range_start: "m", range_end: "",
+    { part_id: 2, ps_id: 1, ps_addr: "127.0.0.1:21202", range_start: LONG_KEY, range_end: "",
       live_size: 0, total_extents: 3, req_per_sec: 0,
       write_bytes_per_sec: 0, read_bytes_per_sec: 0 },
   ],
@@ -176,6 +180,15 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   // Partitions: the precondition warning, before the Split button is clicked.
   want("#drawer", "Split is refused until a major compaction", "an overlapping partition warns BEFORE the click");
   want("#drawer", "Extents", "…and still shows the extents");
+  // Partition rows: each endpoint is one line, cut in the middle, so the shared
+  // prefix's start and the differing tail both show.
+  const ends = [...(nodes.spacer.innerHTML || "").matchAll(/class="range-value">([^<]*)</g)].map(m => m[1]);
+  const longEnd = ends.find(e => e.includes("…"));
+  if (ends.length !== 4 || !longEnd || !longEnd.startsWith("kvc/dsv4") || !longEnd.endsWith("ea123f")
+      || longEnd.length >= LONG_KEY.length / 4) {
+    console.error(`FAIL #spacer: a long range endpoint must be one middle-cut line, got ${JSON.stringify(ends)}`); bad++;
+  }
+  want("#spacer", `title="[${LONG_KEY}`, "…and the row title keeps the full range");
   // Policy + Logs.
   want("#advisories", "major compaction before split", "the advisory keeps its whole reason");
   want("#advisories", "PS 3 partition size imbalance", "hot/cold is rendered in operator language");

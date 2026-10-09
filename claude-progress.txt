@@ -1,3 +1,11 @@
+Date: 2026-10-09 (11)
+TaskStatus: completed
+Task scope: user — the dashboard partition list's start/end ranges were far too long (7446c62b wrapped full keys; one kvc key took ~12 lines).
+Current summary: Each endpoint is one line cut in the middle (clipKey) to the range column's width (canvas char width, minus #vp's scrollbar, one char slack); fixed ROWH 46; the variable-height layout (ROWS/rowAt) is gone. Middle, not tail, because neighbouring keys share long prefixes and differ near the end. Full range in the row title and drawer. Replaces the full-wrap layout described in entry (8). Docs: server CLAUDE.md, ops.md.
+Verification: tabs_smoke with two real kvc keys (one middle-cut line ending in the key's tail; full range in the title) — red when clipKey returns the key whole; render_check, policy_controls green. opus review: no high; scrollbar clipping the tail (M1) fixed.
+Main gaps: no browser here — not checked rendered; the node stub only exercises the fallback width. A cut can start the tail inside a \xNN escape (cosmetic).
+Next steps: look at the live page after the next dashboard deploy.
+
 Date: 2026-10-09 (10)
 TaskStatus: completed
 Task scope: pull/review, Volc CP rollout, complete dashboard ranges, and EN/manager/split/merge stress.
