@@ -2528,10 +2528,9 @@ impl crate::AutumnManager {
                     .map(|(_, l)| l.open_tail_bytes)
                     .sum()
             };
-            // Σ reclaimable dead bytes = sealed (gc_debt) +
-            // open-tail dead, across the same latest-bucket window. gc_debt is
-            // sealed-only, so adding open_tail_dead surfaces the debt a
-            // log-heavy / all-open-tail partition otherwise hides at 0.
+            // Σ reclaimable dead bytes = before the replay floor (gc_debt) +
+            // at/after it incl. the open tail (open_tail_dead), across the
+            // same latest-bucket window.
             let logical_wal_debt: u64 = {
                 let pol = self.policy.borrow();
                 pol.metrics

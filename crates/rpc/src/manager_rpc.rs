@@ -1154,8 +1154,10 @@ pub struct PartitionLoad {
     pub read_bytes_per_sec: u64,
     pub imm_full_per_sec: u32,
     pub p99_us: u32,
-    /// Σ reclaimable bytes on still-live sealed log_stream extents.
-    /// "GC debt" — rises with deletes/overwrites, drops on `punch_holes`.
+    /// Σ reclaimable bytes on sealed log_stream extents before the replay
+    /// floor — what GC may take now. "GC debt" — rises with deletes/overwrites,
+    /// drops on `punch_holes`; dead bytes at/after the floor are
+    /// `open_tail_dead_bytes`.
     pub gc_debt_bytes: u64,
     /// bytes that the next compact tick would feed into `do_compact`
     /// (overlap-tagged tables when has_overlap == 1, else
@@ -1203,13 +1205,15 @@ pub struct PartitionLoad {
     /// `autumn-op info --part` gets by probing the EN. Refreshed on the PS
     /// maintenance loop (throttled, non-blocking); 0 until first refresh.
     pub open_tail_bytes: u64,
-    /// dead (overwritten/deleted) large-value bytes on the OPEN
-    /// log_stream tail extent. `gc_debt_bytes` is sealed-only (GC can't punch
-    /// an unsealed tail), so a log-heavy / all-open-tail partition reports
-    /// `gc_debt_bytes = 0` while still holding real dead bytes here. Together
-    /// `gc_debt_bytes + open_tail_dead_bytes` is the partition's full
-    /// reclaimable WAL debt. Refreshed on the PS GC tick from the persisted SST
-    /// discard maps; 0 until the first tick.
+    /// dead WAL bytes GC cannot take yet: those in the log extents at or
+    /// after the replay floor, the open tail included (the name predates the
+    /// replay window joining it). `gc_debt_bytes` counts only the extents
+    /// before the floor, so a log-heavy / all-open-tail partition, or one whose
+    /// garbage sits in its replay window, reports `gc_debt_bytes = 0` while
+    /// holding real dead bytes here. Together `gc_debt_bytes +
+    /// open_tail_dead_bytes` is the partition's full WAL debt. Refreshed on
+    /// the PS GC tick from the persisted SST discard maps; 0 until the first
+    /// tick.
     pub open_tail_dead_bytes: u64,
     /// Mirror of the PS's `PartitionData.has_overlap`: 1 while this partition's
     /// SSTs still carry keys outside its own range (a CoW split's children
@@ -2200,13 +2204,12 @@ pub struct ClusterDfResp {
     /// `logical_stored`, this is the logical-size denominator for raw-capacity
     /// amplification. 0 until the PS reports (falls back to sealed-only).
     pub logical_open_tail: u64,
-    /// Σ reclaimable DEAD bytes across all partitions — sealed
-    /// (`PartitionLoad.gc_debt_bytes`) + open-tail
+    /// Σ reclaimable DEAD bytes across all partitions — collectable now
+    /// (`PartitionLoad.gc_debt_bytes`) + in the replay window and open tail
     /// (`PartitionLoad.open_tail_dead_bytes`). The dead fraction of the logical
     /// footprint; `physical_used` carries these bytes (they occupy replicas
-    /// until GC punches them). Previously a log-heavy partition's
-    /// open-tail dead bytes were invisible (gc_debt is sealed-only). Lets `df`
-    /// print a dead-vs-live breakdown. 0 until the PS reports.
+    /// until GC punches them). Lets `df` print a dead-vs-live breakdown. 0
+    /// until the PS reports.
     pub logical_wal_debt: u64,
     /// Online EN count — bounds the best achievable EC shape for the writable
     /// range upper bound (K = min(4, node_count-1)).

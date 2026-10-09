@@ -333,8 +333,8 @@ pub(crate) fn partition_sealed_sums(state: &MetadataState) -> HashMap<u64, u64> 
 /// ```text
 /// est_live = Σ sealed_length (3 streams, dedup'd — manager state)
 ///          + open_tail_bytes       (PS-reported)
-///          − gc_debt_bytes         (PS-reported: sealed-extent dead bytes)
-///          − open_tail_dead_bytes  (PS-reported: open-tail dead bytes)
+///          − gc_debt_bytes         (PS-reported: dead bytes before the replay floor)
+///          − open_tail_dead_bytes  (PS-reported: dead bytes at/after it, open tail incl.)
 /// ```
 ///
 /// All four components already exist — zero wire change, zero PS hot-path

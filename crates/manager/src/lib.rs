@@ -665,8 +665,8 @@ pub(crate) struct ClusterCapSnapshot {
     /// partitions (one copy). Refreshed every tick from the policy load
     /// window (cheap sum). Logical size is `logical_stored + this`.
     pub logical_open_tail: u64,
-    /// Σ reclaimable dead bytes across partitions — sealed
-    /// (`PartitionLoad.gc_debt_bytes`) + open-tail (`open_tail_dead_bytes`).
+    /// Σ reclaimable dead bytes across partitions — before the replay floor
+    /// (`PartitionLoad.gc_debt_bytes`) + at/after it (`open_tail_dead_bytes`).
     /// Refreshed every tick from the same policy load window; the dead fraction
     /// of the footprint that GC can eventually reclaim.
     pub logical_wal_debt: u64,

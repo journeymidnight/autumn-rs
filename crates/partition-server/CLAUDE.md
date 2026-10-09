@@ -552,28 +552,37 @@ refreshed every 30 s from `lsm_resident_bytes()` and 0 until the first refresh
 after open — and it is the input to the manager's hard split trigger
 (`SPLIT_LSM_HARD`), which counts only what a key-range cut actually halves.
 
-### `open_tail_dead_bytes` — WAL debt on the open tail
+### `open_tail_dead_bytes` — WAL debt GC cannot take yet
 
-`PartitionMetrics.open_tail_dead_bytes` is the dead bytes on the OPEN (last)
-`log_stream` extent: overwritten/deleted large values, plus the WAL records
-already flushed (see "Discard map"). `gc_debt_bytes` is
-SEALED-only (GC can't punch an unsealed extent), so a log-heavy / all-open-tail
-partition reports `gc_debt=0` while holding real garbage; this gauge exposes it.
-`gc_debt_bytes + open_tail_dead_bytes` is the full reclaimable WAL debt (the two
-are DISJOINT — no double-count). Shipped via `PartitionLoad.open_tail_dead_bytes`;
-the manager sums `Σ(gc_debt + open_tail_dead)` into
-`ClusterDfResp.logical_wal_debt` for `autumn-op df`. Load-bearing:
-- DERIVED each GC tick via `open_tail_dead_bytes(discards, extent_ids)` (=
-  `discards[extent_ids.last()]`) from already-persisted SST discard maps — not a
-  bespoke counter, so it survives restart exactly like `gc_debt` with zero
-  write-path cost.
+`gc_debt_bytes` and `PartitionMetrics.open_tail_dead_bytes` split the log's
+dead bytes (overwritten/deleted large values, plus the WAL records already
+flushed — see "Discard map") at the replay floor the punch guard uses
+(`effective_replay_floor`: the MIN over SST vp_heads raised to the durable
+checkpoint cursor; `split_at_replay_floor`). Before the floor is debt; the
+floor extent, everything after it and the open tail are `open_tail_dead_bytes`
+(the name is older than the replay window joining it; renaming is a wire
+change). The two are DISJOINT and sum to every dead byte, so the manager's
+`Σ(gc_debt + open_tail_dead)` (`ClusterDfResp.logical_wal_debt`, `autumn-op
+df`) and `est_live` are unchanged by where the floor sits.
+
+Why the floor and not "sealed": the floor extent and the extents after it are
+replayed on reopen, so GC refuses them. Counted as debt, they made the advisory
+dispatch a GC that answered "no eligible extents to reclaim" every cooldown
+(#1367: 5.24 GiB on the replay-start extent). They become debt once a flush or
+a compaction moves the cursor past them. Load-bearing:
+- DERIVED each GC tick from already-persisted SST discard maps — not a bespoke
+  counter, so it survives restart exactly like `gc_debt` with zero write-path
+  cost.
 - Refreshed BEFORE the `extent_ids.len() < 2` gate in BOTH the `Sel::GcRecv` and
   `Sel::GcTimeout` paths — the all-open-tail case has a SINGLE log extent and
   would skip the gate, so a gate-gated refresh would leave it 0 exactly where it
   matters most.
 - The `<2`-extent early exits also store `gc_debt_bytes = 0` (no sealed prefix ⇒
   no debt) so a GC-reclaimed-to-one-extent partition doesn't leave stale
-  sealed-debt inflating `logical_wal_debt`.
+  debt inflating `logical_wal_debt`.
+- `crates/manager/tests/system_gc_debt_replay_floor.rs` (a protected floor
+  extent's garbage reported as `open_tail_dead`, then as debt once the cursor
+  moves; red when split at the tail), `background::wal_debt_tests`.
 
 ## Read Path: Get
 
@@ -1359,8 +1368,11 @@ is exactly why the basis it reads has to agree with selection (below).
    - Else multi-tier filter: skip if `empty_only`; skip if `max_size` set and
      `sealed_length > max_size`; then `gc_selects(dead, sealed_length, refs,
      effective_ratio, dead_bytes_high)` decides. `effective_ratio` starts at
-     `params.ratio` (default `GC_DISCARD_RATIO`), halved when the stream's total
-     discard ≥ the `stream_debt` high-water.
+     `params.ratio` (default `GC_DISCARD_RATIO`), halved when the stream's
+     discard before the replay floor ≥ the `stream_debt` high-water. Before
+     the floor, not all of it: the manager fills `stream_debt` from the same
+     `gc_debt_high` the advisory fires on, and the advisory reads `gc_debt`,
+     which is pre-floor — the relief pairs with the number that asked for it.
 
      `gc_selects` is the ONE definition of "will GC take this", shared with
      `collectable_debt` — the gauge the advisory fires on. EVERY writer of
@@ -1411,10 +1423,12 @@ is exactly why the basis it reads has to agree with selection (below).
      latching it off a dispatch. A basis TTL would be hardening against a state
      we cannot produce.
 
-     Agreement holds at the SELECTION predicate only. Two gates run AFTER it and
-     are invisible to the gauge: the replay-floor guard and the per-extent
-     failure cooldown. So "no eligible extents to reclaim" can still coexist
-     with a non-zero gauge — the over-report direction, bounded by the cooldown.
+     Agreement holds at the SELECTION predicate and at the replay floor: the
+     gauge sees only discards before the floor (`split_at_replay_floor`), the
+     same extents the punch guard allows. One gate runs AFTER both and is
+     invisible to the gauge: the per-extent failure cooldown. So "no eligible
+     extents to reclaim" can still coexist with a non-zero gauge — the
+     over-report direction, bounded by the cooldown.
 
      Selection and the gauge used to be two separate expressions and they
      disagreed: the advisory fired on absolute
@@ -2432,7 +2446,8 @@ Three fixes bound the restart replay window (worst case per partition =
     the `PartitionHandle` on the main thread; `report_load_loop` (5 s) snapshots all live
     handles, computes /sec rates, ships `ReportPartitionLoadReq`. Maintenance-debt gauges
     on the same struct feed `compute_maintenance_advisory`: `gc_debt_bytes` (refreshed
-    each GC tick from `Σ(get_discards filtered to live sealed log extents)`),
+    each GC tick from `get_discards` before the replay floor — see
+    "`open_tail_dead_bytes`"),
     `pending_compaction_bytes` (each compact tick: total SST bytes if `has_overlap==1`,
     else `pickup_tables` output), `gc_inflight` / `compact_inflight` (0/1 around the
     awaits), `last_gc_at` / `last_compact_at` (unix-epoch, drives per-kind cooldown),

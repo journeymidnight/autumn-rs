@@ -231,8 +231,8 @@ ValuePointer 里的负载，① 是一个缩小几十倍的影子。
 ```
 est_live = Σ sealed_length(三条 stream, 去重)   # manager 状态
          + open_tail_bytes                      # PS 上报
-         − gc_debt_bytes                        # PS 上报（sealed 死字节）
-         − open_tail_dead_bytes                 # PS 上报（open tail 死字节）
+         − gc_debt_bytes                        # PS 上报（replay floor 之前的死字节）
+         − open_tail_dead_bytes                 # PS 上报（floor 及之后、含 open tail 的死字节）
 
 effective = max(size_bytes, est_live)
 ```

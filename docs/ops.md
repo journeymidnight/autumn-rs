@@ -1038,14 +1038,22 @@ else touches them.
 incl. open-tail)` and, in `--json`, `logical_wal_debt` + `wal_debt_ratio`. This is
 the reclaimable garbage in `log_stream` — large values that were overwritten by a
 newer version or deleted, still occupying replicas until GC punches them. It is
-`Σ (sealed-extent dead + OPEN-tail dead)` across partitions:
+`Σ (gc_debt + open-tail dead)` across partitions, split at each partition's
+replay floor:
 
-- **sealed-extent dead** = each partition's `gc_debt_bytes` (already tracked).
-- **open-tail dead** = the discard-map entry for the current OPEN log tail, which
-  `gc_debt_bytes` excludes because GC can't punch an unsealed extent. Previously
-  a log-heavy / all-open-tail partition (data entirely in one open log tail) showed
-  `gc_debt = 0` and looked debt-free even when holding GBs of overwritten garbage;
-  `df` now surfaces it.
+- **`gc_debt_bytes`** = dead bytes in sealed log extents strictly before the
+  replay floor: what GC may take now, and what the GC advisory fires on.
+- **`open_tail_dead_bytes`** = dead bytes in the floor extent, the extents after
+  it and the open tail. Recovery replays them, so GC refuses them; they move to
+  `gc_debt` once a flush or a compaction moves the checkpoint past them. A
+  partition whose garbage sits there shows `gc_debt = 0` and is still counted
+  here. (Before, that garbage was `gc_debt`, the advisory dispatched GC, and GC
+  answered "no eligible extents to reclaim" every cooldown.)
+
+Check one partition: `autumn-op --json info --part P --detail` shows both
+gauges; with a large `open_tail_dead_bytes` and `gc_debt_bytes = 0`, run
+`autumn-op compact P` (a major compaction flushes, then moves the checkpoint
+off a sealed extent's end) and the bytes become debt on the next GC tick.
 
 Both are DERIVED each PS GC tick from the persisted SST discard maps (no bespoke
 counter, no write-path cost) so they survive PS restart exactly like `gc_debt`.

@@ -1293,43 +1293,6 @@ pub(crate) async fn background_maintenance_loop(
                     }
                 };
                 let extent_ids = stream_info.extent_ids;
-                // refresh the open-tail dead-byte gauge from the
-                // (already-persisted) SST discard maps BEFORE the <2-extent gate.
-                // A log-heavy / all-open-tail partition — the exact case this
-                // metric exists for — commonly has a SINGLE log extent (the open
-                // tail), which continues below and would NEVER refresh if we
-                // waited for the sealed-extent GC path. Computed once here and
-                // reused for gc_debt below (get_discards is snapshot-deterministic).
-                let mut tick_discards = get_discards(&readers_snapshot);
-                metrics.open_tail_dead_bytes.store(
-                    open_tail_dead_bytes(&tick_discards, &extent_ids),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                if extent_ids.len() < 2 {
-                    // No sealed extents (only the open tail, or none) ⇒ sealed-only
-                    // gc_debt is definitionally 0. Store it (don't leave the last
-                    // ≥2-extent value stale): the manager now sums gc_debt into
-                    // `logical_wal_debt` for df, and a partition GC-reclaimed down
-                    // to one extent would otherwise over-report debt forever (and
-                    // keep the urgency scheduler re-dispatching a no-op GC).
-                    metrics
-                        .gc_debt_bytes
-                        .store(0, std::sync::atomic::Ordering::Relaxed);
-                    record_maint_outcome(
-                        &metrics,
-                        gc_op_id,
-                        gc_kind,
-                        manager_rpc::OP_STATE_SUCCEEDED,
-                        String::new(),
-                        "no sealed extents to reclaim".to_string(),
-                    );
-                    stamp_last_gc();
-                    clear_inflight(&metrics);
-                    continue;
-                }
-
-                let sealed_extents = &extent_ids[..extent_ids.len() - 1];
-
                 // WAL replay-floor guard: GC must NEVER punch a log extent
                 // at/after the floor — recovery replays the log_stream from there
                 // forward, so punching it drops records recovery needs (un-flushed
@@ -1341,8 +1304,6 @@ pub(crate) async fn background_maintenance_loop(
                 // checkpoint recovery loads, so this floor == recovery's chosen_pos.
                 // (Flush only ADDS forward-vp_head SSTs, which never lower the min.)
                 // See `gc_replay_floor` for the first-occurrence / floor-0 details.
-                let (mut replay_floor_pos, pos_by_eid) =
-                    gc_replay_floor(&extent_ids, readers_snapshot.iter().map(|r| r.vp_extent_id));
 
                 // BUG2: raise the floor to the newest
                 // DURABLY-ACKed flush checkpoint vp. The MIN-over-SST-vps floor
@@ -1369,15 +1330,65 @@ pub(crate) async fn background_maintenance_loop(
                 // NEVER substitute an in-memory value (p.vp_*, MAX over
                 // readers_snapshot vp_heads): see the `durable_ckpt_vp` field doc.
                 let (dv_eid, _dv_off) = part.borrow().durable_ckpt_vp.get();
-                replay_floor_pos =
-                    gc_floor_raise_to_durable_ckpt(replay_floor_pos, &pos_by_eid, dv_eid);
+                let (replay_floor_pos, pos_by_eid) = effective_replay_floor(
+                    &extent_ids,
+                    readers_snapshot.iter().map(|r| r.vp_extent_id),
+                    dv_eid,
+                );
 
-                // refresh gc_debt_bytes from the sealed-only discards.
-                // `tick_discards` was computed once before the gate (and already
-                // yielded open_tail_dead_bytes); filter it to sealed extents in
-                // place so gc_debt covers still-live SEALED log_stream extents.
-                // The open tail's dead bytes were counted above (as WAL debt),
-                // so the two gauges stay disjoint (no double-count).
+                // refresh the replay-window dead-byte gauge from the
+                // (already-persisted) SST discard maps BEFORE the <2-extent gate.
+                // A log-heavy / all-open-tail partition — the exact case this
+                // metric exists for — commonly has a SINGLE log extent (the open
+                // tail), which continues below and would NEVER refresh if we
+                // waited for the sealed-extent GC path. What stays in
+                // `tick_discards` is the gc_debt basis below.
+                let mut tick_discards = get_discards(&readers_snapshot);
+                let protected_dead =
+                    split_at_replay_floor(&mut tick_discards, &pos_by_eid, replay_floor_pos);
+                metrics
+                    .open_tail_dead_bytes
+                    .store(protected_dead, std::sync::atomic::Ordering::Relaxed);
+                if extent_ids.len() < 2 {
+                    // No sealed extents (only the open tail, or none) ⇒ sealed-only
+                    // gc_debt is definitionally 0. Store it (don't leave the last
+                    // ≥2-extent value stale): the manager now sums gc_debt into
+                    // `logical_wal_debt` for df, and a partition GC-reclaimed down
+                    // to one extent would otherwise over-report debt forever (and
+                    // keep the urgency scheduler re-dispatching a no-op GC).
+                    metrics
+                        .gc_debt_bytes
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        "no sealed extents to reclaim".to_string(),
+                    );
+                    stamp_last_gc();
+                    clear_inflight(&metrics);
+                    continue;
+                }
+
+                let sealed_extents = &extent_ids[..extent_ids.len() - 1];
+                // Auto GC never selects these (no debt), so the punch guard's
+                // hint below no longer fires for them: say it here.
+                if protected_dead > 0 {
+                    tracing::info!(
+                        part_id,
+                        protected_dead,
+                        floor_extent = extent_ids.get(replay_floor_pos).copied().unwrap_or(0),
+                        "GC: dead bytes in the replay window are not collectable until a \
+                         flush or compaction moves the checkpoint past them"
+                    );
+                }
+
+                // refresh gc_debt_bytes from the discards before the replay
+                // floor. `tick_discards` was split at the floor before the gate
+                // (the rest went to open_tail_dead_bytes), so the two gauges
+                // stay disjoint (no double-count).
                 //
                 // Answer with the standing policy, exactly like the other two
                 // stores. This one runs on EVERY dispatch and the Force path
@@ -1387,7 +1398,6 @@ pub(crate) async fn background_maintenance_loop(
                 // Before any standing policy has arrived it degrades to the raw
                 // sum: over-reporting can ask for work that will not qualify,
                 // but it cannot hide work that does.
-                valid_discard(&mut tick_discards, sealed_extents);
                 let gc_debt = {
                     let p = part.borrow();
                     let basis = p.gc_debt_basis.borrow();
@@ -1810,22 +1820,27 @@ pub(crate) async fn background_maintenance_loop(
                 };
                 if let Ok(stream_info) = part_sc.get_stream_info(log_stream_id).await {
                     let extent_ids = stream_info.extent_ids;
+                    // The same floor the dispatch path splits at.
+                    let (dv_eid, _) = part.borrow().durable_ckpt_vp.get();
+                    let (floor, pos_by_eid) = effective_replay_floor(
+                        &extent_ids,
+                        readers_snapshot.iter().map(|r| r.vp_extent_id),
+                        dv_eid,
+                    );
                     let mut discards = get_discards(&readers_snapshot);
-                    // refresh open-tail dead bytes on EVERY periodic
+                    // refresh the replay-window dead bytes on EVERY periodic
                     // tick, regardless of extent count — this is the idle-refresh
                     // path (no GC dispatched), and an all-open-tail partition with a
-                    // single log extent would otherwise never update it. `discards`
-                    // is reused for gc_debt below (one get_discards per tick).
+                    // single log extent would otherwise never update it. What stays
+                    // in `discards` is the gc_debt basis below.
                     metrics.open_tail_dead_bytes.store(
-                        open_tail_dead_bytes(&discards, &extent_ids),
+                        split_at_replay_floor(&mut discards, &pos_by_eid, floor),
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     // Always store gc_debt (0 when there is no sealed prefix) so a
                     // partition reclaimed down to one extent doesn't leave a stale
                     // sealed-debt inflating the manager's `logical_wal_debt`.
                     let gc_debt: u64 = if extent_ids.len() >= 2 {
-                        let sealed = &extent_ids[..extent_ids.len() - 1];
-                        valid_discard(&mut discards, sealed);
                         // Answer with the SAME predicate selection uses, from the
                         // basis the last selection pass resolved. Before the first
                         // dispatch there is none, and this degrades to the raw sum
@@ -3536,20 +3551,42 @@ pub(crate) fn valid_discard(discards: &mut HashMap<u64, i64>, extent_ids: &[u64]
     discards.retain(|eid, _| idx.contains(eid));
 }
 
-/// dead bytes on the OPEN (last) log extent, read from the
-/// aggregated discard map. This is precisely the entry `gc_debt` EXCLUDES —
-/// `valid_discard(sealed_extents)` filters to `extent_ids[..len-1]`, dropping
-/// the tail — so `gc_debt_bytes` (sealed) and this (open) are DISJOINT and sum
-/// to the partition's full reclaimable WAL debt. Rides the already-persisted
-/// SST discard maps, so it needs no bespoke counter and survives restart
-/// exactly like `gc_debt`. Returns 0 when the tail has no discard entry (all
-/// live) or there is no extent.
-pub(crate) fn open_tail_dead_bytes(discards: &HashMap<u64, i64>, extent_ids: &[u64]) -> u64 {
-    extent_ids
-        .last()
-        .and_then(|eid| discards.get(eid))
-        .map(|v| (*v).max(0) as u64)
-        .unwrap_or(0)
+/// The floor GC punches by: the MIN over the live SSTs' vp_heads
+/// (`gc_replay_floor`), raised to the durable checkpoint cursor
+/// (`gc_floor_raise_to_durable_ckpt`). The debt gauges are split at the same
+/// floor, so they never count bytes the punch guard refuses.
+pub(crate) fn effective_replay_floor(
+    extent_ids: &[u64],
+    sst_vp_heads: impl IntoIterator<Item = u64>,
+    durable_vp_eid: u64,
+) -> (usize, HashMap<u64, usize>) {
+    let (floor, pos_by_eid) = gc_replay_floor(extent_ids, sst_vp_heads);
+    let floor = gc_floor_raise_to_durable_ckpt(floor, &pos_by_eid, durable_vp_eid);
+    (floor, pos_by_eid)
+}
+
+/// Keeps in `discards` only the extents strictly before the replay floor —
+/// what GC may take, the basis of `gc_debt_bytes` — and returns the dead
+/// bytes at or after it, the open tail included: `open_tail_dead_bytes`, WAL
+/// garbage GC cannot take yet. Extents gone from the stream are dropped. The
+/// two never overlap and together are every dead byte of the log. Counting
+/// the replay window as debt made the advisory dispatch a GC the punch guard
+/// then refused, every cooldown ("no eligible extents to reclaim").
+pub(crate) fn split_at_replay_floor(
+    discards: &mut HashMap<u64, i64>,
+    pos_by_eid: &HashMap<u64, usize>,
+    floor: usize,
+) -> u64 {
+    let mut protected = 0u64;
+    discards.retain(|eid, dead| match pos_by_eid.get(eid) {
+        Some(&pos) if pos < floor => true,
+        Some(_) => {
+            protected += (*dead).max(0) as u64;
+            false
+        }
+        None => false,
+    });
+    protected
 }
 
 // ---------------------------------------------------------------------------
@@ -5382,46 +5419,39 @@ mod lookup_block_boundary_tests {
 
 #[cfg(test)]
 mod wal_debt_tests {
-    //! the open-tail dead-byte extraction must read exactly the
-    //! LAST log extent's discard and stay DISJOINT from `gc_debt` (which
-    //! `valid_discard` restricts to the sealed prefix). If these ever
-    //! double-count or the open tail leaks into gc_debt, df's debt figure is
-    //! wrong.
-    use super::{open_tail_dead_bytes, valid_discard};
+    //! The debt gauges are split at the replay floor the punch guard uses:
+    //! `gc_debt` only before it, `open_tail_dead_bytes` at/after it (open tail
+    //! included). Disjoint, and together every dead byte of the log.
+    use super::{effective_replay_floor, split_at_replay_floor};
     use std::collections::HashMap;
 
-    #[test]
-    fn open_tail_dead_is_last_extent_discard() {
-        // extents [10, 20, 30]; 30 is the open tail.
-        let discards = HashMap::from([(10u64, 100i64), (20, 200), (30, 500)]);
-        let extent_ids = [10u64, 20, 30];
-        assert_eq!(open_tail_dead_bytes(&discards, &extent_ids), 500);
+    fn split(discards: &[(u64, i64)], extent_ids: &[u64], ssts: &[u64], durable: u64) -> (u64, u64) {
+        let mut d: HashMap<u64, i64> = discards.iter().copied().collect();
+        let (floor, pos) = effective_replay_floor(extent_ids, ssts.iter().copied(), durable);
+        let protected = split_at_replay_floor(&mut d, &pos, floor);
+        (d.values().map(|v| (*v).max(0) as u64).sum(), protected)
     }
 
     #[test]
-    fn open_tail_dead_and_gc_debt_are_disjoint_no_double_count() {
-        let all = HashMap::from([(10u64, 100i64), (20, 200), (30, 500)]);
-        let extent_ids = [10u64, 20, 30];
-        let open = open_tail_dead_bytes(&all, &extent_ids);
-        // gc_debt = sealed prefix only (drops the open tail 30).
-        let mut sealed = all.clone();
-        valid_discard(&mut sealed, &extent_ids[..extent_ids.len() - 1]);
-        let gc_debt: u64 = sealed.values().map(|v| (*v).max(0) as u64).sum();
-        assert_eq!(open, 500);
-        assert_eq!(gc_debt, 300); // 100 + 200, NOT the tail's 500
-        assert_eq!(open + gc_debt, 800); // full WAL debt, each byte once
+    fn the_floor_extent_and_everything_after_it_are_not_debt() {
+        // Floor at 20 (durable cursor): 10 is collectable, 20 and the tail 30 are not.
+        let d = [(10u64, 100i64), (20, 200), (30, 500)];
+        assert_eq!(split(&d, &[10, 20, 30], &[10], 20), (100, 700));
+        // Floor at the tail: only the tail is protected.
+        assert_eq!(split(&d, &[10, 20, 30], &[10], 30), (300, 500));
     }
 
     #[test]
-    fn open_tail_dead_zero_when_tail_all_live_or_absent() {
-        // Tail 30 has no discard entry (all live) → 0.
-        let discards = HashMap::from([(10u64, 100i64)]);
-        assert_eq!(open_tail_dead_bytes(&discards, &[10u64, 20, 30]), 0);
-        // No extents at all → 0.
-        assert_eq!(open_tail_dead_bytes(&discards, &[]), 0);
-        // Negative (over-counted) discard clamps to 0, never underflows u64.
-        let neg = HashMap::from([(30u64, -50i64)]);
-        assert_eq!(open_tail_dead_bytes(&neg, &[10u64, 30]), 0);
+    fn with_no_cursor_resolving_everything_is_protected() {
+        // Floor 0: GC may take no non-empty extent, so none of it is debt.
+        let d = [(10u64, 100i64), (20, 200)];
+        assert_eq!(split(&d, &[10, 20], &[], 0), (0, 300));
+    }
+
+    #[test]
+    fn extents_gone_from_the_log_count_nowhere_and_negatives_clamp() {
+        let d = [(7u64, 900i64), (10, 100), (30, -50)];
+        assert_eq!(split(&d, &[10, 20, 30], &[20], 0), (100, 0));
     }
 }
 

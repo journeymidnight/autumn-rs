@@ -1629,9 +1629,10 @@ pub struct PartitionMetrics {
     /// the already-persisted SST discard maps (no extra RPC, no write-path
     /// cost). Survives restart because it rides the meta_stream checkpoint,
     /// exactly like `gc_debt_bytes` — it is DERIVED each tick, never a bespoke
-    /// counter to persist. For a log-heavy / all-open-tail partition
-    /// `gc_debt_bytes` is 0 while this exposes the real WAL debt. Shipped via
-    /// `report_load_loop`; 0 until the first GC tick.
+    /// counter to persist. Dead bytes at/after the replay floor, open tail
+    /// included (`split_at_replay_floor`): GC cannot take them yet, so they
+    /// are not `gc_debt_bytes`. Shipped via `report_load_loop`; 0 until the
+    /// first GC tick.
     pub open_tail_dead_bytes: std::sync::atomic::AtomicU64,
     /// bytes of SSTable data that compaction would consume on its
     /// next pass — sum of (head-extent table sizes when head-ratio < 30 %)
@@ -2155,8 +2156,8 @@ pub(crate) struct GcAutoParams {
     /// say "punch small extents at even 10% dead". `None` → no upper
     /// bound.
     pub max_size: Option<u64>,
-    /// Whole-stream dead-byte high-water hint. When the stream's total
-    /// reclaimable bytes exceed this, the per-extent ratio is halved
+    /// Whole-stream dead-byte high-water hint. When the stream's reclaimable
+    /// bytes (before the replay floor) exceed this, the per-extent ratio is halved
     /// (so 0.4 → 0.2 etc.) for this dispatch. `None` → no relaxation.
     pub stream_debt: Option<u64>,
     /// Per-extent ABSOLUTE dead-byte floor: an extent with at least this many

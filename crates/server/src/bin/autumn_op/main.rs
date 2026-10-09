@@ -1003,10 +1003,9 @@ async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
         .unwrap_or(0);
     let snap_age = now_ms.saturating_sub(r.last_update_ms) / 1000;
     let logical_age = now_ms.saturating_sub(r.logical_last_update_ms) / 1000;
-    // dead (reclaimable) fraction of the footprint = sealed
-    // gc_debt + open-tail dead bytes. Earlier, a log-heavy /
-    // all-open-tail partition's open-tail debt was invisible (df only had
-    // sealed gc_debt). physical_used carries these bytes until GC punches them.
+    // dead (reclaimable) fraction of the footprint = gc_debt (before the
+    // replay floor) + open-tail dead (at/after it). physical_used carries
+    // these bytes until GC punches them.
     let wal_debt_ratio = if logical_size > 0 {
         r.logical_wal_debt as f64 / logical_size as f64
     } else {
