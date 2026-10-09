@@ -6979,10 +6979,9 @@ async fn partition_thread_main(
             // Every accepted connection belongs to this partition instance.
             // On reload it must close too: otherwise its req_tx/part clones
             // keep the retired, frozen partition serving stale responses.
-            // Dropping `close_connections` (same thread) closes them.
+            // `close_connections.cancel()` (same thread) closes them.
             let mut shutdown_rx = shutdown_rx;
-            let (close_connections, connections_closed) = oneshot::channel::<()>();
-            let connections_closed = connections_closed.shared();
+            let close_connections = compio::runtime::CancelToken::new();
             use futures::future::{select, Either};
             loop {
                 // Race accept against shutdown. `shutdown_rx.await`
@@ -7004,7 +7003,7 @@ async fn partition_thread_main(
                         let req_tx_conn = req_tx_for_accept.clone();
                         let part_conn = part_for_accept.clone();
                         let authz_conn = authz_for_accept.clone();
-                        let connection_shutdown = connections_closed.clone();
+                        let connection_shutdown = close_connections.clone().wait();
                         compio::runtime::spawn(async move {
                             let serving = handle_ps_connection(
                                 conn,
@@ -7030,7 +7029,7 @@ async fn partition_thread_main(
                     }
                 }
             }
-            drop(close_connections);
+            close_connections.cancel();
             tracing::info!(part_id, "accept task exiting");
         });
     }

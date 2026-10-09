@@ -2831,9 +2831,12 @@ settings remain unchanged. The binary can opt into prepared-replica TCP zerocopy
 
 Closing PartitionHandle ends both the listener and its existing connection
 tasks, releasing their req_tx and PartitionData references. Only the accept
-task waits on the handle's cross-thread `shutdown_rx`; when it exits it drops a
-local oneshot whose shared receiver every accepted connection awaits, so the
-connections are woken from the partition thread itself.
+task waits on the handle's cross-thread `shutdown_rx`; when it exits it cancels
+a `compio::runtime::CancelToken` whose `wait()` every accepted connection
+awaits, so the connections are woken from the partition thread itself. The
+token is single-thread by construction (`Rc`, an unsync event): the right
+primitive for a one-to-many signal inside one runtime, where `futures::Shared`
+(an `Arc` and a `Mutex` of wakers) is built for crossing threads.
 
 This is load-bearing. A wake from another thread goes through compio's
 cross-thread queue, an `ArrayQueue` of `sync_queue_size` (64) whose producer
@@ -2850,8 +2853,10 @@ required on merge/reload: a connection left alive would keep serving the old
 frozen partition even after the manager published a new epoch. Client pools
 now retain healthy connections after status refusals, so teardown must be
 owned by the retiring partition rather than happen accidentally via client
-reconnection. The shared shutdown future is polled first when both it and the
-connection are ready. Normal request processing adds no per-request RPC.
+reconnection. The token's `wait()` future is polled first when both it and the
+connection are ready. The token signals on `cancel()`, not on drop: an early
+exit from the accept task that skips the cancel would leave the connections
+open (the reload test goes red). Normal request processing adds no per-request RPC.
 Manager's system_status_connection_reuse covers the merge/reopen window while
 an SDK client keeps its pre-merge connection and routing cache.
 
