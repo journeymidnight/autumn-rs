@@ -517,6 +517,11 @@ with a long common prefix, resize the window, and scroll to the last partition:
 both endpoints should remain complete and rows must not overlap. The detail
 drawer also wraps the full range, including escaped binary key bytes.
 
+The [2026-10-09 VKE fault-test report](vke-stress-20261009.md) records the
+CP revisions, live range checks, two EN outages, two manager failovers,
+split/merge outcomes, and full acknowledged-data readback. It also describes
+the reproduced standby-promotion heartbeat bug and its isolated comparison.
+
 **Manual check of the two tabs that exist for facts a roll-up cannot carry:**
 
 ```bash
