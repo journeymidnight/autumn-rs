@@ -2698,7 +2698,9 @@ pub struct OpQueryResp {
 // Admin connection (`version_hello::Negotiated::check_opcode` refuses them on a
 // Peer one). An Admin connection is one that proved the cluster secret
 // (`peer_auth`), so this list is the whole gate: there is no separate admin
-// token. Not the read/observability ops (info/df/list-nodes/…).
+// token. Not the read/observability ops (info/df/list-nodes/…), except the
+// auto-policy pair: its GET reads only what its SET writes, and both are the
+// operator's (autumn-op, the dashboard through it); no PS or EN sends them.
 
 /// True for the manager ops only an Admin connection may send.
 #[inline]
@@ -2721,6 +2723,8 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_NAMESPACE_CREATE
             | MSG_NAMESPACE_DELETE
             | MSG_NAMESPACE_SET_PRESPLIT
+            | MSG_AUTOPOLICY_GET
+            | MSG_AUTOPOLICY_SET
     )
     // MSG_REGISTER_NODE is NOT listed: the EXTENT NODE self-registers with it
     // over its Peer connection at startup and after a manager restart

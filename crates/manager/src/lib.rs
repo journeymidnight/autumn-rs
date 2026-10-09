@@ -1825,9 +1825,9 @@ impl AutumnManager {
 
     /// Apply an `AutoPolicySet` op (SET_MODE / SET_ACTIVE / UPSERT / DELETE),
     /// persist the new config to etcd, and echo the resulting state. Leader-only
-    /// (the etcd write is leader-fenced; a follower fails NotLeader). Shared by the
-    /// `MSG_AUTOPOLICY_SET` handler, the dashboard `/api/policies/*`, and
-    /// `autumn-op auto-policy`.
+    /// (the etcd write is leader-fenced; a follower fails NotLeader). Reached only
+    /// through the Admin-only `MSG_AUTOPOLICY_SET` (`autumn-op auto-policy`, which
+    /// the dashboard's `/api/policies/*` call).
     pub(crate) async fn autopolicy_set(
         &self,
         op: u8,

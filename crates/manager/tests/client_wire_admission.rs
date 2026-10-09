@@ -70,3 +70,34 @@ fn manager_checks_client_interval_and_exact_internal_wire() {
         assert_eq!(RpcError::decode_status(&frame.payload).0, StatusCode::PermissionDenied);
     });
 }
+
+/// A PS or EN (Peer) cannot read or change the auto-policy; an operator
+/// (Admin) can. Ablation: dropping the pair from `is_admin_mgr_msg` lets the
+/// Peer arm a policy.
+#[test]
+fn only_an_operator_controls_the_auto_policy() {
+    let addr: SocketAddr = format!("127.0.0.1:{}", pick_stable_port_pair()).parse().unwrap();
+    start_manager(addr);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let arm = || {
+            rkyv_encode(&AutoPolicySetReq {
+                op: AUTOPOLICY_OP_SET_MODE,
+                mode: 2,
+                name: String::new(),
+                entry: None,
+            })
+        };
+        let (mut rd, mut wr) = open(addr, Hello::current(Role::Peer)).await.unwrap();
+        for (op, payload) in [(MSG_AUTOPOLICY_SET, arm()), (MSG_AUTOPOLICY_GET, rkyv_encode(&AutoPolicyGetReq {}))] {
+            let frame = call(&mut rd, &mut wr, op, payload).await;
+            assert!(frame.is_error(), "a Peer reached opcode {op:#x}");
+            assert_eq!(RpcError::decode_status(&frame.payload).0, StatusCode::PermissionDenied);
+        }
+        let (mut rd, mut wr) = open(addr, Hello::current(Role::Admin)).await.unwrap();
+        let frame = call(&mut rd, &mut wr, MSG_AUTOPOLICY_GET, rkyv_encode(&AutoPolicyGetReq {})).await;
+        assert!(!frame.is_error());
+        let st: AutoPolicyGetResp = rkyv_decode(&frame.payload).unwrap();
+        assert_eq!(st.code, CODE_OK, "{}", st.message);
+        assert_eq!(st.mode, 0, "the Peer's SET never ran");
+    });
+}

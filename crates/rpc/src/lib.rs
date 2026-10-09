@@ -341,6 +341,9 @@ mod admin_op_tests {
         assert!(is_admin_mgr_msg(MSG_NAMESPACE_CREATE));
         assert!(is_admin_mgr_msg(MSG_NAMESPACE_DELETE));
         assert!(is_admin_mgr_msg(MSG_NAMESPACE_SET_PRESPLIT));
+        // Auto-policy control is the operator's, its read included.
+        assert!(is_admin_mgr_msg(MSG_AUTOPOLICY_SET));
+        assert!(is_admin_mgr_msg(MSG_AUTOPOLICY_GET));
         // MULTI_MODIFY_SPLIT is PS-driven.
         assert!(!is_admin_mgr_msg(MSG_MULTI_MODIFY_SPLIT));
         // Read-only inspection is not.

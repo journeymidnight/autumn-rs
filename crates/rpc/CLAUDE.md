@@ -487,7 +487,8 @@ Tests: `shard_for_extent_tests`.
 
 `is_admin_mgr_msg(msg_type)` is the set of manager ops served only on an Admin
 connection (fence/remove/maintenance/EC/create-stream/upsert-partition/merge/
-op-submit, and the principal/namespace mutations). `check_opcode` refuses them
+op-submit, the principal/namespace mutations, and the auto-policy GET/SET pair,
+read included). `check_opcode` refuses them
 on a Peer connection; an Admin connection exists only after PEER_AUTH, so this
 list is the whole gate — no token rides in any request. `MSG_REGISTER_NODE` is
 deliberately not on it (the EN self-registers over its Peer connection), nor is
@@ -906,7 +907,9 @@ Every service and embedded client must be rebuilt together for wire 44.
 `AutoPolicyLogEntry` and `AutoPolicyGetResp.log` are removed: the log held
 only what an observing (DryRun) policy would run, and that mode is gone.
 `MgrAutoPolicyConfig.mode` keeps its byte values (0 off, 2 armed; 1 refused).
-Admin only: the ceiling rises to [43, 60], the floor stays.
+`MSG_AUTOPOLICY_GET` / `MSG_AUTOPOLICY_SET` join `is_admin_mgr_msg`: a Peer
+(PS/EN) connection could send them before. Admin only: the ceiling rises to
+[43, 60], the floor stays.
 
 ## Principal admin ops, ownerless namespaces (wire 59)
 

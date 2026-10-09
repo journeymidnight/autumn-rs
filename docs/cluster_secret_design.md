@@ -72,7 +72,7 @@ manager，就能让每个连它的进程退出。
 
 manager 上只有 Admin 连接能发的 opcode 是 `manager_rpc::is_admin_mgr_msg` 这张表
 （fence / remove / maintenance / EC / create-stream / upsert-partition / merge /
-op-submit / principal / namespace / set-presplit）；Peer 连接发这些会被
+op-submit / principal / namespace / set-presplit / auto-policy 的 GET 与 SET）；Peer 连接发这些会被
 `check_opcode` 拒绝。Admin 连接必须先过 PEER_AUTH，所以这张表就是全部的门，
 请求体里不再携带任何 token。PS 上的 split / maintenance 不在客户端接口内，只有
 Peer / Admin 连接能发，同样由 PEER_AUTH 把关。

@@ -243,7 +243,8 @@ leaderless-routing note below.
 
 **Operator-only ops.** `autumn_rpc::manager_rpc::is_admin_mgr_msg` lists the ops
 served only on an Admin connection (cluster mutations, principal and namespace
-admin); `check_opcode` refuses them on a Peer connection, and an Admin
+admin, and the auto-policy GET/SET pair, its read included — no PS or EN has a
+use for it); `check_opcode` refuses them on a Peer connection, and an Admin
 connection must have proved the cluster secret (PEER_AUTH). There is no admin
 token: handlers take the bare request. The manager's own split / flush / gc
 calls to a PS go out over its Peer connection, authenticated the same way.

@@ -106,7 +106,7 @@ AO=(autumn-op --cluster-secret-file "$DR/cluster.secret" --manager 127.0.0.1:900
 ```
 
 The admin token is gone: operator-only manager RPCs (fence / remove / merge /
-bootstrap / principal / namespace / presplit / op-submit …) are served only on
+bootstrap / principal / namespace / presplit / op-submit / auto-policy …) are served only on
 an Admin connection, and an Admin connection exists only with the secret.
 `--admin-token` / `--admin-token-file` are refused by name on the manager and
 autumn-op (autumn-dashboard rejects them as unknown flags).
