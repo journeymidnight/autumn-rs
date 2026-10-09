@@ -2829,9 +2829,23 @@ settings remain unchanged. The binary can opt into prepared-replica TCP zerocopy
 
 ## Retiring partition connections on reload
 
-The per-partition accept loop shares its shutdown receiver with each accepted
-connection. Closing PartitionHandle ends both the listener and its existing
-connection tasks, releasing their req_tx and PartitionData references. This is
+Closing PartitionHandle ends both the listener and its existing connection
+tasks, releasing their req_tx and PartitionData references. Only the accept
+task waits on the handle's cross-thread `shutdown_rx`; when it exits it drops a
+local oneshot whose shared receiver every accepted connection awaits, so the
+connections are woken from the partition thread itself.
+
+This is load-bearing. A wake from another thread goes through compio's
+cross-thread queue, an `ArrayQueue` of `sync_queue_size` (64) whose producer
+spins while it is full (compio-executor `task/remote.rs`). When each
+connection awaited a shared clone of `shutdown_rx` directly, the PS main thread
+woke them all inside `futures::Shared`'s waker lock; past 64 the queue filled,
+and the partition thread — polling a woken connection's clone — blocked on that
+same lock instead of draining the queue. The main thread then stopped for good:
+no heartbeat, the manager evicted the PS, the process stayed alive (a stress
+run, 69 connections on one partition). Same-thread wakes use the local queue
+and never spin. `manager/tests/partition_reload_many_connections.rs` (300 idle
+connections, then a range change) is red with the old fan-out. This is
 required on merge/reload: a connection left alive would keep serving the old
 frozen partition even after the manager published a new epoch. Client pools
 now retain healthy connections after status refusals, so teardown must be

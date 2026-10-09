@@ -308,6 +308,14 @@ Measured 2026-09-27: split held 1/6–2/6 through a 15 s stall and finished 6/6
 come from the PS (`set_maintenance_phase`), merge's from the manager's
 orchestrator; with either report removed, the same run shows no phase at all.
 
+**A partition reload with many client connections no longer stops its PS.**
+A PS that stops heartbeating right after `reloading partition N due to region
+change` while its process stays alive was the reload's connection fan-out
+deadlocking the PS main thread (over 64 connections on one partition). Check:
+`cargo test -p autumn-manager --test partition_reload_many_connections`
+(300 idle connections, a range change, the PS must stay registered and the
+partition reopen; ~15 s).
+
 **A merge takes both partitions over before it measures them.** After the
 freeze it acquires each partition's owner lock and fences its stream tails, so a
 PS that restarts, gets unfrozen by a stale rollback, or outlives `FREEZE_TTL`

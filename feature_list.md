@@ -20,6 +20,12 @@
 - **Acceptance**: 复现用例在修复前失败（stream 中间出现 open extent 或两次都成功），修复后第二次 alloc 被拒（Precondition）并能重试成功；既有 alloc/split/merge/GC 回归全绿。
 - `passes: false`
 
+### BUG-MERGE-FREEZE-BLOCKS-PARTITION-LOOP — merge freeze 在分区循环里等维护 gate，整个分区停摆
+- **Trigger** (2026-10-09 用户压测): 分区 1930 的 freeze 19:50:31 发出后一直没回复，manager 30 s 超时；同时 PUT 也无响应。`partition_loop` 里 `try_complete_freeze_drain` 直接 await `maintenance_gate`，在跑的 major compaction 占着 gate 时，整个循环（写、freeze TTL 检查、`freeze=false`）都停住。
+- **Scope**: 仓库内复现（compaction 停在 gate 内时发 freeze，断言写入与 `freeze=false` 都卡住）。修：freeze 交给独立任务等 gate（等的时候照常放写），拿到 gate 才冻结；等待期间可被 `freeze=false` 取消。
+- **Acceptance**: 复现用例修复前卡住、修复后分区在等 gate 期间照常服务、`freeze=false` 能取消；消融变红。
+- `passes: false`
+
 ### BUG-OWNER-EPOCH-MEMORY-BACKWARDS — 同一 key 的两次 acquire 交错时，内存 epoch 可能落后于 etcd（推断，未复现）
 - **Trigger** (2026-10-09 merge 接管修复的 fable 评审): etcd 模式下 `acquire_owner_epoch` 先 await 事务，再无条件 `owner_epochs.insert(rev)`。两次并发 acquire（如 merge 接管与 PS 重开）事务 rev 100、101，若 continuation 逆序恢复，内存留 100、etcd 是 101。后果：持 101 的一方被 `ensure_owner_epoch` 拒（poison → 重开 → 收敛，不卡死）；持 100 的一方通过所有内存检查——merge 现在靠事务里的 `mod_revision` 比较兜住。
 - **Scope**: 先复现（manager 侧在 acquire 的 await 之后挂暂停点，让两次 acquire 逆序落内存）。坐实后插入改为取 max，并核对 replay 的一致性。
@@ -324,6 +330,7 @@
 - **Scope**: 量一下实际影响（一次 30 s 拒写）再决定是否修；修法候选：manager 回滚时也给失败的一侧发 `freeze=false`（它可能已冻住）。
 - **Acceptance**: 复现一次回复丢失后该侧在有界时间内恢复可写；消融变红。
 - `passes: false`
+- **notes** (2026-10-09): 已复现（manager 侧 failpoint `MERGE_TEST_DROP_FREEZE_REPLY` 丢弃 freeze OK：两侧各白冻 ~30 s）。修法"回滚时也给 freeze 失败的一侧发 freeze=false"能把 30 s 降到 ~3 ms，但评审指出：freeze=false 在排空回复仍挂着时到达会只清标志、留下挂着的回复，TTL 失效、split 不再被拦，可与分区循环里的 gate 等待互锁成永久卡死。须与 BUG-MERGE-FREEZE-BLOCKS-PARTITION-LOOP 一起改（freeze=false 取消挂着的排空）。补丁未提交。
 
 ### F-SPLIT-CARRIED-BYTES-UNBOUNDED — 大 value 分区可以无限长大，而现在没有任何判据会说话
 - **Trigger** (2026-09-11，本次 split 判据重设计的直接后果): 硬 size 触发器改读

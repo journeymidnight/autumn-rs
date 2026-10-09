@@ -6954,6 +6954,16 @@ async fn partition_thread_main(
     // task races against `shutdown_rx`: when the main thread drops its
     // `shutdown_tx`, `shutdown_rx.await` resolves and the task exits.
     //
+    // Only the accept task waits on that cross-thread signal; it closes the
+    // connections from THIS thread. A wake from another thread goes through
+    // compio's bounded (64-slot) sync queue, whose producer spins while it is
+    // full. When every connection awaited a shared clone of `shutdown_rx`,
+    // the main thread woke them all under the shared future's lock while this
+    // thread, polling a clone, waited for that lock instead of draining the
+    // queue: the PS main thread stopped for good (no heartbeat, evicted) on a
+    // reload of a partition with many connections
+    // (`tests/partition_reload_many_connections.rs`).
+    //
     // IMPORTANT: this task holds a clone of `req_tx`. When it exits, its
     // clone is dropped. Once every per-connection task's clone is also
     // dropped, partition_loop observes `req_rx.next() == None` and
@@ -6969,14 +6979,17 @@ async fn partition_thread_main(
             // Every accepted connection belongs to this partition instance.
             // On reload it must close too: otherwise its req_tx/part clones
             // keep the retired, frozen partition serving stale responses.
-            let shutdown = shutdown_rx.shared();
+            // Dropping `close_connections` (same thread) closes them.
+            let mut shutdown_rx = shutdown_rx;
+            let (close_connections, connections_closed) = oneshot::channel::<()>();
+            let connections_closed = connections_closed.shared();
             use futures::future::{select, Either};
             loop {
                 // Race accept against shutdown. `shutdown_rx.await`
                 // resolves when the main thread drops its sender.
                 let accept_fut = listener.accept();
                 futures::pin_mut!(accept_fut);
-                let res = match select(shutdown.clone(), accept_fut).await {
+                let res = match select(&mut shutdown_rx, accept_fut).await {
                     Either::Right((r, _pending_shutdown)) => r,
                     Either::Left((_canceled_shutdown, _pending_accept)) => {
                         tracing::info!(part_id, "accept: shutdown signaled, exiting");
@@ -6991,7 +7004,7 @@ async fn partition_thread_main(
                         let req_tx_conn = req_tx_for_accept.clone();
                         let part_conn = part_for_accept.clone();
                         let authz_conn = authz_for_accept.clone();
-                        let connection_shutdown = shutdown.clone();
+                        let connection_shutdown = connections_closed.clone();
                         compio::runtime::spawn(async move {
                             let serving = handle_ps_connection(
                                 conn,
@@ -7017,6 +7030,7 @@ async fn partition_thread_main(
                     }
                 }
             }
+            drop(close_connections);
             tracing::info!(part_id, "accept task exiting");
         });
     }
