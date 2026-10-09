@@ -113,6 +113,10 @@ No new dependency, wire format, or data-path work is added by this integration.
 - The page checks HTTP errors and `{ok:false}` before success feedback, marks
   failed policy status as unknown, and shares concurrent reads per URL. A stale
   partition detail response cannot replace the selected partition's drawer.
+- Partition ranges show the inclusive start and exclusive end on separate,
+  fully wrapped lines. The virtual list uses the same monospace wrapping to
+  compute row heights and cumulative offsets; resizing recomputes that layout.
+  Long common prefixes must not hide the distinguishing endpoint suffixes.
 - The first Policy panel is named Operational advisories. Hot/cold is an
   information-only diagnosis (never an action): the page decodes its compact
   reason into the affected PS, dimension, ratio, large/busy side, small/quiet

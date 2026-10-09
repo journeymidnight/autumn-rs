@@ -173,7 +173,11 @@
   .c-sz { width:82px; flex:none; text-align:right; } .c-sz.zero { color:var(--muted); }
   .c-ex { width:56px; flex:none; text-align:right; color:var(--dim); font-size:12px; }
   .c-io { width:74px; flex:none; text-align:right; }
-  .c-rng { flex:1; color:var(--dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+  .c-rng { flex:1; min-width:0; color:var(--dim); font-size:12px; }
+  .range-endpoint { display:flex; gap:6px; line-height:16px; }
+  .range-label { flex:0 0 36px; color:var(--muted); font-size:10px; }
+  .range-value { min-width:0; flex:1; }
+  .range-line { display:block; white-space:pre; }
   .hot { display:inline-block; font-size:10.5px; color:var(--warn); border:1px solid #cf9b5255;
     border-radius:999px; padding:0 7px; background:#cf9b5214; }
   .listempty { padding:22px 14px; color:var(--dim); text-align:center; }
@@ -184,7 +188,7 @@
   .dh { display:flex; align-items:center; gap:9px; margin-bottom:3px; }
   .dh .swatch { width:9px; height:9px; border-radius:2px; }
   .dh .did { font-size:15px; font-weight:700; } .dh .on { color:var(--dim); font-weight:400; font-size:12px; }
-  .drng { color:var(--dim); font-size:12px; }
+  .drng { color:var(--dim); font-size:12px; overflow-wrap:anywhere; }
   .actions { display:flex; gap:6px; flex-wrap:wrap; align-items:center; margin:12px 0; }
   .actions.locked .btn { opacity:.5; }
   .lockhint { color:var(--warn); font-size:11px; }
@@ -366,7 +370,7 @@
         <div class="cols">
           <span class="c-car"></span><span class="c-ps"></span><span class="c-id">part</span>
           <span class="c-addr">server</span><span class="c-sz">live</span><span class="c-ex">ext</span>
-          <span class="c-io">iops</span><span class="c-rng">key range</span>
+          <span class="c-io">iops</span><span id="rangehead" class="c-rng">key range</span>
         </div>
         <div id="vp"><div id="spacer"></div></div>
       </div>
@@ -455,7 +459,7 @@ let ADVISORIES=[];
 let EXTENT_HEALTH;   // undefined = not loaded yet; null = the leader did not answer
 let STATUS;          // same convention: `autumn-op status`'s JSON
 let LIVE_OPS=[];
-const ROWH=36;
+let ROWS=[];        // wrapped range heights and their cumulative offsets
 const PSCOLORS={};
 const PALETTE=["#c5a05e","#50a868","#9d7cc9","#cf9b52","#c45050","#5aa8a0","#c77fb0","#c98a54","#7a94c0","#9ab84e"];
 function psColor(pid){ const k=String(pid); if(!(k in PSCOLORS)) PSCOLORS[k]=PALETTE[Object.keys(PSCOLORS).length%PALETTE.length]; return PSCOLORS[k]; }
@@ -955,8 +959,35 @@ function applyFilter(){
   });
   const c=$("#lhcnt"); if(c) c.textContent = SEL_PS!=null
     ? `${FILTERED.length} partition${FILTERED.length!==1?"s":""}` : `${FILTERED.length}`;
-  $("#spacer").style.height = (FILTERED.length*ROWH)+"px";
+  layoutRows();
   renderRows();
+}
+// Wrap the escaped, monospace keys explicitly: browser line breaks at
+// punctuation otherwise disagree with the virtual list's character counts.
+// Only visible rows enter the DOM; long ranges still get their full height.
+function layoutRows(){
+  const vp=$("#vp"), head=$("#rangehead");
+  const canvas=document.createElement("canvas"), ctx=canvas.getContext?.("2d");
+  if(ctx) ctx.font=`300 12px ${getComputedStyle(vp).fontFamily}`;
+  const charWidth=ctx ? ctx.measureText("M").width : 7.2;
+  const width=Math.max(24,(head.clientWidth || Math.max(180,(vp.clientWidth||800)-537))-42);
+  const chars=Math.max(1,Math.floor(width/charWidth));
+  const wrap=s=>Array.from({length:Math.ceil(s.length/chars)},(_,i)=>s.slice(i*chars,(i+1)*chars));
+  let top=0;
+  ROWS=FILTERED.map(p=>{
+    const start=showKey(p.range_start)||"-∞", end=showKey(p.range_end)||"+∞";
+    const startLines=wrap(start), endLines=wrap(end);
+    const height=(startLines.length+endLines.length)*16+14;
+    const row={top,height,startLines,endLines}; top+=height; return row;
+  });
+  $("#spacer").style.height=top+"px";
+}
+function rowAt(y){
+  let lo=0, hi=ROWS.length;
+  while(lo<hi){ const mid=(lo+hi)>>1;
+    if(ROWS[mid].top+ROWS[mid].height<=y) lo=mid+1; else hi=mid;
+  }
+  return lo;
 }
 // Ensure the header matches the current scope, then (re)filter. Rebuilds the
 // header only on a scope change — a poll with the same scope leaves it (and the
@@ -968,15 +999,16 @@ function renderList(){
 }
 function renderRows(){
   const vp=$("#vp"), top=vp.scrollTop, h=vp.clientHeight;
-  const start=Math.max(0,Math.floor(top/ROWH)-4);
-  const end=Math.min(FILTERED.length,Math.ceil((top+h)/ROWH)+4);
+  const start=Math.max(0,rowAt(top)-4);
+  const end=Math.min(FILTERED.length,rowAt(top+h)+5);
   if(FILTERED.length===0){ $("#spacer").innerHTML=`<div class="listempty">No partitions${SEL_PS!=null?" on this server":""}.</div>`; return; }
   let html="";
   for(let i=start;i<end;i++){
     const p=FILTERED[i];
+    const row=ROWS[i];
     const io = p.req_per_sec>0 ? `<span class="hot">${p.req_per_sec} iops</span>` : "";
     const zero = (p.live_size||0)===0 ? " zero" : "";
-    html += `<div class="prow ${SELECTED===p.part_id?"sel":""}" style="top:${i*ROWH}px"
+    html += `<div class="prow ${SELECTED===p.part_id?"sel":""}" style="top:${row.top}px;height:${row.height}px"
         onclick='openDetail(${p.part_id})' title="${esc(rlabel(p.range_start,p.range_end))}">
       <span class="c-car">${SELECTED===p.part_id?"▼":"▸"}</span>
       <span class="c-ps"><i style="background:${psColor(p.ps_id)}"></i></span>
@@ -985,7 +1017,10 @@ function renderRows(){
       <span class="c-sz${zero}">${fmtBytes(p.live_size)}</span>
       <span class="c-ex">${p.total_extents} ext</span>
       <span class="c-io">${io}</span>
-      <span class="c-rng">${esc(rlabel(p.range_start,p.range_end))}</span>
+      <span class="c-rng">
+        <span class="range-endpoint"><span class="range-label" title="Inclusive start">start</span><span class="range-value">${row.startLines.map(s=>`<span class="range-line">${esc(s)}</span>`).join("")}</span></span>
+        <span class="range-endpoint"><span class="range-label" title="Exclusive end">end</span><span class="range-value">${row.endLines.map(s=>`<span class="range-line">${esc(s)}</span>`).join("")}</span></span>
+      </span>
     </div>`;
   }
   $("#spacer").innerHTML = html;
@@ -1307,7 +1342,7 @@ function refresh(){
 $("#vp").onscroll = renderRows;
 $("#danger").onchange = e=>{ DANGER=e.target.checked; $("#dangerlbl").textContent = DANGER?"Danger unlocked":"Danger locked";
   renderRows(); if(SELECTED!=null) openDetail(SELECTED); };
-window.onresize = renderRows;
+window.onresize = ()=>{ layoutRows(); renderRows(); };
 window.onhashchange = ()=>{ const id=(location.hash||"#overview").slice(1); if(id!==TAB && TABS.some(t=>t.id===id)) setTab(id); };
 function schedule(){ if(TIMER) clearInterval(TIMER); const ms=+$("#interval").value; if(ms>0) TIMER=setInterval(refresh,ms); }
 $("#interval").onchange = schedule;

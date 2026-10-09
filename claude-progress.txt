@@ -1,3 +1,11 @@
+Date: 2026-10-09 (8)
+TaskStatus: not_completed
+Task scope: VKE CP build/rollout and EN/manager/split/merge stress; user reported incomplete or apparently repeated key ranges in the dashboard.
+Current summary: CP #133 deployed 91163fa5 to core workloads. Baseline 4KiB write/read 631/1981 MiB/s. First online split+merge succeeded; 800000 small keys and 2048 versioned 1MiB values verified with no missing/mismatch after stopping. Temporary test boundaries restored to the original 30 partitions before the user clarified this was a display issue. Dashboard now shows start/end separately, wraps complete escaped keys, and computes variable virtual-row heights from that wrapping; the detail range wraps too. Pulled edba2cd3 before the next build.
+Verification: render_check, tabs_smoke, policy_controls passed. Real Chromium check using captured ranges passed: complete endpoints, long KVC keys, resize, final row reachable. Evidence and stress scripts: /private/tmp/autumn-ff29ad67-stress-20261009/.
+Main gaps: deploy the dashboard fix and edba2cd3 through CP, then resume EN/manager faults (none injected in the stopped 204-second run). Auto-policy remains Off for controlled testing; restore aggressive/Armed at the end. First run had transient freeze refusals (125557 small-value errors, 80 large-value errors), with no integrity failure; quantify separately from corruption. Investigate standby promotion retaining old PS heartbeat timestamps (replay uses or_insert), consistent with immediate fleet eviction observed on rollout.
+Next steps: CP build/rollout, live page verification, resume bounded fault tests, restore policy and verify acknowledged data.
+
 Date: 2026-10-09 (7)
 TaskStatus: completed
 Task scope: user — fix BUG-ALLOC-MEMBERSHIP-CHECK-NOOP (reproduce first).

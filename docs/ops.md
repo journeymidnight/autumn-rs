@@ -511,6 +511,12 @@ a view is linkable.
 Manual actions map to the allow-listed `autumn-op` subcommands (`split` / `gc` /
 `compact` / `merge` / `force-ec-convert` / `rebalance`).
 
+Partition ranges list `start` (inclusive) and `end` (exclusive) separately and
+wrap long keys without truncation. To check the layout, use neighboring ranges
+with a long common prefix, resize the window, and scroll to the last partition:
+both endpoints should remain complete and rows must not overlap. The detail
+drawer also wraps the full range, including escaped binary key bytes.
+
 **Manual check of the two tabs that exist for facts a roll-up cannot carry:**
 
 ```bash
