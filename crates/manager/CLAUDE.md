@@ -1476,11 +1476,15 @@ persisted):**
 `auto_policy.rs` + `auto_policy_tick_loop`: the in-manager topology/maintenance
 controller (folded in from a retired external Python controller; this does NOT revert
 the mechanism/policy split — advisory emission stays a separable layer that never
-self-dispatches). `AutoPolicyMode` = **Off → DryRun → Armed**. **INVARIANT: runs ONLY
+self-dispatches). `AutoPolicyMode` = **Off | Armed**. **INVARIANT: runs ONLY
 on the leader** (`leader.get()` gate every tick — no candidate read / decision /
 actuation on a follower). **DEFAULT-OFF** (a fresh cluster is pure-mechanism); `Armed`
-actuates, `DryRun` logs "would: …" but never mutates. The **mode is the whole gate**
-— arming is per-policy, with no separate process-wide flag.
+actuates. The **mode is the whole gate** — arming is per-policy, with no separate
+process-wide flag. What a policy would act on is the advisory list
+(`policy-candidates`, the dashboard's advisories), which is computed whatever
+the mode; there is no observe mode. Its byte `1` (between Off = 0 and Armed = 2)
+is refused: `SET_MODE` answers InvalidArgument, and a persisted `1` refuses
+leadership until `migratev1_v2` turns it off.
 
 **An armed policy's action is an op-ledger op**, the one the operator's
 `autumn-op` command would submit (`candidate_to_submit`, `requested_by =
@@ -1491,8 +1495,7 @@ is attached to. The cooldown starts at submission, whatever the outcome. The
 only difference is `OpOrigin::Policy`: its repair waits out `repair_grace_secs`
 and never takes a slot under maintenance (`RepairRequester::Policy`), exactly
 what its advisory counted. A policy split or merge waits at the topology gate
-like a submitted one. The controller's own log holds only DryRun's "would: …"
-lines — nothing in it was run.
+like a submitted one.
 
 Config is **etcd, leader-owned, crash-safe** (`autoPolicy/config` = mode + active +
 custom policies, `autoPolicy/cooldowns`), written etcd-first + leader-fenced by
@@ -1514,7 +1517,7 @@ never persisted, safest → most aggressive:
 space, a copy short is durability.
 
 Headless control: `MSG_AUTOPOLICY_GET/SET` + `autumn-op auto-policy
-status|activate <name> [--arm]|deactivate`. Manual per-target actions go through
+status|start <name>|deactivate`. Manual per-target actions go through
 the async op-ledger below (`autumn-op split/gc/compact/merge/force-ec-convert/
 rebalance`), leader-routed — the same underlying ops the controller uses.
 
@@ -1830,8 +1833,8 @@ Two ways in, one function (`request_repair`):
   `aggressive` enable it.
 
 Tests: `tests/extent_repair.rs` — an operator repair moves the copy of a
-stopped node to the spare without a fence; the policy advises in DryRun and
-moves nothing, then rebuilds when Armed; a request recorded on one leader is
+stopped node to the spare without a fence; the policy, selected but Off,
+advises and moves nothing, then rebuilds when Armed; a request recorded on one leader is
 served by the next after a spare joins; a node that returns before its
 requests could be served keeps its copies when the spare comes back.
 Ablations: `slot_verdict` ignoring the request (the first three red), replay

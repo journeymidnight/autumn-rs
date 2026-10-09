@@ -327,11 +327,12 @@ fn an_operator_repair_rebuilds_a_degraded_copy_without_a_fence() {
     drop(nodes);
 }
 
-/// The repair policy: in DryRun it only advises (one row per node, naming it)
-/// and moves nothing; Armed, it rebuilds the copy once the slot has been
-/// degraded for the grace period.
+/// The repair policy: selected but Off, the policy engine still advises (one
+/// row per node, naming it — the controller itself does nothing while Off) and
+/// nothing moves; Armed, it rebuilds the copy once the slot has been degraded
+/// for the grace period.
 #[test]
-fn the_repair_policy_advises_in_dry_run_and_rebuilds_when_armed() {
+fn the_repair_policy_advises_while_off_and_rebuilds_when_armed() {
     let mgr_addr = pick_addr();
     start_fast_policy_manager(mgr_addr, 2);
     let dirs: Vec<_> = (0..4)
@@ -404,15 +405,14 @@ fn the_repair_policy_advises_in_dry_run_and_rebuilds_when_armed() {
             }),
         )
         .await;
-        set(AUTOPOLICY_OP_SET_ACTIVE, 0, "repair-only", None).await;
-        set(AUTOPOLICY_OP_SET_MODE, 1, "", None).await; // DryRun
+        set(AUTOPOLICY_OP_SET_ACTIVE, 0, "repair-only", None).await; // mode stays Off
 
         let victim = node_ids.iter().position(|n| *n == members[1]).unwrap();
         let (flag, handle) = nodes[victim].take().unwrap();
         flag.shutdown();
         handle.join().expect("join extent node");
 
-        // DryRun: the advisory appears, naming the node — and nothing moves.
+        // Off: the advisory appears, naming the node — and nothing moves.
         let start = Instant::now();
         loop {
             let resp = admin
@@ -442,11 +442,11 @@ fn the_repair_policy_advises_in_dry_run_and_rebuilds_when_armed() {
                 .await
                 .replicates
                 .contains(&members[1]),
-            "DryRun must not move anything"
+            "a stopped policy must not move anything"
         );
         assert!(
             policy_repair_ops(&admin, members[1]).await.is_empty(),
-            "DryRun submits no op"
+            "a stopped policy submits no op"
         );
 
         set(AUTOPOLICY_OP_SET_MODE, 2, "", None).await; // Armed
@@ -599,7 +599,7 @@ fn start_etcd_manager_stoppable(
 }
 
 /// Select a policy with only the repair switch, re-deciding every 2 s, in
-/// `mode` (1 = DryRun, 2 = Armed).
+/// `mode` (0 = Off, 2 = Armed).
 async fn repair_only_policy(admin: &RpcClient, mode: u8) {
     let set = |op: u8, mode: u8, name: &str, entry: Option<MgrAutoPolicyEntry>| {
         let name = name.to_string();

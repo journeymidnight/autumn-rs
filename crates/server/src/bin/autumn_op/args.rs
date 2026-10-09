@@ -323,13 +323,12 @@ pub(crate) enum Command {
     /// Always emits JSON; consumed by the standalone dashboard (crates/server/src/bin/autumn_dashboard).
     Overview,
     /// Headless control of the leader-fenced auto-policy controller.
-    /// `action` = status | activate | deactivate | upsert | delete. The upsert
+    /// `action` = status | start | deactivate | upsert | delete. The upsert
     /// fields (`switches`/`interval`/`cooldown`/`max_actions`/`desc`) define a
     /// custom policy; the rest are ignored by the read/select/delete actions.
     AutoPolicy {
         action: String,
         name: String,
-        arm: bool,
         switches: String,
         interval: Option<u64>,
         cooldown: Option<u64>,
@@ -1042,7 +1041,7 @@ pub(crate) fn parse() -> Args {
         }
         "policy-candidates" | "policy_candidates" | "policy" => Command::PolicyCandidates,
         "overview" => Command::Overview,
-        // M2: auto-policy <status|activate <name> [--arm]|deactivate>
+        // auto-policy <status|start <name>|deactivate|upsert|delete>
         "auto-policy" | "auto_policy" => {
             let action = if i < raw.len() {
                 let a = raw[i].clone();
@@ -1052,7 +1051,6 @@ pub(crate) fn parse() -> Args {
                 "status".to_string()
             };
             let mut name = String::new();
-            let mut arm = false;
             let mut switches = String::new();
             let mut interval: Option<u64> = None;
             let mut cooldown: Option<u64> = None;
@@ -1060,7 +1058,13 @@ pub(crate) fn parse() -> Args {
             let mut desc: Option<String> = None;
             while i < raw.len() {
                 match raw[i].as_str() {
-                    "--arm" => arm = true,
+                    "--arm" => {
+                        eprintln!(
+                            "autumn-op: --arm was removed with the observe mode: \
+                             `auto-policy start <name>` runs a policy"
+                        );
+                        std::process::exit(2);
+                    }
                     "--switches" => {
                         switches = raw.get(i + 1).cloned().unwrap_or_default();
                         i += 1;
@@ -1089,7 +1093,6 @@ pub(crate) fn parse() -> Args {
             Command::AutoPolicy {
                 action,
                 name,
-                arm,
                 switches,
                 interval,
                 cooldown,

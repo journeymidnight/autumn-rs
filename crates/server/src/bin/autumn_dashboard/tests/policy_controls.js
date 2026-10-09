@@ -19,7 +19,7 @@ const documentStub = {
 };
 let failure = false, networkFailure = false, delayed = null, confirmed = true;
 const confirmations = [];
-const status = {mode:'armed', active:'custom', policies:[], log:[]};
+const status = {mode:'armed', active:'custom', policies:[]};
 const fetchStub = async (url, opt={}) => {
   calls.push([url, opt]);
   if(networkFailure) throw new Error('connection lost');
@@ -31,7 +31,7 @@ const fetchStub = async (url, opt={}) => {
 // Omit only the automatic initial poll/timer, while retaining all event wiring.
 const api = new Function('document','window','location','fetch','setTimeout','setInterval','clearInterval','confirm',
   script.replace(/setTab\(TAB\);\s*schedule\(\);\s*$/, '') +
-  '\nreturn {observePolicy,startPolicy,stopCtl,delPolicy,loadPolicies,renderPolicyTab,api,jsAttr,policyTab:()=>TAB="policy"};')
+  '\nreturn {startPolicy,stopCtl,delPolicy,loadPolicies,renderPolicyTab,api,jsAttr,policyTab:()=>TAB="policy"};')
   (documentStub,windowStub,{hash:'#policy'},fetchStub,()=>0,()=>0,()=>{},message=>{confirmations.push(message);return confirmed;});
 (async()=>{
   api.policyTab();
@@ -44,7 +44,7 @@ const api = new Function('document','window','location','fetch','setTimeout','se
   await api.loadPolicies();
   assert.equal(node('v_ctl').textContent,'unknown','failed status must not report Off');
   assert(node('ctlstate').textContent.includes('manager unavailable'));
-  for(const fn of [()=>api.observePolicy('custom'),()=>api.startPolicy('custom'),()=>api.stopCtl(),()=>api.delPolicy('custom')]){
+  for(const fn of [()=>api.startPolicy('custom'),()=>api.stopCtl(),()=>api.delPolicy('custom')]){
     const before=toasts.length; await fn();
     assert(toasts.slice(before).some(t=>t.className==='t bad'), 'failed mutation needs a visible error');
   }
@@ -64,11 +64,11 @@ const api = new Function('document','window','location','fetch','setTimeout','se
     windowStub.__pol={...status,policies:[{name,desc:'',switches:{}}]};
     api.renderPolicyTab();
     const handlers=[...node('pollist').innerHTML.matchAll(/onclick='([^']*)'/g)].map(m=>m[1]);
-    assert.equal(handlers.length,3);
+    assert.equal(handlers.length,2);
     for(const handler of handlers){
       const decoded=handler.replace(/&quot;/g,'"').replace(/&#39;|&#x27;/gi,"'").replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&');
       let captured;
-      new Function('startPolicy','observePolicy','delPolicy',decoded)(v=>captured=v,v=>captured=v,v=>captured=v);
+      new Function('startPolicy','delPolicy',decoded)(v=>captured=v,v=>captured=v);
       assert.equal(globalThis.__dashboardInjected,undefined,'policy name must never execute script');
       assert.equal(captured,name,'rendered button must preserve exactly one policy name');
     }
@@ -80,14 +80,14 @@ const api = new Function('document','window','location','fetch','setTimeout','se
   windowStub.__pol={...status,policies:[policy]};
   api.renderPolicyTab();
   assert(node('pollist').innerHTML.includes('>Start</button>'));
-  assert(node('pollist').innerHTML.includes('>Observe</button>'));
+  assert(!node('pollist').innerHTML.includes('Observe'),'the observe mode is gone');
   assert(!node('ctlstate').innerHTML.includes('>Arm</button>'));
   const first=calls.length;
   await api.startPolicy(policy.name);
   const issued=calls.slice(first);
   assert.equal(issued[0][0],'/api/policies/activate');
   assert.equal(issued[0][1].method,'POST','Start must not look up a previously selected policy');
-  assert.deepEqual(JSON.parse(issued[0][1].body),{active:policy.name,enabled:true});
+  assert.deepEqual(JSON.parse(issued[0][1].body),{active:policy.name});
   assert.equal(issued.filter(([,opt])=>opt.method==='POST').length,1);
   assert(confirmations.at(-1).includes(policy.name),'confirmation names the chosen policy');
   confirmed=false;
@@ -95,13 +95,10 @@ const api = new Function('document','window','location','fetch','setTimeout','se
   await api.startPolicy(policy.name);
   assert.equal(calls.length,beforeCancel,'cancelled Start must not contact the server');
   confirmed=true;
-  let from=calls.length;
-  await api.observePolicy(policy.name);
-  assert.deepEqual(JSON.parse(calls[from][1].body),{active:policy.name});
-  from=calls.length;
+  const from=calls.length;
   await api.stopCtl();
   assert.deepEqual(JSON.parse(calls[from][1].body),{enabled:false});
-  for(const [mode,label] of [['armed','Running'],['dry_run','Observing'],['off','Stopped']]){
+  for(const [mode,label] of [['armed','Running'],['off','Stopped']]){
     windowStub.__pol={...status,mode,active:policy.name,policies:[policy]};
     api.renderPolicyTab();
     assert(node('ctlstate').innerHTML.includes(`<b>${label}</b>`));
@@ -114,5 +111,5 @@ const api = new Function('document','window','location','fetch','setTimeout','se
   const a=api.api('/api/policies'), b=api.api('/api/policies');
   assert.equal(calls.length,before+1,'overlapping reads must share one subprocess request');
   resolve({ok:true,json:async()=>status}); await Promise.all([a,b]); delayed=null;
-  console.log('policy controls OK: failures, unknown state, recovery, name escaping, direct Start/Observe/Stop, cancellation, overlapping reads');
+  console.log('policy controls OK: failures, unknown state, recovery, name escaping, direct Start/Stop, cancellation, overlapping reads');
 })().catch(e=>{console.error(e);process.exitCode=1;});

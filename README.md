@@ -72,7 +72,7 @@ erasure-coded, self-healing extents.
   enforcement at the KV layer).
 - **Operable** — a **web dashboard** ([`autumn-dashboard`](crates/server/src/bin/autumn_dashboard/README.md),
   built with `autumn-server`) with tabs for keyspace, partitions, servers,
-  nodes-and-disks, policy and logs, plus direct Start / Observe / Stop policy
+  nodes-and-disks, policy and logs, plus direct Start / Stop policy
   controls; a fleet status checked against the EXPECTED members
   (`autumn-op status`: manager leader/standby, `PS Ready 3/3`, `EN Online 6/6`,
   extents clean/degraded/unavailable, rebuilds in flight, when it was sampled —

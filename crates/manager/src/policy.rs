@@ -361,9 +361,9 @@ pub(crate) fn partition_sealed_sums(state: &MetadataState) -> HashMap<u64, u64> 
 ///   debounce — only the PS-reported components (`open_tail`/debts) are
 ///   per-bucket. A step change in sealed bytes (a fresh large SST, or a GC
 ///   that drops a batch) therefore reaches the size trigger in one tick
-///   instead of a sustained window. ACCEPTED for now because: (a) auto-exec
-///   is off by default (`allow-mutations=0`) so this only affects the
-///   `policy-candidates` DryRun advisory, not real split/merge; (b) sealed is
+///   instead of a sustained window. ACCEPTED for now because: (a) the
+///   controller is off unless a policy with split/merge switched on is
+///   started, so this mostly affects the `policy-candidates` advisory; (b) sealed is
 ///   a slow, near-monotonic variable; (c) split/merge both have cooldowns.
 ///   Historising `sealed` per-bucket would push an O(extents) sum onto the
 ///   high-frequency `handle_report_partition_load` hot path, which is exactly
@@ -602,8 +602,8 @@ impl PolicyEngine {
                 continue;
             }
             // Reason names the trigger that actually fired (checked in the same
-            // priority order) and carries both size metrics, so a DryRun
-            // `policy-candidates` round shows WHICH bytes drove the decision.
+            // priority order) and carries both size metrics, so a
+            // `policy-candidates` row shows WHICH bytes drove the decision.
             let reason = if lsm_hard {
                 format!(
                     "lsm>{} (lsm {} MiB; carries {} GiB incl. large-value payload)",

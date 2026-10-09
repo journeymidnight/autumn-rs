@@ -176,14 +176,14 @@ def run():
             assert http('/api/policies/upsert', config)['ok']
             initial = http('/api/policies')
             assert initial['mode'] == 'off' and not initial['active']
-            # Start selects and runs in one HTTP request, without a prior Observe.
-            assert http('/api/policies/activate', {'active':name, 'enabled':True})['ok']
-            started = http('/api/policies')
-            assert (started['mode'], started['active']) == ('armed', name)
+            # Start selects and runs in one HTTP request.
             assert http('/api/policies/activate', {'active':name})['ok']
             state = http('/api/policies')
-            assert (state['mode'], state['active']) == ('dry_run', name)
+            assert (state['mode'], state['active']) == ('armed', name)
             assert next(p for p in state['policies'] if p['name']==name)['switches'] == switches
+            assert http('/api/policies/activate', {'enabled':False})['ok']
+            assert http('/api/policies')['mode'] == 'off'
+            # Bare enable restarts the policy still selected.
             assert http('/api/policies/activate', {'enabled':True})['ok']
             assert http('/api/policies')['mode'] == 'armed'
             assert http('/api/policies/activate', {'enabled':False})['ok']

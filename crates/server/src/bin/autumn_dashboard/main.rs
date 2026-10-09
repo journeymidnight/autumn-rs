@@ -164,8 +164,7 @@ const SWITCH_ORDER: [&str; 8] =
 
 /// `autumn-op auto-policy status --json` speaks its own shape; the page's
 /// contract (the one the manager used to serve) differs. Translate: `mode`
-/// string → `enabled` bool (+ pass `mode` through for the Off/DryRun/Armed
-/// distinction); each policy's `switches` `[bool;6]` → a named object;
+/// string → `enabled` bool (+ pass `mode` through); each policy's `switches` `[bool;6]` → a named object;
 /// `interval_sec`/`cooldown_sec` → `interval`/`cooldown`; add `switch_order`.
 fn reshape_policies(out: String, ok: bool) -> Response<Body> {
     if !ok {
@@ -217,7 +216,6 @@ fn reshape_policies(out: String, ok: bool) -> Response<Body> {
         "allow_mutations": v.get("allow_mutations").cloned().unwrap_or(serde_json::json!(true)),
         "policies": policies,
         "switch_order": SWITCH_ORDER,
-        "log": v.get("log").cloned().unwrap_or_else(|| serde_json::json!([])),
     });
     json_resp(StatusCode::OK, body.to_string())
 }
@@ -453,11 +451,10 @@ async fn policies(cfg: &Config) -> Response<Body> {
     reshape_policies(out, ok)
 }
 
-/// The page drives the controller with two independent-ish keys, which map onto
-/// autumn-op's coupled `activate <name> [--arm]` / `deactivate`:
-///   `{active:<name>}`            → `activate <name>`  (select, DryRun / observe)
-///   `{active:<name>, enabled:t}` → `activate <name> --arm`  (select + Arm)
-///   `{enabled:true}`  (no name)  → arm the CURRENT active policy
+/// The page drives the controller with two keys, which map onto autumn-op's
+/// `start <name>` / `deactivate`:
+///   `{active:<name>}` (`enabled` absent or true) → `start <name>`
+///   `{enabled:true}`  (no name)  → start the CURRENT active policy
 ///   `{enabled:false}`            → `deactivate`  (Off)
 async fn policies_activate(cfg: &Config, body: Bytes) -> Response<Body> {
     let request: ActivatePolicy = match serde_json::from_slice(&body) {
@@ -502,11 +499,7 @@ async fn policies_activate(cfg: &Config, body: Bytes) -> Response<Body> {
         if !valid_policy_name(&name) {
             return bad_request("no valid active policy — select one first");
         }
-        let mut args = vec!["auto-policy".into(), "activate".into(), name];
-        if request.enabled == Some(true) {
-            args.push("--arm".into());
-        }
-        args
+        vec!["auto-policy".into(), "start".into(), name]
     };
     let (out, ok) = cfg.run_op(args).await;
     json_resp(

@@ -375,12 +375,15 @@ autumn-op --manager $MGR --json info --part <PID> --detail \
 The manager only *emits* advisories (pure mechanism); the leader-fenced
 **auto-policy controller** *decides + actuates* per an active policy. It runs
 in-process — one crash-safe, leader-owned task (it survives as long as the leader
-does). It is **leader-only** (never runs on a follower) and a state machine
-`Off → DryRun → Armed`. `Armed` actuates; `DryRun` logs "would: …" but never
-mutates — the **mode is the whole gate** (arming is per-policy; there is no
-separate process-wide flag). Config is persisted to etcd (`autoPolicy/config` +
-`autoPolicy/cooldowns`, leader-fenced) so the active policy survives leader
-failover.
+does). It is **leader-only** (never runs on a follower) and has two modes,
+`Off` and `Armed`. `Armed` actuates — the **mode is the whole gate** (arming is
+per-policy; there is no separate process-wide flag). What a policy would act on
+is the advisory list (`autumn-op policy-candidates`, the dashboard's
+advisories), shown in either mode; there is no observe mode. Config is
+persisted to etcd (`autoPolicy/config` + `autoPolicy/cooldowns`, leader-fenced)
+so the active policy survives leader failover. A `mode = 1` left by a build
+that had observe mode makes the manager refuse to lead
+(`autoPolicy/config mode 1 ... run migratev1_v2`); `migratev1_v2` turns it off.
 
 **Boot default.** The DEPLOY layer (entrypoint / autumn-deploy / k8s) seeds
 `--auto-policy-default balanced`, which is seeded **Armed** — so a production
@@ -393,11 +396,11 @@ it. **cluster.sh / chaos / perf leave it OFF** (they never set the env), so
 dev/test behaviour is unchanged. Headless control:
 
 ```bash
-autumn-op auto-policy status                 # mode + active + presets + what an observing policy would run
+autumn-op auto-policy status                 # mode + active + presets
+autumn-op policy-candidates                  # what a policy would act on, whatever the mode
 autumn-op ops list --active                  # an armed policy's actions: requested_by=auto-policy
 autumn-op ops history                        # ... and how they ended, refusals included
-autumn-op auto-policy activate gc-only       # select + DryRun (observe, no actuation)
-autumn-op auto-policy activate aggressive --arm   # select + Armed (actuate)
+autumn-op auto-policy start aggressive       # select + Armed (actuate)
 autumn-op auto-policy deactivate             # mode → Off
 ```
 
@@ -408,10 +411,9 @@ Presets (safest → most aggressive): `gc-only`, `maintenance`, `space-reclaim`,
 over `gc_debt_high` on some partition:
 
 ```bash
-autumn-op auto-policy activate gc-only            # Observe: nothing runs
-autumn-op auto-policy status                      # "would: autumn-op gc <PID> (...)"
-autumn-op --json ops list --active | grep auto-policy   # → nothing
-autumn-op auto-policy activate gc-only --arm
+autumn-op policy-candidates                       # a gc row for <PID>
+autumn-op --json ops list --active | grep auto-policy   # → nothing while Off
+autumn-op auto-policy start gc-only
 autumn-op --json ops list | grep -A3 '"requested_by": "auto-policy"'   # a gc on <PID>
 autumn-op ops history --kind gc                   # its outcome once it ends
 ```
@@ -454,7 +456,7 @@ a view is linkable.
 | Partitions | PS-scoped partition list + the lazy per-partition drawer (load metrics + extents) |
 | Servers | every partition server member (an evicted one stays listed until `ps-remove`), with heartbeat, load and its partitions |
 | Nodes | every extent node, with a **per-disk** table — capacity, online, faulted |
-| Policy | advisories with their full reasoning, the controller, the policy editor, what an observing policy would run |
+| Policy | advisories with their full reasoning, the controller, the policy editor |
 | Logs | every op — the operator's and the auto-policy's alike — running, then durable outcomes, each marked with who asked |
 
 Manual actions map to the allow-listed `autumn-op` subcommands (`split` / `gc` /
@@ -519,7 +521,7 @@ runtime override), like every other advisory threshold — not persisted.
 
 ```bash
 # with an etcd-backed cluster:
-autumn-op auto-policy activate gc-only --arm       # → mode=armed active=gc-only
+autumn-op auto-policy start gc-only                # → mode=armed active=gc-only
 kill -9 <leader-manager-pid>                        # crash the leader
 # after the etcd lease expires (~10 s) a new leader wins + replays from etcd:
 autumn-op auto-policy status                         # → STILL mode=armed active=gc-only
@@ -535,10 +537,9 @@ and tunnel. HTTP authentication is an existing non-goal retained in this move.
 **Policy feedback:** rejected writes show the manager's reason and retain the
 editor input; failed status queries display `unknown`. Each policy's **Start**
 button selects that named policy and runs it after confirmation, even if none
-was previously selected. **Observe** selects the named policy in DryRun for
-preview only; it is optional. **Stop** means Off. Status labels are
-Running / Observing / Stopped. The existing CLI selects the policy and
-sets its mode with separate RPCs: after a partial failure, refresh status and
+was previously selected. **Stop** means Off. Status labels are Running /
+Stopped. `auto-policy start` selects the policy and sets its mode with
+separate RPCs: after a partial failure, refresh status and
 verify the actual name/mode before operating again. Review details and the
 remaining transaction gap: [dashboard review](dashboard_review.md).
 
@@ -564,7 +565,7 @@ The API harness requires `etcd` and Python 3, discovers Cargo's target directory
 (or accepts `AUTUMN_BIN_DIR`), allocates temporary data and a free port band,
 and terminates only children it spawned. It checks served HTML bytes, disk/PS
 fields, partition detail, nonempty durable operation history, policy
-create/observe/arm/stop/delete with all switches off, invalid payloads, and
+create/start/stop/delete with all switches off, invalid payloads, and
 manager failure propagation.
 
 ## Fuse daemon runbook
@@ -1154,8 +1155,8 @@ extent, stop its nodes, truncate each replica's `extent-<id>.dat`, start the
 nodes again on the same dirs, `autumn-op gc <PART>`; the extent must still be
 listed. Automated: `cargo test -p autumn-manager --test system_gc_truncated_replica`.
 
-Unattended, the same thing happens through `auto-policy activate gc-only
---arm`: the advisory needs the debt sustained over 5 buckets (~5 min at the
+Unattended, the same thing happens through `auto-policy start gc-only`: the
+advisory needs the debt sustained over 5 buckets (~5 min at the
 default 60 s bucket), logs `GC primary=<PART> ... reason='gc_debt_bytes>...
 sustained 5m'`, and the armed controller dispatches it on a following tick.
 
@@ -1177,7 +1178,7 @@ AC=(autumn-client --manager 127.0.0.1:9001 --namespace bench)
 head -c $((64<<20)) /dev/urandom > /tmp/v64
 for i in $(seq 1 270); do "${AC[@]}" put big$i /tmp/v64; done   # seals a 16 GiB log extent
 for i in $(seq 1 270); do "${AC[@]}" del big$i; done
-"${AO[@]}" auto-policy activate aggressive --arm
+"${AO[@]}" auto-policy start aggressive
 
 "${AO[@]}" --json info --part <PART> --detail   # unsettled_deletes: 270, gc_debt_bytes: 0
 "${AO[@]}" policy-candidates                    # after ~5 min: major <PART> "270 deletes not yet compacted ..."
@@ -3658,12 +3659,11 @@ fencing. Removal of the latch does not prove old binaries can read newer data.
    policy name and mode. For example, if it was `balanced` and Armed:
 
    ```bash
-   autumn-op --manager "$MGR" auto-policy activate balanced --arm
+   autumn-op --manager "$MGR" auto-policy start balanced
    autumn-op --manager "$MGR" auto-policy status
    ```
 
-   Restore a previous DryRun with `activate <original-name>` without `--arm`;
-   leave a previous Off state Off. Resume external management submissions only
+   Leave a previous Off state Off. Resume external management submissions only
    after recovery checks pass. On an upgrade failure keep policy Off while
    following the release's recovery/rollback procedure.
 
@@ -3766,20 +3766,26 @@ scans from the namespace head and does not continue into later partitions, so it
 returns nothing when the head is empty even though keys exist further on. Use
 `ls --prefix` before concluding a namespace was emptied.
 
-#### `migratev1_v2` — the tenant removal (wire 58 -> 59, stop the world)
+#### `migratev1_v2` — the tenant removal and the observe mode (to wire 60, stop the world)
 
-Two etcd changes ship with wire 59:
+Three etcd changes ship with it (the tenant removal was wire 59, the observe
+mode's removal wire 60):
 
 - the principal account DB moves from `tenantAccount/<name>` to `principal/<name>`.
   The value is copied unchanged (same record type 2, format 1).
 - `namespace/<name>` goes from format 1 to 2: `owner_tenant` is dropped. It fed
   only the protected-prefix list, which no PS read.
+- `autoPolicy/config` in mode 1 (observe) goes to mode 0 (off), the active
+  policy still selected. A wire-60 manager refuses to lead on mode 1
+  (`autoPolicy/config mode 1 is not a mode this build has ... run
+  migratev1_v2`). After the restart, `auto-policy start <name>` runs it if it
+  should run.
 
-A wire-59 manager refuses to lead while any namespace record is still v1, with
+A manager from wire 59 on refuses to lead while any namespace record is still v1, with
 `namespace/fs: namespace record is at format version 1, this binary speaks 2.
 The converter has not run`. The built-in `fs`/`kvc`/`mem` rows exist on every
 bootstrapped cluster, so an unconverted cluster always stops there instead of
-starting with principals missing. Wire 58 and 59 cannot run together, so stop
+starting with principals missing. Wire 58 and 60 cannot run together, so stop
 everything.
 
 ```bash
@@ -3792,14 +3798,16 @@ etcdctl get namespace/ --prefix --keys-only | grep -c .
 cargo run --release --bin migratev1_v2 -- --etcd http://ETCD:2379 --dry-run
 #    tenantAccount/ -> principal/  moved=N already=0
 #    namespace/<name>: dropping owner_tenant "..."   (one line per owned namespace)
+#    autoPolicy/config: observe mode -> off      (or: nothing to convert)
 #    namespace/ v1 -> v2  converted=M already=0
 # 3. convert, then re-run: the re-run must report moved=0 and converted=0, with
 #    already=M for namespaces.
 cargo run --release --bin migratev1_v2 -- --etcd http://ETCD:2379
 cargo run --release --bin migratev1_v2 -- --etcd http://ETCD:2379
-# 4. start the wire-59 binaries and check:
+# 4. start the wire-60 binaries and check:
 autumn-op --cluster-secret-file F --manager MGR:9001 principal-list   # same names + grants
 autumn-op --cluster-secret-file F --manager MGR:9001 namespace-list   # no OWNER column
+autumn-op --cluster-secret-file F --manager MGR:9001 auto-policy status   # mode off or armed
 autumn-op --cluster-secret-file F --manager MGR:9001 mint-token --principal P --credential HEX
 ```
 
@@ -5359,8 +5367,8 @@ been degraded at least `--repair-grace-secs` (manager flag, default 600) —
 visible in `autumn-op policy-candidates` and the dashboard's Policy tab as
 `repair node N` — and, when the policy is Armed, submits `repair --node N` as
 an op (`requested_by=auto-policy`, in `ops list` / `ops history`) that
-requests only the slots past the grace (DryRun only lists "would: autumn-op
-repair --node N"). The dashboard's Fleet panel also offers a Repair button for
+requests only the slots past the grace (while Off, the advisory is all there
+is). The dashboard's Fleet panel also offers a Repair button for
 the worst readable degraded extent that still has a slot nobody asked to
 rebuild; once every listed slot is marked `(repair requested)` there is no
 button, only `Cancel repair`.
@@ -5374,8 +5382,8 @@ Verify:
 
 `extent_repair` runs three real-EN scenarios: an operator repair moves the copy
 of a stopped node onto the spare and the node is not fenced; a repair-only
-policy (grace 2 s) advises in DryRun without moving anything, then rebuilds
-when Armed; a request recorded on one leader is served by the next after a
+policy (grace 2 s), selected but Off, advises without moving anything, then
+rebuilds when Armed; a request recorded on one leader is served by the next after a
 spare joins (real etcd, two managers); a node that returns before its requests
 could be served keeps its copies when the spare comes back. Ablations, each
 reddening exactly its scenario: make `slot_verdict` ignore `repair_requested`
@@ -5420,7 +5428,7 @@ Weekly: the auto-policy `scrub` switch (on in `maintenance`, `balanced`,
 `aggressive`) submits `scrub --all` at most once every 7 days; the cooldown is
 persisted, so a manager failover does not restart the week:
 
-    "${AO[@]}" auto-policy activate balanced --arm
+    "${AO[@]}" auto-policy start balanced
     "${AO[@]}" policy-candidates        # a `scrub cluster` row only when it is due
     "${AO[@]}" ops list --kind scrub
 

@@ -56,6 +56,7 @@
 - **Acceptance**: Armed→选择新 policy 的 DryRun 更新只发布一份完整配置；注入持久化失败、leader 切换与并发操作者，不出现部分配置或误 arm 其他 policy；消融测试失败。
 - `passes: false`
 - **notes**: 两次 RPC 与 manager 保留旧 mode 已按代码核实；窗口内真实误派发尚未复现。本次 dashboard 迁移不改这个跨层契约。
+- **notes** (2026-10-09): 观察模式已删（只剩 Off/Armed，CLI `auto-policy start`）。"本应 DryRun 的新 policy 先继承 Armed"这一误 arm 场景已不存在；剩下两次 RPC 之间的部分失败（选中但仍 Off）和并发操作者交错。
 
 ### F-REVIEW-T3-REAL-CRASH — P2 crash 测试真正停止旧 runtime
 - **Trigger**: review.md T3；drop RpcClient 不等于杀 PS/EN。

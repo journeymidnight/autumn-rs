@@ -45,18 +45,18 @@ without the secret — read-only views included.
 | `POST /api/action` | maps `{action, part_id, …}` → `split` / `gc` / `compact` / `merge` / `force-ec-convert` / `rebalance` / `repair <extent>` / `repair --node <id>` / `repair --cancel <extent>` |
 | `GET /api/policies` | `autumn-op auto-policy status` (reshaped to the page's schema) |
 | `GET /api/ops` | `autumn-op ops list --active` + `ops history` → `{live, history, history_error}` |
-| `POST /api/policies/activate` | `autumn-op auto-policy activate <name> [--arm]` / `deactivate` |
+| `POST /api/policies/activate` | `autumn-op auto-policy start <name>` / `deactivate` |
 | `POST /api/policies/upsert` | `autumn-op auto-policy upsert <name> --switches … --interval … …` |
 | `POST /api/policies/delete` | `autumn-op auto-policy delete <name>` |
 
 Each policy has a **Start** button: confirm the named policy to select it and
 run its enabled actions immediately. A running policy's actions are ops like
 an operator's: they are on the Logs tab, running and in the durable history,
-marked `auto-policy`. **Observe** is an optional preview that lists, on the
-Policy tab, what the policy would run, without running it; it is not a
-prerequisite for Start. **Stop** stops the current controller. Only one policy runs at a time;
-starting or observing another replaces the current selection. The page shows
-**Running / Observing / Stopped** and disables the current mode's button.
+marked `auto-policy`. What a policy would act on is the advisory list on the
+Policy tab, shown whether or not a policy runs. **Stop** stops the current
+controller. Only one policy runs at a time; starting another replaces the
+current selection. The page shows **Running / Stopped** and disables the
+running policy's Start button.
 
 The custom-policy editor supports create/replace/delete. Policy names must be
 nonblank and must not start with `-` (they are CLI positional arguments).
@@ -79,7 +79,7 @@ every one. The tab is in the URL hash (`#nodes`), so a view is linkable.
 | **Partitions** | which partition — PS-scoped list + the lazy detail drawer |
 | **Servers** | which partition server — every REGISTERED PS with its heartbeat, load and partitions |
 | **Nodes** | which disk — every extent node with a per-disk table (capacity, online, faulted) |
-| **Policy** | what the controller would do — advisories with their full reasoning, the policy editor, and what an observing policy would run |
+| **Policy** | what the controller would do — advisories with their full reasoning, the controller and the policy editor |
 | **Logs** | what just happened — every op, the operator's and the auto-policy's alike: running now, then durable outcomes, each marked with who asked |
 
 Built for many partitions: the Partitions tab is **partition-server-first** (pick

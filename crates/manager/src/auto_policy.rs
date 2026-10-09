@@ -13,10 +13,10 @@
 //! faithful is what makes the in-manager controller a behavior-preserving
 //! replacement (M2).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 
 use autumn_rpc::manager_rpc::{
-    AutoPolicyLogEntry, MgrAutoPolicyConfig, MgrAutoPolicyCooldowns, MgrAutoPolicyEntry,
+    MgrAutoPolicyConfig, MgrAutoPolicyCooldowns, MgrAutoPolicyEntry,
     OpSubmitReq, PolicyCandidate, OP_KIND_COMPACT, OP_KIND_EC_CONVERT, OP_KIND_GC, OP_KIND_MERGE,
     OP_KIND_REBALANCE, OP_KIND_REPAIR, OP_KIND_SCRUB, OP_KIND_SPLIT, POLICY_KIND_EC,
     POLICY_KIND_GC, POLICY_KIND_HOT_COLD, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE,
@@ -24,23 +24,18 @@ use autumn_rpc::manager_rpc::{
     POLICY_KIND_SPLIT, SCRUB_POLICY_INTERVAL_SEC,
 };
 
-/// Rolling preview-log cap (leader-local, in-memory — not persisted).
-const PREVIEW_LOG_CAP: usize = 100;
-
 /// In-manager controller state: the mode + active policy + custom policies +
-/// per-target cooldowns + a rolling log of what an observing (DryRun) policy
-/// would run. Config (mode/active/custom) is etcd-persisted
+/// per-target cooldowns. Config (mode/active/custom) is etcd-persisted
 /// (`autoPolicy/config`, leader-fenced) and cooldowns to `autoPolicy/cooldowns`,
-/// replayed on leader promotion so the active policy survives failover. The
-/// log is leader-local (not persisted); an armed policy's actions are op-ledger
-/// ops, listed and kept in history like an operator's.
+/// replayed on leader promotion so the active policy survives failover. An
+/// armed policy's actions are op-ledger ops, listed and kept in history like
+/// an operator's.
 pub(crate) struct AutoPolicyState {
     pub mode: AutoPolicyMode,
     pub active: String,
     /// CUSTOM policies only; presets come from `preset_policies()`.
     pub custom: Vec<MgrAutoPolicyEntry>,
     pub cooldowns: HashMap<String, i64>,
-    pub log: VecDeque<AutoPolicyLogEntry>,
     /// Epoch-seconds the loop last launched an actuation decision; it only
     /// re-decides every active-policy `interval_sec`.
     pub last_tick_at: i64,
@@ -57,7 +52,6 @@ impl Default for AutoPolicyState {
             active: String::new(),
             custom: Vec::new(),
             cooldowns: HashMap::new(),
-            log: VecDeque::new(),
             last_tick_at: 0,
             updating: false,
         }
@@ -130,20 +124,16 @@ impl AutoPolicyState {
             .or_else(|| self.custom.iter().find(|p| p.name == name).cloned())
     }
 
-    /// Push a newest-first preview-log entry (capped).
-    pub fn record(&mut self, ts: i64, level: &str, msg: String) {
-        self.log.push_front(AutoPolicyLogEntry {
-            ts,
-            level: level.to_string(),
-            msg,
-        });
-        while self.log.len() > PREVIEW_LOG_CAP {
-            self.log.pop_back();
-        }
-    }
-
-    pub fn load_config(&mut self, c: MgrAutoPolicyConfig) {
-        self.mode = AutoPolicyMode::from_u8(c.mode);
+    /// Errs on a mode this build does not have (`1`, the removed observe
+    /// mode): `migratev1_v2` converts it to Off.
+    pub fn load_config(&mut self, c: MgrAutoPolicyConfig) -> Result<(), String> {
+        self.mode = AutoPolicyMode::from_u8(c.mode).ok_or_else(|| {
+            format!(
+                "autoPolicy/config mode {} is not a mode this build has (1 was the \
+                 removed observe mode); run migratev1_v2, which converts it to off",
+                c.mode
+            )
+        })?;
         self.active = c.active;
         self.custom = c.policies;
         // Clamp on replay: a config persisted by an older/other build (or a
@@ -151,6 +141,7 @@ impl AutoPolicyState {
         for e in &mut self.custom {
             sanitize_entry(e);
         }
+        Ok(())
     }
 
     pub fn to_cooldowns(&self) -> MgrAutoPolicyCooldowns {
@@ -165,14 +156,13 @@ impl AutoPolicyState {
 }
 
 /// Controller lifecycle — a state machine, NOT a bool ([[feedback_state_machine_not_bool]]).
-/// `Off` = nothing runs (a fresh cluster stays pure-mechanism). `DryRun` =
-/// the loop runs and logs "would: …" but never actuates. `Armed` = actuates.
-/// The mode is the whole gate — arming is per-policy, with no separate
-/// process-wide flag. Byte values are wire/etcd-stable.
+/// `Off` = nothing runs (a fresh cluster stays pure-mechanism). `Armed` =
+/// actuates. The mode is the whole gate — arming is per-policy, with no
+/// separate process-wide flag. Byte values are wire/etcd-stable; `1` was the
+/// removed observe mode and is refused, never read as another mode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum AutoPolicyMode {
     Off,
-    DryRun,
     Armed,
 }
 
@@ -180,15 +170,14 @@ impl AutoPolicyMode {
     pub(crate) fn as_u8(self) -> u8 {
         match self {
             AutoPolicyMode::Off => 0,
-            AutoPolicyMode::DryRun => 1,
             AutoPolicyMode::Armed => 2,
         }
     }
-    pub(crate) fn from_u8(b: u8) -> Self {
+    pub(crate) fn from_u8(b: u8) -> Option<Self> {
         match b {
-            2 => AutoPolicyMode::Armed,
-            1 => AutoPolicyMode::DryRun,
-            _ => AutoPolicyMode::Off,
+            0 => Some(AutoPolicyMode::Off),
+            2 => Some(AutoPolicyMode::Armed),
+            _ => None,
         }
     }
 }
@@ -424,8 +413,8 @@ pub(crate) fn candidate_to_cmd(c: &PolicyCandidate) -> Option<Vec<String>> {
         POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
             Some(vec!["compact".to_string(), c.primary_part_id.to_string()])
         }
-        // Cluster-scoped; no target id. Used for the DryRun "would: …" log +
-        // the client-side cooldown key ("rebalance:0" via the default arm).
+        // Cluster-scoped; no target id. Used for the submission log + the
+        // client-side cooldown key ("rebalance:0" via the default arm).
         POLICY_KIND_REBALANCE => Some(vec!["rebalance".to_string()]),
         POLICY_KIND_SCRUB => Some(vec!["scrub".to_string(), "--all".to_string()]),
         POLICY_KIND_REPAIR => {
@@ -804,9 +793,19 @@ mod tests {
 
     #[test]
     fn mode_roundtrips_through_u8() {
-        for m in [AutoPolicyMode::Off, AutoPolicyMode::DryRun, AutoPolicyMode::Armed] {
-            assert_eq!(AutoPolicyMode::from_u8(m.as_u8()), m);
+        for m in [AutoPolicyMode::Off, AutoPolicyMode::Armed] {
+            assert_eq!(AutoPolicyMode::from_u8(m.as_u8()), Some(m));
         }
-        assert_eq!(AutoPolicyMode::from_u8(99), AutoPolicyMode::Off); // unknown → Off
+        // 1 was the removed observe mode: refused, not read as Off or Armed.
+        assert_eq!(AutoPolicyMode::from_u8(1), None);
+        assert_eq!(AutoPolicyMode::from_u8(99), None);
+    }
+
+    #[test]
+    fn a_persisted_observe_mode_is_refused() {
+        let mut st = AutoPolicyState::default();
+        let cfg = MgrAutoPolicyConfig { ver: 1, mode: 1, active: "gc-only".into(), policies: vec![] };
+        let e = st.load_config(cfg).unwrap_err();
+        assert!(e.contains("migratev1_v2"), "{e}");
     }
 }

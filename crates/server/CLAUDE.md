@@ -27,7 +27,7 @@ autumn-manager-server --cluster-secret-file FILE [--port 9001] [--listen 0.0.0.0
 - Without `--etcd`: in-memory only (metadata lost on restart, no leader election). With `--etcd`: persistent — holds `--manager-id` (required, non-zero, unique per manager; a second process with a held id waits), replays state, runs the leader-election loop. `autumn-op manager-remove <id> --by X` drops a stopped manager from the expected fleet.
 - Serves `StreamManagerService` + `PartitionManagerService` on the same port, plus gRPC reflection.
 - `--metrics-port <P>` / `--metrics-listen <H>`: opt-in Prometheus `/metrics` (unauthenticated; pin to 127.0.0.1 when the RPC plane is on 0.0.0.0).
-- The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy activate --arm`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op`. Runbook: `docs/ops.md`.
+- The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy start <NAME>`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op`. Runbook: `docs/ops.md`.
 - `--cluster-secret-file <FILE>` (REQUIRED on the manager, PS and EN; exit 2 without it): the cluster secret every Peer/Admin connection proves (`autumn_rpc::peer_auth`, `docs/cluster_secret_design.md`). `--admin-token[-file]` were removed and are refused by name.
 - Authz (opt-in): `--auth-signing-key-file <FILE>` enables data-plane authz (keys from `autumn-op gen-signing-key`). With a key, every keyed op needs a token (no protected-prefix list). `--auth-token-ttl-secs` / `--auth-clock-skew-secs` tune minted tokens.
 
@@ -106,11 +106,10 @@ No new dependency, wire format, or data-path work is added by this integration.
 - Policy write bodies are typed; invalid booleans, integers, switch names and
   option-like policy names fail before spawning the CLI. HTML event arguments
   encode both JS strings and HTML delimiters/entities.
-- Each policy row offers Start (`{active:name, enabled:true}`) and optional
-  Observe (`{active:name}`); the controller's Stop sends `{enabled:false}`.
-  Start's confirmation names the clicked policy and needs no status prefetch
-  or prior selection. Running / Observing / Stopped are presentation labels
-  for the existing Armed / DryRun / Off modes; no backend contract change.
+- Each policy row offers Start (`{active:name}` → `auto-policy start`); the
+  controller's Stop sends `{enabled:false}` (`deactivate`). Start's
+  confirmation names the clicked policy and needs no status prefetch or prior
+  selection. Running / Stopped are the Armed / Off modes.
 - The page checks HTTP errors and `{ok:false}` before success feedback, marks
   failed policy status as unknown, and shares concurrent reads per URL. A stale
   partition detail response cannot replace the selected partition's drawer.
@@ -148,7 +147,7 @@ Global `--cluster-secret-file` (position-independent): autumn-op connects as an 
 | Node lifecycle | `fence-node <id> --reason ... --by ... [--force]`, `maintenance <id> --reason ... --by ... [--expire TS]`, `unfence <id> --by ...`, `remove <id> --by ...`, `ps-remove <ps_id> --by ...` (drop a stopped, evicted PS from the expected fleet; refused while it is registered) |
 | Cluster / partition admin | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID> [--namespace <NS[/SUB]> [--at S \| --at-hex H]] [--at-raw-hex H]`, `presplit --namespace <NS[/SUB]> <rule flags>`, `merge <SURVIVOR> <VICTIM> [--force]`, `rebalance`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format <DIR>...` |
 | Auth / namespaces | `gen-cluster-secret`, `gen-signing-key [--kid K]`, `principal-create --principal P --grant P...`, `principal-delete --principal P`, `principal-list`, `mint-token --principal P --credential ...`, `namespace-create --name N [--presplit hex,…]`, `namespace-delete --name N`, `namespace-list` |
-| Auto-policy controller | `auto-policy status`, `auto-policy activate <NAME> [--arm]` (`--arm` = Armed, else DryRun), `auto-policy deactivate`, `auto-policy upsert <NAME> --switches split,gc,… [--interval N --cooldown N --max N --desc "…"]` (create/replace a custom policy), `auto-policy delete <NAME>`. Leader-routed |
+| Auto-policy controller | `auto-policy status`, `auto-policy start <NAME>` (select and run; `activate` / `--arm` were removed with the observe mode and are refused), `auto-policy deactivate`, `auto-policy upsert <NAME> --switches split,gc,… [--interval N --cooldown N --max N --desc "…"]` (create/replace a custom policy), `auto-policy delete <NAME>`. Leader-routed |
 | Async op-ledger | `ops status <OP_ID>` (one op, `unknown` if this leader doesn't know it), `ops list [--active] [--kind split\|merge\|rebalance\|compact\|gc\|forcegc\|ec\|recovery] [--limit N]`. The seven op triggers above submit here + print an `op_id`; global `--wait` blocks to terminal. **`recovery` is auto-dispatched** (never submitted — submit refuses it): it appears on its own and, while still `running`, carries the last failure as `ERROR[code]: reason` — including the executing node's own reason, which arrives on the `df` heartbeat rather than waiting for the next re-dispatch. Leader-routed |
 
 **Extent sharing (`info`).** Both extent views name the partitions holding a
@@ -436,9 +435,10 @@ One-shot converter for the manager's etcd records, run against a STOPPED cluster
 (it refuses while any manager is up: the leader key or any `managerAlive/<id>`
 present, since a surviving follower could win the election mid-run). It moves
 each `tenantAccount/<name>` to `principal/<name>` byte for byte (the record was
-only renamed; envelope type 2 / version 1 checked, body not decoded), then
-re-encodes every `namespace/<name>` from format 1 to 2 (drops `owner_tenant`,
-printing any owner it drops). Namespaces go last because a new manager refuses
+only renamed; envelope type 2 / version 1 checked, body not decoded), turns an
+`autoPolicy/config` in mode 1 (the removed observe mode) to mode 0 (off; a new
+manager refuses to lead on mode 1), then re-encodes every `namespace/<name>`
+from format 1 to 2 (drops `owner_tenant`, printing any owner it drops). Namespaces go last because a new manager refuses
 to lead while any namespace row is v1; every step skips finished work, so an
 interrupted run is simply re-run. `--dry-run` reports without writing. Delete
 this bin and the `autumn-etcd` dependency after it has run on the production

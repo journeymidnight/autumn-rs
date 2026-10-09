@@ -113,12 +113,11 @@ const OPS = {
   history_error: null,
 };
 const POLICIES = {
-  enabled: true, mode: "dry_run", active: "gc-only", allow_mutations: true,
+  enabled: true, mode: "armed", active: "gc-only", allow_mutations: true,
   policies: [{ name: "gc-only", desc: "Reclaim space only (GC)", builtin: true,
                interval: 30, cooldown: 120, max_actions: 2,
                switches: { split: false, ec: false, compact: false, gc: true, merge: false, rebalance: false } }],
   switch_order: ["split", "ec", "compact", "gc", "merge", "rebalance", "repair", "scrub"],
-  log: [{ ts: Math.floor(Date.now() / 1000), level: "would", msg: "would: autumn-op gc 168 (gc part 168 debt)" }],
 };
 const payload = { "/api/overview": OVERVIEW, "/api/ops": OPS, "/api/policies": POLICIES };
 const fetchStub = async p => ({ ok: true, json: async () => payload[p] ?? PART });
@@ -181,7 +180,7 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   want("#advisories", "major compaction before split", "the advisory keeps its whole reason");
   want("#advisories", "PS 3 partition size imbalance", "hot/cold is rendered in operator language");
   want("#advisories", "Information only", "hot/cold says it cannot execute an operation");
-  want("#polpreview", "would: autumn-op gc 168", "an observing policy's proposals are on the Policy tab");
+  want("#ctlstate", "Running", "the Policy tab says the policy runs");
   want("#ops_live", "gc", "running ops are on the Logs tab");
   want("#ops_live", "auto-policy", "…naming who asked, so the policy's own ops are told apart");
   want("#ops_hist", "no address for part 1", "…and a failed op keeps its reason");

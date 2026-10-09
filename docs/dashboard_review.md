@@ -12,7 +12,7 @@ binary name. `autumn-server` builds it by default; the example package is gone.
 | --- | --- | --- |
 | P1 | Policy names were HTML-escaped inside an inline JavaScript string. HTML entity decoding restores quotes before JavaScript executes; quotes break the handler and crafted names can execute script. The advisory argument helper also left HTML entities unescaped. | Fixed: one JSON-string encoder escapes `<`, `>`, `&` and apostrophes for the surrounding single-quoted HTML attribute. Policy names use it for both activate and delete. |
 | P1 | HTTP callers are not authenticated. autumn-op calls made on the caller's behalf prove the cluster secret the dashboard holds. The VKE APIG Ingress exposes all paths, including mutations; older comments incorrectly claimed ClusterIP meant private access. | Existing documented access contract retained, with contradictory comments corrected. This promotion does not introduce a login system. |
-| P1 | `autumn-op auto-policy activate` first sends SET_ACTIVE, then SET_MODE. SET_ACTIVE preserves the prior mode. If the old mode is Armed, selection intended as DryRun can temporarily inherit Armed; a failure between calls leaves partial state, and another operator can interleave a change. | Existing CLI/manager transaction gap recorded in `feature_list.md`. Not changed by moving the dashboard; requires an atomic name+mode operation and failure/concurrency tests across all callers. |
+| P1 | `autumn-op auto-policy start` first sends SET_ACTIVE, then SET_MODE. SET_ACTIVE preserves the prior mode; a failure between calls leaves the policy selected but Off, and another operator can interleave a change. (The observe mode, whose selection could inherit Armed, was removed in wire 60.) | Existing CLI/manager transaction gap recorded in `feature_list.md`. Not changed by moving the dashboard; requires an atomic name+mode operation and failure/concurrency tests across all callers. |
 | P2 | Failed policy writes return HTTP 502 and `{ok:false, output:...}`, but Save checked only `error`, announced success, and cleared the input. Activate/Arm/Stop/Delete ignored the result. A failed status response was interpreted as an empty Off configuration. | Fixed: check HTTP status and error/ok fields, show the upstream reason, retain failed edits, render unknown when status cannot be fetched, and clear that state after a successful refresh. |
 | P2 | Empty/incorrectly typed activation bodies could select the current policy and change its mode. Invalid numeric fields were silently omitted; `max_actions` above u32 was passed to a CLI parser that defaulted it. Option-like names were interpreted as CLI flags. | Fixed: typed policy write bodies, a required activation intent, validated names/switches/ranges, HTTP 400 before spawning a child; a failed status lookup for bare Arm remains HTTP 502. |
 | P2 | Each refresh could start another identical read while the previous CLI call was pending, up to its 30-second deadline. A late partition detail response could overwrite a newer selection. | Fixed in the page: concurrent GETs per URL share a promise; writes are never deduplicated/retried. Detail results are installed only for the still-selected partition. |
@@ -41,7 +41,7 @@ endpoint or deployment was contacted.
 - The real isolated API harness passes with etcd + manager + one two-disk EN +
   PS + dashboard. It verifies embedded HTML byte equality, topology/disk fields,
   partition detail, nonempty durable operation history, custom policy
-  create → DryRun → Armed → Off → delete, invalid payload rejection, built-in
+  create → start (Armed) → Off → delete, invalid payload rejection, built-in
   edit refusal, and HTTP 502 after terminating the manager. All policy switches
   are off during this test, so the Armed check does not actuate maintenance.
 - The JavaScript checks and real API harness are added to CI after the workspace
@@ -60,12 +60,11 @@ processes. No throughput improvement is claimed for the directory move.
 
 ## Policy controls follow-up — 2026-09-27
 
-The old page made the operator select a policy into DryRun before offering
-Arm. Each policy now has direct Start and optional Observe actions; Stop
-stops the current controller. Start sends the clicked name and `enabled:true`
-in one HTTP request, with no prior selection or active-policy lookup. Labels
-show Running / Observing / Stopped. This uses the existing HTTP/CLI interface;
-the name/mode RPC transaction finding above remains open.
+Each policy has a direct Start action; Stop stops the current controller.
+Start sends the clicked name in one HTTP request (`auto-policy start`), with no
+prior selection or active-policy lookup. Labels show Running / Stopped; the
+observe mode is gone (wire 60). The name/mode RPC transaction finding above
+remains open.
 
 The user explicitly confirmed retaining existing HTTP access and recording its
 risk while fixing functionality; authentication is not part of this work.

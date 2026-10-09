@@ -71,7 +71,7 @@ struct Args {
     /// seed this preset as the active policy (Armed) on a FRESH cluster. Deploy
     /// layer passes `balanced`; unset = controller stays Off (cluster.sh /
     /// tests). An Armed policy actuates (arming is per-policy via
-    /// `autumn-op auto-policy activate --arm`). The web dashboard is now a
+    /// `autumn-op auto-policy start <NAME>`). The web dashboard is now a
     /// standalone app (crates/server/src/bin/autumn_dashboard) — the manager no longer serves it.
     auto_policy_default: Option<String>,
 }
@@ -384,7 +384,7 @@ async fn main() -> Result<()> {
     // Seed the deploy-configured default active policy on a fresh cluster.
     // Validate the preset name up front — a typo must fail loud at startup, not
     // silently leave the controller Off. A seeded policy is Armed and actuates
-    // (arming is per-policy via `autumn-op auto-policy activate --arm`).
+    // (arming is per-policy via `autumn-op auto-policy start <NAME>`).
     if let Some(preset) = &args.auto_policy_default {
         if !AutumnManager::is_known_auto_policy_preset(preset) {
             anyhow::bail!(

@@ -2753,7 +2753,9 @@ pub struct MgrAutoPolicyEntry {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrAutoPolicyConfig {
     pub ver: u32,
-    /// 0=Off 1=DryRun 2=Armed (`auto_policy::AutoPolicyMode`).
+    /// 0=Off 2=Armed (`auto_policy::AutoPolicyMode`). 1 was the removed
+    /// observe mode: a persisted 1 refuses leadership until `migratev1_v2`
+    /// converts it to 0.
     pub mode: u8,
     /// Active policy name ("" = none selected).
     pub active: String,
@@ -2764,16 +2766,6 @@ pub struct MgrAutoPolicyConfig {
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrAutoPolicyCooldowns {
     pub entries: Vec<(String, i64)>,
-}
-
-/// One entry of what an observing (DryRun) policy would run (leader-local;
-/// served by AutoPolicyGet). An armed policy's actions are op-ledger ops.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct AutoPolicyLogEntry {
-    pub ts: i64,
-    /// "would" (older leaders also wrote "issued" / "refused" / "error").
-    pub level: String,
-    pub msg: String,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
@@ -2790,7 +2782,6 @@ pub struct AutoPolicyGetResp {
     pub allow_mutations: bool,
     /// Presets + custom (full list, for display).
     pub policies: Vec<MgrAutoPolicyEntry>,
-    pub log: Vec<AutoPolicyLogEntry>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]

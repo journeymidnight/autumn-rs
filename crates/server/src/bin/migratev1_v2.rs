@@ -2,7 +2,7 @@
 //! cluster, then delete this file** (and the `autumn-etcd` dependency it
 //! brings into this crate).
 //!
-//! Two changes to the manager's etcd records:
+//! Three changes to the manager's etcd records:
 //!
 //! 1. `tenantAccount/<name>` moves to `principal/<name>`. The value is copied
 //!    byte for byte: the record was only renamed (`TenantAccountRecord` →
@@ -14,6 +14,11 @@
 //!    (an `Option<String>` after `prefix`), so each value is decoded with the
 //!    vendored v1 shape and re-encoded as v2. A dropped owner is printed — it
 //!    fed only the retired `protected_prefixes` list, which no PS read.
+//! 3. `autoPolicy/config` in mode 1 (the removed observe mode) goes to mode 0
+//!    (off): observing ran nothing, and a manager refuses to lead on a mode it
+//!    does not have. The active policy stays selected; `auto-policy start`
+//!    runs it. The record is the bare rkyv `MgrAutoPolicyConfig`, unchanged in
+//!    layout.
 //!
 //! Namespaces go LAST: the built-in `fs`/`kvc`/`mem` rows exist on every
 //! bootstrapped cluster, and a new manager refuses to lead while any of them is
@@ -50,6 +55,9 @@ const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
 const MANAGER_ALIVE_PREFIX: &str = "managerAlive/";
 
 const OLD_ACCOUNT_PREFIX: &str = "tenantAccount/";
+const AUTO_POLICY_CONFIG_KEY: &str = "autoPolicy/config";
+/// The removed observe mode's byte; 0 is off.
+const AUTO_POLICY_MODE_OBSERVE: u8 = 1;
 const PRINCIPAL_PREFIX: &str = "principal/";
 const NAMESPACE_PREFIX: &str = "namespace/";
 
@@ -236,6 +244,51 @@ async fn convert_namespaces(
     Ok((converted, already))
 }
 
+/// The `autoPolicy/config` value with an observe mode turned off, or `None`
+/// when it needs nothing.
+fn convert_auto_policy(value: &[u8]) -> Result<Option<Vec<u8>>, String> {
+    let mut cfg: autumn_rpc::manager_rpc::MgrAutoPolicyConfig =
+        autumn_rpc::manager_rpc::rkyv_decode(value)
+            .map_err(|e| format!("decode {AUTO_POLICY_CONFIG_KEY}: {e}"))?;
+    if cfg.mode != AUTO_POLICY_MODE_OBSERVE {
+        return Ok(None);
+    }
+    cfg.mode = 0;
+    Ok(Some(autumn_rpc::manager_rpc::rkyv_encode(&cfg).to_vec()))
+}
+
+/// Turns an observing auto-policy off. Returns whether it changed anything.
+async fn convert_auto_policy_config(
+    client: &autumn_etcd::EtcdClient,
+    dry_run: bool,
+) -> Result<bool, String> {
+    let resp = client
+        .get(AUTO_POLICY_CONFIG_KEY.as_bytes())
+        .await
+        .map_err(|e| format!("get {AUTO_POLICY_CONFIG_KEY}: {e}"))?;
+    let Some(kv) = resp.kvs.first() else {
+        return Ok(false);
+    };
+    let Some(value) = convert_auto_policy(&kv.value)? else {
+        return Ok(false);
+    };
+    if dry_run {
+        return Ok(true);
+    }
+    let txn = client
+        .txn(autumn_etcd::proto::TxnRequest {
+            compare: vec![Cmp::value(&kv.key, &kv.value)],
+            success: vec![Op::put(&kv.key, &value)],
+            failure: vec![],
+        })
+        .await
+        .map_err(|e| format!("txn {AUTO_POLICY_CONFIG_KEY}: {e}"))?;
+    if !txn.succeeded {
+        return Err(format!("{AUTO_POLICY_CONFIG_KEY}: changed while converting; re-run"));
+    }
+    Ok(true)
+}
+
 const USAGE: &str = "usage: migratev1_v2 --etcd <http://host:2379[,…]> [--dry-run]";
 
 #[compio::main]
@@ -302,6 +355,14 @@ async fn main() -> ExitCode {
         ),
         Err(e) => {
             eprintln!("FAILED moving accounts: {e}\nnamespaces untouched; fix the cause and re-run");
+            return ExitCode::FAILURE;
+        }
+    }
+    match convert_auto_policy_config(&client, dry_run).await {
+        Ok(true) => println!("{AUTO_POLICY_CONFIG_KEY}: observe mode -> off"),
+        Ok(false) => println!("{AUTO_POLICY_CONFIG_KEY}: nothing to convert"),
+        Err(e) => {
+            eprintln!("FAILED converting the auto-policy config: {e}\nnamespaces untouched; fix the cause and re-run");
             return ExitCode::FAILURE;
         }
     }
@@ -380,4 +441,30 @@ mod tests {
         assert!(check_account(&envelope(RECORD_TYPE_PRINCIPAL_ACCOUNT, 1, b"x")).is_ok());
         assert!(convert_namespace(b"bare").is_err());
     }
+
+    #[test]
+    fn an_observing_auto_policy_is_turned_off_and_nothing_else_changes() {
+        use autumn_rpc::manager_rpc::{rkyv_decode, rkyv_encode, MgrAutoPolicyConfig, MgrAutoPolicyEntry};
+        let cfg = |mode| MgrAutoPolicyConfig {
+            ver: 1,
+            mode,
+            active: "my-policy".to_string(),
+            policies: vec![MgrAutoPolicyEntry {
+                name: "my-policy".to_string(),
+                switches: vec![false, false, false, true],
+                interval_sec: 30,
+                ..Default::default()
+            }],
+        };
+        let out = convert_auto_policy(&rkyv_encode(&cfg(1))).unwrap().expect("converted");
+        let got: MgrAutoPolicyConfig = rkyv_decode(&out).unwrap();
+        assert_eq!(got.mode, 0);
+        assert_eq!(got.active, "my-policy");
+        assert_eq!(got.policies.len(), 1);
+        assert_eq!(got.policies[0].switches, vec![false, false, false, true]);
+        assert!(convert_auto_policy(&rkyv_encode(&cfg(0))).unwrap().is_none());
+        assert!(convert_auto_policy(&rkyv_encode(&cfg(2))).unwrap().is_none());
+        assert!(convert_auto_policy(b"not rkyv").is_err());
+    }
+
 }

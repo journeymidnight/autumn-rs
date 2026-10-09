@@ -451,7 +451,6 @@ async fn run(args: Args) -> Result<()> {
         Command::AutoPolicy {
             action,
             name,
-            arm,
             switches,
             interval,
             cooldown,
@@ -463,7 +462,6 @@ async fn run(args: Args) -> Result<()> {
                 args.json,
                 &action,
                 &name,
-                arm,
                 &switches,
                 interval,
                 cooldown,
@@ -1609,7 +1607,7 @@ fn parse_switch_csv(csv: &str) -> Result<Vec<bool>> {
 
 /// Headless control of the leader-fenced auto-policy controller.
 ///   auto-policy status
-///   auto-policy activate <name> [--arm]   (select policy; --arm = actuate)
+///   auto-policy start <name>              (select the policy and run it)
 ///   auto-policy deactivate                (mode → Off)
 ///   auto-policy upsert <name> --switches split,gc,… [--interval N --cooldown N
 ///                              --max N --desc "…"]   (create/replace a custom policy)
@@ -1620,7 +1618,6 @@ async fn cmd_auto_policy(
     json: bool,
     action: &str,
     name: &str,
-    arm: bool,
     switches: &str,
     interval: Option<u64>,
     cooldown: Option<u64>,
@@ -1629,9 +1626,15 @@ async fn cmd_auto_policy(
 ) -> Result<()> {
     match action {
         "status" => {}
-        "activate" => {
+        // `activate` used to observe without `--arm`; letting it run the
+        // policy now would turn an old observe command into an armed one.
+        "activate" => anyhow::bail!(
+            "auto-policy activate was removed with the observe mode: \
+             `auto-policy start <name>` runs a policy, `deactivate` stops it"
+        ),
+        "start" => {
             if name.is_empty() {
-                anyhow::bail!("auto-policy activate requires a policy name");
+                anyhow::bail!("auto-policy start requires a policy name");
             }
             client
                 .auto_policy_set(AutoPolicySetReq {
@@ -1641,14 +1644,11 @@ async fn cmd_auto_policy(
                     entry: None,
                 })
                 .await?;
-            // ALWAYS set the mode explicitly so `activate` never silently
-            // inherits a prior Armed/Off (coco P2): --arm → Armed (actuates),
-            // else DryRun (runs + logs "would: …" but never actuates).
-            let mode = if arm { 2 } else { 1 };
+            // SET_ACTIVE keeps the mode; a stopped controller needs Armed.
             client
                 .auto_policy_set(AutoPolicySetReq {
                     op: AUTOPOLICY_OP_SET_MODE,
-                    mode,
+                    mode: 2,
                     name: String::new(),
                     entry: None,
                 })
@@ -1703,7 +1703,7 @@ async fn cmd_auto_policy(
         }
         other => anyhow::bail!(
             "unknown auto-policy action '{other}' \
-             (status|activate|deactivate|upsert|delete)"
+             (status|start|deactivate|upsert|delete)"
         ),
     }
 
@@ -1713,9 +1713,9 @@ async fn cmd_auto_policy(
         .await
         .map_err(|e| anyhow!("auto-policy status: {e}"))?;
     let mode_str = match st.mode {
-        2 => "armed",
-        1 => "dry_run",
-        _ => "off",
+        2 => "armed".to_string(),
+        0 => "off".to_string(),
+        other => format!("unknown({other})"),
     };
     if json {
         let policies: Vec<_> = st
@@ -1733,11 +1733,6 @@ async fn cmd_auto_policy(
                 })
             })
             .collect();
-        let log: Vec<_> = st
-            .log
-            .iter()
-            .map(|l| serde_json::json!({ "ts": l.ts, "level": l.level, "msg": l.msg }))
-            .collect();
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -1745,7 +1740,6 @@ async fn cmd_auto_policy(
                 "active": st.active,
                 "allow_mutations": st.allow_mutations,
                 "policies": policies,
-                "log": log,
             }))?
         );
     } else {
@@ -1762,12 +1756,6 @@ async fn cmd_auto_policy(
                 if p.builtin { "preset" } else { "custom" },
                 p.desc
             );
-        }
-        if !st.log.is_empty() {
-            println!("  would run (observing; an armed policy's actions are in `ops list`):");
-            for l in st.log.iter().take(10) {
-                println!("    [{}] {}", l.level, l.msg);
-            }
         }
     }
     Ok(())

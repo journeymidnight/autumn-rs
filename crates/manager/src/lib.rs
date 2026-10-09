@@ -975,7 +975,7 @@ pub struct AutumnManager {
     /// act on what they see.
     pub(crate) policy: Rc<RefCell<crate::policy::PolicyEngine>>,
     /// M2: in-manager auto-policy controller state — mode +
-    /// active policy + custom policies + cooldowns + rolling DryRun preview log.
+    /// active policy + custom policies + cooldowns.
     /// Config (mode/active/custom) is etcd-persisted (`autoPolicy/config`,
     /// leader-fenced) + cooldowns (`autoPolicy/cooldowns`), replayed on leader
     /// promotion so the active policy survives failover. The controller loop
@@ -1568,8 +1568,7 @@ impl AutumnManager {
         Self::spawn_supervised("policy_tick", move || mgr.clone().policy_tick_loop());
 
         // Leader-fenced auto-policy controller (DEFAULT-OFF;
-        // ticks + actuates ONLY on the leader; actuation is gated per-policy by
-        // the Armed vs DryRun mode).
+        // ticks + actuates ONLY on the leader, only while its mode is Armed).
         let mgr = self.clone();
         Self::spawn_supervised("auto_policy", move || mgr.clone().auto_policy_tick_loop());
 
@@ -1766,8 +1765,8 @@ impl AutumnManager {
     /// has NO persisted `autoPolicy/config` (a fresh cluster). In-memory only —
     /// the moment an operator changes the config (or deactivates) it persists and
     /// this never fires again for that cluster. `mode = Armed`, so a seeded
-    /// policy actuates on its own — arming is per-policy (Armed vs DryRun), with
-    /// no separate process-wide gate.
+    /// policy actuates on its own — arming is per-policy, with no separate
+    /// process-wide gate.
     ///
     /// Called from the bin AFTER `set_auto_policy_default`, because `new_with_etcd`
     /// runs the first replay + election in the constructor, before the flag exists.
@@ -1808,7 +1807,6 @@ impl AutumnManager {
             // wire (auto-policy status / the page) as "mutations are permitted".
             allow_mutations: true,
             policies: st.all_policies(),
-            log: st.log.iter().cloned().collect(),
         }
     }
 
@@ -1854,7 +1852,9 @@ impl AutumnManager {
             let mut new_custom = st.custom.clone();
             match op {
                 AUTOPOLICY_OP_SET_MODE => {
-                    new_mode = crate::auto_policy::AutoPolicyMode::from_u8(mode);
+                    new_mode = crate::auto_policy::AutoPolicyMode::from_u8(mode).ok_or_else(
+                        || AppError::InvalidArgument(format!("unknown auto-policy mode {mode} (0 = off, 2 = armed)")),
+                    )?;
                 }
                 AUTOPOLICY_OP_SET_ACTIVE => {
                     // "" = deactivate (no active policy selected).
@@ -2403,8 +2403,8 @@ impl AutumnManager {
     /// **INVARIANT (leader-only):** every tick begins with `leader.get()` — no
     /// candidate read, no decision, no actuation on a follower. DEFAULT-OFF: an
     /// `Off` mode (fresh cluster) does nothing, preserving pure-mechanism.
-    /// `Armed` actuates; `DryRun` logs "would: …" but never mutates — the mode
-    /// is the only gate (per-policy, no process-wide flag). Registered under
+    /// `Armed` actuates — the mode is the only gate (per-policy, no
+    /// process-wide flag). Registered under
     /// `spawn_supervised`. Replaces the retired Python `AutoPolicy` loop,
     /// hosted on the crash-safe leader instead of a killable webserver.
     async fn auto_policy_tick_loop(self) {
@@ -2414,7 +2414,7 @@ impl AutumnManager {
                 continue;
             }
             // Resolve the active policy under a short borrow.
-            let (mode, interval, cooldown, max_actions, enabled) = {
+            let (interval, cooldown, max_actions, enabled) = {
                 let st = self.auto_policy.borrow();
                 if st.mode == crate::auto_policy::AutoPolicyMode::Off {
                     continue;
@@ -2427,7 +2427,6 @@ impl AutumnManager {
                     continue;
                 }
                 (
-                    st.mode,
                     // Saturating: never let a huge value wrap i64 negative and
                     // bypass the cadence gates (coco P1; sanitize also clamps).
                     pol.interval_sec.min(crate::auto_policy::MAX_INTERVAL_SEC) as i64,
@@ -2443,11 +2442,6 @@ impl AutumnManager {
                 continue;
             }
             self.auto_policy.borrow_mut().last_tick_at = now;
-
-            // Actuate only when the active policy is Armed; DryRun records "would".
-            // (There is no longer a process-wide mutation gate — arming is per
-            // policy via `auto-policy activate --arm`.)
-            let armed = mode == crate::auto_policy::AutoPolicyMode::Armed;
 
             let candidates = self.policy.borrow().advisory_cache.clone();
             let cooldowns = self.auto_policy.borrow().cooldowns.clone();
@@ -2466,14 +2460,6 @@ impl AutumnManager {
             for (cand, cmd, key) in actions {
                 let desc = crate::auto_policy::describe_candidate(&cand);
                 let cmd_str = cmd.join(" ");
-                if !armed {
-                    self.auto_policy.borrow_mut().record(
-                        now,
-                        "would",
-                        format!("would: autumn-op {cmd_str} ({desc})"),
-                    );
-                    continue;
-                }
                 // A ledger op like an operator's: it shows in `ops list` while it
                 // runs and in `ops history` when it ends, refusals included.
                 let Some(spec) = crate::auto_policy::candidate_to_submit(&cand) else {
@@ -3439,7 +3425,10 @@ impl AutumnManager {
         if let Some(kv) = autopolicy_config_kv.kvs.first() {
             let cfg: MgrAutoPolicyConfig =
                 rkyv_decode(&kv.value).map_err(Self::replay_decode_err)?;
-            self.auto_policy.borrow_mut().load_config(cfg);
+            self.auto_policy
+                .borrow_mut()
+                .load_config(cfg)
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
         // record whether this cluster carried a
         // persisted auto-policy config, so `apply_auto_policy_default` (called

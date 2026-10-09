@@ -247,8 +247,8 @@ effective = max(size_bytes, est_live)
   （低估侧由 `max` 兜住）。
 - **已知缺口**：`sealed_sum` 是单次当前快照，被套用到滑动窗口的每一个 bucket，
   所以 size 维度**不参与**「N 个 bucket 全触发」的去抖 —— sealed 的一次阶跃会
-  在一个 tick 内就够到 size 触发器。今天可接受（auto-exec 默认关，只影响
-  `policy-candidates` 的 DryRun advisory；sealed 是慢变量；split/merge 都有
+  在一个 tick 内就够到 size 触发器。今天可接受（只有启动了开 split/merge 的
+  policy 才会执行，否则只影响 `policy-candidates` advisory；sealed 是慢变量；split/merge 都有
   cooldown）。**arm 基于 size 的 auto-exec 之前必须先修**：要么把 sealed 挪出
   热路径做 per-bucket 历史，要么把 size 维度整个移出去抖。
 

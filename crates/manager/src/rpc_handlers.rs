@@ -4820,7 +4820,7 @@ impl AutumnManager {
     // ── auto-policy controller RPCs (headless control) ────
 
     pub(crate) async fn handle_autopolicy_get(&self, _payload: Bytes) -> HandlerResult {
-        // Leader-only: the live state + preview log are leader-local, and the
+        // Leader-only: the live state is leader-local, and the
         // controller loop only runs on the leader (a follower's replayed config
         // is stale). Sister to the MSG_GET_POLICY_CANDIDATES gate.
         if !self.leader.get() {
@@ -4831,7 +4831,6 @@ impl AutumnManager {
                 active: String::new(),
                 allow_mutations: false,
                 policies: Vec::new(),
-                log: Vec::new(),
             }));
         }
         Ok(rkyv_encode(&self.autopolicy_snapshot()))
