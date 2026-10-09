@@ -364,15 +364,63 @@ vp_head replay correctness; `splice_streams_without_new_tail` for row+meta;
 + victim deletes — the linearization point); (3) verify-at-apply + apply.
 
 `handle_merge_partitions` wraps that txn with a TiKV-PrepareMerge-style freeze-drain
-so writes that would race the flush→commit window are halted at the source. It first
-acquires an admin owner-lock **keyed on the partition pair** (so concurrent merge
-attempts targeting the same survivor serialize on the manager), then
-`MSG_MERGE_FREEZE{true}` to victim then survivor (drains inflight, flushes imms,
-halts new writes with `CODE_UNAVAILABLE`, returns only after a durable post-freeze
-checkpoint) → capture `commit_length` ×6 → `handle_multi_modify_merge` → on OK do
-NOT explicitly unfreeze (each PS's `region_sync_loop` sees the new (rg, stream_ids)
-and reopens the survivor = natural unfreeze); on error best-effort unfreeze. PS-side
-`FREEZE_TTL` (30 s) is the final backstop, so no procedure-WAL is needed.
+so writes that would race the flush→commit window are halted at the source. It
+acquires the txn's admin owner-lock (`admin-merge:S:V`; two merges of one pair are
+kept apart by the topology hold, not by this lock), then `MSG_MERGE_FREEZE{true}` to
+victim then survivor (drains inflight, flushes imms, halts new writes with
+`CODE_UNAVAILABLE`, returns only after a durable post-freeze checkpoint) → **takes
+both sources over** → captures `commit_length` ×6 under the sources' epochs →
+`multi_modify_merge` → on OK does NOT explicitly unfreeze (each PS's
+`region_sync_loop` sees the new (rg, stream_ids) and reopens the survivor = natural
+unfreeze); on error best-effort unfreeze. PS-side `FREEZE_TTL` (30 s) is the final
+backstop, so no procedure-WAL is needed.
+
+**The freeze is not what makes the captured lengths final.** It lives in PS memory,
+and three things undo it while the merge sits between capture and commit: the PS
+restarts (its reopen starts unfrozen), a `freeze=false` the merge did not send
+arrives (a deposed leader's rollback — the rollback is not leader-fenced), or
+`FREEZE_TTL` lapses (a slow etcd txn). Each let the PS ack writes past the captured
+lengths, which the commit then sealed away — every write acked in the window was
+lost (386, 224, 148) in `tests/system_merge_freeze_races.rs`. So
+`take_merge_sources` does what a partition takeover does: acquire `partition/<id>`
+for each source (the manager refuses the old owner's alloc / punch / truncate) and
+fence the tail of all six streams at that epoch (`fence_stream_tail`,
+`MSG_FENCE_EXTENT`; the ENs refuse the old owner's appends). The commit then
+refuses (`MergeSources::verify`, in memory after the Phase-1.5 await;
+`mod_revision` compares on `ownerLocks/partition/<id>` in the etcd txn) once a
+source was acquired again — a reopen may have acked writes the capture does not
+hold — or a stream's tail is no longer the extent it fenced (an alloc that passed
+the old owner's check before the takeover can still land a new, unfenced tail; the
+capture checks the measured tail too). All six source streams are value-CAS'd for
+the same reason. The takeover fences each tail on at least one member; that is
+enough because an append is acked only when every replica took it.
+
+The takeover cannot cover the window BEFORE it: between a source's freeze OK
+and the takeover, a restart or a stale unfreeze lets the PS ack writes under its
+old epoch, the capture then includes them, and every check above passes — but
+the merged open replays nothing before the sources' freeze checkpoints, so those
+writes are gone (40 of 80 in `stale_unfreeze_before_the_takeover`). So the
+freeze reply carries the log position its drain checkpointed
+(`MergeFreezeResp.log_tail_extent_id/log_end`, wire 61) and the merge refuses
+unless the captured log ends exactly there ("partition N took writes after its
+freeze drain"). Every acked write goes through the log, so the log alone
+suffices.
+
+A failed merge leaves the sources fenced: the partition's next append is
+refused (that one write fails, not acked), it poisons itself and reopens under a
+fresh epoch on the next region sync (the tests check writes resume). A refusal
+caught only by the etcd compare reads as the generic CAS-conflict precondition,
+and a reopen landing between the takeover and the capture as `commit_length
+stream N: <owner-epoch mismatch>`.
+The 15 s commit deadline that used to guard the TTL case is gone: a commit
+landing after the TTL is now either safe or refused, and an etcd stall now holds
+the merge (and its topology hold) for as long as the stall, then refuses or
+commits, instead of aborting at 15 s. Ablations: no
+fence → the TTL and stale-unfreeze cases red; no owner check → all three red; a
+wrong `ownerLocks/` key in the txn → the etcd-backed merge red;
+`merge_sources_tests` covers the moved tail; no drained-cursor check →
+`stale_unfreeze_before_the_takeover` red. A self-merge is refused before
+anything freezes (the takeover would acquire the one partition twice).
 
 ### Topology gate (`topology_gate.rs`)
 
@@ -1316,11 +1364,10 @@ clone. A stream-membership baseline verify runs for BOTH paths (refuse if
   asymmetry (load-bearing):** merge captures baselines in **Phase 1** (it has a
   Phase-1.5 `alloc_extent_on_node` await; a Phase-2 capture would read already-mutated
   or deleted state); split captures in **Phase 2** (its only await is the Phase-2 write
-  itself — CoW, no Phase-1.5 alloc). Split-source / merge-victim *membership* is
+  itself — CoW, no Phase-1.5 alloc). Split-source *membership* is
   intentionally NOT CAS'd: the source is `frozen_for_split` + holds gc/compact gates,
-  the victim is `frozen_for_merge`, and every victim extent's `refs` write is CAS'd —
-  so the only reachable concurrent mutation (a cross-partition GC punch on a CoW-shared
-  extent) trips the `refs` CAS. STILL DEFERRED (reproduce-first, not reproduced): the
+  and every extent's `refs` write is CAS'd. Merge CAS's all six source streams: its
+  freeze can be undone under it (see Merge). STILL DEFERRED (reproduce-first, not reproduced): the
   eversion/replicates/avali writes on the stream-layer appliers
   (`apply_ec_conversion_done`, `apply_recovery_done`, split's source-tail eversion
   bump) — protected today by await-adjacency, the ledger, and before-await verify.

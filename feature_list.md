@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-07
+**Last updated:** 2026-10-09
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -18,6 +18,12 @@
 - **Trigger** (2026-10-08 代码评审): `handle_stream_alloc_extent` 的成员校验比较的 baseline 是在 commit_length 探测 / `place_extents_with_fallback` 这些 await 之后才构造的，构造与校验之间没有 await，所以永远相等；etcd CAS 的 baseline 同样取在 await 之后。awaits 期间的并发成员变更因此被吸收。tail 已 sealed 时，同一 stream 的两次并发 alloc 都能成功，留下 `[.., T, N1, N2]`：一个 open 的 N1 卡在 stream 中间。
 - **Scope**: 先用 failpoint 卡住一次 alloc 的 await、并发再发一次 alloc 来复现；复现后把 baseline 取在第一个 await 之前（与 tail_id 同一时刻），让校验与 CAS 真正比较 await 前后。
 - **Acceptance**: 复现用例在修复前失败（stream 中间出现 open extent 或两次都成功），修复后第二次 alloc 被拒（Precondition）并能重试成功；既有 alloc/split/merge/GC 回归全绿。
+- `passes: false`
+
+### BUG-OWNER-EPOCH-MEMORY-BACKWARDS — 同一 key 的两次 acquire 交错时，内存 epoch 可能落后于 etcd（推断，未复现）
+- **Trigger** (2026-10-09 merge 接管修复的 fable 评审): etcd 模式下 `acquire_owner_epoch` 先 await 事务，再无条件 `owner_epochs.insert(rev)`。两次并发 acquire（如 merge 接管与 PS 重开）事务 rev 100、101，若 continuation 逆序恢复，内存留 100、etcd 是 101。后果：持 101 的一方被 `ensure_owner_epoch` 拒（poison → 重开 → 收敛，不卡死）；持 100 的一方通过所有内存检查——merge 现在靠事务里的 `mod_revision` 比较兜住。
+- **Scope**: 先复现（manager 侧在 acquire 的 await 之后挂暂停点，让两次 acquire 逆序落内存）。坐实后插入改为取 max，并核对 replay 的一致性。
+- **Acceptance**: 确定性复现或不可达证据；修则内存 epoch 永不回退，消融变红。
 - `passes: false`
 
 ### F-ETCD-AUTH — manager 连接带认证/TLS 的 etcd
@@ -313,28 +319,16 @@
   消融能变红。
 - `passes: false`
 
-### BUG-MERGE-FREEZE-PS-RESTART — freeze 应答后、merge 提交前 PS 重启，重启后接受的写会被 merge 丢掉（推断，未复现）
-- **Trigger** (2026-10-06，F-REVIEW-V1-MERGE-REPLAY 的 fable 评审): freeze 只存在 PS 内存。某一侧回了 freeze OK 之后崩溃并重开（`frozen_for_merge = None`），manager 还在抓 6 个 commit_length 或提交事务；重开的分区接受客户端写。merge 提交后，合并打开从最新的源 cursor（victim 的）开始重放，survivor 这段写不会被重放，即使被读到也会被并集 max_seq 跳过。`admin-merge:S:V` owner key 只是 epoch bump，不 fence 这个 PS。
-- **Scope**: 先复现（PS 子进程：freeze OK 后 SIGKILL，重开，写，再让 manager 提交）。坐实后从根因修：让 merge 提交能发现某一侧已不在它冻结时的状态（例如 fence 源分区的 owner epoch，或在事务里校验源分区自 freeze 以来没有重开），不是加超时。
-- **Acceptance**: 确定性复现，或说明前提不可达的代码证据；修则 ACK 数据全部可读，消融变红。
-- `passes: false`
-
-### BUG-MERGE-STALE-ROLLBACK-UNFREEZE — 一次 merge 的回滚可能解冻另一次并发 merge 以为冻住的那一侧（推断，未复现）
-- **Trigger** (2026-10-06，同上评审): `MSG_MERGE_FREEZE{freeze:false}` 无条件清 `frozen_for_merge`；`acquire_owner_epoch` 只 bump epoch，不串行化同一对分区的并发 merge（`handle_merge_partitions` 里"two concurrent merge attempts ... serialize on the manager"的注释不准确）。A、B 两次同对 merge：B 的 freeze 命中"already drained-frozen"拿到 OK，A 失败回滚把这一侧解冻，B 继续抓 commit_length 并提交，期间该侧已在接受写。
-- **Scope**: 先复现（两个并发 `MSG_MERGE_PARTITIONS`，让 A 在 freeze 后失败）。坐实后让解冻只作用于发出它的那次 freeze（freeze 带 attempt 身份），或在 manager 侧真正串行化同对 merge；同时改正注释。
-- **Acceptance**: 确定性复现或不可达证据；修则 B 提交时 ACK 数据全部可读，消融变红。
-- `passes: false`
-
-### BUG-MERGE-COMMIT-DEADLINE-BEFORE-TXN — 提交截止时间在 etcd 事务前检查，事务本身无上限（推断，未复现）
-- **Trigger** (2026-10-06，同上评审): `MERGE_FREEZE_COMMIT_DEADLINE`（15 s）在 `handle_multi_modify_merge` 之前检查；etcd 事务本身没有截止时间。事务若超过 `FREEZE_TTL`（30 s）才落地，PS 已自动解冻并在旧尾部继续 ACK 写，merge 按抓到的长度 seal，这些写在 sealed length 之后，丢失（与重放去重无关）。
-- **Scope**: 先复现（在事务前后注入 etcd 延迟，或 manager 侧暂停点放到事务内）。坐实后从根因修：让提交在 PS 解冻后不可能成立（例如 PS 解冻时 fence 掉 merge 的 owner epoch），而不是再加一个超时。
-- **Acceptance**: 确定性复现或不可达证据；修则 ACK 数据全部可读，消融变红。
-- `passes: false`
-
 ### BUG-MERGE-FREEZE-REPLY-LOST — freeze OK 在网络上丢失时，那一侧冻到 FREEZE_TTL（推断，不丢数据）
 - **Trigger** (2026-10-06，同上评审): PS 已把 OK 交给连接（`succeeded && delivered`），但回复没到 manager（30 s `call_timeout` 恰等于 `FREEZE_TTL`，或回复写出时连接断）。manager 视为失败，回滚列表不含这一侧；PS 保持冻结直到 TTL，期间拒写。不丢数据：已排空、全程拒写，重试命中"already drained"是合法的。
 - **Scope**: 量一下实际影响（一次 30 s 拒写）再决定是否修；修法候选：manager 回滚时也给失败的一侧发 `freeze=false`（它可能已冻住）。
 - **Acceptance**: 复现一次回复丢失后该侧在有界时间内恢复可写；消融变红。
+- `passes: false`
+
+### F-SPLIT-PHASE1-WAIT-REASON — split 阶段 1 把三种长等待都显示成同一个 "1/6"
+- **Trigger** (2026-10-09 用户 dashboard 截图: split 2684 停在 `17% · 1 / 6 phases` 两分钟，以为 dashboard 超时): 阶段 1 里有三处可能等很久——本分区的 maintenance gate（在跑的 compaction/GC）、PS 级 compaction 名额（`--major-compact-parallelism` 默认 4，别的分区占满也排队）、没给 `--at` 时对全部 SST 用户 key 做的中位扫描。ops 表和 dashboard 只显示 1/6，分不出在等哪个。dashboard 提交本身不等 split（`autumn-op split` 不带 `--wait`，立即返回 op id）。
+- **Scope**: 先量：大分区上中位扫描的耗时，真实集群上阶段 1 的时长分布。再定：(a) 阶段 1 上报等待原因（op message 或子阶段）；(b) 中位 key 是否改从 SST 索引块估算；(c) split 是否应占 PS 级 compaction 名额。
+- **Acceptance**: `ops status` 与 dashboard 能区分三种等待；若改中位估算，给出大分区上扫描耗时的前后对比，切点误差界写明。
 - `passes: false`
 
 ### F-SPLIT-CARRIED-BYTES-UNBOUNDED — 大 value 分区可以无限长大，而现在没有任何判据会说话

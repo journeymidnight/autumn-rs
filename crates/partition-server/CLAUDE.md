@@ -2536,8 +2536,16 @@ Three fixes bound the restart replay window (worst case per partition =
     txn had no drain and lost a source's unflushed writes, so its opcode
     (0x34) is retired: `handle_multi_modify_merge` runs only inside
     `handle_merge_partitions`.
+    The freeze alone does not keep a write out of the merge: a restart, a stale
+    `freeze=false` or `FREEZE_TTL` lift it. The freeze OK carries the drained log
+    position (`MergeFreezeResp.log_tail_extent_id/log_end`, = `durable_ckpt_vp`,
+    also on the "already drained-frozen" reply); the manager then takes the
+    partition over (`partition/<id>` acquired, all three tails fenced), so the old
+    open's appends and stream ops are refused from then on, and refuses the merge if
+    the log no longer ends at the drained position (manager CLAUDE.md, Merge).
     Recovery on failure: manager sends `MSG_MERGE_FREEZE { freeze: false }` rollback; the
-    FREEZE_TTL backstop fires if even that fails. Merge wallclock is ~2–3 s (bounded by
+    FREEZE_TTL backstop fires if even that fails. Once taken over, the partition's next
+    append is refused and it reopens under a fresh epoch (`poison_for_fence`). Merge wallclock is ~2–3 s (bounded by
     the region_sync tick) but write loss is 0. This model avoids cross-thread plumbing
     (each `PartitionData` is `Rc<RefCell<>>`, `!Send`) that a PS-orchestrated design
     would need.

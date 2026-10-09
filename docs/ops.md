@@ -217,7 +217,7 @@ autumn-op ops status <ID>        # progress_done / progress_total = phase / phas
 |---|---|---|
 | 1 | accepted; waiting on the maintenance gate, choosing a split key | owner lock held |
 | 2 | frozen — writes stop here | both partitions frozen |
-| 3 | drained (compaction + GC + flush) | all six `commit_length`s captured |
+| 3 | drained (compaction + GC + flush) | both taken over, all six `commit_length`s captured |
 | 4 | `commit_length` captured | metadata merge committed |
 | 5 | metadata cut committed | — |
 | 6 | unfrozen | — |
@@ -227,8 +227,11 @@ wait, the median scan and the drain dominate, and a byte counter that sits still
 through them reads as a hang.
 
 **Phase 1 is where a split waits, and it is not frozen there** — it is queued
-behind an in-flight compaction on the partition, or scanning SSTs for a split
-key. A split sitting at 1 is normal and costs nothing but time.
+behind an in-flight compaction or GC on the partition, behind the PS-wide
+compaction slots (`--major-compact-parallelism`, default 4: busy compactions of
+OTHER partitions on the same PS hold a split here too), or scanning every SST
+key for the median (no `--at`). `autumn-op ops --active` shows which: a
+compact/gc on the same partition or PS, or none (the scan). A split sitting at 1 is normal and costs nothing but time.
 **Phase 2 and 3 are the frozen ones**, and they are bounded: `FREEZE_TTL` is
 30 s, so a split cannot sit frozen for minutes. If you see a partition frozen
 longer than that, the freeze is orphaned, not slow.
@@ -304,6 +307,25 @@ Measured 2026-09-27: split held 1/6–2/6 through a 15 s stall and finished 6/6
 0.3 s after SIGCONT; merge held 1/4 through 7 s and finished 4/4. Split's phases
 come from the PS (`set_maintenance_phase`), merge's from the manager's
 orchestrator; with either report removed, the same run shows no phase at all.
+
+**A merge takes both partitions over before it measures them.** After the
+freeze it acquires each partition's owner lock and fences its stream tails, so a
+PS that restarts, gets unfrozen by a stale rollback, or outlives `FREEZE_TTL`
+cannot ack a write the merge will seal away: the merge is refused
+(`merge source reopened: ...`, `tail moved from fenced extent ...`,
+`partition N took writes after its freeze drain`, or the generic CAS-conflict
+precondition) and is retried later. A merge refused after the takeover (any
+of those reasons) leaves both partitions fenced — one refused at the freeze
+step fences nothing: the FIRST write to each fails (not acked; clients retry), the partition
+logs `fenced (LockedByOther) — poisoning partition for fresh-epoch reopen` and
+serves again after its next region sync. Check: after a refused merge, a
+`put` then `get` of a key in each partition's range succeeds (allow one retried
+`put`). The
+races themselves are driven by
+`cargo test -p autumn-manager --test system_merge_freeze_races -- --test-threads=1`
+(PS restart, stale unfreeze before and after the takeover, commit after
+`FREEZE_TTL`, and a merge through a real etcd; ~2 min). Wire 61: the manager and
+every PS must run the same build.
 
 **`cannot split: partition has overlapping keys`** is not an error to chase: the
 PS refuses to split while the LSM still has overlapping key ranges

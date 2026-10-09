@@ -7727,14 +7727,20 @@ async fn try_complete_freeze_drain(
     // Merge ack: external RPC resp.
     let merge_ack = part.borrow().freeze_drain_ack.borrow_mut().take();
     if let Some(ack) = merge_ack {
+        // `publish_freeze_checkpoint` just set it to the drained log end.
+        let ckpt = part.borrow().durable_ckpt_vp.get();
         let resp = match &drain_err {
             None => partition_rpc::MergeFreezeResp {
                 code: partition_rpc::CODE_OK,
                 message: String::new(),
+                log_tail_extent_id: ckpt.0,
+                log_end: ckpt.1,
             },
             Some(e) => partition_rpc::MergeFreezeResp {
                 code: partition_rpc::CODE_UNAVAILABLE,
                 message: format!("freeze drain flush failed: {e}"),
+                log_tail_extent_id: 0,
+                log_end: 0,
             },
         };
         let succeeded = resp.code == partition_rpc::CODE_OK;
@@ -7797,6 +7803,8 @@ fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64) {
                 let resp = partition_rpc::MergeFreezeResp {
                     code: partition_rpc::CODE_PRECONDITION,
                     message: "freeze TTL expired (orchestrator crash backstop)".to_string(),
+                    log_tail_extent_id: 0,
+                    log_end: 0,
                 };
                 let _ = ack.send(Ok(partition_rpc::rkyv_encode(&resp)));
             }
@@ -8139,6 +8147,8 @@ async fn handle_incoming_req(
                 let resp = MergeFreezeResp {
                     code: CODE_OK,
                     message: String::new(),
+                    log_tail_extent_id: 0,
+                    log_end: 0,
                 };
                 let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                 return;
@@ -8160,15 +8170,21 @@ async fn handle_incoming_req(
                         code: CODE_PRECONDITION,
                         message: "partition is frozen for split; retry merge after split completes"
                             .to_string(),
+                        log_tail_extent_id: 0,
+                        log_end: 0,
                     };
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
                 }
                 if p.frozen_for_merge.get().is_some() && p.freeze_drain_ack.borrow().is_none() {
-                    // Already fully drained-frozen — reply OK immediately.
+                    // Already fully drained-frozen — reply OK immediately, with
+                    // the cursor that drain checkpointed.
+                    let ckpt = p.durable_ckpt_vp.get();
                     let resp = MergeFreezeResp {
                         code: CODE_OK,
                         message: String::new(),
+                        log_tail_extent_id: ckpt.0,
+                        log_end: ckpt.1,
                     };
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
@@ -8177,6 +8193,8 @@ async fn handle_incoming_req(
                     let resp = MergeFreezeResp {
                         code: CODE_PRECONDITION,
                         message: "freeze already in progress".to_string(),
+                        log_tail_extent_id: 0,
+                        log_end: 0,
                     };
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
@@ -8195,6 +8213,8 @@ async fn handle_incoming_req(
                         message: "cannot merge: partition has overlapping keys (CoW tables \
                                   from a split); major-compact it first"
                             .to_string(),
+                        log_tail_extent_id: 0,
+                        log_end: 0,
                     };
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;

@@ -915,6 +915,12 @@ pub struct MergeFreezeReq {
 pub struct MergeFreezeResp {
     pub code: u8,
     pub message: String,
+    /// On a freeze OK: the log position the drain checkpointed at
+    /// (`(tail extent, committed end)`). The manager's capture must measure
+    /// exactly this, or the partition took writes after the drain. `(0, 0)`
+    /// otherwise.
+    pub log_tail_extent_id: u64,
+    pub log_end: u64,
 }
 
 // manager → PS "seal + roll these open tails" (see MSG_ROLL_TAILS).

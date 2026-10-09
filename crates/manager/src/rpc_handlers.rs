@@ -33,27 +33,6 @@ impl Drop for SplitInflightGuard {
     }
 }
 
-/// The PS-side `FREEZE_TTL` (`crates/partition-server/src/lib.rs`, 30 s at time
-/// of writing — this const MUST stay comfortably below it; if FREEZE_TTL
-/// changes, revisit this) auto-unfreezes a merge/split freeze after that long.
-/// The manager MUST land the merge txn while the pair is PROVABLY still frozen,
-/// otherwise the seal records a STALE captured `commit_length` and silently
-/// drops the writes that resumed on the victim tail post-unfreeze (reproduced
-/// deterministically: `system_merge_freeze_lostupdate`). Mirrors the split
-/// path's PS-side `split_freeze_deadline` budget — merge is manager-driven, so
-/// the budget lives here.
-///
-/// Unlike split (which bounds its commit RPC with `SPLIT_CALL_TIMEOUT` = 8 s),
-/// the merge Phase-2 `txn_fenced` here is NOT wrapped in an explicit hard
-/// timeout — it relies on the etcd client's own bound, which can be ~10 s under
-/// a degraded etcd. So the deadline is set conservatively: FREEZE_TTL(30) −
-/// worst-case txn(~12) − safety(2) = 15 s. A merge that reaches the budget check
-/// within 15 s of issuing the freeze then commits with ≥ 3 s of headroom before
-/// the PS could unfreeze even if the txn itself runs long. (A merge slower than
-/// 15 s here is pathological; the abort is retryable, so a rare false-abort only
-/// costs a retry, never data.)
-const MERGE_FREEZE_COMMIT_DEADLINE: Duration = Duration::from_secs(15);
-
 /// A non-force fence needs the nodes that may receive its slots to report this
 /// multiple (1.2x) of the bytes it moves off, so recovery does not fill them.
 const FENCE_HEADROOM_NUM: u64 = 12;
@@ -61,14 +40,60 @@ const FENCE_HEADROOM_DEN: u64 = 10;
 
 /// Test-only failpoint: sleep this many ms between the commit_length capture and
 /// the merge txn inside `handle_merge_partitions`, simulating a paused/slow
-/// coordinator so the freeze-budget guard can be exercised deterministically.
-/// Always compiled (the failpoints idiom) so an integration test can arm it —
+/// coordinator (`tests/system_merge_freeze_races.rs`). Always compiled (the failpoints idiom) so an integration test can arm it —
 /// production always leaves it 0, making the hook a single relaxed load per
 /// (rare) merge. A process-global (not thread-local) so a test thread can arm it
 /// for the manager's own runtime thread. Re-exported from `lib.rs`.
 #[doc(hidden)]
 pub static MERGE_TEST_PAUSE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only failpoint like `MERGE_TEST_PAUSE_MS`, between the freezes and the
+/// takeover.
+#[doc(hidden)]
+pub static MERGE_TEST_TAKEOVER_PAUSE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// What a merge took from its two sources before measuring them.
+#[derive(Default)]
+pub(crate) struct MergeSources {
+    /// `(partition/<id>, epoch)` the merge acquired for each source; the
+    /// commit refuses once either was acquired again (a reopen).
+    owners: Vec<(String, i64)>,
+    /// `(stream_id, tail extent id)` fenced at its source's epoch; the commit
+    /// refuses once a stream's tail is another extent.
+    tails: Vec<(u64, u64)>,
+}
+
+impl MergeSources {
+    /// `(owner_key, epoch, fenced tail)` for one of the six source streams.
+    fn for_stream(&self, stream_id: u64) -> (String, i64, u64) {
+        let i = self
+            .tails
+            .iter()
+            .position(|(sid, _)| *sid == stream_id)
+            .expect("every source stream is fenced");
+        let (key, epoch) = &self.owners[i / 3];
+        (key.clone(), *epoch, self.tails[i].1)
+    }
+
+    /// Both checks against the manager's current state.
+    fn verify(&self, s: &crate::store::MetadataState) -> Result<(), AppError> {
+        for (key, epoch) in &self.owners {
+            s.ensure_owner_epoch(key, *epoch)
+                .map_err(|e| AppError::Precondition(format!("merge source reopened: {e}")))?;
+        }
+        for (sid, tail) in &self.tails {
+            let now = s.streams.get(sid).and_then(|st| st.extent_ids.last().copied());
+            if now != Some(*tail) {
+                return Err(AppError::Precondition(format!(
+                    "stream {sid} tail moved from fenced extent {tail} to {now:?}; retry merge"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
 
 impl AutumnManager {
     // ── Serve ──────────────────────────────────────────────────────────
@@ -3714,7 +3739,19 @@ impl AutumnManager {
     // Single-txn etcd commit — crash mid-merge means no state
     // change. Inflight checks + verify-at-apply on
     // pre_bump_eversion. The leader fence is already applied via put_and_delete_txn.
+    /// The merge txn with no source fence, for unit tests of the txn itself.
+    #[cfg(test)]
     pub(crate) async fn handle_multi_modify_merge(&self, payload: Bytes) -> HandlerResult {
+        let req: MultiModifyMergeReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        self.multi_modify_merge(req, &MergeSources::default()).await
+    }
+
+    async fn multi_modify_merge(
+        &self,
+        req: MultiModifyMergeReq,
+        sources: &MergeSources,
+    ) -> HandlerResult {
         if let Err(err) = self.ensure_leader() {
             return Ok(rkyv_encode(&MultiModifyMergeResp {
                 code: Self::err_to_code(&err),
@@ -3722,8 +3759,6 @@ impl AutumnManager {
                 new_log_tail_extent_id: 0,
             }));
         }
-        let req: MultiModifyMergeReq =
-            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
         // capture verified-online node set BEFORE borrowing the
         // store. Passed into the Phase-1 select_nodes call.
@@ -3748,13 +3783,13 @@ impl AutumnManager {
             selected_nodes: Vec<NodeRecord>,
             new_tail_replicas: u32,
             pre_bump_eversion: HashMap<u64, u64>,
-            // Item 3 (uniform CAS): value-CAS baseline for each survivor stream
-            // (log/row/meta) that the splice rewrites — `(streams/<id>,
-            // pre-splice rkyv bytes)`. The Phase-2 txn CAS's these so a
-            // concurrent alloc/punch/truncate committing on a survivor stream
-            // during merge's etcd RTT makes the merge fail+retry instead of
-            // resurrecting the concurrently-removed extent.
-            survivor_stream_baselines: Vec<(String, Vec<u8>)>,
+            // Item 3 (uniform CAS): value-CAS baseline for each of the six
+            // source streams — `(streams/<id>, pre-splice rkyv bytes)`. The
+            // Phase-2 txn CAS's these so a concurrent alloc/punch/truncate
+            // committing on a source stream during merge's etcd RTT makes the
+            // merge fail+retry instead of resurrecting a removed extent or
+            // dropping an added tail.
+            stream_baselines: Vec<(String, Vec<u8>)>,
             // Value-CAS baseline for each EXISTING modified extent (the
             // refs-spliced / tail-sealed ones), captured from the SAME Phase-1
             // snapshot `modified_extents` was computed against — NOT re-read at
@@ -3771,6 +3806,7 @@ impl AutumnManager {
             let mut s = self.store.inner.borrow_mut();
             (|| -> Result<Phase1Result, AppError> {
                 Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s)?;
+                sources.verify(&s)?;
 
                 if req.survivor_part_id == req.victim_part_id {
                     return Err(AppError::Precondition(
@@ -3899,16 +3935,12 @@ impl AutumnManager {
                     req.meta_sealed_lengths[1],
                 )?;
 
-                // Item 3 (uniform CAS): capture each survivor stream's
+                // Item 3 (uniform CAS): capture each source stream's
                 // PRE-splice value (what etcd currently holds) as the CAS
                 // baseline. `compute_*` returned clones, so `s.streams` still
-                // holds the pre-splice survivor streams here.
-                let survivor_stream_baselines: Vec<(String, Vec<u8>)> = [
-                    survivor_meta.log_stream,
-                    survivor_meta.row_stream,
-                    survivor_meta.meta_stream,
-                ]
-                .into_iter()
+                // holds the pre-splice streams here.
+                let stream_baselines: Vec<(String, Vec<u8>)> = all_streams
+                    .into_iter()
                 .filter_map(|sid| {
                     s.streams
                         .get(&sid)
@@ -3957,7 +3989,7 @@ impl AutumnManager {
                     selected_nodes: selected,
                     new_tail_replicas: target_replicas as u32,
                     pre_bump_eversion,
-                    survivor_stream_baselines,
+                    stream_baselines,
                     extent_baselines,
                 })
             })()
@@ -4037,6 +4069,15 @@ impl AutumnManager {
                 new_log_tail_extent_id: 0,
             }));
         }
+        // Without etcd this is the last check before the apply, with no await
+        // between them.
+        if let Err(e) = sources.verify(&self.store.inner.borrow()) {
+            return Ok(rkyv_encode(&MultiModifyMergeResp {
+                code: Self::err_to_code(&e),
+                message: e.to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
 
         // Phase 2: single fenced etcd txn.
         if let Some(etcd) = &self.etcd {
@@ -4079,31 +4120,35 @@ impl AutumnManager {
                 format!("regions/{}", p1.victim_part_id),
                 format!("partitionLastOp/{}", p1.victim_part_id),
             ];
-            // Item 3 (uniform CAS): value-CAS each survivor stream against its
+            // Item 3 (uniform CAS): value-CAS each source stream against its
             // pre-splice baseline so a concurrent alloc/punch/truncate that
-            // committed on a survivor stream during this RTT makes the merge
-            // fail+retry (CODE_PRECONDITION) instead of overwriting it with the
-            // stale spliced membership (resurrecting a removed extent).
-            // CAS = survivor-stream membership baselines + each modified extent's
-            // baseline. Both were captured from the Phase-1 snapshot (NOT re-read
-            // here after the Phase-1.5 await), so a concurrent punch/truncate/
-            // split that mutated or deleted a CoW-shared extent during the await
-            // makes this txn fail+retry instead of clobbering it / resurrecting
-            // a deleted extent (coco P1). Same lost-update class the
-            // compute_extent_ref_drops CAS closes for punch/truncate.
+            // committed on it during this RTT makes the merge fail+retry
+            // (CODE_PRECONDITION) instead of overwriting it with the stale
+            // spliced membership. The victim streams are deleted, but a tail
+            // rolled by an alloc that passed its owner check before the merge
+            // took the sources over would otherwise vanish with its acked bytes.
+            // Each modified extent's baseline is CAS'd as well. Both were
+            // captured from the Phase-1 snapshot (NOT re-read here after the
+            // Phase-1.5 await), so a concurrent punch/truncate/split that
+            // mutated or deleted a CoW-shared extent during the await makes
+            // this txn fail+retry instead of clobbering it / resurrecting a
+            // deleted extent (coco P1).
             //
-            // The deleted VICTIM streams need no membership CAS: the victim is
-            // frozen_for_merge so no concurrent alloc can ADD an extent
-            // to it (coco's orphan-via-alloc scenario is precluded). The only
-            // reachable concurrent victim mutation is a GC punch/truncate, which
-            // ALSO writes the affected extents/<id> (refs-- or delete) — and
-            // splice_victim_extents baselines EVERY victim extent into
-            // extent_baselines, so that write trips the extent CAS above ->
-            // merge retries. (Survivor-side concurrent punches trip
-            // survivor_stream_baselines.) No victim membership CAS adds coverage.
-            let mut cas = p1.survivor_stream_baselines.clone();
-            cas.extend(p1.extent_baselines.clone());
-            etcd.put_delete_txn_cas(kvs, deletes, cas)
+            // `ownerLocks/partition/<id>` must still be at the epoch the merge
+            // acquired: a reopen in between (a PS restart, a poisoned partition)
+            // owns the source again and may have acked writes the captured
+            // lengths do not hold. The in-memory `sources.verify` above cannot
+            // see an acquire whose etcd write is still in flight.
+            let mut cmp: Vec<_> = p1
+                .stream_baselines
+                .iter()
+                .chain(p1.extent_baselines.iter())
+                .map(|(k, v)| autumn_etcd::Cmp::value(k.as_bytes(), v.as_slice()))
+                .collect();
+            cmp.extend(sources.owners.iter().map(|(key, epoch)| {
+                autumn_etcd::Cmp::mod_revision(format!("ownerLocks/{key}"), *epoch)
+            }));
+            etcd.put_delete_txn_compare(kvs, deletes, cmp)
                 .await
                 .map_err(|e| Self::err_to_status(&e))?;
         }
@@ -4149,33 +4194,63 @@ impl AutumnManager {
     //   4. send MSG_MERGE_FREEZE to victim's PS, await OK
     //      (drains pending+inflight + flushes imm; no new writes accepted)
     //   5. send MSG_MERGE_FREEZE to survivor's PS, await OK
-    //   6. capture commit_length × 6 (3 streams × 2 partitions) — these
-    //      are the sealed_lengths that the manager merge txn will use
-    //   7. invoke handle_multi_modify_merge synchronously (existing
-    //      Phase-1 / 1.5 / 2 / 3 logic; etcd put_and_delete_txn is the
-    //      atomic linearization point)
-    //   8a. on success: do NOT explicitly unfreeze — region_sync_loop on
+    //   6. take both sources over: acquire `partition/<id>` for each and
+    //      fence the tail of all six streams at that epoch (see
+    //      `take_merge_sources`)
+    //   7. capture commit_length × 6 under those epochs — these are the
+    //      sealed_lengths that the manager merge txn will use
+    //   8. invoke multi_modify_merge synchronously (Phase-1 / 1.5 / 2 / 3;
+    //      the etcd txn is the atomic linearization point and refuses if a
+    //      source was acquired again or a tail moved)
+    //   9a. on success: do NOT explicitly unfreeze — region_sync_loop on
     //       both PSes will, on its next ~2 s tick, observe the new region
     //       state (survivor's rg widened, victim's region gone) and drop
     //       the frozen `PartitionData` entirely. The reopened survivor
     //       starts fresh with `frozen_for_merge = None`.
-    //   8b. on failure: send freeze=false to anyone we already froze.
+    //   9b. on failure: send freeze=false to anyone we already froze.
     //       Best-effort — if the unfreeze RPC also fails, the PS-side
-    //       FREEZE_TTL (30 s) is the final backstop.
+    //       FREEZE_TTL (30 s) is the final backstop. Once step 6 ran, the
+    //       old owners are fenced: their next append is refused and the
+    //       partition reopens under a fresh epoch.
+    //
+    // The freeze only stops a PS from taking writes while it remembers it;
+    // step 6 is what makes a write the merge did not capture impossible to
+    // acknowledge. Without it a PS restart, a stale freeze=false (a deposed
+    // leader's rollback) or FREEZE_TTL let the PS ack writes past the
+    // captured lengths, which the commit then sealed away
+    // (`tests/system_merge_freeze_races.rs`).
     //
     // Crash semantics:
-    //   - manager crash before step 7's etcd commit: failover sees no
-    //     in-progress merge in etcd, no rollback needed; PSes auto-
-    //     unfreeze via FREEZE_TTL.
-    //   - manager crash after step 7's etcd commit: merge is durable;
+    //   - manager crash before step 8's etcd commit: no merge in etcd; the
+    //     sources reopen under fresh epochs once fenced, or unfreeze via
+    //     FREEZE_TTL.
+    //   - manager crash after step 8's etcd commit: merge is durable;
     //     region_sync_loop on PSes drives the reload normally.
-    //   - PS crash mid-flow: in-memory freeze flag lost on restart;
-    //     either the merge committed (PS reopens with merged state) or
-    //     it didn't (PS reopens with original state).
+    //   - PS crash mid-flow: its reopen acquires a newer `partition/<id>`
+    //     epoch, and the commit refuses.
     pub(crate) async fn handle_merge_partitions(&self, payload: Bytes) -> HandlerResult {
         let req: MergePartitionsReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         self.merge_partitions(req, 0).await
+    }
+
+    /// Take write ownership of each `(part_id, [log, row, meta])` source the
+    /// way a partition takeover does: acquire `partition/<id>` (the manager
+    /// refuses the old owner's stream ops from here on) and fence each
+    /// stream's tail at that epoch (the ENs refuse its appends). Unlike the
+    /// freeze, neither can be undone by a restart, a stale unfreeze or a TTL.
+    async fn take_merge_sources(&self, parts: &[(u64, [u64; 3])]) -> Result<MergeSources, AppError> {
+        let mut sources = MergeSources::default();
+        for (part_id, streams) in parts {
+            let key = format!("partition/{part_id}");
+            let epoch = self.acquire_owner_epoch(&key).await?;
+            for &sid in streams {
+                let tail = self.fence_stream_tail(sid, epoch).await?;
+                sources.tails.push((sid, tail));
+            }
+            sources.owners.push((key, epoch));
+        }
+        Ok(sources)
     }
 
     /// `op_id` 0 (direct RPC, policy) refuses while an extent op blocks the
@@ -4190,6 +4265,15 @@ impl AutumnManager {
             return Ok(rkyv_encode(&MergePartitionsResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+        // Before anything freezes: the takeover below would acquire the one
+        // partition twice and fence out its own first epoch.
+        if req.survivor_part_id == req.victim_part_id {
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: CODE_PRECONDITION,
+                message: "survivor and victim are the same partition".to_string(),
                 new_log_tail_extent_id: 0,
             }));
         }
@@ -4283,8 +4367,8 @@ impl AutumnManager {
             }
         };
 
-        // Owner lock keyed on the partition pair so two concurrent merge
-        // attempts targeting the same survivor serialize on the manager.
+        // The txn's own owner lock. Concurrent merges of one pair are kept
+        // apart by the topology hold above, not by this lock.
         let owner_key = format!(
             "admin-merge:{}:{}",
             req.survivor_part_id, req.victim_part_id
@@ -4345,7 +4429,7 @@ impl AutumnManager {
                         resp.message
                     )));
                 }
-                Ok(())
+                Ok((resp.log_tail_extent_id, resp.log_end))
             }
         };
 
@@ -4372,43 +4456,66 @@ impl AutumnManager {
             }
         };
 
-        // Freeze budget: measured from BEFORE the first freeze is issued (the
-        // earliest a PS could have started its FREEZE_TTL clock) so the elapsed
-        // check below is conservative. The txn must land within
-        // MERGE_FREEZE_COMMIT_DEADLINE of here or we abort rather than seal at a
-        // possibly-stale commit_length.
-        let freeze_start = Instant::now();
-
         // Freeze victim first (matches the dual-gate ordering convention
         // in `crates/partition-server/CLAUDE.md` — victim < survivor for
         // deadlock-safe lock acquisition; here the freezes don't deadlock
         // each other but we keep the order for consistency with future
         // PS-side gate work).
-        if let Err(e) = send_freeze(v_info.part_addr.clone(), req.victim_part_id, true).await {
-            return Ok(rkyv_encode(&MergePartitionsResp {
-                code: Self::err_to_code(&e),
-                message: e.to_string(),
-                new_log_tail_extent_id: 0,
-            }));
-        }
+        let v_drained = match send_freeze(v_info.part_addr.clone(), req.victim_part_id, true).await {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
         to_unfreeze.push((v_info.part_addr.clone(), req.victim_part_id));
 
-        if let Err(e) = send_freeze(s_info.part_addr.clone(), req.survivor_part_id, true).await {
-            rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
-            return Ok(rkyv_encode(&MergePartitionsResp {
-                code: Self::err_to_code(&e),
-                message: e.to_string(),
-                new_log_tail_extent_id: 0,
-            }));
-        }
+        let s_drained = match send_freeze(s_info.part_addr.clone(), req.survivor_part_id, true).await {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
         merge_phase(2); // both sides frozen — writes are stopped from here
         to_unfreeze.push((s_info.part_addr.clone(), req.survivor_part_id));
 
-        // Capture commit_length on each of the 6 streams. Reuse the
-        // existing handle_check_commit_length so we hit the same
-        // sealed-vs-live + min-replica path the merge txn code expects.
+        {
+            let pause = MERGE_TEST_TAKEOVER_PAUSE_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if pause > 0 {
+                compio::time::sleep(Duration::from_millis(pause)).await;
+            }
+        }
+        let sources = match self
+            .take_merge_sources(&[
+                (req.survivor_part_id, [s_info.log_stream, s_info.row_stream, s_info.meta_stream]),
+                (req.victim_part_id, [v_info.log_stream, v_info.row_stream, v_info.meta_stream]),
+            ])
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
+
+        // Capture commit_length on each of the 6 streams under the source's
+        // own epoch (the fenced floor refuses any older one), through the
+        // same sealed-vs-live + min-replica path the merge txn expects.
         let read_commit_len = |stream_id: u64| {
-            let owner_key = owner_key.clone();
+            let (owner_key, owner_epoch, fenced_tail) = sources.for_stream(stream_id);
             async move {
                 let req = CheckCommitLengthReq {
                     stream_id,
@@ -4424,26 +4531,26 @@ impl AutumnManager {
                         format!("commit_length stream {stream_id}: {}", resp.message),
                     ));
                 }
+                // The fence covers one extent: a length measured on any other
+                // tail could still grow.
+                let measured = resp.last_ex_info.as_ref().map(|e| e.extent_id);
+                if measured != Some(fenced_tail) {
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        format!(
+                            "stream {stream_id} tail moved from fenced extent {fenced_tail} \
+                             to {measured:?}; retry merge"
+                        ),
+                    ));
+                }
                 // Pass the REAL committed length, INCLUDING 0. A frozen tail
                 // whose all-replica commit is 0 (empty — e.g. a freshly-rolled
                 // victim log tail that took no writes) MUST seal at
-                // `sealed_length = 0`, not 1. `compute_merge_streams` /
-                // `splice_streams_without_new_tail` seal an empty tail as
-                // `sealed = true, sealed_length = 0` (manager note 32, after the
-                // `&& *_sealed > 0` guard was dropped) → sealed-empty is
-                // recoverable: each child allocs a fresh tail and replay reads 0
-                // bytes there. The OLD `.max(1)` over-sealed an empty spliced
-                // VICTIM log tail at byte 1; on cold reopen the survivor's WAL
-                // replay reaches that extent, expects 1 byte, finds 0, and trips
-                // WAL-FAILSTOP "got 0 of 1 expected bytes" → the merge survivor
-                // is permanently un-openable (reproduced deterministically:
-                // /tmp/soak/repro.sh round 1, survivor part 15, log extent 68).
-                // The stale "0 = no-op / use existing" comment predates note 32;
-                // neither compute fn nor handle_multi_modify_merge special-cases
-                // 0. (handle_check_commit_length already returns Err — caught
-                // above — when a replica is unreachable, so OK+0 = genuinely
-                // empty, never a masked failure: the phantom-seal hazard the split-side
-                // `unwrap_or(0).max(1)` fix addressed does not apply here.)
+                // `sealed_length = 0`, not 1. The old `.max(1)` over-sealed an
+                // empty spliced victim log tail at byte 1 and the merged
+                // survivor's replay then failed "got 0 of 1 expected bytes".
+                // `handle_check_commit_length` returns Err when no replica
+                // answers, so OK+0 is genuinely empty.
                 Ok::<u64, (StatusCode, String)>(resp.end as u64)
             }
         };
@@ -4462,6 +4569,32 @@ impl AutumnManager {
                 return Err((code, msg));
             }
         };
+        // The merged open replays nothing before the sources' freeze
+        // checkpoints (partition-server CLAUDE.md, "Recovery replay start"),
+        // so each log must still end where its drain left it. A write acked
+        // between the freeze and the takeover (a restart, a stale unfreeze)
+        // moved it; the capture includes such a write, but the merged
+        // partition would never replay it.
+        for ((part_id, log_stream, drained), measured_end) in [
+            (req.survivor_part_id, s_info.log_stream, s_drained),
+            (req.victim_part_id, v_info.log_stream, v_drained),
+        ]
+        .into_iter()
+        .zip(log_lens)
+        {
+            let measured = (sources.for_stream(log_stream).2, measured_end);
+            if measured != drained {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "partition {part_id} took writes after its freeze drain \
+                         (log drained at {drained:?}, now {measured:?}); retry merge"
+                    ),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        }
         let row_lens = match (
             read_commit_len(s_info.row_stream).await,
             read_commit_len(v_info.row_stream).await,
@@ -4483,36 +4616,13 @@ impl AutumnManager {
             }
         };
 
-        // Test failpoint (always 0 in production): simulate a slow/paused
-        // coordinator between the commit_length capture and the txn so the
-        // freeze-budget guard below is exercised deterministically (no real
-        // SIGSTOP needed).
+        // Test failpoint (always 0 in production): a slow/paused coordinator
+        // between the capture and the txn.
         {
             let pause = MERGE_TEST_PAUSE_MS.load(std::sync::atomic::Ordering::Relaxed);
             if pause > 0 {
                 compio::time::sleep(Duration::from_millis(pause)).await;
             }
-        }
-
-        // Freeze-budget guard (fixes the merge-freeze lost-update): if the
-        // freeze has been held long enough that the PS-side FREEZE_TTL could
-        // have lapsed and resumed writes on the victim tail, DO NOT commit — the
-        // captured commit_lengths may be stale and the txn would seal the tail
-        // BELOW post-unfreeze acked writes (silent lost update). Roll back the
-        // freezes and abort; the merge is retryable (auto-policy re-evaluates).
-        if freeze_start.elapsed() >= MERGE_FREEZE_COMMIT_DEADLINE {
-            let held = freeze_start.elapsed();
-            rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
-            return Ok(rkyv_encode(&MergePartitionsResp {
-                code: Self::err_to_code(&AppError::Precondition(String::new())),
-                message: format!(
-                    "merge freeze budget exceeded: held {:.1}s >= {:.1}s deadline \
-                     (PS FREEZE_TTL may have lapsed); aborting to avoid a stale-length seal — retry",
-                    held.as_secs_f64(),
-                    MERGE_FREEZE_COMMIT_DEADLINE.as_secs_f64(),
-                ),
-                new_log_tail_extent_id: 0,
-            }));
         }
 
         merge_phase(3); // all six commit_lengths captured under the freeze
@@ -4527,7 +4637,7 @@ impl AutumnManager {
             row_sealed_lengths: row_lens,
             meta_sealed_lengths: meta_lens,
         };
-        let mmm_resp_bytes = match self.handle_multi_modify_merge(rkyv_encode(&mmm_req)).await {
+        let mmm_resp_bytes = match self.multi_modify_merge(mmm_req, &sources).await {
             Ok(b) => b,
             Err((code, msg)) => {
                 rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
@@ -9137,5 +9247,56 @@ mod force_ec_target_tests {
         assert_eq!(resp.code, CODE_OK, "{}", resp.message);
         let p = m.extent_inflight_payload_ec(7).expect("marker written");
         assert_eq!(p.target_nodes, vec![1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod merge_sources_tests {
+    use super::MergeSources;
+    use crate::persist::records::StreamRecord;
+    use crate::store::MetadataState;
+
+    fn state_with_tail(tail: u64) -> (MetadataState, MergeSources) {
+        let mut s = MetadataState::default();
+        let epoch = s.acquire_owner_lock("partition/1");
+        s.streams.insert(
+            10,
+            StreamRecord {
+                stream_id: 10,
+                extent_ids: vec![5, tail],
+                ec_data_shard: 0,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        let sources = MergeSources {
+            owners: vec![("partition/1".to_string(), epoch)],
+            tails: vec![(10, tail)],
+        };
+        (s, sources)
+    }
+
+    #[test]
+    fn an_untouched_source_verifies() {
+        let (s, sources) = state_with_tail(6);
+        sources.verify(&s).unwrap();
+    }
+
+    #[test]
+    fn a_reacquired_source_is_refused() {
+        let (mut s, sources) = state_with_tail(6);
+        s.acquire_owner_lock("partition/1");
+        let e = sources.verify(&s).unwrap_err().to_string();
+        assert!(e.contains("merge source reopened"), "{e}");
+    }
+
+    /// A roll whose alloc passed the old owner's check before the merge took
+    /// the source over lands an unfenced tail.
+    #[test]
+    fn a_tail_that_moved_after_the_fence_is_refused() {
+        let (mut s, sources) = state_with_tail(6);
+        s.streams.get_mut(&10).unwrap().extent_ids.push(7);
+        let e = sources.verify(&s).unwrap_err().to_string();
+        assert!(e.contains("tail moved from fenced extent 6"), "{e}");
     }
 }

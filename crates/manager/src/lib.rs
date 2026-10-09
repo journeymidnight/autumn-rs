@@ -32,7 +32,7 @@ pub(crate) mod store;
 /// `rpc_handlers`. Re-exported so integration tests can arm it.
 #[doc(hidden)]
 pub use manager_members::ManagerIdentity;
-pub use rpc_handlers::MERGE_TEST_PAUSE_MS;
+pub use rpc_handlers::{MERGE_TEST_PAUSE_MS, MERGE_TEST_TAKEOVER_PAUSE_MS};
 
 // Pure `/api/overview` composer, shared with `autumn-op overview` so the
 // standalone dashboard app (crates/server/src/bin/autumn_dashboard) can render the same view the
@@ -487,13 +487,26 @@ impl EtcdMirror {
         // Precondition → caller retries. Empty = no CAS (plain fenced put).
         cas: Vec<(String, Vec<u8>)>,
     ) -> Result<(), AppError> {
+        self.put_delete_txn_compare(
+            puts,
+            deletes,
+            cas.iter()
+                .map(|(k, v)| autumn_etcd::Cmp::value(k.as_bytes(), v.as_slice()))
+                .collect(),
+        )
+        .await
+    }
+
+    /// `put_delete_txn_cas` with arbitrary compares.
+    async fn put_delete_txn_compare(
+        &self,
+        puts: Vec<(String, Vec<u8>)>,
+        deletes: Vec<String>,
+        extra_cmp: Vec<autumn_etcd::proto::Compare>,
+    ) -> Result<(), AppError> {
         if puts.is_empty() && deletes.is_empty() {
             return Ok(());
         }
-        let extra_cmp: Vec<_> = cas
-            .iter()
-            .map(|(k, v)| autumn_etcd::Cmp::value(k.as_bytes(), v.as_slice()))
-            .collect();
         let mut ops = Vec::with_capacity(puts.len() + deletes.len());
         ops.extend(
             puts.into_iter()
@@ -4673,6 +4686,81 @@ impl AutumnManager {
             )));
         }
         Ok(r.length)
+    }
+
+    /// Raise the EN fence floor of `stream_id`'s current tail to `owner_epoch`
+    /// on every member and return that tail's id. One fenced member is enough:
+    /// an append needs every replica to accept it. A member already above the
+    /// epoch counts as fenced (`CODE_LOCKED_BY_OTHER`), as in the PS's
+    /// `fence_tail`.
+    async fn fence_stream_tail(&self, stream_id: u64, owner_epoch: i64) -> Result<u64, AppError> {
+        use autumn_rpc::extent_rpc::{FenceExtentReq, FenceExtentResp, MSG_FENCE_EXTENT};
+        let (tail, addrs) = {
+            let s = self.store.inner.borrow();
+            let tail = s
+                .streams
+                .get(&stream_id)
+                .and_then(|st| st.extent_ids.last().copied())
+                .ok_or_else(|| AppError::NotFound(format!("tail of stream {stream_id}")))?;
+            let ex = s
+                .extents
+                .get(&tail)
+                .ok_or_else(|| AppError::NotFound(format!("extent {tail}")))?;
+            let addrs: Vec<String> = ex
+                .replicates
+                .iter()
+                .chain(ex.parity.iter())
+                .filter_map(|n| s.nodes.get(n).map(|n| n.address.clone()))
+                .collect();
+            (tail, addrs)
+        };
+        let req = FenceExtentReq {
+            extent_id: tail,
+            owner_epoch,
+        };
+        let replies = futures::future::join_all(addrs.iter().map(|addr| {
+            let base = Self::normalize_endpoint(addr);
+            let routed =
+                Self::shard_addr_for_extent(&base, &self.shard_ports_for_addr(&base), tail);
+            let payload = req.encode();
+            // 5 s: an in-memory fetch_max plus one `.meta` persist.
+            async move {
+                self.conn_pool
+                    .call_timeout(&routed, MSG_FENCE_EXTENT, payload, Duration::from_secs(5))
+                    .await
+            }
+        }))
+        .await;
+        let mut fenced = 0;
+        for (addr, r) in addrs.iter().zip(replies) {
+            match r.map(FenceExtentResp::decode) {
+                Ok(Ok(resp))
+                    if resp.code == autumn_rpc::extent_rpc::CODE_OK
+                        || resp.code == autumn_rpc::extent_rpc::CODE_LOCKED_BY_OTHER =>
+                {
+                    fenced += 1
+                }
+                Ok(Ok(resp)) => tracing::warn!(
+                    extent_id = tail, addr = %addr, code = resp.code, message = %resp.message,
+                    "fence_stream_tail: member refused the fence"
+                ),
+                Ok(Err(e)) => tracing::warn!(
+                    extent_id = tail, addr = %addr, error = %e,
+                    "fence_stream_tail: undecodable reply"
+                ),
+                Err(e) => tracing::warn!(
+                    extent_id = tail, addr = %addr, error = %e,
+                    "fence_stream_tail: member unreachable"
+                ),
+            }
+        }
+        if fenced == 0 {
+            return Err(AppError::Internal(format!(
+                "fence tail extent {tail} of stream {stream_id}: no member accepted (0/{})",
+                addrs.len()
+            )));
+        }
+        Ok(tail)
     }
 
     // ── Etcd mirroring ─────────────────────────────────────────────────
