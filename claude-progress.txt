@@ -1,3 +1,11 @@
+Date: 2026-10-09 (6)
+TaskStatus: completed
+Task scope: user-reported P2 on a92a2f4f — merge_freeze_task, when its OK could not be delivered, called end() unconditionally and could end a newer freeze (A drained and woken; the loop handles freeze=false and a new freeze B before A runs; A's cleanup cancels B).
+Current summary: Every merge-freeze attempt carries a number (MergeFreezeState.last_attempt, stored in WaitingForGate/Draining/Drained); start_draining checks holds(attempt), the undelivered-OK cleanup is end_attempt(attempt). Review found the same window on the idempotent path: a retry C answered OK from a drained freeze left it as Drained{A}, so A's late cleanup ended C's freeze — rejoin_drained re-stamps it to a new attempt (check folded in, returns false unless drained). Docs: PS CLAUDE.md note 13.
+Verification: merge_freeze_tests 7 (new: a_failed_answer_does_not_end_a_newer_attempt drives the real task through the interleaving — red with end(); a_retry_answered_from_a_drained_freeze_outlives_its_cleanup — red without the re-stamp). PS lib 293; merge_freeze_waits_for_gate, system_merge_freeze_races 9, system_merge green. opus reviews x2: no high.
+Main gaps: freeze=false carries no attempt identity: a manager rollback delivered late (after a reconnect) could end a later merge's freeze; the drained-cursor check and takeover keep that from losing writes, the merge is refused. Closing it needs a wire change; not done. The handler wiring of rejoin_drained is covered only through the state-machine unit test.
+Next steps: none for this task.
+
 Date: 2026-10-09 (5)
 TaskStatus: completed
 Task scope: user — the merge-freeze half of the stress-test report (partition 1930: a freeze and PUTs both unanswered, the manager's freeze timed out), plus BUG-MERGE-FREEZE-REPLY-LOST.

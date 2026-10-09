@@ -2499,12 +2499,22 @@ Three fixes bound the restart replay window (worst case per partition =
     major compaction stopped the whole partition — writes, the TTL check and the
     manager's freeze=false (a stress run; `manager/tests/merge_freeze_waits_for_gate.rs`
     is red that way). `partition_loop` never awaits the gate now. `MergeFreezeState::end`
-    is the one exit (freeze=false, TTL, failed drain): it ends any stage and the
-    task answers that the freeze was cancelled; freeze=false used to clear only
-    the halt and leave a draining answer parked, with no TTL left to clear it.
-    A split refuses while a merge freeze is active in any stage, including the
-    wait. Unit tests: `merge_freeze_tests` (red when `end` leaves the stage, or
-    when an ended attempt may take over a newer one's stage).
+    is the one exit (freeze=false, TTL, failed drain, an OK that cannot be
+    delivered): it ends any stage and the task answers that the freeze was
+    cancelled; freeze=false used to clear only the halt and leave a draining
+    answer parked, with no TTL left to clear it.
+    Each attempt carries a number, and its task touches the stage only while
+    the stage still holds that number (`start_draining`, and `end_attempt`
+    when its OK cannot be delivered): an unfreeze and a new freeze can be
+    handled in one loop pass between an attempt's wake-up and its next poll,
+    and its cleanup used to end the newer attempt. A retry answered OK from an
+    already drained freeze takes it over (`rejoin_drained`), so the earlier
+    attempt's late cleanup cannot end the freeze the retry was just told is in
+    place. A split refuses while a merge freeze is active in any stage,
+    including the wait. Unit tests: `merge_freeze_tests` (red when `end` leaves
+    the stage, when an ended attempt may take over a newer one's stage, when a
+    failed answer ends a newer attempt's freeze, or when a retry does not take
+    over the drained freeze).
 
     `handle_incoming_req` short-circuits Put / Delete with `CODE_UNAVAILABLE` while
     halted; reads + maintenance flow normally. `partition_loop` top-of-loop:

@@ -7725,7 +7725,7 @@ async fn try_complete_freeze_drain(
     // the manager's rollback.
     if need_merge_drain {
         let state = part.borrow().merge_freeze.clone();
-        if let Some(drained_tx) = state.take_draining() {
+        if let Some((attempt, drained_tx)) = state.take_draining() {
             // `publish_freeze_checkpoint` just set it to the drained log end.
             let outcome = match &drain_err {
                 None => Ok(part.borrow().durable_ckpt_vp.get()),
@@ -7734,7 +7734,7 @@ async fn try_complete_freeze_drain(
             let succeeded = outcome.is_ok();
             let delivered = drained_tx.send(outcome).is_ok();
             if succeeded && delivered {
-                state.set_drained();
+                state.set_drained(attempt);
                 tracing::info!(part_id, "freeze drain complete — partition halted");
             } else {
                 state.end();
@@ -7782,24 +7782,45 @@ enum MergeFreeze {
     Idle,
     /// The freeze task waits for the gate. Dropping the sender (unfreeze)
     /// ends the wait; the task answers that the freeze was cancelled.
-    WaitingForGate { _cancel: oneshot::Sender<()> },
+    WaitingForGate {
+        attempt: u64,
+        _cancel: oneshot::Sender<()>,
+    },
     /// The task holds the gate and writes are halted; `partition_loop`
     /// drains and sends the checkpointed log position, or the failure.
     /// Dropping the sender (unfreeze, TTL) cancels the freeze.
-    Draining(oneshot::Sender<Result<(u64, u64), String>>),
+    Draining {
+        attempt: u64,
+        drained: oneshot::Sender<Result<(u64, u64), String>>,
+    },
     /// Drained and answered; writes stay halted until unfreeze, TTL or reopen.
-    Drained,
+    Drained { attempt: u64 },
+}
+
+impl MergeFreeze {
+    fn attempt(&self) -> Option<u64> {
+        match self {
+            MergeFreeze::Idle => None,
+            MergeFreeze::WaitingForGate { attempt, .. }
+            | MergeFreeze::Draining { attempt, .. }
+            | MergeFreeze::Drained { attempt } => Some(*attempt),
+        }
+    }
 }
 
 /// A partition's merge freeze: the write halt and the stage it belongs to,
 /// kept together so no exit can clear one without the other (a parked answer
 /// once outlived its halt: `freeze=false` cleared the halt only, and with no
 /// halt there was no TTL left to answer it). Writes are halted exactly in
-/// `Draining` and `Drained`.
+/// `Draining` and `Drained`. Each attempt carries a number, and a task acts
+/// on the stage only while it still holds that number: an unfreeze and a new
+/// freeze can be handled in one loop pass between an attempt's wake-up and
+/// its next poll.
 #[derive(Default)]
 pub(crate) struct MergeFreezeState {
     halt: Cell<Option<std::time::Instant>>,
     stage: RefCell<MergeFreeze>,
+    last_attempt: Cell<u64>,
 }
 
 impl MergeFreezeState {
@@ -7818,42 +7839,45 @@ impl MergeFreezeState {
     }
 
     pub(crate) fn is_drained(&self) -> bool {
-        matches!(*self.stage.borrow(), MergeFreeze::Drained)
+        matches!(*self.stage.borrow(), MergeFreeze::Drained { .. })
     }
 
     fn is_draining(&self) -> bool {
-        matches!(*self.stage.borrow(), MergeFreeze::Draining(_))
+        matches!(*self.stage.borrow(), MergeFreeze::Draining { .. })
     }
 
-    /// Start an attempt. The receiver resolves once the attempt is ended.
-    fn wait_for_gate(&self) -> oneshot::Receiver<()> {
+    fn holds(&self, attempt: u64) -> bool {
+        self.stage.borrow().attempt() == Some(attempt)
+    }
+
+    /// Start an attempt: its number, and a receiver that resolves once the
+    /// attempt is ended while it waits.
+    fn wait_for_gate(&self) -> (u64, oneshot::Receiver<()>) {
+        let attempt = self.last_attempt.get() + 1;
+        self.last_attempt.set(attempt);
         let (cancel, cancelled) = oneshot::channel();
-        *self.stage.borrow_mut() = MergeFreeze::WaitingForGate { _cancel: cancel };
-        cancelled
+        *self.stage.borrow_mut() = MergeFreeze::WaitingForGate { attempt, _cancel: cancel };
+        (attempt, cancelled)
     }
 
-    /// Halt writes and hand the drain to `partition_loop`, unless this
-    /// attempt (`cancelled`) was ended meanwhile — the stage may then belong
-    /// to a newer one.
-    fn start_draining(
-        &self,
-        cancelled: &mut oneshot::Receiver<()>,
-    ) -> Option<oneshot::Receiver<Result<(u64, u64), String>>> {
-        if !matches!(cancelled.try_recv(), Ok(None)) {
+    /// Halt writes and hand the drain to `partition_loop`, unless `attempt`
+    /// was ended meanwhile.
+    fn start_draining(&self, attempt: u64) -> Option<oneshot::Receiver<Result<(u64, u64), String>>> {
+        if !self.holds(attempt) {
             return None;
         }
-        let (drained_tx, drained_rx) = oneshot::channel();
+        let (drained, drained_rx) = oneshot::channel();
         self.halt.set(Some(std::time::Instant::now()));
-        *self.stage.borrow_mut() = MergeFreeze::Draining(drained_tx);
+        *self.stage.borrow_mut() = MergeFreeze::Draining { attempt, drained };
         Some(drained_rx)
     }
 
-    /// The drain's answer channel; the caller then calls `set_drained` or
-    /// `end`.
-    fn take_draining(&self) -> Option<oneshot::Sender<Result<(u64, u64), String>>> {
+    /// The drain's attempt and answer channel; the caller then calls
+    /// `set_drained` or `end`.
+    fn take_draining(&self) -> Option<(u64, oneshot::Sender<Result<(u64, u64), String>>)> {
         let mut stage = self.stage.borrow_mut();
         match std::mem::take(&mut *stage) {
-            MergeFreeze::Draining(tx) => Some(tx),
+            MergeFreeze::Draining { attempt, drained } => Some((attempt, drained)),
             other => {
                 *stage = other;
                 None
@@ -7861,13 +7885,34 @@ impl MergeFreezeState {
         }
     }
 
-    fn set_drained(&self) {
-        *self.stage.borrow_mut() = MergeFreeze::Drained;
+    fn set_drained(&self, attempt: u64) {
+        *self.stage.borrow_mut() = MergeFreeze::Drained { attempt };
+    }
+
+    /// If the freeze is drained, a retried freeze answered from it takes it
+    /// over, so the earlier attempt's late cleanup cannot end the freeze this
+    /// caller was just told is in place. False if not drained.
+    pub(crate) fn rejoin_drained(&self) -> bool {
+        if !self.is_drained() {
+            return false;
+        }
+        let attempt = self.last_attempt.get() + 1;
+        self.last_attempt.set(attempt);
+        self.set_drained(attempt);
+        true
+    }
+
+    /// `end`, if the freeze is still `attempt`.
+    fn end_attempt(&self, attempt: u64) {
+        if self.holds(attempt) {
+            self.end();
+        }
     }
 
     /// End the freeze in any stage: writes resume, and an attempt still
     /// waiting or draining answers that it was cancelled. Every way out of
-    /// a freeze (unfreeze, TTL, a failed drain) goes through here.
+    /// a freeze (unfreeze, TTL, a failed drain, an undelivered OK) goes
+    /// through here.
     pub(crate) fn end(&self) {
         self.halt.set(None);
         *self.stage.borrow_mut() = MergeFreeze::Idle;
@@ -7891,6 +7936,7 @@ async fn merge_freeze_task(
     gate: std::sync::Arc<CompactionGate>,
     wake_loop: mpsc::UnboundedSender<()>,
     part_id: u64,
+    attempt: u64,
     cancelled: oneshot::Receiver<()>,
     resp_tx: oneshot::Sender<HandlerResult>,
 ) {
@@ -7898,14 +7944,14 @@ async fn merge_freeze_task(
     const CANCELLED_WAITING: &str = "merge freeze cancelled while waiting for maintenance to finish";
     let acquire = gate.acquire();
     futures::pin_mut!(acquire);
-    let (permit, mut cancelled) = match select(acquire, cancelled).await {
-        Either::Left(held) => held,
+    let permit = match select(acquire, cancelled).await {
+        Either::Left((permit, _)) => permit,
         Either::Right(_) => {
             let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, (0, 0)));
             return;
         }
     };
-    let Some(drained_rx) = state.start_draining(&mut cancelled) else {
+    let Some(drained_rx) = state.start_draining(attempt) else {
         let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, (0, 0)));
         return;
     };
@@ -7926,7 +7972,8 @@ async fn merge_freeze_task(
     };
     if resp_tx.send(resp).is_err() && matches!(drained, Ok(Ok(_))) {
         // A manager that never sees the OK cannot proceed with the merge.
-        state.end();
+        // Only this attempt: a newer one may own the stage by now.
+        state.end_attempt(attempt);
         tracing::warn!(part_id, "merge freeze answered into a closed request; unfrozen");
     }
     drop(permit);
@@ -8314,7 +8361,7 @@ async fn handle_incoming_req(
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
                 }
-                if p.merge_freeze.is_drained() {
+                if p.merge_freeze.rejoin_drained() {
                     // Already fully drained-frozen — reply OK immediately, with
                     // the cursor that drain checkpointed.
                     let ckpt = p.durable_ckpt_vp.get();
@@ -8357,12 +8404,13 @@ async fn handle_incoming_req(
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
                 }
-                let cancelled = p.merge_freeze.wait_for_gate();
+                let (attempt, cancelled) = p.merge_freeze.wait_for_gate();
                 compio::runtime::spawn(merge_freeze_task(
                     p.merge_freeze.clone(),
                     p.maintenance_gate.clone(),
                     p.split_wake_tx.clone(),
                     p.part_id,
+                    attempt,
                     cancelled,
                     req.resp_tx,
                 ))
@@ -15921,12 +15969,13 @@ mod merge_freeze_tests {
     fn start(state: &Rc<MergeFreezeState>, gate: &std::sync::Arc<CompactionGate>) -> Attempt {
         let (wake, _wake_rx) = mpsc::unbounded();
         let (resp_tx, resp) = oneshot::channel();
-        let cancelled = state.wait_for_gate();
+        let (attempt, cancelled) = state.wait_for_gate();
         compio::runtime::spawn(merge_freeze_task(
             state.clone(),
             gate.clone(),
             wake,
             1,
+            attempt,
             cancelled,
             resp_tx,
         ))
@@ -15957,6 +16006,7 @@ mod merge_freeze_tests {
     fn take_draining_outside_draining_leaves_the_stage() {
         let state = MergeFreezeState::default();
         assert!(state.take_draining().is_none());
+        assert!(!state.rejoin_drained() && !state.is_halted());
         let _attempt = state.wait_for_gate();
         assert!(state.take_draining().is_none());
         assert!(state.is_active());
@@ -16006,14 +16056,53 @@ mod merge_freeze_tests {
             let gate = CompactionGate::new(1);
             let a = start(&state, &gate);
             until(|| state.is_halted()).await;
-            let tx = state.take_draining().expect("draining");
+            let (attempt, tx) = state.take_draining().expect("draining");
             assert!(tx.send(Ok((7, 4096))).is_ok());
-            state.set_drained();
+            state.set_drained(attempt);
             let r = answer(a).await;
             assert_eq!(r.code, partition_rpc::CODE_OK);
             assert_eq!((r.log_tail_extent_id, r.log_end), (7, 4096));
             assert!(state.is_drained() && state.is_halted());
         });
+    }
+
+    /// Attempt A drains but its manager is gone, so its OK cannot be sent;
+    /// before A runs again, the loop handles an unfreeze and a new freeze B.
+    /// A's cleanup must not end B.
+    #[test]
+    fn a_failed_answer_does_not_end_a_newer_attempt() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = Rc::new(MergeFreezeState::default());
+            let gate = CompactionGate::new(1);
+            let a = start(&state, &gate);
+            drop(a.resp);
+            until(|| state.is_halted()).await;
+            let (attempt, tx) = state.take_draining().expect("draining");
+            assert!(tx.send(Ok((7, 4096))).is_ok());
+            state.set_drained(attempt);
+            state.end();
+            let b = start(&state, &gate);
+            until(|| state.is_halted()).await;
+            assert!(state.is_draining(), "B was ended by A's cleanup");
+            let (attempt, tx) = state.take_draining().expect("B draining");
+            assert!(tx.send(Ok((8, 1))).is_ok());
+            state.set_drained(attempt);
+            assert_eq!(answer(b).await.code, partition_rpc::CODE_OK);
+        });
+    }
+
+    /// A retry answered OK from attempt A's drained freeze, then A's late
+    /// cleanup (its own OK undeliverable): the retry's freeze stays.
+    #[test]
+    fn a_retry_answered_from_a_drained_freeze_outlives_its_cleanup() {
+        let state = MergeFreezeState::default();
+        let (a, _cancelled) = state.wait_for_gate();
+        let _drained = state.start_draining(a).expect("draining");
+        let (attempt, _tx) = state.take_draining().expect("taken");
+        state.set_drained(attempt);
+        assert!(state.rejoin_drained());
+        state.end_attempt(a);
+        assert!(state.is_drained() && state.is_halted());
     }
 
     /// An attempt ended while its gate was being granted, with a newer
@@ -16022,10 +16111,10 @@ mod merge_freeze_tests {
     #[test]
     fn an_ended_attempt_does_not_take_over_a_newer_one() {
         let state = MergeFreezeState::default();
-        let mut first = state.wait_for_gate();
+        let (first, _first_cancelled) = state.wait_for_gate();
         state.end();
         let _second = state.wait_for_gate();
-        assert!(state.start_draining(&mut first).is_none());
+        assert!(state.start_draining(first).is_none());
         assert!(!state.is_halted() && state.is_active());
     }
 }
