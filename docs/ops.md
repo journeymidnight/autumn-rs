@@ -316,6 +316,16 @@ deadlocking the PS main thread (over 64 connections on one partition). Check:
 (300 idle connections, a range change, the PS must stay registered and the
 partition reopen; ~15 s).
 
+**A merge freeze no longer stops a partition behind a compaction.** The
+freeze waits for the partition's maintenance gate with writes still flowing,
+and halts writes only once it holds it. If a long major compaction holds the
+gate past the manager's 30 s freeze call, the merge fails ("freeze rpc ...
+timed out"), the manager sends `freeze=false` to every side it sent a freeze to
+(also to one whose answer never came), which ends the wait, and the policy retries later.
+Symptom of the old behaviour: PUTs and the freeze to one partition both
+unanswered while `ops --active` showed a compaction on it. Check:
+`cargo test -p autumn-manager --test merge_freeze_waits_for_gate` (~2 s).
+
 **A merge takes both partitions over before it measures them.** After the
 freeze it acquires each partition's owner lock and fences its stream tails, so a
 PS that restarts, gets unfrozen by a stale rollback, or outlives `FREEZE_TTL`
@@ -332,7 +342,8 @@ serves again after its next region sync. Check: after a refused merge, a
 races themselves are driven by
 `cargo test -p autumn-manager --test system_merge_freeze_races -- --test-threads=1`
 (PS restart, stale unfreeze before and after the takeover, commit after
-`FREEZE_TTL`, and a merge through a real etcd; ~2 min). Wire 61: the manager and
+`FREEZE_TTL`, a lost freeze reply — the side must take writes again at once,
+not after the 30 s TTL — and a merge through a real etcd; ~2 min). Wire 61: the manager and
 every PS must run the same build.
 
 **`cannot split: partition has overlapping keys`** is not an error to chase: the

@@ -459,7 +459,7 @@ pub(crate) async fn handle_roll_tails(
         // read it). The roll is best-effort with a manager-side retry
         // cooldown, so skipping here just defers it past the freeze.
         if part.borrow().frozen_for_split.get().is_some()
-            || part.borrow().frozen_for_merge.get().is_some()
+            || part.borrow().merge_freeze.is_halted()
         {
             tracing::info!(
                 target: "roll_trace",
@@ -948,7 +948,7 @@ async fn compare_write_inner(
         if !in_range(&p.rg, &req.key) {
             return Err((StatusCode::InvalidArgument, "key is out of range".into()));
         }
-        if p.frozen_for_merge.get().is_some() || p.frozen_for_split.get().is_some() {
+        if p.merge_freeze.is_halted() || p.frozen_for_split.get().is_some() {
             return Err((StatusCode::Unavailable, "partition frozen; refresh routing".into()));
         }
         Ok(())
@@ -1954,7 +1954,8 @@ async fn split_part(
     let (drain_tx, drain_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
     {
         let p = part.borrow();
-        if p.frozen_for_merge.get().is_some() {
+        // A merge freeze still waiting for the gate counts too: it is next.
+        if p.merge_freeze.is_active() {
             return Err((
                 StatusCode::FailedPrecondition,
                 "partition is frozen for merge; retry split after merge completes".to_string(),

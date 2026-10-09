@@ -394,6 +394,47 @@ fn stale_unfreeze_before_the_takeover() {
     });
 }
 
+/// A freeze OK lost on its way back: the merge gives up, and the side it
+/// does not know is frozen must take writes again at once, not after
+/// `FREEZE_TTL` (30 s). Once for each side.
+#[test]
+fn a_lost_freeze_reply_does_not_leave_the_side_frozen() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let c = cluster(140, None).await;
+        let _ps = start_partition_server_killable(PS_ID + 5, c.mgr_addr, c.ps_addr);
+        wait_both_open(&c).await;
+        baseline(&c).await;
+
+        for (side, prefix) in [(VICTIM, "m"), (SURVIVOR, "a")] {
+            autumn_manager::MERGE_TEST_DROP_FREEZE_REPLY
+                .store(side, std::sync::atomic::Ordering::Relaxed);
+            let merge = spawn_merge(c.mgr.clone());
+            while merge.borrow().is_none() {
+                compio::time::sleep(Duration::from_millis(50)).await;
+            }
+            autumn_manager::MERGE_TEST_DROP_FREEZE_REPLY
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            let resp = merge.borrow_mut().take().unwrap();
+            eprintln!("side {side}: merge code={} msg={}", resp.code, resp.message);
+            assert!(
+                resp.code != CODE_OK && resp.message.contains("reply dropped"),
+                "expected the lost-reply refusal, got code={} {}",
+                resp.code,
+                resp.message
+            );
+            let key = format!("{prefix}/after-lost-reply");
+            let started = std::time::Instant::now();
+            let ok = poll_until_async(Duration::from_secs(5), Duration::from_millis(100), || {
+                try_put(&c.router, side, key.as_bytes(), b"v")
+            })
+            .await;
+            eprintln!("side {side}: writable={ok} after {:?}", started.elapsed());
+            assert!(ok, "partition {side} still refuses writes 5 s after the lost freeze reply");
+        }
+    });
+}
+
 /// The commit's etcd compares (source owner revisions, all six stream
 /// baselines) must hold on an undisturbed merge; a wrong key or revision
 /// would refuse every merge.

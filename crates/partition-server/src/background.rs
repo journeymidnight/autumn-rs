@@ -55,7 +55,7 @@ fn record_maint_outcome(
 
 fn is_frozen_for_maintenance(part: &Rc<RefCell<PartitionData>>) -> bool {
     let p = part.borrow();
-    p.frozen_for_split.get().is_some() || p.frozen_for_merge.get().is_some()
+    p.frozen_for_split.get().is_some() || p.merge_freeze.is_halted()
 }
 
 // the R4 4.4 MIN_PIPELINE_BATCH launch gate (and its
@@ -711,7 +711,7 @@ pub(crate) async fn background_maintenance_loop(
                 // `autumn-op compact`) retries after the freeze clears.
                 {
                     let p = part.borrow();
-                    if p.frozen_for_split.get().is_some() || p.frozen_for_merge.get().is_some() {
+                    if p.frozen_for_split.get().is_some() || p.merge_freeze.is_halted() {
                         // Defer; the dispatcher will retry once the freeze
                         // clears (region_sync_loop drops + reopens the
                         // partition on split-survivor / merge-victim, or

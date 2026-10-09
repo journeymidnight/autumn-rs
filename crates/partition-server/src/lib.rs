@@ -847,7 +847,7 @@ const OP_FENCE_BUMP: u8 = 0x08;
 /// Record op of a delete (the low bits; `OP_VALUE_POINTER` is a flag above).
 const OP_TOMBSTONE: u8 = 2;
 
-/// backstop TTL for `PartitionData.frozen_for_merge`. The manager's
+/// backstop TTL for a merge freeze's write halt. The manager's
 /// merge orchestrator (`handle_merge_partitions`) commits in <1 s on the
 /// happy path and explicitly unfreezes on rollback. This TTL fires only
 /// when the orchestrator crashed mid-flow before either committing the
@@ -1409,9 +1409,9 @@ pub(crate) struct PartitionData {
     pub(crate) extent_pins: std::cell::RefCell<
         std::collections::HashMap<u64, std::rc::Rc<std::sync::atomic::AtomicI64>>,
     >,
-    /// PrepareMerge-style write halt. `Some(instant_set)` while the
-    /// partition is in the merge-window write-halt; `None` otherwise.
-    /// Set by `MSG_MERGE_FREEZE`; cleared by an explicit unfreeze RPC
+    /// PrepareMerge-style write halt and the freeze's stage (see
+    /// `MergeFreezeState`). Halted from the moment the freeze holds the
+    /// maintenance gate; cleared by an explicit unfreeze RPC
     /// (manager rollback path), by partition reopen on rg/stream-id
     /// change (the normal post-commit recovery), or by `FREEZE_TTL`
     /// expiry inside `partition_loop` (backstop for orchestrator
@@ -1421,18 +1421,8 @@ pub(crate) struct PartitionData {
     /// crash mid-freeze loses the flag, which is correct because the
     /// merge txn either committed (next reopen sees the merged region)
     /// or didn't (reopen serves the pre-merge region normally).
-    pub(crate) frozen_for_merge: Cell<Option<std::time::Instant>>,
-    /// stashed `MSG_MERGE_FREEZE` response oneshot. `handle_incoming_req`
-    /// flips `frozen_for_merge=true` and parks the caller's resp here without
-    /// replying; `partition_loop` consumes it once `pending` AND
-    /// `inflight` are both empty AND every imm has been flushed, then sends
-    /// the OK reply. The caller (CLI / autumn-op merge) thus blocks
-    /// until every acked-pre-freeze write is durable on log_stream + has
-    /// flushed through to a row_stream SST referenced by a meta_stream
-    /// checkpoint, which is the strict precondition that makes
-    /// `MSG_CHECK_COMMIT_LENGTH` safe to capture for the merge txn.
-    pub(crate) freeze_drain_ack: std::cell::RefCell<Option<oneshot::Sender<HandlerResult>>>,
-    /// PrepareSplit-style write halt. Mirror of `frozen_for_merge`
+    pub(crate) merge_freeze: Rc<MergeFreezeState>,
+    /// PrepareSplit-style write halt. Mirror of the merge halt
     /// but for the SPLIT path; needed because `handle_split_part` runs on
     /// a spawned task (not inline through dispatch_partition_rpc) so it
     /// can park here and let `partition_loop` drain
@@ -6643,8 +6633,7 @@ async fn partition_thread_main(
         concurrency_ctrl: concurrency_ctrl.clone(),
         partition_budget: partition_budget.clone(),
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
-        frozen_for_merge: Cell::new(None),
-        freeze_drain_ack: std::cell::RefCell::new(None),
+        merge_freeze: Rc::new(MergeFreezeState::default()),
         frozen_for_split: Cell::new(None),
         split_pending: Cell::new(false),
         split_drain_ack: std::cell::RefCell::new(None),
@@ -7676,22 +7665,16 @@ async fn try_complete_freeze_drain(
     pending_empty: bool,
     inflight_empty: bool,
 ) {
-    let need_merge_drain = part.borrow().freeze_drain_ack.borrow().is_some();
+    let need_merge_drain = part.borrow().merge_freeze.is_draining();
     let need_split_drain = part.borrow().split_drain_ack.borrow().is_some();
     if !(need_merge_drain || need_split_drain) || !pending_empty || !inflight_empty {
         return;
     }
-    // Wait out maintenance already in flight and hold the gate through the
-    // final checkpoint publication. Split already holds this same gate in its
-    // caller. Maintenance paths re-check the freeze flag after acquiring the
-    // gate, so work which queued before this freeze cannot mutate the source
-    // between checkpoint publication and manager seal.
-    let _merge_maintenance_permit = if need_merge_drain {
-        let gate = part.borrow().maintenance_gate.clone();
-        Some(gate.acquire().await)
-    } else {
-        None
-    };
+    // Both freezes reach here holding `maintenance_gate` through the final
+    // checkpoint publication — split in its handler, merge in
+    // `merge_freeze_task` — and maintenance re-checks the freeze flag after
+    // acquiring it, so nothing mutates the source between the checkpoint and
+    // the manager's seal. Never await the gate here: it would stop this loop.
     {
         let mut p = part.borrow_mut();
         rotate_active(&mut p);
@@ -7737,40 +7720,29 @@ async fn try_complete_freeze_drain(
             drain_err = Some(msg);
         }
     }
-    // Merge ack: external RPC resp.
-    let merge_ack = part.borrow().freeze_drain_ack.borrow_mut().take();
-    if let Some(ack) = merge_ack {
-        // `publish_freeze_checkpoint` just set it to the drained log end.
-        let ckpt = part.borrow().durable_ckpt_vp.get();
-        let resp = match &drain_err {
-            None => partition_rpc::MergeFreezeResp {
-                code: partition_rpc::CODE_OK,
-                message: String::new(),
-                log_tail_extent_id: ckpt.0,
-                log_end: ckpt.1,
-            },
-            Some(e) => partition_rpc::MergeFreezeResp {
-                code: partition_rpc::CODE_UNAVAILABLE,
-                message: format!("freeze drain flush failed: {e}"),
-                log_tail_extent_id: 0,
-                log_end: 0,
-            },
-        };
-        let succeeded = resp.code == partition_rpc::CODE_OK;
-        let delivered = ack.send(Ok(partition_rpc::rkyv_encode(&resp))).is_ok();
-        if !succeeded || !delivered {
-            // A manager that did not observe a successful freeze cannot
-            // proceed, and its rollback skips the side whose freeze failed.
-            part.borrow().frozen_for_merge.set(None);
-        }
-        if succeeded {
-            tracing::info!(part_id, "freeze drain complete — partition halted");
-        } else {
-            tracing::warn!(
-                part_id,
-                "freeze drain reported flush failure to manager and unfroze; \
-                 merge will be rolled back"
-            );
+    // Merge: hand the outcome to `merge_freeze_task`, which answers the
+    // manager. A failed drain resumes writes at once, without waiting for
+    // the manager's rollback.
+    if need_merge_drain {
+        let state = part.borrow().merge_freeze.clone();
+        if let Some(drained_tx) = state.take_draining() {
+            // `publish_freeze_checkpoint` just set it to the drained log end.
+            let outcome = match &drain_err {
+                None => Ok(part.borrow().durable_ckpt_vp.get()),
+                Some(e) => Err(e.clone()),
+            };
+            let succeeded = outcome.is_ok();
+            let delivered = drained_tx.send(outcome).is_ok();
+            if succeeded && delivered {
+                state.set_drained();
+                tracing::info!(part_id, "freeze drain complete — partition halted");
+            } else {
+                state.end();
+                tracing::warn!(
+                    part_id,
+                    "merge freeze drain failed or its task is gone; unfrozen, the merge rolls back"
+                );
+            }
         }
     }
     // Split ack: internal oneshot signal.
@@ -7795,10 +7767,174 @@ async fn try_complete_freeze_drain(
     }
 }
 
+/// Where a merge freeze stands on one partition.
+///
+/// The drain must hold `maintenance_gate` so no compaction or GC mutates the
+/// source between its checkpoint and the manager's seal, and a compaction can
+/// hold that gate for minutes. The wait therefore runs in its own task
+/// (`merge_freeze_task`) with writes still flowing; `partition_loop` never
+/// awaits the gate. It used to, and a freeze arriving during a long
+/// compaction stopped the whole partition: writes, the TTL check and the
+/// manager's `freeze=false` (`manager/tests/merge_freeze_waits_for_gate.rs`).
+#[derive(Default)]
+enum MergeFreeze {
+    #[default]
+    Idle,
+    /// The freeze task waits for the gate. Dropping the sender (unfreeze)
+    /// ends the wait; the task answers that the freeze was cancelled.
+    WaitingForGate { _cancel: oneshot::Sender<()> },
+    /// The task holds the gate and writes are halted; `partition_loop`
+    /// drains and sends the checkpointed log position, or the failure.
+    /// Dropping the sender (unfreeze, TTL) cancels the freeze.
+    Draining(oneshot::Sender<Result<(u64, u64), String>>),
+    /// Drained and answered; writes stay halted until unfreeze, TTL or reopen.
+    Drained,
+}
+
+/// A partition's merge freeze: the write halt and the stage it belongs to,
+/// kept together so no exit can clear one without the other (a parked answer
+/// once outlived its halt: `freeze=false` cleared the halt only, and with no
+/// halt there was no TTL left to answer it). Writes are halted exactly in
+/// `Draining` and `Drained`.
+#[derive(Default)]
+pub(crate) struct MergeFreezeState {
+    halt: Cell<Option<std::time::Instant>>,
+    stage: RefCell<MergeFreeze>,
+}
+
+impl MergeFreezeState {
+    /// Writes are halted for a merge.
+    pub(crate) fn is_halted(&self) -> bool {
+        self.halt.get().is_some()
+    }
+
+    pub(crate) fn halted_since(&self) -> Option<std::time::Instant> {
+        self.halt.get()
+    }
+
+    /// A freeze is under way in any stage, including still waiting.
+    pub(crate) fn is_active(&self) -> bool {
+        !matches!(*self.stage.borrow(), MergeFreeze::Idle)
+    }
+
+    pub(crate) fn is_drained(&self) -> bool {
+        matches!(*self.stage.borrow(), MergeFreeze::Drained)
+    }
+
+    fn is_draining(&self) -> bool {
+        matches!(*self.stage.borrow(), MergeFreeze::Draining(_))
+    }
+
+    /// Start an attempt. The receiver resolves once the attempt is ended.
+    fn wait_for_gate(&self) -> oneshot::Receiver<()> {
+        let (cancel, cancelled) = oneshot::channel();
+        *self.stage.borrow_mut() = MergeFreeze::WaitingForGate { _cancel: cancel };
+        cancelled
+    }
+
+    /// Halt writes and hand the drain to `partition_loop`, unless this
+    /// attempt (`cancelled`) was ended meanwhile — the stage may then belong
+    /// to a newer one.
+    fn start_draining(
+        &self,
+        cancelled: &mut oneshot::Receiver<()>,
+    ) -> Option<oneshot::Receiver<Result<(u64, u64), String>>> {
+        if !matches!(cancelled.try_recv(), Ok(None)) {
+            return None;
+        }
+        let (drained_tx, drained_rx) = oneshot::channel();
+        self.halt.set(Some(std::time::Instant::now()));
+        *self.stage.borrow_mut() = MergeFreeze::Draining(drained_tx);
+        Some(drained_rx)
+    }
+
+    /// The drain's answer channel; the caller then calls `set_drained` or
+    /// `end`.
+    fn take_draining(&self) -> Option<oneshot::Sender<Result<(u64, u64), String>>> {
+        let mut stage = self.stage.borrow_mut();
+        match std::mem::take(&mut *stage) {
+            MergeFreeze::Draining(tx) => Some(tx),
+            other => {
+                *stage = other;
+                None
+            }
+        }
+    }
+
+    fn set_drained(&self) {
+        *self.stage.borrow_mut() = MergeFreeze::Drained;
+    }
+
+    /// End the freeze in any stage: writes resume, and an attempt still
+    /// waiting or draining answers that it was cancelled. Every way out of
+    /// a freeze (unfreeze, TTL, a failed drain) goes through here.
+    pub(crate) fn end(&self) {
+        self.halt.set(None);
+        *self.stage.borrow_mut() = MergeFreeze::Idle;
+    }
+}
+
+fn merge_freeze_resp(code: u8, message: impl Into<String>, cursor: (u64, u64)) -> HandlerResult {
+    Ok(partition_rpc::rkyv_encode(&partition_rpc::MergeFreezeResp {
+        code,
+        message: message.into(),
+        log_tail_extent_id: cursor.0,
+        log_end: cursor.1,
+    }))
+}
+
+/// One merge freeze attempt: wait for the maintenance gate with writes
+/// flowing, halt writes once held, let `partition_loop` drain, answer, and
+/// release the gate.
+async fn merge_freeze_task(
+    state: Rc<MergeFreezeState>,
+    gate: std::sync::Arc<CompactionGate>,
+    wake_loop: mpsc::UnboundedSender<()>,
+    part_id: u64,
+    cancelled: oneshot::Receiver<()>,
+    resp_tx: oneshot::Sender<HandlerResult>,
+) {
+    use futures::future::{select, Either};
+    const CANCELLED_WAITING: &str = "merge freeze cancelled while waiting for maintenance to finish";
+    let acquire = gate.acquire();
+    futures::pin_mut!(acquire);
+    let (permit, mut cancelled) = match select(acquire, cancelled).await {
+        Either::Left(held) => held,
+        Either::Right(_) => {
+            let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, (0, 0)));
+            return;
+        }
+    };
+    let Some(drained_rx) = state.start_draining(&mut cancelled) else {
+        let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, (0, 0)));
+        return;
+    };
+    let _ = wake_loop.unbounded_send(());
+    let drained = drained_rx.await;
+    let resp = match &drained {
+        Ok(Ok(cursor)) => merge_freeze_resp(partition_rpc::CODE_OK, "", *cursor),
+        Ok(Err(e)) => merge_freeze_resp(
+            partition_rpc::CODE_UNAVAILABLE,
+            format!("freeze drain flush failed: {e}"),
+            (0, 0),
+        ),
+        Err(_) => merge_freeze_resp(
+            partition_rpc::CODE_PRECONDITION,
+            "merge freeze cancelled (unfreeze or TTL) before its drain finished",
+            (0, 0),
+        ),
+    };
+    if resp_tx.send(resp).is_err() && matches!(drained, Ok(Ok(_))) {
+        // A manager that never sees the OK cannot proceed with the merge.
+        state.end();
+        tracing::warn!(part_id, "merge freeze answered into a closed request; unfrozen");
+    }
+    drop(permit);
+}
+
 /// A split owns `maintenance_gate` until its drain ACK and manager commit are
-/// complete. Letting a merge freeze park while either split marker is present
-/// would make `try_complete_freeze_drain` wait for that gate while the split is
-/// waiting for the ACK produced by the same function.
+/// complete; a merge freeze then waits behind it for nothing. Refuse it
+/// instead, so the manager rolls back and retries after the split.
 fn split_blocks_merge_freeze(frozen_for_split: bool, split_drain_pending: bool) -> bool {
     frozen_for_split || split_drain_pending
 }
@@ -7808,19 +7944,9 @@ fn split_blocks_merge_freeze(frozen_for_split: bool, split_drain_pending: bool) 
 /// the split handler wedged), auto-unfreeze and fail any parked ack so the
 /// partition resumes serving writes.
 fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64) {
-    if let Some(at) = part.borrow().frozen_for_merge.get() {
+    if let Some(at) = part.borrow().merge_freeze.halted_since() {
         if at.elapsed() >= FREEZE_TTL {
-            let p = part.borrow();
-            p.frozen_for_merge.set(None);
-            if let Some(ack) = p.freeze_drain_ack.borrow_mut().take() {
-                let resp = partition_rpc::MergeFreezeResp {
-                    code: partition_rpc::CODE_PRECONDITION,
-                    message: "freeze TTL expired (orchestrator crash backstop)".to_string(),
-                    log_tail_extent_id: 0,
-                    log_end: 0,
-                };
-                let _ = ack.send(Ok(partition_rpc::rkyv_encode(&resp)));
-            }
+            part.borrow().merge_freeze.end();
             tracing::warn!(
                 part_id,
                 ttl_secs = FREEZE_TTL.as_secs(),
@@ -7981,7 +8107,7 @@ async fn handle_incoming_req(
     // readers see the existing state).
     let frozen = {
         let p = part.borrow();
-        p.frozen_for_merge.get().is_some() || p.frozen_for_split.get().is_some()
+        p.merge_freeze.is_halted() || p.frozen_for_split.get().is_some()
     };
     if frozen {
         match req.msg_type {
@@ -8140,12 +8266,11 @@ async fn handle_incoming_req(
                 Some(&p.rg),
             )
         }
-        // freeze stashes its resp oneshot in PartitionData and
-        // returns without replying — the loop body sends OK once
-        // pending+inflight drain and every imm flushes (Phase 1.5
-        // analogue of TiKV's PrepareMerge: write halt + final
-        // checkpoint). `freeze=false` (the rollback path) clears the
-        // flag synchronously; nothing to drain.
+        // freeze=true starts `merge_freeze_task`, which answers once it holds
+        // the maintenance gate, writes are halted and the loop has drained
+        // (Phase 1.5 analogue of TiKV's PrepareMerge: write halt + final
+        // checkpoint). freeze=false (the rollback path) ends the freeze in
+        // whatever stage it is.
         MSG_MERGE_FREEZE => {
             let req_msg = match partition_rpc::rkyv_decode::<MergeFreezeReq>(&req.payload) {
                 Ok(r) => r,
@@ -8156,7 +8281,7 @@ async fn handle_incoming_req(
             };
             if !req_msg.freeze {
                 let p = part.borrow();
-                p.frozen_for_merge.set(None);
+                p.merge_freeze.end();
                 let resp = MergeFreezeResp {
                     code: CODE_OK,
                     message: String::new(),
@@ -8189,7 +8314,7 @@ async fn handle_incoming_req(
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
                 }
-                if p.frozen_for_merge.get().is_some() && p.freeze_drain_ack.borrow().is_none() {
+                if p.merge_freeze.is_drained() {
                     // Already fully drained-frozen — reply OK immediately, with
                     // the cursor that drain checkpointed.
                     let ckpt = p.durable_ckpt_vp.get();
@@ -8202,7 +8327,7 @@ async fn handle_incoming_req(
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
                 }
-                if p.freeze_drain_ack.borrow().is_some() {
+                if p.merge_freeze.is_active() {
                     let resp = MergeFreezeResp {
                         code: CODE_PRECONDITION,
                         message: "freeze already in progress".to_string(),
@@ -8232,12 +8357,17 @@ async fn handle_incoming_req(
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
                 }
-                p.frozen_for_merge.set(Some(std::time::Instant::now()));
-                *p.freeze_drain_ack.borrow_mut() = Some(req.resp_tx);
+                let cancelled = p.merge_freeze.wait_for_gate();
+                compio::runtime::spawn(merge_freeze_task(
+                    p.merge_freeze.clone(),
+                    p.maintenance_gate.clone(),
+                    p.split_wake_tx.clone(),
+                    p.part_id,
+                    cancelled,
+                    req.resp_tx,
+                ))
+                .detach();
             }
-            // Loop body fires the OK reply once every pre-freeze write
-            // has cleared pending → inflight → memtable → row_stream SST
-            // → meta_stream checkpoint.
         }
         // SPLIT_PART is spawned as a separate task on the same
         // P-log runtime so its awaits (drain + commit_length + manager
@@ -10215,7 +10345,7 @@ pub(crate) async fn save_table_locs_raw(
 async fn publish_freeze_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
     let (sc, log_stream_id, meta_stream_id) = {
         let p = part.borrow();
-        if p.frozen_for_merge.get().is_none() && p.frozen_for_split.get().is_none() {
+        if !p.merge_freeze.is_halted() && p.frozen_for_split.get().is_none() {
             return Err(anyhow!("freeze checkpoint requires frozen writes"));
         }
         (p.stream_client.clone(), p.log_stream_id, p.meta_stream_id)
@@ -15776,5 +15906,126 @@ mod unsettled_delete_seed_tests {
         m.insert(key_with_ts(b"a", 3), entry(OP_TOMBSTONE), 1);
         m.insert(key_with_ts(b"c", 4), entry(OP_TOMBSTONE), 1);
         assert_eq!(m.tombstone_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod merge_freeze_tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct Attempt {
+        resp: oneshot::Receiver<HandlerResult>,
+    }
+
+    fn start(state: &Rc<MergeFreezeState>, gate: &std::sync::Arc<CompactionGate>) -> Attempt {
+        let (wake, _wake_rx) = mpsc::unbounded();
+        let (resp_tx, resp) = oneshot::channel();
+        let cancelled = state.wait_for_gate();
+        compio::runtime::spawn(merge_freeze_task(
+            state.clone(),
+            gate.clone(),
+            wake,
+            1,
+            cancelled,
+            resp_tx,
+        ))
+        .detach();
+        Attempt { resp }
+    }
+
+    async fn answer(a: Attempt) -> partition_rpc::MergeFreezeResp {
+        let bytes = compio::time::timeout(Duration::from_secs(2), a.resp)
+            .await
+            .expect("the freeze never answered")
+            .expect("task dropped its answer")
+            .expect("handler error");
+        partition_rpc::rkyv_decode(&bytes).unwrap()
+    }
+
+    async fn until(f: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            compio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition never held");
+    }
+
+    #[test]
+    fn take_draining_outside_draining_leaves_the_stage() {
+        let state = MergeFreezeState::default();
+        assert!(state.take_draining().is_none());
+        let _attempt = state.wait_for_gate();
+        assert!(state.take_draining().is_none());
+        assert!(state.is_active());
+    }
+
+    #[test]
+    fn a_freeze_waiting_for_the_gate_halts_nothing_and_ends_on_unfreeze() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = Rc::new(MergeFreezeState::default());
+            let gate = CompactionGate::new(1);
+            let compaction = gate.acquire().await;
+            let a = start(&state, &gate);
+            compio::time::sleep(Duration::from_millis(100)).await;
+            assert!(state.is_active() && !state.is_halted());
+            state.end();
+            let r = answer(a).await;
+            assert_eq!(r.code, partition_rpc::CODE_PRECONDITION);
+            assert!(r.message.contains("waiting for maintenance"), "{}", r.message);
+            drop(compaction);
+            assert!(!state.is_active());
+        });
+    }
+
+    /// An unfreeze while the loop has not finished draining must answer the
+    /// parked freeze; it used to clear only the halt and leave it parked.
+    #[test]
+    fn an_unfreeze_while_draining_answers_the_freeze_and_frees_the_gate() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = Rc::new(MergeFreezeState::default());
+            let gate = CompactionGate::new(1);
+            let a = start(&state, &gate);
+            until(|| state.is_halted()).await;
+            state.end();
+            let r = answer(a).await;
+            assert_eq!(r.code, partition_rpc::CODE_PRECONDITION);
+            assert!(r.message.contains("before its drain finished"), "{}", r.message);
+            assert!(!state.is_halted() && !state.is_active());
+            let freed = compio::time::timeout(Duration::from_secs(1), gate.acquire()).await;
+            assert!(freed.is_ok(), "the cancelled freeze kept the maintenance gate");
+        });
+    }
+
+    #[test]
+    fn a_drained_freeze_answers_the_drained_position_and_stays_halted() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = Rc::new(MergeFreezeState::default());
+            let gate = CompactionGate::new(1);
+            let a = start(&state, &gate);
+            until(|| state.is_halted()).await;
+            let tx = state.take_draining().expect("draining");
+            assert!(tx.send(Ok((7, 4096))).is_ok());
+            state.set_drained();
+            let r = answer(a).await;
+            assert_eq!(r.code, partition_rpc::CODE_OK);
+            assert_eq!((r.log_tail_extent_id, r.log_end), (7, 4096));
+            assert!(state.is_drained() && state.is_halted());
+        });
+    }
+
+    /// An attempt ended while its gate was being granted, with a newer
+    /// attempt already waiting (an unfreeze and a new freeze handled in one
+    /// loop pass): the old one must not take over the newer one's stage.
+    #[test]
+    fn an_ended_attempt_does_not_take_over_a_newer_one() {
+        let state = MergeFreezeState::default();
+        let mut first = state.wait_for_gate();
+        state.end();
+        let _second = state.wait_for_gate();
+        assert!(state.start_draining(&mut first).is_none());
+        assert!(!state.is_halted() && state.is_active());
     }
 }

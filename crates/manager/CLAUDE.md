@@ -372,7 +372,11 @@ victim then survivor (drains inflight, flushes imms, halts new writes with
 both sources over** → captures `commit_length` ×6 under the sources' epochs →
 `multi_modify_merge` → on OK does NOT explicitly unfreeze (each PS's
 `region_sync_loop` sees the new (rg, stream_ids) and reopens the survivor = natural
-unfreeze); on error best-effort unfreeze. PS-side `FREEZE_TTL` (30 s) is the final
+unfreeze); on error best-effort unfreeze of every side a freeze was SENT to —
+including the one whose freeze failed, since its OK may only have been lost
+on the way back (that side then refused writes for the full TTL: 30 s in
+`a_lost_freeze_reply_does_not_leave_the_side_frozen`, now ~3 ms; an unfreeze
+of a side that is not frozen does nothing). PS-side `FREEZE_TTL` (30 s) is the final
 backstop, so no procedure-WAL is needed.
 
 **The freeze is not what makes the captured lengths final.** It lives in PS memory,

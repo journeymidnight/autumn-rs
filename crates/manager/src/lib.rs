@@ -32,7 +32,9 @@ pub(crate) mod store;
 /// `rpc_handlers`. Re-exported so integration tests can arm it.
 #[doc(hidden)]
 pub use manager_members::ManagerIdentity;
-pub use rpc_handlers::{MERGE_TEST_PAUSE_MS, MERGE_TEST_TAKEOVER_PAUSE_MS};
+pub use rpc_handlers::{
+    MERGE_TEST_DROP_FREEZE_REPLY, MERGE_TEST_PAUSE_MS, MERGE_TEST_TAKEOVER_PAUSE_MS,
+};
 
 // Pure `/api/overview` composer, shared with `autumn-op overview` so the
 // standalone dashboard app (crates/server/src/bin/autumn_dashboard) can render the same view the

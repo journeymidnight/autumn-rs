@@ -54,6 +54,13 @@ pub static MERGE_TEST_PAUSE_MS: std::sync::atomic::AtomicU64 =
 pub static MERGE_TEST_TAKEOVER_PAUSE_MS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Test-only failpoint: the freeze OK of this partition id is discarded as if
+/// the reply were lost in transport (the PS stays frozen and believes it
+/// answered). 0 = off.
+#[doc(hidden)]
+pub static MERGE_TEST_DROP_FREEZE_REPLY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// What a merge took from its two sources before measuring them.
 #[derive(Default)]
 pub(crate) struct MergeSources {
@@ -4206,8 +4213,9 @@ impl AutumnManager {
     //       both PSes will, on its next ~2 s tick, observe the new region
     //       state (survivor's rg widened, victim's region gone) and drop
     //       the frozen `PartitionData` entirely. The reopened survivor
-    //       starts fresh with `frozen_for_merge = None`.
-    //   9b. on failure: send freeze=false to anyone we already froze.
+    //       starts unfrozen.
+    //   9b. on failure: send freeze=false to every side a freeze was sent to
+    //       (a failed freeze may have frozen it: the OK can be lost).
     //       Best-effort — if the unfreeze RPC also fails, the PS-side
     //       FREEZE_TTL (30 s) is the final backstop. Once step 6 ran, the
     //       old owners are fenced: their next append is refused and the
@@ -4274,6 +4282,28 @@ impl AutumnManager {
             return Ok(rkyv_encode(&MergePartitionsResp {
                 code: CODE_PRECONDITION,
                 message: "survivor and victim are the same partition".to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+        // Also before anything freezes: a merge refused after the takeover
+        // costs each side a failed write and a reopen. The commit checks
+        // adjacency again against the state it commits on.
+        let not_adjacent = {
+            let s = self.store.inner.borrow();
+            let rg = |pid: u64| s.partitions.get(&pid).and_then(|p| p.rg.clone());
+            match (rg(req.survivor_part_id), rg(req.victim_part_id)) {
+                (Some(sr), Some(vr)) if sr.end_key != vr.start_key => {
+                    Some((sr.end_key, vr.start_key))
+                }
+                _ => None,
+            }
+        };
+        if let Some((s_end, v_start)) = not_adjacent {
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "partitions are not adjacent (survivor.end={s_end:?}, victim.start={v_start:?})"
+                ),
                 new_log_tail_extent_id: 0,
             }));
         }
@@ -4420,6 +4450,14 @@ impl AutumnManager {
                     )
                     .await
                     .map_err(|e| AppError::Internal(format!("freeze rpc to {addr}: {e}")))?;
+                if freeze
+                    && MERGE_TEST_DROP_FREEZE_REPLY.load(std::sync::atomic::Ordering::Relaxed)
+                        == part_id
+                {
+                    return Err(AppError::Internal(format!(
+                        "freeze rpc to {addr}: reply dropped (test failpoint)"
+                    )));
+                }
                 let resp: autumn_rpc::partition_rpc::MergeFreezeResp =
                     autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes)
                         .map_err(AppError::Internal)?;
@@ -4433,8 +4471,7 @@ impl AutumnManager {
             }
         };
 
-        // Track which PSes we successfully froze, in reverse order, for
-        // best-effort rollback on failure.
+        // Every PS a freeze was sent to, unfrozen in reverse order on failure.
         let mut to_unfreeze: Vec<(String, u64)> = Vec::new();
         let rollback = |list: Vec<(String, u64)>, pool: Rc<ConnPool>| async move {
             for (addr, pid) in list.into_iter().rev() {
@@ -4461,9 +4498,15 @@ impl AutumnManager {
         // deadlock-safe lock acquisition; here the freezes don't deadlock
         // each other but we keep the order for consistency with future
         // PS-side gate work).
+        // Each side joins the rollback BEFORE its freeze is sent: a failed
+        // freeze may still have frozen it (the OK lost on the way back), and
+        // an unfreeze of a side that is not frozen does nothing. Left out, a
+        // lost reply kept the side refusing writes until FREEZE_TTL (30 s).
+        to_unfreeze.push((v_info.part_addr.clone(), req.victim_part_id));
         let v_drained = match send_freeze(v_info.part_addr.clone(), req.victim_part_id, true).await {
             Ok(cursor) => cursor,
             Err(e) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
                 return Ok(rkyv_encode(&MergePartitionsResp {
                     code: Self::err_to_code(&e),
                     message: e.to_string(),
@@ -4471,8 +4514,7 @@ impl AutumnManager {
                 }));
             }
         };
-        to_unfreeze.push((v_info.part_addr.clone(), req.victim_part_id));
-
+        to_unfreeze.push((s_info.part_addr.clone(), req.survivor_part_id));
         let s_drained = match send_freeze(s_info.part_addr.clone(), req.survivor_part_id, true).await {
             Ok(cursor) => cursor,
             Err(e) => {
@@ -4485,7 +4527,6 @@ impl AutumnManager {
             }
         };
         merge_phase(2); // both sides frozen — writes are stopped from here
-        to_unfreeze.push((s_info.part_addr.clone(), req.survivor_part_id));
 
         {
             let pause = MERGE_TEST_TAKEOVER_PAUSE_MS.load(std::sync::atomic::Ordering::Relaxed);

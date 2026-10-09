@@ -2489,30 +2489,42 @@ Three fixes bound the restart replay window (worst case per partition =
     the PS closes the merge-window data-loss gap with a write halt. Wire: client →
     `MSG_MERGE_PARTITIONS { survivor, victim }` → manager → `MSG_MERGE_FREEZE { freeze:
     true }` to victim PS → same to survivor PS → 6× commit_length under freeze →
-    `handle_multi_modify_merge` atomic etcd txn → return. PS-side state on
-    `PartitionData`:
-    - `frozen_for_merge: Cell<Option<Instant>>` — `Some(set_at)` while the write halt is
-      in effect.
-    - `freeze_drain_ack: RefCell<Option<oneshot::Sender>>` — parked freeze response.
+    `multi_modify_merge` atomic etcd txn → return. PS-side state:
+    `PartitionData.merge_freeze: Rc<MergeFreezeState>` — the write halt and the
+    freeze's stage together (`Idle → WaitingForGate → Draining → Drained`), so no
+    exit can clear one without the other. A freeze=true starts `merge_freeze_task`,
+    which waits for `maintenance_gate` with writes still flowing (a compaction can
+    hold it for minutes), halts writes once it holds it, and answers. The drain
+    used to await the gate inside `partition_loop`: a freeze arriving during a long
+    major compaction stopped the whole partition — writes, the TTL check and the
+    manager's freeze=false (a stress run; `manager/tests/merge_freeze_waits_for_gate.rs`
+    is red that way). `partition_loop` never awaits the gate now. `MergeFreezeState::end`
+    is the one exit (freeze=false, TTL, failed drain): it ends any stage and the
+    task answers that the freeze was cancelled; freeze=false used to clear only
+    the halt and leave a draining answer parked, with no TTL left to clear it.
+    A split refuses while a merge freeze is active in any stage, including the
+    wait. Unit tests: `merge_freeze_tests` (red when `end` leaves the stage, or
+    when an ended attempt may take over a newer one's stage).
 
     `handle_incoming_req` short-circuits Put / Delete with `CODE_UNAVAILABLE` while
-    frozen; reads + maintenance flow normally. `partition_loop` top-of-loop:
-    - if `freeze_drain_ack.is_some() && pending.is_empty() && inflight.is_empty()`:
+    halted; reads + maintenance flow normally. `partition_loop` top-of-loop:
+    - if the freeze is `Draining` and `pending` / `inflight` are empty:
       rotate active + flush every imm via `flush_one_imm`, publish a checkpoint at the
-      committed log end, then send OK on the parked oneshot (the strict precondition
+      committed log end, then hand that position to the task, which answers OK (the strict precondition
       for the orchestrator's commit_length capture to be race-free). A flush or
-      checkpoint failure answers `CODE_UNAVAILABLE` and unfreezes at once. The
-      manager's rollback skips the side whose freeze failed; left frozen, that side
-      refused writes until `FREEZE_TTL`, and a retried merge inside the TTL was
+      checkpoint failure answers `CODE_UNAVAILABLE` and unfreezes at once, without
+      waiting for the manager's rollback. Left frozen, that side refused writes
+      until `FREEZE_TTL`, and a retried merge inside the TTL was
       answered "already drained-frozen" with no new drain while the failed imm was
       still queued — the merge committed and lost its writes (100 acked writes in
       `a_merge_retried_after_a_failed_drain_flush_loses_nothing`).
-    - if `frozen_for_merge` elapsed > `FREEZE_TTL` (30 s): auto-unfreeze + drop stale ack
-      with PRECONDITION (orchestrator-crash backstop; happy path completes < 1 s).
+    - if halted longer than `FREEZE_TTL` (30 s): `MergeFreezeState::end`
+      (orchestrator-crash backstop; happy path completes < 1 s). The wait for the gate
+      has no TTL: it halts nothing, and the manager's freeze=false ends it.
 
     Recovery on success: the merge txn deletes victim's region and widens survivor's;
     `region_sync_loop` sees both on its next ~2 s tick, drops the frozen `PartitionData`
-    for victim, reopens survivor with `frozen_for_merge = None` (no explicit unfreeze).
+    for victim, reopens survivor with a fresh `MergeFreezeState` (no explicit unfreeze).
     The splice leaves one checkpoint record per source in the survivor's meta stream,
     each written by that source's drain at its committed log end; recovery starts
     at the latest of them and replays nothing from either source ("Recovery replay
@@ -2543,8 +2555,9 @@ Three fixes bound the restart replay window (worst case per partition =
     partition over (`partition/<id>` acquired, all three tails fenced), so the old
     open's appends and stream ops are refused from then on, and refuses the merge if
     the log no longer ends at the drained position (manager CLAUDE.md, Merge).
-    Recovery on failure: manager sends `MSG_MERGE_FREEZE { freeze: false }` rollback; the
-    FREEZE_TTL backstop fires if even that fails. Once taken over, the partition's next
+    Recovery on failure: manager sends `MSG_MERGE_FREEZE { freeze: false }` to every side
+    it sent a freeze to, including one whose freeze failed (its OK may have been lost);
+    the FREEZE_TTL backstop fires if even that fails. Once taken over, the partition's next
     append is refused and it reopens under a fresh epoch (`poison_for_fence`). Merge wallclock is ~2–3 s (bounded by
     the region_sync tick) but write loss is 0. This model avoids cross-thread plumbing
     (each `PartitionData` is `Rc<RefCell<>>`, `!Send`) that a PS-orchestrated design
@@ -2788,7 +2801,7 @@ the chaos acked-write-loss family; repro
   the "big-values-only persistent not_found/timeout" mask (kid%8==0, both
   writer prefixes — both partitions' tails were rolled) until the verifier
   stopped swallowing frame-level GET errors.
-- **Deferred while `frozen_for_split` / `frozen_for_merge`.** Split/merge
+- **Deferred while `frozen_for_split` / the merge halt.** Split/merge
   capture per-stream commit lengths and the manager seals whatever extent is
   the CURRENT tail at commit time; a roll inside that window swaps the tail so
   the captured length gets stamped onto the roll's fresh empty extent (sealed

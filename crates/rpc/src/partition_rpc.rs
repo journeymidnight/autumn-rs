@@ -92,8 +92,8 @@ pub const MSG_MERGE_PART: u8 = 0x4D;
 // victim's PS BEFORE capturing commit_length so writes that would otherwise
 // fall in the FLUSH→manager.commit window are halted at the source.
 //
-// `freeze=true`  → drain pending + inflight + flush all imm, set
-//                  PartitionData.frozen_for_merge=true, ack.
+// `freeze=true`  → wait for the maintenance gate (writes flowing), halt
+//                  writes, drain pending + inflight + flush all imm, ack.
 //                  Subsequent Put/Delete/StreamPut return CODE_UNAVAILABLE
 //                  until either an unfreeze RPC clears the flag OR the
 //                  partition is reopened by region_sync_loop on rg/stream-id
@@ -647,7 +647,7 @@ pub const CODE_VALUE_TOO_LARGE: u8 = 5;
 // any more). Code 6 is RESERVED — don't reuse for at least one major
 // version to avoid mis-decoding by stale clients.
 /// Put/Delete/StreamPut rejected because the partition is in the
-/// `frozen_for_merge` window. Caller should refresh routing and retry —
+/// merge-freeze window. Caller should refresh routing and retry —
 /// the merged topology is committed on the manager and the survivor will
 /// reopen with the wider rg on its next region_sync tick.
 pub const CODE_UNAVAILABLE: u8 = 7;
