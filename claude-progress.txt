@@ -1,3 +1,11 @@
+Date: 2026-10-10 (3)
+TaskStatus: completed
+Task scope: user — (1) compactions should make bigger SSTs; (2) point lookups should check a table's key range before its bloom filter.
+Current summary: (1) `--compact-max-sst-bytes` (default 1 GiB, user's pick; 4 KiB-3 GiB, u32 block offsets), `max_sst_bytes()` = max(flag, 2 × flush): was 2 × flush = 512 MiB; a major leaves ~1 table per GiB. `SstBuilder::finish` now allocates the SST at its final size and frees blocks as it copies (growing a Vec held ~3× the cap). Tests that shrink the flush size (and chaos) set the cap to 2 × flush so multi-output compactions stay covered. (2) `SstReader::may_contain` (key inside smallest..biggest user key, then bloom) used by `lookup_in_sst_via` (get, GC liveness). (3) Found while re-running the ops.md check: `min_size` 128 MiB let one growing table be re-merged with every couple of flushes when flush SSTs are small (4 MiB flushes, 1 GiB cap: 4K writes 21K → 7.7K); default now 1 MiB → tiered merges (14.4K, 2-3 tables per partition). (4) Review: the blocking count now counts only mergeable tables — counting never-mergeable large ones made a partition permanently "stuck" and brought back the re-merge (already in bab03b2c).
+Verification: PS lib 312 (new range-check test red without the check; `large_tables_do_not_make_a_partition_stuck` red when counting all tables; min_size test reworked to KB sizes); stream lib 227; full manager suite 138 green; autumn-server tests green. Perf A/B vs bab03b2c, TCP 4K p8 60 s cpuset-isolated, default config (no minors run): write 57.0/63.0K vs 62.9/63.2K, read 394/370K vs 370/369K, per-op PS CPU equal — no regression seen. ops.md manual check re-run with the new defaults. Reviews: opus x3 (no high; multi-output coverage, finish memory, stuck counting, stale docs fixed).
+Main gaps: flush latency while a 1 GiB compaction append is in flight not measured (inferred: a queued flush waits ~2× longer than at 512 MiB). Not run on a real cluster.
+Next steps: deploy; watch put p99 during majors.
+
 Date: 2026-10-10 (2)
 TaskStatus: completed
 Task scope: user — minor compaction never ran on a partition that sat at 35 tables until a manual major; redesign the trigger after HBase; fix the post-merge stale read found while designing it.

@@ -17,9 +17,13 @@ use crate::TableMeta;
 /// `autumn-ps --compact-*` knobs. Defaults are HBase's
 /// (`hbase.hstore.compaction.{min,max,ratio,min.size}`,
 /// `hbase.hstore.blockingStoreFiles`), except `min_size`: HBase uses the
-/// flush size, but an SST here is usually far smaller than its memtable (large
-/// values live in the log stream), so that would exempt nearly every window
-/// from the ratio. 128 MiB is the old size-tiered "small table" bound.
+/// flush size because its flushes produce files that big; here a flush SST
+/// ranges from KBs (WAL-gap flushes of large-value partitions) to the memtable
+/// size. A window under `min_size` skips the ratio, so with `min_size` far
+/// above the flush SSTs one growing table joined every couple of flushes and
+/// was rewritten each time (4 MiB flushes, 128 MiB: a 125 MB table rewritten
+/// 14 times per partition in 30 s, 4K writes 21K → 7.7K ops/s). At 1 MiB only
+/// tiny windows skip the ratio, and tables grow by tiers.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MinorPolicy {
     pub min_files: usize,
@@ -32,7 +36,8 @@ pub struct MinorPolicy {
     /// ~15% and buys only halving their count (user, 2026-10-10: performance
     /// must not drop). Only a major or the head-extent reclaim rewrites them.
     pub large_size: u64,
-    /// At this many tables a window is picked even when none passes the ratio.
+    /// At this many mergeable tables (under the size bounds) a window is picked
+    /// even when none passes the ratio.
     pub blocking_files: usize,
 }
 
@@ -42,7 +47,7 @@ impl Default for MinorPolicy {
             min_files: 3,
             max_files: 10,
             ratio: 1.2,
-            min_size: 128 * 1024 * 1024,
+            min_size: 1024 * 1024,
             large_size: 128 * 1024 * 1024,
             blocking_files: 16,
         }
@@ -88,22 +93,25 @@ pub(crate) const RECLAIM_LIVE_PERCENT: u64 = 30;
 pub(crate) struct MinorPick {
     /// List indices of the tables to merge.
     pub window: Range<usize>,
-    /// No window passed the ratio test; picked because the table count reached
-    /// `blocking_files`.
+    /// No window passed the ratio test; picked because the mergeable table
+    /// count reached `blocking_files`.
     pub forced: bool,
 }
 
 /// HBase's `ExploringCompactionPolicy.applyCompactionPolicy` over every window
 /// of `min_files..=max_files` tables: keep windows whose total is under
 /// `min_size` or where no table exceeds `ratio` × the rest; prefer the most
-/// tables, then the smallest total. At `blocking_files` tables the comparison
-/// becomes tables-removed per byte (a new window must be 5% better), and with
-/// no window in ratio the smallest window is taken.
+/// tables, then the smallest total. At `blocking_files` mergeable tables (HBase
+/// counts every file; here large ones never merge and writes never wait, so
+/// counting them would only force pointless windows) the comparison becomes
+/// tables-removed per byte (a new window must be 5% better), and with no
+/// window in ratio the smallest window is taken.
 ///
 /// A table of `large_size` or more is never in a window (see the field), nor
-/// one of `max_table` bytes or more (HBase's `compaction.max.size`). Sizes are SST bytes (`TableMeta.len`), the unit
-/// `do_compact` cuts its outputs in (at `max_sst_bytes`). The caller passes
-/// 0.6 × that cap: flush tables (about half of it) stay well inside, full
+/// one of `max_table` bytes or more (HBase's `compaction.max.size`). Sizes are
+/// SST bytes (`TableMeta.len`), the unit `do_compact` cuts its outputs in (at
+/// `max_sst_bytes`). The caller passes 0.6 × that cap: flush tables (at most
+/// half of it) stay inside, full
 /// outputs stay out, and k ≥ 3 tables under 0.6 × cap total under 0.6·k caps,
 /// which cut into fewer than k outputs with room for the bloom, index and
 /// packing slack. Without the bound three ~500 MB tables merged back into
@@ -114,11 +122,16 @@ pub(crate) fn select_minor(
     max_table: u64,
 ) -> Option<MinorPick> {
     let n = tables.len();
-    if n < p.min_files {
+    let limit = max_table.min(p.large_size);
+    // The blocking count is of the tables a window may hold: counting large
+    // ones, 16 of them made a partition "stuck" for good, and the tail window
+    // [growing, tiny, tiny] (out of ratio) was then forced every couple of
+    // flushes, rewriting the growing table each time.
+    let mergeable = tables.iter().filter(|t| t.len < limit).count();
+    if mergeable < p.min_files {
         return None;
     }
-    let might_be_stuck = n >= p.blocking_files;
-    let limit = max_table.min(p.large_size);
+    let might_be_stuck = mergeable >= p.blocking_files;
     let mut best: Option<(Range<usize>, u64)> = None;
     let mut smallest: Option<(Range<usize>, u64)> = None;
     for start in 0..n {
@@ -267,10 +280,14 @@ mod tests {
         assert_eq!(select_minor(&mixed, &p, bound).expect("pick").window, 1..4);
     }
 
-    /// Windows under `min_size` skip the ratio test.
+    /// Windows under `min_size` (1 MiB) skip the ratio test; above it the
+    /// same shape fails it.
     #[test]
     fn a_window_under_min_size_ignores_the_ratio() {
-        assert_eq!(pick(&[100, 2, 2]).expect("pick").window, 0..3);
+        let kb = |sizes: &[u64]| sizes.iter().map(|&k| t(1, k * 1024)).collect::<Vec<_>>();
+        let p = MinorPolicy::default();
+        assert_eq!(select_minor(&kb(&[800, 16, 16]), &p, u64::MAX).expect("pick").window, 0..3);
+        assert_eq!(select_minor(&kb(&[8000, 160, 160]), &p, u64::MAX), None);
     }
 
     /// Same table count: the smaller total wins (2000 fails the ratio in
@@ -302,7 +319,7 @@ mod tests {
         assert_eq!(p.window, 0..3);
     }
 
-    /// Outputs are cut at 512 MiB, the bound is 0.6 of that: three ~500 MB
+    /// With a 512 MiB output cap the bound is 0.6 of that: three ~500 MB
     /// tables would come out as three again and stay out; flush tables a
     /// little over 256 MiB (random keys encode slightly larger) stay in; the
     /// small ones between big tables still merge.
@@ -314,6 +331,16 @@ mod tests {
         assert_eq!(select_minor(&sized(&[258, 258, 258]), &p, bound).expect("pick").window, 0..3);
         let pick = select_minor(&sized(&[500, 100, 100, 100, 500]), &p, bound).expect("pick");
         assert_eq!(pick.window, 1..4);
+    }
+
+    /// Large tables never merge, so they do not count toward the blocking
+    /// level: 16 of them plus an out-of-ratio tail must not force a window.
+    #[test]
+    fn large_tables_do_not_make_a_partition_stuck() {
+        let p = MinorPolicy::default();
+        let mut tables = sized(&vec![200; 16]);
+        tables.extend([t(1, 20 * MB), t(1, 60 * 1024), t(1, 60 * 1024)]);
+        assert_eq!(select_minor(&tables, &p, u64::MAX), None);
     }
 
     #[test]

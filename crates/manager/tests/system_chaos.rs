@@ -456,7 +456,11 @@ impl PsProcess {
         cmd.arg("--cluster-secret-file")
             .arg(support::cluster_secret_file());
         if let Some(n) = self.flush_bytes {
-            cmd.args(["--flush-mem-bytes", &n.to_string()]);
+            // Outputs cut at 2 × the flush, as at the PS's own scale, so
+            // compactions still cut several outputs and full ones stay out of
+            // minor windows.
+            cmd.args(["--flush-mem-bytes", &n.to_string()])
+                .args(["--compact-max-sst-bytes", &(2 * n).to_string()]);
         }
         let child = cmd
             .args([

@@ -192,6 +192,18 @@ impl SstReader {
         }
     }
 
+    /// Whether a point lookup of `user_key` must read this table: the key is
+    /// inside the table's key range and the bloom filter passes it. The range
+    /// check comes first: a table whose range excludes the key costs no bloom
+    /// false positive (1% each), which matters when keys arrive in order and
+    /// every table covers its own slice of the key space.
+    pub fn may_contain(&self, user_key: &[u8]) -> bool {
+        self.block_count() > 0
+            && user_key >= crate::parse_key(&self.smallest_key)
+            && user_key <= crate::parse_key(&self.biggest_key)
+            && self.bloom_may_contain(user_key)
+    }
+
     // -----------------------------------------------------------------------
     // Block access
     // -----------------------------------------------------------------------
@@ -624,6 +636,27 @@ mod window_tests {
             b.add(&ikey(user.as_bytes(), i as u64 + 1), 1, b"v", 0);
         }
         SstReader::from_bytes(Bytes::from(b.finish())).expect("reader")
+    }
+
+    /// A key outside the table's range is never read, even when the bloom
+    /// filter (1% false positives) passes it.
+    #[test]
+    fn a_key_outside_the_range_is_skipped_even_on_a_bloom_false_positive() {
+        let mut b = SstBuilder::new(0, 0, 1000);
+        for i in 100..1100u32 {
+            b.add(&ikey(format!("key{i:06}").as_bytes(), i as u64), 1, b"v", 0);
+        }
+        let r = SstReader::from_bytes(Bytes::from(b.finish())).expect("reader");
+        let fp = (0..100_000u32)
+            .map(|i| format!("zzz{i:06}"))
+            .find(|k| r.bloom_may_contain(k.as_bytes()))
+            .expect("some key past the range passes the bloom");
+        assert!(!r.may_contain(fp.as_bytes()), "{fp} is past the range");
+        assert!(!r.may_contain(b"key000099") && !r.may_contain(b"key001100"));
+        assert!(r.may_contain(b"key000100") && r.may_contain(b"key001099"));
+        let empty = SstReader::from_bytes(Bytes::from(SstBuilder::new(0, 0, 1).finish()))
+            .expect("empty reader");
+        assert!(!empty.may_contain(b"key000500"));
     }
 
     /// The filter is sized for the table's distinct keys. Sized for a fixed

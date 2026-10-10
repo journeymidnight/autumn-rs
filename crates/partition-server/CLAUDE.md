@@ -592,13 +592,25 @@ Get(key, part_id):
   2. lookup_in_memtable(active, key)
   3. For each imm (newest first): lookup_in_memtable
   4. For each sst_reader (newest first):
-       bloom_may_contain? → find_block_for_key → scan block
+       may_contain? (key inside the table's range, then bloom) →
+       find_block_for_key → scan block
   5. If found:
        op == 2 → NotFound (tombstone)
        expires_at > 0 && expired → NotFound
        op has OP_VALUE_POINTER → resolve_value (read from log_stream)
        else → return raw value
 ```
+
+`SstReader::may_contain` checks the key against the table's smallest and
+biggest user key before the bloom filter (two comparisons on resident
+MetaBlock state). The bloom passes 1% of absent keys, so with N tables newer
+than a key's home (or N tables for a missing key) a get pays about N/100
+extra block reads. When keys arrive in order each table covers its own slice
+of the key space and the range check drops those reads to ~0; with random
+keys every table spans the space and nothing changes. Both production point
+lookups (get, GC liveness) go through `lookup_in_sst_via`.
+`reader::window_tests::a_key_outside_the_range_is_skipped_even_on_a_bloom_false_positive`
+(red without the range check).
 
 ### SST on-demand paging + bounded block cache
 
@@ -937,18 +949,30 @@ no window in ratio the tick logs it at debug, once a minute.
 `ExploringCompactionPolicy`): every window of `min_files..=max_files`
 consecutive tables of the list; a window is accepted when its total is below
 `min_size` or no table in it exceeds `ratio` × the rest of it; the most tables
-wins, then the smallest total. At `blocking_files` tables the comparison
+wins, then the smallest total. At `blocking_files` mergeable tables (those
+under the two bounds below; HBase counts every file, but large tables here
+never merge and writes never wait, so counting them only forced pointless
+windows — a growing table rewritten with every couple of flushes) the comparison
 becomes tables removed per byte (a new window must be 5% better) and, with no
 window in ratio, the smallest window is taken. Sizes are SST bytes
 (`TableMeta.len`), the unit `do_compact` cuts outputs in (`encoded_len`).
 
+**Output size.** Minor and major outputs are cut at `max_sst_bytes` =
+max(`--compact-max-sst-bytes`, 2 × flush size); the flag defaults to 1 GiB
+(user, 2026-10-10: bigger SSTs, fewer tables — a 50 GiB partition keeps ~50
+after a major, it was ~100 at the old 2 × flush = 512 MiB). The floor keeps a
+flushed table at no more than half the cap. Each running compaction holds its
+open output in memory (about 1× the cap: `finish` allocates the SST at its
+final size and frees each block as it copies it; growing a Vec held ~3×), up
+to `--major-compact-parallelism` (4) at once, and every replica's extent node
+receives each output as one append. Range 4 KiB-3 GiB (an SST's block offsets
+are u32); tests that shrink the flush size set it to 2 × that, so compactions
+still cut several outputs.
+
 Two bounds keep tables out of every window:
 - `large_size` (128 MiB, `--compact-large-size-bytes`): a table this large
-  never joins. Outputs are cut at `max_sst_bytes` (2 × flush = 512 MiB), so
-  however a partition is compacted it keeps at least one table per 512 MiB of
-  data; on a partition of flush-sized tables (4K inline values, 256 MiB SSTs)
-  a minor can only merge them into full ones — half the table count for
-  rewriting every byte once more. Doing it cost 4K writes ~15% and reads ~10%
+  never joins. Merging flush-sized tables (4K inline values, 256 MiB SSTs)
+  into bigger ones rewrites every byte once more for fewer tables. Doing it cost 4K writes ~15% and reads ~10%
   in the perf A/B (TCP, 8 partitions, 60 s, three replicas on one disk); the
   user ruled that performance must not drop (2026-10-10). Such tables are
   rewritten only by a major or the head-extent reclaim, as before this
@@ -958,15 +982,16 @@ Two bounds keep tables out of every window:
   flush until a major or its 50 GiB split; small tables alternating with large
   ones never form a run of `min_files` and stay. Bounding the count would cost
   one rewrite of every large flush table sooner or later (outputs are cut at
-  512 MiB), which is exactly the write cost refused above.
+  `max_sst_bytes`), which is exactly the write cost refused above.
 - `max_table` = 0.6 × `max_sst_bytes` (HBase's `compaction.max.size`, needed
   because HBase does not cut its outputs and `do_compact` does): k ≥ 3 tables
   each under it total under 0.6·k caps and cut into fewer than k outputs, with
   room for bloom, index and packing slack. Without it, windows of three
   ~500 MB tables merged back into three on every tick (perf A/B: 12-14 such
-  minors per partition-set in a 60 s run, 1.2-1.5 GB rewritten each). It
-  binds when it is below `large_size`: with `--flush-mem-bytes` under ~107 MiB,
-  or `large_size` raised. Measuring both sides in encoded bytes matters: in
+  minors per partition-set in a 60 s run, 1.2-1.5 GB rewritten each, when the
+  cap was 512 MiB). It binds only when it is below `large_size`: both
+  `--compact-max-sst-bytes` and 2 × flush under ~213 MiB, or `large_size`
+  raised. Measuring both sides in encoded bytes matters: in
   raw bytes, half the cap put flush tables right on the bound (random keys
   encode slightly larger and never merged), and selection and cutter
   disagreed by up to 2× on small values. A merge's remainder output between
@@ -974,9 +999,14 @@ Two bounds keep tables out of every window:
 Defaults are HBase's — `--compact-min-files 3`, `--compact-max-files 10`,
 `--compact-ratio 1.2`, `--compact-blocking-files 16` — plus
 `--compact-large-size-bytes` (128 MiB, above), and except
-`--compact-min-size-bytes` (128 MiB): HBase uses the flush size, but an SST
-here is usually far smaller than its memtable (large values live in the log
-stream), and the flush size would exempt nearly every window from the ratio.
+`--compact-min-size-bytes` (1 MiB): HBase uses the flush size because its
+flushes produce files that big; a flush SST here ranges from KBs (WAL-gap
+flushes of large-value partitions) to the memtable size. A window under
+`min_size` skips the ratio, so a `min_size` far above the flush SSTs let one
+growing table join every couple of flushes and be rewritten each time — with
+128 MiB and 4 MiB flushes a 125 MB table was rewritten 14 times per partition
+in 30 s (4K writes 21K → 7.7K ops/s); at 1 MiB the same run merges by tiers
+(12 → 24 → 44 → 92 MB windows, 14.4K ops/s, 2-3 tables per partition).
 HBase's write back-pressure at `blockingStoreFiles` is not copied: writes do
 not wait on compaction.
 
@@ -1223,7 +1253,7 @@ needs inputs whose log extents are all already punched; not reproduced.
        - Range filter: skip keys outside partition range
        - Discard tracking: when dropping VP entries, accumulate {extent_id → bytes}
        - Major filter: skip tombstones and expired entries
-       - If current SstBuilder size > 2 × the flush size: finalize, append to
+       - If the builder's encoded bytes would pass `max_sst_bytes`: finalize, append to
          row_stream, push (TableMeta, SstReader) into new_readers, start fresh
        - Otherwise SstBuilder.add(key, op, value, expires_at)
        - After loop: attach aggregated discards to final SstBuilder, finalize,
@@ -1862,13 +1892,14 @@ A per-partition `GcRateLimiter` survives as a deprecated inner cap layered befor
 | `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | **4** | PS-wide compact concurrency (`compact_max`) |
 | `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | **4** | PS-wide gc concurrency (`gc_max`) |
 | `--max-extent-size-bytes` | — | **16 GiB** | per-extent seal threshold to each partition's `StreamClient` (clamp [1 GiB, 64 GiB]) |
-| `--flush-mem-bytes` | — | **256 MiB** | memtable rotation size; a compaction output is cut at 2× it (clamp [4 KiB, 1 GiB]) |
+| `--flush-mem-bytes` | — | **256 MiB** | memtable rotation size (clamp [4 KiB, 1 GiB]) |
+| `--compact-max-sst-bytes` | — | **1 GiB** | compaction output SST size, at least 2× the flush size (4 KiB-3 GiB) |
 | `--deletion-compact-check-secs` | — | **300** | how often each partition evaluates the deletion-trigger rule (clamp [1, 86400]) |
 | `--compact-min-files` / `--compact-max-files` | — | **3 / 10** | tables a minor compaction merges |
 | `--compact-ratio` | — | **1.2** | a table joins a minor window only if ≤ ratio × the rest of it |
-| `--compact-min-size-bytes` | — | **128 MiB** | a window smaller than this skips the ratio test |
+| `--compact-min-size-bytes` | — | **1 MiB** | a window smaller than this skips the ratio test |
 | `--compact-large-size-bytes` | — | **128 MiB** | tables this large never enter a minor window |
-| `--compact-blocking-files` | — | **16** | at this many tables a window is merged even when none is in ratio |
+| `--compact-blocking-files` | — | **16** | at this many mergeable tables a window is merged even when none is in ratio |
 
 `0` on any rate flag = unlimited for that dimension (per-dimension opt-out).
 
@@ -2407,7 +2438,8 @@ both.
 | Constant | Value | Meaning |
 |----------|-------|---------|
 | `VALUE_THROTTLE` | 4 KB | Large value threshold (store as VP) |
-| `FLUSH_MEM_BYTES` | 256 MB | Memtable size trigger for rotation (`--flush-mem-bytes`). A compaction output SST is cut at 2× it |
+| `FLUSH_MEM_BYTES` | 256 MB | Memtable size trigger for rotation (`--flush-mem-bytes`) |
+| `COMPACT_MAX_SST_BYTES_DEFAULT` | 1 GiB | compaction output SST size (`--compact-max-sst-bytes`; at least 2× the flush size) |
 | `MAX_WRITE_BATCH` | 256 | Max requests per group-commit batch |
 | `BLOCK_SIZE_TARGET` | 64 KB | Target SSTable block size |
 | `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC. Halved when stream discard ≥ `stream_debt`, and again for a shared (`refs > 1`) extent. Bypassed entirely by `dead_bytes_high` (`MaintenanceReq.gc_dead_bytes_high`, `autumn-op gc --dead-bytes`), the absolute floor — a big pile is worth collecting at any fraction. |
@@ -2415,7 +2447,7 @@ both.
 | `MAX_IMM_DEPTH` | 4 | imm queue cap; merged_loop stalls req intake when reached (RocksDB `max_write_buffer_number`). Env `AUTUMN_PS_MAX_IMM_DEPTH` ([1, 64]). |
 | `MAX_WAL_GAP` | 1 GiB | force-rotate active when `active.log_bytes() + Σ imm.log_bytes()` exceeds this. Measures the un-flushed LOG bytes (value included), NOT `mem_bytes()`. RocksDB `max_total_wal_size`. Env `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
 | `SHUTDOWN_TIMEOUT_MS` | 60_000 | per-partition graceful drain deadline before SIGKILL fallback. Env `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` ([1_000, 600_000]). |
-| `MinorPolicy` | 3 / 10 / 1.2 / 128 MiB / 128 MiB / 16 | minor compaction: min files, max files, ratio, min size, large size, blocking files (`--compact-*`, see "Minor compaction") |
+| `MinorPolicy` | 3 / 10 / 1.2 / 1 MiB / 128 MiB / 16 | minor compaction: min files, max files, ratio, min size, large size, blocking files (`--compact-*`, see "Minor compaction") |
 | `RECLAIM_LIVE_PERCENT` | 30 | head-extent reclaim when its live tables are under this share of its sealed length; probed at most every `RECLAIM_CHECK_INTERVAL` (60 s) |
 
 ## Bounded recovery replay

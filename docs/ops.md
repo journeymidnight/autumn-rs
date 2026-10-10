@@ -1264,18 +1264,19 @@ Nothing outside the PS asks for a minor compaction. Every flush asks for one
 when the exploring policy (HBase's) finds a window of 3-10 consecutive tables,
 and the 5-7 s tick asks again; a row-stream head extent pinned by an old table
 is rewritten once its live tables are under 30% of it. Tuning (all `autumn-ps`
-flags): `--compact-min-files 3`, `--compact-max-files 10`, `--compact-ratio
-1.2`, `--compact-min-size-bytes 128MiB`, `--compact-large-size-bytes 128MiB`
-(tables this large never enter a minor window), `--compact-blocking-files 16`.
-Outputs are cut at 2 × the flush size, so a partition keeps at least one table
-per 512 MiB of data whatever compacts it. A partition of small SSTs (large
+flags, sizes in bytes; defaults shown): `--compact-min-files 3`,
+`--compact-max-files 10`, `--compact-ratio 1.2`, `--compact-min-size-bytes
+1048576` (1 MiB), `--compact-large-size-bytes 134217728` (128 MiB; tables this
+large never enter a minor window), `--compact-blocking-files 16`,
+`--compact-max-sst-bytes 1073741824` (1 GiB output SSTs, at least 2 × the
+flush size; each running compaction holds one in memory). A major leaves about one table
+per 1 GiB of data. A partition of small SSTs (large
 values in the log stream) stays at a handful of tables; one of flush-sized
 tables (4K inline values, 256 MiB SSTs) keeps one table per flush until a
 major — merging those into full tables cost 4K writes ~15%, so it is not done.
 
 Check it on a scratch cluster with 4 MiB memtables, so 4 KiB inline writes
-flush every ~1000 keys (each table ~4 MiB, under this flush size's window
-bound of 0.6 × 8 MiB):
+flush every ~1000 keys (each table ~4 MiB, far below `large_size`):
 
 ```bash
 AUTUMN_DATA_ROOT=/data05/<scratch> AUTUMN_EXTENT_BASE_PORT=21000 \
@@ -1293,11 +1294,12 @@ memtable, so `put` of big files does not make flushes.
 
 Expected: `minor compaction: N → M tables` lines with `trigger="flush"` (or
 `tick`) while the writes run, every one with M < N (an `N → N` line is a
-selection bug); the 4 MiB flush tables end up mostly in 8 MiB tables (the
-output cut at this flush size), plus merge remainders between 4.8 and 8 MiB
-that stay until a major (measured: 317 lines, all `3 → 2`, in a 30 s run; a
-partition with 341 MB of SSTs listed 41 tables). `blocking` in a line means a
-window was forced at 16 tables.
+selection bug), merging by tiers: windows of ~12, ~24, ~44, ~92 MB, each table
+growing until it reaches `large_size` (measured: 150 minors in a 30 s run, a
+partition with 230 MB of SSTs listed 2-3 tables). A window that keeps
+re-merging one growing table with every new flush means `min_size` is set far
+above the flush SSTs. `blocking` in a line means a window was forced at 16
+tables.
 
 After upgrading from a build that ordered tables by seq: a partition
 merged under it and minor-compacted since may hold a checkpoint whose table

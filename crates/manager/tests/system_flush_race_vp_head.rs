@@ -53,6 +53,7 @@ fn flush_must_stamp_rotation_vp_not_claim_cursor() {
         autumn_partition_server::set_flush_mem_bytes(8 * 1024),
         "flush_mem_bytes must be settable (OnceLock first-call-wins)"
     );
+    autumn_partition_server::set_compact_max_sst_bytes(16 * 1024).expect("compact max sst");
     autumn_partition_server::set_flush_test_pause(true);
     let _pause_guard = PauseGuard;
 

@@ -180,13 +180,9 @@ impl SstBuilder {
             self.finish_block();
         }
 
-        // Concatenate all blocks
-        let mut sst = Vec::new();
-        for block in &self.blocks {
-            sst.extend_from_slice(block);
-        }
-
-        // Build and append MetaBlock
+        // MetaBlock first, so the output is allocated once at its final size
+        // and each block is freed as it is copied (a compaction output is up
+        // to `--compact-max-sst-bytes`; growing a Vec held ~3× that).
         let bloom_filter = self.bloom.finish();
         let meta = MetaBlock {
             block_offsets: self.block_offsets,
@@ -205,6 +201,10 @@ impl SstBuilder {
         };
         let meta_bytes = meta.encode();
         let meta_len = meta_bytes.len() as u32;
+        let mut sst = Vec::with_capacity(self.running_offset as usize + meta_bytes.len() + 4);
+        for block in self.blocks.drain(..) {
+            sst.extend_from_slice(&block);
+        }
         sst.extend_from_slice(&meta_bytes);
         // Trailer: meta_len (4 bytes LE). Used by reader to locate the MetaBlock.
         sst.extend_from_slice(&meta_len.to_le_bytes());

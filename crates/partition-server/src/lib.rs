@@ -111,6 +111,11 @@ static PS_COMPACT_COOLDOWN_SECS_CELL: std::sync::OnceLock<i64> = std::sync::Once
 /// Memtable rotation threshold. Default `FLUSH_MEM_BYTES`; lowered by tests to
 /// rotate on small writes.
 static FLUSH_MEM_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+static COMPACT_MAX_SST_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+/// `--compact-max-sst-bytes` default: a 50 GiB partition keeps ~50 tables
+/// after a major. Each compaction holds one output SST in memory (about 1×
+/// this), and up to `--major-compact-parallelism` run at once.
+const COMPACT_MAX_SST_BYTES_DEFAULT: u64 = 1024 * 1024 * 1024;
 /// Test sync-point (RocksDB-`SyncPoint` style): when true, `background_flush_loop`
 /// holds BEFORE claiming any imm, so a test can advance the write cursor between
 /// an imm's rotation and its flush-claim — deterministically reproducing the
@@ -167,8 +172,8 @@ pub fn set_max_extent_size_bytes(n: u64) -> bool {
         .is_ok()
 }
 /// Memtable rotation threshold = the SST size a flush writes (`--flush-mem-bytes`).
-/// A compaction output SST is cut at twice it, and minor windows exclude
-/// tables of 0.6 × that cut or more. Clamp [4 KiB, 1 GiB].
+/// A compaction output SST is cut at no less than twice it (see
+/// `max_sst_bytes`). Clamp [4 KiB, 1 GiB].
 pub fn set_flush_mem_bytes(n: u64) -> bool {
     FLUSH_MEM_BYTES_CELL
         .set(n.clamp(4 * 1024, 1024 * 1024 * 1024))
@@ -177,10 +182,24 @@ pub fn set_flush_mem_bytes(n: u64) -> bool {
 pub(crate) fn flush_mem_bytes() -> u64 {
     FLUSH_MEM_BYTES_CELL.get().copied().unwrap_or(FLUSH_MEM_BYTES)
 }
+/// `autumn-ps --compact-max-sst-bytes`; 4 KiB to 3 GiB (an SST's block
+/// offsets are u32). Set before any partition opens; first call wins. Tests
+/// that shrink the flush size set it to 2 × that to keep multi-output
+/// compactions.
+pub fn set_compact_max_sst_bytes(n: u64) -> Result<(), String> {
+    if !(4 * 1024..=3 * 1024 * 1024 * 1024).contains(&n) {
+        return Err(format!("{n}: must be 4 KiB-3 GiB"));
+    }
+    COMPACT_MAX_SST_BYTES_CELL
+        .set(n)
+        .map_err(|_| "already set".to_string())
+}
 /// Data-block bytes at which `do_compact` cuts an output SST (bloom, index and
-/// MetaBlock come on top).
+/// MetaBlock come on top): `--compact-max-sst-bytes`, and at least twice the
+/// flush size so a flushed table is never above half of it.
 pub(crate) fn max_sst_bytes() -> u64 {
-    flush_mem_bytes().saturating_mul(2)
+    let configured = *COMPACT_MAX_SST_BYTES_CELL.get_or_init(|| COMPACT_MAX_SST_BYTES_DEFAULT);
+    configured.max(flush_mem_bytes().saturating_mul(2))
 }
 /// Approximate encoded bytes used to enforce the per-SST output budget.
 pub(crate) fn sst_entry_bytes(key_len: usize, value_len: usize) -> usize {

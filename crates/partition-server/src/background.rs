@@ -2780,7 +2780,7 @@ async fn checkpoint_and_truncate_row_prefix(
 // buffers explained the user-reported 44 GB single-PS RSS during
 // `compact ALL`.
 //
-// The streaming version below builds each ≈512 MB chunk inline within the
+// The streaming version below builds each output chunk inline within the
 // merge loop: when `current_builder` exceeds `max_chunk`, finalize and
 // append immediately, then start a fresh builder. Peak intermediate state
 // is one in-progress `SstBuilder` (≈current_chunk bytes) instead of the
@@ -3739,7 +3739,7 @@ impl GcRateLimiter {
 /// promoted from `gc_yield_now` (was GC-only) to a crate-private
 /// helper and now also called from `do_compact`'s merge loop every
 /// `COMPACT_YIELD_EVERY` entries (1000) — formerly the inline merge
-/// loop ran up to 2x the flush size (512 MiB at the default) of entries with NO
+/// loop ran a whole output (512 MiB at the time) of entries with NO
 /// `.await`, blocking the P-log compio runtime for ~1-2 SECONDS on
 /// large compactions. Client puts/gets to the same partition stalled
 /// for that duration. Heartbeat (PS-main runtime) was unaffected —
@@ -4378,11 +4378,11 @@ pub(crate) fn lookup_in_memtable(mem: &Memtable, user_key: &[u8]) -> Option<(u8,
 /// of the value. Used only by `MSG_DIAG_TRACE_KEY`.
 ///
 /// `use_bloom`: when true, mirror the real GET path (return 0 if the
-/// bloom says no). When false, skip the bloom and scan anyway — so a
+/// key range or the bloom excludes the key). When false, skip the bloom and scan anyway — so a
 /// bloom FALSE NEGATIVE (key present but bloom says absent) shows up as
 /// a divergence between the two.
 pub(crate) fn lookup_in_sst_seq_opt(reader: &SstReader, user_key: &[u8], use_bloom: bool) -> u64 {
-    if use_bloom && !reader.bloom_may_contain(user_key) {
+    if use_bloom && !reader.may_contain(user_key) {
         return 0;
     }
     let target = key_with_ts(user_key, u64::MAX);
@@ -4460,7 +4460,7 @@ pub(crate) async fn lookup_in_sst_via(
     sc: &Rc<StreamClient>,
     cache: &crate::sstable::BlockCache,
 ) -> Result<Option<(u8, Bytes, u64)>> {
-    if !reader.bloom_may_contain(user_key) {
+    if !reader.may_contain(user_key) {
         return Ok(None);
     }
     let target = key_with_ts(user_key, u64::MAX);
@@ -4509,7 +4509,7 @@ pub(crate) async fn lookup_in_sst_via(
 /// `lookup_in_sst_seq_opt` / `lookup_in_sst_via`, which mirror this logic.
 #[cfg(test)]
 pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
-    if !reader.bloom_may_contain(user_key) {
+    if !reader.may_contain(user_key) {
         return None;
     }
     let target = key_with_ts(user_key, u64::MAX);

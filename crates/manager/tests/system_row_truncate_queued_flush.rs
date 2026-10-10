@@ -103,6 +103,7 @@ fn truncation_proceeds_while_a_flush_is_queued() {
         autumn_partition_server::set_flush_mem_bytes(8 * 1024),
         "flush_mem_bytes was already set in this test binary"
     );
+    autumn_partition_server::set_compact_max_sst_bytes(16 * 1024).expect("compact max sst");
     let _guard = PauseGuard;
     // The truncate under test is the expiry major's; a minor of the three
     // SSTs would empty the first two extents before it.

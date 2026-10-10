@@ -58,6 +58,7 @@ struct Args {
     flush_mem_bytes: Option<u64>,
     deletion_compact_check_secs: Option<u64>,
     minor_policy: autumn_partition_server::compact_policy::MinorPolicy,
+    compact_max_sst_bytes: Option<u64>,
     shutdown_timeout_ms: Option<u64>,
     major_compact_parallelism: Option<usize>,
     gc_parallelism: Option<usize>,
@@ -131,6 +132,7 @@ fn parse_args() -> Args {
     let mut flush_mem_bytes: Option<u64> = None;
     let mut deletion_compact_check_secs: Option<u64> = None;
     let mut minor_policy = autumn_partition_server::compact_policy::MinorPolicy::default();
+    let mut compact_max_sst_bytes: Option<u64> = None;
     let mut shutdown_timeout_ms: Option<u64> = None;
     let mut major_compact_parallelism: Option<usize> = None;
     let mut gc_parallelism: Option<usize> = None;
@@ -271,6 +273,11 @@ fn parse_args() -> Args {
                         .parse()
                         .expect("--deletion-compact-check-secs u64 seconds"),
                 );
+            }
+            "--compact-max-sst-bytes" => {
+                i += 1;
+                compact_max_sst_bytes =
+                    Some(args[i].parse().expect("--compact-max-sst-bytes u64 bytes"));
             }
             "--compact-min-files" => {
                 i += 1;
@@ -466,21 +473,23 @@ fn parse_args() -> Args {
                 eprintln!("  --max-extent-size-bytes <N>  Per-extent seal threshold");
                 eprintln!("                       [default: 16 GiB, clamp 1-64 GiB]. Bigger =");
                 eprintln!("                       fewer extents = less manager metadata pressure.");
-                eprintln!("  --flush-mem-bytes <N>  Memtable size = SST size a flush writes;");
-                eprintln!("                       a compaction output is cut at 2x it [default:");
-                eprintln!("                       256 MiB, clamp 4 KiB-1 GiB].");
+                eprintln!("  --flush-mem-bytes <N>  Memtable size = SST size a flush writes");
+                eprintln!("                       [default: 256 MiB, clamp 4 KiB-1 GiB].");
+                eprintln!("  --compact-max-sst-bytes <N>");
+                eprintln!("                       A compaction output SST is cut at this size");
+                eprintln!("                       (at least 2x the flush size) [1 GiB, 4 KiB-3 GiB]");
                 eprintln!("  --compact-min-files <N> / --compact-max-files <N>");
                 eprintln!("                       Tables a minor compaction merges [3 / 10]");
                 eprintln!("  --compact-ratio <F>  A table joins a minor window only if it is at");
                 eprintln!("                       most F x the rest of the window [1.2]");
                 eprintln!("  --compact-min-size-bytes <N>");
                 eprintln!("                       A window smaller than this skips the ratio");
-                eprintln!("                       test [128 MiB]");
+                eprintln!("                       test [1 MiB]");
                 eprintln!("  --compact-large-size-bytes <N>");
                 eprintln!("                       Tables this large never enter a minor window");
                 eprintln!("                       (a major or head-extent reclaim rewrites them) [128 MiB]");
                 eprintln!("  --compact-blocking-files <N>");
-                eprintln!("                       At this many tables a window is merged even");
+                eprintln!("                       At this many mergeable tables a window is merged even");
                 eprintln!("                       when none is in ratio [16]");
                 eprintln!("  --deletion-compact-check-secs <N>");
                 eprintln!("                       How often each partition checks whether its");
@@ -545,6 +554,7 @@ fn parse_args() -> Args {
         flush_mem_bytes,
         deletion_compact_check_secs,
         minor_policy,
+        compact_max_sst_bytes,
         shutdown_timeout_ms,
         major_compact_parallelism,
         gc_parallelism,
@@ -611,6 +621,12 @@ fn apply_ps_tunables(args: &Args) {
     if let Some(n) = args.deletion_compact_check_secs {
         if !ps::background::set_deletion_compact_check_secs(n) {
             eprintln!("--deletion-compact-check-secs {n}: must be 1-86400");
+            std::process::exit(2);
+        }
+    }
+    if let Some(n) = args.compact_max_sst_bytes {
+        if let Err(e) = ps::set_compact_max_sst_bytes(n) {
+            eprintln!("--compact-max-sst-bytes {e}");
             std::process::exit(2);
         }
     }

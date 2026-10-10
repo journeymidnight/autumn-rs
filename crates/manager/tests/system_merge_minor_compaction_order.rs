@@ -71,6 +71,7 @@ async fn put_n(c: &RpcClient, part: u64, prefix: &str, n: usize) {
 #[test]
 fn a_minor_compaction_after_a_merge_keeps_the_newest_version_visible() {
     assert!(autumn_partition_server::set_flush_mem_bytes(FLUSH_BYTES));
+    autumn_partition_server::set_compact_max_sst_bytes(2 * FLUSH_BYTES).expect("compact max sst");
     autumn_partition_server::background::set_minor_compaction_paused(true);
     let mgr_addr = pick_addr();
     let en_addr = pick_addr();
