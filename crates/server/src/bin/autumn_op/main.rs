@@ -745,9 +745,8 @@ async fn cmd_mint_token(
     client: &ClusterClient,
     json: bool,
     principal: String,
-    credential_hex: String,
+    credential: Vec<u8>,
 ) -> Result<()> {
-    let credential = hex_decode(&credential_hex).context("--credential")?;
     let (token_bytes, exp) = client.mint_token(&principal, credential).await?;
     let token = hex_encode(&token_bytes);
     if json {

@@ -94,6 +94,8 @@ fn usage() -> ! {
     eprintln!("                               remove the registry row (refuses non-empty unless --force)");
     eprintln!("  namespace-list [--json]      list registered namespaces (name/prefix/presplit/created)");
     eprintln!("  principal-list [--json]      list principals + their grants (read-only, no credentials)");
+    eprintln!("  mint-token [--principal P] (--credential HEX | --credential-file F)");
+    eprintln!("                               mint a capability token (the file names its principal)");
     std::process::exit(1);
 }
 
@@ -124,16 +126,35 @@ fn num_arg<T: std::str::FromStr>(raw: &[String], i: usize, name: &str) -> T {
     })
 }
 
-/// read a secret (a principal credential) from a file,
-/// trimming a trailing newline. Preferred over passing secrets on argv, which
-/// leak via `ps` / `/proc/<pid>/cmdline` (coco P2). Fatal on read error.
-fn read_secret_file(path: &str) -> String {
-    match std::fs::read_to_string(path) {
-        Ok(s) => s.trim_end_matches(['\n', '\r']).to_string(),
-        Err(e) => {
-            eprintln!("autumn-op: cannot read secret file {path}: {e}");
-            std::process::exit(2);
+/// `mint-token`'s principal and raw credential: `--credential <hex>` (with
+/// `--principal`) wins; otherwise the credential `--credential-file` names
+/// (read by `prescan_secret_flags`, so it may sit before or after the
+/// subcommand, in either form that names a principal — what `principal-create`
+/// prints, or `<principal>\n<hex>`). One `--credential-file` serves both
+/// mint-token and the data plane, so an explicit hex does not conflict with it.
+/// The file's principal fills an absent `--principal` and must match a given
+/// one. The file used to be read as one hex string, which failed on both forms.
+fn mint_token_credential(
+    principal: String,
+    hex: Option<&str>,
+    file: Option<(String, Vec<u8>)>,
+) -> Result<(String, Vec<u8>), String> {
+    match (hex, file) {
+        (Some(""), _) => Err("--credential is empty".into()),
+        (Some(h), _) if !principal.is_empty() => {
+            let credential = crate::hex_decode(h).map_err(|e| format!("--credential: {e:#}"))?;
+            Ok((principal, credential))
         }
+        (Some(_), _) => Err("--credential needs --principal".into()),
+        (None, Some((named, secret))) => {
+            if !principal.is_empty() && principal != named {
+                return Err(format!(
+                    "--principal {principal} does not match the file's principal {named}"
+                ));
+            }
+            Ok((named, secret))
+        }
+        (None, None) => Err("--credential or --credential-file required".into()),
     }
 }
 
@@ -463,7 +484,7 @@ pub(crate) enum Command {
     /// token (hex) to stdout.
     MintToken {
         principal: String,
-        credential: String,
+        credential: Vec<u8>,
     },
     /// D2: register a namespace (admin). `--presplit` takes comma-separated
     /// hex split points, recorded on the namespace.
@@ -594,7 +615,7 @@ pub(crate) fn parse() -> Args {
     let mut manager = "127.0.0.1:9001".to_string();
     let mut json = false;
     let mut transport = TransportKind::Tcp;
-    let mut credential: Option<(String, Vec<u8>)> = scanned_credential;
+    let credential: Option<(String, Vec<u8>)> = scanned_credential;
     let mut i = 1usize;
     while i < raw.len() {
         match raw[i].as_str() {
@@ -622,25 +643,12 @@ pub(crate) fn parse() -> Args {
             "--cluster-secret-file" => {
                 i += 2;
             }
-            // data-plane credential, for the admin subcommands that read or write
-            // partition keys rather than only talking to the manager.
+            // Data-plane credential, for the admin subcommands that read or write
+            // partition keys rather than only talking to the manager. Read by
+            // `prescan_secret_flags` (last occurrence wins, wherever it sits);
+            // reading it again here made a pre-subcommand file override a later one.
             "--credential-file" => {
-                i += 1;
-                let path = raw.get(i).cloned().unwrap_or_else(|| usage());
-                match autumn_client::read_credential_file(&path) {
-                    Ok((principal, secret)) if !principal.is_empty() => {
-                        credential = Some((principal, secret));
-                    }
-                    Ok(_) => {
-                        eprintln!("--credential-file {path}: missing principal name (expected '<principal>\n<hex>')");
-                        std::process::exit(2);
-                    }
-                    Err(e) => {
-                        eprintln!("{e:#}");
-                        std::process::exit(2);
-                    }
-                }
-                i += 1;
+                i += 2;
             }
             "--help" | "-h" => usage(),
             _ => break,
@@ -905,7 +913,7 @@ pub(crate) fn parse() -> Args {
         }
         "mint-token" => {
             let mut principal = String::new();
-            let mut credential = String::new();
+            let mut credential_hex: Option<String> = None;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--principal" => {
@@ -915,24 +923,27 @@ pub(crate) fn parse() -> Args {
                     }
                     "--credential" => {
                         i += 1;
-                        credential = val(&raw, i).to_owned();
+                        credential_hex = Some(val(&raw, i).to_owned());
                         i += 1;
                     }
-                    // Read the (long-lived) credential from a FILE instead of argv.
-                    "--credential-file" => {
-                        i += 1;
-                        credential = read_secret_file(val(&raw, i));
-                        i += 1;
+                    // Read by `prescan_secret_flags` (the long-lived credential
+                    // from a FILE instead of argv); skipped here so position
+                    // never matters.
+                    "--credential-file" | "--cluster-secret-file" => {
+                        i += 2;
                     }
                     _ => break,
                 }
             }
-            if principal.is_empty() || credential.is_empty() {
-                usage();
-            }
-            Command::MintToken {
-                principal,
-                credential,
+            match mint_token_credential(principal, credential_hex.as_deref(), credential.clone()) {
+                Ok((principal, credential)) => Command::MintToken {
+                    principal,
+                    credential,
+                },
+                Err(e) => {
+                    eprintln!("autumn-op mint-token: {e}");
+                    std::process::exit(2);
+                }
             }
         }
         // D2: namespace registry admin
@@ -2254,7 +2265,25 @@ fn parse_ec_flag(s: &str) -> Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hex_split_points, SplitPoint};
+    use super::{mint_token_credential, parse_hex_split_points, SplitPoint};
+
+    /// The file's credential (both named forms are parsed by the SDK reader;
+    /// `prescan_secret_flags` hands it over) fills or checks `--principal`;
+    /// `--credential` hex needs `--principal`.
+    #[test]
+    fn mint_token_takes_the_credential_files_principal() {
+        let file = || Some(("loader".to_string(), vec![0x0a, 0xff]));
+        let want = Ok(("loader".to_string(), vec![0x0a, 0xff]));
+        assert_eq!(mint_token_credential(String::new(), None, file()), want);
+        assert_eq!(mint_token_credential("loader".into(), None, file()), want);
+        assert!(mint_token_credential("other".into(), None, file()).is_err());
+        let app = Ok(("app".to_string(), vec![0x12]));
+        assert_eq!(mint_token_credential("app".into(), Some("12"), file()), app);
+        assert_eq!(mint_token_credential("loader".into(), Some("0aff"), None), want);
+        assert!(mint_token_credential(String::new(), Some("0aff"), None).is_err());
+        assert!(mint_token_credential(String::new(), None, None).is_err());
+        assert!(mint_token_credential("app".into(), Some(""), None).is_err());
+    }
 
     // ── CLI --presplit hex parsing ────────────────────────────
     #[test]
@@ -2740,6 +2769,28 @@ mod lane_parts_tests {
     /// flag nor the position — so a correct-looking command read as an
     /// unsupported flag. This pins the prescan that fixed it, including the
     /// boolean-flag case that would otherwise swallow the following flag.
+    /// Two `--credential-file`s: the prescan keeps the last one, wherever each
+    /// sits. The global argv loop must not read the flag again (it did, and a
+    /// pre-subcommand file overrode a later one).
+    #[test]
+    fn the_last_credential_file_wins() {
+        let dir = std::env::temp_dir();
+        let path = |n: &str| dir.join(format!("autumn-op-{}-{n}", std::process::id()));
+        std::fs::write(path("a"), "a\n0a\n").expect("write a");
+        std::fs::write(path("b"), "b\n0b\n").expect("write b");
+        let argv: Vec<String> = ["autumn-op", "--credential-file"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain([path("a").to_string_lossy().into_owned()])
+            .chain(["mint-token".to_string(), "--credential-file".to_string()])
+            .chain([path("b").to_string_lossy().into_owned()])
+            .collect();
+        let got = super::prescan_secret_flags(&argv).1;
+        std::fs::remove_file(path("a")).expect("remove a");
+        std::fs::remove_file(path("b")).expect("remove b");
+        assert_eq!(got, Some(("b".to_string(), vec![0x0b])));
+    }
+
     #[test]
     fn secret_flags_are_position_independent() {
         let argv = |v: &[&str]| -> Vec<String> {

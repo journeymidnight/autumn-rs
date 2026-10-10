@@ -1,3 +1,11 @@
+Date: 2026-10-10 (4)
+TaskStatus: completed
+Task scope: user — `autumn-op mint-token --credential-file` could read neither credential file format (broken before the compaction work).
+Current summary: the mint-token arm read the whole file as one hex string, so what `principal-create` prints (`principal:`/`credential:` lines) and `<principal>\n<hex>` both failed hex decoding. Now it skips `--credential-file`/`--cluster-secret-file` like every other subcommand and uses the credential `prescan_secret_flags` already parsed (SDK `read_credential_file`) from anywhere in argv; `mint_token_credential` merges it with `--principal` (fills an absent one, must match a given one); an explicit `--credential` hex (with --principal) wins over the file, since one `--credential-file` also serves the data plane. The global argv loop no longer re-reads `--credential-file` (prescan already did): the re-read let a pre-subcommand file override a later one, against prescan's last-wins. `read_secret_file` deleted; usage() lists mint-token. ops.md principal enablement: the mint check sat before the step that gives the manager its signing key and could only fail — steps reordered (arm, then verify mint).
+Verification: autumn-op tests 39 (`mint_token_takes_the_credential_files_principal`); end to end on an AUTUMN_AUTH=1 cluster: labeled file after the subcommand with and without --principal, file before the subcommand, bare two-line file with --cluster-secret-file after the subcommand — all printed tokens; wrong --principal refused. Reviews: opus x2 (first found the prescan rejecting nameless files and the ops step order; fixed by the restructure).
+Main gaps: none.
+Next steps: none.
+
 Date: 2026-10-10 (3)
 TaskStatus: completed
 Task scope: user — (1) compactions should make bigger SSTs; (2) point lookups should check a table's key range before its bloom filter.

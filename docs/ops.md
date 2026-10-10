@@ -4474,8 +4474,8 @@ a whole namespace (`fs/`) or an in-namespace sub-prefix (`mem/app/`). Keys are
 Client-side wiring: PyO3 `Client.connect(scope=,principal=,credential=)` and
 `BatchClient(scope=,principal=,credential=)`. Everything below is the OPERATIONAL enablement
 for a principal the deploy layer did NOT auto-provision. Gradual-rollout axis:
-credentials-first (steps 1–4 are harmless with authz off), prefix-enforcement
-last (step 5).
+credentials first (steps 1–2 are harmless with authz off), then the signing key
+(step 3), which arms enforcement of every keyed op at once.
 
 ```bash
 # 1. one-time: signing key (KEEP SAFE; k8s: put it in a Secret)
@@ -4489,15 +4489,17 @@ autumn-op --manager $M --cluster-secret-file /secrets/cluster.secret \
     principal-create --principal app --grant "mem/app/" \
   > /secrets/app.cred
 
-# 3. Verify mint works BEFORE enforcing (minting is a manager RPC, unaffected by
-#    whether the PS is enforcing yet — safe to run while authz is off):
-autumn-op --manager $M --cluster-secret-file /secrets/cluster.secret \
-    mint-token --principal app --credential-file /secrets/app.cred   # must print a token
-
-# 4. ARM: manager gets --auth-signing-key-file (or env
+# 3. ARM: manager gets --auth-signing-key-file (or env
 #    AUTUMN_AUTH_SIGNING_KEY_FILE via entrypoint). PROTECT-EVERYTHING: the signing
 #    key alone arms enforcement of EVERY keyed op — there is no
 #    protected-prefix list. Restart manager; PS picks it up via 5s authz poll.
+
+# 4. Verify mint works. Minting is signed with that key, so before step 3 it
+#    is refused ("authz not enabled / no signing key on this manager").
+#    --principal is optional: the file names it. Enforcement is already live;
+#    if this fails, roll back (below) before clients start failing.
+autumn-op --manager $M --cluster-secret-file /secrets/cluster.secret \
+    mint-token --credential-file /secrets/app.cred   # must print a token
 
 # 5. Verify enforcement: a credential-less write must fail, while the scoped
 #    client carrying app.cred succeeds.
