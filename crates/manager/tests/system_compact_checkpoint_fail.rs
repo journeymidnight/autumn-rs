@@ -260,6 +260,8 @@ fn crash_after_failed_compaction_checkpoint_loses_nothing() {
             ps1_addr,
             ChildFailpoints {
                 compaction_checkpoint: true,
+                // The failpoint is for the major below, not a minor of SSTs 1-3.
+                minor_paused: true,
                 ..Default::default()
             },
         );

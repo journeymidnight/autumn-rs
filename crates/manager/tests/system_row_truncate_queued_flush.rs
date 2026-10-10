@@ -104,6 +104,9 @@ fn truncation_proceeds_while_a_flush_is_queued() {
         "flush_mem_bytes was already set in this test binary"
     );
     let _guard = PauseGuard;
+    // The truncate under test is the expiry major's; a minor of the three
+    // SSTs would empty the first two extents before it.
+    autumn_partition_server::background::set_minor_compaction_paused(true);
 
     let mgr_addr = pick_addr();
     let n1 = pick_addr();

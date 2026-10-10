@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::store::MetadataState;
 use autumn_rpc::manager_rpc::{
     PartitionLoad, PolicyCandidate, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_HOT_COLD,
-    POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE,
+    POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_REBALANCE,
     POLICY_KIND_SPLIT,
 };
 
@@ -108,12 +108,6 @@ pub const GC_COOLDOWN_SEC: i64 = 300;
 /// compaction advisory cooldown.
 pub const COMPACT_COOLDOWN_SEC: i64 = 300;
 
-/// minor-compaction advisory threshold. 512 MiB — minor compact
-/// is much cheaper than major (size-tiered pickup of < 32 MiB tables
-/// only), so the bar to surface as advisory is correspondingly lower.
-pub const MINOR_COMPACT_PENDING_HIGH: u64 = 512 * 1024 * 1024;
-/// minor-compact advisory cooldown.
-pub const MINOR_COMPACT_COOLDOWN_SEC: i64 = 120;
 /// minimum sealed-extent size to even consider EC advice. Below
 /// this, the EC encode + K+M shard write + manager state churn
 /// outweigh the (replication - K/(K+M)) × `sealed_length` saved.
@@ -243,13 +237,6 @@ pub struct PolicyConfig {
     pub gc_cooldown_sec: i64,
     /// compact advisory cooldown (seconds since `last_compact_at`).
     pub compact_cooldown_sec: i64,
-    /// minor-compact advisory threshold (bytes, sustained over
-    /// `required_buckets`).
-    pub minor_compact_pending_high: u64,
-    /// minor-compact advisory cooldown (seconds since
-    /// `last_compact_at` — same field; minor and major share it
-    /// because they share the PS-side `do_compact` infrastructure).
-    pub minor_compact_cooldown_sec: i64,
     /// minimum sealed-extent size below which EC advisory is
     /// suppressed (encode overhead would outweigh the savings).
     pub ec_min_extent_bytes: u64,
@@ -283,8 +270,6 @@ impl Default for PolicyConfig {
             compact_pending_high: COMPACT_PENDING_HIGH,
             gc_cooldown_sec: GC_COOLDOWN_SEC,
             compact_cooldown_sec: COMPACT_COOLDOWN_SEC,
-            minor_compact_pending_high: MINOR_COMPACT_PENDING_HIGH,
-            minor_compact_cooldown_sec: MINOR_COMPACT_COOLDOWN_SEC,
             ec_min_extent_bytes: EC_MIN_EXTENT_BYTES,
             rebalance_gap_threshold: REBALANCE_GAP_THRESHOLD,
             rebalance_cooldown_sec: REBALANCE_COOLDOWN_SEC,
@@ -677,8 +662,8 @@ impl PolicyEngine {
     /// every `interval_sec`.
     ///
     /// The op emitted is a plain `POLICY_KIND_MAJOR_COMPACT`, actuated as
-    /// `compact <part>`, which reaches the PS with `is_major: true` —
-    /// `MSG_MAINTENANCE` is the only `CompactTask` producer and hardcodes it.
+    /// `compact <part>`, which reaches the PS as `CompactTask::Major` —
+    /// `MSG_MAINTENANCE` sends nothing else.
     /// `has_overlap` does NOT by itself make a compaction major; it only
     /// suppresses the too-few-tables skip. What keeps THIS loop convergent is a
     /// PS invariant: a successful MAJOR compaction clears the flag, in every arm
@@ -909,13 +894,13 @@ impl PolicyEngine {
             let Some(bs) = window.recent(cfg.required_buckets) else {
                 continue;
             };
-            // Three independent maintenance checks per partition, each
-            // emitting at most one candidate. Kept as separate named
+            // Two independent maintenance checks per partition, each
+            // emitting at most one candidate (minor compaction is the PS's
+            // own, after every flush). Kept as separate named
             // sub-checks (NOT one parametrised helper) because the
             // metric / threshold / reason text differ per kind.
             out.extend(Self::gc_advisory(part_id, &bs, &cfg, now));
             out.extend(Self::major_compact_advisory(part_id, &bs, &cfg, now));
-            out.extend(Self::minor_compact_advisory(part_id, &bs, &cfg, now));
         }
 
         out
@@ -1028,52 +1013,6 @@ impl PolicyEngine {
             same_ps: true,
             last_op_at: recent.last_compact_at,
         })
-    }
-
-    /// Minor-compaction maintenance sub-check. Independent from
-    /// the major path: minor compact addresses size-tiered write-amp
-    /// hygiene, not dead-data cleanup. Common-sense filter: only emit
-    /// when the PS-side `minor_compact_pending_bytes` is non-zero (i.e.
-    /// `pickup_tables` actually had something to do) so we don't spam
-    /// advisories for partitions with no real work. Emits a
-    /// `POLICY_KIND_MINOR_COMPACT` candidate when no compaction is
-    /// inflight, the partition is outside `minor_compact_cooldown_sec`,
-    /// and ALL recent buckets sustain
-    /// `minor_compact_pending_bytes > minor_compact_pending_high`.
-    fn minor_compact_advisory(
-        part_id: u64,
-        bs: &[&(i64, PartitionLoad)],
-        cfg: &PolicyConfig,
-        now: i64,
-    ) -> Option<PolicyCandidate> {
-        let recent = &bs[0].1;
-        if recent.compact_inflight == 0
-            && recent.minor_compact_pending_bytes > 0
-            && (recent.last_compact_at == 0
-                || now - recent.last_compact_at >= cfg.minor_compact_cooldown_sec)
-            && bs
-                .iter()
-                .all(|(_, l)| l.minor_compact_pending_bytes > cfg.minor_compact_pending_high)
-        {
-            Some(PolicyCandidate {
-                kind: POLICY_KIND_MINOR_COMPACT,
-                primary_part_id: part_id,
-                secondary_part_id: 0,
-                reason: format!(
-                    "minor_compact_pending_bytes>{} ({} MiB) sustained {}m",
-                    cfg.minor_compact_pending_high,
-                    recent.minor_compact_pending_bytes / (1024 * 1024),
-                    cfg.required_buckets * cfg.bucket_sec as usize / 60,
-                ),
-                size_bytes: recent.minor_compact_pending_bytes,
-                req_per_sec: recent.req_per_sec,
-                imm_full_per_sec: recent.imm_full_per_sec,
-                same_ps: true,
-                last_op_at: recent.last_compact_at,
-            })
-        } else {
-            None
-        }
     }
 
     /// EC-conversion advisory. Scans the manager state for

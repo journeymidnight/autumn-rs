@@ -24,6 +24,8 @@ use autumn_stream::{ConnPool, StreamClient};
 use support::*;
 
 const PART: u64 = 1201;
+/// Keys written, one SST each: the minor policy's `min_files`.
+const KEYS: u32 = 3;
 
 fn spawn_ps(mgr: SocketAddr, addr: SocketAddr, stop: Arc<AtomicBool>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
@@ -157,33 +159,24 @@ fn compaction_drops_only_unreferenced_row_extents() {
             compio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(checkpoint(&sc, meta).await.locs.is_empty());
-        // R1: two SSTs. R2: thirty. R3: one — the 33rd, past the PS's own
-        // auto-trim trigger, whose head rule takes R1's two tables.
-        let mut i = 0u32;
-        for _ in 0..2 {
-            put_flush(&ps, i).await;
-            i += 1;
-        }
+        // R1: two SSTs. R2: the third, whose flush asks for the minor
+        // compaction that takes all three.
+        put_flush(&ps, 0).await;
+        put_flush(&ps, 1).await;
         let r1 = row_extents(&sc, row).await[0];
         roll_row(&ps, &sc, row).await;
-        for _ in 0..30 {
-            put_flush(&ps, i).await;
-            i += 1;
-        }
-        roll_row(&ps, &sc, row).await;
-        put_flush(&ps, i).await;
-        assert_eq!(checkpoint(&sc, meta).await.locs.len(), 33);
+        put_flush(&ps, 2).await;
 
         let t0 = Instant::now();
         loop {
-            if checkpoint(&sc, meta).await.locs.len() < 33 {
+            if checkpoint(&sc, meta).await.locs.len() < KEYS as usize {
                 break;
             }
-            assert!(t0.elapsed() < Duration::from_secs(60), "auto-trim never ran");
-            compio::time::sleep(Duration::from_millis(500)).await;
+            assert!(t0.elapsed() < Duration::from_secs(60), "the minor compaction never ran");
+            compio::time::sleep(Duration::from_millis(100)).await;
         }
         compio::time::sleep(Duration::from_millis(500)).await;
-        assert_checkpoint_covered(&sc, row, meta, "after the auto-trim").await;
+        assert_checkpoint_covered(&sc, row, meta, "after the minor compaction").await;
         let stream = row_extents(&sc, row).await;
         assert!(!stream.contains(&r1), "R1 is fully compacted away and should be dropped: {stream:?}");
 
@@ -242,7 +235,7 @@ fn compaction_drops_only_unreferenced_row_extents() {
             }
             assert_checkpoint_covered(&sc, row, meta, "single SST after reopen").await;
         }
-        for i in 0..33u32 {
+        for i in 0..KEYS {
             let r = ps_get(&ps, PART, format!("k{i:03}").as_bytes()).await;
             assert_eq!(r.code, CODE_OK, "k{i:03} lost");
             assert_eq!(r.value, format!("v{i}").into_bytes());
@@ -267,7 +260,7 @@ fn compaction_drops_only_unreferenced_row_extents() {
             }
             compio::time::sleep(Duration::from_millis(200)).await;
         };
-        for i in 0..33u32 {
+        for i in 0..KEYS {
             let r = ps_get(&ps, PART, format!("k{i:03}").as_bytes()).await;
             assert_eq!(r.code, CODE_OK, "k{i:03} lost after single-SST rewrite");
             assert_eq!(r.value, format!("v{i}").into_bytes());

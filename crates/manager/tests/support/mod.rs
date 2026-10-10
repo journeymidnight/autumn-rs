@@ -1445,10 +1445,13 @@ pub struct ChildFailpoints {
     pub merged_checkpoint: bool,
     /// Every compaction parks after its first progress sample.
     pub compaction_hold: bool,
+    /// No minor compaction is requested, so the test's table shape holds.
+    pub minor_paused: bool,
 }
 
 /// Environment of a re-executed child PS:
-/// `<ps_id> <manager> <ps addr> <flush nth> <compaction 0|1> <merged 0|1> <hold 0|1>`.
+/// `<ps_id> <manager> <ps addr> <flush nth> <compaction 0|1> <merged 0|1> <hold 0|1>
+/// <minor paused 0|1>`.
 const CHILD_PS_ENV: &str = "AUTUMN_TEST_CHILD_PS";
 
 /// A partition server running as a re-executed copy of THIS test binary, so a
@@ -1471,11 +1474,12 @@ impl ChildPs {
             .env(
                 CHILD_PS_ENV,
                 format!(
-                    "{ps_id} {mgr_addr} {ps_addr} {} {} {} {}",
+                    "{ps_id} {mgr_addr} {ps_addr} {} {} {} {} {}",
                     fp.flush_checkpoint_nth,
                     u8::from(fp.compaction_checkpoint),
                     u8::from(fp.merged_checkpoint),
-                    u8::from(fp.compaction_hold)
+                    u8::from(fp.compaction_hold),
+                    u8::from(fp.minor_paused)
                 ),
             )
             .stdout(std::process::Stdio::null())
@@ -1532,6 +1536,9 @@ pub fn child_ps_main() {
     }
     if f[6] == "1" {
         autumn_partition_server::background::set_compaction_hold(true);
+    }
+    if f[7] == "1" {
+        autumn_partition_server::background::set_minor_compaction_paused(true);
     }
     compio::runtime::Runtime::new().unwrap().block_on(async move {
         let ps = PartitionServer::connect_with_advertise_and_port(

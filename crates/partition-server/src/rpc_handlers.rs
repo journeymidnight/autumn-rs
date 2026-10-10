@@ -2502,7 +2502,7 @@ pub(crate) async fn handle_maintenance(
     let result = match req.op {
         MAINTENANCE_COMPACT => p
             .compact_tx
-            .try_send(crate::CompactTask { is_major: true, op_id: req.op_id })
+            .try_send(crate::CompactTask::Major { op_id: req.op_id })
             .map_err(|_| "compaction busy"),
         MAINTENANCE_AUTO_GC => {
             // decode multi-tier filter params from wire request.

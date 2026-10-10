@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-09
+**Last updated:** 2026-10-10
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,12 +14,12 @@
 
 ## Active
 
-### BUG-MANAGER-STANDBY-HEARTBEAT-GRACE — 备用 manager 晋升时沿用旧 PS 心跳，立即驱逐正常 PS（已复现）
-- **Trigger** (2026-10-09 VKE rollout/stress): `7446c62b` 上，备用 manager 开始选举约 0.5 秒后同时报 3 台 PS 心跳超时，30 个分区集中到一台 PS；3 个 PS 容器均未重启。`replay_from_etcd` 的 `ps_last_heartbeat.entry(id).or_insert(now)` 保留备用期间的旧时间，`mark_serving` 只在 listener 初次启动时刷新。
-- **Scope**: 晋升 replay 后给每个仍在册 PS 新的心跳宽限期；核对失联 PS 仍会在新宽限期后被驱逐，以及已删除成员不会复活。
-- **Acceptance**: 保持 leader 上 PS 心跳，备用 manager 等待超过 10 秒再晋升；晋升 3 秒后的 PS 心跳成功，宽限期内成员不被误驱逐；实际失联 PS 在宽限期后被驱逐。复现用例与原有 PS membership/etcd 测试通过，消融变红。
-- `passes: true`
-- **notes**: 隔离探针基于 `ps_members_etcd`，额外让 standby 等待 15 秒；当前代码失败于 `heartbeat ps 1: ps 1 not registered`。仅将该 `or_insert` 改为 `insert`，相同探针通过（44/46 秒）。实验改动已撤回，尚未提交或部署修复。源文件、失败/对照日志及候选 patch 保存在 `/private/tmp/autumn-ff29ad67-stress-20261009/standby*`。
+### BUG-MAINT-LOOP-STARVED-BY-MINORS — 持续写入时回收探测 / 下发的 GC 可能一直排不上（推断，未复现）
+- **Trigger** (2026-10-10 minor compaction 重设计的 fable 评审): `background_maintenance_loop` 的 tick 只在 `select_minor` 找不到窗口时才派回收探测（`spawn_reclaim_probe`）。推断：高写入 PS 上 minor 排在 PS 级 compact permit 后面，tick 时总有窗口，探测永远不跑，被老大表钉住的 row stream 前缀一直截不掉。
+- **Scope**: 先复现（PS 级 permit 被别的分区占满 + 本分区持续 flush，观察 `minor_compaction_runs().2` 与头部 extent）。坐实后让探测按自己的节奏跑、与 count 窗口无关。
+- **Acceptance**: 复现用例修复前头部 extent 一直不被回收、修复后被回收；消融变红。
+- `passes: false`
+- **notes**: 两种负载未复现：每 300 ms 一次 flush、以及不间断 flush（`system_minor_compaction_triggers::a_mostly_dead_head_extent_is_reclaimed` 的变体），探测都正常跑。改动已撤回。同类推断（opus 评审）：`background_maintenance_loop` 的 select 先轮询 `compact_rx`，flush 快于 minor 时 `GcRecv` / `GcTimeout` 排不上；`a_dispatched_gc_runs_under_steady_flushes`（两个写者不间断 flush 时下发 forcegc）6 s 内即执行，未复现，未改。周期 tick 的同类饿死已复现并修复（tick 到点先走、收到任务不推迟）。
 
 ### BUG-UPDATE-STREAM-EC-NO-CAS — `update_stream_ec` 写 etcd 不做 CAS，可能覆盖并发提交的 stream 成员变更（推断，未复现）
 - **Trigger** (2026-10-09 alloc 修复的 fable 评审): `handle_update_stream_ec` 用 `put_msgs_txn` 把整条 `streams/<id>` 写回 etcd，没有值 CAS。它的 etcd RTT 期间若有 alloc / punch / split 提交了该 stream 的成员变更，etcd 被写回旧的 `extent_ids`；内存里只改了两个 ec 字段，所以内存保留了新成员。换主 replay 后，已提交的尾巴会从 stream 里消失。运维触发（autumn-op），罕见。

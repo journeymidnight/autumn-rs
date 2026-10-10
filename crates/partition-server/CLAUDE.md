@@ -899,55 +899,154 @@ so after a restart the tombstone-heavy ones all queue a major at once
 deleting can re-cross 30% within an interval and rewrite itself each time, as
 TiKV's would.
 
-### Minor compaction (`pickup_tables`) — NOT periodic any more
+### Minor compaction — the partition's own, HBase-style
 
-Minor-compact-on-timer was removed; the periodic tick only refreshes gauges and
-runs the expiry-major pass. What still reaches `pickup_tables` is the defensive
-auto-trim above `MAX_SST_BEFORE_AUTO_COMPACT`, and any minor dispatched over
-`compact_rx`. A minor pass does NOT drop out-of-range keys, so — unlike a
-successful major, in every arm that runs one — it must never clear `has_overlap`.
+The partition decides its minor compactions itself, as an HBase RegionServer
+does; nothing outside asks for one (the manager's advisories and `autumn-op
+compact` are majors). A minor drops shadowed versions and out-of-range keys
+but never tombstones or expired entries (older tables outside its window may
+still hold what they cover); it rewrites only some tables, so it never clears
+`has_overlap`; and it stamps no `last_compact_at` (that is the
+manager's cooldown input for its major advisories; minors run every few
+flushes and would hold them off forever).
 
-`pickup_tables` selects tables via one of two strategies:
-- **Head-extent**: if the extent of the FIRST listed table holds < 30% of total
-  data (`HEAD_RATIO`), pick up to 5 (`COMPACT_N`) tables from it, to empty old
-  extents so the row stream can be truncated.
-- **Size-tiered**: sort tables by sequence, find consecutive "small" tables
-  (< `COMPACT_RATIO` × the flush size = 128 MiB by default), pick up to `COMPACT_N`.
+**When.** `commit_flush_outcome` calls `request_minor_compaction(Flush)` after
+the checkpoint is durable and the table is listed (HBase's
+`requestSystemCompaction` after a flush); the 5-7 s tick calls it with `Tick`
+for lists that grew without a flush (a merged or split open, a restart). It
+runs `select_minor` on the table list (pure, no I/O) and, on a window, queues
+`CompactTask::Minor` on `compact_tx`. The flush path pays one selection pass
+over the list. The tick keeps its own 5-7 s cadence: a due tick is taken
+before the channel, and a received task does not push it back. Under steady
+writes `compact_rx` is nearly always ready, and when a received task reset the
+tick timer (harmless while only rare dispatches arrived) the tick never ran —
+no expiry or deletion major, no gauge refresh, no reclaim probe
+(`a_mostly_dead_head_extent_is_reclaimed` with flushes running, red that
+way). The task runs in `background_maintenance_loop`
+(`run_minor_compaction`): the freeze check, `compact_inflight`, the
+maintenance gate and the PS-wide permit as for any compaction, then the window
+is chosen AGAIN under the gate, so it is a run of the list as it is then (only
+a flush can change the list meanwhile, and a flush appends). Queued tasks
+collapse: a major wins, a reclaim wins over a count minor. Every minor logs
+`minor compaction: N → M tables` with its trigger (`flush` / `tick` /
+`blocking` / `reclaim`) and window; `minor_compaction_runs()` counts them by
+trigger for tests. Below `min_files` nothing is logged; with enough tables and
+no window in ratio the tick logs it at debug, once a minute.
 
-Runs `do_compact(major=false)`. `pickup_tables` only SELECTS; it says nothing
-about truncation (next section).
+**Which tables** (`compact_policy::select_minor`, HBase's
+`ExploringCompactionPolicy`): every window of `min_files..=max_files`
+consecutive tables of the list; a window is accepted when its total is below
+`min_size` or no table in it exceeds `ratio` × the rest of it; the most tables
+wins, then the smallest total. At `blocking_files` tables the comparison
+becomes tables removed per byte (a new window must be 5% better) and, with no
+window in ratio, the smallest window is taken. Sizes are SST bytes
+(`TableMeta.len`), the unit `do_compact` cuts outputs in (`encoded_len`).
 
-### Table list order = `last_seq` order
+Two bounds keep tables out of every window:
+- `large_size` (128 MiB, `--compact-large-size-bytes`): a table this large
+  never joins. Outputs are cut at `max_sst_bytes` (2 × flush = 512 MiB), so
+  however a partition is compacted it keeps at least one table per 512 MiB of
+  data; on a partition of flush-sized tables (4K inline values, 256 MiB SSTs)
+  a minor can only merge them into full ones — half the table count for
+  rewriting every byte once more. Doing it cost 4K writes ~15% and reads ~10%
+  in the perf A/B (TCP, 8 partitions, 60 s, three replicas on one disk); the
+  user ruled that performance must not drop (2026-10-10). Such tables are
+  rewritten only by a major or the head-extent reclaim, as before this
+  design. VP-heavy partitions, whose SSTs are small, merge normally.
+  Consequences, accepted (user, 2026-10-10: no table-count backstop): a
+  partition of only large tables gets no minor at all and gains one table per
+  flush until a major or its 50 GiB split; small tables alternating with large
+  ones never form a run of `min_files` and stay. Bounding the count would cost
+  one rewrite of every large flush table sooner or later (outputs are cut at
+  512 MiB), which is exactly the write cost refused above.
+- `max_table` = 0.6 × `max_sst_bytes` (HBase's `compaction.max.size`, needed
+  because HBase does not cut its outputs and `do_compact` does): k ≥ 3 tables
+  each under it total under 0.6·k caps and cut into fewer than k outputs, with
+  room for bloom, index and packing slack. Without it, windows of three
+  ~500 MB tables merged back into three on every tick (perf A/B: 12-14 such
+  minors per partition-set in a 60 s run, 1.2-1.5 GB rewritten each). It
+  binds when it is below `large_size`: with `--flush-mem-bytes` under ~107 MiB,
+  or `large_size` raised. Measuring both sides in encoded bytes matters: in
+  raw bytes, half the cap put flush tables right on the bound (random keys
+  encode slightly larger and never merged), and selection and cutter
+  disagreed by up to 2× on small values. A merge's remainder output between
+  the bound and the cap is left out of later windows until a major.
+Defaults are HBase's — `--compact-min-files 3`, `--compact-max-files 10`,
+`--compact-ratio 1.2`, `--compact-blocking-files 16` — plus
+`--compact-large-size-bytes` (128 MiB, above), and except
+`--compact-min-size-bytes` (128 MiB): HBase uses the flush size, but an SST
+here is usually far smaller than its memtable (large values live in the log
+stream), and the flush size would exempt nearly every window from the ratio.
+HBase's write back-pressure at `blockingStoreFiles` is not copied: writes do
+not wait on compaction.
 
-INVARIANT: `p.tables` / `sst_readers` (and so a checkpoint's `locs`) are in
-`last_seq` order, oldest first. Point reads (`sst_lookup_paged_retry`), GC's
-liveness lookup and split's key sampling walk the list from the back and stop
-at the first hit, and `pickup_tables` picks a run contiguous in `last_seq`
-order — both need list order = recency order for every key. HBase keeps the
-same rule by ordering store files by sequence id.
+Effect: new small flushes merge at the tail; a merged table joins its older
+neighbour once they are comparable; a big old table is left alone until the
+tables after it add up to it.
 
-`sort_tables_by_seq` (stable) establishes it at open and after every change
-that is not an append: a compaction's swap (outputs are pushed, then sorted)
-and the merged open's flush. A flush appends at the end, which is already in
-order. Within one partition, seq order is recency order: each flush covers a
-later seq interval than every table before it, and a compaction replaces a
-contiguous run with outputs that hold disjoint keys. After a merge the two
-sources' sequence counters were independent, but their keys are disjoint, so
-interleaving them by seq changes nothing a read sees.
+**Head-extent reclaim** (`select_reclaim`, `MinorTrigger::Reclaim`). The row
+stream is only ever truncated as a prefix, so one old table the ratio rule never
+picks (a major's output, say) pins its extent and every extent after it, while
+the flushes and minor outputs written beside it die around it. On the tick,
+when no count window exists, at most once a minute (`RECLAIM_CHECK_INTERVAL`),
+(so under writes heavy enough to leave a count window at most ticks it waits
+for a lull), a detached probe (`spawn_reclaim_probe`; `get_stream_info` + `get_extent_info`
+are manager RPCs and must not stall the maintenance task) reads the row
+stream's first extent; when it is not the tail and the live tables in it (their
+SST bytes) are under 30% of its sealed length, it queues a reclaim of the run
+from its first listed table through its last (at most `max_files`, possibly
+one table, possibly with other extents' tables in between — the run must be
+contiguous). The head's own share of the rewrite is under 30% of what it
+frees; tables of other extents listed between the head's first and last table
+are rewritten too, so the full cost can be higher. The truncate after it drops
+the extent. A head cached as open (SST reads fetch its info while it
+is the tail) is refetched once. The old selector folded this into the count
+rule (a "head extent under 30% of all data" branch that, when it matched,
+never fell back to the size rule) and returned nothing for one lone old head
+table followed by any number of small ones; minors stopped for good and the
+only one left was the >32-table trim, which hit the same branch.
 
-Why: the swap used to insert its outputs at the first input's LIST slot, and a
-merged partition's list is the survivor's tables then the victim's. The
-size-tiered pick `[S1, S2, V1]` (seq order V0 < S1 < S2 < V1 < S3) then put
-V1's newer values in front of V0, and a Get found V0's older copy first —
-`system_merge_minor_compaction_order` (the auto-trim is the minor compaction;
-the key read back "old"). Appending the outputs at the end instead had broken
-reads when a flush completed during the compaction (the chaos fence+flush
-data-loss bug).
+Regressions: `compact_policy::tests` (the lone-head shape picks a window),
+`crates/manager/tests/system_minor_compaction_triggers.rs` (60 quick flushes
+stay under 16 tables — 60 without the flush request; a mostly dead head extent
+is reclaimed and truncated — never without the probe).
+
+### Table list order = recency order
+
+INVARIANT: for every key, `p.tables` / `sst_readers` (and so a checkpoint's
+`locs`) hold its newer versions later. Point reads (`sst_lookup_paged_retry`),
+GC's liveness lookup and split's key sampling walk the list from the back and
+stop at the first hit. The list order is the ONLY record of it — nothing
+re-sorts the list: a flush appends; a compaction's outputs take its window's
+place (`splice_compaction_outputs`, which refuses a window that is not one
+contiguous run of the list); an open uses the checkpoint's order; a merged
+open concatenates the sources' lists (their keys are disjoint, so any
+interleaving reads the same). Disjoint because a merge is refused while either
+side has `has_overlap` set (see note 13): a side still listing CoW parent
+tables would, concatenated, put them after the sibling's newer tables of the
+same keys, and a Get would read the pre-split value. Relaxing that
+precondition breaks this invariant. Windows are runs of the list, never of
+`last_seq`.
+
+`last_seq` cannot order the list. After a merge the sources' seq counters
+were independent (split siblings continue from the same parent value, so their
+seqs overlap and tie), and an output's `last_seq` is its window's largest input
+seq. Sorting by it (what `sort_tables_by_seq` did after every compaction and at
+open) moved an output of `[V0, S1, S2]` whose seq came from S2 to after V1 when
+S2 and V1 tied, and a Get read V0's old copy of a key V1 overwrote
+(`system_merge_minor_tie_order`, reproduced on the sorting code; red when the
+splice is replaced by push-and-sort). Appending outputs at the end broke on a
+flush that committed during the compaction (the chaos fence+flush data-loss
+bug); inserting at the first input's slot broke when windows were picked by
+seq, not by list position (`system_merge_minor_compaction_order`). `do_compact`
+orders its merge inputs by list position too (newest last); range scans
+resolve versions by the seq inside the internal key and do not depend on
+table order.
 
 ### Row-stream truncation = the first extent a live table references
 
-INVARIANT: after every successful compaction (dispatched major/minor, expiry
-major, auto-trim) `truncate_unreferenced_row_prefix` drops the row-stream prefix
+INVARIANT: after every successful compaction (dispatched major, expiry major,
+minor, reclaim) `truncate_unreferenced_row_prefix` drops the row-stream prefix
 before `row_truncate_point` — the first extent, in STREAM order (first
 occurrence; the manager truncates by first occurrence too), in the keep set
 `row_keep_set`: the extent of every table in `p.tables`, plus the ROW FLOOR of
@@ -973,9 +1072,9 @@ flush committing in between look like a missing extent.
 Why: the truncate point used to come from the table list's ORDER — the head
 extent's successor (minor) or the last input's extent (major) — and list order
 is not stream order. A minor compaction skips a big full-memtable SST, merges
-small ones after it, and the output is listed by its `last_seq`, among older
-tables, although it is written to the newest extent; a merged partition
-interleaves both sources' tables. The cut then went past extents live tables still referenced,
+small ones after it, and the output is listed in its window's place, among
+older tables, although it is written to the newest extent; a merged partition
+lists both sources' tables. The cut then went past extents live tables still referenced,
 the manager deleted them (files on every EN), and the partition failed to reopen
 on the first missing SST — observed in production: the checkpoint listed 37
 SSTs, 28 in three deleted extents, the row stream down to one. Those SSTs' data
@@ -986,7 +1085,7 @@ this — it never reads checkpoints — so the PS is the only place.
 `repro_truncate_point_skips_a_still_referenced_extent`; the floor is
 `a_queued_flush_floor_stops_the_cut_before_its_sst`),
 `crates/manager/tests/system_row_truncate_live_refs.rs` (multi-extent row stream
-via `MSG_ROLL_TAILS`, auto-trim + major, reopen) and
+via `MSG_ROLL_TAILS`, a minor + major, reopen) and
 `system_row_truncate_queued_flush.rs` (flush paused with an imm queued, expiry
 major truncates anyway, the queued keys survive a reopen). Each truncate logs
 `row stream: dropped the extents no live table references` with the cut.
@@ -1109,16 +1208,15 @@ acknowledged put. `crates/manager/tests/system_compact_seq_below_dropped.rs`
 (both compaction cases red without `cover_seq`; the no-compaction control
 green either way).
 
-Only the final chunk is raised: chunks of one compaction hold disjoint keys, and
-the inputs are all tables (major) or a run contiguous in `last_seq` (minor), so a
-raised output stays inside the span its inputs already occupied in the table
-order. Not covered: a compaction that keeps no entry AND carries no discard
+Only the final chunk is raised; raising it moves nothing, because outputs take
+their window's place in the list rather than a place by seq (see "Table list
+order"). Not covered: a compaction that keeps no entry AND carries no discard
 emits no table at all. Every flushed SST carries its WAL dead bytes, so that
 needs inputs whose log extents are all already punched; not reproduced.
 
 ### `do_compact` Logic (streaming)
 ```
-  1. Read lock: collect SstReaders for selected tables, sort newest-first by last_seq
+  1. Read lock: collect SstReaders for selected tables, newest first by list position
   2. Create MergeIterator over TableIterators
   3. Streaming merge loop (ONE in-progress SstBuilder + Vec<new_readers>):
        - Dedup: skip if same user_key already seen (newest wins)
@@ -1131,7 +1229,7 @@ needs inputs whose log extents are all already punched; not reproduced.
        - After loop: attach aggregated discards to final SstBuilder, finalize,
          append, push to new_readers
   4. Under publish_lock: build the post-compaction list (remove inputs, add
-     new_readers, sort by seq) → save_table_locs_raw (single linearization point;
+     new_readers in the window's place) → save_table_locs_raw (single linearization point;
      a failure or crash before the ack leaves new SSTs as orphan bytes and the
      prior checkpoint) → assign the list to the partition
   5. Caller: truncate row_stream before the first extent a live table references
@@ -1159,8 +1257,7 @@ abort is before any row_stream append so nothing is half-published.
 The meta CHECKPOINT the compaction publishes is not the output stamp: it is the
 same position-MAX over the output stamp AND every table left in the partition
 (`checkpoint_vp_head`, taken under the borrow that snapshots the table list). A
-minor compaction (the >32-SST auto-trim, size-tiered) takes the OLDEST small
-tables while a newer flush's SST stays live; publishing only the inputs' MAX moved
+minor compaction can take older tables while a newer flush's SST stays live; publishing only the inputs' MAX moved
 the partition's replay cursor back behind that flush, and the next open replayed
 every WAL byte since. Safe for the same reason as the stamp: every listed table is
 durable, flushes commit in order, so all WAL below the newest listed boundary is in
@@ -1275,7 +1372,7 @@ floor until the next flush (inferred, not reproduced).
 `crates/manager/tests/system_compact_advance_anchor.rs` (major, GC, SIGKILL,
 reopen; a probe roll after a restart with no write — the reopened PS had
 cached the extent open, see the stream guide's cache table),
-`system_compact_advance_anchor_minor.rs` (auto-trim, log rolled
+`system_compact_advance_anchor_minor.rs` (a minor, log rolled
 mid-compaction) and `system_compact_swept_anchor.rs` (red when the swept
 cursor is republished).
 
@@ -1765,8 +1862,13 @@ A per-partition `GcRateLimiter` survives as a deprecated inner cap layered befor
 | `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | **4** | PS-wide compact concurrency (`compact_max`) |
 | `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | **4** | PS-wide gc concurrency (`gc_max`) |
 | `--max-extent-size-bytes` | — | **16 GiB** | per-extent seal threshold to each partition's `StreamClient` (clamp [1 GiB, 64 GiB]) |
-| `--flush-mem-bytes` | — | **256 MiB** | memtable rotation size; every compaction size derives from it (clamp [4 KiB, 1 GiB]) |
+| `--flush-mem-bytes` | — | **256 MiB** | memtable rotation size; a compaction output is cut at 2× it (clamp [4 KiB, 1 GiB]) |
 | `--deletion-compact-check-secs` | — | **300** | how often each partition evaluates the deletion-trigger rule (clamp [1, 86400]) |
+| `--compact-min-files` / `--compact-max-files` | — | **3 / 10** | tables a minor compaction merges |
+| `--compact-ratio` | — | **1.2** | a table joins a minor window only if ≤ ratio × the rest of it |
+| `--compact-min-size-bytes` | — | **128 MiB** | a window smaller than this skips the ratio test |
+| `--compact-large-size-bytes` | — | **128 MiB** | tables this large never enter a minor window |
+| `--compact-blocking-files` | — | **16** | at this many tables a window is merged even when none is in ratio |
 
 `0` on any rate flag = unlimited for that dimension (per-dimension opt-out).
 
@@ -2305,7 +2407,7 @@ both.
 | Constant | Value | Meaning |
 |----------|-------|---------|
 | `VALUE_THROTTLE` | 4 KB | Large value threshold (store as VP) |
-| `FLUSH_MEM_BYTES` | 256 MB | Memtable size trigger for rotation (`--flush-mem-bytes`). Compaction scales off it: size-tiered skips tables ≥ ½ of it, a pick holds ≤ 2× it, an output SST is cut at 2× it. One setting, so a test can shrink every SST size together and reach many-SST shapes with little data |
+| `FLUSH_MEM_BYTES` | 256 MB | Memtable size trigger for rotation (`--flush-mem-bytes`). A compaction output SST is cut at 2× it |
 | `MAX_WRITE_BATCH` | 256 | Max requests per group-commit batch |
 | `BLOCK_SIZE_TARGET` | 64 KB | Target SSTable block size |
 | `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC. Halved when stream discard ≥ `stream_debt`, and again for a shared (`refs > 1`) extent. Bypassed entirely by `dead_bytes_high` (`MaintenanceReq.gc_dead_bytes_high`, `autumn-op gc --dead-bytes`), the absolute floor — a big pile is worth collecting at any fraction. |
@@ -2313,7 +2415,8 @@ both.
 | `MAX_IMM_DEPTH` | 4 | imm queue cap; merged_loop stalls req intake when reached (RocksDB `max_write_buffer_number`). Env `AUTUMN_PS_MAX_IMM_DEPTH` ([1, 64]). |
 | `MAX_WAL_GAP` | 1 GiB | force-rotate active when `active.log_bytes() + Σ imm.log_bytes()` exceeds this. Measures the un-flushed LOG bytes (value included), NOT `mem_bytes()`. RocksDB `max_total_wal_size`. Env `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
 | `SHUTDOWN_TIMEOUT_MS` | 60_000 | per-partition graceful drain deadline before SIGKILL fallback. Env `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` ([1_000, 600_000]). |
-| `MAX_SST_BEFORE_AUTO_COMPACT` | 32 | defensive: the compact loop's timeout arm auto-triggers a minor compaction when `sst_readers.len()` exceeds this (bounds bloom-FPR runaway: 1% per-SST × 32 ≈ 28% cumulative). Not env-tunable. |
+| `MinorPolicy` | 3 / 10 / 1.2 / 128 MiB / 128 MiB / 16 | minor compaction: min files, max files, ratio, min size, large size, blocking files (`--compact-*`, see "Minor compaction") |
+| `RECLAIM_LIVE_PERCENT` | 30 | head-extent reclaim when its live tables are under this share of its sealed length; probed at most every `RECLAIM_CHECK_INTERVAL` (60 s) |
 
 ## Bounded recovery replay
 
@@ -2353,8 +2456,9 @@ Three fixes bound the restart replay window (worst case per partition =
 1. **Flush is 3-phase** — never hold the write lock during SSTable construction or
    stream I/O. Take the write lock only for the final reader swap.
 
-2. **`pickup_tables` has two strategies** — understand both head-extent and
-   size-tiered paths before modifying compaction selection.
+2. **Minor selection is two independent rules** (`compact_policy.rs`):
+   `select_minor` bounds the table count, `select_reclaim` frees the row
+   stream's head. Both return a run of the list, never of `last_seq`.
 
 3. **Discard map pipeline**: compaction drops a VP entry → accumulates size in a local
    `discard` map → attaches to the last output SST's MetaBlock (an entry-less SST
@@ -2449,7 +2553,7 @@ Three fixes bound the restart replay window (worst case per partition =
     each GC tick from `get_discards` before the replay floor — see
     "`open_tail_dead_bytes`"),
     `pending_compaction_bytes` (each compact tick: total SST bytes if `has_overlap==1`,
-    else `pickup_tables` output), `gc_inflight` / `compact_inflight` (0/1 around the
+    else the `select_minor` window), `gc_inflight` / `compact_inflight` (0/1 around the
     awaits), `last_gc_at` / `last_compact_at` (unix-epoch, drives per-kind cooldown),
     `unsettled_deletes` (deletes no major compaction has covered — see Compaction),
     and `has_overlap` — the cross-thread mirror of the partition thread's `Cell`, which
@@ -2471,18 +2575,16 @@ Three fixes bound the restart replay window (worst case per partition =
     carries a maintenance op's failure reason back — without it, a gc/compact error
     dies in a `tracing::error!` invisible to the operator.
 
-    There is NO PS-level maintenance scheduler any more — `maintenance_scheduler_loop`
-    was deleted when policy moved out of the PS (`lib.rs`, and the comment left at its
-    former site says so). NOTHING in this crate reads these gauges and dispatches off
-    them. They exist to be REPORTED: `report_load_loop` ships them and the manager's
-    advisory engine decides. What still originates work here is the partition's own
-    maintenance loop — the expiry-triggered major compaction and the defensive auto-trim
-    above `MAX_SST_BEFORE_AUTO_COMPACT` — plus whatever arrives over the `Maintenance`
-    RPC. The compact channel's `bool` payload means `is_major` (true: manual
-    `client compact`, expiry) — the channel carries `CompactTask { is_major, op_id }`,
-    not a bare bool. The GC timeout branch dispatches nothing at all; it is a
-    gauge refresh, which is exactly why the basis it reads has to agree with selection
-    (see the GC section).
+    NOTHING in this crate dispatches off these gauges; they exist to be REPORTED:
+    `report_load_loop` ships them and the manager's advisory engine decides the
+    majors and GCs. What originates work here is the partition's own maintenance
+    loop — minor compactions (after each flush and on the tick, see "Minor
+    compaction"), the expiry-triggered and deletion-triggered majors — plus
+    whatever arrives over the `Maintenance` RPC. The compact channel carries
+    `CompactTask::Major { op_id }` (`Maintenance`, the deletion rule) or
+    `CompactTask::Minor(trigger)`. The GC timeout branch dispatches nothing at all;
+    it is a gauge refresh, which is exactly why the basis it reads has to agree with
+    selection (see the GC section).
 
 13. **Partition merge (manager-orchestrated, TiKV PrepareMerge + PS-side write halt).**
     The merge primitive is a manager-side atomic etcd txn (manager CLAUDE.md note 16);
@@ -2581,7 +2683,7 @@ Three fixes bound the restart replay window (worst case per partition =
     and a point read takes the first hit newest-table-first, so an un-separated side
     re-exposes its out-of-range keys over the sibling's own history: pre-split values
     read back, and a key the sibling deleted after the split comes back PERMANENTLY once
-    the sibling's major compaction has dropped the tombstone (the next seq-ordered
+    the sibling's major compaction has dropped the tombstone (the next
     compaction of the merged partition fixes the overwritten keys but has nothing to
     stop the resurrected one). Both directions are real — survivor-only compaction
     leaves the victim's record pointing at the parent table; victim-only compaction

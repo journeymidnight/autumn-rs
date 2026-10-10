@@ -160,6 +160,12 @@ impl SstBuilder {
         self.total_raw_bytes += entry_size as u64;
     }
 
+    /// Encoded bytes so far: finished blocks plus the open block and its
+    /// offset table (the MetaBlock, bloom and index come on top at `finish`).
+    pub fn encoded_len(&self) -> u64 {
+        self.running_offset as u64 + self.current.len() as u64 + 4 * self.entry_offsets.len() as u64
+    }
+
     /// Returns `true` if no entries have been added yet.
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty() && self.entry_offsets.is_empty()

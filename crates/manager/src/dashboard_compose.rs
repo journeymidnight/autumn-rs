@@ -14,7 +14,7 @@ use autumn_rpc::manager_rpc::{
     NodeCapWire, NodeStateEntry, PolicyCandidate, CODE_OK,
     NODE_AUTO_STATE_ONLINE, NODE_AUTO_STATE_SUSPECTED, NODE_AUTO_STATE_SUSPEND,
     NODE_OVERRIDE_FENCED, NODE_OVERRIDE_MAINTENANCE, POLICY_KIND_EC, POLICY_KIND_GC,
-    POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_MINOR_COMPACT,
+    POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE,
     POLICY_KIND_REBALANCE, POLICY_KIND_REPAIR, POLICY_KIND_SCRUB, POLICY_KIND_SPLIT,
     SLOT_STATE_BEHIND,
     SLOT_STATE_CORRUPT,
@@ -198,7 +198,7 @@ fn candidate_to_action(c: &PolicyCandidate) -> Option<serde_json::Value> {
             }))
         }
         POLICY_KIND_GC => Some(json!({ "action": "gc", "part_id": c.primary_part_id })),
-        POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
+        POLICY_KIND_MAJOR_COMPACT => {
             Some(json!({ "action": "compact", "part_id": c.primary_part_id }))
         }
         POLICY_KIND_REBALANCE => Some(json!({ "action": "rebalance" })),

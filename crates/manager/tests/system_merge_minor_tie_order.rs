@@ -1,15 +1,16 @@
-//! Minor compactions after a merge must not let an older SST shadow a newer
-//! one.
+//! A minor compaction after a merge must keep its output where its window was,
+//! even when the output's `last_seq` ties a newer table's.
 //!
-//! Point reads walk the table list from the back and stop at the first hit, so
-//! the list has to hold, for every key, its newer versions later. After a
-//! merge the list is the survivor's tables then the victim's, and the two
-//! sequence counters were independent (`last_seq` order V0 < S1 < S2 < V1 <
-//! S3 here). A selector that picked a run contiguous in `last_seq` order —
-//! `[S1, S2, V1]`, not contiguous in the list — put the output at S1's slot,
-//! in front of V0, and V0's older copy of a key V1 overwrote was found first.
-//! Windows are now runs of the LIST; this keeps the shape and checks the newest
-//! value survives the merged partition's minor compactions.
+//! The two merge sources counted sequence numbers independently, so a table of
+//! one side can carry the same `last_seq` as a table of the other. An output
+//! takes the largest input seq; when that comes from the other side and ties
+//! the next table of its own keys' side, placing outputs by `last_seq` put it
+//! AFTER that newer table, and a Get (list walked from the back, first hit
+//! wins) returned the older copy. Here the merged list is `[S0, S1, S2, V0,
+//! V1]`; S0 is 300 entries and V1 300 entries of 3 KiB, so the only window in
+//! ratio is `[S1, S2, V0]`; its
+//! output carries S2's seq, which is V1's, and V0 holds KEY's old value that
+//! V1 overwrote.
 
 mod support;
 
@@ -24,18 +25,15 @@ use autumn_rpc::partition_rpc::{self, DiagTraceKeyReq, DiagTraceKeyResp, CODE_OK
 use autumn_stream::{ConnPool, StreamClient};
 use support::*;
 
-const SURVIVOR: u64 = 1401;
-const VICTIM: u64 = 1402;
-/// Small memtables so a few hundred puts make a table.
-const FLUSH_BYTES: u64 = 128 * 1024;
-const VALUE: usize = 256;
+const SURVIVOR: u64 = 1411;
+const VICTIM: u64 = 1412;
 const KEY: &[u8] = b"n-key";
 
 /// SSTs the survivor's checkpoint lists (its last record).
 async fn listed_ssts(mgr_addr: std::net::SocketAddr, meta_stream: u64) -> usize {
     let sc = StreamClient::connect(
         &mgr_addr.to_string(),
-        "merge-minor-order-test".to_string(),
+        "merge-minor-tie-test".to_string(),
         128 * 1024 * 1024,
         Rc::new(ConnPool::new()),
     )
@@ -61,16 +59,23 @@ async fn table_seqs(c: &RpcClient, part: u64) -> Vec<u64> {
     r.sst_last_seqs
 }
 
-async fn put_n(c: &RpcClient, part: u64, prefix: &str, n: usize) {
-    let value = vec![b'v'; VALUE];
+async fn put_flush(c: &RpcClient, part: u64, prefix: &str, n: usize) {
     for i in 0..n {
-        ps_put(c, part, format!("{prefix}-{i:05}").as_bytes(), &value).await;
+        ps_put(c, part, format!("{prefix}-{i:03}").as_bytes(), b"x").await;
     }
+    ps_flush(c, part).await;
 }
 
 #[test]
-fn a_minor_compaction_after_a_merge_keeps_the_newest_version_visible() {
-    assert!(autumn_partition_server::set_flush_mem_bytes(FLUSH_BYTES));
+fn a_tied_last_seq_does_not_move_a_minor_output_past_a_newer_table() {
+    // Every window faces the ratio test, so the big tables stay out of it.
+    autumn_partition_server::compact_policy::set_minor_policy(
+        autumn_partition_server::compact_policy::MinorPolicy {
+            min_size: 1,
+            ..Default::default()
+        },
+    )
+    .expect("policy");
     autumn_partition_server::background::set_minor_compaction_paused(true);
     let mgr_addr = pick_addr();
     let en_addr = pick_addr();
@@ -78,48 +83,44 @@ fn a_minor_compaction_after_a_merge_keeps_the_newest_version_visible() {
     let dir = tempfile::tempdir().expect("tempdir");
     start_extent_node(en_addr, dir.path().to_path_buf(), 1);
     compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("mgr");
-        register_node(&mgr, &en_addr.to_string(), "uuid-merge-minor").await;
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None)
+            .await
+            .expect("mgr");
+        register_node(&mgr, &en_addr.to_string(), "uuid-merge-minor-tie").await;
         let (l, r, m) = (create_stream(&mgr, 1).await, create_stream(&mgr, 1).await, create_stream(&mgr, 1).await);
         upsert_partition(&mgr, SURVIVOR, l, r, m, b"", b"m").await;
         let (l, r, m) = (create_stream(&mgr, 1).await, create_stream(&mgr, 1).await, create_stream(&mgr, 1).await);
         upsert_partition(&mgr, VICTIM, l, r, m, b"m", b"").await;
 
         let ps_addr = pick_addr();
-        start_partition_server(91, mgr_addr, ps_addr);
+        start_partition_server(92, mgr_addr, ps_addr);
         let router = PsRouter::new(mgr_addr, ps_addr);
         let s = router.client_for(SURVIVOR).await;
         let v = router.client_for(VICTIM).await;
 
-        // V0 holds KEY's old value; victim seq ~300.
+        put_flush(&s, SURVIVOR, "b-s0", 300).await;
+        put_flush(&s, SURVIVOR, "b-s1", 1).await;
+        put_flush(&s, SURVIVOR, "b-s2", 1).await;
+        // V0 holds KEY's old value; V1 (big) ends with KEY's new value at S2's seq.
         ps_put(&v, VICTIM, KEY, b"old").await;
-        put_n(&v, VICTIM, "n-v0", 299).await;
         ps_flush(&v, VICTIM).await;
-        // S1: survivor seq ~350.
-        put_n(&s, SURVIVOR, "b-s1", 350).await;
-        ps_flush(&s, SURVIVOR).await;
-        // S2: ~370.
-        put_n(&s, SURVIVOR, "b-s2", 20).await;
-        ps_flush(&s, SURVIVOR).await;
-        // V1 ends with KEY's new value; victim seq ~400.
-        put_n(&v, VICTIM, "n-v1", 99).await;
+        let v0 = table_seqs(&v, VICTIM).await[0];
+        let s_seqs = table_seqs(&s, SURVIVOR).await;
+        let s2 = s_seqs[2];
+        // 3 KiB values (inline, under the 4 KiB value-pointer bound): V1 is
+        // bigger in bytes than everything else together.
+        let big = vec![b'v'; 3 * 1024];
+        for i in 0..(s2 - v0 - 1) {
+            ps_put(&v, VICTIM, format!("n-v1-{i:03}").as_bytes(), &big).await;
+        }
         ps_put(&v, VICTIM, KEY, b"new").await;
         ps_flush(&v, VICTIM).await;
-        // S3: ~670.
-        put_n(&s, SURVIVOR, "b-s3", 300).await;
-        ps_flush(&s, SURVIVOR).await;
         assert_eq!(ps_get(&v, VICTIM, KEY).await.value, b"new");
-
-        // By the tables' own seqs: V0 < S1 < S2 < V1 < S3.
         let v_seqs = table_seqs(&v, VICTIM).await;
-        let s_seqs = table_seqs(&s, SURVIVOR).await;
         assert_eq!(v_seqs.len(), 2, "victim tables: {v_seqs:?}");
         assert_eq!(s_seqs.len(), 3, "survivor tables: {s_seqs:?}");
-        let (v0, v1, s1, s2, s3) = (v_seqs[0], v_seqs[1], s_seqs[0], s_seqs[1], s_seqs[2]);
-        assert!(
-            v0 < s1 && s1 < s2 && s2 < v1 && v1 < s3,
-            "seq order: V0 {v0} S1 {s1} S2 {s2} V1 {v1} S3 {s3}"
-        );
+        let v1 = v_seqs[1];
+        assert!(v1 == s2 && s_seqs[0] < v1, "seqs: victim {v_seqs:?} survivor {s_seqs:?}");
 
         let bytes = mgr
             .call(
@@ -143,9 +144,6 @@ fn a_minor_compaction_after_a_merge_keeps_the_newest_version_visible() {
             .expect("survivor region")
             .1
             .meta_stream;
-        // The merged survivor serves the victim's range once it reopens (the
-        // old listener answers the old range until then) and lists all five
-        // tables before serving.
         let deadline = Instant::now() + Duration::from_secs(90);
         let merged = loop {
             if let Ok(c) = router.try_client_for(SURVIVOR).await {
@@ -157,24 +155,31 @@ fn a_minor_compaction_after_a_merge_keeps_the_newest_version_visible() {
             compio::time::sleep(Duration::from_millis(200)).await;
         };
         assert_eq!(listed_ssts(mgr_addr, meta).await, 5, "the merged list");
-        // Let the minor compactions run, reading KEY between them.
+        // The tick finds the window; stop after that one minor (the three
+        // tables it leaves are in ratio, and the next tick would merge them).
         let runs = || autumn_partition_server::background::minor_compaction_runs().1;
         let before = runs();
         autumn_partition_server::background::set_minor_compaction_paused(false);
-        let watch_until = Instant::now() + Duration::from_secs(20);
-        while Instant::now() < watch_until || runs() == before {
+        while runs() == before {
             assert!(Instant::now() < deadline, "no minor compaction of the merged survivor");
-            let got = ps_get(&merged, SURVIVOR, KEY).await;
-            assert_eq!(got.code, CODE_OK);
-            assert_eq!(
-                String::from_utf8_lossy(&got.value),
-                "new",
-                "an older SST shadows the newer value after a post-merge minor compaction \
-                 (tables {:?})",
-                table_seqs(&merged, SURVIVOR).await
-            );
-            compio::time::sleep(Duration::from_millis(100)).await;
+            compio::time::sleep(Duration::from_millis(50)).await;
         }
-        assert!(listed_ssts(mgr_addr, meta).await < 5, "the minor compactions changed nothing");
+        autumn_partition_server::background::set_minor_compaction_paused(true);
+        assert_eq!(listed_ssts(mgr_addr, meta).await, 3, "one window of three merged");
+        // The window was [S1, S2, V0]: S0 and V1 are still their own tables.
+        let merged_seqs = table_seqs(&merged, SURVIVOR).await;
+        assert!(
+            merged_seqs.contains(&s_seqs[0])
+                && merged_seqs.iter().filter(|&&q| q == v1).count() == 2
+                && !merged_seqs.contains(&v0),
+            "tables after the minor: {merged_seqs:?} (S {s_seqs:?}, V0 {v0}, V1 {v1})"
+        );
+        let got = ps_get(&merged, SURVIVOR, KEY).await;
+        assert_eq!(got.code, CODE_OK);
+        assert_eq!(
+            String::from_utf8_lossy(&got.value),
+            "new",
+            "the minor output (V0's old copy) landed after V1 on a tied last_seq"
+        );
     });
 }

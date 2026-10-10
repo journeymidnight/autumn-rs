@@ -5,6 +5,7 @@ pub mod authz;
 pub mod background;
 mod rpc_handlers;
 mod sstable;
+pub mod compact_policy;
 mod wal_record;
 
 use background::*;
@@ -166,9 +167,8 @@ pub fn set_max_extent_size_bytes(n: u64) -> bool {
         .is_ok()
 }
 /// Memtable rotation threshold = the SST size a flush writes (`--flush-mem-bytes`).
-/// Compaction sizes follow it: size-tiered skips tables of half of it or more,
-/// a pick holds up to twice it, and an output SST is cut at twice it. Clamp
-/// [4 KiB, 1 GiB].
+/// A compaction output SST is cut at twice it, and minor windows exclude
+/// tables of 0.6 × that cut or more. Clamp [4 KiB, 1 GiB].
 pub fn set_flush_mem_bytes(n: u64) -> bool {
     FLUSH_MEM_BYTES_CELL
         .set(n.clamp(4 * 1024, 1024 * 1024 * 1024))
@@ -177,8 +177,8 @@ pub fn set_flush_mem_bytes(n: u64) -> bool {
 pub(crate) fn flush_mem_bytes() -> u64 {
     FLUSH_MEM_BYTES_CELL.get().copied().unwrap_or(FLUSH_MEM_BYTES)
 }
-/// Maximum entry bytes emitted into one SST by compaction and merge recovery.
-/// Keep both paths on the same P-SST sizing policy.
+/// Data-block bytes at which `do_compact` cuts an output SST (bloom, index and
+/// MetaBlock come on top).
 pub(crate) fn max_sst_bytes() -> u64 {
     flush_mem_bytes().saturating_mul(2)
 }
@@ -614,10 +614,6 @@ const OPEN_PARALLELISM: usize = 64;
 // pin to the SAME core — P-sst is mostly idle during P-log's busy
 // windows (its work is syscall + 3-replica network wait on a 128 MB SST
 // upload), so sharing a core is fine and keeps "one partition = one core".
-
-const COMPACT_RATIO: f64 = 0.5;
-const HEAD_RATIO: f64 = 0.3;
-const COMPACT_N: usize = 5;
 
 /// global cross-partition gate on concurrent compactions.
 ///
@@ -1156,32 +1152,6 @@ impl TableMeta {
     }
 }
 
-/// Order the table list by `last_seq`, oldest first (stable), keeping
-/// `sst_readers` aligned. Point reads walk the list from the back and stop at
-/// the first hit, and a minor compaction picks a run contiguous in `last_seq`
-/// order, so the list must be in that order — the rule HBase keeps by always
-/// ordering store files by sequence id. Within one partition the two agree:
-/// each flush covers a later seq interval than every table before it and a
-/// compaction replaces a contiguous run. Insertion order alone does not keep
-/// it: after a merge the list is the survivor's tables then the victim's, whose
-/// sequence counters were independent, and a compaction output placed at its
-/// first input's list slot then lands in front of an older table of the other
-/// side and shadows it. Tables of different merge sources hold disjoint keys, so
-/// interleaving them by seq changes nothing a read sees.
-pub(crate) fn sort_tables_by_seq(tables: &mut Vec<TableMeta>, readers: &mut Vec<Arc<SstReader>>) {
-    assert_eq!(tables.len(), readers.len(), "table list and readers out of step");
-    if tables.windows(2).all(|w| w[0].last_seq <= w[1].last_seq) {
-        return;
-    }
-    let mut pairs: Vec<(TableMeta, Arc<SstReader>)> =
-        tables.drain(..).zip(readers.drain(..)).collect();
-    pairs.sort_by_key(|(t, _)| t.last_seq);
-    for (t, r) in pairs {
-        tables.push(t);
-        readers.push(r);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // PartitionData — lives on a dedicated partition thread (Rc, no locks)
 // ---------------------------------------------------------------------------
@@ -1665,8 +1635,7 @@ pub struct PartitionMetrics {
     /// mirror cannot drift from the Cell it mirrors. The manager needs it
     /// because `handle_split_part` refuses while it is 1.
     pub has_overlap: std::sync::atomic::AtomicU32,
-    /// bytes the next *minor* compact tick's `pickup_tables`
-    /// would feed into `do_compact`. Distinct from
+    /// bytes of the minor window `select_minor` picks now. Distinct from
     /// `pending_compaction_bytes` (major). Both can be non-zero
     /// simultaneously.
     pub minor_compact_pending_bytes: std::sync::atomic::AtomicU64,
@@ -2095,12 +2064,24 @@ mod reader_pin_tests {
 // GC task
 // ---------------------------------------------------------------------------
 
-/// A compaction dispatch carrying its manager op-ledger correlation id
-/// (`op_id == 0` = untracked: the PS-local scheduler + legacy SDK callers).
-#[derive(Clone, Copy)]
-pub(crate) struct CompactTask {
-    pub is_major: bool,
-    pub op_id: u64,
+/// One request on a partition's compaction channel.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CompactTask {
+    /// A major compaction: dispatched over `Maintenance` (`op_id` is the
+    /// manager op-ledger id) or raised by the deletion rule (`op_id == 0`).
+    Major { op_id: u64 },
+    /// The partition's own minor check found a window.
+    Minor(MinorTrigger),
+}
+
+/// What asked for a minor compaction; logged with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MinorTrigger {
+    Flush,
+    Tick,
+    /// The row stream's head extent `extent_id`, sealed at `sealed_len`, is
+    /// mostly dead (`compact_policy::select_reclaim`).
+    Reclaim { extent_id: u64, sealed_len: u64 },
 }
 
 pub(crate) enum GcTask {
@@ -9612,7 +9593,9 @@ async fn recover_partition(
             sst_readers.push(Arc::new(reader));
         }
     }
-    sort_tables_by_seq(&mut tables, &mut sst_readers);
+    // The checkpoint's order is the recency order; never re-sort by
+    // `last_seq` (see "Table list order" in this crate's CLAUDE.md). A merge's
+    // sources concatenate: their keys are disjoint.
 
     // Replay logStream into the recovered memtable, skipping records already
     // captured by the loaded SSTs: on one partition's timeline a record whose
@@ -10722,8 +10705,10 @@ async fn commit_flush_outcome_inner(
     part.borrow().durable_ckpt_vp.set((outcome.vp_eid, outcome.vp_off));
     // tables changed (new SST committed) → refresh the
     // advisory-input metrics so the next report_load_loop tick carries
-    // accurate dead-data / minor-compact-pending volumes.
+    // accurate dead-data / minor-compact-pending volumes, and ask for a
+    // minor compaction (HBase's check after every flush).
     crate::background::refresh_metrics(part);
+    crate::background::request_minor_compaction(part, MinorTrigger::Flush);
     // Deterministic completion signal for tests (checkpoint now durable).
     FLUSH_COMMITS.fetch_add(1, Ordering::Relaxed);
     Ok(())

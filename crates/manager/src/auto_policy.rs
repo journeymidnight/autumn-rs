@@ -74,9 +74,8 @@ pub(crate) const MAX_ACTIONS_CAP: u32 = 100;
 /// over-throttles a legitimately-armed rebalance policy.
 pub(crate) const REBALANCE_MIN_ACTUATION_COOLDOWN_SEC: i64 = 60;
 
-/// The same non-configurable floor, for COMPACTION — both compact kinds,
-/// because a major and a minor candidate actuate the identical op (`compact
-/// <part>`, which the PS runs as a major compaction either way). A compaction
+/// The same non-configurable floor, for COMPACTION (`compact <part>`, a major
+/// compaction; minor compaction is the PS's own and never actuated). A compaction
 /// rewrites every SST of the partition, and the loop actuates from a CACHED
 /// candidate list rebuilt only on the 60 s policy tick — so a policy with
 /// `cooldown_sec = 0` and `interval_sec = 2` would re-issue the same cached row
@@ -86,10 +85,6 @@ pub(crate) const REBALANCE_MIN_ACTUATION_COOLDOWN_SEC: i64 = 60;
 /// suppress on `compact_cooldown_sec` (it keys on a FLAG, not a debt level —
 /// see its doc), and even where an advisory does suppress, a row it already
 /// emitted stays in the cache for the rest of the window.
-///
-/// The two kinds keep separate cooldown keys (`major:N` / `minor:N`), so a
-/// partition carrying both rows can be compacted at most twice per floor
-/// window — a bounded backstop, not a storm.
 ///
 /// 60 s, matching rebalance and deliberately below every preset's
 /// `cooldown_sec` (120-240 s): it can only catch a misconfiguration, never
@@ -231,7 +226,7 @@ pub(crate) fn is_preset_name(name: &str) -> bool {
 }
 
 /// Expand a switch set to the actionable candidate kinds it enables. compact ⇒
-/// major + minor. Reads the switches by `SWITCH_ORDER` ([split, ec, compact,
+/// major compaction. Reads the switches by `SWITCH_ORDER` ([split, ec, compact,
 /// gc, merge, rebalance, repair, scrub]); a shorter Vec treats absent switches
 /// as off.
 pub(crate) fn kinds_from_switches(switches: &[bool]) -> HashSet<u8> {
@@ -245,7 +240,6 @@ pub(crate) fn kinds_from_switches(switches: &[bool]) -> HashSet<u8> {
     }
     if on(2) {
         out.insert(POLICY_KIND_MAJOR_COMPACT);
-        out.insert(POLICY_KIND_MINOR_COMPACT);
     }
     if on(3) {
         out.insert(POLICY_KIND_GC);
@@ -266,7 +260,7 @@ pub(crate) fn kinds_from_switches(switches: &[bool]) -> HashSet<u8> {
 }
 
 /// Actuation priority (Python `order`): split (relief valve — spreads load) first,
-/// then cheap upkeep (gc/minor/major), then ec, then merge LAST (concentrates load
+/// then cheap upkeep (gc/major), then ec, then merge LAST (concentrates load
 /// onto one core — [[feedback_auto_split_before_merge]]). Lower = higher priority.
 fn kind_priority(kind: u8) -> u8 {
     match kind {
@@ -278,7 +272,6 @@ fn kind_priority(kind: u8) -> u8 {
         // so it ranks high, ahead of upkeep; merge (concentrates) stays last.
         POLICY_KIND_REBALANCE => 2,
         POLICY_KIND_GC => 3,
-        POLICY_KIND_MINOR_COMPACT => 4,
         POLICY_KIND_MAJOR_COMPACT => 5,
         POLICY_KIND_EC => 6,
         POLICY_KIND_MERGE => 7,
@@ -331,9 +324,7 @@ pub(crate) fn decide_actions(
         // NON-CONFIGURABLE minimum so a mis-set `cooldown_sec` can't bypass it.
         let effective_cooldown = match c.kind {
             POLICY_KIND_REBALANCE => cooldown_secs.max(REBALANCE_MIN_ACTUATION_COOLDOWN_SEC),
-            POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
-                cooldown_secs.max(COMPACT_MIN_ACTUATION_COOLDOWN_SEC)
-            }
+            POLICY_KIND_MAJOR_COMPACT => cooldown_secs.max(COMPACT_MIN_ACTUATION_COOLDOWN_SEC),
             // The cadence IS the cooldown: once a week, whatever the policy's
             // own cooldown says. Persisted with the others, so a failover does
             // not restart the week.
@@ -384,8 +375,8 @@ pub(crate) fn describe_candidate(c: &PolicyCandidate) -> String {
 /// Map a candidate to the `autumn-op` actuation command, or `None` if it is
 /// advisory-only / missing its target (Python `candidate_to_cmd`). EC carries
 /// the extent in `secondary_part_id` (primary=0); split/gc/compact use
-/// `primary_part_id`; merge = primary survivor + secondary victim; major/minor
-/// both map to `compact` (the PS picks the tier). `hotcold`/unknown → `None`.
+/// `primary_part_id`; merge = primary survivor + secondary victim; major maps
+/// to `compact`. `hotcold`/unknown → `None`.
 pub(crate) fn candidate_to_cmd(c: &PolicyCandidate) -> Option<Vec<String>> {
     match c.kind {
         POLICY_KIND_EC => {
@@ -410,7 +401,7 @@ pub(crate) fn candidate_to_cmd(c: &PolicyCandidate) -> Option<Vec<String>> {
             ])
         }
         POLICY_KIND_GC => Some(vec!["gc".to_string(), c.primary_part_id.to_string()]),
-        POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
+        POLICY_KIND_MAJOR_COMPACT => {
             Some(vec!["compact".to_string(), c.primary_part_id.to_string()])
         }
         // Cluster-scoped; no target id. Used for the submission log + the
@@ -445,9 +436,7 @@ pub(crate) fn candidate_to_submit(c: &PolicyCandidate) -> Option<OpSubmitReq> {
             vec![],
         ),
         POLICY_KIND_GC => (OP_KIND_GC, c.primary_part_id, 0, vec![]),
-        POLICY_KIND_MAJOR_COMPACT | POLICY_KIND_MINOR_COMPACT => {
-            (OP_KIND_COMPACT, c.primary_part_id, 0, vec![])
-        }
+        POLICY_KIND_MAJOR_COMPACT => (OP_KIND_COMPACT, c.primary_part_id, 0, vec![]),
         POLICY_KIND_EC => (
             OP_KIND_EC_CONVERT,
             0,
@@ -509,7 +498,7 @@ mod tests {
 
     #[test]
     fn candidate_to_cmd_maps_every_actionable_kind() {
-        // split/gc/major/minor use primary; ec uses secondary as the EXTENT id;
+        // split/gc/major use primary; ec uses secondary as the EXTENT id;
         // merge = survivor + victim.
         assert_eq!(
             candidate_to_cmd(&cand(POLICY_KIND_SPLIT, 7, 0)),
@@ -521,10 +510,6 @@ mod tests {
         );
         assert_eq!(
             candidate_to_cmd(&cand(POLICY_KIND_MAJOR_COMPACT, 7, 0)),
-            Some(vec!["compact".into(), "7".into()])
-        );
-        assert_eq!(
-            candidate_to_cmd(&cand(POLICY_KIND_MINOR_COMPACT, 7, 0)),
             Some(vec!["compact".into(), "7".into()])
         );
         assert_eq!(
@@ -554,7 +539,6 @@ mod tests {
             (cand(POLICY_KIND_MERGE, 3, 4), OP_KIND_MERGE, 3, 4),
             (cand(POLICY_KIND_GC, 5, 0), OP_KIND_GC, 5, 0),
             (cand(POLICY_KIND_MAJOR_COMPACT, 6, 0), OP_KIND_COMPACT, 6, 0),
-            (cand(POLICY_KIND_MINOR_COMPACT, 6, 0), OP_KIND_COMPACT, 6, 0),
             (cand(POLICY_KIND_EC, 0, 88), OP_KIND_EC_CONVERT, 0, 88),
             (cand(POLICY_KIND_REBALANCE, 0, 0), OP_KIND_REBALANCE, 0, 0),
             (cand(POLICY_KIND_SCRUB, 0, 0), OP_KIND_SCRUB, 0, 0),
@@ -619,14 +603,13 @@ mod tests {
     }
 
     #[test]
-    fn kinds_from_switches_expands_compact_to_major_and_minor() {
+    fn kinds_from_switches_expands_compact_to_major() {
         // [split, ec, compact, gc, merge, rebalance, repair]
         let ks = kinds_from_switches(&[false, false, true, false, false, false, false]);
         assert!(ks.contains(&POLICY_KIND_MAJOR_COMPACT));
-        assert!(ks.contains(&POLICY_KIND_MINOR_COMPACT));
-        assert_eq!(ks.len(), 2);
+        assert_eq!(ks.len(), 1);
         let all = kinds_from_switches(&[true; SWITCHES]);
-        assert_eq!(all.len(), 9); // split, ec, major, minor, gc, merge, rebalance, repair, scrub
+        assert_eq!(all.len(), 8); // split, ec, major, gc, merge, rebalance, repair, scrub
         assert!(all.contains(&POLICY_KIND_REBALANCE));
         assert!(all.contains(&POLICY_KIND_REPAIR));
         assert!(all.contains(&POLICY_KIND_SCRUB));
@@ -765,18 +748,6 @@ mod tests {
             decide_actions(&mc, &mcd, &mc_enabled, 1000, 0, 5).len(),
             1,
             "allowed once past the floor"
-        );
-
-        // …and MINOR too: it actuates the identical `compact` op, so flooring
-        // only the major kind would leave the same storm reachable through the
-        // other row.
-        let mn_enabled: HashSet<u8> = [POLICY_KIND_MINOR_COMPACT].into_iter().collect();
-        let mn = vec![cand(POLICY_KIND_MINOR_COMPACT, 7, 0)];
-        let mut mnd = HashMap::new();
-        mnd.insert("minor:7".to_string(), 990i64);
-        assert!(
-            decide_actions(&mn, &mnd, &mn_enabled, 1000, 0, 5).is_empty(),
-            "minor compact floored despite cooldown_sec=0"
         );
 
         // A kind with no floor at cooldown_sec=0 is unaffected.

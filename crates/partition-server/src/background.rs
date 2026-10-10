@@ -69,15 +69,30 @@ fn is_frozen_for_maintenance(part: &Rc<RefCell<PartitionData>>) -> bool {
 // naturally-full burst still lands as ONE batch because the (E) drain pulls
 // the whole req channel into `pending` before the launch check runs.
 
-/// per-partition SST count threshold above which the compact
-/// loop's timer arm auto-triggers a minor compaction. Set high enough
-/// to leave steady-state operation (post-flush + post-minor-compact)
-/// untouched, but below the FPR cliff where per-Get miss-path block
-/// reads dominate. At 1% per-SST bloom FPR, N=32 ≈ 28% cumulative
-/// false-positive on a miss vs. 63% at N=100 — keeping reads cheap
-/// on workloads where external policy hasn't kept up. Not tunable
-/// because it's a mechanism-level defensive bound, not a policy knob.
-const MAX_SST_BEFORE_AUTO_COMPACT: usize = 32;
+/// How often the tick may probe the row stream's head extent for a reclaim
+/// (two manager RPCs), and how often it logs that no minor window exists.
+const RECLAIM_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Test switch: while set, no minor compaction is requested (flush, tick,
+/// reclaim), so a test can build a table shape first. Only tests set it.
+static MINOR_COMPACTION_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_minor_compaction_paused(paused: bool) {
+    MINOR_COMPACTION_PAUSED.store(paused, std::sync::atomic::Ordering::Relaxed);
+}
+/// Minor compactions run, by what asked for them; tests read these.
+static MINOR_RUNS_FLUSH: AtomicU64 = AtomicU64::new(0);
+static MINOR_RUNS_TICK: AtomicU64 = AtomicU64::new(0);
+static MINOR_RUNS_RECLAIM: AtomicU64 = AtomicU64::new(0);
+/// `(flush, tick, reclaim)` minor compactions completed in this process.
+pub fn minor_compaction_runs() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        MINOR_RUNS_FLUSH.load(Relaxed),
+        MINOR_RUNS_TICK.load(Relaxed),
+        MINOR_RUNS_RECLAIM.load(Relaxed),
+    )
+}
 /// Deletion-triggered major compaction, TiKV's rule (`region-compact-min-
 /// tombstones` / `region-compact-tombstones-percent`, the region-level form of
 /// RocksDB's `CompactOnDeletionCollector`): compact when the partition's SSTs
@@ -384,8 +399,9 @@ fn checkpoint_vp_head(
 }
 
 /// Keys one compaction output chunk holds, for sizing its bloom filter: the
-/// inputs' entries at their average size, capped by their total. Dropped
-/// entries only make it high.
+/// inputs' entries at their average SST size (pass the inputs' `TableMeta.len`
+/// — the cut is in encoded bytes), capped by their total. With one chunk,
+/// dropped entries only make it high.
 pub(crate) fn compaction_chunk_keys(input_entries: u64, input_bytes: u64, max_chunk: u64) -> usize {
     let keys = if input_bytes <= max_chunk {
         input_entries
@@ -565,6 +581,9 @@ pub(crate) async fn background_maintenance_loop(
     // First check on the first tick, so a partition that opens with
     // tombstone-heavy SSTs is compacted without waiting a whole interval.
     let mut next_deletion_check_at = Instant::now();
+    let mut next_reclaim_check_at = Instant::now() + RECLAIM_CHECK_INTERVAL;
+    let reclaim_probe_inflight = Rc::new(Cell::new(false));
+    let mut next_no_window_log_at = Instant::now();
 
     loop {
         use std::future::Future;
@@ -643,7 +662,12 @@ pub(crate) async fn background_maintenance_loop(
 
         let compact_sleep = next_compact_at.saturating_duration_since(now);
         let gc_sleep = next_gc_at.saturating_duration_since(now);
-        let sel = {
+        // A due tick goes first: under steady writes every flush queues a
+        // minor, `compact_rx` is nearly always ready, and the tick (expiry and
+        // deletion majors, gauges, the reclaim probe) would never run.
+        let sel = if now >= next_compact_at {
+            Sel::CompactTimeout
+        } else {
             let mut crecv = std::pin::pin!(compact_rx.next());
             let mut grecv = std::pin::pin!(gc_rx.next());
             let mut csleep = std::pin::pin!(compio::time::sleep(compact_sleep));
@@ -670,45 +694,57 @@ pub(crate) async fn background_maintenance_loop(
             // Either channel closing = partition shutdown -> exit the task.
             Sel::CompactRecv(None) | Sel::GcRecv(None) => break,
             Sel::CompactRecv(Some(first)) => {
-                next_compact_at = Instant::now() + random_delay();
-                // fix HIGH-1: futures::channel::mpsc capacity is
-                // `buffer + num_senders`, so cap=1 with 2 senders
-                // (PartitionData clone + PartitionHandle clone) admits
-                // up to 3 backlogged dispatches per partition — the
-                // scheduler comment about "silently no-op via
-                // Full" was wrong. Drain everything that's already in
-                // the channel and collapse: any `true` (major) wins
-                // over `false` (minor). One pass is enough because
-                // both senders are bounded; `now_or_never()` ensures
-                // we never block here.
+                // The tick keeps its own cadence (see the due-tick check
+                // above); a received task does not push it back.
+                // futures::channel::mpsc capacity is `buffer + num_senders`,
+                // and every sender clone (each flush's minor request, the
+                // deletion rule) adds a slot, so several tasks can be queued.
+                // Drain them and collapse: a major wins over any minor (it
+                // rewrites every table); a reclaim wins over a count minor (it
+                // carries the head extent's seal, which the next flush or tick
+                // does not bring back). `now_or_never()` never blocks.
                 use futures::stream::StreamExt;
-                let mut major = first.is_major;
                 // Carry a tracked op_id across the collapsed dispatches (prefer a
-                // non-zero id: a manual op coalescing with a scheduler tick still
+                // non-zero id: a manual op coalescing with an untracked one still
                 // reports its outcome). Same-target manual ops share one id via
                 // the manager's attach-dedup, so two distinct non-zero ids here
                 // can't both be active.
-                let mut compact_op_id = first.op_id;
-                while let Some(Some(more)) = compact_rx.next().now_or_never() {
-                    if more.is_major {
-                        major = true;
+                let mut major_op: Option<u64> = None;
+                let mut minor: Option<MinorTrigger> = None;
+                let mut take = |task: CompactTask| match task {
+                    CompactTask::Major { op_id } => {
+                        major_op = Some(major_op.unwrap_or(0).max(op_id));
                     }
-                    compact_op_id = compact_op_id.max(more.op_id);
+                    CompactTask::Minor(t) => {
+                        if !matches!(minor, Some(MinorTrigger::Reclaim { .. })) {
+                            minor = Some(t);
+                        }
+                    }
+                };
+                take(first);
+                while let Some(Some(more)) = compact_rx.next().now_or_never() {
+                    take(more);
                 }
-                // 2026-06-02 fix — refuse to start a new compact while a
-                // split / merge freeze is in flight. `try_complete_freeze_drain`
-                // waits for `compact_inflight == 0` before acking the freeze,
-                // and `do_compact` writes SSTs to row_stream after the
-                // wait-window would have started. Without this gate the
-                // sequence is: freeze set → drain waits on existing compact
-                // (correct) → existing compact finishes, inflight=0 → drain
-                // acks → split captures commit_length → a freshly-dispatched
-                // compact starts a row_stream append → seal captures stale
-                // length, compact's later TableLocations record points past
-                // it (`stale_vp_offset_past_sealed_length` / `invalid
-                // meta_len` on next PS open). The skip is silent; the
-                // compact dispatcher (maintenance scheduler / manual
-                // `autumn-op compact`) retries after the freeze clears.
+                let Some(compact_op_id) = major_op else {
+                    if let Some(trigger) = minor {
+                        run_minor_compaction(
+                            &part,
+                            part_id,
+                            trigger,
+                            &maintenance_gate,
+                            &concurrency_ctrl,
+                        )
+                        .await;
+                    }
+                    continue;
+                };
+                // Refuse to start a compaction while a split / merge freeze is
+                // in flight: the freeze drain finishes once it holds the
+                // maintenance gate, and a compaction that started its
+                // row_stream append after that would land past the captured
+                // commit_length (`stale_vp_offset_past_sealed_length` /
+                // `invalid meta_len` on the next open). The dispatcher
+                // (`autumn-op compact`, the policy) retries after the freeze.
                 {
                     let p = part.borrow();
                     if p.frozen_for_split.get().is_some() || p.merge_freeze.is_halted() {
@@ -762,9 +798,9 @@ pub(crate) async fn background_maintenance_loop(
                 // `settling` = the deletes this compaction covers; read in the
                 // same synchronous step as the flush's rotate, so a delete that
                 // lands during the compaction stays counted.
-                let mut major_guards = None;
-                let mut settling = 0u64;
-                if major {
+                // Held to the end of the arm: the gate serializes with split,
+                // the permit bounds PS-wide compaction memory.
+                let (_gate, _permit, settling) = {
                     let gate = maintenance_gate.acquire().await;
                     if is_frozen_for_maintenance(&part) {
                         record_maint_outcome(
@@ -780,7 +816,7 @@ pub(crate) async fn background_maintenance_loop(
                         continue;
                     }
                     let permit = concurrency_ctrl.acquire_compact().await;
-                    settling = metrics
+                    let settling = metrics
                         .unsettled_deletes
                         .load(std::sync::atomic::Ordering::Relaxed);
                     if let Err(e) = crate::flush_memtable_locked(&part).await {
@@ -799,27 +835,12 @@ pub(crate) async fn background_maintenance_loop(
                         clear_compact_inflight();
                         continue;
                     }
-                    major_guards = Some((gate, permit));
-                }
-                let tbls = part.borrow().tables.clone();
-                let compact_tbls = if major {
-                    tbls.clone()
-                } else {
-                    pickup_tables(&tbls, 2 * crate::flush_mem_bytes())
+                    (gate, permit, settling)
                 };
                 // A major rewrites even one SST: its old extent may contain
                 // arbitrarily much dead data, including after a restart.
-                let skip_compact = if major {
-                    compact_tbls.is_empty()
-                } else {
-                    compact_tbls.len() < 2
-                };
-                if skip_compact {
-                    let _gate = if major_guards.is_none() {
-                        Some(maintenance_gate.acquire().await)
-                    } else {
-                        None
-                    };
+                let compact_tbls = part.borrow().tables.clone();
+                if compact_tbls.is_empty() {
                     if is_frozen_for_maintenance(&part) {
                         record_maint_outcome(
                             &metrics,
@@ -853,9 +874,7 @@ pub(crate) async fn background_maintenance_loop(
                     // entry leaves no table and does not settle. Without this
                     // the count stayed up and SETTLE re-advised this no-op
                     // compaction every cooldown.
-                    if major {
-                        settle_deletes(&metrics, settling);
-                    }
+                    settle_deletes(&metrics, settling);
                     metrics.pending_compaction_bytes.store(
                         compute_pending_compaction_bytes(&part),
                         std::sync::atomic::Ordering::Relaxed,
@@ -874,48 +893,18 @@ pub(crate) async fn background_maintenance_loop(
                     continue;
                 }
 
-                // Per-partition maintenance_gate FIRST — serializes vs
-                // `handle_split_part` on this partition (split holds this gate
-                // from before commit_length through multi_modify_split so no
-                // `compact_row_append` from us can race the seal).
-                // (A major compaction took both before its flush, above.)
-                let _guards = match major_guards {
-                    Some(g) => g,
-                    // PS-wide concurrency permit — limits cross-partition
-                    // peak RAM (each do_compact holds ~2x SST bytes).
-                    None => (
-                        maintenance_gate.acquire().await,
-                        concurrency_ctrl.acquire_compact().await,
-                    ),
-                };
-                if is_frozen_for_maintenance(&part) {
-                    record_maint_outcome(
-                        &metrics,
-                        compact_op_id,
-                        manager_rpc::OP_KIND_COMPACT,
-                        manager_rpc::OP_STATE_FAILED,
-                        "deferred: partition frozen for split/merge — retry".to_string(),
-                        String::new(),
-                    );
-                    stamp_last_compact();
-                    clear_compact_inflight();
-                    continue;
-                }
                 // compact_inflight already latched at top of recv arm.
-                let result = do_compact(&part, compact_tbls, major, compact_op_id).await;
+                let result = do_compact(&part, compact_tbls, true, compact_op_id).await;
                 match result {
                     Ok(s) => {
                         tracing::info!(
-                            "compact part {}: {}, input={} tables, output={} tables, kept={}, discarded={}, output={}",
+                            "compact part {}: major, input={} tables, output={} tables, kept={}, discarded={}, output={}",
                             part_id,
-                            if major { "major" } else { "minor" },
                             s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
                             crate::human_size(s.output_bytes)
                         );
-                        if major {
-                            part.borrow().set_has_overlap(0);
-                            settle_deletes(&metrics, settling);
-                        }
+                        part.borrow().set_has_overlap(0);
+                        settle_deletes(&metrics, settling);
                         if let Err(e) = truncate_unreferenced_row_prefix(&part, part_id).await {
                             tracing::warn!(part_id, "compaction: row stream truncate: {e:#}");
                         }
@@ -926,10 +915,8 @@ pub(crate) async fn background_maintenance_loop(
                             manager_rpc::OP_STATE_SUCCEEDED,
                             String::new(),
                             format!(
-                                "{} compaction: {} → {} tables",
-                                if major { "major" } else { "minor" },
-                                s.input_tables,
-                                s.output_tables
+                                "major compaction: {} → {} tables",
+                                s.input_tables, s.output_tables
                             ),
                         );
                     }
@@ -1023,8 +1010,8 @@ pub(crate) async fn background_maintenance_loop(
                                 // a later compaction to rewrite: `split` refused
                                 // forever, the policy re-issued a no-op compact
                                 // every window, and only a PS reopen healed it.
-                                // The auto-trim arm below is MINOR and must not
-                                // clear it — it does not drop out-of-range keys.
+                                // A minor compaction must not clear it: it
+                                // rewrites only some of the tables.
                                 part.borrow().set_has_overlap(0);
                                 if let Err(e) =
                                     truncate_unreferenced_row_prefix(&part, part_id).await
@@ -1070,10 +1057,7 @@ pub(crate) async fn background_maintenance_loop(
                         // channel's only consumer, so the task is picked up on
                         // the next select.
                         let mut tx = part.borrow().compact_tx.clone();
-                        if let Err(e) = tx.try_send(crate::CompactTask {
-                            is_major: true,
-                            op_id: 0,
-                        }) {
+                        if let Err(e) = tx.try_send(crate::CompactTask::Major { op_id: 0 }) {
                             if e.is_disconnected() {
                                 break;
                             }
@@ -1082,80 +1066,21 @@ pub(crate) async fn background_maintenance_loop(
                     }
                 }
 
-                // minor-compact-on-timer removed. Scheduler now
-                // dispatches compactions via `compact_rx` based on
-                // `pending_compaction_bytes` (which we just refreshed
-                // above). The Recv branch handles BOTH manual triggers
-                // and scheduler dispatches via the same channel.
-
-                // defensive auto-compact when SST count grows
-                // past `MAX_SST_BEFORE_AUTO_COMPACT`. Per-SST bloom is
-                // tuned to 1% FPR but reads consult EVERY reader for a
-                // miss (`p.sst_readers.iter().rev()` in `handle_get_bulk`),
-                // so the cumulative chance that AT LEAST ONE bloom
-                // false-positives is `1 - 0.99^N`: 39% at N=50, 63% at
-                // N=100, 87% at N=200. Each false-positive costs one
-                // block read + decode on the miss path. The
-                // PS-side maintenance scheduler was deleted in favour of
-                // external policy, but FPR runaway is a mechanism-
-                // level concern (no operator can be expected to
-                // monitor `tables.len()` per partition) so we keep a
-                // cheap auto-trigger here. Uses the existing
-                // `pickup_tables` size-tiered selector — drains the
-                // smallest cohort each tick, converging to a stable
-                // <`MAX_SST_BEFORE_AUTO_COMPACT` count over a few
-                // ticks without monopolising the compact permit. The
-                // recv arm handles externally-dispatched majors
-                // unchanged; the threshold is intentionally larger
-                // than typical steady-state so this only fires when
-                // external policy is absent or has fallen behind.
-                let sst_count = part.borrow().sst_readers.len();
-                if sst_count > MAX_SST_BEFORE_AUTO_COMPACT
-                    && metrics
-                        .compact_inflight
-                        .load(std::sync::atomic::Ordering::Relaxed)
-                        == 0
-                {
-                    let tbls = part.borrow().tables.clone();
-                    let compact_tbls = pickup_tables(&tbls, 2 * crate::flush_mem_bytes());
-                    if compact_tbls.len() >= 2 {
-                        // Per-partition maintenance_gate (see main arm above).
-                        let _local_gate = maintenance_gate.acquire().await;
-                        if is_frozen_for_maintenance(&part) {
-                            continue;
-                        }
-                        let _permit = concurrency_ctrl.acquire_compact().await;
-                        metrics
-                            .compact_inflight
-                            .store(1, std::sync::atomic::Ordering::Relaxed);
-                        let result = do_compact(&part, compact_tbls, false, /* no submitted op */ 0).await;
-                        match result {
-                            Ok(s) => {
-                                tracing::info!(
-                                    "compact part {}: auto-trim (sst_count was {}), input={} tables, output={} tables, kept={}, discarded={}, output={}",
-                                    part_id, sst_count,
-                                    s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
-                                    crate::human_size(s.output_bytes)
-                                );
-                                if let Err(e) =
-                                    truncate_unreferenced_row_prefix(&part, part_id).await
-                                {
-                                    tracing::warn!(part_id, "auto-trim: row stream truncate: {e:#}");
-                                }
-                            }
-                            Err(e) => tracing::error!("auto-trim compaction: {e}"),
-                        }
-                        metrics.pending_compaction_bytes.store(
-                            compute_pending_compaction_bytes(&part),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        metrics.last_compact_at.store(
-                            crate::now_secs() as i64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        metrics
-                            .compact_inflight
-                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                // The minor check that runs after every flush, repeated here
+                // for table lists that grew without one (a merged or split
+                // open, a restart). With no window, the head-extent reclaim
+                // probe (RPCs, detached) at most once a minute.
+                if !request_minor_compaction(&part, MinorTrigger::Tick) {
+                    let now = Instant::now();
+                    let (n_tables, min_files) =
+                        (part.borrow().tables.len(), crate::compact_policy::minor_policy().min_files);
+                    if n_tables >= min_files && now >= next_no_window_log_at {
+                        next_no_window_log_at = now + RECLAIM_CHECK_INTERVAL;
+                        tracing::debug!(part_id, n_tables, "minor compaction: no window in ratio");
+                    }
+                    if now >= next_reclaim_check_at && !reclaim_probe_inflight.get() {
+                        next_reclaim_check_at = now + RECLAIM_CHECK_INTERVAL;
+                        spawn_reclaim_probe(&part, part_id, reclaim_probe_inflight.clone());
                     }
                 }
             }
@@ -2451,12 +2376,10 @@ pub(crate) fn settle_deletes(metrics: &crate::PartitionMetrics, settled: u64) {
         .expect("the update closure never declines");
 }
 
-/// snapshot how many SSTable bytes the next compact tick would
-/// consume. `has_overlap == 1` means major compaction is mandated and
-/// will rewrite every table — so the answer is total SST bytes.
-/// Otherwise it's whatever `pickup_tables` would pick, which is the same
-/// thing the periodic compact tick will actually do. Cheap (no I/O, no
-/// borrow_mut on Memtable).
+/// snapshot how many SSTable bytes compaction has pending.
+/// `has_overlap == 1` means major compaction is mandated and will rewrite
+/// every table — so the answer is total SST bytes. Otherwise it is the minor
+/// window `select_minor` picks now. Cheap (no I/O, no borrow_mut on Memtable).
 pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>) -> u64 {
     let p = part.borrow();
     let tbls = p.tables.clone();
@@ -2465,8 +2388,178 @@ pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>
     if overlap == 1 {
         return tbls.iter().map(|t| t.estimated_size).sum();
     }
-    let compact_tbls = pickup_tables(&tbls, 2 * crate::flush_mem_bytes());
-    compact_tbls.iter().map(|t| t.estimated_size).sum()
+    minor_window_bytes(&tbls)
+}
+
+fn minor_window_bytes(tables: &[TableMeta]) -> u64 {
+    pick_minor(tables).map_or(0, |pick| tables[pick.window].iter().map(|t| t.estimated_size).sum())
+}
+
+/// `select_minor` with the current policy; tables of 0.6 × the output cap or
+/// more stay out of windows (see there).
+fn pick_minor(tables: &[TableMeta]) -> Option<crate::compact_policy::MinorPick> {
+    crate::compact_policy::select_minor(
+        tables,
+        &crate::compact_policy::minor_policy(),
+        crate::max_sst_bytes() / 5 * 3,
+    )
+}
+
+/// Queue a minor compaction when `select_minor` finds a window (after a
+/// flush commits, and on the tick). Returns whether one was queued.
+pub(crate) fn request_minor_compaction(
+    part: &Rc<RefCell<PartitionData>>,
+    trigger: MinorTrigger,
+) -> bool {
+    let found = pick_minor(&part.borrow().tables).is_some();
+    found && send_minor(part, trigger)
+}
+
+fn send_minor(part: &Rc<RefCell<PartitionData>>, trigger: MinorTrigger) -> bool {
+    if MINOR_COMPACTION_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let mut tx = part.borrow().compact_tx.clone();
+    match tx.try_send(CompactTask::Minor(trigger)) {
+        Ok(()) => true,
+        // Each clone brings its own slot, so this is not Full in practice
+        // (queued tasks collapse when the loop drains them). Disconnected:
+        // the partition is closing.
+        Err(_) => false,
+    }
+}
+
+/// Probe the row stream's head extent and queue a reclaim when its live
+/// tables are a small share of it. Detached: `get_stream_info` /
+/// `get_extent_info` are manager RPCs and must not stall the maintenance task.
+fn spawn_reclaim_probe(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+    inflight: Rc<Cell<bool>>,
+) {
+    let (sc, row_stream_id) = {
+        let p = part.borrow();
+        (p.stream_client.clone(), p.row_stream_id)
+    };
+    let weak = Rc::downgrade(part);
+    inflight.set(true);
+    compio::runtime::spawn(async move {
+        match row_head_seal(&sc, row_stream_id).await {
+            Ok(Some((extent_id, sealed_len))) => {
+                if let Some(part) = weak.upgrade() {
+                    let found = crate::compact_policy::select_reclaim(
+                        &part.borrow().tables,
+                        extent_id,
+                        sealed_len,
+                        crate::compact_policy::minor_policy().max_files,
+                    )
+                    .is_some();
+                    if found {
+                        send_minor(&part, MinorTrigger::Reclaim { extent_id, sealed_len });
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(part_id, "row stream reclaim probe: {e:#}"),
+        }
+        inflight.set(false);
+    })
+    .detach();
+}
+
+/// The row stream's first extent and its sealed length, unless it is the tail.
+async fn row_head_seal(sc: &StreamClient, row_stream_id: u64) -> Result<Option<(u64, u64)>> {
+    let ids = sc.get_stream_info(row_stream_id).await?.extent_ids;
+    let [head, _, ..] = ids.as_slice() else {
+        return Ok(None);
+    };
+    let mut info = sc.get_extent_info(*head).await?;
+    if !info.sealed {
+        // Cached while it was the tail (SST reads fetch it); every extent but
+        // the stream's last is sealed, so ask the manager again.
+        sc.invalidate_extent_cache(*head);
+        info = sc.get_extent_info(*head).await?;
+    }
+    Ok(info.sealed.then_some((*head, info.sealed_length)))
+}
+
+/// Run one minor compaction. The window is chosen under the gate: until it is
+/// released only a flush changes the table list, and a flush appends, so the
+/// window stays a contiguous run of the list `do_compact` splices into. It
+/// stamps no `last_compact_at`: that is the manager's cooldown input for the
+/// major advisories, and minors run after every few flushes.
+async fn run_minor_compaction(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+    trigger: MinorTrigger,
+    maintenance_gate: &Arc<crate::CompactionGate>,
+    concurrency_ctrl: &Arc<crate::ConcurrencyController>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Frozen for split/merge: the next flush or tick asks again once the
+    // freeze clears.
+    if is_frozen_for_maintenance(part) {
+        return;
+    }
+    let metrics = part.borrow().metrics.clone();
+    metrics.compact_inflight.store(1, Relaxed);
+    let _gate = maintenance_gate.acquire().await;
+    let _permit = concurrency_ctrl.acquire_compact().await;
+    if !is_frozen_for_maintenance(part) {
+        let tables = part.borrow().tables.clone();
+        let policy = crate::compact_policy::minor_policy();
+        let pick = match trigger {
+            MinorTrigger::Reclaim { extent_id, sealed_len } => {
+                crate::compact_policy::select_reclaim(&tables, extent_id, sealed_len, policy.max_files)
+                    .map(|w| (w, "reclaim"))
+            }
+            MinorTrigger::Flush | MinorTrigger::Tick => {
+                pick_minor(&tables).map(|p| {
+                    let why = match (p.forced, trigger) {
+                        (true, _) => "blocking",
+                        (false, MinorTrigger::Flush) => "flush",
+                        (false, _) => "tick",
+                    };
+                    (p.window, why)
+                })
+            }
+        };
+        if let Some((window, why)) = pick {
+            let input_bytes: u64 = tables[window.clone()].iter().map(|t| t.estimated_size).sum();
+            match do_compact(part, tables[window.clone()].to_vec(), false, 0).await {
+                Ok(s) => {
+                    let runs = match trigger {
+                        MinorTrigger::Flush => &MINOR_RUNS_FLUSH,
+                        MinorTrigger::Tick => &MINOR_RUNS_TICK,
+                        MinorTrigger::Reclaim { .. } => &MINOR_RUNS_RECLAIM,
+                    };
+                    runs.fetch_add(1, Relaxed);
+                    tracing::info!(
+                        part_id,
+                        trigger = why,
+                        ?window,
+                        tables_before = tables.len(),
+                        input = crate::human_size(input_bytes),
+                        output = crate::human_size(s.output_bytes),
+                        "minor compaction: {} → {} tables, kept={}, discarded={}",
+                        s.input_tables,
+                        s.output_tables,
+                        s.entries_kept,
+                        s.entries_discarded,
+                    );
+                    if let Err(e) = truncate_unreferenced_row_prefix(part, part_id).await {
+                        tracing::warn!(part_id, "minor compaction: row stream truncate: {e:#}");
+                    }
+                }
+                Err(e) => tracing::error!(part_id, trigger = why, "minor compaction: {e:#}"),
+            }
+        }
+    }
+    metrics
+        .pending_compaction_bytes
+        .store(compute_pending_compaction_bytes(part), Relaxed);
+    refresh_metrics(part);
+    metrics.compact_inflight.store(0, Relaxed);
 }
 
 /// refresh the per-partition dead-data + minor-compact-debt
@@ -2482,7 +2575,7 @@ pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>
 ///   `has_overlap == 1` (post-split CoW-shared SSTs); 0 otherwise. Same
 ///   conservative shape as `pending_compaction_bytes`'s overlap branch.
 /// - `minor_compact_pending_bytes`: Σ `estimated_size` of
-///   `pickup_tables` output when `has_overlap == 0`. 0 when overlap is
+///   the `select_minor` window when `has_overlap == 0`. 0 when overlap is
 ///   set (a major would run instead, accounted for in
 ///   `pending_compaction_bytes`).
 /// - `sst_tombstone_bytes`: left at 0. The MetaBlock counts tombstones
@@ -2524,8 +2617,7 @@ pub(crate) fn refresh_metrics(part: &Rc<RefCell<PartitionData>>) {
     metrics.sst_out_of_range_bytes.store(sst_oor, Relaxed);
 
     let minor_pending: u64 = if overlap == 0 {
-        let picked = pickup_tables(&tbls, 2 * crate::flush_mem_bytes());
-        picked.iter().map(|t| t.estimated_size).sum()
+        minor_window_bytes(&tbls)
     } else {
         0
     };
@@ -2677,102 +2769,6 @@ async fn checkpoint_and_truncate_row_prefix(
     part.borrow().durable_ckpt_vp.set(vp);
     drop(publish);
     truncate_unreferenced_row_prefix(part, part_id).await
-}
-
-/// Which tables a minor compaction merges. Selection only: which row-stream
-/// extents may then be dropped is `truncate_unreferenced_row_prefix`'s question,
-/// answered from what the tables reference, never from their order here.
-pub(crate) fn pickup_tables(tables: &[TableMeta], max_capacity: u64) -> Vec<TableMeta> {
-    if tables.len() < 2 {
-        return vec![];
-    }
-
-    let total_size: u64 = tables.iter().map(|t| t.estimated_size).sum();
-    let head_extent = tables[0].extent_id;
-    let head_size: u64 = tables
-        .iter()
-        .filter(|t| t.extent_id == head_extent)
-        .map(|t| t.estimated_size)
-        .sum();
-    let head_threshold = (HEAD_RATIO * total_size as f64).round() as u64;
-
-    if head_size < head_threshold {
-        let chosen: Vec<TableMeta> = tables
-            .iter()
-            .filter(|t| t.extent_id == head_extent)
-            .take(COMPACT_N)
-            .cloned()
-            .collect();
-        let mut tbls_sorted = tables.to_vec();
-        tbls_sorted.sort_by_key(|t| t.last_seq);
-        let mut chosen_sorted = chosen.clone();
-        chosen_sorted.sort_by_key(|t| t.last_seq);
-        if chosen_sorted.is_empty() {
-            return vec![];
-        }
-
-        let start_seq = chosen_sorted[0].last_seq;
-        let start_idx = tbls_sorted.partition_point(|t| t.last_seq < start_seq);
-        let mut compact_tbls: Vec<TableMeta> = Vec::new();
-        let mut ci = 0usize;
-        let mut ti = start_idx;
-        while ti < tbls_sorted.len() && ci < chosen_sorted.len() && compact_tbls.len() < COMPACT_N {
-            if tbls_sorted[ti].last_seq <= chosen_sorted[ci].last_seq {
-                compact_tbls.push(tbls_sorted[ti].clone());
-                if tbls_sorted[ti].last_seq == chosen_sorted[ci].last_seq {
-                    ci += 1;
-                }
-                ti += 1;
-            } else {
-                break;
-            }
-        }
-        if compact_tbls.len() >= 2 {
-            return compact_tbls;
-        }
-        return vec![];
-    }
-
-    // Size-tiered rule
-    let mut tbls_sorted = tables.to_vec();
-    tbls_sorted.sort_by_key(|t| t.last_seq);
-    let throttle = (COMPACT_RATIO * crate::flush_mem_bytes() as f64).round() as u64;
-    let mut compact_tbls: Vec<TableMeta> = Vec::new();
-    let mut i = 0usize;
-    while i < tbls_sorted.len() {
-        while i < tbls_sorted.len()
-            && tbls_sorted[i].estimated_size < throttle
-            && compact_tbls.len() < COMPACT_N
-        {
-            if i > 0
-                && compact_tbls.is_empty()
-                && tbls_sorted[i].estimated_size + tbls_sorted[i - 1].estimated_size < max_capacity
-            {
-                compact_tbls.push(tbls_sorted[i - 1].clone());
-            }
-            compact_tbls.push(tbls_sorted[i].clone());
-            i += 1;
-        }
-        if !compact_tbls.is_empty() {
-            if compact_tbls.len() == 1 {
-                if i < tbls_sorted.len()
-                    && compact_tbls[0].estimated_size + tbls_sorted[i].estimated_size < max_capacity
-                {
-                    compact_tbls.push(tbls_sorted[i].clone());
-                } else {
-                    compact_tbls.clear();
-                    i += 1;
-                    continue;
-                }
-            }
-            break;
-        }
-        i += 1;
-    }
-    if compact_tbls.len() >= 2 {
-        return compact_tbls;
-    }
-    vec![]
 }
 
 // streaming `do_compact`. The earlier implementation built a
@@ -2963,12 +2959,13 @@ pub(crate) async fn do_compact(
     // 8 MiB bulk read per window, cache-bypassing (scan-resistant). Replaces
     // Stage-1's materialized_for_iteration whole-SST transient residency;
     // peak read-side memory = inputs × one window instead of Σ input bytes.
-    let mut readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers
+    // Newest first, by list position (`tbls` is in list order).
+    let readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers
         .iter()
         .zip(tbls.iter())
+        .rev()
         .map(|(r, t)| (r.clone(), t.last_seq))
         .collect();
-    readers_with_meta.sort_by_key(|r| std::cmp::Reverse(r.1));
 
     let iters: Vec<AsyncTableIterator> = readers_with_meta
         .iter()
@@ -3044,11 +3041,10 @@ pub(crate) async fn do_compact(
     // start a fresh builder.
     let chunk_keys = compaction_chunk_keys(
         readers.iter().map(|r| r.num_entries).sum(),
-        readers.iter().map(|r| r.estimated_size()).sum(),
+        tbls.iter().map(|t| t.len).sum(),
         max_chunk as u64,
     );
     let mut current_builder = SstBuilder::new(compact_vp_eid, compact_vp_off, chunk_keys);
-    let mut current_size: usize = 0;
     let mut chunk_last_seq: u64 = 0;
     let mut prev_user_key: Option<Vec<u8>> = None;
     let mut entries_kept = 0usize;
@@ -3134,8 +3130,13 @@ pub(crate) async fn do_compact(
             }
         }
 
+        // Cut on encoded bytes — the unit minor selection measures tables in
+        // (`TableMeta.len`); `sst_entry_bytes` approximates this entry's
+        // encoding (over by its shared prefix, so a cut comes slightly early).
         let entry_size = crate::sst_entry_bytes(raw_key.len(), raw_value.len());
-        if current_size + entry_size > max_chunk && !current_builder.is_empty() {
+        if current_builder.encoded_len() + entry_size as u64 > max_chunk as u64
+            && !current_builder.is_empty()
+        {
             // Finalize this chunk inline. Intermediate chunks carry NO
             // discards; only the final chunk after the loop attaches the
             // aggregated discard map (matches the earlier behaviour where
@@ -3153,11 +3154,9 @@ pub(crate) async fn do_compact(
                 &mut new_readers,
             )
             .await?;
-            current_size = 0;
             chunk_last_seq = 0;
         }
-        // After the emit: this entry belongs to the next chunk, and a chunk's
-        // `last_seq` orders the table list (`sort_tables_by_seq`).
+        // After the emit: this entry belongs to the next chunk.
         if raw_ts > chunk_last_seq {
             chunk_last_seq = raw_ts;
         }
@@ -3169,7 +3168,6 @@ pub(crate) async fn do_compact(
             }
         }
         current_builder.add(&raw_key, raw_op, &raw_value, raw_expires);
-        current_size += entry_size;
         entries_kept += 1;
 
         // cooperative yield to keep the compio runtime responsive
@@ -3252,19 +3250,7 @@ pub(crate) async fn do_compact(
         let p = part.borrow();
         let mut tables = p.tables.clone();
         let mut sst_readers = p.sst_readers.clone();
-        // The outputs take their place by `last_seq`, not by list position:
-        // see `sort_tables_by_seq`. Appending them at the newest end instead
-        // broke reads when a flush completed during the compaction's awaits
-        // (that newer SST sat in front of the output and a Get walked the
-        // output first — the chaos fence+flush data-loss bug); inserting at
-        // the oldest input's LIST slot broke them after a merge, whose list is
-        // not in seq order.
-        remove_compacted_tables(&mut tables, &mut sst_readers, &compact_keys);
-        for (tbl_meta, reader) in new_readers {
-            tables.push(tbl_meta);
-            sst_readers.push(reader);
-        }
-        crate::sort_tables_by_seq(&mut tables, &mut sst_readers);
+        splice_compaction_outputs(&mut tables, &mut sst_readers, &compact_keys, new_readers)?;
         let now = p.durable_ckpt_vp.get();
         let base = compaction_checkpoint_cursor(
             now,
@@ -3305,20 +3291,41 @@ pub(crate) async fn do_compact(
     })
 }
 
-pub(crate) fn remove_compacted_tables(
+/// Put a compaction's outputs where its inputs were. The inputs must be one
+/// contiguous run of the list: list order is every key's recency order, so
+/// the outputs then stay newer than every table before the run and older than
+/// every table after it — including a flush that committed during the
+/// compaction (it appended at the end). Placing outputs by `last_seq` broke
+/// after a merge: the sources' seq counters are independent, and an output
+/// whose seq came from the other side tied the next table of its own side and
+/// sorted after it (`system_merge_minor_tie_order`). Appending at the end broke
+/// on that concurrent flush (the chaos fence+flush data-loss bug).
+pub(crate) fn splice_compaction_outputs(
     tables: &mut Vec<TableMeta>,
     sst_readers: &mut Vec<Arc<SstReader>>,
-    compact_keys: &HashSet<(u64, u64)>,
-) {
-    let mut i = 0;
-    while i < tables.len() {
-        if compact_keys.contains(&tables[i].loc()) {
-            tables.remove(i);
-            sst_readers.remove(i);
-        } else {
-            i += 1;
-        }
+    inputs: &HashSet<(u64, u64)>,
+    outputs: Vec<(TableMeta, Arc<SstReader>)>,
+) -> Result<()> {
+    let positions: Vec<usize> = tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| inputs.contains(&t.loc()))
+        .map(|(i, _)| i)
+        .collect();
+    let (Some(&first), Some(&last)) = (positions.first(), positions.last()) else {
+        anyhow::bail!("compaction inputs are no longer listed");
+    };
+    if positions.len() != inputs.len() || last + 1 - first != positions.len() {
+        anyhow::bail!(
+            "compaction inputs are not one contiguous run of the table list \
+             (listed at {positions:?}, {} inputs)",
+            inputs.len()
+        );
     }
+    let (metas, readers): (Vec<TableMeta>, Vec<Arc<SstReader>>) = outputs.into_iter().unzip();
+    tables.splice(first..=last, metas);
+    sst_readers.splice(first..=last, readers);
+    Ok(())
 }
 
 /// classify a `run_gc` failure into a cooldown duration. Scans
@@ -5780,8 +5787,74 @@ mod fence_classifier_tests {
 }
 
 #[cfg(test)]
+mod splice_tests {
+    use super::splice_compaction_outputs;
+    use crate::sstable::{SstBuilder, SstReader};
+    use crate::{key_with_ts, TableMeta};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn t(offset: u64, last_seq: u64) -> (TableMeta, Arc<SstReader>) {
+        let mut b = SstBuilder::new(0, 0, 1);
+        b.add(&key_with_ts(b"k", last_seq), 1, b"v", 0);
+        let reader = SstReader::from_bytes(bytes::Bytes::from(b.finish())).expect("reader");
+        let meta = TableMeta { extent_id: 1, offset, len: 1, estimated_size: 1, last_seq };
+        (meta, Arc::new(reader))
+    }
+
+    fn list(ts: &[(TableMeta, Arc<SstReader>)]) -> (Vec<TableMeta>, Vec<Arc<SstReader>>) {
+        ts.iter().cloned().unzip()
+    }
+
+    fn keys(ts: &[(TableMeta, Arc<SstReader>)]) -> HashSet<(u64, u64)> {
+        ts.iter().map(|(m, _)| m.loc()).collect()
+    }
+
+    fn offsets(tables: &[TableMeta]) -> Vec<u64> {
+        tables.iter().map(|m| m.offset).collect()
+    }
+
+    /// After a merge: the window `[V0, S1, S2]` takes S2's seq, which ties V1
+    /// (a newer table of V0's side). The output stays in front of V1.
+    #[test]
+    fn a_tied_output_stays_in_its_window_slot() {
+        let all = [t(1, 40), t(2, 50), t(3, 100), t(4, 100), t(5, 101)];
+        let (mut tables, mut readers) = list(&all);
+        let out = t(9, 100);
+        splice_compaction_outputs(&mut tables, &mut readers, &keys(&all[..3]), vec![out.clone()])
+            .expect("splice");
+        assert_eq!(offsets(&tables), vec![9, 4, 5]);
+        assert!(Arc::ptr_eq(&readers[0], &out.1) && Arc::ptr_eq(&readers[1], &all[3].1));
+    }
+
+    /// A flush that committed during the compaction appended at the end; the
+    /// outputs go to the window, not after it.
+    #[test]
+    fn outputs_stay_older_than_a_concurrent_flush() {
+        let all = [t(1, 10), t(2, 20), t(3, 30), t(4, 40)];
+        let (mut tables, mut readers) = list(&all);
+        let outs = vec![t(8, 15), t(9, 20)];
+        splice_compaction_outputs(&mut tables, &mut readers, &keys(&all[..2]), outs)
+            .expect("splice");
+        assert_eq!(offsets(&tables), vec![8, 9, 3, 4]);
+        assert_eq!(readers.len(), tables.len());
+    }
+
+    #[test]
+    fn a_window_that_is_not_one_run_is_refused() {
+        let all = [t(1, 10), t(2, 20), t(3, 30)];
+        let (mut tables, mut readers) = list(&all);
+        let window: HashSet<(u64, u64)> = [all[0].0.loc(), all[2].0.loc()].into_iter().collect();
+        assert!(splice_compaction_outputs(&mut tables, &mut readers, &window, vec![t(9, 30)]).is_err());
+        assert_eq!(offsets(&tables), vec![1, 2, 3], "nothing changed");
+        let gone: HashSet<(u64, u64)> = [(1, 77)].into_iter().collect();
+        assert!(splice_compaction_outputs(&mut tables, &mut readers, &gone, vec![]).is_err());
+    }
+}
+
+#[cfg(test)]
 mod compaction_truncate_tests {
-    use super::{pickup_tables, row_keep_set, row_truncate_point};
+    use super::{row_keep_set, row_truncate_point};
     use crate::TableMeta;
     use std::collections::HashSet;
 
@@ -5834,8 +5907,8 @@ mod compaction_truncate_tests {
             t(11, 7, 300 * MB),
             t(12, 8, 10 * MB),
         ];
-        let picked = pickup_tables(&tables, 2 * crate::flush_mem_bytes());
-        assert_eq!(picked.len(), 2, "precondition: the head rule takes extent 10's tables");
+        // A reclaim of extent 10.
+        let picked = tables[0..2].to_vec();
         let live = live_after(&tables, &picked, 12);
         let cut = row_truncate_point(&row_stream, &live);
         assert_eq!(dropped_but_live(&row_stream, cut, &live), Vec::<u64>::new());
@@ -5848,8 +5921,7 @@ mod compaction_truncate_tests {
     fn a_partly_consumed_head_extent_is_kept() {
         let mut tables: Vec<TableMeta> = (0..8).map(|i| t(10, i + 1, 10 * MB)).collect();
         tables.push(t(11, 100, 4 * 1024 * MB));
-        let picked = pickup_tables(&tables, 2 * crate::flush_mem_bytes());
-        assert!(!picked.is_empty() && picked.len() < 8, "precondition");
+        let picked = tables[0..5].to_vec();
         let live = live_after(&tables, &picked, 11);
         assert_eq!(row_truncate_point(&[10, 11], &live), None);
     }
@@ -5858,8 +5930,7 @@ mod compaction_truncate_tests {
     fn a_fully_consumed_head_extent_is_dropped() {
         let mut tables: Vec<TableMeta> = (0..3).map(|i| t(10, i + 1, 10 * MB)).collect();
         tables.push(t(11, 100, 4 * 1024 * MB));
-        let picked = pickup_tables(&tables, 2 * crate::flush_mem_bytes());
-        assert_eq!(picked.len(), 3);
+        let picked = tables[0..3].to_vec();
         let live = live_after(&tables, &picked, 12);
         assert_eq!(row_truncate_point(&[10, 11, 12], &live), Some(11));
     }

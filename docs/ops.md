@@ -1258,6 +1258,58 @@ later and `GC: punched extent N, moved 0 entries` ~4 min after that. No split
 candidate at any point. Before the fix this partition kept `est_live` at
 16.88 GiB with no candidate of any kind, indefinitely.
 
+### Minor compaction: the partition compacts its own tables
+
+Nothing outside the PS asks for a minor compaction. Every flush asks for one
+when the exploring policy (HBase's) finds a window of 3-10 consecutive tables,
+and the 5-7 s tick asks again; a row-stream head extent pinned by an old table
+is rewritten once its live tables are under 30% of it. Tuning (all `autumn-ps`
+flags): `--compact-min-files 3`, `--compact-max-files 10`, `--compact-ratio
+1.2`, `--compact-min-size-bytes 128MiB`, `--compact-large-size-bytes 128MiB`
+(tables this large never enter a minor window), `--compact-blocking-files 16`.
+Outputs are cut at 2 × the flush size, so a partition keeps at least one table
+per 512 MiB of data whatever compacts it. A partition of small SSTs (large
+values in the log stream) stays at a handful of tables; one of flush-sized
+tables (4K inline values, 256 MiB SSTs) keeps one table per flush until a
+major — merging those into full tables cost 4K writes ~15%, so it is not done.
+
+Check it on a scratch cluster with 4 MiB memtables, so 4 KiB inline writes
+flush every ~1000 keys (each table ~4 MiB, under this flush size's window
+bound of 0.6 × 8 MiB):
+
+```bash
+AUTUMN_DATA_ROOT=/data05/<scratch> AUTUMN_EXTENT_BASE_PORT=21000 \
+  AUTUMN_PS_FLUSH_MEM_BYTES=$((4<<20)) bash cluster.sh reset 3
+AO=(autumn-op --manager 127.0.0.1:9001 --cluster-secret-file <DATA_ROOT>/cluster.secret)
+AC=(autumn-client --manager 127.0.0.1:9001)
+
+"${AC[@]}" perf-check --threads 16 --duration 30 --size 4096 --partitions 8 --pipeline-depth 8
+grep 'minor compaction:' /tmp/autumn-rs-logs/ps.log | tail -3
+"${AO[@]}" info --part <PART> | grep -c 'sst\['     # tables listed now
+```
+
+Large values (above 4 KiB) go to the log stream and add only ~60 B to the
+memtable, so `put` of big files does not make flushes.
+
+Expected: `minor compaction: N → M tables` lines with `trigger="flush"` (or
+`tick`) while the writes run, every one with M < N (an `N → N` line is a
+selection bug); the 4 MiB flush tables end up mostly in 8 MiB tables (the
+output cut at this flush size), plus merge remainders between 4.8 and 8 MiB
+that stay until a major (measured: 317 lines, all `3 → 2`, in a 30 s run; a
+partition with 341 MB of SSTs listed 41 tables). `blocking` in a line means a
+window was forced at 16 tables.
+
+After upgrading from a build that ordered tables by seq: a partition
+merged under it and minor-compacted since may hold a checkpoint whose table
+order lets an older copy shadow a newer one (a tied seq after the merge). The
+new build keeps the stored order, so run `autumn-op compact <PART>` (a major
+rewrites every table) on partitions merged before the upgrade.
+
+The reclaim (`trigger="reclaim"`) shows up only once a row extent is
+sealed with an old table in it, so on a 16 GiB extent it is rare; the
+automated check is `cargo test -p autumn-manager --test
+system_minor_compaction_triggers`.
+
 ### Per-partition size in `autumn-op info`
 
 The cluster overview's per-partition size = the manager's authoritative

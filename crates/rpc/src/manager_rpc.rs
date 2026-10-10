@@ -1160,8 +1160,8 @@ pub struct PartitionLoad {
     /// `open_tail_dead_bytes`.
     pub gc_debt_bytes: u64,
     /// bytes that the next compact tick would feed into `do_compact`
-    /// (overlap-tagged tables when has_overlap == 1, else
-    /// pickup_tables(...)). "Major-compaction debt".
+    /// (overlap-tagged tables when has_overlap == 1, else the PS's
+    /// current minor window). "Major-compaction debt".
     pub pending_compaction_bytes: u64,
     /// 1 while `background_gc_loop` is inside `run_gc`, else 0.
     pub gc_inflight: u32,
@@ -1185,10 +1185,8 @@ pub struct PartitionLoad {
     /// partition's current `rg` range (only > 0 when `has_overlap == 1`,
     /// i.e. post-split CoW-shared SSTables haven't been compacted yet).
     pub sst_out_of_range_bytes: u64,
-    /// total bytes the next *minor* compact tick would feed into
-    /// `do_compact` (size-tiered + head-extent pickup output). Distinct
-    /// from `pending_compaction_bytes` which captures the major-compact
-    /// pickup. Both can be non-zero simultaneously.
+    /// total bytes of the minor window the PS's exploring policy picks now
+    /// (0 with `has_overlap == 1`).
     pub minor_compact_pending_bytes: u64,
     /// number of sealed log_stream extents currently in
     /// `extent_ids[..len-1]` (informational; helps OP correlate
@@ -1295,12 +1293,8 @@ pub const POLICY_KIND_COMPACT: u8 = POLICY_KIND_MAJOR_COMPACT;
 /// qps_cold=[…] size_ratio=N size_hot=[…] size_cold=[…]`.
 /// `same_ps = true` always (the advisory is by definition per-PS).
 pub const POLICY_KIND_HOT_COLD: u8 = 4;
-/// minor-compaction debt advisory. PS-local `pickup_tables`
-/// would emit a non-empty set on the next tick and the partition's
-/// `minor_compact_pending_bytes` exceeds the configured low-water
-/// threshold over `required_buckets` consecutive buckets.
-/// `primary_part_id` = partition; `secondary_part_id = 0`;
-/// `reason` carries the byte volume.
+/// Retired: minor compaction is the PS's own (after every flush). The value
+/// stays reserved; no manager emits it.
 pub const POLICY_KIND_MINOR_COMPACT: u8 = 5;
 /// EC-conversion advisory. A sealed log/row stream extent has
 /// not been EC-converted yet AND its `sealed_length` exceeds the

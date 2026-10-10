@@ -2,8 +2,8 @@
 //! against the log as it is when it publishes: here the log rolls while the
 //! compaction runs, after it fetched its extent list.
 //!
-//! The minor compaction is the PS's own auto-trim (more than 32 SSTs). Own
-//! test binary: the compaction hold is process-global.
+//! The minor compaction is the PS's own, requested by the flush that makes
+//! the third table. Own test binary: the compaction hold is process-global.
 
 mod support;
 
@@ -18,8 +18,8 @@ use autumn_stream::{ConnPool, StreamClient};
 use support::*;
 
 const PART: u64 = 1321;
-/// One past the auto-trim threshold (`MAX_SST_BEFORE_AUTO_COMPACT`).
-const FLUSHES: usize = 33;
+/// The minor policy's `min_files`.
+const FLUSHES: usize = 3;
 
 async fn stream_client(mgr_addr: std::net::SocketAddr) -> Rc<StreamClient> {
     StreamClient::connect(
@@ -89,7 +89,7 @@ fn a_minor_compaction_moves_a_cursor_at_a_sealed_end() {
                 compaction_held_count() > held
             })
             .await,
-            "the auto-trim never started"
+            "the minor compaction never started"
         );
         let (flushed, tables_before) = last_checkpoint(&sc, meta).await;
         let sealed = *extents(&sc, log).await.last().unwrap();
@@ -118,7 +118,7 @@ fn a_minor_compaction_moves_a_cursor_at_a_sealed_end() {
             }
             assert!(
                 started.elapsed() < Duration::from_secs(60),
-                "the auto-trim never published"
+                "the minor compaction never published"
             );
             compio::time::sleep(Duration::from_millis(100)).await;
         };

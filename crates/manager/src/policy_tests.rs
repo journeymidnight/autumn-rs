@@ -6,13 +6,13 @@ use crate::store::MetadataState;
 use autumn_rpc::manager_rpc::{
     PartitionLoad,
     POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE,
-    POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_SPLIT,
+    POLICY_KIND_REBALANCE, POLICY_KIND_SPLIT,
 };
 
 use crate::policy::{
     ComputeArgs, PolicyEngine, COMPACT_COOLDOWN_SEC, COMPACT_PENDING_HIGH, EC_MIN_EXTENT_BYTES,
     GC_COOLDOWN_SEC, GC_DEBT_HIGH, MERGE_COOLDOWN_SEC, MERGE_QPS_LOW, MERGE_SIZE_LOW,
-    MINOR_COMPACT_COOLDOWN_SEC, MINOR_COMPACT_PENDING_HIGH, POLICY_BUCKET_SEC,
+    POLICY_BUCKET_SEC,
     POLICY_REQUIRED_BUCKETS, SPLIT_BW_HIGH, SPLIT_COOLDOWN_SEC, SPLIT_IMMFULL_HIGH,
     SPLIT_LSM_HARD, SPLIT_QPS_HIGH, SPLIT_SIZE_MIN,
 };
@@ -1004,7 +1004,7 @@ fn hot_cold_advisory_emits_policy_candidate_for_client_info() {
 }
 
 // ===========================================================================
-// minor compact + EC advisory tests
+// EC advisory tests
 // ===========================================================================
 
 fn mk_stream(state: &mut MetadataState, sid: u64, ec: (u32, u32), extent_ids: &[u64]) {
@@ -1037,99 +1037,6 @@ fn mk_extent(state: &mut MetadataState, eid: u64, sealed_length: u64, ec_convert
             parity_disks: vec![],
             ec_converted,
         },
-    );
-}
-
-/// minor compact advisory fires when sustained
-/// `minor_compact_pending_bytes` exceeds threshold across the window.
-#[test]
-fn minor_compact_fires_when_sustained_above_threshold() {
-    let mut eng = PolicyEngine::default();
-    let now = 10_000;
-    fill_window(
-        &mut eng,
-        500,
-        POLICY_REQUIRED_BUCKETS,
-        PartitionLoad {
-            part_id: 500,
-            minor_compact_pending_bytes: MINOR_COMPACT_PENDING_HIGH * 2,
-            ..Default::default()
-        },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
-    );
-    let out = eng.compute_maintenance_advisory(now);
-    assert_eq!(
-        out.len(),
-        1,
-        "expected one MINOR_COMPACT candidate: {out:?}"
-    );
-    assert_eq!(out[0].kind, POLICY_KIND_MINOR_COMPACT);
-    assert_eq!(out[0].primary_part_id, 500);
-    assert!(
-        out[0].size_bytes >= MINOR_COMPACT_PENDING_HIGH,
-        "size_bytes carries the recent pending volume"
-    );
-}
-
-/// minor compact advisory is SUPPRESSED when the latest bucket has
-/// `minor_compact_pending_bytes == 0` (i.e. `pickup_tables` had nothing
-/// to do — common-sense filter "don't suggest minor compact when there's
-/// no minor compact work").
-#[test]
-fn minor_compact_suppressed_when_latest_bucket_empty() {
-    let mut eng = PolicyEngine::default();
-    let now = 10_000;
-    // Fill the window with a HIGH-ish historic value then a 0 most-recent.
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
-    fill_window(
-        &mut eng,
-        501,
-        POLICY_REQUIRED_BUCKETS - 1,
-        PartitionLoad {
-            part_id: 501,
-            minor_compact_pending_bytes: MINOR_COMPACT_PENDING_HIGH * 2,
-            ..Default::default()
-        },
-        base,
-    );
-    // Latest bucket = 0 → filter trips at "recent.minor_compact_pending_bytes > 0".
-    eng.metrics.entry(501).or_default().push(
-        base + POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
-        PartitionLoad {
-            part_id: 501,
-            minor_compact_pending_bytes: 0,
-            ..Default::default()
-        },
-    );
-    let out = eng.compute_maintenance_advisory(now);
-    assert!(
-        out.iter().all(|c| c.kind != POLICY_KIND_MINOR_COMPACT),
-        "minor advisory must not fire when latest pending = 0: {out:?}"
-    );
-}
-
-/// minor compact respects its own cooldown — distinct from major.
-#[test]
-fn minor_compact_respects_cooldown() {
-    let mut eng = PolicyEngine::default();
-    let now = 10_000;
-    fill_window(
-        &mut eng,
-        502,
-        POLICY_REQUIRED_BUCKETS,
-        PartitionLoad {
-            part_id: 502,
-            minor_compact_pending_bytes: MINOR_COMPACT_PENDING_HIGH * 2,
-            // Just-completed compact → cooldown active.
-            last_compact_at: now - MINOR_COMPACT_COOLDOWN_SEC + 10,
-            ..Default::default()
-        },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
-    );
-    let out = eng.compute_maintenance_advisory(now);
-    assert!(
-        out.iter().all(|c| c.kind != POLICY_KIND_MINOR_COMPACT),
-        "in cooldown — must not fire: {out:?}"
     );
 }
 

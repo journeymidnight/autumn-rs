@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use autumn_partition_server::background::set_minor_compaction_paused;
+use autumn_partition_server::compact_policy::{set_minor_policy, MinorPolicy};
 use autumn_partition_server::{replay_read_bytes, PartitionServer};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::partition_rpc::{TableLocations, CODE_OK};
@@ -113,6 +115,16 @@ async fn put_bulk(ps: &RpcClient, part_id: u64) {
     }
 }
 
+/// Every minor window faces the ratio test, so the bulk table stays out of one.
+/// Process-wide and first-set-wins, so each test sets it before any partition
+/// opens.
+fn minor_policy() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        set_minor_policy(MinorPolicy { min_size: 1, ..Default::default() }).expect("policy")
+    });
+}
+
 /// Restart the PS on a fresh address, wait until the partition serves, and
 /// return how many WAL bytes its recovery replayed. Also checks every bulk key.
 fn restart_and_measure_replay(c: &Cluster, part_id: u64) -> u64 {
@@ -164,6 +176,7 @@ async fn last_checkpoint(mgr_addr: SocketAddr, meta_stream: u64) -> TableLocatio
 
 #[test]
 fn graceful_restart_replays_only_past_the_checkpoint() {
+    minor_policy();
     let part_id = 1101;
     let c = start_cluster(part_id);
     let ps_addr = pick_addr();
@@ -193,6 +206,7 @@ fn graceful_restart_replays_only_past_the_checkpoint() {
 
 #[test]
 fn compaction_never_moves_the_checkpoint_back() {
+    minor_policy();
     let part_id = 1102;
     let c = start_cluster(part_id);
     let ps_addr = pick_addr();
@@ -202,27 +216,29 @@ fn compaction_never_moves_the_checkpoint_back() {
 
     let (flushed, trimmed) = compio::runtime::Runtime::new().unwrap().block_on(async {
         let ps = RpcClient::connect(ps_addr).await.expect("ps");
-        // 32 small SSTs: one short of the PS's own auto-trim trigger (> 32).
-        for i in 0..32 {
+        // Three small SSTs, then the newest holding the bulk. Its flush
+        // checkpoint names the tail; the minor compaction then takes the
+        // three OLDER small tables only (the bulk one fails the ratio).
+        set_minor_compaction_paused(true);
+        for i in 0..3 {
             ps_put(&ps, part_id, format!("small-{i:02}").as_bytes(), b"s").await;
             ps_flush(&ps, part_id).await;
         }
-        // The 33rd, newest SST holds the bulk. Its flush checkpoint names the
-        // tail; the auto-trim then compacts the OLDEST small tables only.
         put_bulk(&ps, part_id).await;
         ps_flush(&ps, part_id).await;
         let flushed = last_checkpoint(c.mgr_addr, c.meta_stream).await;
-        assert_eq!(flushed.locs.len(), 33, "expected 33 SSTs before the trim");
+        assert_eq!(flushed.locs.len(), 4, "expected 4 SSTs before the minor compaction");
+        set_minor_compaction_paused(false);
 
         let started = Instant::now();
         let trimmed = loop {
             let ck = last_checkpoint(c.mgr_addr, c.meta_stream).await;
-            if ck.locs.len() < 33 {
+            if ck.locs.len() < 4 {
                 break ck;
             }
             assert!(
                 started.elapsed() < Duration::from_secs(60),
-                "the auto-trim compaction never ran"
+                "the minor compaction never ran"
             );
             compio::time::sleep(Duration::from_millis(500)).await;
         };

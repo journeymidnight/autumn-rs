@@ -57,6 +57,7 @@ struct Args {
     max_extent_size_bytes: Option<u64>,
     flush_mem_bytes: Option<u64>,
     deletion_compact_check_secs: Option<u64>,
+    minor_policy: autumn_partition_server::compact_policy::MinorPolicy,
     shutdown_timeout_ms: Option<u64>,
     major_compact_parallelism: Option<usize>,
     gc_parallelism: Option<usize>,
@@ -129,6 +130,7 @@ fn parse_args() -> Args {
     let mut max_extent_size_bytes: Option<u64> = None;
     let mut flush_mem_bytes: Option<u64> = None;
     let mut deletion_compact_check_secs: Option<u64> = None;
+    let mut minor_policy = autumn_partition_server::compact_policy::MinorPolicy::default();
     let mut shutdown_timeout_ms: Option<u64> = None;
     let mut major_compact_parallelism: Option<usize> = None;
     let mut gc_parallelism: Option<usize> = None;
@@ -269,6 +271,33 @@ fn parse_args() -> Args {
                         .parse()
                         .expect("--deletion-compact-check-secs u64 seconds"),
                 );
+            }
+            "--compact-min-files" => {
+                i += 1;
+                minor_policy.min_files = args[i].parse().expect("--compact-min-files usize");
+            }
+            "--compact-max-files" => {
+                i += 1;
+                minor_policy.max_files = args[i].parse().expect("--compact-max-files usize");
+            }
+            "--compact-ratio" => {
+                i += 1;
+                minor_policy.ratio = args[i].parse().expect("--compact-ratio f64");
+            }
+            "--compact-min-size-bytes" => {
+                i += 1;
+                minor_policy.min_size =
+                    args[i].parse().expect("--compact-min-size-bytes u64 bytes");
+            }
+            "--compact-large-size-bytes" => {
+                i += 1;
+                minor_policy.large_size =
+                    args[i].parse().expect("--compact-large-size-bytes u64 bytes");
+            }
+            "--compact-blocking-files" => {
+                i += 1;
+                minor_policy.blocking_files =
+                    args[i].parse().expect("--compact-blocking-files usize");
             }
             "--shutdown-timeout-ms" => {
                 i += 1;
@@ -438,9 +467,21 @@ fn parse_args() -> Args {
                 eprintln!("                       [default: 16 GiB, clamp 1-64 GiB]. Bigger =");
                 eprintln!("                       fewer extents = less manager metadata pressure.");
                 eprintln!("  --flush-mem-bytes <N>  Memtable size = SST size a flush writes;");
-                eprintln!("                       compaction sizes follow it [default: 256 MiB,");
-                eprintln!("                       clamp 4 KiB-1 GiB]. Tests shrink it to reach");
-                eprintln!("                       many-SST shapes with little data.");
+                eprintln!("                       a compaction output is cut at 2x it [default:");
+                eprintln!("                       256 MiB, clamp 4 KiB-1 GiB].");
+                eprintln!("  --compact-min-files <N> / --compact-max-files <N>");
+                eprintln!("                       Tables a minor compaction merges [3 / 10]");
+                eprintln!("  --compact-ratio <F>  A table joins a minor window only if it is at");
+                eprintln!("                       most F x the rest of the window [1.2]");
+                eprintln!("  --compact-min-size-bytes <N>");
+                eprintln!("                       A window smaller than this skips the ratio");
+                eprintln!("                       test [128 MiB]");
+                eprintln!("  --compact-large-size-bytes <N>");
+                eprintln!("                       Tables this large never enter a minor window");
+                eprintln!("                       (a major or head-extent reclaim rewrites them) [128 MiB]");
+                eprintln!("  --compact-blocking-files <N>");
+                eprintln!("                       At this many tables a window is merged even");
+                eprintln!("                       when none is in ratio [16]");
                 eprintln!("  --deletion-compact-check-secs <N>");
                 eprintln!("                       How often each partition checks whether its");
                 eprintln!("                       SSTs hold >= 10000 tombstones and >= 30% of");
@@ -503,6 +544,7 @@ fn parse_args() -> Args {
         max_extent_size_bytes,
         flush_mem_bytes,
         deletion_compact_check_secs,
+        minor_policy,
         shutdown_timeout_ms,
         major_compact_parallelism,
         gc_parallelism,
@@ -571,6 +613,10 @@ fn apply_ps_tunables(args: &Args) {
             eprintln!("--deletion-compact-check-secs {n}: must be 1-86400");
             std::process::exit(2);
         }
+    }
+    if let Err(e) = ps::compact_policy::set_minor_policy(args.minor_policy) {
+        eprintln!("--compact-*: {e}");
+        std::process::exit(2);
     }
     if let Some(n) = args.shutdown_timeout_ms {
         ps::set_shutdown_timeout_ms(n);

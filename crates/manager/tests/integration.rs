@@ -841,8 +841,9 @@ fn compaction_merges_small_tables() {
 
         let ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
 
-        // Write 3 values, each followed by an explicit flush.
-        for i in 0u8..3 {
+        // Write 2 values, each followed by an explicit flush (a third table
+        // would start the partition's own minor compaction).
+        for i in 0u8..2 {
             ps_put(
                 &ps,
                 621,
@@ -888,7 +889,7 @@ fn compaction_merges_small_tables() {
         let locs_after = decode_last_table_locations(&meta_bytes_after);
 
         // All keys must still be readable after compaction.
-        for i in 0u8..3 {
+        for i in 0u8..2 {
             let resp = ps_get(&ps, 621, format!("key-{:02}", i).as_bytes()).await;
             assert_eq!(
                 resp.value.len(),

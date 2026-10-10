@@ -517,17 +517,14 @@ better after its source gave up `rebalance_gap_threshold` partitions
 (a full cpuset PS beside a busier capacity-unknown one).
 
 **Actuation cooldown floors (rebalance + compaction).** `decide_actions` floors the
-actuation cooldown of rebalance and of BOTH compact kinds at a non-configurable 60 s
-(`REBALANCE_MIN_ACTUATION_COOLDOWN_SEC` / `COMPACT_MIN_ACTUATION_COOLDOWN_SEC`). Both
-compact kinds, because a major and a minor candidate actuate the identical `compact`
-op. Advisory-side cooldowns only gate EMISSION, and an emitted candidate lingers in
+actuation cooldown of rebalance and of major compaction at a non-configurable 60 s
+(`REBALANCE_MIN_ACTUATION_COOLDOWN_SEC` / `COMPACT_MIN_ACTUATION_COOLDOWN_SEC`). Advisory-side cooldowns only gate EMISSION, and an emitted candidate lingers in
 `advisory_cache` for a whole 60 s policy-tick window while the loop ticks every
 `interval_sec` (min 2 s) — so a policy with `cooldown_sec = 0` would re-actuate the
 same cached candidate ~30 times per window: a partition-reopen storm for rebalance, a
 repeated full-SST rewrite for compaction. For compaction the floor is the only guard
 on the `unblocking_compact` path, which does not suppress on `compact_cooldown_sec` (it
-keys on a FLAG, not a debt level). The two compact kinds keep separate cooldown keys,
-so a partition with both rows is compacted at most twice per floor window. Both floors
+keys on a FLAG, not a debt level). Both floors
 sit below every preset's `cooldown_sec` (120-240 s), so they can only catch a
 misconfiguration.
 
@@ -1415,10 +1412,15 @@ can't catch a panic.
 
 `policy_tick_loop` (leader-only, every `POLICY_BUCKET_SEC = 60 s`) reads per-partition
 metrics from `MSG_REPORT_PARTITION_LOAD` aggregations and rebuilds `advisory_cache`
-(the ONLY job — the manager is pure mechanism; it never self-dispatches). Emits 9 kinds
-(`POLICY_KIND_*`, wire-stable append-only): split / merge / gc / major_compact / minor
-_compact / ec / rebalance / repair / scrub (the last two from extent state and
-the clock, not partition metrics — see "Extent repair" and "Scrub"). `handle_get_policy_candidates` and `handle_get_partition
+(the ONLY job — the manager is pure mechanism; it never self-dispatches). Emits 8 kinds
+(`POLICY_KIND_*`, wire-stable append-only): split / merge / gc / major_compact / ec /
+rebalance / repair / scrub (the last two from extent state and the clock, not
+partition metrics — see "Extent repair" and "Scrub"). `POLICY_KIND_MINOR_COMPACT`
+(5) is no longer emitted: minor compaction is the PS's own, after every flush
+(partition-server CLAUDE.md, "Minor compaction"). Its advisory dispatched
+`compact`, which the PS runs as a MAJOR, and its 512 MiB window-bytes bar was
+out of reach of partitions whose SSTs are small, so it either rewrote everything
+or never fired. `handle_get_policy_candidates` and `handle_get_partition
 _detail` are leader-gated (a follower's metrics are empty).
 
 **Metrics window.** `PartitionMetricsWindow::push_with_cap_and_bucket` snaps `ts` to
@@ -1537,8 +1539,7 @@ persisted):**
 | `MERGE_COOLDOWN_SEC` | 21600 (6 h) | |
 | `GC_DEBT_HIGH` | 1 GiB | GC advisory — AND the per-extent absolute floor selection uses. Both manager paths build their `MaintenanceReq` through `maintenance_req_for_submitted_op`, which fills `gc_dead_bytes_high` (and `gc_stream_debt`) from this value for an AUTO_GC request that names no knobs — so the advisory and the selection judge on the same number. FORCE_GC carries the spec verbatim and the PS Force arm reads neither field. Before that they did not: the advisory fired on absolute dead bytes and selection asked for a ratio, and GC answered "no eligible extents" every cooldown. |
 | `COMPACT_PENDING_HIGH` | 4 GiB | major-compact advisory (BACKLOG); SETTLE has no threshold — any unsettled delete, once none new for the window |
-| `MINOR_COMPACT_PENDING_HIGH` | 512 MiB | minor-compact advisory |
-| `GC/COMPACT_COOLDOWN_SEC` | 300 | ; `MINOR_COMPACT_COOLDOWN_SEC` 120 |
+| `GC/COMPACT_COOLDOWN_SEC` | 300 | |
 | `EC_MIN_EXTENT_BYTES` | 64 MiB | below this, EC's encode+fanout costs outweigh savings |
 | `HOT_COLD_RATIO` / `_SIZE_RATIO` | 10 | hot/cold spread |
 | `HOT_COLD_MIN_HOT_QPS` | 10 000 | ; `_MIN_HOT_SIZE_BYTES` 25 GiB |
