@@ -74,9 +74,12 @@ seconds after promotion before heartbeating the successor. This is inside
 the promised ten-second grace. It failed with `ps 1 not registered`.
 Changing only `or_insert(now)` to `insert(id, now)` made the same probe pass.
 
-The probe and candidate were diagnostic only and were removed from the worktree.
-The deployed image still has this bug. It is tracked as
-`BUG-MANAGER-STANDBY-HEARTBEAT-GRACE` in `feature_list.md`. Evidence:
+Fixed after this report (not yet deployed): replay replaces the clocks with a
+fresh one per replayed PS, which also drops a clock the standby still held for a
+PS the old leader had evicted. Regression test:
+`ps_members_etcd::a_standby_promoted_late_keeps_the_heartbeating_fleet`. The
+diagnostic probe and candidate were removed from the worktree; they are kept with
+the stress-run evidence (`/private/tmp/autumn-ff29ad67-stress-20261009/`):
 `standby_heartbeat_probe.rs`, `standby-heartbeat-probe.log`,
 `standby-heartbeat-candidate.log`, and `standby-heartbeat-candidate.patch`.
 

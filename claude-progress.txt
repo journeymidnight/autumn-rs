@@ -1,3 +1,11 @@
+Date: 2026-10-10
+TaskStatus: completed
+Task scope: user — fix BUG-MANAGER-STANDBY-HEARTBEAT-GRACE (a standby promoted after waiting past the 10 s PS timeout evicted every healthy PS; twice on VKE, 30 partitions onto one PS).
+Current summary: replay_from_etcd seeded ps_last_heartbeat with or_insert(now), keeping the clock the standby set at its own start (a standby answers heartbeats NOT_LEADER; promotion never reruns mark_serving). Replay now replaces the map: now for every replayed PS and only those, so a PS the old leader evicted keeps no clock (key set stays a subset of ps_nodes). Docs: manager CLAUDE.md (PS liveness), ops.md (new "A promoted standby keeps the live PS fleet"), vke-stress-20261009.md.
+Verification: new ps_members_etcd::a_standby_promoted_late_keeps_the_heartbeating_fleet (real etcd; standby ages 14 s, PSes first heartbeat 3 s after promotion, silent PS 3 evicted after the window, evicted PS 4 stays NOT_FOUND with no clock). Unfixed red "heartbeat ps 1: ps 1 not registered"; insert-only ablation red (PS 4 clock 31 s); fixed green 3/3. A first draft heartbeating right at promotion passed on the buggy code (beat the 2 s liveness tick) — hence the 3 s delay. manager lib 484, system_manager_failover, bug_lease_1_heartbeat_etcd_refresh, cluster_status_etcd, manager_members_etcd green. opus review: no correctness issue (replay block has no await after the store swap; register rejected during replay; reset can only delay an eviction by ≤10 s); 4 low doc points fixed.
+Main gaps: not deployed or run on a real multi-manager cluster.
+Next steps: roll out and fail over with the standby up > 10 s (docs/ops.md steps).
+
 Date: 2026-10-09 (11)
 TaskStatus: completed
 Task scope: user — the dashboard partition list's start/end ranges were far too long (7446c62b wrapped full keys; one kvc key took ~12 lines).

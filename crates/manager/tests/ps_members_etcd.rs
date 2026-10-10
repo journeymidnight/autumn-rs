@@ -79,13 +79,19 @@ async fn ps_servers(mgr: &RpcClient) -> Vec<PsOverview> {
     ov.ps_servers
 }
 
-/// Heartbeat PS 1 and 2 (never 3) for `secs` seconds.
-async fn keep_alive_1_2(mgr: &RpcClient, secs: u64) {
+/// Heartbeat each of `ids` once a second for `secs` seconds.
+async fn keep_alive(mgr: &RpcClient, ids: &[u64], secs: u64) {
     for _ in 0..secs {
-        heartbeat(mgr, 1).await;
-        heartbeat(mgr, 2).await;
+        for &ps_id in ids {
+            heartbeat(mgr, ps_id).await;
+        }
         compio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Heartbeat PS 1 and 2 (never 3) for `secs` seconds.
+async fn keep_alive_1_2(mgr: &RpcClient, secs: u64) {
+    keep_alive(mgr, &[1, 2], secs).await;
 }
 
 async fn connect_leader(addr: SocketAddr) -> std::rc::Rc<RpcClient> {
@@ -175,5 +181,68 @@ fn an_evicted_ps_stays_expected_across_a_leader_change_until_removed() {
         let servers = ps_servers(&mgr2).await;
         assert_eq!(servers.len(), 3);
         assert_eq!(servers[2].evicted_at_ms, 0);
+    });
+}
+
+/// A standby that waited longer than the PS timeout before winning must give
+/// every PS it replays a fresh window: its clocks date from its own start
+/// (a standby answers heartbeats NOT_LEADER). Healthy PSes stay; a silent one
+/// goes after the window; one the old leader evicted is not brought back.
+#[test]
+#[ignore] // requires a real etcd binary on PATH
+fn a_standby_promoted_late_keeps_the_heartbeating_fleet() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (_etcd_guard, etcd_endpoint) = start_etcd().await;
+
+        let mgr1_addr = pick_addr();
+        let mgr1_flag = start_stoppable_etcd_manager(mgr1_addr, etcd_endpoint.clone());
+        compio::time::sleep(Duration::from_secs(2)).await;
+        let mgr1 = RpcClient::connect_as(mgr1_addr, Role::Admin, None)
+            .await
+            .expect("connect mgr1");
+        for ps_id in [1, 2, 3, 4] {
+            let r = register(&mgr1, ps_id).await;
+            assert_eq!(r.code, CODE_OK, "register ps {ps_id}: {}", r.message);
+        }
+
+        // The standby replays 1-4 now, then ages past the 10 s timeout while
+        // the leader evicts the silent PS 4.
+        let mgr2_addr = pick_addr();
+        let _mgr2_flag = start_stoppable_etcd_manager(mgr2_addr, etcd_endpoint.clone());
+        keep_alive(&mgr1, &[1, 2, 3], 14).await;
+        let servers = ps_servers(&mgr1).await;
+        assert!(servers[3].evicted_at_ms > 0, "ps 4 not evicted: {:?}", servers[3]);
+
+        mgr1_flag.store(true, Ordering::Release);
+        let mgr2 = connect_leader(mgr2_addr).await;
+
+        // A PS reaches the new leader only after rotating to it: the first
+        // heartbeat lands past the liveness loop's first 2 s tick.
+        compio::time::sleep(Duration::from_secs(3)).await;
+        keep_alive_1_2(&mgr2, 4).await;
+        let r = code_of(
+            &mgr2,
+            MSG_HEARTBEAT_PS,
+            rkyv_encode(&HeartbeatPsReq {
+                ps_id: 4,
+                slot_cap: 0,
+                open_parts: Vec::new(),
+            })
+            .to_vec(),
+        )
+        .await;
+        assert_eq!(r.code, CODE_NOT_FOUND, "evicted ps 4 came back: {}", r.message);
+        let ps4 = &ps_servers(&mgr2).await[3];
+        assert_eq!(ps4.last_heartbeat_secs_ago, u64::MAX, "evicted ps 4 has a clock: {ps4:?}");
+
+        // PS 3 stopped at the leader change: evicted once the window runs out.
+        keep_alive_1_2(&mgr2, 10).await;
+        let servers = ps_servers(&mgr2).await;
+        let evicted: Vec<u64> = servers
+            .iter()
+            .filter(|p| p.evicted_at_ms > 0)
+            .map(|p| p.ps_id)
+            .collect();
+        assert_eq!(evicted, vec![3, 4], "{servers:?}");
     });
 }

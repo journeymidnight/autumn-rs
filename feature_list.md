@@ -18,7 +18,7 @@
 - **Trigger** (2026-10-09 VKE rollout/stress): `7446c62b` 上，备用 manager 开始选举约 0.5 秒后同时报 3 台 PS 心跳超时，30 个分区集中到一台 PS；3 个 PS 容器均未重启。`replay_from_etcd` 的 `ps_last_heartbeat.entry(id).or_insert(now)` 保留备用期间的旧时间，`mark_serving` 只在 listener 初次启动时刷新。
 - **Scope**: 晋升 replay 后给每个仍在册 PS 新的心跳宽限期；核对失联 PS 仍会在新宽限期后被驱逐，以及已删除成员不会复活。
 - **Acceptance**: 保持 leader 上 PS 心跳，备用 manager 等待超过 10 秒再晋升；晋升 3 秒后的 PS 心跳成功，宽限期内成员不被误驱逐；实际失联 PS 在宽限期后被驱逐。复现用例与原有 PS membership/etcd 测试通过，消融变红。
-- `passes: false`
+- `passes: true`
 - **notes**: 隔离探针基于 `ps_members_etcd`，额外让 standby 等待 15 秒；当前代码失败于 `heartbeat ps 1: ps 1 not registered`。仅将该 `or_insert` 改为 `insert`，相同探针通过（44/46 秒）。实验改动已撤回，尚未提交或部署修复。源文件、失败/对照日志及候选 patch 保存在 `/private/tmp/autumn-ff29ad67-stress-20261009/standby*`。
 
 ### BUG-UPDATE-STREAM-EC-NO-CAS — `update_stream_ec` 写 etcd 不做 CAS，可能覆盖并发提交的 stream 成员变更（推断，未复现）

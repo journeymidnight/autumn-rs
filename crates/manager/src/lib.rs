@@ -3291,24 +3291,17 @@ impl AutumnManager {
                 ns.insert(name, row);
             }
         }
-        // seed `ps_last_heartbeat` with `Instant::now()` for
-        // every replayed PS. Previously the map was empty post-failover,
-        // and the liveness loop's `None` arm treated unknown PSes as
-        // "alive" — so a PS that died right before the failover (with
-        // its evicted etcd entry still lingering) was
-        // resurrected on replay and stayed forever unevictable. Seeding
-        // grants every replayed PS a fresh `PS_DEAD_TIMEOUT` window to
-        // start heartbeating again. If it doesn't, the regular eviction
-        // path fires after the window expires (now reachable because
-        // `Some(t)` from the seed engages the `.elapsed() > timeout`
-        // branch).
+        // Every replayed PS gets a fresh `PS_DEAD_TIMEOUT` window from now:
+        // with no clock it would never be evicted, and an older clock — a
+        // standby's, set at its own start and never advanced (a standby
+        // answers heartbeats NOT_LEADER) — would evict the healthy fleet on
+        // the first liveness tick after promotion. Only those: a PS the old
+        // leader evicted keeps no clock.
         {
-            let mut hb = self.ps_last_heartbeat.borrow_mut();
             let now = Instant::now();
             let s = self.store.inner.borrow();
-            for ps_id in s.ps_nodes.keys() {
-                hb.entry(*ps_id).or_insert(now);
-            }
+            *self.ps_last_heartbeat.borrow_mut() =
+                s.ps_nodes.keys().map(|ps_id| (*ps_id, now)).collect();
         }
         // install last_op_at sidecar so policy engine cooldown
         // gating is correct on cold-start as well.

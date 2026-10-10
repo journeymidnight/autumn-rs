@@ -540,8 +540,13 @@ carry `slot_cap`, recorded only for a registered PS — see "Rebalance");
 `put_and_delete_txn(delete psNodes/<id>)` then `rebalance_regions`. On eviction
 `handle_heartbeat_ps` returns `CODE_NOT_FOUND` so the PS re-registers +
 `sync_regions_once` (silent `CODE_OK` would leave it invisible as `ps=unknown`).
-`replay_from_etcd` seeds `ps_last_heartbeat = now` for every replayed PS so the
-liveness loop's `Some(t)` arm engages instead of treating it as an immortal zombie.
+`replay_from_etcd` replaces `ps_last_heartbeat` with `now` for every replayed PS
+and only those: a fresh 10 s window from the promotion, and no clock for a PS the
+old leader evicted (the map's keys stay a subset of `ps_nodes`). A missing clock
+would make a replayed PS unevictable; a kept one would be a standby's, set at its
+own start and never advanced (a standby answers heartbeats `NOT_LEADER`), so the
+first liveness tick after a late promotion would evict the whole healthy fleet.
+Promotion does not run `mark_serving` again, so replay is the only reset.
 
 The PS spawns its `heartbeat_loop` in `finish_connect` (NOT `serve()`, which only
 runs after every assigned partition finishes WAL replay — that can exceed the
@@ -591,7 +596,10 @@ manager does not judge registrations). There is no seeding
 from `psNodes/`: an upgrade is a full restart, and every PS registers.
 Test: `tests/ps_members_etcd.rs` (evicted PS listed, survives a leader change,
 live remove refused; ablations: eviction forgetting the member, replay not
-loading it, remove skipping the live check — each red).
+loading it, remove skipping the live check — each red. A standby promoted
+after aging past the timeout keeps PSes that first heartbeat 3 s in, evicts the
+silent one after the window, and gives no clock to one the old leader evicted;
+red with replay keeping old clocks, or overwriting only the replayed ones).
 
 ## Manager identity and membership (`manager_members.rs`)
 

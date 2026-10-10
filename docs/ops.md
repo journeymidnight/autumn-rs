@@ -2284,6 +2284,22 @@ reclaimed`) and keep running. Kill test processes by the PIDs you started
 (`$!`), not `pkill -f`: a pattern your own command line contains kills your
 shell.
 
+## A promoted standby keeps the live PS fleet
+
+A newly promoted manager gives every PS it replays a fresh 10 s heartbeat window,
+however long it waited as a standby. The test (needs `etcd` on `PATH`; ~45 s):
+
+```bash
+cargo test -p autumn-manager --test ps_members_etcd -- --ignored
+```
+
+On a cluster: leave the standby up longer than 10 s, then kill the leader. In the
+new leader's log, `PS <id> heartbeat timed out` may name only a PS that has
+actually stopped, and only 10 s or more after the promotion. `"${AO[@]}" info`
+should still list every live PS with its partitions. A failure shows every PS
+timing out within ~2 s of the promotion and all partitions moving to the first
+PS to re-register.
+
 ## fs stripe geometry: lanes vs partitions
 
 Large-file striping spreads one file's extents across N **lanes** so a single
