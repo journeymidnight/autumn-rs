@@ -2576,7 +2576,8 @@ Three fixes bound the restart replay window (worst case per partition =
     flight misses its change, and the later record would drop it (a compaction's
     outputs, or a flush's SST, then exist in memory but not in the durable state).
 
-12. **Metrics export.** Each `PartitionData` carries an `Arc<PartitionMetrics>` whose
+12. **Metrics export.** `PartitionMetrics` and its `/metrics` rendering live in
+    `metrics.rs`. Each `PartitionData` carries an `Arc<PartitionMetrics>` whose
     AtomicU64 counters are bumped by `partition_loop` (req_count on each
     `handle_incoming_req`, imm_full_count on imm-cap stalls). The same Arc is cloned into
     the `PartitionHandle` on the main thread; `report_load_loop` (5 s) snapshots all live
@@ -2913,14 +2914,42 @@ Three fixes bound the restart replay window (worst case per partition =
     9 finite ns buckets 0.5ms..250ms + sum + count, non-cumulative storage, cumulative
     `le` at render). PUT observes the ALREADY-MEASURED `BatchStats.end_to_end_ns` once
     per batch with `n = ops` (zero new hot-path timing); GET adds one `Instant` pair +
-    RefCell borrow in `serve_get_local`. `PartitionServer::metrics_text()` renders the
-    Prometheus snapshot on the MAIN compio thread (the `partitions` map is `Rc<RefCell>`);
-    `--metrics-port` spawns a 2 s publisher task that copies the string into an
-    `Arc<RwLock<String>>` served by `autumn_common::metrics_http`. Export rules: only
-    `req_count_monotonic` (the never-reset counter — `req_count` is swap-reset every 30 s
-    and would saw-tooth) plus gauges (size / gc-debt / pending-compaction bytes,
-    gc/compact inflight, sealed log extents). Emission is metric-major (all samples of one
-    metric contiguous after its `# TYPE` line — the Prometheus text format requires it).
+    RefCell borrow in `serve_get_local`. `PartitionServer::metrics_text()` collects the
+    handles on the MAIN compio thread (the `partitions` map is `Rc<RefCell>`) and
+    `metrics::render` writes the text; `--metrics-port` spawns a 2 s publisher task that
+    copies the string to `autumn_common::metrics_http`. Emission is metric-major (all
+    samples of one metric contiguous after its `# TYPE` line — the format requires it).
+    Only monotonic counters and gauges are exported (`req_count` is swap-reset by
+    `report_load_loop` and would saw-tooth; `write_bytes` / `read_bytes` are monotonic
+    and the report loop diffs them against its last reading).
+
+    What is exported, and where each value is written:
+    - PS-wide: `autumn_ps_block_cache_{hits,misses}_total`, `_bytes`, `_capacity_bytes`
+      (`BlockCache::stats`, the counters it always kept under its lock).
+    - `sst_tables`, `memtable_bytes` (active + queued), `imm_memtables`: set by
+      `PartitionData::publish_lsm_gauges` per write batch (after the memtable insert),
+      on rotate, flush commit, compaction commit and open. Three relaxed stores per
+      batch; never computed at scrape time, because the scrape runs on the main thread
+      and the memtables live on the partition thread.
+    - `flushes_total`, `flush_bytes_total` (flush commit); `major_compactions_total`,
+      `compaction_write_bytes_total{kind=minor|major}` (`do_compact`'s publish);
+      `minor_compactions_total{trigger=flush|tick|blocking|reclaim}`
+      (`run_minor_compaction`, the same cause its log line names, `MinorCause`).
+    - `get_sst_checks_total{result=skipped|hit|false_positive}`: per point lookup
+      (GET and HEAD, `sst_lookup_paged_retry`) the SSTs excluded by key range or bloom,
+      the one read and found, the ones read and absent — a bloom false positive, since
+      the range check passed and blooms have no false negatives. Counted locally and
+      added once per lookup; a lookup answered by a memtable counts nothing.
+    - `vp_reads_total`, `vp_read_bytes_total`: large values `get_value_inner` resolved
+      from the log stream (PS-proxied; a `Redirect` is read from the EN and not counted).
+      This path has no PS cache.
+    - the maintenance gauges listed in 12, plus `requests_total`,
+      `write_bytes_total`, `read_bytes_total`, `size_bytes`, `open_tail_bytes`.
+
+    The binary hands the PS the address others reach `/metrics` at
+    (`set_metrics_addr`: the host the listener is bound to — `--metrics-listen`,
+    else `--listen` — when it names one, else the advertised host); every
+    heartbeat carries it, and the dashboard scrapes it.
 
 ## MSG_ROLL_TAILS (`handle_roll_tails`) — rolling a LIVE partition's tails
 

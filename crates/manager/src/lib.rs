@@ -3195,6 +3195,7 @@ impl AutumnManager {
             // stale. The next heartbeat of each PS brings them back.
             s.ps_slot_caps.clear();
             s.ps_open_parts.clear();
+            s.ps_metrics_addrs.clear();
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
@@ -4041,6 +4042,7 @@ impl AutumnManager {
                 s.ps_nodes.remove(ps_id);
                 s.ps_slot_caps.remove(ps_id);
                 s.ps_open_parts.remove(ps_id);
+                s.ps_metrics_addrs.remove(ps_id);
                 if let Some(m) = s.ps_members.get_mut(ps_id) {
                     m.left_at_ms = left_at_ms;
                     member_puts.push((
@@ -6266,6 +6268,7 @@ mod tests {
                 ps_id: 20,
                 slot_cap: 4,
                 open_parts: Vec::new(),
+                metrics_addr: String::new(),
             });
             m.handle_heartbeat_ps(req).await.unwrap();
             m.handle_upsert_partition(upsert(5, b"z", b"")).await.unwrap();
@@ -6276,6 +6279,7 @@ mod tests {
                 ps_id: 99,
                 slot_cap: 8,
                 open_parts: Vec::new(),
+                metrics_addr: String::new(),
             });
             m.handle_heartbeat_ps(req).await.unwrap();
             assert!(!m.store.inner.borrow().ps_slot_caps.contains_key(&99));
@@ -6330,6 +6334,7 @@ mod tests {
                     ps_id,
                     slot_cap: 0,
                     open_parts,
+                    metrics_addr: String::new(),
                 })
             };
             let m = &m;
@@ -6482,6 +6487,7 @@ mod tests {
                 ps_id: 55,
                 slot_cap: 0,
                 open_parts: Vec::new(),
+                metrics_addr: String::new(),
             });
             m.handle_heartbeat_ps(req).await.unwrap();
 

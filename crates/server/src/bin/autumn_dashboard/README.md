@@ -35,6 +35,8 @@ without the secret — read-only views included.
 | `--listen H` | `0.0.0.0` | bind host |
 | `--transport tcp\|ucx` | `tcp` | must match the manager |
 | `--autumn-op PATH` | `autumn-op` | the CLI binary |
+| `--metrics-interval-secs N` | `10` | how often every PS's `/metrics` is scraped |
+| `--metrics-retention-secs N` | `3600` | how much scraped history is kept in memory |
 
 ## Endpoints → `autumn-op`
 
@@ -48,6 +50,7 @@ without the secret — read-only views included.
 | `POST /api/policies/activate` | `autumn-op auto-policy start <name>` / `deactivate` |
 | `POST /api/policies/upsert` | `autumn-op auto-policy upsert <name> --switches … --interval … …` |
 | `POST /api/policies/delete` | `autumn-op auto-policy delete <name>` |
+| `GET /api/metrics?scope=cluster\|ps\|part&id=N` | none — the scraped PS `/metrics` history, summed over the scope |
 
 Each policy has a **Start** button: confirm the named policy to select it and
 run its enabled actions immediately. A running policy's actions are ops like
@@ -68,7 +71,7 @@ reason and retains failed edits. Failed status reads display **unknown**.
 
 ## Navigating the page
 
-**Six tabs**, because the questions an operator arrives with are different
+**Seven tabs**, because the questions an operator arrives with are different
 questions and each wants the whole width. The **vital signs** (topology /
 capacity / throughput / controller) stay above the tabs — they are read first on
 every one. The tab is in the URL hash (`#nodes`), so a view is linkable.
@@ -81,6 +84,7 @@ every one. The tab is in the URL hash (`#nodes`), so a view is linkable.
 | **Nodes** | which disk — every extent node with a per-disk table (capacity, online, faulted) |
 | **Policy** | what the controller would do — advisories with their full reasoning, the controller and the policy editor |
 | **Logs** | what just happened — every op, the operator's and the auto-policy's alike: running now, then durable outcomes, each marked with who asked |
+| **Metrics** | how it has been doing — charts of every PS's `/metrics` over the last hour, for the cluster, one PS or one partition (see below) |
 
 Built for many partitions: the Partitions tab is **partition-server-first** (pick
 a PS card and the list shows *only that server's* partitions; **All servers**
@@ -126,6 +130,32 @@ compaction rewrites them**. The drawer says so before the Split button is
 clicked, and the auto-policy advises that compaction *in place of* the split — so
 the Policy tab shows "major compaction before split", not a split that
 would be refused once per window forever.
+
+## Metrics tab
+
+The dashboard scrapes each partition server's Prometheus `/metrics` itself —
+the only data it does not get through `autumn-op`. Each PS reports where its
+`/metrics` is on every heartbeat (PS started with `--metrics-port`; the host
+its listener is bound to — `--metrics-listen`, else `--listen` — when that
+names one, else the advertised host), and the
+overview carries it as `ps_servers[].metrics_addr`. A PS without the flag shows
+as "no /metrics endpoint reported".
+
+History lives in this process's memory (`--metrics-retention-secs`, default one
+hour) and starts empty after a restart. Counters are stored as per-second
+rates; `/api/metrics` sums a scope's series on one time axis, so the cluster
+view is the sum of every PS and a PS view the sum of its partitions (a gauge
+summed over partitions also comes as `name:max`, the largest one). A round in
+which a PS of the scope could not be scraped is a gap, not a dip.
+
+Charts: requests/s; value bytes/s; GET and write latency (average, and p99
+interpolated in the histogram bucket); block cache hit ratio and size (cluster
+and PS scopes — the cache is per PS); SST tables (sum and largest partition);
+memtable bytes and queued memtables; flush bytes/s; compactions per minute
+(minor by trigger: flush / tick / blocking / reclaim, and major); write
+amplification ((flush + compaction bytes) / value bytes written); point-lookup
+SSTs per second (skipped by range or bloom, read and found, bloom false
+positive); large-value reads from the log stream; maintenance debt.
 
 ## Security posture
 
@@ -186,6 +216,11 @@ node crates/server/src/bin/autumn_dashboard/tests/tabs_smoke.js
 # 4. Failed policy mutations/status, unusual names, and overlapping refreshes.
 node crates/server/src/bin/autumn_dashboard/tests/policy_controls.js
 ```
+
+The contract test (1) also starts the PS with `--metrics-port`, checks the
+overview carries its `metrics_addr`, the PS serves every new series, and
+`/api/metrics` grows a history for the cluster and one partition. The Rust
+store is unit-tested: `cargo test -p autumn-server --bin autumn-dashboard`.
 
 Measured live (1 GiB extent, EC 3+1): `/api/ops` carried
 `ec-convert running 18.6% → 37.2% → 55.8% → 74.4%`, then the op moved to

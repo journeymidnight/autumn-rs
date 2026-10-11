@@ -7,6 +7,8 @@ mod rpc_handlers;
 mod sstable;
 pub mod compact_policy;
 mod wal_record;
+pub mod metrics;
+pub use metrics::{LatHist, PartitionMetrics, LAT_BUCKET_BOUNDS_NS};
 
 use background::*;
 use rpc_handlers::dispatch_partition_rpc;
@@ -1501,275 +1503,6 @@ impl FenceFloors {
     }
 }
 
-/// LAT-1: fixed-bucket latency histogram (Prometheus-shape). Recording
-/// is one bucket fetch_add + sum/count adds; PUT observations reuse the
-/// ALREADY-MEASURED per-batch end-to-end ns from `WriteLoopMetrics`
-/// (zero new hot-path timing), GET adds one `Instant` pair per request
-/// (same cost class as the `req_count` add).
-#[derive(Default)]
-pub struct LatHist {
-    pub buckets: [std::sync::atomic::AtomicU64; LAT_BUCKET_BOUNDS_NS.len()],
-    pub sum_ns: std::sync::atomic::AtomicU64,
-    pub count: std::sync::atomic::AtomicU64,
-}
-
-/// Upper bounds (ns) of the finite buckets; an implicit +Inf bucket is
-/// `count - sum(buckets)` at render time... NO — buckets are CUMULATIVE
-/// at render; stored per-bucket counts here are NON-cumulative for
-/// cheap recording. Bounds: 0.5/1/2/5/10/20/50/100/250 ms.
-pub const LAT_BUCKET_BOUNDS_NS: [u64; 9] = [
-    500_000,
-    1_000_000,
-    2_000_000,
-    5_000_000,
-    10_000_000,
-    20_000_000,
-    50_000_000,
-    100_000_000,
-    250_000_000,
-];
-
-
-impl LatHist {
-    /// Record `n` observations of `ns` each (a group-committed batch's
-    /// ops all share the batch's end-to-end latency).
-    pub fn observe_n(&self, ns: u64, n: u64) {
-        use std::sync::atomic::Ordering::Relaxed;
-        if n == 0 {
-            return;
-        }
-        let idx = LAT_BUCKET_BOUNDS_NS.partition_point(|&b| ns > b);
-        if idx < self.buckets.len() {
-            self.buckets[idx].fetch_add(n, Relaxed);
-        }
-        // idx == len → +Inf bucket, implicit via count.
-        self.sum_ns.fetch_add(ns.saturating_mul(n), Relaxed);
-        self.count.fetch_add(n, Relaxed);
-    }
-}
-
-#[derive(Default)]
-pub struct PartitionMetrics {
-    /// LAT-1: PUT (group-commit end-to-end) / GET (inline serve) latency.
-    pub write_lat: LatHist,
-    pub get_lat: LatHist,
-    pub req_count: std::sync::atomic::AtomicU64,
-    /// fix MED-3: monotonic request counter (NEVER swap-reset).
-    /// `report_load_loop` swaps `req_count` to 0 every 5 s for its
-    /// per-window rate calc, which races the maintenance
-    /// scheduler's diff-based req_per_sec gate (the gate would see
-    /// req_per_sec=0 right after a swap and dispatch BG work during a
-    /// real FG storm). The scheduler now diffs against this monotonic
-    /// counter instead, so it sees true delta over its own interval.
-    pub req_count_monotonic: std::sync::atomic::AtomicU64,
-    /// Value bytes written this interval (Put values, accumulated per batch in
-    /// `start_write_batch`). `report_load_loop` swaps it to 0 every interval and
-    /// divides by the interval for `write_bytes_per_sec` — real write throughput,
-    /// the bytes/sec companion to `req_count`'s IOPS.
-    pub write_bytes: std::sync::atomic::AtomicU64,
-    /// Value bytes READ this interval (GET-served value lengths, accumulated in
-    /// the read path). Swapped → `read_bytes_per_sec`.
-    pub read_bytes: std::sync::atomic::AtomicU64,
-    pub imm_full_count: std::sync::atomic::AtomicU64,
-    /// LSM-resident bytes: Σ SST `tables[].len` + active memtable + Σ imm
-    /// memtables (`PartitionData::lsm_resident_bytes`). Refreshed on the
-    /// maintenance loop's throttled tick (2026-07-05 — was previously DEAD
-    /// with no writer, so this gauge + the manager's
-    /// size-based split/merge policy read a constant 0). This is the LOGICAL
-    /// data size, NOT the total extent footprint — the cluster-overview
-    /// size uses `open_tail_bytes` + the manager's sealed sum instead.
-    /// Drives the `autumn_ps_partition_size_bytes`
-    /// Prometheus gauge and `policy.rs` split_size_*/merge_size_low.
-    pub size_bytes: std::sync::atomic::AtomicU64,
-    /// Σ committed bytes on this partition's three
-    /// stream OPEN-tail extents (log + row + meta). Refreshed by the
-    /// maintenance loop's throttled, non-blocking size probe (a detached
-    /// `commit_length` on each of the 3 tails; kept at the prior value on
-    /// any probe error) and shipped via `report_load_loop`. The manager
-    /// adds it to its authoritative sealed-length sum for the cluster
-    /// overview so an all-open-tail partition doesn't render 0 B. 0 until
-    /// the first refresh completes.
-    pub open_tail_bytes: std::sync::atomic::AtomicU64,
-    /// guards against piling up concurrent open-tail
-    /// size probes (each probe is a detached task; CAS false→true to launch,
-    /// reset to false on completion).
-    pub open_tail_probe_inflight: std::sync::atomic::AtomicBool,
-    /// aggregated discard bytes on sealed log_stream extents that
-    /// the GC loop would target. Refreshed by the GC loop's read-only
-    /// prefix (no extra RPCs) and shipped via report_load_loop. Manager
-    /// emits a `POLICY_KIND_GC` advisory when this stays above
-    /// `gc_debt_high` for `policy.required_buckets` consecutive ticks
-    /// outside the gc cooldown.
-    pub gc_debt_bytes: std::sync::atomic::AtomicU64,
-    /// dead (overwritten/deleted) large-value bytes on the OPEN
-    /// log_stream tail extent — the discard-map entry `gc_debt_bytes` EXCLUDES
-    /// because `valid_discard` filters to sealed extents (GC can't punch an
-    /// unsealed tail). Refreshed on the SAME GC tick as `gc_debt_bytes`, from
-    /// the already-persisted SST discard maps (no extra RPC, no write-path
-    /// cost). Survives restart because it rides the meta_stream checkpoint,
-    /// exactly like `gc_debt_bytes` — it is DERIVED each tick, never a bespoke
-    /// counter to persist. Dead bytes at/after the replay floor, open tail
-    /// included (`split_at_replay_floor`): GC cannot take them yet, so they
-    /// are not `gc_debt_bytes`. Shipped via `report_load_loop`; 0 until the
-    /// first GC tick.
-    pub open_tail_dead_bytes: std::sync::atomic::AtomicU64,
-    /// bytes of SSTable data that compaction would consume on its
-    /// next pass — sum of (head-extent table sizes when head-ratio < 30 %)
-    /// + (overlap-tagged tables when has_overlap == 1). Refreshed by the
-    /// compact loop's periodic tick. Manager emits a `POLICY_KIND_COMPACT`
-    /// advisory when sustained above `compact_pending_high`.
-    pub pending_compaction_bytes: std::sync::atomic::AtomicU64,
-    /// 1 while `background_gc_loop` is inside `run_gc`, else 0. Lets
-    /// operators see stuck-GC at a glance and lets the policy engine skip
-    /// duplicate advisories for an already-active GC.
-    pub gc_inflight: std::sync::atomic::AtomicU32,
-    /// 1 while `background_compact_loop` is inside `do_compact`,
-    /// else 0.
-    pub compact_inflight: std::sync::atomic::AtomicU32,
-    /// unix-epoch seconds of the last successful GC `punch_holes`
-    /// completion. 0 if never run since process start. Used by the policy
-    /// engine to enforce cooldown (no advisory while `now - last_gc_at <
-    /// gc_cooldown_sec`).
-    pub last_gc_at: std::sync::atomic::AtomicI64,
-    /// unix-epoch seconds of the last successful `do_compact`
-    /// commit. 0 if never run since process start. Used for compact
-    /// cooldown.
-    pub last_compact_at: std::sync::atomic::AtomicI64,
-    /// Σ bytes occupied by tombstone (op==2) records inside the
-    /// partition's live SSTs. Refreshed after every flush + compact
-    /// commit. Drives external controller's "should major compact"
-    /// decisions; advisory-only here.
-    pub sst_tombstone_bytes: std::sync::atomic::AtomicU64,
-    /// Σ bytes of SST records whose `expires_at` has passed.
-    pub sst_expired_bytes: std::sync::atomic::AtomicU64,
-    /// Σ bytes of SST records whose keys fall outside the
-    /// partition's current `rg` range. Only > 0 while `has_overlap == 1`.
-    pub sst_out_of_range_bytes: std::sync::atomic::AtomicU64,
-    /// Cross-thread mirror of `PartitionData.has_overlap` (1 = this
-    /// partition's SSTs still carry keys outside its own range).
-    ///
-    /// `report_load_loop` runs on the MAIN thread and can only reach a
-    /// partition through this `Arc`; `PartitionData` lives on the partition's
-    /// own thread. Writers go through `PartitionData::set_has_overlap` so the
-    /// mirror cannot drift from the Cell it mirrors. The manager needs it
-    /// because `handle_split_part` refuses while it is 1.
-    pub has_overlap: std::sync::atomic::AtomicU32,
-    /// bytes of the minor window `select_minor` picks now. Distinct from
-    /// `pending_compaction_bytes` (major). Both can be non-zero
-    /// simultaneously.
-    pub minor_compact_pending_bytes: std::sync::atomic::AtomicU64,
-    /// count of sealed log_stream extents (informational).
-    pub sealed_log_extent_count: std::sync::atomic::AtomicU32,
-    /// Deletes this partition took that no MAJOR compaction has seen yet.
-    ///
-    /// A delete frees nothing on its own: the value it kills is reclaimable
-    /// only once a compaction drops the superseded entry and records the
-    /// discard that GC reads. On an idle partition nothing else gets it there —
-    /// the tombstones sit in the memtable (it rotates on size or on the WAL
-    /// gap, and a few thousand deletes reach neither), and the size-driven
-    /// compaction advisories never fire for an LSM of a few KB, however many
-    /// GiB of large values the deletes killed. The manager's policy reads this
-    /// to advise the one major compaction that settles such a partition.
-    ///
-    /// Bumped per delete as it enters the memtable; seeded at open from the
-    /// replayed memtable plus the tombstones the loaded SSTs record
-    /// (`num_deletions`), so deletes flushed before a restart, split or merge
-    /// are still counted. A successful major compaction subtracts what it
-    /// covered (the count taken as it flushed), so deletes that arrive during
-    /// the compaction stay counted.
-    pub unsettled_deletes: std::sync::atomic::AtomicU64,
-    /// Terminal outcomes of manager-submitted maintenance ops (compact/gc/
-    /// forcegc carrying a non-zero op_id) — a bounded ring copied onto the load
-    /// heartbeat so the manager's op-ledger learns the state + error string that
-    /// would otherwise die in a PS `tracing::error!`.
-    pub maintenance_outcomes: parking_lot::Mutex<VecDeque<manager_rpc::MaintenanceOutcome>>,
-    /// Latest progress sample for the maintenance op running right now, or
-    /// None when idle. A single slot, not a ring: progress is a sample that is
-    /// worthless once superseded, and the merged GC/compaction loop runs one op
-    /// at a time by construction.
-    pub maintenance_progress: parking_lot::Mutex<Option<manager_rpc::MaintenanceProgress>>,
-    /// The running split's phase. Its own slot: a split waits at phase 1 on
-    /// the maintenance gate while a compaction or GC reports and clears the
-    /// slot above, and a submitted split that goes unreported is judged not
-    /// running by the manager.
-    pub split_phase: parking_lot::Mutex<Option<manager_rpc::MaintenanceProgress>>,
-}
-
-/// Max terminal maintenance outcomes buffered for the heartbeat. Small — each
-/// retransmits until newer ones push it out (the manager reconciles by op_id,
-/// idempotently), so a couple of heartbeats' worth is plenty.
-const MAINT_OUTCOME_RING_CAP: usize = 8;
-
-impl PartitionMetrics {
-    /// Record a terminal maintenance outcome for the next heartbeat (bounded).
-    pub fn push_maintenance_outcome(&self, o: manager_rpc::MaintenanceOutcome) {
-        let mut r = self.maintenance_outcomes.lock();
-        r.push_back(o);
-        while r.len() > MAINT_OUTCOME_RING_CAP {
-            r.pop_front();
-        }
-    }
-    /// Publish how far the currently-running maintenance op has got. Called
-    /// from the op's own loop, so the cost must stay trivial — one short lock,
-    /// once per GC chunk / compaction table, never per record.
-    pub fn set_maintenance_progress(&self, op_id: u64, kind: u8, done: u64, total: u64) {
-        if op_id == 0 {
-            return; // PS-local scheduler run: nothing on the manager to update.
-        }
-        *self.maintenance_progress.lock() = Some(manager_rpc::MaintenanceProgress {
-            op_id,
-            kind,
-            done,
-            total,
-        });
-    }
-
-    /// Publish which PHASE the split has reached.
-    ///
-    /// Unlike `set_maintenance_progress`, `op_id: 0` is published too: an
-    /// untracked split (presplit, test helpers) carries none, and the manager
-    /// matches it on (kind, part_id). A submitted split's id also tells the
-    /// manager the split is still running after it stopped waiting for the
-    /// reply.
-    ///
-    /// Phases, not bytes. Split's steps cost wildly different amounts — the
-    /// flush dominates — so a byte counter sits still through the expensive one
-    /// and reads as a hang, which is the exact confusion this is here to end.
-    /// A phase index says "still flushing", and that is the true answer.
-    pub fn set_maintenance_phase(&self, op_id: u64, kind: u8, phase: u64, phases: u64) {
-        *self.split_phase.lock() = Some(manager_rpc::MaintenanceProgress {
-            op_id,
-            kind,
-            done: phase,
-            total: phases,
-        });
-    }
-
-    /// Drop the progress slot — the op finished (its terminal state travels in
-    /// the outcome ring). Leaving a stale sample would show a finished op as
-    /// forever mid-flight.
-    pub fn clear_maintenance_progress(&self) {
-        *self.maintenance_progress.lock() = None;
-    }
-
-    pub fn clear_split_phase(&self) {
-        *self.split_phase.lock() = None;
-    }
-
-    /// Snapshot the live progress samples for the heartbeat.
-    pub fn snapshot_maintenance_progress(&self) -> Vec<manager_rpc::MaintenanceProgress> {
-        let mut v: Vec<_> = self.maintenance_progress.lock().iter().cloned().collect();
-        v.extend(self.split_phase.lock().iter().cloned());
-        v
-    }
-
-    /// Snapshot (copy, not drain) the ring for the heartbeat — idempotent
-    /// retransmit covers a dropped report.
-    pub fn snapshot_maintenance_outcomes(&self) -> Vec<manager_rpc::MaintenanceOutcome> {
-        self.maintenance_outcomes.lock().iter().cloned().collect()
-    }
-}
-
 /// Clears the phase slot however its scope ends.
 ///
 /// `handle_split_part` has a dozen exits — three `?` through a closure, a TTL
@@ -1848,6 +1581,19 @@ impl PartitionData {
         let sst: u64 = self.tables.iter().map(|t| t.len).sum();
         let imm: u64 = self.imm.iter().map(|m| m.mem_bytes()).sum();
         sst.saturating_add(self.active.mem_bytes()).saturating_add(imm)
+    }
+
+    /// Copy the table count and memtable sizes into the `/metrics` gauges.
+    /// Called wherever they change: per write batch, rotate, flush and
+    /// compaction commit, open.
+    pub(crate) fn publish_lsm_gauges(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let imm: u64 = self.imm.iter().map(|m| m.mem_bytes()).sum();
+        self.metrics.sst_tables.store(self.tables.len() as u64, Relaxed);
+        self.metrics
+            .memtable_bytes
+            .store(self.active.mem_bytes() + imm, Relaxed);
+        self.metrics.imm_memtables.store(self.imm.len() as u64, Relaxed);
     }
 }
 
@@ -2766,6 +2512,8 @@ pub struct PartitionServer {
     /// address. Defaults to `127.0.0.1` if `--advertise` is omitted or
     /// is not parseable as `host:port`.
     advertise_host: Rc<std::cell::RefCell<String>>,
+    /// `/metrics` `host:port`, empty when the binary runs no metrics listener.
+    metrics_addr: Rc<RefCell<String>>,
     /// host component for the per-partition listener bind.
     /// For UCX/RoCE this must be the routable HCA IP, not `0.0.0.0`.
     listen_host: Rc<std::cell::RefCell<String>>,
@@ -3736,6 +3484,7 @@ impl PartitionServer {
                                 "127.0.0.1",
                             ))),
                             listen_host: Rc::new(std::cell::RefCell::new(String::from("0.0.0.0"))),
+                            metrics_addr: Rc::new(RefCell::new(String::new())),
                             concurrency_ctrl: std::sync::Arc::new(ConcurrencyController::from_env()),
                             partition_budget: std::sync::Arc::new(PartitionBudget::new(
                                 compute_partition_budget_cap(),
@@ -3856,6 +3605,21 @@ impl PartitionServer {
             .collect()
     }
 
+    /// Where this PS's `/metrics` is reachable; carried on every heartbeat.
+    /// The binary sets it once its metrics listener is up.
+    pub fn set_metrics_addr(&self, addr: String) {
+        *self.metrics_addr.borrow_mut() = addr;
+    }
+
+    fn heartbeat_req(&self) -> Bytes {
+        manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq {
+            ps_id: self.ps_id,
+            slot_cap: self.slot_cap(),
+            open_parts: self.open_parts(),
+            metrics_addr: self.metrics_addr.borrow().clone(),
+        })
+    }
+
     async fn register_ps(&self) -> Result<()> {
         let address = self
             .advertise_addr
@@ -3919,11 +3683,7 @@ impl PartitionServer {
         ticker.tick().await; // first tick is immediate
         loop {
             ticker.tick().await;
-            let req = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq {
-                ps_id: self.ps_id,
-                slot_cap: self.slot_cap(),
-                open_parts: self.open_parts(),
-            });
+            let req = self.heartbeat_req();
             // 5 s — heartbeat is fired every 2 s; we tolerate up to 5
             // consecutive failures (~10 s) before exiting. A 5 s
             // ceiling keeps each tick tight; a missed beat shows up
@@ -4010,131 +3770,23 @@ impl PartitionServer {
         }
     }
 
+    /// Prometheus text for this PS's `/metrics`. Runs on the MAIN compio
+    /// thread (the `partitions` map is `Rc<RefCell>`); the binary's 2 s
+    /// publisher task copies the rendered string to the metrics HTTP thread.
+    pub fn metrics_text(&self) -> String {
+        let series: Vec<(u64, std::sync::Arc<PartitionMetrics>)> = self
+            .partitions
+            .borrow()
+            .iter()
+            .map(|(part_id, h)| (*part_id, h.metrics.clone()))
+            .collect();
+        metrics::render(self.ps_id, &series, &self.block_cache)
+    }
+
     /// every 5 s, snapshot per-partition metrics from each
     /// PartitionHandle's Arc<PartitionMetrics> and ship to the manager
     /// via MSG_REPORT_PARTITION_LOAD. Cheap — one RPC per cycle, payload
     /// scales with partition count.
-    /// Observability batch 1: Prometheus text snapshot of this PS's
-    /// per-partition counters/gauges. Runs on the MAIN compio thread (the
-    /// `partitions` map is `Rc<RefCell>`); the binary's 2 s publisher task
-    /// copies the rendered string to the metrics HTTP thread. Only
-    /// monotonic counters (`req_count_monotonic` — `req_count` is
-    /// swap-reset by `report_load_loop` and would saw-tooth) and gauges
-    /// are exported.
-    pub fn metrics_text(&self) -> String {
-        use autumn_common::metrics_http::{push_metric, push_type};
-        use std::sync::atomic::Ordering::Relaxed;
-        let mut out = String::with_capacity(2048);
-        let ps = self.ps_id.to_string();
-        let parts = self.partitions.borrow();
-        push_type(&mut out, "autumn_ps_partitions", "gauge");
-        push_metric(
-            &mut out,
-            "autumn_ps_partitions",
-            &[("ps", ps.clone())],
-            parts.len() as u32,
-        );
-        // Metric-major emission: the Prometheus text format requires all
-        // samples of one metric to form a single contiguous group after
-        // its # TYPE line — never interleave per-partition.
-        let series: Vec<(u64, std::sync::Arc<PartitionMetrics>)> = parts
-            .iter()
-            .map(|(part_id, h)| (*part_id, h.metrics.clone()))
-            .collect();
-        drop(parts);
-        type Extract = fn(&PartitionMetrics) -> f64;
-        let metrics: [(&str, &str, Extract); 8] = [
-            ("autumn_ps_partition_requests_total", "counter", |m| {
-                m.req_count_monotonic.load(Relaxed) as f64
-            }),
-            ("autumn_ps_partition_size_bytes", "gauge", |m| {
-                m.size_bytes.load(Relaxed) as f64
-            }),
-            ("autumn_ps_partition_gc_debt_bytes", "gauge", |m| {
-                m.gc_debt_bytes.load(Relaxed) as f64
-            }),
-            ("autumn_ps_partition_open_tail_dead_bytes", "gauge", |m| {
-                m.open_tail_dead_bytes.load(Relaxed) as f64
-            }),
-            (
-                "autumn_ps_partition_pending_compaction_bytes",
-                "gauge",
-                |m| m.pending_compaction_bytes.load(Relaxed) as f64,
-            ),
-            ("autumn_ps_partition_gc_inflight", "gauge", |m| {
-                m.gc_inflight.load(Relaxed) as f64
-            }),
-            ("autumn_ps_partition_compact_inflight", "gauge", |m| {
-                m.compact_inflight.load(Relaxed) as f64
-            }),
-            ("autumn_ps_partition_sealed_log_extents", "gauge", |m| {
-                m.sealed_log_extent_count.load(Relaxed) as f64
-            }),
-        ];
-        for (name, kind, extract) in metrics {
-            push_type(&mut out, name, kind);
-            for (part_id, m) in &series {
-                push_metric(
-                    &mut out,
-                    name,
-                    &[("ps", ps.clone()), ("part", part_id.to_string())],
-                    extract(m),
-                );
-            }
-        }
-        // LAT-1: latency histograms (Prometheus histogram exposition —
-        // cumulative `le` buckets + _sum + _count, metric-major).
-        type HistSel = fn(&PartitionMetrics) -> &LatHist;
-        let hists: [(&str, HistSel); 2] = [
-            ("autumn_ps_write_duration_seconds", |m| &m.write_lat),
-            ("autumn_ps_get_duration_seconds", |m| &m.get_lat),
-        ];
-        for (name, sel) in hists {
-            push_type(&mut out, name, "histogram");
-            for (part_id, m) in &series {
-                use std::sync::atomic::Ordering::Relaxed;
-                let h = sel(m);
-                let labels = |le: String| {
-                    [
-                        ("ps", ps.clone()),
-                        ("part", part_id.to_string()),
-                        ("le", le),
-                    ]
-                };
-                let mut cum: u64 = 0;
-                for (i, &bound) in LAT_BUCKET_BOUNDS_NS.iter().enumerate() {
-                    cum += h.buckets[i].load(Relaxed);
-                    push_metric(
-                        &mut out,
-                        &format!("{name}_bucket"),
-                        &labels(format!("{}", bound as f64 / 1e9)),
-                        cum as f64,
-                    );
-                }
-                let count = h.count.load(Relaxed);
-                push_metric(
-                    &mut out,
-                    &format!("{name}_bucket"),
-                    &labels("+Inf".to_string()),
-                    count as f64,
-                );
-                push_metric(
-                    &mut out,
-                    &format!("{name}_sum"),
-                    &[("ps", ps.clone()), ("part", part_id.to_string())],
-                    h.sum_ns.load(Relaxed) as f64 / 1e9,
-                );
-                push_metric(
-                    &mut out,
-                    &format!("{name}_count"),
-                    &[("ps", ps.clone()), ("part", part_id.to_string())],
-                    count as f64,
-                );
-            }
-        }
-        out
-    }
-
     async fn report_load_loop(&self) {
         // Cadence history: 5 s (orig) → 30 s (policy was the ONLY
         // consumer and only needs ≤6 buckets, so 5 s over-sampled ~6× with no
@@ -4149,17 +3801,28 @@ impl PartitionServer {
         const REPORT_INTERVAL_SECS: u64 = 5;
         let mut ticker = compio::time::interval(Duration::from_secs(REPORT_INTERVAL_SECS));
         ticker.tick().await; // first tick is immediate
+        // Last report's monotonic `(write_bytes, read_bytes)` per partition. A
+        // reopened partition starts a fresh counter, so a reading below the
+        // last one is all new.
+        let mut last_bytes: HashMap<u64, (u64, u64)> = HashMap::new();
         loop {
             ticker.tick().await;
             let snapshots: Vec<manager_rpc::PartitionLoad> = {
                 let parts = self.partitions.borrow();
+                last_bytes.retain(|id, _| parts.contains_key(id));
                 parts
                     .iter()
                     .map(|(part_id, handle)| {
                         use std::sync::atomic::Ordering::Relaxed;
                         let req = handle.metrics.req_count.swap(0, Relaxed);
-                        let write_bytes = handle.metrics.write_bytes.swap(0, Relaxed);
-                        let read_bytes = handle.metrics.read_bytes.swap(0, Relaxed);
+                        let now_bytes = (
+                            handle.metrics.write_bytes.load(Relaxed),
+                            handle.metrics.read_bytes.load(Relaxed),
+                        );
+                        let prev = last_bytes.insert(*part_id, now_bytes).unwrap_or((0, 0));
+                        let since = |now: u64, prev: u64| if now >= prev { now - prev } else { now };
+                        let write_bytes = since(now_bytes.0, prev.0);
+                        let read_bytes = since(now_bytes.1, prev.1);
                         let imm_full = handle.metrics.imm_full_count.swap(0, Relaxed);
                         let size_bytes = handle.metrics.size_bytes.load(Relaxed);
                         // maintenance debt + inflight + last-run timestamps.
@@ -4949,11 +4612,7 @@ impl PartitionServer {
         // readiness wait cannot read this process's last report as the new
         // one's. The regular beat would say the same within 2 s — usually after
         // a quick drain has already exited.
-        let beat = manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq {
-            ps_id: self.ps_id,
-            slot_cap: self.slot_cap(),
-            open_parts: self.open_parts(),
-        });
+        let beat = self.heartbeat_req();
         match self
             .pool
             .call_timeout(
@@ -6644,6 +6303,7 @@ async fn partition_thread_main(
         // + replayed OP_FENCE_BUMP records — floors survive PS restarts.
         fence_floors: FenceFloors::recovered(recovered_floors),
     }));
+    part.borrow().publish_lsm_gauges();
 
     // Drop the extra clones held locally: the ones stored in PartitionData
     // are the only references. When PartitionData drops, the channels close,
@@ -10483,6 +10143,7 @@ pub(crate) fn rotate_active(part: &mut PartitionData) {
         .borrow_mut()
         .insert(Arc::as_ptr(&arc) as usize, row_floor);
     part.imm.push_back(arc);
+    part.publish_lsm_gauges();
     let _ = part.flush_tx.unbounded_send(());
 }
 
@@ -10648,6 +10309,7 @@ async fn commit_flush_outcome_inner(
 ) -> Result<()> {
     let outcome_last_seq = outcome.new_meta.last_seq;
     let outcome_src_imm_ptr = outcome.src_imm_ptr;
+    let new_sst_bytes = outcome.new_meta.len;
     let publish_lock = part.borrow().publish_lock.clone();
     let _publish = publish_lock.lock().await;
     // Publish first: the checkpoint names the new SST before the table list
@@ -10713,6 +10375,8 @@ async fn commit_flush_outcome_inner(
             p.imm_vp_heads.borrow_mut().remove(&ptr);
             p.imm_row_floors.borrow_mut().remove(&ptr);
         }
+        p.metrics.record_flush(new_sst_bytes);
+        p.publish_lsm_gauges();
         // wake partition_loop on imm-full back-pressure.
         let _ = p.imm_drained_tx.unbounded_send(());
     }

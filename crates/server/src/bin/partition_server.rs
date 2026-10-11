@@ -860,6 +860,10 @@ async fn main() -> Result<()> {
     // implicit `sync_regions_once()` runs `open_partition`. On restart, partitions
     // already exist in the manager — without this, `open_partition` reads
     // `base_port = 0` and binds the first partition to port `0 + 1 = 1`.
+    let advertise_host = advertise
+        .rsplit_once(':')
+        .map_or(advertise.as_str(), |(h, _)| h)
+        .to_string();
     let ps = PartitionServer::connect_with_advertise_and_port(
         args.psid,
         &args.manager,
@@ -931,7 +935,9 @@ async fn main() -> Result<()> {
                     }
                 })
                 .detach();
-                tracing::info!(port = mport, host = mhost, "metrics endpoint up at /metrics");
+                let reach = metrics_reach_addr(mhost, &advertise_host, mport);
+                ps.set_metrics_addr(reach.clone());
+                tracing::info!(port = mport, host = mhost, reach, "metrics endpoint up at /metrics");
             }
             // Auxiliary — a taken metrics port must not kill the data plane.
             Err(e) => tracing::error!(port = mport, "metrics endpoint bind failed: {e}"),
@@ -988,5 +994,35 @@ fn install_term_handler() {
             libc::SIGINT,
             handle_term_signal as *const () as libc::sighandler_t,
         );
+    }
+}
+
+/// Where others reach this PS's `/metrics`: the host its listener is bound to
+/// (`--metrics-listen`, else `--listen`) when that names one, else — bound to
+/// every address — the advertised host.
+fn metrics_reach_addr(bind_host: &str, advertise_host: &str, port: u16) -> String {
+    let host = match bind_host {
+        h if !matches!(h, "0.0.0.0" | "::" | "[::]") => {
+            if h.contains(':') && !h.starts_with('[') {
+                format!("[{h}]")
+            } else {
+                h.to_string()
+            }
+        }
+        _ => advertise_host.to_string(),
+    };
+    format!("{host}:{port}")
+}
+
+#[cfg(test)]
+mod metrics_reach_tests {
+    use super::metrics_reach_addr;
+
+    #[test]
+    fn a_specific_bind_host_is_reported_and_a_wildcard_falls_back_to_the_advertised_one() {
+        assert_eq!(metrics_reach_addr("10.0.0.5", "1.2.3.4", 9701), "10.0.0.5:9701");
+        assert_eq!(metrics_reach_addr("0.0.0.0", "1.2.3.4", 9701), "1.2.3.4:9701");
+        assert_eq!(metrics_reach_addr("::", "[fd00::1]", 9701), "[fd00::1]:9701");
+        assert_eq!(metrics_reach_addr("fd00::2", "x", 9701), "[fd00::2]:9701");
     }
 }

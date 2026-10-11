@@ -220,8 +220,9 @@ pub fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketA
 
 /// Like `start_partition_server`, but returns a `ShutdownFlag`: calling
 /// `.shutdown()` makes the PS drain and STOP its thread (heartbeat loop +
-/// per-partition listeners gone) via `serve_until_shutdown` — i.e. a REAL
-/// crash. Plain `start_partition_server` spawns a detached thread that serves
+/// per-partition listeners gone) via `serve_until_shutdown` — a GRACEFUL stop:
+/// the drain flushes every memtable, so nothing is left for WAL replay (a crash
+/// test kills a process instead: `start_partition_server_killable`, `ChildPs`). Plain `start_partition_server` spawns a detached thread that serves
 /// forever; dropping the test's `RpcClient` to it only closes the client, so
 /// the server keeps running + heartbeating. A test that then reuses the same
 /// `ps_id` for a takeover PS gets a same-id split-brain (both servers contest
@@ -1409,7 +1410,7 @@ pub fn start_partition_server_killable(
         .arg(mgr_addr.to_string())
         .arg("--port")
         .arg(ps_addr.port().to_string())
-        .arg("--bind-host")
+        .arg("--listen")
         .arg(ps_addr.ip().to_string())
         .arg("--advertise")
         .arg(ps_addr.to_string())

@@ -14,23 +14,33 @@
 //! The cluster secret file is REQUIRED and its path is forwarded to every
 //! `autumn-op` call: autumn-op connects as an operator, which the manager
 //! refuses without the secret, read-only calls included.
+//!
+//! It also scrapes every partition server's `/metrics` (the address each PS
+//! reports on its heartbeat) on its own, and keeps the history in memory for
+//! `/api/metrics` — see `metrics_store.rs`.
 
-use std::io::Read;
+mod metrics_store;
+
+use std::cell::RefCell;
+use std::io::{Read, Write};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use axum::body::{Body, Bytes};
-use axum::extract::Path;
+use axum::extract::{Path, Query};
 use axum::http::{Response, StatusCode};
 use axum::routing::{get, post};
 use axum::Router;
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 
+use metrics_store::{MetricsStore, PsStatus, Scope};
+
 const INDEX_HTML: &str = include_str!("static/index.html");
 const USAGE: &str = "usage: autumn-dashboard --manager H:P [--transport tcp|ucx] \
 [--port 8799] [--listen 0.0.0.0] [--autumn-op autumn-op] \
+[--metrics-interval-secs 10] [--metrics-retention-secs 3600] \
 --cluster-secret-file FILE";
 
 /// Hard deadline on each `autumn-op` subprocess. Without it a manager that
@@ -47,7 +57,17 @@ struct Config {
     transport: String,
     autumn_op: String,
     cluster_secret_file: String,
+    metrics_interval: Duration,
+    metrics_retention: Duration,
 }
+
+/// How often the poller re-reads the PS list (and their metrics addresses)
+/// through `autumn-op overview`; sooner while a PS has reported none yet (it
+/// reports on its heartbeat, after it registers).
+const PS_LIST_REFRESH: Duration = Duration::from_secs(60);
+const PS_LIST_REFRESH_INCOMPLETE: Duration = Duration::from_secs(10);
+/// One PS scrape: connect + read the whole reply.
+const SCRAPE_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl Config {
     /// Run `autumn-op --manager .. --transport .. --cluster-secret-file .. --json <args>`
@@ -267,6 +287,146 @@ async fn index() -> Response<Body> {
 async fn overview(cfg: &Config) -> Response<Body> {
     let (out, ok) = cfg.run_op(vec!["overview".into()]).await;
     passthrough(out, ok)
+}
+
+#[derive(Deserialize)]
+struct MetricsQuery {
+    /// `cluster` (default), `ps` or `part`.
+    scope: Option<String>,
+    id: Option<u64>,
+}
+
+/// `/api/metrics?scope=cluster|ps|part&id=N` — the scraped history, summed
+/// over the scope (see `MetricsStore::query`).
+fn metrics(store: &RefCell<MetricsStore>, q: MetricsQuery) -> Response<Body> {
+    let scope = match (q.scope.as_deref().unwrap_or("cluster"), q.id) {
+        ("cluster", _) => Scope::Cluster,
+        ("ps", Some(id)) => Scope::Ps(id),
+        ("part", Some(id)) => Scope::Part(id),
+        _ => return bad_request("scope must be cluster, or ps / part with an id"),
+    };
+    json_resp(StatusCode::OK, store.borrow().query(&scope).to_string())
+}
+
+/// `(ps_id, metrics_addr)` of every PS in the live registry, from `autumn-op
+/// overview`. An evicted member stays listed until it is removed, but has
+/// nothing to scrape.
+async fn ps_metrics_targets(cfg: &Config) -> Result<Vec<(u64, Option<String>)>> {
+    let (out, ok) = cfg.run_op(vec!["overview".into()]).await;
+    if !ok {
+        bail!("autumn-op overview: {out}");
+    }
+    parse_metrics_targets(&serde_json::from_str(&out)?)
+}
+
+fn parse_metrics_targets(overview: &serde_json::Value) -> Result<Vec<(u64, Option<String>)>> {
+    let rows = overview["ps_servers"]
+        .as_array()
+        .ok_or_else(|| anyhow!("overview has no ps_servers"))?;
+    Ok(rows
+        .iter()
+        .filter(|p| p["evicted_at_ms"].is_null())
+        .filter_map(|p| {
+            let id = p["ps_id"].as_u64()?;
+            Some((id, p["metrics_addr"].as_str().map(str::to_string)))
+        })
+        .collect())
+}
+
+/// GET `http://{addr}/metrics`, blocking (run on a blocking thread).
+fn scrape(addr: &str) -> Result<String> {
+    use std::net::ToSocketAddrs;
+    let sa = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| anyhow!("{addr} resolves to nothing"))?;
+    let mut conn = std::net::TcpStream::connect_timeout(&sa, SCRAPE_TIMEOUT)?;
+    conn.set_read_timeout(Some(SCRAPE_TIMEOUT))?;
+    conn.set_write_timeout(Some(SCRAPE_TIMEOUT))?;
+    write!(conn, "GET /metrics HTTP/1.0\r\nHost: {addr}\r\n\r\n")?;
+    let mut reply = String::new();
+    conn.read_to_string(&mut reply)?;
+    let (head, body) = reply
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| anyhow!("malformed HTTP reply"))?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        bail!("{}", head.lines().next().unwrap_or(head));
+    }
+    Ok(body.to_string())
+}
+
+/// Fold one PS's scrape of round `t` into the store.
+fn fold_scrape(
+    st: &mut MetricsStore,
+    id: u64,
+    t: u64,
+    addr: Option<String>,
+    got: Result<String>,
+) {
+    let last_ok_ms = st.status(id).and_then(|s| s.last_ok_ms);
+    let status = match got {
+        Ok(text) => {
+            st.ingest(id, t, &text);
+            PsStatus { metrics_addr: addr, last_ok_ms: Some(t), error: None }
+        }
+        Err(e) => {
+            // Only a scrape that failed leaves the round incomplete: a PS with
+            // no endpoint never contributes, so its absence is no dip.
+            if addr.is_some() {
+                st.record_failure(id);
+            }
+            PsStatus { metrics_addr: addr, last_ok_ms, error: Some(format!("{e:#}")) }
+        }
+    };
+    st.set_status(id, status);
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Scrape every PS once per `metrics_interval`, forever. The PS list comes
+/// from the manager every `PS_LIST_REFRESH`; a failed refresh keeps the last.
+async fn metrics_poller(cfg: Rc<Config>, store: Rc<RefCell<MetricsStore>>) {
+    let mut targets: Vec<(u64, Option<String>)> = Vec::new();
+    let mut next_list = Instant::now();
+    loop {
+        let round = Instant::now();
+        if round >= next_list {
+            match ps_metrics_targets(&cfg).await {
+                Ok(t) => {
+                    targets = t;
+                    let complete = targets.iter().all(|(_, addr)| addr.is_some());
+                    next_list = round
+                        + if complete { PS_LIST_REFRESH } else { PS_LIST_REFRESH_INCOMPLETE };
+                    let ids: Vec<u64> = targets.iter().map(|(id, _)| *id).collect();
+                    store.borrow_mut().retain_ps(&ids);
+                }
+                Err(e) => tracing::warn!("metrics poller: PS list: {e:#}"),
+            }
+        }
+        let t = now_ms();
+        store.borrow_mut().begin_round(t);
+        let scrapes = targets.iter().map(|(id, addr)| {
+            let (id, addr) = (*id, addr.clone());
+            async move {
+                let Some(addr) = addr else {
+                    return (id, None, Err(anyhow!("no /metrics endpoint reported")));
+                };
+                let a = addr.clone();
+                let got = compio::runtime::spawn_blocking(move || scrape(&a))
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("scrape thread panicked")));
+                (id, Some(addr), got)
+            }
+        });
+        for (id, addr, got) in futures::future::join_all(scrapes).await {
+            fold_scrape(&mut store.borrow_mut(), id, t, addr, got);
+        }
+        compio::time::sleep(cfg.metrics_interval.saturating_sub(round.elapsed())).await;
+    }
 }
 
 /// `/api/ops` — one round trip for the ops panel.
@@ -606,6 +766,8 @@ fn parse_args() -> Result<(Config, String, u16)> {
     let mut port: u16 = 8799;
     let mut autumn_op = "autumn-op".to_string();
     let mut cluster_secret_file: Option<String> = None;
+    let mut metrics_interval = Duration::from_secs(10);
+    let mut metrics_retention = Duration::from_secs(3600);
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < raw.len() {
@@ -634,6 +796,17 @@ fn parse_args() -> Result<(Config, String, u16)> {
                 i += 1;
                 cluster_secret_file = Some(req(&raw, i)?);
             }
+            "--metrics-interval-secs" => {
+                i += 1;
+                metrics_interval = Duration::from_secs(req(&raw, i)?.parse()?);
+                if metrics_interval.is_zero() {
+                    bail!("--metrics-interval-secs must be at least 1");
+                }
+            }
+            "--metrics-retention-secs" => {
+                i += 1;
+                metrics_retention = Duration::from_secs(req(&raw, i)?.parse()?);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -654,6 +827,8 @@ fn parse_args() -> Result<(Config, String, u16)> {
             transport,
             autumn_op,
             cluster_secret_file,
+            metrics_interval,
+            metrics_retention,
         },
         listen,
         port,
@@ -670,6 +845,11 @@ async fn main() -> Result<()> {
 
     let (cfg, listen, port) = parse_args()?;
     let cfg = Rc::new(cfg);
+    let store = Rc::new(RefCell::new(MetricsStore::new(
+        cfg.metrics_interval,
+        cfg.metrics_retention,
+    )));
+    compio::runtime::spawn(metrics_poller(cfg.clone(), store.clone())).detach();
 
     // Wrap the !Send Rc<Config> in SendWrapper to satisfy axum's Send bound —
     // safe because compio runs everything on one thread (the gallery idiom).
@@ -713,6 +893,11 @@ async fn main() -> Result<()> {
         let c = c.clone();
         SendWrapper::new(async move { policies_delete(&c, body).await })
     });
+    let st = SendWrapper::new(store.clone());
+    let metrics_route = get(move |Query(q): Query<MetricsQuery>| {
+        let st = st.clone();
+        SendWrapper::new(async move { metrics(&st, q) })
+    });
 
     let app = Router::new()
         .route("/", get(index))
@@ -723,7 +908,8 @@ async fn main() -> Result<()> {
         .route("/api/policies", policies_route)
         .route("/api/policies/activate", activate_route)
         .route("/api/policies/upsert", upsert_route)
-        .route("/api/policies/delete", delete_route);
+        .route("/api/policies/delete", delete_route)
+        .route("/api/metrics", metrics_route);
 
     let listener = compio::net::TcpListener::bind(format!("{listen}:{port}")).await?;
     tracing::info!(
@@ -733,4 +919,45 @@ async fn main() -> Result<()> {
     );
     cyper_axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fold_scrape, parse_metrics_targets};
+    use crate::metrics_store::{MetricsStore, Scope};
+    use anyhow::anyhow;
+    use std::time::Duration;
+
+    const TEXT: &str = "# TYPE autumn_ps_partition_sst_tables gauge\n\
+                        autumn_ps_partition_sst_tables{ps=\"1\",part=\"7\"} 3\n";
+
+    #[test]
+    fn a_ps_without_an_endpoint_does_not_blank_the_cluster_view() {
+        let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
+        st.begin_round(10_000);
+        fold_scrape(&mut st, 1, 10_000, Some("a:1".into()), Ok(TEXT.into()));
+        fold_scrape(&mut st, 2, 10_000, None, Err(anyhow!("no /metrics endpoint reported")));
+        assert_eq!(st.query(&Scope::Cluster)["series"]["sst_tables"], serde_json::json!([3.0]));
+        // A PS with an endpoint that fails this round does leave a gap.
+        st.begin_round(20_000);
+        fold_scrape(&mut st, 1, 20_000, Some("a:1".into()), Ok(TEXT.into()));
+        fold_scrape(&mut st, 3, 20_000, Some("c:3".into()), Err(anyhow!("refused")));
+        assert_eq!(
+            st.query(&Scope::Cluster)["series"]["sst_tables"],
+            serde_json::json!([3.0, null])
+        );
+    }
+
+    #[test]
+    fn evicted_members_are_not_scrape_targets() {
+        let ov = serde_json::json!({"ps_servers": [
+            {"ps_id": 1, "metrics_addr": "10.0.0.1:9701", "evicted_at_ms": null},
+            {"ps_id": 2, "metrics_addr": null, "evicted_at_ms": null},
+            {"ps_id": 3, "metrics_addr": null, "evicted_at_ms": 1700000000000u64},
+        ]});
+        assert_eq!(
+            parse_metrics_targets(&ov).unwrap(),
+            vec![(1, Some("10.0.0.1:9701".to_string())), (2, None)]
+        );
+    }
 }

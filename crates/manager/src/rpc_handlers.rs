@@ -5552,6 +5552,7 @@ impl AutumnManager {
                     .unwrap_or(u64::MAX),
                 partition_count: per_ps_parts.get(ps_id).copied().unwrap_or(0),
                 slot_cap: s.ps_slot_caps.get(ps_id).copied().unwrap_or(0),
+                metrics_addr: s.ps_metrics_addrs.get(ps_id).cloned().unwrap_or_default(),
                 open_count: s
                     .ps_open_parts
                     .contains_key(ps_id)
@@ -6120,6 +6121,11 @@ impl AutumnManager {
                 Self::record_slot_cap(&mut s, req.ps_id, req.slot_cap);
                 s.ps_open_parts
                     .insert(req.ps_id, req.open_parts.into_iter().collect());
+                if req.metrics_addr.is_empty() {
+                    s.ps_metrics_addrs.remove(&req.ps_id);
+                } else {
+                    s.ps_metrics_addrs.insert(req.ps_id, req.metrics_addr);
+                }
             }
             known
         };

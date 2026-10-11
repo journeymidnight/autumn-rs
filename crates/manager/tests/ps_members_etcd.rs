@@ -55,6 +55,7 @@ async fn heartbeat(mgr: &RpcClient, ps_id: u64) {
         ps_id,
         slot_cap: 0,
         open_parts: Vec::new(),
+        metrics_addr: String::new(),
     };
     let r = code_of(mgr, MSG_HEARTBEAT_PS, rkyv_encode(&req).to_vec()).await;
     assert_eq!(r.code, CODE_OK, "heartbeat ps {ps_id}: {}", r.message);
@@ -227,6 +228,7 @@ fn a_standby_promoted_late_keeps_the_heartbeating_fleet() {
                 ps_id: 4,
                 slot_cap: 0,
                 open_parts: Vec::new(),
+                metrics_addr: String::new(),
             })
             .to_vec(),
         )

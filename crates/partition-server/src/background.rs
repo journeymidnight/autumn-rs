@@ -24,6 +24,7 @@ use crate::sstable::{
 /// materialization this replaces).
 pub(crate) const SCAN_READ_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 use crate::*;
+use crate::metrics::MinorCause;
 
 /// Record a terminal maintenance outcome onto the partition's heartbeat ring so
 /// the manager's op-ledger learns the state + error string. No-op for untracked
@@ -2310,6 +2311,7 @@ pub(crate) async fn finish_write_batch(
         });
 
         p.active.insert_batch(iter);
+        p.publish_lsm_gauges();
         if deletes > 0 {
             p.metrics
                 .unsettled_deletes
@@ -2511,14 +2513,14 @@ async fn run_minor_compaction(
         let pick = match trigger {
             MinorTrigger::Reclaim { extent_id, sealed_len } => {
                 crate::compact_policy::select_reclaim(&tables, extent_id, sealed_len, policy.max_files)
-                    .map(|w| (w, "reclaim"))
+                    .map(|w| (w, MinorCause::Reclaim))
             }
             MinorTrigger::Flush | MinorTrigger::Tick => {
                 pick_minor(&tables).map(|p| {
                     let why = match (p.forced, trigger) {
-                        (true, _) => "blocking",
-                        (false, MinorTrigger::Flush) => "flush",
-                        (false, _) => "tick",
+                        (true, _) => MinorCause::Blocking,
+                        (false, MinorTrigger::Flush) => MinorCause::Flush,
+                        (false, _) => MinorCause::Tick,
                     };
                     (p.window, why)
                 })
@@ -2534,9 +2536,10 @@ async fn run_minor_compaction(
                         MinorTrigger::Reclaim { .. } => &MINOR_RUNS_RECLAIM,
                     };
                     runs.fetch_add(1, Relaxed);
+                    metrics.record_minor_compaction(why);
                     tracing::info!(
                         part_id,
-                        trigger = why,
+                        trigger = why.name(),
                         ?window,
                         tables_before = tables.len(),
                         input = crate::human_size(input_bytes),
@@ -2551,7 +2554,7 @@ async fn run_minor_compaction(
                         tracing::warn!(part_id, "minor compaction: row stream truncate: {e:#}");
                     }
                 }
-                Err(e) => tracing::error!(part_id, trigger = why, "minor compaction: {e:#}"),
+                Err(e) => tracing::error!(part_id, trigger = why.name(), "minor compaction: {e:#}"),
             }
         }
     }
@@ -3281,6 +3284,8 @@ pub(crate) async fn do_compact(
         p.tables = tables;
         p.sst_readers = sst_readers;
         p.durable_ckpt_vp.set((ckpt_vp_eid, ckpt_vp_off));
+        p.metrics.record_compaction(major, output_bytes);
+        p.publish_lsm_gauges();
     }
     Ok(CompactStats {
         input_tables,
@@ -3818,6 +3823,7 @@ async fn flush_gc_batch(
         p.vp_extent_id = result.extent_id;
         p.vp_offset = result.end;
         p.active.insert_batch(insert_items);
+        p.publish_lsm_gauges();
         // BUG1: the GC multi-frag rewrite re-appends live
         // values to log_stream and seeds them into the active memtable, so they
         // join the un-flushed LOG window that recovery would replay. Track the
@@ -4463,6 +4469,16 @@ pub(crate) async fn lookup_in_sst_via(
     if !reader.may_contain(user_key) {
         return Ok(None);
     }
+    read_sst_entry_via(reader, user_key, sc, cache).await
+}
+
+/// `lookup_in_sst_via` past its `may_contain` check: reads the key's block.
+pub(crate) async fn read_sst_entry_via(
+    reader: &SstReader,
+    user_key: &[u8],
+    sc: &Rc<StreamClient>,
+    cache: &crate::sstable::BlockCache,
+) -> Result<Option<(u8, Bytes, u64)>> {
     let target = key_with_ts(user_key, u64::MAX);
     let block_idx = reader.find_block_for_key(&target);
     let block = reader.read_block_via(block_idx, sc, cache).await?;

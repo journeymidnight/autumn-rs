@@ -123,8 +123,26 @@ const POLICIES = {
                switches: { split: false, ec: false, compact: false, gc: true, merge: false, rebalance: false } }],
   switch_order: ["split", "ec", "compact", "gc", "merge", "rebalance", "repair", "scrub"],
 };
-const payload = { "/api/overview": OVERVIEW, "/api/ops": OPS, "/api/policies": POLICIES };
-const fetchStub = async p => ({ ok: true, json: async () => payload[p] ?? PART });
+// /api/metrics: three rounds; PS 2 reports no endpoint. A partition scope has
+// no PS-wide (block cache) series.
+const T0 = Date.now() - 20000;
+const METRICS_SERIES = {
+  requests: [10, 12, 11], write_bytes: [1048576, 2097152, 1048576], read_bytes: [0, 4096, 8192],
+  sst_tables: [6, 7, 5], "sst_tables:max": [4, 4, 3],
+  "minor_compactions{trigger=flush}": [null, 0.1, 0],
+  get_duration_seconds_sum: [0.001, 0.002, 0.003], get_duration_seconds_count: [10, 10, 10],
+  "get_duration_seconds_bucket{le=0.0005}": [5, 5, 5], "get_duration_seconds_bucket{le=0.001}": [10, 10, 10],
+};
+const METRICS = {
+  interval_secs: 10, retention_secs: 3600, t: [T0, T0 + 10000, T0 + 20000],
+  series: Object.assign({ block_cache_hits: [null, 2, 3], block_cache_misses: [null, 2, 1] }, METRICS_SERIES),
+  ps: [{ ps_id: 1, metrics_addr: "127.0.0.1:9701", last_ok_ms: T0 + 20000, error: null },
+       { ps_id: 2, metrics_addr: null, last_ok_ms: null, error: "no /metrics endpoint reported" }],
+};
+const METRICS_PART = Object.assign({}, METRICS, { series: METRICS_SERIES });
+const payload = { "/api/overview": OVERVIEW, "/api/ops": OPS, "/api/policies": POLICIES, "/api/metrics": METRICS };
+const fetchStub = async p => ({ ok: true, json: async () =>
+  p.startsWith("/api/metrics?scope=part") ? METRICS_PART : payload[p] ?? PART });
 
 const api = new Function(
   "document", "location", "window", "fetch", "setInterval", "clearInterval", "setTimeout", "confirm",
@@ -134,10 +152,14 @@ const api = new Function(
 const settle = () => new Promise(r => setTimeout(r, 30));
 (async () => {
   await settle();
-  for (const t of ["overview", "partitions", "servers", "nodes", "policy", "logs"]) {
+  for (const t of ["overview", "partitions", "servers", "nodes", "policy", "logs", "metrics"]) {
     api.setTab(t);
     await settle();
   }
+  const clusterCharts = nodes.m_charts.innerHTML;
+  nodes.m_scope.onchange({ target: { value: "part:1" } });
+  await settle();
+  const partCharts = nodes.m_charts.innerHTML;
   await api.openDetail(1);
   api.openNode(2);
   const deadNodeDrawer = nodes.nodedrawer.innerHTML;
@@ -197,6 +219,22 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   want("#ops_live", "gc", "running ops are on the Logs tab");
   want("#ops_live", "auto-policy", "…naming who asked, so the policy's own ops are told apart");
   want("#ops_hist", "no address for part 1", "…and a failed op keeps its reason");
-  console.log(bad ? `tabs smoke FAILED (${bad})` : "tabs smoke OK — six tabs + both drawers render");
+  // Metrics: charts from the scraped history, and which PS could not be scraped.
+  const has = (html, needle, why) => {
+    if (!html.includes(needle)) { console.error(`FAIL #m_charts: ${why} — missing ${JSON.stringify(needle)}`); bad++; }
+  };
+  has(clusterCharts, "SST tables", "the table count is charted");
+  has(clusterCharts, "largest partition", "…with the largest partition beside the sum");
+  has(clusterCharts, '<path d="M', "a series is drawn as a line");
+  has(clusterCharts, "Block cache hit ratio <b>75.0%</b>", "the cluster view derives the cache hit ratio");
+  has(clusterCharts, "minor · flush", "minor compactions are split by trigger");
+  has(partCharts, "SST tables", "a partition view still charts its tables");
+  if (partCharts.includes("Block cache") || partCharts.includes("largest partition")) {
+    console.error("FAIL #m_charts(part): a partition view has no PS-wide cache or largest-partition line"); bad++;
+  }
+  want("#m_scope", "part:1", "partitions are selectable scopes");
+  want("#m_endpoints", "1/2 partition servers scraped", "the endpoint line counts scraped servers");
+  want("#m_endpoints", "PS 2: no /metrics endpoint reported", "…and names the one that could not be");
+  console.log(bad ? `tabs smoke FAILED (${bad})` : "tabs smoke OK — seven tabs + both drawers render");
   process.exit(bad ? 1 : 0);
 })();

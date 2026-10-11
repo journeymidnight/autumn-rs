@@ -495,7 +495,7 @@ autumn-dashboard \
 kubectl -n autumn port-forward svc/autumn-dashboard 8799:8799   # → http://localhost:8799/
 ```
 
-**Six tabs**, with the vital signs (topology / capacity / throughput /
+**Seven tabs**, with the vital signs (topology / capacity / throughput /
 controller) pinned above all of them. The tab is in the URL hash (`#nodes`), so
 a view is linkable.
 
@@ -507,6 +507,7 @@ a view is linkable.
 | Nodes | every extent node, with a **per-disk** table — capacity, online, faulted |
 | Policy | advisories with their full reasoning, the controller, the policy editor |
 | Logs | every op — the operator's and the auto-policy's alike — running, then durable outcomes, each marked with who asked |
+| Metrics | charts of every PS's `/metrics`, scraped by the dashboard and kept in its memory, for the cluster, one PS or one partition |
 
 Manual actions map to the allow-listed `autumn-op` subcommands (`split` / `gc` /
 `compact` / `merge` / `force-ec-convert` / `rebalance`).
@@ -522,6 +523,31 @@ The [2026-10-09 VKE fault-test report](vke-stress-20261009.md) records the
 CP revisions, live range checks, two EN outages, two manager failovers,
 split/merge outcomes, and full acknowledged-data readback. It also describes
 the reproduced standby-promotion heartbeat bug and its isolated comparison.
+
+**Metrics tab.** The one thing the dashboard does without `autumn-op`: it
+scrapes each PS's `/metrics` at the address the PS reports on its heartbeat
+(the PS needs `--metrics-port`; `cluster.sh` / the deploy paths pass it with
+`AUTUMN_METRICS=1`). `--metrics-interval-secs` (10) and
+`--metrics-retention-secs` (3600) set the cadence and how much history it keeps;
+the history is memory only and starts empty after a dashboard restart.
+
+```bash
+AUTUMN_METRICS=1 ./cluster.sh start 3
+# Each PS's reported endpoint (null = started without --metrics-port):
+autumn-op --manager $MGR --json overview | python3 -c '
+import json,sys
+for p in json.load(sys.stdin)["ps_servers"]: print("PS", p["ps_id"], p["metrics_addr"])'
+autumn-dashboard --manager $MGR --cluster-secret-file $SECRET --metrics-interval-secs 2 &
+# After a few rounds, the history (scope=ps&id=N or scope=part&id=N narrows it):
+curl -s localhost:8799/api/metrics | python3 -c '
+import json,sys; m=json.load(sys.stdin)
+print(len(m["t"]), "rounds;", m["ps"]); print(sorted(m["series"])[:12])'
+```
+
+Run a perf-check write then read; on the Metrics tab requests/s and value
+bytes/s rise, the block cache hit ratio settles, SST tables grow with flushes,
+and a small `--flush-mem-bytes` shows minor compactions keeping the count down.
+A PS without the flag is named on the tab ("no /metrics endpoint reported").
 
 **Manual check of the two tabs that exist for facts a roll-up cannot carry:**
 
@@ -1396,7 +1422,7 @@ the deploy paths accept the same env (autumn-deploy / k8s entrypoint).
 ```bash
 AUTUMN_METRICS=1 AUTUMN_TRANSPORT=tcp ./cluster.sh start 3
 curl -s http://127.0.0.1:9591/metrics   # manager: leader/serving + streams/extents/nodes/partitions/ps/regions counts, per-disk online, inflight ops
-curl -s http://127.0.0.1:9701/metrics   # PS: per-partition requests_total (monotonic), size/gc-debt/pending-compaction bytes, gc/compact inflight, sealed log extents
+curl -s http://127.0.0.1:9701/metrics   # PS: block cache hits/misses/bytes; per partition: requests, value bytes, SST tables, memtable, flushes, minor (by trigger) / major compactions, point-lookup SST checks, large-value reads, maintenance debt
 curl -s http://127.0.0.1:9601/metrics   # EN: append batches/bytes/ns totals, extents per shard + total, per-disk online
 ```
 
@@ -1416,9 +1442,27 @@ observed per batched op from the already-measured WriteLoopMetrics
 serve incl. VP resolve) — Prometheus histogram exposition per partition,
 buckets 0.5ms..250ms. A/B perf-checked (4K, p8, d8): no write regression.
 
+PS read path and LSM shape (all per partition unless noted):
+
+| Metric | Means |
+|---|---|
+| `autumn_ps_block_cache_{hits,misses}_total`, `_bytes`, `_capacity_bytes` | the PS's SST block cache (per PS, `--sst-block-cache-bytes`) |
+| `autumn_ps_partition_get_sst_checks_total{result}` | per point lookup, SSTs `skipped` by key range or bloom, read and found (`hit`), read and absent (`false_positive` of the bloom) |
+| `autumn_ps_partition_vp_reads_total`, `_vp_read_bytes_total` | large values the PS read from the log stream (no PS cache on this path) |
+| `autumn_ps_partition_sst_tables`, `_memtable_bytes`, `_imm_memtables` | the LSM's shape now |
+| `autumn_ps_partition_flushes_total`, `_flush_bytes_total` | committed flushes |
+| `autumn_ps_partition_minor_compactions_total{trigger}` | minors by cause: `flush`, `tick`, `blocking`, `reclaim` |
+| `autumn_ps_partition_major_compactions_total`, `_compaction_write_bytes_total{kind}` | majors, and what compactions wrote |
+| `autumn_ps_partition_write_bytes_total`, `_read_bytes_total` | value bytes written / served |
+
 Manual verify: write a few keys with `autumn-client put`, then confirm
 `autumn_ps_partition_requests_total` increments on the owning partition and
-`autumn_en_append_bytes_total` grows. Notes: all snapshots/gauges refresh
+`autumn_en_append_bytes_total` grows. Read them back twice: the second read's
+blocks come from the cache (`hits` grows), and each GET adds to
+`get_sst_checks_total` once its key is flushed out of the memtable. A `flush`
+bumps `flushes_total` and `sst_tables`; with small flushes (`--flush-mem-bytes`
+4 MiB) and a perf-check write run, `minor_compactions_total{trigger="flush"}`
+climbs and `sst_tables` stays low. Notes: all snapshots/gauges refresh
 every 2 s (PS/manager publisher task; EN per-shard refresh loop); PS
 `requests_total` resets on PS restart (normal Prometheus counter semantics
 — use `rate()`).

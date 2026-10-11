@@ -1054,10 +1054,18 @@ async fn sst_lookup_paged_retry(
                 p.block_cache.clone(),
             )
         };
+        let (mut skipped, mut false_positives) = (0u64, 0u64);
         for reader in readers.iter().rev() {
-            match lookup_in_sst_via(reader, key, &sc, &cache).await {
-                Ok(Some(r)) => return Ok(Some(r)),
-                Ok(None) => {}
+            if !reader.may_contain(key) {
+                skipped += 1;
+                continue;
+            }
+            match read_sst_entry_via(reader, key, &sc, &cache).await {
+                Ok(Some(r)) => {
+                    part.borrow().metrics.record_sst_lookup(skipped, true, false_positives);
+                    return Ok(Some(r));
+                }
+                Ok(None) => false_positives += 1,
                 Err(e) => {
                     let changed =
                         crate::sst_readers_changed(&part.borrow().sst_readers, &readers);
@@ -1068,6 +1076,7 @@ async fn sst_lookup_paged_retry(
                 }
             }
         }
+        part.borrow().metrics.record_sst_lookup(skipped, false, false_positives);
         return Ok(None);
     }
 }
@@ -1248,10 +1257,15 @@ async fn get_value_inner(
 
     // Read-throughput accounting: bytes the PS actually served (resolved-value
     // path only; large-VP Redirect is read directly from the EN, not here).
-    part.borrow()
-        .metrics
-        .read_bytes
-        .fetch_add(value.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = part.borrow();
+        p.metrics.read_bytes.fetch_add(value.len() as u64, Relaxed);
+        if is_vp {
+            p.metrics.vp_reads.fetch_add(1, Relaxed);
+            p.metrics.vp_read_bytes.fetch_add(value.len() as u64, Relaxed);
+        }
+    }
 
     Ok(GetOutcome::Value(value))
 }

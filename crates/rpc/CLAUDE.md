@@ -902,6 +902,13 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## PS heartbeat carries its metrics endpoint (wire 62)
+
+`HeartbeatPsReq` gains `metrics_addr` (the PS's `/metrics` `host:port`, empty
+without `--metrics-port`); `PsOverview` gains `metrics_addr`. The manager keeps
+it in memory only, for the dashboard's metrics poller. PS → manager (Peer) and
+Admin: the ceiling rises to [43, 62], the floor stays.
+
 ## Merge freeze reports its drained log end (wire 61)
 
 `MergeFreezeResp` gains `log_tail_extent_id` / `log_end`: on a freeze OK, the

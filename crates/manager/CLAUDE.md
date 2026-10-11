@@ -532,7 +532,10 @@ misconfiguration.
 
 `ps_last_heartbeat: Arc<Mutex<HashMap<u64, Instant>>>` (ephemeral, not persisted).
 `register_ps` seeds a timestamp; the PS calls `heartbeat_ps` every 2 s (both
-carry `slot_cap`, recorded only for a registered PS — see "Rebalance");
+carry `slot_cap`, recorded only for a registered PS — see "Rebalance"; the beat
+also carries the PS's `/metrics` address, kept in memory only in
+`MetadataState::ps_metrics_addrs` like the slot caps and shown as the overview's
+`ps_servers[].metrics_addr` for the dashboard's poller);
 `ps_liveness_check_loop` (2 s) evicts a PS not seen in 10 s — fenced
 `put_and_delete_txn(delete psNodes/<id>)` then `rebalance_regions`. On eviction
 `handle_heartbeat_ps` returns `CODE_NOT_FOUND` so the PS re-registers +
@@ -589,7 +592,9 @@ left_at_ms}`:
 The overview's `ps_servers` is members ∪ live registry; an evicted member has
 no heartbeat and `evicted_at_ms` set. psid uniqueness is the OPERATOR's job:
 two processes with one psid are counted as one PS, with no error (the
-manager does not judge registrations). There is no seeding
+manager does not judge registrations; owner-epoch fencing keeps their writes
+apart). A psid is the identity, like `--manager-id` for a manager; the address
+is only where it is now. There is no seeding
 from `psNodes/`: an upgrade is a full restart, and every PS registers.
 Test: `tests/ps_members_etcd.rs` (evicted PS listed, survives a leader change,
 live remove refused; ablations: eviction forgetting the member, replay not
@@ -1984,7 +1989,8 @@ scrub is running.
 The manager **no longer serves a web UI** — the old in-manager `dashboard.rs`
 (axum over `cyper_axum::serve` + `include_str!` HTML) is gone. The dashboard is
 now a standalone app, `crates/server/src/bin/autumn_dashboard` (the `autumn-dashboard` binary), which
-holds no cluster state and drives the cluster ONLY through `autumn-op` — so the
+holds no cluster state and drives the cluster ONLY through `autumn-op` (its
+Metrics tab scrapes PS `/metrics` directly, at `ps_servers[].metrics_addr`) — so the
 wire schema stays in exactly one place. It requires `--cluster-secret-file` (forwarded to autumn-op, which connects as an operator); the dashboard HTTP port itself has no authentication.
 
 What survives in this crate is `dashboard_compose.rs`: the pure `/api/overview`

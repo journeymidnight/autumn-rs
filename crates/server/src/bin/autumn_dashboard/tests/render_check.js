@@ -27,6 +27,29 @@ const escLine = page.split("\n").find(l => l.startsWith("const esc ="));
 // Same treatment for the other one-line const helpers the lifted functions call.
 const constLine = name => page.split("\n").find(l => l.startsWith(`const ${name} =`));
 
+// Metrics: the histogram quantile and the line chart, lifted like the rest.
+{
+  const msrc = [escLine, lift("fmtBytes"), lift("zipWith"), lift("histQuantile"), lift("lastOf"),
+                lift("fmtSecs"), lift("lineChart")].join("\n");
+  const M = new Function(msrc + "\nreturn {histQuantile, lineChart, zipWith};")();
+  const series = {
+    "lat_bucket{le=0.0005}": [50, 0, 100], "lat_bucket{le=0.001}": [90, null, 100],
+    "lat_bucket{le=0.002}": [100, 0, 100], lat_count: [100, 0, 200],
+  };
+  const near = (a, b) => a != null && Math.abs(a - b) < 1e-12;
+  const p99 = M.histQuantile(series, "lat", 0.99), p50 = M.histQuantile(series, "lat", 0.5);
+  const fails = [];
+  if (!near(p99[0], 0.0019)) fails.push(`p99 interpolates inside its bucket: ${p99[0]}`);
+  if (!near(p50[0], 0.0005)) fails.push(`p50 at a bucket edge: ${p50[0]}`);
+  if (p99[1] !== null) fails.push(`no requests in a round = no quantile: ${p99[1]}`);
+  if (!near(p99[2], 0.002)) fails.push(`past the last bound answers that bound: ${p99[2]}`);
+  const svg = M.lineChart("L", [0, 1, 2, 3], String, [{ name: "a", color: "#fff", data: [1, null, 3, 4] }]);
+  if ((svg.match(/M/g) || []).length !== 2) fails.push(`a null breaks the line: ${svg}`);
+  if (!M.lineChart("L", [0], String, [{ name: "a", color: "#fff", data: [null] }]).includes("no data yet"))
+    fails.push("an all-null chart says there is no data");
+  if (fails.length) { console.error("FAIL metrics: " + fails.join("; ")); process.exit(1); }
+}
+
 let OUT = {};
 const ctx = { $: sel => ({ set innerHTML(v) { OUT[sel] = v; } }) };
 const src = [escLine, constLine("jsAttr"), constLine("BYTE_KINDS"),

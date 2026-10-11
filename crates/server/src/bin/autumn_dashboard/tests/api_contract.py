@@ -27,7 +27,7 @@ def ports():
         base = random.randrange(22000, 50000)
         sockets = []
         try:
-            for offset in (1, 101, 1101, 201, 301, 401, 402):
+            for offset in (1, 101, 1101, 201, 301, 401, 402, 501):
                 s = socket.socket()
                 sockets.append(s)
                 s.bind(('127.0.0.1', base + offset))
@@ -56,7 +56,7 @@ def eventually(fn, timeout=30):
 
 def run():
     base = ports()
-    mgr, en, ps, dash, etcd = [base + n for n in (1, 101, 201, 301, 401)]
+    mgr, en, ps, dash, etcd, ps_metrics = [base + n for n in (1, 101, 201, 301, 401, 501)]
     address = f'127.0.0.1:{mgr}'
     children, logs = [], []
     with tempfile.TemporaryDirectory(prefix='autumn-dashboard-') as tmp:
@@ -121,10 +121,12 @@ def run():
             eventually(disks_ready)
             op('bootstrap', '--replication', '1+0')
             spawn('ps', [str(BIN/'autumn-ps'), '--psid', '1', '--port', str(ps), '--manager', address,
-                '--listen', '127.0.0.1', '--advertise', f'127.0.0.1:{ps}', '--cluster-secret-file', str(secret)])
+                '--listen', '127.0.0.1', '--advertise', f'127.0.0.1:{ps}', '--cluster-secret-file', str(secret),
+                '--metrics-port', str(ps_metrics)])
             eventually(lambda: ready(ps))
             spawn('dashboard', [str(BIN/'autumn-dashboard'), '--manager', address, '--autumn-op', str(BIN/'autumn-op'),
-                '--port', str(dash), '--listen', '127.0.0.1', '--cluster-secret-file', str(secret)])
+                '--port', str(dash), '--listen', '127.0.0.1', '--cluster-secret-file', str(secret),
+                '--metrics-interval-secs', '1'])
             eventually(lambda: ready(dash))
             assert http('/') == PAGE.read_bytes(), 'served page must be from this build'
             def overview_ready():
@@ -149,6 +151,27 @@ def run():
             server = v['ps_servers'][0]
             assert {'ps_id','addr','last_heartbeat_secs_ago','partition_count','n','size','req_per_sec','write_bytes_per_sec','read_bytes_per_sec','total_extents','open_count','ready'} <= server.keys()
             assert server['last_heartbeat_secs_ago'] is not None and server['last_heartbeat_secs_ago'] < 60
+            # The PS reports its /metrics address on its heartbeat; the
+            # dashboard scrapes it and serves the history.
+            eventually(lambda: http('/api/overview')['ps_servers'][0].get('metrics_addr') == f'127.0.0.1:{ps_metrics}')
+            with urllib.request.urlopen(f'http://127.0.0.1:{ps_metrics}/metrics', timeout=5) as r:
+                text = r.read().decode()
+            for name in ('autumn_ps_block_cache_hits_total', 'autumn_ps_block_cache_capacity_bytes',
+                         'autumn_ps_partition_sst_tables', 'autumn_ps_partition_memtable_bytes',
+                         'autumn_ps_partition_flushes_total', 'autumn_ps_partition_minor_compactions_total',
+                         'autumn_ps_partition_compaction_write_bytes_total', 'autumn_ps_partition_get_sst_checks_total',
+                         'autumn_ps_partition_vp_reads_total', 'autumn_ps_partition_write_bytes_total'):
+                assert f'# TYPE {name} ' in text, name
+            def history():
+                m = http('/api/metrics')
+                return m if len(m['t']) >= 3 and m['series'].get('block_cache_capacity_bytes', [None])[-1] else None
+            m = eventually(history)
+            assert m['ps'] == [{'ps_id': 1, 'metrics_addr': f'127.0.0.1:{ps_metrics}', 'last_ok_ms': m['ps'][0]['last_ok_ms'], 'error': None}], m['ps']
+            assert m['series']['block_cache_capacity_bytes'][-1] == 512 * 1024 * 1024
+            assert len(m['series']['sst_tables']) == len(m['t'])
+            part_view = http(f"/api/metrics?scope=part&id={v['partitions'][0]['part_id']}")
+            assert 'sst_tables' in part_view['series'] and 'block_cache_hits' not in part_view['series']
+            http('/api/metrics?scope=ps', expected=400)
             disks = v['nodes'][0]['disks']
             assert len(disks) == 2 and len({d['disk_id'] for d in disks}) == 2
             assert all(d['reported'] and d['online'] and not d['faulted'] and d['total'] > 0 and d['uuid'] for d in disks)
@@ -196,7 +219,7 @@ def run():
             manager.terminate(); manager.wait(timeout=10)
             http('/api/policies', expected=502)
             http('/api/policies/activate', {'enabled':True}, expected=502)
-            print('dashboard API contract OK: page, topology, disks, detail, durable ops, policy lifecycle, validation, upstream failures')
+            print('dashboard API contract OK: page, topology, PS metrics history, disks, detail, durable ops, policy lifecycle, validation, upstream failures')
         except BaseException:
             for log in logs:
                 log.flush()

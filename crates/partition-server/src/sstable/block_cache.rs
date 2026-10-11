@@ -69,6 +69,10 @@ impl BlockCache {
         }
     }
 
+    pub fn cap_bytes(&self) -> usize {
+        self.cap_bytes
+    }
+
     pub fn get(&self, key: (u64, u64)) -> Option<Arc<DecodedBlock>> {
         let mut g = self.inner.lock();
         match g.map.get(&key).copied() {
@@ -153,8 +157,7 @@ impl BlockCache {
         }
     }
 
-    /// TEST-ONLY diagnostic snapshot: `(bytes, entries, hits, misses)`.
-    #[cfg(test)]
+    /// `(bytes, entries, hits, misses)` — `/metrics` reads it.
     pub fn stats(&self) -> (usize, usize, u64, u64) {
         let g = self.inner.lock();
         (g.bytes, g.map.len(), g.hits, g.misses)

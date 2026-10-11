@@ -890,6 +890,9 @@ pub struct HeartbeatPsReq {
     /// serving right now. The manager compares it with the regions it assigned
     /// to judge the PS ready; like `slot_cap` it is kept in memory only.
     pub open_parts: Vec<(u64, u64)>,
+    /// `host:port` of this PS's Prometheus `/metrics`; empty without
+    /// `--metrics-port`. In memory only, like `slot_cap`.
+    pub metrics_addr: String,
 }
 // Response: CodeResp
 
@@ -1518,6 +1521,9 @@ pub struct PsOverview {
     /// Core-pinned partition slots this PS reported; `0` = no `--cpuset`, or
     /// not yet heard from since this manager became leader.
     pub slot_cap: u32,
+    /// `host:port` of its `/metrics` from its latest heartbeat; empty = no
+    /// endpoint, or not heard from since this manager became leader.
+    pub metrics_addr: String,
     /// How many of the `partition_count` assigned partitions the PS's latest
     /// heartbeat reported open at their current region epoch; `None` = no
     /// heartbeat with that report since the PS registered or this manager

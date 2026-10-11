@@ -4,10 +4,11 @@
   Served by the standalone `autumn-dashboard` app (crates/server/src/bin/autumn_dashboard), which
   proxies every /api/* call to the `autumn-op` CLI.
 
-  SIX TABS, because the five questions an operator arrives with are different
+  SEVEN TABS, because the questions an operator arrives with are different
   questions and each wants the whole width: where is my keyspace (Overview),
   which partition (Partitions), which server (Servers), which disk (Nodes),
-  what will the controller do (Policy), what just happened (Logs).
+  what will the controller do (Policy), what just happened (Logs), how has it
+  been doing (Metrics).
 
   Each /api/* call SPAWNS an autumn-op subprocess, so the poll only fetches
   what the visible tab renders — /api/overview always (the header vitals and
@@ -22,6 +23,7 @@
     POST /api/action  {cmd}       → actuate one autumn-op mutation (danger mode)
     GET  /api/policies + POST /api/policies/{upsert,activate,delete}
     GET  /api/ops                 → {live, history}
+    GET  /api/metrics?scope=&id=  → PS /metrics history the dashboard scraped (no autumn-op call)
 -->
 <html lang="zh">
 <head>
@@ -218,6 +220,20 @@
 
   .panels { display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:16px; }
   .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; }
+  .mbar { display:flex; align-items:center; gap:14px; flex-wrap:wrap; }
+  .mbar .bad { color:var(--bad); }
+  .mbar select { background:var(--panel2); border:1px solid var(--line); border-radius:4px; color:var(--ink); font:inherit; padding:2px 6px; }
+  .charts { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:14px; margin-top:12px; }
+  .chart { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px 8px; min-width:0; }
+  .chart h3 { margin:0 0 4px; font-size:10px; font-weight:500; letter-spacing:.12em; text-transform:uppercase;
+    color:var(--dim); display:flex; justify-content:space-between; gap:8px; }
+  .chart h3 b { color:var(--ink); letter-spacing:0; text-transform:none; font-weight:500; font-size:12px; }
+  .chart svg { width:100%; height:110px; display:block; background:var(--panel2); border-radius:4px; }
+  .chart .axis { display:flex; justify-content:space-between; color:var(--muted); font-size:10.5px; margin-top:2px; }
+  .chart .legend { display:flex; flex-wrap:wrap; gap:2px 12px; font-size:11px; color:var(--dim); margin-top:3px; }
+  .chart .legend i { display:inline-block; width:10px; height:2px; vertical-align:middle; margin-right:5px; }
+  .chart .nodata { height:110px; display:flex; align-items:center; justify-content:center; color:var(--muted);
+    font-size:12px; background:var(--panel2); border-radius:4px; }
   .panel.wide { grid-column:1/-1; }
   .panel h2 { font-size:10px; font-weight:500; letter-spacing:.12em; text-transform:uppercase; color:var(--dim);
     margin:0 0 12px; display:flex; align-items:center; gap:8px; }
@@ -438,6 +454,17 @@
       <div class="panel wide"><h2>Recent outcomes · durable history</h2><div id="ops_hist"></div></div>
     </div>
   </section>
+
+  <!-- ── METRICS (each PS's /metrics, scraped and kept by the dashboard) ── -->
+  <section class="pane" id="pane-metrics" hidden>
+    <div class="cap" style="margin-top:2px"><span class="eyebrow">Metrics</span>
+      <span class="hint">scraped from every partition server's /metrics by this dashboard and kept in its memory — a restart starts over</span></div>
+    <div class="mbar">
+      <label class="ctrl">scope <select id="m_scope"></select></label>
+      <span class="stamp" id="m_endpoints"></span>
+    </div>
+    <div class="charts" id="m_charts"></div>
+  </section>
 </div></main>
 <div id="toast"></div>
 
@@ -546,6 +573,7 @@ const TABS = [
   {id:"nodes",      label:"Nodes",      needs:["overview"],                  render:renderNodesTab},
   {id:"policy",     label:"Policy",     needs:["overview","policies"],       render:renderPolicyTab},
   {id:"logs",       label:"Logs",       needs:["ops"],                       render:renderLogsTab},
+  {id:"metrics",    label:"Metrics",    needs:["overview","metrics"],        render:renderMetricsTab},
 ];
 let TAB = (location.hash||"#overview").slice(1);
 if(!TABS.some(t=>t.id===TAB)) TAB="overview";
@@ -1322,6 +1350,132 @@ $("#np_save").onclick=async()=>{
   await loadPolicies();
 };
 
+// ── Metrics tab ──────────────────────────────────────────────────────────────
+// The dashboard scrapes every PS's /metrics itself (the address each PS reports
+// on its heartbeat) and keeps the history in memory. /api/metrics sums the
+// scope's series on one time axis; counters arrive as per-second rates, and a
+// gauge summed over partitions also comes as `name:max` (the largest one).
+let METRICS=null;          // the last /api/metrics reply
+let M_SCOPE="cluster";     // "cluster" | "ps:<id>" | "part:<id>"
+function metricsPath(scope){
+  const [kind,id]=scope.split(":");
+  return kind==="cluster" ? "/api/metrics" : `/api/metrics?scope=${kind}&id=${encodeURIComponent(id)}`;
+}
+async function loadMetrics(){
+  try{ METRICS=await api(metricsPath(M_SCOPE)); }
+  catch(e){ METRICS=null; $("#m_endpoints").textContent="metrics unavailable: "+e.message; return; }
+  if(TAB==="metrics") renderMetricsTab();
+}
+// Element-wise f over equally long series; null where any input is null.
+function zipWith(f, ...arrs){
+  if(arrs.some(a=>!a)) return null;
+  return arrs[0].map((_,i)=>{ const v=arrs.map(a=>a[i]); return v.some(x=>x==null)?null:f(...v); });
+}
+// Quantile of a Prometheus histogram from its summed cumulative bucket rates,
+// interpolated inside the bucket. Past the last finite bound it answers that
+// bound (the true value is only known to be larger).
+function histQuantile(series, prefix, q){
+  const bounds=Object.keys(series)
+    .map(n=>{ const m=/^(.*)_bucket\{le=(.*)\}$/.exec(n); return m&&m[1]===prefix ? [parseFloat(m[2]), series[n]] : null; })
+    .filter(b=>b&&isFinite(b[0])).sort((a,b)=>a[0]-b[0]);
+  const count=series[prefix+"_count"];
+  if(!count||!bounds.length) return null;
+  return count.map((c,i)=>{
+    if(c==null||c<=0) return null;
+    const want=q*c; let lo=0, prev=0;
+    for(const [b,arr] of bounds){
+      const cum=arr[i]; if(cum==null) return null;
+      if(cum>=want){ const span=cum-prev; return span>0 ? lo+(b-lo)*(want-prev)/span : b; }
+      lo=b; prev=cum;
+    }
+    return bounds[bounds.length-1][0];
+  });
+}
+function fmtRate(v){ return v==null?"-":v>=1e6?(v/1e6).toFixed(1)+"M":v>=1e3?(v/1e3).toFixed(1)+"K":v>=10?v.toFixed(0):v.toFixed(2); }
+function fmtSecs(v){ return v==null?"-":v<1e-3?(v*1e6).toFixed(0)+" µs":v<1?(v*1e3).toFixed(2)+" ms":v.toFixed(2)+" s"; }
+function fmtBps(v){ return v==null?"-":fmtBytes(v)+"/s"; }
+function fmtNum(v){ return v==null?"-":Math.abs(v)>=100?v.toFixed(0):v.toFixed(2); }
+function fmtPct(v){ return v==null?"-":(v*100).toFixed(1)+"%"; }
+function lastOf(data){ for(let i=data.length-1;i>=0;i--) if(data[i]!=null) return data[i]; return null; }
+// One line chart: an SVG polyline per series, scaled to the largest value; a
+// gap (null) breaks the line rather than drawing through it.
+function lineChart(title, t, fmt, lines){
+  lines=lines.filter(l=>l.data);
+  const vals=lines.flatMap(l=>l.data.filter(v=>v!=null));
+  if(!vals.length) return `<div class="chart"><h3>${esc(title)}</h3><div class="nodata">no data yet</div></div>`;
+  const n=t.length, W=600, H=110, max=Math.max(...vals)>0?Math.max(...vals):1;
+  const x=i=>n<2?W:i*W/(n-1), y=v=>H-2-(v/max)*(H-6);
+  const paths=lines.map(l=>{
+    let d="", pen=false;
+    l.data.forEach((v,i)=>{ if(v==null){ pen=false; return; } d+=(pen?"L":"M")+x(i).toFixed(1)+","+y(v).toFixed(1); pen=true; });
+    return `<path d="${d}" fill="none" stroke="${l.color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
+  }).join("");
+  const mins=n>1?Math.round((t[n-1]-t[0])/60000):0;
+  return `<div class="chart"><h3>${esc(title)} <b>${esc(fmt(lastOf(lines[0].data)))}</b></h3>
+    <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${paths}</svg>
+    <div class="axis"><span>${mins?`last ${mins} min`:""}</span><span>max ${esc(fmt(max))}</span></div>
+    <div class="legend">${lines.map(l=>`<span><i style="background:${l.color}"></i>${esc(l.name)} ${esc(fmt(lastOf(l.data)))}</span>`).join("")}</div></div>`;
+}
+// Every chart the tab draws, from one /api/metrics reply. A partition scope has
+// no PS-wide series (the block cache is per PS) and no "largest partition" line.
+function metricsCharts(m, isPart){
+  const S=m.series, C=PALETTE, t=m.t;
+  const div=(a,b)=>zipWith((p,q)=>q>0?p/q:null,a,b);
+  const add=(...a)=>zipWith((...v)=>v.reduce((p,q)=>p+q,0),...a);
+  const perMin=a=>a&&a.map(v=>v==null?null:v*60);
+  const L=(name,data,i)=>({name,data,color:C[i%C.length]});
+  const out=[
+    lineChart("Requests / s", t, fmtRate, [L("requests",S["requests"],0)]),
+    lineChart("Value bytes / s", t, fmtBps, [L("write",S["write_bytes"],0), L("read",S["read_bytes"],1)]),
+    lineChart("GET latency", t, fmtSecs, [L("avg",div(S["get_duration_seconds_sum"],S["get_duration_seconds_count"]),0),
+      L("p99",histQuantile(S,"get_duration_seconds",0.99),4)]),
+    lineChart("Write latency", t, fmtSecs, [L("avg",div(S["write_duration_seconds_sum"],S["write_duration_seconds_count"]),0),
+      L("p99",histQuantile(S,"write_duration_seconds",0.99),4)]),
+  ];
+  if(!isPart){
+    out.push(lineChart("Block cache hit ratio", t, fmtPct,
+      [L("hits / lookups",div(S["block_cache_hits"],add(S["block_cache_hits"],S["block_cache_misses"])),1)]));
+    out.push(lineChart("Block cache size", t, fmtBytes,
+      [L("cached",S["block_cache_bytes"],0), L("capacity",S["block_cache_capacity_bytes"],8)]));
+  }
+  out.push(
+    lineChart("SST tables", t, fmtNum, isPart ? [L("tables",S["sst_tables"],0)]
+      : [L("all partitions",S["sst_tables"],0), L("largest partition",S["sst_tables:max"],4)]),
+    lineChart("Memtable", t, fmtBytes, [L("active + queued",S["memtable_bytes"],0)]),
+    lineChart("Queued memtables", t, fmtNum, isPart ? [L("immutable",S["imm_memtables"],3)]
+      : [L("all partitions",S["imm_memtables"],3), L("largest partition",S["imm_memtables:max"],4)]),
+    lineChart("Flush", t, fmtBps, [L("SST bytes",S["flush_bytes"],0)]),
+    lineChart("Compactions / min", t, fmtNum, [
+      L("minor · flush",perMin(S["minor_compactions{trigger=flush}"]),0),
+      L("minor · tick",perMin(S["minor_compactions{trigger=tick}"]),1),
+      L("minor · blocking",perMin(S["minor_compactions{trigger=blocking}"]),4),
+      L("minor · reclaim",perMin(S["minor_compactions{trigger=reclaim}"]),2),
+      L("major",perMin(S["major_compactions"]),3)]),
+    lineChart("Write amplification", t, fmtNum, [L("(flush + compaction) / written",
+      div(add(S["flush_bytes"],S["compaction_write_bytes{kind=minor}"],S["compaction_write_bytes{kind=major}"]),S["write_bytes"]),0)]),
+    lineChart("Point lookups · SSTs / s", t, fmtRate, [
+      L("skipped (range or bloom)",S["get_sst_checks{result=skipped}"],1),
+      L("read, found",S["get_sst_checks{result=hit}"],0),
+      L("read, bloom false positive",S["get_sst_checks{result=false_positive}"],4)]),
+    lineChart("Large-value reads", t, fmtBps, [L("from the log stream",S["vp_read_bytes"],2)]),
+    lineChart("Maintenance debt", t, fmtBytes, [L("GC",S["gc_debt_bytes"],0),
+      L("major compaction",S["pending_compaction_bytes"],1), L("minor window",S["minor_compact_pending_bytes"],2)]),
+  );
+  return out.join("");
+}
+function renderMetricsTab(){
+  const opts=[["cluster","whole cluster"],
+    ...PS_SERVERS.map(p=>[`ps:${p.ps_id}`,`PS ${p.ps_id} · ${p.addr||""}`]),
+    ...PARTS.map(p=>[`part:${p.part_id}`,`partition ${p.part_id} · PS ${p.ps_id}`])];
+  if(!opts.some(([v])=>v===M_SCOPE)) M_SCOPE="cluster";
+  $("#m_scope").innerHTML=opts.map(([v,l])=>`<option value="${esc(v)}"${v===M_SCOPE?" selected":""}>${esc(l)}</option>`).join("");
+  if(!METRICS){ $("#m_charts").innerHTML='<div class="listempty">Loading…</div>'; return; }
+  const ps=METRICS.ps||[], bad=ps.filter(p=>p.error);
+  $("#m_endpoints").innerHTML = `${ps.length-bad.length}/${ps.length} partition servers scraped every ${METRICS.interval_secs}s`
+    + bad.map(p=>` · <span class="bad">PS ${p.ps_id}: ${esc(p.error)}</span>`).join("");
+  $("#m_charts").innerHTML=metricsCharts(METRICS, M_SCOPE.startsWith("part:"));
+}
+
 // ── wiring ───────────────────────────────────────────────────────────────────
 // /api/overview is always fetched (the header vitals and every tab's data come
 // from it); the other two only when the visible tab renders them, because each
@@ -1330,6 +1484,7 @@ function refresh(){
   overview();
   if(tabNeeds("policies")) loadPolicies();
   if(tabNeeds("ops")) loadOps();
+  if(tabNeeds("metrics")) loadMetrics();
 }
 $("#vp").onscroll = renderRows;
 $("#danger").onchange = e=>{ DANGER=e.target.checked; $("#dangerlbl").textContent = DANGER?"Danger unlocked":"Danger locked";
@@ -1338,6 +1493,7 @@ window.onresize = ()=>{ layoutRows(); renderRows(); };
 window.onhashchange = ()=>{ const id=(location.hash||"#overview").slice(1); if(id!==TAB && TABS.some(t=>t.id===id)) setTab(id); };
 function schedule(){ if(TIMER) clearInterval(TIMER); const ms=+$("#interval").value; if(ms>0) TIMER=setInterval(refresh,ms); }
 $("#interval").onchange = schedule;
+$("#m_scope").onchange = e=>{ M_SCOPE=e.target.value||"cluster"; loadMetrics(); };
 setTab(TAB);
 schedule();
 </script>
