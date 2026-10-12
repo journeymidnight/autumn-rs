@@ -1,3 +1,11 @@
+Date: 2026-10-12 (6)
+TaskStatus: completed
+Task scope: user — dashboard Metrics tab: latency shows p99 only (no average); drop the write-amplification chart; latency broke into disconnected segments whenever a round had no requests, so it is no longer a line chart.
+Current summary: `lineChart` → `timeChart`; a series marked `bars` draws one column per round (slot = W/n, column 70% of it, at least 1 unit but never wider than the slot), so a round with no p99 (no requests, or a PS not scraped) is an empty slot. GET / Write latency = p99 columns. Write amplification chart removed (the PS still exports compaction_write_bytes). Docs: dashboard README, server CLAUDE.md.
+Verification: render_check (exact column geometry for 4 rounds; 1800 rounds stay inside their slots — red with the old width rule), tabs_smoke (header is the p99 990 µs not the 300 µs average; no avg; no amplification; columns drawn — 3 red against the old page), policy_controls; autumn-dashboard builds with the new page embedded. Review: opus (no high/medium; tightened the geometry test, slot cap, doc wording). Not looked at in a browser.
+Main gaps: none known.
+Next steps: none.
+
 Date: 2026-10-12 (5)
 TaskStatus: completed
 Task scope: user — merge NodeStateEntry's five flat override_* fields into one optional field.

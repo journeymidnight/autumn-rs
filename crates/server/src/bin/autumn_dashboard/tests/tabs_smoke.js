@@ -231,6 +231,10 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   has(clusterCharts, '<path d="M', "a series is drawn as a line");
   has(clusterCharts, "Block cache hit ratio <b>75.0%</b>", "the cluster view derives the cache hit ratio");
   has(clusterCharts, "minor · flush", "minor compactions are split by trigger");
+  has(clusterCharts, "GET latency <b>990 µs</b>", "latency is the round's p99, not the average (300 µs)");
+  has(clusterCharts, 'stroke="none"', "latency is drawn as one column per round, not a line that breaks when idle");
+  if (clusterCharts.includes("avg")) { console.error("FAIL #m_charts: latency still draws an average"); bad++; }
+  if (clusterCharts.includes("amplification")) { console.error("FAIL #m_charts: write amplification is not charted"); bad++; }
   has(clusterHot, "#1</a>", "the hottest partitions list the busy one");
   if (clusterHot.includes("#2</a>")) { console.error("FAIL #m_hot: an idle partition is listed as hot"); bad++; }
   has(ps2Hot, "no load reported", "a server scope lists only its own partitions");

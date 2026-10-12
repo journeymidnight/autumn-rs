@@ -148,8 +148,9 @@ No new dependency, wire format, or data-path work is added by this integration.
   history is not kept: the tab's "hottest partitions" table is the overview's
   current per-partition load (the manager's load reports), top 10 by iops. The page
   derives ratios and latency quantiles (interpolated in the histogram bucket)
-  and draws SVG line charts. A restart starts an empty history — nothing is
-  persisted, by design.
+  and draws SVG charts: lines, except latency p99, which is one column per
+  round (a round with no requests has no p99 and would break a line). A
+  restart starts an empty history — nothing is persisted, by design.
 - Tests live alongside this binary: `tests/{render_check,tabs_smoke,policy_controls}.js`
   and `tests/api_contract.sh` (Python harness, real etcd/manager/EN/PS, allocated
   temporary data and ports, cleanup only of children it spawned). CI runs all.

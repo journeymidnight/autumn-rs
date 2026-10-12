@@ -1405,15 +1405,21 @@ function fmtBps(v){ return v==null?"-":fmtBytes(v)+"/s"; }
 function fmtNum(v){ return v==null?"-":Math.abs(v)>=100?v.toFixed(0):v.toFixed(2); }
 function fmtPct(v){ return v==null?"-":(v*100).toFixed(1)+"%"; }
 function lastOf(data){ for(let i=data.length-1;i>=0;i--) if(data[i]!=null) return data[i]; return null; }
-// One line chart: an SVG polyline per series, scaled to the largest value; a
-// gap (null) breaks the line rather than drawing through it.
-function lineChart(title, t, fmt, lines){
+// One chart over the round axis, scaled to the largest value. A line series
+// breaks at a gap (null) rather than drawing through it; a `bars` series draws
+// one column per round, so a round with no value (no requests) is simply empty.
+function timeChart(title, t, fmt, lines){
   lines=lines.filter(l=>l.data);
   const vals=lines.flatMap(l=>l.data.filter(v=>v!=null));
   if(!vals.length) return `<div class="chart"><h3>${esc(title)}</h3><div class="nodata">no data yet</div></div>`;
   const n=t.length, W=600, H=110, max=Math.max(...vals)>0?Math.max(...vals):1;
   const x=i=>n<2?W:i*W/(n-1), y=v=>H-2-(v/max)*(H-6);
   const paths=lines.map(l=>{
+    if(l.bars){
+      const slot=W/n, bw=Math.min(Math.max(slot*0.7,1),slot);
+      const d=l.data.map((v,i)=>v==null?"":`M${(i*slot+(slot-bw)/2).toFixed(1)},${H}V${y(v).toFixed(1)}h${bw.toFixed(1)}V${H}Z`).join("");
+      return `<path d="${d}" fill="${l.color}" stroke="none"/>`;
+    }
     let d="", pen=false;
     l.data.forEach((v,i)=>{ if(v==null){ pen=false; return; } d+=(pen?"L":"M")+x(i).toFixed(1)+","+y(v).toFixed(1); pen=true; });
     return `<path d="${d}" fill="none" stroke="${l.color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>`;
@@ -1431,37 +1437,34 @@ function metricsCharts(m){
   const add=(...a)=>zipWith((...v)=>v.reduce((p,q)=>p+q,0),...a);
   const perMin=a=>a&&a.map(v=>v==null?null:v*60);
   const L=(name,data,i)=>({name,data,color:C[i%C.length]});
+  const B=(name,data,i)=>({...L(name,data,i),bars:true});
   const out=[
-    lineChart("Requests / s", t, fmtRate, [L("requests",S["requests"],0)]),
-    lineChart("Value bytes / s", t, fmtBps, [L("write",S["write_bytes"],0), L("read",S["read_bytes"],1)]),
-    lineChart("GET latency", t, fmtSecs, [L("avg",div(S["get_duration_seconds_sum"],S["get_duration_seconds_count"]),0),
-      L("p99",histQuantile(S,"get_duration_seconds",0.99),4)]),
-    lineChart("Write latency", t, fmtSecs, [L("avg",div(S["write_duration_seconds_sum"],S["write_duration_seconds_count"]),0),
-      L("p99",histQuantile(S,"write_duration_seconds",0.99),4)]),
+    timeChart("Requests / s", t, fmtRate, [L("requests",S["requests"],0)]),
+    timeChart("Value bytes / s", t, fmtBps, [L("write",S["write_bytes"],0), L("read",S["read_bytes"],1)]),
+    timeChart("GET latency", t, fmtSecs, [B("p99",histQuantile(S,"get_duration_seconds",0.99),4)]),
+    timeChart("Write latency", t, fmtSecs, [B("p99",histQuantile(S,"write_duration_seconds",0.99),4)]),
   ];
   out.push(
-    lineChart("Block cache hit ratio", t, fmtPct,
+    timeChart("Block cache hit ratio", t, fmtPct,
       [L("hits / lookups",div(S["block_cache_hits"],add(S["block_cache_hits"],S["block_cache_misses"])),1)]),
-    lineChart("Block cache size", t, fmtBytes,
+    timeChart("Block cache size", t, fmtBytes,
       [L("cached",S["block_cache_bytes"],0), L("capacity",S["block_cache_capacity_bytes"],8)]),
-    lineChart("SST tables", t, fmtNum,
+    timeChart("SST tables", t, fmtNum,
       [L("all partitions",S["sst_tables"],0), L("largest partition",S["partition_sst_tables_max"],4)]),
-    lineChart("Memtable", t, fmtBytes, [L("active + queued",S["memtable_bytes"],0)]),
-    lineChart("Queued memtables", t, fmtNum, [L("immutable",S["imm_memtables"],3)]),
-    lineChart("Flush", t, fmtBps, [L("SST bytes",S["flush_bytes"],0)]),
-    lineChart("Compactions / min", t, fmtNum, [
+    timeChart("Memtable", t, fmtBytes, [L("active + queued",S["memtable_bytes"],0)]),
+    timeChart("Queued memtables", t, fmtNum, [L("immutable",S["imm_memtables"],3)]),
+    timeChart("Flush", t, fmtBps, [L("SST bytes",S["flush_bytes"],0)]),
+    timeChart("Compactions / min", t, fmtNum, [
       L("minor · flush",perMin(S["minor_compactions{trigger=flush}"]),0),
       L("minor · tick",perMin(S["minor_compactions{trigger=tick}"]),1),
       L("minor · blocking",perMin(S["minor_compactions{trigger=blocking}"]),4),
       L("minor · reclaim",perMin(S["minor_compactions{trigger=reclaim}"]),2),
       L("major",perMin(S["major_compactions"]),3)]),
-    lineChart("Write amplification", t, fmtNum, [L("(flush + compaction) / written",
-      div(add(S["flush_bytes"],S["compaction_write_bytes{kind=minor}"],S["compaction_write_bytes{kind=major}"]),S["write_bytes"]),0)]),
-    lineChart("Point lookups · SSTs / s", t, fmtRate, [
+    timeChart("Point lookups · SSTs / s", t, fmtRate, [
       L("skipped (range or bloom)",S["get_sst_checks{result=skipped}"],1),
       L("read, found",S["get_sst_checks{result=hit}"],0),
       L("read, bloom false positive",S["get_sst_checks{result=false_positive}"],4)]),
-    lineChart("Large-value reads", t, fmtBps, [L("from the log stream",S["vp_read_bytes"],2)]),
+    timeChart("Large-value reads", t, fmtBps, [L("from the log stream",S["vp_read_bytes"],2)]),
   );
   return out.join("");
 }

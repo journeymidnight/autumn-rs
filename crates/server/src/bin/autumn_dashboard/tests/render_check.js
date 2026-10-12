@@ -27,11 +27,11 @@ const escLine = page.split("\n").find(l => l.startsWith("const esc ="));
 // Same treatment for the other one-line const helpers the lifted functions call.
 const constLine = name => page.split("\n").find(l => l.startsWith(`const ${name} =`));
 
-// Metrics: the histogram quantile and the line chart, lifted like the rest.
+// Metrics: the histogram quantile and the chart, lifted like the rest.
 {
   const msrc = [escLine, lift("fmtBytes"), lift("zipWith"), lift("histQuantile"), lift("lastOf"),
-                lift("fmtSecs"), lift("lineChart")].join("\n");
-  const M = new Function(msrc + "\nreturn {histQuantile, lineChart, zipWith};")();
+                lift("fmtSecs"), lift("timeChart")].join("\n");
+  const M = new Function(msrc + "\nreturn {histQuantile, timeChart, zipWith};")();
   const series = {
     "lat_bucket{le=0.0005}": [50, 0, 100], "lat_bucket{le=0.001}": [90, null, 100],
     "lat_bucket{le=0.002}": [100, 0, 100], lat_count: [100, 0, 200],
@@ -43,9 +43,16 @@ const constLine = name => page.split("\n").find(l => l.startsWith(`const ${name}
   if (!near(p50[0], 0.0005)) fails.push(`p50 at a bucket edge: ${p50[0]}`);
   if (p99[1] !== null) fails.push(`no requests in a round = no quantile: ${p99[1]}`);
   if (!near(p99[2], 0.002)) fails.push(`past the last bound answers that bound: ${p99[2]}`);
-  const svg = M.lineChart("L", [0, 1, 2, 3], String, [{ name: "a", color: "#fff", data: [1, null, 3, 4] }]);
-  if ((svg.match(/M/g) || []).length !== 2) fails.push(`a null breaks the line: ${svg}`);
-  if (!M.lineChart("L", [0], String, [{ name: "a", color: "#fff", data: [null] }]).includes("no data yet"))
+  const svg = M.timeChart("L", [0, 1, 2, 3], String, [{ name: "a", color: "#fff", data: [1, null, 3, 4] }]);
+  const pathD = html => html.match(/<path d="([^"]*)"/)[1];
+  if ((pathD(svg).match(/M/g) || []).length !== 2) fails.push(`a null breaks the line: ${svg}`);
+  // 4 rounds in W=600: slot 150, column 105 centred; the largest value tops at y=4.
+  const bars = pathD(M.timeChart("B", [0, 1, 2, 3], String, [{ name: "a", color: "#fff", bars: true, data: [1, null, 3, 4] }]));
+  if (bars !== "M22.5,110V82.0h105.0V110ZM322.5,110V30.0h105.0V110ZM472.5,110V4.0h105.0V110Z")
+    fails.push(`bars: one column per round with a value, none for a gap: ${bars}`);
+  const dense = pathD(M.timeChart("B", [...Array(1800).keys()], String, [{ name: "a", color: "#fff", bars: true, data: Array(1800).fill(1) }]));
+  if (!dense.startsWith("M0.0,110V4.0h0.3V110Z")) fails.push(`a column never spills out of its slot: ${dense.slice(0, 40)}`);
+  if (!M.timeChart("L", [0], String, [{ name: "a", color: "#fff", data: [null] }]).includes("no data yet"))
     fails.push("an all-null chart says there is no data");
   if (fails.length) { console.error("FAIL metrics: " + fails.join("; ")); process.exit(1); }
 }

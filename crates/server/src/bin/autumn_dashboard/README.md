@@ -151,12 +151,13 @@ not be scraped is a gap, not a dip. Per-partition history is not kept: the
 per-partition load (from the manager's load reports), top 10 by iops, within
 the chosen PS when one is picked.
 
-Charts: requests/s; value bytes/s; GET and write latency (average, and p99
-interpolated in the histogram bucket); block cache hit ratio and size; SST
+Charts: requests/s; value bytes/s; GET and write latency (p99 over each scrape
+round, interpolated in the histogram bucket, one column per round, so a round
+with no requests or no scrape is an empty slot rather than a broken line);
+block cache hit ratio and size; SST
 tables (sum and largest partition);
 memtable bytes and queued memtables; flush bytes/s; compactions per minute
-(minor by trigger: flush / tick / blocking / reclaim, and major); write
-amplification ((flush + compaction bytes) / value bytes written); point-lookup
+(minor by trigger: flush / tick / blocking / reclaim, and major); point-lookup
 SSTs per second (skipped by range or bloom, read and found, bloom false
 positive); large-value reads from the log stream.
 
