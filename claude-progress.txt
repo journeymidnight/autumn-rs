@@ -1,3 +1,10 @@
+Date: 2026-10-12 (7)
+TaskStatus: not_completed
+Task scope: user — ec-convert ops failing after an EN was put in maintenance and stopped (proposals of extents with a replica there or under Delete; shards still sent to the maintenance node). Turned into a design for one per-extent arbitration of Recovery / EC / GC.
+Current summary: docs/extent_op_arbitration_design.md committed (four node classes health/suspend/suspected/fence from auto-state + override; one pure arbiter for every entry point; no preemption; a marker is one attempt, cancelled when a node it depends on is abnormal, rewritten by its owner; EC substitutes health nodes; PS GC prechecks; ec_convert_advisory/ deleted). §6 lists the current divergences with code locations, verified by three surveys + a fable review. Feature entry F-EXTENT-OP-ARBITRATION added.
+Main gaps: nothing implemented. The working tree still carries an uncommitted first patch (manager: EC advisory skips busy extents / replicas on excluded nodes; EC dispatch defers on any target; dead-executor release cancels EC on any target gone/suspected/fenced/maintenance; tests) — to be folded into the implementation, not committed as is.
+Next steps: implement per the design (two lists first), tests per §6 divergence with ablation, fable review, then the cluster acceptance in the feature entry.
+
 Date: 2026-10-12 (6)
 TaskStatus: completed
 Task scope: user — dashboard Metrics tab: latency shows p99 only (no average); drop the write-amplification chart; latency broke into disconnected segments whenever a round had no requests, so it is no longer a line chart.
