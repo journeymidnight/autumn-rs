@@ -7,51 +7,17 @@
 //!    task.
 //! 2. No new dependencies — hand-rolled HTTP/1.1 is ~40 lines and the
 //!    Prometheus text exposition format needs nothing more.
-//! 3. The render closure runs on the metrics thread, so it must be
-//!    `Send + Sync` and read only `Arc`-shared state: the PS and EN read
-//!    their atomics directly; the manager, whose store is `Rc`/`RefCell`,
-//!    publishes a pre-rendered snapshot (`MetricsSnapshot`).
+//! 3. The render closure runs on that thread, so it must be `Send + Sync`
+//!    and read only `Arc`-shared state (atomics) — never a runtime's
+//!    `Rc`/`RefCell` state.
 //!
-//! Every PS and EN serves one by default on its service port plus
-//! `METRICS_PORT_OFFSET` (`--metrics-port` overrides, 0 turns it off); the
-//! manager on 9591, where it also serves the Prometheus `http_sd` list of
-//! them at `/sd`.
+//! Every PS and EN serves `/metrics` by default on its service port plus
+//! `METRICS_PORT_OFFSET` (`--metrics-port` overrides, 0 turns it off). The
+//! manager serves none; `autumn-op info --file-sd` lists these endpoints for
+//! Prometheus.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
-
-/// Snapshot mailbox between an owning runtime (which renders the metrics
-/// text) and the HTTP thread. Both sides hold the lock only for an
-/// `Arc` pointer swap/clone — never across a render or a large string
-/// clone — so the publisher can NEVER block its compio runtime behind a
-/// slow scraper (coco P2). Poison-safe: a panicked holder doesn't kill
-/// metrics, the next caller just takes the last value.
-pub struct MetricsSnapshot {
-    inner: Mutex<Arc<String>>,
-}
-
-impl MetricsSnapshot {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            inner: Mutex::new(Arc::new(String::new())),
-        })
-    }
-
-    pub fn publish(&self, text: String) {
-        let arc = Arc::new(text);
-        *self
-            .inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = arc;
-    }
-
-    pub fn get(&self) -> Arc<String> {
-        self.inner
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-    }
-}
 
 /// A PS or EN serves `/metrics` on its service port plus this, unless
 /// `--metrics-port` says otherwise. Clear of the EN shard grid
@@ -87,16 +53,10 @@ pub fn metrics_reach_addr(bind_host: &str, advertise_host: &str, port: u16) -> S
 
 pub type Render = Arc<dyn Fn() -> String + Send + Sync>;
 
-/// Spawn the metrics HTTP listener thread. `/metrics` (and `/`) serve
-/// `render`; `sd`, when given, serves a JSON body at `/sd`. Returns Err only
-/// on bind failure (callers log and decide; the data plane must not die
-/// because a metrics port is taken).
-pub fn spawn_metrics_http(
-    bind_host: &str,
-    port: u16,
-    render: Render,
-    sd: Option<Render>,
-) -> std::io::Result<()> {
+/// Spawn the HTTP listener thread serving `render` at `/metrics`; any other
+/// path is a 404. Returns Err on bind or runtime failure (callers log and
+/// decide; the data plane must not die because a metrics port is taken).
+pub fn spawn_metrics_http(bind_host: &str, port: u16, render: Render) -> std::io::Result<()> {
     // Bracket bare IPv6 hosts; "0.0.0.0"/"127.0.0.1"/hostnames pass through.
     let host = if bind_host.contains(':') && !bind_host.starts_with('[') {
         format!("[{bind_host}]")
@@ -130,7 +90,7 @@ pub fn spawn_metrics_http(
                 loop {
                     match listener.accept().await {
                         Ok((stream, _)) => {
-                            compio::runtime::spawn(serve_one(stream, render.clone(), sd.clone())).detach();
+                            compio::runtime::spawn(serve_one(stream, render.clone())).detach();
                         }
                         Err(e) => {
                             // EMFILE and the like: back off instead of spinning.
@@ -148,7 +108,7 @@ pub fn spawn_metrics_http(
 
 /// Answer one request and close. A scraper that stalls is dropped after a
 /// short timeout.
-async fn serve_one(mut stream: compio::net::TcpStream, render: Render, sd: Option<Render>) {
+async fn serve_one(mut stream: compio::net::TcpStream, render: Render) {
     use compio::buf::BufResult;
     use compio::io::{AsyncRead, AsyncWriteExt};
 
@@ -164,17 +124,13 @@ async fn serve_one(mut stream: compio::net::TcpStream, render: Render, sd: Optio
     };
     let head = String::from_utf8_lossy(&head);
     let path = head.split_whitespace().nth(1).unwrap_or("/");
-    let ok = |content_type: &str, body: String| {
+    let resp = if path == "/metrics" {
+        let body = render();
         format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
             body.len(),
             body
         )
-    };
-    let resp = if path == "/metrics" || path == "/" {
-        ok("text/plain; version=0.0.4; charset=utf-8", render())
-    } else if let (Some(sd), "/sd") = (&sd, path) {
-        ok("application/json", sd())
     } else {
         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
     };
@@ -266,8 +222,7 @@ mod tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             l.local_addr().unwrap().port()
         };
-        let sd: Render = Arc::new(|| "[]".to_string());
-        spawn_metrics_http("127.0.0.1", port, render, Some(sd)).unwrap();
+        spawn_metrics_http("127.0.0.1", port, render).unwrap();
 
         let get = |path: &str| -> String {
             let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -280,8 +235,6 @@ mod tests {
         let ok = get("/metrics");
         assert!(ok.starts_with("HTTP/1.1 200 OK\r\n"), "{ok}");
         assert!(ok.ends_with("autumn_up 1\n"), "{ok}");
-        let sd = get("/sd");
-        assert!(sd.contains("Content-Type: application/json") && sd.ends_with("[]"), "{sd}");
         let nf = get("/nope");
         assert!(nf.starts_with("HTTP/1.1 404"), "{nf}");
     }

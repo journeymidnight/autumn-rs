@@ -910,7 +910,7 @@ async fn main() -> Result<()> {
     if let Some(mport) = autumn_common::metrics_http::metrics_port(args.metrics_port, args.port) {
         let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
         let m = ps.metrics();
-        match autumn_common::metrics_http::spawn_metrics_http(mhost, mport, std::sync::Arc::new(move || m.render()), None) {
+        match autumn_common::metrics_http::spawn_metrics_http(mhost, mport, std::sync::Arc::new(move || m.render())) {
             Ok(()) => {
                 let reach = autumn_common::metrics_http::metrics_reach_addr(mhost, &advertise_host, mport);
                 ps.set_metrics_addr(reach.clone());

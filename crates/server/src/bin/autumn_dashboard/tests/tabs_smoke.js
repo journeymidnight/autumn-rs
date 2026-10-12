@@ -123,7 +123,7 @@ const POLICIES = {
                switches: { split: false, ec: false, compact: false, gc: true, merge: false, rebalance: false } }],
   switch_order: ["split", "ec", "compact", "gc", "merge", "rebalance", "repair", "scrub"],
 };
-// /api/metrics: three rounds; PS 2 reports no endpoint.
+// /api/metrics: three rounds; PS 2 cannot be scraped.
 const T0 = Date.now() - 20000;
 const METRICS_SERIES = {
   requests: [10, 12, 11], write_bytes: [1048576, 2097152, 1048576], read_bytes: [0, 4096, 8192],
@@ -136,7 +136,7 @@ const METRICS = {
   interval_secs: 10, retention_secs: 3600, t: [T0, T0 + 10000, T0 + 20000],
   series: Object.assign({ block_cache_hits: [null, 2, 3], block_cache_misses: [null, 2, 1] }, METRICS_SERIES),
   ps: [{ ps_id: 1, metrics_addr: "127.0.0.1:9701", last_ok_ms: T0 + 20000, error: null },
-       { ps_id: 2, metrics_addr: null, last_ok_ms: null, error: "no /metrics endpoint reported" }],
+       { ps_id: 2, metrics_addr: "127.0.0.1:9802", last_ok_ms: null, error: "connection refused" }],
 };
 const payload = { "/api/overview": OVERVIEW, "/api/ops": OPS, "/api/policies": POLICIES, "/api/metrics": METRICS };
 const fetchStub = async p => ({ ok: true, json: async () =>
@@ -233,7 +233,7 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   has(ps2Hot, "no load reported", "a server scope lists only its own partitions");
   if (scopes.includes("part:")) { console.error("FAIL #m_scope: partitions are not metrics scopes"); bad++; }
   want("#m_endpoints", "1/2 partition servers scraped", "the endpoint line counts scraped servers");
-  want("#m_endpoints", "PS 2: no /metrics endpoint reported", "…and names the one that could not be");
+  want("#m_endpoints", "PS 2: connection refused", "…and names the one that could not be");
   console.log(bad ? `tabs smoke FAILED (${bad})` : "tabs smoke OK — seven tabs + both drawers render");
   process.exit(bad ? 1 : 0);
 })();

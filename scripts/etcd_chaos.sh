@@ -94,7 +94,8 @@ sleep 5
 wait_progress "baseline"
 
 # ── D0 (cluster mode): kill ONE member → NO manager step-down ───────────────
-mgr_leader() { curl -s --max-time 3 http://127.0.0.1:9591/metrics 2>/dev/null | grep "^autumn_manager_leader" | awk '{print $NF}'; }
+# How many managers hold leadership (the one manager here: 1 = it kept it).
+mgr_leader() { "${AO[@]}" --json status 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)["managers"]["leader"])' 2>/dev/null; }
 if [ "$MODE" = "cluster" ]; then
     M0=$(pgrep -af "etcd --name etcd0" | head -1 | awk '{print $1}')
     say "D0: kill -9 etcd member 0 pid=$M0 (2 of 3 remain — quorum holds)"
@@ -104,7 +105,7 @@ if [ "$MODE" = "cluster" ]; then
     if [ "${L:-0}" = "1" ]; then
         say "D0: manager kept leadership through the member kill"
     else
-        fail "D0: manager lost leadership (leader=$L) — endpoint failover did not engage"
+        fail "D0: manager lost leadership (leaders=${L:-none}) — endpoint failover did not engage"
     fi
     wait_progress "after-member-kill"
     "${AO[@]}" info >/dev/null 2>&1 && say "D0: control plane fully available"         || fail "D0: control plane unavailable with 2/3 etcd members"

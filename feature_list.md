@@ -523,3 +523,7 @@
   partition 标签，manager `/sd` 列出二者（单测 + 真集群 api_contract）、follower 返回 `[]`（单测）；
   dashboard 无分区 scope、显示热点分区表（JS 测试）；全量单测与 manager 集成套件通过。
 - `passes: true` (2026-10-12)
+- **notes** (2026-10-12): 用户随后定：`/metrics` 只放性能指标（iops、延迟、缓存命中率之类），manager
+  不导出任何指标、不开 HTTP 端口（`--metrics-port` 按名拒绝），`/sd` 去掉；目标列表改由
+  `autumn-op info --file-sd` 输出 Prometheus `file_sd` JSON（EN 地址经 `NodeStateEntry.metrics_addr`，
+  wire 65）；dashboard 也从它取 PS 目标。

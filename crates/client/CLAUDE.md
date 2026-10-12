@@ -325,6 +325,9 @@ failover via `rotate_manager` on connection error.
 
 - `mgr_call(msg_type, payload)` — raw manager RPC.
 - `mgr_call_retry(msg_type, payload, max_retries)` — with round-robin retry.
+- `cluster_overview()` / `list_node_states()` — the overview and the EN states,
+  leader-routed (rotate on NOT_LEADER, like `cluster_df` / `auto_policy_get`);
+  `autumn-op info --file-sd` builds the Prometheus target list from them.
 - `ps_call(ps_addr, msg_type, payload)` — raw PS RPC.
 - `get_ps_client(ps_addr)` — get/create PS connection. Both this cache and
   `mgr_client()`'s skip a client whose `is_closed()` is true and open a fresh one,

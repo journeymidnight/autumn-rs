@@ -674,10 +674,9 @@ launch_manager() {
     if [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]]; then
         mgr_extra="--policy-fast-mode"
     fi
-    # Prometheus: every process serves /metrics by default — the manager at
-    # 9591 (plus the http_sd target list at /sd), each EN and PS at its
-    # service port + 500 (EN 960<i>, PS 9801; below the 10000 ephemeral
-    # floor, see BUG#3).
+    # Prometheus: every EN and PS serves /metrics by default at its service
+    # port + 500 (EN 960<i>, PS 9801; below the 10000 ephemeral floor, see
+    # BUG#3); `autumn-op info --file-sd` lists them. The manager serves none.
     # The web dashboard is a separate app now (crates/server/src/bin/autumn_dashboard → the
     # autumn-dashboard binary); cluster.sh does not start it. Run it by hand
     # against this cluster's manager + cluster secret when you want the UI.

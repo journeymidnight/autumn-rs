@@ -902,6 +902,13 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## Node states carry the EN metrics endpoint (wire 65)
+
+`NodeStateEntry` gains `metrics_addr` — the address each EN's latest df answer
+carried (`DfResp.metrics_addr`, wire 64). With `PsOverview.metrics_addr` it is what
+`autumn-op info --file-sd` turns into the Prometheus target list. The manager's own
+`/metrics` and its `/sd` are gone. The ceiling rises to [43, 65], the floor stays.
+
 ## EN df answer carries its metrics endpoint (wire 64)
 
 `DfResp` gains `metrics_addr` (the EN's `/metrics` `host:port`, empty when not

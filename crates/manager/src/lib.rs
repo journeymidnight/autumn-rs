@@ -3925,86 +3925,6 @@ impl AutumnManager {
         self.serving.set(true);
     }
 
-    /// Prometheus `http_sd` body: every registered PS and extent node that
-    /// reported a `/metrics` address, labelled `autumn_role` and its id. Only
-    /// the leader hears heartbeats and df answers, so a follower lists
-    /// nothing — Prometheus pointed at every manager sees each target once.
-    pub fn metrics_sd_json(&self) -> String {
-        if !self.leader.get() {
-            return "[]".to_string();
-        }
-        let s = self.store.inner.borrow();
-        let mut groups: Vec<serde_json::Value> = Vec::new();
-        let mut ps: Vec<_> = s.ps_metrics_addrs.iter().filter(|(id, _)| s.ps_nodes.contains_key(id)).collect();
-        ps.sort();
-        for (id, addr) in ps {
-            groups.push(serde_json::json!({"targets": [addr], "labels": {"autumn_role": "ps", "ps_id": id.to_string()}}));
-        }
-        let mut en: Vec<_> = s.en_metrics_addrs.iter().filter(|(id, _)| s.nodes.contains_key(id)).collect();
-        en.sort();
-        for (id, addr) in en {
-            groups.push(serde_json::json!({"targets": [addr], "labels": {"autumn_role": "en", "node_id": id.to_string()}}));
-        }
-        serde_json::Value::Array(groups).to_string()
-    }
-
-    /// Observability batch 1: Prometheus text snapshot of control-plane
-    /// state. Called by the manager binary's 2 s publisher task ON the
-    /// compio runtime (the store is `Rc<RefCell>`, !Send); the rendered
-    /// string is what crosses to the metrics HTTP thread.
-    pub fn metrics_text(&self) -> String {
-        use autumn_common::metrics_http::{push_metric, push_type};
-        let mut out = String::with_capacity(1024);
-        push_type(&mut out, "autumn_manager_leader", "gauge");
-        push_metric(
-            &mut out,
-            "autumn_manager_leader",
-            &[],
-            self.leader.get() as u32,
-        );
-        push_type(&mut out, "autumn_manager_serving", "gauge");
-        push_metric(
-            &mut out,
-            "autumn_manager_serving",
-            &[],
-            self.serving.get() as u32,
-        );
-        {
-            let s = self.store.inner.borrow();
-            for (name, v) in [
-                ("autumn_manager_streams", s.streams.len()),
-                ("autumn_manager_extents", s.extents.len()),
-                ("autumn_manager_extent_nodes", s.nodes.len()),
-                ("autumn_manager_partitions", s.partitions.len()),
-                ("autumn_manager_ps_nodes", s.ps_nodes.len()),
-                ("autumn_manager_regions", s.regions.len()),
-                ("autumn_manager_part_addrs", s.part_addrs.len()),
-            ] {
-                push_type(&mut out, name, "gauge");
-                push_metric(&mut out, name, &[], v as u32);
-            }
-            // Per-disk online state as the manager sees it (the df-driven
-            // call-result signal, CLAUDE.md note 7).
-            push_type(&mut out, "autumn_manager_disk_online", "gauge");
-            for (disk_id, d) in &s.disks {
-                push_metric(
-                    &mut out,
-                    "autumn_manager_disk_online",
-                    &[("disk_id", disk_id.to_string())],
-                    d.online as u32,
-                );
-            }
-        }
-        push_type(&mut out, "autumn_manager_extent_inflight_ops", "gauge");
-        push_metric(
-            &mut out,
-            "autumn_manager_extent_inflight_ops",
-            &[],
-            self.inflight.borrow().len() as u32,
-        );
-        out
-    }
-
     // ── Background loops ───────────────────────────────────────────────
 
     // (1C): takes `self` by value (was `&self`) for uniformity with the
@@ -5243,28 +5163,14 @@ mod tests {
     }
 
     #[test]
-    fn metrics_sd_lists_registered_servers_and_nodes_on_the_leader_only() {
+    fn node_states_carry_the_metrics_address_the_df_reported() {
         let m = AutumnManager::new();
         add_node_and_disk(&m, 3, 30);
-        {
-            let mut s = m.store.inner.borrow_mut();
-            s.ps_nodes.insert(1, "127.0.0.1:9301".to_string());
-            s.ps_metrics_addrs.insert(1, "127.0.0.1:9801".to_string());
-            // Evicted PS and removed node: their last addresses are not targets.
-            s.ps_metrics_addrs.insert(2, "127.0.0.1:9802".to_string());
-            s.en_metrics_addrs.insert(3, "127.0.0.1:9603".to_string());
-            s.en_metrics_addrs.insert(4, "127.0.0.1:9604".to_string());
-        }
-        let sd: serde_json::Value = serde_json::from_str(&m.metrics_sd_json()).unwrap();
-        assert_eq!(
-            sd,
-            serde_json::json!([
-                {"targets": ["127.0.0.1:9801"], "labels": {"autumn_role": "ps", "ps_id": "1"}},
-                {"targets": ["127.0.0.1:9603"], "labels": {"autumn_role": "en", "node_id": "3"}},
-            ])
-        );
-        m.leader.set(false);
-        assert_eq!(m.metrics_sd_json(), "[]");
+        add_node_and_disk(&m, 4, 40);
+        m.store.inner.borrow_mut().en_metrics_addrs.insert(3, "127.0.0.1:9603".to_string());
+        let resp = m.compute_list_node_states_resp();
+        let addrs: Vec<_> = resp.nodes.iter().map(|n| (n.node_id, n.metrics_addr.as_str())).collect();
+        assert_eq!(addrs, [(3, "127.0.0.1:9603"), (4, "")]);
     }
 
     #[test]

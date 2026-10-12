@@ -87,8 +87,8 @@ erasure-coded, self-healing extents.
   policy's weekly `scrub`) to check sealed copies against their checksums on
   the nodes that hold them, with rotted ones isolated and rebuilt; declarative
   bare-metal deployer
-  (systemd), Kubernetes manifests, Prometheus `/metrics` on every process
-  with the target list served by the manager (`http_sd`), `ceph df`-style
+  (systemd), Kubernetes manifests, Prometheus `/metrics` on every PS and EN
+  (`autumn-op info --file-sd` prints the target list), `ceph df`-style
   capacity accounting, rolling restart with convergence gates.
 
 ## Quick start

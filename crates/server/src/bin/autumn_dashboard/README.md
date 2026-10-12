@@ -134,12 +134,12 @@ would be refused once per window forever.
 ## Metrics tab
 
 The dashboard scrapes each partition server's Prometheus `/metrics` itself —
-the only data it does not get through `autumn-op`. Each PS reports where its
-`/metrics` is on every heartbeat (by default its `--port` + 500; the host
-its listener is bound to — `--metrics-listen`, else `--listen` — when that
-names one, else the advertised host), and the
-overview carries it as `ps_servers[].metrics_addr`. A PS started with
-`--metrics-port 0` shows as "no /metrics endpoint reported".
+the only data it does not get through `autumn-op`. It finds them where
+Prometheus does, in `autumn-op info --file-sd` (re-read every 15 s): each PS
+reports where its `/metrics` is on every heartbeat (by default its `--port` +
+500; the host its listener is bound to — `--metrics-listen`, else `--listen` —
+when that names one, else the advertised host). A PS started with
+`--metrics-port 0` is not listed, and so not charted.
 
 History lives in this process's memory (`--metrics-retention-secs`, default one
 hour) and starts empty after a restart. Counters are stored as per-second
@@ -221,8 +221,8 @@ node crates/server/src/bin/autumn_dashboard/tests/policy_controls.js
 ```
 
 The contract test (1) also checks the PS and EN serve `/metrics` at their
-default ports with no partition label, the manager's `/sd` lists both, the
-overview carries the PS's `metrics_addr`, and `/api/metrics` grows a history
+default ports with no partition label, `autumn-op info --file-sd` lists both,
+the overview carries the PS's `metrics_addr`, and `/api/metrics` grows a history
 for the cluster and the PS (a partition scope is refused). The Rust
 store is unit-tested: `cargo test -p autumn-server --bin autumn-dashboard`.
 

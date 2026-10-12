@@ -2962,8 +2962,8 @@ Three fixes bound the restart replay window (worst case per partition =
     The binary hands the PS the address others reach `/metrics` at
     (`set_metrics_addr`: the host the listener is bound to — `--metrics-listen`,
     else `--listen` — when it names one, else the advertised host); every
-    heartbeat carries it, the manager lists it in its `http_sd`, and the dashboard
-    scrapes it.
+    heartbeat carries it, `autumn-op info --file-sd` lists it for Prometheus, and
+    the dashboard scrapes it.
 
 ## MSG_ROLL_TAILS (`handle_roll_tails`) — rolling a LIVE partition's tails
 

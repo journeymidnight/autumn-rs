@@ -470,7 +470,8 @@ async fn run(args: Args) -> Result<()> {
             )
             .await?
         }
-        Command::Info { part, detail, full } => {
+        Command::Info { file_sd: true, .. } => run_file_sd(&client).await?,
+        Command::Info { part, detail, full, file_sd: false } => {
             run_info(&client, args.json, part, detail, full).await?;
         }
         // ---------------- cluster / partition admin ----------------
@@ -3453,6 +3454,29 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
     Ok(())
 }
 
+/// `info --file-sd`: every PS and EN `/metrics` endpoint as Prometheus
+/// `file_sd` JSON (always JSON). Evicted servers and those that reported no
+/// endpoint are left out. Both reads follow the leader, so `--manager` may
+/// name any manager (or list them all).
+async fn run_file_sd(client: &ClusterClient) -> Result<()> {
+    let ov = client.cluster_overview().await?;
+    let nodes = client.list_node_states().await?;
+    println!("{}", serde_json::to_string_pretty(&file_sd_groups(&ov.ps_servers, &nodes.nodes))?);
+    Ok(())
+}
+
+fn file_sd_groups(ps: &[PsOverview], nodes: &[NodeStateEntry]) -> serde_json::Value {
+    let ps = ps
+        .iter()
+        .filter(|p| p.evicted_at_ms == 0 && !p.metrics_addr.is_empty())
+        .map(|p| serde_json::json!({"targets": [p.metrics_addr], "labels": {"autumn_role": "ps", "ps_id": p.ps_id.to_string()}}));
+    let en = nodes
+        .iter()
+        .filter(|n| !n.metrics_addr.is_empty())
+        .map(|n| serde_json::json!({"targets": [n.metrics_addr], "labels": {"autumn_role": "en", "node_id": n.node_id.to_string()}}));
+    serde_json::Value::Array(ps.chain(en).collect())
+}
+
 /// One word on whether a PS serves what it was assigned; `ready` is the
 /// only state a start-up or readiness check should accept.
 fn ps_state(p: &PsOverview) -> String {
@@ -4350,6 +4374,42 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_sd_lists_live_endpoints_only() {
+        let ps = |ps_id, addr: &str, evicted_at_ms| PsOverview {
+            ps_id,
+            metrics_addr: addr.to_string(),
+            evicted_at_ms,
+            ..Default::default()
+        };
+        let node = |node_id, addr: &str| NodeStateEntry {
+            node_id,
+            address: String::new(),
+            auto_state: 0,
+            last_heartbeat_secs_ago: 0,
+            suspected_age_secs: 0,
+            override_kind: 0,
+            override_reason: String::new(),
+            override_set_by: String::new(),
+            override_set_at: 0,
+            override_expire_at: 0,
+            node_uuid: String::new(),
+            shard_ports: Vec::new(),
+            metrics_addr: addr.to_string(),
+        };
+        let got = super::file_sd_groups(
+            &[ps(1, "10.0.0.1:9801", 0), ps(2, "", 0), ps(3, "10.0.0.3:9801", 1_700_000_000_000)],
+            &[node(7, "10.0.0.7:9601"), node(8, "")],
+        );
+        assert_eq!(
+            got,
+            serde_json::json!([
+                {"targets": ["10.0.0.1:9801"], "labels": {"autumn_role": "ps", "ps_id": "1"}},
+                {"targets": ["10.0.0.7:9601"], "labels": {"autumn_role": "en", "node_id": "7"}},
+            ])
+        );
+    }
 
     #[test]
     fn utc_string_is_the_civil_date() {

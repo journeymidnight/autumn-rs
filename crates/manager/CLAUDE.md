@@ -535,7 +535,7 @@ misconfiguration.
 carry `slot_cap`, recorded only for a registered PS — see "Rebalance"; the beat
 also carries the PS's `/metrics` address, kept in memory only in
 `MetadataState::ps_metrics_addrs` like the slot caps, shown as the overview's
-`ps_servers[].metrics_addr` for the dashboard's poller and listed in `/sd`);
+`ps_servers[].metrics_addr` and listed by `autumn-op info --file-sd`);
 `ps_liveness_check_loop` (2 s) evicts a PS not seen in 10 s — fenced
 `put_and_delete_txn(delete psNodes/<id>)` then `rebalance_regions`. On eviction
 `handle_heartbeat_ps` returns `CODE_NOT_FOUND` so the PS re-registers +
@@ -2299,23 +2299,19 @@ no PS could possibly heartbeat into the unbound socket.
 
 ## Observability
 
-`AutumnManager::metrics_text()` renders leader/serving gauges + store counts (streams /
-extents / nodes / partitions / ps_nodes / regions / part_addrs), per-disk online (the
-`df` call-result signal), and the inflight-op count. Because the store is `!Send`, the
-binary's `/metrics` (9591 unless `--metrics-port`; 0 = none) runs a 2 s publisher task
-on the compio runtime that copies the rendered string into a snapshot served by the
-shared `autumn_common::metrics_http` thread. A follower's counts are replay-stale —
-scrape `autumn_manager_leader` to pick the authoritative instance.
+The manager serves no `/metrics` and opens no HTTP port (`--metrics-port` /
+`--metrics-listen` are refused by name). `/metrics` carries performance series only,
+and those live in the PS and EN, each of which serves its own; the manager's state
+(leadership, fleet, in-flight ops, extents) is what `autumn-op` reports.
 
-PS and EN serve their own process-level `/metrics`; the manager does not relay them.
-It serves the Prometheus `http_sd` target list at `/sd` on the same port
-(`metrics_sd_json`, published by the same task): every registered PS with the
-`metrics_addr` its heartbeat carried (`MetadataState::ps_metrics_addrs`) and every
-registered EN with the one its df answer carried (`en_metrics_addrs`, set in
-`node_health_loop`), labelled `autumn_role` = `ps` | `en` and `ps_id` / `node_id`.
-Both maps are in memory only and cleared on replay. Only the leader hears heartbeats
-and df answers, so a follower serves `[]`: point Prometheus's `http_sd_configs` at
-every manager and each target appears once.
+What it does keep is where those endpoints are, in memory only and cleared on replay:
+`MetadataState::ps_metrics_addrs` (each PS's heartbeat `metrics_addr`, shown as
+`PsOverview.metrics_addr`) and `en_metrics_addrs` (each EN's df answer, set in
+`node_health_loop`, shown as `NodeStateEntry.metrics_addr`). `autumn-op info
+--file-sd` turns the two into Prometheus `file_sd` JSON. Only the leader hears
+heartbeats and df answers; `info --file-sd` reads both through the client's
+leader-following calls (`cluster_overview`, `list_node_states`), so it may be pointed
+at any manager.
 
 ## Runtime dependency
 

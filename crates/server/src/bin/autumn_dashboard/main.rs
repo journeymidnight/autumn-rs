@@ -61,11 +61,9 @@ struct Config {
     metrics_retention: Duration,
 }
 
-/// How often the poller re-reads the PS list (and their metrics addresses)
-/// through `autumn-op overview`; sooner while a PS has reported none yet (it
-/// reports on its heartbeat, after it registers).
-const PS_LIST_REFRESH: Duration = Duration::from_secs(60);
-const PS_LIST_REFRESH_INCOMPLETE: Duration = Duration::from_secs(10);
+/// How often the poller re-reads the target list (`autumn-op info
+/// --file-sd`): a new PS is listed once its heartbeat carried its address.
+const PS_LIST_REFRESH: Duration = Duration::from_secs(15);
 /// One PS scrape: connect + read the whole reply.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -307,27 +305,24 @@ fn metrics(store: &RefCell<MetricsStore>, q: MetricsQuery) -> Response<Body> {
     json_resp(StatusCode::OK, store.borrow().query(&scope).to_string())
 }
 
-/// `(ps_id, metrics_addr)` of every PS in the live registry, from `autumn-op
-/// overview`. An evicted member stays listed until it is removed, but has
-/// nothing to scrape.
-async fn ps_metrics_targets(cfg: &Config) -> Result<Vec<(u64, Option<String>)>> {
-    let (out, ok) = cfg.run_op(vec!["overview".into()]).await;
+/// `(ps_id, metrics_addr)` of every live PS with an endpoint, from the
+/// Prometheus target list `autumn-op info --file-sd` prints.
+async fn ps_metrics_targets(cfg: &Config) -> Result<Vec<(u64, String)>> {
+    let (out, ok) = cfg.run_op(vec!["info".into(), "--file-sd".into()]).await;
     if !ok {
-        bail!("autumn-op overview: {out}");
+        bail!("autumn-op info --file-sd: {out}");
     }
     parse_metrics_targets(&serde_json::from_str(&out)?)
 }
 
-fn parse_metrics_targets(overview: &serde_json::Value) -> Result<Vec<(u64, Option<String>)>> {
-    let rows = overview["ps_servers"]
-        .as_array()
-        .ok_or_else(|| anyhow!("overview has no ps_servers"))?;
-    Ok(rows
+fn parse_metrics_targets(file_sd: &serde_json::Value) -> Result<Vec<(u64, String)>> {
+    let groups = file_sd.as_array().ok_or_else(|| anyhow!("file_sd is not a list"))?;
+    Ok(groups
         .iter()
-        .filter(|p| p["evicted_at_ms"].is_null())
-        .filter_map(|p| {
-            let id = p["ps_id"].as_u64()?;
-            Some((id, p["metrics_addr"].as_str().map(str::to_string)))
+        .filter(|g| g["labels"]["autumn_role"] == "ps")
+        .filter_map(|g| {
+            let id = g["labels"]["ps_id"].as_str()?.parse().ok()?;
+            Some((id, g["targets"][0].as_str()?.to_string()))
         })
         .collect())
 }
@@ -354,27 +349,18 @@ fn scrape(addr: &str) -> Result<String> {
     Ok(body.to_string())
 }
 
-/// Fold one PS's scrape of round `t` into the store.
-fn fold_scrape(
-    st: &mut MetricsStore,
-    id: u64,
-    t: u64,
-    addr: Option<String>,
-    got: Result<String>,
-) {
+/// Fold one PS's scrape of round `t` into the store. A failed scrape leaves
+/// the round incomplete for the PS's scopes.
+fn fold_scrape(st: &mut MetricsStore, id: u64, t: u64, addr: String, got: Result<String>) {
     let last_ok_ms = st.status(id).and_then(|s| s.last_ok_ms);
     let status = match got {
         Ok(text) => {
             st.ingest(id, t, &text);
-            PsStatus { metrics_addr: addr, last_ok_ms: Some(t), error: None }
+            PsStatus { metrics_addr: Some(addr), last_ok_ms: Some(t), error: None }
         }
         Err(e) => {
-            // Only a scrape that failed leaves the round incomplete: a PS with
-            // no endpoint never contributes, so its absence is no dip.
-            if addr.is_some() {
-                st.record_failure(id);
-            }
-            PsStatus { metrics_addr: addr, last_ok_ms, error: Some(format!("{e:#}")) }
+            st.record_failure(id);
+            PsStatus { metrics_addr: Some(addr), last_ok_ms, error: Some(format!("{e:#}")) }
         }
     };
     st.set_status(id, status);
@@ -386,10 +372,11 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Scrape every PS once per `metrics_interval`, forever. The PS list comes
-/// from the manager every `PS_LIST_REFRESH`; a failed refresh keeps the last.
+/// Scrape every PS once per `metrics_interval`, forever. The target list
+/// comes from the manager every `PS_LIST_REFRESH`; a failed refresh keeps
+/// the last.
 async fn metrics_poller(cfg: Rc<Config>, store: Rc<RefCell<MetricsStore>>) {
-    let mut targets: Vec<(u64, Option<String>)> = Vec::new();
+    let mut targets: Vec<(u64, String)> = Vec::new();
     let mut next_list = Instant::now();
     loop {
         let round = Instant::now();
@@ -397,9 +384,7 @@ async fn metrics_poller(cfg: Rc<Config>, store: Rc<RefCell<MetricsStore>>) {
             match ps_metrics_targets(&cfg).await {
                 Ok(t) => {
                     targets = t;
-                    let complete = targets.iter().all(|(_, addr)| addr.is_some());
-                    next_list = round
-                        + if complete { PS_LIST_REFRESH } else { PS_LIST_REFRESH_INCOMPLETE };
+                    next_list = round + PS_LIST_REFRESH;
                     let ids: Vec<u64> = targets.iter().map(|(id, _)| *id).collect();
                     store.borrow_mut().retain_ps(&ids);
                 }
@@ -411,14 +396,11 @@ async fn metrics_poller(cfg: Rc<Config>, store: Rc<RefCell<MetricsStore>>) {
         let scrapes = targets.iter().map(|(id, addr)| {
             let (id, addr) = (*id, addr.clone());
             async move {
-                let Some(addr) = addr else {
-                    return (id, None, Err(anyhow!("no /metrics endpoint reported")));
-                };
                 let a = addr.clone();
                 let got = compio::runtime::spawn_blocking(move || scrape(&a))
                     .await
                     .unwrap_or_else(|_| Err(anyhow!("scrape thread panicked")));
-                (id, Some(addr), got)
+                (id, addr, got)
             }
         });
         for (id, addr, got) in futures::future::join_all(scrapes).await {
@@ -930,16 +912,14 @@ mod tests {
     const TEXT: &str = "# TYPE autumn_ps_sst_tables gauge\nautumn_ps_sst_tables 3\n";
 
     #[test]
-    fn a_ps_without_an_endpoint_does_not_blank_the_cluster_view() {
+    fn a_failed_scrape_leaves_a_gap_in_the_cluster_view() {
         let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
         st.begin_round(10_000);
-        fold_scrape(&mut st, 1, 10_000, Some("a:1".into()), Ok(TEXT.into()));
-        fold_scrape(&mut st, 2, 10_000, None, Err(anyhow!("no /metrics endpoint reported")));
+        fold_scrape(&mut st, 1, 10_000, "a:1".into(), Ok(TEXT.into()));
         assert_eq!(st.query(&Scope::Cluster)["series"]["sst_tables"], serde_json::json!([3.0]));
-        // A PS with an endpoint that fails this round does leave a gap.
         st.begin_round(20_000);
-        fold_scrape(&mut st, 1, 20_000, Some("a:1".into()), Ok(TEXT.into()));
-        fold_scrape(&mut st, 3, 20_000, Some("c:3".into()), Err(anyhow!("refused")));
+        fold_scrape(&mut st, 1, 20_000, "a:1".into(), Ok(TEXT.into()));
+        fold_scrape(&mut st, 3, 20_000, "c:3".into(), Err(anyhow!("refused")));
         assert_eq!(
             st.query(&Scope::Cluster)["series"]["sst_tables"],
             serde_json::json!([3.0, null])
@@ -947,15 +927,11 @@ mod tests {
     }
 
     #[test]
-    fn evicted_members_are_not_scrape_targets() {
-        let ov = serde_json::json!({"ps_servers": [
-            {"ps_id": 1, "metrics_addr": "10.0.0.1:9701", "evicted_at_ms": null},
-            {"ps_id": 2, "metrics_addr": null, "evicted_at_ms": null},
-            {"ps_id": 3, "metrics_addr": null, "evicted_at_ms": 1700000000000u64},
-        ]});
-        assert_eq!(
-            parse_metrics_targets(&ov).unwrap(),
-            vec![(1, Some("10.0.0.1:9701".to_string())), (2, None)]
-        );
+    fn scrape_targets_are_the_partition_servers_in_the_file_sd_list() {
+        let sd = serde_json::json!([
+            {"targets": ["10.0.0.1:9801"], "labels": {"autumn_role": "ps", "ps_id": "1"}},
+            {"targets": ["10.0.0.7:9601"], "labels": {"autumn_role": "en", "node_id": "7"}},
+        ]);
+        assert_eq!(parse_metrics_targets(&sd).unwrap(), vec![(1, "10.0.0.1:9801".to_string())]);
     }
 }

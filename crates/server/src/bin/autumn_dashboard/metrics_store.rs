@@ -24,7 +24,6 @@ struct Key {
 }
 
 struct Series {
-    counter: bool,
     /// Absolute round index of `values[0]`.
     start: u64,
     values: VecDeque<f32>,
@@ -155,7 +154,6 @@ impl MetricsStore {
             return;
         };
         let s = self.series.entry(key).or_insert_with(|| Series {
-            counter,
             start: idx,
             values: VecDeque::new(),
             last_raw: None,

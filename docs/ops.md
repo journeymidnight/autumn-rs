@@ -1413,47 +1413,51 @@ phases in as old extents are compacted/truncated away.
 
 ## Prometheus /metrics
 
-Every process serves a Prometheus text endpoint at `/metrics` by default, on
+Every PS and EN serves a Prometheus text endpoint at `/metrics` by default, on
 its own thread and compio runtime pinned to no core — zero interaction with
-the data-plane runtimes:
+the data-plane runtimes. The manager serves none: its state (leadership,
+fleet, in-flight ops) is what `autumn-op status` / `ops` report.
 
 | Process | Port | Series |
 |---|---|---|
-| manager | 9591 | leader/serving, store counts, per-disk online, inflight ops; plus `/sd` |
 | EN | `--port` + 500 (cluster.sh: `960<i>`) | append totals, extents per shard + total, per-disk online/full, auth rejects |
 | PS | `--port` + 500 (cluster.sh: 9801) | PS-wide only, no partition label (table below) |
 
 `--metrics-port <P>` moves a process's endpoint (0 turns it off) and
-`--metrics-listen <H>` pins its bind host (it is unauthenticated; `/sd` then
-lists that host, so a loopback-pinned endpoint is reachable only from the
-same machine). A taken port
-is logged as an ERROR and the server keeps serving. Per-partition detail is
-not exported: it goes to the manager on the load report, for scheduling (the
-dashboard's "hottest partitions"). Aggregate across servers in PromQL, e.g.
-`sum(rate(autumn_ps_requests_total[1m]))` or
-`max(autumn_ps_partition_sst_tables_max)`.
+`--metrics-listen <H>` pins its bind host (it is unauthenticated; the target
+list then carries that host, so a loopback-pinned endpoint is reachable only
+from the same machine). A taken port is logged as an ERROR and the server
+keeps serving. Per-partition detail is not exported: it goes to the manager
+on the load report, for scheduling (the dashboard's "hottest partitions").
+Aggregate across servers in PromQL, e.g. `sum(rate(autumn_ps_requests_total[1m]))`
+or `max(autumn_ps_partition_sst_tables_max)`.
 
-**Discovery.** The manager serves the Prometheus `http_sd` target list at
-`http://<manager>:9591/sd`: every registered PS and EN that reported an
-endpoint, labelled `autumn_role` (`ps` | `en`) and `ps_id` / `node_id`. Only the
-leader lists targets (a follower answers `[]`), so list every manager:
+**Discovery.** `autumn-op info --file-sd` prints every live PS and EN endpoint
+as Prometheus `file_sd` JSON, labelled `autumn_role` (`ps` | `en`) and `ps_id` /
+`node_id` (a server that reported no endpoint, or an evicted PS, is left out).
+Pick one:
+- deploy tooling writes a static `scrape_configs` from the hosts it started;
+- cron refreshes a `file_sd` file, which Prometheus re-reads on change:
 
-```yaml
-scrape_configs:
-  - job_name: autumn
-    http_sd_configs:
-      - url: http://mgr1:9591/sd
-      - url: http://mgr2:9591/sd
-      - url: http://mgr3:9591/sd
-  - job_name: autumn-manager
-    static_configs:
-      - targets: [mgr1:9591, mgr2:9591, mgr3:9591]
-```
+  ```bash
+  # every minute; write then rename so Prometheus never reads half a file.
+  # It follows the leader, so list every manager.
+  autumn-op --manager mgr1:9001,mgr2:9001,mgr3:9001 --cluster-secret-file $SECRET \
+    info --file-sd > /etc/prometheus/autumn.json.tmp \
+    && mv /etc/prometheus/autumn.json.tmp /etc/prometheus/autumn.json
+  ```
+  ```yaml
+  scrape_configs:
+    - job_name: autumn
+      file_sd_configs:
+        - files: [/etc/prometheus/autumn.json]
+  ```
+- on Kubernetes, `kubernetes_sd_configs` with pod annotations.
 
 ```bash
 AUTUMN_TRANSPORT=tcp ./cluster.sh start 3
-curl -s http://127.0.0.1:9591/metrics   # manager
-curl -s http://127.0.0.1:9591/sd        # [{"targets":["127.0.0.1:9801"],"labels":{"autumn_role":"ps","ps_id":"1"}}, {"targets":["127.0.0.1:9601"],...,"node_id":...}, ...]
+autumn-op --manager 127.0.0.1:9001 --cluster-secret-file $SECRET info --file-sd
+# [{"targets":["127.0.0.1:9801"],"labels":{"autumn_role":"ps","ps_id":"1"}}, {"targets":["127.0.0.1:9601"],"labels":{"autumn_role":"en","node_id":...}}, ...]
 curl -s http://127.0.0.1:9801/metrics   # PS
 curl -s http://127.0.0.1:9601/metrics   # EN 1
 ```
@@ -1499,8 +1503,8 @@ bumps `flushes_total` and `sst_tables`; with small flushes (`--flush-mem-bytes`
 4 MiB) and a perf-check write run, `minor_compactions_total{trigger="flush"}`
 climbs and `sst_tables` stays low. `autumn-op split` a partition: the
 counters keep climbing through it (no reset). Notes: PS and EN render at
-scrape time from their atomics (EN per-shard gauges refresh every 2 s); the
-manager's text and `/sd` refresh every 2 s; PS counters reset on PS restart
+scrape time from their atomics (EN per-shard gauges refresh every 2 s); PS
+counters reset on PS restart
 (normal Prometheus counter semantics — use `rate()`).
 
 ## Disk-full (ENOSPC) behavior

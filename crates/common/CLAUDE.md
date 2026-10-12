@@ -68,15 +68,15 @@ Used by `StreamAppendMetrics` (stream crate), `WriteLoopMetrics` and `ReadMetric
 
 ### `metrics_http.rs` — Prometheus `/metrics` endpoint (observability batch 1)
 
-`spawn_metrics_http(bind_host, port, render, sd)` — minimal hand-rolled HTTP/1.1
+`spawn_metrics_http(bind_host, port, render)` — minimal hand-rolled HTTP/1.1
 server on its own thread with its own compio runtime, pinned to no core (the
 binaries spawn it from an unpinned thread; 2 s/5 s read/write timeouts).
 Deliberately ZERO interaction with the data-plane runtimes: the
 `render: Arc<dyn Fn() -> String + Send + Sync>` closure runs on the metrics
-thread and must only read `Arc`-shared state. The PS (`PsMetrics`) and EN render
-directly from their atomics; the manager, whose store is `Rc`/`RefCell`,
-publishes pre-rendered snapshots (`MetricsSnapshot`) from a 2 s task and also
-serves its Prometheus `http_sd` body at `/sd` (`sd`). The listener is bound and
+thread at scrape time and reads only atomics — the PS through `PsMetrics`, the
+EN through its process-global mirrors. Only `/metrics` is answered; any other
+path is a 404. Nothing is published from a server's
+own runtime. The listener is bound and
 the runtime built before the call returns, so a taken port or a failed runtime
 is the caller's Err — callers log ERROR and keep serving (metrics are
 auxiliary, never kill the data plane). `metrics_port(flag, service_port)`: a PS
@@ -86,8 +86,10 @@ others reach it at (the bound host, or the advertised one when bound to every
 address). `push_metric` / `push_type` emit the Prometheus
 text format with label escaping; emission must be metric-major (all samples
 of one metric contiguous after its `# TYPE` line — never interleave).
-Every process serves one by default: the manager at 9591, each PS and EN at
-its service port + 500.
+Every PS and EN serves one by default, at its service port + 500. The manager
+serves none: `/metrics` carries performance series only (throughput, latency,
+cache hit ratio, LSM shape), and the manager's state is visible through
+`autumn-op`.
 
 ### `error.rs` — Domain Error Types
 

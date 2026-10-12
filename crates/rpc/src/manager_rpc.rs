@@ -1656,6 +1656,9 @@ pub struct NodeStateEntry {
     /// node (impossible on a reset cluster) / legacy single-shard registration.
     pub node_uuid: String,
     pub shard_ports: Vec<u16>,
+    /// Where the node serves `/metrics`, from its latest df answer (empty:
+    /// none reported, or not heard from since this manager became leader).
+    pub metrics_addr: String,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]

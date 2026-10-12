@@ -33,6 +33,7 @@ fn usage() -> ! {
     eprintln!("  audit-log [--op N] [--node N] [--since S] [--until U] [--limit L]");
     eprintln!("                               query operator action history");
     eprintln!("  info [--part PID] [--detail] show cluster snapshot (--detail = partition load)");
+    eprintln!("  info --file-sd               Prometheus file_sd JSON: every PS / EN /metrics endpoint");
     eprintln!("  policy-candidates            advisory split/merge/gc/compact/ec candidates");
     eprintln!();
     eprintln!("op observability:");
@@ -338,6 +339,9 @@ pub(crate) enum Command {
         /// per-PS discard probes). Default `info` is now the SCALABLE compact
         /// overview (per-partition rollup, no per-extent array) for big clusters.
         full: bool,
+        /// `--file-sd`: the PS and EN `/metrics` endpoints as Prometheus
+        /// `file_sd` JSON, instead of the snapshot.
+        file_sd: bool,
     },
     PolicyCandidates,
     /// Full dashboard overview JSON (df + nodes + partitions + amp + advisories).
@@ -1016,6 +1020,7 @@ pub(crate) fn parse() -> Args {
             let mut part: Option<u64> = None;
             let mut detail = false;
             let mut full = false;
+            let mut file_sd = false;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--part" => {
@@ -1038,6 +1043,10 @@ pub(crate) fn parse() -> Args {
                         full = true;
                         i += 1;
                     }
+                    "--file-sd" => {
+                        file_sd = true;
+                        i += 1;
+                    }
                     other => {
                         eprintln!("unknown info flag: {other}");
                         usage();
@@ -1048,7 +1057,11 @@ pub(crate) fn parse() -> Args {
                 eprintln!("--detail requires --part <PID>");
                 usage();
             }
-            Command::Info { part, detail, full }
+            if file_sd && (part.is_some() || detail || full) {
+                eprintln!("--file-sd takes no other info flag");
+                usage();
+            }
+            Command::Info { part, detail, full, file_sd }
         }
         "policy-candidates" | "policy_candidates" | "policy" => Command::PolicyCandidates,
         "overview" => Command::Overview,

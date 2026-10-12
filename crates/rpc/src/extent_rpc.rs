@@ -971,7 +971,8 @@ pub struct DfResp {
     /// failures, and the next attempt reports again.
     pub op_failures: Vec<ExtentOpFailure>,
     /// Where this node serves `/metrics` (empty: not registered, or no
-    /// endpoint). The manager lists it in its Prometheus `http_sd`.
+    /// endpoint). The manager passes it on as `NodeStateEntry.metrics_addr`,
+    /// which `autumn-op info --file-sd` lists for Prometheus.
     pub metrics_addr: String,
 }
 

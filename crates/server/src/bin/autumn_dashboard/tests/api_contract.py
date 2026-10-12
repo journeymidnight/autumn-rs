@@ -27,7 +27,7 @@ def ports():
         base = random.randrange(22000, 50000)
         sockets = []
         try:
-            for offset in (1, 101, 1101, 201, 301, 401, 402, 601, 701, 801):
+            for offset in (1, 101, 1101, 201, 301, 401, 402, 601, 701):
                 s = socket.socket()
                 sockets.append(s)
                 s.bind(('127.0.0.1', base + offset))
@@ -56,7 +56,7 @@ def eventually(fn, timeout=30):
 
 def run():
     base = ports()
-    mgr, en, ps, dash, etcd, mgr_metrics = [base + n for n in (1, 101, 201, 301, 401, 801)]
+    mgr, en, ps, dash, etcd = [base + n for n in (1, 101, 201, 301, 401)]
     # A PS or EN serves /metrics on its service port + 500 unless told otherwise.
     en_metrics, ps_metrics = en + 500, ps + 500
     address = f'127.0.0.1:{mgr}'
@@ -100,8 +100,7 @@ def run():
                 '--initial-cluster', f'dashboard-test=http://127.0.0.1:{etcd+1}'])
             eventually(lambda: ready(etcd))
             manager = spawn('manager', [str(BIN/'autumn-manager-server'), '--port', str(mgr), '--listen', '127.0.0.1',
-                '--cluster-secret-file', str(secret), '--manager-id', '1', '--etcd', f'127.0.0.1:{etcd}',
-                '--metrics-port', str(mgr_metrics)])
+                '--cluster-secret-file', str(secret), '--manager-id', '1', '--etcd', f'127.0.0.1:{etcd}'])
             eventually(lambda: ready(mgr))
             # Read-only status proves that leader election/replay finished.
             def leader():
@@ -168,11 +167,11 @@ def run():
                 assert f'# TYPE {name} ' in text, name
             assert 'part=' not in text and 'ps=' not in text, 'PS series carry no partition or ps label'
             assert '# TYPE autumn_en_append_bytes_total ' in scrape(en_metrics)
-            # The manager's http_sd lists both, once the EN's df answer carried its address.
-            def sd():
-                groups = json.loads(scrape(mgr_metrics, '/sd'))
+            # autumn-op lists both for Prometheus, once the EN's df answer carried its address.
+            def file_sd():
+                groups = op('info', '--file-sd')
                 return groups if len(groups) == 2 else None
-            assert eventually(sd) == [
+            assert eventually(file_sd) == [
                 {'targets': [f'127.0.0.1:{ps_metrics}'], 'labels': {'autumn_role': 'ps', 'ps_id': '1'}},
                 {'targets': [f'127.0.0.1:{en_metrics}'], 'labels': {'autumn_role': 'en', 'node_id': str(v['nodes'][0]['node_id'])}},
             ]

@@ -26,7 +26,7 @@ autumn-manager-server --cluster-secret-file FILE [--port 9001] [--listen 0.0.0.0
 
 - Without `--etcd`: in-memory only (metadata lost on restart, no leader election). With `--etcd`: persistent — holds `--manager-id` (required, non-zero, unique per manager; a second process with a held id waits), replays state, runs the leader-election loop. `autumn-op manager-remove <id> --by X` drops a stopped manager from the expected fleet.
 - Serves `StreamManagerService` + `PartitionManagerService` on the same port, plus gRPC reflection.
-- Prometheus `/metrics` on every process by default (unauthenticated; `--metrics-listen <H>` pins it to 127.0.0.1 when the RPC plane is on 0.0.0.0): the manager at 9591, plus the `http_sd` target list of every PS and EN at `/sd`; each PS and EN at its `--port` + 500, process-level series only (no partition label — Prometheus sums servers). `--metrics-port <P>` moves it, 0 turns it off. The PS/EN endpoint runs on its own thread and compio runtime, pinned to no core, reading the server's atomics.
+- Prometheus `/metrics` on every PS and EN by default, at its `--port` + 500 (unauthenticated; `--metrics-listen <H>` pins it to 127.0.0.1 when the RPC plane is on 0.0.0.0): performance series only, process-level (no partition label — Prometheus sums servers). `--metrics-port <P>` moves it, 0 turns it off. It runs on its own thread and compio runtime, pinned to no core, reading the server's atomics. The manager serves none and refuses `--metrics-port` / `--metrics-listen`; `autumn-op info --file-sd` prints the PS and EN endpoints as Prometheus `file_sd` JSON.
 - The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy start <NAME>`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op` (it scrapes PS `/metrics` directly for its Metrics tab). Runbook: `docs/ops.md`.
 - `--cluster-secret-file <FILE>` (REQUIRED on the manager, PS and EN; exit 2 without it): the cluster secret every Peer/Admin connection proves (`autumn_rpc::peer_auth`, `docs/cluster_secret_design.md`). `--admin-token[-file]` were removed and are refused by name.
 - Authz (opt-in): `--auth-signing-key-file <FILE>` enables data-plane authz (keys from `autumn-op gen-signing-key`). With a key, every keyed op needs a token (no protected-prefix list). `--auth-token-ttl-secs` / `--auth-clock-skew-secs` tune minted tokens.
@@ -131,9 +131,9 @@ No new dependency, wire format, or data-path work is added by this integration.
   overhead, outside client/PS/EN data traffic. Multiple browsers still incur
   separate requests.
 - **Metrics tab.** The one thing it does without `autumn-op`: a poller task
-  scrapes every PS's Prometheus `/metrics` itself, at the address each PS reports
-  on its heartbeat (`ps_servers[].metrics_addr`, re-read through `autumn-op
-  overview` every 60 s, every 10 s while a PS has reported none). Scrapes run on
+  scrapes every PS's Prometheus `/metrics` itself, at the targets `autumn-op info
+  --file-sd` lists (`autumn_role` = `ps`; re-read every 15 s, so a new PS shows up
+  once its heartbeat carried its address). Scrapes run on
   blocking threads (plain `std::net`, 3 s timeout), all PSes per round, every
   `--metrics-interval-secs` (10). `metrics_store.rs` keeps
   `--metrics-retention-secs` (3600) in memory: counters as per-second rates (a
@@ -142,8 +142,7 @@ No new dependency, wire format, or data-path work is added by this integration.
   PS's ~40 series cost ~60 KB an hour), so series add up point for
   point and a query indexes instead of matching times. A round in which a PS of
   the scope failed its scrape is `null` in the scope's sums rather than a dip;
-  a PS with no endpoint is not a failure (it never contributes), and evicted
-  members are not scraped at all. A PS's series are PS-wide. `GET
+  a PS with no endpoint, or evicted, is not listed and not scraped. A PS's series are PS-wide. `GET
   /api/metrics?scope=cluster|ps&id=N` sums the scope (a `*_max` series takes the
   largest); no subprocess, so it costs the page nothing to poll. Per-partition
   history is not kept: the tab's "hottest partitions" table is the overview's
@@ -169,7 +168,7 @@ Global `--cluster-secret-file` (position-independent): autumn-op connects as an 
 
 | Category | Commands |
 |----------|----------|
-| Read / observability | `status` (fleet vs expected members, `--json`), `list-nodes`, `df`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `policy-candidates` |
+| Read / observability | `status` (fleet vs expected members, `--json`), `list-nodes`, `df`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `info --file-sd` (every live PS / EN `/metrics` endpoint as Prometheus `file_sd` JSON, labelled `autumn_role` and `ps_id` / `node_id`), `policy-candidates` |
 | Node lifecycle | `fence-node <id> --reason ... --by ... [--force]`, `maintenance <id> --reason ... --by ... [--expire TS]`, `unfence <id> --by ...`, `remove <id> --by ...`, `ps-remove <ps_id> --by ...` (drop a stopped, evicted PS from the expected fleet; refused while it is registered) |
 | Cluster / partition admin | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID> [--namespace <NS[/SUB]> [--at S \| --at-hex H]] [--at-raw-hex H]`, `presplit --namespace <NS[/SUB]> <rule flags>`, `merge <SURVIVOR> <VICTIM> [--force]`, `rebalance`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format <DIR>...` |
 | Auth / namespaces | `gen-cluster-secret`, `gen-signing-key [--kid K]`, `principal-create --principal P --grant P...`, `principal-delete --principal P`, `principal-list`, `mint-token [--principal P] (--credential HEX \| --credential-file F)` (the file, before or after the subcommand, is read once by `prescan_secret_flags` in a form that names its principal — what `principal-create` prints, or `<principal>\n<hex>`; that principal fills or must match `--principal`), `namespace-create --name N [--presplit hex,…]`, `namespace-delete --name N`, `namespace-list` |

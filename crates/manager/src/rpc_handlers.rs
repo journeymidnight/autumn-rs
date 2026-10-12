@@ -6347,7 +6347,7 @@ impl AutumnManager {
         }
         let (nodes_meta, overrides, snapshot) = {
             let s = self.store.inner.borrow();
-            let nodes: Vec<(u64, String, String, Vec<u16>)> = s
+            let nodes: Vec<(u64, String, String, Vec<u16>, String)> = s
                 .nodes
                 .iter()
                 .map(|(id, n)| {
@@ -6356,6 +6356,7 @@ impl AutumnManager {
                         n.address.clone(),
                         n.node_uuid.clone(),
                         n.shard_ports.clone(),
+                        s.en_metrics_addrs.get(id).cloned().unwrap_or_default(),
                     )
                 })
                 .collect();
@@ -6372,7 +6373,7 @@ impl AutumnManager {
             .collect();
         let mut out: Vec<NodeStateEntry> = nodes_meta
             .into_iter()
-            .map(|(node_id, address, node_uuid, shard_ports)| {
+            .map(|(node_id, address, node_uuid, shard_ports, metrics_addr)| {
                 let (auto_state, last_secs) = snap_map
                     .get(&node_id)
                     .copied()
@@ -6402,6 +6403,7 @@ impl AutumnManager {
                     override_expire_at: ovr.map(|o| o.expire_at).unwrap_or(0),
                     node_uuid,
                     shard_ports,
+                    metrics_addr,
                 }
             })
             .collect();

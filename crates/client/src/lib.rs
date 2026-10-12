@@ -1224,6 +1224,54 @@ impl ClusterClient {
         Ok(resp)
     }
 
+    /// The cluster overview (`MSG_GET_CLUSTER_OVERVIEW`). Leader-routed
+    /// (rotates on NOT_LEADER): only the leader hears PS heartbeats.
+    pub async fn cluster_overview(&self) -> Result<autumn_rpc::manager_rpc::GetClusterOverviewResp> {
+        use autumn_rpc::manager_rpc::{GetClusterOverviewReq, GetClusterOverviewResp, MSG_GET_CLUSTER_OVERVIEW};
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: GetClusterOverviewResp = self
+            .mgr_call_leader(
+                MSG_GET_CLUSTER_OVERVIEW,
+                rkyv_encode(&GetClusterOverviewReq {}),
+                "cluster_overview",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: GetClusterOverviewResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("cluster_overview failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
+    /// Every extent node's state (`MSG_LIST_NODE_STATES`). Leader-routed
+    /// (rotates on NOT_LEADER): only the leader hears df answers.
+    pub async fn list_node_states(&self) -> Result<autumn_rpc::manager_rpc::ListNodeStatesResp> {
+        use autumn_rpc::manager_rpc::{ListNodeStatesReq, ListNodeStatesResp, MSG_LIST_NODE_STATES};
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: ListNodeStatesResp = self
+            .mgr_call_leader(
+                MSG_LIST_NODE_STATES,
+                rkyv_encode(&ListNodeStatesReq {}),
+                "list_node_states",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: ListNodeStatesResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("list_node_states failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
     /// M2: read the auto-policy controller state
     /// (`MSG_AUTOPOLICY_GET`). Leader-routed (rotates on NOT_LEADER).
     pub async fn auto_policy_get(&self) -> Result<AutoPolicyGetResp> {

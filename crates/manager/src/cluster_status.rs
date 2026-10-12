@@ -265,6 +265,7 @@ mod tests {
             override_expire_at: 0,
             node_uuid: String::new(),
             shard_ports: Vec::new(),
+            metrics_addr: String::new(),
         };
         let nodes = [
             node(1, NODE_AUTO_STATE_ONLINE, NODE_OVERRIDE_NONE),
