@@ -1420,7 +1420,7 @@ fleet, in-flight ops) is what `autumn-op status` / `ops` report.
 
 | Process | Port | Series |
 |---|---|---|
-| EN | `--port` + 500 (cluster.sh: `960<i>`) | append totals, extents per shard + total, per-disk online/full, auth rejects |
+| EN | `--port` + 500 (cluster.sh: `960<i>`) | append batches, bytes and time |
 | PS | `--port` + 500 (cluster.sh: 9801) | PS-wide only, no partition label (table below) |
 
 `--metrics-port <P>` moves a process's endpoint (0 turns it off) and
@@ -1462,15 +1462,12 @@ curl -s http://127.0.0.1:9801/metrics   # PS
 curl -s http://127.0.0.1:9601/metrics   # EN 1
 ```
 
-EN refusals: `autumn_en_auth_rejects_total{class="opcode_denied|peer_auth|client_read|client_token"}`
-counts connections/frames the EN refused (a Client sending a member op, a Peer
-that fails PEER_AUTH, a direct read without a valid principal, a refused
-`CLIENT_AUTH` token). A rising `peer_auth` means a process with the wrong
-`--cluster-secret-file` (it also counts a peer that vanished or timed out
-mid-handshake, so a lone tick is not a verdict); a rising `opcode_denied` means something is sending
-non-read ops on a Client connection. Manual check:
-`cargo test -p autumn-server --test cluster_secret` (scrapes both counters from a
-real EN's `/metrics`).
+`/metrics` carries performance series only. State lives in `autumn-op`: disk
+online / faulted / full per node (`autumn-op list-nodes`, the `FULL` column, and
+`--json overview` `nodes[].disks[]`), extent counts (`overview`), fleet and
+leadership (`status`), in-flight ops (`ops`). Refusals of a wrong cluster secret
+show in the refusing server's log ("PEER_AUTH refused a connection holding a
+different cluster secret").
 
 PS latency histograms (LAT-1): `autumn_ps_write_duration_seconds` (group-commit end-to-end across ALL write ops — Put/Delete —
 observed per batched op from the already-measured WriteLoopMetrics
@@ -1514,8 +1511,9 @@ distinct from **Faulted** (any other I/O error, permanent until restart):
 a Full disk keeps serving reads and existing extents but hosts no NEW
 extents, and **self-heals** back to Online within ~2 s of free space
 returning above 5% of the disk (GC or operator cleanup — no process
-restart needed). Watch `autumn_en_disk_full{disk_id=...}` on the EN
-`/metrics` endpoint. The manager additionally soft-avoids allocating onto
+restart needed). Watch the `FULL` column of `autumn-op list-nodes` (or
+`full` on the disk rows of `autumn-op --json overview`; the dashboard's Nodes
+tab marks the disk full). The manager additionally soft-avoids allocating onto
 nodes whose best disk has < `--min-alloc-free-bytes` free (default
 256 MiB; 0 disables; cluster.sh env `AUTUMN_MGR_MIN_ALLOC_FREE_BYTES`).
 

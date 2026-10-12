@@ -381,17 +381,12 @@ and a keyring lookup per read frame, only on Client connections with authz on.
 Tests: `client_direct_read_auth_tests` (anonymous / forged / expired / valid /
 revoked kid / Unknown / Off / member connection).
 
-**Refusal counters.** `EN_REJECTS` (process-global atomics, bumped only on the
-refusal paths via `note_reject`) feed `autumn_en_auth_rejects_total{class}` in
-`render_en_metrics`: `opcode_denied` (`check_opcode` refused a frame),
-`peer_auth` (any failed PEER_AUTH handshake in `handle_connection`: wrong secret, or a peer that vanished / timed out mid-handshake), `client_read` (authz-On
-read without a valid principal), `client_token` (`CLIENT_AUTH` token refused).
-`Unavailable` answers are not counted. Tests: `a_client_connection_cannot_reach_a_mutating_op_and_the_refusal_is_counted`
-(Client `DELETE_EXTENT` / `FENCE_EXTENT` / `APPEND` refused, counter +3, extent
-untouched and unfenced), `refused_reads_and_tokens_are_counted_by_class`, and the
-real-binary `cluster_secret.rs::members_and_operators_must_prove_the_secret`
-(`opcode_denied` and `peer_auth` scraped from a running EN). The counters are
-process-global, so in-process tests compare deltas with `>=` (never `==`).
+**Refusals are not counted.** A refused frame or connection answers
+`PermissionDenied` (a failed PEER_AUTH is also logged with the peer); nothing
+tallies them. Tests: `a_client_connection_cannot_reach_a_mutating_op` (Client
+`DELETE_EXTENT` / `FENCE_EXTENT` / `APPEND` refused, extent untouched and
+unfenced), `an_unbound_read_and_a_forged_token_are_refused`, and the real-binary
+`cluster_secret.rs::members_and_operators_must_prove_the_secret`.
 
 **`ConnPool::set_auth_token`**: a pool that holds a token sends `CLIENT_AUTH` on
 every connection it opens, right after the handshake and before pooling it
@@ -1486,7 +1481,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
 25. **No `.meta` persist failure is ever swallowed** — the `.meta` sidecar is the only state a restart trusts (note 23); any path mutating eversion/sealed/avali/sealed_length then ignoring a failed persist reports a state the disk does not hold. All such sites are fail-closed (`mark_disk_offline_for_extent` + error): `run_recovery_task` final persist (also REMOVES the partial `ExtentEntry` so local retries can't reuse the offline disk and block manager re-dispatch), and both `handle_convert_to_ec` seal persists. Corollary: the note-16 **idempotent-skip must ENSURE durability, not just check atomics** — a prior attempt may have published the in-memory atomics then failed its persist, so the skip re-runs `save_meta` (idempotent) and fail-closes if it still can't. **Invariant: returning OK from any seal/convert/recovery RPC asserts the sidecar is durable, not merely that memory agrees.**
 
-26. **/metrics.** The EN's authoritative state is shard-local `Rc` (unreadable from the metrics HTTP thread), so two process-global mirrors feed `render_en_metrics()`: (a) `EN_APPEND_TOTALS` — monotonic batch/bytes/ns counters (3 relaxed fetch_adds per BATCH); (b) `EN_SHARD_GAUGES` — one `Arc<EnShardGauges>` per ExtentNode, refreshed by a 2 s task spawned on THAT shard's runtime (NOT df-driven — the manager df reaches only shard 0, so a df-refresh left other shards permanently stale). The renderer sums extents across shards (disjoint sets) and reports a disk offline if ANY shard's view says so. The binary serves it on its own thread and compio runtime, pinned to no core (spawned before any shard thread pins itself), at `--port` + 500 unless `--metrics-port` (0 = none); shard 0's `handle_df` reports the address (`NodeRegistration.metrics_addr`, `DfResp.metrics_addr`) so `autumn-op info --file-sd` can list the EN for Prometheus (`NodeStateEntry.metrics_addr`).
+26. **/metrics.** Performance only: `render_en_metrics()` reads `EN_APPEND_TOTALS`, process-global monotonic batch/bytes/ns counters (3 relaxed fetch_adds per BATCH). Disk health is state and travels on the df answer instead (`DiskStatus.online`, and `DiskStatus.full` for an ENOSPC-full disk, which the manager passes on as `NodeStateEntry.full_disks` — `autumn-op list-nodes` / overview); extent counts are the manager's (`overview` `extent_count`). Each shard still runs its 2 s ENOSPC self-heal sweep (Full → Online once free space is back above 5%). The binary serves it on its own thread and compio runtime, pinned to no core (spawned before any shard thread pins itself), at `--port` + 500 unless `--metrics-port` (0 = none); shard 0's `handle_df` reports the address (`NodeRegistration.metrics_addr`, `DfResp.metrics_addr`) so `autumn-op info --file-sd` can list the EN for Prometheus (`NodeStateEntry.metrics_addr`).
 
 27. **Read-path Suspected avoidance (replicated route-around + EC proactive reconstruct).** `alloc_extent` already excludes manager-`Suspected` nodes; reads apply the SAME avoidance so rotation onto a flaky node does not cost a per-read timeout.
     - **Client-side snapshot, not new wire.** `StreamClient.suspected: Rc<RefCell<SuspectedCache>>` refreshed by `maybe_refresh_suspected()` at `read_with_layout` entry: TTL-gated (2 s) + NON-BLOCKING (spawns a detached poll of `MSG_LIST_NODE_STATES`, filter `NODE_AUTO_STATE_SUSPECTED`, swaps the set in; the current read proceeds on the slightly-stale snapshot and NEVER awaits a manager RTT). A failed poll keeps the prior snapshot — a failed refresh must NEVER widen the avoidance set.

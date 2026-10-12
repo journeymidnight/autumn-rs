@@ -298,6 +298,7 @@
   .node .disks { display:flex; gap:3px; margin-top:7px; }
   .node .disks i { flex:1; height:3px; border-radius:2px; background:var(--ok); }
   .node .disks i.off { background:var(--muted); } .node .disks i.bad { background:var(--bad); }
+  .node .disks i.warn { background:var(--warn); }
 
   /* per-disk table (Nodes tab detail) */
   table.disks { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
@@ -311,6 +312,7 @@
   .pill.ok { color:var(--ok); border-color:#50a86855; }
   .pill.bad { color:var(--bad); border-color:#c4505055; background:#c4505014; }
   .pill.off { color:var(--muted); }
+  .pill.warn { color:var(--warn); }
   .minibar { height:4px; border-radius:2px; background:var(--line); overflow:hidden; min-width:60px; }
   .minibar i { display:block; height:100%; background:var(--accent-dim); }
   .minibar i.hi { background:var(--warn); } .minibar i.crit { background:var(--bad); }
@@ -857,7 +859,8 @@ function nodeCard(n){
   const total=n.total,free=n.free,usedPct=total?100*(1-free/total):0;
   const disks=n.disks||[];
   const dstate=d=> d.reported===false ? ["off","not reported by the node"]
-                 : (d.faulted||!d.online) ? ["bad","FAULTED"] : ["","online"];
+                 : (d.faulted||!d.online) ? ["bad","FAULTED"]
+                 : d.full ? ["warn","FULL — serves reads, takes no new extents"] : ["","online"];
   const strip=disks.length?`<div class="disks">${disks.map(d=>{
     const [cls,label]=dstate(d);
     return `<i class="${cls}" title="disk ${d.disk_id} — ${label}"></i>`;}).join("")}</div>`:"";
@@ -877,16 +880,18 @@ function renderNodesTab(){
     : '<div class="listempty">No extent node is registered.</div>';
   if(SEL_NODE!=null) renderNodeDrawer(SEL_NODE);
 }
-// Three states, and each is reachable — which is the point of `reported`.
+// Four states, and each is reachable — which is the point of `reported`.
 // `faulted` and `online` are the SAME fact today (both come from the node's own
 // `DiskStatus.online`), so rendering them as two rows would invent a
 // distinction; a disk the node never described is the genuinely different one.
+// `full` (out of space) is a third verdict of the node's: it still serves.
 function diskRow(d){
   const used=(d.total&&d.free!=null)?d.total-d.free:null;
   const pct=d.total?100*(1-d.free/d.total):0;
   const state = d.reported===false ? `<span class="pill off">not reported</span>`
               : (d.faulted || !d.online) ? `<span class="pill bad">faulted</span>`
-                                         : `<span class="pill ok">online</span>`;
+              : d.full ? `<span class="pill warn" title="serves reads, takes no new extents">full</span>`
+                       : `<span class="pill ok">online</span>`;
   return `<tr>
     <td><b>#${d.disk_id}</b><div class="uuid">${esc((d.uuid||"").slice(0,12))}${(d.uuid||"").length>12?"…":""}</div></td>
     <td>${state}</td>

@@ -62,9 +62,11 @@ const OVERVIEW = {
       last_heartbeat_secs_ago: 1, suspected_age_secs: 0, override_kind: "-",
       override_reason: "", override_set_by: "", node_uuid: "node-uuid", shard_ports: [21101],
       // one healthy, one the node calls faulted, one the registry has but the
-      // node did not describe — all three states the tab must tell apart.
+      // node did not describe, one out of space — the states the tab must
+      // tell apart.
       disks: [disk(2), disk(3, { faulted: true, online: false }),
-              disk(4, { reported: false, online: false, total: 0, free: 0, extent_bytes: 0 })] },
+              disk(4, { reported: false, online: false, total: 0, free: 0, extent_bytes: 0 }),
+              disk(5, { full: true })] },
     // registered but NOT answering df: no per-disk rows at all, and the page
     // must call its disk state unknown rather than blame a data directory.
     { node_id: 2, address: "127.0.0.1:21102", extent_count: 0, online: false,
@@ -180,6 +182,7 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   want("#nodedrawer", "Disks", "the node drawer has a disk table");
   want("#nodedrawer", "faulted", "…and names the faulted disk as faulted");
   want("#nodedrawer", "not reported", "…and separates a disk the node never described");
+  want("#nodedrawer", ">full</span>", "…and marks a disk out of space as full");
   want("#nodedrawer", "NOT described on its last df", "…with what that actually means");
   want("#nodedrawer", "uuid-2", "…and shows each disk's identity");
   // An unreachable node is ONE fact, not N missing disks.

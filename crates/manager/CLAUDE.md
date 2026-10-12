@@ -2306,8 +2306,11 @@ and those live in the PS and EN, each of which serves its own; the manager's sta
 
 What it does keep is where those endpoints are, in memory only and cleared on replay:
 `MetadataState::ps_metrics_addrs` (each PS's heartbeat `metrics_addr`, shown as
-`PsOverview.metrics_addr`) and `en_metrics_addrs` (each EN's df answer, set in
-`node_health_loop`, shown as `NodeStateEntry.metrics_addr`). `autumn-op info
+`PsOverview.metrics_addr`) and `en_reports` (`EnDfReport`, from each EN's df answer in
+`node_health_loop`: its `metrics_addr` and the disks it reports ENOSPC-full, shown as
+`NodeStateEntry.metrics_addr` / `full_disks` and as `full` on the overview's disk
+rows). An entry goes when the node's df fails (unreachable, undecodable, imposter)
+or the node is removed, so a dead node does not keep reporting a full disk. `autumn-op info
 --file-sd` turns the two into Prometheus `file_sd` JSON. Only the leader hears
 heartbeats and df answers; `info --file-sd` reads both through the client's
 leader-following calls (`cluster_overview`, `list_node_states`), so it may be pointed

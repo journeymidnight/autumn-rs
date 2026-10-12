@@ -248,7 +248,9 @@ pub fn build_overview_json(
     // extents, each de-amplified. A 4+1-only cluster is ~1.25x; RF3 is ~3x.
     let logical_size = df.logical_stored.saturating_add(df.logical_open_tail);
     let amp = raw_capacity_amplification(raw_used, logical_size);
+    // `full` comes from the node state: `DiskCapWire` is client surface.
     let disks_json = |n: &NodeCapWire| -> Vec<serde_json::Value> {
+        let full = ns_by_id.get(&n.node_id).map_or(&[][..], |s| &s.full_disks[..]);
         n.disks
             .iter()
             .map(|d| {
@@ -261,6 +263,7 @@ pub fn build_overview_json(
                     "reported": d.reported,
                     "online": d.online,
                     "faulted": d.faulted,
+                    "full": full.contains(&d.disk_id),
                 })
             })
             .collect()

@@ -135,16 +135,12 @@ thread_local! {
         RefCell::new(ExtentAppendMetrics::new());
 }
 
-// ─── /metrics globals (observability batch 1) ───────────────────────────────
+// ─── /metrics globals ────────────────────────────────────────────────────────
 //
-// The EN's authoritative state (`extents` DashMap, `disks` map) is
-// shard-local behind `Rc` — unreadable from the metrics HTTP thread. Each
-// shard therefore mirrors cheap gauges into an `Arc<EnShardGauges>` slot
-// (registered at construction, refreshed from `handle_df` — the manager's
-// ~2 s node_health_loop probe — so staleness is bounded by the df cadence)
-// while monotonic append totals accumulate directly into process-global
-// atomics from the per-batch `record` path. `render_en_metrics()` is safe
-// to call from any thread.
+// `/metrics` carries performance series only: monotonic append totals that
+// the per-batch `record` path adds into process-global atomics.
+// `render_en_metrics()` is safe to call from any thread. Disk health is state,
+// reported on the df answer (and through the manager to `autumn-op`), not here.
 
 pub struct EnAppendTotals {
     pub requests: std::sync::atomic::AtomicU64,
@@ -158,63 +154,7 @@ pub(crate) static EN_APPEND_TOTALS: EnAppendTotals = EnAppendTotals {
     ns: std::sync::atomic::AtomicU64::new(0),
 };
 
-/// Why the EN refused a connection or a request on authentication grounds.
-/// Counted on the refusal path only, so the admitted path pays nothing.
-#[derive(Clone, Copy)]
-enum EnReject {
-    /// A connection called an opcode its (service, role) may not call.
-    OpcodeDenied,
-    /// A Peer/Admin connection did not prove the cluster secret.
-    PeerAuth,
-    /// A Client read refused: authz is on and the connection bound no principal.
-    ClientRead,
-    /// `CLIENT_AUTH` refused the presented capability token.
-    ClientToken,
-}
-
-impl EnReject {
-    const ALL: [(EnReject, &'static str); 4] = [
-        (EnReject::OpcodeDenied, "opcode_denied"),
-        (EnReject::PeerAuth, "peer_auth"),
-        (EnReject::ClientRead, "client_read"),
-        (EnReject::ClientToken, "client_token"),
-    ];
-}
-
-static EN_REJECTS: [std::sync::atomic::AtomicU64; 4] = [
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0),
-];
-
-fn note_reject(class: EnReject) {
-    EN_REJECTS[class as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub struct EnShardGauges {
-    shard_idx: u32,
-    extents: std::sync::atomic::AtomicU64,
-    /// (disk_id, DiskHealth as u64: 0=Online 1=Full 2=Faulted) — disk
-    /// set is fixed at construction.
-    disks: Vec<(u64, std::sync::atomic::AtomicU64)>,
-}
-
-/// One slot per LIVE ExtentNode instance. Weak entries (coco P2): a
-/// dropped node (test teardown, failed init after registration) leaves a
-/// dead Weak that the renderer prunes — no slot leak, no stale/duplicate
-/// series, and the per-shard refresh task exits when its upgrades fail.
-static EN_SHARD_GAUGES: std::sync::Mutex<Vec<std::sync::Weak<EnShardGauges>>> =
-    std::sync::Mutex::new(Vec::new());
-
-/// Render the EN's Prometheus text. Extents are summed across shards
-/// (shards own disjoint extent sets); per-disk health takes the WORST
-/// across shards. That fold is now belt-and-braces rather than load-bearing:
-/// the health cell itself is SHARED per physical directory
-/// (`shared_disk_health`, canonical-path keyed), so a flip by any shard is
-/// already visible to all of them — the comment here used to say the opposite.
-/// `autumn_en_disk_online` = 0 iff some shard sees Faulted,
-/// `autumn_en_disk_full` = 1 iff some shard sees Full (and none Faulted).
+/// The EN's Prometheus text: append batches, bytes and time.
 pub fn render_en_metrics() -> String {
     use autumn_common::metrics_http::{push_metric, push_type};
     use std::sync::atomic::Ordering::Relaxed;
@@ -240,64 +180,6 @@ pub fn render_en_metrics() -> String {
         &[],
         EN_APPEND_TOTALS.ns.load(Relaxed) as f64,
     );
-    push_type(&mut out, "autumn_en_auth_rejects_total", "counter");
-    for (class, name) in EnReject::ALL {
-        push_metric(
-            &mut out,
-            "autumn_en_auth_rejects_total",
-            &[("class", name.to_string())],
-            EN_REJECTS[class as usize].load(Relaxed) as f64,
-        );
-    }
-    let slots: Vec<std::sync::Arc<EnShardGauges>> = {
-        let mut guard = EN_SHARD_GAUGES.lock().unwrap();
-        // Prune slots whose ExtentNode has dropped (coco P2).
-        guard.retain(|w| w.strong_count() > 0);
-        guard.iter().filter_map(|w| w.upgrade()).collect()
-    };
-    let mut extents_total: u64 = 0;
-    // Worst health per disk across shards (0=Online 1=Full 2=Faulted).
-    let mut disk_health: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    push_type(&mut out, "autumn_en_shard_extents", "gauge");
-    for s in slots.iter() {
-        let e = s.extents.load(Relaxed);
-        extents_total += e;
-        push_metric(
-            &mut out,
-            "autumn_en_shard_extents",
-            &[("shard", s.shard_idx.to_string())],
-            e as f64,
-        );
-        for (disk_id, health) in &s.disks {
-            let v = health.load(Relaxed);
-            disk_health
-                .entry(*disk_id)
-                .and_modify(|cur| *cur = (*cur).max(v))
-                .or_insert(v);
-        }
-    }
-    push_type(&mut out, "autumn_en_extents", "gauge");
-    push_metric(&mut out, "autumn_en_extents", &[], extents_total as f64);
-    let mut disk_ids: Vec<u64> = disk_health.keys().copied().collect();
-    disk_ids.sort_unstable();
-    push_type(&mut out, "autumn_en_disk_online", "gauge");
-    for disk_id in &disk_ids {
-        push_metric(
-            &mut out,
-            "autumn_en_disk_online",
-            &[("disk_id", disk_id.to_string())],
-            u64::from(disk_health[disk_id] != 2) as f64,
-        );
-    }
-    push_type(&mut out, "autumn_en_disk_full", "gauge");
-    for disk_id in &disk_ids {
-        push_metric(
-            &mut out,
-            "autumn_en_disk_full",
-            &[("disk_id", disk_id.to_string())],
-            u64::from(disk_health[disk_id] == 1) as f64,
-        );
-    }
     out
 }
 
@@ -1950,10 +1832,6 @@ pub struct ExtentNode {
     fd_lru: Rc<FdLru>,
     /// All disks attached to this node, keyed by disk_id.
     disks: Rc<HashMap<u64, Rc<DiskFS>>>,
-    /// Observability batch 1: this shard's /metrics gauge slot (also
-    /// registered in the process-global `EN_SHARD_GAUGES`). Refreshed
-    /// from `handle_df` (manager-driven ~2 s cadence).
-    metrics_gauges: std::sync::Arc<EnShardGauges>,
     manager_endpoint: Option<String>,
     /// ConnPool for manager RPC calls (nodes_info, extent_info, etc.)
     manager_pool: Rc<crate::ConnPool>,
@@ -2079,7 +1957,6 @@ impl Clone for ExtentNode {
             extents: self.extents.clone(),
             fd_lru: self.fd_lru.clone(),
             disks: self.disks.clone(),
-            metrics_gauges: self.metrics_gauges.clone(),
             manager_endpoint: self.manager_endpoint.clone(),
             manager_pool: self.manager_pool.clone(),
             client_authz: self.client_authz.clone(),
@@ -2467,7 +2344,6 @@ async fn process_frames_backpressured(
         match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
             Some(frame) if frame.req_id != 0 => {
                 if let Err(e) = protocol.check_opcode(frame.msg_type) {
-                    note_reject(EnReject::OpcodeDenied);
                     tx_bufs.push(err_bytes(
                         frame.req_id,
                         frame.msg_type,
@@ -3850,32 +3726,6 @@ impl ExtentNode {
             );
         }
 
-        // Observability batch 1: register this instance's gauge slot —
-        // the registry holds a Weak, so a dropped/failed-init node is
-        // pruned by the renderer (coco P2/P3). Disk set is fixed for the
-        // node's lifetime; initial state = all online (matches DiskFS
-        // construction).
-        let metrics_gauges = {
-            let mut disk_slots: Vec<(u64, std::sync::atomic::AtomicU64)> = disk_map
-                .keys()
-                // DiskHealth::Online as u64 == 0 (coco P3: the old `1`
-                // meant online under the bool scheme; under the health
-                // scheme it reads as Full until the first sweep).
-                .map(|id| (*id, std::sync::atomic::AtomicU64::new(0)))
-                .collect();
-            disk_slots.sort_unstable_by_key(|(id, _)| *id);
-            let g = std::sync::Arc::new(EnShardGauges {
-                shard_idx: config.shard_idx,
-                extents: std::sync::atomic::AtomicU64::new(0),
-                disks: disk_slots,
-            });
-            EN_SHARD_GAUGES
-                .lock()
-                .unwrap()
-                .push(std::sync::Arc::downgrade(&g));
-            g
-        };
-
         // build `extents` first so the fd cache can share it (for
         // eviction reach-through). Both are `Rc`, no cycle (FdLru holds the
         // DashMap, not the node).
@@ -3892,7 +3742,6 @@ impl ExtentNode {
             extents,
             fd_lru,
             disks: Rc::new(disk_map),
-            metrics_gauges,
             client_authz: Rc::new(RefCell::new(if config.manager_endpoint.is_some() {
                 ClientAuthz::Unknown
             } else {
@@ -3947,49 +3796,30 @@ impl ExtentNode {
         node.spawn_reconcile_orphans_loop();
         node.spawn_client_authz_poll_loop();
 
-        // Per-shard 2 s sweep on THIS shard's runtime, two jobs:
-        // (1) OBS-1 gauge refresh — the manager's df probe only reaches
-        //     the registered control_address (one shard), so a df-driven
-        //     refresh left every other shard's slot permanently stale;
-        //     each shard must refresh its own.
-        // (2) ENOSPC-1 Full self-heal — a disk marked Full (capacity)
-        //     returns Online once free space is back above the
-        //     hysteresis floor (5% of total), so GC / operator cleanup
-        //     restores allocatability WITHOUT a process restart. Faulted
-        //     is never touched here.
-        // The task holds only WEAK refs (coco P2): when the node's last
-        // clone drops, the upgrades fail, the loop exits, and nothing
-        // pins the extent/disk state alive.
+        // ENOSPC-1 Full self-heal, a 2 s sweep on THIS shard's runtime: a
+        // disk marked Full (capacity) returns Online once free space is back
+        // above the hysteresis floor (5% of total), so GC / operator cleanup
+        // restores allocatability WITHOUT a process restart. Faulted is never
+        // touched here. The task holds only a WEAK ref (coco P2): when the
+        // node's last clone drops, the upgrade fails and the loop exits.
         {
-            use std::sync::atomic::Ordering::Relaxed;
-            let extents = Rc::downgrade(&node.extents);
             let disks = Rc::downgrade(&node.disks);
-            let gauges = std::sync::Arc::downgrade(&node.metrics_gauges);
             compio::runtime::spawn(async move {
-                loop {
-                    let (Some(extents), Some(disks), Some(gauges)) =
-                        (extents.upgrade(), disks.upgrade(), gauges.upgrade())
-                    else {
-                        return; // node dropped — exit, slot gets pruned
-                    };
-                    gauges.extents.store(extents.len() as u64, Relaxed);
-                    for (disk_id, health_slot) in &gauges.disks {
-                        if let Some(disk) = disks.get(disk_id) {
-                            if disk.health() == DiskHealth::Full {
-                                let (total, free) = disk.disk_stats();
-                                if total > 0 && free >= total / 20 && disk.try_clear_full() {
-                                    tracing::info!(
-                                        disk_id,
-                                        free,
-                                        total,
-                                        "disk no longer full — allocation re-enabled"
-                                    );
-                                }
+                while let Some(disks) = disks.upgrade() {
+                    for (disk_id, disk) in disks.iter() {
+                        if disk.health() == DiskHealth::Full {
+                            let (total, free) = disk.disk_stats();
+                            if total > 0 && free >= total / 20 && disk.try_clear_full() {
+                                tracing::info!(
+                                    disk_id,
+                                    free,
+                                    total,
+                                    "disk no longer full — allocation re-enabled"
+                                );
                             }
-                            health_slot.store(disk.health() as u64, Relaxed);
                         }
                     }
-                    drop((extents, disks, gauges));
+                    drop(disks);
                     compio::time::sleep(Duration::from_secs(2)).await;
                 }
             })
@@ -4078,12 +3908,7 @@ impl ExtentNode {
             return authz
                 .admit_read(principal.as_ref(), now)
                 .err()
-                .map(|(code, m)| {
-                    if code == StatusCode::PermissionDenied {
-                        note_reject(EnReject::ClientRead);
-                    }
-                    err_bytes(frame.req_id, frame.msg_type, code, m)
-                });
+                .map(|(code, m)| err_bytes(frame.req_id, frame.msg_type, code, m));
         }
         let (code, message) = if frame.payload.len() > autumn_rpc::partition_rpc::CLIENT_AUTH_MAX_PAYLOAD
         {
@@ -4095,12 +3920,7 @@ impl ExtentNode {
                         *principal = bound;
                         (StatusCode::Ok, String::new())
                     }
-                    Err(refusal) => {
-                        if refusal.0 == StatusCode::PermissionDenied {
-                            note_reject(EnReject::ClientToken);
-                        }
-                        refusal
-                    }
+                    Err(refusal) => refusal,
                 },
                 Err(e) => (StatusCode::InvalidArgument, format!("bad CLIENT_AUTH: {e}")),
             }
@@ -5676,7 +5496,6 @@ impl ExtentNode {
         )
         .await
         {
-            note_reject(EnReject::PeerAuth);
             return Err(e.into());
         }
         // Bound by CLIENT_AUTH on a Client connection (see `client_gate`).
@@ -8832,6 +8651,7 @@ impl ExtentNode {
                         total,
                         free,
                         online: disk.online(),
+                        full: disk.health() == DiskHealth::Full,
                         extent_bytes: extent_bytes_by_disk
                             .get(&disk.disk_id)
                             .copied()
@@ -8849,6 +8669,7 @@ impl ExtentNode {
                             total,
                             free,
                             online: disk.online(),
+                            full: disk.health() == DiskHealth::Full,
                             extent_bytes: extent_bytes_by_disk.get(disk_id).copied().unwrap_or(0),
                         },
                     ));
@@ -11080,6 +10901,30 @@ mod enospc_disk_health_tests {
             Process,
             "ENOMEM"
         );
+    }
+
+    /// A full disk reaches the manager as full and still online: it keeps
+    /// serving, so nothing may rebuild it.
+    #[compio::test]
+    async fn df_reports_a_full_disk_as_full_and_online() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .expect("node");
+        let df = |node: &ExtentNode| {
+            let node = node.clone();
+            async move {
+                let resp = node
+                    .handle_df(rkyv_encode(&DfReq { disk_ids: vec![], tasks: vec![] }))
+                    .await
+                    .unwrap();
+                let df: DfResp = rkyv_decode(&resp).unwrap();
+                (df.disk_status[0].1.online, df.disk_status[0].1.full)
+            }
+        };
+        assert_eq!(df(&node).await, (true, false));
+        node.disk_for(1).expect("disk").set_full();
+        assert_eq!(df(&node).await, (true, true));
     }
 
     /// …and the classification is actually acted on: a process-level error
@@ -14925,26 +14770,11 @@ mod client_direct_read_auth_tests {
         assert_eq!(&read(&peer, &addr).await.unwrap()[..], PAYLOAD);
     }
 
-    /// The counter of one refusal class, from the EN's own `/metrics` text.
-    fn rejects(class: &str) -> u64 {
-        let line = format!("autumn_en_auth_rejects_total{{class=\"{class}\"}} ");
-        render_en_metrics()
-            .lines()
-            .find_map(|l| l.strip_prefix(&line))
-            .unwrap_or_else(|| panic!("no {class} counter"))
-            .trim()
-            .parse::<f64>()
-            .unwrap() as u64
-    }
-
-    /// The counters are process-global and sibling tests refuse reads too, so
-    /// a class is judged by how far it rose, never by its value.
     #[compio::test]
-    async fn a_client_connection_cannot_reach_a_mutating_op_and_the_refusal_is_counted() {
+    async fn a_client_connection_cannot_reach_a_mutating_op() {
         let dir = tempfile::tempdir().unwrap();
         let (node, addr) = served_node(dir.path()).await;
         let client = crate::ConnPool::with_role(Role::Client);
-        let before = rejects("opcode_denied");
 
         let delete = autumn_rpc::manager_rpc::rkyv_encode(&DeleteExtentReq {
             extent_id: 1,
@@ -14963,10 +14793,6 @@ mod client_direct_read_auth_tests {
             let e = client.call(&addr, op, payload).await.expect_err("a Client reached a member op");
             assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "op {op}: {e:#}");
         }
-        assert!(
-            rejects("opcode_denied") >= before + 3,
-            "three refused member ops must all be counted"
-        );
 
         // None of them ran: the extent is still there, unfenced (the owner
         // epoch 1 writer still appends), and holds exactly what it did.
@@ -14988,20 +14814,19 @@ mod client_direct_read_auth_tests {
     }
 
     #[compio::test]
-    async fn refused_reads_and_tokens_are_counted_by_class() {
+    async fn an_unbound_read_and_a_forged_token_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (node, addr) = served_node(dir.path()).await;
         *node.client_authz.borrow_mut() = authz_on();
-        let (read_before, token_before) = (rejects("client_read"), rejects("client_token"));
 
         let anonymous = crate::ConnPool::with_role(Role::Client);
-        read(&anonymous, &addr).await.expect_err("anonymous read served");
-        assert!(rejects("client_read") > read_before, "an unbound read is a client_read refusal");
+        let e = read(&anonymous, &addr).await.expect_err("anonymous read served");
+        assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "{e:#}");
 
         let forged = crate::ConnPool::with_role(Role::Client);
         forged.set_auth_token(Some(token([1; 32], autumn_rpc::cap_token::now_secs() + 3600)));
-        read(&forged, &addr).await.expect_err("forged token admitted");
-        assert!(rejects("client_token") > token_before, "a bad token is a client_token refusal");
+        let e = read(&forged, &addr).await.expect_err("forged token admitted");
+        assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "{e:#}");
     }
 }
 

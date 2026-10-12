@@ -3,12 +3,12 @@
 #
 # EN1's data dir sits on a small loopback ext4 (512 MB). A ballast file
 # squeezes its headroom, then 1 MB puts run until EN1 hits ENOSPC:
-#   E1: EN1's disk must classify FULL (autumn_en_disk_full=1) while
-#       STAYING online (autumn_en_disk_online=1) — capacity ≠ media fault.
+#   E1: EN1's disk must classify FULL (`autumn-op overview`: full) while
+#       STAYING online (online) — capacity ≠ media fault.
 #   E2: writes keep succeeding (new extents allocate on EN2-4; EN1's
 #       choose_disk refuses Full → manager per-RPC fallback walks).
 #   E3: rm ballast → the 2 s sweep self-heals Full→Online without any
-#       process restart (autumn_en_disk_full back to 0).
+#       process restart (full back to false).
 #   E4: every ACKed key reads back byte-exact (zero loss).
 #
 # Manager allocation floor is DISABLED (=0) so the EN-side ENOSPC path is
@@ -25,15 +25,28 @@ WORK="$(mktemp -d /tmp/enospc_chaos.XXXXXX)"
 IMG="$WORK/disk1.img"
 DATA_ROOT="${AUTUMN_DATA_ROOT:-/data05/autumn-rs}"
 MNT="$DATA_ROOT/d1"
-AC=("$ROOT/target/release/autumn-client" --manager "$MGR")
+# The bootstrap presplit spreads `bench/perf/<hex>` over the 8 partitions, so
+# keys are `perf/<2 hex>-...` under namespace bench.
+AC=("$ROOT/target/release/autumn-client" --manager "$MGR" --namespace bench)
+SECRET="${AUTUMN_CLUSTER_SECRET_FILE:-$DATA_ROOT/cluster.secret}"
+AO=(timeout 20 "$ROOT/target/release/autumn-op" --cluster-secret-file "$SECRET" --manager "$MGR" --transport tcp)
 FAIL=0
 
 say()  { echo "[enospc $(date +%H:%M:%S)] $*"; }
 fail() { echo "[enospc $(date +%H:%M:%S)] FAIL: $*"; FAIL=1; }
 
-en1_metric() { # $1 = grep pattern; prints last numeric field or empty
-    curl -s --max-time 3 http://127.0.0.1:20501/metrics 2>/dev/null \
-        | grep "$1" | head -1 | awk '{print $NF}'
+command -v python3 >/dev/null || { echo "python3 is required (reads autumn-op JSON)"; exit 2; }
+
+# EN1's disk state as the manager reports it from EN1's df answer (EN1 is the
+# node at port 20001). $1 = full | online; prints 1 / 0, or nothing.
+en1_disk() {
+    "${AO[@]}" --json overview 2>/dev/null | python3 -c '
+import json, sys
+want = sys.argv[1]
+for n in json.load(sys.stdin)["nodes"]:
+    if n["address"].endswith(":20001") and n["disks"]:
+        print(int(any(d[want] for d in n["disks"]) if want == "full" else all(d[want] for d in n["disks"])))
+' "$1" 2>/dev/null
 }
 
 cleanup_all() {
@@ -87,17 +100,17 @@ dd if=/dev/urandom of="$WORK/val1m" bs=1M count=1 status=none
 n=0 full_seen=0
 while [ $n -lt 600 ]; do
     n=$((n+1))
-    key="$(printf '%02x' $(( RANDOM % 256 )))-ek-$n"
+    key="perf/$(printf '%02x' $(( RANDOM % 256 )))-ek-$n"
     if timeout 20 "${AC[@]}" put "$key" "$WORK/val1m" >/dev/null 2>&1; then
         echo "$key" >> "$WORK/acked.txt"
     fi
-    f=$(en1_metric "^autumn_en_disk_full")
+    f=$(en1_disk full)
     if [ "${f:-0}" = "1" ]; then full_seen=1; say "E1: EN1 FULL after $n puts"; break; fi
 done
 if [ "$full_seen" != "1" ]; then
-    fail "E1: EN1 never reported disk_full=1 after $n puts (free: $(df -h --output=avail "$MNT" | tail -1))"
+    fail "E1: EN1 never reported its disk full after $n puts (free: $(df -h --output=avail "$MNT" | tail -1))"
 else
-    on=$(en1_metric "^autumn_en_disk_online")
+    on=$(en1_disk online)
     [ "${on:-0}" = "1" ] || fail "E1: disk reported OFFLINE/faulted — ENOSPC misclassified as media fault (online=$on)"
 fi
 
@@ -105,7 +118,7 @@ fi
 say "E2: post-full write availability (20 keys, transient errors tolerated)"
 ok2=0
 for i in $(seq 1 20); do
-    key="$(printf '%02x' $(( RANDOM % 256 )))-post-full-$i"
+    key="perf/$(printf '%02x' $(( RANDOM % 256 )))-post-full-$i"
     if timeout 30 "${AC[@]}" put "$key" "$WORK/val1m" >/dev/null 2>&1; then
         echo "$key" >> "$WORK/acked.txt"
         ok2=$((ok2+1))
@@ -120,15 +133,15 @@ rm -f "$MNT/ballast"
 healed=0
 for i in $(seq 1 15); do
     sleep 2
-    f=$(en1_metric "^autumn_en_disk_full")
+    f=$(en1_disk full)
     if [ "${f:-1}" = "0" ]; then healed=1; say "E3: EN1 full cleared after ~$((i*2))s"; break; fi
 done
-[ "$healed" = "1" ] || fail "E3: disk_full did not clear within 30s of freeing space"
+[ "$healed" = "1" ] || fail "E3: the full state did not clear within 30s of freeing space"
 
 say "E3b: 10 more writes after heal"
 ok3=0
 for i in $(seq 1 10); do
-    key="$(printf '%02x' $(( RANDOM % 256 )))-post-heal-$i"
+    key="perf/$(printf '%02x' $(( RANDOM % 256 )))-post-heal-$i"
     if timeout 30 "${AC[@]}" put "$key" "$WORK/val1m" >/dev/null 2>&1; then
         echo "$key" >> "$WORK/acked.txt"
         ok3=$((ok3+1))

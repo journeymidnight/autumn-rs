@@ -2138,6 +2138,8 @@ impl crate::AutumnManager {
                         // Suspected after the soft timeout). NOT a recovery
                         // trigger — that requires explicit fence.
                         Self::mark_node_disks_offline(&self.store, node);
+                        // What it said last is no longer a current verdict.
+                        self.store.inner.borrow_mut().en_reports.remove(&node.node_id);
                         self.node_states
                             .borrow_mut()
                             .on_heartbeat_fail(node.node_id);
@@ -2156,6 +2158,7 @@ impl crate::AutumnManager {
                 let df: DfResp = match rkyv_decode(&resp) {
                     Ok(v) => v,
                     Err(_) => {
+                        self.store.inner.borrow_mut().en_reports.remove(&node.node_id);
                         cdf_per_node.push((
                             node.node_id,
                             crate::NodeCap {
@@ -2193,6 +2196,8 @@ impl crate::AutumnManager {
                              healing, treating df as failed"
                         );
                         Self::mark_node_disks_offline(&self.store, node);
+                        // What it said last is no longer a current verdict.
+                        self.store.inner.borrow_mut().en_reports.remove(&node.node_id);
                         self.node_states
                             .borrow_mut()
                             .on_heartbeat_fail(node.node_id);
@@ -2228,14 +2233,19 @@ impl crate::AutumnManager {
                     }
                     DfEchoAction::Ok => {}
                 }
-                {
-                    let mut s = self.store.inner.borrow_mut();
-                    if df.metrics_addr.is_empty() {
-                        s.en_metrics_addrs.remove(&node.node_id);
-                    } else if s.en_metrics_addrs.get(&node.node_id) != Some(&df.metrics_addr) {
-                        s.en_metrics_addrs.insert(node.node_id, df.metrics_addr.clone());
-                    }
-                }
+                self.store.inner.borrow_mut().en_reports.insert(
+                    node.node_id,
+                    crate::store::EnDfReport {
+                        metrics_addr: df.metrics_addr.clone(),
+                        // Only its own disks, like `apply_df_disk_health`.
+                        full_disks: df
+                            .disk_status
+                            .iter()
+                            .filter(|(id, st)| st.full && node.disks.contains(id))
+                            .map(|(id, _)| *id)
+                            .collect(),
+                    },
+                );
 
                 // A successful df proves the NODE reachable, and carries what
                 // the node says about each of its DISKS. Apply the per-disk
@@ -4334,6 +4344,7 @@ mod df_disk_health_tests {
             free: 500,
             online,
             extent_bytes: 500,
+            ..Default::default()
         }
     }
 

@@ -266,6 +266,7 @@ mod tests {
             node_uuid: String::new(),
             shard_ports: Vec::new(),
             metrics_addr: String::new(),
+            full_disks: Vec::new(),
         };
         let nodes = [
             node(1, NODE_AUTO_STATE_ONLINE, NODE_OVERRIDE_NONE),

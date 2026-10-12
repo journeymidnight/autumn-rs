@@ -3196,7 +3196,7 @@ impl AutumnManager {
             s.ps_slot_caps.clear();
             s.ps_open_parts.clear();
             s.ps_metrics_addrs.clear();
-            s.en_metrics_addrs.clear();
+            s.en_reports.clear();
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
@@ -5163,14 +5163,24 @@ mod tests {
     }
 
     #[test]
-    fn node_states_carry_the_metrics_address_the_df_reported() {
+    fn node_states_carry_what_the_df_reported() {
         let m = AutumnManager::new();
         add_node_and_disk(&m, 3, 30);
         add_node_and_disk(&m, 4, 40);
-        m.store.inner.borrow_mut().en_metrics_addrs.insert(3, "127.0.0.1:9603".to_string());
+        m.store.inner.borrow_mut().en_reports.insert(
+            3,
+            crate::store::EnDfReport {
+                metrics_addr: "127.0.0.1:9603".to_string(),
+                full_disks: vec![30],
+            },
+        );
         let resp = m.compute_list_node_states_resp();
-        let addrs: Vec<_> = resp.nodes.iter().map(|n| (n.node_id, n.metrics_addr.as_str())).collect();
-        assert_eq!(addrs, [(3, "127.0.0.1:9603"), (4, "")]);
+        let got: Vec<_> = resp
+            .nodes
+            .iter()
+            .map(|n| (n.node_id, n.metrics_addr.as_str(), n.full_disks.clone()))
+            .collect();
+        assert_eq!(got, [(3, "127.0.0.1:9603", vec![30]), (4, "", vec![])]);
     }
 
     #[test]

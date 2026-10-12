@@ -6347,7 +6347,7 @@ impl AutumnManager {
         }
         let (nodes_meta, overrides, snapshot) = {
             let s = self.store.inner.borrow();
-            let nodes: Vec<(u64, String, String, Vec<u16>, String)> = s
+            let nodes: Vec<(u64, String, String, Vec<u16>, crate::store::EnDfReport)> = s
                 .nodes
                 .iter()
                 .map(|(id, n)| {
@@ -6356,7 +6356,7 @@ impl AutumnManager {
                         n.address.clone(),
                         n.node_uuid.clone(),
                         n.shard_ports.clone(),
-                        s.en_metrics_addrs.get(id).cloned().unwrap_or_default(),
+                        s.en_reports.get(id).cloned().unwrap_or_default(),
                     )
                 })
                 .collect();
@@ -6373,7 +6373,7 @@ impl AutumnManager {
             .collect();
         let mut out: Vec<NodeStateEntry> = nodes_meta
             .into_iter()
-            .map(|(node_id, address, node_uuid, shard_ports, metrics_addr)| {
+            .map(|(node_id, address, node_uuid, shard_ports, report)| {
                 let (auto_state, last_secs) = snap_map
                     .get(&node_id)
                     .copied()
@@ -6403,7 +6403,8 @@ impl AutumnManager {
                     override_expire_at: ovr.map(|o| o.expire_at).unwrap_or(0),
                     node_uuid,
                     shard_ports,
-                    metrics_addr,
+                    metrics_addr: report.metrics_addr,
+                    full_disks: report.full_disks,
                 }
             })
             .collect();
@@ -7099,6 +7100,7 @@ impl AutumnManager {
         {
             let mut s = self.store.inner.borrow_mut();
             s.nodes.remove(&req.node_id);
+            s.en_reports.remove(&req.node_id);
             for did in &disk_ids {
                 s.disks.remove(did);
             }
@@ -8818,6 +8820,7 @@ mod cluster_df_disk_tests {
             free,
             online: true,
             extent_bytes: 0,
+            ..Default::default()
         }
     }
 

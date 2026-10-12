@@ -810,13 +810,17 @@ pub struct AllocExtentResp {
 }
 
 /// Disk space statistics for one disk.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct DiskStatus {
     /// Raw filesystem capacity (statvfs `f_blocks * f_frsize`).
     pub total: u64,
     /// Raw filesystem free bytes (statvfs `f_bavail * f_frsize`).
     pub free: u64,
     pub online: bool,
+    /// Out of space (ENOSPC/EDQUOT): serves reads and existing extents but
+    /// takes no new ones, until free space is back above 5%. Never set
+    /// together with `!online` (a faulted disk is not reported full).
+    pub full: bool,
     /// Cluster-df: sum of THIS disk's live extent file lengths
     /// (`ExtentEntry.len`) — the REAL autumn physical footprint on this
     /// disk: replicas count their full copy, EC shards count shard size,

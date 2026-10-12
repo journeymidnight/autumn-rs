@@ -902,6 +902,16 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## A full disk reaches autumn-op; EN reject counters gone (wire 66)
+
+`DiskStatus` gains `full` (the EN marked the disk ENOSPC-full: it serves reads and
+existing extents, takes no new ones) and `NodeStateEntry` gains `full_disks` — the
+manager's copy, which `autumn-op list-nodes` / overview show. Not `DiskCapWire.full`:
+`ClusterDfResp` is client surface and frozen (`client_surface_freeze.rs`). The EN's
+`/metrics` keeps only its append counters; disk health, extent counts and the
+authentication-refusal counters left it (the refusal counters are gone entirely).
+The ceiling rises to [43, 66], the floor stays.
+
 ## Node states carry the EN metrics endpoint (wire 65)
 
 `NodeStateEntry` gains `metrics_addr` — the address each EN's latest df answer

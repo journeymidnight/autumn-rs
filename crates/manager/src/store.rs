@@ -61,9 +61,18 @@ pub(crate) struct MetadataState {
     /// `/metrics` `host:port` each PS's latest heartbeat carried (non-empty
     /// only). In-memory only, like `ps_slot_caps`.
     pub ps_metrics_addrs: HashMap<u64, String>,
-    /// `/metrics` `host:port` each extent node's latest df answer carried
-    /// (non-empty only). In-memory only.
-    pub en_metrics_addrs: HashMap<u64, String>,
+    /// What each extent node's latest df answer said about itself, for
+    /// `autumn-op` (`NodeStateEntry`). In-memory only.
+    pub en_reports: HashMap<u64, EnDfReport>,
+}
+
+/// The parts of an extent node's df answer the manager only passes on.
+#[derive(Debug, Default, Clone)]
+pub struct EnDfReport {
+    /// Its `/metrics` `host:port` (empty: none).
+    pub metrics_addr: String,
+    /// Its own disks it reported out of space.
+    pub full_disks: Vec<u64>,
 }
 
 impl MetadataState {

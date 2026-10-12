@@ -527,3 +527,6 @@
   不导出任何指标、不开 HTTP 端口（`--metrics-port` 按名拒绝），`/sd` 去掉；目标列表改由
   `autumn-op info --file-sd` 输出 Prometheus `file_sd` JSON（EN 地址经 `NodeStateEntry.metrics_addr`，
   wire 65）；dashboard 也从它取 PS 目标。
+- **notes** (2026-10-12): 用户再定：EN `/metrics` 也只留性能（append 批次/字节/耗时）；盘 online/full、
+  extent 数移到 `autumn-op`（full 经 `DiskStatus.full` → `NodeStateEntry.full_disks`，wire 66；
+  `DiskCapWire` 属客户端冻结面不改）；鉴权拒绝计数不需要，整体删除。

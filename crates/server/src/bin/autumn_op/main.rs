@@ -199,6 +199,8 @@ struct JsonNode {
     node_uuid: String,
     shard_count: usize,
     shard_ports: Vec<u16>,
+    /// Disks the node reports out of space.
+    full_disks: Vec<u64>,
 }
 
 #[derive(Serialize)]
@@ -928,13 +930,14 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
                 node_uuid: n.node_uuid,
                 shard_count: n.shard_ports.len(),
                 shard_ports: n.shard_ports,
+                full_disks: n.full_disks,
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         println!(
-            "{:<6} {:<10} {:<24} {:<7} {:<10} {:<8} {:<8} {:<12} REASON",
-            "ID", "UUID", "ADDRESS", "SHARDS", "AUTO", "HB_AGO", "SUSP_AGE", "OVERRIDE"
+            "{:<6} {:<10} {:<24} {:<7} {:<10} {:<8} {:<8} {:<12} {:<10} REASON",
+            "ID", "UUID", "ADDRESS", "SHARDS", "AUTO", "HB_AGO", "SUSP_AGE", "OVERRIDE", "FULL"
         );
         for n in resp.nodes {
             let hb = if n.last_heartbeat_secs_ago == u64::MAX {
@@ -948,8 +951,13 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
             } else {
                 n.node_uuid.chars().take(8).collect::<String>()
             };
+            let full = if n.full_disks.is_empty() {
+                "-".to_string()
+            } else {
+                n.full_disks.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
+            };
             println!(
-                "{:<6} {:<10} {:<24} {:<7} {:<10} {:<8} {:<8} {:<12} {}",
+                "{:<6} {:<10} {:<24} {:<7} {:<10} {:<8} {:<8} {:<12} {:<10} {}",
                 n.node_id,
                 uuid_short,
                 n.address,
@@ -958,6 +966,7 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
                 hb,
                 n.suspected_age_secs,
                 override_str(n.override_kind),
+                full,
                 n.override_reason,
             );
         }
@@ -4397,6 +4406,7 @@ mod tests {
             node_uuid: String::new(),
             shard_ports: Vec::new(),
             metrics_addr: addr.to_string(),
+            full_disks: Vec::new(),
         };
         let got = super::file_sd_groups(
             &[ps(1, "10.0.0.1:9801", 0), ps(2, "", 0), ps(3, "10.0.0.3:9801", 1_700_000_000_000)],

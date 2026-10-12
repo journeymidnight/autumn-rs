@@ -1659,6 +1659,10 @@ pub struct NodeStateEntry {
     /// Where the node serves `/metrics`, from its latest df answer (empty:
     /// none reported, or not heard from since this manager became leader).
     pub metrics_addr: String,
+    /// Disks the node's latest df answer reported out of space (they serve
+    /// reads and existing extents but take no new ones until free space
+    /// returns). Here, not in `DiskCapWire`: that struct is client surface.
+    pub full_disks: Vec<u64>,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
