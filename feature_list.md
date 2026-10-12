@@ -509,3 +509,17 @@
 - **Status**: `passes: false` (2026-09-16) — 未开工；可行性未证，passthrough 与
   非 POSIX 后端的适配形态是最大未知。
 - `passes: false`
+
+### F-METRICS-PER-PROCESS — 每进程 /metrics + manager http_sd
+- **Trigger** (2026-10-12，用户定案): 经 manager 汇总 PS/EN 指标（单点、换主断点、大量 wire）
+  和"PS 先把分区加起来再上报"都被否；照 TiKV/CockroachDB/etcd 的做法，每个进程自己暴露
+  `/metrics`，跨进程聚合交给 Prometheus。
+- **Scope**: (1) PS/EN 各自暴露进程级 `/metrics`，不带 partition 标签；(2) 端口 = 服务端口 +
+  固定偏移，可用 `--metrics-port` 覆盖；(3) manager 提供 Prometheus `http_sd`；(4) 分区级信息
+  只走心跳供调度，dashboard 的热点分区从 manager 拿 top-N，不做成时间序列；(5) PS/EN 的
+  HTTP 在单独的 compio runtime 线程上、不绑核，直接读 atomic；(6) 撤掉经 manager 中转时塞进
+  PS/EN 的指标字段。
+- **Acceptance**: PS 计数器在分区关闭/迁移/重开后不回退（单测）；PS/EN 默认端口可抓、无
+  partition 标签，manager `/sd` 列出二者（单测 + 真集群 api_contract）、follower 返回 `[]`（单测）；
+  dashboard 无分区 scope、显示热点分区表（JS 测试）；全量单测与 manager 集成套件通过。
+- `passes: true` (2026-10-12)

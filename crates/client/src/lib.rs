@@ -1224,23 +1224,6 @@ impl ClusterClient {
         Ok(resp)
     }
 
-    /// Every PS's and EN's latest metrics report (`MSG_GET_FLEET_METRICS`).
-    /// Leader-routed (rotates on NOT_LEADER): only the leader receives them.
-    pub async fn fleet_metrics(&self) -> Result<autumn_rpc::manager_rpc::FleetMetricsResp> {
-        use autumn_rpc::manager_rpc::{FleetMetricsResp, MSG_GET_FLEET_METRICS};
-        let managers = self.manager_addrs.len().max(1) as u32;
-        let resp: FleetMetricsResp = self
-            .mgr_call_leader(MSG_GET_FLEET_METRICS, Bytes::new(), "fleet_metrics", 3, managers + 2, |b| {
-                let r: FleetMetricsResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
-                Ok((r.code, r))
-            })
-            .await?;
-        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-            return Err(anyhow!("fleet_metrics failed: {}", resp.message));
-        }
-        Ok(resp)
-    }
-
     /// M2: read the auto-policy controller state
     /// (`MSG_AUTOPOLICY_GET`). Leader-routed (rotates on NOT_LEADER).
     pub async fn auto_policy_get(&self) -> Result<AutoPolicyGetResp> {

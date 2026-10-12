@@ -35,8 +35,8 @@ without the secret — read-only views included.
 | `--listen H` | `0.0.0.0` | bind host |
 | `--transport tcp\|ucx` | `tcp` | must match the manager |
 | `--autumn-op PATH` | `autumn-op` | the CLI binary |
-| `--metrics-interval-secs N` | `10` | how often every PS's metrics are polled (`autumn-op metrics`); below 5 (the PS report cadence) every other round has no new report and shows as a gap |
-| `--metrics-retention-secs N` | `3600` | how much polled history is kept in memory |
+| `--metrics-interval-secs N` | `10` | how often every PS's `/metrics` is scraped |
+| `--metrics-retention-secs N` | `3600` | how much scraped history is kept in memory |
 
 ## Endpoints → `autumn-op`
 
@@ -50,7 +50,7 @@ without the secret — read-only views included.
 | `POST /api/policies/activate` | `autumn-op auto-policy start <name>` / `deactivate` |
 | `POST /api/policies/upsert` | `autumn-op auto-policy upsert <name> --switches … --interval … …` |
 | `POST /api/policies/delete` | `autumn-op auto-policy delete <name>` |
-| `GET /api/metrics?scope=cluster\|ps&id=N` | none — the history the poller built from `autumn-op metrics`, summed over the scope |
+| `GET /api/metrics?scope=cluster\|ps&id=N` | none — the scraped PS `/metrics` history, summed over the scope |
 
 Each policy has a **Start** button: confirm the named policy to select it and
 run its enabled actions immediately. A running policy's actions are ops like
@@ -84,7 +84,7 @@ every one. The tab is in the URL hash (`#nodes`), so a view is linkable.
 | **Nodes** | which disk — every extent node with a per-disk table (capacity, online, faulted) |
 | **Policy** | what the controller would do — advisories with their full reasoning, the controller and the policy editor |
 | **Logs** | what just happened — every op, the operator's and the auto-policy's alike: running now, then durable outcomes, each marked with who asked |
-| **Metrics** | how it has been doing — charts of every PS's metrics over the last hour, for the cluster or one PS (see below) |
+| **Metrics** | how it has been doing — charts of every PS's `/metrics` over the last hour, for the cluster or one PS, and the hottest partitions now (see below) |
 
 Built for many partitions: the Partitions tab is **partition-server-first** (pick
 a PS card and the list shows *only that server's* partitions; **All servers**
@@ -133,27 +133,32 @@ would be refused once per window forever.
 
 ## Metrics tab
 
-Partition servers serve no `/metrics`: they send their counters to the manager
-on every load report, and the leader keeps the latest. The dashboard polls them
-with `autumn-op metrics` like everything else (`autumn-op` finds the leader, so
-a manager failover costs a round or two of points). `--metrics-interval-secs`
-(default 10) sets the cadence; a PS's report is used only if it is newer than
-the last one, and is summed over its partitions on the way in — the tab shows
-the cluster and single partition servers, not partitions.
+The dashboard scrapes each partition server's Prometheus `/metrics` itself —
+the only data it does not get through `autumn-op`. Each PS reports where its
+`/metrics` is on every heartbeat (by default its `--port` + 500; the host
+its listener is bound to — `--metrics-listen`, else `--listen` — when that
+names one, else the advertised host), and the
+overview carries it as `ps_servers[].metrics_addr`. A PS started with
+`--metrics-port 0` shows as "no /metrics endpoint reported".
 
 History lives in this process's memory (`--metrics-retention-secs`, default one
 hour) and starts empty after a restart. Counters are stored as per-second
-rates; `/api/metrics` sums a scope's series on one time axis, so the cluster
-view is the sum of every PS (a gauge also comes as `name:max`, its largest
-partition). A round in which a PS sent nothing new is a gap, not a dip.
+rates; a PS's series are PS-wide (no partition label), and `/api/metrics` sums
+a scope's series on one time axis, so the cluster view is the sum of every PS
+(a `*_max` series takes the largest). A round in which a PS of the scope could
+not be scraped is a gap, not a dip. Per-partition history is not kept: the
+"hottest partitions" table under the charts is the overview's current
+per-partition load (from the manager's load reports), top 10 by iops, within
+the chosen PS when one is picked.
 
 Charts: requests/s; value bytes/s; GET and write latency (average, and p99
-interpolated in the histogram bucket); block cache hit ratio and size; SST tables (sum and largest partition);
+interpolated in the histogram bucket); block cache hit ratio and size; SST
+tables (sum and largest partition);
 memtable bytes and queued memtables; flush bytes/s; compactions per minute
 (minor by trigger: flush / tick / blocking / reclaim, and major); write
 amplification ((flush + compaction bytes) / value bytes written); point-lookup
 SSTs per second (skipped by range or bloom, read and found, bloom false
-positive); large-value reads from the log stream; maintenance debt.
+positive); large-value reads from the log stream.
 
 ## Security posture
 
@@ -215,10 +220,11 @@ node crates/server/src/bin/autumn_dashboard/tests/tabs_smoke.js
 node crates/server/src/bin/autumn_dashboard/tests/policy_controls.js
 ```
 
-The contract test (1) also checks `autumn-op metrics` (text and JSON) carries
-every PS and EN series and that `/api/metrics` grows a history for the cluster
-and one PS. The Rust store and poller are unit-tested:
-`cargo test -p autumn-server --bin autumn-dashboard`.
+The contract test (1) also checks the PS and EN serve `/metrics` at their
+default ports with no partition label, the manager's `/sd` lists both, the
+overview carries the PS's `metrics_addr`, and `/api/metrics` grows a history
+for the cluster and the PS (a partition scope is refused). The Rust
+store is unit-tested: `cargo test -p autumn-server --bin autumn-dashboard`.
 
 Measured live (1 GiB extent, EC 3+1): `/api/ops` carried
 `ec-convert running 18.6% → 37.2% → 55.8% → 74.4%`, then the op moved to

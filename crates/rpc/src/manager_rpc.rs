@@ -890,6 +890,9 @@ pub struct HeartbeatPsReq {
     /// serving right now. The manager compares it with the regions it assigned
     /// to judge the PS ready; like `slot_cap` it is kept in memory only.
     pub open_parts: Vec<(u64, u64)>,
+    /// `host:port` of this PS's Prometheus `/metrics`; empty without
+    /// `--metrics-port`. In memory only, like `slot_cap`.
+    pub metrics_addr: String,
 }
 // Response: CodeResp
 
@@ -1247,121 +1250,12 @@ pub struct PartitionLoad {
     /// running now. Empty when idle. At most two: the merged GC/compaction
     /// loop runs one at a time, and a split waiting for it reports its own.
     pub active_maintenance: Vec<MaintenanceProgress>,
-    pub counters: PartitionCounters,
-}
-
-/// Upper bounds (ns) of a `LatencyHist`'s finite buckets: 0.5/1/2/5/10/20/50/
-/// 100/250 ms; above the last is counted only in `count`.
-pub const LATENCY_BUCKET_BOUNDS_NS: [u64; 9] = [
-    500_000,
-    1_000_000,
-    2_000_000,
-    5_000_000,
-    10_000_000,
-    20_000_000,
-    50_000_000,
-    100_000_000,
-    250_000_000,
-];
-
-/// A latency histogram: per-bucket (non-cumulative) counts for
-/// `LATENCY_BUCKET_BOUNDS_NS`, plus the sum and the count of all observations.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct LatencyHist {
-    pub buckets: Vec<u64>,
-    pub sum_ns: u64,
-    pub count: u64,
-}
-
-/// One partition's counters (monotonic since the partition opened) and LSM
-/// gauges, for the manager's `/metrics`. Rates are the consumer's job.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct PartitionCounters {
-    pub requests: u64,
-    /// Value bytes written / served.
-    pub write_bytes: u64,
-    pub read_bytes: u64,
-    /// Tables in the SST list, memtable bytes (active + queued), queued
-    /// immutable memtables.
-    pub sst_tables: u64,
-    pub memtable_bytes: u64,
-    pub imm_memtables: u64,
-    pub flushes: u64,
-    pub flush_bytes: u64,
-    /// Minor compactions by what asked: a flush, the tick, too many tables
-    /// (blocking), the row-stream head reclaim.
-    pub minor_flush: u64,
-    pub minor_tick: u64,
-    pub minor_blocking: u64,
-    pub minor_reclaim: u64,
-    pub major_compactions: u64,
-    /// SST bytes compactions wrote.
-    pub compaction_bytes_minor: u64,
-    pub compaction_bytes_major: u64,
-    /// SSTs point lookups consulted: excluded by key range or bloom, read and
-    /// found, read and absent (a bloom false positive).
-    pub sst_skipped: u64,
-    pub sst_hits: u64,
-    pub sst_false_positives: u64,
-    /// Large values read from the log stream through the PS, and their bytes.
-    pub vp_reads: u64,
-    pub vp_read_bytes: u64,
-    pub write_lat: LatencyHist,
-    pub get_lat: LatencyHist,
-}
-
-/// A PS's SST block cache (one per PS), cumulative since the PS started.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct BlockCacheStats {
-    pub hits: u64,
-    pub misses: u64,
-    pub bytes: u64,
-    pub capacity: u64,
 }
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ReportPartitionLoadReq {
     pub ps_id: u64,
     pub partitions: Vec<PartitionLoad>,
-    pub block_cache: BlockCacheStats,
-}
-
-/// Every partition server's and extent node's latest report, as the leader
-/// holds it (PS: `ReportPartitionLoadReq`; EN: `df`). Request: empty.
-/// Leader-gated. Reports older than 30 s are left out.
-pub const MSG_GET_FLEET_METRICS: u8 = 0x66;
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct PsMetricsReport {
-    pub ps_id: u64,
-    /// Leader's unix ms when the report arrived.
-    pub reported_at_ms: u64,
-    pub block_cache: BlockCacheStats,
-    pub partitions: Vec<PartitionLoad>,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct EnDiskMetrics {
-    pub disk_id: u64,
-    pub online: bool,
-    pub full: bool,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct EnMetricsReport {
-    pub node_id: u64,
-    /// Leader's unix ms when the `df` answer arrived.
-    pub reported_at_ms: u64,
-    pub counters: crate::extent_rpc::EnCounters,
-    pub disks: Vec<EnDiskMetrics>,
-}
-
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct FleetMetricsResp {
-    pub code: u8,
-    pub message: String,
-    pub ps: Vec<PsMetricsReport>,
-    pub nodes: Vec<EnMetricsReport>,
 }
 
 // --- GetPolicyCandidates (advisory) ---
@@ -1627,6 +1521,9 @@ pub struct PsOverview {
     /// Core-pinned partition slots this PS reported; `0` = no `--cpuset`, or
     /// not yet heard from since this manager became leader.
     pub slot_cap: u32,
+    /// `host:port` of its `/metrics` from its latest heartbeat; empty = no
+    /// endpoint, or not heard from since this manager became leader.
+    pub metrics_addr: String,
     /// How many of the `partition_count` assigned partitions the PS's latest
     /// heartbeat reported open at their current region epoch; `None` = no
     /// heartbeat with that report since the PS registered or this manager

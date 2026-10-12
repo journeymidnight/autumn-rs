@@ -1,12 +1,15 @@
-//! Per-partition counters and gauges. They reach the manager on the load
-//! report (`PartitionMetrics::counters`); the manager's `/metrics` exports
-//! them — a PS serves no `/metrics` of its own.
+//! Per-partition counters and gauges, and the PS-wide Prometheus text
+//! `/metrics` serves from them (`PsMetrics`).
 
 use std::collections::VecDeque;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
 
+use autumn_common::metrics_http::{push_metric, push_type};
 use autumn_rpc::manager_rpc;
+
+use crate::sstable::BlockCache;
 
 /// What asked for a minor compaction; its log line and metric label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,19 +46,23 @@ pub struct LatHist {
     pub count: std::sync::atomic::AtomicU64,
 }
 
-/// Upper bounds (ns) of the finite buckets (stored per-bucket, non-cumulative).
-pub const LAT_BUCKET_BOUNDS_NS: [u64; 9] = manager_rpc::LATENCY_BUCKET_BOUNDS_NS;
+/// Upper bounds (ns) of the finite buckets. Stored per-bucket counts are
+/// non-cumulative for cheap recording; render makes them cumulative, with
+/// `+Inf` = count. Bounds: 0.5/1/2/5/10/20/50/100/250 ms.
+pub const LAT_BUCKET_BOUNDS_NS: [u64; 9] = [
+    500_000,
+    1_000_000,
+    2_000_000,
+    5_000_000,
+    10_000_000,
+    20_000_000,
+    50_000_000,
+    100_000_000,
+    250_000_000,
+];
 
 
 impl LatHist {
-    pub fn snapshot(&self) -> manager_rpc::LatencyHist {
-        manager_rpc::LatencyHist {
-            buckets: self.buckets.iter().map(|b| b.load(Relaxed)).collect(),
-            sum_ns: self.sum_ns.load(Relaxed),
-            count: self.count.load(Relaxed),
-        }
-    }
-
     /// Record `n` observations of `ns` each (a group-committed batch's
     /// ops all share the batch's end-to-end latency).
     pub fn observe_n(&self, ns: u64, n: u64) {
@@ -74,6 +81,9 @@ impl LatHist {
 
 #[derive(Default)]
 pub struct PartitionMetrics {
+    /// Set when this partition's handle goes (close, move, reopen); its
+    /// gauges stop counting toward the PS's, its counters keep counting.
+    pub closed: std::sync::atomic::AtomicBool,
     /// LAT-1: PUT (group-commit end-to-end) / GET (inline serve) latency.
     pub write_lat: LatHist,
     pub get_lat: LatHist,
@@ -101,7 +111,7 @@ pub struct PartitionMetrics {
     /// size-based split/merge policy read a constant 0). This is the LOGICAL
     /// data size, NOT the total extent footprint — the cluster-overview
     /// size uses `open_tail_bytes` + the manager's sealed sum instead.
-    /// Drives the `autumn_ps_partition_size_bytes`
+    /// Feeds the PS-wide `autumn_ps_size_bytes`
     /// Prometheus gauge and `policy.rs` split_size_*/merge_size_low.
     pub size_bytes: std::sync::atomic::AtomicU64,
     /// Σ committed bytes on this partition's three
@@ -248,36 +258,6 @@ pub struct PartitionMetrics {
 const MAINT_OUTCOME_RING_CAP: usize = 8;
 
 impl PartitionMetrics {
-    /// The counters and LSM gauges for the next load report.
-    pub fn counters(&self) -> manager_rpc::PartitionCounters {
-        let [minor_flush, minor_tick, minor_blocking, minor_reclaim] =
-            self.minor_compactions.each_ref().map(|n| n.load(Relaxed));
-        manager_rpc::PartitionCounters {
-            requests: self.req_count_monotonic.load(Relaxed),
-            write_bytes: self.write_bytes.load(Relaxed),
-            read_bytes: self.read_bytes.load(Relaxed),
-            sst_tables: self.sst_tables.load(Relaxed),
-            memtable_bytes: self.memtable_bytes.load(Relaxed),
-            imm_memtables: self.imm_memtables.load(Relaxed),
-            flushes: self.flushes.load(Relaxed),
-            flush_bytes: self.flush_bytes.load(Relaxed),
-            minor_flush,
-            minor_tick,
-            minor_blocking,
-            minor_reclaim,
-            major_compactions: self.major_compactions.load(Relaxed),
-            compaction_bytes_minor: self.compaction_bytes[0].load(Relaxed),
-            compaction_bytes_major: self.compaction_bytes[1].load(Relaxed),
-            sst_skipped: self.sst_skipped.load(Relaxed),
-            sst_hits: self.sst_hits.load(Relaxed),
-            sst_false_positives: self.sst_false_positives.load(Relaxed),
-            vp_reads: self.vp_reads.load(Relaxed),
-            vp_read_bytes: self.vp_read_bytes.load(Relaxed),
-            write_lat: self.write_lat.snapshot(),
-            get_lat: self.get_lat.snapshot(),
-        }
-    }
-
     pub fn record_flush(&self, sst_bytes: u64) {
         self.flushes.fetch_add(1, Relaxed);
         self.flush_bytes.fetch_add(sst_bytes, Relaxed);
@@ -377,26 +357,281 @@ impl PartitionMetrics {
     }
 }
 
+/// What `/metrics` serves for this PS, read on the metrics thread.
+///
+/// Counters are kept per partition so the hot paths of different partitions
+/// never share a cache line; the PS-wide value is their sum. A partition no one
+/// holds any more can count nothing else, so its counts move into `retired`:
+/// the totals never step back when a partition closes, moves or reopens.
+/// Gauges sum the partitions still open on this PS.
+pub struct PsMetrics {
+    block_cache: Arc<BlockCache>,
+    parts: parking_lot::Mutex<Parts>,
+}
+
+#[derive(Default)]
+struct Parts {
+    live: Vec<Arc<PartitionMetrics>>,
+    retired: Counts,
+}
+
+#[derive(Clone, Default)]
+struct HistCounts {
+    buckets: [u64; LAT_BUCKET_BOUNDS_NS.len()],
+    sum_ns: u64,
+    count: u64,
+}
+
+impl HistCounts {
+    fn add(&mut self, h: &LatHist) {
+        for (b, n) in self.buckets.iter_mut().zip(&h.buckets) {
+            *b += n.load(Relaxed);
+        }
+        self.sum_ns += h.sum_ns.load(Relaxed);
+        self.count += h.count.load(Relaxed);
+    }
+}
+
+#[derive(Clone, Default)]
+struct Counts {
+    requests: u64,
+    write_bytes: u64,
+    read_bytes: u64,
+    flushes: u64,
+    flush_bytes: u64,
+    minor: [u64; MinorCause::ALL.len()],
+    majors: u64,
+    /// `[minor, major]`.
+    compaction_bytes: [u64; 2],
+    /// `[skipped, hit, false_positive]`.
+    sst_checks: [u64; 3],
+    vp_reads: u64,
+    vp_read_bytes: u64,
+    write_lat: HistCounts,
+    get_lat: HistCounts,
+}
+
+impl Counts {
+    fn add(&mut self, m: &PartitionMetrics) {
+        self.requests += m.req_count_monotonic.load(Relaxed);
+        self.write_bytes += m.write_bytes.load(Relaxed);
+        self.read_bytes += m.read_bytes.load(Relaxed);
+        self.flushes += m.flushes.load(Relaxed);
+        self.flush_bytes += m.flush_bytes.load(Relaxed);
+        for (t, n) in self.minor.iter_mut().zip(&m.minor_compactions) {
+            *t += n.load(Relaxed);
+        }
+        self.majors += m.major_compactions.load(Relaxed);
+        for (t, n) in self.compaction_bytes.iter_mut().zip(&m.compaction_bytes) {
+            *t += n.load(Relaxed);
+        }
+        for (t, n) in self.sst_checks.iter_mut().zip([&m.sst_skipped, &m.sst_hits, &m.sst_false_positives]) {
+            *t += n.load(Relaxed);
+        }
+        self.vp_reads += m.vp_reads.load(Relaxed);
+        self.vp_read_bytes += m.vp_read_bytes.load(Relaxed);
+        self.write_lat.add(&m.write_lat);
+        self.get_lat.add(&m.get_lat);
+    }
+}
+
+#[derive(Default)]
+struct Gauges {
+    partitions: u64,
+    size_bytes: u64,
+    sst_tables: u64,
+    sst_tables_max: u64,
+    memtable_bytes: u64,
+    imm_memtables: u64,
+}
+
+impl PsMetrics {
+    pub fn new(block_cache: Arc<BlockCache>) -> Self {
+        Self {
+            block_cache,
+            parts: parking_lot::Mutex::new(Parts::default()),
+        }
+    }
+
+    /// Count a newly opened partition from now on.
+    pub fn register(&self, m: Arc<PartitionMetrics>) {
+        self.parts.lock().live.push(m);
+    }
+
+    fn snapshot(&self) -> (Counts, Gauges) {
+        let mut parts = self.parts.lock();
+        let Parts { live, retired } = &mut *parts;
+        // Only this list holds it: no one can add to it any more.
+        live.retain(|m| {
+            let held = Arc::strong_count(m) > 1;
+            if !held {
+                retired.add(m);
+            }
+            held
+        });
+        let mut c = retired.clone();
+        let mut g = Gauges::default();
+        for m in live.iter() {
+            c.add(m);
+            if !m.closed.load(Relaxed) {
+                let tables = m.sst_tables.load(Relaxed);
+                g.partitions += 1;
+                g.size_bytes += m.size_bytes.load(Relaxed);
+                g.sst_tables += tables;
+                g.sst_tables_max = g.sst_tables_max.max(tables);
+                g.memtable_bytes += m.memtable_bytes.load(Relaxed);
+                g.imm_memtables += m.imm_memtables.load(Relaxed);
+            }
+        }
+        (c, g)
+    }
+
+    /// Prometheus text: PS-wide series only, no partition label.
+    pub fn render(&self) -> String {
+        let (c, g) = self.snapshot();
+        let (cache_bytes, _, hits, misses) = self.block_cache.stats();
+        let mut out = String::with_capacity(8192);
+        let plain: [(&str, &str, f64); 18] = [
+            ("autumn_ps_partitions", "gauge", g.partitions as f64),
+            ("autumn_ps_size_bytes", "gauge", g.size_bytes as f64),
+            ("autumn_ps_sst_tables", "gauge", g.sst_tables as f64),
+            ("autumn_ps_partition_sst_tables_max", "gauge", g.sst_tables_max as f64),
+            ("autumn_ps_memtable_bytes", "gauge", g.memtable_bytes as f64),
+            ("autumn_ps_imm_memtables", "gauge", g.imm_memtables as f64),
+            ("autumn_ps_block_cache_hits_total", "counter", hits as f64),
+            ("autumn_ps_block_cache_misses_total", "counter", misses as f64),
+            ("autumn_ps_block_cache_bytes", "gauge", cache_bytes as f64),
+            ("autumn_ps_block_cache_capacity_bytes", "gauge", self.block_cache.cap_bytes() as f64),
+            ("autumn_ps_requests_total", "counter", c.requests as f64),
+            ("autumn_ps_write_bytes_total", "counter", c.write_bytes as f64),
+            ("autumn_ps_read_bytes_total", "counter", c.read_bytes as f64),
+            ("autumn_ps_flushes_total", "counter", c.flushes as f64),
+            ("autumn_ps_flush_bytes_total", "counter", c.flush_bytes as f64),
+            ("autumn_ps_major_compactions_total", "counter", c.majors as f64),
+            ("autumn_ps_vp_reads_total", "counter", c.vp_reads as f64),
+            ("autumn_ps_vp_read_bytes_total", "counter", c.vp_read_bytes as f64),
+        ];
+        for (name, kind, v) in plain {
+            push_type(&mut out, name, kind);
+            push_metric(&mut out, name, &[], v);
+        }
+
+        let minor: Vec<(&str, u64)> = MinorCause::ALL.iter().map(|c| c.name()).zip(c.minor).collect();
+        let labeled: [(&str, &str, Vec<(&str, u64)>); 3] = [
+            ("autumn_ps_minor_compactions_total", "trigger", minor),
+            (
+                "autumn_ps_compaction_write_bytes_total",
+                "kind",
+                vec![("minor", c.compaction_bytes[0]), ("major", c.compaction_bytes[1])],
+            ),
+            (
+                "autumn_ps_get_sst_checks_total",
+                "result",
+                vec![("skipped", c.sst_checks[0]), ("hit", c.sst_checks[1]), ("false_positive", c.sst_checks[2])],
+            ),
+        ];
+        for (name, label, samples) in labeled {
+            push_type(&mut out, name, "counter");
+            for (value, n) in samples {
+                push_metric(&mut out, name, &[(label, value.to_string())], n as f64);
+            }
+        }
+
+        // Latency histograms: cumulative `le` buckets + _sum + _count.
+        for (name, h) in [("autumn_ps_write_duration_seconds", &c.write_lat), ("autumn_ps_get_duration_seconds", &c.get_lat)] {
+            push_type(&mut out, name, "histogram");
+            let bucket = format!("{name}_bucket");
+            let mut cum: u64 = 0;
+            for (n, &bound) in h.buckets.iter().zip(&LAT_BUCKET_BOUNDS_NS) {
+                cum += n;
+                push_metric(&mut out, &bucket, &[("le", format!("{}", bound as f64 / 1e9))], cum as f64);
+            }
+            push_metric(&mut out, &bucket, &[("le", "+Inf".to_string())], h.count as f64);
+            push_metric(&mut out, &format!("{name}_sum"), &[], h.sum_ns as f64 / 1e9);
+            push_metric(&mut out, &format!("{name}_count"), &[], h.count as f64);
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn sample(text: &str, series: &str) -> f64 {
+        text.lines()
+            .find_map(|l| l.strip_prefix(series)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or_else(|| panic!("no sample {series}"))
+    }
+
     #[test]
-    fn counters_carry_what_the_partition_recorded() {
-        let m = PartitionMetrics::default();
-        m.sst_tables.store(7, Relaxed);
-        m.record_flush(4096);
-        m.record_compaction(false, 100);
-        m.record_compaction(true, 900);
-        m.record_minor_compaction(MinorCause::Blocking);
-        m.record_sst_lookup(5, true, 1);
-        m.get_lat.observe_n(700_000, 2);
-        let c = m.counters();
-        assert_eq!((c.sst_tables, c.flushes, c.flush_bytes), (7, 1, 4096));
-        assert_eq!((c.compaction_bytes_minor, c.compaction_bytes_major, c.major_compactions), (100, 900, 1));
-        assert_eq!((c.minor_flush, c.minor_blocking), (0, 1));
-        assert_eq!((c.sst_skipped, c.sst_hits, c.sst_false_positives), (5, 1, 1));
-        assert_eq!(c.get_lat.buckets[1], 2, "0.7 ms lands in the <=1 ms bucket");
-        assert_eq!(c.get_lat.count, 2);
+    fn render_sums_partitions_with_no_partition_label() {
+        let ps = PsMetrics::new(Arc::new(BlockCache::new(64 << 20)));
+        let a = Arc::new(PartitionMetrics::default());
+        let b = Arc::new(PartitionMetrics::default());
+        ps.register(a.clone());
+        ps.register(b.clone());
+        a.sst_tables.store(7, Relaxed);
+        b.sst_tables.store(3, Relaxed);
+        a.record_flush(4096);
+        b.record_flush(100);
+        a.record_compaction(false, 100);
+        a.record_compaction(true, 900);
+        b.record_minor_compaction(MinorCause::Blocking);
+        a.record_sst_lookup(5, true, 1);
+        b.get_lat.observe_n(700_000, 2);
+        let text = ps.render();
+
+        assert!(!text.contains("part="), "{text}");
+        assert_eq!(sample(&text, "autumn_ps_partitions"), 2.0);
+        assert_eq!(sample(&text, "autumn_ps_sst_tables"), 10.0);
+        assert_eq!(sample(&text, "autumn_ps_partition_sst_tables_max"), 7.0);
+        assert_eq!(sample(&text, "autumn_ps_flush_bytes_total"), 4196.0);
+        assert_eq!(sample(&text, "autumn_ps_block_cache_capacity_bytes"), (64 << 20) as f64);
+        assert_eq!(sample(&text, r#"autumn_ps_compaction_write_bytes_total{kind="major"}"#), 900.0);
+        assert_eq!(sample(&text, r#"autumn_ps_minor_compactions_total{trigger="blocking"}"#), 1.0);
+        assert_eq!(sample(&text, r#"autumn_ps_get_sst_checks_total{result="false_positive"}"#), 1.0);
+        assert_eq!(sample(&text, r#"autumn_ps_get_duration_seconds_bucket{le="0.001"}"#), 2.0);
+        assert_eq!(sample(&text, "autumn_ps_get_duration_seconds_count"), 2.0);
+
+        // Every metric's samples form one run after its # TYPE line.
+        let mut seen = std::collections::HashSet::new();
+        let mut current = String::new();
+        for l in text.lines() {
+            if let Some(rest) = l.strip_prefix("# TYPE ") {
+                current = rest.split(' ').next().unwrap().to_string();
+                assert!(seen.insert(current.clone()), "{current} typed twice");
+            } else {
+                let name = l.split(['{', ' ']).next().unwrap();
+                assert!(name.starts_with(&current), "{name} outside its group ({current})");
+            }
+        }
+    }
+
+    #[test]
+    fn counters_stay_put_when_a_partition_closes_and_reopens() {
+        let ps = PsMetrics::new(Arc::new(BlockCache::new(1 << 20)));
+        let old = Arc::new(PartitionMetrics::default());
+        ps.register(old.clone());
+        old.record_flush(10);
+        old.sst_tables.store(4, Relaxed);
+        assert_eq!(sample(&ps.render(), "autumn_ps_flushes_total"), 1.0);
+
+        // Closed but still held (its thread winding down): counted, not open.
+        old.closed.store(true, Relaxed);
+        let reopened = Arc::new(PartitionMetrics::default());
+        ps.register(reopened.clone());
+        reopened.record_flush(10);
+        let text = ps.render();
+        assert_eq!(sample(&text, "autumn_ps_flushes_total"), 2.0);
+        assert_eq!(sample(&text, "autumn_ps_partitions"), 1.0);
+        assert_eq!(sample(&text, "autumn_ps_sst_tables"), 0.0);
+
+        // Released: its counts move to retired, nothing steps back.
+        drop(old);
+        assert_eq!(sample(&ps.render(), "autumn_ps_flushes_total"), 2.0);
+        assert_eq!(ps.parts.lock().live.len(), 1);
+        reopened.record_flush(10);
+        assert_eq!(sample(&ps.render(), "autumn_ps_flushes_total"), 3.0);
     }
 }

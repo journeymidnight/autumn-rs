@@ -810,7 +810,7 @@ pub struct AllocExtentResp {
 }
 
 /// Disk space statistics for one disk.
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DiskStatus {
     /// Raw filesystem capacity (statvfs `f_blocks * f_frsize`).
     pub total: u64,
@@ -823,29 +823,6 @@ pub struct DiskStatus {
     /// open tails count live appended bytes. The manager sums these across
     /// all disks/nodes into `physical_used` with no amplification formula.
     pub extent_bytes: u64,
-    /// Out of space (`Full`): serving, taking no new extents. Only while
-    /// `online`; a faulted disk is not online.
-    pub full: bool,
-}
-
-/// An extent node's process-wide counters, carried on every `df` so the
-/// manager can export them (the node serves no `/metrics` of its own).
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
-pub struct EnCounters {
-    /// Append batches / bytes / time spent, since the process started.
-    pub append_batches: u64,
-    pub append_bytes: u64,
-    pub append_ns: u64,
-    /// Refusals on authentication grounds, by class: an opcode the
-    /// connection's (service, role) may not call; a Peer/Admin without the
-    /// cluster secret; a Client read without a principal (authz on); a refused
-    /// `CLIENT_AUTH` token.
-    pub rejects_opcode_denied: u64,
-    pub rejects_peer_auth: u64,
-    pub rejects_client_read: u64,
-    pub rejects_client_token: u64,
-    /// `(shard index, extents it holds)`.
-    pub shard_extents: Vec<(u32, u64)>,
 }
 
 /// A recovery task descriptor.
@@ -939,7 +916,7 @@ pub struct ExtentOpProgress {
     pub total: u64,
 }
 
-#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DfResp {
     pub done_tasks: Vec<RecoveryTaskDone>,
     /// Completed EC conversions, drained on each `df` (same at-most-once
@@ -993,7 +970,9 @@ pub struct DfResp {
     /// A lost report costs nothing: the manager keeps its own dispatch-side
     /// failures, and the next attempt reports again.
     pub op_failures: Vec<ExtentOpFailure>,
-    pub counters: EnCounters,
+    /// Where this node serves `/metrics` (empty: not registered, or no
+    /// endpoint). The manager lists it in its Prometheus `http_sd`.
+    pub metrics_addr: String,
 }
 
 /// One failure a node hit running an extent-scoped op.

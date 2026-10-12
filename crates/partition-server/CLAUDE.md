@@ -2576,7 +2576,8 @@ Three fixes bound the restart replay window (worst case per partition =
     flight misses its change, and the later record would drop it (a compaction's
     outputs, or a flush's SST, then exist in memory but not in the durable state).
 
-12. **Metrics export.** `PartitionMetrics` lives in `metrics.rs`. Each `PartitionData` carries an `Arc<PartitionMetrics>` whose
+12. **Metrics export.** `PartitionMetrics` and the PS's `/metrics` rendering
+    (`PsMetrics`) live in `metrics.rs`. Each `PartitionData` carries an `Arc<PartitionMetrics>` whose
     AtomicU64 counters are bumped by `partition_loop` (req_count on each
     `handle_incoming_req`, imm_full_count on imm-cap stalls). The same Arc is cloned into
     the `PartitionHandle` on the main thread; `report_load_loop` (5 s) snapshots all live
@@ -2909,38 +2910,60 @@ Three fixes bound the restart replay window (worst case per partition =
     rotation to itself while serving stale `part_addrs`.
     (d) Client SDK `refresh_regions` rotates + retries on NOT_LEADER.
 
-21. **Metrics go to the manager.** A PS serves no `/metrics`: every load report
-    (`report_load_loop`, 5 s) carries `PartitionMetrics::counters()` per partition
-    (`PartitionLoad.counters`) and the block cache (`ReportPartitionLoadReq.block_cache`,
-    from `BlockCache::stats`), and the manager's `/metrics` exports them
-    (`crates/manager/CLAUDE.md`, "Observability"). Counters are monotonic since the
-    partition opened; rates are the consumer's job. `req_count` is still swap-reset by
-    the report loop for its own rate; `write_bytes` / `read_bytes` are monotonic and
-    the loop diffs them against its last reading.
-
-    Latency: `PartitionMetrics.write_lat/get_lat` (`LatHist`: the 9 finite buckets of
-    `manager_rpc::LATENCY_BUCKET_BOUNDS_NS`, 0.5 ms..250 ms, + sum + count, per-bucket
-    storage). PUT observes the ALREADY-MEASURED `BatchStats.end_to_end_ns` once per
-    batch with `n = ops` (zero new hot-path timing); GET adds one `Instant` pair +
+21. **Latency histograms + /metrics.** `PartitionMetrics.write_lat/get_lat` (`LatHist`:
+    9 finite ns buckets 0.5ms..250ms + sum + count, non-cumulative storage, cumulative
+    `le` at render). PUT observes the ALREADY-MEASURED `BatchStats.end_to_end_ns` once
+    per batch with `n = ops` (zero new hot-path timing); GET adds one `Instant` pair +
     RefCell borrow in `serve_get_local`.
 
-    Where each value is written:
-    - `sst_tables`, `memtable_bytes` (active + queued), `imm_memtables`: set by
+    **`/metrics` is PS-wide only — no partition label.** Per-partition detail goes to
+    the manager on the load report, for scheduling; Prometheus sums PSes. The binary
+    serves it on its own thread and compio runtime, pinned to no core
+    (`autumn_common::metrics_http`, port `--port` + 500 unless `--metrics-port`), and
+    the render reads atomics there directly: `PsMetrics` (Send + Sync, held by the PS)
+    keeps every `Arc<PartitionMetrics>` `open_partition` created. Counters stay per
+    partition, so different partitions' hot paths never share a cache line, and the
+    render sums them. When the list is the only holder of one — the partition closed,
+    moved or reopened and its thread is gone, so nothing can count into it — its counts
+    move into `retired`: the PS-wide counters never step back, which Prometheus would
+    read as a reset. Gauges sum the partitions still open (`PartitionHandle::drop`
+    sets `closed`). Emission is metric-major (all samples of one metric contiguous
+    after its `# TYPE` line — the format requires it). Only monotonic counters are
+    exported as counters (`req_count` is swap-reset by `report_load_loop`; the export
+    reads `req_count_monotonic`).
+
+    What is exported (all `autumn_ps_*`), and where each value is written:
+    - `block_cache_{hits,misses}_total`, `_bytes`, `_capacity_bytes`
+      (`BlockCache::stats`, the counters it always kept under its lock).
+    - `partitions`, `size_bytes`, `sst_tables`, `partition_sst_tables_max` (the worst
+      partition — a sum hides one stuck at 35 tables), `memtable_bytes` (active +
+      queued), `imm_memtables`: per-partition gauges set by
       `PartitionData::publish_lsm_gauges` per write batch (after the memtable insert),
       on rotate, flush commit, compaction commit and open. Three relaxed stores per
-      batch; never computed at report time, because the report runs on the main thread
-      and the memtables live on the partition thread.
-    - `flushes`, `flush_bytes` (flush commit); `major_compactions`, compaction bytes
-      minor / major (`do_compact`'s publish); minor compactions by trigger (flush /
-      tick / blocking / reclaim — `run_minor_compaction`, the cause its log line names,
-      `MinorCause`).
-    - SST checks per point lookup (GET and HEAD, `sst_lookup_paged_retry`): excluded by
-      key range or bloom, read and found, read and absent — a bloom false positive,
-      since the range check passed and blooms have no false negatives. Counted locally
-      and added once per lookup; a lookup answered by a memtable counts nothing.
-    - `vp_reads`, `vp_read_bytes`: large values `get_value_inner` resolved from the log
-      stream (PS-proxied; a `Redirect` is read from the EN and not counted). This path
-      has no PS cache.
+      batch; summed at scrape time from those stores, since the memtables live on the
+      partition thread.
+    - `flushes_total`, `flush_bytes_total` (flush commit); `major_compactions_total`,
+      `compaction_write_bytes_total{kind=minor|major}` (`do_compact`'s publish);
+      `minor_compactions_total{trigger=flush|tick|blocking|reclaim}`
+      (`run_minor_compaction`, the same cause its log line names, `MinorCause`).
+    - `get_sst_checks_total{result=skipped|hit|false_positive}`: per point lookup
+      (GET and HEAD, `sst_lookup_paged_retry`) the SSTs excluded by key range or bloom,
+      the one read and found, the ones read and absent — a bloom false positive, since
+      the range check passed and blooms have no false negatives. Counted locally and
+      added once per lookup; a lookup answered by a memtable counts nothing.
+    - `vp_reads_total`, `vp_read_bytes_total`: large values `get_value_inner` resolved
+      from the log stream (PS-proxied; a `Redirect` is read from the EN and not counted).
+      This path has no PS cache.
+    - `requests_total`, `write_bytes_total`, `read_bytes_total`; the latency
+      histograms `write_duration_seconds` / `get_duration_seconds`.
+    The maintenance gauges of note 12 are scheduling inputs and travel only on the
+    load report.
+
+    The binary hands the PS the address others reach `/metrics` at
+    (`set_metrics_addr`: the host the listener is bound to — `--metrics-listen`,
+    else `--listen` — when it names one, else the advertised host); every
+    heartbeat carries it, the manager lists it in its `http_sd`, and the dashboard
+    scrapes it.
 
 ## MSG_ROLL_TAILS (`handle_roll_tails`) — rolling a LIVE partition's tails
 

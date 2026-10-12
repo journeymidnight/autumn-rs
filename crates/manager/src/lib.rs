@@ -42,7 +42,6 @@ pub use rpc_handlers::{
 // manager used to serve. The manager itself no longer serves a web UI — only
 // the leader-fenced auto-policy controller below survives in-process.
 pub mod dashboard_compose;
-pub mod fleet_metrics;
 // ported pure decision helpers (M1) → leader-fenced controller (M2).
 mod auto_policy;
 // The async op-ledger: every long-running op (split/merge/rebalance/compact/gc/
@@ -872,9 +871,6 @@ pub struct AutumnManager {
     /// node_id; absent = "unknown" (treated as spacious: cold leader /
     /// pre-first-df nodes must stay allocatable).
     pub(crate) node_max_free: Rc<RefCell<HashMap<u64, u64>>>,
-    /// Each PS's and EN's latest metrics report (`fleet_metrics`). Leader-
-    /// local and in memory; a new leader refills it within one report.
-    pub(crate) fleet_metrics: Rc<RefCell<fleet_metrics::FleetMetrics>>,
     /// cluster-df: in-memory capacity snapshot for `MSG_CLUSTER_DF`. RAW +
     /// physical_used are summed from every EN's df report each
     /// `node_health_loop` tick (the EN self-reports its real per-disk extent
@@ -1194,7 +1190,6 @@ impl AutumnManager {
             serving: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             node_max_free: Rc::new(RefCell::new(HashMap::new())),
-            fleet_metrics: Rc::new(RefCell::new(fleet_metrics::FleetMetrics::default())),
             cluster_cap: Rc::new(RefCell::new(ClusterCapSnapshot::default())),
             node_slot_counts: Rc::new(RefCell::new(HashMap::new())),
             faulted_disks: Rc::new(RefCell::new(HashSet::new())),
@@ -3200,7 +3195,8 @@ impl AutumnManager {
             // stale. The next heartbeat of each PS brings them back.
             s.ps_slot_caps.clear();
             s.ps_open_parts.clear();
-            self.fleet_metrics.borrow_mut().clear();
+            s.ps_metrics_addrs.clear();
+            s.en_metrics_addrs.clear();
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
@@ -3929,6 +3925,29 @@ impl AutumnManager {
         self.serving.set(true);
     }
 
+    /// Prometheus `http_sd` body: every registered PS and extent node that
+    /// reported a `/metrics` address, labelled `autumn_role` and its id. Only
+    /// the leader hears heartbeats and df answers, so a follower lists
+    /// nothing — Prometheus pointed at every manager sees each target once.
+    pub fn metrics_sd_json(&self) -> String {
+        if !self.leader.get() {
+            return "[]".to_string();
+        }
+        let s = self.store.inner.borrow();
+        let mut groups: Vec<serde_json::Value> = Vec::new();
+        let mut ps: Vec<_> = s.ps_metrics_addrs.iter().filter(|(id, _)| s.ps_nodes.contains_key(id)).collect();
+        ps.sort();
+        for (id, addr) in ps {
+            groups.push(serde_json::json!({"targets": [addr], "labels": {"autumn_role": "ps", "ps_id": id.to_string()}}));
+        }
+        let mut en: Vec<_> = s.en_metrics_addrs.iter().filter(|(id, _)| s.nodes.contains_key(id)).collect();
+        en.sort();
+        for (id, addr) in en {
+            groups.push(serde_json::json!({"targets": [addr], "labels": {"autumn_role": "en", "node_id": id.to_string()}}));
+        }
+        serde_json::Value::Array(groups).to_string()
+    }
+
     /// Observability batch 1: Prometheus text snapshot of control-plane
     /// state. Called by the manager binary's 2 s publisher task ON the
     /// compio runtime (the store is `Rc<RefCell>`, !Send); the rendered
@@ -3984,16 +4003,6 @@ impl AutumnManager {
             self.inflight.borrow().len() as u32,
         );
         out
-    }
-
-    /// The partition servers' and extent nodes' reports for `/metrics`, or
-    /// `None` on a follower: only the leader receives them, so a follower
-    /// exports none of their series. The caller renders them
-    /// (`fleet_metrics::render_text`) off this runtime, on the scrape.
-    pub fn fleet_metrics_snapshot(&self) -> Option<FleetMetricsResp> {
-        self.leader
-            .get()
-            .then(|| self.fleet_metrics.borrow().snapshot(Self::now_s_ms().1 as u64))
     }
 
     // ── Background loops ───────────────────────────────────────────────
@@ -4057,7 +4066,7 @@ impl AutumnManager {
                 s.ps_nodes.remove(ps_id);
                 s.ps_slot_caps.remove(ps_id);
                 s.ps_open_parts.remove(ps_id);
-                self.fleet_metrics.borrow_mut().forget_ps(*ps_id);
+                s.ps_metrics_addrs.remove(ps_id);
                 if let Some(m) = s.ps_members.get_mut(ps_id) {
                     m.left_at_ms = left_at_ms;
                     member_puts.push((
@@ -5234,6 +5243,31 @@ mod tests {
     }
 
     #[test]
+    fn metrics_sd_lists_registered_servers_and_nodes_on_the_leader_only() {
+        let m = AutumnManager::new();
+        add_node_and_disk(&m, 3, 30);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            s.ps_nodes.insert(1, "127.0.0.1:9301".to_string());
+            s.ps_metrics_addrs.insert(1, "127.0.0.1:9801".to_string());
+            // Evicted PS and removed node: their last addresses are not targets.
+            s.ps_metrics_addrs.insert(2, "127.0.0.1:9802".to_string());
+            s.en_metrics_addrs.insert(3, "127.0.0.1:9603".to_string());
+            s.en_metrics_addrs.insert(4, "127.0.0.1:9604".to_string());
+        }
+        let sd: serde_json::Value = serde_json::from_str(&m.metrics_sd_json()).unwrap();
+        assert_eq!(
+            sd,
+            serde_json::json!([
+                {"targets": ["127.0.0.1:9801"], "labels": {"autumn_role": "ps", "ps_id": "1"}},
+                {"targets": ["127.0.0.1:9603"], "labels": {"autumn_role": "en", "node_id": "3"}},
+            ])
+        );
+        m.leader.set(false);
+        assert_eq!(m.metrics_sd_json(), "[]");
+    }
+
+    #[test]
     fn op_submit_rejects_bad_kind_and_missing_target() {
         let m = AutumnManager::new(); // memory mode ⇒ leader = true
         // unknown kind.
@@ -5751,7 +5785,6 @@ mod tests {
         let req = rkyv_encode(&ReportPartitionLoadReq {
             ps_id: 1,
             partitions: vec![load],
-            ..Default::default()
         });
         run(async { m.handle_report_partition_load(req).await.unwrap() });
         // The ledger entry is now terminal with the surfaced error string.
@@ -6284,6 +6317,7 @@ mod tests {
                 ps_id: 20,
                 slot_cap: 4,
                 open_parts: Vec::new(),
+                metrics_addr: String::new(),
             });
             m.handle_heartbeat_ps(req).await.unwrap();
             m.handle_upsert_partition(upsert(5, b"z", b"")).await.unwrap();
@@ -6294,6 +6328,7 @@ mod tests {
                 ps_id: 99,
                 slot_cap: 8,
                 open_parts: Vec::new(),
+                metrics_addr: String::new(),
             });
             m.handle_heartbeat_ps(req).await.unwrap();
             assert!(!m.store.inner.borrow().ps_slot_caps.contains_key(&99));
@@ -6348,6 +6383,7 @@ mod tests {
                     ps_id,
                     slot_cap: 0,
                     open_parts,
+                    metrics_addr: String::new(),
                 })
             };
             let m = &m;
@@ -6500,6 +6536,7 @@ mod tests {
                 ps_id: 55,
                 slot_cap: 0,
                 open_parts: Vec::new(),
+                metrics_addr: String::new(),
             });
             m.handle_heartbeat_ps(req).await.unwrap();
 

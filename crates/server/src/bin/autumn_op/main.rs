@@ -415,7 +415,6 @@ async fn run(args: Args) -> Result<()> {
         } => cmd_extent_health(&client, args.json, node_filter, include_healthy).await?,
         Command::Health { max_problems } => cmd_health(&client, args.json, max_problems).await?,
         Command::Status => cmd_status(&client, args.json).await?,
-        Command::Metrics => cmd_metrics(&client, args.json).await?,
         Command::ListEcMarkers => cmd_list_ec_markers(&client, args.json).await?,
         Command::RecoveryStats => cmd_recovery_stats(&client, args.json).await?,
         Command::AuditLog {
@@ -1253,20 +1252,6 @@ fn render_health(r: &ExtentHealthSummaryResp) -> String {
         ));
     }
     lines.join("\n") + "\n"
-}
-
-/// The partition servers' and extent nodes' metrics, from the leader (they
-/// serve no `/metrics` of their own).
-async fn cmd_metrics(client: &ClusterClient, json: bool) -> Result<()> {
-    use autumn_manager::fleet_metrics::{families, render_text, to_json};
-    let r = client.fleet_metrics().await?;
-    let fams = families(&r);
-    if json {
-        println!("{}", serde_json::to_string(&to_json(&r, &fams))?);
-    } else {
-        print!("{}", render_text(&fams));
-    }
-    Ok(())
 }
 
 async fn cmd_status(client: &ClusterClient, json: bool) -> Result<()> {

@@ -27,7 +27,6 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
-
 struct Args {
     /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
     cluster_secret_file: Option<std::path::PathBuf>,
@@ -95,6 +94,12 @@ struct Args {
     /// enough to surface every thread's pool activity. Useful for
     /// confirming the registered-buffer hit rate during a perf run.
     regpool_log_interval_secs: Option<u64>,
+    /// Prometheus `/metrics` port. `None` = `--port` + 500; 0 = no endpoint.
+    metrics_port: Option<u16>,
+    /// Bind host for /metrics only. `None` = follow `--listen`. The
+    /// endpoint is unauthenticated — operators exposing the RPC plane
+    /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
+    metrics_listen: Option<String>,
     // pprof CLI flags (replaces AUTUMN_PPROF_* env reads).
     #[cfg(feature = "profiling")]
     pprof_secs: Option<u64>,
@@ -150,6 +155,8 @@ fn parse_args() -> Args {
     let mut gc_rate_bytes_per_sec: Option<u64> = None;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut regpool_log_interval_secs: Option<u64> = None;
+    let mut metrics_port: Option<u16> = None;
+    let mut metrics_listen: Option<String> = None;
     #[cfg(feature = "profiling")]
     let mut pprof_secs: Option<u64> = None;
     #[cfg(feature = "profiling")]
@@ -423,12 +430,13 @@ fn parse_args() -> Args {
                         .expect("--regpool-log-interval-secs u64"),
                 );
             }
-            "--metrics-port" | "--metrics-listen" => {
-                eprintln!(
-                    "error: {} was removed; {} metrics reach the manager, whose /metrics exports them",
-                    args[i], "partition-server"
-                );
-                std::process::exit(2);
+            "--metrics-port" => {
+                i += 1;
+                metrics_port = Some(args[i].parse().expect("--metrics-port must be a port"));
+            }
+            "--metrics-listen" => {
+                i += 1;
+                metrics_listen = Some(args[i].clone());
             }
             #[cfg(feature = "profiling")]
             "--pprof-secs" => {
@@ -569,6 +577,8 @@ fn parse_args() -> Args {
         gc_rate_bytes_per_sec,
         ucx_regpool_cap_bytes,
         regpool_log_interval_secs,
+        metrics_port,
+        metrics_listen,
         #[cfg(feature = "profiling")]
         pprof_secs,
         #[cfg(feature = "profiling")]
@@ -849,6 +859,10 @@ async fn main() -> Result<()> {
     // implicit `sync_regions_once()` runs `open_partition`. On restart, partitions
     // already exist in the manager — without this, `open_partition` reads
     // `base_port = 0` and binds the first partition to port `0 + 1 = 1`.
+    let advertise_host = advertise
+        .rsplit_once(':')
+        .map_or(advertise.as_str(), |(h, _)| h)
+        .to_string();
     let ps = PartitionServer::connect_with_advertise_and_port(
         args.psid,
         &args.manager,
@@ -889,6 +903,21 @@ async fn main() -> Result<()> {
             })
             .detach();
             tracing::info!(period_secs = secs, "regpool periodic log armed");
+        }
+    }
+
+    // /metrics on its own thread and runtime, reading the PS's atomics.
+    if let Some(mport) = autumn_common::metrics_http::metrics_port(args.metrics_port, args.port) {
+        let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
+        let m = ps.metrics();
+        match autumn_common::metrics_http::spawn_metrics_http(mhost, mport, std::sync::Arc::new(move || m.render()), None) {
+            Ok(()) => {
+                let reach = autumn_common::metrics_http::metrics_reach_addr(mhost, &advertise_host, mport);
+                ps.set_metrics_addr(reach.clone());
+                tracing::info!(port = mport, host = mhost, reach, "metrics endpoint up at /metrics");
+            }
+            // Auxiliary — a taken metrics port must not kill the data plane.
+            Err(e) => tracing::error!(port = mport, "metrics endpoint bind failed: {e}"),
         }
     }
 
@@ -944,3 +973,4 @@ fn install_term_handler() {
         );
     }
 }
+

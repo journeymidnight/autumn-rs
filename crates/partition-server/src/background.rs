@@ -616,7 +616,7 @@ pub(crate) async fn background_maintenance_loop(
                 // revive the size gauge here (local +
                 // cheap, no RPC — unlike open_tail_bytes below). LSM-resident
                 // size (SST + memtable) drives the Prometheus
-                // `autumn_ps_partition_size_bytes` gauge and the manager's
+                // `autumn_ps_size_bytes` gauge and the manager's
                 // size-based split/merge policy, both of which read a
                 // constant 0 before this.
                 p.metrics

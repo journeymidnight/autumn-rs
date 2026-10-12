@@ -23,7 +23,7 @@
     POST /api/action  {cmd}       → actuate one autumn-op mutation (danger mode)
     GET  /api/policies + POST /api/policies/{upsert,activate,delete}
     GET  /api/ops                 → {live, history}
-    GET  /api/metrics?scope=&id=  → PS metrics history the dashboard polled (autumn-op metrics, in its own loop)
+    GET  /api/metrics?scope=&id=  → PS /metrics history the dashboard scraped (no autumn-op call)
 -->
 <html lang="zh">
 <head>
@@ -225,6 +225,8 @@
   .mbar select { background:var(--panel2); border:1px solid var(--line); border-radius:4px; color:var(--ink); font:inherit; padding:2px 6px; }
   .charts { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:14px; margin-top:12px; }
   .chart { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:10px 12px 8px; min-width:0; }
+  .hotparts { margin-top:14px; } .hotparts table { width:100%; border-collapse:collapse; font-size:12px; }
+  .hotparts td, .hotparts th { padding:3px 8px; text-align:right; } .hotparts td:first-child, .hotparts th:first-child { text-align:left; }
   .chart h3 { margin:0 0 4px; font-size:10px; font-weight:500; letter-spacing:.12em; text-transform:uppercase;
     color:var(--dim); display:flex; justify-content:space-between; gap:8px; }
   .chart h3 b { color:var(--ink); letter-spacing:0; text-transform:none; font-weight:500; font-size:12px; }
@@ -455,15 +457,16 @@
     </div>
   </section>
 
-  <!-- ── METRICS (every PS's metrics, polled via autumn-op, kept by the dashboard) ── -->
+  <!-- ── METRICS (each PS's /metrics, scraped and kept by the dashboard) ── -->
   <section class="pane" id="pane-metrics" hidden>
     <div class="cap" style="margin-top:2px"><span class="eyebrow">Metrics</span>
-      <span class="hint">every partition server's metrics, polled from the manager by this dashboard and kept in its memory — a restart starts over</span></div>
+      <span class="hint">scraped from every partition server's /metrics by this dashboard and kept in its memory — a restart starts over</span></div>
     <div class="mbar">
       <label class="ctrl">scope <select id="m_scope"></select></label>
       <span class="stamp" id="m_endpoints"></span>
     </div>
     <div class="charts" id="m_charts"></div>
+    <div class="chart hotparts" id="m_hot"></div>
   </section>
 </div></main>
 <div id="toast"></div>
@@ -1351,10 +1354,10 @@ $("#np_save").onclick=async()=>{
 };
 
 // ── Metrics tab ──────────────────────────────────────────────────────────────
-// The dashboard polls every PS's metrics from the manager (`autumn-op metrics`)
-// and keeps the history in memory, summed per PS. /api/metrics sums the scope's
-// series on one time axis; counters arrive as per-second rates, and a gauge
-// summed over partitions also comes as `name:max` (the largest partition).
+// The dashboard scrapes every PS's /metrics itself (the address each PS reports
+// on its heartbeat) and keeps the history in memory. A PS's series are PS-wide;
+// /api/metrics sums the scope's series on one time axis (a `*_max` series takes
+// the largest) and counters arrive as per-second rates.
 let METRICS=null;          // the last /api/metrics reply
 let M_SCOPE="cluster";     // "cluster" | "ps:<id>"
 function metricsPath(scope){
@@ -1437,10 +1440,9 @@ function metricsCharts(m){
     lineChart("Block cache size", t, fmtBytes,
       [L("cached",S["block_cache_bytes"],0), L("capacity",S["block_cache_capacity_bytes"],8)]),
     lineChart("SST tables", t, fmtNum,
-      [L("all partitions",S["sst_tables"],0), L("largest partition",S["sst_tables:max"],4)]),
+      [L("all partitions",S["sst_tables"],0), L("largest partition",S["partition_sst_tables_max"],4)]),
     lineChart("Memtable", t, fmtBytes, [L("active + queued",S["memtable_bytes"],0)]),
-    lineChart("Queued memtables", t, fmtNum,
-      [L("all partitions",S["imm_memtables"],3), L("largest partition",S["imm_memtables:max"],4)]),
+    lineChart("Queued memtables", t, fmtNum, [L("immutable",S["imm_memtables"],3)]),
     lineChart("Flush", t, fmtBps, [L("SST bytes",S["flush_bytes"],0)]),
     lineChart("Compactions / min", t, fmtNum, [
       L("minor · flush",perMin(S["minor_compactions{trigger=flush}"]),0),
@@ -1455,8 +1457,6 @@ function metricsCharts(m){
       L("read, found",S["get_sst_checks{result=hit}"],0),
       L("read, bloom false positive",S["get_sst_checks{result=false_positive}"],4)]),
     lineChart("Large-value reads", t, fmtBps, [L("from the log stream",S["vp_read_bytes"],2)]),
-    lineChart("Maintenance debt", t, fmtBytes, [L("GC",S["gc_debt_bytes"],0),
-      L("major compaction",S["pending_compaction_bytes"],1), L("minor window",S["minor_compact_pending_bytes"],2)]),
   );
   return out.join("");
 }
@@ -1467,9 +1467,26 @@ function renderMetricsTab(){
   $("#m_scope").innerHTML=opts.map(([v,l])=>`<option value="${esc(v)}"${v===M_SCOPE?" selected":""}>${esc(l)}</option>`).join("");
   if(!METRICS){ $("#m_charts").innerHTML='<div class="listempty">Loading…</div>'; return; }
   const ps=METRICS.ps||[], bad=ps.filter(p=>p.error);
-  $("#m_endpoints").innerHTML = `${ps.length-bad.length}/${ps.length} partition servers reporting, polled every ${METRICS.interval_secs}s`
+  $("#m_endpoints").innerHTML = `${ps.length-bad.length}/${ps.length} partition servers scraped every ${METRICS.interval_secs}s`
     + bad.map(p=>` · <span class="bad">PS ${p.ps_id}: ${esc(p.error)}</span>`).join("");
   $("#m_charts").innerHTML=metricsCharts(METRICS);
+  $("#m_hot").innerHTML=hotPartitions();
+}
+// The busiest partitions right now, from the manager's load reports (the
+// overview) — a snapshot, not a series: per-partition history is not kept.
+const HOT_N=10;
+function hotPartitions(){
+  const ps=M_SCOPE.startsWith("ps:") ? +M_SCOPE.slice(3) : null;
+  const rows=PARTS.filter(p=>ps==null||p.ps_id===ps)
+    .map(p=>({p, bytes:(p.write_bytes_per_sec||0)+(p.read_bytes_per_sec||0)}))
+    .filter(r=>(r.p.req_per_sec||0)>0||r.bytes>0)
+    .sort((a,b)=>(b.p.req_per_sec||0)-(a.p.req_per_sec||0)||b.bytes-a.bytes).slice(0,HOT_N);
+  const head=`<h3>Hottest partitions <b>top ${HOT_N}</b></h3>`;
+  if(!rows.length) return head+'<div class="nodata">no load reported</div>';
+  return head+`<table><tr><th>partition</th><th>PS</th><th>iops</th><th>write</th><th>read</th></tr>${rows.map(({p})=>
+    `<tr><td><a href="#partitions" onclick='pick(${JSON.stringify(p.ps_id)},true); openDetail(${p.part_id})'>#${p.part_id}</a></td>
+     <td>${esc(String(p.ps_id))}</td><td>${p.req_per_sec||0}</td><td>${fmtBytes(p.write_bytes_per_sec||0)}/s</td>
+     <td>${fmtBytes(p.read_bytes_per_sec||0)}/s</td></tr>`).join("")}</table>`;
 }
 
 // ── wiring ───────────────────────────────────────────────────────────────────

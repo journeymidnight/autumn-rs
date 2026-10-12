@@ -68,21 +68,26 @@ Used by `StreamAppendMetrics` (stream crate), `WriteLoopMetrics` and `ReadMetric
 
 ### `metrics_http.rs` — Prometheus `/metrics` endpoint (observability batch 1)
 
-`spawn_metrics_http(bind_host, port, render)` — minimal hand-rolled HTTP/1.1
-listener on a dedicated OS thread (`std::net::TcpListener`, blocking, 2 s/5 s
-read/write timeouts). Deliberately ZERO interaction with the compio runtimes:
-the `render: Arc<dyn Fn() -> String + Send + Sync>` closure runs on the
-metrics thread and must only read `Arc`-shared state. Binaries whose state is
-`Rc`/`RefCell` (manager store, PS partitions map) publish a pre-rendered
-snapshot string into an `Arc<RwLock<String>>` from a 2 s task on their own
-runtime; the EN renders directly from process-global atomics. Bind failure
-returns Err — callers log ERROR and keep serving (metrics are auxiliary,
-never kill the data plane). `push_metric` / `push_type` emit the Prometheus
+`spawn_metrics_http(bind_host, port, render, sd)` — minimal hand-rolled HTTP/1.1
+server on its own thread with its own compio runtime, pinned to no core (the
+binaries spawn it from an unpinned thread; 2 s/5 s read/write timeouts).
+Deliberately ZERO interaction with the data-plane runtimes: the
+`render: Arc<dyn Fn() -> String + Send + Sync>` closure runs on the metrics
+thread and must only read `Arc`-shared state. The PS (`PsMetrics`) and EN render
+directly from their atomics; the manager, whose store is `Rc`/`RefCell`,
+publishes pre-rendered snapshots (`MetricsSnapshot`) from a 2 s task and also
+serves its Prometheus `http_sd` body at `/sd` (`sd`). The listener is bound and
+the runtime built before the call returns, so a taken port or a failed runtime
+is the caller's Err — callers log ERROR and keep serving (metrics are
+auxiliary, never kill the data plane). `metrics_port(flag, service_port)`: a PS
+or EN serves on its service port + `METRICS_PORT_OFFSET` (500) unless
+`--metrics-port` says otherwise (0 = none); `metrics_reach_addr` is the address
+others reach it at (the bound host, or the advertised one when bound to every
+address). `push_metric` / `push_type` emit the Prometheus
 text format with label escaping; emission must be metric-major (all samples
 of one metric contiguous after its `# TYPE` line — never interleave).
-Only the manager serves it (default 9591; `--metrics-port N` moves it, `0`
-turns it off): partition servers and extent nodes report their counters to the
-manager, which exports them.
+Every process serves one by default: the manager at 9591, each PS and EN at
+its service port + 500.
 
 ### `error.rs` — Domain Error Types
 

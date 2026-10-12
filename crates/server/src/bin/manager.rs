@@ -20,11 +20,6 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
-/// Where `/metrics` listens when `--metrics-port` is not given — on by
-/// default; the deploy scripts use the same port (and number it per instance
-/// when several share a host).
-const DEFAULT_METRICS_PORT: u16 = 9591;
-
 struct Args {
     port: u16,
     etcd: Vec<String>,
@@ -46,8 +41,7 @@ struct Args {
     /// (was env): MSG_REPORT_DISK_FAILURE distinct-reporter
     /// quorum threshold. `None` = library default (3).
     report_disk_failure_quorum: Option<usize>,
-    /// Prometheus `/metrics` HTTP port: `DEFAULT_METRICS_PORT` unless
-    /// `--metrics-port` says otherwise; `--metrics-port 0` = `None`, no endpoint.
+    /// Prometheus `/metrics` (and `/sd`) port, 9591 unless given; 0 = none.
     metrics_port: Option<u16>,
     /// Bind host for /metrics only. `None` = follow `--listen`. The
     /// endpoint is unauthenticated — operators exposing the RPC plane
@@ -90,7 +84,7 @@ fn parse_args() -> Args {
     let mut policy_fast_mode = false;
     let mut report_disk_failure_window_secs: Option<u64> = None;
     let mut report_disk_failure_quorum: Option<usize> = None;
-    let mut metrics_port: Option<u16> = Some(DEFAULT_METRICS_PORT);
+    let mut metrics_port: Option<u16> = Some(9591);
     let mut metrics_listen: Option<String> = None;
     let mut min_alloc_free_bytes: Option<u64> = None;
     let mut repair_grace_secs: Option<u64> = None;
@@ -161,8 +155,7 @@ fn parse_args() -> Args {
             }
             "--metrics-port" => {
                 i += 1;
-                let port: u16 = raw[i].parse().expect("--metrics-port must be a port");
-                metrics_port = (port != 0).then_some(port);
+                metrics_port = Some(raw[i].parse().expect("--metrics-port must be a port"));
             }
             "--metrics-listen" => {
                 i += 1;
@@ -350,47 +343,38 @@ async fn main() -> Result<()> {
         );
     }
 
-    // /metrics endpoint. The store is Rc/!Send, so a 2 s publisher task on
-    // THIS runtime takes a snapshot — the manager's own text plus the
-    // partition servers' and extent nodes' latest reports — and the HTTP
-    // listener (own OS thread, std::net) renders the reports on each scrape:
-    // with thousands of partitions that rendering is the expensive part, and
-    // it stays off the control runtime and costs nothing unscraped.
-    if let Some(mport) = args.metrics_port {
-        type Snap = (String, Option<autumn_rpc::manager_rpc::FleetMetricsResp>);
-        let take = |m: &autumn_manager::AutumnManager| -> std::sync::Arc<Snap> {
-            std::sync::Arc::new((m.metrics_text(), m.fleet_metrics_snapshot()))
-        };
+    // /metrics and the Prometheus http_sd list at /sd. The store is
+    // Rc/!Send, so a 2 s publisher task on THIS runtime renders both; the
+    // HTTP thread serves the latest copies.
+    if let Some(mport) = args.metrics_port.filter(|p| *p != 0) {
+        let snap = autumn_common::metrics_http::MetricsSnapshot::new();
+        let sd = autumn_common::metrics_http::MetricsSnapshot::new();
         // Initial snapshot BEFORE the listener — a scrape that races
         // startup gets real data, never an empty 200 (coco P3).
-        let snap = std::sync::Arc::new(std::sync::Mutex::new(take(&manager)));
-        let snap_http = snap.clone();
+        snap.publish(manager.metrics_text());
+        sd.publish(manager.metrics_sd_json());
+        let (snap_http, sd_http) = (snap.clone(), sd.clone());
         let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
         match autumn_common::metrics_http::spawn_metrics_http(
             mhost,
             mport,
-            std::sync::Arc::new(move || {
-                // Only the Arc is cloned under the lock (coco P2).
-                let s = snap_http.lock().unwrap_or_else(|p| p.into_inner()).clone();
-                let mut text = s.0.clone();
-                if let Some(fleet) = &s.1 {
-                    use autumn_manager::fleet_metrics::{families, render_text};
-                    text.push_str(&render_text(&families(fleet)));
-                }
-                text
-            }),
+            std::sync::Arc::new(move || snap_http.get().as_ref().clone()),
+            Some(std::sync::Arc::new(move || sd_http.get().as_ref().clone())),
         ) {
             Ok(()) => {
                 let mgr = manager.clone();
                 compio::runtime::spawn(async move {
                     loop {
                         compio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        let next = take(&mgr);
-                        *snap.lock().unwrap_or_else(|p| p.into_inner()) = next;
+                        // Render OUTSIDE any lock; publish is an O(1)
+                        // Arc swap — never blocks this runtime behind a
+                        // scraper (coco P2).
+                        snap.publish(mgr.metrics_text());
+                        sd.publish(mgr.metrics_sd_json());
                     }
                 })
                 .detach();
-                tracing::info!(port = mport, host = mhost, "metrics endpoint up at /metrics");
+                tracing::info!(port = mport, host = mhost, "metrics endpoint up at /metrics and /sd");
             }
             // Metrics are auxiliary — a taken port must not kill the
             // control plane. Loud log, keep serving.

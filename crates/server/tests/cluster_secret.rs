@@ -118,31 +118,21 @@ fn refused(r: &Result<(ReadHalf, WriteHalf), RpcError>, needle: &str) {
     }
 }
 
-/// One class of the (single) extent node's `autumn_en_auth_rejects_total`,
-/// from the manager's /metrics — the node reports it on `df`. `None` until
-/// the manager has heard a `df` from it.
-fn en_rejects(manager_metrics_port: u16, class: &str) -> Option<u64> {
+/// One class of `autumn_en_auth_rejects_total` from an extent node's /metrics.
+fn en_rejects(metrics_port: u16, class: &str) -> u64 {
     use std::io::{Read, Write};
-    wait_port_open(manager_metrics_port);
-    let mut conn = std::net::TcpStream::connect(("127.0.0.1", manager_metrics_port)).unwrap();
+    wait_port_open(metrics_port);
+    let mut conn = std::net::TcpStream::connect(("127.0.0.1", metrics_port)).unwrap();
     conn.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").unwrap();
     let mut body = String::new();
     conn.read_to_string(&mut body).unwrap();
-    let class_label = format!(",class=\"{class}\"}} ");
+    let line = format!("autumn_en_auth_rejects_total{{class=\"{class}\"}} ");
     body.lines()
-        .filter(|l| l.starts_with("autumn_en_auth_rejects_total{"))
-        .find_map(|l| l.split_once(&class_label).map(|(_, v)| v.trim().parse::<f64>().unwrap() as u64))
-}
-
-/// Wait (the `df` cadence is 2 s) until the class reads `want`.
-fn wait_en_rejects(manager_metrics_port: u16, class: &str, want: u64) {
-    for _ in 0..100 {
-        if en_rejects(manager_metrics_port, class) == Some(want) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    panic!("{class} never reached {want}: {:?}", en_rejects(manager_metrics_port, class));
+        .find_map(|l| l.strip_prefix(&line))
+        .unwrap_or_else(|| panic!("no {class} counter in:\n{body}"))
+        .trim()
+        .parse::<f64>()
+        .unwrap() as u64
 }
 
 fn run_op(args: &[&str]) -> std::process::Output {
@@ -163,10 +153,6 @@ fn servers_refuse_to_start_without_the_secret() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains("--cluster-secret-file is required"), "{bin}: {err}");
     }
-    // An extent node serves no /metrics of its own; the flag is named.
-    let out = Command::new(EXTENT_NODE_BIN).args(["--metrics-port", "9601"]).output().unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("was removed"));
     // The removed admin token is named, not ignored.
     let out = Command::new(MANAGER_BIN)
         .args(["--admin-token-file", "/nonexistent"])
@@ -186,12 +172,10 @@ fn members_and_operators_must_prove_the_secret() {
     let mgr_port = pick_port();
     let mgr_addr = format!("127.0.0.1:{mgr_port}");
     let mgr_log = tmp.0.join("manager.log");
-    let metrics_port = pick_port();
     let _manager = ChildGuard(
         Command::new(MANAGER_BIN)
             .args(["--cluster-secret-file", secret_arg])
             .args(["--port", &mgr_port.to_string(), "--listen", "127.0.0.1"])
-            .args(["--metrics-port", &metrics_port.to_string()])
             .stdout(std::fs::File::create(&mgr_log).unwrap())
             .stderr(Stdio::null())
             .spawn()
@@ -212,11 +196,13 @@ fn members_and_operators_must_prove_the_secret() {
     ]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let en_port = pick_port();
+    let metrics_port = pick_port();
     let en_log = tmp.0.join("en.log");
     let _en = ChildGuard(
         Command::new(EXTENT_NODE_BIN)
             .args(["--cluster-secret-file", secret_arg])
             .args(["--port", &en_port.to_string(), "--listen", "127.0.0.1"])
+            .args(["--metrics-port", &metrics_port.to_string()])
             .args(["--control-port", &pick_port().to_string()])
             .args(["--data", en_dir.to_str().unwrap()])
             .args(["--manager", &mgr_addr])
@@ -277,15 +263,7 @@ fn members_and_operators_must_prove_the_secret() {
 
         // A Client reaches an extent node without any proof, but only its
         // read ops: a destructive one is refused and counted.
-        let mut before = (None, None);
-        for _ in 0..100 {
-            before = (en_rejects(metrics_port, "opcode_denied"), en_rejects(metrics_port, "peer_auth"));
-            if before.0.is_some() && before.1.is_some() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(100));
-        }
-        let before = (before.0.expect("EN never reported"), before.1.expect("EN never reported"));
+        let before = (en_rejects(metrics_port, "opcode_denied"), en_rejects(metrics_port, "peer_auth"));
         let (mut rd, mut wr) = open(en, Service::ExtentNode, Role::Client, None)
             .await
             .unwrap();
@@ -295,13 +273,13 @@ fn members_and_operators_must_prove_the_secret() {
             StatusCode::PermissionDenied,
             "a Client ran DELETE_EXTENT"
         );
-        wait_en_rejects(metrics_port, "opcode_denied", before.0 + 1);
+        assert_eq!(en_rejects(metrics_port, "opcode_denied"), before.0 + 1);
         // A Peer holding the wrong secret never reaches a frame: counted too.
         refused(
             &open(en, Service::ExtentNode, Role::Peer, Some(&secret(WRONG))).await,
             "different secrets",
         );
-        wait_en_rejects(metrics_port, "peer_auth", before.1 + 1);
+        assert_eq!(en_rejects(metrics_port, "peer_auth"), before.1 + 1);
     });
 
     // The refusing side names the refused peer, so a misconfigured process can

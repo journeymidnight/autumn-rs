@@ -1,40 +1,42 @@
-//! In-memory history of every partition server's metrics.
+//! In-memory history of every partition server's `/metrics`.
 //!
-//! Once per round the poller asks the manager (`autumn-op metrics`) for each
-//! PS's latest report. A report is summed over its partitions as it arrives —
-//! the page shows the cluster and single PSes, never one partition — and a
-//! gauge also keeps its largest partition as `name:max`. Every series is a
-//! column of one shared round axis, one `f32` per round (NaN = none), so series
-//! from different PSes line up and add up point for point. Counters are stored
-//! as per-second rates over the PS's own report times (a sum that went down —
-//! a restart or a reopened partition — yields no point); gauges as read.
-//! Nothing is persisted: a dashboard restart starts an empty history.
+//! The poller scrapes all PSes once per round; a PS's series are PS-wide (it
+//! has no per-partition ones). Every series is a column of one shared round
+//! axis: a series stores one `f32` per round from its first (NaN = no value
+//! that round), so series from different PSes line up and add up point for
+//! point, at 4 bytes a point. Counters are stored as per-second rates (a
+//! counter that went down was reset by a PS restart and yields no point);
+//! gauges as read. Nothing is persisted: a dashboard restart starts an empty
+//! history.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 
-/// How a series combines across PSes in a cluster view.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Agg {
-    Sum,
-    Max,
+/// One series: a metric of one PS.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Key {
+    ps: u64,
+    /// Short metric name plus its labels, e.g.
+    /// `minor_compactions{trigger=flush}`.
+    name: String,
 }
 
 struct Series {
-    agg: Agg,
+    counter: bool,
     /// Absolute round index of `values[0]`.
     start: u64,
     values: VecDeque<f32>,
-    /// The counter's last raw reading `(report ms, value)`, to rate the next.
+    /// The counter's last raw reading `(t_ms, value)`, to rate the next one.
     last_raw: Option<(u64, f64)>,
 }
 
-/// The latest report of one PS, for the page's reporter list.
+/// The latest scrape of one PS, for the page's endpoint list.
 #[derive(Clone, Debug, Default)]
 pub struct PsStatus {
-    pub last_report_ms: Option<u64>,
+    pub metrics_addr: Option<String>,
+    pub last_ok_ms: Option<u64>,
     pub error: Option<String>,
 }
 
@@ -43,28 +45,24 @@ pub enum Scope {
     Ps(u64),
 }
 
-/// One sample of a report: metric name, labels other than `ps` / `part`
-/// folded into the name, whether it is a counter, its partition (if any).
-pub struct Sample {
-    pub name: String,
-    pub counter: bool,
-    pub per_partition: bool,
-    pub value: f64,
-}
-
 pub struct MetricsStore {
     retention_ms: u64,
     interval: Duration,
     /// Round start times; `rounds[0]` has absolute index `first_round`.
     rounds: VecDeque<u64>,
     first_round: u64,
-    /// Per round, the PSes that sent no new report although they had before:
-    /// a sum missing one of them would read as a drop, so such a round is
-    /// left out of it.
+    /// Per round, the PSes whose scrape failed: a sum over a scope missing one
+    /// of them would read as a drop, so such a round is left out of it.
     failed: VecDeque<Vec<u64>>,
-    /// Keyed by (ps, series name).
-    series: HashMap<(u64, String), Series>,
+    series: HashMap<Key, Series>,
     ps: BTreeMap<u64, PsStatus>,
+}
+
+/// One parsed sample line.
+struct Sample {
+    name: String,
+    labels: Vec<(String, String)>,
+    value: f64,
 }
 
 impl MetricsStore {
@@ -80,7 +78,7 @@ impl MetricsStore {
         }
     }
 
-    /// Start a round at `t_ms` and drop what has aged out.
+    /// Start a scrape round at `t_ms` and drop what has aged out.
     pub fn begin_round(&mut self, t_ms: u64) {
         self.rounds.push_back(t_ms);
         self.failed.push_back(Vec::new());
@@ -100,14 +98,14 @@ impl MetricsStore {
         });
     }
 
-    /// The PS had reported before but sent nothing new this round.
+    /// The PS could not be scraped this round.
     pub fn record_failure(&mut self, ps_id: u64) {
         if let Some(f) = self.failed.back_mut() {
             f.push(ps_id);
         }
     }
 
-    /// Forget PSes the manager no longer reports.
+    /// Forget PSes no longer registered.
     pub fn retain_ps(&mut self, live: &[u64]) {
         self.ps.retain(|id, _| live.contains(id));
     }
@@ -116,31 +114,48 @@ impl MetricsStore {
         self.ps.insert(ps_id, status);
     }
 
-    /// Fold one PS's report, taken at `report_ms`, into the current round.
-    pub fn ingest(&mut self, ps_id: u64, report_ms: u64, samples: &[Sample]) {
-        // name -> (counter, sum over partitions, largest partition)
-        let mut folded: BTreeMap<&str, (bool, f64, Option<f64>)> = BTreeMap::new();
-        for s in samples {
-            let e = folded.entry(&s.name).or_insert((s.counter, 0.0, None));
-            e.1 += s.value;
-            if s.per_partition && !s.counter {
-                e.2 = Some(e.2.map_or(s.value, |m: f64| m.max(s.value)));
-            }
-        }
-        for (name, (counter, sum, max)) in folded {
-            self.record(ps_id, name.to_string(), counter, Agg::Sum, report_ms, sum);
-            if let Some(m) = max {
-                self.record(ps_id, format!("{name}:max"), false, Agg::Max, report_ms, m);
-            }
-        }
+    pub fn status(&self, ps_id: u64) -> Option<&PsStatus> {
+        self.ps.get(&ps_id)
     }
 
-    fn record(&mut self, ps: u64, name: String, counter: bool, agg: Agg, t_ms: u64, v: f64) {
+    /// Fold one PS's `/metrics` text into the current round, taken at `t_ms`.
+    pub fn ingest(&mut self, ps_id: u64, t_ms: u64, text: &str) -> usize {
+        let mut counters: HashMap<String, bool> = HashMap::new();
+        let mut n = 0;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("# TYPE ") {
+                let mut it = rest.split_whitespace();
+                if let (Some(family), Some(kind)) = (it.next(), it.next()) {
+                    counters.insert(family.to_string(), kind == "counter" || kind == "histogram");
+                }
+                continue;
+            }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some(s) = parse_sample(line) else { continue };
+            let family = ["_bucket", "_sum", "_count"]
+                .iter()
+                .find_map(|sfx| s.name.strip_suffix(sfx).filter(|f| counters.contains_key(*f)))
+                .unwrap_or(&s.name);
+            let counter = counters.get(family).copied().unwrap_or(false);
+            let labels: Vec<String> = s.labels.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            let mut name = short_name(&s.name).to_string();
+            if !labels.is_empty() {
+                name = format!("{name}{{{}}}", labels.join(","));
+            }
+            self.record(Key { ps: ps_id, name }, counter, t_ms, s.value);
+            n += 1;
+        }
+        n
+    }
+
+    fn record(&mut self, key: Key, counter: bool, t_ms: u64, v: f64) {
         let Some(idx) = (self.first_round + self.rounds.len() as u64).checked_sub(1) else {
             return;
         };
-        let s = self.series.entry((ps, name)).or_insert_with(|| Series {
-            agg,
+        let s = self.series.entry(key).or_insert_with(|| Series {
+            counter,
             start: idx,
             values: VecDeque::new(),
             last_raw: None,
@@ -166,31 +181,30 @@ impl MetricsStore {
         s.values[slot] = point as f32;
     }
 
-    /// The scope's series on the common round axis: summed over the scope's
-    /// PSes (a `name:max` series takes the largest). `null` = nothing reported
-    /// at that round, or a PS of the scope sent no new report then.
+    /// The scope's series, summed over the PSes it covers (a `*_max` series
+    /// takes the largest), on the common round axis. `null` = nothing reported
+    /// at that round, or a PS of the scope could not be scraped then.
     pub fn query(&self, scope: &Scope) -> Value {
         let len = self.rounds.len();
-        let mut out: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
-        for ((ps, name), s) in &self.series {
+        let mut sums: BTreeMap<String, Vec<Option<f64>>> = BTreeMap::new();
+        for (k, s) in &self.series {
             if let Scope::Ps(id) = scope {
-                if ps != id {
+                if k.ps != *id {
                     continue;
                 }
             }
             let off = (s.start - self.first_round) as usize;
-            let col = out.entry(name.clone()).or_insert_with(|| vec![None; len]);
+            let max = k.name.ends_with("_max");
+            let sum = sums.entry(k.name.clone()).or_insert_with(|| vec![None; len]);
             for (i, v) in s.values.iter().enumerate() {
-                if v.is_nan() {
-                    continue;
+                if !v.is_nan() {
+                    let (slot, v) = (&mut sum[off + i], *v as f64);
+                    *slot = Some(match *slot {
+                        None => v,
+                        Some(acc) if max => acc.max(v),
+                        Some(acc) => acc + v,
+                    });
                 }
-                let v = *v as f64;
-                let slot = &mut col[off + i];
-                *slot = Some(match (s.agg, *slot) {
-                    (_, None) => v,
-                    (Agg::Sum, Some(acc)) => acc + v,
-                    (Agg::Max, Some(acc)) => acc.max(v),
-                });
             }
         }
         let incomplete: Vec<bool> = self
@@ -202,7 +216,7 @@ impl MetricsStore {
             })
             .collect();
         let mut series = Map::new();
-        for (name, mut vals) in out {
+        for (name, mut vals) in sums {
             for (v, gap) in vals.iter_mut().zip(&incomplete) {
                 if *gap {
                     *v = None;
@@ -213,7 +227,14 @@ impl MetricsStore {
         let ps: Vec<Value> = self
             .ps
             .iter()
-            .map(|(id, st)| json!({"ps_id": id, "last_report_ms": st.last_report_ms, "error": st.error}))
+            .map(|(id, st)| {
+                json!({
+                    "ps_id": id,
+                    "metrics_addr": st.metrics_addr,
+                    "last_ok_ms": st.last_ok_ms,
+                    "error": st.error,
+                })
+            })
             .collect();
         json!({
             "interval_secs": self.interval.as_secs(),
@@ -225,34 +246,71 @@ impl MetricsStore {
     }
 }
 
-/// `autumn_ps_partition_flushes_total` → `flushes`.
-pub fn short_name(name: &str) -> &str {
-    let n = name
-        .strip_prefix("autumn_ps_partition_")
-        .or_else(|| name.strip_prefix("autumn_ps_"))
-        .unwrap_or(name);
+/// `autumn_ps_flushes_total` → `flushes`.
+fn short_name(name: &str) -> &str {
+    let n = name.strip_prefix("autumn_ps_").unwrap_or(name);
     n.strip_suffix("_total").unwrap_or(n)
+}
+
+/// `name{k="v",...} value` (labels optional). Label values here never contain
+/// escaped quotes, but a backslash escape is still honoured.
+fn parse_sample(line: &str) -> Option<Sample> {
+    let (head, value) = line.rsplit_once(' ')?;
+    let value: f64 = value.parse().ok()?;
+    let (name, labels) = match head.split_once('{') {
+        None => (head.to_string(), Vec::new()),
+        Some((name, rest)) => {
+            let body = rest.strip_suffix('}')?;
+            let mut labels = Vec::new();
+            let mut chars = body.chars().peekable();
+            while chars.peek().is_some() {
+                let key: String = chars.by_ref().take_while(|c| *c != '=').collect();
+                if chars.next() != Some('"') {
+                    return None;
+                }
+                let mut val = String::new();
+                loop {
+                    match chars.next()? {
+                        '\\' => val.push(chars.next()?),
+                        '"' => break,
+                        c => val.push(c),
+                    }
+                }
+                labels.push((key.trim_start_matches(',').to_string(), val));
+                if chars.peek() == Some(&',') {
+                    chars.next();
+                }
+            }
+            (name.to_string(), labels)
+        }
+    };
+    Some(Sample { name, labels, value })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn s(name: &str, counter: bool, per_partition: bool, value: f64) -> Sample {
-        Sample { name: name.into(), counter, per_partition, value }
+    const TEXT_A: &str = "\
+# TYPE autumn_ps_block_cache_hits_total counter
+autumn_ps_block_cache_hits_total 100
+# TYPE autumn_ps_sst_tables gauge
+autumn_ps_sst_tables 8
+# TYPE autumn_ps_partition_sst_tables_max gauge
+autumn_ps_partition_sst_tables_max 5
+# TYPE autumn_ps_minor_compactions_total counter
+autumn_ps_minor_compactions_total{trigger=\"flush\"} 2
+# TYPE autumn_ps_get_duration_seconds histogram
+autumn_ps_get_duration_seconds_bucket{le=\"0.0005\"} 10
+autumn_ps_get_duration_seconds_count 10
+";
+
+    /// Another PS's text: 3 more tables, a larger worst partition.
+    fn text_b() -> String {
+        TEXT_A.replace("autumn_ps_sst_tables 8", "autumn_ps_sst_tables 11").replace("_max 5", "_max 9")
     }
 
-    /// Two partitions of one PS: tables 3 and 5, cache hits, a minor counter.
-    fn report(hits: f64, minors: f64) -> Vec<Sample> {
-        vec![
-            s("block_cache_hits", true, false, hits),
-            s("sst_tables", false, true, 3.0),
-            s("sst_tables", false, true, 5.0),
-            s("minor_compactions{trigger=flush}", true, true, minors),
-            s("minor_compactions{trigger=flush}", true, true, 1.0),
-        ]
-    }
-
+    /// The series, rounded to 4 decimals (values are stored as `f32`).
     fn series(v: &Value, name: &str) -> Vec<Option<f64>> {
         let raw: Vec<Option<f64>> = serde_json::from_value(v["series"][name].clone())
             .unwrap_or_else(|_| panic!("no {name}: {v}"));
@@ -260,55 +318,30 @@ mod tests {
     }
 
     #[test]
-    fn a_report_is_summed_over_partitions_and_counters_become_rates() {
+    fn counters_become_rates_and_gauges_read_as_is() {
         let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
         st.begin_round(10_000);
-        st.ingest(1, 9_000, &report(100.0, 1.0));
+        st.ingest(1, 10_000, TEXT_A);
         st.begin_round(20_000);
-        st.ingest(1, 19_000, &report(150.0, 3.0));
-        let q = st.query(&Scope::Ps(1));
-        assert_eq!(series(&q, "block_cache_hits"), vec![None, Some(5.0)]);
-        assert_eq!(series(&q, "minor_compactions{trigger=flush}"), vec![None, Some(0.2)]);
-        assert_eq!(series(&q, "sst_tables"), vec![Some(8.0), Some(8.0)]);
-        assert_eq!(series(&q, "sst_tables:max"), vec![Some(5.0), Some(5.0)]);
+        st.ingest(1, 20_000, &TEXT_A.replace("total 100", "total 150").replace("trigger=\"flush\"} 2", "trigger=\"flush\"} 4"));
+
+        let ps = st.query(&Scope::Ps(1));
+        assert_eq!(series(&ps, "block_cache_hits"), vec![None, Some(5.0)]);
+        assert_eq!(series(&ps, "minor_compactions{trigger=flush}"), vec![None, Some(0.2)]);
+        assert_eq!(series(&ps, "sst_tables"), vec![Some(8.0), Some(8.0)]);
+        assert_eq!(series(&ps, "partition_sst_tables_max"), vec![Some(5.0), Some(5.0)]);
+        assert_eq!(series(&ps, "get_duration_seconds_bucket{le=0.0005}"), vec![None, Some(0.0)]);
     }
 
     #[test]
-    fn the_cluster_view_sums_servers_and_takes_the_largest_partition() {
+    fn a_reset_counter_yields_no_point() {
         let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
-        st.begin_round(10_000);
-        st.ingest(1, 9_000, &report(0.0, 0.0));
-        st.ingest(2, 9_500, &[s("sst_tables", false, true, 9.0)]);
+        for (t, v) in [(10_000u64, "100"), (20_000, "5"), (30_000, "25")] {
+            st.begin_round(t);
+            st.ingest(1, t, &format!("# TYPE autumn_ps_block_cache_hits_total counter\nautumn_ps_block_cache_hits_total {v}\n"));
+        }
         let q = st.query(&Scope::Cluster);
-        assert_eq!(series(&q, "sst_tables"), vec![Some(17.0)]);
-        assert_eq!(series(&q, "sst_tables:max"), vec![Some(9.0)]);
-    }
-
-    #[test]
-    fn a_round_without_a_new_report_is_left_out_of_its_sums() {
-        let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
-        st.begin_round(10_000);
-        st.ingest(1, 9_000, &report(0.0, 0.0));
-        st.ingest(2, 9_000, &[s("sst_tables", false, true, 9.0)]);
-        st.begin_round(20_000);
-        st.ingest(1, 19_000, &report(0.0, 0.0));
-        st.record_failure(2);
-        assert_eq!(series(&st.query(&Scope::Cluster), "sst_tables"), vec![Some(17.0), None]);
-        assert_eq!(series(&st.query(&Scope::Ps(1)), "sst_tables"), vec![Some(8.0), Some(8.0)]);
-        assert_eq!(series(&st.query(&Scope::Ps(2)), "sst_tables"), vec![Some(9.0), None]);
-    }
-
-    #[test]
-    fn a_reset_sum_yields_no_point_and_a_late_series_lines_up() {
-        let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
-        st.begin_round(10_000);
-        st.begin_round(20_000);
-        st.ingest(1, 19_000, &[s("flushes", true, true, 100.0)]);
-        st.begin_round(30_000);
-        st.ingest(1, 29_000, &[s("flushes", true, true, 5.0)]);
-        st.begin_round(40_000);
-        st.ingest(1, 39_000, &[s("flushes", true, true, 25.0)]);
-        assert_eq!(series(&st.query(&Scope::Cluster), "flushes"), vec![None, None, None, Some(2.0)]);
+        assert_eq!(series(&q, "block_cache_hits"), vec![None, None, Some(2.0)]);
     }
 
     #[test]
@@ -316,7 +349,7 @@ mod tests {
         let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(20));
         for t in [0u64, 10_000, 20_000, 30_000] {
             st.begin_round(t);
-            st.ingest(1, t, &report(0.0, 0.0));
+            st.ingest(1, t, TEXT_A);
         }
         let q = st.query(&Scope::Cluster);
         assert_eq!(q["t"], json!([10_000, 20_000, 30_000]));
@@ -324,9 +357,37 @@ mod tests {
     }
 
     #[test]
-    fn short_names() {
-        assert_eq!(short_name("autumn_ps_partition_flushes_total"), "flushes");
-        assert_eq!(short_name("autumn_ps_block_cache_hits_total"), "block_cache_hits");
-        assert_eq!(short_name("autumn_ps_get_duration_seconds_bucket"), "get_duration_seconds_bucket");
+    fn a_round_missing_a_server_is_left_out_of_its_sums() {
+        let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
+        let b = text_b();
+        st.begin_round(10_000);
+        st.ingest(1, 10_000, TEXT_A);
+        st.ingest(2, 10_000, &b);
+        st.begin_round(20_000);
+        st.ingest(1, 20_000, TEXT_A);
+        st.record_failure(2);
+        assert_eq!(series(&st.query(&Scope::Cluster), "sst_tables"), vec![Some(19.0), None]);
+        assert_eq!(series(&st.query(&Scope::Ps(1)), "sst_tables"), vec![Some(8.0), Some(8.0)]);
+        assert_eq!(series(&st.query(&Scope::Ps(2)), "sst_tables"), vec![Some(11.0), None]);
+    }
+
+    #[test]
+    fn a_series_that_starts_late_lines_up_with_the_rounds() {
+        let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
+        st.begin_round(10_000);
+        st.begin_round(20_000);
+        st.ingest(1, 20_000, TEXT_A);
+        assert_eq!(series(&st.query(&Scope::Cluster), "sst_tables"), vec![None, Some(8.0)]);
+    }
+
+    #[test]
+    fn two_servers_add_up_and_a_max_takes_the_larger() {
+        let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
+        st.begin_round(10_000);
+        st.ingest(1, 10_000, TEXT_A);
+        st.ingest(2, 10_000, &text_b());
+        let q = st.query(&Scope::Cluster);
+        assert_eq!(series(&q, "sst_tables"), vec![Some(19.0)]);
+        assert_eq!(series(&q, "partition_sst_tables_max"), vec![Some(9.0)]);
     }
 }

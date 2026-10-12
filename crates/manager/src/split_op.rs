@@ -297,7 +297,6 @@ mod tests {
                     }],
                     ..Default::default()
                 }],
-                block_cache: Default::default(),
             })
         };
         m.split_inflight.borrow_mut().insert(5);

@@ -2228,6 +2228,14 @@ impl crate::AutumnManager {
                     }
                     DfEchoAction::Ok => {}
                 }
+                {
+                    let mut s = self.store.inner.borrow_mut();
+                    if df.metrics_addr.is_empty() {
+                        s.en_metrics_addrs.remove(&node.node_id);
+                    } else if s.en_metrics_addrs.get(&node.node_id) != Some(&df.metrics_addr) {
+                        s.en_metrics_addrs.insert(node.node_id, df.metrics_addr.clone());
+                    }
+                }
 
                 // A successful df proves the NODE reachable, and carries what
                 // the node says about each of its DISKS. Apply the per-disk
@@ -2241,11 +2249,6 @@ impl crate::AutumnManager {
                 // dead disk still answers df, so the manager overwrote the
                 // one fact that would have repaired it.
                 self.apply_df_disk_health(node, &df.disk_status);
-                self.fleet_metrics.borrow_mut().record_node(
-                    Self::now_s_ms().1 as u64,
-                    node.node_id,
-                    &df,
-                );
                 // ENOSPC-1: stash the node's max per-disk free for the
                 // allocation free-space soft filter.
                 //
@@ -4331,7 +4334,6 @@ mod df_disk_health_tests {
             free: 500,
             online,
             extent_bytes: 500,
-            full: false,
         }
     }
 

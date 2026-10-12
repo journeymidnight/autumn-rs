@@ -27,7 +27,7 @@ def ports():
         base = random.randrange(22000, 50000)
         sockets = []
         try:
-            for offset in (1, 101, 1101, 201, 301, 401, 402):
+            for offset in (1, 101, 1101, 201, 301, 401, 402, 601, 701, 801):
                 s = socket.socket()
                 sockets.append(s)
                 s.bind(('127.0.0.1', base + offset))
@@ -56,7 +56,9 @@ def eventually(fn, timeout=30):
 
 def run():
     base = ports()
-    mgr, en, ps, dash, etcd = [base + n for n in (1, 101, 201, 301, 401)]
+    mgr, en, ps, dash, etcd, mgr_metrics = [base + n for n in (1, 101, 201, 301, 401, 801)]
+    # A PS or EN serves /metrics on its service port + 500 unless told otherwise.
+    en_metrics, ps_metrics = en + 500, ps + 500
     address = f'127.0.0.1:{mgr}'
     children, logs = [], []
     with tempfile.TemporaryDirectory(prefix='autumn-dashboard-') as tmp:
@@ -98,7 +100,8 @@ def run():
                 '--initial-cluster', f'dashboard-test=http://127.0.0.1:{etcd+1}'])
             eventually(lambda: ready(etcd))
             manager = spawn('manager', [str(BIN/'autumn-manager-server'), '--port', str(mgr), '--listen', '127.0.0.1',
-                '--cluster-secret-file', str(secret), '--manager-id', '1', '--etcd', f'127.0.0.1:{etcd}'])
+                '--cluster-secret-file', str(secret), '--manager-id', '1', '--etcd', f'127.0.0.1:{etcd}',
+                '--metrics-port', str(mgr_metrics)])
             eventually(lambda: ready(mgr))
             # Read-only status proves that leader election/replay finished.
             def leader():
@@ -150,32 +153,40 @@ def run():
             server = v['ps_servers'][0]
             assert {'ps_id','addr','last_heartbeat_secs_ago','partition_count','n','size','req_per_sec','write_bytes_per_sec','read_bytes_per_sec','total_extents','open_count','ready'} <= server.keys()
             assert server['last_heartbeat_secs_ago'] is not None and server['last_heartbeat_secs_ago'] < 60
-            # PS and EN metrics reach the manager on their reports; autumn-op
-            # reads them from the leader, and the dashboard polls that.
-            def fleet():
-                fams = {f['name']: f['samples'] for f in op('metrics')['families']}
-                return fams if fams.get('autumn_ps_partition_sst_tables') and fams.get('autumn_en_extents') else None
-            fams = eventually(fleet)
-            for name in ('autumn_ps_block_cache_hits_total', 'autumn_ps_block_cache_capacity_bytes',
-                         'autumn_ps_partition_sst_tables', 'autumn_ps_partition_memtable_bytes',
-                         'autumn_ps_partition_flushes_total', 'autumn_ps_partition_minor_compactions_total',
-                         'autumn_ps_partition_compaction_write_bytes_total', 'autumn_ps_partition_get_sst_checks_total',
-                         'autumn_ps_partition_vp_reads_total', 'autumn_ps_partition_write_bytes_total',
-                         'autumn_ps_get_duration_seconds', 'autumn_en_append_bytes_total', 'autumn_en_disk_full'):
-                assert name in fams, name
-            text = subprocess.run([str(BIN / 'autumn-op'), '--manager', address, '--cluster-secret-file', str(secret),
-                'metrics'], capture_output=True, text=True, timeout=15, check=True).stdout
-            assert '# TYPE autumn_ps_partition_sst_tables gauge' in text and 'autumn_en_extents{node=' in text, text[:500]
+            # The PS reports its /metrics address on its heartbeat; the
+            # dashboard scrapes it and serves the history.
+            eventually(lambda: http('/api/overview')['ps_servers'][0].get('metrics_addr') == f'127.0.0.1:{ps_metrics}')
+            def scrape(port, path='/metrics'):
+                with urllib.request.urlopen(f'http://127.0.0.1:{port}{path}', timeout=5) as r:
+                    return r.read().decode()
+            text = scrape(ps_metrics)
+            for name in ('autumn_ps_partitions', 'autumn_ps_block_cache_hits_total', 'autumn_ps_block_cache_capacity_bytes',
+                         'autumn_ps_sst_tables', 'autumn_ps_partition_sst_tables_max', 'autumn_ps_memtable_bytes',
+                         'autumn_ps_flushes_total', 'autumn_ps_minor_compactions_total',
+                         'autumn_ps_compaction_write_bytes_total', 'autumn_ps_get_sst_checks_total',
+                         'autumn_ps_vp_reads_total', 'autumn_ps_write_bytes_total', 'autumn_ps_get_duration_seconds'):
+                assert f'# TYPE {name} ' in text, name
+            assert 'part=' not in text and 'ps=' not in text, 'PS series carry no partition or ps label'
+            assert '# TYPE autumn_en_append_bytes_total ' in scrape(en_metrics)
+            # The manager's http_sd lists both, once the EN's df answer carried its address.
+            def sd():
+                groups = json.loads(scrape(mgr_metrics, '/sd'))
+                return groups if len(groups) == 2 else None
+            assert eventually(sd) == [
+                {'targets': [f'127.0.0.1:{ps_metrics}'], 'labels': {'autumn_role': 'ps', 'ps_id': '1'}},
+                {'targets': [f'127.0.0.1:{en_metrics}'], 'labels': {'autumn_role': 'en', 'node_id': str(v['nodes'][0]['node_id'])}},
+            ]
             def history():
                 m = http('/api/metrics')
-                return m if len(m['t']) >= 3 and (m['series'].get('block_cache_capacity_bytes') or [None])[-1] else None
+                return m if len(m['t']) >= 3 and m['series'].get('block_cache_capacity_bytes', [None])[-1] else None
             m = eventually(history)
-            assert [p['ps_id'] for p in m['ps']] == [1] and m['ps'][0]['error'] is None, m['ps']
+            assert m['ps'] == [{'ps_id': 1, 'metrics_addr': f'127.0.0.1:{ps_metrics}', 'last_ok_ms': m['ps'][0]['last_ok_ms'], 'error': None}], m['ps']
             assert m['series']['block_cache_capacity_bytes'][-1] == 512 * 1024 * 1024
             assert len(m['series']['sst_tables']) == len(m['t'])
-            assert 'sst_tables' in http('/api/metrics?scope=ps&id=1')['series']
-            http('/api/metrics?scope=ps', expected=400)
+            ps_view = http('/api/metrics?scope=ps&id=1')
+            assert ps_view['series']['block_cache_capacity_bytes'][-1] == 512 * 1024 * 1024
             http(f"/api/metrics?scope=part&id={v['partitions'][0]['part_id']}", expected=400)
+            http('/api/metrics?scope=ps', expected=400)
             disks = v['nodes'][0]['disks']
             assert len(disks) == 2 and len({d['disk_id'] for d in disks}) == 2
             assert all(d['reported'] and d['online'] and not d['faulted'] and d['total'] > 0 and d['uuid'] for d in disks)
@@ -223,7 +234,7 @@ def run():
             manager.terminate(); manager.wait(timeout=10)
             http('/api/policies', expected=502)
             http('/api/policies/activate', {'enabled':True}, expected=502)
-            print('dashboard API contract OK: page, topology, fleet metrics + history, disks, detail, durable ops, policy lifecycle, validation, upstream failures')
+            print('dashboard API contract OK: page, topology, PS metrics history, disks, detail, durable ops, policy lifecycle, validation, upstream failures')
         except BaseException:
             for log in logs:
                 log.flush()

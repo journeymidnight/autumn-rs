@@ -97,7 +97,6 @@ rm -rf "$DATA_ROOT" /tmp/autumn-rs /tmp/autumn-rs-logs
 env AUTUMN_DATA_ROOT="$DATA_ROOT" \
     AUTUMN_BOOTSTRAP_PRESPLIT="1:normal" \
     AUTUMN_TRANSPORT=tcp \
-    \
     AUTUMN_EXTENT_BASE_PORT=20000 \
     bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" \

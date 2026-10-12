@@ -123,11 +123,11 @@ const POLICIES = {
                switches: { split: false, ec: false, compact: false, gc: true, merge: false, rebalance: false } }],
   switch_order: ["split", "ec", "compact", "gc", "merge", "rebalance", "repair", "scrub"],
 };
-// /api/metrics: three rounds; PS 2 stopped reporting.
+// /api/metrics: three rounds; PS 2 reports no endpoint.
 const T0 = Date.now() - 20000;
 const METRICS_SERIES = {
   requests: [10, 12, 11], write_bytes: [1048576, 2097152, 1048576], read_bytes: [0, 4096, 8192],
-  sst_tables: [6, 7, 5], "sst_tables:max": [4, 4, 3],
+  sst_tables: [6, 7, 5], partition_sst_tables_max: [4, 4, 3],
   "minor_compactions{trigger=flush}": [null, 0.1, 0],
   get_duration_seconds_sum: [0.001, 0.002, 0.003], get_duration_seconds_count: [10, 10, 10],
   "get_duration_seconds_bucket{le=0.0005}": [5, 5, 5], "get_duration_seconds_bucket{le=0.001}": [10, 10, 10],
@@ -135,13 +135,12 @@ const METRICS_SERIES = {
 const METRICS = {
   interval_secs: 10, retention_secs: 3600, t: [T0, T0 + 10000, T0 + 20000],
   series: Object.assign({ block_cache_hits: [null, 2, 3], block_cache_misses: [null, 2, 1] }, METRICS_SERIES),
-  ps: [{ ps_id: 1, last_report_ms: T0 + 20000, error: null },
-       { ps_id: 2, last_report_ms: T0, error: "no new report for 20 s" }],
+  ps: [{ ps_id: 1, metrics_addr: "127.0.0.1:9701", last_ok_ms: T0 + 20000, error: null },
+       { ps_id: 2, metrics_addr: null, last_ok_ms: null, error: "no /metrics endpoint reported" }],
 };
-const METRICS_PS = Object.assign({}, METRICS, { series: METRICS_SERIES });
 const payload = { "/api/overview": OVERVIEW, "/api/ops": OPS, "/api/policies": POLICIES, "/api/metrics": METRICS };
 const fetchStub = async p => ({ ok: true, json: async () =>
-  p.startsWith("/api/metrics?scope=ps") ? METRICS_PS : payload[p] ?? PART });
+  p.startsWith("/api/metrics?scope=ps") ? METRICS : payload[p] ?? PART });
 
 const api = new Function(
   "document", "location", "window", "fetch", "setInterval", "clearInterval", "setTimeout", "confirm",
@@ -156,9 +155,11 @@ const settle = () => new Promise(r => setTimeout(r, 30));
     await settle();
   }
   const clusterCharts = nodes.m_charts.innerHTML;
-  nodes.m_scope.onchange({ target: { value: "ps:1" } });
+  const clusterHot = nodes.m_hot.innerHTML;
+  const scopes = nodes.m_scope.innerHTML;
+  nodes.m_scope.onchange({ target: { value: "ps:2" } });
   await settle();
-  const psCharts = nodes.m_charts.innerHTML;
+  const ps2Hot = nodes.m_hot.innerHTML;
   await api.openDetail(1);
   api.openNode(2);
   const deadNodeDrawer = nodes.nodedrawer.innerHTML;
@@ -227,13 +228,12 @@ const settle = () => new Promise(r => setTimeout(r, 30));
   has(clusterCharts, '<path d="M', "a series is drawn as a line");
   has(clusterCharts, "Block cache hit ratio <b>75.0%</b>", "the cluster view derives the cache hit ratio");
   has(clusterCharts, "minor · flush", "minor compactions are split by trigger");
-  has(psCharts, "SST tables", "a PS view charts its tables");
-  want("#m_scope", "ps:2", "partition servers are selectable scopes");
-  if ((nodes.m_scope.innerHTML || "").includes("part:")) {
-    console.error("FAIL #m_scope: partitions are not a scope"); bad++;
-  }
-  want("#m_endpoints", "1/2 partition servers reporting", "the reporter line counts reporting servers");
-  want("#m_endpoints", "PS 2: no new report for 20 s", "…and names the one that stopped");
+  has(clusterHot, "#1</a>", "the hottest partitions list the busy one");
+  if (clusterHot.includes("#2</a>")) { console.error("FAIL #m_hot: an idle partition is listed as hot"); bad++; }
+  has(ps2Hot, "no load reported", "a server scope lists only its own partitions");
+  if (scopes.includes("part:")) { console.error("FAIL #m_scope: partitions are not metrics scopes"); bad++; }
+  want("#m_endpoints", "1/2 partition servers scraped", "the endpoint line counts scraped servers");
+  want("#m_endpoints", "PS 2: no /metrics endpoint reported", "…and names the one that could not be");
   console.log(bad ? `tabs smoke FAILED (${bad})` : "tabs smoke OK — seven tabs + both drawers render");
   process.exit(bad ? 1 : 0);
 })();
