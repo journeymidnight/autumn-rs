@@ -1,6 +1,6 @@
 //! policy engine unit tests.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::store::MetadataState;
 use autumn_rpc::manager_rpc::{
@@ -1047,7 +1047,7 @@ fn ec_advisory_fires_for_large_sealed_unconverted_extent() {
     mk_stream(&mut state, 100, (3, 1), &[1001]);
     mk_extent(&mut state, 1001, EC_MIN_EXTENT_BYTES * 2, false);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, 999);
+    let out = eng.compute_ec_advisory(&state, &HashSet::new(), &all_health(), 999);
     assert_eq!(out.len(), 1, "expected one EC candidate: {out:?}");
     let c = &out[0];
     assert_eq!(c.kind, POLICY_KIND_EC);
@@ -1067,7 +1067,7 @@ fn ec_advisory_suppresses_small_extents() {
     // Above threshold — should be advised.
     mk_extent(&mut state, 1003, EC_MIN_EXTENT_BYTES + 1, false);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, 0);
+    let out = eng.compute_ec_advisory(&state, &HashSet::new(), &all_health(), 0);
     assert_eq!(out.len(), 1, "small extent filtered out: {out:?}");
     assert_eq!(out[0].secondary_part_id, 1003);
 }
@@ -1079,7 +1079,7 @@ fn ec_advisory_skips_converted() {
     mk_stream(&mut state, 102, (3, 1), &[1004]);
     mk_extent(&mut state, 1004, EC_MIN_EXTENT_BYTES * 4, true);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, 0);
+    let out = eng.compute_ec_advisory(&state, &HashSet::new(), &all_health(), 0);
     assert!(
         out.is_empty(),
         "ec_converted=true should be skipped: {out:?}"
@@ -1095,7 +1095,7 @@ fn ec_advisory_skips_non_ec_streams() {
     mk_stream(&mut state, 103, (0, 0), &[1005]);
     mk_extent(&mut state, 1005, EC_MIN_EXTENT_BYTES * 4, false);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, 0);
+    let out = eng.compute_ec_advisory(&state, &HashSet::new(), &all_health(), 0);
     assert!(
         out.is_empty(),
         "non-EC stream should not be advised: {out:?}"
@@ -1110,8 +1110,35 @@ fn ec_advisory_skips_empty_extents() {
     mk_stream(&mut state, 104, (3, 1), &[1006]);
     mk_extent(&mut state, 1006, 0, false);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, 0);
+    let out = eng.compute_ec_advisory(&state, &HashSet::new(), &all_health(), 0);
     assert!(out.is_empty(), "sealed_length=0 should be skipped: {out:?}");
+}
+
+fn all_health() -> crate::node_class::Classes {
+    crate::node_class::Classes::_test_health(0..100, [])
+}
+
+/// EC advisory skips what a submit would refuse: an extent with an op in
+/// flight, a replica on an abnormal node (83 is unregistered here, i.e.
+/// `Fence`), and a replica on a disk its node reports Faulted (disk 4).
+#[test]
+fn ec_advisory_skips_busy_extents_and_abnormal_replicas() {
+    let mut state = MetadataState::default();
+    mk_stream(&mut state, 105, (3, 1), &[1007, 1008, 1009, 1010]);
+    for eid in [1007, 1008, 1009, 1010] {
+        mk_extent(&mut state, eid, EC_MIN_EXTENT_BYTES * 2, false);
+    }
+    state.extents.get_mut(&1008).unwrap().replicates = vec![1, 3, 83];
+    state.extents.get_mut(&1008).unwrap().replicate_disks = vec![20, 22, 24];
+    state.extents.get_mut(&1009).unwrap().replicates = vec![7, 9, 11];
+    state.extents.get_mut(&1009).unwrap().replicate_disks = vec![30, 32, 34];
+    // 1010 keeps 1/3/5 on disks 2/4/6: disk 4 is the Faulted one.
+    let busy: HashSet<u64> = [1007].into();
+    let classes = crate::node_class::Classes::_test_health([1, 3, 5, 7, 9, 11], [4]);
+    let eng = PolicyEngine::default();
+    let out = eng.compute_ec_advisory(&state, &busy, &classes, 0);
+    let ids: Vec<u64> = out.iter().map(|c| c.secondary_part_id).collect();
+    assert_eq!(ids, vec![1009], "only the free extent on usable disks: {out:?}");
 }
 
 // ── Region-rebalance Phase B: compute_rebalance_advisory ───────────────────

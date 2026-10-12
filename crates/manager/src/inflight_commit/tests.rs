@@ -234,6 +234,7 @@ fn recovery_response_delayed_past_same_assignment_reissue_keeps_successor() {
 fn ec_response_delayed_past_same_assignment_reissue_keeps_successor() {
     run(async {
         let manager = AutumnManager::new();
+        manager._test_register_health_nodes([1, 3, 5, 7]);
         manager.store.inner.borrow_mut().nodes.insert(
             9,
             NodeRecord {
@@ -297,6 +298,7 @@ fn ec_response_delayed_past_same_assignment_reissue_keeps_successor() {
 fn ec_request_delayed_past_same_assignment_reissue_is_refused() {
     run(async {
         let manager = AutumnManager::new();
+        manager._test_register_health_nodes([1, 3, 5, 7]);
         manager.store.inner.borrow_mut().nodes.insert(
             9,
             NodeRecord {

@@ -92,33 +92,27 @@ impl AutumnManager {
             .nodes
             .get(&task.node_id)
             .ok_or_else(|| AppError::NotFound("recovery target node".into()))?;
+        // A `Suspend` target passes: right after a failover every node is one,
+        // and its recovery waits for its first df rather than being retired.
         if !ex.sealed
             || Self::extent_nodes(ex).contains(&task.node_id)
-            || self.node_overrides.borrow().contains_key(&task.node_id)
-            || self.decommissioned.borrow().contains_key(&task.node_id)
-            || self
-                .node_states
-                .borrow()
-                .state_of(task.node_id)
-                .is_suspected()
+            || self.node_class_of(task.node_id).is_abnormal()
         {
             return Err(AppError::Precondition(
                 "recovery source or target is unavailable".into(),
             ));
         }
+        // By disk class, not the disk record's `online` bit: that drops on a
+        // single df timeout, which says nothing about the disk.
         let disks = node
             .disks
             .iter()
-            .filter_map(|id| {
-                s.disks
-                    .get(id)
-                    .filter(|d| d.online)
-                    .map(|d| (*id, d.uuid.clone()))
-            })
+            .filter(|&&id| !self.disk_class_of(task.node_id, id).is_abnormal())
+            .filter_map(|id| s.disks.get(id).map(|d| (*id, d.uuid.clone())))
             .collect::<Vec<_>>();
         if disks.is_empty() {
             return Err(AppError::Precondition(
-                "recovery target has no online disk".into(),
+                "recovery target has no usable disk".into(),
             ));
         }
         Ok(RecoveryRecord {

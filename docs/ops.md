@@ -2072,6 +2072,41 @@ a 4.5 GiB sealed extent, whose 4+1 shard is 1.125 GiB — big enough that a
 rebuild takes long enough to watch, and small enough to fit twice on a 40 GiB
 scratch disk.
 
+## Node classes: what a node or disk may take part in
+
+Every extent-work path (allocation, recovery, EC, scrub) judges a node by one
+class (`crates/manager/src/node_class.rs`,
+`docs/extent_op_arbitration_design.md` §1), built from its auto-state and its
+override:
+
+| `list-nodes` shows | class | new data | work it is in | its copies |
+|---|---|---|---|---|
+| Online, no override | health | yes | continues | stay |
+| Suspend (not heard from since registration or since this manager became leader) | suspend | no | waits for its first df | stay |
+| Suspected, or override maintenance | suspected | no | **cancelled** | Suspected: moved on a repair request (the `repair` policy files one after the grace); maintenance: moved only if you run `autumn-op repair` |
+| override fenced, or removed | fence | no | **cancelled** | moved at once |
+
+A disk takes its node's class, except that a disk its node reports Faulted is
+fence (its copies move) and one it reports Full takes no new data. A df that
+merely times out says nothing about the disks.
+
+Maintenance means "this node is coming back": nothing is rebuilt off it by
+policy, so the extents with a copy there run one copy short for as long as the
+override stands. `autumn-op maintenance` on a fenced node is refused — clear the
+fence first with `autumn-op unfence` (a node carries one override).
+
+A registered node that never answers a df becomes Suspected after the soft
+timeout (10 s), with no last heartbeat: that empty heartbeat is what tells
+"never started" from "was running and stopped". Right after a manager failover
+every node shows Suspend for one df round (~2 s); nothing is cancelled then.
+
+**Manual check** (any running cluster): `autumn-op maintenance <id> --reason x
+--by you` on a node holding replicas, then `autumn-op ops list --active` — any
+recovery executing on it and any EC conversion targeting it closes FAILED within
+a few seconds, naming the node; `autumn-op fence-node <id> --reason x --by you
+--force` followed by `autumn-op maintenance <id> --reason x --by you` is refused
+(PRECONDITION) and `list-nodes` still shows it fenced.
+
 ## Node decommission runbook (fence → drain → remove)
 
 Retiring an EN is operator-driven (HDFS-decommission style). The manager never
@@ -2208,7 +2243,7 @@ MUST forward the control port alongside the data port, or every df fails
 silently: recoveries complete on the target ENs but are never applied, the
 fenced node's slots never rewrite, and `remove` blocks forever while
 `extent-health` shows the same blocking extents each probe. Symptoms of this
-wiring failure: all nodes stuck in `Suspend` state (`list-nodes`), and
+wiring failure: all nodes `Suspected` with no last heartbeat (`list-nodes`), and
 `recovery-stats` re-dispatching the same extent to a new candidate every
 stale-sweep interval until every candidate refuses `extent already exists`
 (re-dispatch to a candidate holding a verified-complete copy self-heals by
@@ -4733,11 +4768,11 @@ find <data-dir> -name 'extent-<ID>.*' -printf '%f(%s) '
 **If a conversion never reaches `succeeded`:**
 
 - `ops list --kind ec` carries the last failure reason and an attempt count.
-- A marker whose coordinator went offline is released automatically and
-  re-derived onto a live node — "gone" means absent from the cluster or
-  `Suspected`, NOT merely "not Online" (a freshly registered node is `Suspend`
-  until its first `df`, and abandoning on that would make any conversion longer
-  than one tick impossible).
+- A marker any of whose targets — or the disk a target writes to — is
+  suspected, in maintenance, fenced or gone is cancelled automatically (the op
+  closes FAILED naming the node or disk), and the auto-policy proposes the
+  extent again once its replicas are usable. A `Suspend` node (not heard from
+  yet) is waited for, not cancelled on.
 - A completion report from a superseded attempt is refused by nonce, logged as
   `ec_done is from a DIFFERENT conversion attempt than the live marker`. That is
   the system protecting itself, not an error to chase.

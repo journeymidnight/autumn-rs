@@ -226,86 +226,63 @@ pub(crate) fn classify_recovery_completion(
 }
 
 impl AutumnManager {
-    /// Release markers whose pinned executor can no longer run them — both
-    /// Recovery (its target) and ConvertToEc (its coordinator).
+    /// Cancel every marker that depends on an abnormal node (class `Suspected`
+    /// or `Fence`): a Recovery on its executor, a ConvertToEc on any of its
+    /// targets — each one receives a shard. The owner writes the next attempt
+    /// from the state at that time: the recovery tick, or the auto-policy /
+    /// an operator for EC.
     ///
-    /// This is the event that ends a marker's life when completion never comes.
-    /// It is evaluated LEVEL-TRIGGERED — re-derived from live node state every
-    /// tick rather than hooked onto the fence/remove/suspect transitions — so it
-    /// cannot miss an edge, needs no bookkeeping in three handlers, and
-    /// re-converges after a leader failover that never saw the transition.
+    /// LEVEL-TRIGGERED — re-derived from live node state every tick rather
+    /// than hooked onto the fence / maintenance / suspect transitions — so it
+    /// cannot miss an edge and re-converges after a leader failover. A
+    /// `Suspend` node is not abnormal: right after a failover every node is
+    /// one, and its work waits for its first df.
     ///
-    /// Safe unconditionally, and for the same reason in both cases: nothing is
-    /// committed until the manager applies it, so releasing only discards an
-    /// ATTEMPT. If the executor was in fact still working and finishes later,
-    /// its completion is refused — recovery for want of a marker, EC for want
-    /// of a matching attempt nonce — and the next tick re-derives the work.
+    /// Safe unconditionally: nothing is committed until the manager applies
+    /// it, so cancelling discards an ATTEMPT. A late completion is refused —
+    /// recovery for want of a marker, EC for want of a matching attempt nonce.
     ///
-    /// EC could not be released this way under the old scheme: a coordinator
-    /// that had begun renaming shards over `.dat` left a middle state nobody
-    /// could classify, so abandoning it risked destroying the last full
-    /// replicas. Now the shards are additive files no reader is pointed at,
-    /// so a released attempt costs only the space until cleanup, and the
-    /// successor is free to pick a completely different assignment.
-    ///
-    /// Returns the extents whose markers were released (for tests/diagnostics).
-    pub(crate) async fn release_recovery_markers_for_dead_executors(&self) -> Vec<u64> {
-        let dead: Vec<(u64, u64)> = {
-            let states = self.node_states.borrow();
-            let nodes = self.store.inner.borrow();
-            // "Cannot run it any more" is NOT "is not Online". A freshly
-            // registered node sits in `Suspend` until its first df — it has
-            // simply not been proven yet, and abandoning its attempt every tick
-            // means a conversion that takes longer than one tick can never
-            // finish. The states that mean it will not finish on its own are:
-            // gone from the cluster, or `Suspected` (it WAS alive and stopped
-            // answering). Fenced / decommissioned nodes are handled by their
-            // own sweeps, which also quarantine the work.
-            let is_gone = |node_id: u64| {
-                !nodes.nodes.contains_key(&node_id) || states.state_of(node_id).is_suspected()
-            };
-            self.inflight
-                .borrow()
-                .values()
-                .filter_map(|rec| match rec.unpack() {
-                    Some((_, crate::extent_inflight::ExtentOpPayload::ConvertToEc(p))) => {
-                        // The coordinator drives the whole conversion; if it is
-                        // gone, the attempt is not going to finish.
-                        let coord = params_coordinator(&p)?;
-                        is_gone(coord).then_some((p.extent_id, coord))
-                    }
-                    Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) => {
-                        let gone = is_gone(t.node_id);
-                        gone.then_some((t.extent_id, t.node_id))
-                    }
-                    _ => None,
-                })
-                .collect()
-        };
-        let mut released = Vec::new();
-        for (extent_id, node_id) in dead {
-            match self
-                .drain_extent_inflight_marker(extent_id, "its pinned executor is no longer online")
-                .await
-            {
+    /// Returns the extents whose markers were cancelled (for tests/diagnostics).
+    pub(crate) async fn cancel_markers_on_abnormal_nodes(&self) -> Vec<u64> {
+        let classes = self.classes();
+        let store = self.store.inner.borrow();
+        // (extent, node, kind, attempt nonce, reason)
+        let doomed: Vec<(u64, u64, crate::extent_inflight::ExtentOpKind, u64, String)> = self
+            .inflight
+            .borrow()
+            .values()
+            .filter_map(|rec| match rec.unpack()? {
+                (kind, crate::extent_inflight::ExtentOpPayload::ConvertToEc(p)) => {
+                    let ex = store.extents.get(&p.extent_id);
+                    ec_target_disks(ex, &p).into_iter().find_map(|(n, d)| {
+                        let why = abnormal_target(&classes, n, d)?;
+                        Some((p.extent_id, n, kind, why))
+                    })
+                }
+                (kind, crate::extent_inflight::ExtentOpPayload::Recovery(t)) => {
+                    let why = abnormal_target(&classes, t.node_id, None)?;
+                    Some((t.extent_id, t.node_id, kind, why))
+                }
+                _ => None,
+            })
+            .map(|(eid, node, kind, why)| (eid, node, kind, self.extent_inflight_nonce(eid), why))
+            .collect();
+        drop(store);
+        let mut cancelled = Vec::new();
+        for (extent_id, node_id, kind, nonce, reason) in doomed {
+            match self.drain_attempt(extent_id, nonce, &reason).await {
                 Ok(()) => {
-                    tracing::info!(
-                        extent_id,
-                        node_id,
-                        "released marker: its pinned executor is no longer online \
-                         — re-derivation will pick a live one"
-                    );
-                    released.push(extent_id);
+                    tracing::info!(extent_id, node_id, ?kind, "cancelled marker: {reason}");
+                    cancelled.push(extent_id);
                 }
                 Err(e) => tracing::warn!(
                     extent_id,
                     node_id,
-                    "could not release the marker of a dead executor \
-                     (retried next tick): {e}"
+                    "could not cancel the marker on an abnormal node (retried next tick): {e}"
                 ),
             }
         }
-        released
+        cancelled
     }
 
     /// Release work whose source slot is healthy again (for example after
@@ -378,14 +355,21 @@ impl AutumnManager {
                     } else {
                         ex.parity_disks.get(slot - ex.replicates.len())
                     };
-                    let disk_faulted =
-                        disk_id.is_some_and(|id| self.faulted_disks.borrow().contains(id));
+                    let slot_fence = match disk_id {
+                        Some(&d) => {
+                            self.disk_class_of(task.replace_id, d)
+                                == crate::node_class::DiskClass::Fence
+                        }
+                        None => {
+                            self.node_class_of(task.replace_id)
+                                == crate::node_class::NodeClass::Fence
+                        }
+                    };
                     // `None` is "no disk record", not "offline".
                     let disk_online = disk_id.and_then(|id| s.disks.get(id)).map(|d| d.online);
                     let verdict = slot_verdict(
-                        self.node_overrides.borrow().contains_key(&task.replace_id),
+                        slot_fence,
                         self.slot_is_corrupt(extent_id, slot),
-                        disk_faulted,
                         self.slot_repair_requested(extent_id, slot),
                     );
                     s.nodes.contains_key(&task.replace_id)
@@ -549,14 +533,15 @@ impl AutumnManager {
     /// The hard constraints are applied BEFORE scoring, so scoring never gets
     /// the chance to overrule them: a node already holding a slot of this
     /// extent (`occupied` — two slots on one node quietly costs a replica's
-    /// worth of fault tolerance) and a fenced / maintenance / suspected node
-    /// (`hard_excluded` — rebuilding onto one only makes work to migrate off).
-    fn recovery_candidate_order(
+    /// worth of fault tolerance) and any node whose class is not `Health`
+    /// (rebuilding onto one only makes work to migrate off, or waits on a node
+    /// not yet heard from).
+    pub(crate) fn recovery_candidate_order(
         &self,
         extent_id: u64,
     ) -> Result<(ExtentRecord, Vec<NodeRecord>), AppError> {
         // Both read RefCells disjoint from the store; taken before its borrow.
-        let hard_excluded = self.placement_excluded_node_ids();
+        let classes = self.classes();
         let placement_load = self.placement_load();
         let (extent, all) = {
             let s = self.store.inner.borrow();
@@ -572,7 +557,7 @@ impl AutumnManager {
                 .nodes
                 .values()
                 .filter(|n| !occupied.contains(&n.node_id))
-                .filter(|n| !hard_excluded.contains(&n.node_id))
+                .filter(|n| classes.takes_new_data(n))
                 .cloned()
                 .collect::<Vec<_>>();
             (extent, all)
@@ -617,12 +602,20 @@ impl AutumnManager {
             None => {}
         }
 
-        // never rebuild a replica onto a fenced / maintenance /
-        // suspected node — that would just create more work to migrate off.
-        // Captured before the store borrow (disjoint RefCells).
+        // Only onto a node that takes new data (`Classes::takes_new_data`).
         let (extent, candidates) = self.recovery_candidate_order(extent_id)?;
 
         if candidates.is_empty() {
+            // Right after a promotion every node is `Suspend` until its first
+            // df: no target YET is not a failed dispatch, so no backoff.
+            if self
+                .classes()
+                .nodes
+                .values()
+                .any(|c| *c == crate::node_class::NodeClass::Suspend)
+            {
+                return Ok(DispatchOutcome::Deferred);
+            }
             return Err(AppError::Precondition(
                 "no candidate node for recovery".to_string(),
             ));
@@ -718,7 +711,7 @@ impl AutumnManager {
                     // on the next tick and the EN-side check will idempotently
                     // refuse the duplicate.
                     if let Err(e) = self
-                        .drain_recovery_dispatch(
+                        .drain_attempt(
                             extent.extent_id,
                             dispatched_nonce,
                             "dispatch RPC failed",
@@ -746,7 +739,7 @@ impl AutumnManager {
                 Ok(v) => v,
                 Err(_) => {
                     if let Err(e) = self
-                        .drain_recovery_dispatch(
+                        .drain_attempt(
                             extent.extent_id,
                             dispatched_nonce,
                             "the dispatch response was undecodable",
@@ -772,7 +765,7 @@ impl AutumnManager {
                 // recovery_inflight conflict). Release marker
                 // and try next candidate.
                 if let Err(e) = self
-                    .drain_recovery_dispatch(
+                    .drain_attempt(
                         extent.extent_id,
                         dispatched_nonce,
                         "the target refused the rebuild",
@@ -853,7 +846,9 @@ impl AutumnManager {
         ))
     }
 
-    async fn drain_recovery_dispatch(
+    /// Cancel the attempt `nonce` on `extent_id` — and only it: a successor
+    /// written since is left alone.
+    pub(crate) async fn drain_attempt(
         &self,
         extent_id: u64,
         nonce: u64,
@@ -861,7 +856,7 @@ impl AutumnManager {
     ) -> Result<(), AppError> {
         if self.extent_inflight_nonce(extent_id) != nonce {
             return Err(AppError::Precondition(
-                "recovery dispatch belongs to a released attempt".into(),
+                "the attempt was already released".into(),
             ));
         }
         self.drain_extent_inflight_marker(extent_id, reason).await
@@ -1476,15 +1471,13 @@ impl AutumnManager {
         // overrides before the dispatch decision. Cheap.
         self.tick_maintenance_ttl().await;
 
-        // snapshot operator overrides so the body's fenced-gate
-        // decision is consistent within this tick. (The node auto-state
-        // snapshot was dead — recovery dispatch gates on Fenced only;
-        // Suspected/Maintenance are consulted by the EC dispatch loop, not
-        // here — so it was removed.)
-        let overrides = self.node_overrides.borrow().clone();
+        // One class snapshot for the tick, so every slot's fence verdict agrees.
+        // Only `Fence` rebuilds by itself; a `Suspected` node's copies move on a
+        // repair request.
+        let classes = self.classes();
         let now_s = Self::epoch_seconds();
 
-        self.release_recovery_markers_for_dead_executors().await;
+        self.cancel_markers_on_abnormal_nodes().await;
         self.release_recovery_markers_for_healthy_slots().await;
         self.resend_pinned_recovery_markers().await;
 
@@ -1567,10 +1560,6 @@ impl AutumnManager {
                 let bit = 1u32 << slot;
                 let node = nodes.get(&node_id).cloned();
 
-                let is_fenced = matches!(
-                    overrides.get(&node_id).map(|o| o.kind),
-                    Some(NODE_OVERRIDE_FENCED)
-                );
                 let is_corrupt = self.slot_is_corrupt(ex.extent_id, slot);
                 // Which disk holds THIS slot, per the extent's own layout.
                 let disk_id = if slot < ex.replicate_disks.len() {
@@ -1582,8 +1571,11 @@ impl AutumnManager {
                 let disk_online = disk_id
                     .and_then(|did| disks.get(&did))
                     .map(|disk| disk.online);
-                let disk_faulted =
-                    disk_id.is_some_and(|did| self.faulted_disks.borrow().contains(&did));
+                // A fence node, or a disk its own node reports Faulted.
+                let slot_fence = match disk_id {
+                    Some(did) => classes.disk(node_id, did) == crate::node_class::DiskClass::Fence,
+                    None => classes.node(node_id) == crate::node_class::NodeClass::Fence,
+                };
 
                 // A repair request is a decision about a copy that is NOT
                 // there, and its node coming back changes that (Ceph's mark-in
@@ -1646,7 +1638,7 @@ impl AutumnManager {
                 // ONE place decides whether the copy moves. It used to be
                 // three checks in a row whose ORDER was the bug: the gate
                 // returned before anything looked at the disk.
-                if slot_verdict(is_fenced, is_corrupt, disk_faulted, repair_requested)
+                if slot_verdict(slot_fence, is_corrupt, repair_requested)
                     == SlotVerdict::Rebuild
                 {
                     open_need.insert((ex.extent_id, slot as u32));
@@ -1786,11 +1778,11 @@ impl AutumnManager {
     async fn drain_fenced_open_tails(&self) {
         let now_s = Self::epoch_seconds();
         let fenced: HashSet<u64> = self
-            .node_overrides
-            .borrow()
-            .iter()
-            .filter(|(_, o)| o.kind == NODE_OVERRIDE_FENCED)
-            .map(|(id, _)| *id)
+            .classes()
+            .nodes
+            .into_iter()
+            .filter(|(_, c)| *c == crate::node_class::NodeClass::Fence)
+            .map(|(id, _)| id)
             .collect();
         if fenced.is_empty() {
             return;
@@ -2002,48 +1994,66 @@ pub(crate) enum SlotVerdict {
 
 /// Should this slot be rebuilt on another node?
 ///
-/// Extracted from the dispatch loop so the decision can be tested at all. It
-/// was inline, which is how it came to be wrong in a way nothing could assert
-/// on: the gate returned BEFORE the per-disk health check, so a slot on a dead
-/// disk was never even considered.
-pub(crate) fn slot_verdict(
-    fenced: bool,
-    corrupt: bool,
-    disk_faulted: bool,
-    repair_requested: bool,
-) -> SlotVerdict {
-    // A fenced node must have every slot moved off it — that is what fencing
-    // is for. A slot a partition owner PROVED corrupt is rebuilt: the owner
-    // replayed those bytes and found them wrong, and `re_avali` cannot repair
-    // it (it compares length, which a full-length rotted replica passes).
-    if fenced || corrupt {
-        return SlotVerdict::Rebuild;
+/// `slot_fence`: the slot's disk class is `Fence` — its node is fenced (that is
+/// what fencing is for), or its own node reports the disk Faulted (a local I/O
+/// error it has already suffered; it never clears without a restart). Never a
+/// disk record's `online` bit: a df that merely times out clears that
+/// node-wide, and rebuilding on it would rebuild every sealed slot of any node
+/// that missed one heartbeat — what the rolling-restart procedure relies on not
+/// happening. A Full disk is not fence either: it heals itself.
+///
+/// `corrupt`: a partition owner PROVED the copy wrong; `re_avali` cannot repair
+/// it (it compares length, which a full-length rotted replica passes).
+///
+/// `repair_requested`: an operator (`autumn-op repair`) or the repair policy
+/// after the slot stayed degraded past its grace period decided to move it.
+pub(crate) fn slot_verdict(slot_fence: bool, corrupt: bool, repair_requested: bool) -> SlotVerdict {
+    if slot_fence || corrupt || repair_requested {
+        SlotVerdict::Rebuild
+    } else {
+        SlotVerdict::Keep
     }
-    // A disk its OWN node reports faulted is conclusive too.
-    //
-    // `disk_faulted`, NOT `MgrDiskInfo.online`. The two are not the same fact
-    // and conflating them turns this arm into a rebuild storm: `online` is also
-    // set false node-wide when a `df` merely times out (5 s) or when partition
-    // servers report the node, so reading it here would rebuild every sealed
-    // slot of any node that missed one heartbeat — exactly what the
-    // documented rolling-restart procedure relies on not happening.
-    // `disk_faulted` is written only from the node's own per-disk answer.
-    //
-    // A faulted disk is not transient: the extent node sets `Faulted` from a
-    // local I/O error it has already suffered, and it never clears without a
-    // process restart. `Full` — the transient, self-healing state — is
-    // reported `online: true` and never lands here, which is what keeps a
-    // cluster running low on space from rebuilding itself.
-    if disk_faulted {
-        return SlotVerdict::Rebuild;
+}
+
+/// Why `node` (writing to `disk`, when known) cannot take part in an attempt,
+/// or `None` when it can. A `Suspend` node can: it is waited for.
+pub(crate) fn abnormal_target(
+    classes: &crate::node_class::Classes,
+    node: u64,
+    disk: Option<u64>,
+) -> Option<String> {
+    let node_class = classes.node(node);
+    if node_class.is_abnormal() {
+        return Some(format!("node {node} is {node_class:?}"));
     }
-    // Someone DECIDED to move this copy — an operator (`autumn-op repair`) or
-    // the repair policy after the slot stayed degraded past its grace period
-    // (`extent_repair`). The loop does not second-guess it.
-    if repair_requested {
-        return SlotVerdict::Rebuild;
-    }
-    SlotVerdict::Keep
+    let disk = disk?;
+    let disk_class = classes.disk(node, disk);
+    disk_class
+        .is_abnormal()
+        .then(|| format!("disk {disk} on node {node} is {disk_class:?}"))
+}
+
+/// The disk each EC target writes its shard to, in target order: a target that
+/// already holds a replica keeps that replica's disk; every other target takes
+/// the next of `extra_disk_ids`. `None` when the extent or a disk is unknown.
+pub(crate) fn ec_target_disks(
+    ex: Option<&ExtentRecord>,
+    p: &MgrEcDispatchInflight,
+) -> Vec<(u64, Option<u64>)> {
+    let mut extras = p.extra_disk_ids.iter().copied();
+    p.target_nodes
+        .iter()
+        .map(|&n| {
+            let replica_disk = ex.and_then(|ex| {
+                let j = ex.replicates.iter().position(|&r| r == n)?;
+                ex.replicate_disks.get(j).copied()
+            });
+            match replica_disk {
+                Some(d) => (n, Some(d)),
+                None => (n, extras.next()),
+            }
+        })
+        .collect()
 }
 
 impl crate::AutumnManager {
@@ -2875,8 +2885,8 @@ impl crate::AutumnManager {
     /// target nodes / disks / eversion verbatim (replay-safe). Filters:
     /// - skip extents with a Recovery in flight (avoid colliding with
     ///   `run_recovery_task`);
-    /// - skip when the coordinator (`target_nodes[0]`) is Suspected / Suspend /
-    ///   operator-overridden — silently, marker kept;
+    /// - skip when any target's class is not `Health` — an abnormal one gets
+    ///   the marker cancelled by `cancel_markers_on_abnormal_nodes`;
     /// - drop the marker for an extent that vanished, was already converted, or
     ///   truncated to 0 (stale).
     /// dedup is structural: ledger keys are unique by construction.
@@ -2910,14 +2920,7 @@ impl crate::AutumnManager {
                 _ => None,
             })
             .collect();
-        let node_state_snap: HashMap<u64, crate::node_state::NodeAutoState> = self
-            .node_states
-            .borrow()
-            .snapshot()
-            .into_iter()
-            .map(|(id, st, _)| (id, st))
-            .collect();
-        let overrides_snap = self.node_overrides.borrow().clone();
+        let classes = self.classes();
 
         // Every arm that drops a candidate says WHY.
         //
@@ -2936,22 +2939,22 @@ impl crate::AutumnManager {
                 );
                 continue;
             }
-            if let Some(coord) = params.target_nodes.first() {
-                let auto_st = node_state_snap
-                    .get(coord)
-                    .copied()
-                    .unwrap_or(crate::node_state::NodeAutoState::Online);
-                let is_overridden = overrides_snap.contains_key(coord);
-                if auto_st.is_suspected() || auto_st.is_suspend() || is_overridden {
-                    tracing::debug!(
-                        extent_id = eid,
-                        coordinator = *coord,
-                        ?auto_st,
-                        is_overridden,
-                        "ec dispatch: deferring — coordinator is not dispatchable"
-                    );
-                    continue;
-                }
+            // Every target receives a shard, not just the coordinator. Only an
+            // all-`Health` set is dispatched: a `Suspend` target is waited for,
+            // an abnormal one gets the marker cancelled by
+            // `cancel_markers_on_abnormal_nodes`.
+            if let Some(&node) = params
+                .target_nodes
+                .iter()
+                .find(|&&n| classes.node(n) != crate::node_class::NodeClass::Health)
+            {
+                tracing::debug!(
+                    extent_id = eid,
+                    node,
+                    class = ?classes.node(node),
+                    "ec dispatch: deferring — a target node is not Health"
+                );
+                continue;
             }
             let ex = match s.extents.get(&eid) {
                 Some(e) => e.clone(),
@@ -3450,17 +3453,14 @@ impl crate::AutumnManager {
         new_eversion: u64,
     ) -> Result<(), AppError> {
         let _lifecycle = self.node_lifecycle_lock.lock().await;
-        if target_nodes.iter().any(|id| {
-            self.decommissioned.borrow().contains_key(id)
-                || self
-                    .node_overrides
-                    .borrow()
-                    .get(id)
-                    .is_some_and(|o| o.kind == NODE_OVERRIDE_FENCED)
-        }) {
-            return Err(AppError::Precondition(
-                "EC target fenced or removed before apply".into(),
-            ));
+        if let Some(id) = target_nodes
+            .iter()
+            .find(|&&id| self.node_class_of(id).is_abnormal())
+        {
+            return Err(AppError::Precondition(format!(
+                "EC target node {id} is {:?}; the attempt is cancelled",
+                self.node_class_of(*id)
+            )));
         }
         // TEST-ONLY (G4 harness): one-shot transient failure BEFORE any etcd /
         // leadership interaction — a faithful model of "apply's etcd txn blipped
@@ -3867,6 +3867,7 @@ mod ec_apply_fail_tests {
     fn apply_success_releases_inflight_marker() {
         block_on(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             let extent_id: u64 = 7002;
             m.store
                 .inner
@@ -4283,7 +4284,7 @@ mod slot_verdict_tests {
     /// the data movement on a four-disk machine.
     #[test]
     fn a_dead_disk_is_rebuilt() {
-        assert_eq!(slot_verdict(false, false, true, false), SlotVerdict::Rebuild);
+        assert_eq!(slot_verdict(true, false, false), SlotVerdict::Rebuild);
     }
 
     /// A node that is merely unreachable — `MgrDiskInfo.online` false because a
@@ -4293,20 +4294,20 @@ mod slot_verdict_tests {
     /// merely-absent node does NOT trigger recovery") relies on it.
     #[test]
     fn an_unreachable_node_keeps_its_copies() {
-        assert_eq!(slot_verdict(false, false, false, false), SlotVerdict::Keep);
+        assert_eq!(slot_verdict(false, false, false), SlotVerdict::Keep);
     }
 
     /// An operator's or the policy's repair request moves the copy even
     /// though nothing conclusive says it is lost.
     #[test]
     fn a_repair_request_is_rebuilt() {
-        assert_eq!(slot_verdict(false, false, false, true), SlotVerdict::Rebuild);
+        assert_eq!(slot_verdict(false, false, true), SlotVerdict::Rebuild);
     }
 
     #[test]
     fn a_fenced_node_or_a_corrupt_slot_is_rebuilt() {
-        assert_eq!(slot_verdict(true, false, false, false), SlotVerdict::Rebuild);
-        assert_eq!(slot_verdict(false, true, false, false), SlotVerdict::Rebuild);
+        assert_eq!(slot_verdict(true, false, false), SlotVerdict::Rebuild);
+        assert_eq!(slot_verdict(false, true, false), SlotVerdict::Rebuild);
     }
 }
 
@@ -4388,7 +4389,7 @@ mod df_disk_health_tests {
             "…but says nothing about any individual disk"
         );
         assert_eq!(
-            slot_verdict(false, false, m.faulted_disks.borrow().contains(&10), false),
+            slot_verdict(m.faulted_disks.borrow().contains(&10), false, false),
             SlotVerdict::Keep,
             "a node that missed a heartbeat must not have its data rebuilt"
         );
@@ -4396,11 +4397,11 @@ mod df_disk_health_tests {
         // (b) the node answers, and names one of its disks faulted.
         m.apply_df_disk_health(&node, &[(10, status(true)), (11, status(false))]);
         assert_eq!(
-            slot_verdict(false, false, m.faulted_disks.borrow().contains(&11), false),
+            slot_verdict(m.faulted_disks.borrow().contains(&11), false, false),
             SlotVerdict::Rebuild
         );
         assert_eq!(
-            slot_verdict(false, false, m.faulted_disks.borrow().contains(&10), false),
+            slot_verdict(m.faulted_disks.borrow().contains(&10), false, false),
             SlotVerdict::Keep,
             "its healthy sibling is untouched"
         );

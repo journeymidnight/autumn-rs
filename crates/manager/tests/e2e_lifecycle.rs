@@ -109,19 +109,16 @@ async fn query_audit(mgr: &RpcClient, op: u8, node_id: u64) -> Vec<MgrAuditEntry
     resp.entries
 }
 
-// ── E2E test 1: phantom node stays Suspend ─────────────────
+// ── E2E test 1: a phantom node becomes Suspected ─────────────────
 //
-// Previously a phantom node (registered, no real EN listening) seeded
-// Online and was promoted to Suspected after df failed for the soft-
-// timeout window. After the state-machine refactor, an
-// unverified-alive node starts in `Suspend`; `on_heartbeat_fail` and
-// `tick()` no longer auto-promote Suspend → Suspected because the
-// "Suspected" semantic requires a prior verified-alive baseline. So
-// the phantom stays Suspend forever — which is the correct
-// operator-facing diagnostic ("format ran but EN never started").
+// A registered node with no EN listening starts `Suspend` and, silent past
+// the soft timeout counted from its registration, becomes `Suspected` — it is
+// not left `Suspend` (unknown, so never cancelled) forever. It has never
+// answered, so its last heartbeat stays empty: that is what tells "never
+// started" from "was running and stopped".
 
 #[test]
-fn e2e_phantom_node_stays_suspend() {
+fn e2e_phantom_node_becomes_suspected() {
     fast_node_timeout();
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -135,20 +132,17 @@ fn e2e_phantom_node_stays_suspend() {
         assert_eq!(resp.code, CODE_OK);
         let phantom_id = resp.node_id;
 
-        // first-time register seeds Suspend (was Online previously).
         let nodes = list_nodes(&mgr).await;
         let me = nodes.iter().find(|n| n.node_id == phantom_id).expect("me");
         assert_eq!(me.auto_state, NODE_AUTO_STATE_SUSPEND);
 
-        // Wait long enough that previously the node would have been
-        // promoted to Suspected (one df cycle + soft timeout). With
-        // the state stays Suspend forever.
+        // One df cycle + the soft timeout.
         compio::time::sleep(Duration::from_secs(15)).await;
         let nodes = list_nodes(&mgr).await;
         let me = nodes.iter().find(|n| n.node_id == phantom_id).unwrap();
         assert_eq!(
-            me.auto_state, NODE_AUTO_STATE_SUSPEND,
-            "phantom must stay Suspend; got auto_state={}",
+            me.auto_state, NODE_AUTO_STATE_SUSPECTED,
+            "a node silent past the soft timeout is Suspected; got auto_state={}",
             me.auto_state
         );
     });

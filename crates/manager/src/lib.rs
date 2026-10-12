@@ -12,6 +12,7 @@ mod fs_alloc;
 mod inflight_commit;
 pub mod inode_lease;
 pub mod node_state;
+mod node_class;
 mod op_log;
 mod cluster_status;
 mod manager_members;
@@ -1042,18 +1043,16 @@ pub struct AutumnManager {
     /// reports doesn't re-trip the quorum after the node recovers.
     pub(crate) recent_failure_reports:
         Rc<RefCell<HashMap<u64, std::collections::VecDeque<(Instant, u64)>>>>,
-    /// per-extent-node auto-tracked liveness (Online ↔ Suspected).
-    /// Fed by `disk_status_update_loop` (df ok / fail) and `register_node`
-    /// (initial heartbeat). Consumed by health-report RPCs,
-    /// recovery dispatch gate, and the EC dispatch loop's
-    /// Suspected-window skip. **No automatic Down transition** — fence
-    /// is operator-driven (`mgr_fence_node`).
+    /// per-extent-node auto-tracked liveness (Suspend / Online / Suspected).
+    /// Fed by the df loop and `register_node`; combined with the overrides
+    /// by `node_class`. **No automatic Down transition** — fence is
+    /// operator-driven (`mgr_fence_node`).
     pub(crate) node_states: Rc<RefCell<crate::node_state::NodeStateTracker>>,
     /// persistent operator overrides keyed on node_id. Mirrors
     /// the etcd prefix `node_override/<node_id>`. Mutated only via the
     /// admin RPCs `mgr_fence_node` / `mgr_set_node_maintenance` /
-    /// `mgr_clear_node_override` / by Maintenance TTL expiry inside
-    /// `node_states.tick()`. Survives leader failover via etcd replay.
+    /// `mgr_clear_node_override` / by Maintenance TTL expiry
+    /// (`tick_maintenance_ttl`). Survives leader failover via etcd replay.
     pub(crate) node_overrides: Rc<RefCell<HashMap<u64, MgrNodeOverride>>>,
     /// tombstones for `mgr_remove_node`. Etcd prefix
     /// `decommissioned/<node_id>` — written when the OP removes a node.
@@ -1714,6 +1713,8 @@ impl AutumnManager {
         // copy short is the most urgent thing on the list.
         let mut repair = self.repair_candidates(now);
         repair.append(&mut self.scrub_candidates(now));
+        let busy_extents: HashSet<u64> = self.inflight.borrow().keys().copied().collect();
+        let classes = self.classes();
         let mut p = self.policy.borrow_mut();
         p.sacred_boundaries = sacred;
         // prune metrics for partitions that no longer exist
@@ -1740,8 +1741,9 @@ impl AutumnManager {
         let sealed_sums = crate::policy::partition_sealed_sums(state);
         cands.append(&mut p.compute_hot_cold_advisory(owners, &sealed_sums, now));
         // EC advisory — per-extent, sourced from streams + extents (not
-        // partition-windowed); the helper filters extents < ec_min_extent_bytes.
-        cands.append(&mut p.compute_ec_advisory(state, now));
+        // partition-windowed); the helper filters extents < ec_min_extent_bytes
+        // and the ones a submit would refuse right now.
+        cands.append(&mut p.compute_ec_advisory(state, &busy_extents, &classes, now));
         // Phase B: cluster-level region→PS imbalance advisory
         // (kind = POLICY_KIND_REBALANCE), sourced from regions + ps_nodes.
         cands.append(&mut p.compute_rebalance_advisory(state, now));
@@ -3200,17 +3202,13 @@ impl AutumnManager {
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
-        // seed the node-state tracker with an OK heartbeat for
-        // every replayed EN node so the new leader starts with all
-        // nodes Online; the next `df` poll (10 s tick) will re-derive
-        // the truth from RPC outcomes. Mirrors the approach
-        // for PS heartbeats below.
+        // This term has heard from no node yet: each is `Suspend` until its
+        // first df answers, `Suspected` if none does within the soft timeout.
         {
-            let mut t = self.node_states.borrow_mut();
             let s = self.store.inner.borrow();
-            for node_id in s.nodes.keys() {
-                t.on_heartbeat_ok(*node_id);
-            }
+            self.node_states
+                .borrow_mut()
+                .on_term_start(s.nodes.keys().copied());
         }
         // replay persistent operator overrides (Fenced /
         // Maintenance). Overrides survive leader failover so the new
@@ -3585,23 +3583,29 @@ impl AutumnManager {
         }
     }
 
-    /// node_ids that must NOT receive new extent placements —
-    /// operator-Fenced or -Maintenance (`node_overrides`) plus auto-Suspected
-    /// (`node_states`). Capture this owned set BEFORE any `store.inner` borrow
-    /// (the RefCells are disjoint), mirroring the `online_node_ids`
-    /// capture pattern, then thread it into `select_nodes` + every fallback walk
-    /// + recovery-target selection so a decommissioning / flaky node never gets
-    /// data we'd immediately have to migrate off.
+    /// Nodes that take new data: `Health` with a `Health` disk.
+    pub(crate) fn ready_node_ids(&self) -> HashSet<u64> {
+        let classes = self.classes();
+        let s = self.store.inner.borrow();
+        s.nodes
+            .values()
+            .filter(|n| classes.takes_new_data(n))
+            .map(|n| n.node_id)
+            .collect()
+    }
+
+    /// Registered nodes whose class is abnormal (`Suspected` or `Fence`): no new
+    /// placement, recovery target or EC target goes to them. `Suspend` nodes
+    /// are not in it — allocation's preferred pool already requires `ready_node_ids`,
+    /// and its degraded fallback is what keeps a cold leader able to place.
+    /// Capture it BEFORE any `store.inner` borrow is held across other work.
     pub(crate) fn placement_excluded_node_ids(&self) -> HashSet<u64> {
-        let mut set: HashSet<u64> = self
-            .node_overrides
-            .borrow()
-            .iter()
-            .filter(|(_, o)| o.kind == NODE_OVERRIDE_FENCED || o.kind == NODE_OVERRIDE_MAINTENANCE)
-            .map(|(id, _)| *id)
-            .collect();
-        set.extend(self.node_states.borrow().suspected_node_ids());
-        set
+        self.classes()
+            .nodes
+            .into_iter()
+            .filter(|(_, c)| c.is_abnormal())
+            .map(|(id, _)| id)
+            .collect()
     }
 
     /// pick `count` candidate nodes for a fresh extent allocation.
@@ -3638,14 +3642,11 @@ impl AutumnManager {
     /// to satisfy `count`, drop the exclusion and retry — never block
     /// allocation on a stale exclude.
     ///
-    /// `online_node_ids` is the set of nodes whose
-    /// `NodeStateTracker` state is `Online` (i.e. registered AND verified
-    /// alive via at least one successful df). Suspend / Suspected nodes
-    /// are excluded at the primary filter; the cold-leader fallback
-    /// still applies — when too few `Online` nodes exist (e.g. the
-    /// manager has just won leader election and hasn't run its first
-    /// df sweep), the pool widens to honour the existing
-    /// "fall-back-to-fresh-node" path in `handle_stream_alloc_extent`.
+    /// `ready_node_ids` (`ready_node_ids()`) is the nodes that take new data: a
+    /// `Health` node with a `Health` disk. The cold-leader fallback still
+    /// applies — when too few are ready (e.g. the manager has just won leader
+    /// election and hasn't run its first df sweep), the pool widens to honour
+    /// the "fall-back-to-fresh-node" path in `handle_stream_alloc_extent`.
     ///
     /// `hard_excluded` (Fenced / Maintenance / Suspected, from
     /// `placement_excluded_node_ids`) is removed from EVERY placement path,
@@ -3656,8 +3657,7 @@ impl AutumnManager {
     /// surfaces it) rather than placing data we'd immediately migrate off.
     fn select_nodes(
         nodes: &HashMap<u64, NodeRecord>,
-        disks: &HashMap<u64, crate::persist::records::DiskRecord>,
-        online_node_ids: &HashSet<u64>,
+        ready_node_ids: &HashSet<u64>,
         space_low_node_ids: &HashSet<u64>,
         hard_excluded: &HashSet<u64>,
         load: &HashMap<u64, crate::placement::NodeLoad>,
@@ -3692,18 +3692,9 @@ impl AutumnManager {
         } else {
             all_unfiltered
         };
-        // prefer nodes that are BOTH verified-Online AND
-        // have at least one online disk. The two filters layer naturally
-        // — the state filter is the new gate, the disk filter is the
-        // existing post-df health signal.
         let healthy: Vec<NodeRecord> = all
             .iter()
-            .filter(|n| online_node_ids.contains(&n.node_id))
-            .filter(|n| {
-                n.disks
-                    .iter()
-                    .any(|d| disks.get(d).map(|di| di.online).unwrap_or(false))
-            })
+            .filter(|n| ready_node_ids.contains(&n.node_id))
             .cloned()
             .collect();
         let mut rng = rand::thread_rng();
@@ -3725,12 +3716,11 @@ impl AutumnManager {
         if healthy.len() >= count {
             return Ok(Self::take_least_loaded(healthy, load, count, &mut rng));
         }
-        // Degraded fallback: not enough verified-online nodes with
-        // online disks. Preserve the legacy fallback —
+        // Degraded fallback: not enough ready nodes. Preserve the legacy fallback —
         // widen to the full node set so the post-RPC fall-back path
         // in `handle_stream_alloc_extent` can still recover (it pings
         // the candidate per-RPC and walks alternates on failure). Cold-
-        // leader case (no df sweep yet → online_node_ids empty) is
+        // leader case (no df sweep yet → ready_node_ids empty) is
         // covered here.
         Ok(Self::take_least_loaded(all, load, count, &mut rng))
     }
@@ -8133,6 +8123,7 @@ mod tests {
     fn full_race_recovery_after_ec_apply() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             add_node_and_disk(&m, 9, 99);
             let extent_id = 202u64;
             m.store
@@ -8779,14 +8770,13 @@ mod tests {
         }
 
         // tests assume all nodes are verified-Online.
-        let online_node_ids: HashSet<u64> = nodes.keys().copied().collect();
+        let ready_node_ids: HashSet<u64> = nodes.keys().copied().collect();
         const ITERS: usize = 1000;
         let mut counts: HashMap<u64, usize> = HashMap::new();
         for _ in 0..ITERS {
             let picked = AutumnManager::select_nodes(
                 &nodes,
-                &disks,
-                &online_node_ids,
+                &ready_node_ids,
                 &HashSet::new(),
                 &HashSet::new(),
                 &HashMap::new(),
@@ -8815,13 +8805,12 @@ mod tests {
         }
     }
 
-    /// Degraded fallback (no online disks) must also shuffle so that
+    /// Degraded fallback (no node ready) must also shuffle so that
     /// repeated retries from a cold leader spread across the cluster
     /// instead of always pinging the lowest-id node first.
     #[test]
     fn select_nodes_degraded_fallback_shuffles() {
         let mut nodes: HashMap<u64, NodeRecord> = HashMap::new();
-        let disks: HashMap<u64, crate::persist::records::DiskRecord> = HashMap::new(); // empty = nothing online
         for &nid in &[1u64, 3, 5, 7] {
             nodes.insert(
                 nid,
@@ -8836,16 +8825,13 @@ mod tests {
             );
         }
 
-        // tests assume all nodes are verified-Online; the
-        // degraded fallback here is "no online disks" (empty `disks`
-        // map), not "no Online state nodes".
-        let online_node_ids: HashSet<u64> = nodes.keys().copied().collect();
+        // A cold leader: no node is ready yet.
+        let ready_node_ids: HashSet<u64> = HashSet::new();
         let mut first_node_seen: HashSet<u64> = HashSet::new();
         for _ in 0..200 {
             let picked = AutumnManager::select_nodes(
                 &nodes,
-                &disks,
-                &online_node_ids,
+                &ready_node_ids,
                 &HashSet::new(),
                 &HashSet::new(),
                 &HashMap::new(),
@@ -8898,7 +8884,6 @@ mod tests {
         for _ in 0..200 {
             let picked = AutumnManager::select_nodes(
                 &nodes,
-                &disks,
                 &online,
                 &low,
                 &HashSet::new(),
@@ -8919,7 +8904,6 @@ mod tests {
         let low2: HashSet<u64> = [5u64, 7].into_iter().collect();
         let picked = AutumnManager::select_nodes(
             &nodes,
-            &disks,
             &online,
             &low2,
             &HashSet::new(),
@@ -10050,6 +10034,7 @@ mod tests {
     #[test]
     fn pending_ec_dispatch_in_memory_bookkeeping() {
         let m = AutumnManager::new();
+        m._test_register_health_nodes([1, 3, 5, 7]);
         assert!(
             m.inflight.borrow().is_empty(),
             "ledger starts empty"
@@ -10144,6 +10129,7 @@ mod tests {
     fn apply_ec_conversion_done_sets_avali_for_all_shards() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             let extent_id = 206u64;
             // Pre-EC: 3 replicates, K data shards = 3, M parity = 0.
             // The seal path would have set avali = all_bits(3) = 0b0111.

@@ -340,11 +340,12 @@ impl AutumnManager {
     }
 
     /// Where a scrub task for `extent_id` on `node_id` must be sent: the node
-    /// shard that owns the extent. `None` = the node is unknown or not online.
+    /// shard that owns the extent. `None` = the node is unknown or not
+    /// `Health` (a fenced copy is moving off, a maintenance one is stopping).
     fn scrub_addr(&self, node_id: u64, extent_id: u64) -> Option<String> {
         let state = self.store.inner.borrow();
         let n = state.nodes.get(&node_id)?;
-        if !self.node_states.borrow().state_of(node_id).is_online() {
+        if self.node_class_of(node_id) != crate::node_class::NodeClass::Health {
             return None;
         }
         Some(Self::shard_addr_for_extent(&n.address, &n.shard_ports, extent_id))

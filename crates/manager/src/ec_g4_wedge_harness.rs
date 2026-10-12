@@ -86,6 +86,7 @@ fn is_candidate(m: &AutumnManager, extent_id: u64) -> bool {
 fn g4_transient_apply_fail_selfheals_via_redispatch_without_failover() {
     block_on(async {
         let m = AutumnManager::new();
+        m._test_register_health_nodes([1, 3, 5, 7]);
         let eid: u64 = 8001;
 
         {

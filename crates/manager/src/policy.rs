@@ -1034,7 +1034,19 @@ impl PolicyEngine {
     /// negative-EV operation. Operators who still want to convert
     /// such extents can use `client set-stream-ec --stream <ID>`
     /// which bypasses the advisory layer entirely.
-    pub(crate) fn compute_ec_advisory(&self, state: &MetadataState, now: i64) -> Vec<PolicyCandidate> {
+    ///
+    /// Also skipped, because `handle_force_ec_convert` would refuse them and
+    /// an armed controller would then file a FAILED op every round: extents
+    /// with an op in flight (`busy_extents`) and extents with a replica whose
+    /// node or disk is abnormal (`classes`) — those wait for repair to move
+    /// the replica off.
+    pub(crate) fn compute_ec_advisory(
+        &self,
+        state: &MetadataState,
+        busy_extents: &HashSet<u64>,
+        classes: &crate::node_class::Classes,
+        now: i64,
+    ) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
         let cfg = &self.config;
         for stream in state.streams.values() {
@@ -1058,6 +1070,15 @@ impl PolicyEngine {
                     continue;
                 }
                 if ext.sealed_length < cfg.ec_min_extent_bytes {
+                    continue;
+                }
+                let abnormal_replica = ext.replicates.iter().enumerate().any(|(j, &n)| {
+                    match ext.replicate_disks.get(j) {
+                        Some(&d) => classes.disk(n, d).is_abnormal(),
+                        None => classes.node(n).is_abnormal(),
+                    }
+                });
+                if busy_extents.contains(&eid) || abnormal_replica {
                     continue;
                 }
                 out.push(PolicyCandidate {

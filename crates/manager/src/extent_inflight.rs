@@ -219,17 +219,15 @@ impl AutumnManager {
         }
 
         if let ExtentOpPayload::ConvertToEc(params) = &payload {
-            if params.target_nodes.iter().any(|id| {
-                self.decommissioned.borrow().contains_key(id)
-                    || self
-                        .node_overrides
-                        .borrow()
-                        .get(id)
-                        .is_some_and(|o| o.kind == autumn_rpc::manager_rpc::NODE_OVERRIDE_FENCED)
-            }) {
-                return Err(AppError::Precondition(
-                    "EC target fenced or removed before dispatch".into(),
-                ));
+            let classes = self.classes();
+            let why = {
+                let s = self.store.inner.borrow();
+                crate::recovery::ec_target_disks(s.extents.get(&extent_id), params)
+                    .into_iter()
+                    .find_map(|(n, d)| crate::recovery::abnormal_target(&classes, n, d))
+            };
+            if let Some(why) = why {
+                return Err(AppError::Precondition(format!("EC target: {why}")));
             }
             // The coordinator encodes from its OWN copy when that copy is full
             // length, and a corrupt-marked copy is full length. Rebuild the
@@ -786,7 +784,7 @@ impl AutumnManager {
 mod tests {
     use super::*;
     use crate::persist::records::{ExtentRecord, NodeRecord};
-    use autumn_rpc::manager_rpc::{MgrNodeOverride, NODE_OVERRIDE_FENCED};
+    use autumn_rpc::manager_rpc::{MgrNodeOverride, RecoveryTask, NODE_OVERRIDE_FENCED};
 
     fn ec_payload(extent_id: u64) -> ExtentOpPayload {
         ExtentOpPayload::ConvertToEc(MgrEcDispatchInflight {
@@ -831,6 +829,7 @@ mod tests {
     fn acquire_extent_inflight_succeeds_when_empty() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             m.acquire_extent_inflight(42, ec_payload(42))
                 .await
                 .expect("acquire");
@@ -845,6 +844,7 @@ mod tests {
     fn acquire_extent_inflight_rejects_duplicate() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             m.acquire_extent_inflight(42, ec_payload(42))
                 .await
                 .expect("first acquire");
@@ -866,6 +866,7 @@ mod tests {
     fn a_reissued_attempt_gets_a_fresh_nonce() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             m.acquire_extent_inflight(42, ec_payload(42))
                 .await
                 .expect("acquire");
@@ -913,6 +914,7 @@ mod tests {
     fn commit_extent_inflight_release_clears_probe() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             m.acquire_extent_inflight(42, ec_payload(42))
                 .await
                 .expect("acquire");
@@ -1026,7 +1028,7 @@ mod tests {
                 .expect("recovery");
             assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
 
-            let released = m.release_recovery_markers_for_dead_executors().await;
+            let released = m.cancel_markers_on_abnormal_nodes().await;
             assert_eq!(
                 released,
                 vec![20],
@@ -1067,13 +1069,228 @@ mod tests {
             }
             m.node_states.borrow_mut().on_heartbeat_ok(9);
 
-            let released = m.release_recovery_markers_for_dead_executors().await;
+            let released = m.cancel_markers_on_abnormal_nodes().await;
             assert!(
                 released.is_empty(),
                 "a live executor's marker must NOT be released: {released:?}"
             );
             assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
         })
+    }
+
+    fn set_override(m: &AutumnManager, node_id: u64, kind: u8) {
+        m.node_overrides.borrow_mut().insert(
+            node_id,
+            MgrNodeOverride {
+                node_id,
+                kind,
+                set_at: 0,
+                set_by: "test".into(),
+                reason: String::new(),
+                expire_at: 0,
+                node_uuid: String::new(),
+            },
+        );
+    }
+
+    /// Extent 42 replicated on 1/3/5 (disks 10/30/50), its conversion targeting
+    /// 1/3/5 plus 7 (extra disk 70), all `Health`.
+    fn ec_in_flight() -> AutumnManager {
+        let m = AutumnManager::new();
+        m._test_register_health_nodes([1, 3, 5, 7]);
+        m.store.inner.borrow_mut().extents.insert(
+            42,
+            ExtentRecord {
+                extent_id: 42,
+                replicates: vec![1, 3, 5],
+                replicate_disks: vec![10, 30, 50],
+                sealed: true,
+                sealed_length: 4096,
+                ..Default::default()
+            },
+        );
+        m.inflight.borrow_mut().insert(
+            42,
+            MgrExtentInflightRecord::new(42, ec_payload(42), "test".to_string()),
+        );
+        m
+    }
+
+    /// Every EC target receives a shard, so a conversion whose PARTICIPANT (not
+    /// its coordinator) is in maintenance is cancelled, and its op closed FAILED
+    /// naming the node, while a conversion on healthy nodes survives.
+    #[test]
+    fn an_ec_participant_in_maintenance_cancels_the_conversion() {
+        run(async {
+            let m = ec_in_flight();
+            let (op, _) = m.ops.borrow_mut().submit(
+                autumn_rpc::manager_rpc::OP_KIND_EC_CONVERT,
+                0,
+                42,
+                vec![],
+                "auto-policy".into(),
+                0,
+                0,
+            );
+            set_override(&m, 5, autumn_rpc::manager_rpc::NODE_OVERRIDE_MAINTENANCE);
+            assert_eq!(m.cancel_markers_on_abnormal_nodes().await, vec![42]);
+            let rec = m.ops.borrow().record(op).expect("op");
+            assert_eq!(rec.state, autumn_rpc::manager_rpc::OP_STATE_FAILED);
+            assert!(rec.error.contains("node 5"), "{}", rec.error);
+        })
+    }
+
+    #[test]
+    fn an_ec_conversion_on_health_nodes_survives() {
+        run(async {
+            let m = ec_in_flight();
+            assert!(m.cancel_markers_on_abnormal_nodes().await.is_empty());
+            assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::ConvertToEc));
+        })
+    }
+
+    /// The disk a target writes to counts, not just its node: a replica target
+    /// whose disk its node reports Faulted cancels the conversion, and so does
+    /// the extra target's allocated disk. A Faulted disk the conversion does
+    /// not use changes nothing.
+    #[test]
+    fn an_ec_target_disk_faulted_cancels_the_conversion() {
+        run(async {
+            let m = ec_in_flight();
+            m.faulted_disks.borrow_mut().insert(999);
+            assert!(m.cancel_markers_on_abnormal_nodes().await.is_empty());
+            m.faulted_disks.borrow_mut().insert(30);
+            assert_eq!(m.cancel_markers_on_abnormal_nodes().await, vec![42]);
+
+            let m = ec_in_flight();
+            m.faulted_disks.borrow_mut().insert(70);
+            assert_eq!(m.cancel_markers_on_abnormal_nodes().await, vec![42]);
+        })
+    }
+
+    /// Submit refuses what the next tick would cancel: a target whose disk its
+    /// node reports Faulted, not only a target whose node is abnormal.
+    #[test]
+    fn an_ec_target_on_a_faulted_disk_is_refused_at_submit() {
+        run(async {
+            let m = ec_in_flight();
+            m._test_clear_inflight(42);
+            m.faulted_disks.borrow_mut().insert(30);
+            let err = m.acquire_extent_inflight(42, ec_payload(42)).await.unwrap_err();
+            assert!(err.to_string().contains("disk 30"), "{err}");
+        })
+    }
+
+    /// Right after a promotion no node has answered a df, so nothing takes new
+    /// data yet. That is not a failed dispatch: it is deferred, without the
+    /// backoff a failure would start.
+    #[test]
+    fn recovery_without_a_proven_target_is_deferred() {
+        run(async {
+            let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 9]);
+            m.store.inner.borrow_mut().extents.insert(
+                20,
+                ExtentRecord {
+                    extent_id: 20,
+                    replicates: vec![1],
+                    replicate_disks: vec![10],
+                    sealed: true,
+                    sealed_length: 4096,
+                    ..Default::default()
+                },
+            );
+            m.node_states.borrow_mut().on_term_start([1, 9]);
+            let outcome = m.dispatch_recovery_task(20, 1).await.unwrap();
+            assert_eq!(outcome, crate::recovery::DispatchOutcome::Deferred);
+        })
+    }
+
+    /// A recovery depends on its executor: one that enters maintenance has its
+    /// marker cancelled (only a Suspected or unregistered executor used to be).
+    #[test]
+    fn a_recovery_whose_executor_enters_maintenance_is_cancelled() {
+        run(async {
+            let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 9]);
+            m._test_acquire_marker(20, recovery_payload(20)).await.unwrap();
+            assert!(m.cancel_markers_on_abnormal_nodes().await.is_empty());
+            set_override(&m, 9, autumn_rpc::manager_rpc::NODE_OVERRIDE_MAINTENANCE);
+            assert_eq!(m.cancel_markers_on_abnormal_nodes().await, vec![20]);
+        })
+    }
+
+    /// Right after a failover every node is `Suspend`. That is unknown, not
+    /// abnormal: the markers stay and wait for the nodes' first df.
+    #[test]
+    fn a_new_term_cancels_nothing() {
+        run(async {
+            let m = ec_in_flight();
+            m._test_register_health_nodes([9]);
+            m._test_acquire_marker(20, recovery_payload(20)).await.unwrap();
+            m.node_states.borrow_mut().on_term_start([1, 3, 5, 7, 9]);
+            assert!(m.cancel_markers_on_abnormal_nodes().await.is_empty());
+            assert_eq!(m.extent_inflight_op(20), Some(ExtentOpKind::Recovery));
+            assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::ConvertToEc));
+        })
+    }
+
+    /// A df that times out clears every disk's `online` bit node-wide; that says
+    /// nothing about the disks and must not retire the recovery. A disk its node
+    /// reports Faulted does.
+    #[test]
+    fn a_df_timeout_does_not_retire_a_recovery() {
+        let m = AutumnManager::new();
+        m._test_register_health_nodes([1, 9]);
+        m.store.inner.borrow_mut().extents.insert(
+            20,
+            ExtentRecord {
+                extent_id: 20,
+                replicates: vec![1],
+                replicate_disks: vec![10],
+                sealed: true,
+                sealed_length: 4096,
+                ..Default::default()
+            },
+        );
+        let task = RecoveryTask { extent_id: 20, replace_id: 1, node_id: 9, start_time: 0 };
+        m.store.inner.borrow_mut().disks.get_mut(&90).unwrap().online = false;
+        assert!(m.capture_recovery_attempt(&task).is_ok());
+        m.faulted_disks.borrow_mut().insert(90);
+        assert!(m.capture_recovery_attempt(&task).is_err());
+    }
+
+    /// A recovery target takes new data: a `Health` node with a `Health` disk.
+    /// Not a node nobody has heard from this term, nor one whose only disk is
+    /// Full or Faulted.
+    #[test]
+    fn recovery_targets_are_nodes_that_take_new_data() {
+        let m = AutumnManager::new();
+        m._test_register_health_nodes([1, 2, 3, 4, 5]);
+        m.store.inner.borrow_mut().extents.insert(
+            20,
+            ExtentRecord {
+                extent_id: 20,
+                replicates: vec![1],
+                replicate_disks: vec![10],
+                sealed: true,
+                sealed_length: 4096,
+                ..Default::default()
+            },
+        );
+        m.node_states.borrow_mut().on_term_start([2]);
+        m.store
+            .inner
+            .borrow_mut()
+            .en_reports
+            .entry(3)
+            .or_default()
+            .full_disks
+            .push(30);
+        m.faulted_disks.borrow_mut().insert(40);
+        let (_, order) = m.recovery_candidate_order(20).unwrap();
+        let ids: Vec<u64> = order.iter().map(|n| n.node_id).collect();
+        assert_eq!(ids, vec![5]);
     }
 
     #[test]
@@ -1714,6 +1931,7 @@ mod tests {
     fn no_ec_conversion_starts_on_an_extent_with_a_corrupt_slot() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             m.extent_corrupt_slots.borrow_mut().insert(10, 0b1);
             assert!(matches!(
                 m.acquire_extent_inflight(10, ec_payload(10)).await,
@@ -1818,6 +2036,7 @@ mod tests {
     fn sweep_auto_releases_stale_markers() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             // Three markers, one of each kind.
             m.acquire_extent_inflight(10, ec_payload(10))
                 .await
@@ -1895,6 +2114,7 @@ mod tests {
     fn sweep_excludes_convert_to_ec_from_auto_release() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             m.acquire_extent_inflight(77, ec_payload(77))
                 .await
                 .expect("acquire");
@@ -1922,6 +2142,7 @@ mod tests {
     fn sweep_leaves_fresh_markers_alone() {
         run(async {
             let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 3, 5, 7]);
             m.acquire_extent_inflight(42, ec_payload(42))
                 .await
                 .expect("acquire");

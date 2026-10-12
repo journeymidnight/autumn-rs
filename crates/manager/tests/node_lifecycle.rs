@@ -285,3 +285,33 @@ fn recovery_stats_baseline() {
     assert!(resp.per_source.is_empty());
     assert!(resp.per_target.is_empty());
 }
+
+/// A node carries one override: Maintenance written over Fenced would silently
+/// un-fence it.
+#[test]
+fn maintenance_on_a_fenced_node_is_refused() {
+    let m = AutumnManager::new();
+    let n1 = register(&m, "127.0.0.1:9001");
+    let fence_req = FenceNodeReq {
+        node_id: n1,
+        reason: "dead".to_string(),
+        set_by: "op".to_string(),
+        force: true,
+    };
+    let resp: CodeResp = rkyv_decode(&run(m.handle_fence_node(rkyv_encode(&fence_req))).unwrap()).unwrap();
+    assert_eq!(resp.code, CODE_OK, "fence: {}", resp.message);
+
+    let req = SetNodeMaintenanceReq {
+        node_id: n1,
+        reason: "reboot".to_string(),
+        set_by: "op".to_string(),
+        expire_at: 0,
+    };
+    let resp: CodeResp =
+        rkyv_decode(&run(m.handle_set_node_maintenance(rkyv_encode(&req))).unwrap()).unwrap();
+    assert_eq!(resp.code, CODE_PRECONDITION, "{}", resp.message);
+    let list: ListNodeStatesResp =
+        rkyv_decode(&run(m.handle_list_node_states(Bytes::new())).unwrap()).unwrap();
+    let entry = list.nodes.iter().find(|n| n.node_id == n1).unwrap();
+    assert_eq!(entry.override_kind(), NODE_OVERRIDE_FENCED, "still fenced");
+}

@@ -6,8 +6,8 @@
 //! the PS/client -> EN DATA path but leave the manager -> EN control (`df`)
 //! path reachable, the node stays `Online`, so:
 //!   * `select_nodes` (manager `lib.rs`) — which has NO data-plane-reachability
-//!     input, only `online_node_ids` (df-verified) / disk-online / `hard_excluded`
-//!     = Fenced|Maintenance|Suspected — keeps the node in the selectable pool and
+//!     input, only `ready_node_ids` (df-verified node and disk classes) /
+//!     `hard_excluded` = abnormal classes — keeps the node in the selectable pool and
 //!     keeps placing new extents' replicas on it;
 //!   * `place_extents_with_fallback` (rpc_handlers.rs) fails to `alloc_extent_on_node`
 //!     over the (cut) data plane and just walks fallbacks — it NEVER marks the node

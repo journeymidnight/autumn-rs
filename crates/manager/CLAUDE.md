@@ -751,9 +751,9 @@ next re-send simply starts it again, and every EN answer is idempotent by
 contract (same-attempt already-running → `CODE_OK`; complete local copy → re-report done;
 incomplete residue → discard + rebuild — see `crates/stream/CLAUDE.md`).
 **Release is EVENT-driven:** `apply_recovery_done` (the
-work finished), `release_recovery_markers_for_dead_executors` (level-triggered
-each tick — the pinned node is gone from `s.nodes` or no longer Online → drop the
-marker so re-derivation picks a live target), and
+work finished), `cancel_markers_on_abnormal_nodes` (level-triggered
+each tick — the executor's class is `Suspected` or `Fence` → drop the marker so
+re-derivation picks a `Health` target; a `Suspend` executor is waited for), and
 `release_recovery_markers_for_healthy_slots` (level-triggered each tick — the
 SOURCE slot no longer needs rebuilding at all). The standing-instruction tick
 also retires a marker whose extent disappeared, source slot was replaced, or
@@ -832,14 +832,17 @@ persisted retry outlives the address's ownership, and extent ids restart from
 small integers in the next cluster on that host — see the stream guide's
 "Delete extent" section.
 
-**One recovery mode.** `slot_verdict(fenced, corrupt, disk_faulted) -> Rebuild
-| Keep` decides whether a slot's copy moves to another node. It is a function
+**One recovery mode.** `slot_verdict(slot_fence, corrupt, repair_requested) ->
+Rebuild | Keep` decides whether a slot's copy moves to another node;
+`slot_fence` is the slot's disk class being `Fence` (`node_class.rs`). It is a function
 because it was three inline checks whose ORDER was the bug — the gate returned
 before anything looked at the disk, so a slot on a DEAD disk was never
 considered, and nothing could assert on it.
 
 Three things move a copy on their own, each because it is CONCLUSIVE rather
-than suggestive: an operator `Fenced` node (that is what fencing is for), a
+than suggestive: a `Fence` node (operator `Fenced`, tombstoned; that is what
+fencing is for — Maintenance is NOT: it means "coming back", and its copies move
+only on an operator's repair request), a
 slot a partition owner PROVED corrupt (it replayed those bytes; `re_avali`
 compares length, which a full-length rotted replica passes), and a disk **its
 own node named faulted on its last df**. A fourth is a DECISION rather than
@@ -1085,17 +1088,19 @@ and score order would concentrate that on the emptiest node — a different
 resource than this change is about.
 
 Scoring runs strictly AFTER the hard constraints and cannot reach past them:
-`occupied`, `hard_excluded`, online-disk, `min_alloc_free_bytes`, and the rate
-limiter, which is a gate and never a score term.
+`occupied`, `takes_new_data` (a `Health` node with a `Health` disk),
+`min_alloc_free_bytes`, and the rate limiter, which is a gate and never a score term.
 
-**Placement hard-exclusion.** `placement_excluded_node_ids()` = Fenced ∪ Maintenance
-(overrides) ∪ Suspected (`node_states`) — threaded as `hard_excluded` into
-`select_nodes` (filtered at the top so both the count precheck and cold-leader
-fallback inherit it — hard-excluded nodes are NEVER backfilled), all fallback walks,
-`dispatch_recovery_task`'s targets, and `handle_force_ec_convert`'s parity pool.
-Trade-off: a 3-EN RF-3 cluster with one Suspected node refuses new allocation until
-it heals (~2 s df tick) or is fenced. (Bootstrap-seeded `Suspend` is deliberately NOT
-excluded.)
+**Placement hard-exclusion.** `placement_excluded_node_ids()` = registered nodes
+whose class is abnormal (`Suspected`, which includes Maintenance, or `Fence`) —
+threaded as `hard_excluded` into `select_nodes` (filtered at the top so both the
+count precheck and cold-leader fallback inherit it — hard-excluded nodes are NEVER
+backfilled), all fallback walks, and `handle_force_ec_convert`'s parity pool.
+`select_nodes` prefers `ready_node_ids()` (a `Health` node with a `Health` disk),
+then falls back to every non-excluded node, which is what keeps a cold leader able
+to place before any df. Recovery targets take only `Classes::takes_new_data`, no
+fallback. Trade-off: a 3-EN RF-3 cluster with one Suspected node refuses new
+allocation until it heals (~2 s df tick) or is fenced.
 
 **ENOSPC soft-avoid.** `select_nodes` then filters the healthy set down to nodes at or
 above `min_alloc_free_bytes` (`--min-alloc-free-bytes`, default 256 MiB, 0 = off),
@@ -1131,12 +1136,13 @@ from the layout it belongs to would, for the width of the gap, send readers to a
 file the layout does not yet say anyone holds; and the CAS states explicitly
 what today rests implicitly on the inflight ledger serialising per-extent ops.
 Before the flip nothing is committed — the shards are additive files no reader
-is pointed at — so **an EC marker whose coordinator is gone is now released**
-like a recovery marker (`release_recovery_markers_for_dead_executors`), and the
-successor is free to choose a different assignment. "Gone" means absent from the
-cluster or `Suspected`, NOT merely "not Online": a freshly registered node sits
-in `Suspend` until its first `df`, and abandoning on that makes a conversion
-that outlives one tick impossible.
+is pointed at — so **an EC marker any of whose targets, or the disk a target
+writes to (`ec_target_disks`), is abnormal is cancelled** like a recovery marker
+(`cancel_markers_on_abnormal_nodes`), and the successor is free to choose a
+different assignment. Abnormal means class `Suspected` or `Fence`, NOT merely
+"not Online": a `Suspend` node (freshly registered, or any node right after a
+failover) is waited for — cancelling on it would drop every marker at every
+failover.
 
 `abandon_ec_marker` is CAS'd on the persisted record and re-reads the attempt
 nonce after its etcd await, so a release decided against a stale view cannot
@@ -1212,8 +1218,9 @@ Candidates are deduped by `extent_id` (a CoW-shared extent appears in both child
 streams; re-encoding an already-shrunk shard produces `original/K²` sub-shards). The
 coordinator `handle_convert_to_ec` is idempotent (already-converted at this eversion
 → `CODE_OK` without re-encoding) and holds a per-extent mutex so a duplicate dispatch
-after leader-failover serialises and no-ops. EC dispatch skips a coord whose state is
-Suspected/Fenced/Maintenance/Suspend (no log spam during a flap).
+after leader-failover serialises and no-ops. EC dispatch skips a marker any of whose
+targets is not `Health` (an abnormal one is cancelled by the tick; a `Suspend` one is
+waited for).
 
 **Target selection (`handle_force_ec_convert`).** Targets are the extent's
 replicas (positionally paired with `replicate_disks`, the coordinator encodes its
@@ -1226,12 +1233,26 @@ would block the repair that moves the replica.
 
 **State machine (`node_state.rs`).** `NodeAutoState {Online, Suspected, Suspend}`,
 driven by `node_health_loop`'s df outcome. **No automatic `Down` transition** — a
-`Down`-equivalent is operator-driven only. `Suspend` is the initial state of a
-freshly registered node (`on_register_first`, no `last_ok`); Suspend → Online on the
-first df OK (~2–4 s) or operator re-register; Suspend → Suspected NEVER (Suspected
-means "was alive, now flaky"). Replay seeds every EN OK on promotion so a fresh
-soft-timeout window elapses before judgement. `NODE_AUTO_STATE_SUSPEND = 2` is
-wire-stable. `select_nodes` ANDs Online-state AND online-disk filters.
+`Down`-equivalent is operator-driven only. `Suspend` = not heard from this term: a
+freshly registered node (`on_register_first`), and EVERY node after a promotion
+(`replay_from_etcd` → `on_term_start`, which forgets the previous term's
+`last_ok`). Suspend → Online on the first df OK (~2–4 s) or a re-register; Suspend
+→ Suspected once silent for the soft timeout counted from registration / term
+start (`unproven_since`), so a dead node is not left Suspend forever. While leaders
+change faster than the soft timeout, a dead node stays Suspend and its markers are
+held — accepted: a control plane that cannot keep a leader moves nothing anyway.
+`NODE_AUTO_STATE_SUSPEND = 2` is wire-stable.
+
+**Node and disk classes (`node_class.rs`).** The one answer to "may this node / disk
+take part in extent work" (`docs/extent_op_arbitration_design.md` §1). `node_class`:
+unregistered / tombstoned / `Fenced` → `Fence`; `Maintenance` → `Suspected`; else the
+auto-state (`Online` → `Health`). An override only makes a node worse.
+`disk_class`: the node's class, narrowed by what the node itself reports in its df —
+Faulted → `Fence`, Full → `Full` (keeps its copies and the work on them, takes no new
+data). A disk record's `online` bit plays no part: a single df timeout clears it
+node-wide. `Classes` (`classes()`) snapshots both for a pass over many extents.
+Abnormal = `Suspected` | `Fence`: the work it takes part in is cancelled. A node
+carries one override: `set_node_maintenance` refuses a `Fenced` node.
 
 **Operator overrides (etcd-persisted, `node_override/`).** `mgr_fence_node` /
 `mgr_set_node_maintenance` / `mgr_clear_node_override` / `mgr_remove_node`.

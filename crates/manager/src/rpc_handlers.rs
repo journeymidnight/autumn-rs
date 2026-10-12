@@ -1628,14 +1628,12 @@ impl AutumnManager {
             }));
         }
 
-        // capture the verified-online node set BEFORE borrowing
-        // the store; select_nodes uses it as the primary allocation
-        // filter so a freshly-registered (but not-yet-df'd) EN doesn't
-        // get picked. Two separate borrows are fine — node_states is an
-        // independent RefCell.
-        let online_node_ids = self.node_states.borrow().online_node_ids();
+        // capture the nodes that take new data BEFORE borrowing the
+        // store; select_nodes uses it as the primary allocation filter so a
+        // node not yet heard from this term doesn't get picked.
+        let ready_node_ids = self.ready_node_ids();
         let space_low_node_ids = self.space_low_node_ids();
-        // Fenced/Maintenance/Suspected nodes are hard-excluded
+        // Abnormal nodes (Suspected, Maintenance, Fence) are hard-excluded
         // from allocation AND the fallback walk below.
         let hard_excluded = self.placement_excluded_node_ids();
         // Captured with the exclusion set, before the store borrow: both read
@@ -1647,8 +1645,7 @@ impl AutumnManager {
             let selected =
                 match Self::select_nodes(
                     &s.nodes,
-                    &s.disks,
-                    &online_node_ids,
+                    &ready_node_ids,
                     &space_low_node_ids,
                     &hard_excluded,
                     &placement_load,
@@ -2405,9 +2402,9 @@ impl AutumnManager {
         let req: StreamAllocExtentReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // capture the verified-online node set before borrowing
+        // capture the nodes that take new data before borrowing
         // the store. See `handle_create_stream` for the same pattern.
-        let online_node_ids = self.node_states.borrow().online_node_ids();
+        let ready_node_ids = self.ready_node_ids();
         let space_low_node_ids = self.space_low_node_ids();
         let hard_excluded = self.placement_excluded_node_ids();
         let placement_load = self.placement_load();
@@ -2509,8 +2506,7 @@ impl AutumnManager {
             };
             let selected = match Self::select_nodes(
                 &s.nodes,
-                &s.disks,
-                &online_node_ids,
+                &ready_node_ids,
                 &space_low_node_ids,
                 &hard_excluded,
                 &placement_load,
@@ -3774,9 +3770,9 @@ impl AutumnManager {
             }));
         }
 
-        // capture verified-online node set BEFORE borrowing the
+        // capture the nodes that take new data BEFORE borrowing the
         // store. Passed into the Phase-1 select_nodes call.
-        let online_node_ids = self.node_states.borrow().online_node_ids();
+        let ready_node_ids = self.ready_node_ids();
         let space_low_node_ids = self.space_low_node_ids();
         let hard_excluded = self.placement_excluded_node_ids();
         // Captured with the exclusion set, before the store borrow: both read
@@ -3903,8 +3899,7 @@ impl AutumnManager {
                 let selected =
                     Self::select_nodes(
                     &s.nodes,
-                    &s.disks,
-                    &online_node_ids,
+                    &ready_node_ids,
                     &space_low_node_ids,
                     &hard_excluded,
                     &placement_load,
@@ -4029,7 +4024,7 @@ impl AutumnManager {
             s.nodes
                 .values()
                 .filter(|n| !p1_selected_ids.contains(&n.node_id))
-                .filter(|n| online_node_ids.contains(&n.node_id))
+                .filter(|n| ready_node_ids.contains(&n.node_id))
                 .filter(|n| !space_low_node_ids.contains(&n.node_id))
                 .filter(|n| !hard_excluded.contains(&n.node_id))
                 .cloned()
@@ -6640,12 +6635,28 @@ impl AutumnManager {
         }
         let req: SetNodeMaintenanceReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-        // zombie defense — refuse if node was decommissioned.
-        if self.decommissioned.borrow().contains_key(&req.node_id) {
-            let msg = format!(
+        // zombie defense — refuse if node was decommissioned. A fenced node is
+        // refused too: a node carries one override, and writing Maintenance over
+        // Fenced would silently un-fence it.
+        let refusal = if self.decommissioned.borrow().contains_key(&req.node_id) {
+            Some(format!(
                 "node {} was previously decommissioned; cannot mark maintenance",
                 req.node_id
-            );
+            ))
+        } else if self
+            .node_overrides
+            .borrow()
+            .get(&req.node_id)
+            .is_some_and(|o| o.kind == NODE_OVERRIDE_FENCED)
+        {
+            Some(format!(
+                "node {} is fenced; clear the fence before marking maintenance",
+                req.node_id
+            ))
+        } else {
+            None
+        };
+        if let Some(msg) = refusal {
             self.append_audit(MgrAuditEntry {
                 op: AUDIT_OP_SET_NODE_MAINTENANCE,
                 node_id: req.node_id,
@@ -9058,7 +9069,7 @@ mod fence_precheck_tests {
                     *st = crate::node_state::NodeStateTracker::new(std::time::Duration::ZERO);
                     st.on_heartbeat_ok(3);
                     st.on_heartbeat_fail(3);
-                    assert!(st.suspected_node_ids().contains(&3));
+                    assert!(st.state_of(3).is_suspected());
                 }
             }
             assert!(
@@ -9261,7 +9272,7 @@ mod force_ec_target_tests {
                     *st = crate::node_state::NodeStateTracker::new(Duration::ZERO);
                     st.on_heartbeat_ok(2);
                     st.on_heartbeat_fail(2);
-                    assert!(st.suspected_node_ids().contains(&2));
+                    assert!(st.state_of(2).is_suspected());
                 }
             }
             let resp = force(&m);
