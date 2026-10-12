@@ -23,6 +23,8 @@ fn usage() -> ! {
     eprintln!("read / observability commands:");
     eprintln!("  status                       the fleet against its expected members: managers,");
     eprintln!("                               PS ready, EN online, extents, rebuilds, sample time");
+    eprintln!("  metrics                      every PS's and EN's metrics as the leader last heard");
+    eprintln!("                               them, Prometheus text (--json: families + report times)");
     eprintln!("  list-nodes                   show every EN's auto-state + override");
     eprintln!("  health [--detail N]          sealed extents clean / degraded / unavailable, slots");
     eprintln!("                               by state, and the N worst extents (default 10)");
@@ -326,6 +328,7 @@ pub(crate) enum Command {
         by: String,
     },
     Status,
+    Metrics,
     ManagerRemove {
         manager_id: u64,
         by: String,
@@ -663,6 +666,7 @@ pub(crate) fn parse() -> Args {
         // read
         "list-nodes" => Command::ListNodes,
         "status" => Command::Status,
+        "metrics" => Command::Metrics,
         "df" => Command::Df,
         "extent-health" => {
             let mut node_filter: Vec<u64> = Vec::new();

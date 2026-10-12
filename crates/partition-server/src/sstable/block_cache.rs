@@ -157,7 +157,7 @@ impl BlockCache {
         }
     }
 
-    /// `(bytes, entries, hits, misses)` — `/metrics` reads it.
+    /// `(bytes, entries, hits, misses)` — the PS load report reads it.
     pub fn stats(&self) -> (usize, usize, u64, u64) {
         let g = self.inner.lock();
         (g.bytes, g.map.len(), g.hits, g.misses)

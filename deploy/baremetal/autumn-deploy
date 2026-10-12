@@ -509,7 +509,6 @@ _start_managers() {
     local m host
     local -a extra=()
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && extra+=(--policy-fast-mode)
-    [[ "${AUTUMN_METRICS:-0}" == "1" ]] && extra+=(--metrics-port 9591)
     # Leader-fenced auto-policy controller, ON by default: production defaults to
     # ARMED steady-state maintenance — the `balanced` policy is seeded Armed on a
     # fresh cluster and auto-runs gc + compaction + EC + rebalance (no separate
@@ -660,9 +659,6 @@ _start_ps() {
     for (( i = 0; i < ${#PS_HOSTS[@]}; i++ )); do
         host="${PS_HOSTS[$i]}"; port="$(ps_port "$i")"; ph="$(plain_host "$host")"; psid=$(( i + 1 ))
         local -a inst_args=("${tun[@]}")
-        # Per-instance metrics port so multiple PS on one host don't all bind
-        # 9701 (their data ports are already strided by PS_PORT_STRIDE).
-        [[ "${AUTUMN_METRICS:-0}" == "1" ]] && inst_args+=(--metrics-port "$(( 9701 + i ))")
         svc_start "$host" "ps$i" "$DATA_ROOT" "$BIN_DIR/autumn-ps" \
             --cluster-secret-file "$CLUSTER_SECRET_REMOTE" \
             --psid "$psid" --port "$port" --manager "$MANAGER_LIST" \

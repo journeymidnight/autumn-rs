@@ -382,15 +382,15 @@ Tests: `client_direct_read_auth_tests` (anonymous / forged / expired / valid /
 revoked kid / Unknown / Off / member connection).
 
 **Refusal counters.** `EN_REJECTS` (process-global atomics, bumped only on the
-refusal paths via `note_reject`) feed `autumn_en_auth_rejects_total{class}` in
-`render_en_metrics`: `opcode_denied` (`check_opcode` refused a frame),
+refusal paths via `note_reject`) ride every `df` answer (`EnCounters`) and the
+manager exports them as `autumn_en_auth_rejects_total{node,class}`: `opcode_denied` (`check_opcode` refused a frame),
 `peer_auth` (any failed PEER_AUTH handshake in `handle_connection`: wrong secret, or a peer that vanished / timed out mid-handshake), `client_read` (authz-On
 read without a valid principal), `client_token` (`CLIENT_AUTH` token refused).
 `Unavailable` answers are not counted. Tests: `a_client_connection_cannot_reach_a_mutating_op_and_the_refusal_is_counted`
 (Client `DELETE_EXTENT` / `FENCE_EXTENT` / `APPEND` refused, counter +3, extent
 untouched and unfenced), `refused_reads_and_tokens_are_counted_by_class`, and the
 real-binary `cluster_secret.rs::members_and_operators_must_prove_the_secret`
-(`opcode_denied` and `peer_auth` scraped from a running EN). The counters are
+(`opcode_denied` and `peer_auth` of a running EN, read from the manager's `/metrics`). The counters are
 process-global, so in-process tests compare deltas with `>=` (never `==`).
 
 **`ConnPool::set_auth_token`**: a pool that holds a token sends `CLIENT_AUTH` on
@@ -1486,7 +1486,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
 25. **No `.meta` persist failure is ever swallowed** — the `.meta` sidecar is the only state a restart trusts (note 23); any path mutating eversion/sealed/avali/sealed_length then ignoring a failed persist reports a state the disk does not hold. All such sites are fail-closed (`mark_disk_offline_for_extent` + error): `run_recovery_task` final persist (also REMOVES the partial `ExtentEntry` so local retries can't reuse the offline disk and block manager re-dispatch), and both `handle_convert_to_ec` seal persists. Corollary: the note-16 **idempotent-skip must ENSURE durability, not just check atomics** — a prior attempt may have published the in-memory atomics then failed its persist, so the skip re-runs `save_meta` (idempotent) and fail-closes if it still can't. **Invariant: returning OK from any seal/convert/recovery RPC asserts the sidecar is durable, not merely that memory agrees.**
 
-26. **/metrics.** The EN's authoritative state is shard-local `Rc` (unreadable from the metrics HTTP thread), so two process-global mirrors feed `render_en_metrics()`: (a) `EN_APPEND_TOTALS` — monotonic batch/bytes/ns counters (3 relaxed fetch_adds per BATCH); (b) `EN_SHARD_GAUGES` — one `Arc<EnShardGauges>` per ExtentNode, refreshed by a 2 s task spawned on THAT shard's runtime (NOT df-driven — the manager df reaches only shard 0, so a df-refresh left other shards permanently stale). The renderer sums extents across shards (disjoint sets) and reports a disk offline if ANY shard's view says so.
+26. **Metrics ride `df`.** The EN serves no `/metrics`; `handle_df` puts `en_counters()` on every answer (`DfResp.counters`) and each disk's `full` flag on its `DiskStatus`, and the manager exports them (`crates/manager/CLAUDE.md`, "Observability"). The authoritative state is shard-local `Rc`, so two process-global mirrors feed `en_counters()`: (a) `EN_APPEND_TOTALS` — monotonic batch/bytes/ns counters (3 relaxed fetch_adds per BATCH) plus `EN_REJECTS`; (b) `EN_SHARD_GAUGES` — one `Arc<EnShardGauges>` per ExtentNode holding its extent count, refreshed by a 2 s task spawned on THAT shard's runtime (the manager's df reaches only one shard, so the counts cannot come from the shard that answers). The same task self-heals a `Full` disk.
 
 27. **Read-path Suspected avoidance (replicated route-around + EC proactive reconstruct).** `alloc_extent` already excludes manager-`Suspected` nodes; reads apply the SAME avoidance so rotation onto a flaky node does not cost a per-read timeout.
     - **Client-side snapshot, not new wire.** `StreamClient.suspected: Rc<RefCell<SuspectedCache>>` refreshed by `maybe_refresh_suspected()` at `read_with_layout` entry: TTL-gated (2 s) + NON-BLOCKING (spawns a detached poll of `MSG_LIST_NODE_STATES`, filter `NODE_AUTO_STATE_SUSPECTED`, swaps the set in; the current read proceeds on the slightly-stale snapshot and NEVER awaits a manager RTT). A failed poll keeps the prior snapshot — a failed refresh must NEVER widen the avoidance set.

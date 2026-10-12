@@ -26,8 +26,8 @@ autumn-manager-server --cluster-secret-file FILE [--port 9001] [--listen 0.0.0.0
 
 - Without `--etcd`: in-memory only (metadata lost on restart, no leader election). With `--etcd`: persistent — holds `--manager-id` (required, non-zero, unique per manager; a second process with a held id waits), replays state, runs the leader-election loop. `autumn-op manager-remove <id> --by X` drops a stopped manager from the expected fleet.
 - Serves `StreamManagerService` + `PartitionManagerService` on the same port, plus gRPC reflection.
-- `--metrics-port <P>` / `--metrics-listen <H>`: opt-in Prometheus `/metrics` (unauthenticated; pin to 127.0.0.1 when the RPC plane is on 0.0.0.0).
-- The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy start <NAME>`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op` (it scrapes PS `/metrics` directly for its Metrics tab). Runbook: `docs/ops.md`.
+- Prometheus `/metrics` is on by default at 9591 (`DEFAULT_METRICS_PORT`): the manager's own series plus every PS's and EN's, which they report to it (the leader exports those; `crates/manager/CLAUDE.md`, "Observability"). `--metrics-port <P>` moves it, `--metrics-port 0` turns it off, `--metrics-listen <H>` binds it apart from `--listen` (unauthenticated; pin to 127.0.0.1 when the RPC plane is on 0.0.0.0). A taken port logs an ERROR and the manager serves on. `autumn-ps` and `autumn-extent-node` serve no `/metrics` and refuse `--metrics-port` / `--metrics-listen` by name (exit 2).
+- The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy start <NAME>`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op`. Runbook: `docs/ops.md`.
 - `--cluster-secret-file <FILE>` (REQUIRED on the manager, PS and EN; exit 2 without it): the cluster secret every Peer/Admin connection proves (`autumn_rpc::peer_auth`, `docs/cluster_secret_design.md`). `--admin-token[-file]` were removed and are refused by name.
 - Authz (opt-in): `--auth-signing-key-file <FILE>` enables data-plane authz (keys from `autumn-op gen-signing-key`). With a key, every keyed op needs a token (no protected-prefix list). `--auth-token-ttl-secs` / `--auth-clock-skew-secs` tune minted tokens.
 
@@ -130,25 +130,20 @@ No new dependency, wire format, or data-path work is added by this integration.
   its existing 30-second child deadline stays in place. This is control-plane
   overhead, outside client/PS/EN data traffic. Multiple browsers still incur
   separate requests.
-- **Metrics tab.** The one thing it does without `autumn-op`: a poller task
-  scrapes every PS's Prometheus `/metrics` itself, at the address each PS reports
-  on its heartbeat (`ps_servers[].metrics_addr`, re-read through `autumn-op
-  overview` every 60 s, every 10 s while a PS has reported none). Scrapes run on
-  blocking threads (plain `std::net`, 3 s timeout), all PSes per round, every
-  `--metrics-interval-secs` (10). `metrics_store.rs` keeps
-  `--metrics-retention-secs` (3600) in memory: counters as per-second rates (a
-  counter that went down yields no point), gauges as read. Every series is a
-  column of one shared round axis, one `f32` per round (4 bytes a point — a
-  partition's ~55 series cost ~80 KB an hour), so series add up point for
-  point and a query indexes instead of matching times. A round in which a PS of
-  the scope failed its scrape is `null` in the scope's sums rather than a dip;
-  a PS with no endpoint is not a failure (it never contributes), and evicted
-  members are not scraped at all. `GET /api/metrics?scope=
-  cluster|ps|part&id=N` sums the scope (gauges summed over partitions also come
-  as `name:max`); no subprocess, so it costs the page nothing to poll. The page
-  derives ratios and latency quantiles (interpolated in the histogram bucket)
-  and draws SVG line charts. A restart starts an empty history — nothing is
-  persisted, by design.
+- **Metrics tab.** A poller task runs `autumn-op metrics` (every PS's latest report,
+  from the leader — autumn-op finds the leader, so a manager failover costs a round
+  or two) every `--metrics-interval-secs` (10). A report is ingested only if it is
+  newer than the last one from that PS, and summed over its partitions on the way
+  in — the tab shows the cluster and single PSes, never one partition — with a
+  gauge's largest partition kept as `name:max`. `metrics_store.rs` keeps
+  `--metrics-retention-secs` (3600) in memory: counters as per-second rates over
+  the PS's own report times (a sum that went down yields no point), gauges as read.
+  Every series is a column of one shared round axis, one `f32` per round, so series
+  add up point for point. A round in which a PS heard before sent nothing new is
+  `null` in its scope's sums rather than a dip. `GET /api/metrics?scope=cluster|ps&id=N`
+  answers from memory, so it costs the page nothing to poll. The page derives ratios
+  and latency quantiles (interpolated in the histogram bucket) and draws SVG line
+  charts. A restart starts an empty history — nothing is persisted, by design.
 - Tests live alongside this binary: `tests/{render_check,tabs_smoke,policy_controls}.js`
   and `tests/api_contract.sh` (Python harness, real etcd/manager/EN/PS, allocated
   temporary data and ports, cleanup only of children it spawned). CI runs all.
@@ -167,7 +162,7 @@ Global `--cluster-secret-file` (position-independent): autumn-op connects as an 
 
 | Category | Commands |
 |----------|----------|
-| Read / observability | `status` (fleet vs expected members, `--json`), `list-nodes`, `df`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `policy-candidates` |
+| Read / observability | `status` (fleet vs expected members, `--json`), `metrics` (every PS's and EN's metrics from the leader, Prometheus text; `--json` families + report times), `list-nodes`, `df`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `policy-candidates` |
 | Node lifecycle | `fence-node <id> --reason ... --by ... [--force]`, `maintenance <id> --reason ... --by ... [--expire TS]`, `unfence <id> --by ...`, `remove <id> --by ...`, `ps-remove <ps_id> --by ...` (drop a stopped, evicted PS from the expected fleet; refused while it is registered) |
 | Cluster / partition admin | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID> [--namespace <NS[/SUB]> [--at S \| --at-hex H]] [--at-raw-hex H]`, `presplit --namespace <NS[/SUB]> <rule flags>`, `merge <SURVIVOR> <VICTIM> [--force]`, `rebalance`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format <DIR>...` |
 | Auth / namespaces | `gen-cluster-secret`, `gen-signing-key [--kid K]`, `principal-create --principal P --grant P...`, `principal-delete --principal P`, `principal-list`, `mint-token [--principal P] (--credential HEX \| --credential-file F)` (the file, before or after the subcommand, is read once by `prescan_secret_flags` in a form that names its principal — what `principal-create` prints, or `<principal>\n<hex>`; that principal fills or must match `--principal`), `namespace-create --name N [--presplit hex,…]`, `namespace-delete --name N`, `namespace-list` |

@@ -441,10 +441,6 @@ launch_extent_node() {
     # --disk-id was removed. Single-disk and multi-disk paths
     # are now uniform — `autumn-op format` writes the disk_id sentinel
     # file per dir, which the EN reads on startup.
-    local -a metrics_args=()
-    if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
-        metrics_args=(--metrics-port "$(( 9600 + i ))")
-    fi
     # O_DIRECT for append bursts >= 1 MiB is the EN's default on Linux; the
     # data dirs must take it (a filesystem that refuses it, e.g. tmpfs before
     # Linux 6.6, makes the EN refuse to start). AUTUMN_EXTENT_DIRECT_IO=0 →
@@ -460,7 +456,6 @@ launch_extent_node() {
         --listen "$BIND_HOST" --transport "$TRANSPORT" \
         --advertise "${BIND_HOST}:$port" \
         ${stride_args[@]:+"${stride_args[@]}"} \
-        ${metrics_args[@]:+"${metrics_args[@]}"} \
         ${dio_args[@]:+"${dio_args[@]}"} \
         ${cpu_args[@]:+"${cpu_args[@]}"} \
         --cluster-secret-file "$CLUSTER_SECRET_FILE"
@@ -637,9 +632,6 @@ launch_ps() {
     if [[ -n "${AUTUMN_REGPOOL_LOG_INTERVAL_SECS:-}" ]]; then
         tunable_args+=(--regpool-log-interval-secs "$AUTUMN_REGPOOL_LOG_INTERVAL_SECS")
     fi
-    if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
-        tunable_args+=(--metrics-port 9701)
-    fi
     start_proc ps \
         "$PS" \
         --psid 1 --port "$PS_BASE_PORT" \
@@ -682,12 +674,8 @@ launch_manager() {
     if [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]]; then
         mgr_extra="--policy-fast-mode"
     fi
-    # Observability batch 1: AUTUMN_METRICS=1 wires Prometheus /metrics
-    # endpoints on every role (manager 9591, EN 960<i>, PS 9701 — all
-    # below the 10000 ephemeral floor, see BUG#3).
-    if [[ "${AUTUMN_METRICS:-0}" == "1" ]]; then
-        mgr_extra="$mgr_extra --metrics-port 9591"
-    fi
+    # Prometheus /metrics: the manager's, on by default at 9591 (below the
+    # 10000 ephemeral floor, see BUG#3); PS and EN report to it.
     # The web dashboard is a separate app now (crates/server/src/bin/autumn_dashboard → the
     # autumn-dashboard binary); cluster.sh does not start it. Run it by hand
     # against this cluster's manager + cluster secret when you want the UI.

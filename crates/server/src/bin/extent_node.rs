@@ -40,6 +40,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
+
 struct Args {
     /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
     cluster_secret_file: Option<PathBuf>,
@@ -98,14 +99,6 @@ struct Args {
     /// Per-thread regpool cap (pinned/registered bytes). `None` = library
     /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB].
     ucx_regpool_cap_bytes: Option<usize>,
-    /// Observability batch 1: Prometheus `/metrics` HTTP port.
-    /// `None` = endpoint disabled (zero cost). One endpoint per PROCESS
-    /// (shard gauges are aggregated by the renderer).
-    metrics_port: Option<u16>,
-    /// Bind host for /metrics only. `None` = follow `--listen`. The
-    /// endpoint is unauthenticated — operators exposing the RPC plane
-    /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
-    metrics_listen: Option<String>,
     /// M1: `HOST:PORT` this EN announces to the manager at
     /// startup (HOST must be an IP — the binary stays DNS-free; the shell
     /// resolves names). PORT is the shard-0 data port (== `--port`). When set
@@ -131,8 +124,6 @@ fn parse_args() -> Args {
     let mut cpuset: Option<Vec<usize>> = None;
     // optional override; default = port + 1000.
     let mut control_port: Option<u16> = None;
-    let mut metrics_port: Option<u16> = None;
-    let mut metrics_listen: Option<String> = None;
     // parallelism + inflight-cap knobs as Option<usize>; library defaults when None.
     let mut ec_convert_parallelism: Option<usize> = None;
     let mut recovery_parallelism: Option<usize> = None;
@@ -266,13 +257,12 @@ fn parse_args() -> Args {
                 ucx_regpool_cap_bytes =
                     Some(args[i].parse().expect("--ucx-regpool-cap-bytes usize"));
             }
-            "--metrics-port" => {
-                i += 1;
-                metrics_port = Some(args[i].parse().expect("--metrics-port must be a port"));
-            }
-            "--metrics-listen" => {
-                i += 1;
-                metrics_listen = Some(args[i].clone());
+            "--metrics-port" | "--metrics-listen" => {
+                eprintln!(
+                    "error: {} was removed; {} metrics reach the manager, whose /metrics exports them",
+                    args[i], "extent-node"
+                );
+                std::process::exit(2);
             }
             "--advertise" => {
                 i += 1;
@@ -314,8 +304,6 @@ fn parse_args() -> Args {
         direct_io,
         scrub_bytes_per_sec,
         ucx_regpool_cap_bytes,
-        metrics_port,
-        metrics_listen,
         advertise,
     }
 }
@@ -845,24 +833,6 @@ fn main() -> Result<()> {
         ports = ?shard_ports,
         "autumn-extent-node starting"
     );
-
-    // Observability batch 1: ONE /metrics endpoint per process, spawned
-    // before the shard threads (covers both single- and multi-shard
-    // paths). The renderer reads process-global atomics + the per-shard
-    // gauge slots each ExtentNode registers at construction — no compio
-    // involvement, safe on its own OS thread.
-    if let Some(mport) = args.metrics_port {
-        let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
-        match autumn_common::metrics_http::spawn_metrics_http(
-            mhost,
-            mport,
-            std::sync::Arc::new(autumn_stream::render_en_metrics),
-        ) {
-            Ok(()) => tracing::info!(port = mport, host = mhost, "metrics endpoint up at /metrics"),
-            // Auxiliary — a taken metrics port must not kill the data plane.
-            Err(e) => tracing::error!(port = mport, "metrics endpoint bind failed: {e}"),
-        }
-    }
 
     if shards == 1 {
         // Single-shard fast path — preserve exact single-core behaviour.

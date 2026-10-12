@@ -169,7 +169,6 @@ run_manager() {
         --port "$port" --manager-id "$mid" --etcd "$etcd" --listen 0.0.0.0 --transport "$TRANSPORT"
     )
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && args+=(--policy-fast-mode)
-    [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9591)
     # Leader-fenced auto-policy controller. Production deploy defaults to ARMED
     # steady-state maintenance — the `balanced` policy (gc + compaction + EC +
     # rebalance) is seeded Armed on a fresh cluster and actuates on its own (no
@@ -272,7 +271,6 @@ run_extent_node() {
         # sharding block above and docs/k8s_deploy.md "Multi-shard extent nodes".
         --cpuset "$cpuset"
     )
-    [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9601)
     # bound resident sealed-extent fds (default 4096 in the
     # binary). env→flag in the shell layer, never read in Rust.
     [[ -n "${AUTUMN_EXTENT_FD_CACHE_CAP:-}" ]] && args+=(--fd-cache-cap "$AUTUMN_EXTENT_FD_CACHE_CAP")
@@ -345,7 +343,6 @@ run_ps() {
         --listen 0.0.0.0 --advertise "${adv}:${port}" --transport "$TRANSPORT"
     )
     [[ -n "${AUTUMN_PS_CPUSET:-}" ]] && args+=(--cpuset "$AUTUMN_PS_CPUSET")
-    [[ "${AUTUMN_METRICS:-0}" == "1" ]] && args+=(--metrics-port 9701)
     local pair env_name flag
     for pair in "${PS_TUNABLES[@]}"; do
         env_name="${pair%%:*}"; flag="${pair#*:}"

@@ -902,6 +902,18 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## PS and EN metrics ride their reports to the manager (wire 63)
+
+`PartitionLoad` gains `counters: PartitionCounters` (per-partition counters, LSM
+gauges and two `LatencyHist`s over `LATENCY_BUCKET_BOUNDS_NS`);
+`ReportPartitionLoadReq` gains `block_cache: BlockCacheStats`; `DfResp` gains
+`counters: EnCounters` and `DiskStatus` gains `full`. `HeartbeatPsReq.metrics_addr`
+and `PsOverview.metrics_addr` (wire 62) are removed: a PS and an EN serve no
+`/metrics` of their own any more. New opcode `MSG_GET_FLEET_METRICS` (0x66,
+leader-gated, admitted on Manager connections) returns `FleetMetricsResp` — every
+fresh `PsMetricsReport` / `EnMetricsReport` the leader holds. PS/EN → manager (Peer)
+and Admin: the ceiling rises to [43, 63], the floor stays.
+
 ## PS heartbeat carries its metrics endpoint (wire 62)
 
 `HeartbeatPsReq` gains `metrics_addr` (the PS's `/metrics` `host:port`, empty

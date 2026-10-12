@@ -31,9 +31,12 @@ FAIL=0
 say()  { echo "[enospc $(date +%H:%M:%S)] $*"; }
 fail() { echo "[enospc $(date +%H:%M:%S)] FAIL: $*"; FAIL=1; }
 
-en1_metric() { # $1 = grep pattern; prints last numeric field or empty
-    curl -s --max-time 3 http://127.0.0.1:9601/metrics 2>/dev/null \
-        | grep "$1" | head -1 | awk '{print $NF}'
+# EN1's series from the manager's /metrics (ENs report on df; the first EN
+# cluster.sh registers is node 1).
+EN1_NODE="${EN1_NODE:-1}"
+en1_metric() { # $1 = metric name; prints last numeric field or empty
+    curl -s --max-time 3 http://127.0.0.1:9591/metrics 2>/dev/null \
+        | grep "^$1{node=\"$EN1_NODE\"" | head -1 | awk '{print $NF}'
 }
 
 cleanup_all() {
@@ -59,12 +62,12 @@ dd if=/dev/zero of="$IMG" bs=1M count=512 status=none || { echo "dd failed"; exi
 mkfs.ext4 -q -F "$IMG" || { echo "mkfs failed"; exit 1; }
 mount -o loop "$IMG" "$MNT" || { echo "mount failed (need root)"; exit 1; }
 
-say "starting 4-EN cluster (metrics on, manager alloc floor disabled)"
+say "starting 4-EN cluster (manager alloc floor disabled)"
 env AUTUMN_DATA_ROOT="$DATA_ROOT" \
     AUTUMN_EXTENT_BASE_PORT=20000 \
     AUTUMN_BOOTSTRAP_PRESPLIT="8:hexstring" \
     AUTUMN_TRANSPORT=tcp \
-    AUTUMN_METRICS=1 \
+    \
     AUTUMN_MGR_MIN_ALLOC_FREE_BYTES=0 \
     bash "$ROOT/cluster.sh" start 4 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" \
@@ -92,13 +95,13 @@ while [ $n -lt 600 ]; do
     if timeout 20 "${AC[@]}" put "$key" "$WORK/val1m" >/dev/null 2>&1; then
         echo "$key" >> "$WORK/acked.txt"
     fi
-    f=$(en1_metric "^autumn_en_disk_full")
+    f=$(en1_metric autumn_en_disk_full)
     if [ "${f:-0}" = "1" ]; then full_seen=1; say "E1: EN1 FULL after $n puts"; break; fi
 done
 if [ "$full_seen" != "1" ]; then
     fail "E1: EN1 never reported disk_full=1 after $n puts (free: $(df -h --output=avail "$MNT" | tail -1))"
 else
-    on=$(en1_metric "^autumn_en_disk_online")
+    on=$(en1_metric autumn_en_disk_online)
     [ "${on:-0}" = "1" ] || fail "E1: disk reported OFFLINE/faulted — ENOSPC misclassified as media fault (online=$on)"
 fi
 
@@ -121,7 +124,7 @@ rm -f "$MNT/ballast"
 healed=0
 for i in $(seq 1 15); do
     sleep 2
-    f=$(en1_metric "^autumn_en_disk_full")
+    f=$(en1_metric autumn_en_disk_full)
     if [ "${f:-1}" = "0" ]; then healed=1; say "E3: EN1 full cleared after ~$((i*2))s"; break; fi
 done
 [ "$healed" = "1" ] || fail "E3: disk_full did not clear within 30s of freeing space"

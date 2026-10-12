@@ -2512,8 +2512,6 @@ pub struct PartitionServer {
     /// address. Defaults to `127.0.0.1` if `--advertise` is omitted or
     /// is not parseable as `host:port`.
     advertise_host: Rc<std::cell::RefCell<String>>,
-    /// `/metrics` `host:port`, empty when the binary runs no metrics listener.
-    metrics_addr: Rc<RefCell<String>>,
     /// host component for the per-partition listener bind.
     /// For UCX/RoCE this must be the routable HCA IP, not `0.0.0.0`.
     listen_host: Rc<std::cell::RefCell<String>>,
@@ -3484,7 +3482,6 @@ impl PartitionServer {
                                 "127.0.0.1",
                             ))),
                             listen_host: Rc::new(std::cell::RefCell::new(String::from("0.0.0.0"))),
-                            metrics_addr: Rc::new(RefCell::new(String::new())),
                             concurrency_ctrl: std::sync::Arc::new(ConcurrencyController::from_env()),
                             partition_budget: std::sync::Arc::new(PartitionBudget::new(
                                 compute_partition_budget_cap(),
@@ -3605,18 +3602,11 @@ impl PartitionServer {
             .collect()
     }
 
-    /// Where this PS's `/metrics` is reachable; carried on every heartbeat.
-    /// The binary sets it once its metrics listener is up.
-    pub fn set_metrics_addr(&self, addr: String) {
-        *self.metrics_addr.borrow_mut() = addr;
-    }
-
     fn heartbeat_req(&self) -> Bytes {
         manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq {
             ps_id: self.ps_id,
             slot_cap: self.slot_cap(),
             open_parts: self.open_parts(),
-            metrics_addr: self.metrics_addr.borrow().clone(),
         })
     }
 
@@ -3770,19 +3760,6 @@ impl PartitionServer {
         }
     }
 
-    /// Prometheus text for this PS's `/metrics`. Runs on the MAIN compio
-    /// thread (the `partitions` map is `Rc<RefCell>`); the binary's 2 s
-    /// publisher task copies the rendered string to the metrics HTTP thread.
-    pub fn metrics_text(&self) -> String {
-        let series: Vec<(u64, std::sync::Arc<PartitionMetrics>)> = self
-            .partitions
-            .borrow()
-            .iter()
-            .map(|(part_id, h)| (*part_id, h.metrics.clone()))
-            .collect();
-        metrics::render(self.ps_id, &series, &self.block_cache)
-    }
-
     /// every 5 s, snapshot per-partition metrics from each
     /// PartitionHandle's Arc<PartitionMetrics> and ship to the manager
     /// via MSG_REPORT_PARTITION_LOAD. Cheap — one RPC per cycle, payload
@@ -3885,16 +3862,23 @@ impl PartitionServer {
                             active_maintenance: handle
                                 .metrics
                                 .snapshot_maintenance_progress(),
+                            counters: handle.metrics.counters(),
                         }
                     })
                     .collect()
             };
-            if snapshots.is_empty() {
-                continue;
-            }
+            // Sent even with no partition: the manager lists this PS's
+            // metrics (its block cache, its partition count) from it.
+            let (cache_bytes, _, hits, misses) = self.block_cache.stats();
             let req = manager_rpc::rkyv_encode(&manager_rpc::ReportPartitionLoadReq {
                 ps_id: self.ps_id,
                 partitions: snapshots,
+                block_cache: manager_rpc::BlockCacheStats {
+                    hits,
+                    misses,
+                    bytes: cache_bytes as u64,
+                    capacity: self.block_cache.cap_bytes() as u64,
+                },
             });
             // 10 s — telemetry report fired every 30 s. Bounded so a
             // hung manager doesn't keep the report task alive past

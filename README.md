@@ -73,9 +73,9 @@ erasure-coded, self-healing extents.
 - **Operable** — a **web dashboard** ([`autumn-dashboard`](crates/server/src/bin/autumn_dashboard/README.md),
   built with `autumn-server`) with tabs for keyspace, partitions, servers,
   nodes-and-disks, policy, logs and metrics (an hour of every partition
-  server's `/metrics` charted for the cluster, one server or one partition —
-  block cache hit ratio, SST tables, compactions, latency), plus direct
-  Start / Stop policy controls; a fleet status checked against the EXPECTED members
+  server's metrics charted for the cluster or one server — block cache hit
+  ratio, SST tables, compactions, latency), plus direct Start / Stop policy
+  controls; a fleet status checked against the EXPECTED members
   (`autumn-op status`: manager leader/standby, `PS Ready 3/3`, `EN Online 6/6`,
   extents clean/degraded/unavailable, rebuilds in flight, when it was sampled —
   a stopped server stays in the count until an operator removes it);
@@ -87,7 +87,8 @@ erasure-coded, self-healing extents.
   policy's weekly `scrub`) to check sealed copies against their checksums on
   the nodes that hold them, with rotted ones isolated and rebuilt; declarative
   bare-metal deployer
-  (systemd), Kubernetes manifests, Prometheus `/metrics`, `ceph df`-style
+  (systemd), Kubernetes manifests, one Prometheus `/metrics` for the whole
+  cluster (the manager exports every server's counters), `ceph df`-style
   capacity accounting, rolling restart with convergence gates.
 
 ## Quick start

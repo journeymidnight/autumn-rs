@@ -58,9 +58,6 @@ pub(crate) struct MetadataState {
     /// In-memory only, like `ps_slot_caps`; absent = no report since the PS
     /// registered or this manager became leader.
     pub ps_open_parts: HashMap<u64, HashSet<(u64, u64)>>,
-    /// `/metrics` `host:port` each PS's latest heartbeat carried (non-empty
-    /// only). In-memory only, like `ps_slot_caps`.
-    pub ps_metrics_addrs: HashMap<u64, String>,
 }
 
 impl MetadataState {

@@ -23,7 +23,7 @@
     POST /api/action  {cmd}       → actuate one autumn-op mutation (danger mode)
     GET  /api/policies + POST /api/policies/{upsert,activate,delete}
     GET  /api/ops                 → {live, history}
-    GET  /api/metrics?scope=&id=  → PS /metrics history the dashboard scraped (no autumn-op call)
+    GET  /api/metrics?scope=&id=  → PS metrics history the dashboard polled (autumn-op metrics, in its own loop)
 -->
 <html lang="zh">
 <head>
@@ -455,10 +455,10 @@
     </div>
   </section>
 
-  <!-- ── METRICS (each PS's /metrics, scraped and kept by the dashboard) ── -->
+  <!-- ── METRICS (every PS's metrics, polled via autumn-op, kept by the dashboard) ── -->
   <section class="pane" id="pane-metrics" hidden>
     <div class="cap" style="margin-top:2px"><span class="eyebrow">Metrics</span>
-      <span class="hint">scraped from every partition server's /metrics by this dashboard and kept in its memory — a restart starts over</span></div>
+      <span class="hint">every partition server's metrics, polled from the manager by this dashboard and kept in its memory — a restart starts over</span></div>
     <div class="mbar">
       <label class="ctrl">scope <select id="m_scope"></select></label>
       <span class="stamp" id="m_endpoints"></span>
@@ -1351,12 +1351,12 @@ $("#np_save").onclick=async()=>{
 };
 
 // ── Metrics tab ──────────────────────────────────────────────────────────────
-// The dashboard scrapes every PS's /metrics itself (the address each PS reports
-// on its heartbeat) and keeps the history in memory. /api/metrics sums the
-// scope's series on one time axis; counters arrive as per-second rates, and a
-// gauge summed over partitions also comes as `name:max` (the largest one).
+// The dashboard polls every PS's metrics from the manager (`autumn-op metrics`)
+// and keeps the history in memory, summed per PS. /api/metrics sums the scope's
+// series on one time axis; counters arrive as per-second rates, and a gauge
+// summed over partitions also comes as `name:max` (the largest partition).
 let METRICS=null;          // the last /api/metrics reply
-let M_SCOPE="cluster";     // "cluster" | "ps:<id>" | "part:<id>"
+let M_SCOPE="cluster";     // "cluster" | "ps:<id>"
 function metricsPath(scope){
   const [kind,id]=scope.split(":");
   return kind==="cluster" ? "/api/metrics" : `/api/metrics?scope=${kind}&id=${encodeURIComponent(id)}`;
@@ -1416,9 +1416,8 @@ function lineChart(title, t, fmt, lines){
     <div class="axis"><span>${mins?`last ${mins} min`:""}</span><span>max ${esc(fmt(max))}</span></div>
     <div class="legend">${lines.map(l=>`<span><i style="background:${l.color}"></i>${esc(l.name)} ${esc(fmt(lastOf(l.data)))}</span>`).join("")}</div></div>`;
 }
-// Every chart the tab draws, from one /api/metrics reply. A partition scope has
-// no PS-wide series (the block cache is per PS) and no "largest partition" line.
-function metricsCharts(m, isPart){
+// Every chart the tab draws, from one /api/metrics reply.
+function metricsCharts(m){
   const S=m.series, C=PALETTE, t=m.t;
   const div=(a,b)=>zipWith((p,q)=>q>0?p/q:null,a,b);
   const add=(...a)=>zipWith((...v)=>v.reduce((p,q)=>p+q,0),...a);
@@ -1432,18 +1431,16 @@ function metricsCharts(m, isPart){
     lineChart("Write latency", t, fmtSecs, [L("avg",div(S["write_duration_seconds_sum"],S["write_duration_seconds_count"]),0),
       L("p99",histQuantile(S,"write_duration_seconds",0.99),4)]),
   ];
-  if(!isPart){
-    out.push(lineChart("Block cache hit ratio", t, fmtPct,
-      [L("hits / lookups",div(S["block_cache_hits"],add(S["block_cache_hits"],S["block_cache_misses"])),1)]));
-    out.push(lineChart("Block cache size", t, fmtBytes,
-      [L("cached",S["block_cache_bytes"],0), L("capacity",S["block_cache_capacity_bytes"],8)]));
-  }
   out.push(
-    lineChart("SST tables", t, fmtNum, isPart ? [L("tables",S["sst_tables"],0)]
-      : [L("all partitions",S["sst_tables"],0), L("largest partition",S["sst_tables:max"],4)]),
+    lineChart("Block cache hit ratio", t, fmtPct,
+      [L("hits / lookups",div(S["block_cache_hits"],add(S["block_cache_hits"],S["block_cache_misses"])),1)]),
+    lineChart("Block cache size", t, fmtBytes,
+      [L("cached",S["block_cache_bytes"],0), L("capacity",S["block_cache_capacity_bytes"],8)]),
+    lineChart("SST tables", t, fmtNum,
+      [L("all partitions",S["sst_tables"],0), L("largest partition",S["sst_tables:max"],4)]),
     lineChart("Memtable", t, fmtBytes, [L("active + queued",S["memtable_bytes"],0)]),
-    lineChart("Queued memtables", t, fmtNum, isPart ? [L("immutable",S["imm_memtables"],3)]
-      : [L("all partitions",S["imm_memtables"],3), L("largest partition",S["imm_memtables:max"],4)]),
+    lineChart("Queued memtables", t, fmtNum,
+      [L("all partitions",S["imm_memtables"],3), L("largest partition",S["imm_memtables:max"],4)]),
     lineChart("Flush", t, fmtBps, [L("SST bytes",S["flush_bytes"],0)]),
     lineChart("Compactions / min", t, fmtNum, [
       L("minor · flush",perMin(S["minor_compactions{trigger=flush}"]),0),
@@ -1465,15 +1462,14 @@ function metricsCharts(m, isPart){
 }
 function renderMetricsTab(){
   const opts=[["cluster","whole cluster"],
-    ...PS_SERVERS.map(p=>[`ps:${p.ps_id}`,`PS ${p.ps_id} · ${p.addr||""}`]),
-    ...PARTS.map(p=>[`part:${p.part_id}`,`partition ${p.part_id} · PS ${p.ps_id}`])];
+    ...PS_SERVERS.map(p=>[`ps:${p.ps_id}`,`PS ${p.ps_id} · ${p.addr||""}`])];
   if(!opts.some(([v])=>v===M_SCOPE)) M_SCOPE="cluster";
   $("#m_scope").innerHTML=opts.map(([v,l])=>`<option value="${esc(v)}"${v===M_SCOPE?" selected":""}>${esc(l)}</option>`).join("");
   if(!METRICS){ $("#m_charts").innerHTML='<div class="listempty">Loading…</div>'; return; }
   const ps=METRICS.ps||[], bad=ps.filter(p=>p.error);
-  $("#m_endpoints").innerHTML = `${ps.length-bad.length}/${ps.length} partition servers scraped every ${METRICS.interval_secs}s`
+  $("#m_endpoints").innerHTML = `${ps.length-bad.length}/${ps.length} partition servers reporting, polled every ${METRICS.interval_secs}s`
     + bad.map(p=>` · <span class="bad">PS ${p.ps_id}: ${esc(p.error)}</span>`).join("");
-  $("#m_charts").innerHTML=metricsCharts(METRICS, M_SCOPE.startsWith("part:"));
+  $("#m_charts").innerHTML=metricsCharts(METRICS);
 }
 
 // ── wiring ───────────────────────────────────────────────────────────────────

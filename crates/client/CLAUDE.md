@@ -293,6 +293,8 @@ There is no `--bulk` / `bulk=` flag — call `bulk_worthwhile(size)`. The const 
 - `flush(part_id)` — trigger memtable flush.
 - `merge_partitions(survivor, victim)` — partition merge (CLI orchestration).
 - `policy_candidates() → Vec<PolicyCandidate>` — advisory engine output.
+- `fleet_metrics() → FleetMetricsResp` — every PS's and EN's latest metrics report
+  (`MSG_GET_FLEET_METRICS`), leader-routed.
 - `submit_op(OpSubmitReq) → OpSubmitResp` / `op_query(OpQueryReq) → OpQueryResp` —
   the async op-ledger (MSG_OP_SUBMIT/QUERY): submit a long-running op (split/merge/
   rebalance/compact/gc/forcegc/ec-convert) and get an `op_id` back, then poll for

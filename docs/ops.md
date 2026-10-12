@@ -507,7 +507,7 @@ a view is linkable.
 | Nodes | every extent node, with a **per-disk** table — capacity, online, faulted |
 | Policy | advisories with their full reasoning, the controller, the policy editor |
 | Logs | every op — the operator's and the auto-policy's alike — running, then durable outcomes, each marked with who asked |
-| Metrics | charts of every PS's `/metrics`, scraped by the dashboard and kept in its memory, for the cluster, one PS or one partition |
+| Metrics | charts of every PS's metrics, polled by the dashboard through `autumn-op metrics` and kept in its memory, for the cluster or one PS |
 
 Manual actions map to the allow-listed `autumn-op` subcommands (`split` / `gc` /
 `compact` / `merge` / `force-ec-convert` / `rebalance`).
@@ -524,21 +524,17 @@ CP revisions, live range checks, two EN outages, two manager failovers,
 split/merge outcomes, and full acknowledged-data readback. It also describes
 the reproduced standby-promotion heartbeat bug and its isolated comparison.
 
-**Metrics tab.** The one thing the dashboard does without `autumn-op`: it
-scrapes each PS's `/metrics` at the address the PS reports on its heartbeat
-(the PS needs `--metrics-port`; `cluster.sh` / the deploy paths pass it with
-`AUTUMN_METRICS=1`). `--metrics-interval-secs` (10) and
-`--metrics-retention-secs` (3600) set the cadence and how much history it keeps;
-the history is memory only and starts empty after a dashboard restart.
+**Metrics tab.** The poller runs `autumn-op metrics` (every PS's latest report,
+from the leader) each `--metrics-interval-secs` (10) and keeps
+`--metrics-retention-secs` (3600) of history in memory, summed per PS; the tab
+shows the cluster or one PS. The history starts empty after a dashboard restart,
+and a manager failover costs a round or two of points (autumn-op finds the new
+leader).
 
 ```bash
-AUTUMN_METRICS=1 ./cluster.sh start 3
-# Each PS's reported endpoint (null = started without --metrics-port):
-autumn-op --manager $MGR --json overview | python3 -c '
-import json,sys
-for p in json.load(sys.stdin)["ps_servers"]: print("PS", p["ps_id"], p["metrics_addr"])'
+./cluster.sh start 3
 autumn-dashboard --manager $MGR --cluster-secret-file $SECRET --metrics-interval-secs 2 &
-# After a few rounds, the history (scope=ps&id=N or scope=part&id=N narrows it):
+# After a few rounds, the history (scope=ps&id=N narrows it to one PS):
 curl -s localhost:8799/api/metrics | python3 -c '
 import json,sys; m=json.load(sys.stdin)
 print(len(m["t"]), "rounds;", m["ps"]); print(sorted(m["series"])[:12])'
@@ -547,7 +543,9 @@ print(len(m["t"]), "rounds;", m["ps"]); print(sorted(m["series"])[:12])'
 Run a perf-check write then read; on the Metrics tab requests/s and value
 bytes/s rise, the block cache hit ratio settles, SST tables grow with flushes,
 and a small `--flush-mem-bytes` shows minor compactions keeping the count down.
-A PS without the flag is named on the tab ("no /metrics endpoint reported").
+A PS that stopped reporting is named on the tab ("no new report for N s").
+With several managers give the dashboard all of them (`--manager a,b,c`) or the
+leader-routed Service.
 
 **Manual check of the two tabs that exist for facts a roll-up cannot carry:**
 
@@ -1412,18 +1410,30 @@ phases in as old extents are compacted/truncated away.
 
 ## Prometheus /metrics
 
-Every server binary takes an opt-in `--metrics-port <PORT>` flag exposing a
-Prometheus text endpoint at `http://<listen-host>:<PORT>/metrics` (plain
-`std::net` listener on its own OS thread — zero interaction with the
-io_uring data plane; absent flag = no listener). `cluster.sh` wires all
-three with `AUTUMN_METRICS=1` (manager `9591`, EN `960<i>`, PS `9701`);
-the deploy paths accept the same env (autumn-deploy / k8s entrypoint).
+The manager serves the cluster's only Prometheus text endpoint, at
+`http://<listen-host>:9591/metrics` by default (plain `std::net` listener on its
+own OS thread). `--metrics-port N` moves it, `--metrics-port 0` turns it off,
+`--metrics-listen H` binds it elsewhere than `--listen`. It is unauthenticated
+(read-only counters): pin it with `--metrics-listen 127.0.0.1` if they must not
+be visible. A taken port is logged as an ERROR and the manager serves on.
+
+Partition servers and extent nodes have no endpoint of their own (`autumn-ps` /
+`autumn-extent-node` refuse `--metrics-port` by name): a PS sends its counters on
+its load report every 5 s, an EN on its `df` answer every 2 s, and the LEADER
+exports the latest of each — `autumn_ps_*` labelled `ps` (+ `part`),
+`autumn_en_*` labelled `node`. A follower exports only its own `autumn_manager_*`
+series, so scrape every manager: nothing is counted twice (save the seconds before
+a deposed leader notices its lease lapsed), and after a failover
+the new leader's endpoint fills within one report (the counters belong to the PS
+and EN processes, so rates carry on). A reporter silent for 30 s drops out.
+`autumn-op metrics` prints the same PS/EN series from the leader (`--json`: the
+families and each reporter's report time) — the one view that needs no scrape
+configuration.
 
 ```bash
-AUTUMN_METRICS=1 AUTUMN_TRANSPORT=tcp ./cluster.sh start 3
-curl -s http://127.0.0.1:9591/metrics   # manager: leader/serving + streams/extents/nodes/partitions/ps/regions counts, per-disk online, inflight ops
-curl -s http://127.0.0.1:9701/metrics   # PS: block cache hits/misses/bytes; per partition: requests, value bytes, SST tables, memtable, flushes, minor (by trigger) / major compactions, point-lookup SST checks, large-value reads, maintenance debt
-curl -s http://127.0.0.1:9601/metrics   # EN: append batches/bytes/ns totals, extents per shard + total, per-disk online
+AUTUMN_TRANSPORT=tcp ./cluster.sh start 3
+curl -s http://127.0.0.1:9591/metrics   # leader: autumn_manager_* (leader/serving, store counts, per-disk online, inflight ops) + every PS's and EN's series
+autumn-op --manager 127.0.0.1:9001 --cluster-secret-file $SECRET metrics | grep -E 'sst_tables|block_cache_hits|en_append_bytes'
 ```
 
 EN refusals: `autumn_en_auth_rejects_total{class="opcode_denied|peer_auth|client_read|client_token"}`
@@ -1433,8 +1443,8 @@ that fails PEER_AUTH, a direct read without a valid principal, a refused
 `--cluster-secret-file` (it also counts a peer that vanished or timed out
 mid-handshake, so a lone tick is not a verdict); a rising `opcode_denied` means something is sending
 non-read ops on a Client connection. Manual check:
-`cargo test -p autumn-server --test cluster_secret` (scrapes both counters from a
-real EN started with `--metrics-port`).
+`cargo test -p autumn-server --test cluster_secret` (reads both counters of a real
+EN from the manager's `/metrics`).
 
 PS latency histograms (LAT-1): `autumn_ps_write_duration_seconds` (group-commit end-to-end across ALL write ops — Put/Delete —
 observed per batched op from the already-measured WriteLoopMetrics
@@ -1462,10 +1472,10 @@ blocks come from the cache (`hits` grows), and each GET adds to
 `get_sst_checks_total` once its key is flushed out of the memtable. A `flush`
 bumps `flushes_total` and `sst_tables`; with small flushes (`--flush-mem-bytes`
 4 MiB) and a perf-check write run, `minor_compactions_total{trigger="flush"}`
-climbs and `sst_tables` stays low. Notes: all snapshots/gauges refresh
-every 2 s (PS/manager publisher task; EN per-shard refresh loop); PS
-`requests_total` resets on PS restart (normal Prometheus counter semantics
-— use `rate()`).
+climbs and `sst_tables` stays low. Notes: PS series refresh every 5 s (the
+load report), EN series every 2 s (`df`), the manager's text every 2 s; a PS
+partition's counters restart at 0 when the partition reopens and a PS's or EN's
+when it restarts (normal Prometheus counter semantics — use `rate()`).
 
 ## Disk-full (ENOSPC) behavior
 

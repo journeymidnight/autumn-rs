@@ -532,10 +532,7 @@ misconfiguration.
 
 `ps_last_heartbeat: Arc<Mutex<HashMap<u64, Instant>>>` (ephemeral, not persisted).
 `register_ps` seeds a timestamp; the PS calls `heartbeat_ps` every 2 s (both
-carry `slot_cap`, recorded only for a registered PS — see "Rebalance"; the beat
-also carries the PS's `/metrics` address, kept in memory only in
-`MetadataState::ps_metrics_addrs` like the slot caps and shown as the overview's
-`ps_servers[].metrics_addr` for the dashboard's poller);
+carry `slot_cap`, recorded only for a registered PS — see "Rebalance");
 `ps_liveness_check_loop` (2 s) evicts a PS not seen in 10 s — fenced
 `put_and_delete_txn(delete psNodes/<id>)` then `rebalance_regions`. On eviction
 `handle_heartbeat_ps` returns `CODE_NOT_FOUND` so the PS re-registers +
@@ -1990,7 +1987,7 @@ The manager **no longer serves a web UI** — the old in-manager `dashboard.rs`
 (axum over `cyper_axum::serve` + `include_str!` HTML) is gone. The dashboard is
 now a standalone app, `crates/server/src/bin/autumn_dashboard` (the `autumn-dashboard` binary), which
 holds no cluster state and drives the cluster ONLY through `autumn-op` (its
-Metrics tab scrapes PS `/metrics` directly, at `ps_servers[].metrics_addr`) — so the
+Metrics tab polls `autumn-op metrics`) — so the
 wire schema stays in exactly one place. It requires `--cluster-secret-file` (forwarded to autumn-op, which connects as an operator); the dashboard HTTP port itself has no authentication.
 
 What survives in this crate is `dashboard_compose.rs`: the pure `/api/overview`
@@ -2302,10 +2299,30 @@ no PS could possibly heartbeat into the unbound socket.
 `AutumnManager::metrics_text()` renders leader/serving gauges + store counts (streams /
 extents / nodes / partitions / ps_nodes / regions / part_addrs), per-disk online (the
 `df` call-result signal), and the inflight-op count. Because the store is `!Send`, the
-`--metrics-port` path runs a 2 s publisher task on the compio runtime that copies the
+`/metrics` endpoint (on by default, port 9591; `--metrics-port 0` turns it off) runs a 2 s publisher task on the compio runtime that copies the
 rendered string into an `Arc<RwLock<String>>` served by the shared
 `autumn_common::metrics_http` listener thread. A follower's counts are replay-stale —
 scrape `autumn_manager_leader` to pick the authoritative instance.
+
+**It is the only `/metrics` in the cluster** (`fleet_metrics.rs`). A PS sends its
+counters on the load report (`PartitionLoad.counters` per partition, the PS's block
+cache in `ReportPartitionLoadReq.block_cache`, every 5 s); an EN on its `df` answer
+(`DfResp.counters`, `DiskStatus.full`, every 2 s). The leader keeps the latest of each
+in memory (`FleetMetrics`); the 2 s publisher snapshots them (`fleet_metrics_snapshot`)
+and the HTTP thread renders them after the manager's own series on each scrape —
+`autumn_ps_*` labelled `ps` (+ `part`), `autumn_en_*` labelled `node` — so with
+thousands of partitions the formatting stays off the control runtime. Only the
+leader records or exports them, so scraping every manager counts nothing twice
+(except while an old leader has not yet noticed its lease lapse; its reports then
+age out within 30 s). Only a registered PS's report is kept (an evicted PS that is
+still reporting stays out); a PS with no partition still reports. A report older
+than 30 s is left out, and eviction drops a PS's; a new leader starts empty and is
+full again within one report, and the counters are the reporters' own (monotonic in the PS / EN process),
+so rates carry on across a failover. `MSG_GET_FLEET_METRICS` (0x66, leader-gated)
+returns the same reports; `autumn-op metrics` prints them as Prometheus text (`--json`:
+the families plus each reporter's report time), from the one renderer
+(`families` / `render_text` / `to_json`). Cost: ~25 counters + two 9-bucket histograms
+per partition on the 5 s report. Test: `fleet_metrics::tests`.
 
 ## Runtime dependency
 

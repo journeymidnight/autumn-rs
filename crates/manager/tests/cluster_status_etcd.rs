@@ -99,7 +99,6 @@ fn status_counts_against_the_expected_fleet() {
                     ps_id,
                     slot_cap: 0,
                     open_parts: Vec::new(),
-                    metrics_addr: String::new(),
                 };
                 ps_call(&a, MSG_HEARTBEAT_PS, rkyv_encode(&req).to_vec()).await;
             }
@@ -141,7 +140,6 @@ fn status_counts_against_the_expected_fleet() {
                     ps_id,
                     slot_cap: 0,
                     open_parts: Vec::new(),
-                    metrics_addr: String::new(),
                 };
                 ps_call(&a, MSG_HEARTBEAT_PS, rkyv_encode(&req).to_vec()).await;
             }

@@ -15,14 +15,15 @@
 //! `autumn-op` call: autumn-op connects as an operator, which the manager
 //! refuses without the secret, read-only calls included.
 //!
-//! It also scrapes every partition server's `/metrics` (the address each PS
-//! reports on its heartbeat) on its own, and keeps the history in memory for
-//! `/api/metrics` — see `metrics_store.rs`.
+//! It also polls every partition server's metrics (`autumn-op metrics`, from
+//! the leader) and keeps the history in memory for `/api/metrics` — see
+//! `metrics_store.rs`.
 
 mod metrics_store;
 
 use std::cell::RefCell;
-use std::io::{Read, Write};
+use std::collections::{BTreeMap, HashMap};
+use std::io::Read;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -35,7 +36,7 @@ use axum::Router;
 use send_wrapper::SendWrapper;
 use serde::Deserialize;
 
-use metrics_store::{MetricsStore, PsStatus, Scope};
+use metrics_store::{short_name, MetricsStore, PsStatus, Sample, Scope};
 
 const INDEX_HTML: &str = include_str!("static/index.html");
 const USAGE: &str = "usage: autumn-dashboard --manager H:P [--transport tcp|ucx] \
@@ -61,13 +62,6 @@ struct Config {
     metrics_retention: Duration,
 }
 
-/// How often the poller re-reads the PS list (and their metrics addresses)
-/// through `autumn-op overview`; sooner while a PS has reported none yet (it
-/// reports on its heartbeat, after it registers).
-const PS_LIST_REFRESH: Duration = Duration::from_secs(60);
-const PS_LIST_REFRESH_INCOMPLETE: Duration = Duration::from_secs(10);
-/// One PS scrape: connect + read the whole reply.
-const SCRAPE_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl Config {
     /// Run `autumn-op --manager .. --transport .. --cluster-secret-file .. --json <args>`
@@ -291,94 +285,93 @@ async fn overview(cfg: &Config) -> Response<Body> {
 
 #[derive(Deserialize)]
 struct MetricsQuery {
-    /// `cluster` (default), `ps` or `part`.
+    /// `cluster` (default) or `ps`.
     scope: Option<String>,
     id: Option<u64>,
 }
 
-/// `/api/metrics?scope=cluster|ps|part&id=N` — the scraped history, summed
-/// over the scope (see `MetricsStore::query`).
+/// `/api/metrics?scope=cluster|ps&id=N` — the polled history, summed over the
+/// scope (see `MetricsStore::query`).
 fn metrics(store: &RefCell<MetricsStore>, q: MetricsQuery) -> Response<Body> {
     let scope = match (q.scope.as_deref().unwrap_or("cluster"), q.id) {
         ("cluster", _) => Scope::Cluster,
         ("ps", Some(id)) => Scope::Ps(id),
-        ("part", Some(id)) => Scope::Part(id),
-        _ => return bad_request("scope must be cluster, or ps / part with an id"),
+        _ => return bad_request("scope must be cluster, or ps with an id"),
     };
     json_resp(StatusCode::OK, store.borrow().query(&scope).to_string())
 }
 
-/// `(ps_id, metrics_addr)` of every PS in the live registry, from `autumn-op
-/// overview`. An evicted member stays listed until it is removed, but has
-/// nothing to scrape.
-async fn ps_metrics_targets(cfg: &Config) -> Result<Vec<(u64, Option<String>)>> {
-    let (out, ok) = cfg.run_op(vec!["overview".into()]).await;
-    if !ok {
-        bail!("autumn-op overview: {out}");
+/// One PS's report from `autumn-op metrics --json`: its id, when the leader
+/// received it, and its `autumn_ps_*` samples (labels other than `ps` / `part`
+/// folded into the short name, e.g. `minor_compactions{trigger=flush}`).
+fn parse_fleet(v: &serde_json::Value) -> Result<Vec<(u64, u64, Vec<Sample>)>> {
+    let mut reports: BTreeMap<u64, (u64, Vec<Sample>)> = BTreeMap::new();
+    for p in v["ps"].as_array().ok_or_else(|| anyhow!("metrics reply has no ps list"))? {
+        let id = p["ps_id"].as_u64().ok_or_else(|| anyhow!("ps entry without ps_id"))?;
+        reports.insert(id, (p["reported_at_ms"].as_u64().unwrap_or(0), Vec::new()));
     }
-    parse_metrics_targets(&serde_json::from_str(&out)?)
-}
-
-fn parse_metrics_targets(overview: &serde_json::Value) -> Result<Vec<(u64, Option<String>)>> {
-    let rows = overview["ps_servers"]
+    let families = v["families"]
         .as_array()
-        .ok_or_else(|| anyhow!("overview has no ps_servers"))?;
-    Ok(rows
-        .iter()
-        .filter(|p| p["evicted_at_ms"].is_null())
-        .filter_map(|p| {
-            let id = p["ps_id"].as_u64()?;
-            Some((id, p["metrics_addr"].as_str().map(str::to_string)))
-        })
-        .collect())
-}
-
-/// GET `http://{addr}/metrics`, blocking (run on a blocking thread).
-fn scrape(addr: &str) -> Result<String> {
-    use std::net::ToSocketAddrs;
-    let sa = addr
-        .to_socket_addrs()?
-        .next()
-        .ok_or_else(|| anyhow!("{addr} resolves to nothing"))?;
-    let mut conn = std::net::TcpStream::connect_timeout(&sa, SCRAPE_TIMEOUT)?;
-    conn.set_read_timeout(Some(SCRAPE_TIMEOUT))?;
-    conn.set_write_timeout(Some(SCRAPE_TIMEOUT))?;
-    write!(conn, "GET /metrics HTTP/1.0\r\nHost: {addr}\r\n\r\n")?;
-    let mut reply = String::new();
-    conn.read_to_string(&mut reply)?;
-    let (head, body) = reply
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| anyhow!("malformed HTTP reply"))?;
-    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
-        bail!("{}", head.lines().next().unwrap_or(head));
+        .ok_or_else(|| anyhow!("metrics reply has no families"))?;
+    for f in families {
+        let Some(fname) = f["name"].as_str().filter(|n| n.starts_with("autumn_ps_")) else {
+            continue;
+        };
+        // A histogram's buckets, sum and count are all cumulative counters.
+        let counter = matches!(f["type"].as_str(), Some("counter" | "histogram"));
+        for s in f["samples"].as_array().into_iter().flatten() {
+            let labels = s["labels"].as_object();
+            let label = |k: &str| labels.and_then(|l| l.get(k)).and_then(|v| v.as_str());
+            let Some(ps) = label("ps").and_then(|p| p.parse::<u64>().ok()) else {
+                continue;
+            };
+            let Some((_, samples)) = reports.get_mut(&ps) else { continue };
+            let extra: Vec<String> = labels
+                .into_iter()
+                .flatten()
+                .filter(|(k, _)| *k != "ps" && *k != "part")
+                .map(|(k, v)| format!("{k}={}", v.as_str().unwrap_or_default()))
+                .collect();
+            let base = short_name(s["name"].as_str().unwrap_or(fname));
+            samples.push(Sample {
+                name: if extra.is_empty() { base.to_string() } else { format!("{base}{{{}}}", extra.join(",")) },
+                counter,
+                per_partition: label("part").is_some(),
+                value: s["value"].as_f64().unwrap_or(0.0),
+            });
+        }
     }
-    Ok(body.to_string())
+    Ok(reports.into_iter().map(|(id, (t, s))| (id, t, s)).collect())
 }
 
-/// Fold one PS's scrape of round `t` into the store.
-fn fold_scrape(
+/// Fold one round's reports: a report newer than the last one ingested for
+/// its PS is ingested; one that is not, from a PS heard before, leaves the
+/// round incomplete for that PS.
+fn fold_reports(
     st: &mut MetricsStore,
-    id: u64,
-    t: u64,
-    addr: Option<String>,
-    got: Result<String>,
+    reports: Vec<(u64, u64, Vec<Sample>)>,
+    last_seen: &mut HashMap<u64, u64>,
 ) {
-    let last_ok_ms = st.status(id).and_then(|s| s.last_ok_ms);
-    let status = match got {
-        Ok(text) => {
-            st.ingest(id, t, &text);
-            PsStatus { metrics_addr: addr, last_ok_ms: Some(t), error: None }
-        }
-        Err(e) => {
-            // Only a scrape that failed leaves the round incomplete: a PS with
-            // no endpoint never contributes, so its absence is no dip.
-            if addr.is_some() {
+    let ids: Vec<u64> = reports.iter().map(|(id, _, _)| *id).collect();
+    st.retain_ps(&ids);
+    last_seen.retain(|id, _| ids.contains(id));
+    for (id, report_ms, samples) in reports {
+        match last_seen.get(&id) {
+            Some(prev) if *prev >= report_ms => {
                 st.record_failure(id);
+                let age = now_ms().saturating_sub(report_ms) / 1000;
+                st.set_status(id, PsStatus {
+                    last_report_ms: Some(report_ms),
+                    error: Some(format!("no new report for {age} s")),
+                });
             }
-            PsStatus { metrics_addr: addr, last_ok_ms, error: Some(format!("{e:#}")) }
+            _ => {
+                st.ingest(id, report_ms, &samples);
+                last_seen.insert(id, report_ms);
+                st.set_status(id, PsStatus { last_report_ms: Some(report_ms), error: None });
+            }
         }
-    };
-    st.set_status(id, status);
+    }
 }
 
 fn now_ms() -> u64 {
@@ -387,43 +380,23 @@ fn now_ms() -> u64 {
         .map_or(0, |d| d.as_millis() as u64)
 }
 
-/// Scrape every PS once per `metrics_interval`, forever. The PS list comes
-/// from the manager every `PS_LIST_REFRESH`; a failed refresh keeps the last.
+/// Ask the manager for every PS's latest report once per `metrics_interval`,
+/// forever. Only the leader holds them; `autumn-op` finds it, so a manager
+/// failover costs a round or two, not a reconfiguration.
 async fn metrics_poller(cfg: Rc<Config>, store: Rc<RefCell<MetricsStore>>) {
-    let mut targets: Vec<(u64, Option<String>)> = Vec::new();
-    let mut next_list = Instant::now();
+    let mut last_seen: HashMap<u64, u64> = HashMap::new();
     loop {
         let round = Instant::now();
-        if round >= next_list {
-            match ps_metrics_targets(&cfg).await {
-                Ok(t) => {
-                    targets = t;
-                    let complete = targets.iter().all(|(_, addr)| addr.is_some());
-                    next_list = round
-                        + if complete { PS_LIST_REFRESH } else { PS_LIST_REFRESH_INCOMPLETE };
-                    let ids: Vec<u64> = targets.iter().map(|(id, _)| *id).collect();
-                    store.borrow_mut().retain_ps(&ids);
-                }
-                Err(e) => tracing::warn!("metrics poller: PS list: {e:#}"),
-            }
-        }
-        let t = now_ms();
-        store.borrow_mut().begin_round(t);
-        let scrapes = targets.iter().map(|(id, addr)| {
-            let (id, addr) = (*id, addr.clone());
-            async move {
-                let Some(addr) = addr else {
-                    return (id, None, Err(anyhow!("no /metrics endpoint reported")));
-                };
-                let a = addr.clone();
-                let got = compio::runtime::spawn_blocking(move || scrape(&a))
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow!("scrape thread panicked")));
-                (id, Some(addr), got)
-            }
-        });
-        for (id, addr, got) in futures::future::join_all(scrapes).await {
-            fold_scrape(&mut store.borrow_mut(), id, t, addr, got);
+        store.borrow_mut().begin_round(now_ms());
+        let (out, ok) = cfg.run_op(vec!["metrics".into()]).await;
+        let parsed = if ok {
+            serde_json::from_str(&out).map_err(anyhow::Error::from).and_then(|v| parse_fleet(&v))
+        } else {
+            Err(anyhow!("autumn-op metrics: {out}"))
+        };
+        match parsed {
+            Ok(reports) => fold_reports(&mut store.borrow_mut(), reports, &mut last_seen),
+            Err(e) => tracing::warn!("metrics poller: {e:#}"),
         }
         compio::time::sleep(cfg.metrics_interval.saturating_sub(round.elapsed())).await;
     }
@@ -923,41 +896,51 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{fold_scrape, parse_metrics_targets};
+    use super::{fold_reports, parse_fleet};
     use crate::metrics_store::{MetricsStore, Scope};
-    use anyhow::anyhow;
+    use std::collections::HashMap;
     use std::time::Duration;
 
-    const TEXT: &str = "# TYPE autumn_ps_partition_sst_tables gauge\n\
-                        autumn_ps_partition_sst_tables{ps=\"1\",part=\"7\"} 3\n";
-
-    #[test]
-    fn a_ps_without_an_endpoint_does_not_blank_the_cluster_view() {
-        let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
-        st.begin_round(10_000);
-        fold_scrape(&mut st, 1, 10_000, Some("a:1".into()), Ok(TEXT.into()));
-        fold_scrape(&mut st, 2, 10_000, None, Err(anyhow!("no /metrics endpoint reported")));
-        assert_eq!(st.query(&Scope::Cluster)["series"]["sst_tables"], serde_json::json!([3.0]));
-        // A PS with an endpoint that fails this round does leave a gap.
-        st.begin_round(20_000);
-        fold_scrape(&mut st, 1, 20_000, Some("a:1".into()), Ok(TEXT.into()));
-        fold_scrape(&mut st, 3, 20_000, Some("c:3".into()), Err(anyhow!("refused")));
-        assert_eq!(
-            st.query(&Scope::Cluster)["series"]["sst_tables"],
-            serde_json::json!([3.0, null])
-        );
+    fn reply(report_ms: u64, tables: f64) -> serde_json::Value {
+        serde_json::json!({
+            "ps": [{"ps_id": 1, "reported_at_ms": report_ms, "partitions": 2}],
+            "nodes": [{"node_id": 9, "reported_at_ms": report_ms}],
+            "families": [
+                {"name": "autumn_ps_partition_sst_tables", "type": "gauge", "samples": [
+                    {"name": "autumn_ps_partition_sst_tables", "labels": {"ps": "1", "part": "7"}, "value": tables},
+                    {"name": "autumn_ps_partition_sst_tables", "labels": {"ps": "1", "part": "8"}, "value": 1.0}]},
+                {"name": "autumn_ps_get_duration_seconds", "type": "histogram", "samples": [
+                    {"name": "autumn_ps_get_duration_seconds_bucket", "labels": {"ps": "1", "part": "7", "le": "0.0005"}, "value": 4.0}]},
+                {"name": "autumn_en_extents", "type": "gauge", "samples": [
+                    {"name": "autumn_en_extents", "labels": {"node": "9"}, "value": 3.0}]}
+            ]
+        })
     }
 
     #[test]
-    fn evicted_members_are_not_scrape_targets() {
-        let ov = serde_json::json!({"ps_servers": [
-            {"ps_id": 1, "metrics_addr": "10.0.0.1:9701", "evicted_at_ms": null},
-            {"ps_id": 2, "metrics_addr": null, "evicted_at_ms": null},
-            {"ps_id": 3, "metrics_addr": null, "evicted_at_ms": 1700000000000u64},
-        ]});
+    fn a_reply_becomes_one_summed_report_per_ps() {
+        let reports = parse_fleet(&reply(5_000, 3.0)).unwrap();
+        assert_eq!(reports.len(), 1);
+        let (id, t, samples) = &reports[0];
+        assert_eq!((*id, *t), (1, 5_000));
+        let names: Vec<&str> = samples.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["sst_tables", "sst_tables", "get_duration_seconds_bucket{le=0.0005}"]);
+        assert!(samples[2].counter && samples[0].per_partition && !samples[0].counter);
+    }
+
+    #[test]
+    fn a_report_that_did_not_advance_leaves_a_gap_not_a_dip() {
+        let mut st = MetricsStore::new(Duration::from_secs(10), Duration::from_secs(3600));
+        let mut seen = HashMap::new();
+        st.begin_round(10_000);
+        fold_reports(&mut st, parse_fleet(&reply(9_000, 3.0)).unwrap(), &mut seen);
+        st.begin_round(20_000);
+        fold_reports(&mut st, parse_fleet(&reply(9_000, 3.0)).unwrap(), &mut seen);
+        st.begin_round(30_000);
+        fold_reports(&mut st, parse_fleet(&reply(29_000, 5.0)).unwrap(), &mut seen);
         assert_eq!(
-            parse_metrics_targets(&ov).unwrap(),
-            vec![(1, Some("10.0.0.1:9701".to_string())), (2, None)]
+            st.query(&Scope::Cluster)["series"]["sst_tables"],
+            serde_json::json!([4.0, null, 6.0])
         );
     }
 }

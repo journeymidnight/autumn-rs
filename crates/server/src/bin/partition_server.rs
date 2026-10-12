@@ -27,6 +27,7 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
+
 struct Args {
     /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
     cluster_secret_file: Option<std::path::PathBuf>,
@@ -94,13 +95,6 @@ struct Args {
     /// enough to surface every thread's pool activity. Useful for
     /// confirming the registered-buffer hit rate during a perf run.
     regpool_log_interval_secs: Option<u64>,
-    /// Observability batch 1: Prometheus `/metrics` HTTP port.
-    /// `None` = endpoint disabled (zero cost).
-    metrics_port: Option<u16>,
-    /// Bind host for /metrics only. `None` = follow `--listen`. The
-    /// endpoint is unauthenticated — operators exposing the RPC plane
-    /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
-    metrics_listen: Option<String>,
     // pprof CLI flags (replaces AUTUMN_PPROF_* env reads).
     #[cfg(feature = "profiling")]
     pprof_secs: Option<u64>,
@@ -156,8 +150,6 @@ fn parse_args() -> Args {
     let mut gc_rate_bytes_per_sec: Option<u64> = None;
     let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut regpool_log_interval_secs: Option<u64> = None;
-    let mut metrics_port: Option<u16> = None;
-    let mut metrics_listen: Option<String> = None;
     #[cfg(feature = "profiling")]
     let mut pprof_secs: Option<u64> = None;
     #[cfg(feature = "profiling")]
@@ -431,13 +423,12 @@ fn parse_args() -> Args {
                         .expect("--regpool-log-interval-secs u64"),
                 );
             }
-            "--metrics-port" => {
-                i += 1;
-                metrics_port = Some(args[i].parse().expect("--metrics-port must be a port"));
-            }
-            "--metrics-listen" => {
-                i += 1;
-                metrics_listen = Some(args[i].clone());
+            "--metrics-port" | "--metrics-listen" => {
+                eprintln!(
+                    "error: {} was removed; {} metrics reach the manager, whose /metrics exports them",
+                    args[i], "partition-server"
+                );
+                std::process::exit(2);
             }
             #[cfg(feature = "profiling")]
             "--pprof-secs" => {
@@ -578,8 +569,6 @@ fn parse_args() -> Args {
         gc_rate_bytes_per_sec,
         ucx_regpool_cap_bytes,
         regpool_log_interval_secs,
-        metrics_port,
-        metrics_listen,
         #[cfg(feature = "profiling")]
         pprof_secs,
         #[cfg(feature = "profiling")]
@@ -860,10 +849,6 @@ async fn main() -> Result<()> {
     // implicit `sync_regions_once()` runs `open_partition`. On restart, partitions
     // already exist in the manager — without this, `open_partition` reads
     // `base_port = 0` and binds the first partition to port `0 + 1 = 1`.
-    let advertise_host = advertise
-        .rsplit_once(':')
-        .map_or(advertise.as_str(), |(h, _)| h)
-        .to_string();
     let ps = PartitionServer::connect_with_advertise_and_port(
         args.psid,
         &args.manager,
@@ -904,43 +889,6 @@ async fn main() -> Result<()> {
             })
             .detach();
             tracing::info!(period_secs = secs, "regpool periodic log armed");
-        }
-    }
-
-    // Observability batch 1: /metrics endpoint. `partitions` is
-    // Rc/!Send, so a 2 s publisher task on the MAIN compio runtime
-    // renders the snapshot; the HTTP listener (own OS thread) serves the
-    // latest copy.
-    if let Some(mport) = args.metrics_port {
-        let snap = autumn_common::metrics_http::MetricsSnapshot::new();
-        // Initial snapshot BEFORE the listener — a scrape that races
-        // startup gets real data, never an empty 200 (coco P3).
-        snap.publish(ps.metrics_text());
-        let snap_http = snap.clone();
-        let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
-        match autumn_common::metrics_http::spawn_metrics_http(
-            mhost,
-            mport,
-            std::sync::Arc::new(move || snap_http.get().as_ref().clone()),
-        ) {
-            Ok(()) => {
-                let ps2 = ps.clone();
-                compio::runtime::spawn(async move {
-                    loop {
-                        compio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        // Render OUTSIDE any lock; publish is an O(1)
-                        // Arc swap — never blocks the main runtime
-                        // behind a scraper (coco P2).
-                        snap.publish(ps2.metrics_text());
-                    }
-                })
-                .detach();
-                let reach = metrics_reach_addr(mhost, &advertise_host, mport);
-                ps.set_metrics_addr(reach.clone());
-                tracing::info!(port = mport, host = mhost, reach, "metrics endpoint up at /metrics");
-            }
-            // Auxiliary — a taken metrics port must not kill the data plane.
-            Err(e) => tracing::error!(port = mport, "metrics endpoint bind failed: {e}"),
         }
     }
 
@@ -994,35 +942,5 @@ fn install_term_handler() {
             libc::SIGINT,
             handle_term_signal as *const () as libc::sighandler_t,
         );
-    }
-}
-
-/// Where others reach this PS's `/metrics`: the host its listener is bound to
-/// (`--metrics-listen`, else `--listen`) when that names one, else — bound to
-/// every address — the advertised host.
-fn metrics_reach_addr(bind_host: &str, advertise_host: &str, port: u16) -> String {
-    let host = match bind_host {
-        h if !matches!(h, "0.0.0.0" | "::" | "[::]") => {
-            if h.contains(':') && !h.starts_with('[') {
-                format!("[{h}]")
-            } else {
-                h.to_string()
-            }
-        }
-        _ => advertise_host.to_string(),
-    };
-    format!("{host}:{port}")
-}
-
-#[cfg(test)]
-mod metrics_reach_tests {
-    use super::metrics_reach_addr;
-
-    #[test]
-    fn a_specific_bind_host_is_reported_and_a_wildcard_falls_back_to_the_advertised_one() {
-        assert_eq!(metrics_reach_addr("10.0.0.5", "1.2.3.4", 9701), "10.0.0.5:9701");
-        assert_eq!(metrics_reach_addr("0.0.0.0", "1.2.3.4", 9701), "1.2.3.4:9701");
-        assert_eq!(metrics_reach_addr("::", "[fd00::1]", 9701), "[fd00::1]:9701");
-        assert_eq!(metrics_reach_addr("fd00::2", "x", 9701), "[fd00::2]:9701");
     }
 }

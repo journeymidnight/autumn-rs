@@ -244,7 +244,7 @@ descriptor 前做 `check_key`，但 EN 收到的只是坐标，不知道它属�
 不防的：持有集群密钥的进程被攻破（见 §9，密钥即信任根）；Client 通过 EN 直读读到
 grant 之外的 extent（§10）。
 
-拒绝按类计数，EN `/metrics` 的 `autumn_en_auth_rejects_total{class}`：`opcode_denied`
+拒绝按类计数，EN 随 df 上报、由 manager `/metrics` 导出为 `autumn_en_auth_rejects_total{node,class}`：`opcode_denied`
 （Client 发了不许发的 op）、`peer_auth`（PEER_AUTH 握手失败：密钥不符，或对端在握手中途断开/超时）、`client_read`（authz 开启，
 读请求没有有效 principal）、`client_token`（`CLIENT_AUTH` 的 token 被拒）。`Unavailable`
 （EN 还没拿到 authz 配置）不是拒绝，不计数。只在拒绝路径上累加，放行路径零开销。

@@ -172,15 +172,6 @@ enum EnReject {
     ClientToken,
 }
 
-impl EnReject {
-    const ALL: [(EnReject, &'static str); 4] = [
-        (EnReject::OpcodeDenied, "opcode_denied"),
-        (EnReject::PeerAuth, "peer_auth"),
-        (EnReject::ClientRead, "client_read"),
-        (EnReject::ClientToken, "client_token"),
-    ];
-}
-
 static EN_REJECTS: [std::sync::atomic::AtomicU64; 4] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -195,9 +186,6 @@ fn note_reject(class: EnReject) {
 pub struct EnShardGauges {
     shard_idx: u32,
     extents: std::sync::atomic::AtomicU64,
-    /// (disk_id, DiskHealth as u64: 0=Online 1=Full 2=Faulted) — disk
-    /// set is fixed at construction.
-    disks: Vec<(u64, std::sync::atomic::AtomicU64)>,
 }
 
 /// One slot per LIVE ExtentNode instance. Weak entries (coco P2): a
@@ -207,98 +195,27 @@ pub struct EnShardGauges {
 static EN_SHARD_GAUGES: std::sync::Mutex<Vec<std::sync::Weak<EnShardGauges>>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Render the EN's Prometheus text. Extents are summed across shards
-/// (shards own disjoint extent sets); per-disk health takes the WORST
-/// across shards. That fold is now belt-and-braces rather than load-bearing:
-/// the health cell itself is SHARED per physical directory
-/// (`shared_disk_health`, canonical-path keyed), so a flip by any shard is
-/// already visible to all of them — the comment here used to say the opposite.
-/// `autumn_en_disk_online` = 0 iff some shard sees Faulted,
-/// `autumn_en_disk_full` = 1 iff some shard sees Full (and none Faulted).
-pub fn render_en_metrics() -> String {
-    use autumn_common::metrics_http::{push_metric, push_type};
+/// The process-wide counters for the next `df` answer. Extents are summed per
+/// shard slot (shards own disjoint extent sets). Safe from any thread.
+pub(crate) fn en_counters() -> autumn_rpc::extent_rpc::EnCounters {
     use std::sync::atomic::Ordering::Relaxed;
-    let mut out = String::with_capacity(1024);
-    push_type(&mut out, "autumn_en_append_batches_total", "counter");
-    push_metric(
-        &mut out,
-        "autumn_en_append_batches_total",
-        &[],
-        EN_APPEND_TOTALS.requests.load(Relaxed) as f64,
-    );
-    push_type(&mut out, "autumn_en_append_bytes_total", "counter");
-    push_metric(
-        &mut out,
-        "autumn_en_append_bytes_total",
-        &[],
-        EN_APPEND_TOTALS.bytes.load(Relaxed) as f64,
-    );
-    push_type(&mut out, "autumn_en_append_ns_total", "counter");
-    push_metric(
-        &mut out,
-        "autumn_en_append_ns_total",
-        &[],
-        EN_APPEND_TOTALS.ns.load(Relaxed) as f64,
-    );
-    push_type(&mut out, "autumn_en_auth_rejects_total", "counter");
-    for (class, name) in EnReject::ALL {
-        push_metric(
-            &mut out,
-            "autumn_en_auth_rejects_total",
-            &[("class", name.to_string())],
-            EN_REJECTS[class as usize].load(Relaxed) as f64,
-        );
-    }
     let slots: Vec<std::sync::Arc<EnShardGauges>> = {
         let mut guard = EN_SHARD_GAUGES.lock().unwrap();
         // Prune slots whose ExtentNode has dropped (coco P2).
         guard.retain(|w| w.strong_count() > 0);
         guard.iter().filter_map(|w| w.upgrade()).collect()
     };
-    let mut extents_total: u64 = 0;
-    // Worst health per disk across shards (0=Online 1=Full 2=Faulted).
-    let mut disk_health: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-    push_type(&mut out, "autumn_en_shard_extents", "gauge");
-    for s in slots.iter() {
-        let e = s.extents.load(Relaxed);
-        extents_total += e;
-        push_metric(
-            &mut out,
-            "autumn_en_shard_extents",
-            &[("shard", s.shard_idx.to_string())],
-            e as f64,
-        );
-        for (disk_id, health) in &s.disks {
-            let v = health.load(Relaxed);
-            disk_health
-                .entry(*disk_id)
-                .and_modify(|cur| *cur = (*cur).max(v))
-                .or_insert(v);
-        }
+    let reject = |c: EnReject| EN_REJECTS[c as usize].load(Relaxed);
+    autumn_rpc::extent_rpc::EnCounters {
+        append_batches: EN_APPEND_TOTALS.requests.load(Relaxed),
+        append_bytes: EN_APPEND_TOTALS.bytes.load(Relaxed),
+        append_ns: EN_APPEND_TOTALS.ns.load(Relaxed),
+        rejects_opcode_denied: reject(EnReject::OpcodeDenied),
+        rejects_peer_auth: reject(EnReject::PeerAuth),
+        rejects_client_read: reject(EnReject::ClientRead),
+        rejects_client_token: reject(EnReject::ClientToken),
+        shard_extents: slots.iter().map(|s| (s.shard_idx, s.extents.load(Relaxed))).collect(),
     }
-    push_type(&mut out, "autumn_en_extents", "gauge");
-    push_metric(&mut out, "autumn_en_extents", &[], extents_total as f64);
-    let mut disk_ids: Vec<u64> = disk_health.keys().copied().collect();
-    disk_ids.sort_unstable();
-    push_type(&mut out, "autumn_en_disk_online", "gauge");
-    for disk_id in &disk_ids {
-        push_metric(
-            &mut out,
-            "autumn_en_disk_online",
-            &[("disk_id", disk_id.to_string())],
-            u64::from(disk_health[disk_id] != 2) as f64,
-        );
-    }
-    push_type(&mut out, "autumn_en_disk_full", "gauge");
-    for disk_id in &disk_ids {
-        push_metric(
-            &mut out,
-            "autumn_en_disk_full",
-            &[("disk_id", disk_id.to_string())],
-            u64::from(disk_health[disk_id] == 1) as f64,
-        );
-    }
-    out
 }
 
 // ─── DiskFS ──────────────────────────────────────────────────────────────────
@@ -3838,24 +3755,12 @@ impl ExtentNode {
             );
         }
 
-        // Observability batch 1: register this instance's gauge slot —
-        // the registry holds a Weak, so a dropped/failed-init node is
-        // pruned by the renderer (coco P2/P3). Disk set is fixed for the
-        // node's lifetime; initial state = all online (matches DiskFS
-        // construction).
+        // Register this instance's gauge slot — the registry holds a Weak,
+        // so a dropped/failed-init node is pruned by `en_counters` (coco P2).
         let metrics_gauges = {
-            let mut disk_slots: Vec<(u64, std::sync::atomic::AtomicU64)> = disk_map
-                .keys()
-                // DiskHealth::Online as u64 == 0 (coco P3: the old `1`
-                // meant online under the bool scheme; under the health
-                // scheme it reads as Full until the first sweep).
-                .map(|id| (*id, std::sync::atomic::AtomicU64::new(0)))
-                .collect();
-            disk_slots.sort_unstable_by_key(|(id, _)| *id);
             let g = std::sync::Arc::new(EnShardGauges {
                 shard_idx: config.shard_idx,
                 extents: std::sync::atomic::AtomicU64::new(0),
-                disks: disk_slots,
             });
             EN_SHARD_GAUGES
                 .lock()
@@ -3961,20 +3866,17 @@ impl ExtentNode {
                         return; // node dropped — exit, slot gets pruned
                     };
                     gauges.extents.store(extents.len() as u64, Relaxed);
-                    for (disk_id, health_slot) in &gauges.disks {
-                        if let Some(disk) = disks.get(disk_id) {
-                            if disk.health() == DiskHealth::Full {
-                                let (total, free) = disk.disk_stats();
-                                if total > 0 && free >= total / 20 && disk.try_clear_full() {
-                                    tracing::info!(
-                                        disk_id,
-                                        free,
-                                        total,
-                                        "disk no longer full — allocation re-enabled"
-                                    );
-                                }
+                    for disk in disks.values() {
+                        if disk.health() == DiskHealth::Full {
+                            let (total, free) = disk.disk_stats();
+                            if total > 0 && free >= total / 20 && disk.try_clear_full() {
+                                tracing::info!(
+                                    disk_id = disk.disk_id,
+                                    free,
+                                    total,
+                                    "disk no longer full — allocation re-enabled"
+                                );
                             }
-                            health_slot.store(disk.health() as u64, Relaxed);
                         }
                     }
                     drop((extents, disks, gauges));
@@ -8824,6 +8726,7 @@ impl ExtentNode {
                             .get(&disk.disk_id)
                             .copied()
                             .unwrap_or(0),
+                        full: disk.health() == DiskHealth::Full,
                     },
                 ));
             }
@@ -8838,6 +8741,7 @@ impl ExtentNode {
                             free,
                             online: disk.online(),
                             extent_bytes: extent_bytes_by_disk.get(disk_id).copied().unwrap_or(0),
+                            full: disk.health() == DiskHealth::Full,
                         },
                     ));
                 }
@@ -8895,6 +8799,7 @@ impl ExtentNode {
         let op_failures = self.done.take_op_failures();
 
         Ok(rkyv_encode(&DfResp {
+            counters: en_counters(),
             done_tasks,
             ec_done,
             scrub_done,
@@ -14912,16 +14817,16 @@ mod client_direct_read_auth_tests {
         assert_eq!(&read(&peer, &addr).await.unwrap()[..], PAYLOAD);
     }
 
-    /// The counter of one refusal class, from the EN's own `/metrics` text.
+    /// The counter of one refusal class, as the next `df` reports it.
     fn rejects(class: &str) -> u64 {
-        let line = format!("autumn_en_auth_rejects_total{{class=\"{class}\"}} ");
-        render_en_metrics()
-            .lines()
-            .find_map(|l| l.strip_prefix(&line))
-            .unwrap_or_else(|| panic!("no {class} counter"))
-            .trim()
-            .parse::<f64>()
-            .unwrap() as u64
+        let c = en_counters();
+        match class {
+            "opcode_denied" => c.rejects_opcode_denied,
+            "peer_auth" => c.rejects_peer_auth,
+            "client_read" => c.rejects_client_read,
+            "client_token" => c.rejects_client_token,
+            other => panic!("no {other} counter"),
+        }
     }
 
     /// The counters are process-global and sibling tests refuse reads too, so

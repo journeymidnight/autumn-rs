@@ -348,6 +348,7 @@ impl AutumnManager {
             MSG_EXTENT_HEALTH_SUMMARY => self.handle_extent_health_summary(payload).await,
             MSG_REMOVE_MEMBER => self.handle_remove_member(payload).await,
             MSG_GET_CLUSTER_STATUS => self.handle_get_cluster_status().await,
+            MSG_GET_FLEET_METRICS => self.handle_get_fleet_metrics(),
             MSG_LIST_EC_INFLIGHT_MARKERS => self.handle_list_ec_inflight_markers(payload).await,
             MSG_FENCE_NODE => self.handle_fence_node(payload).await,
             MSG_SET_NODE_MAINTENANCE => self.handle_set_node_maintenance(payload).await,
@@ -5025,10 +5026,31 @@ impl AutumnManager {
         }))
     }
 
+    /// `MSG_GET_FLEET_METRICS`: the PS and EN reports this leader holds.
+    pub(crate) fn handle_get_fleet_metrics(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&FleetMetricsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ..Default::default()
+            }));
+        }
+        Ok(rkyv_encode(
+            &self.fleet_metrics.borrow().snapshot(Self::now_s_ms().1 as u64),
+        ))
+    }
+
     pub(crate) async fn handle_report_partition_load(&self, payload: Bytes) -> HandlerResult {
         let req: ReportPartitionLoadReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let now = Self::epoch_seconds();
+        // An evicted PS still reporting is not part of the fleet until it
+        // registers again.
+        if self.leader.get() && self.store.inner.borrow().ps_nodes.contains_key(&req.ps_id) {
+            self.fleet_metrics
+                .borrow_mut()
+                .record_ps(Self::now_s_ms().1 as u64, &req);
+        }
         // Collect PS-reported maintenance outcomes before the loop consumes
         // `req.partitions`; reconciled into the op-ledger after the metrics
         // borrow is released (append_audit is async).
@@ -5552,7 +5574,6 @@ impl AutumnManager {
                     .unwrap_or(u64::MAX),
                 partition_count: per_ps_parts.get(ps_id).copied().unwrap_or(0),
                 slot_cap: s.ps_slot_caps.get(ps_id).copied().unwrap_or(0),
-                metrics_addr: s.ps_metrics_addrs.get(ps_id).cloned().unwrap_or_default(),
                 open_count: s
                     .ps_open_parts
                     .contains_key(ps_id)
@@ -6121,11 +6142,6 @@ impl AutumnManager {
                 Self::record_slot_cap(&mut s, req.ps_id, req.slot_cap);
                 s.ps_open_parts
                     .insert(req.ps_id, req.open_parts.into_iter().collect());
-                if req.metrics_addr.is_empty() {
-                    s.ps_metrics_addrs.remove(&req.ps_id);
-                } else {
-                    s.ps_metrics_addrs.insert(req.ps_id, req.metrics_addr);
-                }
             }
             known
         };
@@ -8816,6 +8832,7 @@ mod cluster_df_disk_tests {
             free,
             online: true,
             extent_bytes: 0,
+            full: false,
         }
     }
 

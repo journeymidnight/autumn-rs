@@ -80,8 +80,9 @@ returns Err — callers log ERROR and keep serving (metrics are auxiliary,
 never kill the data plane). `push_metric` / `push_type` emit the Prometheus
 text format with label escaping; emission must be metric-major (all samples
 of one metric contiguous after its `# TYPE` line — never interleave).
-Endpoint is opt-in per binary via `--metrics-port`; `cluster.sh` wires it
-with `AUTUMN_METRICS=1`.
+Only the manager serves it (default 9591; `--metrics-port N` moves it, `0`
+turns it off): partition servers and extent nodes report their counters to the
+manager, which exports them.
 
 ### `error.rs` — Domain Error Types
 

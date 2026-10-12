@@ -2241,6 +2241,11 @@ impl crate::AutumnManager {
                 // dead disk still answers df, so the manager overwrote the
                 // one fact that would have repaired it.
                 self.apply_df_disk_health(node, &df.disk_status);
+                self.fleet_metrics.borrow_mut().record_node(
+                    Self::now_s_ms().1 as u64,
+                    node.node_id,
+                    &df,
+                );
                 // ENOSPC-1: stash the node's max per-disk free for the
                 // allocation free-space soft filter.
                 //
@@ -4326,6 +4331,7 @@ mod df_disk_health_tests {
             free: 500,
             online,
             extent_bytes: 500,
+            full: false,
         }
     }
 

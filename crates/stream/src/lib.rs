@@ -18,6 +18,6 @@ pub use client::{
 };
 pub use conn_pool::{normalize_endpoint, shard_addr_for_extent, ConnPool};
 pub use extent_node::{
-    render_en_metrics, set_ec_encode_stripe_bytes, set_fd_cache_cap, ExtentNode, ExtentNodeConfig,
+    set_ec_encode_stripe_bytes, set_fd_cache_cap, ExtentNode, ExtentNodeConfig,
     RECONCILE_SWEEP_INTERVAL,
 };

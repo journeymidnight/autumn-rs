@@ -42,6 +42,7 @@ pub use rpc_handlers::{
 // manager used to serve. The manager itself no longer serves a web UI — only
 // the leader-fenced auto-policy controller below survives in-process.
 pub mod dashboard_compose;
+pub mod fleet_metrics;
 // ported pure decision helpers (M1) → leader-fenced controller (M2).
 mod auto_policy;
 // The async op-ledger: every long-running op (split/merge/rebalance/compact/gc/
@@ -871,6 +872,9 @@ pub struct AutumnManager {
     /// node_id; absent = "unknown" (treated as spacious: cold leader /
     /// pre-first-df nodes must stay allocatable).
     pub(crate) node_max_free: Rc<RefCell<HashMap<u64, u64>>>,
+    /// Each PS's and EN's latest metrics report (`fleet_metrics`). Leader-
+    /// local and in memory; a new leader refills it within one report.
+    pub(crate) fleet_metrics: Rc<RefCell<fleet_metrics::FleetMetrics>>,
     /// cluster-df: in-memory capacity snapshot for `MSG_CLUSTER_DF`. RAW +
     /// physical_used are summed from every EN's df report each
     /// `node_health_loop` tick (the EN self-reports its real per-disk extent
@@ -1190,6 +1194,7 @@ impl AutumnManager {
             serving: Rc::new(Cell::new(false)),
             ps_last_heartbeat: Rc::new(RefCell::new(HashMap::new())),
             node_max_free: Rc::new(RefCell::new(HashMap::new())),
+            fleet_metrics: Rc::new(RefCell::new(fleet_metrics::FleetMetrics::default())),
             cluster_cap: Rc::new(RefCell::new(ClusterCapSnapshot::default())),
             node_slot_counts: Rc::new(RefCell::new(HashMap::new())),
             faulted_disks: Rc::new(RefCell::new(HashSet::new())),
@@ -3195,7 +3200,7 @@ impl AutumnManager {
             // stale. The next heartbeat of each PS brings them back.
             s.ps_slot_caps.clear();
             s.ps_open_parts.clear();
-            s.ps_metrics_addrs.clear();
+            self.fleet_metrics.borrow_mut().clear();
             s.regions = decoded_regions;
             s.next_id = s.next_id.max(max_id.saturating_add(1));
         }
@@ -3981,6 +3986,16 @@ impl AutumnManager {
         out
     }
 
+    /// The partition servers' and extent nodes' reports for `/metrics`, or
+    /// `None` on a follower: only the leader receives them, so a follower
+    /// exports none of their series. The caller renders them
+    /// (`fleet_metrics::render_text`) off this runtime, on the scrape.
+    pub fn fleet_metrics_snapshot(&self) -> Option<FleetMetricsResp> {
+        self.leader
+            .get()
+            .then(|| self.fleet_metrics.borrow().snapshot(Self::now_s_ms().1 as u64))
+    }
+
     // ── Background loops ───────────────────────────────────────────────
 
     // (1C): takes `self` by value (was `&self`) for uniformity with the
@@ -4042,7 +4057,7 @@ impl AutumnManager {
                 s.ps_nodes.remove(ps_id);
                 s.ps_slot_caps.remove(ps_id);
                 s.ps_open_parts.remove(ps_id);
-                s.ps_metrics_addrs.remove(ps_id);
+                self.fleet_metrics.borrow_mut().forget_ps(*ps_id);
                 if let Some(m) = s.ps_members.get_mut(ps_id) {
                     m.left_at_ms = left_at_ms;
                     member_puts.push((
@@ -5736,6 +5751,7 @@ mod tests {
         let req = rkyv_encode(&ReportPartitionLoadReq {
             ps_id: 1,
             partitions: vec![load],
+            ..Default::default()
         });
         run(async { m.handle_report_partition_load(req).await.unwrap() });
         // The ledger entry is now terminal with the surfaced error string.
@@ -6268,7 +6284,6 @@ mod tests {
                 ps_id: 20,
                 slot_cap: 4,
                 open_parts: Vec::new(),
-                metrics_addr: String::new(),
             });
             m.handle_heartbeat_ps(req).await.unwrap();
             m.handle_upsert_partition(upsert(5, b"z", b"")).await.unwrap();
@@ -6279,7 +6294,6 @@ mod tests {
                 ps_id: 99,
                 slot_cap: 8,
                 open_parts: Vec::new(),
-                metrics_addr: String::new(),
             });
             m.handle_heartbeat_ps(req).await.unwrap();
             assert!(!m.store.inner.borrow().ps_slot_caps.contains_key(&99));
@@ -6334,7 +6348,6 @@ mod tests {
                     ps_id,
                     slot_cap: 0,
                     open_parts,
-                    metrics_addr: String::new(),
                 })
             };
             let m = &m;
@@ -6487,7 +6500,6 @@ mod tests {
                 ps_id: 55,
                 slot_cap: 0,
                 open_parts: Vec::new(),
-                metrics_addr: String::new(),
             });
             m.handle_heartbeat_ps(req).await.unwrap();
 
