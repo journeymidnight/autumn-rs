@@ -238,7 +238,7 @@ fn no_override(mgr_states: &ListNodeStatesResp, node: u64) -> bool {
         .nodes
         .iter()
         .find(|n| n.node_id == node)
-        .is_some_and(|n| n.override_kind == NODE_OVERRIDE_NONE)
+        .is_some_and(|n| n.operator_override.is_none())
 }
 
 async fn node_states(mgr: &RpcClient) -> ListNodeStatesResp {

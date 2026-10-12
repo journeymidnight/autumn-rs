@@ -916,21 +916,25 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
         let out: Vec<JsonNode> = resp
             .nodes
             .into_iter()
-            .map(|n| JsonNode {
-                node_id: n.node_id,
-                address: n.address,
-                auto_state: auto_state_str(n.auto_state).to_string(),
-                last_heartbeat_secs_ago: n.last_heartbeat_secs_ago,
-                suspected_age_secs: n.suspected_age_secs,
-                override_kind: override_str(n.override_kind).to_string(),
-                override_reason: n.override_reason,
-                override_set_by: n.override_set_by,
-                override_set_at: n.override_set_at,
-                override_expire_at: n.override_expire_at,
-                node_uuid: n.node_uuid,
-                shard_count: n.shard_ports.len(),
-                shard_ports: n.shard_ports,
-                full_disks: n.full_disks,
+            .map(|n| {
+                // No override reads as kind NONE with empty details.
+                let ovr = n.operator_override.unwrap_or_default();
+                JsonNode {
+                    node_id: n.node_id,
+                    address: n.address,
+                    auto_state: auto_state_str(n.auto_state).to_string(),
+                    last_heartbeat_secs_ago: n.last_heartbeat_secs_ago,
+                    suspected_age_secs: n.suspected_age_secs,
+                    override_kind: override_str(ovr.kind).to_string(),
+                    override_reason: ovr.reason,
+                    override_set_by: ovr.set_by,
+                    override_set_at: ovr.set_at,
+                    override_expire_at: ovr.expire_at,
+                    node_uuid: n.node_uuid,
+                    shard_count: n.shard_ports.len(),
+                    shard_ports: n.shard_ports,
+                    full_disks: n.full_disks,
+                }
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&out)?);
@@ -965,9 +969,9 @@ async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
                 auto_state_str(n.auto_state),
                 hb,
                 n.suspected_age_secs,
-                override_str(n.override_kind),
+                override_str(n.override_kind()),
                 full,
-                n.override_reason,
+                n.operator_override.as_ref().map_or("", |o| o.reason.as_str()),
             );
         }
     }
@@ -3411,7 +3415,7 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
                         n.node_id,
                         (
                             auto_state_str(n.auto_state).to_string(),
-                            override_str(n.override_kind).to_string(),
+                            override_str(n.override_kind()).to_string(),
                         ),
                     );
                 }
@@ -4398,11 +4402,7 @@ mod tests {
             auto_state: 0,
             last_heartbeat_secs_ago: 0,
             suspected_age_secs: 0,
-            override_kind: 0,
-            override_reason: String::new(),
-            override_set_by: String::new(),
-            override_set_at: 0,
-            override_expire_at: 0,
+            operator_override: None,
             node_uuid: String::new(),
             shard_ports: Vec::new(),
             metrics_addr: addr.to_string(),

@@ -180,8 +180,8 @@ fn e2e_fence_persists_and_blocks_reregister() {
         // Override visible.
         let nodes = list_nodes(&mgr).await;
         let me = nodes.iter().find(|n| n.node_id == n1).unwrap();
-        assert_eq!(me.override_kind, NODE_OVERRIDE_FENCED);
-        assert_eq!(me.override_reason, "e2e fence");
+        assert_eq!(me.override_kind(), NODE_OVERRIDE_FENCED);
+        assert_eq!(me.operator_override.as_ref().unwrap().reason, "e2e fence");
 
         // Try to re-register at the same address — must be refused.
         let req = RegisterNodeReq {

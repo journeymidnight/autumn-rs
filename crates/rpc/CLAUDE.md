@@ -902,6 +902,14 @@ errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
 
+## Node override as one optional field (wire 67)
+
+`NodeStateEntry`'s five flat `override_*` fields become `operator_override:
+Option<NodeOverride>` (`kind`, `reason`, `set_by`, `set_at`, `expire_at`); `None` = no
+override. `NodeStateEntry::override_kind()` answers `NODE_OVERRIDE_NONE` for `None`.
+`autumn-op --json list-nodes` and the dashboard overview JSON keep the flat
+`override_*` keys. The ceiling rises to [43, 67], the floor stays.
+
 ## A full disk reaches autumn-op; EN reject counters gone (wire 66)
 
 `DiskStatus` gains `full` (the EN marked the disk ENOSPC-full: it serves reads and

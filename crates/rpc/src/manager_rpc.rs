@@ -1629,6 +1629,28 @@ pub struct MgrNodeOverride {
 
 // --- ListNodeStates ---
 
+/// An operator override on an extent node: `autumn-op fence-node` (Fenced,
+/// until `unfence`) or `autumn-op maintenance` (Maintenance, optionally timed).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeOverride {
+    /// `NODE_OVERRIDE_FENCED` or `NODE_OVERRIDE_MAINTENANCE` (`Default` gives
+    /// `NODE_OVERRIDE_NONE`: "no override" for display, never on the wire).
+    pub kind: u8,
+    pub reason: String,
+    pub set_by: String,
+    /// Unix seconds.
+    pub set_at: i64,
+    /// Unix seconds at which a Maintenance override clears itself; 0 = never.
+    pub expire_at: u64,
+}
+
+impl NodeStateEntry {
+    /// The override's kind, `NODE_OVERRIDE_NONE` when there is none.
+    pub fn override_kind(&self) -> u8 {
+        self.operator_override.as_ref().map_or(NODE_OVERRIDE_NONE, |o| o.kind)
+    }
+}
+
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct ListNodeStatesReq {}
 
@@ -1644,12 +1666,8 @@ pub struct NodeStateEntry {
     pub last_heartbeat_secs_ago: u64,
     /// Seconds since auto_state flipped to Suspected, or 0 when Online.
     pub suspected_age_secs: u64,
-    /// Operator override if any (`NODE_OVERRIDE_NONE` if absent).
-    pub override_kind: u8,
-    pub override_reason: String,
-    pub override_set_by: String,
-    pub override_set_at: i64,
-    pub override_expire_at: u64,
+    /// The operator override on the node, if any.
+    pub operator_override: Option<NodeOverride>,
     /// M1c: the node's stable identity + the shard ports it last
     /// registered (`shard_ports.len()` = its shard count). Lets `list-nodes`
     /// show the identity and verify a reshard took effect. Empty for a pre-M0

@@ -313,6 +313,7 @@ pub fn build_overview_json(
         .map(|n| {
             let dn = df_by_node.get(&n.node_id);
             let ns = ns_by_id.get(&n.node_id);
+            let ovr = ns.and_then(|x| x.operator_override.as_ref());
             let heartbeat = ns
                 .map(|x| x.last_heartbeat_secs_ago)
                 .filter(|v| *v != u64::MAX);
@@ -327,11 +328,11 @@ pub fn build_overview_json(
                 "auto_state": ns.map(|x| node_auto_state_str(x.auto_state)).unwrap_or("Online"),
                 "last_heartbeat_secs_ago": heartbeat,
                 "suspected_age_secs": ns.map(|x| x.suspected_age_secs),
-                "override_kind": ns.map(|x| node_override_kind_str(x.override_kind)).unwrap_or("-"),
-                "override_reason": ns.map(|x| x.override_reason.clone()).unwrap_or_default(),
-                "override_set_by": ns.map(|x| x.override_set_by.clone()).unwrap_or_default(),
-                "override_set_at": ns.map(|x| x.override_set_at).unwrap_or(0),
-                "override_expire_at": ns.map(|x| x.override_expire_at).unwrap_or(0),
+                "override_kind": ns.map(|x| node_override_kind_str(x.override_kind())).unwrap_or("-"),
+                "override_reason": ovr.map(|o| o.reason.clone()).unwrap_or_default(),
+                "override_set_by": ovr.map(|o| o.set_by.clone()).unwrap_or_default(),
+                "override_set_at": ovr.map_or(0, |o| o.set_at),
+                "override_expire_at": ovr.map_or(0, |o| o.expire_at),
                 // Per-disk rows, from the node's own last df. The node-level
                 // total/free above are sums over these and cannot say which
                 // disk is full or which one the node calls bad.

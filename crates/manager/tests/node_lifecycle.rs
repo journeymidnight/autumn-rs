@@ -46,7 +46,7 @@ fn list_node_states_starts_suspend() {
     assert_eq!(resp.nodes.len(), 2);
     for entry in &resp.nodes {
         assert_eq!(entry.auto_state, NODE_AUTO_STATE_SUSPEND);
-        assert_eq!(entry.override_kind, NODE_OVERRIDE_NONE);
+        assert_eq!(entry.override_kind(), NODE_OVERRIDE_NONE);
     }
     let ids: Vec<u64> = resp.nodes.iter().map(|n| n.node_id).collect();
     assert!(ids.contains(&n1));
@@ -72,9 +72,9 @@ fn fence_persists_override_and_audit_records_op() {
     let list_bytes = run(m.handle_list_node_states(Bytes::new())).expect("list");
     let list: ListNodeStatesResp = rkyv_decode(&list_bytes).expect("decode");
     let entry = list.nodes.iter().find(|n| n.node_id == n1).expect("entry");
-    assert_eq!(entry.override_kind, NODE_OVERRIDE_FENCED);
-    assert_eq!(entry.override_reason, "ssh-confirmed dead");
-    assert_eq!(entry.override_set_by, "op-alice");
+    assert_eq!(entry.override_kind(), NODE_OVERRIDE_FENCED);
+    assert_eq!(entry.operator_override.as_ref().unwrap().reason, "ssh-confirmed dead");
+    assert_eq!(entry.operator_override.as_ref().unwrap().set_by, "op-alice");
 }
 
 #[test]
@@ -95,8 +95,8 @@ fn maintenance_set_then_clear_round_trip() {
     let list: ListNodeStatesResp =
         rkyv_decode(&run(m.handle_list_node_states(Bytes::new())).unwrap()).unwrap();
     let entry = list.nodes.iter().find(|n| n.node_id == n1).unwrap();
-    assert_eq!(entry.override_kind, NODE_OVERRIDE_MAINTENANCE);
-    assert_eq!(entry.override_expire_at, 1_700_000_000);
+    assert_eq!(entry.override_kind(), NODE_OVERRIDE_MAINTENANCE);
+    assert_eq!(entry.operator_override.as_ref().unwrap().expire_at, 1_700_000_000);
 
     let clear = ClearNodeOverrideReq {
         node_id: n1,
@@ -109,7 +109,7 @@ fn maintenance_set_then_clear_round_trip() {
     let list: ListNodeStatesResp =
         rkyv_decode(&run(m.handle_list_node_states(Bytes::new())).unwrap()).unwrap();
     let entry = list.nodes.iter().find(|n| n.node_id == n1).unwrap();
-    assert_eq!(entry.override_kind, NODE_OVERRIDE_NONE);
+    assert_eq!(entry.override_kind(), NODE_OVERRIDE_NONE);
 }
 
 #[test]

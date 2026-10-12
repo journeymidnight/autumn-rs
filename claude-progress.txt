@@ -1,3 +1,11 @@
+Date: 2026-10-12 (5)
+TaskStatus: completed
+Task scope: user — merge NodeStateEntry's five flat override_* fields into one optional field.
+Current summary: Wire 67: `NodeStateEntry.operator_override: Option<NodeOverride { kind, reason, set_by, set_at, expire_at }>` (None = no override) replaces `override_kind/_reason/_set_by/_set_at/_expire_at`; `NodeStateEntry::override_kind()` gives NONE for None. Manager builds it from its `MgrNodeOverride` map; cluster_status, dashboard_compose, autumn-op and the manager integration tests read through it. The JSON that autumn-op list-nodes and the overview print keeps the flat `override_*` keys, so the dashboard is unchanged.
+Verification: libs rpc 97, manager 482, stream 228, client 66; autumn-server tests; full manager suite green (139 binaries, 1090 passed). Review: fable (no high/medium; two doc wordings fixed).
+Main gaps: none known.
+Next steps: none.
+
 Date: 2026-10-12 (4)
 TaskStatus: completed
 Task scope: user — move everything non-performance out of the EN's /metrics (disk online/full, extent counts, auth rejects) to autumn-op; then: auth rejects are not needed at all.

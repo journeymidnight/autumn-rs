@@ -94,7 +94,7 @@ pub(crate) fn en_fleet(
     nodes
         .iter()
         .map(|n| {
-            let state = match (n.override_kind, n.auto_state) {
+            let state = match (n.override_kind(), n.auto_state) {
                 (NODE_OVERRIDE_FENCED, _) => FLEET_EN_FENCED,
                 (NODE_OVERRIDE_MAINTENANCE, _) => FLEET_EN_MAINTENANCE,
                 (_, NODE_AUTO_STATE_ONLINE) if !answered(n.node_id) => FLEET_EN_UNKNOWN,
@@ -258,11 +258,7 @@ mod tests {
             auto_state: auto,
             last_heartbeat_secs_ago: 2,
             suspected_age_secs: 0,
-            override_kind: ovr,
-            override_reason: String::new(),
-            override_set_by: String::new(),
-            override_set_at: 0,
-            override_expire_at: 0,
+            operator_override: (ovr != NODE_OVERRIDE_NONE).then(|| NodeOverride { kind: ovr, ..Default::default() }),
             node_uuid: String::new(),
             shard_ports: Vec::new(),
             metrics_addr: String::new(),
