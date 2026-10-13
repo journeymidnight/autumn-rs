@@ -5351,7 +5351,7 @@ impl AutumnManager {
         // partition that owns this extent. Threaded through dispatch ->
         // coord -> WriteShard/CommitEcShard so a fenced ex-coord's
         // in-flight 2PC is rejected by remote ENs once
-        // `auto_abandon_for_fenced_node` bumps their `entry.owner_epoch`
+        // a fence bumps their `entry.owner_epoch`
         // via fence-handover. CoW-shared extents (refs >= 2) appear in
         // multiple partitions' streams; any of them works because all
         // sharing partitions hold the same owner_lock owner_epoch at any
@@ -6824,29 +6824,11 @@ impl AutumnManager {
         // protection is the NEW PS's `acquire_owner_lock` on takeover (higher
         // owner_epoch), unaffected by this removal — see
         // `system_locked_by_other.rs::owner_lock_fencing_rejects_stale_revision`.
-        // auto-abandon EC convert markers whose coord matches
-        // the freshly-fenced node.
-        let targets: Vec<u64> = self
-            .inflight
-            .borrow()
-            .iter()
-            .filter_map(|(id, r)| {
-                r.recovery_payload
-                    .as_ref()
-                    .filter(|t| t.node_id == req.node_id)
-                    .map(|_| *id)
-            })
-            .collect();
-        for id in targets {
-            // Failed durable cancellation retains a Remove blocker for retry.
-            if let Err(e) = self
-                .drain_extent_inflight_marker(id, "recovery target fenced")
-                .await
-            {
-                tracing::warn!(extent_id = id, error = %e, "recovery cancellation retained for retry");
-            }
-        }
-        let _ = self.auto_abandon_for_fenced_node(req.node_id).await;
+        // Cancel the work the node is in now, rather than at the next recovery
+        // tick: a Recovery it executes, an EC conversion it is a target of.
+        // The same level-triggered cancel the tick runs; one that fails stays a
+        // Remove blocker and is retried there.
+        self.cancel_markers_on_abnormal_nodes().await;
         Ok(())
     }
 

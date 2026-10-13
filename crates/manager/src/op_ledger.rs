@@ -471,24 +471,6 @@ impl OpLedger {
         self.trim();
     }
 
-    /// The coordinator reported that its LAST conversion attempt failed.
-    ///
-    /// The entry stays RUNNING while the dispatch loop keeps retrying — it gives
-    /// up only after `EC_ABANDON_AFTER_CONSECUTIVE_FAILURES`, which completes the
-    /// entry as FAILED through `complete_ec` rather than here — but it now
-    /// carries the reason, so `ops status` shows why an extent has been
-    /// converting for an hour instead of leaving the only record in one EN's
-    /// log. Symmetric with `record_recovery_failure`, except the reason arrives
-    /// on the NEXT dispatch's response rather than from a failed dispatch: the
-    /// conversion runs in the background after a CODE_OK accept.
-    pub(crate) fn record_ec_failure(&mut self, extent_id: u64, reason: String) {
-        if let Some(e) = self.entries.iter_mut().find(|e| {
-            e.kind == OP_KIND_EC_CONVERT && e.secondary_id == extent_id && Self::is_active(e.state)
-        }) {
-            e.error = reason;
-        }
-    }
-
     /// A recovery dispatch attempt FAILED. The entry stays RUNNING (the loop
     /// retries with exponential backoff — it never gives up), carrying the last
     /// reason + code, so `ops status` shows "running, last error: …" instead of
@@ -1215,14 +1197,6 @@ mod tests {
         let recs = led.query(&OpQueryReq::default());
         let ec: Vec<_> = recs.iter().filter(|r| r.secondary_id == 12).collect();
         assert_eq!(ec.len(), 1, "one entry per extent, not one per try");
-
-        // The coordinator's reason lands on that entry, and the op stays RUNNING
-        // because the dispatch loop never gives up.
-        led.record_ec_failure(12, "WriteShard to 127.0.0.1:15009 shard 1: refused".into());
-        let recs = led.query(&OpQueryReq::default());
-        let r = recs.iter().find(|r| r.secondary_id == 12).expect("entry");
-        assert!(r.error.contains("WriteShard"), "error was {:?}", r.error);
-        assert_eq!(r.state, OP_STATE_RUNNING);
     }
 
     /// A dispatch response can arrive a minute after the send, and a fence in

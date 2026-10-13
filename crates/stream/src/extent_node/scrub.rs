@@ -489,7 +489,7 @@ mod tests {
         assert!(!disk.shard_ck_path(22, 0).exists());
 
         sealed_dat(&node, 23, &[3u8; 4096]).await;
-        node.ec_convert_inflight.insert(23, ());
+        node.ec_convert_inflight.insert(23, 0);
         assert_eq!(outcome(&node.test_scrub(vec![dat_task(23, 4096)]).await), SCRUB_OUTCOME_SKIPPED);
         assert!(!disk.ck_path(23).exists());
     }

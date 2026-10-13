@@ -341,10 +341,8 @@ pub struct MgrEcDispatchInflight {
     /// → `WriteShardReq.owner_epoch` / `CommitEcShardReq.owner_epoch` so a
     /// fenced ex-coord whose in-flight 2PC continues with the OLD owner_epoch
     /// is rejected by remote ENs via the existing `req.owner_epoch <
-    /// entry.owner_epoch → CODE_LOCKED_BY_OTHER` check. A bumped
-    /// owner_epoch is pushed to live targets by
-    /// `auto_abandon_for_fenced_node` (fence-handover via
-    /// `MSG_CHECK_COMMIT_LENGTH`) so the EN-side check fires.
+    /// entry.owner_epoch → CODE_LOCKED_BY_OTHER` check, once a partition
+    /// reopen raised the floor on the targets.
     ///
     /// `0` keeps the earlier no-fence behaviour for tests /
     /// memory-only mode where no owner_lock has been acquired.

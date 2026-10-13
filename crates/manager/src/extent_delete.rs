@@ -576,6 +576,11 @@ impl AutumnManager {
                 let mut still_pending = Vec::new();
                 let targets = std::mem::take(&mut entry.pending_targets);
                 for target in targets {
+                    // A fence node's files are reaped by its reconcile if it
+                    // comes back; it is not waited for.
+                    if self.delete_target_is_fence(&target) {
+                        continue;
+                    }
                     let acked = self.try_delete_one(&target, entry.extent_id).await;
                     if !acked {
                         still_pending.push(target);
@@ -637,6 +642,27 @@ impl AutumnManager {
                     q.insert(eid, e);
                 }
             }
+        }
+    }
+
+    /// The target's node is `Fence` (fenced, tombstoned, or no longer
+    /// registered). Matched by uuid; a target without one (a legacy node) is
+    /// never judged fence and keeps being retried.
+    pub(crate) fn delete_target_is_fence(&self, target: &DeleteTarget) -> bool {
+        if target.node_uuid.is_empty() {
+            return false;
+        }
+        let node = self
+            .store
+            .inner
+            .borrow()
+            .nodes
+            .values()
+            .find(|n| n.node_uuid == target.node_uuid)
+            .map(|n| n.node_id);
+        match node {
+            Some(id) => self.node_class_of(id) == crate::node_class::NodeClass::Fence,
+            None => true,
         }
     }
 
@@ -755,6 +781,9 @@ impl AutumnManager {
                 let mut still_pending = Vec::new();
                 let addrs = std::mem::take(&mut entry.pending_targets);
                 for addr in addrs {
+                    if self.delete_target_is_fence(&addr) {
+                        continue;
+                    }
                     let acked = self.try_delete_one(&addr, extent_id).await;
                     if !acked {
                         still_pending.push(addr);

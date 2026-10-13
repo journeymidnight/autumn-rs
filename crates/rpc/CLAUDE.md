@@ -556,7 +556,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **61**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **68**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -901,6 +901,17 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## EC attempt answer is typed (wire 68)
+
+`MSG_CONVERT_TO_EC` answers `ConvertToEcResp { code, message, state,
+failed_target }` instead of `CodeResp`: `state` is `EC_ATTEMPT_STARTED` /
+`EC_ATTEMPT_RUNNING` / `EC_ATTEMPT_FAILED`, and a failed attempt names the target
+that failed as an index into the request's `target_addrs` (0 = the coordinator).
+The manager used to read both from the message text. A failed attempt is not
+started again under the same nonce; a request with a NEWER nonce supersedes the
+attempt running on the coordinator. Cluster-internal only; the ceiling rises to
+[43, 68], the floor stays.
 
 ## Node override as one optional field (wire 67)
 

@@ -1124,6 +1124,29 @@ pub struct ConvertToEcReq {
     pub attempt_nonce: u64,
 }
 
+/// `MSG_CONVERT_TO_EC`'s answer. A non-OK `code` is a refusal of the request
+/// (or `CODE_CONTENT_CORRUPT`: the coordinator's own copy rotted); with
+/// `CODE_OK`, `state` says what the request found.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ConvertToEcResp {
+    pub code: u8,
+    pub message: String,
+    /// `EC_ATTEMPT_*`.
+    pub state: u8,
+    /// `EC_ATTEMPT_FAILED`: which target failed, as an index into the
+    /// request's `target_addrs` (0 = the coordinator itself); `None` when the
+    /// failure names no target.
+    pub failed_target: Option<u32>,
+}
+
+/// The attempt was not running; this request started it.
+pub const EC_ATTEMPT_STARTED: u8 = 0;
+/// This attempt is already running here.
+pub const EC_ATTEMPT_RUNNING: u8 = 1;
+/// This attempt ran here and failed; it is not started again. The manager
+/// cancels the marker, and the next proposal derives a new attempt.
+pub const EC_ATTEMPT_FAILED: u8 = 2;
+
 // ── CopyExtent (binary — large payload) ─────────────────────────────────────
 
 /// CopyExtentRequest: 32 bytes fixed header.

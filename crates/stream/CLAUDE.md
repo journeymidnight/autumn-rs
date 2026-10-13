@@ -1416,10 +1416,17 @@ and from other crates' CLAUDE.md); do not renumber.
     cleanup) holds the whole extent.
 
     **EC conversion is ACCEPT-then-BACKGROUND (same shape as recovery).**
-    `handle_convert_to_ec` validates, refuses a duplicate via `ec_convert_inflight`
-    (the manager re-dispatches from its durable marker every ~5 s, so without the
-    guard every tick would spawn another converter), spawns
-    `run_convert_to_ec_task`, and ACKs `CODE_OK = "accepted"` — **not "done"**. The
+    `handle_convert_to_ec` validates and answers a typed `ConvertToEcResp`. One
+    attempt (nonce) runs at most once: `ec_convert_inflight` maps the extent to the
+    RUNNING attempt's nonce, so a re-send of it answers RUNNING; a re-send of an
+    attempt that FAILED answers FAILED with `failed_target` (the participant index,
+    0 = the coordinator) and does not encode again — the manager cancels the
+    marker; a NEWER nonce supersedes: the map names it, the old attempt stops
+    before its next stripe (`superseded by a newer EC attempt`) — after the
+    stripe in flight, whose participant writes are each bounded by a 30 s
+    timeout — and the new one waits on the extent op lock; an older nonce is
+    refused. A started attempt spawns
+    `run_convert_to_ec_task` and answers STARTED — **not "done"**. The
     completion is pushed to `ec_done` and drained by the next `df`
     (`DfResp.ec_done`), which is the ONLY signal the manager applies the layout on
     (from the etcd marker's PINNED assignment; a reported `new_eversion` that

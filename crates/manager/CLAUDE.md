@@ -729,13 +729,18 @@ change.
 `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS` (default 60 s, floor 1); stale threshold
 `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS` (default 600 s, floor 60). `started_at`
 is in the persisted record so the clock survives failover. **Only Delete markers
-auto-release on wall-clock** (sweep touches only the marker, never `extents/<id>`
-or an EN; delete is idempotent). **Recovery has NO TTL** — a marker is released
+auto-release on wall-clock**, and their work is not dropped: the still-pending
+targets go to the persisted `extentDeleteRetry/` queue first, the same hand-off
+the delete loop makes after its attempt budget (the sweep touches only the
+marker, never `extents/<id>` or an EN; delete is idempotent). A delete does not
+wait for a `Fence` target (fenced, tombstoned, unregistered; matched by
+`node_uuid`, `delete_target_is_fence`): its reconcile reaps the files if the node
+returns. **Recovery has NO TTL** — a marker is released
 by an EVENT (its pinned executor stops being Online, or the recovery completes),
-never by elapsed time; see the Recovery section. **ConvertToEc is WARN-only and
-NEVER auto-released** — releasing it races the original EN dispatch and can record a
-different parity assignment than the bytes that physically landed (silent EC
-corruption); operator inspects EN state and clears manually.
+never by elapsed time; see the Recovery section. **ConvertToEc is WARN-only here**:
+age is no evidence (a multi-GiB encode runs for minutes). Cancelling it is safe —
+nothing is committed before the manager's flip — and happens on an event: an
+abnormal target, or the attempt's own report (see "EC conversion").
 
 Deploying onto pre-ledger etcd state is unsupported — those keys never existed,
 so there is nothing to migrate from. That is a dev-cluster situation and NOT
@@ -773,15 +778,18 @@ extent, node Online, disk not offline) is caught up in place with `re_avali` to
 the sealed length. In-flight recoveries live in the unified inflight ledger so a
 double-dispatch is impossible across failover.
 
-**The marker is a STANDING INSTRUCTION, not a do-not-disturb flag.** A marker pins
-one `(extent, executor)` assignment; the leader keeps RE-SENDING that exact RPC
+**The marker is ONE ATTEMPT, re-sent while it stands.** A marker pins one
+`(extent, executor)` assignment; the leader keeps RE-SENDING that exact RPC
 (`redispatch_pinned_recovery`, 5 s timeout, skipped when the pinned node is not
-Online so a keep-alive to a corpse can't eat the whole dispatch tick) and **never
-drains the marker on an RPC failure**. That is what makes an EN restart
-self-healing without a TTL: the EN loses its in-memory `recovery_inflight`, the
-next re-send simply starts it again, and every EN answer is idempotent by
-contract (same-attempt already-running → `CODE_OK`; complete local copy → re-report done;
-incomplete residue → discard + rebuild — see `crates/stream/CLAUDE.md`).
+Online so a keep-alive to a corpse can't eat the whole dispatch tick). Every EN
+answer is idempotent by contract (same-attempt already-running → `CODE_OK`;
+complete local copy → re-report done; incomplete residue → discard + rebuild —
+see `crates/stream/CLAUDE.md`). A re-send the executor REFUSES, or cannot be
+reached for at all (connect refused, connection closed), cancels the attempt by
+its nonce (`drain_attempt`) and the next tick derives a fresh one. A re-send that
+merely TIMES OUT keeps it: a busy node may still be copying, and dropping a
+rebuild that is nearly done costs far more than waiting — the executor's class
+cancels it once the node is Suspected (`rpc_timed_out` tells them apart).
 **Release is EVENT-driven:** `apply_recovery_done` (the
 work finished), `cancel_markers_on_abnormal_nodes` (level-triggered
 each tick — the executor's class is `Suspected` or `Fence` → drop the marker so
@@ -793,7 +801,7 @@ target became a member at another slot; this makes a failed durable cleanup
 self-retrying. **There is deliberately NO
 wall-clock TTL**: a timeout is indistinguishable from a slow-but-progressing
 rebuild, and releasing on one races the executor still writing the copy. Never
-re-introduce a TTL, and never drain a Recovery marker on a dispatch error.
+re-introduce a TTL, and never cancel a Recovery on a timeout alone.
 
 The third exists because **fence CREATES markers and unfence is on no release
 path**. The two executor-shaped releases both ask about the node doing the work,
@@ -1175,10 +1183,16 @@ different assignment. Abnormal means class `Suspected` or `Fence`, NOT merely
 failover) is waited for — cancelling on it would drop every marker at every
 failover.
 
-`abandon_ec_marker` is CAS'd on the persisted record and re-reads the attempt
-nonce after its etcd await, so a release decided against a stale view cannot
-release a SUCCESSOR's marker — the release path is as attempt-scoped as the
-apply path (`classify_ec_done`).
+**An EC marker is one attempt too.** `MSG_CONVERT_TO_EC` answers a typed
+`ConvertToEcResp` (wire 68): STARTED / RUNNING, or FAILED with `failed_target` —
+the index in the request's targets, so `ec_failed_node` maps it onto
+`target_nodes`. A FAILED answer, a refusal, an undecodable answer or an
+unreachable coordinator cancels the attempt at once through `drain_attempt`
+(nonce-scoped: a cancel decided against a stale view cannot release a
+SUCCESSOR's marker, the same attempt scoping as `classify_ec_done`); the op
+closes FAILED naming the node, and the next proposal derives a fresh attempt. A
+timeout keeps it. There is no failure counter, no `ec_convert_advisory/` record
+and no fence-specific abandon: every cancel is `drain_extent_inflight_marker`.
 
 **Payload location (`extent_layout.rs`).** Which FILE holds an extent's payload
 — `.dat` or `.shard{i}` — is per-extent metadata the manager owns and the EN
@@ -1290,9 +1304,9 @@ carries one override: `set_node_maintenance` refuses a `Fenced` node.
 on the node needs a recovery target under `recovery_candidate_order`'s own filters —
 not `occupied`, not fenced/maintenance/suspected — one of them with df-reported room
 for its shard, and those receivers together 1.2x the bytes; no df row = no room),
-write the override, then
-`auto_abandon_for_fenced_node` sweeps ConvertToEc markers whose `target_nodes[0]` is
-the fenced node (atomic delete + `ec_convert_advisory/` for follow-up). Fencing an EN
+write the override, then run `cancel_markers_on_abnormal_nodes` at once (the
+same level-triggered cancel the recovery tick runs): a Recovery the node executes
+and an EC conversion it is any target of. Fencing an EN
 must NOT fence PS partition owners (writer fencing on takeover is
 `acquire_partition_owner_epoch`'s job). `mgr_remove_node` requires Fenced AND no
 extent/marker still references the node (an OPEN tail slot counts — hence
@@ -1825,7 +1839,7 @@ failure reason the fire-and-forget maintenance ops used to drop.
   kept. `dispatch_one_ec_conversion` no longer finalizes on the RPC return; the
   EC dispatch loop is bounded-concurrent (8) so one slow coordinator can't stall
   the tick. This removes the "RPC timeout vs dead EN" ambiguity that made a stuck
-  marker un-releasable; a dead PINNED coordinator still needs fence→auto_abandon.
+  marker un-releasable; a dead PINNED coordinator is cancelled by its class.
 - **Failover seeding is by durability, not by kind**: `seed_replay(kind, …)`
   reconstructs RUNNING entries for BOTH EC-convert and recovery on promotion
   (their etcd markers survived and this leader keeps working them);

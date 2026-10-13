@@ -176,8 +176,11 @@ that failure is the attempt's own report below.
   evaluated every tick from live state. Level-triggered: no hook on the fence / maintenance / suspect
   transitions, and it re-converges after a failover;
 - **the attempt's own report** — a dispatch, a re-send or a participant write
-  that fails or is refused names the node, and the marker is cancelled on the
-  spot, before the node's class catches up (`Suspected` takes a 10 s silence).
+  that is refused, fails, or cannot reach the node names the node, and the
+  marker is cancelled on the spot, before the node's class catches up
+  (`Suspected` takes a 10 s silence). A call that only TIMES OUT is not such a
+  report: the node may be slow, not gone — a rebuild nearly done would be thrown
+  away — and its class cancels the marker once it is `Suspected`.
   The node is a typed field of the report — the EC coordinator's accept answer
   and completion, the recovery completion and refusal carry the failed node's
   id — not text the manager parses out of a message.
@@ -187,7 +190,8 @@ A Recovery marker is also cancelled when its source slot is healthy again
 
 On the EN, a newer attempt supersedes an older one for the same extent: a
 `ConvertToEc` request whose nonce is higher than the running attempt's stops
-that attempt at its next stripe and starts the new one, instead of answering
+that attempt before its next stripe (after the stripe in flight, bounded by
+the participant write timeout) and starts the new one, instead of answering
 "already running". Otherwise the successor is reported accepted while the
 cancelled encode runs to its end.
 
@@ -269,31 +273,6 @@ Where the code still answers differently from §1–§5. Paths are under
 `crates/manager/src/` unless noted. Node and disk classes (§1) are
 `node_class.rs` and the arbiter (§2, §4) is `extent_arbiter.rs`; every path that
 judges a node, a disk or whether an op may start uses them.
-
-**Release paths**
-
-- ConvertToEc markers are released by four paths: the fence sweep
-  (`auto_abandon_for_fenced_node`, coordinator only) and the repeated-failure
-  give-up (`abandon_ec_marker`, which also writes an `ec_convert_advisory/<extent>`
-  key), the abnormal-node cancel and the stale-marker drain
-  (`drain_extent_inflight_marker`). The `abandon_ec_marker` doc calls itself
-  "the one place".
-- A failed EC attempt is re-dispatched with the same targets; the marker is
-  abandoned only after 24 consecutive reported failures
-  (`EC_ABANDON_AFTER_CONSECUTIVE_FAILURES`, recovery.rs), and a coordinator that
-  is itself unreachable never counts toward it.
-- A recovery re-send that fails or is refused is only logged
-  (`redispatch_pinned_recovery`); a failed first dispatch does drain the marker.
-- The stale sweep releases Delete markers after 600 s without moving them to the
-  persisted retry queue; the delete loop moves them there after 60 attempts.
-  `snapshot_replica_targets` (extent_delete.rs) keeps a fence target in the
-  fan-out.
-- The EN answers "already running" to a `ConvertToEc` request whatever its nonce
-  (`handle_convert_to_ec`, crates/stream/src/extent_node.rs), and the
-  coordinator's failure reaches the manager only as text after "failed: " in
-  that answer (`dispatch_one_ec_conversion`), with no node id.
-- `ec_convert_advisory/<extent>` (ec_abandon.rs) is written on every abandon and
-  read and deleted by nothing in the repository; it goes, with its writer.
 
 **EC targets**
 

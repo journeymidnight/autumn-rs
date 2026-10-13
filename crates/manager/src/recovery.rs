@@ -19,28 +19,6 @@ fn params_coordinator(p: &MgrEcDispatchInflight) -> Option<u64> {
     p.target_nodes.first().copied()
 }
 
-/// Did this CODE_OK answer mean a NEW conversion started, or that the
-/// coordinator is already working on one?
-///
-/// Both answers are CODE_OK and both quote the last failure for as long as it
-/// stands (the coordinator clears it on success, not when a new attempt begins).
-/// Telling them apart is what keeps a long healthy conversion from being counted
-/// as failing once every five seconds.
-fn ec_accept_started_new(message: &str) -> bool {
-    message.starts_with("ec convert accepted")
-}
-
-/// How many consecutive failed EC conversion attempts before the marker is
-/// dropped.
-///
-/// At the loop's ~5 s cadence this is a couple of minutes of uninterrupted
-/// failure — long enough that an ordinary node restart rides through it, short
-/// enough that a node which is not coming back stops holding the extent's GC.
-/// Erring low is cheap: `policy` re-proposes from extent state, so an early
-/// give-up costs one more conversion later, while erring high costs unbounded
-/// un-reclaimable garbage.
-const EC_ABANDON_AFTER_CONSECUTIVE_FAILURES: u32 = 24;
-
 /// The manager-side contribution to logical size. Open extent length comes
 /// from the PS commit-length probe, never from `sealed_length`.
 fn sealed_extent_logical_size(sealed: bool, sealed_length: u64) -> u64 {
@@ -273,7 +251,8 @@ impl AutumnManager {
         let mut cancelled = Vec::new();
         for (extent_id, node_id, kind, nonce, reason) in doomed {
             match self.drain_attempt(extent_id, nonce, &reason).await {
-                Ok(()) => {
+                Ok(false) => {}
+                Ok(true) => {
                     tracing::info!(extent_id, node_id, ?kind, "cancelled marker: {reason}");
                     cancelled.push(extent_id);
                 }
@@ -479,8 +458,9 @@ impl AutumnManager {
                 .await?;
             return Ok(DispatchOutcome::Dispatched);
         };
+        let nonce = attempt.nonce;
         let payload = rkyv_encode(&RequireRecoveryReq { task, attempt });
-        match self
+        let result = self
             .conn_pool
             .call_timeout(
                 &addr,
@@ -490,32 +470,30 @@ impl AutumnManager {
                 // initial dispatch. A slow answer just means we re-send next tick.
                 Duration::from_secs(5),
             )
-            .await
-        {
+            .await;
+        // A marker is one attempt: the executor refusing it, or not being
+        // reachable at all, cancels it now and the next tick derives a fresh one.
+        // A TIMEOUT does not — a busy node may still be copying, and dropping a
+        // rebuild that is nearly done to start over costs far more than waiting;
+        // the node's class cancels it once it is Suspected.
+        let cancel = match result {
             Ok(resp) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
                 // CODE_OK covers both "started it" and "already running it".
-                Ok(r) if r.code == CODE_OK => {}
-                // WARN, not debug. A refusal means the standing instruction
-                // cannot be carried out, and the re-send will repeat it every
-                // tick forever while the marker holds a rate-limiter slot. At
-                // debug it is invisible on a manager at INFO: a wedged drain
-                // reads as "no dispatch at all" in the log, which is how one
-                // stayed hidden for hours while four markers blocked every
-                // other candidate with "every candidate rate-limited".
-                Ok(r) => tracing::warn!(
-                    extent_id,
-                    node_id,
-                    "recovery re-dispatch refused: {} (marker retained; it will \
-                     be re-sent every tick and holds a rate-limiter slot)",
-                    r.message
-                ),
-                Err(e) => tracing::warn!(
-                    extent_id,
-                    node_id,
-                    "recovery re-dispatch decode: {e} (marker retained)"
-                ),
+                Ok(r) if r.code == CODE_OK => None,
+                Ok(r) => Some(format!("node {node_id} refused the re-send: {}", r.message)),
+                Err(e) => Some(format!("node {node_id} answered the re-send undecodably: {e}")),
             },
-            Err(e) => tracing::warn!(extent_id, node_id, "recovery re-dispatch unreachable: {e}"),
+            Err(e) if rpc_timed_out(&e) => {
+                tracing::warn!(extent_id, node_id, "recovery re-send timed out (marker kept): {e}");
+                None
+            }
+            Err(e) => Some(format!("node {node_id} is unreachable: {e}")),
+        };
+        if let Some(reason) = cancel {
+            tracing::warn!(extent_id, node_id, "recovery attempt cancelled: {reason}");
+            if let Err(e) = self.drain_attempt(extent_id, nonce, &reason).await {
+                tracing::warn!(extent_id, "cancelling the recovery attempt failed (retried next tick): {e}");
+            }
         }
         Ok(DispatchOutcome::Dispatched)
     }
@@ -714,14 +692,22 @@ impl AutumnManager {
                 )
                 .await
             {
-                Ok(v) => v,
+                Ok(v) => Some(v),
+                // A timeout is not a report that the target is gone: it may have
+                // taken the rebuild and be slow to answer. The attempt stands and
+                // the re-send next tick finds out; the node's class cancels it if
+                // the node stays silent.
+                Err(e) if rpc_timed_out(&e) => {
+                    tracing::warn!(
+                        extent_id = extent.extent_id,
+                        executor = candidate.node_id,
+                        "recovery dispatch timed out; the attempt stands and is re-sent: {e}"
+                    );
+                    None
+                }
                 Err(_) => {
-                    // RPC failed → release the marker we just acquired
-                    // and try the next candidate. We don't know if the
-                    // EN received the request; if it did, the EN-side
-                    // recovery_inflight tracks it; we'll re-dispatch
-                    // on the next tick and the EN-side check will idempotently
-                    // refuse the duplicate.
+                    // Refused at the transport or unreachable → release the
+                    // marker we just acquired and try the next candidate.
                     if let Err(e) = self
                         .drain_attempt(
                             extent.extent_id,
@@ -747,7 +733,11 @@ impl AutumnManager {
             if self.extent_inflight_nonce(extent_id) != dispatched_nonce {
                 return Ok(DispatchOutcome::Dispatched);
             }
-            let r: autumn_rpc::extent_rpc::CodeResp = match rkyv_decode(&resp) {
+            let decoded = match &resp {
+                Some(bytes) => rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(bytes).map(Some),
+                None => Ok(None),
+            };
+            let r = match decoded {
                 Ok(v) => v,
                 Err(_) => {
                     if let Err(e) = self
@@ -772,7 +762,7 @@ impl AutumnManager {
                     continue;
                 }
             };
-            if r.code != CODE_OK {
+            if r.as_ref().is_some_and(|r| r.code != CODE_OK) {
                 // EN rejected (e.g. extent exists locally already, or
                 // recovery_inflight conflict). Release marker
                 // and try next candidate.
@@ -859,19 +849,19 @@ impl AutumnManager {
     }
 
     /// Cancel the attempt `nonce` on `extent_id` — and only it: a successor
-    /// written since is left alone.
+    /// written since is left alone. `Ok(false)`: it was already gone (released,
+    /// completed, or cancelled by another path), so there is nothing to retry.
     pub(crate) async fn drain_attempt(
         &self,
         extent_id: u64,
         nonce: u64,
         reason: &str,
-    ) -> Result<(), AppError> {
+    ) -> Result<bool, AppError> {
         if self.extent_inflight_nonce(extent_id) != nonce {
-            return Err(AppError::Precondition(
-                "the attempt was already released".into(),
-            ));
+            return Ok(false);
         }
-        self.drain_extent_inflight_marker(extent_id, reason).await
+        self.drain_extent_inflight_marker(extent_id, reason).await?;
+        Ok(true)
     }
 
     fn stale_recovery_reason(&self, task: &RecoveryTask) -> Option<String> {
@@ -2027,6 +2017,27 @@ pub(crate) fn slot_verdict(slot_fence: bool, corrupt: bool, repair_requested: bo
     }
 }
 
+/// The node a failed EC attempt names: `failed_target` indexes the request's
+/// targets, which are `target_nodes` in order; no index names the coordinator.
+pub(crate) fn ec_failed_node(target_nodes: &[u64], failed_target: Option<u32>) -> u64 {
+    let coord = target_nodes.first().copied().unwrap_or(0);
+    failed_target
+        .and_then(|i| target_nodes.get(i as usize).copied())
+        .unwrap_or(coord)
+}
+
+/// The call ran out of time without an answer — a slow peer, not proof it is
+/// gone. Every other failure to get an answer (connect refused, connection
+/// closed, I/O) is.
+pub(crate) fn rpc_timed_out(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<autumn_rpc::RpcError>(),
+            Some(autumn_rpc::RpcError::Timeout(_))
+        )
+    })
+}
+
 /// Why `node` (writing to `disk`, when known) cannot take part in an attempt,
 /// or `None` when it can. A `Suspend` node can: it is waited for.
 pub(crate) fn abnormal_target(
@@ -3112,164 +3123,60 @@ impl crate::AutumnManager {
             )
             .await;
 
-        // Set when the coordinator's answer carried its previous attempt's
-        // failure; read after the match to decide whether to give up.
-        let mut carried_failure: Option<String> = None;
-        // True when the coordinator started a NEW conversion rather than
-        // answering a re-send it was already working on.
-        let mut started_new = false;
-        let rpc_ok = match result {
-            Ok(resp_data) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp_data) {
+        let coord = params.target_nodes.first().copied().unwrap_or(0);
+        // A marker is one attempt (docs/extent_op_arbitration_design.md §3): a
+        // failure the attempt reports, a refusal, or an unreachable coordinator
+        // cancels it now, and the next proposal derives a fresh attempt from the
+        // state at that time. A TIMEOUT does not: the coordinator may be slow,
+        // not gone, and its class cancels the marker once it is Suspected.
+        // CODE_OK + STARTED / RUNNING means ACCEPTED, not done: the coordinator
+        // encodes in the background and reports completion on its next `df`.
+        let cancel: Option<String> = match result {
+            Ok(resp_data) => match rkyv_decode::<autumn_rpc::extent_rpc::ConvertToEcResp>(&resp_data) {
                 Ok(r) if r.code == autumn_rpc::extent_rpc::CODE_CONTENT_CORRUPT => {
                     self.release_rotted_ec_attempt(
                         extent_id,
                         attempt_nonce,
-                        params.target_nodes.first().copied().unwrap_or(0),
+                        coord,
                         params.new_eversion.saturating_sub(1),
                         &r.message,
                     )
                     .await;
                     return;
                 }
+                Ok(r) if r.code == CODE_OK && r.state == autumn_rpc::extent_rpc::EC_ATTEMPT_FAILED => {
+                    let node = ec_failed_node(&params.target_nodes, r.failed_target);
+                    Some(format!("node {node} failed the conversion: {}", r.message))
+                }
                 Ok(r) if r.code == CODE_OK => {
-                    // CODE_OK is "accepted", so count the ACCEPT, and read the
-                    // message: the coordinator puts its previous attempt's
-                    // failure there because there is nowhere else for it to go
-                    // (the conversion runs in the background, long after this
-                    // response). Without both halves the ledger shows attempts=0
-                    // and no error for a conversion that has been failing for an
-                    // hour, and the extent's GC is blocked the whole time.
+                    // The marker may have been drained while this response was
+                    // in flight (up to a minute). Refresh an existing entry, but
+                    // do not resurrect one — a RUNNING entry with no marker
+                    // behind it is never closed, and it makes later
+                    // force-ec-convert calls on this extent attach-dedup into
+                    // silent no-ops.
                     let (now_s, now_ms) = Self::now_s_ms();
-                    // A FRESH accept means a conversion actually started; the
-                    // coordinator says "already running" when this re-send hit
-                    // one it is still working on. Only the former is an attempt.
-                    started_new = ec_accept_started_new(&r.message);
-                    // The marker may have been drained while this response was in
-                    // flight (up to a minute). Refresh an existing entry, but do
-                    // not resurrect one — a RUNNING entry with no marker behind
-                    // it is never closed, and it makes later force-ec-convert
-                    // calls on this extent attach-dedup into silent no-ops.
                     let marker_still_held = self.inflight.borrow().contains_key(&extent_id);
-                    {
-                        let mut ops = self.ops.borrow_mut();
-                        let coord = params.target_nodes.first().copied().unwrap_or(0);
-                        ops.note_ec_dispatch(extent_id, coord, marker_still_held, now_s, now_ms);
-                        if let Some(why) = r.message.split_once("failed: ").map(|(_, w)| w) {
-                            // ONE closing paren — the one this message's own
-                            // wrapper added. `trim_end_matches` repeats, and the
-                            // reason itself commonly ends in a paren
-                            // ("(os error 111)"), so it ate the error's last
-                            // character.
-                            let why = why.strip_suffix(')').unwrap_or(why).to_string();
-                            ops.record_ec_failure(extent_id, why.clone());
-                            carried_failure = Some(why);
-                        }
-                    }
-                    true
+                    self.ops
+                        .borrow_mut()
+                        .note_ec_dispatch(extent_id, coord, marker_still_held, now_s, now_ms);
+                    tracing::debug!(extent_id, state = r.state, "EC convert accepted by coordinator");
+                    None
                 }
-                Ok(r) => {
-                    tracing::warn!("EC conversion failed for extent {extent_id}: {}", r.message);
-                    false
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "EC conversion: failed to decode response for extent {extent_id}: {e}"
-                    );
-                    false
-                }
+                Ok(r) => Some(format!("coordinator node {coord} refused: {}", r.message)),
+                Err(e) => Some(format!("coordinator node {coord} answered undecodably: {e}")),
             },
-            Err(e) => {
-                tracing::warn!("EC conversion failed for extent {extent_id}: {e}");
-                false
+            Err(e) if rpc_timed_out(&e) => {
+                tracing::warn!(extent_id, coord, "EC dispatch timed out (marker kept): {e}");
+                None
             }
+            Err(e) => Some(format!("coordinator node {coord} is unreachable: {e}")),
         };
-
-        // Give up on a conversion whose participant will not come back.
-        //
-        // The target set is pinned when the marker is created and nothing
-        // re-picks it, so a dead participant makes every re-dispatch fail the
-        // same way, forever — and the extent's GC is refused the whole time. One
-        // unreachable node holding an extent's garbage indefinitely is the worse
-        // outcome, so after enough consecutive failures the marker is dropped.
-        //
-        // What abandoning costs. `policy` proposes EC conversion from EXTENT STATE
-        // (not converted, sealed, big enough), so the extent returns to the
-        // candidate pool and gets converted again — the deploy layer seeds
-        // `balanced` Armed, and that preset has EC on. (The BINARY default is
-        // Off, which is what cluster.sh, chaos and perf run with, so nothing
-        // re-proposes there.)
-        //
-        // The one thing re-proposing does NOT fix by itself: the target set is
-        // only fresh in its EXTRAS. Targets start from `ex.replicates`, so a dead
-        // replica-holder is re-picked every time until recovery re-replicates the
-        // extent away from it — the conversion then fails and is abandoned again,
-        // at the cost of one encode attempt per round rather than a permanently
-        // blocked GC.
-        //
-        // Even so, giving up beats the alternative: an extent whose GC is refused
-        // indefinitely. And this deliberately does not re-target in place —
-        // rewriting a marker's assignment mid-2PC lets old and new participants
-        // hold staging for the same extent, and the attempt-identity rules that
-        // keep that safe are exactly where this subsystem has been bitten.
-        //
-        // Only failures the coordinator REPORTS count. A coordinator that is
-        // itself unreachable takes the `rpc_ok = false` path, never carries a
-        // reason, and so never trips this — that shape is left to the fence
-        // sweep, which abandons on a fenced coordinator.
-        // Only a FRESH accept counts. The coordinator clears its remembered
-        // failure on success, not when a new attempt starts, so both CODE_OK
-        // messages keep quoting the last failure for as long as it stands —
-        // "already running (last attempt failed: X)" every five seconds while a
-        // perfectly healthy multi-GiB encode runs. Counting those would abandon
-        // any conversion that takes longer than the threshold and had ever
-        // hiccuped, which is the opposite of the intent. Gating on `started_new`
-        // counts each FAILED ATTEMPT exactly once, since a new attempt only
-        // starts after the previous one ended.
-        if let Some(why) = carried_failure.filter(|_| started_new) {
-            let n = {
-                let mut m = self.ec_consecutive_failures.borrow_mut();
-                let e = m.entry(extent_id).or_insert(0);
-                *e = e.saturating_add(1);
-                *e
-            };
-            if n >= EC_ABANDON_AFTER_CONSECUTIVE_FAILURES {
-                let coord = params.target_nodes.first().copied().unwrap_or(0);
-                tracing::error!(
-                    extent_id,
-                    attempts = n,
-                    coordinator = coord,
-                    "EC convert failed {n} times in a row ({why}) — abandoning the marker so the \
-                     extent's GC can proceed. An armed auto-policy re-proposes the conversion from \
-                     extent state; if this repeats, the participant is still unreachable and needs \
-                     recovery to move the extent off it"
-                );
-                if self
-                    .abandon_ec_marker(extent_id, coord, "repeated_failure")
-                    .await
-                {
-                    // (the release funnel already cleared the tally)
-                    let (now_s, _) = Self::now_s_ms();
-                    self.ops.borrow_mut().complete_ec(
-                        extent_id,
-                        autumn_rpc::manager_rpc::OP_STATE_FAILED,
-                        "abandoned after repeated failures".to_string(),
-                        why,
-                        now_s,
-                    );
-                }
+        if let Some(reason) = cancel {
+            tracing::warn!(extent_id, "EC conversion attempt cancelled: {reason}");
+            if let Err(e) = self.drain_attempt(extent_id, attempt_nonce, &reason).await {
+                tracing::warn!(extent_id, "cancelling the EC attempt failed (retried next tick): {e}");
             }
-        }
-
-        // NOTE: CODE_OK here means ACCEPTED, not DONE. The coordinator encodes
-        // in the background and reports completion on its next `df`
-        // (`DfResp.ec_done`), which `node_health_loop` turns into
-        // `finalize_ec_dispatch_after_convert`. The marker deliberately stays
-        // until then, so this dispatch is a safe idempotent re-send every tick.
-        if rpc_ok {
-            tracing::debug!(
-                extent_id,
-                "EC convert accepted by coordinator; awaiting df report"
-            );
         }
     }
 
@@ -3288,26 +3195,21 @@ impl crate::AutumnManager {
         eversion: u64,
         message: &str,
     ) {
-        if self.extent_inflight_nonce(extent_id) != nonce
-            || self.extent_inflight_op(extent_id)
-                != Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        if self.extent_inflight_op(extent_id)
+            != Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
         {
             return;
         }
-        if !self.abandon_ec_marker(extent_id, coord, "source_rotted").await {
+        let reason = format!(
+            "the coordinator's copy on node {coord} failed its checksums ({message}); it is \
+             isolated and rebuilt before a conversion, unless it is the last available copy \
+             (then it stays, unconvertible)"
+        );
+        if let Err(e) = self.drain_attempt(extent_id, nonce, &reason).await {
+            tracing::warn!(extent_id, "releasing the rotted EC attempt failed: {e}");
             return;
         }
         tracing::warn!(extent_id, coord, message, "EC source rotted: released the marker");
-        let (now_s, _) = Self::now_s_ms();
-        self.ops.borrow_mut().complete_ec(
-            extent_id,
-            OP_STATE_FAILED,
-            "the coordinator's copy failed its checksums; it is isolated and rebuilt before a \
-             conversion, unless it is the last available copy (then it stays, unconvertible)"
-                .into(),
-            message.into(),
-            now_s,
-        );
         self.isolate_rotted_slot(extent_id, coord, eversion, "ec_convert").await;
     }
 
@@ -4040,28 +3942,35 @@ mod ec_dispatch_owner_epoch_tests {
 }
 
 #[cfg(test)]
-mod ec_abandon_counting_tests {
-    use super::ec_accept_started_new;
+mod rpc_timed_out_tests {
+    use super::rpc_timed_out;
+    use autumn_rpc::RpcError;
 
-    /// The coordinator answers CODE_OK either way, and quotes its last failure
-    /// in both. Only a fresh accept means an attempt actually ran and failed;
-    /// counting the other would abandon a healthy multi-GiB conversion that once
-    /// hiccuped, at one phantom failure every five seconds.
+    /// Only a timeout keeps a marker: the peer may be slow, not gone. A refused
+    /// connect or a closed connection says it is not reachable.
     #[test]
-    fn only_a_fresh_accept_counts_as_an_attempt() {
-        assert!(ec_accept_started_new("ec convert accepted"));
-        assert!(ec_accept_started_new(
-            "ec convert accepted (previous attempt failed: WriteShard refused)"
-        ));
+    fn only_a_timeout_is_a_timeout() {
+        let t = anyhow::Error::new(RpcError::Timeout(std::time::Duration::from_secs(5)));
+        assert!(rpc_timed_out(&t));
+        assert!(rpc_timed_out(&t.context("re-send")));
+        assert!(!rpc_timed_out(&anyhow::Error::new(RpcError::ConnectionClosed)));
+        assert!(!rpc_timed_out(&anyhow::anyhow!("connect 127.0.0.1:1: refused")));
+    }
+}
 
-        assert!(!ec_accept_started_new("ec convert already running"));
-        assert!(
-            !ec_accept_started_new(
-                "ec convert already running (last attempt failed: WriteShard refused)"
-            ),
-            "a re-send into a live conversion must not count, however loudly it \
-             quotes an old failure"
-        );
+#[cfg(test)]
+mod ec_failed_node_tests {
+    use super::ec_failed_node;
+
+    /// The coordinator reports the failed target by its position in the request,
+    /// which is the marker's target order.
+    #[test]
+    fn the_index_names_the_target_node() {
+        let targets = [11, 22, 33];
+        assert_eq!(ec_failed_node(&targets, Some(2)), 33);
+        assert_eq!(ec_failed_node(&targets, Some(0)), 11);
+        assert_eq!(ec_failed_node(&targets, None), 11, "no index: the coordinator");
+        assert_eq!(ec_failed_node(&targets, Some(9)), 11, "out of range: the coordinator");
     }
 }
 

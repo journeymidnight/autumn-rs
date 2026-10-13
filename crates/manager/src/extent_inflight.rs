@@ -305,12 +305,6 @@ impl AutumnManager {
         self.recovery_attempts.borrow_mut().remove(&extent_id);
         self.inflight.borrow_mut().remove(&extent_id);
         self.inflight_attempt_nonce.borrow_mut().remove(&extent_id);
-        // The consecutive-failure tally belongs to the marker, not the extent.
-        // Clearing it here — the single funnel every release goes through —
-        // means a conversion that succeeded after a few failures does not leave
-        // the NEXT conversion of the same extent starting part-way to being
-        // abandoned.
-        self.ec_consecutive_failures.borrow_mut().remove(&extent_id);
     }
 
     /// Read-only probe — returns the op kind currently in flight on
@@ -519,25 +513,17 @@ impl AutumnManager {
     ///   (NotFound is downgraded to Ok) — re-dispatch from a future
     ///   GC tick is safe.
     ///
-    /// **ConvertToEc is WARN-only (supersedes the earlier blanket
-    /// auto-release).** A released ConvertToEc marker opens a race with
-    /// the original EN-side dispatch: a fresh `handle_force_ec_convert`
-    /// can succeed in the gap and shuffle a *different* parity node
-    /// assignment, then apply_ec_conversion_done writes the new layout
-    /// while the original EN-side `convert_to_ec` is still running. The
-    /// coordinator serialises the two, but the manager state can
-    /// still record the second dispatch's `target_nodes` while the first
-    /// dispatch's bytes are what hit disk. This is exactly the failure
-    /// mode the rich EC-dispatch marker was added to prevent. That is why THIS
-    /// sweep stays WARN-only and leaves a stuck marker to operator judgement
-    /// (`etcdctl get extent_inflight/<id>` + inspect EN state + decide whether to
-    /// delete it after confirming the EN finished). The WARN log fires every
-    /// sweep tick so operators get the signal.
+    /// **ConvertToEc is WARN-only here.** Not because cancelling it is unsafe —
+    /// it is (see below) — but because age is no evidence: an encode of a
+    /// multi-GiB extent legitimately runs for minutes. A conversion is cancelled
+    /// by an event instead: an abnormal target (`cancel_markers_on_abnormal_nodes`)
+    /// or the attempt's own report (`dispatch_one_ec_conversion`). The WARN fires
+    /// every sweep tick so a marker stuck for another reason is visible.
     ///
-    /// **Repeated-failure abandon is a deliberate exception, and here is why it
-    /// is safe** (`EC_ABANDON_AFTER_CONSECUTIVE_FAILURES`, recovery.rs): the
-    /// danger above is a live EN dispatch applying its layout after a second
-    /// dispatch changed the assignment. Since this doc was written, three things
+    /// **Cancelling an attempt on its own report or on an abnormal node is a
+    /// deliberate exception, and here is why it is safe** (`drain_attempt`,
+    /// recovery.rs): the danger above is a live EN dispatch applying its layout
+    /// after a second dispatch changed the assignment. Since this doc was written, three things
     /// closed that: there is no EN-side commit phase at all (shards are additive
     /// per-index staging, `.dat` is untouched, and the manager's nonce-checked
     /// flip is the ONLY commit point); a completion report whose nonce does not
@@ -549,7 +535,7 @@ impl AutumnManager {
     /// idempotent-skip keys on eversion, which only the manager's flip advances.
     /// Any future change that reintroduces an EN-side commit, or makes the flip
     /// accept a report without matching the live nonce, invalidates this and the
-    /// abandon must go back to operator-only.
+    /// cancel must go back to operator-only.
     ///
     /// **Leader-failover-as-reconcile invariant:** when the leader
     /// changes, the new leader's `replay_from_etcd` rebuilds the
@@ -623,9 +609,9 @@ impl AutumnManager {
     /// one sweep iteration. Extracted from the loop so unit tests
     /// can drive it with controlled `now` + `threshold_secs` values.
     ///
-    /// ConvertToEc markers are WARN-only and never auto-released —
-    /// see the loop's docstring for the safety argument. Only Recovery
-    /// and Delete are auto-released here.
+    /// Only Delete markers are released here (their targets handed to the
+    /// retry queue); ConvertToEc is WARN-only and Recovery is not swept — see
+    /// the loop's docstring.
     pub(crate) async fn sweep_stale_inflight_once(&self, now: i64, threshold_secs: i64) -> usize {
         // Recovery markers release faster (see
         // `recovery_stale_threshold_secs`). `.min(threshold_secs)` so a caller
@@ -665,22 +651,43 @@ impl AutumnManager {
             .collect();
         let mut released = 0usize;
         for (eid, kind, age_secs) in stale {
-            // ConvertToEc is WARN-only. Releasing the marker would
-            // open a race with the original EN-side dispatch — a fresh
-            // force-ec-convert could shuffle a different parity assignment
-            // and apply_ec_conversion_done would write the new layout while
-            // the original EN-side bytes are what hit disk. Operator must
-            // manually remediate (Python ops tooling).
+            // ConvertToEc is not released by age: a long encode is slow, not
+            // stuck. Events cancel it (an abnormal target, the attempt's own
+            // report).
             if matches!(kind, ExtentOpKind::ConvertToEc) {
                 tracing::warn!(
                     extent_id = eid,
                     age_secs,
                     threshold_secs,
-                    "stale ConvertToEc inflight marker — NOT auto-released. \
-                     Operator must inspect EN state and decide manually. \
-                     See crates/manager/CLAUDE.md note 21 for rationale."
+                    "long-running ConvertToEc marker — not released by age; check the \
+                     coordinator's log for the conversion's progress"
                 );
                 continue;
+            }
+            // A Delete marker's work is not dropped: what is still pending goes
+            // to the persisted retry queue, the same hand-off the delete loop
+            // makes after its attempt budget.
+            if matches!(kind, ExtentOpKind::Delete) {
+                // No progress entry: the delete loop holds it mid-pass (replay
+                // rebuilds one for every Delete marker), so what is still
+                // pending is known only there — look again next tick.
+                let Some(pending) = self
+                    .delete_progress
+                    .borrow()
+                    .get(&eid)
+                    .map(|d| d.pending_targets.clone())
+                else {
+                    continue;
+                };
+                if let Err(e) = self.persist_failed_delete(eid, pending).await {
+                    tracing::warn!(
+                        extent_id = eid,
+                        error = %e,
+                        "stale Delete marker: could not hand its targets to the retry queue; \
+                         will retry next sweep tick"
+                    );
+                    continue;
+                }
             }
             // Atomic etcd delete under leader fence. On error, log and
             // skip — next tick will retry.
@@ -869,23 +876,6 @@ mod tests {
     }
 
     /// Phase 0: in-memory release clears the probe.
-    /// The consecutive-failure tally belongs to the MARKER. A conversion that
-    /// succeeds after a few failures must not leave the extent's next
-    /// conversion starting part-way to being abandoned.
-    #[test]
-    fn releasing_a_marker_clears_the_ec_failure_tally() {
-        run(async {
-            let m = crate::AutumnManager::new();
-            m.ec_consecutive_failures.borrow_mut().insert(77, 5);
-            m.commit_extent_inflight_release(77);
-            assert_eq!(
-                m.ec_consecutive_failures.borrow().get(&77).copied(),
-                None,
-                "a released marker must not leave its failure count behind"
-            );
-        })
-    }
-
     #[test]
     fn commit_extent_inflight_release_clears_probe() {
         run(async {
@@ -1215,6 +1205,30 @@ mod tests {
         assert!(why.contains("in-flight"), "{why}");
         m._test_clear_inflight(42);
         assert_eq!(m.stale_candidate(&m.arbiter_view(), &cand), None);
+    }
+
+    /// A re-send the executor cannot even be reached for cancels the attempt
+    /// (nothing listens at node 9's address); the next tick derives a new one.
+    #[test]
+    fn a_re_send_to_an_unreachable_executor_cancels_the_attempt() {
+        run(async {
+            let m = AutumnManager::new();
+            m._test_register_health_nodes([1, 9]);
+            m.store.inner.borrow_mut().extents.insert(
+                20,
+                ExtentRecord {
+                    extent_id: 20,
+                    replicates: vec![1],
+                    replicate_disks: vec![10],
+                    sealed: true,
+                    sealed_length: 4096,
+                    ..Default::default()
+                },
+            );
+            m._test_acquire_marker(20, recovery_payload(20)).await.unwrap();
+            m.dispatch_recovery_task(20, 1).await.unwrap();
+            assert_eq!(m.extent_inflight_op(20), None, "the unreachable attempt is cancelled");
+        })
     }
 
     /// A recovery depends on its executor: one that enters maintenance has its
@@ -1554,7 +1568,9 @@ mod tests {
             // evidence a release cannot tell a healthy disk from a
             // faulted one it has not been told about yet.
             m.node_max_free.borrow_mut().insert(1, 1 << 30);
-            m.node_states.borrow_mut().on_heartbeat_ok(9);
+            // The executor has not answered this term (no EN runs here): not
+            // abnormal, so its marker is kept, and nothing is re-sent to it.
+            m.node_states.borrow_mut().on_register_first(9);
             m.store.inner.borrow_mut().disks.insert(
                 10,
                 crate::persist::records::DiskRecord {
@@ -1977,7 +1993,13 @@ mod tests {
                         node_uuid: String::new(),
                     },
                 );
-                m.node_states.borrow_mut().on_heartbeat_ok(node_id);
+                // The executor (9) has not answered this term — no EN runs
+                // here — so its marker is kept and nothing is re-sent to it.
+                if node_id == 9 {
+                    m.node_states.borrow_mut().on_register_first(node_id);
+                } else {
+                    m.node_states.borrow_mut().on_heartbeat_ok(node_id);
+                }
                 m.store.inner.borrow_mut().disks.insert(
                     disk,
                     crate::persist::records::DiskRecord {
@@ -2115,7 +2137,54 @@ mod tests {
                 !m.delete_progress.borrow().contains_key(&30),
                 "Delete release must also drop delete_progress entry"
             );
+            // ... and its work is not dropped: what was pending is in the
+            // persisted retry queue.
+            let retry = m.failed_deletes.borrow().get(&30).cloned().expect("handed off");
+            assert_eq!(retry.pending_targets.len(), 1);
+            assert_eq!(retry.pending_targets[0].addr, "127.0.0.1:9101");
         })
+    }
+
+    /// While the delete loop holds a Delete's progress mid-pass, only it knows
+    /// what is still pending: the stale sweep leaves that marker for its next
+    /// tick instead of handing off the ORIGINAL target list.
+    #[test]
+    fn the_stale_sweep_waits_for_a_delete_mid_pass() {
+        run(async {
+            let m = AutumnManager::new();
+            m.acquire_extent_inflight(30, delete_payload(30)).await.expect("delete");
+            let far = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 7200;
+            assert_eq!(m.sweep_stale_inflight_once(far, 1).await, 0);
+            assert_eq!(m.extent_inflight_op(30), Some(ExtentOpKind::Delete));
+            assert!(m.failed_deletes.borrow().get(&30).is_none());
+        })
+    }
+
+    /// A fence node is not waited for by a delete: its files are reaped by its
+    /// reconcile if it ever returns. A node no longer registered is fence too;
+    /// a target without a uuid (a legacy node) cannot be judged and is kept.
+    #[test]
+    fn a_delete_does_not_wait_for_a_fence_target() {
+        let m = AutumnManager::new();
+        m._test_register_health_nodes([1, 2]);
+        for (id, uuid) in [(1u64, "u-1"), (2, "u-2")] {
+            m.store.inner.borrow_mut().nodes.get_mut(&id).unwrap().node_uuid = uuid.into();
+        }
+        let target = |uuid: &str| crate::extent_delete::DeleteTarget {
+            addr: "127.0.0.1:9".to_string(),
+            node_uuid: uuid.to_string(),
+        };
+        assert!(!m.delete_target_is_fence(&target("u-1")));
+        set_override(&m, 1, NODE_OVERRIDE_FENCED);
+        assert!(m.delete_target_is_fence(&target("u-1")));
+        set_override(&m, 2, autumn_rpc::manager_rpc::NODE_OVERRIDE_MAINTENANCE);
+        assert!(!m.delete_target_is_fence(&target("u-2")), "maintenance is waited for");
+        assert!(m.delete_target_is_fence(&target("u-gone")));
+        assert!(!m.delete_target_is_fence(&target("")));
     }
 
     /// stale ConvertToEc marker is WARN-only across multiple

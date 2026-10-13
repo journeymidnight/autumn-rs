@@ -3456,16 +3456,15 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   `extent-<id>.shard<N>` files still present on a quiet extent after two
 #   rounds mean the node is not reconciling — check that it registered
 #   (`reconcile: cannot identify the reporting node` on the manager).
-#   ONE EXPECTED ERROR: the give-up releases the marker on the tick where the
-#   coordinator has just started a FRESH attempt, so a reclaim can land while
-#   that attempt is still streaming. Its next stripe then logs
+#   ONE EXPECTED ERROR: a cancel can land while the cancelled attempt is still
+#   streaming, and a reclaim then removes its staging. Its next stripe logs
 #   `write_shard <id>/<n>: staging file vanished before stripe @<off> — this
 #   attempt's staging was clobbered; refusing to recreate it with holes` at
-#   ERROR. Beside an `abandoning the marker` line for the same extent that is
-#   BENIGN and is the system working: the refusal is what stops a zero-holed
-#   shard being built, and an abandoned attempt could not have committed anyway.
-#   The same ERROR with NO abandon for that extent is a real problem — something
-#   deleted staging out from under a live conversion.
+#   ERROR. Beside an `EC conversion attempt cancelled` line for the same extent
+#   that is BENIGN and is the system working: the refusal is what stops a
+#   zero-holed shard being built, and a cancelled attempt could not have
+#   committed anyway. The same ERROR with NO cancel for that extent is a real
+#   problem — something deleted staging out from under a live conversion.
 #   A parity target that staged but never became a member gets no placement at
 #   all (placements are member-only), so its residue is collected by the
 #   non-member garbage leg after its three-round grace (~15 min), not the next
@@ -4769,7 +4768,11 @@ find <data-dir> -name 'extent-<ID>.*' -printf '%f(%s) '
 
 **If a conversion never reaches `succeeded`:**
 
-- `ops list --kind ec` carries the last failure reason and an attempt count.
+- `ops list --kind ec` shows the reason a conversion ended. An attempt that fails
+  (a participant refused or was unreachable, the coordinator's own step failed)
+  is cancelled at once and the op closes FAILED naming the node (`node N failed
+  the conversion: …`); the auto-policy proposes the extent again with a fresh
+  attempt. A dispatch that only times out keeps the attempt.
 - A marker any of whose targets — or the disk a target writes to — is
   suspected, in maintenance, fenced or gone is cancelled automatically (the op
   closes FAILED naming the node or disk), and the auto-policy proposes the

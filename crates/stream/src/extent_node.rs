@@ -233,8 +233,16 @@ enum DiskProbeError {
 
 #[derive(Debug, Clone, thiserror::Error)]
 enum EcConvertError {
+    /// The coordinator's own step failed.
     #[error("{code:?}: {message}")]
     Status { code: StatusCode, message: String },
+    /// A shard write to target `target` (index into `target_addrs`) failed.
+    #[error("{code:?}: {message}")]
+    Participant {
+        target: u32,
+        code: StatusCode,
+        message: String,
+    },
     /// The coordinator's `.dat` differs from its recorded checksums.
     #[error("source content rotted: {0}")]
     SourceRotted(String),
@@ -244,6 +252,25 @@ impl From<(StatusCode, String)> for EcConvertError {
     fn from((code, message): (StatusCode, String)) -> Self {
         Self::Status { code, message }
     }
+}
+
+impl EcConvertError {
+    /// The target the failure names: the participant, or the coordinator (0).
+    fn failed_target(&self) -> u32 {
+        match self {
+            Self::Participant { target, .. } => *target,
+            Self::Status { .. } | Self::SourceRotted(_) => 0,
+        }
+    }
+}
+
+fn ec_resp(code: u8, message: String, state: u8, failed_target: Option<u32>) -> HandlerResult {
+    Ok(rkyv_encode(&crate::extent_rpc::ConvertToEcResp {
+        code,
+        message,
+        state,
+        failed_target,
+    }))
 }
 
 impl DiskProbeError {
@@ -1847,7 +1874,8 @@ pub struct ExtentNode {
     /// EC conversions running in the background on this shard. The manager
     /// re-dispatches from its durable marker every ~5 s, so without this guard
     /// each tick would spawn another converter for the same extent.
-    ec_convert_inflight: Rc<DashMap<u64, ()>>,
+    /// extent -> the nonce of the conversion attempt running on it.
+    ec_convert_inflight: Rc<DashMap<u64, u64>>,
     /// Why this extent's last EC conversion attempt failed.
     ///
     /// The coordinator's failures used to exist only in its own log: the manager
@@ -9868,27 +9896,38 @@ impl ExtentNode {
             ));
         }
 
-        // The manager re-dispatches from its durable marker every ~5 s; without
-        // this guard every tick would spawn another converter for the same
-        // extent (they would serialise on the per-extent lock, but pile up).
-        // Both answers below are CODE_OK — "accepted" and "already running" are
-        // equally not-an-error — so the MESSAGE is the only place the manager can
-        // learn that the previous attempt died, and which of the two states this
-        // one is.
+        // The manager re-sends its marker every ~5 s. One attempt (one nonce)
+        // runs at most once here: a re-send of the running one is answered
+        // RUNNING, of a failed one FAILED (with the target that failed) and not
+        // started again — the manager cancels that marker and derives a new
+        // attempt. A NEWER nonce supersedes the running attempt: the map now
+        // names it, the old one stops at its next stripe, and the new one waits
+        // for the extent op lock it releases.
+        let running = self.ec_convert_inflight.get(&req.extent_id).map(|v| *v);
+        match running {
+            Some(n) if n == req.attempt_nonce => {
+                return ec_resp(
+                    CODE_OK,
+                    "ec convert already running".to_string(),
+                    crate::extent_rpc::EC_ATTEMPT_RUNNING,
+                    None,
+                );
+            }
+            Some(n) if n > req.attempt_nonce => {
+                return ec_resp(
+                    CODE_PRECONDITION,
+                    format!("a newer EC attempt ({n}) runs on this extent"),
+                    crate::extent_rpc::EC_ATTEMPT_FAILED,
+                    None,
+                );
+            }
+            _ => {}
+        }
         let prior_failure = self
             .ec_last_error
             .get(&req.extent_id)
             .filter(|e| e.value().0 == req.attempt_nonce)
             .map(|e| e.value().1.clone());
-        if self.ec_convert_inflight.contains_key(&req.extent_id) {
-            return code_resp(
-                CODE_OK,
-                match &prior_failure {
-                    Some(why) => format!("ec convert already running (last attempt failed: {why})"),
-                    None => "ec convert already running".to_string(),
-                },
-            );
-        }
         if let Some(EcConvertError::SourceRotted(why)) = &prior_failure {
             // Encoding again would only find the same rot. The typed answer is
             // what lets the manager release the marker and isolate this copy.
@@ -9903,9 +9942,22 @@ impl ExtentNode {
                 outcome: SCRUB_OUTCOME_ROT,
                 message: why.clone(),
             });
-            return code_resp(CODE_CONTENT_CORRUPT, why.clone());
+            return ec_resp(
+                CODE_CONTENT_CORRUPT,
+                why.clone(),
+                crate::extent_rpc::EC_ATTEMPT_FAILED,
+                Some(0),
+            );
         }
-        self.ec_convert_inflight.insert(req.extent_id, ());
+        if let Some(error) = prior_failure {
+            return ec_resp(
+                CODE_OK,
+                error.to_string(),
+                crate::extent_rpc::EC_ATTEMPT_FAILED,
+                Some(error.failed_target()),
+            );
+        }
+        self.ec_convert_inflight.insert(req.extent_id, req.attempt_nonce);
 
         let node = self.clone();
         compio::runtime::spawn(async move {
@@ -9943,17 +9995,22 @@ impl ExtentNode {
                     );
                 }
             }
-            node.ec_convert_inflight.remove(&extent_id);
-            node.clear_op_progress(extent_id);
+            // Only this attempt's entry: a newer one may have replaced it.
+            if node
+                .ec_convert_inflight
+                .remove_if(&extent_id, |_, n| *n == attempt_nonce)
+                .is_some()
+            {
+                node.clear_op_progress(extent_id);
+            }
         })
         .detach();
 
-        code_resp(
+        ec_resp(
             CODE_OK,
-            match prior_failure {
-                Some(why) => format!("ec convert accepted (previous attempt failed: {why})"),
-                None => "ec convert accepted".to_string(),
-            },
+            "ec convert accepted".to_string(),
+            crate::extent_rpc::EC_ATTEMPT_STARTED,
+            None,
         )
     }
 
@@ -10262,6 +10319,15 @@ impl ExtentNode {
                 };
                 let mut s = 0usize;
                 while s < per_shard {
+                    if self.ec_convert_inflight.get(&extent_id).map(|n| *n)
+                        != Some(req.attempt_nonce)
+                    {
+                        return Err((
+                            StatusCode::FailedPrecondition,
+                            format!("extent {extent_id}: superseded by a newer EC attempt"),
+                        )
+                            .into());
+                    }
                     let stripe_len = (per_shard - s).min(stripe_bytes);
                     // Read the K data-shard sub-ranges at shard-offset `s` from
                     // the local `.dat`. Data shard i covers
@@ -10392,7 +10458,12 @@ impl ExtentNode {
                                 })
                             },
                         )
-                        .await?;
+                        .await
+                        .map_err(|(code, message)| EcConvertError::Participant {
+                            target: i as u32,
+                            code,
+                            message,
+                        })?;
                     }
 
                     // Coordinator's own shard 0 stripe, written LAST.

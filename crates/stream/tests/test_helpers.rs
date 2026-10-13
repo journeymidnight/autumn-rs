@@ -61,6 +61,15 @@ impl TestConn {
         }
     }
 
+    pub async fn convert_to_ec(&self, req: &ConvertToEcReq) -> ConvertToEcResp {
+        let resp = self
+            .pool
+            .call(&self.addr, MSG_CONVERT_TO_EC, rkyv_encode(req))
+            .await
+            .expect("convert_to_ec RPC");
+        rkyv_decode::<ConvertToEcResp>(&resp).expect("decode ConvertToEcResp")
+    }
+
     pub async fn alloc_extent(&self, extent_id: u64) -> AllocExtentResp {
         let payload = rkyv_encode(&AllocExtentReq { extent_id });
         let resp = self
