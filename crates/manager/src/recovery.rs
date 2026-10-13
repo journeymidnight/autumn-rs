@@ -101,7 +101,7 @@ pub(crate) fn classify_ec_done(
 /// marker's creation and a re-dispatch raises the ENs' per-extent floor above a
 /// frozen value. Every participant then answers `CODE_LOCKED_BY_OTHER`, the
 /// conversion can never finish, the marker is never released, and that extent's
-/// GC is refused forever ("has in-flight EC conversion") — an unbounded space
+/// GC is refused forever ("has in-flight ConvertToEc") — an unbounded space
 /// leak from an ordinary restart.
 ///
 /// Refreshing keeps the fence's actual purpose intact: it exists to stop a
@@ -176,8 +176,10 @@ pub(crate) fn _test_arm_ec_apply_fail_once() {
 pub(crate) enum DispatchOutcome {
     /// A target accepted the rebuild (or one was already running).
     Dispatched,
-    /// Every candidate was capped by the rate limiter and no RPC was
-    /// attempted. Retry next tick; leave backoff accounting alone.
+    /// No RPC was attempted, and not for a reason that is a failure: every
+    /// candidate was capped by the rate limiter, the arbiter holds the extent
+    /// back (another op in flight, a split/merge hold), or no node has proven
+    /// itself this term yet. Retry next tick; leave backoff accounting alone.
     Deferred,
 }
 
@@ -598,8 +600,18 @@ impl AutumnManager {
             Some(crate::extent_inflight::ExtentOpKind::Recovery) => {
                 return self.redispatch_pinned_recovery(extent_id).await;
             }
-            Some(_) => return Ok(DispatchOutcome::Dispatched),
-            None => {}
+            _ => {}
+        }
+        // Another op holding the extent (nothing preempts it), a split/merge
+        // hold: not a dispatch, not a failure — the backoff is left alone and
+        // the slot is looked at again next tick.
+        if let Err(why) = self.arbitrate(
+            &self.arbiter_view(),
+            extent_id,
+            crate::extent_arbiter::ExtentOp::Rebuild,
+        ) {
+            tracing::debug!(extent_id, "recovery deferred: {why}");
+            return Ok(DispatchOutcome::Deferred);
         }
 
         // Only onto a node that takes new data (`Classes::takes_new_data`).
@@ -1902,7 +1914,7 @@ impl AutumnManager {
                 tracing::debug!(
                     extent_id,
                     slot,
-                    "recovery dispatch deferred (every candidate rate-limited); backoff untouched"
+                    "recovery dispatch deferred (rate-limited, held back, or no proven target yet); backoff untouched"
                 );
             }
             // Capture WHY it failed so `recovery-stats`
@@ -3986,7 +3998,7 @@ mod ec_dispatch_owner_epoch_tests {
     /// re-dispatch leaves any frozen copy BELOW the ENs' per-extent floor. Every
     /// participant then answers `CODE_LOCKED_BY_OTHER` and the conversion can
     /// never finish: the marker is pinned forever and the extent's GC is refused
-    /// forever with "has in-flight EC conversion".
+    /// forever with "has in-flight ConvertToEc".
     ///
     /// Observed in system_chaos: a coordinator re-dispatched every 5 s, each
     /// time failing `WriteShard ... shard 1 @ 0`, holding extent 12's marker for

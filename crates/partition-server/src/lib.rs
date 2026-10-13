@@ -10043,9 +10043,55 @@ pub(crate) async fn save_table_locs_raw(
     let info = stream_client.get_stream_info(meta_stream_id).await?;
     if info.extent_ids.len() > 1 {
         let last = *info.extent_ids.last().unwrap();
-        stream_client.truncate(meta_stream_id, last).await?;
+        // Reclaiming the extents before this checkpoint is not part of
+        // publishing it. The manager refuses it while another op (a recovery,
+        // an EC conversion) is in flight on one of them; the next checkpoint
+        // asks again.
+        if let Err(e) = stream_client.truncate(meta_stream_id, last).await {
+            if !manager_says_retry_later(&e) {
+                return Err(e);
+            }
+            tracing::info!(meta_stream_id, "meta stream truncate deferred: {e}");
+        }
     }
     Ok(())
+}
+
+/// The manager refused for now, not for good: another op is in flight on the
+/// extent, or the caller's snapshot was stale. Not the owner fence.
+pub(crate) fn manager_says_retry_later(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<autumn_stream::client::ManagerError>()
+            .is_some_and(|m| m.is_transient_conflict())
+    })
+}
+
+#[cfg(test)]
+mod manager_says_retry_later_tests {
+    use super::manager_says_retry_later;
+    use autumn_rpc::manager_rpc::{CODE_ERROR, CODE_PRECONDITION};
+    use autumn_stream::client::ManagerError;
+
+    fn err(code: u8, message: &str) -> anyhow::Error {
+        anyhow::Error::new(ManagerError::new(code, "truncate", message))
+    }
+
+    /// A truncate refused because a recovery is in flight on an old meta
+    /// extent waits for the next checkpoint; anything else still fails it.
+    #[test]
+    fn only_a_wait_for_another_op_is_deferred() {
+        let busy = autumn_common::alloc_conflict::inflight_defer_message(7, "Recovery", "truncate");
+        assert!(manager_says_retry_later(&err(CODE_PRECONDITION, &busy)));
+        assert!(manager_says_retry_later(
+            &err(CODE_PRECONDITION, &busy).context("checkpoint")
+        ));
+        assert!(!manager_says_retry_later(&err(
+            CODE_PRECONDITION,
+            "owner_key=partition/1 owner_epoch mismatch, expected 4, got 3"
+        )));
+        assert!(!manager_says_retry_later(&err(CODE_ERROR, &busy)));
+        assert!(!manager_says_retry_later(&anyhow::anyhow!("connection reset")));
+    }
 }
 
 /// Publish the final source checkpoint used by merge recovery. The caller has

@@ -267,21 +267,8 @@ rebuild the copy instead.
 
 Where the code still answers differently from §1–§5. Paths are under
 `crates/manager/src/` unless noted. Node and disk classes (§1) are
-`node_class.rs`, and every path that judges a node or a disk uses them.
-
-**Conflicts between ops**
-
-- Punch / truncate refuse against Recovery only when `refs` would reach 0, and
-  against EC unconditionally (`refuse_if_removed_extent_inflight`,
-  rpc_handlers.rs). The PS has already relocated the live values, retries only
-  on the next manager GC dispatch, and the refusal stamps `last_gc_at`, muting
-  the GC advisory for `gc_cooldown_sec`.
-- The auto-policy controller acts on an advisory cache up to a policy tick
-  (60 s) old without asking again, and every refusal becomes a FAILED op.
-- Recovery dispatch maps "another op holds the marker" to `Dispatched`, which
-  clears the slot's backoff and logs nothing.
-- `apply_recovery_done` refuses while an EC marker is held, and the completion
-  is dropped (logged at trace).
+`node_class.rs` and the arbiter (§2, §4) is `extent_arbiter.rs`; every path that
+judges a node, a disk or whether an op may start uses them.
 
 **Release paths**
 

@@ -1,5 +1,6 @@
-//! Transient `alloc_extent` conflict messages: the BUILDERS (manager side)
-//! and the CLASSIFIER (stream-client side) in one place.
+//! Transient manager-side conflict messages (`alloc_extent`, and an extent op
+//! that waits for another in flight): the BUILDERS (manager side) and the
+//! CLASSIFIER (stream-client / PS side) in one place.
 //!
 //! Over the wire these rejections are plain `CODE_PRECONDITION`, which is
 //! also what deterministic business-rule refusals use ("stream cannot be
@@ -33,9 +34,10 @@ pub fn cas_conflict_message() -> String {
     format!("stream changed concurrently (CAS conflict); retry with a {FRESH_SNAPSHOT_TOKEN}")
 }
 
-/// The tail extent is busy with an EC conversion / recovery / GC op.
-pub fn inflight_defer_message(extent_id: u64, op: &str) -> String {
-    format!("extent {extent_id} has in-flight {op}; defer alloc_extent {INFLIGHT_DEFER_TOKEN}")
+/// The extent is busy with an EC conversion / recovery / delete, so `action`
+/// (alloc_extent, punch_holes, truncate, an EC conversion, ...) waits.
+pub fn inflight_defer_message(extent_id: u64, op: &str, action: &str) -> String {
+    format!("extent {extent_id} has in-flight {op}; defer {action} {INFLIGHT_DEFER_TOKEN}")
 }
 
 /// Verify-at-apply saw the stream's membership move under the allocation.
@@ -74,7 +76,8 @@ mod tests {
     fn builders_pair_with_classifier() {
         for m in [
             cas_conflict_message(),
-            inflight_defer_message(7, "EcConvert"),
+            inflight_defer_message(7, "EcConvert", "alloc_extent"),
+            inflight_defer_message(7, "Recovery", "truncate"),
             membership_changed_message(42),
             eversion_changed_message(7, 3, 4),
         ] {

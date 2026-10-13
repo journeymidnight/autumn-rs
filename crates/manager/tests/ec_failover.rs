@@ -80,6 +80,24 @@ async fn get_stream_info(mgr: &RpcClient, stream_id: u64) -> MgrStreamInfo {
 }
 
 /// Full EC failover test: 3-replica → seal → 2+1 EC → kill node → read → recover
+/// EC targets go only to nodes that answered this term's df (class Health);
+/// right after registration they have not yet.
+async fn wait_all_nodes_online(mgr: &RpcClient) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let bytes = mgr
+            .call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
+            .await
+            .expect("list_node_states");
+        let r: ListNodeStatesResp = rkyv_decode(&bytes).expect("decode");
+        if !r.nodes.is_empty() && r.nodes.iter().all(|n| n.auto_state == NODE_AUTO_STATE_ONLINE) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "nodes never came Online");
+        compio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 #[test]
 fn ec_2_1_failover_and_recovery() {
     tracing_subscriber::fmt()
@@ -191,6 +209,7 @@ fn ec_2_1_failover_and_recovery() {
         // was removed during the mechanism/policy refactor. Trigger
         // the conversion explicitly so the dispatch loop has something
         // to drain.
+        wait_all_nodes_online(&mgr).await;
         let force_resp = mgr
             .call(
                 MSG_FORCE_EC_CONVERT,

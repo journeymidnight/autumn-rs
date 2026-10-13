@@ -2489,6 +2489,7 @@ impl AutumnManager {
                     let msg = autumn_common::alloc_conflict::inflight_defer_message(
                         tail_id,
                         &format!("{op:?}"),
+                        "alloc_extent",
                     );
                     return Self::alloc_reject(CODE_PRECONDITION, msg);
                 }
@@ -2913,40 +2914,30 @@ impl AutumnManager {
         }))
     }
 
-    /// Refuse a punch_holes / truncate when any to-be-removed extent has a
-    /// stream-layer op in flight: recovery (only when the extent would drop
-    /// to refs==0 — `refs==1 && vp_table_refs==0`) or EC conversion
-    /// (unconditional). `op` names the operation for the error message.
-    /// Pure read over `s`; shared refuse-at-start by
-    /// handle_stream_punch_holes + handle_truncate.
+    /// Refuse a punch_holes / truncate while any to-be-removed extent has an op
+    /// in flight, whatever its `refs`: nothing preempts (`extent_arbiter.rs`).
+    /// Even a punch that only decrements a CoW-shared extent's refs bumps its
+    /// `eversion`, which voids an in-flight recovery's attempt as surely as
+    /// deleting the extent would. The refusal is a transient conflict
+    /// (`alloc_conflict::inflight_defer_message`): the PS retries on its next
+    /// GC dispatch or checkpoint.
     fn refuse_if_removed_extent_inflight(
-        s: &crate::store::MetadataState,
+        &self,
         removed: &HashSet<u64>,
-        recovery_inflight_set: &HashSet<u64>,
-        ec_inflight_set: &HashSet<u64>,
         op: &str,
     ) -> Result<(), AppError> {
-        // If any extent that would drop to refs=0 is currently being
-        // recovered, refuse the entire call.
-        for eid in removed {
-            if recovery_inflight_set.contains(eid) {
-                if let Some(ex) = s.extents.get(eid) {
-                    if ex.refs == 1 && ex.vp_table_refs == 0 {
-                        return Err(AppError::Precondition(format!(
-                            "extent {eid} has in-flight recovery; \
-                             defer {op} until recovery completes"
-                        )));
-                    }
-                }
-            }
-        }
-        // Refuse if any to-be-removed extent is mid-EC.
-        for eid in removed {
-            if ec_inflight_set.contains(eid) {
-                return Err(AppError::Precondition(format!(
-                    "extent {eid} has in-flight EC conversion; \
-                     defer {op} until conversion completes"
-                )));
+        for &eid in removed {
+            let facts = crate::extent_arbiter::ExtentFacts {
+                extent_id: eid,
+                in_flight: self.extent_inflight_op(eid),
+                ..Default::default()
+            };
+            if let Err(why) = crate::extent_arbiter::may_start(crate::extent_arbiter::ExtentOp::Removal, &facts) {
+                tracing::debug!(extent_id = eid, "{op} deferred: {why}");
+                let kind = facts.in_flight.map(|k| format!("{k:?}")).unwrap_or_default();
+                return Err(AppError::Precondition(
+                    autumn_common::alloc_conflict::inflight_defer_message(eid, &kind, op),
+                ));
             }
         }
         Ok(())
@@ -2954,15 +2945,15 @@ impl AutumnManager {
 
     /// For every extent in `removed`, compute its ref-drop effect and build
     /// `(extent_puts, extent_deletes, pending_deletes)`. An extent dropping
-    /// to refs==0 that is physically deletable (`extent_can_delete`) and not
-    /// EC-inflight goes to `extent_deletes` + gets a `PendingDelete`
-    /// snapshot; otherwise refs is decremented (eversion bumped) into
-    /// `extent_puts`. Pure read over `s` (returns clones). Shared by
-    /// handle_stream_punch_holes + handle_truncate.
+    /// to refs==0 that is physically deletable (`extent_can_delete`) goes to
+    /// `extent_deletes` + gets a `PendingDelete` snapshot; otherwise refs is
+    /// decremented (eversion bumped) into `extent_puts`. Pure read over `s`
+    /// (returns clones). Every caller has already refused an extent with an
+    /// op in flight. Shared by handle_stream_punch_holes + handle_truncate +
+    /// the sealed-empty sweep.
     pub(crate) fn compute_extent_ref_drops(
         s: &crate::store::MetadataState,
         removed: &HashSet<u64>,
-        ec_inflight_set: &HashSet<u64>,
     ) -> (
         Vec<ExtentRecord>,
         Vec<u64>,
@@ -2987,11 +2978,10 @@ impl AutumnManager {
         let mut extent_cas: Vec<(String, Vec<u8>)> = Vec::new();
 
         // Build pending_deletes snapshot for extents that would physically
-        // delete (refs would hit 0 and not EC-inflight).
+        // delete (refs would hit 0).
         for &eid in removed {
             if let Some(extent) = s.extents.get(&eid) {
-                if extent.refs == 1 && extent.vp_table_refs == 0 && !ec_inflight_set.contains(&eid)
-                {
+                if extent.refs == 1 && extent.vp_table_refs == 0 {
                     let pending_targets = Self::snapshot_replica_targets(&s.nodes, eid, extent);
                     pending_deletes.push(PendingDelete {
                         extent_id: eid,
@@ -3014,7 +3004,7 @@ impl AutumnManager {
                 let mut new_ext = extent.clone();
                 if new_ext.refs <= 1 {
                     new_ext.refs = 0;
-                    if Self::extent_can_delete(&new_ext) && !ec_inflight_set.contains(extent_id) {
+                    if Self::extent_can_delete(&new_ext) {
                         extent_deletes.push(*extent_id);
                     } else {
                         new_ext.eversion += 1;
@@ -3043,10 +3033,6 @@ impl AutumnManager {
         let req: PunchHolesReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // Snapshot the ConvertToEc + Recovery sets from the inflight ledger
-        // once. Single-threaded compio — snapshot-then-consult preserves
-        // semantics.
-        let (ec_inflight_set, recovery_inflight_set) = self.inflight_snapshot_ec_recovery();
 
         // Etcd-first: compute mutations on clones (no store mutation), persist
         // to etcd, then apply — so a mirror failure (NotLeader / etcd
@@ -3089,13 +3075,7 @@ impl AutumnManager {
                     .filter(|id| members.contains(id))
                     .collect();
 
-                Self::refuse_if_removed_extent_inflight(
-                    s,
-                    &removed,
-                    &recovery_inflight_set,
-                    &ec_inflight_set,
-                    "punch_holes",
-                )?;
+                self.refuse_if_removed_extent_inflight(&removed, "punch_holes")?;
                 self.refuse_if_topology_holds(&removed, req.stream_id, "punch_holes")?;
 
                 let mut updated = stream;
@@ -3106,7 +3086,7 @@ impl AutumnManager {
                     ));
                 }
                 let (extent_puts, extent_deletes, pending_deletes, extent_cas) =
-                    Self::compute_extent_ref_drops(s, &removed, &ec_inflight_set);
+                    Self::compute_extent_ref_drops(s, &removed);
                 Ok((
                     updated,
                     extent_puts,
@@ -3210,9 +3190,6 @@ impl AutumnManager {
         let req: TruncateReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // Snapshot ConvertToEc + Recovery inflight sets.
-        let (ec_inflight_set, recovery_inflight_set) = self.inflight_snapshot_ec_recovery();
-
         // Etcd-first (same shape as handle_stream_punch_holes).
         let out = {
             let guard = self.store.inner.borrow();
@@ -3255,19 +3232,13 @@ impl AutumnManager {
 
                 let removed: HashSet<u64> = stream.extent_ids[..pos].iter().copied().collect();
 
-                Self::refuse_if_removed_extent_inflight(
-                    s,
-                    &removed,
-                    &recovery_inflight_set,
-                    &ec_inflight_set,
-                    "truncate",
-                )?;
+                self.refuse_if_removed_extent_inflight(&removed, "truncate")?;
                 self.refuse_if_topology_holds(&removed, req.stream_id, "truncate")?;
 
                 let mut updated = stream;
                 updated.extent_ids.retain(|id| !removed.contains(id));
                 let (extent_puts, extent_deletes, pending_deletes, extent_cas) =
-                    Self::compute_extent_ref_drops(s, &removed, &ec_inflight_set);
+                    Self::compute_extent_ref_drops(s, &removed);
                 Ok((
                     updated,
                     extent_puts,
@@ -5168,23 +5139,12 @@ impl AutumnManager {
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
         let extent_id = req.extent_id;
 
-        // already in-flight (any stream-layer op)? Idempotent OK
-        // for the ConvertToEc case (caller's intent matches the in-flight
-        // op); Precondition for Recovery / Delete (different ops, retry
-        // later).
-        match self.extent_inflight_op(extent_id) {
-            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc) => {
-                return Self::force_ec_resp(CODE_OK, "already pending dispatch".to_string());
-            }
-            Some(other) => {
-                return Self::force_ec_resp(
-                    CODE_PRECONDITION,
-                    format!(
-                        "extent {extent_id} has in-flight {other:?}; retry after it completes"
-                    ),
-                );
-            }
-            None => {}
+        // Already converting: idempotent OK (the caller's intent matches the op
+        // in flight). Any other op in flight is the arbiter's refusal below.
+        if self.extent_inflight_op(extent_id)
+            == Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        {
+            return Self::force_ec_resp(CODE_OK, "already pending dispatch".to_string());
         }
 
         // Look up current state + the owning stream's EC shape under
@@ -5243,21 +5203,17 @@ impl AutumnManager {
         let parity_shards = stream.ec_parity_shard as usize;
         let total_shards = data_shards + parity_shards;
 
-        // Every replica is a target (the coordinator encodes its own copy, the
-        // others keep their disk slot), so a replica on an excluded node would
-        // make the conversion fail on every attempt — and its marker blocks the
-        // repair that moves that replica.
-        let hard_excluded = self.placement_excluded_node_ids();
-        if let Some(nid) = ex.replicates.iter().find(|n| hard_excluded.contains(n)) {
-            return Self::force_ec_resp(
-                CODE_PRECONDITION,
-                format!(
-                    "extent {extent_id} has a replica on node {nid}, which is suspected, \
-                     fenced or in maintenance; retry once the node is back or the replica \
-                     is repaired off it"
-                ),
-            );
+        // May a conversion start now (`extent_arbiter.rs`): nothing in flight,
+        // no split/merge hold, no rebuild owed, every replica usable — every
+        // replica is a target (the coordinator encodes its own copy, the others
+        // keep their disk slot).
+        let view = self.arbiter_view();
+        if let Err(why) =
+            self.arbitrate(&view, extent_id, crate::extent_arbiter::ExtentOp::EcConvert)
+        {
+            return Self::force_ec_resp(CODE_PRECONDITION, why);
         }
+        let classes = view.classes;
         let mut target_nodes = ex.replicates.clone();
         let mut extra_disk_ids: Vec<u64> = Vec::new();
         let mut target_addrs: Vec<String> = Vec::new();
@@ -5283,7 +5239,7 @@ impl AutumnManager {
                     .nodes
                     .values()
                     .filter(|n| !existing.contains(&n.node_id))
-                    .filter(|n| !hard_excluded.contains(&n.node_id))
+                    .filter(|n| classes.takes_new_data(n))
                     .cloned()
                     .collect();
                 pool.shuffle(&mut rand::thread_rng());

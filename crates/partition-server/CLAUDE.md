@@ -843,7 +843,15 @@ the manager reschedules. There is no in-thread fallback (see row_stream
 single-writer invariant).
 
 After flush, `save_table_locs_raw` writes `TableLocations` to `meta_stream` and
-**truncates meta_stream to 1 extent** — only the latest checkpoint is kept.
+**truncates meta_stream to 1 extent** — only the latest checkpoint is kept. The
+truncate is reclamation, not part of publishing: the manager refuses it while
+another op (a recovery, an EC conversion) is in flight on one of the old extents
+— nothing preempts (manager CLAUDE.md, "Extent arbiter") — and that refusal is a
+transient conflict (`manager_says_retry_later`), so the checkpoint stands and the
+next one truncates. Any other refusal (the owner fence) still fails it. Until
+then a restart replays from the earliest record left, which is correct, only
+slower. The row-stream prefix cut after a compaction
+(`truncate_unreferenced_row_prefix`) defers the same way.
 
 INVARIANT (checkpoint publication): only P-log may publish `metaStream`
 checkpoints. P-sst may upload the SST and build the `SstReader`, but it must not

@@ -2840,9 +2840,11 @@ $AO scrub EXT_ID... | --part PART_ID | --all [--wait]
 # EC never targets an excluded node: stop one EN that holds a replica of a
 #   sealed extent E, wait for `$AO health` / node states to show it Suspected,
 #   then `$AO force-ec-convert --extent E --wait` must FAIL with "has a replica
-#   on node N, which is suspected, fenced or in maintenance" and no EC marker
-#   is left (`$AO info` shows no in-flight op on E). Restart the EN (or repair
-#   the replica off it) and the same command succeeds.
+#   on node N, which is suspected or in maintenance" and no EC marker is left
+#   (`$AO info` shows no in-flight op on E). Restart the EN (or repair the
+#   replica off it) and the same command succeeds. While any op is in flight
+#   on E (a recovery, a delete) it fails with "has an in-flight <op>"; nothing
+#   preempts an op in flight, GC's punch included.
 
 # Admin / observability
 $AO info                                 # nodes / extents / streams / partitions

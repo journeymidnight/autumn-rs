@@ -369,11 +369,9 @@ impl AutumnManager {
         }
     }
 
-    /// Same split as `inflight_snapshot_ec_recovery`, but carrying each
-    /// marker's `started_at` — the ledger seeds replayed entries from it so a
-    /// leader change does not reset how long the work has been running. Kept
-    /// separate because the three other callers only ask "is this extent in
-    /// flight" and have no use for the timestamp.
+    /// The EC and Recovery markers with each one's `started_at` — the ledger
+    /// seeds replayed entries from it so a leader change does not reset how
+    /// long the work has been running.
     pub(crate) fn inflight_started_at_ec_recovery(&self) -> (Vec<(u64, i64)>, Vec<(u64, i64)>) {
         let mut ec = Vec::new();
         let mut rec = Vec::new();
@@ -381,28 +379,6 @@ impl AutumnManager {
             match r.kind() {
                 Some(ExtentOpKind::ConvertToEc) => ec.push((*id, r.started_at)),
                 Some(ExtentOpKind::Recovery) => rec.push((*id, r.started_at)),
-                _ => {}
-            }
-        }
-        (ec, rec)
-    }
-
-    pub(crate) fn inflight_snapshot_ec_recovery(
-        &self,
-    ) -> (
-        std::collections::HashSet<u64>,
-        std::collections::HashSet<u64>,
-    ) {
-        let mut ec = std::collections::HashSet::new();
-        let mut rec = std::collections::HashSet::new();
-        for (id, r) in self.inflight.borrow().iter() {
-            match r.kind() {
-                Some(ExtentOpKind::ConvertToEc) => {
-                    ec.insert(*id);
-                }
-                Some(ExtentOpKind::Recovery) => {
-                    rec.insert(*id);
-                }
                 _ => {}
             }
         }
@@ -1204,6 +1180,41 @@ mod tests {
             let outcome = m.dispatch_recovery_task(20, 1).await.unwrap();
             assert_eq!(outcome, crate::recovery::DispatchOutcome::Deferred);
         })
+    }
+
+    /// Another op holding the extent defers a recovery: it is neither a
+    /// dispatch (which would clear the slot's backoff) nor a failure.
+    #[test]
+    fn recovery_under_another_op_is_deferred() {
+        run(async {
+            let m = ec_in_flight();
+            let outcome = m.dispatch_recovery_task(42, 1).await.unwrap();
+            assert_eq!(outcome, crate::recovery::DispatchOutcome::Deferred);
+        })
+    }
+
+    /// The advisory cache can be a policy tick old: at actuation the arbiter is
+    /// asked again, and a candidate it now refuses is dropped.
+    #[test]
+    fn a_stale_ec_candidate_is_dropped_at_actuation() {
+        let m = ec_in_flight();
+        let cand = autumn_rpc::manager_rpc::PolicyCandidate {
+            kind: autumn_rpc::manager_rpc::POLICY_KIND_EC,
+            primary_part_id: 0,
+            secondary_part_id: 42,
+            reason: String::new(),
+            size_bytes: 0,
+            req_per_sec: 0,
+            imm_full_per_sec: 0,
+            same_ps: true,
+            last_op_at: 0,
+        };
+        let why = m
+            .stale_candidate(&m.arbiter_view(), &cand)
+            .expect("the conversion in flight refuses");
+        assert!(why.contains("in-flight"), "{why}");
+        m._test_clear_inflight(42);
+        assert_eq!(m.stale_candidate(&m.arbiter_view(), &cand), None);
     }
 
     /// A recovery depends on its executor: one that enters maintenance has its

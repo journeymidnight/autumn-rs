@@ -2720,7 +2720,15 @@ async fn truncate_unreferenced_row_prefix(
         }
         return Ok(());
     };
-    part_sc.truncate(row_stream_id, cut).await?;
+    if let Err(e) = part_sc.truncate(row_stream_id, cut).await {
+        // Another op in flight on one of the extents: nothing preempts it, and
+        // the next compaction cuts again.
+        if !crate::manager_says_retry_later(&e) {
+            return Err(e);
+        }
+        tracing::info!(part_id, row_stream_id, "row stream prefix cut deferred: {e}");
+        return Ok(());
+    }
     tracing::info!(
         part_id,
         row_stream_id,

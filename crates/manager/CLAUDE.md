@@ -278,7 +278,13 @@ fallback walk over other registered nodes if one is dead → append to the strea
 mirror. Sealing semantics: see the lenient-seal note.
 
 **GC**: `stream_punch_holes` removes named extent ids from a stream and decrements
-extent `refs`; `truncate` removes all extents before a given id. Extents are
+extent `refs`; `truncate` removes all extents before a given id. Both are refused
+while any extent they remove has an op in flight, whatever its `refs`
+(`refuse_if_removed_extent_inflight` → the arbiter): even a decrement bumps the
+extent's eversion and would void the op. The refusal is
+`alloc_conflict::inflight_defer_message`, a transient conflict — the PS's GC takes
+its soft cooldown; its meta-stream checkpoint truncate and its row-stream prefix
+cut defer to the next checkpoint / compaction. Extents are
 CoW-shared across partitions after a split, so **never delete an extent with
 `refs > 0`**. When `refs → 0`, the handler snapshots the replica address list
 **before** removing the extent from `s.extents`, and after the etcd mirror succeeds
@@ -653,6 +659,32 @@ opcode), which the dashboard draws as its Overview status bar. Tests: `cluster_s
 never answered, a stopped standby turning absent; ablations: counting only
 present managers, not telling an evicted PS apart — both red).
 
+## Extent arbiter (`extent_arbiter.rs`)
+
+"May this op start on this extent now" has one answer, `may_start(op, facts)`, a
+pure function over `ExtentFacts` (sealed, the op in flight, the topology hold,
+corrupt and repair-requested slots, each replica's disk class), built from live
+state by `extent_facts` / `arbitrate` (`docs/extent_op_arbitration_design.md`
+§2, §4). Ops: `Removal` (punch / truncate), `Rebuild`, `EcConvert`.
+
+- **Nothing preempts.** Any op in flight refuses every other, removal included.
+- A topology hold refuses Rebuild and EC; a punch checks the hold itself, because
+  the held partition's own split / merge punches its own streams.
+- **EC ranks last**: it waits for every rebuild the extent is owed (a corrupt
+  slot, a repair request, a replica on a `Fence` disk) and refuses a replica on
+  a `Suspected` node.
+
+Asked by: the EC advisory (`compute_ec_advisory` takes `may_convert`), the
+auto-policy actuation (`stale_candidate`: the advisory cache can be a policy tick
+old, so the arbiter is asked again, and a candidate it refuses is dropped with a
+debug line, never filed as a FAILED op), `handle_force_ec_convert`, punch /
+truncate, the sealed-empty sweep (`removal_refused`), and recovery dispatch
+(`Rebuild`; a refusal is `Deferred` — not a dispatch, which would clear the
+slot's backoff, and not a failure). The both-zero sweep skips any extent in the
+ledger, the same rule. A pass over many extents takes one `ArbiterView` (node and
+disk classes, extent → held partition) so the topology check is a lookup, not a
+stream scan per extent.
+
 ## Extent in-flight ledger (unified)
 
 One etcd-backed ledger `extent_inflight/<id>` keyed by extent_id replaces all
@@ -779,10 +811,9 @@ legitimate marker sources that do not care about overrides. So it asks the
 DISPATCHER's own question, through `slot_verdict` rather than a re-derivation,
 and releases only on `Keep`: the node is registered and Online, its `avali`
 bit is set, its disk is online, and the verdict would not rebuild this slot now.
-It is deliberately STRICTER than the dispatcher in one place — it counts ANY
-override as a reason to keep the marker, where the dispatcher's verdict tests only
-`NODE_OVERRIDE_FENCED` — so a node moved from Fenced into Maintenance keeps its
-markers until that override clears.
+Its fence input is the same as the dispatcher's: the slot's disk class being
+`Fence`. (A node moved from Fenced into Maintenance used to be the one case that
+needed more; Maintenance can no longer be written over a fence.)
 
 One state looks healthy but must KEEP the marker (found in review): between a
 promotion and the source node's first `df`, `faulted_disks` is empty and
@@ -1222,12 +1253,10 @@ after leader-failover serialises and no-ops. EC dispatch skips a marker any of w
 targets is not `Health` (an abnormal one is cancelled by the tick; a `Suspend` one is
 waited for).
 
-**Target selection (`handle_force_ec_convert`).** Targets are the extent's
-replicas (positionally paired with `replicate_disks`, the coordinator encodes its
-own `.dat`) plus extra nodes drawn outside `placement_excluded_node_ids`. A
-replica on an excluded node (Suspected / Fenced / Maintenance) refuses the
-submit with `CODE_PRECONDITION`: no shard write to it can land, and the marker
-would block the repair that moves the replica.
+**Target selection (`handle_force_ec_convert`).** The arbiter decides whether a
+conversion may start (see "Extent arbiter"). Targets are the extent's replicas
+(positionally paired with `replicate_disks`, the coordinator encodes its own
+`.dat`) plus extra nodes that take new data (`Classes::takes_new_data`).
 
 ## Node lifecycle & identity
 

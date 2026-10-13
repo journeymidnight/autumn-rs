@@ -144,6 +144,24 @@ fn parse_meta_seal(path: &Path) -> (u64, u64, u8) {
     (sealed_length, eversion, buf[40])
 }
 
+/// EC targets go only to nodes that answered this term's df (class Health);
+/// right after registration they have not yet.
+async fn wait_all_nodes_online(mgr: &RpcClient) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let bytes = mgr
+            .call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
+            .await
+            .expect("list_node_states");
+        let r: ListNodeStatesResp = rkyv_decode(&bytes).expect("decode");
+        if !r.nodes.is_empty() && r.nodes.iter().all(|n| n.auto_state == NODE_AUTO_STATE_ONLINE) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "nodes never came Online");
+        compio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 #[test]
 fn ec_flip_persists_seal_on_every_shard_holder() {
     let d1 = tempfile::tempdir().unwrap();
@@ -229,6 +247,7 @@ fn ec_flip_persists_seal_on_every_shard_holder() {
         let seal_info: StreamAllocExtentResp = rkyv_decode(&seal_resp).unwrap();
         assert_eq!(seal_info.code, CODE_OK, "seal failed: {}", seal_info.message);
 
+        wait_all_nodes_online(&mgr).await;
         let force_resp = mgr
             .call(
                 MSG_FORCE_EC_CONVERT,

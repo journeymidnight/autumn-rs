@@ -361,11 +361,20 @@ impl AutumnManager {
     ///
     /// `pub` so an integration test can drive exactly one tick of it; the loop
     /// below is the only production caller.
+    /// The arbiter refuses removing `extent_id` now: an op is in flight on it.
+    fn removal_refused(&self, extent_id: u64) -> bool {
+        let facts = crate::extent_arbiter::ExtentFacts {
+            extent_id,
+            in_flight: self.extent_inflight_op(extent_id),
+            ..Default::default()
+        };
+        crate::extent_arbiter::may_start(crate::extent_arbiter::ExtentOp::Removal, &facts).is_err()
+    }
+
     pub async fn sealed_empty_sweep_once(&self) -> usize {
         if !self.leader.get() {
             return 0;
         }
-        let (ec_inflight, recovery_inflight) = self.inflight_snapshot_ec_recovery();
 
         // Plan under ONE borrow, with no await inside it: the mutation below
         // re-borrows, and the etcd CAS is what makes a concurrent change lose.
@@ -389,8 +398,7 @@ impl AutumnManager {
                             extent_id: *eid,
                             sealed: ex.is_some_and(|e| e.sealed),
                             sealed_length: ex.map_or(0, |e| e.sealed_length),
-                            inflight: recovery_inflight.contains(eid)
-                                || ec_inflight.contains(eid),
+                            inflight: self.removal_refused(*eid),
                         }
                     })
                     .collect();
@@ -448,16 +456,13 @@ impl AutumnManager {
             // something proves it fires.
             let drops = {
                 let s = self.store.inner.borrow();
-                let (ec_now, rec_now) = self.inflight_snapshot_ec_recovery();
                 // A pending split CAS's every extent of its streams.
                 if removed.iter().any(|id| {
-                    ec_now.contains(id)
-                        || rec_now.contains(id)
-                        || self.topology_holding_extent(*id).is_some()
+                    self.removal_refused(*id) || self.topology_holding_extent(*id).is_some()
                 }) {
                     None
                 } else {
-                    Some(Self::compute_extent_ref_drops(&s, &removed, &ec_now))
+                    Some(Self::compute_extent_ref_drops(&s, &removed))
                 }
             };
             let Some((extent_puts, extent_deletes, pending_deletes, extent_cas)) = drops else {

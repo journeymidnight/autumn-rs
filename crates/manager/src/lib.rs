@@ -13,6 +13,7 @@ mod inflight_commit;
 pub mod inode_lease;
 pub mod node_state;
 mod node_class;
+mod extent_arbiter;
 mod op_log;
 mod cluster_status;
 mod manager_members;
@@ -1713,8 +1714,11 @@ impl AutumnManager {
         // copy short is the most urgent thing on the list.
         let mut repair = self.repair_candidates(now);
         repair.append(&mut self.scrub_candidates(now));
-        let busy_extents: HashSet<u64> = self.inflight.borrow().keys().copied().collect();
-        let classes = self.classes();
+        let view = self.arbiter_view();
+        let may_convert = |eid: u64| {
+            self.arbitrate(&view, eid, crate::extent_arbiter::ExtentOp::EcConvert)
+                .is_ok()
+        };
         let mut p = self.policy.borrow_mut();
         p.sacred_boundaries = sacred;
         // prune metrics for partitions that no longer exist
@@ -1742,8 +1746,8 @@ impl AutumnManager {
         cands.append(&mut p.compute_hot_cold_advisory(owners, &sealed_sums, now));
         // EC advisory — per-extent, sourced from streams + extents (not
         // partition-windowed); the helper filters extents < ec_min_extent_bytes
-        // and the ones a submit would refuse right now.
-        cands.append(&mut p.compute_ec_advisory(state, &busy_extents, &classes, now));
+        // and the ones the arbiter would not let a conversion start on now.
+        cands.append(&mut p.compute_ec_advisory(state, &may_convert, now));
         // Phase B: cluster-level region→PS imbalance advisory
         // (kind = POLICY_KIND_REBALANCE), sourced from regions + ps_nodes.
         cands.append(&mut p.compute_rebalance_advisory(state, now));
@@ -2475,9 +2479,17 @@ impl AutumnManager {
                 continue;
             }
             let mut cooldowns_changed = false;
+            let view = self.arbiter_view();
             for (cand, cmd, key) in actions {
                 let desc = crate::auto_policy::describe_candidate(&cand);
                 let cmd_str = cmd.join(" ");
+                if let Some(why) = self.stale_candidate(&view, &cand) {
+                    // The advisory cache can be a policy tick old. Not filed as
+                    // an op: nothing was attempted, and the next advisory
+                    // re-derives the candidate if it still applies.
+                    tracing::debug!("auto-policy dropped a stale candidate ({desc}): {why}");
+                    continue;
+                }
                 // A ledger op like an operator's: it shows in `ops list` while it
                 // runs and in `ops history` when it ends, refusals included.
                 let Some(spec) = crate::auto_policy::candidate_to_submit(&cand) else {
@@ -2498,6 +2510,25 @@ impl AutumnManager {
                     tracing::warn!(error = %e, "auto-policy: cooldown persist failed");
                 }
             }
+        }
+    }
+
+    /// Why a cached candidate may no longer start, asked again at actuation
+    /// (`extent_arbiter.rs`), or `None`. Only the per-extent kinds ask.
+    pub(crate) fn stale_candidate(
+        &self,
+        view: &crate::extent_arbiter::ArbiterView,
+        cand: &PolicyCandidate,
+    ) -> Option<String> {
+        match cand.kind {
+            autumn_rpc::manager_rpc::POLICY_KIND_EC => self
+                .arbitrate(
+                    view,
+                    cand.secondary_part_id,
+                    crate::extent_arbiter::ExtentOp::EcConvert,
+                )
+                .err(),
+            _ => None,
         }
     }
 
@@ -9227,6 +9258,59 @@ mod tests {
 
     /// handle_stream_punch_holes must return Precondition (not remove the
     /// extent) when the to-be-deleted extent is currently being recovered.
+    /// Nothing preempts, removal included: a punch that only decrements a
+    /// CoW-shared extent's refs still bumps its eversion, which would void the
+    /// recovery in flight on it. It waits, and the refusal reads as a transient
+    /// conflict so the PS retries instead of failing.
+    #[test]
+    fn punch_holes_waits_for_recovery_on_a_shared_extent() {
+        run(async {
+            let m = AutumnManager::new();
+            let owner_key = "owner-shared-ph".to_string();
+            let owner_epoch = m.store.inner.borrow_mut().acquire_owner_lock(&owner_key);
+            let (stream_id, extent_id) = (51u64, 311u64);
+            {
+                let mut s = m.store.inner.borrow_mut();
+                s.streams.insert(
+                    stream_id,
+                    StreamRecord {
+                        stream_id,
+                        extent_ids: vec![extent_id, 398],
+                        ec_data_shard: 0,
+                        ec_parity_shard: 0,
+                        replicates: 3,
+                    },
+                );
+                s.extents.insert(398, make_ec_extent(398, 1));
+                let mut ex = make_ec_extent(extent_id, 1);
+                ex.refs = 2;
+                s.extents.insert(extent_id, ex);
+            }
+            m._test_mark_recovery_inflight(
+                extent_id,
+                RecoveryTask { extent_id, replace_id: 1, node_id: 9, start_time: 0 },
+            );
+            let eversion = m.store.inner.borrow().extents[&extent_id].eversion;
+            let req = rkyv_encode(&PunchHolesReq {
+                stream_id,
+                owner_key,
+                owner_epoch,
+                extent_ids: vec![extent_id],
+            });
+            let r: PunchHolesResp =
+                rkyv_decode(&m.handle_stream_punch_holes(req).await.unwrap()).unwrap();
+            assert_eq!(r.code, CODE_PRECONDITION, "{}", r.message);
+            assert!(
+                autumn_common::alloc_conflict::is_transient_alloc_conflict_message(&r.message),
+                "{}",
+                r.message
+            );
+            let s = m.store.inner.borrow();
+            assert_eq!(s.extents[&extent_id].refs, 2);
+            assert_eq!(s.extents[&extent_id].eversion, eversion, "the recovery's attempt stands");
+        });
+    }
+
     #[test]
     fn punch_holes_aborts_when_extent_is_in_recovery() {
         run(async {
@@ -9285,7 +9369,7 @@ mod tests {
                 "punch_holes must be rejected when target extent is in recovery"
             );
             assert!(
-                r.message.contains("in-flight recovery"),
+                r.message.contains("in-flight Recovery"),
                 "error must mention in-flight recovery: {}",
                 r.message
             );
@@ -9366,7 +9450,7 @@ mod tests {
                 "truncate must be rejected when a to-be-removed extent is in recovery"
             );
             assert!(
-                r.message.contains("in-flight recovery"),
+                r.message.contains("in-flight Recovery"),
                 "error must mention in-flight recovery: {}",
                 r.message
             );
@@ -9531,7 +9615,7 @@ mod tests {
                 "punch_holes must be rejected when target extent is mid-EC"
             );
             assert!(
-                r.message.contains("in-flight EC conversion"),
+                r.message.contains("in-flight ConvertToEc"),
                 "error must mention in-flight EC conversion: {}",
                 r.message
             );
@@ -9629,7 +9713,7 @@ mod tests {
                 "truncate must be rejected when a to-be-removed extent is mid-EC"
             );
             assert!(
-                r.message.contains("in-flight EC conversion"),
+                r.message.contains("in-flight ConvertToEc"),
                 "error must mention in-flight EC conversion: {}",
                 r.message
             );

@@ -298,7 +298,7 @@ pub struct ManagerError {
 }
 
 impl ManagerError {
-    fn new(code: u8, ctx: &str, message: &str) -> Self {
+    pub fn new(code: u8, ctx: &str, message: &str) -> Self {
         Self {
             code,
             ctx: ctx.to_string(),
@@ -328,7 +328,7 @@ impl ManagerError {
     /// `autumn_common::alloc_conflict`, which owns BOTH the manager-side
     /// message builders and this matcher, with a test running every real
     /// builder through it. Nothing here or in the manager writes the text.
-    fn is_transient_conflict(&self) -> bool {
+    pub fn is_transient_conflict(&self) -> bool {
         self.code == manager_rpc::CODE_PRECONDITION
             && autumn_common::alloc_conflict::is_transient_alloc_conflict_message(&self.message)
     }
@@ -3284,9 +3284,9 @@ impl StreamClient {
     ///   `sealing = true` (appends rejected) and `ResetTail` to the fresh
     ///   tail is sent only after `alloc_new_extent` (and this reclaim)
     ///   returns; the manager rejects any stale-epoch writer via
-    ///   `ensure_owner_epoch`, and in-flight ledger ops (Recovery/EC) make
-    ///   `punch_holes` refuse with Precondition (→ WARN, retry never needed —
-    ///   those ops only run on extents worth keeping).
+    ///   `ensure_owner_epoch`, and an in-flight ledger op (Recovery/EC) makes
+    ///   `punch_holes` refuse with Precondition (→ WARN, not retried here: the
+    ///   manager's sealed-empty sweep reclaims the extent once the op is done).
     async fn reclaim_abandoned_empty_tail(&self, stream_id: u64, extent_id: u64) {
         self.invalidate_extent_cache(extent_id);
         let info = match self.get_extent_info(extent_id).await {
@@ -3296,7 +3296,7 @@ impl StreamClient {
                     stream_id,
                     extent_id,
                     error = %e,
-                    "abandoned-tail reclaim: extent_info fetch failed; extent leaks until manual GC"
+                    "abandoned-tail reclaim: extent_info fetch failed; the manager's sealed-empty sweep reclaims it"
                 );
                 return;
             }
@@ -3322,7 +3322,7 @@ impl StreamClient {
                     stream_id,
                     extent_id,
                     error = %e,
-                    "abandoned-tail reclaim: punch_holes failed; extent leaks until manual GC"
+                    "abandoned-tail reclaim: punch_holes failed; the manager's sealed-empty sweep reclaims it"
                 );
             }
         }
