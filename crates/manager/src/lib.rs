@@ -1701,8 +1701,8 @@ impl AutumnManager {
         let mut repair = self.repair_candidates(now);
         repair.append(&mut self.scrub_candidates(now));
         let view = self.arbiter_view();
-        let may_convert = |eid: u64| {
-            self.arbitrate(&view, eid, crate::extent_arbiter::ExtentOp::EcConvert)
+        let may_convert = |eid: u64, shards: usize| {
+            self.arbitrate(&view, eid, crate::extent_arbiter::ExtentOp::EcConvert { shards })
                 .is_ok()
         };
         let mut p = self.policy.borrow_mut();
@@ -2507,15 +2507,30 @@ impl AutumnManager {
         cand: &PolicyCandidate,
     ) -> Option<String> {
         match cand.kind {
-            autumn_rpc::manager_rpc::POLICY_KIND_EC => self
-                .arbitrate(
+            autumn_rpc::manager_rpc::POLICY_KIND_EC => {
+                let extent_id = cand.secondary_part_id;
+                let Some(shards) = self.ec_shards_of(extent_id) else {
+                    return Some(format!("no EC-policy stream lists extent {extent_id}"));
+                };
+                self.arbitrate(
                     view,
-                    cand.secondary_part_id,
-                    crate::extent_arbiter::ExtentOp::EcConvert,
+                    extent_id,
+                    crate::extent_arbiter::ExtentOp::EcConvert { shards },
                 )
-                .err(),
+                .err()
+            }
             _ => None,
         }
+    }
+
+    /// K + M of the EC-policy stream that lists `extent_id`, or `None` when no
+    /// stream with an EC shape does.
+    pub(crate) fn ec_shards_of(&self, extent_id: u64) -> Option<usize> {
+        let s = self.store.inner.borrow();
+        s.streams
+            .values()
+            .find(|st| st.ec_parity_shard > 0 && st.extent_ids.contains(&extent_id))
+            .map(|st| (st.ec_data_shard + st.ec_parity_shard) as usize)
     }
 
     /// auto-dispatch SPLIT to the owning PS for a SPLIT candidate.
@@ -10193,6 +10208,61 @@ mod tests {
         assert!(AutumnManager::is_known_auto_policy_preset("balanced"));
         assert!(AutumnManager::is_known_auto_policy_preset("aggressive"));
         assert!(!AutumnManager::is_known_auto_policy_preset("nope"));
+    }
+
+    /// A substituted replica shifts the targets: node 3's replica is replaced
+    /// by node 9, so the targets are [1, 5, 9, 7]. Each target keeps the disk it
+    /// writes to — the replicas their own (10, 50), the substitute and the extra
+    /// the ones allocated on them (90, 70) — not a disk by position, which
+    /// would hand node 9 node 5's disk.
+    #[test]
+    fn the_flip_takes_each_target_s_own_disk() {
+        run(async {
+            m_flip_case().await;
+        })
+    }
+
+    async fn m_flip_case() {
+        let m = AutumnManager::new();
+        m._test_register_health_nodes([1, 3, 5, 7, 9]);
+        let extent_id = 207u64;
+        m.store.inner.borrow_mut().extents.insert(
+            extent_id,
+            ExtentRecord {
+                extent_id,
+                replicates: vec![1, 3, 5],
+                replicate_disks: vec![10, 30, 50],
+                eversion: 3,
+                refs: 1,
+                sealed_length: 4096,
+                sealed: true,
+                avali: 0x7,
+                ..Default::default()
+            },
+        );
+        let targets = vec![1, 5, 9, 7];
+        m.acquire_extent_inflight(
+            extent_id,
+            crate::extent_inflight::ExtentOpPayload::ConvertToEc(MgrEcDispatchInflight {
+                extent_id,
+                target_nodes: targets.clone(),
+                extra_disk_ids: vec![90, 70],
+                data_shards: 3,
+                new_eversion: 4,
+                owner_epoch: 0,
+            }),
+        )
+        .await
+        .expect("acquire EC marker");
+        m.apply_ec_conversion_done(extent_id, targets, vec![90, 70], 3, 4)
+            .await
+            .expect("apply_ec_conversion_done");
+        let s = m.store.inner.borrow();
+        let ex = s.extents.get(&extent_id).expect("extent present");
+        assert_eq!(ex.replicates, vec![1, 5, 9]);
+        assert_eq!(ex.replicate_disks, vec![10, 50, 90]);
+        assert_eq!(ex.parity, vec![7]);
+        assert_eq!(ex.parity_disks, vec![70]);
     }
 
     #[test]

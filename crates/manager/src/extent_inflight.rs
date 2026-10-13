@@ -222,7 +222,11 @@ impl AutumnManager {
             let classes = self.classes();
             let why = {
                 let s = self.store.inner.borrow();
-                crate::recovery::ec_target_disks(s.extents.get(&extent_id), params)
+                crate::recovery::ec_target_disks(
+                    s.extents.get(&extent_id),
+                    &params.target_nodes,
+                    &params.extra_disk_ids,
+                )
                     .into_iter()
                     .find_map(|(n, d)| crate::recovery::abnormal_target(&classes, n, d))
             };
@@ -1072,7 +1076,18 @@ mod tests {
                 replicate_disks: vec![10, 30, 50],
                 sealed: true,
                 sealed_length: 4096,
+                avali: 0b111,
                 ..Default::default()
+            },
+        );
+        m.store.inner.borrow_mut().streams.insert(
+            100,
+            crate::persist::records::StreamRecord {
+                stream_id: 100,
+                extent_ids: vec![42],
+                ec_data_shard: 3,
+                ec_parity_shard: 1,
+                replicates: 3,
             },
         );
         m.inflight.borrow_mut().insert(

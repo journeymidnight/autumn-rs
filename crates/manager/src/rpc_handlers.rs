@@ -5149,7 +5149,7 @@ impl AutumnManager {
 
         // Look up current state + the owning stream's EC shape under
         // a single borrow.
-        let (ex, stream, node_addrs) = {
+        let (ex, stream) = {
             let s = self.store.inner.borrow();
             let ex = match s.extents.get(&extent_id) {
                 Some(e) => e.clone(),
@@ -5189,72 +5189,72 @@ impl AutumnManager {
                     );
                 }
             };
-            let node_addrs: HashMap<u64, String> = s
-                .nodes
-                .iter()
-                .map(|(id, n)| (*id, n.address.clone()))
-                .collect();
-            (ex, stream, node_addrs)
+            (ex, stream)
         };
 
-        // Derive target_nodes + extra_disk_ids the same way
-        // `ec_conversion_dispatch_loop` did in its earlier fresh-scan path.
         let data_shards = stream.ec_data_shard as usize;
         let parity_shards = stream.ec_parity_shard as usize;
         let total_shards = data_shards + parity_shards;
 
         // May a conversion start now (`extent_arbiter.rs`): nothing in flight,
-        // no split/merge hold, no rebuild owed, every replica usable — every
-        // replica is a target (the coordinator encodes its own copy, the others
-        // keep their disk slot).
+        // no split/merge hold, no rebuild or catch-up owed, a full copy to
+        // encode from and enough health nodes for K+M.
         let view = self.arbiter_view();
         if let Err(why) =
-            self.arbitrate(&view, extent_id, crate::extent_arbiter::ExtentOp::EcConvert)
+            self.arbitrate(
+                &view,
+                extent_id,
+                crate::extent_arbiter::ExtentOp::EcConvert { shards: total_shards },
+            )
         {
             return Self::force_ec_resp(CODE_PRECONDITION, why);
         }
-        let classes = view.classes;
-        let mut target_nodes = ex.replicates.clone();
+        // Targets (§5): the replicas that can keep their copy where it is, the
+        // coordinator first — it encodes from its own copy — then health
+        // non-members for the rest: substitutes for replicas on suspected or
+        // maintenance nodes, and the extras K+M needs. A substituted replica
+        // falls out of the layout at the flip; its node's reconcile drops it.
+        let mut target_nodes: Vec<u64> = view
+            .replicas(&ex, self.corrupt_slots_of(extent_id))
+            .iter()
+            .filter(|r| r.ec_usable())
+            .map(|r| r.node)
+            .take(total_shards)
+            .collect();
         let mut extra_disk_ids: Vec<u64> = Vec::new();
-        let mut target_addrs: Vec<String> = Vec::new();
-        for &nid in &target_nodes {
-            match node_addrs.get(&nid) {
-                Some(addr) => target_addrs.push(addr.clone()),
-                None => {
-                    return Self::force_ec_resp(
-                        CODE_PRECONDITION,
-                        format!("target node {nid} not in nodes map"),
-                    );
-                }
-            }
-        }
-
-        if total_shards > target_nodes.len() {
-            let extra_needed = total_shards - target_nodes.len();
-            let extra_candidates: Vec<_> = {
-                use rand::seq::SliceRandom;
+        let needed = total_shards - target_nodes.len();
+        if needed > 0 {
+            let placement_load = self.placement_load();
+            let candidates: Vec<NodeRecord> = {
                 let s = self.store.inner.borrow();
-                let existing: HashSet<u64> = target_nodes.iter().copied().collect();
-                let mut pool: Vec<_> = s
-                    .nodes
-                    .values()
-                    .filter(|n| !existing.contains(&n.node_id))
-                    .filter(|n| classes.takes_new_data(n))
-                    .cloned()
+                let members: HashSet<u64> =
+                    ex.replicates.iter().chain(ex.parity.iter()).copied().collect();
+                let ids: Vec<u64> = view
+                    .ready
+                    .iter()
+                    .copied()
+                    .filter(|n| !members.contains(n))
                     .collect();
-                pool.shuffle(&mut rand::thread_rng());
-                pool.into_iter().take(extra_needed).collect()
+                crate::placement::order_by_load(
+                    crate::placement::pool_for(ids, &placement_load),
+                    &mut rand::thread_rng(),
+                )
+                .into_iter()
+                .filter_map(|id| s.nodes.get(&id).cloned())
+                .take(needed)
+                .collect()
             };
-            if extra_candidates.len() < extra_needed {
+            if candidates.len() < needed {
                 return Self::force_ec_resp(
                     CODE_PRECONDITION,
                     format!(
-                        "not enough nodes for EC {data_shards}+{parity_shards} ({} of {total_shards} available)",
-                        target_nodes.len() + extra_candidates.len()
+                        "not enough health nodes for EC {data_shards}+{parity_shards} ({} of \
+                         {total_shards} available)",
+                        target_nodes.len() + candidates.len()
                     ),
                 );
             }
-            for node in &extra_candidates {
+            for node in &candidates {
                 match self.alloc_extent_on_node(&node.address, extent_id).await {
                     Ok(disk_id) => {
                         target_nodes.push(node.node_id);
@@ -5269,7 +5269,6 @@ impl AutumnManager {
                 }
             }
         }
-        target_nodes.truncate(total_shards);
 
         // verify-BEFORE-acquire (revised after codex review of
         // the initial verify-AFTER-acquire form). The race we close:
@@ -9124,8 +9123,8 @@ mod fence_precheck_tests {
 
 #[cfg(test)]
 mod force_ec_target_tests {
-    //! A force-ec-convert whose targets would include an excluded node is
-    //! refused before any marker exists.
+    //! force-ec-convert's target set: usable replicas first, substitutes for
+    //! the rest; refused before any marker exists when it cannot be built.
     use super::*;
     use crate::persist::records::{ExtentRecord, NodeRecord, StreamRecord};
 
@@ -9187,7 +9186,7 @@ mod force_ec_target_tests {
     }
 
     #[test]
-    fn a_replica_on_an_excluded_node_refuses_the_conversion() {
+    fn a_replica_on_an_excluded_node_is_substituted() {
         for how in ["suspected", "maintenance"] {
             let m = cluster();
             match how {
@@ -9213,13 +9212,31 @@ mod force_ec_target_tests {
                     assert!(st.state_of(2).is_suspected());
                 }
             }
+            // No spare: node 2's replica cannot be substituted.
             let resp = force(&m);
             assert_eq!(resp.code, CODE_PRECONDITION, "{how}: {}", resp.message);
-            assert!(resp.message.contains("node 2"), "{how}: {}", resp.message);
+            assert!(resp.message.contains("not enough health nodes"), "{how}: {}", resp.message);
             assert!(
                 m.extent_inflight_payload_ec(7).is_none(),
                 "{how}: no marker may be written"
             );
+            // A spare (node 4): the conversion goes on to allocate the
+            // substitute's shard there — no EN answers in this test, so that
+            // allocation is where it stops.
+            m.store.inner.borrow_mut().nodes.insert(
+                4,
+                NodeRecord {
+                    node_id: 4,
+                    address: "127.0.0.1:9004".into(),
+                    disks: vec![40],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: "uuid-4".into(),
+                },
+            );
+            let resp = force(&m);
+            assert_eq!(resp.code, CODE_ERROR, "{how}: {}", resp.message);
+            assert!(resp.message.contains("127.0.0.1:9004"), "{how}: {}", resp.message);
         }
     }
 

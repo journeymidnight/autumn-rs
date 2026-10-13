@@ -249,9 +249,10 @@ full copy — its `avali` bit set, not corrupt-marked, on a disk of class
   non-member nodes with a **health** disk (load-ordered, the same pick as
   allocation).
 
-A replica on a **suspected** or **fence** node is therefore no reason to refuse: it is
-left out of the target set, falls out of the layout at the flip, and the
-reconcile deletes it when its node is back. The conversion restores redundancy
+A replica on a **suspected** node is therefore no reason to refuse: it is left out
+of the target set, falls out of the layout at the flip, and the reconcile deletes
+it when its node is back. (A replica on a **fence** disk is rebuilt first, and a
+behind one on a node that serves is caught up first — §2 rules 3 and 5.) The conversion restores redundancy
 by itself, so a degraded extent that gets converted needs no recovery.
 
 At the flip, each target's disk comes from the target itself — the replica's own
@@ -274,9 +275,6 @@ Where the code still answers differently from §1–§5. Paths are under
 `node_class.rs` and the arbiter (§2, §4) is `extent_arbiter.rs`; every path that
 judges a node, a disk or whether an op may start uses them.
 
-**EC targets**
+**GC**
 
-- `handle_force_ec_convert` (rpc_handlers.rs) takes every replica as a target and
-  refuses an extent with a replica on an abnormal node, instead of substituting
-  a **health** node (§5); the flip maps disks to targets by position.
 - There is no PS GC precheck; a punch refused after relocation wastes it.

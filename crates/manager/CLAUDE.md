@@ -671,8 +671,12 @@ state by `extent_facts` / `arbitrate` (`docs/extent_op_arbitration_design.md`
 - A topology hold refuses Rebuild and EC; a punch checks the hold itself, because
   the held partition's own split / merge punches its own streams.
 - **EC ranks last**: it waits for every rebuild the extent is owed (a corrupt
-  slot, a repair request, a replica on a `Fence` disk) and refuses a replica on
-  a `Suspected` node.
+  slot, a repair request, a replica on a `Fence` disk, a behind replica on a node
+  that serves — caught up in place first) and for a replica on a `Suspend` node
+  (not heard from yet — its copy may be fine). A replica on a
+  `Suspected` node is substituted; the conversion needs one full copy on a health
+  node to encode from and K+M health nodes (`ExtentOp::EcConvert { shards }`,
+  `ExtentFacts::spare_nodes`).
 
 Asked by: the EC advisory (`compute_ec_advisory` takes `may_convert`), the
 auto-policy actuation (`stale_candidate`: the advisory cache can be a policy tick
@@ -1268,9 +1272,19 @@ targets is not `Health` (an abnormal one is cancelled by the tick; a `Suspend` o
 waited for).
 
 **Target selection (`handle_force_ec_convert`).** The arbiter decides whether a
-conversion may start (see "Extent arbiter"). Targets are the extent's replicas
-(positionally paired with `replicate_disks`, the coordinator encodes its own
-`.dat`) plus extra nodes that take new data (`Classes::takes_new_data`).
+conversion may start (see "Extent arbiter"). Targets are the replicas that keep
+their copy where it is (`ReplicaFacts::ec_usable`: a disk of class `Health` or
+`Full` holding a full copy — `avali` set, not corrupt-marked), the coordinator
+first since it encodes from its own `.dat`; then health non-members
+(`ArbiterView::ready`), load-ordered like allocation, for the rest — substitutes
+for replicas on `Suspected` nodes (Maintenance included) and the extras K+M
+needs, each with a shard allocated on it. A substituted replica falls out of the
+layout at the flip, and its node's reconcile drops the copy — as does a usable
+replica beyond the first K+M, when an extent has more replicas than shards. At the flip each
+target's disk comes from the target (`ec_target_disks`: a replica's own, else
+the next allocated one), never a position in `replicate_disks ++
+extra_disk_ids`, which a substitute would shift; markers written before keep
+working because their targets are the replicas in order, then the extras.
 
 ## Node lifecycle & identity
 

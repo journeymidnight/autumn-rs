@@ -1042,7 +1042,7 @@ impl PolicyEngine {
     pub(crate) fn compute_ec_advisory(
         &self,
         state: &MetadataState,
-        may_convert: &dyn Fn(u64) -> bool,
+        may_convert: &dyn Fn(u64, usize) -> bool,
         now: i64,
     ) -> Vec<PolicyCandidate> {
         let mut out = Vec::new();
@@ -1070,7 +1070,8 @@ impl PolicyEngine {
                 if ext.sealed_length < cfg.ec_min_extent_bytes {
                     continue;
                 }
-                if !may_convert(eid) {
+                let shards = (stream.ec_data_shard + stream.ec_parity_shard) as usize;
+                if !may_convert(eid, shards) {
                     continue;
                 }
                 out.push(PolicyCandidate {

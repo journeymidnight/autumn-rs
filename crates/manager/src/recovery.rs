@@ -234,7 +234,9 @@ impl AutumnManager {
             .filter_map(|rec| match rec.unpack()? {
                 (kind, crate::extent_inflight::ExtentOpPayload::ConvertToEc(p)) => {
                     let ex = store.extents.get(&p.extent_id);
-                    ec_target_disks(ex, &p).into_iter().find_map(|(n, d)| {
+                    ec_target_disks(ex, &p.target_nodes, &p.extra_disk_ids)
+                        .into_iter()
+                        .find_map(|(n, d)| {
                         let why = abnormal_target(&classes, n, d)?;
                         Some((p.extent_id, n, kind, why))
                     })
@@ -2061,10 +2063,11 @@ pub(crate) fn abnormal_target(
 /// the next of `extra_disk_ids`. `None` when the extent or a disk is unknown.
 pub(crate) fn ec_target_disks(
     ex: Option<&ExtentRecord>,
-    p: &MgrEcDispatchInflight,
+    target_nodes: &[u64],
+    extra_disk_ids: &[u64],
 ) -> Vec<(u64, Option<u64>)> {
-    let mut extras = p.extra_disk_ids.iter().copied();
-    p.target_nodes
+    let mut extras = extra_disk_ids.iter().copied();
+    target_nodes
         .iter()
         .map(|&n| {
             let replica_disk = ex.and_then(|ex| {
@@ -3073,9 +3076,9 @@ impl crate::AutumnManager {
             }
         }
 
-        // coordinator = the shard owning `extent_id` on the first
-        // replica; it reads the full extent locally and fans WriteShard out to
-        // each target node's owner shard for `extent_id`.
+        // coordinator = the shard owning `extent_id` on the first target (a
+        // replica with a full copy); it reads the extent locally and fans
+        // WriteShard out to each target node's owner shard for `extent_id`.
         let coordinator_base = Self::normalize_endpoint(&target_addrs[0]);
         let coordinator_shard_ports = self.shard_ports_for_addr(&coordinator_base);
         let coordinator_addr =
@@ -3403,9 +3406,20 @@ impl crate::AutumnManager {
             // against it below.
             let baseline = crate::persist::encode(ex);
 
-            let mut all_disks = ex.replicate_disks.clone();
-            all_disks.extend_from_slice(&extra_disk_ids);
-            all_disks.truncate(target_nodes.len());
+            // Each target's disk comes from the target itself: a replica keeps
+            // its own, a substitute or extra the one allocated on it — never a
+            // position in `replicate_disks ++ extra_disk_ids`, which a
+            // substituted replica would shift.
+            let all_disks = ec_target_disks(Some(ex), &target_nodes, &extra_disk_ids)
+                .into_iter()
+                .map(|(n, d)| {
+                    d.ok_or_else(|| {
+                        AppError::Precondition(format!(
+                            "EC target node {n} of extent {extent_id} has no disk"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<u64>, AppError>>()?;
 
             let mut new_ex = ex.clone();
             new_ex.ec_converted = true;

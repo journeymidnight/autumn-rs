@@ -2837,14 +2837,17 @@ $AO scrub EXT_ID... | --part PART_ID | --all [--wait]
 #   AUTUMN_EXTENT_EC_STRIPE_BYTES on the EN to force many stripes on a smaller
 #   extent. Repro script: the isolated memory-mode loopback recipe (manager
 #   w/o --etcd, 4 single-shard ENs, 1 PS) used in dev.
-# EC never targets an excluded node: stop one EN that holds a replica of a
-#   sealed extent E, wait for `$AO health` / node states to show it Suspected,
-#   then `$AO force-ec-convert --extent E --wait` must FAIL with "has a replica
-#   on node N, which is suspected or in maintenance" and no EC marker is left
-#   (`$AO info` shows no in-flight op on E). Restart the EN (or repair the
-#   replica off it) and the same command succeeds. While any op is in flight
-#   on E (a recovery, a delete) it fails with "has an in-flight <op>"; nothing
-#   preempts an op in flight, GC's punch included.
+# EC never targets an unusable node, it substitutes one: put an EN that holds a
+#   replica of a sealed extent E into maintenance (or stop it and wait for it to
+#   show Suspected), keep one spare health node, then
+#   `$AO force-ec-convert --extent E --wait` succeeds and `$AO info` shows E's
+#   layout without that node (the spare holds its shard); the node's own copy is
+#   dropped by its reconcile when it is back. With no spare it fails with "not
+#   enough health nodes" and no EC marker is left. While any op is in flight on E
+#   (a recovery, a delete) it fails with "has an in-flight <op>"; nothing
+#   preempts an op in flight, GC's punch included. Right after a manager
+#   failover a replica on a node not heard from yet makes it wait ("not heard
+#   from yet this term") for one df round.
 
 # Admin / observability
 $AO info                                 # nodes / extents / streams / partitions

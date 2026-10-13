@@ -1047,7 +1047,7 @@ fn ec_advisory_fires_for_large_sealed_unconverted_extent() {
     mk_stream(&mut state, 100, (3, 1), &[1001]);
     mk_extent(&mut state, 1001, EC_MIN_EXTENT_BYTES * 2, false);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, &|_| true, 999);
+    let out = eng.compute_ec_advisory(&state, &|_, _| true, 999);
     assert_eq!(out.len(), 1, "expected one EC candidate: {out:?}");
     let c = &out[0];
     assert_eq!(c.kind, POLICY_KIND_EC);
@@ -1067,7 +1067,7 @@ fn ec_advisory_suppresses_small_extents() {
     // Above threshold — should be advised.
     mk_extent(&mut state, 1003, EC_MIN_EXTENT_BYTES + 1, false);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, &|_| true, 0);
+    let out = eng.compute_ec_advisory(&state, &|_, _| true, 0);
     assert_eq!(out.len(), 1, "small extent filtered out: {out:?}");
     assert_eq!(out[0].secondary_part_id, 1003);
 }
@@ -1079,7 +1079,7 @@ fn ec_advisory_skips_converted() {
     mk_stream(&mut state, 102, (3, 1), &[1004]);
     mk_extent(&mut state, 1004, EC_MIN_EXTENT_BYTES * 4, true);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, &|_| true, 0);
+    let out = eng.compute_ec_advisory(&state, &|_, _| true, 0);
     assert!(
         out.is_empty(),
         "ec_converted=true should be skipped: {out:?}"
@@ -1095,7 +1095,7 @@ fn ec_advisory_skips_non_ec_streams() {
     mk_stream(&mut state, 103, (0, 0), &[1005]);
     mk_extent(&mut state, 1005, EC_MIN_EXTENT_BYTES * 4, false);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, &|_| true, 0);
+    let out = eng.compute_ec_advisory(&state, &|_, _| true, 0);
     assert!(
         out.is_empty(),
         "non-EC stream should not be advised: {out:?}"
@@ -1110,7 +1110,7 @@ fn ec_advisory_skips_empty_extents() {
     mk_stream(&mut state, 104, (3, 1), &[1006]);
     mk_extent(&mut state, 1006, 0, false);
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, &|_| true, 0);
+    let out = eng.compute_ec_advisory(&state, &|_, _| true, 0);
     assert!(out.is_empty(), "sealed_length=0 should be skipped: {out:?}");
 }
 
@@ -1124,7 +1124,7 @@ fn ec_advisory_skips_what_the_arbiter_refuses() {
         mk_extent(&mut state, eid, EC_MIN_EXTENT_BYTES * 2, false);
     }
     let eng = PolicyEngine::default();
-    let out = eng.compute_ec_advisory(&state, &|eid| eid == 1009, 0);
+    let out = eng.compute_ec_advisory(&state, &|eid, _| eid == 1009, 0);
     let ids: Vec<u64> = out.iter().map(|c| c.secondary_part_id).collect();
     assert_eq!(ids, vec![1009], "{out:?}");
 }

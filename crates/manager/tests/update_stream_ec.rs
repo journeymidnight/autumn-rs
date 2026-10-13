@@ -117,6 +117,24 @@ async fn call_update_stream_ec(
 
 /// Updating a pure-replication stream to EC 2+1 succeeds and the manager
 /// reflects the new EC shape.
+/// EC targets go only to nodes that answered this term's df; right after
+/// registration they have not yet.
+async fn wait_all_nodes_online(mgr: &RpcClient) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let bytes = mgr
+            .call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
+            .await
+            .expect("list_node_states");
+        let r: ListNodeStatesResp = rkyv_decode(&bytes).expect("decode");
+        if !r.nodes.is_empty() && r.nodes.iter().all(|n| n.auto_state == NODE_AUTO_STATE_ONLINE) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "nodes never came Online");
+        compio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
 #[test]
 fn update_stream_ec_sets_ec_fields() {
     let mgr_addr = pick_addr();
@@ -275,6 +293,7 @@ fn update_stream_ec_triggers_conversion() {
         // markers for existing sealed extents — callers must explicitly
         // trigger via MSG_FORCE_EC_CONVERT (per the manager / external
         // policy controller split). Same pattern as ec_failover.
+        wait_all_nodes_online(&mgr).await;
         let force_resp = mgr
             .call(
                 MSG_FORCE_EC_CONVERT,
