@@ -14,12 +14,6 @@
 
 ## Active
 
-### F-EXTENT-OP-ARBITRATION — 按 extent 统一仲裁 Recovery / EC / GC
-- **Trigger** (2026-10-12 用户): 关掉一个 EN（maintenance）后，auto-policy 的 ec-convert 大量 FAILED：提议了副本在 maintenance 节点上的 extent、提议了正在 Delete 的 extent、在跑的 EC 仍往 maintenance 节点发分片。根因是"节点能不能用""这个 extent 现在能做什么"在各路径各写一套。
-- **Scope**: 按 `docs/extent_op_arbitration_design.md` 实现：四类节点（health / suspend / suspected / fence）一个函数；一个纯函数仲裁，所有入口共用；不抢占；marker 是一次尝试，相关节点异常即取消（失败节点为报告里的类型化字段），由 owner 重写；EC 用健康节点替补；PS GC 搬数据前预检；取消只走 `drain_extent_inflight_marker`；删除 `ec_convert_advisory/`、连续失败计数和 fence 时的专用放弃；修 maintenance 覆盖 fence。
-- **Acceptance**: 文档 §6 每条分叉都有一个修前红、修后绿的单测（仲裁与 node_class 为纯函数直接测）；真实集群把一个 EN 设 maintenance 并停掉：auto-policy 不提议其副本所在 extent、在跑的 EC/Recovery 在一轮内取消且 op 写明节点、EC 用健康节点完成转换、GC 不再因 marker 白搬数据；leader 切换后 10 s 内死节点变 suspected。
-- `passes: false`
-
 ### BUG-MAINT-LOOP-STARVED-BY-MINORS — 持续写入时回收探测 / 下发的 GC 可能一直排不上（推断，未复现）
 - **Trigger** (2026-10-10 minor compaction 重设计的 fable 评审): `background_maintenance_loop` 的 tick 只在 `select_minor` 找不到窗口时才派回收探测（`spawn_reclaim_probe`）。推断：高写入 PS 上 minor 排在 PS 级 compact permit 后面，tick 时总有窗口，探测永远不跑，被老大表钉住的 row stream 前缀一直截不掉。
 - **Scope**: 先复现（PS 级 permit 被别的分区占满 + 本分区持续 flush，观察 `minor_compaction_runs().2` 与头部 extent）。坐实后让探测按自己的节奏跑、与 count 窗口无关。
