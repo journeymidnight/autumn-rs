@@ -1669,6 +1669,49 @@ pub(crate) async fn background_maintenance_loop(
                     clear_inflight(&metrics);
                     continue;
                 }
+                // Nothing preempts an op in flight on an extent (a recovery, an
+                // EC conversion), a punch included: ask first rather than
+                // relocate an extent's live values and then have the punch
+                // refused. One that slips in after the answer still refuses the
+                // punch. When the manager cannot be asked, the punch decides.
+                let (holes, busy): (Vec<(u64, u64)>, Vec<u64>) = {
+                    let sc = part.borrow().stream_client.clone();
+                    let ids: Vec<u64> = holes.iter().map(|(e, _)| *e).collect();
+                    match sc.extents_in_flight(&ids).await {
+                        Ok(busy) if !busy.is_empty() => {
+                            tracing::info!(?busy, "GC: skipping extents with an op in flight");
+                            for e in &busy {
+                                gc_failure_cooldown
+                                    .insert(*e, (Instant::now(), GC_FAILURE_COOLDOWN_SOFT));
+                            }
+                            let free = holes.into_iter().filter(|(e, _)| !busy.contains(e)).collect();
+                            (free, busy)
+                        }
+                        Ok(_) => (holes, Vec::new()),
+                        Err(e) => {
+                            tracing::debug!("GC: could not ask which extents are busy: {e}");
+                            (holes, Vec::new())
+                        }
+                    }
+                };
+                if holes.is_empty() {
+                    // Everything asked for is busy: nothing ran, like a run
+                    // deferred for a frozen partition.
+                    record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_FAILED,
+                        format!(
+                            "deferred: an op is in flight on extent(s) {busy:?}; retry after it \
+                             completes"
+                        ),
+                        String::new(),
+                    );
+                    stamp_last_gc();
+                    clear_inflight(&metrics);
+                    continue;
+                }
                 tracing::info!("GC: starting, extents={:?}", holes);
                 // fix MED-4: gc_inflight already latched at top of loop;
                 // hold through the punch and clear at the bottom.
@@ -1712,7 +1755,14 @@ pub(crate) async fn background_maintenance_loop(
                         gc_kind,
                         manager_rpc::OP_STATE_SUCCEEDED,
                         String::new(),
-                        format!("reclaimed {n_holes} extent(s)"),
+                        if busy.is_empty() {
+                            format!("reclaimed {n_holes} extent(s)")
+                        } else {
+                            format!(
+                                "reclaimed {n_holes} extent(s); skipped {busy:?} (an op is in \
+                                 flight on them)"
+                            )
+                        },
                     ),
                     Some(err) => record_maint_outcome(
                         &metrics,

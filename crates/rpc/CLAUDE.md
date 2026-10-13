@@ -556,7 +556,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **68**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **69**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -901,6 +901,18 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## GC asks which extents are busy (wire 69)
+
+`MSG_EXTENTS_IN_FLIGHT` (0x66, manager, peer, leader-gated): `ExtentsInFlightReq
+{ extent_ids }` → `ExtentsInFlightResp { code, message, in_flight }`, the
+requested extents with a Recovery / EC / Delete marker. The PS's GC asks it once
+per run before relocating, because a punch of such an extent is refused. A pure
+opcode addition, cluster-internal, bumped (unlike 0x65, which only `autumn-op`
+calls) because a peer sends it: a PS paired with a manager that predates it would
+have every ask refused as an unknown opcode — harmless, the punch still refuses,
+but every busy extent's relocation would come back. The ceiling rises to
+[43, 69], the floor stays.
 
 ## EC attempt answer is typed (wire 68)
 

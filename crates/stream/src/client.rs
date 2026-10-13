@@ -4008,6 +4008,22 @@ impl StreamClient {
             .ok_or_else(|| anyhow!("punch_holes: missing stream"))
     }
 
+    /// Which of `extent_ids` have an op in flight on the manager (a punch of
+    /// one is refused until it ends).
+    pub async fn extents_in_flight(&self, extent_ids: &[u64]) -> Result<Vec<u64>> {
+        let req = manager_rpc::rkyv_encode(&manager_rpc::ExtentsInFlightReq {
+            extent_ids: extent_ids.to_vec(),
+        });
+        // 5 s — read-only manager call.
+        let resp_data = self
+            .manager_call(manager_rpc::MSG_EXTENTS_IN_FLIGHT, req, Duration::from_secs(5))
+            .await?;
+        let resp: manager_rpc::ExtentsInFlightResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "extents_in_flight")?;
+        Ok(resp.in_flight)
+    }
+
     pub async fn truncate(&self, stream_id: u64, extent_id: u64) -> Result<StreamInfo> {
         let req = manager_rpc::rkyv_encode(&TruncateReq {
             stream_id,

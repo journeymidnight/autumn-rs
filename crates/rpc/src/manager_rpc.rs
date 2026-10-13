@@ -1758,6 +1758,26 @@ pub const MEMBER_ROLE_MANAGER: u8 = 2;
 /// (`sampled_at_ms`). Request: empty. Leader-gated.
 pub const MSG_GET_CLUSTER_STATUS: u8 = 0x65;
 
+/// Which of these extents have a stream-layer op in flight (Recovery, EC
+/// conversion, Delete). Nothing preempts such an op, a punch included, so the
+/// PS's GC asks before relocating an extent's live values rather than relocate
+/// them and then have the punch refused. Request: `ExtentsInFlightReq`;
+/// response: `ExtentsInFlightResp`. Leader-gated; a peer call.
+pub const MSG_EXTENTS_IN_FLIGHT: u8 = 0x66;
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ExtentsInFlightReq {
+    pub extent_ids: Vec<u64>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ExtentsInFlightResp {
+    pub code: u8,
+    pub message: String,
+    /// The requested extents with an op in flight.
+    pub in_flight: Vec<u64>,
+}
+
 /// `FleetMember.state`. Managers: `age_secs` is unused (0) except for ABSENT,
 /// where it is the time since the leader saw it go (`u64::MAX` = unknown).
 pub const FLEET_MANAGER_LEADER: u8 = 1;

@@ -2179,6 +2179,26 @@ mod tests {
         })
     }
 
+    /// GC's question: of these extents, which have an op in flight. A follower
+    /// has an empty ledger, so it says NOT_LEADER rather than "none".
+    #[test]
+    fn extents_in_flight_answers_which_are_busy() {
+        use autumn_rpc::manager_rpc::{ExtentsInFlightReq, ExtentsInFlightResp, CODE_NOT_LEADER};
+        let m = ec_in_flight();
+        m.leader.set(true);
+        let ask = |m: &AutumnManager| -> ExtentsInFlightResp {
+            let bytes = m
+                .handle_extents_in_flight(rkyv_encode(&ExtentsInFlightReq { extent_ids: vec![41, 42, 43] }))
+                .unwrap();
+            autumn_rpc::manager_rpc::rkyv_decode(&bytes).unwrap()
+        };
+        let r = ask(&m);
+        assert_eq!(r.code, autumn_rpc::manager_rpc::CODE_OK, "{}", r.message);
+        assert_eq!(r.in_flight, vec![42]);
+        m.leader.set(false);
+        assert_eq!(ask(&m).code, CODE_NOT_LEADER);
+    }
+
     /// A fence node is not waited for by a delete: its files are reaped by its
     /// reconcile if it ever returns. A node no longer registered is fence too;
     /// a target without a uuid (a legacy node) cannot be judged and is kept.

@@ -1806,6 +1806,22 @@ To check a live partition after such a failure, compare the checkpoint's SST
 extents with the row stream as in the previous section: every `locs[].extent_id`
 must still be a row extent.
 
+### A GC that skips an extent with an op in flight is CORRECT
+
+Nothing preempts an op in flight on an extent — a recovery, an EC conversion —
+and GC's punch is no exception. A GC run asks the manager first and skips such
+an extent (PS log `GC: skipping extents with an op in flight`, the extent ids
+listed) with a 30 s soft cooldown, so its live values are not relocated only to
+have the punch refused; the op says `skipped [..]`, or ends FAILED "deferred: an
+op is in flight on extent(s) [..]" when nothing else was left. It is collected
+by a later run once the op ends.
+Manual check: on a partition with a sealed log extent E, `forcegc` the
+partition while an op is in flight on E (`autumn-op ops list --active` shows a
+recovery or ec-convert entry naming E) — the PS log shows the skip, E stays in
+the log stream and the log tail does not grow; once the op ends the next
+`forcegc` reclaims E. Regression: `cargo test -p autumn-manager --test
+gc_waits_for_extent_ops`.
+
 ### Reading GC replay-floor protection — a skipped `forcegc` is usually CORRECT
 
 GC protects any NON-EMPTY `log_stream` extent that sits AT/BEFORE the recovery

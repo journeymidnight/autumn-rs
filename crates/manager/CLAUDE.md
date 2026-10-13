@@ -33,7 +33,8 @@ via the shared `ConnPool`. RPC families:
   clear_node_override, remove_node, recovery_stats, query_audit_log,
   report_disk_failure, extent_health_report, extent_health_summary (`0x63`),
   list_ec_inflight_markers, remove_member (`0x64`, see "PS membership"),
-  get_cluster_status (`0x65`, see "Cluster status").
+  get_cluster_status (`0x65`, see "Cluster status"), extents_in_flight (`0x66`,
+  see "Extent arbiter").
 
 `extent_health_report` calls a slot unhealthy when its node is Suspected /
 Fenced / Maintenance, or when `avali` is clear **on a SEALED extent**. The
@@ -682,7 +683,9 @@ Asked by: the EC advisory (`compute_ec_advisory` takes `may_convert`), the
 auto-policy actuation (`stale_candidate`: the advisory cache can be a policy tick
 old, so the arbiter is asked again, and a candidate it refuses is dropped with a
 debug line, never filed as a FAILED op), `handle_force_ec_convert`, punch /
-truncate, the sealed-empty sweep (`removal_refused`), and recovery dispatch
+truncate, the PS GC before it relocates (`MSG_EXTENTS_IN_FLIGHT`, peer,
+leader-gated: which of the given extents have an op in flight), the sealed-empty
+sweep (`removal_refused`), and recovery dispatch
 (`Rebuild`; a refusal is `Deferred` — not a dispatch, which would clear the
 slot's backoff, and not a failure). The both-zero sweep skips any extent in the
 ledger, the same rule. A pass over many extents takes one `ArbiterView` (node and

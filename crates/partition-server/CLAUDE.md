@@ -1789,11 +1789,20 @@ about what the gauge means; inferring the difference from which fields happen to
 populated does not work, because `autumn-op gc --ratio 0.9 --dead-bytes 100G PART`
 carries a perfectly real floor.
 
+**Busy extents are skipped before relocation.** The manager refuses a punch while
+any op is in flight on the extent (a recovery, an EC conversion — nothing
+preempts it), so a GC run asks first: one `MSG_EXTENTS_IN_FLIGHT` for its
+candidates (`StreamClient::extents_in_flight`), right before relocating, and
+skips the busy ones with the soft cooldown (`GC: skipping extents with an op in
+flight`). A marker taken after the answer still refuses the punch; when the
+manager cannot be asked, the punch decides.
+
 **Cooldown classification** (`classify_gc_failure_cooldown`,
 `gc_failure_cooldown: HashMap<u64, (Instant, Duration)>`): soft window (30 s) when
-the failure chain contains `"precondition failed"` (manager refuses `punch_holes`
-while `ec_conversion_inflight`) or `"eversion mismatch"` (stale `extent_info_cache`
-after an EC bump); hard window (300 s) for everything else.
+the failure chain contains `"precondition failed"` (the manager refusing
+`punch_holes` while an op is in flight on the extent) or `"eversion mismatch"`
+(stale `extent_info_cache` after an EC bump); hard window (300 s) for everything
+else.
 
 **Tunable**: `AUTUMN_PS_GC_READ_CHUNK_BYTES` (default 64 MiB) — chunk size for the
 streaming read inside `run_gc`.

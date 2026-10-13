@@ -139,9 +139,9 @@ includes repair and EC) or an operator.
 any marker, whatever its `refs`: a punch on a CoW-shared extent changes its
 `eversion`, which voids an in-flight recovery's attempt as surely as deleting
 the extent would. So that a refused punch does not waste the relocation in
-front of it, the PS GC asks the manager whether each candidate is free
-**before** relocating (one RPC per candidate, at most `MAX_GC_ONCE` per run) and
-skips a busy one with the soft cooldown. A marker taken between that check and
+front of it, the PS GC asks the manager which of its candidates are free
+**before** relocating (one RPC per run, for all of them) and skips a busy one
+with the soft cooldown; a run left with nothing ends FAILED "deferred". A marker taken between that check and
 the punch still refuses the punch; the window is one relocation long.
 
 Waiting has two costs, both accepted. Removal does not reserve the extent: a
@@ -226,7 +226,7 @@ separate abandon record: the op entry is where the reason is read.
 | auto-policy actuation | again at actuation (the advisory cache can be a policy tick old) | dropped, logged at debug — not filed as a FAILED op |
 | `force-ec-convert` / op submit | before acquiring the marker | refused with the arbiter's reason |
 | EC dispatch loop, recovery tick | every tick, per marker | §3 cancel, or wait (**suspend**) |
-| PS GC | per candidate, before relocating | skipped, soft cooldown |
+| PS GC | once per run, for its candidates, before relocating | skipped, soft cooldown |
 | punch / truncate / reclaim sweeps | before the etcd txn | refused; the PS retries on its next GC dispatch, the sweeps on their next tick |
 
 The arbiter and `node_class` are pure functions over a snapshot
@@ -265,16 +265,3 @@ nonce keeps the old and new attempts' staging apart on the ENs.
 
 With fewer than K+M **health** nodes the conversion is refused, and rules 3–4
 rebuild the copy instead.
-
----
-
-## 6. Divergences in the code
-
-Where the code still answers differently from §1–§5. Paths are under
-`crates/manager/src/` unless noted. Node and disk classes (§1) are
-`node_class.rs` and the arbiter (§2, §4) is `extent_arbiter.rs`; every path that
-judges a node, a disk or whether an op may start uses them.
-
-**GC**
-
-- There is no PS GC precheck; a punch refused after relocation wastes it.

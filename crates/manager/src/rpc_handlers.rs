@@ -348,6 +348,7 @@ impl AutumnManager {
             MSG_EXTENT_HEALTH_SUMMARY => self.handle_extent_health_summary(payload).await,
             MSG_REMOVE_MEMBER => self.handle_remove_member(payload).await,
             MSG_GET_CLUSTER_STATUS => self.handle_get_cluster_status().await,
+            MSG_EXTENTS_IN_FLIGHT => self.handle_extents_in_flight(payload),
             MSG_LIST_EC_INFLIGHT_MARKERS => self.handle_list_ec_inflight_markers(payload).await,
             MSG_FENCE_NODE => self.handle_fence_node(payload).await,
             MSG_SET_NODE_MAINTENANCE => self.handle_set_node_maintenance(payload).await,
@@ -5131,6 +5132,39 @@ impl AutumnManager {
     /// already-converted extent returns CODE_OK. Out-of-policy
     /// requests (non-EC stream, sealed_length=0, missing extent)
     /// return CODE_PRECONDITION with a descriptive message.
+    /// The requested extents the arbiter would not let a removal start on: an
+    /// op is in flight on them. A follower's ledger is empty, so it answers
+    /// NOT_LEADER rather than "none".
+    pub(crate) fn handle_extents_in_flight(&self, payload: Bytes) -> HandlerResult {
+        let req: ExtentsInFlightReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ExtentsInFlightResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                in_flight: Vec::new(),
+            }));
+        }
+        let in_flight = req
+            .extent_ids
+            .into_iter()
+            .filter(|&eid| {
+                let facts = crate::extent_arbiter::ExtentFacts {
+                    extent_id: eid,
+                    in_flight: self.extent_inflight_op(eid),
+                    ..Default::default()
+                };
+                crate::extent_arbiter::may_start(crate::extent_arbiter::ExtentOp::Removal, &facts)
+                    .is_err()
+            })
+            .collect();
+        Ok(rkyv_encode(&ExtentsInFlightResp {
+            code: CODE_OK,
+            message: String::new(),
+            in_flight,
+        }))
+    }
+
     pub(crate) async fn handle_force_ec_convert(&self, payload: Bytes) -> HandlerResult {
         if !self.leader.get() {
             return Self::force_ec_resp(CODE_NOT_LEADER, "not leader".to_string());
