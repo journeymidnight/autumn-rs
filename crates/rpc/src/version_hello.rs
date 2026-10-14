@@ -489,6 +489,8 @@ fn known_manager_opcode(opcode: u8) -> bool {
             | MSG_OP_SUBMIT
             | MSG_OP_QUERY
             | MSG_OP_HISTORY
+            | MSG_GET_RUNTIME_CONFIG
+            | MSG_SET_RUNTIME_CONFIG
     )
 }
 

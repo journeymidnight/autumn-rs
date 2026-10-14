@@ -85,7 +85,9 @@ erasure-coded, self-healing extents.
   auto-policy's `repair` switch, after a grace period) to rebuild degraded
   copies on other nodes without fencing theirs; `autumn-op scrub` (or the
   policy's weekly `scrub`) to check sealed copies against their checksums on
-  the nodes that hold them, with rotted ones isolated and rebuilt; declarative
+  the nodes that hold them, with rotted ones isolated and rebuilt; recovery,
+  scrub, GC and compaction speed changed on the running cluster
+  (`autumn-op config set ps.gc-rate-bytes-per-sec 32M`); declarative
   bare-metal deployer
   (systemd), Kubernetes manifests, Prometheus `/metrics` on every PS and EN
   (`autumn-op info --file-sd` prints the target list), `ceph df`-style

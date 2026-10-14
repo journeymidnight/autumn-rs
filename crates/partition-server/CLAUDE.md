@@ -1913,6 +1913,15 @@ build fixed-cap controllers with `RateController::new` /
 they are consumed (block cache size at `PartitionServer` construction, extent
 size at partition open).
 
+The overrides come from the manager (`autumn-op config set ps.<flag> <v>`):
+`fetch_runtime_config_once` runs at startup and on every authz poll
+(`--config-poll-secs`, and on an authz refresh request), and installs the `ps.`
+entries through `autumn_params::Installed` — only when they changed, so an
+unchanged poll logs nothing. A fetch that fails keeps what is installed; an
+entry dropped from the set goes back to the flag value. An entry that fails
+`PsParams`'s cross-field check against this process's flags is refused (logged
+`runtime override refused`) and keeps the old value; the other entries apply.
+
 `0` on any rate flag = unlimited for that dimension (per-dimension opt-out).
 
 **`--max-extent-size-bytes`**: the threshold at which a stream's tail rolls a fresh

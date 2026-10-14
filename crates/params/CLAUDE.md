@@ -29,9 +29,22 @@ generates the struct (one `Live<T>` per field) and `impl Params`:
 - `help::<X>()`: the `--help` section (default, range, `runtime` marker, help).
 - `apply_overrides(&p, entries)`: installs the full override set of a role from
   `(role.flag, value)` pairs; runtime fields absent from it go back to their base.
-  Unknown keys and rejected values are returned, the rest still apply.
+  Changes apply one at a time; one that breaks the `CrossCheck` is undone and
+  retried after the others (it may fit only once they are in). Unknown keys,
+  rejected values and changes that never fit are returned and keep the old
+  value; the rest still apply, so one bad entry does not hold back the others.
 - `runtime_spec::<X>(key)` / `Spec::check`: validate a key and value without an
   instance (the manager validating `config set` for a PS or EN key).
+- `Installed`: what a polling process (PS, EN) installed last; `install` calls
+  `apply_overrides` only when this role's entries changed, so a poll that brings
+  back the same set does nothing and logs nothing.
+
+Overrides live in the manager (etcd `runtimeConfig/<role>.<flag>`) and are set
+with `autumn-op config set|unset <role>.<flag>`; `autumn-op config keys` lists
+every runtime parameter from these declarations. The PS and EN fetch the set on
+their authz poll (`--config-poll-secs`, 30 s); the manager applies `manager.`
+entries to itself on each change it makes and on every replay (startup and
+promotion; a standby does not follow later changes until it is promoted).
 
 Values live in atomics (`Relaxed`): a reader calls `.get()` where it needs the
 value, so an override reaches it on the next read. Reading once at startup and
@@ -41,4 +54,4 @@ Integers accept binary suffixes (`64M`, `64MiB`, `1g`, `512k`) and `_`.
 
 Cross-field checks are `impl CrossCheck` next to the declaration (empty for
 most structs). The binary calls `cross_check` after parsing, and
-`apply_overrides` rolls back a whole override set that fails it.
+`apply_overrides` refuses each change that would fail it.

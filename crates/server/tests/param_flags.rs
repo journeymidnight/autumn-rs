@@ -12,6 +12,7 @@ const AUTUMNFS_BIN: &str = env!("CARGO_BIN_EXE_autumnfs");
 const S3_BIN: &str = env!("CARGO_BIN_EXE_autumn-s3");
 const DASHBOARD_BIN: &str = env!("CARGO_BIN_EXE_autumn-dashboard");
 const CLIENT_BIN: &str = env!("CARGO_BIN_EXE_autumn-client");
+const OP_BIN: &str = env!("CARGO_BIN_EXE_autumn-op");
 
 fn run(bin: &str, args: &[&str]) -> (i32, String) {
     let out = Command::new(bin).args(args).output().expect("spawn");
@@ -131,4 +132,27 @@ fn client_side_binaries_refuse_a_bad_value() {
         let (code, text) = run(bin, args);
         assert_eq!(code, 2, "{bin} {args:?}: {text}");
     }
+}
+
+/// `autumn-op config keys` lists exactly the runtime parameters, offline.
+#[test]
+fn config_keys_lists_every_runtime_parameter() {
+    fn keys<P: Params>() -> Vec<String> {
+        P::specs()
+            .iter()
+            .filter(|s| s.runtime)
+            .map(|s| format!("{}.{}", P::ROLE, s.flag()))
+            .collect()
+    }
+    let (code, text) = run(OP_BIN, &["--manager", "127.0.0.1:1", "config", "keys"]);
+    assert_eq!(code, 0, "{text}");
+    let mut want = keys::<autumn_params::manager::ManagerParams>();
+    want.extend(keys::<autumn_params::ps::PsParams>());
+    want.extend(keys::<autumn_params::en::EnParams>());
+    let listed: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.starts_with(' '))
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert_eq!(listed, want, "{text}");
 }

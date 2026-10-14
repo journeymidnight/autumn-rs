@@ -26,6 +26,7 @@ mod recovery;
 mod recovery_attempt;
 pub mod recovery_rate_limiter;
 mod rpc_handlers;
+mod runtime_config;
 mod topology_gate;
 mod split_op;
 pub(crate) mod store;
@@ -1059,6 +1060,11 @@ pub struct AutumnManager {
     /// (build → etcd write → in-memory apply), mirroring `principal_admin_lock`.
     /// Low-frequency admin path → a global async mutex is free.
     pub(crate) namespace_admin_lock: Rc<futures::lock::Mutex<()>>,
+    /// `runtimeConfig/<key>` shadow: the operator's runtime parameter
+    /// overrides, replayed on leader promotion (`runtime_config`).
+    pub(crate) runtime_overrides: Rc<RefCell<runtime_config::Overrides>>,
+    /// Serializes `MSG_SET_RUNTIME_CONFIG` (trial → etcd write → apply).
+    pub(crate) runtime_config_lock: Rc<futures::lock::Mutex<()>>,
 }
 
 impl Default for AutumnManager {
@@ -1180,6 +1186,8 @@ impl AutumnManager {
             // seed_builtin_namespaces on leader promotion.
             namespaces: Rc::new(RefCell::new(HashMap::new())),
             namespace_admin_lock: Rc::new(futures::lock::Mutex::new(())),
+            runtime_overrides: Rc::new(RefCell::new(BTreeMap::new())),
+            runtime_config_lock: Rc::new(futures::lock::Mutex::new(())),
         }
     }
 
@@ -3058,6 +3066,7 @@ impl AutumnManager {
         let principal_raw = c.get_prefix(PRINCIPAL_PREFIX).await?;
         // D2: persisted namespace registry.
         let namespace_raw = c.get_prefix(NAMESPACE_PREFIX).await?;
+        let runtime_config_raw = c.get_prefix(runtime_config::PREFIX).await?;
         // M2: auto-policy controller config + cooldowns (single keys)
         // so the active policy + mode survive leader failover.
         let autopolicy_config_kv = c.get(b"autoPolicy/config").await?;
@@ -3247,6 +3256,26 @@ impl AutumnManager {
                 }
                 ns.insert(name, row);
             }
+        }
+        {
+            let mut set = runtime_config::Overrides::new();
+            for kv in &runtime_config_raw.kvs {
+                let raw = str::from_utf8(&kv.key)
+                    .map_err(|e| anyhow::anyhow!("non-utf8 runtime config key: {e}"))?;
+                let key = raw
+                    .strip_prefix(runtime_config::PREFIX)
+                    .ok_or_else(|| anyhow::anyhow!("invalid runtime config key: {raw}"))?;
+                let row: persist::records::RuntimeOverrideRecord =
+                    persist::decode(raw, &kv.value).map_err(Self::replay_decode_err)?;
+                if row.key != key {
+                    return Err(anyhow::anyhow!(
+                        "{raw}: row.key mismatch ('{}' != '{key}')",
+                        row.key
+                    ));
+                }
+                set.insert(row.key.clone(), row);
+            }
+            self.install_replayed_overrides(set);
         }
         // Every replayed PS gets a fresh `--ps-dead-timeout-secs` window from now:
         // with no clock it would never be evicted, and an older clock — a

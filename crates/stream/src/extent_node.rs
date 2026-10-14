@@ -20,6 +20,9 @@ use std::time::{Duration, Instant};
 /// refused by `claim_ec_staging`.
 const EC_STAGING_SEALED: u64 = u64::MAX;
 
+/// The runtime overrides this process installed last (`poll_runtime_config`).
+static RUNTIME_INSTALLED: autumn_params::Installed = autumn_params::Installed::new();
+
 /// Every extent-node tunable (`autumn_params::en`), shared by all shards of
 /// the process. Readers call `en_params().x.get()` where they need the value,
 /// so a runtime override lands on the next read.
@@ -3831,7 +3834,8 @@ impl ExtentNode {
         Ok(node)
     }
 
-    /// Keeps `client_authz` current: every `--config-poll-secs`, and at once
+    /// Keeps `client_authz` and the runtime overrides current: every
+    /// `--config-poll-secs`, and at once
     /// (at most once a second) when a token names a key the installed config
     /// does not know. A failed poll keeps the last answer, so a manager outage
     /// does not stop direct reads; while there is none yet it retries every 5 s.
@@ -3865,6 +3869,9 @@ impl ExtentNode {
                             true
                         }
                     };
+                    if let Err(e) = node.poll_runtime_config(&mgr).await {
+                        tracing::debug!(error = %e, "EN runtime config poll failed");
+                    }
                     let mut every = Duration::from_secs(en_params().config_poll_secs.get());
                     if failed && matches!(*node.client_authz.state.read(), ClientAuthz::Unknown) {
                         every = every.min(Duration::from_secs(5));
@@ -3908,6 +3915,35 @@ impl ExtentNode {
                 enabled = resp.enabled,
                 "EN direct-read authz config loaded"
             );
+        }
+        Ok(())
+    }
+
+    /// Fetch the operator's runtime overrides and install the `en.` entries
+    /// (process-wide: every shard reads `en_params()`). A failed fetch keeps
+    /// what is installed.
+    async fn poll_runtime_config(&self, mgr: &str) -> Result<()> {
+        let resp = self
+            .manager_pool
+            .call_timeout(
+                mgr,
+                manager_rpc::MSG_GET_RUNTIME_CONFIG,
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
+            .await?;
+        let resp: manager_rpc::GetRuntimeConfigResp =
+            manager_rpc::rkyv_decode(&resp).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            anyhow::bail!("get_runtime_config: {}", resp.message);
+        }
+        let entries: Vec<(String, String)> =
+            resp.entries.into_iter().map(|e| (e.key, e.value)).collect();
+        if let Some((mine, errs)) = RUNTIME_INSTALLED.install(en_params(), &entries) {
+            tracing::info!(overrides = ?mine, "runtime overrides installed");
+            for e in errs {
+                tracing::warn!(error = %e, "runtime override refused");
+            }
         }
         Ok(())
     }

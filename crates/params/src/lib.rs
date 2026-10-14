@@ -301,60 +301,105 @@ pub fn help<P: Params>() -> String {
 /// Look up a runtime key (`<role>.<flag>`) among `P`'s specs.
 pub fn runtime_spec<P: Params>(key: &str) -> Option<&'static Spec> {
     let flag = key.strip_prefix(P::ROLE)?.strip_prefix('.')?;
-    let field = flag.replace('-', "_");
-    P::specs().iter().find(|s| s.runtime && s.field == field)
+    // The flag spelling only: a second spelling would be a second stored row.
+    P::specs().iter().find(|s| s.runtime && s.flag() == flag)
 }
 
 /// Install the full override set for `P`: keys of this role get their value,
 /// every other runtime parameter of `P` goes back to its startup value.
-/// Returns one message per entry that could not be applied (a key this binary
-/// does not know, or a value it rejects); the rest still apply, and a field
-/// whose value is rejected keeps what it had. A set that leaves the struct
-/// failing its `CrossCheck` is not applied at all.
+/// Returns one message per entry that could not be applied: a key this binary
+/// does not know, a value it rejects (the field keeps what it had), or a change
+/// that leaves the struct failing its `CrossCheck` against the values around it.
+/// Changes apply one at a time and a refused one is retried after the others,
+/// since it may only fit once they are in; whatever still fails keeps its old
+/// value, and the rest of the set applies.
 pub fn apply_overrides<P: Params>(p: &P, entries: &[(String, String)]) -> Vec<String> {
-    let before: Vec<(&'static str, String)> = P::specs()
-        .iter()
-        .filter(|s| s.runtime)
-        .filter_map(|s| p.get_str(s.field).map(|v| (s.field, v)))
-        .collect();
-    let mut errs = apply_entries(p, entries);
-    if let Err(e) = p.cross_check() {
-        for (field, value) in &before {
-            // The values were accepted once and round-trip exactly.
-            if let Some(Err(e)) = p.override_str(field, Some(value)) {
-                errs.push(format!("{}.{field}: restoring {value}: {e}", P::ROLE));
-            }
-        }
-        errs.push(format!("{}: override set refused: {e}", P::ROLE));
-    }
-    errs
-}
-
-fn apply_entries<P: Params>(p: &P, entries: &[(String, String)]) -> Vec<String> {
     let mut errs = Vec::new();
     let mut seen: Vec<&'static str> = Vec::new();
+    // (field, value; None = back to base, label)
+    let mut steps: Vec<(&'static str, Option<&str>, String)> = Vec::new();
     for (key, value) in entries {
         let Some(flag) = key.strip_prefix(P::ROLE).and_then(|k| k.strip_prefix('.')) else {
             continue;
         };
-        match runtime_spec::<P>(key) {
-            Some(spec) => match p.override_str(spec.field, Some(value)) {
-                Some(Ok(())) => seen.push(spec.field),
-                Some(Err(e)) => {
-                    seen.push(spec.field);
-                    errs.push(format!("{key} = {value}: {e}"));
+        let Some(spec) = runtime_spec::<P>(key) else {
+            errs.push(format!("{}.{flag}: not a runtime parameter", P::ROLE));
+            continue;
+        };
+        seen.push(spec.field);
+        match (spec.check)(value) {
+            Ok(()) => steps.push((spec.field, Some(value), format!("{key} = {value}"))),
+            Err(e) => errs.push(format!("{key} = {value}: {e}")),
+        }
+    }
+    for s in P::specs().iter().filter(|s| s.runtime && !seen.contains(&s.field)) {
+        steps.push((s.field, None, format!("{}.{} (unset)", P::ROLE, s.flag())));
+    }
+    loop {
+        let mut refused = Vec::new();
+        let before = steps.len();
+        for (field, value, label) in steps {
+            let Some(prev) = p.get_str(field) else { continue };
+            if let Some(Err(e)) = p.override_str(field, value) {
+                errs.push(format!("{label}: {e}"));
+                continue;
+            }
+            if let Err(e) = p.cross_check() {
+                // `prev` round-trips exactly; it fails only if it was never in range.
+                if let Some(Err(re)) = p.override_str(field, Some(&prev)) {
+                    errs.push(format!("{label}: restoring {prev}: {re}"));
                 }
-                None => errs.push(format!("{key}: not a runtime parameter")),
-            },
-            None => errs.push(format!("{}.{flag}: not a runtime parameter", P::ROLE)),
+                refused.push((field, value, label, e));
+            }
         }
-    }
-    for s in P::specs().iter().filter(|s| s.runtime) {
-        if !seen.contains(&s.field) {
-            p.override_str(s.field, None);
+        if refused.is_empty() || refused.len() == before {
+            for (_, _, label, e) in refused {
+                errs.push(format!("{label}: refused: {e}"));
+            }
+            return errs;
         }
+        steps = refused.into_iter().map(|(f, v, l, _)| (f, v, l)).collect();
     }
-    errs
+}
+
+/// The override set a process installed last, so a poll that brings back
+/// the same entries changes nothing and logs nothing.
+pub struct Installed(std::sync::Mutex<Option<Vec<(String, String)>>>);
+
+impl Installed {
+    pub const fn new() -> Self {
+        Self(std::sync::Mutex::new(None))
+    }
+
+    /// Apply `entries` (every role's) to `p` if the entries of `P`'s role
+    /// differ from the last install. `None` = unchanged; else this role's
+    /// entries and what `apply_overrides` refused.
+    pub fn install<P: Params>(
+        &self,
+        p: &P,
+        entries: &[(String, String)],
+    ) -> Option<(Vec<(String, String)>, Vec<String>)> {
+        let mine: Vec<(String, String)> = entries
+            .iter()
+            .filter(|(k, _)| k.strip_prefix(P::ROLE).is_some_and(|r| r.starts_with('.')))
+            .cloned()
+            .collect();
+        let mut last = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        // Before the first install every field already holds its base.
+        if last.as_ref().map_or(mine.is_empty(), |l| *l == mine) {
+            *last = Some(mine);
+            return None;
+        }
+        let errs = apply_overrides(p, &mine);
+        *last = Some(mine.clone());
+        Some((mine, errs))
+    }
+}
+
+impl Default for Installed {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[doc(hidden)]
@@ -539,14 +584,49 @@ mod tests {
         let errs = apply_overrides(&t, &[("t.ratio".into(), "7".into())]);
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert_eq!(t.ratio.get(), 0.5);
-        // A set failing the cross-field check is not applied at all.
+        // A change failing the cross-field check is refused; the rest applies.
         let errs = apply_overrides(
             &t,
-            &[("t.rate-bytes-per-sec".into(), "2".into()), ("t.floor".into(), "50".into())],
+            &[
+                ("t.floor".into(), "50".into()),
+                ("t.rate-bytes-per-sec".into(), "2".into()),
+                ("t.ratio".into(), "0.25".into()),
+            ],
         );
         assert_eq!(errs.len(), 1, "{errs:?}");
-        assert_eq!((t.rate_bytes_per_sec.get(), t.floor.get(), t.ratio.get()), (32 * MIB, 1, 0.5));
+        assert!(errs[0].contains("t.rate-bytes-per-sec = 2"), "{errs:?}");
+        assert_eq!((t.rate_bytes_per_sec.get(), t.floor.get(), t.ratio.get()), (32 * MIB, 50, 0.25));
+        // A change that fits only after a later one is retried after it.
+        let errs = apply_overrides(
+            &t,
+            &[("t.rate-bytes-per-sec".into(), "10".into()), ("t.floor".into(), "5".into())],
+        );
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!((t.rate_bytes_per_sec.get(), t.floor.get()), (10, 5));
         assert!(runtime_spec::<T>("t.count").is_none());
+        assert!(runtime_spec::<T>("t.rate_bytes_per_sec").is_none(), "one spelling per key");
         assert!((runtime_spec::<T>("t.ratio").unwrap().check)("0.5").is_ok());
+    }
+
+    #[test]
+    fn an_unchanged_set_is_not_installed_again() {
+        let t = T::default();
+        let inst = Installed::new();
+        assert!(inst.install(&t, &[]).is_none(), "nothing to do before any override");
+        let set = vec![
+            ("t.rate-bytes-per-sec".to_string(), "100".to_string()),
+            ("other.x".to_string(), "1".to_string()),
+        ];
+        let (mine, errs) = inst.install(&t, &set).expect("first install applies");
+        assert_eq!(mine.len(), 1, "only this role's entries");
+        assert!(errs.is_empty());
+        assert_eq!(t.rate_bytes_per_sec.get(), 100);
+        // Another role's change is not this role's change.
+        let set2 = vec![set[0].clone(), ("other.x".to_string(), "2".to_string())];
+        assert!(inst.install(&t, &set2).is_none());
+        // Dropping the entry goes back to the base.
+        assert!(inst.install(&t, &[]).is_some());
+        assert_eq!(t.rate_bytes_per_sec.get(), 64 * MIB);
+        assert!(inst.install(&t, &[]).is_none());
     }
 }

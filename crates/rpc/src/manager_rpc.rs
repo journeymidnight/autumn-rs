@@ -1764,6 +1764,42 @@ pub const MSG_GET_CLUSTER_STATUS: u8 = 0x65;
 /// response: `ExtentsInFlightResp`. Leader-gated; a peer call.
 pub const MSG_EXTENTS_IN_FLIGHT: u8 = 0x66;
 
+/// The runtime parameter overrides an operator set (`autumn-op config set`).
+/// The PS and the EN poll it next to the authz config and apply the entries of
+/// their role. Request: empty; response: `GetRuntimeConfigResp`. Leader-gated;
+/// a peer or admin call.
+pub const MSG_GET_RUNTIME_CONFIG: u8 = 0x67;
+/// Set (`value: Some`) or drop (`None`) one runtime override. The manager
+/// refuses a key that is not a runtime parameter of its role and a value out of
+/// its range. Request: `SetRuntimeConfigReq`; response: `CodeResp`.
+/// Leader-gated; admin only.
+pub const MSG_SET_RUNTIME_CONFIG: u8 = 0x68;
+
+/// One runtime override. `key` = `<role>.<flag>` (`ps.gc-rate-bytes-per-sec`).
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct RuntimeConfigEntry {
+    pub key: String,
+    pub value: String,
+    pub set_by: String,
+    /// Unix seconds.
+    pub set_at: i64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
+pub struct GetRuntimeConfigResp {
+    pub code: u8,
+    pub message: String,
+    pub entries: Vec<RuntimeConfigEntry>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SetRuntimeConfigReq {
+    pub key: String,
+    /// `None` drops the override (the process goes back to its flag value).
+    pub value: Option<String>,
+    pub set_by: String,
+}
+
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
 pub struct ExtentsInFlightReq {
     pub extent_ids: Vec<u64>,
@@ -2054,6 +2090,8 @@ pub const AUDIT_OP_SCRUB: u8 = 15;
 /// `node_id` of the entry carries the removed member's id.
 pub const AUDIT_OP_REMOVE_PS: u8 = 16;
 pub const AUDIT_OP_REMOVE_MANAGER: u8 = 17;
+/// `reason` carries `<key> = <value>` or `unset <key>`.
+pub const AUDIT_OP_RUNTIME_CONFIG: u8 = 18;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct MgrAuditEntry {
@@ -2767,6 +2805,7 @@ pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
             | MSG_NAMESPACE_SET_PRESPLIT
             | MSG_AUTOPOLICY_GET
             | MSG_AUTOPOLICY_SET
+            | MSG_SET_RUNTIME_CONFIG
     )
     // MSG_REGISTER_NODE is NOT listed: the EXTENT NODE self-registers with it
     // over its Peer connection at startup and after a manager restart

@@ -22,6 +22,30 @@ parameters may be copied once at construction: `connect_timeout_ms` (the two
 tests replace it whole with `set_policy_config`). Setting one of those through
 `params()` after construction changes nothing.
 
+**Runtime overrides (`runtime_config.rs`).** `autumn-op config set <role>.<flag>
+<value>` → `MSG_SET_RUNTIME_CONFIG` (leader, admin): the key must be a `[runtime]`
+parameter of `manager`, `ps` or `en` and the value inside its range
+(`check_entry`, from the declarations). The whole set after the change is then
+trial-applied: on this manager's own params for a `manager.` key (its flags
+count; refused → the previous set is re-applied), on a default-flag instance for
+`ps.` / `en.` (the process re-checks against its own flags and refuses the
+entries that fail its cross-field check there, logging them; `config list` still
+shows them). Then etcd (`runtimeConfig/<key>` →
+`RuntimeOverrideRecord`, record type 12), then memory. `MSG_GET_RUNTIME_CONFIG`
+(leader-gated) serves every row; the PS and EN fetch it in their authz poll
+(`--config-poll-secs`, 30 s). Replay — at startup, standby or not, and on
+promotion — reinstalls the rows and applies the `manager.` ones (an entry this
+manager's flags refuse is logged and the flag value stays); a standby does not
+follow later sets until it is promoted; a row this binary cannot apply (a parameter removed since) is
+kept and listed, logged at WARN, and skipped everywhere until unset. Serialized
+on `runtime_config_lock`. A set is refused only for refusals it ADDS over the
+stored set, so a stored row this build refuses (a default moved under it) does
+not block other keys. Every set / unset that reaches the leader, refused values
+included, writes an audit row (`AUDIT_OP_RUNTIME_CONFIG`, reason `<key> = <value>` / `unset <key>`). Test: `tests/runtime_config_etcd.rs` (PS, EN and
+manager pick up a set, unset returns to the flag, refusals change nothing, the
+next leader installs the manager override and serves the rows; ablations: no
+replay install, no PS fetch in the poll, no PS trial — each red).
+
 ## RPC surface
 
 Handlers dispatch on a `msg_type: u8` in `rpc_handlers.rs::dispatch`. Every message
@@ -48,6 +72,8 @@ via the shared `ConnPool`. RPC families:
   list_ec_inflight_markers, remove_member (`0x64`, see "PS membership"),
   get_cluster_status (`0x65`, see "Cluster status"), extents_in_flight (`0x66`,
   see "Extent arbiter").
+- **Runtime parameters**: get_runtime_config (`0x67`), set_runtime_config
+  (`0x68`, admin), see "Runtime overrides" under Parameters.
 
 `extent_health_report` calls a slot unhealthy when its node is Suspected /
 Fenced / Maintenance, or when `avali` is clear **on a SEALED extent**. The
@@ -181,7 +207,7 @@ work here.
 
 **ALL ARE SPLIT.** extent=4, stream=5, node=6, disk=7, partition=8,
 region=9, audit=1, principalAccount=2, namespace=3, recoveryAttempt=10,
-member=11; the next record takes 12.
+member=11, runtimeOverride=12; the next record takes 13.
 `MetadataState` (now `src/store.rs`, moved here from `autumn-common`) holds the
 RECORDS, not the wire structs — which is what gives a purely persistent field
 somewhere to live. `RangeRecord` is a FIELD of the partition and region records
@@ -245,6 +271,7 @@ All writes go through the leader-fenced `txn_fenced` (below). On promotion
 | `mgr_audit_log/<ts>_<seq>` | `persist::AuditRecord` | admin-op audit trail (90-day GC) |
 | `inode_leases/<ino>` | writer lease | reader leases are memory-only |
 | `namespace/<name>` | `persist::NamespaceRecord` | registry |
+| `runtimeConfig/<role.flag>` | `persist::RuntimeOverrideRecord` | operator runtime overrides |
 | `principal/<name>` | `persist::PrincipalAccountRecord` | authz principal DB |
 | `autoPolicy/config`, `autoPolicy/cooldowns` | policy state | leader-owned |
 | `autumn-rs/cluster_id` | UUID | CAS-imprinted once |

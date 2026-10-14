@@ -50,7 +50,8 @@
 
 use super::records::{
     AuditRecord, DiskRecord, ExtentRecord, MemberRecord, NamespaceRecord, NodeRecord,
-    PartitionRecord, RangeRecord, RegionRecord, StreamRecord, PrincipalAccountRecord,
+    PartitionRecord, RangeRecord, RegionRecord, RuntimeOverrideRecord, StreamRecord,
+    PrincipalAccountRecord,
 };
 use super::{decode, encode, PersistRecord};
 
@@ -101,6 +102,15 @@ fn namespace_fixture() -> NamespaceRecord {
         prefix: b"prefix-field/".to_vec(),
         presplit: vec![b"cut-one".to_vec(), b"cut-two".to_vec()],
         created_at: 0x6162636465666768,
+    }
+}
+
+fn runtime_override_fixture() -> RuntimeOverrideRecord {
+    RuntimeOverrideRecord {
+        key: "role.flag-field".to_string(),
+        value: "value-field".to_string(),
+        set_by: "set-by-field".to_string(),
+        set_at: 0x6162636465666768,
     }
 }
 
@@ -207,6 +217,7 @@ const REGION_FROZEN: &str = "41554d470901726567696f6e2d7374617274726567696f6e2d6
 const EXTENT_FROZEN: &str = "41554d47040103000000000000000100000000000000040000000000000009000000000000000b000000000000000c000000000000000d000000000000000e00000000000000e8e7e6e5e4e3e2e1b8ffffff03000000c8ffffff010000000700000000000000020000000000000005000000000000000000000004000000010000000b000000a0ffffff03000000b0ffffff010000000000000000000000";
 const NODE_FROZEN: &str = "41554d470601616464726573732d6669656c6400000011000000000000002200000000000000330000000000000055447766636f6e74726f6c2d616464726573732d6669656c646e6f64652d757569642d6669656c6488878685848382818d000000a8ffffffb0ffffff03000000c0ffffff0200000095000000bcffffff8f000000c9ffffff";
 const MEMBER_FROZEN: &str = "41554d470b016d656d6265722d616464726573732d6669656c640000000094000000e8ffffff68676665646362617877767574737271";
+const RUNTIME_OVERRIDE_FROZEN: &str = "41554d470c01726f6c652e666c61672d6669656c6476616c75652d6669656c647365742d62792d6669656c6400008f000000d8ffffff8b000000dfffffff8c000000e2ffffff6867666564636261";
 const DISK_FROZEN: &str = "41554d470701757569642d6669656c640000000000007877767574737271000000008a000000e4ffffff00000000";
 const NAMESPACE_FROZEN: &str = "41554d4703026e616d652d6669656c647072656669782d6669656c642f6375742d6f6e656375742d74776f000000efffffff07000000eeffffff070000008a000000c8ffffffcaffffff0d000000e0ffffff020000006867666564636261";
 
@@ -223,6 +234,7 @@ fn the_persisted_encodings_are_frozen() {
         ("region", hex(&encode(&region_fixture())), REGION_FROZEN),
         ("extent", hex(&encode(&extent_fixture())), EXTENT_FROZEN),
         ("member", hex(&encode(&member_fixture())), MEMBER_FROZEN),
+        ("runtime override", hex(&encode(&runtime_override_fixture())), RUNTIME_OVERRIDE_FROZEN),
     ] {
         assert_eq!(
             actual, frozen,
@@ -256,6 +268,11 @@ fn every_recorded_encoding_is_a_value_this_binary_can_read_back() {
     let raw = encode(&member_fixture());
     let back: MemberRecord = decode("psMembers/1", &raw).expect("member decodes");
     assert_eq!(back, member_fixture());
+
+    let raw = encode(&runtime_override_fixture());
+    let back: RuntimeOverrideRecord =
+        decode("runtimeConfig/ps.x", &raw).expect("runtime override decodes");
+    assert_eq!(back, runtime_override_fixture());
 }
 
 /// The envelope is the first six bytes of every record, and the version in it
@@ -324,6 +341,12 @@ fn each_frozen_encoding_carries_the_version_it_was_recorded_at() {
             MEMBER_FROZEN,
             MemberRecord::RECORD_TYPE,
             MemberRecord::FORMAT_VERSION,
+        ),
+        (
+            "runtime override",
+            RUNTIME_OVERRIDE_FROZEN,
+            RuntimeOverrideRecord::RECORD_TYPE,
+            RuntimeOverrideRecord::FORMAT_VERSION,
         ),
     ] {
         assert_eq!(&frozen[0..8], "41554d47", "{name}: magic");

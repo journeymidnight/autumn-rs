@@ -59,6 +59,9 @@ use sstable::TableIterator;
 
 const WRITE_CHANNEL_CAP: usize = 1024;
 
+/// The runtime overrides this process installed last (`fetch_runtime_config_once`).
+static RUNTIME_INSTALLED: autumn_params::Installed = autumn_params::Installed::new();
+
 /// Every PS tunable (`autumn_params::ps`). Process-wide: the binary sets the
 /// flags before the first `PartitionServer`; a runtime override lands on the
 /// next read, so readers call `params().x.get()` where they need the value.
@@ -3457,6 +3460,12 @@ impl PartitionServer {
                 "initial authz config fetch failed ({e:#}); will retry via poll loop"
             );
         }
+        if let Err(e) = server.fetch_runtime_config_once().await {
+            tracing::warn!(
+                ps_id = server.ps_id,
+                "initial runtime config fetch failed ({e:#}); will retry via poll loop"
+            );
+        }
 
         server.sync_regions_once().await?;
 
@@ -3848,7 +3857,39 @@ impl PartitionServer {
         Ok(())
     }
 
-    /// Fetch the authz config every `--config-poll-secs`, and at once when a
+    /// Fetch the operator's runtime overrides and install the `ps.` entries.
+    /// A failed fetch keeps what is installed.
+    pub async fn fetch_runtime_config_once(&self) -> Result<()> {
+        let resp_data = self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_GET_RUNTIME_CONFIG,
+                Bytes::new(),
+                Duration::from_secs(10),
+            )
+            .await
+            .context("get runtime config")?;
+        let resp: manager_rpc::GetRuntimeConfigResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            if resp.code == manager_rpc::CODE_NOT_LEADER {
+                self.rotate_manager();
+            }
+            return Err(anyhow!("get_runtime_config failed: {}", resp.message));
+        }
+        let entries: Vec<(String, String)> =
+            resp.entries.into_iter().map(|e| (e.key, e.value)).collect();
+        if let Some((mine, errs)) = RUNTIME_INSTALLED.install(params(), &entries) {
+            tracing::info!(ps_id = self.ps_id, overrides = ?mine, "runtime overrides installed");
+            for e in errs {
+                tracing::warn!(ps_id = self.ps_id, error = %e, "runtime override refused");
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch the authz config and the runtime overrides every `--config-poll-secs`, and at once when a
     /// connection met a namespace or key the installed config does not know
     /// (`AuthzState::request_refresh`) — at most once a second. The initial
     /// load happens in `finish_connect`, so enforcement is armed before the
@@ -3876,6 +3917,9 @@ impl PartitionServer {
             last_fetch = Instant::now();
             if let Err(e) = self.fetch_authz_config_once().await {
                 tracing::debug!("PS {} authz config poll failed: {e:#}", self.ps_id);
+            }
+            if let Err(e) = self.fetch_runtime_config_once().await {
+                tracing::debug!("PS {} runtime config poll failed: {e:#}", self.ps_id);
             }
         }
     }

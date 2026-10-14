@@ -38,6 +38,7 @@ use serde::Serialize;
 mod args;
 use args::{
     fuse_split_ranges, hex_split_ranges, parse, parse_replication, presplit_suffixes, Args, Command,
+    ConfigCmd,
     PresplitRule, SplitPoint,
 };
 
@@ -174,6 +175,7 @@ fn op_name(b: u8) -> &'static str {
         AUDIT_OP_REMOVE_NODE => "remove_node",
         AUDIT_OP_REMOVE_PS => "remove_ps",
         AUDIT_OP_REMOVE_MANAGER => "remove_manager",
+        AUDIT_OP_RUNTIME_CONFIG => "runtime_config",
         AUDIT_OP_FORCE_EC_CONVERT => "force_ec_convert",
         AUDIT_OP_FORCE_ABANDON_EC_MARKER => "force_abandon_ec_marker",
         AUDIT_OP_REPAIR => "repair",
@@ -385,6 +387,9 @@ async fn run(args: Args) -> Result<()> {
         println!("{}", autumn_rpc::peer_auth::ClusterSecret::generate());
         return Ok(());
     }
+    if matches!(args.cmd, Command::Config(ConfigCmd::Keys)) {
+        return print_runtime_keys(args.json);
+    }
     // Every connection below declares the Admin role, which every server
     // refuses unless it proves the cluster secret. Without the flag nothing is
     // installed, and the first connect says which flag is missing.
@@ -444,6 +449,7 @@ async fn run(args: Args) -> Result<()> {
         } => cmd_maintenance(&client, args.json, node_id, reason, by, expire).await?,
         Command::Unfence { node_id, by } => cmd_unfence(&client, args.json, node_id, by).await?,
         Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
+        Command::Config(cmd) => cmd_config(&client, args.json, cmd).await?,
         Command::PsRemove { ps_id, by } => {
             cmd_remove_member(&client, args.json, MEMBER_ROLE_PS, ps_id, by).await?
         }
@@ -842,6 +848,102 @@ async fn cmd_namespace_delete(
 }
 
 /// D2: list the registered namespaces (rich rows). Read-only.
+/// Every runtime parameter of the three server roles, from the declarations.
+fn runtime_keys() -> Vec<(String, &'static autumn_params::Spec)> {
+    use autumn_params::Params;
+    fn of<P: Params>() -> Vec<(String, &'static autumn_params::Spec)> {
+        P::specs()
+            .iter()
+            .filter(|s| s.runtime)
+            .map(|s| (format!("{}.{}", P::ROLE, s.flag()), s))
+            .collect()
+    }
+    let mut out = of::<autumn_params::manager::ManagerParams>();
+    out.extend(of::<autumn_params::ps::PsParams>());
+    out.extend(of::<autumn_params::en::EnParams>());
+    out
+}
+
+/// `config keys`: local, needs no manager.
+fn print_runtime_keys(json: bool) -> Result<()> {
+    let keys = runtime_keys();
+    if json {
+        let rows: Vec<_> = keys
+            .iter()
+            .map(|(k, s)| {
+                serde_json::json!({
+                    "key": k, "default": (s.default)(), "range": (s.range)(),
+                    "help": s.help.trim(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        for (k, s) in &keys {
+            println!("{k}  (default {}, range {})", (s.default)(), (s.range)());
+            for line in s.help.lines() {
+                println!("    {}", line.trim());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_config(client: &ClusterClient, json: bool, cmd: ConfigCmd) -> Result<()> {
+    let entry_json = |e: &RuntimeConfigEntry| {
+        serde_json::json!({
+            "key": e.key, "value": e.value, "set_by": e.set_by, "set_at": e.set_at,
+        })
+    };
+    match cmd {
+        ConfigCmd::Keys => unreachable!("config keys handled before connect"),
+        ConfigCmd::List => {
+            let entries = client.runtime_config_get().await?;
+            if json {
+                let rows: Vec<_> = entries.iter().map(entry_json).collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if entries.is_empty() {
+                println!("no overrides");
+            } else {
+                println!("{:<44} {:<16} {:<12} {:>12}", "KEY", "VALUE", "SET_BY", "SET_AT");
+                for e in &entries {
+                    println!("{:<44} {:<16} {:<12} {:>12}", e.key, e.value, e.set_by, e.set_at);
+                }
+            }
+        }
+        ConfigCmd::Get { key } => {
+            let entries = client.runtime_config_get().await?;
+            let found = entries.iter().find(|e| e.key == key);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&found.map(entry_json))?
+                );
+            } else {
+                match found {
+                    Some(e) => println!("{} = {} (set by {} at {})", e.key, e.value, e.set_by, e.set_at),
+                    None => println!("{key}: no override (each process uses its flag)"),
+                }
+            }
+        }
+        ConfigCmd::Set { key, value, by } => {
+            if by.is_empty() {
+                bail!("--by is required");
+            }
+            client.runtime_config_set(&key, Some(value), &by).await?;
+            println!("config set: ok");
+        }
+        ConfigCmd::Unset { key, by } => {
+            if by.is_empty() {
+                bail!("--by is required");
+            }
+            client.runtime_config_set(&key, None, &by).await?;
+            println!("config unset: ok");
+        }
+    }
+    Ok(())
+}
+
 async fn cmd_namespace_list(client: &ClusterClient, json: bool) -> Result<()> {
     let namespaces = client.namespace_list().await?;
     if json {

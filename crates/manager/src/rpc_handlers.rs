@@ -383,6 +383,8 @@ impl AutumnManager {
             MSG_OP_SUBMIT => self.handle_op_submit(payload).await,
             MSG_OP_QUERY => self.handle_op_query(payload).await,
             MSG_OP_HISTORY => self.handle_op_history(payload).await,
+            MSG_GET_RUNTIME_CONFIG => self.handle_get_runtime_config(),
+            MSG_SET_RUNTIME_CONFIG => self.handle_set_runtime_config(payload).await,
             _ => Err((
                 StatusCode::InvalidArgument,
                 format!("unknown msg_type {msg_type}"),
@@ -2329,7 +2331,7 @@ impl AutumnManager {
     /// (success, not-found, precondition, leader/owner/routable rejects) goes
     /// through here instead of repeating the `Ok(rkyv_encode(&CodeResp { .. }))`
     /// boilerplate.
-    fn code_resp(code: u8, message: String) -> HandlerResult {
+    pub(crate) fn code_resp(code: u8, message: String) -> HandlerResult {
         Ok(rkyv_encode(&CodeResp { code, message }))
     }
 

@@ -325,6 +325,8 @@ failover via `rotate_manager` on connection error.
 
 - `mgr_call(msg_type, payload)` — raw manager RPC.
 - `mgr_call_retry(msg_type, payload, max_retries)` — with round-robin retry.
+- `runtime_config_get()` / `runtime_config_set(key, Option<value>, set_by)` — the
+  operator's runtime parameter overrides (`autumn-op config`), leader-routed.
 - `cluster_overview()` / `list_node_states()` — the overview and the EN states,
   leader-routed (rotate on NOT_LEADER, like `cluster_df` / `auto_policy_get`);
   `autumn-op info --file-sd` builds the Prometheus target list from them.

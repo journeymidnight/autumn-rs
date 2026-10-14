@@ -113,7 +113,8 @@ pub(crate) const RECORD_TYPE_NODE: u8 = 6;
 pub(crate) const RECORD_TYPE_DISK: u8 = 7;
 pub(crate) const RECORD_TYPE_RECOVERY_ATTEMPT: u8 = 10;
 pub(crate) const RECORD_TYPE_MEMBER: u8 = 11;
-// The next record takes 12.
+pub(crate) const RECORD_TYPE_RUNTIME_OVERRIDE: u8 = 12;
+// The next record takes 13.
 
 /// Wrap a record in its envelope. The body is the same rkyv codec the rest of
 /// the manager uses — the envelope is what this module adds, not a new

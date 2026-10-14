@@ -127,6 +127,36 @@ Check it with `cargo test -p autumn-manager --test system_namespace_layer_a --
 --include-ignored` (`a_namespace_created_after_the_ps_started_is_writable_at_once`
 runs the PS at a one-hour poll).
 
+### Changing a parameter on the running cluster
+
+A parameter marked `runtime` can be overridden without a restart. The override
+is stored by the manager (etcd, survives a leader change) and wins over the flag;
+unsetting it returns every process to its own flag value. The keys are
+`<role>.<flag>`: `manager.recovery-max-global`, `ps.gc-rate-bytes-per-sec`,
+`en.recovery-parallelism`, ... The manager applies its own at once; each PS and EN
+picks it up at its next config poll (`--config-poll-secs`, 30 s).
+
+```sh
+AO="target/release/autumn-op --cluster-secret-file $SECRET --manager $MGR"
+$AO config keys                                   # every runtime key, default, range
+$AO config set en.recovery-parallelism 4 --by alice
+$AO config set ps.gc-rate-bytes-per-sec 32M --by alice
+$AO config list                                   # key, value, set_by, set_at
+$AO config set en.recovery-parallelism 0 --by alice    # refused: outside [1, 16]
+$AO config set ps.compact-max-files 2 --by alice       # refused: below compact-min-files
+sleep 31; grep "runtime overrides installed" $LOGS/ps*.log $LOGS/node*.log
+$AO config unset en.recovery-parallelism --by alice
+cargo test -p autumn-manager --test runtime_config_etcd
+```
+
+The PS and EN log `runtime overrides installed` with the set they applied, and
+`runtime override refused` for an entry they cannot apply (e.g. one that breaks a
+cross-field check against that process's own flags); the other entries still
+apply. Every `config set` / `unset` is in the audit log
+(`$AO audit-log --op 18`). An extent node polls
+only when its `--manager` is a single address (its authz poll has the same limit):
+with a comma-separated list the poll fails and the EN keeps its flag values.
+
 Removed PS flags are refused by name (exit 2): `--fg-qps-quota`,
 `--gc-debt-high-bytes`, `--compact-pending-high-bytes`, `--gc-cooldown-secs`,
 `--compact-cooldown-secs` (they were never read; the advisory thresholds are the

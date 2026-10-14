@@ -1332,6 +1332,66 @@ impl ClusterClient {
         Ok(resp)
     }
 
+    /// The operator's runtime parameter overrides (`MSG_GET_RUNTIME_CONFIG`).
+    /// Leader-routed.
+    pub async fn runtime_config_get(
+        &self,
+    ) -> Result<Vec<autumn_rpc::manager_rpc::RuntimeConfigEntry>> {
+        use autumn_rpc::manager_rpc::{GetRuntimeConfigResp, MSG_GET_RUNTIME_CONFIG};
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: GetRuntimeConfigResp = self
+            .mgr_call_leader(
+                MSG_GET_RUNTIME_CONFIG,
+                Bytes::new(),
+                "runtime_config_get",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: GetRuntimeConfigResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("runtime_config_get failed: {}", resp.message));
+        }
+        Ok(resp.entries)
+    }
+
+    /// Set (`Some`) or drop (`None`) one runtime override
+    /// (`MSG_SET_RUNTIME_CONFIG`, admin). Leader-routed.
+    pub async fn runtime_config_set(
+        &self,
+        key: &str,
+        value: Option<String>,
+        set_by: &str,
+    ) -> Result<()> {
+        use autumn_rpc::manager_rpc::{SetRuntimeConfigReq, MSG_SET_RUNTIME_CONFIG};
+        let req = rkyv_encode(&SetRuntimeConfigReq {
+            key: key.to_string(),
+            value,
+            set_by: set_by.to_string(),
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: CodeResp = self
+            .mgr_call_leader(
+                MSG_SET_RUNTIME_CONFIG,
+                req,
+                "runtime_config_set",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: CodeResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("{}", resp.message));
+        }
+        Ok(())
+    }
+
     /// M0: grant a contiguous batch of fuse-fs inode numbers
     /// `[base, base + count)` from the manager's crash-safe allocator
     /// (leader-fenced etcd CAS — concurrent allocators always receive

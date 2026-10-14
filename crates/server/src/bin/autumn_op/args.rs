@@ -52,6 +52,16 @@ fn usage() -> ! {
     eprintln!("  manager-remove <manager_id> --by alice");
     eprintln!("                               drop a stopped manager from the expected fleet");
     eprintln!();
+    eprintln!("runtime parameters (override a flag on every running manager / PS / EN):");
+    eprintln!("  config keys                  every runtime parameter, its default and range");
+    eprintln!("  config list                  the overrides in force");
+    eprintln!("  config get <role.flag>");
+    eprintln!("  config set <role.flag> <value> --by alice");
+    eprintln!("                               e.g. ps.gc-rate-bytes-per-sec 32M; applied within");
+    eprintln!("                               --config-poll-secs (30 s) on every PS / EN");
+    eprintln!("  config unset <role.flag> --by alice");
+    eprintln!("                               back to each process's flag value");
+    eprintln!();
     eprintln!("cluster / partition admin commands (moved from autumn-client):");
     eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]");
     eprintln!("                               (--presplit RETIRED — use `presplit --namespace <NS>` after bootstrap)");
@@ -280,6 +290,15 @@ impl SplitPoint {
     }
 }
 
+pub(crate) enum ConfigCmd {
+    /// Every runtime parameter (local, from the declarations).
+    Keys,
+    List,
+    Get { key: String },
+    Set { key: String, value: String, by: String },
+    Unset { key: String, by: String },
+}
+
 pub(crate) enum Command {
     // read / observability
     ListNodes,
@@ -327,6 +346,8 @@ pub(crate) enum Command {
         ps_id: u64,
         by: String,
     },
+    /// Runtime parameter overrides.
+    Config(ConfigCmd),
     Status,
     ManagerRemove {
         manager_id: u64,
@@ -836,6 +857,32 @@ pub(crate) fn parse() -> Args {
             i += 1;
             let (_reason, by, _force) = parse_admin_flags(&raw, &mut i);
             Command::Remove { node_id, by }
+        }
+        "config" => {
+            let sub = val(&raw, i).to_owned();
+            i += 1;
+            let cmd = match sub.as_str() {
+                "keys" => ConfigCmd::Keys,
+                "list" => ConfigCmd::List,
+                "get" => ConfigCmd::Get {
+                    key: val(&raw, i).to_owned(),
+                },
+                "set" => {
+                    let key = val(&raw, i).to_owned();
+                    let value = val(&raw, i + 1).to_owned();
+                    i += 2;
+                    let (_reason, by, _force) = parse_admin_flags(&raw, &mut i);
+                    ConfigCmd::Set { key, value, by }
+                }
+                "unset" => {
+                    let key = val(&raw, i).to_owned();
+                    i += 1;
+                    let (_reason, by, _force) = parse_admin_flags(&raw, &mut i);
+                    ConfigCmd::Unset { key, by }
+                }
+                _ => usage(),
+            };
+            Command::Config(cmd)
         }
         "ps-remove" => {
             let ps_id: u64 = raw

@@ -30,7 +30,8 @@ use rkyv::{Archive, Deserialize, Serialize};
 use super::{
     PersistRecord, RECORD_TYPE_AUDIT, RECORD_TYPE_DISK, RECORD_TYPE_NAMESPACE,
     RECORD_TYPE_EXTENT, RECORD_TYPE_MEMBER, RECORD_TYPE_NODE, RECORD_TYPE_PARTITION,
-    RECORD_TYPE_REGION, RECORD_TYPE_STREAM, RECORD_TYPE_PRINCIPAL_ACCOUNT,
+    RECORD_TYPE_REGION, RECORD_TYPE_RUNTIME_OVERRIDE, RECORD_TYPE_STREAM,
+    RECORD_TYPE_PRINCIPAL_ACCOUNT,
 };
 
 // ── audit log ───────────────────────────────────────────────────────────────
@@ -505,6 +506,25 @@ impl PersistRecord for MemberRecord {
     const RECORD_TYPE: u8 = RECORD_TYPE_MEMBER;
     const FORMAT_VERSION: u8 = 1;
     const NAME: &'static str = "member";
+}
+
+// ── runtime parameter overrides ─────────────────────────────────────────────
+
+/// `runtimeConfig/<role>.<flag>` — one operator override of a runtime
+/// parameter (`autumn-op config set`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub(crate) struct RuntimeOverrideRecord {
+    pub key: String,
+    pub value: String,
+    pub set_by: String,
+    /// Unix seconds.
+    pub set_at: i64,
+}
+
+impl PersistRecord for RuntimeOverrideRecord {
+    const RECORD_TYPE: u8 = RECORD_TYPE_RUNTIME_OVERRIDE;
+    const FORMAT_VERSION: u8 = 1;
+    const NAME: &'static str = "runtime override";
 }
 
 // ── streams ─────────────────────────────────────────────────────────────────

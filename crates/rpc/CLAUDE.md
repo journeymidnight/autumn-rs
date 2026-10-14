@@ -487,8 +487,8 @@ Tests: `shard_for_extent_tests`.
 
 `is_admin_mgr_msg(msg_type)` is the set of manager ops served only on an Admin
 connection (fence/remove/maintenance/EC/create-stream/upsert-partition/merge/
-op-submit, the principal/namespace mutations, and the auto-policy GET/SET pair,
-read included). `check_opcode` refuses them
+op-submit, the principal/namespace mutations, the auto-policy GET/SET pair,
+read included, and `MSG_SET_RUNTIME_CONFIG`). `check_opcode` refuses them
 on a Peer connection; an Admin connection exists only after PEER_AUTH, so this
 list is the whole gate — no token rides in any request. `MSG_REGISTER_NODE` is
 deliberately not on it (the EN self-registers over its Peer connection), nor is
@@ -556,7 +556,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **69**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **70**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -901,6 +901,19 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## Runtime parameter overrides (wire 70)
+
+`MSG_GET_RUNTIME_CONFIG` (0x67, leader-gated, peer or admin): empty request →
+`GetRuntimeConfigResp { code, message, entries }`, each entry
+`RuntimeConfigEntry { key, value, set_by, set_at }` with `key = <role>.<flag>`.
+The PS and the EN fetch it in their authz poll loop. `MSG_SET_RUNTIME_CONFIG`
+(0x68, leader-gated, admin only): `SetRuntimeConfigReq { key, value: Option,
+set_by }` → `CodeResp`; `None` drops the override. Bumped because a peer sends
+the GET: a PS or EN paired with a manager that predates it would have every
+fetch refused as an unknown opcode. Not on the client surface; the ceiling rises
+to [43, 70], the floor stays. `AUDIT_OP_RUNTIME_CONFIG` (18) is an appended value for the
+audit rows of a set / unset.
 
 ## GC asks which extents are busy (wire 69)
 
