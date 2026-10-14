@@ -15,6 +15,7 @@ futures = "0.3"
 tracing.workspace = true
 thiserror.workspace = true
 autumn-common = { path = "../common" }
+autumn-params = { path = "../params" }
 autumn-rpc = { path = "../rpc" }
 autumn-transport = { path = "../transport" }
 compio = { workspace = true, features = ["net", "time", "macros", "dispatcher", "fs"] }

@@ -275,6 +275,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autumn-common",
+ "autumn-params",
  "autumn-rpc",
  "autumn-stream",
  "autumn-transport",
@@ -356,6 +357,7 @@ dependencies = [
  "anyhow",
  "autumn-common",
  "autumn-manager",
+ "autumn-params",
  "autumn-rpc",
  "autumn-transport",
  "bytes",

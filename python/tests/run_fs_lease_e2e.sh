@@ -48,7 +48,7 @@ wait_port 19601 20 || { echo FAIL mgr; tail -6 "$WORK/mgr.log"; exit 1; }
 wait_port 19611 20 || { echo FAIL en; tail -6 "$WORK/en0.log"; exit 1; }
 sleep 3
 "$BIN/autumn-op" --cluster-secret-file "$SECRET" --manager "$MGR" bootstrap --replication 1+0 >"$WORK/bs.log" 2>&1 || { echo FAIL bootstrap; cat "$WORK/bs.log"; exit 1; }
-"$BIN/autumn-ps" --cluster-secret-file "$SECRET" --psid 1 --port 19621 --manager "$MGR" --data "$WORK/ps1" --listen 127.0.0.1 --advertise 127.0.0.1:19621 >"$WORK/ps1.log" 2>&1 & PIDS+=($!)
+"$BIN/autumn-ps" --cluster-secret-file "$SECRET" --psid 1 --port 19621 --manager "$MGR" --listen 127.0.0.1 --advertise 127.0.0.1:19621 >"$WORK/ps1.log" 2>&1 & PIDS+=($!)
 wait_port 19621 20 || { echo FAIL ps; tail -6 "$WORK/ps1.log"; exit 1; }
 sleep 4
 

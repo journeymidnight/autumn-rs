@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use autumn_common::cpu_pin::{pick_cpu_for_ord, pin_current};
 use autumn_common::metrics::{duration_to_ns, ns_to_ms};
+use autumn_params::ps::PsParams;
 use autumn_rpc::manager_rpc::{self, rkyv_decode, rkyv_encode, MgrRange as Range};
 use autumn_rpc::partition_rpc::{self, SstLocation, TableLocations, *};
 use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
@@ -56,68 +57,16 @@ use sstable::TableIterator;
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Memtable rotation threshold, and so the size of an SST a flush writes.
-/// Compaction reads its own sizes off the same value (`flush_mem_bytes`).
-pub(crate) const FLUSH_MEM_BYTES: u64 = 256 * 1024 * 1024;
 const WRITE_CHANNEL_CAP: usize = 1024;
-const DEFAULT_MAX_WRITE_BATCH: usize = WRITE_CHANNEL_CAP * 3;
 
-// process-global PS tunables. Historically each `xxx()` function read
-// env::var inside an inner static OnceLock — the cell was hidden inside
-// the function so no setter could override it from the binary. Lifting
-// each cell to module scope exposes a paired `pub fn set_xxx`
-// that the autumn-ps binary calls from main() based on CLI args. The
-// reader functions still use `get_or_init` for thread-safe lazy default
-// fallback — but the init closure no longer touches the environment.
-//
-// First-call-wins semantics: any reader that fires before main() applied
-// its setter will lock in the default. The binary's main() always calls
-// the setters BEFORE constructing PartitionServer, so this is fine in
-// production. Tests that need overrides must call `set_xxx` early too;
-// tests running in parallel against the same process share the cells,
-// same constraint as the previous env::var approach.
+/// Every PS tunable (`autumn_params::ps`). Process-wide: the binary sets the
+/// flags before the first `PartitionServer`; a runtime override lands on the
+/// next read, so readers call `params().x.get()` where they need the value.
+pub fn params() -> &'static PsParams {
+    static PARAMS: std::sync::LazyLock<PsParams> = std::sync::LazyLock::new(PsParams::default);
+    &PARAMS
+}
 
-static MAX_WRITE_BATCH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static PS_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static PS_SST_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-/// parallel-flush drain cap on P-log side. Sets how many imm
-/// entries `background_flush_loop` can have in flight concurrently
-/// (each doing build SST + upload row_stream + await response from
-/// P-sst). Commit (`tables.push` + `meta_stream` save) is still
-/// strictly serial in launch order via `FuturesOrdered`.
-static PS_FLUSH_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MAX_IMM_DEPTH_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static MAX_WAL_GAP_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-/// Per-extent seal threshold (bytes) for the per-partition StreamClient.
-/// When a stream's tail extent reaches this size, the next append rolls a
-/// fresh extent. Bigger = fewer extents = less manager/etcd metadata
-/// pressure at scale (the reason for the u64-offset widening). Default
-/// 16 GiB; clamp [1 GiB, 64 GiB].
-static MAX_EXTENT_SIZE_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static SHUTDOWN_TIMEOUT_MS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static PS_MAJOR_COMPACT_PARALLELISM_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static PS_GC_PARALLELISM_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static PS_CONN_INFLIGHT_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-static PS_FG_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static PS_FG_IOPS_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-/// D-r7: replaces the former `PS_BG_RATE_BYTES_PER_SEC_CELL`.
-/// Compact and GC each have their own per-partition bytes/s cap now.
-static PS_COMPACT_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static PS_GC_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static PS_FG_SATURATED_THRESHOLD_CELL: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-static PS_FG_QPS_QUOTA_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-static PS_GC_DEBT_HIGH_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static PS_COMPACT_PENDING_HIGH_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static PS_GC_COOLDOWN_SECS_CELL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-static PS_COMPACT_COOLDOWN_SECS_CELL: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-/// Memtable rotation threshold. Default `FLUSH_MEM_BYTES`; lowered by tests to
-/// rotate on small writes.
-static FLUSH_MEM_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-static COMPACT_MAX_SST_BYTES_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-/// `--compact-max-sst-bytes` default: a 50 GiB partition keeps ~50 tables
-/// after a major. Each compaction holds one output SST in memory (about 1×
-/// this), and up to `--major-compact-parallelism` run at once.
-const COMPACT_MAX_SST_BYTES_DEFAULT: u64 = 1024 * 1024 * 1024;
 /// Test sync-point (RocksDB-`SyncPoint` style): when true, `background_flush_loop`
 /// holds BEFORE claiming any imm, so a test can advance the write cursor between
 /// an imm's rotation and its flush-claim — deterministically reproducing the
@@ -143,65 +92,19 @@ static WRITE_PHASE3_PAUSE: std::sync::atomic::AtomicBool =
 /// polls this to know a write is seq-assigned but not yet in the memtable.
 static WRITE_PHASE3_PARKED: AtomicU64 = AtomicU64::new(0);
 
-/// setter for the group-commit request cap. First-call-wins.
-/// `[1, 1_000_000]` clamp matches the legacy env-default behavior.
-pub fn set_max_write_batch(n: usize) -> bool {
-    MAX_WRITE_BATCH_CELL.set(n.clamp(1, 1_000_000)).is_ok()
-}
-pub fn set_ps_inflight_cap(n: usize) -> bool {
-    PS_INFLIGHT_CAP_CELL.set(n.clamp(1, 64)).is_ok()
-}
-pub fn set_ps_sst_inflight_cap(n: usize) -> bool {
-    PS_SST_INFLIGHT_CAP_CELL.set(n.clamp(1, 16)).is_ok()
-}
-/// max concurrent in-flight imm flushes (parallel drain).
-/// Range [1, 64]; default = MAX_IMM_DEPTH so the imm queue can fully
-/// drain in parallel.
-pub fn set_ps_flush_inflight_cap(n: usize) -> bool {
-    PS_FLUSH_INFLIGHT_CAP_CELL.set(n.clamp(1, 64)).is_ok()
-}
-pub fn set_max_imm_depth(n: usize) -> bool {
-    MAX_IMM_DEPTH_CELL.set(n.clamp(1, 64)).is_ok()
-}
-pub fn set_max_wal_gap(n: u64) -> bool {
-    MAX_WAL_GAP_CELL
-        .set(n.clamp(128 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
-        .is_ok()
-}
-pub fn set_max_extent_size_bytes(n: u64) -> bool {
-    MAX_EXTENT_SIZE_BYTES_CELL
-        .set(n.clamp(1024 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
-        .is_ok()
-}
-/// Memtable rotation threshold = the SST size a flush writes (`--flush-mem-bytes`).
-/// A compaction output SST is cut at no less than twice it (see
-/// `max_sst_bytes`). Clamp [4 KiB, 1 GiB].
-pub fn set_flush_mem_bytes(n: u64) -> bool {
-    FLUSH_MEM_BYTES_CELL
-        .set(n.clamp(4 * 1024, 1024 * 1024 * 1024))
-        .is_ok()
-}
+/// Memtable rotation threshold, and so the size of an SST a flush writes.
+/// Compaction reads its own sizes off the same value.
 pub(crate) fn flush_mem_bytes() -> u64 {
-    FLUSH_MEM_BYTES_CELL.get().copied().unwrap_or(FLUSH_MEM_BYTES)
-}
-/// `autumn-ps --compact-max-sst-bytes`; 4 KiB to 3 GiB (an SST's block
-/// offsets are u32). Set before any partition opens; first call wins. Tests
-/// that shrink the flush size set it to 2 × that to keep multi-output
-/// compactions.
-pub fn set_compact_max_sst_bytes(n: u64) -> Result<(), String> {
-    if !(4 * 1024..=3 * 1024 * 1024 * 1024).contains(&n) {
-        return Err(format!("{n}: must be 4 KiB-3 GiB"));
-    }
-    COMPACT_MAX_SST_BYTES_CELL
-        .set(n)
-        .map_err(|_| "already set".to_string())
+    params().flush_mem_bytes.get()
 }
 /// Data-block bytes at which `do_compact` cuts an output SST (bloom, index and
 /// MetaBlock come on top): `--compact-max-sst-bytes`, and at least twice the
 /// flush size so a flushed table is never above half of it.
 pub(crate) fn max_sst_bytes() -> u64 {
-    let configured = *COMPACT_MAX_SST_BYTES_CELL.get_or_init(|| COMPACT_MAX_SST_BYTES_DEFAULT);
-    configured.max(flush_mem_bytes().saturating_mul(2))
+    params()
+        .compact_max_sst_bytes
+        .get()
+        .max(flush_mem_bytes().saturating_mul(2))
 }
 /// Approximate encoded bytes used to enforce the per-SST output budget.
 pub(crate) fn sst_entry_bytes(key_len: usize, value_len: usize) -> usize {
@@ -312,72 +215,10 @@ pub fn write_phase3_parked_count() -> u64 {
 pub(crate) fn note_write_phase3_parked() {
     WRITE_PHASE3_PARKED.fetch_add(1, Ordering::Relaxed);
 }
-pub fn set_shutdown_timeout_ms(n: u64) -> bool {
-    SHUTDOWN_TIMEOUT_MS_CELL
-        .set(n.clamp(1_000, 600_000))
-        .is_ok()
-}
-pub fn set_ps_major_compact_parallelism(n: usize) -> bool {
-    PS_MAJOR_COMPACT_PARALLELISM_CELL
-        .set(n.clamp(1, 64))
-        .is_ok()
-}
-pub fn set_ps_gc_parallelism(n: usize) -> bool {
-    PS_GC_PARALLELISM_CELL.set(n.clamp(1, 64)).is_ok()
-}
-pub fn set_ps_conn_inflight_cap(n: usize) -> bool {
-    if n == 0 || n > 4096 {
-        return false;
-    }
-    PS_CONN_INFLIGHT_CAP_CELL.set(n).is_ok()
-}
-pub fn set_admission_fg_rate(n: u64) -> bool {
-    PS_FG_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
-}
-pub fn set_admission_fg_iops(n: u64) -> bool {
-    PS_FG_IOPS_PER_SEC_CELL.set(n).is_ok()
-}
-/// D-r7: per-partition compact rate cap (bytes/s). Replaces the
-/// former combined `set_admission_bg_rate`.
-pub fn set_admission_compact_rate(n: u64) -> bool {
-    PS_COMPACT_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
-}
-/// D-r7: per-partition gc rate cap (bytes/s).
-pub fn set_admission_gc_rate(n: u64) -> bool {
-    PS_GC_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
-}
-pub fn set_admission_fg_saturated_threshold(n: f64) -> bool {
-    PS_FG_SATURATED_THRESHOLD_CELL.set(n).is_ok()
-}
-pub fn set_fg_qps_quota(n: u32) -> bool {
-    if n == 0 {
-        return false;
-    }
-    PS_FG_QPS_QUOTA_CELL.set(n).is_ok()
-}
-pub fn set_gc_debt_high(n: u64) -> bool {
-    if n == 0 {
-        return false;
-    }
-    PS_GC_DEBT_HIGH_BYTES_CELL.set(n).is_ok()
-}
-pub fn set_compact_pending_high(n: u64) -> bool {
-    if n == 0 {
-        return false;
-    }
-    PS_COMPACT_PENDING_HIGH_BYTES_CELL.set(n).is_ok()
-}
-pub fn set_gc_cooldown_secs(n: i64) -> bool {
-    PS_GC_COOLDOWN_SECS_CELL.set(n).is_ok()
-}
-pub fn set_compact_cooldown_secs(n: i64) -> bool {
-    PS_COMPACT_COOLDOWN_SECS_CELL.set(n).is_ok()
-}
 
-/// Group-commit request count cap. Defaults to DEFAULT_MAX_WRITE_BATCH
-/// (3072); overridable via `set_max_write_batch` from the binary main().
+/// Group-commit request count cap (`--group-commit-cap`).
 fn max_write_batch() -> usize {
-    *MAX_WRITE_BATCH_CELL.get_or_init(|| DEFAULT_MAX_WRITE_BATCH)
+    params().group_commit_cap.get()
 }
 /// The most encoded bytes one group-commit batch may carry.
 ///
@@ -475,16 +316,6 @@ impl CoalesceWindow {
     }
 }
 
-/// R4 4.4 — maximum number of P-log `append_batch` futures in flight
-/// concurrently per partition. Higher values give more pipeline depth so
-/// multiple 256-request group-commit batches overlap their replica RTT, but
-/// also raise peak memory (each in-flight batch holds its requests' encoded
-/// segments).
-///
-/// Default = 8. The per-batch memory is whatever the queued requests hold —
-/// `MAX_WRITE_BATCH_BYTES` bounds the WIRE frame, not the working set — so a
-/// burst of large Puts can exceed the figure this note used to quote.
-/// Range clamped to [1, 64]. Overridable via `set_ps_inflight_cap`.
 /// Capacity of a `PartitionServer`'s SST block cache (paged readers only).
 /// The cache ITSELF is per-`PartitionServer` (`PartitionServer::block_cache`,
 /// handed to every partition it opens) — only this size knob is process-wide.
@@ -493,17 +324,9 @@ impl CoalesceWindow {
 /// one cluster. One PS serves one cluster, so a per-PS cache can never alias;
 /// a process-global one silently could, and did in test harnesses that run
 /// several in-process clusters at once.
-static SST_BLOCK_CACHE_BYTES_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-pub fn set_sst_block_cache_bytes(n: usize) -> bool {
-    if !(16 * 1024 * 1024..=256 * 1024 * 1024 * 1024).contains(&n) {
-        return false;
-    }
-    SST_BLOCK_CACHE_BYTES_CELL.set(n).is_ok()
-}
 
 fn new_block_cache() -> std::sync::Arc<crate::sstable::BlockCache> {
-    let cap = *SST_BLOCK_CACHE_BYTES_CELL.get_or_init(|| 512 * 1024 * 1024);
+    let cap = params().sst_block_cache_bytes.get();
     std::sync::Arc::new(crate::sstable::BlockCache::new(cap))
 }
 
@@ -523,8 +346,18 @@ pub(crate) fn sst_readers_changed(
             .any(|(a, b)| !std::sync::Arc::ptr_eq(a, b))
 }
 
+/// R4 4.4 — maximum number of P-log `append_batch` futures in flight
+/// concurrently per partition. Higher values give more pipeline depth so
+/// multiple 256-request group-commit batches overlap their replica RTT, but
+/// also raise peak memory (each in-flight batch holds its requests' encoded
+/// segments).
+///
+/// Default = 8. The per-batch memory is whatever the queued requests hold —
+/// `MAX_WRITE_BATCH_BYTES` bounds the WIRE frame, not the working set — so a
+/// burst of large Puts can exceed the figure this note used to quote.
+/// Range clamped to [1, 64]. `--ps-inflight-cap`.
 pub(crate) fn ps_inflight_cap() -> usize {
-    *PS_INFLIGHT_CAP_CELL.get_or_init(|| 8)
+    params().ps_inflight_cap.get()
 }
 
 /// R4 4.4 — maximum number of P-sst (flush) in-flight SST uploads per
@@ -532,7 +365,7 @@ pub(crate) fn ps_inflight_cap() -> usize {
 /// (peak), so this cap is deliberately small. Default = 2 lets the next
 /// flush start its `build_sst_bytes` while the previous one's 128 MB
 /// `row_stream.append` is streaming. Range clamped to [1, 16].
-/// Overridable via `set_ps_sst_inflight_cap`.
+/// `--ps-bulk-inflight-cap`.
 ///
 /// (2026-05-13): `background_flush_loop` is now structurally
 /// parallel via `FuturesOrdered` and `ps_flush_inflight_cap()`. The
@@ -544,7 +377,7 @@ pub(crate) fn ps_inflight_cap() -> usize {
 /// P-sst `FuturesUnordered` doesn't head-of-line block.
 /// Default returns to 2 (the long-standing R4 4.4 value).
 pub(crate) fn ps_sst_inflight_cap() -> usize {
-    *PS_SST_INFLIGHT_CAP_CELL.get_or_init(|| 2)
+    params().ps_bulk_inflight_cap.get()
 }
 
 /// parallel imm-flush drain cap on the P-log side.
@@ -567,21 +400,21 @@ pub(crate) fn ps_sst_inflight_cap() -> usize {
 /// VP-heavy imm with small SST + big log_stream tail, short burst
 /// → drain. Operator can opt in via `--flush-inflight-cap N`.
 pub(crate) fn ps_flush_inflight_cap() -> usize {
-    *PS_FLUSH_INFLIGHT_CAP_CELL.get_or_init(|| 1)
+    params().flush_inflight_cap.get()
 }
 
 /// maximum imm queue depth per partition. When `imm.len()` reaches
 /// this cap, `partition_loop` stops pulling from `req_rx` (write
 /// back-pressure) and waits for `flush_one_imm` to pop one entry before
 /// resuming. Worst-case unflushed-WAL window per partition is therefore
-/// `MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 4 × 256 MB + 256 MB
+/// `MAX_IMM_DEPTH * --flush-mem-bytes + active.bytes` = 4 × 256 MB + 256 MB
 /// = 1.25 GB (vs. the earlier unbounded window). Range clamped to [1, 64].
-/// Overridable via `set_max_imm_depth`. RocksDB analogue:
+/// `--max-imm-depth`. RocksDB analogue:
 /// `max_write_buffer_number` (default 2). Default 4 because our memtable
 /// is 4× RocksDB's default `write_buffer_size` and bulk uploads are
 /// network-bound 128 MB SSTs.
 pub(crate) fn max_imm_depth() -> usize {
-    *MAX_IMM_DEPTH_CELL.get_or_init(|| 4)
+    params().max_imm_depth.get()
 }
 
 /// maximum unflushed log_stream gap per partition. When
@@ -591,44 +424,43 @@ pub(crate) fn max_imm_depth() -> usize {
 /// the workload is dominated by large values (small memtable footprint
 /// per record but full payload sits in log_stream as VPs) or by small
 /// writes that drip in below the rotate threshold. Range clamped to
-/// [128 MiB, 64 GiB]. Overridable via `set_max_wal_gap`.
+/// [128 MiB, 64 GiB]. `--max-wal-gap`.
 /// RocksDB analogue: `max_total_wal_size` (default
 /// `write_buffer_size × max_write_buffer_number × 4`).
 pub(crate) fn max_wal_gap() -> u64 {
-    const DEFAULT: u64 = 1024 * 1024 * 1024;
-    *MAX_WAL_GAP_CELL.get_or_init(|| DEFAULT)
+    params().max_wal_gap.get()
 }
 
 /// Per-extent seal threshold passed to each partition's `StreamClient`.
 /// Default 16 GiB (was a hardcoded 3 GiB); overridable via
-/// `set_max_extent_size_bytes` (`autumn-ps --max-extent-size-bytes`).
+/// `autumn-ps --max-extent-size-bytes`.
 /// The u64-offset widening lifted the prior 4 GiB `ReadBytesReq.offset`
 /// ceiling so extents can now exceed 4 GiB.
 pub(crate) fn max_extent_size_bytes() -> u64 {
-    const DEFAULT: u64 = 16 * 1024 * 1024 * 1024;
-    *MAX_EXTENT_SIZE_BYTES_CELL.get_or_init(|| DEFAULT)
+    params().max_extent_size_bytes.get()
+}
+
+/// The `--stream-*` parameters, read when a partition opens its stream clients.
+fn stream_client_config() -> autumn_stream::client::StreamClientConfig {
+    let p = params();
+    autumn_stream::client::StreamClientConfig {
+        bad_nodes_ttl: Duration::from_secs(p.stream_bad_nodes_ttl_secs.get()),
+        inflight_cap: p.stream_inflight_cap.get(),
+        append_fanout_timeout: Duration::from_millis(p.stream_append_timeout_ms.get()),
+        append_floor_bytes_per_sec: p.stream_append_floor_bytes_per_sec.get(),
+        read_chunk_bytes: p.stream_read_chunk_bytes.get(),
+        read_base_timeout: Duration::from_millis(p.stream_read_timeout_ms.get()),
+        read_floor_bytes_per_sec: p.stream_read_floor_bytes_per_sec.get(),
+    }
 }
 
 /// graceful shutdown deadline. After SIGTERM, `PartitionServer::
 /// shutdown()` waits at most this many milliseconds for each partition's
 /// drain (rotate active + flush all imm). Range clamped to [1 s, 10 min].
-/// overridable via `set_shutdown_timeout_ms`.
+/// `--shutdown-timeout-ms`.
 pub(crate) fn shutdown_timeout_ms() -> u64 {
-    *SHUTDOWN_TIMEOUT_MS_CELL.get_or_init(|| 60_000)
+    params().shutdown_timeout_ms.get()
 }
-
-/// BUG3 — how many partitions `sync_regions_once` opens
-/// CONCURRENTLY. Each `open_partition` spawns the partition's own OS thread
-/// (own compio runtime + core) and returns only after that thread finishes
-/// `recover_partition` (log_stream replay) + bind + register — so opening
-/// serially made a PS that inherits N partitions (e.g. a full takeover after
-/// a sibling PS died) pay ~N× the single-partition recovery wallclock
-/// (measured ×32 on a 32-partition takeover). Recovery is latency-bound and
-/// runs on per-partition threads, so launching the opens concurrently overlaps
-/// the waits. The live partition count is already bounded by the per-PS
-/// partition budget (cpuset_len / 2); this cap only bounds the burst of
-/// manager RPCs (owner-lock / commit_length) a mass reopen fires at once.
-const OPEN_PARALLELISM: usize = 64;
 
 // CPU affinity policy lives in `autumn_common::cpu_pin`. Both OS threads
 // owned by a partition (P-log `part-{id}` and P-sst `part-{id}-sst`)
@@ -662,7 +494,7 @@ pub(crate) fn ps_major_compact_parallelism() -> usize {
     // 432 MB/s aggregate flush input), a serialized single compact at
     // 256 MiB/s simply cannot keep up. Operator can lower via
     // `--major-compact-parallelism` for memory-constrained hosts.
-    *PS_MAJOR_COMPACT_PARALLELISM_CELL.get_or_init(|| 4)
+    params().major_compact_parallelism.get()
 }
 
 /// PS-wide cap on concurrent `run_gc` calls across partitions.
@@ -679,7 +511,7 @@ pub(crate) fn ps_major_compact_parallelism() -> usize {
 /// 4 × 64 MiB chunk buffer = 256 MiB peak RSS, well below any
 /// reasonable budget.
 pub(crate) fn ps_gc_parallelism() -> usize {
-    *PS_GC_PARALLELISM_CELL.get_or_init(|| 4)
+    params().gc_parallelism.get()
 }
 
 pub struct CompactionGate {
@@ -888,16 +720,6 @@ const FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 // than this with `CODE_VALUE_TOO_LARGE`; client SDK retries via
 // `put_stream_begin` (client-side striping).
 pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
-
-/// (PS write-recv bulk, W1): minimum `MSG_PUT_BULK` value size for which the
-/// ps-conn recvs the value straight into a `PooledBuf` (one UCX Stream unpack
-/// or TCP kernel copy) instead of letting the `FrameDecoder` accumulate it. Below
-/// this the per-op recv-into-registered overhead (regpool_acquire + memh +
-/// staged recv) exceeds the copy saved — same size-asymmetry as the read path's
-/// `BULK_MIN_BYTES`. Consulted on BOTH transports: UCX recvs into a
-/// registered buffer, TCP into a pooled buffer via a compio owned read; below
-/// this both keep the proven FrameDecoder path. 64 KiB matches the read threshold.
-pub(crate) const AUTUMN_PS_BULK_RECV_MIN_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ValuePointer {
@@ -1885,7 +1707,7 @@ impl GcTask {
 #[derive(Default, Clone, Debug)]
 pub(crate) struct GcAutoParams {
     /// Discard ratio threshold (0.0..=1.0). `None` → 0.4
-    /// (`GC_DISCARD_RATIO`).
+    /// (`--gc-discard-ratio`).
     pub ratio: Option<f64>,
     /// Only consider sealed extents whose `sealed_length` is at most
     /// this many bytes. Combined with a lower `ratio` lets the caller
@@ -2569,12 +2391,11 @@ struct OpenBackoff {
 
 /// First open-failure backoff = `OPEN_BACKOFF_BASE_SECS` (≈ "retry next
 /// region_sync tick"); each further consecutive failure doubles it up to
-/// `2^OPEN_BACKOFF_MAX_SHIFT`, capped at `OPEN_BACKOFF_CAP_SECS`. Small
+/// `2^OPEN_BACKOFF_MAX_SHIFT`, capped at `--open-backoff-max-secs`. Small
 /// at first so a transient port conflict recovers fast; throttles a
 /// persistently-failing open so it doesn't spin.
 const OPEN_BACKOFF_BASE_SECS: u64 = 1;
 const OPEN_BACKOFF_MAX_SHIFT: u32 = 5;
-const OPEN_BACKOFF_CAP_SECS: u64 = 30;
 
 /// D-r7: per-partition rate controller. Tracks FOUR independent
 /// rate dimensions in one 1-second sliding window:
@@ -2593,26 +2414,29 @@ const OPEN_BACKOFF_CAP_SECS: u64 = 30;
 /// exceeds `fg_saturated_ratio × cap`. Disabled per-dimension when
 /// that fg cap is 0 (we lack a baseline to detect saturation).
 ///
-/// Defaults (process-global, set via `set_admission_*` setters before
-/// constructing PartitionServer; see CLI `--*-rate-bytes-per-sec` etc.):
-///   AUTUMN_PS_FG_RATE_BYTES_PER_SEC     — 256 MiB/s
-///   AUTUMN_PS_FG_IOPS_PER_SEC           — 30_000
-///   AUTUMN_PS_COMPACT_RATE_BYTES_PER_SEC— 64 MiB/s
-///   AUTUMN_PS_GC_RATE_BYTES_PER_SEC     — 32 MiB/s
-///   AUTUMN_PS_FG_SATURATED_THRESHOLD    — 0.8
-/// `0` on any rate disables that dimension (unlimited).
+/// The caps are the runtime parameters `--fg-rate-bytes-per-sec`,
+/// `--fg-iops-per-sec`, `--admission-compact-rate-bytes-per-sec`,
+/// `--admission-gc-rate-bytes-per-sec` and `--fg-saturated-threshold`, read on
+/// every accounting call so an override applies at once. `0` on any rate
+/// disables that dimension (unlimited).
 ///
 /// `parking_lot::Mutex` is held only across the synchronous accounting
 /// calc; sleep happens outside the lock. Per-partition controllers
 /// have no cross-thread contention since the partition owns its
 /// own Arc — the Mutex is uncontended in steady state.
 pub struct RateController {
+    /// `None`: read the PS parameters on each call.
+    fixed: Option<RateCaps>,
+    state: parking_lot::Mutex<RateState>,
+}
+
+#[derive(Clone, Copy)]
+struct RateCaps {
     fg_rate_bytes_per_sec: u64,
     fg_iops_per_sec: u64,
     compact_rate_bytes_per_sec: u64,
     gc_rate_bytes_per_sec: u64,
     fg_saturated_ratio: f64,
-    state: parking_lot::Mutex<RateState>,
 }
 
 struct RateState {
@@ -2631,12 +2455,18 @@ impl RateController {
         gc_rate_bytes_per_sec: u64,
         fg_saturated_ratio: f64,
     ) -> Self {
-        Self {
+        Self::with_caps(Some(RateCaps {
             fg_rate_bytes_per_sec,
             fg_iops_per_sec,
             compact_rate_bytes_per_sec,
             gc_rate_bytes_per_sec,
             fg_saturated_ratio: fg_saturated_ratio.clamp(0.1, 1.0),
+        }))
+    }
+
+    fn with_caps(fixed: Option<RateCaps>) -> Self {
+        Self {
+            fixed,
             state: parking_lot::Mutex::new(RateState {
                 window_start: Instant::now(),
                 fg_bytes: 0,
@@ -2647,7 +2477,7 @@ impl RateController {
         }
     }
 
-    /// Reads process-global setters. Defaults recalibrated against
+    /// Follows the PS parameters. Defaults recalibrated against
     /// `perf_baseline_tcp_p16_d8_s4k.json` and the 8M peak observation
     /// (see `[[partition-qps-ceiling]]` and the D-r7-recal analysis):
     ///
@@ -2660,13 +2490,21 @@ impl RateController {
     ///                          437 MB/s flush = 27 MB/s per partition).
     ///   - gc 128 MiB/s   — handles 50% overwrite rate on 8M workloads
     ///                       (218 × 0.5 = 109 MB/s).
-    pub fn from_env() -> Self {
-        let fg_rate = *PS_FG_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 1024 * 1024 * 1024);
-        let fg_iops = *PS_FG_IOPS_PER_SEC_CELL.get_or_init(|| 30_000);
-        let compact_rate = *PS_COMPACT_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 256 * 1024 * 1024);
-        let gc_rate = *PS_GC_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 128 * 1024 * 1024);
-        let saturated = *PS_FG_SATURATED_THRESHOLD_CELL.get_or_init(|| 0.8);
-        Self::new(fg_rate, fg_iops, compact_rate, gc_rate, saturated)
+    pub fn from_params() -> Self {
+        Self::with_caps(None)
+    }
+
+    fn caps(&self) -> RateCaps {
+        self.fixed.unwrap_or_else(|| {
+            let p = params();
+            RateCaps {
+                fg_rate_bytes_per_sec: p.fg_rate_bytes_per_sec.get(),
+                fg_iops_per_sec: p.fg_iops_per_sec.get(),
+                compact_rate_bytes_per_sec: p.admission_compact_rate_bytes_per_sec.get(),
+                gc_rate_bytes_per_sec: p.admission_gc_rate_bytes_per_sec.get(),
+                fg_saturated_ratio: p.fg_saturated_threshold.get(),
+            }
+        })
     }
 
     fn maybe_reset_window(state: &mut RateState) {
@@ -2682,17 +2520,17 @@ impl RateController {
     /// Returns `true` iff fg observed rate (bytes OR ops) exceeds
     /// `fg_saturated_ratio × cap`. Used by `account_compact` and
     /// `account_gc` to decide whether to yield to fg.
-    fn fg_saturated(&self, s: &RateState, elapsed_secs: f64) -> bool {
-        if self.fg_rate_bytes_per_sec > 0 {
+    fn fg_saturated(c: &RateCaps, s: &RateState, elapsed_secs: f64) -> bool {
+        if c.fg_rate_bytes_per_sec > 0 {
             let obs = s.fg_bytes as f64 / elapsed_secs;
-            let at = self.fg_rate_bytes_per_sec as f64 * self.fg_saturated_ratio;
+            let at = c.fg_rate_bytes_per_sec as f64 * c.fg_saturated_ratio;
             if obs > at {
                 return true;
             }
         }
-        if self.fg_iops_per_sec > 0 {
+        if c.fg_iops_per_sec > 0 {
             let obs = s.fg_ops as f64 / elapsed_secs;
-            let at = self.fg_iops_per_sec as f64 * self.fg_saturated_ratio;
+            let at = c.fg_iops_per_sec as f64 * c.fg_saturated_ratio;
             if obs > at {
                 return true;
             }
@@ -2704,27 +2542,28 @@ impl RateController {
     /// ceiling is set AND would be exceeded (LARGER sleep wins).
     /// Both caps at 0 = unlimited (default in tests, NOT in production).
     pub async fn account_fg(&self, bytes: u64, ops: u64) {
+        let c = self.caps();
         let sleep_for = {
             let mut s = self.state.lock();
             Self::maybe_reset_window(&mut s);
             s.fg_bytes = s.fg_bytes.saturating_add(bytes);
             s.fg_ops = s.fg_ops.saturating_add(ops);
             let elapsed = s.window_start.elapsed();
-            let bytes_sleep: Option<Duration> = if self.fg_rate_bytes_per_sec == 0 {
+            let bytes_sleep: Option<Duration> = if c.fg_rate_bytes_per_sec == 0 {
                 None
             } else {
                 let target =
-                    Duration::from_secs_f64(s.fg_bytes as f64 / self.fg_rate_bytes_per_sec as f64);
+                    Duration::from_secs_f64(s.fg_bytes as f64 / c.fg_rate_bytes_per_sec as f64);
                 if target > elapsed {
                     Some(target - elapsed)
                 } else {
                     None
                 }
             };
-            let iops_sleep: Option<Duration> = if self.fg_iops_per_sec == 0 {
+            let iops_sleep: Option<Duration> = if c.fg_iops_per_sec == 0 {
                 None
             } else {
-                let target = Duration::from_secs_f64(s.fg_ops as f64 / self.fg_iops_per_sec as f64);
+                let target = Duration::from_secs_f64(s.fg_ops as f64 / c.fg_iops_per_sec as f64);
                 if target > elapsed {
                     Some(target - elapsed)
                 } else {
@@ -2746,16 +2585,17 @@ impl RateController {
     /// (1) own compact ceiling; (2) fg-aware yield (yields when fg is
     /// saturated).
     pub async fn account_compact(&self, bytes: u64) {
+        let c = self.caps();
         let sleep_for = {
             let mut s = self.state.lock();
             Self::maybe_reset_window(&mut s);
             s.compact_bytes = s.compact_bytes.saturating_add(bytes);
             let elapsed = s.window_start.elapsed();
-            let own_sleep: Option<Duration> = if self.compact_rate_bytes_per_sec == 0 {
+            let own_sleep: Option<Duration> = if c.compact_rate_bytes_per_sec == 0 {
                 None
             } else {
                 let target = Duration::from_secs_f64(
-                    s.compact_bytes as f64 / self.compact_rate_bytes_per_sec as f64,
+                    s.compact_bytes as f64 / c.compact_rate_bytes_per_sec as f64,
                 );
                 if target > elapsed {
                     Some(target - elapsed)
@@ -2764,7 +2604,7 @@ impl RateController {
                 }
             };
             let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-            let yield_sleep: Option<Duration> = if self.fg_saturated(&s, elapsed_secs) {
+            let yield_sleep: Option<Duration> = if Self::fg_saturated(&c, &s, elapsed_secs) {
                 let remaining = Duration::from_secs(1).saturating_sub(elapsed);
                 if remaining > Duration::ZERO {
                     Some(remaining)
@@ -2788,16 +2628,17 @@ impl RateController {
     /// GC rate accounting. Symmetric to `account_compact`, separate
     /// counter + cap so compact and gc don't fight for the same budget.
     pub async fn account_gc(&self, bytes: u64) {
+        let c = self.caps();
         let sleep_for = {
             let mut s = self.state.lock();
             Self::maybe_reset_window(&mut s);
             s.gc_bytes = s.gc_bytes.saturating_add(bytes);
             let elapsed = s.window_start.elapsed();
-            let own_sleep: Option<Duration> = if self.gc_rate_bytes_per_sec == 0 {
+            let own_sleep: Option<Duration> = if c.gc_rate_bytes_per_sec == 0 {
                 None
             } else {
                 let target =
-                    Duration::from_secs_f64(s.gc_bytes as f64 / self.gc_rate_bytes_per_sec as f64);
+                    Duration::from_secs_f64(s.gc_bytes as f64 / c.gc_rate_bytes_per_sec as f64);
                 if target > elapsed {
                     Some(target - elapsed)
                 } else {
@@ -2805,7 +2646,7 @@ impl RateController {
                 }
             };
             let elapsed_secs = elapsed.as_secs_f64().max(0.001);
-            let yield_sleep: Option<Duration> = if self.fg_saturated(&s, elapsed_secs) {
+            let yield_sleep: Option<Duration> = if Self::fg_saturated(&c, &s, elapsed_secs) {
                 let remaining = Duration::from_secs(1).saturating_sub(elapsed);
                 if remaining > Duration::ZERO {
                     Some(remaining)
@@ -2852,8 +2693,9 @@ impl RateController {
 /// `CompactionGate`-backed `compact_gate` and
 /// `gc_concurrency_gate` (D-r5).
 pub struct ConcurrencyController {
-    compact_max: usize,
-    gc_max: usize,
+    /// `(compact, gc)` caps; `None`: `--major-compact-parallelism` and
+    /// `--gc-parallelism`, read on each acquire.
+    fixed: Option<(usize, usize)>,
     compact_inflight: std::sync::atomic::AtomicUsize,
     gc_inflight: std::sync::atomic::AtomicUsize,
 }
@@ -2884,23 +2726,31 @@ impl Drop for GcPermit {
 
 impl ConcurrencyController {
     pub fn new(compact_max: usize, gc_max: usize) -> Self {
+        Self::with_caps(Some((compact_max.max(1), gc_max.max(1))))
+    }
+
+    fn with_caps(fixed: Option<(usize, usize)>) -> Self {
         Self {
-            compact_max: compact_max.max(1),
-            gc_max: gc_max.max(1),
+            fixed,
             compact_inflight: std::sync::atomic::AtomicUsize::new(0),
             gc_inflight: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    pub fn from_env() -> Self {
-        Self::new(ps_major_compact_parallelism(), ps_gc_parallelism())
+    pub fn from_params() -> Self {
+        Self::with_caps(None)
+    }
+
+    fn caps(&self) -> (usize, usize) {
+        self.fixed
+            .unwrap_or_else(|| (ps_major_compact_parallelism(), ps_gc_parallelism()))
     }
 
     pub async fn acquire_compact(self: &std::sync::Arc<Self>) -> CompactPermit {
         use std::sync::atomic::Ordering;
         loop {
             let cur = self.compact_inflight.load(Ordering::Acquire);
-            if cur < self.compact_max
+            if cur < self.caps().0
                 && self
                     .compact_inflight
                     .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
@@ -2918,7 +2768,7 @@ impl ConcurrencyController {
         use std::sync::atomic::Ordering;
         loop {
             let cur = self.gc_inflight.load(Ordering::Acquire);
-            if cur < self.gc_max
+            if cur < self.caps().1
                 && self
                     .gc_inflight
                     .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
@@ -3310,6 +3160,34 @@ mod admission_tests {
             assert_eq!(cc.gc_inflight.load(Ordering::Acquire), 0);
         });
     }
+
+    /// A controller built from the parameters follows a runtime override of
+    /// `--gc-parallelism` on the next acquire, and the admission caps on the
+    /// next accounting call.
+    #[test]
+    fn controllers_follow_a_runtime_override() {
+        use autumn_params::apply_overrides;
+        let p = params();
+        let cc = std::sync::Arc::new(ConcurrencyController::from_params());
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            apply_overrides(p, &[("ps.gc-parallelism".into(), "1".into())]);
+            let g1 = cc.acquire_gc().await;
+            let blocked = compio::time::timeout(Duration::from_millis(200), cc.acquire_gc()).await;
+            assert!(blocked.is_err(), "a second GC permit past an override of 1");
+            apply_overrides(p, &[("ps.gc-parallelism".into(), "2".into())]);
+            let g2 = compio::time::timeout(Duration::from_secs(2), cc.acquire_gc())
+                .await
+                .expect("the raised cap admits a second permit");
+            drop((g1, g2));
+        });
+        let rc = RateController::from_params();
+        apply_overrides(p, &[("ps.fg-iops-per-sec".into(), "7".into())]);
+        assert_eq!(rc.caps().fg_iops_per_sec, 7);
+        apply_overrides(p, &[]);
+        assert_eq!(rc.caps().fg_iops_per_sec, p.fg_iops_per_sec.base());
+        assert_eq!(cc.caps().1, p.gc_parallelism.base());
+    }
 }
 
 impl PartitionServer {
@@ -3489,7 +3367,7 @@ impl PartitionServer {
                             ))),
                             listen_host: Rc::new(std::cell::RefCell::new(String::from("0.0.0.0"))),
                             metrics_addr: Rc::new(RefCell::new(String::new())),
-                            concurrency_ctrl: std::sync::Arc::new(ConcurrencyController::from_env()),
+                            concurrency_ctrl: std::sync::Arc::new(ConcurrencyController::from_params()),
                             partition_budget: std::sync::Arc::new(PartitionBudget::new(
                                 compute_partition_budget_cap(),
                             )),
@@ -3538,7 +3416,7 @@ impl PartitionServer {
         }
 
         // Start heartbeats BEFORE the (potentially long) sync_regions_once. The
-        // manager evicts a PS after PS_DEAD_TIMEOUT (10s) without a heartbeat;
+        // manager evicts a PS after --ps-dead-timeout-secs (10s) without a heartbeat;
         // opening N partitions can take >10s (each open_partition awaits
         // commit_length on 3 streams + replays the WAL), which used to push
         // the first heartbeat past the deadline and silently evict the PS.
@@ -3669,7 +3547,8 @@ impl PartitionServer {
         // happen, so serving through its outage is safe; 90 s comfortably
         // outlasts the worst observed manager restart while still bounding
         // the partitioned-from-manager-only stale-serving window.
-        const MAX_CONSECUTIVE_FAILURES: u32 = 45; // 45 × 2s = 90s
+        let max_consecutive_failures =
+            (params().heartbeat_failure_exit_secs.get() / HEARTBEAT_INTERVAL_SECS) as u32;
         // etcd-chaos D2: NOT_LEADER gets its OWN, much longer budget.
         // A reachable manager answering NOT_LEADER means the control
         // plane is alive but LEADERLESS (single manager during an etcd
@@ -3681,7 +3560,8 @@ impl PartitionServer {
         // bounds the multi-manager follower-pinned stale-READ window —
         // data safety never depended on this exit (owner_epoch fences
         // writes at the ENs, region_epoch fences client routing).
-        const MAX_CONSECUTIVE_NOT_LEADER: u32 = 450; // 450 × 2s = 15min
+        let max_consecutive_not_leader =
+            (params().heartbeat_not_leader_exit_secs.get() / HEARTBEAT_INTERVAL_SECS) as u32;
         let mut consecutive_failures: u32 = 0;
         let mut consecutive_not_leader: u32 = 0;
         let mut ticker = compio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
@@ -3724,7 +3604,7 @@ impl PartitionServer {
                         // only the leaderless budget advances.
                         consecutive_failures = 0;
                         consecutive_not_leader += 1;
-                        if consecutive_not_leader >= MAX_CONSECUTIVE_NOT_LEADER {
+                        if consecutive_not_leader >= max_consecutive_not_leader {
                             tracing::error!(
                                 "PS {} saw only non-leader managers for {}s, exiting to prevent stale serving",
                                 self.ps_id,
@@ -3759,10 +3639,10 @@ impl PartitionServer {
                         "PS {} heartbeat failed ({}/{}): {e} (next mgr: {})",
                         self.ps_id,
                         consecutive_failures,
-                        MAX_CONSECUTIVE_FAILURES,
+                        max_consecutive_failures,
                         self.manager_addr(),
                     );
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    if consecutive_failures >= max_consecutive_failures {
                         tracing::error!(
                             "PS {} heartbeat lost for {}s, exiting to prevent stale serving",
                             self.ps_id,
@@ -3913,7 +3793,8 @@ impl PartitionServer {
     }
 
     async fn region_sync_loop(&self) {
-        let mut ticker = compio::time::interval(Duration::from_secs(2));
+        let every = Duration::from_secs(params().region_sync_interval_secs.get());
+        let mut ticker = compio::time::interval(every);
         ticker.tick().await; // first tick is immediate
         loop {
             ticker.tick().await;
@@ -4212,6 +4093,10 @@ impl PartitionServer {
             // the completion stream incrementally keeps the opens concurrent
             // (`buffer_unordered`) while publishing in completion order. No
             // `self.partitions` borrow is held across the `.next().await`.
+            // Opens run concurrently (each replays on its own thread, so the waits
+            // overlap; serial opens made a 32-partition takeover pay ~32× one
+            // recovery). The live count is already bounded by the partition budget;
+            // `--open-parallelism` only bounds the burst of manager RPCs.
             let mut opens = futures::stream::iter(to_open)
                 .map(
                     |(
@@ -4232,7 +4117,7 @@ impl PartitionServer {
                         (part_id, r)
                     },
                 )
-                .buffer_unordered(OPEN_PARALLELISM);
+                .buffer_unordered(params().open_parallelism.get());
 
             while let Some((part_id, result)) = opens.next().await {
                 match result {
@@ -4254,7 +4139,7 @@ impl PartitionServer {
                         let shift = (entry.consecutive_failures - 1).min(OPEN_BACKOFF_MAX_SHIFT);
                         let secs = OPEN_BACKOFF_BASE_SECS
                             .saturating_mul(1u64 << shift)
-                            .min(OPEN_BACKOFF_CAP_SECS);
+                            .min(params().open_backoff_max_secs.get());
                         entry.retry_after = now + Duration::from_secs(secs);
                         tracing::warn!(
                             "PS {} open partition {part_id} failed (attempt {}); backing off {secs}s: {e:#}",
@@ -4590,7 +4475,7 @@ impl PartitionServer {
     ///      `partition_loop` stops pulling new requests, drains
     ///      inflight, rotates `active`, calls `flush_one_imm` until imm
     ///      is empty (or a flush fails), then replies with the outcome.
-    ///   2. Await the oneshot with `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS`
+    ///   2. Await the oneshot with `--shutdown-timeout-ms`
     ///      deadline. On timeout, log a warning and skip — the SIGKILL
     ///      fallback (and on-restart logStream replay) keeps correctness.
     ///   3. Drop `shutdown_tx` to close the per-partition accept loop;
@@ -4901,10 +4786,10 @@ impl PartitionServer {
 /// 4×8 MiB ≫ the RoCE bandwidth-delay product, so the pipe is already full),
 /// and intra-host reads are per-op-CPU-bound and saturate by depth ~4. The
 /// deeper cap only added a tiny intra-host regression. Keep 4; raise per-deploy
-/// via `set_ps_conn_inflight_cap` (CLI `--conn-inflight-cap`) if a future
+/// via `--conn-inflight-cap` if a future
 /// workload ever shows a need.
 fn ps_conn_inflight_cap() -> usize {
-    *PS_CONN_INFLIGHT_CAP_CELL.get_or_init(|| 4)
+    params().conn_inflight_cap.get()
 }
 
 /// Test-only count of receive iterations carrying one complete frame.
@@ -5030,7 +4915,7 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Vec<Bytes>)) {
 /// recv. On UCX, `recv_into`'s `InflightSlot` drains the NIC before the buffer
 /// drops back to the pool; on TCP, compio retains the owned buffer until the
 /// in-flight read CQE lands. Either way: no leak, no DMA/kernel-writes-to-freed.
-/// Small writes (< `AUTUMN_PS_BULK_RECV_MIN_BYTES`) keep the proven decode path.
+/// Small writes (< `--bulk-recv-min-bytes`) keep the proven decode path.
 #[allow(clippy::too_many_arguments)]
 async fn drain_bulk_writes(
     decoder: &mut FrameDecoder,
@@ -5062,7 +4947,9 @@ async fn drain_bulk_writes(
         };
         let ctrl_len = prologue.ctrl_len;
         let value_len = prologue.value_len;
-        if value_len < AUTUMN_PS_BULK_RECV_MIN_BYTES {
+        // Below `--bulk-recv-min-bytes` the recv-into-pooled-buffer overhead
+        // (regpool acquire + memh + staged recv) exceeds the copy it saves.
+        if value_len < params().bulk_recv_min_bytes.get() {
             return Ok(()); // below threshold → the proven decode path
         }
         // The single-value form caps at the inline limit (`enqueue_put_bulk`
@@ -5706,7 +5593,7 @@ async fn handle_ps_connection(
 ) -> Result<()> {
     use futures::future::{select, Either, LocalBoxFuture};
 
-    const READ_BUF_SIZE: usize = 64 * 1024;
+    let read_buf_size = params().conn_read_buf_bytes.get();
 
     // DIAGNOSTIC label for the stuck-in-flight report below; resolved once,
     // before the split consumes `conn`.
@@ -5748,7 +5635,7 @@ async fn handle_ps_connection(
     // Persistent read future: owns reader + read window across iterations.
     let mut read_fut: Option<LocalBoxFuture<'static, PsReadBurst>> = Some(spawn_ps_read(
         reader,
-        ps_read_window(&mut decoder, READ_BUF_SIZE),
+        ps_read_window(&mut decoder, read_buf_size),
     ));
 
     loop {
@@ -5861,7 +5748,7 @@ async fn handle_ps_connection(
                     .await?;
                     read_fut = Some(spawn_ps_read(
                         reader,
-                        ps_read_window(&mut decoder, READ_BUF_SIZE),
+                        ps_read_window(&mut decoder, read_buf_size),
                     ));
                 }
             }
@@ -5959,7 +5846,7 @@ async fn handle_ps_connection(
                         .await?;
                         read_fut = Some(spawn_ps_read(
                             reader,
-                            ps_read_window(&mut decoder, READ_BUF_SIZE),
+                            ps_read_window(&mut decoder, read_buf_size),
                         ));
                     }
                 }
@@ -6020,7 +5907,7 @@ async fn partition_thread_main(
 ) -> Result<()> {
     // D-r7: per-partition rate controller. Built inside the
     // partition thread; each partition gets its own Mutex/state.
-    let rate_ctrl = std::sync::Arc::new(crate::RateController::from_env());
+    let rate_ctrl = std::sync::Arc::new(crate::RateController::from_params());
     // create the same-thread ps-conn ↔ partition_loop
     // channel. Both endpoints live on THIS compio runtime, so sends and
     // wakes do not cross threads.
@@ -6029,12 +5916,13 @@ async fn partition_thread_main(
     let pool = Rc::new(ConnPool::new());
     // StreamClient::new_with_owner_epoch now returns `Rc<StreamClient>` directly
     // (R4 step 4.3: Rc::new_cyclic for Weak-self worker removal guard).
-    let part_sc = StreamClient::new_with_owner_epoch(
+    let part_sc = StreamClient::new_with_owner_epoch_and_config(
         &manager_addr,
         owner_key.clone(),
         owner_epoch,
         max_extent_size_bytes(),
         pool.clone(),
+        stream_client_config(),
     )
     .await
     .context("create per-partition StreamClient")?;
@@ -7171,7 +7059,7 @@ async fn partition_loop(
 
         // WAL-gap-driven force rotate. After each iteration, if
         // the unflushed WAL window exceeds `MAX_WAL_GAP`, rotate `active`
-        // even when it hasn't reached `FLUSH_MEM_BYTES`. Skipped when
+        // even when it hasn't reached `--flush-mem-bytes`. Skipped when
         // imm is already full (rotation would over-cap and `imm_full`
         // back-pressure has already kicked in).
         //
@@ -9389,7 +9277,7 @@ async fn recover_partition(
             // whole-read this replaced resolved its end from
             // sealed_length / the commit probe, which is exactly what
             // `read_committed_bytes_from_extent` restores per chunk.
-            const REPLAY_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
+            let replay_chunk_bytes = params().replay_chunk_bytes.get();
             let mut cur_off: u64 = start_off;
             let mut carry: Vec<u8> = Vec::new();
             loop {
@@ -9397,7 +9285,7 @@ async fn recover_partition(
                 let mut attempt = 0u32;
                 loop {
                     match part_sc
-                        .read_committed_bytes_from_extent(eid, cur_off, REPLAY_CHUNK_BYTES)
+                        .read_committed_bytes_from_extent(eid, cur_off, replay_chunk_bytes)
                         .await
                     {
                         Ok((d, ce)) => break (d, ce),
@@ -9428,8 +9316,8 @@ async fn recover_partition(
                 // treated as end-of-extent, dropping the committed tail. We route it
                 // to self-heal (a clean replica has the bytes) / fail-loud instead.
                 let rem = committed_end.saturating_sub(cur_off);
-                let expected = REPLAY_CHUNK_BYTES.min(rem) as usize;
-                let is_final = rem <= REPLAY_CHUNK_BYTES;
+                let expected = replay_chunk_bytes.min(rem) as usize;
+                let is_final = rem <= replay_chunk_bytes;
                 let short = got < expected;
                 if rem == 0 && carry.is_empty() {
                     // Reached the committed end cleanly, nothing buffered. Done.
@@ -10677,8 +10565,11 @@ where
 /// Mode B fix: how often `background_flush_loop` re-attempts a still-pending imm
 /// after a flush error (e.g. row_stream append wedged on a dead replica), so the
 /// flush self-heals once the cluster recovers without needing a new-write signal.
-/// 2 s is well below the chaos settle window and far above a tight error spin.
-const FLUSH_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
+/// `--flush-retry-backoff-ms`: 2 s is well below the chaos settle window and far
+/// above a tight error spin.
+fn flush_retry_backoff() -> Duration {
+    Duration::from_millis(params().flush_retry_backoff_ms.get())
+}
 
 /// DIAGNOSTIC: how often a ps-conn parked on an in-flight request says so.
 /// A connection that stops reading is invisible from the server side — the
@@ -10729,7 +10620,7 @@ async fn background_flush_loop(
 
     let cap = ps_flush_inflight_cap();
 
-    // Diagnostic for a wedge seen live: the loop wakes every FLUSH_RETRY_BACKOFF
+    // Diagnostic for a wedge seen live: the loop wakes every flush_retry_backoff()
     // with a NON-EMPTY imm and launches nothing, silently, forever — which this
     // code can only do when the front imm's pointer is already in
     // `flushing_imm_ptrs` and nobody is left to remove it. Every failure path
@@ -10751,7 +10642,7 @@ async fn background_flush_loop(
         let pending = !part.borrow().imm.is_empty();
         if pending {
             let signal = flush_rx.next();
-            let timer = compio::time::sleep(FLUSH_RETRY_BACKOFF);
+            let timer = compio::time::sleep(flush_retry_backoff());
             futures::pin_mut!(signal, timer);
             match select(signal, timer).await {
                 Either::Left((s, _)) => {
@@ -10947,12 +10838,13 @@ fn spawn_sst_thread(
             tracing::info!(part_id, ?cpu, "P-sst thread runtime ready");
             rt.block_on(async move {
                 let pool = Rc::new(ConnPool::new());
-                let sst_sc = match StreamClient::new_with_owner_epoch(
+                let sst_sc = match StreamClient::new_with_owner_epoch_and_config(
                     &manager_addr,
                     owner_key,
                     owner_epoch,
                     max_extent_size_bytes(),
                     pool,
+                    stream_client_config(),
                 )
                 .await
                 {
@@ -10995,7 +10887,7 @@ fn spawn_sst_thread(
 ///   - `RowAppendReq`: row_stream.append only (from compaction on P-log)
 ///
 /// The cap is deliberately small (default 2, env
-/// `AUTUMN_PS_SST_INFLIGHT_CAP`) because each in-flight item holds a
+/// `--ps-bulk-inflight-cap`) because each in-flight item holds a
 /// full SSTable buffer in RAM.
 async fn flush_worker_loop(
     sst_sc: Rc<StreamClient>,
@@ -12407,164 +12299,6 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod env_knob_tests {
-    // `max_write_batch()` uses OnceLock and can only be initialized once per
-    // process. We test the underlying parsing logic by inlining the same
-    // expression, so the test does not depend on init order.
-    fn parse_env(raw: Option<&str>) -> usize {
-        raw.and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0 && n <= 1_000_000)
-            .unwrap_or(super::DEFAULT_MAX_WRITE_BATCH)
-    }
-
-    #[test]
-    fn default_when_unset() {
-        assert_eq!(parse_env(None), super::DEFAULT_MAX_WRITE_BATCH);
-    }
-
-    #[test]
-    fn parses_positive_in_range() {
-        assert_eq!(parse_env(Some("8192")), 8192);
-    }
-
-    #[test]
-    fn rejects_zero() {
-        assert_eq!(parse_env(Some("0")), super::DEFAULT_MAX_WRITE_BATCH);
-    }
-
-    #[test]
-    fn rejects_negative() {
-        assert_eq!(parse_env(Some("-1")), super::DEFAULT_MAX_WRITE_BATCH);
-    }
-
-    #[test]
-    fn rejects_too_large() {
-        assert_eq!(
-            parse_env(Some("999999999999")),
-            super::DEFAULT_MAX_WRITE_BATCH
-        );
-    }
-
-    #[test]
-    fn rejects_garbage() {
-        assert_eq!(parse_env(Some("abc")), super::DEFAULT_MAX_WRITE_BATCH);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// env-knob parsing tests (mirrors env_knob_tests' "inline parse"
-// strategy because OnceLock prevents re-initialisation in-process).
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-mod knob_tests {
-    fn parse_imm_depth(raw: Option<&str>) -> usize {
-        raw.and_then(|s| s.parse::<usize>().ok())
-            .map(|n| n.clamp(1, 64))
-            .unwrap_or(4)
-    }
-
-    fn parse_wal_gap(raw: Option<&str>) -> u64 {
-        const DEFAULT: u64 = 2 * 1024 * 1024 * 1024;
-        const MIN: u64 = 128 * 1024 * 1024;
-        const MAX: u64 = 64 * 1024 * 1024 * 1024;
-        raw.and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n.clamp(MIN, MAX))
-            .unwrap_or(DEFAULT)
-    }
-
-    fn parse_shutdown_timeout(raw: Option<&str>) -> u64 {
-        raw.and_then(|s| s.parse::<u64>().ok())
-            .map(|n| n.clamp(1_000, 600_000))
-            .unwrap_or(60_000)
-    }
-
-    #[test]
-    fn imm_depth_default() {
-        assert_eq!(parse_imm_depth(None), 4);
-    }
-
-    #[test]
-    fn imm_depth_clamped_low() {
-        assert_eq!(parse_imm_depth(Some("0")), 1);
-    }
-
-    #[test]
-    fn imm_depth_clamped_high() {
-        assert_eq!(parse_imm_depth(Some("999")), 64);
-    }
-
-    #[test]
-    fn imm_depth_in_range() {
-        assert_eq!(parse_imm_depth(Some("8")), 8);
-    }
-
-    #[test]
-    fn wal_gap_default_is_2gib() {
-        assert_eq!(parse_wal_gap(None), 2 * 1024 * 1024 * 1024);
-    }
-
-    #[test]
-    fn wal_gap_clamped_low() {
-        // 1 KiB → clamped up to 128 MiB minimum.
-        assert_eq!(parse_wal_gap(Some("1024")), 128 * 1024 * 1024);
-    }
-
-    #[test]
-    fn wal_gap_clamped_high() {
-        // 1 TiB → clamped down to 64 GiB maximum.
-        let one_tib: u64 = 1024 * 1024 * 1024 * 1024;
-        assert_eq!(
-            parse_wal_gap(Some(&one_tib.to_string())),
-            64 * 1024 * 1024 * 1024,
-        );
-    }
-
-    #[test]
-    fn shutdown_timeout_default() {
-        assert_eq!(parse_shutdown_timeout(None), 60_000);
-    }
-
-    #[test]
-    fn shutdown_timeout_clamped_low() {
-        // 100 ms is below 1 s minimum.
-        assert_eq!(parse_shutdown_timeout(Some("100")), 1_000);
-    }
-
-    #[test]
-    fn shutdown_timeout_clamped_high() {
-        // 1 hour is above 10 min maximum.
-        assert_eq!(parse_shutdown_timeout(Some("3600000")), 600_000);
-    }
-
-    /// Drives the actual `max_imm_depth()` once via OnceLock — proves the
-    /// runtime path returns a value in range without exploding. Subsequent
-    /// reads are cached so this is a smoke test, not a per-env-value test.
-    #[test]
-    fn live_max_imm_depth_in_range() {
-        let v = super::max_imm_depth();
-        assert!((1..=64).contains(&v), "imm_depth out of range: {v}");
-    }
-
-    #[test]
-    fn live_max_wal_gap_in_range() {
-        let v = super::max_wal_gap();
-        assert!(
-            (128 * 1024 * 1024..=64 * 1024 * 1024 * 1024).contains(&v),
-            "wal_gap out of range: {v}",
-        );
-    }
-
-    #[test]
-    fn live_shutdown_timeout_in_range() {
-        let v = super::shutdown_timeout_ms();
-        assert!(
-            (1_000..=600_000).contains(&v),
-            "shutdown_timeout_ms out of range: {v}"
-        );
-    }
-}
-
 // imm-pop signal flow is validated by:
 //   - The manager crate's graceful-shutdown integration test
 //     (graceful drain end-to-end exercises rotate → imm push → P-sst
@@ -13757,17 +13491,10 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
         });
     }
 
-    /// test 3 — Back-pressure at cap.  The env knob
-    /// `AUTUMN_PS_CONN_INFLIGHT_CAP` lowers the cap so we can exercise the
-    /// back-pressure branch in `push_frames_to_inflight`.  We set cap to 4,
-    /// fire 100 frames in one write, and verify: (a) every frame completes
+    /// test 3 — Back-pressure at cap. The default `--conn-inflight-cap` is
+    /// 4; fire 100 frames in one write and verify: (a) every frame completes
     /// correctly, (b) the merged_loop never observes more than `cap` reqs
     /// simultaneously in-flight.
-    ///
-    /// Because `ps_conn_inflight_cap` caches via OnceLock on first call,
-    /// we spin up the whole test in a subprocess-like isolated runtime
-    /// (a fresh thread) so the OnceLock init picks up our env override
-    /// without interfering with parallel tests.
     #[test]
     fn backpressure_at_cap() {
         const CAP: usize = 4;
@@ -13778,25 +13505,14 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
         // tests in this module.
         let _g = fast_path_counter_lock();
 
-        // Run in a dedicated thread with the env var set BEFORE the
-        // OnceLock is initialised.
+        // Run in a dedicated thread with its own runtime.
         let handle = std::thread::Builder::new()
             .name("batch-bp".to_string())
             .spawn(move || {
-                // SAFETY: single-threaded isolation by virtue of the
-                // OnceLock cache being per-process but initialised lazily
-                // here before any other ps_conn_inflight_cap() caller.
-                std::env::set_var("AUTUMN_PS_CONN_INFLIGHT_CAP", CAP.to_string());
-
                 let rt = compio::runtime::Runtime::new().unwrap();
                 rt.block_on(async move {
-                    // Sanity-check that our override got picked up. If
-                    // another test already triggered the OnceLock with a
-                    // different cap, we skip this assertion and let the
-                    // main body still exercise correctness under whatever
-                    // cap is in force (the stream of 100 frames still
-                    // completes; just the peak-concurrency assertion
-                    // becomes weaker).
+                    // The peak-concurrency assertion below holds at whatever
+                    // cap is in force.
                     let effective_cap = ps_conn_inflight_cap();
 
                     let listener = compio::net::TcpListener::bind("127.0.0.1:0")
@@ -14322,7 +14038,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             });
             let tail: Vec<u8> = values.concat();
             assert!(
-                tail.len() > AUTUMN_PS_BULK_RECV_MIN_BYTES,
+                tail.len() > params().bulk_recv_min_bytes.get(),
                 "the tail must clear the threshold or this tests nothing"
             );
 

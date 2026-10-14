@@ -569,7 +569,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     // with the python BatchClient + `get_many_into` via `bulk_worthwhile`:
     // engage bulk iff value >= 64 KiB, for BOTH reads and writes and BOTH
     // transports. Mirrors the PS recv gates (client BULK_MIN_BYTES +
-    // PS AUTUMN_PS_BULK_RECV_MIN_BYTES, both 64 KiB): below 64 KiB the per-op
+    // PS --bulk-recv-min-bytes, both 64 KiB): below 64 KiB the per-op
     // registered/pooled-recv machinery exceeds the copy saved (small UCX read
     // -18%) and the PS recv doesn't bulk anyway. (An earlier asymmetric WRITE
     // rule `is_ucx || large` later dropped its `is_ucx ||` term — small UCX writes only

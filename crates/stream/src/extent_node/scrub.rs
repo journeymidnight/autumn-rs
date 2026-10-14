@@ -115,8 +115,10 @@ impl ExtentNode {
         self.scrub_worker_running.set(true);
         let node = self.clone();
         compio::runtime::spawn(async move {
-            let mut pacer = extent_scrub::ScrubPacer::new(node.scrub_bytes_per_sec);
+            let rate = || super::en_params().scrub_bytes_per_sec.get();
+            let mut pacer = extent_scrub::ScrubPacer::new(rate());
             loop {
+                pacer.set_rate(rate());
                 // Pop under a borrow that ends with this statement: the task
                 // below awaits, and new requests push while it does.
                 let next = {

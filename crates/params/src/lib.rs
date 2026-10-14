@@ -72,7 +72,7 @@ macro_rules! unsigned_value {
         }
     )*};
 }
-unsigned_value!(u16, u32, u64, usize);
+unsigned_value!(u8, u16, u32, u64, usize);
 
 impl Value for i64 {
     fn parse(s: &str) -> Result<Self, String> {
@@ -192,8 +192,16 @@ impl Spec {
     }
 }
 
+/// Checks that span several parameters of one struct. Every parameter struct
+/// implements it (most with the empty default).
+pub trait CrossCheck {
+    fn cross_check(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 /// What the `params!` macro implements for every parameter struct.
-pub trait Params: Sync {
+pub trait Params: Sync + CrossCheck {
     /// Role name, the prefix of a runtime key (`ps.fg-rate-bytes-per-sec`).
     const ROLE: &'static str;
     fn specs() -> &'static [Spec];
@@ -259,8 +267,28 @@ pub fn runtime_spec<P: Params>(key: &str) -> Option<&'static Spec> {
 /// every other runtime parameter of `P` goes back to its startup value.
 /// Returns one message per entry that could not be applied (a key this binary
 /// does not know, or a value it rejects); the rest still apply, and a field
-/// whose value is rejected keeps what it had.
+/// whose value is rejected keeps what it had. A set that leaves the struct
+/// failing its `CrossCheck` is not applied at all.
 pub fn apply_overrides<P: Params>(p: &P, entries: &[(String, String)]) -> Vec<String> {
+    let before: Vec<(&'static str, String)> = P::specs()
+        .iter()
+        .filter(|s| s.runtime)
+        .filter_map(|s| p.get_str(s.field).map(|v| (s.field, v)))
+        .collect();
+    let mut errs = apply_entries(p, entries);
+    if let Err(e) = p.cross_check() {
+        for (field, value) in &before {
+            // The values were accepted once and round-trip exactly.
+            if let Some(Err(e)) = p.override_str(field, Some(value)) {
+                errs.push(format!("{}.{field}: restoring {value}: {e}", P::ROLE));
+            }
+        }
+        errs.push(format!("{}: override set refused: {e}", P::ROLE));
+    }
+    errs
+}
+
+fn apply_entries<P: Params>(p: &P, entries: &[(String, String)]) -> Vec<String> {
     let mut errs = Vec::new();
     let mut seen: Vec<&'static str> = Vec::new();
     for (key, value) in entries {
@@ -395,6 +423,16 @@ mod tests {
             /// A rate.
             [runtime] rate_bytes_per_sec: u64 = 64 * MIB, [0, u64::MAX];
             [runtime] ratio: f64 = 0.8, [0.0, 1.0];
+            [runtime] floor: u64 = 1, [0, 100];
+        }
+    }
+
+    impl CrossCheck for T {
+        fn cross_check(&self) -> Result<(), String> {
+            if self.floor.get() > self.rate_bytes_per_sec.get() {
+                return Err("floor above rate".into());
+            }
+            Ok(())
         }
     }
 
@@ -452,6 +490,13 @@ mod tests {
         let errs = apply_overrides(&t, &[("t.ratio".into(), "7".into())]);
         assert_eq!(errs.len(), 1, "{errs:?}");
         assert_eq!(t.ratio.get(), 0.5);
+        // A set failing the cross-field check is not applied at all.
+        let errs = apply_overrides(
+            &t,
+            &[("t.rate-bytes-per-sec".into(), "2".into()), ("t.floor".into(), "50".into())],
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert_eq!((t.rate_bytes_per_sec.get(), t.floor.get(), t.ratio.get()), (32 * MIB, 1, 0.5));
         assert!(runtime_spec::<T>("t.count").is_none());
         assert!((runtime_spec::<T>("t.ratio").unwrap().check)("0.5").is_ok());
     }

@@ -72,32 +72,11 @@ struct Args {
     /// `control_port + shard_idx * shard_stride`. Operators only need
     /// to override this when 1000 collides on a non-default deployment.
     control_port: Option<u16>,
-    /// (was env `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM`).
-    /// Default 1; clamped to [1, 16] by library.
-    ec_convert_parallelism: Option<usize>,
-    /// (was env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`).
-    /// Default 2; clamped to [1, 16] by library.
-    recovery_parallelism: Option<usize>,
-    /// (was env `AUTUMN_EXTENT_INFLIGHT_CAP`). Default 64.
-    inflight_cap: Option<usize>,
-    /// Chunked EC-convert stripe size (bytes). `None` = library default
-    /// (64 MiB). Peak EC-convert RAM = `(K+M) × stripe`. Clamped to
-    /// [1 MiB, 1 GiB] by the library.
-    ec_stripe_bytes: Option<usize>,
-    /// max resident SEALED-extent fds cached per shard. `None` =
-    /// library default (4096). Bounds open fds on a node with many extents.
-    fd_cache_cap: Option<usize>,
     /// Append bursts of 1 MiB and more bypass the page cache for their aligned
     /// part. On by default on Linux (off elsewhere, where there is no O_DIRECT
     /// path); `--no-direct-io` turns it off. While on, startup fails if any
     /// data dir's filesystem refuses O_DIRECT.
     direct_io: bool,
-    /// How much a scrub may read per second, per shard (`--scrub-bytes-per-sec`;
-    /// `None` = library default, 8 MiB/s; `0` = unpaced).
-    scrub_bytes_per_sec: Option<u64>,
-    /// Per-thread regpool cap (pinned/registered bytes). `None` = library
-    /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB].
-    ucx_regpool_cap_bytes: Option<usize>,
     /// Prometheus `/metrics` port. `None` = `--port` + 500; 0 = no endpoint.
     /// One endpoint per PROCESS (shard gauges are aggregated by the renderer).
     metrics_port: Option<u16>,
@@ -113,6 +92,29 @@ struct Args {
     /// a fresh pod IP is picked up automatically. When unset, the EN relies on
     /// the location `autumn-op format` stamped (the pre-M1 behavior).
     advertise: Option<String>,
+}
+
+fn usage() -> String {
+    format!(
+        "usage: autumn-extent-node --cluster-secret-file <PATH> --data <DIR[,DIR...]> [options]\n\
+         \n\
+         \x20 --data <dirs>               formatted data dirs (autumn-op format), comma-separated or repeated\n\
+         \x20 --port <n>                  shard 0 data port (default 9101)\n\
+         \x20 --shard-stride <n>          port stride between shards (default 10)\n\
+         \x20 --control-port <n>          control port of shard 0 (default port+1000)\n\
+         \x20 --manager <a,b,...>         manager endpoints (requires --advertise)\n\
+         \x20 --advertise <ip:port>       location announced to the manager\n\
+         \x20 --listen <host>             bind host (default 0.0.0.0)\n\
+         \x20 --transport tcp|ucx\n\
+         \x20 --cpuset <spec>             cores; shard count = number of cores\n\
+         \x20 --cpu-start <n>             first core (exclusive with --cpuset)\n\
+         \x20 --no-direct-io              no O_DIRECT for large append bursts\n\
+         \x20 --metrics-port <n>          /metrics port (default port+500, 0 = off)\n\
+         \x20 --metrics-listen <host>     /metrics bind host (default --listen)\n\
+         \n\
+         parameters:\n{}",
+        autumn_params::help::<autumn_params::en::EnParams>()
+    )
 }
 
 fn parse_args() -> Args {
@@ -132,21 +134,18 @@ fn parse_args() -> Args {
     let mut control_port: Option<u16> = None;
     let mut metrics_port: Option<u16> = None;
     let mut metrics_listen: Option<String> = None;
-    // parallelism + inflight-cap knobs as Option<usize>; library defaults when None.
-    let mut ec_convert_parallelism: Option<usize> = None;
-    let mut recovery_parallelism: Option<usize> = None;
-    let mut inflight_cap: Option<usize> = None;
-    let mut ec_stripe_bytes: Option<usize> = None;
-    let mut fd_cache_cap: Option<usize> = None;
     let mut direct_io = cfg!(target_os = "linux");
-    let mut scrub_bytes_per_sec: Option<u64> = None;
-    let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut advertise: Option<String> = None;
+    let params = autumn_stream::en_params();
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
             "--cluster-secret-file" => {
                 i += 1;
                 cluster_secret_file = Some(PathBuf::from(&args[i]));
@@ -224,47 +223,7 @@ fn parse_args() -> Args {
                 i += 1;
                 control_port = Some(args[i].parse().expect("--control-port must be a number"));
             }
-            "--ec-convert-parallelism" => {
-                i += 1;
-                ec_convert_parallelism = Some(
-                    args[i]
-                        .parse()
-                        .expect("--ec-convert-parallelism must be a number"),
-                );
-            }
-            "--recovery-parallelism" => {
-                i += 1;
-                recovery_parallelism = Some(
-                    args[i]
-                        .parse()
-                        .expect("--recovery-parallelism must be a number"),
-                );
-            }
-            "--inflight-cap" => {
-                i += 1;
-                inflight_cap = Some(args[i].parse().expect("--inflight-cap must be a number"));
-            }
-            "--ec-stripe-bytes" => {
-                i += 1;
-                ec_stripe_bytes =
-                    Some(args[i].parse().expect("--ec-stripe-bytes must be a number"));
-            }
             "--no-direct-io" => direct_io = false,
-            "--scrub-bytes-per-sec" => {
-                i += 1;
-                scrub_bytes_per_sec =
-                    Some(args[i].parse().expect("--scrub-bytes-per-sec must be a number"));
-            }
-            "--fd-cache-cap" => {
-                i += 1;
-                fd_cache_cap =
-                    Some(args[i].parse().expect("--fd-cache-cap must be a number"));
-            }
-            "--ucx-regpool-cap-bytes" => {
-                i += 1;
-                ucx_regpool_cap_bytes =
-                    Some(args[i].parse().expect("--ucx-regpool-cap-bytes usize"));
-            }
             "--metrics-port" => {
                 i += 1;
                 metrics_port = Some(args[i].parse().expect("--metrics-port must be a port"));
@@ -277,11 +236,25 @@ fn parse_args() -> Args {
                 i += 1;
                 advertise = Some(args[i].clone());
             }
-            other => eprintln!("unknown arg: {other}"),
+            other => match autumn_params::take_flag(params, other, args.get(i + 1).map(|s| s.as_str())) {
+                Ok(autumn_params::Flag::Taken) => i += 1,
+                Ok(autumn_params::Flag::Unknown) => {
+                    eprintln!("error: unknown argument {other:?}\n\n{}", usage());
+                    std::process::exit(2);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
         }
         i += 1;
     }
 
+    if let Err(e) = autumn_params::CrossCheck::cross_check(params) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     if data_dirs.is_empty() {
         data_dirs.push(PathBuf::from("/tmp/autumn-extent"));
     }
@@ -305,39 +278,11 @@ fn parse_args() -> Args {
         cpu_start,
         cpuset,
         control_port,
-        ec_convert_parallelism,
-        recovery_parallelism,
-        inflight_cap,
-        ec_stripe_bytes,
-        fd_cache_cap,
         direct_io,
-        scrub_bytes_per_sec,
-        ucx_regpool_cap_bytes,
         metrics_port,
         metrics_listen,
         advertise,
     }
-}
-
-/// helper — apply the parallelism / inflight-cap CLI flags to an ExtentNodeConfig.
-/// `None` means "library default" and skips the builder call.
-fn apply_extent_tunables(
-    mut cfg: autumn_stream::ExtentNodeConfig,
-    args: &Args,
-) -> autumn_stream::ExtentNodeConfig {
-    if let Some(n) = args.ec_convert_parallelism {
-        cfg = cfg.with_ec_convert_parallelism(n);
-    }
-    if let Some(n) = args.recovery_parallelism {
-        cfg = cfg.with_recovery_parallelism(n);
-    }
-    if let Some(n) = args.inflight_cap {
-        cfg = cfg.with_inflight_cap(n);
-    }
-    if let Some(n) = args.scrub_bytes_per_sec {
-        cfg = cfg.with_scrub_bytes_per_sec(n);
-    }
-    cfg.with_direct_io(args.direct_io)
 }
 
 /// async manager cross-check. Connects to the manager once,
@@ -653,26 +598,11 @@ fn main() -> Result<()> {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
-    // Apply the EC-convert stripe size (process-global, first-call-wins) before
-    // any shard runs an EC convert. Flag > env > 64 MiB default.
-    if let Some(n) = args.ec_stripe_bytes {
-        if !autumn_stream::set_ec_encode_stripe_bytes(n) {
-            tracing::warn!(n, "ec-stripe-bytes already set (ignored — first-call-wins)");
-        }
-    }
-    // apply the sealed-extent fd-cache cap (process-global,
-    // first-call-wins) before ExtentNode::new opens extents.
-    if let Some(n) = args.fd_cache_cap {
-        if !autumn_stream::set_fd_cache_cap(n) {
-            tracing::warn!(n, "fd-cache-cap already set (ignored — first-call-wins)");
-        }
-    }
     // Apply regpool cap BEFORE init_with so the first transport-touch (and
     // thus first TLS pool init) reads the operator's setting.
-    if let Some(cap) = args.ucx_regpool_cap_bytes {
-        if !autumn_transport::set_regpool_cap_bytes(cap) {
-            tracing::warn!(cap, "regpool cap already set (ignored — first-call-wins)");
-        }
+    let regpool_cap = autumn_stream::en_params().ucx_regpool_cap_bytes.get();
+    if !autumn_transport::set_regpool_cap_bytes(regpool_cap) {
+        tracing::warn!(regpool_cap, "regpool cap already set (ignored — first-call-wins)");
     }
     let _ = autumn_transport::init_with(args.transport);
 
@@ -900,12 +830,7 @@ fn main() -> Result<()> {
         let reg_control_base = advertise_control_base;
         let reg_transport = args.transport;
         let reg_metrics_addr = metrics_reach.clone();
-        // capture parallelism / inflight-cap tunable overrides for the thread.
-        let ec_par = args.ec_convert_parallelism;
-        let rec_par = args.recovery_parallelism;
-        let inflight = args.inflight_cap;
         let direct_io = args.direct_io;
-        let scrub_rate = args.scrub_bytes_per_sec;
         let bound_tx = bound_tx.clone();
         // Fail-stop: any shard exit (Err / panic / unexpected clean return)
         // calls `std::process::exit(1)` directly. The join loop below is
@@ -998,20 +923,7 @@ fn main() -> Result<()> {
                         if shard_idx == 0 {
                             cfg = cfg.with_metrics_addr(reg_metrics_addr);
                         }
-                        // per-shard tunables.
-                        if let Some(n) = ec_par {
-                            cfg = cfg.with_ec_convert_parallelism(n);
-                        }
-                        if let Some(n) = rec_par {
-                            cfg = cfg.with_recovery_parallelism(n);
-                        }
-                        if let Some(n) = inflight {
-                            cfg = cfg.with_inflight_cap(n);
-                        }
                         cfg = cfg.with_direct_io(direct_io);
-                        if let Some(n) = scrub_rate {
-                            cfg = cfg.with_scrub_bytes_per_sec(n);
-                        }
 
                         let node = ExtentNode::new(cfg)
                             .await
@@ -1136,8 +1048,7 @@ fn run_single_shard(args: Args, stamped_cluster_id: String, metrics_addr: String
         if let Some((nu, adv, ports)) = reg_for_cfg {
             config = config.with_registration(nu, adv, ports).with_metrics_addr(metrics_addr);
         }
-        // parallelism / inflight-cap tunables.
-        let config = apply_extent_tunables(config, &args);
+        let config = config.with_direct_io(args.direct_io);
 
         let node = ExtentNode::new(config).await.context("create ExtentNode")?;
         node.serve_with_control(addr, ctl_addr, || {

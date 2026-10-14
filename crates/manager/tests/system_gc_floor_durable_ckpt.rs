@@ -74,13 +74,12 @@ async fn log_extent_ids(sc: &StreamClient, log: u64) -> Vec<u64> {
 #[test]
 #[ignore = "heavy: writes >1 GiB to roll a log extent + GC scans ~1 GiB (~1-2 min)"]
 fn gc_floor_raise_reclaims_min_extent_and_loses_nothing() {
-    // Roll a fresh log extent at 1 GiB (the smallest the PS setter allows). Set
-    // once, BEFORE any partition opens (OnceLock; this is the only test in the
-    // binary so it wins uncontended).
-    assert!(
-        autumn_partition_server::set_max_extent_size_bytes(1024 * 1024 * 1024),
-        "set_max_extent_size_bytes must win the OnceLock before any PS start"
-    );
+    // Roll a fresh log extent at 1 GiB (the smallest `--max-extent-size-bytes`
+    // allows), set BEFORE any partition opens: the stream client reads it at
+    // open.
+    autumn_partition_server::params()
+        .max_extent_size_bytes
+        .set(1024 * 1024 * 1024);
 
     // The red-without-the-raise case needs the cold SST to stay its own table
     // (its vp_head anchors the MIN floor at E0); a minor would merge it.

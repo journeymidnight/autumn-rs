@@ -10,11 +10,10 @@
 //!   rule skips big tables) pins its extent and everything after it.
 
 use std::ops::Range;
-use std::sync::OnceLock;
 
 use crate::TableMeta;
 
-/// `autumn-ps --compact-*` knobs. Defaults are HBase's
+/// `autumn-ps --compact-*` runtime parameters. Defaults are HBase's
 /// (`hbase.hstore.compaction.{min,max,ratio,min.size}`,
 /// `hbase.hstore.blockingStoreFiles`), except `min_size`: HBase uses the
 /// flush size because its flushes produce files that big; here a flush SST
@@ -41,53 +40,29 @@ pub struct MinorPolicy {
     pub blocking_files: usize,
 }
 
-impl Default for MinorPolicy {
-    fn default() -> Self {
+impl MinorPolicy {
+    pub fn from_params(p: &autumn_params::ps::PsParams) -> Self {
         Self {
-            min_files: 3,
-            max_files: 10,
-            ratio: 1.2,
-            min_size: 1024 * 1024,
-            large_size: 128 * 1024 * 1024,
-            blocking_files: 16,
+            min_files: p.compact_min_files.get(),
+            max_files: p.compact_max_files.get(),
+            ratio: p.compact_ratio.get(),
+            min_size: p.compact_min_size_bytes.get(),
+            large_size: p.compact_large_size_bytes.get(),
+            blocking_files: p.compact_blocking_files.get(),
         }
     }
 }
 
-static MINOR_POLICY: OnceLock<MinorPolicy> = OnceLock::new();
-
-/// Set the minor-compaction policy (first call wins).
-pub fn set_minor_policy(p: MinorPolicy) -> Result<(), String> {
-    if p.min_files < 2 {
-        return Err(format!("min files {} must be at least 2", p.min_files));
+impl Default for MinorPolicy {
+    fn default() -> Self {
+        Self::from_params(&autumn_params::ps::PsParams::default())
     }
-    if p.max_files < p.min_files {
-        return Err(format!("max files {} below min files {}", p.max_files, p.min_files));
-    }
-    if p.large_size == 0 {
-        return Err("large size must be positive".to_string());
-    }
-    if !(p.ratio > 0.0 && p.ratio.is_finite()) {
-        return Err(format!("ratio {} must be positive", p.ratio));
-    }
-    if p.blocking_files < p.min_files {
-        return Err(format!(
-            "blocking files {} below min files {}",
-            p.blocking_files, p.min_files
-        ));
-    }
-    MINOR_POLICY
-        .set(p)
-        .map_err(|_| "minor compaction policy already set".to_string())
 }
 
+/// Read on every selection, so a runtime override applies at the next tick.
 pub(crate) fn minor_policy() -> MinorPolicy {
-    *MINOR_POLICY.get_or_init(MinorPolicy::default)
+    MinorPolicy::from_params(crate::params())
 }
-
-/// A rewrite reclaims the head extent once its live tables are below this
-/// share of its sealed bytes: it rewrites < 30% to free > 70%.
-pub(crate) const RECLAIM_LIVE_PERCENT: u64 = 30;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MinorPick {
@@ -187,7 +162,8 @@ fn is_better(best: Option<&(Range<usize>, u64)>, len: usize, size: u64, might_be
 /// listed table through its last, at most `max_files`. A window may hold
 /// tables of other extents in between (it must be contiguous) and may be a
 /// single table. `None` while the head's live tables (their SST bytes) are at
-/// least `RECLAIM_LIVE_PERCENT` of it, or it holds none (the truncate after
+/// least `--compact-reclaim-live-percent` (30: rewrite < 30% to free > 70%)
+/// of it, or it holds none (the truncate after
 /// any compaction drops it then).
 pub(crate) fn select_reclaim(
     tables: &[TableMeta],
@@ -200,7 +176,8 @@ pub(crate) fn select_reclaim(
         .filter(|t| t.extent_id == head)
         .map(|t| t.len)
         .sum();
-    if live == 0 || live.saturating_mul(100) >= head_sealed_len.saturating_mul(RECLAIM_LIVE_PERCENT) {
+    let live_percent = crate::params().compact_reclaim_live_percent.get();
+    if live == 0 || live.saturating_mul(100) >= head_sealed_len.saturating_mul(live_percent) {
         return None;
     }
     let first = tables.iter().position(|t| t.extent_id == head)?;
@@ -345,12 +322,17 @@ mod tests {
 
     #[test]
     fn policy_validation() {
-        let ok = MinorPolicy::default();
-        assert!(set_minor_policy(MinorPolicy { min_files: 1, ..ok }).is_err());
-        assert!(set_minor_policy(MinorPolicy { max_files: 2, ..ok }).is_err());
-        assert!(set_minor_policy(MinorPolicy { ratio: 0.0, ..ok }).is_err());
-        assert!(set_minor_policy(MinorPolicy { blocking_files: 2, ..ok }).is_err());
-        assert!(set_minor_policy(MinorPolicy { large_size: 0, ..ok }).is_err());
+        use autumn_params::take_flag;
+        let bad = |flag: &str, v: &str| {
+            let p = autumn_params::ps::PsParams::default();
+            take_flag(&p, flag, Some(v)).is_err() || autumn_params::CrossCheck::cross_check(&p).is_err()
+        };
+        assert!(bad("--compact-min-files", "1"));
+        assert!(bad("--compact-max-files", "2"));
+        assert!(bad("--compact-ratio", "0"));
+        assert!(bad("--compact-blocking-files", "2"));
+        assert!(bad("--compact-large-size-bytes", "0"));
+        assert!(!bad("--compact-max-files", "3"));
     }
 
     #[test]

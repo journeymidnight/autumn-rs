@@ -2,6 +2,7 @@ use crate::conn_pool::{parse_addr, shard_addr_for_extent};
 use crate::extent_cksum;
 use crate::extent_rpc::*;
 use crate::extent_scrub;
+use autumn_params::en::EnParams;
 use autumn_rpc::manager_rpc::{self, MgrExtentInfo};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -19,9 +20,13 @@ use std::time::{Duration, Instant};
 /// refused by `claim_ec_staging`.
 const EC_STAGING_SEALED: u64 = u64::MAX;
 
-/// Period of the orphan reconcile after the startup round. Public so a test
-/// that waits for the sweep to collect residue derives its bound from here.
-pub const RECONCILE_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+/// Every extent-node tunable (`autumn_params::en`), shared by all shards of
+/// the process. Readers call `en_params().x.get()` where they need the value,
+/// so a runtime override lands on the next read.
+pub fn en_params() -> &'static EnParams {
+    static PARAMS: std::sync::LazyLock<EnParams> = std::sync::LazyLock::new(EnParams::default);
+    &PARAMS
+}
 
 /// What this node knows about EC staging for one extent.
 ///
@@ -69,20 +74,11 @@ use std::rc::Rc;
 
 // ─── Per-extent fallocate prealloc (opt-in) ──────────────────────────────────
 
-/// Read `AUTUMN_EN_PREALLOC_BYTES`: when set to a positive integer N, every
-/// freshly-created extent calls `fallocate(KEEP_SIZE, 0, N)` so the underlying
-/// disk blocks are pre-reserved (saves ext4 extent-tree updates + per-grow
-/// journal entries on subsequent appends). Default 0 = disabled, matching
-/// pre-change behaviour. Cached via OnceLock to avoid env-read overhead in
-/// the hot extent-creation path.
+/// `--prealloc-bytes`: when positive, every freshly-created extent calls
+/// `fallocate(KEEP_SIZE, 0, N)` so the disk blocks are pre-reserved (saves ext4
+/// extent-tree updates + per-grow journal entries on later appends).
 fn en_prealloc_bytes() -> u64 {
-    static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *CELL.get_or_init(|| {
-        std::env::var("AUTUMN_EN_PREALLOC_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0)
-    })
+    en_params().prealloc_bytes.get()
 }
 
 // ─── Per-node append metrics ─────────────────────────────────────────────────
@@ -578,7 +574,7 @@ impl DiskFS {
     /// Bound the whole probe, including open/unlink/write/file and directory
     /// fsync. A stuck device must not stall the caller's error handling.
     async fn probe_write(&self, extent_id: u64) -> Result<(), DiskProbeError> {
-        let deadline = Duration::from_secs(2);
+        let deadline = Duration::from_millis(en_params().disk_probe_timeout_ms.get());
         compio::time::timeout(deadline, self.probe_write_inner(extent_id))
             .await
             .map_err(|_| DiskProbeError::Timeout(deadline))??;
@@ -953,20 +949,6 @@ pub struct ExtentNodeConfig {
     /// require_recovery) to forward a mismatched extent_id to the
     /// owning sibling shard via localhost loopback.
     pub sibling_addrs: Vec<String>,
-    /// (was env `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM`):
-    /// cross-extent cap on concurrent `handle_convert_to_ec` heavy
-    /// paths. Default 1 = fully serialise. Clamped to [1, 16].
-    pub ec_convert_parallelism: usize,
-    /// (was env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`):
-    /// cross-extent cap on concurrent `run_recovery_task` heavy paths.
-    /// Default 2 (repair work — some concurrency speeds post-failure
-    /// convergence). Clamped to [1, 16].
-    pub recovery_parallelism: usize,
-    /// (was env `AUTUMN_EXTENT_INFLIGHT_CAP`): per-conn
-    /// FuturesUnordered cap for the connection-task SQ/CQ loop. Caps
-    /// the per-client memory footprint at `cap × avg-frame`. Default
-    /// 64 matches the historical env default.
-    pub inflight_cap: usize,
     /// M1b: this EN's own identity to echo in `handle_df`.
     /// `None` = not self-registered (`--advertise` unset) → the manager skips
     /// the echo-based drift-heal / imposter checks.
@@ -978,8 +960,6 @@ pub struct ExtentNodeConfig {
     /// including one built with `ExtentNodeConfig::new`, which reads no
     /// `disk_id`, so a caller turning this on there must write one.
     pub direct_io: bool,
-    /// How much a scrub may read per second on this shard (`0` = unpaced).
-    pub scrub_bytes_per_sec: u64,
 }
 
 impl ExtentNodeConfig {
@@ -991,12 +971,8 @@ impl ExtentNodeConfig {
             shard_idx: 0,
             shard_count: 1,
             sibling_addrs: Vec::new(),
-            ec_convert_parallelism: 1,
-            recovery_parallelism: 2,
-            inflight_cap: 64,
             registration: None,
             direct_io: false,
-            scrub_bytes_per_sec: extent_scrub::SCRUB_DEFAULT_BYTES_PER_SEC,
         }
     }
 
@@ -1009,43 +985,14 @@ impl ExtentNodeConfig {
             shard_idx: 0,
             shard_count: 1,
             sibling_addrs: Vec::new(),
-            ec_convert_parallelism: 1,
-            recovery_parallelism: 2,
-            inflight_cap: 64,
             registration: None,
             direct_io: false,
-            scrub_bytes_per_sec: extent_scrub::SCRUB_DEFAULT_BYTES_PER_SEC,
         }
-    }
-
-    /// EC convert parallelism setter. Clamped to [1, 16].
-    pub fn with_ec_convert_parallelism(mut self, n: usize) -> Self {
-        self.ec_convert_parallelism = n.clamp(1, 16);
-        self
-    }
-
-    /// recovery parallelism setter. Clamped to [1, 16].
-    pub fn with_recovery_parallelism(mut self, n: usize) -> Self {
-        self.recovery_parallelism = n.clamp(1, 16);
-        self
-    }
-
-    /// See the `scrub_bytes_per_sec` field.
-    pub fn with_scrub_bytes_per_sec(mut self, bytes_per_sec: u64) -> Self {
-        self.scrub_bytes_per_sec = bytes_per_sec;
-        self
     }
 
     /// See the `direct_io` field.
     pub fn with_direct_io(mut self, on: bool) -> Self {
         self.direct_io = on;
-        self
-    }
-
-    /// per-conn inflight cap setter. Must be > 0; falls
-    /// back to default 64 on 0.
-    pub fn with_inflight_cap(mut self, n: usize) -> Self {
-        self.inflight_cap = if n == 0 { 64 } else { n };
         self
     }
 
@@ -1495,20 +1442,9 @@ impl ExtentEntry {
 /// extents are pinned (NOT counted here), so the process fd ceiling is
 /// `fd_cache_cap + Σ(open tails) + sockets`. Default 4096 — well under the
 /// raised RLIMIT_NOFILE (65535) with room for open tails + TCP
-/// conns. Set via `--fd-cache-cap` (binary); OnceLock first-call-wins, env-free
-/// per the project's no-env-in-Rust rule (the shell maps env→flag).
-static FD_CACHE_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// conns (`--fd-cache-cap`; floored at 64: a tiny cache would churn).
 fn fd_cache_cap() -> usize {
-    FD_CACHE_CAP_CELL.get().copied().unwrap_or(4096)
-}
-
-/// Binary override for `fd_cache_cap` (first-call-wins, returns false if already
-/// set). The extent-node binary calls this from CLI parsing before
-/// `ExtentNode::new`. Mirrors `set_ec_encode_stripe_bytes`. Floored at 64: a
-/// tiny cache would churn (and, historically, widened the now-closed
-/// seal-transition eviction window).
-pub fn set_fd_cache_cap(cap: usize) -> bool {
-    FD_CACHE_CAP_CELL.set(cap.max(64)).is_ok()
+    en_params().fd_cache_cap.get()
 }
 
 /// a bounded LRU cache of open file descriptors for SEALED
@@ -1663,10 +1599,11 @@ struct LocalExtentMeta {
 //
 // Two independent counters in one struct (mirrors PS holding compact +
 // gc concurrency together):
-//   - `ec_convert`  — caps `handle_convert_to_ec` heavy paths.
-//     Default `ExtentNodeConfig.ec_convert_parallelism = 1`.
-//   - `recovery`    — caps `run_recovery_task` heavy paths.
-//     Default `ExtentNodeConfig.recovery_parallelism = 2`.
+//   - `ec_convert`  — caps `handle_convert_to_ec` heavy paths
+//     (`--ec-convert-parallelism`, default 1).
+//   - `recovery`    — caps `run_recovery_task` heavy paths
+//     (`--recovery-parallelism`, default 2, a runtime parameter: read on
+//     every acquire).
 //
 // Uses `Cell<usize>` (NOT `AtomicUsize`) because each extent-node
 // shard runs on a single-threaded compio runtime — all acquires
@@ -1686,19 +1623,34 @@ struct LocalExtentMeta {
 // extents.
 
 pub struct ConcurrencyController {
-    ec_convert_max: usize,
-    recovery_max: usize,
+    /// `(ec_convert, recovery)` caps; `None`: the EN parameters, read on
+    /// each acquire.
+    fixed: Option<(usize, usize)>,
     ec_convert_inflight: std::cell::Cell<usize>,
     recovery_inflight: std::cell::Cell<usize>,
 }
 
 impl ConcurrencyController {
     pub fn new(ec_convert_max: usize, recovery_max: usize) -> Rc<Self> {
+        Self::with_caps(Some((ec_convert_max.max(1), recovery_max.max(1))))
+    }
+
+    pub fn from_params() -> Rc<Self> {
+        Self::with_caps(None)
+    }
+
+    fn with_caps(fixed: Option<(usize, usize)>) -> Rc<Self> {
         Rc::new(Self {
-            ec_convert_max: ec_convert_max.max(1),
-            recovery_max: recovery_max.max(1),
+            fixed,
             ec_convert_inflight: std::cell::Cell::new(0),
             recovery_inflight: std::cell::Cell::new(0),
+        })
+    }
+
+    fn caps(&self) -> (usize, usize) {
+        self.fixed.unwrap_or_else(|| {
+            let p = en_params();
+            (p.ec_convert_parallelism.get(), p.recovery_parallelism.get())
         })
     }
 
@@ -1707,7 +1659,7 @@ impl ConcurrencyController {
     pub async fn acquire_ec_convert(self: &Rc<Self>) -> EcConvertPermit {
         loop {
             let cur = self.ec_convert_inflight.get();
-            if cur < self.ec_convert_max {
+            if cur < self.caps().0 {
                 self.ec_convert_inflight.set(cur + 1);
                 return EcConvertPermit { ctrl: self.clone() };
             }
@@ -1719,7 +1671,7 @@ impl ConcurrencyController {
     pub async fn acquire_recovery(self: &Rc<Self>) -> RecoveryPermit {
         loop {
             let cur = self.recovery_inflight.get();
-            if cur < self.recovery_max {
+            if cur < self.caps().1 {
                 self.recovery_inflight.set(cur + 1);
                 return RecoveryPermit { ctrl: self.clone() };
             }
@@ -1761,12 +1713,6 @@ impl Drop for RecoveryPermit {
         self.ctrl.recovery_inflight.set(cur.saturating_sub(1));
     }
 }
-
-// The env-reading helpers `ec_convert_parallelism()` and
-// `recovery_parallelism()` were removed — values now live on
-// `ExtentNodeConfig.ec_convert_parallelism` / `.recovery_parallelism`,
-// set by the extent-node binary's CLI parser. The clamp([1, 16]) moved
-// to the `with_*` builder methods on ExtentNodeConfig.
 
 // ─── ExtentNode ───────────────────────────────────────────────────────────────
 
@@ -1963,10 +1909,6 @@ pub struct ExtentNode {
     /// `recovery_gate`) to mirror PS's `ConcurrencyController` shape —
     /// one struct, two counters. RAM cap, not rate cap.
     concurrency_ctrl: Rc<ConcurrencyController>,
-    /// (was env `AUTUMN_EXTENT_INFLIGHT_CAP`): per-conn
-    /// FuturesUnordered cap. Read once at construction from
-    /// `ExtentNodeConfig.inflight_cap`; immutable after.
-    inflight_cap: usize,
     /// M1b: this EN's own identity, echoed in `handle_df`
     /// (default/empty when `--advertise` was not passed).
     registration: Rc<NodeRegistration>,
@@ -1976,7 +1918,6 @@ pub struct ExtentNode {
     /// one worker that exists only while there are some.
     scrub_queue: Rc<RefCell<scrub::ScrubQueue>>,
     scrub_worker_running: Rc<Cell<bool>>,
-    scrub_bytes_per_sec: u64,
 }
 
 impl Clone for ExtentNode {
@@ -2002,22 +1943,23 @@ impl Clone for ExtentNode {
             ec_conversion_locks: self.ec_conversion_locks.clone(),
             meta_locks: self.meta_locks.clone(),
             concurrency_ctrl: self.concurrency_ctrl.clone(),
-            inflight_cap: self.inflight_cap,
             registration: self.registration.clone(),
             direct_io: self.direct_io,
             scrub_queue: self.scrub_queue.clone(),
             scrub_worker_running: self.scrub_worker_running.clone(),
-            scrub_bytes_per_sec: self.scrub_bytes_per_sec,
         }
     }
 }
 
 /// Helper: one-shot RPC call (connect → send → recv → close).
-async fn rpc_oneshot(addr: std::net::SocketAddr, msg_type: u8, payload: Bytes) -> Result<Bytes> {
+async fn rpc_oneshot(
+    addr: std::net::SocketAddr,
+    msg_type: u8,
+    payload: Bytes,
+    timeout: Duration,
+) -> Result<Bytes> {
     let client = autumn_rpc::client::RpcClient::connect(addr).await?;
-    Ok(client
-        .call_timeout(msg_type, payload, std::time::Duration::from_secs(30))
-        .await?)
+    Ok(client.call_timeout(msg_type, payload, timeout).await?)
 }
 
 /// Send an EC participant control RPC (`WriteShard`) to a
@@ -2033,7 +1975,8 @@ async fn ec_2pc_participant_rpc(
     label: &str,
     decode_code: impl FnOnce(Bytes) -> std::result::Result<u8, (StatusCode, String)>,
 ) -> std::result::Result<(), (StatusCode, String)> {
-    match rpc_oneshot(sock, msg_type, payload).await {
+    let timeout = Duration::from_secs(en_params().ec_participant_rpc_timeout_secs.get());
+    match rpc_oneshot(sock, msg_type, payload, timeout).await {
         Ok(resp_bytes) => {
             let code = decode_code(resp_bytes)?;
             if code != CODE_OK {
@@ -2213,22 +2156,6 @@ struct DiskChoice {
 /// RPC path; this constant covers the local-file path on the extent node.
 const FILE_IO_CHUNK_BYTES: usize = 256 * 1024 * 1024;
 
-static EC_ENCODE_STRIPE_BYTES_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Set the EC-convert encode/transfer stripe size in bytes
-/// (`autumn-extent-node --ec-stripe-bytes N`). First-call-wins (OnceLock) — the
-/// binary applies it at startup, before any EC convert runs. Clamped to
-/// `[1 MiB, 1 GiB]`: below 1 MiB the per-stripe RPC + `sync_data` overhead
-/// dominates (more, smaller WriteShards); above 1 GiB the peak RAM
-/// `(K+M) × stripe` balloons and a single stripe approaches the frame
-/// `payload_len: u32` ceiling. Returns false if already initialised. Precedence:
-/// this flag > `AUTUMN_EXTENT_EC_STRIPE_BYTES` env (test override) > 64 MiB default.
-pub fn set_ec_encode_stripe_bytes(n: usize) -> bool {
-    EC_ENCODE_STRIPE_BYTES_CELL
-        .set(n.clamp(1024 * 1024, 1024 * 1024 * 1024))
-        .is_ok()
-}
-
 /// EC convert encode/transfer stripe size. The chunked EC convert holds at most
 /// `(K+M)` stripes resident at once (the K data sub-ranges read off the source
 /// extent + the M parity sub-ranges computed from them), so peak RAM is
@@ -2236,18 +2163,10 @@ pub fn set_ec_encode_stripe_bytes(n: usize) -> bool {
 /// the pre-chunking whole-extent encode). 64 MiB default keeps the peak ~256 MiB
 /// at K+M=4 while bounding the per-shard `sync_data` count; it is also well under
 /// the frame `payload_len: u32` ceiling so each stripe's `WriteShard` is a single
-/// in-frame RPC even for >4 GiB shards. Tunable via `--ec-stripe-bytes`
-/// (`set_ec_encode_stripe_bytes`); `AUTUMN_EXTENT_EC_STRIPE_BYTES` is a test
-/// override to exercise multi-stripe without writing multi-GiB extents.
+/// in-frame RPC even for >4 GiB shards (`--ec-stripe-bytes`, 1 MiB-1 GiB: below
+/// 1 MiB the per-stripe RPC + `sync_data` overhead dominates).
 fn ec_encode_stripe_bytes() -> usize {
-    *EC_ENCODE_STRIPE_BYTES_CELL.get_or_init(|| {
-        std::env::var("AUTUMN_EXTENT_EC_STRIPE_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .map(|n| n.clamp(1024 * 1024, 1024 * 1024 * 1024))
-            .unwrap_or(64 * 1024 * 1024)
-    })
+    en_params().ec_stripe_bytes.get()
 }
 
 /// Chunked pread for full-extent reads (recovery / EC convert / etc.).
@@ -2337,11 +2256,6 @@ fn spawn_read(
     }
     .boxed_local()
 }
-
-// The env-reading helper `extent_inflight_cap()` was removed —
-// value now lives on `ExtentNodeConfig.inflight_cap`, set by the
-// extent-node binary's CLI parser. Default 64 matches the client-side
-// pipelining depth where extent_bench peaks.
 
 /// Decode all complete frames from `decoder`, group consecutive same-extent
 /// APPEND/READ frames, and push one I/O future per group onto `inflight`.
@@ -2893,7 +2807,7 @@ enum ReadRefusal {
     /// `read_plan` bounds a read by the FILE, and a log extent is 16 GiB, so a
     /// `length = 0` to-end read asks for four times what the frame header's
     /// `payload_len: u32` can express. Every in-tree client already chunks
-    /// (`AUTUMN_STREAM_READ_CHUNK_BYTES`, 256 MiB), which is why this is not a
+    /// (`--stream-read-chunk-bytes`, 256 MiB), which is why this is not a
     /// live failure — but the server must not depend on the client for it. The
     /// alternative is worse in both directions: the length silently wrapped and
     /// the peer reported a CRC error on a frame that was never corrupt, and
@@ -3762,7 +3676,7 @@ impl ExtentNode {
         // PROCESS-wide. Each shard is a separate `ExtentNode`, so N shards would
         // hold N × cap sealed fds; clamp the per-shard cap so the process total
         // stays comfortably under the 65535 RLIMIT_NOFILE limit (reserve headroom
-        // for open tails + TCP sockets). Floor 64 (matches `set_fd_cache_cap`).
+        // for open tails + TCP sockets). Floor 64 (`--fd-cache-cap`'s minimum).
         let shards = config.shard_count.max(1) as usize;
         let per_shard_cap = fd_cache_cap().min((60_000 / shards).max(64));
         let fd_lru = Rc::new(FdLru::new(per_shard_cap, extents.clone()));
@@ -3790,18 +3704,11 @@ impl ExtentNode {
             sibling_addrs: Rc::new(config.sibling_addrs),
             ec_conversion_locks: Rc::new(RefCell::new(HashMap::new())),
             meta_locks: Rc::new(RefCell::new(HashMap::new())),
-            // parallelism comes from `ExtentNodeConfig`. CLI flag
-            // → builder → here. No env read.
-            concurrency_ctrl: ConcurrencyController::new(
-                config.ec_convert_parallelism,
-                config.recovery_parallelism,
-            ),
-            inflight_cap: config.inflight_cap.max(1),
+            concurrency_ctrl: ConcurrencyController::from_params(),
             registration: Rc::new(config.registration.unwrap_or_default()),
             direct_io: config.direct_io,
             scrub_queue: Rc::new(RefCell::new(scrub::ScrubQueue::default())),
             scrub_worker_running: Rc::new(Cell::new(false)),
-            scrub_bytes_per_sec: config.scrub_bytes_per_sec,
         };
 
         // Load existing extents from all disks.
@@ -3837,7 +3744,11 @@ impl ExtentNode {
                     for (disk_id, disk) in disks.iter() {
                         if disk.health() == DiskHealth::Full {
                             let (total, free) = disk.disk_stats();
-                            if total > 0 && free >= total / 20 && disk.try_clear_full() {
+                            let resume = en_params().disk_full_resume_free_percent.get();
+                            if total > 0
+                                && free.saturating_mul(100) >= total.saturating_mul(resume)
+                                && disk.try_clear_full()
+                            {
                                 tracing::info!(
                                     disk_id,
                                     free,
@@ -3969,7 +3880,7 @@ impl ExtentNode {
 
     /// long-lived periodic orphan reconcile.
     ///
-    /// Runs immediately on spawn, then every `RECONCILE_SWEEP_INTERVAL`. Errors
+    /// Runs immediately on spawn, then every `--reconcile-sweep-interval-secs`. Errors
     /// (manager not leader during cold boot, transient network blip,
     /// etcd hiccup) are logged at WARN and the loop continues — the
     /// next sweep retries. No separate "startup retry" phase: a cold-
@@ -4023,7 +3934,8 @@ impl ExtentNode {
                             "reconcile failed (will retry next sweep)",
                         );
                     }
-                    compio::time::sleep(RECONCILE_SWEEP_INTERVAL).await;
+                    let every = en_params().reconcile_sweep_interval_secs.get();
+                    compio::time::sleep(Duration::from_secs(every)).await;
                 }
             }
         });
@@ -4514,7 +4426,7 @@ impl ExtentNode {
     /// coincidence, and makes it hold within one shard.
     ///
     /// Free space ALONE cannot decide it, and this is sharper here than a level
-    /// up: with the default `--en-prealloc-bytes` of 0, creating an extent
+    /// up: with the default `--prealloc-bytes` of 0, creating an extent
     /// moves the free-space number by nothing at all, so ten allocations in a
     /// row would all see the same emptiest disk and all choose it. (With
     /// prealloc on, `fallocate` does claim the blocks, and free space moves —
@@ -5501,7 +5413,7 @@ impl ExtentNode {
         use futures::stream::{FuturesUnordered, StreamExt};
         use futures::FutureExt;
 
-        const READ_BUF_SIZE: usize = 512 * 1024;
+        let read_buf_size = en_params().conn_read_buf_bytes.get();
 
         let peer = conn
             .peer_addr()
@@ -5530,9 +5442,7 @@ impl ExtentNode {
         let mut principal: Option<autumn_rpc::cap_token::BoundPrincipal> = None;
         let mut decoder = FrameDecoder::new();
 
-        // per-conn inflight cap from `ExtentNodeConfig.inflight_cap`,
-        // set once at node construction. No env read.
-        let cap = node.inflight_cap;
+        let cap = en_params().inflight_cap.get();
         let mut inflight: FuturesUnordered<
             std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>>,
         > = FuturesUnordered::new();
@@ -5548,7 +5458,7 @@ impl ExtentNode {
         let next_window = |decoder: &mut FrameDecoder| {
             let len = decoder
                 .front_frame_remaining()
-                .map_or(READ_BUF_SIZE, |rest| rest.max(READ_BUF_SIZE));
+                .map_or(read_buf_size, |rest| rest.max(read_buf_size));
             decoder.read_window(len)
         };
         let mut read_fut: Option<LocalBoxFuture<'static, ReadBurst>> =
@@ -5759,7 +5669,7 @@ impl ExtentNode {
             .map_err(|e| e.to_string())?;
 
         // Optional ext4 block preallocation via `fallocate(FALLOC_FL_KEEP_SIZE)`.
-        // Triggered ONLY when `AUTUMN_EN_PREALLOC_BYTES` is set to a positive
+        // Triggered ONLY when `--prealloc-bytes` is set to a positive
         // size (default 0 = disabled). Preallocates the extent file's disk
         // blocks up front so subsequent appends don't pay the ext4 extent-tree
         // update + block-allocation journal cost on each grow. `KEEP_SIZE`
@@ -6255,9 +6165,10 @@ impl ExtentNode {
         // was the lost recovery COMPLETION, see `try_adopt_completed_recovery`
         // + the system_chaos control-port proxy fix. Kept as a correct
         // liveness bound in its own right.)
+        let read_timeout = Duration::from_secs(en_params().recovery_read_timeout_secs.get());
         let resp_bytes = match compio::time::timeout(
-            std::time::Duration::from_secs(30),
-            rpc_oneshot(sock, MSG_READ_BYTES, req.encode()),
+            read_timeout,
+            rpc_oneshot(sock, MSG_READ_BYTES, req.encode(), read_timeout),
         )
         .await
         {
@@ -6944,7 +6855,7 @@ impl ExtentNode {
         // recoveries on the same survivor node, multiplying the peak
         // by N. Default parallelism=2 — repair work runs concurrently
         // for faster post-failure convergence. Env tunable via
-        // `AUTUMN_EXTENT_RECOVERY_PARALLELISM` (clamped [1, 16]).
+        // `--recovery-parallelism` ([1, 16]).
         let _rec_permit = self.concurrency_ctrl.acquire_recovery().await;
 
         // EC vs replication dispatch keys on `ec_converted` (set by the
@@ -7232,17 +7143,9 @@ impl ExtentNode {
     /// 64 MiB matches the stripe the EC CONVERSION already writes with
     /// (`stripe_bytes` in its 2PC prepare), so the read path now moves in the
     /// same units as the write path.
-    /// Overridable so a test can drive several stripes without a >128 MiB
-    /// payload — the encode stripe has the same shape for the same reason.
+    /// `--ec-recovery-stripe-bytes`.
     fn ec_recovery_stripe_bytes() -> u64 {
-        static CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-        *CELL.get_or_init(|| {
-            std::env::var("AUTUMN_EXTENT_EC_RECOVERY_STRIPE_BYTES")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|v| *v > 0)
-                .unwrap_or(64 * 1024 * 1024)
-        })
+        en_params().ec_recovery_stripe_bytes.get()
     }
 
     /// The `(offset, span)` sequence a streaming rebuild walks.
@@ -9126,8 +9029,9 @@ impl ExtentNode {
             // resolved the extent.
             progress.set(0, 0);
             let instruction = attempt;
-            const MAX_RECOVERY_RETRIES: u32 = 10;
-            for attempt in 1..=MAX_RECOVERY_RETRIES {
+            let max_retries = en_params().recovery_max_retries.get();
+            let retry_backoff = Duration::from_secs(en_params().recovery_retry_backoff_secs.get());
+            for attempt in 1..=max_retries {
                 match node
                     .run_recovery_task(task.clone(), instruction.clone())
                     .await
@@ -9165,7 +9069,7 @@ impl ExtentNode {
                             autumn_rpc::manager_rpc::CODE_ERROR,
                             e.to_string(),
                         );
-                        if attempt >= MAX_RECOVERY_RETRIES {
+                        if attempt >= max_retries {
                             tracing::error!(
                                 extent_id,
                                 attempt,
@@ -9178,9 +9082,10 @@ impl ExtentNode {
                             extent_id,
                             attempt,
                             error = %e,
-                            "recovery task failed, retrying in 10s",
+                            backoff_secs = retry_backoff.as_secs(),
+                            "recovery task failed, retrying",
                         );
-                        compio::time::sleep(std::time::Duration::from_secs(10)).await;
+                        compio::time::sleep(retry_backoff).await;
                     }
                 }
             }
@@ -9446,7 +9351,7 @@ impl ExtentNode {
         // requests don't consume a permit. Held until function exit via
         // RAII. Permit pool shared with `run_recovery_task`; both are
         // logically "bulk repair work" and benefit from a unified cap
-        // (env `AUTUMN_EXTENT_RECOVERY_PARALLELISM`, default 2).
+        // (`--recovery-parallelism`, default 2).
         let _rec_permit = self.concurrency_ctrl.acquire_recovery().await;
 
         // TEMP-THEN-PUBLISH. The destination here is an EXISTING copy, so it
@@ -10113,7 +10018,7 @@ impl ExtentNode {
         // correctness gate against same-extent concurrent dispatches;
         // this is the new memory-safety gate against cross-extent fan
         // out. Default parallelism=1 — fully serialise. Env tunable
-        // via `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM` (clamped [1, 16]).
+        // via `--ec-convert-parallelism` ([1, 16]).
         let _ec_permit = self.concurrency_ctrl.acquire_ec_convert().await;
 
         // ── Has THIS attempt already staged every shard? ──
@@ -12669,35 +12574,26 @@ mod concurrency_gate_tests {
     #[test]
     fn zero_parallelism_clamps_to_one() {
         let ctrl = ConcurrencyController::new(0, 0);
-        assert_eq!(ctrl.ec_convert_max, 1, "ec_convert: 0 must clamp to 1");
-        assert_eq!(ctrl.recovery_max, 1, "recovery: 0 must clamp to 1");
+        assert_eq!(ctrl.caps(), (1, 1), "0 must clamp to 1");
     }
 
-    /// clamp test against the builder methods (replaces the
-    /// removed env-parser smoke test). Process-global env mutation
-    /// removed — no more hostility to parallel test runs.
-    #[test]
-    fn config_builder_clamps_parallelism() {
-        let cfg = ExtentNodeConfig::new(PathBuf::from("/tmp/x"), 1);
-        assert_eq!(cfg.ec_convert_parallelism, 1, "default ec=1");
-        assert_eq!(cfg.recovery_parallelism, 2, "default recovery=2");
-        assert_eq!(cfg.inflight_cap, 64, "default inflight=64");
-
-        let cfg = ExtentNodeConfig::new(PathBuf::from("/tmp/x"), 1)
-            .with_ec_convert_parallelism(9999)
-            .with_recovery_parallelism(0)
-            .with_inflight_cap(0);
-        assert_eq!(cfg.ec_convert_parallelism, 16, "9999 clamps to 16");
-        assert_eq!(cfg.recovery_parallelism, 1, "0 clamps to 1");
-        assert_eq!(cfg.inflight_cap, 64, "0 falls back to default 64");
-
-        let cfg = ExtentNodeConfig::new(PathBuf::from("/tmp/x"), 1)
-            .with_ec_convert_parallelism(4)
-            .with_recovery_parallelism(8)
-            .with_inflight_cap(128);
-        assert_eq!(cfg.ec_convert_parallelism, 4);
-        assert_eq!(cfg.recovery_parallelism, 8);
-        assert_eq!(cfg.inflight_cap, 128);
+    /// Built from the parameters, the recovery cap follows a runtime override
+    /// on the next acquire.
+    #[compio::test]
+    async fn recovery_cap_follows_a_runtime_override() {
+        let p = en_params();
+        let ctrl = ConcurrencyController::from_params();
+        autumn_params::apply_overrides(p, &[("en.recovery-parallelism".into(), "1".into())]);
+        let r1 = ctrl.acquire_recovery().await;
+        let blocked = compio::time::timeout(Duration::from_millis(200), ctrl.acquire_recovery()).await;
+        assert!(blocked.is_err(), "a second recovery permit past an override of 1");
+        autumn_params::apply_overrides(p, &[("en.recovery-parallelism".into(), "2".into())]);
+        let r2 = compio::time::timeout(Duration::from_secs(2), ctrl.acquire_recovery())
+            .await
+            .expect("the raised cap admits a second permit");
+        drop((r1, r2));
+        autumn_params::apply_overrides(p, &[]);
+        assert_eq!(ctrl.caps().1, p.recovery_parallelism.base());
     }
 }
 
@@ -12995,12 +12891,11 @@ mod fd_lru_chaos_tests {
 
     #[compio::test]
     async fn over_cap_reload_concurrent_churn_bounded_fds_no_torn_read() {
-        // Global fd cache cap = 64 (the setter's minimum). This test is the ONLY
-        // set_fd_cache_cap caller in the crate, so it wins the OnceLock; the other
+        // Global fd cache cap = 64 (`--fd-cache-cap`'s minimum); the other
         // fd_lru_tests build FdLru with explicit caps and are unaffected. If the
-        // cap failed to take (stayed 4096), the mid-churn bound below fails loudly
-        // (no eviction → residency grows to N), so a wrong cap can't false-pass.
-        set_fd_cache_cap(64);
+        // cap failed to take, the mid-churn bound below fails loudly (no
+        // eviction → residency grows to N), so a wrong cap can't false-pass.
+        en_params().fd_cache_cap.set(64);
         const N: usize = 150; // >> cap ⇒ the reloaded node MUST evict to serve
         const CAP: usize = 64;
         const BASE: u64 = 9_000;

@@ -128,7 +128,7 @@ async fn stream_extent_ids(mgr_addr: SocketAddr, stream_id: u64) -> Vec<u64> {
 }
 
 /// Force a real WAL extent boundary without weakening the production 1-GiB
-/// minimum accepted by `set_max_extent_size_bytes`. Every preceding put is
+/// minimum accepted by `--max-extent-size-bytes`. Every preceding put is
 /// awaited and this test has one sequential writer; no P-log append is in
 /// flight when the independent stream client rolls the tail. Background GC is
 /// never dispatched in this test.

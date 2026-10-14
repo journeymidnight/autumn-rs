@@ -75,7 +75,7 @@ OP list-nodes 2>&1 | head -6
 echo "=== bootstrap RF1 + log-ec 2+1 ==="
 OP bootstrap --replication 1+0 --log-ec 2+1 > "$WD/bootstrap.log" 2>&1 \
   || { echo BOOTSTRAP-FAIL; cat "$WD/bootstrap.log"; exit 1; }
-"$BIN/autumn-ps" --psid 1 --port $PS --manager "[$L6]:$MGR" --data "$WD/ps1" \
+"$BIN/autumn-ps" --psid 1 --port $PS --manager "[$L6]:$MGR" \
   --listen "$L6" --advertise "[$L6]:$PS" --cluster-secret-file "$SECRET" > "$WD/ps.log" 2>&1 & PIDS+=($!)
 sleep 4
 

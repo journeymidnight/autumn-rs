@@ -966,7 +966,7 @@ pub struct MaintenanceReq {
     pub op: u8,
     pub extent_ids: Vec<u64>,
     /// filter — discard ratio threshold (0.0..=1.0). `None` → 0.4
-    /// (`GC_DISCARD_RATIO`). Used only when `op == MAINTENANCE_AUTO_GC`.
+    /// (`--gc-discard-ratio`). Used only when `op == MAINTENANCE_AUTO_GC`.
     pub gc_ratio: Option<f64>,
     /// filter — only consider sealed extents whose `sealed_length`
     /// is at most this many bytes. Combined with a lower `gc_ratio`

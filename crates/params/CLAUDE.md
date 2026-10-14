@@ -35,5 +35,6 @@ keeping a copy defeats `[runtime]`; only do that for startup-only parameters.
 
 Integers accept binary suffixes (`64M`, `64MiB`, `1g`, `512k`) and `_`.
 
-Cross-field checks (`ManagerParams::validate`) are hand-written next to the
-declaration and called by the binary after parsing.
+Cross-field checks are `impl CrossCheck` next to the declaration (empty for
+most structs). The binary calls `cross_check` after parsing, and
+`apply_overrides` rolls back a whole override set that fails it.

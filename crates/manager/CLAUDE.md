@@ -2373,7 +2373,7 @@ fence diagnosis observes a DIFFERENT instance in the leader key — a *missing* 
 lease-expiry, not displacement) keeps a rejoined FOLLOWER from serving replay-stale
 regions. Bounded by `--routable-stale-ttl-secs` (15 min from `leaderless_since`): in an
 asymmetric partition a peer may have taken over, and after the TTL PSes get NOT_LEADER
-and rotate to the real leader. PS-side `MAX_CONSECUTIVE_NOT_LEADER = 450` (15 min) is a
+and rotate to the real leader. PS-side `--heartbeat-not-leader-exit-secs` (900 s = 15 min) is a
 SEPARATE heartbeat exit budget from the transport budget — NOT_LEADER proves the manager
 is reachable, and a leaderless control plane can't evict anyone. Data safety is always
 `owner_epoch`/`region_epoch` fencing, never these stale-read bounds.

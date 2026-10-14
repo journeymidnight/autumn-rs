@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use autumn_partition_server::background::minor_compaction_runs;
-use autumn_partition_server::compact_policy::{set_minor_policy, MinorPolicy};
+use autumn_partition_server::compact_policy::MinorPolicy;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::partition_rpc::{self, CODE_OK};
 use autumn_stream::{ConnPool, StreamClient};
@@ -22,7 +22,7 @@ use support::*;
 fn minor_policy() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        set_minor_policy(MinorPolicy { min_size: 1, ..Default::default() }).expect("policy")
+        autumn_partition_server::params().compact_min_size_bytes.set(1)
     });
 }
 

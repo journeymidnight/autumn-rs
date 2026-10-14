@@ -10,8 +10,8 @@
 //! EINVAL once length crossed `INT_MAX` (~2 GiB).
 //!
 //! This test reproduces the failure mode at small scale by overriding
-//! `AUTUMN_STREAM_READ_CHUNK_BYTES` to a tiny value (forcing the
-//! chunked path on a regular workload) AND `AUTUMN_PS_GC_READ_CHUNK_BYTES`
+//! `--stream-read-chunk-bytes` to a tiny value (forcing the
+//! chunked path on a regular workload) AND `--gc-read-chunk-bytes`
 //! (forcing run_gc's record-streaming carry across every chunk
 //! boundary). With both knobs set, GC must still reclaim the dead VPs
 //! and a normal Get must still return the live value.
@@ -28,20 +28,14 @@ use support::*;
 
 #[test]
 fn gc_works_on_large_extent_via_chunked_reads() {
-    // Force StreamClient to chunk reads at 1 KiB and run_gc to carry
-    // records across 512 B GC chunks. With ~8 KiB values, every read
+    // Force the PS's stream client to chunk reads at 1 KiB and run_gc to
+    // carry records across 512 B GC chunks. With ~8 KiB values, every read
     // and every record will straddle a chunk boundary — exercising the
-    // chunked read path AND the carry-forward path on every
-    // step. `set_var` is fine here because this is the only test in
-    // this binary.
-    //
-    // SAFETY: std::env::set_var is unsafe in 1.84+ because env mutation
-    // races with concurrent reads in other threads. This test binary
-    // contains exactly one test and no other thread has spawned yet.
-    unsafe {
-        std::env::set_var("AUTUMN_STREAM_READ_CHUNK_BYTES", "1024");
-        std::env::set_var("AUTUMN_PS_GC_READ_CHUNK_BYTES", "512");
-    }
+    // chunked read path AND the carry-forward path on every step. Set
+    // before the PS opens the partition (its stream clients read them then).
+    let ps_params = autumn_partition_server::params();
+    ps_params.stream_read_chunk_bytes.set(1024);
+    ps_params.gc_read_chunk_bytes.set(512);
 
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_two_node_infra(7100);
 

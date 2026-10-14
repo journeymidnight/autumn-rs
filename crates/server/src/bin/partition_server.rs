@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 #[cfg(unix)]
 extern crate libc;
+use autumn_params::ps::PsParams;
 use autumn_partition_server::PartitionServer;
 use autumn_transport::TransportKind;
 
@@ -36,77 +37,44 @@ struct Args {
     advertise: Option<String>,
     bind_host: String,
     transport: TransportKind,
-    tcp_zerocopy_min_bytes: usize,
     cpu_start: usize,
     /// explicit list of cores this binary may pin to, taskset
     /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides
     /// `core_affinity::get_core_ids()` snapshot and disables
     /// `--cpu-start`. Mutually exclusive with `--cpu-start`.
     cpuset: Option<Vec<usize>>,
-    // PS tunables previously env::var-gated, now CLI flags.
-    // `None` = library default. Defaults match the earlier env defaults.
-    group_commit_cap: Option<usize>,
-    ps_inflight_cap: Option<usize>,
-    ps_sst_inflight_cap: Option<usize>,
-    ps_flush_inflight_cap: Option<usize>,
-    max_imm_depth: Option<usize>,
-    max_wal_gap: Option<u64>,
-    /// Per-extent seal threshold (bytes). `None` = library default (16 GiB).
-    /// Clamped to [1 GiB, 64 GiB]. Bigger = fewer extents = less manager/etcd
-    /// metadata pressure at scale (enabled by the u64-offset widening).
-    max_extent_size_bytes: Option<u64>,
-    flush_mem_bytes: Option<u64>,
-    deletion_compact_check_secs: Option<u64>,
-    minor_policy: autumn_partition_server::compact_policy::MinorPolicy,
-    compact_max_sst_bytes: Option<u64>,
-    shutdown_timeout_ms: Option<u64>,
-    major_compact_parallelism: Option<usize>,
-    gc_parallelism: Option<usize>,
-    conn_inflight_cap: Option<usize>,
-    fg_rate_bytes_per_sec: Option<u64>,
-    fg_iops_per_sec: Option<u64>,
-    admission_compact_rate_bytes_per_sec: Option<u64>,
-    admission_gc_rate_bytes_per_sec: Option<u64>,
-    fg_saturated_threshold: Option<f64>,
-    fg_qps_quota: Option<u32>,
-    gc_debt_high_bytes: Option<u64>,
-    compact_pending_high_bytes: Option<u64>,
-    gc_cooldown_secs: Option<i64>,
-    compact_cooldown_secs: Option<i64>,
-    min_pipeline_batch: Option<usize>,
-    /// hedge delay (ms) for replicated sealed-extent reads. None/0 = off.
-    read_hedge_ms: Option<u64>,
-    /// bounded SST block cache capacity (bytes). None = 512 MiB.
-    sst_block_cache_bytes: Option<usize>,
-    gc_read_chunk_bytes: Option<u32>,
-    gc_batch_records: Option<usize>,
-    gc_batch_bytes: Option<usize>,
-    gc_rate_bytes_per_sec: Option<u64>,
-    /// Per-thread regpool cap (pinned/registered bytes). `None` = library
-    /// default (512 MiB/thread). Clamped to [16 MiB, 64 GiB] by
-    /// `set_regpool_cap_bytes`. Mostly useful when shrinking on a memlock-
-    /// constrained host or growing when many in-flight 8 MiB bulk writes
-    /// pin the pool above the default.
-    ucx_regpool_cap_bytes: Option<usize>,
-    /// Period (seconds) for emitting a `regpool` snapshot via
-    /// `tracing::info!`. `None` or `Some(0)` = disabled. The counters are
-    /// process-global (cross-thread aggregate), so one task per PS is
-    /// enough to surface every thread's pool activity. Useful for
-    /// confirming the registered-buffer hit rate during a perf run.
-    regpool_log_interval_secs: Option<u64>,
     /// Prometheus `/metrics` port. `None` = `--port` + 500; 0 = no endpoint.
     metrics_port: Option<u16>,
     /// Bind host for /metrics only. `None` = follow `--listen`. The
     /// endpoint is unauthenticated — operators exposing the RPC plane
     /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
     metrics_listen: Option<String>,
-    // pprof CLI flags (replaces AUTUMN_PPROF_* env reads).
     #[cfg(feature = "profiling")]
     pprof_secs: Option<u64>,
     #[cfg(feature = "profiling")]
     pprof_out: Option<String>,
     #[cfg(feature = "profiling")]
     pprof_threads: Option<String>,
+}
+
+fn usage() -> String {
+    format!(
+        "usage: autumn-ps --psid <ID> --cluster-secret-file <PATH> [options]\n\
+         \n\
+         \x20 --psid <id>                 partition server id (required, non-zero)\n\
+         \x20 --port <n>                  first partition's port; partition N binds port+N-1 (default 9201)\n\
+         \x20 --manager <a,b,...>         manager endpoints (default 127.0.0.1:9001)\n\
+         \x20 --listen <host>             bind host (default 0.0.0.0)\n\
+         \x20 --advertise <host:port>     address announced to the manager\n\
+         \x20 --transport tcp|ucx\n\
+         \x20 --cpuset <spec>             cores to pin to (taskset syntax); budget = len/2 partitions\n\
+         \x20 --cpu-start <n>             first core to pin to (exclusive with --cpuset)\n\
+         \x20 --metrics-port <n>          /metrics port (default port+500, 0 = off)\n\
+         \x20 --metrics-listen <host>     /metrics bind host (default --listen)\n\
+         \n\
+         parameters:\n{}",
+        autumn_params::help::<PsParams>()
+    )
 }
 
 fn parse_args() -> Args {
@@ -117,44 +85,8 @@ fn parse_args() -> Args {
     let mut advertise: Option<String> = None;
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
-    let mut tcp_zerocopy_min_bytes = 0;
     let mut cpu_start: usize = 0;
     let mut cpuset: Option<Vec<usize>> = None;
-    // tunables — None = library default.
-    let mut group_commit_cap: Option<usize> = None;
-    let mut ps_inflight_cap: Option<usize> = None;
-    let mut ps_sst_inflight_cap: Option<usize> = None;
-    let mut ps_flush_inflight_cap: Option<usize> = None;
-    let mut max_imm_depth: Option<usize> = None;
-    let mut max_wal_gap: Option<u64> = None;
-    let mut max_extent_size_bytes: Option<u64> = None;
-    let mut flush_mem_bytes: Option<u64> = None;
-    let mut deletion_compact_check_secs: Option<u64> = None;
-    let mut minor_policy = autumn_partition_server::compact_policy::MinorPolicy::default();
-    let mut compact_max_sst_bytes: Option<u64> = None;
-    let mut shutdown_timeout_ms: Option<u64> = None;
-    let mut major_compact_parallelism: Option<usize> = None;
-    let mut gc_parallelism: Option<usize> = None;
-    let mut conn_inflight_cap: Option<usize> = None;
-    let mut fg_rate_bytes_per_sec: Option<u64> = None;
-    let mut fg_iops_per_sec: Option<u64> = None;
-    let mut admission_compact_rate_bytes_per_sec: Option<u64> = None;
-    let mut admission_gc_rate_bytes_per_sec: Option<u64> = None;
-    let mut fg_saturated_threshold: Option<f64> = None;
-    let mut fg_qps_quota: Option<u32> = None;
-    let mut gc_debt_high_bytes: Option<u64> = None;
-    let mut compact_pending_high_bytes: Option<u64> = None;
-    let mut gc_cooldown_secs: Option<i64> = None;
-    let mut compact_cooldown_secs: Option<i64> = None;
-    let mut min_pipeline_batch: Option<usize> = None;
-    let mut read_hedge_ms: Option<u64> = None;
-    let mut sst_block_cache_bytes: Option<usize> = None;
-    let mut gc_read_chunk_bytes: Option<u32> = None;
-    let mut gc_batch_records: Option<usize> = None;
-    let mut gc_batch_bytes: Option<usize> = None;
-    let mut gc_rate_bytes_per_sec: Option<u64> = None;
-    let mut ucx_regpool_cap_bytes: Option<usize> = None;
-    let mut regpool_log_interval_secs: Option<u64> = None;
     let mut metrics_port: Option<u16> = None;
     let mut metrics_listen: Option<String> = None;
     #[cfg(feature = "profiling")]
@@ -163,11 +95,16 @@ fn parse_args() -> Args {
     let mut pprof_out: Option<String> = None;
     #[cfg(feature = "profiling")]
     let mut pprof_threads: Option<String> = None;
+    let params = autumn_partition_server::params();
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
             "--port" => {
                 i += 1;
                 port = args[i].parse().expect("--port must be a number");
@@ -200,14 +137,6 @@ fn parse_args() -> Args {
                         std::process::exit(2);
                     });
             }
-            "--tcp-zerocopy-min-bytes" => {
-                i += 1;
-                tcp_zerocopy_min_bytes = args
-                    .get(i)
-                    .expect("--tcp-zerocopy-min-bytes requires a value")
-                    .parse()
-                    .expect("--tcp-zerocopy-min-bytes must be a byte count (0 disables)");
-            }
             "--cpu-start" => {
                 i += 1;
                 cpu_start = args[i].parse().expect("--cpu-start must be a number");
@@ -218,217 +147,6 @@ fn parse_args() -> Args {
                     eprintln!("--cpuset parse error: {e}");
                     std::process::exit(2);
                 }));
-            }
-            // `--conn-threads` is a no-op. Earlier it sized the
-            // compio Dispatcher worker pool that ran ps-conn tasks; after
-            // every ps-conn task runs on the owning partition's
-            // P-log runtime and there is no worker pool. The flag is
-            // accepted and ignored to preserve CLI compatibility with
-            // existing deployment scripts.
-            "--conn-threads" => {
-                i += 1;
-                let _ = args[i].clone();
-                tracing::warn!("--conn-threads is a no-op; worker pool removed");
-            }
-            // PS tunables. Each flag mirrors the earlier env var
-            // of the same suffix (lowercased + kebab-cased).
-            "--group-commit-cap" => {
-                i += 1;
-                group_commit_cap = Some(args[i].parse().expect("--group-commit-cap u64"));
-            }
-            "--ps-inflight-cap" => {
-                i += 1;
-                ps_inflight_cap = Some(args[i].parse().expect("--ps-inflight-cap usize"));
-            }
-            "--ps-bulk-inflight-cap" => {
-                i += 1;
-                ps_sst_inflight_cap = Some(args[i].parse().expect("--ps-bulk-inflight-cap usize"));
-            }
-            "--flush-inflight-cap" => {
-                i += 1;
-                ps_flush_inflight_cap = Some(args[i].parse().expect("--flush-inflight-cap usize"));
-            }
-            "--max-imm-depth" => {
-                i += 1;
-                max_imm_depth = Some(args[i].parse().expect("--max-imm-depth usize"));
-            }
-            "--max-wal-gap" => {
-                i += 1;
-                max_wal_gap = Some(args[i].parse().expect("--max-wal-gap u64 bytes"));
-            }
-            "--max-extent-size-bytes" => {
-                i += 1;
-                max_extent_size_bytes =
-                    Some(args[i].parse().expect("--max-extent-size-bytes u64 bytes"));
-            }
-            "--flush-mem-bytes" => {
-                i += 1;
-                flush_mem_bytes = Some(args[i].parse().expect("--flush-mem-bytes u64 bytes"));
-            }
-            "--deletion-compact-check-secs" => {
-                i += 1;
-                deletion_compact_check_secs = Some(
-                    args[i]
-                        .parse()
-                        .expect("--deletion-compact-check-secs u64 seconds"),
-                );
-            }
-            "--compact-max-sst-bytes" => {
-                i += 1;
-                compact_max_sst_bytes =
-                    Some(args[i].parse().expect("--compact-max-sst-bytes u64 bytes"));
-            }
-            "--compact-min-files" => {
-                i += 1;
-                minor_policy.min_files = args[i].parse().expect("--compact-min-files usize");
-            }
-            "--compact-max-files" => {
-                i += 1;
-                minor_policy.max_files = args[i].parse().expect("--compact-max-files usize");
-            }
-            "--compact-ratio" => {
-                i += 1;
-                minor_policy.ratio = args[i].parse().expect("--compact-ratio f64");
-            }
-            "--compact-min-size-bytes" => {
-                i += 1;
-                minor_policy.min_size =
-                    args[i].parse().expect("--compact-min-size-bytes u64 bytes");
-            }
-            "--compact-large-size-bytes" => {
-                i += 1;
-                minor_policy.large_size =
-                    args[i].parse().expect("--compact-large-size-bytes u64 bytes");
-            }
-            "--compact-blocking-files" => {
-                i += 1;
-                minor_policy.blocking_files =
-                    args[i].parse().expect("--compact-blocking-files usize");
-            }
-            "--shutdown-timeout-ms" => {
-                i += 1;
-                shutdown_timeout_ms = Some(args[i].parse().expect("--shutdown-timeout-ms u64"));
-            }
-            "--major-compact-parallelism" => {
-                i += 1;
-                major_compact_parallelism =
-                    Some(args[i].parse().expect("--major-compact-parallelism usize"));
-            }
-            "--gc-parallelism" => {
-                i += 1;
-                gc_parallelism = Some(args[i].parse().expect("--gc-parallelism usize"));
-            }
-            "--conn-inflight-cap" => {
-                i += 1;
-                conn_inflight_cap = Some(args[i].parse().expect("--conn-inflight-cap usize"));
-            }
-            "--fg-rate-bytes-per-sec" => {
-                i += 1;
-                fg_rate_bytes_per_sec = Some(args[i].parse().expect("--fg-rate-bytes-per-sec u64"));
-            }
-            "--fg-iops-per-sec" => {
-                i += 1;
-                fg_iops_per_sec = Some(args[i].parse().expect("--fg-iops-per-sec u64"));
-            }
-            "--bg-rate-bytes-per-sec" => {
-                eprintln!(
-                    "error: --bg-rate-bytes-per-sec was removed. \
-                     Use --compact-rate-bytes-per-sec + --gc-rate-bytes-per-sec instead."
-                );
-                std::process::exit(2);
-            }
-            "--admission-compact-rate-bytes-per-sec" => {
-                i += 1;
-                admission_compact_rate_bytes_per_sec = Some(
-                    args[i]
-                        .parse()
-                        .expect("--admission-compact-rate-bytes-per-sec u64"),
-                );
-            }
-            "--admission-gc-rate-bytes-per-sec" => {
-                i += 1;
-                admission_gc_rate_bytes_per_sec = Some(
-                    args[i]
-                        .parse()
-                        .expect("--admission-gc-rate-bytes-per-sec u64"),
-                );
-            }
-            "--fg-saturated-threshold" => {
-                i += 1;
-                fg_saturated_threshold =
-                    Some(args[i].parse().expect("--fg-saturated-threshold f64"));
-            }
-            "--fg-qps-quota" => {
-                i += 1;
-                fg_qps_quota = Some(args[i].parse().expect("--fg-qps-quota u32"));
-            }
-            "--gc-debt-high-bytes" => {
-                i += 1;
-                gc_debt_high_bytes = Some(args[i].parse().expect("--gc-debt-high-bytes u64"));
-            }
-            "--compact-pending-high-bytes" => {
-                i += 1;
-                compact_pending_high_bytes =
-                    Some(args[i].parse().expect("--compact-pending-high-bytes u64"));
-            }
-            "--gc-cooldown-secs" => {
-                i += 1;
-                gc_cooldown_secs = Some(args[i].parse().expect("--gc-cooldown-secs i64"));
-            }
-            "--compact-cooldown-secs" => {
-                i += 1;
-                compact_cooldown_secs = Some(args[i].parse().expect("--compact-cooldown-secs i64"));
-            }
-            "--min-pipeline-batch" => {
-                // deprecated no-op. The launch gate this tuned is gone —
-                // partition_loop natural-batches (launches whatever is pending
-                // whenever a pipeline slot is free). Parsed for back-compat so
-                // existing cluster.sh invocations don't break.
-                i += 1;
-                min_pipeline_batch = Some(args[i].parse().expect("--min-pipeline-batch usize"));
-            }
-            "--sst-block-cache-bytes" => {
-                i += 1;
-                sst_block_cache_bytes =
-                    Some(args[i].parse().expect("--sst-block-cache-bytes usize"));
-            }
-            "--read-hedge-ms" => {
-                // hedge delay for replicated sealed-extent reads.
-                // 0 (default) = hedging off; replica rotation always on.
-                i += 1;
-                read_hedge_ms = Some(args[i].parse().expect("--read-hedge-ms u64"));
-            }
-            "--gc-read-chunk-bytes" => {
-                i += 1;
-                gc_read_chunk_bytes = Some(args[i].parse().expect("--gc-read-chunk-bytes u32"));
-            }
-            "--gc-batch-records" => {
-                i += 1;
-                gc_batch_records = Some(args[i].parse().expect("--gc-batch-records usize"));
-            }
-            "--gc-batch-bytes" => {
-                i += 1;
-                gc_batch_bytes = Some(args[i].parse().expect("--gc-batch-bytes usize"));
-            }
-            "--gc-rate-bytes-per-sec" => {
-                i += 1;
-                gc_rate_bytes_per_sec = Some(args[i].parse().expect("--gc-rate-bytes-per-sec u64"));
-            }
-            "--ucx-regpool-cap-bytes" => {
-                i += 1;
-                ucx_regpool_cap_bytes = Some(
-                    args[i]
-                        .parse()
-                        .expect("--ucx-regpool-cap-bytes usize"),
-                );
-            }
-            "--regpool-log-interval-secs" => {
-                i += 1;
-                regpool_log_interval_secs = Some(
-                    args[i]
-                        .parse()
-                        .expect("--regpool-log-interval-secs u64"),
-                );
             }
             "--metrics-port" => {
                 i += 1;
@@ -453,68 +171,33 @@ fn parse_args() -> Args {
                 i += 1;
                 pprof_threads = Some(args[i].clone());
             }
-            "--help" | "-h" => {
-                eprintln!("Usage: autumn-ps --psid <ID> [OPTIONS]");
-                eprintln!();
-                eprintln!("Options:");
-                eprintln!("  --psid <ID>          Partition server ID (required, non-zero)");
-                eprintln!("  --port <PORT>        First partition's listener port [default: 9201]");
-                eprintln!("                       (subsequent partitions bind PORT+1, PORT+2, ...)");
-                eprintln!("  --manager <ADDR>     Manager endpoint [default: 127.0.0.1:9001]");
-                eprintln!("  --listen <HOST>      Bind host (IPv4 or bare/bracketed IPv6) [default: 0.0.0.0]");
-                eprintln!("  --advertise <ADDR>   Advertise host for cluster discovery");
-                eprintln!("                       (the `host:port` base — port comes from --port)");
-                eprintln!("  --transport <MODE>   Transport backend: tcp (default) or ucx");
-                eprintln!("  --tcp-zerocopy-min-bytes <N>  Prepared replica sends; 0/default = off");
-                eprintln!("  --read-hedge-ms <MS> hedge delay for replicated sealed-extent");
-                eprintln!("                       reads; 0/default = hedging off (replica");
-                eprintln!("                       rotation is always on)");
-                eprintln!("  --max-extent-size-bytes <N>  Per-extent seal threshold");
-                eprintln!("                       [default: 16 GiB, clamp 1-64 GiB]. Bigger =");
-                eprintln!("                       fewer extents = less manager metadata pressure.");
-                eprintln!("  --flush-mem-bytes <N>  Memtable size = SST size a flush writes");
-                eprintln!("                       [default: 256 MiB, clamp 4 KiB-1 GiB].");
-                eprintln!("  --compact-max-sst-bytes <N>");
-                eprintln!("                       A compaction output SST is cut at this size");
-                eprintln!("                       (at least 2x the flush size) [1 GiB, 4 KiB-3 GiB]");
-                eprintln!("  --compact-min-files <N> / --compact-max-files <N>");
-                eprintln!("                       Tables a minor compaction merges [3 / 10]");
-                eprintln!("  --compact-ratio <F>  A table joins a minor window only if it is at");
-                eprintln!("                       most F x the rest of the window [1.2]");
-                eprintln!("  --compact-min-size-bytes <N>");
-                eprintln!("                       A window smaller than this skips the ratio");
-                eprintln!("                       test [1 MiB]");
-                eprintln!("  --compact-large-size-bytes <N>");
-                eprintln!("                       Tables this large never enter a minor window");
-                eprintln!("                       (a major or head-extent reclaim rewrites them) [128 MiB]");
-                eprintln!("  --compact-blocking-files <N>");
-                eprintln!("                       At this many mergeable tables a window is merged even");
-                eprintln!("                       when none is in ratio [16]");
-                eprintln!("  --deletion-compact-check-secs <N>");
-                eprintln!("                       How often each partition checks whether its");
-                eprintln!("                       SSTs hold >= 10000 tombstones and >= 30% of");
-                eprintln!("                       entries, and if so major-compacts itself");
-                eprintln!("                       [default: 300, clamp 1-86400].");
+            "--bg-rate-bytes-per-sec" => {
                 eprintln!(
-                    "  --cpu-start <N>      First core to pin partition threads to [default: 0]"
+                    "error: --bg-rate-bytes-per-sec was removed. Use \
+                     --admission-compact-rate-bytes-per-sec + \
+                     --admission-gc-rate-bytes-per-sec instead."
                 );
-                eprintln!("                       Multi-process clusters on one host need disjoint values");
-                eprintln!(
-                    "                       so PS partitions don't share cores with extent-nodes."
-                );
-                eprintln!(
-                    "                       (prefer --cpuset for explicit pre-allocation.)"
-                );
-                eprintln!("  --cpuset <SPEC>      explicit core list, taskset syntax");
-                eprintln!("                       (e.g. 4-11, 0,2,4, 0-3,8-11). Overrides the");
-                eprintln!(
-                    "                       auto-detected core list and disables --cpu-start."
-                );
-                eprintln!("                       PS uses cpuset_len/2 as max partition budget.");
-                eprintln!("  --conn-threads <N>   [DEPRECATED] accepted but ignored");
-                std::process::exit(0);
+                std::process::exit(2);
             }
-            other => eprintln!("unknown arg: {other}"),
+            // Never read by anything; the GC / compaction advisory thresholds
+            // and cooldowns are the manager's (`--gc-debt-high-bytes` etc.).
+            "--fg-qps-quota" | "--gc-debt-high-bytes" | "--compact-pending-high-bytes"
+            | "--gc-cooldown-secs" | "--compact-cooldown-secs" | "--min-pipeline-batch"
+            | "--conn-threads" => {
+                eprintln!("error: {} was removed: it had no effect on the PS", args[i]);
+                std::process::exit(2);
+            }
+            other => match autumn_params::take_flag(params, other, args.get(i + 1).map(|s| s.as_str())) {
+                Ok(autumn_params::Flag::Taken) => i += 1,
+                Ok(autumn_params::Flag::Unknown) => {
+                    eprintln!("error: unknown argument {other:?}\n\n{}", usage());
+                    std::process::exit(2);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
         }
         i += 1;
     }
@@ -522,6 +205,10 @@ fn parse_args() -> Args {
     if psid == 0 {
         eprintln!("error: --psid is required and must be non-zero");
         std::process::exit(1);
+    }
+    if let Err(e) = autumn_params::CrossCheck::cross_check(params) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
     }
 
     // --cpuset and --cpu-start are mutually exclusive at the CLI
@@ -540,43 +227,8 @@ fn parse_args() -> Args {
         advertise,
         bind_host,
         transport,
-        tcp_zerocopy_min_bytes,
         cpu_start,
         cpuset,
-        group_commit_cap,
-        ps_inflight_cap,
-        ps_sst_inflight_cap,
-        ps_flush_inflight_cap,
-        max_imm_depth,
-        max_wal_gap,
-        max_extent_size_bytes,
-        flush_mem_bytes,
-        deletion_compact_check_secs,
-        minor_policy,
-        compact_max_sst_bytes,
-        shutdown_timeout_ms,
-        major_compact_parallelism,
-        gc_parallelism,
-        conn_inflight_cap,
-        fg_rate_bytes_per_sec,
-        fg_iops_per_sec,
-        admission_compact_rate_bytes_per_sec,
-        admission_gc_rate_bytes_per_sec,
-        fg_saturated_threshold,
-        fg_qps_quota,
-        gc_debt_high_bytes,
-        compact_pending_high_bytes,
-        gc_cooldown_secs,
-        compact_cooldown_secs,
-        min_pipeline_batch,
-        read_hedge_ms,
-        sst_block_cache_bytes,
-        gc_read_chunk_bytes,
-        gc_batch_records,
-        gc_batch_bytes,
-        gc_rate_bytes_per_sec,
-        ucx_regpool_cap_bytes,
-        regpool_log_interval_secs,
         metrics_port,
         metrics_listen,
         #[cfg(feature = "profiling")]
@@ -585,128 +237,6 @@ fn parse_args() -> Args {
         pprof_out,
         #[cfg(feature = "profiling")]
         pprof_threads,
-    }
-}
-
-/// apply CLI-derived tunables BEFORE the first PartitionServer
-/// construction. Each setter is first-call-wins, so calling here
-/// guarantees the binary's values land before any library reader fires.
-fn apply_ps_tunables(args: &Args) {
-    use autumn_partition_server as ps;
-    if let Some(n) = args.group_commit_cap {
-        ps::set_max_write_batch(n);
-    }
-    if let Some(n) = args.ps_inflight_cap {
-        ps::set_ps_inflight_cap(n);
-    }
-    if let Some(n) = args.ps_sst_inflight_cap {
-        ps::set_ps_sst_inflight_cap(n);
-    }
-    if let Some(n) = args.ps_flush_inflight_cap {
-        ps::set_ps_flush_inflight_cap(n);
-    }
-    if let Some(n) = args.max_imm_depth {
-        ps::set_max_imm_depth(n);
-    }
-    if let Some(n) = args.max_wal_gap {
-        ps::set_max_wal_gap(n);
-    }
-    if let Some(n) = args.max_extent_size_bytes {
-        ps::set_max_extent_size_bytes(n);
-    }
-    if let Some(n) = args.flush_mem_bytes {
-        ps::set_flush_mem_bytes(n);
-    }
-    if let Some(n) = args.deletion_compact_check_secs {
-        if !ps::background::set_deletion_compact_check_secs(n) {
-            eprintln!("--deletion-compact-check-secs {n}: must be 1-86400");
-            std::process::exit(2);
-        }
-    }
-    if let Some(n) = args.compact_max_sst_bytes {
-        if let Err(e) = ps::set_compact_max_sst_bytes(n) {
-            eprintln!("--compact-max-sst-bytes {e}");
-            std::process::exit(2);
-        }
-    }
-    if let Err(e) = ps::compact_policy::set_minor_policy(args.minor_policy) {
-        eprintln!("--compact-*: {e}");
-        std::process::exit(2);
-    }
-    if let Some(n) = args.shutdown_timeout_ms {
-        ps::set_shutdown_timeout_ms(n);
-    }
-    if let Some(n) = args.major_compact_parallelism {
-        ps::set_ps_major_compact_parallelism(n);
-    }
-    if let Some(n) = args.gc_parallelism {
-        ps::set_ps_gc_parallelism(n);
-    }
-    if let Some(n) = args.conn_inflight_cap {
-        ps::set_ps_conn_inflight_cap(n);
-    }
-    if let Some(n) = args.fg_rate_bytes_per_sec {
-        ps::set_admission_fg_rate(n);
-    }
-    if let Some(n) = args.fg_iops_per_sec {
-        ps::set_admission_fg_iops(n);
-    }
-    if let Some(n) = args.admission_compact_rate_bytes_per_sec {
-        ps::set_admission_compact_rate(n);
-    }
-    if let Some(n) = args.admission_gc_rate_bytes_per_sec {
-        ps::set_admission_gc_rate(n);
-    }
-    if let Some(n) = args.fg_saturated_threshold {
-        ps::set_admission_fg_saturated_threshold(n);
-    }
-    if let Some(n) = args.fg_qps_quota {
-        ps::set_fg_qps_quota(n);
-    }
-    if let Some(n) = args.gc_debt_high_bytes {
-        ps::set_gc_debt_high(n);
-    }
-    if let Some(n) = args.compact_pending_high_bytes {
-        ps::set_compact_pending_high(n);
-    }
-    if let Some(n) = args.gc_cooldown_secs {
-        ps::set_gc_cooldown_secs(n);
-    }
-    if let Some(n) = args.compact_cooldown_secs {
-        ps::set_compact_cooldown_secs(n);
-    }
-    if let Some(n) = args.read_hedge_ms {
-        autumn_stream::set_read_hedge_ms(n);
-    }
-    if let Some(n) = args.sst_block_cache_bytes {
-        // coco P3: the setter rejects out-of-range values ([16MiB, 256GiB])
-        // or a too-late call — fail loudly instead of silently running with
-        // the 512MiB default.
-        if !autumn_partition_server::set_sst_block_cache_bytes(n) {
-            eprintln!(
-                "error: --sst-block-cache-bytes {n} rejected \
-                 (valid range [16MiB, 256GiB], must be set before first use)"
-            );
-            std::process::exit(2);
-        }
-    }
-    if let Some(n) = args.min_pipeline_batch {
-        eprintln!(
-            "warning: --min-pipeline-batch {n} is deprecated and ignored \
-             (partition_loop natural batching removed the launch gate)"
-        );
-    }
-    if let Some(n) = args.gc_read_chunk_bytes {
-        ps::background::set_gc_read_chunk_bytes(n);
-    }
-    if let Some(n) = args.gc_batch_records {
-        ps::background::set_gc_batch_records(n);
-    }
-    if let Some(n) = args.gc_batch_bytes {
-        ps::background::set_gc_batch_bytes(n);
-    }
-    if let Some(n) = args.gc_rate_bytes_per_sec {
-        ps::background::set_gc_rate_bytes_per_sec(n);
     }
 }
 
@@ -726,18 +256,11 @@ async fn main() -> Result<()> {
 
     let args = parse_args();
 
+    let params = autumn_partition_server::params();
     // Apply the regpool cap BEFORE any compio runtime / TLS pool init, so
-    // the first thread's `POOL` reads the operator-supplied value. The
-    // setter is `OnceLock::set`, first-call-wins; subsequent attempts are
-    // no-ops, so unrelated paths that later try to set a different value
-    // won't corrupt it.
-    if let Some(cap) = args.ucx_regpool_cap_bytes {
-        if !autumn_transport::set_regpool_cap_bytes(cap) {
-            tracing::warn!(
-                cap,
-                "regpool cap already set (ignored — first-call-wins)"
-            );
-        }
+    // the first thread's `POOL` reads the operator-supplied value.
+    if !autumn_transport::set_regpool_cap_bytes(params.ucx_regpool_cap_bytes.get()) {
+        tracing::warn!("regpool cap already set (ignored — first-call-wins)");
     }
 
     // ---- pprof CLI flags (replaces AUTUMN_PPROF_* env reads) ----
@@ -779,8 +302,7 @@ async fn main() -> Result<()> {
     }
     // ---- end pprof hook ----
 
-    // apply PS-library tunables before any library reader fires.
-    apply_ps_tunables(&args);
+    autumn_stream::set_read_hedge_ms(params.read_hedge_ms.get());
 
     if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref())
         .and_then(|()| autumn_rpc::peer_auth::designate_managers(&args.manager))
@@ -789,7 +311,7 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
     let _ = autumn_transport::init_with(args.transport);
-    autumn_rpc::client::set_prepared_zerocopy_min_bytes(args.tcp_zerocopy_min_bytes);
+    autumn_rpc::client::set_prepared_zerocopy_min_bytes(params.tcp_zerocopy_min_bytes.get());
     // --cpuset (if given) is installed BEFORE any cpu_pin reader
     // fires, so the cached core list reflects the override. Otherwise
     // fall back to the legacy --cpu-start offset.
@@ -880,7 +402,8 @@ async fn main() -> Result<()> {
     // Detach (not supervised) because this is observability-only; a panic
     // here loses the counters, not data — and compio's runtime already
     // catches the panic so the main thread stays alive.
-    if let Some(secs) = args.regpool_log_interval_secs {
+    {
+        let secs = params.regpool_log_interval_secs.get();
         if secs > 0 {
             let period = std::time::Duration::from_secs(secs);
             compio::runtime::spawn(async move {

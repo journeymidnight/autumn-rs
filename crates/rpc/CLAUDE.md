@@ -433,7 +433,7 @@ value (see autumn-client CLAUDE.md "Zero-copy selection rule"):
 |------|------|-------|---------|
 | `bulk_worthwhile` (autumn-client) | client send | expected size | which msg_type/API (read + write intent) |
 | `TCP_RECV_INTO_POOLED_MIN_BYTES` (client.rs) | client recv | actual value_len | GET-bulk response recv strategy (this table) |
-| `AUTUMN_PS_BULK_RECV_MIN_BYTES` (partition-server) | PS recv | actual tail len | bulk-write request recv strategy — `MSG_PUT_BULK` and `MSG_BATCH_PUT_BULK` alike (`drain_bulk_writes`) |
+| `--bulk-recv-min-bytes` (partition-server) | PS recv | actual tail len | bulk-write request recv strategy — `MSG_PUT_BULK` and `MSG_BATCH_PUT_BULK` alike (`drain_bulk_writes`) |
 | `handle_get_redirect` 64 KiB (partition-server) | PS route | actual clamped read len | EN-direct descriptor vs proxy read |
 
 **Why pooled-only (cancel-safety):** the recv runs in the long-lived
@@ -464,7 +464,7 @@ routes items ≥ 64 KiB to per-op `MSG_PUT_BULK` and smaller ones into
 `MSG_BATCH_PUT` via `bulk_worthwhile`; the bare `put_bulk` API does not gate, so the
 wire legitimately carries any-size `MSG_PUT_BULK` — the PS recv side re-decides on
 the ACTUAL size (`drain_bulk_writes` recv-into-pooled ≥
-`AUTUMN_PS_BULK_RECV_MIN_BYTES`, else the normal FrameDecoder path).
+`--bulk-recv-min-bytes`, else the normal FrameDecoder path).
 
 ## shard_for_extent
 

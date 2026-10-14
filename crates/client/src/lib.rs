@@ -414,7 +414,7 @@ pub const BULK_MIN_BYTES: usize = 64 * 1024;
 /// the single zero-copy selection rule. Engage bulk (`get_into`/`MSG_GET_BULK`,
 /// `put_bulk`/`MSG_PUT_BULK`) iff the value is at least `BULK_MIN_BYTES`
 /// (64 KiB). SYMMETRIC across reads and writes AND across transports — it mirrors
-/// the PS-side recv gates (`BULK_MIN_BYTES` here + `AUTUMN_PS_BULK_RECV_MIN_BYTES`
+/// the PS-side recv gates (`BULK_MIN_BYTES` here + `--bulk-recv-min-bytes`
 /// on the PS, both 64 KiB). Below 64 KiB the per-op registered/pooled-recv machinery
 /// costs more than the copy it saves (small UCX read regresses ~18%) AND the PS recv
 /// side doesn't bulk anyway, so end-to-end bulk only engages at/above 64 KiB. This is the

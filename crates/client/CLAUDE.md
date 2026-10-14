@@ -271,7 +271,7 @@ BOTH reads and writes AND BOTH transports.** This is the INTENT gate (which msg_
 to use, from the size the sender knows/expects); the two RECEIVERS re-decide their recv
 strategy on the ACTUAL size with the same 64 KiB — the client read_loop for GET-bulk
 responses (`TCP_RECV_INTO_POOLED_MIN_BYTES`), the PS ps-conn loop for PUT_BULK requests
-(`AUTUMN_PS_BULK_RECV_MIN_BYTES`) — because a reply/request can legitimately be smaller
+(`--bulk-recv-min-bytes`) — because a reply/request can legitimately be smaller
 than the intent predicted (error/NotFound = 0-length value; bare `put_bulk` doesn't gate).
 All four gates (this one + the two recv gates + the PS `handle_get_redirect` 64 KiB) are
 deliberately one value; the dispatch table lives in autumn-rpc CLAUDE.md "read_loop

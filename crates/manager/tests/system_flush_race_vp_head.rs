@@ -47,13 +47,10 @@ fn val_b(i: u32) -> Vec<u8> {
 #[test]
 fn flush_must_stamp_rotation_vp_not_claim_cursor() {
     // Rotate on small writes + hold the background flush so its claim races the
-    // cursor. Process-global (own test binary); the setter is first-call-wins,
-    // so assert it took. The guard clears the pause even on panic.
-    assert!(
-        autumn_partition_server::set_flush_mem_bytes(8 * 1024),
-        "flush_mem_bytes must be settable (OnceLock first-call-wins)"
-    );
-    autumn_partition_server::set_compact_max_sst_bytes(16 * 1024).expect("compact max sst");
+    // cursor. Process-global (own test binary). The guard clears the pause even
+    // on panic.
+    autumn_partition_server::params().flush_mem_bytes.set(8 * 1024);
+    autumn_partition_server::params().compact_max_sst_bytes.set(16 * 1024);
     autumn_partition_server::set_flush_test_pause(true);
     let _pause_guard = PauseGuard;
 

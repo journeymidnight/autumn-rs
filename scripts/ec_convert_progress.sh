@@ -54,7 +54,7 @@ done
 sleep 4
 $AO bootstrap --replication 3+0 >"$W/boot.log" 2>&1 || { echo FAIL-boot; cat "$W/boot.log"; exit 1; }
 "$BIN/autumn-ps" --cluster-secret-file "$SECRET" \
-  --psid 1 --port $PS --manager "$MGR" --data "$W/ps1" \
+  --psid 1 --port $PS --manager "$MGR" \
   --listen 127.0.0.1 --advertise "127.0.0.1:$PS" \
   --max-extent-size-bytes $((1024*1024*1024)) >"$W/ps.log" 2>&1 & PIDS+=($!)
 wp $PS || { echo FAIL-ps; tail -5 "$W/ps.log"; exit 1; }

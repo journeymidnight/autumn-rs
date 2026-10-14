@@ -92,7 +92,7 @@ with its default, its range, and `runtime` when it can also be changed while
 the process runs. Integer values accept `64M` / `1G` / `512k`.
 
 ```sh
-target/release/autumn-manager-server --help | less
+target/release/autumn-manager-server --help | less    # also autumn-ps, autumn-extent-node
 # A value outside the range, a missing value or an unknown flag exits 2 at once:
 target/release/autumn-manager-server --recovery-max-global 0; echo "exit=$?"
 #   error: --recovery-max-global 0: 0 is outside [1, 100000]   exit=2
@@ -103,6 +103,15 @@ cargo test -p autumn-server --test param_flags
 
 `--policy-fast-mode` on the manager sets the short policy windows first, so an
 explicit flag after it still wins (`--policy-fast-mode --gc-cooldown-secs 600`).
+
+Removed PS flags are refused by name (exit 2): `--fg-qps-quota`,
+`--gc-debt-high-bytes`, `--compact-pending-high-bytes`, `--gc-cooldown-secs`,
+`--compact-cooldown-secs` (they were never read; the advisory thresholds are the
+manager's), `--min-pipeline-batch`, `--conn-threads`. `--data` was never a PS
+flag and now fails too. Former env knobs are flags: the manager's recovery caps
+(`--recovery-max-global` / `-per-source` / `-per-target`), node-suspected
+timeout, in-flight sweep and connect / etcd timeouts; the EN's
+`--prealloc-bytes`, `--ec-stripe-bytes`, `--ec-recovery-stripe-bytes`.
 
 ## Cluster secret
 
@@ -2869,9 +2878,8 @@ $AO scrub EXT_ID... | --part PART_ID | --all [--wait]
 #   target; awaiting the manager's layout flip" (there is NO commit phase —
 #   see the EC copy-on-write section below), then `get-stream` the value back
 #   -> sha256 must match (chunk-encoded shards are byte-identical to a
-#   whole-extent encode). Override stripe size with
-#   AUTUMN_EXTENT_EC_STRIPE_BYTES on the EN to force many stripes on a smaller
-#   extent. Repro script: the isolated memory-mode loopback recipe (manager
+#   whole-extent encode). Start the EN with a small `--ec-stripe-bytes`
+#   (1 MiB minimum) to force many stripes on a smaller extent. Repro script: the isolated memory-mode loopback recipe (manager
 #   w/o --etcd, 4 single-shard ENs, 1 PS) used in dev.
 # EC never targets an unusable node, it substitutes one: put an EN that holds a
 #   replica of a sealed extent E into maintenance (or stop it and wait for it to
@@ -2914,7 +2922,7 @@ $AO gc --dead-bytes 1GiB PART_ID          # absolute floor: take an extent holdi
 #   COST of that floor: it is a PER-EXTENT number taken from a partition-total
 #   threshold, so at defaults (gc_debt_high 1 GiB, --max-extent-size-bytes
 #   16 GiB) an extent qualifies at 6.25% dead — up to ~15 GiB of live data
-#   relocated per 1 GiB reclaimed, x MAX_GC_ONCE=3 per dispatch, throttled by
+#   relocated per 1 GiB reclaimed, x --gc-max-extents-per-run=3 per dispatch, throttled by
 #   the 128 MiB/s GC admission cap. Safe (relocate-then-punch, never a torn
 #   read), but a bare `gc PART` on a healthy partition used to be ~a no-op and
 #   can now be a multi-GiB rewrite. Under --policy-fast-mode the floor is 1 MiB,
@@ -4375,8 +4383,8 @@ default) and the io_uring workers confined: TCP with the cluster on node-1 cores
 PS 32-47); each file is the median-write run of three. TCP 4K 54.9K write / 583K
 read ops/s, 8M 2.4 GB/s write / 7.5 GB/s read; UCX 4K 18.3K / 964K, 8M 2.2 / 5.0
 GB/s — UCX 4K writes are slow because every small append pays an rc round trip,
-which the old posix-shm baselines hid. The `--min-pipeline-batch` PS flag is deprecated
-(parsed, warns, no effect) — batch sizing is adaptive and needs no tuning knob.
+which the old posix-shm baselines hid. Batch sizing is adaptive and needs no tuning
+knob (the old `--min-pipeline-batch` PS flag is refused).
 
 **Pin the cluster away from the tenants first.** This box is shared with
 inference jobs (sglang, Ray), and a perf number taken while the cluster shares

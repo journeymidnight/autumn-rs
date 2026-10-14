@@ -35,7 +35,7 @@ const LIGHT_KEYS: u32 = 300;
 fn fast_checks() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        assert!(autumn_partition_server::background::set_deletion_compact_check_secs(1));
+        autumn_partition_server::params().deletion_compact_check_secs.set(1);
     });
 }
 

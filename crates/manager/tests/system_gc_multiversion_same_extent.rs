@@ -12,7 +12,7 @@
 //! the new value is gone and the old value is revived → silent lost-update.
 //!
 //! This test forces the flush-before-scan condition deterministically with
-//! `set_gc_batch_records(1)` (each relocated record flushes immediately), so a
+//! `gc_batch_records = 1` (each relocated record flushes immediately), so a
 //! small (5 KiB, still VP) value reproduces it without needing ≥4 MiB values.
 //!
 //! Seal of the shared log extent is via `split` (the proven harness pattern —
@@ -43,12 +43,8 @@ fn val(tag: u8) -> Vec<u8> {
 fn gc_same_key_two_large_versions_same_extent_keeps_newest() {
     // Force GC to flush every relocated record immediately so a superseded
     // older version (scanned + relocated first) becomes the live version
-    // before the newer version is scanned — the exact P0 race. Must run
-    // before the PS performs any GC (the OnceLock is set-once).
-    assert!(
-        autumn_partition_server::background::set_gc_batch_records(1),
-        "set_gc_batch_records must win the OnceLock before any GC"
-    );
+    // before the newer version is scanned — the exact P0 race.
+    autumn_partition_server::params().gc_batch_records.set(1);
 
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

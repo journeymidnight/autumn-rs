@@ -6,10 +6,10 @@
 //!      `Arc<AtomicBool>` shutdown flag. The thread runs
 //!      `ps.serve_until_shutdown(addr, fut)` where `fut` polls the flag.
 //!   3. Write enough small entries to populate the active memtable
-//!      WITHOUT triggering a 256 MB FLUSH_MEM_BYTES rotate (we want
+//!      WITHOUT triggering a 256 MB `--flush-mem-bytes` rotate (we want
 //!      active to hold un-flushed data when shutdown fires).
 //!   4. Set the shutdown flag. Assert the thread joins within
-//!      `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` (set tight at 5 s for the test).
+//!      `--shutdown-timeout-ms` (set tight at 5 s for the test).
 //!   5. After the thread exits cleanly, spawn a SECOND PS pointing at
 //!      the same partitions. Verify that every previously-written key
 //!      is readable. This proves the post-shutdown on-disk state
@@ -43,10 +43,8 @@ use support::*;
 
 #[test]
 fn graceful_shutdown_drains_active_to_sst() {
-    // Tighten shutdown deadline so the test fails fast on regression.
-    // Read by `shutdown_timeout_ms()` once via OnceLock — must be set
-    // before the PS thread spawns.
-    std::env::set_var("AUTUMN_PS_SHUTDOWN_TIMEOUT_MS", "5000");
+    // Tighten the shutdown deadline so the test fails fast on regression.
+    autumn_partition_server::params().shutdown_timeout_ms.set(5000);
 
     let mgr_addr = pick_addr();
     let n1_addr = pick_addr();
@@ -75,7 +73,7 @@ fn graceful_shutdown_drains_active_to_sst() {
     // Wait for PS to bind its per-partition listener.
     std::thread::sleep(Duration::from_millis(800));
 
-    // Write 64 entries × 256 B ≈ 16 KB — well below FLUSH_MEM_BYTES.
+    // Write 64 entries × 256 B ≈ 16 KB — well below `--flush-mem-bytes`.
     let n_keys: usize = 64;
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let ps = RpcClient::connect(ps_addr).await.expect("ps connect");

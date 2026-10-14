@@ -206,9 +206,10 @@ impl ManagerParams {
         self.merge_cooldown_secs.set(30);
         self.sealed_empty_sweep_interval_secs.set(5);
     }
+}
 
-    /// Checks that span several parameters.
-    pub fn validate(&self) -> Result<(), String> {
+impl crate::CrossCheck for ManagerParams {
+    fn cross_check(&self) -> Result<(), String> {
         if self.policy_required_buckets.get() > self.policy_window_buckets.get() {
             return Err(format!(
                 "--policy-required-buckets {} exceeds --policy-window-buckets {}",

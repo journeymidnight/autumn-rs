@@ -99,11 +99,8 @@ fn queued_value(i: u32) -> Vec<u8> {
 
 #[test]
 fn truncation_proceeds_while_a_flush_is_queued() {
-    assert!(
-        autumn_partition_server::set_flush_mem_bytes(8 * 1024),
-        "flush_mem_bytes was already set in this test binary"
-    );
-    autumn_partition_server::set_compact_max_sst_bytes(16 * 1024).expect("compact max sst");
+    autumn_partition_server::params().flush_mem_bytes.set(8 * 1024);
+    autumn_partition_server::params().compact_max_sst_bytes.set(16 * 1024);
     let _guard = PauseGuard;
     // The truncate under test is the expiry major's; a minor of the three
     // SSTs would empty the first two extents before it.

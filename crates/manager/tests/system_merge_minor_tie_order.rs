@@ -69,13 +69,7 @@ async fn put_flush(c: &RpcClient, part: u64, prefix: &str, n: usize) {
 #[test]
 fn a_tied_last_seq_does_not_move_a_minor_output_past_a_newer_table() {
     // Every window faces the ratio test, so the big tables stay out of it.
-    autumn_partition_server::compact_policy::set_minor_policy(
-        autumn_partition_server::compact_policy::MinorPolicy {
-            min_size: 1,
-            ..Default::default()
-        },
-    )
-    .expect("policy");
+    autumn_partition_server::params().compact_min_size_bytes.set(1);
     autumn_partition_server::background::set_minor_compaction_paused(true);
     let mgr_addr = pick_addr();
     let en_addr = pick_addr();

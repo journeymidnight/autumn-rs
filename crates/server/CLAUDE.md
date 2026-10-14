@@ -68,10 +68,10 @@ autumn-extent-node --cluster-secret-file FILE --data DIR[,DIR2,...] [--port 9101
 **Default port**: 9201
 
 ```
-autumn-ps --cluster-secret-file FILE --psid <ID> --manager 127.0.0.1:9001 [--port 9201] [--data /tmp] [--advertise <ADDR>]
+autumn-ps --cluster-secret-file FILE --psid <ID> --manager 127.0.0.1:9001 [--port 9201] [--advertise <ADDR>]
 ```
 
-- `--psid`: **required**, unique partition-server ID across the cluster. `--data`: directory for local WAL files (`part-{id}.wal`). `--advertise`: address announced to the manager (when listening on 0.0.0.0 but the manager needs a routable address).
+- `--psid`: **required**, unique partition-server ID across the cluster. The PS keeps no local files (its WAL is the log stream). `--advertise`: address announced to the manager (when listening on 0.0.0.0 but the manager needs a routable address).
 - Startup: connect to manager → `RegisterPs(ps_id, advertise_addr)` → `GetRegions()` for assigned partitions → `open_partition()` (replay from streams) each → serve `PartitionKv` gRPC.
 
 ### `autumn-client` (`src/bin/autumn_client/`)
@@ -532,7 +532,7 @@ autumn-op "${S[@]}" --manager 127.0.0.1:9001 format /tmp/extent0
 autumn-extent-node "${S[@]}" --data /tmp/extent0 --port 9101 --manager 127.0.0.1:9001 \
     --advertise 127.0.0.1:9101 &
 autumn-op "${S[@]}" --manager 127.0.0.1:9001 bootstrap --replication 1+0
-autumn-ps "${S[@]}" --psid 1 --port 9201 --manager 127.0.0.1:9001 --data /tmp/ps1 &
+autumn-ps "${S[@]}" --psid 1 --port 9201 --manager 127.0.0.1:9001 &
 
 # Write and read (data plane = autumn-client)
 echo "hello world" > /tmp/val.txt

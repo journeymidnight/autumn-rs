@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use autumn_partition_server::{replay_read_bytes, set_shutdown_timeout_ms, PartitionServer};
+use autumn_partition_server::{replay_read_bytes, PartitionServer};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::partition_rpc::CODE_OK;
 use support::*;
@@ -38,8 +38,8 @@ struct Cluster {
 }
 
 fn start_cluster(part_id: u64) -> Cluster {
-    // Bounds every wait inside `shutdown()`; first setter in the process wins.
-    set_shutdown_timeout_ms(10_000);
+    // Bounds every wait inside `shutdown()`.
+    autumn_partition_server::params().shutdown_timeout_ms.set(10_000);
     let mgr_addr = pick_addr();
     let n1_addr = pick_addr();
     start_manager(mgr_addr);

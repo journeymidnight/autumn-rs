@@ -587,24 +587,6 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_FG_SATURATED_THRESHOLD:-}" ]]; then
         tunable_args+=(--fg-saturated-threshold "$AUTUMN_PS_FG_SATURATED_THRESHOLD")
     fi
-    if [[ -n "${AUTUMN_PS_FG_QPS_QUOTA:-}" ]]; then
-        tunable_args+=(--fg-qps-quota "$AUTUMN_PS_FG_QPS_QUOTA")
-    fi
-    if [[ -n "${AUTUMN_PS_GC_DEBT_HIGH_BYTES:-}" ]]; then
-        tunable_args+=(--gc-debt-high-bytes "$AUTUMN_PS_GC_DEBT_HIGH_BYTES")
-    fi
-    if [[ -n "${AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES:-}" ]]; then
-        tunable_args+=(--compact-pending-high-bytes "$AUTUMN_PS_COMPACT_PENDING_HIGH_BYTES")
-    fi
-    if [[ -n "${AUTUMN_PS_GC_COOLDOWN_SECS:-}" ]]; then
-        tunable_args+=(--gc-cooldown-secs "$AUTUMN_PS_GC_COOLDOWN_SECS")
-    fi
-    if [[ -n "${AUTUMN_PS_COMPACT_COOLDOWN_SECS:-}" ]]; then
-        tunable_args+=(--compact-cooldown-secs "$AUTUMN_PS_COMPACT_COOLDOWN_SECS")
-    fi
-    if [[ -n "${AUTUMN_PS_MIN_BATCH:-}" ]]; then
-        tunable_args+=(--min-pipeline-batch "$AUTUMN_PS_MIN_BATCH")
-    fi
     if [[ -n "${AUTUMN_READ_HEDGE_MS:-}" ]]; then
         tunable_args+=(--read-hedge-ms "$AUTUMN_READ_HEDGE_MS")
     fi

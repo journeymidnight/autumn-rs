@@ -9,13 +9,6 @@
 
 use std::time::{Duration, Instant};
 
-/// How much a scrub may read per second, PER SHARD, unless the node is started
-/// with another figure (`--scrub-bytes-per-sec`).
-///
-/// Per shard, not per node: each `ExtentNode` runs its own scrub worker, so a
-/// node with N shards reads at up to N times this.
-pub const SCRUB_DEFAULT_BYTES_PER_SEC: u64 = 8 * 1024 * 1024;
-
 /// The most a pacer lets a reader run ahead of its rate after being idle.
 ///
 /// An idle stretch must not bank credit for a burst against live reads — the
@@ -36,6 +29,13 @@ impl ScrubPacer {
         Self {
             bytes_per_sec,
             epoch: None,
+        }
+    }
+
+    /// Follow a changed rate (a runtime override) from the next read on.
+    pub(crate) fn set_rate(&mut self, bytes_per_sec: u64) {
+        if bytes_per_sec != self.bytes_per_sec {
+            *self = Self::new(bytes_per_sec);
         }
     }
 
@@ -103,5 +103,18 @@ mod tests {
         for _ in 0..10 {
             assert_eq!(p.pace(t0, 64 * MIB), Duration::ZERO);
         }
+    }
+
+    /// A changed rate restarts the run at the new rate; an unchanged one keeps it.
+    #[test]
+    fn a_new_rate_restarts_the_run() {
+        let t0 = Instant::now();
+        let mut p = ScrubPacer::new(8 * MIB);
+        assert_eq!(p.pace(t0, MIB), Duration::ZERO);
+        p.set_rate(8 * MIB);
+        assert_eq!(p.pace(t0, MIB), Duration::from_millis(125));
+        p.set_rate(MIB);
+        assert_eq!(p.pace(t0, MIB), Duration::ZERO);
+        assert_eq!(p.pace(t0, MIB), Duration::from_secs(1));
     }
 }

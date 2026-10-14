@@ -239,7 +239,7 @@ fn concurrent_append_preserves_order_within_stream() {
 
 /// Test 2: Back-pressure cap caps the worker's FuturesUnordered depth.
 ///
-/// Set `AUTUMN_STREAM_INFLIGHT_CAP=4` and submit 100 ops concurrently.  All
+/// Build the client with an inflight cap of 4 and submit 100 ops concurrently.  All
 /// must complete (no deadlock).  We can't directly probe `inflight.len()`
 /// from outside the worker, but the bounded-channel + inflight-cap
 /// combination guarantees at-most `CAP + STREAM_SUBMIT_CAP` ops are ever
@@ -251,17 +251,6 @@ fn concurrent_append_preserves_order_within_stream() {
 ///  - callers parked on bounded `send().await` eventually progress
 #[test]
 fn worker_handles_back_pressure() {
-    // NOTE: env_var must be set BEFORE the StreamClient spawns its first
-    // worker; the cap is read once at worker-task startup.
-    std::env::set_var("AUTUMN_STREAM_INFLIGHT_CAP", "4");
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            std::env::remove_var("AUTUMN_STREAM_INFLIGHT_CAP");
-        }
-    }
-    let _restore = Restore;
-
     let (mgr_addr, n_addr) = spawn_stack();
 
     compio::runtime::Runtime::new()
@@ -269,11 +258,15 @@ fn worker_handles_back_pressure() {
         .block_on(async move {
             let stream_id = setup_stream(mgr_addr, n_addr).await;
             let pool = Rc::new(ConnPool::new());
-            let client = StreamClient::connect(
+            let client = StreamClient::connect_with_config(
                 &mgr_addr.to_string(),
                 "owner/sqcq/backpressure".to_string(),
                 256 * 1024 * 1024,
                 pool,
+                autumn_stream::client::StreamClientConfig {
+                    inflight_cap: 4,
+                    ..Default::default()
+                },
             )
             .await
             .expect("stream client");

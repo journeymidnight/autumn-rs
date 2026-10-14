@@ -177,7 +177,7 @@ fn parse_args() -> Args {
         eprintln!("error: --manager-id <N> (non-zero) is required with --etcd");
         std::process::exit(2);
     }
-    if let Err(e) = params.validate() {
+    if let Err(e) = autumn_params::CrossCheck::cross_check(&params) {
         eprintln!("error: {e}");
         std::process::exit(2);
     }

@@ -85,7 +85,7 @@ disk), then fewest OPEN extents, then fewest held, then least recently picked.
 It used to return the first allocatable disk in `HashMap` order, which stuck to
 one disk until it filled — per shard, since the map is randomly seeded, so a
 multi-shard node was already spread by accident and a single-shard one was not.
-Free space cannot decide alone: at the default `--en-prealloc-bytes` of 0,
+Free space cannot decide alone: at the default `--prealloc-bytes` of 0,
 creating an extent moves it by nothing, so the open count is the only signal a
 new extent changes. The least-recently-picked stamp is set synchronously inside
 the choice, before the first await, because several awaits separate it from the
@@ -315,7 +315,7 @@ they happen — not gated on a burst boundary.
 │    owns OwnedReadHalf + the decoder's read window (≥512 KiB);    │
 │    NEVER dropped mid-flight (io_uring SQE stability)             │
 │  CQ — FuturesUnordered<Pin<Box<dyn Future<Vec<Bytes>>>>>         │
-│    cap = AUTUMN_EXTENT_INFLIGHT_CAP (default 64)                 │
+│    cap = --inflight-cap (default 64)                             │
 │    holds in-flight append/read batch + control-rpc futures       │
 │  Loop:                                                           │
 │    1. drain ready completions via `.next().now_or_never()`       │
@@ -839,8 +839,8 @@ belt-and-braces for leader-failover where `pending_extent_deletes` is lost but
 ### Startup + periodic orphan reconcile
 
 `ExtentNode::new` spawns `spawn_reconcile_orphans_loop()` after
-`load_extents()`: runs immediately, then every `RECONCILE_SWEEP_INTERVAL`
-(5 min, exported so tests derive their wait from it). Each iteration ships
+`load_extents()`: runs immediately, then every `--reconcile-sweep-interval-secs`
+(5 min; tests derive their wait from `en_params()`). Each iteration ships
 every locally-loaded (shard-owned) `extent_id` to the manager via
 `MSG_RECONCILE_EXTENTS = 0x31`. The answer is **file-granular**: `garbage`
 (extents this node is not a member of — delete everything) plus `placements`
@@ -1010,19 +1010,19 @@ is where bytes/s + iops limits matter.
 
 ### Configuration
 
-| CLI flag | Env (shell→flag) | Default | Range |
-|----------|------------------|---------|-------|
-| `--ec-convert-parallelism` | `AUTUMN_EXTENT_EC_CONVERT_PARALLELISM` | 1 | [1, 16] |
-| `--recovery-parallelism` | `AUTUMN_EXTENT_RECOVERY_PARALLELISM` | 2 | [1, 16] |
-| `--ec-stripe-bytes` | `AUTUMN_EXTENT_EC_STRIPE_BYTES` (test override) | 64 MiB | [1 MiB, 1 GiB] |
-| `--fd-cache-cap` | `AUTUMN_EXTENT_FD_CACHE_CAP` | 4096 | floored 64, clamped by shard count |
-| `--no-direct-io` | `AUTUMN_EXTENT_DIRECT_IO=0` (only 0 or 1) | on (Linux), off elsewhere | startup O_DIRECT open of each `disk_id` while on |
-
-`--ec-stripe-bytes` (process-global, `set_ec_encode_stripe_bytes`, OnceLock
-first-call-wins; precedence flag > env > default) is the chunked EC-convert
-stripe size. Peak EC-convert RAM = `(K+M) × stripe`; bigger = fewer WriteShard
-RPCs / syncs at higher RAM. Max 1 GiB keeps a single stripe's WriteShard under
-the frame `payload_len: u32` ceiling.
+Every extent-node tunable is declared in `crates/params/src/en.rs` (`EnParams`):
+one process-wide instance, `autumn_stream::en_params()`, shared by all shards;
+`autumn-extent-node --help` lists them. No EN tunable is read from the
+environment (deploy scripts map their own env vars to flags). `--recovery-parallelism`
+and `--scrub-bytes-per-sec` are runtime parameters: `ConcurrencyController::caps`
+reads the caps on every acquire (`from_params`; tests build fixed caps with
+`new`), and the scrub worker hands the rate to its `ScrubPacer` before each
+task (`set_rate` restarts the pacing run when it changed). `--ec-stripe-bytes`
+sets the chunked EC-convert stripe: peak EC-convert RAM = `(K+M) × stripe`;
+bigger = fewer WriteShard RPCs / syncs at higher RAM, and the 1 GiB cap keeps a
+single stripe's WriteShard under the frame `payload_len: u32` ceiling.
+`--no-direct-io` stays a plain switch of the binary (O_DIRECT is on by default on
+Linux).
 
 ---
 
@@ -1134,7 +1134,7 @@ append*(stream_id, payload):
 │     - in_flight: u32                                             │
 │     - poisoned: bool ; sealing: bool ; failure_floor             │
 │  OWNS: inflight: FuturesUnordered<InflightFut>                   │
-│     cap = AUTUMN_STREAM_INFLIGHT_CAP (default 32)                │
+│     cap = --stream-inflight-cap (default 32)                │
 │  RECV: submit_rx: mpsc::Receiver<StreamSubmitMsg>                │
 │                                                                 │
 │  SQ (launch_append):                                            │
@@ -1184,7 +1184,7 @@ first append would overwrite committed bytes).
 | Concern | Behaviour |
 |---------|-----------|
 | Submit mpsc cap | 256 per stream. Parked callers wake as the worker drains. |
-| Inflight cap | `AUTUMN_STREAM_INFLIGHT_CAP` (default 32); `at_cap` → CQ-only. |
+| Inflight cap | `--stream-inflight-cap` (default 32); `at_cap` → CQ-only. |
 | Worker lifecycle | Spawned lazily on first `append*`; exits on channel close / `Shutdown` after draining all inflight for a final ack. |
 | Worker removal | On exit a `WorkerRemovalGuard` (via `Weak<StreamClient>`) removes the Sender **only if the entry still carries its own generation**, and then also drops the stream's init flag; next `append*` spawns fresh AND re-initialises. See note 35. |
 | `LockedByOther` | Propagated immediately; PS owner self-evicts. |
@@ -1274,7 +1274,7 @@ client as its own code and self-heals differently.
 bounds a read by the FILE, a log extent is 16 GiB, `ReadBytesReq.length` is a
 u64 and `0` means to-end — so one remote request can ask for four times what
 the frame header's `payload_len: u32` can express. Most in-tree clients chunk at
-`AUTUMN_STREAM_READ_CHUNK_BYTES` (256 MiB), but not all — `ec_read_full` sends a
+`--stream-read-chunk-bytes` (256 MiB), but not all — `ec_read_full` sends a
 whole-shard `length = 0` read and `stream_one_source` does the same with
 `total == 0`, so a 16 GiB EC extent at K=3 or K=4 is now REFUSED where it used
 to wrap. That is the same outcome, typed instead of silent; those callers have
@@ -1328,7 +1328,7 @@ on replica[0] created a hotspot). Appends stay replica[0]-first
 - Optional **hedged read** (`set_read_hedge_ms`, default 0=off): if the first
   replica hasn't answered within the window, race the second and take the first
   Ok (eversion-stale still fails fast; loser drop is cancel-safe).
-- **Chunked** at `AUTUMN_STREAM_READ_CHUNK_BYTES` (default 256 MiB) so reads
+- **Chunked** at `--stream-read-chunk-bytes` (default 256 MiB) so reads
   >2 GiB don't trip the per-syscall pread ceiling (macOS INT_MAX / Linux
   0x7ffff000). EC = parallel per-shard reads with decode. `length=0` resolves
   to-end via `sealed_length` (sealed) or `commit_length_for_extent` (open)
@@ -1379,7 +1379,7 @@ and from other crates' CLAUDE.md); do not renumber.
 
 11. **ConnPool is single-kind** — keys by `SocketAddr` alone; each address owns one sequential `RpcConn` on `Rc<RefCell<Option<RpcConn>>>` (take/put; if taken, open a fresh connection on the fly). There is no `PoolKind`.
 
-12. **Chunked reads for >2 GiB extents** — `read_bytes_from_extent` splits requests larger than `AUTUMN_STREAM_READ_CHUNK_BYTES` (default 256 MiB) into per-replica RPCs. Without chunking a single `pread` of 3 GiB returns `EINVAL` (macOS INT_MAX, Linux 0x7ffff000). `length=0` resolves the byte count via `ExtentInfo.sealed_length` (sealed) or `commit_length_for_extent` (open), then chunks. EC dispatch goes straight to `ec_subrange_read`, so **`read_shard_from_addr` chunks internally at `read_chunk_bytes` (u64-offset)** — the single EC choke point that bounds each RPC ≤ 256 MiB (an EC shard is `sealed_length / data_shards`; a 16 GiB / K=3 extent has ~5.33 GiB shards, and a full-shard `MSG_READ_BYTES` would overflow the response frame's `payload_len: u32`).
+12. **Chunked reads for >2 GiB extents** — `read_bytes_from_extent` splits requests larger than `--stream-read-chunk-bytes` (default 256 MiB) into per-replica RPCs. Without chunking a single `pread` of 3 GiB returns `EINVAL` (macOS INT_MAX, Linux 0x7ffff000). `length=0` resolves the byte count via `ExtentInfo.sealed_length` (sealed) or `commit_length_for_extent` (open), then chunks. EC dispatch goes straight to `ec_subrange_read`, so **`read_shard_from_addr` chunks internally at `read_chunk_bytes` (u64-offset)** — the single EC choke point that bounds each RPC ≤ 256 MiB (an EC shard is `sealed_length / data_shards`; a 16 GiB / K=3 extent has ~5.33 GiB shards, and a full-shard `MSG_READ_BYTES` would overflow the response frame's `payload_len: u32`).
 
 13. **Chunked local-file I/O for >2 GiB extents** — server-side helpers in `extent_node.rs` (`FILE_IO_CHUNK_BYTES = 256 MiB`): `file_pread_chunked` (convert, read, copy) and `file_pwrite_chunked` (recovery, re_avali, write_shard; splits via `Bytes::split_to`, O(1)). Both fast-path a single syscall when payload ≤ 256 MiB. **Any new full-extent local-file read/write MUST use these — never call `file_pread`/`file_pwrite` directly with a `sealed_length`-sized buffer.**
 

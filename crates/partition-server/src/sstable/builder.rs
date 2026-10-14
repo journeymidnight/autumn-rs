@@ -56,7 +56,7 @@ impl SstBuilder {
             current: Vec::new(),
             entry_offsets: Vec::new(),
             base_key: Vec::new(),
-            bloom: BloomFilterBuilder::new(expected_keys, 0.01),
+            bloom: BloomFilterBuilder::new(expected_keys, crate::params().sst_bloom_fp_rate.get()),
             seq_num: 0,
             vp_extent_id,
             vp_offset,

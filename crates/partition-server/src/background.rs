@@ -16,13 +16,6 @@ use crate::sstable::{
     AsyncMergeIterator, AsyncTableIterator, FetchMode, IterItem, SstBuilder, SstReader,
 };
 
-/// bulk-read window for sequential SST sweeps (compaction merge
-/// inputs, split key-scan). One `read_bytes_from_extent` per window,
-/// bypassing the BlockCache (scan-resistant). 8 MiB ≈ 128 blocks per RPC —
-/// large enough to amortize the round trip, small enough that N concurrent
-/// merge inputs hold N × 8 MiB instead of Σ SST bytes (the Stage-1
-/// materialization this replaces).
-pub(crate) const SCAN_READ_WINDOW_BYTES: u32 = 8 * 1024 * 1024;
 use crate::*;
 use crate::metrics::MinorCause;
 
@@ -72,7 +65,9 @@ fn is_frozen_for_maintenance(part: &Rc<RefCell<PartitionData>>) -> bool {
 
 /// How often the tick may probe the row stream's head extent for a reclaim
 /// (two manager RPCs), and how often it logs that no minor window exists.
-const RECLAIM_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+fn reclaim_check_interval() -> Duration {
+    Duration::from_secs(crate::params().reclaim_check_interval_secs.get())
+}
 
 /// Test switch: while set, no minor compaction is requested (flush, tick,
 /// reclaim), so a test can build a table shape first. Only tests set it.
@@ -102,31 +97,20 @@ pub fn minor_compaction_runs() -> (u64, u64, u64) {
 /// shadows until a major compaction drops both, so without this a partition
 /// that keeps deleting makes every scan over the deleted keys pay for all of
 /// them (measured: 13 M tombstones, 185 s for the first page after a restart).
-const DELETION_COMPACT_MIN_TOMBSTONES: u64 = 10_000;
-const DELETION_COMPACT_TOMBSTONES_PERCENT: u64 = 30;
-/// How often the rule is evaluated (TiKV's `region-compact-check-interval`).
-/// It also bounds how often it can compact a partition that keeps deleting.
-const DELETION_COMPACT_CHECK_SECS_DEFAULT: u64 = 300;
-static DELETION_COMPACT_CHECK_SECS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-/// `autumn-ps --deletion-compact-check-secs`. First call wins.
-pub fn set_deletion_compact_check_secs(secs: u64) -> bool {
-    if !(1..=86_400).contains(&secs) {
-        return false;
-    }
-    DELETION_COMPACT_CHECK_SECS_CELL.set(secs).is_ok()
-}
-
+/// (`--deletion-compact-min-tombstones`, `--deletion-compact-min-percent`).
+/// The rule is evaluated every `--deletion-compact-check-secs` (TiKV's
+/// `region-compact-check-interval`), which also bounds how often it can compact
+/// a partition that keeps deleting.
 fn deletion_compact_check_interval() -> Duration {
-    Duration::from_secs(
-        *DELETION_COMPACT_CHECK_SECS_CELL.get_or_init(|| DELETION_COMPACT_CHECK_SECS_DEFAULT),
-    )
+    Duration::from_secs(crate::params().deletion_compact_check_secs.get())
 }
 
 /// TiKV's rule over the sums of `num_entries` / `num_deletions`.
 fn deletions_need_compaction(entries: u64, deletions: u64) -> bool {
-    deletions >= DELETION_COMPACT_MIN_TOMBSTONES
-        && deletions.saturating_mul(100) >= entries.saturating_mul(DELETION_COMPACT_TOMBSTONES_PERCENT)
+    let p = crate::params();
+    deletions >= p.deletion_compact_min_tombstones.get()
+        && deletions.saturating_mul(100)
+            >= entries.saturating_mul(p.deletion_compact_min_percent.get())
 }
 
 /// `(Σ num_entries, Σ num_deletions)` over the partition's live SSTs.
@@ -134,37 +118,6 @@ pub(crate) fn sst_entry_counts(p: &crate::PartitionData) -> (u64, u64) {
     p.sst_readers
         .iter()
         .fold((0, 0), |(e, d), r| (e + r.num_entries, d + r.num_deletions))
-}
-
-// process-global setter cells for the background.rs knobs.
-// Each was formerly an inner static OnceLock+env read; now lifted to
-// module scope with paired pub setters that the autumn-ps binary calls
-// from main() based on CLI args. (MIN_PIPELINE_BATCH_CELL was removed.)
-pub(crate) static GC_READ_CHUNK_BYTES_CELL: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-pub(crate) static GC_BATCH_RECORDS_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-pub(crate) static GC_BATCH_BYTES_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-pub(crate) static GC_RATE_BYTES_PER_SEC_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-
-pub fn set_gc_read_chunk_bytes(n: u32) -> bool {
-    if n == 0 {
-        return false;
-    }
-    GC_READ_CHUNK_BYTES_CELL.set(n).is_ok()
-}
-pub fn set_gc_batch_records(n: usize) -> bool {
-    if !(1..=4096).contains(&n) {
-        return false;
-    }
-    GC_BATCH_RECORDS_CELL.set(n).is_ok()
-}
-pub fn set_gc_batch_bytes(n: usize) -> bool {
-    if !(64 * 1024..=256 * 1024 * 1024).contains(&n) {
-        return false;
-    }
-    GC_BATCH_BYTES_CELL.set(n).is_ok()
-}
-pub fn set_gc_rate_bytes_per_sec(n: u64) -> bool {
-    GC_RATE_BYTES_PER_SEC_CELL.set(n).is_ok()
 }
 
 /// Test sync-point: when set, `process_gc_chunk` parks a VP record's liveness
@@ -555,17 +508,14 @@ pub(crate) async fn background_maintenance_loop(
     // acquire the single per-partition `maintenance_gate` vs SPLIT (which runs
     // on partition_loop, a different task, and must see no compact_row_append
     // nor log_stream GC append in flight while it seals). See lock notes.
-    const MAX_GC_ONCE: usize = 3;
+    let p = crate::params();
     // Empty sealed extents (sealed_length == 0) are FREE to reclaim — `run_gc`
     // skips the read/relocate loop and only calls `punch_holes`. They sort LAST
     // in the discard-desc candidate order (0 reclaimable bytes), so sharing the
-    // MAX_GC_ONCE budget with big rewrite candidates let them starve forever
-    // under split/merge churn (which mints empty sealed tails in bulk). Give
-    // them their OWN, more generous per-tick budget so they drain promptly.
-    const MAX_GC_EMPTY_ONCE: usize = 32;
-    const GC_DISCARD_RATIO: f64 = 0.4;
-    const GC_FAILURE_COOLDOWN: Duration = Duration::from_secs(300);
-    const GC_FAILURE_COOLDOWN_SOFT: Duration = Duration::from_secs(30);
+    // `--gc-max-extents-per-run` budget with big rewrite candidates let them
+    // starve forever under split/merge churn (which mints empty sealed tails in
+    // bulk). They get their OWN, more generous budget
+    // (`--gc-max-empty-per-run`) so they drain promptly.
     let mut gc_failure_cooldown: std::collections::HashMap<u64, (Instant, Duration)> =
         std::collections::HashMap::new();
 
@@ -576,13 +526,12 @@ pub(crate) async fn background_maintenance_loop(
     let mut next_compact_at = Instant::now() + random_delay();
     let mut next_gc_at = Instant::now() + random_delay();
     // next open-tail size probe (fires immediately on
-    // first iteration, then every SIZE_REFRESH_INTERVAL).
+    // first iteration, then every `--size-refresh-interval-secs`).
     let mut next_size_refresh_at = Instant::now();
-    const SIZE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
     // First check on the first tick, so a partition that opens with
     // tombstone-heavy SSTs is compacted without waiting a whole interval.
     let mut next_deletion_check_at = Instant::now();
-    let mut next_reclaim_check_at = Instant::now() + RECLAIM_CHECK_INTERVAL;
+    let mut next_reclaim_check_at = Instant::now() + reclaim_check_interval();
     let reclaim_probe_inflight = Rc::new(Cell::new(false));
     let mut next_no_window_log_at = Instant::now();
 
@@ -610,7 +559,7 @@ pub(crate) async fn background_maintenance_loop(
         // misreport, e.g. a briefly-unreachable replica dropping to a tiny
         // number). Read by report_load_loop → shipped to the manager.
         if now >= next_size_refresh_at {
-            next_size_refresh_at = now + SIZE_REFRESH_INTERVAL;
+            next_size_refresh_at = now + Duration::from_secs(p.size_refresh_interval_secs.get());
             let (sc, log_id, row_id, meta_id, metrics) = {
                 let p = part.borrow();
                 // revive the size gauge here (local +
@@ -769,7 +718,7 @@ pub(crate) async fn background_maintenance_loop(
                 // not after gate.acquire(). The scheduler reads
                 // compact_inflight to gate duplicate dispatches; the
                 // gate.acquire() can block for seconds when other
-                // partitions hold AUTUMN_PS_MAJOR_COMPACT_PARALLELISM.
+                // partitions hold --major-compact-parallelism.
                 metrics
                     .compact_inflight
                     .store(1, std::sync::atomic::Ordering::Relaxed);
@@ -1076,11 +1025,11 @@ pub(crate) async fn background_maintenance_loop(
                     let (n_tables, min_files) =
                         (part.borrow().tables.len(), crate::compact_policy::minor_policy().min_files);
                     if n_tables >= min_files && now >= next_no_window_log_at {
-                        next_no_window_log_at = now + RECLAIM_CHECK_INTERVAL;
+                        next_no_window_log_at = now + reclaim_check_interval();
                         tracing::debug!(part_id, n_tables, "minor compaction: no window in ratio");
                     }
                     if now >= next_reclaim_check_at && !reclaim_probe_inflight.get() {
-                        next_reclaim_check_at = now + RECLAIM_CHECK_INTERVAL;
+                        next_reclaim_check_at = now + reclaim_check_interval();
                         spawn_reclaim_probe(&part, part_id, reclaim_probe_inflight.clone());
                     }
                 }
@@ -1341,7 +1290,7 @@ pub(crate) async fn background_maintenance_loop(
                         let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
                         let mut hs: Vec<(u64, u64)> = Vec::new();
                         let mut skipped = 0usize;
-                        // coco P3: count the MAX_GC_ONCE quota by VALIDATED holes, not by
+                        // coco P3: count the --gc-max-extents-per-run quota by VALIDATED holes, not by
                         // input candidates — i.e. apply `take` AFTER `authoritative_
                         // sealed_length`, not before. Otherwise a transient `None`
                         // (manager RPC hiccup / not-yet-observable seal) on the first
@@ -1349,7 +1298,7 @@ pub(crate) async fn background_maintenance_loop(
                         // valid ones, and Force GC is a one-shot consume (no "later
                         // tick" for the skipped tail).
                         for e in extent_ids.iter().copied().filter(|e| idx.contains(e)) {
-                            if hs.len() >= MAX_GC_ONCE {
+                            if hs.len() >= p.gc_max_extents_per_run.get() {
                                 break;
                             }
                             // Even an operator Force GC must not punch on stale/open
@@ -1407,7 +1356,7 @@ pub(crate) async fn background_maintenance_loop(
                         let effective_ratio = if params.empty_only {
                             f64::INFINITY // ratio gate unreachable
                         } else {
-                            let r = params.ratio.unwrap_or(GC_DISCARD_RATIO);
+                            let r = params.ratio.unwrap_or(p.gc_discard_ratio.get());
                             if stream_debt_hit {
                                 r * 0.5
                             } else {
@@ -1417,9 +1366,9 @@ pub(crate) async fn background_maintenance_loop(
 
                         let mut holes = Vec::new();
                         // Two INDEPENDENT budgets: expensive rewrite candidates
-                        // (bounded by MAX_GC_ONCE — each holds ~chunk of RAM + moves
+                        // (bounded by --gc-max-extents-per-run — each holds ~chunk of RAM + moves
                         // live VPs) vs free empty-sealed reclaims (bounded by the
-                        // larger MAX_GC_EMPTY_ONCE — just punch_holes). Empties sort
+                        // larger --gc-max-empty-per-run — just punch_holes). Empties sort
                         // LAST here (0 reclaimable bytes), so we must NOT stop scanning
                         // when the rewrite budget fills — else split/merge-minted empty
                         // sealed extents at the tail of the list starve forever.
@@ -1437,8 +1386,8 @@ pub(crate) async fn background_maintenance_loop(
                         // guard here changed nothing observable.
                         let dead_bytes_high = params.dead_bytes_high;
                         for eid in candidates {
-                            if nonempty_selected >= MAX_GC_ONCE
-                                && empty_selected >= MAX_GC_EMPTY_ONCE
+                            if nonempty_selected >= p.gc_max_extents_per_run.get()
+                                && empty_selected >= p.gc_max_empty_per_run.get()
                             {
                                 break;
                             }
@@ -1459,15 +1408,15 @@ pub(crate) async fn background_maintenance_loop(
                                 // to flush_gc_batch (no-op) + punch_holes. Uses the
                                 // SEPARATE empty budget so it never starves behind big
                                 // rewrite candidates (the split/merge-churn gap).
-                                if empty_selected < MAX_GC_EMPTY_ONCE {
+                                if empty_selected < p.gc_max_empty_per_run.get() {
                                     holes.push((eid, sealed_length));
                                     empty_selected += 1;
                                 }
                                 continue;
                             }
-                            // Non-empty rewrite candidate: bounded by MAX_GC_ONCE, but
+                            // Non-empty rewrite candidate: bounded by --gc-max-extents-per-run, but
                             // `continue` (not `break`) so we keep scanning for empties.
-                            if nonempty_selected >= MAX_GC_ONCE {
+                            if nonempty_selected >= p.gc_max_extents_per_run.get() {
                                 continue;
                             }
                             if params.empty_only {
@@ -1521,7 +1470,7 @@ pub(crate) async fn background_maintenance_loop(
                         // no floor can no longer answer a different question
                         // than the one the advisory asks (`next_gc_debt_basis`).
                         let policy = GcDebtPolicy {
-                            ratio_base: params.ratio.unwrap_or(GC_DISCARD_RATIO),
+                            ratio_base: params.ratio.unwrap_or(p.gc_discard_ratio.get()),
                             stream_debt: params.stream_debt,
                             floor: dead_bytes_high,
                         };
@@ -1682,7 +1631,7 @@ pub(crate) async fn background_maintenance_loop(
                             tracing::info!(?busy, "GC: skipping extents with an op in flight");
                             for e in &busy {
                                 gc_failure_cooldown
-                                    .insert(*e, (Instant::now(), GC_FAILURE_COOLDOWN_SOFT));
+                                    .insert(*e, (Instant::now(), Duration::from_secs(p.gc_failure_soft_cooldown_secs.get())));
                             }
                             let free = holes.into_iter().filter(|(e, _)| !busy.contains(e)).collect();
                             (free, busy)
@@ -1733,8 +1682,8 @@ pub(crate) async fn background_maintenance_loop(
                         Err(e) => {
                             let dur = classify_gc_failure_cooldown(
                                 &e,
-                                GC_FAILURE_COOLDOWN_SOFT,
-                                GC_FAILURE_COOLDOWN,
+                                Duration::from_secs(p.gc_failure_soft_cooldown_secs.get()),
+                                Duration::from_secs(p.gc_failure_cooldown_secs.get()),
                             );
                             tracing::error!(
                                 extent_id = eid,
@@ -3035,7 +2984,7 @@ pub(crate) async fn do_compact(
                 r.clone(),
                 part_sc.clone(),
                 part_cache.clone(),
-                FetchMode::Window(SCAN_READ_WINDOW_BYTES),
+                FetchMode::Window(crate::params().scan_read_window_bytes.get()),
             )
         })
         .collect();
@@ -3465,7 +3414,7 @@ pub(crate) fn gc_debt_from_basis(discards: &HashMap<u64, i64>, basis: Option<&Gc
 /// fact into standing policy.
 #[derive(Clone, Debug)]
 pub(crate) struct GcDebtPolicy {
-    /// the un-halved per-extent ratio gate (`GC_DISCARD_RATIO` unless the
+    /// the un-halved per-extent ratio gate (`--gc-discard-ratio` unless the
     /// dispatch overrode it).
     pub ratio_base: f64,
     /// stream-level dead-byte high-water that halves `ratio_base`.
@@ -3673,34 +3622,32 @@ pub(crate) fn split_at_replay_floor(
 /// to time out at the StreamClient's 5 s ceiling. Smaller chunks keep
 /// the extent-node's read I/O slot returning often enough that
 /// foreground appends don't hit the timeout. Overridable via
-/// `set_gc_read_chunk_bytes` (CLI flag `--gc-read-chunk-bytes`).
+/// `--gc-read-chunk-bytes`.
 fn gc_read_chunk_bytes() -> u32 {
-    *GC_READ_CHUNK_BYTES_CELL.get_or_init(|| 8 * 1024 * 1024)
+    crate::params().gc_read_chunk_bytes.get()
 }
 
 /// max records per GC append batch. Defaults to 256 to match
-/// `MAX_WRITE_BATCH` on the foreground put path. Overridable
-/// via `set_gc_batch_records`.
+/// `MAX_WRITE_BATCH` on the foreground put path (`--gc-batch-records`).
 fn gc_batch_records() -> usize {
-    *GC_BATCH_RECORDS_CELL.get_or_init(|| 256)
+    crate::params().gc_batch_records.get()
 }
 
 /// max bytes per GC append batch. Defaults to 4 MiB so a single
 /// `append_segments` payload is bounded regardless of how large the
 /// individual VP values are. Hit the records cap first on small VPs;
-/// hit the bytes cap first on large VPs. Overridable via
-/// `set_gc_batch_bytes`.
+/// hit the bytes cap first on large VPs (`--gc-batch-bytes`).
 fn gc_batch_bytes() -> usize {
-    *GC_BATCH_BYTES_CELL.get_or_init(|| 4 * 1024 * 1024)
+    crate::params().gc_batch_bytes.get()
 }
 
 /// GC log_stream rewrite throttle in bytes/sec. 0 = unlimited.
 /// Default 64 MiB/s — bounded headroom relative to typical foreground
 /// put traffic so GC doesn't starve client writes on the shared
-/// log_stream worker / extent-node fanout. Overridable via
-/// `set_gc_rate_bytes_per_sec`.
+/// log_stream worker / extent-node fanout (`--gc-rate-bytes-per-sec`, a
+/// runtime parameter: read on every batch).
 fn gc_rate_bytes_per_sec() -> u64 {
-    *GC_RATE_BYTES_PER_SEC_CELL.get_or_init(|| 64 * 1024 * 1024)
+    crate::params().gc_rate_bytes_per_sec.get()
 }
 
 /// Per-record metadata kept alongside the encoded segments for memtable
@@ -3752,7 +3699,6 @@ impl GcWriteBatch {
 /// exceed what the budget allows for the elapsed time, sleep enough to
 /// catch up. Window resets every second to bound drift.
 struct GcRateLimiter {
-    bytes_per_sec: u64,
     window_start: Instant,
     bytes_in_window: u64,
 }
@@ -3760,14 +3706,14 @@ struct GcRateLimiter {
 impl GcRateLimiter {
     fn new() -> Self {
         Self {
-            bytes_per_sec: gc_rate_bytes_per_sec(),
             window_start: Instant::now(),
             bytes_in_window: 0,
         }
     }
 
     fn account(&mut self, bytes: u64) -> Option<Duration> {
-        if self.bytes_per_sec == 0 {
+        let bytes_per_sec = gc_rate_bytes_per_sec();
+        if bytes_per_sec == 0 {
             return None;
         }
         self.bytes_in_window = self.bytes_in_window.saturating_add(bytes);
@@ -3778,7 +3724,7 @@ impl GcRateLimiter {
             self.bytes_in_window = 0;
             return None;
         }
-        let target_secs = self.bytes_in_window as f64 / self.bytes_per_sec as f64;
+        let target_secs = self.bytes_in_window as f64 / bytes_per_sec as f64;
         let target = Duration::from_secs_f64(target_secs);
         if target > elapsed {
             Some(target - elapsed)
@@ -4714,7 +4660,7 @@ pub(crate) async fn sst_user_key_versions(
             reader.clone(),
             sc.clone(),
             cache.clone(),
-            FetchMode::Window(SCAN_READ_WINDOW_BYTES),
+            FetchMode::Window(crate::params().scan_read_window_bytes.get()),
         );
         it.rewind().await?;
         while it.valid() {

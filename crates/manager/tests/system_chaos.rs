@@ -470,7 +470,7 @@ impl PsProcess {
                 &self.manager_addr.to_string(),
                 "--port",
                 &self.addr.port().to_string(),
-                "--bind-host",
+                "--listen",
                 &self.addr.ip().to_string(),
                 "--advertise",
                 &self.addr.to_string(),
@@ -4568,7 +4568,8 @@ async fn verify_gc_reclaim(
         .map(|(id, members)| (*id, members.clone()))
         .collect();
     let push_timeout = Duration::from_secs(30);
-    let sweep_timeout = push_timeout + autumn_stream::RECONCILE_SWEEP_INTERVAL;
+    let sweep_timeout = push_timeout
+        + Duration::from_secs(autumn_stream::en_params().reconcile_sweep_interval_secs.get());
     if let Err(error) = wait_for_physical_reclaim(
         etcd_endpoint, nodes, &candidates, push_timeout, sweep_timeout,
     ).await {

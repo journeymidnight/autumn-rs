@@ -135,7 +135,7 @@ PIDS+=($!); sleep 4
     --advertise "127.0.0.1:$EN_PORT" --cpuset 0 "${S[@]}" >"$WORK/en.log" 2>&1 &
 PIDS+=($!); sleep 8
 "$B/autumn-op" "${S[@]}" --manager "$M" bootstrap --replication 1+0 >/dev/null || exit 1
-"$B/autumn-ps" --psid 1 --port "$PS_PORT" --manager "$M" --data "$WORK/ps1" "${S[@]}" \
+"$B/autumn-ps" --psid 1 --port "$PS_PORT" --manager "$M" "${S[@]}" \
     >"$WORK/ps.log" 2>&1 &
 PIDS+=($!); sleep 5
 "$B/autumn-op" "${S[@]}" --manager "$M" namespace-create --name "$NS" >/dev/null 2>&1

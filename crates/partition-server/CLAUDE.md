@@ -222,7 +222,7 @@ Put(key, value, part_id):
 
 partition_loop (per partition):
   OWNS:   FuturesOrdered<Pin<Box<dyn Future<Output=InflightCompletion>>>>
-  CAP:    AUTUMN_PS_INFLIGHT_CAP (default 8, range [1, 64])
+  CAP:    --ps-inflight-cap (default 8, range [1, 64])
   RECV:   req_rx: mpsc<PartitionRequest> (WRITE_CHANNEL_CAP = 1024)
           — the SAME channel carries reads + writes from ps-conn
 
@@ -332,8 +332,8 @@ refill and re-locks at 8.
 `the_window_waits_for_the_acked_refill_not_a_fixed_count` goes red with the
 fixed target.
 
-`--min-pipeline-batch` is parsed but a deprecated no-op; the threshold and the
-window are constants, not knobs.
+The threshold and the window are constants, not knobs (`--min-pipeline-batch`
+is refused).
 
 ### In-order Phase 3 commit
 
@@ -373,7 +373,7 @@ distinct contiguous offsets regardless of completion order).
 ### P-sst SQ/CQ (flush_worker_loop)
 
 Same FuturesUnordered + select pattern on the bulk thread, cap = 2 (env
-`AUTUMN_PS_SST_INFLIGHT_CAP`, range [1, 16]). Each in-flight flush holds a 128 MB
+`--ps-bulk-inflight-cap`, range [1, 16]). Each in-flight flush holds a 128 MB
 SST buffer, so the cap is deliberately small. The overlap benefit: while one SST
 uploads via `row_stream.append`, the next flush can start its `build_sst_bytes`
 `spawn_blocking` — CPU (build) overlaps network (upload) without ballooning peak
@@ -550,7 +550,7 @@ manager/replica latency. Do not confuse `open_tail_bytes` with the sibling
 `size_bytes` gauge: that one is LSM-RESIDENT bytes (Σ SST len + memtables),
 refreshed every 30 s from `lsm_resident_bytes()` and 0 until the first refresh
 after open — and it is the input to the manager's hard split trigger
-(`SPLIT_LSM_HARD`), which counts only what a key-range cut actually halves.
+(`--split-lsm-hard-bytes`), which counts only what a key-range cut actually halves.
 
 ### `open_tail_dead_bytes` — WAL debt GC cannot take yet
 
@@ -774,7 +774,7 @@ Symmetric on the WRITE recv side. The ps-conn reads into the decoder's own buffe
 the front keeps a fixed 64 KiB window so only its prologue and a bounded prefix
 land there. `drain_bulk_writes` (`lib.rs`) runs right after the read, BEFORE the
 normal decode: if the FRONT frame
-is a bulk write whose raw tail is `>= AUTUMN_PS_BULK_RECV_MIN_BYTES` (64 KiB), it
+is a bulk write whose raw tail is `>= --bulk-recv-min-bytes` (64 KiB), it
 recvs that tail straight into a `PooledBuf` instead of letting `FrameDecoder`
 accumulate (and copy) it. BOTH value-separable write shapes qualify —
 `MSG_PUT_BULK` (one value, fixed 44-byte binary meta then the key) and
@@ -815,7 +815,7 @@ namespace/authz checks enabled (see authz section).
 
 ## Flush Pipeline
 
-Triggered when `active` exceeds `FLUSH_MEM_BYTES` (256 MB).
+Triggered when `active` exceeds `--flush-mem-bytes` (256 MB).
 
 ```
 P-log: background_flush_loop
@@ -856,7 +856,7 @@ slower. The row-stream prefix cut after a compaction
 INVARIANT (checkpoint publication): only P-log may publish `metaStream`
 checkpoints. P-sst may upload the SST and build the `SstReader`, but it must not
 write `TableLocations` from the `FlushReq` snapshot. With
-`AUTUMN_PS_SST_INFLIGHT_CAP > 1`, two in-flight flushes can complete out of order;
+`--ps-bulk-inflight-cap > 1`, two in-flight flushes can complete out of order;
 publishing from stale `tables_before` snapshots can drop older SSTs or emit
 duplicate `(extent_id, offset)` entries. The authoritative checkpoint must be
 emitted only after P-log merges `new_meta` into `part.tables`.
@@ -1026,7 +1026,7 @@ tables after it add up to it.
 stream is only ever truncated as a prefix, so one old table the ratio rule never
 picks (a major's output, say) pins its extent and every extent after it, while
 the flushes and minor outputs written beside it die around it. On the tick,
-when no count window exists, at most once a minute (`RECLAIM_CHECK_INTERVAL`),
+when no count window exists, at most once a minute (`--reclaim-check-interval-secs`),
 (so under writes heavy enough to leave a count window at most ticks it waits
 for a lull), a detached probe (`spawn_reclaim_probe`; `get_stream_info` + `get_extent_info`
 are manager RPCs and must not stall the maintenance task) reads the row
@@ -1314,7 +1314,7 @@ background flush lags the writer; foreground writes landing between an imm's
 AHEAD of that imm's own content → on crash before those writes flush, recovery
 starts past them → silent loss. This is also the premise the compaction-MAX rests
 on (each input's vp_head must be its TRUE content boundary). Test-only affordances:
-`set_flush_mem_bytes`, `set_flush_test_pause`, `flush_commit_count`.
+`params().flush_mem_bytes.set(..)`, `set_flush_test_pause`, `flush_commit_count`.
 
 Companion: recovery seeds `p.vp` = the committed log TAIL (tracks each replayed
 extent's committed end), kept SEPARATE from the replay start. Without it, an
@@ -1503,7 +1503,7 @@ is exactly why the basis it reads has to agree with selection (below).
    - Else multi-tier filter: skip if `empty_only`; skip if `max_size` set and
      `sealed_length > max_size`; then `gc_selects(dead, sealed_length, refs,
      effective_ratio, dead_bytes_high)` decides. `effective_ratio` starts at
-     `params.ratio` (default `GC_DISCARD_RATIO`), halved when the stream's
+     `params.ratio` (default `--gc-discard-ratio`), halved when the stream's
      discard before the replay floor ≥ the `stream_debt` high-water. Before
      the floor, not all of it: the manager fills `stream_debt` from the same
      `gc_debt_high` the advisory fires on, and the advisory reads `gc_debt`,
@@ -1586,7 +1586,7 @@ is exactly why the basis it reads has to agree with selection (below).
        probabilistic: an operator must be able to answer "why was this not
        collected". It is a weighting, not a promise — if the sibling never
        collects, this side has paid a rewrite and `refs` stays at 1.
-3. Cap at `MAX_GC_ONCE` (3) per dispatch.
+3. Cap at `--gc-max-extents-per-run` (3) per dispatch.
 
 INVARIANT (never punch on a stale/open `extent_info`): the destructive
 `sealed_length == 0` fast-punch branch keys on `get_extent_info(eid)`, a CACHED read.
@@ -1696,7 +1696,7 @@ at Phase 3). The pre-fix bug was the missing Case A: at T4, GC did
      GC pass. Without this, OP_CHUNK_BLOB records of live multi-frag values would be
      silently orphaned by punch_holes (the single-VP scan skips OP_CHUNK_BLOB).
   1. Single-VP loop (streaming): until cur >= sealed_length:
-       a. read_bytes_from_extent(eid, cur, AUTUMN_PS_GC_READ_CHUNK_BYTES)
+       a. read_bytes_from_extent(eid, cur, --gc-read-chunk-bytes)
        b. concatenate carry + chunk → buf
        c. process_gc_chunk(buf):
           - decode complete records left-to-right; on partial record at tail stop,
@@ -1804,7 +1804,7 @@ the failure chain contains `"precondition failed"` (the manager refusing
 (stale `extent_info_cache` after an EC bump); hard window (300 s) for everything
 else.
 
-**Tunable**: `AUTUMN_PS_GC_READ_CHUNK_BYTES` (default 64 MiB) — chunk size for the
+**Tunable**: `--gc-read-chunk-bytes` (default 8 MiB) — chunk size for the
 streaming read inside `run_gc`.
 
 ## Admission: rate limiting + concurrency control
@@ -1866,7 +1866,7 @@ never gets sliced across windows).
 
 ### ConcurrencyController — PS-wide RAM cap
 
-Each `do_compact` holds ~2× SST bytes; each `run_gc` holds ~64 MiB chunk-read +
+Each `do_compact` holds ~2× SST bytes; each `run_gc` holds one `--gc-read-chunk-bytes` (8 MiB) chunk-read +
 rewrite staging. Without a global cap, `autumn-op compact ALL` would launch N
 concurrent compactions and multiply peak RSS by N.
 
@@ -1897,26 +1897,21 @@ A per-partition `GcRateLimiter` survives as a deprecated inner cap layered befor
 `account_gc`, kept for the `--gc-rate-bytes-per-sec` flag (distinct from
 `--admission-gc-rate-bytes-per-sec`).
 
-### Configuration (CLI flags + env)
+### Configuration
 
-| Flag | Env | Default | Knob |
-|------|-----|---------|------|
-| `--fg-rate-bytes-per-sec` | `AUTUMN_PS_FG_RATE_BYTES_PER_SEC` | **1 GiB/s** | per-partition fg bytes |
-| `--fg-iops-per-sec` | `AUTUMN_PS_FG_IOPS_PER_SEC` | 30_000 | per-partition fg ops |
-| `--admission-compact-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC` | **256 MiB/s** | per-partition compact bytes |
-| `--admission-gc-rate-bytes-per-sec` | `AUTUMN_PS_ADMISSION_GC_RATE_BYTES_PER_SEC` | **128 MiB/s** | per-partition gc bytes |
-| `--fg-saturated-threshold` | `AUTUMN_PS_FG_SATURATED_THRESHOLD` | 0.8 | fg-aware yield trigger |
-| `--major-compact-parallelism` | `AUTUMN_PS_MAJOR_COMPACT_PARALLELISM` | **4** | PS-wide compact concurrency (`compact_max`) |
-| `--gc-parallelism` | `AUTUMN_PS_GC_PARALLELISM` | **4** | PS-wide gc concurrency (`gc_max`) |
-| `--max-extent-size-bytes` | — | **16 GiB** | per-extent seal threshold to each partition's `StreamClient` (clamp [1 GiB, 64 GiB]) |
-| `--flush-mem-bytes` | — | **256 MiB** | memtable rotation size (clamp [4 KiB, 1 GiB]) |
-| `--compact-max-sst-bytes` | — | **1 GiB** | compaction output SST size, at least 2× the flush size (4 KiB-3 GiB) |
-| `--deletion-compact-check-secs` | — | **300** | how often each partition evaluates the deletion-trigger rule (clamp [1, 86400]) |
-| `--compact-min-files` / `--compact-max-files` | — | **3 / 10** | tables a minor compaction merges |
-| `--compact-ratio` | — | **1.2** | a table joins a minor window only if ≤ ratio × the rest of it |
-| `--compact-min-size-bytes` | — | **1 MiB** | a window smaller than this skips the ratio test |
-| `--compact-large-size-bytes` | — | **128 MiB** | tables this large never enter a minor window |
-| `--compact-blocking-files` | — | **16** | at this many mergeable tables a window is merged even when none is in ratio |
+Every PS tunable is declared in `crates/params/src/ps.rs` (`PsParams`) and lives
+in one process-wide instance, `autumn_partition_server::params()`; `autumn-ps
+--help` lists them all. No PS tunable is read from the environment.
+
+`[runtime]` parameters are read on every use so an override applies at once:
+the five admission caps (`RateController::caps`, each accounting call),
+`--major-compact-parallelism` / `--gc-parallelism` (`ConcurrencyController::caps`,
+each acquire), `--gc-rate-bytes-per-sec` (`GcRateLimiter::account`, each batch)
+and the `--compact-*` minor policy (`minor_policy()`, each selection). Tests
+build fixed-cap controllers with `RateController::new` /
+`ConcurrencyController::new`. Startup-only parameters can be read once where
+they are consumed (block cache size at `PartitionServer` construction, extent
+size at partition open).
 
 `0` on any rate flag = unlimited for that dimension (per-dimension opt-out).
 
@@ -1926,7 +1921,7 @@ extent. Enabled by widening every extent byte position on the read+append path f
 `ReadBytesReq.offset/length` / `CommitLengthResp.length`; persisted `ValuePointer`
 16→24 B, `SstLocation`, `TableLocations.vp_offset`, SST `MetaBlock.vp_offset`,
 `TableMeta.offset/len`). Bigger extents = fewer extents = less manager/etcd metadata
-pressure. Flows through `set_max_extent_size_bytes` → `max_extent_size_bytes()`, read
+pressure. Flows through `params().max_extent_size_bytes` → `max_extent_size_bytes()`, read
 at both `StreamClient::new_with_owner_epoch` sites (P-log + P-sst). With EC + 16 GiB
 extents a shard exceeds 4 GiB, so `read_shard_from_addr` chunks internally to keep
 each `MSG_READ_BYTES` under the frame's `payload_len: u32` ceiling.
@@ -2056,7 +2051,7 @@ The logStream replay + GC both read via `StreamClient::read_bytes_from_extent`, 
 chunks internally so a >2 GiB sealed extent never EINVALs.
 
 INVARIANT (concurrent opens): `sync_regions_once` fans out the opens via
-`futures::stream::iter(to_open).buffer_unordered(OPEN_PARALLELISM=64)` so a PS
+`futures::stream::iter(to_open).buffer_unordered(--open-parallelism=64)` so a PS
 inheriting N partitions (full takeover) doesn't pay ~N× the single-partition recovery
 wallclock (each recovery runs on its own thread/core and is latency-bound). Race-free
 because port ordinals are reserved synchronously per open
@@ -2064,7 +2059,7 @@ because port ordinals are reserved synchronously per open
 keys, so no cross-open shared-RefCell borrow is held across an await. Gating
 (already-open / backoff / budget, with a LOCAL budget reservation counter) is applied
 UP FRONT; results (insert handle + budget inc + backoff record) after `collect`.
-`OPEN_PARALLELISM` caps only the manager-RPC burst; the live count is bounded by the
+`--open-parallelism` caps only the manager-RPC burst; the live count is bounded by the
 per-PS partition budget (cpuset_len / 2).
 
 Corrupt historical checkpoints are repaired out of band (a one-off `repair_metastream`
@@ -2128,7 +2123,7 @@ by — an early heartbeat is exactly why liveness alone cannot mean ready
 
 `finish_connect` spawns `heartbeat_loop` immediately after `register_ps` succeeds,
 BEFORE the (potentially 10+ s with hundreds of MiB unflushed WAL) `sync_regions_once`
-— else the first heartbeat lands AFTER the manager's `PS_DEAD_TIMEOUT` (10 s) evicts
+— else the first heartbeat lands AFTER the manager's `--ps-dead-timeout-secs` (10 s) evicts
 the PS, leaving every region's `ps_addr` permanently `unknown`. `heartbeat_loop` also
 decodes the manager `CodeResp`: on `CODE_NOT_FOUND` (unknown `ps_id`) it WARN-logs and
 re-runs `register_ps` + `sync_regions_once`, so a transient eviction self-heals.
@@ -2454,33 +2449,33 @@ both.
 
 | Constant | Value | Meaning |
 |----------|-------|---------|
-| `VALUE_THROTTLE` | 4 KB | Large value threshold (store as VP) |
-| `FLUSH_MEM_BYTES` | 256 MB | Memtable size trigger for rotation (`--flush-mem-bytes`) |
-| `COMPACT_MAX_SST_BYTES_DEFAULT` | 1 GiB | compaction output SST size (`--compact-max-sst-bytes`; at least 2× the flush size) |
-| `MAX_WRITE_BATCH` | 256 | Max requests per group-commit batch |
+| `VALUE_THROTTLE` | 4 KB | Large value threshold (store as VP); replay classifies records by it, so it is not a flag |
 | `BLOCK_SIZE_TARGET` | 64 KB | Target SSTable block size |
-| `GC_DISCARD_RATIO` | 0.4 (40%) | Min discard ratio to trigger GC. Halved when stream discard ≥ `stream_debt`, and again for a shared (`refs > 1`) extent. Bypassed entirely by `dead_bytes_high` (`MaintenanceReq.gc_dead_bytes_high`, `autumn-op gc --dead-bytes`), the absolute floor — a big pile is worth collecting at any fraction. |
 | `OP_VALUE_POINTER` | 0x80 | Op flag bit for ValuePointer entries |
-| `MAX_IMM_DEPTH` | 4 | imm queue cap; merged_loop stalls req intake when reached (RocksDB `max_write_buffer_number`). Env `AUTUMN_PS_MAX_IMM_DEPTH` ([1, 64]). |
-| `MAX_WAL_GAP` | 1 GiB | force-rotate active when `active.log_bytes() + Σ imm.log_bytes()` exceeds this. Measures the un-flushed LOG bytes (value included), NOT `mem_bytes()`. RocksDB `max_total_wal_size`. Env `AUTUMN_PS_MAX_WAL_GAP` ([128 MiB, 64 GiB]). |
-| `SHUTDOWN_TIMEOUT_MS` | 60_000 | per-partition graceful drain deadline before SIGKILL fallback. Env `AUTUMN_PS_SHUTDOWN_TIMEOUT_MS` ([1_000, 600_000]). |
-| `MinorPolicy` | 3 / 10 / 1.2 / 1 MiB / 128 MiB / 16 | minor compaction: min files, max files, ratio, min size, large size, blocking files (`--compact-*`, see "Minor compaction") |
-| `RECLAIM_LIVE_PERCENT` | 30 | head-extent reclaim when its live tables are under this share of its sealed length; probed at most every `RECLAIM_CHECK_INTERVAL` (60 s) |
+
+The memtable, imm-queue, WAL-gap, group-commit, shutdown, compaction and GC
+sizes that used to be constants are parameters (`autumn-ps --help`): e.g.
+`--flush-mem-bytes` 256 MiB, `--max-imm-depth` 4 (RocksDB
+`max_write_buffer_number`), `--max-wal-gap` 1 GiB (force-rotate when un-flushed
+LOG bytes exceed it, value included; RocksDB `max_total_wal_size`),
+`--group-commit-cap` 3072, `--gc-discard-ratio` 0.4 (halved when stream discard ≥
+`stream_debt`, and again for a shared extent; bypassed by `dead_bytes_high`),
+`--compact-reclaim-live-percent` 30 probed every `--reclaim-check-interval-secs`.
 
 ## Bounded recovery replay
 
 Three fixes bound the restart replay window (worst case per partition =
-`MAX_IMM_DEPTH * FLUSH_MEM_BYTES + active.bytes` = 1.25 GB):
+`--max-imm-depth × --flush-mem-bytes + active.bytes` = 1.25 GB):
 
 1. **imm depth cap + back-pressure.** `partition_loop` reads `imm_full = part.imm.len()
-   >= MAX_IMM_DEPTH` at top of loop. When full it skips both batch launches (B) and
+   >= --max-imm-depth` at top of loop. When full it skips both batch launches (B) and
    `req_rx.next()` (D), only polling `inflight.next()` and `imm_drained_rx`.
    `flush_one_imm` signals `imm_drained_tx` after each successful `imm.pop_front()` so
    the loop wakes and resumes intake.
 
 2. **WAL-gap forced rotate.** After each `partition_loop` iteration, if `gap =
-   active.log_bytes() + Σ imm[i].log_bytes() > MAX_WAL_GAP` AND `imm.len() <
-   MAX_IMM_DEPTH`, call `rotate_active`. INVARIANT: the gap MUST be the un-flushed LOG
+   active.log_bytes() + Σ imm[i].log_bytes() > --max-wal-gap` AND `imm.len() <
+   --max-imm-depth`, call `rotate_active`. INVARIANT: the gap MUST be the un-flushed LOG
    bytes, not the memtable footprint — for a large-value (VP) workload the memtable
    holds only the ~24-byte ValuePointer while the 8 MB value lives in log_stream, so a
    `mem_bytes` gap never trips → active never force-rotates → the un-flushed replay
@@ -2781,7 +2776,7 @@ Three fixes bound the restart replay window (worst case per partition =
     - **Release on every error.** `run_flush_async_phase` AND `commit_flush_outcome`
       remove their `src_imm_ptr` on any Err (idempotent). `background_flush_loop` also
       releases the ptr of a *successful* outcome it must DROP because a FIFO-earlier imm
-      in the same batch failed, and retries pending imm every `FLUSH_RETRY_BACKOFF` (2 s)
+      in the same batch failed, and retries pending imm every `--flush-retry-backoff-ms` (2 s)
       so a failed flush self-heals once the cluster recovers (a parked loop produces no
       rotate → no `flush_tx`). INVARIANT: any new flush error path must release the claim.
     - **Reads off the write loop.** RANGE + HEAD are served LOCALLY on the ps-conn task
@@ -2870,7 +2865,7 @@ Three fixes bound the restart replay window (worst case per partition =
     trusts it as source of truth.
 
 18. **Heartbeat-loss exit is a 90 s last resort, not a 10 s tripwire.**
-    `heartbeat_loop`'s `MAX_CONSECUTIVE_FAILURES` is 45 (× 2 s = 90 s). The
+    `heartbeat_loop`'s `--heartbeat-failure-exit-secs` is 90 (45 missed 2 s beats). The
     `std::process::exit(1)` on sustained heartbeat failure guards only the narrow
     "partitioned from the manager but not from clients" stale-serving case — it is NOT the
     primary fencing (owner_epoch fences writes at the ENs; region_epoch fences client

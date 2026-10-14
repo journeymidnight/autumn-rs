@@ -1396,7 +1396,7 @@ mod io_deadline_tests {
     #[test]
     fn bulk_sst_append_deadline_scales_with_payload() {
         let cfg = StreamClientConfig::default();
-        // FLUSH_MEM_BYTES = 256 MiB (partition-server lib.rs:53): one SST
+        // --flush-mem-bytes = 256 MiB (partition-server lib.rs:53): one SST
         // upload. 3-replica fanout + fsync of 256 MiB cannot finish in 5 s
         // under load; the deadline must cover payload / assumed-floor.
         let d_sst = effective_io_timeout(
@@ -4373,7 +4373,7 @@ impl StreamClient {
     /// Pass `length=0` to read from offset to the end of the extent.
     ///
     /// For replicated extents, reads larger than `read_chunk_bytes()`
-    /// (default 256 MiB, env `AUTUMN_STREAM_READ_CHUNK_BYTES`) are split
+    /// (default 256 MiB, the PS's `--stream-read-chunk-bytes`) are split
     /// transparently into multiple chunks. This is required on macOS
     /// (pread INT_MAX) and matches Linux's per-syscall ceiling
     /// (`0x7ffff000`); without chunking, GC and recovery fail with
